@@ -1,0 +1,111 @@
+"""Reject malformed written types even in unused declarations and dead blocks."""
+
+import unittest
+
+from kursal import core as C
+from kursal.check import check_program
+from kursal.kurs import parse_program
+from kursal.sexpr import KursError
+
+
+class FormationTests(unittest.TestCase):
+    def rejects(self, source, message):
+        with self.assertRaisesRegex(KursError, "type formation: " + message):
+            check_program(parse_program(source))
+
+    def test_unknown_names_and_nominal_arity_in_unused_declarations(self):
+        self.rejects("(type Bad Unknown)", "unknown type Unknown")
+        self.rejects("(type Box (forall (T) () (tuple T))) (type Bad Box)", "wrong number")
+        self.rejects("(type Box (forall (T) () (tuple T))) (type Bad (Box u32 u32))", "wrong number")
+        self.rejects("(extern fun f Typo ())", "unknown type Typo")
+        self.rejects("(data d Typo ())", "unknown type Typo")
+
+    def test_type_and_brand_arguments_have_distinct_kinds(self):
+        self.rejects("(type Box (forall (T) () (tuple T))) "
+                     "(type Bad (forall ($k) () (Box $k)))", "expected any")
+        self.rejects("(type Tag (forall ($k) () (builtin::Brand $k))) (type Bad (Tag u32))",
+                     "expected brand")
+        self.rejects("(type Bad (builtin::Pointer $missing))", "brand missing is not in scope")
+        self.rejects("(type Bad (forall ($k) () (builtin::Pointer $k)))", "expected any")
+        check_program(parse_program("(type Tag (forall ($k) () (builtin::Brand $k))) "
+                                    "(type Good (exists ($k) (Tag $k)))"))
+
+    def test_copy_arguments_are_checked(self):
+        self.rejects("(type Linear! (tuple)) (type Box (forall (T) ((Copy T)) (tuple T))) "
+                     "(type Bad (Box Linear))", "expected Copy")
+        self.rejects("(type Box (forall (T) ((Copy T)) (tuple T))) "
+                     "(type Bad (forall (U) () (Box U)))", "expected Copy")
+        check_program(parse_program("(type Box (forall (T) ((Copy T)) (tuple T))) "
+                                    "(type Good (forall (U) ((Copy U)) (Box U)))"))
+
+    def test_trait_premises_have_valid_names_arity_and_kinds(self):
+        self.rejects("(type Bad (forall (T) ((Missing T)) T))", "unknown trait Missing")
+        self.rejects("(trait P (T)) (type Bad (forall (T) ((P T T)) T))", "wrong number")
+        self.rejects("(trait P ($k)) (type Bad (forall (T) ((P T)) T))", "expected brand")
+        self.rejects("(trait P (T) (run Missing (T)))", "unknown type Missing")
+        check_program(parse_program("(trait P ($k) (run (builtin::Brand $k) ())) "
+                                    "(type Good (forall ($k) ((P $k)) (tuple)))"))
+
+    def test_binders_are_scoped_and_names_unique(self):
+        self.rejects("(type Bad (forall (T T) () T))", "duplicate parameter")
+        self.rejects("(type Bad (exists ($k $k) (tuple)))", "duplicate parameter")
+        self.rejects("(type Bad (struct (x u32) (x u32)))", "duplicate component")
+        self.rejects("(type Bad (foreach (F F) F))", "unknown type F")
+        check_program(parse_program("(type Good (foreach (F (tuple u32)) (tuple F F)))"))
+
+    def test_existential_binders_are_used_and_flattened(self):
+        self.rejects("(type Bad (exists () u32))", "existential requires")
+        self.rejects("(type Bad (exists ($k) u32))", "existential brand binder is unused")
+        self.rejects("(type Bad (exists ($a) (exists ($b) "
+                     "(tuple (builtin::Brand $a) (builtin::Brand $b)))))",
+                     "nested existential binders must be flattened")
+        check_program(parse_program("(type Good (exists ($a $b) "
+                                    "(tuple (builtin::Brand $a) (builtin::Brand $b))))"))
+
+    def test_arrays_place_indices_and_retained_slots_are_valid(self):
+        self.rejects("(type Bad (array u32 -1))", "negative array")
+        self.rejects("(type Bad _)", "_ is only")
+        self.rejects("(type Bad (builtin::Fn (forall (T) () T (T))))", "function values quantify only brands")
+        p = C.Program(types={"Bad": C.TypeDecl("Bad", False, (), (), C.Fn((), C.UNIT, places=frozenset({0})))})
+        with self.assertRaisesRegex(KursError, "place index"):
+            check_program(p)
+
+    def test_unknown_types_are_rejected_in_dead_blocks(self):
+        self.rejects("""(fun main u32 ()
+          (entry () (= %n (const u32 0)) (ret %n))
+          (dead ((%x Missing)) (ret %x)))""", "unknown type Missing")
+
+    def test_call_type_arguments_are_formed_even_when_unused(self):
+        self.rejects("""(fun f (forall (T) () u32 ()
+          (entry () (= %n (const u32 0)) (ret %n))))
+          (fun main u32 () (entry () (= %r (call (f Missing))) (ret %r)))""", "unknown type Missing")
+        self.rejects("""(extern fun foreign u32 ())
+          (fun main u32 () (entry () (unsafe (= %r (call (foreign u32)))) (ret %r)))""", "wrong number")
+        self.rejects("""(fun f (forall ($k) () u32 ()
+          (entry () (= %n (const u32 0)) (ret %n))))
+          (fun main u32 () (entry () (= %r (call (f _))) (ret %r)))""", "_ is only")
+        check_program(parse_program("""(fun f (forall ($k) () u32 ()
+          (entry () (= %n (const u32 0)) (ret %n))))
+          (fun main u32 () (entry () (= %p (fn (f _))) (= %r (const u32 0)) (ret %r)))"""))
+
+    def test_open_scopes_start_after_the_instruction(self):
+        self.rejects("""(fun main u32 () (entry ()
+          (= %n (builtin::sizeof (tuple u32 (builtin::Brand $k))))
+          (= %fresh (builtin::fresh)) (= %w (open %fresh ($k)))
+          (= %r (const u32 0)) (ret %r)))""", "brand k is not in scope")
+        check_program(parse_program("""(fun main u32 () (entry ()
+          (= %fresh (builtin::fresh)) (= %w (open %fresh ($k)))
+          (= %n (builtin::sizeof (tuple u32 (builtin::Brand $k))))
+          (= %r (const u32 0)) (ret %r)))"""))
+
+    def test_local_storage_requires_function_generic_brands(self):
+        self.rejects("""(fun main u32 () (locals (&slot (builtin::Brand $k)))
+          (entry () (= %fresh (builtin::fresh)) (= %w (open %fresh ($k)))
+          (= %u (store &slot %w)) (= %r (const u32 0)) (ret %r)))""", "local types may mention only")
+        self.rejects("""(fun main u32 () (locals (&slot (builtin::Brand $typo)))
+          (entry () (= %r (const u32 0)) (ret %r)))""", "local types may mention only")
+        self.rejects("""(fun main u32 () (locals (&slot (builtin::Brand $k)))
+          (entry () (= %fresh (builtin::fresh)) (= %w (open %fresh ($k)))
+            (= %u (store &slot %w)) (= %r (const u32 0)) (ret %r))
+          (dead () (= %w (load &slot)) (= %r (const u32 0)) (ret %r)))""",
+                     "local types may mention only")

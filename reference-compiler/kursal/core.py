@@ -1,0 +1,309 @@
+"""The typed KURS core. Text serialization is read by kurs.py.
+
+Types are frozen and compared structurally; language-level equality
+(nominal declarations, alpha-renamed binders) lives in `types`.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Literal, Optional
+from .sexpr import Form, Position
+
+type Kind = Literal["brand", "copy", "any"]
+
+INTEGERS = {"i8": 8, "i16": 16, "i32": 32, "i64": 64, "isize": 64,
+            "u8": 8, "u16": 16, "u32": 32, "u64": 64, "usize": 64}
+FLOATS = {"f32", "f64"}
+PRIMS = set(INTEGERS) | FLOATS | {"bool"}
+
+# Kinds: a brand, a Copy value type, or any value type.
+BRAND: Kind = "brand"
+COPY: Kind = "copy"
+ANY: Kind = "any"
+
+
+class Type:
+    pass
+
+
+@dataclass(frozen=True)
+class Prim(Type):
+    name: str
+
+
+@dataclass(frozen=True)
+class Never(Type):
+    pass
+
+
+@dataclass(frozen=True)
+class Named(Type):
+    name: str
+    args: tuple[Type, ...] = ()
+
+
+@dataclass(frozen=True)
+class Struct(Type):
+    fields: tuple[tuple[str, Type], ...]  # ((name, Type), ...)
+
+
+@dataclass(frozen=True)
+class Enum(Type):
+    variants: tuple[tuple[str, Type], ...]  # ((name, Type), ...), in tag order
+
+
+@dataclass(frozen=True)
+class Tuple(Type):
+    elems: tuple[Type, ...]
+
+
+@dataclass(frozen=True)
+class Array(Type):
+    elem: Type
+    length: int
+
+
+@dataclass(frozen=True)
+class Ptr(Type):
+    inner: Type
+
+
+@dataclass(frozen=True)
+class Skolem(Type):
+    """A brand variable or identity; kind Brand, never a value type."""
+    label: str
+
+
+@dataclass(frozen=True)
+class Brand(Type):
+    """`builtin::Brand $k`, the Copy witness type of brand `$k`."""
+    brand: Type  # Skolem in checked IR; inference may use a brand metavariable.
+
+
+@dataclass(frozen=True)
+class Exists(Type):
+    binders: tuple[str, ...]  # brand labels
+    body: Type
+
+
+@dataclass(frozen=True)
+class Param:
+    name: str
+    kind: Kind = ANY
+
+
+@dataclass(frozen=True)
+class Premise:
+    trait: str
+    args: tuple[Type, ...]
+
+
+@dataclass(frozen=True)
+class Foreach(Type):
+    binder: str
+    indirect: bool  # the `(builtin::Pointer F)` pattern
+    source: Type
+    body: Type
+    retained: tuple[str, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.retained is None:
+            source = self.source
+            names = (source.binder, *(source.retained or ())) if isinstance(source, Foreach) else ()
+            object.__setattr__(self, "retained", names)
+
+
+@dataclass(frozen=True)
+class Fn(Type):
+    params: tuple[Type, ...]
+    ret: Type
+    forall: tuple[Param, ...] = ()     # retained brand Params; a function value carries no premises
+    unsafe: bool = False
+    places: frozenset[int] = frozenset()  # indices of place parameters
+
+
+@dataclass(frozen=True)
+class Ignored(Type):
+    """`_`: a retained brand slot of `fn`'s type arguments."""
+
+
+UNIT = Tuple(())
+BOOL = Prim("bool")
+U32 = Prim("u32")
+USIZE = Prim("usize")
+
+
+@dataclass(frozen=True)
+class ModuleId:
+    package: int
+    path: tuple[str, ...] = ()
+
+    def child(self, name: str) -> ModuleId:
+        return ModuleId(self.package, (*self.path, name))
+
+    def within(self, scope: ModuleId) -> bool:
+        return self.package == scope.package and self.path[:len(scope.path)] == scope.path
+
+
+type Exposure = tuple[Literal["owner", "within"], ModuleId]
+
+
+@dataclass
+class TypeDecl:
+    name: str
+    linear: bool
+    params: tuple[Param, ...]
+    premises: tuple[Premise, ...]
+    body: Type
+    module: Optional[ModuleId] = None
+    exposure: Optional[Exposure] = None  # None: transparent; ("owner", m) or ("within", m)
+
+
+@dataclass
+class Instr:
+    lhs: tuple[str, ...]
+    op: str
+    args: tuple[str, ...] = ()
+    ty: Optional[Type] = None        # the type operand
+    tys: tuple[Type, ...] = ()        # type arguments
+    lit: Optional[str] = None
+    unsafe: bool = False   # the instruction's discharge marker
+    binders: tuple[str, ...] = ()    # `open`'s brand binders
+    pos: Optional[Position] = None
+
+
+@dataclass
+class Ret:
+    value: str
+    pos: Optional[Position] = None
+
+
+@dataclass
+class Edge:
+    target: str
+    args: tuple[str, ...] = ()
+    tys: tuple[Type, ...] = ()
+
+
+@dataclass
+class Jmp:
+    edge: Edge
+    pos: Optional[Position] = None
+
+
+@dataclass
+class Jnz:
+    cond: str
+    then: Edge
+    other: Edge
+    pos: Optional[Position] = None
+
+
+@dataclass
+class Arm:
+    variant: str
+    edge: Edge
+
+
+@dataclass
+class Switch:
+    scrutinee: str
+    ty: Type
+    arms: tuple[Arm, ...]
+    pos: Optional[Position] = None
+
+
+@dataclass
+class Unreachable:
+    pos: Optional[Position] = None
+
+
+type Terminator = Ret | Jmp | Jnz | Switch | Unreachable
+
+
+@dataclass
+class Block:
+    label: str
+    params: tuple[tuple[str, Type], ...]          # ((name, Type), ...)
+    instrs: tuple[Instr, ...]
+    term: Terminator
+    brands: tuple[str, ...] = ()     # brand labels
+    empty: tuple[str, ...] = ()      # place paths declared empty
+    known: tuple[tuple[str, str], ...] = ()      # ((path, variant), ...)
+    opened: tuple[tuple[str, tuple[str, ...]], ...] = ()  # ((package path, view brands), ...)
+    pos: Optional[Position] = None
+
+
+@dataclass
+class Fun:
+    name: str
+    params: tuple[Param, ...]          # forall Params
+    premises: tuple[Premise, ...]
+    ret: Type
+    ptypes: tuple[Type, ...]          # a place parameter's type is the root type; see `places`
+    blocks: tuple[Block, ...]
+    locals: tuple[tuple[str, Type], ...] = ()     # (("&name", Type), ...)
+    unsafe: bool = False
+    module: Optional[ModuleId] = None
+    pos: Optional[Position] = None
+
+    @property
+    def places(self) -> frozenset[int]:
+        """Indices of the place parameters, whose entry names start with `&`."""
+        return frozenset(i for i, (name, _) in enumerate(self.blocks[0].params) if name.startswith("&"))
+
+
+@dataclass
+class Extern:
+    name: str
+    ret: Optional[Type] = None
+    ptypes: Optional[tuple[Type, ...]] = None   # None for an extern value
+    pos: Optional[Position] = None
+
+
+@dataclass
+class Method:
+    name: str
+    ret: Type
+    ptypes: tuple[Type, ...]
+    unsafe: bool = False
+    places: frozenset[int] = frozenset()
+
+
+@dataclass
+class Trait:
+    name: str
+    params: tuple[str, ...]          # names
+    methods: tuple[Method, ...]
+    module: Optional[ModuleId] = None
+    param_kinds: tuple[Kind, ...] = ()  # omitted kinds are Any, as in plain KURS headers
+
+
+@dataclass
+class Instance:
+    trait: str
+    params: tuple[Param, ...]
+    premises: tuple[Premise, ...]
+    head: tuple[Type, ...]            # types, one per trait parameter
+    methods: tuple[Fun, ...]         # Funs with bare method names
+    module: Optional[ModuleId] = None
+    pos: Optional[Position] = None
+
+
+@dataclass
+class Data:
+    name: str
+    ty: Type
+    init: Form           # the raw form
+    module: Optional[ModuleId] = None
+
+
+@dataclass
+class Program:
+    types: dict[str, TypeDecl] = field(default_factory=dict)
+    funs: dict[str, Fun] = field(default_factory=dict)
+    externs: dict[str, Extern] = field(default_factory=dict)
+    datas: dict[str, Data] = field(default_factory=dict)
+    traits: dict[str, Trait] = field(default_factory=dict)
+    instances: dict[str, list[Instance]] = field(default_factory=dict)  # trait -> [Instance]
