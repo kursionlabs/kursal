@@ -1,0 +1,108 @@
+// The compiler's view of the operating system: arguments, files and directories.
+
+use package::base::{Out, Seq, Text, text};
+use std::bytes::buffer::Buffer;
+use std::io::read_file;
+use std::option::{Option, Result};
+use std::process::Args;
+use std::cstr::cstr_len;
+use libc::fs::{canonicalize, environment_variable, open_directory};
+
+// The arguments the program was started with, after its own name.
+fn arguments(argc: i32, argv: *(*u8)) -> Seq[Text] {
+    let args = unsafe Args::from_main(argc, argv);
+    let out: Seq[Text] = Seq::new();
+    var i = 1usize;
+    while i < args.len() {
+        let unit = match args.bytes(i) {
+            Option::Some(bytes) => out.push(text(bytes)),
+            Option::None => (),
+        };
+        i = i + 1usize;
+    }
+    out
+}
+
+// `t` followed by a NUL, as C wants a path.
+fn c_string(t: Text) -> *u8 {
+    Out::new().add(t).byte(0u8).done().ptr
+}
+
+// The bytes of a buffer, as text that outlives it.
+fn take(b: Buffer!) -> Text {
+    let ptr = unsafe &b.as_ptr();
+    let len = &b.len();
+    let copy = Out::new();
+    copy.bytes.push_bytes(ptr, len);
+    b.destroy();
+    copy.done()
+}
+
+fn buffer(t: Text) -> Buffer! {
+    unsafe Buffer::new().push_n(t.ptr, t.len)
+}
+
+// The contents of the file at `path`, if it can be read.
+fn read(path: Text) -> Option[Text] {
+    match unsafe read_file(c_string(path)) {
+        Result::Ok(b) => Option::Some.(take(b)),
+        Result::Err(code) => Option::None,
+    }
+}
+
+// The absolute path with no symbolic links that `path` names, if it exists.
+fn real_path(path: Text) -> Option[Text] {
+    var b = buffer(path);
+    let result = canonicalize(&b);
+    b.destroy();
+    match result {
+        Result::Ok(r) => Option::Some.(take(r)),
+        Result::Err(code) => Option::None,
+    }
+}
+
+fn environment(name: Text) -> Option[Text] {
+    var b = buffer(name);
+    let result = environment_variable(&b);
+    b.destroy();
+    match result {
+        Option::Some(r) => Option::Some.(take(r)),
+        Option::None => Option::None,
+    }
+}
+
+// The entries of a directory, other than `.` and `..`, with whether each is a directory.
+fn list_directory(path: Text) -> Seq[(Text, bool)] {
+    let out: Seq[(Text, bool)] = Seq::new();
+    var b = buffer(path);
+    let opened = open_directory(&b);
+    b.destroy();
+    match opened {
+        Result::Ok(stream) => {
+            var stream = stream;
+            var going = true;
+            while going {
+                let unit = match &stream.next_entry() {
+                    Result::Ok(next) => match next {
+                        Option::Some(entry) => {
+                            let { name, is_directory } = entry;
+                            let n = take(name);
+                            if !n.is(".") && !n.is("..") {
+                                out.push((n, is_directory));
+                            }
+                        },
+                        Option::None => {
+                            going = false;
+                        },
+                    },
+                    Result::Err(code) => {
+                        going = false;
+                    },
+                };
+            }
+            let closed = stream.close();
+        },
+        Result::Err(code) => (),
+    }
+    out
+}
