@@ -1,0 +1,185 @@
+// POSIX host filesystem adapter. Link with lib/libc/fs.c.
+
+use std::bytes::buffer::Buffer;
+use std::cstr::cstr_len;
+use std::io::File;
+use std::option::{Option, Result};
+use std::raw::elem_ptr;
+
+extern "C" fn kur_libc_fs_error() -> i32;
+extern "C" fn kur_libc_fs_release(bytes: *u8) -> ();
+extern "C" fn kur_libc_fs_canonicalize(path: *u8, len: usize) -> *u8;
+extern "C" fn kur_libc_fs_getenv(name: *u8, len: usize) -> *u8;
+extern "C" fn kur_libc_fs_stat(path: *u8, len: usize, output: *u8) -> i32;
+extern "C" fn kur_libc_fs_open_read(path: *u8, len: usize) -> i32;
+extern "C" fn kur_libc_fs_open_directory(path: *u8, len: usize) -> *u8;
+extern "C" fn kur_libc_fs_next_entry(handle: *u8) -> *u8;
+extern "C" fn kur_libc_fs_entry_name(entry: *u8) -> *u8;
+extern "C" fn kur_libc_fs_entry_is_directory(handle: *u8, entry: *u8) -> i32;
+extern "C" fn kur_libc_fs_close_directory(handle: *u8) -> i32;
+
+exposed enum FileKind {
+    Regular,
+    Directory,
+    Other,
+}
+
+exposed struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+exposed struct Metadata {
+    identity: FileIdentity,
+    kind: FileKind,
+}
+
+exposed struct DirectoryEntry! {
+    name: Buffer!,
+    is_directory: bool,
+}
+
+// No raw handle extraction or safe construction outside this module.
+struct DirectoryStream! {
+    handle: *u8,
+}
+
+// Paths are owned buffers so reading their bytes requires no external
+// lifetime assertion. All operations preserve the caller's buffer.
+fn canonicalize(&path: Buffer!) -> Result[Buffer!, i32] {
+    let p = unsafe &path.as_ptr();
+    let n = &path.len();
+    let result = unsafe kur_libc_fs_canonicalize(p, n);
+    if unsafe (result as usize) == 0usize {
+        let error = unsafe kur_libc_fs_error();
+        Result::Err.(error)
+    } else {
+        let len = unsafe cstr_len(result);
+        // Copy before releasing: libc storage never escapes the adapter.
+        let output = unsafe Buffer::new().push_n(result, len);
+        let unit = unsafe kur_libc_fs_release(result);
+        Result::Ok.(output)
+    }
+}
+
+// An environment variable's value, or nothing when it is unset.
+fn environment_variable(&name: Buffer!) -> Option[Buffer!] {
+    let p = unsafe &name.as_ptr();
+    let n = &name.len();
+    let result = unsafe kur_libc_fs_getenv(p, n);
+    if unsafe (result as usize) == 0usize {
+        Option::None
+    } else {
+        let len = unsafe cstr_len(result);
+        let output = unsafe Buffer::new().push_n(result, len);
+        let unit = unsafe kur_libc_fs_release(result);
+        Option::Some.(output)
+    }
+}
+
+fn metadata(&path: Buffer!) -> Result[Metadata, i32] {
+    let p = unsafe &path.as_ptr();
+    let n = &path.len();
+    let scratch = Buffer::new_zeroed(24usize);
+    let output = unsafe &scratch.as_ptr();
+    let status = unsafe kur_libc_fs_stat(p, n, output);
+    let result: Result[Metadata, i32] = if status != 0i32 {
+        Result::Err.(status)
+    } else {
+        // malloc is aligned for u64; C initialized all three values.
+        let values = unsafe (output as *u64);
+        let device = unsafe *values;
+        let inode = unsafe *(unsafe elem_ptr(values, 1usize));
+        let kind_code = unsafe *(unsafe elem_ptr(values, 2usize));
+        let kind = if kind_code == 1u64 {
+            FileKind::Regular
+        } else {
+            if kind_code == 2u64 {
+                FileKind::Directory
+            } else {
+                FileKind::Other
+            }
+        };
+        Result::Ok.(Metadata.{ identity: FileIdentity.{ device, inode }, kind })
+    };
+    let unit = scratch.destroy();
+    result
+}
+
+fn open_read(&path: Buffer!) -> Result[File!, i32] {
+    let p = unsafe &path.as_ptr();
+    let n = &path.len();
+    let fd = unsafe kur_libc_fs_open_read(p, n);
+    if fd < 0i32 {
+        Result::Err.(0i32 - fd)
+    } else {
+        // A successful adapter call creates a fresh exclusively owned fd.
+        Result::Ok.(unsafe File::adopt(fd))
+    }
+}
+
+fn open_directory(&path: Buffer!) -> Result[DirectoryStream!, i32] {
+    let p = unsafe &path.as_ptr();
+    let n = &path.len();
+    let handle = unsafe kur_libc_fs_open_directory(p, n);
+    if unsafe (handle as usize) == 0usize {
+        let error = unsafe kur_libc_fs_error();
+        Result::Err.(error)
+    } else {
+        Result::Ok.(DirectoryStream.{ handle })
+    }
+}
+
+impl DirectoryStream {
+    // Includes . and ..; ordering is unspecified. Each returned buffer owns
+    // its bytes and remains valid after advancing or closing the directory.
+    fn next(&self) -> Result[Option[Buffer!], i32] {
+        let result = &self.next_entry();
+        let result: Result[Option[Buffer!], i32] = match result {
+            Result::Err(error) => Result::Err.(error),
+            Result::Ok(entry) => {
+                match entry {
+                    Option::None => Result::Ok.(Option::None),
+                    Option::Some(value) => {
+                        let { name, is_directory } = value;
+                        Result::Ok.(Option::Some.(name))
+                    },
+                }
+            },
+        };
+        result
+    }
+
+    // Classification is an observation, not access authority. Symlinks are
+    // followed; failed classification is false, as in POSIX directory walks.
+    fn next_entry(&self) -> Result[Option[DirectoryEntry!], i32] {
+        let { handle } = self;
+        let raw = unsafe kur_libc_fs_next_entry(handle);
+        let result: Result[Option[DirectoryEntry!], i32] = if unsafe (raw as usize) == 0usize {
+            let error = unsafe kur_libc_fs_error();
+            if error == 0i32 {
+                Result::Ok.(Option::None)
+            } else {
+                Result::Err.(error)
+            }
+        } else {
+            let name = unsafe kur_libc_fs_entry_name(raw);
+            let is_directory = unsafe kur_libc_fs_entry_is_directory(handle, raw) != 0i32;
+            let len = unsafe cstr_len(name);
+            let entry = unsafe Buffer::new().push_n(name, len);
+            Result::Ok.(Option::Some.(DirectoryEntry.{ name: entry, is_directory }))
+        };
+        self = DirectoryStream.{ handle };
+        result
+    }
+
+    fn close(self) -> Result[(), i32] {
+        let { handle } = self;
+        let status = unsafe kur_libc_fs_close_directory(handle);
+        if status == 0i32 {
+            Result::Ok.(())
+        } else {
+            Result::Err.(status)
+        }
+    }
+}

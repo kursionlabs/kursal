@@ -1,0 +1,531 @@
+// toml::lex -- the TOML lexical layer. Table construction is
+// `toml::document`'s; tokens alone do not establish valid TOML.
+
+use std::raw::span_byte_or_zero;
+use std::alloc::arena::{Arena, save_buffer};
+use std::utf8::decode;
+use std::bytes::buffer::Buffer;
+use std::collections::list::List;
+use std::cap::Exclusive;
+use std::option::{Option, Result};
+use std::raw::{Span, raw_byte_at};
+
+exposed enum TomlError {
+    Syntax(usize),
+    InvalidUtf8(usize),
+}
+
+forall 'k.
+exposed enum TomlTokenKind {
+    Text(Span['k]),
+    Bare(Span['k]),
+    Equals,
+    Dot,
+    Comma,
+    OpenTable,
+    CloseTable,
+    OpenInline,
+    CloseInline,
+    Newline,
+}
+
+forall 'k.
+exposed struct TomlToken {
+    kind: TomlTokenKind['k],
+    offset: usize,
+    multiline: bool,
+}
+
+// One UTF-8 scalar and the index past it; an invalid sequence is an error
+// at `start`.
+forall 'k.
+fn toml_codepoint(&tag: Exclusive!['k], text: Span['k], start: usize) -> Result[(u32, usize), TomlError] {
+    match decode(&tag, text, start) {
+        Option::Some(decoded) => Result::Ok.(decoded),
+        Option::None => Result::Err.(TomlError::InvalidUtf8.(start)),
+    }
+}
+
+fn toml_hex(byte: u8) -> Result[u32, TomlError] {
+    let value = if byte >= b'0' && byte <= b'9' {
+        unsafe ((byte - b'0') as u32)
+    } else {
+        if byte >= b'A' && byte <= b'F' {
+            unsafe ((byte - b'A') as u32) + 10u32
+        } else {
+            if byte >= b'a' && byte <= b'f' {
+                unsafe ((byte - b'a') as u32) + 10u32
+            } else {
+                16u32
+            }
+        }
+    };
+    if value == 16u32 {
+        Result::Err.(TomlError::Syntax.(0usize))
+    } else {
+        Result::Ok.(value)
+    }
+}
+
+forall 'k.
+unsafe fn toml_unicode_escape(&tag: Exclusive!['k], text: Span['k], start: usize, count: usize) -> Result[(u32, usize), TomlError] {
+    // Only 4 or 8 digits are admitted, preventing arithmetic overflow even when
+    // called outside the lexer. Bounds use subtraction, not unchecked start+n.
+    let span_result =
+        if (count != 4usize && count != 8usize)
+        || start > text
+        .len()
+        || count > text
+        .len() - start {
+        Result::Err.(TomlError::Syntax.(start))
+    } else {
+        var code = 0u32;
+        var i = 0usize;
+        var valid = true;
+        while i < count {
+            let byte = span_byte_or_zero(&tag, text, start + i);
+            let digit = toml_hex(byte);
+            let unit = match digit {
+                Result::Err(error) => {
+                    valid = false;
+                },
+                Result::Ok(value) => {
+                    code = code * 16u32 + value;
+                },
+            };
+            i = i + 1usize;
+        }
+        if valid && code <= 1114111u32 && !(code >= 55296u32 && code <= 57343u32) {
+            Result::Ok.((code, start + count))
+        } else {
+            Result::Err.(TomlError::Syntax.(start))
+        }
+    };
+    span_result
+}
+
+fn toml_append_scalar(buffer: Buffer!, code: u32) -> Buffer! {
+    if code < 128u32 {
+        buffer.push_byte(unsafe (code as u8))
+    } else {
+        if code < 2048u32 {
+            buffer.push_byte(unsafe ((192u32 + code / 64u32) as u8)).push_byte(unsafe ((128u32 + code % 64u32) as u8))
+        } else {
+            if code < 65536u32 {
+                buffer
+                    .push_byte(unsafe ((224u32 + code / 4096u32) as u8))
+                    .push_byte(unsafe ((128u32 + code / 64u32 % 64u32) as u8))
+                    .push_byte(unsafe ((128u32 + code % 64u32) as u8))
+            } else {
+                buffer
+                    .push_byte(unsafe ((240u32 + code / 262144u32) as u8))
+                    .push_byte(unsafe ((128u32 + code / 4096u32 % 64u32) as u8))
+                    .push_byte(unsafe ((128u32 + code / 64u32 % 64u32) as u8))
+                    .push_byte(unsafe ((128u32 + code % 64u32) as u8))
+            }
+        }
+    }
+}
+
+// Requires live bytes. The decoded allocation is consumed on every error.
+// Input UTF-8 validity is established once by tokenize before this call.
+forall 'k.
+unsafe fn toml_string(&tag: Exclusive!['k], text: Span['k], start: usize) -> Result[(Buffer!, usize, bool), TomlError] {
+    if start >= text.len() {
+        let span_result = Result[(Buffer!, usize, bool), TomlError]::Err.(TomlError::Syntax.(start));
+        return span_result;
+    }
+    let quote = span_byte_or_zero(&tag, text, start);
+    if quote != b'"' && quote != b'\'' {
+        let span_result = Result[(Buffer!, usize, bool), TomlError]::Err.(TomlError::Syntax.(start));
+        return span_result;
+    }
+    let basic = quote == b'"';
+    let multiline = if text.len() - start >= 3usize {
+        span_byte_or_zero(&tag, text, start + 1usize) == quote && span_byte_or_zero(&tag, text, start + 2usize) == quote
+    } else {
+        false
+    };
+    let opening = if multiline { 3usize } else { 1usize };
+    var i = start + opening;
+    var output = Buffer::new();
+    var error_at = start;
+    var failed = false;
+    var closed = false;
+    // A single immediately following newline is trimmed in multiline strings.
+    if multiline && i < text.len() {
+        let first = span_byte_or_zero(&tag, text, i);
+        if first == b'\n' {
+            i = i + 1usize;
+        } else {
+            if first == b'\r' && i + 1usize < text.len() {
+                if span_byte_or_zero(&tag, text, i + 1usize) == b'\n' {
+                    i = i + 2usize;
+                }
+                let unit = ();
+            }
+            let unit = ();
+        }
+    }
+    while i < text.len() && !failed && !closed {
+        let byte = span_byte_or_zero(&tag, text, i);
+        error_at = i;
+        if byte == quote {
+            var end = i;
+            var same = span_byte_or_zero(&tag, text, end) == quote;
+            while end < text.len() && same {
+                end = end + 1usize;
+                same = span_byte_or_zero(&tag, text, end) == quote;
+            }
+            let count = end - i;
+            if !multiline {
+                closed = true;
+                i = i + 1usize;
+            } else {
+                if count >= 3usize {
+                    if count > 5usize {
+                        failed = true;
+                    } else {
+                        var n = 3usize;
+                        while n < count {
+                            output = output.push_byte(quote);
+                            n = n + 1usize;
+                        }
+                        closed = true;
+                        i = end;
+                    }
+                } else {
+                    var n = 0usize;
+                    while n < count {
+                        output = output.push_byte(quote);
+                        n = n + 1usize;
+                    }
+                    i = end;
+                }
+            }
+        } else {
+            if basic && byte == b'\\' {
+                i = i + 1usize;
+                if i == text.len() {
+                    failed = true;
+                } else {
+                    let escape = span_byte_or_zero(&tag, text, i);
+                    if escape == b'u' || escape == b'U' {
+                        let count = if escape == b'u' { 4usize } else { 8usize };
+                        match unsafe toml_unicode_escape(&tag, text, i + 1usize, count) {
+                            Result::Err(error) => {
+                                failed = true;
+                            },
+                            Result::Ok(decoded) => {
+                                let (code, next) = decoded;
+                                output = toml_append_scalar(output, code);
+                                i = next;
+                            },
+                        }
+                    } else {
+                        if multiline && (escape == b' ' || escape == b'\t' || escape == b'\n' || escape == b'\r') {
+                            var newline = false;
+                            var trimming = true;
+                            while trimming && i < text.len() && !failed {
+                                let space = span_byte_or_zero(&tag, text, i);
+                                if space == b' ' || space == b'\t' {
+                                    i = i + 1usize;
+                                } else {
+                                    if space == b'\n' {
+                                        newline = true;
+                                        i = i + 1usize;
+                                    } else {
+                                        if space == b'\r' {
+                                            let crlf = if i + 1usize < text.len() {
+                                                span_byte_or_zero(&tag, text, i + 1usize) == b'\n'
+                                            } else {
+                                                false
+                                            };
+                                            if crlf {
+                                                newline = true;
+                                                i = i + 2usize;
+                                            } else {
+                                                failed = true;
+                                            }
+                                        } else {
+                                            trimming = false;
+                                        }
+                                    }
+                                }
+                            }
+                            if !newline {
+                                failed = true;
+                            }
+                            let unit = ();
+                        } else {
+                            let decoded = if escape == b'b' {
+                                8u8
+                            } else {
+                                if escape == b't' {
+                                    9u8
+                                } else {
+                                    if escape == b'n' {
+                                        10u8
+                                    } else {
+                                        if escape == b'f' {
+                                            12u8
+                                        } else {
+                                            if escape == b'r' { 13u8 } else { escape }
+                                        }
+                                    }
+                                }
+                            };
+                            let known = escape == b'b'
+                                || escape == b't'
+                                || escape == b'n'
+                                || escape == b'f'
+                                || escape == b'r'
+                                || escape == b'"'
+                                || escape == b'\\';
+                            if known {
+                                output = output.push_byte(decoded);
+                                i = i + 1usize;
+                            } else {
+                                failed = true;
+                            }
+                        }
+                    }
+                }
+            } else {
+                if byte == b'\n' {
+                    if multiline {
+                        output = output.push_byte(b'\n');
+                        i = i + 1usize;
+                    } else {
+                        failed = true;
+                    }
+                } else {
+                    if byte == b'\r' {
+                        let crlf = if i + 1usize < text.len() {
+                            span_byte_or_zero(&tag, text, i + 1usize) == b'\n'
+                        } else {
+                            false
+                        };
+                        if multiline && crlf {
+                            output = output.push_byte(b'\n');
+                            i = i + 2usize;
+                        } else {
+                            failed = true;
+                        }
+                    } else {
+                        if (byte < b' ' && byte != b'\t') || byte == 127u8 {
+                            failed = true;
+                        } else {
+                            output = output.push_byte(byte);
+                            i = i + 1usize;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let span_result = if closed && !failed {
+        Result::Ok.((output, i, multiline))
+    } else {
+        let unit = output.destroy();
+        Result::Err.(TomlError::Syntax.(error_at))
+    };
+    span_result
+}
+
+fn toml_boundary(byte: u8) -> bool {
+    byte == b' '
+        || byte == b'\t'
+        || byte == b'\n'
+        || byte == b'\r'
+        || byte == b'#'
+        || byte == b'"'
+        || byte == b'\''
+        || byte == b'='
+        || byte == b'.'
+        || byte == b','
+        || byte == b'['
+        || byte == b']'
+        || byte == b'{'
+        || byte == b'}'
+}
+
+forall 'k.
+fn toml_punctuation(byte: u8) -> Option[TomlTokenKind['k]] {
+    if byte == b'=' {
+        Option::Some.(TomlTokenKind::Equals)
+    } else {
+        if byte == b'.' {
+            Option::Some.(TomlTokenKind::Dot)
+        } else {
+            if byte == b',' {
+                Option::Some.(TomlTokenKind::Comma)
+            } else {
+                if byte == b'[' {
+                    Option::Some.(TomlTokenKind::OpenTable)
+                } else {
+                    if byte == b']' {
+                        Option::Some.(TomlTokenKind::CloseTable)
+                    } else {
+                        if byte == b'{' {
+                            Option::Some.(TomlTokenKind::OpenInline)
+                        } else {
+                            if byte == b'}' {
+                                Option::Some.(TomlTokenKind::CloseInline)
+                            } else {
+                                Option::None
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+forall 'k.
+unsafe fn toml_bare(&tag: Exclusive!['k], text: Span['k], start: usize) -> Result[(Buffer!, usize), TomlError] {
+    var end = start;
+    var scanning = true;
+    var valid = start < text.len();
+    while end < text.len() && scanning && valid {
+        let byte = span_byte_or_zero(&tag, text, end);
+        if toml_boundary(byte) {
+            scanning = false;
+        } else {
+            if byte < b' ' || byte == 127u8 {
+                valid = false;
+            } else {
+                end = end + 1usize;
+            }
+        }
+    }
+    let span_result = if valid && end > start {
+        let raw = text.skip(start).take(end - start);
+        Result::Ok.((Buffer::new().push_bytes(&tag, raw), end))
+    } else {
+        Result::Err.(TomlError::Syntax.(end))
+    };
+    span_result
+}
+
+// The owning input remains live throughout scanning; all token text is copied
+// into the supplied arena before the input is destroyed, including on error.
+forall 'k.
+fn tokenize(&tag: Exclusive!['k], &arena: Arena!['k], input: Buffer!) -> Result[List[TomlToken['k], 'k], TomlError] {
+    let p = unsafe &input.as_ptr();
+    let n = &input.len();
+    let text = unsafe Span::from_raw_parts(&tag, p, n);
+    var i = 0usize;
+    var status = Result[(), TomlError]::Ok.(());
+    var running = true;
+    while i < n && running {
+        match toml_codepoint(&tag, text, i) {
+            Result::Err(error) => {
+                status = Result[(), TomlError]::Err.(error);
+                running = false;
+            },
+            Result::Ok(decoded) => {
+                let (code, next) = decoded;
+                i = next;
+            },
+        }
+    }
+    i = 0usize;
+    var tokens = List::Empty;
+    while i < n && running {
+        let byte = unsafe raw_byte_at(p, n, i);
+        let offset = i;
+        if byte == b' ' || byte == b'\t' {
+            i = i + 1usize;
+        } else {
+            if byte == b'#' {
+                i = i + 1usize;
+                var comment = true;
+                while i < n && comment && running {
+                    let c = unsafe raw_byte_at(p, n, i);
+                    if c == b'\n' || c == b'\r' {
+                        comment = false;
+                    } else {
+                        if (c < b' ' && c != b'\t') || c == 127u8 {
+                            status = Result[(), TomlError]::Err.(TomlError::Syntax.(i));
+                            running = false;
+                        } else {
+                            i = i + 1usize;
+                        }
+                    }
+                }
+            } else {
+                if byte == b'"' || byte == b'\'' {
+                    match unsafe toml_string(&tag, text, i) {
+                        Result::Err(error) => {
+                            status = Result[(), TomlError]::Err.(error);
+                            running = false;
+                        },
+                        Result::Ok(decoded) => {
+                            let (buffer, next, multiline) = decoded;
+                            let value = save_buffer(&arena, buffer);
+                            tokens = tokens.cons(&tag, &arena, TomlToken.{ kind: TomlTokenKind::Text.(value), offset, multiline });
+                            i = next;
+                        },
+                    }
+                } else {
+                    let punctuation = toml_punctuation['k](byte);
+                    let kind: Result[TomlTokenKind['k], TomlError] = match punctuation {
+                        Option::Some(value) => {
+                            i = i + 1usize;
+                            Result::Ok.(value)
+                        },
+                        Option::None => {
+                            if byte == b'\n' {
+                                i = i + 1usize;
+                                Result::Ok.(TomlTokenKind::Newline)
+                            } else {
+                                if byte == b'\r' {
+                                    let crlf = if i + 1usize < n {
+                                        unsafe raw_byte_at(p, n, i + 1usize) == b'\n'
+                                    } else {
+                                        false
+                                    };
+                                    if crlf {
+                                        i = i + 2usize;
+                                        Result::Ok.(TomlTokenKind::Newline)
+                                    } else {
+                                        Result::Err.(TomlError::Syntax.(i))
+                                    }
+                                } else {
+                                    match unsafe toml_bare(&tag, text, i) {
+                                        Result::Err(error) => Result::Err.(error),
+                                        Result::Ok(decoded) => {
+                                            let (buffer, next) = decoded;
+                                            let value = save_buffer(&arena, buffer);
+                                            i = next;
+                                            Result::Ok.(TomlTokenKind::Bare.(value))
+                                        },
+                                    }
+                                }
+                            }
+                        },
+                    };
+                    match kind {
+                        Result::Err(error) => {
+                            status = Result[(), TomlError]::Err.(error);
+                            running = false;
+                        },
+                        Result::Ok(value) => {
+                            tokens = tokens.cons(&tag, &arena, TomlToken.{ kind: value, offset, multiline: false });
+                        },
+                    }
+                }
+            }
+        }
+    }
+    let unit = input.destroy();
+    match status {
+        Result::Err(error) => Result::Err.(error),
+        Result::Ok(unit) => {
+            let ordered = tokens.reverse(&tag, &arena, List::Empty);
+            Result::Ok.(ordered)
+        },
+    }
+}

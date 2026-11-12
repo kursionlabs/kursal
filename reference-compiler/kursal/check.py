@@ -36,7 +36,8 @@ SEALED = ("Copy", "builtin::")      # compiler-reserved trait names: no user tra
 
 
 def contains(ty: Type, pred: Callable[[Type], bool]) -> bool:
-    return pred(ty) or any(contains(t, pred) for t in children(ty))
+    """`pred` holds somewhere in the value representation of `ty`: a pointer's target is not part of it."""
+    return pred(ty) or not isinstance(ty, Ptr) and any(contains(t, pred) for t in children(ty))
 
 
 class CheckError(KursError):
@@ -669,8 +670,9 @@ class Checker:
         return instr.ty
 
     def uncastable(self, ty: Type) -> bool:
-        """What no unsafe operation may conjure: a package, a brand witness, a function value, a transform,
-        a value of an abstract type parameter, or Never."""
+        """What no unsafe cast may conjure in a value: a package, a brand witness, a function value, a
+        transform, a value of an abstract type parameter, or Never. Behind a pointer, reading any of them
+        is a separate unsafe operation."""
         return isinstance(ty, (Exists, Brand, Fn, Foreach, Never)) or \
             isinstance(ty, Named) and not ty.args and ty.name in self.kinds
 
@@ -894,13 +896,9 @@ class Checker:
             self.fail("foreach_source_not_exposed")
         if not self.types.pattern_available(t, self.module, self.kinds):
             self.fail("foreach_pointer_pattern_requires_pointer_components")
-        if not self.concrete_product(t.source):
-            self.fail("foreach_source_is_a_concrete_struct_tuple_or_enum")
         mapper = self.program.funs.get(instr.args[1])
         if mapper is None:
             self.fail("unknown_mapper")
-        if mapper.premises or len(instr.args) > 2:
-            self.fail("foreach_mapper_without_premises_or_captures")
         binders = foreach_binders(t)
         if len(mapper.params) != len(binders) + len(instr.tys) or mapper.places:
             self.fail("mapper_takes_traversal_binders")
@@ -927,15 +925,6 @@ class Checker:
             self.fail("foreach_capture_count_disagrees")
         self.authorize(instr, mapper.unsafe)
         return t
-
-    def concrete_product(self, source: Type) -> bool:
-        """A struct, tuple or enum whose shape is known here, or a pointer to one: not an array, a type
-        parameter, or another transform."""
-        if isinstance(source, Ptr):
-            source = source.inner
-        if isinstance(source, Foreach) or isinstance(source, Named) and source.name in self.kinds:
-            return False
-        return isinstance(self.types.shape(source, self.module), (Struct, Tuple, Enum))
 
     # ------------------------------------------------------- terminators --
 

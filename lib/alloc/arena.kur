@@ -1,0 +1,403 @@
+// alloc::arena -- a bump allocator over a chain of heap chunks (not one
+// contiguous buffer, unlike `Vec!`). `Arena::new` mints one brand `'k` and
+// the arena keeps it for its whole life: `alloc` never rebrands, so a `Ref`
+// obtained before a later allocation (even one that starts a new chunk)
+// stays valid. The whole arena is freed as a unit by `Arena::destroy`, the
+// only place its memory goes away.
+//
+// The `Allocation!`/`RegionResume!` pair in `Arena!` covers the ROOT chunk's
+// data buffer only. An `Allocation!` is the right to free one block, and an
+// arena is many blocks under one brand, so no single record can stand for
+// all of it. `destroy` consumes the caller's `Exclusive!['k]` through
+// `RegionResume::resume`, passes the rebuilt region to
+// `Allocation::release`, and frees the root buffer at the extent the
+// allocator recorded. Chunks 2..n are allocated and freed inside this
+// module, appear in no public signature, and are tracked by raw pointers.
+//
+// Unlike `Owned!` or `Vec!`, an arena does not track what it contains: it
+// holds any number of values of different types with no way to walk them.
+// `destroy` therefore cannot route every contained value through a
+// consumer, and a linear value stored in an arena and never read back out
+// leaks. Arenas are meant for `Copy` node data forming self-referential
+// structures; their safety is aliasing safety through `Exclusive!`/`Ref`,
+// not per-node linearity.
+//
+// `Chunk` and `Arena!` are restricted, so no other module can construct or
+// destructure them. Forging an `Arena!` would pair a chunk chain with a
+// brand it does not own, letting `alloc` hand out `'k` refs over foreign
+// memory and `destroy` free a chain it never built; a forged `Chunk`'s
+// `next`/`cap` would drive `free_chain_after_root_release`'s walk.
+
+use package as alloc;
+
+use alloc::heap::Uninit;
+use alloc::heap::HeapAllocator;
+use core::cap::Exclusive;
+use core::mem::Ref;
+use alloc::owned::Allocation;
+use core::mem::Region;
+use core::mem::RegionResume;
+use alloc::buffer::Buffer;
+use core::raw::Span;
+
+struct Chunk {
+    data: *u8,
+    used: usize,
+    cap: usize,
+    next: *Chunk,
+}
+
+// `root`/`back` describe the root chunk's data buffer -- the block
+// `Arena::new` allocates, over which `'k` was minted (see the module comment
+// for why only the root). `current` is the head of the chunk chain, and
+// `marker` is the same brand as a value, which `alloc` needs to brand the
+// pointers it computes.
+forall 'k.
+struct Arena! {
+    root: Allocation![u8, 'k],
+    back: RegionResume![u8, 'k],
+    current: *Chunk,
+    marker: Brand['k],
+}
+
+// An arena-owned, fixed-capacity byte run whose public length is exactly
+// the initialized prefix. No safe operation exposes its raw destination.
+forall 'k.
+struct ArenaByteWriter! {
+    arena: Arena!['k],
+    ptr: *u8,
+    capacity: usize,
+    filled: usize,
+}
+
+forall 'k.
+struct ArenaBytes {
+    ptr: *u8,
+    len: usize,
+    marker: Brand['k],
+}
+
+forall 'k.
+impl ArenaBytes['k] {
+    // The unchanged pointer and initialized extent. Dereferencing this
+    // address still requires unsafe; the writer has already finished.
+    fn into_parts(self) -> (*u8, usize) {
+        let { ptr, len, marker } = self;
+        (ptr, len)
+    }
+}
+
+// For every supported layout, sizeof[T] is a multiple of alignof[T].
+// Therefore sizeof[{ u8, T }] - sizeof[T] is exactly alignof[T]: the
+// prefix forces the value to the next aligned offset, while the
+// aggregate's trailing padding makes its total size `align + size`.
+// This gives generic library code a target-correct alignment query using
+// the existing `sizeof` primitive.
+//
+// `AlignProbe` is never constructed; `type_align` only takes its `sizeof`.
+// It needs no `!` because its linearity follows `T`'s.
+forall T.
+exposed struct AlignProbe {
+    prefix: u8,
+    value: T,
+}
+
+forall T.
+fn type_align() -> usize {
+    sizeof[AlignProbe[T]]() - sizeof[T]()
+}
+
+// `alignment` is a power of two (`type_align`'s C alignment), so the
+// padding up to the next multiple of it is a mask rather than a division.
+fn padding_for(used: usize, alignment: usize) -> usize {
+    (0usize - used) & (alignment - 1usize)
+}
+
+// Check capacity by subtraction so wrapping usize addition cannot make an
+// out-of-bounds allocation appear to fit.
+fn has_room(used: usize, cap: usize, padding: usize, need: usize) -> bool {
+    if used > cap {
+        false
+    } else {
+        let remaining = cap - used;
+        if padding > remaining {
+            false
+        } else {
+            need <= remaining - padding
+        }
+    }
+}
+
+// Address `off` bytes into a `*u8` buffer: pointers have no arithmetic of
+// their own, so this casts to `usize`, adds, and casts back.
+unsafe fn byte_ptr_at(base: *u8, off: usize) -> *u8 {
+    let addr = unsafe (base as usize);
+    let addr2 = addr + off;
+    unsafe (addr2 as *u8)
+}
+
+// Allocates the chunk header for an already-allocated data buffer. Kept
+// separate from `new_chunk` so that `Arena::new` can pass the root buffer's
+// `Uninit!` straight to `Allocation::adopt`, which records the allocator's
+// extent.
+//
+// The header is a small, separate heap allocation (simpler than packing
+// it into the front of `data`, at the cost of one extra alloc/drop pair
+// per chunk), and is arena-private in every chunk including the root.
+unsafe fn new_header(data: *u8, cap: usize, next: *Chunk) -> *Chunk {
+    let hdr_uninit = HeapAllocator::alloc(sizeof[Chunk]());
+    let hdr_bytes = hdr_uninit.into_raw();
+    let hdr = unsafe (hdr_bytes as *Chunk);
+    let zero = 0usize;
+    unsafe *hdr = Chunk.{ data, used: zero, cap, next };
+    hdr
+}
+
+// A fresh chunk ahead of `next`, the current one, with room for at least
+// `min_cap` bytes: twice `next`'s capacity up to 1 MiB, so a small arena
+// stays small and a large one takes few chunks, or bigger if the single
+// allocation that triggered growth needs more than that on its own. Used
+// for chunks 2..n only (`Arena::new` builds the root itself, because the
+// root's buffer is the tracked one); its data buffer never becomes an
+// `Allocation!` and is freed by `free_chain_after_root_release`.
+//
+// Requires: `next` is the arena's live current chunk.
+unsafe fn new_chunk(min_cap: usize, next: *Chunk) -> *Chunk {
+    let { data: _, used: _, cap: next_cap, next: _ } = unsafe *next;
+    let max_cap = 1048576usize;
+    let doubled = if next_cap >= max_cap / 2usize {
+        max_cap
+    } else {
+        next_cap * 2usize
+    };
+    let base_cap = if doubled > 4096usize {
+        doubled
+    } else {
+        4096usize
+    };
+    let cap = if min_cap > base_cap { min_cap } else { base_cap };
+    let data_uninit = HeapAllocator::alloc(cap);
+    let data = data_uninit.into_raw();
+    unsafe new_header(data, cap, next)
+}
+
+// Reserves `need` bytes at `alignment` in `cur`, growing into a new chunk
+// when it lacks room, and returns the chunk the bytes are in and their
+// address. Everything in `Arena::alloc` that does not depend on its `T`,
+// kept out of it so each instantiation stays a few statements.
+//
+// Requires: `cur` is the arena's live current chunk.
+unsafe fn bump_chunk(cur: *Chunk, need: usize, alignment: usize) -> (*Chunk, *u8) {
+    let { data: d, used: u, cap: c, next: n } = unsafe *cur;
+    let padding = padding_for(u, alignment);
+    if has_room(u, c, padding, need) {
+        let start = u + padding;
+        unsafe *cur = Chunk.{ data: d, used: start + need, cap: c, next: n };
+        (cur, unsafe byte_ptr_at(d, start))
+    } else {
+        let fresh = unsafe new_chunk(need, cur);
+        let { data: d2, used: u2, cap: c2, next: n2 } = unsafe *fresh;
+        let start = u2 + padding_for(u2, alignment);
+        unsafe *fresh = Chunk.{ data: d2, used: start + need, cap: c2, next: n2 };
+        (fresh, unsafe byte_ptr_at(d2, start))
+    }
+}
+
+// Frees every chunk's header, plus every non-root chunk's data buffer.
+//
+// Precondition: `Arena::destroy` has already freed the root chunk's data
+// buffer through `Allocation::release` + `HeapAllocator::drop`, so freeing
+// it here would be a double free. The walk skips exactly the root because
+// the root is the chain's tail: `new_chunk` prepends (it stores
+// `next: cur`), `Arena::new` builds the root with a null `next`, and
+// nothing else writes a chunk's `next`, so `next == null` holds for the
+// root alone.
+unsafe fn free_chain_after_root_release(c: *Chunk) -> () {
+    let z = 0usize;
+    let nullc = unsafe (z as *Chunk);
+    var cur = c;
+    while cur != nullc {
+        let { data: d, used: u, cap: cc, next: n } = unsafe *cur;
+        let u2 = if n == nullc {
+            ()
+        } else {
+            HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(d))
+        };
+        let hb = unsafe (cur as *u8);
+        let u3 = HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(hb));
+        cur = n;
+    }
+}
+
+impl Arena {
+    fn new() -> exists '1. (Exclusive!['1], Arena!['1]) {
+        let z = 0usize;
+        let nullchunk = unsafe (z as *Chunk);
+        let cap = 4096usize;
+        // The root chunk's data buffer goes straight from the allocator into
+        // `Allocation::adopt`, which mints and seals a fresh brand.
+        let exists 'open1. (a, rg) = Allocation::adopt[u8](HeapAllocator::alloc(cap));
+        let (tag, base_ref, bk) = rg.share();
+        // `share` hands the brand out inside the `Ref`; `Arena!` keeps it as
+        // a value in `marker`, because `alloc` brands pointers this module
+        // computes itself.
+        let (d, am) = base_ref.into_parts();
+        let c = unsafe new_header(d, cap, nullchunk);
+        pack 'open1. (tag, Arena.{ root: a, back: bk, current: c, marker: am })
+    }
+}
+
+forall 'k.
+impl Arena['k] {
+    // The arena's brand, for a container that lives in its domain
+    // (`ArenaMap::new`). Holding the arena is what entitles a caller to
+    // put new objects in its domain; the capability alone never does.
+    fn marker(&self) -> Brand['k] {
+        self.marker
+    }
+
+    // Allocates naturally aligned room for one `T`, writes `val` into it,
+    // and hands back a `Ref` under the arena's own, never-changing brand --
+    // growing into a fresh chunk first if the current one doesn't have room
+    // for both alignment padding and the value, but never rebranding either
+    // way.
+    forall T.
+    fn alloc(&self, &tag: Exclusive!['k], val: T) -> Ref[T, 'k] {
+        let { root: a, back: bk, current: cur, marker: m } = self;
+        let (cur2, target) = unsafe bump_chunk(cur, sizeof[T](), type_align[T]());
+        let target_t = unsafe (target as *T);
+        unsafe *target_t = val;
+        // `target_t` was just carved out of this arena's own chunk and
+        // initialized; the arena's chunks are the domain `m` names.
+        let r = unsafe Ref::from_raw(target_t, m);
+        // `root`/`back` pass through untouched: growth adds a chunk rather
+        // than moving the root, so the result keeps the same brand `'k`
+        // whether or not growth happened, and this signature needs no
+        // `exists` (unlike `Vec::push`, which may relocate its one block).
+        self = Arena.{ root: a, back: bk, current: cur2, marker: m };
+        r
+    }
+
+    // Frees every chunk. See the module comment for why this cannot route
+    // every contained value through a consumer the way `Vec!`'s teardown
+    // does.
+    //
+    // The caller's witness is consumed by real work: `resume` demands this
+    // exact `Exclusive!['k]` and rebuilds the root chunk's `Region![u8,'k]`,
+    // `release` demands that complete region and returns the `Uninit!` whose
+    // base and extent `Allocation::adopt` read off the allocator, and `drop`
+    // frees it. No `Ref` is constructed on the path. The remaining headers
+    // and non-root buffers are freed by `free_chain_after_root_release`.
+    fn destroy(self, tag: Exclusive!['k]) -> () {
+        let { root: a, back: bk, current: cur, marker: m } = self;
+        let rg = bk.resume(tag);
+        let u = a.release(rg);
+        let u2 = HeapAllocator::drop(u);
+        unsafe free_chain_after_root_release(cur)
+    }
+
+    // Bump-allocates `n` raw, uninitialized bytes and returns a bare
+    // pointer, with no brand. For a caller with a finished, exact-length run
+    // of bytes to copy in once (e.g. built in a scratch `Buffer!`), so the
+    // result can be read many times without linear tracking. Unlike `alloc`,
+    // nothing is written; the caller copies the bytes in (see `copy_bytes`).
+    // No alignment padding is added.
+    unsafe fn alloc_bytes(&self, n: usize) -> *u8 {
+        let { root: a, back: bk, current: cur, marker: m } = self;
+        let { data: d, used: u, cap: c, next: nx } = unsafe *cur;
+        let fits = has_room(u, c, 0usize, n);
+        let cur2 = if fits {
+            cur
+        } else {
+            unsafe new_chunk(n, cur)
+        };
+        let { data: d2, used: u2, cap: c2, next: n2 } = unsafe *cur2;
+        let target = unsafe byte_ptr_at(d2, u2);
+        let u3 = u2 + n;
+        unsafe *cur2 = Chunk.{ data: d2, used: u3, cap: c2, next: n2 };
+        self = Arena.{ root: a, back: bk, current: cur2, marker: m };
+        target
+    }
+}
+
+// `buffer`'s bytes copied into the arena, as a span that lives as long as
+// the arena; the buffer is freed.
+forall 'k.
+fn save_buffer(&arena: Arena!['k], buffer: Buffer!) -> Span['k] {
+    let p = unsafe &buffer.as_ptr();
+    let n = &buffer.len();
+    let dest = unsafe &arena.alloc_bytes(n);
+    let u = unsafe copy_bytes(dest, p, n);
+    let u2 = buffer.destroy();
+    unsafe Span::from_raw_parts_branded(dest, n, arena.marker)
+}
+
+forall 'k.
+fn arena_byte_writer(arena: Arena!['k], capacity: usize) -> ArenaByteWriter!['k] {
+    let ptr = unsafe Arena::alloc_bytes['k](&arena, capacity);
+    ArenaByteWriter.{ arena, ptr, capacity, filled: 0usize }
+}
+
+forall 'k.
+impl ArenaByteWriter['k] {
+    fn remaining(&self) -> usize {
+        let { capacity, filled, ..rest } = self;
+        self = ArenaByteWriter.{ capacity, filled, ..rest };
+        capacity - filled
+    }
+
+    fn push(&self, byte: u8) -> bool {
+        let { ptr, capacity, filled, ..rest } = self;
+        if filled >= capacity {
+            self = ArenaByteWriter.{ ptr, capacity, filled, ..rest };
+            false
+        } else {
+            let dest = unsafe byte_ptr_at(ptr, filled);
+            unsafe *dest = byte;
+            self = ArenaByteWriter.{ ptr, capacity, filled: filled + 1usize, ..rest };
+            true
+        }
+    }
+
+    // FFI-only pair: an external writer must report how many bytes it
+    // actually initialized before those bytes become part of the span.
+    unsafe fn writable_tail(&self) -> (*u8, usize) {
+        let { ptr, capacity, filled, ..rest } = self;
+        let dest = unsafe byte_ptr_at(ptr, filled);
+        let remaining = capacity - filled;
+        self = ArenaByteWriter.{ ptr, capacity, filled, ..rest };
+        (dest, remaining)
+    }
+
+    unsafe fn commit_external(&self, count: usize) -> bool {
+        let { capacity, filled, ..rest } = self;
+        if count > capacity - filled {
+            self = ArenaByteWriter.{ capacity, filled, ..rest };
+            false
+        } else {
+            self = ArenaByteWriter.{ capacity, filled: filled + count, ..rest };
+            true
+        }
+    }
+
+    fn finish(self) -> (Arena!['k], ArenaBytes['k]) {
+        let { arena, capacity, filled, ..rest } = self;
+        let { root, back, current, marker } = arena;
+        let arena = Arena.{ root, back, current, marker };
+        (arena, ArenaBytes.{ len: filled, marker, ..rest })
+    }
+}
+
+// Copies `count` bytes from `src` to `dest`, byte by byte (the same loop as
+// `alloc::buffer::Buffer::push_n`). `alloc_bytes` only reserves room, so its
+// callers copy with this.
+unsafe fn copy_bytes(dest: *u8, src: *u8, count: usize) -> () {
+    var i = 0usize;
+    while i < count {
+        let s = unsafe byte_ptr_at(src, i);
+        let v = unsafe *s;
+        let d = unsafe byte_ptr_at(dest, i);
+        unsafe *d = v;
+        i = i + 1usize;
+    }
+}

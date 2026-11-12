@@ -382,7 +382,7 @@ fn main() -> i32 {
     let f = |amount: u32, &cur: Cur| -> u32 { add(amount + bias, &cur) };
     let x = f(2, &c);
     let p = Pair.{ a: 2, b: 3 };
-    let mapped = foreach item of p { (item, 4u32) };
+    let mapped = foreach item of p { (item, bias) };
     let { a, b } = mapped;
     let (av, ac) = a;
     let (bv, bc) = b;
@@ -398,7 +398,7 @@ fn main() -> i32 {
         let inner = |y: u32| b * 100 + a * 10 + x + y;
         inner(2) + b
     };
-    let mapped = foreach item of (1u32, 2u32) { (item, 7u32, 3u32, 7u32) };
+    let mapped = foreach item of (1u32, 2u32) { (item, b, a, b) };
     let (left, right) = mapped;
     let (p, q, r, s) = left;
     (((outer(a) + p + q + r + s) % 251u32) as i32)

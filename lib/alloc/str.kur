@@ -1,0 +1,154 @@
+// alloc::str -- building strings out of byte views. A string literal is a
+// `Slice[u8,'static]`, read with `StaticRead`; a slice over a freeable
+// allocation (such as an opened `Buffer!`) carries its own brand and is read
+// through that brand's capability. Compare either kind with
+// `core::slice::bytes_eq`.
+//
+// Templates are built piece by piece: `push_literal`/`push_piece` append one
+// segment each to a `Vec![u8,'k]` accumulator and `finish` turns it into a
+// `Buffer!`. Each piece is read and copied immediately, so pieces with
+// unrelated brands never have to be stored together (a `Vec!` holds one
+// element type, so it cannot hold slices of different brands).
+
+use package as alloc;
+
+use alloc::heap::Uninit;
+use core::cap::Exclusive;
+use core::mem::Ref;
+use core::slice::{Slice, StaticRead, byte_or_zero};
+use core::option::Option;
+use alloc::buffer::Buffer;
+use alloc::buffer::BufferRestore;
+use alloc::collections::vec::Vec;
+use alloc::owned::Allocation;
+use core::mem::Region;
+
+// `a` followed by `b`, in a new buffer of exactly their combined length.
+// Open the result with `Buffer::open` to read it, then `restore` and
+// `destroy` it like any other `Buffer!`.
+fn concat(a: Slice[u8, 'static], b: Slice[u8, 'static]) -> Buffer! {
+    let sr = StaticRead::get();
+    let an = a.len();
+    let bn = b.len();
+    let total = an + bn;
+    // `new_zeroed` makes every index of the opened slice addressable; the
+    // two loops below overwrite all of `[0, total)`.
+    let buf = Buffer::new_zeroed(total);
+    let exists 'open1. (tag, s, restore) = buf.open();
+
+    var tag = tag;
+    var i = 0usize;
+    while i < an {
+        let v = byte_or_zero(&sr, a, i);
+        let rdo = s.get_ref(&tag, i);
+        let old = match rdo {
+            Option::Some(rd) => rd.with(&tag, |x: u8| (v, x)),
+            Option::None => 0u8,
+        };
+        i = i + 1usize;
+        tag = tag;
+    }
+    var j = 0usize;
+    while j < bn {
+        let v = byte_or_zero(&sr, b, j);
+        let rd2o = s.get_ref(&tag, an + j);
+        let old2 = match rd2o {
+            Option::Some(rd2) => rd2.with(&tag, |x: u8| (v, x)),
+            Option::None => 0u8,
+        };
+        j = j + 1usize;
+        tag = tag;
+    }
+    restore.restore(tag)
+}
+
+// Appends the bytes of literal `s` to `acc`.
+//
+// Copies through one `Vec::reserve_n` call rather than one `Vec::push` per
+// byte. `push` returns its vector under a fresh existential brand on every
+// call, and a loop's back edge (or an `if`'s two arms) would then join two
+// different brands, which the checker rejects. `reserve_n` mints once for
+// the whole batch and returns a `Slice` view of the extended buffer; writing
+// through that view with `get_ref`/`Ref::with` keeps the same brand on every
+// iteration, so a plain `while` loop works. The brand `reserve_n` mints is
+// returned sealed and becomes this function's `'2`.
+forall 'k.
+fn push_literal(acc: Vec![u8, 'k], tag: Exclusive!['k], s: Slice[u8, 'static]) -> exists '2. (Exclusive!['2], Vec![u8, '2]) {
+    let sr = StaticRead::get();
+    let n = s.len();
+    // `reserve_n` requires every slot in `[old_len, old_len + n)` to be
+    // written before any is read. The loop below writes exactly those slots
+    // and reads none of them (`Ref::with`'s old value goes to `old`, unused);
+    // its bound is the same `n` passed to `reserve_n`.
+    let exists 'open1. (tag, acc2, view, old_len) = unsafe acc.reserve_n(tag, n);
+    var tag = tag;
+    var i = 0usize;
+    while i < n {
+        let b = byte_or_zero(&sr, s, i);
+        let rvo = view.get_ref(&tag, old_len + i);
+        let old = match rvo {
+            Option::Some(rv) => rv.with(&tag, |x: u8| (b, x)),
+            Option::None => 0u8,
+        };
+        i = i + 1usize;
+        tag = tag;
+    }
+    pack 'open1. (tag, acc2)
+}
+
+// Appends the bytes of `piece`, whose brand `'k2` is independent of the
+// accumulator's `'k`. Returns `piece_tag` so the caller can restore and
+// destroy the piece's `Buffer!`, if it came from one. Same
+// `reserve_n`-then-fill shape as `push_literal`: the piece is only read, so
+// `piece_tag` passes through the loop unchanged, and the accumulator's fresh
+// brand comes back sealed from `reserve_n`.
+forall 'k, 'k2.
+fn push_piece(acc: Vec![u8, 'k], acc_tag: Exclusive!['k], piece_tag: Exclusive!['k2], piece: Slice[u8, 'k2]) -> exists '2. (
+    Exclusive!['2],
+    Vec![u8, '2],
+    Exclusive!['k2],
+) {
+    let n = piece.len();
+    // `reserve_n`'s obligation is discharged as in `push_literal`: the loop
+    // writes every slot `old_len .. old_len + n` before reading any, and `n`
+    // is the same `piece.len()` passed to `reserve_n`. Its reads are all of
+    // `piece`, under `'k2`, never of the reserved region.
+    let exists 'open1. (acc_tag, acc2, view, old_len) = unsafe acc.reserve_n(acc_tag, n);
+    var acc_tag = acc_tag;
+    var piece_tag = piece_tag;
+    var i = 0usize;
+    while i < n {
+        let ro = piece.get_ref(&piece_tag, i);
+        let b = match ro {
+            Option::Some(r) => r.copy(&piece_tag),
+            Option::None => 0u8,
+        };
+        let rvo = view.get_ref(&acc_tag, old_len + i);
+        let old = match rvo {
+            Option::Some(rv) => rv.with(&acc_tag, |x: u8| (b, x)),
+            Option::None => 0u8,
+        };
+        i = i + 1usize;
+        acc_tag = acc_tag;
+        piece_tag = piece_tag;
+    }
+    pack 'open1. (acc_tag, acc2, piece_tag)
+}
+
+// Turns the accumulator into a `Buffer!` holding the same bytes, with no copy
+// and no further allocation.
+//
+// `from_owned_ptr`'s obligation holds: the pointer comes from
+// `Allocation::release`, so it is the base of a live heap block that this
+// call owns outright, and the region `into_region` returned was consumed by
+// `release`, so no `Ref` of the vector's brand can still reach it. The first
+// `n` bytes are the vector's initialized elements. `cap` is passed as `n`,
+// which may understate the vector's real capacity; `Buffer::destroy` frees
+// by `ptr` alone, and growth re-allocates from whatever `cap` says.
+forall 'k.
+fn finish(acc: Vec![u8, 'k], tag: Exclusive!['k]) -> Buffer! {
+    let (a, rg, n) = acc.into_region(tag);
+    let u = a.release(rg);
+    let raw = u.into_raw();
+    unsafe Buffer::from_owned_ptr(raw, n, n)
+}

@@ -77,21 +77,20 @@ class ExposureTests(unittest.TestCase):
         program.funs["walk"].module = OWNER
         check_program(program)
 
-    def test_a_type_parameter_is_not_a_foreach_source(self):
+    def test_generic_foreach_requires_exact_premise(self):
         program = declarations()
         program.funs = {"identity": identity(), "walk": traversal(T, CLIENT, (C.Param("T"),))}
         with self.assertRaisesRegex(KursError, "foreach_source_not_exposed"):
             check_program(program)
         program.funs["walk"].premises = (exposed(T),)
-        with self.assertRaisesRegex(KursError, "foreach_source_is_a_concrete_struct_tuple_or_enum"):
-            check_program(program)
+        check_program(program)
 
     def test_mapper_cannot_smuggle_component_exposure(self):
         program = declarations()
         mapper = identity()
         mapper.premises = (exposed(F),)
         program.funs = {"identity": mapper, "walk": traversal(C.Tuple((C.U32,)), CLIENT)}
-        with self.assertRaisesRegex(KursError, "foreach_mapper_without_premises_or_captures"):
+        with self.assertRaisesRegex(KursError, "unsatisfied_premise"):
             check_program(program)
 
     def test_call_cannot_forge_exposure_and_backend_does_not_reauthorize(self):

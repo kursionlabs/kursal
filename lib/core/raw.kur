@@ -1,0 +1,324 @@
+// core::raw -- bounds-checked indexing over a flat buffer given as a plain
+// `*T` plus a length. The unsafe cast-to-usize / integer-math /
+// cast-back-and-dereference idiom lives here once, behind a bounds check.
+// These are not capability-gated accessors like `Slice::get_ref`: a caller
+// that has flattened a structure to `*T` + `len` can peek into it without
+// threading a live `Exclusive!` through every read. The caller still
+// vouches (hence `unsafe fn`) that `len` really bounds the buffer.
+//
+// `T: Copy` is required: reading a value out of raw memory by index, with
+// no tracking of whether that slot's value has already been read, is only
+// sound for values that can be freely duplicated. A linear `T` read this
+// way could be duplicated through two reads with nothing to catch it.
+
+use package as core;
+
+use core::option::Option;
+use core::slice::{Slice, ReadBytes};
+use core::cap::{Exclusive, Shared, Stamp};
+use core::hash::HashState;
+
+// Address of the i-th `T` in a flat buffer starting at `base`. Pure
+// address math: nothing is read, and nothing checks that `i` is in range.
+forall T.
+unsafe fn elem_ptr(base: *T, i: usize) -> *T {
+    let addr = unsafe (base as usize);
+    let off = i * sizeof[T]();
+    let addr2 = addr + off;
+    unsafe (addr2 as *T)
+}
+
+// Bounds-checked read: `None` past `len`, `Some(value)` otherwise.
+forall T where Copy[T].
+unsafe fn raw_get(base: *T, len: usize, i: usize) -> Option[T] {
+    if i < len {
+        Option::Some.(unsafe *(unsafe elem_ptr(base, i)))
+    } else {
+        Option::None
+    }
+}
+
+// Bounds-checked byte read: out of range reads come back as `0u8` (NUL)
+// rather than an `Option[u8]`, for scanners whose character-class tests
+// already treat `0u8` as matching nothing.
+unsafe fn raw_byte_at(base: *u8, len: usize, i: usize) -> u8 {
+    if i < len {
+        unsafe *(unsafe elem_ptr(base, i))
+    } else {
+        0u8
+    }
+}
+
+// Bounds-checked write: writes `val` at index `i` if `i < len`, and
+// silently does nothing otherwise. `T: Copy` for the mirror image of
+// `raw_get`'s reason: overwriting a slot by index never consumes the value
+// that was there, which would leak a linear one. The bounds check turns an
+// off-by-one into a no-op instead of memory corruption; it is not meant to
+// be inspected, so there is no result.
+forall T where Copy[T].
+unsafe fn raw_set(base: *T, len: usize, i: usize, val: T) -> () {
+    if i < len {
+        unsafe *(unsafe elem_ptr(base, i)) = val;
+    } else {
+        ()
+    }
+}
+
+// Bounds-checked byte write, as `raw_set` for `u8`.
+unsafe fn raw_byte_set(base: *u8, len: usize, i: usize, val: u8) -> () {
+    if i < len {
+        unsafe *(unsafe elem_ptr(base, i)) = val;
+    } else {
+        ()
+    }
+}
+
+// A source position. `file` is a raw NUL-terminated C string pointer,
+// typically straight into the process's `argv`: never copied, allocated or
+// freed here. `argv` strings live for the whole process, so a `Pos` may be
+// held for as long as needed. A plain `{*u8, u32, u32}` value with no
+// dependencies, so it lives in `core`.
+exposed struct Pos {
+    file: *u8,
+    line: u32,
+    col: u32,
+}
+
+// A byte range into some live text buffer, as `{ptr, len}`.
+//
+// Branded and restricted: a span names bytes in domain 'k, and only this
+// module can build one or see its pointer. Reading the bytes needs the
+// domain's capability (`span_bytes_eq`, `span_byte_or_zero`, `ReadBytes`,
+// ...), so a span cannot be read once its arena's `Exclusive!['k]` is
+// gone. `marker: Brand['k]` costs nothing at runtime (`Brand` is Copy,
+// with size 0 and alignment 1) and does not make `Span` linear.
+// Literals enter a domain through `Span::from_static`; spans over memory
+// the caller just filled use `unsafe Span::from_raw_parts`. Both take the
+// domain's capability, never a loose brand: only `builtin::fresh` makes a
+// brand witness, so a span cannot be planted in a domain nobody holds.
+forall 'k.
+struct Span {
+    ptr: *u8,
+    len: usize,
+    marker: Brand['k],
+}
+
+// Byte-for-byte equality of two raw buffers. Takes no capability: a caller
+// may hold bytes that are alive by construction with no witness in scope.
+// `unsafe`: `len` must bound both `a` and `b`; `raw_byte_at`'s bounds
+// check only guards against `len`, so a wrong `len` reads out of bounds.
+// Compares the first `i` bytes, last byte first: names of one length
+// usually differ at the end (`t_17` and `t_18`, `a::b::x` and `a::b::y`).
+unsafe fn raw_span_bytes_eq(a: *u8, b: *u8, len: usize, i: usize) -> bool {
+    if i == 0usize {
+        true
+    } else {
+        let j = i - 1usize;
+        let ca = unsafe raw_byte_at(a, len, j);
+        let cb = unsafe raw_byte_at(b, len, j);
+        if ca == cb {
+            unsafe raw_span_bytes_eq(a, b, len, j)
+        } else {
+            false
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Capability-checked span access. A `Span['k]` describes bytes in domain
+// 'k; reading them needs that domain's capability, exactly like
+// `core::slice::Slice` (`ReadBytes`). For spans over text in an arena (or
+// permanent literals branded into the same domain), the arena's
+// `Exclusive!['k]` is the capability, and it stops existing when
+// `alloc::arena::Arena::destroy` consumes it.
+
+forall 'k.
+impl Span['k] {
+    // The checked way to build a span. `unsafe`: the caller vouches that
+    // `ptr[0 .. len)` is initialized and stays readable for as long as the
+    // domain 'k's capability exists.
+    unsafe fn from_raw_parts(&cap: Exclusive!['k], ptr: *u8, len: usize) -> Span['k] {
+        let stamp = &cap.stamp();
+        let { marker } = stamp;
+        Span.{ ptr, len, marker }
+    }
+
+    // The same, for a module whose own object already carries the domain's
+    // brand (an arena's `marker`, set once from `Exclusive::fresh`).
+    // `unsafe` as above, and `marker` must be a witness that object really
+    // holds: a span planted in someone else's domain reads their bytes.
+    unsafe fn from_raw_parts_branded(ptr: *u8, len: usize, marker: Brand['k]) -> Span['k] {
+        Span.{ ptr, len, marker }
+    }
+
+    // The pointer and length back; rebuilding a span from them needs
+    // `from_raw_parts` again. The brand stays inside: a span may be made
+    // from the capability alone, so it must not hand out a witness.
+    fn into_parts(self) -> (*u8, usize) {
+        let { ptr, len, marker } = self;
+        (ptr, len)
+    }
+
+    // No bytes at all; nothing to read.
+    fn empty(&cap: Exclusive!['k]) -> Span['k] {
+        let stamp = &cap.stamp();
+        let { marker } = stamp;
+        Span.{ ptr: unsafe (0usize as *u8), len: 0usize, marker }
+    }
+
+    // A literal viewed as a span of domain 'k. Static bytes outlive every
+    // domain, so reading them under 'k's capability is always valid.
+    fn from_static(&cap: Exclusive!['k], text: Slice[u8, 'static]) -> Span['k] {
+        let (ptr, len, m) = text.into_parts();
+        let stamp = &cap.stamp();
+        let { marker } = stamp;
+        Span.{ ptr, len, marker }
+    }
+
+    fn len(self) -> usize {
+        let { ptr, len, marker } = self;
+        len
+    }
+
+    // Where the span starts, as a number. Like `Ref::address`, it hands out
+    // nothing to read through; it lets a span be matched against a known
+    // buffer (a diagnostic finding the line a name came from).
+    fn address(self) -> usize {
+        let { ptr, len, marker } = self;
+        unsafe (ptr as usize)
+    }
+
+    // The same start, `len` bytes long, in the same domain. `unsafe`: the
+    // caller vouches that those bytes are initialized and lie in the buffer
+    // this span points into (joining two spans of one source text).
+    unsafe fn with_len(self, len: usize) -> Span['k] {
+        let { ptr, len: old, marker } = self;
+        Span.{ ptr, len, marker }
+    }
+
+    // The first `count` bytes, or the whole span if it is shorter.
+    fn take(self, count: usize) -> Span['k] {
+        let { len, ..rest } = self;
+        if count < len {
+            Span.{ len: count, ..rest }
+        } else {
+            Span.{ len, ..rest }
+        }
+    }
+
+    // Everything after the first `count` bytes, or an empty span at the end.
+    fn skip(self, count: usize) -> Span['k] {
+        let { ptr, len, ..rest } = self;
+        let n = if count < len { count } else { len };
+        Span.{ ptr: unsafe elem_ptr(ptr, n), len: len - n, ..rest }
+    }
+
+    // `count` bytes starting `start` in, or `None` past the end. Checked by
+    // subtraction so a huge `count` cannot wrap into range.
+    fn sub(self, start: usize, count: usize) -> Option[Span['k]] {
+        let { ptr, len, ..rest } = self;
+        if start > len {
+            Option::None
+        } else {
+            let remaining = len - start;
+            if count > remaining {
+                Option::None
+            } else {
+                Option::Some.(Span.{ ptr: unsafe elem_ptr(ptr, start), len: count, ..rest })
+            }
+        }
+    }
+}
+
+// The shared body of the `ReadBytes` instances. `unsafe`: reads `s` with no
+// capability of its own; every caller has just been handed one for 'k.
+forall 'k.
+unsafe fn span_byte_at(s: Span['k], index: usize) -> Option[u8] {
+    let { ptr, len, marker } = s;
+    if index < len {
+        Option::Some.(unsafe raw_byte_at(ptr, len, index))
+    } else {
+        Option::None
+    }
+}
+
+forall 'r.
+instance ReadBytes[Exclusive!['r], Span['r]] {
+    fn get(&cap: Exclusive!['r], bytes: Span['r], index: usize) -> Option[u8] {
+        unsafe span_byte_at(bytes, index)
+    }
+    fn len(&cap: Exclusive!['r], bytes: Span['r]) -> usize {
+        bytes.len()
+    }
+}
+
+forall 'r, 'q.
+instance ReadBytes[Shared!['r, 'q], Span['r]] {
+    fn get(&cap: Shared!['r, 'q], bytes: Span['r], index: usize) -> Option[u8] {
+        unsafe span_byte_at(bytes, index)
+    }
+    fn len(&cap: Shared!['r, 'q], bytes: Span['r]) -> usize {
+        bytes.len()
+    }
+}
+
+// Byte equality of two spans of one domain, under that domain's single
+// writer (two reads cannot each take the linear capability).
+forall 'k.
+fn span_bytes_eq(&cap: Exclusive!['k], a: Span['k], b: Span['k]) -> bool {
+    let { ptr: ap, len: an, marker: am } = a;
+    let { ptr: bp, len: bn, marker: bm } = b;
+    // Spans of one buffer often share their bytes; skip the byte walk.
+    let aliased = unsafe (ap as usize) == unsafe (bp as usize);
+    let same = an == bn && (aliased || unsafe raw_span_bytes_eq(ap, bp, an, an));
+    same
+}
+
+// Copies a span's bytes to `dest`, reading them under the domain's
+// capability; returns the count. `unsafe`: `dest` must have room for
+// `s.len()` bytes.
+forall 'k.
+unsafe fn copy_span_bytes(&cap: Exclusive!['k], dest: *u8, s: Span['k]) -> usize {
+    let { ptr, len, marker } = s;
+    var i = 0usize;
+    while i < len {
+        let u = unsafe raw_byte_set(dest, len, i, unsafe raw_byte_at(ptr, len, i));
+        i = i + 1usize;
+    }
+    len
+}
+
+// The djb2 hash of a span's bytes, read under its domain's capability.
+// With `span_bytes_eq`, the key functions for span-keyed maps
+// (`ArenaMap::get_copy_with` and friends).
+forall 'k.
+fn span_bytes_hash(&cap: Exclusive!['k], s: Span['k]) -> u64 {
+    let { ptr: p, len: n, marker: m } = s;
+    let state = unsafe HashState::new().write_bytes(p, n);
+    state.finish()
+}
+
+// Byte equality of a span and a literal.
+forall 'k.
+fn span_bytes_eq_lit(&cap: Exclusive!['k], a: Span['k], lit: Slice[u8, 'static]) -> bool {
+    let { ptr: ap, len: an, marker: am } = a;
+    let (lp, ln, lm) = lit.into_parts();
+    let same = an == ln && unsafe raw_span_bytes_eq(ap, lp, an, an);
+    same
+}
+
+// Whether `a` begins with the literal.
+forall 'k.
+fn span_starts_with_lit(&cap: Exclusive!['k], a: Span['k], lit: Slice[u8, 'static]) -> bool {
+    span_bytes_eq_lit(&cap, a.take(lit.len()), lit)
+}
+
+// One byte, `0u8` past the end (`byte_or_zero`'s sentinel).
+forall 'k.
+fn span_byte_or_zero(&cap: Exclusive!['k], s: Span['k], index: usize) -> u8 {
+    let b = match unsafe span_byte_at(s, index) {
+        Option::Some(x) => x,
+        Option::None => 0u8,
+    };
+    b
+}

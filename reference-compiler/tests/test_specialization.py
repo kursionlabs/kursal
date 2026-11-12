@@ -63,6 +63,27 @@ class SpecializationTests(unittest.TestCase):
         self.assertNotEqual(backend.request(fun, {"a": C.Skolem("static"), "b": C.Skolem("x")}),
                             backend.request(fun, {"a": C.Skolem("x"), "b": C.Skolem("static")}))
 
+    def test_substituted_foreach_source_keeps_mapper_parameter_partition(self):
+        f, s = C.Named("F"), C.Named("S")
+        mapped = C.Foreach("F", False, s, f)
+        mapper = C.Fun("mapper", (C.Param("F"), C.Param("S")), (), f, (f,),
+                       (C.Block("entry", (("%x", f),), (), C.Ret("%x")),))
+        walk = C.Fun("walk", (C.Param("S"),), (C.Premise("builtin::Exposed", (s,)),), mapped, (s,),
+                     (C.Block("entry", (("%x", s),),
+                              (C.Instr(("%y",), "foreach", ("%x", "mapper"), ty=mapped, tys=(s,)),),
+                              C.Ret("%y")),))
+        source = C.Foreach("G", False, C.U32, C.Named("G"))
+        result = subst(mapped, {"S": source})
+        caller = C.Fun("caller", (), (), result, (source,),
+                       (C.Block("entry", (("%x", source),),
+                                (C.Instr(("%y",), "call", ("walk", "%x"), tys=(source,)),),
+                                C.Ret("%y")),))
+        program = C.Program(funs={"mapper": mapper, "walk": walk, "caller": caller})
+        backend = Backend(program, check_program(program))
+        backend.emit_program()
+        keys = [args for (identity, args) in backend.symbols if identity == id(mapper)]
+        self.assertEqual(keys, [(C.U32, source)])
+
 
 class FunctionAddressTests(unittest.TestCase):
     def retained_program(self):

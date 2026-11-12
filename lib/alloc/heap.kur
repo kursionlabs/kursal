@@ -1,0 +1,209 @@
+// alloc::heap -- the one place `malloc`/`realloc`/`free` are declared. Every
+// other module that needs raw heap memory goes through
+// `HeapAllocator::alloc`/`grow`/`drop`.
+//
+// `Uninit!` is restricted: only this module can construct or destructure
+// one, so no other module can rebuild two owners from one extracted pointer.
+// Other modules work with raw addresses through four functions:
+// `Uninit::into_raw` and `Uninit::into_parts` consume the owner and hand back
+// its address (and, for `into_parts`, its extent); `HeapAllocator::adopt_raw`
+// and `adopt_raw_sized` turn an address back into an owner and are
+// `unsafe fn`, with their preconditions stated on them below.
+//
+// `Storage::try_alloc`/`try_grow` are the fallible primitives;
+// `HeapAllocator::alloc`/`grow` are aborting conveniences built on them.
+
+use package as alloc;
+
+use core::option::Result;
+
+extern "C" fn malloc(size: usize) -> *u8;
+extern "C" fn realloc(p: *u8, size: usize) -> *u8;
+extern "C" fn free(p: *u8);
+// Allocation failure, and a size computation that overflows `usize`, are
+// hard stops in the aborting API (`alloc`, `grow`, `checked_add`,
+// `checked_mul`).
+extern "C" fn abort() -> !;
+
+// The null `*u8`, for comparison only -- never dereferenced.
+//
+// Safe: the pointer it returns is null and carries no authority; any
+// dereference of it needs its own `unsafe`. Allocation results are checked
+// by comparing pointers against it rather than casting them to integers.
+fn null_u8() -> *u8 {
+    unsafe (0usize as *u8)
+}
+
+// `a + b`, or `abort` if the sum is not representable.
+//
+// Checked by subtraction before adding: `usize::MAX - b` cannot wrap, so
+// `a > usize::MAX - b` detects overflow before a wrapped (too small) size
+// could reach `malloc`. `alloc::arena::has_room` uses the same idiom.
+fn checked_add(a: usize, b: usize) -> usize {
+    let room = usize::MAX - b;
+    // The `: ()` annotation gives the `if` a concrete type for the diverging
+    // `abort()` arm.
+    let g: () = if a > room { unsafe abort() } else { () };
+    a + b
+}
+
+// `a * b`, or `abort` if the product is not representable.
+//
+// Guarded by division against `usize::MAX`, for the same reason: testing
+// `a * b / b != a` would inspect an already-wrapped value. `b == 0usize` is
+// special-cased because the guard divides by it; a zero-sized element or a
+// zero-element request is legitimate and cannot overflow.
+fn checked_mul(a: usize, b: usize) -> usize {
+    let is_zero = b == 0usize;
+    let limit = if is_zero {
+        usize::MAX
+    } else {
+        usize::MAX / b
+    };
+    // See `checked_add` for the `: ()` annotation.
+    let g: () = if a > limit { unsafe abort() } else { () };
+    a * b
+}
+
+// Allocation failure, as a value. `Storage::try_alloc`/`try_grow` are the
+// only producers. Not linear: an error code is `Copy` data, and the aborting
+// wrappers below drop it.
+exposed enum AllocError {
+    OutOfMemory,
+}
+
+// Zero-field policy types give static allocator methods a nominal receiver.
+// They own no memory; allocation ownership remains exclusively in Uninit!.
+struct Storage {}
+
+struct HeapAllocator {}
+
+// Sole ownership of one uninitialized heap block: its base address and its
+// extent. Linear, and restricted to this module.
+//
+// `extent` is the size in bytes most recently REQUESTED for the block -- not
+// what the allocator actually reserved (`malloc` may round up), and not an
+// alignment. `alloc`/`try_alloc`/`grow`/`try_grow` record it truthfully;
+// `adopt_raw` cannot and records `0usize` (see there).
+struct Uninit! {
+    ptr: *u8,
+    extent: usize,
+}
+
+impl Uninit {
+    // Consumes the owner and hands back its address. Safe: the caller cannot
+    // turn the address back into an `Uninit!` except through `adopt_raw`,
+    // which is `unsafe fn` and carries the real obligation.
+    fn into_raw(self) -> *u8 {
+        let { ptr: p, extent: n } = self;
+        p
+    }
+
+    // `into_raw`, keeping the extent; `alloc::owned::Allocation::adopt`
+    // records both. Safe for the same reason as `into_raw`; the extent is a
+    // plain number.
+    fn into_parts(self) -> (*u8, usize) {
+        let { ptr: p, extent: n } = self;
+        (p, n)
+    }
+}
+
+// The fallible allocation primitives. `HeapAllocator::alloc`/`grow` are
+// built on these.
+//
+// `try_grow` can hand the caller's block back on failure because C
+// guarantees a failed `realloc` leaves the original block live and unmoved:
+// the old address is still the base of a single live allocation with no
+// other `Uninit!`, which is exactly `adopt_raw`'s precondition. Linearity
+// then forces every caller to deal with the returned owner; ignoring the
+// `Err` payload does not compile.
+//
+// `Storage` and `HeapAllocator` are zero-field policy receivers; neither
+// holds storage, and ownership stays with `Uninit!`.
+impl Storage {
+    // The fallible `alloc`. Takes no alignment: the block is whatever
+    // `malloc` returns.
+    fn try_alloc(size: usize) -> Result[Uninit!, AllocError] {
+        let raw = unsafe malloc(size);
+        if raw == null_u8() {
+            Result::Err.(AllocError::OutOfMemory)
+        } else {
+            Result::Ok.(Uninit.{ ptr: raw, extent: size })
+        }
+    }
+
+    // The fallible `grow`. The error arm hands the caller's own block back
+    // at its original extent -- never a fresh or null one.
+    fn try_grow(u: Uninit!, new_size: usize) -> Result[Uninit!, (AllocError, Uninit!)] {
+        let (raw, old_size) = u.into_parts();
+        let raw2 = unsafe realloc(raw, new_size);
+        if raw2 == null_u8() {
+            Result::Err.((AllocError::OutOfMemory, Uninit.{ ptr: raw, extent: old_size }))
+        } else {
+            Result::Ok.(Uninit.{ ptr: raw2, extent: new_size })
+        }
+    }
+}
+
+impl HeapAllocator {
+    // `Storage::try_alloc`, aborting on failure. Most constructors in the
+    // library (`Vec::new`, `Buffer::new_with_cap`, arena chunks, ...) use
+    // this form, so they need no error channel.
+    //
+    // The `Err` arm aborts; its tail still has to be an `Uninit!`. It builds
+    // the null `Uninit!` directly rather than through `adopt_raw`, whose
+    // precondition (a live allocation) the null pointer does not meet.
+    // Constructing the literal in its own module makes no such claim.
+    fn alloc(size: usize) -> Uninit! {
+        match Storage::try_alloc(size) {
+            Result::Ok(u) => u,
+            Result::Err(e) => {
+                let g = unsafe abort();
+                Uninit.{ ptr: null_u8(), extent: 0usize }
+            },
+        }
+    }
+
+    // `Storage::try_grow`, aborting on failure. The `Err` arm needs no
+    // invented value: `try_grow` hands the caller's block back.
+    fn grow(u: Uninit!, new_size: usize) -> Uninit! {
+        match Storage::try_grow(u, new_size) {
+            Result::Ok(u2) => u2,
+            Result::Err(pair) => {
+                let (e, u2) = pair;
+                let g = unsafe abort();
+                u2
+            },
+        }
+    }
+
+    fn drop(u: Uninit!) -> () {
+        let raw = u.into_raw();
+        unsafe free(raw)
+    }
+
+    // Turns an address back into an owner.
+    //
+    // Precondition: `p` is the base address of a single live allocation
+    // obtained from `malloc`/`realloc` (directly or through this module's
+    // `alloc`/`grow`), for which no other `Uninit!` exists -- i.e. an address
+    // the caller itself obtained from `Uninit::into_raw` (or carried along a
+    // single-owner path), never a copy, a sub-range, or an address from
+    // another allocator.
+    //
+    // Records `extent: 0usize`, meaning "not recorded", which is
+    // indistinguishable from a real zero-byte allocation. A caller that
+    // still knows the size should use `adopt_raw_sized`.
+    unsafe fn adopt_raw(p: *u8) -> Uninit! {
+        Uninit.{ ptr: p, extent: 0usize }
+    }
+
+    // `adopt_raw`, for a caller that still knows the block's size, so the
+    // extent survives a round trip (as in `alloc::owned::Allocation::release`).
+    //
+    // Precondition: `adopt_raw`'s, plus `extent` is the size most recently
+    // requested for that block.
+    unsafe fn adopt_raw_sized(p: *u8, extent: usize) -> Uninit! {
+        Uninit.{ ptr: p, extent: extent }
+    }
+}

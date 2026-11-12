@@ -1,0 +1,264 @@
+// core::fmt -- the writer protocol and formatting.
+//
+// Allocator-free: everything here works with any writer. `alloc::fmt`
+// re-exports it and adds what needs `Buffer!`.
+//
+// `Writable[W]` is the output protocol: write one byte, a whole `'static`
+// byte view, or raw bytes. Reading `'static` storage needs no capability
+// argument (`core::slice::StaticRead`), so a bulk write of one can live in
+// the trait itself and lets a writer copy literal segments in one step.
+// `write_raw` is the bulk write for everything else: a caller that already
+// holds the right to read some bytes passes them without a per-byte loop.
+//
+// Writers use sticky errors. A writer that can fail records its first
+// failure and ignores every later write; its own `finish` reports the
+// failure together with the underlying resource. Neither `Writable` nor
+// `Format` carries an error type, so an f-string never has to infer one,
+// and the writer and every threaded input always come back.
+//
+// `Format[T, W]` formats a `T` into any writer `W` and hands the value back:
+// formatting does not consume. The compiler expands `f"..."` into these
+// calls -- literal segments through `Writable::write_static`, `{expr}`
+// segments through `Format::format` -- so instances are written once,
+// generically over the writer, and work with every writer.
+
+use package as core;
+
+use core::slice::{Slice, ReadBytes, Readable};
+use core::option::Option;
+use core::cap::Exclusive;
+use core::raw::Span;
+
+forall Self.
+trait Writable {
+    fn write_byte(self: Self, byte: u8) -> Self;
+    fn write_static(self: Self, bytes: Slice[u8, 'static]) -> Self;
+    // Writes `len` bytes starting at `ptr`. `unsafe`: `ptr[0..len)` must be
+    // readable for the whole call; the writer reads them before it returns
+    // and keeps no pointer to them.
+    unsafe fn write_raw(self: Self, ptr: *u8, len: usize) -> Self;
+}
+
+// Writes any readable byte view's bytes, reading through its capability.
+forall W, C, S where Writable[W], ReadBytes[C, S], Copy[S].
+fn write_bytes(out: W, &cap: C, bytes: S) -> W {
+    let n = ReadBytes[C, S]::len(&cap, bytes);
+    var o = out;
+    var i = 0usize;
+    while i < n {
+        let b = ReadBytes[C, S]::get(&cap, bytes, i);
+        let next = match b {
+            Option::Some(x) => Writable[W]::write_byte(o, x),
+            Option::None => o,
+        };
+        o = next;
+        i = i + 1usize;
+    }
+    o
+}
+
+// Decimal digits of `n`, most significant first.
+forall W where Writable[W].
+fn write_u64(out: W, n: u64) -> W {
+    let ten = 10u64;
+    let rest = n / ten;
+    let o = if rest != 0u64 {
+        write_u64(out, rest)
+    } else {
+        out
+    };
+    let digit = ((n % ten) as u8) + b'0';
+    Writable[W]::write_byte(o, digit)
+}
+
+forall W where Writable[W].
+fn write_i64(out: W, n: i64) -> W {
+    if n < 0i64 {
+        let o = Writable[W]::write_byte(out, 45u8);
+        // Two's-complement negation in `u64`, so `i64::MIN` has a magnitude.
+        let magnitude = 0u64 - (n as u64);
+        write_u64(o, magnitude)
+    } else {
+        write_u64(out, (n as u64))
+    }
+}
+
+forall T, W.
+trait Format {
+    fn format(value: T, out: W) -> (T, W);
+}
+
+forall W where Writable[W].
+instance Format[u8, W] {
+    fn format(value: u8, out: W) -> (u8, W) {
+        (value, write_u64(out, (value as u64)))
+    }
+}
+
+forall W where Writable[W].
+instance Format[u16, W] {
+    fn format(value: u16, out: W) -> (u16, W) {
+        (value, write_u64(out, (value as u64)))
+    }
+}
+
+forall W where Writable[W].
+instance Format[u32, W] {
+    fn format(value: u32, out: W) -> (u32, W) {
+        (value, write_u64(out, (value as u64)))
+    }
+}
+
+forall W where Writable[W].
+instance Format[u64, W] {
+    fn format(value: u64, out: W) -> (u64, W) {
+        (value, write_u64(out, value))
+    }
+}
+
+forall W where Writable[W].
+instance Format[usize, W] {
+    fn format(value: usize, out: W) -> (usize, W) {
+        (value, write_u64(out, (value as u64)))
+    }
+}
+
+forall W where Writable[W].
+instance Format[i8, W] {
+    fn format(value: i8, out: W) -> (i8, W) {
+        (value, write_i64(out, (value as i64)))
+    }
+}
+
+forall W where Writable[W].
+instance Format[i16, W] {
+    fn format(value: i16, out: W) -> (i16, W) {
+        (value, write_i64(out, (value as i64)))
+    }
+}
+
+forall W where Writable[W].
+instance Format[i32, W] {
+    fn format(value: i32, out: W) -> (i32, W) {
+        (value, write_i64(out, (value as i64)))
+    }
+}
+
+forall W where Writable[W].
+instance Format[i64, W] {
+    fn format(value: i64, out: W) -> (i64, W) {
+        (value, write_i64(out, value))
+    }
+}
+
+forall W where Writable[W].
+instance Format[isize, W] {
+    fn format(value: isize, out: W) -> (isize, W) {
+        (value, write_i64(out, (value as i64)))
+    }
+}
+
+forall W where Writable[W].
+instance Format[bool, W] {
+    fn format(value: bool, out: W) -> (bool, W) {
+        let text = if value { "true" } else { "false" };
+        (value, Writable[W]::write_static(out, text))
+    }
+}
+
+forall W where Writable[W].
+instance Format[Slice[u8, 'static], W] {
+    fn format(value: Slice[u8, 'static], out: W) -> (Slice[u8, 'static], W) {
+        (value, Writable[W]::write_static(out, value))
+    }
+}
+
+// A borrowed byte view of any brand, together with the capability that
+// permits reading it.
+forall C, S, W where ReadBytes[C, S], Copy[S], Writable[W].
+instance Format[Readable[C, S], W] {
+    fn format(value: Readable[C, S], out: W) -> (Readable[C, S], W) {
+        let { cap: c, bytes: s } = value;
+        let o = write_bytes(out, &c, s);
+        (Readable.{ cap: c, bytes: s }, o)
+    }
+}
+
+// A writer that also carries a read capability, so an f-string can
+// interpolate views of that capability's domain directly: every `{span}` is
+// read through the writer's own capability, one capability serving any
+// number of parts. `finish` hands both back.
+//
+//     let (text, tag) = f"{name} = {value}".write(ReadingWriter::new(Buffer::new(), tag)).finish();
+forall W, C.
+exposed struct ReadingWriter! {
+    out: W,
+    cap: C,
+}
+
+forall W, C.
+impl ReadingWriter[W, C] {
+    fn new(out: W, cap: C) -> ReadingWriter![W, C] {
+        ReadingWriter.{ out, cap }
+    }
+
+    fn finish(self) -> (W, C) {
+        let { out, cap } = self;
+        (out, cap)
+    }
+}
+
+forall W, C where Writable[W].
+instance Writable[ReadingWriter![W, C]] {
+    fn write_byte(self: ReadingWriter![W, C], byte: u8) -> ReadingWriter![W, C] {
+        let { out, ..rest } = self;
+        ReadingWriter.{ out: Writable[W]::write_byte(out, byte), ..rest }
+    }
+    fn write_static(self: ReadingWriter![W, C], bytes: Slice[u8, 'static]) -> ReadingWriter![W, C] {
+        let { out, ..rest } = self;
+        ReadingWriter.{ out: Writable[W]::write_static(out, bytes), ..rest }
+    }
+    unsafe fn write_raw(self: ReadingWriter![W, C], ptr: *u8, len: usize) -> ReadingWriter![W, C] {
+        let { out, ..rest } = self;
+        ReadingWriter.{ out: unsafe Writable[W]::write_raw(out, ptr, len), ..rest }
+    }
+}
+
+// A span of the writer's capability domain.
+forall W, 'r where Writable[W].
+instance Format[Span['r], ReadingWriter![W, Exclusive!['r]]] {
+    fn format(value: Span['r], out: ReadingWriter![W, Exclusive!['r]]) -> (Span['r], ReadingWriter![W, Exclusive!['r]]) {
+        let { out: o, cap } = out;
+        // `unsafe`: `cap` is the capability for `value`'s domain, so its
+        // bytes are readable for the call.
+        let (ptr, len) = value.into_parts();
+        let o2 = unsafe Writable[W]::write_raw(o, ptr, len);
+        (value, ReadingWriter.{ out: o2, cap })
+    }
+}
+
+// Counts bytes without storing them.
+exposed struct CountingWriter {
+    count: usize,
+}
+
+impl CountingWriter {
+    fn new() -> CountingWriter {
+        CountingWriter.{ count: 0usize }
+    }
+}
+
+instance Writable[CountingWriter] {
+    fn write_byte(self: CountingWriter, byte: u8) -> CountingWriter {
+        let { count } = self;
+        CountingWriter.{ count: count + 1usize }
+    }
+    fn write_static(self: CountingWriter, bytes: Slice[u8, 'static]) -> CountingWriter {
+        let { count } = self;
+        CountingWriter.{ count: count + bytes.len() }
+    }
+    unsafe fn write_raw(self: CountingWriter, ptr: *u8, len: usize) -> CountingWriter {
+        let { count } = self;
+        CountingWriter.{ count: count + len }
+    }
+}

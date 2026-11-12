@@ -1,0 +1,138 @@
+// alloc::fmt -- writers and formatting. Re-exports `core::fmt`'s
+// allocator-free protocol and adds what needs `Buffer!`: its `Writable` and
+// `Format` instances, the `*_to_str` helpers and `FixedWriter!`. `f"..."`
+// expands through the `Writable` and `Format` names exported here.
+
+use package as alloc;
+
+use core::fmt::{Writable, write_bytes, write_u64, write_i64, Format, ReadingWriter, CountingWriter};
+export Writable;
+export write_bytes;
+export write_u64;
+export write_i64;
+export Format;
+export ReadingWriter;
+export CountingWriter;
+use core::slice::{Slice, StaticRead};
+use core::raw::raw_byte_at;
+use core::option::Result;
+use alloc::buffer::Buffer;
+
+// Infallible: `Buffer!` aborts on out-of-memory.
+instance Writable[Buffer!] {
+    fn write_byte(self: Buffer!, byte: u8) -> Buffer! {
+        self.push_byte(byte)
+    }
+    fn write_static(self: Buffer!, bytes: Slice[u8, 'static]) -> Buffer! {
+        self.push_static(bytes)
+    }
+    unsafe fn write_raw(self: Buffer!, ptr: *u8, len: usize) -> Buffer! {
+        unsafe self.push_n(ptr, len)
+    }
+}
+
+fn u64_to_str(n: u64) -> Buffer! {
+    write_u64(Buffer::new(), n)
+}
+
+fn i64_to_str(n: i64) -> Buffer! {
+    write_i64(Buffer::new(), n)
+}
+
+fn u8_to_str(n: u8) -> Buffer! {
+    u64_to_str((n as u64))
+}
+
+fn u16_to_str(n: u16) -> Buffer! {
+    u64_to_str((n as u64))
+}
+
+fn u32_to_str(n: u32) -> Buffer! {
+    u64_to_str((n as u64))
+}
+
+fn usize_to_str(n: usize) -> Buffer! {
+    u64_to_str((n as u64))
+}
+
+fn i8_to_str(n: i8) -> Buffer! {
+    i64_to_str((n as i64))
+}
+
+fn i16_to_str(n: i16) -> Buffer! {
+    i64_to_str((n as i64))
+}
+
+fn i32_to_str(n: i32) -> Buffer! {
+    i64_to_str((n as i64))
+}
+
+fn isize_to_str(n: isize) -> Buffer! {
+    i64_to_str((n as i64))
+}
+
+// An owned buffer's contents. The buffer is handed back, not freed: an
+// f-string formats a linear value only through `{&name}`.
+forall W where Writable[W].
+instance Format[Buffer!, W] {
+    fn format(value: Buffer!, out: W) -> (Buffer!, W) {
+        let exists 'b. (tag, bytes, restore) = value.open();
+        // `unsafe`: the open buffer's bytes stay readable until `restore`.
+        let (ptr, len, marker) = bytes.into_parts();
+        let o = unsafe Writable[W]::write_raw(out, ptr, len);
+        (restore.restore(tag), o)
+    }
+}
+
+// The sticky error a `FixedWriter!` reports once it has run out of room.
+exposed struct Full {}
+
+// A byte buffer that never grows past `cap`. The first write that does not
+// fit marks it full; that write and every later one is dropped, so the
+// contents are always a prefix of what was written.
+struct FixedWriter! {
+    buf: Buffer!,
+    cap: usize,
+    full: bool,
+}
+
+impl FixedWriter {
+    fn new(cap: usize) -> FixedWriter! {
+        FixedWriter.{ buf: Buffer::new_with_cap(cap), cap, full: false }
+    }
+
+    fn finish(self) -> (Buffer!, Result[(), Full]) {
+        let { buf, cap, full } = self;
+        let status = if full {
+            Result[(), Full]::Err.(Full.{})
+        } else {
+            Result[(), Full]::Ok.(())
+        };
+        (buf, status)
+    }
+}
+
+instance Writable[FixedWriter!] {
+    fn write_byte(self: FixedWriter!, byte: u8) -> FixedWriter! {
+        let { buf, cap, full } = self;
+        let n = &buf.len();
+        if full || n >= cap {
+            FixedWriter.{ buf, cap, full: true }
+        } else {
+            FixedWriter.{ buf: buf.push_byte(byte), cap, full }
+        }
+    }
+    fn write_static(self: FixedWriter!, bytes: Slice[u8, 'static]) -> FixedWriter! {
+        let sr = StaticRead::get();
+        write_bytes(self, &sr, bytes)
+    }
+    unsafe fn write_raw(self: FixedWriter!, ptr: *u8, len: usize) -> FixedWriter! {
+        var w = self;
+        var i = 0usize;
+        while i < len {
+            w = w.write_byte(unsafe raw_byte_at(ptr, len, i));
+            i = i + 1usize;
+        }
+        w
+    }
+}

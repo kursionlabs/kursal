@@ -1,0 +1,213 @@
+// toml::document -- a whole TOML document as a table. Definition metadata is
+// kept apart from the normalized tree: implicit parents, dotted tables and explicit headers have
+// different reopening rules, even when their resulting values are identical.
+
+use package::lex::{TomlToken, TomlTokenKind, TomlError, tokenize};
+use package::value::{TomlValue, TomlField, toml_key, toml_value, toml_insert, toml_path_prefix};
+use std::alloc::arena::Arena;
+use std::bytes::buffer::Buffer;
+use std::collections::list::List;
+use std::cap::Exclusive;
+use std::option::Result;
+use std::raw::Span;
+
+enum TomlDefinitionKind {
+    Assignment,
+    Dotted,
+    Header,
+}
+
+forall 'k.
+struct TomlDefinition {
+    path: List[Span['k], 'k],
+    kind: TomlDefinitionKind,
+}
+
+// Requires live lexer/tree storage, as do the other unsafe document helpers.
+forall 'k.
+unsafe fn toml_definition_conflict(
+    &tag: Exclusive!['k],
+    definitions: List[TomlDefinition['k], 'k],
+    path: List[Span['k], 'k],
+    scope: List[Span['k], 'k],
+    header: bool,
+) -> bool {
+    match definitions {
+        List::Empty => false,
+        List::Cell(r) => {
+            let cell = r.copy(&tag);
+            let forward = unsafe toml_path_prefix(&tag, cell.head.path, path);
+            let backward = unsafe toml_path_prefix(&tag, path, cell.head.path);
+            let conflict = match cell.head.kind {
+                TomlDefinitionKind::Assignment => { if header { forward } else { forward || backward } },
+                TomlDefinitionKind::Dotted => { if header { forward && backward } else { backward } },
+                TomlDefinitionKind::Header => {
+                    if header {
+                        forward && backward
+                    } else {
+                        let contains_scope = unsafe toml_path_prefix(&tag, cell.head.path, scope);
+                        backward || (forward && !contains_scope)
+                    }
+                },
+            };
+            if conflict {
+                true
+            } else {
+                unsafe toml_definition_conflict(&tag, cell.tail, path, scope, header)
+            }
+        },
+    }
+}
+
+// Only prefixes contributed by the relative dotted key are defined here;
+// enclosing scope prefixes may still be implicit parents of explicit headers.
+forall 'k.
+fn toml_define_dotted(
+    &tag: Exclusive!['k],
+    &arena: Arena!['k],
+    definitions: List[TomlDefinition['k], 'k],
+    scope: List[Span['k], 'k],
+    key: List[Span['k], 'k],
+) -> List[TomlDefinition['k], 'k] {
+    match key {
+        List::Empty => definitions,
+        List::Cell(r) => {
+            let cell = r.copy(&tag);
+            match cell.tail {
+                List::Empty => definitions,
+                _ => {
+                    let part = List::Empty.cons(&tag, &arena, cell.head);
+                    let prefix = scope.append(&tag, &arena, part);
+                    let next = definitions.cons(&tag, &arena, TomlDefinition.{ path: prefix, kind: TomlDefinitionKind::Dotted });
+                    toml_define_dotted(&tag, &arena, next, prefix, cell.tail)
+                },
+            }
+        },
+    }
+}
+
+// Comments/spacing are already removed by the lexer. Every document statement
+// must end at a newline or EOF; consuming arbitrary leftover tokens is invalid.
+forall 'k.
+fn toml_line_end(&tag: Exclusive!['k], tokens: List[TomlToken['k], 'k]) -> Result[List[TomlToken['k], 'k], TomlError] {
+    match tokens {
+        List::Empty => Result::Ok.(tokens),
+        List::Cell(r) => {
+            let cell = r.copy(&tag);
+            match cell.head.kind {
+                TomlTokenKind::Newline => Result::Ok.(cell.tail),
+                _ => Result::Err.(TomlError::Syntax.(cell.head.offset)),
+            }
+        },
+    }
+}
+
+forall 'k.
+unsafe fn parse_tokens(&tag: Exclusive!['k], &arena: Arena!['k], tokens: List[TomlToken['k], 'k]) -> Result[TomlValue['k], TomlError] {
+    var pending = tokens;
+    var fields = List::Empty;
+    var scope = List::Empty;
+    var definitions = List::Empty;
+    var running = true;
+    while running {
+        match pending {
+            List::Empty => {
+                running = false;
+            },
+            List::Cell(r) => {
+                let cell = r.copy(&tag);
+                let blank = match cell.head.kind {
+                    TomlTokenKind::Newline => true,
+                    _ => false,
+                };
+                if blank {
+                    pending = cell.tail;
+                } else {
+                    let header = match cell.head.kind {
+                        TomlTokenKind::OpenTable => true,
+                        _ => false,
+                    };
+                    let key_tokens = if header { cell.tail } else { pending };
+                    let (key, rest) = match unsafe toml_key(&tag, &arena, key_tokens) {
+                        Result::Err(error) => {
+                            return Result[TomlValue['k], TomlError]::Err.(error);
+                        },
+                        Result::Ok(parsed) => parsed,
+                    };
+                    let delimiter = match rest {
+                        List::Empty => {
+                            return Result[TomlValue['k], TomlError]::Err.(TomlError::Syntax.(cell.head.offset));
+                        },
+                        List::Cell(next) => next.copy(&tag),
+                    };
+                    let valid = match delimiter.head.kind {
+                        TomlTokenKind::CloseTable => header,
+                        TomlTokenKind::Equals => !header,
+                        _ => false,
+                    };
+                    if !valid {
+                        return Result[TomlValue['k], TomlError]::Err.(TomlError::Syntax.(delimiter.head.offset));
+                    }
+                    let path = if header {
+                        key
+                    } else {
+                        scope.append(&tag, &arena, key)
+                    };
+                    let conflict = unsafe toml_definition_conflict(&tag, definitions, path, scope, header);
+                    if conflict {
+                        return Result[TomlValue['k], TomlError]::Err.(TomlError::Syntax.(cell.head.offset));
+                    }
+                    let value_and_rest: (TomlValue['k], List[TomlToken['k], 'k]) = if header {
+                        (TomlValue::Table.(List::Empty), delimiter.tail)
+                    } else {
+                        match unsafe toml_value(&tag, &arena, delimiter.tail) {
+                            Result::Err(error) => {
+                                return Result[TomlValue['k], TomlError]::Err.(error);
+                            },
+                            Result::Ok(parsed) => parsed,
+                        }
+                    };
+                    let (value, rest) = value_and_rest;
+                    let next = match toml_line_end(&tag, rest) {
+                        Result::Err(error) => {
+                            return Result[TomlValue['k], TomlError]::Err.(error);
+                        },
+                        Result::Ok(parsed) => parsed,
+                    };
+                    let updated = match unsafe toml_insert(&tag, &arena, fields, path, value, header) {
+                        Result::Err(error) => {
+                            return Result[TomlValue['k], TomlError]::Err.(error);
+                        },
+                        Result::Ok(parsed) => parsed,
+                    };
+                    fields = updated;
+                    let kind = if header {
+                        TomlDefinitionKind::Header
+                    } else {
+                        TomlDefinitionKind::Assignment
+                    };
+                    definitions = definitions.cons(&tag, &arena, TomlDefinition.{ path, kind });
+                    if header {
+                        scope = path;
+                    } else {
+                        definitions = toml_define_dotted(&tag, &arena, definitions, scope, key);
+                    }
+                    pending = next;
+                }
+            },
+        }
+    }
+    Result::Ok.(TomlValue::Table.(fields))
+}
+
+// Safe entry accepts ownership, not user-supplied spans or token descriptors.
+forall 'k.
+fn parse(&tag: Exclusive!['k], &arena: Arena!['k], input: Buffer!) -> Result[TomlValue['k], TomlError] {
+    let tokens = match tokenize(&tag, &arena, input) {
+        Result::Err(error) => {
+            return Result[TomlValue['k], TomlError]::Err.(error);
+        },
+        Result::Ok(parsed) => parsed,
+    };
+    unsafe parse_tokens(&tag, &arena, tokens)
+}

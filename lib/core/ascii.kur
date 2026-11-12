@@ -1,0 +1,132 @@
+// core::ascii -- ASCII character classes and case, and the text operations
+// built on them: trimming and splitting a byte view into lines or words.
+// The view is read through whatever capability permits it (`Exclusive!`,
+// `Shared!`, `StaticRead`), and every result is a sub-view of it.
+use package as core;
+
+use core::option::Option;
+use core::slice::{Slice, ReadBytes, byte_or_zero};
+
+fn is_upper(b: u8) -> bool {
+    b >= b'A' && b <= b'Z'
+}
+
+fn is_lower(b: u8) -> bool {
+    b >= b'a' && b <= b'z'
+}
+
+fn is_alpha(b: u8) -> bool {
+    is_upper(b) || is_lower(b)
+}
+
+fn is_digit(b: u8) -> bool {
+    b >= b'0' && b <= b'9'
+}
+
+fn is_alnum(b: u8) -> bool {
+    is_alpha(b) || is_digit(b)
+}
+
+// Space, tab, newline, vertical tab, form feed and carriage return.
+fn is_space(b: u8) -> bool {
+    b == b' ' || (b >= b'\t' && b <= b'\r')
+}
+
+fn to_lower(b: u8) -> u8 {
+    if is_upper(b) { b + 32u8 } else { b }
+}
+
+fn to_upper(b: u8) -> u8 {
+    if is_lower(b) { b - 32u8 } else { b }
+}
+
+// `bytes` without its leading and trailing whitespace.
+forall C, 'k where ReadBytes[C, Slice[u8, 'k]].
+fn trim(&cap: C, bytes: Slice[u8, 'k]) -> Slice[u8, 'k] {
+    var start = 0usize;
+    var end = bytes.len();
+    var scanning = true;
+    while scanning && start < end {
+        let b = byte_or_zero(&cap, bytes, start);
+        if is_space(b) {
+            start = start + 1usize;
+        } else {
+            scanning = false;
+        }
+    }
+    scanning = true;
+    while scanning && end > start {
+        let b = byte_or_zero(&cap, bytes, end - 1usize);
+        if is_space(b) {
+            end = end - 1usize;
+        } else {
+            scanning = false;
+        }
+    }
+    let trimmed = match bytes.sub(start, end - start) {
+        Option::Some(view) => view,
+        Option::None => bytes,
+    };
+    trimmed
+}
+
+// The line starting at `start`, without its '\n', and where the next line
+// starts; nothing once `start` is past the end. A final line need not end
+// with '\n'.
+forall C, 'k where ReadBytes[C, Slice[u8, 'k]].
+fn line_at(&cap: C, bytes: Slice[u8, 'k], start: usize) -> Option[(Slice[u8, 'k], usize)] {
+    let n = bytes.len();
+    if start >= n {
+        return Option::None;
+    }
+    var end = start;
+    var scanning = true;
+    while scanning && end < n {
+        let b = byte_or_zero(&cap, bytes, end);
+        if b == b'\n' {
+            scanning = false;
+        } else {
+            end = end + 1usize;
+        }
+    }
+    let line = match bytes.sub(start, end - start) {
+        Option::Some(view) => view,
+        Option::None => bytes,
+    };
+    Option::Some.((line, end + 1usize))
+}
+
+// The next whitespace-separated word at or after `start`, and where the
+// search for the one after it starts; nothing when only whitespace is left.
+forall C, 'k where ReadBytes[C, Slice[u8, 'k]].
+fn word_at(&cap: C, bytes: Slice[u8, 'k], start: usize) -> Option[(Slice[u8, 'k], usize)] {
+    let n = bytes.len();
+    var begin = start;
+    var scanning = true;
+    while scanning && begin < n {
+        let b = byte_or_zero(&cap, bytes, begin);
+        if is_space(b) {
+            begin = begin + 1usize;
+        } else {
+            scanning = false;
+        }
+    }
+    if begin >= n {
+        return Option::None;
+    }
+    var end = begin;
+    scanning = true;
+    while scanning && end < n {
+        let b = byte_or_zero(&cap, bytes, end);
+        if is_space(b) {
+            scanning = false;
+        } else {
+            end = end + 1usize;
+        }
+    }
+    let word = match bytes.sub(begin, end - begin) {
+        Option::Some(view) => view,
+        Option::None => bytes,
+    };
+    Option::Some.((word, end))
+}

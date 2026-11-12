@@ -1,8 +1,7 @@
-"""A source `foreach` maps each component of a concrete struct, tuple or enum on its own."""
+"""A source `foreach` maps each component of its source, and may read Copy locals of its function."""
 
 import unittest
 
-from kursal.lower import LowerError
 from tests import test_closure_boundary
 
 
@@ -18,26 +17,27 @@ class ForeachSurfaceTests(unittest.TestCase):
             (x + y + z + w) as i32
         }''', 9)
 
-    def test_a_body_uses_no_outer_local(self):
-        with self.assertRaisesRegex(LowerError, "cannot use the outer local bias"):
-            self.run_source('''fn main() -> i32 {
-                let bias = 1u32;
-                let mapped = foreach item of (3u32, 4u32) { (item, bias) };
-                0i32
-            }''', 0)
+    def test_a_body_reads_copy_locals(self):
+        self.run_source('''fn main() -> i32 {
+            let bias = 2u32;
+            let mapped = foreach item of (3u32, 4u32) { (item, bias) };
+            let (a, b) = mapped;
+            let (x, y) = a;
+            let (z, w) = b;
+            (x + y + z + w) as i32
+        }''', 11)
 
-    def test_an_array_is_not_a_source(self):
-        with self.assertRaisesRegex(LowerError, "struct, tuple or enum whose shape is known here"):
-            self.run_source('''fn main() -> i32 {
-                let mapped = foreach item of [1u32, 2u32] { (item, 1u32) };
-                0i32
-            }''', 0)
-
-    def test_no_premises_to_inherit(self):
-        with self.assertRaisesRegex(LowerError, "function with premises"):
-            self.run_source('''forall T. trait Show { fn show(x: T) -> u32; }
-                forall T where Show[T]. fn walk(x: T) -> () { let mapped = foreach item of (1u32,) { () }; () }
-                fn main() -> i32 { 0i32 }''', 0)
+    def test_a_mapper_runs_under_its_function_premises(self):
+        self.run_source('''forall T. trait Size { fn size(x: T) -> u32; }
+            instance Size[u32] { fn size(x: u32) -> u32 { 4u32 } }
+            forall T where Size[T]. fn count(x: T) -> u32 {
+                let s = foreach item of (5u32, 6u32) { (item, 1u32) };
+                let (a, b) = s;
+                let (p, q) = a;
+                let (r, t) = b;
+                q + t + Size::size(x)
+            }
+            fn main() -> i32 { count[u32](1u32) as i32 }''', 6)
 
 
 if __name__ == "__main__":

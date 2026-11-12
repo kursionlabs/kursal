@@ -89,7 +89,7 @@ class TerminationTests(unittest.TestCase):
         with self.assertRaisesRegex(KursError, "unchanged parameter"):
             check_mono_termination(program)
 
-    def test_a_generic_traversal_is_rejected(self):
+    def test_checked_recursive_traversal_is_rejected_before_emission(self):
         program = Program()
         t = Named("T")
         program.funs["f"] = Fun("f", (Param("T"),), (Premise("builtin::Exposed", (t,)),), U32, (t,), (
@@ -101,8 +101,9 @@ class TerminationTests(unittest.TestCase):
                 Instr(("%wrapped",), "construct", ("%x",), ty=Tuple((t,))),
                 Instr(("%r",), "call", ("f", "%wrapped"), tys=(Tuple((t,)),)),
                 Instr(("%unit",), "construct", ty=UNIT)), Ret("%unit")),))
-        with self.assertRaisesRegex(KursError, "foreach_source_is_a_concrete_struct_tuple_or_enum"):
-            check_program(program)
+        checker = check_program(program)
+        with self.assertRaisesRegex(KursError, "recursive foreach"):
+            emit_c(program, checker)
 
     def test_self_recursive_function_address_is_rejected(self):
         program = parse_program("""

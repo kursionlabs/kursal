@@ -1,0 +1,118 @@
+#define _DEFAULT_SOURCE
+#define _XOPEN_SOURCE 700
+#include "fs.h"
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+/* Length-delimited paths: no truncation at an embedded NUL, no PATH_MAX. */
+static char *path_copy(const uint8_t *bytes, uintptr_t len) {
+    if (len == SIZE_MAX) { errno = EOVERFLOW; return NULL; }
+    if (memchr(bytes, 0, len)) { errno = EINVAL; return NULL; }
+    char *path = malloc(len + 1);
+    if (!path) { errno = ENOMEM; return NULL; }
+    memcpy(path, bytes, len);
+    path[len] = 0;
+    return path;
+}
+
+/* Read immediately after a failed operation, before allocation/cleanup. */
+int32_t kur_libc_fs_error(void) { return errno; }
+
+void kur_libc_fs_release(uint8_t *bytes) { free(bytes); }
+
+uint8_t *kur_libc_fs_canonicalize(uint8_t *bytes, uintptr_t len) {
+    char *path = path_copy(bytes, len);
+    if (!path) return NULL;
+    char *resolved = realpath(path, NULL);
+    int saved = errno;
+    free(path);
+    errno = saved;
+    return (uint8_t *)resolved;
+}
+
+/* An environment variable's value as an independently owned string, or NULL
+ * when it is unset. */
+uint8_t *kur_libc_fs_getenv(uint8_t *bytes, uintptr_t len) {
+    char *name = path_copy(bytes, len);
+    if (!name) return NULL;
+    const char *value = getenv(name);
+    free(name);
+    return value ? (uint8_t *)strdup(value) : NULL;
+}
+
+/* Output is three uint64 values, copied rather than imposing a C struct ABI.
+ * kind: 1 regular, 2 directory, 3 other. stat follows symbolic links. */
+int32_t kur_libc_fs_stat(uint8_t *bytes, uintptr_t len, uint8_t *output) {
+    char *path = path_copy(bytes, len);
+    if (!path) return errno;
+    struct stat info;
+    int status = stat(path, &info);
+    int saved = errno;
+    free(path);
+    if (status != 0) return saved;
+    if ((dev_t)(uint64_t)info.st_dev != info.st_dev ||
+        (ino_t)(uint64_t)info.st_ino != info.st_ino) return EOVERFLOW;
+    uint64_t values[3] = {
+        (uint64_t)info.st_dev, (uint64_t)info.st_ino,
+        S_ISREG(info.st_mode) ? 1 : S_ISDIR(info.st_mode) ? 2 : 3
+    };
+    memcpy(output, values, sizeof values);
+    return 0;
+}
+
+uint8_t *kur_libc_fs_open_directory(uint8_t *bytes, uintptr_t len) {
+    char *path = path_copy(bytes, len);
+    if (!path) return NULL;
+    DIR *directory = opendir(path);
+    int saved = errno;
+    free(path);
+    errno = saved;
+    return (uint8_t *)directory;
+}
+
+/* A fresh descriptor on success; negative errno on failure. */
+int32_t kur_libc_fs_open_read(uint8_t *bytes, uintptr_t len) {
+    char *path = path_copy(bytes, len);
+    if (!path) return -errno;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    int saved = errno;
+    free(path);
+    return fd < 0 ? -saved : fd;
+}
+
+/* Opaque entry borrowed until the next read or close on this DIR.
+ * NULL with errno == 0 is EOF; otherwise NULL indicates an error.
+ * No dirent layout crosses the ABI. */
+uint8_t *kur_libc_fs_next_entry(uint8_t *handle) {
+    errno = 0;
+    return (uint8_t *)readdir((DIR *)handle);
+}
+
+uint8_t *kur_libc_fs_entry_name(uint8_t *entry) {
+    return (uint8_t *)((struct dirent *)entry)->d_name;
+}
+
+/* Match directory walking: use the entry hint when available, follow links
+ * otherwise, and classify failed observations as non-directories. Actual
+ * source/directory access still performs strict validation in the caller. */
+int32_t kur_libc_fs_entry_is_directory(uint8_t *handle, uint8_t *raw_entry) {
+    struct dirent *entry = (struct dirent *)raw_entry;
+#if !defined(KUR_LIBC_FS_NO_D_TYPE) && defined(DT_DIR) && defined(DT_UNKNOWN) && defined(DT_LNK)
+    if (entry->d_type == DT_DIR) return 1;
+    if (entry->d_type != DT_UNKNOWN && entry->d_type != DT_LNK) return 0;
+#endif
+    struct stat info;
+    return fstatat(dirfd((DIR *)handle), entry->d_name, &info, 0) == 0 &&
+           S_ISDIR(info.st_mode);
+}
+
+/* The handle is consumed even if closedir reports an error. */
+int32_t kur_libc_fs_close_directory(uint8_t *handle) {
+    return closedir((DIR *)handle) == 0 ? 0 : errno;
+}

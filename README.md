@@ -7,6 +7,7 @@ Kursal is a systems programming language that compiles to C.
 | Directory | Contents |
 |---|---|
 | [`reference-compiler/`](reference-compiler/) | the reference compiler, in Python: source to KURS (the core language) to C |
+| [`lib/`](lib/) | the standard library packages: `core`, `alloc`, `std`, `libc`, `thread`, `toml` |
 
 See [`reference-compiler/README.md`](reference-compiler/README.md) to build and test it.
 

@@ -1,0 +1,475 @@
+// core::slice -- a checked view of a contiguous run of `T`.
+//
+// `Slice[T,'k]` is a Copy, restricted view of `len` elements. Its length
+// must be honest, and every element access requires presenting the
+// matching `Exclusive!['k]` -- via `get_ref`, which hands back an
+// `Option[Ref[T,'k]]` of the same brand, through which `Ref::with` does
+// the read or write.
+//
+// The brand and the bounds are two independent checks: the brand proves
+// the allocation this view names is still live, and says nothing about
+// whether an index is inside it. `get_ref` and `sub` check both, and
+// return `Option` for an out-of-range request; `byte_or_zero` below
+// returns a `0u8` sentinel instead.
+//
+// There is deliberately no unbranded, unchecked `get`/`set`: a view such
+// as a `Vec::as_slice` result would silently go stale after the next
+// `push`, with nothing catching it. Scoping a raw view to a closure does
+// not help either, since a Copy value can simply be returned out of the
+// closure. Only a brand comparison against a live `Exclusive!` catches
+// "used after the owner moved on", so `Slice` carries a brand, like `Ref`.
+//
+// A fresh, single-owner byte buffer is viewed through
+// `alloc::buffer::Buffer::open`, which mints a brand and hands back a
+// `Slice[u8,'k]` plus a `BufferRestore!['k]` receipt as the only way back
+// to the buffer. Reconstruction cannot go through the `Slice` itself
+// because `sub` can offset its pointer (the same reason
+// `core::mem::RegionResume!` exists).
+
+use package as core;
+
+use core::cap::Exclusive;
+use core::mem::Ref;
+use core::cap::Shared;
+use core::hash::{Hash, Eq, HashIn, HashState};
+use core::option::Option;
+use core::cmp::Order;
+use core::iter::Iterator;
+
+// As with `core::mem::Ref`, `Slice` stores `*T`, never `T` inline, so it
+// is Copy whatever `T` is.
+//
+// Restricted because of `len`: a `Ref` has no field besides its pointer
+// to lie about, and fabricating a different pointer needs an `unsafe`
+// cast, but `Slice`'s `len` is independent of the pointer's honesty. If the literal were open, safe
+// code holding a live `Ref[u8,'k]` and its `Exclusive!['k]` could copy the
+// honest pointer and brand into a `Slice` with an enormous `len`, then
+// read and write far past the allocation through the safe `get_ref`/`sub`,
+// which trust `len` unconditionally. No module but this one can write the
+// struct literal or destructure a `Slice`; `from_raw_parts` is the sole,
+// `unsafe` way in, so every construction site names its obligation.
+forall T, 'k.
+struct Slice {
+    ptr: *T,
+    len: usize,
+    marker: Brand['k],
+}
+
+// Address of the i-th element of a `T` buffer starting at `base`: cast to
+// usize, do plain integer math, cast back, since pointers have no
+// arithmetic of their own. Nothing checks that `i` is in range.
+forall T.
+unsafe fn elem_ptr(base: *T, i: usize) -> *T {
+    let addr = unsafe (base as usize);
+    let off = i * sizeof[T]();
+    let addr2 = addr + off;
+    unsafe (addr2 as *T)
+}
+
+forall T, 'k.
+impl Slice[T, 'k] {
+    // The only way to build a `Slice` from outside this module. `unsafe`:
+    // the caller vouches that `ptr[0 .. len)` is live and readable and
+    // writable under `marker`'s brand. `get_ref`/`sub` are safe methods
+    // that trust exactly this, so an honest `len` here is the whole of
+    // `Slice`'s soundness boundary. Typical callers already hold a `Ref`
+    // of the same brand and assert that more elements are live starting
+    // there (`Vec::as_slice`, `Buffer::open`); string literals are built
+    // through it by the compiler, which discharges the obligation.
+    unsafe fn from_raw_parts(ptr: *T, len: usize, marker: Brand['k]) -> Slice[T, 'k] {
+        Slice.{ ptr, len, marker }
+    }
+
+    // The safe inverse of `from_raw_parts`: the `(ptr, len, marker)` the
+    // slice was built from, for code that must read through it directly
+    // (e.g. `Buffer::push_static`). Safe because it grants no authority:
+    // rebuilding a `Slice` from the result still goes through the `unsafe`
+    // `from_raw_parts`, and the raw pointer can only be dereferenced
+    // under `unsafe`.
+    fn into_parts(self) -> (*T, usize, Brand['k]) {
+        let { ptr: p, len: n, marker: m } = self;
+        (p, n, m)
+    }
+
+    // A `Ref` of the same brand to element `i`, or `None` when `i` is out
+    // of range; reads and writes then go through `Ref::with`. Mirrors
+    // `Vec::get_ref`. The bounds check is what makes this sound: the brand
+    // only proves the allocation is live, not that `i` is inside it.
+    //
+    // `Option`, not an abort and not a sentinel: this is a fallible lookup,
+    // the same shape as `core::raw::raw_get` (`Option[T]`) and the map
+    // lookups (`Found[Ref[V,'k]]`).
+    fn get_ref(self, &tag: Exclusive!['k], i: usize) -> Option[Ref[T, 'k]] {
+        let { ptr: p, len: n, marker: m } = self;
+        let out: Option[Ref[T, 'k]] = if i < n {
+            let ep = unsafe elem_ptr(p, i);
+            // In bounds of this slice, whose extent is live under `m`.
+            Option::Some.(unsafe Ref::from_raw(ep, m))
+        } else {
+            Option::None
+        };
+        out
+    }
+
+    fn len(self) -> usize {
+        let { ptr: p, len: n, marker: m } = self;
+        n
+    }
+
+    // A sub-view starting `start` elements in, `count` elements long, or
+    // `None` if that range does not fit. Pure address projection with the
+    // same brand, so no capability is needed. There is no way back from a
+    // sub-view to a destroyable buffer: `alloc::buffer::BufferRestore!`
+    // exists so a sub-sliced `Slice` can never be used to reconstruct one.
+    fn sub(self, start: usize, count: usize) -> Option[Slice[T, 'k]] {
+        let { ptr: p, len: n, marker: m } = self;
+        // The range check uses subtraction, as `alloc::arena::has_room`
+        // does: the obvious `start + count <= n` wraps for a `count` near
+        // `usize::MAX` and would then admit an arbitrarily long view.
+        let out: Option[Slice[T, 'k]] = if start > n {
+            Option::None
+        } else {
+            let remaining = n - start;
+            if count > remaining {
+                Option::None
+            } else {
+                let base = unsafe elem_ptr(p, start);
+                Option::Some.(Slice.{ ptr: base, len: count, marker: m })
+            }
+        };
+        out
+    }
+}
+
+// ---------------------------------------------------------------------
+// Read capabilities.
+//
+// A `Slice[u8,'r]` only describes bytes; reading them needs a capability
+// for `'r`. `ReadBytes[C, S]` is the one protocol every safe byte reader
+// goes through, with an instance per capability that can authorize the
+// read: `Exclusive!['r]` (exclusive), `Shared!['r,'q]` (a shared-read node), and
+// `StaticRead` (permanent read access to `'static`). The brand relationship
+// lives in the instance heads; the trait itself needs no brand parameter.
+//
+// Generic code carries `where ReadBytes[C, S], Copy[S]` with bare
+// parameters (a premise may not nest a caller's parameter inside another
+// type) and must read through the trait, never through the slice's raw
+// pointer: a user-written instance can then only return wrong bytes, not
+// read memory it has no authority over.
+
+// Permanent read access to the immutable `'static` byte domain. Copy and
+// zero-sized; it has no write, resume, or deallocation operation, so
+// duplicating it is harmless. It authorizes reads through
+// `Slice[u8,'static]` only: `Slice` is restricted and built only by
+// `unsafe from_raw_parts`, whose `'static` obligation (extent,
+// initialization, permanence, immutability) string-literal lowering
+// discharges for literals.
+struct StaticRead {}
+
+impl StaticRead {
+    fn get() -> StaticRead {
+        StaticRead.{}
+    }
+}
+
+forall C, S.
+trait ReadBytes {
+    // `None` when `index` is out of range; zero is an ordinary byte.
+    fn get(&cap: C, bytes: S, index: usize) -> Option[u8];
+    // Needs `cap` only so a call can select the instance: generic code
+    // holding just `S` has no other way to name the view's length.
+    fn len(&cap: C, bytes: S) -> usize;
+}
+
+// The shared body of the three instances below. `unsafe`: reads `s`'s
+// bytes with no capability of its own; every caller has just been handed
+// one for `s`'s brand.
+forall 'k.
+unsafe fn slice_byte_at(s: Slice[u8, 'k], index: usize) -> Option[u8] {
+    let { ptr: p, len: n, marker: m } = s;
+    if index < n {
+        let b = unsafe *(unsafe elem_ptr(p, index));
+        Option::Some.(b)
+    } else {
+        Option::None
+    }
+}
+
+forall 'r.
+instance ReadBytes[Exclusive!['r], Slice[u8, 'r]] {
+    fn get(&cap: Exclusive!['r], bytes: Slice[u8, 'r], index: usize) -> Option[u8] {
+        unsafe slice_byte_at(bytes, index)
+    }
+    fn len(&cap: Exclusive!['r], bytes: Slice[u8, 'r]) -> usize {
+        bytes.len()
+    }
+}
+
+forall 'r, 'q.
+instance ReadBytes[Shared!['r, 'q], Slice[u8, 'r]] {
+    fn get(&cap: Shared!['r, 'q], bytes: Slice[u8, 'r], index: usize) -> Option[u8] {
+        unsafe slice_byte_at(bytes, index)
+    }
+    fn len(&cap: Shared!['r, 'q], bytes: Slice[u8, 'r]) -> usize {
+        bytes.len()
+    }
+}
+
+instance ReadBytes[StaticRead, Slice[u8, 'static]] {
+    fn get(&cap: StaticRead, bytes: Slice[u8, 'static], index: usize) -> Option[u8] {
+        unsafe slice_byte_at(bytes, index)
+    }
+    fn len(&cap: StaticRead, bytes: Slice[u8, 'static]) -> usize {
+        bytes.len()
+    }
+}
+
+// A byte view together with the capability that permits reading it, as
+// one value: what `Eq`, `Hash`, and `Format` instances take, since an
+// instance head must be a named type. `core::borrow::Borrowed!` is the
+// same idea for a `Ref`. Copy exactly when `C` is (e.g. `StaticRead`).
+forall C, S.
+exposed struct Readable {
+    cap: C,
+    bytes: S,
+}
+
+// The capability-generic byte read. Concrete callers infer `C` and `S`:
+// `byte_at(&tag, s, i)`.
+forall C, S where ReadBytes[C, S].
+fn byte_at(&cap: C, bytes: S, index: usize) -> Option[u8] {
+    ReadBytes[C, S]::get(&cap, bytes, index)
+}
+
+// `byte_at` with `0u8` for out of range: a sentinel for scanners whose
+// character-class tests already treat `0u8` as matching nothing.
+forall C, S where ReadBytes[C, S].
+fn byte_or_zero(&cap: C, bytes: S, index: usize) -> u8 {
+    let b = ReadBytes[C, S]::get(&cap, bytes, index);
+    let v = match b {
+        Option::Some(x) => x,
+        Option::None => 0u8,
+    };
+    v
+}
+
+// Content equality of two byte views, of equal or different brands and
+// capabilities. Two views of one exclusively owned domain cannot both
+// take its single `Exclusive!`; split shared access first (`Exclusive::share`,
+// `Shared::split`).
+forall C1, S1, C2, S2 where ReadBytes[C1, S1], ReadBytes[C2, S2], Copy[S1], Copy[S2].
+fn bytes_eq(&left_cap: C1, left: S1, &right_cap: C2, right: S2) -> bool {
+    let n = ReadBytes[C1, S1]::len(&left_cap, left);
+    let m = ReadBytes[C2, S2]::len(&right_cap, right);
+    var same = n == m;
+    var i = 0usize;
+    while same && i < n {
+        let a = ReadBytes[C1, S1]::get(&left_cap, left, i);
+        let b = ReadBytes[C2, S2]::get(&right_cap, right, i);
+        let equal = match a {
+            Option::Some(x) => {
+                match b {
+                    Option::Some(y) => x == y,
+                    Option::None => false,
+                }
+            },
+            Option::None => false,
+        };
+        same = equal;
+        i = i + 1usize;
+    }
+    same
+}
+
+// Byte views in byte order, as unsigned values, a shorter prefix first.
+// As with `bytes_eq`, each view is read through its own capability.
+forall C1, S1, C2, S2 where ReadBytes[C1, S1], ReadBytes[C2, S2], Copy[S1], Copy[S2].
+fn bytes_cmp(&left_cap: C1, left: S1, &right_cap: C2, right: S2) -> Order {
+    let n = ReadBytes[C1, S1]::len(&left_cap, left);
+    let m = ReadBytes[C2, S2]::len(&right_cap, right);
+    var i = 0usize;
+    while i < n && i < m {
+        let x = byte_or_zero(&left_cap, left, i);
+        let y = byte_or_zero(&right_cap, right, i);
+        if x != y {
+            let order = if x < y {
+                Order::Less
+            } else {
+                Order::Greater
+            };
+            return order;
+        }
+        i = i + 1usize;
+    }
+    let order = if n < m {
+        Order::Less
+    } else if n > m {
+        Order::Greater
+    } else {
+        Order::Equal
+    };
+    order
+}
+
+// `bytes_eq` for two views of one domain, read through its one capability
+// (which cannot be passed twice when it is linear).
+forall C, S where ReadBytes[C, S], Copy[S].
+fn bytes_eq_within(&cap: C, left: S, right: S) -> bool {
+    let order = bytes_cmp_within(&cap, left, right);
+    let same = match order {
+        Order::Equal => true,
+        _ => false,
+    };
+    same
+}
+
+// `bytes_cmp` for two views of one domain, read through its one capability.
+forall C, S where ReadBytes[C, S], Copy[S].
+fn bytes_cmp_within(&cap: C, left: S, right: S) -> Order {
+    let n = ReadBytes[C, S]::len(&cap, left);
+    let m = ReadBytes[C, S]::len(&cap, right);
+    var i = 0usize;
+    while i < n && i < m {
+        let x = byte_or_zero(&cap, left, i);
+        let y = byte_or_zero(&cap, right, i);
+        if x != y {
+            let order = if x < y {
+                Order::Less
+            } else {
+                Order::Greater
+            };
+            return order;
+        }
+        i = i + 1usize;
+    }
+    let order = if n < m {
+        Order::Less
+    } else if n > m {
+        Order::Greater
+    } else {
+        Order::Equal
+    };
+    order
+}
+
+// The first index at or after `start` holding `needle`.
+forall C, S where ReadBytes[C, S], Copy[S].
+fn find_byte(&cap: C, bytes: S, start: usize, needle: u8) -> Option[usize] {
+    let n = ReadBytes[C, S]::len(&cap, bytes);
+    var i = start;
+    var found = Option::None;
+    var searching = true;
+    while searching && i < n {
+        let b = ReadBytes[C, S]::get(&cap, bytes, i);
+        let hit = match b {
+            Option::Some(x) => x == needle,
+            Option::None => false,
+        };
+        if hit {
+            found = Option::Some.(i);
+            searching = false;
+        }
+        i = i + 1usize;
+    }
+    found
+}
+
+// Feeds a byte view's contents into `state`, byte by byte.
+forall C, S where ReadBytes[C, S], Copy[S].
+fn hash_bytes(&cap: C, bytes: S, state: HashState) -> HashState {
+    let n = ReadBytes[C, S]::len(&cap, bytes);
+    var s = state;
+    var i = 0usize;
+    while i < n {
+        let b = ReadBytes[C, S]::get(&cap, bytes, i);
+        let next = match b {
+            Option::Some(x) => s.write_u8(x),
+            Option::None => s,
+        };
+        s = next;
+        i = i + 1usize;
+    }
+    s
+}
+
+// A byte view of a domain, as a map key read through that domain's
+// capability (`HashMap::get_in` and friends).
+forall C, 't where ReadBytes[C, Slice[u8, 't]].
+instance HashIn[Slice[u8, 't], C] {
+    fn hash_in(cap: C, key: Slice[u8, 't], state: HashState) -> (C, HashState) {
+        let s = hash_bytes(&cap, key, state);
+        (cap, s)
+    }
+
+    fn eq_in(cap: C, a: Slice[u8, 't], b: Slice[u8, 't]) -> (C, bool) {
+        let same = bytes_eq_within(&cap, a, b);
+        (cap, same)
+    }
+}
+
+forall C1, S1, C2, S2 where ReadBytes[C1, S1], ReadBytes[C2, S2], Copy[S1], Copy[S2].
+instance Eq[Readable[C1, S1], Readable[C2, S2]] {
+    fn eq(a: Readable[C1, S1], b: Readable[C2, S2]) -> (Readable[C1, S1], Readable[C2, S2], bool) {
+        let { cap: ca, bytes: sa } = a;
+        let { cap: cb, bytes: sb } = b;
+        let same = bytes_eq(&ca, sa, &cb, sb);
+        (Readable.{ cap: ca, bytes: sa }, Readable.{ cap: cb, bytes: sb }, same)
+    }
+}
+
+forall C, S where ReadBytes[C, S], Copy[S].
+instance Hash[Readable[C, S]] {
+    fn hash(self: Readable[C, S], state: HashState) -> (Readable[C, S], HashState) {
+        let { cap: c, bytes: s } = self;
+        let state2 = hash_bytes(&c, s, state);
+        (Readable.{ cap: c, bytes: s }, state2)
+    }
+}
+
+// ------------------------------------------------------------ iteration --
+// A slice's elements in order, read under its domain's capability, which the
+// iterator holds while it runs: `var it = bytes.iter(tag); for b in &it { .. }
+// let tag = it.finish();`.
+forall T, 'k.
+exposed struct SliceIter! {
+    tag: Exclusive!['k],
+    slice: Slice[T, 'k],
+    index: usize,
+}
+
+forall T, 'k where Copy[T].
+impl Slice[T, 'k] {
+    fn iter(self, tag: Exclusive!['k]) -> SliceIter![T, 'k] {
+        SliceIter.{ tag, slice: self, index: 0usize }
+    }
+}
+
+forall T, 'k where Copy[T].
+impl SliceIter[T, 'k] {
+    // Ends the iteration, handing back the capability.
+    fn finish(self) -> Exclusive!['k] {
+        let { tag, slice: _slice, index: _index } = self;
+        tag
+    }
+}
+
+forall T, 'k where Copy[T].
+instance Iterator[SliceIter![T, 'k] -> T] {
+    fn next(&it: SliceIter![T, 'k]) -> Option[T] {
+        let { tag, slice, index } = it;
+        let slot = slice.get_ref(&tag, index);
+        let (tag, item) = match slot {
+            Option::Some(r) => {
+                let value = r.copy(&tag);
+                (tag, Option::Some.(value))
+            },
+            Option::None => (tag, Option::None),
+        };
+        let next_index = match item {
+            Option::Some(_v) => index + 1usize,
+            Option::None => index,
+        };
+        it = SliceIter.{ tag, slice, index: next_index };
+        item
+    }
+}

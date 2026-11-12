@@ -1,0 +1,64 @@
+// Process arguments: one unsafe adoption of the C main boundary, then
+// bounds-checked access to borrowed, process-lifetime C strings.
+use package as std;
+
+use core::cstr::{CStr, cstr_len};
+use core::slice::Slice;
+use core::option::Option;
+use core::raw::raw_get;
+use alloc::heap::abort as c_abort;
+
+struct Args {
+    argv: *(*u8),
+    count: usize,
+}
+
+impl Args {
+    // Caller guarantees the C main contract: argc >= 0, argv points to
+    // argc readable entries, and each entry is a live NUL-terminated
+    // string for the remainder of the process.
+    unsafe fn from_main(argc: i32, argv: *(*u8)) -> Args {
+        Args.{ argv, count: (argc as usize) }
+    }
+
+    fn len(self) -> usize {
+        let { argv, count } = self;
+        count
+    }
+
+    fn get(self, index: usize) -> Option[CStr] {
+        let { argv, count } = self;
+        let raw = unsafe raw_get(argv, count, index);
+        match raw {
+            Option::None => Option::None,
+            Option::Some(ptr) => Option::Some.(unsafe CStr::from_raw(ptr)),
+        }
+    }
+
+    // The bytes of argument `index`, without its NUL. `argv` strings live
+    // as long as the process does, so the view is `'static`.
+    fn bytes(self, index: usize) -> Option[Slice[u8, 'static]] {
+        match self.get(index) {
+            Option::None => Option::None,
+            Option::Some(arg) => {
+                let ptr = arg.as_ptr();
+                // `from_main`'s contract: a live NUL-terminated string.
+                Option::Some.(unsafe Slice::from_raw_parts(ptr, unsafe cstr_len(ptr), unsafe builtin::static_brand()))
+            },
+        }
+    }
+
+    // The unchanged argv table, for APIs that take argc/argv. Reading
+    // through it still requires `unsafe`.
+    fn as_raw(self) -> *(*u8) {
+        let { argv, count } = self;
+        argv
+    }
+}
+
+// Ends the process immediately, without returning, unwinding or flushing
+// buffered output. Stopping the process can break no invariant, so this is
+// safe to call.
+fn abort() -> ! {
+    unsafe c_abort()
+}

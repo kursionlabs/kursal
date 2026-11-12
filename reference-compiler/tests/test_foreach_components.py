@@ -58,7 +58,7 @@ class ComponentTests(unittest.TestCase):
         with self.assertRaisesRegex(KursError, "foreach_pointer_pattern"):
             check_program(C.Program(funs={"identity": mapper, "walk": caller}))
 
-    def test_a_transform_is_not_a_foreach_source(self):
+    def test_nested_leaf_c_passes_the_singleton_member(self):
         source = C.Foreach("G", False, C.U32, C.Named("G"))
         mapped = C.Foreach("F", False, source, C.Named("G"))
         g = C.Named("G")
@@ -69,8 +69,8 @@ class ComponentTests(unittest.TestCase):
                                 (C.Instr(("%out",), "foreach", ("%x", "identity"), ty=mapped),),
                                 C.Ret("%out")),))
         program = C.Program(funs={"identity": mapper, "walk": caller})
-        with self.assertRaisesRegex(KursError, "foreach_source_is_a_concrete_struct_tuple_or_enum"):
-            check_program(program)
+        output = emit_c(program, check_program(program))
+        self.assertRegex(output, r"\.e0 = [A-Za-z_][A-Za-z_0-9]*\([A-Za-z_][A-Za-z_0-9]*\.e0\);")
 
 
 class RetainedScopeTests(unittest.TestCase):

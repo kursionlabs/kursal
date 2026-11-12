@@ -1,0 +1,101 @@
+// Closure-based thread spawning, built on `libc::thread`'s raw pthread
+// wrapper. The closure moves its captured environment into the new
+// thread instead of handing over a bare `*u8`. There is no `detach`:
+// every spawned thread's `Ret` must reach a `join`, so a linear value it
+// produces can never be stranded with nobody left to destroy it.
+//
+// `spawn` is safe to call. Holding a value does not by itself grant
+// permission to act on it, so moving an environment into another thread
+// is inert by itself:
+// - a linear `Env` transfers exclusive ownership; the checker rejects any
+//   further use of what was captured;
+// - a Copy `Env` with no raw pointer in it is plain data, with nothing to
+//   race on;
+// - a Copy `Env` that is or contains a raw pointer grants no access by
+//   existing: every dereference of it, in either thread, needs its own
+//   `unsafe`.
+// Shared mutable state should cross as `std::cap::Exclusive!`/`Shared!`
+// rather than a bare pointer; both are linear, so moving or splitting one
+// into the closure is the same ownership transfer as any linear `Env`.
+
+use std::alloc::heap::HeapAllocator;
+use std::option::Result;
+use libc::thread::{spawn as raw_spawn, Thread as RawThread};
+
+exposed struct ThreadError {
+    code: i32,
+}
+
+forall Env, Ret.
+struct SpawnPayload {
+    f: closure[Env]() -> Ret,
+}
+
+forall Ret.
+struct ResultBox {
+    value: Ret,
+}
+
+forall Ret.
+struct Thread! {
+    raw: RawThread!,
+}
+
+// Runs on the new thread, instantiated once per `(Env, Ret)`. Takes
+// ownership of the heap payload `spawn` built, frees the box, calls the
+// closure exactly once, and boxes the result for `join` to unbox.
+forall Env, Ret.
+fn trampoline(raw: *u8) -> *u8 {
+    let typed_in = unsafe (raw as *SpawnPayload[Env, Ret]);
+    let payload = unsafe *typed_in;
+    let { f } = payload;
+    let reclaimed = unsafe HeapAllocator::adopt_raw(raw);
+    let freed = HeapAllocator::drop(reclaimed);
+    let value = f();
+    let out = HeapAllocator::alloc(sizeof[ResultBox[Ret]]());
+    let out_raw = out.into_raw();
+    let typed_out = unsafe (out_raw as *ResultBox[Ret]);
+    unsafe *typed_out = ResultBox.{ value };
+    unsafe (typed_out as *u8)
+}
+
+// Spawns an OS thread running `f()`; `join` returns `f`'s result, typed
+// as `Ret`. The header explains why this is safe to call.
+forall Env, Ret.
+fn spawn(f: closure[Env]() -> Ret) -> Result[Thread![Ret], ThreadError] {
+    let payload = SpawnPayload.{ f };
+    let boxed = HeapAllocator::alloc(sizeof[SpawnPayload[Env, Ret]]());
+    let raw = boxed.into_raw();
+    let typed = unsafe (raw as *SpawnPayload[Env, Ret]);
+    unsafe *typed = payload;
+    let spawned = unsafe raw_spawn(trampoline[Env, Ret], raw);
+    match spawned {
+        Result::Err(error) => Result::Err.(ThreadError.{ code: error }),
+        Result::Ok(raw_thread) => Result::Ok.(Thread.{ raw: raw_thread }),
+    }
+}
+
+forall Ret.
+impl Thread[Ret] {
+    // Blocks until the thread exits, consuming the handle, and returns
+    // the `Ret` value `f` produced. Safe, unlike `libc::thread::Thread::
+    // join`: no raw pointer escapes, and the pointer read back is the
+    // `ResultBox[Ret]` `trampoline` built for this same `Ret`, which
+    // nothing else writes through. The box is freed after unboxing.
+    fn join(self) -> Result[Ret, ThreadError] {
+        let { raw } = self;
+        let joined = unsafe raw.join();
+        match joined {
+            Result::Err(error) => Result::Err.(ThreadError.{ code: error }),
+            Result::Ok(result_ptr) => {
+                let typed = unsafe (result_ptr as *ResultBox[Ret]);
+                let boxed_result = unsafe *typed;
+                let { value } = boxed_result;
+                let reclaimed = unsafe HeapAllocator::adopt_raw(result_ptr);
+                let freed = HeapAllocator::drop(reclaimed);
+                Result::Ok.(value)
+            },
+        }
+    }
+    // No `detach`: see the header.
+}

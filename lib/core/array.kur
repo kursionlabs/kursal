@@ -1,0 +1,76 @@
+// core::array -- a fixed-length run of values over storage the caller
+// provides. `core` does not care how that storage was obtained (a stack
+// array, a static, memory from an allocator or a page frame): the one
+// `unsafe` constructor states what it must be, and every access after
+// that is bounds-checked against the length it was given.
+//
+// An array is total: values go in and come out (`get` copies, `set`
+// swaps), and nothing ever references an element inside it. That is the
+// difference from `alloc::collections::vec::Vec!`, which is branded and
+// hands out `Ref`s to its elements. Without references there is nothing to
+// brand, so the array is simply linear: it owns exclusive access to its
+// storage, and moving it is the only way to share it.
+use package as core;
+
+use core::option::{Option, Result};
+use core::slice::elem_ptr;
+
+forall T.
+struct Array! {
+    base: *T,
+    len: usize,
+}
+
+forall T.
+impl Array[T] {
+    // `base` addresses `len` initialized `T`s that nothing else reads or
+    // writes while this array exists.
+    unsafe fn from_parts(base: *T, len: usize) -> Array![T] {
+        Array.{ base, len }
+    }
+
+    // Ends the array and gives its storage back, with every element in it.
+    fn into_parts(self) -> (*T, usize) {
+        let { base, len } = self;
+        (base, len)
+    }
+
+    fn len(&self) -> usize {
+        let { base, len } = self;
+        self = Array.{ base, len };
+        len
+    }
+
+    // Puts `value` at `i` and hands back what was there, or hands `value`
+    // back unplaced when `i` is out of range. Nothing is dropped either way,
+    // so this works for linear elements too.
+    fn set(&self, i: usize, value: T) -> Result[T, T] {
+        let { base, len } = self;
+        if i >= len {
+            self = Array.{ base, len };
+            return Result::Err.(value);
+        }
+        // `i < len`, inside the storage `from_parts` was given.
+        let slot = unsafe elem_ptr(base, i);
+        let old = unsafe *slot;
+        unsafe *slot = value;
+        self = Array.{ base, len };
+        Result::Ok.(old)
+    }
+}
+
+forall T where Copy[T].
+impl Array[T] {
+    // A copy of the element at `i`, or nothing when `i` is out of range.
+    fn get(&self, i: usize) -> Option[T] {
+        let { base, len } = self;
+        if i >= len {
+            self = Array.{ base, len };
+            return Option::None;
+        }
+        // `i < len`, inside the storage `from_parts` was given.
+        let value = unsafe *(unsafe elem_ptr(base, i));
+        self = Array.{ base, len };
+        Option::Some.(value)
+    }
+}

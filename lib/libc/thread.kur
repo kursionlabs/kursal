@@ -1,0 +1,67 @@
+// POSIX host thread adapter. Link with lib/libc/thread.c (and `-pthread`).
+//
+// A thin wrapper over pthread_create/join/detach. `Thread!` is linear, so
+// every spawned thread is joined or detached exactly once, and failures
+// are reported as positive errno values. `spawn` is `unsafe`: `arg`'s
+// pointee becomes reachable from two independently scheduled call stacks
+// with no ordering between them, and nothing here tracks which stack may
+// touch it when. `thread::thread::spawn` is the safe, closure-based layer
+// built on this one.
+
+use std::bytes::buffer::Buffer;
+use std::option::Result;
+
+extern "C" fn kur_libc_thread_error() -> i32;
+extern "C" fn kur_libc_thread_create(entry: fn(*u8) -> *u8, arg: *u8) -> *u8;
+extern "C" fn kur_libc_thread_join(handle: *u8, out_result: *(*u8)) -> i32;
+extern "C" fn kur_libc_thread_detach(handle: *u8) -> i32;
+
+// No raw handle extraction or safe construction outside this module.
+struct Thread! {
+    handle: *u8,
+}
+
+// Spawns an OS thread running `entry(arg)`; `join` returns what `entry`
+// returns. Caller: `arg`'s pointee stays valid for as long as the new
+// thread may use it, and every access to it from either thread is safe to
+// interleave. This call establishes no synchronization.
+unsafe fn spawn(entry: fn(*u8) -> *u8, arg: *u8) -> Result[Thread!, i32] {
+    let handle = unsafe kur_libc_thread_create(entry, arg);
+    if unsafe (handle as usize) == 0usize {
+        Result::Err.(unsafe kur_libc_thread_error())
+    } else {
+        Result::Ok.(Thread.{ handle })
+    }
+}
+
+impl Thread {
+    // Blocks until the thread exits, consuming the handle (thread.c frees
+    // it even when pthread_join fails). `unsafe`: returns the raw `*u8`
+    // `entry` produced, with no static knowledge of what it points to.
+    unsafe fn join(self) -> Result[*u8, i32] {
+        let { handle } = self;
+        let scratch = Buffer::new_zeroed(sizeof[*u8]());
+        let out = unsafe &scratch.as_ptr();
+        let status = unsafe kur_libc_thread_join(handle, unsafe (out as *(*u8)));
+        let result: Result[*u8, i32] = if status != 0i32 {
+            Result::Err.(status)
+        } else {
+            let slot = unsafe (out as *(*u8));
+            Result::Ok.(unsafe *slot)
+        };
+        let unit = scratch.destroy();
+        result
+    }
+
+    // Lets the thread run on with nothing joining it, consuming the
+    // handle. Safe: no pointer comes back out through this call.
+    fn detach(self) -> Result[(), i32] {
+        let { handle } = self;
+        let status = unsafe kur_libc_thread_detach(handle);
+        if status == 0i32 {
+            Result::Ok.(())
+        } else {
+            Result::Err.(status)
+        }
+    }
+}

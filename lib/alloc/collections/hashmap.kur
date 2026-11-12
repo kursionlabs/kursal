@@ -1,0 +1,1183 @@
+// A separate-chaining hash table. Like `alloc::collections::vec`, it owns
+// its bucket array through an `Allocation!`/`RegionResume!` pair and hands
+// out `Exclusive!`/`Ref` access, with no witness type of its own.
+//
+// `get`, `insert` and `remove` (at the end of this file) hash and compare
+// keys through their `Hash`/`Eq` instances, are safe, and hand back every
+// key they do not keep. The unsafe `get_ref_with`, `insert_with` and
+// `remove_with` take `hash_fn`/`eq_fn` as explicit `fn` arguments instead,
+// never closures: they are called an unbounded number of times, once per
+// colliding entry, and only a captureless function pointer is provably
+// Copy generically.
+//
+// Keys and values each live in their own one-value allocation: `Entry`
+// holds `*K`/`*V`, never `K`/`V` inline. A generic type parameter is not
+// provably Copy, so an inline `key: K` could not be read out of a shared
+// `Entry` and compared more than once in this generic code, whereas a raw
+// pointer is always Copy. `hash_fn`/`eq_fn` take `*K` for the same reason
+// and dereference it at their concrete key type.
+//
+// Brand policy: `insert` and `remove` return a fresh `Exclusive!['2]`,
+// minted by `Allocation::adopt` and sealed by the operation's `exists '2.`
+// return. Read-only operations (`len`, the lookups) present the caller's
+// `Exclusive!['k]` and hand it back. `insert` may replace the bucket array
+// (`resize`), and a new block always gets a new brand, so a `Ref[V,'k]`
+// taken before an `insert` cannot be used after it, even though entries
+// themselves never move.
+
+use package as alloc;
+
+use alloc::heap::Uninit;
+use alloc::heap::HeapAllocator;
+use alloc::heap::checked_mul;
+use core::cap::Exclusive;
+use core::mem::Ref;
+use alloc::owned::Allocation;
+use core::mem::Region;
+use core::mem::RegionResume;
+use core::hash::{Hash, Eq, HashIn, HashState};
+use core::iter::{Iterator, Pair};
+use core::option::Option;
+
+// `Entry` stores only pointers, so it is Copy whatever `K` and `V` are; a
+// map with a linear value type, such as `HashMap[u32, Marker!]`, needs no
+// annotation here.
+//
+// Neither `Entry` nor `HashMap!` is `exposed`, so other modules cannot
+// build or destructure them. The invariant protected is the tie between
+// `buckets`, `bucket_count` and the chains hanging off it: a forged
+// `HashMap!` with a mismatched `bucket_count` makes `slot_ptr` index past
+// the allocation, and a forged `Entry` puts arbitrary addresses in front
+// of `free_one` and `destroy_chain`.
+forall K, V.
+struct Entry {
+    key: *K,
+    val: *V,
+    next: *Entry[K, V],
+}
+
+// `alloc`/`back` describe the bucket array only. The per-entry `K`, `V`
+// and `Entry` allocations are single-value blocks reached through raw
+// pointers, freed by `free_one`, `remove_chain` and `destroy_chain`, and
+// are not under a domain. The bucket array's free takes its address from
+// `alloc`, never from a `Ref`.
+forall K, V, 'k.
+struct HashMap! {
+    alloc: Allocation![*Entry[K, V], 'k],
+    back: RegionResume![*Entry[K, V], 'k],
+    buckets: Ref[*Entry[K, V], 'k],
+    bucket_count: usize,
+    len: usize,
+}
+
+// The result of a lookup. Not `!`-marked: a `!` makes a type linear
+// unconditionally, whereas plain `Found[T]` is linear exactly when `T` is.
+// `get_ref_chain` reassigns a `Found[*V]` inside a loop, which needs it to
+// be Copy, as it is for any pointer or `Ref` payload; the `Found[V]` from
+// `insert`/`remove` stays linear for a linear `V`.
+forall T.
+exposed enum Found {
+    Item(T),
+    Missing,
+}
+
+forall K, V.
+unsafe fn null_entry() -> *Entry[K, V] {
+    unsafe (0usize as *Entry[K, V])
+}
+
+forall K, V.
+unsafe fn is_null_entry(p: *Entry[K, V]) -> bool {
+    let a = unsafe (p as usize);
+    a == 0usize
+}
+
+// Address of the i-th bucket slot: integer arithmetic on the base
+// address, as in `alloc::collections::vec`'s `elem_ptr`, for a slot type
+// that is itself a pointer.
+forall K, V.
+unsafe fn slot_ptr(base: *(*Entry[K, V]), i: usize) -> *(*Entry[K, V]) {
+    let addr = unsafe (base as usize);
+    let off = i * sizeof[*Entry[K, V]]();
+    let addr2 = addr + off;
+    unsafe (addr2 as *(*Entry[K, V]))
+}
+
+// Allocates a bucket array of `n` null slots and hands back the block
+// itself along with its base. Returning the `Uninit!` rather than a bare
+// pointer lets the caller pass it straight to `Allocation::adopt` (the
+// only producer of an `Allocation!`) without re-stating a size; the
+// `into_parts`/`adopt_raw_sized` round trip keeps the extent the
+// allocator recorded.
+forall K, V.
+unsafe fn alloc_buckets(n: usize) -> (Uninit!, *(*Entry[K, V])) {
+    let bytes = checked_mul(n, sizeof[*Entry[K, V]]());
+    let u = HeapAllocator::alloc(bytes);
+    let (raw, extent) = u.into_parts();
+    let base = unsafe (raw as *(*Entry[K, V]));
+    var i = 0usize;
+    while i < n {
+        let s = unsafe slot_ptr[K, V](base, i);
+        unsafe *s = unsafe null_entry[K, V]();
+        i = i + 1usize;
+    }
+    let u2 = unsafe HeapAllocator::adopt_raw_sized(raw, extent);
+    (u2, base)
+}
+
+// A single value in its own allocation; used for both keys and values
+// (see the header for why neither lives inline in `Entry`).
+forall T.
+unsafe fn alloc_one(v: T) -> *T {
+    let u = HeapAllocator::alloc(sizeof[T]());
+    let raw = u.into_raw();
+    let p = unsafe (raw as *T);
+    unsafe *p = v;
+    p
+}
+
+forall T.
+unsafe fn free_one(p: *T) -> () {
+    let raw = unsafe (p as *u8);
+    HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(raw))
+}
+
+forall K, V.
+unsafe fn alloc_entry(key: *K, val: *V, next: *Entry[K, V]) -> *Entry[K, V] {
+    let u = HeapAllocator::alloc(sizeof[Entry[K, V]]());
+    let raw = u.into_raw();
+    let p = unsafe (raw as *Entry[K, V]);
+    let e = Entry.{ key, val, next };
+    unsafe *p = e;
+    p
+}
+
+// Walks a chain comparing keys with `eq_fn`, returning the pointer to the
+// matching entry's value (or `Missing`); `get_ref_with` wraps it as a
+// `Ref[V,'k]`. A plain loop: nothing here mints a brand or moves a value
+// out of storage across iterations (`Entry` and `*K` are Copy).
+forall K, V.
+unsafe fn get_ref_chain(head: *Entry[K, V], key_ptr: *K, eq_fn: fn(*K, *K) -> bool) -> Found[*V] {
+    var cur = head;
+    var found: Found[*V] = Found::Missing;
+    while unsafe (cur as usize) != 0usize {
+        let e = unsafe *cur;
+        let { key: k, val: vp, next: nx } = e;
+        let is_match = eq_fn(k, key_ptr);
+        cur = if is_match {
+            found = Found::Item.(vp);
+            unsafe null_entry[K, V]()
+        } else {
+            nx
+        };
+    }
+    found
+}
+
+// Inserts or updates in one bucket's chain, recursively. Recursion, not a
+// loop, because which node consumes `val` (and takes ownership of
+// `key_ptr`) depends on a runtime comparison the checker cannot resolve
+// across a loop's back edge; each recursive call is its own linear
+// consumption site. Every node off the match path is read out (`Entry` is
+// Copy) and written back with its possibly updated `next`; rewriting
+// unchanged bits is harmless.
+//
+// On a match the equal key is already stored, so `key_ptr` is freed here
+// and the replaced value returned. `is_new` tells the caller whether
+// `key_ptr` went into a new `Entry` (`true`) or was freed (`false`).
+forall K, V.
+unsafe fn insert_chain(head: *Entry[K, V], key_ptr: *K, val: V, eq_fn: fn(*K, *K) -> bool) -> (*Entry[K, V], Found[V], bool) {
+    let is_null = unsafe is_null_entry[K, V](head);
+    let result: (*Entry[K, V], Found[V], bool) = if is_null {
+        let vp = unsafe alloc_one[V](val);
+        let new_entry = unsafe alloc_entry[K, V](key_ptr, vp, head);
+        (new_entry, Found::Missing, true)
+    } else {
+        let e = unsafe *head;
+        let { key: k, val: vp, next: nx } = e;
+        let is_match = eq_fn(k, key_ptr);
+        let result2: (*Entry[K, V], Found[V], bool) = if is_match {
+            let u0 = unsafe free_one[K](key_ptr);
+            let old_v = unsafe *vp;
+            unsafe *vp = val;
+            (head, Found::Item.(old_v), false)
+        } else {
+            let (new_next, found, is_new) = unsafe insert_chain[K, V](nx, key_ptr, val, eq_fn);
+            let updated = Entry.{ key: k, val: vp, next: new_next };
+            unsafe *head = updated;
+            (head, found, is_new)
+        };
+        result2
+    };
+    result
+}
+
+// Removes a matching entry, recursively, for the same reason as
+// `insert_chain`. `key_ptr` is only searched with, never stored, so it is
+// freed once the search concludes, match or not. The matched entry's key,
+// value and node allocations are freed directly; every other node is read
+// out and written back, as in `insert_chain`.
+forall K, V.
+unsafe fn remove_chain(head: *Entry[K, V], key_ptr: *K, eq_fn: fn(*K, *K) -> bool) -> (*Entry[K, V], Found[V], bool) {
+    let is_null = unsafe is_null_entry[K, V](head);
+    let result: (*Entry[K, V], Found[V], bool) = if is_null {
+        let u0 = unsafe free_one[K](key_ptr);
+        (head, Found::Missing, false)
+    } else {
+        let e = unsafe *head;
+        let { key: k, val: vp, next: nx } = e;
+        let is_match = eq_fn(k, key_ptr);
+        let result2: (*Entry[K, V], Found[V], bool) = if is_match {
+            let u0 = unsafe free_one[K](key_ptr);
+            let old_v = unsafe *vp;
+            let u1 = unsafe free_one[K](k);
+            let u2 = unsafe free_one[V](vp);
+            let raw2 = unsafe (head as *u8);
+            let u3 = HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(raw2));
+            (nx, Found::Item.(old_v), true)
+        } else {
+            let (new_next, found, removed) = unsafe remove_chain[K, V](nx, key_ptr, eq_fn);
+            let updated = Entry.{ key: k, val: vp, next: new_next };
+            unsafe *head = updated;
+            (head, found, removed)
+        };
+        result2
+    };
+    result
+}
+
+// Calls `f` once per entry (so linear `K`/`V` can be consumed), then frees
+// that entry's key, value and node allocations. Recursive for the same
+// reason as `insert_chain`: each level consumes its own node's key and
+// value exactly once.
+forall K, V.
+unsafe fn destroy_chain(head: *Entry[K, V], f: fn(K, V) -> ()) -> () {
+    let is_null = unsafe is_null_entry[K, V](head);
+    let result = if is_null {
+        ()
+    } else {
+        let e = unsafe *head;
+        let { key: kp, val: vp, next: nx } = e;
+        let k = unsafe *kp;
+        let v = unsafe *vp;
+        let u1 = f(k, v);
+        let u2 = unsafe free_one[K](kp);
+        let u3 = unsafe free_one[V](vp);
+        let raw2 = unsafe (head as *u8);
+        let u4 = HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(raw2));
+        unsafe destroy_chain[K, V](nx, f)
+    };
+    result
+}
+
+// Relinks one old bucket's chain into the new, larger bucket array. Node
+// addresses are untouched; only each node's `next` changes, to whatever
+// already heads its new bucket. A plain loop: nothing is consumed or
+// freed.
+forall K, V.
+unsafe fn rehash_bucket(head: *Entry[K, V], new_base: *(*Entry[K, V]), new_bc: usize, hash_fn: fn(*K) -> u64) -> () {
+    var cur = head;
+    while unsafe (cur as usize) != 0usize {
+        let e = unsafe *cur;
+        let { key: k, val: vp, next: nx } = e;
+        let h = hash_fn(k);
+        let idx = (h as usize) % new_bc;
+        let slot = unsafe slot_ptr[K, V](new_base, idx);
+        let old_head = unsafe *slot;
+        let updated = Entry.{ key: k, val: vp, next: old_head };
+        unsafe *cur = updated;
+        unsafe *slot = cur;
+        cur = nx;
+    }
+}
+
+// Doubles the bucket count and rehashes every entry into a new array,
+// reusing every `Entry` node in place, then frees the old array.
+//
+// Takes and returns blocks, not addresses. `u_old` is the old array,
+// already retired from its domain by `Allocation::release` at the call
+// site; `base` is that block's base, passed separately because an
+// `Uninit!` cannot be read through. The returned `Uninit!` is the new
+// array, which the caller re-enters under a fresh brand: `resize` never
+// mints or stamps a brand itself.
+forall K, V.
+unsafe fn resize(u_old: Uninit!, base: *(*Entry[K, V]), old_bc: usize, hash_fn: fn(*K) -> u64) -> (Uninit!, usize) {
+    let new_bc = checked_mul(old_bc, 2usize);
+    let (u_new, new_base) = unsafe alloc_buckets[K, V](new_bc);
+    var i = 0usize;
+    while i < old_bc {
+        let s = unsafe slot_ptr[K, V](base, i);
+        let head = unsafe *s;
+        let u = unsafe rehash_bucket[K, V](head, new_base, new_bc, hash_fn);
+        i = i + 1usize;
+    }
+    let u2 = HeapAllocator::drop(u_old);
+    (u_new, new_bc)
+}
+
+forall K, V.
+impl HashMap[K, V] {
+    fn new() -> exists '1. (Exclusive!['1], HashMap![K, V, '1]) {
+        let initial_buckets = 8usize;
+        let (u, base) = unsafe alloc_buckets[K, V](initial_buckets);
+        let exists 'open1. (a, rg) = Allocation::adopt[*Entry[K, V]](u);
+        let (tag, r, bk) = rg.share();
+        pack 'open1. (tag, HashMap.{ alloc: a, back: bk, buckets: r, bucket_count: initial_buckets, len: 0usize })
+    }
+}
+
+forall K, V, 'k.
+impl HashMap[K, V, 'k] {
+    fn len(&self, &tag: Exclusive!['k]) -> usize {
+        let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n } = self;
+        self = HashMap.{ alloc: a, back: bk, buckets: r, bucket_count: bc, len: n };
+        n
+    }
+
+    // Read-only: `tag` is presented, never consumed. The returned
+    // `Ref[V,'k]`, if any, shares the map's live brand.
+    unsafe fn get_ref_with(&self, &tag: Exclusive!['k], key: K, hash_fn: fn(*K) -> u64, eq_fn: fn(*K, *K) -> bool) -> Found[Ref[V, 'k]] {
+        let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n } = self;
+        let (base, m) = r.into_parts();
+        let key_ptr = unsafe alloc_one[K](key);
+        let h = hash_fn(key_ptr);
+        let idx = (h as usize) % bc;
+        let s = unsafe slot_ptr[K, V](base, idx);
+        let head = unsafe *s;
+        let found_vp = unsafe get_ref_chain[K, V](head, key_ptr, eq_fn);
+        let u0 = unsafe free_one[K](key_ptr);
+        let found_ref: Found[Ref[V, 'k]] = match found_vp {
+            // `vp` is a value slot inside this map's own bucket chains,
+            // which live in the domain `m` names.
+            Found::Item(vp) => Found::Item.(unsafe Ref::from_raw(vp, m)),
+            Found::Missing => Found::Missing,
+        };
+        self = HashMap.{ alloc: a, back: bk, buckets: r, bucket_count: bc, len: n };
+        found_ref
+    }
+
+    // Stores `val` under `key`. Returns the previous value (`Found::Item`)
+    // if `key` already had one, so a linear `V` is never silently discarded.
+    //
+    // Once the entry count exceeds three quarters of the bucket count, the
+    // bucket array is replaced (`resize`), so this consumes the old domain
+    // and returns under a fresh brand. On the non-resizing path the same
+    // block goes back in, still under a fresh brand: `adopt` seals a new one
+    // per call and cannot be asked for an existing one.
+    unsafe fn insert_with(self, tag: Exclusive!['k], key: K, val: V, hash_fn: fn(*K) -> u64, eq_fn: fn(*K, *K) -> bool) -> exists '2. (
+        Exclusive!['2],
+        HashMap![K, V, '2],
+        Found[V],
+    ) {
+        let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n } = self;
+        let (base, m) = r.into_parts();
+        let key_ptr = unsafe alloc_one[K](key);
+        let h = hash_fn(key_ptr);
+        let idx = (h as usize) % bc;
+        let s = unsafe slot_ptr[K, V](base, idx);
+        let head = unsafe *s;
+        let (new_head, found, is_new) = unsafe insert_chain[K, V](head, key_ptr, val, eq_fn);
+        unsafe *s = new_head;
+        let new_len = if is_new { n + 1usize } else { n };
+        let threshold = bc * 3usize / 4usize;
+        let should_resize = if is_new { new_len > threshold } else { false };
+        let rg = bk.resume(tag);
+        let u0 = a.release(rg);
+        let (u1, new_bc) = if should_resize {
+            unsafe resize[K, V](u0, base, bc, hash_fn)
+        } else {
+            (u0, bc)
+        };
+        let exists 'open1. (a2, rg2) = Allocation::adopt[*Entry[K, V]](u1);
+        let (tag2, r2, bk2) = rg2.share();
+        pack 'open1. (tag2, HashMap.{ alloc: a2, back: bk2, buckets: r2, bucket_count: new_bc, len: new_len }, found)
+    }
+
+    // Removes `key`'s entry, returning its value if present. The matched
+    // entry's allocations are freed, so the map returns under a fresh brand
+    // and every outstanding `Ref[V,'k]` into it stops working: a
+    // whole-container policy like `Vec::pop`'s, though only one entry is
+    // freed.
+    unsafe fn remove_with(self, tag: Exclusive!['k], key: K, hash_fn: fn(*K) -> u64, eq_fn: fn(*K, *K) -> bool) -> exists '2. (
+        Exclusive!['2],
+        HashMap![K, V, '2],
+        Found[V],
+    ) {
+        let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n } = self;
+        let (base, m) = r.into_parts();
+        let rg = bk.resume(tag);
+        let u0 = a.release(rg);
+        let key_ptr = unsafe alloc_one[K](key);
+        let h = hash_fn(key_ptr);
+        let idx = (h as usize) % bc;
+        let s = unsafe slot_ptr[K, V](base, idx);
+        let head = unsafe *s;
+        let (new_head, found, removed) = unsafe remove_chain[K, V](head, key_ptr, eq_fn);
+        unsafe *s = new_head;
+        let new_len = if removed { n - 1usize } else { n };
+        let exists 'open1. (a2, rg2) = Allocation::adopt[*Entry[K, V]](u0);
+        let (tag2, r2, bk2) = rg2.share();
+        pack 'open1. (tag2, HashMap.{ alloc: a2, back: bk2, buckets: r2, bucket_count: bc, len: new_len }, found)
+    }
+
+    // Consumes the map: calls `f` once per (key, value) pair, then frees
+    // every entry and the bucket array. The array's free takes its address
+    // from `alloc`, recorded by `Allocation::adopt`; the per-entry frees in
+    // `destroy_chain` go through raw `*K`/`*V`/`*Entry` pointers.
+    fn destroy(self, tag: Exclusive!['k], f: fn(K, V) -> ()) -> () {
+        let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n } = self;
+        let (base, m) = r.into_parts();
+        var i = 0usize;
+        while i < bc {
+            let s = unsafe slot_ptr[K, V](base, i);
+            let head = unsafe *s;
+            let u = unsafe destroy_chain[K, V](head, f);
+            i = i + 1usize;
+        }
+        let rg = bk.resume(tag);
+        let u0 = a.release(rg);
+        HeapAllocator::drop(u0)
+    }
+}
+
+// ---------------------------------------------------------------------
+// The trait-based interface. Keys are hashed and compared through their
+// own `Hash` and `Eq` instances rather than caller-supplied callbacks, so
+// these operations are safe, and every key a call does not keep is handed
+// back rather than dropped -- a linear key is never lost.
+
+// The hash of the key at `p`, which is moved out and put back.
+forall K where Hash[K].
+unsafe fn hash_key(p: *K) -> u64 {
+    let k = unsafe *p;
+    let (k, state) = k.hash(HashState::new());
+    unsafe *p = k;
+    state.finish()
+}
+
+// Whether the keys at `a` and `b` are equal; both are put back.
+forall K where Eq[K, K].
+unsafe fn keys_equal(a: *K, b: *K) -> bool {
+    let x = unsafe *a;
+    let y = unsafe *b;
+    let (x, y, same) = Eq[K, K]::eq(x, y);
+    unsafe *a = x;
+    unsafe *b = y;
+    same
+}
+
+forall K, V where Eq[K, K].
+unsafe fn find_chain(head: *Entry[K, V], key_ptr: *K) -> Found[*V] {
+    var cur = head;
+    var found: Found[*V] = Found::Missing;
+    while unsafe (cur as usize) != 0usize {
+        let e = unsafe *cur;
+        let { key: k, val: vp, next: nx } = e;
+        cur = if unsafe keys_equal[K](k, key_ptr) {
+            found = Found::Item.(vp);
+            unsafe null_entry[K, V]()
+        } else {
+            nx
+        };
+    }
+    found
+}
+
+// Stores `val` under the key at `key_ptr`. When the key was already
+// present, the entry keeps its stored key, and the given key and the
+// replaced value come back.
+forall K, V where Eq[K, K].
+unsafe fn put_chain(head: *Entry[K, V], key_ptr: *K, val: V) -> (*Entry[K, V], Found[(K, V)], bool) {
+    if unsafe is_null_entry[K, V](head) {
+        let vp = unsafe alloc_one[V](val);
+        return (unsafe alloc_entry[K, V](key_ptr, vp, head), Found::Missing, true);
+    }
+    let e = unsafe *head;
+    let { key: k, val: vp, next: nx } = e;
+    if unsafe keys_equal[K](k, key_ptr) {
+        let given = unsafe *key_ptr;
+        let u = unsafe free_one[K](key_ptr);
+        let old = unsafe *vp;
+        unsafe *vp = val;
+        return (head, Found::Item.((given, old)), false);
+    }
+    let (new_next, found, is_new) = unsafe put_chain[K, V](nx, key_ptr, val);
+    unsafe *head = Entry.{ key: k, val: vp, next: new_next };
+    (head, found, is_new)
+}
+
+// Unlinks the entry whose key equals the one at `key_ptr`, handing back
+// its stored key and value. The probe at `key_ptr` is left in place.
+forall K, V where Eq[K, K].
+unsafe fn take_chain(head: *Entry[K, V], key_ptr: *K) -> (*Entry[K, V], Found[(K, V)], bool) {
+    if unsafe is_null_entry[K, V](head) {
+        return (head, Found::Missing, false);
+    }
+    let e = unsafe *head;
+    let { key: k, val: vp, next: nx } = e;
+    if unsafe keys_equal[K](k, key_ptr) {
+        let stored = unsafe *k;
+        let old = unsafe *vp;
+        let u1 = unsafe free_one[K](k);
+        let u2 = unsafe free_one[V](vp);
+        let u3 = HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(unsafe (head as *u8)));
+        return (nx, Found::Item.((stored, old)), true);
+    }
+    let (new_next, found, removed) = unsafe take_chain[K, V](nx, key_ptr);
+    unsafe *head = Entry.{ key: k, val: vp, next: new_next };
+    (head, found, removed)
+}
+
+forall K, V where Hash[K].
+unsafe fn rehash_bucket_hashed(head: *Entry[K, V], new_base: *(*Entry[K, V]), new_bc: usize) -> () {
+    var cur = head;
+    while unsafe (cur as usize) != 0usize {
+        let e = unsafe *cur;
+        let { key: k, val: vp, next: nx } = e;
+        let idx = (unsafe hash_key[K](k) as usize) % new_bc;
+        let slot = unsafe slot_ptr[K, V](new_base, idx);
+        let old_head = unsafe *slot;
+        unsafe *cur = Entry.{ key: k, val: vp, next: old_head };
+        unsafe *slot = cur;
+        cur = nx;
+    }
+}
+
+forall K, V where Hash[K].
+unsafe fn resize_hashed(u_old: Uninit!, base: *(*Entry[K, V]), old_bc: usize) -> (Uninit!, usize) {
+    let new_bc = checked_mul(old_bc, 2usize);
+    let (u_new, new_base) = unsafe alloc_buckets[K, V](new_bc);
+    var i = 0usize;
+    while i < old_bc {
+        let head = unsafe *(unsafe slot_ptr[K, V](base, i));
+        let u = unsafe rehash_bucket_hashed[K, V](head, new_base, new_bc);
+        i = i + 1usize;
+    }
+    let u2 = HeapAllocator::drop(u_old);
+    (u_new, new_bc)
+}
+
+// The domain-keyed counterparts of the helpers above: `Copy` keys that
+// point into a domain, hashed and compared through its capability `cap`
+// (`HashIn`), which every helper threads and hands back.
+
+forall K, C where Copy[K], HashIn[K, C].
+fn hash_key_in(cap: C, key: K) -> (C, u64) {
+    let (cap, state) = HashIn[K, C]::hash_in(cap, key, HashState::new());
+    (cap, state.finish())
+}
+
+forall K, V, C where Copy[K], HashIn[K, C].
+unsafe fn find_chain_in(cap: C, head: *Entry[K, V], key: K) -> (C, Found[*V]) {
+    var cap = cap;
+    var cur = head;
+    var found: Found[*V] = Found::Missing;
+    while unsafe (cur as usize) != 0usize {
+        let e = unsafe *cur;
+        let { key: k, val: vp, next: nx } = e;
+        let (c, same) = HashIn[K, C]::eq_in(cap, unsafe *k, key);
+        cap = c;
+        cur = if same {
+            found = Found::Item.(vp);
+            unsafe null_entry[K, V]()
+        } else {
+            nx
+        };
+    }
+    (cap, found)
+}
+
+// Stores `val` under `key`, handing back the value it replaces.
+forall K, V, C where Copy[K], HashIn[K, C].
+unsafe fn put_chain_in(cap: C, head: *Entry[K, V], key: K, val: V) -> (C, *Entry[K, V], Found[V], bool) {
+    if unsafe is_null_entry[K, V](head) {
+        let kp = unsafe alloc_one[K](key);
+        let vp = unsafe alloc_one[V](val);
+        return (cap, unsafe alloc_entry[K, V](kp, vp, head), Found::Missing, true);
+    }
+    let e = unsafe *head;
+    let { key: k, val: vp, next: nx } = e;
+    let (cap, same) = HashIn[K, C]::eq_in(cap, unsafe *k, key);
+    if same {
+        let old = unsafe *vp;
+        unsafe *vp = val;
+        return (cap, head, Found::Item.(old), false);
+    }
+    let (cap, new_next, found, is_new) = unsafe put_chain_in[K, V, C](cap, nx, key, val);
+    unsafe *head = Entry.{ key: k, val: vp, next: new_next };
+    (cap, head, found, is_new)
+}
+
+// Unlinks `key`'s entry, handing back its value.
+forall K, V, C where Copy[K], HashIn[K, C].
+unsafe fn take_chain_in(cap: C, head: *Entry[K, V], key: K) -> (C, *Entry[K, V], Found[V], bool) {
+    if unsafe is_null_entry[K, V](head) {
+        return (cap, head, Found::Missing, false);
+    }
+    let e = unsafe *head;
+    let { key: k, val: vp, next: nx } = e;
+    let (cap, same) = HashIn[K, C]::eq_in(cap, unsafe *k, key);
+    if same {
+        let old = unsafe *vp;
+        let u1 = unsafe free_one[K](k);
+        let u2 = unsafe free_one[V](vp);
+        let u3 = HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(unsafe (head as *u8)));
+        return (cap, nx, Found::Item.(old), true);
+    }
+    let (cap, new_next, found, removed) = unsafe take_chain_in[K, V, C](cap, nx, key);
+    unsafe *head = Entry.{ key: k, val: vp, next: new_next };
+    (cap, head, found, removed)
+}
+
+forall K, V, C where Copy[K], HashIn[K, C].
+unsafe fn rehash_bucket_in(cap: C, head: *Entry[K, V], new_base: *(*Entry[K, V]), new_bc: usize) -> C {
+    var cap = cap;
+    var cur = head;
+    while unsafe (cur as usize) != 0usize {
+        let e = unsafe *cur;
+        let { key: k, val: vp, next: nx } = e;
+        let (c, h) = hash_key_in[K, C](cap, unsafe *k);
+        cap = c;
+        let idx = (h as usize) % new_bc;
+        let slot = unsafe slot_ptr[K, V](new_base, idx);
+        let old_head = unsafe *slot;
+        unsafe *cur = Entry.{ key: k, val: vp, next: old_head };
+        unsafe *slot = cur;
+        cur = nx;
+    }
+    cap
+}
+
+forall K, V, C where Copy[K], HashIn[K, C].
+unsafe fn resize_in(cap: C, u_old: Uninit!, base: *(*Entry[K, V]), old_bc: usize) -> (C, Uninit!, usize) {
+    var cap = cap;
+    let new_bc = checked_mul(old_bc, 2usize);
+    let (u_new, new_base) = unsafe alloc_buckets[K, V](new_bc);
+    var i = 0usize;
+    while i < old_bc {
+        let head = unsafe *(unsafe slot_ptr[K, V](base, i));
+        cap = unsafe rehash_bucket_in[K, V, C](cap, head, new_base, new_bc);
+        i = i + 1usize;
+    }
+    let u2 = HeapAllocator::drop(u_old);
+    (cap, u_new, new_bc)
+}
+
+forall K, V, 'k where Copy[K].
+impl HashMap[K, V, 'k] {
+    // `get` for a `Copy` key that points into a domain, hashed and compared
+    // through that domain's capability `cap`, which comes back.
+    forall C where HashIn[K, C].
+    fn get_in(&self, &tag: Exclusive!['k], &cap: C, key: K) -> Found[Ref[V, 'k]] {
+        let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n } = self;
+        let (base, m) = r.into_parts();
+        let (cap_back, h) = hash_key_in[K, C](cap, key);
+        cap = cap_back;
+        let head = unsafe *(unsafe slot_ptr[K, V](base, (h as usize) % bc));
+        let (cap_back, found_vp) = unsafe find_chain_in[K, V, C](cap, head, key);
+        cap = cap_back;
+        let found: Found[Ref[V, 'k]] = match found_vp {
+            Found::Item(vp) => Found::Item.(unsafe Ref::from_raw(vp, m)),
+            Found::Missing => Found::Missing,
+        };
+        self = HashMap.{ alloc: a, back: bk, buckets: r, bucket_count: bc, len: n };
+        found
+    }
+
+    // `insert` for a domain key: stores `val` under `key`, handing back the
+    // value it replaces. The map comes back freshly branded, as from
+    // `insert`.
+    forall C where HashIn[K, C].
+    fn insert_in(self, tag: Exclusive!['k], cap: C, key: K, val: V) -> exists '2. (Exclusive!['2], C, HashMap![K, V, '2], Found[V]) {
+        let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n } = self;
+        let (base, m) = r.into_parts();
+        let (cap, h) = hash_key_in[K, C](cap, key);
+        let s = unsafe slot_ptr[K, V](base, (h as usize) % bc);
+        let head = unsafe *s;
+        let (cap, new_head, found, is_new) = unsafe put_chain_in[K, V, C](cap, head, key, val);
+        unsafe *s = new_head;
+        let new_len = if is_new { n + 1usize } else { n };
+        let should_resize = is_new && new_len > bc * 3usize / 4usize;
+        let rg = bk.resume(tag);
+        let u0 = a.release(rg);
+        let (cap, u1, new_bc) = if should_resize {
+            unsafe resize_in[K, V, C](cap, u0, base, bc)
+        } else {
+            (cap, u0, bc)
+        };
+        let exists 'open1. (a2, rg2) = Allocation::adopt[*Entry[K, V]](u1);
+        let (tag2, r2, bk2) = rg2.share();
+        pack 'open1. (tag2, cap, HashMap.{ alloc: a2, back: bk2, buckets: r2, bucket_count: new_bc, len: new_len }, found)
+    }
+
+    // `remove` for a domain key, handing back its value.
+    forall C where HashIn[K, C].
+    fn remove_in(&self, &tag: Exclusive!['k], &cap: C, key: K) -> Found[V] {
+        let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n } = self;
+        let (base, m) = r.into_parts();
+        let (cap_back, h) = hash_key_in[K, C](cap, key);
+        cap = cap_back;
+        let s = unsafe slot_ptr[K, V](base, (h as usize) % bc);
+        let head = unsafe *s;
+        let (cap_back, new_head, found, removed) = unsafe take_chain_in[K, V, C](cap, head, key);
+        cap = cap_back;
+        unsafe *s = new_head;
+        let new_len = if removed { n - 1usize } else { n };
+        self = HashMap.{ alloc: a, back: bk, buckets: r, bucket_count: bc, len: new_len };
+        found
+    }
+}
+
+forall K, V, 'k where Hash[K], Eq[K, K].
+impl HashMap[K, V, 'k] {
+    // The value stored under `key`, if any; `key` comes back either way.
+    fn get(&self, &tag: Exclusive!['k], &key: K) -> Found[Ref[V, 'k]] {
+        let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n } = self;
+        let (base, m) = r.into_parts();
+        let probe = unsafe alloc_one[K](key);
+        let idx = (unsafe hash_key[K](probe) as usize) % bc;
+        let head = unsafe *(unsafe slot_ptr[K, V](base, idx));
+        let found_vp = unsafe find_chain[K, V](head, probe);
+        key = unsafe *probe;
+        let u = unsafe free_one[K](probe);
+        let found: Found[Ref[V, 'k]] = match found_vp {
+            Found::Item(vp) => Found::Item.(unsafe Ref::from_raw(vp, m)),
+            Found::Missing => Found::Missing,
+        };
+        self = HashMap.{ alloc: a, back: bk, buckets: r, bucket_count: bc, len: n };
+        found
+    }
+
+    // Stores `val` under `key`. When `key` was already present, the map
+    // keeps its stored key and hands back the given key with the value it
+    // replaced. The bucket array may move, so the map comes back freshly
+    // branded.
+    fn insert(self, tag: Exclusive!['k], key: K, val: V) -> exists '2. (Exclusive!['2], HashMap![K, V, '2], Found[(K, V)]) {
+        let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n } = self;
+        let (base, m) = r.into_parts();
+        let key_ptr = unsafe alloc_one[K](key);
+        let idx = (unsafe hash_key[K](key_ptr) as usize) % bc;
+        let s = unsafe slot_ptr[K, V](base, idx);
+        let head = unsafe *s;
+        let (new_head, found, is_new) = unsafe put_chain[K, V](head, key_ptr, val);
+        unsafe *s = new_head;
+        let new_len = if is_new { n + 1usize } else { n };
+        let should_resize = is_new && new_len > bc * 3usize / 4usize;
+        let rg = bk.resume(tag);
+        let u0 = a.release(rg);
+        let (u1, new_bc) = if should_resize {
+            unsafe resize_hashed[K, V](u0, base, bc)
+        } else {
+            (u0, bc)
+        };
+        let exists 'open1. (a2, rg2) = Allocation::adopt[*Entry[K, V]](u1);
+        let (tag2, r2, bk2) = rg2.share();
+        pack 'open1. (tag2, HashMap.{ alloc: a2, back: bk2, buckets: r2, bucket_count: new_bc, len: new_len }, found)
+    }
+
+    // Removes the entry stored under `key`, handing back its stored key and
+    // value; `key` itself comes back too.
+    fn remove(self, tag: Exclusive!['k], key: K) -> exists '2. (Exclusive!['2], HashMap![K, V, '2], K, Found[(K, V)]) {
+        let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n } = self;
+        let (base, m) = r.into_parts();
+        let probe = unsafe alloc_one[K](key);
+        let idx = (unsafe hash_key[K](probe) as usize) % bc;
+        let s = unsafe slot_ptr[K, V](base, idx);
+        let head = unsafe *s;
+        let (new_head, found, removed) = unsafe take_chain[K, V](head, probe);
+        unsafe *s = new_head;
+        let key = unsafe *probe;
+        let u = unsafe free_one[K](probe);
+        let new_len = if removed { n - 1usize } else { n };
+        let rg = bk.resume(tag);
+        let u0 = a.release(rg);
+        let exists 'open1. (a2, rg2) = Allocation::adopt[*Entry[K, V]](u0);
+        let (tag2, r2, bk2) = rg2.share();
+        pack 'open1. (tag2, HashMap.{ alloc: a2, back: bk2, buckets: r2, bucket_count: bc, len: new_len }, key, found)
+    }
+}
+
+// Whether the stored key at `k` equals the probe at `q`; both are put back.
+forall K, Q where Eq[K, Q].
+unsafe fn key_matches(k: *K, q: *Q) -> bool {
+    let x = unsafe *k;
+    let y = unsafe *q;
+    let (x, y, same) = Eq[K, Q]::eq(x, y);
+    unsafe *k = x;
+    unsafe *q = y;
+    same
+}
+
+forall K, V, Q where Eq[K, Q].
+unsafe fn find_chain_by(head: *Entry[K, V], probe: *Q) -> Found[*V] {
+    var cur = head;
+    var found: Found[*V] = Found::Missing;
+    while unsafe (cur as usize) != 0usize {
+        let e = unsafe *cur;
+        let { key: k, val: vp, next: nx } = e;
+        cur = if unsafe key_matches[K, Q](k, probe) {
+            found = Found::Item.(vp);
+            unsafe null_entry[K, V]()
+        } else {
+            nx
+        };
+    }
+    found
+}
+
+forall K, V, 'k.
+impl HashMap[K, V, 'k] {
+    // Looks up by a probe of another type that hashes like the stored keys
+    // and compares equal to the one it stands for -- typically a borrowed
+    // view of an owned key (`Readable` for `Buffer!`, see `core::borrow`),
+    // so a lookup needs no owned key. The probe comes back.
+    forall Q where Hash[Q], Eq[K, Q].
+    fn find(&self, &tag: Exclusive!['k], &probe: Q) -> Found[Ref[V, 'k]] {
+        let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n } = self;
+        let (base, m) = r.into_parts();
+        let slot = unsafe alloc_one[Q](probe);
+        let idx = (unsafe hash_key[Q](slot) as usize) % bc;
+        let head = unsafe *(unsafe slot_ptr[K, V](base, idx));
+        let found_vp = unsafe find_chain_by[K, V, Q](head, slot);
+        probe = unsafe *slot;
+        let u = unsafe free_one[Q](slot);
+        let found: Found[Ref[V, 'k]] = match found_vp {
+            Found::Item(vp) => Found::Item.(unsafe Ref::from_raw(vp, m)),
+            Found::Missing => Found::Missing,
+        };
+        self = HashMap.{ alloc: a, back: bk, buckets: r, bucket_count: bc, len: n };
+        found
+    }
+}
+
+forall K, V where Copy[K], Copy[V].
+fn forget_entry(key: K, value: V) -> () {
+    ()
+}
+
+forall K, V, 'k where Copy[K], Copy[V].
+impl HashMap[K, V, 'k] {
+    // Frees a map of `Copy` keys and values, which need no per-entry callback.
+    fn free(self, tag: Exclusive!['k]) -> () {
+        self.destroy(tag, forget_entry[K, V])
+    }
+}
+
+// ---------------------------------------------------------------------
+// Draining: the map's entries, moved out one at a time.
+
+// The map being taken apart: the bucket being walked, and the entry in it
+// that comes next. Holds the map's capability, so nothing else can touch
+// the entries meanwhile.
+forall K, V, 'k.
+struct Drain! {
+    alloc: Allocation![*Entry[K, V], 'k],
+    back: RegionResume![*Entry[K, V], 'k],
+    tag: Exclusive!['k],
+    base: *(*Entry[K, V]),
+    bucket_count: usize,
+    next_bucket: usize,
+    cur: *Entry[K, V],
+}
+
+forall K, V, 'k.
+impl HashMap[K, V, 'k] {
+    // Every entry, as an `Iterator` of owned `(key, value)` pairs, in no
+    // particular order. `Drain::finish` frees what is left.
+    fn drain(self, tag: Exclusive!['k]) -> Drain![K, V, 'k] {
+        let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n } = self;
+        let (base, m) = r.into_parts();
+        Drain.{ alloc: a, back: bk, tag, base, bucket_count: bc, next_bucket: 0usize, cur: unsafe null_entry[K, V]() }
+    }
+}
+
+forall K, V, 'k.
+impl Drain[K, V, 'k] {
+    // The next entry, moved out of the map and freed from it.
+    fn take(&self) -> Option[(K, V)] {
+        let { alloc, back, tag, base, bucket_count, next_bucket, cur } = self;
+        var cur = cur;
+        var next_bucket = next_bucket;
+        // The drain holds the map's capability, so `base` and every entry
+        // reached from it are still the map's own.
+        while unsafe is_null_entry[K, V](cur) && next_bucket < bucket_count {
+            cur = unsafe *(unsafe slot_ptr[K, V](base, next_bucket));
+            unsafe *(unsafe slot_ptr[K, V](base, next_bucket)) = unsafe null_entry[K, V]();
+            next_bucket = next_bucket + 1usize;
+        }
+        if unsafe is_null_entry[K, V](cur) {
+            self = Drain.{ alloc, back, tag, base, bucket_count, next_bucket, cur };
+            return Option::None;
+        }
+        let e = unsafe *cur;
+        let { key: kp, val: vp, next: nx } = e;
+        let k = unsafe *kp;
+        let v = unsafe *vp;
+        let u1 = unsafe free_one[K](kp);
+        let u2 = unsafe free_one[V](vp);
+        let u3 = HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(unsafe (cur as *u8)));
+        self = Drain.{ alloc, back, tag, base, bucket_count, next_bucket, cur: nx };
+        Option::Some.((k, v))
+    }
+
+    // Ends the drain: `f` disposes of every entry not yet taken, and the
+    // bucket array is freed.
+    fn finish(self, f: fn(K, V) -> ()) -> () {
+        let { alloc, back, tag, base, bucket_count, next_bucket, cur } = self;
+        let u = unsafe destroy_chain[K, V](cur, f);
+        var i = next_bucket;
+        while i < bucket_count {
+            let head = unsafe *(unsafe slot_ptr[K, V](base, i));
+            let u = unsafe destroy_chain[K, V](head, f);
+            i = i + 1usize;
+        }
+        let rg = back.resume(tag);
+        HeapAllocator::drop(alloc.release(rg))
+    }
+}
+
+// As an `Iterator`, each entry is a `Pair { a: key, b: value }`, the item
+// type `core::iter::zip` uses.
+forall K, V, 'k.
+instance Iterator[Drain![K, V, 'k] -> Pair[K, V]] {
+    fn next(&it: Drain![K, V, 'k]) -> Option[Pair[K, V]] {
+        let taken = &it.take();
+        match taken {
+            Option::Some(entry) => {
+                let (k, v) = entry;
+                Option::Some.(Pair.{ a: k, b: v })
+            },
+            Option::None => Option::None,
+        }
+    }
+}
+
+// ------------------------------------------------------------ OwnedMap! --
+// A `HashMap!` packaged with its capability, for a map kept across calls or
+// in a loop variable without naming its brand. Each method opens the
+// package, calls the `HashMap!` method and repacks the result under
+// whatever brand it returned. `inner` is the package itself: open it for
+// the branded API and pack it back afterwards.
+forall K, V.
+exposed struct OwnedMap! {
+    inner: exists 'm. (Exclusive!['m], HashMap![K, V, 'm]),
+}
+
+forall K, V.
+impl OwnedMap[K, V] {
+    fn new() -> OwnedMap![K, V] {
+        OwnedMap.{ inner: HashMap::new[K, V]() }
+    }
+
+    fn len(&self) -> usize {
+        let exists 'm. (tag, map) = self.inner;
+        let n = &map.len(&tag);
+        self = OwnedMap.{ inner: pack 'm. (tag, map) };
+        n
+    }
+
+    // Every entry, moved out, in no particular order (see `HashMap::drain`).
+    fn drain(self) -> exists 'm. Drain![K, V, 'm] {
+        let exists 'm. (tag, map) = self.inner;
+        pack 'm. map.drain(tag)
+    }
+
+    // Frees the map, handing each entry to `f` first.
+    fn destroy(self, f: fn(K, V) -> ()) -> () {
+        let exists 'm. (tag, map) = self.inner;
+        map.destroy(tag, f)
+    }
+}
+
+forall K, V where Hash[K], Eq[K, K].
+impl OwnedMap[K, V] {
+    // Stores `val` under `key`, handing back the entry it replaces.
+    fn insert(&self, key: K, val: V) -> Found[(K, V)] {
+        let exists 'm. (tag, map) = self.inner;
+        let exists '2. (tag, map, old) = map.insert(tag, key, val);
+        self = OwnedMap.{ inner: pack '2. (tag, map) };
+        old
+    }
+
+    // Removes `key`'s entry, handing it back with the key.
+    fn remove(&self, key: K) -> (K, Found[(K, V)]) {
+        let exists 'm. (tag, map) = self.inner;
+        let exists '2. (tag, map, key, old) = map.remove(tag, key);
+        self = OwnedMap.{ inner: pack '2. (tag, map) };
+        (key, old)
+    }
+
+    // Calls `f` on `key`'s value in place: `f` takes the value and hands it
+    // back with a result. When the key is absent `f` is dropped uncalled,
+    // so what it captures must be `Copy`. The key comes back.
+    forall Ret, Env where Copy[Env].
+    fn with(&self, key: K, f: closure[Env](V) -> (V, Ret)) -> (K, Found[Ret]) {
+        let exists 'm. (tag, map) = self.inner;
+        let slot = &map.get(&tag, &key);
+        let (tag, result) = match slot {
+            Found::Item(r) => {
+                let ret = r.with(&tag, f);
+                (tag, Found::Item.(ret))
+            },
+            Found::Missing => (tag, Found::Missing),
+        };
+        self = OwnedMap.{ inner: pack 'm. (tag, map) };
+        (key, result)
+    }
+
+    // Calls `f` on `key`'s value where it lives: `f` gets it through `&`,
+    // and nothing is copied out or back. When the key is absent `f` is
+    // dropped uncalled, so what it captures must be `Copy`. The key comes
+    // back.
+    forall Ret, Env where Copy[Env].
+    fn update(&self, key: K, f: closure[Env](&_: V) -> Ret) -> (K, Found[Ret]) {
+        let exists 'm. (tag, map) = self.inner;
+        let slot = &map.get(&tag, &key);
+        let (tag, result) = match slot {
+            Found::Item(r) => {
+                let ret = r.update(&tag, f);
+                (tag, Found::Item.(ret))
+            },
+            Found::Missing => (tag, Found::Missing),
+        };
+        self = OwnedMap.{ inner: pack 'm. (tag, map) };
+        (key, result)
+    }
+
+    // `update`, with a context `cx` lent to `f` beside the value: the linear
+    // values `f` works on, which it cannot capture.
+    forall C, Ret, Env where Copy[Env].
+    fn update_in(&self, key: K, &cx: C, f: closure[Env](&_: V, &_: C) -> Ret) -> (K, Found[Ret]) {
+        let exists 'm. (tag, map) = self.inner;
+        let slot = &map.get(&tag, &key);
+        let (tag, result) = match slot {
+            Found::Item(r) => {
+                let ret = r.update_in(&tag, &cx, f);
+                (tag, Found::Item.(ret))
+            },
+            Found::Missing => (tag, Found::Missing),
+        };
+        self = OwnedMap.{ inner: pack 'm. (tag, map) };
+        (key, result)
+    }
+
+    // `update`, looking the key up by a probe of another type, as
+    // `HashMap::find` does. The probe comes back.
+    forall Q, Ret, Env where Hash[Q], Eq[K, Q], Copy[Env].
+    fn find_update(&self, probe: Q, f: closure[Env](&_: V) -> Ret) -> (Q, Found[Ret]) {
+        let exists 'm. (tag, map) = self.inner;
+        let slot = &map.find(&tag, &probe);
+        let (tag, result) = match slot {
+            Found::Item(r) => {
+                let ret = r.update(&tag, f);
+                (tag, Found::Item.(ret))
+            },
+            Found::Missing => (tag, Found::Missing),
+        };
+        self = OwnedMap.{ inner: pack 'm. (tag, map) };
+        (probe, result)
+    }
+
+    // `with`, looking the key up by a probe of another type, as
+    // `HashMap::find` does. The probe comes back.
+    forall Q, Ret, Env where Hash[Q], Eq[K, Q], Copy[Env].
+    fn find_with(&self, probe: Q, f: closure[Env](V) -> (V, Ret)) -> (Q, Found[Ret]) {
+        let exists 'm. (tag, map) = self.inner;
+        let slot = &map.find(&tag, &probe);
+        let (tag, result) = match slot {
+            Found::Item(r) => {
+                let ret = r.with(&tag, f);
+                (tag, Found::Item.(ret))
+            },
+            Found::Missing => (tag, Found::Missing),
+        };
+        self = OwnedMap.{ inner: pack 'm. (tag, map) };
+        (probe, result)
+    }
+}
+
+forall K, V where Hash[K], Eq[K, K], Copy[V].
+impl OwnedMap[K, V] {
+    // A copy of `key`'s value. The key comes back.
+    fn get(&self, key: K) -> (K, Found[V]) {
+        let exists 'm. (tag, map) = self.inner;
+        let slot = &map.get(&tag, &key);
+        let (tag, value) = match slot {
+            Found::Item(r) => {
+                let value = r.copy(&tag);
+                (tag, Found::Item.(value))
+            },
+            Found::Missing => (tag, Found::Missing),
+        };
+        self = OwnedMap.{ inner: pack 'm. (tag, map) };
+        (key, value)
+    }
+}
+
+forall K, V where Copy[K].
+impl OwnedMap[K, V] {
+    // `insert` for a `Copy` key that points into a domain, hashed and
+    // compared through that domain's capability `cap`. Hands back the value
+    // it replaces.
+    forall C where HashIn[K, C].
+    fn insert_in(&self, &cap: C, key: K, val: V) -> Found[V] {
+        let exists 'm. (tag, map) = self.inner;
+        let exists '2. (tag, cap_back, map, old) = map.insert_in(tag, cap, key, val);
+        cap = cap_back;
+        self = OwnedMap.{ inner: pack '2. (tag, map) };
+        old
+    }
+
+    // `remove` for a domain key, handing back its value.
+    forall C where HashIn[K, C].
+    fn remove_in(&self, &cap: C, key: K) -> Found[V] {
+        let exists 'm. (tag, map) = self.inner;
+        let old = &map.remove_in(&tag, &cap, key);
+        self = OwnedMap.{ inner: pack 'm. (tag, map) };
+        old
+    }
+
+    // `with` for a domain key: calls `f` on `key`'s value in place.
+    forall C, Ret, Env where HashIn[K, C], Copy[Env].
+    fn with_in(&self, &cap: C, key: K, f: closure[Env](V) -> (V, Ret)) -> Found[Ret] {
+        let exists 'm. (tag, map) = self.inner;
+        let slot = &map.get_in(&tag, &cap, key);
+        let (tag, result) = match slot {
+            Found::Item(r) => {
+                let ret = r.with(&tag, f);
+                (tag, Found::Item.(ret))
+            },
+            Found::Missing => (tag, Found::Missing),
+        };
+        self = OwnedMap.{ inner: pack 'm. (tag, map) };
+        result
+    }
+}
+
+forall K, V where Copy[K], Copy[V].
+impl OwnedMap[K, V] {
+    // `get` for a domain key: a copy of its value.
+    forall C where HashIn[K, C].
+    fn get_in(&self, &cap: C, key: K) -> Found[V] {
+        let exists 'm. (tag, map) = self.inner;
+        let slot = &map.get_in(&tag, &cap, key);
+        let (tag, value) = match slot {
+            Found::Item(r) => {
+                let value = r.copy(&tag);
+                (tag, Found::Item.(value))
+            },
+            Found::Missing => (tag, Found::Missing),
+        };
+        self = OwnedMap.{ inner: pack 'm. (tag, map) };
+        value
+    }
+}
+
+forall K, V where Copy[K], Copy[V].
+impl OwnedMap[K, V] {
+    // Frees a map of `Copy` keys and values, which need no per-entry callback.
+    fn free(self) -> () {
+        let exists 'm. (tag, map) = self.inner;
+        map.free(tag)
+    }
+}

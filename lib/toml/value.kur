@@ -1,0 +1,371 @@
+// toml::value -- TOML values and keys. Document headers are
+// `toml::document`'s. Only strings and tables are supported; other TOML
+// values are rejected rather than read as strings.
+
+use std::raw::span_byte_or_zero;
+use std::raw::{ span_bytes_eq };
+use package::lex::{TomlToken, TomlTokenKind, TomlError, tokenize};
+use std::alloc::arena::Arena;
+use std::bytes::buffer::Buffer;
+use std::collections::list::List;
+use std::cap::Exclusive;
+use std::option::Result;
+use std::raw::{ Span };
+
+// A string or a table of keyed values, in source order.
+forall 'k.
+exposed enum TomlValue {
+    String(Span['k]),
+    Table(List[TomlField['k], 'k]),
+}
+
+forall 'k.
+exposed struct TomlField {
+    key: Span['k],
+    value: TomlValue['k],
+}
+
+forall 'k.
+struct TomlAssignment {
+    path: List[Span['k], 'k],
+}
+
+// All unsafe parsing helpers require live lexer tokens and their arena-backed,
+// valid UTF-8 text. A brand alone does not establish these obligations.
+forall 'k.
+unsafe fn toml_bare_key(&tag: Exclusive!['k], text: Span['k]) -> bool {
+    var i = 0usize;
+    var valid = text.len() > 0usize;
+    while i < text.len() && valid {
+        let byte = span_byte_or_zero(&tag, text, i);
+        valid = (byte >= b'A' && byte <= b'Z') || (byte >= b'a' && byte <= b'z') || (byte >= b'0' && byte <= b'9') || byte == b'_' || byte == b'-';
+        i = i + 1usize;
+    }
+    valid
+}
+
+// Stops before the first non-dot token. Empty quoted keys are valid TOML;
+// multiline strings and non-ASCII bare keys are not.
+forall 'k.
+unsafe fn toml_key(
+    &tag: Exclusive!['k],
+    &arena: Arena!['k],
+    tokens: List[TomlToken['k], 'k],
+) -> Result[(List[Span['k], 'k], List[TomlToken['k], 'k]), TomlError] {
+    var pending = tokens;
+    var parts = List::Empty;
+    var running = true;
+    var status = Result[(), TomlError]::Ok.(());
+    while running {
+        match pending {
+            List::Empty => {
+                status = Result[(), TomlError]::Err.(TomlError::Syntax.(0usize));
+                running = false;
+            },
+            List::Cell(r) => {
+                let cell = r.copy(&tag);
+                let token = cell.head;
+                let key: Result[Span['k], TomlError] = match token.kind {
+                    TomlTokenKind::Text(text) => {
+                        if token.multiline {
+                            Result[Span['k], TomlError]::Err.(TomlError::Syntax.(token.offset))
+                        } else {
+                            Result::Ok.(text)
+                        }
+                    },
+                    TomlTokenKind::Bare(text) => {
+                        if unsafe toml_bare_key(&tag, text) {
+                            Result::Ok.(text)
+                        } else {
+                            Result[Span['k], TomlError]::Err.(TomlError::Syntax.(token.offset))
+                        }
+                    },
+                    _ => Result[Span['k], TomlError]::Err.(TomlError::Syntax.(token.offset)),
+                };
+                match key {
+                    Result::Err(error) => {
+                        status = Result[(), TomlError]::Err.(error);
+                        running = false;
+                    },
+                    Result::Ok(name) => {
+                        parts = parts.cons(&tag, &arena, name);
+                        pending = cell.tail;
+                        match pending {
+                            List::Empty => {
+                                running = false;
+                            },
+                            List::Cell(next) => {
+                                let after = next.copy(&tag);
+                                match after.head.kind {
+                                    TomlTokenKind::Dot => {
+                                        pending = after.tail;
+                                    },
+                                    _ => {
+                                        running = false;
+                                    },
+                                }
+                            },
+                        }
+                    },
+                }
+            },
+        }
+    }
+    match status {
+        Result::Err(error) => Result::Err.(error),
+        Result::Ok(unit) => {
+            let ordered = parts.reverse(&tag, &arena, List::Empty);
+            Result::Ok.((ordered, pending))
+        },
+    }
+}
+
+forall 'k.
+unsafe fn toml_path_prefix(&tag: Exclusive!['k], a: List[Span['k], 'k], b: List[Span['k], 'k]) -> bool {
+    match a {
+        List::Empty => true,
+        List::Cell(ar) => {
+            let ac = ar.copy(&tag);
+            match b {
+                List::Empty => false,
+                List::Cell(br) => {
+                    let bc = br.copy(&tag);
+                    if span_bytes_eq(&tag, ac.head, bc.head) {
+                        unsafe toml_path_prefix(&tag, ac.tail, bc.tail)
+                    } else {
+                        false
+                    }
+                },
+            }
+        },
+    }
+}
+
+// An assignment's value is complete, even if it is an inline table. No later
+// assignment may replace it, extend it, or replace one of its ancestors.
+forall 'k.
+unsafe fn toml_assignment_conflict(&tag: Exclusive!['k], assignments: List[TomlAssignment['k], 'k], path: List[Span['k], 'k]) -> bool {
+    match assignments {
+        List::Empty => false,
+        List::Cell(r) => {
+            let cell = r.copy(&tag);
+            let forward = unsafe toml_path_prefix(&tag, cell.head.path, path);
+            let backward = unsafe toml_path_prefix(&tag, path, cell.head.path);
+            if forward || backward {
+                true
+            } else {
+                unsafe toml_assignment_conflict(&tag, cell.tail, path)
+            }
+        },
+    }
+}
+
+// Persistent insertion expands dotted keys into ordinary normalized tables.
+// Callers check complete-assignment conflicts before insertion; this helper
+// independently rejects a scalar used as a table or a repeated leaf. Header
+// insertion can retain an existing table; document metadata checks whether
+// declaring that table is legal before requesting this mode.
+forall 'k.
+unsafe fn toml_insert(
+    &tag: Exclusive!['k],
+    &arena: Arena!['k],
+    fields: List[TomlField['k], 'k],
+    path: List[Span['k], 'k],
+    value: TomlValue['k],
+    header: bool,
+) -> Result[List[TomlField['k], 'k], TomlError] {
+    match path {
+        List::Empty => Result::Err.(TomlError::Syntax.(0usize)),
+        List::Cell(pr) => {
+            let part = pr.copy(&tag);
+            match fields {
+                List::Empty => {
+                    let child: Result[TomlValue['k], TomlError] = match part.tail {
+                        List::Empty => Result::Ok.(value),
+                        _ => {
+                            match unsafe toml_insert(&tag, &arena, List::Empty, part.tail, value, header) {
+                                Result::Err(error) => Result::Err.(error),
+                                Result::Ok(nested) => Result::Ok.(TomlValue::Table.(nested)),
+                            }
+                        },
+                    };
+                    match child {
+                        Result::Err(error) => Result::Err.(error),
+                        Result::Ok(item) => {
+                            let added = fields.cons(&tag, &arena, TomlField.{ key: part.head, value: item });
+                            Result::Ok.(added)
+                        },
+                    }
+                },
+                List::Cell(fr) => {
+                    let field = fr.copy(&tag);
+                    if span_bytes_eq(&tag, field.head.key, part.head) {
+                        let child: Result[TomlValue['k], TomlError] = match part.tail {
+                            List::Empty => {
+                                match field.head.value {
+                                    TomlValue::Table(nested) => {
+                                        if header {
+                                            Result::Ok.(field.head.value)
+                                        } else {
+                                            Result[TomlValue['k], TomlError]::Err.(TomlError::Syntax.(0usize))
+                                        }
+                                    },
+                                    _ => Result[TomlValue['k], TomlError]::Err.(TomlError::Syntax.(0usize)),
+                                }
+                            },
+                            _ => {
+                                match field.head.value {
+                                    TomlValue::Table(nested) => {
+                                        match unsafe toml_insert(&tag, &arena, nested, part.tail, value, header) {
+                                            Result::Err(error) => Result::Err.(error),
+                                            Result::Ok(updated) => Result::Ok.(TomlValue::Table.(updated)),
+                                        }
+                                    },
+                                    _ => Result[TomlValue['k], TomlError]::Err.(TomlError::Syntax.(0usize)),
+                                }
+                            },
+                        };
+                        match child {
+                            Result::Err(error) => Result::Err.(error),
+                            Result::Ok(item) => {
+                                let updated = field.tail.cons(&tag, &arena, TomlField.{ key: part.head, value: item });
+                                Result::Ok.(updated)
+                            },
+                        }
+                    } else {
+                        match unsafe toml_insert(&tag, &arena, field.tail, path, value, header) {
+                            Result::Err(error) => Result::Err.(error),
+                            Result::Ok(updated) => {
+                                let rebuilt = updated.cons(&tag, &arena, field.head);
+                                Result::Ok.(rebuilt)
+                            },
+                        }
+                    }
+                },
+            }
+        },
+    }
+}
+
+forall 'k.
+unsafe fn toml_value(&tag: Exclusive!['k], &arena: Arena!['k], tokens: List[TomlToken['k], 'k]) -> Result[(TomlValue['k], List[TomlToken['k], 'k]), TomlError] {
+    match tokens {
+        List::Empty => Result::Err.(TomlError::Syntax.(0usize)),
+        List::Cell(r) => {
+            let cell = r.copy(&tag);
+            match cell.head.kind {
+                TomlTokenKind::Text(text) => Result::Ok.((TomlValue::String.(text), cell.tail)),
+                TomlTokenKind::OpenInline => { unsafe toml_inline(&tag, &arena, cell.tail) },
+                _ => Result::Err.(TomlError::Syntax.(cell.head.offset)),
+            }
+        },
+    }
+}
+
+forall 'k.
+unsafe fn toml_inline(
+    &tag: Exclusive!['k],
+    &arena: Arena!['k],
+    tokens: List[TomlToken['k], 'k],
+) -> Result[(TomlValue['k], List[TomlToken['k], 'k]), TomlError] {
+    var pending = tokens;
+    var assignments = List::Empty;
+    var fields = List::Empty;
+    var first = true;
+    while true {
+        let head = match pending {
+            List::Empty => {
+                return Result[(TomlValue['k], List[TomlToken['k], 'k]), TomlError]::Err.(TomlError::Syntax.(0usize));
+            },
+            List::Cell(r) => r.copy(&tag),
+        };
+        let closing = match head.head.kind {
+            TomlTokenKind::CloseInline => true,
+            _ => false,
+        };
+        if closing && first {
+            return Result[(TomlValue['k], List[TomlToken['k], 'k]), TomlError]::Ok.((TomlValue::Table.(fields), head.tail));
+        }
+        let (path, rest) = match unsafe toml_key(&tag, &arena, pending) {
+            Result::Err(error) => {
+                return Result[(TomlValue['k], List[TomlToken['k], 'k]), TomlError]::Err.(error);
+            },
+            Result::Ok(parsed) => parsed,
+        };
+        let equals = match rest {
+            List::Empty => {
+                return Result[(TomlValue['k], List[TomlToken['k], 'k]), TomlError]::Err.(TomlError::Syntax.(0usize));
+            },
+            List::Cell(r) => r.copy(&tag),
+        };
+        let valid = match equals.head.kind {
+            TomlTokenKind::Equals => true,
+            _ => false,
+        };
+        if !valid {
+            return Result[(TomlValue['k], List[TomlToken['k], 'k]), TomlError]::Err.(TomlError::Syntax.(equals.head.offset));
+        }
+        let (value, rest) = match unsafe toml_value(&tag, &arena, equals.tail) {
+            Result::Err(error) => {
+                return Result[(TomlValue['k], List[TomlToken['k], 'k]), TomlError]::Err.(error);
+            },
+            Result::Ok(parsed) => parsed,
+        };
+        let conflict = unsafe toml_assignment_conflict(&tag, assignments, path);
+        if conflict {
+            return Result[(TomlValue['k], List[TomlToken['k], 'k]), TomlError]::Err.(TomlError::Syntax.(head.head.offset));
+        }
+        let updated = match unsafe toml_insert(&tag, &arena, fields, path, value, false) {
+            Result::Err(error) => {
+                return Result[(TomlValue['k], List[TomlToken['k], 'k]), TomlError]::Err.(error);
+            },
+            Result::Ok(parsed) => parsed,
+        };
+        fields = updated;
+        assignments = assignments.cons(&tag, &arena, TomlAssignment.{ path });
+        let delimiter = match rest {
+            List::Empty => {
+                return Result[(TomlValue['k], List[TomlToken['k], 'k]), TomlError]::Err.(TomlError::Syntax.(0usize));
+            },
+            List::Cell(r) => r.copy(&tag),
+        };
+        let unit = match delimiter.head.kind {
+            TomlTokenKind::CloseInline => {
+                return Result[(TomlValue['k], List[TomlToken['k], 'k]), TomlError]::Ok.((TomlValue::Table.(fields), delimiter.tail));
+            },
+            TomlTokenKind::Comma => {
+                pending = delimiter.tail;
+                first = false;
+            },
+            _ => {
+                return Result[(TomlValue['k], List[TomlToken['k], 'k]), TomlError]::Err.(TomlError::Syntax.(delimiter.head.offset));
+            },
+        };
+    }
+    Result::Err.(TomlError::Syntax.(0usize))
+}
+
+// Owning boundary for a single value, useful independently of document parsing.
+// Token descriptors are not accepted from callers of this safe function.
+forall 'k.
+fn parse_value(&tag: Exclusive!['k], &arena: Arena!['k], input: Buffer!) -> Result[TomlValue['k], TomlError] {
+    let tokens = match tokenize(&tag, &arena, input) {
+        Result::Err(error) => {
+            return Result[TomlValue['k], TomlError]::Err.(error);
+        },
+        Result::Ok(parsed) => parsed,
+    };
+    let (value, rest) = match unsafe toml_value(&tag, &arena, tokens) {
+        Result::Err(error) => {
+            return Result[TomlValue['k], TomlError]::Err.(error);
+        },
+        Result::Ok(parsed) => parsed,
+    };
+    match rest {
+        List::Empty => Result::Ok.(value),
+        List::Cell(r) => {
+            let cell = r.copy(&tag);
+            Result::Err.(TomlError::Syntax.(cell.head.offset))
+        },
+    }
+}

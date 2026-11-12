@@ -1114,22 +1114,12 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         return self.emit("construct", ty, (env, code), ty=ty)
 
     def expr_foreach(self, expr: S.Foreach) -> Optional[str]:
-        """A foreach maps each component of a concrete struct, tuple or enum on its own: its body uses no
-        outer local, and its function has no premises for the mapper to inherit."""
         ty = self.substitute_type(expr.ty)
         self.check_closed(ty)
-        if expr.captures:
-            fail(f"a foreach body cannot use the outer local {expr.captures[0].name}", expr.pos)
-        if self.sig.premises:
-            fail("a foreach cannot be used in a function with premises", expr.pos)
-        assert isinstance(ty, C.Foreach)
-        source = ty.source.inner if isinstance(ty.source, C.Ptr) else ty.source
-        abstract = isinstance(source, C.Foreach) or isinstance(source, C.Named) and source.name in self.kinds
-        if abstract or not isinstance(self.types.shape(source), (C.Struct, C.Tuple, C.Enum)):
-            fail("a foreach source is a struct, tuple or enum whose shape is known here", expr.pos)
         vals = self.operands([expr.source] + [self.bindings[c.binder_id] for c in expr.captures])
         if vals is None:
             return None
+        assert isinstance(ty, C.Foreach)
         name = MapperLower(self, expr, ty).lower()
         return self.emit("foreach", ty, (vals[0], name, *vals[1:]), ty=ty, tys=self.identity_args(), node=expr)
 

@@ -1,0 +1,95 @@
+// `Borrow` -- how a key type that needs a live capability to read what it
+// points to (`Ref[T,'k]`, `Span['k]`, ...) gets from "I hold this handle"
+// to "here is a value I can hash or compare". A `Hash`/`Eq` instance that
+// reads through a bare pointer with `unsafe` trusts, without proof, that
+// its caller still holds a capability over the domain. `Borrow` makes that
+// requirement type-checked: the only way to obtain an `Out` is to present
+// a `Cap` value to `borrow`.
+//
+// `Out` is a fused value, not a capability-free snapshot: `borrow`
+// consumes `cap` into `Out` (`-> (Self, Out)`, no separate `Cap` left
+// over). So `Out` can itself be read again later (`Hash`/`Eq` instances
+// over it do exactly that), and two independently fused values of the same
+// domain can be alive at once -- `Borrowed!`'s `Eq` instance below needs
+// exactly that to compare two simultaneously held reads.
+//
+// A separate module from `core::hash`: `Borrow` is not about hashing or
+// comparing (an `Out` could feed any other operation), and nothing here
+// depends on `HashState`/`Hash` -- only on `core::mem::Ref` and
+// `core::cap::Shared!` for the instance below, and on `core::hash::Eq`
+// for that instance's `Eq`.
+//
+// Three type parameters, never dot-dispatchable: a multi-parameter trait
+// without determined parameters has no single receiver to dispatch on, so
+// every call site is written
+// `Borrow[ConcreteSelf, ConcreteCap, ConcreteOut]::borrow(key, cap)`.
+//
+// Free for a key with no indirection at all: `Cap = NoCap`, `Out = Self`,
+// `borrow` is the identity. There is no blanket instance; every concrete
+// `Self` writes its own, as with `Hash`/`Eq`.
+
+use package as core;
+
+use core::mem::Ref;
+use core::cap::Shared;
+use core::hash::Eq;
+use core::slice::{Slice, ReadBytes, Readable};
+
+forall Self, Cap, Out.
+trait Borrow {
+    fn borrow(key: Self, cap: Cap) -> (Self, Out);
+}
+
+// The "no capability needed" marker for `Borrow`'s `Cap` slot. An
+// instance's target must be a named or primitive type, so the empty tuple
+// `()` cannot fill that slot; a zero-field struct can. Copy, with no
+// fields, so threading it through `borrow` costs nothing at runtime.
+exposed struct NoCap {}
+
+// A `Ref[T,'k]` cannot be hashed or compared on its own (comparing
+// addresses would be pointer identity, not value identity), and `Eq` only
+// needs to read what it points to, never exclusive access, so the
+// capability fused in is `Shared!['k,'q]`, not `Exclusive!['k]`. Two
+// `Borrowed!` values over the same domain but different lineages (the two
+// children of one `Shared::split`) can be alive, and compared, at the same
+// time; two `Exclusive!['k]`-fused values of one domain never could be.
+// Linear because its `cap: Shared!['k,'q]` field is linear.
+forall T, 'k, 'q.
+exposed struct Borrowed! {
+    cap: Shared!['k, 'q],
+    ptr: Ref[T, 'k],
+}
+
+forall T, 'k, 'q.
+instance Borrow[Ref[T, 'k], Shared!['k, 'q], Borrowed![T, 'k, 'q]] {
+    fn borrow(key: Ref[T, 'k], cap: Shared!['k, 'q]) -> (Ref[T, 'k], Borrowed![T, 'k, 'q]) {
+        (key, Borrowed.{ cap: cap, ptr: key })
+    }
+}
+
+// Why `Eq` is `Eq[A, B]` rather than `Eq[Self]`: two independently split
+// reads of one domain are `Borrowed![T,'k,'q1]` and `Borrowed![T,'k,'q2]`
+// for different lineage brands `'q1`/`'q2` -- two different types a
+// homogeneous `Eq[Self]` could not compare.
+forall T, 'k, 'q1, 'q2 where Copy[T], Eq[T, T].
+instance Eq[Borrowed![T, 'k, 'q1], Borrowed![T, 'k, 'q2]] {
+    fn eq(a: Borrowed![T, 'k, 'q1], b: Borrowed![T, 'k, 'q2]) -> (Borrowed![T, 'k, 'q1], Borrowed![T, 'k, 'q2], bool) {
+        let { cap: ca, ptr: pa } = a;
+        let { cap: cb, ptr: pb } = b;
+        let va = pa.read(&ca);
+        let vb = pb.read(&cb);
+        let (va2, vb2, is_eq) = Eq[T, T]::eq(va, vb);
+        (Borrowed.{ cap: ca, ptr: pa }, Borrowed.{ cap: cb, ptr: pb }, is_eq)
+    }
+}
+
+// A byte view borrowed through any read capability it can be read with
+// (`Exclusive!`, `Shared!`, `StaticRead`) is a `Readable`, which hashes and
+// compares by its bytes. That is what lets a map keyed by owned text be
+// searched with a borrowed view (`HashMap::find`), with no copy.
+forall C, 'k where ReadBytes[C, Slice[u8, 'k]].
+instance Borrow[Slice[u8, 'k], C, Readable[C, Slice[u8, 'k]]] {
+    fn borrow(key: Slice[u8, 'k], cap: C) -> (Slice[u8, 'k], Readable[C, Slice[u8, 'k]]) {
+        (key, Readable.{ cap, bytes: key })
+    }
+}

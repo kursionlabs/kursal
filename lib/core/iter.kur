@@ -1,0 +1,397 @@
+// core::iter -- `Iterator`, the iteration protocol, a base producer
+// (`Range`) and the `map`/`filter`/`zip` adapters with `fold` to drive them.
+//
+// `Iterator[Self -> Item]`: the iterator's own type determines its item
+// type, so each iterator type has one instance. Inference solves `Item` from
+// `Self` (`filter(range(0, 10), |x| x % 2 == 0)` types `x` as `usize` with no
+// annotation), and `it.next()` dispatches on the iterator.
+//
+// `next` takes the iterator in-out (`&it`): `let item = &it.next();` advances
+// `it` in place. A linear iterator threads through like any other linear
+// value, and every function here hands it back when done rather than
+// dropping it.
+
+use package as core;
+
+use core::option::Option;
+
+forall Self -> Item.
+trait Iterator {
+    fn next(&it: Self) -> Option[Item];
+}
+
+// Counts `cur` up to, not including, `end`.
+exposed struct Range {
+    cur: usize,
+    end: usize,
+}
+
+fn range(start: usize, end: usize) -> Range {
+    Range.{ cur: start, end }
+}
+
+// Once exhausted, it keeps returning `None`.
+instance Iterator[Range -> usize] {
+    fn next(&it: Range) -> Option[usize] {
+        if it.cur < it.end {
+            let cur = it.cur;
+            it = Range.{ cur: cur + 1usize, end: it.end };
+            Option::Some.(cur)
+        } else {
+            Option::None
+        }
+    }
+}
+
+// Left-folds `f` over every item, returning the exhausted iterator with the
+// result. `f` captures freely; `Copy[Env]` lets the one closure be called for
+// every item.
+forall Self, Item, Acc, Env where Iterator[Self -> Item], Copy[Env].
+fn fold(it: Self, acc: Acc, f: closure[Env](Acc, Item) -> Acc) -> (Self, Acc) {
+    var it = it;
+    let item_opt = &it.next();
+    match item_opt {
+        Option::Some(item) => fold(it, f(acc, item), f),
+        Option::None => (it, acc),
+    }
+}
+
+// ------------------------------------------------------------ adapters --
+// Each adapter's instance is conditional on its inner iterator's:
+// `Iterator[Map[I, In, Out, Env] -> Out]` holds when `Iterator[I -> In]`
+// does. The constructors carry the same bound, so a call's closure is typed
+// from the inner iterator's items. An adapter destructures itself once per
+// `next`, since its inner iterator may be linear.
+
+// `f` applied to each item.
+forall I, In, Out, Env.
+exposed struct Map {
+    inner: I,
+    f: closure[Env](In) -> Out,
+}
+
+forall I, In, Out, Env where Iterator[I -> In].
+fn map(it: I, f: closure[Env](In) -> Out) -> Map[I, In, Out, Env] {
+    Map.{ inner: it, f }
+}
+
+forall I, In, Out, Env where Iterator[I -> In], Copy[Env].
+instance Iterator[Map[I, In, Out, Env] -> Out] {
+    fn next(&m: Map[I, In, Out, Env]) -> Option[Out] {
+        let { inner, f } = m;
+        var inner = inner;
+        let item_opt = &inner.next();
+        m = Map.{ inner, f };
+        match item_opt {
+            Option::Some(item) => Option::Some.(f(item)),
+            Option::None => Option::None,
+        }
+    }
+}
+
+// The items `pred` keeps. `Copy[In]`: a rejected item is dropped.
+forall I, In, Env where Copy[In].
+exposed struct Filter {
+    inner: I,
+    pred: closure[Env](In) -> bool,
+}
+
+forall I, In, Env where Iterator[I -> In], Copy[In].
+fn filter(it: I, pred: closure[Env](In) -> bool) -> Filter[I, In, Env] {
+    Filter.{ inner: it, pred }
+}
+
+// Pulls from the inner iterator until `pred` keeps an item or it runs out.
+// A plain function rather than the instance's own body, so that it recurses
+// on the inner `I` itself.
+forall I, In, Env where Iterator[I -> In], Copy[In], Copy[Env].
+fn filter_skip(&it: I, pred: closure[Env](In) -> bool) -> Option[In] {
+    let item_opt = &it.next();
+    match item_opt {
+        Option::Some(item) => {
+            let keep = pred(item);
+            if keep {
+                Option::Some.(item)
+            } else {
+                filter_skip(&it, pred)
+            }
+        },
+        Option::None => Option::None,
+    }
+}
+
+forall I, In, Env where Iterator[I -> In], Copy[In], Copy[Env].
+instance Iterator[Filter[I, In, Env] -> In] {
+    fn next(&flt: Filter[I, In, Env]) -> Option[In] {
+        let { inner, pred } = flt;
+        let item_opt = filter_skip(&inner, pred);
+        flt = Filter.{ inner, pred };
+        item_opt
+    }
+}
+
+// A named pair: the item type of `zip` and `enumerate`.
+forall A, B.
+exposed struct Pair {
+    a: A,
+    b: B,
+}
+
+// Pairs the two iterators' items until either runs out. Both sides are
+// pulled before either is inspected, so an item left over when the other
+// side ends is dropped: `Copy[ItemA]`, `Copy[ItemB]`.
+forall IA, IB.
+exposed struct Zip {
+    a: IA,
+    b: IB,
+}
+
+forall IA, IB.
+fn zip(a: IA, b: IB) -> Zip[IA, IB] {
+    Zip.{ a, b }
+}
+
+forall IA, IB, ItemA, ItemB where Iterator[IA -> ItemA], Iterator[IB -> ItemB], Copy[ItemA], Copy[ItemB].
+instance Iterator[Zip[IA, IB] -> Pair[ItemA, ItemB]] {
+    fn next(&z: Zip[IA, IB]) -> Option[Pair[ItemA, ItemB]] {
+        let { a, b } = z;
+        var a = a;
+        var b = b;
+        let a_opt = &a.next();
+        let b_opt = &b.next();
+        z = Zip.{ a, b };
+        match a_opt {
+            Option::Some(av) => match b_opt {
+                Option::Some(bv) => Option::Some.(Pair.{ a: av, b: bv }),
+                Option::None => Option::None,
+            },
+            Option::None => Option::None,
+        }
+    }
+}
+
+// Each item with its index, counting from 0: `Pair { a: index, b: item }`.
+forall I.
+exposed struct Enumerate {
+    inner: I,
+    index: usize,
+}
+
+forall I, T where Iterator[I -> T].
+instance Iterator[Enumerate[I] -> Pair[usize, T]] {
+    fn next(&e: Enumerate[I]) -> Option[Pair[usize, T]] {
+        let { inner, index } = e;
+        var inner = inner;
+        let item = &inner.next();
+        match item {
+            Option::Some(v) => {
+                e = Enumerate.{ inner, index: index + 1usize };
+                Option::Some.(Pair.{ a: index, b: v })
+            },
+            Option::None => {
+                e = Enumerate.{ inner, index };
+                Option::None
+            },
+        }
+    }
+}
+
+// At most `left` more items; the inner iterator is not pulled past them.
+forall I.
+exposed struct Take {
+    inner: I,
+    left: usize,
+}
+
+forall I, T where Iterator[I -> T].
+instance Iterator[Take[I] -> T] {
+    fn next(&t: Take[I]) -> Option[T] {
+        let { inner, left } = t;
+        var inner = inner;
+        if left == 0usize {
+            t = Take.{ inner, left };
+            return Option::None;
+        }
+        let item = &inner.next();
+        t = Take.{ inner, left: left - 1usize };
+        item
+    }
+}
+
+// The items after the first `left`. `Copy[T]`: the skipped ones are dropped.
+forall I.
+exposed struct Skip {
+    inner: I,
+    left: usize,
+}
+
+forall I, T where Iterator[I -> T], Copy[T].
+instance Iterator[Skip[I] -> T] {
+    fn next(&s: Skip[I]) -> Option[T] {
+        let { inner, left } = s;
+        var inner = inner;
+        var left = left;
+        while left > 0usize {
+            let skipped = &inner.next();
+            left = left - 1usize;
+        }
+        let item = &inner.next();
+        s = Skip.{ inner, left: 0usize };
+        item
+    }
+}
+
+// Items while `pred` keeps them; the first it rejects ends the iterator and
+// is dropped (`Copy[T]`).
+forall I, T, Env where Copy[T].
+exposed struct TakeWhile {
+    inner: I,
+    pred: closure[Env](T) -> bool,
+    done: bool,
+}
+
+forall I, T, Env where Iterator[I -> T], Copy[T], Copy[Env].
+instance Iterator[TakeWhile[I, T, Env] -> T] {
+    fn next(&w: TakeWhile[I, T, Env]) -> Option[T] {
+        let { inner, pred, done } = w;
+        var inner = inner;
+        if done {
+            w = TakeWhile.{ inner, pred, done };
+            return Option::None;
+        }
+        let item = &inner.next();
+        let kept = match item {
+            Option::Some(v) => if pred(v) {
+                Option::Some.(v)
+            } else {
+                Option::None
+            },
+            Option::None => Option::None,
+        };
+        let done = match kept {
+            Option::Some(_v) => false,
+            Option::None => true,
+        };
+        w = TakeWhile.{ inner, pred, done };
+        kept
+    }
+}
+
+// The first iterator's items, then the second's.
+forall IA, IB.
+exposed struct Chain {
+    a: IA,
+    b: IB,
+}
+
+forall IA, IB, T where Iterator[IA -> T], Iterator[IB -> T].
+instance Iterator[Chain[IA, IB] -> T] {
+    fn next(&c: Chain[IA, IB]) -> Option[T] {
+        let { a, b } = c;
+        var a = a;
+        var b = b;
+        let first = &a.next();
+        let item = match first {
+            Option::Some(v) => Option::Some.(v),
+            Option::None => &b.next(),
+        };
+        c = Chain.{ a, b };
+        item
+    }
+}
+
+// ------------------------------------------------------------- methods --
+// The adapters as methods of every iterator, through an extension impl:
+// `range(0, 10).filter(|x| x % 2 == 0).map(|x| x * x).fold(0, |a, x| a + x)`.
+forall I, T where Iterator[I -> T].
+impl I {
+    forall Out, Env.
+    fn map(self, f: closure[Env](T) -> Out) -> Map[I, T, Out, Env] {
+        map(self, f)
+    }
+
+    forall Env where Copy[T].
+    fn filter(self, pred: closure[Env](T) -> bool) -> Filter[I, T, Env] {
+        filter(self, pred)
+    }
+
+    forall J.
+    fn zip(self, other: J) -> Zip[I, J] {
+        zip(self, other)
+    }
+
+    forall Acc, Env where Copy[Env].
+    fn fold(self, acc: Acc, f: closure[Env](Acc, T) -> Acc) -> (I, Acc) {
+        fold(self, acc, f)
+    }
+
+    fn enumerate(self) -> Enumerate[I] {
+        Enumerate.{ inner: self, index: 0usize }
+    }
+
+    fn take(self, count: usize) -> Take[I] {
+        Take.{ inner: self, left: count }
+    }
+
+    forall J.
+    fn chain(self, other: J) -> Chain[I, J] {
+        Chain.{ a: self, b: other }
+    }
+}
+
+// The methods that drop items they pass over or reject, so `Copy[T]`. Each
+// consumer returns the iterator with its answer, as `fold` does; one that
+// stops early leaves the rest unread.
+forall I, T where Iterator[I -> T], Copy[T].
+impl I {
+    fn skip(self, count: usize) -> Skip[I] {
+        Skip.{ inner: self, left: count }
+    }
+
+    forall Env where Copy[Env].
+    fn take_while(self, pred: closure[Env](T) -> bool) -> TakeWhile[I, T, Env] {
+        TakeWhile.{ inner: self, pred, done: false }
+    }
+
+    fn count(self) -> (I, usize) {
+        var it = self;
+        var n = 0usize;
+        for x in &it {
+            n = n + 1usize;
+        }
+        (it, n)
+    }
+
+    forall Env where Copy[Env].
+    fn any(self, pred: closure[Env](T) -> bool) -> (I, bool) {
+        var it = self;
+        for x in &it {
+            if pred(x) {
+                return (it, true);
+            }
+        }
+        (it, false)
+    }
+
+    forall Env where Copy[Env].
+    fn all(self, pred: closure[Env](T) -> bool) -> (I, bool) {
+        var it = self;
+        for x in &it {
+            if !pred(x) {
+                return (it, false);
+            }
+        }
+        (it, true)
+    }
+
+    forall Env where Copy[Env].
+    fn find(self, pred: closure[Env](T) -> bool) -> (I, Option[T]) {
+        var it = self;
+        for x in &it {
+            if pred(x) {
+                return (it, Option::Some.(x));
+            }
+        }
+        (it, Option::None)
+    }
+}

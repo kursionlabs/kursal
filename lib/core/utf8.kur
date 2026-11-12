@@ -1,0 +1,65 @@
+// core::utf8 -- decoding UTF-8 one scalar at a time from a byte view, read
+// through whatever capability permits it (`Exclusive!`, `Shared!`,
+// `StaticRead`), as in `core::ascii`.
+use package as core;
+
+use core::option::Option;
+use core::slice::{ReadBytes, byte_or_zero};
+
+// The scalar starting at `start` and the index just past it; `None` for an
+// overlong encoding, a surrogate, a truncated sequence, a scalar outside
+// Unicode, or a `start` past the end.
+forall C, S where ReadBytes[C, S], Copy[S].
+fn decode(&cap: C, bytes: S, start: usize) -> Option[(u32, usize)] {
+    let len = ReadBytes[C, S]::len(&cap, bytes);
+    if start >= len {
+        return Option::None;
+    }
+    let first = byte_or_zero(&cap, bytes, start);
+    let width = if first < 128u8 {
+        1usize
+    } else if first >= 194u8 && first <= 223u8 {
+        2usize
+    } else if first >= 224u8 && first <= 239u8 {
+        3usize
+    } else if first >= 240u8 && first <= 244u8 {
+        4usize
+    } else {
+        0usize
+    };
+    if width == 0usize || width > len - start {
+        return Option::None;
+    }
+    let modulus = if width == 1usize {
+        128u32
+    } else if width == 2usize {
+        32u32
+    } else if width == 3usize {
+        16u32
+    } else {
+        8u32
+    };
+    var code = (first as u32) % modulus;
+    var i = 1usize;
+    var valid = true;
+    while i < width {
+        let byte = byte_or_zero(&cap, bytes, start + i);
+        valid = valid && byte >= 128u8 && byte <= 191u8;
+        code = code * 64u32 + (byte as u32) % 64u32;
+        i = i + 1usize;
+    }
+    let minimum = if width == 1usize {
+        0u32
+    } else if width == 2usize {
+        128u32
+    } else if width == 3usize {
+        2048u32
+    } else {
+        65536u32
+    };
+    if valid && code >= minimum && code <= 1114111u32 && !(code >= 55296u32 && code <= 57343u32) {
+        Option::Some.((code, start + width))
+    } else {
+        Option::None
+    }
+}
