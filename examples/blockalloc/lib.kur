@@ -1,0 +1,220 @@
+// A scripted workload over a fixed-size block allocator (`blocks.kur`):
+// typed blocks of four sizes, a size class filled to the last block,
+// emptied and reused, and the raw interface's checks against a double
+// free, a pointer into a block, and a pointer from elsewhere.
+use package::blocks::{Heap, Block, PoolStats, FreeError, new_heap, class_count};
+use std::alloc::heap::HeapAllocator;
+use std::collections::vec::{OwnedVec, Popped};
+use std::io::{Output, stdout};
+use std::option::{Option, Result};
+use std::process::abort;
+use std::slice::Slice;
+
+struct Point {
+    x: u64,
+    y: u64,
+}
+
+struct Segment {
+    from: Point,
+    to: Point,
+}
+
+struct Wide {
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+    e: u64,
+    f: u64,
+    g: u64,
+    h: u64,
+}
+
+struct Huge {
+    left: Wide,
+    right: Wide,
+}
+
+// Larger than the largest size class.
+struct TooBig {
+    huge: Huge,
+    extra: u64,
+}
+
+fn wide(n: u64) -> Wide {
+    Wide.{ a: n, b: n + 1, c: n + 2, d: n + 3, e: n + 4, f: n + 5, g: n + 6, h: n + 7 }
+}
+
+fn wide_sum(w: Wide) -> u64 {
+    w.a + w.b + w.c + w.d + w.e + w.f + w.g + w.h
+}
+
+// A block the workload cannot do without.
+forall T, 'k.
+fn expect(r: Result[Block![T, 'k], T]) -> Block![T, 'k] {
+    match r {
+        Result::Ok(b) => b,
+        Result::Err(v) => abort(),
+    }
+}
+
+fn error_name(e: FreeError) -> Slice[u8, 'static] {
+    match e {
+        FreeError::Foreign => "foreign pointer",
+        FreeError::Interior => "pointer into a block",
+        FreeError::DoubleFree => "double free",
+    }
+}
+
+fn freed(out: Output!, what: Slice[u8, 'static], r: Result[(), FreeError]) -> Output! {
+    let out = out.write_static(what);
+    match r {
+        Result::Ok(nothing) => out.write_static(": freed\n"),
+        Result::Err(e) => out.write_static(": refused, ").write_static(error_name(e)).write_static("\n"),
+    }
+}
+
+forall 'k.
+fn print_stats(&heap: Heap!['k], out: Output!) -> Output! {
+    var out = out;
+    var class = 0usize;
+    while class < class_count() {
+        let s = &heap.stats(class);
+        out = f"class {s.block}: {s.in_use} of {s.count} in use, peak {s.peak}, {s.failed} failed\n".write(out);
+        class = class + 1;
+    }
+    out
+}
+
+fn main() -> i32 {
+    let exists 'k. heap = new_heap();
+    var heap = heap;
+    var out = stdout();
+
+    // One block of each size class, read and written through its handle.
+    var point = expect(&heap.alloc(Point.{ x: 3, y: 4 }));
+    var segment = expect(&heap.alloc(Segment.{ from: Point.{ x: 0, y: 0 }, to: Point.{ x: 6, y: 8 } }));
+    var row = expect(&heap.alloc(wide(10)));
+    var both = expect(&heap.alloc(Huge.{ left: wide(1), right: wide(100) }));
+    let p = &point.get(&heap);
+    &point.set(&heap, Point.{ x: p.x * 10, y: p.y * 10 });
+    let p = &point.get(&heap);
+    let s = &segment.get(&heap);
+    let h = &both.get(&heap);
+    out = f"point ({p.x}, {p.y}), segment to ({s.to.x}, {s.to.y}), row {wide_sum(&row.get(&heap))}, huge {wide_sum(h.left) + wide_sum(h.right)}\n".write(out);
+
+    // Too large for any size class: the value comes back.
+    let too_big = TooBig.{ huge: h, extra: 7 };
+    let refused = match &heap.alloc(too_big) {
+        Result::Ok(b) => {
+            let v = &heap.free(b);
+            0u64
+        },
+        Result::Err(v) => v.extra,
+    };
+    out = f"too big: refused, got back extra = {refused}\n".write(out);
+
+    // Fill the 16-byte class: `point` already holds one of its blocks.
+    var blocks = OwnedVec::new[Block![u64, 'k]]();
+    var n = 0u64;
+    var filling = true;
+    while filling {
+        let unit = match &heap.alloc(n) {
+            Result::Ok(b) => {
+                blocks = blocks.push(b);
+                n = n + 1;
+            },
+            Result::Err(v) => {
+                filling = false;
+            },
+        };
+    }
+    out = f"16-byte class full after {n} more blocks\n".write(out);
+    out = print_stats(&heap, out);
+
+    // Free the odd values, keep the even ones, then fill the holes again:
+    // the freed blocks are reused.
+    var kept = OwnedVec::new[Block![u64, 'k]]();
+    var sum_freed = 0u64;
+    var draining = true;
+    while draining {
+        let unit = match &blocks.pop() {
+            Popped::Item(b) => {
+                let v = &b.get(&heap);
+                if v % 2 == 1 {
+                    sum_freed = sum_freed + &heap.free(b);
+                } else {
+                    kept = kept.push(b);
+                }
+            },
+            Popped::Empty => {
+                draining = false;
+            },
+        };
+    }
+    blocks.destroy(drop_none);
+    var reused = 0u64;
+    var refilling = true;
+    while refilling {
+        let unit = match &heap.alloc(1000 + reused) {
+            Result::Ok(b) => {
+                kept = kept.push(b);
+                reused = reused + 1;
+            },
+            Result::Err(v) => {
+                refilling = false;
+            },
+        };
+    }
+    out = f"freed the odd values (sum {sum_freed}), reused {reused} blocks\n".write(out);
+
+    // The raw interface: addresses only, checked on the way back.
+    let raw = match &heap.alloc_raw(24) {
+        Option::Some(r) => r,
+        Option::None => abort(),
+    };
+    let inside = unsafe ((unsafe (raw as usize) + 8) as *u8);
+    let elsewhere = HeapAllocator::alloc(16).into_raw();
+    let r = unsafe &heap.free_raw(raw);
+    out = freed(out, "raw block", r);
+    let r = unsafe &heap.free_raw(raw);
+    out = freed(out, "raw block again", r);
+    let r = unsafe &heap.free_raw(inside);
+    out = freed(out, "inside a block", r);
+    let r = unsafe &heap.free_raw(elsewhere);
+    out = freed(out, "malloc'd memory", r);
+    HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(elsewhere));
+
+    // Give everything back.
+    var sum_kept = 0u64;
+    var emptying = true;
+    while emptying {
+        let unit = match &kept.pop() {
+            Popped::Item(b) => {
+                sum_kept = sum_kept + &heap.free(b);
+            },
+            Popped::Empty => {
+                emptying = false;
+            },
+        };
+    }
+    kept.destroy(drop_none);
+    let last = &heap.free(point);
+    let seg = &heap.free(segment);
+    let r = &heap.free(row);
+    let hh = &heap.free(both);
+    out = f"freed the rest (sum {sum_kept}), last point ({last.x}, {last.y})\n".write(out);
+    out = print_stats(&heap, out);
+    heap.destroy();
+    match out.finish() {
+        Result::Ok(nothing) => 0,
+        Result::Err(code) => 1,
+    }
+}
+
+// `OwnedVec::destroy` for a vector known to be empty: it never runs.
+forall 'k.
+fn drop_none(b: Block![u64, 'k]) -> () {
+    abort()
+}

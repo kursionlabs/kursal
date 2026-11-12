@@ -23,6 +23,37 @@ development tools (`pyproject.toml`, `uv.lock`); mypy checks `kursal/`.
 `kurs.py` reads serialized KURS (S-expressions, `sexpr.py`), and `readable.py`
 prints it in the readable notation.
 
+## A worked example: Counter
+
+[`examples/counter`](examples/counter/lib.kur) is a complete package with no library dependencies. It
+starts a counter at 40, branches on its value, and lends it to `bump`, which stores 41 and returns 41.
+The result adds the updated field and the returned value, so the program exits **82**.
+
+```bash
+uv run python examples/counter/walkthrough.py            # regenerate examples/counter/generated, then verify
+uv run python examples/counter/walkthrough.py /tmp/out   # write elsewhere, leaving the snapshots alone
+```
+
+The runner calls `resolve`, `signatures`, `lower`, `check_program` and `emit_c`, and writes
+[the inferred annotations](examples/counter/generated/annotations.txt),
+[readable KURS](examples/counter/generated/program.kurs), [C](examples/counter/generated/program.c) and
+[the KURS serialization](examples/counter/generated/program.sexpr). It then reads the serialization back,
+checks it, requires the same C from both routes, and builds and runs both executables.
+
+What to look for in each output:
+
+- **Inference.** `bump`'s parameter is a place (`&counter: Counter`): lending is a parameter mode, not a
+  pointer type. `main`'s `counter` and `result` get binding IDs 1 and 2, which name their storage below.
+- **Lowering.** Each source local is a whole-function place (`&counter#1`, `&result#2`). A field read is
+  `load &counter#1.value`; the call lends the place itself, `call counter::bump(&counter#1)`. The `if`
+  becomes `branch` to `b10` and `b11`, which meet at `join15(%r14: u32)`. An operand that precedes
+  another waits in a temporary place (`&#tmp1`, `&#tmp3`) and is loaded again just before use.
+- **Place contracts.** Each block states which places are empty on entry (`state { empty &result#2; ... }`).
+  The checker checks every block against its own contract alone, and every jump against its target's.
+- **C.** The place parameter is a pointer, and the call passes the caller's storage:
+  `b10_v12 = ...bump...(&p_counter_1);`. Each block is a label; a jump with an argument assigns
+  `join15_r14` and jumps to `L_join15`. Contracts leave nothing behind at run time.
+
 ## Packages
 
 A package is a directory with a `kur.toml`:

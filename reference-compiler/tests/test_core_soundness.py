@@ -140,14 +140,6 @@ REJECTED = {
         (fun f u32 (Pk) (entry ((&k Pk)) (= %o (open &k.pkg ($o))) (= %r (call g &k))
           (= %c (pack (exists ($h) (tuple u32 (builtin::Brand $h))) $o &k.pkg)) (ret %r)))"""),
 
-    # `sizeof` observes a layout, which only code with shape authority may see.
-    "sizeof_of_a_hidden_type": ("not exposed", """
-        (type (in (module 0 a) abstract) Secret (struct (k u32)))
-        (fun (in (module 0 b)) h usize () (entry () (= %n (builtin::sizeof Secret)) (ret %n)))"""),
-    "sizeof_through_a_tuple": ("not exposed", """
-        (type (in (module 0 a) abstract) Secret (struct (k u32)))
-        (fun (in (module 0 b)) h usize () (entry () (= %n (builtin::sizeof (tuple u8 Secret))) (ret %n)))"""),
-
     # A zero-size type's memory form is not decided: nothing observes it.
     "sizeof_unit": ("zero_size_type_has_no_memory_form",
                     "(fun h usize () (entry () (= %n (builtin::sizeof (tuple))) (ret %n)))"),
@@ -183,9 +175,10 @@ class CoreSoundnessTests(unittest.TestCase):
             """(type (in (module 0 a) abstract) Secret (struct (k u32)))
                (fun (in (module 0 a)) h u32 (Secret) (entry ((%s Secret)) (= %k (destruct %s Secret)) (ret %k)))
                (data (in (module 0 a)) made Secret (7))""",
-            # The size of a pointer to a hidden type, and of a type parameter.
+            # Sizes are public: of a hidden type, of a type holding one, of a type parameter.
             """(type (in (module 0 a) abstract) Secret (struct (k u32)))
-               (fun (in (module 0 b)) h usize () (entry () (= %n (builtin::sizeof (builtin::Pointer Secret))) (ret %n)))
+               (fun (in (module 0 b)) h usize () (entry () (= %n (builtin::sizeof Secret)) (ret %n)))
+               (fun (in (module 0 b)) i usize () (entry () (= %n (builtin::sizeof (tuple u8 Secret))) (ret %n)))
                (fun (in (module 0 b)) g (forall (T) () usize () (entry () (= %n (builtin::sizeof T)) (ret %n))))""",
             # Two sibling fields lent together, beside a whole root.
             """(type T3 (struct (a u32) (b u32) (c u32)))

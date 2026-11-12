@@ -1,0 +1,101 @@
+// A small `wc`: prints the lines, words and bytes of each file named on the
+// command line, and a total when there is more than one.
+use std::io::{File, print, print_buffer};
+use std::process::Args;
+use std::cstr::CStr;
+use std::bytes::buffer::Buffer;
+use std::slice::Slice;
+use std::iter::range;
+use std::option::{Option, Result};
+use std::ascii::is_space;
+
+exposed struct Counts {
+    lines: usize,
+    words: usize,
+    bytes: usize,
+}
+
+// The bytes are read through an iterator that holds the buffer's capability
+// while the loop runs; `finish` hands it back to restore the buffer.
+fn count(text: Buffer!) -> (Buffer!, Counts) {
+    let exists 't. (tag, bytes, restore) = text.open();
+    var lines = 0usize;
+    var words = 0usize;
+    var in_word = false;
+    var it = bytes.iter(tag);
+    for b in &it {
+        if b == b'\n' {
+            lines = lines + 1;
+        }
+        let space = is_space(b);
+        if !space && !in_word {
+            words = words + 1;
+        }
+        in_word = !space;
+    }
+    let tag = it.finish();
+    (restore.restore(tag), Counts.{ lines, words, bytes: bytes.len() })
+}
+
+fn report(counts: Counts, name: Slice[u8, 'static]) -> () {
+    let { lines, words, bytes } = counts;
+    print_buffer(1, f"{lines} {words} {bytes} {name}\n")
+}
+
+// Counts one named file, or says why it could not.
+fn count_file(arg: CStr, name: Slice[u8, 'static]) -> Result[Counts, ()] {
+    match File::open_read(arg) {
+        Result::Err(code) => {
+            print_buffer(2, f"wc: cannot open {name}\n");
+            Result::Err.(())
+        },
+        Result::Ok(file) => {
+            var file = file;
+            let read = &file.read_to_buffer();
+            let closed = file.close();
+            match read {
+                Result::Err(code) => {
+                    print_buffer(2, f"wc: cannot read {name}\n");
+                    Result::Err.(())
+                },
+                Result::Ok(text) => {
+                    let (text, counts) = count(text);
+                    text.destroy();
+                    report(counts, name);
+                    Result::Ok.(counts)
+                },
+            }
+        },
+    }
+}
+
+fn main(argc: i32, argv: *(*u8)) -> i32 {
+    let args = unsafe Args::from_main(argc, argv);
+    var total = Counts.{ lines: 0, words: 0, bytes: 0 };
+    var failed = 0i32;
+    var indices = range(1, args.len());
+    for i in &indices {
+        let counted = match args.get(i) {
+            Option::Some(arg) => {
+                let name = match args.bytes(i) {
+                    Option::Some(b) => b,
+                    Option::None => "?",
+                };
+                count_file(arg, name)
+            },
+            Option::None => Result::Err.(()),
+        };
+        let unit = match counted {
+            Result::Ok(c) => {
+                total = Counts.{ lines: total.lines + c.lines, words: total.words + c.words, bytes: total.bytes + c.bytes };
+            },
+            Result::Err(nothing) => {
+                failed = 1;
+            },
+        };
+    }
+    if args.len() > 2 {
+        report(total, "total");
+    }
+    failed
+}

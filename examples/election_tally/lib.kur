@@ -1,0 +1,91 @@
+// A small vote tally on `std::collections::hashmap`: nine votes for four
+// candidates, then 30 write-in candidates (enough to grow the bucket array
+// several times), a re-fetch of candidate 1's tally, a `remove`, and a
+// final count.
+//
+// The tally is an `OwnedMap!`, which keeps the map together with its
+// capability, so it can sit in a variable and be updated in a loop.
+// Entries are separately allocated nodes that a resize only relinks, so
+// candidate 1's tally survives the write-ins; a re-fetch shows it.
+
+use std::collections::hashmap::{OwnedMap, Found};
+use std::slice::Slice;
+use std::bytes::buffer::Buffer;
+use std::io::print_buffer;
+use std::iter::range;
+
+fn build_line(prefix: Slice[u8, 'static], n: u32, suffix: Slice[u8, 'static]) -> Buffer! {
+    f"{prefix}{n}{suffix}"
+}
+
+// Casts one vote for `id`: reads the current tally (0 for a first vote) and
+// writes back `count + 1`. `insert` hands back the entry it replaces, a
+// pair of `u32`s, which can be dropped.
+fn cast_vote(tally: OwnedMap![u32, u32], id: u32) -> OwnedMap![u32, u32] {
+    var tally = tally;
+    let current = &tally.get(id);
+    let (id, found) = current;
+    let count = match found {
+        Found::Item(n) => n,
+        Found::Missing => 0,
+    };
+    let old = &tally.insert(id, count + 1);
+    tally
+}
+
+fn main() -> i32 {
+    var tally = OwnedMap::new[u32, u32]();
+
+    // An early round of votes for four candidates.
+    tally = cast_vote(tally, 2);
+    tally = cast_vote(tally, 1);
+    tally = cast_vote(tally, 3);
+    tally = cast_vote(tally, 2);
+    tally = cast_vote(tally, 1);
+    tally = cast_vote(tally, 4);
+    tally = cast_vote(tally, 2);
+    tally = cast_vote(tally, 3);
+    tally = cast_vote(tally, 1);
+
+    // 30 write-in candidates, enough to grow the bucket array several times.
+    var write_ins = range(100, 130);
+    for id in &write_ins {
+        tally = cast_vote(tally, (id as u32));
+    }
+
+    // Candidate 1's tally, re-fetched after the write-ins have grown the
+    // bucket array: the entry never moved, so the count is still 3.
+    let first = &tally.get(1);
+    let (key, found) = first;
+    let line1 = match found {
+        Found::Item(count) => build_line("Candidate 1, re-fetched after the write-ins: ", count, " votes\n"),
+        Found::Missing => build_line("Candidate 1: ", 0, " -- entry went missing!\n"),
+    };
+    print_buffer(1, line1);
+
+    // Disqualify candidate 3, which frees the entry.
+    let removed = &tally.remove(3);
+    let (key, disqualified) = removed;
+    let dq_votes = match disqualified {
+        Found::Item(entry) => {
+            let (id, v) = entry;
+            v
+        },
+        Found::Missing => 0,
+    };
+    print_buffer(1, build_line("Candidate 3 disqualified, had ", dq_votes, " votes\n"));
+
+    let again = &tally.get(3);
+    let (key, still_there) = again;
+    let line3 = match still_there {
+        Found::Item(v) => build_line("Candidate 3 still on file with ", v, " votes (unexpected)\n"),
+        Found::Missing => build_line("Candidate 3 confirmed removed -- 0 candidates found (expected 0): ", 0, "\n"),
+    };
+    print_buffer(1, line3);
+
+    let total = &tally.len();
+    print_buffer(1, build_line("Total distinct candidates on file: ", (total as u32), "\n"));
+
+    tally.free();
+    0
+}

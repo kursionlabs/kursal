@@ -1,0 +1,199 @@
+// A calculator: evaluates one integer expression per line of stdin, with
+// `+ - * /`, unary minus and parentheses, and reports where a line goes
+// wrong.
+use std::io::{read_all_stdin, print_buffer};
+use std::bytes::cursor::Cursor;
+use std::bytes::buffer::Buffer;
+use std::cap::Exclusive;
+use std::slice::Slice;
+use std::option::{Option, Result};
+use std::ascii::{is_digit, is_space, line_at};
+use std::parse::parse_u64;
+
+exposed enum CalcError {
+    Expected(usize),
+    Unexpected(usize),
+    DivideByZero(usize),
+    TooLarge(usize),
+}
+
+// The next non-space byte, without consuming it.
+forall 't.
+fn peek(&tag: Exclusive!['t], cur: Cursor['t]) -> (Cursor['t], Option[u8]) {
+    let cur = cur.skip_while(&tag, is_space);
+    let next = cur.peek(&tag);
+    (cur, next)
+}
+
+forall 't.
+fn number(&tag: Exclusive!['t], cur: Cursor['t]) -> Result[(Cursor['t], i64), CalcError] {
+    let at = cur.pos();
+    let taken = cur.take(&tag, is_digit);
+    let (cur, digits) = taken;
+    if digits.len() == 0 {
+        return Result::Err.(CalcError::Expected.(at));
+    }
+    let parsed = match parse_u64(&tag, digits) {
+        Option::Some(v) => {
+            if v > 9223372036854775807u64 {
+                Option::None
+            } else {
+                Option::Some.((v as i64))
+            }
+        },
+        Option::None => Option::None,
+    };
+    match parsed {
+        Option::Some(value) => Result::Ok.((cur, value)),
+        Option::None => Result::Err.(CalcError::TooLarge.(at)),
+    }
+}
+
+forall 't.
+fn primary(&tag: Exclusive!['t], cur: Cursor['t]) -> Result[(Cursor['t], i64), CalcError] {
+    let peeked = peek(&tag, cur);
+    let (cur, next) = peeked;
+    let at = cur.pos();
+    match next {
+        Option::Some(b) => {
+            if b == b'(' {
+                let stepped = cur.step(&tag);
+                let (cur, skipped) = stepped;
+                let (cur, value) = expr(&tag, cur)?;
+                let peeked = peek(&tag, cur);
+                let (cur, close) = peeked;
+                let closed = match close {
+                    Option::Some(c) => c == b')',
+                    Option::None => false,
+                };
+                if !closed {
+                    return Result::Err.(CalcError::Expected.(cur.pos()));
+                }
+                let stepped = cur.step(&tag);
+                let (cur, skipped) = stepped;
+                Result::Ok.((cur, value))
+            } else if b == b'-' {
+                let stepped = cur.step(&tag);
+                let (cur, skipped) = stepped;
+                let (cur, value) = primary(&tag, cur)?;
+                Result::Ok.((cur, 0 - value))
+            } else if is_digit(b) {
+                number(&tag, cur)
+            } else {
+                Result::Err.(CalcError::Unexpected.(at))
+            }
+        },
+        Option::None => Result::Err.(CalcError::Expected.(at)),
+    }
+}
+
+forall 't.
+fn term(&tag: Exclusive!['t], cur: Cursor['t]) -> Result[(Cursor['t], i64), CalcError] {
+    let (cur, first) = primary(&tag, cur)?;
+    var cur = cur;
+    var acc = first;
+    var going = true;
+    while going {
+        let peeked = peek(&tag, cur);
+        let (c, next) = peeked;
+        let op = match next {
+            Option::Some(b) => b,
+            Option::None => 0,
+        };
+        if op == b'*' || op == b'/' {
+            let at = c.pos();
+            let stepped = c.step(&tag);
+            let (c, skipped) = stepped;
+            let (c, rhs) = primary(&tag, c)?;
+            if op == 47 && rhs == 0 {
+                return Result::Err.(CalcError::DivideByZero.(at));
+            }
+            let product = if op == b'*' { acc * rhs } else { acc / rhs };
+            acc = product;
+            cur = c;
+        } else {
+            cur = c;
+            going = false;
+        }
+    }
+    Result::Ok.((cur, acc))
+}
+
+forall 't.
+fn expr(&tag: Exclusive!['t], cur: Cursor['t]) -> Result[(Cursor['t], i64), CalcError] {
+    let (cur, first) = term(&tag, cur)?;
+    var cur = cur;
+    var acc = first;
+    var going = true;
+    while going {
+        let peeked = peek(&tag, cur);
+        let (c, next) = peeked;
+        let op = match next {
+            Option::Some(b) => b,
+            Option::None => 0,
+        };
+        if op == b'+' || op == b'-' {
+            let stepped = c.step(&tag);
+            let (c, skipped) = stepped;
+            let (c, rhs) = term(&tag, c)?;
+            let sum = if op == b'+' { acc + rhs } else { acc - rhs };
+            acc = sum;
+            cur = c;
+        } else {
+            cur = c;
+            going = false;
+        }
+    }
+    Result::Ok.((cur, acc))
+}
+
+// A whole line: an expression and nothing after it.
+forall 't.
+fn evaluate(&tag: Exclusive!['t], line: Slice[u8, 't]) -> Result[i64, CalcError] {
+    let (cur, value) = expr(&tag, Cursor::new(line))?;
+    let peeked = peek(&tag, cur);
+    let (cur, rest) = peeked;
+    match rest {
+        Option::Some(b) => Result::Err.(CalcError::Unexpected.(cur.pos())),
+        Option::None => Result::Ok.(value),
+    }
+}
+
+fn describe(error: CalcError) -> Buffer! {
+    match error {
+        CalcError::Expected(at) => f"expected a number or '(' at column {at + 1}\n",
+        CalcError::Unexpected(at) => f"unexpected character at column {at + 1}\n",
+        CalcError::DivideByZero(at) => f"division by zero at column {at + 1}\n",
+        CalcError::TooLarge(at) => f"number too large at column {at + 1}\n",
+    }
+}
+
+fn main() -> i32 {
+    let text = read_all_stdin();
+    let exists 't. (tag, bytes, restore) = text.open();
+    var start = 0usize;
+    var failures = 0i32;
+    var reading = true;
+    while reading {
+        let next = line_at(&tag, bytes, start);
+        let unit = match next {
+            Option::None => {
+                reading = false;
+            },
+            Option::Some(found) => {
+                let (line, after) = found;
+                let out = match evaluate(&tag, line) {
+                    Result::Ok(value) => f"{value}\n",
+                    Result::Err(error) => {
+                        failures = failures + 1;
+                        describe(error)
+                    },
+                };
+                print_buffer(1, out);
+                start = after;
+            },
+        };
+    }
+    restore.restore(tag).destroy();
+    failures
+}

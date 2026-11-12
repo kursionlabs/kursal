@@ -1,0 +1,96 @@
+// A fixed-capacity ring buffer (FIFO queue) over an `OwnedVec!`. The slots
+// are allocated once, up front; after that the ring only reads and replaces
+// them in place, so it can live in an ordinary loop variable.
+use std::collections::vec::OwnedVec;
+use std::option::Option;
+
+exposed struct Ring! {
+    slots: OwnedVec![u32],
+    head: usize,
+    len: usize,
+}
+
+// A ring with `capacity` slots.
+fn ring(capacity: usize) -> Ring! {
+    var slots = OwnedVec::new[u32]();
+    var n = 0usize;
+    while n < capacity {
+        slots = slots.push(0);
+        n = n + 1;
+    }
+    Ring.{ slots, head: 0, len: 0 }
+}
+
+impl Ring! {
+    // Adds `value` at the back; a full ring hands it back.
+    fn push(&self, value: u32) -> Option[u32] {
+        let { slots, head, len } = self;
+        var slots = slots;
+        let capacity = &slots.len();
+        if len == capacity {
+            self = Ring.{ slots, head, len };
+            return Option::Some.(value);
+        }
+        let old = &slots.with((head + len) % capacity, |old: u32| (value, old));
+        self = Ring.{ slots, head, len: len + 1 };
+        Option::None
+    }
+
+    // Removes the value at the front.
+    fn pop(&self) -> Option[u32] {
+        let { slots, head, len } = self;
+        var slots = slots;
+        if len == 0 {
+            self = Ring.{ slots, head, len };
+            return Option::None;
+        }
+        let capacity = &slots.len();
+        let front = &slots.get(head);
+        self = Ring.{ slots, head: (head + 1) % capacity, len: len - 1 };
+        front
+    }
+
+    fn destroy(self) -> () {
+        let { slots, head, len } = self;
+        slots.free()
+    }
+}
+
+fn main() -> i32 {
+    var ring = ring(2);
+    var rejected = 0u32;
+    var sum = 0u32;
+    var i = 1u32;
+    while i <= 6 {
+        // Push each value and pop on even steps: the two-slot ring wraps
+        // around, and turns away 4 and 6 because it is full.
+        let turned_away = match &ring.push(i) {
+            Option::Some(v) => 1u32,
+            Option::None => 0,
+        };
+        rejected = rejected + turned_away;
+        if i % 2 == 0 {
+            let popped = match &ring.pop() {
+                Option::Some(v) => v,
+                Option::None => 0,
+            };
+            sum = sum + popped;
+        }
+        i = i + 1;
+    }
+    var draining = true;
+    while draining {
+        let unit = match &ring.pop() {
+            Option::Some(v) => {
+                sum = sum + v;
+            },
+            Option::None => {
+                draining = false;
+            },
+        };
+    }
+    ring.destroy();
+    // Accepted values come back out once each, in order: 1 + 2 + 3 + 5 = 11,
+    // plus 100 for each of the two rejected pushes: 211.
+    ((sum + rejected * 100) as i32)
+}

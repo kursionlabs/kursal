@@ -1,0 +1,60 @@
+// `std::borrow::Borrow`: how a key that needs a live capability to read
+// what it points to (`Ref[T, 'k]`, `Span['k]`, ...) becomes a value that
+// can be compared, instead of every `Eq` instance over an indirect key
+// reading through its pointer with a bare `unsafe`.
+//
+// This is why `std::hash::Eq` is `Eq[A, B]` and not `Eq[Self]`: borrowing a
+// `Ref[T, 'k]` gives a `Borrowed![T, 'k, 'q]` (a pointer plus a live
+// `Shared!['k, 'q]`), and comparing two independently split reads of one
+// domain compares `Borrowed![T, 'k, 'q1]` with `Borrowed![T, 'k, 'q2]`:
+// two different types.
+
+use std::alloc::arena::Arena;
+use std::hash::Eq;
+use std::borrow::{Borrow, NoCap, Borrowed};
+
+// A key with no indirection needs no capability to read: `Cap = NoCap`,
+// `Out = Self`, and `borrow` is the identity. Every directly Copy key's
+// instance looks like this one. (`Eq[u32, u32]` comes from `core::hash`.)
+instance Borrow[u32, NoCap, u32] {
+    fn borrow(key: u32, cap: NoCap) -> (u32, u32) {
+        (key, key)
+    }
+}
+
+fn borrow_no_indirection() -> u32 {
+    let (k, out) = Borrow[u32, NoCap, u32]::borrow(7, NoCap.{});
+    out
+}
+
+// Two values in the same arena domain `'k`, read at the same time through
+// two independently split `Shared!` fragments. `std::borrow` provides both
+// the `Ref[T, 'k]` instance and the mixed-brand `Eq` instance used here.
+fn compare_two_borrowed() -> bool {
+    let exists 'k. (tag, arena) = Arena::new();
+    let r1 = &arena.alloc(&tag, 11u32);
+    let r2 = &arena.alloc(&tag, 11u32);
+
+    // One domain, split into two read fragments that are live at once,
+    // which an `Exclusive!['k]` could never allow.
+    let exists 'q0. (root, resume) = tag.share();
+    let exists 'q1, 'q2. (read1, read2, join) = root.split();
+
+    let b1 = Borrowed.{ cap: read1, ptr: r1 };
+    let b2 = Borrowed.{ cap: read2, ptr: r2 };
+    let (b1, b2, is_eq) = Eq[Borrowed![u32, 'k, 'q1], Borrowed![u32, 'k, 'q2]]::eq(b1, b2);
+
+    let { cap: read1, ptr: p1 } = b1;
+    let { cap: read2, ptr: p2 } = b2;
+    let tag = resume.resume(join.join(read1, read2));
+    Arena::destroy(arena, tag);
+    is_eq
+}
+
+fn main() -> i32 {
+    if borrow_no_indirection() == 7 && compare_two_borrowed() {
+        0
+    } else {
+        1
+    }
+}

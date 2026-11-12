@@ -1,0 +1,516 @@
+// Shortest routes: reads a weighted, directed graph and route queries on
+// stdin, and answers each query with Dijkstra's algorithm.
+//
+//     edge FROM TO WEIGHT    a one-way road from FROM to TO, WEIGHT a whole number
+//     route FROM TO          the cheapest way from FROM to TO
+//
+// Blank lines and lines starting with `#` are ignored. The routes are
+// answered once the whole input is read, in input order, as
+// `A -> C -> D (12)`, or as `A -> D unreachable`. A malformed line is
+// reported on stderr with its line number, and nothing is answered.
+//
+// One domain: the input is read once, and every name is a `Copy` slice of
+// it. Nodes are numbered as they first appear; the name map, the roads and
+// everything Dijkstra keeps are vectors of `Copy` values.
+use std::io::{read_all_stdin, stdout, stderr, Output};
+use std::cap::Exclusive;
+use std::slice::{Slice, StaticRead, bytes_eq, byte_or_zero};
+use std::ascii::{line_at, word_at};
+use std::parse::parse_u64;
+use std::text::format::write_bytes;
+use std::collections::hashmap::{OwnedMap, Found};
+use std::collections::vec::{OwnedVec, Popped};
+use std::option::{Option, Result};
+
+// No node, or no road: the end of a list.
+fn none() -> u32 {
+    4294967295u32
+}
+
+fn infinity() -> u64 {
+    18446744073709551615u64
+}
+
+// A road: where it leads, what it costs, and the next road from the same
+// node (an index into `Graph.roads`, or `none()`).
+struct Road {
+    to: u32,
+    weight: u64,
+    next: u32,
+}
+
+// A route query.
+forall 't.
+struct Query {
+    from: Slice[u8, 't],
+    to: Slice[u8, 't],
+    line: usize,
+}
+
+// The graph: node numbers by name and names by number, each node's first
+// road, and every road.
+forall 't.
+struct Graph! {
+    ids: OwnedMap![Slice[u8, 't], u32],
+    names: OwnedVec![Slice[u8, 't]],
+    first: OwnedVec![u32],
+    roads: OwnedVec![Road],
+}
+
+// What a parse gives: the graph and the queries.
+forall 't.
+struct Input! {
+    graph: Graph!['t],
+    queries: OwnedVec![Query['t]],
+}
+
+// A malformed line: where, and why.
+struct Bad {
+    line: usize,
+    reason: Slice[u8, 'static],
+}
+
+forall 't.
+fn empty_graph() -> Graph!['t] {
+    Graph.{ ids: OwnedMap::new[Slice[u8, 't], u32](), names: OwnedVec::new[Slice[u8, 't]](), first: OwnedVec::new[u32](), roads: OwnedVec::new[Road]() }
+}
+
+forall 't.
+fn free_graph(graph: Graph!['t]) -> () {
+    let { ids, names, first, roads } = graph;
+    ids.free();
+    names.free();
+    first.free();
+    roads.free()
+}
+
+// Replaces element `i` of `v` with `x`.
+forall T where Copy[T].
+fn set(v: OwnedVec![T], i: usize, x: T) -> OwnedVec![T] {
+    var v = v;
+    let replaced = &v.with(i, |old: T| (x, ()));
+    v
+}
+
+// Element `i` of `v`, which must exist.
+forall T where Copy[T].
+fn at(&v: OwnedVec![T], i: usize, fallback: T) -> T {
+    let value = &v.get(i).unwrap_or(fallback);
+    value
+}
+
+// ------------------------------------------------------------ the graph --
+
+// The number of the node `name`, numbering it if it is new.
+forall 't.
+fn node(&tag: Exclusive!['t], graph: Graph!['t], name: Slice[u8, 't]) -> (Graph!['t], u32) {
+    let { ids, names, first, roads } = graph;
+    var ids = ids;
+    var names = names;
+    var first = first;
+    let id = match &ids.get_in(&tag, name) {
+        Found::Item(id) => id,
+        Found::Missing => {
+            let id = (&names.len() as u32);
+            let old = &ids.insert_in(&tag, name, id);
+            names = names.push(name);
+            first = first.push(none());
+            id
+        },
+    };
+    (Graph.{ ids, names, first, roads }, id)
+}
+
+// The number of the node `name`, if there is one.
+forall 't.
+fn lookup(&tag: Exclusive!['t], &graph: Graph!['t], name: Slice[u8, 't]) -> Option[u32] {
+    let id = match &graph.ids.get_in(&tag, name) {
+        Found::Item(id) => Option::Some.(id),
+        Found::Missing => Option::None,
+    };
+    id
+}
+
+// Adds a road from `from` to `to`.
+forall 't.
+fn add_road(&tag: Exclusive!['t], graph: Graph!['t], from: Slice[u8, 't], to: Slice[u8, 't], weight: u64) -> Graph!['t] {
+    let (graph, a) = node(&tag, graph, from);
+    let (graph, b) = node(&tag, graph, to);
+    let { first, roads, ..rest } = graph;
+    var first = first;
+    var roads = roads;
+    let index = (&roads.len() as u32);
+    let head = at(&first, (a as usize), none());
+    roads = roads.push(Road.{ to: b, weight, next: head });
+    let first = set(first, (a as usize), index);
+    Graph.{ first, roads, ..rest }
+}
+
+// ------------------------------------------------------------- parsing --
+
+// The word of `line` at or after `at`, and where the next search starts.
+forall 't.
+fn next_word(&tag: Exclusive!['t], line: Slice[u8, 't], at: usize) -> (Option[Slice[u8, 't]], usize) {
+    let (word, next) = match word_at(&tag, line, at) {
+        Option::None => (Option::None, line.len()),
+        Option::Some(found) => {
+            let (word, next) = found;
+            (Option::Some.(word), next)
+        },
+    };
+    (word, next)
+}
+
+forall 't.
+fn is(&tag: Exclusive!['t], word: Slice[u8, 't], lit: Slice[u8, 'static]) -> bool {
+    var sr = StaticRead::get();
+    let same = bytes_eq(&tag, word, &sr, lit);
+    same
+}
+
+// Adds what `line` says to the graph or the queries; why it is malformed,
+// if it is.
+forall 't.
+fn parse_line(&tag: Exclusive!['t], input: Input!['t], line: Slice[u8, 't], number: usize) -> (Input!['t], Option[Slice[u8, 'static]]) {
+    let (command, at) = next_word(&tag, line, 0usize);
+    let command = match command {
+        Option::None => {
+            return (input, Option::None);
+        },
+        Option::Some(word) => word,
+    };
+    if byte_or_zero(&tag, command, 0usize) == b'#' {
+        return (input, Option::None);
+    }
+    let (first, at) = next_word(&tag, line, at);
+    let (second, at) = next_word(&tag, line, at);
+    let (third, at) = next_word(&tag, line, at);
+    let (fourth, at) = next_word(&tag, line, at);
+    let { graph, queries } = input;
+    if is(&tag, command, "edge") {
+        let (from, to, weight) = match first {
+            Option::Some(from) => match second {
+                Option::Some(to) => match third {
+                    Option::Some(weight) => (from, to, weight),
+                    Option::None => {
+                        return (Input.{ graph, queries }, Option::Some.("an edge needs a weight"));
+                    },
+                },
+                Option::None => {
+                    return (Input.{ graph, queries }, Option::Some.("an edge needs two nodes and a weight"));
+                },
+            },
+            Option::None => {
+                return (Input.{ graph, queries }, Option::Some.("an edge needs two nodes and a weight"));
+            },
+        };
+        let extra = match fourth {
+            Option::Some(_) => true,
+            Option::None => false,
+        };
+        if extra {
+            return (Input.{ graph, queries }, Option::Some.("an edge takes two nodes and a weight"));
+        }
+        let weight = match parse_u64(&tag, weight) {
+            Option::Some(w) => w,
+            Option::None => {
+                return (Input.{ graph, queries }, Option::Some.("the weight must be a whole number"));
+            },
+        };
+        let graph = add_road(&tag, graph, from, to, weight);
+        return (Input.{ graph, queries }, Option::None);
+    }
+    if is(&tag, command, "route") {
+        let (from, to) = match first {
+            Option::Some(from) => match second {
+                Option::Some(to) => (from, to),
+                Option::None => {
+                    return (Input.{ graph, queries }, Option::Some.("a route needs two nodes"));
+                },
+            },
+            Option::None => {
+                return (Input.{ graph, queries }, Option::Some.("a route needs two nodes"));
+            },
+        };
+        let extra = match third {
+            Option::Some(_) => true,
+            Option::None => false,
+        };
+        if extra {
+            return (Input.{ graph, queries }, Option::Some.("a route takes two nodes"));
+        }
+        let queries = queries.push(Query.{ from, to, line: number });
+        return (Input.{ graph, queries }, Option::None);
+    }
+    (Input.{ graph, queries }, Option::Some.("expected 'edge' or 'route'"))
+}
+
+// The graph and the queries in `text`, or its first malformed line.
+forall 't.
+fn parse(&tag: Exclusive!['t], text: Slice[u8, 't]) -> Result[Input!['t], Bad] {
+    var input = Input.{ graph: empty_graph['t](), queries: OwnedVec::new[Query['t]]() };
+    var start = 0usize;
+    var number = 0usize;
+    var reading = true;
+    while reading {
+        let unit = match line_at(&tag, text, start) {
+            Option::None => {
+                reading = false;
+            },
+            Option::Some(found) => {
+                let (line, next) = found;
+                start = next;
+                number = number + 1usize;
+                let (checked, bad) = parse_line(&tag, input, line, number);
+                input = checked;
+                let unit = match bad {
+                    Option::None => (),
+                    Option::Some(reason) => {
+                        let { graph, queries } = input;
+                        free_graph(graph);
+                        queries.free();
+                        return Result::Err.(Bad.{ line: number, reason });
+                    },
+                };
+            },
+        };
+    }
+    Result::Ok.(input)
+}
+
+// ---------------------------------------------------------------- heap --
+// A binary min-heap of (distance, node) pairs, in a vector: the children of
+// element `i` are `2i + 1` and `2i + 2`. Dijkstra pushes a node again when
+// it finds a shorter way to it, and skips the stale entries as they come up.
+
+fn less(a: (u64, u32), b: (u64, u32)) -> bool {
+    let (da, na) = a;
+    let (db, nb) = b;
+    da < db || (da == db && na < nb)
+}
+
+fn swap(heap: OwnedVec![(u64, u32)], i: usize, j: usize) -> OwnedVec![(u64, u32)] {
+    var heap = heap;
+    let a = at(&heap, i, (0u64, 0u32));
+    let b = at(&heap, j, (0u64, 0u32));
+    let heap = set(heap, i, b);
+    set(heap, j, a)
+}
+
+fn heap_push(heap: OwnedVec![(u64, u32)], item: (u64, u32)) -> OwnedVec![(u64, u32)] {
+    var heap = heap.push(item);
+    var i = &heap.len() - 1usize;
+    var rising = true;
+    while rising && i > 0usize {
+        let parent = (i - 1usize) / 2usize;
+        if less(at(&heap, i, item), at(&heap, parent, item)) {
+            heap = swap(heap, i, parent);
+            i = parent;
+        } else {
+            rising = false;
+        }
+    }
+    heap
+}
+
+fn heap_pop(heap: OwnedVec![(u64, u32)]) -> (OwnedVec![(u64, u32)], Option[(u64, u32)]) {
+    var heap = heap;
+    let n = &heap.len();
+    if n == 0usize {
+        return (heap, Option::None);
+    }
+    let top = at(&heap, 0usize, (0u64, 0u32));
+    let last = match &heap.pop() {
+        Popped::Item(x) => x,
+        Popped::Empty => top,
+    };
+    if n == 1usize {
+        return (heap, Option::Some.(top));
+    }
+    heap = set(heap, 0usize, last);
+    let size = n - 1usize;
+    var i = 0usize;
+    var sinking = true;
+    while sinking {
+        let left = 2usize * i + 1usize;
+        let right = left + 1usize;
+        var smallest = i;
+        if left < size && less(at(&heap, left, top), at(&heap, smallest, top)) {
+            smallest = left;
+        }
+        if right < size && less(at(&heap, right, top), at(&heap, smallest, top)) {
+            smallest = right;
+        }
+        if smallest == i {
+            sinking = false;
+        } else {
+            heap = swap(heap, i, smallest);
+            i = smallest;
+        }
+    }
+    (heap, Option::Some.(top))
+}
+
+// ------------------------------------------------------------ Dijkstra --
+
+// What one search found: the cheapest distance from the source to every
+// node (`infinity()` when unreachable) and the node before each on the
+// cheapest path (`none()` at the source).
+struct Paths! {
+    dist: OwnedVec![u64],
+    prev: OwnedVec![u32],
+}
+
+forall 't.
+fn dijkstra(&graph: Graph!['t], source: u32) -> Paths! {
+    let n = &graph.first.len();
+    var dist = OwnedVec::new[u64]();
+    var prev = OwnedVec::new[u32]();
+    var i = 0usize;
+    while i < n {
+        dist = dist.push(infinity());
+        prev = prev.push(none());
+        i = i + 1usize;
+    }
+    dist = set(dist, (source as usize), 0u64);
+    var heap = heap_push(OwnedVec::new[(u64, u32)](), (0u64, source));
+    var searching = true;
+    while searching {
+        let (h, popped) = heap_pop(heap);
+        heap = h;
+        let unit = match popped {
+            Option::None => {
+                searching = false;
+            },
+            Option::Some(entry) => {
+                let (d, u) = entry;
+                // A stale entry: `u` was reached more cheaply since.
+                if d == at(&dist, (u as usize), infinity()) {
+                    var road = at(&graph.first, (u as usize), none());
+                    while road != none() {
+                        let r = at(&graph.roads, (road as usize), Road.{ to: 0u32, weight: 0u64, next: none() });
+                        let through = d + r.weight;
+                        if through < at(&dist, (r.to as usize), infinity()) {
+                            dist = set(dist, (r.to as usize), through);
+                            prev = set(prev, (r.to as usize), u);
+                            heap = heap_push(heap, (through, r.to));
+                        }
+                        road = r.next;
+                    }
+                }
+            },
+        };
+    }
+    heap.free();
+    Paths.{ dist, prev }
+}
+
+// -------------------------------------------------------------- output --
+
+forall 't.
+fn write_name(&tag: Exclusive!['t], out: Output!, &graph: Graph!['t], id: u32) -> Output! {
+    let out = match &graph.names.get((id as usize)) {
+        Option::Some(name) => write_bytes(out, &tag, name),
+        Option::None => out,
+    };
+    out
+}
+
+// Writes the answer to one query.
+forall 't.
+fn answer(&tag: Exclusive!['t], out: Output!, &graph: Graph!['t], q: Query['t]) -> Output! {
+    let from = lookup(&tag, &graph, q.from);
+    let to = lookup(&tag, &graph, q.to);
+    let paths = match from {
+        Option::Some(source) => {
+            let paths = dijkstra(&graph, source);
+            Option::Some.(paths)
+        },
+        Option::None => Option::None,
+    };
+    // The cheapest path, from the target back to the source.
+    var back = OwnedVec::new[u32]();
+    var total = infinity();
+    let unit = match paths {
+        Option::None => (),
+        Option::Some(paths) => {
+            let { dist, prev } = paths;
+            var dist = dist;
+            var prev = prev;
+            let unit = match to {
+                Option::None => (),
+                Option::Some(target) => {
+                    total = at(&dist, (target as usize), infinity());
+                    if total != infinity() {
+                        var node = target;
+                        while node != none() {
+                            back = back.push(node);
+                            node = at(&prev, (node as usize), none());
+                        }
+                    }
+                },
+            };
+            dist.free();
+            prev.free();
+        },
+    };
+    var out = out;
+    let steps = &back.len();
+    if steps == 0usize {
+        out = write_bytes(out, &tag, q.from);
+        out = f" -> ".write(out);
+        out = write_bytes(out, &tag, q.to);
+        out = f" unreachable\n".write(out);
+    } else {
+        var k = steps;
+        while k > 0usize {
+            k = k - 1usize;
+            out = write_name(&tag, out, &graph, at(&back, k, 0u32));
+            if k > 0usize {
+                out = f" -> ".write(out);
+            }
+        }
+        out = f" ({total})\n".write(out);
+    }
+    back.free();
+    out
+}
+
+fn main() -> i32 {
+    let text = read_all_stdin();
+    let exists 't. (tag, bytes, text) = text.open();
+    var tag = tag;
+    let status = match parse(&tag, bytes) {
+        Result::Err(bad) => {
+            var sr = StaticRead::get();
+            var err = f"line {bad.line}: ".write(stderr());
+            err = write_bytes(err, &sr, bad.reason);
+            err = f"\n".write(err);
+            let done = err.finish();
+            1
+        },
+        Result::Ok(input) => {
+            var input = input;
+            var out = stdout();
+            let n = &input.queries.len();
+            var i = 0usize;
+            while i < n {
+                let q = match &input.queries.get(i) {
+                    Option::Some(q) => q,
+                    Option::None => Query.{ from: bytes, to: bytes, line: 0usize },
+                };
+                out = answer(&tag, out, &input.graph, q);
+                i = i + 1usize;
+            }
+            let { graph, queries } = input;
+            free_graph(graph);
+            queries.free();
+            match out.finish() {
+                Result::Ok(nothing) => 0,
+                Result::Err(code) => 1,
+            }
+        },
+    };
+    text.restore(tag).destroy();
+    status
+}

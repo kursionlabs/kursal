@@ -1,0 +1,53 @@
+// Spawns two OS threads, each taking ownership of its own `Buffer!` and
+// summing its bytes, joins both, and combines the results into the exit
+// code.
+//
+// Each closure moves a linear `Buffer!` into its thread: once `spawn` has
+// captured `first` or `second`, `main` cannot touch it again (adding
+// `let n = &first.len();` after the first `spawn` is rejected: `first` has
+// been moved). Neither thread touches the other's buffer, so there is no
+// aliasing in either direction. `spawn` itself is safe; the `thread`
+// library's README explains why.
+
+use thread::thread;
+use std::bytes::buffer::Buffer;
+use std::option::Result;
+use std::slice::byte_or_zero;
+use std::process::abort;
+
+fn sum_bytes(buf: Buffer!) -> u32 {
+    let exists 'b. (tag, bytes, restore) = buf.open();
+    var total = 0u32;
+    var i = 0usize;
+    while i < bytes.len() {
+        total = total + (byte_or_zero(&tag, bytes, i) as u32);
+        i = i + 1;
+    }
+    restore.restore(tag).destroy();
+    total
+}
+
+fn main() -> i32 {
+    let first = Buffer::new().push_static("hello");
+    let second = Buffer::new().push_static("world!!");
+
+    let spawned_first = match thread::spawn(|| -> u32 { sum_bytes(first) }) {
+        Result::Err(_) => abort(),
+        Result::Ok(t) => t,
+    };
+    let spawned_second = match thread::spawn(|| -> u32 { sum_bytes(second) }) {
+        Result::Err(_) => abort(),
+        Result::Ok(t) => t,
+    };
+
+    let first_sum = match spawned_first.join() {
+        Result::Err(error) => 0,
+        Result::Ok(value) => value,
+    };
+    let second_sum = match spawned_second.join() {
+        Result::Err(error) => 0,
+        Result::Ok(value) => value,
+    };
+
+    ((first_sum + second_sum) as i32)
+}

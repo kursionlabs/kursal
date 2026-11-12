@@ -1,0 +1,863 @@
+// A small Lisp: reads a program from stdin, evaluates each top-level form
+// and prints its value.
+//
+//   (define (fact n) (if (< n 2) 1 (* n (fact (- n 1)))))
+//   (fact 10)                                  ; prints 3628800
+//
+// Numbers are `i64`. Special forms: `quote` (also `'x`), `if`, `define`
+// (of a value, or `(define (f args...) body...)`), `lambda`, `let`.
+// Builtins: `+ - * < = car cdr cons list null?`. Only `#f` and the empty
+// list are false. An error names its line and stops the program with
+// exit status 1.
+//
+// Two domains. The program's text is one: every symbol is a `Copy` slice
+// of it, so reading copies no names. The values are the other: pairs,
+// closures and environment frames live in one arena and are linked by
+// `Ref`s, which is what lets a closure share the frames it captured with
+// every other closure that captured them. `Interp!` holds both domains'
+// capabilities and the arena, and every operation takes it as `&cx`.
+use std::io::{read_all_stdin, print_buffer};
+use std::alloc::arena::Arena;
+use std::cap::Exclusive;
+use std::mem::Ref;
+use std::bytes::buffer::Buffer;
+use std::slice::{Slice, StaticRead, byte_at, bytes_eq, bytes_eq_within};
+use std::ascii::{is_digit, is_space};
+use std::parse::parse_i64;
+use std::option::{Option, Result};
+
+// ---------------------------------------------------------------- values --
+
+forall 't, 'k.
+exposed enum Value {
+    Nil,
+    Void,
+    Bool(bool),
+    Num(i64),
+    // A symbol's name, and the line it was read on.
+    Sym(Slice[u8, 't], usize),
+    Pair(Ref[Cell['t, 'k], 'k]),
+    Lambda(Ref[Closure['t, 'k], 'k]),
+    Builtin(u32),
+}
+
+// A pair, and the line the list it starts was read on.
+forall 't, 'k.
+exposed struct Cell {
+    car: Value['t, 'k],
+    cdr: Value['t, 'k],
+    line: usize,
+}
+
+forall 't, 'k.
+exposed struct Closure {
+    params: Value['t, 'k],
+    body: Value['t, 'k],
+    env: Option[Ref[Frame['t, 'k], 'k]],
+}
+
+// One binding of an environment, which is a chain of frames.
+forall 't, 'k.
+exposed struct Frame {
+    name: Slice[u8, 't],
+    value: Value['t, 'k],
+    next: Option[Ref[Frame['t, 'k], 'k]],
+}
+
+forall 't.
+exposed enum Fault {
+    Unclosed(usize),
+    Unexpected(usize),
+    Unbound(Slice[u8, 't], usize),
+    Arity(usize),
+    NotCallable(usize),
+    BadArgument(usize),
+    BadForm(usize),
+}
+
+// ----------------------------------------------------------- interpreter --
+
+// The program's text and the values' arena, with both domains'
+// capabilities, and the global environment.
+forall 't, 'k.
+exposed struct Interp! {
+    text: Exclusive!['t],
+    tag: Exclusive!['k],
+    arena: Arena!['k],
+    globals: Option[Ref[Frame['t, 'k], 'k]],
+}
+
+forall 't, 'k.
+impl Interp['t, 'k] {
+    fn byte(&self, s: Slice[u8, 't], i: usize) -> Option[u8] {
+        let b = byte_at(&self.text, s, i);
+        b
+    }
+
+    fn number(&self, s: Slice[u8, 't]) -> Option[i64] {
+        let n = parse_i64(&self.text, s);
+        n
+    }
+
+    fn same(&self, a: Slice[u8, 't], b: Slice[u8, 't]) -> bool {
+        let eq = bytes_eq_within(&self.text, a, b);
+        eq
+    }
+
+    fn named(&self, s: Slice[u8, 't], lit: Slice[u8, 'static]) -> bool {
+        var sr = StaticRead::get();
+        let eq = bytes_eq(&self.text, s, &sr, lit);
+        eq
+    }
+
+    fn push_name(&self, out: Buffer!, s: Slice[u8, 't]) -> Buffer! {
+        let out = out.push_bytes(&self.text, s);
+        out
+    }
+
+    fn cons(&self, car: Value['t, 'k], cdr: Value['t, 'k], line: usize) -> Value['t, 'k] {
+        let { tag, arena, ..rest } = self;
+        let at = &arena.alloc(&tag, Cell.{ car, cdr, line });
+        self = Interp.{ tag, arena, ..rest };
+        Value::Pair.(at)
+    }
+
+    fn cell(&self, at: Ref[Cell['t, 'k], 'k]) -> Cell['t, 'k] {
+        let c = at.copy(&self.tag);
+        c
+    }
+
+    fn procedure(&self, at: Ref[Closure['t, 'k], 'k]) -> Closure['t, 'k] {
+        let c = at.copy(&self.tag);
+        c
+    }
+
+    fn lambda(&self, params: Value['t, 'k], body: Value['t, 'k], env: Option[Ref[Frame['t, 'k], 'k]]) -> Value['t, 'k] {
+        let { tag, arena, ..rest } = self;
+        let at = &arena.alloc(&tag, Closure.{ params, body, env });
+        self = Interp.{ tag, arena, ..rest };
+        Value::Lambda.(at)
+    }
+
+    fn bind(&self, name: Slice[u8, 't], value: Value['t, 'k], next: Option[Ref[Frame['t, 'k], 'k]]) -> Option[Ref[Frame['t, 'k], 'k]] {
+        let { tag, arena, ..rest } = self;
+        let at = &arena.alloc(&tag, Frame.{ name, value, next });
+        self = Interp.{ tag, arena, ..rest };
+        Option::Some.(at)
+    }
+
+    fn frame(&self, at: Ref[Frame['t, 'k], 'k]) -> Frame['t, 'k] {
+        let f = at.copy(&self.tag);
+        f
+    }
+
+    // Adds a global binding; a later one shadows an earlier one.
+    fn define(&self, name: Slice[u8, 't], value: Value['t, 'k]) -> () {
+        let { tag, arena, globals, ..rest } = self;
+        let at = &arena.alloc(&tag, Frame.{ name, value, next: globals });
+        self = Interp.{ tag, arena, globals: Option::Some.(at), ..rest };
+    }
+
+    fn globals(&self) -> Option[Ref[Frame['t, 'k], 'k]] {
+        let { globals, ..rest } = self;
+        self = Interp.{ globals, ..rest };
+        globals
+    }
+
+    // The `i`th element of the list `v`, or `Nil`.
+    fn nth(&self, v: Value['t, 'k], i: usize) -> Value['t, 'k] {
+        var at = v;
+        var k = 0usize;
+        var found = Value::Nil;
+        var walking = true;
+        while walking {
+            let unit = match at {
+                Value::Pair(r) => {
+                    let c = &self.cell(r);
+                    if k == i {
+                        found = c.car;
+                        walking = false;
+                    }
+                    at = c.cdr;
+                    k = k + 1;
+                },
+                _ => {
+                    walking = false;
+                },
+            };
+        }
+        found
+    }
+
+    // The list `v` without its first element, or `Nil`.
+    fn rest(&self, v: Value['t, 'k]) -> Value['t, 'k] {
+        match v {
+            Value::Pair(r) => {
+                let c = &self.cell(r);
+                c.cdr
+            },
+            _ => Value::Nil,
+        }
+    }
+
+    fn length(&self, v: Value['t, 'k]) -> usize {
+        var at = v;
+        var n = 0usize;
+        var walking = true;
+        while walking {
+            let unit = match at {
+                Value::Pair(r) => {
+                    let c = &self.cell(r);
+                    at = c.cdr;
+                    n = n + 1;
+                },
+                _ => {
+                    walking = false;
+                },
+            };
+        }
+        n
+    }
+}
+
+// ---------------------------------------------------------------- reader --
+
+fn is_delimiter(b: u8) -> bool {
+    is_space(b) || b == b'(' || b == b')' || b == b'\'' || b == b';'
+}
+
+// Skips spaces and `;` comments from `pos`, counting lines; returns the
+// position of the next token and its line.
+forall 't, 'k.
+fn skip_blank(&cx: Interp!['t, 'k], text: Slice[u8, 't], pos: usize, line: usize) -> (usize, usize) {
+    var pos = pos;
+    var line = line;
+    var in_comment = false;
+    var skipping = true;
+    while skipping {
+        let unit = match &cx.byte(text, pos) {
+            Option::None => {
+                skipping = false;
+            },
+            Option::Some(b) => {
+                if b == b'\n' {
+                    line = line + 1;
+                    in_comment = false;
+                    pos = pos + 1;
+                } else if in_comment || is_space(b) {
+                    pos = pos + 1;
+                } else if b == b';' {
+                    in_comment = true;
+                    pos = pos + 1;
+                } else {
+                    skipping = false;
+                }
+            },
+        };
+    }
+    (pos, line)
+}
+
+// Reads one form starting at `pos` (blanks already skipped): the form, and
+// the position and line after it.
+forall 't, 'k.
+fn read(&cx: Interp!['t, 'k], text: Slice[u8, 't], pos: usize, line: usize) -> Result[(Value['t, 'k], usize, usize), Fault['t]] {
+    let first = match &cx.byte(text, pos) {
+        Option::Some(b) => b,
+        Option::None => {
+            return Result::Err.(Fault::Unclosed.(line));
+        },
+    };
+    if first == b'(' {
+        let (p, l) = skip_blank(&cx, text, pos + 1, line);
+        read_list(&cx, text, p, l, line)
+    } else if first == b')' {
+        Result::Err.(Fault::Unexpected.(line))
+    } else if first == b'\'' {
+        let (p, l) = skip_blank(&cx, text, pos + 1, line);
+        let (quoted, p, l) = read(&cx, text, p, l)?;
+        let quote = Value::Sym.(text.sub(0, 0).unwrap_or(text), line);
+        let tail = &cx.cons(quoted, Value::Nil, line);
+        let form = &cx.cons(quote, tail, line);
+        Result::Ok.((form, p, l))
+    } else {
+        read_atom(&cx, text, pos, line)
+    }
+}
+
+// The rest of a list after its `(`, which was on `open`.
+forall 't, 'k.
+fn read_list(&cx: Interp!['t, 'k], text: Slice[u8, 't], pos: usize, line: usize, open: usize) -> Result[(Value['t, 'k], usize, usize), Fault['t]] {
+    let next = match &cx.byte(text, pos) {
+        Option::Some(b) => b,
+        Option::None => {
+            return Result::Err.(Fault::Unclosed.(open));
+        },
+    };
+    if next == b')' {
+        return Result::Ok.((Value::Nil, pos + 1, line));
+    }
+    let (item, p, l) = read(&cx, text, pos, line)?;
+    let (p, l) = skip_blank(&cx, text, p, l);
+    let (tail, p, l) = read_list(&cx, text, p, l, open)?;
+    let list = &cx.cons(item, tail, open);
+    Result::Ok.((list, p, l))
+}
+
+forall 't, 'k.
+fn read_atom(&cx: Interp!['t, 'k], text: Slice[u8, 't], pos: usize, line: usize) -> Result[(Value['t, 'k], usize, usize), Fault['t]] {
+    var end = pos;
+    var scanning = true;
+    while scanning {
+        let unit = match &cx.byte(text, end) {
+            Option::Some(b) => {
+                if is_delimiter(b) {
+                    scanning = false;
+                } else {
+                    end = end + 1;
+                }
+            },
+            Option::None => {
+                scanning = false;
+            },
+        };
+    }
+    let atom = match text.sub(pos, end - pos) {
+        Option::Some(s) => s,
+        Option::None => {
+            return Result::Err.(Fault::Unexpected.(line));
+        },
+    };
+    let first = &cx.byte(atom, 0).unwrap_or(0);
+    let second = &cx.byte(atom, 1).unwrap_or(0);
+    let numeric = is_digit(first) || (first == b'-' && is_digit(second));
+    let value: Value['t, 'k] = if numeric {
+        match &cx.number(atom) {
+            Option::Some(n) => Value::Num.(n),
+            Option::None => {
+                return Result::Err.(Fault::BadForm.(line));
+            },
+        }
+    } else if &cx.named(atom, "#t") {
+        Value::Bool.(true)
+    } else if &cx.named(atom, "#f") {
+        Value::Bool.(false)
+    } else {
+        Value::Sym.(atom, line)
+    };
+    Result::Ok.((value, end, line))
+}
+
+// ------------------------------------------------------------- evaluator --
+
+// The builtin a global name stands for, if it is one.
+forall 't, 'k.
+fn builtin_named(&cx: Interp!['t, 'k], name: Slice[u8, 't]) -> Option[u32] {
+    let id = if &cx.named(name, "+") {
+        1u32
+    } else if &cx.named(name, "-") {
+        2u32
+    } else if &cx.named(name, "*") {
+        3u32
+    } else if &cx.named(name, "<") {
+        4u32
+    } else if &cx.named(name, "=") {
+        5u32
+    } else if &cx.named(name, "car") {
+        6u32
+    } else if &cx.named(name, "cdr") {
+        7u32
+    } else if &cx.named(name, "cons") {
+        8u32
+    } else if &cx.named(name, "list") {
+        9u32
+    } else if &cx.named(name, "null?") {
+        10u32
+    } else {
+        0u32
+    };
+    if id == 0u32 {
+        Option::None
+    } else {
+        Option::Some.(id)
+    }
+}
+
+// `name`'s value in `env`, then among the globals, then the builtins.
+forall 't, 'k.
+fn lookup(&cx: Interp!['t, 'k], name: Slice[u8, 't], env: Option[Ref[Frame['t, 'k], 'k]]) -> Option[Value['t, 'k]] {
+    var at = env;
+    var in_globals = false;
+    var found = Option::None;
+    var walking = true;
+    while walking {
+        let unit = match at {
+            Option::Some(r) => {
+                let f = &cx.frame(r);
+                if &cx.same(f.name, name) {
+                    found = Option::Some.(f.value);
+                    walking = false;
+                } else {
+                    at = f.next;
+                }
+            },
+            Option::None => {
+                if in_globals {
+                    walking = false;
+                } else {
+                    in_globals = true;
+                    at = &cx.globals();
+                }
+            },
+        };
+    }
+    let found = match found {
+        Option::Some(v) => Option::Some.(v),
+        Option::None => match builtin_named(&cx, name) {
+            Option::Some(id) => Option::Some.(Value::Builtin.(id)),
+            Option::None => Option::None,
+        },
+    };
+    found
+}
+
+forall 't, 'k.
+fn truthy(v: Value['t, 'k]) -> bool {
+    match v {
+        Value::Bool(b) => b,
+        Value::Nil => false,
+        _ => true,
+    }
+}
+
+// Which special form a list headed by `name` is: 0 for none, then
+// `quote`, `if`, `define`, `lambda`, `let`.
+forall 't, 'k.
+fn special_form(&cx: Interp!['t, 'k], name: Slice[u8, 't]) -> u32 {
+    let form = if name.len() == 0 || &cx.named(name, "quote") {
+        // The reader spells `'x` as a symbol of no bytes.
+        1u32
+    } else if &cx.named(name, "if") {
+        2u32
+    } else if &cx.named(name, "define") {
+        3u32
+    } else if &cx.named(name, "lambda") {
+        4u32
+    } else if &cx.named(name, "let") {
+        5u32
+    } else {
+        0u32
+    };
+    form
+}
+
+forall 't, 'k.
+fn eval(&cx: Interp!['t, 'k], expr: Value['t, 'k], env: Option[Ref[Frame['t, 'k], 'k]]) -> Result[Value['t, 'k], Fault['t]] {
+    match expr {
+        Value::Sym(name, line) => {
+            match lookup(&cx, name, env) {
+                Option::Some(v) => Result::Ok.(v),
+                Option::None => Result::Err.(Fault::Unbound.(name, line)),
+            }
+        },
+        Value::Pair(r) => eval_list(&cx, r, env),
+        _ => Result::Ok.(expr),
+    }
+}
+
+forall 't, 'k.
+fn eval_list(&cx: Interp!['t, 'k], at: Ref[Cell['t, 'k], 'k], env: Option[Ref[Frame['t, 'k], 'k]]) -> Result[Value['t, 'k], Fault['t]] {
+    let c = &cx.cell(at);
+    let line = c.line;
+    let form = match c.car {
+        Value::Sym(name, l) => special_form(&cx, name),
+        _ => 0u32,
+    };
+    if form == 1u32 {
+        let quoted = &cx.nth(c.cdr, 0);
+        Result::Ok.(quoted)
+    } else if form == 2u32 {
+        let test = eval(&cx, &cx.nth(c.cdr, 0), env)?;
+        let branch = if truthy(test) { 1usize } else { 2usize };
+        eval(&cx, &cx.nth(c.cdr, branch), env)
+    } else if form == 3u32 {
+        eval_define(&cx, c.cdr, env, line)
+    } else if form == 4u32 {
+        let params = &cx.nth(c.cdr, 0);
+        let body = &cx.rest(c.cdr);
+        let f = &cx.lambda(params, body, env);
+        Result::Ok.(f)
+    } else if form == 5u32 {
+        eval_let(&cx, c.cdr, env, line)
+    } else {
+        let f = eval(&cx, c.car, env)?;
+        let args = eval_args(&cx, c.cdr, env)?;
+        apply(&cx, f, args, line)
+    }
+}
+
+// `(define name expr)` or `(define (name params...) body...)`.
+forall 't, 'k.
+fn eval_define(&cx: Interp!['t, 'k], args: Value['t, 'k], env: Option[Ref[Frame['t, 'k], 'k]], line: usize) -> Result[Value['t, 'k], Fault['t]] {
+    let target = &cx.nth(args, 0);
+    match target {
+        Value::Sym(name, l) => {
+            let value = eval(&cx, &cx.nth(args, 1), env)?;
+            &cx.define(name, value);
+            Result::Ok.(Value::Void)
+        },
+        Value::Pair(r) => {
+            let head = &cx.cell(r);
+            match head.car {
+                Value::Sym(name, l) => {
+                    let f = &cx.lambda(head.cdr, &cx.rest(args), env);
+                    &cx.define(name, f);
+                    Result::Ok.(Value::Void)
+                },
+                _ => Result::Err.(Fault::BadForm.(line)),
+            }
+        },
+        _ => Result::Err.(Fault::BadForm.(line)),
+    }
+}
+
+// `(let ((name expr)...) body...)`.
+forall 't, 'k.
+fn eval_let(&cx: Interp!['t, 'k], args: Value['t, 'k], env: Option[Ref[Frame['t, 'k], 'k]], line: usize) -> Result[Value['t, 'k], Fault['t]] {
+    var bindings = &cx.nth(args, 0);
+    var inner = env;
+    var walking = true;
+    while walking {
+        let unit = match bindings {
+            Value::Pair(r) => {
+                let binding = &cx.cell(r);
+                let name = match &cx.nth(binding.car, 0) {
+                    Value::Sym(n, l) => n,
+                    _ => {
+                        return Result::Err.(Fault::BadForm.(line));
+                    },
+                };
+                let value = eval(&cx, &cx.nth(binding.car, 1), env)?;
+                inner = &cx.bind(name, value, inner);
+                bindings = binding.cdr;
+            },
+            _ => {
+                walking = false;
+            },
+        };
+    }
+    eval_body(&cx, &cx.rest(args), inner)
+}
+
+// Each expression of `body` in turn; the value of the last.
+forall 't, 'k.
+fn eval_body(&cx: Interp!['t, 'k], body: Value['t, 'k], env: Option[Ref[Frame['t, 'k], 'k]]) -> Result[Value['t, 'k], Fault['t]] {
+    var at = body;
+    var last = Value::Nil;
+    var walking = true;
+    while walking {
+        let unit = match at {
+            Value::Pair(r) => {
+                let c = &cx.cell(r);
+                last = eval(&cx, c.car, env)?;
+                at = c.cdr;
+            },
+            _ => {
+                walking = false;
+            },
+        };
+    }
+    Result::Ok.(last)
+}
+
+// The values of a call's arguments, as a list.
+forall 't, 'k.
+fn eval_args(&cx: Interp!['t, 'k], args: Value['t, 'k], env: Option[Ref[Frame['t, 'k], 'k]]) -> Result[Value['t, 'k], Fault['t]] {
+    match args {
+        Value::Pair(r) => {
+            let c = &cx.cell(r);
+            let first = eval(&cx, c.car, env)?;
+            let rest = eval_args(&cx, c.cdr, env)?;
+            let list = &cx.cons(first, rest, c.line);
+            Result::Ok.(list)
+        },
+        _ => Result::Ok.(Value::Nil),
+    }
+}
+
+forall 't, 'k.
+fn apply(&cx: Interp!['t, 'k], f: Value['t, 'k], args: Value['t, 'k], line: usize) -> Result[Value['t, 'k], Fault['t]] {
+    match f {
+        Value::Builtin(id) => apply_builtin(&cx, id, args, line),
+        Value::Lambda(r) => {
+            let c = &cx.procedure(r);
+            let env = bind_params(&cx, c.params, args, c.env, line)?;
+            eval_body(&cx, c.body, env)
+        },
+        _ => Result::Err.(Fault::NotCallable.(line)),
+    }
+}
+
+// `env` extended with each of `params` bound to the matching argument.
+forall 't, 'k.
+fn bind_params(
+    &cx: Interp!['t, 'k],
+    params: Value['t, 'k],
+    args: Value['t, 'k],
+    env: Option[Ref[Frame['t, 'k], 'k]],
+    line: usize,
+) -> Result[Option[Ref[Frame['t, 'k], 'k]], Fault['t]] {
+    var ps = params;
+    var xs = args;
+    var env = env;
+    var walking = true;
+    while walking {
+        let unit = match ps {
+            Value::Pair(pr) => {
+                let p = &cx.cell(pr);
+                let name = match p.car {
+                    Value::Sym(n, l) => n,
+                    _ => {
+                        return Result::Err.(Fault::BadForm.(line));
+                    },
+                };
+                let arg = match xs {
+                    Value::Pair(xr) => &cx.cell(xr),
+                    _ => {
+                        return Result::Err.(Fault::Arity.(line));
+                    },
+                };
+                env = &cx.bind(name, arg.car, env);
+                ps = p.cdr;
+                xs = arg.cdr;
+            },
+            _ => {
+                walking = false;
+            },
+        };
+    }
+    match xs {
+        Value::Pair(_) => Result::Err.(Fault::Arity.(line)),
+        _ => Result::Ok.(env),
+    }
+}
+
+forall 't, 'k.
+fn as_number(v: Value['t, 'k], line: usize) -> Result[i64, Fault['t]] {
+    match v {
+        Value::Num(n) => Result::Ok.(n),
+        _ => Result::Err.(Fault::BadArgument.(line)),
+    }
+}
+
+forall 't, 'k.
+fn apply_builtin(&cx: Interp!['t, 'k], id: u32, args: Value['t, 'k], line: usize) -> Result[Value['t, 'k], Fault['t]] {
+    let n = &cx.length(args);
+    let a = &cx.nth(args, 0);
+    let b = &cx.nth(args, 1);
+    if id == 1u32 || id == 3u32 {
+        // `+` and `*` over any number of arguments.
+        var acc = if id == 1u32 { 0i64 } else { 1i64 };
+        var at = args;
+        var walking = true;
+        while walking {
+            let unit = match at {
+                Value::Pair(r) => {
+                    let c = &cx.cell(r);
+                    let x = match as_number(c.car, line) {
+                        Result::Ok(x) => x,
+                        Result::Err(fault) => {
+                            return Result::Err.(fault);
+                        },
+                    };
+                    acc = if id == 1u32 { acc + x } else { acc * x };
+                    at = c.cdr;
+                },
+                _ => {
+                    walking = false;
+                },
+            };
+        }
+        return Result::Ok.(Value::Num.(acc));
+    }
+    if id == 2u32 {
+        if n == 1usize {
+            let x = as_number(a, line);
+            return match x {
+                Result::Ok(x) => Result::Ok.(Value::Num.(0 - x)),
+                Result::Err(fault) => Result::Err.(fault),
+            };
+        }
+    }
+    if id == 6u32 || id == 7u32 || id == 10u32 {
+        if n != 1usize {
+            return Result::Err.(Fault::Arity.(line));
+        }
+        if id == 10u32 {
+            let empty = match a {
+                Value::Nil => true,
+                _ => false,
+            };
+            return Result::Ok.(Value::Bool.(empty));
+        }
+        return match a {
+            Value::Pair(r) => {
+                let c = &cx.cell(r);
+                let part = if id == 6u32 { c.car } else { c.cdr };
+                Result::Ok.(part)
+            },
+            _ => Result::Err.(Fault::BadArgument.(line)),
+        };
+    }
+    if id == 9u32 {
+        return Result::Ok.(args);
+    }
+    // The rest take exactly two arguments.
+    if n != 2usize {
+        return Result::Err.(Fault::Arity.(line));
+    }
+    if id == 8u32 {
+        let pair = &cx.cons(a, b, line);
+        return Result::Ok.(pair);
+    }
+    let x = match as_number(a, line) {
+        Result::Ok(x) => x,
+        Result::Err(fault) => {
+            return Result::Err.(fault);
+        },
+    };
+    let y = match as_number(b, line) {
+        Result::Ok(y) => y,
+        Result::Err(fault) => {
+            return Result::Err.(fault);
+        },
+    };
+    let value: Value['t, 'k] = if id == 2u32 {
+        Value::Num.(x - y)
+    } else if id == 4u32 {
+        Value::Bool.(x < y)
+    } else {
+        Value::Bool.(x == y)
+    };
+    Result::Ok.(value)
+}
+
+// --------------------------------------------------------------- printer --
+
+forall 't, 'k.
+fn show(&cx: Interp!['t, 'k], out: Buffer!, v: Value['t, 'k]) -> Buffer! {
+    match v {
+        Value::Nil => out.push_static("()"),
+        Value::Void => out,
+        Value::Bool(b) => out.push_static(if b { "#t" } else { "#f" }),
+        Value::Num(n) => out.push_buffer(f"{n}"),
+        Value::Sym(name, line) => {
+            let out = &cx.push_name(out, name);
+            out
+        },
+        Value::Lambda(_) => out.push_static("#<lambda>"),
+        Value::Builtin(_) => out.push_static("#<builtin>"),
+        Value::Pair(r) => {
+            var out = out.push_byte(b'(');
+            var at = Value::Pair.(r);
+            var first = true;
+            var walking = true;
+            while walking {
+                let unit = match at {
+                    Value::Pair(p) => {
+                        let c = &cx.cell(p);
+                        if !first {
+                            out = out.push_byte(b' ');
+                        }
+                        out = show(&cx, out, c.car);
+                        first = false;
+                        at = c.cdr;
+                    },
+                    Value::Nil => {
+                        walking = false;
+                    },
+                    _ => {
+                        // An improper list's last tail.
+                        out = show(&cx, out.push_static(" . "), at);
+                        walking = false;
+                    },
+                };
+            }
+            out.push_byte(b')')
+        },
+    }
+}
+
+forall 't, 'k.
+fn describe(&cx: Interp!['t, 'k], fault: Fault['t]) -> Buffer! {
+    match fault {
+        Fault::Unclosed(line) => f"line {line}: unclosed '('\n",
+        Fault::Unexpected(line) => f"line {line}: unexpected ')'\n",
+        Fault::Unbound(name, line) => {
+            let out = &cx.push_name(f"line {line}: unbound symbol '", name);
+            out.push_static("'\n")
+        },
+        Fault::Arity(line) => f"line {line}: wrong number of arguments\n",
+        Fault::NotCallable(line) => f"line {line}: not a function\n",
+        Fault::BadArgument(line) => f"line {line}: bad argument\n",
+        Fault::BadForm(line) => f"line {line}: malformed expression\n",
+    }
+}
+
+// ------------------------------------------------------------------ main --
+
+// Reads, evaluates and prints the form at `pos`; the position and line
+// after it.
+forall 't, 'k.
+fn step(&cx: Interp!['t, 'k], text: Slice[u8, 't], pos: usize, line: usize) -> Result[(usize, usize), Fault['t]] {
+    let (form, p, l) = read(&cx, text, pos, line)?;
+    let value = eval(&cx, form, Option::None)?;
+    let unit = match value {
+        Value::Void => (),
+        _ => {
+            let out = show(&cx, Buffer::new(), value);
+            print_buffer(1, out.push_byte(b'\n'));
+        },
+    };
+    Result::Ok.((p, l))
+}
+
+forall 't, 'k.
+fn run(&cx: Interp!['t, 'k], text: Slice[u8, 't]) -> i32 {
+    var pos = 0usize;
+    var line = 1usize;
+    var status = 0i32;
+    var going = true;
+    while going {
+        let (p, l) = skip_blank(&cx, text, pos, line);
+        if p >= text.len() {
+            going = false;
+        } else {
+            let unit = match step(&cx, text, p, l) {
+                Result::Ok(next) => {
+                    let (np, nl) = next;
+                    pos = np;
+                    line = nl;
+                },
+                Result::Err(fault) => {
+                    print_buffer(2, describe(&cx, fault));
+                    status = 1;
+                    going = false;
+                },
+            };
+        }
+    }
+    status
+}
+
+fn main() -> i32 {
+    let input = read_all_stdin();
+    let exists 't. (text, bytes, restore) = input.open();
+    let exists 'k. (tag, arena) = Arena::new();
+    var cx = Interp.{ text, tag, arena, globals: Option::None };
+    let status = run(&cx, bytes);
+    let { text, tag, arena, globals } = cx;
+    arena.destroy(tag);
+    restore.restore(text).destroy();
+    status
+}

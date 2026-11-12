@@ -1,0 +1,57 @@
+// A program that needs no allocator and no operating system: it depends
+// on `core` alone. String literals, `Option`, checked slices and the
+// `Writable`/`Format` protocol all come from there; only `f"..."`, which
+// builds a `Buffer!`, needs `alloc`.
+use core::option::Option;
+use core::slice::{Slice, StaticRead, byte_or_zero, find_byte};
+use core::fmt::{Writable, Format, CountingWriter, write_u64};
+use core::raw::raw_byte_at;
+
+// A writer that keeps a checksum of what it is given instead of the bytes.
+exposed struct Checksum {
+    total: u32,
+}
+
+instance Writable[Checksum] {
+    fn write_byte(self: Checksum, byte: u8) -> Checksum {
+        let { total } = self;
+        Checksum.{ total: total * 31 + (byte as u32) }
+    }
+    fn write_static(self: Checksum, bytes: Slice[u8, 'static]) -> Checksum {
+        var sr = StaticRead::get();
+        var out = self;
+        var i = 0usize;
+        while i < bytes.len() {
+            out = out.write_byte(byte_or_zero(&sr, bytes, i));
+            i = i + 1;
+        }
+        out
+    }
+    unsafe fn write_raw(self: Checksum, ptr: *u8, len: usize) -> Checksum {
+        var out = self;
+        var i = 0usize;
+        while i < len {
+            out = out.write_byte(unsafe raw_byte_at(ptr, len, i));
+            i = i + 1;
+        }
+        out
+    }
+}
+
+fn digits(n: u64) -> usize {
+    let { count } = write_u64(CountingWriter::new(), n);
+    count
+}
+
+fn main() -> i32 {
+    var sr = StaticRead::get();
+    let comma = match find_byte(&sr, "hello, world", 0, b',') {
+        Option::Some(at) => at,
+        Option::None => 0,
+    };
+    let (value, sum) = Format[u32, Checksum]::format(7, Checksum.{ total: 0 });
+    let { total } = sum.write_static("!");
+    // 5 (the comma) + 5 (digits in 12345) + 7 + the checksum of "7!"
+    // (55 * 31 + 33 = 1738) mod 100, which is 38: 55.
+    ((comma + digits(12345) + (value as usize) + ((total % 100) as usize)) as i32)
+}

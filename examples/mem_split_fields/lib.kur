@@ -1,0 +1,53 @@
+// Project a region's two disjoint fields into independently addressable
+// references. The pointer arithmetic is explicit and unsafe.
+
+use std::alloc::owned::Owned;
+use std::mem::Ref;
+use std::cap::Exclusive;
+
+exposed struct Pair {
+    x: u32,
+    y: u32,
+}
+
+// `x` is the first declared field, so its address is the struct's own.
+forall 'k.
+unsafe fn field_x(p: Ref[Pair, 'k]) -> Ref[u32, 'k] {
+    let (q, m) = p.into_parts();
+    let addr = unsafe (q as usize);
+    unsafe Ref::from_raw(unsafe (addr as *u32), m)
+}
+
+// `y` follows `x`, padded up to its natural alignment, which for a `u32`
+// after a `u32` is no padding at all.
+forall 'k.
+unsafe fn field_y(p: Ref[Pair, 'k]) -> Ref[u32, 'k] {
+    let (q, m) = p.into_parts();
+    let addr = unsafe (q as usize) + sizeof[u32]();
+    unsafe Ref::from_raw(unsafe (addr as *u32), m)
+}
+
+// Bumps one shared u32 through `Ref::with`; used for both projected fields.
+forall 'k. fn bump(&tag: Exclusive!['k], r: Ref[u32, 'k]) -> () {
+    let unit = r.with(&tag, |v: u32| (v + 1, ()));
+}
+
+// Projects a Pair's Ref onto its x and y fields, bumps each through its
+// own Ref, then reads the Pair back out and frees it.
+fn bump_both_fields(x0: u32, y0: u32) -> u32 {
+    let o = Owned::new(Pair.{ x: x0, y: y0 });
+    let exists 'open1. (alloc, reg) = o.open();
+    let (tag, r, back) = reg.share();
+    let xr = unsafe field_x(r);
+    let yr = unsafe field_y(r);
+    bump(&tag, xr);
+    bump(&tag, yr);
+    let pair = r.copy(&tag);
+    let reg = back.resume(tag);
+    let last = alloc.close(reg).into_value();
+    pair.x + pair.y
+}
+
+fn main() -> i32 {
+    ((bump_both_fields(10, 20) - 32) as i32)
+}

@@ -1,0 +1,270 @@
+// A tiny key-value store kept in a file:
+//
+//   kvstore FILE set KEY VALUE    stores VALUE under KEY
+//   kvstore FILE get KEY          prints KEY's value
+//   kvstore FILE del KEY          removes KEY
+//   kvstore FILE list             prints every entry, sorted by key
+//
+// The file holds one `KEY<TAB>VALUE` line per entry and is rewritten,
+// sorted, after every change. A missing file is an empty store. Exits 1
+// when a key is not found, 2 on bad usage and 3 when the file cannot be
+// written.
+//
+// One domain: the file's text is opened once and every key and value is a
+// `Copy` slice of it. `set` appends its line to the text before opening it,
+// and a later line for a key wins over an earlier one, so the new entry
+// needs no separate storage either.
+use std::io::{File, print, print_bytes, print_buffer};
+use std::process::Args;
+use std::cstr::CStr;
+use std::bytes::buffer::Buffer;
+use std::cap::Exclusive;
+use std::slice::{Slice, StaticRead, bytes_eq, bytes_eq_within, bytes_cmp_within, find_byte};
+use std::ascii::line_at;
+use std::collections::vec::OwnedVec;
+use std::cmp::Order;
+use std::option::{Option, Result};
+
+forall 't.
+tuple Entry(Slice[u8, 't], Slice[u8, 't]);
+
+// The text before and after a line's first tab, if it has one.
+forall 't.
+fn split_at_tab(&tag: Exclusive!['t], line: Slice[u8, 't]) -> Option[Entry['t]] {
+    let at = find_byte(&tag, line, 0, b'\t')?;
+    let key = line.sub(0, at)?;
+    let value = line.sub(at + 1, line.len() - at - 1)?;
+    Option::Some.(Entry.(key, value))
+}
+
+// Every `KEY<TAB>VALUE` line of `text`, in file order. Lines without a tab
+// are skipped.
+forall 't.
+fn entries(&tag: Exclusive!['t], text: Slice[u8, 't]) -> OwnedVec![Entry['t]] {
+    var found = OwnedVec::new[Entry['t]]();
+    var start = 0usize;
+    var reading = true;
+    while reading {
+        let unit = match line_at(&tag, text, start) {
+            Option::None => {
+                reading = false;
+            },
+            Option::Some(next) => {
+                let (line, after) = next;
+                start = after;
+                let unit = match split_at_tab(&tag, line) {
+                    Option::Some(entry) => {
+                        found = found.push(entry);
+                    },
+                    Option::None => (),
+                };
+            },
+        };
+    }
+    found
+}
+
+// The comparison `sort_with` calls: it takes the capability and hands it back.
+forall 't.
+fn key_order(tag: Exclusive!['t], a: Entry['t], b: Entry['t]) -> (Exclusive!['t], Order) {
+    var tag = tag;
+    let order = bytes_cmp_within(&tag, a.0, b.0);
+    (tag, order)
+}
+
+// The store's entries in key order, one per key: the sort is stable, so
+// the last entry of each run of equal keys is the one written last.
+forall 't.
+fn latest(&tag: Exclusive!['t], text: Slice[u8, 't]) -> OwnedVec![Entry['t]] {
+    var sorted = entries(&tag, text).sort_with(&tag, key_order);
+    var kept = OwnedVec::new[Entry['t]]();
+    let n = &sorted.len();
+    var i = 0usize;
+    while i < n {
+        let entry = &sorted.get(i).unwrap_or(Entry.(text, text));
+        let superseded = if i + 1usize < n {
+            bytes_eq_within(&tag, entry.0, &sorted.get(i + 1usize).unwrap_or(entry).0)
+        } else {
+            false
+        };
+        if !superseded {
+            kept = kept.push(entry);
+        }
+        i = i + 1usize;
+    }
+    sorted.free();
+    kept
+}
+
+// `entries` as file text, leaving out the entry for `skip` if any.
+forall 't.
+fn render(&tag: Exclusive!['t], entries: OwnedVec![Entry['t]], skip: Option[Slice[u8, 'static]]) -> Buffer! {
+    var entries = entries;
+    var sr = StaticRead::get();
+    var out = Buffer::new();
+    let n = &entries.len();
+    var i = 0usize;
+    while i < n {
+        let entry = match &entries.get(i) {
+            Option::Some(e) => e,
+            Option::None => {
+                entries.free();
+                return out;
+            },
+        };
+        let skipped = match skip {
+            Option::Some(key) => bytes_eq(&tag, entry.0, &sr, key),
+            Option::None => false,
+        };
+        if !skipped {
+            out = out.push_bytes(&tag, entry.0).push_byte(b'\t').push_bytes(&tag, entry.1).push_byte(b'\n');
+        }
+        i = i + 1usize;
+    }
+    entries.free();
+    out
+}
+
+// The file's text, or nothing for a missing file.
+fn load(path: CStr) -> Buffer! {
+    match File::open_read(path) {
+        Result::Err(code) => Buffer::new(),
+        Result::Ok(file) => {
+            var file = file;
+            let read = &file.read_to_buffer();
+            let closed = file.close();
+            match read {
+                Result::Err(code) => Buffer::new(),
+                Result::Ok(text) => text,
+            }
+        },
+    }
+}
+
+fn save(path: CStr, text: Buffer!) -> i32 {
+    match File::create_truncate(path) {
+        Result::Err(code) => {
+            text.destroy();
+            3
+        },
+        Result::Ok(file) => {
+            let written = &file.write_buffer(text);
+            let closed = file.close();
+            match written {
+                Result::Ok(nothing) => 0,
+                Result::Err(code) => 3,
+            }
+        },
+    }
+}
+
+// Rewrites the store from `text`, leaving out `skip`; exits 1 when `skip`
+// is given but was not stored.
+fn rewrite(path: CStr, text: Buffer!, skip: Option[Slice[u8, 'static]]) -> i32 {
+    let exists 't. (tag, bytes, text) = text.open();
+    var tag = tag;
+    var sr = StaticRead::get();
+    var kept = latest(&tag, bytes);
+    let n = &kept.len();
+    var found = false;
+    var i = 0usize;
+    while i < n {
+        let entry = &kept.get(i).unwrap_or(Entry.(bytes, bytes));
+        let unit = match skip {
+            Option::Some(key) => {
+                found = found || bytes_eq(&tag, entry.0, &sr, key);
+            },
+            Option::None => (),
+        };
+        i = i + 1usize;
+    }
+    let out = render(&tag, kept, skip);
+    text.restore(tag).destroy();
+    let saved = save(path, out);
+    let missing = match skip {
+        Option::Some(_) => !found,
+        Option::None => false,
+    };
+    if missing { 1 } else { saved }
+}
+
+fn list(path: CStr) -> i32 {
+    let exists 't. (tag, bytes, text) = load(path).open();
+    var tag = tag;
+    let out = render(&tag, latest(&tag, bytes), Option::None);
+    text.restore(tag).destroy();
+    print_buffer(1, out);
+    0
+}
+
+// Prints `key`'s value, or exits 1 when it is absent.
+fn get(path: CStr, key: Slice[u8, 'static]) -> i32 {
+    let exists 't. (tag, bytes, text) = load(path).open();
+    var tag = tag;
+    var sr = StaticRead::get();
+    var all = entries(&tag, bytes);
+    let n = &all.len();
+    var value = Option::None;
+    var i = 0usize;
+    while i < n {
+        let entry = &all.get(i).unwrap_or(Entry.(bytes, bytes));
+        if bytes_eq(&tag, entry.0, &sr, key) {
+            value = Option::Some.(entry.1);
+        }
+        i = i + 1usize;
+    }
+    all.free();
+    let status = match value {
+        Option::Some(v) => {
+            print_bytes(1, &tag, v);
+            print(1, "\n");
+            0
+        },
+        Option::None => 1,
+    };
+    text.restore(tag).destroy();
+    status
+}
+
+fn arg(args: Args, i: usize) -> Slice[u8, 'static] {
+    match args.bytes(i) {
+        Option::Some(b) => b,
+        Option::None => "",
+    }
+}
+
+fn is(a: Slice[u8, 'static], b: Slice[u8, 'static]) -> bool {
+    var sr = StaticRead::get();
+    bytes_eq_within(&sr, a, b)
+}
+
+fn usage() -> i32 {
+    print(2, "usage: kvstore FILE (set KEY VALUE | get KEY | del KEY | list)\n");
+    2
+}
+
+fn main(argc: i32, argv: *(*u8)) -> i32 {
+    let args = unsafe Args::from_main(argc, argv);
+    let path = match args.get(1) {
+        Option::Some(p) => p,
+        Option::None => {
+            return usage();
+        },
+    };
+    let command = arg(args, 2);
+    let n = args.len();
+    if is(command, "list") && n == 3 {
+        return list(path);
+    }
+    if is(command, "get") && n == 4 {
+        return get(path, arg(args, 3));
+    }
+    if is(command, "del") && n == 4 {
+        return rewrite(path, load(path), Option::Some.(arg(args, 3)));
+    }
+    if is(command, "set") && n == 5 {
+        let line = load(path).push_static(arg(args, 3)).push_byte(b'\t').push_static(arg(args, 4)).push_byte(b'\n');
+        return rewrite(path, line, Option::None);
+    }
+    usage()
+}

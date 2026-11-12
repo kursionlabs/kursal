@@ -1,0 +1,91 @@
+// Word frequencies: reads text on stdin and prints each distinct word with
+// the number of times it occurs, most frequent first, then by word.
+//
+// One domain: the input is opened once, every word is a `Copy` slice of it,
+// and the one capability for that domain is passed to whatever reads bytes,
+// including the map that counts them. No word is copied, owned or freed.
+use std::io::{read_all_stdin, stdout};
+use std::bytes::cursor::Cursor;
+use std::cap::Exclusive;
+use std::slice::{Slice, bytes_cmp_within};
+use std::text::format::write_bytes;
+use std::collections::hashmap::{OwnedMap, Found, forget_entry};
+use std::collections::vec::OwnedVec;
+use std::cmp::Order;
+use std::option::Result;
+use std::ascii::is_alpha;
+
+fn not_letter(b: u8) -> bool {
+    !is_alpha(b)
+}
+
+// How often each word of `text` occurs, keyed by the word itself.
+forall 't.
+fn count_words(&tag: Exclusive!['t], text: Slice[u8, 't]) -> OwnedMap![Slice[u8, 't], u32] {
+    var counts = OwnedMap::new[Slice[u8, 't], u32]();
+    var cur = Cursor::new(text).skip_while(&tag, not_letter);
+    while !cur.at_end() {
+        let (c, word) = cur.take(&tag, is_alpha);
+        let found = &counts.with_in(&tag, word, |n: u32| (n + 1, ()));
+        let unit = match found {
+            Found::Item(nothing) => (),
+            Found::Missing => {
+                let old = &counts.insert_in(&tag, word, 1);
+            },
+        };
+        cur = c.skip_while(&tag, not_letter);
+    }
+    counts
+}
+
+// Every entry of `counts` as a (count, word) pair. Draining the map is an
+// iterator of its entries, each a `Pair { a: word, b: count }`.
+forall 't.
+fn pairs(counts: OwnedMap![Slice[u8, 't], u32]) -> OwnedVec![(u32, Slice[u8, 't])] {
+    let exists 'd. entries = counts.drain();
+    var entries = entries;
+    var pairs = OwnedVec::new[(u32, Slice[u8, 't])]();
+    for entry in &entries {
+        pairs = pairs.push((entry.b, entry.a));
+    }
+    entries.finish(forget_entry[Slice[u8, 't], u32]);
+    pairs
+}
+
+// The printing order: more frequent first, then by word.
+forall 't.
+fn entry_order(tag: Exclusive!['t], a: (u32, Slice[u8, 't]), b: (u32, Slice[u8, 't])) -> (Exclusive!['t], Order) {
+    var tag = tag;
+    let (na, wa) = a;
+    let (nb, wb) = b;
+    if na != nb {
+        let order = if na > nb {
+            Order::Less
+        } else {
+            Order::Greater
+        };
+        return (tag, order);
+    }
+    let order = bytes_cmp_within(&tag, wa, wb);
+    (tag, order)
+}
+
+fn main() -> i32 {
+    let text = read_all_stdin();
+    let exists 't. (tag, bytes, text) = text.open();
+    var tag = tag;
+    let counts = pairs(count_words(&tag, bytes)).sort_with(&tag, entry_order);
+    var out = stdout();
+    var entries = counts.iter();
+    for entry in &entries {
+        let (count, word) = entry;
+        out = write_bytes(out, &tag, word);
+        out = f" {count}\n".write(out);
+    }
+    entries.finish().free();
+    text.restore(tag).destroy();
+    match out.finish() {
+        Result::Ok(nothing) => 0,
+        Result::Err(code) => 1,
+    }
+}

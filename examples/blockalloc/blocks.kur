@@ -1,0 +1,407 @@
+// A fixed-size block allocator, the kind a kernel keeps for its small
+// objects: each size class is one page of raw memory cut into equal blocks,
+// the free ones threaded on a list through their own first bytes, so
+// allocating and freeing are O(1) and need no other memory.
+//
+// Two levels:
+//
+// - The core (`Pool!`) is unsafe code over raw memory. Its obligations are
+//   the memory contract's: a block's memory has the type last stored in it
+//   (strict aliasing), so a free block holds a `FreeNode`, stored before it
+//   is read, and an allocated one the caller's value; the state of each
+//   block lives in a separate byte array, because reading an allocated
+//   block as a `FreeNode` would read it at the wrong type.
+// - The safe API (`Heap!`, `Block!`) hands out linear, branded handles.
+//   A `Block![T, 'k]` is the only handle to its block, `Heap::free`
+//   consumes it, and reading or writing one needs the heap it came from, so
+//   safe code cannot reach a freed block, a block of another heap, or any
+//   block once its heap is gone: none of that type-checks. A program cannot
+//   even forget a block: the handle is linear.
+//
+// `Heap::alloc_raw` and the unsafe `Heap::free_raw` are the door for code
+// that only has addresses (an interrupt handler, a C caller): `free_raw`
+// checks what is cheap to check (a foreign pointer, a pointer into the
+// middle of a block, a block that is already free).
+use std::alloc::heap::HeapAllocator;
+use std::alloc::arena::type_align;
+use std::cap::Exclusive;
+use std::ptr::NonNull;
+use std::option::{Option, Result};
+
+// ------------------------------------------------------------- the core --
+
+fn page_size() -> usize {
+    4096
+}
+
+// What a free block holds: the next free block, or null.
+struct FreeNode {
+    next: *FreeNode,
+}
+
+fn null_node() -> *FreeNode {
+    unsafe (0usize as *FreeNode)
+}
+
+fn address(p: *u8) -> usize {
+    unsafe (p as usize)
+}
+
+// The byte `offset` bytes after `base`, in the same allocation.
+fn byte_at(base: *u8, offset: usize) -> *u8 {
+    unsafe ((address(base) + offset) as *u8)
+}
+
+// Why a raw free was refused.
+exposed enum FreeError {
+    // Not inside any pool's page.
+    Foreign,
+    // Inside a page, but not at the start of a block.
+    Interior,
+    // The block is already free.
+    DoubleFree,
+}
+
+// One size class: `count` blocks of `block` bytes in a page at `base`,
+// one state byte per block at `states` (0 free, 1 allocated), and the head
+// of the free list.
+struct Pool! {
+    base: *u8,
+    states: *u8,
+    block: usize,
+    count: usize,
+    free: *FreeNode,
+    in_use: usize,
+    peak: usize,
+    failed: usize,
+}
+
+// A pool's counters, for printing.
+exposed struct PoolStats {
+    block: usize,
+    count: usize,
+    in_use: usize,
+    peak: usize,
+    failed: usize,
+}
+
+impl Pool! {
+    // A page of `block`-byte blocks, all free. The free list runs in
+    // address order.
+    fn new(block: usize) -> Pool! {
+        let count = page_size() / block;
+        let base = HeapAllocator::alloc(page_size()).into_raw();
+        let states = HeapAllocator::alloc(count).into_raw();
+        var free = null_node();
+        var i = count;
+        while i > 0 {
+            i = i - 1;
+            // Fresh memory has no type yet: storing a `FreeNode` gives it one.
+            let node = unsafe (byte_at(base, i * block) as *FreeNode);
+            unsafe *node = FreeNode.{ next: free };
+            let state = byte_at(states, i);
+            unsafe *state = 0u8;
+            free = node;
+        }
+        Pool.{ base, states, block, count, free, in_use: 0, peak: 0, failed: 0 }
+    }
+
+    // The address of a free block, now allocated, or nothing when the pool
+    // is full.
+    fn take(&self) -> Option[NonNull[u8]] {
+        let { base, states, block, count, free, in_use, peak, failed } = self;
+        if free == null_node() {
+            self = Pool.{ base, states, block, count, free, in_use, peak, failed: failed + 1 };
+            return Option::None;
+        }
+        // A free block holds the `FreeNode` stored when it was freed.
+        let node = unsafe *free;
+        let p = unsafe (free as *u8);
+        let state = byte_at(states, (address(p) - address(base)) / block);
+        unsafe *state = 1u8;
+        let in_use = in_use + 1;
+        let peak = if in_use > peak { in_use } else { peak };
+        let block_ptr = unsafe NonNull::new_unchecked(p);
+        self = Pool.{ base, states, block, count, free: node.next, in_use, peak, failed };
+        Option::Some.(block_ptr)
+    }
+
+    // Whether `p` lies in this pool's page.
+    fn contains(&self, p: *u8) -> bool {
+        let { base, block, count, ..rest } = self;
+        let a = address(p);
+        let b = address(base);
+        let inside = a >= b && a < b + count * block;
+        self = Pool.{ base, block, count, ..rest };
+        inside
+    }
+
+    // Puts the block at `p` back on the free list. Unsafe: when the block
+    // is allocated, nothing may use its old contents again.
+    unsafe fn give(&self, p: *u8) -> Result[(), FreeError] {
+        let { base, states, block, count, free, in_use, peak, failed } = self;
+        let a = address(p);
+        let b = address(base);
+        if a < b || a >= b + count * block {
+            self = Pool.{ base, states, block, count, free, in_use, peak, failed };
+            return Result::Err.(FreeError::Foreign);
+        }
+        if (a - b) % block != 0 {
+            self = Pool.{ base, states, block, count, free, in_use, peak, failed };
+            return Result::Err.(FreeError::Interior);
+        }
+        let state = byte_at(states, (a - b) / block);
+        let allocated = unsafe *state;
+        if allocated == 0u8 {
+            self = Pool.{ base, states, block, count, free, in_use, peak, failed };
+            return Result::Err.(FreeError::DoubleFree);
+        }
+        // The block held the caller's value; storing a `FreeNode` makes it a
+        // `FreeNode` again, before anything reads it as one.
+        let node = unsafe (p as *FreeNode);
+        unsafe *node = FreeNode.{ next: free };
+        unsafe *state = 0u8;
+        self = Pool.{ base, states, block, count, free: node, in_use: in_use - 1, peak, failed };
+        Result::Ok.(())
+    }
+
+    fn stats(&self) -> PoolStats {
+        let { block, count, in_use, peak, failed, ..rest } = self;
+        let s = PoolStats.{ block, count, in_use, peak, failed };
+        self = Pool.{ block, count, in_use, peak, failed, ..rest };
+        s
+    }
+
+    // Frees the page and the state bytes, whatever is still allocated.
+    fn destroy(self) -> () {
+        let { base, states, block, count, free, in_use, peak, failed } = self;
+        HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(base));
+        HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(states))
+    }
+}
+
+// ------------------------------------------------------------- safe API --
+
+fn class_count() -> usize {
+    4
+}
+
+// The size class for `size` bytes at `align`: 16, 32, 64 or 128-byte
+// blocks. Every block is 16-aligned (pages come from `malloc`, and blocks
+// are multiples of 16 into them).
+fn class_for(size: usize, align: usize) -> Option[usize] {
+    if align > 16 {
+        Option::None
+    } else if size <= 16 {
+        Option::Some.(0)
+    } else if size <= 32 {
+        Option::Some.(1)
+    } else if size <= 64 {
+        Option::Some.(2)
+    } else if size <= 128 {
+        Option::Some.(3)
+    } else {
+        Option::None
+    }
+}
+
+// The allocator: four pools, and the brand of its domain, which every
+// block it hands out carries.
+forall 'k.
+struct Heap! {
+    cap: Exclusive!['k],
+    brand: Brand['k],
+    tiny: Pool!,
+    small: Pool!,
+    medium: Pool!,
+    large: Pool!,
+}
+
+// A block holding a `T`, allocated from heap 'k. The only handle to its
+// block.
+forall T, 'k.
+struct Block! {
+    ptr: NonNull[T],
+    class: usize,
+    marker: Brand['k],
+}
+
+// An empty heap, in a domain of its own.
+fn new_heap() -> exists 'k. Heap!['k] {
+    let exists 'k. (brand, cap) = Exclusive::fresh();
+    pack 'k. Heap.{ cap, brand, tiny: Pool::new(16), small: Pool::new(32), medium: Pool::new(64), large: Pool::new(128) }
+}
+
+forall 'k.
+impl Heap['k] {
+    // A block from size class `class`, if it has one free.
+    fn take_from(&self, class: usize) -> Option[NonNull[u8]] {
+        let got = if class == 0 {
+            &self.tiny.take()
+        } else if class == 1 {
+            &self.small.take()
+        } else if class == 2 {
+            &self.medium.take()
+        } else {
+            &self.large.take()
+        };
+        got
+    }
+
+    // Gives the block at `p` back to size class `class`. Unsafe as
+    // `Pool::give` is.
+    unsafe fn give_to(&self, class: usize, p: *u8) -> Result[(), FreeError] {
+        let { tiny, small, medium, large, ..rest } = self;
+        var tiny = tiny;
+        var small = small;
+        var medium = medium;
+        var large = large;
+        let done = if class == 0 {
+            let d = unsafe &tiny.give(p);
+            d
+        } else if class == 1 {
+            let d = unsafe &small.give(p);
+            d
+        } else if class == 2 {
+            let d = unsafe &medium.give(p);
+            d
+        } else {
+            let d = unsafe &large.give(p);
+            d
+        };
+        self = Heap.{ tiny, small, medium, large, ..rest };
+        done
+    }
+
+    // Stores `value` in a new block. A value too large, too aligned, or
+    // whose size class is full comes back as the error.
+    forall T.
+    fn alloc(&self, value: T) -> Result[Block![T, 'k], T] {
+        let class = match class_for(sizeof[T](), type_align[T]()) {
+            Option::Some(c) => c,
+            Option::None => {
+                return Result::Err.(value);
+            },
+        };
+        let got = &self.take_from(class);
+        match got {
+            Option::None => Result::Err.(value),
+            Option::Some(raw) => {
+                // The block holds a `FreeNode`, which nothing will read
+                // again: storing the value makes it a `T`.
+                let p = unsafe (raw.as_ptr() as *T);
+                unsafe *p = value;
+                let ptr = unsafe NonNull::new_unchecked(p);
+                Result::Ok.(Block.{ ptr, class, marker: self.brand })
+            },
+        }
+    }
+
+    // Frees `block`, handing back its value.
+    forall T.
+    fn free(&self, block: Block![T, 'k]) -> T {
+        let { ptr, class, marker } = block;
+        let p = ptr.as_ptr();
+        let value = unsafe *p;
+        // The handle is gone, so nothing can read the block again; it was
+        // allocated from this class, so the pool takes it back.
+        let done = unsafe &self.give_to(class, unsafe (p as *u8));
+        value
+    }
+
+    // A block of at least `size` bytes, as an address only: for code that
+    // holds blocks by address, and frees them with `free_raw`.
+    fn alloc_raw(&self, size: usize) -> Option[*u8] {
+        let class = match class_for(size, 1) {
+            Option::Some(c) => c,
+            Option::None => {
+                return Option::None;
+            },
+        };
+        let got = &self.take_from(class);
+        match got {
+            Option::Some(raw) => { Option::Some.(raw.as_ptr()) },
+            Option::None => { Option::None },
+        }
+    }
+
+    // Frees the block at `p`, refusing an address that is not an allocated
+    // block of this heap. Unsafe: no `Block!` handle may still name it,
+    // and nothing may use its old contents again.
+    unsafe fn free_raw(&self, p: *u8) -> Result[(), FreeError] {
+        let class = if &self.tiny.contains(p) {
+            0
+        } else if &self.small.contains(p) {
+            1
+        } else if &self.medium.contains(p) {
+            2
+        } else if &self.large.contains(p) {
+            3
+        } else {
+            class_count()
+        };
+        if class == class_count() {
+            return Result::Err.(FreeError::Foreign);
+        }
+        let done = unsafe &self.give_to(class, p);
+        done
+    }
+
+    // The counters of size class `class`.
+    fn stats(&self, class: usize) -> PoolStats {
+        let s = if class == 0 {
+            &self.tiny.stats()
+        } else if class == 1 {
+            &self.small.stats()
+        } else if class == 2 {
+            &self.medium.stats()
+        } else {
+            &self.large.stats()
+        };
+        s
+    }
+
+    // Frees every page and ends the domain. Blocks still allocated are
+    // freed with their pages; no handle to them can exist, since a
+    // `Block!` must be freed before its heap can be given up.
+    fn destroy(self) -> () {
+        let { cap, brand, tiny, small, medium, large } = self;
+        tiny.destroy();
+        small.destroy();
+        medium.destroy();
+        large.destroy();
+        cap.retire()
+    }
+}
+
+forall T, 'k where Copy[T].
+impl Block[T, 'k] {
+    // The value in the block. Needs the heap, so a block cannot be read
+    // once its heap is gone.
+    fn get(&self, &heap: Heap!['k]) -> T {
+        let { ptr, class, marker } = self;
+        let p = ptr.as_ptr();
+        let value = unsafe *p;
+        self = Block.{ ptr, class, marker };
+        value
+    }
+
+    // Replaces the value in the block.
+    fn set(&self, &heap: Heap!['k], value: T) -> () {
+        let { ptr, class, marker } = self;
+        let p = ptr.as_ptr();
+        unsafe *p = value;
+        self = Block.{ ptr, class, marker };
+    }
+}
+
+forall T, 'k.
+impl Block[T, 'k] {
+    // The block's address, for printing or comparing. Grants nothing.
+    fn address(&self) -> usize {
+        let { ptr, class, marker } = self;
+        let a = unsafe (ptr.as_ptr() as usize);
+        self = Block.{ ptr, class, marker };
+        a
+    }
+}

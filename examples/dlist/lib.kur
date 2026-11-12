@@ -1,0 +1,227 @@
+// A doubly linked list, written in the one-domain style. Every node lives in
+// one arena, and the links between nodes are `Ref`s: `Copy` descriptions of
+// a place that grant nothing by themselves. The domain's single capability,
+// held with the arena in `Mem!`, is what every read and write goes through.
+//
+// That is what lets two nodes point at a third that neither owns, which in
+// Rust takes `Rc<RefCell<..>>` or `unsafe`: here a node can be named by any
+// number of links and handles at once, and nothing here is unsafe. A handle
+// to a node is a `Ref`, so a node is removed, or added beside, in O(1).
+//
+// Removed nodes stay in the arena until the whole list is freed. A handle to
+// a removed node still reads a valid node, just not one on the list.
+use std::alloc::arena::Arena;
+use std::cap::Exclusive;
+use std::mem::Ref;
+use std::option::Option;
+
+// The memory a list lives in: its arena and the capability for its domain.
+forall 'k.
+exposed struct Mem! {
+    tag: Exclusive!['k],
+    arena: Arena!['k],
+}
+
+forall 'k.
+impl Mem['k] {
+    // Stores `v` in the arena.
+    forall T.
+    fn alloc(&self, v: T) -> Ref[T, 'k] {
+        let { tag, arena } = self;
+        let at = &arena.alloc(&tag, v);
+        self = Mem.{ tag, arena };
+        at
+    }
+
+    // The value at `at`.
+    forall T where Copy[T].
+    fn get(&self, at: Ref[T, 'k]) -> T {
+        let { tag, arena } = self;
+        let v = at.copy(&tag);
+        self = Mem.{ tag, arena };
+        v
+    }
+
+    // Stores `v` at `at`.
+    forall T where Copy[T].
+    fn set(&self, at: Ref[T, 'k], v: T) -> () {
+        let { tag, arena } = self;
+        let old = at.with(&tag, |prev: T| (v, prev));
+        self = Mem.{ tag, arena };
+    }
+
+    // Frees the arena and everything in it.
+    fn free(self) -> () {
+        let { tag, arena } = self;
+        arena.destroy(tag)
+    }
+}
+
+fn new_mem() -> exists 'k. Mem!['k] {
+    let exists 'k. (tag, arena) = Arena::new();
+    pack 'k. Mem.{ tag, arena }
+}
+
+forall T, 'k.
+exposed struct Node {
+    value: T,
+    prev: Option[Ref[Node[T, 'k], 'k]],
+    next: Option[Ref[Node[T, 'k], 'k]],
+}
+
+// The list itself is only a description too: its two ends and its length.
+forall T, 'k.
+exposed struct List {
+    head: Option[Ref[Node[T, 'k], 'k]],
+    tail: Option[Ref[Node[T, 'k], 'k]],
+    len: usize,
+}
+
+forall T, 'k.
+fn empty() -> List[T, 'k] {
+    List.{ head: Option::None, tail: Option::None, len: 0 }
+}
+
+// Points the node at `at` (if any) forward at `next`.
+forall T, 'k where Copy[T].
+fn link_next(&mem: Mem!['k], at: Option[Ref[Node[T, 'k], 'k]], next: Option[Ref[Node[T, 'k], 'k]]) -> () {
+    let unit = match at {
+        Option::Some(node) => {
+            let n = &mem.get(node);
+            &mem.set(node, Node.{ value: n.value, prev: n.prev, next });
+        },
+        Option::None => (),
+    };
+}
+
+// Points the node at `at` (if any) back at `prev`.
+forall T, 'k where Copy[T].
+fn link_prev(&mem: Mem!['k], at: Option[Ref[Node[T, 'k], 'k]], prev: Option[Ref[Node[T, 'k], 'k]]) -> () {
+    let unit = match at {
+        Option::Some(node) => {
+            let n = &mem.get(node);
+            &mem.set(node, Node.{ value: n.value, prev, next: n.next });
+        },
+        Option::None => (),
+    };
+}
+
+// Adds `v` at the back, returning the new node's handle.
+forall T, 'k where Copy[T].
+fn push_back(&mem: Mem!['k], list: List[T, 'k], v: T) -> (List[T, 'k], Ref[Node[T, 'k], 'k]) {
+    let node = &mem.alloc(Node.{ value: v, prev: list.tail, next: Option::None });
+    link_next(&mem, list.tail, Option::Some.(node));
+    let head = match list.head {
+        Option::None => Option::Some.(node),
+        Option::Some(h) => Option::Some.(h),
+    };
+    (List.{ head, tail: Option::Some.(node), len: list.len + 1 }, node)
+}
+
+// Adds `v` at the front, returning the new node's handle.
+forall T, 'k where Copy[T].
+fn push_front(&mem: Mem!['k], list: List[T, 'k], v: T) -> (List[T, 'k], Ref[Node[T, 'k], 'k]) {
+    let node = &mem.alloc(Node.{ value: v, prev: Option::None, next: list.head });
+    link_prev(&mem, list.head, Option::Some.(node));
+    let tail = match list.tail {
+        Option::None => Option::Some.(node),
+        Option::Some(t) => Option::Some.(t),
+    };
+    (List.{ head: Option::Some.(node), tail, len: list.len + 1 }, node)
+}
+
+// Adds `v` right after the node `at`, returning the new node's handle.
+forall T, 'k where Copy[T].
+fn insert_after(&mem: Mem!['k], list: List[T, 'k], at: Ref[Node[T, 'k], 'k], v: T) -> (List[T, 'k], Ref[Node[T, 'k], 'k]) {
+    let before = &mem.get(at);
+    let node = &mem.alloc(Node.{ value: v, prev: Option::Some.(at), next: before.next });
+    link_next(&mem, Option::Some.(at), Option::Some.(node));
+    link_prev(&mem, before.next, Option::Some.(node));
+    let tail = match before.next {
+        Option::None => Option::Some.(node),
+        Option::Some(_) => list.tail,
+    };
+    (List.{ head: list.head, tail, len: list.len + 1 }, node)
+}
+
+// Takes the node `at` off the list; its neighbours are linked together.
+forall T, 'k where Copy[T].
+fn remove(&mem: Mem!['k], list: List[T, 'k], at: Ref[Node[T, 'k], 'k]) -> List[T, 'k] {
+    let gone = &mem.get(at);
+    link_next(&mem, gone.prev, gone.next);
+    link_prev(&mem, gone.next, gone.prev);
+    let head = match gone.prev {
+        Option::None => gone.next,
+        Option::Some(_) => list.head,
+    };
+    let tail = match gone.next {
+        Option::None => gone.prev,
+        Option::Some(_) => list.tail,
+    };
+    List.{ head, tail, len: list.len - 1 }
+}
+
+// Takes the first value off the list.
+forall T, 'k where Copy[T].
+fn pop_front(&mem: Mem!['k], list: List[T, 'k]) -> (List[T, 'k], Option[T]) {
+    match list.head {
+        Option::None => (list, Option::None),
+        Option::Some(first) => {
+            let value = &mem.get(first).value;
+            let rest = remove(&mem, list, first);
+            (rest, Option::Some.(value))
+        },
+    }
+}
+
+// The list's digits read front to back (`forward`) or back to front.
+forall 'k.
+fn digits(&mem: Mem!['k], list: List[u32, 'k], forward: bool) -> u32 {
+    var number = 0u32;
+    var at = if forward { list.head } else { list.tail };
+    var going = true;
+    while going {
+        let unit = match at {
+            Option::Some(n) => {
+                let node = &mem.get(n);
+                number = number * 10 + node.value;
+                at = if forward { node.next } else { node.prev };
+            },
+            Option::None => {
+                going = false;
+            },
+        };
+    }
+    number
+}
+
+fn main() -> i32 {
+    let exists 'k. mem = new_mem();
+    var mem = mem;
+    var list = empty[u32, 'k]();
+    // 1 2 3 4 5, keeping handles to the nodes holding 2 and 3.
+    let (l, one) = push_back(&mem, list, 1);
+    let (l, two) = push_back(&mem, l, 2);
+    let (l, three) = push_back(&mem, l, 3);
+    let (l, four) = push_back(&mem, l, 4);
+    let (l, five) = push_back(&mem, l, 5);
+    // 0 1 2 3 4 5, then 0 1 2 4 5 by handle, then 0 1 2 9 4 5.
+    let (l, zero) = push_front(&mem, l, 0);
+    let l = remove(&mem, l, three);
+    let (l, nine) = insert_after(&mem, l, two, 9);
+    let forward = digits(&mem, l, true);
+    let backward = digits(&mem, l, false);
+    // 1 2 9 4 5, with 0 popped off the front.
+    let (l, first) = pop_front(&mem, l);
+    let after = digits(&mem, l, true);
+    let reversed = digits(&mem, l, false);
+    // The handle to a removed node still reads that node.
+    let stale = &mem.get(three).value;
+    mem.free();
+    let popped = match first {
+        Option::Some(v) => v,
+        Option::None => 99,
+    };
+    let ok = forward == 12945 && backward == 549210 && popped == 0 && after == 12945 && reversed == 54921 && l.len == 5 && stale == 3;
+    if ok { 0 } else { 1 }
+}

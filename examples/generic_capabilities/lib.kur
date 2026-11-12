@@ -1,0 +1,71 @@
+// A user-defined heap resource protected by std::cap, independently of
+// std::mem::Ref. CounterView is freely copyable but carries no authority;
+// the matching Exclusive! or Shared! token is required for every access.
+// The resource module owns the unsafe pointer operations and ensures the
+// allocation is freed only after exclusive authority is recovered.
+
+use std::cap::{Exclusive, Shared};
+use std::alloc::heap::{HeapAllocator, Uninit};
+
+forall 'r.
+struct CounterOwner! {
+    storage: Uninit!,
+    marker: Brand['r],
+}
+
+forall 'r.
+struct CounterView {
+    ptr: *u32,
+    marker: Brand['r],
+}
+
+fn new_counter(initial: u32) -> exists 'r. (CounterOwner!['r], CounterView['r], Exclusive!['r]) {
+    let storage = HeapAllocator::alloc(sizeof[u32]());
+    let (raw, extent) = storage.into_parts();
+    let ptr = unsafe (raw as *u32);
+    unsafe *ptr = initial;
+    // `raw` is exactly the base returned by this allocation, and
+    // `extent` is unchanged. No second owner exists at this point.
+    let storage = unsafe HeapAllocator::adopt_raw_sized(raw, extent);
+    let exists 'r. (brand, exclusive) = Exclusive::fresh();
+    pack 'r. (CounterOwner.{ storage, marker: brand }, CounterView.{ ptr, marker: brand }, exclusive)
+}
+
+forall 'r.
+impl CounterOwner['r] {
+    fn close(self, exclusive: Exclusive!['r]) -> () {
+        let { storage, marker } = self;
+        let freed = HeapAllocator::drop(storage);
+        exclusive.retire()
+    }
+}
+
+forall 'r.
+impl CounterView['r] {
+    forall 'q.
+    fn read(self, &shared: Shared!['r, 'q]) -> u32 {
+        let { ptr, marker } = self;
+        unsafe *ptr
+    }
+
+    fn write(self, &exclusive: Exclusive!['r], value: u32) -> () {
+        let { ptr, marker } = self;
+        unsafe *ptr = value;
+    }
+}
+
+fn main() -> i32 {
+    let exists 'r. (owner, view, exclusive) = new_counter(10);
+    let exists 'q. (shared, resume) = exclusive.share();
+    let exists 'a, 'b. (left, right, join) = shared.split();
+
+    // Both leaves authorize reads of the same allocation. Neither can
+    // authorize a write or restore exclusivity on its own.
+    let a = view.read(&left);
+    let b = view.read(&right);
+    let exclusive = resume.resume(join.join(left, right));
+
+    view.write(&exclusive, a + b);
+    owner.close(exclusive);
+    ((a + b) as i32)
+}

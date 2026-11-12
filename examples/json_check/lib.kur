@@ -1,0 +1,458 @@
+// Checks that stdin holds one JSON value and pretty-prints it, two spaces
+// per level. On bad input it prints the byte offset where the input goes
+// wrong and what it expected there, and exits 1.
+//
+// The value is parsed into a tree first. Each node owns its children
+// through `Owned!`, which is what lets the types refer to themselves, and
+// printing consumes the tree, freeing each node once it is written. A parse
+// error frees whatever was built before it.
+use std::io::{read_all_stdin, print_buffer, stdout, Output};
+use std::text::fmt::Writable;
+use std::bytes::cursor::Cursor;
+use std::bytes::buffer::Buffer;
+use std::cap::Exclusive;
+use std::slice::{Slice, byte_or_zero};
+use std::alloc::owned::Owned;
+use std::option::{Option, Result};
+use std::ascii::{is_digit, is_space};
+
+// Numbers and strings keep their source text, quotes and escapes included.
+exposed enum Json! {
+    Null,
+    True,
+    False,
+    Number(Buffer!),
+    Str(Buffer!),
+    Array(Items!),
+    Object(Members!),
+}
+
+exposed enum Items! {
+    End,
+    Item(Owned![Json!], Owned![Items!]),
+}
+
+exposed enum Members! {
+    End,
+    Member(Buffer!, Owned![Json!], Owned![Members!]),
+}
+
+exposed struct JsonError {
+    at: usize,
+    expected: Slice[u8, 'static],
+}
+
+fn free_json(j: Json!) -> () {
+    match j {
+        Json::Null | Json::True | Json::False => (),
+        Json::Number(text) => text.destroy(),
+        Json::Str(text) => text.destroy(),
+        Json::Array(items) => free_items(items),
+        Json::Object(members) => free_members(members),
+    }
+}
+
+fn free_items(items: Items!) -> () {
+    match items {
+        Items::End => (),
+        Items::Item(head, rest) => {
+            free_json(head.into_value());
+            free_items(rest.into_value())
+        },
+    }
+}
+
+fn free_members(members: Members!) -> () {
+    match members {
+        Members::End => (),
+        Members::Member(key, value, rest) => {
+            key.destroy();
+            free_json(value.into_value());
+            free_members(rest.into_value())
+        },
+    }
+}
+
+// Lists are built back to front while parsing, then turned around.
+fn reverse_items(items: Items!, done: Items!) -> Items! {
+    match items {
+        Items::End => done,
+        Items::Item(head, rest) => reverse_items(rest.into_value(), Items::Item.(head, Owned::new(done))),
+    }
+}
+
+fn reverse_members(members: Members!, done: Members!) -> Members! {
+    match members {
+        Members::End => done,
+        Members::Member(key, value, rest) => reverse_members(rest.into_value(), Members::Member.(key, value, Owned::new(done))),
+    }
+}
+
+// --- parsing ---
+
+forall 't.
+fn peek_is(&tag: Exclusive!['t], cur: Cursor['t], byte: u8) -> bool {
+    let next = cur.peek(&tag);
+    let found = match next {
+        Option::Some(b) => b == byte,
+        Option::None => false,
+    };
+    found
+}
+
+forall 't.
+fn skip(cur: Cursor['t], count: usize) -> Cursor['t] {
+    match cur.take_exact(count) {
+        Option::Some(taken) => {
+            let (c, bytes) = taken;
+            c
+        },
+        Option::None => cur,
+    }
+}
+
+// The source text from `start` up to the cursor, as an owned buffer.
+forall 't.
+fn text_since(&tag: Exclusive!['t], cur: Cursor['t], start: usize) -> Buffer! {
+    let text = match cur.span_since(start) {
+        Option::Some(bytes) => Buffer::new().push_bytes(&tag, bytes),
+        Option::None => Buffer::new(),
+    };
+    text
+}
+
+fn is_hex(b: u8) -> bool {
+    is_digit(b) || (b >= b'a' && b <= b'f') || (b >= b'A' && b <= b'F')
+}
+
+fn fail(at: usize, expected: Slice[u8, 'static]) -> JsonError {
+    JsonError.{ at, expected }
+}
+
+// The escape after a backslash; the cursor comes back past it.
+forall 't.
+fn escape(&tag: Exclusive!['t], cur: Cursor['t]) -> Result[Cursor['t], JsonError] {
+    let at = cur.pos();
+    let stepped = cur.step(&tag);
+    let (cur, next) = stepped;
+    let e = match next {
+        Option::Some(e) => e,
+        Option::None => 0u8,
+    };
+    if e == b'u' {
+        let digits = cur.take(&tag, is_hex);
+        let (c, hex) = digits;
+        if hex.len() < 4 {
+            return Result::Err.(fail(c.pos(), "four hex digits"));
+        }
+        return Result::Ok.(skip(cur, 4));
+    }
+    let simple = e == b'"' || e == b'\\' || e == b'/' || e == b'b' || e == b'f' || e == b'n' || e == b'r' || e == b't';
+    if simple {
+        Result::Ok.(cur)
+    } else {
+        Result::Err.(fail(at, "a valid escape"))
+    }
+}
+
+// A string literal, starting at its opening quote.
+forall 't.
+fn string(&tag: Exclusive!['t], cur: Cursor['t]) -> Result[(Cursor['t], Buffer!), JsonError] {
+    let start = cur.mark();
+    var cur = skip(cur, 1);
+    var closed = false;
+    while !closed {
+        let at = cur.pos();
+        let stepped = cur.step(&tag);
+        let (c, next) = stepped;
+        cur = c;
+        let b = match next {
+            Option::Some(b) => b,
+            Option::None => {
+                return Result::Err.(fail(at, "a closing quote"));
+            },
+        };
+        if b == b'"' {
+            closed = true;
+        }
+        if b == b'\\' {
+            let c = escape(&tag, cur)?;
+            cur = c;
+        }
+        if b < b' ' {
+            return Result::Err.(fail(at, "a closing quote"));
+        }
+    }
+    let text = text_since(&tag, cur, start);
+    Result::Ok.((cur, text))
+}
+
+// A number: an optional minus, an integer part without leading zeros, then
+// an optional fraction and exponent.
+forall 't.
+fn number(&tag: Exclusive!['t], cur: Cursor['t]) -> Result[(Cursor['t], Buffer!), JsonError] {
+    let start = cur.mark();
+    let cur = if peek_is(&tag, cur, b'-') {
+        skip(cur, 1)
+    } else {
+        cur
+    };
+    let taken = cur.take(&tag, is_digit);
+    let (cur, whole) = taken;
+    if whole.len() == 0 {
+        return Result::Err.(fail(cur.pos(), "a digit"));
+    }
+    if whole.len() > 1 && byte_or_zero(&tag, whole, 0) == b'0' {
+        return Result::Err.(fail(start, "a number without leading zeros"));
+    }
+    let cur = if peek_is(&tag, cur, b'.') {
+        let taken = skip(cur, 1).take(&tag, is_digit);
+        let (c, fraction) = taken;
+        if fraction.len() == 0 {
+            return Result::Err.(fail(c.pos(), "a digit"));
+        }
+        c
+    } else {
+        cur
+    };
+    let cur = if peek_is(&tag, cur, b'e') || peek_is(&tag, cur, b'E') {
+        let c = skip(cur, 1);
+        let c = if peek_is(&tag, c, b'+') || peek_is(&tag, c, b'-') {
+            skip(c, 1)
+        } else {
+            c
+        };
+        let taken = c.take(&tag, is_digit);
+        let (c, exponent) = taken;
+        if exponent.len() == 0 {
+            return Result::Err.(fail(c.pos(), "a digit"));
+        }
+        c
+    } else {
+        cur
+    };
+    let text = text_since(&tag, cur, start);
+    Result::Ok.((cur, text))
+}
+
+forall 't.
+fn array(&tag: Exclusive!['t], cur: Cursor['t]) -> Result[(Cursor['t], Json!), JsonError] {
+    let cur = skip(cur, 1).skip_while(&tag, is_space);
+    if peek_is(&tag, cur, b']') {
+        return Result::Ok.((skip(cur, 1), Json::Array.(Items::End)));
+    }
+    var cur = cur;
+    var items = Items::End;
+    var more = true;
+    while more {
+        let parsed = value(&tag, cur);
+        let (c, item) = match parsed {
+            Result::Ok(p) => p,
+            Result::Err(e) => {
+                free_items(items);
+                return Result::Err.(e);
+            },
+        };
+        items = Items::Item.(Owned::new(item), Owned::new(items));
+        let c = c.skip_while(&tag, is_space);
+        if peek_is(&tag, c, b',') {
+            cur = skip(c, 1);
+        } else if peek_is(&tag, c, b']') {
+            cur = skip(c, 1);
+            more = false;
+        } else {
+            free_items(items);
+            return Result::Err.(fail(c.pos(), "',' or ']'"));
+        }
+    }
+    Result::Ok.((cur, Json::Array.(reverse_items(items, Items::End))))
+}
+
+forall 't.
+fn object(&tag: Exclusive!['t], cur: Cursor['t]) -> Result[(Cursor['t], Json!), JsonError] {
+    let cur = skip(cur, 1).skip_while(&tag, is_space);
+    if peek_is(&tag, cur, b'}') {
+        return Result::Ok.((skip(cur, 1), Json::Object.(Members::End)));
+    }
+    var cur = cur;
+    var members = Members::End;
+    var more = true;
+    while more {
+        let c = cur.skip_while(&tag, is_space);
+        if !peek_is(&tag, c, b'"') {
+            free_members(members);
+            return Result::Err.(fail(c.pos(), "a string key"));
+        }
+        let parsed = string(&tag, c);
+        let (c, key) = match parsed {
+            Result::Ok(p) => p,
+            Result::Err(e) => {
+                free_members(members);
+                return Result::Err.(e);
+            },
+        };
+        let c = c.skip_while(&tag, is_space);
+        if !peek_is(&tag, c, b':') {
+            key.destroy();
+            free_members(members);
+            return Result::Err.(fail(c.pos(), "':'"));
+        }
+        let parsed = value(&tag, skip(c, 1));
+        let (c, item) = match parsed {
+            Result::Ok(p) => p,
+            Result::Err(e) => {
+                key.destroy();
+                free_members(members);
+                return Result::Err.(e);
+            },
+        };
+        members = Members::Member.(key, Owned::new(item), Owned::new(members));
+        let c = c.skip_while(&tag, is_space);
+        if peek_is(&tag, c, b',') {
+            cur = skip(c, 1);
+        } else if peek_is(&tag, c, b'}') {
+            cur = skip(c, 1);
+            more = false;
+        } else {
+            free_members(members);
+            return Result::Err.(fail(c.pos(), "',' or '}'"));
+        }
+    }
+    Result::Ok.((cur, Json::Object.(reverse_members(members, Members::End))))
+}
+
+forall 't.
+fn value(&tag: Exclusive!['t], cur: Cursor['t]) -> Result[(Cursor['t], Json!), JsonError] {
+    let cur = cur.skip_while(&tag, is_space);
+    let at = cur.pos();
+    if peek_is(&tag, cur, b'{') {
+        return object(&tag, cur);
+    }
+    if peek_is(&tag, cur, b'[') {
+        return array(&tag, cur);
+    }
+    if peek_is(&tag, cur, b'"') {
+        let (cur, text) = string(&tag, cur)?;
+        return Result::Ok.((cur, Json::Str.(text)));
+    }
+    if peek_is(&tag, cur, b'-') || is_digit(byte_or_zero(&tag, cur.remaining_view(), 0)) {
+        let (cur, text) = number(&tag, cur)?;
+        return Result::Ok.((cur, Json::Number.(text)));
+    }
+    if cur.starts_with(&tag, "null") {
+        return Result::Ok.((skip(cur, 4), Json::Null));
+    }
+    if cur.starts_with(&tag, "true") {
+        return Result::Ok.((skip(cur, 4), Json::True));
+    }
+    if cur.starts_with(&tag, "false") {
+        return Result::Ok.((skip(cur, 5), Json::False));
+    }
+    Result::Err.(fail(at, "a value"))
+}
+
+// One value and nothing after it but space.
+forall 't.
+fn document(&tag: Exclusive!['t], cur: Cursor['t]) -> Result[Json!, JsonError] {
+    let (cur, json) = value(&tag, cur)?;
+    let cur = cur.skip_while(&tag, is_space);
+    if cur.at_end() {
+        Result::Ok.(json)
+    } else {
+        free_json(json);
+        Result::Err.(fail(cur.pos(), "the end of the input"))
+    }
+}
+
+// --- printing ---
+
+fn pad(out: Output!, depth: usize) -> Output! {
+    var out = out;
+    var i = 0usize;
+    while i < depth {
+        out = out.write_static("  ");
+        i = i + 1;
+    }
+    out
+}
+
+fn print_text(out: Output!, text: Buffer!) -> Output! {
+    let out = f"{&text}".write(out);
+    text.destroy();
+    out
+}
+
+fn print_json(out: Output!, j: Json!, depth: usize) -> Output! {
+    match j {
+        Json::Null => out.write_static("null"),
+        Json::True => out.write_static("true"),
+        Json::False => out.write_static("false"),
+        Json::Number(text) => print_text(out, text),
+        Json::Str(text) => print_text(out, text),
+        Json::Array(items) => {
+            match items {
+                Items::End => out.write_static("[]"),
+                Items::Item(head, rest) => {
+                    let out = print_items(out.write_static("[\n"), Items::Item.(head, rest), depth + 1);
+                    pad(out.write_static("\n"), depth).write_static("]")
+                },
+            }
+        },
+        Json::Object(members) => {
+            match members {
+                Members::End => out.write_static("{}"),
+                Members::Member(key, value, rest) => {
+                    let out = print_members(out.write_static("{\n"), Members::Member.(key, value, rest), depth + 1);
+                    pad(out.write_static("\n"), depth).write_static("}")
+                },
+            }
+        },
+    }
+}
+
+fn print_items(out: Output!, items: Items!, depth: usize) -> Output! {
+    match items {
+        Items::End => out,
+        Items::Item(head, rest) => {
+            let out = print_json(pad(out, depth), head.into_value(), depth);
+            match rest.into_value() {
+                Items::End => out,
+                Items::Item(h, r) => print_items(out.write_static(",\n"), Items::Item.(h, r), depth),
+            }
+        },
+    }
+}
+
+fn print_members(out: Output!, members: Members!, depth: usize) -> Output! {
+    match members {
+        Members::End => out,
+        Members::Member(key, value, rest) => {
+            let out = print_text(pad(out, depth), key).write_static(": ");
+            let out = print_json(out, value.into_value(), depth);
+            match rest.into_value() {
+                Members::End => out,
+                Members::Member(k, v, r) => print_members(out.write_static(",\n"), Members::Member.(k, v, r), depth),
+            }
+        },
+    }
+}
+
+fn main() -> i32 {
+    let input = read_all_stdin();
+    let exists 't. (tag, bytes, restore) = input.open();
+    let parsed = document(&tag, Cursor::new(bytes));
+    restore.restore(tag).destroy();
+    match parsed {
+        Result::Ok(json) => {
+            let out = print_json(stdout(), json, 0).write_static("\n");
+            match out.finish() {
+                Result::Ok(nothing) => 0,
+                Result::Err(code) => 2,
+            }
+        },
+        Result::Err(e) => {
+            print_buffer(2, f"error at byte {e.at}: expected {e.expected}\n");
+            1
+        },
+    }
+}

@@ -1,0 +1,152 @@
+// A directed graph with cycles, written in the one-domain style. Nodes and
+// edges live in one arena and point at each other through `Ref`s, which are
+// `Copy` and grant nothing by themselves; in Rust a cyclic graph like this
+// takes `Rc<RefCell<..>>`, indices, or `unsafe`. Nothing here is unsafe.
+//
+// Built, then frozen: the graph is built with the domain's exclusive
+// capability, then shared, and the traversal reads it through a read-only
+// node of that capability. The traversal's own state (visited marks and a
+// work stack) is separate, mutable, and in its own domain.
+use std::alloc::arena::Arena;
+use std::cap::{Exclusive, Shared};
+use std::mem::Ref;
+use std::collections::vec::{OwnedVec, Popped};
+use std::option::Option;
+
+forall 'k.
+exposed struct Node {
+    id: usize,
+    edges: Option[Ref[Edge['k], 'k]],
+}
+
+// One outgoing edge, in a list of the node's edges.
+forall 'k.
+exposed struct Edge {
+    to: Ref[Node['k], 'k],
+    next: Option[Ref[Edge['k], 'k]],
+}
+
+// The graph's memory while it is being built.
+forall 'k.
+exposed struct Mem! {
+    tag: Exclusive!['k],
+    arena: Arena!['k],
+}
+
+forall 'k.
+impl Mem['k] {
+    forall T.
+    fn alloc(&self, v: T) -> Ref[T, 'k] {
+        let { tag, arena } = self;
+        let at = &arena.alloc(&tag, v);
+        self = Mem.{ tag, arena };
+        at
+    }
+
+    forall T where Copy[T].
+    fn get(&self, at: Ref[T, 'k]) -> T {
+        let { tag, arena } = self;
+        let v = at.copy(&tag);
+        self = Mem.{ tag, arena };
+        v
+    }
+
+    forall T where Copy[T].
+    fn set(&self, at: Ref[T, 'k], v: T) -> () {
+        let { tag, arena } = self;
+        let old = at.with(&tag, |prev: T| (v, prev));
+        self = Mem.{ tag, arena };
+    }
+}
+
+// Adds an edge from `from` to `to`. Both nodes exist already, which is how
+// an edge can close a cycle.
+forall 'k.
+fn connect(&mem: Mem!['k], from: Ref[Node['k], 'k], to: Ref[Node['k], 'k]) -> () {
+    let node = &mem.get(from);
+    let edge = &mem.alloc(Edge.{ to, next: node.edges });
+    &mem.set(from, Node.{ id: node.id, edges: Option::Some.(edge) });
+}
+
+// How many nodes can be reached from `start`, reading the frozen graph
+// through `view`. `count` nodes, numbered from 0.
+forall 'k, 'q.
+fn reachable(&view: Shared!['k, 'q], start: Ref[Node['k], 'k], count: usize) -> usize {
+    var visited = OwnedVec::new[bool]();
+    var i = 0usize;
+    while i < count {
+        visited = visited.push(false);
+        i = i + 1usize;
+    }
+    var stack = OwnedVec::new[Ref[Node['k], 'k]]().push(start);
+    var seen = 0usize;
+    var going = true;
+    while going {
+        let unit = match &stack.pop() {
+            Popped::Empty => {
+                going = false;
+            },
+            Popped::Item(at) => {
+                let node = at.read(&view);
+                let fresh = !&visited.get(node.id).unwrap_or(true);
+                if fresh {
+                    let was = &visited.with(node.id, |v: bool| (true, v));
+                    seen = seen + 1usize;
+                    var edge = node.edges;
+                    var walking = true;
+                    while walking {
+                        let unit = match edge {
+                            Option::Some(e) => {
+                                let link = e.read(&view);
+                                stack = stack.push(link.to);
+                                edge = link.next;
+                            },
+                            Option::None => {
+                                walking = false;
+                            },
+                        };
+                    }
+                }
+            },
+        };
+    }
+    visited.free();
+    stack.free();
+    seen
+}
+
+fn main() -> i32 {
+    let exists 'k. (tag, arena) = Arena::new();
+    var mem = Mem.{ tag, arena };
+    // 0 -> 1 -> 2 -> 0 is a cycle; 2 -> 3; 4 stands alone, and 3 -> 4 is
+    // added below to check that edges can follow the whole graph.
+    let n0 = &mem.alloc(Node.{ id: 0, edges: Option::None });
+    let n1 = &mem.alloc(Node.{ id: 1, edges: Option::None });
+    let n2 = &mem.alloc(Node.{ id: 2, edges: Option::None });
+    let n3 = &mem.alloc(Node.{ id: 3, edges: Option::None });
+    let n4 = &mem.alloc(Node.{ id: 4, edges: Option::None });
+    connect(&mem, n0, n1);
+    connect(&mem, n1, n2);
+    connect(&mem, n2, n0);
+    connect(&mem, n2, n3);
+    // Frozen: every read from here on goes through a shared node.
+    let { tag, arena } = mem;
+    let exists 'q. (view, resume) = tag.share();
+    var view = view;
+    let from_zero = reachable(&view, n0, 5usize);
+    let from_three = reachable(&view, n3, 5usize);
+    // Writable again: one more edge, then the walk sees it.
+    var mem = Mem.{ tag: resume.resume(view), arena };
+    connect(&mem, n3, n4);
+    let { tag, arena } = mem;
+    let exists 'r. (view, resume) = tag.share();
+    var view = view;
+    let after = reachable(&view, n0, 5usize);
+    let tag = resume.resume(view);
+    arena.destroy(tag);
+    if from_zero == 4usize && from_three == 1usize && after == 5usize {
+        0
+    } else {
+        1
+    }
+}

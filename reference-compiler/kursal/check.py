@@ -749,21 +749,8 @@ class Checker:
     def op_sizeof(self, instr: Instr) -> Type:
         if instr.ty is None:
             self.fail("instruction_requires_type")
-        self.layout_visible(instr.ty)
         self.has_memory_form(instr.ty)
         return USIZE
-
-    def layout_visible(self, ty: Type) -> None:
-        """`sizeof` observes a layout: each nominal type stored by value in `ty` exposes its shape here.
-        Pointers, function values and brand witnesses have a fixed size; a type parameter is answered by
-        whoever instantiates it."""
-        match ty:
-            case Ptr() | Fn() | Brand() | Prim() | Never():
-                return
-            case Named(name=name, args=()) if name in self.kinds:
-                return
-        for part in children(self.types.shape(ty, self.module)):
-            self.layout_visible(part)
 
     def op_data(self, instr: Instr) -> Type:
         data = self.program.datas.get(instr.args[0])
