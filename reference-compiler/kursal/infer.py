@@ -217,10 +217,12 @@ class Infer:
     def run(self) -> None:
         for decl, sig in self.sigs.sigs.items():
             if isinstance(decl.node, S.Fn) and decl.node.body is not None:
-                self.function(sig, decl.node, decl.module)
+                with self.r.located(decl.module, decl.node.pos):
+                    self.function(sig, decl.node, decl.module)
         for inst, item, module in self.sigs.instances:
             for sig, node in zip(inst.methods, item.methods):
-                self.function(sig, node, module, instance=inst)
+                with self.r.located(module, node.pos):
+                    self.function(sig, node, module, instance=inst)
 
     def function(self, sig: Sig, node: S.Fn, module: C.ModuleId, instance: Optional[InstanceSig] = None) -> None:
         self.module, self.sig = module, sig

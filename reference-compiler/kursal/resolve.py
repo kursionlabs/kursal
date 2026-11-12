@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import os
 import tomllib
-from collections.abc import Sequence, Set
+from collections.abc import Iterator, Sequence, Set
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Literal, Never, cast, Optional
 from pathlib import Path
@@ -81,6 +82,17 @@ type LookupKey = (
 
 def fail(message: str, pos: Optional[Position] = None) -> Never:
     raise ResolveError(message, pos)
+
+
+def located(error: KursError, file: Path, pos: Optional[Position]) -> KursError:
+    """`error`, naming `file` and, when it has no position of its own, the position of the item it is in."""
+    if str(error).startswith(str(file)):
+        return error
+    where = error.pos or pos
+    prefix = f"{file}:{where[0]}:{where[1]}" if where else str(file)
+    located_error = type(error)(f"{prefix}: {error.message}")
+    located_error.message, located_error.pos = error.message, where
+    return located_error
 
 
 # ------------------------------------------------------------ the graph --
@@ -152,6 +164,8 @@ def load(path: str | Path) -> list[Package]:
     for package in packages:
         if not package.files:
             package.files = discover(package)
+            if ModuleId(package.id) not in package.files:
+                fail(f"package {package.name} has no lib.kur in {package.source_root}")
     check_acyclic(packages)
     return packages
 
@@ -283,6 +297,17 @@ class Resolver:
                 self.attached.setdefault((owner, member.name), []).append(decl)
 
     # ---- path lookup
+    def file(self, module: ModuleId) -> Path:
+        return self.packages[module.package].files[module]
+
+    @contextmanager
+    def located(self, module: ModuleId, pos: Optional[Position]) -> Iterator[None]:
+        """Errors raised inside name `module`'s file and, when they have no position, `pos`."""
+        try:
+            yield
+        except KursError as error:
+            raise located(error, self.file(module), pos) from None
+
     def lookup(self, module: ModuleId, path: S.NamePath, pos: Optional[Position] = None) -> Target:
         """What `path` names from `module`: a Decl or a ModuleId."""
         try:
@@ -405,7 +430,8 @@ class Names:
         for module, scope in self.r.scopes.items():
             self.module = module
             for item in scope.items:
-                self.item(item, frozenset())
+                with self.r.located(module, item.pos):
+                    self.item(item, frozenset())
         return self.r
 
     def params(self, forall: Optional[S.Forall]) -> frozenset[str]:

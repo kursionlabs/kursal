@@ -19,6 +19,7 @@ The result is a `core.Program`, ready for core checking before C emission.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import Never, Optional
 from functools import partial
@@ -105,14 +106,16 @@ class Lowering:
                 program.externs[decl.node.name] = C.Extern(decl.node.name, sig.ret, sig.ptypes)
             elif isinstance(decl.node, S.Fn) and decl.node.body is not None:
                 node = decl.node
-                fun = self.attempt(strict, sig.name, partial(self.function, sig, node, sig.name))
+                with self.r.located(decl.module, node.pos):
+                    fun = self.attempt(strict, sig.name, partial(self.function, sig, node, sig.name))
                 if fun is not None:
                     program.funs[sig.name] = fun
         for inst, item, module in self.sigs.instances:
             methods = []
             for sig, node in zip(inst.methods, item.methods):
-                fun = self.attempt(strict, f"{inst.trait}::{node.name}",
-                                   partial(self.function, sig, node, node.name))
+                with self.r.located(module, node.pos):
+                    fun = self.attempt(strict, f"{inst.trait}::{node.name}",
+                                       partial(self.function, sig, node, node.name))
                 if fun is not None:
                     fun.params = sig.params[len(inst.params):]
                     fun.premises = sig.premises[len(inst.premises):]
@@ -144,12 +147,17 @@ class Lowering:
                 program.errors.append((fun.name, error))
 
         for fun in list(program.funs.values()):
-            plan(fun)
+            with self.located(fun):
+                plan(fun)
         for insts in program.instances.values():
             for lowered in insts:
                 for method in lowered.methods:
-                    plan(method, lowered)
+                    with self.located(method):
+                        plan(method, lowered)
         return program
+
+    def located(self, fun: C.Fun) -> AbstractContextManager[None]:
+        return self.r.located(fun.module, fun.pos) if fun.module is not None else nullcontext()
 
     def attempt(self, strict: bool, name: str, build: Callable[[], C.Fun]) -> Optional[C.Fun]:
         if strict:

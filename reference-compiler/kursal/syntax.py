@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, Optional
-from .sexpr import ESCAPES, Position
+from .sexpr import ESCAPES, KursError, Position
 
 
 if TYPE_CHECKING:
@@ -562,6 +562,8 @@ def unescape(text: str) -> str:
             out.append(chr(int(text[i + 2:i + 4], 16)))
             i += 4
         elif text[i] == "\\":
+            if text[i + 1] not in ESCAPES:
+                raise KursError(f"unknown escape \\{text[i + 1]}")
             out.append(ESCAPES[text[i + 1]])
             i += 2
         else:

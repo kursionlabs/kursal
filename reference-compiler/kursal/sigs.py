@@ -111,7 +111,8 @@ class Signatures:
         for scope in resolver.scopes.values():
             for decl in scope.decls.values():
                 if decl.kind in ("struct", "enum", "tuple"):
-                    self.types[self.name(decl)] = self.type_decl(decl)
+                    with resolver.located(decl.module, decl.node.pos):
+                        self.types[self.name(decl)] = self.type_decl(decl)
         check_type_expansion(C.Program(types=self.types))
         self.types_ready = True
         for ty, kinds in self.copy_checks:
@@ -119,15 +120,17 @@ class Signatures:
         self.copy_checks.clear()
         for scope in resolver.scopes.values():
             for decl in scope.decls.values():
-                if decl.kind == "trait":
-                    self.traits[self.name(decl)] = self.trait(decl)
-                elif decl.kind in ("fn", "method", "extern"):
-                    self.sigs[decl] = self.signature(decl)
-                elif decl.kind == "const":
-                    self.const(decl)
+                with resolver.located(decl.module, decl.node.pos):
+                    if decl.kind == "trait":
+                        self.traits[self.name(decl)] = self.trait(decl)
+                    elif decl.kind in ("fn", "method", "extern"):
+                        self.sigs[decl] = self.signature(decl)
+                    elif decl.kind == "const":
+                        self.const(decl)
             for item in scope.items:
                 if isinstance(item, S.InstanceDecl):
-                    self.instances.append(self.instance(item, scope.module))
+                    with resolver.located(scope.module, item.pos):
+                        self.instances.append(self.instance(item, scope.module))
 
     # ---- naming
     def name(self, decl: Decl) -> str:
