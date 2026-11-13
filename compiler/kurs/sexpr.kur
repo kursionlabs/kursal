@@ -1,6 +1,9 @@
 // S-expressions: the forms serialized KURS is written in.
 
-use package::support::base::{Cx, Seq, Text, fail, fail_static, text, text_of};
+use package::support::base::{fail, fail_static};
+use std::collections::arena_vec::ArenaVec;
+use std::raw::Span;
+use std::alloc::arena::Domain;
 use std::bytes::buffer::Buffer;
 use package::syntax::ast::Pos;
 use std::collections::vec::{OwnedVec, Popped};
@@ -18,8 +21,8 @@ exposed enum FormKind {
 forall 'k.
 exposed struct Form {
     kind: FormKind,
-    text: Text['k],
-    items: Seq[Form['k], 'k],
+    text: Span['k],
+    items: ArenaVec[Form['k], 'k],
     pos: Pos,
 }
 
@@ -46,29 +49,29 @@ impl Form['k] {
         }
     }
 
-    fn len(self, &cx: Cx!['k]) -> usize {
+    fn len(self, &cx: Domain!['k]) -> usize {
         self.items.len(&cx)
     }
 
-    fn at(self, &cx: Cx!['k], i: usize) -> Form['k] {
-        self.items.get(&cx, i)
+    fn at(self, &cx: Domain!['k], i: usize) -> Form['k] {
+        self.items.at(&cx, i)
     }
 }
 
 forall 'k.
-fn located(&cx: Cx!['k], message: Text['k], pos: Pos) -> Text['k] {
-    text_of(&cx, Buffer::new().push_u64(pos.line as u64).push_static(":").push_u64(pos.col as u64).push_static(": ").push_bytes(&cx, message))
+fn located(&cx: Domain!['k], message: Span['k], pos: Pos) -> Span['k] {
+    Buffer::new().push_u64(pos.line as u64).push_static(":").push_u64(pos.col as u64).push_static(": ").push_bytes(&cx, message).save(&cx)
 }
 
 forall 'k.
-fn fail_at(&cx: Cx!['k], message: Slice[u8, 'static], pos: Pos) -> ! {
-    fail(&cx, located(&cx, text(&cx, message), pos))
+fn fail_at(&cx: Domain!['k], message: Slice[u8, 'static], pos: Pos) -> ! {
+    fail(&cx, located(&cx, Span::from_static(&cx, message), pos))
 }
 
 // Every top-level form of `source`, as one list.
 forall 'k.
-fn read(&cx: Cx!['k], source: Text['k]) -> Form['k] {
-    let top = Form.{ kind: FormKind::List, text: text(&cx, ""), items: Seq::new(&cx), pos: Pos.{ line: 0u32, col: 0u32 } };
+fn read(&cx: Domain!['k], source: Span['k]) -> Form['k] {
+    let top = Form.{ kind: FormKind::List, text: Span::from_static(&cx, ""), items: ArenaVec::new(&cx), pos: Pos.{ line: 0u32, col: 0u32 } };
     // The lists open at this point, outermost first: the reader's own, freed when it is done.
     var stack = OwnedVec::new[Form['k]]().push(top);
     var i = 0usize;
@@ -76,7 +79,7 @@ fn read(&cx: Cx!['k], source: Text['k]) -> Form['k] {
     var line = 1u32;
     var line_start = 0usize;
     while i < n {
-        let c = source.byte(&cx, i);
+        let c = source.byte_or_zero(&cx, i);
         let pos = Pos.{ line, col: (i - line_start + 1usize) as u32 };
         if c == b'\n' {
             line = line + 1u32;
@@ -85,11 +88,11 @@ fn read(&cx: Cx!['k], source: Text['k]) -> Form['k] {
         if c == b' ' || c == b'\t' || c == b'\r' || c == b'\n' {
             i = i + 1usize;
         } else if c == b';' {
-            while i < n && source.byte(&cx, i) != b'\n' {
+            while i < n && source.byte_or_zero(&cx, i) != b'\n' {
                 i = i + 1usize;
             }
         } else if c == b'(' {
-            let form = Form.{ kind: FormKind::List, text: text(&cx, ""), items: Seq::new(&cx), pos };
+            let form = Form.{ kind: FormKind::List, text: Span::from_static(&cx, ""), items: ArenaVec::new(&cx), pos };
             innermost(&stack).items.push(&cx, form);
             stack = stack.push(form);
             i = i + 1usize;
@@ -106,13 +109,13 @@ fn read(&cx: Cx!['k], source: Text['k]) -> Form['k] {
         } else if c == b'"' {
             var j = i + 1usize;
             var chars = Buffer::new();
-            while j < n && source.byte(&cx, j) != b'"' {
-                let d = source.byte(&cx, j);
-                if d == b'\\' && source.byte(&cx, j + 1usize) == b'x' {
-                    chars = chars.push_byte(hex(source.byte(&cx, j + 2usize)) * 16u8 + hex(source.byte(&cx, j + 3usize)));
+            while j < n && source.byte_or_zero(&cx, j) != b'"' {
+                let d = source.byte_or_zero(&cx, j);
+                if d == b'\\' && source.byte_or_zero(&cx, j + 1usize) == b'x' {
+                    chars = chars.push_byte(hex(source.byte_or_zero(&cx, j + 2usize)) * 16u8 + hex(source.byte_or_zero(&cx, j + 3usize)));
                     j = j + 4usize;
                 } else if d == b'\\' {
-                    let e = source.byte(&cx, j + 1usize);
+                    let e = source.byte_or_zero(&cx, j + 1usize);
                     let byte = if e == b'n' {
                         b'\n'
                     } else if e == b't' {
@@ -136,14 +139,14 @@ fn read(&cx: Cx!['k], source: Text['k]) -> Form['k] {
             if j >= n {
                 fail_at(&cx, "unterminated string literal", pos);
             }
-            innermost(&stack).items.push(&cx, Form.{ kind: FormKind::Str, text: text_of(&cx, chars), items: Seq::new(&cx), pos });
+            innermost(&stack).items.push(&cx, Form.{ kind: FormKind::Str, text: chars.save(&cx), items: ArenaVec::new(&cx), pos });
             i = j + 1usize;
         } else {
             var j = i;
-            while j < n && !is_delimiter(source.byte(&cx, j)) {
+            while j < n && !is_delimiter(source.byte_or_zero(&cx, j)) {
                 j = j + 1usize;
             }
-            innermost(&stack).items.push(&cx, Form.{ kind: FormKind::Atom, text: source.slice(i, j), items: Seq::new(&cx), pos });
+            innermost(&stack).items.push(&cx, Form.{ kind: FormKind::Atom, text: source.slice(i, j), items: ArenaVec::new(&cx), pos });
             i = j;
         }
     }

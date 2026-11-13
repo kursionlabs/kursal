@@ -4,7 +4,12 @@
 // declarations and renames binders, lives in `types`. An inference variable (`Meta`) is a type
 // too, compared by identity; checked programs contain none.
 
-use package::support::base::{Cell, Cx, Map, Seq, Text, combine, key_hash, text};
+use package::support::base::{combine, key_hash};
+use std::collections::arena_vec::ArenaVec;
+use std::collections::arena_map::ArenaMap;
+use std::mem::Ref;
+use std::raw::Span;
+use std::alloc::arena::Domain;
 use package::kurs::sexpr::Form;
 use std::hash::{HashIn, HashState};
 use std::slice::Slice;
@@ -34,7 +39,7 @@ fn kind_index(k: Kind) -> u32 {
 
 // The width in bits of an integer type, or 0 for any other name.
 forall 'k.
-fn integer_bits(&cx: Cx!['k], name: Text['k]) -> u32 {
+fn integer_bits(&cx: Domain!['k], name: Span['k]) -> u32 {
     if name.is(&cx, "i8") || name.is(&cx, "u8") {
         8u32
     } else if name.is(&cx, "i16") || name.is(&cx, "u16") {
@@ -49,17 +54,17 @@ fn integer_bits(&cx: Cx!['k], name: Text['k]) -> u32 {
 }
 
 forall 'k.
-fn is_integer(&cx: Cx!['k], name: Text['k]) -> bool {
+fn is_integer(&cx: Domain!['k], name: Span['k]) -> bool {
     integer_bits(&cx, name) != 0u32
 }
 
 forall 'k.
-fn is_float(&cx: Cx!['k], name: Text['k]) -> bool {
+fn is_float(&cx: Domain!['k], name: Span['k]) -> bool {
     name.is(&cx, "f32") || name.is(&cx, "f64")
 }
 
 forall 'k.
-fn is_prim(&cx: Cx!['k], name: Text['k]) -> bool {
+fn is_prim(&cx: Domain!['k], name: Span['k]) -> bool {
     is_integer(&cx, name) || is_float(&cx, name) || name.is(&cx, "bool")
 }
 
@@ -67,22 +72,22 @@ fn is_prim(&cx: Cx!['k], name: Text['k]) -> bool {
 
 forall 'k.
 exposed enum Type {
-    Prim(Text['k]),
+    Prim(Span['k]),
     Never,
-    Named(Text['k], Seq[Type['k], 'k]),
-    Struct(Seq[Member['k], 'k]),
+    Named(Span['k], ArenaVec[Type['k], 'k]),
+    Struct(ArenaVec[Member['k], 'k]),
     // variants in tag order
-    Enum(Seq[Member['k], 'k]),
-    Tuple(Seq[Type['k], 'k]),
-    Array(Cell[Type['k], 'k], u64),
-    Ptr(Cell[Type['k], 'k]),
+    Enum(ArenaVec[Member['k], 'k]),
+    Tuple(ArenaVec[Type['k], 'k]),
+    Array(Ref[Type['k], 'k], u64),
+    Ptr(Ref[Type['k], 'k]),
     // A brand variable or identity; of kind Brand, never a value type.
-    Skolem(Text['k]),
+    Skolem(Span['k]),
     // `builtin::Brand $k`, the Copy witness type of brand `$k`: a Skolem in checked IR; inference may
     // use a brand metavariable.
-    Brand(Cell[Type['k], 'k]),
+    Brand(Ref[Type['k], 'k]),
     // brand labels, and the body they scope over
-    Exists(Seq[Text['k], 'k], Cell[Type['k], 'k]),
+    Exists(ArenaVec[Span['k], 'k], Ref[Type['k], 'k]),
     Foreach(ForeachType['k]),
     Fn(FnType['k]),
     // `_`: a retained brand slot of `fn`'s type arguments
@@ -93,29 +98,29 @@ exposed enum Type {
 // A field of a struct or a variant of an enum.
 forall 'k.
 exposed struct Member {
-    name: Text['k],
+    name: Span['k],
     type: Type['k],
 }
 
 forall 'k.
 exposed struct ForeachType {
-    binder: Text['k],
+    binder: Span['k],
     // the `(builtin::Pointer F)` pattern
     indirect: bool,
-    source: Cell[Type['k], 'k],
-    body: Cell[Type['k], 'k],
-    retained: Seq[Text['k], 'k],
+    source: Ref[Type['k], 'k],
+    body: Ref[Type['k], 'k],
+    retained: ArenaVec[Span['k], 'k],
 }
 
 forall 'k.
 exposed struct FnType {
-    params: Seq[Type['k], 'k],
-    ret: Cell[Type['k], 'k],
+    params: ArenaVec[Type['k], 'k],
+    ret: Ref[Type['k], 'k],
     // retained brand parameters; a function value carries no premises
-    quantified: Seq[Param['k], 'k],
+    quantified: ArenaVec[Param['k], 'k],
     is_unsafe: bool,
     // indices of place parameters, ascending
-    places: Seq[usize, 'k],
+    places: ArenaVec[usize, 'k],
 }
 
 exposed enum MetaKind {
@@ -128,7 +133,7 @@ exposed enum MetaKind {
 // An inference variable: its solution once it has one.
 forall 'k.
 exposed struct Meta {
-    state: Cell[MetaState['k], 'k],
+    state: Ref[MetaState['k], 'k],
 }
 
 forall 'k.
@@ -140,93 +145,93 @@ exposed struct MetaState {
 
 forall 'k.
 impl Meta['k] {
-    fn new(&cx: Cx!['k], kind: MetaKind) -> Meta['k] {
-        Meta.{ state: Cell::new(&cx, MetaState.{ solution: Option::None, kind, pos: Pos.{ line: 0u32, col: 0u32 } }) }
+    fn new(&cx: Domain!['k], kind: MetaKind) -> Meta['k] {
+        Meta.{ state: Ref::new(&cx, MetaState.{ solution: Option::None, kind, pos: Pos.{ line: 0u32, col: 0u32 } }) }
     }
 
     fn id(self) -> usize {
         self.state.address()
     }
 
-    fn solution(self, &cx: Cx!['k]) -> Option[Type['k]] {
-        self.state.get(&cx).solution
+    fn solution(self, &cx: Domain!['k]) -> Option[Type['k]] {
+        self.state.copy(&cx).solution
     }
 
-    fn kind(self, &cx: Cx!['k]) -> MetaKind {
-        self.state.get(&cx).kind
+    fn kind(self, &cx: Domain!['k]) -> MetaKind {
+        self.state.copy(&cx).kind
     }
 
-    fn pos(self, &cx: Cx!['k]) -> Pos {
-        self.state.get(&cx).pos
+    fn pos(self, &cx: Domain!['k]) -> Pos {
+        self.state.copy(&cx).pos
     }
 
-    fn solve(self, &cx: Cx!['k], t: Type['k]) {
-        let s = self.state.get(&cx);
+    fn solve(self, &cx: Domain!['k], t: Type['k]) {
+        let s = self.state.copy(&cx);
         self.state.set(&cx, MetaState.{ solution: Option::Some.(t), kind: s.kind, pos: s.pos });
     }
 
-    fn set_kind(self, &cx: Cx!['k], kind: MetaKind) {
-        let s = self.state.get(&cx);
+    fn set_kind(self, &cx: Domain!['k], kind: MetaKind) {
+        let s = self.state.copy(&cx);
         self.state.set(&cx, MetaState.{ solution: s.solution, kind, pos: s.pos });
     }
 
-    fn set_pos(self, &cx: Cx!['k], pos: Pos) {
-        let s = self.state.get(&cx);
+    fn set_pos(self, &cx: Domain!['k], pos: Pos) {
+        let s = self.state.copy(&cx);
         self.state.set(&cx, MetaState.{ solution: s.solution, kind: s.kind, pos });
     }
 }
 
 forall 'k.
 exposed struct Param {
-    name: Text['k],
+    name: Span['k],
     kind: Kind,
 }
 
 forall 'k.
 exposed struct Premise {
-    trait_name: Text['k],
-    args: Seq[Type['k], 'k],
+    trait_name: Span['k],
+    args: ArenaVec[Type['k], 'k],
 }
 
 forall 'k.
-fn prim(&cx: Cx!['k], name: Slice[u8, 'static]) -> Type['k] {
-    Type::Prim.(text(&cx, name))
+fn prim(&cx: Domain!['k], name: Slice[u8, 'static]) -> Type['k] {
+    Type::Prim.(Span::from_static(&cx, name))
 }
 
 forall 'k.
-fn unit(&cx: Cx!['k]) -> Type['k] {
-    Type::Tuple.(Seq::new(&cx))
+fn unit(&cx: Domain!['k]) -> Type['k] {
+    Type::Tuple.(ArenaVec::new(&cx))
 }
 
 forall 'k.
-fn bool_type(&cx: Cx!['k]) -> Type['k] {
+fn bool_type(&cx: Domain!['k]) -> Type['k] {
     prim(&cx, "bool")
 }
 
 forall 'k.
-fn u32_type(&cx: Cx!['k]) -> Type['k] {
+fn u32_type(&cx: Domain!['k]) -> Type['k] {
     prim(&cx, "u32")
 }
 
 forall 'k.
-fn usize_type(&cx: Cx!['k]) -> Type['k] {
+fn usize_type(&cx: Domain!['k]) -> Type['k] {
     prim(&cx, "usize")
 }
 
 forall 'k.
-fn ptr(&cx: Cx!['k], inner: Type['k]) -> Type['k] {
-    Type::Ptr.(Cell::new(&cx, inner))
+fn ptr(&cx: Domain!['k], inner: Type['k]) -> Type['k] {
+    Type::Ptr.(Ref::new(&cx, inner))
 }
 
 forall 'k.
-fn named(name: Text['k], args: Seq[Type['k], 'k]) -> Type['k] {
+fn named(name: Span['k], args: ArenaVec[Type['k], 'k]) -> Type['k] {
     Type::Named.(name, args)
 }
 
 // A foreach type whose retained binders default to those of a foreach source.
 forall 'k.
-fn foreach_type(&cx: Cx!['k], binder: Text['k], indirect: bool, source: Type['k], body: Type['k]) -> Type['k] {
-    let retained: Seq[Text['k], 'k] = Seq::new(&cx);
+fn foreach_type(&cx: Domain!['k], binder: Span['k], indirect: bool, source: Type['k], body: Type['k]) -> Type['k] {
+    let retained: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
     let unit = match source {
         Type::Foreach(f) => {
             retained.push(&cx, f.binder);
@@ -234,47 +239,47 @@ fn foreach_type(&cx: Cx!['k], binder: Text['k], indirect: bool, source: Type['k]
         },
         _ => (),
     };
-    Type::Foreach.(ForeachType.{ binder, indirect, source: Cell::new(&cx, source), body: Cell::new(&cx, body), retained })
+    Type::Foreach.(ForeachType.{ binder, indirect, source: Ref::new(&cx, source), body: Ref::new(&cx, body), retained })
 }
 
 forall 'k.
-fn fn_type(&cx: Cx!['k], params: Seq[Type['k], 'k], ret: Type['k], quantified: Seq[Param['k], 'k], is_unsafe: bool, places: Seq[usize, 'k]) -> Type['k] {
-    Type::Fn.(FnType.{ params, ret: Cell::new(&cx, ret), quantified, is_unsafe, places })
+fn fn_type(&cx: Domain!['k], params: ArenaVec[Type['k], 'k], ret: Type['k], quantified: ArenaVec[Param['k], 'k], is_unsafe: bool, places: ArenaVec[usize, 'k]) -> Type['k] {
+    Type::Fn.(FnType.{ params, ret: Ref::new(&cx, ret), quantified, is_unsafe, places })
 }
 
 forall 'k.
-fn types_same(&cx: Cx!['k], a: Seq[Type['k], 'k], b: Seq[Type['k], 'k]) -> bool {
+fn types_same(&cx: Domain!['k], a: ArenaVec[Type['k], 'k], b: ArenaVec[Type['k], 'k]) -> bool {
     var equal = a.len(&cx) == b.len(&cx);
     var i = 0usize;
     while equal && i < a.len(&cx) {
-        equal = same(&cx, a.get(&cx, i), b.get(&cx, i));
+        equal = same(&cx, a.at(&cx, i), b.at(&cx, i));
         i = i + 1usize;
     }
     equal
 }
 
 forall 'k.
-fn members_same(&cx: Cx!['k], a: Seq[Member['k], 'k], b: Seq[Member['k], 'k]) -> bool {
+fn members_same(&cx: Domain!['k], a: ArenaVec[Member['k], 'k], b: ArenaVec[Member['k], 'k]) -> bool {
     var equal = a.len(&cx) == b.len(&cx);
     var i = 0usize;
     while equal && i < a.len(&cx) {
-        equal = a.get(&cx, i).name.eq(&cx, b.get(&cx, i).name) && same(&cx, a.get(&cx, i).type, b.get(&cx, i).type);
+        equal = a.at(&cx, i).name.eq(&cx, b.at(&cx, i).name) && same(&cx, a.at(&cx, i).type, b.at(&cx, i).type);
         i = i + 1usize;
     }
     equal
 }
 
 forall 'k.
-fn texts_same(&cx: Cx!['k], a: Seq[Text['k], 'k], b: Seq[Text['k], 'k]) -> bool {
-    a.same(&cx, b)
+fn texts_same(&cx: Domain!['k], a: ArenaVec[Span['k], 'k], b: ArenaVec[Span['k], 'k]) -> bool {
+    a.eq(&cx, b)
 }
 
 forall 'k.
-fn params_same(&cx: Cx!['k], a: Seq[Param['k], 'k], b: Seq[Param['k], 'k]) -> bool {
+fn params_same(&cx: Domain!['k], a: ArenaVec[Param['k], 'k], b: ArenaVec[Param['k], 'k]) -> bool {
     var equal = a.len(&cx) == b.len(&cx);
     var i = 0usize;
     while equal && i < a.len(&cx) {
-        equal = a.get(&cx, i).name.eq(&cx, b.get(&cx, i).name) && same_kind(a.get(&cx, i).kind, b.get(&cx, i).kind);
+        equal = a.at(&cx, i).name.eq(&cx, b.at(&cx, i).name) && same_kind(a.at(&cx, i).kind, b.at(&cx, i).kind);
         i = i + 1usize;
     }
     equal
@@ -283,7 +288,7 @@ fn params_same(&cx: Cx!['k], a: Seq[Param['k], 'k], b: Seq[Param['k], 'k]) -> bo
 // Structural equality: the same constructor with the same parts. Variables are equal only to
 // themselves.
 forall 'k.
-fn same(&cx: Cx!['k], a: Type['k], b: Type['k]) -> bool {
+fn same(&cx: Domain!['k], a: Type['k], b: Type['k]) -> bool {
     match a {
         Type::Prim(x) => match b {
             Type::Prim(y) => x.eq(&cx, y),
@@ -310,11 +315,11 @@ fn same(&cx: Cx!['k], a: Type['k], b: Type['k]) -> bool {
             _ => false,
         },
         Type::Array(x, n) => match b {
-            Type::Array(y, m) => n == m && same(&cx, x.get(&cx), y.get(&cx)),
+            Type::Array(y, m) => n == m && same(&cx, x.copy(&cx), y.copy(&cx)),
             _ => false,
         },
         Type::Ptr(x) => match b {
-            Type::Ptr(y) => same(&cx, x.get(&cx), y.get(&cx)),
+            Type::Ptr(y) => same(&cx, x.copy(&cx), y.copy(&cx)),
             _ => false,
         },
         Type::Skolem(x) => match b {
@@ -322,21 +327,21 @@ fn same(&cx: Cx!['k], a: Type['k], b: Type['k]) -> bool {
             _ => false,
         },
         Type::Brand(x) => match b {
-            Type::Brand(y) => same(&cx, x.get(&cx), y.get(&cx)),
+            Type::Brand(y) => same(&cx, x.copy(&cx), y.copy(&cx)),
             _ => false,
         },
         Type::Exists(xs, x) => match b {
-            Type::Exists(ys, y) => texts_same(&cx, xs, ys) && same(&cx, x.get(&cx), y.get(&cx)),
+            Type::Exists(ys, y) => texts_same(&cx, xs, ys) && same(&cx, x.copy(&cx), y.copy(&cx)),
             _ => false,
         },
         Type::Foreach(x) => match b {
-            Type::Foreach(y) => x.binder.eq(&cx, y.binder) && x.indirect == y.indirect && same(&cx, x.source.get(&cx), y.source.get(&cx))
-                && same(&cx, x.body.get(&cx), y.body.get(&cx)) && texts_same(&cx, x.retained, y.retained),
+            Type::Foreach(y) => x.binder.eq(&cx, y.binder) && x.indirect == y.indirect && same(&cx, x.source.copy(&cx), y.source.copy(&cx))
+                && same(&cx, x.body.copy(&cx), y.body.copy(&cx)) && texts_same(&cx, x.retained, y.retained),
             _ => false,
         },
         Type::Fn(x) => match b {
-            Type::Fn(y) => types_same(&cx, x.params, y.params) && same(&cx, x.ret.get(&cx), y.ret.get(&cx)) && params_same(&cx, x.quantified, y.quantified)
-                && x.is_unsafe == y.is_unsafe && x.places.same(&cx, y.places),
+            Type::Fn(y) => types_same(&cx, x.params, y.params) && same(&cx, x.ret.copy(&cx), y.ret.copy(&cx)) && params_same(&cx, x.quantified, y.quantified)
+                && x.is_unsafe == y.is_unsafe && x.places.eq(&cx, y.places),
             _ => false,
         },
         Type::Ignored => match b {
@@ -351,29 +356,29 @@ fn same(&cx: Cx!['k], a: Type['k], b: Type['k]) -> bool {
 }
 
 forall 'k.
-fn hash_types(&cx: Cx!['k], h: u64, ts: Seq[Type['k], 'k]) -> u64 {
+fn hash_types(&cx: Domain!['k], h: u64, ts: ArenaVec[Type['k], 'k]) -> u64 {
     var h = h;
     var i = 0usize;
     while i < ts.len(&cx) {
-        h = combine(h, hash(&cx, ts.get(&cx, i)));
+        h = combine(h, hash(&cx, ts.at(&cx, i)));
         i = i + 1usize;
     }
     h
 }
 
 forall 'k.
-fn hash_members(&cx: Cx!['k], h: u64, ms: Seq[Member['k], 'k]) -> u64 {
+fn hash_members(&cx: Domain!['k], h: u64, ms: ArenaVec[Member['k], 'k]) -> u64 {
     var h = h;
     var i = 0usize;
     while i < ms.len(&cx) {
-        h = combine(combine(h, ms.get(&cx, i).name.hash(&cx)), hash(&cx, ms.get(&cx, i).type));
+        h = combine(combine(h, ms.at(&cx, i).name.hash(&cx)), hash(&cx, ms.at(&cx, i).type));
         i = i + 1usize;
     }
     h
 }
 
 forall 'k.
-fn hash(&cx: Cx!['k], t: Type['k]) -> u64 {
+fn hash(&cx: Domain!['k], t: Type['k]) -> u64 {
     match t {
         Type::Prim(x) => combine(1u64, x.hash(&cx)),
         Type::Never => 2u64,
@@ -381,52 +386,52 @@ fn hash(&cx: Cx!['k], t: Type['k]) -> u64 {
         Type::Struct(xs) => hash_members(&cx, 4u64, xs),
         Type::Enum(xs) => hash_members(&cx, 5u64, xs),
         Type::Tuple(xs) => hash_types(&cx, 6u64, xs),
-        Type::Array(x, n) => combine(combine(7u64, hash(&cx, x.get(&cx))), n),
-        Type::Ptr(x) => combine(8u64, hash(&cx, x.get(&cx))),
+        Type::Array(x, n) => combine(combine(7u64, hash(&cx, x.copy(&cx))), n),
+        Type::Ptr(x) => combine(8u64, hash(&cx, x.copy(&cx))),
         Type::Skolem(x) => combine(9u64, x.hash(&cx)),
-        Type::Brand(x) => combine(10u64, hash(&cx, x.get(&cx))),
-        Type::Exists(xs, x) => combine(combine(11u64, key_hash(&cx, xs)), hash(&cx, x.get(&cx))),
-        Type::Foreach(x) => combine(combine(12u64, x.binder.hash(&cx)), combine(hash(&cx, x.source.get(&cx)), hash(&cx, x.body.get(&cx)))),
-        Type::Fn(x) => combine(hash_types(&cx, 13u64, x.params), hash(&cx, x.ret.get(&cx))),
+        Type::Brand(x) => combine(10u64, hash(&cx, x.copy(&cx))),
+        Type::Exists(xs, x) => combine(combine(11u64, key_hash(&cx, xs)), hash(&cx, x.copy(&cx))),
+        Type::Foreach(x) => combine(combine(12u64, x.binder.hash(&cx)), combine(hash(&cx, x.source.copy(&cx)), hash(&cx, x.body.copy(&cx)))),
+        Type::Fn(x) => combine(hash_types(&cx, 13u64, x.params), hash(&cx, x.ret.copy(&cx))),
         Type::Ignored => 14u64,
         Type::Meta(x) => combine(15u64, x.id() as u64),
     }
 }
 
 forall 'k.
-instance HashIn[Type['k], Cx!['k]] {
-    fn hash_in(&cx: Cx!['k], key: Type['k], state: HashState) -> HashState {
+instance HashIn[Type['k], Domain!['k]] {
+    fn hash_in(&cx: Domain!['k], key: Type['k], state: HashState) -> HashState {
         let h = hash(&cx, key);
         state.write_u64(h)
     }
 
-    fn eq_in(&cx: Cx!['k], a: Type['k], b: Type['k]) -> bool {
+    fn eq_in(&cx: Domain!['k], a: Type['k], b: Type['k]) -> bool {
         let equal = same(&cx, a, b);
         equal
     }
 }
 
 forall 'k.
-instance HashIn[Param['k], Cx!['k]] {
-    fn hash_in(&cx: Cx!['k], key: Param['k], state: HashState) -> HashState {
+instance HashIn[Param['k], Domain!['k]] {
+    fn hash_in(&cx: Domain!['k], key: Param['k], state: HashState) -> HashState {
         let h = combine(key.name.hash(&cx), kind_index(key.kind) as u64);
         state.write_u64(h)
     }
 
-    fn eq_in(&cx: Cx!['k], a: Param['k], b: Param['k]) -> bool {
+    fn eq_in(&cx: Domain!['k], a: Param['k], b: Param['k]) -> bool {
         let equal = a.name.eq(&cx, b.name) && same_kind(a.kind, b.kind);
         equal
     }
 }
 
 forall 'k.
-instance HashIn[Premise['k], Cx!['k]] {
-    fn hash_in(&cx: Cx!['k], key: Premise['k], state: HashState) -> HashState {
+instance HashIn[Premise['k], Domain!['k]] {
+    fn hash_in(&cx: Domain!['k], key: Premise['k], state: HashState) -> HashState {
         let h = hash_types(&cx, key.trait_name.hash(&cx), key.args);
         state.write_u64(h)
     }
 
-    fn eq_in(&cx: Cx!['k], a: Premise['k], b: Premise['k]) -> bool {
+    fn eq_in(&cx: Domain!['k], a: Premise['k], b: Premise['k]) -> bool {
         let equal = a.trait_name.eq(&cx, b.trait_name) && types_same(&cx, a.args, b.args);
         equal
     }
@@ -437,36 +442,36 @@ instance HashIn[Premise['k], Cx!['k]] {
 forall 'k.
 exposed struct ModuleId {
     package: usize,
-    path: Seq[Text['k], 'k],
+    path: ArenaVec[Span['k], 'k],
 }
 
 forall 'k.
 impl ModuleId['k] {
-    fn root(&cx: Cx!['k], package: usize) -> ModuleId['k] {
-        ModuleId.{ package, path: Seq::new(&cx) }
+    fn root(&cx: Domain!['k], package: usize) -> ModuleId['k] {
+        ModuleId.{ package, path: ArenaVec::new(&cx) }
     }
 
-    fn child(self, &cx: Cx!['k], name: Text['k]) -> ModuleId['k] {
-        let path = self.path.copy(&cx);
+    fn child(self, &cx: Domain!['k], name: Span['k]) -> ModuleId['k] {
+        let path = self.path.clone(&cx);
         path.push(&cx, name);
         ModuleId.{ package: self.package, path }
     }
 
     // `self` is `scope` or a module inside it.
-    fn within(self, &cx: Cx!['k], scope: ModuleId['k]) -> bool {
-        self.package == scope.package && self.path.len(&cx) >= scope.path.len(&cx) && self.path.slice(&cx, 0usize, scope.path.len(&cx)).same(&cx, scope.path)
+    fn within(self, &cx: Domain!['k], scope: ModuleId['k]) -> bool {
+        self.package == scope.package && self.path.len(&cx) >= scope.path.len(&cx) && self.path.slice(&cx, 0usize, scope.path.len(&cx)).eq(&cx, scope.path)
     }
 }
 
 forall 'k.
-instance HashIn[ModuleId['k], Cx!['k]] {
-    fn hash_in(&cx: Cx!['k], key: ModuleId['k], state: HashState) -> HashState {
+instance HashIn[ModuleId['k], Domain!['k]] {
+    fn hash_in(&cx: Domain!['k], key: ModuleId['k], state: HashState) -> HashState {
         let h = combine(key.package as u64, key_hash(&cx, key.path));
         state.write_u64(h)
     }
 
-    fn eq_in(&cx: Cx!['k], a: ModuleId['k], b: ModuleId['k]) -> bool {
-        let equal = a.package == b.package && a.path.same(&cx, b.path);
+    fn eq_in(&cx: Domain!['k], a: ModuleId['k], b: ModuleId['k]) -> bool {
+        let equal = a.package == b.package && a.path.eq(&cx, b.path);
         equal
     }
 }
@@ -486,10 +491,10 @@ exposed struct Exposure {
 
 forall 'k.
 exposed struct TypeDecl {
-    name: Text['k],
+    name: Span['k],
     linear: bool,
-    params: Seq[Param['k], 'k],
-    premises: Seq[Premise['k], 'k],
+    params: ArenaVec[Param['k], 'k],
+    premises: ArenaVec[Premise['k], 'k],
     body: Type['k],
     home: Option[ModuleId['k]],
     // none: transparent
@@ -498,91 +503,91 @@ exposed struct TypeDecl {
 
 forall 'k.
 exposed struct Instr {
-    lhs: Seq[Text['k], 'k],
-    op: Text['k],
-    args: Seq[Text['k], 'k],
+    lhs: ArenaVec[Span['k], 'k],
+    op: Span['k],
+    args: ArenaVec[Span['k], 'k],
     // the type operand
     ty: Option[Type['k]],
     // type arguments
-    tys: Seq[Type['k], 'k],
-    lit: Option[Text['k]],
+    tys: ArenaVec[Type['k], 'k],
+    lit: Option[Span['k]],
     // the instruction's discharge marker
     is_unsafe: bool,
     // `open`'s brand binders
-    binders: Seq[Text['k], 'k],
+    binders: ArenaVec[Span['k], 'k],
     pos: Pos,
 }
 
 forall 'k.
 exposed struct Edge {
-    target: Text['k],
-    args: Seq[Text['k], 'k],
-    tys: Seq[Type['k], 'k],
+    target: Span['k],
+    args: ArenaVec[Span['k], 'k],
+    tys: ArenaVec[Type['k], 'k],
 }
 
 forall 'k.
 exposed struct Arm {
-    variant: Text['k],
+    variant: Span['k],
     edge: Edge['k],
 }
 
 forall 'k.
 exposed enum Terminator {
-    Ret(Text['k], Pos),
+    Ret(Span['k], Pos),
     Jmp(Edge['k], Pos),
     // condition, then, other
-    Jnz(Text['k], Edge['k], Edge['k], Pos),
+    Jnz(Span['k], Edge['k], Edge['k], Pos),
     // scrutinee, its enum type, one arm per variant
-    Switch(Text['k], Type['k], Seq[Arm['k], 'k], Pos),
+    Switch(Span['k], Type['k], ArenaVec[Arm['k], 'k], Pos),
     Unreachable(Pos),
 }
 
 forall 'k.
 exposed struct Binding {
-    name: Text['k],
+    name: Span['k],
     type: Type['k],
 }
 
 // A known variant of a place: `known &path = Variant`.
 forall 'k.
 exposed struct Known {
-    path: Text['k],
-    variant: Text['k],
+    path: Span['k],
+    variant: Span['k],
 }
 
 // An opened package place and the brands of its view.
 forall 'k.
 exposed struct Opened {
-    path: Text['k],
-    brands: Seq[Text['k], 'k],
+    path: Span['k],
+    brands: ArenaVec[Span['k], 'k],
 }
 
 forall 'k.
 exposed struct Block {
-    label: Text['k],
-    params: Seq[Binding['k], 'k],
-    instrs: Seq[Instr['k], 'k],
+    label: Span['k],
+    params: ArenaVec[Binding['k], 'k],
+    instrs: ArenaVec[Instr['k], 'k],
     term: Terminator['k],
-    brands: Seq[Text['k], 'k],
+    brands: ArenaVec[Span['k], 'k],
     // place paths declared empty
-    empty: Seq[Text['k], 'k],
-    known: Seq[Known['k], 'k],
-    opened: Seq[Opened['k], 'k],
+    empty: ArenaVec[Span['k], 'k],
+    known: ArenaVec[Known['k], 'k],
+    opened: ArenaVec[Opened['k], 'k],
     pos: Pos,
 }
 
 forall 'k.
 exposed struct Fun {
-    name: Text['k],
+    name: Span['k],
     // quantified parameters
-    params: Seq[Param['k], 'k],
-    premises: Seq[Premise['k], 'k],
+    params: ArenaVec[Param['k], 'k],
+    premises: ArenaVec[Premise['k], 'k],
     ret: Type['k],
     // a place parameter's type is the root type; see `places`
-    ptypes: Seq[Type['k], 'k],
-    blocks: Seq[Block['k], 'k],
+    ptypes: ArenaVec[Type['k], 'k],
+    blocks: ArenaVec[Block['k], 'k],
     // whole-function places: `&name` and its type
-    locals: Seq[Binding['k], 'k],
+    locals: ArenaVec[Binding['k], 'k],
     is_unsafe: bool,
     home: Option[ModuleId['k]],
     pos: Pos,
@@ -591,12 +596,12 @@ exposed struct Fun {
 forall 'k.
 impl Fun['k] {
     // The indices of the place parameters, whose entry names start with `&`.
-    fn places(self, &cx: Cx!['k]) -> Seq[usize, 'k] {
-        let out: Seq[usize, 'k] = Seq::new(&cx);
-        let params = self.blocks.get(&cx, 0usize).params;
+    fn places(self, &cx: Domain!['k]) -> ArenaVec[usize, 'k] {
+        let out: ArenaVec[usize, 'k] = ArenaVec::new(&cx);
+        let params = self.blocks.at(&cx, 0usize).params;
         var i = 0usize;
         while i < params.len(&cx) {
-            if params.get(&cx, i).name.byte(&cx, 0usize) == b'&' {
+            if params.at(&cx, i).name.byte_or_zero(&cx, 0usize) == b'&' {
                 out.push(&cx, i);
             }
             i = i + 1usize;
@@ -607,48 +612,48 @@ impl Fun['k] {
 
 forall 'k.
 exposed struct Extern {
-    name: Text['k],
+    name: Span['k],
     ret: Option[Type['k]],
     // none for an extern value
-    ptypes: Option[Seq[Type['k], 'k]],
+    ptypes: Option[ArenaVec[Type['k], 'k]],
     pos: Pos,
 }
 
 forall 'k.
 exposed struct Method {
-    name: Text['k],
+    name: Span['k],
     ret: Type['k],
-    ptypes: Seq[Type['k], 'k],
+    ptypes: ArenaVec[Type['k], 'k],
     is_unsafe: bool,
-    places: Seq[usize, 'k],
+    places: ArenaVec[usize, 'k],
 }
 
 forall 'k.
 exposed struct Trait {
-    name: Text['k],
-    params: Seq[Text['k], 'k],
-    methods: Seq[Method['k], 'k],
+    name: Span['k],
+    params: ArenaVec[Span['k], 'k],
+    methods: ArenaVec[Method['k], 'k],
     home: Option[ModuleId['k]],
     // omitted kinds are Any, as in plain KURS headers
-    param_kinds: Seq[Kind, 'k],
+    param_kinds: ArenaVec[Kind, 'k],
 }
 
 forall 'k.
 exposed struct Instance {
-    trait_name: Text['k],
-    params: Seq[Param['k], 'k],
-    premises: Seq[Premise['k], 'k],
+    trait_name: Span['k],
+    params: ArenaVec[Param['k], 'k],
+    premises: ArenaVec[Premise['k], 'k],
     // one type per trait parameter
-    head: Seq[Type['k], 'k],
+    head: ArenaVec[Type['k], 'k],
     // functions with bare method names
-    methods: Seq[Fun['k], 'k],
+    methods: ArenaVec[Fun['k], 'k],
     home: Option[ModuleId['k]],
     pos: Pos,
 }
 
 forall 'k.
 exposed struct Data {
-    name: Text['k],
+    name: Span['k],
     ty: Type['k],
     // the raw form
     init: Form['k],
@@ -657,18 +662,18 @@ exposed struct Data {
 
 forall 'k.
 exposed struct Program {
-    types: Map[Text['k], TypeDecl['k], 'k],
-    funs: Map[Text['k], Fun['k], 'k],
-    externs: Map[Text['k], Extern['k], 'k],
-    datas: Map[Text['k], Data['k], 'k],
-    traits: Map[Text['k], Trait['k], 'k],
+    types: ArenaMap[Span['k], TypeDecl['k], 'k],
+    funs: ArenaMap[Span['k], Fun['k], 'k],
+    externs: ArenaMap[Span['k], Extern['k], 'k],
+    datas: ArenaMap[Span['k], Data['k], 'k],
+    traits: ArenaMap[Span['k], Trait['k], 'k],
     // trait -> its instances
-    instances: Map[Text['k], Seq[Instance['k], 'k], 'k],
+    instances: ArenaMap[Span['k], ArenaVec[Instance['k], 'k], 'k],
 }
 
 forall 'k.
 impl Program['k] {
-    fn new(&cx: Cx!['k]) -> Program['k] {
-        Program.{ types: Map::new(&cx), funs: Map::new(&cx), externs: Map::new(&cx), datas: Map::new(&cx), traits: Map::new(&cx), instances: Map::new(&cx) }
+    fn new(&cx: Domain!['k]) -> Program['k] {
+        Program.{ types: ArenaMap::new(&cx), funs: ArenaMap::new(&cx), externs: ArenaMap::new(&cx), datas: ArenaMap::new(&cx), traits: ArenaMap::new(&cx), instances: ArenaMap::new(&cx) }
     }
 }

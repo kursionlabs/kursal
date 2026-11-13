@@ -18,7 +18,13 @@
 // Results are kept in `Results`, by syntax node id, for lowering: each expression's, pattern's and
 // variant case's type, what each call calls (`Callee`), local binding ids, captures and the rest.
 
-use package::support::base::{Cell, Cx, Map, Seq, Set, Text, text, text_of};
+use package::support::base::fail_static;
+use std::collections::list::List;
+use std::collections::arena_vec::ArenaVec;
+use std::collections::arena_map::{ArenaMap, ArenaSet};
+use std::mem::Ref;
+use std::raw::Span;
+use std::alloc::arena::Domain;
 use std::bytes::buffer::Buffer;
 use package::types::coherence::check_coherence;
 use package::kurs::core::{ForeachType, Kind, Member, Meta, MetaKind, ModuleId, Param, Premise, Program, Type, TypeDecl};
@@ -47,14 +53,14 @@ exposed struct Receiver {
 forall 'k.
 exposed struct FnCall {
     sig: Sig['k],
-    sub: Map[Text['k], Type['k], 'k],
+    sub: ArenaMap[Span['k], Type['k], 'k],
     receiver: Option[Receiver['k]],
 }
 
 forall 'k.
 impl FnCall['k] {
     // The called symbol: an extern's own name, else the signature's.
-    fn call_name(self) -> Text['k] {
+    fn call_name(self) -> Span['k] {
         match self.sig.decl {
             Option::Some(d) => match d.node {
                 Named::Extern(x) => x.name,
@@ -65,11 +71,11 @@ impl FnCall['k] {
     }
 
     // In signature order; Ignored retains a function value's brand binder.
-    fn targs(self, &cx: Cx!['k]) -> Seq[Type['k], 'k] {
-        let out: Seq[Type['k], 'k] = Seq::new(&cx);
+    fn targs(self, &cx: Domain!['k]) -> ArenaVec[Type['k], 'k] {
+        let out: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < self.sig.params.len(&cx) {
-            out.push(&cx, self.sub.get_or(&cx, self.sig.params.get(&cx, i).name, Type::Ignored));
+            out.push(&cx, self.sub.get_or(&cx, self.sig.params.at(&cx, i).name, Type::Ignored));
             i = i + 1usize;
         }
         out
@@ -78,9 +84,9 @@ impl FnCall['k] {
 
 forall 'k.
 exposed struct TraitCall {
-    trait_name: Text['k],
-    method: Text['k],
-    targs: Seq[Type['k], 'k],
+    trait_name: Span['k],
+    method: Span['k],
+    targs: ArenaVec[Type['k], 'k],
     receiver: Option[Receiver['k]],
 }
 
@@ -90,21 +96,21 @@ exposed enum Callee {
     Fn(FnCall['k]),
     Trait(TraitCall['k]),
     // a function value, with its brand instantiation
-    Value(Map[Text['k], Type['k], 'k]),
+    Value(ArenaMap[Span['k], Type['k], 'k]),
     Closure,
-    Variant(Text['k]),
+    Variant(Span['k]),
     Tuple,
-    Builtin(Text['k]),
+    Builtin(Span['k]),
     Alloca(Type['k]),
     // a pointer method, and its receiver
-    Pointer(Text['k], Expr['k]),
+    Pointer(Span['k], Expr['k]),
     FStringWrite(S::FStr['k]),
 }
 
 // One captured binding, in first-use order.
 forall 'k.
 exposed struct Capture {
-    name: Text['k],
+    name: Span['k],
     binder: u32,
 }
 
@@ -112,46 +118,46 @@ exposed struct Capture {
 forall 'k.
 exposed struct Results {
     // expressions, patterns and variant cases (a case's is its payload type)
-    types: Map[u32, Type['k], 'k],
+    types: ArenaMap[u32, Type['k], 'k],
     // the binding a local path uses, or a var, const, for, foreach item or pattern binds
-    binders: Map[u32, u32, 'k],
+    binders: ArenaMap[u32, u32, 'k],
     // constant paths and local consts
-    folded: Map[u32, ConstValue['k], 'k],
+    folded: ArenaMap[u32, ConstValue['k], 'k],
     // paths and calls
-    calls: Map[u32, Callee['k], 'k],
+    calls: ArenaMap[u32, Callee['k], 'k],
     // sizeof
-    targets: Map[u32, Type['k], 'k],
+    targets: ArenaMap[u32, Type['k], 'k],
     // struct literals: shorthand fields' binding ids, and the spread's
-    field_ids: Map[u32, Map[Text['k], u32, 'k], 'k],
-    spread_ids: Map[u32, u32, 'k],
+    field_ids: ArenaMap[u32, ArenaMap[Span['k], u32, 'k], 'k],
+    spread_ids: ArenaMap[u32, u32, 'k],
     // variant cases: payload binding ids, none for each `_`
-    case_binders: Map[u32, Seq[Option[u32], 'k], 'k],
+    case_binders: ArenaMap[u32, ArenaVec[Option[u32], 'k], 'k],
     // matches: whether the scrutinee lends a place
-    lent: Map[u32, bool, 'k],
+    lent: ArenaMap[u32, bool, 'k],
     // functions and closures
-    param_ids: Map[u32, Seq[u32, 'k], 'k],
+    param_ids: ArenaMap[u32, ArenaVec[u32, 'k], 'k],
     // closures and foreach bodies
-    captures: Map[u32, Seq[Capture['k], 'k], 'k],
+    captures: ArenaMap[u32, ArenaVec[Capture['k], 'k], 'k],
     // packs
-    witnesses: Map[u32, Seq[Type['k], 'k], 'k],
+    witnesses: ArenaMap[u32, ArenaVec[Type['k], 'k], 'k],
     // `?`: option or result
-    try_kinds: Map[u32, Text['k], 'k],
+    try_kinds: ArenaMap[u32, Span['k], 'k],
     // `let exists`: the opened brands' labels
-    opened: Map[u32, Seq[Text['k], 'k], 'k],
+    opened: ArenaMap[u32, ArenaVec[Span['k], 'k], 'k],
     // for loops: the `next` result type, and the Iterator call
-    options: Map[u32, Type['k], 'k],
-    next_calls: Map[u32, TraitCall['k], 'k],
+    options: ArenaMap[u32, Type['k], 'k],
+    next_calls: ArenaMap[u32, TraitCall['k], 'k],
     // struct patterns with `..rest`
-    rest_ids: Map[u32, u32, 'k],
+    rest_ids: ArenaMap[u32, u32, 'k],
 }
 
 forall 'k.
-fn new_results(&cx: Cx!['k]) -> Results['k] {
+fn new_results(&cx: Domain!['k]) -> Results['k] {
     Results.{
-        types: Map::new(&cx), binders: Map::new(&cx), folded: Map::new(&cx), calls: Map::new(&cx), targets: Map::new(&cx),
-        field_ids: Map::new(&cx), spread_ids: Map::new(&cx), case_binders: Map::new(&cx), lent: Map::new(&cx),
-        param_ids: Map::new(&cx), captures: Map::new(&cx), witnesses: Map::new(&cx), try_kinds: Map::new(&cx),
-        opened: Map::new(&cx), options: Map::new(&cx), next_calls: Map::new(&cx), rest_ids: Map::new(&cx),
+        types: ArenaMap::new(&cx), binders: ArenaMap::new(&cx), folded: ArenaMap::new(&cx), calls: ArenaMap::new(&cx), targets: ArenaMap::new(&cx),
+        field_ids: ArenaMap::new(&cx), spread_ids: ArenaMap::new(&cx), case_binders: ArenaMap::new(&cx), lent: ArenaMap::new(&cx),
+        param_ids: ArenaMap::new(&cx), captures: ArenaMap::new(&cx), witnesses: ArenaMap::new(&cx), try_kinds: ArenaMap::new(&cx),
+        opened: ArenaMap::new(&cx), options: ArenaMap::new(&cx), next_calls: ArenaMap::new(&cx), rest_ids: ArenaMap::new(&cx),
     }
 }
 
@@ -160,8 +166,8 @@ fn new_results(&cx: Cx!['k]) -> Results['k] {
 // The fields a `..rest` pattern left over: known once the type matched against is.
 forall 'k.
 exposed struct Bundle {
-    types: Map[Text['k], Type['k], 'k],
-    filled: Cell[bool, 'k],
+    types: ArenaMap[Span['k], Type['k], 'k],
+    filled: Ref[bool, 'k],
 }
 
 forall 'k.
@@ -179,27 +185,27 @@ exposed struct Local {
 // A lexical scope: the names bound in it, and the brands a `let exists` opened in it.
 forall 'k.
 exposed struct Level {
-    names: Map[Text['k], Local['k], 'k],
+    names: ArenaMap[Span['k], Local['k], 'k],
     // source spelling -> unique witness
-    brands: Map[Text['k], Text['k], 'k],
+    brands: ArenaMap[Span['k], Span['k], 'k],
     // includes witnesses whose spelling was shadowed
-    opened: Set[Text['k], 'k],
+    opened: ArenaSet[Span['k], 'k],
 }
 
 forall 'k.
-fn new_level(&cx: Cx!['k]) -> Level['k] {
-    Level.{ names: Map::new(&cx), brands: Map::new(&cx), opened: Set::new(&cx) }
+fn new_level(&cx: Domain!['k]) -> Level['k] {
+    Level.{ names: ArenaMap::new(&cx), brands: ArenaMap::new(&cx), opened: ArenaSet::new(&cx) }
 }
 
 // A closure or foreach body being walked: the outer locals it captures, in first-use order.
 forall 'k.
 exposed struct Frame {
-    locals: Seq[(Text['k], Local['k]), 'k],
+    locals: ArenaVec[(Span['k], Local['k]), 'k],
 }
 
 forall 'k.
-fn new_frame(&cx: Cx!['k]) -> Frame['k] {
-    Frame.{ locals: Seq::new(&cx) }
+fn new_frame(&cx: Domain!['k]) -> Frame['k] {
+    Frame.{ locals: ArenaVec::new(&cx) }
 }
 
 // ------------------------------------------------------------- the solver --
@@ -209,7 +215,7 @@ fn new_frame(&cx: Cx!['k]) -> Frame['k] {
 forall 'k.
 exposed enum Ready {
     Head(Type['k]),
-    Ground(Seq[Type['k], 'k], usize),
+    Ground(ArenaVec[Type['k], 'k], usize),
     Filled(Bundle['k]),
     Both(Type['k], Type['k]),
 }
@@ -218,21 +224,21 @@ forall 'k.
 exposed struct Elements {
     array: bool,
     ty: Type['k],
-    types: Seq[Type['k], 'k],
+    types: ArenaVec[Type['k], 'k],
 }
 
 forall 'k.
 exposed struct Fields {
     ty: Type['k],
-    metas: Map[Text['k], Type['k], 'k],
+    metas: ArenaMap[Span['k], Type['k], 'k],
     bundle: Bundle['k],
 }
 
 forall 'k.
 exposed struct Spread {
-    spread: Text['k],
-    fields: Map[Text['k], Type['k], 'k],
-    given: Set[Text['k], 'k],
+    spread: Span['k],
+    fields: ArenaMap[Span['k], Type['k], 'k],
+    given: ArenaSet[Span['k], 'k],
     bundle: Bundle['k],
 }
 
@@ -240,7 +246,7 @@ forall 'k.
 exposed struct PackWait {
     result: Type['k],
     value: Type['k],
-    labels: Seq[Text['k], 'k],
+    labels: ArenaVec[Span['k], 'k],
     pos: Pos,
 }
 
@@ -255,7 +261,7 @@ exposed struct TryWait {
 // `owner.name` (a field) or `owner.N` (an index).
 forall 'k.
 exposed struct Component {
-    field: Option[Text['k]],
+    field: Option[Span['k]],
     index: usize,
     owner: Type['k],
     result: Type['k],
@@ -265,7 +271,7 @@ forall 'k.
 exposed struct CallWait {
     call: S::Call['k],
     callee: Type['k],
-    got: Seq[Option[(Type['k], bool)], 'k],
+    got: ArenaVec[Option[(Type['k], bool)], 'k],
     result: Type['k],
 }
 
@@ -273,17 +279,17 @@ forall 'k.
 exposed struct MethodWait {
     call: S::Call['k],
     receiver: Type['k],
-    name: Text['k],
+    name: Span['k],
     actual: Receiver['k],
-    got: Seq[Option[(Type['k], bool)], 'k],
+    got: ArenaVec[Option[(Type['k], bool)], 'k],
     result: Type['k],
 }
 
 forall 'k.
 exposed struct PointerWait {
-    name: Text['k],
+    name: Span['k],
     pointer: Type['k],
-    operands: Seq[Type['k], 'k],
+    operands: ArenaVec[Type['k], 'k],
     out: Type['k],
 }
 
@@ -291,11 +297,11 @@ exposed struct PointerWait {
 forall 'k.
 exposed enum Action {
     Copy(Type['k]),
-    Discharge(Text['k], Seq[Type['k], 'k], usize),
+    Discharge(Span['k], ArenaVec[Type['k], 'k], usize),
     Elements(Elements['k]),
     Fields(Fields['k]),
     // op, operand, unary
-    Primitive(Text['k], Type['k], bool),
+    Primitive(Span['k], Type['k], bool),
     // result, element
     Fill(Type['k], Type['k]),
     Spread(Spread['k]),
@@ -330,13 +336,13 @@ forall 'k.
 exposed enum Lookup {
     Pointer,
     Method(Sig['k]),
-    Trait(C::Trait['k], Seq[Type['k], 'k]),
+    Trait(C::Trait['k], ArenaVec[Type['k], 'k]),
 }
 
 // ---------------------------------------------------------------- helpers --
 
 forall 'k.
-fn is_never(&cx: Cx!['k], t: Type['k]) -> bool {
+fn is_never(&cx: Domain!['k], t: Type['k]) -> bool {
     match prune(&cx, t) {
         Type::Never => true,
         _ => false,
@@ -344,7 +350,7 @@ fn is_never(&cx: Cx!['k], t: Type['k]) -> bool {
 }
 
 forall 'k.
-fn is_unsolved(&cx: Cx!['k], t: Type['k]) -> bool {
+fn is_unsolved(&cx: Domain!['k], t: Type['k]) -> bool {
     match prune(&cx, t) {
         Type::Meta(_m) => true,
         _ => false,
@@ -352,10 +358,10 @@ fn is_unsolved(&cx: Cx!['k], t: Type['k]) -> bool {
 }
 
 forall 'k.
-fn all_settled(&cx: Cx!['k], ts: Seq[Type['k], 'k]) -> bool {
+fn all_settled(&cx: Domain!['k], ts: ArenaVec[Type['k], 'k]) -> bool {
     var i = 0usize;
     while i < ts.len(&cx) {
-        if !settled(&cx, ts.get(&cx, i)) {
+        if !settled(&cx, ts.at(&cx, i)) {
             return false;
         }
         i = i + 1usize;
@@ -364,10 +370,10 @@ fn all_settled(&cx: Cx!['k], ts: Seq[Type['k], 'k]) -> bool {
 }
 
 forall 'k.
-fn members_settled(&cx: Cx!['k], ms: Seq[Member['k], 'k]) -> bool {
+fn members_settled(&cx: Domain!['k], ms: ArenaVec[Member['k], 'k]) -> bool {
     var i = 0usize;
     while i < ms.len(&cx) {
-        if !settled(&cx, ms.get(&cx, i).type) {
+        if !settled(&cx, ms.at(&cx, i).type) {
             return false;
         }
         i = i + 1usize;
@@ -377,25 +383,25 @@ fn members_settled(&cx: Cx!['k], ms: Seq[Member['k], 'k]) -> bool {
 
 // `ty` mentions no unsolved metavariable (`unify::ground`, without building the zonked type).
 forall 'k.
-fn settled(&cx: Cx!['k], ty: Type['k]) -> bool {
+fn settled(&cx: Domain!['k], ty: Type['k]) -> bool {
     match prune(&cx, ty) {
         Type::Meta(_m) => false,
-        Type::Ptr(inner) => settled(&cx, inner.get(&cx)),
-        Type::Brand(inner) => settled(&cx, inner.get(&cx)),
-        Type::Array(elem, _n) => settled(&cx, elem.get(&cx)),
+        Type::Ptr(inner) => settled(&cx, inner.copy(&cx)),
+        Type::Brand(inner) => settled(&cx, inner.copy(&cx)),
+        Type::Array(elem, _n) => settled(&cx, elem.copy(&cx)),
         Type::Tuple(elems) => all_settled(&cx, elems),
         Type::Named(_name, args) => all_settled(&cx, args),
         Type::Struct(fields) => members_settled(&cx, fields),
         Type::Enum(variants) => members_settled(&cx, variants),
-        Type::Exists(_b, body) => settled(&cx, body.get(&cx)),
-        Type::Foreach(f) => settled(&cx, f.source.get(&cx)) && settled(&cx, f.body.get(&cx)),
-        Type::Fn(f) => all_settled(&cx, f.params) && settled(&cx, f.ret.get(&cx)),
+        Type::Exists(_b, body) => settled(&cx, body.copy(&cx)),
+        Type::Foreach(f) => settled(&cx, f.source.copy(&cx)) && settled(&cx, f.body.copy(&cx)),
+        Type::Fn(f) => all_settled(&cx, f.params) && settled(&cx, f.ret.copy(&cx)),
         _ => true,
     }
 }
 
 forall 'k.
-fn meta_of(&cx: Cx!['k], kind: Kind) -> Type['k] {
+fn meta_of(&cx: Domain!['k], kind: Kind) -> Type['k] {
     match kind {
         Kind::Brand => Type::Meta.(Meta::new(&cx, MetaKind::Brand)),
         _ => Type::Meta.(Meta::new(&cx, MetaKind::Type)),
@@ -403,7 +409,7 @@ fn meta_of(&cx: Cx!['k], kind: Kind) -> Type['k] {
 }
 
 forall 'k.
-fn new_meta(&cx: Cx!['k]) -> Type['k] {
+fn new_meta(&cx: Domain!['k]) -> Type['k] {
     Type::Meta.(Meta::new(&cx, MetaKind::Type))
 }
 
@@ -422,15 +428,10 @@ fn is_copy_kind(kind: Kind) -> bool {
 }
 
 forall 'k.
-fn text_before(&cx: Cx!['k], a: Text['k], b: Text['k]) -> bool {
-    a.compare(&cx, b) < 0
-}
-
-forall 'k.
-fn has_args(&cx: Cx!['k], path: S::Path['k]) -> bool {
+fn has_args(&cx: Domain!['k], path: S::Path['k]) -> bool {
     var i = 0usize;
     while i < path.segments.len(&cx) {
-        if !path.segments.get(&cx, i).args.is_empty(&cx) {
+        if !path.segments.at(&cx, i).args.is_empty(&cx) {
             return true;
         }
         i = i + 1usize;
@@ -439,21 +440,21 @@ fn has_args(&cx: Cx!['k], path: S::Path['k]) -> bool {
 }
 
 forall 'k.
-fn joined_names(&cx: Cx!['k], names: Seq[Text['k], 'k]) -> Text['k] {
+fn joined_names(&cx: Domain!['k], names: ArenaVec[Span['k], 'k]) -> Span['k] {
     var out = Buffer::new();
     var i = 0usize;
     while i < names.len(&cx) {
         if i > 0usize {
             out = out.push_static("::");
         }
-        out = out.push_bytes(&cx, names.get(&cx, i));
+        out = out.push_bytes(&cx, names.at(&cx, i));
         i = i + 1usize;
     }
-    text_of(&cx, out)
+    out.save(&cx)
 }
 
 forall 'k.
-fn is_pointer_method(&cx: Cx!['k], name: Text['k]) -> bool {
+fn is_pointer_method(&cx: Domain!['k], name: Span['k]) -> bool {
     name.is(&cx, "load") || name.is(&cx, "load_volatile") || name.is(&cx, "store") || name.is(&cx, "store_volatile") || name.is(&cx, "atomic_load")
         || name.is(&cx, "atomic_store") || name.is(&cx, "compare_exchange") || name.is(&cx, "atomic_swap") || name.is(&cx, "fetch_add")
         || name.is(&cx, "fetch_sub") || name.is(&cx, "fetch_and") || name.is(&cx, "fetch_or") || name.is(&cx, "fetch_xor")
@@ -461,23 +462,23 @@ fn is_pointer_method(&cx: Cx!['k], name: Text['k]) -> bool {
 
 // A pointer operation's parameter types, `T` for the pointee and `O` for a memory ordering.
 forall 'k.
-fn pointer_params(&cx: Cx!['k], name: Text['k]) -> Text['k] {
+fn pointer_params(&cx: Domain!['k], name: Span['k]) -> Span['k] {
     if name.is(&cx, "load") || name.is(&cx, "load_volatile") {
-        text(&cx, "")
+        Span::from_static(&cx, "")
     } else if name.is(&cx, "store") || name.is(&cx, "store_volatile") {
-        text(&cx, "T")
+        Span::from_static(&cx, "T")
     } else if name.is(&cx, "atomic_load") {
-        text(&cx, "O")
+        Span::from_static(&cx, "O")
     } else if name.is(&cx, "compare_exchange") {
-        text(&cx, "TTOO")
+        Span::from_static(&cx, "TTOO")
     } else {
-        text(&cx, "TO")
+        Span::from_static(&cx, "TO")
     }
 }
 
 // Its result: `T`, `U` for `()`, or `B` for `(T, bool)`.
 forall 'k.
-fn pointer_result(&cx: Cx!['k], name: Text['k]) -> u8 {
+fn pointer_result(&cx: Domain!['k], name: Span['k]) -> u8 {
     if name.is(&cx, "store") || name.is(&cx, "store_volatile") || name.is(&cx, "atomic_store") {
         b'U'
     } else if name.is(&cx, "compare_exchange") {
@@ -489,7 +490,7 @@ fn pointer_result(&cx: Cx!['k], name: Text['k]) -> u8 {
 
 // A builtin's number of value arguments, or none for an unknown builtin.
 forall 'k.
-fn builtin_arity(&cx: Cx!['k], name: Text['k]) -> Option[usize] {
+fn builtin_arity(&cx: Domain!['k], name: Span['k]) -> Option[usize] {
     if name.is(&cx, "fresh") || name.is(&cx, "static_brand") || name.is(&cx, "alloca") {
         Option::Some.(0usize)
     } else if name.is(&cx, "enum_variant") || name.is(&cx, "fence") || name.is(&cx, "load_volatile") {
@@ -502,13 +503,13 @@ fn builtin_arity(&cx: Cx!['k], name: Text['k]) -> Option[usize] {
 }
 
 forall 'k.
-fn is_comparison(&cx: Cx!['k], op: Text['k]) -> bool {
+fn is_comparison(&cx: Domain!['k], op: Span['k]) -> bool {
     op.is(&cx, "==") || op.is(&cx, "!=") || op.is(&cx, "<") || op.is(&cx, "<=") || op.is(&cx, ">") || op.is(&cx, ">=")
 }
 
 forall 'k.
-fn has_place(&cx: Cx!['k], places: Seq[usize, 'k], k: usize) -> bool {
-    places.has(&cx, k)
+fn has_place(&cx: Domain!['k], places: ArenaVec[usize, 'k], k: usize) -> bool {
+    places.contains(&cx, k)
 }
 
 // ------------------------------------------------------------- inference --
@@ -518,30 +519,30 @@ exposed struct Infer {
     r: Resolver['k],
     sigs: Signatures['k],
     types: Types['k],
-    decl_of: Map[Text['k], Decl['k], 'k],
+    decl_of: ArenaMap[Span['k], Decl['k], 'k],
     // trait -> its number of input parameters
-    inputs: Map[Text['k], usize, 'k],
-    instances: Map[Text['k], Seq[InstanceSig['k], 'k], 'k],
+    inputs: ArenaMap[Span['k], usize, 'k],
+    instances: ArenaMap[Span['k], ArenaVec[InstanceSig['k], 'k], 'k],
     // module -> the ids of the traits visible in it
-    visible: Map[ModuleId['k], Set[u32, 'k], 'k],
+    visible: ArenaMap[ModuleId['k], ArenaSet[u32, 'k], 'k],
     // source binding identities, and the numbers of generated names
-    ids: Cell[u32, 'k],
+    ids: Ref[u32, 'k],
     counter: Fresh['k],
     out: Results['k],
     // inference-only flags: bare function names bound without an annotation, calls whose receiver
     // `&` lends
-    generic: Set[u32, 'k],
-    lend_marked: Set[u32, 'k],
+    generic: ArenaSet[u32, 'k],
+    lend_marked: ArenaSet[u32, 'k],
 }
 
 forall 'k.
 impl Infer['k] {
-    fn new(&cx: Cx!['k], r: Resolver['k], sigs: Signatures['k], counter: Fresh['k]) -> Infer['k] {
-        let headers: Seq[(Premise['k], Seq[Premise['k], 'k], Pos), 'k] = Seq::new(&cx);
-        let ranges: Seq[(Premise['k], Seq[Param['k], 'k], Pos), 'k] = Seq::new(&cx);
+    fn new(&cx: Domain!['k], r: Resolver['k], sigs: Signatures['k], counter: Fresh['k]) -> Infer['k] {
+        let headers: ArenaVec[(Premise['k], ArenaVec[Premise['k], 'k], Pos), 'k] = ArenaVec::new(&cx);
+        let ranges: ArenaVec[(Premise['k], ArenaVec[Param['k], 'k], Pos), 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < sigs.instances.len(&cx) {
-            let (inst, _item, _home) = sigs.instances.get(&cx, i);
+            let (inst, _item, _home) = sigs.instances.at(&cx, i);
             let head = Premise.{ trait_name: inst.trait_name, args: inst.head };
             headers.push(&cx, (head, inst.premises, inst.pos));
             ranges.push(&cx, (head, inst.params, inst.pos));
@@ -549,24 +550,24 @@ impl Infer['k] {
         }
         check_instance_termination(&cx, headers);
         check_coherence(&cx, ranges, counter);
-        let program = Program.{ types: sigs.types, funs: Map::new(&cx), externs: Map::new(&cx), datas: Map::new(&cx), traits: sigs.traits, instances: Map::new(&cx) };
+        let program = Program.{ types: sigs.types, funs: ArenaMap::new(&cx), externs: ArenaMap::new(&cx), datas: ArenaMap::new(&cx), traits: sigs.traits, instances: ArenaMap::new(&cx) };
         let inf = Infer.{
-            r, sigs, types: Types::new(&cx, program, counter), decl_of: Map::new(&cx), inputs: Map::new(&cx), instances: Map::new(&cx),
-            visible: Map::new(&cx), ids: Cell::new(&cx, 0u32), counter, out: new_results(&cx), generic: Set::new(&cx), lend_marked: Set::new(&cx),
+            r, sigs, types: Types::new(&cx, program, counter), decl_of: ArenaMap::new(&cx), inputs: ArenaMap::new(&cx), instances: ArenaMap::new(&cx),
+            visible: ArenaMap::new(&cx), ids: Ref::new(&cx, 0u32), counter, out: new_results(&cx), generic: ArenaSet::new(&cx), lend_marked: ArenaSet::new(&cx),
         };
         let scopes = r.scopes.values(&cx);
         i = 0usize;
         while i < scopes.len(&cx) {
-            let decls = scopes.get(&cx, i).decls.values(&cx);
+            let decls = scopes.at(&cx, i).decls.values(&cx);
             var k = 0usize;
             while k < decls.len(&cx) {
-                let decl = decls.get(&cx, k);
+                let decl = decls.at(&cx, k);
                 if decl.kind.is(&cx, "struct") || decl.kind.is(&cx, "enum") || decl.kind.is(&cx, "tuple") || decl.kind.is(&cx, "trait") {
-                    inf.decl_of.set(&cx, sigs.name(&cx, decl), decl);
+                    inf.decl_of.insert(&cx, sigs.name(&cx, decl), decl);
                 }
                 let unit = match decl.node {
                     Named::Trait(t) => if decl.kind.is(&cx, "trait") {
-                        inf.inputs.set(&cx, sigs.name(&cx, decl), match t.quantifier {
+                        inf.inputs.insert(&cx, sigs.name(&cx, decl), match t.quantifier {
                             Option::Some(f) => f.params.len(&cx),
                             Option::None => 1usize,
                         });
@@ -579,27 +580,27 @@ impl Infer['k] {
         }
         i = 0usize;
         while i < sigs.instances.len(&cx) {
-            let (inst, _item, _home) = sigs.instances.get(&cx, i);
+            let (inst, _item, _home) = sigs.instances.at(&cx, i);
             let unit = match inf.instances.get(&cx, inst.trait_name) {
                 Option::Some(list) => list.push(&cx, inst),
-                Option::None => inf.instances.set(&cx, inst.trait_name, Seq::one(&cx, inst)),
+                Option::None => { inf.instances.insert(&cx, inst.trait_name, ArenaVec::one(&cx, inst)); },
             };
             i = i + 1usize;
         }
         inf
     }
 
-    fn next_id(self, &cx: Cx!['k]) -> u32 {
-        let n = self.ids.get(&cx);
+    fn next_id(self, &cx: Domain!['k]) -> u32 {
+        let n = self.ids.copy(&cx);
         self.ids.set(&cx, n + 1u32);
         n
     }
 
-    fn run(self, &cx: Cx!['k]) {
+    fn run(self, &cx: Domain!['k]) {
         let sigs = self.sigs.sigs.values(&cx);
         var i = 0usize;
         while i < sigs.len(&cx) {
-            let sig = sigs.get(&cx, i);
+            let sig = sigs.at(&cx, i);
             let unit = match sig.decl {
                 Option::Some(decl) => match decl.node {
                     Named::Fn(node) => if node.body.is_some() {
@@ -615,12 +616,12 @@ impl Infer['k] {
         }
         i = 0usize;
         while i < self.sigs.instances.len(&cx) {
-            let (inst, item, home) = self.sigs.instances.get(&cx, i);
+            let (inst, item, home) = self.sigs.instances.at(&cx, i);
             var k = 0usize;
             while k < inst.methods.len(&cx) {
-                let node = item.methods.get(&cx, k);
+                let node = item.methods.at(&cx, k);
                 self.r.locate(&cx, home, node.pos);
-                self.function(&cx, inst.methods.get(&cx, k), node, home, Option::Some.(inst));
+                self.function(&cx, inst.methods.at(&cx, k), node, home, Option::Some.(inst));
                 self.r.unlocate(&cx);
                 k = k + 1usize;
             }
@@ -628,33 +629,33 @@ impl Infer['k] {
         }
     }
 
-    fn function(self, &cx: Cx!['k], sig: Sig['k], node: S::Fn['k], home: ModuleId['k], inst: Option[InstanceSig['k]]) {
-        let kinds: Map[Text['k], Kind, 'k] = Map::new(&cx);
+    fn function(self, &cx: Domain!['k], sig: Sig['k], node: S::Fn['k], home: ModuleId['k], inst: Option[InstanceSig['k]]) {
+        let kinds: ArenaMap[Span['k], Kind, 'k] = ArenaMap::new(&cx);
         var i = 0usize;
         while i < sig.params.len(&cx) {
-            kinds.set(&cx, sig.params.get(&cx, i).name, sig.params.get(&cx, i).kind);
+            kinds.insert(&cx, sig.params.at(&cx, i).name, sig.params.at(&cx, i).kind);
             i = i + 1usize;
         }
-        let assumptions = sig.premises.copy(&cx);
+        let assumptions = sig.premises.clone(&cx);
         let unit = match inst {
             Option::Some(x) => assumptions.push(&cx, Premise.{ trait_name: x.trait_name, args: x.head }),
             Option::None => (),
         };
         let level = new_level(&cx);
         let b = Body.{
-            inf: self, home, sig, kinds, assumptions, waiting: Seq::new(&cx), defaults: Seq::new(&cx), recorded: Seq::new(&cx),
-            literals: Seq::new(&cx), brand_checks: Seq::new(&cx), solving: Cell::new(&cx, false), returns: Seq::one(&cx, sig.ret),
-            scopes: Seq::one(&cx, level), frames: Seq::one(&cx, new_frame(&cx)), allowed: Cell::new(&cx, Option::None),
+            inf: self, home, sig, kinds, assumptions, waiting: ArenaVec::new(&cx), defaults: ArenaVec::new(&cx), recorded: ArenaVec::new(&cx),
+            literals: ArenaVec::new(&cx), brand_checks: ArenaVec::new(&cx), solving: Ref::new(&cx, false), returns: ArenaVec::one(&cx, sig.ret),
+            scopes: Ref::new(&cx, List::Empty.cons(&cx, level)), frames: ArenaVec::one(&cx, new_frame(&cx)), allowed: Ref::new(&cx, Option::None),
         };
-        let ids: Seq[u32, 'k] = Seq::new(&cx);
+        let ids: ArenaVec[u32, 'k] = ArenaVec::new(&cx);
         i = 0usize;
         while i < sig.pnames.len(&cx) {
-            let local = Local.{ type: sig.ptypes.get(&cx, i), mutable: has_place(&cx, sig.places, i), rest: Option::None, depth: 0usize, id: self.next_id(&cx) };
-            level.names.set(&cx, sig.pnames.get(&cx, i), local);
+            let local = Local.{ type: sig.ptypes.at(&cx, i), mutable: has_place(&cx, sig.places, i), rest: Option::None, depth: 0usize, id: self.next_id(&cx) };
+            level.names.insert(&cx, sig.pnames.at(&cx, i), local);
             ids.push(&cx, local.id);
             i = i + 1usize;
         }
-        self.out.param_ids.set(&cx, node.id, ids);
+        self.out.param_ids.insert(&cx, node.id, ids);
         let body = match node.body {
             Option::Some(block) => block,
             Option::None => return,
@@ -666,31 +667,31 @@ impl Infer['k] {
     // The traits a name in `home`'s scope resolves to: declared, imported by name or glob, or
     // re-exported. A glob's names are those its source module declares, imports or exports, and every
     // trait's own name.
-    fn visible_traits(self, &cx: Cx!['k], home: ModuleId['k]) -> Set[u32, 'k] {
+    fn visible_traits(self, &cx: Domain!['k], home: ModuleId['k]) -> ArenaSet[u32, 'k] {
         let unit = match self.visible.get(&cx, home) {
             Option::Some(found) => return found,
             Option::None => (),
         };
         let scope = self.r.scopes.at(&cx, home);
-        let names: Seq[Text['k], 'k] = scope.decls.keys(&cx);
+        let names: ArenaVec[Span['k], 'k] = scope.decls.keys(&cx);
         names.append(&cx, scope.imports.keys(&cx));
         let decls = self.decl_of.values(&cx);
         var i = 0usize;
         while i < decls.len(&cx) {
-            if decls.get(&cx, i).kind.is(&cx, "trait") {
-                names.push(&cx, decls.get(&cx, i).name);
+            if decls.at(&cx, i).kind.is(&cx, "trait") {
+                names.push(&cx, decls.at(&cx, i).name);
             }
             i = i + 1usize;
         }
         i = 0usize;
         while i < scope.globs.len(&cx) {
-            let unit = match self.r.lookup(&cx, home, scope.globs.get(&cx, i), no_pos()) {
+            let unit = match self.r.lookup(&cx, home, scope.globs.at(&cx, i), no_pos()) {
                 Result::Ok(t) => match t {
                     Target::Module(m) => match self.r.scopes.get(&cx, m) {
                         Option::Some(other) => {
                             names.append(&cx, other.decls.keys(&cx));
                             names.append(&cx, other.imports.keys(&cx));
-                            names.append(&cx, other.exports.items(&cx));
+                            names.append(&cx, other.exports.keys(&cx));
                         },
                         Option::None => (),
                     },
@@ -700,17 +701,17 @@ impl Infer['k] {
             };
             i = i + 1usize;
         }
-        let found: Set[u32, 'k] = Set::new(&cx);
-        let tried: Set[Text['k], 'k] = Set::new(&cx);
+        let found: ArenaSet[u32, 'k] = ArenaSet::new(&cx);
+        let tried: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
         i = 0usize;
         while i < names.len(&cx) {
-            let name = names.get(&cx, i);
-            if !tried.has(&cx, name) {
-                tried.add(&cx, name);
-                let unit = match self.r.lookup(&cx, home, Seq::one(&cx, name), no_pos()) {
+            let name = names.at(&cx, i);
+            if !tried.contains(&cx, name) {
+                tried.insert(&cx, name);
+                let unit = match self.r.lookup(&cx, home, ArenaVec::one(&cx, name), no_pos()) {
                     Result::Ok(t) => match t {
                         Target::Decl(d) => if d.kind.is(&cx, "trait") {
-                            found.add(&cx, d.id);
+                            found.insert(&cx, d.id);
                         },
                         _ => (),
                     },
@@ -719,14 +720,14 @@ impl Infer['k] {
             }
             i = i + 1usize;
         }
-        self.visible.set(&cx, home, found);
+        self.visible.insert(&cx, home, found);
         found
     }
 
     // A blanket impl's method is found from a package that is the impl's or depends on it directly,
     // when every trait bounding the impl's type parameter is visible there (and it has one).
     // `package` is `target` or depends on it, directly or through other packages.
-    fn depends_on(self, &cx: Cx!['k], package: usize, target: usize) -> bool {
+    fn depends_on(self, &cx: Domain!['k], package: usize, target: usize) -> bool {
         // The walk's worklist and the packages it has seen are its own, freed when it ends.
         var seen = OwnedMap::new[usize, bool]();
         var pending = OwnedVec::new[usize]().push(package);
@@ -741,10 +742,10 @@ impl Infer['k] {
                     } else {
                         match &seen.insert(p, true) {
                             Found::Missing => {
-                                let deps = self.r.packages.get(&cx, p).deps;
+                                let deps = self.r.packages.at(&cx, p).deps;
                                 var i = 0usize;
                                 while i < deps.positions(&cx) {
-                                    match deps.entry(&cx, i) {
+                                    match deps.key_at(&cx, i) {
                                         Option::Some(name) => {
                                             pending = pending.push(deps.at(&cx, name));
                                         },
@@ -767,7 +768,7 @@ impl Infer['k] {
         found
     }
 
-    fn blanket_visible(self, &cx: Cx!['k], method: Decl['k], home: ModuleId['k], visible: Set[u32, 'k]) -> bool {
+    fn blanket_visible(self, &cx: Domain!['k], method: Decl['k], home: ModuleId['k], visible: ArenaSet[u32, 'k]) -> bool {
         if !self.depends_on(&cx, home.package, method.home.package) {
             return false;
         }
@@ -776,7 +777,7 @@ impl Infer['k] {
             Option::None => return false,
         };
         let param = match impl_block.type {
-            S::Type::Name(n) => n.path.get(&cx, 0usize),
+            S::Type::Name(n) => n.path.at(&cx, 0usize),
             _ => return false,
         };
         let premises = match impl_block.quantifier {
@@ -786,12 +787,12 @@ impl Infer['k] {
         var bounds = 0usize;
         var i = 0usize;
         while i < premises.len(&cx) {
-            let args = premises.get(&cx, i).args;
+            let args = premises.at(&cx, i).args;
             let bounding = if args.args.is_empty(&cx) {
                 false
             } else {
-                match args.args.get(&cx, 0usize) {
-                    S::Type::Name(n) => n.path.len(&cx) == 1usize && n.path.get(&cx, 0usize).eq(&cx, param),
+                match args.args.at(&cx, 0usize) {
+                    S::Type::Name(n) => n.path.len(&cx) == 1usize && n.path.at(&cx, 0usize).eq(&cx, param),
                     _ => false,
                 }
             };
@@ -799,7 +800,7 @@ impl Infer['k] {
                 let unit = match self.r.refs.get(&cx, args.id) {
                     Option::Some(r) => match r {
                         NameRef::Decl(d) => {
-                            if !visible.has(&cx, d.id) {
+                            if !visible.contains(&cx, d.id) {
                                 return false;
                             }
                             bounds = bounds + 1usize;
@@ -821,76 +822,77 @@ exposed struct Body {
     inf: Infer['k],
     home: ModuleId['k],
     sig: Sig['k],
-    kinds: Map[Text['k], Kind, 'k],
-    assumptions: Seq[Premise['k], 'k],
-    waiting: Seq[Waiter['k], 'k],
-    defaults: Seq[PackWait['k], 'k],
-    recorded: Seq[u32, 'k],
-    literals: Seq[Meta['k], 'k],
-    brand_checks: Seq[(Type['k], Set[Text['k], 'k], Pos), 'k],
-    solving: Cell[bool, 'k],
-    returns: Seq[Type['k], 'k],
-    scopes: Seq[Level['k], 'k],
-    frames: Seq[Frame['k], 'k],
+    kinds: ArenaMap[Span['k], Kind, 'k],
+    assumptions: ArenaVec[Premise['k], 'k],
+    waiting: ArenaVec[Waiter['k], 'k],
+    defaults: ArenaVec[PackWait['k], 'k],
+    recorded: ArenaVec[u32, 'k],
+    literals: ArenaVec[Meta['k], 'k],
+    brand_checks: ArenaVec[(Type['k], ArenaSet[Span['k], 'k], Pos), 'k],
+    solving: Ref[bool, 'k],
+    returns: ArenaVec[Type['k], 'k],
+    // the scopes open, innermost first
+    scopes: Ref[List[Level['k], 'k], 'k],
+    frames: ArenaVec[Frame['k], 'k],
     // the brands a type recorded here may mention, until a scope opens or closes some
-    allowed: Cell[Option[Set[Text['k], 'k]], 'k],
+    allowed: Ref[Option[ArenaSet[Span['k], 'k]], 'k],
 }
 
 forall 'k.
 impl Body['k] {
-    fn fail(self, &cx: Cx!['k], message: Text['k], pos: Pos) -> ! {
+    fn fail(self, &cx: Domain!['k], message: Span['k], pos: Pos) -> ! {
         self.inf.r.fail(&cx, message, pos)
     }
 
-    fn fails(self, &cx: Cx!['k], message: Slice[u8, 'static], pos: Pos) -> ! {
-        self.inf.r.fail(&cx, text(&cx, message), pos)
+    fn fails(self, &cx: Domain!['k], message: Slice[u8, 'static], pos: Pos) -> ! {
+        self.inf.r.fail(&cx, Span::from_static(&cx, message), pos)
     }
 
     fn results(self) -> Results['k] {
         self.inf.out
     }
 
-    fn type_of(self, &cx: Cx!['k], id: u32) -> Type['k] {
+    fn type_of(self, &cx: Domain!['k], id: u32) -> Type['k] {
         self.inf.out.types.at(&cx, id)
     }
 
     // Finish pending inference, report unresolved requirements, and normalize annotations for lowering.
-    fn finish(self, &cx: Cx!['k]) {
+    fn finish(self, &cx: Domain!['k]) {
         self.solve(&cx);
         self.run_defaults(&cx);
         if !self.waiting.is_empty(&cx) {
-            self.fails(&cx, "a type here is not known yet; annotate it", self.waiting.get(&cx, 0usize).pos);
+            self.fails(&cx, "a type here is not known yet; annotate it", self.waiting.at(&cx, 0usize).pos);
         }
         var i = 0usize;
         while i < self.literals.len(&cx) {
-            let m = self.literals.get(&cx, i);
+            let m = self.literals.at(&cx, i);
             if is_unsolved(&cx, Type::Meta.(m)) {
                 let what = match m.kind(&cx) {
                     MetaKind::Float => "floating",
                     _ => "integer",
                 };
-                self.fail(&cx, text_of(&cx, Buffer::new().push_static("a ").push_static(what).push_static(" literal's type is not determined; write a suffix")), m.pos(&cx));
+                self.fail(&cx, Buffer::new().push_static("a ").push_static(what).push_static(" literal's type is not determined; write a suffix").save(&cx), m.pos(&cx));
             }
             i = i + 1usize;
         }
         i = 0usize;
         while i < self.brand_checks.len(&cx) {
-            let (ty, allowed, pos) = self.brand_checks.get(&cx, i);
-            let brands = free_brands(&cx, zonk(&cx, ty)).items(&cx);
-            var least: Option[Text['k]] = Option::None;
+            let (ty, allowed, pos) = self.brand_checks.at(&cx, i);
+            let brands = free_brands(&cx, zonk(&cx, ty)).keys(&cx);
+            var least: Option[Span['k]] = Option::None;
             var k = 0usize;
             while k < brands.len(&cx) {
-                let b = brands.get(&cx, k);
-                if !allowed.has(&cx, b) {
+                let b = brands.at(&cx, k);
+                if !allowed.contains(&cx, b) {
                     least = match least {
-                        Option::Some(l) => if b.compare(&cx, l) < 0 { Option::Some.(b) } else { Option::Some.(l) },
+                        Option::Some(l) => if b.cmp(&cx, l).is_lt() { Option::Some.(b) } else { Option::Some.(l) },
                         Option::None => Option::Some.(b),
                     };
                 }
                 k = k + 1usize;
             }
             let unit = match least {
-                Option::Some(b) => self.fail(&cx, text_of(&cx, Buffer::new().push_static("brand ").push_bytes(&cx, b).push_static(" escapes its lexical scope")), pos),
+                Option::Some(b) => self.fail(&cx, Buffer::new().push_static("brand ").push_bytes(&cx, b).push_static(" escapes its lexical scope").save(&cx), pos),
                 Option::None => (),
             };
             i = i + 1usize;
@@ -898,11 +900,11 @@ impl Body['k] {
         let out = self.results();
         i = 0usize;
         while i < self.recorded.len(&cx) {
-            let id = self.recorded.get(&cx, i);
-            out.types.set(&cx, id, zonk(&cx, out.types.at(&cx, id)));
+            let id = self.recorded.at(&cx, i);
+            out.types.insert(&cx, id, zonk(&cx, out.types.at(&cx, id)));
             let unit = match out.options.get(&cx, id) {
                 Option::Some(t) => {
-                    out.options.set(&cx, id, zonk(&cx, t));
+                    out.options.insert(&cx, id, zonk(&cx, t));
                     zonk_all(&cx, out.next_calls.at(&cx, id).targs);
                 },
                 Option::None => (),
@@ -912,7 +914,7 @@ impl Body['k] {
                     Callee::Fn(f) => zonk_map(&cx, f.sub),
                     Callee::Value(sub) => zonk_map(&cx, sub),
                     Callee::Trait(t) => zonk_all(&cx, t.targs),
-                    Callee::Alloca(t) => out.calls.set(&cx, id, Callee::Alloca.(zonk(&cx, t))),
+                    Callee::Alloca(t) => { out.calls.insert(&cx, id, Callee::Alloca.(zonk(&cx, t))); },
                     _ => (),
                 },
                 Option::None => (),
@@ -923,30 +925,30 @@ impl Body['k] {
 
     // ---- the solver
     // Run `action` once `ready` holds.
-    fn wait(self, &cx: Cx!['k], ready: Ready['k], action: Action['k], pos: Pos) {
+    fn wait(self, &cx: Domain!['k], ready: Ready['k], action: Action['k], pos: Pos) {
         self.waiting.push(&cx, Waiter.{ ready, action, pos });
         self.solve(&cx);
     }
 
     // Run `action` once the head of the type `ty` is known.
-    fn later(self, &cx: Cx!['k], ty: Type['k], action: Action['k], pos: Pos) {
+    fn later(self, &cx: Domain!['k], ty: Type['k], action: Action['k], pos: Pos) {
         self.wait(&cx, Ready::Head.(ty), action, pos);
     }
 
-    fn ready(self, &cx: Cx!['k], r: Ready['k]) -> bool {
+    fn ready(self, &cx: Domain!['k], r: Ready['k]) -> bool {
         match r {
             Ready::Head(t) => !is_unsolved(&cx, t),
             Ready::Ground(ts, n) => {
                 var i = 0usize;
                 while i < n && i < ts.len(&cx) {
-                    if !settled(&cx, ts.get(&cx, i)) {
+                    if !settled(&cx, ts.at(&cx, i)) {
                         return false;
                     }
                     i = i + 1usize;
                 }
                 true
             },
-            Ready::Filled(b) => b.filled.get(&cx),
+            Ready::Filled(b) => b.filled.copy(&cx),
             Ready::Both(a, b) => !is_unsolved(&cx, a) && !is_unsolved(&cx, b),
         }
     }
@@ -954,8 +956,8 @@ impl Body['k] {
     // Drain ready actions; a nested call leaves its work to the active solver loop. Each pass runs
     // the waiters present when it began, in order; the others are kept in place, in order, followed
     // by the ones added during the pass.
-    fn solve(self, &cx: Cx!['k]) {
-        if self.solving.get(&cx) {
+    fn solve(self, &cx: Domain!['k]) {
+        if self.solving.copy(&cx) {
             return;
         }
         self.solving.set(&cx, true);
@@ -966,7 +968,7 @@ impl Body['k] {
             var kept = 0usize;
             var i = 0usize;
             while i < n {
-                let item = self.waiting.get(&cx, i);
+                let item = self.waiting.at(&cx, i);
                 if self.ready(&cx, item.ready) {
                     self.act(&cx, item.action, item.pos);
                     progress = true;
@@ -978,7 +980,7 @@ impl Body['k] {
             }
             var j = n;
             while j < self.waiting.len(&cx) {
-                self.waiting.set(&cx, kept, self.waiting.get(&cx, j));
+                self.waiting.set(&cx, kept, self.waiting.at(&cx, j));
                 kept = kept + 1usize;
                 j = j + 1usize;
             }
@@ -988,7 +990,7 @@ impl Body['k] {
     }
 
     // What is still unknown when nothing else can run takes its default.
-    fn run_defaults(self, &cx: Cx!['k]) {
+    fn run_defaults(self, &cx: Domain!['k]) {
         while !self.defaults.is_empty(&cx) {
             let wait = self.defaults.remove(&cx, 0usize);
             if is_unsolved(&cx, wait.result) {
@@ -998,7 +1000,7 @@ impl Body['k] {
         }
     }
 
-    fn act(self, &cx: Cx!['k], action: Action['k], pos: Pos) {
+    fn act(self, &cx: Domain!['k], action: Action['k], pos: Pos) {
         match action {
             Action::Copy(ty) => if !self.inf.types.is_copy(&cx, zonk(&cx, ty), self.kinds) {
                 self.fails(&cx, "type argument must satisfy Copy", pos);
@@ -1009,7 +1011,7 @@ impl Body['k] {
             Action::Primitive(op, operand, unary) => self.primitive(&cx, op, operand, unary, pos),
             Action::Fill(result, elem) => {
                 match self.shape(&cx, result, pos) {
-                    Type::Array(want, _n) => self.unify_at(&cx, elem, want.get(&cx), pos),
+                    Type::Array(want, _n) => self.unify_at(&cx, elem, want.copy(&cx), pos),
                     _ => self.fails(&cx, "an array literal with `..` needs its length from the expected type", pos),
                 }
             },
@@ -1017,11 +1019,11 @@ impl Body['k] {
                 let names = s.fields.keys(&cx);
                 var i = 0usize;
                 while i < names.len(&cx) {
-                    let name = names.get(&cx, i);
-                    if !s.given.has(&cx, name) {
+                    let name = names.at(&cx, i);
+                    if !s.given.contains(&cx, name) {
                         let have = match s.bundle.types.get(&cx, name) {
                             Option::Some(t) => t,
-                            Option::None => self.fail(&cx, text_of(&cx, Buffer::new().push_static("..").push_bytes(&cx, s.spread).push_static(" has no field ").push_bytes(&cx, name)), pos),
+                            Option::None => self.fail(&cx, Buffer::new().push_static("..").push_bytes(&cx, s.spread).push_static(" has no field ").push_bytes(&cx, name).save(&cx), pos),
                         };
                         self.unify_at(&cx, have, s.fields.at(&cx, name), pos);
                     }
@@ -1041,16 +1043,16 @@ impl Body['k] {
             Action::Pack(p) => {
                 let want = self.shape(&cx, p.result, pos);
                 let (binders, body) = match want {
-                    Type::Exists(binders, body) => (binders, body.get(&cx)),
+                    Type::Exists(binders, body) => (binders, body.copy(&cx)),
                     _ => self.fails(&cx, "pack does not match the type it is used at", pos),
                 };
                 if binders.len(&cx) != p.labels.len(&cx) {
                     self.fails(&cx, "pack does not match the type it is used at", pos);
                 }
-                let sub: Map[Text['k], Type['k], 'k] = Map::new(&cx);
+                let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
                 var i = 0usize;
                 while i < binders.len(&cx) {
-                    sub.set(&cx, binders.get(&cx, i), Type::Skolem.(p.labels.get(&cx, i)));
+                    sub.insert(&cx, binders.at(&cx, i), Type::Skolem.(p.labels.at(&cx, i)));
                     i = i + 1usize;
                 }
                 self.unify_at(&cx, p.value, subst(&cx, body, sub, self.inf.counter), pos);
@@ -1076,14 +1078,14 @@ impl Body['k] {
         }
     }
 
-    fn unify_at(self, &cx: Cx!['k], a: Type['k], b: Type['k], pos: Pos) {
+    fn unify_at(self, &cx: Domain!['k], a: Type['k], b: Type['k], pos: Pos) {
         if !unify(&cx, a, b, false, self.inf.counter) {
-            self.fail(&cx, text_of(&cx, Buffer::new().push_static("type mismatch: ").push_bytes(&cx, show(&cx, zonk(&cx, a))).push_static(" and ").push_bytes(&cx, show(&cx, zonk(&cx, b)))), pos);
+            self.fail(&cx, Buffer::new().push_static("type mismatch: ").push_bytes(&cx, show(&cx, zonk(&cx, a))).push_static(" and ").push_bytes(&cx, show(&cx, zonk(&cx, b))).save(&cx), pos);
         }
         self.solve(&cx);
     }
 
-    fn coerce(self, &cx: Cx!['k], actual: Type['k], expected: Option[Type['k]], pos: Pos) {
+    fn coerce(self, &cx: Domain!['k], actual: Type['k], expected: Option[Type['k]], pos: Pos) {
         let unit = match expected {
             Option::Some(want) => if !is_never(&cx, actual) {
                 self.unify_at(&cx, actual, want, pos);
@@ -1092,7 +1094,7 @@ impl Body['k] {
         };
     }
 
-    fn join(self, &cx: Cx!['k], a: Type['k], b: Type['k], pos: Pos) -> Type['k] {
+    fn join(self, &cx: Domain!['k], a: Type['k], b: Type['k], pos: Pos) -> Type['k] {
         if is_never(&cx, a) {
             return b;
         }
@@ -1103,7 +1105,7 @@ impl Body['k] {
     }
 
     // The structure of `ty`, needed now: a type still unknown takes its defaults, else it is an error.
-    fn shape(self, &cx: Cx!['k], ty: Type['k], pos: Pos) -> Type['k] {
+    fn shape(self, &cx: Domain!['k], ty: Type['k], pos: Pos) -> Type['k] {
         if is_unsolved(&cx, ty) {
             self.solve(&cx);
             self.run_defaults(&cx);
@@ -1111,7 +1113,7 @@ impl Body['k] {
         let ty = zonk(&cx, ty);
         match ty {
             Type::Meta(_m) => self.fails(&cx, "the type here is not known yet; annotate it", pos),
-            Type::Named(name, _args) => if self.inf.types.program.types.has(&cx, name) {
+            Type::Named(name, _args) => if self.inf.types.program.types.contains(&cx, name) {
                 self.inf.types.shape(&cx, ty, Option::None)
             } else {
                 ty
@@ -1123,11 +1125,11 @@ impl Body['k] {
 
     // ---- premises
     // Check nominal authority at shape-using source operations, not type uses.
-    fn require_visible_shape(self, &cx: Cx!['k], ty: Type['k], pos: Pos) {
+    fn require_visible_shape(self, &cx: Domain!['k], ty: Type['k], pos: Pos) {
         let unit = match prune(&cx, ty) {
             Type::Named(name, _args) => match self.inf.types.program.types.get(&cx, name) {
                 Option::Some(decl) => if !self.inf.types.is_exposed(&cx, decl, Option::Some.(self.home)) {
-                    self.fail(&cx, text_of(&cx, Buffer::new().push_static("the shape of ").push_bytes(&cx, name).push_static(" is not exposed here")), pos);
+                    self.fail(&cx, Buffer::new().push_static("the shape of ").push_bytes(&cx, name).push_static(" is not exposed here").save(&cx), pos);
                 },
                 Option::None => (),
             },
@@ -1135,14 +1137,14 @@ impl Body['k] {
         };
     }
 
-    fn require_copy(self, &cx: Cx!['k], ty: Type['k], pos: Pos) {
-        self.wait(&cx, Ready::Ground.(Seq::one(&cx, ty), 1usize), Action::Copy.(ty), pos);
+    fn require_copy(self, &cx: Domain!['k], ty: Type['k], pos: Pos) {
+        self.wait(&cx, Ready::Ground.(ArenaVec::one(&cx, ty), 1usize), Action::Copy.(ty), pos);
     }
 
-    fn require_parameter_kinds(self, &cx: Cx!['k], params: Seq[Param['k], 'k], sub: Map[Text['k], Type['k], 'k], pos: Pos) {
+    fn require_parameter_kinds(self, &cx: Domain!['k], params: ArenaVec[Param['k], 'k], sub: ArenaMap[Span['k], Type['k], 'k], pos: Pos) {
         var i = 0usize;
         while i < params.len(&cx) {
-            let p = params.get(&cx, i);
+            let p = params.at(&cx, i);
             if is_copy_kind(p.kind) {
                 self.require_copy(&cx, sub.at(&cx, p.name), pos);
             }
@@ -1151,40 +1153,40 @@ impl Body['k] {
     }
 
     // Discharge a premise once its input arguments are known.
-    fn require(self, &cx: Cx!['k], trait_name: Text['k], args: Seq[Type['k], 'k], pos: Pos) {
+    fn require(self, &cx: Domain!['k], trait_name: Span['k], args: ArenaVec[Type['k], 'k], pos: Pos) {
         let n = self.inf.inputs.get_or(&cx, trait_name, args.len(&cx));
         self.wait(&cx, Ready::Ground.(args, n), Action::Discharge.(trait_name, args, n), pos);
     }
 
     // An assumption or a unique matching instance solves the output arguments.
-    fn discharge(self, &cx: Cx!['k], trait_name: Text['k], args: Seq[Type['k], 'k], n: usize, pos: Pos) {
+    fn discharge(self, &cx: Domain!['k], trait_name: Span['k], args: ArenaVec[Type['k], 'k], n: usize, pos: Pos) {
         if trait_name.is(&cx, "builtin::Exposed") {
-            if args.len(&cx) != 1usize || !self.inf.types.exposure_available(&cx, zonk(&cx, args.get(&cx, 0usize)), Option::Some.(self.home), self.kinds, self.assumptions) {
+            if args.len(&cx) != 1usize || !self.inf.types.exposure_available(&cx, zonk(&cx, args.at(&cx, 0usize)), Option::Some.(self.home), self.kinds, self.assumptions) {
                 self.fails(&cx, "Exposed requires an exact premise or an authorized traversable shape", pos);
             }
             return;
         }
         let count = if n < args.len(&cx) { n } else { args.len(&cx) };
-        let inputs: Seq[Type['k], 'k] = Seq::new(&cx);
+        let inputs: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < count {
-            inputs.push(&cx, zonk(&cx, args.get(&cx, i)));
+            inputs.push(&cx, zonk(&cx, args.at(&cx, i)));
             i = i + 1usize;
         }
         i = 0usize;
         while i < self.assumptions.len(&cx) {
-            let p = self.assumptions.get(&cx, i);
+            let p = self.assumptions.at(&cx, i);
             if p.trait_name.eq(&cx, trait_name) && p.args.len(&cx) == args.len(&cx) {
                 var matches = true;
                 var k = 0usize;
                 while matches && k < count {
-                    matches = equal(&cx, zonk(&cx, p.args.get(&cx, k)), inputs.get(&cx, k));
+                    matches = equal(&cx, zonk(&cx, p.args.at(&cx, k)), inputs.at(&cx, k));
                     k = k + 1usize;
                 }
                 if matches {
                     k = count;
                     while k < args.len(&cx) {
-                        self.unify_at(&cx, p.args.get(&cx, k), args.get(&cx, k), pos);
+                        self.unify_at(&cx, p.args.at(&cx, k), args.at(&cx, k), pos);
                         k = k + 1usize;
                     }
                     return;
@@ -1192,11 +1194,11 @@ impl Body['k] {
             }
             i = i + 1usize;
         }
-        let found: Seq[(InstanceSig['k], Map[Text['k], Type['k], 'k]), 'k] = Seq::new(&cx);
-        let candidates = self.inf.instances.get_or(&cx, trait_name, Seq::new(&cx));
+        let found: ArenaVec[(InstanceSig['k], ArenaMap[Span['k], Type['k], 'k]), 'k] = ArenaVec::new(&cx);
+        let candidates = self.inf.instances.get_or(&cx, trait_name, ArenaVec::new(&cx));
         i = 0usize;
         while i < candidates.len(&cx) {
-            let inst = candidates.get(&cx, i);
+            let inst = candidates.at(&cx, i);
             let head_count = if count < inst.head.len(&cx) { count } else { inst.head.len(&cx) };
             let unit = match match_head(&cx, inst.params, inst.head.slice(&cx, 0usize, head_count), inputs, false, self.inf.counter) {
                 Option::Some(sub) => if self.copy_ok(&cx, inst, sub) {
@@ -1213,37 +1215,37 @@ impl Body['k] {
                 if k > 0usize {
                     shown = shown.push_static(", ");
                 }
-                shown = shown.push_bytes(&cx, show(&cx, zonk(&cx, args.get(&cx, k))));
+                shown = shown.push_bytes(&cx, show(&cx, zonk(&cx, args.at(&cx, k))));
                 k = k + 1usize;
             }
-            self.fail(&cx, text_of(&cx, shown.push_static("]")), pos);
+            self.fail(&cx, shown.push_static("]").save(&cx), pos);
         }
-        let (inst, sub) = found.get(&cx, 0usize);
+        let (inst, sub) = found.at(&cx, 0usize);
         i = 0usize;
         while i < inst.params.len(&cx) {
-            let p = inst.params.get(&cx, i);
-            if !sub.has(&cx, p.name) {
-                sub.set(&cx, p.name, meta_of(&cx, p.kind));
+            let p = inst.params.at(&cx, i);
+            if !sub.contains(&cx, p.name) {
+                sub.insert(&cx, p.name, meta_of(&cx, p.kind));
             }
             i = i + 1usize;
         }
         i = 0usize;
         while i < inst.head.len(&cx) && i < args.len(&cx) {
-            self.unify_at(&cx, subst(&cx, inst.head.get(&cx, i), sub, self.inf.counter), args.get(&cx, i), pos);
+            self.unify_at(&cx, subst(&cx, inst.head.at(&cx, i), sub, self.inf.counter), args.at(&cx, i), pos);
             i = i + 1usize;
         }
         i = 0usize;
         while i < inst.premises.len(&cx) {
-            let premise = inst.premises.get(&cx, i);
+            let premise = inst.premises.at(&cx, i);
             self.require(&cx, premise.trait_name, self.subst_all(&cx, premise.args, sub), pos);
             i = i + 1usize;
         }
     }
 
-    fn copy_ok(self, &cx: Cx!['k], inst: InstanceSig['k], sub: Map[Text['k], Type['k], 'k]) -> bool {
+    fn copy_ok(self, &cx: Domain!['k], inst: InstanceSig['k], sub: ArenaMap[Span['k], Type['k], 'k]) -> bool {
         var i = 0usize;
         while i < inst.params.len(&cx) {
-            let p = inst.params.get(&cx, i);
+            let p = inst.params.at(&cx, i);
             if is_copy_kind(p.kind) {
                 let unit = match sub.get(&cx, p.name) {
                     Option::Some(t) => if !self.inf.types.is_copy(&cx, t, self.kinds) {
@@ -1257,129 +1259,122 @@ impl Body['k] {
         true
     }
 
-    fn subst_all(self, &cx: Cx!['k], ts: Seq[Type['k], 'k], sub: Map[Text['k], Type['k], 'k]) -> Seq[Type['k], 'k] {
-        let out: Seq[Type['k], 'k] = Seq::new(&cx);
+    fn subst_all(self, &cx: Domain!['k], ts: ArenaVec[Type['k], 'k], sub: ArenaMap[Span['k], Type['k], 'k]) -> ArenaVec[Type['k], 'k] {
+        let out: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < ts.len(&cx) {
-            out.push(&cx, subst(&cx, ts.get(&cx, i), sub, self.inf.counter));
+            out.push(&cx, subst(&cx, ts.at(&cx, i), sub, self.inf.counter));
             i = i + 1usize;
         }
         out
     }
 
     // ---- scopes
-    fn record(self, &cx: Cx!['k], id: u32, pos: Pos, ty: Type['k]) -> Type['k] {
-        self.inf.out.types.set(&cx, id, ty);
+    fn record(self, &cx: Domain!['k], id: u32, pos: Pos, ty: Type['k]) -> Type['k] {
+        self.inf.out.types.insert(&cx, id, ty);
         self.check_brand_scope(&cx, ty, pos);
         self.recorded.push(&cx, id);
         ty
     }
 
-    fn library(self, &cx: Cx!['k], name: Slice[u8, 'static]) -> Text['k] {
-        self.inf.sigs.name(&cx, self.inf.sigs.library(&cx, self.home, text(&cx, name)))
+    fn library(self, &cx: Domain!['k], name: Slice[u8, 'static]) -> Span['k] {
+        self.inf.sigs.name(&cx, self.inf.sigs.library(&cx, self.home, Span::from_static(&cx, name)))
     }
 
-    fn lookup(self, &cx: Cx!['k], name: Text['k]) -> Option[Local['k]] {
-        var i = self.scopes.len(&cx);
-        while i > 0usize {
-            i = i - 1usize;
-            let unit = match self.scopes.get(&cx, i).names.get(&cx, name) {
-                Option::Some(local) => {
-                    // every closure it is used inside captures it
-                    var f = local.depth + 1usize;
-                    while f < self.frames.len(&cx) {
-                        let frame = self.frames.get(&cx, f);
-                        var seen = false;
-                        var k = 0usize;
-                        while !seen && k < frame.locals.len(&cx) {
-                            let (_n, l) = frame.locals.get(&cx, k);
-                            seen = l.id == local.id;
-                            k = k + 1usize;
-                        }
-                        if !seen {
-                            frame.locals.push(&cx, (name, local));
-                        }
-                        f = f + 1usize;
+    fn lookup(self, &cx: Domain!['k], name: Span['k]) -> Option[Local['k]] {
+        let found = self.scopes.copy(&cx).find_map(&cx, |&cx, level: Level['k]| level.names.get(&cx, name));
+        match found {
+            Option::Some(local) => {
+                // every closure it is used inside captures it
+                var f = local.depth + 1usize;
+                while f < self.frames.len(&cx) {
+                    let frame = self.frames.at(&cx, f);
+                    if !frame.locals.any(&cx, |&cx, seen: (Span['k], Local['k])| seen.1.id == local.id) {
+                        frame.locals.push(&cx, (name, local));
                     }
-                    return Option::Some.(local);
-                },
-                Option::None => (),
-            };
+                    f = f + 1usize;
+                }
+                Option::Some.(local)
+            },
+            Option::None => Option::None,
         }
-        Option::None
     }
 
-    fn bind(self, &cx: Cx!['k], name: Text['k], ty: Type['k], mutable: bool, rest: Option[Bundle['k]]) -> Local['k] {
+    fn bind(self, &cx: Domain!['k], name: Span['k], ty: Type['k], mutable: bool, rest: Option[Bundle['k]]) -> Local['k] {
         self.check_brand_scope(&cx, ty, no_pos());
         let local = Local.{ type: ty, mutable, rest, depth: self.frames.len(&cx) - 1usize, id: self.inf.next_id(&cx) };
-        self.scopes.last(&cx).names.set(&cx, name, local);
+        self.level(&cx).names.insert(&cx, name, local);
         local
     }
 
-    fn brand_sub(self, &cx: Cx!['k]) -> Map[Text['k], Type['k], 'k] {
-        let out: Map[Text['k], Type['k], 'k] = Map::new(&cx);
-        var i = 0usize;
-        while i < self.scopes.len(&cx) {
-            let level = self.scopes.get(&cx, i);
-            let names = level.brands.keys(&cx);
-            var k = 0usize;
-            while k < names.len(&cx) {
-                out.set(&cx, names.get(&cx, k), Type::Skolem.(level.brands.at(&cx, names.get(&cx, k))));
-                k = k + 1usize;
-            }
-            i = i + 1usize;
-        }
+    // The scopes open, outermost first.
+    fn outward(self, &cx: Domain!['k]) -> List[Level['k], 'k] {
+        self.scopes.copy(&cx).reverse(&cx, List::Empty)
+    }
+
+    fn brand_sub(self, &cx: Domain!['k]) -> ArenaMap[Span['k], Type['k], 'k] {
+        let out: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+        self.outward(&cx).each(&cx, |&cx, level: Level['k]| level.brands.each(&cx, |&cx, spelling: Span['k], witness: Span['k]| {
+            out.insert(&cx, spelling, Type::Skolem.(witness));
+        }));
         out
     }
 
-    fn leave(self, &cx: Cx!['k]) {
-        let level = self.scopes.pop(&cx);
+    // Opens a scope inside the innermost one.
+    fn enter(self, &cx: Domain!['k]) {
+        self.scopes.set(&cx, self.scopes.copy(&cx).cons(&cx, new_level(&cx)));
+    }
+
+    // The innermost scope.
+    fn level(self, &cx: Domain!['k]) -> Level['k] {
+        match self.scopes.copy(&cx).first(&cx) {
+            Option::Some(level) => level,
+            Option::None => fail_static("internal error: no scope is open"),
+        }
+    }
+
+    fn leave(self, &cx: Domain!['k]) {
+        let level = self.level(&cx);
+        self.scopes.set(&cx, self.scopes.copy(&cx).tail(&cx));
         if level.opened.len(&cx) != 0usize {
             self.allowed.set(&cx, Option::None);
         }
     }
 
     // Checked after solving: an outer metavariable may acquire a local brand later.
-    fn check_brand_scope(self, &cx: Cx!['k], ty: Type['k], pos: Pos) {
-        let unit = match self.allowed.get(&cx) {
+    fn check_brand_scope(self, &cx: Domain!['k], ty: Type['k], pos: Pos) {
+        let unit = match self.allowed.copy(&cx) {
             Option::Some(allowed) => {
                 self.brand_checks.push(&cx, (ty, allowed, pos));
                 return;
             },
             Option::None => (),
         };
-        let allowed: Set[Text['k], 'k] = Set::new(&cx);
+        let allowed: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
         var i = 0usize;
         while i < self.sig.params.len(&cx) {
-            if is_brand(self.sig.params.get(&cx, i).kind) {
-                allowed.add(&cx, self.sig.params.get(&cx, i).name);
+            if is_brand(self.sig.params.at(&cx, i).kind) {
+                allowed.insert(&cx, self.sig.params.at(&cx, i).name);
             }
             i = i + 1usize;
         }
-        allowed.add(&cx, text(&cx, "static"));
-        i = 0usize;
-        while i < self.scopes.len(&cx) {
-            let opened = self.scopes.get(&cx, i).opened.items(&cx);
-            var k = 0usize;
-            while k < opened.len(&cx) {
-                allowed.add(&cx, opened.get(&cx, k));
-                k = k + 1usize;
-            }
-            i = i + 1usize;
-        }
+        allowed.insert(&cx, Span::from_static(&cx, "static"));
+        self.outward(&cx).each(&cx, |&cx, level: Level['k]| level.opened.each(&cx, |&cx, witness: Span['k]| {
+            allowed.insert(&cx, witness);
+        }));
         self.allowed.set(&cx, Option::Some.(allowed));
         self.brand_checks.push(&cx, (ty, allowed, pos));
     }
 
-    fn core_type(self, &cx: Cx!['k], type_expr: S::Type['k]) -> Type['k] {
+    fn core_type(self, &cx: Domain!['k], type_expr: S::Type['k]) -> Type['k] {
         let scope = new_scope(&cx);
         var i = 0usize;
         while i < self.sig.params.len(&cx) {
-            let p = self.sig.params.get(&cx, i);
+            let p = self.sig.params.at(&cx, i);
             if is_brand(p.kind) {
-                scope.brands.add(&cx, p.name);
+                scope.brands.insert(&cx, p.name);
             } else {
-                scope.kinds.set(&cx, p.name, p.kind);
+                scope.kinds.insert(&cx, p.name, p.kind);
             }
             i = i + 1usize;
         }
@@ -1387,13 +1382,13 @@ impl Body['k] {
         let names = sub.keys(&cx);
         i = 0usize;
         while i < names.len(&cx) {
-            scope.brands.add(&cx, names.get(&cx, i));
+            scope.brands.insert(&cx, names.at(&cx, i));
             i = i + 1usize;
         }
         subst(&cx, self.inf.sigs.got(&cx, self.inf.sigs.type(&cx, type_expr, scope)), sub, self.inf.counter)
     }
 
-    fn opt_type(self, &cx: Cx!['k], t: Option[S::Type['k]]) -> Option[Type['k]] {
+    fn opt_type(self, &cx: Domain!['k], t: Option[S::Type['k]]) -> Option[Type['k]] {
         match t {
             Option::Some(x) => Option::Some.(self.core_type(&cx, x)),
             Option::None => Option::None,
@@ -1401,18 +1396,18 @@ impl Body['k] {
     }
 
     // ---- statements
-    fn block(self, &cx: Cx!['k], b: S::Block['k]) -> Type['k] {
-        self.scopes.push(&cx, new_level(&cx));
+    fn block(self, &cx: Domain!['k], b: S::Block['k]) -> Type['k] {
+        self.enter(&cx);
         var diverges = false;
         var i = 0usize;
         while i < b.stmts.len(&cx) {
-            if self.stmt(&cx, b.stmts.get(&cx, i)) {
+            if self.stmt(&cx, b.stmts.at(&cx, i)) {
                 diverges = true;
             }
             i = i + 1usize;
         }
         let ty = match b.tail {
-            Option::Some(tail) => self.expr(&cx, tail.get(&cx)),
+            Option::Some(tail) => self.expr(&cx, tail.copy(&cx)),
             Option::None => if diverges { Type::Never } else { C::unit(&cx) },
         };
         self.leave(&cx);
@@ -1420,7 +1415,7 @@ impl Body['k] {
     }
 
     // Type one statement; true when it cannot complete normally.
-    fn stmt(self, &cx: Cx!['k], s: Statement['k]) -> bool {
+    fn stmt(self, &cx: Domain!['k], s: Statement['k]) -> bool {
         match s {
             Statement::Let(l) => {
                 if !l.brands.is_empty(&cx) {
@@ -1443,17 +1438,17 @@ impl Body['k] {
                     Option::Some(t) => t,
                     Option::None => got,
                 }, true, Option::None);
-                self.results().binders.set(&cx, v.id, local.id);
+                self.results().binders.insert(&cx, v.id, local.id);
                 false
             },
             Statement::Const(c) => {
                 let value = self.inf.sigs.got(&cx, self.inf.sigs.typed(&cx, c.name, c.value, self.core_type(&cx, c.type), self.home));
-                self.results().folded.set(&cx, c.id, value);
+                self.results().folded.insert(&cx, c.id, value);
                 let ty = match const_type(&cx, value) {
                     Option::Some(t) => t,
                     Option::None => self.fails(&cx, "internal error: an untyped local constant", c.pos),
                 };
-                self.results().binders.set(&cx, c.id, self.bind(&cx, c.name, ty, false, Option::None).id);
+                self.results().binders.insert(&cx, c.id, self.bind(&cx, c.name, ty, false, Option::None).id);
                 false
             },
             Statement::Assign(a) => {
@@ -1466,51 +1461,51 @@ impl Body['k] {
     }
 
     // A bare function name bound with no annotation keeps its quantified brands.
-    fn generic(self, &cx: Cx!['k], value: Expr['k], want: Option[Type['k]]) {
+    fn generic(self, &cx: Domain!['k], value: Expr['k], want: Option[Type['k]]) {
         if want.is_none() {
             let unit = match value {
-                Expr::Path(p) => self.inf.generic.add(&cx, p.id),
+                Expr::Path(p) => { self.inf.generic.insert(&cx, p.id); },
                 _ => (),
             };
         }
     }
 
-    fn let_exists(self, &cx: Cx!['k], l: S::Let['k]) -> bool {
+    fn let_exists(self, &cx: Domain!['k], l: S::Let['k]) -> bool {
         let package = self.shape(&cx, self.expr(&cx, l.value), l.pos);
         let opened = match package {
-            Type::Exists(binders, body) => if binders.len(&cx) == l.brands.len(&cx) { Option::Some.((binders, body.get(&cx))) } else { Option::None },
+            Type::Exists(binders, body) => if binders.len(&cx) == l.brands.len(&cx) { Option::Some.((binders, body.copy(&cx))) } else { Option::None },
             _ => Option::None,
         };
         let (binders, body) = match opened {
             Option::Some(pair) => pair,
-            Option::None => self.fail(&cx, text_of(&cx, Buffer::new().push_static("let exists opens ").push_usize(l.brands.len(&cx)).push_static(" brands of ").push_bytes(&cx, show(&cx, zonk(&cx, package)))), l.pos),
+            Option::None => self.fail(&cx, Buffer::new().push_static("let exists opens ").push_usize(l.brands.len(&cx)).push_static(" brands of ").push_bytes(&cx, show(&cx, zonk(&cx, package))).save(&cx), l.pos),
         };
-        let names: Seq[Text['k], 'k] = Seq::new(&cx);
-        let distinct: Set[Text['k], 'k] = Set::new(&cx);
+        let names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let distinct: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
         var i = 0usize;
         while i < l.brands.len(&cx) {
-            let name = l.brands.get(&cx, i).from(1usize);
+            let name = l.brands.at(&cx, i).skip(1usize);
             names.push(&cx, name);
-            distinct.add(&cx, name);
+            distinct.insert(&cx, name);
             i = i + 1usize;
         }
         if distinct.len(&cx) != names.len(&cx) {
             self.fails(&cx, "an existential opening repeats a brand name", l.pos);
         }
-        let labels: Seq[Text['k], 'k] = Seq::new(&cx);
-        let level = self.scopes.last(&cx);
-        let sub: Map[Text['k], Type['k], 'k] = Map::new(&cx);
+        let labels: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let level = self.level(&cx);
+        let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
         i = 0usize;
         while i < names.len(&cx) {
-            let label = text_of(&cx, Buffer::new().push_bytes(&cx, names.get(&cx, i)).push_static("#open").push_u64(self.inf.next_id(&cx) as u64));
+            let label = Buffer::new().push_bytes(&cx, names.at(&cx, i)).push_static("#open").push_u64(self.inf.next_id(&cx) as u64).save(&cx);
             labels.push(&cx, label);
-            level.brands.set(&cx, names.get(&cx, i), label);
-            level.opened.add(&cx, label);
+            level.brands.insert(&cx, names.at(&cx, i), label);
+            level.opened.insert(&cx, label);
             self.allowed.set(&cx, Option::None);
-            sub.set(&cx, binders.get(&cx, i), Type::Skolem.(label));
+            sub.insert(&cx, binders.at(&cx, i), Type::Skolem.(label));
             i = i + 1usize;
         }
-        self.results().opened.set(&cx, l.id, labels);
+        self.results().opened.insert(&cx, l.id, labels);
         let payload = subst(&cx, body, sub, self.inf.counter);
         let unit = match l.type {
             Option::Some(t) => self.unify_at(&cx, payload, self.core_type(&cx, t), l.pos),
@@ -1520,41 +1515,41 @@ impl Body['k] {
         false
     }
 
-    fn pattern(self, &cx: Cx!['k], p: Pattern['k], ty: Type['k], pos: Pos, mutable: bool) {
+    fn pattern(self, &cx: Domain!['k], p: Pattern['k], ty: Type['k], pos: Pos, mutable: bool) {
         let id = S::pattern_id(p);
-        self.results().types.set(&cx, id, ty);
+        self.results().types.insert(&cx, id, ty);
         self.recorded.push(&cx, id);
         match p {
-            Pattern::Bind(n) => self.results().binders.set(&cx, n.id, self.bind(&cx, n.value, ty, mutable, Option::None).id),
+            Pattern::Bind(n) => { self.results().binders.insert(&cx, n.id, self.bind(&cx, n.value, ty, mutable, Option::None).id); },
             Pattern::Wild(_id) => (),
             Pattern::Tuple(n) => self.elements_pattern(&cx, false, n.value, ty, pos, mutable),
             Pattern::Array(n) => self.elements_pattern(&cx, true, n.value, ty, pos, mutable),
             Pattern::Struct(ps) => {
                 // the names are bound now, their types related when known
-                let metas: Map[Text['k], Type['k], 'k] = Map::new(&cx);
+                let metas: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
                 var i = 0usize;
                 while i < ps.fields.len(&cx) {
-                    metas.set(&cx, ps.fields.get(&cx, i).name, new_meta(&cx));
+                    metas.insert(&cx, ps.fields.at(&cx, i).name, new_meta(&cx));
                     i = i + 1usize;
                 }
-                let bundle = Bundle.{ types: Map::new(&cx), filled: Cell::new(&cx, false) };
+                let bundle = Bundle.{ types: ArenaMap::new(&cx), filled: Ref::new(&cx, false) };
                 self.later(&cx, ty, Action::Fields.(Fields.{ ty, metas, bundle }), pos);
                 i = 0usize;
                 while i < ps.fields.len(&cx) {
-                    let f = ps.fields.get(&cx, i);
+                    let f = ps.fields.at(&cx, i);
                     self.pattern(&cx, f.pattern, metas.at(&cx, f.name), pos, mutable);
                     i = i + 1usize;
                 }
                 let unit = match ps.rest {
-                    Option::Some(rest) => self.results().rest_ids.set(&cx, ps.id, self.bind(&cx, rest, C::unit(&cx), false, Option::Some.(bundle)).id),
+                    Option::Some(rest) => { self.results().rest_ids.insert(&cx, ps.id, self.bind(&cx, rest, C::unit(&cx), false, Option::Some.(bundle)).id); },
                     Option::None => (),
                 };
             },
         }
     }
 
-    fn elements_pattern(self, &cx: Cx!['k], array: bool, elems: Seq[Pattern['k], 'k], ty: Type['k], pos: Pos, mutable: bool) {
-        let types: Seq[Type['k], 'k] = Seq::new(&cx);
+    fn elements_pattern(self, &cx: Domain!['k], array: bool, elems: ArenaVec[Pattern['k], 'k], ty: Type['k], pos: Pos, mutable: bool) {
+        let types: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < elems.len(&cx) {
             types.push(&cx, new_meta(&cx));
@@ -1563,21 +1558,21 @@ impl Body['k] {
         self.later(&cx, ty, Action::Elements.(Elements.{ array, ty, types }), pos);
         i = 0usize;
         while i < elems.len(&cx) {
-            self.pattern(&cx, elems.get(&cx, i), types.get(&cx, i), pos, mutable);
+            self.pattern(&cx, elems.at(&cx, i), types.at(&cx, i), pos, mutable);
             i = i + 1usize;
         }
     }
 
-    fn elements(self, &cx: Cx!['k], e: Elements['k], pos: Pos) {
+    fn elements(self, &cx: Domain!['k], e: Elements['k], pos: Pos) {
         self.require_visible_shape(&cx, e.ty, pos);
         let s = self.shape(&cx, e.ty, pos);
-        let actual: Seq[Type['k], 'k] = Seq::new(&cx);
+        let actual: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         let fits = if e.array {
             match s {
                 Type::Array(elem, length) => if length == e.types.len(&cx) as u64 {
                     var i = 0usize;
                     while i < e.types.len(&cx) {
-                        actual.push(&cx, elem.get(&cx));
+                        actual.push(&cx, elem.copy(&cx));
                         i = i + 1usize;
                     }
                     true
@@ -1598,42 +1593,42 @@ impl Body['k] {
             }
         };
         if !fits {
-            self.fail(&cx, text_of(&cx, Buffer::new().push_static("pattern does not match ").push_bytes(&cx, show(&cx, zonk(&cx, e.ty)))), pos);
+            self.fail(&cx, Buffer::new().push_static("pattern does not match ").push_bytes(&cx, show(&cx, zonk(&cx, e.ty))).save(&cx), pos);
         }
         var i = 0usize;
         while i < actual.len(&cx) {
-            self.unify_at(&cx, e.types.get(&cx, i), actual.get(&cx, i), pos);
+            self.unify_at(&cx, e.types.at(&cx, i), actual.at(&cx, i), pos);
             i = i + 1usize;
         }
     }
 
-    fn fields_known(self, &cx: Cx!['k], f: Fields['k], pos: Pos) {
+    fn fields_known(self, &cx: Domain!['k], f: Fields['k], pos: Pos) {
         self.require_visible_shape(&cx, f.ty, pos);
         let fields = match self.shape(&cx, f.ty, pos) {
             Type::Struct(fields) => fields,
-            _ => self.fail(&cx, text_of(&cx, Buffer::new().push_static("a struct pattern needs a struct, not ").push_bytes(&cx, show(&cx, zonk(&cx, f.ty)))), pos),
+            _ => self.fail(&cx, Buffer::new().push_static("a struct pattern needs a struct, not ").push_bytes(&cx, show(&cx, zonk(&cx, f.ty))).save(&cx), pos),
         };
-        let by_name: Map[Text['k], Type['k], 'k] = Map::new(&cx);
+        let by_name: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
         var i = 0usize;
         while i < fields.len(&cx) {
-            by_name.set(&cx, fields.get(&cx, i).name, fields.get(&cx, i).type);
+            by_name.insert(&cx, fields.at(&cx, i).name, fields.at(&cx, i).type);
             i = i + 1usize;
         }
         let names = f.metas.keys(&cx);
         i = 0usize;
         while i < names.len(&cx) {
-            let name = names.get(&cx, i);
+            let name = names.at(&cx, i);
             let have = match by_name.get(&cx, name) {
                 Option::Some(t) => t,
-                Option::None => self.fail(&cx, text_of(&cx, Buffer::new().push_static("no field ").push_bytes(&cx, name)), pos),
+                Option::None => self.fail(&cx, Buffer::new().push_static("no field ").push_bytes(&cx, name).save(&cx), pos),
             };
             self.unify_at(&cx, f.metas.at(&cx, name), have, pos);
             i = i + 1usize;
         }
         i = 0usize;
         while i < fields.len(&cx) {
-            if !f.metas.has(&cx, fields.get(&cx, i).name) {
-                f.bundle.types.set(&cx, fields.get(&cx, i).name, fields.get(&cx, i).type);
+            if !f.metas.contains(&cx, fields.at(&cx, i).name) {
+                f.bundle.types.insert(&cx, fields.at(&cx, i).name, fields.at(&cx, i).type);
             }
             i = i + 1usize;
         }
@@ -1641,63 +1636,63 @@ impl Body['k] {
     }
 
     // ---- expressions
-    fn check(self, &cx: Cx!['k], e: Expr['k], expected: Option[Type['k]]) -> Type['k] {
+    fn check(self, &cx: Domain!['k], e: Expr['k], expected: Option[Type['k]]) -> Type['k] {
         let ty = self.expr(&cx, e);
         self.coerce(&cx, ty, expected, S::expr_pos(e));
         ty
     }
 
-    fn expr(self, &cx: Cx!['k], e: Expr['k]) -> Type['k] {
+    fn expr(self, &cx: Domain!['k], e: Expr['k]) -> Type['k] {
         let ty = self.infer_expr(&cx, e);
         self.record(&cx, S::expr_id(e), S::expr_pos(e), ty)
     }
 
-    fn infer_expr(self, &cx: Cx!['k], e: Expr['k]) -> Type['k] {
+    fn infer_expr(self, &cx: Domain!['k], e: Expr['k]) -> Type['k] {
         match e {
-            Expr::While(w) => self.apply(&cx, Seq::two(&cx, (w.cond.get(&cx), Pat::Bool), (Expr::Block.(w.body), Pat::Unit)), Pat::Unit, w.pos),
+            Expr::While(w) => self.apply(&cx, ArenaVec::two(&cx, (w.cond.copy(&cx), Pat::Bool), (Expr::Block.(w.body), Pat::Unit)), Pat::Unit, w.pos),
             Expr::If(n) => match n.other {
-                Option::None => self.apply(&cx, Seq::two(&cx, (n.cond.get(&cx), Pat::Bool), (Expr::Block.(n.then), Pat::Unit)), Pat::Unit, n.pos),
+                Option::None => self.apply(&cx, ArenaVec::two(&cx, (n.cond.copy(&cx), Pat::Bool), (Expr::Block.(n.then), Pat::Unit)), Pat::Unit, n.pos),
                 Option::Some(other) => {
-                    let parts = Seq::two(&cx, (n.cond.get(&cx), Pat::Bool), (Expr::Block.(n.then), Pat::T));
-                    parts.push(&cx, (other.get(&cx), Pat::T));
+                    let parts = ArenaVec::two(&cx, (n.cond.copy(&cx), Pat::Bool), (Expr::Block.(n.then), Pat::T));
+                    parts.push(&cx, (other.copy(&cx), Pat::T));
                     self.apply(&cx, parts, Pat::T, n.pos)
                 },
             },
             Expr::Binop(b) => {
                 if b.op.is(&cx, "&&") || b.op.is(&cx, "||") {
-                    return self.apply(&cx, Seq::two(&cx, (b.left.get(&cx), Pat::Bool), (b.right.get(&cx), Pat::Bool)), Pat::Bool, b.pos);
+                    return self.apply(&cx, ArenaVec::two(&cx, (b.left.copy(&cx), Pat::Bool), (b.right.copy(&cx), Pat::Bool)), Pat::Bool, b.pos);
                 }
-                let result = self.apply(&cx, Seq::two(&cx, (b.left.get(&cx), Pat::T), (b.right.get(&cx), Pat::T)), if is_comparison(&cx, b.op) { Pat::Bool } else { Pat::T }, b.pos);
-                let left = self.type_of(&cx, S::expr_id(b.left.get(&cx)));
-                let operand = if is_never(&cx, left) { self.type_of(&cx, S::expr_id(b.right.get(&cx))) } else { left };
+                let result = self.apply(&cx, ArenaVec::two(&cx, (b.left.copy(&cx), Pat::T), (b.right.copy(&cx), Pat::T)), if is_comparison(&cx, b.op) { Pat::Bool } else { Pat::T }, b.pos);
+                let left = self.type_of(&cx, S::expr_id(b.left.copy(&cx)));
+                let operand = if is_never(&cx, left) { self.type_of(&cx, S::expr_id(b.right.copy(&cx))) } else { left };
                 self.require_primitive(&cx, b.op, operand, b.pos, false);
                 result
             },
             Expr::Unary(u) => if u.op.is(&cx, "&") {
                 self.expr_unary(&cx, u)
             } else {
-                let result = self.apply(&cx, Seq::one(&cx, (u.operand.get(&cx), if u.op.is(&cx, "*") { Pat::PtrT } else { Pat::T })), Pat::T, u.pos);
+                let result = self.apply(&cx, ArenaVec::one(&cx, (u.operand.copy(&cx), if u.op.is(&cx, "*") { Pat::PtrT } else { Pat::T })), Pat::T, u.pos);
                 if u.op.is(&cx, "-") || u.op.is(&cx, "!") {
-                    self.require_primitive(&cx, u.op, self.type_of(&cx, S::expr_id(u.operand.get(&cx))), u.pos, true);
+                    self.require_primitive(&cx, u.op, self.type_of(&cx, S::expr_id(u.operand.copy(&cx))), u.pos, true);
                 }
                 result
             },
-            Expr::UnsafeStore(s) => self.apply(&cx, Seq::two(&cx, (s.pointer.get(&cx), Pat::PtrT), (s.value.get(&cx), Pat::T)), Pat::Unit, s.pos),
+            Expr::UnsafeStore(s) => self.apply(&cx, ArenaVec::two(&cx, (s.pointer.copy(&cx), Pat::PtrT), (s.value.copy(&cx), Pat::T)), Pat::Unit, s.pos),
             Expr::Lit(l) => self.expr_lit(&cx, l),
             Expr::FStr(f) => self.expr_fstring(&cx, f),
             Expr::Path(p) => self.expr_path(&cx, p),
             Expr::Tuple(n) => {
-                let elems: Seq[Type['k], 'k] = Seq::new(&cx);
+                let elems: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
                 var i = 0usize;
                 while i < n.value.len(&cx) {
-                    elems.push(&cx, self.expr(&cx, n.value.get(&cx, i)));
+                    elems.push(&cx, self.expr(&cx, n.value.at(&cx, i)));
                     i = i + 1usize;
                 }
                 Type::Tuple.(elems)
             },
             Expr::Array(a) => self.expr_array(&cx, a),
             Expr::Sizeof(n) => {
-                self.results().targets.set(&cx, n.id, self.core_type(&cx, n.value));
+                self.results().targets.insert(&cx, n.id, self.core_type(&cx, n.value));
                 C::usize_type(&cx)
             },
             Expr::StructLit(s) => self.expr_struct_lit(&cx, s),
@@ -1706,9 +1701,9 @@ impl Body['k] {
             Expr::Return(n) => {
                 let unit = match n.value {
                     Option::Some(v) => {
-                        let unit = self.check(&cx, v.get(&cx), Option::Some.(self.returns.last(&cx)));
+                        let unit = self.check(&cx, v.copy(&cx), Option::Some.(self.returns.at(&cx, self.returns.len(&cx) - 1usize)));
                     },
-                    Option::None => self.coerce(&cx, C::unit(&cx), Option::Some.(self.returns.last(&cx)), n.pos),
+                    Option::None => self.coerce(&cx, C::unit(&cx), Option::Some.(self.returns.at(&cx, self.returns.len(&cx) - 1usize)), n.pos),
                 };
                 Type::Never
             },
@@ -1717,14 +1712,14 @@ impl Body['k] {
             Expr::Pack(p) => self.expr_pack(&cx, p),
             Expr::Foreach(f) => self.expr_foreach(&cx, f),
             Expr::Cast(c) => {
-                let unit = self.expr(&cx, c.value.get(&cx));
+                let unit = self.expr(&cx, c.value.copy(&cx));
                 self.core_type(&cx, c.type)
             },
-            Expr::Field(f) => self.projection(&cx, f.value.get(&cx), Option::Some.(f.name), 0usize, f.id, f.pos, false),
-            Expr::Index(x) => self.projection(&cx, x.value.get(&cx), Option::None, x.index, x.id, x.pos, false),
+            Expr::Field(f) => self.projection(&cx, f.value.copy(&cx), Option::Some.(f.name), 0usize, f.id, f.pos, false),
+            Expr::Index(x) => self.projection(&cx, x.value.copy(&cx), Option::None, x.index, x.id, x.pos, false),
             Expr::Try(n) => {
-                let operand = self.expr(&cx, n.value.get(&cx));
-                let returned = self.returns.last(&cx);
+                let operand = self.expr(&cx, n.value.copy(&cx));
+                let returned = self.returns.at(&cx, self.returns.len(&cx) - 1usize);
                 let result = new_meta(&cx);
                 self.wait(&cx, Ready::Both.(operand, returned), Action::Try.(TryWait.{ id: n.id, operand, returned, result }), n.pos);
                 result
@@ -1734,7 +1729,7 @@ impl Body['k] {
     }
 
     // Primitive applicability waits for inference, without unfolding nominal types.
-    fn require_primitive(self, &cx: Cx!['k], op: Text['k], operand: Type['k], pos: Pos, unary: bool) {
+    fn require_primitive(self, &cx: Domain!['k], op: Span['k], operand: Type['k], pos: Pos, unary: bool) {
         if is_never(&cx, operand) {
             // No operand value reaches this operation.
             return;
@@ -1742,7 +1737,7 @@ impl Body['k] {
         self.later(&cx, operand, Action::Primitive.(op, operand, unary), pos);
     }
 
-    fn primitive(self, &cx: Cx!['k], op: Text['k], operand: Type['k], unary: bool, pos: Pos) {
+    fn primitive(self, &cx: Domain!['k], op: Span['k], operand: Type['k], unary: bool, pos: Pos) {
         let ty = zonk(&cx, operand);
         let (prim, integer, numeric, boolean) = match ty {
             Type::Prim(name) => (true, C::is_integer(&cx, name), C::is_integer(&cx, name) || C::is_float(&cx, name), name.is(&cx, "bool")),
@@ -1762,15 +1757,15 @@ impl Body['k] {
             numeric
         };
         if !valid {
-            self.fail(&cx, text_of(&cx, Buffer::new().push_static("operator ").push_bytes(&cx, op).push_static(" is not defined for ").push_bytes(&cx, show(&cx, ty))), pos);
+            self.fail(&cx, Buffer::new().push_static("operator ").push_bytes(&cx, op).push_static(" is not defined for ").push_bytes(&cx, show(&cx, ty)).save(&cx), pos);
         }
     }
 
-    fn pat_type(self, &cx: Cx!['k], p: Pat, t: Cell[Option[Type['k]], 'k]) -> Type['k] {
+    fn pat_type(self, &cx: Domain!['k], p: Pat, t: Ref[Option[Type['k]], 'k]) -> Type['k] {
         match p {
             Pat::Bool => C::bool_type(&cx),
             Pat::Unit => C::unit(&cx),
-            Pat::T => match t.get(&cx) {
+            Pat::T => match t.copy(&cx) {
                 Option::Some(v) => v,
                 Option::None => {
                     let v = new_meta(&cx);
@@ -1783,11 +1778,11 @@ impl Body['k] {
     }
 
     // Each premise pairs an expression with a type pattern; `t` is shared by the rule.
-    fn apply(self, &cx: Cx!['k], premises: Seq[(Expr['k], Pat), 'k], result: Pat, pos: Pos) -> Type['k] {
-        let t: Cell[Option[Type['k]], 'k] = Cell::new(&cx, Option::None);
+    fn apply(self, &cx: Domain!['k], premises: ArenaVec[(Expr['k], Pat), 'k], result: Pat, pos: Pos) -> Type['k] {
+        let t: Ref[Option[Type['k]], 'k] = Ref::new(&cx, Option::None);
         var i = 0usize;
         while i < premises.len(&cx) {
-            let (child, p) = premises.get(&cx, i);
+            let (child, p) = premises.at(&cx, i);
             let got = self.expr(&cx, child);
             // a child that diverges fits anywhere
             if !is_never(&cx, got) {
@@ -1796,7 +1791,7 @@ impl Body['k] {
             i = i + 1usize;
         }
         match result {
-            Pat::T => match t.get(&cx) {
+            Pat::T => match t.copy(&cx) {
                 Option::Some(v) => v,
                 Option::None => Type::Never,
             },
@@ -1804,14 +1799,14 @@ impl Body['k] {
         }
     }
 
-    fn literal(self, &cx: Cx!['k], kind: MetaKind, pos: Pos) -> Type['k] {
+    fn literal(self, &cx: Domain!['k], kind: MetaKind, pos: Pos) -> Type['k] {
         let m = Meta::new(&cx, kind);
         m.set_pos(&cx, pos);
         self.literals.push(&cx, m);
         Type::Meta.(m)
     }
 
-    fn expr_lit(self, &cx: Cx!['k], l: S::Lit['k]) -> Type['k] {
+    fn expr_lit(self, &cx: Domain!['k], l: S::Lit['k]) -> Type['k] {
         match l.kind {
             S::LitKind::Int => match l.suffix {
                 Option::Some(suffix) => Type::Prim.(suffix),
@@ -1822,17 +1817,17 @@ impl Body['k] {
                 Option::None => self.literal(&cx, MetaKind::Float, l.pos),
             },
             S::LitKind::Bool => C::bool_type(&cx),
-            S::LitKind::Str => C::named(self.library(&cx, "Slice"), Seq::two(&cx, C::prim(&cx, "u8"), Type::Skolem.(text(&cx, "static")))),
+            S::LitKind::Str => C::named(self.library(&cx, "Slice"), ArenaVec::two(&cx, C::prim(&cx, "u8"), Type::Skolem.(Span::from_static(&cx, "static")))),
         }
     }
 
-    fn expr_fstring(self, &cx: Cx!['k], f: S::FStr['k]) -> Type['k] {
+    fn expr_fstring(self, &cx: Domain!['k], f: S::FStr['k]) -> Type['k] {
         var i = 0usize;
         while i < f.parts.len(&cx) {
-            let unit = match f.parts.get(&cx, i) {
+            let unit = match f.parts.at(&cx, i) {
                 S::Piece::Expr(part) => {
                     let operand = match part {
-                        Expr::Unary(u) => if u.op.is(&cx, "&") { u.operand.get(&cx) } else { part },
+                        Expr::Unary(u) => if u.op.is(&cx, "&") { u.operand.copy(&cx) } else { part },
                         _ => part,
                     };
                     let unit = self.expr(&cx, operand);
@@ -1841,10 +1836,10 @@ impl Body['k] {
             };
             i = i + 1usize;
         }
-        C::named(self.library(&cx, "Buffer"), Seq::new(&cx))
+        C::named(self.library(&cx, "Buffer"), ArenaVec::new(&cx))
     }
 
-    fn expr_path(self, &cx: Cx!['k], p: S::Path['k]) -> Type['k] {
+    fn expr_path(self, &cx: Domain!['k], p: S::Path['k]) -> Type['k] {
         let r = self.inf.r.refs.get(&cx, p.id);
         let unit = match r {
             Option::Some(r) => match r {
@@ -1854,12 +1849,12 @@ impl Body['k] {
                     }
                     let local = match self.lookup(&cx, name) {
                         Option::Some(l) => l,
-                        Option::None => self.fail(&cx, text_of(&cx, Buffer::new().push_static("unknown local ").push_bytes(&cx, name)), p.pos),
+                        Option::None => self.fail(&cx, Buffer::new().push_static("unknown local ").push_bytes(&cx, name).save(&cx), p.pos),
                     };
                     if local.rest.is_some() {
-                        self.fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, name).push_static(" is a ..rest bundle, not a value")), p.pos);
+                        self.fail(&cx, Buffer::new().push_bytes(&cx, name).push_static(" is a ..rest bundle, not a value").save(&cx), p.pos);
                     }
-                    self.results().binders.set(&cx, p.id, local.id);
+                    self.results().binders.insert(&cx, p.id, local.id);
                     return local.type;
                 },
                 NameRef::Decl(decl) => {
@@ -1868,7 +1863,7 @@ impl Body['k] {
                             self.fails(&cx, "constant paths take no type arguments", p.pos);
                         }
                         let value = self.inf.sigs.got(&cx, self.inf.sigs.const_decl(&cx, decl));
-                        self.results().folded.set(&cx, p.id, value);
+                        self.results().folded.insert(&cx, p.id, value);
                         let ty = match const_type(&cx, value) {
                             Option::Some(t) => t,
                             Option::None => self.fails(&cx, "internal error: an untyped constant", p.pos),
@@ -1884,25 +1879,25 @@ impl Body['k] {
             },
             Option::None => (),
         };
-        self.fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, joined_names(&cx, p.names(&cx))).push_static(" is not a value")), p.pos)
+        self.fail(&cx, Buffer::new().push_bytes(&cx, joined_names(&cx, p.names(&cx))).push_static(" is not a value").save(&cx), p.pos)
     }
 
     // A named function keeps its declared parameter modes and result type. Bare names bound by let
     // retain unconstrained brand quantifiers; other parameters are instantiated at the occurrence.
-    fn function_value(self, &cx: Cx!['k], p: S::Path['k], sig: Sig['k]) -> Type['k] {
-        let retain = self.inf.generic.has(&cx, p.id) && !has_args(&cx, p);
-        let kept: Seq[Param['k], 'k] = Seq::new(&cx);
-        let fresh: Seq[Param['k], 'k] = Seq::new(&cx);
+    fn function_value(self, &cx: Domain!['k], p: S::Path['k], sig: Sig['k]) -> Type['k] {
+        let retain = self.inf.generic.contains(&cx, p.id) && !has_args(&cx, p);
+        let kept: ArenaVec[Param['k], 'k] = ArenaVec::new(&cx);
+        let fresh: ArenaVec[Param['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < sig.params.len(&cx) {
-            let param = sig.params.get(&cx, i);
+            let param = sig.params.at(&cx, i);
             var keep = retain && is_brand(param.kind);
             var k = 0usize;
             while keep && k < sig.premises.len(&cx) {
-                let args = sig.premises.get(&cx, k).args;
+                let args = sig.premises.at(&cx, k).args;
                 var a = 0usize;
                 while keep && a < args.len(&cx) {
-                    keep = !free_names(&cx, zonk(&cx, args.get(&cx, a))).has(&cx, param.name);
+                    keep = !free_names(&cx, zonk(&cx, args.at(&cx, a))).contains(&cx, param.name);
                     a = a + 1usize;
                 }
                 k = k + 1usize;
@@ -1916,24 +1911,24 @@ impl Body['k] {
         }
         let sub = instantiate(&cx, fresh);
         self.explicit_args(&cx, p, sig, sub);
-        self.results().calls.set(&cx, p.id, Callee::Fn.(FnCall.{ sig, sub, receiver: Option::None }));
+        self.results().calls.insert(&cx, p.id, Callee::Fn.(FnCall.{ sig, sub, receiver: Option::None }));
         self.require_signature(&cx, sig, sub, p.pos);
         C::fn_type(&cx, self.subst_all(&cx, sig.ptypes, sub), subst(&cx, sig.ret, sub, self.inf.counter), kept, sig.is_unsafe, sig.places)
     }
 
     // Type arguments written on a callee path: on its last segment, the function's own; on the type
     // segment of `Type[A]::f`, its impl's.
-    fn explicit_args(self, &cx: Cx!['k], path: S::Path['k], sig: Sig['k], sub: Map[Text['k], Type['k], 'k]) {
+    fn explicit_args(self, &cx: Domain!['k], path: S::Path['k], sig: Sig['k], sub: ArenaMap[Span['k], Type['k], 'k]) {
         let segments = path.segments;
         let count = segments.len(&cx);
         let impl_block = match sig.decl {
             Option::Some(d) => if d.kind.is(&cx, "method") { d.impl_block } else { Option::None },
             Option::None => Option::None,
         };
-        let own = segments.get(&cx, count - 1usize).args;
+        let own = segments.at(&cx, count - 1usize).args;
         var index = 0usize;
         while index + 1usize < count {
-            if !segments.get(&cx, index).args.is_empty(&cx) && !(index + 2usize == count && impl_block.is_some()) {
+            if !segments.at(&cx, index).args.is_empty(&cx) && !(index + 2usize == count && impl_block.is_some()) {
                 self.fails(&cx, "function type arguments cannot appear on a namespace", path.pos);
             }
             index = index + 1usize;
@@ -1946,16 +1941,16 @@ impl Body['k] {
             Option::None => 0usize,
         };
         if !own.is_empty(&cx) {
-            let explicit: Seq[Param['k], 'k] = Seq::new(&cx);
+            let explicit: ArenaVec[Param['k], 'k] = ArenaVec::new(&cx);
             var i = 0usize;
             while i < sig.params.len(&cx) {
-                if !sig.params.get(&cx, i).name.starts_with(&cx, text(&cx, "Env#")) {
-                    explicit.push(&cx, sig.params.get(&cx, i));
+                if !sig.params.at(&cx, i).name.starts_with(&cx, Span::from_static(&cx, "Env#")) {
+                    explicit.push(&cx, sig.params.at(&cx, i));
                 }
                 i = i + 1usize;
             }
             let split = if impl_params < explicit.len(&cx) { impl_params } else { explicit.len(&cx) };
-            let mine = explicit.from(&cx, split);
+            let mine = explicit.skip(&cx, split);
             let outer = explicit.slice(&cx, 0usize, split);
             let params = if mine.len(&cx) == own.len(&cx) {
                 mine
@@ -1964,23 +1959,23 @@ impl Body['k] {
             } else if outer.len(&cx) == own.len(&cx) {
                 outer
             } else {
-                self.fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, segments.get(&cx, count - 1usize).name).push_static(" takes ").push_usize(mine.len(&cx)).push_static(" type arguments")), path.pos)
+                self.fail(&cx, Buffer::new().push_bytes(&cx, segments.at(&cx, count - 1usize).name).push_static(" takes ").push_usize(mine.len(&cx)).push_static(" type arguments").save(&cx), path.pos)
             };
             i = 0usize;
             while i < params.len(&cx) {
-                let a = own.get(&cx, i);
+                let a = own.at(&cx, i);
                 let skipped = match a {
                     S::Type::Ignored => true,
                     S::Type::Brand(b) => b.is(&cx, "'_"),
                     _ => false,
                 };
-                if !skipped && sub.has(&cx, params.get(&cx, i).name) {
-                    self.unify_at(&cx, sub.at(&cx, params.get(&cx, i).name), self.core_type(&cx, a), path.pos);
+                if !skipped && sub.contains(&cx, params.at(&cx, i).name) {
+                    self.unify_at(&cx, sub.at(&cx, params.at(&cx, i).name), self.core_type(&cx, a), path.pos);
                 }
                 i = i + 1usize;
             }
         }
-        if count >= 2usize && !segments.get(&cx, count - 2usize).args.is_empty(&cx) {
+        if count >= 2usize && !segments.at(&cx, count - 2usize).args.is_empty(&cx) {
             let unit = match impl_block {
                 Option::Some(b) => {
                     let (_params, _premises, scope) = self.inf.sigs.quantifier(&cx, b.quantifier, new_scope(&cx));
@@ -1997,14 +1992,14 @@ impl Body['k] {
                     if !same {
                         self.fails(&cx, "method type arguments belong on the impl type, not a namespace", path.pos);
                     }
-                    let written = segments.get(&cx, count - 2usize).args;
+                    let written = segments.at(&cx, count - 2usize).args;
                     if written.len(&cx) != args.len(&cx) {
-                        self.fail(&cx, text_of(&cx, Buffer::new().push_static("the impl type qualifier takes ").push_usize(args.len(&cx)).push_static(" type arguments")), path.pos);
+                        self.fail(&cx, Buffer::new().push_static("the impl type qualifier takes ").push_usize(args.len(&cx)).push_static(" type arguments").save(&cx), path.pos);
                     }
-                    let given: Seq[Type['k], 'k] = Seq::new(&cx);
+                    let given: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
                     var i = 0usize;
                     while i < written.len(&cx) {
-                        given.push(&cx, self.core_type(&cx, written.get(&cx, i)));
+                        given.push(&cx, self.core_type(&cx, written.at(&cx, i)));
                         i = i + 1usize;
                     }
                     self.unify_at(&cx, subst(&cx, target, sub, self.inf.counter), C::named(name, given), path.pos);
@@ -2015,7 +2010,7 @@ impl Body['k] {
     }
 
     // Arguments belong on the declaration name, before a variant or method if present.
-    fn path_arguments(self, &cx: Cx!['k], path: S::Path['k], declaration: Decl['k], member: bool) -> Seq[S::Type['k], 'k] {
+    fn path_arguments(self, &cx: Domain!['k], path: S::Path['k], declaration: Decl['k], member: bool) -> ArenaVec[S::Type['k], 'k] {
         let count = path.segments.len(&cx);
         let drop = if member { 2usize } else { 1usize };
         let owner = if count >= drop { Option::Some.(count - drop) } else { Option::None };
@@ -2025,14 +2020,14 @@ impl Body['k] {
                 Option::Some(o) => o == i,
                 Option::None => false,
             };
-            if !path.segments.get(&cx, i).args.is_empty(&cx) && !at_owner {
-                self.fail(&cx, text_of(&cx, Buffer::new().push_static("type arguments belong on ").push_bytes(&cx, declaration.name).push_static(", not a namespace or member")), path.pos);
+            if !path.segments.at(&cx, i).args.is_empty(&cx) && !at_owner {
+                self.fail(&cx, Buffer::new().push_static("type arguments belong on ").push_bytes(&cx, declaration.name).push_static(", not a namespace or member").save(&cx), path.pos);
             }
             i = i + 1usize;
         }
         let written = match owner {
-            Option::Some(o) => path.segments.get(&cx, o).args,
-            Option::None => Seq::new(&cx),
+            Option::Some(o) => path.segments.at(&cx, o).args,
+            Option::None => ArenaVec::new(&cx),
         };
         if member && !written.is_empty(&cx) {
             let names = path.names(&cx);
@@ -2041,7 +2036,7 @@ impl Body['k] {
                 _ => false,
             };
             if !same {
-                self.fail(&cx, text_of(&cx, Buffer::new().push_static("type arguments belong on ").push_bytes(&cx, declaration.name).push_static(", not a namespace")), path.pos);
+                self.fail(&cx, Buffer::new().push_static("type arguments belong on ").push_bytes(&cx, declaration.name).push_static(", not a namespace").save(&cx), path.pos);
             }
         }
         written
@@ -2049,53 +2044,53 @@ impl Body['k] {
 
     // The type a struct, tuple or enum is built at: its parameters instantiated, and any written ones
     // applied.
-    fn construct(self, &cx: Cx!['k], pos: Pos, decl: Decl['k], written: Seq[S::Type['k], 'k]) -> (TypeDecl['k], Map[Text['k], Type['k], 'k], Type['k]) {
+    fn construct(self, &cx: Domain!['k], pos: Pos, decl: Decl['k], written: ArenaVec[S::Type['k], 'k]) -> (TypeDecl['k], ArenaMap[Span['k], Type['k], 'k], Type['k]) {
         let td = self.inf.sigs.types.at(&cx, self.inf.sigs.name(&cx, decl));
-        self.require_visible_shape(&cx, C::named(td.name, Seq::new(&cx)), pos);
+        self.require_visible_shape(&cx, C::named(td.name, ArenaVec::new(&cx)), pos);
         if written.len(&cx) > td.params.len(&cx) {
-            self.fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, td.name).push_static(" accepts at most ").push_usize(td.params.len(&cx)).push_static(" type arguments, got ").push_usize(written.len(&cx))), pos);
+            self.fail(&cx, Buffer::new().push_bytes(&cx, td.name).push_static(" accepts at most ").push_usize(td.params.len(&cx)).push_static(" type arguments, got ").push_usize(written.len(&cx)).save(&cx), pos);
         }
         let sub = instantiate(&cx, td.params);
         var i = 0usize;
         while i < written.len(&cx) {
-            self.unify_at(&cx, sub.at(&cx, td.params.get(&cx, i).name), self.core_type(&cx, written.get(&cx, i)), pos);
+            self.unify_at(&cx, sub.at(&cx, td.params.at(&cx, i).name), self.core_type(&cx, written.at(&cx, i)), pos);
             i = i + 1usize;
         }
         self.require_parameter_kinds(&cx, td.params, sub, pos);
-        let args: Seq[Type['k], 'k] = Seq::new(&cx);
+        let args: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         i = 0usize;
         while i < td.params.len(&cx) {
-            args.push(&cx, sub.at(&cx, td.params.get(&cx, i).name));
+            args.push(&cx, sub.at(&cx, td.params.at(&cx, i).name));
             i = i + 1usize;
         }
         (td, sub, C::named(td.name, args))
     }
 
-    fn payload_of(self, &cx: Cx!['k], td: TypeDecl['k], name: Text['k], sub: Map[Text['k], Type['k], 'k]) -> Type['k] {
+    fn payload_of(self, &cx: Domain!['k], td: TypeDecl['k], name: Span['k], sub: ArenaMap[Span['k], Type['k], 'k]) -> Type['k] {
         let variants = match td.body {
             Type::Enum(variants) => variants,
             _ => self.fails(&cx, "internal error: a variant of a type that is not an enum", no_pos()),
         };
         var i = 0usize;
         while i < variants.len(&cx) {
-            if variants.get(&cx, i).name.eq(&cx, name) {
-                return subst(&cx, variants.get(&cx, i).type, sub, self.inf.counter);
+            if variants.at(&cx, i).name.eq(&cx, name) {
+                return subst(&cx, variants.at(&cx, i).type, sub, self.inf.counter);
             }
             i = i + 1usize;
         }
         self.fails(&cx, "internal error: an unknown variant", no_pos())
     }
 
-    fn variant(self, &cx: Cx!['k], path: S::Path['k], enum_decl: Decl['k], name: Text['k], payload_args: Option[Seq[Expr['k], 'k]]) -> Type['k] {
+    fn variant(self, &cx: Domain!['k], path: S::Path['k], enum_decl: Decl['k], name: Span['k], payload_args: Option[ArenaVec[Expr['k], 'k]]) -> Type['k] {
         let (td, sub, result) = self.construct(&cx, path.pos, enum_decl, self.path_arguments(&cx, path, enum_decl, true));
         let payload = self.payload_of(&cx, td, name, sub);
-        self.results().calls.set(&cx, path.id, Callee::Variant.(name));
+        self.results().calls.insert(&cx, path.id, Callee::Variant.(name));
         let unit = match payload_args {
             Option::None => if !C::same(&cx, payload, C::unit(&cx)) {
-                self.fail(&cx, text_of(&cx, Buffer::new().push_static("variant ").push_bytes(&cx, name).push_static(" carries a payload")), path.pos);
+                self.fail(&cx, Buffer::new().push_static("variant ").push_bytes(&cx, name).push_static(" carries a payload").save(&cx), path.pos);
             },
             Option::Some(args) => if args.len(&cx) == 1usize {
-                let unit = self.check(&cx, args.get(&cx, 0usize), Option::Some.(payload));
+                let unit = self.check(&cx, args.at(&cx, 0usize), Option::Some.(payload));
             } else {
                 let elems = match payload {
                     Type::Tuple(elems) => if elems.len(&cx) == args.len(&cx) { Option::Some.(elems) } else { Option::None },
@@ -2105,26 +2100,26 @@ impl Body['k] {
                     Option::Some(types) => {
                         var i = 0usize;
                         while i < args.len(&cx) {
-                            let unit = self.check(&cx, args.get(&cx, i), Option::Some.(types.get(&cx, i)));
+                            let unit = self.check(&cx, args.at(&cx, i), Option::Some.(types.at(&cx, i)));
                             i = i + 1usize;
                         }
                     },
-                    Option::None => self.fail(&cx, text_of(&cx, Buffer::new().push_static("variant ").push_bytes(&cx, name).push_static(" takes one payload")), path.pos),
+                    Option::None => self.fail(&cx, Buffer::new().push_static("variant ").push_bytes(&cx, name).push_static(" takes one payload").save(&cx), path.pos),
                 }
             },
         };
         result
     }
 
-    fn expr_array(self, &cx: Cx!['k], a: S::ArrayLit['k]) -> Type['k] {
+    fn expr_array(self, &cx: Domain!['k], a: S::ArrayLit['k]) -> Type['k] {
         let elem = new_meta(&cx);
         var i = 0usize;
         while i < a.elems.len(&cx) {
-            let unit = self.check(&cx, a.elems.get(&cx, i), Option::Some.(elem));
+            let unit = self.check(&cx, a.elems.at(&cx, i), Option::Some.(elem));
             i = i + 1usize;
         }
         if !a.fill {
-            return Type::Array.(Cell::new(&cx, elem), a.elems.len(&cx) as u64);
+            return Type::Array.(Ref::new(&cx, elem), a.elems.len(&cx) as u64);
         }
         // `[x, ..]` gets its length from the type it is used at
         let result = new_meta(&cx);
@@ -2132,7 +2127,7 @@ impl Body['k] {
         result
     }
 
-    fn expr_struct_lit(self, &cx: Cx!['k], s: S::StructLit['k]) -> Type['k] {
+    fn expr_struct_lit(self, &cx: Domain!['k], s: S::StructLit['k]) -> Type['k] {
         let decl = match self.inf.r.refs.get(&cx, s.path.id) {
             Option::Some(r) => match r {
                 NameRef::Decl(d) => d,
@@ -2145,22 +2140,22 @@ impl Body['k] {
             Type::Struct(members) => members,
             _ => self.fails(&cx, "internal error: a struct literal of something other than a struct", s.pos),
         };
-        let fields: Map[Text['k], Type['k], 'k] = Map::new(&cx);
+        let fields: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
         var i = 0usize;
         while i < members.len(&cx) {
-            fields.set(&cx, members.get(&cx, i).name, subst(&cx, members.get(&cx, i).type, sub, self.inf.counter));
+            fields.insert(&cx, members.at(&cx, i).name, subst(&cx, members.at(&cx, i).type, sub, self.inf.counter));
             i = i + 1usize;
         }
-        let given: Set[Text['k], 'k] = Set::new(&cx);
-        let field_ids: Map[Text['k], u32, 'k] = Map::new(&cx);
-        self.results().field_ids.set(&cx, s.id, field_ids);
+        let given: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+        let field_ids: ArenaMap[Span['k], u32, 'k] = ArenaMap::new(&cx);
+        self.results().field_ids.insert(&cx, s.id, field_ids);
         i = 0usize;
         while i < s.fields.len(&cx) {
-            let f = s.fields.get(&cx, i);
-            if !fields.has(&cx, f.name) || given.has(&cx, f.name) {
-                self.fail(&cx, text_of(&cx, Buffer::new().push_static("field ").push_bytes(&cx, f.name).push_static(" is unknown or given twice")), s.pos);
+            let f = s.fields.at(&cx, i);
+            if !fields.contains(&cx, f.name) || given.contains(&cx, f.name) {
+                self.fail(&cx, Buffer::new().push_static("field ").push_bytes(&cx, f.name).push_static(" is unknown or given twice").save(&cx), s.pos);
             }
-            given.add(&cx, f.name);
+            given.insert(&cx, f.name);
             let unit = match f.value {
                 Option::Some(v) => {
                     let unit = self.check(&cx, v, Option::Some.(fields.at(&cx, f.name)));
@@ -2168,9 +2163,9 @@ impl Body['k] {
                 Option::None => {
                     let local = match self.lookup(&cx, f.name) {
                         Option::Some(l) => l,
-                        Option::None => self.fail(&cx, text_of(&cx, Buffer::new().push_static("unknown local ").push_bytes(&cx, f.name)), s.pos),
+                        Option::None => self.fail(&cx, Buffer::new().push_static("unknown local ").push_bytes(&cx, f.name).save(&cx), s.pos),
                     };
-                    field_ids.set(&cx, f.name, local.id);
+                    field_ids.insert(&cx, f.name, local.id);
                     self.unify_at(&cx, local.type, fields.at(&cx, f.name), s.pos);
                 },
             };
@@ -2181,44 +2176,44 @@ impl Body['k] {
                 let bundle = match self.lookup(&cx, spread) {
                     Option::Some(rest) => match rest.rest {
                         Option::Some(b) => {
-                            self.results().spread_ids.set(&cx, s.id, rest.id);
+                            self.results().spread_ids.insert(&cx, s.id, rest.id);
                             b
                         },
-                        Option::None => self.fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, spread).push_static(" is not a ..rest bundle")), s.pos),
+                        Option::None => self.fail(&cx, Buffer::new().push_bytes(&cx, spread).push_static(" is not a ..rest bundle").save(&cx), s.pos),
                     },
-                    Option::None => self.fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, spread).push_static(" is not a ..rest bundle")), s.pos),
+                    Option::None => self.fail(&cx, Buffer::new().push_bytes(&cx, spread).push_static(" is not a ..rest bundle").save(&cx), s.pos),
                 };
                 self.wait(&cx, Ready::Filled.(bundle), Action::Spread.(Spread.{ spread, fields, given, bundle }), s.pos);
             },
             Option::None => if given.len(&cx) != fields.len(&cx) {
-                let missing: Seq[Text['k], 'k] = Seq::new(&cx);
+                let missing: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
                 let names = fields.keys(&cx);
                 i = 0usize;
                 while i < names.len(&cx) {
-                    if !given.has(&cx, names.get(&cx, i)) {
-                        missing.push(&cx, names.get(&cx, i));
+                    if !given.contains(&cx, names.at(&cx, i)) {
+                        missing.push(&cx, names.at(&cx, i));
                     }
                     i = i + 1usize;
                 }
-                missing.sort(&cx, text_before);
+                missing.sort_by(&cx, |&cx, a, b| a.cmp(&cx, b));
                 var out = Buffer::new().push_static("missing fields [");
                 i = 0usize;
                 while i < missing.len(&cx) {
                     if i > 0usize {
                         out = out.push_static(", ");
                     }
-                    out = out.push_bytes(&cx, repr(&cx, missing.get(&cx, i)));
+                    out = out.push_bytes(&cx, repr(&cx, missing.at(&cx, i)));
                     i = i + 1usize;
                 }
-                self.fail(&cx, text_of(&cx, out.push_static("]")), s.pos);
+                self.fail(&cx, out.push_static("]").save(&cx), s.pos);
             },
         };
         result
     }
 
-    fn expr_for(self, &cx: Cx!['k], f: S::For['k]) -> Type['k] {
-        let target = match f.iterator.get(&cx) {
-            Expr::Unary(u) => if u.op.is(&cx, "&") { Option::Some.(u.operand.get(&cx)) } else { Option::None },
+    fn expr_for(self, &cx: Domain!['k], f: S::For['k]) -> Type['k] {
+        let target = match f.iterator.copy(&cx) {
+            Expr::Unary(u) => if u.op.is(&cx, "&") { Option::Some.(u.operand.copy(&cx)) } else { Option::None },
             _ => Option::None,
         };
         let operand = match target {
@@ -2227,27 +2222,27 @@ impl Body['k] {
         };
         let it = self.place_type(&cx, operand, false);
         let item = new_meta(&cx);
-        let next = TraitCall.{ trait_name: self.library(&cx, "Iterator"), method: text(&cx, "next"), targs: Seq::two(&cx, it, item), receiver: Option::None };
-        self.results().next_calls.set(&cx, f.id, next);
+        let next = TraitCall.{ trait_name: self.library(&cx, "Iterator"), method: Span::from_static(&cx, "next"), targs: ArenaVec::two(&cx, it, item), receiver: Option::None };
+        self.results().next_calls.insert(&cx, f.id, next);
         self.require(&cx, next.trait_name, next.targs, f.pos);
-        let option = C::named(self.library(&cx, "Option"), Seq::one(&cx, item));
-        self.results().options.set(&cx, f.id, option);
+        let option = C::named(self.library(&cx, "Option"), ArenaVec::one(&cx, item));
+        self.results().options.insert(&cx, f.id, option);
         self.require_visible_shape(&cx, option, f.pos);
-        self.scopes.push(&cx, new_level(&cx));
-        self.results().binders.set(&cx, f.id, self.bind(&cx, f.name, item, false, Option::None).id);
+        self.enter(&cx);
+        self.results().binders.insert(&cx, f.id, self.bind(&cx, f.name, item, false, Option::None).id);
         let unit = self.check(&cx, Expr::Block.(f.body), Option::Some.(C::unit(&cx)));
         self.leave(&cx);
         C::unit(&cx)
     }
 
-    fn expr_match(self, &cx: Cx!['k], m: S::Match['k]) -> Type['k] {
-        let scrutinee = m.scrutinee.get(&cx);
+    fn expr_match(self, &cx: Domain!['k], m: S::Match['k]) -> Type['k] {
+        let scrutinee = m.scrutinee.copy(&cx);
         let place = match scrutinee {
-            Expr::Unary(u) => if u.op.is(&cx, "&") && self.is_place(&cx, u.operand.get(&cx)) { Option::Some.(u.operand.get(&cx)) } else { Option::None },
+            Expr::Unary(u) => if u.op.is(&cx, "&") && self.is_place(&cx, u.operand.copy(&cx)) { Option::Some.(u.operand.copy(&cx)) } else { Option::None },
             _ => Option::None,
         };
         let lent = place.is_some();
-        self.results().lent.set(&cx, m.id, lent);
+        self.results().lent.insert(&cx, m.id, lent);
         let ty = match place {
             Option::Some(p) => self.place_type(&cx, p, false),
             Option::None => self.expr(&cx, scrutinee),
@@ -2256,11 +2251,11 @@ impl Body['k] {
         var result: Option[Type['k]] = Option::None;
         var i = 0usize;
         while i < m.arms.len(&cx) {
-            let arm = m.arms.get(&cx, i);
-            self.scopes.push(&cx, new_level(&cx));
+            let arm = m.arms.at(&cx, i);
+            self.enter(&cx);
             var k = 0usize;
             while k < arm.cases.len(&cx) {
-                self.case(&cx, arm.cases.get(&cx, k), ty, lent, arm.cases.len(&cx) == 1usize, m.pos);
+                self.case(&cx, arm.cases.at(&cx, k), ty, lent, arm.cases.len(&cx) == 1usize, m.pos);
                 k = k + 1usize;
             }
             let arm_ty = self.expr(&cx, arm.body);
@@ -2277,7 +2272,7 @@ impl Body['k] {
         }
     }
 
-    fn case(self, &cx: Cx!['k], c: S::Case['k], ty: Type['k], lent: bool, alone: bool, pos: Pos) {
+    fn case(self, &cx: Domain!['k], c: S::Case['k], ty: Type['k], lent: bool, alone: bool, pos: Pos) {
         let unit = match c.kind {
             S::CaseKind::Wild => return,
             S::CaseKind::Value => {
@@ -2300,10 +2295,10 @@ impl Body['k] {
         let (td, sub, scrutinee) = self.construct(&cx, path.pos, enum_decl, self.path_arguments(&cx, path, enum_decl, true));
         self.unify_at(&cx, scrutinee, ty, pos);
         let payload = self.payload_of(&cx, td, name, sub);
-        self.results().types.set(&cx, c.id, payload);
+        self.results().types.insert(&cx, c.id, payload);
         self.recorded.push(&cx, c.id);
-        let ids: Seq[Option[u32], 'k] = Seq::new(&cx);
-        self.results().case_binders.set(&cx, c.id, ids);
+        let ids: ArenaVec[Option[u32], 'k] = ArenaVec::new(&cx);
+        self.results().case_binders.insert(&cx, c.id, ids);
         let binders = match c.binders {
             Option::Some(b) => b,
             Option::None => return,
@@ -2312,46 +2307,46 @@ impl Body['k] {
             self.fails(&cx, "a grouped arm binds no payload", pos);
         }
         let types = if binders.len(&cx) == 1usize {
-            Seq::one(&cx, payload)
+            ArenaVec::one(&cx, payload)
         } else {
             match payload {
                 Type::Tuple(elems) => if elems.len(&cx) == binders.len(&cx) {
                     elems
                 } else {
-                    self.fail(&cx, text_of(&cx, Buffer::new().push_static("variant ").push_bytes(&cx, name).push_static(" does not carry ").push_usize(binders.len(&cx)).push_static(" values")), pos)
+                    self.fail(&cx, Buffer::new().push_static("variant ").push_bytes(&cx, name).push_static(" does not carry ").push_usize(binders.len(&cx)).push_static(" values").save(&cx), pos)
                 },
-                _ => self.fail(&cx, text_of(&cx, Buffer::new().push_static("variant ").push_bytes(&cx, name).push_static(" does not carry ").push_usize(binders.len(&cx)).push_static(" values")), pos),
+                _ => self.fail(&cx, Buffer::new().push_static("variant ").push_bytes(&cx, name).push_static(" does not carry ").push_usize(binders.len(&cx)).push_static(" values").save(&cx), pos),
             }
         };
         var i = 0usize;
         while i < binders.len(&cx) {
-            let b = binders.get(&cx, i);
-            ids.push(&cx, if b.is(&cx, "_") { Option::None } else { Option::Some.(self.bind(&cx, b, types.get(&cx, i), lent, Option::None).id) });
+            let b = binders.at(&cx, i);
+            ids.push(&cx, if b.is(&cx, "_") { Option::None } else { Option::Some.(self.bind(&cx, b, types.at(&cx, i), lent, Option::None).id) });
             i = i + 1usize;
         }
     }
 
-    fn captures(self, &cx: Cx!['k], frame: Frame['k]) -> Seq[Capture['k], 'k] {
-        let out: Seq[Capture['k], 'k] = Seq::new(&cx);
+    fn captures(self, &cx: Domain!['k], frame: Frame['k]) -> ArenaVec[Capture['k], 'k] {
+        let out: ArenaVec[Capture['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < frame.locals.len(&cx) {
-            let (name, local) = frame.locals.get(&cx, i);
+            let (name, local) = frame.locals.at(&cx, i);
             out.push(&cx, Capture.{ name, binder: local.id });
             i = i + 1usize;
         }
         out
     }
 
-    fn expr_closure(self, &cx: Cx!['k], c: S::Closure['k]) -> Type['k] {
-        let params: Seq[Type['k], 'k] = Seq::new(&cx);
-        let places: Seq[usize, 'k] = Seq::new(&cx);
+    fn expr_closure(self, &cx: Domain!['k], c: S::Closure['k]) -> Type['k] {
+        let params: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
+        let places: ArenaVec[usize, 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < c.params.len(&cx) {
-            params.push(&cx, match c.params.get(&cx, i).type {
+            params.push(&cx, match c.params.at(&cx, i).type {
                 Option::Some(t) => self.core_type(&cx, t),
                 Option::None => new_meta(&cx),
             });
-            if c.params.get(&cx, i).lend {
+            if c.params.at(&cx, i).lend {
                 places.push(&cx, i + 1usize);
             }
             i = i + 1usize;
@@ -2362,56 +2357,56 @@ impl Body['k] {
         };
         let frame = new_frame(&cx);
         self.frames.push(&cx, frame);
-        self.scopes.push(&cx, new_level(&cx));
-        let ids: Seq[u32, 'k] = Seq::new(&cx);
+        self.enter(&cx);
+        let ids: ArenaVec[u32, 'k] = ArenaVec::new(&cx);
         i = 0usize;
         while i < c.params.len(&cx) {
-            let p = c.params.get(&cx, i);
-            ids.push(&cx, self.bind(&cx, p.name, params.get(&cx, i), p.lend, Option::None).id);
+            let p = c.params.at(&cx, i);
+            ids.push(&cx, self.bind(&cx, p.name, params.at(&cx, i), p.lend, Option::None).id);
             i = i + 1usize;
         }
-        self.results().param_ids.set(&cx, c.id, ids);
+        self.results().param_ids.insert(&cx, c.id, ids);
         self.returns.push(&cx, ret);
-        let unit = self.check(&cx, c.body.get(&cx), Option::Some.(ret));
+        let unit = self.check(&cx, c.body.copy(&cx), Option::Some.(ret));
         let unit = self.returns.pop(&cx);
         self.leave(&cx);
         let unit = self.frames.pop(&cx);
-        self.results().captures.set(&cx, c.id, self.captures(&cx, frame));
-        let env_types: Seq[Type['k], 'k] = Seq::new(&cx);
+        self.results().captures.insert(&cx, c.id, self.captures(&cx, frame));
+        let env_types: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         i = 0usize;
         while i < frame.locals.len(&cx) {
-            let (_n, l) = frame.locals.get(&cx, i);
+            let (_n, l) = frame.locals.at(&cx, i);
             env_types.push(&cx, l.type);
             i = i + 1usize;
         }
         let env = Type::Tuple.(env_types);
-        let code_params = Seq::one(&cx, env);
+        let code_params = ArenaVec::one(&cx, env);
         code_params.append(&cx, params);
-        let code = C::fn_type(&cx, code_params, ret, Seq::new(&cx), false, places);
-        Type::Struct.(Seq::two(&cx, Member.{ name: text(&cx, "env"), type: env }, Member.{ name: text(&cx, "code"), type: code }))
+        let code = C::fn_type(&cx, code_params, ret, ArenaVec::new(&cx), false, places);
+        Type::Struct.(ArenaVec::two(&cx, Member.{ name: Span::from_static(&cx, "env"), type: env }, Member.{ name: Span::from_static(&cx, "code"), type: code }))
     }
 
-    fn expr_pack(self, &cx: Cx!['k], p: S::Pack['k]) -> Type['k] {
+    fn expr_pack(self, &cx: Domain!['k], p: S::Pack['k]) -> Type['k] {
         let sub = self.brand_sub(&cx);
-        let witnesses: Seq[Type['k], 'k] = Seq::new(&cx);
-        let labels: Seq[Text['k], 'k] = Seq::new(&cx);
+        let witnesses: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
+        let labels: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < p.brands.len(&cx) {
-            let name = p.brands.get(&cx, i).from(1usize);
-            var known = name.is(&cx, "static") || sub.has(&cx, name);
+            let name = p.brands.at(&cx, i).skip(1usize);
+            var known = name.is(&cx, "static") || sub.contains(&cx, name);
             var k = 0usize;
             while !known && k < self.sig.params.len(&cx) {
-                known = is_brand(self.sig.params.get(&cx, k).kind) && self.sig.params.get(&cx, k).name.eq(&cx, name);
+                known = is_brand(self.sig.params.at(&cx, k).kind) && self.sig.params.at(&cx, k).name.eq(&cx, name);
                 k = k + 1usize;
             }
             if !known {
-                self.fail(&cx, text_of(&cx, Buffer::new().push_static("pack brand ").push_bytes(&cx, name).push_static(" is not in scope")), p.pos);
+                self.fail(&cx, Buffer::new().push_static("pack brand ").push_bytes(&cx, name).push_static(" is not in scope").save(&cx), p.pos);
             }
             i = i + 1usize;
         }
         i = 0usize;
         while i < p.brands.len(&cx) {
-            let name = p.brands.get(&cx, i).from(1usize);
+            let name = p.brands.at(&cx, i).skip(1usize);
             let witness = sub.get_or(&cx, name, Type::Skolem.(name));
             witnesses.push(&cx, witness);
             labels.push(&cx, match witness {
@@ -2420,8 +2415,8 @@ impl Body['k] {
             });
             i = i + 1usize;
         }
-        self.results().witnesses.set(&cx, p.id, witnesses);
-        let value = self.expr(&cx, p.value.get(&cx));
+        self.results().witnesses.insert(&cx, p.id, witnesses);
+        let value = self.expr(&cx, p.value.copy(&cx));
         let result = new_meta(&cx);
         let wait = PackWait.{ result, value, labels, pos: p.pos };
         // the type it is used at says which brands are hidden
@@ -2431,93 +2426,93 @@ impl Body['k] {
     }
 
     // Otherwise a pack's type is the payload's, with the brands abstracted.
-    fn pack_default(self, &cx: Cx!['k], p: PackWait['k]) {
-        let binders: Seq[Text['k], 'k] = Seq::new(&cx);
-        let sub: Map[Text['k], Type['k], 'k] = Map::new(&cx);
+    fn pack_default(self, &cx: Domain!['k], p: PackWait['k]) {
+        let binders: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
         var i = 0usize;
         while i < p.labels.len(&cx) {
-            let binder = text_of(&cx, Buffer::new().push_static("p").push_usize(i));
+            let binder = Buffer::new().push_static("p").push_usize(i).save(&cx);
             binders.push(&cx, binder);
-            sub.set(&cx, p.labels.get(&cx, i), Type::Skolem.(binder));
+            sub.insert(&cx, p.labels.at(&cx, i), Type::Skolem.(binder));
             i = i + 1usize;
         }
-        self.unify_at(&cx, p.result, Type::Exists.(binders, Cell::new(&cx, subst(&cx, zonk(&cx, p.value), sub, self.inf.counter))), no_pos());
+        self.unify_at(&cx, p.result, Type::Exists.(binders, Ref::new(&cx, subst(&cx, zonk(&cx, p.value), sub, self.inf.counter))), no_pos());
     }
 
-    fn expr_foreach(self, &cx: Cx!['k], f: S::Foreach['k]) -> Type['k] {
-        var source = zonk(&cx, self.expr(&cx, f.source.get(&cx)));
+    fn expr_foreach(self, &cx: Domain!['k], f: S::Foreach['k]) -> Type['k] {
+        var source = zonk(&cx, self.expr(&cx, f.source.copy(&cx)));
         if is_unsolved(&cx, source) {
             source = self.shape(&cx, source, f.pos);
         }
-        self.require(&cx, text(&cx, "builtin::Exposed"), Seq::one(&cx, source), f.pos);
+        self.require(&cx, Span::from_static(&cx, "builtin::Exposed"), ArenaVec::one(&cx, source), f.pos);
         let binder = match f.binder {
             Option::Some(b) => b,
-            Option::None => text_of(&cx, Buffer::new().push_static("#F").push_u64(self.inf.next_id(&cx) as u64)),
+            Option::None => Buffer::new().push_static("#F").push_u64(self.inf.next_id(&cx) as u64).save(&cx),
         };
-        self.kinds.set(&cx, binder, Kind::Any);
+        self.kinds.insert(&cx, binder, Kind::Any);
         let (indirect, item) = match source {
             Type::Foreach(s) => {
                 let names = foreach_binders(&cx, s);
                 var i = 0usize;
                 while i < names.len(&cx) {
-                    self.kinds.set(&cx, names.get(&cx, i), Kind::Any);
+                    self.kinds.insert(&cx, names.at(&cx, i), Kind::Any);
                     i = i + 1usize;
                 }
-                (false, s.body.get(&cx))
+                (false, s.body.copy(&cx))
             },
             _ => {
                 let indirect = match self.shape(&cx, source, f.pos) {
                     Type::Ptr(_p) => true,
                     _ => false,
                 };
-                let named = C::named(binder, Seq::new(&cx));
+                let named = C::named(binder, ArenaVec::new(&cx));
                 (indirect, if indirect { C::ptr(&cx, named) } else { named })
             },
         };
         let frame = new_frame(&cx);
         self.frames.push(&cx, frame);
-        self.scopes.push(&cx, new_level(&cx));
-        self.results().binders.set(&cx, f.id, self.bind(&cx, f.name, item, false, Option::None).id);
+        self.enter(&cx);
+        self.results().binders.insert(&cx, f.id, self.bind(&cx, f.name, item, false, Option::None).id);
         let body = zonk(&cx, self.expr(&cx, Expr::Block.(f.body)));
         self.leave(&cx);
         let unit = self.frames.pop(&cx);
-        self.results().captures.set(&cx, f.id, self.captures(&cx, frame));
+        self.results().captures.insert(&cx, f.id, self.captures(&cx, frame));
         C::foreach_type(&cx, binder, indirect, source, body)
     }
 
     // The other operators have rules; `&` lends the receiver of a call.
-    fn expr_unary(self, &cx: Cx!['k], u: S::Unary['k]) -> Type['k] {
-        let first = match self.first_call(&cx, u.operand.get(&cx)) {
+    fn expr_unary(self, &cx: Domain!['k], u: S::Unary['k]) -> Type['k] {
+        let first = match self.first_call(&cx, u.operand.copy(&cx)) {
             Option::Some(c) => c,
             Option::None => self.fails(&cx, "& lends a place only as a call argument, a receiver, or a match scrutinee", u.pos),
         };
-        self.inf.lend_marked.add(&cx, first.id);
-        self.expr(&cx, u.operand.get(&cx))
+        self.inf.lend_marked.insert(&cx, first.id);
+        self.expr(&cx, u.operand.copy(&cx))
     }
 
     // The type behind a pointer.
-    fn pointee(self, &cx: Cx!['k], pointer: Type['k], pos: Pos) -> Type['k] {
+    fn pointee(self, &cx: Domain!['k], pointer: Type['k], pos: Pos) -> Type['k] {
         let target = new_meta(&cx);
         self.unify_at(&cx, pointer, C::ptr(&cx, target), pos);
         target
     }
 
     // The innermost method call of a postfix chain: the one `&` lends the receiver of.
-    fn first_call(self, &cx: Cx!['k], e: Expr['k]) -> Option[S::Call['k]] {
+    fn first_call(self, &cx: Domain!['k], e: Expr['k]) -> Option[S::Call['k]] {
         var e = e;
         while true {
             e = match e {
-                Expr::Call(c) => match c.callee.get(&cx) {
-                    Expr::Field(f) => if self.is_place(&cx, f.value.get(&cx)) {
+                Expr::Call(c) => match c.callee.copy(&cx) {
+                    Expr::Field(f) => if self.is_place(&cx, f.value.copy(&cx)) {
                         return Option::Some.(c);
                     } else {
-                        f.value.get(&cx)
+                        f.value.copy(&cx)
                     },
                     _ => return Option::None,
                 },
-                Expr::Field(f) => f.value.get(&cx),
-                Expr::Index(x) => x.value.get(&cx),
-                Expr::Try(n) => n.value.get(&cx),
+                Expr::Field(f) => f.value.copy(&cx),
+                Expr::Index(x) => x.value.copy(&cx),
+                Expr::Try(n) => n.value.copy(&cx),
                 _ => return Option::None,
             };
         }
@@ -2525,17 +2520,17 @@ impl Body['k] {
     }
 
     // `x?` unwraps success or returns failure from the same Option/Result family.
-    fn resolve_try(self, &cx: Cx!['k], t: TryWait['k], pos: Pos) -> Type['k] {
+    fn resolve_try(self, &cx: Domain!['k], t: TryWait['k], pos: Pos) -> Type['k] {
         let operand = zonk(&cx, t.operand);
         let returned = zonk(&cx, t.returned);
         let family = self.family(&cx, operand);
         let (name, args) = match operand {
             Type::Named(name, args) => (name, args),
-            _ => (text(&cx, ""), Seq::new(&cx)),
+            _ => (Span::from_static(&cx, ""), ArenaVec::new(&cx)),
         };
         let (other_name, other_args) = match returned {
             Type::Named(name, args) => (name, args),
-            _ => (text(&cx, ""), Seq::new(&cx)),
+            _ => (Span::from_static(&cx, ""), ArenaVec::new(&cx)),
         };
         let fits = !family.is_empty() && self.family(&cx, returned).eq(&cx, family) && name.eq(&cx, other_name);
         if !fits {
@@ -2544,55 +2539,55 @@ impl Body['k] {
         self.require_visible_shape(&cx, operand, pos);
         self.require_visible_shape(&cx, returned, pos);
         let result = family.is(&cx, "result");
-        let ok = text(&cx, if result { "Ok" } else { "Some" });
-        let error = text(&cx, if result { "Err" } else { "None" });
+        let ok = Span::from_static(&cx, if result { "Ok" } else { "Some" });
+        let error = Span::from_static(&cx, if result { "Err" } else { "None" });
         let td = self.inf.types.program.types.at(&cx, name);
         self.unify_at(&cx, self.variant_type(&cx, td, args, error), self.variant_type(&cx, td, other_args, error), pos);
-        self.results().try_kinds.set(&cx, t.id, family);
+        self.results().try_kinds.insert(&cx, t.id, family);
         self.variant_type(&cx, td, args, ok)
     }
 
-    fn variant_type(self, &cx: Cx!['k], td: TypeDecl['k], args: Seq[Type['k], 'k], name: Text['k]) -> Type['k] {
-        let sub: Map[Text['k], Type['k], 'k] = Map::new(&cx);
+    fn variant_type(self, &cx: Domain!['k], td: TypeDecl['k], args: ArenaVec[Type['k], 'k], name: Span['k]) -> Type['k] {
+        let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
         var i = 0usize;
         while i < td.params.len(&cx) && i < args.len(&cx) {
-            sub.set(&cx, td.params.get(&cx, i).name, args.get(&cx, i));
+            sub.insert(&cx, td.params.at(&cx, i).name, args.at(&cx, i));
             i = i + 1usize;
         }
         self.payload_of(&cx, td, name, sub)
     }
 
     // `option`, `result`, or empty for any other type.
-    fn family(self, &cx: Cx!['k], ty: Type['k]) -> Text['k] {
+    fn family(self, &cx: Domain!['k], ty: Type['k]) -> Span['k] {
         let name = match ty {
             Type::Named(name, _args) => name,
-            _ => return text(&cx, ""),
+            _ => return Span::from_static(&cx, ""),
         };
         let variants = match self.inf.types.program.types.get(&cx, name) {
             Option::Some(td) => match td.body {
                 Type::Enum(variants) => variants,
-                _ => return text(&cx, ""),
+                _ => return Span::from_static(&cx, ""),
             },
-            Option::None => return text(&cx, ""),
+            Option::None => return Span::from_static(&cx, ""),
         };
-        let names: Set[Text['k], 'k] = Set::new(&cx);
+        let names: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
         var i = 0usize;
         while i < variants.len(&cx) {
-            names.add(&cx, variants.get(&cx, i).name);
+            names.insert(&cx, variants.at(&cx, i).name);
             i = i + 1usize;
         }
-        if names.len(&cx) == 2usize && names.has(&cx, text(&cx, "Ok")) && names.has(&cx, text(&cx, "Err")) {
-            text(&cx, "result")
-        } else if names.len(&cx) == 2usize && names.has(&cx, text(&cx, "Some")) && names.has(&cx, text(&cx, "None")) {
-            text(&cx, "option")
+        if names.len(&cx) == 2usize && names.contains(&cx, Span::from_static(&cx, "Ok")) && names.contains(&cx, Span::from_static(&cx, "Err")) {
+            Span::from_static(&cx, "result")
+        } else if names.len(&cx) == 2usize && names.contains(&cx, Span::from_static(&cx, "Some")) && names.contains(&cx, Span::from_static(&cx, "None")) {
+            Span::from_static(&cx, "option")
         } else {
-            text(&cx, "")
+            Span::from_static(&cx, "")
         }
     }
 
     // ---- places
     // The type of a place expression: a local, or fields and tuple elements of one.
-    fn place_type(self, &cx: Cx!['k], e: Expr['k], assign: bool) -> Type['k] {
+    fn place_type(self, &cx: Domain!['k], e: Expr['k], assign: bool) -> Type['k] {
         let unit = match e {
             Expr::Path(p) => {
                 let local_name = match self.inf.r.refs.get(&cx, p.id) {
@@ -2606,19 +2601,19 @@ impl Body['k] {
                     Option::Some(name) => {
                         let local = match self.lookup(&cx, name) {
                             Option::Some(l) => l,
-                            Option::None => self.fail(&cx, text_of(&cx, Buffer::new().push_static("unknown local ").push_bytes(&cx, name)), p.pos),
+                            Option::None => self.fail(&cx, Buffer::new().push_static("unknown local ").push_bytes(&cx, name).save(&cx), p.pos),
                         };
                         if assign && !local.mutable {
-                            self.fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, name).push_static(" is not a var")), p.pos);
+                            self.fail(&cx, Buffer::new().push_bytes(&cx, name).push_static(" is not a var").save(&cx), p.pos);
                         }
-                        self.results().binders.set(&cx, p.id, local.id);
+                        self.results().binders.insert(&cx, p.id, local.id);
                         return self.record(&cx, p.id, p.pos, local.type);
                     },
                     Option::None => (),
                 };
             },
-            Expr::Field(f) => return self.projection(&cx, f.value.get(&cx), Option::Some.(f.name), 0usize, f.id, f.pos, assign),
-            Expr::Index(x) => return self.projection(&cx, x.value.get(&cx), Option::None, x.index, x.id, x.pos, assign),
+            Expr::Field(f) => return self.projection(&cx, f.value.copy(&cx), Option::Some.(f.name), 0usize, f.id, f.pos, assign),
+            Expr::Index(x) => return self.projection(&cx, x.value.copy(&cx), Option::None, x.index, x.id, x.pos, assign),
             _ => (),
         };
         if assign {
@@ -2629,14 +2624,14 @@ impl Body['k] {
 
     // The type of `owner.name` or `owner.N`; an owner that is a place is typed as one, so that an
     // assignment is checked down to its root local.
-    fn projection(self, &cx: Cx!['k], value: Expr['k], field: Option[Text['k]], index: usize, id: u32, pos: Pos, assign: bool) -> Type['k] {
+    fn projection(self, &cx: Domain!['k], value: Expr['k], field: Option[Span['k]], index: usize, id: u32, pos: Pos, assign: bool) -> Type['k] {
         let owner = if self.is_place(&cx, value) { self.place_type(&cx, value, assign) } else { self.expr(&cx, value) };
         let result = new_meta(&cx);
         self.later(&cx, owner, Action::Component.(Component.{ field, index, owner, result }), pos);
         self.record(&cx, id, pos, result)
     }
 
-    fn component(self, &cx: Cx!['k], c: Component['k], pos: Pos) {
+    fn component(self, &cx: Domain!['k], c: Component['k], pos: Pos) {
         self.require_visible_shape(&cx, c.owner, pos);
         let s = self.shape(&cx, c.owner, pos);
         let unit = match c.field {
@@ -2644,8 +2639,8 @@ impl Body['k] {
                 Type::Struct(fields) => {
                     var i = 0usize;
                     while i < fields.len(&cx) {
-                        if fields.get(&cx, i).name.eq(&cx, name) {
-                            self.unify_at(&cx, c.result, fields.get(&cx, i).type, pos);
+                        if fields.at(&cx, i).name.eq(&cx, name) {
+                            self.unify_at(&cx, c.result, fields.at(&cx, i).type, pos);
                             return;
                         }
                         i = i + 1usize;
@@ -2655,7 +2650,7 @@ impl Body['k] {
             },
             Option::None => match s {
                 Type::Tuple(elems) => if c.index < elems.len(&cx) {
-                    self.unify_at(&cx, c.result, elems.get(&cx, c.index), pos);
+                    self.unify_at(&cx, c.result, elems.at(&cx, c.index), pos);
                     return;
                 },
                 _ => (),
@@ -2663,12 +2658,12 @@ impl Body['k] {
         };
         let what = match c.field {
             Option::Some(name) => name,
-            Option::None => text_of(&cx, Buffer::new().push_usize(c.index)),
+            Option::None => Buffer::new().push_usize(c.index).save(&cx),
         };
-        self.fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, show(&cx, zonk(&cx, c.owner))).push_static(" has no component ").push_bytes(&cx, what)), pos)
+        self.fail(&cx, Buffer::new().push_bytes(&cx, show(&cx, zonk(&cx, c.owner))).push_static(" has no component ").push_bytes(&cx, what).save(&cx), pos)
     }
 
-    fn is_place(self, &cx: Cx!['k], e: Expr['k]) -> bool {
+    fn is_place(self, &cx: Domain!['k], e: Expr['k]) -> bool {
         match e {
             Expr::Path(p) => match self.inf.r.refs.get(&cx, p.id) {
                 Option::Some(r) => match r {
@@ -2677,16 +2672,16 @@ impl Body['k] {
                 },
                 Option::None => false,
             },
-            Expr::Field(f) => self.is_place(&cx, f.value.get(&cx)),
-            Expr::Index(x) => self.is_place(&cx, x.value.get(&cx)),
+            Expr::Field(f) => self.is_place(&cx, f.value.copy(&cx)),
+            Expr::Index(x) => self.is_place(&cx, x.value.copy(&cx)),
             _ => false,
         }
     }
 
     // ---- calls
-    fn expr_call(self, &cx: Cx!['k], c: S::Call['k]) -> Type['k] {
-        let callee = c.callee.get(&cx);
-        let lent_receiver = self.inf.lend_marked.has(&cx, c.id);
+    fn expr_call(self, &cx: Domain!['k], c: S::Call['k]) -> Type['k] {
+        let callee = c.callee.copy(&cx);
+        let lent_receiver = self.inf.lend_marked.contains(&cx, c.id);
         let unit = match callee {
             Expr::Field(f) => return self.method_call(&cx, c, f, lent_receiver),
             _ => (),
@@ -2705,7 +2700,7 @@ impl Body['k] {
         match r {
             NameRef::Variant(enum_decl, name) => {
                 let ty = self.variant(&cx, path, enum_decl, name, Option::Some.(c.args));
-                self.results().calls.set(&cx, c.id, self.results().calls.at(&cx, path.id));
+                self.results().calls.insert(&cx, c.id, self.results().calls.at(&cx, path.id));
                 self.record(&cx, path.id, path.pos, ty)
             },
             NameRef::Decl(decl) => if decl.kind.is(&cx, "fn") || decl.kind.is(&cx, "method") || decl.kind.is(&cx, "extern") {
@@ -2713,7 +2708,7 @@ impl Body['k] {
                 let sub = instantiate(&cx, sig.params);
                 self.explicit_args(&cx, path, sig, sub);
                 let call = FnCall.{ sig, sub, receiver: Option::None };
-                self.results().calls.set(&cx, c.id, Callee::Fn.(call));
+                self.results().calls.insert(&cx, c.id, Callee::Fn.(call));
                 self.call_sig(&cx, c, call, self.operands(&cx, c.args))
             } else if decl.kind.is(&cx, "tuple") {
                 let (td, sub, result) = self.construct(&cx, c.pos, decl, self.path_arguments(&cx, path, decl, false));
@@ -2722,14 +2717,14 @@ impl Body['k] {
                     _ => self.fails(&cx, "internal error: a tuple declaration that is not a tuple", c.pos),
                 };
                 if c.args.len(&cx) != elems.len(&cx) {
-                    self.fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, td.name).push_static(" has ").push_usize(elems.len(&cx)).push_static(" elements")), c.pos);
+                    self.fail(&cx, Buffer::new().push_bytes(&cx, td.name).push_static(" has ").push_usize(elems.len(&cx)).push_static(" elements").save(&cx), c.pos);
                 }
                 var i = 0usize;
                 while i < elems.len(&cx) {
-                    let unit = self.check(&cx, c.args.get(&cx, i), Option::Some.(subst(&cx, elems.get(&cx, i), sub, self.inf.counter)));
+                    let unit = self.check(&cx, c.args.at(&cx, i), Option::Some.(subst(&cx, elems.at(&cx, i), sub, self.inf.counter)));
                     i = i + 1usize;
                 }
-                self.results().calls.set(&cx, c.id, Callee::Tuple);
+                self.results().calls.insert(&cx, c.id, Callee::Tuple);
                 self.record(&cx, path.id, path.pos, result)
             } else {
                 self.call_value(&cx, c)
@@ -2742,24 +2737,24 @@ impl Body['k] {
     }
 
     // A call of a value: a closure `{env, code}`, or a function pointer.
-    fn call_value(self, &cx: Cx!['k], c: S::Call['k]) -> Type['k] {
-        let callee = self.expr(&cx, c.callee.get(&cx));
+    fn call_value(self, &cx: Domain!['k], c: S::Call['k]) -> Type['k] {
+        let callee = self.expr(&cx, c.callee.copy(&cx));
         let got = self.operands(&cx, c.args);
         let result = new_meta(&cx);
         self.later(&cx, callee, Action::CallValue.(CallWait.{ call: c, callee, got, result }), c.pos);
         result
     }
 
-    fn call_known(self, &cx: Cx!['k], w: CallWait['k], pos: Pos) {
+    fn call_known(self, &cx: Domain!['k], w: CallWait['k], pos: Pos) {
         let s = self.shape(&cx, w.callee, pos);
-        let ptypes: Seq[Type['k], 'k] = Seq::new(&cx);
-        let places: Seq[usize, 'k] = Seq::new(&cx);
+        let ptypes: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
+        let places: ArenaVec[usize, 'k] = ArenaVec::new(&cx);
         let closure_fields = match s {
             Type::Struct(fields) => {
                 var has_code = false;
                 var i = 0usize;
                 while i < fields.len(&cx) {
-                    if fields.get(&cx, i).name.is(&cx, "code") {
+                    if fields.at(&cx, i).name.is(&cx, "code") {
                         has_code = true;
                     }
                     i = i + 1usize;
@@ -2771,39 +2766,39 @@ impl Body['k] {
         let ret = match closure_fields {
             Option::Some(fields) => {
                 self.require_visible_shape(&cx, w.callee, pos);
-                if fields.len(&cx) != 2usize || !fields.get(&cx, 0usize).name.is(&cx, "env") || !fields.get(&cx, 1usize).name.is(&cx, "code") {
+                if fields.len(&cx) != 2usize || !fields.at(&cx, 0usize).name.is(&cx, "env") || !fields.at(&cx, 1usize).name.is(&cx, "code") {
                     self.fails(&cx, "a closure must have exactly env and code fields, in that order", pos);
                 }
-                let env = fields.get(&cx, 0usize).type;
-                let code = match self.shape(&cx, fields.get(&cx, 1usize).type, pos) {
+                let env = fields.at(&cx, 0usize).type;
+                let code = match self.shape(&cx, fields.at(&cx, 1usize).type, pos) {
                     Type::Fn(f) => f,
                     _ => self.fails(&cx, "a closure code field must have a function type", pos),
                 };
                 if !code.quantified.is_empty(&cx) {
                     self.fails(&cx, "a closure code field must have a monomorphic function type", pos);
                 }
-                if code.params.is_empty(&cx) || code.places.has(&cx, 0usize) {
+                if code.params.is_empty(&cx) || code.places.contains(&cx, 0usize) {
                     self.fails(&cx, "a closure code function must take its environment by value first", pos);
                 }
-                self.unify_at(&cx, env, code.params.get(&cx, 0usize), pos);
-                self.results().calls.set(&cx, w.call.id, Callee::Closure);
-                ptypes.append(&cx, code.params.from(&cx, 1usize));
+                self.unify_at(&cx, env, code.params.at(&cx, 0usize), pos);
+                self.results().calls.insert(&cx, w.call.id, Callee::Closure);
+                ptypes.append(&cx, code.params.skip(&cx, 1usize));
                 var i = 0usize;
                 while i < code.places.len(&cx) {
-                    places.push(&cx, code.places.get(&cx, i) - 1usize);
+                    places.push(&cx, code.places.at(&cx, i) - 1usize);
                     i = i + 1usize;
                 }
-                code.ret.get(&cx)
+                code.ret.copy(&cx)
             },
             Option::None => match s {
                 Type::Fn(f) => {
                     let sub = instantiate(&cx, f.quantified);
-                    self.results().calls.set(&cx, w.call.id, Callee::Value.(sub));
+                    self.results().calls.insert(&cx, w.call.id, Callee::Value.(sub));
                     ptypes.append(&cx, self.subst_all(&cx, f.params, sub));
                     places.append(&cx, f.places);
-                    subst(&cx, f.ret.get(&cx), sub, self.inf.counter)
+                    subst(&cx, f.ret.copy(&cx), sub, self.inf.counter)
                 },
-                _ => self.fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, show(&cx, zonk(&cx, w.callee))).push_static(" is not callable")), pos),
+                _ => self.fail(&cx, Buffer::new().push_bytes(&cx, show(&cx, zonk(&cx, w.callee))).push_static(" is not callable").save(&cx), pos),
             },
         };
         self.bind_operands(&cx, w.call, w.got, ptypes, places);
@@ -2812,24 +2807,24 @@ impl Body['k] {
 
     // Type each argument now: its type, and whether it lends a place. Holding it to its parameter waits
     // for the callee.
-    fn operands(self, &cx: Cx!['k], args: Seq[Expr['k], 'k]) -> Seq[Option[(Type['k], bool)], 'k] {
-        let out: Seq[Option[(Type['k], bool)], 'k] = Seq::new(&cx);
+    fn operands(self, &cx: Domain!['k], args: ArenaVec[Expr['k], 'k]) -> ArenaVec[Option[(Type['k], bool)], 'k] {
+        let out: ArenaVec[Option[(Type['k], bool)], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < args.len(&cx) {
-            out.push(&cx, Option::Some.(self.operand(&cx, args.get(&cx, i))));
+            out.push(&cx, Option::Some.(self.operand(&cx, args.at(&cx, i))));
             i = i + 1usize;
         }
         out
     }
 
-    fn operand(self, &cx: Cx!['k], arg: Expr['k]) -> (Type['k], bool) {
+    fn operand(self, &cx: Domain!['k], arg: Expr['k]) -> (Type['k], bool) {
         let unit = match arg {
             Expr::Unary(u) => {
-                let inner = u.operand.get(&cx);
+                let inner = u.operand.copy(&cx);
                 if u.op.is(&cx, "unsafe") {
                     let unit = match inner {
                         Expr::Unary(lend) => if lend.op.is(&cx, "&") {
-                            let call = match lend.operand.get(&cx) {
+                            let call = match lend.operand.copy(&cx) {
                                 Expr::Call(_c) => true,
                                 _ => false,
                             };
@@ -2844,7 +2839,7 @@ impl Body['k] {
                     let unit = match inner {
                         // `&*p`: a raw pointer's target
                         Expr::Unary(deref) => if deref.op.is(&cx, "*") {
-                            let target = self.pointee(&cx, self.expr(&cx, deref.operand.get(&cx)), u.pos);
+                            let target = self.pointee(&cx, self.expr(&cx, deref.operand.copy(&cx)), u.pos);
                             return (self.record(&cx, u.id, u.pos, target), true);
                         },
                         _ => (),
@@ -2861,19 +2856,19 @@ impl Body['k] {
 
     // Hold the operands to the parameters: the count, the `&` modes, the types. A method's receiver
     // is none.
-    fn bind_operands(self, &cx: Cx!['k], c: S::Call['k], got: Seq[Option[(Type['k], bool)], 'k], ptypes: Seq[Type['k], 'k], places: Seq[usize, 'k]) {
+    fn bind_operands(self, &cx: Domain!['k], c: S::Call['k], got: ArenaVec[Option[(Type['k], bool)], 'k], ptypes: ArenaVec[Type['k], 'k], places: ArenaVec[usize, 'k]) {
         if got.len(&cx) != ptypes.len(&cx) {
-            self.fail(&cx, text_of(&cx, Buffer::new().push_static("expected ").push_usize(ptypes.len(&cx)).push_static(" arguments, got ").push_usize(got.len(&cx))), c.pos);
+            self.fail(&cx, Buffer::new().push_static("expected ").push_usize(ptypes.len(&cx)).push_static(" arguments, got ").push_usize(got.len(&cx)).save(&cx), c.pos);
         }
         var k = 0usize;
         while k < got.len(&cx) {
-            let unit = match got.get(&cx, k) {
+            let unit = match got.at(&cx, k) {
                 Option::Some(operand) => {
                     let (ty, lends) = operand;
-                    if places.has(&cx, k) != lends {
+                    if places.contains(&cx, k) != lends {
                         self.fails(&cx, "an & parameter takes `&place`, and only an & parameter does", c.pos);
                     }
-                    self.unify_at(&cx, ty, ptypes.get(&cx, k), c.pos);
+                    self.unify_at(&cx, ty, ptypes.at(&cx, k), c.pos);
                 },
                 Option::None => (),
             };
@@ -2881,99 +2876,99 @@ impl Body['k] {
         }
     }
 
-    fn require_signature(self, &cx: Cx!['k], sig: Sig['k], sub: Map[Text['k], Type['k], 'k], pos: Pos) {
+    fn require_signature(self, &cx: Domain!['k], sig: Sig['k], sub: ArenaMap[Span['k], Type['k], 'k], pos: Pos) {
         self.require_parameter_kinds(&cx, sig.params, sub, pos);
         var i = 0usize;
         while i < sig.premises.len(&cx) {
-            let premise = sig.premises.get(&cx, i);
+            let premise = sig.premises.at(&cx, i);
             self.require(&cx, premise.trait_name, self.subst_all(&cx, premise.args, sub), pos);
             i = i + 1usize;
         }
     }
 
-    fn call_sig(self, &cx: Cx!['k], c: S::Call['k], call: FnCall['k], got: Seq[Option[(Type['k], bool)], 'k]) -> Type['k] {
+    fn call_sig(self, &cx: Domain!['k], c: S::Call['k], call: FnCall['k], got: ArenaVec[Option[(Type['k], bool)], 'k]) -> Type['k] {
         self.require_signature(&cx, call.sig, call.sub, c.pos);
         self.bind_operands(&cx, c, got, self.subst_all(&cx, call.sig.ptypes, call.sub), call.sig.places);
         subst(&cx, call.sig.ret, call.sub, self.inf.counter)
     }
 
-    fn trait_call(self, &cx: Cx!['k], c: S::Call['k], path: S::Path['k], trait_decl: Decl['k], method: Text['k]) -> Type['k] {
+    fn trait_call(self, &cx: Domain!['k], c: S::Call['k], path: S::Path['k], trait_decl: Decl['k], method: Span['k]) -> Type['k] {
         let tr = self.inf.sigs.traits.at(&cx, self.inf.sigs.name(&cx, trait_decl));
         let written = self.path_arguments(&cx, path, trait_decl, true);
         if written.len(&cx) > tr.params.len(&cx) {
-            self.fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, tr.name).push_static(" accepts at most ").push_usize(tr.params.len(&cx)).push_static(" type arguments, got ").push_usize(written.len(&cx))), c.pos);
+            self.fail(&cx, Buffer::new().push_bytes(&cx, tr.name).push_static(" accepts at most ").push_usize(tr.params.len(&cx)).push_static(" type arguments, got ").push_usize(written.len(&cx)).save(&cx), c.pos);
         }
-        let targs: Seq[Type['k], 'k] = Seq::new(&cx);
+        let targs: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < tr.param_kinds.len(&cx) {
-            targs.push(&cx, meta_of(&cx, tr.param_kinds.get(&cx, i)));
+            targs.push(&cx, meta_of(&cx, tr.param_kinds.at(&cx, i)));
             i = i + 1usize;
         }
         i = 0usize;
         while i < written.len(&cx) {
-            let unit = match written.get(&cx, i) {
+            let unit = match written.at(&cx, i) {
                 S::Type::Ignored => (),
-                _ => self.unify_at(&cx, targs.get(&cx, i), self.core_type(&cx, written.get(&cx, i)), c.pos),
+                _ => self.unify_at(&cx, targs.at(&cx, i), self.core_type(&cx, written.at(&cx, i)), c.pos),
             };
             i = i + 1usize;
         }
         self.trait_method(&cx, c, tr, method, targs, self.operands(&cx, c.args), Option::None)
     }
 
-    fn method_of(self, &cx: Cx!['k], tr: C::Trait['k], method: Text['k]) -> C::Method['k] {
+    fn method_of(self, &cx: Domain!['k], tr: C::Trait['k], method: Span['k]) -> C::Method['k] {
         var i = 0usize;
         while i < tr.methods.len(&cx) {
-            if tr.methods.get(&cx, i).name.eq(&cx, method) {
-                return tr.methods.get(&cx, i);
+            if tr.methods.at(&cx, i).name.eq(&cx, method) {
+                return tr.methods.at(&cx, i);
             }
             i = i + 1usize;
         }
         self.fails(&cx, "internal error: an unknown trait method", no_pos())
     }
 
-    fn trait_method(self, &cx: Cx!['k], c: S::Call['k], tr: C::Trait['k], method: Text['k], targs: Seq[Type['k], 'k], got: Seq[Option[(Type['k], bool)], 'k],
+    fn trait_method(self, &cx: Domain!['k], c: S::Call['k], tr: C::Trait['k], method: Span['k], targs: ArenaVec[Type['k], 'k], got: ArenaVec[Option[(Type['k], bool)], 'k],
                     receiver: Option[Receiver['k]]) -> Type['k] {
         let m = self.method_of(&cx, tr, method);
-        let sub: Map[Text['k], Type['k], 'k] = Map::new(&cx);
+        let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
         var i = 0usize;
         while i < tr.params.len(&cx) && i < targs.len(&cx) {
-            sub.set(&cx, tr.params.get(&cx, i), targs.get(&cx, i));
+            sub.insert(&cx, tr.params.at(&cx, i), targs.at(&cx, i));
             i = i + 1usize;
         }
         i = 0usize;
         while i < tr.param_kinds.len(&cx) && i < targs.len(&cx) {
-            if is_copy_kind(tr.param_kinds.get(&cx, i)) {
-                self.require_copy(&cx, targs.get(&cx, i), c.pos);
+            if is_copy_kind(tr.param_kinds.at(&cx, i)) {
+                self.require_copy(&cx, targs.at(&cx, i), c.pos);
             }
             i = i + 1usize;
         }
-        let args = targs.copy(&cx);
-        self.results().calls.set(&cx, c.id, Callee::Trait.(TraitCall.{ trait_name: tr.name, method, targs: args, receiver }));
+        let args = targs.clone(&cx);
+        self.results().calls.insert(&cx, c.id, Callee::Trait.(TraitCall.{ trait_name: tr.name, method, targs: args, receiver }));
         self.require(&cx, tr.name, args, c.pos);
         self.bind_operands(&cx, c, got, self.subst_all(&cx, m.ptypes, sub), m.places);
         subst(&cx, m.ret, sub, self.inf.counter)
     }
 
     // `T::name(args)` for a type parameter `T`: the one bound of `T` with that method.
-    fn assoc_call(self, &cx: Cx!['k], c: S::Call['k], path: S::Path['k], param: Text['k], name: Text['k]) -> Type['k] {
+    fn assoc_call(self, &cx: Domain!['k], c: S::Call['k], path: S::Path['k], param: Span['k], name: Span['k]) -> Type['k] {
         if has_args(&cx, path) {
             self.fails(&cx, "an associated parameter call takes its type arguments from its trait premise", c.pos);
         }
-        let found: Seq[Premise['k], 'k] = Seq::new(&cx);
+        let found: ArenaVec[Premise['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < self.assumptions.len(&cx) {
-            let p = self.assumptions.get(&cx, i);
+            let p = self.assumptions.at(&cx, i);
             let unit = match self.inf.sigs.traits.get(&cx, p.trait_name) {
                 Option::Some(tr) => {
                     var has = false;
                     var k = 0usize;
                     while k < tr.methods.len(&cx) {
-                        if tr.methods.get(&cx, k).name.eq(&cx, name) {
+                        if tr.methods.at(&cx, k).name.eq(&cx, name) {
                             has = true;
                         }
                         k = k + 1usize;
                     }
-                    if has && !p.args.is_empty(&cx) && C::same(&cx, p.args.get(&cx, 0usize), C::named(param, Seq::new(&cx))) {
+                    if has && !p.args.is_empty(&cx) && C::same(&cx, p.args.at(&cx, 0usize), C::named(param, ArenaVec::new(&cx))) {
                         found.push(&cx, p);
                     }
                 },
@@ -2982,43 +2977,43 @@ impl Body['k] {
             i = i + 1usize;
         }
         if found.len(&cx) != 1usize {
-            self.fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, param).push_static("::").push_bytes(&cx, name).push_static(" needs exactly one bound of ").push_bytes(&cx, param).push_static(" with that method")), c.pos);
+            self.fail(&cx, Buffer::new().push_bytes(&cx, param).push_static("::").push_bytes(&cx, name).push_static(" needs exactly one bound of ").push_bytes(&cx, param).push_static(" with that method").save(&cx), c.pos);
         }
-        let p = found.get(&cx, 0usize);
-        self.trait_method(&cx, c, self.inf.sigs.traits.at(&cx, p.trait_name), name, p.args.copy(&cx), self.operands(&cx, c.args), Option::None)
+        let p = found.at(&cx, 0usize);
+        self.trait_method(&cx, c, self.inf.sigs.traits.at(&cx, p.trait_name), name, p.args.clone(&cx), self.operands(&cx, c.args), Option::None)
     }
 
-    fn builtin(self, &cx: Cx!['k], c: S::Call['k], path: S::Path['k], name: Text['k]) -> Type['k] {
+    fn builtin(self, &cx: Domain!['k], c: S::Call['k], path: S::Path['k], name: Span['k]) -> Type['k] {
         let arity = match builtin_arity(&cx, name) {
             Option::Some(n) => n,
-            Option::None => self.fail(&cx, text_of(&cx, Buffer::new().push_static("unknown builtin ").push_bytes(&cx, name)), c.pos),
+            Option::None => self.fail(&cx, Buffer::new().push_static("unknown builtin ").push_bytes(&cx, name).save(&cx), c.pos),
         };
         if c.args.len(&cx) != arity {
             if name.is(&cx, "fence") {
                 self.fails(&cx, "fence takes one ordering argument", c.pos);
             }
-            self.fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, name).push_static(" takes ").push_usize(arity).push_static(" value arguments")), c.pos);
+            self.fail(&cx, Buffer::new().push_bytes(&cx, name).push_static(" takes ").push_usize(arity).push_static(" value arguments").save(&cx), c.pos);
         }
         let count = path.segments.len(&cx);
-        let targs = path.segments.get(&cx, count - 1usize).args;
+        let targs = path.segments.at(&cx, count - 1usize).args;
         var i = 0usize;
         while i + 1usize < count {
-            if !path.segments.get(&cx, i).args.is_empty(&cx) {
+            if !path.segments.at(&cx, i).args.is_empty(&cx) {
                 self.fails(&cx, "builtin namespace does not take type arguments", c.pos);
             }
             i = i + 1usize;
         }
         let expected = if name.is(&cx, "alloca") { 1usize } else { 0usize };
         if targs.len(&cx) != expected {
-            self.fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, name).push_static(" takes ").push_usize(expected).push_static(" type arguments")), c.pos);
+            self.fail(&cx, Buffer::new().push_bytes(&cx, name).push_static(" takes ").push_usize(expected).push_static(" type arguments").save(&cx), c.pos);
         }
-        self.results().calls.set(&cx, c.id, Callee::Builtin.(name));
+        self.results().calls.insert(&cx, c.id, Callee::Builtin.(name));
         if name.is(&cx, "fresh") {
-            Type::Exists.(Seq::one(&cx, text(&cx, "x")), Cell::new(&cx, Type::Brand.(Cell::new(&cx, Type::Skolem.(text(&cx, "x"))))))
+            Type::Exists.(ArenaVec::one(&cx, Span::from_static(&cx, "x")), Ref::new(&cx, Type::Brand.(Ref::new(&cx, Type::Skolem.(Span::from_static(&cx, "x"))))))
         } else if name.is(&cx, "static_brand") {
-            Type::Brand.(Cell::new(&cx, Type::Skolem.(text(&cx, "static"))))
+            Type::Brand.(Ref::new(&cx, Type::Skolem.(Span::from_static(&cx, "static"))))
         } else if name.is(&cx, "enum_variant") {
-            let arg = c.args.get(&cx, 0usize);
+            let arg = c.args.at(&cx, 0usize);
             let arg_pos = S::expr_pos(arg);
             let lent = match arg {
                 Expr::Unary(u) => if u.op.is(&cx, "&") { Option::Some.(u) } else { Option::None },
@@ -3026,48 +3021,48 @@ impl Body['k] {
             };
             let operand = match lent {
                 Option::Some(u) => {
-                    if !self.is_place(&cx, u.operand.get(&cx)) {
+                    if !self.is_place(&cx, u.operand.copy(&cx)) {
                         self.fails(&cx, "enum_variant(&place) requires a place", arg_pos);
                     }
-                    self.record(&cx, u.id, u.pos, self.place_type(&cx, u.operand.get(&cx), false))
+                    self.record(&cx, u.id, u.pos, self.place_type(&cx, u.operand.copy(&cx), false))
                 },
                 Option::None => self.expr(&cx, arg),
             };
             if !is_never(&cx, operand) {
                 self.later(&cx, operand, Action::EnumOperand.(operand), arg_pos);
             }
-            if lent.is_some() { C::u32_type(&cx) } else { Type::Tuple.(Seq::two(&cx, operand, C::u32_type(&cx))) }
+            if lent.is_some() { C::u32_type(&cx) } else { Type::Tuple.(ArenaVec::two(&cx, operand, C::u32_type(&cx))) }
         } else if name.is(&cx, "alloca") {
-            let target = self.core_type(&cx, targs.get(&cx, 0usize));
-            self.results().calls.set(&cx, c.id, Callee::Alloca.(target));
+            let target = self.core_type(&cx, targs.at(&cx, 0usize));
+            self.results().calls.insert(&cx, c.id, Callee::Alloca.(target));
             C::ptr(&cx, target)
         } else if name.is(&cx, "fence") {
-            let unit = self.check(&cx, c.args.get(&cx, 0usize), Option::Some.(C::named(self.library(&cx, "Ordering"), Seq::new(&cx))));
+            let unit = self.check(&cx, c.args.at(&cx, 0usize), Option::Some.(C::named(self.library(&cx, "Ordering"), ArenaVec::new(&cx))));
             C::unit(&cx)
         } else {
-            let pointer = self.expr(&cx, c.args.get(&cx, 0usize));
-            let rest: Seq[Type['k], 'k] = Seq::new(&cx);
+            let pointer = self.expr(&cx, c.args.at(&cx, 0usize));
+            let rest: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
             i = 1usize;
             while i < c.args.len(&cx) {
-                rest.push(&cx, self.expr(&cx, c.args.get(&cx, i)));
+                rest.push(&cx, self.expr(&cx, c.args.at(&cx, i)));
                 i = i + 1usize;
             }
             self.pointer_op(&cx, c, name, pointer, rest)
         }
     }
 
-    fn method_call(self, &cx: Cx!['k], c: S::Call['k], callee: S::Field['k], lent_receiver: bool) -> Type['k] {
-        let receiver = callee.value.get(&cx);
+    fn method_call(self, &cx: Domain!['k], c: S::Call['k], callee: S::Field['k], lent_receiver: bool) -> Type['k] {
+        let receiver = callee.value.copy(&cx);
         let name = callee.name;
         let unit = match receiver {
             Expr::FStr(f) => if name.is(&cx, "write") {
                 let unit = self.expr(&cx, receiver);
-                self.results().calls.set(&cx, c.id, Callee::FStringWrite.(f));
+                self.results().calls.insert(&cx, c.id, Callee::FStringWrite.(f));
                 if c.args.len(&cx) != 1usize {
                     self.fails(&cx, "write takes the writer", c.pos);
                 }
-                let out = self.expr(&cx, c.args.get(&cx, 0usize));
-                self.require(&cx, self.library(&cx, "Writable"), Seq::one(&cx, out), c.pos);
+                let out = self.expr(&cx, c.args.at(&cx, 0usize));
+                self.require(&cx, self.library(&cx, "Writable"), ArenaVec::one(&cx, out), c.pos);
                 return out;
             },
             _ => (),
@@ -3077,7 +3072,7 @@ impl Body['k] {
         }
         let receiver_ty = if lent_receiver { self.place_type(&cx, receiver, false) } else { self.expr(&cx, receiver) };
         let actual = Receiver.{ value: receiver, lend: lent_receiver };
-        let got: Seq[Option[(Type['k], bool)], 'k] = Seq::one(&cx, Option::None);
+        let got: ArenaVec[Option[(Type['k], bool)], 'k] = ArenaVec::one(&cx, Option::None);
         got.append(&cx, self.operands(&cx, c.args));
         let result = new_meta(&cx);
         self.later(&cx, receiver_ty, Action::Method.(MethodWait.{ call: c, receiver: receiver_ty, name, actual, got, result }), c.pos);
@@ -3085,14 +3080,14 @@ impl Body['k] {
     }
 
     // The method `name` of the receiver's type: its signature instantiated, and its result type.
-    fn resolve_method(self, &cx: Cx!['k], c: S::Call['k], receiver_ty: Type['k], name: Text['k], receiver: Receiver['k], got: Seq[Option[(Type['k], bool)], 'k]) -> Type['k] {
+    fn resolve_method(self, &cx: Domain!['k], c: S::Call['k], receiver_ty: Type['k], name: Span['k], receiver: Receiver['k], got: ArenaVec[Option[(Type['k], bool)], 'k]) -> Type['k] {
         match self.find_method(&cx, receiver_ty, name, c.pos) {
             Lookup::Pointer => {
-                self.results().calls.set(&cx, c.id, Callee::Pointer.(name, receiver.value));
-                let operand_types: Seq[Type['k], 'k] = Seq::new(&cx);
+                self.results().calls.insert(&cx, c.id, Callee::Pointer.(name, receiver.value));
+                let operand_types: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
                 var i = 1usize;
                 while i < got.len(&cx) {
-                    let unit = match got.get(&cx, i) {
+                    let unit = match got.at(&cx, i) {
                         Option::Some(operand) => {
                             let (ty, _lends) = operand;
                             operand_types.push(&cx, ty);
@@ -3110,29 +3105,29 @@ impl Body['k] {
             },
             Lookup::Method(sig) => {
                 if sig.ptypes.is_empty(&cx) {
-                    self.fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, name).push_static(" takes no receiver")), c.pos);
+                    self.fail(&cx, Buffer::new().push_bytes(&cx, name).push_static(" takes no receiver").save(&cx), c.pos);
                 }
                 self.receiver_mode(&cx, name, sig.places, receiver, c.pos);
                 let sub = instantiate(&cx, sig.params);
-                self.unify_at(&cx, subst(&cx, sig.ptypes.get(&cx, 0usize), sub, self.inf.counter), receiver_ty, c.pos);
+                self.unify_at(&cx, subst(&cx, sig.ptypes.at(&cx, 0usize), sub, self.inf.counter), receiver_ty, c.pos);
                 let call = FnCall.{ sig, sub, receiver: Option::Some.(receiver) };
-                self.results().calls.set(&cx, c.id, Callee::Fn.(call));
+                self.results().calls.insert(&cx, c.id, Callee::Fn.(call));
                 self.call_sig(&cx, c, call, got)
             },
         }
     }
 
-    fn receiver_mode(self, &cx: Cx!['k], name: Text['k], places: Seq[usize, 'k], receiver: Receiver['k], pos: Pos) {
-        let lends = places.has(&cx, 0usize);
+    fn receiver_mode(self, &cx: Domain!['k], name: Span['k], places: ArenaVec[usize, 'k], receiver: Receiver['k], pos: Pos) {
+        let lends = places.contains(&cx, 0usize);
         if lends != receiver.lend {
-            self.fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, name).push_static(" takes its receiver ").push_static(if lends { "by &" } else { "by value" })), pos);
+            self.fail(&cx, Buffer::new().push_bytes(&cx, name).push_static(" takes its receiver ").push_static(if lends { "by &" } else { "by value" }).save(&cx), pos);
         }
     }
 
     // Method lookup by name: the receiver type's own method, else the one trait (of a single input) or
     // blanket impl method of that name visible here. A name that several of them share is written
     // `Trait::name(x)`.
-    fn find_method(self, &cx: Cx!['k], receiver_ty: Type['k], name: Text['k], pos: Pos) -> Lookup['k] {
+    fn find_method(self, &cx: Domain!['k], receiver_ty: Type['k], name: Span['k], pos: Pos) -> Lookup['k] {
         let t = zonk(&cx, receiver_ty);
         let owner = match t {
             Type::Ptr(_i) => {
@@ -3148,14 +3143,14 @@ impl Body['k] {
             Type::Prim(n) => Option::Some.(Owner::Prim.(n)),
             _ => Option::None,
         };
-        let candidates: Seq[Lookup['k], 'k] = Seq::new(&cx);
+        let candidates: ArenaVec[Lookup['k], 'k] = ArenaVec::new(&cx);
         let unit = match owner {
             Option::Some(o) => {
-                let own = self.inf.r.attached.get_or(&cx, (o, name), Seq::new(&cx));
+                let own = self.inf.r.attached.get_or(&cx, (o, name), ArenaVec::new(&cx));
                 var i = 0usize;
                 while i < own.len(&cx) {
-                    if own.get(&cx, i).kind.is(&cx, "method") {
-                        candidates.push(&cx, Lookup::Method.(self.inf.sigs.sigs.at(&cx, own.get(&cx, i).id)));
+                    if own.at(&cx, i).kind.is(&cx, "method") {
+                        candidates.push(&cx, Lookup::Method.(self.inf.sigs.sigs.at(&cx, own.at(&cx, i).id)));
                     }
                     i = i + 1usize;
                 }
@@ -3167,35 +3162,35 @@ impl Body['k] {
             let traits = self.inf.sigs.traits.values(&cx);
             var i = 0usize;
             while i < traits.len(&cx) {
-                let tr = traits.get(&cx, i);
+                let tr = traits.at(&cx, i);
                 let single = self.inf.inputs.get_or(&cx, tr.name, 0usize) == 1usize;
                 let seen = match self.inf.decl_of.get(&cx, tr.name) {
-                    Option::Some(d) => visible.has(&cx, d.id),
+                    Option::Some(d) => visible.contains(&cx, d.id),
                     Option::None => false,
                 };
                 var has = false;
                 var k = 0usize;
                 while k < tr.methods.len(&cx) {
-                    if tr.methods.get(&cx, k).name.eq(&cx, name) {
+                    if tr.methods.at(&cx, k).name.eq(&cx, name) {
                         has = true;
                     }
                     k = k + 1usize;
                 }
                 if single && seen && has {
-                    let targs = Seq::one(&cx, t);
+                    let targs = ArenaVec::one(&cx, t);
                     k = 1usize;
                     while k < tr.param_kinds.len(&cx) {
-                        targs.push(&cx, meta_of(&cx, tr.param_kinds.get(&cx, k)));
+                        targs.push(&cx, meta_of(&cx, tr.param_kinds.at(&cx, k)));
                         k = k + 1usize;
                     }
                     candidates.push(&cx, Lookup::Trait.(tr, targs));
                 }
                 i = i + 1usize;
             }
-            let blanket = self.inf.r.attached.get_or(&cx, (Owner::Blanket, name), Seq::new(&cx));
+            let blanket = self.inf.r.attached.get_or(&cx, (Owner::Blanket, name), ArenaVec::new(&cx));
             i = 0usize;
             while i < blanket.len(&cx) {
-                let d = blanket.get(&cx, i);
+                let d = blanket.at(&cx, i);
                 if d.kind.is(&cx, "method") && self.inf.blanket_visible(&cx, d, self.home, visible) {
                     candidates.push(&cx, Lookup::Method.(self.inf.sigs.sigs.at(&cx, d.id)));
                 }
@@ -3203,32 +3198,32 @@ impl Body['k] {
             }
         }
         if candidates.len(&cx) != 1usize {
-            self.fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, show(&cx, t)).push_static(" has ").push_static(if candidates.is_empty(&cx) { "no" } else { "several" }).push_static(" method ").push_bytes(&cx, name)), pos);
+            self.fail(&cx, Buffer::new().push_bytes(&cx, show(&cx, t)).push_static(" has ").push_static(if candidates.is_empty(&cx) { "no" } else { "several" }).push_static(" method ").push_bytes(&cx, name).save(&cx), pos);
         }
-        candidates.get(&cx, 0usize)
+        candidates.at(&cx, 0usize)
     }
 
     // A pointer operation: its operands held to their types, once the pointee is known.
-    fn pointer_op(self, &cx: Cx!['k], c: S::Call['k], name: Text['k], pointer: Type['k], operands: Seq[Type['k], 'k]) -> Type['k] {
+    fn pointer_op(self, &cx: Domain!['k], c: S::Call['k], name: Span['k], pointer: Type['k], operands: ArenaVec[Type['k], 'k]) -> Type['k] {
         let params = pointer_params(&cx, name);
         if operands.len(&cx) != params.len() {
-            self.fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, name).push_static(" takes ").push_usize(params.len()).push_static(" arguments")), c.pos);
+            self.fail(&cx, Buffer::new().push_bytes(&cx, name).push_static(" takes ").push_usize(params.len()).push_static(" arguments").save(&cx), c.pos);
         }
         let out = new_meta(&cx);
         self.later(&cx, pointer, Action::Pointer.(PointerWait.{ name, pointer, operands, out }), c.pos);
         out
     }
 
-    fn pointer_known(self, &cx: Cx!['k], w: PointerWait['k], pos: Pos) {
+    fn pointer_known(self, &cx: Domain!['k], w: PointerWait['k], pos: Pos) {
         let inner = match self.shape(&cx, w.pointer, pos) {
-            Type::Ptr(inner) => inner.get(&cx),
-            _ => self.fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, w.name).push_static(" needs a pointer")), pos),
+            Type::Ptr(inner) => inner.copy(&cx),
+            _ => self.fail(&cx, Buffer::new().push_bytes(&cx, w.name).push_static(" needs a pointer").save(&cx), pos),
         };
         let params = pointer_params(&cx, w.name);
         var i = 0usize;
         while i < w.operands.len(&cx) {
-            let want = if params.byte(&cx, i) == b'T' { inner } else { C::named(self.library(&cx, "Ordering"), Seq::new(&cx)) };
-            self.unify_at(&cx, w.operands.get(&cx, i), want, pos);
+            let want = if params.byte_or_zero(&cx, i) == b'T' { inner } else { C::named(self.library(&cx, "Ordering"), ArenaVec::new(&cx)) };
+            self.unify_at(&cx, w.operands.at(&cx, i), want, pos);
             i = i + 1usize;
         }
         let result = pointer_result(&cx, w.name);
@@ -3237,34 +3232,34 @@ impl Body['k] {
         } else if result == b'U' {
             C::unit(&cx)
         } else {
-            Type::Tuple.(Seq::two(&cx, inner, C::bool_type(&cx)))
+            Type::Tuple.(ArenaVec::two(&cx, inner, C::bool_type(&cx)))
         };
         self.unify_at(&cx, w.out, ret, pos);
     }
 }
 
 forall 'k.
-fn zonk_all(&cx: Cx!['k], ts: Seq[Type['k], 'k]) {
+fn zonk_all(&cx: Domain!['k], ts: ArenaVec[Type['k], 'k]) {
     var i = 0usize;
     while i < ts.len(&cx) {
-        ts.set(&cx, i, zonk(&cx, ts.get(&cx, i)));
+        ts.set(&cx, i, zonk(&cx, ts.at(&cx, i)));
         i = i + 1usize;
     }
 }
 
 forall 'k.
-fn zonk_map(&cx: Cx!['k], sub: Map[Text['k], Type['k], 'k]) {
+fn zonk_map(&cx: Domain!['k], sub: ArenaMap[Span['k], Type['k], 'k]) {
     let names = sub.keys(&cx);
     var i = 0usize;
     while i < names.len(&cx) {
-        sub.set(&cx, names.get(&cx, i), zonk(&cx, sub.at(&cx, names.get(&cx, i))));
+        sub.insert(&cx, names.at(&cx, i), zonk(&cx, sub.at(&cx, names.at(&cx, i))));
         i = i + 1usize;
     }
 }
 
 // Infer every function body of the program.
 forall 'k.
-fn infer(&cx: Cx!['k], r: Resolver['k], sigs: Signatures['k], counter: Fresh['k]) -> Infer['k] {
+fn infer(&cx: Domain!['k], r: Resolver['k], sigs: Signatures['k], counter: Fresh['k]) -> Infer['k] {
     let inf = Infer::new(&cx, r, sigs, counter);
     inf.run(&cx);
     inf

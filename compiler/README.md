@@ -11,7 +11,7 @@ reference in the tests.
 
 | Module | Translates | |
 |---|---|---|
-| `support::base` | | storage on the standard library's arena: the context `Cx!`, text, sequences, maps, sets, cells, text copied between arenas, text built in a `Buffer!` kept in the arena; `fail` |
+| `support::base` | | `fail`, and hashing the compiler's own keys; its storage is the standard library's (see below) |
 | `support::system` | | arguments, files, directories, processes and the environment, through the standard library |
 | `syntax::ast`, `syntax::parser` | `syntax.py`, `parser.py` | the surface AST and the parser |
 | `syntax::dump` | | the AST as text |
@@ -66,42 +66,43 @@ limited to 6 GB of address space and a timeout. When valgrind is installed, the 
 
 ## Storage
 
-The compiler keeps what it builds in arenas of the standard library, `std::alloc::arena::Arena!['k]`.
-`support::base::Cx!['k]` holds an arena with the one capability for its domain, `Exclusive!['k]`:
+The compiler keeps what it builds in arenas of the standard library. Each group of phases has one
+`std::alloc::arena::Domain!['k]`: an arena with the one capability for its domain.
 
 ```kursal
 forall 'k.
-exposed struct Cx! {
+exposed struct Domain! {
     tag: Exclusive!['k],
     arena: Arena!['k],
 }
 ```
 
-Every value of the storage is a `Copy` view branded `'k`, built on the standard library's arena
-structures:
+It lends both to the standard library: every arena structure takes the context by place, `&cx`,
+bounded by `core::cap::Access` where it reads or writes the domain and by `alloc::arena::Allocate`
+where it allocates there, so `&cx` is all a call needs. Every value of the storage is a `Copy` view
+branded `'k`:
 
-- `Text['k]` is a `std::raw::Span['k]`: the bytes of a literal, of a file copied into the arena, or of
-  text the compiler built.
-- `Seq[T, 'k]` is a `std::collections::arena_vec::ArenaVec[T, 'k]`: a header in the arena naming
-  segments of elements that double in size, so elements never move and growing copies nothing. A
-  `Map[K, V, 'k]` keeps its entries in insertion order in one `ArenaVec` and its hash slots in an
-  arena slice (`Arena::alloc_slice`), made at the first key, under a header of its own; a
-  `Set[K, 'k]` is a `Map[K, bool, 'k]`.
-- `Cell[T, 'k]` is a `std::mem::Ref[T, 'k]` to one value in the arena.
+- Text is a `std::raw::Span['k]`: the bytes of a literal (`Span::from_static(&cx, "x")`), of a file
+  copied into the arena, or of text the compiler built.
+- A sequence is a `std::collections::arena_vec::ArenaVec[T, 'k]`: a header in the arena naming
+  segments of elements that double in size, so elements never move and growing copies nothing.
+- A map is a `std::collections::arena_map::ArenaMap[K, V, 'k]`, in insertion order like Python's
+  `dict`: its entries in one `ArenaVec`, its hash slots in an arena slice made at the first key; a
+  set is an `ArenaSet[K, 'k]` on top of one.
+- One mutable value, and a recursive field, is a `std::mem::Ref[T, 'k]` (`Ref::new(&cx, value)`).
+- The scopes of inference, opened and closed as a body is walked, are a persistent
+  `std::collections::list::List` of levels, innermost first.
 
-Each handle names a header in the arena, so a change made through one copy of a `Seq`, `Map`, `Set`
-or `Cell` is seen through every copy, as with Python's lists, dicts and sets. Elements are `Copy`
+Each handle names a header in the arena, so a change made through one copy of a vec, map, set or
+`Ref` is seen through every copy, as with Python's lists, dicts and sets. Elements are `Copy`
 values, read and written whole, and no reference into storage is handed out, so growing a sequence
-never leaves one dangling. Every operation that reads or writes takes `&cx`: a read presents
-`cx.tag` (`Ref::copy`, `ArenaVec::get`), a write presents it too (`Ref::replace`, `ArenaVec::set`),
-and one that may allocate also lends `cx.arena` to the library (`Arena::alloc`,
-`Arena::alloc_slice`). `support::base` has no `unsafe` and no raw pointers; the brand and the
-capability are what make its views safe to read.
+never leaves one dangling. `support::base` has no storage of its own: it keeps `fail`, and the
+hashing helpers for the compiler's own key types.
 
 Every type that holds storage carries the brand (`kurs::core::Type['k]`, `syntax::ast::Expr['k]`,
 `lower::lowering::FnLower['k]`), and every function that touches it is `forall 'k.` and takes
-`&cx: Cx!['k]`, first or right after `self`. The brand is always a parameter, never one brand for
-the whole compiler, so each group of phases runs in an arena of its own.
+`&cx: Domain!['k]`, first or right after `self`. The brand is always a parameter, never one brand
+for the whole compiler, so each group of phases runs in an arena of its own.
 
 ### An arena per group of phases
 
@@ -120,8 +121,8 @@ because place flow and promotion report errors through the resolver, in their fi
 
 A group's hand-off is copied into the next arena with `kurs::transfer::copy_program` (every type,
 function, block, instruction, declaration and data form, maps in the same order),
-`check::checker::copy_typed`, `support::base::copy_text` (`std::alloc::arena::copy_span`, read under
-the first arena's capability) and `types::ops::carry_fresh`; then the first arena is destroyed. A
+`check::checker::copy_typed`, `Span::copy_to(&from, &to)` (read under the first arena's
+capability) and `types::ops::carry_fresh`; then the first arena is destroyed. A
 part shared by two places in the original is copied for each: nothing changes a program once it is
 lowered. `fail` still stops the process from inside, leaving whichever arenas are open to the
 operating system; on success, every arena is destroyed and every byte the compiler allocated is
@@ -148,15 +149,15 @@ the rest of a phase stays in the arena, and so does everything that ends up in a
 ### Text being built
 
 Text is built in the standard library's linear `Buffer!`, on the heap, threaded by value through
-the chain of pushes: `Buffer::new().push_static("(").push_bytes(&cx, t).push_u64(n)`. A `Text`
-is read under the context's capability (`support::base` has `ReadBytes[Cx!['k], Text['k]]`), so
-`push_bytes(&cx, t)` takes it whole. Text that must outlive the builder ends in the arena through
-`support::base::text_of(&cx, buffer)`, which copies the finished bytes into one block of exactly
-their length and frees the buffer; a builder that is dropped on a path is destroyed there
-(`out.destroy()`), and the leak check under valgrind would see one that is not.
+the chain of pushes: `Buffer::new().push_static("(").push_bytes(&cx, t).push_u64(n)`. A span is
+read under the domain's capability (`ReadBytes[Domain!['k], Span['k]]`), so `push_bytes(&cx, t)`
+takes it whole. Text that must outlive the builder ends in the arena through `Buffer::save`,
+`Buffer::new().push_static("a").push_bytes(&cx, t).save(&cx)`, which copies the finished bytes into
+one block of exactly their length and frees the buffer; a builder that is dropped on a path is
+destroyed there (`out.destroy()`), and the leak check under valgrind would see one that is not.
 
 A helper that adds to text being built either takes the buffer and returns it
-(`fn str(&cx, out: Buffer!, t: Text['k]) -> Buffer!`, called `out = str(&cx, out, t)`), or, when
+(`fn str(&cx, out: Buffer!, t: Span['k]) -> Buffer!`, called `out = str(&cx, out, t)`), or, when
 it writes many lines from deep in a walk, takes it by place: `resolve::dump::Walk` and
 `infer::dump::Walk` pass `&out: Buffer!` to every method, `sigs::dump::sig` takes `&out`, and the
 C of a function's body is written into `&lines: Buffer!`, which `backend::cgen::line` appends to
@@ -167,39 +168,39 @@ printed with `std::io::print_buffer`.
 
 | Python | Kursal |
 |---|---|
-| `str` | `Text['k]` (a byte view; `text(&cx, "literal")`, `t.is(&cx, "literal")`, `t.eq(&cx, u)`, `t.len()`, `slice`, `find`, `split`, `starts_with`) |
-| building a `str` | `text_of(&cx, Buffer::new().push_static("a").push_bytes(&cx, t).push_u64(n))`; in a loop, `var out = Buffer::new();` and `out = out.push_static(", ");` |
-| `list`, `tuple` of values | `Seq[T, 'k]` (`push`, `get`, `set`, `len`, `pop`, `last`, `copy`, `slice`, `append`, `insert`, `remove`, `sort`; each takes `&cx`) |
-| `dict` | `Map[K, V, 'k]` (insertion-ordered like `dict`: `set`, `get` → `Option`, `at`, `get_or`, `has`, `remove`, `keys`, `values`) |
-| `set` | `Set[K, 'k]` (insertion-ordered: `add`, `has`, `remove`, `items`) |
+| `str` | `Span['k]` (a byte view; `Span::from_static(&cx, "literal")`, `t.is(&cx, "literal")`, `t.eq(&cx, u)`, `t.cmp(&cx, u)`, `t.len()`, `slice`, `skip`, `find`, `split`, `starts_with`, `byte_or_zero`) |
+| building a `str` | `Buffer::new().push_static("a").push_bytes(&cx, t).push_u64(n).save(&cx)`; in a loop, `var out = Buffer::new();` and `out = out.push_static(", ");` |
+| `list`, `tuple` of values | `ArenaVec[T, 'k]` (`push`, `at`, `get` → `Option`, `set`, `len`, `pop` → `Option`, `clone`, `slice`, `skip`, `append`, `insert`, `remove`, `sort_by`, `contains`, `each`, `any`, `fold`, ...; each takes `&cx`) |
+| `dict` | `ArenaMap[K, V, 'k]` (insertion-ordered like `dict`: `insert`, `get` → `Option`, `at`, `get_or`, `contains`, `remove`, `keys`, `values`, `each`, `any`) |
+| `set` | `ArenaSet[K, 'k]` (insertion-ordered: `insert`, `contains`, `remove`, `keys`, `each`, `any`, `all`) |
+| scopes pushed and popped by a walk | `List[T, 'k]` in a `Ref` (`cons`, `tail`, `first`, `find_map`, `reverse`, `each`) |
 | a worklist or visited set local to a walk | `OwnedVec![T]` (`push`, `pop` → `Popped`, `get`, `len`, `free`), `OwnedMap![K, V]` (`insert`, `get`; `insert_in(&cx, ...)` for keys in the arena; `free`) |
-| a mutable attribute | a field holding a `Cell[T, 'k]` (`get`, `set`), a `Seq` or a `Map` |
-| a dataclass | an `exposed struct` branded `'k`; a `HashIn[X['k], Cx!['k]]` instance if it is a map key |
+| a mutable attribute | a field holding a `Ref[T, 'k]` (`copy`, `set`), an `ArenaVec` or an `ArenaMap` |
+| a dataclass | an `exposed struct` branded `'k`; a `HashIn[X['k], Domain!['k]]` instance if it is a map key |
 | a union of classes | an `exposed enum` whose variants carry structs |
 | `raise KursError(message, pos)` | `fail(&cx, message)` with the same text; see below |
 | `Optional[T]` | `Option[T]` |
-| a recursive field | `Cell[T, 'k]` (or a `Seq`), so the type has a finite size |
-| `x is y` on lists, dicts, cells | `a.address() == b.address()` |
+| a recursive field | `Ref[T, 'k]` (or an `ArenaVec`), so the type has a finite size |
+| `x is y` on lists, dicts, refs | `a.address() == b.address()` |
 
 Nothing in an arena is freed until the arena is, so a loop that builds throwaway values on every
 step costs memory for the rest of its group. A sequence takes up to twice its length in room; a
 map's slots are made again, twice as many, as it grows, and the old ones stay. Text built in a
-`Buffer!` costs the arena only its final length, in `text_of`; one buffer pushed into another
+`Buffer!` costs the arena only its final length, in `save`; one buffer pushed into another
 (`push_buffer`) costs it nothing. Where a pure computation is repeated on the same input, cache it
 in a map (`Backend::ctype`, `Types::unfold`, the layout walk's finished keys). In a hot
-loop, read a map's or set's keys in place with `positions` and `entry` rather than copying them
-with `keys` or `items`, and compare text without splitting it.
+loop, read a map's or set's keys in place with `positions` and `key_at`, or `each` and `any`,
+rather than copying them with `keys`, and compare text without splitting it.
 
-Map keys are hashed and compared through the standard library's `HashIn[K, Cx!['k]]`, which borrows
-the context by place: `HashIn[K, Cx!['k]]::hash_in(&cx, key, state)`, or `key_hash(&cx, key)` and
-`key_same(&cx, a, b)`. The standard library has the instances for the integers, `bool` and tuples
-of keys, `support::base` those for `Text` and `Seq`s of keys, and `kurs::core` adds `Type`,
-`Param`, `Premise` and `ModuleId`. `kurs::core::same` is structural type equality (Python's `==` on
-frozen dataclasses), `kurs::core::hash` its hash.
+Map keys are hashed and compared through the standard library's `HashIn[K, Domain!['k]]`, which
+borrows the context by place: `HashIn[K, Domain!['k]]::hash_in(&cx, key, state)`, or
+`key_hash(&cx, key)` and `key_same(&cx, a, b)`. The standard library has the instances for the
+integers, `bool`, tuples, spans and `ArenaVec`s of keys, and `kurs::core` adds `Type`, `Param`,
+`Premise` and `ModuleId`. `kurs::core::same` is structural type equality (Python's `==` on frozen
+dataclasses), `kurs::core::hash` its hash.
 
-A class whose methods mutate `self` becomes a struct of handles (cells, sequences, maps) whose
-methods take `self` by value and `&cx`: the copies share the same storage. Its constructor allocates
-them.
+A class whose methods mutate `self` becomes a struct of handles (refs, vecs, maps) whose methods
+take `self` by value and `&cx`: the copies share the same storage. Its constructor allocates them.
 
 ### The operating system
 
@@ -257,7 +258,7 @@ These are the places where Kursal differs from what one might expect.
   the standard library's iterator adapters (`range(0, n).map(...)`) needs `core` as a direct
   dependency and `Iterator` imported.
 - **No indexing operator.** `a[i]` is not an expression; `[` after a name starts type arguments. Use
-  a `Seq` and `get`.
+  an `ArenaVec` and `at`.
 - **No nested patterns.** A match case binds names: `Option::Some(x) =>`, never
   `Result::Ok(Option::Some(x))`. Match the outer value, then the inner one. The `_` arm comes last.
 - **Struct literals** are `Point.{ x: 1u32, y }`; tuple structs and variants with a payload are built
@@ -271,28 +272,28 @@ These are the places where Kursal differs from what one might expect.
 - **Generic code over linear types.** A type parameter may stand for a linear type unless a premise
   says `Copy[T]`. Using a value twice, or dropping it on one path (`a && b` drops `b` when `a` is
   false), needs `Copy[T]`. Every `support::base` collection requires it.
-- **Places.** A linear value is lent by place: `fn f(&cx: Cx!['k])` is called `f(&cx)`, and the
+- **Places.** A linear value is lent by place: `fn f(&cx: Domain!['k])` is called `f(&cx)`, and the
   callee's changes to `cx` are the caller's. Fields of a lent struct can be lent in one call
   (`&cx.arena.alloc(&cx.tag, value)`), and a call may lend `cx` again in its arguments
   (`f(&cx, g(&cx, x))`). A function may move a place parameter out if it puts a value back before it
-  returns: `let { tag, arena } = cx; ...; cx = Cx.{ tag, arena };`. A
+  returns: `let { tag, arena } = cx; ...; cx = Domain.{ tag, arena };`. A
   `match`, `&&` or `if` may lend it in every branch.
 - **Brands.** `forall 'k.` binds a brand like a type parameter, and a type that holds branded storage
-  takes it as its last argument (`Seq[Text['k], 'k]`). A brand is minted by a constructor that
-  returns `exists 'k. ...` and is opened by `let exists 'k. cx = Cx::new();`; a trait may take one
+  takes it as its last argument (`ArenaVec[Span['k], 'k]`). A brand is minted by a constructor that
+  returns `exists 'k. ...` and is opened by `let exists 'k. cx = Domain::new();`; a trait may take one
   as a parameter (`forall D, 'k. trait Discharge`, `instance Discharge[Checker['k], 'k]`).
 - **Zero-size types** (`()`, empty structs) have no memory form: no `sizeof`, no storage. Use `bool`
-  as a placeholder value (`Set` is a `Map[K, bool]`).
+  as a placeholder value (`ArenaSet` is an `ArenaMap[K, bool]`).
 - **Expressions as statements.** `f(x);` discards a Copy result. A block's value is its last
   expression, without a `;`. `return` is allowed anywhere; a function whose type is `!` (such as
   `fail`) can stand in any expression position.
 - **`if` and `match` are expressions** and need an `else`/every case when their value is used.
 - **Closures** `|x| x + 1u32` have types `closure(u32) -> u32` as parameters; a closure may read Copy
   locals of its function, but captures nothing linear, so one that touches storage takes the
-  context as a place parameter: `closure[Env](&_: Cx!['k], Type['k]) -> Type['k]`, written
+  context as a place parameter: `closure[Env](&_: Domain!['k], Type['k]) -> Type['k]`, written
   `|&cx, child: Type['k]| zonk(&cx, child)` and called `transform(&cx, ty)`. Plain function values
-  have types `fn(u32) -> u32`; a brand-generic function passes as one (`items.sort(&cx, text_before)`
-  for `fn(&_: Cx!['k], Text['k], Text['k]) -> bool`).
+  have types `fn(u32) -> u32`, and a closure parameter does not take one: a comparator is passed
+  as a closure that calls it, `items.sort_by(&cx, |&cx, a, b| a.cmp(&cx, b))`.
 - **Modules.** Each `.kur` file is a module named by its path; `use package::name` imports one, and
   `lib.kur` lists them. `use package::syntax::ast as S;` then `S::Expr`. A directory is a module whose
   `lib.kur` lists its children, as `compiler/lib.kur` lists the phases.

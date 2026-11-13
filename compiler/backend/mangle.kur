@@ -5,7 +5,9 @@
 // bound names; nominal names and free brands remain distinct. A specialization's type arguments are
 // keyed `unbranded`, so code made for them does not depend on their brands.
 
-use package::support::base::{Cx, Seq, Text, text, text_of};
+use std::collections::arena_vec::ArenaVec;
+use std::raw::Span;
+use std::alloc::arena::Domain;
 use std::bytes::buffer::Buffer;
 use package::kurs::core::{Member, Type};
 use package::types::ops::{foreach_binders, kind_name, kurs_error, map_children};
@@ -14,11 +16,11 @@ use std::option::Option;
 
 // The number of characters of UTF-8 text: its bytes that do not continue a character.
 forall 'k.
-fn char_count(&cx: Cx!['k], t: Text['k]) -> usize {
+fn char_count(&cx: Domain!['k], t: Span['k]) -> usize {
     var n = 0usize;
     var i = 0usize;
     while i < t.len() {
-        if (t.byte(&cx, i) & 192u8) != 128u8 {
+        if (t.byte_or_zero(&cx, i) & 192u8) != 128u8 {
             n = n + 1usize;
         }
         i = i + 1usize;
@@ -28,49 +30,49 @@ fn char_count(&cx: Cx!['k], t: Text['k]) -> usize {
 
 // Length framing avoids ambiguity without recursively escaping nested keys.
 forall 'k.
-fn encode(&cx: Cx!['k], parts: Seq[Text['k], 'k]) -> Text['k] {
+fn encode(&cx: Domain!['k], parts: ArenaVec[Span['k], 'k]) -> Span['k] {
     var out = Buffer::new();
     var i = 0usize;
     while i < parts.len(&cx) {
-        out = out.push_usize(char_count(&cx, parts.get(&cx, i))).push_static(":").push_bytes(&cx, parts.get(&cx, i));
+        out = out.push_usize(char_count(&cx, parts.at(&cx, i))).push_static(":").push_bytes(&cx, parts.at(&cx, i));
         i = i + 1usize;
     }
-    text_of(&cx, out)
+    out.save(&cx)
 }
 
 forall 'k.
-fn bool_text(&cx: Cx!['k], b: bool) -> Text['k] {
-    if b { text(&cx, "True") } else { text(&cx, "False") }
+fn bool_text(&cx: Domain!['k], b: bool) -> Span['k] {
+    if b { Span::from_static(&cx, "True") } else { Span::from_static(&cx, "False") }
 }
 
 forall 'k.
-fn number(&cx: Cx!['k], n: u64) -> Text['k] {
-    text_of(&cx, Buffer::new().push_u64(n))
+fn number(&cx: Domain!['k], n: u64) -> Span['k] {
+    Buffer::new().push_u64(n).save(&cx)
 }
 
 forall 'k.
-fn with_names(&cx: Cx!['k], scope: Seq[Text['k], 'k], names: Seq[Text['k], 'k]) -> Seq[Text['k], 'k] {
-    let out = scope.copy(&cx);
+fn with_names(&cx: Domain!['k], scope: ArenaVec[Span['k], 'k], names: ArenaVec[Span['k], 'k]) -> ArenaVec[Span['k], 'k] {
+    let out = scope.clone(&cx);
     out.append(&cx, names);
     out
 }
 
 forall 'k.
-fn keys(&cx: Cx!['k], types: Seq[Type['k], 'k], scope: Seq[Text['k], 'k]) -> Seq[Text['k], 'k] {
-    let out: Seq[Text['k], 'k] = Seq::new(&cx);
+fn keys(&cx: Domain!['k], types: ArenaVec[Type['k], 'k], scope: ArenaVec[Span['k], 'k]) -> ArenaVec[Span['k], 'k] {
+    let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
     var i = 0usize;
     while i < types.len(&cx) {
-        out.push(&cx, type_key(&cx, types.get(&cx, i), scope));
+        out.push(&cx, type_key(&cx, types.at(&cx, i), scope));
         i = i + 1usize;
     }
     out
 }
 
 forall 'k.
-fn any_branded(&cx: Cx!['k], types: Seq[Type['k], 'k]) -> bool {
+fn any_branded(&cx: Domain!['k], types: ArenaVec[Type['k], 'k]) -> bool {
     var i = 0usize;
     while i < types.len(&cx) {
-        if branded(&cx, types.get(&cx, i)) {
+        if branded(&cx, types.at(&cx, i)) {
             return true;
         }
         i = i + 1usize;
@@ -79,10 +81,10 @@ fn any_branded(&cx: Cx!['k], types: Seq[Type['k], 'k]) -> bool {
 }
 
 forall 'k.
-fn members_branded(&cx: Cx!['k], members: Seq[Member['k], 'k]) -> bool {
+fn members_branded(&cx: Domain!['k], members: ArenaVec[Member['k], 'k]) -> bool {
     var i = 0usize;
     while i < members.len(&cx) {
-        if branded(&cx, members.get(&cx, i).type) {
+        if branded(&cx, members.at(&cx, i).type) {
             return true;
         }
         i = i + 1usize;
@@ -92,19 +94,19 @@ fn members_branded(&cx: Cx!['k], members: Seq[Member['k], 'k]) -> bool {
 
 // Whether `ty` mentions a brand.
 forall 'k.
-fn branded(&cx: Cx!['k], ty: Type['k]) -> bool {
+fn branded(&cx: Domain!['k], ty: Type['k]) -> bool {
     match ty {
         Type::Skolem(_label) => true,
         Type::Named(_name, args) => any_branded(&cx, args),
-        Type::Brand(brand) => branded(&cx, brand.get(&cx)),
-        Type::Ptr(inner) => branded(&cx, inner.get(&cx)),
-        Type::Array(elem, _length) => branded(&cx, elem.get(&cx)),
+        Type::Brand(brand) => branded(&cx, brand.copy(&cx)),
+        Type::Ptr(inner) => branded(&cx, inner.copy(&cx)),
+        Type::Array(elem, _length) => branded(&cx, elem.copy(&cx)),
         Type::Tuple(elems) => any_branded(&cx, elems),
         Type::Struct(fields) => members_branded(&cx, fields),
         Type::Enum(variants) => members_branded(&cx, variants),
-        Type::Exists(_binders, body) => branded(&cx, body.get(&cx)),
-        Type::Foreach(f) => branded(&cx, f.source.get(&cx)) || branded(&cx, f.body.get(&cx)),
-        Type::Fn(f) => any_branded(&cx, f.params) || branded(&cx, f.ret.get(&cx)),
+        Type::Exists(_binders, body) => branded(&cx, body.copy(&cx)),
+        Type::Foreach(f) => branded(&cx, f.source.copy(&cx)) || branded(&cx, f.body.copy(&cx)),
+        Type::Fn(f) => any_branded(&cx, f.params) || branded(&cx, f.ret.copy(&cx)),
         _ => false,
     }
 }
@@ -114,128 +116,128 @@ fn branded(&cx: Cx!['k], ty: Type['k]) -> bool {
 // A brand has no representation, and coherence never tells two instance heads apart by brands
 // alone, so specializations whose type arguments differ only in brands make the same C.
 forall 'k.
-fn unbranded(&cx: Cx!['k], ty: Type['k]) -> Type['k] {
+fn unbranded(&cx: Domain!['k], ty: Type['k]) -> Type['k] {
     match ty {
-        Type::Skolem(_label) => Type::Skolem.(text(&cx, "_")),
+        Type::Skolem(_label) => Type::Skolem.(Span::from_static(&cx, "_")),
         _ => if branded(&cx, ty) { map_children(&cx, ty, |&cx, child: Type['k]| unbranded(&cx, child)) } else { ty },
     }
 }
 
 // The position of the innermost binder of `name`, counted from the innermost.
 forall 'k.
-fn bound(&cx: Cx!['k], scope: Seq[Text['k], 'k], name: Text['k]) -> Text['k] {
+fn bound(&cx: Domain!['k], scope: ArenaVec[Span['k], 'k], name: Span['k]) -> Span['k] {
     var i = scope.len(&cx);
     var found = 0usize;
     var going = true;
     while going && i > 0usize {
         i = i - 1usize;
-        if scope.get(&cx, i).eq(&cx, name) {
+        if scope.at(&cx, i).eq(&cx, name) {
             found = scope.len(&cx) - 1usize - i;
             going = false;
         }
     }
-    text_of(&cx, Buffer::new().push_usize(found))
+    Buffer::new().push_usize(found).save(&cx)
 }
 
 forall 'k.
-fn type_key(&cx: Cx!['k], ty: Type['k], scope: Seq[Text['k], 'k]) -> Text['k] {
-    let parts: Seq[Text['k], 'k] = Seq::new(&cx);
+fn type_key(&cx: Domain!['k], ty: Type['k], scope: ArenaVec[Span['k], 'k]) -> Span['k] {
+    let parts: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
     match ty {
         Type::Skolem(n) => {
-            if scope.has(&cx, n) {
-                parts.push(&cx, text(&cx, "bound-brand"));
+            if scope.contains(&cx, n) {
+                parts.push(&cx, Span::from_static(&cx, "bound-brand"));
                 parts.push(&cx, bound(&cx, scope, n));
             } else {
-                parts.push(&cx, text(&cx, "brand"));
+                parts.push(&cx, Span::from_static(&cx, "brand"));
                 parts.push(&cx, n);
             }
         },
         Type::Named(n, args) => {
-            if args.is_empty(&cx) && scope.has(&cx, n) {
-                parts.push(&cx, text(&cx, "bound-type"));
+            if args.is_empty(&cx) && scope.contains(&cx, n) {
+                parts.push(&cx, Span::from_static(&cx, "bound-type"));
                 parts.push(&cx, bound(&cx, scope, n));
             } else {
-                parts.push(&cx, text(&cx, "named"));
+                parts.push(&cx, Span::from_static(&cx, "named"));
                 parts.push(&cx, n);
                 parts.append(&cx, keys(&cx, args, scope));
             }
         },
         Type::Prim(n) => {
-            parts.push(&cx, text(&cx, "prim"));
+            parts.push(&cx, Span::from_static(&cx, "prim"));
             parts.push(&cx, n);
         },
-        Type::Never => parts.push(&cx, text(&cx, "never")),
-        Type::Ignored => parts.push(&cx, text(&cx, "ignored")),
+        Type::Never => parts.push(&cx, Span::from_static(&cx, "never")),
+        Type::Ignored => parts.push(&cx, Span::from_static(&cx, "ignored")),
         Type::Tuple(elems) => {
-            parts.push(&cx, text(&cx, "tuple"));
+            parts.push(&cx, Span::from_static(&cx, "tuple"));
             parts.append(&cx, keys(&cx, elems, scope));
         },
         Type::Struct(fields) => {
-            parts.push(&cx, text(&cx, "Struct"));
+            parts.push(&cx, Span::from_static(&cx, "Struct"));
             var i = 0usize;
             while i < fields.len(&cx) {
-                parts.push(&cx, encode(&cx, Seq::two(&cx, fields.get(&cx, i).name, type_key(&cx, fields.get(&cx, i).type, scope))));
+                parts.push(&cx, encode(&cx, ArenaVec::two(&cx, fields.at(&cx, i).name, type_key(&cx, fields.at(&cx, i).type, scope))));
                 i = i + 1usize;
             }
         },
         Type::Enum(variants) => {
-            parts.push(&cx, text(&cx, "Enum"));
+            parts.push(&cx, Span::from_static(&cx, "Enum"));
             var i = 0usize;
             while i < variants.len(&cx) {
-                parts.push(&cx, encode(&cx, Seq::two(&cx, variants.get(&cx, i).name, type_key(&cx, variants.get(&cx, i).type, scope))));
+                parts.push(&cx, encode(&cx, ArenaVec::two(&cx, variants.at(&cx, i).name, type_key(&cx, variants.at(&cx, i).type, scope))));
                 i = i + 1usize;
             }
         },
         Type::Array(elem, length) => {
-            parts.push(&cx, text(&cx, "array"));
+            parts.push(&cx, Span::from_static(&cx, "array"));
             parts.push(&cx, number(&cx, length));
-            parts.push(&cx, type_key(&cx, elem.get(&cx), scope));
+            parts.push(&cx, type_key(&cx, elem.copy(&cx), scope));
         },
         Type::Ptr(inner) => {
-            parts.push(&cx, text(&cx, "Ptr"));
-            parts.push(&cx, type_key(&cx, inner.get(&cx), scope));
+            parts.push(&cx, Span::from_static(&cx, "Ptr"));
+            parts.push(&cx, type_key(&cx, inner.copy(&cx), scope));
         },
         Type::Brand(brand) => {
-            parts.push(&cx, text(&cx, "Brand"));
-            parts.push(&cx, type_key(&cx, brand.get(&cx), scope));
+            parts.push(&cx, Span::from_static(&cx, "Brand"));
+            parts.push(&cx, type_key(&cx, brand.copy(&cx), scope));
         },
         Type::Exists(names, body) => {
-            parts.push(&cx, text(&cx, "exists"));
+            parts.push(&cx, Span::from_static(&cx, "exists"));
             parts.push(&cx, number(&cx, names.len(&cx) as u64));
-            parts.push(&cx, type_key(&cx, body.get(&cx), with_names(&cx, scope, names)));
+            parts.push(&cx, type_key(&cx, body.copy(&cx), with_names(&cx, scope, names)));
         },
         Type::Foreach(f) => {
             let binders = foreach_binders(&cx, f);
-            parts.push(&cx, text(&cx, "foreach"));
+            parts.push(&cx, Span::from_static(&cx, "foreach"));
             parts.push(&cx, bool_text(&cx, f.indirect));
             parts.push(&cx, number(&cx, binders.len(&cx) as u64));
-            parts.push(&cx, type_key(&cx, f.source.get(&cx), scope));
-            parts.push(&cx, type_key(&cx, f.body.get(&cx), with_names(&cx, scope, binders)));
+            parts.push(&cx, type_key(&cx, f.source.copy(&cx), scope));
+            parts.push(&cx, type_key(&cx, f.body.copy(&cx), with_names(&cx, scope, binders)));
         },
         Type::Fn(f) => {
-            let names: Seq[Text['k], 'k] = Seq::new(&cx);
-            let kinds: Seq[Text['k], 'k] = Seq::new(&cx);
+            let names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+            let kinds: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
             var i = 0usize;
             while i < f.quantified.len(&cx) {
-                names.push(&cx, f.quantified.get(&cx, i).name);
-                kinds.push(&cx, kind_name(&cx, f.quantified.get(&cx, i).kind));
+                names.push(&cx, f.quantified.at(&cx, i).name);
+                kinds.push(&cx, kind_name(&cx, f.quantified.at(&cx, i).kind));
                 i = i + 1usize;
             }
             let inner = with_names(&cx, scope, names);
-            let places: Seq[Text['k], 'k] = Seq::new(&cx);
+            let places: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
             var j = 0usize;
             while j < f.places.len(&cx) {
-                places.push(&cx, number(&cx, f.places.get(&cx, j) as u64));
+                places.push(&cx, number(&cx, f.places.at(&cx, j) as u64));
                 j = j + 1usize;
             }
-            parts.push(&cx, text(&cx, "fn"));
+            parts.push(&cx, Span::from_static(&cx, "fn"));
             parts.push(&cx, bool_text(&cx, f.is_unsafe));
             parts.push(&cx, encode(&cx, places));
             parts.push(&cx, encode(&cx, kinds));
             parts.push(&cx, encode(&cx, keys(&cx, f.params, inner)));
-            parts.push(&cx, type_key(&cx, f.ret.get(&cx), inner));
+            parts.push(&cx, type_key(&cx, f.ret.copy(&cx), inner));
         },
-        Type::Meta(_m) => kurs_error(&cx, text(&cx, "cannot mangle an inference variable"), no_pos()),
+        Type::Meta(_m) => kurs_error(&cx, Span::from_static(&cx, "cannot mangle an inference variable"), no_pos()),
     };
     encode(&cx, parts)
 }
@@ -251,30 +253,30 @@ fn is_lower_hex(b: u8) -> bool {
 // The bytes a linker identity segment encodes: `m` or `d` and pairs of lowercase hex digits that
 // spell UTF-8 text. Any other segment encodes nothing.
 forall 'k.
-fn decode_segment(&cx: Cx!['k], seg: Text['k]) -> Option[Text['k]] {
-    if seg.len() < 3usize || seg.len() % 2usize == 0usize || seg.byte(&cx, 0usize) != b'm' && seg.byte(&cx, 0usize) != b'd' {
+fn decode_segment(&cx: Domain!['k], seg: Span['k]) -> Option[Span['k]] {
+    if seg.len() < 3usize || seg.len() % 2usize == 0usize || seg.byte_or_zero(&cx, 0usize) != b'm' && seg.byte_or_zero(&cx, 0usize) != b'd' {
         return Option::None;
     }
     var out = Buffer::new();
     var i = 1usize;
     while i < seg.len() {
-        if !is_lower_hex(seg.byte(&cx, i)) || !is_lower_hex(seg.byte(&cx, i + 1usize)) {
+        if !is_lower_hex(seg.byte_or_zero(&cx, i)) || !is_lower_hex(seg.byte_or_zero(&cx, i + 1usize)) {
             out.destroy();
             return Option::None;
         }
-        out = out.push_byte(hex_value(seg.byte(&cx, i)) * 16u8 + hex_value(seg.byte(&cx, i + 1usize)));
+        out = out.push_byte(hex_value(seg.byte_or_zero(&cx, i)) * 16u8 + hex_value(seg.byte_or_zero(&cx, i + 1usize)));
         i = i + 2usize;
     }
-    let bytes = text_of(&cx, out);
+    let bytes = out.save(&cx);
     if valid_utf8(&cx, bytes) { Option::Some.(bytes) } else { Option::None }
 }
 
 // `t` is well-formed UTF-8: no overlong forms, surrogates or code points past U+10FFFF.
 forall 'k.
-fn valid_utf8(&cx: Cx!['k], t: Text['k]) -> bool {
+fn valid_utf8(&cx: Domain!['k], t: Span['k]) -> bool {
     var i = 0usize;
     while i < t.len() {
-        let b = t.byte(&cx, i);
+        let b = t.byte_or_zero(&cx, i);
         let (count, low, high) = if b < 128u8 {
             (0usize, 128u8, 191u8)
         } else if b >= 194u8 && b <= 223u8 {
@@ -299,7 +301,7 @@ fn valid_utf8(&cx: Cx!['k], t: Text['k]) -> bool {
         }
         var k = 1usize;
         while k <= count {
-            let c = t.byte(&cx, i + k);
+            let c = t.byte_or_zero(&cx, i + k);
             let (lo, hi) = if k == 1usize { (low, high) } else { (128u8, 191u8) };
             if c < lo || c > hi {
                 return false;
@@ -313,20 +315,20 @@ fn valid_utf8(&cx: Cx!['k], t: Text['k]) -> bool {
 
 // Decode linker segments for display, then escape bytes into C identifiers.
 forall 'k.
-fn path_segments(&cx: Cx!['k], name: Text['k]) -> Seq[Text['k], 'k] {
-    let parts: Seq[Text['k], 'k] = Seq::new(&cx);
-    let pieces = name.split(&cx, text(&cx, "::"));
+fn path_segments(&cx: Domain!['k], name: Span['k]) -> ArenaVec[Span['k], 'k] {
+    let parts: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+    let pieces = name.split(&cx, Span::from_static(&cx, "::"));
     var i = 0usize;
     while i < pieces.len(&cx) {
-        let part = match decode_segment(&cx, pieces.get(&cx, i)) {
+        let part = match decode_segment(&cx, pieces.at(&cx, i)) {
             Option::Some(bytes) => bytes,
-            Option::None => pieces.get(&cx, i),
+            Option::None => pieces.at(&cx, i),
         };
         // Escape underscores too, so punctuation cannot alias literal escapes.
         var out = Buffer::new();
         var j = 0usize;
         while j < part.len() {
-            let b = part.byte(&cx, j);
+            let b = part.byte_or_zero(&cx, j);
             if b >= b'0' && b <= b'9' || b >= b'A' && b <= b'Z' || b >= b'a' && b <= b'z' {
                 out = out.push_byte(b);
             } else {
@@ -336,9 +338,9 @@ fn path_segments(&cx: Cx!['k], name: Text['k]) -> Seq[Text['k], 'k] {
         }
         parts.push(&cx, if part.is_empty() {
             out.destroy();
-            text(&cx, "_empty")
+            Span::from_static(&cx, "_empty")
         } else {
-            text_of(&cx, out)
+            out.save(&cx)
         });
         i = i + 1usize;
     }
@@ -347,26 +349,26 @@ fn path_segments(&cx: Cx!['k], name: Text['k]) -> Seq[Text['k], 'k] {
 
 // `b` as two lowercase hex digits.
 forall 'k.
-fn hex_byte(&cx: Cx!['k], out: Buffer!, b: u8) -> Buffer! {
-    let digits = text(&cx, "0123456789abcdef");
-    out.push_byte(digits.byte(&cx, (b / 16u8) as usize)).push_byte(digits.byte(&cx, (b % 16u8) as usize))
+fn hex_byte(&cx: Domain!['k], out: Buffer!, b: u8) -> Buffer! {
+    let digits = Span::from_static(&cx, "0123456789abcdef");
+    out.push_byte(digits.byte_or_zero(&cx, (b / 16u8) as usize)).push_byte(digits.byte_or_zero(&cx, (b % 16u8) as usize))
 }
 
 forall 'k.
-fn mangle(&cx: Cx!['k], path: Seq[Text['k], 'k], identity: Text['k], salt: u64) -> Text['k] {
-    let framed = Seq::two(&cx, text(&cx, "kurs"), identity);
+fn mangle(&cx: Domain!['k], path: ArenaVec[Span['k], 'k], identity: Span['k], salt: u64) -> Span['k] {
+    let framed = ArenaVec::two(&cx, Span::from_static(&cx, "kurs"), identity);
     framed.push(&cx, number(&cx, salt));
     let digest = sha256_hex(&cx, encode(&cx, framed)).slice(0usize, 16usize);
-    let parts: Seq[Text['k], 'k] = Seq::one(&cx, text(&cx, "kurs"));
+    let parts: ArenaVec[Span['k], 'k] = ArenaVec::one(&cx, Span::from_static(&cx, "kurs"));
     parts.append(&cx, path);
-    parts.push(&cx, text_of(&cx, Buffer::new().push_static("h").push_bytes(&cx, digest)));
+    parts.push(&cx, Buffer::new().push_static("h").push_bytes(&cx, digest).save(&cx));
     var out = Buffer::new().push_static("_ZN");
     var i = 0usize;
     while i < parts.len(&cx) {
-        out = out.push_usize(char_count(&cx, parts.get(&cx, i))).push_bytes(&cx, parts.get(&cx, i));
+        out = out.push_usize(char_count(&cx, parts.at(&cx, i))).push_bytes(&cx, parts.at(&cx, i));
         i = i + 1usize;
     }
-    text_of(&cx, out.push_static("E"))
+    out.push_static("E").save(&cx)
 }
 
 // ---------------------------------------------------------------- SHA-256 --
@@ -376,8 +378,8 @@ fn rotr(x: u32, n: u32) -> u32 {
 }
 
 forall 'k.
-fn round_constants(&cx: Cx!['k]) -> Seq[u32, 'k] {
-    let k: Seq[u32, 'k] = Seq::new(&cx);
+fn round_constants(&cx: Domain!['k]) -> ArenaVec[u32, 'k] {
+    let k: ArenaVec[u32, 'k] = ArenaVec::new(&cx);
     push8(&cx, k, 1116352408u32, 1899447441u32, 3049323471u32, 3921009573u32, 961987163u32, 1508970993u32, 2453635748u32, 2870763221u32);
     push8(&cx, k, 3624381080u32, 310598401u32, 607225278u32, 1426881987u32, 1925078388u32, 2162078206u32, 2614888103u32, 3248222580u32);
     push8(&cx, k, 3835390401u32, 4022224774u32, 264347078u32, 604807628u32, 770255983u32, 1249150122u32, 1555081692u32, 1996064986u32);
@@ -390,7 +392,7 @@ fn round_constants(&cx: Cx!['k]) -> Seq[u32, 'k] {
 }
 
 forall 'k.
-fn push8(&cx: Cx!['k], k: Seq[u32, 'k], a: u32, b: u32, c: u32, d: u32, e: u32, f: u32, g: u32, h: u32) {
+fn push8(&cx: Domain!['k], k: ArenaVec[u32, 'k], a: u32, b: u32, c: u32, d: u32, e: u32, f: u32, g: u32, h: u32) {
     k.push(&cx, a);
     k.push(&cx, b);
     k.push(&cx, c);
@@ -403,14 +405,14 @@ fn push8(&cx: Cx!['k], k: Seq[u32, 'k], a: u32, b: u32, c: u32, d: u32, e: u32, 
 
 // The SHA-256 digest of `data`, in lowercase hex.
 forall 'k.
-fn sha256_hex(&cx: Cx!['k], data: Text['k]) -> Text['k] {
+fn sha256_hex(&cx: Domain!['k], data: Span['k]) -> Span['k] {
     let k = round_constants(&cx);
-    let h: Seq[u32, 'k] = Seq::new(&cx);
+    let h: ArenaVec[u32, 'k] = ArenaVec::new(&cx);
     push8(&cx, h, 1779033703u32, 3144134277u32, 1013904242u32, 2773480762u32, 1359893119u32, 2600822924u32, 528734635u32, 1541459225u32);
-    let message: Seq[u8, 'k] = Seq::new(&cx);
+    let message: ArenaVec[u8, 'k] = ArenaVec::new(&cx);
     var b = 0usize;
     while b < data.len() {
-        message.push(&cx, data.byte(&cx, b));
+        message.push(&cx, data.byte_or_zero(&cx, b));
         b = b + 1usize;
     }
     message.push(&cx, 128u8);
@@ -423,38 +425,38 @@ fn sha256_hex(&cx: Cx!['k], data: Text['k]) -> Text['k] {
         message.push(&cx, ((bits >> (56u64 - 8u64 * j)) & 255u64) as u8);
         j = j + 1u64;
     }
-    let w: Seq[u32, 'k] = Seq::new(&cx);
+    let w: ArenaVec[u32, 'k] = ArenaVec::new(&cx);
     var chunk = 0usize;
     while chunk < message.len(&cx) {
         w.clear(&cx);
         var t = 0usize;
         while t < 16usize {
             let at = chunk + t * 4usize;
-            w.push(&cx, ((message.get(&cx, at) as u32) << 24u32) | ((message.get(&cx, at + 1usize) as u32) << 16u32)
-                | ((message.get(&cx, at + 2usize) as u32) << 8u32) | (message.get(&cx, at + 3usize) as u32));
+            w.push(&cx, ((message.at(&cx, at) as u32) << 24u32) | ((message.at(&cx, at + 1usize) as u32) << 16u32)
+                | ((message.at(&cx, at + 2usize) as u32) << 8u32) | (message.at(&cx, at + 3usize) as u32));
             t = t + 1usize;
         }
         while t < 64usize {
-            let x = w.get(&cx, t - 15usize);
-            let y = w.get(&cx, t - 2usize);
+            let x = w.at(&cx, t - 15usize);
+            let y = w.at(&cx, t - 2usize);
             let s0 = rotr(x, 7u32) ^ rotr(x, 18u32) ^ (x >> 3u32);
             let s1 = rotr(y, 17u32) ^ rotr(y, 19u32) ^ (y >> 10u32);
-            w.push(&cx, w.get(&cx, t - 16usize) + s0 + w.get(&cx, t - 7usize) + s1);
+            w.push(&cx, w.at(&cx, t - 16usize) + s0 + w.at(&cx, t - 7usize) + s1);
             t = t + 1usize;
         }
-        var a = h.get(&cx, 0usize);
-        var b = h.get(&cx, 1usize);
-        var c = h.get(&cx, 2usize);
-        var d = h.get(&cx, 3usize);
-        var e = h.get(&cx, 4usize);
-        var f = h.get(&cx, 5usize);
-        var g = h.get(&cx, 6usize);
-        var hh = h.get(&cx, 7usize);
+        var a = h.at(&cx, 0usize);
+        var b = h.at(&cx, 1usize);
+        var c = h.at(&cx, 2usize);
+        var d = h.at(&cx, 3usize);
+        var e = h.at(&cx, 4usize);
+        var f = h.at(&cx, 5usize);
+        var g = h.at(&cx, 6usize);
+        var hh = h.at(&cx, 7usize);
         var r = 0usize;
         while r < 64usize {
             let big1 = rotr(e, 6u32) ^ rotr(e, 11u32) ^ rotr(e, 25u32);
             let choice = (e & f) ^ ((e ^ 4294967295u32) & g);
-            let t1 = hh + big1 + choice + k.get(&cx, r) + w.get(&cx, r);
+            let t1 = hh + big1 + choice + k.at(&cx, r) + w.at(&cx, r);
             let big0 = rotr(a, 2u32) ^ rotr(a, 13u32) ^ rotr(a, 22u32);
             let majority = (a & b) ^ (a & c) ^ (b & c);
             let t2 = big0 + majority;
@@ -468,22 +470,22 @@ fn sha256_hex(&cx: Cx!['k], data: Text['k]) -> Text['k] {
             a = t1 + t2;
             r = r + 1usize;
         }
-        h.set(&cx, 0usize, h.get(&cx, 0usize) + a);
-        h.set(&cx, 1usize, h.get(&cx, 1usize) + b);
-        h.set(&cx, 2usize, h.get(&cx, 2usize) + c);
-        h.set(&cx, 3usize, h.get(&cx, 3usize) + d);
-        h.set(&cx, 4usize, h.get(&cx, 4usize) + e);
-        h.set(&cx, 5usize, h.get(&cx, 5usize) + f);
-        h.set(&cx, 6usize, h.get(&cx, 6usize) + g);
-        h.set(&cx, 7usize, h.get(&cx, 7usize) + hh);
+        h.set(&cx, 0usize, h.at(&cx, 0usize) + a);
+        h.set(&cx, 1usize, h.at(&cx, 1usize) + b);
+        h.set(&cx, 2usize, h.at(&cx, 2usize) + c);
+        h.set(&cx, 3usize, h.at(&cx, 3usize) + d);
+        h.set(&cx, 4usize, h.at(&cx, 4usize) + e);
+        h.set(&cx, 5usize, h.at(&cx, 5usize) + f);
+        h.set(&cx, 6usize, h.at(&cx, 6usize) + g);
+        h.set(&cx, 7usize, h.at(&cx, 7usize) + hh);
         chunk = chunk + 64usize;
     }
     var out = Buffer::new();
     var i = 0usize;
     while i < 8usize {
-        let word = h.get(&cx, i);
+        let word = h.at(&cx, i);
         out = hex_byte(&cx, hex_byte(&cx, hex_byte(&cx, hex_byte(&cx, out, (word >> 24u32) as u8), ((word >> 16u32) & 255u32) as u8), ((word >> 8u32) & 255u32) as u8), (word & 255u32) as u8);
         i = i + 1usize;
     }
-    text_of(&cx, out)
+    out.save(&cx)
 }

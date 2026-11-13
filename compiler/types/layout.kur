@@ -5,7 +5,10 @@
 // storage cycles; aggregate names break C alias cycles. No concrete specialization budget is
 // needed.
 
-use package::support::base::{Cx, Map, Seq, Set, Text, text, text_of};
+use std::collections::arena_vec::ArenaVec;
+use std::collections::arena_map::{ArenaMap, ArenaSet};
+use std::raw::Span;
+use std::alloc::arena::Domain;
 use std::bytes::buffer::Buffer;
 use package::kurs::core::{Kind, Program, Type};
 use package::kurs::core as C;
@@ -18,33 +21,33 @@ use std::option::Option;
 // owner's parameters and the names derived from them in scope there.
 forall 'k.
 exposed struct ExpansionSite {
-    owner: Text['k],
-    name: Text['k],
-    args: Seq[Type['k], 'k],
-    params: Set[Text['k], 'k],
-    derived: Set[Text['k], 'k],
+    owner: Span['k],
+    name: Span['k],
+    args: ArenaVec[Type['k], 'k],
+    params: ArenaSet[Span['k], 'k],
+    derived: ArenaSet[Span['k], 'k],
 }
 
 forall 'k.
 exposed struct Expansion {
     program: Program['k],
     counter: Fresh['k],
-    graph: Map[Seq[Text['k], 'k], Set[Seq[Text['k], 'k], 'k], 'k],
-    sites: Seq[ExpansionSite['k], 'k],
+    graph: ArenaMap[ArenaVec[Span['k], 'k], ArenaSet[ArenaVec[Span['k], 'k], 'k], 'k],
+    sites: ArenaVec[ExpansionSite['k], 'k],
     // The keys `walk` has unfolded to the end without an error, by value and as aliases. Nothing
     // reachable from one of them reaches it again, so walking it again would find nothing.
-    walked: Set[Type['k], 'k],
-    aliased: Set[Type['k], 'k],
+    walked: ArenaSet[Type['k], 'k],
+    aliased: ArenaSet[Type['k], 'k],
 }
 
 forall 'k.
-fn without(&cx: Cx!['k], names: Set[Text['k], 'k], removed: Set[Text['k], 'k]) -> Set[Text['k], 'k] {
-    let out: Set[Text['k], 'k] = Set::new(&cx);
-    let items = names.items(&cx);
+fn without(&cx: Domain!['k], names: ArenaSet[Span['k], 'k], removed: ArenaSet[Span['k], 'k]) -> ArenaSet[Span['k], 'k] {
+    let out: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+    let items = names.keys(&cx);
     var i = 0usize;
     while i < items.len(&cx) {
-        if !removed.has(&cx, items.get(&cx, i)) {
-            out.add(&cx, items.get(&cx, i));
+        if !removed.contains(&cx, items.at(&cx, i)) {
+            out.insert(&cx, items.at(&cx, i));
         }
         i = i + 1usize;
     }
@@ -52,23 +55,23 @@ fn without(&cx: Cx!['k], names: Set[Text['k], 'k], removed: Set[Text['k], 'k]) -
 }
 
 forall 'k.
-fn union(&cx: Cx!['k], a: Set[Text['k], 'k], b: Set[Text['k], 'k]) -> Set[Text['k], 'k] {
-    with_names(&cx, a, b.items(&cx))
+fn union(&cx: Domain!['k], a: ArenaSet[Span['k], 'k], b: ArenaSet[Span['k], 'k]) -> ArenaSet[Span['k], 'k] {
+    with_names(&cx, a, b.keys(&cx))
 }
 
 forall 'k.
-fn with_type(&cx: Cx!['k], active: Seq[Type['k], 'k], t: Type['k]) -> Seq[Type['k], 'k] {
-    let out = active.copy(&cx);
+fn with_type(&cx: Domain!['k], active: ArenaVec[Type['k], 'k], t: Type['k]) -> ArenaVec[Type['k], 'k] {
+    let out = active.clone(&cx);
     out.push(&cx, t);
     out
 }
 
 forall 'k.
-fn any_equal(&cx: Cx!['k], t: Type['k], active: Seq[Type['k], 'k]) -> bool {
+fn any_equal(&cx: Domain!['k], t: Type['k], active: ArenaVec[Type['k], 'k]) -> bool {
     var found = false;
     var i = 0usize;
     while !found && i < active.len(&cx) {
-        found = equal(&cx, t, active.get(&cx, i));
+        found = equal(&cx, t, active.at(&cx, i));
         i = i + 1usize;
     }
     found
@@ -76,46 +79,46 @@ fn any_equal(&cx: Cx!['k], t: Type['k], active: Seq[Type['k], 'k]) -> bool {
 
 forall 'k.
 impl Expansion['k] {
-    fn collect(self, &cx: Cx!['k], owner: Text['k], ty: Type['k], bound: Set[Text['k], 'k], params: Set[Text['k], 'k], derived: Set[Text['k], 'k]) {
+    fn collect(self, &cx: Domain!['k], owner: Span['k], ty: Type['k], bound: ArenaSet[Span['k], 'k], params: ArenaSet[Span['k], 'k], derived: ArenaSet[Span['k], 'k]) {
         match ty {
             Type::Named(name, args) => {
-                if !bound.has(&cx, name) && self.program.types.has(&cx, name) {
-                    self.graph.at(&cx, Seq::one(&cx, owner)).add(&cx, Seq::one(&cx, name));
+                if !bound.contains(&cx, name) && self.program.types.contains(&cx, name) {
+                    self.graph.at(&cx, ArenaVec::one(&cx, owner)).insert(&cx, ArenaVec::one(&cx, name));
                     self.sites.push(&cx, ExpansionSite.{ owner, name, args, params, derived });
                 }
                 var i = 0usize;
                 while i < args.len(&cx) {
-                    self.collect(&cx, owner, args.get(&cx, i), bound, params, derived);
+                    self.collect(&cx, owner, args.at(&cx, i), bound, params, derived);
                     i = i + 1usize;
                 }
             },
             Type::Foreach(f) => {
-                self.collect(&cx, owner, f.source.get(&cx), bound, params, derived);
-                let binders = with_names(&cx, Set::new(&cx), foreach_binders(&cx, f));
-                let tainted = if overlap(&cx, free_names(&cx, f.source.get(&cx)), union(&cx, params, derived)) { binders } else { Set::new(&cx) };
-                self.collect(&cx, owner, f.body.get(&cx), union(&cx, bound, binders), without(&cx, params, binders), union(&cx, without(&cx, derived, binders), tainted));
+                self.collect(&cx, owner, f.source.copy(&cx), bound, params, derived);
+                let binders = with_names(&cx, ArenaSet::new(&cx), foreach_binders(&cx, f));
+                let tainted = if overlap(&cx, free_names(&cx, f.source.copy(&cx)), union(&cx, params, derived)) { binders } else { ArenaSet::new(&cx) };
+                self.collect(&cx, owner, f.body.copy(&cx), union(&cx, bound, binders), without(&cx, params, binders), union(&cx, without(&cx, derived, binders), tainted));
             },
             _ => {
                 let parts = children(&cx, ty);
                 var i = 0usize;
                 while i < parts.len(&cx) {
-                    self.collect(&cx, owner, parts.get(&cx, i), bound, params, derived);
+                    self.collect(&cx, owner, parts.at(&cx, i), bound, params, derived);
                     i = i + 1usize;
                 }
             },
         }
     }
 
-    fn unfold(self, &cx: Cx!['k], name: Text['k], args: Seq[Type['k], 'k], bound: Set[Text['k], 'k]) -> Option[Type['k]] {
-        if bound.has(&cx, name) || !self.program.types.has(&cx, name) {
+    fn unfold(self, &cx: Domain!['k], name: Span['k], args: ArenaVec[Type['k], 'k], bound: ArenaSet[Span['k], 'k]) -> Option[Type['k]] {
+        if bound.contains(&cx, name) || !self.program.types.contains(&cx, name) {
             // Formation reports unknown names and arities separately.
             return Option::None;
         }
         let decl = self.program.types.at(&cx, name);
-        let sub: Map[Text['k], Type['k], 'k] = Map::new(&cx);
+        let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
         var i = 0usize;
         while i < decl.params.len(&cx) && i < args.len(&cx) {
-            sub.set(&cx, decl.params.get(&cx, i).name, args.get(&cx, i));
+            sub.insert(&cx, decl.params.at(&cx, i).name, args.at(&cx, i));
             i = i + 1usize;
         }
         Option::Some.(subst(&cx, decl.body, sub, self.counter))
@@ -123,16 +126,16 @@ impl Expansion['k] {
 
     // Brand identity cannot affect size or C representation. Equality also ignores alpha-renaming
     // of binders in arguments introduced by subst.
-    fn key(self, &cx: Cx!['k], name: Text['k], args: Seq[Type['k], 'k]) -> Type['k] {
-        let out: Seq[Type['k], 'k] = Seq::new(&cx);
+    fn key(self, &cx: Domain!['k], name: Span['k], args: ArenaVec[Type['k], 'k]) -> Type['k] {
+        let out: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < args.len(&cx) {
-            let a = args.get(&cx, i);
-            let sub: Map[Text['k], Type['k], 'k] = Map::new(&cx);
-            let brands = free_brands(&cx, a).items(&cx);
+            let a = args.at(&cx, i);
+            let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+            let brands = free_brands(&cx, a).keys(&cx);
             var b = 0usize;
             while b < brands.len(&cx) {
-                sub.set(&cx, brands.get(&cx, b), Type::Skolem.(text(&cx, "_")));
+                sub.insert(&cx, brands.at(&cx, b), Type::Skolem.(Span::from_static(&cx, "_")));
                 b = b + 1usize;
             }
             out.push(&cx, subst(&cx, a, sub, self.counter));
@@ -142,22 +145,22 @@ impl Expansion['k] {
     }
 
     // Demand just the outer shape needed by foreach rows (one pointer layer).
-    fn shape(self, &cx: Cx!['k], ty: Type['k], active: Seq[Type['k], 'k], bound: Set[Text['k], 'k], pointer: bool) {
+    fn shape(self, &cx: Domain!['k], ty: Type['k], active: ArenaVec[Type['k], 'k], bound: ArenaSet[Span['k], 'k], pointer: bool) {
         match ty {
             Type::Named(name, args) => match self.unfold(&cx, name, args, bound) {
                 Option::Some(found) => {
                     let current = self.key(&cx, name, args);
                     if any_equal(&cx, current, active) {
-                        kurs_error(&cx, text_of(&cx, Buffer::new().push_static("recursive foreach source shape through ").push_bytes(&cx, name)), no_pos());
+                        kurs_error(&cx, Buffer::new().push_static("recursive foreach source shape through ").push_bytes(&cx, name).save(&cx), no_pos());
                     }
                     self.shape(&cx, found, with_type(&cx, active, current), bound, pointer);
                 },
                 Option::None => (),
             },
-            Type::Foreach(f) => self.shape(&cx, f.source.get(&cx), active, bound, true),
+            Type::Foreach(f) => self.shape(&cx, f.source.copy(&cx), active, bound, true),
             Type::Ptr(inner) => {
                 if pointer {
-                    self.shape(&cx, inner.get(&cx), active, bound, false);
+                    self.shape(&cx, inner.copy(&cx), active, bound, false);
                 }
             },
             _ => (),
@@ -166,12 +169,12 @@ impl Expansion['k] {
 
     // Whether `bound` leaves every declared type name meaning the declaration, so that a key walks
     // the same way under it as under any other such set.
-    fn plain(self, &cx: Cx!['k], bound: Set[Text['k], 'k]) -> bool {
+    fn plain(self, &cx: Domain!['k], bound: ArenaSet[Span['k], 'k]) -> bool {
         var i = 0usize;
         while i < bound.positions(&cx) {
-            let unit = match bound.entry(&cx, i) {
+            let unit = match bound.key_at(&cx, i) {
                 Option::Some(name) => {
-                    if self.program.types.has(&cx, name) {
+                    if self.program.types.contains(&cx, name) {
                         return false;
                     }
                 },
@@ -182,34 +185,34 @@ impl Expansion['k] {
         true
     }
 
-    fn walk(self, &cx: Cx!['k], ty: Type['k], active: Seq[Type['k], 'k], bound: Set[Text['k], 'k], aliases: bool) {
+    fn walk(self, &cx: Domain!['k], ty: Type['k], active: ArenaVec[Type['k], 'k], bound: ArenaSet[Span['k], 'k], aliases: bool) {
         match ty {
             Type::Named(name, args) => match self.unfold(&cx, name, args, bound) {
                 Option::Some(found) => {
                     let current = self.key(&cx, name, args);
                     if any_equal(&cx, current, active) {
-                        let reason = if aliases { text(&cx, "recursive alias needs an aggregate boundary") } else { text(&cx, "infinite by-value layout") };
-                        kurs_error(&cx, text_of(&cx, Buffer::new().push_static("type ").push_bytes(&cx, name).push_static(": ").push_bytes(&cx, reason)), no_pos());
+                        let reason = if aliases { Span::from_static(&cx, "recursive alias needs an aggregate boundary") } else { Span::from_static(&cx, "infinite by-value layout") };
+                        kurs_error(&cx, Buffer::new().push_static("type ").push_bytes(&cx, name).push_static(": ").push_bytes(&cx, reason).save(&cx), no_pos());
                     }
                     let done = if aliases { self.aliased } else { self.walked };
                     let plain = self.plain(&cx, bound);
-                    if !(plain && done.has(&cx, current)) {
+                    if !(plain && done.contains(&cx, current)) {
                         self.walk(&cx, found, with_type(&cx, active, current), bound, aliases);
                         if plain {
-                            done.add(&cx, current);
+                            done.insert(&cx, current);
                         }
                     }
                 },
                 Option::None => (),
             },
             Type::Foreach(f) => {
-                self.shape(&cx, f.source.get(&cx), Seq::new(&cx), bound, true);
+                self.shape(&cx, f.source.copy(&cx), ArenaVec::new(&cx), bound, true);
                 if aliases {
                     // Every foreach result has an aggregate representation.
                     return ();
                 }
-                self.walk(&cx, f.source.get(&cx), active, bound, aliases);
-                self.walk(&cx, f.body.get(&cx), active, with_names(&cx, bound, foreach_binders(&cx, f)), aliases);
+                self.walk(&cx, f.source.copy(&cx), active, bound, aliases);
+                self.walk(&cx, f.body.copy(&cx), active, with_names(&cx, bound, foreach_binders(&cx, f)), aliases);
             },
             Type::Brand(_b) => (),
             Type::Ptr(_i) => if !aliases { () } else { self.walk_children(&cx, ty, active, bound, aliases) },
@@ -222,57 +225,57 @@ impl Expansion['k] {
         }
     }
 
-    fn walk_children(self, &cx: Cx!['k], ty: Type['k], active: Seq[Type['k], 'k], bound: Set[Text['k], 'k], aliases: bool) {
+    fn walk_children(self, &cx: Domain!['k], ty: Type['k], active: ArenaVec[Type['k], 'k], bound: ArenaSet[Span['k], 'k], aliases: bool) {
         let parts = children(&cx, ty);
         var i = 0usize;
         while i < parts.len(&cx) {
-            self.walk(&cx, parts.get(&cx, i), active, bound, aliases);
+            self.walk(&cx, parts.at(&cx, i), active, bound, aliases);
             i = i + 1usize;
         }
     }
 }
 
 forall 'k.
-fn check_type_expansion(&cx: Cx!['k], program: Program['k], counter: Fresh['k]) {
-    let graph: Map[Seq[Text['k], 'k], Set[Seq[Text['k], 'k], 'k], 'k] = Map::new(&cx);
+fn check_type_expansion(&cx: Domain!['k], program: Program['k], counter: Fresh['k]) {
+    let graph: ArenaMap[ArenaVec[Span['k], 'k], ArenaSet[ArenaVec[Span['k], 'k], 'k], 'k] = ArenaMap::new(&cx);
     let names = program.types.keys(&cx);
     var n = 0usize;
     while n < names.len(&cx) {
-        graph.set(&cx, Seq::one(&cx, names.get(&cx, n)), Set::new(&cx));
+        graph.insert(&cx, ArenaVec::one(&cx, names.at(&cx, n)), ArenaSet::new(&cx));
         n = n + 1usize;
     }
-    let state = Expansion.{ program, counter, graph, sites: Seq::new(&cx), walked: Set::new(&cx), aliased: Set::new(&cx) };
+    let state = Expansion.{ program, counter, graph, sites: ArenaVec::new(&cx), walked: ArenaSet::new(&cx), aliased: ArenaSet::new(&cx) };
     let decls = program.types.values(&cx);
     var d = 0usize;
     while d < decls.len(&cx) {
-        let decl = decls.get(&cx, d);
-        let params: Set[Text['k], 'k] = Set::new(&cx);
+        let decl = decls.at(&cx, d);
+        let params: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
         var p = 0usize;
         while p < decl.params.len(&cx) {
-            if !C::same_kind(decl.params.get(&cx, p).kind, Kind::Brand) {
-                params.add(&cx, decl.params.get(&cx, p).name);
+            if !C::same_kind(decl.params.at(&cx, p).kind, Kind::Brand) {
+                params.insert(&cx, decl.params.at(&cx, p).name);
             }
             p = p + 1usize;
         }
-        state.collect(&cx, decl.name, decl.body, params, params, Set::new(&cx));
+        state.collect(&cx, decl.name, decl.body, params, params, ArenaSet::new(&cx));
         d = d + 1usize;
     }
     let scc = components(&cx, graph);
     var s = 0usize;
     while s < state.sites.len(&cx) {
-        let site = state.sites.get(&cx, s);
-        if scc.at(&cx, Seq::one(&cx, site.owner)) == scc.at(&cx, Seq::one(&cx, site.name)) {
+        let site = state.sites.at(&cx, s);
+        if scc.at(&cx, ArenaVec::one(&cx, site.owner)) == scc.at(&cx, ArenaVec::one(&cx, site.name)) {
             var a = 0usize;
             while a < site.args.len(&cx) {
-                let arg = site.args.get(&cx, a);
+                let arg = site.args.at(&cx, a);
                 let names = free_names(&cx, arg);
                 let bare = match arg {
-                    Type::Named(name, args) => args.is_empty(&cx) && site.params.has(&cx, name),
+                    Type::Named(name, args) => args.is_empty(&cx) && site.params.contains(&cx, name),
                     _ => false,
                 };
                 if overlap(&cx, names, site.derived) || (overlap(&cx, names, site.params) && !bare) {
-                    kurs_error(&cx, text_of(&cx, Buffer::new().push_static("recursive type expansion ").push_bytes(&cx, site.owner).push_static(" -> ").push_bytes(&cx, site.name)
-                        .push_static(": arguments must be unchanged parameters or independent of them; foreach components of parameter-dependent sources may grow")), no_pos());
+                    kurs_error(&cx, Buffer::new().push_static("recursive type expansion ").push_bytes(&cx, site.owner).push_static(" -> ").push_bytes(&cx, site.name)
+                        .push_static(": arguments must be unchanged parameters or independent of them; foreach components of parameter-dependent sources may grow").save(&cx), no_pos());
                 }
                 a = a + 1usize;
             }
@@ -281,19 +284,19 @@ fn check_type_expansion(&cx: Cx!['k], program: Program['k], counter: Fresh['k]) 
     }
     var r = 0usize;
     while r < decls.len(&cx) {
-        let decl = decls.get(&cx, r);
-        let bound: Set[Text['k], 'k] = Set::new(&cx);
-        let root_args: Seq[Type['k], 'k] = Seq::new(&cx);
+        let decl = decls.at(&cx, r);
+        let bound: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+        let root_args: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         var p = 0usize;
         while p < decl.params.len(&cx) {
-            let param = decl.params.get(&cx, p);
-            bound.add(&cx, param.name);
-            root_args.push(&cx, if C::same_kind(param.kind, Kind::Brand) { Type::Skolem.(param.name) } else { C::named(param.name, Seq::new(&cx)) });
+            let param = decl.params.at(&cx, p);
+            bound.insert(&cx, param.name);
+            root_args.push(&cx, if C::same_kind(param.kind, Kind::Brand) { Type::Skolem.(param.name) } else { C::named(param.name, ArenaVec::new(&cx)) });
             p = p + 1usize;
         }
         let root = state.key(&cx, decl.name, root_args);
-        state.walk(&cx, decl.body, Seq::one(&cx, root), bound, false);
-        state.walk(&cx, decl.body, Seq::one(&cx, root), bound, true);
+        state.walk(&cx, decl.body, ArenaVec::one(&cx, root), bound, false);
+        state.walk(&cx, decl.body, ArenaVec::one(&cx, root), bound, true);
         r = r + 1usize;
     }
 }

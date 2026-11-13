@@ -3,7 +3,9 @@
 // syntax order, with its type and the annotations inference made on it. Types are written as KURS
 // writes them; a metavariable left unsolved is written `?` (`$?` for a brand).
 
-use package::support::base::{Cx, Seq, Text, text, text_of};
+use std::collections::arena_vec::ArenaVec;
+use std::raw::Span;
+use std::alloc::arena::Domain;
 use std::bytes::buffer::Buffer;
 use package::kurs::core::{MetaKind, Type};
 use package::infer::inference::{Callee, Capture, Infer, Receiver, TraitCall};
@@ -18,92 +20,92 @@ use std::option::Option;
 use std::slice::Slice;
 
 forall 'k.
-fn filled(&cx: Cx!['k], ty: Type['k]) -> Type['k] {
+fn filled(&cx: Domain!['k], ty: Type['k]) -> Type['k] {
     let t = prune(&cx, ty);
     match t {
         Type::Meta(m) => match m.kind(&cx) {
-            MetaKind::Brand => Type::Skolem.(text(&cx, "?")),
-            _ => Type::Named.(text(&cx, "?"), Seq::new(&cx)),
+            MetaKind::Brand => Type::Skolem.(Span::from_static(&cx, "?")),
+            _ => Type::Named.(Span::from_static(&cx, "?"), ArenaVec::new(&cx)),
         },
         _ => map_children(&cx, t, |&cx, child: Type['k]| filled(&cx, child)),
     }
 }
 
 forall 'k.
-fn type_text(&cx: Cx!['k], ty: Type['k]) -> Text['k] {
+fn type_text(&cx: Domain!['k], ty: Type['k]) -> Span['k] {
     write_type(&cx, filled(&cx, ty))
 }
 
 forall 'k.
-fn types_text(&cx: Cx!['k], ts: Seq[Type['k], 'k]) -> Text['k] {
-    let parts: Seq[Text['k], 'k] = Seq::new(&cx);
+fn types_text(&cx: Domain!['k], ts: ArenaVec[Type['k], 'k]) -> Span['k] {
+    let parts: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
     var i = 0usize;
     while i < ts.len(&cx) {
-        parts.push(&cx, type_text(&cx, ts.get(&cx, i)));
+        parts.push(&cx, type_text(&cx, ts.at(&cx, i)));
         i = i + 1usize;
     }
     form_text(&cx, parts)
 }
 
 forall 'k.
-fn ids_text(&cx: Cx!['k], ids: Seq[u32, 'k]) -> Text['k] {
-    let parts: Seq[Text['k], 'k] = Seq::new(&cx);
+fn ids_text(&cx: Domain!['k], ids: ArenaVec[u32, 'k]) -> Span['k] {
+    let parts: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
     var i = 0usize;
     while i < ids.len(&cx) {
-        parts.push(&cx, text_of(&cx, Buffer::new().push_u64(ids.get(&cx, i) as u64)));
+        parts.push(&cx, Buffer::new().push_u64(ids.at(&cx, i) as u64).save(&cx));
         i = i + 1usize;
     }
     form_text(&cx, parts)
 }
 
 forall 'k.
-fn receiver_text(&cx: Cx!['k], r: Option[Receiver['k]]) -> Text['k] {
+fn receiver_text(&cx: Domain!['k], r: Option[Receiver['k]]) -> Span['k] {
     match r {
-        Option::Some(x) => text(&cx, if x.lend { " &recv" } else { " recv" }),
-        Option::None => text(&cx, ""),
+        Option::Some(x) => Span::from_static(&cx, if x.lend { " &recv" } else { " recv" }),
+        Option::None => Span::from_static(&cx, ""),
     }
 }
 
 forall 'k.
-fn trait_text(&cx: Cx!['k], t: TraitCall['k]) -> Text['k] {
-    text_of(&cx, Buffer::new().push_static("(trait ").push_bytes(&cx, write_atom(&cx, t.trait_name)).push_static(" ").push_bytes(&cx, write_atom(&cx, t.method)).push_static(" ").push_bytes(&cx, types_text(&cx, t.targs))
-        .push_bytes(&cx, receiver_text(&cx, t.receiver)).push_static(")"))
+fn trait_text(&cx: Domain!['k], t: TraitCall['k]) -> Span['k] {
+    Buffer::new().push_static("(trait ").push_bytes(&cx, write_atom(&cx, t.trait_name)).push_static(" ").push_bytes(&cx, write_atom(&cx, t.method)).push_static(" ").push_bytes(&cx, types_text(&cx, t.targs))
+        .push_bytes(&cx, receiver_text(&cx, t.receiver)).push_static(")").save(&cx)
 }
 
 forall 'k.
-fn callee_text(&cx: Cx!['k], c: Callee['k]) -> Text['k] {
+fn callee_text(&cx: Domain!['k], c: Callee['k]) -> Span['k] {
     match c {
-        Callee::Fn(f) => text_of(&cx, Buffer::new().push_static("(fn ").push_bytes(&cx, write_atom(&cx, f.call_name())).push_static(" ").push_bytes(&cx, write_atom(&cx, f.sig.name)).push_static(" ")
-            .push_bytes(&cx, types_text(&cx, f.targs(&cx))).push_bytes(&cx, receiver_text(&cx, f.receiver)).push_static(")")),
+        Callee::Fn(f) => Buffer::new().push_static("(fn ").push_bytes(&cx, write_atom(&cx, f.call_name())).push_static(" ").push_bytes(&cx, write_atom(&cx, f.sig.name)).push_static(" ")
+            .push_bytes(&cx, types_text(&cx, f.targs(&cx))).push_bytes(&cx, receiver_text(&cx, f.receiver)).push_static(")").save(&cx),
         Callee::Trait(t) => trait_text(&cx, t),
-        Callee::Value(sub) => text_of(&cx, Buffer::new().push_static("(value ").push_bytes(&cx, types_text(&cx, sub.values(&cx))).push_static(")")),
-        Callee::Closure => text(&cx, "(closure)"),
-        Callee::Variant(name) => text_of(&cx, Buffer::new().push_static("(variant ").push_bytes(&cx, write_atom(&cx, name)).push_static(")")),
-        Callee::Tuple => text(&cx, "(tuple)"),
-        Callee::Builtin(name) => text_of(&cx, Buffer::new().push_static("(builtin ").push_bytes(&cx, write_atom(&cx, name)).push_static(")")),
-        Callee::Alloca(t) => text_of(&cx, Buffer::new().push_static("(alloca ").push_bytes(&cx, type_text(&cx, t)).push_static(")")),
-        Callee::Pointer(name, _receiver) => text_of(&cx, Buffer::new().push_static("(pointer ").push_bytes(&cx, write_atom(&cx, name)).push_static(")")),
-        Callee::FStringWrite(_f) => text(&cx, "(fwrite)"),
+        Callee::Value(sub) => Buffer::new().push_static("(value ").push_bytes(&cx, types_text(&cx, sub.values(&cx))).push_static(")").save(&cx),
+        Callee::Closure => Span::from_static(&cx, "(closure)"),
+        Callee::Variant(name) => Buffer::new().push_static("(variant ").push_bytes(&cx, write_atom(&cx, name)).push_static(")").save(&cx),
+        Callee::Tuple => Span::from_static(&cx, "(tuple)"),
+        Callee::Builtin(name) => Buffer::new().push_static("(builtin ").push_bytes(&cx, write_atom(&cx, name)).push_static(")").save(&cx),
+        Callee::Alloca(t) => Buffer::new().push_static("(alloca ").push_bytes(&cx, type_text(&cx, t)).push_static(")").save(&cx),
+        Callee::Pointer(name, _receiver) => Buffer::new().push_static("(pointer ").push_bytes(&cx, write_atom(&cx, name)).push_static(")").save(&cx),
+        Callee::FStringWrite(_f) => Span::from_static(&cx, "(fwrite)"),
     }
 }
 
 forall 'k.
-fn captures_text(&cx: Cx!['k], cs: Seq[Capture['k], 'k]) -> Text['k] {
-    let parts: Seq[Text['k], 'k] = Seq::new(&cx);
+fn captures_text(&cx: Domain!['k], cs: ArenaVec[Capture['k], 'k]) -> Span['k] {
+    let parts: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
     var i = 0usize;
     while i < cs.len(&cx) {
-        parts.push(&cx, text_of(&cx, Buffer::new().push_static("(").push_bytes(&cx, write_atom(&cx, cs.get(&cx, i).name)).push_static(" ").push_u64(cs.get(&cx, i).binder as u64).push_static(")")));
+        parts.push(&cx, Buffer::new().push_static("(").push_bytes(&cx, write_atom(&cx, cs.at(&cx, i).name)).push_static(" ").push_u64(cs.at(&cx, i).binder as u64).push_static(")").save(&cx));
         i = i + 1usize;
     }
     form_text(&cx, parts)
 }
 
 forall 'k.
-fn pos_text(&cx: Cx!['k], p: Pos) -> Text['k] {
+fn pos_text(&cx: Domain!['k], p: Pos) -> Span['k] {
     if p.line == 0u32 {
-        text(&cx, "_")
+        Span::from_static(&cx, "_")
     } else {
-        text_of(&cx, Buffer::new().push_u64(p.line as u64).push_static(":").push_u64(p.col as u64))
+        Buffer::new().push_u64(p.line as u64).push_static(":").push_u64(p.col as u64).save(&cx)
     }
 }
 
@@ -115,7 +117,7 @@ exposed struct Walk {
 forall 'k.
 impl Walk['k] {
     // One node's line: its tag, position, type and annotations.
-    fn line(self, &cx: Cx!['k], &out: Buffer!, tag: Slice[u8, 'static], id: u32, p: Option[Pos]) {
+    fn line(self, &cx: Domain!['k], &out: Buffer!, tag: Slice[u8, 'static], id: u32, p: Option[Pos]) {
         let r = self.inf.out;
         out = out.push_static("  ").push_static(tag);
         out = match p {
@@ -145,10 +147,10 @@ impl Walk['k] {
         out = match r.field_ids.get(&cx, id) {
             Option::Some(fields) => {
                 let names = fields.keys(&cx);
-                let parts: Seq[Text['k], 'k] = Seq::new(&cx);
+                let parts: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
                 var i = 0usize;
                 while i < names.len(&cx) {
-                    parts.push(&cx, text_of(&cx, Buffer::new().push_static("(").push_bytes(&cx, write_atom(&cx, names.get(&cx, i))).push_static(" ").push_u64(fields.at(&cx, names.get(&cx, i)) as u64).push_static(")")));
+                    parts.push(&cx, Buffer::new().push_static("(").push_bytes(&cx, write_atom(&cx, names.at(&cx, i))).push_static(" ").push_u64(fields.at(&cx, names.at(&cx, i)) as u64).push_static(")").save(&cx));
                     i = i + 1usize;
                 }
                 out.push_static(" fields ").push_bytes(&cx, form_text(&cx, parts))
@@ -161,12 +163,12 @@ impl Walk['k] {
         };
         out = match r.case_binders.get(&cx, id) {
             Option::Some(ids) => {
-                let parts: Seq[Text['k], 'k] = Seq::new(&cx);
+                let parts: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
                 var i = 0usize;
                 while i < ids.len(&cx) {
-                    parts.push(&cx, match ids.get(&cx, i) {
-                        Option::Some(b) => text_of(&cx, Buffer::new().push_u64(b as u64)),
-                        Option::None => text(&cx, "_"),
+                    parts.push(&cx, match ids.at(&cx, i) {
+                        Option::Some(b) => Buffer::new().push_u64(b as u64).save(&cx),
+                        Option::None => Span::from_static(&cx, "_"),
                     });
                     i = i + 1usize;
                 }
@@ -196,10 +198,10 @@ impl Walk['k] {
         };
         out = match r.opened.get(&cx, id) {
             Option::Some(labels) => {
-                let parts: Seq[Text['k], 'k] = Seq::new(&cx);
+                let parts: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
                 var i = 0usize;
                 while i < labels.len(&cx) {
-                    parts.push(&cx, write_atom(&cx, labels.get(&cx, i)));
+                    parts.push(&cx, write_atom(&cx, labels.at(&cx, i)));
                     i = i + 1usize;
                 }
                 out.push_static(" opened ").push_bytes(&cx, form_text(&cx, parts))
@@ -221,28 +223,28 @@ impl Walk['k] {
         out = out.push_static("\n");
     }
 
-    fn exprs(self, &cx: Cx!['k], &out: Buffer!, es: Seq[Expr['k], 'k]) {
+    fn exprs(self, &cx: Domain!['k], &out: Buffer!, es: ArenaVec[Expr['k], 'k]) {
         var i = 0usize;
         while i < es.len(&cx) {
-            self.expr(&cx, &out, es.get(&cx, i));
+            self.expr(&cx, &out, es.at(&cx, i));
             i = i + 1usize;
         }
     }
 
-    fn block(self, &cx: Cx!['k], &out: Buffer!, b: S::Block['k]) {
+    fn block(self, &cx: Domain!['k], &out: Buffer!, b: S::Block['k]) {
         self.line(&cx, &out, "block", b.id, Option::Some.(b.pos));
         var i = 0usize;
         while i < b.stmts.len(&cx) {
-            self.statement(&cx, &out, b.stmts.get(&cx, i));
+            self.statement(&cx, &out, b.stmts.at(&cx, i));
             i = i + 1usize;
         }
         let unit = match b.tail {
-            Option::Some(t) => self.expr(&cx, &out, t.get(&cx)),
+            Option::Some(t) => self.expr(&cx, &out, t.copy(&cx)),
             Option::None => (),
         };
     }
 
-    fn expr(self, &cx: Cx!['k], &out: Buffer!, e: Expr['k]) {
+    fn expr(self, &cx: Domain!['k], &out: Buffer!, e: Expr['k]) {
         let id = S::expr_id(e);
         let at = Option::Some.(S::expr_pos(e));
         match e {
@@ -251,7 +253,7 @@ impl Walk['k] {
                 self.line(&cx, &out, "fstr", id, at);
                 var i = 0usize;
                 while i < f.parts.len(&cx) {
-                    let unit = match f.parts.get(&cx, i) {
+                    let unit = match f.parts.at(&cx, i) {
                         S::Piece::Expr(x) => self.expr(&cx, &out, x),
                         S::Piece::Text(_t) => (),
                     };
@@ -272,7 +274,7 @@ impl Walk['k] {
                 self.line(&cx, &out, "struct", id, at);
                 var i = 0usize;
                 while i < s.fields.len(&cx) {
-                    let unit = match s.fields.get(&cx, i).value {
+                    let unit = match s.fields.at(&cx, i).value {
                         Option::Some(v) => self.expr(&cx, &out, v),
                         Option::None => (),
                     };
@@ -282,22 +284,22 @@ impl Walk['k] {
             Expr::Block(b) => self.block(&cx, &out, b),
             Expr::If(n) => {
                 self.line(&cx, &out, "if", id, at);
-                self.expr(&cx, &out, n.cond.get(&cx));
+                self.expr(&cx, &out, n.cond.copy(&cx));
                 self.block(&cx, &out, n.then);
                 let unit = match n.other {
-                    Option::Some(o) => self.expr(&cx, &out, o.get(&cx)),
+                    Option::Some(o) => self.expr(&cx, &out, o.copy(&cx)),
                     Option::None => (),
                 };
             },
             Expr::Match(m) => {
                 self.line(&cx, &out, "match", id, at);
-                self.expr(&cx, &out, m.scrutinee.get(&cx));
+                self.expr(&cx, &out, m.scrutinee.copy(&cx));
                 var i = 0usize;
                 while i < m.arms.len(&cx) {
-                    let arm = m.arms.get(&cx, i);
+                    let arm = m.arms.at(&cx, i);
                     var k = 0usize;
                     while k < arm.cases.len(&cx) {
-                        let c = arm.cases.get(&cx, k);
+                        let c = arm.cases.at(&cx, k);
                         self.line(&cx, &out, "case", c.id, Option::Some.(c.pos));
                         k = k + 1usize;
                     }
@@ -307,73 +309,73 @@ impl Walk['k] {
             },
             Expr::Closure(c) => {
                 self.line(&cx, &out, "closure", id, at);
-                self.expr(&cx, &out, c.body.get(&cx));
+                self.expr(&cx, &out, c.body.copy(&cx));
             },
             Expr::Return(n) => {
                 self.line(&cx, &out, "return", id, at);
                 let unit = match n.value {
-                    Option::Some(v) => self.expr(&cx, &out, v.get(&cx)),
+                    Option::Some(v) => self.expr(&cx, &out, v.copy(&cx)),
                     Option::None => (),
                 };
             },
             Expr::Pack(p) => {
                 self.line(&cx, &out, "pack", id, at);
-                self.expr(&cx, &out, p.value.get(&cx));
+                self.expr(&cx, &out, p.value.copy(&cx));
             },
             Expr::Foreach(f) => {
                 self.line(&cx, &out, "foreach", id, at);
-                self.expr(&cx, &out, f.source.get(&cx));
+                self.expr(&cx, &out, f.source.copy(&cx));
                 self.block(&cx, &out, f.body);
             },
             Expr::Binop(b) => {
                 self.line(&cx, &out, "binop", id, at);
-                self.expr(&cx, &out, b.left.get(&cx));
-                self.expr(&cx, &out, b.right.get(&cx));
+                self.expr(&cx, &out, b.left.copy(&cx));
+                self.expr(&cx, &out, b.right.copy(&cx));
             },
             Expr::Unary(u) => {
                 self.line(&cx, &out, "unary", id, at);
-                self.expr(&cx, &out, u.operand.get(&cx));
+                self.expr(&cx, &out, u.operand.copy(&cx));
             },
             Expr::Cast(c) => {
                 self.line(&cx, &out, "cast", id, at);
-                self.expr(&cx, &out, c.value.get(&cx));
+                self.expr(&cx, &out, c.value.copy(&cx));
             },
             Expr::UnsafeStore(s) => {
                 self.line(&cx, &out, "store", id, at);
-                self.expr(&cx, &out, s.pointer.get(&cx));
-                self.expr(&cx, &out, s.value.get(&cx));
+                self.expr(&cx, &out, s.pointer.copy(&cx));
+                self.expr(&cx, &out, s.value.copy(&cx));
             },
             Expr::Field(f) => {
                 self.line(&cx, &out, "field", id, at);
-                self.expr(&cx, &out, f.value.get(&cx));
+                self.expr(&cx, &out, f.value.copy(&cx));
             },
             Expr::Index(x) => {
                 self.line(&cx, &out, "index", id, at);
-                self.expr(&cx, &out, x.value.get(&cx));
+                self.expr(&cx, &out, x.value.copy(&cx));
             },
             Expr::Call(c) => {
                 self.line(&cx, &out, "call", id, at);
-                self.expr(&cx, &out, c.callee.get(&cx));
+                self.expr(&cx, &out, c.callee.copy(&cx));
                 self.exprs(&cx, &out, c.args);
             },
             Expr::Try(n) => {
                 self.line(&cx, &out, "try", id, at);
-                self.expr(&cx, &out, n.value.get(&cx));
+                self.expr(&cx, &out, n.value.copy(&cx));
             },
             Expr::While(w) => {
                 self.line(&cx, &out, "while", id, at);
-                self.expr(&cx, &out, w.cond.get(&cx));
+                self.expr(&cx, &out, w.cond.copy(&cx));
                 self.block(&cx, &out, w.body);
             },
             Expr::For(f) => {
                 self.line(&cx, &out, "for", id, at);
-                self.expr(&cx, &out, f.iterator.get(&cx));
+                self.expr(&cx, &out, f.iterator.copy(&cx));
                 self.block(&cx, &out, f.body);
             },
         }
     }
 
-    fn statement(self, &cx: Cx!['k], &out: Buffer!, s: Statement['k]) {
+    fn statement(self, &cx: Domain!['k], &out: Buffer!, s: Statement['k]) {
         match s {
             Statement::Let(l) => {
                 self.line(&cx, &out, "let", l.id, Option::Some.(l.pos));
@@ -397,7 +399,7 @@ impl Walk['k] {
         }
     }
 
-    fn pattern(self, &cx: Cx!['k], &out: Buffer!, p: Pattern['k]) {
+    fn pattern(self, &cx: Domain!['k], &out: Buffer!, p: Pattern['k]) {
         let id = S::pattern_id(p);
         match p {
             Pattern::Bind(_n) => self.line(&cx, &out, "pbind", id, Option::None),
@@ -414,24 +416,24 @@ impl Walk['k] {
                 self.line(&cx, &out, "pstruct", id, Option::None);
                 var i = 0usize;
                 while i < ps.fields.len(&cx) {
-                    self.pattern(&cx, &out, ps.fields.get(&cx, i).pattern);
+                    self.pattern(&cx, &out, ps.fields.at(&cx, i).pattern);
                     i = i + 1usize;
                 }
             },
         }
     }
 
-    fn patterns(self, &cx: Cx!['k], &out: Buffer!, ps: Seq[Pattern['k], 'k]) {
+    fn patterns(self, &cx: Domain!['k], &out: Buffer!, ps: ArenaVec[Pattern['k], 'k]) {
         var i = 0usize;
         while i < ps.len(&cx) {
-            self.pattern(&cx, &out, ps.get(&cx, i));
+            self.pattern(&cx, &out, ps.at(&cx, i));
             i = i + 1usize;
         }
     }
 
-    fn function(self, &cx: Cx!['k], &out: Buffer!, name: Text['k], node: S::Fn['k]) {
+    fn function(self, &cx: Domain!['k], &out: Buffer!, name: Span['k], node: S::Fn['k]) {
         out = out.push_static("fn ").push_bytes(&cx, write_atom(&cx, name)).push_static(" ").push_bytes(&cx, pos_text(&cx, node.pos)).push_static(" params ")
-            .push_bytes(&cx, ids_text(&cx, self.inf.out.param_ids.get_or(&cx, node.id, Seq::new(&cx)))).push_static("\n");
+            .push_bytes(&cx, ids_text(&cx, self.inf.out.param_ids.get_or(&cx, node.id, ArenaVec::new(&cx)))).push_static("\n");
         let unit = match node.body {
             Option::Some(b) => self.block(&cx, &out, b),
             Option::None => (),
@@ -440,13 +442,13 @@ impl Walk['k] {
 }
 
 forall 'k.
-fn program(&cx: Cx!['k], inf: Infer['k]) -> Text['k] {
+fn program(&cx: Domain!['k], inf: Infer['k]) -> Span['k] {
     let w = Walk.{ inf };
     var out = Buffer::new();
     let sigs = inf.sigs.sigs.values(&cx);
     var i = 0usize;
     while i < sigs.len(&cx) {
-        let sig = sigs.get(&cx, i);
+        let sig = sigs.at(&cx, i);
         let unit = match sig.decl {
             Option::Some(decl) => match decl.node {
                 Named::Fn(node) => if node.body.is_some() {
@@ -460,13 +462,13 @@ fn program(&cx: Cx!['k], inf: Infer['k]) -> Text['k] {
     }
     i = 0usize;
     while i < inf.sigs.instances.len(&cx) {
-        let (inst, item, _home) = inf.sigs.instances.get(&cx, i);
+        let (inst, item, _home) = inf.sigs.instances.at(&cx, i);
         var k = 0usize;
         while k < inst.methods.len(&cx) {
-            w.function(&cx, &out, text_of(&cx, Buffer::new().push_bytes(&cx, inst.trait_name).push_static("::").push_bytes(&cx, item.methods.get(&cx, k).name)), item.methods.get(&cx, k));
+            w.function(&cx, &out, Buffer::new().push_bytes(&cx, inst.trait_name).push_static("::").push_bytes(&cx, item.methods.at(&cx, k).name).save(&cx), item.methods.at(&cx, k));
             k = k + 1usize;
         }
         i = i + 1usize;
     }
-    text_of(&cx, out)
+    out.save(&cx)
 }

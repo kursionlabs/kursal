@@ -4,26 +4,28 @@
 // `syntax.py` dataclasses: a sequence as `[...]`, text as a quoted string with `\xHH` for any byte
 // outside printable ASCII, nothing as `_`, a boolean as `#t` or `#f`, a position as `line:col`.
 
-use package::support::base::{Cx, Seq, Text, text, text_of};
+use std::collections::arena_vec::ArenaVec;
+use std::raw::Span;
+use std::alloc::arena::Domain;
 use std::bytes::buffer::Buffer;
 use package::syntax::ast as S;
 use package::syntax::ast::{Expr, Pattern, Statement, Type};
 use std::option::Option;
 
 forall 'k.
-fn str(&cx: Cx!['k], out: Buffer!, t: Text['k]) -> Buffer! {
+fn str(&cx: Domain!['k], out: Buffer!, t: Span['k]) -> Buffer! {
     var out = out;
     out = out.push_byte(b'"');
     var i = 0usize;
     while i < t.len() {
-        let b = t.byte(&cx, i);
+        let b = t.byte_or_zero(&cx, i);
         if b == b'"' || b == b'\\' {
             out = out.push_byte(b'\\').push_byte(b);
         } else if b >= 32u8 && b < 127u8 {
             out = out.push_byte(b);
         } else {
-            let digits = text(&cx, "0123456789abcdef");
-            out = out.push_static("\\x").push_byte(digits.byte(&cx, (b / 16u8) as usize)).push_byte(digits.byte(&cx, (b % 16u8) as usize));
+            let digits = Span::from_static(&cx, "0123456789abcdef");
+            out = out.push_static("\\x").push_byte(digits.byte_or_zero(&cx, (b / 16u8) as usize)).push_byte(digits.byte_or_zero(&cx, (b % 16u8) as usize));
         }
         i = i + 1usize;
     }
@@ -31,12 +33,12 @@ fn str(&cx: Cx!['k], out: Buffer!, t: Text['k]) -> Buffer! {
 }
 
 forall 'k.
-fn flag(&cx: Cx!['k], out: Buffer!, b: bool) -> Buffer! {
+fn flag(&cx: Domain!['k], out: Buffer!, b: bool) -> Buffer! {
     out.push_static(if b { " #t" } else { " #f" })
 }
 
 forall 'k.
-fn pos(&cx: Cx!['k], out: Buffer!, p: S::Pos) -> Buffer! {
+fn pos(&cx: Domain!['k], out: Buffer!, p: S::Pos) -> Buffer! {
     if p.line == 0u32 {
         out.push_static(" _")
     } else {
@@ -45,7 +47,7 @@ fn pos(&cx: Cx!['k], out: Buffer!, p: S::Pos) -> Buffer! {
 }
 
 forall 'k.
-fn texts(&cx: Cx!['k], out: Buffer!, ts: Seq[Text['k], 'k]) -> Buffer! {
+fn texts(&cx: Domain!['k], out: Buffer!, ts: ArenaVec[Span['k], 'k]) -> Buffer! {
     var out = out;
     out = out.push_static(" [");
     var i = 0usize;
@@ -53,14 +55,14 @@ fn texts(&cx: Cx!['k], out: Buffer!, ts: Seq[Text['k], 'k]) -> Buffer! {
         if i > 0usize {
             out = out.push_static(" ");
         }
-        out = str(&cx, out, ts.get(&cx, i));
+        out = str(&cx, out, ts.at(&cx, i));
         i = i + 1usize;
     }
     out.push_static("]")
 }
 
 forall 'k.
-fn opt_text(&cx: Cx!['k], out: Buffer!, t: Option[Text['k]]) -> Buffer! {
+fn opt_text(&cx: Domain!['k], out: Buffer!, t: Option[Span['k]]) -> Buffer! {
     match t {
         Option::Some(v) => str(&cx, out.push_static(" "), v),
         Option::None => out.push_static(" _"),
@@ -68,7 +70,7 @@ fn opt_text(&cx: Cx!['k], out: Buffer!, t: Option[Text['k]]) -> Buffer! {
 }
 
 forall 'k.
-fn opt_path(&cx: Cx!['k], out: Buffer!, t: Option[Seq[Text['k], 'k]]) -> Buffer! {
+fn opt_path(&cx: Domain!['k], out: Buffer!, t: Option[ArenaVec[Span['k], 'k]]) -> Buffer! {
     match t {
         Option::Some(v) => texts(&cx, out, v),
         Option::None => out.push_static(" _"),
@@ -76,19 +78,19 @@ fn opt_path(&cx: Cx!['k], out: Buffer!, t: Option[Seq[Text['k], 'k]]) -> Buffer!
 }
 
 forall 'k.
-fn types(&cx: Cx!['k], out: Buffer!, ts: Seq[Type['k], 'k]) -> Buffer! {
+fn types(&cx: Domain!['k], out: Buffer!, ts: ArenaVec[Type['k], 'k]) -> Buffer! {
     var out = out;
     out = out.push_static(" [");
     var i = 0usize;
     while i < ts.len(&cx) {
-        out = type(&cx, out.push_static(if i > 0usize { " " } else { "" }), ts.get(&cx, i));
+        out = type(&cx, out.push_static(if i > 0usize { " " } else { "" }), ts.at(&cx, i));
         i = i + 1usize;
     }
     out.push_static("]")
 }
 
 forall 'k.
-fn opt_type(&cx: Cx!['k], out: Buffer!, t: Option[Type['k]]) -> Buffer! {
+fn opt_type(&cx: Domain!['k], out: Buffer!, t: Option[Type['k]]) -> Buffer! {
     match t {
         Option::Some(v) => type(&cx, out.push_static(" "), v),
         Option::None => out.push_static(" _"),
@@ -96,12 +98,12 @@ fn opt_type(&cx: Cx!['k], out: Buffer!, t: Option[Type['k]]) -> Buffer! {
 }
 
 forall 'k.
-fn slots(&cx: Cx!['k], out: Buffer!, ss: Seq[S::Slot['k], 'k]) -> Buffer! {
+fn slots(&cx: Domain!['k], out: Buffer!, ss: ArenaVec[S::Slot['k], 'k]) -> Buffer! {
     var out = out;
     out = out.push_static(" [");
     var i = 0usize;
     while i < ss.len(&cx) {
-        let s = ss.get(&cx, i);
+        let s = ss.at(&cx, i);
         out = type(&cx, flag(&cx, out.push_static(if i > 0usize { " [" } else { "[" }), s.lend).push_static(" "), s.type).push_static("]");
         i = i + 1usize;
     }
@@ -109,44 +111,44 @@ fn slots(&cx: Cx!['k], out: Buffer!, ss: Seq[S::Slot['k], 'k]) -> Buffer! {
 }
 
 forall 'k.
-fn type(&cx: Cx!['k], out: Buffer!, t: Type['k]) -> Buffer! {
+fn type(&cx: Domain!['k], out: Buffer!, t: Type['k]) -> Buffer! {
     var out = out;
     match t {
         Type::Name(n) => types(&cx, texts(&cx, out.push_static("(TName"), n.path).push_static(if n.linear { " #t" } else { " #f" }), n.args).push_static(" ").push_usize(n.determined).push_static(")"),
-        Type::Ptr(inner) => type(&cx, out.push_static("(TPtr "), inner.get(&cx)).push_static(")"),
+        Type::Ptr(inner) => type(&cx, out.push_static("(TPtr "), inner.copy(&cx)).push_static(")"),
         Type::Never => out.push_static("(TNever)"),
         Type::Tuple(elems) => types(&cx, out.push_static("(TTuple"), elems).push_static(")"),
-        Type::Array(elem, length) => expr(&cx, type(&cx, out.push_static("(TArray "), elem.get(&cx)).push_static(" "), length.get(&cx)).push_static(")"),
-        Type::Fn(f) => flag(&cx, type(&cx, slots(&cx, out.push_static("(TFn"), f.params).push_static(" "), f.ret.get(&cx)), f.is_unsafe).push_static(")"),
+        Type::Array(elem, length) => expr(&cx, type(&cx, out.push_static("(TArray "), elem.copy(&cx)).push_static(" "), length.copy(&cx)).push_static(")"),
+        Type::Fn(f) => flag(&cx, type(&cx, slots(&cx, out.push_static("(TFn"), f.params).push_static(" "), f.ret.copy(&cx)), f.is_unsafe).push_static(")"),
         Type::Closure(c) => {
             out = match c.env {
-                Option::Some(env) => type(&cx, out.push_static("(TClosure "), env.get(&cx)),
+                Option::Some(env) => type(&cx, out.push_static("(TClosure "), env.copy(&cx)),
                 Option::None => out.push_static("(TClosure _"),
             };
-            type(&cx, slots(&cx, out, c.params).push_static(" "), c.ret.get(&cx)).push_static(")")
+            type(&cx, slots(&cx, out, c.params).push_static(" "), c.ret.copy(&cx)).push_static(")")
         },
-        Type::Exists(brands, body) => type(&cx, texts(&cx, out.push_static("(TExists"), brands).push_static(" "), body.get(&cx)).push_static(")"),
-        Type::Foreach(f) => type(&cx, type(&cx, flag(&cx, str(&cx, out.push_static("(TForeach "), f.binder), f.indirect).push_static(" "), f.source.get(&cx)).push_static(" "), f.body.get(&cx)).push_static(")"),
-        Type::Forall(params, body) => type(&cx, texts(&cx, out.push_static("(TForall"), params).push_static(" "), body.get(&cx)).push_static(")"),
+        Type::Exists(brands, body) => type(&cx, texts(&cx, out.push_static("(TExists"), brands).push_static(" "), body.copy(&cx)).push_static(")"),
+        Type::Foreach(f) => type(&cx, type(&cx, flag(&cx, str(&cx, out.push_static("(TForeach "), f.binder), f.indirect).push_static(" "), f.source.copy(&cx)).push_static(" "), f.body.copy(&cx)).push_static(")"),
+        Type::Forall(params, body) => type(&cx, texts(&cx, out.push_static("(TForall"), params).push_static(" "), body.copy(&cx)).push_static(")"),
         Type::Brand(label) => str(&cx, out.push_static("(TBrand "), label).push_static(")"),
         Type::Ignored => out.push_static("(TIgnored)"),
     }
 }
 
 forall 'k.
-fn exprs(&cx: Cx!['k], out: Buffer!, es: Seq[Expr['k], 'k]) -> Buffer! {
+fn exprs(&cx: Domain!['k], out: Buffer!, es: ArenaVec[Expr['k], 'k]) -> Buffer! {
     var out = out;
     out = out.push_static(" [");
     var i = 0usize;
     while i < es.len(&cx) {
-        out = expr(&cx, out.push_static(if i > 0usize { " " } else { "" }), es.get(&cx, i));
+        out = expr(&cx, out.push_static(if i > 0usize { " " } else { "" }), es.at(&cx, i));
         i = i + 1usize;
     }
     out.push_static("]")
 }
 
 forall 'k.
-fn opt_expr(&cx: Cx!['k], out: Buffer!, e: Option[Expr['k]]) -> Buffer! {
+fn opt_expr(&cx: Domain!['k], out: Buffer!, e: Option[Expr['k]]) -> Buffer! {
     match e {
         Option::Some(v) => expr(&cx, out.push_static(" "), v),
         Option::None => out.push_static(" _"),
@@ -154,7 +156,7 @@ fn opt_expr(&cx: Cx!['k], out: Buffer!, e: Option[Expr['k]]) -> Buffer! {
 }
 
 forall 'k.
-fn lit(&cx: Cx!['k], out: Buffer!, l: S::Lit['k]) -> Buffer! {
+fn lit(&cx: Domain!['k], out: Buffer!, l: S::Lit['k]) -> Buffer! {
     var out = out;
     out = match l.kind {
         S::LitKind::Int => {
@@ -170,12 +172,12 @@ fn lit(&cx: Cx!['k], out: Buffer!, l: S::Lit['k]) -> Buffer! {
 }
 
 forall 'k.
-fn path(&cx: Cx!['k], out: Buffer!, p: S::Path['k]) -> Buffer! {
+fn path(&cx: Domain!['k], out: Buffer!, p: S::Path['k]) -> Buffer! {
     var out = out;
     out = out.push_static("(Path [");
     var i = 0usize;
     while i < p.segments.len(&cx) {
-        let s = p.segments.get(&cx, i);
+        let s = p.segments.at(&cx, i);
         out = types(&cx, flag(&cx, str(&cx, out.push_static(if i > 0usize { " [" } else { "[" }), s.name), s.linear), s.args).push_static("]");
         i = i + 1usize;
     }
@@ -183,24 +185,24 @@ fn path(&cx: Cx!['k], out: Buffer!, p: S::Path['k]) -> Buffer! {
 }
 
 forall 'k.
-fn block(&cx: Cx!['k], out: Buffer!, b: S::Block['k]) -> Buffer! {
+fn block(&cx: Domain!['k], out: Buffer!, b: S::Block['k]) -> Buffer! {
     var out = out;
     out = out.push_static("(Block [");
     var i = 0usize;
     while i < b.stmts.len(&cx) {
-        out = statement(&cx, out.push_static(if i > 0usize { " " } else { "" }), b.stmts.get(&cx, i));
+        out = statement(&cx, out.push_static(if i > 0usize { " " } else { "" }), b.stmts.at(&cx, i));
         i = i + 1usize;
     }
     out = out.push_static("]");
     out = match b.tail {
-        Option::Some(t) => expr(&cx, out.push_static(" "), t.get(&cx)),
+        Option::Some(t) => expr(&cx, out.push_static(" "), t.copy(&cx)),
         Option::None => out.push_static(" _"),
     };
     pos(&cx, out, b.pos).push_static(")")
 }
 
 forall 'k.
-fn case(&cx: Cx!['k], out: Buffer!, c: S::Case['k]) -> Buffer! {
+fn case(&cx: Domain!['k], out: Buffer!, c: S::Case['k]) -> Buffer! {
     var out = out;
     out = match c.kind {
         S::CaseKind::Variant => out.push_static("(Case \"variant\""),
@@ -224,7 +226,7 @@ fn case(&cx: Cx!['k], out: Buffer!, c: S::Case['k]) -> Buffer! {
 }
 
 forall 'k.
-fn expr(&cx: Cx!['k], out: Buffer!, e: Expr['k]) -> Buffer! {
+fn expr(&cx: Domain!['k], out: Buffer!, e: Expr['k]) -> Buffer! {
     var out = out;
     match e {
         Expr::Lit(l) => lit(&cx, out, l),
@@ -233,7 +235,7 @@ fn expr(&cx: Cx!['k], out: Buffer!, e: Expr['k]) -> Buffer! {
             var i = 0usize;
             while i < f.parts.len(&cx) {
                 out = out.push_static(if i > 0usize { " " } else { "" });
-                out = match f.parts.get(&cx, i) {
+                out = match f.parts.at(&cx, i) {
                     S::Piece::Text(t) => str(&cx, out, t),
                     S::Piece::Expr(x) => expr(&cx, out, x),
                 };
@@ -249,7 +251,7 @@ fn expr(&cx: Cx!['k], out: Buffer!, e: Expr['k]) -> Buffer! {
             out = path(&cx, out.push_static("(StructLit "), s.path).push_static(" [");
             var i = 0usize;
             while i < s.fields.len(&cx) {
-                let f = s.fields.get(&cx, i);
+                let f = s.fields.at(&cx, i);
                 out = opt_expr(&cx, str(&cx, out.push_static(if i > 0usize { " [" } else { "[" }), f.name), f.value).push_static("]");
                 i = i + 1usize;
             }
@@ -257,22 +259,22 @@ fn expr(&cx: Cx!['k], out: Buffer!, e: Expr['k]) -> Buffer! {
         },
         Expr::Block(b) => block(&cx, out, b),
         Expr::If(n) => {
-            out = block(&cx, expr(&cx, out.push_static("(If "), n.cond.get(&cx)).push_static(" "), n.then);
+            out = block(&cx, expr(&cx, out.push_static("(If "), n.cond.copy(&cx)).push_static(" "), n.then);
             out = match n.other {
-                Option::Some(o) => expr(&cx, out.push_static(" "), o.get(&cx)),
+                Option::Some(o) => expr(&cx, out.push_static(" "), o.copy(&cx)),
                 Option::None => out.push_static(" _"),
             };
             pos(&cx, out, n.pos).push_static(")")
         },
         Expr::Match(m) => {
-            out = expr(&cx, out.push_static("(Match "), m.scrutinee.get(&cx)).push_static(" [");
+            out = expr(&cx, out.push_static("(Match "), m.scrutinee.copy(&cx)).push_static(" [");
             var i = 0usize;
             while i < m.arms.len(&cx) {
-                let arm = m.arms.get(&cx, i);
+                let arm = m.arms.at(&cx, i);
                 out = out.push_static(if i > 0usize { " (Arm [" } else { "(Arm [" });
                 var k = 0usize;
                 while k < arm.cases.len(&cx) {
-                    out = case(&cx, out.push_static(if k > 0usize { " " } else { "" }), arm.cases.get(&cx, k));
+                    out = case(&cx, out.push_static(if k > 0usize { " " } else { "" }), arm.cases.at(&cx, k));
                     k = k + 1usize;
                 }
                 out = pos(&cx, expr(&cx, out.push_static("] "), arm.body), arm.pos).push_static(")");
@@ -284,37 +286,37 @@ fn expr(&cx: Cx!['k], out: Buffer!, e: Expr['k]) -> Buffer! {
             out = out.push_static("(Closure [");
             var i = 0usize;
             while i < c.params.len(&cx) {
-                let p = c.params.get(&cx, i);
+                let p = c.params.at(&cx, i);
                 out = opt_type(&cx, str(&cx, flag(&cx, out.push_static(if i > 0usize { " [" } else { "[" }), p.lend).push_static(" "), p.name), p.type).push_static("]");
                 i = i + 1usize;
             }
-            pos(&cx, expr(&cx, opt_type(&cx, out.push_static("]"), c.ret).push_static(" "), c.body.get(&cx)), c.pos).push_static(")")
+            pos(&cx, expr(&cx, opt_type(&cx, out.push_static("]"), c.ret).push_static(" "), c.body.copy(&cx)), c.pos).push_static(")")
         },
         Expr::Return(n) => {
             out = out.push_static("(Return");
             out = match n.value {
-                Option::Some(v) => expr(&cx, out.push_static(" "), v.get(&cx)),
+                Option::Some(v) => expr(&cx, out.push_static(" "), v.copy(&cx)),
                 Option::None => out.push_static(" _"),
             };
             pos(&cx, out, n.pos).push_static(")")
         },
-        Expr::Pack(p) => pos(&cx, expr(&cx, texts(&cx, out.push_static("(Pack"), p.brands).push_static(" "), p.value.get(&cx)), p.pos).push_static(")"),
-        Expr::Foreach(f) => pos(&cx, block(&cx, expr(&cx, opt_text(&cx, str(&cx, out.push_static("(Foreach "), f.name), f.binder).push_static(" "), f.source.get(&cx)).push_static(" "), f.body), f.pos).push_static(")"),
-        Expr::Binop(b) => pos(&cx, expr(&cx, expr(&cx, str(&cx, out.push_static("(Binop "), b.op).push_static(" "), b.left.get(&cx)).push_static(" "), b.right.get(&cx)), b.pos).push_static(")"),
-        Expr::Unary(u) => pos(&cx, expr(&cx, str(&cx, out.push_static("(Unary "), u.op).push_static(" "), u.operand.get(&cx)), u.pos).push_static(")"),
-        Expr::Cast(c) => pos(&cx, type(&cx, expr(&cx, out.push_static("(Cast "), c.value.get(&cx)).push_static(" "), c.type), c.pos).push_static(")"),
-        Expr::UnsafeStore(s) => pos(&cx, expr(&cx, expr(&cx, out.push_static("(UnsafeStore "), s.pointer.get(&cx)).push_static(" "), s.value.get(&cx)), s.pos).push_static(")"),
-        Expr::Field(f) => pos(&cx, str(&cx, expr(&cx, out.push_static("(Field "), f.value.get(&cx)).push_static(" "), f.name), f.pos).push_static(")"),
-        Expr::Index(x) => pos(&cx, expr(&cx, out.push_static("(Index "), x.value.get(&cx)).push_static(" ").push_usize(x.index), x.pos).push_static(")"),
-        Expr::Call(c) => pos(&cx, exprs(&cx, expr(&cx, out.push_static("(Call "), c.callee.get(&cx)), c.args), c.pos).push_static(")"),
-        Expr::Try(n) => pos(&cx, expr(&cx, out.push_static("(Try "), n.value.get(&cx)), n.pos).push_static(")"),
-        Expr::While(w) => pos(&cx, block(&cx, expr(&cx, out.push_static("(While "), w.cond.get(&cx)).push_static(" "), w.body), w.pos).push_static(")"),
-        Expr::For(f) => pos(&cx, block(&cx, expr(&cx, str(&cx, out.push_static("(For "), f.name).push_static(" "), f.iterator.get(&cx)).push_static(" "), f.body), f.pos).push_static(")"),
+        Expr::Pack(p) => pos(&cx, expr(&cx, texts(&cx, out.push_static("(Pack"), p.brands).push_static(" "), p.value.copy(&cx)), p.pos).push_static(")"),
+        Expr::Foreach(f) => pos(&cx, block(&cx, expr(&cx, opt_text(&cx, str(&cx, out.push_static("(Foreach "), f.name), f.binder).push_static(" "), f.source.copy(&cx)).push_static(" "), f.body), f.pos).push_static(")"),
+        Expr::Binop(b) => pos(&cx, expr(&cx, expr(&cx, str(&cx, out.push_static("(Binop "), b.op).push_static(" "), b.left.copy(&cx)).push_static(" "), b.right.copy(&cx)), b.pos).push_static(")"),
+        Expr::Unary(u) => pos(&cx, expr(&cx, str(&cx, out.push_static("(Unary "), u.op).push_static(" "), u.operand.copy(&cx)), u.pos).push_static(")"),
+        Expr::Cast(c) => pos(&cx, type(&cx, expr(&cx, out.push_static("(Cast "), c.value.copy(&cx)).push_static(" "), c.type), c.pos).push_static(")"),
+        Expr::UnsafeStore(s) => pos(&cx, expr(&cx, expr(&cx, out.push_static("(UnsafeStore "), s.pointer.copy(&cx)).push_static(" "), s.value.copy(&cx)), s.pos).push_static(")"),
+        Expr::Field(f) => pos(&cx, str(&cx, expr(&cx, out.push_static("(Field "), f.value.copy(&cx)).push_static(" "), f.name), f.pos).push_static(")"),
+        Expr::Index(x) => pos(&cx, expr(&cx, out.push_static("(Index "), x.value.copy(&cx)).push_static(" ").push_usize(x.index), x.pos).push_static(")"),
+        Expr::Call(c) => pos(&cx, exprs(&cx, expr(&cx, out.push_static("(Call "), c.callee.copy(&cx)), c.args), c.pos).push_static(")"),
+        Expr::Try(n) => pos(&cx, expr(&cx, out.push_static("(Try "), n.value.copy(&cx)), n.pos).push_static(")"),
+        Expr::While(w) => pos(&cx, block(&cx, expr(&cx, out.push_static("(While "), w.cond.copy(&cx)).push_static(" "), w.body), w.pos).push_static(")"),
+        Expr::For(f) => pos(&cx, block(&cx, expr(&cx, str(&cx, out.push_static("(For "), f.name).push_static(" "), f.iterator.copy(&cx)).push_static(" "), f.body), f.pos).push_static(")"),
     }
 }
 
 forall 'k.
-fn pattern(&cx: Cx!['k], out: Buffer!, p: Pattern['k]) -> Buffer! {
+fn pattern(&cx: Domain!['k], out: Buffer!, p: Pattern['k]) -> Buffer! {
     var out = out;
     match p {
         Pattern::Bind(n) => str(&cx, out.push_static("(PBind "), n.value).push_static(")"),
@@ -325,7 +327,7 @@ fn pattern(&cx: Cx!['k], out: Buffer!, p: Pattern['k]) -> Buffer! {
             out = out.push_static("(PStruct [");
             var i = 0usize;
             while i < s.fields.len(&cx) {
-                let f = s.fields.get(&cx, i);
+                let f = s.fields.at(&cx, i);
                 out = pattern(&cx, str(&cx, out.push_static(if i > 0usize { " [" } else { "[" }), f.name).push_static(" "), f.pattern).push_static("]");
                 i = i + 1usize;
             }
@@ -335,19 +337,19 @@ fn pattern(&cx: Cx!['k], out: Buffer!, p: Pattern['k]) -> Buffer! {
 }
 
 forall 'k.
-fn patterns(&cx: Cx!['k], out: Buffer!, ps: Seq[Pattern['k], 'k]) -> Buffer! {
+fn patterns(&cx: Domain!['k], out: Buffer!, ps: ArenaVec[Pattern['k], 'k]) -> Buffer! {
     var out = out;
     out = out.push_static(" [");
     var i = 0usize;
     while i < ps.len(&cx) {
-        out = pattern(&cx, out.push_static(if i > 0usize { " " } else { "" }), ps.get(&cx, i));
+        out = pattern(&cx, out.push_static(if i > 0usize { " " } else { "" }), ps.at(&cx, i));
         i = i + 1usize;
     }
     out.push_static("]")
 }
 
 forall 'k.
-fn statement(&cx: Cx!['k], out: Buffer!, s: Statement['k]) -> Buffer! {
+fn statement(&cx: Domain!['k], out: Buffer!, s: Statement['k]) -> Buffer! {
     match s {
         Statement::Let(l) => pos(&cx, texts(&cx, expr(&cx, opt_type(&cx, pattern(&cx, out.push_static("(Let "), l.pattern), l.type).push_static(" "), l.value), l.brands), l.pos).push_static(")"),
         Statement::Var(v) => pos(&cx, expr(&cx, opt_type(&cx, str(&cx, out.push_static("(Var "), v.name), v.type).push_static(" "), v.value), v.pos).push_static(")"),
@@ -358,19 +360,19 @@ fn statement(&cx: Cx!['k], out: Buffer!, s: Statement['k]) -> Buffer! {
 }
 
 forall 'k.
-fn type_args(&cx: Cx!['k], out: Buffer!, a: S::TypeArgs['k]) -> Buffer! {
+fn type_args(&cx: Domain!['k], out: Buffer!, a: S::TypeArgs['k]) -> Buffer! {
     types(&cx, out.push_static("(TypeArgs"), a.args).push_static(" ").push_usize(a.determined).push_static(")")
 }
 
 forall 'k.
-fn quantifier(&cx: Cx!['k], out: Buffer!, q: Option[S::Forall['k]]) -> Buffer! {
+fn quantifier(&cx: Domain!['k], out: Buffer!, q: Option[S::Forall['k]]) -> Buffer! {
     var out = out;
     match q {
         Option::Some(f) => {
             out = texts(&cx, texts(&cx, out.push_static(" (Forall"), f.params), f.determined).push_static(" [");
             var i = 0usize;
             while i < f.premises.len(&cx) {
-                let p = f.premises.get(&cx, i);
+                let p = f.premises.at(&cx, i);
                 out = type_args(&cx, texts(&cx, out.push_static(if i > 0usize { " [" } else { "[" }), p.trait_path).push_static(" "), p.args).push_static("]");
                 i = i + 1usize;
             }
@@ -381,12 +383,12 @@ fn quantifier(&cx: Cx!['k], out: Buffer!, q: Option[S::Forall['k]]) -> Buffer! {
 }
 
 forall 'k.
-fn params(&cx: Cx!['k], out: Buffer!, ps: Seq[S::Param['k], 'k]) -> Buffer! {
+fn params(&cx: Domain!['k], out: Buffer!, ps: ArenaVec[S::Param['k], 'k]) -> Buffer! {
     var out = out;
     out = out.push_static(" [");
     var i = 0usize;
     while i < ps.len(&cx) {
-        let p = ps.get(&cx, i);
+        let p = ps.at(&cx, i);
         out = flag(&cx, opt_type(&cx, str(&cx, out.push_static(if i > 0usize { " (Param " } else { "(Param " }), p.name), p.type), p.lend).push_static(")");
         i = i + 1usize;
     }
@@ -394,7 +396,7 @@ fn params(&cx: Cx!['k], out: Buffer!, ps: Seq[S::Param['k], 'k]) -> Buffer! {
 }
 
 forall 'k.
-fn exposure(&cx: Cx!['k], out: Buffer!, e: Option[S::Exposed['k]]) -> Buffer! {
+fn exposure(&cx: Domain!['k], out: Buffer!, e: Option[S::Exposed['k]]) -> Buffer! {
     match e {
         Option::Some(x) => opt_path(&cx, out.push_static(" (Exposed"), x.scope).push_static(")"),
         Option::None => out.push_static(" _"),
@@ -402,19 +404,19 @@ fn exposure(&cx: Cx!['k], out: Buffer!, e: Option[S::Exposed['k]]) -> Buffer! {
 }
 
 forall 'k.
-fn use_tree(&cx: Cx!['k], out: Buffer!, t: S::UseTree['k]) -> Buffer! {
+fn use_tree(&cx: Domain!['k], out: Buffer!, t: S::UseTree['k]) -> Buffer! {
     var out = out;
     out = flag(&cx, texts(&cx, out.push_static("["), t.path), t.star).push_static(" [");
     var i = 0usize;
     while i < t.children.len(&cx) {
-        out = use_tree(&cx, out.push_static(if i > 0usize { " " } else { "" }), t.children.get(&cx, i));
+        out = use_tree(&cx, out.push_static(if i > 0usize { " " } else { "" }), t.children.at(&cx, i));
         i = i + 1usize;
     }
     opt_text(&cx, out.push_static("]"), t.alias).push_static("]")
 }
 
 forall 'k.
-fn function(&cx: Cx!['k], out: Buffer!, f: S::Fn['k]) -> Buffer! {
+fn function(&cx: Domain!['k], out: Buffer!, f: S::Fn['k]) -> Buffer! {
     var out = out;
     out = opt_type(&cx, params(&cx, str(&cx, out.push_static("(Fn "), f.name), f.params), f.ret);
     out = match f.body {
@@ -425,12 +427,12 @@ fn function(&cx: Cx!['k], out: Buffer!, f: S::Fn['k]) -> Buffer! {
 }
 
 forall 'k.
-fn const_decl(&cx: Cx!['k], out: Buffer!, c: S::Const['k]) -> Buffer! {
+fn const_decl(&cx: Domain!['k], out: Buffer!, c: S::Const['k]) -> Buffer! {
     pos(&cx, quantifier(&cx, expr(&cx, type(&cx, str(&cx, out.push_static("(Const "), c.name).push_static(" "), c.type).push_static(" "), c.value), c.quantifier), c.pos).push_static(")")
 }
 
 forall 'k.
-fn item(&cx: Cx!['k], out: Buffer!, it: S::Item['k]) -> Buffer! {
+fn item(&cx: Domain!['k], out: Buffer!, it: S::Item['k]) -> Buffer! {
     var out = out;
     match it {
         S::Item::Use(u) => pos(&cx, flag(&cx, use_tree(&cx, out.push_static("(Use "), u.tree), u.is_export), u.pos).push_static(")"),
@@ -439,7 +441,7 @@ fn item(&cx: Cx!['k], out: Buffer!, it: S::Item['k]) -> Buffer! {
             out = flag(&cx, str(&cx, out.push_static("(Struct "), s.name), s.linear).push_static(" [");
             var i = 0usize;
             while i < s.fields.len(&cx) {
-                let f = s.fields.get(&cx, i);
+                let f = s.fields.at(&cx, i);
                 out = type(&cx, str(&cx, out.push_static(if i > 0usize { " [" } else { "[" }), f.name).push_static(" "), f.type).push_static("]");
                 i = i + 1usize;
             }
@@ -450,7 +452,7 @@ fn item(&cx: Cx!['k], out: Buffer!, it: S::Item['k]) -> Buffer! {
             out = flag(&cx, str(&cx, out.push_static("(EnumDecl "), e.name), e.linear).push_static(" [");
             var i = 0usize;
             while i < e.variants.len(&cx) {
-                let v = e.variants.get(&cx, i);
+                let v = e.variants.at(&cx, i);
                 out = types(&cx, str(&cx, out.push_static(if i > 0usize { " [" } else { "[" }), v.name), v.payload).push_static("]");
                 i = i + 1usize;
             }
@@ -464,7 +466,7 @@ fn item(&cx: Cx!['k], out: Buffer!, it: S::Item['k]) -> Buffer! {
             var i = 0usize;
             while i < m.items.len(&cx) {
                 out = out.push_static(if i > 0usize { " " } else { "" });
-                out = match m.items.get(&cx, i) {
+                out = match m.items.at(&cx, i) {
                     S::Member::Fn(f) => function(&cx, out, f),
                     S::Member::Const(c) => const_decl(&cx, out, c),
                 };
@@ -478,12 +480,12 @@ fn item(&cx: Cx!['k], out: Buffer!, it: S::Item['k]) -> Buffer! {
 }
 
 forall 'k.
-fn functions(&cx: Cx!['k], out: Buffer!, fs: Seq[S::Fn['k], 'k]) -> Buffer! {
+fn functions(&cx: Domain!['k], out: Buffer!, fs: ArenaVec[S::Fn['k], 'k]) -> Buffer! {
     var out = out;
     out = out.push_static(" [");
     var i = 0usize;
     while i < fs.len(&cx) {
-        out = function(&cx, out.push_static(if i > 0usize { " " } else { "" }), fs.get(&cx, i));
+        out = function(&cx, out.push_static(if i > 0usize { " " } else { "" }), fs.at(&cx, i));
         i = i + 1usize;
     }
     out.push_static("]")
@@ -491,12 +493,12 @@ fn functions(&cx: Cx!['k], out: Buffer!, fs: Seq[S::Fn['k], 'k]) -> Buffer! {
 
 // One line per item.
 forall 'k.
-fn items(&cx: Cx!['k], items: Seq[S::Item['k], 'k]) -> Text['k] {
+fn items(&cx: Domain!['k], items: ArenaVec[S::Item['k], 'k]) -> Span['k] {
     var out = Buffer::new();
     var i = 0usize;
     while i < items.len(&cx) {
-        out = item(&cx, out, items.get(&cx, i)).push_static("\n");
+        out = item(&cx, out, items.at(&cx, i)).push_static("\n");
         i = i + 1usize;
     }
-    text_of(&cx, out)
+    out.save(&cx)
 }

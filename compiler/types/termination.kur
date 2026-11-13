@@ -8,7 +8,11 @@
 // might reset its arguments). Instance search instead requires structural descent on every
 // recursive edge.
 
-use package::support::base::{Cx, Map, Seq, Set, Text, fail, text, text_of};
+use package::support::base::fail;
+use std::collections::arena_vec::ArenaVec;
+use std::collections::arena_map::{ArenaMap, ArenaSet};
+use std::raw::Span;
+use std::alloc::arena::Domain;
 use std::bytes::buffer::Buffer;
 use package::kurs::core::{Fun, Instr, Kind, Param, Premise, Program, Type};
 use package::kurs::core as C;
@@ -23,12 +27,12 @@ use std::option::Option;
 // or (trait, method). The walk's numbering, stack and active set are its own, freed when it ends;
 // only the components are kept.
 forall 'k.
-fn components(&cx: Cx!['k], graph: Map[Seq[Text['k], 'k], Set[Seq[Text['k], 'k], 'k], 'k]) -> Map[Seq[Text['k], 'k], usize, 'k] {
-    let result: Map[Seq[Text['k], 'k], usize, 'k] = Map::new(&cx);
+fn components(&cx: Domain!['k], graph: ArenaMap[ArenaVec[Span['k], 'k], ArenaSet[ArenaVec[Span['k], 'k], 'k], 'k]) -> ArenaMap[ArenaVec[Span['k], 'k], usize, 'k] {
+    let result: ArenaMap[ArenaVec[Span['k], 'k], usize, 'k] = ArenaMap::new(&cx);
     var walk = Tarjan.{ indices: OwnedMap::new(), low: OwnedMap::new(), stack: OwnedVec::new(), active: OwnedMap::new() };
     var i = 0usize;
     while i < graph.positions(&cx) {
-        match graph.entry(&cx, i) {
+        match graph.key_at(&cx, i) {
             Option::Some(node) => if !&walk.numbered(&cx, node) {
                 &walk.visit(&cx, graph, result, node);
             },
@@ -46,10 +50,10 @@ fn components(&cx: Cx!['k], graph: Map[Seq[Text['k], 'k], Set[Seq[Text['k], 'k],
 
 forall 'k.
 exposed struct Tarjan! {
-    indices: OwnedMap![Seq[Text['k], 'k], usize],
-    low: OwnedMap![Seq[Text['k], 'k], usize],
-    stack: OwnedVec![Seq[Text['k], 'k]],
-    active: OwnedMap![Seq[Text['k], 'k], bool],
+    indices: OwnedMap![ArenaVec[Span['k], 'k], usize],
+    low: OwnedMap![ArenaVec[Span['k], 'k], usize],
+    stack: OwnedVec![ArenaVec[Span['k], 'k]],
+    active: OwnedMap![ArenaVec[Span['k], 'k], bool],
 }
 
 fn min(a: usize, b: usize) -> usize {
@@ -58,23 +62,23 @@ fn min(a: usize, b: usize) -> usize {
 
 // The number `numbers` gives `node`, which it must have.
 forall 'k.
-fn number(&cx: Cx!['k], &numbers: OwnedMap![Seq[Text['k], 'k], usize], node: Seq[Text['k], 'k]) -> usize {
+fn number(&cx: Domain!['k], &numbers: OwnedMap![ArenaVec[Span['k], 'k], usize], node: ArenaVec[Span['k], 'k]) -> usize {
     match &numbers.get_in(&cx, node) {
         Found::Item(n) => n,
-        Found::Missing => fail(&cx, text(&cx, "internal error: a node the walk has not numbered")),
+        Found::Missing => fail(&cx, Span::from_static(&cx, "internal error: a node the walk has not numbered")),
     }
 }
 
 forall 'k.
 impl Tarjan['k] {
-    fn numbered(&self, &cx: Cx!['k], node: Seq[Text['k], 'k]) -> bool {
+    fn numbered(&self, &cx: Domain!['k], node: ArenaVec[Span['k], 'k]) -> bool {
         match &self.indices.get_in(&cx, node) {
             Found::Item(n) => true,
             Found::Missing => false,
         }
     }
 
-    fn visit(&self, &cx: Cx!['k], graph: Map[Seq[Text['k], 'k], Set[Seq[Text['k], 'k], 'k], 'k], result: Map[Seq[Text['k], 'k], usize, 'k], node: Seq[Text['k], 'k]) {
+    fn visit(&self, &cx: Domain!['k], graph: ArenaMap[ArenaVec[Span['k], 'k], ArenaSet[ArenaVec[Span['k], 'k], 'k], 'k], result: ArenaMap[ArenaVec[Span['k], 'k], usize, 'k], node: ArenaVec[Span['k], 'k]) {
         let index = &self.indices.len();
         let fresh = &self.indices.insert_in(&cx, node, index);
         let first = &self.low.insert_in(&cx, node, index);
@@ -83,7 +87,7 @@ impl Tarjan['k] {
         let targets = graph.at(&cx, node);
         var i = 0usize;
         while i < targets.positions(&cx) {
-            match targets.entry(&cx, i) {
+            match targets.key_at(&cx, i) {
                 Option::Some(target) => {
                     if !&self.numbered(&cx, target) {
                         &self.visit(&cx, graph, result, target);
@@ -110,8 +114,8 @@ impl Tarjan['k] {
                 match &self.stack.pop() {
                     Popped::Item(member) => {
                         let left = &self.active.remove_in(&cx, member);
-                        result.set(&cx, member, own);
-                        going = !member.same(&cx, node);
+                        result.insert(&cx, member, own);
+                        going = !member.eq(&cx, node);
                     },
                     Popped::Empty => {
                         going = false;
@@ -123,14 +127,14 @@ impl Tarjan['k] {
 }
 
 forall 'k.
-fn node1(&cx: Cx!['k], a: Text['k]) -> Seq[Text['k], 'k] {
-    Seq::one(&cx, a)
+fn node1(&cx: Domain!['k], a: Span['k]) -> ArenaVec[Span['k], 'k] {
+    ArenaVec::one(&cx, a)
 }
 
 forall 'k.
-fn add_node(&cx: Cx!['k], graph: Map[Seq[Text['k], 'k], Set[Seq[Text['k], 'k], 'k], 'k], node: Seq[Text['k], 'k]) {
-    if !graph.has(&cx, node) {
-        graph.set(&cx, node, Set::new(&cx));
+fn add_node(&cx: Domain!['k], graph: ArenaMap[ArenaVec[Span['k], 'k], ArenaSet[ArenaVec[Span['k], 'k], 'k], 'k], node: ArenaVec[Span['k], 'k]) {
+    if !graph.contains(&cx, node) {
+        graph.insert(&cx, node, ArenaSet::new(&cx));
     }
 }
 
@@ -140,16 +144,16 @@ fn add_node(&cx: Cx!['k], graph: Map[Seq[Text['k], 'k], Set[Seq[Text['k], 'k], '
 // and edges between components follow a finite DAG. Headers are shared by surface inference and
 // KURS, before either searches.
 forall 'k.
-fn check_instance_termination(&cx: Cx!['k], headers: Seq[(Premise['k], Seq[Premise['k], 'k], Pos), 'k]) {
-    let graph: Map[Seq[Text['k], 'k], Set[Seq[Text['k], 'k], 'k], 'k] = Map::new(&cx);
+fn check_instance_termination(&cx: Domain!['k], headers: ArenaVec[(Premise['k], ArenaVec[Premise['k], 'k], Pos), 'k]) {
+    let graph: ArenaMap[ArenaVec[Span['k], 'k], ArenaSet[ArenaVec[Span['k], 'k], 'k], 'k] = ArenaMap::new(&cx);
     var i = 0usize;
     while i < headers.len(&cx) {
-        let (head, premises, _pos) = headers.get(&cx, i);
+        let (head, premises, _pos) = headers.at(&cx, i);
         add_node(&cx, graph, node1(&cx, head.trait_name));
         var j = 0usize;
         while j < premises.len(&cx) {
-            add_node(&cx, graph, node1(&cx, premises.get(&cx, j).trait_name));
-            graph.at(&cx, node1(&cx, head.trait_name)).add(&cx, node1(&cx, premises.get(&cx, j).trait_name));
+            add_node(&cx, graph, node1(&cx, premises.at(&cx, j).trait_name));
+            graph.at(&cx, node1(&cx, head.trait_name)).insert(&cx, node1(&cx, premises.at(&cx, j).trait_name));
             j = j + 1usize;
         }
         i = i + 1usize;
@@ -157,14 +161,14 @@ fn check_instance_termination(&cx: Cx!['k], headers: Seq[(Premise['k], Seq[Premi
     let scc = components(&cx, graph);
     var k = 0usize;
     while k < headers.len(&cx) {
-        let (head, premises, pos) = headers.get(&cx, k);
+        let (head, premises, pos) = headers.at(&cx, k);
         var j = 0usize;
         while j < premises.len(&cx) {
-            let premise = premises.get(&cx, j);
+            let premise = premises.at(&cx, j);
             if scc.at(&cx, node1(&cx, head.trait_name)) == scc.at(&cx, node1(&cx, premise.trait_name)) {
-                if head.args.is_empty(&cx) || premise.args.is_empty(&cx) || !strict_subterm(&cx, premise.args.get(&cx, 0usize), head.args.get(&cx, 0usize)) {
-                    kurs_error(&cx, text_of(&cx, Buffer::new().push_static("recursive instance premise ").push_bytes(&cx, head.trait_name).push_static(" -> ").push_bytes(&cx, premise.trait_name)
-                        .push_static(": first argument must be a strict structural subterm of the head's first argument")), pos);
+                if head.args.is_empty(&cx) || premise.args.is_empty(&cx) || !strict_subterm(&cx, premise.args.at(&cx, 0usize), head.args.at(&cx, 0usize)) {
+                    kurs_error(&cx, Buffer::new().push_static("recursive instance premise ").push_bytes(&cx, head.trait_name).push_static(" -> ").push_bytes(&cx, premise.trait_name)
+                        .push_static(": first argument must be a strict structural subterm of the head's first argument").save(&cx), pos);
                 }
             }
             j = j + 1usize;
@@ -177,24 +181,24 @@ fn check_instance_termination(&cx: Cx!['k], headers: Seq[(Premise['k], Seq[Premi
 // parameters, and the instruction.
 forall 'k.
 exposed struct Site {
-    caller: Seq[Text['k], 'k],
-    callee: Seq[Text['k], 'k],
-    scope: Set[Text['k], 'k],
+    caller: ArenaVec[Span['k], 'k],
+    callee: ArenaVec[Span['k], 'k],
+    scope: ArenaSet[Span['k], 'k],
     instr: Instr['k],
 }
 
 forall 'k.
-fn join(&cx: Cx!['k], key: Seq[Text['k], 'k]) -> Text['k] {
+fn join(&cx: Domain!['k], key: ArenaVec[Span['k], 'k]) -> Span['k] {
     var out = Buffer::new();
     var i = 0usize;
     while i < key.len(&cx) {
         if i > 0usize {
             out = out.push_static("::");
         }
-        out = out.push_bytes(&cx, key.get(&cx, i));
+        out = out.push_bytes(&cx, key.at(&cx, i));
         i = i + 1usize;
     }
-    text_of(&cx, out)
+    out.save(&cx)
 }
 
 // Check every specialization request before starting the backend worklist.
@@ -203,31 +207,31 @@ fn join(&cx: Cx!['k], key: Seq[Text['k], 'k]) -> Text['k] {
 // was already requested at a statically named `fn` site. Lifted closures and foreach mappers are
 // ordinary functions in this graph.
 forall 'k.
-fn check_mono_termination(&cx: Cx!['k], program: Program['k]) {
-    let keys: Seq[Seq[Text['k], 'k], 'k] = Seq::new(&cx);
-    let bodies: Seq[Fun['k], 'k] = Seq::new(&cx);
-    let scopes: Seq[Seq[Param['k], 'k], 'k] = Seq::new(&cx);
+fn check_mono_termination(&cx: Domain!['k], program: Program['k]) {
+    let keys: ArenaVec[ArenaVec[Span['k], 'k], 'k] = ArenaVec::new(&cx);
+    let bodies: ArenaVec[Fun['k], 'k] = ArenaVec::new(&cx);
+    let scopes: ArenaVec[ArenaVec[Param['k], 'k], 'k] = ArenaVec::new(&cx);
     let funs = program.funs.values(&cx);
     var f = 0usize;
     while f < funs.len(&cx) {
-        keys.push(&cx, node1(&cx, funs.get(&cx, f).name));
-        bodies.push(&cx, funs.get(&cx, f));
-        scopes.push(&cx, funs.get(&cx, f).params);
+        keys.push(&cx, node1(&cx, funs.at(&cx, f).name));
+        bodies.push(&cx, funs.at(&cx, f));
+        scopes.push(&cx, funs.at(&cx, f).params);
         f = f + 1usize;
     }
     let groups = program.instances.values(&cx);
     var g = 0usize;
     while g < groups.len(&cx) {
-        let instances = groups.get(&cx, g);
+        let instances = groups.at(&cx, g);
         var n = 0usize;
         while n < instances.len(&cx) {
-            let inst = instances.get(&cx, n);
+            let inst = instances.at(&cx, n);
             var m = 0usize;
             while m < inst.methods.len(&cx) {
-                let fun = inst.methods.get(&cx, m);
-                keys.push(&cx, Seq::two(&cx, inst.trait_name, fun.name));
+                let fun = inst.methods.at(&cx, m);
+                keys.push(&cx, ArenaVec::two(&cx, inst.trait_name, fun.name));
                 bodies.push(&cx, fun);
-                let params = inst.params.copy(&cx);
+                let params = inst.params.clone(&cx);
                 params.append(&cx, fun.params);
                 scopes.push(&cx, params);
                 m = m + 1usize;
@@ -236,46 +240,46 @@ fn check_mono_termination(&cx: Cx!['k], program: Program['k]) {
         }
         g = g + 1usize;
     }
-    let graph: Map[Seq[Text['k], 'k], Set[Seq[Text['k], 'k], 'k], 'k] = Map::new(&cx);
+    let graph: ArenaMap[ArenaVec[Span['k], 'k], ArenaSet[ArenaVec[Span['k], 'k], 'k], 'k] = ArenaMap::new(&cx);
     var b = 0usize;
     while b < keys.len(&cx) {
-        graph.set(&cx, keys.get(&cx, b), Set::new(&cx));
+        graph.insert(&cx, keys.at(&cx, b), ArenaSet::new(&cx));
         b = b + 1usize;
     }
-    let sites: Seq[Site['k], 'k] = Seq::new(&cx);
+    let sites: ArenaVec[Site['k], 'k] = ArenaVec::new(&cx);
     var c = 0usize;
     while c < keys.len(&cx) {
-        let key = keys.get(&cx, c);
-        let fun = bodies.get(&cx, c);
+        let key = keys.at(&cx, c);
+        let fun = bodies.at(&cx, c);
         // Brands have no type constructors and cannot grow.
-        let scope: Set[Text['k], 'k] = Set::new(&cx);
-        let params = scopes.get(&cx, c);
+        let scope: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+        let params = scopes.at(&cx, c);
         var p = 0usize;
         while p < params.len(&cx) {
-            if !C::same_kind(params.get(&cx, p).kind, Kind::Brand) {
-                scope.add(&cx, params.get(&cx, p).name);
+            if !C::same_kind(params.at(&cx, p).kind, Kind::Brand) {
+                scope.insert(&cx, params.at(&cx, p).name);
             }
             p = p + 1usize;
         }
         var k = 0usize;
         while k < fun.blocks.len(&cx) {
-            let instrs = fun.blocks.get(&cx, k).instrs;
+            let instrs = fun.blocks.at(&cx, k).instrs;
             var i = 0usize;
             while i < instrs.len(&cx) {
-                let instr = instrs.get(&cx, i);
-                let target: Option[Seq[Text['k], 'k]] = if instr.op.is(&cx, "call") || instr.op.is(&cx, "fn") {
-                    Option::Some.(node1(&cx, instr.args.get(&cx, 0usize)))
+                let instr = instrs.at(&cx, i);
+                let target: Option[ArenaVec[Span['k], 'k]] = if instr.op.is(&cx, "call") || instr.op.is(&cx, "fn") {
+                    Option::Some.(node1(&cx, instr.args.at(&cx, 0usize)))
                 } else if instr.op.is(&cx, "trait_call") {
-                    Option::Some.(Seq::two(&cx, instr.args.get(&cx, 0usize), instr.args.get(&cx, 1usize)))
+                    Option::Some.(ArenaVec::two(&cx, instr.args.at(&cx, 0usize), instr.args.at(&cx, 1usize)))
                 } else if instr.op.is(&cx, "foreach") {
-                    Option::Some.(node1(&cx, instr.args.get(&cx, 1usize)))
+                    Option::Some.(node1(&cx, instr.args.at(&cx, 1usize)))
                 } else {
                     Option::None
                 };
                 let unit = match target {
                     Option::Some(t) => {
-                        if graph.has(&cx, t) {
-                            graph.at(&cx, key).add(&cx, t);
+                        if graph.contains(&cx, t) {
+                            graph.at(&cx, key).insert(&cx, t);
                             sites.push(&cx, Site.{ caller: key, callee: t, scope, instr });
                         }
                     },
@@ -290,7 +294,7 @@ fn check_mono_termination(&cx: Cx!['k], program: Program['k]) {
     let scc = components(&cx, graph);
     var s = 0usize;
     while s < sites.len(&cx) {
-        let site = sites.get(&cx, s);
+        let site = sites.at(&cx, s);
         if scc.at(&cx, site.caller) == scc.at(&cx, site.callee) {
             check_site(&cx, site);
         }
@@ -299,19 +303,19 @@ fn check_mono_termination(&cx: Cx!['k], program: Program['k]) {
 }
 
 forall 'k.
-fn check_site(&cx: Cx!['k], site: Site['k]) {
+fn check_site(&cx: Domain!['k], site: Site['k]) {
     let instr = site.instr;
-    let context = text_of(&cx, Buffer::new().push_static("recursive specialization ").push_bytes(&cx, join(&cx, site.caller)).push_static(" -> ").push_bytes(&cx, join(&cx, site.callee)));
+    let context = Buffer::new().push_static("recursive specialization ").push_bytes(&cx, join(&cx, site.caller)).push_static(" -> ").push_bytes(&cx, join(&cx, site.callee)).save(&cx);
     var i = 0usize;
     while i < instr.tys.len(&cx) {
-        let ty = instr.tys.get(&cx, i);
+        let ty = instr.tys.at(&cx, i);
         let unchanged = match ty {
-            Type::Named(name, args) => args.is_empty(&cx) && site.scope.has(&cx, name),
+            Type::Named(name, args) => args.is_empty(&cx) && site.scope.contains(&cx, name),
             _ => false,
         };
         if !unchanged && overlap(&cx, free_names(&cx, ty), site.scope) {
-            kurs_error(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, context).push_static(": ").push_bytes(&cx, show(&cx, ty))
-                .push_static(" must be an unchanged parameter or independent of the caller's parameters")), instr.pos);
+            kurs_error(&cx, Buffer::new().push_bytes(&cx, context).push_static(": ").push_bytes(&cx, show(&cx, ty))
+                .push_static(" must be an unchanged parameter or independent of the caller's parameters").save(&cx), instr.pos);
         }
         i = i + 1usize;
     }
@@ -321,8 +325,8 @@ fn check_site(&cx: Cx!['k], site: Site['k]) {
     let unit = match instr.ty {
         Option::Some(t) => match t {
             Type::Foreach(f) => {
-                if instr.op.is(&cx, "foreach") && overlap(&cx, free_names(&cx, f.source.get(&cx)), site.scope) {
-                    kurs_error(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, context).push_static(": recursive foreach requires a parameter-independent source")), instr.pos);
+                if instr.op.is(&cx, "foreach") && overlap(&cx, free_names(&cx, f.source.copy(&cx)), site.scope) {
+                    kurs_error(&cx, Buffer::new().push_bytes(&cx, context).push_static(": recursive foreach requires a parameter-independent source").save(&cx), instr.pos);
                 }
             },
             _ => (),

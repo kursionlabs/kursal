@@ -5,7 +5,11 @@
 // and rebuilt; lends use a generic value adapter. Sum refinements and opened root views require a
 // further representation extension.
 
-use package::support::base::{Cell, Cx, Map, Seq, Set, Text, text, text_of};
+use std::collections::arena_vec::ArenaVec;
+use std::collections::arena_map::{ArenaMap, ArenaSet};
+use std::mem::Ref;
+use std::raw::Span;
+use std::alloc::arena::Domain;
 use std::bytes::buffer::Buffer;
 use package::check::checker::overlap;
 use package::kurs::core::{Binding, Block, Edge, Fun, Instr, Kind, Param, Premise, Terminator, Type};
@@ -23,45 +27,45 @@ exposed struct Promotion {
     types: Types['k],
     r: Resolver['k],
     counter: Fresh['k],
-    params: Seq[Param['k], 'k],
-    premises: Seq[Premise['k], 'k],
-    value_types: Map[Text['k], Type['k], 'k],
-    roots: Map[Text['k], Type['k], 'k],
-    kinds: Map[Text['k], Kind, 'k],
+    params: ArenaVec[Param['k], 'k],
+    premises: ArenaVec[Premise['k], 'k],
+    value_types: ArenaMap[Span['k], Type['k], 'k],
+    roots: ArenaMap[Span['k], Type['k], 'k],
+    kinds: ArenaMap[Span['k], Kind, 'k],
     // SSA names in use
-    taken: Set[Text['k], 'k],
-    serial: Cell[u64, 'k],
-    helpers: Seq[Fun['k], 'k],
+    taken: ArenaSet[Span['k], 'k],
+    serial: Ref[u64, 'k],
+    helpers: ArenaVec[Fun['k], 'k],
     // an exposed product path -> its components' paths and types
-    shapes: Map[Text['k], Seq[Binding['k], 'k], 'k],
-    path_types: Map[Text['k], Type['k], 'k],
+    shapes: ArenaMap[Span['k], ArenaVec[Binding['k], 'k], 'k],
+    path_types: ArenaMap[Span['k], Type['k], 'k],
 }
 
 // One block being rewritten: the SSA value holding each leaf path, the loads replaced by those
 // values, the new instructions and the brands open so far.
 forall 'k.
 exposed struct Rewrite {
-    contents: Map[Text['k], Text['k], 'k],
-    aliases: Map[Text['k], Text['k], 'k],
-    instructions: Seq[Instr['k], 'k],
-    brands: Seq[Text['k], 'k],
+    contents: ArenaMap[Span['k], Span['k], 'k],
+    aliases: ArenaMap[Span['k], Span['k], 'k],
+    instructions: ArenaVec[Instr['k], 'k],
+    brands: ArenaVec[Span['k], 'k],
 }
 
 forall 'k.
-fn instr(&cx: Cx!['k], lhs: Seq[Text['k], 'k], op: Slice[u8, 'static], args: Seq[Text['k], 'k], ty: Option[Type['k]], pos: Pos) -> Instr['k] {
-    Instr.{ lhs, op: text(&cx, op), args, ty, tys: Seq::new(&cx), lit: Option::None, is_unsafe: false, binders: Seq::new(&cx), pos }
+fn instr(&cx: Domain!['k], lhs: ArenaVec[Span['k], 'k], op: Slice[u8, 'static], args: ArenaVec[Span['k], 'k], ty: Option[Type['k]], pos: Pos) -> Instr['k] {
+    Instr.{ lhs, op: Span::from_static(&cx, op), args, ty, tys: ArenaVec::new(&cx), lit: Option::None, is_unsafe: false, binders: ArenaVec::new(&cx), pos }
 }
 
 forall 'k.
-fn root_of(&cx: Cx!['k], path: Text['k]) -> Text['k] {
-    match path.find(&cx, text(&cx, "."), 0usize) {
+fn root_of(&cx: Domain!['k], path: Span['k]) -> Span['k] {
+    match path.find(&cx, Span::from_static(&cx, "."), 0usize) {
         Option::Some(at) => path.slice(0usize, at),
         Option::None => path,
     }
 }
 
 forall 'k.
-fn parent_of(&cx: Cx!['k], path: Text['k]) -> Text['k] {
+fn parent_of(&cx: Domain!['k], path: Span['k]) -> Span['k] {
     match path.rfind_byte(&cx, b'.') {
         Option::Some(at) => path.slice(0usize, at),
         Option::None => path,
@@ -69,93 +73,93 @@ fn parent_of(&cx: Cx!['k], path: Text['k]) -> Text['k] {
 }
 
 forall 'k.
-fn lends(&cx: Cx!['k], arg: Text['k]) -> bool {
-    arg.starts_with(&cx, text(&cx, "&")) && !arg.starts_with(&cx, text(&cx, "&*"))
+fn lends(&cx: Domain!['k], arg: Span['k]) -> bool {
+    arg.starts_with(&cx, Span::from_static(&cx, "&")) && !arg.starts_with(&cx, Span::from_static(&cx, "&*"))
 }
 
 forall 'k.
 impl Promotion['k] {
-    fn fresh(self, &cx: Cx!['k]) -> Text['k] {
-        var name = text(&cx, "");
+    fn fresh(self, &cx: Domain!['k]) -> Span['k] {
+        var name = Span::from_static(&cx, "");
         var going = true;
         while going {
-            name = text_of(&cx, Buffer::new().push_static("%#contents").push_u64(self.serial.get(&cx)));
-            self.serial.set(&cx, self.serial.get(&cx) + 1u64);
-            going = self.taken.has(&cx, name);
+            name = Buffer::new().push_static("%#contents").push_u64(self.serial.copy(&cx)).save(&cx);
+            self.serial.set(&cx, self.serial.copy(&cx) + 1u64);
+            going = self.taken.contains(&cx, name);
         }
-        self.taken.add(&cx, name);
+        self.taken.insert(&cx, name);
         name
     }
 
-    fn restricted(self, &cx: Cx!['k], path: Text['k]) -> bool {
-        self.roots.has(&cx, root_of(&cx, path))
+    fn restricted(self, &cx: Domain!['k], path: Span['k]) -> bool {
+        self.roots.contains(&cx, root_of(&cx, path))
     }
 
-    fn unsupported(self, &cx: Cx!['k], path: Text['k]) -> ! {
-        self.r.fail(&cx, text_of(&cx, Buffer::new().push_static("frontend limitation: locally branded value ").push_bytes(&cx, path)
-            .push_static(" requires structural SSA lowering; pass it by value to a generic function")), self.fun.pos)
+    fn unsupported(self, &cx: Domain!['k], path: Span['k]) -> ! {
+        self.r.fail(&cx, Buffer::new().push_static("frontend limitation: locally branded value ").push_bytes(&cx, path)
+            .push_static(" requires structural SSA lowering; pass it by value to a generic function").save(&cx), self.fun.pos)
     }
 
-    fn expose(self, &cx: Cx!['k], path: Text['k]) {
-        if self.path_types.has(&cx, path) {
+    fn expose(self, &cx: Domain!['k], path: Span['k]) {
+        if self.path_types.contains(&cx, path) {
             return;
         }
         let parent = parent_of(&cx, path);
         self.expose(&cx, parent);
-        if !self.shapes.has(&cx, parent) {
-            let fields: Seq[Binding['k], 'k] = Seq::new(&cx);
+        if !self.shapes.contains(&cx, parent) {
+            let fields: ArenaVec[Binding['k], 'k] = ArenaVec::new(&cx);
             match self.types.shape(&cx, self.path_types.at(&cx, parent), self.fun.home) {
                 Type::Tuple(elems) => {
                     var k = 0usize;
                     while k < elems.len(&cx) {
-                        fields.push(&cx, Binding.{ name: text_of(&cx, Buffer::new().push_usize(k)), type: elems.get(&cx, k) });
+                        fields.push(&cx, Binding.{ name: Buffer::new().push_usize(k).save(&cx), type: elems.at(&cx, k) });
                         k = k + 1usize;
                     }
                 },
                 Type::Struct(members) => {
                     var k = 0usize;
                     while k < members.len(&cx) {
-                        fields.push(&cx, Binding.{ name: members.get(&cx, k).name, type: members.get(&cx, k).type });
+                        fields.push(&cx, Binding.{ name: members.at(&cx, k).name, type: members.at(&cx, k).type });
                         k = k + 1usize;
                     }
                 },
                 _ => self.unsupported(&cx, path),
             };
-            let children: Seq[Binding['k], 'k] = Seq::new(&cx);
+            let children: ArenaVec[Binding['k], 'k] = ArenaVec::new(&cx);
             var k = 0usize;
             while k < fields.len(&cx) {
-                let child = text_of(&cx, Buffer::new().push_bytes(&cx, parent).push_static(".").push_bytes(&cx, fields.get(&cx, k).name));
-                children.push(&cx, Binding.{ name: child, type: fields.get(&cx, k).type });
-                self.path_types.set(&cx, child, fields.get(&cx, k).type);
+                let child = Buffer::new().push_bytes(&cx, parent).push_static(".").push_bytes(&cx, fields.at(&cx, k).name).save(&cx);
+                children.push(&cx, Binding.{ name: child, type: fields.at(&cx, k).type });
+                self.path_types.insert(&cx, child, fields.at(&cx, k).type);
                 k = k + 1usize;
             }
-            self.shapes.set(&cx, parent, children);
+            self.shapes.insert(&cx, parent, children);
         }
-        if !self.path_types.has(&cx, path) {
+        if !self.path_types.contains(&cx, path) {
             self.unsupported(&cx, path);
         }
     }
 
     // Checks every use of a branded root before anything changes; sums and opened roots need their
     // own representation.
-    fn validate(self, &cx: Cx!['k]) {
+    fn validate(self, &cx: Domain!['k]) {
         var b = 0usize;
         while b < self.fun.blocks.len(&cx) {
-            let block = self.fun.blocks.get(&cx, b);
+            let block = self.fun.blocks.at(&cx, b);
             var i = 0usize;
             while i < block.empty.len(&cx) {
-                let path = block.empty.get(&cx, i);
+                let path = block.empty.at(&cx, i);
                 if self.restricted(&cx, path) {
                     var k = 0usize;
                     while k < block.known.len(&cx) {
-                        if block.known.get(&cx, k).path.eq(&cx, path) {
+                        if block.known.at(&cx, k).path.eq(&cx, path) {
                             self.unsupported(&cx, path);
                         }
                         k = k + 1usize;
                     }
                     k = 0usize;
                     while k < block.opened.len(&cx) {
-                        if block.opened.get(&cx, k).path.eq(&cx, path) {
+                        if block.opened.at(&cx, k).path.eq(&cx, path) {
                             self.unsupported(&cx, path);
                         }
                         k = k + 1usize;
@@ -166,24 +170,24 @@ impl Promotion['k] {
             }
             i = 0usize;
             while i < block.known.len(&cx) {
-                if self.restricted(&cx, block.known.get(&cx, i).path) {
-                    self.unsupported(&cx, block.known.get(&cx, i).path);
+                if self.restricted(&cx, block.known.at(&cx, i).path) {
+                    self.unsupported(&cx, block.known.at(&cx, i).path);
                 }
                 i = i + 1usize;
             }
             i = 0usize;
             while i < block.opened.len(&cx) {
-                if self.restricted(&cx, block.opened.get(&cx, i).path) {
-                    self.unsupported(&cx, block.opened.get(&cx, i).path);
+                if self.restricted(&cx, block.opened.at(&cx, i).path) {
+                    self.unsupported(&cx, block.opened.at(&cx, i).path);
                 }
                 i = i + 1usize;
             }
             i = 0usize;
             while i < block.instrs.len(&cx) {
-                let ins = block.instrs.get(&cx, i);
+                let ins = block.instrs.at(&cx, i);
                 var k = 0usize;
                 while k < ins.args.len(&cx) {
-                    let arg = ins.args.get(&cx, k);
+                    let arg = ins.args.at(&cx, k);
                     if self.restricted(&cx, arg) {
                         let path_operand = k == 0usize && (ins.op.is(&cx, "load") || ins.op.is(&cx, "store") || ins.op.is(&cx, "destruct"));
                         if !(path_operand || ins.op.is(&cx, "call") || ins.op.is(&cx, "trait_call")) {
@@ -205,51 +209,51 @@ impl Promotion['k] {
         }
     }
 
-    fn read(self, &cx: Cx!['k], w: Rewrite['k], path: Text['k]) -> Text['k] {
+    fn read(self, &cx: Domain!['k], w: Rewrite['k], path: Span['k]) -> Span['k] {
         match w.contents.get(&cx, path) {
             Option::Some(v) => v,
-            Option::None => self.r.fail(&cx, text_of(&cx, Buffer::new().push_static("locally branded value ").push_bytes(&cx, path).push_static(" is unavailable")), self.fun.pos),
+            Option::None => self.r.fail(&cx, Buffer::new().push_static("locally branded value ").push_bytes(&cx, path).push_static(" is unavailable").save(&cx), self.fun.pos),
         }
     }
 
-    fn install(self, &cx: Cx!['k], w: Rewrite['k], path: Text['k], operand: Text['k]) {
+    fn install(self, &cx: Domain!['k], w: Rewrite['k], path: Span['k], operand: Span['k]) {
         match self.shapes.get(&cx, path) {
             Option::Some(children) => {
-                let names: Seq[Text['k], 'k] = Seq::new(&cx);
+                let names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
                 var k = 0usize;
                 while k < children.len(&cx) {
                     names.push(&cx, self.fresh(&cx));
                     k = k + 1usize;
                 }
-                w.instructions.push(&cx, instr(&cx, names, "destruct", Seq::one(&cx, operand), Option::Some.(self.path_types.at(&cx, path)), self.fun.pos));
+                w.instructions.push(&cx, instr(&cx, names, "destruct", ArenaVec::one(&cx, operand), Option::Some.(self.path_types.at(&cx, path)), self.fun.pos));
                 k = 0usize;
                 while k < children.len(&cx) {
-                    self.install(&cx, w, children.get(&cx, k).name, names.get(&cx, k));
+                    self.install(&cx, w, children.at(&cx, k).name, names.at(&cx, k));
                     k = k + 1usize;
                 }
             },
-            Option::None => w.contents.set(&cx, path, operand),
+            Option::None => { w.contents.insert(&cx, path, operand); },
         }
     }
 
-    fn extract(self, &cx: Cx!['k], w: Rewrite['k], path: Text['k], copy: bool) -> Text['k] {
+    fn extract(self, &cx: Domain!['k], w: Rewrite['k], path: Span['k], copy: bool) -> Span['k] {
         match self.shapes.get(&cx, path) {
             Option::Some(children) => {
-                let names: Seq[Text['k], 'k] = Seq::new(&cx);
+                let names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
                 var k = 0usize;
                 while k < children.len(&cx) {
-                    names.push(&cx, self.extract(&cx, w, children.get(&cx, k).name, copy));
+                    names.push(&cx, self.extract(&cx, w, children.at(&cx, k).name, copy));
                     k = k + 1usize;
                 }
                 let name = self.fresh(&cx);
-                w.instructions.push(&cx, instr(&cx, Seq::one(&cx, name), "construct", names, Option::Some.(self.path_types.at(&cx, path)), self.fun.pos));
+                w.instructions.push(&cx, instr(&cx, ArenaVec::one(&cx, name), "construct", names, Option::Some.(self.path_types.at(&cx, path)), self.fun.pos));
                 name
             },
             Option::None => {
                 let name = self.read(&cx, w, path);
                 if copy {
                     let copied = self.fresh(&cx);
-                    w.instructions.push(&cx, instr(&cx, Seq::one(&cx, copied), "copy", Seq::one(&cx, name), Option::None, self.fun.pos));
+                    w.instructions.push(&cx, instr(&cx, ArenaVec::one(&cx, copied), "copy", ArenaVec::one(&cx, name), Option::None, self.fun.pos));
                     return copied;
                 }
                 w.contents.remove(&cx, path);
@@ -258,74 +262,74 @@ impl Promotion['k] {
         }
     }
 
-    fn value(self, &cx: Cx!['k], w: Rewrite['k], name: Text['k]) -> Text['k] {
-        if name.starts_with(&cx, text(&cx, "&*")) {
-            let inner = name.from(2usize);
-            return text_of(&cx, Buffer::new().push_static("&*").push_bytes(&cx, w.aliases.get_or(&cx, inner, inner)));
+    fn value(self, &cx: Domain!['k], w: Rewrite['k], name: Span['k]) -> Span['k] {
+        if name.starts_with(&cx, Span::from_static(&cx, "&*")) {
+            let inner = name.skip(2usize);
+            return Buffer::new().push_static("&*").push_bytes(&cx, w.aliases.get_or(&cx, inner, inner)).save(&cx);
         }
         w.aliases.get_or(&cx, name, name)
     }
 
-    fn param_types(self, &cx: Cx!['k], ins: Instr['k], indirect: bool) -> Seq[Type['k], 'k] {
+    fn param_types(self, &cx: Domain!['k], ins: Instr['k], indirect: bool) -> ArenaVec[Type['k], 'k] {
         let program = self.types.program;
-        let callee = ins.args.get(&cx, 0usize);
+        let callee = ins.args.at(&cx, 0usize);
         let (names, types) = if ins.op.is(&cx, "trait_call") {
             let t = program.traits.at(&cx, callee);
             var found: Option[C::Method['k]] = Option::None;
             var m = 0usize;
             while found.is_none() && m < t.methods.len(&cx) {
-                if t.methods.get(&cx, m).name.eq(&cx, ins.args.get(&cx, 1usize)) {
-                    found = Option::Some.(t.methods.get(&cx, m));
+                if t.methods.at(&cx, m).name.eq(&cx, ins.args.at(&cx, 1usize)) {
+                    found = Option::Some.(t.methods.at(&cx, m));
                 }
                 m = m + 1usize;
             }
             let method = match found {
                 Option::Some(x) => x,
-                Option::None => self.r.fail(&cx, text(&cx, "internal error: an unknown trait method"), ins.pos),
+                Option::None => self.r.fail(&cx, Span::from_static(&cx, "internal error: an unknown trait method"), ins.pos),
             };
             (t.params, method.ptypes)
         } else if indirect {
             match self.value_types.at(&cx, callee) {
                 Type::Fn(f) => {
-                    let names: Seq[Text['k], 'k] = Seq::new(&cx);
+                    let names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
                     var k = 0usize;
                     while k < f.quantified.len(&cx) {
-                        names.push(&cx, f.quantified.get(&cx, k).name);
+                        names.push(&cx, f.quantified.at(&cx, k).name);
                         k = k + 1usize;
                     }
                     (names, f.params)
                 },
-                _ => self.r.fail(&cx, text(&cx, "internal error: an indirect callee is not a function"), ins.pos),
+                _ => self.r.fail(&cx, Span::from_static(&cx, "internal error: an indirect callee is not a function"), ins.pos),
             }
         } else {
             match program.externs.get(&cx, callee) {
                 Option::Some(x) => {
                     return match x.ptypes {
                         Option::Some(ts) => ts,
-                        Option::None => Seq::new(&cx),
+                        Option::None => ArenaVec::new(&cx),
                     };
                 },
                 Option::None => (),
             };
             let target = program.funs.at(&cx, callee);
-            let names: Seq[Text['k], 'k] = Seq::new(&cx);
+            let names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
             var k = 0usize;
             while k < target.params.len(&cx) {
-                names.push(&cx, target.params.get(&cx, k).name);
+                names.push(&cx, target.params.at(&cx, k).name);
                 k = k + 1usize;
             }
             (names, target.ptypes)
         };
-        let sub: Map[Text['k], Type['k], 'k] = Map::new(&cx);
+        let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
         var k = 0usize;
         while k < names.len(&cx) && k < ins.tys.len(&cx) {
-            sub.set(&cx, names.get(&cx, k), ins.tys.get(&cx, k));
+            sub.insert(&cx, names.at(&cx, k), ins.tys.at(&cx, k));
             k = k + 1usize;
         }
-        let out: Seq[Type['k], 'k] = Seq::new(&cx);
+        let out: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         k = 0usize;
         while k < types.len(&cx) {
-            out.push(&cx, subst(&cx, types.get(&cx, k), sub, self.counter));
+            out.push(&cx, subst(&cx, types.at(&cx, k), sub, self.counter));
             k = k + 1usize;
         }
         out
@@ -333,14 +337,14 @@ impl Promotion['k] {
 
     // A call lending a branded place: a generic helper takes the place's contents by value, lends
     // them to the callee from its own slot, and hands them back with the result.
-    fn adapt_call(self, &cx: Cx!['k], w: Rewrite['k], ins: Instr['k]) {
+    fn adapt_call(self, &cx: Domain!['k], w: Rewrite['k], ins: Instr['k]) {
         let offset = if ins.op.is(&cx, "trait_call") { 2usize } else { 1usize };
-        let operands = ins.args.from(&cx, offset);
-        let borrowed: Seq[usize, 'k] = Seq::new(&cx);
-        let paths: Seq[Text['k], 'k] = Seq::new(&cx);
+        let operands = ins.args.skip(&cx, offset);
+        let borrowed: ArenaVec[usize, 'k] = ArenaVec::new(&cx);
+        let paths: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         var k = 0usize;
         while k < operands.len(&cx) {
-            let p = operands.get(&cx, k);
+            let p = operands.at(&cx, k);
             if self.restricted(&cx, p) {
                 borrowed.push(&cx, k);
             }
@@ -353,68 +357,68 @@ impl Promotion['k] {
         while k < paths.len(&cx) {
             var j = k + 1usize;
             while j < paths.len(&cx) {
-                if overlap(&cx, paths.get(&cx, k), paths.get(&cx, j)) {
-                    self.r.fail(&cx, text(&cx, "lent places overlap"), ins.pos);
+                if overlap(&cx, paths.at(&cx, k), paths.at(&cx, j)) {
+                    self.r.fail(&cx, Span::from_static(&cx, "lent places overlap"), ins.pos);
                 }
                 j = j + 1usize;
             }
             k = k + 1usize;
         }
-        let indirect = ins.op.is(&cx, "call") && ins.args.get(&cx, 0usize).starts_with(&cx, text(&cx, "%"));
+        let indirect = ins.op.is(&cx, "call") && ins.args.at(&cx, 0usize).starts_with(&cx, Span::from_static(&cx, "%"));
         let ptypes = self.param_types(&cx, ins, indirect);
-        let result = self.value_types.at(&cx, ins.lhs.get(&cx, 0usize));
-        let generic = self.params.copy(&cx);
+        let result = self.value_types.at(&cx, ins.lhs.at(&cx, 0usize));
+        let generic = self.params.clone(&cx);
         k = 0usize;
         while k < w.brands.len(&cx) {
-            generic.push(&cx, Param.{ name: w.brands.get(&cx, k), kind: Kind::Brand });
+            generic.push(&cx, Param.{ name: w.brands.at(&cx, k), kind: Kind::Brand });
             k = k + 1usize;
         }
-        var name = text_of(&cx, Buffer::new().push_bytes(&cx, self.fun.name).push_static("#lend").push_bytes(&cx, self.fresh(&cx).from(1usize)));
-        while self.types.program.funs.has(&cx, name) {
-            name = text_of(&cx, Buffer::new().push_bytes(&cx, name).push_static("_"));
+        var name = Buffer::new().push_bytes(&cx, self.fun.name).push_static("#lend").push_bytes(&cx, self.fresh(&cx).skip(1usize)).save(&cx);
+        while self.types.program.funs.contains(&cx, name) {
+            name = Buffer::new().push_bytes(&cx, name).push_static("_").save(&cx);
         }
-        let argument_names: Seq[Text['k], 'k] = Seq::new(&cx);
+        let argument_names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         k = 0usize;
         while k < operands.len(&cx) {
-            let p = operands.get(&cx, k);
-            argument_names.push(&cx, text_of(&cx, Buffer::new().push_static(if p.starts_with(&cx, text(&cx, "&")) && !self.restricted(&cx, p) { "&a" } else { "%a" }).push_usize(k)));
+            let p = operands.at(&cx, k);
+            argument_names.push(&cx, Buffer::new().push_static(if p.starts_with(&cx, Span::from_static(&cx, "&")) && !self.restricted(&cx, p) { "&a" } else { "%a" }).push_usize(k).save(&cx));
             k = k + 1usize;
         }
-        let bindings: Seq[Binding['k], 'k] = Seq::new(&cx);
+        let bindings: ArenaVec[Binding['k], 'k] = ArenaVec::new(&cx);
         k = 0usize;
         while k < argument_names.len(&cx) && k < ptypes.len(&cx) {
-            bindings.push(&cx, Binding.{ name: argument_names.get(&cx, k), type: ptypes.get(&cx, k) });
+            bindings.push(&cx, Binding.{ name: argument_names.at(&cx, k), type: ptypes.at(&cx, k) });
             k = k + 1usize;
         }
-        let actuals: Seq[Text['k], 'k] = Seq::new(&cx);
+        let actuals: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         k = 0usize;
         while k < operands.len(&cx) {
-            let p = operands.get(&cx, k);
+            let p = operands.at(&cx, k);
             actuals.push(&cx, if self.restricted(&cx, p) { self.extract(&cx, w, p, false) } else { p });
             k = k + 1usize;
         }
         var head = ins.args.slice(&cx, 0usize, offset);
         if indirect {
-            bindings.insert(&cx, 0usize, Binding.{ name: text(&cx, "%callee"), type: self.value_types.at(&cx, ins.args.get(&cx, 0usize)) });
-            actuals.insert(&cx, 0usize, ins.args.get(&cx, 0usize));
-            head = Seq::one(&cx, text(&cx, "%callee"));
+            bindings.insert(&cx, 0usize, Binding.{ name: Span::from_static(&cx, "%callee"), type: self.value_types.at(&cx, ins.args.at(&cx, 0usize)) });
+            actuals.insert(&cx, 0usize, ins.args.at(&cx, 0usize));
+            head = ArenaVec::one(&cx, Span::from_static(&cx, "%callee"));
         }
-        let locals: Seq[Binding['k], 'k] = Seq::new(&cx);
-        let body: Seq[Instr['k], 'k] = Seq::new(&cx);
-        let forwarded = argument_names.copy(&cx);
+        let locals: ArenaVec[Binding['k], 'k] = ArenaVec::new(&cx);
+        let body: ArenaVec[Instr['k], 'k] = ArenaVec::new(&cx);
+        let forwarded = argument_names.clone(&cx);
         k = 0usize;
         while k < borrowed.len(&cx) {
-            let b = borrowed.get(&cx, k);
-            let slot = text_of(&cx, Buffer::new().push_static("&slot").push_usize(b));
-            locals.push(&cx, Binding.{ name: slot, type: ptypes.get(&cx, b) });
-            body.push(&cx, instr(&cx, Seq::one(&cx, text_of(&cx, Buffer::new().push_static("%unit").push_usize(b))), "store", Seq::two(&cx, slot, argument_names.get(&cx, b)), Option::None, ins.pos));
+            let b = borrowed.at(&cx, k);
+            let slot = Buffer::new().push_static("&slot").push_usize(b).save(&cx);
+            locals.push(&cx, Binding.{ name: slot, type: ptypes.at(&cx, b) });
+            body.push(&cx, instr(&cx, ArenaVec::one(&cx, Buffer::new().push_static("%unit").push_usize(b).save(&cx)), "store", ArenaVec::two(&cx, slot, argument_names.at(&cx, b)), Option::None, ins.pos));
             forwarded.set(&cx, b, slot);
             k = k + 1usize;
         }
-        let call_args = head.copy(&cx);
+        let call_args = head.clone(&cx);
         call_args.append(&cx, forwarded);
-        body.push(&cx, Instr.{ lhs: Seq::one(&cx, text(&cx, "%result")), op: ins.op, args: call_args, ty: Option::None, tys: ins.tys,
-            lit: Option::None, is_unsafe: ins.is_unsafe, binders: Seq::new(&cx), pos: ins.pos });
+        body.push(&cx, Instr.{ lhs: ArenaVec::one(&cx, Span::from_static(&cx, "%result")), op: ins.op, args: call_args, ty: Option::None, tys: ins.tys,
+            lit: Option::None, is_unsafe: ins.is_unsafe, binders: ArenaVec::new(&cx), pos: ins.pos });
         let never = match result {
             Type::Never => true,
             _ => false,
@@ -422,76 +426,76 @@ impl Promotion['k] {
         let (ret, term) = if never {
             (result, Terminator::Unreachable.(ins.pos))
         } else {
-            let restored: Seq[Text['k], 'k] = Seq::new(&cx);
-            let elems: Seq[Type['k], 'k] = Seq::new(&cx);
+            let restored: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+            let elems: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
             k = 0usize;
             while k < borrowed.len(&cx) {
-                let b = borrowed.get(&cx, k);
-                let n = text_of(&cx, Buffer::new().push_static("%restored").push_usize(b));
+                let b = borrowed.at(&cx, k);
+                let n = Buffer::new().push_static("%restored").push_usize(b).save(&cx);
                 restored.push(&cx, n);
-                elems.push(&cx, ptypes.get(&cx, b));
-                body.push(&cx, instr(&cx, Seq::one(&cx, n), "load", Seq::one(&cx, text_of(&cx, Buffer::new().push_static("&slot").push_usize(b))), Option::None, ins.pos));
+                elems.push(&cx, ptypes.at(&cx, b));
+                body.push(&cx, instr(&cx, ArenaVec::one(&cx, n), "load", ArenaVec::one(&cx, Buffer::new().push_static("&slot").push_usize(b).save(&cx)), Option::None, ins.pos));
                 k = k + 1usize;
             }
             elems.push(&cx, result);
             let ret = Type::Tuple.(elems);
-            restored.push(&cx, text(&cx, "%result"));
-            body.push(&cx, instr(&cx, Seq::one(&cx, text(&cx, "%out")), "construct", restored, Option::Some.(ret), ins.pos));
-            (ret, Terminator::Ret.(text(&cx, "%out"), ins.pos))
+            restored.push(&cx, Span::from_static(&cx, "%result"));
+            body.push(&cx, instr(&cx, ArenaVec::one(&cx, Span::from_static(&cx, "%out")), "construct", restored, Option::Some.(ret), ins.pos));
+            (ret, Terminator::Ret.(Span::from_static(&cx, "%out"), ins.pos))
         };
-        let ptys: Seq[Type['k], 'k] = Seq::new(&cx);
+        let ptys: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         k = 0usize;
         while k < bindings.len(&cx) {
-            ptys.push(&cx, bindings.get(&cx, k).type);
+            ptys.push(&cx, bindings.at(&cx, k).type);
             k = k + 1usize;
         }
-        let entry = Block.{ label: text(&cx, "entry"), params: bindings, instrs: body, term, brands: Seq::new(&cx), empty: Seq::new(&cx),
-            known: Seq::new(&cx), opened: Seq::new(&cx), pos: Pos.{ line: 0u32, col: 0u32 } };
-        self.helpers.push(&cx, Fun.{ name, params: generic, premises: self.premises, ret, ptypes: ptys, blocks: Seq::one(&cx, entry), locals,
+        let entry = Block.{ label: Span::from_static(&cx, "entry"), params: bindings, instrs: body, term, brands: ArenaVec::new(&cx), empty: ArenaVec::new(&cx),
+            known: ArenaVec::new(&cx), opened: ArenaVec::new(&cx), pos: Pos.{ line: 0u32, col: 0u32 } };
+        self.helpers.push(&cx, Fun.{ name, params: generic, premises: self.premises, ret, ptypes: ptys, blocks: ArenaVec::one(&cx, entry), locals,
             is_unsafe: self.fun.is_unsafe || ins.is_unsafe, home: self.fun.home, pos: ins.pos });
-        let tys: Seq[Type['k], 'k] = Seq::new(&cx);
+        let tys: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         k = 0usize;
         while k < generic.len(&cx) {
-            let p = generic.get(&cx, k);
-            tys.push(&cx, if C::same_kind(p.kind, Kind::Brand) { Type::Skolem.(p.name) } else { Type::Named.(p.name, Seq::new(&cx)) });
+            let p = generic.at(&cx, k);
+            tys.push(&cx, if C::same_kind(p.kind, Kind::Brand) { Type::Skolem.(p.name) } else { Type::Named.(p.name, ArenaVec::new(&cx)) });
             k = k + 1usize;
         }
-        let call_args = Seq::one(&cx, name);
+        let call_args = ArenaVec::one(&cx, name);
         call_args.append(&cx, actuals);
         if never {
-            w.instructions.push(&cx, Instr.{ lhs: ins.lhs, op: text(&cx, "call"), args: call_args, ty: Option::None, tys, lit: Option::None,
-                is_unsafe: ins.is_unsafe, binders: Seq::new(&cx), pos: ins.pos });
+            w.instructions.push(&cx, Instr.{ lhs: ins.lhs, op: Span::from_static(&cx, "call"), args: call_args, ty: Option::None, tys, lit: Option::None,
+                is_unsafe: ins.is_unsafe, binders: ArenaVec::new(&cx), pos: ins.pos });
             return;
         }
         let output = self.fresh(&cx);
-        w.instructions.push(&cx, Instr.{ lhs: Seq::one(&cx, output), op: text(&cx, "call"), args: call_args, ty: Option::None, tys, lit: Option::None,
-            is_unsafe: ins.is_unsafe, binders: Seq::new(&cx), pos: ins.pos });
-        let replacements: Seq[Text['k], 'k] = Seq::new(&cx);
+        w.instructions.push(&cx, Instr.{ lhs: ArenaVec::one(&cx, output), op: Span::from_static(&cx, "call"), args: call_args, ty: Option::None, tys, lit: Option::None,
+            is_unsafe: ins.is_unsafe, binders: ArenaVec::new(&cx), pos: ins.pos });
+        let replacements: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         k = 0usize;
         while k < borrowed.len(&cx) {
             replacements.push(&cx, self.fresh(&cx));
             k = k + 1usize;
         }
-        let lhs = replacements.copy(&cx);
+        let lhs = replacements.clone(&cx);
         lhs.append(&cx, ins.lhs);
-        w.instructions.push(&cx, instr(&cx, lhs, "destruct", Seq::one(&cx, output), Option::Some.(ret), ins.pos));
+        w.instructions.push(&cx, instr(&cx, lhs, "destruct", ArenaVec::one(&cx, output), Option::Some.(ret), ins.pos));
         k = 0usize;
         while k < borrowed.len(&cx) {
-            self.install(&cx, w, operands.get(&cx, borrowed.get(&cx, k)), replacements.get(&cx, k));
+            self.install(&cx, w, operands.at(&cx, borrowed.at(&cx, k)), replacements.at(&cx, k));
             k = k + 1usize;
         }
     }
 
-    fn edge(self, &cx: Cx!['k], w: Rewrite['k], incoming: Map[Text['k], Map[Text['k], Text['k], 'k], 'k], e: Edge['k]) {
+    fn edge(self, &cx: Domain!['k], w: Rewrite['k], incoming: ArenaMap[Span['k], ArenaMap[Span['k], Span['k], 'k], 'k], e: Edge['k]) {
         var k = 0usize;
         while k < e.args.len(&cx) {
-            e.args.set(&cx, k, self.value(&cx, w, e.args.get(&cx, k)));
+            e.args.set(&cx, k, self.value(&cx, w, e.args.at(&cx, k)));
             k = k + 1usize;
         }
         let wanted = incoming.at(&cx, e.target);
         k = 0usize;
         while k < wanted.positions(&cx) {
-            match wanted.entry(&cx, k) {
+            match wanted.key_at(&cx, k) {
                 Option::Some(p) => e.args.push(&cx, self.read(&cx, w, p)),
                 Option::None => (),
             };
@@ -499,32 +503,32 @@ impl Promotion['k] {
         }
     }
 
-    fn rewrite(self, &cx: Cx!['k], b: usize, incoming: Map[Text['k], Map[Text['k], Text['k], 'k], 'k]) {
-        let block = self.fun.blocks.get(&cx, b);
-        let w = Rewrite.{ contents: incoming.at(&cx, block.label).copy(&cx), aliases: Map::new(&cx), instructions: Seq::new(&cx), brands: block.brands.copy(&cx) };
+    fn rewrite(self, &cx: Domain!['k], b: usize, incoming: ArenaMap[Span['k], ArenaMap[Span['k], Span['k], 'k], 'k]) {
+        let block = self.fun.blocks.at(&cx, b);
+        let w = Rewrite.{ contents: incoming.at(&cx, block.label).clone(&cx), aliases: ArenaMap::new(&cx), instructions: ArenaVec::new(&cx), brands: block.brands.clone(&cx) };
         var i = 0usize;
         while i < block.instrs.len(&cx) {
-            let ins = block.instrs.get(&cx, i);
+            let ins = block.instrs.at(&cx, i);
             var k = 0usize;
             while k < ins.args.len(&cx) {
-                ins.args.set(&cx, k, self.value(&cx, w, ins.args.get(&cx, k)));
+                ins.args.set(&cx, k, self.value(&cx, w, ins.args.at(&cx, k)));
                 k = k + 1usize;
             }
             if ins.op.is(&cx, "open") {
                 w.brands.append(&cx, ins.binders);
             }
-            let first = if ins.args.is_empty(&cx) { text(&cx, "") } else { ins.args.get(&cx, 0usize) };
+            let first = if ins.args.is_empty(&cx) { Span::from_static(&cx, "") } else { ins.args.at(&cx, 0usize) };
             if ins.op.is(&cx, "store") && self.restricted(&cx, first) {
-                self.install(&cx, w, first, ins.args.get(&cx, 1usize));
-                w.instructions.push(&cx, instr(&cx, ins.lhs, "construct", Seq::new(&cx), Option::Some.(C::unit(&cx)), ins.pos));
+                self.install(&cx, w, first, ins.args.at(&cx, 1usize));
+                w.instructions.push(&cx, instr(&cx, ins.lhs, "construct", ArenaVec::new(&cx), Option::Some.(C::unit(&cx)), ins.pos));
             } else if (ins.op.is(&cx, "load") || ins.op.is(&cx, "destruct")) && self.restricted(&cx, first) {
                 let operand = self.extract(&cx, w, first, self.types.is_copy(&cx, self.path_types.at(&cx, first), self.kinds));
                 if ins.op.is(&cx, "destruct") {
                     let { args: _old, ..rest } = ins;
-                    w.instructions.push(&cx, Instr.{ args: Seq::one(&cx, operand), ..rest });
+                    w.instructions.push(&cx, Instr.{ args: ArenaVec::one(&cx, operand), ..rest });
                 } else {
-                    w.aliases.set(&cx, ins.lhs.get(&cx, 0usize), operand);
-                    self.value_types.set(&cx, operand, self.path_types.at(&cx, first));
+                    w.aliases.insert(&cx, ins.lhs.at(&cx, 0usize), operand);
+                    self.value_types.insert(&cx, operand, self.path_types.at(&cx, first));
                 }
             } else if (ins.op.is(&cx, "call") || ins.op.is(&cx, "trait_call")) && self.any_restricted(&cx, ins.args) {
                 self.adapt_call(&cx, w, ins);
@@ -551,18 +555,18 @@ impl Promotion['k] {
                 let scrutinee = self.value(&cx, w, s);
                 var k = 0usize;
                 while k < arms.len(&cx) {
-                    self.edge(&cx, w, incoming, arms.get(&cx, k).edge);
+                    self.edge(&cx, w, incoming, arms.at(&cx, k).edge);
                     k = k + 1usize;
                 }
                 Terminator::Switch.(scrutinee, t, arms, p)
             },
             Terminator::Unreachable(p) => Terminator::Unreachable.(p),
         };
-        let empty: Seq[Text['k], 'k] = Seq::new(&cx);
+        let empty: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         i = 0usize;
         while i < block.empty.len(&cx) {
-            if !self.restricted(&cx, block.empty.get(&cx, i)) {
-                empty.push(&cx, block.empty.get(&cx, i));
+            if !self.restricted(&cx, block.empty.at(&cx, i)) {
+                empty.push(&cx, block.empty.at(&cx, i));
             }
             i = i + 1usize;
         }
@@ -570,10 +574,10 @@ impl Promotion['k] {
         self.fun.blocks.set(&cx, b, Block.{ term, empty, ..rest });
     }
 
-    fn any_restricted(self, &cx: Cx!['k], args: Seq[Text['k], 'k]) -> bool {
+    fn any_restricted(self, &cx: Domain!['k], args: ArenaVec[Span['k], 'k]) -> bool {
         var k = 0usize;
         while k < args.len(&cx) {
-            if self.restricted(&cx, args.get(&cx, k)) {
+            if self.restricted(&cx, args.at(&cx, k)) {
                 return true;
             }
             k = k + 1usize;
@@ -586,97 +590,97 @@ impl Promotion['k] {
 // instance's first) to SSA values, in place, and returns the lending helpers this needs.
 // `value_types` holds the types of `fun`'s SSA values.
 forall 'k.
-fn promote_locals(&cx: Cx!['k], fun: Fun['k], types: Types['k], params: Seq[Param['k], 'k], premises: Seq[Premise['k], 'k], value_types: Map[Text['k], Type['k], 'k],
-                  r: Resolver['k], counter: Fresh['k]) -> Seq[Fun['k], 'k] {
-    let allowed: Set[Text['k], 'k] = Set::new(&cx);
-    let kinds: Map[Text['k], Kind, 'k] = Map::new(&cx);
+fn promote_locals(&cx: Domain!['k], fun: Fun['k], types: Types['k], params: ArenaVec[Param['k], 'k], premises: ArenaVec[Premise['k], 'k], value_types: ArenaMap[Span['k], Type['k], 'k],
+                  r: Resolver['k], counter: Fresh['k]) -> ArenaVec[Fun['k], 'k] {
+    let allowed: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+    let kinds: ArenaMap[Span['k], Kind, 'k] = ArenaMap::new(&cx);
     var i = 0usize;
     while i < params.len(&cx) {
-        if C::same_kind(params.get(&cx, i).kind, Kind::Brand) {
-            allowed.add(&cx, params.get(&cx, i).name);
+        if C::same_kind(params.at(&cx, i).kind, Kind::Brand) {
+            allowed.insert(&cx, params.at(&cx, i).name);
         }
-        kinds.set(&cx, params.get(&cx, i).name, params.get(&cx, i).kind);
+        kinds.insert(&cx, params.at(&cx, i).name, params.at(&cx, i).kind);
         i = i + 1usize;
     }
-    let roots: Map[Text['k], Type['k], 'k] = Map::new(&cx);
+    let roots: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
     i = 0usize;
     while i < fun.locals.len(&cx) {
-        let brands = free_brands(&cx, fun.locals.get(&cx, i).type).items(&cx);
+        let brands = free_brands(&cx, fun.locals.at(&cx, i).type).keys(&cx);
         var k = 0usize;
         var outside = false;
         while k < brands.len(&cx) {
-            outside = outside || !allowed.has(&cx, brands.get(&cx, k));
+            outside = outside || !allowed.contains(&cx, brands.at(&cx, k));
             k = k + 1usize;
         }
         if outside {
-            roots.set(&cx, fun.locals.get(&cx, i).name, fun.locals.get(&cx, i).type);
+            roots.insert(&cx, fun.locals.at(&cx, i).name, fun.locals.at(&cx, i).type);
         }
         i = i + 1usize;
     }
     if roots.is_empty(&cx) {
-        return Seq::new(&cx);
+        return ArenaVec::new(&cx);
     }
-    let taken: Set[Text['k], 'k] = Set::new(&cx);
+    let taken: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
     i = 0usize;
     while i < fun.blocks.len(&cx) {
-        let block = fun.blocks.get(&cx, i);
+        let block = fun.blocks.at(&cx, i);
         var k = 0usize;
         while k < block.params.len(&cx) {
-            taken.add(&cx, block.params.get(&cx, k).name);
+            taken.insert(&cx, block.params.at(&cx, k).name);
             k = k + 1usize;
         }
         k = 0usize;
         while k < block.instrs.len(&cx) {
-            let lhs = block.instrs.get(&cx, k).lhs;
+            let lhs = block.instrs.at(&cx, k).lhs;
             var j = 0usize;
             while j < lhs.len(&cx) {
-                taken.add(&cx, lhs.get(&cx, j));
+                taken.insert(&cx, lhs.at(&cx, j));
                 j = j + 1usize;
             }
             k = k + 1usize;
         }
         i = i + 1usize;
     }
-    let p = Promotion.{ fun, types, r, counter, params, premises, value_types, roots, kinds, taken, serial: Cell::new(&cx, 0u64),
-        helpers: Seq::new(&cx), shapes: Map::new(&cx), path_types: roots.copy(&cx) };
+    let p = Promotion.{ fun, types, r, counter, params, premises, value_types, roots, kinds, taken, serial: Ref::new(&cx, 0u64),
+        helpers: ArenaVec::new(&cx), shapes: ArenaMap::new(&cx), path_types: roots.clone(&cx) };
     p.validate(&cx);
     // the leaf paths: those not decomposed further
-    let leaves: Map[Text['k], Type['k], 'k] = Map::new(&cx);
+    let leaves: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
     let paths = p.path_types.keys(&cx);
     i = 0usize;
     while i < paths.len(&cx) {
-        if !p.shapes.has(&cx, paths.get(&cx, i)) {
-            leaves.set(&cx, paths.get(&cx, i), p.path_types.at(&cx, paths.get(&cx, i)));
+        if !p.shapes.contains(&cx, paths.at(&cx, i)) {
+            leaves.insert(&cx, paths.at(&cx, i), p.path_types.at(&cx, paths.at(&cx, i)));
         }
         i = i + 1usize;
     }
     // the SSA parameter that brings each leaf's contents into each block
-    let incoming: Map[Text['k], Map[Text['k], Text['k], 'k], 'k] = Map::new(&cx);
+    let incoming: ArenaMap[Span['k], ArenaMap[Span['k], Span['k], 'k], 'k] = ArenaMap::new(&cx);
     let leaf_paths = leaves.keys(&cx);
     i = 0usize;
     while i < fun.blocks.len(&cx) {
-        let block = fun.blocks.get(&cx, i);
-        let contents: Map[Text['k], Text['k], 'k] = Map::new(&cx);
+        let block = fun.blocks.at(&cx, i);
+        let contents: ArenaMap[Span['k], Span['k], 'k] = ArenaMap::new(&cx);
         if i > 0usize {
             var k = 0usize;
             while k < leaf_paths.len(&cx) {
-                let leaf = leaf_paths.get(&cx, k);
+                let leaf = leaf_paths.at(&cx, k);
                 var emptied = false;
                 var z = 0usize;
                 while !emptied && z < block.empty.len(&cx) {
-                    let e = block.empty.get(&cx, z);
-                    emptied = leaf.eq(&cx, e) || leaf.starts_with(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, e).push_static(".")));
+                    let e = block.empty.at(&cx, z);
+                    emptied = leaf.eq(&cx, e) || leaf.starts_with(&cx, Buffer::new().push_bytes(&cx, e).push_static(".").save(&cx));
                     z = z + 1usize;
                 }
                 if !emptied {
                     let v = p.fresh(&cx);
-                    contents.set(&cx, leaf, v);
+                    contents.insert(&cx, leaf, v);
                     block.params.push(&cx, Binding.{ name: v, type: leaves.at(&cx, leaf) });
                 }
                 k = k + 1usize;
             }
         }
-        incoming.set(&cx, block.label, contents);
+        incoming.insert(&cx, block.label, contents);
         i = i + 1usize;
     }
     i = 0usize;
@@ -684,11 +688,11 @@ fn promote_locals(&cx: Cx!['k], fun: Fun['k], types: Types['k], params: Seq[Para
         p.rewrite(&cx, i, incoming);
         i = i + 1usize;
     }
-    let kept: Seq[Binding['k], 'k] = Seq::new(&cx);
+    let kept: ArenaVec[Binding['k], 'k] = ArenaVec::new(&cx);
     i = 0usize;
     while i < fun.locals.len(&cx) {
-        if !roots.has(&cx, fun.locals.get(&cx, i).name) {
-            kept.push(&cx, fun.locals.get(&cx, i));
+        if !roots.contains(&cx, fun.locals.at(&cx, i).name) {
+            kept.push(&cx, fun.locals.at(&cx, i));
         }
         i = i + 1usize;
     }

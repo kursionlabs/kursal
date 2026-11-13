@@ -3,7 +3,10 @@
 // The inference variable is `core::Meta` (`Type::Meta`): its kind is type, int, float or brand,
 // and solving it sets its solution.
 
-use package::support::base::{Cx, Map, Seq, Set, Text, text};
+use std::collections::arena_vec::ArenaVec;
+use std::collections::arena_map::{ArenaMap, ArenaSet};
+use std::raw::Span;
+use std::alloc::arena::Domain;
 use package::kurs::core::{FnType, Kind, Member, Meta, MetaKind, Param, Type};
 use package::kurs::core as C;
 use package::types::ops::{Fresh, extractable_names, foreach_binders, free_names, fresh, map_children, subst, type_tag};
@@ -12,7 +15,7 @@ use std::collections::hashmap::{Found, OwnedMap};
 use std::option::Option;
 
 forall 'k.
-fn prune(&cx: Cx!['k], ty: Type['k]) -> Type['k] {
+fn prune(&cx: Domain!['k], ty: Type['k]) -> Type['k] {
     var ty = ty;
     var going = true;
     while going {
@@ -33,13 +36,13 @@ fn prune(&cx: Cx!['k], ty: Type['k]) -> Type['k] {
 
 // `ty` with every solved metavariable replaced by its solution.
 forall 'k.
-fn zonk(&cx: Cx!['k], ty: Type['k]) -> Type['k] {
+fn zonk(&cx: Domain!['k], ty: Type['k]) -> Type['k] {
     map_children(&cx, prune(&cx, ty), |&cx, child: Type['k]| zonk(&cx, child))
 }
 
 // `ty` mentions no unsolved metavariable.
 forall 'k.
-fn ground(&cx: Cx!['k], ty: Type['k]) -> bool {
+fn ground(&cx: Domain!['k], ty: Type['k]) -> bool {
     let ty = zonk(&cx, ty);
     match ty {
         Type::Meta(_m) => false,
@@ -48,7 +51,7 @@ fn ground(&cx: Cx!['k], ty: Type['k]) -> bool {
             var all = true;
             var i = 0usize;
             while all && i < parts.len(&cx) {
-                all = ground(&cx, parts.get(&cx, i));
+                all = ground(&cx, parts.at(&cx, i));
                 i = i + 1usize;
             }
             all
@@ -58,16 +61,16 @@ fn ground(&cx: Cx!['k], ty: Type['k]) -> bool {
 
 // A fresh metavariable for each type parameter (brand parameters get brand-kind ones).
 forall 'k.
-fn instantiate(&cx: Cx!['k], params: Seq[Param['k], 'k]) -> Map[Text['k], Type['k], 'k] {
-    let out: Map[Text['k], Type['k], 'k] = Map::new(&cx);
+fn instantiate(&cx: Domain!['k], params: ArenaVec[Param['k], 'k]) -> ArenaMap[Span['k], Type['k], 'k] {
+    let out: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
     var i = 0usize;
     while i < params.len(&cx) {
-        let p = params.get(&cx, i);
+        let p = params.at(&cx, i);
         let kind = match p.kind {
             Kind::Brand => MetaKind::Brand,
             _ => MetaKind::Type,
         };
-        out.set(&cx, p.name, Type::Meta.(Meta::new(&cx, kind)));
+        out.insert(&cx, p.name, Type::Meta.(Meta::new(&cx, kind)));
         i = i + 1usize;
     }
     out
@@ -82,7 +85,7 @@ fn is_meta(ty: Type['k], meta: Meta['k]) -> bool {
 }
 
 forall 'k.
-fn occurs(&cx: Cx!['k], meta: Meta['k], ty: Type['k]) -> bool {
+fn occurs(&cx: Domain!['k], meta: Meta['k], ty: Type['k]) -> bool {
     let ty = prune(&cx, ty);
     if is_meta(ty, meta) {
         return true;
@@ -91,14 +94,14 @@ fn occurs(&cx: Cx!['k], meta: Meta['k], ty: Type['k]) -> bool {
     var found = false;
     var i = 0usize;
     while !found && i < parts.len(&cx) {
-        found = occurs(&cx, meta, parts.get(&cx, i));
+        found = occurs(&cx, meta, parts.at(&cx, i));
         i = i + 1usize;
     }
     found
 }
 
 forall 'k.
-fn fits_kind(&cx: Cx!['k], kind: MetaKind, ty: Type['k]) -> bool {
+fn fits_kind(&cx: Domain!['k], kind: MetaKind, ty: Type['k]) -> bool {
     match kind {
         MetaKind::Int => match ty {
             Type::Prim(name) => C::is_integer(&cx, name),
@@ -134,8 +137,8 @@ fn is_type_kind(k: MetaKind) -> bool {
 
 // The unsolved variables reachable through a type, including premises; each once.
 forall 'k.
-fn metas(&cx: Cx!['k], ty: Type['k]) -> Seq[Meta['k], 'k] {
-    let out: Seq[Meta['k], 'k] = Seq::new(&cx);
+fn metas(&cx: Domain!['k], ty: Type['k]) -> ArenaVec[Meta['k], 'k] {
+    let out: ArenaVec[Meta['k], 'k] = ArenaVec::new(&cx);
     var seen = OwnedMap::new[usize, bool]();
     metas_into(&cx, ty, out, &seen);
     seen.free();
@@ -143,7 +146,7 @@ fn metas(&cx: Cx!['k], ty: Type['k]) -> Seq[Meta['k], 'k] {
 }
 
 forall 'k.
-fn metas_into(&cx: Cx!['k], ty: Type['k], out: Seq[Meta['k], 'k], &seen: OwnedMap![usize, bool]) {
+fn metas_into(&cx: Domain!['k], ty: Type['k], out: ArenaVec[Meta['k], 'k], &seen: OwnedMap![usize, bool]) {
     let ty = prune(&cx, ty);
     match ty {
         Type::Meta(m) => match &seen.insert(m.id(), true) {
@@ -154,7 +157,7 @@ fn metas_into(&cx: Cx!['k], ty: Type['k], out: Seq[Meta['k], 'k], &seen: OwnedMa
             let parts = T::children(&cx, ty);
             var i = 0usize;
             while i < parts.len(&cx) {
-                metas_into(&cx, parts.get(&cx, i), out, &seen);
+                metas_into(&cx, parts.at(&cx, i), out, &seen);
                 i = i + 1usize;
             }
         },
@@ -162,36 +165,36 @@ fn metas_into(&cx: Cx!['k], ty: Type['k], out: Seq[Meta['k], 'k], &seen: OwnedMa
 }
 
 forall 'k.
-fn kinds_differ(&cx: Cx!['k], left: Seq[Param['k], 'k], right: Seq[Param['k], 'k]) -> bool {
+fn kinds_differ(&cx: Domain!['k], left: ArenaVec[Param['k], 'k], right: ArenaVec[Param['k], 'k]) -> bool {
     !T::same_kinds(&cx, left, right)
 }
 
 forall 'k.
-fn concat(&cx: Cx!['k], xs: Seq[Type['k], 'k], ys: Seq[Type['k], 'k]) -> Seq[Type['k], 'k] {
-    let out = xs.copy(&cx);
+fn concat(&cx: Domain!['k], xs: ArenaVec[Type['k], 'k], ys: ArenaVec[Type['k], 'k]) -> ArenaVec[Type['k], 'k] {
+    let out = xs.clone(&cx);
     out.append(&cx, ys);
     out
 }
 
 // Instance variables live outside binders; body inference variables may live inside.
 forall 'k.
-fn quantified(&cx: Cx!['k], left: Seq[Param['k], 'k], right: Seq[Param['k], 'k], xs: Seq[Type['k], 'k], ys: Seq[Type['k], 'k], closed: bool, counter: Fresh['k]) -> bool {
+fn quantified(&cx: Domain!['k], left: ArenaVec[Param['k], 'k], right: ArenaVec[Param['k], 'k], xs: ArenaVec[Type['k], 'k], ys: ArenaVec[Type['k], 'k], closed: bool, counter: Fresh['k]) -> bool {
     if kinds_differ(&cx, left, right) || xs.len(&cx) != ys.len(&cx) {
         return false;
     }
     if !closed {
-        let rename: Map[Text['k], Type['k], 'k] = Map::new(&cx);
+        let rename: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
         var i = 0usize;
         while i < left.len(&cx) && i < right.len(&cx) {
-            let p = left.get(&cx, i);
-            let q = right.get(&cx, i);
-            rename.set(&cx, q.name, rigid(&cx, p.kind, p.name));
+            let p = left.at(&cx, i);
+            let q = right.at(&cx, i);
+            rename.insert(&cx, q.name, rigid(&cx, p.kind, p.name));
             i = i + 1usize;
         }
         var all = true;
         var j = 0usize;
         while all && j < xs.len(&cx) {
-            all = unify(&cx, zonk(&cx, xs.get(&cx, j)), subst(&cx, zonk(&cx, ys.get(&cx, j)), rename, counter), false, counter);
+            all = unify(&cx, zonk(&cx, xs.at(&cx, j)), subst(&cx, zonk(&cx, ys.at(&cx, j)), rename, counter), false, counter);
             j = j + 1usize;
         }
         return all;
@@ -200,61 +203,61 @@ fn quantified(&cx: Cx!['k], left: Seq[Param['k], 'k], right: Seq[Param['k], 'k],
         var all = true;
         var j = 0usize;
         while all && j < xs.len(&cx) {
-            all = unify(&cx, xs.get(&cx, j), ys.get(&cx, j), true, counter);
+            all = unify(&cx, xs.at(&cx, j), ys.at(&cx, j), true, counter);
             j = j + 1usize;
         }
         return all;
     }
     let both = concat(&cx, xs, ys);
-    let variables: Seq[Meta['k], 'k] = Seq::new(&cx);
+    let variables: ArenaVec[Meta['k], 'k] = ArenaVec::new(&cx);
     var seen = OwnedMap::new[usize, bool]();
     var k = 0usize;
     while k < both.len(&cx) {
-        metas_into(&cx, both.get(&cx, k), variables, &seen);
+        metas_into(&cx, both.at(&cx, k), variables, &seen);
         k = k + 1usize;
     }
     seen.free();
-    let occupied: Set[Text['k], 'k] = Set::new(&cx);
+    let occupied: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
     var k2 = 0usize;
     while k2 < both.len(&cx) {
-        T::add_all(&cx, occupied, free_names(&cx, zonk(&cx, both.get(&cx, k2))));
+        T::add_all(&cx, occupied, free_names(&cx, zonk(&cx, both.at(&cx, k2))));
         k2 = k2 + 1usize;
     }
-    let labels: Seq[Text['k], 'k] = Seq::new(&cx);
+    let labels: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
     var n = 0usize;
     while n < left.len(&cx) {
-        var label = fresh(&cx, text(&cx, "rigid"), counter);
-        while occupied.has(&cx, label) {
-            label = fresh(&cx, text(&cx, "rigid"), counter);
+        var label = fresh(&cx, Span::from_static(&cx, "rigid"), counter);
+        while occupied.contains(&cx, label) {
+            label = fresh(&cx, Span::from_static(&cx, "rigid"), counter);
         }
         labels.push(&cx, label);
         n = n + 1usize;
     }
-    let a: Map[Text['k], Type['k], 'k] = Map::new(&cx);
-    let b: Map[Text['k], Type['k], 'k] = Map::new(&cx);
+    let a: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+    let b: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
     var r = 0usize;
     while r < left.len(&cx) {
-        let rigid_type = rigid(&cx, left.get(&cx, r).kind, labels.get(&cx, r));
-        a.set(&cx, left.get(&cx, r).name, rigid_type);
+        let rigid_type = rigid(&cx, left.at(&cx, r).kind, labels.at(&cx, r));
+        a.insert(&cx, left.at(&cx, r).name, rigid_type);
         if r < right.len(&cx) {
-            b.set(&cx, right.get(&cx, r).name, rigid_type);
+            b.insert(&cx, right.at(&cx, r).name, rigid_type);
         }
         r = r + 1usize;
     }
     var all = true;
     var j = 0usize;
     while all && j < xs.len(&cx) {
-        all = unify(&cx, subst(&cx, zonk(&cx, xs.get(&cx, j)), a, counter), subst(&cx, zonk(&cx, ys.get(&cx, j)), b, counter), true, counter);
+        all = unify(&cx, subst(&cx, zonk(&cx, xs.at(&cx, j)), a, counter), subst(&cx, zonk(&cx, ys.at(&cx, j)), b, counter), true, counter);
         j = j + 1usize;
     }
     if !all {
         return false;
     }
-    let label_set = T::with_names(&cx, Set::new(&cx), labels);
+    let label_set = T::with_names(&cx, ArenaSet::new(&cx), labels);
     var escaped = false;
     var v = 0usize;
     while !escaped && v < variables.len(&cx) {
-        escaped = T::overlap(&cx, free_names(&cx, zonk(&cx, Type::Meta.(variables.get(&cx, v)))), label_set);
+        escaped = T::overlap(&cx, free_names(&cx, zonk(&cx, Type::Meta.(variables.at(&cx, v)))), label_set);
         v = v + 1usize;
     }
     !escaped
@@ -262,41 +265,41 @@ fn quantified(&cx: Cx!['k], left: Seq[Param['k], 'k], right: Seq[Param['k], 'k],
 
 // A rigid stand-in for a quantified parameter: a brand label or a type variable.
 forall 'k.
-fn rigid(&cx: Cx!['k], kind: Kind, name: Text['k]) -> Type['k] {
+fn rigid(&cx: Domain!['k], kind: Kind, name: Span['k]) -> Type['k] {
     match kind {
         Kind::Brand => Type::Skolem.(name),
-        _ => C::named(name, Seq::new(&cx)),
+        _ => C::named(name, ArenaVec::new(&cx)),
     }
 }
 
 forall 'k.
-fn params_named(&cx: Cx!['k], names: Seq[Text['k], 'k], kind: Kind) -> Seq[Param['k], 'k] {
-    let out: Seq[Param['k], 'k] = Seq::new(&cx);
+fn params_named(&cx: Domain!['k], names: ArenaVec[Span['k], 'k], kind: Kind) -> ArenaVec[Param['k], 'k] {
+    let out: ArenaVec[Param['k], 'k] = ArenaVec::new(&cx);
     var i = 0usize;
     while i < names.len(&cx) {
-        out.push(&cx, Param.{ name: names.get(&cx, i), kind });
+        out.push(&cx, Param.{ name: names.at(&cx, i), kind });
         i = i + 1usize;
     }
     out
 }
 
 forall 'k.
-fn unify_all(&cx: Cx!['k], xs: Seq[Type['k], 'k], ys: Seq[Type['k], 'k], closed: bool, counter: Fresh['k]) -> bool {
+fn unify_all(&cx: Domain!['k], xs: ArenaVec[Type['k], 'k], ys: ArenaVec[Type['k], 'k], closed: bool, counter: Fresh['k]) -> bool {
     var ok = xs.len(&cx) == ys.len(&cx);
     var i = 0usize;
     while ok && i < xs.len(&cx) {
-        ok = unify(&cx, xs.get(&cx, i), ys.get(&cx, i), closed, counter);
+        ok = unify(&cx, xs.at(&cx, i), ys.at(&cx, i), closed, counter);
         i = i + 1usize;
     }
     ok
 }
 
 forall 'k.
-fn unify_members(&cx: Cx!['k], xs: Seq[Member['k], 'k], ys: Seq[Member['k], 'k], closed: bool, counter: Fresh['k]) -> bool {
+fn unify_members(&cx: Domain!['k], xs: ArenaVec[Member['k], 'k], ys: ArenaVec[Member['k], 'k], closed: bool, counter: Fresh['k]) -> bool {
     var ok = xs.len(&cx) == ys.len(&cx);
     var i = 0usize;
     while ok && i < xs.len(&cx) {
-        ok = xs.get(&cx, i).name.eq(&cx, ys.get(&cx, i).name) && unify(&cx, xs.get(&cx, i).type, ys.get(&cx, i).type, closed, counter);
+        ok = xs.at(&cx, i).name.eq(&cx, ys.at(&cx, i).name) && unify(&cx, xs.at(&cx, i).type, ys.at(&cx, i).type, closed, counter);
         i = i + 1usize;
     }
     ok
@@ -306,7 +309,7 @@ fn unify_members(&cx: Cx!['k], xs: Seq[Member['k], 'k], ys: Seq[Member['k], 'k],
 //
 // Two identical metavariables unify at once; any other pair is compared by structure.
 forall 'k.
-fn unify(&cx: Cx!['k], a: Type['k], b: Type['k], closed: bool, counter: Fresh['k]) -> bool {
+fn unify(&cx: Domain!['k], a: Type['k], b: Type['k], closed: bool, counter: Fresh['k]) -> bool {
     let a = prune(&cx, a);
     let b = prune(&cx, b);
     let unit = match a {
@@ -344,17 +347,17 @@ fn unify(&cx: Cx!['k], a: Type['k], b: Type['k], closed: bool, counter: Fresh['k
             _ => false,
         },
         Type::Exists(xs, p) => match b {
-            Type::Exists(ys, q) => quantified(&cx, params_named(&cx, xs, Kind::Brand), params_named(&cx, ys, Kind::Brand), Seq::one(&cx, p.get(&cx)), Seq::one(&cx, q.get(&cx)), closed, counter),
+            Type::Exists(ys, q) => quantified(&cx, params_named(&cx, xs, Kind::Brand), params_named(&cx, ys, Kind::Brand), ArenaVec::one(&cx, p.copy(&cx)), ArenaVec::one(&cx, q.copy(&cx)), closed, counter),
             _ => false,
         },
         Type::Foreach(x) => match b {
-            Type::Foreach(y) => x.indirect == y.indirect && unify(&cx, x.source.get(&cx), y.source.get(&cx), closed, counter)
-                && quantified(&cx, params_named(&cx, foreach_binders(&cx, x), Kind::Any), params_named(&cx, foreach_binders(&cx, y), Kind::Any), Seq::one(&cx, x.body.get(&cx)), Seq::one(&cx, y.body.get(&cx)), closed, counter),
+            Type::Foreach(y) => x.indirect == y.indirect && unify(&cx, x.source.copy(&cx), y.source.copy(&cx), closed, counter)
+                && quantified(&cx, params_named(&cx, foreach_binders(&cx, x), Kind::Any), params_named(&cx, foreach_binders(&cx, y), Kind::Any), ArenaVec::one(&cx, x.body.copy(&cx)), ArenaVec::one(&cx, y.body.copy(&cx)), closed, counter),
             _ => false,
         },
         Type::Fn(x) => match b {
             Type::Fn(y) => {
-                if x.params.len(&cx) != y.params.len(&cx) || !x.places.same(&cx, y.places) || x.is_unsafe != y.is_unsafe {
+                if x.params.len(&cx) != y.params.len(&cx) || !x.places.eq(&cx, y.places) || x.is_unsafe != y.is_unsafe {
                     return false;
                 }
                 quantified(&cx, x.quantified, y.quantified, with_ret(&cx, x), with_ret(&cx, y), closed, counter)
@@ -370,16 +373,16 @@ fn unify(&cx: Cx!['k], a: Type['k], b: Type['k], closed: bool, counter: Fresh['k
 }
 
 forall 'k.
-fn with_ret(&cx: Cx!['k], f: FnType['k]) -> Seq[Type['k], 'k] {
-    let out = f.params.copy(&cx);
-    out.push(&cx, f.ret.get(&cx));
+fn with_ret(&cx: Domain!['k], f: FnType['k]) -> ArenaVec[Type['k], 'k] {
+    let out = f.params.clone(&cx);
+    out.push(&cx, f.ret.copy(&cx));
     out
 }
 
 // Solves the variable `a` with `b`, which is not `a` itself. Of two variables, the less specific
 // is bound to the more specific one.
 forall 'k.
-fn solve(&cx: Cx!['k], a: Meta['k], b: Type['k]) -> bool {
+fn solve(&cx: Domain!['k], a: Meta['k], b: Type['k]) -> bool {
     match b {
         Type::Meta(other) => {
             var x = a;
@@ -411,11 +414,11 @@ fn solve(&cx: Cx!['k], a: Meta['k], b: Type['k]) -> bool {
 // binder-free occurrences contribute extracted parameters. KURS passes the full head and requires
 // every parameter to be extractable. Failure discards all tentative bindings.
 forall 'k.
-fn match_head(&cx: Cx!['k], params: Seq[Param['k], 'k], head: Seq[Type['k], 'k], query: Seq[Type['k], 'k], require_extractable: bool, counter: Fresh['k]) -> Option[Map[Text['k], Type['k], 'k]] {
-    let reachable: Set[Text['k], 'k] = Set::new(&cx);
+fn match_head(&cx: Domain!['k], params: ArenaVec[Param['k], 'k], head: ArenaVec[Type['k], 'k], query: ArenaVec[Type['k], 'k], require_extractable: bool, counter: Fresh['k]) -> Option[ArenaMap[Span['k], Type['k], 'k]] {
+    let reachable: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
     var i = 0usize;
     while i < head.len(&cx) {
-        T::add_all(&cx, reachable, extractable_names(&cx, head.get(&cx, i)));
+        T::add_all(&cx, reachable, extractable_names(&cx, head.at(&cx, i)));
         i = i + 1usize;
     }
     if head.len(&cx) != query.len(&cx) {
@@ -423,7 +426,7 @@ fn match_head(&cx: Cx!['k], params: Seq[Param['k], 'k], head: Seq[Type['k], 'k],
     }
     var j = 0usize;
     while j < query.len(&cx) {
-        if !ground(&cx, query.get(&cx, j)) {
+        if !ground(&cx, query.at(&cx, j)) {
             return Option::None;
         }
         j = j + 1usize;
@@ -431,7 +434,7 @@ fn match_head(&cx: Cx!['k], params: Seq[Param['k], 'k], head: Seq[Type['k], 'k],
     if require_extractable {
         var k = 0usize;
         while k < params.len(&cx) {
-            if !reachable.has(&cx, params.get(&cx, k).name) {
+            if !reachable.contains(&cx, params.at(&cx, k).name) {
                 return Option::None;
             }
             k = k + 1usize;
@@ -440,18 +443,18 @@ fn match_head(&cx: Cx!['k], params: Seq[Param['k], 'k], head: Seq[Type['k], 'k],
     let sub = instantiate(&cx, params);
     var m = 0usize;
     while m < head.len(&cx) {
-        if !unify(&cx, subst(&cx, head.get(&cx, m), sub, counter), query.get(&cx, m), true, counter) {
+        if !unify(&cx, subst(&cx, head.at(&cx, m), sub, counter), query.at(&cx, m), true, counter) {
             return Option::None;
         }
         m = m + 1usize;
     }
-    let out: Map[Text['k], Type['k], 'k] = Map::new(&cx);
+    let out: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
     let names = sub.keys(&cx);
     var n = 0usize;
     while n < names.len(&cx) {
-        let t = sub.at(&cx, names.get(&cx, n));
-        if reachable.has(&cx, names.get(&cx, n)) && ground(&cx, t) {
-            out.set(&cx, names.get(&cx, n), zonk(&cx, t));
+        let t = sub.at(&cx, names.at(&cx, n));
+        if reachable.contains(&cx, names.at(&cx, n)) && ground(&cx, t) {
+            out.insert(&cx, names.at(&cx, n), zonk(&cx, t));
         }
         n = n + 1usize;
     }

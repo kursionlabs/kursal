@@ -2,10 +2,13 @@
 //
 // Every node that a later phase annotates carries an `id`, unique in the program. Resolution,
 // inference and lowering keep what they learn about a node in tables keyed by that id, so the tree
-// itself never changes once parsed. Subtrees are held in cells (`Cell[Expr]`), which is what lets a
+// itself never changes once parsed. Subtrees are held in cells (`Ref[Expr]`), which is what lets a
 // node contain nodes of its own kind.
 
-use package::support::base::{Cell, Cx, Seq, Text};
+use std::collections::arena_vec::ArenaVec;
+use std::mem::Ref;
+use std::raw::Span;
+use std::alloc::arena::Domain;
 use std::option::Option;
 
 // A source position: line and column, from 1. Line 0 is no position.
@@ -23,16 +26,16 @@ fn no_pos() -> Pos {
 forall 'k.
 exposed enum Type {
     Name(TName['k]),
-    Ptr(Cell[Type['k], 'k]),
+    Ptr(Ref[Type['k], 'k]),
     Never,
-    Tuple(Seq[Type['k], 'k]),
-    Array(Cell[Type['k], 'k], Cell[Expr['k], 'k]),
+    Tuple(ArenaVec[Type['k], 'k]),
+    Array(Ref[Type['k], 'k], Ref[Expr['k], 'k]),
     Fn(TFn['k]),
     Closure(TClosure['k]),
-    Exists(Seq[Text['k], 'k], Cell[Type['k], 'k]),
+    Exists(ArenaVec[Span['k], 'k], Ref[Type['k], 'k]),
     Foreach(TForeach['k]),
-    Forall(Seq[Text['k], 'k], Cell[Type['k], 'k]),
-    Brand(Text['k]),
+    Forall(ArenaVec[Span['k], 'k], Ref[Type['k], 'k]),
+    Brand(Span['k]),
     Ignored,
 }
 
@@ -40,9 +43,9 @@ exposed enum Type {
 forall 'k.
 exposed struct TName {
     id: u32,
-    path: Seq[Text['k], 'k],
+    path: ArenaVec[Span['k], 'k],
     linear: bool,
-    args: Seq[Type['k], 'k],
+    args: ArenaVec[Type['k], 'k],
     determined: usize,
 }
 
@@ -55,24 +58,24 @@ exposed struct Slot {
 
 forall 'k.
 exposed struct TFn {
-    params: Seq[Slot['k], 'k],
-    ret: Cell[Type['k], 'k],
+    params: ArenaVec[Slot['k], 'k],
+    ret: Ref[Type['k], 'k],
     is_unsafe: bool,
 }
 
 forall 'k.
 exposed struct TClosure {
-    env: Option[Cell[Type['k], 'k]],
-    params: Seq[Slot['k], 'k],
-    ret: Cell[Type['k], 'k],
+    env: Option[Ref[Type['k], 'k]],
+    params: ArenaVec[Slot['k], 'k],
+    ret: Ref[Type['k], 'k],
 }
 
 forall 'k.
 exposed struct TForeach {
-    binder: Text['k],
+    binder: Span['k],
     indirect: bool,
-    source: Cell[Type['k], 'k],
-    body: Cell[Type['k], 'k],
+    source: Ref[Type['k], 'k],
+    body: Ref[Type['k], 'k],
 }
 
 // ------------------------------------------------------------ expressions --
@@ -82,7 +85,7 @@ exposed enum Expr {
     Lit(Lit['k]),
     FStr(FStr['k]),
     Path(Path['k]),
-    Tuple(Node[Seq[Expr['k], 'k]]),
+    Tuple(Node[ArenaVec[Expr['k], 'k]]),
     Array(ArrayLit['k]),
     Sizeof(Node[Type['k]]),
     StructLit(StructLit['k]),
@@ -90,7 +93,7 @@ exposed enum Expr {
     If(If['k]),
     Match(Match['k]),
     Closure(Closure['k]),
-    Return(Node[Option[Cell[Expr['k], 'k]]]),
+    Return(Node[Option[Ref[Expr['k], 'k]]]),
     Pack(Pack['k]),
     Foreach(Foreach['k]),
     Binop(Binop['k]),
@@ -100,7 +103,7 @@ exposed enum Expr {
     Field(Field['k]),
     Index(Index['k]),
     Call(Call['k]),
-    Try(Node[Cell[Expr['k], 'k]]),
+    Try(Node[Ref[Expr['k], 'k]]),
     While(While['k]),
     For(For['k]),
 }
@@ -129,47 +132,47 @@ exposed struct Lit {
     kind: LitKind,
     int: u64,
     negative: bool,
-    text: Text['k],
-    suffix: Option[Text['k]],
+    text: Span['k],
+    suffix: Option[Span['k]],
     pos: Pos,
 }
 
 // An f-string's pieces, in order: text, or an expression to format.
 forall 'k.
 exposed enum Piece {
-    Text(Text['k]),
+    Text(Span['k]),
     Expr(Expr['k]),
 }
 
 forall 'k.
 exposed struct FStr {
     id: u32,
-    parts: Seq[Piece['k], 'k],
+    parts: ArenaVec[Piece['k], 'k],
     pos: Pos,
 }
 
 // One segment of a path: a name, whether it was written `Name!`, and its type arguments.
 forall 'k.
 exposed struct Segment {
-    name: Text['k],
+    name: Span['k],
     linear: bool,
-    args: Seq[Type['k], 'k],
+    args: ArenaVec[Type['k], 'k],
 }
 
 forall 'k.
 exposed struct Path {
     id: u32,
-    segments: Seq[Segment['k], 'k],
+    segments: ArenaVec[Segment['k], 'k],
     pos: Pos,
 }
 
 forall 'k.
 impl Path['k] {
-    fn names(self, &cx: Cx!['k]) -> Seq[Text['k], 'k] {
-        let names: Seq[Text['k], 'k] = Seq::new(&cx);
+    fn names(self, &cx: Domain!['k]) -> ArenaVec[Span['k], 'k] {
+        let names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < self.segments.len(&cx) {
-            names.push(&cx, self.segments.get(&cx, i).name);
+            names.push(&cx, self.segments.at(&cx, i).name);
             i = i + 1usize;
         }
         names
@@ -180,7 +183,7 @@ impl Path['k] {
 forall 'k.
 exposed struct ArrayLit {
     id: u32,
-    elems: Seq[Expr['k], 'k],
+    elems: ArenaVec[Expr['k], 'k],
     fill: bool,
     pos: Pos,
 }
@@ -188,7 +191,7 @@ exposed struct ArrayLit {
 // A field of a struct literal; `value` is none for the shorthand `Point.{ x }`.
 forall 'k.
 exposed struct FieldInit {
-    name: Text['k],
+    name: Span['k],
     value: Option[Expr['k]],
 }
 
@@ -196,26 +199,26 @@ forall 'k.
 exposed struct StructLit {
     id: u32,
     path: Path['k],
-    fields: Seq[FieldInit['k], 'k],
-    spread: Option[Text['k]],
+    fields: ArenaVec[FieldInit['k], 'k],
+    spread: Option[Span['k]],
     pos: Pos,
 }
 
 forall 'k.
 exposed struct Block {
     id: u32,
-    stmts: Seq[Statement['k], 'k],
-    tail: Option[Cell[Expr['k], 'k]],
+    stmts: ArenaVec[Statement['k], 'k],
+    tail: Option[Ref[Expr['k], 'k]],
     pos: Pos,
 }
 
 forall 'k.
 exposed struct If {
     id: u32,
-    cond: Cell[Expr['k], 'k],
+    cond: Ref[Expr['k], 'k],
     then: Block['k],
     // A block, or an `else if`.
-    other: Option[Cell[Expr['k], 'k]],
+    other: Option[Ref[Expr['k], 'k]],
     pos: Pos,
 }
 
@@ -232,7 +235,7 @@ exposed struct Case {
     id: u32,
     kind: CaseKind,
     path: Option[Path['k]],
-    binders: Option[Seq[Text['k], 'k]],
+    binders: Option[ArenaVec[Span['k], 'k]],
     low: Option[Lit['k]],
     high: Option[Lit['k]],
     pos: Pos,
@@ -240,7 +243,7 @@ exposed struct Case {
 
 forall 'k.
 exposed struct Arm {
-    cases: Seq[Case['k], 'k],
+    cases: ArenaVec[Case['k], 'k],
     body: Expr['k],
     pos: Pos,
 }
@@ -248,41 +251,41 @@ exposed struct Arm {
 forall 'k.
 exposed struct Match {
     id: u32,
-    scrutinee: Cell[Expr['k], 'k],
-    arms: Seq[Arm['k], 'k],
+    scrutinee: Ref[Expr['k], 'k],
+    arms: ArenaVec[Arm['k], 'k],
     pos: Pos,
 }
 
 forall 'k.
 exposed struct ClosureParam {
     lend: bool,
-    name: Text['k],
+    name: Span['k],
     type: Option[Type['k]],
 }
 
 forall 'k.
 exposed struct Closure {
     id: u32,
-    params: Seq[ClosureParam['k], 'k],
+    params: ArenaVec[ClosureParam['k], 'k],
     ret: Option[Type['k]],
-    body: Cell[Expr['k], 'k],
+    body: Ref[Expr['k], 'k],
     pos: Pos,
 }
 
 forall 'k.
 exposed struct Pack {
     id: u32,
-    brands: Seq[Text['k], 'k],
-    value: Cell[Expr['k], 'k],
+    brands: ArenaVec[Span['k], 'k],
+    value: Ref[Expr['k], 'k],
     pos: Pos,
 }
 
 forall 'k.
 exposed struct Foreach {
     id: u32,
-    name: Text['k],
-    binder: Option[Text['k]],
-    source: Cell[Expr['k], 'k],
+    name: Span['k],
+    binder: Option[Span['k]],
+    source: Ref[Expr['k], 'k],
     body: Block['k],
     pos: Pos,
 }
@@ -290,9 +293,9 @@ exposed struct Foreach {
 forall 'k.
 exposed struct Binop {
     id: u32,
-    op: Text['k],
-    left: Cell[Expr['k], 'k],
-    right: Cell[Expr['k], 'k],
+    op: Span['k],
+    left: Ref[Expr['k], 'k],
+    right: Ref[Expr['k], 'k],
     pos: Pos,
 }
 
@@ -300,15 +303,15 @@ exposed struct Binop {
 forall 'k.
 exposed struct Unary {
     id: u32,
-    op: Text['k],
-    operand: Cell[Expr['k], 'k],
+    op: Span['k],
+    operand: Ref[Expr['k], 'k],
     pos: Pos,
 }
 
 forall 'k.
 exposed struct Cast {
     id: u32,
-    value: Cell[Expr['k], 'k],
+    value: Ref[Expr['k], 'k],
     type: Type['k],
     pos: Pos,
 }
@@ -316,23 +319,23 @@ exposed struct Cast {
 forall 'k.
 exposed struct UnsafeStore {
     id: u32,
-    pointer: Cell[Expr['k], 'k],
-    value: Cell[Expr['k], 'k],
+    pointer: Ref[Expr['k], 'k],
+    value: Ref[Expr['k], 'k],
     pos: Pos,
 }
 
 forall 'k.
 exposed struct Field {
     id: u32,
-    value: Cell[Expr['k], 'k],
-    name: Text['k],
+    value: Ref[Expr['k], 'k],
+    name: Span['k],
     pos: Pos,
 }
 
 forall 'k.
 exposed struct Index {
     id: u32,
-    value: Cell[Expr['k], 'k],
+    value: Ref[Expr['k], 'k],
     index: usize,
     pos: Pos,
 }
@@ -340,15 +343,15 @@ exposed struct Index {
 forall 'k.
 exposed struct Call {
     id: u32,
-    callee: Cell[Expr['k], 'k],
-    args: Seq[Expr['k], 'k],
+    callee: Ref[Expr['k], 'k],
+    args: ArenaVec[Expr['k], 'k],
     pos: Pos,
 }
 
 forall 'k.
 exposed struct While {
     id: u32,
-    cond: Cell[Expr['k], 'k],
+    cond: Ref[Expr['k], 'k],
     body: Block['k],
     pos: Pos,
 }
@@ -356,8 +359,8 @@ exposed struct While {
 forall 'k.
 exposed struct For {
     id: u32,
-    name: Text['k],
-    iterator: Cell[Expr['k], 'k],
+    name: Span['k],
+    iterator: Ref[Expr['k], 'k],
     body: Block['k],
     pos: Pos,
 }
@@ -441,14 +444,14 @@ exposed struct Let {
     type: Option[Type['k]],
     value: Expr['k],
     // `let exists 'a. ...`
-    brands: Seq[Text['k], 'k],
+    brands: ArenaVec[Span['k], 'k],
     pos: Pos,
 }
 
 forall 'k.
 exposed struct Var {
     id: u32,
-    name: Text['k],
+    name: Span['k],
     type: Option[Type['k]],
     value: Expr['k],
     pos: Pos,
@@ -463,24 +466,24 @@ exposed struct Assign {
 
 forall 'k.
 exposed enum Pattern {
-    Bind(Node[Text['k]]),
+    Bind(Node[Span['k]]),
     Wild(u32),
-    Tuple(Node[Seq[Pattern['k], 'k]]),
-    Array(Node[Seq[Pattern['k], 'k]]),
+    Tuple(Node[ArenaVec[Pattern['k], 'k]]),
+    Array(Node[ArenaVec[Pattern['k], 'k]]),
     Struct(PStruct['k]),
 }
 
 forall 'k.
 exposed struct FieldPattern {
-    name: Text['k],
+    name: Span['k],
     pattern: Pattern['k],
 }
 
 forall 'k.
 exposed struct PStruct {
     id: u32,
-    fields: Seq[FieldPattern['k], 'k],
-    rest: Option[Text['k]],
+    fields: ArenaVec[FieldPattern['k], 'k],
+    rest: Option[Span['k]],
 }
 
 forall 'k.
@@ -499,14 +502,14 @@ fn pattern_id(p: Pattern['k]) -> u32 {
 // `forall T, 'k -> U where Trait[T, U].`; brand parameters keep their quote.
 forall 'k.
 exposed struct Forall {
-    params: Seq[Text['k], 'k],
-    determined: Seq[Text['k], 'k],
-    premises: Seq[Premise['k], 'k],
+    params: ArenaVec[Span['k], 'k],
+    determined: ArenaVec[Span['k], 'k],
+    premises: ArenaVec[Premise['k], 'k],
 }
 
 forall 'k.
 exposed struct Premise {
-    trait_path: Seq[Text['k], 'k],
+    trait_path: ArenaVec[Span['k], 'k],
     args: TypeArgs['k],
 }
 
@@ -514,13 +517,13 @@ exposed struct Premise {
 forall 'k.
 exposed struct TypeArgs {
     id: u32,
-    args: Seq[Type['k], 'k],
+    args: ArenaVec[Type['k], 'k],
     determined: usize,
 }
 
 forall 'k.
 exposed struct Param {
-    name: Text['k],
+    name: Span['k],
     type: Option[Type['k]],
     // written `&name: T` or `&self`
     lend: bool,
@@ -529,22 +532,22 @@ exposed struct Param {
 // `a::b::{c, d as e}` or `a::*`. `children` is empty unless braces were written.
 forall 'k.
 exposed struct UseTree {
-    path: Seq[Text['k], 'k],
+    path: ArenaVec[Span['k], 'k],
     star: bool,
-    children: Seq[UseTree['k], 'k],
-    alias: Option[Text['k]],
+    children: ArenaVec[UseTree['k], 'k],
+    alias: Option[Span['k]],
 }
 
 // `exposed`, or `exposed(scope)`; a declaration without one is restricted to its module.
 forall 'k.
 exposed struct Exposed {
-    scope: Option[Seq[Text['k], 'k]],
+    scope: Option[ArenaVec[Span['k], 'k]],
 }
 
 forall 'k.
 exposed enum Item {
     Use(UseItem['k]),
-    Module(Node[Seq[Text['k], 'k]]),
+    Module(Node[ArenaVec[Span['k], 'k]]),
     Struct(StructDecl['k]),
     Tuple(TupleDecl['k]),
     Enum(EnumDecl['k]),
@@ -566,16 +569,16 @@ exposed struct UseItem {
 
 forall 'k.
 exposed struct FieldDecl {
-    name: Text['k],
+    name: Span['k],
     type: Type['k],
 }
 
 forall 'k.
 exposed struct StructDecl {
     id: u32,
-    name: Text['k],
+    name: Span['k],
     linear: bool,
-    fields: Seq[FieldDecl['k], 'k],
+    fields: ArenaVec[FieldDecl['k], 'k],
     exposure: Option[Exposed['k]],
     quantifier: Option[Forall['k]],
     pos: Pos,
@@ -584,9 +587,9 @@ exposed struct StructDecl {
 forall 'k.
 exposed struct TupleDecl {
     id: u32,
-    name: Text['k],
+    name: Span['k],
     linear: bool,
-    elems: Seq[Type['k], 'k],
+    elems: ArenaVec[Type['k], 'k],
     exposure: Option[Exposed['k]],
     quantifier: Option[Forall['k]],
     pos: Pos,
@@ -594,16 +597,16 @@ exposed struct TupleDecl {
 
 forall 'k.
 exposed struct Variant {
-    name: Text['k],
-    payload: Seq[Type['k], 'k],
+    name: Span['k],
+    payload: ArenaVec[Type['k], 'k],
 }
 
 forall 'k.
 exposed struct EnumDecl {
     id: u32,
-    name: Text['k],
+    name: Span['k],
     linear: bool,
-    variants: Seq[Variant['k], 'k],
+    variants: ArenaVec[Variant['k], 'k],
     exposure: Option[Exposed['k]],
     quantifier: Option[Forall['k]],
     pos: Pos,
@@ -613,8 +616,8 @@ exposed struct EnumDecl {
 forall 'k.
 exposed struct Fn {
     id: u32,
-    name: Text['k],
-    params: Seq[Param['k], 'k],
+    name: Span['k],
+    params: ArenaVec[Param['k], 'k],
     ret: Option[Type['k]],
     body: Option[Block['k]],
     is_unsafe: bool,
@@ -625,9 +628,9 @@ exposed struct Fn {
 forall 'k.
 exposed struct Extern {
     id: u32,
-    abi: Text['k],
-    name: Text['k],
-    params: Seq[Param['k], 'k],
+    abi: Span['k],
+    name: Span['k],
+    params: ArenaVec[Param['k], 'k],
     ret: Option[Type['k]],
     quantifier: Option[Forall['k]],
     pos: Pos,
@@ -636,7 +639,7 @@ exposed struct Extern {
 forall 'k.
 exposed struct Const {
     id: u32,
-    name: Text['k],
+    name: Span['k],
     type: Type['k],
     value: Expr['k],
     quantifier: Option[Forall['k]],
@@ -654,7 +657,7 @@ forall 'k.
 exposed struct Impl {
     id: u32,
     type: Type['k],
-    items: Seq[Member['k], 'k],
+    items: ArenaVec[Member['k], 'k],
     quantifier: Option[Forall['k]],
     pos: Pos,
 }
@@ -662,8 +665,8 @@ exposed struct Impl {
 forall 'k.
 exposed struct TraitDecl {
     id: u32,
-    name: Text['k],
-    methods: Seq[Fn['k], 'k],
+    name: Span['k],
+    methods: ArenaVec[Fn['k], 'k],
     quantifier: Option[Forall['k]],
     pos: Pos,
 }
@@ -672,7 +675,7 @@ forall 'k.
 exposed struct InstanceDecl {
     id: u32,
     type: Type['k],
-    methods: Seq[Fn['k], 'k],
+    methods: ArenaVec[Fn['k], 'k],
     is_unsafe: bool,
     quantifier: Option[Forall['k]],
     pos: Pos,

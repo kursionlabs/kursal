@@ -42,8 +42,15 @@
 //                                    check_mono_termination; INSTR is (call F T...), (fn F T...),
 //                                    (trait_call TRAIT METHOD T...) or (foreach F FOREACH-TYPE T...)
 
-use package::support::base::{Cell, Cx, Map, Seq, Set, Text, fail, text, text_of};
+use package::support::base::fail;
+use std::parse::parse_u64;
+use std::collections::arena_vec::ArenaVec;
+use std::collections::arena_map::{ArenaMap, ArenaSet};
+use std::mem::Ref;
+use std::raw::Span;
+use std::alloc::arena::Domain;
 use std::bytes::buffer::Buffer;
+use std::io::print_buffer;
 use package::types::coherence::check_coherence;
 use package::kurs::core::{Block, Exposure, ExposureMode, Fun, ModuleId, Instr, Kind, Member, Meta, MetaKind, Param, Premise, Program, Terminator, Type, TypeDecl};
 use package::kurs::core as C;
@@ -60,8 +67,8 @@ use std::option::Option;
 // ---------------------------------------------------------------- reading --
 
 forall 'k.
-fn strip_bang(&cx: Cx!['k], name: Text['k]) -> Text['k] {
-    if name.len() > 1usize && name.byte(&cx, name.len() - 1usize) == b'!' {
+fn strip_bang(&cx: Domain!['k], name: Span['k]) -> Span['k] {
+    if name.len() > 1usize && name.byte_or_zero(&cx, name.len() - 1usize) == b'!' {
         strip_bang(&cx, name.slice(0usize, name.len() - 1usize))
     } else {
         name
@@ -69,22 +76,22 @@ fn strip_bang(&cx: Cx!['k], name: Text['k]) -> Text['k] {
 }
 
 forall 'k.
-fn parse_types(&cx: Cx!['k], forms: Seq[Form['k], 'k], start: usize) -> Seq[Type['k], 'k] {
-    let out: Seq[Type['k], 'k] = Seq::new(&cx);
+fn parse_types(&cx: Domain!['k], forms: ArenaVec[Form['k], 'k], start: usize) -> ArenaVec[Type['k], 'k] {
+    let out: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
     var i = start;
     while i < forms.len(&cx) {
-        out.push(&cx, parse_type(&cx, forms.get(&cx, i)));
+        out.push(&cx, parse_type(&cx, forms.at(&cx, i)));
         i = i + 1usize;
     }
     out
 }
 
 forall 'k.
-fn parse_members(&cx: Cx!['k], forms: Seq[Form['k], 'k]) -> Seq[Member['k], 'k] {
-    let out: Seq[Member['k], 'k] = Seq::new(&cx);
+fn parse_members(&cx: Domain!['k], forms: ArenaVec[Form['k], 'k]) -> ArenaVec[Member['k], 'k] {
+    let out: ArenaVec[Member['k], 'k] = ArenaVec::new(&cx);
     var i = 1usize;
     while i < forms.len(&cx) {
-        let f = forms.get(&cx, i);
+        let f = forms.at(&cx, i);
         out.push(&cx, Member.{ name: f.at(&cx, 0usize).text, type: parse_type(&cx, f.at(&cx, 1usize)) });
         i = i + 1usize;
     }
@@ -92,13 +99,13 @@ fn parse_members(&cx: Cx!['k], forms: Seq[Form['k], 'k]) -> Seq[Member['k], 'k] 
 }
 
 forall 'k.
-fn brand_label(f: Form['k]) -> Text['k] {
-    f.text.from(1usize)
+fn brand_label(f: Form['k]) -> Span['k] {
+    f.text.skip(1usize)
 }
 
 // A KURS type, as `kurs.parse_type` reads it.
 forall 'k.
-fn parse_type(&cx: Cx!['k], f: Form['k]) -> Type['k] {
+fn parse_type(&cx: Domain!['k], f: Form['k]) -> Type['k] {
     if !f.is_list() {
         let t = f.text;
         if t.is(&cx, "_") {
@@ -107,13 +114,13 @@ fn parse_type(&cx: Cx!['k], f: Form['k]) -> Type['k] {
         if t.is(&cx, "!") {
             return Type::Never;
         }
-        if t.byte(&cx, 0usize) == b'$' {
+        if t.byte_or_zero(&cx, 0usize) == b'$' {
             return Type::Skolem.(brand_label(f));
         }
         if C::is_prim(&cx, t) {
             return Type::Prim.(t);
         }
-        return C::named(strip_bang(&cx, t), Seq::new(&cx));
+        return C::named(strip_bang(&cx, t), ArenaVec::new(&cx));
     }
     let head = f.at(&cx, 0usize).text;
     if head.is(&cx, "struct") {
@@ -123,19 +130,19 @@ fn parse_type(&cx: Cx!['k], f: Form['k]) -> Type['k] {
     } else if head.is(&cx, "tuple") {
         Type::Tuple.(parse_types(&cx, f.items, 1usize))
     } else if head.is(&cx, "array") {
-        Type::Array.(Cell::new(&cx, parse_type(&cx, f.at(&cx, 1usize))), f.at(&cx, 2usize).text.to_usize(&cx).unwrap_or(0usize) as u64)
+        Type::Array.(Ref::new(&cx, parse_type(&cx, f.at(&cx, 1usize))), parse_u64(&cx, f.at(&cx, 2usize).text).unwrap_or(0u64))
     } else if head.is(&cx, "builtin::Pointer") {
         C::ptr(&cx, parse_type(&cx, f.at(&cx, 1usize)))
     } else if head.is(&cx, "builtin::Brand") {
-        Type::Brand.(Cell::new(&cx, Type::Skolem.(brand_label(f.at(&cx, 1usize)))))
+        Type::Brand.(Ref::new(&cx, Type::Skolem.(brand_label(f.at(&cx, 1usize)))))
     } else if head.is(&cx, "exists") {
-        let binders: Seq[Text['k], 'k] = Seq::new(&cx);
+        let binders: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < f.at(&cx, 1usize).len(&cx) {
             binders.push(&cx, brand_label(f.at(&cx, 1usize).at(&cx, i)));
             i = i + 1usize;
         }
-        Type::Exists.(binders, Cell::new(&cx, parse_type(&cx, f.at(&cx, 2usize))))
+        Type::Exists.(binders, Ref::new(&cx, parse_type(&cx, f.at(&cx, 2usize))))
     } else if head.is(&cx, "foreach") {
         let pattern = f.at(&cx, 1usize).at(&cx, 0usize);
         let source = parse_type(&cx, f.at(&cx, 1usize).at(&cx, 1usize));
@@ -143,13 +150,13 @@ fn parse_type(&cx: Cx!['k], f: Form['k]) -> Type['k] {
         let binder = if indirect { pattern.at(&cx, 1usize).text } else { pattern.text };
         let body = parse_type(&cx, f.at(&cx, 2usize));
         if f.len(&cx) == 4usize {
-            let retained: Seq[Text['k], 'k] = Seq::new(&cx);
+            let retained: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
             var i = 1usize;
             while i < f.at(&cx, 3usize).len(&cx) {
                 retained.push(&cx, f.at(&cx, 3usize).at(&cx, i).text);
                 i = i + 1usize;
             }
-            Type::Foreach.(C::ForeachType.{ binder, indirect, source: Cell::new(&cx, source), body: Cell::new(&cx, body), retained })
+            Type::Foreach.(C::ForeachType.{ binder, indirect, source: Ref::new(&cx, source), body: Ref::new(&cx, body), retained })
         } else {
             C::foreach_type(&cx, binder, indirect, source, body)
         }
@@ -163,9 +170,9 @@ fn parse_type(&cx: Cx!['k], f: Form['k]) -> Type['k] {
         let header = f.at(&cx, at);
         if header.is_list() && header.len(&cx) == 5usize && header.at(&cx, 0usize).is_atom() && header.at(&cx, 0usize).text.is(&cx, "forall") {
             let params = parse_params(&cx, header.at(&cx, 1usize));
-            C::fn_type(&cx, parse_types(&cx, header.at(&cx, 4usize).items, 0usize), parse_type(&cx, header.at(&cx, 3usize)), params, is_unsafe, Seq::new(&cx))
+            C::fn_type(&cx, parse_types(&cx, header.at(&cx, 4usize).items, 0usize), parse_type(&cx, header.at(&cx, 3usize)), params, is_unsafe, ArenaVec::new(&cx))
         } else {
-            C::fn_type(&cx, parse_types(&cx, header.items, 0usize), parse_type(&cx, f.at(&cx, at + 1usize)), Seq::new(&cx), is_unsafe, Seq::new(&cx))
+            C::fn_type(&cx, parse_types(&cx, header.items, 0usize), parse_type(&cx, f.at(&cx, at + 1usize)), ArenaVec::new(&cx), is_unsafe, ArenaVec::new(&cx))
         }
     } else {
         C::named(strip_bang(&cx, head), parse_types(&cx, f.items, 1usize))
@@ -174,15 +181,15 @@ fn parse_type(&cx: Cx!['k], f: Form['k]) -> Type['k] {
 
 // Parameters: `$k` a brand, `+T` a Copy type, `T` any type.
 forall 'k.
-fn parse_params(&cx: Cx!['k], f: Form['k]) -> Seq[Param['k], 'k] {
-    let out: Seq[Param['k], 'k] = Seq::new(&cx);
+fn parse_params(&cx: Domain!['k], f: Form['k]) -> ArenaVec[Param['k], 'k] {
+    let out: ArenaVec[Param['k], 'k] = ArenaVec::new(&cx);
     var i = 0usize;
     while i < f.len(&cx) {
         let t = f.at(&cx, i).text;
-        if t.byte(&cx, 0usize) == b'$' {
-            out.push(&cx, Param.{ name: t.from(1usize), kind: Kind::Brand });
-        } else if t.byte(&cx, 0usize) == b'+' {
-            out.push(&cx, Param.{ name: t.from(1usize), kind: Kind::Copy });
+        if t.byte_or_zero(&cx, 0usize) == b'$' {
+            out.push(&cx, Param.{ name: t.skip(1usize), kind: Kind::Brand });
+        } else if t.byte_or_zero(&cx, 0usize) == b'+' {
+            out.push(&cx, Param.{ name: t.skip(1usize), kind: Kind::Copy });
         } else {
             out.push(&cx, Param.{ name: t, kind: Kind::Any });
         }
@@ -192,7 +199,7 @@ fn parse_params(&cx: Cx!['k], f: Form['k]) -> Seq[Param['k], 'k] {
 }
 
 forall 'k.
-fn parse_kind(&cx: Cx!['k], t: Text['k]) -> Kind {
+fn parse_kind(&cx: Domain!['k], t: Span['k]) -> Kind {
     if t.is(&cx, "brand") {
         Kind::Brand
     } else if t.is(&cx, "copy") {
@@ -203,32 +210,32 @@ fn parse_kind(&cx: Cx!['k], t: Text['k]) -> Kind {
 }
 
 forall 'k.
-fn parse_kinds(&cx: Cx!['k], f: Form['k]) -> Map[Text['k], Kind, 'k] {
-    let out: Map[Text['k], Kind, 'k] = Map::new(&cx);
+fn parse_kinds(&cx: Domain!['k], f: Form['k]) -> ArenaMap[Span['k], Kind, 'k] {
+    let out: ArenaMap[Span['k], Kind, 'k] = ArenaMap::new(&cx);
     var i = 0usize;
     while i < f.len(&cx) {
-        out.set(&cx, f.at(&cx, i).at(&cx, 0usize).text, parse_kind(&cx, f.at(&cx, i).at(&cx, 1usize).text));
+        out.insert(&cx, f.at(&cx, i).at(&cx, 0usize).text, parse_kind(&cx, f.at(&cx, i).at(&cx, 1usize).text));
         i = i + 1usize;
     }
     out
 }
 
 forall 'k.
-fn parse_premise(&cx: Cx!['k], f: Form['k]) -> Premise['k] {
+fn parse_premise(&cx: Domain!['k], f: Form['k]) -> Premise['k] {
     Premise.{ trait_name: f.at(&cx, 0usize).text, args: parse_types(&cx, f.items, 1usize) }
 }
 
 forall 'k.
-fn parse_decl(&cx: Cx!['k], f: Form['k]) -> TypeDecl['k] {
+fn parse_decl(&cx: Domain!['k], f: Form['k]) -> TypeDecl['k] {
     TypeDecl.{
         name: f.at(&cx, 1usize).text,
         linear: f.at(&cx, 0usize).text.is(&cx, "linear"),
         params: parse_params(&cx, f.at(&cx, 2usize)),
-        premises: Seq::new(&cx),
+        premises: ArenaVec::new(&cx),
         body: parse_type(&cx, f.at(&cx, 3usize)),
         home: Option::None,
         exposure: if f.at(&cx, 0usize).text.is(&cx, "opaque") {
-            Option::Some.(Exposure.{ mode: ExposureMode::Owner, home: ModuleId::root(&cx, 0usize).child(&cx, text(&cx, "m")) })
+            Option::Some.(Exposure.{ mode: ExposureMode::Owner, home: ModuleId::root(&cx, 0usize).child(&cx, Span::from_static(&cx, "m")) })
         } else {
             Option::None
         },
@@ -236,21 +243,21 @@ fn parse_decl(&cx: Cx!['k], f: Form['k]) -> TypeDecl['k] {
 }
 
 forall 'k.
-fn parse_program(&cx: Cx!['k], forms: Seq[Form['k], 'k], start: usize) -> Program['k] {
+fn parse_program(&cx: Domain!['k], forms: ArenaVec[Form['k], 'k], start: usize) -> Program['k] {
     let program = Program::new(&cx);
     var i = start;
     while i < forms.len(&cx) {
-        let decl = parse_decl(&cx, forms.get(&cx, i));
-        program.types.set(&cx, decl.name, decl);
+        let decl = parse_decl(&cx, forms.at(&cx, i));
+        program.types.insert(&cx, decl.name, decl);
         i = i + 1usize;
     }
     program
 }
 
 forall 'k.
-fn parse_instr(&cx: Cx!['k], f: Form['k]) -> Instr['k] {
+fn parse_instr(&cx: Domain!['k], f: Form['k]) -> Instr['k] {
     let op = f.at(&cx, 0usize).text;
-    let args: Seq[Text['k], 'k] = Seq::new(&cx);
+    let args: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
     var ty: Option[Type['k]] = Option::None;
     var first = 2usize;
     if op.is(&cx, "trait_call") {
@@ -258,58 +265,53 @@ fn parse_instr(&cx: Cx!['k], f: Form['k]) -> Instr['k] {
         args.push(&cx, f.at(&cx, 2usize).text);
         first = 3usize;
     } else if op.is(&cx, "foreach") {
-        args.push(&cx, text(&cx, "items"));
+        args.push(&cx, Span::from_static(&cx, "items"));
         args.push(&cx, f.at(&cx, 1usize).text);
         ty = Option::Some.(parse_type(&cx, f.at(&cx, 2usize)));
         first = 3usize;
     } else {
         args.push(&cx, f.at(&cx, 1usize).text);
     }
-    Instr.{ lhs: Seq::new(&cx), op, args, ty, tys: parse_types(&cx, f.items, first), lit: Option::None, is_unsafe: false, binders: Seq::new(&cx), pos: f.pos }
+    Instr.{ lhs: ArenaVec::new(&cx), op, args, ty, tys: parse_types(&cx, f.items, first), lit: Option::None, is_unsafe: false, binders: ArenaVec::new(&cx), pos: f.pos }
 }
 
 forall 'k.
-fn parse_fun(&cx: Cx!['k], f: Form['k]) -> Fun['k] {
-    let instrs: Seq[Instr['k], 'k] = Seq::new(&cx);
+fn parse_fun(&cx: Domain!['k], f: Form['k]) -> Fun['k] {
+    let instrs: ArenaVec[Instr['k], 'k] = ArenaVec::new(&cx);
     var i = 2usize;
     while i < f.len(&cx) {
         instrs.push(&cx, parse_instr(&cx, f.at(&cx, i)));
         i = i + 1usize;
     }
-    let entry = Block.{ label: text(&cx, "entry"), params: Seq::new(&cx), instrs, term: Terminator::Ret.(text(&cx, "x"), no_pos()), brands: Seq::new(&cx), empty: Seq::new(&cx), known: Seq::new(&cx), opened: Seq::new(&cx), pos: no_pos() };
-    Fun.{ name: f.at(&cx, 0usize).text, params: parse_params(&cx, f.at(&cx, 1usize)), premises: Seq::new(&cx), ret: C::unit(&cx), ptypes: Seq::new(&cx), blocks: Seq::one(&cx, entry), locals: Seq::new(&cx), is_unsafe: false, home: Option::None, pos: no_pos() }
+    let entry = Block.{ label: Span::from_static(&cx, "entry"), params: ArenaVec::new(&cx), instrs, term: Terminator::Ret.(Span::from_static(&cx, "x"), no_pos()), brands: ArenaVec::new(&cx), empty: ArenaVec::new(&cx), known: ArenaVec::new(&cx), opened: ArenaVec::new(&cx), pos: no_pos() };
+    Fun.{ name: f.at(&cx, 0usize).text, params: parse_params(&cx, f.at(&cx, 1usize)), premises: ArenaVec::new(&cx), ret: C::unit(&cx), ptypes: ArenaVec::new(&cx), blocks: ArenaVec::one(&cx, entry), locals: ArenaVec::new(&cx), is_unsafe: false, home: Option::None, pos: no_pos() }
 }
 
 // --------------------------------------------------------------- printing --
 
 forall 'k.
-fn text_before(&cx: Cx!['k], a: Text['k], b: Text['k]) -> bool {
-    a.compare(&cx, b) < 0
-}
-
-forall 'k.
-fn show_set(&cx: Cx!['k], names: Set[Text['k], 'k]) -> Text['k] {
-    let items = names.items(&cx);
-    items.sort(&cx, text_before);
+fn show_set(&cx: Domain!['k], names: ArenaSet[Span['k], 'k]) -> Span['k] {
+    let items = names.keys(&cx);
+    items.sort_by(&cx, |&cx, a, b| a.cmp(&cx, b));
     var out = Buffer::new().push_static("[");
     var i = 0usize;
     while i < items.len(&cx) {
         if i > 0usize {
             out = out.push_static(" ");
         }
-        out = out.push_bytes(&cx, items.get(&cx, i));
+        out = out.push_bytes(&cx, items.at(&cx, i));
         i = i + 1usize;
     }
-    text_of(&cx, out.push_static("]"))
+    out.push_static("]").save(&cx)
 }
 
 forall 'k.
-fn flag(&cx: Cx!['k], b: bool) -> Text['k] {
-    if b { text(&cx, "true") } else { text(&cx, "false") }
+fn flag(&cx: Domain!['k], b: bool) -> Span['k] {
+    if b { Span::from_static(&cx, "true") } else { Span::from_static(&cx, "false") }
 }
 
 forall 'k.
-fn meta_kind(&cx: Cx!['k], t: Text['k]) -> MetaKind {
+fn meta_kind(&cx: Domain!['k], t: Span['k]) -> MetaKind {
     if t.is(&cx, "int") {
         MetaKind::Int
     } else if t.is(&cx, "float") {
@@ -324,17 +326,17 @@ fn meta_kind(&cx: Cx!['k], t: Text['k]) -> MetaKind {
 // ------------------------------------------------------------------ cases --
 
 forall 'k.
-fn run_case(&cx: Cx!['k], source: Text['k], counter: Fresh['k]) -> Text['k] {
+fn run_case(&cx: Domain!['k], source: Span['k], counter: Fresh['k]) -> Span['k] {
     let form = read(&cx, source).at(&cx, 0usize);
     let op = form.at(&cx, 0usize).text;
     if op.is(&cx, "show") {
         show(&cx, parse_type(&cx, form.at(&cx, 1usize)))
     } else if op.is(&cx, "subst") {
-        let sub: Map[Text['k], Type['k], 'k] = Map::new(&cx);
+        let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
         let pairs = form.at(&cx, 2usize);
         var i = 0usize;
         while i < pairs.len(&cx) {
-            sub.set(&cx, pairs.at(&cx, i).at(&cx, 0usize).text, parse_type(&cx, pairs.at(&cx, i).at(&cx, 1usize)));
+            sub.insert(&cx, pairs.at(&cx, i).at(&cx, 0usize).text, parse_type(&cx, pairs.at(&cx, i).at(&cx, 1usize)));
             i = i + 1usize;
         }
         show(&cx, subst(&cx, parse_type(&cx, form.at(&cx, 1usize)), sub, counter))
@@ -349,14 +351,14 @@ fn run_case(&cx: Cx!['k], source: Text['k], counter: Fresh['k]) -> Text['k] {
     } else if op.is(&cx, "fits") {
         flag(&cx, fits(&cx, parse_type(&cx, form.at(&cx, 1usize)), parse_type(&cx, form.at(&cx, 2usize))))
     } else if op.is(&cx, "unify") || op.is(&cx, "unify-closed") {
-        let metas: Map[Text['k], Type['k], 'k] = Map::new(&cx);
-        let names: Seq[Text['k], 'k] = Seq::new(&cx);
+        let metas: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+        let names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         let declared = form.at(&cx, 1usize);
         var i = 0usize;
         while i < declared.len(&cx) {
-            let name = text_of(&cx, Buffer::new().push_static("?").push_bytes(&cx, declared.at(&cx, i).at(&cx, 0usize).text));
+            let name = Buffer::new().push_static("?").push_bytes(&cx, declared.at(&cx, i).at(&cx, 0usize).text).save(&cx);
             names.push(&cx, name);
-            metas.set(&cx, name, Type::Meta.(Meta::new(&cx, meta_kind(&cx, declared.at(&cx, i).at(&cx, 1usize).text))));
+            metas.insert(&cx, name, Type::Meta.(Meta::new(&cx, meta_kind(&cx, declared.at(&cx, i).at(&cx, 1usize).text))));
             i = i + 1usize;
         }
         let a = subst(&cx, parse_type(&cx, form.at(&cx, 2usize)), metas, counter);
@@ -365,15 +367,15 @@ fn run_case(&cx: Cx!['k], source: Text['k], counter: Fresh['k]) -> Text['k] {
         var out = Buffer::new().push_bytes(&cx, flag(&cx, ok)).push_static(" | ").push_bytes(&cx, show(&cx, zonk(&cx, a))).push_static(" | ").push_bytes(&cx, show(&cx, zonk(&cx, b))).push_static(" |");
         var j = 0usize;
         while j < names.len(&cx) {
-            out = out.push_static(" ").push_bytes(&cx, names.get(&cx, j)).push_static("=").push_bytes(&cx, show(&cx, zonk(&cx, metas.at(&cx, names.get(&cx, j)))));
+            out = out.push_static(" ").push_bytes(&cx, names.at(&cx, j)).push_static("=").push_bytes(&cx, show(&cx, zonk(&cx, metas.at(&cx, names.at(&cx, j)))));
             j = j + 1usize;
         }
-        text_of(&cx, out)
+        out.save(&cx)
     } else if op.is(&cx, "match-head") {
         let params = parse_params(&cx, form.at(&cx, 1usize));
         let found = match_head(&cx, params, parse_types(&cx, form.at(&cx, 2usize).items, 0usize), parse_types(&cx, form.at(&cx, 3usize).items, 0usize), form.at(&cx, 4usize).text.is(&cx, "true"), counter);
         match found {
-            Option::None => text(&cx, "none"),
+            Option::None => Span::from_static(&cx, "none"),
             Option::Some(sub) => {
                 var out = Buffer::new().push_static("{");
                 let keys = sub.keys(&cx);
@@ -382,10 +384,10 @@ fn run_case(&cx: Cx!['k], source: Text['k], counter: Fresh['k]) -> Text['k] {
                     if i > 0usize {
                         out = out.push_static(" ");
                     }
-                    out = out.push_bytes(&cx, keys.get(&cx, i)).push_static("=").push_bytes(&cx, show(&cx, sub.at(&cx, keys.get(&cx, i))));
+                    out = out.push_bytes(&cx, keys.at(&cx, i)).push_static("=").push_bytes(&cx, show(&cx, sub.at(&cx, keys.at(&cx, i))));
                     i = i + 1usize;
                 }
-                text_of(&cx, out.push_static("}"))
+                out.push_static("}").save(&cx)
             },
         }
     } else if op.is(&cx, "literal") {
@@ -401,20 +403,20 @@ fn run_case(&cx: Cx!['k], source: Text['k], counter: Fresh['k]) -> Text['k] {
         show(&cx, types.shape(&cx, parse_type(&cx, form.at(&cx, 2usize)), Option::None))
     } else if op.is(&cx, "layout") {
         check_type_expansion(&cx, parse_program(&cx, form.items, 1usize), counter);
-        text(&cx, "ok")
+        Span::from_static(&cx, "ok")
     } else if op.is(&cx, "formation") {
         let formation: Formation[NoDischarge, 'k] = Formation::new(&cx, parse_program(&cx, form.items, 1usize), counter);
         formation.declarations(&cx);
-        text(&cx, "ok")
+        Span::from_static(&cx, "ok")
     } else if op.is(&cx, "kind") {
         let formation: Formation[NoDischarge, 'k] = Formation::new(&cx, parse_program(&cx, form.at(&cx, 1usize).items, 0usize), counter);
         kind_name(&cx, formation.kind(&cx, parse_type(&cx, form.at(&cx, 3usize)), parse_kinds(&cx, form.at(&cx, 2usize))))
     } else if op.is(&cx, "instances") {
-        let headers: Seq[(Premise['k], Seq[Premise['k], 'k], Pos), 'k] = Seq::new(&cx);
+        let headers: ArenaVec[(Premise['k], ArenaVec[Premise['k], 'k], Pos), 'k] = ArenaVec::new(&cx);
         var i = 1usize;
         while i < form.len(&cx) {
             let h = form.at(&cx, i);
-            let premises: Seq[Premise['k], 'k] = Seq::new(&cx);
+            let premises: ArenaVec[Premise['k], 'k] = ArenaVec::new(&cx);
             var j = 1usize;
             while j < h.len(&cx) {
                 premises.push(&cx, parse_premise(&cx, h.at(&cx, j)));
@@ -424,9 +426,9 @@ fn run_case(&cx: Cx!['k], source: Text['k], counter: Fresh['k]) -> Text['k] {
             i = i + 1usize;
         }
         check_instance_termination(&cx, headers);
-        text(&cx, "ok")
+        Span::from_static(&cx, "ok")
     } else if op.is(&cx, "coherence") {
-        let headers: Seq[(Premise['k], Seq[Param['k], 'k], Pos), 'k] = Seq::new(&cx);
+        let headers: ArenaVec[(Premise['k], ArenaVec[Param['k], 'k], Pos), 'k] = ArenaVec::new(&cx);
         var i = 1usize;
         while i < form.len(&cx) {
             let h = form.at(&cx, i);
@@ -434,34 +436,34 @@ fn run_case(&cx: Cx!['k], source: Text['k], counter: Fresh['k]) -> Text['k] {
             i = i + 1usize;
         }
         check_coherence(&cx, headers, counter);
-        text(&cx, "ok")
+        Span::from_static(&cx, "ok")
     } else if op.is(&cx, "mono") {
         let program = Program::new(&cx);
         var i = 1usize;
         while i < form.len(&cx) {
             let fun = parse_fun(&cx, form.at(&cx, i));
-            program.funs.set(&cx, fun.name, fun);
+            program.funs.insert(&cx, fun.name, fun);
             i = i + 1usize;
         }
         check_mono_termination(&cx, program);
-        text(&cx, "ok")
+        Span::from_static(&cx, "ok")
     } else if op.is(&cx, "function") {
         let program = parse_program(&cx, form.at(&cx, 1usize).items, 0usize);
-        let funs: Seq[Fun['k], 'k] = Seq::new(&cx);
+        let funs: ArenaVec[Fun['k], 'k] = ArenaVec::new(&cx);
         var i = 2usize;
         while i < form.len(&cx) {
             let fun = parse_fun(&cx, form.at(&cx, i));
-            program.funs.set(&cx, fun.name, fun);
+            program.funs.insert(&cx, fun.name, fun);
             funs.push(&cx, fun);
             i = i + 1usize;
         }
         let formation: Formation[NoDischarge, 'k] = Formation::new(&cx, program, counter);
         var j = 0usize;
         while j < funs.len(&cx) {
-            formation.function(&cx, funs.get(&cx, j), Seq::new(&cx), Seq::new(&cx));
+            formation.function(&cx, funs.at(&cx, j), ArenaVec::new(&cx), ArenaVec::new(&cx));
             j = j + 1usize;
         }
-        text(&cx, "ok")
+        Span::from_static(&cx, "ok")
     } else if op.is(&cx, "fields") {
         let types = Types::new(&cx, parse_program(&cx, form.at(&cx, 1usize).items, 0usize), counter);
         let found = types.fields(&cx, parse_type(&cx, form.at(&cx, 2usize)), Option::None);
@@ -471,10 +473,10 @@ fn run_case(&cx: Cx!['k], source: Text['k], counter: Fresh['k]) -> Text['k] {
             if i > 0usize {
                 out = out.push_static(" ");
             }
-            out = out.push_bytes(&cx, show(&cx, found.get(&cx, i)));
+            out = out.push_bytes(&cx, show(&cx, found.at(&cx, i)));
             i = i + 1usize;
         }
-        text_of(&cx, out.push_static("]"))
+        out.push_static("]").save(&cx)
     } else if op.is(&cx, "variants") {
         let types = Types::new(&cx, parse_program(&cx, form.at(&cx, 1usize).items, 0usize), counter);
         let found = types.variants(&cx, parse_type(&cx, form.at(&cx, 2usize)), Option::None);
@@ -484,35 +486,35 @@ fn run_case(&cx: Cx!['k], source: Text['k], counter: Fresh['k]) -> Text['k] {
             if i > 0usize {
                 out = out.push_static(" ");
             }
-            out = out.push_bytes(&cx, found.get(&cx, i).name).push_static(":").push_bytes(&cx, show(&cx, found.get(&cx, i).type));
+            out = out.push_bytes(&cx, found.at(&cx, i).name).push_static(":").push_bytes(&cx, show(&cx, found.at(&cx, i).type));
             i = i + 1usize;
         }
-        text_of(&cx, out.push_static("]"))
+        out.push_static("]").save(&cx)
     } else if op.is(&cx, "exposure") {
         let types = Types::new(&cx, parse_program(&cx, form.at(&cx, 1usize).items, 0usize), counter);
         let unit = match types.visible_shape(&cx, parse_type(&cx, form.at(&cx, 3usize)), Option::None, parse_kinds(&cx, form.at(&cx, 2usize))) {
-            Option::Some(t) => text_of(&cx, Buffer::new().push_bytes(&cx, show(&cx, t))),
-            Option::None => text(&cx, "hidden"),
+            Option::Some(t) => Buffer::new().push_bytes(&cx, show(&cx, t)).save(&cx),
+            Option::None => Span::from_static(&cx, "hidden"),
         };
-        text_of(&cx, Buffer::new().push_bytes(&cx, unit).push_static(" ").push_bytes(&cx, flag(&cx, types.concrete_exposure(&cx, parse_type(&cx, form.at(&cx, 3usize)), Option::None, parse_kinds(&cx, form.at(&cx, 2usize))))))
+        Buffer::new().push_bytes(&cx, unit).push_static(" ").push_bytes(&cx, flag(&cx, types.concrete_exposure(&cx, parse_type(&cx, form.at(&cx, 3usize)), Option::None, parse_kinds(&cx, form.at(&cx, 2usize))))).save(&cx)
     } else if op.is(&cx, "pattern") {
         let types = Types::new(&cx, parse_program(&cx, form.at(&cx, 1usize).items, 0usize), counter);
         match parse_type(&cx, form.at(&cx, 3usize)) {
             Type::Foreach(f) => flag(&cx, types.pattern_available(&cx, f, Option::None, parse_kinds(&cx, form.at(&cx, 2usize)))),
-            _ => fail(&cx, text(&cx, "a pattern case needs a foreach type")),
+            _ => fail(&cx, Span::from_static(&cx, "a pattern case needs a foreach type")),
         }
     } else {
-        fail(&cx, text_of(&cx, Buffer::new().push_static("unknown case ").push_bytes(&cx, op)))
+        fail(&cx, Buffer::new().push_static("unknown case ").push_bytes(&cx, op).save(&cx))
     }
 }
 
 // Runs each case in order, printing its result on a line of its own.
 forall 'k.
-fn selftest_types(&cx: Cx!['k], cases: Seq[Text['k], 'k]) {
+fn selftest_types(&cx: Domain!['k], cases: ArenaVec[Span['k], 'k]) {
     let counter = Fresh::new(&cx);
     var i = 0usize;
     while i < cases.len(&cx) {
-        text_of(&cx, Buffer::new().push_bytes(&cx, run_case(&cx, cases.get(&cx, i), counter)).push_static("\n")).print(&cx, 1);
+        print_buffer(1, Buffer::new().push_bytes(&cx, run_case(&cx, cases.at(&cx, i), counter)).push_static("\n"));
         i = i + 1usize;
     }
 }

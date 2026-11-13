@@ -3,7 +3,11 @@
 // This pass validates written contracts, not recursive layout or trait coherence. Premises are
 // checked for formation here and discharged by the assertion checker.
 
-use package::support::base::{Cell, Cx, Map, Seq, Set, Text, text, text_of};
+use std::collections::arena_vec::ArenaVec;
+use std::collections::arena_map::{ArenaMap, ArenaSet};
+use std::mem::Ref;
+use std::raw::Span;
+use std::alloc::arena::Domain;
 use std::bytes::buffer::Buffer;
 use package::kurs::core::{Block, Edge, Fun, Kind, ModuleId, Param, Premise, Program, Terminator, Trait, Type};
 use package::kurs::core as C;
@@ -15,22 +19,22 @@ use std::slice::Slice;
 
 // Children admissible for descent; a path cannot cross a binder.
 forall 'k.
-fn formation_children(&cx: Cx!['k], ty: Type['k]) -> Seq[Type['k], 'k] {
+fn formation_children(&cx: Domain!['k], ty: Type['k]) -> ArenaVec[Type['k], 'k] {
     match ty {
-        Type::Exists(_binders, _body) => Seq::new(&cx),
-        Type::Foreach(f) => Seq::one(&cx, f.source.get(&cx)),
-        Type::Fn(f) => if f.quantified.is_empty(&cx) { children(&cx, ty) } else { Seq::new(&cx) },
+        Type::Exists(_binders, _body) => ArenaVec::new(&cx),
+        Type::Foreach(f) => ArenaVec::one(&cx, f.source.copy(&cx)),
+        Type::Fn(f) => if f.quantified.is_empty(&cx) { children(&cx, ty) } else { ArenaVec::new(&cx) },
         _ => children(&cx, ty),
     }
 }
 
 forall 'k.
-fn strict_subterm(&cx: Cx!['k], child: Type['k], parent: Type['k]) -> bool {
+fn strict_subterm(&cx: Domain!['k], child: Type['k], parent: Type['k]) -> bool {
     let parts = formation_children(&cx, parent);
     var found = false;
     var i = 0usize;
     while !found && i < parts.len(&cx) {
-        found = equal(&cx, child, parts.get(&cx, i)) || strict_subterm(&cx, child, parts.get(&cx, i));
+        found = equal(&cx, child, parts.at(&cx, i)) || strict_subterm(&cx, child, parts.at(&cx, i));
         i = i + 1usize;
     }
     found
@@ -38,7 +42,7 @@ fn strict_subterm(&cx: Cx!['k], child: Type['k], parent: Type['k]) -> bool {
 
 // Componentwise subterms, with at least one strict component.
 forall 'k.
-fn nominal_descent(&cx: Cx!['k], args: Seq[Type['k], 'k], previous: Seq[Type['k], 'k]) -> bool {
+fn nominal_descent(&cx: Domain!['k], args: ArenaVec[Type['k], 'k], previous: ArenaVec[Type['k], 'k]) -> bool {
     if args.len(&cx) != previous.len(&cx) {
         return false;
     }
@@ -46,8 +50,8 @@ fn nominal_descent(&cx: Cx!['k], args: Seq[Type['k], 'k], previous: Seq[Type['k]
     var any = false;
     var i = 0usize;
     while i < args.len(&cx) {
-        let strict = strict_subterm(&cx, args.get(&cx, i), previous.get(&cx, i));
-        all = all && (equal(&cx, args.get(&cx, i), previous.get(&cx, i)) || strict);
+        let strict = strict_subterm(&cx, args.at(&cx, i), previous.at(&cx, i));
+        all = all && (equal(&cx, args.at(&cx, i), previous.at(&cx, i)) || strict);
         any = any || strict;
         i = i + 1usize;
     }
@@ -56,20 +60,20 @@ fn nominal_descent(&cx: Cx!['k], args: Seq[Type['k], 'k], previous: Seq[Type['k]
 
 // A reference to one brand, respecting nested brand binders.
 forall 'k.
-fn brand_occurs(&cx: Cx!['k], ty: Type['k], label: Text['k]) -> bool {
+fn brand_occurs(&cx: Domain!['k], ty: Type['k], label: Span['k]) -> bool {
     let unit = match ty {
         Type::Skolem(found) => {
             return found.eq(&cx, label);
         },
         Type::Exists(binders, _body) => {
-            if binders.has(&cx, label) {
+            if binders.contains(&cx, label) {
                 return false;
             }
         },
         Type::Fn(f) => {
             var i = 0usize;
             while i < f.quantified.len(&cx) {
-                if f.quantified.get(&cx, i).name.eq(&cx, label) {
+                if f.quantified.at(&cx, i).name.eq(&cx, label) {
                     return false;
                 }
                 i = i + 1usize;
@@ -81,7 +85,7 @@ fn brand_occurs(&cx: Cx!['k], ty: Type['k], label: Text['k]) -> bool {
     var found = false;
     var i = 0usize;
     while !found && i < parts.len(&cx) {
-        found = brand_occurs(&cx, parts.get(&cx, i), label);
+        found = brand_occurs(&cx, parts.at(&cx, i), label);
         i = i + 1usize;
     }
     found
@@ -91,7 +95,7 @@ fn brand_occurs(&cx: Cx!['k], ty: Type['k], label: Text['k]) -> bool {
 // assumptions and module of the declaration being formed. The assertion checker provides one.
 forall D, 'k.
 trait Discharge {
-    fn discharge_premise(discharger: D, &cx: Cx!['k], premise: Premise['k], env: Map[Text['k], Kind, 'k], premises: Seq[Premise['k], 'k], home: Option[ModuleId['k]]) -> bool;
+    fn discharge_premise(discharger: D, &cx: Domain!['k], premise: Premise['k], env: ArenaMap[Span['k], Kind, 'k], premises: ArenaVec[Premise['k], 'k], home: Option[ModuleId['k]]) -> bool;
 }
 
 // A formation that discharges nothing: its `discharge` stays none.
@@ -101,7 +105,7 @@ exposed struct NoDischarge {
 
 forall 'k.
 instance Discharge[NoDischarge, 'k] {
-    fn discharge_premise(discharger: NoDischarge, &cx: Cx!['k], premise: Premise['k], env: Map[Text['k], Kind, 'k], premises: Seq[Premise['k], 'k], home: Option[ModuleId['k]]) -> bool {
+    fn discharge_premise(discharger: NoDischarge, &cx: Domain!['k], premise: Premise['k], env: ArenaMap[Span['k], Kind, 'k], premises: ArenaVec[Premise['k], 'k], home: Option[ModuleId['k]]) -> bool {
         false
     }
 }
@@ -110,20 +114,20 @@ forall D, 'k.
 exposed struct Formation {
     program: Program['k],
     types: Types['k],
-    pos: Cell[Pos, 'k],
-    discharge: Cell[Option[D], 'k],
-    premises: Cell[Seq[Premise['k], 'k], 'k],
-    home: Cell[Option[ModuleId['k]], 'k],
+    pos: Ref[Pos, 'k],
+    discharge: Ref[Option[D], 'k],
+    premises: Ref[ArenaVec[Premise['k], 'k], 'k],
+    home: Ref[Option[ModuleId['k]], 'k],
     // nominal types whose premises are being formed, with their arguments
-    active: Seq[(Text['k], Seq[Type['k], 'k]), 'k],
+    active: ArenaVec[(Span['k], ArenaVec[Type['k], 'k]), 'k],
     // the resolver that locates errors, when a declaration's file is known
-    reporter: Cell[Option[Resolver['k]], 'k],
+    reporter: Ref[Option[Resolver['k]], 'k],
 }
 
 forall 'k.
-fn with_kind(&cx: Cx!['k], env: Map[Text['k], Kind, 'k], name: Text['k], kind: Kind) -> Map[Text['k], Kind, 'k] {
-    let out = env.copy(&cx);
-    out.set(&cx, name, kind);
+fn with_kind(&cx: Domain!['k], env: ArenaMap[Span['k], Kind, 'k], name: Span['k], kind: Kind) -> ArenaMap[Span['k], Kind, 'k] {
+    let out = env.clone(&cx);
+    out.insert(&cx, name, kind);
     out
 }
 
@@ -132,11 +136,11 @@ fn is_brand(kind: Kind) -> bool {
 }
 
 forall 'k.
-fn params_of(&cx: Cx!['k], names: Seq[Text['k], 'k], kind: Kind) -> Seq[Param['k], 'k] {
-    let out: Seq[Param['k], 'k] = Seq::new(&cx);
+fn params_of(&cx: Domain!['k], names: ArenaVec[Span['k], 'k], kind: Kind) -> ArenaVec[Param['k], 'k] {
+    let out: ArenaVec[Param['k], 'k] = ArenaVec::new(&cx);
     var i = 0usize;
     while i < names.len(&cx) {
-        out.push(&cx, Param.{ name: names.get(&cx, i), kind });
+        out.push(&cx, Param.{ name: names.at(&cx, i), kind });
         i = i + 1usize;
     }
     out
@@ -151,87 +155,87 @@ fn is_ignored(t: Type['k]) -> bool {
 }
 
 forall 'k.
-fn concat_params(&cx: Cx!['k], a: Seq[Param['k], 'k], b: Seq[Param['k], 'k]) -> Seq[Param['k], 'k] {
-    let out = a.copy(&cx);
+fn concat_params(&cx: Domain!['k], a: ArenaVec[Param['k], 'k], b: ArenaVec[Param['k], 'k]) -> ArenaVec[Param['k], 'k] {
+    let out = a.clone(&cx);
     out.append(&cx, b);
     out
 }
 
 forall 'k.
-fn concat_premises(&cx: Cx!['k], a: Seq[Premise['k], 'k], b: Seq[Premise['k], 'k]) -> Seq[Premise['k], 'k] {
-    let out = a.copy(&cx);
+fn concat_premises(&cx: Domain!['k], a: ArenaVec[Premise['k], 'k], b: ArenaVec[Premise['k], 'k]) -> ArenaVec[Premise['k], 'k] {
+    let out = a.clone(&cx);
     out.append(&cx, b);
     out
 }
 
 forall D, 'k where Copy[D], Discharge[D, 'k].
 impl Formation[D, 'k] {
-    fn new(&cx: Cx!['k], program: Program['k], counter: Fresh['k]) -> Formation[D, 'k] {
+    fn new(&cx: Domain!['k], program: Program['k], counter: Fresh['k]) -> Formation[D, 'k] {
         Formation.{
             program,
             types: Types::new(&cx, program, counter),
-            pos: Cell::new(&cx, no_pos()),
-            discharge: Cell::new(&cx, Option::None),
-            premises: Cell::new(&cx, Seq::new(&cx)),
-            home: Cell::new(&cx, Option::None),
-            active: Seq::new(&cx),
-            reporter: Cell::new(&cx, Option::None),
+            pos: Ref::new(&cx, no_pos()),
+            discharge: Ref::new(&cx, Option::None),
+            premises: Ref::new(&cx, ArenaVec::new(&cx)),
+            home: Ref::new(&cx, Option::None),
+            active: ArenaVec::new(&cx),
+            reporter: Ref::new(&cx, Option::None),
         }
     }
 
-    fn fail(self, &cx: Cx!['k], message: Text['k]) -> ! {
-        let full = text_of(&cx, Buffer::new().push_static("type formation: ").push_bytes(&cx, message));
-        match self.reporter.get(&cx) {
-            Option::Some(r) => r.fail(&cx, full, self.pos.get(&cx)),
-            Option::None => kurs_error(&cx, full, self.pos.get(&cx)),
+    fn fail(self, &cx: Domain!['k], message: Span['k]) -> ! {
+        let full = Buffer::new().push_static("type formation: ").push_bytes(&cx, message).save(&cx);
+        match self.reporter.copy(&cx) {
+            Option::Some(r) => r.fail(&cx, full, self.pos.copy(&cx)),
+            Option::None => kurs_error(&cx, full, self.pos.copy(&cx)),
         }
     }
 
-    fn fail_static(self, &cx: Cx!['k], message: Slice[u8, 'static]) -> ! {
-        self.fail(&cx, text(&cx, message))
+    fn fail_static(self, &cx: Domain!['k], message: Slice[u8, 'static]) -> ! {
+        self.fail(&cx, Span::from_static(&cx, message))
     }
 
-    fn extend(self, &cx: Cx!['k], env: Map[Text['k], Kind, 'k], params: Seq[Param['k], 'k]) -> Map[Text['k], Kind, 'k] {
-        let names: Set[Text['k], 'k] = Set::new(&cx);
+    fn extend(self, &cx: Domain!['k], env: ArenaMap[Span['k], Kind, 'k], params: ArenaVec[Param['k], 'k]) -> ArenaMap[Span['k], Kind, 'k] {
+        let names: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
         var i = 0usize;
         while i < params.len(&cx) {
-            names.add(&cx, params.get(&cx, i).name);
+            names.insert(&cx, params.at(&cx, i).name);
             i = i + 1usize;
         }
         if names.len(&cx) != params.len(&cx) {
             self.fail_static(&cx, "duplicate parameter");
         }
-        if names.has(&cx, text(&cx, "static")) {
+        if names.contains(&cx, Span::from_static(&cx, "static")) {
             self.fail_static(&cx, "static is not a parameter name");
         }
         // A `Kind` is one of the three kinds by construction.
-        let out = env.copy(&cx);
+        let out = env.clone(&cx);
         var j = 0usize;
         while j < params.len(&cx) {
-            out.set(&cx, params.get(&cx, j).name, params.get(&cx, j).kind);
+            out.insert(&cx, params.at(&cx, j).name, params.at(&cx, j).kind);
             j = j + 1usize;
         }
         out
     }
 
-    fn fits(self, &cx: Cx!['k], ty: Type['k], want: Kind, env: Map[Text['k], Kind, 'k]) {
+    fn fits(self, &cx: Domain!['k], ty: Type['k], want: Kind, env: ArenaMap[Span['k], Kind, 'k]) {
         let got = self.kind(&cx, ty, env);
         if is_brand(got) != is_brand(want) {
-            self.fail(&cx, text_of(&cx, Buffer::new().push_static("expected ").push_bytes(&cx, kind_name(&cx, want)).push_static(" argument")));
+            self.fail(&cx, Buffer::new().push_static("expected ").push_bytes(&cx, kind_name(&cx, want)).push_static(" argument").save(&cx));
         }
         if C::same_kind(want, Kind::Copy) && !self.types.is_copy(&cx, ty, env) {
             self.fail_static(&cx, "expected Copy argument");
         }
     }
 
-    fn arguments(self, &cx: Cx!['k], params: Seq[Param['k], 'k], args: Seq[Type['k], 'k], env: Map[Text['k], Kind, 'k], retain: bool) {
+    fn arguments(self, &cx: Domain!['k], params: ArenaVec[Param['k], 'k], args: ArenaVec[Type['k], 'k], env: ArenaMap[Span['k], Kind, 'k], retain: bool) {
         if params.len(&cx) != args.len(&cx) {
             self.fail_static(&cx, "wrong number of type arguments");
         }
         var i = 0usize;
         while i < params.len(&cx) {
-            let param = params.get(&cx, i);
-            let arg = args.get(&cx, i);
+            let param = params.at(&cx, i);
+            let arg = args.at(&cx, i);
             let skip = retain && is_brand(param.kind) && is_ignored(arg);
             if !skip {
                 self.fits(&cx, arg, param.kind, env);
@@ -240,21 +244,21 @@ impl Formation[D, 'k] {
         }
     }
 
-    fn premise(self, &cx: Cx!['k], premise: Premise['k], env: Map[Text['k], Kind, 'k]) {
+    fn premise(self, &cx: Domain!['k], premise: Premise['k], env: ArenaMap[Span['k], Kind, 'k]) {
         let params = if premise.trait_name.is(&cx, "builtin::Exposed") {
-            Seq::one(&cx, Param.{ name: text(&cx, "T"), kind: Kind::Any })
+            ArenaVec::one(&cx, Param.{ name: Span::from_static(&cx, "T"), kind: Kind::Any })
         } else {
             match self.program.traits.get(&cx, premise.trait_name) {
                 Option::Some(t) => self.trait_params(&cx, t),
-                Option::None => self.fail(&cx, text_of(&cx, Buffer::new().push_static("unknown trait ").push_bytes(&cx, premise.trait_name))),
+                Option::None => self.fail(&cx, Buffer::new().push_static("unknown trait ").push_bytes(&cx, premise.trait_name).save(&cx)),
             }
         };
         self.arguments(&cx, params, premise.args, env, false);
     }
 
-    fn trait_params(self, &cx: Cx!['k], t: Trait['k]) -> Seq[Param['k], 'k] {
-        let kinds: Seq[Kind, 'k] = if t.param_kinds.is_empty(&cx) {
-            let all: Seq[Kind, 'k] = Seq::new(&cx);
+    fn trait_params(self, &cx: Domain!['k], t: Trait['k]) -> ArenaVec[Param['k], 'k] {
+        let kinds: ArenaVec[Kind, 'k] = if t.param_kinds.is_empty(&cx) {
+            let all: ArenaVec[Kind, 'k] = ArenaVec::new(&cx);
             var i = 0usize;
             while i < t.params.len(&cx) {
                 all.push(&cx, Kind::Any);
@@ -267,17 +271,17 @@ impl Formation[D, 'k] {
         if kinds.len(&cx) != t.params.len(&cx) {
             self.fail_static(&cx, "trait parameter kinds disagree");
         }
-        let out: Seq[Param['k], 'k] = Seq::new(&cx);
+        let out: ArenaVec[Param['k], 'k] = ArenaVec::new(&cx);
         var j = 0usize;
         while j < kinds.len(&cx) {
-            out.push(&cx, Param.{ name: t.params.get(&cx, j), kind: kinds.get(&cx, j) });
+            out.push(&cx, Param.{ name: t.params.at(&cx, j), kind: kinds.at(&cx, j) });
             j = j + 1usize;
         }
         out
     }
 
     // Validate structure and distinguish brands from values; fits refines Copy.
-    fn kind(self, &cx: Cx!['k], ty: Type['k], env: Map[Text['k], Kind, 'k]) -> Kind {
+    fn kind(self, &cx: Domain!['k], ty: Type['k], env: ArenaMap[Span['k], Kind, 'k]) -> Kind {
         match ty {
             Type::Skolem(label) => {
                 let in_scope = match env.get(&cx, label) {
@@ -285,52 +289,52 @@ impl Formation[D, 'k] {
                     Option::None => false,
                 };
                 if !in_scope {
-                    self.fail(&cx, text_of(&cx, Buffer::new().push_static("brand ").push_bytes(&cx, label).push_static(" is not in scope")));
+                    self.fail(&cx, Buffer::new().push_static("brand ").push_bytes(&cx, label).push_static(" is not in scope").save(&cx));
                 }
                 return Kind::Brand;
             },
             Type::Named(name, args) => self.named(&cx, name, args, env),
-            Type::Brand(brand) => self.fits(&cx, brand.get(&cx), Kind::Brand, env),
+            Type::Brand(brand) => self.fits(&cx, brand.copy(&cx), Kind::Brand, env),
             Type::Exists(binders, body) => {
                 if binders.is_empty(&cx) {
                     self.fail_static(&cx, "existential requires at least one brand binder");
                 }
                 let inner = self.extend(&cx, env, params_of(&cx, binders, Kind::Brand));
-                let unit = match body.get(&cx) {
+                let unit = match body.copy(&cx) {
                     Type::Exists(_b, _t) => self.fail_static(&cx, "nested existential binders must be flattened"),
                     _ => (),
                 };
                 var i = 0usize;
                 while i < binders.len(&cx) {
-                    if !brand_occurs(&cx, body.get(&cx), binders.get(&cx, i)) {
+                    if !brand_occurs(&cx, body.copy(&cx), binders.at(&cx, i)) {
                         self.fail_static(&cx, "existential brand binder is unused");
                     }
                     i = i + 1usize;
                 }
-                self.fits(&cx, body.get(&cx), Kind::Any, inner);
+                self.fits(&cx, body.copy(&cx), Kind::Any, inner);
             },
             Type::Foreach(f) => {
-                self.fits(&cx, f.source.get(&cx), Kind::Any, env);
-                let available = match f.source.get(&cx) {
+                self.fits(&cx, f.source.copy(&cx), Kind::Any, env);
+                let available = match f.source.copy(&cx) {
                     Type::Foreach(source) => foreach_binders(&cx, source),
-                    _ => Seq::new(&cx),
+                    _ => ArenaVec::new(&cx),
                 };
-                if !available.slice(&cx, 0usize, f.retained.len(&cx)).same(&cx, f.retained) {
+                if !available.slice(&cx, 0usize, f.retained.len(&cx)).eq(&cx, f.retained) {
                     self.fail_static(&cx, "foreach retained binders must be a source prefix");
                 }
-                self.fits(&cx, f.body.get(&cx), Kind::Any, self.extend(&cx, env, params_of(&cx, foreach_binders(&cx, f), Kind::Any)));
+                self.fits(&cx, f.body.copy(&cx), Kind::Any, self.extend(&cx, env, params_of(&cx, foreach_binders(&cx, f), Kind::Any)));
             },
             Type::Fn(f) => {
                 var i = 0usize;
                 while i < f.quantified.len(&cx) {
-                    if !is_brand(f.quantified.get(&cx, i).kind) {
+                    if !is_brand(f.quantified.at(&cx, i).kind) {
                         self.fail_static(&cx, "function values quantify only brands");
                     }
                     i = i + 1usize;
                 }
                 var j = 0usize;
                 while j < f.places.len(&cx) {
-                    if f.places.get(&cx, j) >= f.params.len(&cx) {
+                    if f.places.at(&cx, j) >= f.params.len(&cx) {
                         self.fail_static(&cx, "function place index out of range");
                     }
                     j = j + 1usize;
@@ -338,14 +342,14 @@ impl Formation[D, 'k] {
                 let inner = self.extend(&cx, env, f.quantified);
                 var k = 0usize;
                 while k < f.params.len(&cx) {
-                    self.fits(&cx, f.params.get(&cx, k), Kind::Any, inner);
+                    self.fits(&cx, f.params.at(&cx, k), Kind::Any, inner);
                     k = k + 1usize;
                 }
-                self.fits(&cx, f.ret.get(&cx), Kind::Any, inner);
+                self.fits(&cx, f.ret.copy(&cx), Kind::Any, inner);
             },
             Type::Prim(name) => {
                 if !C::is_prim(&cx, name) {
-                    self.fail(&cx, text_of(&cx, Buffer::new().push_static("unknown primitive ").push_bytes(&cx, name)));
+                    self.fail(&cx, Buffer::new().push_static("unknown primitive ").push_bytes(&cx, name).save(&cx));
                 }
             },
             // A length is never negative: it is unsigned.
@@ -361,11 +365,11 @@ impl Formation[D, 'k] {
         Kind::Any
     }
 
-    fn components(self, &cx: Cx!['k], ty: Type['k], members: Seq[C::Member['k], 'k], env: Map[Text['k], Kind, 'k]) {
-        let names: Set[Text['k], 'k] = Set::new(&cx);
+    fn components(self, &cx: Domain!['k], ty: Type['k], members: ArenaVec[C::Member['k], 'k], env: ArenaMap[Span['k], Kind, 'k]) {
+        let names: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
         var i = 0usize;
         while i < members.len(&cx) {
-            names.add(&cx, members.get(&cx, i).name);
+            names.insert(&cx, members.at(&cx, i).name);
             i = i + 1usize;
         }
         if names.len(&cx) != members.len(&cx) {
@@ -374,20 +378,20 @@ impl Formation[D, 'k] {
         self.children_fit(&cx, ty, env);
     }
 
-    fn children_fit(self, &cx: Cx!['k], ty: Type['k], env: Map[Text['k], Kind, 'k]) {
+    fn children_fit(self, &cx: Domain!['k], ty: Type['k], env: ArenaMap[Span['k], Kind, 'k]) {
         let parts = children(&cx, ty);
         var i = 0usize;
         while i < parts.len(&cx) {
-            self.fits(&cx, parts.get(&cx, i), Kind::Any, env);
+            self.fits(&cx, parts.at(&cx, i), Kind::Any, env);
             i = i + 1usize;
         }
     }
 
-    fn named(self, &cx: Cx!['k], name: Text['k], args: Seq[Type['k], 'k], env: Map[Text['k], Kind, 'k]) {
+    fn named(self, &cx: Domain!['k], name: Span['k], args: ArenaVec[Type['k], 'k], env: ArenaMap[Span['k], Kind, 'k]) {
         let unit = match env.get(&cx, name) {
             Option::Some(k) => {
                 if !args.is_empty(&cx) || is_brand(k) {
-                    self.fail(&cx, text_of(&cx, Buffer::new().push_static("invalid type parameter ").push_bytes(&cx, name)));
+                    self.fail(&cx, Buffer::new().push_static("invalid type parameter ").push_bytes(&cx, name).save(&cx));
                 }
                 return ();
             },
@@ -395,10 +399,10 @@ impl Formation[D, 'k] {
         };
         let decl = match self.program.types.get(&cx, name) {
             Option::Some(d) => d,
-            Option::None => self.fail(&cx, text_of(&cx, Buffer::new().push_static("unknown type ").push_bytes(&cx, name))),
+            Option::None => self.fail(&cx, Buffer::new().push_static("unknown type ").push_bytes(&cx, name).save(&cx)),
         };
         self.arguments(&cx, decl.params, args, env, false);
-        let discharger = match self.discharge.get(&cx) {
+        let discharger = match self.discharge.copy(&cx) {
             Option::Some(d) => d,
             Option::None => {
                 return ();
@@ -409,71 +413,71 @@ impl Formation[D, 'k] {
         }
         var i = 0usize;
         while i < self.active.len(&cx) {
-            let (n, previous) = self.active.get(&cx, i);
+            let (n, previous) = self.active.at(&cx, i);
             if n.eq(&cx, name) && !nominal_descent(&cx, args, previous) {
-                self.fail(&cx, text_of(&cx, Buffer::new().push_static("non-descending nominal premise formation for ").push_bytes(&cx, name)));
+                self.fail(&cx, Buffer::new().push_static("non-descending nominal premise formation for ").push_bytes(&cx, name).save(&cx));
             }
             i = i + 1usize;
         }
         self.active.push(&cx, (name, args));
-        let sub: Map[Text['k], Type['k], 'k] = Map::new(&cx);
+        let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
         var j = 0usize;
         while j < decl.params.len(&cx) && j < args.len(&cx) {
-            sub.set(&cx, decl.params.get(&cx, j).name, args.get(&cx, j));
+            sub.insert(&cx, decl.params.at(&cx, j).name, args.at(&cx, j));
             j = j + 1usize;
         }
         var k = 0usize;
         while k < decl.premises.len(&cx) {
-            let p = decl.premises.get(&cx, k);
-            let required_args: Seq[Type['k], 'k] = Seq::new(&cx);
+            let p = decl.premises.at(&cx, k);
+            let required_args: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
             var a = 0usize;
             while a < p.args.len(&cx) {
-                required_args.push(&cx, subst(&cx, p.args.get(&cx, a), sub, self.types.counter));
+                required_args.push(&cx, subst(&cx, p.args.at(&cx, a), sub, self.types.counter));
                 a = a + 1usize;
             }
             let required = Premise.{ trait_name: p.trait_name, args: required_args };
             self.premise(&cx, required, env);
-            if !Discharge[D, 'k]::discharge_premise(discharger, &cx, required, env, self.premises.get(&cx), self.home.get(&cx)) {
-                self.fail(&cx, text_of(&cx, Buffer::new().push_static("unsatisfied nominal premise ").push_bytes(&cx, required.trait_name).push_static(" for ").push_bytes(&cx, name)));
+            if !Discharge[D, 'k]::discharge_premise(discharger, &cx, required, env, self.premises.copy(&cx), self.home.copy(&cx)) {
+                self.fail(&cx, Buffer::new().push_static("unsatisfied nominal premise ").push_bytes(&cx, required.trait_name).push_static(" for ").push_bytes(&cx, name).save(&cx));
             }
             k = k + 1usize;
         }
         let unit = self.active.pop(&cx);
     }
 
-    fn function(self, &cx: Cx!['k], fun: Fun['k], outer: Seq[Param['k], 'k], premises: Seq[Premise['k], 'k]) {
+    fn function(self, &cx: Domain!['k], fun: Fun['k], outer: ArenaVec[Param['k], 'k], premises: ArenaVec[Premise['k], 'k]) {
         self.pos.set(&cx, fun.pos);
         let all_premises = concat_premises(&cx, premises, fun.premises);
         self.home.set(&cx, fun.home);
         self.premises.set(&cx, all_premises);
         let params = concat_params(&cx, outer, fun.params);
-        let env = self.extend(&cx, with_kind(&cx, Map::new(&cx), text(&cx, "static"), Kind::Brand), params);
+        let env = self.extend(&cx, with_kind(&cx, ArenaMap::new(&cx), Span::from_static(&cx, "static"), Kind::Brand), params);
         var i = 0usize;
         while i < all_premises.len(&cx) {
-            self.premise(&cx, all_premises.get(&cx, i), env);
+            self.premise(&cx, all_premises.at(&cx, i), env);
             i = i + 1usize;
         }
         var j = 0usize;
         while j < fun.ptypes.len(&cx) {
-            self.fits(&cx, fun.ptypes.get(&cx, j), Kind::Any, env);
+            self.fits(&cx, fun.ptypes.at(&cx, j), Kind::Any, env);
             j = j + 1usize;
         }
         self.fits(&cx, fun.ret, Kind::Any, env);
-        let generic_brands: Set[Text['k], 'k] = Set::new(&cx);
+        let generic_brands: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
         var g = 0usize;
         while g < params.len(&cx) {
-            if is_brand(params.get(&cx, g).kind) {
-                generic_brands.add(&cx, params.get(&cx, g).name);
+            if is_brand(params.at(&cx, g).kind) {
+                generic_brands.insert(&cx, params.at(&cx, g).name);
             }
             g = g + 1usize;
         }
         var l = 0usize;
         while l < fun.locals.len(&cx) {
-            let t = fun.locals.get(&cx, l).type;
-            let brands = free_brands(&cx, t).items(&cx);
+            let t = fun.locals.at(&cx, l).type;
+            let brands = free_brands(&cx, t).keys(&cx);
             var b = 0usize;
             while b < brands.len(&cx) {
-                if !generic_brands.has(&cx, brands.get(&cx, b)) {
+                if !generic_brands.contains(&cx, brands.at(&cx, b)) {
                     self.fail_static(&cx, "local types may mention only function-generic free brands");
                 }
                 b = b + 1usize;
@@ -483,16 +487,16 @@ impl Formation[D, 'k] {
         }
         var n = 0usize;
         while n < fun.blocks.len(&cx) {
-            self.block(&cx, fun.blocks.get(&cx, n), env);
+            self.block(&cx, fun.blocks.at(&cx, n), env);
             n = n + 1usize;
         }
     }
 
-    fn block(self, &cx: Cx!['k], block: Block['k], env: Map[Text['k], Kind, 'k]) {
+    fn block(self, &cx: Domain!['k], block: Block['k], env: ArenaMap[Span['k], Kind, 'k]) {
         self.pos.set(&cx, block.pos);
         var i = 0usize;
         while i < block.brands.len(&cx) {
-            let rebinds = match env.get(&cx, block.brands.get(&cx, i)) {
+            let rebinds = match env.get(&cx, block.brands.at(&cx, i)) {
                 Option::Some(k) => is_brand(k),
                 Option::None => false,
             };
@@ -504,33 +508,33 @@ impl Formation[D, 'k] {
         var scope = self.extend(&cx, env, params_of(&cx, block.brands, Kind::Brand));
         var o = 0usize;
         while o < block.opened.len(&cx) {
-            let view_brands = block.opened.get(&cx, o).brands;
+            let view_brands = block.opened.at(&cx, o).brands;
             var v = 0usize;
             while v < view_brands.len(&cx) {
-                self.fits(&cx, Type::Skolem.(view_brands.get(&cx, v)), Kind::Brand, scope);
+                self.fits(&cx, Type::Skolem.(view_brands.at(&cx, v)), Kind::Brand, scope);
                 v = v + 1usize;
             }
             o = o + 1usize;
         }
         var p = 0usize;
         while p < block.params.len(&cx) {
-            self.fits(&cx, block.params.get(&cx, p).type, Kind::Any, scope);
+            self.fits(&cx, block.params.at(&cx, p).type, Kind::Any, scope);
             p = p + 1usize;
         }
         var n = 0usize;
         while n < block.instrs.len(&cx) {
-            let instr = block.instrs.get(&cx, n);
+            let instr = block.instrs.at(&cx, n);
             self.pos.set(&cx, instr.pos);
             let unit = match instr.ty {
                 Option::Some(t) => self.fits(&cx, t, Kind::Any, scope),
                 Option::None => (),
             };
             let call = instr.op.is(&cx, "call") || instr.op.is(&cx, "fn");
-            if call && self.program.funs.has(&cx, instr.args.get(&cx, 0usize)) {
-                self.arguments(&cx, self.program.funs.at(&cx, instr.args.get(&cx, 0usize)).params, instr.tys, scope, instr.op.is(&cx, "fn"));
-            } else if call && self.program.externs.has(&cx, instr.args.get(&cx, 0usize)) {
-                self.arguments(&cx, Seq::new(&cx), instr.tys, scope, false);
-            } else if instr.op.is(&cx, "foreach") && self.program.funs.has(&cx, instr.args.get(&cx, 1usize)) {
+            if call && self.program.funs.contains(&cx, instr.args.at(&cx, 0usize)) {
+                self.arguments(&cx, self.program.funs.at(&cx, instr.args.at(&cx, 0usize)).params, instr.tys, scope, instr.op.is(&cx, "fn"));
+            } else if call && self.program.externs.contains(&cx, instr.args.at(&cx, 0usize)) {
+                self.arguments(&cx, ArenaVec::new(&cx), instr.tys, scope, false);
+            } else if instr.op.is(&cx, "foreach") && self.program.funs.contains(&cx, instr.args.at(&cx, 1usize)) {
                 let count = match instr.ty {
                     Option::Some(t) => match t {
                         Type::Foreach(f) => foreach_binders(&cx, f).len(&cx),
@@ -538,22 +542,22 @@ impl Formation[D, 'k] {
                     },
                     Option::None => 0usize,
                 };
-                let mapper = self.program.funs.at(&cx, instr.args.get(&cx, 1usize));
+                let mapper = self.program.funs.at(&cx, instr.args.at(&cx, 1usize));
                 let leading = mapper.params.slice(&cx, 0usize, count);
                 var q = 0usize;
                 while q < leading.len(&cx) {
-                    if is_brand(leading.get(&cx, q).kind) {
+                    if is_brand(leading.at(&cx, q).kind) {
                         self.fail_static(&cx, "foreach binders require value parameters");
                     }
                     q = q + 1usize;
                 }
-                self.arguments(&cx, mapper.params.from(&cx, count), instr.tys, scope, false);
+                self.arguments(&cx, mapper.params.skip(&cx, count), instr.tys, scope, false);
             } else if instr.op.is(&cx, "trait_call") {
-                self.premise(&cx, Premise.{ trait_name: instr.args.get(&cx, 0usize), args: instr.tys }, scope);
+                self.premise(&cx, Premise.{ trait_name: instr.args.at(&cx, 0usize), args: instr.tys }, scope);
             } else {
                 var t = 0usize;
                 while t < instr.tys.len(&cx) {
-                    let unit = self.kind(&cx, instr.tys.get(&cx, t), scope);
+                    let unit = self.kind(&cx, instr.tys.at(&cx, t), scope);
                     t = t + 1usize;
                 }
             }
@@ -562,14 +566,14 @@ impl Formation[D, 'k] {
             }
             n = n + 1usize;
         }
-        let edges: Seq[Edge['k], 'k] = Seq::new(&cx);
+        let edges: ArenaVec[Edge['k], 'k] = ArenaVec::new(&cx);
         let unit = match block.term {
             Terminator::Switch(_scrutinee, ty, arms, pos) => {
                 self.pos.set(&cx, pos);
                 self.fits(&cx, ty, Kind::Any, scope);
                 var a = 0usize;
                 while a < arms.len(&cx) {
-                    edges.push(&cx, arms.get(&cx, a).edge);
+                    edges.push(&cx, arms.at(&cx, a).edge);
                     a = a + 1usize;
                 }
             },
@@ -587,28 +591,28 @@ impl Formation[D, 'k] {
         };
         var e = 0usize;
         while e < edges.len(&cx) {
-            let tys = edges.get(&cx, e).tys;
+            let tys = edges.at(&cx, e).tys;
             var t = 0usize;
             while t < tys.len(&cx) {
-                self.fits(&cx, tys.get(&cx, t), Kind::Brand, scope);
+                self.fits(&cx, tys.at(&cx, t), Kind::Brand, scope);
                 t = t + 1usize;
             }
             e = e + 1usize;
         }
     }
 
-    fn declarations(self, &cx: Cx!['k]) {
-        let env = with_kind(&cx, Map::new(&cx), text(&cx, "static"), Kind::Brand);
+    fn declarations(self, &cx: Domain!['k]) {
+        let env = with_kind(&cx, ArenaMap::new(&cx), Span::from_static(&cx, "static"), Kind::Brand);
         let decls = self.program.types.values(&cx);
         var i = 0usize;
         while i < decls.len(&cx) {
-            let decl = decls.get(&cx, i);
+            let decl = decls.at(&cx, i);
             self.home.set(&cx, decl.home);
             self.premises.set(&cx, decl.premises);
             let scope = self.extend(&cx, env, decl.params);
             var p = 0usize;
             while p < decl.premises.len(&cx) {
-                self.premise(&cx, decl.premises.get(&cx, p), scope);
+                self.premise(&cx, decl.premises.at(&cx, p), scope);
                 p = p + 1usize;
             }
             self.fits(&cx, decl.body, Kind::Any, scope);
@@ -617,16 +621,16 @@ impl Formation[D, 'k] {
         let traits = self.program.traits.values(&cx);
         var t = 0usize;
         while t < traits.len(&cx) {
-            let tr = traits.get(&cx, t);
+            let tr = traits.at(&cx, t);
             self.home.set(&cx, tr.home);
-            self.premises.set(&cx, Seq::new(&cx));
+            self.premises.set(&cx, ArenaVec::new(&cx));
             let scope = self.extend(&cx, env, self.trait_params(&cx, tr));
             var m = 0usize;
             while m < tr.methods.len(&cx) {
-                let method = tr.methods.get(&cx, m);
+                let method = tr.methods.at(&cx, m);
                 var k = 0usize;
                 while k < method.ptypes.len(&cx) {
-                    self.fits(&cx, method.ptypes.get(&cx, k), Kind::Any, scope);
+                    self.fits(&cx, method.ptypes.at(&cx, k), Kind::Any, scope);
                     k = k + 1usize;
                 }
                 self.fits(&cx, method.ret, Kind::Any, scope);
@@ -637,10 +641,10 @@ impl Formation[D, 'k] {
         let groups = self.program.instances.values(&cx);
         var g = 0usize;
         while g < groups.len(&cx) {
-            let insts = groups.get(&cx, g);
+            let insts = groups.at(&cx, g);
             var n = 0usize;
             while n < insts.len(&cx) {
-                let inst = insts.get(&cx, n);
+                let inst = insts.at(&cx, n);
                 self.pos.set(&cx, inst.pos);
                 self.home.set(&cx, inst.home);
                 self.premises.set(&cx, inst.premises);
@@ -648,7 +652,7 @@ impl Formation[D, 'k] {
                 self.premise(&cx, Premise.{ trait_name: inst.trait_name, args: inst.head }, scope);
                 var p = 0usize;
                 while p < inst.premises.len(&cx) {
-                    self.premise(&cx, inst.premises.get(&cx, p), scope);
+                    self.premise(&cx, inst.premises.at(&cx, p), scope);
                     p = p + 1usize;
                 }
                 n = n + 1usize;
@@ -656,11 +660,11 @@ impl Formation[D, 'k] {
             g = g + 1usize;
         }
         self.home.set(&cx, Option::None);
-        self.premises.set(&cx, Seq::new(&cx));
+        self.premises.set(&cx, ArenaVec::new(&cx));
         let externs = self.program.externs.values(&cx);
         var x = 0usize;
         while x < externs.len(&cx) {
-            let ext = externs.get(&cx, x);
+            let ext = externs.at(&cx, x);
             self.pos.set(&cx, ext.pos);
             let unit = match ext.ret {
                 Option::None => self.fail_static(&cx, "extern requires a type"),
@@ -669,7 +673,7 @@ impl Formation[D, 'k] {
                         Option::Some(ptypes) => {
                             var k = 0usize;
                             while k < ptypes.len(&cx) {
-                                self.fits(&cx, ptypes.get(&cx, k), Kind::Any, env);
+                                self.fits(&cx, ptypes.at(&cx, k), Kind::Any, env);
                                 k = k + 1usize;
                             }
                         },
@@ -683,7 +687,7 @@ impl Formation[D, 'k] {
         let datas = self.program.datas.values(&cx);
         var d = 0usize;
         while d < datas.len(&cx) {
-            let data = datas.get(&cx, d);
+            let data = datas.at(&cx, d);
             self.home.set(&cx, data.home);
             self.pos.set(&cx, no_pos());
             self.fits(&cx, data.ty, Kind::Any, env);

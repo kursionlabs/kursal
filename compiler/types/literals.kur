@@ -1,6 +1,8 @@
 // Pure scalar-literal contract shared by source lowering and core assertions.
 
-use package::support::base::{Cx, Text, fail, text};
+use package::support::base::fail;
+use std::raw::Span;
+use std::alloc::arena::Domain;
 use package::kurs::core::Type;
 use package::kurs::core as C;
 use std::float::parse_f64;
@@ -13,9 +15,9 @@ fn is_digit(b: u8) -> bool {
 
 // The end of the digits of `t` starting at `i`.
 forall 'k.
-fn digits_end(&cx: Cx!['k], t: Text['k], i: usize) -> usize {
+fn digits_end(&cx: Domain!['k], t: Span['k], i: usize) -> usize {
     var j = i;
-    while j < t.len() && is_digit(t.byte(&cx, j)) {
+    while j < t.len() && is_digit(t.byte_or_zero(&cx, j)) {
         j = j + 1usize;
     }
     j
@@ -23,25 +25,25 @@ fn digits_end(&cx: Cx!['k], t: Text['k], i: usize) -> usize {
 
 // `t` matches `[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?` entirely.
 forall 'k.
-fn float_syntax(&cx: Cx!['k], t: Text['k]) -> bool {
+fn float_syntax(&cx: Domain!['k], t: Span['k]) -> bool {
     var i = 0usize;
-    if t.byte(&cx, i) == b'+' || t.byte(&cx, i) == b'-' {
+    if t.byte_or_zero(&cx, i) == b'+' || t.byte_or_zero(&cx, i) == b'-' {
         i = i + 1usize;
     }
     let whole = digits_end(&cx, t, i);
     if whole > i {
         i = whole;
-        if i < t.len() && t.byte(&cx, i) == b'.' {
+        if i < t.len() && t.byte_or_zero(&cx, i) == b'.' {
             i = digits_end(&cx, t, i + 1usize);
         }
-    } else if i < t.len() && t.byte(&cx, i) == b'.' && digits_end(&cx, t, i + 1usize) > i + 1usize {
+    } else if i < t.len() && t.byte_or_zero(&cx, i) == b'.' && digits_end(&cx, t, i + 1usize) > i + 1usize {
         i = digits_end(&cx, t, i + 1usize);
     } else {
         return false;
     }
-    if i < t.len() && (t.byte(&cx, i) == b'e' || t.byte(&cx, i) == b'E') {
+    if i < t.len() && (t.byte_or_zero(&cx, i) == b'e' || t.byte_or_zero(&cx, i) == b'E') {
         var j = i + 1usize;
-        if j < t.len() && (t.byte(&cx, j) == b'+' || t.byte(&cx, j) == b'-') {
+        if j < t.len() && (t.byte_or_zero(&cx, j) == b'+' || t.byte_or_zero(&cx, j) == b'-') {
             j = j + 1usize;
         }
         let end = digits_end(&cx, t, j);
@@ -55,25 +57,25 @@ fn float_syntax(&cx: Cx!['k], t: Text['k]) -> bool {
 
 // `t` matches `0|-?[1-9][0-9]*` entirely.
 forall 'k.
-fn integer_syntax(&cx: Cx!['k], t: Text['k]) -> bool {
+fn integer_syntax(&cx: Domain!['k], t: Span['k]) -> bool {
     if t.is(&cx, "0") {
         return true;
     }
-    let start = if t.byte(&cx, 0usize) == b'-' { 1usize } else { 0usize };
-    start < t.len() && t.byte(&cx, start) != b'0' && digits_end(&cx, t, start) == t.len()
+    let start = if t.byte_or_zero(&cx, 0usize) == b'-' { 1usize } else { 0usize };
+    start < t.len() && t.byte_or_zero(&cx, start) != b'0' && digits_end(&cx, t, start) == t.len()
 }
 
 // The decimal digits of `n` are at most `bound`'s digits, as numbers: neither has leading zeros.
 forall 'k.
-fn at_most(&cx: Cx!['k], n: Text['k], bound: Slice[u8, 'static]) -> bool {
-    let b = text(&cx, bound);
-    n.len() < b.len() || (n.len() == b.len() && n.compare(&cx, b) <= 0)
+fn at_most(&cx: Domain!['k], n: Span['k], bound: Slice[u8, 'static]) -> bool {
+    let b = Span::from_static(&cx, bound);
+    n.len() < b.len() || (n.len() == b.len() && !n.cmp(&cx, b).is_gt())
 }
 
 // The largest magnitude of a non-negative and of a negative value of an integer type, in decimal.
 // Integer literals are compared as digit strings, so a literal of any length is judged exactly.
 forall 'k.
-fn bounds(&cx: Cx!['k], name: Text['k]) -> (Slice[u8, 'static], Slice[u8, 'static]) {
+fn bounds(&cx: Domain!['k], name: Span['k]) -> (Slice[u8, 'static], Slice[u8, 'static]) {
     if name.is(&cx, "i8") {
         ("127", "128")
     } else if name.is(&cx, "i16") {
@@ -94,10 +96,10 @@ fn bounds(&cx: Cx!['k], name: Text['k]) -> (Slice[u8, 'static], Slice[u8, 'stati
 }
 
 forall 'k.
-fn valid_literal(&cx: Cx!['k], ty: Type['k], t: Text['k]) -> bool {
+fn valid_literal(&cx: Domain!['k], ty: Type['k], t: Span['k]) -> bool {
     let name = match ty {
         Type::Prim(name) => name,
-        _ => fail(&cx, text(&cx, "internal error: a literal of a non-primitive type")),
+        _ => fail(&cx, Span::from_static(&cx, "internal error: a literal of a non-primitive type")),
     };
     if name.is(&cx, "bool") {
         return t.is(&cx, "true") || t.is(&cx, "false");
@@ -106,9 +108,9 @@ fn valid_literal(&cx: Cx!['k], ty: Type['k], t: Text['k]) -> bool {
         if !float_syntax(&cx, t) {
             return false;
         }
-        let value = match parse_f64(&cx.tag, t.bytes) {
+        let value = match parse_f64(&cx, t) {
             Option::Some(v) => v,
-            Option::None => fail(&cx, text(&cx, "internal error: a float literal strtod does not read")),
+            Option::None => fail(&cx, Span::from_static(&cx, "internal error: a float literal strtod does not read")),
         };
         if ((value.to_bits() >> 52u64) & 2047u64) == 2047u64 {
             return false;
@@ -124,8 +126,8 @@ fn valid_literal(&cx: Cx!['k], ty: Type['k], t: Text['k]) -> bool {
         return false;
     }
     let (positive, negative) = bounds(&cx, name);
-    if t.byte(&cx, 0usize) == b'-' {
-        at_most(&cx, t.from(1usize), negative)
+    if t.byte_or_zero(&cx, 0usize) == b'-' {
+        at_most(&cx, t.skip(1usize), negative)
     } else {
         at_most(&cx, t, positive)
     }

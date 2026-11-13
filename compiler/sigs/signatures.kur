@@ -16,7 +16,12 @@
 // their operands' low bits. Division, remainder, comparison and right shifts depend on whole values,
 // and are computed on them (see `binop`).
 
-use package::support::base::{Cell, Cx, Map, Seq, Set, Text, fail, text, text_of};
+use package::support::base::fail;
+use std::collections::arena_vec::ArenaVec;
+use std::collections::arena_map::{ArenaMap, ArenaSet};
+use std::mem::Ref;
+use std::raw::Span;
+use std::alloc::arena::Domain;
 use std::bytes::buffer::Buffer;
 use package::kurs::core::{Exposure, ExposureMode, Kind, Member, ModuleId, Param, Premise, Program, Type, TypeDecl};
 use package::kurs::core as C;
@@ -35,19 +40,19 @@ use std::slice::Slice;
 // through std.
 forall 'k.
 exposed struct LibraryItem {
-    home: Text['k],
-    path: Seq[Text['k], 'k],
-    std_path: Seq[Text['k], 'k],
+    home: Span['k],
+    path: ArenaVec[Span['k], 'k],
+    std_path: ArenaVec[Span['k], 'k],
 }
 
 forall 'k.
-fn library_entry(&cx: Cx!['k], home: Slice[u8, 'static], path: Slice[u8, 'static], std_path: Slice[u8, 'static]) -> LibraryItem['k] {
-    LibraryItem.{ home: text(&cx, home), path: text(&cx, path).split(&cx, text(&cx, "::")), std_path: text(&cx, std_path).split(&cx, text(&cx, "::")) }
+fn library_entry(&cx: Domain!['k], home: Slice[u8, 'static], path: Slice[u8, 'static], std_path: Slice[u8, 'static]) -> LibraryItem['k] {
+    LibraryItem.{ home: Span::from_static(&cx, home), path: Span::from_static(&cx, path).split(&cx, Span::from_static(&cx, "::")), std_path: Span::from_static(&cx, std_path).split(&cx, Span::from_static(&cx, "::")) }
 }
 
 // The table `LIBRARY`: the item named `name`.
 forall 'k.
-fn library_item(&cx: Cx!['k], name: Text['k]) -> LibraryItem['k] {
+fn library_item(&cx: Domain!['k], name: Span['k]) -> LibraryItem['k] {
     if name.is(&cx, "Option") {
         library_entry(&cx, "core", "option::Option", "option::Option")
     } else if name.is(&cx, "Result") {
@@ -69,7 +74,7 @@ fn library_item(&cx: Cx!['k], name: Text['k]) -> LibraryItem['k] {
     } else if name.is(&cx, "Ordering") {
         library_entry(&cx, "core", "atomic::Ordering", "atomic::Ordering")
     } else {
-        fail(&cx, text_of(&cx, Buffer::new().push_static("internal error: no library item ").push_bytes(&cx, name)))
+        fail(&cx, Buffer::new().push_static("internal error: no library item ").push_bytes(&cx, name).save(&cx))
     }
 }
 
@@ -78,18 +83,18 @@ fn library_item(&cx: Cx!['k], name: Text['k]) -> LibraryItem['k] {
 // An error of this stage, before its file is known; a `pos` on line 0 is no position.
 forall 'k.
 exposed struct SigError {
-    message: Text['k],
+    message: Span['k],
     pos: Pos,
 }
 
 forall T, 'k.
-fn sig_error(message: Text['k], pos: Pos) -> Result[T, SigError['k]] {
+fn sig_error(message: Span['k], pos: Pos) -> Result[T, SigError['k]] {
     Result::Err.(SigError.{ message, pos })
 }
 
 forall T, 'k.
-fn sig_error_static(&cx: Cx!['k], message: Slice[u8, 'static]) -> Result[T, SigError['k]] {
-    sig_error(text(&cx, message), no_pos())
+fn sig_error_static(&cx: Domain!['k], message: Slice[u8, 'static]) -> Result[T, SigError['k]] {
+    sig_error(Span::from_static(&cx, message), no_pos())
 }
 
 // ------------------------------------------------------------- the results --
@@ -98,17 +103,17 @@ fn sig_error_static(&cx: Cx!['k], message: Slice[u8, 'static]) -> Result[T, SigE
 forall 'k.
 exposed struct Sig {
     // its core name
-    name: Text['k],
+    name: Span['k],
     // the Decl, or none for an instance or trait method
     decl: Option[Decl['k]],
     // forall Params, implicit closure environments included
-    params: Seq[Param['k], 'k],
-    premises: Seq[Premise['k], 'k],
+    params: ArenaVec[Param['k], 'k],
+    premises: ArenaVec[Premise['k], 'k],
     // parameter names
-    pnames: Seq[Text['k], 'k],
-    ptypes: Seq[Type['k], 'k],
+    pnames: ArenaVec[Span['k], 'k],
+    ptypes: ArenaVec[Type['k], 'k],
     // indices of `&` parameters, ascending
-    places: Seq[usize, 'k],
+    places: ArenaVec[usize, 'k],
     ret: Type['k],
     is_unsafe: bool,
     home: Option[ModuleId['k]],
@@ -117,11 +122,11 @@ exposed struct Sig {
 // An instance header before its method bodies have been lowered to core functions.
 forall 'k.
 exposed struct InstanceSig {
-    trait_name: Text['k],
-    params: Seq[Param['k], 'k],
-    premises: Seq[Premise['k], 'k],
-    head: Seq[Type['k], 'k],
-    methods: Seq[Sig['k], 'k],
+    trait_name: Span['k],
+    params: ArenaVec[Param['k], 'k],
+    premises: ArenaVec[Premise['k], 'k],
+    head: ArenaVec[Type['k], 'k],
+    methods: ArenaVec[Sig['k], 'k],
     home: ModuleId['k],
     pos: Pos,
 }
@@ -133,13 +138,13 @@ forall 'k.
 exposed enum ConstValue {
     Int(u64, Type['k]),
     Bool(bool),
-    Float(Text['k], Type['k]),
-    Str(Text['k], Option[Type['k]]),
+    Float(Span['k], Type['k]),
+    Str(Span['k], Option[Type['k]]),
 }
 
 // `value[2]`: the constant's type.
 forall 'k.
-fn const_type(&cx: Cx!['k], value: ConstValue['k]) -> Option[Type['k]] {
+fn const_type(&cx: Domain!['k], value: ConstValue['k]) -> Option[Type['k]] {
     match value {
         ConstValue::Int(_v, ty) => Option::Some.(ty),
         ConstValue::Bool(_b) => Option::Some.(C::bool_type(&cx)),
@@ -150,17 +155,17 @@ fn const_type(&cx: Cx!['k], value: ConstValue['k]) -> Option[Type['k]] {
 
 // `value[0]`: which kind of constant it is.
 forall 'k.
-fn const_kind(&cx: Cx!['k], value: ConstValue['k]) -> Text['k] {
+fn const_kind(&cx: Domain!['k], value: ConstValue['k]) -> Span['k] {
     match value {
-        ConstValue::Int(_v, _t) => text(&cx, "int"),
-        ConstValue::Bool(_b) => text(&cx, "bool"),
-        ConstValue::Float(_t, _u) => text(&cx, "float"),
-        ConstValue::Str(_t, _u) => text(&cx, "str"),
+        ConstValue::Int(_v, _t) => Span::from_static(&cx, "int"),
+        ConstValue::Bool(_b) => Span::from_static(&cx, "bool"),
+        ConstValue::Float(_t, _u) => Span::from_static(&cx, "float"),
+        ConstValue::Str(_t, _u) => Span::from_static(&cx, "str"),
     }
 }
 
 forall 'k.
-fn same_type(&cx: Cx!['k], a: Option[Type['k]], b: Option[Type['k]]) -> bool {
+fn same_type(&cx: Domain!['k], a: Option[Type['k]], b: Option[Type['k]]) -> bool {
     match a {
         Option::Some(x) => match b {
             Option::Some(y) => C::same(&cx, x, y),
@@ -172,7 +177,7 @@ fn same_type(&cx: Cx!['k], a: Option[Type['k]], b: Option[Type['k]]) -> bool {
 
 // An integer type's name, if `ty` is one.
 forall 'k.
-fn integer_type(&cx: Cx!['k], ty: Option[Type['k]]) -> Option[Text['k]] {
+fn integer_type(&cx: Domain!['k], ty: Option[Type['k]]) -> Option[Span['k]] {
     match ty {
         Option::Some(t) => match t {
             Type::Prim(name) => if C::is_integer(&cx, name) { Option::Some.(name) } else { Option::None },
@@ -183,7 +188,7 @@ fn integer_type(&cx: Cx!['k], ty: Option[Type['k]]) -> Option[Text['k]] {
 }
 
 forall 'k.
-fn is_float_type(&cx: Cx!['k], ty: Option[Type['k]]) -> bool {
+fn is_float_type(&cx: Domain!['k], ty: Option[Type['k]]) -> bool {
     match ty {
         Option::Some(t) => match t {
             Type::Prim(name) => C::is_float(&cx, name),
@@ -194,13 +199,13 @@ fn is_float_type(&cx: Cx!['k], ty: Option[Type['k]]) -> bool {
 }
 
 forall 'k.
-fn is_signed(&cx: Cx!['k], name: Text['k]) -> bool {
-    name.starts_with(&cx, text(&cx, "i"))
+fn is_signed(&cx: Domain!['k], name: Span['k]) -> bool {
+    name.starts_with(&cx, Span::from_static(&cx, "i"))
 }
 
 // A folded integer below zero: a signed value, stored sign-extended, with its top bit set.
 forall 'k.
-fn is_negative(&cx: Cx!['k], value: u64, ty: Type['k]) -> bool {
+fn is_negative(&cx: Domain!['k], value: u64, ty: Type['k]) -> bool {
     match ty {
         Type::Prim(name) => is_signed(&cx, name) && value >= 9223372036854775808u64,
         _ => false,
@@ -217,11 +222,11 @@ fn sign_bit() -> u64 {
 
 // An integer constant's value as Python writes it.
 forall 'k.
-fn int_text(&cx: Cx!['k], value: u64, name: Text['k]) -> Text['k] {
+fn int_text(&cx: Domain!['k], value: u64, name: Span['k]) -> Span['k] {
     if is_signed(&cx, name) && value >= sign_bit() {
-        text_of(&cx, Buffer::new().push_static("-").push_u64(0u64 - value))
+        Buffer::new().push_static("-").push_u64(0u64 - value).save(&cx)
     } else {
-        text_of(&cx, Buffer::new().push_u64(value))
+        Buffer::new().push_u64(value).save(&cx)
     }
 }
 
@@ -229,85 +234,85 @@ fn int_text(&cx: Cx!['k], value: u64, name: Text['k]) -> Text['k] {
 
 // A tuple's repr from its elements' reprs: `()`, `(a,)`, `(a, b)`.
 forall 'k.
-fn repr_parts(&cx: Cx!['k], parts: Seq[Text['k], 'k]) -> Text['k] {
+fn repr_parts(&cx: Domain!['k], parts: ArenaVec[Span['k], 'k]) -> Span['k] {
     var out = Buffer::new().push_static("(");
     var i = 0usize;
     while i < parts.len(&cx) {
         if i > 0usize {
             out = out.push_static(", ");
         }
-        out = out.push_bytes(&cx, parts.get(&cx, i));
+        out = out.push_bytes(&cx, parts.at(&cx, i));
         i = i + 1usize;
     }
     if parts.len(&cx) == 1usize {
         out = out.push_static(",");
     }
-    text_of(&cx, out.push_static(")"))
+    out.push_static(")").save(&cx)
 }
 
 forall 'k.
-fn repr_types(&cx: Cx!['k], types: Seq[Type['k], 'k]) -> Text['k] {
-    let parts: Seq[Text['k], 'k] = Seq::new(&cx);
+fn repr_types(&cx: Domain!['k], types: ArenaVec[Type['k], 'k]) -> Span['k] {
+    let parts: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
     var i = 0usize;
     while i < types.len(&cx) {
-        parts.push(&cx, type_repr(&cx, types.get(&cx, i)));
+        parts.push(&cx, type_repr(&cx, types.at(&cx, i)));
         i = i + 1usize;
     }
     repr_parts(&cx, parts)
 }
 
 forall 'k.
-fn repr_members(&cx: Cx!['k], members: Seq[Member['k], 'k]) -> Text['k] {
-    let parts: Seq[Text['k], 'k] = Seq::new(&cx);
+fn repr_members(&cx: Domain!['k], members: ArenaVec[Member['k], 'k]) -> Span['k] {
+    let parts: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
     var i = 0usize;
     while i < members.len(&cx) {
-        parts.push(&cx, repr_parts(&cx, Seq::two(&cx, repr(&cx, members.get(&cx, i).name), type_repr(&cx, members.get(&cx, i).type))));
+        parts.push(&cx, repr_parts(&cx, ArenaVec::two(&cx, repr(&cx, members.at(&cx, i).name), type_repr(&cx, members.at(&cx, i).type))));
         i = i + 1usize;
     }
     repr_parts(&cx, parts)
 }
 
 forall 'k.
-fn repr_bool(&cx: Cx!['k], b: bool) -> Text['k] {
-    text(&cx, if b { "True" } else { "False" })
+fn repr_bool(&cx: Domain!['k], b: bool) -> Span['k] {
+    Span::from_static(&cx, if b { "True" } else { "False" })
 }
 
 forall 'k.
-fn kind_repr(&cx: Cx!['k], k: Kind) -> Text['k] {
+fn kind_repr(&cx: Domain!['k], k: Kind) -> Span['k] {
     match k {
-        Kind::Brand => text(&cx, "'brand'"),
-        Kind::Copy => text(&cx, "'copy'"),
-        Kind::Any => text(&cx, "'any'"),
+        Kind::Brand => Span::from_static(&cx, "'brand'"),
+        Kind::Copy => Span::from_static(&cx, "'copy'"),
+        Kind::Any => Span::from_static(&cx, "'any'"),
     }
 }
 
 // A core type as Python's dataclass `repr` writes it.
 forall 'k.
-fn type_repr(&cx: Cx!['k], ty: Type['k]) -> Text['k] {
+fn type_repr(&cx: Domain!['k], ty: Type['k]) -> Span['k] {
     match ty {
-        Type::Prim(name) => text_of(&cx, Buffer::new().push_static("Prim(name=").push_bytes(&cx, repr(&cx, name)).push_static(")")),
-        Type::Never => text(&cx, "Never()"),
-        Type::Named(name, args) => text_of(&cx, Buffer::new().push_static("Named(name=").push_bytes(&cx, repr(&cx, name)).push_static(", args=").push_bytes(&cx, repr_types(&cx, args)).push_static(")")),
-        Type::Struct(fields) => text_of(&cx, Buffer::new().push_static("Struct(fields=").push_bytes(&cx, repr_members(&cx, fields)).push_static(")")),
-        Type::Enum(variants) => text_of(&cx, Buffer::new().push_static("Enum(variants=").push_bytes(&cx, repr_members(&cx, variants)).push_static(")")),
-        Type::Tuple(elems) => text_of(&cx, Buffer::new().push_static("Tuple(elems=").push_bytes(&cx, repr_types(&cx, elems)).push_static(")")),
-        Type::Array(elem, length) => text_of(&cx, Buffer::new().push_static("Array(elem=").push_bytes(&cx, type_repr(&cx, elem.get(&cx))).push_static(", length=").push_u64(length).push_static(")")),
-        Type::Ptr(inner) => text_of(&cx, Buffer::new().push_static("Ptr(inner=").push_bytes(&cx, type_repr(&cx, inner.get(&cx))).push_static(")")),
-        Type::Skolem(label) => text_of(&cx, Buffer::new().push_static("Skolem(label=").push_bytes(&cx, repr(&cx, label)).push_static(")")),
-        Type::Brand(brand) => text_of(&cx, Buffer::new().push_static("Brand(brand=").push_bytes(&cx, type_repr(&cx, brand.get(&cx))).push_static(")")),
-        Type::Exists(binders, body) => text_of(&cx, Buffer::new().push_static("Exists(binders=").push_bytes(&cx, repr_tuple(&cx, binders)).push_static(", body=").push_bytes(&cx, type_repr(&cx, body.get(&cx))).push_static(")")),
-        Type::Foreach(f) => text_of(&cx, Buffer::new().push_static("Foreach(binder=").push_bytes(&cx, repr(&cx, f.binder)).push_static(", indirect=").push_bytes(&cx, repr_bool(&cx, f.indirect))
-            .push_static(", source=").push_bytes(&cx, type_repr(&cx, f.source.get(&cx))).push_static(", body=").push_bytes(&cx, type_repr(&cx, f.body.get(&cx)))
-            .push_static(", retained=").push_bytes(&cx, repr_tuple(&cx, f.retained)).push_static(")")),
+        Type::Prim(name) => Buffer::new().push_static("Prim(name=").push_bytes(&cx, repr(&cx, name)).push_static(")").save(&cx),
+        Type::Never => Span::from_static(&cx, "Never()"),
+        Type::Named(name, args) => Buffer::new().push_static("Named(name=").push_bytes(&cx, repr(&cx, name)).push_static(", args=").push_bytes(&cx, repr_types(&cx, args)).push_static(")").save(&cx),
+        Type::Struct(fields) => Buffer::new().push_static("Struct(fields=").push_bytes(&cx, repr_members(&cx, fields)).push_static(")").save(&cx),
+        Type::Enum(variants) => Buffer::new().push_static("Enum(variants=").push_bytes(&cx, repr_members(&cx, variants)).push_static(")").save(&cx),
+        Type::Tuple(elems) => Buffer::new().push_static("Tuple(elems=").push_bytes(&cx, repr_types(&cx, elems)).push_static(")").save(&cx),
+        Type::Array(elem, length) => Buffer::new().push_static("Array(elem=").push_bytes(&cx, type_repr(&cx, elem.copy(&cx))).push_static(", length=").push_u64(length).push_static(")").save(&cx),
+        Type::Ptr(inner) => Buffer::new().push_static("Ptr(inner=").push_bytes(&cx, type_repr(&cx, inner.copy(&cx))).push_static(")").save(&cx),
+        Type::Skolem(label) => Buffer::new().push_static("Skolem(label=").push_bytes(&cx, repr(&cx, label)).push_static(")").save(&cx),
+        Type::Brand(brand) => Buffer::new().push_static("Brand(brand=").push_bytes(&cx, type_repr(&cx, brand.copy(&cx))).push_static(")").save(&cx),
+        Type::Exists(binders, body) => Buffer::new().push_static("Exists(binders=").push_bytes(&cx, repr_tuple(&cx, binders)).push_static(", body=").push_bytes(&cx, type_repr(&cx, body.copy(&cx))).push_static(")").save(&cx),
+        Type::Foreach(f) => Buffer::new().push_static("Foreach(binder=").push_bytes(&cx, repr(&cx, f.binder)).push_static(", indirect=").push_bytes(&cx, repr_bool(&cx, f.indirect))
+            .push_static(", source=").push_bytes(&cx, type_repr(&cx, f.source.copy(&cx))).push_static(", body=").push_bytes(&cx, type_repr(&cx, f.body.copy(&cx)))
+            .push_static(", retained=").push_bytes(&cx, repr_tuple(&cx, f.retained)).push_static(")").save(&cx),
         Type::Fn(f) => {
-            let quantified: Seq[Text['k], 'k] = Seq::new(&cx);
+            let quantified: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
             var i = 0usize;
             while i < f.quantified.len(&cx) {
-                let p = f.quantified.get(&cx, i);
-                quantified.push(&cx, text_of(&cx, Buffer::new().push_static("Param(name=").push_bytes(&cx, repr(&cx, p.name)).push_static(", kind=").push_bytes(&cx, kind_repr(&cx, p.kind)).push_static(")")));
+                let p = f.quantified.at(&cx, i);
+                quantified.push(&cx, Buffer::new().push_static("Param(name=").push_bytes(&cx, repr(&cx, p.name)).push_static(", kind=").push_bytes(&cx, kind_repr(&cx, p.kind)).push_static(")").save(&cx));
                 i = i + 1usize;
             }
-            var out = Buffer::new().push_static("Fn(params=").push_bytes(&cx, repr_types(&cx, f.params)).push_static(", ret=").push_bytes(&cx, type_repr(&cx, f.ret.get(&cx)))
+            var out = Buffer::new().push_static("Fn(params=").push_bytes(&cx, repr_types(&cx, f.params)).push_static(", ret=").push_bytes(&cx, type_repr(&cx, f.ret.copy(&cx)))
                 .push_static(", forall=").push_bytes(&cx, repr_parts(&cx, quantified)).push_static(", unsafe=").push_bytes(&cx, repr_bool(&cx, f.is_unsafe))
                 .push_static(", places=");
             if f.places.is_empty(&cx) {
@@ -319,15 +324,15 @@ fn type_repr(&cx: Cx!['k], ty: Type['k]) -> Text['k] {
                     if k > 0usize {
                         out = out.push_static(", ");
                     }
-                    out = out.push_usize(f.places.get(&cx, k));
+                    out = out.push_usize(f.places.at(&cx, k));
                     k = k + 1usize;
                 }
                 out = out.push_static("})");
             }
-            text_of(&cx, out.push_static(")"))
+            out.push_static(")").save(&cx)
         },
-        Type::Ignored => text(&cx, "Ignored()"),
-        Type::Meta(_m) => text(&cx, "Meta()"),
+        Type::Ignored => Span::from_static(&cx, "Ignored()"),
+        Type::Meta(_m) => Span::from_static(&cx, "Meta()"),
     }
 }
 
@@ -337,27 +342,27 @@ fn type_repr(&cx: Cx!['k], ty: Type['k]) -> Text['k] {
 forall 'k.
 exposed struct Scope {
     // type parameter -> Copy or Any
-    kinds: Map[Text['k], Kind, 'k],
-    brands: Set[Text['k], 'k],
+    kinds: ArenaMap[Span['k], Kind, 'k],
+    brands: ArenaSet[Span['k], 'k],
     // hidden closure environments, when allowed
-    implicit: Cell[Option[Seq[Param['k], 'k]], 'k],
+    implicit: Ref[Option[ArenaVec[Param['k], 'k]], 'k],
 }
 
 forall 'k.
-fn new_scope(&cx: Cx!['k]) -> Scope['k] {
-    Scope.{ kinds: Map::new(&cx), brands: Set::new(&cx), implicit: Cell::new(&cx, Option::None) }
+fn new_scope(&cx: Domain!['k]) -> Scope['k] {
+    Scope.{ kinds: ArenaMap::new(&cx), brands: ArenaSet::new(&cx), implicit: Ref::new(&cx, Option::None) }
 }
 
 forall 'k.
 impl Scope['k] {
-    fn extend(self, &cx: Cx!['k], params: Seq[Param['k], 'k]) -> Scope['k] {
-        let out = Scope.{ kinds: self.kinds.copy(&cx), brands: self.brands.copy(&cx), implicit: Cell::new(&cx, self.implicit.get(&cx)) };
+    fn extend(self, &cx: Domain!['k], params: ArenaVec[Param['k], 'k]) -> Scope['k] {
+        let out = Scope.{ kinds: self.kinds.clone(&cx), brands: self.brands.clone(&cx), implicit: Ref::new(&cx, self.implicit.copy(&cx)) };
         var i = 0usize;
         while i < params.len(&cx) {
-            let p = params.get(&cx, i);
+            let p = params.at(&cx, i);
             let unit = match p.kind {
-                Kind::Brand => out.brands.add(&cx, p.name),
-                _ => out.kinds.set(&cx, p.name, p.kind),
+                Kind::Brand => { out.brands.insert(&cx, p.name); },
+                _ => { out.kinds.insert(&cx, p.name, p.kind); },
             };
             i = i + 1usize;
         }
@@ -370,7 +375,7 @@ impl Scope['k] {
 // What a signature is made from: a function, a trait method's signature, or an extern.
 forall 'k.
 exposed struct Header {
-    params: Seq[S::Param['k], 'k],
+    params: ArenaVec[S::Param['k], 'k],
     ret: Option[S::Type['k]],
     quantifier: Option[S::Forall['k]],
     is_unsafe: bool,
@@ -396,8 +401,8 @@ fn named_quantifier(node: Named['k]) -> Option[S::Forall['k]] {
 }
 
 forall 'k.
-fn is_copy_trait(&cx: Cx!['k], path: Seq[Text['k], 'k]) -> bool {
-    path.len(&cx) == 1usize && path.get(&cx, 0usize).is(&cx, "Copy")
+fn is_copy_trait(&cx: Domain!['k], path: ArenaVec[Span['k], 'k]) -> bool {
+    path.len(&cx) == 1usize && path.at(&cx, 0usize).is(&cx, "Copy")
 }
 
 forall 'k.
@@ -409,28 +414,28 @@ fn is_skolem(ty: Type['k]) -> bool {
 }
 
 forall 'k.
-fn all_params(&cx: Cx!['k], f: S::Forall['k]) -> Seq[Text['k], 'k] {
-    let out = f.params.copy(&cx);
+fn all_params(&cx: Domain!['k], f: S::Forall['k]) -> ArenaVec[Span['k], 'k] {
+    let out = f.params.clone(&cx);
     out.append(&cx, f.determined);
     out
 }
 
 forall 'k.
-fn concat_params(&cx: Cx!['k], a: Seq[Param['k], 'k], b: Seq[Param['k], 'k]) -> Seq[Param['k], 'k] {
-    let out = a.copy(&cx);
+fn concat_params(&cx: Domain!['k], a: ArenaVec[Param['k], 'k], b: ArenaVec[Param['k], 'k]) -> ArenaVec[Param['k], 'k] {
+    let out = a.clone(&cx);
     out.append(&cx, b);
     out
 }
 
 forall 'k.
-fn concat_premises(&cx: Cx!['k], a: Seq[Premise['k], 'k], b: Seq[Premise['k], 'k]) -> Seq[Premise['k], 'k] {
-    let out = a.copy(&cx);
+fn concat_premises(&cx: Domain!['k], a: ArenaVec[Premise['k], 'k], b: ArenaVec[Premise['k], 'k]) -> ArenaVec[Premise['k], 'k] {
+    let out = a.clone(&cx);
     out.append(&cx, b);
     out
 }
 
 forall 'k.
-fn is_comparison(&cx: Cx!['k], op: Text['k]) -> bool {
+fn is_comparison(&cx: Domain!['k], op: Span['k]) -> bool {
     op.is(&cx, "==") || op.is(&cx, "!=") || op.is(&cx, "<") || op.is(&cx, "<=") || op.is(&cx, ">") || op.is(&cx, ">=")
 }
 
@@ -439,44 +444,44 @@ fn is_comparison(&cx: Cx!['k], op: Text['k]) -> bool {
 forall 'k.
 exposed struct Signatures {
     r: Resolver['k],
-    packages: Seq[Package['k], 'k],
+    packages: ArenaVec[Package['k], 'k],
     // package id -> its name in core names
-    package_names: Map[usize, Text['k], 'k],
-    types: Map[Text['k], TypeDecl['k], 'k],
+    package_names: ArenaMap[usize, Span['k], 'k],
+    types: ArenaMap[Span['k], TypeDecl['k], 'k],
     // decl id -> its signature
-    sigs: Map[u32, Sig['k], 'k],
-    traits: Map[Text['k], C::Trait['k], 'k],
+    sigs: ArenaMap[u32, Sig['k], 'k],
+    traits: ArenaMap[Span['k], C::Trait['k], 'k],
     // (instance with Sig methods, its declaration, its module)
-    instances: Seq[(InstanceSig['k], S::InstanceDecl['k], ModuleId['k]), 'k],
+    instances: ArenaVec[(InstanceSig['k], S::InstanceDecl['k], ModuleId['k]), 'k],
     // decl id -> its value
-    consts: Map[u32, ConstValue['k], 'k],
+    consts: ArenaMap[u32, ConstValue['k], 'k],
     // the ids of the consts being folded
-    folding: Set[u32, 'k],
-    implicit: Cell[u32, 'k],
-    copy_checks: Seq[(Type['k], Map[Text['k], Kind, 'k]), 'k],
-    types_ready: Cell[bool, 'k],
+    folding: ArenaSet[u32, 'k],
+    implicit: Ref[u32, 'k],
+    copy_checks: ArenaVec[(Type['k], ArenaMap[Span['k], Kind, 'k]), 'k],
+    types_ready: Ref[bool, 'k],
     counter: Fresh['k],
 }
 
 forall 'k.
 impl Signatures['k] {
-    fn new(&cx: Cx!['k], resolver: Resolver['k], counter: Fresh['k]) -> Signatures['k] {
+    fn new(&cx: Domain!['k], resolver: Resolver['k], counter: Fresh['k]) -> Signatures['k] {
         let packages = resolver.packages;
-        let spelled: Set[Text['k], 'k] = Set::new(&cx);
+        let spelled: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
         var p = 0usize;
         while p < packages.len(&cx) {
-            spelled.add(&cx, packages.get(&cx, p).name.get(&cx));
+            spelled.insert(&cx, packages.at(&cx, p).name.copy(&cx));
             p = p + 1usize;
         }
         let clash = spelled.len(&cx) != packages.len(&cx);
-        let package_names: Map[usize, Text['k], 'k] = Map::new(&cx);
+        let package_names: ArenaMap[usize, Span['k], 'k] = ArenaMap::new(&cx);
         p = 0usize;
         while p < packages.len(&cx) {
-            let package = packages.get(&cx, p);
-            package_names.set(&cx, package.id, if clash {
-                text_of(&cx, Buffer::new().push_bytes(&cx, package.name.get(&cx)).push_static("#").push_usize(package.id))
+            let package = packages.at(&cx, p);
+            package_names.insert(&cx, package.id, if clash {
+                Buffer::new().push_bytes(&cx, package.name.copy(&cx)).push_static("#").push_usize(package.id).save(&cx)
             } else {
-                package.name.get(&cx)
+                package.name.copy(&cx)
             });
             p = p + 1usize;
         }
@@ -484,28 +489,28 @@ impl Signatures['k] {
             r: resolver,
             packages,
             package_names,
-            types: Map::new(&cx),
-            sigs: Map::new(&cx),
-            traits: Map::new(&cx),
-            instances: Seq::new(&cx),
-            consts: Map::new(&cx),
-            folding: Set::new(&cx),
-            implicit: Cell::new(&cx, 0u32),
-            copy_checks: Seq::new(&cx),
-            types_ready: Cell::new(&cx, false),
+            types: ArenaMap::new(&cx),
+            sigs: ArenaMap::new(&cx),
+            traits: ArenaMap::new(&cx),
+            instances: ArenaVec::new(&cx),
+            consts: ArenaMap::new(&cx),
+            folding: ArenaSet::new(&cx),
+            implicit: Ref::new(&cx, 0u32),
+            copy_checks: ArenaVec::new(&cx),
+            types_ready: Ref::new(&cx, false),
             counter,
         };
         let scopes = resolver.scopes.values(&cx);
         var i = 0usize;
         while i < scopes.len(&cx) {
-            let decls = scopes.get(&cx, i).decls.values(&cx);
+            let decls = scopes.at(&cx, i).decls.values(&cx);
             var k = 0usize;
             while k < decls.len(&cx) {
-                let decl = decls.get(&cx, k);
+                let decl = decls.at(&cx, k);
                 if decl.kind.is(&cx, "struct") || decl.kind.is(&cx, "enum") || decl.kind.is(&cx, "tuple") {
                     resolver.locate(&cx, decl.home, named_pos(decl.node));
                     let type_decl = s.type_decl(&cx, decl);
-                    s.types.set(&cx, s.name(&cx, decl), type_decl);
+                    s.types.insert(&cx, s.name(&cx, decl), type_decl);
                     resolver.unlocate(&cx);
                 }
                 k = k + 1usize;
@@ -516,24 +521,24 @@ impl Signatures['k] {
         s.types_ready.set(&cx, true);
         i = 0usize;
         while i < s.copy_checks.len(&cx) {
-            let (ty, kinds) = s.copy_checks.get(&cx, i);
+            let (ty, kinds) = s.copy_checks.at(&cx, i);
             let unit = s.got(&cx, s.require_copy(&cx, ty, kinds));
             i = i + 1usize;
         }
         s.copy_checks.clear(&cx);
         i = 0usize;
         while i < scopes.len(&cx) {
-            let scope = scopes.get(&cx, i);
+            let scope = scopes.at(&cx, i);
             let decls = scope.decls.values(&cx);
             var k = 0usize;
             while k < decls.len(&cx) {
-                let decl = decls.get(&cx, k);
+                let decl = decls.at(&cx, k);
                 resolver.locate(&cx, decl.home, named_pos(decl.node));
                 if decl.kind.is(&cx, "trait") {
                     let t = s.trait_decl(&cx, decl);
-                    s.traits.set(&cx, s.name(&cx, decl), t);
+                    s.traits.insert(&cx, s.name(&cx, decl), t);
                 } else if decl.kind.is(&cx, "fn") || decl.kind.is(&cx, "method") || decl.kind.is(&cx, "extern") {
-                    s.sigs.set(&cx, decl.id, s.decl_signature(&cx, decl));
+                    s.sigs.insert(&cx, decl.id, s.decl_signature(&cx, decl));
                 } else if decl.kind.is(&cx, "const") {
                     let unit = s.got(&cx, s.const_decl(&cx, decl));
                 }
@@ -542,7 +547,7 @@ impl Signatures['k] {
             }
             var n = 0usize;
             while n < scope.items.len(&cx) {
-                let unit = match scope.items.get(&cx, n) {
+                let unit = match scope.items.at(&cx, n) {
                     S::Item::Instance(item) => {
                         resolver.locate(&cx, scope.home, item.pos);
                         s.instances.push(&cx, s.instance_decl(&cx, item, scope.home));
@@ -558,19 +563,19 @@ impl Signatures['k] {
     }
 
     // The type declarations so far, as a program.
-    fn program(self, &cx: Cx!['k]) -> Program['k] {
-        Program.{ types: self.types, funs: Map::new(&cx), externs: Map::new(&cx), datas: Map::new(&cx), traits: Map::new(&cx), instances: Map::new(&cx) }
+    fn program(self, &cx: Domain!['k]) -> Program['k] {
+        Program.{ types: self.types, funs: ArenaMap::new(&cx), externs: ArenaMap::new(&cx), datas: ArenaMap::new(&cx), traits: ArenaMap::new(&cx), instances: ArenaMap::new(&cx) }
     }
 
     // ---- errors
     // Stops with `message` at `pos`, in the declaration being translated.
-    fn fail(self, &cx: Cx!['k], message: Text['k], pos: Pos) -> ! {
+    fn fail(self, &cx: Domain!['k], message: Span['k], pos: Pos) -> ! {
         self.r.fail(&cx, message, pos)
     }
 
     // The value of a step that may fail, stopping if it did.
     forall T.
-    fn got(self, &cx: Cx!['k], result: Result[T, SigError['k]]) -> T {
+    fn got(self, &cx: Domain!['k], result: Result[T, SigError['k]]) -> T {
         match result {
             Result::Ok(value) => value,
             Result::Err(e) => self.fail(&cx, e.message, e.pos),
@@ -578,8 +583,8 @@ impl Signatures['k] {
     }
 
     // ---- naming
-    fn name(self, &cx: Cx!['k], decl: Decl['k]) -> Text['k] {
-        let parts = Seq::one(&cx, self.package_names.at(&cx, decl.home.package));
+    fn name(self, &cx: Domain!['k], decl: Decl['k]) -> Span['k] {
+        let parts = ArenaVec::one(&cx, self.package_names.at(&cx, decl.home.package));
         parts.append(&cx, decl.home.path);
         parts.push(&cx, decl.name);
         var out = Buffer::new();
@@ -588,56 +593,56 @@ impl Signatures['k] {
             if i > 0usize {
                 out = out.push_static("::");
             }
-            out = out.push_bytes(&cx, parts.get(&cx, i));
+            out = out.push_bytes(&cx, parts.at(&cx, i));
             i = i + 1usize;
         }
-        text_of(&cx, out)
+        out.save(&cx)
     }
 
     // Resolve a compiler-known library item in the requesting module's package.
-    fn library(self, &cx: Cx!['k], home: ModuleId['k], name: Text['k]) -> Decl['k] {
+    fn library(self, &cx: Domain!['k], home: ModuleId['k], name: Span['k]) -> Decl['k] {
         let item = library_item(&cx, name);
         match self.r.library(&cx, home, item.home, item.path, item.std_path) {
             Target::Decl(d) => d,
-            _ => fail(&cx, text_of(&cx, Buffer::new().push_static("internal error: library item ").push_bytes(&cx, name).push_static(" is not a declaration"))),
+            _ => fail(&cx, Buffer::new().push_static("internal error: library item ").push_bytes(&cx, name).push_static(" is not a declaration").save(&cx)),
         }
     }
 
     // ---- headers
     // Core Params and premises of a `forall` header, and the scope it opens.
-    fn quantifier(self, &cx: Cx!['k], header: Option[S::Forall['k]], scope: Scope['k]) -> (Seq[Param['k], 'k], Seq[Premise['k], 'k], Scope['k]) {
+    fn quantifier(self, &cx: Domain!['k], header: Option[S::Forall['k]], scope: Scope['k]) -> (ArenaVec[Param['k], 'k], ArenaVec[Premise['k], 'k], Scope['k]) {
         let f = match header {
             Option::Some(f) => f,
-            Option::None => return (Seq::new(&cx), Seq::new(&cx), scope),
+            Option::None => return (ArenaVec::new(&cx), ArenaVec::new(&cx), scope),
         };
         let copy = self.got(&cx, self.copy_names(&cx, header));
         let names = all_params(&cx, f);
-        let params: Seq[Param['k], 'k] = Seq::new(&cx);
+        let params: ArenaVec[Param['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < names.len(&cx) {
-            let p = names.get(&cx, i);
-            params.push(&cx, if p.starts_with(&cx, text(&cx, "'")) {
-                Param.{ name: p.from(1usize), kind: Kind::Brand }
+            let p = names.at(&cx, i);
+            params.push(&cx, if p.starts_with(&cx, Span::from_static(&cx, "'")) {
+                Param.{ name: p.skip(1usize), kind: Kind::Brand }
             } else {
-                Param.{ name: p, kind: if copy.has(&cx, p) { Kind::Copy } else { Kind::Any } }
+                Param.{ name: p, kind: if copy.contains(&cx, p) { Kind::Copy } else { Kind::Any } }
             });
             i = i + 1usize;
         }
         let inner = scope.extend(&cx, params);
-        let copied = copy.items(&cx);
+        let copied = copy.keys(&cx);
         i = 0usize;
         while i < copied.len(&cx) {
-            let name = copied.get(&cx, i);
-            if !inner.kinds.has(&cx, name) {
-                self.fail(&cx, text_of(&cx, Buffer::new().push_static("Copy requires an in-scope type parameter, not ").push_bytes(&cx, name)), no_pos());
+            let name = copied.at(&cx, i);
+            if !inner.kinds.contains(&cx, name) {
+                self.fail(&cx, Buffer::new().push_static("Copy requires an in-scope type parameter, not ").push_bytes(&cx, name).save(&cx), no_pos());
             }
-            inner.kinds.set(&cx, name, Kind::Copy);
+            inner.kinds.insert(&cx, name, Kind::Copy);
             i = i + 1usize;
         }
-        let premises: Seq[Premise['k], 'k] = Seq::new(&cx);
+        let premises: ArenaVec[Premise['k], 'k] = ArenaVec::new(&cx);
         i = 0usize;
         while i < f.premises.len(&cx) {
-            let premise = f.premises.get(&cx, i);
+            let premise = f.premises.at(&cx, i);
             if !is_copy_trait(&cx, premise.trait_path) {
                 premises.push(&cx, self.premise(&cx, premise.args, inner));
             }
@@ -646,21 +651,21 @@ impl Signatures['k] {
         (params, premises, inner)
     }
 
-    fn copy_names(self, &cx: Cx!['k], header: Option[S::Forall['k]]) -> Result[Set[Text['k], 'k], SigError['k]] {
-        let names: Set[Text['k], 'k] = Set::new(&cx);
+    fn copy_names(self, &cx: Domain!['k], header: Option[S::Forall['k]]) -> Result[ArenaSet[Span['k], 'k], SigError['k]] {
+        let names: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
         let premises = match header {
             Option::Some(f) => f.premises,
-            Option::None => Seq::new(&cx),
+            Option::None => ArenaVec::new(&cx),
         };
         var i = 0usize;
         while i < premises.len(&cx) {
-            let premise = premises.get(&cx, i);
+            let premise = premises.at(&cx, i);
             if is_copy_trait(&cx, premise.trait_path) {
                 let args = premise.args.args;
                 if args.len(&cx) != 1usize {
                     return sig_error_static(&cx, "Copy requires one type parameter");
                 }
-                let arg = match args.get(&cx, 0usize) {
+                let arg = match args.at(&cx, 0usize) {
                     S::Type::Name(n) => n,
                     _ => return sig_error_static(&cx, "Copy requires one type parameter"),
                 };
@@ -675,7 +680,7 @@ impl Signatures['k] {
                     return sig_error_static(&cx, "Copy requires one bare, in-scope type parameter");
                 }
                 let unit = match param {
-                    Option::Some(name) => names.add(&cx, name),
+                    Option::Some(name) => { names.insert(&cx, name); },
                     Option::None => (),
                 };
             }
@@ -684,10 +689,10 @@ impl Signatures['k] {
         Result::Ok.(names)
     }
 
-    fn premise(self, &cx: Cx!['k], args: S::TypeArgs['k], scope: Scope['k]) -> Premise['k] {
+    fn premise(self, &cx: Domain!['k], args: S::TypeArgs['k], scope: Scope['k]) -> Premise['k] {
         let r = match self.r.refs.get(&cx, args.id) {
             Option::Some(r) => r,
-            Option::None => fail(&cx, text(&cx, "internal error: an unresolved premise")),
+            Option::None => fail(&cx, Span::from_static(&cx, "internal error: an unresolved premise")),
         };
         let is_exposed = match r {
             NameRef::Builtin(name) => name.is(&cx, "Exposed"),
@@ -695,24 +700,24 @@ impl Signatures['k] {
         };
         let actual = self.got(&cx, self.types_of(&cx, args.args, scope));
         if is_exposed {
-            return Premise.{ trait_name: text(&cx, "builtin::Exposed"), args: actual };
+            return Premise.{ trait_name: Span::from_static(&cx, "builtin::Exposed"), args: actual };
         }
         let decl = match r {
             NameRef::Decl(d) => d,
-            _ => fail(&cx, text(&cx, "internal error: a premise that names no trait")),
+            _ => fail(&cx, Span::from_static(&cx, "internal error: a premise that names no trait")),
         };
         let unit = self.got(&cx, self.check_arguments(&cx, decl, actual, scope));
         Premise.{ trait_name: self.name(&cx, decl), args: actual }
     }
 
-    fn check_arguments(self, &cx: Cx!['k], decl: Decl['k], args: Seq[Type['k], 'k], scope: Scope['k]) -> Result[bool, SigError['k]] {
+    fn check_arguments(self, &cx: Domain!['k], decl: Decl['k], args: ArenaVec[Type['k], 'k], scope: Scope['k]) -> Result[bool, SigError['k]] {
         let header = named_quantifier(decl.node);
         let params = match header {
             Option::Some(f) => all_params(&cx, f),
-            Option::None => if decl.kind.is(&cx, "trait") { Seq::one(&cx, text(&cx, "Self")) } else { Seq::new(&cx) },
+            Option::None => if decl.kind.is(&cx, "trait") { ArenaVec::one(&cx, Span::from_static(&cx, "Self")) } else { ArenaVec::new(&cx) },
         };
         if args.len(&cx) != params.len(&cx) {
-            return sig_error(text_of(&cx, Buffer::new().push_bytes(&cx, decl.name).push_static(" takes ").push_usize(params.len(&cx)).push_static(" type arguments, got ").push_usize(args.len(&cx))), no_pos());
+            return sig_error(Buffer::new().push_bytes(&cx, decl.name).push_static(" takes ").push_usize(params.len(&cx)).push_static(" type arguments, got ").push_usize(args.len(&cx)).save(&cx), no_pos());
         }
         let copied = match self.copy_names(&cx, header) {
             Result::Ok(c) => c,
@@ -720,13 +725,13 @@ impl Signatures['k] {
         };
         var i = 0usize;
         while i < params.len(&cx) {
-            let param = params.get(&cx, i);
-            let arg = args.get(&cx, i);
-            if param.starts_with(&cx, text(&cx, "'")) != is_skolem(arg) {
-                return sig_error(text_of(&cx, Buffer::new().push_static("argument for ").push_bytes(&cx, param).push_static(" of ").push_bytes(&cx, decl.name)
-                    .push_static(" has the wrong kind (brand versus type)")), no_pos());
+            let param = params.at(&cx, i);
+            let arg = args.at(&cx, i);
+            if param.starts_with(&cx, Span::from_static(&cx, "'")) != is_skolem(arg) {
+                return sig_error(Buffer::new().push_static("argument for ").push_bytes(&cx, param).push_static(" of ").push_bytes(&cx, decl.name)
+                    .push_static(" has the wrong kind (brand versus type)").save(&cx), no_pos());
             }
-            if copied.has(&cx, param) {
+            if copied.contains(&cx, param) {
                 let unit = self.require_copy(&cx, arg, scope.kinds)?;
             }
             i = i + 1usize;
@@ -734,9 +739,9 @@ impl Signatures['k] {
         Result::Ok.(true)
     }
 
-    fn require_copy(self, &cx: Cx!['k], ty: Type['k], kinds: Map[Text['k], Kind, 'k]) -> Result[bool, SigError['k]] {
-        if !self.types_ready.get(&cx) {
-            self.copy_checks.push(&cx, (ty, kinds.copy(&cx)));
+    fn require_copy(self, &cx: Domain!['k], ty: Type['k], kinds: ArenaMap[Span['k], Kind, 'k]) -> Result[bool, SigError['k]] {
+        if !self.types_ready.copy(&cx) {
+            self.copy_checks.push(&cx, (ty, kinds.clone(&cx)));
         } else if !Types::new(&cx, self.program(&cx), self.counter).is_copy(&cx, ty, kinds) {
             return sig_error_static(&cx, "type argument must satisfy Copy");
         }
@@ -744,51 +749,51 @@ impl Signatures['k] {
     }
 
     // ---- types
-    fn types_of(self, &cx: Cx!['k], exprs: Seq[S::Type['k], 'k], scope: Scope['k]) -> Result[Seq[Type['k], 'k], SigError['k]] {
-        let out: Seq[Type['k], 'k] = Seq::new(&cx);
+    fn types_of(self, &cx: Domain!['k], exprs: ArenaVec[S::Type['k], 'k], scope: Scope['k]) -> Result[ArenaVec[Type['k], 'k], SigError['k]] {
+        let out: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < exprs.len(&cx) {
-            out.push(&cx, self.type(&cx, exprs.get(&cx, i), scope)?);
+            out.push(&cx, self.type(&cx, exprs.at(&cx, i), scope)?);
             i = i + 1usize;
         }
         Result::Ok.(out)
     }
 
-    fn slot_types(self, &cx: Cx!['k], slots: Seq[S::Slot['k], 'k], scope: Scope['k]) -> Result[Seq[Type['k], 'k], SigError['k]] {
-        let out: Seq[Type['k], 'k] = Seq::new(&cx);
+    fn slot_types(self, &cx: Domain!['k], slots: ArenaVec[S::Slot['k], 'k], scope: Scope['k]) -> Result[ArenaVec[Type['k], 'k], SigError['k]] {
+        let out: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < slots.len(&cx) {
-            out.push(&cx, self.type(&cx, slots.get(&cx, i).type, scope)?);
+            out.push(&cx, self.type(&cx, slots.at(&cx, i).type, scope)?);
             i = i + 1usize;
         }
         Result::Ok.(out)
     }
 
-    fn type(self, &cx: Cx!['k], type_expr: S::Type['k], scope: Scope['k]) -> Result[Type['k], SigError['k]] {
+    fn type(self, &cx: Domain!['k], type_expr: S::Type['k], scope: Scope['k]) -> Result[Type['k], SigError['k]] {
         match type_expr {
             S::Type::Name(n) => {
                 let args = self.types_of(&cx, n.args, scope)?;
-                let not_a_type = text_of(&cx, Buffer::new().push_static("not a type name: ").push_bytes(&cx, repr_tuple(&cx, n.path)));
+                let not_a_type = Buffer::new().push_static("not a type name: ").push_bytes(&cx, repr_tuple(&cx, n.path)).save(&cx);
                 let r = match self.r.refs.get(&cx, n.id) {
                     Option::Some(r) => r,
                     Option::None => return sig_error(not_a_type, no_pos()),
                 };
                 match r {
                     NameRef::Param(name) => if !args.is_empty(&cx) {
-                        sig_error(text_of(&cx, Buffer::new().push_static("type parameter ").push_bytes(&cx, name).push_static(" takes no type arguments")), no_pos())
+                        sig_error(Buffer::new().push_static("type parameter ").push_bytes(&cx, name).push_static(" takes no type arguments").save(&cx), no_pos())
                     } else {
-                        Result::Ok.(C::named(name, Seq::new(&cx)))
+                        Result::Ok.(C::named(name, ArenaVec::new(&cx)))
                     },
                     NameRef::Prim(name) => if !args.is_empty(&cx) {
-                        sig_error(text_of(&cx, Buffer::new().push_static("primitive ").push_bytes(&cx, name).push_static(" takes no type arguments")), no_pos())
+                        sig_error(Buffer::new().push_static("primitive ").push_bytes(&cx, name).push_static(" takes no type arguments").save(&cx), no_pos())
                     } else {
                         Result::Ok.(Type::Prim.(name))
                     },
                     NameRef::Builtin(name) => if name.is(&cx, "Brand") {
-                        if args.len(&cx) != 1usize || !is_skolem(args.get(&cx, 0usize)) {
+                        if args.len(&cx) != 1usize || !is_skolem(args.at(&cx, 0usize)) {
                             sig_error_static(&cx, "Brand requires exactly one brand argument")
                         } else {
-                            Result::Ok.(Type::Brand.(Cell::new(&cx, args.get(&cx, 0usize))))
+                            Result::Ok.(Type::Brand.(Ref::new(&cx, args.at(&cx, 0usize))))
                         }
                     } else if name.is(&cx, "Never") {
                         if !args.is_empty(&cx) {
@@ -807,78 +812,78 @@ impl Signatures['k] {
                 }
             },
             S::Type::Brand(quoted) => {
-                let label = quoted.from(1usize);
-                if !scope.brands.has(&cx, label) && !label.is(&cx, "static") {
-                    return sig_error(text_of(&cx, Buffer::new().push_static("brand '").push_bytes(&cx, label).push_static(" is not in scope")), no_pos());
+                let label = quoted.skip(1usize);
+                if !scope.brands.contains(&cx, label) && !label.is(&cx, "static") {
+                    return sig_error(Buffer::new().push_static("brand '").push_bytes(&cx, label).push_static(" is not in scope").save(&cx), no_pos());
                 }
                 Result::Ok.(Type::Skolem.(label))
             },
-            S::Type::Ptr(inner) => Result::Ok.(C::ptr(&cx, self.type(&cx, inner.get(&cx), scope)?)),
+            S::Type::Ptr(inner) => Result::Ok.(C::ptr(&cx, self.type(&cx, inner.copy(&cx), scope)?)),
             S::Type::Never => Result::Ok.(Type::Never),
             S::Type::Tuple(elems) => Result::Ok.(Type::Tuple.(self.types_of(&cx, elems, scope)?)),
             S::Type::Array(elem, length) => {
-                let elem_type = self.type(&cx, elem.get(&cx), scope)?;
-                let count = self.array_length(&cx, length.get(&cx))?;
-                Result::Ok.(Type::Array.(Cell::new(&cx, elem_type), count))
+                let elem_type = self.type(&cx, elem.copy(&cx), scope)?;
+                let count = self.array_length(&cx, length.copy(&cx))?;
+                Result::Ok.(Type::Array.(Ref::new(&cx, elem_type), count))
             },
             S::Type::Fn(f) => {
                 let params = self.slot_types(&cx, f.params, scope)?;
-                let ret = self.type(&cx, f.ret.get(&cx), scope)?;
-                Result::Ok.(C::fn_type(&cx, params, ret, Seq::new(&cx), f.is_unsafe, places_of(&cx, f.params, 0usize)))
+                let ret = self.type(&cx, f.ret.copy(&cx), scope)?;
+                Result::Ok.(C::fn_type(&cx, params, ret, ArenaVec::new(&cx), f.is_unsafe, places_of(&cx, f.params, 0usize)))
             },
             S::Type::Closure(c) => {
                 let environment = match c.env {
-                    Option::Some(env) => self.type(&cx, env.get(&cx), scope)?,
-                    Option::None => match scope.implicit.get(&cx) {
+                    Option::Some(env) => self.type(&cx, env.copy(&cx), scope)?,
+                    Option::None => match scope.implicit.copy(&cx) {
                         Option::Some(implicit) => {
-                            self.implicit.set(&cx, self.implicit.get(&cx) + 1u32);
-                            let name = text_of(&cx, Buffer::new().push_static("Env#").push_u64(self.implicit.get(&cx) as u64));
+                            self.implicit.set(&cx, self.implicit.copy(&cx) + 1u32);
+                            let name = Buffer::new().push_static("Env#").push_u64(self.implicit.copy(&cx) as u64).save(&cx);
                             implicit.push(&cx, Param.{ name, kind: Kind::Any });
-                            C::named(name, Seq::new(&cx))
+                            C::named(name, ArenaVec::new(&cx))
                         },
                         Option::None => return sig_error_static(&cx, "a closure type needs [Env] outside a parameter list"),
                     },
                 };
-                let params = Seq::one(&cx, environment);
+                let params = ArenaVec::one(&cx, environment);
                 params.append(&cx, self.slot_types(&cx, c.params, scope)?);
-                let ret = self.type(&cx, c.ret.get(&cx), scope)?;
-                let code = C::fn_type(&cx, params, ret, Seq::new(&cx), false, places_of(&cx, c.params, 1usize));
-                Result::Ok.(Type::Struct.(Seq::two(&cx, Member.{ name: text(&cx, "env"), type: environment }, Member.{ name: text(&cx, "code"), type: code })))
+                let ret = self.type(&cx, c.ret.copy(&cx), scope)?;
+                let code = C::fn_type(&cx, params, ret, ArenaVec::new(&cx), false, places_of(&cx, c.params, 1usize));
+                Result::Ok.(Type::Struct.(ArenaVec::two(&cx, Member.{ name: Span::from_static(&cx, "env"), type: environment }, Member.{ name: Span::from_static(&cx, "code"), type: code })))
             },
             S::Type::Exists(brands, body) => {
-                let labels: Seq[Text['k], 'k] = Seq::new(&cx);
-                let binders: Seq[Param['k], 'k] = Seq::new(&cx);
+                let labels: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+                let binders: ArenaVec[Param['k], 'k] = ArenaVec::new(&cx);
                 var i = 0usize;
                 while i < brands.len(&cx) {
-                    let label = brands.get(&cx, i).from(1usize);
+                    let label = brands.at(&cx, i).skip(1usize);
                     labels.push(&cx, label);
                     binders.push(&cx, Param.{ name: label, kind: Kind::Brand });
                     i = i + 1usize;
                 }
-                let inner = self.type(&cx, body.get(&cx), scope.extend(&cx, binders))?;
-                Result::Ok.(Type::Exists.(labels, Cell::new(&cx, inner)))
+                let inner = self.type(&cx, body.copy(&cx), scope.extend(&cx, binders))?;
+                Result::Ok.(Type::Exists.(labels, Ref::new(&cx, inner)))
             },
             S::Type::Foreach(f) => {
-                let source = self.type(&cx, f.source.get(&cx), scope)?;
-                let body = self.type(&cx, f.body.get(&cx), scope.extend(&cx, Seq::one(&cx, Param.{ name: f.binder, kind: Kind::Any })))?;
+                let source = self.type(&cx, f.source.copy(&cx), scope)?;
+                let body = self.type(&cx, f.body.copy(&cx), scope.extend(&cx, ArenaVec::one(&cx, Param.{ name: f.binder, kind: Kind::Any })))?;
                 Result::Ok.(C::foreach_type(&cx, f.binder, f.indirect, source, body))
             },
             S::Type::Forall(tparams, body) => {
-                let quantified: Seq[Param['k], 'k] = Seq::new(&cx);
+                let quantified: ArenaVec[Param['k], 'k] = ArenaVec::new(&cx);
                 var all_brands = true;
                 var i = 0usize;
                 while i < tparams.len(&cx) {
-                    let p = tparams.get(&cx, i);
-                    quantified.push(&cx, Param.{ name: p.from(1usize), kind: Kind::Brand });
-                    if !p.starts_with(&cx, text(&cx, "'")) {
+                    let p = tparams.at(&cx, i);
+                    quantified.push(&cx, Param.{ name: p.skip(1usize), kind: Kind::Brand });
+                    if !p.starts_with(&cx, Span::from_static(&cx, "'")) {
                         all_brands = false;
                     }
                     i = i + 1usize;
                 }
-                let inner = self.type(&cx, body.get(&cx), scope.extend(&cx, quantified))?;
+                let inner = self.type(&cx, body.copy(&cx), scope.extend(&cx, quantified))?;
                 match inner {
                     Type::Fn(f) => if all_brands {
-                        Result::Ok.(C::fn_type(&cx, f.params, f.ret.get(&cx), quantified, f.is_unsafe, f.places))
+                        Result::Ok.(C::fn_type(&cx, f.params, f.ret.copy(&cx), quantified, f.is_unsafe, f.places))
                     } else {
                         sig_error_static(&cx, "forall in a type quantifies brands of a function type")
                     },
@@ -892,7 +897,7 @@ impl Signatures['k] {
     // An array length is folded as a usize, but a literal with another integer suffix keeps its
     // own type: the length is the value's 64 bits, so a negative length of a signed type is its
     // two's complement.
-    fn array_length(self, &cx: Cx!['k], expr: Expr['k]) -> Result[u64, SigError['k]] {
+    fn array_length(self, &cx: Domain!['k], expr: Expr['k]) -> Result[u64, SigError['k]] {
         match self.fold(&cx, expr, Option::Some.(C::usize_type(&cx)), Option::None, true)? {
             ConstValue::Int(value, ty) => if is_negative(&cx, value, ty) {
                 sig_error_static(&cx, "negative array length")
@@ -904,14 +909,14 @@ impl Signatures['k] {
     }
 
     // ---- declarations
-    fn type_decl(self, &cx: Cx!['k], decl: Decl['k]) -> TypeDecl['k] {
+    fn type_decl(self, &cx: Domain!['k], decl: Decl['k]) -> TypeDecl['k] {
         let (params, premises, scope) = self.quantifier(&cx, named_quantifier(decl.node), new_scope(&cx));
         let (body, linear, written) = match decl.node {
             Named::Struct(node) => {
-                let fields: Seq[Member['k], 'k] = Seq::new(&cx);
+                let fields: ArenaVec[Member['k], 'k] = ArenaVec::new(&cx);
                 var i = 0usize;
                 while i < node.fields.len(&cx) {
-                    let field = node.fields.get(&cx, i);
+                    let field = node.fields.at(&cx, i);
                     fields.push(&cx, Member.{ name: field.name, type: self.got(&cx, self.type(&cx, field.type, scope)) });
                     i = i + 1usize;
                 }
@@ -919,16 +924,16 @@ impl Signatures['k] {
             },
             Named::Tuple(node) => (Type::Tuple.(self.got(&cx, self.types_of(&cx, node.elems, scope))), node.linear, node.exposure),
             Named::Enum(node) => {
-                let variants: Seq[Member['k], 'k] = Seq::new(&cx);
+                let variants: ArenaVec[Member['k], 'k] = ArenaVec::new(&cx);
                 var i = 0usize;
                 while i < node.variants.len(&cx) {
-                    let variant = node.variants.get(&cx, i);
+                    let variant = node.variants.at(&cx, i);
                     variants.push(&cx, Member.{ name: variant.name, type: self.got(&cx, self.payload(&cx, variant.payload, scope)) });
                     i = i + 1usize;
                 }
                 (Type::Enum.(variants), node.linear, node.exposure)
             },
-            _ => fail(&cx, text(&cx, "internal error: a type declaration that declares no type")),
+            _ => fail(&cx, Span::from_static(&cx, "internal error: a type declaration that declares no type")),
         };
         var exposure = Option::Some.(Exposure.{ mode: ExposureMode::Owner, home: decl.home });
         let unit = match written {
@@ -943,17 +948,17 @@ impl Signatures['k] {
         TypeDecl.{ name: self.name(&cx, decl), linear, params, premises, body, home: Option::Some.(decl.home), exposure }
     }
 
-    fn payload(self, &cx: Cx!['k], types: Seq[S::Type['k], 'k], scope: Scope['k]) -> Result[Type['k], SigError['k]] {
+    fn payload(self, &cx: Domain!['k], types: ArenaVec[S::Type['k], 'k], scope: Scope['k]) -> Result[Type['k], SigError['k]] {
         if types.is_empty(&cx) {
             return Result::Ok.(C::unit(&cx));
         }
         if types.len(&cx) == 1usize {
-            return self.type(&cx, types.get(&cx, 0usize), scope);
+            return self.type(&cx, types.at(&cx, 0usize), scope);
         }
         Result::Ok.(Type::Tuple.(self.types_of(&cx, types, scope)?))
     }
 
-    fn scope_module(self, &cx: Cx!['k], decl: Decl['k], path: Seq[Text['k], 'k]) -> ModuleId['k] {
+    fn scope_module(self, &cx: Domain!['k], decl: Decl['k], path: ArenaVec[Span['k], 'k]) -> ModuleId['k] {
         let target = match self.r.need(&cx, decl.home, path, no_pos()) {
             Target::Module(m) => Option::Some.(m),
             _ => Option::None,
@@ -964,21 +969,21 @@ impl Signatures['k] {
             },
             Option::None => (),
         };
-        self.fail(&cx, text_of(&cx, Buffer::new().push_static("an exposure scope is an enclosing module of ").push_bytes(&cx, decl.name)), no_pos())
+        self.fail(&cx, Buffer::new().push_static("an exposure scope is an enclosing module of ").push_bytes(&cx, decl.name).save(&cx), no_pos())
     }
 
     // The signature of a function, method or extern declaration.
-    fn decl_signature(self, &cx: Cx!['k], decl: Decl['k]) -> Sig['k] {
+    fn decl_signature(self, &cx: Domain!['k], decl: Decl['k]) -> Sig['k] {
         let node = match decl.node {
             Named::Fn(f) => fn_header(f),
             Named::Extern(x) => Header.{ params: x.params, ret: x.ret, quantifier: x.quantifier, is_unsafe: true, pos: x.pos },
-            _ => fail(&cx, text(&cx, "internal error: a signature of a declaration that is not callable")),
+            _ => fail(&cx, Span::from_static(&cx, "internal error: a signature of a declaration that is not callable")),
         };
-        self.signature(&cx, Option::Some.(decl), node, Seq::new(&cx), Seq::new(&cx), Option::None, Option::None)
+        self.signature(&cx, Option::Some.(decl), node, ArenaVec::new(&cx), ArenaVec::new(&cx), Option::None, Option::None)
     }
 
-    fn signature(self, &cx: Cx!['k], decl: Option[Decl['k]], node: Header['k], outer: Seq[Param['k], 'k], outer_premises: Seq[Premise['k], 'k],
-                 outer_scope: Option[Scope['k]], name: Option[Text['k]]) -> Sig['k] {
+    fn signature(self, &cx: Domain!['k], decl: Option[Decl['k]], node: Header['k], outer: ArenaVec[Param['k], 'k], outer_premises: ArenaVec[Premise['k], 'k],
+                 outer_scope: Option[Scope['k]], name: Option[Span['k]]) -> Sig['k] {
         var scope = match outer_scope {
             Option::Some(s) => s,
             Option::None => new_scope(&cx),
@@ -1005,35 +1010,35 @@ impl Signatures['k] {
         let (params, premises, inner) = self.quantifier(&cx, node.quantifier, scope);
         let scope = inner;
         let copied = self.got(&cx, self.copy_names(&cx, node.quantifier));
-        let adjusted: Seq[Param['k], 'k] = Seq::new(&cx);
+        let adjusted: ArenaVec[Param['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < outer.len(&cx) {
-            let p = outer.get(&cx, i);
+            let p = outer.at(&cx, i);
             let any = match p.kind {
                 Kind::Any => true,
                 _ => false,
             };
-            adjusted.push(&cx, if copied.has(&cx, p.name) && any { Param.{ name: p.name, kind: Kind::Copy } } else { p });
+            adjusted.push(&cx, if copied.contains(&cx, p.name) && any { Param.{ name: p.name, kind: Kind::Copy } } else { p });
             i = i + 1usize;
         }
         let outer = adjusted;
         i = 0usize;
         while i < outer.len(&cx) {
-            let p = outer.get(&cx, i);
+            let p = outer.at(&cx, i);
             let unit = match p.kind {
                 Kind::Brand => (),
-                _ => scope.kinds.set(&cx, p.name, p.kind),
+                _ => { scope.kinds.insert(&cx, p.name, p.kind); },
             };
             i = i + 1usize;
         }
-        let implicit: Seq[Param['k], 'k] = Seq::new(&cx);
+        let implicit: ArenaVec[Param['k], 'k] = ArenaVec::new(&cx);
         scope.implicit.set(&cx, Option::Some.(implicit));
-        let pnames: Seq[Text['k], 'k] = Seq::new(&cx);
-        let ptypes: Seq[Type['k], 'k] = Seq::new(&cx);
-        let places: Seq[usize, 'k] = Seq::new(&cx);
+        let pnames: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let ptypes: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
+        let places: ArenaVec[usize, 'k] = ArenaVec::new(&cx);
         var k = 0usize;
         while k < node.params.len(&cx) {
-            let p = node.params.get(&cx, k);
+            let p = node.params.at(&cx, k);
             let unit = match p.type {
                 Option::None => {
                     let self_type = match method_impl {
@@ -1042,7 +1047,7 @@ impl Signatures['k] {
                     };
                     match self_type {
                         Option::Some(t) => ptypes.push(&cx, self.got(&cx, self.type(&cx, t, scope))),
-                        Option::None => self.fail(&cx, text_of(&cx, Buffer::new().push_static("parameter ").push_bytes(&cx, p.name).push_static(" needs a type")), node.pos),
+                        Option::None => self.fail(&cx, Buffer::new().push_static("parameter ").push_bytes(&cx, p.name).push_static(" needs a type").save(&cx), node.pos),
                     }
                 },
                 Option::Some(t) => ptypes.push(&cx, self.got(&cx, self.type(&cx, t, scope))),
@@ -1062,7 +1067,7 @@ impl Signatures['k] {
             Option::Some(n) => n,
             Option::None => match decl {
                 Option::Some(d) => self.name(&cx, d),
-                Option::None => fail(&cx, text(&cx, "internal error: a signature without a name")),
+                Option::None => fail(&cx, Span::from_static(&cx, "internal error: a signature without a name")),
             },
         };
         let all = concat_params(&cx, concat_params(&cx, outer, params), implicit);
@@ -1074,62 +1079,62 @@ impl Signatures['k] {
               is_unsafe: node.is_unsafe, home }
     }
 
-    fn trait_decl(self, &cx: Cx!['k], decl: Decl['k]) -> C::Trait['k] {
+    fn trait_decl(self, &cx: Domain!['k], decl: Decl['k]) -> C::Trait['k] {
         let node = match decl.node {
             Named::Trait(t) => t,
-            _ => fail(&cx, text(&cx, "internal error: a trait declaration that declares no trait")),
+            _ => fail(&cx, Span::from_static(&cx, "internal error: a trait declaration that declares no trait")),
         };
         let (declared, premises, declared_scope) = self.quantifier(&cx, node.quantifier, new_scope(&cx));
         if !premises.is_empty(&cx) {
-            self.fail(&cx, text(&cx, "trait declarations cannot have their own trait premises"), node.pos);
+            self.fail(&cx, Span::from_static(&cx, "trait declarations cannot have their own trait premises"), node.pos);
         }
-        let self_param = Param.{ name: text(&cx, "Self"), kind: Kind::Any };
+        let self_param = Param.{ name: Span::from_static(&cx, "Self"), kind: Kind::Any };
         let (params, scope) = if node.quantifier.is_none() {
-            (Seq::one(&cx, self_param), declared_scope.extend(&cx, Seq::one(&cx, self_param)))
+            (ArenaVec::one(&cx, self_param), declared_scope.extend(&cx, ArenaVec::one(&cx, self_param)))
         } else {
             (declared, declared_scope)
         };
-        let methods: Seq[C::Method['k], 'k] = Seq::new(&cx);
+        let methods: ArenaVec[C::Method['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < node.methods.len(&cx) {
-            let m = node.methods.get(&cx, i);
-            let sig = self.signature(&cx, Option::None, fn_header(m), Seq::new(&cx), Seq::new(&cx), Option::Some.(scope), Option::Some.(m.name));
+            let m = node.methods.at(&cx, i);
+            let sig = self.signature(&cx, Option::None, fn_header(m), ArenaVec::new(&cx), ArenaVec::new(&cx), Option::Some.(scope), Option::Some.(m.name));
             if !sig.params.is_empty(&cx) {
-                self.fail(&cx, text_of(&cx, Buffer::new().push_static("trait method ").push_bytes(&cx, m.name).push_static(" cannot be generic itself")), no_pos());
+                self.fail(&cx, Buffer::new().push_static("trait method ").push_bytes(&cx, m.name).push_static(" cannot be generic itself").save(&cx), no_pos());
             }
             methods.push(&cx, C::Method.{ name: m.name, ret: sig.ret, ptypes: sig.ptypes, is_unsafe: sig.is_unsafe, places: sig.places });
             i = i + 1usize;
         }
-        let names: Seq[Text['k], 'k] = Seq::new(&cx);
-        let kinds: Seq[Kind, 'k] = Seq::new(&cx);
+        let names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let kinds: ArenaVec[Kind, 'k] = ArenaVec::new(&cx);
         i = 0usize;
         while i < params.len(&cx) {
-            names.push(&cx, params.get(&cx, i).name);
-            kinds.push(&cx, params.get(&cx, i).kind);
+            names.push(&cx, params.at(&cx, i).name);
+            kinds.push(&cx, params.at(&cx, i).kind);
             i = i + 1usize;
         }
         C::Trait.{ name: self.name(&cx, decl), params: names, methods, home: Option::Some.(decl.home), param_kinds: kinds }
     }
 
-    fn instance_decl(self, &cx: Cx!['k], item: S::InstanceDecl['k], home: ModuleId['k]) -> (InstanceSig['k], S::InstanceDecl['k], ModuleId['k]) {
+    fn instance_decl(self, &cx: Domain!['k], item: S::InstanceDecl['k], home: ModuleId['k]) -> (InstanceSig['k], S::InstanceDecl['k], ModuleId['k]) {
         let (params, premises, scope) = self.quantifier(&cx, item.quantifier, new_scope(&cx));
         let head = match item.type {
             S::Type::Name(n) => n,
-            _ => fail(&cx, text(&cx, "internal error: an instance of something other than a trait")),
+            _ => fail(&cx, Span::from_static(&cx, "internal error: an instance of something other than a trait")),
         };
         let trait_decl = match self.r.refs.get(&cx, head.id) {
             Option::Some(r) => match r {
                 NameRef::Decl(d) => d,
-                _ => fail(&cx, text(&cx, "internal error: an instance of something other than a trait")),
+                _ => fail(&cx, Span::from_static(&cx, "internal error: an instance of something other than a trait")),
             },
-            Option::None => fail(&cx, text(&cx, "internal error: an unresolved instance")),
+            Option::None => fail(&cx, Span::from_static(&cx, "internal error: an unresolved instance")),
         };
         let arguments = self.got(&cx, self.types_of(&cx, head.args, scope));
         let unit = self.got(&cx, self.check_arguments(&cx, trait_decl, arguments, scope));
-        let methods: Seq[Sig['k], 'k] = Seq::new(&cx);
+        let methods: ArenaVec[Sig['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < item.methods.len(&cx) {
-            let m = item.methods.get(&cx, i);
+            let m = item.methods.at(&cx, i);
             let sig = self.signature(&cx, Option::None, fn_header(m), params, premises, Option::Some.(scope), Option::Some.(m.name));
             methods.push(&cx, Sig.{ name: sig.name, decl: sig.decl, params: sig.params, premises: sig.premises, pnames: sig.pnames,
                                ptypes: sig.ptypes, places: sig.places, ret: sig.ret, is_unsafe: sig.is_unsafe, home: Option::Some.(home) });
@@ -1140,49 +1145,49 @@ impl Signatures['k] {
     }
 
     // ---- consts
-    fn const_decl(self, &cx: Cx!['k], decl: Decl['k]) -> Result[ConstValue['k], SigError['k]] {
+    fn const_decl(self, &cx: Domain!['k], decl: Decl['k]) -> Result[ConstValue['k], SigError['k]] {
         let unit = match self.consts.get(&cx, decl.id) {
             Option::Some(value) => return Result::Ok.(value),
             Option::None => (),
         };
-        if self.folding.has(&cx, decl.id) {
-            return sig_error(text_of(&cx, Buffer::new().push_static("const ").push_bytes(&cx, decl.name).push_static(" depends on itself")), no_pos());
+        if self.folding.contains(&cx, decl.id) {
+            return sig_error(Buffer::new().push_static("const ").push_bytes(&cx, decl.name).push_static(" depends on itself").save(&cx), no_pos());
         }
-        self.folding.add(&cx, decl.id);
+        self.folding.insert(&cx, decl.id);
         let result = self.const_value(&cx, decl);
         self.folding.remove(&cx, decl.id);
         result
     }
 
-    fn const_value(self, &cx: Cx!['k], decl: Decl['k]) -> Result[ConstValue['k], SigError['k]] {
+    fn const_value(self, &cx: Domain!['k], decl: Decl['k]) -> Result[ConstValue['k], SigError['k]] {
         let node = match decl.node {
             Named::Const(c) => c,
-            _ => fail(&cx, text(&cx, "internal error: a const declaration that declares no const")),
+            _ => fail(&cx, Span::from_static(&cx, "internal error: a const declaration that declares no const")),
         };
         let value = self.typed(&cx, decl.name, node.value, self.type(&cx, node.type, new_scope(&cx))?, decl.home)?;
-        self.consts.set(&cx, decl.id, value);
+        self.consts.insert(&cx, decl.id, value);
         Result::Ok.(value)
     }
 
     // The value of `const name: want = expr`, which must have type `want`.
-    fn typed(self, &cx: Cx!['k], name: Text['k], expr: Expr['k], want: Type['k], home: ModuleId['k]) -> Result[ConstValue['k], SigError['k]] {
+    fn typed(self, &cx: Domain!['k], name: Span['k], expr: Expr['k], want: Type['k], home: ModuleId['k]) -> Result[ConstValue['k], SigError['k]] {
         let value = self.fold(&cx, expr, Option::Some.(want), Option::Some.(home), true)?;
         if !same_type(&cx, const_type(&cx, value), Option::Some.(want)) {
-            return sig_error(text_of(&cx, Buffer::new().push_static("const ").push_bytes(&cx, name).push_static(" is not a ").push_bytes(&cx, type_repr(&cx, want))), no_pos());
+            return sig_error(Buffer::new().push_static("const ").push_bytes(&cx, name).push_static(" is not a ").push_bytes(&cx, type_repr(&cx, want)).save(&cx), no_pos());
         }
         Result::Ok.(value)
     }
 
     // `Slice[u8, 'static]`, the type of a string literal.
-    fn string_type(self, &cx: Cx!['k], home: ModuleId['k]) -> Type['k] {
-        Type::Named.(self.name(&cx, self.library(&cx, home, text(&cx, "Slice"))), Seq::two(&cx, C::prim(&cx, "u8"), Type::Skolem.(text(&cx, "static"))))
+    fn string_type(self, &cx: Domain!['k], home: ModuleId['k]) -> Type['k] {
+        Type::Named.(self.name(&cx, self.library(&cx, home, Span::from_static(&cx, "Slice"))), ArenaVec::two(&cx, C::prim(&cx, "u8"), Type::Skolem.(Span::from_static(&cx, "static"))))
     }
 
     // Type a constant expression and, when `evaluate`, its value.
     //
     // Unevaluated short-circuit operands still validate operators and literals; only computed
     // values (and their division-by-zero traps) are skipped.
-    fn fold(self, &cx: Cx!['k], expr: Expr['k], want: Option[Type['k]], home: Option[ModuleId['k]], evaluate: bool) -> Result[ConstValue['k], SigError['k]] {
+    fn fold(self, &cx: Domain!['k], expr: Expr['k], want: Option[Type['k]], home: Option[ModuleId['k]], evaluate: bool) -> Result[ConstValue['k], SigError['k]] {
         match expr {
             Expr::Lit(lit) => match lit.kind {
                 S::LitKind::Int => {
@@ -1192,7 +1197,7 @@ impl Signatures['k] {
                     };
                     match integer_type(&cx, ty) {
                         Option::Some(name) => self.wrapped_literal(&cx, lit.int, false, name, lit.pos),
-                        Option::None => sig_error(text(&cx, "an integer constant needs a type"), lit.pos),
+                        Option::None => sig_error(Span::from_static(&cx, "an integer constant needs a type"), lit.pos),
                     }
                 },
                 S::LitKind::Bool => Result::Ok.(ConstValue::Bool.(lit.int != 0u64)),
@@ -1202,7 +1207,7 @@ impl Signatures['k] {
                         Option::None => want,
                     };
                     if !is_float_type(&cx, ty) {
-                        return sig_error(text(&cx, "a floating constant needs a floating type"), lit.pos);
+                        return sig_error(Span::from_static(&cx, "a floating constant needs a floating type"), lit.pos);
                     }
                     let prim = match ty {
                         Option::Some(t) => t,
@@ -1211,9 +1216,9 @@ impl Signatures['k] {
                     if !valid_literal(&cx, prim, lit.text) {
                         let name = match prim {
                             Type::Prim(n) => n,
-                            _ => text(&cx, ""),
+                            _ => Span::from_static(&cx, ""),
                         };
-                        return sig_error(text_of(&cx, Buffer::new().push_static("literal ").push_bytes(&cx, lit.text).push_static(" does not fit ").push_bytes(&cx, name)), lit.pos);
+                        return sig_error(Buffer::new().push_static("literal ").push_bytes(&cx, lit.text).push_static(" does not fit ").push_bytes(&cx, name).save(&cx), lit.pos);
                     }
                     Result::Ok.(ConstValue::Float.(lit.text, prim))
                 },
@@ -1234,28 +1239,28 @@ impl Signatures['k] {
                     Option::Some(d) => {
                         var i = 0usize;
                         while i < path.segments.len(&cx) {
-                            if !path.segments.get(&cx, i).args.is_empty(&cx) {
-                                return sig_error(text(&cx, "constant paths take no type arguments"), path.pos);
+                            if !path.segments.at(&cx, i).args.is_empty(&cx) {
+                                return sig_error(Span::from_static(&cx, "constant paths take no type arguments"), path.pos);
                             }
                             i = i + 1usize;
                         }
                         self.const_decl(&cx, d)
                     },
-                    Option::None => sig_error(text(&cx, "a constant expression names only consts"), path.pos),
+                    Option::None => sig_error(Span::from_static(&cx, "a constant expression names only consts"), path.pos),
                 }
             },
             Expr::Tuple(t) => if t.value.len(&cx) == 1usize {
-                self.fold(&cx, t.value.get(&cx, 0usize), want, home, evaluate)
+                self.fold(&cx, t.value.at(&cx, 0usize), want, home, evaluate)
             } else {
-                sig_error(text(&cx, "not a constant expression"), t.pos)
+                sig_error(Span::from_static(&cx, "not a constant expression"), t.pos)
             },
             Expr::Unary(u) => if u.op.is(&cx, "-") || u.op.is(&cx, "!") {
                 self.unary(&cx, u, want, home, evaluate)
             } else {
-                sig_error(text(&cx, "not a constant expression"), u.pos)
+                sig_error(Span::from_static(&cx, "not a constant expression"), u.pos)
             },
             Expr::Cast(c) => {
-                let v = self.fold(&cx, c.value.get(&cx), Option::None, home, evaluate)?;
+                let v = self.fold(&cx, c.value.copy(&cx), Option::None, home, evaluate)?;
                 let to = self.type(&cx, c.type, new_scope(&cx))?;
                 let unit = match v {
                     ConstValue::Int(value, _ty) => match integer_type(&cx, Option::Some.(to)) {
@@ -1264,17 +1269,17 @@ impl Signatures['k] {
                     },
                     _ => (),
                 };
-                sig_error(text(&cx, "a constant cast converts between integer types"), c.pos)
+                sig_error(Span::from_static(&cx, "a constant cast converts between integer types"), c.pos)
             },
             Expr::Binop(b) => self.binop(&cx, b, want, home, evaluate),
-            _ => sig_error(text(&cx, "not a constant expression"), S::expr_pos(expr)),
+            _ => sig_error(Span::from_static(&cx, "not a constant expression"), S::expr_pos(expr)),
         }
     }
 
     // `-` or `!` applied to a constant.
-    fn unary(self, &cx: Cx!['k], expr: S::Unary['k], want: Option[Type['k]], home: Option[ModuleId['k]], evaluate: bool) -> Result[ConstValue['k], SigError['k]] {
+    fn unary(self, &cx: Domain!['k], expr: S::Unary['k], want: Option[Type['k]], home: Option[ModuleId['k]], evaluate: bool) -> Result[ConstValue['k], SigError['k]] {
         if expr.op.is(&cx, "-") {
-            let unit = match expr.operand.get(&cx) {
+            let unit = match expr.operand.copy(&cx) {
                 Expr::Lit(literal) => match literal.kind {
                     S::LitKind::Int => {
                         let ty = match literal.suffix {
@@ -1283,7 +1288,7 @@ impl Signatures['k] {
                         };
                         return match integer_type(&cx, ty) {
                             Option::Some(name) => self.wrapped_literal(&cx, literal.int, true, name, expr.pos),
-                            Option::None => sig_error(text(&cx, "an integer constant needs a type"), expr.pos),
+                            Option::None => sig_error(Span::from_static(&cx, "an integer constant needs a type"), expr.pos),
                         };
                     },
                     _ => (),
@@ -1291,10 +1296,10 @@ impl Signatures['k] {
                 _ => (),
             };
         }
-        let v = self.fold(&cx, expr.operand.get(&cx), want, home, evaluate)?;
+        let v = self.fold(&cx, expr.operand.copy(&cx), want, home, evaluate)?;
         match v {
             ConstValue::Float(digits, ty) => if expr.op.is(&cx, "-") {
-                let negated = if digits.starts_with(&cx, text(&cx, "-")) { digits.from(1usize) } else { text(&cx, "-").concat(&cx, digits) };
+                let negated = if digits.starts_with(&cx, Span::from_static(&cx, "-")) { digits.skip(1usize) } else { Span::from_static(&cx, "-").concat(&cx, digits) };
                 return Result::Ok.(ConstValue::Float.(negated, ty));
             },
             ConstValue::Bool(b) => if expr.op.is(&cx, "!") {
@@ -1306,33 +1311,33 @@ impl Signatures['k] {
             ConstValue::Int(value, ty) => {
                 let name = match ty {
                     Type::Prim(n) => n,
-                    _ => text(&cx, ""),
+                    _ => Span::from_static(&cx, ""),
                 };
                 Result::Ok.(wrapped(&cx, if expr.op.is(&cx, "-") { 0u64 - value } else { value ^ all_bits() }, name))
             },
-            _ => sig_error(text(&cx, "operator needs an integer"), expr.pos),
+            _ => sig_error(Span::from_static(&cx, "operator needs an integer"), expr.pos),
         }
     }
 
-    fn binop(self, &cx: Cx!['k], expr: S::Binop['k], want: Option[Type['k]], home: Option[ModuleId['k]], evaluate: bool) -> Result[ConstValue['k], SigError['k]] {
+    fn binop(self, &cx: Domain!['k], expr: S::Binop['k], want: Option[Type['k]], home: Option[ModuleId['k]], evaluate: bool) -> Result[ConstValue['k], SigError['k]] {
         let op = expr.op;
         if op.is(&cx, "&&") || op.is(&cx, "||") {
-            let a = match self.fold(&cx, expr.left.get(&cx), Option::Some.(C::bool_type(&cx)), home, evaluate)? {
+            let a = match self.fold(&cx, expr.left.copy(&cx), Option::Some.(C::bool_type(&cx)), home, evaluate)? {
                 ConstValue::Bool(x) => x,
-                _ => return sig_error(text(&cx, "logical constant operands must be booleans"), expr.pos),
+                _ => return sig_error(Span::from_static(&cx, "logical constant operands must be booleans"), expr.pos),
             };
             let needed = if op.is(&cx, "&&") { a } else { !a };
-            let b = match self.fold(&cx, expr.right.get(&cx), Option::Some.(C::bool_type(&cx)), home, evaluate && needed)? {
+            let b = match self.fold(&cx, expr.right.copy(&cx), Option::Some.(C::bool_type(&cx)), home, evaluate && needed)? {
                 ConstValue::Bool(x) => x,
-                _ => return sig_error(text(&cx, "logical constant operands must be booleans"), expr.pos),
+                _ => return sig_error(Span::from_static(&cx, "logical constant operands must be booleans"), expr.pos),
             };
             return Result::Ok.(ConstValue::Bool.(if op.is(&cx, "&&") { a && b } else { a || b }));
         }
         let comparison = is_comparison(&cx, op);
         let hint = if comparison { Option::None } else { want };
         // The left operand first, giving the right its type; if that fails, the other way round.
-        let first = match self.fold(&cx, expr.left.get(&cx), hint, home, evaluate) {
-            Result::Ok(a) => match self.fold(&cx, expr.right.get(&cx), const_type(&cx, a), home, evaluate) {
+        let first = match self.fold(&cx, expr.left.copy(&cx), hint, home, evaluate) {
+            Result::Ok(a) => match self.fold(&cx, expr.right.copy(&cx), const_type(&cx, a), home, evaluate) {
                 Result::Ok(b) => Option::Some.((a, b)),
                 Result::Err(_e) => Option::None,
             },
@@ -1341,8 +1346,8 @@ impl Signatures['k] {
         let (a, b) = match first {
             Option::Some(pair) => pair,
             Option::None => {
-                let b = self.fold(&cx, expr.right.get(&cx), hint, home, evaluate)?;
-                let a = self.fold(&cx, expr.left.get(&cx), const_type(&cx, b), home, evaluate)?;
+                let b = self.fold(&cx, expr.right.copy(&cx), hint, home, evaluate)?;
+                let a = self.fold(&cx, expr.left.copy(&cx), const_type(&cx, b), home, evaluate)?;
                 (a, b)
             },
         };
@@ -1350,24 +1355,24 @@ impl Signatures['k] {
             ConstValue::Bool(x) => if op.is(&cx, "==") || op.is(&cx, "!=") {
                 return match b {
                     ConstValue::Bool(y) => Result::Ok.(ConstValue::Bool.((x == y) == op.is(&cx, "=="))),
-                    _ => sig_error(text(&cx, "constant comparison operands must have the same type"), expr.pos),
+                    _ => sig_error(Span::from_static(&cx, "constant comparison operands must have the same type"), expr.pos),
                 };
             },
             _ => (),
         };
         let (x, ty) = match a {
             ConstValue::Int(x, ty) => (x, ty),
-            _ => return sig_error(text(&cx, "constant operands must be integers of one type"), expr.pos),
+            _ => return sig_error(Span::from_static(&cx, "constant operands must be integers of one type"), expr.pos),
         };
         let y = match b {
             ConstValue::Int(y, other) => if C::same(&cx, ty, other) { y } else {
-                return sig_error(text(&cx, "constant operands must be integers of one type"), expr.pos);
+                return sig_error(Span::from_static(&cx, "constant operands must be integers of one type"), expr.pos);
             },
-            _ => return sig_error(text(&cx, "constant operands must be integers of one type"), expr.pos),
+            _ => return sig_error(Span::from_static(&cx, "constant operands must be integers of one type"), expr.pos),
         };
         let name = match ty {
             Type::Prim(n) => n,
-            _ => text(&cx, ""),
+            _ => Span::from_static(&cx, ""),
         };
         if !evaluate {
             return Result::Ok.(if comparison { ConstValue::Bool.(false) } else { wrapped(&cx, 0u64, name) });
@@ -1397,7 +1402,7 @@ impl Signatures['k] {
         let bits = C::integer_bits(&cx, name) as u64;
         let value = if op.is(&cx, "/") || op.is(&cx, "%") {
             if y == 0u64 {
-                return sig_error(text(&cx, "constant division by zero"), expr.pos);
+                return sig_error(Span::from_static(&cx, "constant division by zero"), expr.pos);
             }
             // The quotient rounds toward zero, from the magnitudes; the most negative i64's
             // magnitude, 2^63, fits in a u64.
@@ -1432,21 +1437,21 @@ impl Signatures['k] {
         } else if op.is(&cx, "^") {
             x ^ y
         } else {
-            fail(&cx, text_of(&cx, Buffer::new().push_static("internal error: no constant operator ").push_bytes(&cx, op)))
+            fail(&cx, Buffer::new().push_static("internal error: no constant operator ").push_bytes(&cx, op).save(&cx))
         };
         Result::Ok.(wrapped(&cx, value, name))
     }
 
     // A literal's value in the integer type `name`; it must fit (a negated one may reach the
     // minimum).
-    fn wrapped_literal(self, &cx: Cx!['k], magnitude: u64, negative: bool, name: Text['k], pos: Pos) -> Result[ConstValue['k], SigError['k]] {
+    fn wrapped_literal(self, &cx: Domain!['k], magnitude: u64, negative: bool, name: Span['k], pos: Pos) -> Result[ConstValue['k], SigError['k]] {
         let spelled = if negative && magnitude != 0u64 {
-            text_of(&cx, Buffer::new().push_static("-").push_u64(magnitude))
+            Buffer::new().push_static("-").push_u64(magnitude).save(&cx)
         } else {
-            text_of(&cx, Buffer::new().push_u64(magnitude))
+            Buffer::new().push_u64(magnitude).save(&cx)
         };
         if !valid_literal(&cx, Type::Prim.(name), spelled) {
-            return sig_error(text_of(&cx, Buffer::new().push_bytes(&cx, spelled).push_static(" does not fit ").push_bytes(&cx, name)), pos);
+            return sig_error(Buffer::new().push_bytes(&cx, spelled).push_static(" does not fit ").push_bytes(&cx, name).save(&cx), pos);
         }
         Result::Ok.(wrapped(&cx, if negative { 0u64 - magnitude } else { magnitude }, name))
     }
@@ -1454,7 +1459,7 @@ impl Signatures['k] {
 
 // `value` in the integer type `name`'s width, sign-extended when it is signed.
 forall 'k.
-fn wrapped(&cx: Cx!['k], value: u64, name: Text['k]) -> ConstValue['k] {
+fn wrapped(&cx: Domain!['k], value: u64, name: Span['k]) -> ConstValue['k] {
     let bits = C::integer_bits(&cx, name) as u64;
     var v = value;
     if bits < 64u64 {
@@ -1469,11 +1474,11 @@ fn wrapped(&cx: Cx!['k], value: u64, name: Text['k]) -> ConstValue['k] {
 
 // The indices of a function type's place slots, from `first`.
 forall 'k.
-fn places_of(&cx: Cx!['k], slots: Seq[S::Slot['k], 'k], first: usize) -> Seq[usize, 'k] {
-    let out: Seq[usize, 'k] = Seq::new(&cx);
+fn places_of(&cx: Domain!['k], slots: ArenaVec[S::Slot['k], 'k], first: usize) -> ArenaVec[usize, 'k] {
+    let out: ArenaVec[usize, 'k] = ArenaVec::new(&cx);
     var i = 0usize;
     while i < slots.len(&cx) {
-        if slots.get(&cx, i).lend {
+        if slots.at(&cx, i).lend {
             out.push(&cx, i + first);
         }
         i = i + 1usize;
@@ -1482,6 +1487,6 @@ fn places_of(&cx: Cx!['k], slots: Seq[S::Slot['k], 'k], first: usize) -> Seq[usi
 }
 
 forall 'k.
-fn signatures(&cx: Cx!['k], resolver: Resolver['k], counter: Fresh['k]) -> Signatures['k] {
+fn signatures(&cx: Domain!['k], resolver: Resolver['k], counter: Fresh['k]) -> Signatures['k] {
     Signatures::new(&cx, resolver, counter)
 }

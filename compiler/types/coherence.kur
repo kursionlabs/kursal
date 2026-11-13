@@ -9,7 +9,10 @@
 // quantified function type) is compared as a wildcard. Two heads that differ only under binders
 // count as overlapping, so no overlap can hide in how binders are compared.
 
-use package::support::base::{Cx, Map, Seq, Set, Text, text_of};
+use std::collections::arena_vec::ArenaVec;
+use std::collections::arena_map::{ArenaMap, ArenaSet};
+use std::raw::Span;
+use std::alloc::arena::Domain;
 use std::bytes::buffer::Buffer;
 use package::kurs::core::{Kind, Meta, MetaKind, Param, Premise, Type};
 use package::kurs::core as C;
@@ -19,7 +22,7 @@ use package::types::unify::{instantiate, unify};
 use std::option::Option;
 
 forall 'k.
-fn binders_as_wildcards(&cx: Cx!['k], ty: Type['k]) -> Type['k] {
+fn binders_as_wildcards(&cx: Domain!['k], ty: Type['k]) -> Type['k] {
     match ty {
         Type::Exists(_binders, _body) => Type::Meta.(Meta::new(&cx, MetaKind::Type)),
         Type::Foreach(_f) => Type::Meta.(Meta::new(&cx, MetaKind::Type)),
@@ -36,61 +39,61 @@ fn binders_as_wildcards(&cx: Cx!['k], ty: Type['k]) -> Type['k] {
 
 // Every quantified parameter is extractable without crossing a binder.
 forall 'k.
-fn check_instance_range(&cx: Cx!['k], head: Premise['k], params: Seq[Param['k], 'k], pos: Pos) {
-    let used: Set[Text['k], 'k] = Set::new(&cx);
+fn check_instance_range(&cx: Domain!['k], head: Premise['k], params: ArenaVec[Param['k], 'k], pos: Pos) {
+    let used: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
     var i = 0usize;
     while i < head.args.len(&cx) {
-        add_all(&cx, used, extractable_names(&cx, head.args.get(&cx, i)));
+        add_all(&cx, used, extractable_names(&cx, head.args.at(&cx, i)));
         i = i + 1usize;
     }
     var j = 0usize;
     while j < params.len(&cx) {
-        let param = params.get(&cx, j);
-        if !used.has(&cx, param.name) {
-            let name = if C::same_kind(param.kind, Kind::Brand) { text_of(&cx, Buffer::new().push_static("$").push_bytes(&cx, param.name)) } else { param.name };
-            kurs_error(&cx, text_of(&cx, Buffer::new().push_static("instance of ").push_bytes(&cx, head.trait_name).push_static(": parameter ").push_bytes(&cx, name)
-                .push_static(" needs a binder-free head occurrence")), pos);
+        let param = params.at(&cx, j);
+        if !used.contains(&cx, param.name) {
+            let name = if C::same_kind(param.kind, Kind::Brand) { Buffer::new().push_static("$").push_bytes(&cx, param.name).save(&cx) } else { param.name };
+            kurs_error(&cx, Buffer::new().push_static("instance of ").push_bytes(&cx, head.trait_name).push_static(": parameter ").push_bytes(&cx, name)
+                .push_static(" needs a binder-free head occurrence").save(&cx), pos);
         }
         j = j + 1usize;
     }
 }
 
 forall 'k.
-fn show_args(&cx: Cx!['k], args: Seq[Type['k], 'k]) -> Text['k] {
+fn show_args(&cx: Domain!['k], args: ArenaVec[Type['k], 'k]) -> Span['k] {
     var out = Buffer::new();
     var i = 0usize;
     while i < args.len(&cx) {
         if i > 0usize {
             out = out.push_static(", ");
         }
-        out = out.push_bytes(&cx, show(&cx, args.get(&cx, i)));
+        out = out.push_bytes(&cx, show(&cx, args.at(&cx, i)));
         i = i + 1usize;
     }
-    text_of(&cx, out)
+    out.save(&cx)
 }
 
 forall 'k.
-fn wildcards(&cx: Cx!['k], args: Seq[Type['k], 'k], sub: Map[Text['k], Type['k], 'k], counter: Fresh['k]) -> Seq[Type['k], 'k] {
-    let out: Seq[Type['k], 'k] = Seq::new(&cx);
+fn wildcards(&cx: Domain!['k], args: ArenaVec[Type['k], 'k], sub: ArenaMap[Span['k], Type['k], 'k], counter: Fresh['k]) -> ArenaVec[Type['k], 'k] {
+    let out: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
     var i = 0usize;
     while i < args.len(&cx) {
-        out.push(&cx, binders_as_wildcards(&cx, subst(&cx, args.get(&cx, i), sub, counter)));
+        out.push(&cx, binders_as_wildcards(&cx, subst(&cx, args.at(&cx, i), sub, counter)));
         i = i + 1usize;
     }
     out
 }
 
 forall 'k.
-fn check_coherence(&cx: Cx!['k], headers: Seq[(Premise['k], Seq[Param['k], 'k], Pos), 'k], counter: Fresh['k]) {
-    let seen: Map[Text['k], Seq[(Premise['k], Seq[Param['k], 'k]), 'k], 'k] = Map::new(&cx);
+fn check_coherence(&cx: Domain!['k], headers: ArenaVec[(Premise['k], ArenaVec[Param['k], 'k], Pos), 'k], counter: Fresh['k]) {
+    let seen: ArenaMap[Span['k], ArenaVec[(Premise['k], ArenaVec[Param['k], 'k]), 'k], 'k] = ArenaMap::new(&cx);
     var h = 0usize;
     while h < headers.len(&cx) {
-        let (head, params, pos) = headers.get(&cx, h);
+        let (head, params, pos) = headers.at(&cx, h);
         check_instance_range(&cx, head, params, pos);
-        let earlier_heads = seen.get_or(&cx, head.trait_name, Seq::new(&cx));
+        let earlier_heads = seen.get_or(&cx, head.trait_name, ArenaVec::new(&cx));
         var e = 0usize;
         while e < earlier_heads.len(&cx) {
-            let (earlier, earlier_params) = earlier_heads.get(&cx, e);
+            let (earlier, earlier_params) = earlier_heads.at(&cx, e);
             // Freshen for every comparison: failed unification can leave some variables solved,
             // so its substitutions must not reach another pair.
             let left = instantiate(&cx, params);
@@ -100,17 +103,17 @@ fn check_coherence(&cx: Cx!['k], headers: Seq[(Premise['k], Seq[Param['k], 'k], 
             var overlapping = xs.len(&cx) == ys.len(&cx);
             var i = 0usize;
             while overlapping && i < xs.len(&cx) {
-                overlapping = unify(&cx, xs.get(&cx, i), ys.get(&cx, i), true, counter);
+                overlapping = unify(&cx, xs.at(&cx, i), ys.at(&cx, i), true, counter);
                 i = i + 1usize;
             }
             if overlapping {
-                kurs_error(&cx, text_of(&cx, Buffer::new().push_static("overlapping instances of ").push_bytes(&cx, head.trait_name).push_static(": (").push_bytes(&cx, show_args(&cx, head.args))
-                    .push_static(") and (").push_bytes(&cx, show_args(&cx, earlier.args)).push_static(")")), pos);
+                kurs_error(&cx, Buffer::new().push_static("overlapping instances of ").push_bytes(&cx, head.trait_name).push_static(": (").push_bytes(&cx, show_args(&cx, head.args))
+                    .push_static(") and (").push_bytes(&cx, show_args(&cx, earlier.args)).push_static(")").save(&cx), pos);
             }
             e = e + 1usize;
         }
-        if !seen.has(&cx, head.trait_name) {
-            seen.set(&cx, head.trait_name, Seq::new(&cx));
+        if !seen.contains(&cx, head.trait_name) {
+            seen.insert(&cx, head.trait_name, ArenaVec::new(&cx));
         }
         seen.at(&cx, head.trait_name).push(&cx, (head, params));
         h = h + 1usize;

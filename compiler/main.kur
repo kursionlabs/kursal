@@ -22,7 +22,12 @@
 // the code of every phase is made once, for the brand of the group it runs in. A command that
 // fails stops the process from inside, leaving its arenas to the operating system.
 
-use package::support::base::{Cell, Cx, Map, Seq, Text, fail, text, text_of};
+use package::support::base::fail;
+use std::collections::arena_vec::ArenaVec;
+use std::collections::arena_map::ArenaMap;
+use std::mem::Ref;
+use std::raw::Span;
+use std::alloc::arena::Domain;
 use package::backend::cgen::emit_c;
 use package::check::checker::{FunKey, check_program, copy_typed};
 use package::syntax::dump as syntax_dump;
@@ -42,7 +47,7 @@ use package::sigs::signatures::signatures;
 use package::support::system::{arguments, command_line, read, run, write};
 use package::types::ops::{Fresh, carry_fresh};
 use std::bytes::buffer::Buffer;
-use std::io::print_buffer;
+use std::io::{print_buffer, write_span};
 use std::option::Option;
 use std::slice::Slice;
 use std::time::Instant;
@@ -64,9 +69,9 @@ exposed struct Handoff {
     program: Program['k],
     counter: Fresh['k],
     // the function C's `main` enters through
-    entry: Option[Text['k]],
+    entry: Option[Span['k]],
     // `build`'s OUTPUT
-    output: Option[Text['k]],
+    output: Option[Span['k]],
     times: bool,
     // when the current stage started
     started: Instant,
@@ -74,14 +79,14 @@ exposed struct Handoff {
 
 // `handoff` copied from the arena of `from` into that of `to`.
 forall 'a, 'b.
-fn carry(&from: Cx!['a], &to: Cx!['b], handoff: Handoff['a]) -> Handoff['b] {
+fn carry(&from: Domain!['a], &to: Domain!['b], handoff: Handoff['a]) -> Handoff['b] {
     Handoff.{ goal: handoff.goal, program: copy_program(&from, &to, handoff.program), counter: carry_fresh(&from, &to, handoff.counter),
         entry: copy_option_text(&from, &to, handoff.entry), output: copy_option_text(&from, &to, handoff.output), times: handoff.times,
         started: handoff.started }
 }
 
 fn main() -> i32 {
-    let exists 'f. front = Cx::new();
+    let exists 'f. front = Domain::new();
     var front = front;
     let handoff = match front_end(&front) {
         Option::Some(h) => h,
@@ -90,7 +95,7 @@ fn main() -> i32 {
             return 0;
         },
     };
-    let exists 'c. core = Cx::new();
+    let exists 'c. core = Domain::new();
     var core = core;
     let checked = carry(&front, &core, handoff);
     front.destroy();
@@ -103,7 +108,7 @@ fn main() -> i32 {
         },
         _ => (),
     };
-    let exists 'b. back = Cx::new();
+    let exists 'b. back = Domain::new();
     var back = back;
     let emitted = carry(&core, &back, Handoff.{ goal: checked.goal, program: checked.program, counter: checked.counter, entry: checked.entry,
         output: checked.output, times: checked.times, started });
@@ -115,87 +120,87 @@ fn main() -> i32 {
 // The front end of every command, in the arena of `cx`: a command that only the front end does is
 // done, and gives nothing; `check`, `c` and `build` give what the core needs.
 forall 'k.
-fn front_end(&cx: Cx!['k]) -> Option[Handoff['k]] {
+fn front_end(&cx: Domain!['k]) -> Option[Handoff['k]] {
     let args = arguments(&cx);
     if args.is_empty(&cx) {
-        fail(&cx, text(&cx, "usage: kursal parse FILE... | kursal resolve PATH | kursal sigs PATH | kursal infer PATH | kursal kurs FILE | kursal check FILE | kursal c FILE [--entry NAME] | kursal readable FILE | kursal lower PATH | kursal build PATH [-o OUTPUT] [--times]"));
+        fail(&cx, Span::from_static(&cx, "usage: kursal parse FILE... | kursal resolve PATH | kursal sigs PATH | kursal infer PATH | kursal kurs FILE | kursal check FILE | kursal c FILE [--entry NAME] | kursal readable FILE | kursal lower PATH | kursal build PATH [-o OUTPUT] [--times]"));
     }
-    let command = args.get(&cx, 0usize);
+    let command = args.at(&cx, 0usize);
     if command.is(&cx, "parse") {
-        let ids = Cell::new(&cx, 0u32);
+        let ids = Ref::new(&cx, 0u32);
         var i = 1usize;
         while i < args.len(&cx) {
-            let file = args.get(&cx, i);
+            let file = args.at(&cx, i);
             let source = match read(&cx, file) {
                 Option::Some(s) => s,
-                Option::None => fail(&cx, text_of(&cx, Buffer::new().push_static("cannot read ").push_bytes(&cx, file))),
+                Option::None => fail(&cx, Buffer::new().push_static("cannot read ").push_bytes(&cx, file).save(&cx)),
             };
             print_buffer(1i32, Buffer::new().push_static("== ").push_bytes(&cx, file).push_static("\n"));
-            syntax_dump::items(&cx, parse(&cx, source, file, ids)).print(&cx, 1);
+            let written = write_span(1, &cx, syntax_dump::items(&cx, parse(&cx, source, file, ids)));
             i = i + 1usize;
         }
         Option::None
     } else if command.is(&cx, "selftest-types") {
-        selftest_types(&cx, args.from(&cx, 1usize));
+        selftest_types(&cx, args.skip(&cx, 1usize));
         Option::None
     } else if command.is(&cx, "resolve") && args.len(&cx) == 2usize {
-        resolve_dump::program(&cx, resolve(&cx, args.get(&cx, 1usize))).print(&cx, 1);
+        let written = write_span(1, &cx, resolve_dump::program(&cx, resolve(&cx, args.at(&cx, 1usize))));
         Option::None
     } else if command.is(&cx, "sigs") && args.len(&cx) == 2usize {
-        sigs_dump::program(&cx, signatures(&cx, resolve(&cx, args.get(&cx, 1usize)), Fresh::new(&cx))).print(&cx, 1);
+        let written = write_span(1, &cx, sigs_dump::program(&cx, signatures(&cx, resolve(&cx, args.at(&cx, 1usize)), Fresh::new(&cx))));
         Option::None
     } else if command.is(&cx, "infer") && args.len(&cx) == 2usize {
         let counter = Fresh::new(&cx);
-        let r = resolve(&cx, args.get(&cx, 1usize));
-        infer_dump::program(&cx, infer(&cx, r, signatures(&cx, r, counter), counter)).print(&cx, 1);
+        let r = resolve(&cx, args.at(&cx, 1usize));
+        let written = write_span(1, &cx, infer_dump::program(&cx, infer(&cx, r, signatures(&cx, r, counter), counter)));
         Option::None
     } else if command.is(&cx, "kurs") && args.len(&cx) == 2usize {
-        write_program(&cx, parse_program(&cx, read_file(&cx, args.get(&cx, 1usize)))).print(&cx, 1);
+        let written = write_span(1, &cx, write_program(&cx, parse_program(&cx, read_file(&cx, args.at(&cx, 1usize)))));
         Option::None
     } else if command.is(&cx, "check") && args.len(&cx) == 2usize {
-        Option::Some.(Handoff.{ goal: Goal::Check, program: parse_program(&cx, read_file(&cx, args.get(&cx, 1usize))), counter: Fresh::new(&cx),
+        Option::Some.(Handoff.{ goal: Goal::Check, program: parse_program(&cx, read_file(&cx, args.at(&cx, 1usize))), counter: Fresh::new(&cx),
             entry: Option::None, output: Option::None, times: false, started: Instant::now() })
     } else if command.is(&cx, "c") {
-        var file: Option[Text['k]] = Option::None;
-        var entry: Option[Text['k]] = Option::None;
+        var file: Option[Span['k]] = Option::None;
+        var entry: Option[Span['k]] = Option::None;
         var i = 1usize;
         while i < args.len(&cx) {
-            if args.get(&cx, i).is(&cx, "--entry") && i + 1usize < args.len(&cx) {
-                entry = Option::Some.(args.get(&cx, i + 1usize));
+            if args.at(&cx, i).is(&cx, "--entry") && i + 1usize < args.len(&cx) {
+                entry = Option::Some.(args.at(&cx, i + 1usize));
                 i = i + 2usize;
             } else if file.is_none() {
-                file = Option::Some.(args.get(&cx, i));
+                file = Option::Some.(args.at(&cx, i));
                 i = i + 1usize;
             } else {
-                fail(&cx, text(&cx, "usage: kursal c FILE [--entry NAME]"));
+                fail(&cx, Span::from_static(&cx, "usage: kursal c FILE [--entry NAME]"));
             }
         }
         let path = match file {
             Option::Some(f) => f,
-            Option::None => fail(&cx, text(&cx, "usage: kursal c FILE [--entry NAME]")),
+            Option::None => fail(&cx, Span::from_static(&cx, "usage: kursal c FILE [--entry NAME]")),
         };
         Option::Some.(Handoff.{ goal: Goal::C, program: parse_program(&cx, read_file(&cx, path)), counter: Fresh::new(&cx),
             entry, output: Option::None, times: false, started: Instant::now() })
     } else if command.is(&cx, "lower") && args.len(&cx) == 2usize {
         let counter = Fresh::new(&cx);
-        let r = resolve(&cx, args.get(&cx, 1usize));
-        write_program(&cx, lower(&cx, r, signatures(&cx, r, counter), counter)).print(&cx, 1);
+        let r = resolve(&cx, args.at(&cx, 1usize));
+        let written = write_span(1, &cx, write_program(&cx, lower(&cx, r, signatures(&cx, r, counter), counter)));
         Option::None
     } else if command.is(&cx, "build") {
-        Option::Some.(build(&cx, args.from(&cx, 1usize)))
+        Option::Some.(build(&cx, args.skip(&cx, 1usize)))
     } else if command.is(&cx, "readable") && args.len(&cx) == 2usize {
-        emit_kurs(&cx, parse_program(&cx, read_file(&cx, args.get(&cx, 1usize))), Fresh::new(&cx)).print(&cx, 1);
+        let written = write_span(1, &cx, emit_kurs(&cx, parse_program(&cx, read_file(&cx, args.at(&cx, 1usize))), Fresh::new(&cx)));
         Option::None
     } else {
-        fail(&cx, text_of(&cx, Buffer::new().push_static("unknown command ").push_bytes(&cx, command)))
+        fail(&cx, Buffer::new().push_static("unknown command ").push_bytes(&cx, command).save(&cx))
     }
 }
 
 forall 'k.
-fn read_file(&cx: Cx!['k], file: Text['k]) -> Text['k] {
+fn read_file(&cx: Domain!['k], file: Span['k]) -> Span['k] {
     match read(&cx, file) {
         Option::Some(s) => s,
-        Option::None => fail(&cx, text_of(&cx, Buffer::new().push_static("cannot read ").push_bytes(&cx, file))),
+        Option::None => fail(&cx, Buffer::new().push_static("cannot read ").push_bytes(&cx, file).save(&cx)),
     }
 }
 
@@ -213,28 +218,28 @@ fn stage(times: bool, name: Slice[u8, 'static], started: Instant) -> Instant {
 // The front end of `kursal build PATH [-o OUTPUT] [--times]`: the package resolved, its
 // signatures built, and its bodies inferred and lowered.
 forall 'k.
-fn build(&cx: Cx!['k], args: Seq[Text['k], 'k]) -> Handoff['k] {
-    var path: Option[Text['k]] = Option::None;
-    var output: Option[Text['k]] = Option::None;
+fn build(&cx: Domain!['k], args: ArenaVec[Span['k], 'k]) -> Handoff['k] {
+    var path: Option[Span['k]] = Option::None;
+    var output: Option[Span['k]] = Option::None;
     var times = false;
     var i = 0usize;
     while i < args.len(&cx) {
-        if args.get(&cx, i).is(&cx, "--times") {
+        if args.at(&cx, i).is(&cx, "--times") {
             times = true;
             i = i + 1usize;
-        } else if args.get(&cx, i).is(&cx, "-o") && i + 1usize < args.len(&cx) && output.is_none() {
-            output = Option::Some.(args.get(&cx, i + 1usize));
+        } else if args.at(&cx, i).is(&cx, "-o") && i + 1usize < args.len(&cx) && output.is_none() {
+            output = Option::Some.(args.at(&cx, i + 1usize));
             i = i + 2usize;
         } else if path.is_none() {
-            path = Option::Some.(args.get(&cx, i));
+            path = Option::Some.(args.at(&cx, i));
             i = i + 1usize;
         } else {
-            fail(&cx, text(&cx, "usage: kursal build PATH [-o OUTPUT] [--times]"));
+            fail(&cx, Span::from_static(&cx, "usage: kursal build PATH [-o OUTPUT] [--times]"));
         }
     }
     let package = match path {
         Option::Some(p) => p,
-        Option::None => fail(&cx, text(&cx, "usage: kursal build PATH [-o OUTPUT] [--times]")),
+        Option::None => fail(&cx, Span::from_static(&cx, "usage: kursal build PATH [-o OUTPUT] [--times]")),
     };
     var started = Instant::now();
     let counter = Fresh::new(&cx);
@@ -243,7 +248,7 @@ fn build(&cx: Cx!['k], args: Seq[Text['k], 'k]) -> Handoff['k] {
     started = stage(times, "signatures", started);
     let program = lower(&cx, r, sigs, counter);
     started = stage(times, "lower", started);
-    let entry = match r.packages.get(&cx, 0usize).entry_decl.get(&cx) {
+    let entry = match r.packages.at(&cx, 0usize).entry_decl.copy(&cx) {
         Option::Some(decl) => Option::Some.(sigs.name(&cx, decl)),
         Option::None => Option::None,
     };
@@ -254,7 +259,7 @@ fn build(&cx: Cx!['k], args: Seq[Text['k], 'k]) -> Handoff['k] {
 // for `build` with OUTPUT, written to OUTPUT.c and compiled into OUTPUT with the standard
 // library's C helpers. The command's exit status.
 forall 'k.
-fn back_end(cx: Cx!['k], handoff: Handoff['k], typed: Map[FunKey['k], Map[(Text['k], Text['k]), Type['k], 'k], 'k]) -> i32 {
+fn back_end(cx: Domain!['k], handoff: Handoff['k], typed: ArenaMap[FunKey['k], ArenaMap[(Span['k], Span['k]), Type['k], 'k], 'k]) -> i32 {
     var cx = cx;
     let c = emit_c(&cx, handoff.program, typed, handoff.entry, handoff.counter);
     let started = stage(handoff.times, "C", handoff.started);
@@ -266,21 +271,21 @@ fn back_end(cx: Cx!['k], handoff: Handoff['k], typed: Map[FunKey['k], Map[(Text[
             return 0;
         },
     };
-    let c_file = text_of(&cx, Buffer::new().push_bytes(&cx, out).push_static(".c"));
+    let c_file = Buffer::new().push_bytes(&cx, out).push_static(".c").save(&cx);
     if !write(&cx, c_file, c) {
-        fail(&cx, text_of(&cx, Buffer::new().push_static("cannot write ").push_bytes(&cx, c_file)));
+        fail(&cx, Buffer::new().push_static("cannot write ").push_bytes(&cx, c_file).save(&cx));
     }
     let lib = lib_dir(&cx);
-    let command: Seq[Text['k], 'k] = Seq::new(&cx);
-    command.push(&cx, text(&cx, "cc"));
-    command.push(&cx, text(&cx, "-O2"));
-    command.push(&cx, text(&cx, "-w"));
-    command.push(&cx, text(&cx, "-fno-builtin"));
+    let command: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+    command.push(&cx, Span::from_static(&cx, "cc"));
+    command.push(&cx, Span::from_static(&cx, "-O2"));
+    command.push(&cx, Span::from_static(&cx, "-w"));
+    command.push(&cx, Span::from_static(&cx, "-fno-builtin"));
     command.push(&cx, c_file);
-    command.push(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, lib).push_static("/libc/fs.c")));
-    command.push(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, lib).push_static("/libc/thread.c")));
-    command.push(&cx, text(&cx, "-lpthread"));
-    command.push(&cx, text(&cx, "-o"));
+    command.push(&cx, Buffer::new().push_bytes(&cx, lib).push_static("/libc/fs.c").save(&cx));
+    command.push(&cx, Buffer::new().push_bytes(&cx, lib).push_static("/libc/thread.c").save(&cx));
+    command.push(&cx, Span::from_static(&cx, "-lpthread"));
+    command.push(&cx, Span::from_static(&cx, "-o"));
     command.push(&cx, out);
     // Only the command line outlives the arena while `cc` runs.
     let line = command_line(&cx, command);
