@@ -48,9 +48,10 @@ class ManglingTests(unittest.TestCase):
         backend = self.backend()
         fun = backend.program.funs['alpha']
         fun.params = (C.Param('T'),)
-        types = (C.U32, C.Prim('i32'), C.Brand(C.Skolem('a')), C.Brand(C.Skolem('b')))
+        types = (C.U32, C.Prim('i32'), C.Brand(C.Skolem('a')))
         symbols = [backend.request(fun, {'T': t}) for t in types]
         self.assertEqual(len(set(symbols)), len(types))
+        self.assertEqual(symbols[-1], backend.request(fun, {'T': C.Brand(C.Skolem('b'))}))
         x = backend.request(fun, {'T': C.Exists(('a',), C.Brand(C.Skolem('a')))})
         y = backend.request(fun, {'T': C.Exists(('b',), C.Brand(C.Skolem('b')))})
         self.assertEqual(x, y)

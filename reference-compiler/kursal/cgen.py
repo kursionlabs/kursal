@@ -1,7 +1,7 @@
 """Checked KURS to C, by the canonical profile: no optimization, one C local
 per SSA definition, places as fixed C objects, parallel edge assignment.
 
-Generic functions are specialized on demand by logical type arguments.
+Generic functions are specialized on demand by logical type arguments, up to their brands.
 Representation erasure is separate from code-specialization identity."""
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from .check import Checker
 from .sexpr import Form, KursError, List, Str
 from .types import foreach_binders, ForeachRow, Types, equal, map_children, subst, subst_foreach
 from .termination import check_mono_termination
-from .mangle import encode, mangle, path_segments, type_key
+from .mangle import encode, mangle, path_segments, type_key, unbranded
 
 PRELUDE = """#include <stddef.h>
 #include <stdint.h>
@@ -102,7 +102,7 @@ class Backend:
         self.pending: dict[Type, Tuple | Struct | Array | Enum] = {}      # named but not yet defined aggregates
         self.forward: list[str] = []
         self.defs: list[str] = []
-        self.symbols: dict[int, list[tuple[tuple[Type, ...], str]]] = {}  # function -> its specializations' arguments and C symbols
+        self.symbols: dict[int, list[tuple[tuple[Type, ...], str]]] = {}  # function -> its specializations' unbranded arguments and C symbols
         self.queue: list[tuple[Fun, Mapping[str, Type], str]] = []
         self.bodies: list[str] = []
         self.protos: list[str] = []
@@ -206,9 +206,10 @@ class Backend:
         params = self.instance_params.get(id(fun), fun.params)
         if set(sub) != {p.name for p in params}:
             raise KursError(f"specialization arguments disagree for {fun.name}")
-        args = tuple(sub[p.name] for p in params)
-        # Logical alpha-equivalence, not representation equality. Capture-avoiding
-        # substitution may freshen bound names on recursive requests.
+        # One specialization for type arguments that differ only in brands, made for the first
+        # request's. Otherwise logical alpha-equivalence, not representation equality.
+        # Capture-avoiding substitution may freshen bound names on recursive requests.
+        args = tuple(unbranded(sub[p.name]) for p in params)
         for previous, symbol in self.symbols.get(id(fun), ()):
             if all(equal(a, b) for a, b in zip(args, previous)):
                 return symbol

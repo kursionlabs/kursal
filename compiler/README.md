@@ -127,11 +127,11 @@ lowered. `fail` still stops the process from inside, leaving whichever arenas ar
 operating system; on success, every arena is destroyed and every byte the compiler allocated is
 freed, which `tests/test_compiler.py` checks under valgrind.
 
-Code is specialized for each brand it runs under, so each arena is opened once, in `main`, and
-`front_end`, `check_program` and `back_end` take it by place: every command's front end shares one
-specialization, as do the checks and the backends. Code that more than one group runs (the
-`support` and `types` modules, `kurs::core`, the checker that place flow uses) is made once for
-each of them.
+Each arena is opened once, in `main`, and `front_end`, `check_program` and `back_end` take it by
+place. The backends specialize a generic function once for type arguments that differ only in
+brands (`backend::mangle::unbranded`), and brands are erased from C types, so code that more than
+one group runs (the `support` and `types` modules, `kurs::core`, the checker that place flow uses)
+is made once, whatever arena it runs in.
 
 ### Scratch state
 

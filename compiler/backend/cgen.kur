@@ -1,14 +1,14 @@
 // Checked KURS to C, by the canonical profile: no optimization, one C local per SSA definition,
 // places as fixed C objects, parallel edge assignment.
 //
-// Generic functions are specialized on demand by logical type arguments. Representation erasure is
-// separate from code-specialization identity.
+// Generic functions are specialized on demand by logical type arguments, up to their brands.
+// Representation erasure is separate from code-specialization identity.
 
 use package::support::base::{Cell, Cx, Map, Out, Seq, Set, Text, text};
 use package::check::checker::{FunKey, matching_instance};
 use package::kurs::core::{Arm, Block, Data, Edge, Fun, ForeachType, Instr, Member, Param, Program, Terminator, Type};
 use package::kurs::core as C;
-use package::backend::mangle::{decode_segment, encode, mangle, path_segments, type_key};
+use package::backend::mangle::{decode_segment, encode, mangle, path_segments, type_key, unbranded};
 use package::kurs::sexpr::Form;
 use package::syntax::ast::{Pos, no_pos};
 use package::types::termination::check_mono_termination;
@@ -406,7 +406,7 @@ exposed struct Backend {
     pending: Map[Type['k], Type['k], 'k],
     forward: Seq[Text['k], 'k],
     defs: Seq[Text['k], 'k],
-    // function -> the type arguments of each of its specializations, and its C symbol
+    // function -> the unbranded type arguments of each of its specializations, and its C symbol
     symbols: Map[FunKey['k], Seq[(Seq[Type['k], 'k], Text['k]), 'k], 'k],
     // the same, by structure: an earlier request with these very arguments
     symbol_index: Map[(FunKey['k], Seq[Type['k], 'k]), Text['k], 'k],
@@ -761,15 +761,17 @@ impl Backend['k] {
         if !agree {
             fail_text(&cx, Out::new(&cx).put(&cx, "specialization arguments disagree for ").add(&cx, fun.name).done(&cx));
         }
+        // One specialization for type arguments that differ only in brands, made for the first
+        // request's. Otherwise logical alpha-equivalence, not representation equality.
+        // Capture-avoiding substitution may freshen bound names on recursive requests. At most one
+        // earlier request is alpha-equivalent to these arguments, so one with structurally equal
+        // arguments is it.
         let args: Seq[Type['k], 'k] = Seq::new(&cx);
         var a = 0usize;
         while a < params.len(&cx) {
-            args.push(&cx, sub.at(&cx, params.get(&cx, a).name));
+            args.push(&cx, unbranded(&cx, sub.at(&cx, params.get(&cx, a).name)));
             a = a + 1usize;
         }
-        // Logical alpha-equivalence, not representation equality. Capture-avoiding substitution
-        // may freshen bound names on recursive requests. At most one earlier request is
-        // alpha-equivalent to these arguments, so one with structurally equal arguments is it.
         match self.symbol_index.get(&cx, (key, args)) {
             Option::Some(symbol) => {
                 return symbol;

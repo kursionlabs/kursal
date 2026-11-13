@@ -1,12 +1,13 @@
 // Symbol names in the Itanium `_ZN...E` nested-name form (`kurs::path::h<hash>`, as `c++filt` shows
 // them), where the hash is of the specialization's logical identity.
 //
-// This is a codegen convention, not a C++ ABI or a stable linking contract. Only bound names are
-// normalized; nominal names and free brands remain distinct.
+// This is a codegen convention, not a C++ ABI or a stable linking contract. `type_key` normalizes
+// bound names; nominal names and free brands remain distinct. A specialization's type arguments are
+// keyed `unbranded`, so code made for them does not depend on their brands.
 
 use package::support::base::{Cx, Out, Seq, Text, text};
-use package::kurs::core::Type;
-use package::types::ops::{foreach_binders, kind_name, kurs_error};
+use package::kurs::core::{Member, Type};
+use package::types::ops::{foreach_binders, kind_name, kurs_error, map_children};
 use package::syntax::ast::no_pos;
 use std::option::Option;
 
@@ -62,6 +63,61 @@ fn keys(&cx: Cx!['k], types: Seq[Type['k], 'k], scope: Seq[Text['k], 'k]) -> Seq
         i = i + 1usize;
     }
     out
+}
+
+forall 'k.
+fn any_branded(&cx: Cx!['k], types: Seq[Type['k], 'k]) -> bool {
+    var i = 0usize;
+    while i < types.len(&cx) {
+        if branded(&cx, types.get(&cx, i)) {
+            return true;
+        }
+        i = i + 1usize;
+    }
+    false
+}
+
+forall 'k.
+fn members_branded(&cx: Cx!['k], members: Seq[Member['k], 'k]) -> bool {
+    var i = 0usize;
+    while i < members.len(&cx) {
+        if branded(&cx, members.get(&cx, i).type) {
+            return true;
+        }
+        i = i + 1usize;
+    }
+    false
+}
+
+// Whether `ty` mentions a brand.
+forall 'k.
+fn branded(&cx: Cx!['k], ty: Type['k]) -> bool {
+    match ty {
+        Type::Skolem(_label) => true,
+        Type::Named(_name, args) => any_branded(&cx, args),
+        Type::Brand(brand) => branded(&cx, brand.get(&cx)),
+        Type::Ptr(inner) => branded(&cx, inner.get(&cx)),
+        Type::Array(elem, _length) => branded(&cx, elem.get(&cx)),
+        Type::Tuple(elems) => any_branded(&cx, elems),
+        Type::Struct(fields) => members_branded(&cx, fields),
+        Type::Enum(variants) => members_branded(&cx, variants),
+        Type::Exists(_binders, body) => branded(&cx, body.get(&cx)),
+        Type::Foreach(f) => branded(&cx, f.source.get(&cx)) || branded(&cx, f.body.get(&cx)),
+        Type::Fn(f) => any_branded(&cx, f.params) || branded(&cx, f.ret.get(&cx)),
+        _ => false,
+    }
+}
+
+// `ty` with every brand, free or bound, written as the one brand `_`.
+//
+// A brand has no representation, and coherence never tells two instance heads apart by brands
+// alone, so specializations whose type arguments differ only in brands make the same C.
+forall 'k.
+fn unbranded(&cx: Cx!['k], ty: Type['k]) -> Type['k] {
+    match ty {
+        Type::Skolem(_label) => Type::Skolem.(text(&cx, "_")),
+        _ => if branded(&cx, ty) { map_children(&cx, ty, |&cx, child: Type['k]| unbranded(&cx, child)) } else { ty },
+    }
 }
 
 // The position of the innermost binder of `name`, counted from the innermost.

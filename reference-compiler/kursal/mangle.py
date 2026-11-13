@@ -2,7 +2,9 @@
 shows them), where the hash is of the specialization's logical identity.
 
 This is a codegen convention, not a C++ ABI or a stable linking contract.
-Only bound names are normalized; nominal names and free brands remain distinct.
+`type_key` normalizes bound names; nominal names and free brands remain distinct. A
+specialization's type arguments are keyed `unbranded`, so code made for them does not depend on
+their brands.
 """
 from __future__ import annotations
 
@@ -10,12 +12,25 @@ import hashlib
 import re
 
 from . import core as C
-from .types import foreach_binders
+from .types import foreach_binders, map_children
 
 
 def encode(parts: tuple[str, ...]) -> str:
     """Length framing avoids ambiguity without recursively escaping nested keys."""
     return "".join(f"{len(part)}:{part}" for part in parts)
+
+
+BRAND = C.Skolem("_")
+
+
+def unbranded(ty: C.Type) -> C.Type:
+    """`ty` with every brand, free or bound, written as the one brand `_`.
+
+    A brand has no representation, and coherence never tells two instance heads apart by brands
+    alone, so specializations whose type arguments differ only in brands make the same C."""
+    if isinstance(ty, C.Skolem):
+        return BRAND
+    return map_children(ty, unbranded)
 
 
 def type_key(ty: C.Type, scope: tuple[str, ...] = ()) -> str:

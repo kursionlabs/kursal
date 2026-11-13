@@ -38,7 +38,7 @@ class SpecializationTests(unittest.TestCase):
         backend.emit_program()
         choose = program.funs["choose"]
         keys = [args for args, _symbol in backend.symbols[id(choose)]]
-        self.assertCountEqual(keys, [(C.Brand(C.Skolem("static")),), (C.UNIT,)])
+        self.assertCountEqual(keys, [(C.Brand(C.Skolem("_")),), (C.UNIT,)])
         methods = {id(i.methods[0]) for i in program.instances["Pick"]}
         self.assertEqual(set(backend.symbols) & methods, methods)
 
@@ -55,13 +55,15 @@ class SpecializationTests(unittest.TestCase):
         unsafe = backend.request(fun, {"T": C.Fn((), C.U32, unsafe=True)})
         self.assertNotEqual(safe, unsafe)
 
-    def test_brand_parameters_remain_part_of_logical_identity(self):
+    def test_brand_arguments_share_one_specialization(self):
         fun = constant("f", 0)
         fun.params = (C.Param("a", C.BRAND), C.Param("b", C.BRAND))
         program = C.Program(funs={"f": fun})
         backend = Backend(program, check_program(program))
-        self.assertNotEqual(backend.request(fun, {"a": C.Skolem("static"), "b": C.Skolem("x")}),
-                            backend.request(fun, {"a": C.Skolem("x"), "b": C.Skolem("static")}))
+        first = backend.request(fun, {"a": C.Skolem("static"), "b": C.Skolem("x")})
+        self.assertEqual(first, backend.request(fun, {"a": C.Skolem("x"), "b": C.Skolem("static")}))
+        self.assertEqual(first, backend.request(fun, {"a": C.Skolem("y"), "b": C.Skolem("y")}))
+        self.assertEqual(len(backend.queue), 1)
 
     def test_substituted_foreach_source_keeps_mapper_parameter_partition(self):
         f, s = C.Named("F"), C.Named("S")
