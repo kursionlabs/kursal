@@ -270,8 +270,12 @@ class Checker:
                 if any(set(brands) & set(other) for other in self.places.opened.values()):
                     self.fail("opened_contract_brand_names_one_view")
                 self.places.opened[path] = brands
-            for path in (*block.empty, *(p for p, _ in block.known)):
+            for path in block.empty:
                 self.path_type(path)
+            for path, variant in block.known:
+                shape = self.types.shape(self.path_type(path), self.module)
+                if not isinstance(shape, Enum) or variant not in dict(shape.variants):
+                    self.fail("known_contract_names_a_variant")
         last = None
         for instr in block.instrs:
             self.pos = instr.pos

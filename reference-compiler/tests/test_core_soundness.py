@@ -23,6 +23,20 @@ REJECTED = {
         (fun h (forall ($static) () u32 ((builtin::Brand $static))
           (entry ((%x (builtin::Brand $static))) (= %r (const u32 0)) (ret %r))))"""),
 
+    # A block's `known` contract names a variant of the enum at its path.
+    "known_unknown_variant": ("known_contract_names_a_variant", """
+        (type L! (struct (a u32)))
+        (type E (enum (A L) (B u32)))
+        (fun f u32 ()
+          (locals (&x E))
+          (entry () (= %n (const u32 0)) (ret %n))
+          (done ((%r u32)) (known &x Nope) (ret %r)))"""),
+    "known_not_an_enum": ("known_contract_names_a_variant", """
+        (fun f u32 ()
+          (locals (&x u32))
+          (entry () (= %n (const u32 0)) (ret %n))
+          (done ((%r u32)) (known &x A) (ret %r)))"""),
+
     # An instance method has no quantifiers of its own: its premises would never be discharged.
     "instance_method_premise": ("instance_method_has_own_quantifier", """
         (trait K (T) (keep T (T)))
