@@ -1,8 +1,30 @@
 """Constant evaluation agrees with emitted arithmetic and short-circuiting."""
+import tempfile
 import unittest
+from pathlib import Path
 
-from kursal.sigs import SigError
+from kursal.cgen import emit_c
+from kursal.check import check_program
+from kursal.lower import lower
+from kursal.resolve import LIB, resolve
+from kursal.sigs import SigError, signatures
 from tests import test_closure_boundary
+from tests.test_lower import compile_and_run, write
+
+
+def run_with_std(source: str) -> int | str:
+    """Build `source` as a package that depends on the standard library, and run it."""
+    with tempfile.TemporaryDirectory(prefix="kursal-constants-") as base:
+        directory = Path(base)
+        write(directory, {"lib.kur": source})
+        with (directory / "kur.toml").open("a") as manifest:
+            manifest.write(f'[dependencies.std]\npath="{LIB / "std"}"\n')
+        resolver = resolve(directory)
+        sigs = signatures(resolver)
+        program = lower(resolver, sigs)
+        c_file = directory / "main.c"
+        c_file.write_text(emit_c(program, check_program(program), sigs.name(resolver.packages[0].entry_decl)))
+        return compile_and_run(c_file, directory / "main")
 
 
 class ConstantRuntimeTests(unittest.TestCase):
@@ -34,6 +56,21 @@ class ConstantRuntimeTests(unittest.TestCase):
                            'true || (true == 1u8)', 'false && (256u8 == 0u8)'):
             with self.subTest(expression=expression), self.assertRaises(SigError):
                 self.run_source('const X: bool = ' + expression + '; fn main() -> i32 { 0i32 }', 0)
+
+    def test_string_constants_are_static_byte_slices(self):
+        self.assertEqual(run_with_std('''use std::slice::Slice;
+            const GREETING: Slice[u8, 'static] = "hello";
+            fn main() -> i32 {
+                const LOCAL: Slice[u8, 'static] = "hi";
+                (GREETING.len() + LOCAL.len()) as i32
+            }'''), 7)
+
+    def test_string_constant_of_another_type_is_rejected(self):
+        for source in ('const T: u32 = "text"; fn main() -> i32 { 0i32 }',
+                       'fn main() -> i32 { const T: u32 = "text"; 0i32 }',
+                       'fn main() -> i32 { const T: u32 = 5u8; 0i32 }'):
+            with self.subTest(source=source), self.assertRaisesRegex(SigError, 'const T is not a'):
+                run_with_std(source)
 
     def test_bool_integer_comparison_is_rejected(self):
         for expression in ('true == 1u8', 'false != 0u8', '1u8 == true'):

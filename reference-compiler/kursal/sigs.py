@@ -388,14 +388,22 @@ class Signatures:
         try:
             node = decl.node
             assert isinstance(node, S.Const)
-            want = self.type(node.type, Scope())
-            value = self.fold(node.value, want, decl.module)
-            if value[2] != want:
-                fail(f"const {decl.name} is not a {want}")
+            value = self.typed(decl.name, node.value, self.type(node.type, Scope()), decl.module)
             self.consts[decl] = value
             return value
         finally:
             self.folding.discard(decl)
+
+    def typed(self, name: str, expr: S.Expr, want: C.Type, module: C.ModuleId) -> ConstValue:
+        """The value of `const name: want = expr`, which must have type `want`."""
+        value = self.fold(expr, want, module)
+        if value[2] != want:
+            fail(f"const {name} is not a {want}")
+        return value
+
+    def string_type(self, module: C.ModuleId) -> C.Type:
+        """`Slice[u8, 'static]`, the type of a string literal."""
+        return C.Named(self.name(self.library(module, "Slice")), (C.Prim("u8"), C.Skolem("static")))
 
     def fold(self, expr: S.Expr, want: Optional[C.Type] = None, module: Optional[C.ModuleId] = None, *, evaluate: bool = True) -> ConstValue:
         """Type a constant expression and optionally evaluate its value.
@@ -423,7 +431,7 @@ class Signatures:
                 return ("float", expr.value, ty)
             if expr.kind == "str":
                 assert isinstance(expr.value, str)
-                return ("str", expr.value, want)
+                return ("str", expr.value, self.string_type(module) if module is not None else None)
         if isinstance(expr, S.Path):
             ref = expr.ref
             if ref and ref[0] == "decl" and ref[1].kind == "const":

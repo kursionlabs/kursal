@@ -1123,13 +1123,23 @@ impl Signatures {
             Named::Const(c) => c,
             _ => fail(text("internal error: a const declaration that declares no const")),
         };
-        let want = self.type(node.type, new_scope())?;
-        let value = self.fold(node.value, Option::Some.(want), Option::Some.(decl.home), true)?;
-        if !same_type(const_type(value), Option::Some.(want)) {
-            return sig_error(Out::new().put("const ").add(decl.name).put(" is not a ").add(type_repr(want)).done(), no_pos());
-        }
+        let value = self.typed(decl.name, node.value, self.type(node.type, new_scope())?, decl.home)?;
         self.consts.set(decl.id, value);
         Result::Ok.(value)
+    }
+
+    // The value of `const name: want = expr`, which must have type `want`.
+    fn typed(self, name: Text, expr: Expr, want: Type, home: ModuleId) -> Result[ConstValue, SigError] {
+        let value = self.fold(expr, Option::Some.(want), Option::Some.(home), true)?;
+        if !same_type(const_type(value), Option::Some.(want)) {
+            return sig_error(Out::new().put("const ").add(name).put(" is not a ").add(type_repr(want)).done(), no_pos());
+        }
+        Result::Ok.(value)
+    }
+
+    // `Slice[u8, 'static]`, the type of a string literal.
+    fn string_type(self, home: ModuleId) -> Type {
+        Type::Named.(self.name(self.library(home, text("Slice"))), Seq::two(C::prim("u8"), Type::Skolem.(text("static"))))
     }
 
     // Type a constant expression and, when `evaluate`, its value.
@@ -1171,7 +1181,10 @@ impl Signatures {
                     }
                     Result::Ok.(ConstValue::Float.(lit.text, prim))
                 },
-                S::LitKind::Str => Result::Ok.(ConstValue::Str.(lit.text, want)),
+                S::LitKind::Str => Result::Ok.(ConstValue::Str.(lit.text, match home {
+                    Option::Some(h) => Option::Some.(self.string_type(h)),
+                    Option::None => Option::None,
+                })),
             },
             Expr::Path(path) => {
                 let decl = match self.r.refs.get(path.id) {

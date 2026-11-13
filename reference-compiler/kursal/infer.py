@@ -468,8 +468,7 @@ class Infer:
                 got = self.check(self.generic(value, want), want)
                 stmt.binder = self.bind(name, want or got, mutable=True).id
             case S.Const(name=name, type=ty, value=value):
-                stmt.folded = self.sigs.fold(value, self.type(ty), self.module)
-                assert stmt.folded[2] is not None
+                stmt.folded = self.sigs.typed(name, value, self.type(ty), self.module)
                 stmt.binder = self.bind(name, stmt.folded[2]).id
             case S.Assign(target=target, value=value):
                 self.check(value, self.place_type(target, assign=True))
