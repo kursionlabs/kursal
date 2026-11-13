@@ -1,0 +1,1448 @@
+// Signatures: every resolved declaration in core terms.
+//
+// Types become core types, with each nominal declaration named by its identity. Functions, methods,
+// externs and trait methods get core signatures, with place modes. Consts are folded to values.
+//
+// Folding a binary operation tries its operands in one order and, when that fails, in the other, so
+// an error met while folding must be one the caller can recover from. The steps folding may reach
+// (`type`, `check_arguments`, `require_copy`, `copy_names`, `array_length`, `const_decl`, `fold`,
+// `binop`, `wrapped_literal`) therefore return a `Result` whose error is a `SigError`; the others
+// stop at the first error, through `got`, as raising `SigError` does.
+//
+// An integer constant is held in 64 bits: its value in its type's width, sign-extended for a signed
+// type, so every value of every integer type has one representation. Folding computes modulo 2^64
+// and then reduces to the type's width, which gives the same result as computing exactly and then
+// reducing: addition, subtraction, multiplication, negation and the bitwise operations depend only on
+// their operands' low bits. Division, remainder, comparison and right shifts depend on whole values,
+// and are computed on them (see `binop`).
+
+use package::support::base::{Cell, Map, Out, Seq, Set, Text, fail, text};
+use package::kurs::core::{Exposure, ExposureMode, Kind, Member, ModuleId, Param, Premise, Program, Type, TypeDecl};
+use package::kurs::core as C;
+use package::types::layout::check_type_expansion;
+use package::types::literals::valid_literal;
+use package::resolve::resolver::{Decl, NameRef, Named, Package, Resolver, Target, named_pos, repr, repr_tuple};
+use package::syntax::ast as S;
+use package::syntax::ast::{Expr, Pos, no_pos};
+use package::types::ops::{Fresh, Types};
+use std::option::{Option, Result};
+use std::slice::Slice;
+
+// ------------------------------------------------------------ the library --
+
+// A library item the compiler itself refers to: its home library, its path there, and its path
+// through std.
+exposed struct LibraryItem {
+    home: Text,
+    path: Seq[Text],
+    std_path: Seq[Text],
+}
+
+fn library_entry(home: Slice[u8, 'static], path: Slice[u8, 'static], std_path: Slice[u8, 'static]) -> LibraryItem {
+    LibraryItem.{ home: text(home), path: text(path).split(text("::")), std_path: text(std_path).split(text("::")) }
+}
+
+// The table `LIBRARY`: the item named `name`.
+fn library_item(name: Text) -> LibraryItem {
+    if name.is("Option") {
+        library_entry("core", "option::Option", "option::Option")
+    } else if name.is("Result") {
+        library_entry("core", "option::Result", "option::Result")
+    } else if name.is("Slice") {
+        library_entry("core", "slice::Slice", "slice::Slice")
+    } else if name.is("Buffer") {
+        library_entry("alloc", "buffer::Buffer", "bytes::buffer::Buffer")
+    } else if name.is("Iterator") {
+        library_entry("core", "iter::Iterator", "iter::Iterator")
+    } else if name.is("Format") {
+        library_entry("core", "fmt::Format", "text::fmt::Format")
+    } else if name.is("Writable") {
+        library_entry("core", "fmt::Writable", "text::fmt::Writable")
+    } else if name.is("Slice::from_raw_parts") {
+        library_entry("core", "slice::Slice::from_raw_parts", "slice::Slice::from_raw_parts")
+    } else if name.is("Buffer::new") {
+        library_entry("alloc", "buffer::Buffer::new", "bytes::buffer::Buffer::new")
+    } else if name.is("Ordering") {
+        library_entry("core", "atomic::Ordering", "atomic::Ordering")
+    } else {
+        fail(Out::new().put("internal error: no library item ").add(name).done())
+    }
+}
+
+// ----------------------------------------------------------------- errors --
+
+// An error of this stage, before its file is known; a `pos` on line 0 is no position.
+exposed struct SigError {
+    message: Text,
+    pos: Pos,
+}
+
+forall T.
+fn sig_error(message: Text, pos: Pos) -> Result[T, SigError] {
+    Result::Err.(SigError.{ message, pos })
+}
+
+forall T.
+fn sig_error_static(message: Slice[u8, 'static]) -> Result[T, SigError] {
+    sig_error(text(message), no_pos())
+}
+
+// ------------------------------------------------------------- the results --
+
+// A callable's core signature.
+exposed struct Sig {
+    // its core name
+    name: Text,
+    // the Decl, or none for an instance or trait method
+    decl: Option[Decl],
+    // forall Params, implicit closure environments included
+    params: Seq[Param],
+    premises: Seq[Premise],
+    // parameter names
+    pnames: Seq[Text],
+    ptypes: Seq[Type],
+    // indices of `&` parameters, ascending
+    places: Seq[usize],
+    ret: Type,
+    is_unsafe: bool,
+    home: Option[ModuleId],
+}
+
+// An instance header before its method bodies have been lowered to core functions.
+exposed struct InstanceSig {
+    trait_name: Text,
+    params: Seq[Param],
+    premises: Seq[Premise],
+    head: Seq[Type],
+    methods: Seq[Sig],
+    home: ModuleId,
+    pos: Pos,
+}
+
+// A folded constant. An integer is its value in its type's width, in 64 bits, sign-extended for a
+// signed type; its type is an integer `Prim`. A float keeps its digits. A string's type is the one
+// wanted where it was folded, if any.
+exposed enum ConstValue {
+    Int(u64, Type),
+    Bool(bool),
+    Float(Text, Type),
+    Str(Text, Option[Type]),
+}
+
+// `value[2]`: the constant's type.
+fn const_type(value: ConstValue) -> Option[Type] {
+    match value {
+        ConstValue::Int(_v, ty) => Option::Some.(ty),
+        ConstValue::Bool(_b) => Option::Some.(C::bool_type()),
+        ConstValue::Float(_t, ty) => Option::Some.(ty),
+        ConstValue::Str(_t, ty) => ty,
+    }
+}
+
+// `value[0]`: which kind of constant it is.
+fn const_kind(value: ConstValue) -> Text {
+    match value {
+        ConstValue::Int(_v, _t) => text("int"),
+        ConstValue::Bool(_b) => text("bool"),
+        ConstValue::Float(_t, _u) => text("float"),
+        ConstValue::Str(_t, _u) => text("str"),
+    }
+}
+
+fn same_type(a: Option[Type], b: Option[Type]) -> bool {
+    match a {
+        Option::Some(x) => match b {
+            Option::Some(y) => C::same(x, y),
+            Option::None => false,
+        },
+        Option::None => b.is_none(),
+    }
+}
+
+// An integer type's name, if `ty` is one.
+fn integer_type(ty: Option[Type]) -> Option[Text] {
+    match ty {
+        Option::Some(t) => match t {
+            Type::Prim(name) => if C::is_integer(name) { Option::Some.(name) } else { Option::None },
+            _ => Option::None,
+        },
+        Option::None => Option::None,
+    }
+}
+
+fn is_float_type(ty: Option[Type]) -> bool {
+    match ty {
+        Option::Some(t) => match t {
+            Type::Prim(name) => C::is_float(name),
+            _ => false,
+        },
+        Option::None => false,
+    }
+}
+
+fn is_signed(name: Text) -> bool {
+    name.starts_with(text("i"))
+}
+
+// A folded integer below zero: a signed value, stored sign-extended, with its top bit set.
+fn is_negative(value: u64, ty: Type) -> bool {
+    match ty {
+        Type::Prim(name) => is_signed(name) && value >= 9223372036854775808u64,
+        _ => false,
+    }
+}
+
+fn all_bits() -> u64 {
+    18446744073709551615u64
+}
+
+fn sign_bit() -> u64 {
+    9223372036854775808u64
+}
+
+// An integer constant's value as Python writes it.
+fn int_text(value: u64, name: Text) -> Text {
+    if is_signed(name) && value >= sign_bit() {
+        Out::new().put("-").u64(0u64 - value).done()
+    } else {
+        Out::new().u64(value).done()
+    }
+}
+
+// --------------------------------------------------------- Python's repr --
+
+// A tuple's repr from its elements' reprs: `()`, `(a,)`, `(a, b)`.
+fn repr_parts(parts: Seq[Text]) -> Text {
+    let out = Out::new().put("(");
+    var i = 0usize;
+    while i < parts.len() {
+        if i > 0usize {
+            let unit = out.put(", ");
+        }
+        let unit = out.add(parts.get(i));
+        i = i + 1usize;
+    }
+    if parts.len() == 1usize {
+        let unit = out.put(",");
+    }
+    out.put(")").done()
+}
+
+fn repr_types(types: Seq[Type]) -> Text {
+    let parts: Seq[Text] = Seq::new();
+    var i = 0usize;
+    while i < types.len() {
+        parts.push(type_repr(types.get(i)));
+        i = i + 1usize;
+    }
+    repr_parts(parts)
+}
+
+fn repr_members(members: Seq[Member]) -> Text {
+    let parts: Seq[Text] = Seq::new();
+    var i = 0usize;
+    while i < members.len() {
+        parts.push(repr_parts(Seq::two(repr(members.get(i).name), type_repr(members.get(i).type))));
+        i = i + 1usize;
+    }
+    repr_parts(parts)
+}
+
+fn repr_bool(b: bool) -> Text {
+    text(if b { "True" } else { "False" })
+}
+
+fn kind_repr(k: Kind) -> Text {
+    match k {
+        Kind::Brand => text("'brand'"),
+        Kind::Copy => text("'copy'"),
+        Kind::Any => text("'any'"),
+    }
+}
+
+// A core type as Python's dataclass `repr` writes it.
+fn type_repr(ty: Type) -> Text {
+    match ty {
+        Type::Prim(name) => Out::new().put("Prim(name=").add(repr(name)).put(")").done(),
+        Type::Never => text("Never()"),
+        Type::Named(name, args) => Out::new().put("Named(name=").add(repr(name)).put(", args=").add(repr_types(args)).put(")").done(),
+        Type::Struct(fields) => Out::new().put("Struct(fields=").add(repr_members(fields)).put(")").done(),
+        Type::Enum(variants) => Out::new().put("Enum(variants=").add(repr_members(variants)).put(")").done(),
+        Type::Tuple(elems) => Out::new().put("Tuple(elems=").add(repr_types(elems)).put(")").done(),
+        Type::Array(elem, length) => Out::new().put("Array(elem=").add(type_repr(elem.get())).put(", length=").u64(length).put(")").done(),
+        Type::Ptr(inner) => Out::new().put("Ptr(inner=").add(type_repr(inner.get())).put(")").done(),
+        Type::Skolem(label) => Out::new().put("Skolem(label=").add(repr(label)).put(")").done(),
+        Type::Brand(brand) => Out::new().put("Brand(brand=").add(type_repr(brand.get())).put(")").done(),
+        Type::Exists(binders, body) => Out::new().put("Exists(binders=").add(repr_tuple(binders)).put(", body=").add(type_repr(body.get())).put(")").done(),
+        Type::Foreach(f) => Out::new().put("Foreach(binder=").add(repr(f.binder)).put(", indirect=").add(repr_bool(f.indirect))
+            .put(", source=").add(type_repr(f.source.get())).put(", body=").add(type_repr(f.body.get()))
+            .put(", retained=").add(repr_tuple(f.retained)).put(")").done(),
+        Type::Fn(f) => {
+            let quantified: Seq[Text] = Seq::new();
+            var i = 0usize;
+            while i < f.quantified.len() {
+                let p = f.quantified.get(i);
+                quantified.push(Out::new().put("Param(name=").add(repr(p.name)).put(", kind=").add(kind_repr(p.kind)).put(")").done());
+                i = i + 1usize;
+            }
+            let places = Out::new();
+            if f.places.is_empty() {
+                let unit = places.put("frozenset()");
+            } else {
+                let unit = places.put("frozenset({");
+                var k = 0usize;
+                while k < f.places.len() {
+                    if k > 0usize {
+                        let unit = places.put(", ");
+                    }
+                    let unit = places.usize(f.places.get(k));
+                    k = k + 1usize;
+                }
+                let unit = places.put("})");
+            }
+            Out::new().put("Fn(params=").add(repr_types(f.params)).put(", ret=").add(type_repr(f.ret.get()))
+                .put(", forall=").add(repr_parts(quantified)).put(", unsafe=").add(repr_bool(f.is_unsafe))
+                .put(", places=").add(places.done()).put(")").done()
+        },
+        Type::Ignored => text("Ignored()"),
+        Type::Meta(_m) => text("Meta()"),
+    }
+}
+
+// ------------------------------------------------------------------ scopes --
+
+// The type names in scope while translating one declaration.
+exposed struct Scope {
+    // type parameter -> Copy or Any
+    kinds: Map[Text, Kind],
+    brands: Set[Text],
+    // hidden closure environments, when allowed
+    implicit: Cell[Option[Seq[Param]]],
+}
+
+fn new_scope() -> Scope {
+    Scope.{ kinds: Map::new(), brands: Set::new(), implicit: Cell::new(Option::None) }
+}
+
+impl Scope {
+    fn extend(self, params: Seq[Param]) -> Scope {
+        let out = Scope.{ kinds: self.kinds.copy(), brands: self.brands.copy(), implicit: Cell::new(self.implicit.get()) };
+        var i = 0usize;
+        while i < params.len() {
+            let p = params.get(i);
+            let unit = match p.kind {
+                Kind::Brand => out.brands.add(p.name),
+                _ => out.kinds.set(p.name, p.kind),
+            };
+            i = i + 1usize;
+        }
+        out
+    }
+}
+
+// ------------------------------------------------------------- the syntax --
+
+// What a signature is made from: a function, a trait method's signature, or an extern.
+exposed struct Header {
+    params: Seq[S::Param],
+    ret: Option[S::Type],
+    quantifier: Option[S::Forall],
+    is_unsafe: bool,
+    pos: Pos,
+}
+
+fn fn_header(f: S::Fn) -> Header {
+    Header.{ params: f.params, ret: f.ret, quantifier: f.quantifier, is_unsafe: f.is_unsafe, pos: f.pos }
+}
+
+fn named_quantifier(node: Named) -> Option[S::Forall] {
+    match node {
+        Named::Struct(x) => x.quantifier,
+        Named::Enum(x) => x.quantifier,
+        Named::Tuple(x) => x.quantifier,
+        Named::Fn(x) => x.quantifier,
+        Named::Extern(x) => x.quantifier,
+        Named::Trait(x) => x.quantifier,
+        Named::Const(x) => x.quantifier,
+    }
+}
+
+fn is_copy_trait(path: Seq[Text]) -> bool {
+    path.len() == 1usize && path.get(0usize).is("Copy")
+}
+
+fn is_skolem(ty: Type) -> bool {
+    match ty {
+        Type::Skolem(_l) => true,
+        _ => false,
+    }
+}
+
+fn all_params(f: S::Forall) -> Seq[Text] {
+    let out = f.params.copy();
+    out.append(f.determined);
+    out
+}
+
+fn concat_params(a: Seq[Param], b: Seq[Param]) -> Seq[Param] {
+    let out = a.copy();
+    out.append(b);
+    out
+}
+
+fn concat_premises(a: Seq[Premise], b: Seq[Premise]) -> Seq[Premise] {
+    let out = a.copy();
+    out.append(b);
+    out
+}
+
+fn is_comparison(op: Text) -> bool {
+    op.is("==") || op.is("!=") || op.is("<") || op.is("<=") || op.is(">") || op.is(">=")
+}
+
+// ------------------------------------------------------------- Signatures --
+
+exposed struct Signatures {
+    r: Resolver,
+    packages: Seq[Package],
+    // package id -> its name in core names
+    package_names: Map[usize, Text],
+    types: Map[Text, TypeDecl],
+    // decl id -> its signature
+    sigs: Map[u32, Sig],
+    traits: Map[Text, C::Trait],
+    // (instance with Sig methods, its declaration, its module)
+    instances: Seq[(InstanceSig, S::InstanceDecl, ModuleId)],
+    // decl id -> its value
+    consts: Map[u32, ConstValue],
+    // the ids of the consts being folded
+    folding: Set[u32],
+    implicit: Cell[u32],
+    copy_checks: Seq[(Type, Map[Text, Kind])],
+    types_ready: Cell[bool],
+    counter: Fresh,
+}
+
+impl Signatures {
+    fn new(resolver: Resolver, counter: Fresh) -> Signatures {
+        let packages = resolver.packages;
+        let spelled: Set[Text] = Set::new();
+        var p = 0usize;
+        while p < packages.len() {
+            spelled.add(packages.get(p).name.get());
+            p = p + 1usize;
+        }
+        let clash = spelled.len() != packages.len();
+        let package_names: Map[usize, Text] = Map::new();
+        p = 0usize;
+        while p < packages.len() {
+            let package = packages.get(p);
+            package_names.set(package.id, if clash {
+                Out::new().add(package.name.get()).put("#").usize(package.id).done()
+            } else {
+                package.name.get()
+            });
+            p = p + 1usize;
+        }
+        let s = Signatures.{
+            r: resolver,
+            packages,
+            package_names,
+            types: Map::new(),
+            sigs: Map::new(),
+            traits: Map::new(),
+            instances: Seq::new(),
+            consts: Map::new(),
+            folding: Set::new(),
+            implicit: Cell::new(0u32),
+            copy_checks: Seq::new(),
+            types_ready: Cell::new(false),
+            counter,
+        };
+        let scopes = resolver.scopes.values();
+        var i = 0usize;
+        while i < scopes.len() {
+            let decls = scopes.get(i).decls.values();
+            var k = 0usize;
+            while k < decls.len() {
+                let decl = decls.get(k);
+                if decl.kind.is("struct") || decl.kind.is("enum") || decl.kind.is("tuple") {
+                    resolver.locate(decl.home, named_pos(decl.node));
+                    let type_decl = s.type_decl(decl);
+                    s.types.set(s.name(decl), type_decl);
+                    resolver.unlocate();
+                }
+                k = k + 1usize;
+            }
+            i = i + 1usize;
+        }
+        check_type_expansion(s.program(), counter);
+        s.types_ready.set(true);
+        i = 0usize;
+        while i < s.copy_checks.len() {
+            let (ty, kinds) = s.copy_checks.get(i);
+            let unit = s.got(s.require_copy(ty, kinds));
+            i = i + 1usize;
+        }
+        s.copy_checks.clear();
+        i = 0usize;
+        while i < scopes.len() {
+            let scope = scopes.get(i);
+            let decls = scope.decls.values();
+            var k = 0usize;
+            while k < decls.len() {
+                let decl = decls.get(k);
+                resolver.locate(decl.home, named_pos(decl.node));
+                if decl.kind.is("trait") {
+                    let t = s.trait_decl(decl);
+                    s.traits.set(s.name(decl), t);
+                } else if decl.kind.is("fn") || decl.kind.is("method") || decl.kind.is("extern") {
+                    s.sigs.set(decl.id, s.decl_signature(decl));
+                } else if decl.kind.is("const") {
+                    let unit = s.got(s.const_decl(decl));
+                }
+                resolver.unlocate();
+                k = k + 1usize;
+            }
+            var n = 0usize;
+            while n < scope.items.len() {
+                let unit = match scope.items.get(n) {
+                    S::Item::Instance(item) => {
+                        resolver.locate(scope.home, item.pos);
+                        s.instances.push(s.instance_decl(item, scope.home));
+                        resolver.unlocate();
+                    },
+                    _ => (),
+                };
+                n = n + 1usize;
+            }
+            i = i + 1usize;
+        }
+        s
+    }
+
+    // The type declarations so far, as a program.
+    fn program(self) -> Program {
+        Program.{ types: self.types, funs: Map::new(), externs: Map::new(), datas: Map::new(), traits: Map::new(), instances: Map::new() }
+    }
+
+    // ---- errors
+    // Stops with `message` at `pos`, in the declaration being translated.
+    fn fail(self, message: Text, pos: Pos) -> ! {
+        self.r.fail(message, pos)
+    }
+
+    // The value of a step that may fail, stopping if it did.
+    forall T.
+    fn got(self, result: Result[T, SigError]) -> T {
+        match result {
+            Result::Ok(value) => value,
+            Result::Err(e) => self.fail(e.message, e.pos),
+        }
+    }
+
+    // ---- naming
+    fn name(self, decl: Decl) -> Text {
+        let parts = Seq::one(self.package_names.at(decl.home.package));
+        parts.append(decl.home.path);
+        parts.push(decl.name);
+        let out = Out::new();
+        var i = 0usize;
+        while i < parts.len() {
+            if i > 0usize {
+                let unit = out.put("::");
+            }
+            let unit = out.add(parts.get(i));
+            i = i + 1usize;
+        }
+        out.done()
+    }
+
+    // Resolve a compiler-known library item in the requesting module's package.
+    fn library(self, home: ModuleId, name: Text) -> Decl {
+        let item = library_item(name);
+        match self.r.library(home, item.home, item.path, item.std_path) {
+            Target::Decl(d) => d,
+            _ => fail(Out::new().put("internal error: library item ").add(name).put(" is not a declaration").done()),
+        }
+    }
+
+    // ---- headers
+    // Core Params and premises of a `forall` header, and the scope it opens.
+    fn quantifier(self, header: Option[S::Forall], scope: Scope) -> (Seq[Param], Seq[Premise], Scope) {
+        let f = match header {
+            Option::Some(f) => f,
+            Option::None => return (Seq::new(), Seq::new(), scope),
+        };
+        let copy = self.got(self.copy_names(header));
+        let names = all_params(f);
+        let params: Seq[Param] = Seq::new();
+        var i = 0usize;
+        while i < names.len() {
+            let p = names.get(i);
+            params.push(if p.starts_with(text("'")) {
+                Param.{ name: p.from(1usize), kind: Kind::Brand }
+            } else {
+                Param.{ name: p, kind: if copy.has(p) { Kind::Copy } else { Kind::Any } }
+            });
+            i = i + 1usize;
+        }
+        let inner = scope.extend(params);
+        let copied = copy.items();
+        i = 0usize;
+        while i < copied.len() {
+            let name = copied.get(i);
+            if !inner.kinds.has(name) {
+                self.fail(Out::new().put("Copy requires an in-scope type parameter, not ").add(name).done(), no_pos());
+            }
+            inner.kinds.set(name, Kind::Copy);
+            i = i + 1usize;
+        }
+        let premises: Seq[Premise] = Seq::new();
+        i = 0usize;
+        while i < f.premises.len() {
+            let premise = f.premises.get(i);
+            if !is_copy_trait(premise.trait_path) {
+                premises.push(self.premise(premise.args, inner));
+            }
+            i = i + 1usize;
+        }
+        (params, premises, inner)
+    }
+
+    fn copy_names(self, header: Option[S::Forall]) -> Result[Set[Text], SigError] {
+        let names: Set[Text] = Set::new();
+        let premises = match header {
+            Option::Some(f) => f.premises,
+            Option::None => Seq::new(),
+        };
+        var i = 0usize;
+        while i < premises.len() {
+            let premise = premises.get(i);
+            if is_copy_trait(premise.trait_path) {
+                let args = premise.args.args;
+                if args.len() != 1usize {
+                    return sig_error_static("Copy requires one type parameter");
+                }
+                let arg = match args.get(0usize) {
+                    S::Type::Name(n) => n,
+                    _ => return sig_error_static("Copy requires one type parameter"),
+                };
+                let param = match self.r.refs.get(arg.id) {
+                    Option::Some(r) => match r {
+                        NameRef::Param(name) => Option::Some.(name),
+                        _ => Option::None,
+                    },
+                    Option::None => Option::None,
+                };
+                if !arg.args.is_empty() || arg.path.len() != 1usize || param.is_none() {
+                    return sig_error_static("Copy requires one bare, in-scope type parameter");
+                }
+                let unit = match param {
+                    Option::Some(name) => names.add(name),
+                    Option::None => (),
+                };
+            }
+            i = i + 1usize;
+        }
+        Result::Ok.(names)
+    }
+
+    fn premise(self, args: S::TypeArgs, scope: Scope) -> Premise {
+        let r = match self.r.refs.get(args.id) {
+            Option::Some(r) => r,
+            Option::None => fail(text("internal error: an unresolved premise")),
+        };
+        let is_exposed = match r {
+            NameRef::Builtin(name) => name.is("Exposed"),
+            _ => false,
+        };
+        let actual = self.got(self.types_of(args.args, scope));
+        if is_exposed {
+            return Premise.{ trait_name: text("builtin::Exposed"), args: actual };
+        }
+        let decl = match r {
+            NameRef::Decl(d) => d,
+            _ => fail(text("internal error: a premise that names no trait")),
+        };
+        let unit = self.got(self.check_arguments(decl, actual, scope));
+        Premise.{ trait_name: self.name(decl), args: actual }
+    }
+
+    fn check_arguments(self, decl: Decl, args: Seq[Type], scope: Scope) -> Result[bool, SigError] {
+        let header = named_quantifier(decl.node);
+        let params = match header {
+            Option::Some(f) => all_params(f),
+            Option::None => if decl.kind.is("trait") { Seq::one(text("Self")) } else { Seq::new() },
+        };
+        if args.len() != params.len() {
+            return sig_error(Out::new().add(decl.name).put(" takes ").usize(params.len()).put(" type arguments, got ").usize(args.len()).done(), no_pos());
+        }
+        let copied = match self.copy_names(header) {
+            Result::Ok(c) => c,
+            Result::Err(e) => return Result::Err.(e),
+        };
+        var i = 0usize;
+        while i < params.len() {
+            let param = params.get(i);
+            let arg = args.get(i);
+            if param.starts_with(text("'")) != is_skolem(arg) {
+                return sig_error(Out::new().put("argument for ").add(param).put(" of ").add(decl.name)
+                    .put(" has the wrong kind (brand versus type)").done(), no_pos());
+            }
+            if copied.has(param) {
+                let unit = self.require_copy(arg, scope.kinds)?;
+            }
+            i = i + 1usize;
+        }
+        Result::Ok.(true)
+    }
+
+    fn require_copy(self, ty: Type, kinds: Map[Text, Kind]) -> Result[bool, SigError] {
+        if !self.types_ready.get() {
+            self.copy_checks.push((ty, kinds.copy()));
+        } else if !Types::new(self.program(), self.counter).is_copy(ty, kinds) {
+            return sig_error_static("type argument must satisfy Copy");
+        }
+        Result::Ok.(true)
+    }
+
+    // ---- types
+    fn types_of(self, exprs: Seq[S::Type], scope: Scope) -> Result[Seq[Type], SigError] {
+        let out: Seq[Type] = Seq::new();
+        var i = 0usize;
+        while i < exprs.len() {
+            out.push(self.type(exprs.get(i), scope)?);
+            i = i + 1usize;
+        }
+        Result::Ok.(out)
+    }
+
+    fn slot_types(self, slots: Seq[S::Slot], scope: Scope) -> Result[Seq[Type], SigError] {
+        let out: Seq[Type] = Seq::new();
+        var i = 0usize;
+        while i < slots.len() {
+            out.push(self.type(slots.get(i).type, scope)?);
+            i = i + 1usize;
+        }
+        Result::Ok.(out)
+    }
+
+    fn type(self, type_expr: S::Type, scope: Scope) -> Result[Type, SigError] {
+        match type_expr {
+            S::Type::Name(n) => {
+                let args = self.types_of(n.args, scope)?;
+                let not_a_type = Out::new().put("not a type name: ").add(repr_tuple(n.path)).done();
+                let r = match self.r.refs.get(n.id) {
+                    Option::Some(r) => r,
+                    Option::None => return sig_error(not_a_type, no_pos()),
+                };
+                match r {
+                    NameRef::Param(name) => if !args.is_empty() {
+                        sig_error(Out::new().put("type parameter ").add(name).put(" takes no type arguments").done(), no_pos())
+                    } else {
+                        Result::Ok.(C::named(name, Seq::new()))
+                    },
+                    NameRef::Prim(name) => if !args.is_empty() {
+                        sig_error(Out::new().put("primitive ").add(name).put(" takes no type arguments").done(), no_pos())
+                    } else {
+                        Result::Ok.(Type::Prim.(name))
+                    },
+                    NameRef::Builtin(name) => if name.is("Brand") {
+                        if args.len() != 1usize || !is_skolem(args.get(0usize)) {
+                            sig_error_static("Brand requires exactly one brand argument")
+                        } else {
+                            Result::Ok.(Type::Brand.(Cell::new(args.get(0usize))))
+                        }
+                    } else if name.is("Never") {
+                        if !args.is_empty() {
+                            sig_error_static("Never takes no type arguments")
+                        } else {
+                            Result::Ok.(Type::Never)
+                        }
+                    } else {
+                        sig_error(not_a_type, no_pos())
+                    },
+                    NameRef::Decl(decl) => {
+                        let unit = self.check_arguments(decl, args, scope)?;
+                        Result::Ok.(C::named(self.name(decl), args))
+                    },
+                    _ => sig_error(not_a_type, no_pos()),
+                }
+            },
+            S::Type::Brand(quoted) => {
+                let label = quoted.from(1usize);
+                if !scope.brands.has(label) && !label.is("static") {
+                    return sig_error(Out::new().put("brand '").add(label).put(" is not in scope").done(), no_pos());
+                }
+                Result::Ok.(Type::Skolem.(label))
+            },
+            S::Type::Ptr(inner) => Result::Ok.(C::ptr(self.type(inner.get(), scope)?)),
+            S::Type::Never => Result::Ok.(Type::Never),
+            S::Type::Tuple(elems) => Result::Ok.(Type::Tuple.(self.types_of(elems, scope)?)),
+            S::Type::Array(elem, length) => {
+                let elem_type = self.type(elem.get(), scope)?;
+                let count = self.array_length(length.get())?;
+                Result::Ok.(Type::Array.(Cell::new(elem_type), count))
+            },
+            S::Type::Fn(f) => {
+                let params = self.slot_types(f.params, scope)?;
+                let ret = self.type(f.ret.get(), scope)?;
+                Result::Ok.(C::fn_type(params, ret, Seq::new(), f.is_unsafe, places_of(f.params, 0usize)))
+            },
+            S::Type::Closure(c) => {
+                let environment = match c.env {
+                    Option::Some(env) => self.type(env.get(), scope)?,
+                    Option::None => match scope.implicit.get() {
+                        Option::Some(implicit) => {
+                            self.implicit.set(self.implicit.get() + 1u32);
+                            let name = Out::new().put("Env#").u64(self.implicit.get() as u64).done();
+                            implicit.push(Param.{ name, kind: Kind::Any });
+                            C::named(name, Seq::new())
+                        },
+                        Option::None => return sig_error_static("a closure type needs [Env] outside a parameter list"),
+                    },
+                };
+                let params = Seq::one(environment);
+                params.append(self.slot_types(c.params, scope)?);
+                let ret = self.type(c.ret.get(), scope)?;
+                let code = C::fn_type(params, ret, Seq::new(), false, places_of(c.params, 1usize));
+                Result::Ok.(Type::Struct.(Seq::two(Member.{ name: text("env"), type: environment }, Member.{ name: text("code"), type: code })))
+            },
+            S::Type::Exists(brands, body) => {
+                let labels: Seq[Text] = Seq::new();
+                let binders: Seq[Param] = Seq::new();
+                var i = 0usize;
+                while i < brands.len() {
+                    let label = brands.get(i).from(1usize);
+                    labels.push(label);
+                    binders.push(Param.{ name: label, kind: Kind::Brand });
+                    i = i + 1usize;
+                }
+                let inner = self.type(body.get(), scope.extend(binders))?;
+                Result::Ok.(Type::Exists.(labels, Cell::new(inner)))
+            },
+            S::Type::Foreach(f) => {
+                let source = self.type(f.source.get(), scope)?;
+                let body = self.type(f.body.get(), scope.extend(Seq::one(Param.{ name: f.binder, kind: Kind::Any })))?;
+                Result::Ok.(C::foreach_type(f.binder, f.indirect, source, body))
+            },
+            S::Type::Forall(tparams, body) => {
+                let quantified: Seq[Param] = Seq::new();
+                var all_brands = true;
+                var i = 0usize;
+                while i < tparams.len() {
+                    let p = tparams.get(i);
+                    quantified.push(Param.{ name: p.from(1usize), kind: Kind::Brand });
+                    if !p.starts_with(text("'")) {
+                        all_brands = false;
+                    }
+                    i = i + 1usize;
+                }
+                let inner = self.type(body.get(), scope.extend(quantified))?;
+                match inner {
+                    Type::Fn(f) => if all_brands {
+                        Result::Ok.(C::fn_type(f.params, f.ret.get(), quantified, f.is_unsafe, f.places))
+                    } else {
+                        sig_error_static("forall in a type quantifies brands of a function type")
+                    },
+                    _ => sig_error_static("forall in a type quantifies brands of a function type"),
+                }
+            },
+            S::Type::Ignored => sig_error_static("no core type for TIgnored"),
+        }
+    }
+
+    // An array length is folded as a usize, but a literal with another integer suffix keeps its
+    // own type: the length is the value's 64 bits, so a negative length of a signed type is its
+    // two's complement.
+    fn array_length(self, expr: Expr) -> Result[u64, SigError] {
+        match self.fold(expr, Option::Some.(C::usize_type()), Option::None, true)? {
+            ConstValue::Int(value, ty) => if is_negative(value, ty) {
+                sig_error_static("negative array length")
+            } else {
+                Result::Ok.(value)
+            },
+            _ => sig_error_static("an array length is an integer constant"),
+        }
+    }
+
+    // ---- declarations
+    fn type_decl(self, decl: Decl) -> TypeDecl {
+        let (params, premises, scope) = self.quantifier(named_quantifier(decl.node), new_scope());
+        let (body, linear, written) = match decl.node {
+            Named::Struct(node) => {
+                let fields: Seq[Member] = Seq::new();
+                var i = 0usize;
+                while i < node.fields.len() {
+                    let field = node.fields.get(i);
+                    fields.push(Member.{ name: field.name, type: self.got(self.type(field.type, scope)) });
+                    i = i + 1usize;
+                }
+                (Type::Struct.(fields), node.linear, node.exposure)
+            },
+            Named::Tuple(node) => (Type::Tuple.(self.got(self.types_of(node.elems, scope))), node.linear, node.exposure),
+            Named::Enum(node) => {
+                let variants: Seq[Member] = Seq::new();
+                var i = 0usize;
+                while i < node.variants.len() {
+                    let variant = node.variants.get(i);
+                    variants.push(Member.{ name: variant.name, type: self.got(self.payload(variant.payload, scope)) });
+                    i = i + 1usize;
+                }
+                (Type::Enum.(variants), node.linear, node.exposure)
+            },
+            _ => fail(text("internal error: a type declaration that declares no type")),
+        };
+        var exposure = Option::Some.(Exposure.{ mode: ExposureMode::Owner, home: decl.home });
+        let unit = match written {
+            Option::Some(e) => {
+                exposure = match e.scope {
+                    Option::Some(path) => Option::Some.(Exposure.{ mode: ExposureMode::Within, home: self.scope_module(decl, path) }),
+                    Option::None => Option::None,
+                };
+            },
+            Option::None => (),
+        };
+        TypeDecl.{ name: self.name(decl), linear, params, premises, body, home: Option::Some.(decl.home), exposure }
+    }
+
+    fn payload(self, types: Seq[S::Type], scope: Scope) -> Result[Type, SigError] {
+        if types.is_empty() {
+            return Result::Ok.(C::unit());
+        }
+        if types.len() == 1usize {
+            return self.type(types.get(0usize), scope);
+        }
+        Result::Ok.(Type::Tuple.(self.types_of(types, scope)?))
+    }
+
+    fn scope_module(self, decl: Decl, path: Seq[Text]) -> ModuleId {
+        let target = match self.r.need(decl.home, path, no_pos()) {
+            Target::Module(m) => Option::Some.(m),
+            _ => Option::None,
+        };
+        match target {
+            Option::Some(m) => if decl.home.within(m) {
+                return m;
+            },
+            Option::None => (),
+        };
+        self.fail(Out::new().put("an exposure scope is an enclosing module of ").add(decl.name).done(), no_pos())
+    }
+
+    // The signature of a function, method or extern declaration.
+    fn decl_signature(self, decl: Decl) -> Sig {
+        let node = match decl.node {
+            Named::Fn(f) => fn_header(f),
+            Named::Extern(x) => Header.{ params: x.params, ret: x.ret, quantifier: x.quantifier, is_unsafe: true, pos: x.pos },
+            _ => fail(text("internal error: a signature of a declaration that is not callable")),
+        };
+        self.signature(Option::Some.(decl), node, Seq::new(), Seq::new(), Option::None, Option::None)
+    }
+
+    fn signature(self, decl: Option[Decl], node: Header, outer: Seq[Param], outer_premises: Seq[Premise],
+                 outer_scope: Option[Scope], name: Option[Text]) -> Sig {
+        var scope = match outer_scope {
+            Option::Some(s) => s,
+            Option::None => new_scope(),
+        };
+        var outer = outer;
+        var outer_premises = outer_premises;
+        // a method's impl, which also gives `self` its type
+        var method_impl = Option::None;
+        let unit = match decl {
+            Option::Some(d) => if d.kind.is("method") {
+                method_impl = d.impl_block;
+            },
+            Option::None => (),
+        };
+        let unit = match method_impl {
+            Option::Some(impl_block) => {
+                let (impl_params, impl_premises, inner) = self.quantifier(impl_block.quantifier, scope);
+                outer = concat_params(outer, impl_params);
+                outer_premises = concat_premises(outer_premises, impl_premises);
+                scope = inner;
+            },
+            Option::None => (),
+        };
+        let (params, premises, inner) = self.quantifier(node.quantifier, scope);
+        let scope = inner;
+        let copied = self.got(self.copy_names(node.quantifier));
+        let adjusted: Seq[Param] = Seq::new();
+        var i = 0usize;
+        while i < outer.len() {
+            let p = outer.get(i);
+            let any = match p.kind {
+                Kind::Any => true,
+                _ => false,
+            };
+            adjusted.push(if copied.has(p.name) && any { Param.{ name: p.name, kind: Kind::Copy } } else { p });
+            i = i + 1usize;
+        }
+        let outer = adjusted;
+        i = 0usize;
+        while i < outer.len() {
+            let p = outer.get(i);
+            let unit = match p.kind {
+                Kind::Brand => (),
+                _ => scope.kinds.set(p.name, p.kind),
+            };
+            i = i + 1usize;
+        }
+        let implicit: Seq[Param] = Seq::new();
+        scope.implicit.set(Option::Some.(implicit));
+        let pnames: Seq[Text] = Seq::new();
+        let ptypes: Seq[Type] = Seq::new();
+        let places: Seq[usize] = Seq::new();
+        var k = 0usize;
+        while k < node.params.len() {
+            let p = node.params.get(k);
+            let unit = match p.type {
+                Option::None => {
+                    let self_type = match method_impl {
+                        Option::Some(impl_block) => if p.name.is("self") { Option::Some.(impl_block.type) } else { Option::None },
+                        Option::None => Option::None,
+                    };
+                    match self_type {
+                        Option::Some(t) => ptypes.push(self.got(self.type(t, scope))),
+                        Option::None => self.fail(Out::new().put("parameter ").add(p.name).put(" needs a type").done(), node.pos),
+                    }
+                },
+                Option::Some(t) => ptypes.push(self.got(self.type(t, scope))),
+            };
+            pnames.push(p.name);
+            if p.lend {
+                places.push(k);
+            }
+            k = k + 1usize;
+        }
+        scope.implicit.set(Option::None);
+        let ret = match node.ret {
+            Option::None => C::unit(),
+            Option::Some(t) => self.got(self.type(t, scope)),
+        };
+        let core_name = match name {
+            Option::Some(n) => n,
+            Option::None => match decl {
+                Option::Some(d) => self.name(d),
+                Option::None => fail(text("internal error: a signature without a name")),
+            },
+        };
+        let all = concat_params(concat_params(outer, params), implicit);
+        let home = match decl {
+            Option::Some(d) => Option::Some.(d.home),
+            Option::None => Option::None,
+        };
+        Sig.{ name: core_name, decl, params: all, premises: concat_premises(outer_premises, premises), pnames, ptypes, places, ret,
+              is_unsafe: node.is_unsafe, home }
+    }
+
+    fn trait_decl(self, decl: Decl) -> C::Trait {
+        let node = match decl.node {
+            Named::Trait(t) => t,
+            _ => fail(text("internal error: a trait declaration that declares no trait")),
+        };
+        let (declared, premises, declared_scope) = self.quantifier(node.quantifier, new_scope());
+        if !premises.is_empty() {
+            self.fail(text("trait declarations cannot have their own trait premises"), node.pos);
+        }
+        let self_param = Param.{ name: text("Self"), kind: Kind::Any };
+        let (params, scope) = if node.quantifier.is_none() {
+            (Seq::one(self_param), declared_scope.extend(Seq::one(self_param)))
+        } else {
+            (declared, declared_scope)
+        };
+        let methods: Seq[C::Method] = Seq::new();
+        var i = 0usize;
+        while i < node.methods.len() {
+            let m = node.methods.get(i);
+            let sig = self.signature(Option::None, fn_header(m), Seq::new(), Seq::new(), Option::Some.(scope), Option::Some.(m.name));
+            if !sig.params.is_empty() {
+                self.fail(Out::new().put("trait method ").add(m.name).put(" cannot be generic itself").done(), no_pos());
+            }
+            methods.push(C::Method.{ name: m.name, ret: sig.ret, ptypes: sig.ptypes, is_unsafe: sig.is_unsafe, places: sig.places });
+            i = i + 1usize;
+        }
+        let names: Seq[Text] = Seq::new();
+        let kinds: Seq[Kind] = Seq::new();
+        i = 0usize;
+        while i < params.len() {
+            names.push(params.get(i).name);
+            kinds.push(params.get(i).kind);
+            i = i + 1usize;
+        }
+        C::Trait.{ name: self.name(decl), params: names, methods, home: Option::Some.(decl.home), param_kinds: kinds }
+    }
+
+    fn instance_decl(self, item: S::InstanceDecl, home: ModuleId) -> (InstanceSig, S::InstanceDecl, ModuleId) {
+        let (params, premises, scope) = self.quantifier(item.quantifier, new_scope());
+        let head = match item.type {
+            S::Type::Name(n) => n,
+            _ => fail(text("internal error: an instance of something other than a trait")),
+        };
+        let trait_decl = match self.r.refs.get(head.id) {
+            Option::Some(r) => match r {
+                NameRef::Decl(d) => d,
+                _ => fail(text("internal error: an instance of something other than a trait")),
+            },
+            Option::None => fail(text("internal error: an unresolved instance")),
+        };
+        let arguments = self.got(self.types_of(head.args, scope));
+        let unit = self.got(self.check_arguments(trait_decl, arguments, scope));
+        let methods: Seq[Sig] = Seq::new();
+        var i = 0usize;
+        while i < item.methods.len() {
+            let m = item.methods.get(i);
+            let sig = self.signature(Option::None, fn_header(m), params, premises, Option::Some.(scope), Option::Some.(m.name));
+            methods.push(Sig.{ name: sig.name, decl: sig.decl, params: sig.params, premises: sig.premises, pnames: sig.pnames,
+                               ptypes: sig.ptypes, places: sig.places, ret: sig.ret, is_unsafe: sig.is_unsafe, home: Option::Some.(home) });
+            i = i + 1usize;
+        }
+        let inst = InstanceSig.{ trait_name: self.name(trait_decl), params, premises, head: arguments, methods, home, pos: item.pos };
+        (inst, item, home)
+    }
+
+    // ---- consts
+    fn const_decl(self, decl: Decl) -> Result[ConstValue, SigError] {
+        let unit = match self.consts.get(decl.id) {
+            Option::Some(value) => return Result::Ok.(value),
+            Option::None => (),
+        };
+        if self.folding.has(decl.id) {
+            return sig_error(Out::new().put("const ").add(decl.name).put(" depends on itself").done(), no_pos());
+        }
+        self.folding.add(decl.id);
+        let result = self.const_value(decl);
+        self.folding.remove(decl.id);
+        result
+    }
+
+    fn const_value(self, decl: Decl) -> Result[ConstValue, SigError] {
+        let node = match decl.node {
+            Named::Const(c) => c,
+            _ => fail(text("internal error: a const declaration that declares no const")),
+        };
+        let value = self.typed(decl.name, node.value, self.type(node.type, new_scope())?, decl.home)?;
+        self.consts.set(decl.id, value);
+        Result::Ok.(value)
+    }
+
+    // The value of `const name: want = expr`, which must have type `want`.
+    fn typed(self, name: Text, expr: Expr, want: Type, home: ModuleId) -> Result[ConstValue, SigError] {
+        let value = self.fold(expr, Option::Some.(want), Option::Some.(home), true)?;
+        if !same_type(const_type(value), Option::Some.(want)) {
+            return sig_error(Out::new().put("const ").add(name).put(" is not a ").add(type_repr(want)).done(), no_pos());
+        }
+        Result::Ok.(value)
+    }
+
+    // `Slice[u8, 'static]`, the type of a string literal.
+    fn string_type(self, home: ModuleId) -> Type {
+        Type::Named.(self.name(self.library(home, text("Slice"))), Seq::two(C::prim("u8"), Type::Skolem.(text("static"))))
+    }
+
+    // Type a constant expression and, when `evaluate`, its value.
+    //
+    // Unevaluated short-circuit operands still validate operators and literals; only computed
+    // values (and their division-by-zero traps) are skipped.
+    fn fold(self, expr: Expr, want: Option[Type], home: Option[ModuleId], evaluate: bool) -> Result[ConstValue, SigError] {
+        match expr {
+            Expr::Lit(lit) => match lit.kind {
+                S::LitKind::Int => {
+                    let ty = match lit.suffix {
+                        Option::Some(suffix) => Option::Some.(Type::Prim.(suffix)),
+                        Option::None => want,
+                    };
+                    match integer_type(ty) {
+                        Option::Some(name) => self.wrapped_literal(lit.int, false, name, lit.pos),
+                        Option::None => sig_error(text("an integer constant needs a type"), lit.pos),
+                    }
+                },
+                S::LitKind::Bool => Result::Ok.(ConstValue::Bool.(lit.int != 0u64)),
+                S::LitKind::Float => {
+                    let ty = match lit.suffix {
+                        Option::Some(suffix) => Option::Some.(Type::Prim.(suffix)),
+                        Option::None => want,
+                    };
+                    if !is_float_type(ty) {
+                        return sig_error(text("a floating constant needs a floating type"), lit.pos);
+                    }
+                    let prim = match ty {
+                        Option::Some(t) => t,
+                        Option::None => C::unit(),
+                    };
+                    if !valid_literal(prim, lit.text) {
+                        let name = match prim {
+                            Type::Prim(n) => n,
+                            _ => text(""),
+                        };
+                        return sig_error(Out::new().put("literal ").add(lit.text).put(" does not fit ").add(name).done(), lit.pos);
+                    }
+                    Result::Ok.(ConstValue::Float.(lit.text, prim))
+                },
+                S::LitKind::Str => Result::Ok.(ConstValue::Str.(lit.text, match home {
+                    Option::Some(h) => Option::Some.(self.string_type(h)),
+                    Option::None => Option::None,
+                })),
+            },
+            Expr::Path(path) => {
+                let decl = match self.r.refs.get(path.id) {
+                    Option::Some(r) => match r {
+                        NameRef::Decl(d) => if d.kind.is("const") { Option::Some.(d) } else { Option::None },
+                        _ => Option::None,
+                    },
+                    Option::None => Option::None,
+                };
+                match decl {
+                    Option::Some(d) => {
+                        var i = 0usize;
+                        while i < path.segments.len() {
+                            if !path.segments.get(i).args.is_empty() {
+                                return sig_error(text("constant paths take no type arguments"), path.pos);
+                            }
+                            i = i + 1usize;
+                        }
+                        self.const_decl(d)
+                    },
+                    Option::None => sig_error(text("a constant expression names only consts"), path.pos),
+                }
+            },
+            Expr::Tuple(t) => if t.value.len() == 1usize {
+                self.fold(t.value.get(0usize), want, home, evaluate)
+            } else {
+                sig_error(text("not a constant expression"), t.pos)
+            },
+            Expr::Unary(u) => if u.op.is("-") || u.op.is("!") {
+                self.unary(u, want, home, evaluate)
+            } else {
+                sig_error(text("not a constant expression"), u.pos)
+            },
+            Expr::Cast(c) => {
+                let v = self.fold(c.value.get(), Option::None, home, evaluate)?;
+                let to = self.type(c.type, new_scope())?;
+                let unit = match v {
+                    ConstValue::Int(value, _ty) => match integer_type(Option::Some.(to)) {
+                        Option::Some(name) => return Result::Ok.(wrapped(value, name)),
+                        Option::None => (),
+                    },
+                    _ => (),
+                };
+                sig_error(text("a constant cast converts between integer types"), c.pos)
+            },
+            Expr::Binop(b) => self.binop(b, want, home, evaluate),
+            _ => sig_error(text("not a constant expression"), S::expr_pos(expr)),
+        }
+    }
+
+    // `-` or `!` applied to a constant.
+    fn unary(self, expr: S::Unary, want: Option[Type], home: Option[ModuleId], evaluate: bool) -> Result[ConstValue, SigError] {
+        if expr.op.is("-") {
+            let unit = match expr.operand.get() {
+                Expr::Lit(literal) => match literal.kind {
+                    S::LitKind::Int => {
+                        let ty = match literal.suffix {
+                            Option::Some(suffix) => Option::Some.(Type::Prim.(suffix)),
+                            Option::None => want,
+                        };
+                        return match integer_type(ty) {
+                            Option::Some(name) => self.wrapped_literal(literal.int, true, name, expr.pos),
+                            Option::None => sig_error(text("an integer constant needs a type"), expr.pos),
+                        };
+                    },
+                    _ => (),
+                },
+                _ => (),
+            };
+        }
+        let v = self.fold(expr.operand.get(), want, home, evaluate)?;
+        match v {
+            ConstValue::Float(digits, ty) => if expr.op.is("-") {
+                let negated = if digits.starts_with(text("-")) { digits.from(1usize) } else { text("-").concat(digits) };
+                return Result::Ok.(ConstValue::Float.(negated, ty));
+            },
+            ConstValue::Bool(b) => if expr.op.is("!") {
+                return Result::Ok.(ConstValue::Bool.(!b));
+            },
+            _ => (),
+        };
+        match v {
+            ConstValue::Int(value, ty) => {
+                let name = match ty {
+                    Type::Prim(n) => n,
+                    _ => text(""),
+                };
+                Result::Ok.(wrapped(if expr.op.is("-") { 0u64 - value } else { value ^ all_bits() }, name))
+            },
+            _ => sig_error(text("operator needs an integer"), expr.pos),
+        }
+    }
+
+    fn binop(self, expr: S::Binop, want: Option[Type], home: Option[ModuleId], evaluate: bool) -> Result[ConstValue, SigError] {
+        let op = expr.op;
+        if op.is("&&") || op.is("||") {
+            let a = match self.fold(expr.left.get(), Option::Some.(C::bool_type()), home, evaluate)? {
+                ConstValue::Bool(x) => x,
+                _ => return sig_error(text("logical constant operands must be booleans"), expr.pos),
+            };
+            let needed = if op.is("&&") { a } else { !a };
+            let b = match self.fold(expr.right.get(), Option::Some.(C::bool_type()), home, evaluate && needed)? {
+                ConstValue::Bool(x) => x,
+                _ => return sig_error(text("logical constant operands must be booleans"), expr.pos),
+            };
+            return Result::Ok.(ConstValue::Bool.(if op.is("&&") { a && b } else { a || b }));
+        }
+        let comparison = is_comparison(op);
+        let hint = if comparison { Option::None } else { want };
+        // The left operand first, giving the right its type; if that fails, the other way round.
+        let first = match self.fold(expr.left.get(), hint, home, evaluate) {
+            Result::Ok(a) => match self.fold(expr.right.get(), const_type(a), home, evaluate) {
+                Result::Ok(b) => Option::Some.((a, b)),
+                Result::Err(_e) => Option::None,
+            },
+            Result::Err(_e) => Option::None,
+        };
+        let (a, b) = match first {
+            Option::Some(pair) => pair,
+            Option::None => {
+                let b = self.fold(expr.right.get(), hint, home, evaluate)?;
+                let a = self.fold(expr.left.get(), const_type(b), home, evaluate)?;
+                (a, b)
+            },
+        };
+        let unit = match a {
+            ConstValue::Bool(x) => if op.is("==") || op.is("!=") {
+                return match b {
+                    ConstValue::Bool(y) => Result::Ok.(ConstValue::Bool.((x == y) == op.is("=="))),
+                    _ => sig_error(text("constant comparison operands must have the same type"), expr.pos),
+                };
+            },
+            _ => (),
+        };
+        let (x, ty) = match a {
+            ConstValue::Int(x, ty) => (x, ty),
+            _ => return sig_error(text("constant operands must be integers of one type"), expr.pos),
+        };
+        let y = match b {
+            ConstValue::Int(y, other) => if C::same(ty, other) { y } else {
+                return sig_error(text("constant operands must be integers of one type"), expr.pos);
+            },
+            _ => return sig_error(text("constant operands must be integers of one type"), expr.pos),
+        };
+        let name = match ty {
+            Type::Prim(n) => n,
+            _ => text(""),
+        };
+        if !evaluate {
+            return Result::Ok.(if comparison { ConstValue::Bool.(false) } else { wrapped(0u64, name) });
+        }
+        let signed = is_signed(name);
+        if comparison {
+            // Both values are sign-extended in a signed type: flipping the sign bit orders them as
+            // unsigned numbers.
+            let flip = if signed { sign_bit() } else { 0u64 };
+            let p = x ^ flip;
+            let q = y ^ flip;
+            let result = if op.is("==") {
+                p == q
+            } else if op.is("!=") {
+                p != q
+            } else if op.is("<") {
+                p < q
+            } else if op.is("<=") {
+                p <= q
+            } else if op.is(">") {
+                p > q
+            } else {
+                p >= q
+            };
+            return Result::Ok.(ConstValue::Bool.(result));
+        }
+        let bits = C::integer_bits(name) as u64;
+        let value = if op.is("/") || op.is("%") {
+            if y == 0u64 {
+                return sig_error(text("constant division by zero"), expr.pos);
+            }
+            // The quotient rounds toward zero, from the magnitudes; the most negative i64's
+            // magnitude, 2^63, fits in a u64.
+            let x_negative = signed && x >= sign_bit();
+            let y_negative = signed && y >= sign_bit();
+            let x_magnitude = if x_negative { 0u64 - x } else { x };
+            let y_magnitude = if y_negative { 0u64 - y } else { y };
+            let magnitude = x_magnitude / y_magnitude;
+            let q = if x_negative == y_negative { magnitude } else { 0u64 - magnitude };
+            if op.is("/") { q } else { x - q * y }
+        } else if op.is("<<") || op.is(">>") {
+            // `y % bits` of the whole value: the width is a power of two.
+            let shift = y & (bits - 1u64);
+            if op.is("<<") {
+                x << shift
+            } else if signed && x >= sign_bit() {
+                // An arithmetic shift of a negative value.
+                (((x ^ all_bits()) >> shift) ^ all_bits())
+            } else {
+                x >> shift
+            }
+        } else if op.is("+") {
+            x + y
+        } else if op.is("-") {
+            x - y
+        } else if op.is("*") {
+            x * y
+        } else if op.is("&") {
+            x & y
+        } else if op.is("|") {
+            x | y
+        } else if op.is("^") {
+            x ^ y
+        } else {
+            fail(Out::new().put("internal error: no constant operator ").add(op).done())
+        };
+        Result::Ok.(wrapped(value, name))
+    }
+
+    // A literal's value in the integer type `name`; it must fit (a negated one may reach the
+    // minimum).
+    fn wrapped_literal(self, magnitude: u64, negative: bool, name: Text, pos: Pos) -> Result[ConstValue, SigError] {
+        let spelled = if negative && magnitude != 0u64 {
+            Out::new().put("-").u64(magnitude).done()
+        } else {
+            Out::new().u64(magnitude).done()
+        };
+        if !valid_literal(Type::Prim.(name), spelled) {
+            return sig_error(Out::new().add(spelled).put(" does not fit ").add(name).done(), pos);
+        }
+        Result::Ok.(wrapped(if negative { 0u64 - magnitude } else { magnitude }, name))
+    }
+}
+
+// `value` in the integer type `name`'s width, sign-extended when it is signed.
+fn wrapped(value: u64, name: Text) -> ConstValue {
+    let bits = C::integer_bits(name) as u64;
+    var v = value;
+    if bits < 64u64 {
+        let mask = (1u64 << bits) - 1u64;
+        v = v & mask;
+        if is_signed(name) && v >= 1u64 << (bits - 1u64) {
+            v = v | (mask ^ all_bits());
+        }
+    }
+    ConstValue::Int.(v, Type::Prim.(name))
+}
+
+// The indices of a function type's place slots, from `first`.
+fn places_of(slots: Seq[S::Slot], first: usize) -> Seq[usize] {
+    let out: Seq[usize] = Seq::new();
+    var i = 0usize;
+    while i < slots.len() {
+        if slots.get(i).lend {
+            out.push(i + first);
+        }
+        i = i + 1usize;
+    }
+    out
+}
+
+fn signatures(resolver: Resolver, counter: Fresh) -> Signatures {
+    Signatures::new(resolver, counter)
+}

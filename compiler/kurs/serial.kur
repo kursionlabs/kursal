@@ -1,0 +1,1377 @@
+// The KURS S-expression serialization of the core: `parse_program` reads it into a `Program`, and
+// `write_program` writes a program as text that `parse_program` reads back into the same program.
+
+use package::support::base::{Cell, Out, Seq, Text, fail, text};
+use package::kurs::core as C;
+use package::kurs::core::{Arm, Binding, Block, Data, Edge, Exposure, ExposureMode, Extern, Fun, ForeachType, Instance, Instr, Kind, Known, Member, Method, ModuleId, Opened, Param, Premise, Program, Terminator, Trait, Type, TypeDecl};
+use package::kurs::sexpr::{Form, FormKind, located, read};
+use package::syntax::ast::Pos;
+use std::option::Option;
+use std::slice::Slice;
+
+// ---------------------------------------------------------------- parsing --
+
+fn fail_text_on(message: Text, form: Form) -> ! {
+    if form.pos.line == 0u32 {
+        fail(message)
+    } else {
+        fail(located(message, form.pos))
+    }
+}
+
+fn fail_on(message: Slice[u8, 'static], form: Form) -> ! {
+    fail_text_on(text(message), form)
+}
+
+// An empty list with no position.
+fn no_form() -> Form {
+    Form.{ kind: FormKind::List, text: text(""), items: Seq::new(), pos: Pos.{ line: 0u32, col: 0u32 } }
+}
+
+// `form` is an atom (or string) whose text is `word`.
+fn is_word(form: Form, word: Slice[u8, 'static]) -> bool {
+    !form.is_list() && form.text.is(word)
+}
+
+// `form` is a non-empty list headed by `head`.
+fn is_form(form: Form, head: Slice[u8, 'static]) -> bool {
+    form.is_list() && form.len() > 0usize && is_word(form.at(0usize), head)
+}
+
+// ... with exactly `length` items.
+fn is_form_of(form: Form, head: Slice[u8, 'static], length: usize) -> bool {
+    is_form(form, head) && form.len() == length
+}
+
+fn list_of(form: Form) -> Form {
+    if !form.is_list() {
+        fail_on("expected a list", form);
+    }
+    form
+}
+
+fn atom_of(form: Form) -> Form {
+    if form.is_list() {
+        fail_on("expected an atom", form);
+    }
+    form
+}
+
+// A form as text: an atom's text, or a list as Python prints a list of strings.
+fn str_of(form: Form) -> Text {
+    if form.is_list() {
+        repr_list(Out::new(), form).done()
+    } else {
+        form.text
+    }
+}
+
+fn repr_list(out: Out, form: Form) -> Out {
+    let unit = out.byte(b'[');
+    var i = 0usize;
+    while i < form.len() {
+        if i > 0usize {
+            let unit = out.put(", ");
+        }
+        let item = form.at(i);
+        let unit = if item.is_list() { repr_list(out, item) } else { repr_text(out, item.text) };
+        i = i + 1usize;
+    }
+    out.byte(b']')
+}
+
+// A string as Python's `repr` writes it.
+fn repr_text(out: Out, t: Text) -> Out {
+    let quote = if t.contains(text("'")) && !t.contains(text("\"")) { b'"' } else { b'\'' };
+    let unit = out.byte(quote);
+    var i = 0usize;
+    while i < t.len {
+        let b = t.byte(i);
+        let unit = if b == b'\\' || b == quote {
+            out.byte(b'\\').byte(b)
+        } else if b == b'\n' {
+            out.put("\\n")
+        } else if b == b'\t' {
+            out.put("\\t")
+        } else if b == b'\r' {
+            out.put("\\r")
+        } else if b < 32u8 || b == 127u8 {
+            hex_escape(out, b)
+        } else {
+            out.byte(b)
+        };
+        i = i + 1usize;
+    }
+    out.byte(quote)
+}
+
+fn hex_escape(out: Out, b: u8) -> Out {
+    let digits = text("0123456789abcdef");
+    out.put("\\x").byte(digits.byte((b / 16u8) as usize)).byte(digits.byte((b % 16u8) as usize))
+}
+
+fn strs(forms: Seq[Form]) -> Seq[Text] {
+    let out: Seq[Text] = Seq::new();
+    var i = 0usize;
+    while i < forms.len() {
+        out.push(str_of(forms.get(i)));
+        i = i + 1usize;
+    }
+    out
+}
+
+fn brand_of(form: Form) -> Text {
+    if form.is_list() || !form.text.starts_with(text("$")) || form.text.len < 2usize {
+        fail_text_on(Out::new().put("expected a brand such as $k, got ").add(str_of(form)).done(), form);
+    }
+    form.text.from(1usize)
+}
+
+fn brands_of(form: Form) -> Seq[Text] {
+    let out: Seq[Text] = Seq::new();
+    var i = 0usize;
+    while i < form.len() {
+        out.push(brand_of(form.at(i)));
+        i = i + 1usize;
+    }
+    out
+}
+
+// The decimal value of an atom.
+fn int_of(form: Form) -> usize {
+    match form.text.to_usize() {
+        Option::Some(n) => n,
+        Option::None => fail(Out::new().put("invalid literal for int() with base 10: ").add(repr_text(Out::new(), form.text).done()).done()),
+    }
+}
+
+// `name` without its trailing `!`s.
+fn strip_bang(name: Text) -> Text {
+    var end = name.len;
+    while end > 0usize && name.byte(end - 1usize) == b'!' {
+        end = end - 1usize;
+    }
+    name.slice(0usize, end)
+}
+
+fn parse_types(forms: Seq[Form]) -> Seq[Type] {
+    let out: Seq[Type] = Seq::new();
+    var i = 0usize;
+    while i < forms.len() {
+        out.push(parse_type(forms.get(i)));
+        i = i + 1usize;
+    }
+    out
+}
+
+// `(name TYPE)` for each form: struct fields and enum variants.
+fn parse_members(forms: Seq[Form]) -> Seq[Member] {
+    let out: Seq[Member] = Seq::new();
+    var i = 0usize;
+    while i < forms.len() {
+        let f = list_of(forms.get(i));
+        let name = str_of(f.at(0usize));
+        out.push(Member.{ name, type: parse_type(f.at(1usize)) });
+        i = i + 1usize;
+    }
+    out
+}
+
+// `(name TYPE)` for each form: block parameters and function locals.
+fn parse_bindings(forms: Seq[Form]) -> Seq[Binding] {
+    let out: Seq[Binding] = Seq::new();
+    var i = 0usize;
+    while i < forms.len() {
+        let p = list_of(forms.get(i));
+        let name = str_of(p.at(0usize));
+        out.push(Binding.{ name, type: parse_type(p.at(1usize)) });
+        i = i + 1usize;
+    }
+    out
+}
+
+fn parse_type(form: Form) -> Type {
+    if !form.is_list() {
+        let t = form.text;
+        if t.is("_") {
+            return Type::Ignored;
+        }
+        if t.is("!") {
+            return Type::Never;
+        }
+        if t.starts_with(text("$")) {
+            return Type::Skolem.(brand_of(form));
+        }
+        if C::is_prim(t) {
+            return Type::Prim.(t);
+        }
+        return Type::Named.(if t.len > 1usize { strip_bang(t) } else { t }, Seq::new());
+    }
+    if form.len() == 0usize {
+        fail_on("empty type", form);
+    }
+    let head = atom_of(form.at(0usize)).text;
+    let rest = form.items.from(1usize);
+    if head.is("struct") {
+        return Type::Struct.(parse_members(rest));
+    }
+    if head.is("enum") {
+        return Type::Enum.(parse_members(rest));
+    }
+    if head.is("tuple") {
+        return Type::Tuple.(parse_types(rest));
+    }
+    if head.is("array") {
+        let elem = parse_type(rest.get(0usize));
+        return Type::Array.(Cell::new(elem), int_of(atom_of(rest.get(1usize))) as u64);
+    }
+    if head.is("builtin::Pointer") {
+        return C::ptr(parse_type(rest.get(0usize)));
+    }
+    if head.is("builtin::Brand") {
+        return Type::Brand.(Cell::new(Type::Skolem.(brand_of(rest.get(0usize)))));
+    }
+    if head.is("exists") {
+        let binders = brands_of(list_of(rest.get(0usize)));
+        return Type::Exists.(binders, Cell::new(parse_type(rest.get(1usize))));
+    }
+    if head.is("foreach") {
+        return parse_foreach(form, rest);
+    }
+    if head.is("builtin::Fn") {
+        return parse_fn_type(rest);
+    }
+    Type::Named.(strip_bang(head), parse_types(rest))
+}
+
+fn parse_foreach(form: Form, rest: Seq[Form]) -> Type {
+    let pair = list_of(rest.get(0usize));
+    if pair.len() != 2usize {
+        fail(text("internal error: a foreach pattern and source are two forms"));
+    }
+    let pattern = pair.at(0usize);
+    let source = pair.at(1usize);
+    let indirect = is_form_of(pattern, "builtin::Pointer", 2usize);
+    let binder = str_of(if indirect { list_of(pattern).at(1usize) } else { pattern });
+    var retained = Option::None;
+    if rest.len() == 3usize {
+        let annotation = list_of(rest.get(2usize));
+        if annotation.len() == 0usize || !is_word(annotation.at(0usize), "retain") {
+            fail_on("expected foreach retained-binder annotation", rest.get(2usize));
+        }
+        retained = Option::Some.(strs(annotation.items.from(1usize)));
+    } else if rest.len() != 2usize {
+        fail_on("foreach requires source and body", form);
+    }
+    let source = parse_type(source);
+    let body = parse_type(rest.get(1usize));
+    match retained {
+        Option::Some(names) => Type::Foreach.(ForeachType.{ binder, indirect, source: Cell::new(source), body: Cell::new(body), retained: names }),
+        Option::None => C::foreach_type(binder, indirect, source, body),
+    }
+}
+
+fn parse_fn_type(rest: Seq[Form]) -> Type {
+    let is_unsafe = is_form_of(rest.get(0usize), "unsafe", 1usize);
+    let rest = if is_unsafe { rest.from(1usize) } else { rest };
+    let header = rest.get(0usize);
+    if is_form_of(header, "forall", 5usize) {
+        let q = parse_forall(header.at(1usize), header.at(2usize));
+        if q.premises.len() > 0usize {
+            fail_on("a function type has no premises", header);
+        }
+        let p = parse_ptypes(header.at(4usize));
+        return C::fn_type(p.types, parse_type(header.at(3usize)), q.params, is_unsafe, p.places);
+    }
+    let p = parse_ptypes(rest.get(0usize));
+    C::fn_type(p.types, parse_type(rest.get(1usize)), Seq::new(), is_unsafe, p.places)
+}
+
+exposed struct Ptypes {
+    types: Seq[Type],
+    // indices of the place parameters, ascending
+    places: Seq[usize],
+}
+
+// A function type's or trait method's `(PTYPE*)`, where `(& T)` is a place parameter of type T.
+fn parse_ptypes(form: Form) -> Ptypes {
+    let forms = list_of(form);
+    let types: Seq[Type] = Seq::new();
+    let places: Seq[usize] = Seq::new();
+    var i = 0usize;
+    while i < forms.len() {
+        let f = forms.at(i);
+        if is_form_of(f, "&", 2usize) {
+            places.push(i);
+        }
+        i = i + 1usize;
+    }
+    i = 0usize;
+    while i < forms.len() {
+        let f = forms.at(i);
+        types.push(parse_type(if is_form_of(f, "&", 2usize) { f.at(1usize) } else { f }));
+        i = i + 1usize;
+    }
+    Ptypes.{ types, places }
+}
+
+exposed struct Quantified {
+    params: Seq[Param],
+    premises: Seq[Premise],
+}
+
+// A `(forall (PARAM*) (PREMISE*) ...)` header; `(Copy T)` sets T's kind.
+fn parse_forall(params_form: Form, premises_form: Form) -> Quantified {
+    let all: Seq[Premise] = Seq::new();
+    let premise_forms = list_of(premises_form);
+    var i = 0usize;
+    while i < premise_forms.len() {
+        let p = list_of(premise_forms.at(i));
+        let trait_name = str_of(p.at(0usize));
+        all.push(Premise.{ trait_name, args: parse_types(p.items.from(1usize)) });
+        i = i + 1usize;
+    }
+    let copy: Seq[Text] = Seq::new();
+    i = 0usize;
+    while i < all.len() {
+        let p = all.get(i);
+        if p.trait_name.is("Copy") {
+            if p.args.len() != 1usize {
+                fail_on("Copy requires a type parameter name", premises_form);
+            }
+            let name = match p.args.get(0usize) {
+                Type::Named(name, args) => name,
+                Type::Prim(name) => name,
+                _ => fail_on("Copy requires a type parameter name", premises_form),
+            };
+            copy.push(name);
+        }
+        i = i + 1usize;
+    }
+    let param_forms = list_of(params_form);
+    let names: Seq[Text] = Seq::new();
+    i = 0usize;
+    while i < param_forms.len() {
+        names.push(str_of(atom_of(param_forms.at(i))));
+        i = i + 1usize;
+    }
+    i = 0usize;
+    while i < copy.len() {
+        if !names.has(copy.get(i)) {
+            fail_on("Copy requires a type parameter name", premises_form);
+        }
+        i = i + 1usize;
+    }
+    let params: Seq[Param] = Seq::new();
+    i = 0usize;
+    while i < param_forms.len() {
+        let a = atom_of(param_forms.at(i)).text;
+        params.push(if a.starts_with(text("$")) {
+            Param.{ name: a.from(1usize), kind: Kind::Brand }
+        } else {
+            Param.{ name: a, kind: if copy.has(a) { Kind::Copy } else { Kind::Any } }
+        });
+        i = i + 1usize;
+    }
+    let premises: Seq[Premise] = Seq::new();
+    i = 0usize;
+    while i < all.len() {
+        if !all.get(i).trait_name.is("Copy") {
+            premises.push(all.get(i));
+        }
+        i = i + 1usize;
+    }
+    Quantified.{ params, premises }
+}
+
+fn parse_edge(target: Form, args: Seq[Form]) -> Edge {
+    if target.is_list() {
+        let name = str_of(target.at(0usize));
+        return Edge.{ target: name, args: strs(args), tys: parse_types(target.items.from(1usize)) };
+    }
+    Edge.{ target: str_of(target), args: strs(args), tys: Seq::new() }
+}
+
+// An edge written as one list: `(TARGET ARG*)`.
+fn parse_edge_form(form: Form) -> Edge {
+    let target = list_of(form).at(0usize);
+    parse_edge(target, list_of(form).items.from(1usize))
+}
+
+fn parse_term(form: Form) -> Terminator {
+    let form = list_of(form);
+    let head = form.at(0usize);
+    let pos = form.pos;
+    if is_word(head, "ret") {
+        return Terminator::Ret.(str_of(form.at(1usize)), pos);
+    }
+    if is_word(head, "unreachable") {
+        return Terminator::Unreachable.(pos);
+    }
+    if is_word(head, "jmp") {
+        return Terminator::Jmp.(parse_edge(form.at(1usize), form.items.from(2usize)), pos);
+    }
+    if is_word(head, "jnz") {
+        let cond = str_of(form.at(1usize));
+        let then = parse_edge_form(form.at(2usize));
+        return Terminator::Jnz.(cond, then, parse_edge_form(form.at(3usize)), pos);
+    }
+    if is_word(head, "switch") {
+        let arms: Seq[Arm] = Seq::new();
+        var i = 3usize;
+        while i < form.len() {
+            let arm = list_of(form.at(i));
+            let variant = atom_of(arm.at(0usize)).text;
+            arms.push(Arm.{ variant, edge: parse_edge(arm.at(1usize), arm.items.from(2usize)) });
+            i = i + 1usize;
+        }
+        let scrutinee = str_of(form.at(1usize));
+        return Terminator::Switch.(scrutinee, parse_type(form.at(2usize)), arms, pos);
+    }
+    fail_text_on(Out::new().put("unknown terminator ").add(str_of(head)).done(), form)
+}
+
+exposed struct Applied {
+    name: Text,
+    tys: Seq[Type],
+}
+
+// `name` or `(name T*)`: a callee, mapper or function-value name.
+fn parse_applied(form: Form) -> Applied {
+    if form.is_list() {
+        let name = str_of(form.at(0usize));
+        return Applied.{ name, tys: parse_types(form.items.from(1usize)) };
+    }
+    Applied.{ name: str_of(form), tys: Seq::new() }
+}
+
+fn make_instr(lhs: Seq[Text], op: Text, pos: Pos, args: Seq[Text], ty: Option[Type], tys: Seq[Type], lit: Option[Text]) -> Instr {
+    Instr.{ lhs, op, args, ty, tys, lit, is_unsafe: false, binders: Seq::new(), pos }
+}
+
+fn parse_instr(form: Form) -> Instr {
+    let form = list_of(form);
+    if is_form_of(form, "unsafe", 2usize) {
+        let i = parse_instr(form.at(1usize));
+        return Instr.{ lhs: i.lhs, op: i.op, args: i.args, ty: i.ty, tys: i.tys, lit: i.lit, is_unsafe: true, binders: i.binders, pos: i.pos };
+    }
+    // selected evidence is not consumed yet
+    let form = if form.len() == 4usize && is_form(form.at(3usize), "evidence") {
+        Form.{ kind: FormKind::List, text: form.text, items: form.items.slice(0usize, 3usize), pos: form.pos }
+    } else {
+        form
+    };
+    if !is_form_of(form, "=", 3usize) || !form.at(2usize).is_list() {
+        fail_on("an instruction is (= lhs (op arg*))", form);
+    }
+    let lhs_form = form.at(1usize);
+    let operation = list_of(form.at(2usize));
+    let lhs = if lhs_form.is_list() { strs(lhs_form.items) } else { Seq::one(str_of(lhs_form)) };
+    let op = str_of(operation.at(0usize));
+    let rest = operation.items.from(1usize);
+    let pos = form.pos;
+    let none: Seq[Type] = Seq::new();
+    if op.is("const") {
+        let ty = parse_type(rest.get(0usize));
+        return make_instr(lhs, op, pos, Seq::new(), Option::Some.(ty), none, Option::Some.(str_of(rest.get(1usize))));
+    }
+    if op.is("construct") {
+        let ty = parse_type(rest.get(0usize));
+        return make_instr(lhs, op, pos, strs(rest.from(1usize)), Option::Some.(ty), none, Option::None);
+    }
+    if op.is("destruct") || op.is("variant_tag") || op.is("builtin::unsafe::cast") || op.is("builtin::int_cast") {
+        let args = Seq::one(str_of(rest.get(0usize)));
+        return make_instr(lhs, op, pos, args, Option::Some.(parse_type(rest.get(1usize))), none, Option::None);
+    }
+    if op.is("construct_variant") {
+        let ty = parse_type(rest.get(0usize));
+        let lit = str_of(rest.get(1usize));
+        return make_instr(lhs, op, pos, Seq::one(str_of(rest.get(2usize))), Option::Some.(ty), none, Option::Some.(lit));
+    }
+    if op.is("alloca") || op.is("builtin::sizeof") {
+        return make_instr(lhs, op, pos, Seq::new(), Option::Some.(parse_type(rest.get(0usize))), none, Option::None);
+    }
+    if op.is("pack") {
+        let witnesses = if rest.get(1usize).is_list() { rest.get(1usize).items } else { Seq::one(rest.get(1usize)) };
+        let ty = parse_type(rest.get(0usize));
+        let tys = parse_types(witnesses);
+        return make_instr(lhs, op, pos, Seq::one(str_of(rest.get(2usize))), Option::Some.(ty), tys, Option::None);
+    }
+    if op.is("open") {
+        let args = Seq::one(str_of(rest.get(0usize)));
+        let binders = brands_of(list_of(rest.get(1usize)));
+        return Instr.{ lhs, op, args, ty: Option::None, tys: none, lit: Option::None, is_unsafe: false, binders, pos };
+    }
+    if op.is("call") || op.is("fn") {
+        let callee = parse_applied(rest.get(0usize));
+        let args = Seq::one(callee.name);
+        args.append(strs(rest.from(1usize)));
+        return make_instr(lhs, op, pos, args, Option::None, callee.tys, Option::None);
+    }
+    if op.is("foreach") {
+        let mapper = parse_applied(rest.get(2usize));
+        let ty = parse_type(rest.get(0usize));
+        let args = Seq::two(str_of(rest.get(1usize)), mapper.name);
+        args.append(strs(rest.from(3usize)));
+        return make_instr(lhs, op, pos, args, Option::Some.(ty), mapper.tys, Option::None);
+    }
+    if op.is("trait_call") {
+        let args = Seq::two(str_of(rest.get(0usize)), str_of(rest.get(1usize)));
+        args.append(strs(rest.from(3usize)));
+        return make_instr(lhs, op, pos, args, Option::None, parse_types(list_of(rest.get(2usize)).items), Option::None);
+    }
+    if op.starts_with(text("builtin::unsafe::atomic_")) {
+        let lit = str_of(rest.get(0usize));
+        return make_instr(lhs, op, pos, strs(rest.from(1usize)), Option::None, none, Option::Some.(lit));
+    }
+    make_instr(lhs, op, pos, strs(rest), Option::None, none, Option::None)
+}
+
+// A form is a block's brands: a non-empty list of atoms that start with `$`.
+fn is_brand_list(form: Form) -> bool {
+    var all = form.is_list() && form.len() > 0usize;
+    var i = 0usize;
+    while all && i < form.len() {
+        all = !form.at(i).is_list() && form.at(i).text.starts_with(text("$"));
+        i = i + 1usize;
+    }
+    all
+}
+
+fn parse_block(form: Form) -> Block {
+    let form = list_of(form);
+    let label = str_of(form.at(0usize));
+    // `k` is the start of the rest of the block
+    var k = 1usize;
+    var brands: Seq[Text] = Seq::new();
+    if k < form.len() && is_brand_list(form.at(k)) {
+        brands = brands_of(form.at(k));
+        k = k + 1usize;
+    }
+    let params = parse_bindings(list_of(form.at(k)).items);
+    k = k + 1usize;
+    let empty: Seq[Text] = Seq::new();
+    let known: Seq[Known] = Seq::new();
+    let opened: Seq[Opened] = Seq::new();
+    while form.len() - k > 1usize && (is_form(form.at(k), "empty") || is_form(form.at(k), "known") || is_form(form.at(k), "opened")) {
+        let clause = form.at(k);
+        if is_word(clause.at(0usize), "empty") {
+            empty.append(strs(clause.items.from(1usize)));
+        } else if is_word(clause.at(0usize), "known") {
+            known.push(Known.{ path: str_of(clause.at(1usize)), variant: str_of(clause.at(2usize)) });
+        } else {
+            if clause.len() != 3usize {
+                fail_on("an opened contract is (opened PLACE ($brand*))", clause);
+            }
+            let path = atom_of(clause.at(1usize)).text;
+            opened.push(Opened.{ path, brands: brands_of(list_of(clause.at(2usize))) });
+        }
+        k = k + 1usize;
+    }
+    if k >= form.len() {
+        // there is no terminator
+        let unit = form.at(form.len());
+    }
+    let instrs: Seq[Instr] = Seq::new();
+    while k + 1usize < form.len() {
+        instrs.push(parse_instr(form.at(k)));
+        k = k + 1usize;
+    }
+    let term = parse_term(form.at(k));
+    Block.{ label, params, instrs, term, brands, empty, known, opened, pos: form.pos }
+}
+
+// `RET (PARAM-TYPES) (locals ...)? BLOCK+`, possibly forall-wrapped.
+fn parse_fun(forms: Seq[Form], name: Text, home: Option[ModuleId], is_unsafe: bool, pos: Pos) -> Fun {
+    var params: Seq[Param] = Seq::new();
+    var premises: Seq[Premise] = Seq::new();
+    var forms = forms;
+    let header = forms.get(0usize);
+    if is_form(header, "forall") {
+        let q = parse_forall(header.at(1usize), header.at(2usize));
+        params = q.params;
+        premises = q.premises;
+        forms = header.items.from(3usize);
+    }
+    var body = forms.from(2usize);
+    var locals: Seq[Binding] = Seq::new();
+    if body.len() > 0usize && is_form(body.get(0usize), "locals") {
+        locals = parse_bindings(body.get(0usize).items.from(1usize));
+        body = body.from(1usize);
+    }
+    let ret = parse_type(forms.get(0usize));
+    let ptypes = parse_types(list_of(forms.get(1usize)).items);
+    let blocks: Seq[Block] = Seq::new();
+    var i = 0usize;
+    while i < body.len() {
+        blocks.push(parse_block(body.get(i)));
+        i = i + 1usize;
+    }
+    Fun.{ name, params, premises, ret, ptypes, blocks, locals, is_unsafe, home, pos }
+}
+
+fn parse_module(form: Form) -> ModuleId {
+    let form = list_of(form);
+    ModuleId.{ package: int_of(atom_of(form.at(1usize))), path: strs(form.items.from(2usize)) }
+}
+
+// A declaration's optional `(unsafe)` or `(in OWNER POLICY?)` clause, after its head.
+exposed struct Clause {
+    rest: Seq[Form],
+    home: Option[ModuleId],
+    is_unsafe: bool,
+    exposure: Option[Exposure],
+}
+
+fn parse_clause(form: Form) -> Clause {
+    let rest = form.items.from(1usize);
+    let none = Option::None;
+    if form.len() > 1usize && is_form_of(form.at(1usize), "unsafe", 1usize) {
+        return Clause.{ rest: rest.from(1usize), home: none, is_unsafe: true, exposure: Option::None };
+    }
+    if !(form.len() > 1usize && is_form(form.at(1usize), "in")) {
+        return Clause.{ rest, home: none, is_unsafe: false, exposure: Option::None };
+    }
+    let clause = form.at(1usize);
+    let home = parse_module(clause.at(1usize));
+    var is_unsafe = false;
+    var exposure = Option::None;
+    if clause.len() > 2usize {
+        let policy = clause.at(2usize);
+        if is_word(policy, "abstract") {
+            exposure = Option::Some.(Exposure.{ mode: ExposureMode::Owner, home });
+        } else if is_form(policy, "exposed") {
+            exposure = Option::Some.(Exposure.{ mode: ExposureMode::Within, home: parse_module(policy.at(1usize)) });
+        }
+        is_unsafe = is_word(policy, "unsafe");
+    }
+    Clause.{ rest: rest.from(1usize), home: Option::Some.(home), is_unsafe, exposure }
+}
+
+fn parse_program(source: Text) -> Program {
+    let program = Program::new();
+    let top = read(source);
+    var n = 0usize;
+    while n < top.len() {
+        let form = list_of(top.at(n));
+        let clause = parse_clause(form);
+        let rest = clause.rest;
+        let home = clause.home;
+        let head = form.at(0usize);
+        if is_word(head, "type") {
+            let raw = str_of(rest.get(0usize));
+            var params: Seq[Param] = Seq::new();
+            var premises: Seq[Premise] = Seq::new();
+            var body = rest.get(1usize);
+            while is_form(body, "forall") {
+                let q = parse_forall(body.at(1usize), body.at(2usize));
+                params = params.copy();
+                params.append(q.params);
+                premises = premises.copy();
+                premises.append(q.premises);
+                body = body.at(3usize);
+            }
+            let name = if raw.len > 1usize { strip_bang(raw) } else { raw };
+            let linear = raw.ends_with(text("!"));
+            program.types.set(name, TypeDecl.{ name, linear, params, premises, body: parse_type(body), home, exposure: clause.exposure });
+        } else if is_word(head, "fun") {
+            let name = str_of(rest.get(0usize));
+            program.funs.set(name, parse_fun(rest.from(1usize), name, home, clause.is_unsafe, form.pos));
+        } else if is_word(head, "extern") {
+            let kind = form.at(1usize);
+            let name = str_of(form.at(2usize));
+            let ret = parse_type(form.at(3usize));
+            let ptypes = if is_word(kind, "fun") { Option::Some.(parse_types(list_of(form.at(4usize)).items)) } else { Option::None };
+            program.externs.set(name, Extern.{ name, ret: Option::Some.(ret), ptypes, pos: form.pos });
+        } else if is_word(head, "trait") {
+            let methods: Seq[Method] = Seq::new();
+            var i = 2usize;
+            while i < rest.len() {
+                let method = list_of(rest.get(i));
+                let m_unsafe = is_form_of(method.at(0usize), "unsafe", 1usize);
+                let m = if m_unsafe { method.items.from(1usize) } else { method.items };
+                let ret = parse_type(m.get(1usize));
+                let p = parse_ptypes(m.get(2usize));
+                methods.push(Method.{ name: str_of(m.get(0usize)), ret, ptypes: p.types, is_unsafe: m_unsafe, places: p.places });
+                i = i + 1usize;
+            }
+            let params = parse_forall(rest.get(1usize), no_form()).params;
+            let names: Seq[Text] = Seq::new();
+            let kinds: Seq[Kind] = Seq::new();
+            i = 0usize;
+            while i < params.len() {
+                names.push(params.get(i).name);
+                kinds.push(params.get(i).kind);
+                i = i + 1usize;
+            }
+            let name = str_of(rest.get(0usize));
+            program.traits.set(name, Trait.{ name, params: names, methods, home, param_kinds: kinds });
+        } else if is_word(head, "instance") {
+            var head_form = rest.get(1usize);
+            var params: Seq[Param] = Seq::new();
+            var premises: Seq[Premise] = Seq::new();
+            if is_form(head_form, "forall") {
+                let q = parse_forall(head_form.at(1usize), head_form.at(2usize));
+                params = q.params;
+                premises = q.premises;
+                head_form = head_form.at(3usize);
+            }
+            let methods: Seq[Fun] = Seq::new();
+            var i = 2usize;
+            while i < rest.len() {
+                let m = list_of(rest.get(i));
+                let m_clause = parse_clause(m);
+                let m_rest = m_clause.rest;
+                let m_name = str_of(m_rest.get(0usize));
+                methods.push(parse_fun(m_rest.from(1usize), m_name, home, clause.is_unsafe || m_clause.is_unsafe, m.pos));
+                i = i + 1usize;
+            }
+            let trait_name = str_of(rest.get(0usize));
+            let decl = Instance.{ trait_name, params, premises, head: parse_types(list_of(head_form).items), methods, home, pos: form.pos };
+            match program.instances.get(trait_name) {
+                Option::Some(list) => list.push(decl),
+                Option::None => program.instances.set(trait_name, Seq::one(decl)),
+            };
+        } else if is_word(head, "data") {
+            let name = str_of(rest.get(0usize));
+            program.datas.set(name, Data.{ name, ty: parse_type(rest.get(1usize)), init: rest.get(2usize), home });
+        } else {
+            fail_text_on(Out::new().put("unknown declaration ").add(str_of(head)).done(), form);
+        }
+        n = n + 1usize;
+    }
+    program
+}
+
+// ---------------------------------------------------------------- writing --
+//
+// `write_program` is the inverse of `parse_program`: one top-level form per declaration, and in a
+// function one block header, clause, instruction or terminator per line. Every part has one
+// spelling, so equal programs are written as equal text.
+
+fn cannot(what: Text) -> ! {
+    fail(Out::new().put("cannot write ").add(what).put(" as KURS").done())
+}
+
+// `t` as a string literal.
+fn write_string(t: Text) -> Text {
+    let out = Out::new().byte(b'"');
+    var i = 0usize;
+    while i < t.len {
+        let c = t.byte(i);
+        let unit = if c == b'\n' {
+            out.put("\\n")
+        } else if c == b'\t' {
+            out.put("\\t")
+        } else if c == b'\r' {
+            out.put("\\r")
+        } else if c == b'\\' || c == b'"' {
+            out.byte(b'\\').byte(c)
+        } else if c < 32u8 || c == 127u8 {
+            hex_escape(out, c)
+        } else {
+            out.byte(c)
+        };
+        i = i + 1usize;
+    }
+    out.byte(b'"').done()
+}
+
+// `t` as an atom, or as a string literal when it is not a single word.
+fn write_atom(t: Text) -> Text {
+    var word = t.len > 0usize;
+    var i = 0usize;
+    while word && i < t.len {
+        let c = t.byte(i);
+        word = !(c <= 32u8 || c == b'(' || c == b')' || c == b';' || c == b'"' || c == 127u8);
+        i = i + 1usize;
+    }
+    if word { t } else { write_string(t) }
+}
+
+fn form_text(parts: Seq[Text]) -> Text {
+    let out = Out::new().byte(b'(');
+    var i = 0usize;
+    while i < parts.len() {
+        if i > 0usize {
+            let unit = out.byte(b' ');
+        }
+        let unit = out.add(parts.get(i));
+        i = i + 1usize;
+    }
+    out.byte(b')').done()
+}
+
+// `(head part*)`
+fn headed(head: Slice[u8, 'static], parts: Seq[Text]) -> Text {
+    let all = Seq::one(text(head));
+    all.append(parts);
+    form_text(all)
+}
+
+fn write_form(form: Form) -> Text {
+    match form.kind {
+        FormKind::List => {
+            let parts: Seq[Text] = Seq::new();
+            var i = 0usize;
+            while i < form.len() {
+                parts.push(write_form(form.at(i)));
+                i = i + 1usize;
+            }
+            form_text(parts)
+        },
+        FormKind::Str => write_string(form.text),
+        FormKind::Atom => write_atom(form.text),
+    }
+}
+
+fn write_types(types: Seq[Type]) -> Seq[Text] {
+    let out: Seq[Text] = Seq::new();
+    var i = 0usize;
+    while i < types.len() {
+        out.push(write_type(types.get(i)));
+        i = i + 1usize;
+    }
+    out
+}
+
+fn atoms(names: Seq[Text]) -> Seq[Text] {
+    let out: Seq[Text] = Seq::new();
+    var i = 0usize;
+    while i < names.len() {
+        out.push(write_atom(names.get(i)));
+        i = i + 1usize;
+    }
+    out
+}
+
+fn brand_atom(label: Text) -> Text {
+    write_atom(text("$").concat(label))
+}
+
+fn write_type(ty: Type) -> Text {
+    match ty {
+        Type::Ignored => text("_"),
+        Type::Never => text("!"),
+        Type::Skolem(label) => brand_atom(label),
+        Type::Prim(name) => name,
+        Type::Named(name, args) => if args.is_empty() {
+            write_atom(name)
+        } else {
+            let parts = Seq::one(write_atom(name));
+            parts.append(write_types(args));
+            form_text(parts)
+        },
+        Type::Struct(fields) => headed("struct", members(fields)),
+        Type::Enum(variants) => headed("enum", members(variants)),
+        Type::Tuple(elems) => headed("tuple", write_types(elems)),
+        Type::Array(elem, length) => headed("array", Seq::two(write_type(elem.get()), Out::new().u64(length).done())),
+        Type::Ptr(inner) => headed("builtin::Pointer", Seq::one(write_type(inner.get()))),
+        Type::Brand(brand) => match brand.get() {
+            Type::Skolem(label) => headed("builtin::Brand", Seq::one(brand_atom(label))),
+            _ => cannot(text("a brand witness type of a brand that is not a variable")),
+        },
+        Type::Exists(binders, body) => headed("exists", Seq::two(brands_text(binders), write_type(body.get()))),
+        Type::Foreach(f) => write_foreach(f),
+        Type::Fn(f) => {
+            let parts: Seq[Text] = Seq::one(text("builtin::Fn"));
+            if f.is_unsafe {
+                parts.push(text("(unsafe)"));
+            }
+            if f.quantified.len() > 0usize {
+                parts.push(Out::new().put("(").add(write_forall(f.quantified, Seq::new())).put(" ").add(write_type(f.ret.get()))
+                    .put(" ").add(write_ptypes(f.params, f.places)).put(")").done());
+            } else {
+                parts.push(write_ptypes(f.params, f.places));
+                parts.push(write_type(f.ret.get()));
+            }
+            form_text(parts)
+        },
+        Type::Meta(m) => cannot(text("an inference variable")),
+    }
+}
+
+fn write_foreach(f: ForeachType) -> Text {
+    let pattern = if f.indirect { headed("builtin::Pointer", Seq::one(write_atom(f.binder))) } else { write_atom(f.binder) };
+    let parts = Seq::one(text("foreach"));
+    parts.push(form_text(Seq::two(pattern, write_type(f.source.get()))));
+    parts.push(write_type(f.body.get()));
+    let inferred: Seq[Text] = Seq::new();
+    let unit = match f.source.get() {
+        Type::Foreach(s) => {
+            inferred.push(s.binder);
+            inferred.append(s.retained);
+        },
+        _ => (),
+    };
+    if !f.retained.same(inferred) {
+        parts.push(headed("retain", atoms(f.retained)));
+    }
+    form_text(parts)
+}
+
+fn brands_text(labels: Seq[Text]) -> Text {
+    let parts: Seq[Text] = Seq::new();
+    var i = 0usize;
+    while i < labels.len() {
+        parts.push(brand_atom(labels.get(i)));
+        i = i + 1usize;
+    }
+    form_text(parts)
+}
+
+// `(name TYPE)` for each field or variant.
+fn members(ms: Seq[Member]) -> Seq[Text] {
+    let out: Seq[Text] = Seq::new();
+    var i = 0usize;
+    while i < ms.len() {
+        out.push(form_text(Seq::two(write_atom(ms.get(i).name), write_type(ms.get(i).type))));
+        i = i + 1usize;
+    }
+    out
+}
+
+// `(name TYPE)` for each parameter or local.
+fn bindings(bs: Seq[Binding]) -> Seq[Text] {
+    let out: Seq[Text] = Seq::new();
+    var i = 0usize;
+    while i < bs.len() {
+        out.push(form_text(Seq::two(write_atom(bs.get(i).name), write_type(bs.get(i).type))));
+        i = i + 1usize;
+    }
+    out
+}
+
+fn write_ptypes(ptypes: Seq[Type], places: Seq[usize]) -> Text {
+    let parts: Seq[Text] = Seq::new();
+    var i = 0usize;
+    while i < ptypes.len() {
+        let t = write_type(ptypes.get(i));
+        parts.push(if places.has(i) { form_text(Seq::two(text("&"), t)) } else { t });
+        i = i + 1usize;
+    }
+    form_text(parts)
+}
+
+// `forall (PARAM*) (PREMISE*)`, the start of a forall form; a Copy parameter has a `(Copy T)` premise.
+fn write_forall(params: Seq[Param], premises: Seq[Premise]) -> Text {
+    let names: Seq[Text] = Seq::new();
+    let bounds: Seq[Text] = Seq::new();
+    var i = 0usize;
+    while i < params.len() {
+        let p = params.get(i);
+        let unit = match p.kind {
+            Kind::Brand => names.push(brand_atom(p.name)),
+            Kind::Copy => {
+                names.push(write_atom(p.name));
+                bounds.push(form_text(Seq::two(text("Copy"), write_atom(p.name))));
+            },
+            Kind::Any => names.push(write_atom(p.name)),
+        };
+        i = i + 1usize;
+    }
+    i = 0usize;
+    while i < premises.len() {
+        let parts = Seq::one(write_atom(premises.get(i).trait_name));
+        parts.append(write_types(premises.get(i).args));
+        bounds.push(form_text(parts));
+        i = i + 1usize;
+    }
+    Out::new().put("forall ").add(form_text(names)).put(" ").add(form_text(bounds)).done()
+}
+
+// `name` or `(name T*)`: a callee, mapper, function-value name or edge target.
+fn applied_text(name: Text, tys: Seq[Type]) -> Text {
+    if tys.is_empty() {
+        write_atom(name)
+    } else {
+        let parts = Seq::one(write_atom(name));
+        parts.append(write_types(tys));
+        form_text(parts)
+    }
+}
+
+fn write_edge(edge: Edge) -> Seq[Text] {
+    let parts = Seq::one(applied_text(edge.target, edge.tys));
+    parts.append(atoms(edge.args));
+    parts
+}
+
+fn write_term(term: Terminator) -> Text {
+    match term {
+        Terminator::Ret(value, pos) => headed("ret", Seq::one(write_atom(value))),
+        Terminator::Unreachable(pos) => text("(unreachable)"),
+        Terminator::Jmp(edge, pos) => headed("jmp", write_edge(edge)),
+        Terminator::Jnz(cond, then, other, pos) => {
+            let parts = Seq::two(write_atom(cond), form_text(write_edge(then)));
+            parts.push(form_text(write_edge(other)));
+            headed("jnz", parts)
+        },
+        Terminator::Switch(scrutinee, ty, arms, pos) => {
+            let parts = Seq::two(write_atom(scrutinee), write_type(ty));
+            var i = 0usize;
+            while i < arms.len() {
+                let arm = arms.get(i);
+                let edge = Seq::one(write_atom(arm.variant));
+                edge.append(write_edge(arm.edge));
+                parts.push(form_text(edge));
+                i = i + 1usize;
+            }
+            headed("switch", parts)
+        },
+    }
+}
+
+fn type_operand(instr: Instr) -> Text {
+    match instr.ty {
+        Option::Some(t) => write_type(t),
+        Option::None => cannot(instr.op.concat(text(" without a type operand"))),
+    }
+}
+
+fn literal(instr: Instr) -> Text {
+    match instr.lit {
+        Option::Some(l) => write_atom(l),
+        Option::None => cannot(instr.op.concat(text(" without a literal"))),
+    }
+}
+
+fn write_instr(instr: Instr) -> Text {
+    let op = instr.op;
+    let args = atoms(instr.args);
+    let operation = Seq::one(op);
+    if op.is("const") {
+        operation.push(type_operand(instr));
+        operation.push(literal(instr));
+    } else if op.is("construct") {
+        operation.push(type_operand(instr));
+        operation.append(args);
+    } else if op.is("destruct") || op.is("variant_tag") || op.is("builtin::unsafe::cast") || op.is("builtin::int_cast") {
+        operation.push(args.get(0usize));
+        operation.push(type_operand(instr));
+    } else if op.is("construct_variant") {
+        operation.push(type_operand(instr));
+        operation.push(literal(instr));
+        operation.push(args.get(0usize));
+    } else if op.is("alloca") || op.is("builtin::sizeof") {
+        operation.push(type_operand(instr));
+    } else if op.is("pack") {
+        operation.push(type_operand(instr));
+        operation.push(form_text(write_types(instr.tys)));
+        operation.push(args.get(0usize));
+    } else if op.is("open") {
+        operation.push(args.get(0usize));
+        operation.push(brands_text(instr.binders));
+    } else if op.is("call") || op.is("fn") {
+        operation.push(applied_text(instr.args.get(0usize), instr.tys));
+        operation.append(args.from(1usize));
+    } else if op.is("foreach") {
+        operation.push(type_operand(instr));
+        operation.push(args.get(0usize));
+        operation.push(applied_text(instr.args.get(1usize), instr.tys));
+        operation.append(args.from(2usize));
+    } else if op.is("trait_call") {
+        operation.push(args.get(0usize));
+        operation.push(args.get(1usize));
+        operation.push(form_text(write_types(instr.tys)));
+        operation.append(args.from(2usize));
+    } else if op.starts_with(text("builtin::unsafe::atomic_")) {
+        operation.push(literal(instr));
+        operation.append(args);
+    } else {
+        operation.append(args);
+    }
+    let lhs = if instr.lhs.len() == 1usize { write_atom(instr.lhs.get(0usize)) } else { form_text(atoms(instr.lhs)) };
+    let t = headed("=", Seq::two(lhs, form_text(operation)));
+    if instr.is_unsafe { headed("unsafe", Seq::one(t)) } else { t }
+}
+
+// Appends `suffix` to the last line.
+fn close(lines: Seq[Text], suffix: Slice[u8, 'static]) {
+    lines.set(lines.len() - 1usize, lines.last().concat(text(suffix)));
+}
+
+fn indented(indent: Text, line: Text) -> Text {
+    indent.concat(line)
+}
+
+// The block's lines: its header, then its clauses, instructions and terminator, indented further.
+fn write_block(block: Block, indent: Text) -> Seq[Text] {
+    let header = Seq::one(write_atom(block.label));
+    if !block.brands.is_empty() {
+        header.push(brands_text(block.brands));
+    }
+    header.push(form_text(bindings(block.params)));
+    let inner = indent.concat(text("  "));
+    let lines = Seq::one(indent.concat(text("(")).concat(join(header)));
+    if !block.empty.is_empty() {
+        lines.push(indented(inner, headed("empty", atoms(block.empty))));
+    }
+    var i = 0usize;
+    while i < block.known.len() {
+        let k = block.known.get(i);
+        lines.push(indented(inner, headed("known", Seq::two(write_atom(k.path), write_atom(k.variant)))));
+        i = i + 1usize;
+    }
+    i = 0usize;
+    while i < block.opened.len() {
+        let o = block.opened.get(i);
+        lines.push(indented(inner, headed("opened", Seq::two(write_atom(o.path), brands_text(o.brands)))));
+        i = i + 1usize;
+    }
+    i = 0usize;
+    while i < block.instrs.len() {
+        lines.push(indented(inner, write_instr(block.instrs.get(i))));
+        i = i + 1usize;
+    }
+    lines.push(indented(inner, write_term(block.term)));
+    close(lines, ")");
+    lines
+}
+
+// The parts, separated by spaces.
+fn join(parts: Seq[Text]) -> Text {
+    let out = Out::new();
+    var i = 0usize;
+    while i < parts.len() {
+        if i > 0usize {
+            let unit = out.byte(b' ');
+        }
+        let unit = out.add(parts.get(i));
+        i = i + 1usize;
+    }
+    out.done()
+}
+
+// `(HEAD... NAME RET (PTYPES) (locals ...)? BLOCK+)`, forall-wrapped from RET on when generic.
+fn write_fun(fun: Fun, head: Seq[Text], indent: Text) -> Seq[Text] {
+    let generic = !fun.params.is_empty() || !fun.premises.is_empty();
+    let first = head.copy();
+    first.push(write_atom(fun.name));
+    if generic {
+        first.push(text("(").concat(write_forall(fun.params, fun.premises)));
+    }
+    first.push(write_type(fun.ret));
+    first.push(form_text(write_types(fun.ptypes)));
+    let lines = Seq::one(indent.concat(text("(")).concat(join(first)));
+    let inner = indent.concat(text("  "));
+    if !fun.locals.is_empty() {
+        lines.push(indented(inner, headed("locals", bindings(fun.locals))));
+    }
+    var i = 0usize;
+    while i < fun.blocks.len() {
+        lines.append(write_block(fun.blocks.get(i), inner));
+        i = i + 1usize;
+    }
+    close(lines, if generic { "))" } else { ")" });
+    lines
+}
+
+fn write_module(home: ModuleId) -> Text {
+    let parts = Seq::two(text("module"), Out::new().usize(home.package).done());
+    parts.append(atoms(home.path));
+    form_text(parts)
+}
+
+// The `(in MODULE POLICY?)` clause, if the declaration has a module.
+fn in_clause(home: Option[ModuleId], policy: Option[Text]) -> Seq[Text] {
+    match home {
+        Option::None => Seq::new(),
+        Option::Some(m) => {
+            let parts = Seq::two(text("in"), write_module(m));
+            let unit = match policy {
+                Option::Some(p) => parts.push(p),
+                Option::None => (),
+            };
+            Seq::one(form_text(parts))
+        },
+    }
+}
+
+// A function's `(unsafe)` or `(in MODULE unsafe?)` clause.
+fn fun_clause(home: Option[ModuleId], is_unsafe: bool) -> Seq[Text] {
+    match home {
+        Option::None => if is_unsafe { Seq::one(text("(unsafe)")) } else { Seq::new() },
+        Option::Some(m) => in_clause(home, if is_unsafe { Option::Some.(text("unsafe")) } else { Option::None }),
+    }
+}
+
+fn same_module(a: Option[ModuleId], b: Option[ModuleId]) -> bool {
+    match a {
+        Option::None => b.is_none(),
+        Option::Some(x) => match b {
+            Option::Some(y) => x.package == y.package && x.path.same(y.path),
+            Option::None => false,
+        },
+    }
+}
+
+fn write_type_decl(decl: TypeDecl) -> Text {
+    var policy = Option::None;
+    let unit = match decl.exposure {
+        Option::Some(e) => {
+            let owner = match e.mode {
+                ExposureMode::Owner => true,
+                ExposureMode::Within => false,
+            };
+            if decl.home.is_none() || owner && !same_module(Option::Some.(e.home), decl.home) {
+                cannot(text("the exposure of ").concat(decl.name));
+            }
+            policy = Option::Some.(if owner { text("abstract") } else { headed("exposed", Seq::one(write_module(e.home))) });
+        },
+        Option::None => (),
+    };
+    var body = write_type(decl.body);
+    if !decl.params.is_empty() || !decl.premises.is_empty() {
+        body = Out::new().put("(").add(write_forall(decl.params, decl.premises)).put(" ").add(body).put(")").done();
+    }
+    let name = if decl.linear { decl.name.concat(text("!")) } else { decl.name };
+    let parts = in_clause(decl.home, policy);
+    parts.push(write_atom(name));
+    parts.push(body);
+    headed("type", parts)
+}
+
+fn write_extern(ext: Extern) -> Text {
+    let ret = match ext.ret {
+        Option::Some(t) => write_type(t),
+        Option::None => cannot(Out::new().put("the extern ").add(ext.name).put(" without a type").done()),
+    };
+    match ext.ptypes {
+        Option::None => {
+            let parts = Seq::two(text("value"), write_atom(ext.name));
+            parts.push(ret);
+            headed("extern", parts)
+        },
+        Option::Some(ptypes) => {
+            let parts = Seq::two(text("fun"), write_atom(ext.name));
+            parts.push(ret);
+            parts.push(form_text(write_types(ptypes)));
+            headed("extern", parts)
+        },
+    }
+}
+
+fn write_data(data: Data) -> Text {
+    let parts = in_clause(data.home, Option::None);
+    parts.push(write_atom(data.name));
+    parts.push(write_type(data.ty));
+    parts.push(write_form(data.init));
+    headed("data", parts)
+}
+
+fn write_trait(tr: Trait) -> Seq[Text] {
+    let params: Seq[Text] = Seq::new();
+    var i = 0usize;
+    while i < tr.params.len() {
+        let kind = if tr.param_kinds.is_empty() { Kind::Any } else { tr.param_kinds.get(i) };
+        let unit = match kind {
+            Kind::Brand => params.push(brand_atom(tr.params.get(i))),
+            Kind::Copy => cannot(text("the Copy parameter of trait ").concat(tr.name)),
+            Kind::Any => params.push(write_atom(tr.params.get(i))),
+        };
+        i = i + 1usize;
+    }
+    let first = Seq::one(text("trait"));
+    first.append(in_clause(tr.home, Option::None));
+    first.push(write_atom(tr.name));
+    first.push(form_text(params));
+    let lines = Seq::one(text("(").concat(join(first)));
+    i = 0usize;
+    while i < tr.methods.len() {
+        let m = tr.methods.get(i);
+        let parts: Seq[Text] = Seq::new();
+        if m.is_unsafe {
+            parts.push(text("(unsafe)"));
+        }
+        parts.push(write_atom(m.name));
+        parts.push(write_type(m.ret));
+        parts.push(write_ptypes(m.ptypes, m.places));
+        lines.push(text("  ").concat(form_text(parts)));
+        i = i + 1usize;
+    }
+    close(lines, ")");
+    lines
+}
+
+fn write_instance(inst: Instance) -> Seq[Text] {
+    var head = form_text(write_types(inst.head));
+    if !inst.params.is_empty() || !inst.premises.is_empty() {
+        head = Out::new().put("(").add(write_forall(inst.params, inst.premises)).put(" ").add(head).put(")").done();
+    }
+    let first = Seq::one(text("instance"));
+    first.append(in_clause(inst.home, Option::None));
+    first.push(write_atom(inst.trait_name));
+    first.push(head);
+    let lines = Seq::one(text("(").concat(join(first)));
+    var i = 0usize;
+    while i < inst.methods.len() {
+        let method = inst.methods.get(i);
+        if !same_module(method.home, inst.home) {
+            cannot(Out::new().put("the method ").add(method.name).put(" of an instance of ").add(inst.trait_name).put(" from another module").done());
+        }
+        let method_head = Seq::one(text("fun"));
+        if method.is_unsafe {
+            method_head.push(text("(unsafe)"));
+        }
+        lines.append(write_fun(method, method_head, text("  ")));
+        i = i + 1usize;
+    }
+    close(lines, ")");
+    lines
+}
+
+// The program as KURS text that `parse_program` reads back into the same program.
+fn write_program(program: Program) -> Text {
+    let lines: Seq[Text] = Seq::new();
+    let types = program.types.values();
+    var i = 0usize;
+    while i < types.len() {
+        lines.push(write_type_decl(types.get(i)));
+        i = i + 1usize;
+    }
+    let funs = program.funs.values();
+    i = 0usize;
+    while i < funs.len() {
+        let fun = funs.get(i);
+        let head = Seq::one(text("fun"));
+        head.append(fun_clause(fun.home, fun.is_unsafe));
+        lines.append(write_fun(fun, head, text("")));
+        i = i + 1usize;
+    }
+    let externs = program.externs.values();
+    i = 0usize;
+    while i < externs.len() {
+        lines.push(write_extern(externs.get(i)));
+        i = i + 1usize;
+    }
+    let datas = program.datas.values();
+    i = 0usize;
+    while i < datas.len() {
+        lines.push(write_data(datas.get(i)));
+        i = i + 1usize;
+    }
+    let traits = program.traits.values();
+    i = 0usize;
+    while i < traits.len() {
+        lines.append(write_trait(traits.get(i)));
+        i = i + 1usize;
+    }
+    let instances = program.instances.values();
+    i = 0usize;
+    while i < instances.len() {
+        var j = 0usize;
+        while j < instances.get(i).len() {
+            lines.append(write_instance(instances.get(i).get(j)));
+            j = j + 1usize;
+        }
+        i = i + 1usize;
+    }
+    let out = Out::new();
+    i = 0usize;
+    while i < lines.len() {
+        let unit = out.add(lines.get(i)).byte(b'\n');
+        i = i + 1usize;
+    }
+    out.done()
+}

@@ -121,7 +121,7 @@ def build_compiler() -> Path:
 
 
 def dump(node: object) -> str:
-    """The canonical text of a syntax tree, as compiler/dump.kur writes it."""
+    """The canonical text of a syntax tree, as compiler/syntax/dump.kur writes it."""
     if node is None:
         return "_"
     if isinstance(node, bool):
@@ -200,7 +200,7 @@ def ref_text(ref: S.NameRef) -> str:
 
 
 def ref_lines(node: object, out: list[str]) -> None:
-    """The references in `node`, in the order of its dataclass fields, as compiler/resolved.kur
+    """The references in `node`, in the order of its dataclass fields, as compiler/resolve/dump.kur
     writes them. A declaration's `forall`, when it is not a field, comes last."""
     if isinstance(node, (list, tuple)):
         for child in node:
@@ -225,7 +225,7 @@ def ref_lines(node: object, out: list[str]) -> None:
 
 
 def resolve_dump(resolver: Resolver) -> str:
-    """The canonical text of a resolved program, as compiler/resolved.kur writes it."""
+    """The canonical text of a resolved program, as compiler/resolve/dump.kur writes it."""
     out = []
     for package in resolver.packages:
         out.append(f"package {package.id} {package.name}")
@@ -280,7 +280,7 @@ def const_text(value: ConstValue) -> str:
 
 
 def signatures_dump(sigs: Signatures) -> str:
-    """The canonical text of a program's signatures, as compiler/sigdump.kur writes it."""
+    """The canonical text of a program's signatures, as compiler/sigs/dump.kur writes it."""
     out = [f"type {write_type_decl(decl)}" for decl in sigs.types.values()]
     for trait in sigs.traits.values():
         params, kinds = _form([write_atom(p) for p in trait.params]), _form(list(trait.param_kinds))
@@ -364,7 +364,7 @@ def position(node: object) -> str:
 
 
 def inferred_line(tag: str, node: object, positioned: bool = True) -> str:
-    """One node's line, as compiler/inferdump.kur writes it: tag, position, type and annotations."""
+    """One node's line, as compiler/infer/dump.kur writes it: tag, position, type and annotations."""
     parts = [tag, *([position(node)] if positioned else []), inferred_type(node.ty) if hasattr(node, "ty") else "-"]
     binder = getattr(node, "name_id" if isinstance(node, S.Foreach) else "binder", None)
     if isinstance(binder, int):
@@ -402,7 +402,7 @@ def inferred_line(tag: str, node: object, positioned: bool = True) -> str:
     return "  " + " ".join(parts)
 
 
-# Each syntax node with a body's tag, and its children in the order compiler/inferdump.kur walks them.
+# Each syntax node with a body's tag, and its children in the order compiler/infer/dump.kur walks them.
 WALKED = {
     S.Block: ("block", lambda n: (*n.stmts, n.tail)), S.Lit: ("lit", lambda n: ()),
     S.FStr: ("fstr", lambda n: n.parts), S.Path: ("path", lambda n: ()), S.Tuple: ("tuple", lambda n: n.elems),
@@ -425,7 +425,7 @@ PATTERNS = {
 
 
 def inferred_body(node: object, out: list[str]) -> None:
-    """The lines of a body's nodes, in syntax order, as compiler/inferdump.kur walks them."""
+    """The lines of a body's nodes, in syntax order, as compiler/infer/dump.kur walks them."""
     def walk(children: Sequence[object]) -> None:
         for child in children:
             if child is not None and not isinstance(child, str):
@@ -452,7 +452,7 @@ def inferred_body(node: object, out: list[str]) -> None:
 
 
 def inference_dump(sigs: Signatures) -> str:
-    """The canonical text of what inference found, as compiler/inferdump.kur writes it."""
+    """The canonical text of what inference found, as compiler/infer/dump.kur writes it."""
     out: list[str] = []
 
     def function(name: str, node: S.Fn) -> None:
@@ -997,7 +997,7 @@ def core_cases() -> list[dict[str, Optional[str]]]:
     return cached("core", digest_of(sources), make)
 
 
-# Cases for `kursal selftest-types`; compiler/selftest.kur describes their forms.
+# Cases for `kursal selftest-types`; compiler/types/selftest.kur describes their forms.
 TYPE_CASES = (
     # show
     "(show (tuple))",

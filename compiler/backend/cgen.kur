@@ -1,0 +1,1985 @@
+// Checked KURS to C, by the canonical profile: no optimization, one C local per SSA definition,
+// places as fixed C objects, parallel edge assignment.
+//
+// Generic functions are specialized on demand by logical type arguments. Representation erasure is
+// separate from code-specialization identity.
+
+use package::support::base::{Cell, Key, Map, Out, Seq, Set, Text, text};
+use package::check::checker::{Checker, FunKey};
+use package::kurs::core::{Arm, Block, Data, Edge, Fun, ForeachType, Instr, Member, Param, Program, Terminator, Type};
+use package::kurs::core as C;
+use package::backend::mangle::{decode_segment, encode, mangle, path_segments, type_key};
+use package::kurs::sexpr::Form;
+use package::syntax::ast::{Pos, no_pos};
+use package::types::termination::check_mono_termination;
+use package::types::ops::{Fresh, Row, Types, equal, foreach_binders, kurs_error, map_children, subst, subst_foreach};
+use std::option::Option;
+use std::slice::Slice;
+
+fn prelude() -> Text {
+    Out::new()
+        .put("#include <stddef.h>\n")
+        .put("#include <stdint.h>\n")
+        .put("typedef struct { unsigned char dummy; } KurUnit;\n")
+        .put("#define KUR_TRAP() __builtin_trap()\n")
+        .put("/* A component's address by integer arithmetic: projection never dereferences, so it is defined for any\n")
+        .put("   pointer value, null and dangling included. The `__typeof__` operands are not evaluated. */\n")
+        .put("#define KUR_FIELD(p, m) ((__typeof__(&(p)->m))((uintptr_t)(p) + offsetof(__typeof__(*(p)), m)))\n")
+        .put("static inline int8_t kur_dec_i8(uint64_t b) { b &= 0xFF; return b < 0x80 ? (int8_t)b : (int8_t)((int64_t)b - 0x100); }\n")
+        .put("static inline int16_t kur_dec_i16(uint64_t b) { b &= 0xFFFF; return b < 0x8000 ? (int16_t)b : (int16_t)((int64_t)b - 0x10000); }\n")
+        .put("static inline int32_t kur_dec_i32(uint64_t b) { b &= 0xFFFFFFFF; return b < 0x80000000 ? (int32_t)b : (int32_t)((int64_t)b - 0x100000000); }\n")
+        .put("static inline int64_t kur_dec_i64(uint64_t b) { return b <= (uint64_t)INT64_MAX ? (int64_t)b : -INT64_C(1) - (int64_t)(UINT64_MAX - b); }\n")
+        .done()
+}
+
+fn c_prim(name: Text) -> Text {
+    if name.is("bool") {
+        text("_Bool")
+    } else if name.is("f32") {
+        text("float")
+    } else if name.is("f64") {
+        text("double")
+    } else if name.is("usize") {
+        text("uint64_t")
+    } else if name.is("isize") {
+        text("int64_t")
+    } else if name.byte(0usize) == b'u' {
+        Out::new().put("uint").add(name.from(1usize)).put("_t").done()
+    } else {
+        Out::new().put("int").add(name.from(1usize)).put("_t").done()
+    }
+}
+
+// The width of a signed integer type, or 0 for any other.
+fn signed_bits(name: Text) -> u32 {
+    if name.byte(0usize) == b'i' { C::integer_bits(name) } else { 0u32 }
+}
+
+fn c_order(order: Text) -> Text {
+    let out = Out::new().put("__ATOMIC_");
+    var i = 0usize;
+    while i < order.len {
+        let b = order.byte(i);
+        let unit = out.byte(if b >= b'a' && b <= b'z' { b - 32u8 } else { b });
+        i = i + 1usize;
+    }
+    out.done()
+}
+
+fn c_op(op: Text) -> Text {
+    if op.is("add") {
+        text("+")
+    } else if op.is("sub") {
+        text("-")
+    } else if op.is("mul") {
+        text("*")
+    } else if op.is("div") {
+        text("/")
+    } else if op.is("mod") {
+        text("%")
+    } else if op.is("bit_and") {
+        text("&")
+    } else if op.is("bit_or") {
+        text("|")
+    } else if op.is("bit_xor") {
+        text("^")
+    } else if op.is("eq") {
+        text("==")
+    } else if op.is("ne") {
+        text("!=")
+    } else if op.is("lt") {
+        text("<")
+    } else if op.is("le") {
+        text("<=")
+    } else if op.is("gt") {
+        text(">")
+    } else {
+        text(">=")
+    }
+}
+
+fn is_c_op(op: Text) -> bool {
+    op.is("add") || op.is("sub") || op.is("mul") || op.is("div") || op.is("mod") || op.is("bit_and") || op.is("bit_or")
+        || op.is("bit_xor") || op.is("eq") || op.is("ne") || op.is("lt") || op.is("le") || op.is("gt") || op.is("ge")
+}
+
+fn add_words(set: Set[Text], words: Slice[u8, 'static]) {
+    let all = text(words).split(text(" "));
+    var i = 0usize;
+    while i < all.len() {
+        set.add(all.get(i));
+        i = i + 1usize;
+    }
+}
+
+fn c_keywords() -> Set[Text] {
+    let out: Set[Text] = Set::new();
+    add_words(out, "auto break case char const continue default do double else enum extern float for goto if");
+    add_words(out, "inline int long register restrict return short signed sizeof static struct switch typedef");
+    add_words(out, "union unsigned void volatile while _Alignas _Alignof _Atomic _Bool _Complex _Generic");
+    add_words(out, "_Imaginary _Noreturn _Static_assert _Thread_local");
+    out
+}
+
+fn runtime_names() -> Set[Text] {
+    let out: Set[Text] = Set::new();
+    add_words(out, "KurUnit KUR_TRAP kur_dec_i8 kur_dec_i16 kur_dec_i32 kur_dec_i64");
+    add_words(out, "SIZE_MAX PTRDIFF_MIN PTRDIFF_MAX SIG_ATOMIC_MIN SIG_ATOMIC_MAX WCHAR_MIN WCHAR_MAX WINT_MIN WINT_MAX");
+    add_words(out, "__ATOMIC_RELAXED __ATOMIC_ACQUIRE __ATOMIC_RELEASE __ATOMIC_ACQ_REL __ATOMIC_SEQ_CST");
+    let stems = text("8 16 32 64 _LEAST8 _LEAST16 _LEAST32 _LEAST64 _FAST8 _FAST16 _FAST32 _FAST64 PTR MAX").split(text(" "));
+    let suffixes = text("MIN MAX C WIDTH").split(text(" "));
+    var i = 0usize;
+    while i < stems.len() {
+        let stem = stems.get(i);
+        var u = 0usize;
+        while u < 2usize {
+            let unsigned = if u == 1usize { text("U") } else { text("") };
+            out.add(Out::new().add(lower(unsigned)).put("int").add(lower(stem)).put("_t").done());
+            var s = 0usize;
+            while s < suffixes.len() {
+                out.add(Out::new().add(unsigned).put("INT").add(stem).put("_").add(suffixes.get(s)).done());
+                s = s + 1usize;
+            }
+            u = u + 1usize;
+        }
+        i = i + 1usize;
+    }
+    out
+}
+
+fn lower(t: Text) -> Text {
+    let out = Out::new();
+    var i = 0usize;
+    while i < t.len {
+        let b = t.byte(i);
+        let unit = out.byte(if b >= b'A' && b <= b'Z' { b + 32u8 } else { b });
+        i = i + 1usize;
+    }
+    out.done()
+}
+
+fn is_digit(b: u8) -> bool {
+    b >= b'0' && b <= b'9'
+}
+
+fn is_word_byte(b: u8) -> bool {
+    is_digit(b) || b >= b'A' && b <= b'Z' || b >= b'a' && b <= b'z' || b == b'_'
+}
+
+// The identifiers taken in one namespace. Many functions spell their locals alike, so for each
+// base `last` remembers the highest numbered spelling `allocate` has tried: names are never
+// released, so every lower number is still taken, and the search resumes after it.
+exposed struct Pool {
+    taken: Set[Text],
+    last: Map[Text, usize],
+}
+
+impl Pool {
+    fn new(taken: Set[Text]) -> Pool {
+        Pool.{ taken, last: Map::new() }
+    }
+}
+
+// Allocate a C identifier; the readable spelling is only a hint.
+fn allocate(base: Text, pool: Pool) -> Text {
+    let start = if is_digit(base.byte(0usize)) { Out::new().put("k_").add(base).done() } else { base };
+    var name = start;
+    if pool.taken.has(name) {
+        var index = pool.last.get_or(start, 0usize);
+        var going = true;
+        while going {
+            index = index + 1usize;
+            name = Out::new().add(start).put("_").usize(index).done();
+            going = pool.taken.has(name);
+        }
+        pool.last.set(start, index);
+    }
+    pool.taken.add(name);
+    name
+}
+
+// Decode the linker's hex-encoded identity segments, then make a C identifier.
+fn readable(name: Text) -> Text {
+    let joined = Out::new();
+    let pieces = name.split(text("::"));
+    var i = 0usize;
+    while i < pieces.len() {
+        if i > 0usize {
+            let unit = joined.put("_");
+        }
+        let unit = joined.add(match decode_segment(pieces.get(i)) {
+            Option::Some(bytes) => bytes,
+            Option::None => pieces.get(i),
+        });
+        i = i + 1usize;
+    }
+    // Every character outside [A-Za-z0-9_] becomes one `_`; the text is UTF-8, so a character's
+    // continuation bytes add nothing.
+    let all = joined.done();
+    let out = Out::new();
+    var j = 0usize;
+    while j < all.len {
+        let b = all.byte(j);
+        if is_word_byte(b) {
+            let unit = out.byte(b);
+        } else if (b & 192u8) != 128u8 {
+            let unit = out.put("_");
+        }
+        j = j + 1usize;
+    }
+    let made = out.done();
+    var start = 0usize;
+    var end = made.len;
+    while start < end && made.byte(start) == b'_' {
+        start = start + 1usize;
+    }
+    while end > start && made.byte(end - 1usize) == b'_' {
+        end = end - 1usize;
+    }
+    if start == end { text("x") } else { made.slice(start, end) }
+}
+
+// The last `n` characters of ASCII text.
+fn tail(t: Text, n: usize) -> Text {
+    if t.len > n { t.from(t.len - n) } else { t }
+}
+
+// The representation key: brands erased, packages unwrapped, transforms expanded.
+fn erase(ty: Type, types: Types) -> Type {
+    match ty {
+        Type::Skolem(_label) => Type::Skolem.(text("_")),
+        Type::Brand(_brand) => C::unit(),
+        Type::Exists(_binders, body) => erase(body.get(), types),
+        Type::Foreach(f) => erase(types.expand(f, Option::None), types),
+        Type::Fn(f) => {
+            let params: Seq[Type] = Seq::new();
+            var i = 0usize;
+            while i < f.params.len() {
+                params.push(erase(f.params.get(i), types));
+                i = i + 1usize;
+            }
+            C::fn_type(params, erase(f.ret.get(), types), Seq::new(), false, f.places)
+        },
+        _ => map_children(ty, |child: Type| erase(child, types)),
+    }
+}
+
+fn is_never(t: Type) -> bool {
+    match t {
+        Type::Never => true,
+        _ => false,
+    }
+}
+
+fn is_ptr(t: Type) -> bool {
+    match t {
+        Type::Ptr(_inner) => true,
+        _ => false,
+    }
+}
+
+fn is_foreach(t: Type) -> bool {
+    match t {
+        Type::Foreach(_f) => true,
+        _ => false,
+    }
+}
+
+fn joined(parts: Seq[Text], separator: Slice[u8, 'static]) -> Text {
+    let out = Out::new();
+    var i = 0usize;
+    while i < parts.len() {
+        if i > 0usize {
+            let unit = out.put(separator);
+        }
+        let unit = out.add(parts.get(i));
+        i = i + 1usize;
+    }
+    out.done()
+}
+
+fn or_void(t: Text) -> Text {
+    if t.is_empty() { text("void") } else { t }
+}
+
+// A C identifier: `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_c_identifier(t: Text) -> bool {
+    if t.is_empty() || is_digit(t.byte(0usize)) {
+        return false;
+    }
+    var i = 0usize;
+    while i < t.len {
+        if !is_word_byte(t.byte(i)) {
+            return false;
+        }
+        i = i + 1usize;
+    }
+    true
+}
+
+// Python's `repr` of a string: quoted, with backslashes, the quote and control characters escaped.
+fn repr(t: Text) -> Text {
+    let quote = if t.contains(text("'")) && !t.contains(text("\"")) { b'"' } else { b'\'' };
+    let out = Out::new().byte(quote);
+    let digits = text("0123456789abcdef");
+    var i = 0usize;
+    while i < t.len {
+        let b = t.byte(i);
+        if b == b'\\' || b == quote {
+            let unit = out.byte(b'\\').byte(b);
+        } else if b == b'\n' {
+            let unit = out.put("\\n");
+        } else if b == b'\r' {
+            let unit = out.put("\\r");
+        } else if b == b'\t' {
+            let unit = out.put("\\t");
+        } else if b < 32u8 || b == 127u8 {
+            let unit = out.put("\\x").byte(digits.byte((b / 16u8) as usize)).byte(digits.byte((b % 16u8) as usize));
+        } else {
+            let unit = out.byte(b);
+        }
+        i = i + 1usize;
+    }
+    out.byte(quote).done()
+}
+
+fn member_names(members: Seq[(Text, Type)]) -> Seq[Text] {
+    let out: Seq[Text] = Seq::new();
+    var i = 0usize;
+    while i < members.len() {
+        let (m, _t) = members.get(i);
+        out.push(m);
+        i = i + 1usize;
+    }
+    out
+}
+
+fn items_access(count: usize) -> Seq[Text] {
+    let out: Seq[Text] = Seq::new();
+    var k = 0usize;
+    while k < count {
+        out.push(Out::new().put("items[").usize(k).put("]").done());
+        k = k + 1usize;
+    }
+    out
+}
+
+exposed struct Backend {
+    program: Program,
+    checker: Checker,
+    counter: Fresh,
+    types: Types,
+    // representation key -> C type name
+    names: Map[Type, Text],
+    // named but not yet defined aggregates
+    pending: Map[Type, Type],
+    forward: Seq[Text],
+    defs: Seq[Text],
+    // specialization key (function, type arguments) -> C symbol
+    symbols: Seq[(FunKey, Seq[Type], Text)],
+    // the same, by structure: an earlier request with these very arguments
+    symbol_index: Map[(FunKey, Seq[Type]), Text],
+    queue: Seq[(FunKey, Fun, Map[Text, Type], Text)],
+    bodies: Seq[Text],
+    protos: Seq[Text],
+    datas: Map[Text, (Text, Data)],
+    // One conservative pool for ordinary identifiers, including function locals: later global
+    // declarations must not be shadowed by earlier locals.
+    taken: Pool,
+    component_names: Map[(Text, Text), Text],
+    component_taken: Pool,
+    foreign_adapters: Map[Text, Text],
+    instance_params: Map[FunKey, Seq[Param]],
+    function_ids: Map[FunKey, (Seq[Text], Text)],
+    // the function being emitted
+    fun: Cell[Option[Fun]],
+    sub: Cell[Map[Text, Type]],
+    locals: Cell[Map[(Text, Text), Text]],
+    lines: Cell[Seq[Text]],
+    scratch: Cell[usize],
+    labels: Cell[Map[Text, Text]],
+    decls: Cell[Seq[Text]],
+    place_c: Cell[Map[Text, Text]],
+    roots: Cell[Map[Text, Type]],
+    typed: Cell[Map[(Text, Text), Type]],
+    blocks: Cell[Map[Text, Block]],
+    label: Cell[Text],
+}
+
+fn fail_at(message: Text, pos: Pos) -> ! {
+    kurs_error(message, pos)
+}
+
+fn fail_text(message: Text) -> ! {
+    kurs_error(message, no_pos())
+}
+
+impl Backend {
+    fn new(program: Program, checker: Checker, counter: Fresh) -> Backend {
+        let taken = c_keywords();
+        let runtime = runtime_names().items();
+        var r = 0usize;
+        while r < runtime.len() {
+            taken.add(runtime.get(r));
+            r = r + 1usize;
+        }
+        taken.add(text("main"));
+        let externs = program.externs.values();
+        var e = 0usize;
+        while e < externs.len() {
+            taken.add(externs.get(e).name);
+            e = e + 1usize;
+        }
+        let function_ids: Map[FunKey, (Seq[Text], Text)] = Map::new();
+        let funs = program.funs.values();
+        var f = 0usize;
+        while f < funs.len() {
+            let name = funs.get(f).name;
+            function_ids.set(FunKey::Function.(name), (path_segments(name), encode(Seq::two(text("function"), name))));
+            f = f + 1usize;
+        }
+        let instance_params: Map[FunKey, Seq[Param]] = Map::new();
+        let groups = program.instances.keys();
+        var g = 0usize;
+        while g < groups.len() {
+            let insts = program.instances.at(groups.get(g));
+            var i = 0usize;
+            while i < insts.len() {
+                let inst = insts.get(i);
+                let scope: Seq[Text] = Seq::new();
+                var p = 0usize;
+                while p < inst.params.len() {
+                    scope.push(inst.params.get(p).name);
+                    p = p + 1usize;
+                }
+                let head_keys: Seq[Text] = Seq::new();
+                var h = 0usize;
+                while h < inst.head.len() {
+                    head_keys.push(type_key(inst.head.get(h), scope));
+                    h = h + 1usize;
+                }
+                let head = encode(head_keys);
+                var m = 0usize;
+                while m < inst.methods.len() {
+                    let fun = inst.methods.get(m);
+                    let key = FunKey::Method.(groups.get(g), i, fun.name);
+                    let params = inst.params.copy();
+                    params.append(fun.params);
+                    instance_params.set(key, params);
+                    let path = path_segments(inst.trait_name);
+                    path.push(text("impl"));
+                    path.append(path_segments(fun.name));
+                    let identity = Seq::two(text("instance"), inst.trait_name);
+                    identity.push(head);
+                    identity.push(fun.name);
+                    function_ids.set(key, (path, encode(identity)));
+                    m = m + 1usize;
+                }
+                i = i + 1usize;
+            }
+            g = g + 1usize;
+        }
+        Backend.{
+            program,
+            checker,
+            counter,
+            types: Types::new(program, counter),
+            names: Map::new(),
+            pending: Map::new(),
+            forward: Seq::new(),
+            defs: Seq::new(),
+            symbols: Seq::new(),
+            symbol_index: Map::new(),
+            queue: Seq::new(),
+            bodies: Seq::new(),
+            protos: Seq::new(),
+            datas: Map::new(),
+            taken: Pool::new(taken),
+            component_names: Map::new(),
+            component_taken: Pool::new(Set::new()),
+            foreign_adapters: Map::new(),
+            instance_params,
+            function_ids,
+            fun: Cell::new(Option::None),
+            sub: Cell::new(Map::new()),
+            locals: Cell::new(Map::new()),
+            lines: Cell::new(Seq::new()),
+            scratch: Cell::new(0usize),
+            labels: Cell::new(Map::new()),
+            decls: Cell::new(Seq::new()),
+            place_c: Cell::new(Map::new()),
+            roots: Cell::new(Map::new()),
+            typed: Cell::new(Map::new()),
+            blocks: Cell::new(Map::new()),
+            label: Cell::new(text("")),
+        }
+    }
+
+    // ------------------------------------------------------------ representations --
+
+    fn fresh_name(self, hint: Text) -> Text {
+        allocate(Out::new().put("K_").add(tail(readable(hint), 48usize)).done(), self.taken)
+    }
+
+    // The C type of `ty`; through a pointer, an aggregate needs only its name.
+    fn ctype(self, ty: Type, defined: bool) -> Text {
+        let ty = erase(ty, self.types);
+        match ty {
+            Type::Prim(name) => {
+                return c_prim(name);
+            },
+            Type::Never => {
+                return text("void");
+            },
+            Type::Ptr(inner) => {
+                let inner = erase(inner.get(), self.types);
+                return if is_never(inner) { text("void*") } else { Out::new().add(self.ctype(inner, false)).put("*").done() };
+            },
+            _ => (),
+        };
+        if !self.names.has(ty) {
+            self.register(ty);
+        }
+        if defined && self.pending.has(ty) {
+            self.define(ty);
+        }
+        self.names.at(ty)
+    }
+
+    fn c(self, ty: Type) -> Text {
+        self.ctype(ty, true)
+    }
+
+    fn register(self, ty: Type) {
+        let s = match ty {
+            Type::Named(_name, _args) => self.types.shape(ty, Option::None),
+            _ => ty,
+        };
+        match s {
+            Type::Tuple(elems) => {
+                if elems.is_empty() {
+                    self.names.set(ty, text("KurUnit"));
+                } else {
+                    self.aggregate(ty, s, text("tuple"));
+                }
+            },
+            Type::Struct(fields) => {
+                if fields.is_empty() {
+                    self.names.set(ty, text("KurUnit"));
+                } else {
+                    self.aggregate(ty, s, text("struct"));
+                }
+            },
+            Type::Array(_elem, _length) => self.aggregate(ty, s, text("array")),
+            Type::Enum(_variants) => self.aggregate(ty, s, text("enum")),
+            Type::Fn(f) => {
+                let name = self.fresh_name(text("fn"));
+                self.names.set(ty, name);
+                // Function declarations may name forward-declared aggregates. Define their
+                // fields after this typedef, which they may use.
+                let ret = f.ret.get();
+                let result = if is_never(ret) { text("void") } else { self.ctype(ret, false) };
+                let params: Seq[Text] = Seq::new();
+                var k = 0usize;
+                while k < f.params.len() {
+                    let ct = self.ctype(f.params.get(k), false);
+                    params.push(if f.places.has(k) { Out::new().add(ct).put("*").done() } else { ct });
+                    k = k + 1usize;
+                }
+                self.defs.push(Out::new().put("typedef ").add(result).put(" (*").add(name).put(")(").add(or_void(joined(params, ", "))).put(");").done());
+            },
+            _ => {
+                let name = self.c(s);
+                self.names.set(ty, name);
+            },
+        };
+    }
+
+    fn aggregate(self, ty: Type, s: Type, kind: Text) {
+        let hint = match ty {
+            Type::Named(name, _args) => name,
+            _ => kind,
+        };
+        let name = self.fresh_name(hint);
+        self.names.set(ty, name);
+        self.forward.push(Out::new().put("typedef struct ").add(name).put(" ").add(name).put(";").done());
+        self.pending.set(ty, s);
+    }
+
+    fn define(self, ty: Type) {
+        let s = self.pending.at(ty);
+        self.pending.remove(ty);
+        let body = match s {
+            Type::Array(elem, length) => {
+                if length != 0u64 {
+                    Out::new().add(self.c(elem.get())).put(" items[").u64(length).put("];").done()
+                } else {
+                    text("unsigned char dummy;")
+                }
+            },
+            Type::Enum(variants) => {
+                let members: Seq[Text] = Seq::new();
+                var i = 0usize;
+                while i < variants.len() {
+                    let ct = self.c(variants.get(i).type);
+                    members.push(Out::new().add(ct).put(" ").add(self.variant(variants.get(i).name)).put(";").done());
+                    i = i + 1usize;
+                }
+                Out::new().put("uint32_t tag; union { ").add(joined(members, " ")).put(" } payload;").done()
+            },
+            _ => {
+                let rows = self.members(s);
+                let parts: Seq[Text] = Seq::new();
+                var i = 0usize;
+                while i < rows.len() {
+                    let (m, f) = rows.get(i);
+                    parts.push(Out::new().add(self.c(f)).put(" ").add(m).put(";").done());
+                    i = i + 1usize;
+                }
+                joined(parts, " ")
+            },
+        };
+        self.defs.push(Out::new().put("struct ").add(self.names.at(ty)).put(" { ").add(body).put(" };").done());
+    }
+
+    // (C member, component type) of a struct or tuple shape, in order.
+    fn members(self, shape: Type) -> Seq[(Text, Type)] {
+        let out: Seq[(Text, Type)] = Seq::new();
+        match shape {
+            Type::Tuple(elems) => {
+                var i = 0usize;
+                while i < elems.len() {
+                    out.push((Out::new().put("e").usize(i).done(), elems.get(i)));
+                    i = i + 1usize;
+                }
+            },
+            Type::Struct(fields) => {
+                var i = 0usize;
+                while i < fields.len() {
+                    out.push((self.component(fields.get(i).name, text("f")), fields.get(i).type));
+                    i = i + 1usize;
+                }
+            },
+            _ => fail_text(text("internal error: members of a type that is not a struct or tuple")),
+        };
+        out
+    }
+
+    fn component(self, name: Text, prefix: Text) -> Text {
+        let key = (prefix, name);
+        if !self.component_names.has(key) {
+            self.component_names.set(key, allocate(Out::new().add(prefix).put("_").add(readable(name)).done(), self.component_taken));
+        }
+        self.component_names.at(key)
+    }
+
+    fn variant(self, name: Text) -> Text {
+        self.component(name, text("v"))
+    }
+
+    fn shape(self, ty: Type) -> Type {
+        self.types.shape(erase(ty, self.types), Option::None)
+    }
+
+    fn is_unit(self, ty: Type) -> bool {
+        self.c(ty).is("KurUnit")
+    }
+
+    // ------------------------------------------------------------ specialization --
+
+    fn request(self, key: FunKey, fun: Fun, sub: Map[Text, Type]) -> Text {
+        let params = self.instance_params.get_or(key, fun.params);
+        var agree = sub.len() == params.len();
+        var p = 0usize;
+        while agree && p < params.len() {
+            agree = sub.has(params.get(p).name);
+            p = p + 1usize;
+        }
+        if !agree {
+            fail_text(Out::new().put("specialization arguments disagree for ").add(fun.name).done());
+        }
+        let args: Seq[Type] = Seq::new();
+        var a = 0usize;
+        while a < params.len() {
+            args.push(sub.at(params.get(a).name));
+            a = a + 1usize;
+        }
+        // Logical alpha-equivalence, not representation equality. Capture-avoiding substitution
+        // may freshen bound names on recursive requests. At most one earlier request is
+        // alpha-equivalent to these arguments, so one with structurally equal arguments is it.
+        match self.symbol_index.get((key, args)) {
+            Option::Some(symbol) => {
+                return symbol;
+            },
+            Option::None => (),
+        };
+        var s = 0usize;
+        while s < self.symbols.len() {
+            let (identity, previous, symbol) = self.symbols.get(s);
+            if Key::key_same(identity, key) {
+                var same = true;
+                var i = 0usize;
+                while same && i < args.len() && i < previous.len() {
+                    same = equal(args.get(i), previous.get(i));
+                    i = i + 1usize;
+                }
+                if same {
+                    return symbol;
+                }
+            }
+            s = s + 1usize;
+        }
+        let (path, function_id) = self.function_ids.at(key);
+        let signature = C::fn_type(fun.ptypes, fun.ret, params, fun.is_unsafe, fun.places());
+        let identity = Seq::two(function_id, type_key(signature, Seq::new()));
+        var t = 0usize;
+        while t < args.len() {
+            identity.push(type_key(args.get(t), Seq::new()));
+            t = t + 1usize;
+        }
+        let symbol = self.function_name(path, encode(identity));
+        self.symbols.push((key, args, symbol));
+        self.symbol_index.set((key, args), symbol);
+        self.queue.push((key, fun, sub.copy(), symbol));
+        symbol
+    }
+
+    fn function_name(self, path: Seq[Text], identity: Text) -> Text {
+        var salt = 0u64;
+        var symbol = mangle(path, identity, salt);
+        while self.taken.taken.has(symbol) {
+            salt = salt + 1u64;
+            symbol = mangle(path, identity, salt);
+        }
+        self.taken.taken.add(symbol);
+        symbol
+    }
+
+    fn function_address(self, instr: Instr) -> Text {
+        let name = instr.args.get(0usize);
+        if self.program.externs.has(name) {
+            return self.foreign_address(name);
+        }
+        let fun = self.program.funs.at(name);
+        // Stable distinct rigid identities: not a wildcard and not static.
+        let sub: Map[Text, Type] = Map::new();
+        var k = 0usize;
+        while k < fun.params.len() && k < instr.tys.len() {
+            let t = instr.tys.get(k);
+            let value = match t {
+                Type::Ignored => {
+                    let identity = Seq::two(text("#retained"), fun.name);
+                    identity.push(Out::new().usize(k).done());
+                    Type::Skolem.(encode(identity))
+                },
+                _ => self.substitute_type(t),
+            };
+            sub.set(fun.params.get(k).name, value);
+            k = k + 1usize;
+        }
+        self.request(FunKey::Function.(name), fun, sub)
+    }
+
+    fn foreign_address(self, name: Text) -> Text {
+        let ext = self.program.externs.at(name);
+        let ret = match ext.ret {
+            Option::Some(r) => r,
+            Option::None => fail_text(text("internal error: an extern without a type")),
+        };
+        let ptypes = match ext.ptypes {
+            Option::Some(p) => p,
+            Option::None => fail_text(text("internal error: an extern value has no address")),
+        };
+        if !self.is_unit(ret) {
+            return name;
+        }
+        match self.foreign_adapters.get(name) {
+            Option::Some(symbol) => {
+                return symbol;
+            },
+            Option::None => (),
+        };
+        let signature = C::fn_type(ptypes, ret, Seq::new(), true, Seq::new());
+        let path = Seq::one(text("adapter"));
+        path.append(path_segments(name));
+        let identity = Seq::two(text("adapter"), name);
+        identity.push(type_key(signature, Seq::new()));
+        let symbol = self.function_name(path, encode(identity));
+        self.foreign_adapters.set(name, symbol);
+        let names: Seq[Text] = Seq::new();
+        var k = 0usize;
+        while k < ptypes.len() {
+            names.push(allocate(Out::new().put("a").usize(k).done(), self.taken));
+            k = k + 1usize;
+        }
+        let params: Seq[Text] = Seq::new();
+        var p = 0usize;
+        while p < ptypes.len() {
+            params.push(Out::new().add(self.c(ptypes.get(p))).put(" ").add(names.get(p)).done());
+            p = p + 1usize;
+        }
+        let args = joined(names, ", ");
+        let result = allocate(text("result"), self.taken);
+        let head = Out::new().put("static KurUnit ").add(symbol).put("(").add(or_void(joined(params, ", "))).put(")").done();
+        self.protos.push(Out::new().add(head).put(";").done());
+        self.bodies.push(Out::new().add(head).put(" {\n  ").add(name).put("(").add(args).put(");\n")
+            .put("  KurUnit ").add(result).put(" = { 0 };\n  return ").add(result).put(";\n}").done());
+        symbol
+    }
+
+    fn resolve_trait(self, trait_name: Text, method: Text, tys: Seq[Type]) -> (FunKey, Fun, Map[Text, Type]) {
+        // Checking already discharged authority at the use site. Specialization selects its
+        // coherent head; the callee's module need not own that shape.
+        let (index, inst, sub) = match self.checker.matching_instance(trait_name, tys) {
+            Option::Some(found) => found,
+            Option::None => fail_text(Out::new().put("no instance of ").add(trait_name).put(" for these types").done()),
+        };
+        var i = 0usize;
+        while i < inst.methods.len() {
+            if inst.methods.get(i).name.eq(method) {
+                return (FunKey::Method.(trait_name, index, method), inst.methods.get(i), sub);
+            }
+            i = i + 1usize;
+        }
+        fail_text(Out::new().put("internal error: no method ").add(method).done())
+    }
+
+    // ------------------------------------------------------------------- program --
+
+    fn emit_program(self, entry: Option[Text]) -> Text {
+        check_mono_termination(self.program);
+        let keywords = c_keywords();
+        let runtime = runtime_names();
+        let externs: Seq[Text] = Seq::new();
+        let all = self.program.externs.values();
+        var e = 0usize;
+        while e < all.len() {
+            let ext = all.get(e);
+            if !is_c_identifier(ext.name) || keywords.has(ext.name) {
+                fail_at(Out::new().put("backend: foreign symbol ").add(repr(ext.name)).put(" is not a C identifier").done(), ext.pos);
+            }
+            if runtime.has(ext.name) || ext.name.starts_with(text("__builtin_")) || ext.name.starts_with(text("__atomic_"))
+                || ext.name.is("main") && entry.is_some() {
+                fail_at(Out::new().put("backend: foreign symbol ").add(repr(ext.name))
+                    .put(" conflicts with the C runtime prelude or entry wrapper").done(), ext.pos);
+            }
+            let ret = match ext.ret {
+                Option::Some(r) => r,
+                Option::None => fail_text(text("internal error: an extern without a type")),
+            };
+            match ext.ptypes {
+                Option::None => externs.push(Out::new().put("extern ").add(self.c(ret)).put(" ").add(ext.name).put(";").done()),
+                Option::Some(ptypes) => {
+                    let result = if self.is_foreign_void(ret) { text("void") } else { self.c(ret) };
+                    let noreturn = if is_never(ret) { text("_Noreturn ") } else { text("") };
+                    let params: Seq[Text] = Seq::new();
+                    var p = 0usize;
+                    while p < ptypes.len() {
+                        params.push(self.c(ptypes.get(p)));
+                        p = p + 1usize;
+                    }
+                    externs.push(Out::new().add(noreturn).add(result).put(" ").add(ext.name).put("(").add(or_void(joined(params, ", "))).put(");").done());
+                },
+            };
+            e = e + 1usize;
+        }
+        var main: Option[Text] = Option::None;
+        match entry {
+            Option::Some(name) => {
+                let i32 = C::prim("i32");
+                let argv = C::ptr(C::ptr(C::prim("u8")));
+                let ok = match self.program.funs.get(name) {
+                    Option::Some(fun) => {
+                        let plain = fun.ptypes.is_empty() || fun.ptypes.len() == 2usize && C::same(fun.ptypes.get(0usize), i32)
+                            && C::same(fun.ptypes.get(1usize), argv);
+                        fun.params.is_empty() && fun.premises.is_empty() && !fun.is_unsafe && fun.places().is_empty()
+                            && equal(fun.ret, i32) && plain
+                    },
+                    Option::None => false,
+                };
+                if !ok {
+                    fail_text(Out::new().put("backend: the entry ").add(name).put(" must be a safe, non-generic ")
+                        .put("`fn() -> i32` or `fn(i32, *(*u8)) -> i32` without premises").done());
+                }
+                main = Option::Some.(self.request(FunKey::Function.(name), self.program.funs.at(name), Map::new()));
+            },
+            Option::None => {
+                // The roots are the functions with nothing left to choose or discharge. One with
+                // premises gets code only when a checked call, which discharged them, requests it.
+                let funs = self.program.funs.values();
+                var f = 0usize;
+                while f < funs.len() {
+                    let fun = funs.get(f);
+                    if fun.params.is_empty() && fun.premises.is_empty() {
+                        let unit = self.request(FunKey::Function.(fun.name), fun, Map::new());
+                    }
+                    f = f + 1usize;
+                }
+            },
+        };
+        while !self.queue.is_empty() {
+            let (key, fun, sub, symbol) = self.queue.remove(0usize);
+            self.emit_function(key, fun, sub, symbol);
+        }
+        let datas: Seq[Text] = Seq::new();
+        let entries = self.datas.values();
+        var d = 0usize;
+        while d < entries.len() {
+            datas.push(self.emit_data(entries.get(d)));
+            d = d + 1usize;
+        }
+        // The first pending type each time: positions before `first` hold only defined ones.
+        var first = 0usize;
+        while first < self.pending.positions() {
+            match self.pending.entry(first) {
+                Option::Some(ty) => self.define(ty),
+                Option::None => {
+                    first = first + 1usize;
+                },
+            };
+        }
+        let out: Seq[Text] = Seq::one(prelude());
+        out.append(self.forward);
+        out.append(self.defs);
+        out.append(externs);
+        out.append(datas);
+        out.append(self.protos);
+        out.append(self.bodies);
+        match main {
+            Option::Some(symbol) => {
+                let fun = self.program.funs.at(match entry {
+                    Option::Some(name) => name,
+                    Option::None => text(""),
+                });
+                if !fun.ptypes.is_empty() {
+                    out.push(Out::new().put("int main(int argc, char **argv) { return (int)").add(symbol).put("((int32_t)argc, ")
+                        .put("(").add(self.c(fun.ptypes.get(1usize))).put(")argv); }").done());
+                } else {
+                    out.push(Out::new().put("int main(void) { return (int)").add(symbol).put("(); }").done());
+                }
+            },
+            Option::None => (),
+        };
+        Out::new().add(joined(out, "\n")).put("\n").done()
+    }
+
+    fn is_foreign_void(self, ty: Type) -> bool {
+        is_never(ty) || self.is_unit(ty)
+    }
+
+    // ---------------------------------------------------------------------- data --
+
+    fn data_symbol(self, name: Text) -> Text {
+        if !self.datas.has(name) {
+            let symbol = allocate(Out::new().put("d").usize(self.datas.len()).put("_").add(tail(readable(name), 40usize)).done(), self.taken);
+            self.datas.set(name, (symbol, self.program.datas.at(name)));
+        }
+        let (symbol, _data) = self.datas.at(name);
+        symbol
+    }
+
+    fn emit_data(self, entry: (Text, Data)) -> Text {
+        let (symbol, data) = entry;
+        let ct = self.c(data.ty);
+        Out::new().put("static ").add(ct).put(" ").add(symbol).put(" = ").add(self.initializer(data.ty, data.init)).put(";").done()
+    }
+
+    fn initializer(self, ty: Type, form: Form) -> Text {
+        let s = self.shape(ty);
+        match s {
+            Type::Prim(_name) => {
+                return self.literal(s, form.text);
+            },
+            Type::Array(elem, length) => {
+                let values: Seq[Text] = Seq::new();
+                var i = 0usize;
+                while i < form.len() {
+                    let part = form.at(i);
+                    if C::same(elem.get(), C::prim("u8")) && part.is_str() {
+                        var b = 0usize;
+                        while b < part.text.len {
+                            values.push(Out::new().u64(part.text.byte(b) as u64).done());
+                            b = b + 1usize;
+                        }
+                    } else {
+                        values.push(self.initializer(elem.get(), part));
+                    }
+                    i = i + 1usize;
+                }
+                return if length != 0u64 { Out::new().put("{ { ").add(joined(values, ", ")).put(" } }").done() } else { text("{ 0 }") };
+            },
+            _ => (),
+        };
+        if self.is_unit(ty) {
+            return text("{ 0 }");
+        }
+        let rows = self.members(s);
+        let parts: Seq[Text] = Seq::new();
+        var i = 0usize;
+        while i < rows.len() && i < form.len() {
+            let (_m, f) = rows.get(i);
+            parts.push(self.initializer(f, form.at(i)));
+            i = i + 1usize;
+        }
+        Out::new().put("{ ").add(joined(parts, ", ")).put(" }").done()
+    }
+
+    fn literal(self, ty: Type, lit: Text) -> Text {
+        let name = match ty {
+            Type::Prim(n) => n,
+            _ => fail_text(text("internal error: a literal of a type that is not primitive")),
+        };
+        if name.is("bool") {
+            return if lit.is("1") || lit.is("true") || lit.is("True") { text("1") } else { text("0") };
+        }
+        if C::is_float(name) {
+            let digits = if lit.contains(text(".")) || lit.contains(text("e")) || lit.contains(text("E")) { lit } else { lit.concat(text(".0")) };
+            return if name.is("f32") { digits.concat(text("f")) } else { digits };
+        }
+        if signed_bits(name) != 0u32 {
+            return if lit.is("-9223372036854775808") { text("(-INT64_C(9223372036854775807) - 1)") } else { Out::new().put("INT64_C(").add(lit).put(")").done() };
+        }
+        Out::new().put("UINT64_C(").add(lit).put(")").done()
+    }
+
+    // ----------------------------------------------------------------- functions --
+
+    fn emit_function(self, key: FunKey, fun: Fun, sub: Map[Text, Type], symbol: Text) {
+        self.fun.set(Option::Some.(fun));
+        self.sub.set(sub);
+        let typed = self.checker.typed.at(key);
+        self.locals.set(Map::new());
+        self.lines.set(Seq::new());
+        self.scratch.set(0usize);
+        let label_taken = Pool::new(Set::new());
+        let labels: Map[Text, Text] = Map::new();
+        var b = 0usize;
+        while b < fun.blocks.len() {
+            let label = fun.blocks.get(b).label;
+            labels.set(label, allocate(Out::new().put("L_").add(readable(label)).done(), label_taken));
+            b = b + 1usize;
+        }
+        self.labels.set(labels);
+        let decls: Seq[Text] = Seq::new();
+        self.decls.set(decls);
+        let entry = fun.blocks.get(0usize);
+        let place_c: Map[Text, Text] = Map::new();
+        self.place_c.set(place_c);
+        let cparams: Seq[Text] = Seq::new();
+        var p = 0usize;
+        while p < entry.params.len() {
+            let binding = entry.params.get(p);
+            let cname = self.cname(entry.label, binding.name);
+            if binding.name.starts_with(text("&")) {
+                place_c.set(binding.name, Out::new().put("(*").add(cname).put(")").done());
+                cparams.push(Out::new().add(self.c(self.substitute_type(binding.type))).put("* ").add(cname).done());
+            } else {
+                cparams.push(Out::new().add(self.c(self.substitute_type(binding.type))).put(" ").add(cname).done());
+            }
+            p = p + 1usize;
+        }
+        var l = 0usize;
+        while l < fun.locals.len() {
+            let binding = fun.locals.get(l);
+            let cname = allocate(Out::new().put("p_").add(readable(binding.name)).done(), self.taken);
+            place_c.set(binding.name, cname);
+            decls.push(Out::new().add(self.c(self.substitute_type(binding.type))).put(" ").add(cname).put(";").done());
+            l = l + 1usize;
+        }
+        let roots: Map[Text, Type] = Map::new();
+        var r = 0usize;
+        while r < entry.params.len() {
+            let binding = entry.params.get(r);
+            if binding.name.starts_with(text("&")) {
+                roots.set(binding.name, self.substitute_type(binding.type));
+            }
+            r = r + 1usize;
+        }
+        var o = 0usize;
+        while o < fun.locals.len() {
+            roots.set(fun.locals.get(o).name, self.substitute_type(fun.locals.get(o).type));
+            o = o + 1usize;
+        }
+        self.roots.set(roots);
+        self.typed.set(typed);
+        let values = typed.keys();
+        var v = 0usize;
+        while v < values.len() {
+            let (label, name) = values.get(v);
+            let ty = typed.at(values.get(v));
+            var parameter = false;
+            if label.eq(entry.label) {
+                var q = 0usize;
+                while q < entry.params.len() {
+                    if entry.params.get(q).name.eq(name) {
+                        parameter = true;
+                    }
+                    q = q + 1usize;
+                }
+            }
+            if !parameter && !is_never(self.substitute_type(ty)) {
+                let ct = self.c(self.substitute_type(ty));
+                decls.push(Out::new().add(ct).put(" ").add(self.cname(label, name)).put(";").done());
+            }
+            v = v + 1usize;
+        }
+        let blocks: Map[Text, Block] = Map::new();
+        var k = 0usize;
+        while k < fun.blocks.len() {
+            blocks.set(fun.blocks.get(k).label, fun.blocks.get(k));
+            k = k + 1usize;
+        }
+        self.blocks.set(blocks);
+        var n = 0usize;
+        while n < fun.blocks.len() {
+            let block = fun.blocks.get(n);
+            self.label.set(block.label);
+            self.line(Out::new().add(labels.at(block.label)).put(": ;").done());
+            var i = 0usize;
+            while i < block.instrs.len() {
+                self.instr(block.instrs.get(i));
+                i = i + 1usize;
+            }
+            self.term(block.term);
+            n = n + 1usize;
+        }
+        let ret_type = self.substitute_type(fun.ret);
+        let ret = if is_never(ret_type) { text("void") } else { self.c(ret_type) };
+        let head = Out::new().put(if ret.is("void") { "_Noreturn " } else { "" }).put("static ").add(ret).put(" ").add(symbol)
+            .put("(").add(or_void(joined(cparams, ", "))).put(")").done();
+        self.protos.push(Out::new().add(head).put(";").done());
+        let body = Out::new().add(head).put(" {\n");
+        var d = 0usize;
+        while d < decls.len() {
+            let unit = body.put("  ").add(decls.get(d)).put("\n");
+            d = d + 1usize;
+        }
+        let lines = self.lines.get();
+        var j = 0usize;
+        while j < lines.len() {
+            let unit = body.put("  ").add(lines.get(j)).put("\n");
+            j = j + 1usize;
+        }
+        self.bodies.push(body.put("}\n").done());
+    }
+
+    fn substitute_type(self, ty: Type) -> Type {
+        subst(ty, self.sub.get(), self.counter)
+    }
+
+    fn cname(self, label: Text, name: Text) -> Text {
+        let key = (label, name);
+        let locals = self.locals.get();
+        if !locals.has(key) {
+            locals.set(key, allocate(Out::new().add(readable(label)).put("_").add(readable(name)).done(), self.taken));
+        }
+        locals.at(key)
+    }
+
+    fn value_name(self, name: Text) -> Text {
+        self.cname(self.label.get(), name)
+    }
+
+    fn type_of(self, name: Text) -> Type {
+        self.substitute_type(self.typed.get().at((self.label.get(), name)))
+    }
+
+    fn line(self, t: Text) {
+        self.lines.get().push(t);
+    }
+
+    // ------------------------------------------------------------------- places --
+
+    // The C lvalue and type of a place path.
+    fn place(self, path: Text) -> (Text, Type) {
+        let parts = path.split(text("."));
+        var expr = self.place_c.get().at(parts.get(0usize));
+        var ty = self.roots.get().at(parts.get(0usize));
+        var i = 1usize;
+        while i < parts.len() {
+            let seg = parts.get(i);
+            ty = self.view(ty);
+            let s = self.shape(ty);
+            match s {
+                Type::Enum(variants) => {
+                    expr = Out::new().add(expr).put(".payload.").add(self.variant(seg)).done();
+                    ty = last_member(variants, seg);
+                },
+                _ => {
+                    let names: Seq[Text] = match s {
+                        Type::Struct(fields) => {
+                            let out: Seq[Text] = Seq::new();
+                            var f = 0usize;
+                            while f < fields.len() {
+                                out.push(fields.get(f).name);
+                                f = f + 1usize;
+                            }
+                            out
+                        },
+                        Type::Tuple(elems) => {
+                            let out: Seq[Text] = Seq::new();
+                            var e = 0usize;
+                            while e < elems.len() {
+                                out.push(Out::new().usize(e).done());
+                                e = e + 1usize;
+                            }
+                            out
+                        },
+                        _ => fail_text(text("internal error: a place through a type that is not a product")),
+                    };
+                    let rows = self.members(s);
+                    var found = false;
+                    var k = names.len();
+                    while !found && k > 0usize {
+                        k = k - 1usize;
+                        if names.get(k).eq(seg) {
+                            let (m, t) = rows.get(k);
+                            expr = Out::new().add(expr).put(".").add(m).done();
+                            ty = t;
+                            found = true;
+                        }
+                    }
+                    if !found {
+                        fail_text(text("internal error: a place names no component"));
+                    }
+                },
+            };
+            i = i + 1usize;
+        }
+        (expr, ty)
+    }
+
+    // Opened views share the package's representation.
+    fn view(self, ty: Type) -> Type {
+        match ty {
+            Type::Exists(_binders, body) => body.get(),
+            _ => ty,
+        }
+    }
+
+    // A call argument: a value, a lent place's address, or a raw target.
+    fn operand(self, arg: Text) -> Text {
+        if arg.starts_with(text("&*")) {
+            return self.value_name(arg.from(2usize));
+        }
+        if arg.starts_with(text("&")) {
+            let (expr, _ty) = self.place(arg);
+            return Out::new().put("&").add(expr).done();
+        }
+        self.value_name(arg)
+    }
+
+    // ------------------------------------------------------------- instructions --
+
+    fn instr(self, instr: Instr) {
+        let op = instr.op;
+        let a = instr.args;
+        let dst = if instr.lhs.len() == 1usize { Option::Some.(self.value_name(instr.lhs.get(0usize))) } else { Option::None };
+        // `None` where an instruction without one result would name it, as the f-strings print it.
+        let d = match dst {
+            Option::Some(t) => t,
+            Option::None => text("None"),
+        };
+        if op.is("const") {
+            let lit = match instr.lit {
+                Option::Some(l) => l,
+                Option::None => text(""),
+            };
+            self.line(Out::new().add(d).put(" = ").add(self.literal(self.type_operand_raw(instr), lit)).put(";").done());
+        } else if op.is("copy") {
+            self.line(Out::new().add(d).put(" = ").add(self.value_name(a.get(0usize))).put(";").done());
+        } else if op.is("construct") {
+            let ty = self.type_operand(instr);
+            let values: Seq[Text] = Seq::new();
+            var i = 0usize;
+            while i < a.len() {
+                values.push(self.value_name(a.get(i)));
+                i = i + 1usize;
+            }
+            self.construct(d, ty, values);
+        } else if op.is("destruct") {
+            self.destruct(instr);
+        } else if op.is("construct_variant") {
+            let lit = match instr.lit {
+                Option::Some(l) => l,
+                Option::None => text(""),
+            };
+            let variants = self.types.variants(erase(self.type_operand(instr), self.types), Option::None);
+            var index = 0usize;
+            var found = false;
+            while !found && index < variants.len() {
+                if variants.get(index).name.eq(lit) {
+                    found = true;
+                } else {
+                    index = index + 1usize;
+                }
+            }
+            let member = self.variant(lit);
+            self.line(Out::new().add(d).put(".payload.").add(member).put(" = ").add(self.value_name(a.get(0usize))).put(";").done());
+            self.line(Out::new().add(d).put(".tag = ").usize(index).put(";").done());
+        } else if op.is("variant_tag") {
+            let source = if a.get(0usize).starts_with(text("&")) {
+                let (expr, _ty) = self.place(a.get(0usize));
+                expr
+            } else {
+                self.value_name(a.get(0usize))
+            };
+            self.line(Out::new().add(d).put(" = ").add(source).put(".tag;").done());
+        } else if op.is("builtin::int_cast") {
+            let value = self.value_name(a.get(0usize));
+            self.line(Out::new().add(d).put(" = ").add(self.convert(value, self.type_operand(instr))).put(";").done());
+        } else if op.is("builtin::unsafe::cast") {
+            let value = self.value_name(a.get(0usize));
+            let src = self.type_of(a.get(0usize));
+            self.cast(d, value, src, self.type_operand(instr));
+        } else if is_c_op(op) || op.is("shl") || op.is("shr") {
+            self.primitive(d, op, a);
+        } else if op.is("call") {
+            self.call(instr);
+        } else if op.is("trait_call") {
+            let tys: Seq[Type] = Seq::new();
+            var i = 0usize;
+            while i < instr.tys.len() {
+                tys.push(self.substitute_type(instr.tys.get(i)));
+                i = i + 1usize;
+            }
+            let (key, fun, sub) = self.resolve_trait(a.get(0usize), a.get(1usize), tys);
+            let symbol = self.request(key, fun, sub);
+            self.emit_call(instr, symbol, fun.ret, sub, a.from(2usize), false);
+        } else if op.is("fn") {
+            self.line(Out::new().add(d).put(" = ").add(self.function_address(instr)).put(";").done());
+        } else if op.is("alloca") {
+            self.has_memory_form(self.type_operand(instr), instr);
+            let ct = self.c(self.type_operand(instr));
+            self.line(Out::new().add(d).put(" = (").add(ct).put("*)__builtin_alloca(sizeof(").add(ct).put("));").done());
+        } else if op.is("builtin::sizeof") {
+            self.has_memory_form(self.type_operand(instr), instr);
+            self.line(Out::new().add(d).put(" = (uint64_t)sizeof(").add(self.c(self.type_operand(instr))).put(");").done());
+        } else if op.is("data") {
+            self.line(Out::new().add(d).put(" = &").add(self.data_symbol(a.get(0usize))).put(";").done());
+        } else if op.is("builtin::unsafe::static_brand") || op.is("builtin::fresh") {
+            self.line(Out::new().add(d).put(".dummy = 0;").done());
+        } else if op.is("pack") || op.is("open") {
+            if a.get(0usize).starts_with(text("&")) {
+                self.unit(dst);
+            } else {
+                self.line(Out::new().add(d).put(" = ").add(self.value_name(a.get(0usize))).put(";").done());
+            }
+        } else if op.is("builtin::unsafe::deref") {
+            let inner = self.pointee(self.type_of(a.get(0usize)));
+            self.has_memory_form(inner, instr);
+            self.line(Out::new().add(d).put(" = *").add(self.value_name(a.get(0usize))).put(";").done());
+        } else if op.is("builtin::unsafe::load_volatile") {
+            let inner = self.pointee(self.type_of(a.get(0usize)));
+            self.has_memory_form(inner, instr);
+            let ct = self.c(inner);
+            self.line(Out::new().add(d).put(" = *(").add(ct).put(" volatile*)").add(self.value_name(a.get(0usize))).put(";").done());
+        } else if op.is("builtin::unsafe::store") || op.is("builtin::unsafe::store_volatile") {
+            let inner = self.pointee(self.type_of(a.get(0usize)));
+            self.has_memory_form(inner, instr);
+            let qual = if op.ends_with(text("volatile")) { Out::new().put("(").add(self.c(inner)).put(" volatile*)").done() } else { text("") };
+            let target = self.value_name(a.get(0usize));
+            self.line(Out::new().put("*").add(qual).add(target).put(" = ").add(self.value_name(a.get(1usize))).put(";").done());
+            self.unit(dst);
+        } else if op.starts_with(text("builtin::unsafe::atomic_")) {
+            self.atomic(instr, dst);
+        } else if op.is("load") {
+            let (expr, _ty) = self.place(a.get(0usize));
+            self.line(Out::new().add(d).put(" = ").add(expr).put(";").done());
+        } else if op.is("store") {
+            let (expr, _ty) = self.place(a.get(0usize));
+            self.line(Out::new().add(expr).put(" = ").add(self.value_name(a.get(1usize))).put(";").done());
+            self.unit(dst);
+        } else if op.is("foreach") {
+            self.foreach_instr(instr, d);
+        } else {
+            fail_text(Out::new().put("no C recipe for ").add(op).done());
+        }
+    }
+
+    fn pointee(self, pointer: Type) -> Type {
+        match pointer {
+            Type::Ptr(inner) => inner.get(),
+            _ => fail_text(text("internal error: a pointer operation on a value that is not a pointer")),
+        }
+    }
+
+    // The checker's zero-size rule, for types a specialization chose.
+    fn has_memory_form(self, ty: Type, instr: Instr) {
+        if self.types.zero_size(ty) {
+            fail_at(text("a zero-size type has no memory form yet"), instr.pos);
+        }
+    }
+
+    fn type_operand_raw(self, instr: Instr) -> Type {
+        match instr.ty {
+            Option::Some(t) => t,
+            Option::None => fail_text(text("internal error: an instruction without its type")),
+        }
+    }
+
+    fn type_operand(self, instr: Instr) -> Type {
+        self.substitute_type(self.type_operand_raw(instr))
+    }
+
+    fn unit(self, dst: Option[Text]) {
+        match dst {
+            Option::Some(d) => self.line(Out::new().add(d).put(".dummy = 0;").done()),
+            Option::None => (),
+        };
+    }
+
+    fn construct(self, dst: Text, ty: Type, values: Seq[Text]) {
+        let s = self.shape(ty);
+        if self.is_unit(ty) {
+            self.line(Out::new().add(dst).put(".dummy = 0;").done());
+            return ();
+        }
+        match s {
+            Type::Array(_elem, length) => {
+                if length == 0u64 {
+                    self.line(Out::new().add(dst).put(".dummy = 0;").done());
+                }
+                var k = 0u64;
+                while k < length {
+                    let at = if (k as usize) < values.len() - 1usize { k as usize } else { values.len() - 1usize };
+                    self.line(Out::new().add(dst).put(".items[").u64(k).put("] = ").add(values.get(at)).put(";").done());
+                    k = k + 1u64;
+                }
+            },
+            _ => {
+                let rows = self.members(s);
+                var i = 0usize;
+                while i < rows.len() && i < values.len() {
+                    let (m, _t) = rows.get(i);
+                    self.line(Out::new().add(dst).put(".").add(m).put(" = ").add(values.get(i)).put(";").done());
+                    i = i + 1usize;
+                }
+            },
+        };
+    }
+
+    fn destruct(self, instr: Instr) {
+        let arg = instr.args.get(0usize);
+        let (source, ty) = if arg.starts_with(text("&")) {
+            self.place(arg)
+        } else {
+            let source = self.value_name(arg);
+            (source, self.type_of(arg))
+        };
+        let representation = erase(ty, self.types);
+        let pointer = is_ptr(representation);
+        let component_type = match representation {
+            Type::Ptr(inner) => inner.get(),
+            _ => ty,
+        };
+        let s = self.shape(component_type);
+        let access = match s {
+            Type::Array(_elem, length) => items_access(length as usize),
+            _ => if !self.is_unit(component_type) { member_names(self.members(s)) } else { Seq::new() },
+        };
+        var i = 0usize;
+        while i < instr.lhs.len() && i < access.len() {
+            let name = self.value_name(instr.lhs.get(i));
+            if pointer {
+                self.line(Out::new().add(name).put(" = KUR_FIELD(").add(source).put(", ").add(access.get(i)).put(");").done());
+            } else {
+                self.line(Out::new().add(name).put(" = ").add(source).put(".").add(access.get(i)).put(";").done());
+            }
+            i = i + 1usize;
+        }
+    }
+
+    // Integer conversion by truncation or sign extension.
+    fn convert(self, expr: Text, dst: Type) -> Text {
+        let name = match dst {
+            Type::Prim(n) => n,
+            _ => fail_text(text("internal error: a conversion to a type that is not primitive")),
+        };
+        let bits = signed_bits(name);
+        if bits != 0u32 {
+            return Out::new().put("kur_dec_i").u64(bits as u64).put("((uint64_t)(").add(expr).put("))").done();
+        }
+        Out::new().put("(").add(c_prim(name)).put(")((uint64_t)(").add(expr).put("))").done()
+    }
+
+    fn cast(self, dst: Text, expr: Text, src: Type, dst_ty: Type) {
+        let s = self.shape(src);
+        let d = self.shape(dst_ty);
+        let cd = self.c(dst_ty);
+        if is_never(s) || is_never(d) {
+            fail_text(text("backend cast does not support a never representation"));
+        }
+        if is_ptr(s) || is_ptr(d) {
+            let s_int = match s {
+                Type::Prim(n) => C::is_integer(n),
+                _ => false,
+            };
+            let d_int = match d {
+                Type::Prim(n) => C::is_integer(n),
+                _ => false,
+            };
+            if is_ptr(s) && is_ptr(d) {
+                self.line(Out::new().add(dst).put(" = (").add(cd).put(")").add(expr).put(";").done());
+            } else if is_ptr(s) && d_int || is_ptr(d) && s_int {
+                let value = Out::new().put("(uintptr_t)").add(expr).done();
+                let converted = if d_int { self.convert(value, d) } else { Out::new().put("(").add(cd).put(")").add(value).done() };
+                self.line(Out::new().add(dst).put(" = ").add(converted).put(";").done());
+            } else {
+                fail_text(text("backend cast supports raw pointers only with pointers or integers"));
+            }
+            return ();
+        }
+        let (sn, dn) = match s {
+            Type::Prim(x) => match d {
+                Type::Prim(y) => (x, y),
+                _ => {
+                    // Layout belongs to C. Never silently truncate a source or leave a destination
+                    // tail uninitialized; exact size is a target obligation.
+                    self.reinterpret(dst, expr);
+                    return ();
+                },
+            },
+            _ => {
+                self.reinterpret(dst, expr);
+                return ();
+            },
+        };
+        if sn.is("bool") || dn.is("bool") || C::is_float(sn) && C::is_float(dn) {
+            self.line(Out::new().add(dst).put(" = (").add(cd).put(")").add(expr).put(";").done());
+        } else if C::is_float(sn) != C::is_float(dn) {
+            if width(sn) != width(dn) {
+                fail_text(text("backend integer/float reinterpretation requires equal widths"));
+            }
+            self.reinterpret(dst, expr);
+        } else {
+            self.line(Out::new().add(dst).put(" = ").add(self.convert(expr, d)).put(";").done());
+        }
+    }
+
+    fn reinterpret(self, dst: Text, expr: Text) {
+        self.line(Out::new().put("_Static_assert(sizeof(").add(dst).put(") == sizeof(").add(expr)
+            .put("), \"KURS cast requires equal representation sizes\");").done());
+        self.line(Out::new().put("__builtin_memcpy(&").add(dst).put(", &").add(expr).put(", sizeof(").add(dst).put("));").done());
+    }
+
+    fn primitive(self, dst: Text, op: Text, args: Seq[Text]) {
+        let x = self.value_name(args.get(0usize));
+        let y = self.value_name(args.get(1usize));
+        let t = self.shape(self.type_of(args.get(0usize)));
+        let name = match t {
+            Type::Ptr(_inner) => {
+                self.line(Out::new().add(dst).put(" = ((uintptr_t)").add(x).put(" ").add(c_op(op)).put(" (uintptr_t)").add(y).put(");").done());
+                return ();
+            },
+            Type::Prim(n) => n,
+            _ => fail_text(text("internal error: a primitive operation on a value that is not primitive")),
+        };
+        if !C::is_integer(name) || op.is("eq") || op.is("ne") || op.is("lt") || op.is("le") || op.is("gt") || op.is("ge") {
+            self.line(Out::new().add(dst).put(" = (").add(x).put(" ").add(c_op(op)).put(" ").add(y).put(");").done());
+            return ();
+        }
+        let bits = C::integer_bits(name);
+        let ct = c_prim(name);
+        let signed = signed_bits(name) != 0u32;
+        if op.is("div") || op.is("mod") {
+            self.line(Out::new().put("if (").add(y).put(" == 0) KUR_TRAP();").done());
+            if signed {
+                let minus = if op.is("div") {
+                    wrap(Out::new().put("(uint64_t)0 - (uint64_t)(").add(x).put(")").done(), bits, signed, ct)
+                } else {
+                    text("0")
+                };
+                self.line(Out::new().add(dst).put(" = (").add(y).put(" == -1) ? ").add(minus).put(" : (").add(ct).put(")(")
+                    .add(x).put(" ").add(c_op(op)).put(" ").add(y).put(");").done());
+            } else {
+                self.line(Out::new().add(dst).put(" = (").add(ct).put(")((uint64_t)").add(x).put(" ").add(c_op(op))
+                    .put(" (uint64_t)").add(y).put(");").done());
+            }
+            return ();
+        }
+        if op.is("shl") || op.is("shr") {
+            let amount = Out::new().put("((uint64_t)(").add(y).put(") & ").u64((bits - 1u32) as u64).put(")").done();
+            let bits_of = if bits < 64u32 || signed {
+                Out::new().put("(uint64_t)(uint").u64(bits as u64).put("_t)(").add(x).put(")").done()
+            } else {
+                Out::new().put("(uint64_t)(").add(x).put(")").done()
+            };
+            let shifted = if op.is("shl") {
+                Out::new().add(bits_of).put(" << ").add(amount).done()
+            } else if !signed {
+                Out::new().add(bits_of).put(" >> ").add(amount).done()
+            } else {
+                let fill = Out::new().put("(").add(x).put(" < 0 && ").add(amount).put(" ? (UINT64_MAX << (").u64(bits as u64)
+                    .put(" - ").add(amount).put(")) : 0)").done();
+                Out::new().put("(").add(bits_of).put(" >> ").add(amount).put(") | ").add(fill).done()
+            };
+            self.line(Out::new().add(dst).put(" = ").add(wrap(shifted, bits, signed, ct)).put(";").done());
+            return ();
+        }
+        let expr = Out::new().put("(uint64_t)(").add(x).put(") ").add(c_op(op)).put(" (uint64_t)(").add(y).put(")").done();
+        self.line(Out::new().add(dst).put(" = ").add(wrap(expr, bits, signed, ct)).put(";").done());
+    }
+
+    fn call(self, instr: Instr) {
+        let callee = instr.args.get(0usize);
+        if callee.starts_with(text("%")) {
+            let ret = match erase(self.type_of(callee), self.types) {
+                Type::Fn(f) => f.ret.get(),
+                _ => fail_text(text("internal error: a call of a value that is not a function")),
+            };
+            self.emit_call(instr, self.value_name(callee), ret, Map::new(), instr.args.from(1usize), false);
+        } else if self.program.externs.has(callee) {
+            let ret = match self.program.externs.at(callee).ret {
+                Option::Some(r) => r,
+                Option::None => fail_text(text("internal error: an extern without a type")),
+            };
+            self.emit_call(instr, callee, ret, Map::new(), instr.args.from(1usize), true);
+        } else {
+            let fun = self.program.funs.at(callee);
+            let sub: Map[Text, Type] = Map::new();
+            var i = 0usize;
+            while i < fun.params.len() && i < instr.tys.len() {
+                sub.set(fun.params.get(i).name, self.substitute_type(instr.tys.get(i)));
+                i = i + 1usize;
+            }
+            let symbol = self.request(FunKey::Function.(callee), fun, sub);
+            self.emit_call(instr, symbol, fun.ret, sub, instr.args.from(1usize), false);
+        }
+    }
+
+    fn emit_call(self, instr: Instr, callee: Text, ret: Type, sub: Map[Text, Type], args: Seq[Text], foreign: bool) {
+        let operands: Seq[Text] = Seq::new();
+        var i = 0usize;
+        while i < args.len() {
+            operands.push(self.operand(args.get(i)));
+            i = i + 1usize;
+        }
+        let call = Out::new().add(callee).put("(").add(joined(operands, ", ")).put(")").done();
+        let ret = subst(ret, sub, self.counter);
+        let dst = self.value_name(instr.lhs.get(0usize));
+        if is_never(ret) {
+            self.line(Out::new().add(call).put(";").done());
+        } else if foreign && self.is_unit(ret) {
+            self.line(Out::new().add(call).put(";").done());
+            self.line(Out::new().add(dst).put(".dummy = 0;").done());
+        } else {
+            self.line(Out::new().add(dst).put(" = ").add(call).put(";").done());
+        }
+    }
+
+    fn atomic(self, instr: Instr, dst: Option[Text]) {
+        let order = match instr.lit {
+            Option::Some(o) => o,
+            Option::None => fail_text(text("internal error: an atomic operation without its ordering")),
+        };
+        let d = match dst {
+            Option::Some(t) => t,
+            Option::None => text("None"),
+        };
+        let kind = instr.op.from(text("builtin::unsafe::atomic_").len);
+        let args: Seq[Text] = Seq::new();
+        var i = 0usize;
+        while i < instr.args.len() {
+            args.push(self.value_name(instr.args.get(i)));
+            i = i + 1usize;
+        }
+        if !kind.is("fence") {
+            let item = self.shape(self.pointee(self.type_of(instr.args.get(0usize))));
+            let (integer, transfer) = match item {
+                Type::Prim(n) => (C::is_integer(n), n.is("bool")),
+                Type::Ptr(_inner) => (false, true),
+                _ => (false, false),
+            };
+            if !integer && (kind.starts_with(text("fetch_")) || !transfer) {
+                fail_at(Out::new().put("backend atomic ").add(kind).put(" does not support this pointee type; ")
+                    .put("fetch operations require integers, transfers require integers, bool or raw pointers").done(), instr.pos);
+            }
+        }
+        if kind.is("fence") {
+            self.line(Out::new().put("__atomic_thread_fence(").add(c_order(order)).put(");").done());
+            self.unit(dst);
+        } else if kind.is("load") {
+            self.line(Out::new().add(d).put(" = __atomic_load_n(").add(args.get(0usize)).put(", ").add(c_order(order)).put(");").done());
+        } else if kind.is("store") {
+            self.line(Out::new().put("__atomic_store_n(").add(args.get(0usize)).put(", ").add(args.get(1usize)).put(", ").add(c_order(order)).put(");").done());
+            self.unit(dst);
+        } else if kind.is("swap") {
+            self.line(Out::new().add(d).put(" = __atomic_exchange_n(").add(args.get(0usize)).put(", ").add(args.get(1usize)).put(", ")
+                .add(c_order(order)).put(");").done());
+        } else if kind.is("compare_exchange") {
+            let (success, failure) = match order.find(text("/"), 0usize) {
+                Option::Some(at) => (order.slice(0usize, at), order.from(at + 1usize)),
+                Option::None => (order, text("")),
+            };
+            self.line(Out::new().add(d).put(".e0 = ").add(args.get(1usize)).put(";").done());
+            self.line(Out::new().add(d).put(".e1 = __atomic_compare_exchange_n(").add(args.get(0usize)).put(", &").add(d).put(".e0, ")
+                .add(args.get(2usize)).put(", 0, ").add(c_order(success)).put(", ").add(c_order(failure)).put(");").done());
+        } else {
+            self.line(Out::new().add(d).put(" = __atomic_").add(kind).put("(").add(args.get(0usize)).put(", ").add(args.get(1usize)).put(", ")
+                .add(c_order(order)).put(");").done());
+        }
+    }
+
+    fn foreach_instr(self, instr: Instr, dst: Text) {
+        let original = match instr.ty {
+            Option::Some(ty) => match ty {
+                Type::Foreach(f) => f,
+                _ => fail_text(text("internal error: a foreach of a type that is not a transform")),
+            },
+            Option::None => fail_text(text("internal error: a foreach without its type")),
+        };
+        let (t, renamed) = subst_foreach(original, self.sub.get(), self.counter);
+        let source = self.value_name(instr.args.get(0usize));
+        let mapper_name = instr.args.get(1usize);
+        let mapper = self.program.funs.at(mapper_name);
+        let binders: Seq[Text] = Seq::new();
+        let names = foreach_binders(original);
+        var b = 0usize;
+        while b < names.len() {
+            let name = names.get(b);
+            let binder = match renamed.get(name) {
+                Option::Some(found) => match found {
+                    Type::Named(n, args) => {
+                        if !args.is_empty() {
+                            fail_text(text("internal error: a foreach binder renamed to an application"));
+                        }
+                        n
+                    },
+                    _ => fail_text(text("internal error: a foreach binder renamed to a type that is not a name")),
+                },
+                Option::None => name,
+            };
+            binders.push(binder);
+            b = b + 1usize;
+        }
+        let own: Seq[Type] = Seq::new();
+        var o = 0usize;
+        while o < instr.tys.len() {
+            own.push(self.substitute_type(instr.tys.get(o)));
+            o = o + 1usize;
+        }
+        if mapper.params.len() != binders.len() + own.len() {
+            fail_at(text("foreach mapper parameter partition disagrees"), instr.pos);
+        }
+        let caps: Seq[Text] = Seq::new();
+        var c = 2usize;
+        while c < instr.args.len() {
+            caps.push(self.value_name(instr.args.get(c)));
+            c = c + 1usize;
+        }
+        let found = self.types.rows(t.source.get(), Option::None, false);
+        let rows = found.rows;
+        let pointer = is_ptr(self.shape(t.source.get())) && !is_foreach(t.source.get());
+        let out_shape = self.shape(Type::Foreach.(t));
+        let walk = Walk.{ backend: self, t, mapper, mapper_name, binders, own, caps };
+        let skeleton = match found.skeleton {
+            Option::Some(s) => s,
+            Option::None => {
+                let component = if is_foreach(t.source.get()) { Out::new().add(source).put(".e0").done() } else { source };
+                self.line(Out::new().add(dst).put(".e0 = ").add(walk.apply(rows.get(0usize), component)).put(";").done());
+                return ();
+            },
+        };
+        let unit = match skeleton {
+            Type::Enum(_variants) => {
+                self.line(Out::new().put("switch (").add(source).put(".tag) {").done());
+                var k = 0usize;
+                while k < rows.len() {
+                    let row = rows.get(k);
+                    let member = self.variant(row.label);
+                    let applied = walk.apply(row, Out::new().add(source).put(".payload.").add(member).done());
+                    self.line(Out::new().put("case ").usize(k).put(": ").add(dst).put(".payload.").add(member).put(" = ").add(applied)
+                        .put("; ").add(dst).put(".tag = ").usize(k).put("; break;").done());
+                    k = k + 1usize;
+                }
+                self.line(text("default: KUR_TRAP();\n  }"));
+                return ();
+            },
+            _ => (),
+        };
+        let (src_access, dst_access) = match skeleton {
+            Type::Array(_elem, _length) => (items_access(rows.len()), items_access(rows.len())),
+            _ => (member_names(self.members(skeleton)), member_names(self.members(out_shape))),
+        };
+        var source_access = src_access;
+        if is_foreach(t.source.get()) {
+            let inner_shape = self.shape(t.source.get());
+            source_access = match inner_shape {
+                Type::Array(_elem, _length) => items_access(rows.len()),
+                _ => member_names(self.members(inner_shape)),
+            };
+        }
+        var k = 0usize;
+        while k < rows.len() && k < source_access.len() && k < dst_access.len() {
+            let component = if pointer {
+                Out::new().put("KUR_FIELD(").add(source).put(", ").add(source_access.get(k)).put(")").done()
+            } else {
+                Out::new().add(source).put(".").add(source_access.get(k)).done()
+            };
+            let applied = walk.apply(rows.get(k), component);
+            self.line(Out::new().add(dst).put(".").add(dst_access.get(k)).put(" = ").add(applied).put(";").done());
+            k = k + 1usize;
+        }
+        if rows.is_empty() {
+            self.line(Out::new().add(dst).put(".dummy = 0;").done());
+        }
+    }
+
+    // ---------------------------------------------------------------- terminators --
+
+    fn term(self, term: Terminator) {
+        match term {
+            Terminator::Ret(value, _pos) => self.line(Out::new().put("return ").add(self.value_name(value)).put(";").done()),
+            Terminator::Jmp(edge, _pos) => self.edge(edge, Option::None, text("")),
+            Terminator::Jnz(cond, then, other, _pos) => {
+                self.line(Out::new().put("if (").add(self.value_name(cond)).put(") {").done());
+                self.edge(then, Option::None, text("  "));
+                self.line(text("} else {"));
+                self.edge(other, Option::None, text("  "));
+                self.line(text("}"));
+            },
+            Terminator::Switch(scrutinee, ty, arms, _pos) => self.switch(scrutinee, ty, arms),
+            Terminator::Unreachable(_pos) => self.line(text("KUR_TRAP();")),
+        };
+    }
+
+    // A jump assigns every target parameter at once, through scratch locals.
+    fn edge(self, edge: Edge, payload: Option[Text], indent: Text) {
+        let target = self.blocks.get().at(edge.target);
+        let values: Seq[Text] = Seq::new();
+        match payload {
+            Option::Some(p) => values.push(p),
+            Option::None => (),
+        };
+        var a = 0usize;
+        while a < edge.args.len() {
+            values.push(self.value_name(edge.args.get(a)));
+            a = a + 1usize;
+        }
+        let params: Seq[(Text, Type)] = Seq::new();
+        var p = 0usize;
+        while p < target.params.len() {
+            params.push((self.cname(target.label, target.params.get(p).name), target.params.get(p).type));
+            p = p + 1usize;
+        }
+        let temps: Seq[Text] = Seq::new();
+        var i = 0usize;
+        while i < params.len() && i < values.len() {
+            let (_cname, t) = params.get(i);
+            let temp = allocate(Out::new().put("edge_").usize(self.scratch.get()).done(), self.taken);
+            self.scratch.set(self.scratch.get() + 1usize);
+            self.decls.get().push(Out::new().add(self.c(self.substitute_type(t))).put(" ").add(temp).put(";").done());
+            self.line(Out::new().add(indent).add(temp).put(" = ").add(values.get(i)).put(";").done());
+            temps.push(temp);
+            i = i + 1usize;
+        }
+        var j = 0usize;
+        while j < params.len() && j < temps.len() {
+            let (cname, _t) = params.get(j);
+            self.line(Out::new().add(indent).add(cname).put(" = ").add(temps.get(j)).put(";").done());
+            j = j + 1usize;
+        }
+        self.line(Out::new().add(indent).put("goto ").add(self.labels.get().at(target.label)).put(";").done());
+    }
+
+    fn switch(self, arg: Text, ty: Type, arms: Seq[Arm]) {
+        let place = arg.starts_with(text("&"));
+        let source = if place {
+            let (expr, _t) = self.place(arg);
+            expr
+        } else {
+            self.value_name(arg)
+        };
+        let variants = self.types.variants(erase(self.substitute_type(ty), self.types), Option::None);
+        self.line(Out::new().put("switch (").add(source).put(".tag) {").done());
+        var i = 0usize;
+        while i < arms.len() {
+            let arm = arms.get(i);
+            var index = 0usize;
+            var found = false;
+            while !found && index < variants.len() {
+                if variants.get(index).name.eq(arm.variant) {
+                    found = true;
+                } else {
+                    index = index + 1usize;
+                }
+            }
+            self.line(Out::new().put("case ").usize(index).put(":").done());
+            let payload = if place {
+                Option::None
+            } else {
+                Option::Some.(Out::new().add(source).put(".payload.").add(self.variant(arm.variant)).done())
+            };
+            self.line(text("  {"));
+            self.edge(arm.edge, payload, text("    "));
+            self.line(text("  }"));
+            i = i + 1usize;
+        }
+        self.line(text("default: KUR_TRAP();"));
+        self.line(text("}"));
+    }
+}
+
+fn width(name: Text) -> u32 {
+    if name.is("f32") { 32u32 } else if name.is("f64") { 64u32 } else { C::integer_bits(name) }
+}
+
+fn wrap(expr: Text, bits: u32, signed: bool, ct: Text) -> Text {
+    if signed {
+        Out::new().put("kur_dec_i").u64(bits as u64).put("(").add(expr).put(")").done()
+    } else {
+        Out::new().put("(").add(ct).put(")(").add(expr).put(")").done()
+    }
+}
+
+fn last_member(members: Seq[Member], name: Text) -> Type {
+    var found: Option[Type] = Option::None;
+    var i = 0usize;
+    while i < members.len() {
+        if members.get(i).name.eq(name) {
+            found = Option::Some.(members.get(i).type);
+        }
+        i = i + 1usize;
+    }
+    match found {
+        Option::Some(t) => t,
+        Option::None => fail_text(text("internal error: no such variant")),
+    }
+}
+
+// One foreach instruction's mapping of its rows: the transform at the specialization, the mapper,
+// its traversal binders, its own type arguments and the captured values.
+exposed struct Walk {
+    backend: Backend,
+    t: ForeachType,
+    mapper: Fun,
+    mapper_name: Text,
+    binders: Seq[Text],
+    own: Seq[Type],
+    caps: Seq[Text],
+}
+
+impl Walk {
+    fn apply(self, row: Row, component: Text) -> Text {
+        let bound = self.backend.types.bind(self.t, row.item, row.extra);
+        let sub: Map[Text, Type] = Map::new();
+        var i = 0usize;
+        while i < self.mapper.params.len() && i < self.binders.len() {
+            sub.set(self.mapper.params.get(i).name, bound.at(self.binders.get(i)));
+            i = i + 1usize;
+        }
+        var j = self.binders.len();
+        while j < self.mapper.params.len() && j - self.binders.len() < self.own.len() {
+            sub.set(self.mapper.params.get(j).name, self.own.get(j - self.binders.len()));
+            j = j + 1usize;
+        }
+        let arguments = Seq::one(component);
+        arguments.append(self.caps);
+        Out::new().add(self.backend.request(FunKey::Function.(self.mapper_name), self.mapper, sub)).put("(").add(joined(arguments, ", ")).put(")").done()
+    }
+}
+
+fn emit_c(program: Program, checker: Checker, entry: Option[Text], counter: Fresh) -> Text {
+    Backend::new(program, checker, counter).emit_program(entry)
+}

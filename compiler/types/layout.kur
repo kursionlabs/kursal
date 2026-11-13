@@ -1,0 +1,261 @@
+// Finite type expansion, productive C aliases, and finite by-value layouts.
+//
+// First, recursive nominal applications pass parameters unchanged or choose fixed types. Then
+// symbolic unfolding checks aliases and stored values. Pointer and function representations break
+// storage cycles; aggregate names break C alias cycles. No concrete specialization budget is
+// needed.
+
+use package::support::base::{Map, Out, Seq, Set, Text, text};
+use package::kurs::core::{Kind, Program, Type};
+use package::kurs::core as C;
+use package::syntax::ast::no_pos;
+use package::types::termination::components;
+use package::types::ops::{Fresh, children, equal, foreach_binders, free_brands, free_names, kurs_error, overlap, subst, with_names};
+use std::option::Option;
+
+// A nominal application found while collecting: its owner declaration, the application, and the
+// owner's parameters and the names derived from them in scope there.
+exposed struct ExpansionSite {
+    owner: Text,
+    name: Text,
+    args: Seq[Type],
+    params: Set[Text],
+    derived: Set[Text],
+}
+
+exposed struct Expansion {
+    program: Program,
+    counter: Fresh,
+    graph: Map[Seq[Text], Set[Seq[Text]]],
+    sites: Seq[ExpansionSite],
+}
+
+fn without(names: Set[Text], removed: Set[Text]) -> Set[Text] {
+    let out: Set[Text] = Set::new();
+    let items = names.items();
+    var i = 0usize;
+    while i < items.len() {
+        if !removed.has(items.get(i)) {
+            out.add(items.get(i));
+        }
+        i = i + 1usize;
+    }
+    out
+}
+
+fn union(a: Set[Text], b: Set[Text]) -> Set[Text] {
+    with_names(a, b.items())
+}
+
+fn with_type(active: Seq[Type], t: Type) -> Seq[Type] {
+    let out = active.copy();
+    out.push(t);
+    out
+}
+
+fn any_equal(t: Type, active: Seq[Type]) -> bool {
+    var found = false;
+    var i = 0usize;
+    while !found && i < active.len() {
+        found = equal(t, active.get(i));
+        i = i + 1usize;
+    }
+    found
+}
+
+impl Expansion {
+    fn collect(self, owner: Text, ty: Type, bound: Set[Text], params: Set[Text], derived: Set[Text]) {
+        match ty {
+            Type::Named(name, args) => {
+                if !bound.has(name) && self.program.types.has(name) {
+                    self.graph.at(Seq::one(owner)).add(Seq::one(name));
+                    self.sites.push(ExpansionSite.{ owner, name, args, params, derived });
+                }
+                var i = 0usize;
+                while i < args.len() {
+                    self.collect(owner, args.get(i), bound, params, derived);
+                    i = i + 1usize;
+                }
+            },
+            Type::Foreach(f) => {
+                self.collect(owner, f.source.get(), bound, params, derived);
+                let binders = with_names(Set::new(), foreach_binders(f));
+                let tainted = if overlap(free_names(f.source.get()), union(params, derived)) { binders } else { Set::new() };
+                self.collect(owner, f.body.get(), union(bound, binders), without(params, binders), union(without(derived, binders), tainted));
+            },
+            _ => {
+                let parts = children(ty);
+                var i = 0usize;
+                while i < parts.len() {
+                    self.collect(owner, parts.get(i), bound, params, derived);
+                    i = i + 1usize;
+                }
+            },
+        }
+    }
+
+    fn unfold(self, name: Text, args: Seq[Type], bound: Set[Text]) -> Option[Type] {
+        if bound.has(name) || !self.program.types.has(name) {
+            // Formation reports unknown names and arities separately.
+            return Option::None;
+        }
+        let decl = self.program.types.at(name);
+        let sub: Map[Text, Type] = Map::new();
+        var i = 0usize;
+        while i < decl.params.len() && i < args.len() {
+            sub.set(decl.params.get(i).name, args.get(i));
+            i = i + 1usize;
+        }
+        Option::Some.(subst(decl.body, sub, self.counter))
+    }
+
+    // Brand identity cannot affect size or C representation. Equality also ignores alpha-renaming
+    // of binders in arguments introduced by subst.
+    fn key(self, name: Text, args: Seq[Type]) -> Type {
+        let out: Seq[Type] = Seq::new();
+        var i = 0usize;
+        while i < args.len() {
+            let a = args.get(i);
+            let sub: Map[Text, Type] = Map::new();
+            let brands = free_brands(a).items();
+            var b = 0usize;
+            while b < brands.len() {
+                sub.set(brands.get(b), Type::Skolem.(text("_")));
+                b = b + 1usize;
+            }
+            out.push(subst(a, sub, self.counter));
+            i = i + 1usize;
+        }
+        C::named(name, out)
+    }
+
+    // Demand just the outer shape needed by foreach rows (one pointer layer).
+    fn shape(self, ty: Type, active: Seq[Type], bound: Set[Text], pointer: bool) {
+        match ty {
+            Type::Named(name, args) => match self.unfold(name, args, bound) {
+                Option::Some(found) => {
+                    let current = self.key(name, args);
+                    if any_equal(current, active) {
+                        kurs_error(Out::new().put("recursive foreach source shape through ").add(name).done(), no_pos());
+                    }
+                    self.shape(found, with_type(active, current), bound, pointer);
+                },
+                Option::None => (),
+            },
+            Type::Foreach(f) => self.shape(f.source.get(), active, bound, true),
+            Type::Ptr(inner) => {
+                if pointer {
+                    self.shape(inner.get(), active, bound, false);
+                }
+            },
+            _ => (),
+        }
+    }
+
+    fn walk(self, ty: Type, active: Seq[Type], bound: Set[Text], aliases: bool) {
+        match ty {
+            Type::Named(name, args) => match self.unfold(name, args, bound) {
+                Option::Some(found) => {
+                    let current = self.key(name, args);
+                    if any_equal(current, active) {
+                        let reason = if aliases { text("recursive alias needs an aggregate boundary") } else { text("infinite by-value layout") };
+                        kurs_error(Out::new().put("type ").add(name).put(": ").add(reason).done(), no_pos());
+                    }
+                    self.walk(found, with_type(active, current), bound, aliases);
+                },
+                Option::None => (),
+            },
+            Type::Foreach(f) => {
+                self.shape(f.source.get(), Seq::new(), bound, true);
+                if aliases {
+                    // Every foreach result has an aggregate representation.
+                    return ();
+                }
+                self.walk(f.source.get(), active, bound, aliases);
+                self.walk(f.body.get(), active, with_names(bound, foreach_binders(f)), aliases);
+            },
+            Type::Brand(_b) => (),
+            Type::Ptr(_i) => if !aliases { () } else { self.walk_children(ty, active, bound, aliases) },
+            Type::Fn(_f) => if !aliases { () } else { self.walk_children(ty, active, bound, aliases) },
+            Type::Tuple(_e) => if aliases { () } else { self.walk_children(ty, active, bound, aliases) },
+            Type::Struct(_f) => if aliases { () } else { self.walk_children(ty, active, bound, aliases) },
+            Type::Enum(_v) => if aliases { () } else { self.walk_children(ty, active, bound, aliases) },
+            Type::Array(_e, length) => if aliases || length == 0u64 { () } else { self.walk_children(ty, active, bound, aliases) },
+            _ => self.walk_children(ty, active, bound, aliases),
+        }
+    }
+
+    fn walk_children(self, ty: Type, active: Seq[Type], bound: Set[Text], aliases: bool) {
+        let parts = children(ty);
+        var i = 0usize;
+        while i < parts.len() {
+            self.walk(parts.get(i), active, bound, aliases);
+            i = i + 1usize;
+        }
+    }
+}
+
+fn check_type_expansion(program: Program, counter: Fresh) {
+    let graph: Map[Seq[Text], Set[Seq[Text]]] = Map::new();
+    let names = program.types.keys();
+    var n = 0usize;
+    while n < names.len() {
+        graph.set(Seq::one(names.get(n)), Set::new());
+        n = n + 1usize;
+    }
+    let state = Expansion.{ program, counter, graph, sites: Seq::new() };
+    let decls = program.types.values();
+    var d = 0usize;
+    while d < decls.len() {
+        let decl = decls.get(d);
+        let params: Set[Text] = Set::new();
+        var p = 0usize;
+        while p < decl.params.len() {
+            if !C::same_kind(decl.params.get(p).kind, Kind::Brand) {
+                params.add(decl.params.get(p).name);
+            }
+            p = p + 1usize;
+        }
+        state.collect(decl.name, decl.body, params, params, Set::new());
+        d = d + 1usize;
+    }
+    let scc = components(graph);
+    var s = 0usize;
+    while s < state.sites.len() {
+        let site = state.sites.get(s);
+        if scc.at(Seq::one(site.owner)) == scc.at(Seq::one(site.name)) {
+            var a = 0usize;
+            while a < site.args.len() {
+                let arg = site.args.get(a);
+                let names = free_names(arg);
+                let bare = match arg {
+                    Type::Named(name, args) => args.is_empty() && site.params.has(name),
+                    _ => false,
+                };
+                if overlap(names, site.derived) || (overlap(names, site.params) && !bare) {
+                    kurs_error(Out::new().put("recursive type expansion ").add(site.owner).put(" -> ").add(site.name)
+                        .put(": arguments must be unchanged parameters or independent of them; foreach components of parameter-dependent sources may grow").done(), no_pos());
+                }
+                a = a + 1usize;
+            }
+        }
+        s = s + 1usize;
+    }
+    var r = 0usize;
+    while r < decls.len() {
+        let decl = decls.get(r);
+        let bound: Set[Text] = Set::new();
+        let root_args: Seq[Type] = Seq::new();
+        var p = 0usize;
+        while p < decl.params.len() {
+            let param = decl.params.get(p);
+            bound.add(param.name);
+            root_args.push(if C::same_kind(param.kind, Kind::Brand) { Type::Skolem.(param.name) } else { C::named(param.name, Seq::new()) });
+            p = p + 1usize;
+        }
+        let root = state.key(decl.name, root_args);
+        state.walk(decl.body, Seq::one(root), bound, false);
+        state.walk(decl.body, Seq::one(root), bound, true);
+        r = r + 1usize;
+    }
+}

@@ -1,0 +1,1757 @@
+// A hand-written recursive-descent parser for Kursal source, building the AST of `syntax`.
+//
+// The grammar is LL(1): the current token alone decides every choice. The parser never looks
+// further ahead and never backtracks. Errors stop the compiler with the file, line and column.
+
+use package::support::base::{Cell, Out, Seq, Text, alloc, fail, store_at, text};
+use package::syntax::ast as S;
+use package::syntax::ast::{Expr, Pos, Statement, Type};
+use std::slice::Slice;
+use std::option::Option;
+
+// Every keyword, each between spaces.
+fn keywords() -> Text {
+    text(" use export module struct tuple enum fn extern impl trait instance const forall where as exposed unsafe closure exists foreach of in for while if else match let var return pack sizeof true false self _ ")
+}
+// ------------------------------------------------------------------ lexer --
+
+// A token: its kind (a keyword or operator is its own text; otherwise NAME, INT, FLOAT, BYTE,
+// STRING, BRAND, TUPLE_INDEX, the f-string kinds, or EOF), its text and position.
+exposed struct Tok {
+    kind: Text,
+    text: Text,
+    line: u32,
+    col: u32,
+}
+
+exposed struct Lexer {
+    source: Text,
+    file: Text,
+    i: Cell[usize],
+    // The offset where each line starts.
+    lines: Seq[usize],
+    out: Seq[Tok],
+}
+
+fn is_digit(b: u8) -> bool {
+    b >= b'0' && b <= b'9'
+}
+
+fn is_hex(b: u8) -> bool {
+    is_digit(b) || (b >= b'a' && b <= b'f') || (b >= b'A' && b <= b'F')
+}
+
+fn is_space(b: u8) -> bool {
+    b == b' ' || b == b'\n' || b == b'\t' || b == b'\r' || b == 11u8 || b == 12u8
+}
+
+// A byte that can start a name: a letter, `_`, or any byte of a non-ASCII character.
+fn is_name_start(b: u8) -> bool {
+    (b >= b'a' && b <= b'z') || (b >= b'A' && b <= b'Z') || b == b'_' || b >= 128u8
+}
+
+fn is_name_byte(b: u8) -> bool {
+    is_name_start(b) || is_digit(b)
+}
+
+fn is_keyword(word: Text) -> bool {
+    keywords().contains(Out::new().put(" ").add(word).put(" ").done())
+}
+
+impl Lexer {
+    fn new(source: Text, file: Text) -> Lexer {
+        let lines: Seq[usize] = Seq::one(0usize);
+        var i = 0usize;
+        while i < source.len {
+            if source.byte(i) == b'\n' {
+                lines.push(i + 1usize);
+            }
+            i = i + 1usize;
+        }
+        Lexer.{ source, file, i: Cell::new(0usize), lines, out: Seq::new() }
+    }
+
+    fn at(self) -> usize {
+        self.i.get()
+    }
+
+    fn byte(self, offset: usize) -> u8 {
+        self.source.byte(offset)
+    }
+
+    // The line and column of `offset`; the column counts characters, not bytes.
+    fn loc(self, offset: usize) -> (u32, u32) {
+        var lo = 0usize;
+        var hi = self.lines.len();
+        while lo + 1usize < hi {
+            let mid = (lo + hi) / 2usize;
+            if self.lines.get(mid) <= offset {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        var col = 1u32;
+        var k = self.lines.get(lo);
+        while k < offset {
+            if (self.byte(k) & 192u8) != 128u8 {
+                col = col + 1u32;
+            }
+            k = k + 1usize;
+        }
+        ((lo + 1usize) as u32, col)
+    }
+
+    fn token(self, kind: Text, word: Text, start: usize) {
+        let (line, col) = self.loc(start);
+        self.out.push(Tok.{ kind, text: word, line, col });
+    }
+
+    fn fail_at(self, offset: usize) -> ! {
+        let (line, col) = self.loc(offset);
+        fail(Out::new().add(self.file).put(":").u64(line as u64).put(":").u64(col as u64).put(": syntax error").done())
+    }
+
+    fn run(self) -> Seq[Tok] {
+        let unit = self.expression(false);
+        self.token(text("EOF"), text(""), self.source.len);
+        self.out
+    }
+
+    // Tokens up to the end of the text; in an interpolation, up to its closing `}`, whose offset is
+    // returned.
+    fn expression(self, nested: bool) -> usize {
+        var depth = 0usize;
+        var closing = Option::None;
+        while closing.is_none() {
+            let start = self.at();
+            if start >= self.source.len {
+                if nested {
+                    fail(text("unterminated f-string interpolation"));
+                }
+                closing = Option::Some.(start);
+            } else if self.skip_blank(start) {
+                ()
+            } else {
+                let (kind, end) = self.scan(start);
+                self.i.set(end);
+                let word = self.source.slice(start, end);
+                if kind.is("FSTRING_START") {
+                    self.token(kind, word, start);
+                    self.fstring();
+                } else if kind.is("NAME") && is_keyword(word) {
+                    self.token(word, word, start);
+                } else if kind.is("OP") {
+                    if nested && (word.is("{") || word.is(".{")) {
+                        depth = depth + 1usize;
+                        self.token(word, word, start);
+                    } else if nested && word.is("}") {
+                        if depth == 0usize {
+                            closing = Option::Some.(start);
+                        } else {
+                            depth = depth - 1usize;
+                            self.token(word, word, start);
+                        }
+                    } else {
+                        self.token(word, word, start);
+                    }
+                } else {
+                    self.token(kind, word, start);
+                }
+            }
+        }
+        closing.unwrap_or(0usize)
+    }
+
+    // Skips whitespace or a comment at `start`, if there is one there.
+    fn skip_blank(self, start: usize) -> bool {
+        let b = self.byte(start);
+        if is_space(b) {
+            var i = start;
+            while i < self.source.len && is_space(self.byte(i)) {
+                i = i + 1usize;
+            }
+            self.i.set(i);
+            true
+        } else if b == b'/' && self.byte(start + 1usize) == b'/' {
+            var i = start;
+            while i < self.source.len && self.byte(i) != b'\n' {
+                i = i + 1usize;
+            }
+            self.i.set(i);
+            true
+        } else if b == b'/' && self.byte(start + 1usize) == b'*' {
+            match self.source.find(text("*/"), start + 2usize) {
+                Option::Some(end) => {
+                    self.i.set(end + 2usize);
+                    true
+                },
+                Option::None => false,
+            }
+        } else {
+            false
+        }
+    }
+
+    // The kind of the token at `start` and the offset where it ends.
+    fn scan(self, start: usize) -> (Text, usize) {
+        let b = self.byte(start);
+        let next = self.byte(start + 1usize);
+        if b == b'f' && next == b'"' {
+            return (text("FSTRING_START"), start + 2usize);
+        }
+        if b == b'b' && next == b'\'' {
+            match self.byte_literal(start + 2usize) {
+                Option::Some(end) => {
+                    return (text("BYTE"), end);
+                },
+                Option::None => (),
+            }
+        }
+        if b == b'"' {
+            match self.string_end(start + 1usize) {
+                Option::Some(end) => {
+                    return (text("STRING"), end);
+                },
+                Option::None => (),
+            }
+        }
+        if b == b'\'' && self.is_brand_byte(next) {
+            var i = start + 1usize;
+            while self.is_brand_byte(self.byte(i)) {
+                i = i + 1usize;
+            }
+            return (text("BRAND"), i);
+        }
+        if is_digit(b) {
+            return self.number(start);
+        }
+        if b == b'.' && is_digit(next) {
+            var i = start + 1usize;
+            while is_digit(self.byte(i)) {
+                i = i + 1usize;
+            }
+            return (text("TUPLE_INDEX"), i);
+        }
+        if is_name_start(b) {
+            var i = start;
+            while i < self.source.len && is_name_byte(self.byte(i)) {
+                i = i + 1usize;
+            }
+            return (text("NAME"), i);
+        }
+        (text("OP"), self.operator(start))
+    }
+
+    fn is_brand_byte(self, b: u8) -> bool {
+        (b >= b'a' && b <= b'z') || (b >= b'A' && b <= b'Z') || b == b'_' || is_digit(b)
+    }
+
+    // After `b'`: `\xHH`, `\c` or one other byte, then `'`.
+    fn byte_literal(self, i: usize) -> Option[usize] {
+        let b = self.byte(i);
+        let end = if b == b'\\' && self.byte(i + 1usize) == b'x' && is_hex(self.byte(i + 2usize)) && is_hex(self.byte(i + 3usize)) {
+            i + 4usize
+        } else if b == b'\\' && i + 1usize < self.source.len && self.byte(i + 1usize) != b'\n' {
+            i + 2usize
+        } else if b != b'\'' && b != b'\\' && i < self.source.len {
+            i + 1usize + self.continuation(i + 1usize)
+        } else {
+            return Option::None;
+        };
+        if self.byte(end) == b'\'' && end < self.source.len {
+            Option::Some.(end + 1usize)
+        } else {
+            Option::None
+        }
+    }
+
+    // The number of UTF-8 continuation bytes from `i`: one character is one regex `.`.
+    fn continuation(self, i: usize) -> usize {
+        var n = 0usize;
+        while i + n < self.source.len && (self.byte(i + n) & 192u8) == 128u8 {
+            n = n + 1usize;
+        }
+        n
+    }
+
+    // After `"`: the end of the string literal, past its closing quote.
+    fn string_end(self, start: usize) -> Option[usize] {
+        var i = start;
+        var end = Option::None;
+        var going = true;
+        while going {
+            if i >= self.source.len {
+                going = false;
+            } else {
+                let b = self.byte(i);
+                if b == b'"' {
+                    end = Option::Some.(i + 1usize);
+                    going = false;
+                } else if b == b'\\' {
+                    if i + 1usize >= self.source.len || self.byte(i + 1usize) == b'\n' {
+                        going = false;
+                    } else {
+                        i = i + 2usize + self.continuation(i + 2usize);
+                    }
+                } else {
+                    i = i + 1usize;
+                }
+            }
+        }
+        end
+    }
+
+    fn digits(self, i: usize, hex: bool, octal: bool, binary: bool) -> usize {
+        var i = i;
+        var going = true;
+        while going {
+            let b = self.byte(i);
+            let ok = b == b'_' || (if hex { is_hex(b) } else if octal { b >= b'0' && b <= b'7' } else if binary { b == b'0' || b == b'1' } else { is_digit(b) });
+            if ok && i < self.source.len {
+                i = i + 1usize;
+            } else {
+                going = false;
+            }
+        }
+        i
+    }
+
+    fn starts(self, at: usize, word: Slice[u8, 'static]) -> bool {
+        self.source.from(at).starts_with(text(word))
+    }
+
+    // A FLOAT or an INT at `start`, which is a digit.
+    fn number(self, start: usize) -> (Text, usize) {
+        let whole = self.digits(start, false, false, false);
+        if self.byte(whole) == b'.' && is_digit(self.byte(whole + 1usize)) {
+            let fraction = self.digits(whole + 1usize, false, false, false);
+            let end = if self.starts(fraction, "f32") || self.starts(fraction, "f64") { fraction + 3usize } else { fraction };
+            return (text("FLOAT"), end);
+        }
+        if self.starts(whole, "f32") || self.starts(whole, "f64") {
+            return (text("FLOAT"), whole + 3usize);
+        }
+        let b = self.byte(start);
+        let next = self.byte(start + 1usize);
+        let prefixed = b == b'0' && (next == b'x' || next == b'o' || next == b'b');
+        let body = if prefixed {
+            let end = self.digits(start + 2usize, next == b'x', next == b'o', next == b'b');
+            if end > start + 2usize { end } else { whole }
+        } else {
+            whole
+        };
+        (text("INT"), body + self.int_suffix(body))
+    }
+
+    fn int_suffix(self, at: usize) -> usize {
+        if self.starts(at, "i8") || self.starts(at, "u8") {
+            2usize
+        } else if self.starts(at, "i16") || self.starts(at, "i32") || self.starts(at, "i64") || self.starts(at, "u16") || self.starts(at, "u32") || self.starts(at, "u64") {
+            3usize
+        } else if self.starts(at, "isize") || self.starts(at, "usize") {
+            5usize
+        } else {
+            0usize
+        }
+    }
+
+    // The end of the operator at `start`, or a syntax error.
+    fn operator(self, start: usize) -> usize {
+        let rest = self.source.from(start);
+        if rest.starts_with(text("..=")) {
+            return start + 3usize;
+        }
+        let pairs = text(" .{ .( .. :: -> => == != <= >= << >> || && ");
+        if rest.len >= 2usize && pairs.contains(Out::new().put(" ").add(rest.slice(0usize, 2usize)).put(" ").done()) {
+            return start + 2usize;
+        }
+        let singles = text("-+*/%&|^!<>=.,;:()[]{}?");
+        var j = 0usize;
+        while j < singles.len {
+            if rest.len > 0usize && singles.byte(j) == rest.byte(0usize) {
+                return start + 1usize;
+            }
+            j = j + 1usize;
+        }
+        self.fail_at(start)
+    }
+
+    // After `f"`: text up to a `{` (FSTRING_OPEN; `{{` and `}}` stand for the brace), then ordinary
+    // tokens up to the matching `}` (FSTRING_CLOSE), then more text, until the closing quote
+    // (FSTRING_END). A text token is always produced, possibly empty.
+    fn fstring(self) {
+        var i = self.at();
+        var going = true;
+        while going {
+            let chunk = Out::new();
+            let begin = i;
+            var scanning = true;
+            while scanning {
+                if i >= self.source.len {
+                    fail(text("unterminated f-string"));
+                }
+                let ch = self.byte(i);
+                if ch == b'\\' {
+                    let width = if self.byte(i + 1usize) == b'x' { 4usize } else { 2usize };
+                    let unit = chunk.add(self.source.slice(i, i + width));
+                    i = i + width;
+                } else if (ch == b'{' || ch == b'}') && self.byte(i + 1usize) == ch {
+                    let unit = chunk.byte(ch);
+                    i = i + 2usize;
+                } else if ch == b'}' {
+                    let (line, col) = self.loc(begin);
+                    fail(Out::new().u64(line as u64).put(":").u64(col as u64).put(": a lone '}' in an f-string").done());
+                } else if ch == b'{' || ch == b'"' {
+                    scanning = false;
+                } else {
+                    let unit = chunk.byte(ch);
+                    i = i + 1usize;
+                }
+            }
+            self.token(text("FSTRING_TEXT"), chunk.done(), begin);
+            if self.byte(i) == b'"' {
+                self.token(text("FSTRING_END"), text("\""), i);
+                self.i.set(i + 1usize);
+                going = false;
+            } else {
+                self.token(text("FSTRING_OPEN"), text("{"), i);
+                self.i.set(i + 1usize);
+                let close = self.expression(true);
+                self.token(text("FSTRING_CLOSE"), text("}"), close);
+                i = self.at();
+            }
+        }
+    }
+}
+
+// ----------------------------------------------------------------- parser --
+
+// A statement, or a block's tail expression.
+exposed enum Parsed {
+    Stmt(Statement),
+    Tail(Expr),
+}
+
+exposed struct Parser {
+    toks: Seq[Tok],
+    i: Cell[usize],
+    file: Text,
+    // The next node id, shared by every file of a program.
+    ids: Cell[u32],
+}
+
+fn is_block_like(kind: Text) -> bool {
+    kind.is("{") || kind.is("if") || kind.is("match") || kind.is("while") || kind.is("for") || kind.is("foreach")
+}
+
+fn is_expr_start(kind: Text) -> bool {
+    is_block_like(kind) || kind.is("INT") || kind.is("FLOAT") || kind.is("BYTE") || kind.is("STRING")
+        || kind.is("FSTRING_START") || kind.is("true") || kind.is("false") || kind.is("NAME") || kind.is("self")
+        || kind.is("(") || kind.is("[") || kind.is("sizeof") || kind.is("-") || kind.is("!") || kind.is("*")
+        || kind.is("&") || kind.is("unsafe") || kind.is("|") || kind.is("||") || kind.is("return") || kind.is("pack")
+}
+
+// The binary operators of each precedence level, loosest first.
+fn level_has(level: usize, kind: Text) -> bool {
+    if level == 0usize {
+        kind.is("||")
+    } else if level == 1usize {
+        kind.is("&&")
+    } else if level == 2usize {
+        kind.is("==") || kind.is("!=") || kind.is("<=") || kind.is(">=") || kind.is("<") || kind.is(">")
+    } else if level == 3usize {
+        kind.is("|")
+    } else if level == 4usize {
+        kind.is("^")
+    } else if level == 5usize {
+        kind.is("&")
+    } else if level == 6usize {
+        kind.is("<<") || kind.is(">>")
+    } else if level == 7usize {
+        kind.is("+") || kind.is("-")
+    } else {
+        kind.is("*") || kind.is("/") || kind.is("%")
+    }
+}
+
+const LEVELS: usize = 9usize;
+const COMPARE: usize = 2usize;
+
+// The items of one source file. `ids` numbers the nodes.
+fn parse(source: Text, file: Text, ids: Cell[u32]) -> Seq[S::Item] {
+    let p = Parser.{ toks: Lexer::new(source, file).run(), i: Cell::new(0usize), file, ids };
+    p.file_items()
+}
+
+impl Parser {
+    // ---- tokens
+    fn tok(self) -> Tok {
+        self.toks.get(self.i.get())
+    }
+
+    fn k(self) -> Text {
+        self.tok().kind
+    }
+
+    fn at(self, kind: Slice[u8, 'static]) -> bool {
+        self.k().is(kind)
+    }
+
+    fn pos(self) -> Pos {
+        let t = self.tok();
+        Pos.{ line: t.line, col: t.col }
+    }
+
+    fn next(self) -> Tok {
+        let t = self.tok();
+        if !t.kind.is("EOF") {
+            self.i.set(self.i.get() + 1usize);
+        }
+        t
+    }
+
+    fn eat(self, kind: Slice[u8, 'static]) -> bool {
+        if self.at(kind) {
+            let unit = self.next();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect(self, kind: Slice[u8, 'static]) -> Tok {
+        if !self.at(kind) {
+            self.fail();
+        }
+        self.next()
+    }
+
+    fn fail(self) -> ! {
+        let t = self.tok();
+        fail(Out::new().add(self.file).put(":").u64(t.line as u64).put(":").u64(t.col as u64).put(": syntax error").done())
+    }
+
+    fn id(self) -> u32 {
+        let id = self.ids.get();
+        self.ids.set(id + 1u32);
+        id
+    }
+
+    fn name(self) -> Text {
+        self.expect("NAME").text
+    }
+
+    // ---- items
+    fn file_items(self) -> Seq[S::Item] {
+        let items: Seq[S::Item] = Seq::new();
+        while !self.at("EOF") {
+            items.push(self.item());
+        }
+        items
+    }
+
+    fn item(self) -> S::Item {
+        let quantifier = if self.at("forall") { Option::Some.(self.forall_clause()) } else { Option::None };
+        self.item_body(quantifier)
+    }
+
+    // `BRAND ("," BRAND)* "."`: nonempty, with no trailing comma.
+    fn brands(self) -> Seq[Text] {
+        let brands: Seq[Text] = Seq::one(self.expect("BRAND").text);
+        while self.eat(",") {
+            brands.push(self.expect("BRAND").text);
+        }
+        let unit = self.expect(".");
+        brands
+    }
+
+    fn forall_param(self) -> Text {
+        if !self.at("NAME") && !self.at("BRAND") {
+            self.fail();
+        }
+        self.next().text
+    }
+
+    fn forall_clause(self) -> S::Forall {
+        let unit = self.expect("forall");
+        let params: Seq[Text] = Seq::one(self.forall_param());
+        let determined: Seq[Text] = Seq::new();
+        let premises: Seq[S::Premise] = Seq::new();
+        while self.eat(",") {
+            params.push(self.forall_param());
+        }
+        if self.eat("->") {
+            determined.push(self.forall_param());
+            while self.eat(",") {
+                determined.push(self.forall_param());
+            }
+        }
+        if self.eat("where") {
+            premises.push(self.premise());
+            while self.eat(",") {
+                premises.push(self.premise());
+            }
+        }
+        let unit = self.expect(".");
+        S::Forall.{ params, determined, premises }
+    }
+
+    fn premise(self) -> S::Premise {
+        let trait_path = self.path();
+        let unit = self.expect("[");
+        let args = self.type_args();
+        let unit = self.expect("]");
+        S::Premise.{ trait_path, args }
+    }
+
+    fn item_body(self, quantifier: Option[S::Forall]) -> S::Item {
+        let k = self.k();
+        let start = self.pos();
+        if k.is("use") || k.is("export") {
+            let unit = self.next();
+            let tree = self.use_tree();
+            let unit = self.expect(";");
+            return S::Item::Use.(S::UseItem.{ tree, is_export: k.is("export"), quantifier, pos: start });
+        }
+        if k.is("module") {
+            let unit = self.next();
+            let names: Seq[Text] = Seq::one(self.name());
+            while self.eat("::") {
+                names.push(self.name());
+            }
+            let unit = self.expect(";");
+            return S::Item::Module.(S::Node.{ id: self.id(), value: names, pos: start });
+        }
+        if k.is("exposed") || k.is("struct") || k.is("tuple") || k.is("enum") {
+            return self.aggregate(quantifier);
+        }
+        if k.is("unsafe") {
+            let unit = self.next();
+            if self.at("instance") {
+                return S::Item::Instance.(self.instance_decl(start, true, quantifier));
+            }
+            return S::Item::Fn.(self.fn_rest(start, true, quantifier));
+        }
+        if k.is("instance") {
+            return S::Item::Instance.(self.instance_decl(start, false, quantifier));
+        }
+        if k.is("fn") {
+            return S::Item::Fn.(self.fn_rest(start, false, quantifier));
+        }
+        if k.is("extern") {
+            return S::Item::Extern.(self.extern_decl(quantifier));
+        }
+        if k.is("impl") {
+            return S::Item::Impl.(self.impl_block(quantifier));
+        }
+        if k.is("trait") {
+            let unit = self.next();
+            let name = self.name();
+            let unit = self.expect("{");
+            let methods: Seq[S::Fn] = Seq::new();
+            while !self.at("}") {
+                methods.push(self.fn_decl(Option::None));
+            }
+            let unit = self.next();
+            return S::Item::Trait.(S::TraitDecl.{ id: self.id(), name, methods, quantifier, pos: start });
+        }
+        if k.is("const") {
+            return S::Item::Const.(self.const_decl(quantifier));
+        }
+        self.fail()
+    }
+
+    fn use_tree(self) -> S::UseTree {
+        let path: Seq[Text] = Seq::one(self.name());
+        var star = false;
+        let children: Seq[S::UseTree] = Seq::new();
+        var going = true;
+        while going && self.eat("::") {
+            if self.at("NAME") {
+                path.push(self.next().text);
+            } else if self.eat("*") {
+                star = true;
+                going = false;
+            } else if self.eat("{") {
+                while !self.at("}") {
+                    children.push(self.use_tree());
+                    if !self.eat(",") {
+                        let unit = self.expect("}");
+                        return self.use_alias(path, star, children);
+                    }
+                }
+                let unit = self.expect("}");
+                going = false;
+            } else {
+                self.fail();
+            }
+        }
+        self.use_alias(path, star, children)
+    }
+
+    fn use_alias(self, path: Seq[Text], star: bool, children: Seq[S::UseTree]) -> S::UseTree {
+        let alias = if self.eat("as") { Option::Some.(self.name()) } else { Option::None };
+        S::UseTree.{ path, star, children, alias }
+    }
+
+    fn path(self) -> Seq[Text] {
+        let names: Seq[Text] = Seq::one(self.name());
+        while self.eat("::") {
+            names.push(self.name());
+        }
+        names
+    }
+
+    fn aggregate(self, quantifier: Option[S::Forall]) -> S::Item {
+        let start = self.pos();
+        let exposure = if self.eat("exposed") {
+            var scope = Option::None;
+            if self.eat("(") {
+                scope = Option::Some.(self.path());
+                let unit = self.expect(")");
+            }
+            Option::Some.(S::Exposed.{ scope })
+        } else {
+            Option::None
+        };
+        let kind = self.k();
+        if !kind.is("struct") && !kind.is("tuple") && !kind.is("enum") {
+            self.fail();
+        }
+        let unit = self.next();
+        let name = self.name();
+        let linear = self.eat("!");
+        if kind.is("struct") {
+            let unit = self.expect("{");
+            let fields: Seq[S::FieldDecl] = Seq::new();
+            while !self.at("}") {
+                let field_name = self.name();
+                let unit = self.expect(":");
+                fields.push(S::FieldDecl.{ name: field_name, type: self.type() });
+                if !self.eat(",") {
+                    let unit = self.expect("}");
+                    return S::Item::Struct.(S::StructDecl.{ id: self.id(), name, linear, fields, exposure, quantifier, pos: start });
+                }
+            }
+            let unit = self.expect("}");
+            return S::Item::Struct.(S::StructDecl.{ id: self.id(), name, linear, fields, exposure, quantifier, pos: start });
+        }
+        if kind.is("tuple") {
+            let unit = self.expect("(");
+            let elems = self.types_until_close();
+            let unit = self.expect(";");
+            return S::Item::Tuple.(S::TupleDecl.{ id: self.id(), name, linear, elems, exposure, quantifier, pos: start });
+        }
+        let unit = self.expect("{");
+        let variants: Seq[S::Variant] = Seq::new();
+        while !self.at("}") {
+            variants.push(self.variant());
+            if !self.eat(",") {
+                let unit = self.expect("}");
+                return S::Item::Enum.(S::EnumDecl.{ id: self.id(), name, linear, variants, exposure, quantifier, pos: start });
+            }
+        }
+        let unit = self.expect("}");
+        S::Item::Enum.(S::EnumDecl.{ id: self.id(), name, linear, variants, exposure, quantifier, pos: start })
+    }
+
+    // `type ("," type)* ","? ")"`, possibly empty; the `(` was read.
+    fn types_until_close(self) -> Seq[Type] {
+        let out: Seq[Type] = Seq::new();
+        var going = true;
+        while going && !self.at(")") {
+            out.push(self.type());
+            going = self.eat(",");
+        }
+        let unit = self.expect(")");
+        out
+    }
+
+    fn variant(self) -> S::Variant {
+        let name = self.name();
+        let payload: Seq[Type] = Seq::new();
+        if self.eat("(") {
+            payload.push(self.type());
+            var going = true;
+            while going && self.eat(",") {
+                if self.at(")") {
+                    going = false;
+                } else {
+                    payload.push(self.type());
+                }
+            }
+            let unit = self.expect(")");
+        }
+        S::Variant.{ name, payload }
+    }
+
+    fn params(self) -> Seq[S::Param] {
+        let out: Seq[S::Param] = Seq::new();
+        var going = true;
+        while going && !self.at(")") {
+            let lend = self.eat("&");
+            if out.is_empty() && self.eat("self") {
+                let type = if self.eat(":") { Option::Some.(self.type()) } else { Option::None };
+                out.push(S::Param.{ name: text("self"), type, lend });
+            } else {
+                let name = self.name();
+                let unit = self.expect(":");
+                out.push(S::Param.{ name, type: Option::Some.(self.ptype()), lend });
+            }
+            going = self.eat(",");
+        }
+        out
+    }
+
+    // `fn NAME "(" params? ")" ("->" type)?`, shared by definitions and externs.
+    fn fn_header(self) -> (Text, Seq[S::Param], Option[Type]) {
+        let unit = self.expect("fn");
+        let name = self.name();
+        let unit = self.expect("(");
+        let params = self.params();
+        let unit = self.expect(")");
+        let ret = if self.eat("->") { Option::Some.(self.type()) } else { Option::None };
+        (name, params, ret)
+    }
+
+    // `"unsafe"? fn_header (";" | block)`.
+    fn fn_decl(self, quantifier: Option[S::Forall]) -> S::Fn {
+        let start = self.pos();
+        let is_unsafe = self.eat("unsafe");
+        self.fn_rest(start, is_unsafe, quantifier)
+    }
+
+    fn fn_rest(self, start: Pos, is_unsafe: bool, quantifier: Option[S::Forall]) -> S::Fn {
+        let (name, params, ret) = self.fn_header();
+        let body = if self.eat(";") { Option::None } else { Option::Some.(self.block()) };
+        S::Fn.{ id: self.id(), name, params, ret, body, is_unsafe, quantifier, pos: start }
+    }
+
+    fn extern_decl(self, quantifier: Option[S::Forall]) -> S::Extern {
+        let start = self.pos();
+        let unit = self.expect("extern");
+        let raw = self.expect("STRING").text;
+        let abi = unescape(raw.slice(1usize, raw.len - 1usize));
+        let (name, params, ret) = self.fn_header();
+        let unit = self.expect(";");
+        S::Extern.{ id: self.id(), abi, name, params, ret, quantifier, pos: start }
+    }
+
+    fn const_decl(self, quantifier: Option[S::Forall]) -> S::Const {
+        let start = self.pos();
+        let unit = self.expect("const");
+        let name = self.name();
+        let unit = self.expect(":");
+        let type = self.type();
+        let unit = self.expect("=");
+        let value = self.expr();
+        let unit = self.expect(";");
+        S::Const.{ id: self.id(), name, type, value, quantifier, pos: start }
+    }
+
+    fn impl_block(self, quantifier: Option[S::Forall]) -> S::Impl {
+        let start = self.pos();
+        let unit = self.expect("impl");
+        let type = self.type();
+        let unit = self.expect("{");
+        let items: Seq[S::Member] = Seq::new();
+        while !self.at("}") {
+            let member_forall = if self.at("forall") { Option::Some.(self.forall_clause()) } else { Option::None };
+            if self.at("const") {
+                items.push(S::Member::Const.(self.const_decl(member_forall)));
+            } else {
+                items.push(S::Member::Fn.(self.fn_decl(member_forall)));
+            }
+        }
+        let unit = self.next();
+        S::Impl.{ id: self.id(), type, items, quantifier, pos: start }
+    }
+
+    fn instance_decl(self, start: Pos, is_unsafe: bool, quantifier: Option[S::Forall]) -> S::InstanceDecl {
+        let unit = self.expect("instance");
+        let type = self.type();
+        let unit = self.expect("{");
+        let methods: Seq[S::Fn] = Seq::new();
+        while !self.at("}") {
+            methods.push(self.fn_decl(Option::None));
+        }
+        let unit = self.next();
+        S::InstanceDecl.{ id: self.id(), type, methods, is_unsafe, quantifier, pos: start }
+    }
+
+    // ---- types
+    fn type(self) -> Type {
+        self.type_in(false)
+    }
+
+    // The type of a parameter, which may also be a `closure(...)` type whose environment is unnamed.
+    fn ptype(self) -> Type {
+        self.type_in(true)
+    }
+
+    fn type_in(self, parameter: bool) -> Type {
+        let k = self.k();
+        if k.is("NAME") {
+            return Type::Name.(self.named_type());
+        }
+        if k.is("*") {
+            let unit = self.next();
+            return Type::Ptr.(Cell::new(self.type()));
+        }
+        if k.is("!") {
+            let unit = self.next();
+            return Type::Never;
+        }
+        if k.is("(") {
+            let unit = self.next();
+            if self.eat(")") {
+                return Type::Tuple.(Seq::new());
+            }
+            let first = self.type();
+            if self.eat(")") {
+                return first;
+            }
+            let unit = self.expect(",");
+            let elems = self.types_until_close();
+            elems.insert(0usize, first);
+            return Type::Tuple.(elems);
+        }
+        if k.is("[") {
+            let unit = self.next();
+            let elem = self.type();
+            let unit = self.expect(";");
+            let length = self.expr();
+            let unit = self.expect("]");
+            return Type::Array.(Cell::new(elem), Cell::new(length));
+        }
+        if k.is("unsafe") || k.is("fn") {
+            let is_unsafe = self.eat("unsafe");
+            let unit = self.expect("fn");
+            let unit = self.expect("(");
+            let params = self.fn_params();
+            let unit = self.expect("->");
+            return Type::Fn.(S::TFn.{ params, ret: Cell::new(self.type()), is_unsafe });
+        }
+        if k.is("closure") {
+            let unit = self.next();
+            var env = Option::None;
+            if self.eat("[") {
+                env = Option::Some.(Cell::new(self.type()));
+                let unit = self.expect("]");
+            } else if !parameter {
+                self.fail();
+            }
+            let unit = self.expect("(");
+            let params = self.fn_params();
+            let unit = self.expect("->");
+            return Type::Closure.(S::TClosure.{ env, params, ret: Cell::new(self.type()) });
+        }
+        if k.is("exists") {
+            let unit = self.next();
+            let brands = self.brands();
+            return Type::Exists.(brands, Cell::new(self.type()));
+        }
+        if k.is("foreach") {
+            let unit = self.next();
+            let indirect = self.eat("*");
+            let binder = self.name();
+            let unit = self.expect("of");
+            let source = self.type();
+            let unit = self.expect("=>");
+            return Type::Foreach.(S::TForeach.{ binder, indirect, source: Cell::new(source), body: Cell::new(self.type()) });
+        }
+        if k.is("forall") {
+            let unit = self.next();
+            let quantified: Seq[Text] = Seq::one(self.forall_param());
+            while self.eat(",") {
+                quantified.push(self.forall_param());
+            }
+            let unit = self.expect(".");
+            return Type::Forall.(quantified, Cell::new(self.type()));
+        }
+        self.fail()
+    }
+
+    // The slots of a `fn(...)` or `closure(...)` type, after its `(`; the `)` is consumed.
+    fn fn_params(self) -> Seq[S::Slot] {
+        let out: Seq[S::Slot] = Seq::new();
+        var going = true;
+        while going && !self.at(")") {
+            if self.eat("&") {
+                if !self.at("NAME") && !self.at("_") {
+                    self.fail();
+                }
+                let unit = self.next();
+                let unit = self.expect(":");
+                out.push(S::Slot.{ lend: true, type: self.type() });
+            } else {
+                out.push(S::Slot.{ lend: false, type: self.ptype() });
+            }
+            going = self.eat(",");
+        }
+        let unit = self.expect(")");
+        out
+    }
+
+    fn named_type(self) -> S::TName {
+        let path = self.path();
+        let linear = self.eat("!");
+        if self.eat("[") {
+            let args = self.type_args();
+            let unit = self.expect("]");
+            S::TName.{ id: self.id(), path, linear, args: args.args, determined: args.determined }
+        } else {
+            S::TName.{ id: self.id(), path, linear, args: Seq::new(), determined: 0usize }
+        }
+    }
+
+    fn type_arg(self) -> Type {
+        if self.at("BRAND") {
+            return Type::Brand.(self.next().text);
+        }
+        if self.eat("_") {
+            return Type::Ignored;
+        }
+        self.type()
+    }
+
+    // `a, b` or `a, b -> c`, with an optional trailing comma; ends before the `]`.
+    fn type_args(self) -> S::TypeArgs {
+        let args: Seq[Type] = Seq::one(self.type_arg());
+        var split = Option::None;
+        var going = true;
+        while going {
+            if self.eat(",") {
+                if self.at("]") {
+                    going = false;
+                } else {
+                    args.push(self.type_arg());
+                }
+            } else if self.at("->") && split.is_none() {
+                let unit = self.next();
+                split = Option::Some.(args.len());
+                args.push(self.type_arg());
+            } else {
+                going = false;
+            }
+        }
+        let determined = match split {
+            Option::Some(at) => args.len() - at,
+            Option::None => 0usize,
+        };
+        S::TypeArgs.{ id: self.id(), args, determined }
+    }
+
+    // ---- statements
+    fn block(self) -> S::Block {
+        let start = self.pos();
+        let unit = self.expect("{");
+        let stmts: Seq[Statement] = Seq::new();
+        var tail = Option::None;
+        while !self.at("}") {
+            let unit = match self.statement() {
+                Parsed::Stmt(s) => stmts.push(s),
+                Parsed::Tail(e) => {
+                    tail = Option::Some.(Cell::new(e));
+                },
+            };
+        }
+        let unit = self.next();
+        S::Block.{ id: self.id(), stmts, tail, pos: start }
+    }
+
+    fn expr_stmt(self, e: Expr, start: Pos) -> Statement {
+        Statement::Expr.(S::Node.{ id: self.id(), value: e, pos: start })
+    }
+
+    // A statement; or, when the block ends right after it, a bare expression (its tail).
+    fn statement(self) -> Parsed {
+        let k = self.k();
+        let start = self.pos();
+        if k.is("let") {
+            return Parsed::Stmt.(Statement::Let.(self.let_stmt()));
+        }
+        if k.is("var") {
+            let unit = self.next();
+            let name = self.name();
+            let type = if self.eat(":") { Option::Some.(self.type()) } else { Option::None };
+            let unit = self.expect("=");
+            let value = self.expr();
+            let unit = self.expect(";");
+            return Parsed::Stmt.(Statement::Var.(S::Var.{ id: self.id(), name, type, value, pos: start }));
+        }
+        if k.is("const") {
+            return Parsed::Stmt.(Statement::Const.(self.const_decl(Option::None)));
+        }
+        if is_block_like(k) {
+            let e = self.block_like();
+            let looping = match e {
+                Expr::While(w) => true,
+                Expr::For(f) => true,
+                _ => false,
+            };
+            if !self.eat(";") && self.at("}") && !looping {
+                return Parsed::Tail.(e);
+            }
+            return Parsed::Stmt.(self.expr_stmt(e, start));
+        }
+        let e = if k.is("unsafe") {
+            let unit = self.next();
+            let star = self.pos();
+            if self.eat("*") {
+                let target = self.unary();
+                if self.eat("=") {
+                    // a store: `unsafe *p = v;`
+                    let value = self.expr();
+                    let unit = self.expect(";");
+                    let store = Expr::UnsafeStore.(S::UnsafeStore.{ id: self.id(), pointer: Cell::new(target), value: Cell::new(value), pos: start });
+                    let marked = Expr::Unary.(S::Unary.{ id: self.id(), op: text("unsafe"), operand: Cell::new(store), pos: start });
+                    return Parsed::Stmt.(self.expr_stmt(marked, start));
+                }
+                let deref = Expr::Unary.(S::Unary.{ id: self.id(), op: text("*"), operand: Cell::new(target), pos: star });
+                self.oexpr_from(Expr::Unary.(S::Unary.{ id: self.id(), op: text("unsafe"), operand: Cell::new(deref), pos: start }))
+            } else {
+                let operand = self.unary();
+                self.oexpr_from(Expr::Unary.(S::Unary.{ id: self.id(), op: text("unsafe"), operand: Cell::new(operand), pos: start }))
+            }
+        } else {
+            self.expr()
+        };
+        if self.eat("=") {
+            if !assignable(e) {
+                self.fail();
+            }
+            let value = self.expr();
+            let unit = self.expect(";");
+            return Parsed::Stmt.(Statement::Assign.(S::Assign.{ target: e, value, pos: start }));
+        }
+        if self.eat(";") {
+            return Parsed::Stmt.(self.expr_stmt(e, start));
+        }
+        let returning = match e {
+            Expr::Return(r) => true,
+            _ => false,
+        };
+        if self.at("}") && !returning {
+            return Parsed::Tail.(e);
+        }
+        self.fail()
+    }
+
+    fn let_stmt(self) -> S::Let {
+        let start = self.pos();
+        let unit = self.expect("let");
+        let brands = if self.eat("exists") { self.brands() } else { Seq::new() };
+        let pattern = self.pattern();
+        let type = if self.eat(":") { Option::Some.(self.type()) } else { Option::None };
+        let unit = self.expect("=");
+        let value = self.expr();
+        let unit = self.expect(";");
+        S::Let.{ id: self.id(), pattern, type, value, brands, pos: start }
+    }
+
+    fn pattern(self) -> S::Pattern {
+        let k = self.k();
+        let start = self.pos();
+        if k.is("NAME") {
+            return S::Pattern::Bind.(S::Node.{ id: self.id(), value: self.next().text, pos: start });
+        }
+        if k.is("_") {
+            let unit = self.next();
+            return S::Pattern::Wild.(self.id());
+        }
+        if k.is("(") {
+            let unit = self.next();
+            let elems: Seq[S::Pattern] = Seq::new();
+            if self.eat(")") {
+                return S::Pattern::Tuple.(S::Node.{ id: self.id(), value: elems, pos: start });
+            }
+            elems.push(self.pattern());
+            let unit = self.expect(",");
+            var going = true;
+            while going && !self.at(")") {
+                elems.push(self.pattern());
+                going = self.eat(",");
+            }
+            let unit = self.expect(")");
+            return S::Pattern::Tuple.(S::Node.{ id: self.id(), value: elems, pos: start });
+        }
+        if k.is("[") {
+            let unit = self.next();
+            let elems: Seq[S::Pattern] = Seq::one(self.pattern());
+            var going = true;
+            while going && self.eat(",") {
+                if self.at("]") {
+                    going = false;
+                } else {
+                    elems.push(self.pattern());
+                }
+            }
+            let unit = self.expect("]");
+            return S::Pattern::Array.(S::Node.{ id: self.id(), value: elems, pos: start });
+        }
+        if k.is("{") {
+            let unit = self.next();
+            let fields: Seq[S::FieldPattern] = Seq::new();
+            var rest = Option::None;
+            if self.at("..") {
+                rest = Option::Some.(self.spread());
+            } else if !self.at("}") {
+                fields.push(self.field_pattern());
+                var going = true;
+                while going && self.eat(",") {
+                    if self.at("}") {
+                        going = false;
+                    } else if self.at("..") {
+                        rest = Option::Some.(self.spread());
+                        let unit = self.eat(",");
+                        going = false;
+                    } else {
+                        fields.push(self.field_pattern());
+                    }
+                }
+            }
+            let unit = self.expect("}");
+            return S::Pattern::Struct.(S::PStruct.{ id: self.id(), fields, rest });
+        }
+        self.fail()
+    }
+
+    fn field_pattern(self) -> S::FieldPattern {
+        let start = self.pos();
+        let name = self.name();
+        let pattern = if self.eat(":") { self.pattern() } else { S::Pattern::Bind.(S::Node.{ id: self.id(), value: name, pos: start }) };
+        S::FieldPattern.{ name, pattern }
+    }
+
+    fn spread(self) -> Text {
+        let unit = self.expect("..");
+        self.name()
+    }
+
+    // ---- expressions
+    // A whole expression: an operator expression, or a block-like, closure, `return` or `pack` form.
+    fn expr(self) -> Expr {
+        let k = self.k();
+        if is_block_like(k) {
+            return self.block_like();
+        }
+        if k.is("|") || k.is("||") {
+            return self.closure_expr();
+        }
+        if k.is("return") {
+            let start = self.pos();
+            let unit = self.next();
+            let value = if is_expr_start(self.k()) { Option::Some.(Cell::new(self.expr())) } else { Option::None };
+            return Expr::Return.(S::Node.{ id: self.id(), value, pos: start });
+        }
+        if k.is("pack") {
+            let start = self.pos();
+            let unit = self.next();
+            let brands = self.brands();
+            let value = self.expr();
+            return Expr::Pack.(S::Pack.{ id: self.id(), brands, value: Cell::new(value), pos: start });
+        }
+        self.oexpr()
+    }
+
+    fn block_like(self) -> Expr {
+        let k = self.k();
+        let start = self.pos();
+        if k.is("{") {
+            return Expr::Block.(self.block());
+        }
+        let unit = self.next();
+        if k.is("if") {
+            let cond = self.oexpr();
+            let then = self.block();
+            var other = Option::None;
+            if self.eat("else") {
+                if self.at("{") {
+                    other = Option::Some.(Cell::new(Expr::Block.(self.block())));
+                } else if self.at("if") {
+                    other = Option::Some.(Cell::new(self.block_like()));
+                } else {
+                    self.fail();
+                }
+            }
+            return Expr::If.(S::If.{ id: self.id(), cond: Cell::new(cond), then, other, pos: start });
+        }
+        if k.is("match") {
+            return self.match_rest(start);
+        }
+        if k.is("while") {
+            let cond = self.oexpr();
+            let body = self.block();
+            return Expr::While.(S::While.{ id: self.id(), cond: Cell::new(cond), body, pos: start });
+        }
+        if k.is("for") {
+            let name = self.name();
+            let unit = self.expect("in");
+            let iterator = self.oexpr();
+            let body = self.block();
+            return Expr::For.(S::For.{ id: self.id(), name, iterator: Cell::new(iterator), body, pos: start });
+        }
+        // foreach
+        let name = self.name();
+        let binder = if self.eat(":") { Option::Some.(self.name()) } else { Option::None };
+        let unit = self.expect("of");
+        let source = self.oexpr();
+        let body = self.block();
+        Expr::Foreach.(S::Foreach.{ id: self.id(), name, binder, source: Cell::new(source), body, pos: start })
+    }
+
+    fn match_rest(self, start: Pos) -> Expr {
+        let scrutinee = self.oexpr();
+        let unit = self.expect("{");
+        let arms: Seq[S::Arm] = Seq::new();
+        var going = true;
+        while going && !self.at("}") {
+            let at = self.pos();
+            if self.eat("_") {
+                // the wildcard arm is the last one
+                let unit = self.expect("=>");
+                let body = self.expr();
+                let unit = self.eat(",");
+                let wild = S::Case.{ id: self.id(), kind: S::CaseKind::Wild, path: Option::None, binders: Option::None, low: Option::None, high: Option::None, pos: at };
+                arms.push(S::Arm.{ cases: Seq::one(wild), body, pos: at });
+                going = false;
+            } else {
+                let cases: Seq[S::Case] = Seq::one(self.case());
+                while self.eat("|") {
+                    cases.push(self.case());
+                }
+                let unit = self.expect("=>");
+                // A block-like body's comma is optional; any other body needs one, unless the arm is
+                // last (and is not a `return`).
+                let block_like = is_block_like(self.k());
+                let body = self.expr();
+                let returning = match body {
+                    Expr::Return(r) => true,
+                    _ => false,
+                };
+                if !(self.eat(",") || block_like || (self.at("}") && !returning)) {
+                    self.fail();
+                }
+                arms.push(S::Arm.{ cases, body, pos: at });
+            }
+        }
+        let unit = self.expect("}");
+        Expr::Match.(S::Match.{ id: self.id(), scrutinee: Cell::new(scrutinee), arms, pos: start })
+    }
+
+    fn case(self) -> S::Case {
+        let start = self.pos();
+        if self.at("INT") || self.at("BYTE") || self.at("-") {
+            let low = self.lit_value();
+            let high = if self.eat("..=") { self.lit_value() } else { low };
+            return S::Case.{ id: self.id(), kind: S::CaseKind::Value, path: Option::None, binders: Option::None, low: Option::Some.(low), high: Option::Some.(high), pos: start };
+        }
+        let path = self.expr_path();
+        var binders = Option::None;
+        if self.eat("(") {
+            let names: Seq[Text] = Seq::new();
+            var going = true;
+            while going && !self.at(")") {
+                if !self.at("NAME") && !self.at("_") {
+                    self.fail();
+                }
+                names.push(self.next().text);
+                going = self.eat(",");
+            }
+            let unit = self.expect(")");
+            if !names.is_empty() {
+                binders = Option::Some.(names);
+            }
+        }
+        S::Case.{ id: self.id(), kind: S::CaseKind::Variant, path: Option::Some.(path), binders, low: Option::None, high: Option::None, pos: start }
+    }
+
+    fn lit_value(self) -> S::Lit {
+        let negative = self.eat("-");
+        if !self.at("INT") && !self.at("BYTE") {
+            self.fail();
+        }
+        let value = self.literal();
+        let { negative: unsigned, ..rest } = value;
+        S::Lit.{ negative, ..rest }
+    }
+
+    fn closure_expr(self) -> Expr {
+        let start = self.pos();
+        let params: Seq[S::ClosureParam] = Seq::new();
+        if !self.eat("||") {
+            let unit = self.expect("|");
+            var going = true;
+            while going && !self.at("|") {
+                let lend = self.eat("&");
+                let name = self.name();
+                let type = if self.eat(":") { Option::Some.(self.ptype()) } else { Option::None };
+                params.push(S::ClosureParam.{ lend, name, type });
+                going = self.eat(",");
+            }
+            let unit = self.expect("|");
+        }
+        if self.eat("->") {
+            let ret = self.type();
+            let body = Expr::Block.(self.block());
+            return Expr::Closure.(S::Closure.{ id: self.id(), params, ret: Option::Some.(ret), body: Cell::new(body), pos: start });
+        }
+        let body = self.expr();
+        Expr::Closure.(S::Closure.{ id: self.id(), params, ret: Option::None, body: Cell::new(body), pos: start })
+    }
+
+    fn oexpr(self) -> Expr {
+        self.level(0usize, Option::None)
+    }
+
+    // An operator expression whose first operand, `first`, was already read.
+    fn oexpr_from(self, first: Expr) -> Expr {
+        self.level(0usize, Option::Some.(first))
+    }
+
+    fn level(self, precedence: usize, first: Option[Expr]) -> Expr {
+        if precedence == LEVELS {
+            return self.cast(first);
+        }
+        let start = match first {
+            Option::Some(e) => S::expr_pos(e),
+            Option::None => self.pos(),
+        };
+        var left = self.level(precedence + 1usize, first);
+        var going = true;
+        while going && level_has(precedence, self.k()) {
+            let op = self.next().text;
+            let right = self.level(precedence + 1usize, Option::None);
+            left = Expr::Binop.(S::Binop.{ id: self.id(), op, left: Cell::new(left), right: Cell::new(right), pos: start });
+            // comparisons do not chain
+            going = precedence != COMPARE;
+        }
+        left
+    }
+
+    fn cast(self, first: Option[Expr]) -> Expr {
+        let start = match first {
+            Option::Some(e) => S::expr_pos(e),
+            Option::None => self.pos(),
+        };
+        var left = match first {
+            Option::Some(e) => e,
+            Option::None => self.unary(),
+        };
+        while self.eat("as") {
+            let type = self.type();
+            left = Expr::Cast.(S::Cast.{ id: self.id(), value: Cell::new(left), type, pos: start });
+        }
+        left
+    }
+
+    fn unary(self) -> Expr {
+        let k = self.k();
+        let start = self.pos();
+        if k.is("-") || k.is("!") || k.is("*") || k.is("&") || k.is("unsafe") {
+            let unit = self.next();
+            let operand = self.unary();
+            return Expr::Unary.(S::Unary.{ id: self.id(), op: k, operand: Cell::new(operand), pos: start });
+        }
+        self.postfix()
+    }
+
+    fn postfix(self) -> Expr {
+        let start = self.pos();
+        var e = self.atom();
+        var after_index = false;
+        var going = true;
+        while going {
+            let k = self.k();
+            if k.is(".") {
+                let unit = self.next();
+                let name = self.name();
+                e = Expr::Field.(S::Field.{ id: self.id(), value: Cell::new(e), name, pos: start });
+                after_index = false;
+            } else if k.is("(") {
+                let unit = self.next();
+                let args = self.exprs_until(")");
+                e = Expr::Call.(S::Call.{ id: self.id(), callee: Cell::new(e), args, pos: start });
+                after_index = false;
+            } else if k.is("?") {
+                let unit = self.next();
+                e = Expr::Try.(S::Node.{ id: self.id(), value: Cell::new(e), pos: start });
+                after_index = false;
+            } else if k.is("TUPLE_INDEX") && !after_index {
+                // `p.0.1` is written `(p.0).1`
+                let t = self.next();
+                let index = t.text.from(1usize).to_usize().unwrap_or(0usize);
+                e = Expr::Index.(S::Index.{ id: self.id(), value: Cell::new(e), index, pos: start });
+                after_index = true;
+            } else {
+                going = false;
+            }
+        }
+        e
+    }
+
+    // `expr ("," expr)* ","? close`, possibly empty; consumes `close`.
+    fn exprs_until(self, close: Slice[u8, 'static]) -> Seq[Expr] {
+        let out: Seq[Expr] = Seq::new();
+        var going = true;
+        while going && !self.at(close) {
+            out.push(self.expr());
+            going = self.eat(",");
+        }
+        let unit = self.expect(close);
+        out
+    }
+
+    fn atom(self) -> Expr {
+        let k = self.k();
+        let start = self.pos();
+        if k.is("INT") || k.is("FLOAT") || k.is("BYTE") || k.is("STRING") || k.is("true") || k.is("false") {
+            return Expr::Lit.(self.literal());
+        }
+        if k.is("FSTRING_START") {
+            let unit = self.next();
+            let parts: Seq[S::Piece] = Seq::one(S::Piece::Text.(unescape(self.expect("FSTRING_TEXT").text)));
+            while self.eat("FSTRING_OPEN") {
+                parts.push(S::Piece::Expr.(self.expr()));
+                let unit = self.expect("FSTRING_CLOSE");
+                parts.push(S::Piece::Text.(unescape(self.expect("FSTRING_TEXT").text)));
+            }
+            let unit = self.expect("FSTRING_END");
+            return Expr::FStr.(S::FStr.{ id: self.id(), parts, pos: start });
+        }
+        if k.is("(") {
+            let unit = self.next();
+            if self.eat(")") {
+                return Expr::Tuple.(S::Node.{ id: self.id(), value: Seq::new(), pos: start });
+            }
+            let first = self.expr();
+            if self.eat(")") {
+                return first;
+            }
+            let unit = self.expect(",");
+            let elems = self.exprs_until(")");
+            elems.insert(0usize, first);
+            return Expr::Tuple.(S::Node.{ id: self.id(), value: elems, pos: start });
+        }
+        if k.is("[") {
+            let unit = self.next();
+            let elems: Seq[Expr] = Seq::new();
+            var fill = false;
+            if !self.at("]") {
+                elems.push(self.expr());
+                var going = true;
+                while going && self.eat(",") {
+                    if self.at("]") {
+                        going = false;
+                    } else if self.eat("..") {
+                        fill = true;
+                        let unit = self.eat(",");
+                        going = false;
+                    } else {
+                        elems.push(self.expr());
+                    }
+                }
+            }
+            let unit = self.expect("]");
+            return Expr::Array.(S::ArrayLit.{ id: self.id(), elems, fill, pos: start });
+        }
+        if k.is("sizeof") {
+            let unit = self.next();
+            let unit = self.expect("[");
+            let type = self.type();
+            let unit = self.expect("]");
+            let unit = self.expect("(");
+            let unit = self.expect(")");
+            return Expr::Sizeof.(S::Node.{ id: self.id(), value: type, pos: start });
+        }
+        let path = self.expr_path();
+        if self.eat(".{") {
+            let fields: Seq[S::FieldInit] = Seq::new();
+            var spread = Option::None;
+            if self.at("..") {
+                spread = Option::Some.(self.spread());
+            } else if !self.at("}") {
+                fields.push(self.field_init());
+                var going = true;
+                while going && self.eat(",") {
+                    if self.at("}") {
+                        going = false;
+                    } else if self.at("..") {
+                        spread = Option::Some.(self.spread());
+                        let unit = self.eat(",");
+                        going = false;
+                    } else {
+                        fields.push(self.field_init());
+                    }
+                }
+            }
+            let unit = self.expect("}");
+            return Expr::StructLit.(S::StructLit.{ id: self.id(), path, fields, spread, pos: start });
+        }
+        if self.eat(".(") {
+            let args = self.exprs_until(")");
+            return Expr::Call.(S::Call.{ id: self.id(), callee: Cell::new(Expr::Path.(path)), args, pos: start });
+        }
+        Expr::Path.(path)
+    }
+
+    fn field_init(self) -> S::FieldInit {
+        let name = self.name();
+        let value = if self.eat(":") { Option::Some.(self.expr()) } else { Option::None };
+        S::FieldInit.{ name, value }
+    }
+
+    fn expr_path(self) -> S::Path {
+        let start = self.pos();
+        let segments: Seq[S::Segment] = Seq::new();
+        var going = true;
+        while going {
+            if !self.at("NAME") && !self.at("self") {
+                self.fail();
+            }
+            let name = self.next().text;
+            let linear = self.eat("!");
+            let args = if self.eat("[") {
+                let parsed = self.type_args();
+                let unit = self.expect("]");
+                parsed.args
+            } else {
+                Seq::new()
+            };
+            segments.push(S::Segment.{ name, linear, args });
+            going = self.eat("::");
+        }
+        S::Path.{ id: self.id(), segments, pos: start }
+    }
+
+    fn literal(self) -> S::Lit {
+        let k = self.k();
+        if !(k.is("INT") || k.is("FLOAT") || k.is("BYTE") || k.is("STRING") || k.is("true") || k.is("false")) {
+            self.fail();
+        }
+        let tok = self.next();
+        let p = Pos.{ line: tok.line, col: tok.col };
+        let word = tok.text;
+        let id = self.id();
+        if k.is("INT") {
+            let (digits, suffix) = split_int_suffix(word);
+            let (value, ok) = int_value(digits);
+            if !ok {
+                fail(Out::new().add(self.file).put(":").u64(tok.line as u64).put(":").u64(tok.col as u64).put(": integer literal out of range").done());
+            }
+            return S::Lit.{ id, kind: S::LitKind::Int, int: value, negative: false, text: word, suffix, pos: p };
+        }
+        if k.is("FLOAT") {
+            let (digits, suffix) = if word.ends_with(text("f32")) || word.ends_with(text("f64")) {
+                (word.slice(0usize, word.len - 3usize), Option::Some.(word.from(word.len - 3usize)))
+            } else {
+                (word, Option::None)
+            };
+            return S::Lit.{ id, kind: S::LitKind::Float, int: 0u64, negative: false, text: without_underscores(digits), suffix, pos: p };
+        }
+        if k.is("BYTE") {
+            let byte = unescape(word.slice(2usize, word.len - 1usize));
+            return S::Lit.{ id, kind: S::LitKind::Int, int: byte.byte(0usize) as u64, negative: false, text: word, suffix: Option::Some.(text("u8")), pos: p };
+        }
+        if k.is("STRING") {
+            return S::Lit.{ id, kind: S::LitKind::Str, int: 0u64, negative: false, text: unescape(word.slice(1usize, word.len - 1usize)), suffix: Option::None, pos: p };
+        }
+        S::Lit.{ id, kind: S::LitKind::Bool, int: if k.is("true") { 1u64 } else { 0u64 }, negative: false, text: word, suffix: Option::None, pos: p }
+    }
+}
+
+// The left side of `=`: a name, then fields and tuple elements (`x`, `self.n`, `(p.0).1`).
+fn assignable(e: Expr) -> bool {
+    match e {
+        Expr::Path(p) => p.segments.len() == 1usize && !p.segments.get(0usize).linear && p.segments.get(0usize).args.is_empty(),
+        Expr::Field(f) => assignable(f.value.get()),
+        Expr::Index(i) => assignable(i.value.get()),
+        _ => false,
+    }
+}
+
+fn split_int_suffix(word: Text) -> (Text, Option[Text]) {
+    let suffixes = text("isize usize i8 i16 i32 i64 u8 u16 u32 u64").split(text(" "));
+    var k = 0usize;
+    var found = Option::None;
+    while found.is_none() && k < suffixes.len() {
+        if word.ends_with(suffixes.get(k)) {
+            found = Option::Some.(suffixes.get(k));
+        }
+        k = k + 1usize;
+    }
+    match found {
+        Option::Some(s) => (word.slice(0usize, word.len - s.len), Option::Some.(s)),
+        Option::None => (word, Option::None),
+    }
+}
+
+fn without_underscores(word: Text) -> Text {
+    let out = Out::new();
+    var i = 0usize;
+    while i < word.len {
+        if word.byte(i) != b'_' {
+            let unit = out.byte(word.byte(i));
+        }
+        i = i + 1usize;
+    }
+    out.done()
+}
+
+// The value of decimal, `0x`, `0o` or `0b` digits; false when it does not fit in 64 bits.
+fn int_value(word: Text) -> (u64, bool) {
+    let digits = without_underscores(word);
+    let base = if digits.starts_with(text("0x")) { 16u64 } else if digits.starts_with(text("0o")) { 8u64 } else if digits.starts_with(text("0b")) { 2u64 } else { 10u64 };
+    let body = if base == 10u64 { digits } else { digits.from(2usize) };
+    var value = 0u64;
+    var ok = true;
+    var i = 0usize;
+    while i < body.len {
+        let b = body.byte(i);
+        let d = if b >= b'0' && b <= b'9' { (b - b'0') as u64 } else if b >= b'a' && b <= b'f' { (b - b'a') as u64 + 10u64 } else { (b - b'A') as u64 + 10u64 };
+        if value > (18446744073709551615u64 - d) / base {
+            ok = false;
+        } else {
+            value = value * base + d;
+        }
+        i = i + 1usize;
+    }
+    (value, ok)
+}
+
+// The bytes `\n`, `\t`, `\r`, `\0`, `\\`, `\'`, `\"` and `\xHH` stand for.
+fn unescape(raw: Text) -> Text {
+    let out = Out::new();
+    var i = 0usize;
+    while i < raw.len {
+        let b = raw.byte(i);
+        if b == b'\\' && raw.byte(i + 1usize) == b'x' {
+            let (value, ok) = int_value(Out::new().put("0x").add(raw.slice(i + 2usize, i + 4usize)).done());
+            let unit = out.byte(value as u8);
+            i = i + 4usize;
+        } else if b == b'\\' {
+            let c = raw.byte(i + 1usize);
+            let byte = if c == b'n' {
+                b'\n'
+            } else if c == b't' {
+                b'\t'
+            } else if c == b'r' {
+                b'\r'
+            } else if c == b'0' {
+                0u8
+            } else if c == b'\\' || c == b'\'' || c == b'"' {
+                c
+            } else {
+                fail(Out::new().put("unknown escape \\").add(raw.slice(i + 1usize, i + 2usize)).done())
+            };
+            let unit = out.byte(byte);
+            i = i + 2usize;
+        } else {
+            let unit = out.byte(b);
+            i = i + 1usize;
+        }
+    }
+    out.done()
+}

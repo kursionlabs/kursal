@@ -1,0 +1,689 @@
+// Frontend SSA promotion for roots whose types contain nongeneric brands.
+//
+// Place planning establishes which complete contents reach each edge. This pass threads those
+// contents explicitly; it does not relax core local formation. Projected products are decomposed
+// and rebuilt; lends use a generic value adapter. Sum refinements and opened root views require a
+// further representation extension.
+
+use package::support::base::{Cell, Map, Out, Seq, Set, Text, text};
+use package::check::checker::overlap;
+use package::kurs::core::{Binding, Block, Edge, Fun, Instr, Kind, Param, Premise, Terminator, Type};
+use package::kurs::core as C;
+use package::resolve::resolver::Resolver;
+use package::syntax::ast::Pos;
+use package::types::ops::{Fresh, Types, free_brands, subst};
+use std::option::Option;
+use std::slice::Slice;
+
+// The promotion of one function's branded roots.
+exposed struct Promotion {
+    fun: Fun,
+    types: Types,
+    r: Resolver,
+    counter: Fresh,
+    params: Seq[Param],
+    premises: Seq[Premise],
+    value_types: Map[Text, Type],
+    roots: Map[Text, Type],
+    kinds: Map[Text, Kind],
+    // SSA names in use
+    taken: Set[Text],
+    serial: Cell[u64],
+    helpers: Seq[Fun],
+    // an exposed product path -> its components' paths and types
+    shapes: Map[Text, Seq[Binding]],
+    path_types: Map[Text, Type],
+}
+
+// One block being rewritten: the SSA value holding each leaf path, the loads replaced by those
+// values, the new instructions and the brands open so far.
+exposed struct Rewrite {
+    contents: Map[Text, Text],
+    aliases: Map[Text, Text],
+    instructions: Seq[Instr],
+    brands: Seq[Text],
+}
+
+fn instr(lhs: Seq[Text], op: Slice[u8, 'static], args: Seq[Text], ty: Option[Type], pos: Pos) -> Instr {
+    Instr.{ lhs, op: text(op), args, ty, tys: Seq::new(), lit: Option::None, is_unsafe: false, binders: Seq::new(), pos }
+}
+
+fn root_of(path: Text) -> Text {
+    match path.find(text("."), 0usize) {
+        Option::Some(at) => path.slice(0usize, at),
+        Option::None => path,
+    }
+}
+
+fn parent_of(path: Text) -> Text {
+    match path.rfind_byte(b'.') {
+        Option::Some(at) => path.slice(0usize, at),
+        Option::None => path,
+    }
+}
+
+fn lends(arg: Text) -> bool {
+    arg.starts_with(text("&")) && !arg.starts_with(text("&*"))
+}
+
+impl Promotion {
+    fn fresh(self) -> Text {
+        var name = text("");
+        var going = true;
+        while going {
+            name = Out::new().put("%#contents").u64(self.serial.get()).done();
+            self.serial.set(self.serial.get() + 1u64);
+            going = self.taken.has(name);
+        }
+        self.taken.add(name);
+        name
+    }
+
+    fn restricted(self, path: Text) -> bool {
+        self.roots.has(root_of(path))
+    }
+
+    fn unsupported(self, path: Text) -> ! {
+        self.r.fail(Out::new().put("frontend limitation: locally branded value ").add(path)
+            .put(" requires structural SSA lowering; pass it by value to a generic function").done(), self.fun.pos)
+    }
+
+    fn expose(self, path: Text) {
+        if self.path_types.has(path) {
+            return;
+        }
+        let parent = parent_of(path);
+        self.expose(parent);
+        if !self.shapes.has(parent) {
+            let fields: Seq[Binding] = Seq::new();
+            match self.types.shape(self.path_types.at(parent), self.fun.home) {
+                Type::Tuple(elems) => {
+                    var k = 0usize;
+                    while k < elems.len() {
+                        fields.push(Binding.{ name: Out::new().usize(k).done(), type: elems.get(k) });
+                        k = k + 1usize;
+                    }
+                },
+                Type::Struct(members) => {
+                    var k = 0usize;
+                    while k < members.len() {
+                        fields.push(Binding.{ name: members.get(k).name, type: members.get(k).type });
+                        k = k + 1usize;
+                    }
+                },
+                _ => self.unsupported(path),
+            };
+            let children: Seq[Binding] = Seq::new();
+            var k = 0usize;
+            while k < fields.len() {
+                let child = Out::new().add(parent).put(".").add(fields.get(k).name).done();
+                children.push(Binding.{ name: child, type: fields.get(k).type });
+                self.path_types.set(child, fields.get(k).type);
+                k = k + 1usize;
+            }
+            self.shapes.set(parent, children);
+        }
+        if !self.path_types.has(path) {
+            self.unsupported(path);
+        }
+    }
+
+    // Checks every use of a branded root before anything changes; sums and opened roots need their
+    // own representation.
+    fn validate(self) {
+        var b = 0usize;
+        while b < self.fun.blocks.len() {
+            let block = self.fun.blocks.get(b);
+            var i = 0usize;
+            while i < block.empty.len() {
+                let path = block.empty.get(i);
+                if self.restricted(path) {
+                    var k = 0usize;
+                    while k < block.known.len() {
+                        if block.known.get(k).path.eq(path) {
+                            self.unsupported(path);
+                        }
+                        k = k + 1usize;
+                    }
+                    k = 0usize;
+                    while k < block.opened.len() {
+                        if block.opened.get(k).path.eq(path) {
+                            self.unsupported(path);
+                        }
+                        k = k + 1usize;
+                    }
+                    self.expose(path);
+                }
+                i = i + 1usize;
+            }
+            i = 0usize;
+            while i < block.known.len() {
+                if self.restricted(block.known.get(i).path) {
+                    self.unsupported(block.known.get(i).path);
+                }
+                i = i + 1usize;
+            }
+            i = 0usize;
+            while i < block.opened.len() {
+                if self.restricted(block.opened.get(i).path) {
+                    self.unsupported(block.opened.get(i).path);
+                }
+                i = i + 1usize;
+            }
+            i = 0usize;
+            while i < block.instrs.len() {
+                let ins = block.instrs.get(i);
+                var k = 0usize;
+                while k < ins.args.len() {
+                    let arg = ins.args.get(k);
+                    if self.restricted(arg) {
+                        let path_operand = k == 0usize && (ins.op.is("load") || ins.op.is("store") || ins.op.is("destruct"));
+                        if !(path_operand || ins.op.is("call") || ins.op.is("trait_call")) {
+                            self.unsupported(arg);
+                        }
+                        self.expose(arg);
+                    }
+                    k = k + 1usize;
+                }
+                i = i + 1usize;
+            }
+            match block.term {
+                Terminator::Switch(s, _t, _arms, _p) => if self.restricted(s) {
+                    self.unsupported(s);
+                },
+                _ => (),
+            };
+            b = b + 1usize;
+        }
+    }
+
+    fn read(self, w: Rewrite, path: Text) -> Text {
+        match w.contents.get(path) {
+            Option::Some(v) => v,
+            Option::None => self.r.fail(Out::new().put("locally branded value ").add(path).put(" is unavailable").done(), self.fun.pos),
+        }
+    }
+
+    fn install(self, w: Rewrite, path: Text, operand: Text) {
+        match self.shapes.get(path) {
+            Option::Some(children) => {
+                let names: Seq[Text] = Seq::new();
+                var k = 0usize;
+                while k < children.len() {
+                    names.push(self.fresh());
+                    k = k + 1usize;
+                }
+                w.instructions.push(instr(names, "destruct", Seq::one(operand), Option::Some.(self.path_types.at(path)), self.fun.pos));
+                k = 0usize;
+                while k < children.len() {
+                    self.install(w, children.get(k).name, names.get(k));
+                    k = k + 1usize;
+                }
+            },
+            Option::None => w.contents.set(path, operand),
+        }
+    }
+
+    fn extract(self, w: Rewrite, path: Text, copy: bool) -> Text {
+        match self.shapes.get(path) {
+            Option::Some(children) => {
+                let names: Seq[Text] = Seq::new();
+                var k = 0usize;
+                while k < children.len() {
+                    names.push(self.extract(w, children.get(k).name, copy));
+                    k = k + 1usize;
+                }
+                let name = self.fresh();
+                w.instructions.push(instr(Seq::one(name), "construct", names, Option::Some.(self.path_types.at(path)), self.fun.pos));
+                name
+            },
+            Option::None => {
+                let name = self.read(w, path);
+                if copy {
+                    let copied = self.fresh();
+                    w.instructions.push(instr(Seq::one(copied), "copy", Seq::one(name), Option::None, self.fun.pos));
+                    return copied;
+                }
+                w.contents.remove(path);
+                name
+            },
+        }
+    }
+
+    fn value(self, w: Rewrite, name: Text) -> Text {
+        if name.starts_with(text("&*")) {
+            let inner = name.from(2usize);
+            return Out::new().put("&*").add(w.aliases.get_or(inner, inner)).done();
+        }
+        w.aliases.get_or(name, name)
+    }
+
+    fn param_types(self, ins: Instr, indirect: bool) -> Seq[Type] {
+        let program = self.types.program;
+        let callee = ins.args.get(0usize);
+        let (names, types) = if ins.op.is("trait_call") {
+            let t = program.traits.at(callee);
+            var found: Option[C::Method] = Option::None;
+            var m = 0usize;
+            while found.is_none() && m < t.methods.len() {
+                if t.methods.get(m).name.eq(ins.args.get(1usize)) {
+                    found = Option::Some.(t.methods.get(m));
+                }
+                m = m + 1usize;
+            }
+            let method = match found {
+                Option::Some(x) => x,
+                Option::None => self.r.fail(text("internal error: an unknown trait method"), ins.pos),
+            };
+            (t.params, method.ptypes)
+        } else if indirect {
+            match self.value_types.at(callee) {
+                Type::Fn(f) => {
+                    let names: Seq[Text] = Seq::new();
+                    var k = 0usize;
+                    while k < f.quantified.len() {
+                        names.push(f.quantified.get(k).name);
+                        k = k + 1usize;
+                    }
+                    (names, f.params)
+                },
+                _ => self.r.fail(text("internal error: an indirect callee is not a function"), ins.pos),
+            }
+        } else {
+            match program.externs.get(callee) {
+                Option::Some(x) => {
+                    return match x.ptypes {
+                        Option::Some(ts) => ts,
+                        Option::None => Seq::new(),
+                    };
+                },
+                Option::None => (),
+            };
+            let target = program.funs.at(callee);
+            let names: Seq[Text] = Seq::new();
+            var k = 0usize;
+            while k < target.params.len() {
+                names.push(target.params.get(k).name);
+                k = k + 1usize;
+            }
+            (names, target.ptypes)
+        };
+        let sub: Map[Text, Type] = Map::new();
+        var k = 0usize;
+        while k < names.len() && k < ins.tys.len() {
+            sub.set(names.get(k), ins.tys.get(k));
+            k = k + 1usize;
+        }
+        let out: Seq[Type] = Seq::new();
+        k = 0usize;
+        while k < types.len() {
+            out.push(subst(types.get(k), sub, self.counter));
+            k = k + 1usize;
+        }
+        out
+    }
+
+    // A call lending a branded place: a generic helper takes the place's contents by value, lends
+    // them to the callee from its own slot, and hands them back with the result.
+    fn adapt_call(self, w: Rewrite, ins: Instr) {
+        let offset = if ins.op.is("trait_call") { 2usize } else { 1usize };
+        let operands = ins.args.from(offset);
+        let borrowed: Seq[usize] = Seq::new();
+        let paths: Seq[Text] = Seq::new();
+        var k = 0usize;
+        while k < operands.len() {
+            let p = operands.get(k);
+            if self.restricted(p) {
+                borrowed.push(k);
+            }
+            if lends(p) {
+                paths.push(p);
+            }
+            k = k + 1usize;
+        }
+        k = 0usize;
+        while k < paths.len() {
+            var j = k + 1usize;
+            while j < paths.len() {
+                if overlap(paths.get(k), paths.get(j)) {
+                    self.r.fail(text("lent places overlap"), ins.pos);
+                }
+                j = j + 1usize;
+            }
+            k = k + 1usize;
+        }
+        let indirect = ins.op.is("call") && ins.args.get(0usize).starts_with(text("%"));
+        let ptypes = self.param_types(ins, indirect);
+        let result = self.value_types.at(ins.lhs.get(0usize));
+        let generic = self.params.copy();
+        k = 0usize;
+        while k < w.brands.len() {
+            generic.push(Param.{ name: w.brands.get(k), kind: Kind::Brand });
+            k = k + 1usize;
+        }
+        var name = Out::new().add(self.fun.name).put("#lend").add(self.fresh().from(1usize)).done();
+        while self.types.program.funs.has(name) {
+            name = Out::new().add(name).put("_").done();
+        }
+        let argument_names: Seq[Text] = Seq::new();
+        k = 0usize;
+        while k < operands.len() {
+            let p = operands.get(k);
+            argument_names.push(Out::new().put(if p.starts_with(text("&")) && !self.restricted(p) { "&a" } else { "%a" }).usize(k).done());
+            k = k + 1usize;
+        }
+        let bindings: Seq[Binding] = Seq::new();
+        k = 0usize;
+        while k < argument_names.len() && k < ptypes.len() {
+            bindings.push(Binding.{ name: argument_names.get(k), type: ptypes.get(k) });
+            k = k + 1usize;
+        }
+        let actuals: Seq[Text] = Seq::new();
+        k = 0usize;
+        while k < operands.len() {
+            let p = operands.get(k);
+            actuals.push(if self.restricted(p) { self.extract(w, p, false) } else { p });
+            k = k + 1usize;
+        }
+        var head = ins.args.slice(0usize, offset);
+        if indirect {
+            bindings.insert(0usize, Binding.{ name: text("%callee"), type: self.value_types.at(ins.args.get(0usize)) });
+            actuals.insert(0usize, ins.args.get(0usize));
+            head = Seq::one(text("%callee"));
+        }
+        let locals: Seq[Binding] = Seq::new();
+        let body: Seq[Instr] = Seq::new();
+        let forwarded = argument_names.copy();
+        k = 0usize;
+        while k < borrowed.len() {
+            let b = borrowed.get(k);
+            let slot = Out::new().put("&slot").usize(b).done();
+            locals.push(Binding.{ name: slot, type: ptypes.get(b) });
+            body.push(instr(Seq::one(Out::new().put("%unit").usize(b).done()), "store", Seq::two(slot, argument_names.get(b)), Option::None, ins.pos));
+            forwarded.set(b, slot);
+            k = k + 1usize;
+        }
+        let call_args = head.copy();
+        call_args.append(forwarded);
+        body.push(Instr.{ lhs: Seq::one(text("%result")), op: ins.op, args: call_args, ty: Option::None, tys: ins.tys,
+            lit: Option::None, is_unsafe: ins.is_unsafe, binders: Seq::new(), pos: ins.pos });
+        let never = match result {
+            Type::Never => true,
+            _ => false,
+        };
+        let (ret, term) = if never {
+            (result, Terminator::Unreachable.(ins.pos))
+        } else {
+            let restored: Seq[Text] = Seq::new();
+            let elems: Seq[Type] = Seq::new();
+            k = 0usize;
+            while k < borrowed.len() {
+                let b = borrowed.get(k);
+                let n = Out::new().put("%restored").usize(b).done();
+                restored.push(n);
+                elems.push(ptypes.get(b));
+                body.push(instr(Seq::one(n), "load", Seq::one(Out::new().put("&slot").usize(b).done()), Option::None, ins.pos));
+                k = k + 1usize;
+            }
+            elems.push(result);
+            let ret = Type::Tuple.(elems);
+            restored.push(text("%result"));
+            body.push(instr(Seq::one(text("%out")), "construct", restored, Option::Some.(ret), ins.pos));
+            (ret, Terminator::Ret.(text("%out"), ins.pos))
+        };
+        let ptys: Seq[Type] = Seq::new();
+        k = 0usize;
+        while k < bindings.len() {
+            ptys.push(bindings.get(k).type);
+            k = k + 1usize;
+        }
+        let entry = Block.{ label: text("entry"), params: bindings, instrs: body, term, brands: Seq::new(), empty: Seq::new(),
+            known: Seq::new(), opened: Seq::new(), pos: Pos.{ line: 0u32, col: 0u32 } };
+        self.helpers.push(Fun.{ name, params: generic, premises: self.premises, ret, ptypes: ptys, blocks: Seq::one(entry), locals,
+            is_unsafe: self.fun.is_unsafe || ins.is_unsafe, home: self.fun.home, pos: ins.pos });
+        let tys: Seq[Type] = Seq::new();
+        k = 0usize;
+        while k < generic.len() {
+            let p = generic.get(k);
+            tys.push(if C::same_kind(p.kind, Kind::Brand) { Type::Skolem.(p.name) } else { Type::Named.(p.name, Seq::new()) });
+            k = k + 1usize;
+        }
+        let call_args = Seq::one(name);
+        call_args.append(actuals);
+        if never {
+            w.instructions.push(Instr.{ lhs: ins.lhs, op: text("call"), args: call_args, ty: Option::None, tys, lit: Option::None,
+                is_unsafe: ins.is_unsafe, binders: Seq::new(), pos: ins.pos });
+            return;
+        }
+        let output = self.fresh();
+        w.instructions.push(Instr.{ lhs: Seq::one(output), op: text("call"), args: call_args, ty: Option::None, tys, lit: Option::None,
+            is_unsafe: ins.is_unsafe, binders: Seq::new(), pos: ins.pos });
+        let replacements: Seq[Text] = Seq::new();
+        k = 0usize;
+        while k < borrowed.len() {
+            replacements.push(self.fresh());
+            k = k + 1usize;
+        }
+        let lhs = replacements.copy();
+        lhs.append(ins.lhs);
+        w.instructions.push(instr(lhs, "destruct", Seq::one(output), Option::Some.(ret), ins.pos));
+        k = 0usize;
+        while k < borrowed.len() {
+            self.install(w, operands.get(borrowed.get(k)), replacements.get(k));
+            k = k + 1usize;
+        }
+    }
+
+    fn edge(self, w: Rewrite, incoming: Map[Text, Map[Text, Text]], e: Edge) {
+        var k = 0usize;
+        while k < e.args.len() {
+            e.args.set(k, self.value(w, e.args.get(k)));
+            k = k + 1usize;
+        }
+        let wanted = incoming.at(e.target);
+        k = 0usize;
+        while k < wanted.positions() {
+            match wanted.entry(k) {
+                Option::Some(p) => e.args.push(self.read(w, p)),
+                Option::None => (),
+            };
+            k = k + 1usize;
+        }
+    }
+
+    fn rewrite(self, b: usize, incoming: Map[Text, Map[Text, Text]]) {
+        let block = self.fun.blocks.get(b);
+        let w = Rewrite.{ contents: incoming.at(block.label).copy(), aliases: Map::new(), instructions: Seq::new(), brands: block.brands.copy() };
+        var i = 0usize;
+        while i < block.instrs.len() {
+            let ins = block.instrs.get(i);
+            var k = 0usize;
+            while k < ins.args.len() {
+                ins.args.set(k, self.value(w, ins.args.get(k)));
+                k = k + 1usize;
+            }
+            if ins.op.is("open") {
+                w.brands.append(ins.binders);
+            }
+            let first = if ins.args.is_empty() { text("") } else { ins.args.get(0usize) };
+            if ins.op.is("store") && self.restricted(first) {
+                self.install(w, first, ins.args.get(1usize));
+                w.instructions.push(instr(ins.lhs, "construct", Seq::new(), Option::Some.(C::unit()), ins.pos));
+            } else if (ins.op.is("load") || ins.op.is("destruct")) && self.restricted(first) {
+                let operand = self.extract(w, first, self.types.is_copy(self.path_types.at(first), self.kinds));
+                if ins.op.is("destruct") {
+                    let { args: _old, ..rest } = ins;
+                    w.instructions.push(Instr.{ args: Seq::one(operand), ..rest });
+                } else {
+                    w.aliases.set(ins.lhs.get(0usize), operand);
+                    self.value_types.set(operand, self.path_types.at(first));
+                }
+            } else if (ins.op.is("call") || ins.op.is("trait_call")) && self.any_restricted(ins.args) {
+                self.adapt_call(w, ins);
+            } else {
+                w.instructions.push(ins);
+            }
+            i = i + 1usize;
+        }
+        block.instrs.clear();
+        block.instrs.append(w.instructions);
+        let term = match block.term {
+            Terminator::Ret(v, p) => Terminator::Ret.(self.value(w, v), p),
+            Terminator::Jmp(e, p) => {
+                self.edge(w, incoming, e);
+                Terminator::Jmp.(e, p)
+            },
+            Terminator::Jnz(c, a, other, p) => {
+                let cond = self.value(w, c);
+                self.edge(w, incoming, a);
+                self.edge(w, incoming, other);
+                Terminator::Jnz.(cond, a, other, p)
+            },
+            Terminator::Switch(s, t, arms, p) => {
+                let scrutinee = self.value(w, s);
+                var k = 0usize;
+                while k < arms.len() {
+                    self.edge(w, incoming, arms.get(k).edge);
+                    k = k + 1usize;
+                }
+                Terminator::Switch.(scrutinee, t, arms, p)
+            },
+            Terminator::Unreachable(p) => Terminator::Unreachable.(p),
+        };
+        let empty: Seq[Text] = Seq::new();
+        i = 0usize;
+        while i < block.empty.len() {
+            if !self.restricted(block.empty.get(i)) {
+                empty.push(block.empty.get(i));
+            }
+            i = i + 1usize;
+        }
+        let { term: _t, empty: _e, ..rest } = block;
+        self.fun.blocks.set(b, Block.{ term, empty, ..rest });
+    }
+
+    fn any_restricted(self, args: Seq[Text]) -> bool {
+        var k = 0usize;
+        while k < args.len() {
+            if self.restricted(args.get(k)) {
+                return true;
+            }
+            k = k + 1usize;
+        }
+        false
+    }
+}
+
+// Promotes `fun`'s roots whose types mention brands other than its parameters' (`params`, an
+// instance's first) to SSA values, in place, and returns the lending helpers this needs.
+// `value_types` holds the types of `fun`'s SSA values.
+fn promote_locals(fun: Fun, types: Types, params: Seq[Param], premises: Seq[Premise], value_types: Map[Text, Type],
+                  r: Resolver, counter: Fresh) -> Seq[Fun] {
+    let allowed: Set[Text] = Set::new();
+    let kinds: Map[Text, Kind] = Map::new();
+    var i = 0usize;
+    while i < params.len() {
+        if C::same_kind(params.get(i).kind, Kind::Brand) {
+            allowed.add(params.get(i).name);
+        }
+        kinds.set(params.get(i).name, params.get(i).kind);
+        i = i + 1usize;
+    }
+    let roots: Map[Text, Type] = Map::new();
+    i = 0usize;
+    while i < fun.locals.len() {
+        let brands = free_brands(fun.locals.get(i).type).items();
+        var k = 0usize;
+        var outside = false;
+        while k < brands.len() {
+            outside = outside || !allowed.has(brands.get(k));
+            k = k + 1usize;
+        }
+        if outside {
+            roots.set(fun.locals.get(i).name, fun.locals.get(i).type);
+        }
+        i = i + 1usize;
+    }
+    if roots.is_empty() {
+        return Seq::new();
+    }
+    let taken: Set[Text] = Set::new();
+    i = 0usize;
+    while i < fun.blocks.len() {
+        let block = fun.blocks.get(i);
+        var k = 0usize;
+        while k < block.params.len() {
+            taken.add(block.params.get(k).name);
+            k = k + 1usize;
+        }
+        k = 0usize;
+        while k < block.instrs.len() {
+            let lhs = block.instrs.get(k).lhs;
+            var j = 0usize;
+            while j < lhs.len() {
+                taken.add(lhs.get(j));
+                j = j + 1usize;
+            }
+            k = k + 1usize;
+        }
+        i = i + 1usize;
+    }
+    let p = Promotion.{ fun, types, r, counter, params, premises, value_types, roots, kinds, taken, serial: Cell::new(0u64),
+        helpers: Seq::new(), shapes: Map::new(), path_types: roots.copy() };
+    p.validate();
+    // the leaf paths: those not decomposed further
+    let leaves: Map[Text, Type] = Map::new();
+    let paths = p.path_types.keys();
+    i = 0usize;
+    while i < paths.len() {
+        if !p.shapes.has(paths.get(i)) {
+            leaves.set(paths.get(i), p.path_types.at(paths.get(i)));
+        }
+        i = i + 1usize;
+    }
+    // the SSA parameter that brings each leaf's contents into each block
+    let incoming: Map[Text, Map[Text, Text]] = Map::new();
+    let leaf_paths = leaves.keys();
+    i = 0usize;
+    while i < fun.blocks.len() {
+        let block = fun.blocks.get(i);
+        let contents: Map[Text, Text] = Map::new();
+        if i > 0usize {
+            var k = 0usize;
+            while k < leaf_paths.len() {
+                let leaf = leaf_paths.get(k);
+                var emptied = false;
+                var z = 0usize;
+                while !emptied && z < block.empty.len() {
+                    let e = block.empty.get(z);
+                    emptied = leaf.eq(e) || leaf.starts_with(Out::new().add(e).put(".").done());
+                    z = z + 1usize;
+                }
+                if !emptied {
+                    let v = p.fresh();
+                    contents.set(leaf, v);
+                    block.params.push(Binding.{ name: v, type: leaves.at(leaf) });
+                }
+                k = k + 1usize;
+            }
+        }
+        incoming.set(block.label, contents);
+        i = i + 1usize;
+    }
+    i = 0usize;
+    while i < fun.blocks.len() {
+        p.rewrite(i, incoming);
+        i = i + 1usize;
+    }
+    let kept: Seq[Binding] = Seq::new();
+    i = 0usize;
+    while i < fun.locals.len() {
+        if !roots.has(fun.locals.get(i).name) {
+            kept.push(fun.locals.get(i));
+        }
+        i = i + 1usize;
+    }
+    fun.locals.clear();
+    fun.locals.append(kept);
+    p.helpers
+}

@@ -1,0 +1,610 @@
+// The typed KURS core: the program that lowering produces, the checker accepts and C is made from.
+//
+// Types are values compared by structure (`same`); language-level equality, which knows nominal
+// declarations and renames binders, lives in `types`. An inference variable (`Meta`) is a type
+// too, compared by identity; checked programs contain none.
+
+use package::support::base::{Cell, Key, Map, Out, Seq, Text, combine, text};
+use package::kurs::sexpr::Form;
+use std::slice::Slice;
+use package::syntax::ast::Pos;
+use std::option::Option;
+
+exposed enum Kind {
+    // a brand
+    Brand,
+    // a Copy value type
+    Copy,
+    // any value type
+    Any,
+}
+
+fn same_kind(a: Kind, b: Kind) -> bool {
+    kind_index(a) == kind_index(b)
+}
+
+fn kind_index(k: Kind) -> u32 {
+    match k {
+        Kind::Brand => 0u32,
+        Kind::Copy => 1u32,
+        Kind::Any => 2u32,
+    }
+}
+
+// The width in bits of an integer type, or 0 for any other name.
+fn integer_bits(name: Text) -> u32 {
+    if name.is("i8") || name.is("u8") {
+        8u32
+    } else if name.is("i16") || name.is("u16") {
+        16u32
+    } else if name.is("i32") || name.is("u32") {
+        32u32
+    } else if name.is("i64") || name.is("u64") || name.is("isize") || name.is("usize") {
+        64u32
+    } else {
+        0u32
+    }
+}
+
+fn is_integer(name: Text) -> bool {
+    integer_bits(name) != 0u32
+}
+
+fn is_float(name: Text) -> bool {
+    name.is("f32") || name.is("f64")
+}
+
+fn is_prim(name: Text) -> bool {
+    is_integer(name) || is_float(name) || name.is("bool")
+}
+
+// ------------------------------------------------------------------ types --
+
+exposed enum Type {
+    Prim(Text),
+    Never,
+    Named(Text, Seq[Type]),
+    Struct(Seq[Member]),
+    // variants in tag order
+    Enum(Seq[Member]),
+    Tuple(Seq[Type]),
+    Array(Cell[Type], u64),
+    Ptr(Cell[Type]),
+    // A brand variable or identity; of kind Brand, never a value type.
+    Skolem(Text),
+    // `builtin::Brand $k`, the Copy witness type of brand `$k`: a Skolem in checked IR; inference may
+    // use a brand metavariable.
+    Brand(Cell[Type]),
+    // brand labels, and the body they scope over
+    Exists(Seq[Text], Cell[Type]),
+    Foreach(ForeachType),
+    Fn(FnType),
+    // `_`: a retained brand slot of `fn`'s type arguments
+    Ignored,
+    Meta(Meta),
+}
+
+// A field of a struct or a variant of an enum.
+exposed struct Member {
+    name: Text,
+    type: Type,
+}
+
+exposed struct ForeachType {
+    binder: Text,
+    // the `(builtin::Pointer F)` pattern
+    indirect: bool,
+    source: Cell[Type],
+    body: Cell[Type],
+    retained: Seq[Text],
+}
+
+exposed struct FnType {
+    params: Seq[Type],
+    ret: Cell[Type],
+    // retained brand parameters; a function value carries no premises
+    quantified: Seq[Param],
+    is_unsafe: bool,
+    // indices of place parameters, ascending
+    places: Seq[usize],
+}
+
+exposed enum MetaKind {
+    Type,
+    Int,
+    Float,
+    Brand,
+}
+
+// An inference variable: its solution once it has one.
+exposed struct Meta {
+    state: Cell[MetaState],
+}
+
+exposed struct MetaState {
+    solution: Option[Type],
+    kind: MetaKind,
+    pos: Pos,
+}
+
+impl Meta {
+    fn new(kind: MetaKind) -> Meta {
+        Meta.{ state: Cell::new(MetaState.{ solution: Option::None, kind, pos: Pos.{ line: 0u32, col: 0u32 } }) }
+    }
+
+    fn id(self) -> usize {
+        unsafe (self.state.at as usize)
+    }
+
+    fn solution(self) -> Option[Type] {
+        self.state.get().solution
+    }
+
+    fn kind(self) -> MetaKind {
+        self.state.get().kind
+    }
+
+    fn pos(self) -> Pos {
+        self.state.get().pos
+    }
+
+    fn solve(self, t: Type) {
+        let s = self.state.get();
+        self.state.set(MetaState.{ solution: Option::Some.(t), kind: s.kind, pos: s.pos });
+    }
+
+    fn set_kind(self, kind: MetaKind) {
+        let s = self.state.get();
+        self.state.set(MetaState.{ solution: s.solution, kind, pos: s.pos });
+    }
+
+    fn set_pos(self, pos: Pos) {
+        let s = self.state.get();
+        self.state.set(MetaState.{ solution: s.solution, kind: s.kind, pos });
+    }
+}
+
+exposed struct Param {
+    name: Text,
+    kind: Kind,
+}
+
+exposed struct Premise {
+    trait_name: Text,
+    args: Seq[Type],
+}
+
+fn prim(name: Slice[u8, 'static]) -> Type {
+    Type::Prim.(text(name))
+}
+
+fn unit() -> Type {
+    Type::Tuple.(Seq::new())
+}
+
+fn bool_type() -> Type {
+    prim("bool")
+}
+
+fn u32_type() -> Type {
+    prim("u32")
+}
+
+fn usize_type() -> Type {
+    prim("usize")
+}
+
+fn ptr(inner: Type) -> Type {
+    Type::Ptr.(Cell::new(inner))
+}
+
+fn named(name: Text, args: Seq[Type]) -> Type {
+    Type::Named.(name, args)
+}
+
+// A foreach type whose retained binders default to those of a foreach source.
+fn foreach_type(binder: Text, indirect: bool, source: Type, body: Type) -> Type {
+    let retained: Seq[Text] = Seq::new();
+    let unit = match source {
+        Type::Foreach(f) => {
+            retained.push(f.binder);
+            retained.append(f.retained);
+        },
+        _ => (),
+    };
+    Type::Foreach.(ForeachType.{ binder, indirect, source: Cell::new(source), body: Cell::new(body), retained })
+}
+
+fn fn_type(params: Seq[Type], ret: Type, quantified: Seq[Param], is_unsafe: bool, places: Seq[usize]) -> Type {
+    Type::Fn.(FnType.{ params, ret: Cell::new(ret), quantified, is_unsafe, places })
+}
+
+fn types_same(a: Seq[Type], b: Seq[Type]) -> bool {
+    var equal = a.len() == b.len();
+    var i = 0usize;
+    while equal && i < a.len() {
+        equal = same(a.get(i), b.get(i));
+        i = i + 1usize;
+    }
+    equal
+}
+
+fn members_same(a: Seq[Member], b: Seq[Member]) -> bool {
+    var equal = a.len() == b.len();
+    var i = 0usize;
+    while equal && i < a.len() {
+        equal = a.get(i).name.eq(b.get(i).name) && same(a.get(i).type, b.get(i).type);
+        i = i + 1usize;
+    }
+    equal
+}
+
+fn texts_same(a: Seq[Text], b: Seq[Text]) -> bool {
+    a.same(b)
+}
+
+fn params_same(a: Seq[Param], b: Seq[Param]) -> bool {
+    var equal = a.len() == b.len();
+    var i = 0usize;
+    while equal && i < a.len() {
+        equal = a.get(i).name.eq(b.get(i).name) && same_kind(a.get(i).kind, b.get(i).kind);
+        i = i + 1usize;
+    }
+    equal
+}
+
+// Structural equality: the same constructor with the same parts. Variables are equal only to
+// themselves.
+fn same(a: Type, b: Type) -> bool {
+    match a {
+        Type::Prim(x) => match b {
+            Type::Prim(y) => x.eq(y),
+            _ => false,
+        },
+        Type::Never => match b {
+            Type::Never => true,
+            _ => false,
+        },
+        Type::Named(x, xs) => match b {
+            Type::Named(y, ys) => x.eq(y) && types_same(xs, ys),
+            _ => false,
+        },
+        Type::Struct(xs) => match b {
+            Type::Struct(ys) => members_same(xs, ys),
+            _ => false,
+        },
+        Type::Enum(xs) => match b {
+            Type::Enum(ys) => members_same(xs, ys),
+            _ => false,
+        },
+        Type::Tuple(xs) => match b {
+            Type::Tuple(ys) => types_same(xs, ys),
+            _ => false,
+        },
+        Type::Array(x, n) => match b {
+            Type::Array(y, m) => n == m && same(x.get(), y.get()),
+            _ => false,
+        },
+        Type::Ptr(x) => match b {
+            Type::Ptr(y) => same(x.get(), y.get()),
+            _ => false,
+        },
+        Type::Skolem(x) => match b {
+            Type::Skolem(y) => x.eq(y),
+            _ => false,
+        },
+        Type::Brand(x) => match b {
+            Type::Brand(y) => same(x.get(), y.get()),
+            _ => false,
+        },
+        Type::Exists(xs, x) => match b {
+            Type::Exists(ys, y) => texts_same(xs, ys) && same(x.get(), y.get()),
+            _ => false,
+        },
+        Type::Foreach(x) => match b {
+            Type::Foreach(y) => x.binder.eq(y.binder) && x.indirect == y.indirect && same(x.source.get(), y.source.get())
+                && same(x.body.get(), y.body.get()) && texts_same(x.retained, y.retained),
+            _ => false,
+        },
+        Type::Fn(x) => match b {
+            Type::Fn(y) => types_same(x.params, y.params) && same(x.ret.get(), y.ret.get()) && params_same(x.quantified, y.quantified)
+                && x.is_unsafe == y.is_unsafe && x.places.same(y.places),
+            _ => false,
+        },
+        Type::Ignored => match b {
+            Type::Ignored => true,
+            _ => false,
+        },
+        Type::Meta(x) => match b {
+            Type::Meta(y) => x.id() == y.id(),
+            _ => false,
+        },
+    }
+}
+
+fn hash_types(h: u64, ts: Seq[Type]) -> u64 {
+    var h = h;
+    var i = 0usize;
+    while i < ts.len() {
+        h = combine(h, hash(ts.get(i)));
+        i = i + 1usize;
+    }
+    h
+}
+
+fn hash_members(h: u64, ms: Seq[Member]) -> u64 {
+    var h = h;
+    var i = 0usize;
+    while i < ms.len() {
+        h = combine(combine(h, ms.get(i).name.hash()), hash(ms.get(i).type));
+        i = i + 1usize;
+    }
+    h
+}
+
+fn hash(t: Type) -> u64 {
+    match t {
+        Type::Prim(x) => combine(1u64, x.hash()),
+        Type::Never => 2u64,
+        Type::Named(x, xs) => hash_types(combine(3u64, x.hash()), xs),
+        Type::Struct(xs) => hash_members(4u64, xs),
+        Type::Enum(xs) => hash_members(5u64, xs),
+        Type::Tuple(xs) => hash_types(6u64, xs),
+        Type::Array(x, n) => combine(combine(7u64, hash(x.get())), n),
+        Type::Ptr(x) => combine(8u64, hash(x.get())),
+        Type::Skolem(x) => combine(9u64, x.hash()),
+        Type::Brand(x) => combine(10u64, hash(x.get())),
+        Type::Exists(xs, x) => combine(combine(11u64, Key::key_hash(xs)), hash(x.get())),
+        Type::Foreach(x) => combine(combine(12u64, x.binder.hash()), combine(hash(x.source.get()), hash(x.body.get()))),
+        Type::Fn(x) => combine(hash_types(13u64, x.params), hash(x.ret.get())),
+        Type::Ignored => 14u64,
+        Type::Meta(x) => combine(15u64, x.id() as u64),
+    }
+}
+
+instance Key[Type] {
+    fn key_hash(key: Type) -> u64 {
+        hash(key)
+    }
+
+    fn key_same(a: Type, b: Type) -> bool {
+        same(a, b)
+    }
+}
+
+instance Key[Param] {
+    fn key_hash(key: Param) -> u64 {
+        combine(key.name.hash(), kind_index(key.kind) as u64)
+    }
+
+    fn key_same(a: Param, b: Param) -> bool {
+        a.name.eq(b.name) && same_kind(a.kind, b.kind)
+    }
+}
+
+instance Key[Premise] {
+    fn key_hash(key: Premise) -> u64 {
+        hash_types(key.trait_name.hash(), key.args)
+    }
+
+    fn key_same(a: Premise, b: Premise) -> bool {
+        a.trait_name.eq(b.trait_name) && types_same(a.args, b.args)
+    }
+}
+
+// ---------------------------------------------------------------- modules --
+
+exposed struct ModuleId {
+    package: usize,
+    path: Seq[Text],
+}
+
+impl ModuleId {
+    fn root(package: usize) -> ModuleId {
+        ModuleId.{ package, path: Seq::new() }
+    }
+
+    fn child(self, name: Text) -> ModuleId {
+        let path = self.path.copy();
+        path.push(name);
+        ModuleId.{ package: self.package, path }
+    }
+
+    // `self` is `scope` or a module inside it.
+    fn within(self, scope: ModuleId) -> bool {
+        self.package == scope.package && self.path.len() >= scope.path.len() && self.path.slice(0usize, scope.path.len()).same(scope.path)
+    }
+}
+
+instance Key[ModuleId] {
+    fn key_hash(key: ModuleId) -> u64 {
+        combine(key.package as u64, Key::key_hash(key.path))
+    }
+
+    fn key_same(a: ModuleId, b: ModuleId) -> bool {
+        a.package == b.package && a.path.same(b.path)
+    }
+}
+
+exposed enum ExposureMode {
+    Owner,
+    Within,
+}
+
+exposed struct Exposure {
+    mode: ExposureMode,
+    home: ModuleId,
+}
+
+// ----------------------------------------------------------- declarations --
+
+exposed struct TypeDecl {
+    name: Text,
+    linear: bool,
+    params: Seq[Param],
+    premises: Seq[Premise],
+    body: Type,
+    home: Option[ModuleId],
+    // none: transparent
+    exposure: Option[Exposure],
+}
+
+exposed struct Instr {
+    lhs: Seq[Text],
+    op: Text,
+    args: Seq[Text],
+    // the type operand
+    ty: Option[Type],
+    // type arguments
+    tys: Seq[Type],
+    lit: Option[Text],
+    // the instruction's discharge marker
+    is_unsafe: bool,
+    // `open`'s brand binders
+    binders: Seq[Text],
+    pos: Pos,
+}
+
+exposed struct Edge {
+    target: Text,
+    args: Seq[Text],
+    tys: Seq[Type],
+}
+
+exposed struct Arm {
+    variant: Text,
+    edge: Edge,
+}
+
+exposed enum Terminator {
+    Ret(Text, Pos),
+    Jmp(Edge, Pos),
+    // condition, then, other
+    Jnz(Text, Edge, Edge, Pos),
+    // scrutinee, its enum type, one arm per variant
+    Switch(Text, Type, Seq[Arm], Pos),
+    Unreachable(Pos),
+}
+
+exposed struct Binding {
+    name: Text,
+    type: Type,
+}
+
+// A known variant of a place: `known &path = Variant`.
+exposed struct Known {
+    path: Text,
+    variant: Text,
+}
+
+// An opened package place and the brands of its view.
+exposed struct Opened {
+    path: Text,
+    brands: Seq[Text],
+}
+
+exposed struct Block {
+    label: Text,
+    params: Seq[Binding],
+    instrs: Seq[Instr],
+    term: Terminator,
+    brands: Seq[Text],
+    // place paths declared empty
+    empty: Seq[Text],
+    known: Seq[Known],
+    opened: Seq[Opened],
+    pos: Pos,
+}
+
+exposed struct Fun {
+    name: Text,
+    // quantified parameters
+    params: Seq[Param],
+    premises: Seq[Premise],
+    ret: Type,
+    // a place parameter's type is the root type; see `places`
+    ptypes: Seq[Type],
+    blocks: Seq[Block],
+    // whole-function places: `&name` and its type
+    locals: Seq[Binding],
+    is_unsafe: bool,
+    home: Option[ModuleId],
+    pos: Pos,
+}
+
+impl Fun {
+    // The indices of the place parameters, whose entry names start with `&`.
+    fn places(self) -> Seq[usize] {
+        let out: Seq[usize] = Seq::new();
+        let params = self.blocks.get(0usize).params;
+        var i = 0usize;
+        while i < params.len() {
+            if params.get(i).name.byte(0usize) == b'&' {
+                out.push(i);
+            }
+            i = i + 1usize;
+        }
+        out
+    }
+}
+
+exposed struct Extern {
+    name: Text,
+    ret: Option[Type],
+    // none for an extern value
+    ptypes: Option[Seq[Type]],
+    pos: Pos,
+}
+
+exposed struct Method {
+    name: Text,
+    ret: Type,
+    ptypes: Seq[Type],
+    is_unsafe: bool,
+    places: Seq[usize],
+}
+
+exposed struct Trait {
+    name: Text,
+    params: Seq[Text],
+    methods: Seq[Method],
+    home: Option[ModuleId],
+    // omitted kinds are Any, as in plain KURS headers
+    param_kinds: Seq[Kind],
+}
+
+exposed struct Instance {
+    trait_name: Text,
+    params: Seq[Param],
+    premises: Seq[Premise],
+    // one type per trait parameter
+    head: Seq[Type],
+    // functions with bare method names
+    methods: Seq[Fun],
+    home: Option[ModuleId],
+    pos: Pos,
+}
+
+exposed struct Data {
+    name: Text,
+    ty: Type,
+    // the raw form
+    init: Form,
+    home: Option[ModuleId],
+}
+
+exposed struct Program {
+    types: Map[Text, TypeDecl],
+    funs: Map[Text, Fun],
+    externs: Map[Text, Extern],
+    datas: Map[Text, Data],
+    traits: Map[Text, Trait],
+    // trait -> its instances
+    instances: Map[Text, Seq[Instance]],
+}
+
+impl Program {
+    fn new() -> Program {
+        Program.{ types: Map::new(), funs: Map::new(), externs: Map::new(), datas: Map::new(), traits: Map::new(), instances: Map::new() }
+    }
+}

@@ -1,32 +1,36 @@
 # compiler
 
 The Kursal compiler, written in Kursal. It is built on the design of the reference compiler,
-[`reference-compiler/kursal`](../reference-compiler/kursal): each module here translates the Python
-module of the same name, and must accept and reject the same programs, with the same messages, and
-produce the same output.
+[`reference-compiler/kursal`](../reference-compiler/kursal): each module here translates a Python
+module, and must accept and reject the same programs, with the same messages, and produce the same
+output.
+
+The compiler has one directory per phase, in pipeline order below; `support` is the layer beneath
+them all. A phase's `dump` module prints what the phase computed, as text, for comparison with the
+reference in the tests.
 
 | Module | Translates | |
 |---|---|---|
-| `base` | | storage: text, sequences, maps, sets, cells; `fail` |
-| `system` | | arguments, files, directories, environment |
-| `syntax`, `parser` | `syntax.py`, `parser.py` | the surface AST and the parser |
-| `dump` | | the AST as text, for comparison with the reference parser |
-| `core`, `sexpr` | `core.py`, `sexpr.py` | the KURS core and S-expressions |
-| `types`, `unify` | `types.py`, `unify.py` | substitution, equality, shapes; unification over `core::Meta` |
-| `literals`, `formation`, `layout`, `termination`, `coherence` | the same names | checks of literals, types, declarations and instances |
-| `resolve` | `resolve.py` | manifests, the package graph, and what every name names |
-| `resolved` | | a resolved program as text, for comparison with the reference resolver |
-| `sigs` | `sigs.py` | signatures: type declarations, function, method, extern and trait signatures, instances, folded constants |
-| `sigdump` | | signatures as text, for comparison with the reference |
-| `infer` | `infer.py` | type inference of function bodies: each node's type, what each call calls, local bindings and captures |
-| `inferdump` | | what inference found, as text, for comparison with the reference |
-| `kurs` | `kurs.py` | serialized KURS: its reader and writer |
-| `lower`, `placeflow`, `promote` | `lower.py`, `placeflow.py`, `promote.py` | lowering inferred bodies to core: control flow, places and their contracts, branded locals as SSA values |
-| `check` | `check.py` | the KURS checker; it records every SSA value's type by `FunKey` |
-| `mangle`, `cgen` | `mangle.py`, `cgen.py` | symbol names (with SHA-256); checked KURS to C |
-| `readable` | `readable.py` | readable KURS |
+| `support::base` | | storage: text, sequences, maps, sets, cells; `fail` |
+| `support::system` | | arguments, files, directories, processes, the environment |
+| `syntax::ast`, `syntax::parser` | `syntax.py`, `parser.py` | the surface AST and the parser |
+| `syntax::dump` | | the AST as text |
+| `resolve::resolver` | `resolve.py` | manifests, the package graph, and what every name names |
+| `resolve::dump` | | a resolved program as text |
+| `kurs::core`, `kurs::sexpr` | `core.py`, `sexpr.py` | the KURS core and S-expressions |
+| `kurs::serial` | `kurs.py` | serialized KURS: its reader and writer |
+| `kurs::readable` | `readable.py` | readable KURS |
+| `types::ops`, `types::unify` | `types.py`, `unify.py` | substitution, equality, shapes; unification over `kurs::core::Meta` |
+| `types::literals`, `formation`, `layout`, `termination`, `coherence` | the same names | checks of literals, types, declarations and instances |
+| `types::selftest` | | `kursal selftest-types`, the type modules on small cases, for the tests |
+| `sigs::signatures` | `sigs.py` | signatures: type declarations, function, method, extern and trait signatures, instances, folded constants |
+| `sigs::dump` | | signatures as text |
+| `infer::inference` | `infer.py` | type inference of function bodies: each node's type, what each call calls, local bindings and captures |
+| `infer::dump` | | what inference found, as text |
+| `lower::lowering`, `lower::placeflow`, `lower::promote` | `lower.py`, `placeflow.py`, `promote.py` | lowering inferred bodies to core: control flow, places and their contracts, branded locals as SSA values |
+| `check::checker` | `check.py` | the KURS checker; it records every SSA value's type by `FunKey` |
+| `backend::mangle`, `backend::cgen` | `mangle.py`, `cgen.py` | symbol names (with SHA-256); checked KURS to C |
 | `main` | `__main__.py` | the command line |
-| `selftest` | | `kursal selftest-types`, the type modules on small cases, for the tests |
 
 ## Building and testing
 
@@ -58,7 +62,7 @@ limited to 6 GB of address space and a timeout.
 
 ## Storage
 
-A compiler builds one web of values and keeps it until it exits, so nothing in `base` is freed and
+A compiler builds one web of values and keeps it until it exits, so nothing in `support::base` is freed and
 every handle is a Copy pointer: a change made through one copy of a `Seq`, `Map`, `Set` or `Cell` is
 seen through every copy, as with Python's lists, dicts and sets. Elements are Copy values, read and
 written whole. This is what lets the rest of the compiler pass state around by value, with no `&` and
@@ -82,26 +86,26 @@ Nothing is freed, so a loop that builds throwaway values on every step costs mem
 hot loop, read a map's or set's keys in place with `positions` and `entry` rather than copying them
 with `keys` or `items`, and compare text without splitting it.
 
-Map keys need an instance of `base::Key`; `Text`, `u32`, `usize`, `bool`, 2- and 3-tuples and
-`Seq`s of keys have one, and `core` adds `Type`, `Param`, `Premise` and `ModuleId`. `core::same` is
-structural type equality (Python's `==` on frozen dataclasses), `core::hash` its hash.
+Map keys need an instance of `support::base::Key`; `Text`, `u32`, `usize`, `bool`, 2- and 3-tuples and
+`Seq`s of keys have one, and `kurs::core` adds `Type`, `Param`, `Premise` and `ModuleId`. `kurs::core::same` is
+structural type equality (Python's `==` on frozen dataclasses), `kurs::core::hash` its hash.
 
 A class whose methods mutate `self` becomes a struct of handles (cells, sequences, maps) whose
 methods take `self` by value: the copies share the same storage. Its constructor allocates them.
 
 ## Errors
 
-The compiler stops at the first error: `base::fail(message)` prints the message and exits with
+The compiler stops at the first error: `support::base::fail(message)` prints the message and exits with
 status 1. A message is exactly what the reference compiler prints for the same error: `KursError`'s
 `str()`, which is `line:col: message` when it carries a position and the message alone otherwise,
 and the file prefix the front end adds (`resolve.located`). Tests compare messages.
-`types::kurs_error(message, pos)` stops with `KursError(message, pos)`'s text; a `Pos` with line 0
+`types::ops::kurs_error(message, pos)` stops with `KursError(message, pos)`'s text; a `Pos` with line 0
 stands for no position.
 
 ## Fresh names
 
 `types.fresh` numbers renamed binders (`a#3`) from one counter for the whole compilation. Here that
-counter is a `types::Fresh`, made once and passed to everything that may rename a binder: `subst`,
+counter is a `types::ops::Fresh`, made once and passed to everything that may rename a binder: `subst`,
 `unify`, `match_head`, `Types`, `Formation`, `check_type_expansion`, `check_coherence`, `Signatures`,
 `Infer`, `lower`, `check_program`, `emit_c`, `emit_kurs`. Passing the
 same one everywhere numbers names as the reference compiler does.
@@ -127,7 +131,7 @@ These are the places where Kursal differs from what one might expect.
   `x`'s type, and otherwise among the single-parameter traits visible in the calling module
   (declared there, imported by name or glob, or re-exported to it), and the methods of blanket impls
   (`forall I where Iterator[I -> T]. impl I`) whose bounding traits are visible there and whose
-  package is the caller's or one it depends on, directly or not. Import the trait (`use package::base::Key;`)
+  package is the caller's or one it depends on, directly or not. Import the trait (`use package::support::base::Key;`)
   to call its methods with a dot; two visible traits sharing a method name make such calls ambiguous,
   and are called as `Trait::method(x)`, which works whether or not the trait is imported. Calling
   the standard library's iterator adapters (`range(0, n).map(...)`) needs `core` as a direct
@@ -146,7 +150,7 @@ These are the places where Kursal differs from what one might expect.
   operations. A safe function may contain unsafe operations.
 - **Generic code over linear types.** A type parameter may stand for a linear type unless a premise
   says `Copy[T]`. Using a value twice, or dropping it on one path (`a && b` drops `b` when `a` is
-  false), needs `Copy[T]`. Every `base` collection requires it.
+  false), needs `Copy[T]`. Every `support::base` collection requires it.
 - **Zero-size types** (`()`, empty structs) have no memory form: no `sizeof`, no storage. Use `bool`
   as a placeholder value (`Set` is a `Map[K, bool]`).
 - **Expressions as statements.** `f(x);` discards a Copy result. A block's value is its last
@@ -156,6 +160,7 @@ These are the places where Kursal differs from what one might expect.
 - **Closures** `|x| x + 1u32` have types `closure(u32) -> u32` as parameters; a closure may read Copy
   locals of its function. Plain function values have types `fn(u32) -> u32`.
 - **Modules.** Each `.kur` file is a module named by its path; `use package::name` imports one, and
-  `lib.kur` lists them. `use package::syntax as S;` then `S::Expr`.
+  `lib.kur` lists them. `use package::syntax::ast as S;` then `S::Expr`. A directory is a module whose
+  `lib.kur` lists its children, as `compiler/lib.kur` lists the phases.
 - **Statics.** There are no global variables. State lives in values passed in, usually a struct of
   handles.
