@@ -1,212 +1,211 @@
-// The compiler's storage: text, growable sequences, hash maps and cells.
+// The compiler's storage: text, growable sequences, hash maps, sets and cells, all kept in one
+// arena of the standard library.
 //
-// A compiler builds one large web of values and keeps it until it exits, so this storage is never
-// freed and is shared freely: every handle here is a Copy pointer, and a change made through one
-// copy is seen through all of them, as with Python's lists and dicts. Elements are Copy values,
-// read and written whole; no reference into storage is ever handed out, so growing a sequence or
-// a map never leaves one dangling. The compiler runs on one thread.
+// A `Cx!['k]` holds the arena and the one capability for its domain, `'k`. Everything here is a
+// `Copy` view branded `'k`: a `Text['k]` is a span of bytes in the arena (or of a literal), and a
+// `Seq`, `Map`, `Set` or `Cell` names a header in the arena, so a change made through one copy is
+// seen through all of them, as with Python's lists and dicts. Every operation that reads or
+// writes takes the context by place, `&cx`, and presents its capability; one that may allocate
+// also hands the arena to the standard library. Elements are `Copy` values, read and written
+// whole; nothing hands out a reference into storage, and nothing is freed until the arena is.
 
-use std::alloc::heap::{malloc, realloc};
-use std::io::write_all;
+use std::alloc::arena::Arena;
+use std::cap::Exclusive;
+use std::cmp::Order;
+use std::collections::arena_vec::ArenaVec;
+use std::hash::{HashIn, HashState};
+use std::io::{print, write_span};
+use std::mem::Ref;
 use std::option::Option;
-use std::raw::elem_ptr;
-use std::slice::Slice;
+use std::process::exit;
+use std::raw::{Span, span_byte_or_zero, span_bytes_eq, span_bytes_eq_lit, span_bytes_hash};
+use std::slice::{Slice, bytes_cmp_within, find_bytes};
 
-extern "C" fn exit(code: i32) -> !;
-extern "C" fn memcmp(a: *u8, b: *u8, n: usize) -> i32;
-extern "C" fn memcpy(dest: *u8, src: *u8, n: usize) -> *u8;
+// ---------------------------------------------------------------- context --
 
-// ----------------------------------------------------------------- memory --
-
-// Storage for `count` values of `T`, never freed.
-forall T.
-fn alloc(count: usize) -> *T {
-    let bytes = count * sizeof[T]();
-    unsafe (unsafe malloc(if bytes == 0usize { 1usize } else { bytes }) as *T)
+// The arena that holds a phase's data, and the capability every read and write of it presents.
+forall 'k.
+exposed struct Cx! {
+    tag: Exclusive!['k],
+    arena: Arena!['k],
 }
 
-forall T where Copy[T].
-fn load_at(base: *T, i: usize) -> T {
-    unsafe *(unsafe elem_ptr(base, i))
+impl Cx {
+    // A fresh, empty arena under a brand of its own.
+    fn new() -> exists 'k. Cx!['k] {
+        let exists 'k. (tag, arena) = Arena::new();
+        pack 'k. Cx.{ tag, arena }
+    }
 }
 
-forall T where Copy[T].
-fn store_at(base: *T, i: usize, value: T) {
-    unsafe *(unsafe elem_ptr(base, i)) = value;
+forall 'k.
+impl Cx['k] {
+    // Frees everything in the arena; no view of it can be read after.
+    fn destroy(self) {
+        let { tag, arena } = self;
+        arena.destroy(tag);
+    }
 }
 
-// One value on the heap: the way a recursive type refers to itself. `set` replaces it for every
-// copy of the cell.
-forall T.
+// One value in the arena: the way a recursive type refers to itself, and a mutable attribute.
+// `set` replaces it for every copy of the cell.
+forall T, 'k.
 exposed struct Cell {
-    at: *T,
+    at: Ref[T, 'k],
 }
 
-forall T where Copy[T].
-impl Cell[T] {
-    fn new(value: T) -> Cell[T] {
-        let at: *T = alloc(1usize);
-        store_at(at, 0usize, value);
-        Cell.{ at }
+forall T, 'k where Copy[T].
+impl Cell[T, 'k] {
+    fn new(&cx: Cx!['k], value: T) -> Cell[T, 'k] {
+        Cell.{ at: &cx.arena.alloc(&cx.tag, value) }
     }
 
-    fn get(self) -> T {
-        load_at(self.at, 0usize)
+    fn get(self, &cx: Cx!['k]) -> T {
+        self.at.copy(&cx.tag)
     }
 
-    fn set(self, value: T) {
-        store_at(self.at, 0usize, value);
+    fn set(self, &cx: Cx!['k], value: T) {
+        let old = self.at.replace(&cx.tag, value);
+    }
+
+    // The cell's identity: equal for copies of one cell, different for different cells.
+    fn address(self) -> usize {
+        self.at.address()
     }
 }
 
 // --------------------------------------------------------------- failure --
 
 // Prints `message` and stops the compiler with status 1.
-fn fail(message: Text) -> ! {
-    let unit = unsafe write_all(2, message.ptr, message.len);
-    let unit = unsafe write_all(2, text("\n").ptr, 1usize);
-    unsafe exit(1)
+forall 'k.
+fn fail(&cx: Cx!['k], message: Text['k]) -> ! {
+    message.print(&cx, 2);
+    print(2, "\n");
+    exit(1)
 }
 
 fn fail_static(message: Slice[u8, 'static]) -> ! {
-    fail(text(message))
+    print(2, message);
+    print(2, "\n");
+    exit(1)
 }
 
 fn stop(status: i32) -> ! {
-    unsafe exit(status)
+    exit(status)
 }
 
 // ------------------------------------------------------------------- text --
 
 // Bytes that never change: a view of a literal, of a file, or of text the compiler built.
+forall 'k.
 exposed struct Text {
-    ptr: *u8,
-    len: usize,
+    bytes: Span['k],
 }
 
-fn text(literal: Slice[u8, 'static]) -> Text {
-    let (ptr, len, brand) = literal.into_parts();
-    Text.{ ptr, len }
+forall 'k.
+fn text(&cx: Cx!['k], literal: Slice[u8, 'static]) -> Text['k] {
+    Text.{ bytes: Span::from_static(&cx.tag, literal) }
 }
 
-fn empty_text() -> Text {
-    text("")
+forall 'k.
+fn empty_text(&cx: Cx!['k]) -> Text['k] {
+    text(&cx, "")
 }
 
-impl Text {
-    fn byte(self, i: usize) -> u8 {
-        if i < self.len { load_at(self.ptr, i) } else { 0u8 }
+forall 'k.
+impl Text['k] {
+    fn len(self) -> usize {
+        self.bytes.len()
     }
 
     fn is_empty(self) -> bool {
-        self.len == 0usize
+        self.bytes.len() == 0usize
+    }
+
+    // Byte `i`, or zero past the end.
+    fn byte(self, &cx: Cx!['k], i: usize) -> u8 {
+        span_byte_or_zero(&cx.tag, self.bytes, i)
     }
 
     // Bytes `start` to `end`, clamped to the text.
-    fn slice(self, start: usize, end: usize) -> Text {
-        let end = if end > self.len { self.len } else { end };
+    fn slice(self, start: usize, end: usize) -> Text['k] {
+        let end = if end > self.len() { self.len() } else { end };
         let start = if start > end { end } else { start };
-        Text.{ ptr: unsafe elem_ptr(self.ptr, start), len: end - start }
+        Text.{ bytes: self.bytes.skip(start).take(end - start) }
     }
 
-    fn from(self, start: usize) -> Text {
-        self.slice(start, self.len)
+    fn from(self, start: usize) -> Text['k] {
+        self.slice(start, self.len())
     }
 
-    fn eq(self, other: Text) -> bool {
-        if self.len != other.len {
-            false
-        } else if self.len == 0usize {
-            true
-        } else {
-            unsafe memcmp(self.ptr, other.ptr, self.len) == 0
-        }
+    fn eq(self, &cx: Cx!['k], other: Text['k]) -> bool {
+        span_bytes_eq(&cx.tag, self.bytes, other.bytes)
     }
 
-    fn is(self, literal: Slice[u8, 'static]) -> bool {
-        self.eq(text(literal))
+    fn is(self, &cx: Cx!['k], literal: Slice[u8, 'static]) -> bool {
+        span_bytes_eq_lit(&cx.tag, self.bytes, literal)
     }
 
     // Byte order, as Python orders `str`s of ASCII: negative, zero or positive.
-    fn compare(self, other: Text) -> i32 {
-        let n = if self.len < other.len { self.len } else { other.len };
-        let c = if n == 0usize { 0 } else { unsafe memcmp(self.ptr, other.ptr, n) };
-        if c != 0 {
-            c
-        } else if self.len < other.len {
-            -1
-        } else if self.len > other.len {
-            1
-        } else {
-            0
+    fn compare(self, &cx: Cx!['k], other: Text['k]) -> i32 {
+        match bytes_cmp_within(&cx.tag, self.bytes, other.bytes) {
+            Order::Less => -1,
+            Order::Equal => 0,
+            Order::Greater => 1,
         }
     }
 
-    fn starts_with(self, prefix: Text) -> bool {
-        prefix.len <= self.len && self.slice(0usize, prefix.len).eq(prefix)
+    fn starts_with(self, &cx: Cx!['k], prefix: Text['k]) -> bool {
+        prefix.len() <= self.len() && self.slice(0usize, prefix.len()).eq(&cx, prefix)
     }
 
-    fn ends_with(self, suffix: Text) -> bool {
-        suffix.len <= self.len && self.from(self.len - suffix.len).eq(suffix)
+    fn ends_with(self, &cx: Cx!['k], suffix: Text['k]) -> bool {
+        suffix.len() <= self.len() && self.from(self.len() - suffix.len()).eq(&cx, suffix)
     }
 
     // The first index at or after `start` of `needle`, if any.
-    fn find(self, needle: Text, start: usize) -> Option[usize] {
-        var i = start;
-        var found = Option::None;
-        while found.is_none() && i + needle.len <= self.len {
-            if self.slice(i, i + needle.len).eq(needle) {
-                found = Option::Some.(i);
-            }
-            i = i + 1usize;
-        }
-        found
+    fn find(self, &cx: Cx!['k], needle: Text['k], start: usize) -> Option[usize] {
+        find_bytes(&cx.tag, self.bytes, start, needle.bytes)
     }
 
-    fn contains(self, needle: Text) -> bool {
-        self.find(needle, 0usize).is_some()
+    fn contains(self, &cx: Cx!['k], needle: Text['k]) -> bool {
+        self.find(&cx, needle, 0usize).is_some()
     }
 
     // The last index of `byte`, if any.
-    fn rfind_byte(self, byte: u8) -> Option[usize] {
-        var i = self.len;
+    fn rfind_byte(self, &cx: Cx!['k], byte: u8) -> Option[usize] {
+        var i = self.len();
         var found = Option::None;
         while found.is_none() && i > 0usize {
             i = i - 1usize;
-            if self.byte(i) == byte {
+            if self.byte(&cx, i) == byte {
                 found = Option::Some.(i);
             }
         }
         found
     }
 
-    fn hash(self) -> u64 {
-        var h = 14695981039346656037u64;
-        var i = 0usize;
-        while i < self.len {
-            h = (h ^ (self.byte(i) as u64)) * 1099511628211u64;
-            i = i + 1usize;
-        }
-        h
+    fn hash(self, &cx: Cx!['k]) -> u64 {
+        span_bytes_hash(&cx.tag, self.bytes)
     }
 
-    fn concat(self, other: Text) -> Text {
-        Out::new().add(self).add(other).done()
+    fn concat(self, &cx: Cx!['k], other: Text['k]) -> Text['k] {
+        Out::new(&cx).add(&cx, self).add(&cx, other).done(&cx)
     }
 
     // The pieces between occurrences of `separator`.
-    fn split(self, separator: Text) -> Seq[Text] {
-        let pieces: Seq[Text] = Seq::new();
+    fn split(self, &cx: Cx!['k], separator: Text['k]) -> Seq[Text['k], 'k] {
+        let pieces: Seq[Text['k], 'k] = Seq::new(&cx);
         var start = 0usize;
         var going = true;
         while going {
-            let unit = match self.find(separator, start) {
+            let unit = match self.find(&cx, separator, start) {
                 Option::Some(at) => {
-                    pieces.push(self.slice(start, at));
-                    start = at + separator.len;
+                    pieces.push(&cx, self.slice(start, at));
+                    start = at + separator.len();
                 },
                 Option::None => {
-                    pieces.push(self.from(start));
+                    pieces.push(&cx, self.from(start));
                     going = false;
                 },
             };
@@ -215,12 +214,12 @@ impl Text {
     }
 
     // The decimal value of the text's digits, if it is all digits.
-    fn to_usize(self) -> Option[usize] {
+    fn to_usize(self, &cx: Cx!['k]) -> Option[usize] {
         var n = 0usize;
-        var ok = self.len > 0usize;
+        var ok = self.len() > 0usize;
         var i = 0usize;
-        while ok && i < self.len {
-            let b = self.byte(i);
+        while ok && i < self.len() {
+            let b = self.byte(&cx, i);
             if b >= b'0' && b <= b'9' {
                 n = n * 10usize + ((b - b'0') as usize);
             } else {
@@ -231,271 +230,228 @@ impl Text {
         if ok { Option::Some.(n) } else { Option::None }
     }
 
-    fn print(self, fd: i32) {
-        let unit = unsafe write_all(fd, self.ptr, self.len);
+    fn print(self, &cx: Cx!['k], fd: i32) {
+        let written = write_span(fd, &cx.tag, self.bytes);
     }
 }
 
 // Text being built. `done` returns what was written; the builder may go on growing after it.
+forall 'k.
 exposed struct Out {
-    bytes: Seq[u8],
+    bytes: ArenaVec[u8, 'k],
 }
 
-impl Out {
-    fn new() -> Out {
-        Out.{ bytes: Seq::new() }
+forall 'k.
+impl Out['k] {
+    fn new(&cx: Cx!['k]) -> Out['k] {
+        Out.{ bytes: ArenaVec::new(&cx.tag, &cx.arena) }
     }
 
-    fn byte(self, b: u8) -> Out {
-        self.bytes.push(b);
+    fn byte(self, &cx: Cx!['k], b: u8) -> Out['k] {
+        self.bytes.push(&cx.tag, &cx.arena, b);
         self
     }
 
-    fn add(self, t: Text) -> Out {
-        self.bytes.push_bytes(t.ptr, t.len);
+    fn add(self, &cx: Cx!['k], t: Text['k]) -> Out['k] {
+        self.bytes.push_span(&cx.tag, &cx.arena, t.bytes);
         self
     }
 
-    fn put(self, literal: Slice[u8, 'static]) -> Out {
-        self.add(text(literal))
+    fn put(self, &cx: Cx!['k], literal: Slice[u8, 'static]) -> Out['k] {
+        self.bytes.push_static(&cx.tag, &cx.arena, literal);
+        self
     }
 
-    fn u64(self, n: u64) -> Out {
+    fn u64(self, &cx: Cx!['k], n: u64) -> Out['k] {
         if n >= 10u64 {
-            let unit = self.u64(n / 10u64);
+            let unit = self.u64(&cx, n / 10u64);
         }
-        self.byte(b'0' + ((n % 10u64) as u8))
+        self.byte(&cx, b'0' + ((n % 10u64) as u8))
     }
 
-    fn usize(self, n: usize) -> Out {
-        self.u64(n as u64)
+    fn usize(self, &cx: Cx!['k], n: usize) -> Out['k] {
+        self.u64(&cx, n as u64)
     }
 
-    fn i64(self, n: i64) -> Out {
+    fn i64(self, &cx: Cx!['k], n: i64) -> Out['k] {
         if n < 0i64 {
             // The magnitude of the most negative value is one past the largest positive one.
-            self.byte(b'-').u64(((0i64 - (n + 1i64)) as u64) + 1u64)
+            self.byte(&cx, b'-').u64(&cx, ((0i64 - (n + 1i64)) as u64) + 1u64)
         } else {
-            self.u64(n as u64)
+            self.u64(&cx, n as u64)
         }
     }
 
-    fn len(self) -> usize {
-        self.bytes.len()
+    fn len(self, &cx: Cx!['k]) -> usize {
+        self.bytes.len(&cx.tag)
     }
 
-    fn done(self) -> Text {
-        Text.{ ptr: self.bytes.data(), len: self.bytes.len() }
+    fn done(self, &cx: Cx!['k]) -> Text['k] {
+        Text.{ bytes: self.bytes.span(&cx.tag, &cx.arena) }
     }
 }
 
 // --------------------------------------------------------------- sequences --
 
-forall T.
+forall T, 'k.
 exposed struct Seq {
-    head: *SeqHead[T],
+    items: ArenaVec[T, 'k],
 }
 
-forall T.
-exposed struct SeqHead {
-    data: *T,
-    len: usize,
-    cap: usize,
-}
-
-forall T where Copy[T].
-impl Seq[T] {
-    fn new() -> Seq[T] {
-        let head: *SeqHead[T] = alloc(1usize);
-        store_at(head, 0usize, SeqHead.{ data: alloc(4usize), len: 0usize, cap: 4usize });
-        Seq.{ head }
+forall T, 'k where Copy[T].
+impl Seq[T, 'k] {
+    fn new(&cx: Cx!['k]) -> Seq[T, 'k] {
+        Seq.{ items: ArenaVec::new(&cx.tag, &cx.arena) }
     }
 
-    fn one(value: T) -> Seq[T] {
-        let s: Seq[T] = Seq::new();
-        s.push(value);
+    fn one(&cx: Cx!['k], value: T) -> Seq[T, 'k] {
+        let s: Seq[T, 'k] = Seq::new(&cx);
+        s.push(&cx, value);
         s
     }
 
-    fn two(a: T, b: T) -> Seq[T] {
-        let s: Seq[T] = Seq::new();
-        s.push(a);
-        s.push(b);
+    fn two(&cx: Cx!['k], a: T, b: T) -> Seq[T, 'k] {
+        let s: Seq[T, 'k] = Seq::new(&cx);
+        s.push(&cx, a);
+        s.push(&cx, b);
         s
     }
 
-    fn state(self) -> SeqHead[T] {
-        load_at(self.head, 0usize)
+    fn len(self, &cx: Cx!['k]) -> usize {
+        self.items.len(&cx.tag)
     }
 
-    fn len(self) -> usize {
-        self.state().len
+    fn is_empty(self, &cx: Cx!['k]) -> bool {
+        self.items.is_empty(&cx.tag)
     }
 
-    fn is_empty(self) -> bool {
-        self.len() == 0usize
+    // The sequence's identity: equal for copies of one sequence, different for different ones.
+    fn address(self) -> usize {
+        self.items.address()
     }
 
-    fn data(self) -> *T {
-        self.state().data
+    fn push(self, &cx: Cx!['k], value: T) {
+        self.items.push(&cx.tag, &cx.arena, value);
     }
 
-    fn reserve(self, extra: usize) {
-        let h = self.state();
-        if h.len + extra > h.cap {
-            var cap = h.cap * 2usize;
-            while cap < h.len + extra {
-                cap = cap * 2usize;
-            }
-            let data = unsafe (unsafe realloc(unsafe (h.data as *u8), cap * sizeof[T]()) as *T);
-            store_at(self.head, 0usize, SeqHead.{ data, len: h.len, cap });
+    fn get(self, &cx: Cx!['k], i: usize) -> T {
+        match self.items.get_ref(&cx.tag, i) {
+            Option::Some(at) => at.copy(&cx.tag),
+            Option::None => fail_static("internal error: sequence index out of range"),
         }
     }
 
-    fn push(self, value: T) {
-        self.reserve(1usize);
-        let h = self.state();
-        store_at(h.data, h.len, value);
-        store_at(self.head, 0usize, SeqHead.{ data: h.data, len: h.len + 1usize, cap: h.cap });
-    }
-
-    fn push_bytes(self, ptr: *u8, count: usize) {
-        self.reserve(count);
-        let h = self.state();
-        if count > 0usize {
-            let unit = unsafe memcpy(unsafe (unsafe elem_ptr(h.data, h.len) as *u8), ptr, count * sizeof[T]());
+    fn set(self, &cx: Cx!['k], i: usize, value: T) {
+        match self.items.set(&cx.tag, i, value) {
+            Option::Some(old) => (),
+            Option::None => fail_static("internal error: sequence index out of range"),
         }
-        store_at(self.head, 0usize, SeqHead.{ data: h.data, len: h.len + count, cap: h.cap });
     }
 
-    fn get(self, i: usize) -> T {
-        let h = self.state();
-        if i >= h.len {
-            fail_static("internal error: sequence index out of range");
+    fn last(self, &cx: Cx!['k]) -> T {
+        match self.items.last(&cx.tag) {
+            Option::Some(value) => value,
+            Option::None => fail_static("internal error: sequence index out of range"),
         }
-        load_at(h.data, i)
     }
 
-    fn set(self, i: usize, value: T) {
-        let h = self.state();
-        if i >= h.len {
-            fail_static("internal error: sequence index out of range");
+    fn pop(self, &cx: Cx!['k]) -> T {
+        match self.items.pop(&cx.tag) {
+            Option::Some(value) => value,
+            Option::None => fail_static("internal error: pop from an empty sequence"),
         }
-        store_at(h.data, i, value);
-    }
-
-    fn last(self) -> T {
-        self.get(self.len() - 1usize)
-    }
-
-    fn pop(self) -> T {
-        let h = self.state();
-        if h.len == 0usize {
-            fail_static("internal error: pop from an empty sequence");
-        }
-        store_at(self.head, 0usize, SeqHead.{ data: h.data, len: h.len - 1usize, cap: h.cap });
-        load_at(h.data, h.len - 1usize)
     }
 
     // Keeps the first `len` values.
-    fn truncate(self, len: usize) {
-        let h = self.state();
-        if len < h.len {
-            store_at(self.head, 0usize, SeqHead.{ data: h.data, len, cap: h.cap });
-        }
+    fn truncate(self, &cx: Cx!['k], len: usize) {
+        self.items.truncate(&cx.tag, len);
     }
 
-    fn clear(self) {
-        self.truncate(0usize);
+    fn clear(self, &cx: Cx!['k]) {
+        self.items.clear(&cx.tag);
     }
 
-    fn append(self, other: Seq[T]) {
-        var i = 0usize;
-        let n = other.len();
-        while i < n {
-            self.push(other.get(i));
-            i = i + 1usize;
-        }
+    fn append(self, &cx: Cx!['k], other: Seq[T, 'k]) {
+        self.items.append(&cx.tag, &cx.arena, other.items);
     }
 
     // A new sequence holding the same values.
-    fn copy(self) -> Seq[T] {
-        let s: Seq[T] = Seq::new();
-        s.append(self);
-        s
+    fn copy(self, &cx: Cx!['k]) -> Seq[T, 'k] {
+        Seq.{ items: self.items.clone(&cx.tag, &cx.arena) }
     }
 
     // Values `start` to `end`, as a new sequence.
-    fn slice(self, start: usize, end: usize) -> Seq[T] {
-        let s: Seq[T] = Seq::new();
+    fn slice(self, &cx: Cx!['k], start: usize, end: usize) -> Seq[T, 'k] {
+        let s: Seq[T, 'k] = Seq::new(&cx);
+        let n = self.len(&cx);
         var i = start;
-        while i < end && i < self.len() {
-            s.push(self.get(i));
+        while i < end && i < n {
+            s.push(&cx, self.get(&cx, i));
             i = i + 1usize;
         }
         s
     }
 
-    fn from(self, start: usize) -> Seq[T] {
-        self.slice(start, self.len())
+    fn from(self, &cx: Cx!['k], start: usize) -> Seq[T, 'k] {
+        self.slice(&cx, start, self.len(&cx))
     }
 
-    fn insert(self, at: usize, value: T) {
-        self.push(value);
-        var i = self.len() - 1usize;
+    fn insert(self, &cx: Cx!['k], at: usize, value: T) {
+        self.push(&cx, value);
+        var i = self.len(&cx) - 1usize;
         while i > at {
-            self.set(i, self.get(i - 1usize));
+            self.set(&cx, i, self.get(&cx, i - 1usize));
             i = i - 1usize;
         }
-        self.set(at, value);
+        self.set(&cx, at, value);
     }
 
-    fn remove(self, at: usize) -> T {
-        let value = self.get(at);
+    fn remove(self, &cx: Cx!['k], at: usize) -> T {
+        let value = self.get(&cx, at);
         var i = at;
-        while i + 1usize < self.len() {
-            self.set(i, self.get(i + 1usize));
+        while i + 1usize < self.len(&cx) {
+            self.set(&cx, i, self.get(&cx, i + 1usize));
             i = i + 1usize;
         }
-        let unit = self.pop();
+        let unit = self.pop(&cx);
         value
     }
 
-    fn reverse(self) {
+    fn reverse(self, &cx: Cx!['k]) {
         var i = 0usize;
-        var j = self.len();
+        var j = self.len(&cx);
         while i + 1usize < j {
             j = j - 1usize;
-            let a = self.get(i);
-            self.set(i, self.get(j));
-            self.set(j, a);
+            let a = self.get(&cx, i);
+            self.set(&cx, i, self.get(&cx, j));
+            self.set(&cx, j, a);
             i = i + 1usize;
         }
     }
 
     // Sorts in place by `before`, keeping equal values in their order (insertion sort).
-    fn sort(self, before: fn(T, T) -> bool) {
+    fn sort(self, &cx: Cx!['k], before: fn(&_: Cx!['k], T, T) -> bool) {
         var i = 1usize;
-        while i < self.len() {
-            let value = self.get(i);
+        while i < self.len(&cx) {
+            let value = self.get(&cx, i);
             var j = i;
-            while j > 0usize && before(value, self.get(j - 1usize)) {
-                self.set(j, self.get(j - 1usize));
+            while j > 0usize && before(&cx, value, self.get(&cx, j - 1usize)) {
+                self.set(&cx, j, self.get(&cx, j - 1usize));
                 j = j - 1usize;
             }
-            self.set(j, value);
+            self.set(&cx, j, value);
             i = i + 1usize;
         }
     }
 }
 
-forall T where Copy[T], Key[T].
-impl Seq[T] {
-    fn index_of(self, value: T) -> Option[usize] {
+forall T, 'k where Copy[T], HashIn[T, Cx!['k]].
+impl Seq[T, 'k] {
+    fn index_of(self, &cx: Cx!['k], value: T) -> Option[usize] {
         var i = 0usize;
         var found = Option::None;
-        while found.is_none() && i < self.len() {
-            if Key::key_same(self.get(i), value) {
+        while found.is_none() && i < self.len(&cx) {
+            if key_same(&cx, self.get(&cx, i), value) {
                 found = Option::Some.(i);
             }
             i = i + 1usize;
@@ -503,15 +459,15 @@ impl Seq[T] {
         found
     }
 
-    fn has(self, value: T) -> bool {
-        self.index_of(value).is_some()
+    fn has(self, &cx: Cx!['k], value: T) -> bool {
+        self.index_of(&cx, value).is_some()
     }
 
-    fn same(self, other: Seq[T]) -> bool {
-        var equal = self.len() == other.len();
+    fn same(self, &cx: Cx!['k], other: Seq[T, 'k]) -> bool {
+        var equal = self.len(&cx) == other.len(&cx);
         var i = 0usize;
-        while equal && i < self.len() {
-            equal = Key::key_same(self.get(i), other.get(i));
+        while equal && i < self.len(&cx) {
+            equal = key_same(&cx, self.get(&cx, i), other.get(&cx, i));
             i = i + 1usize;
         }
         equal
@@ -520,95 +476,56 @@ impl Seq[T] {
 
 // ------------------------------------------------------------- hash maps --
 
-// Keys of maps: hashed and compared by value.
-forall K.
-trait Key {
-    fn key_hash(key: K) -> u64;
-    fn key_same(a: K, b: K) -> bool;
+// Keys of maps are hashed and compared by value through `HashIn[K, Cx!['k]]`: the standard
+// library has the instances for integers, `bool` and tuples of keys, this module those for `Text`
+// and `Seq`s of keys, and `kurs::core` adds `Type`, `Param`, `Premise` and `ModuleId`.
+
+forall K, 'k where HashIn[K, Cx!['k]].
+fn key_hash(&cx: Cx!['k], key: K) -> u64 {
+    let (back, state) = HashIn[K, Cx!['k]]::hash_in(cx, key, HashState::new());
+    cx = back;
+    mix(state.finish())
 }
 
-instance Key[Text] {
-    fn key_hash(key: Text) -> u64 {
-        key.hash()
-    }
-
-    fn key_same(a: Text, b: Text) -> bool {
-        a.eq(b)
-    }
+forall K, 'k where HashIn[K, Cx!['k]].
+fn key_same(&cx: Cx!['k], a: K, b: K) -> bool {
+    let (back, same) = HashIn[K, Cx!['k]]::eq_in(cx, a, b);
+    cx = back;
+    same
 }
 
-instance Key[u32] {
-    fn key_hash(key: u32) -> u64 {
-        mix(key as u64)
+forall 'k.
+instance HashIn[Text['k], Cx!['k]] {
+    fn hash_in(cap: Cx!['k], key: Text['k], state: HashState) -> (Cx!['k], HashState) {
+        var cx = cap;
+        let h = key.hash(&cx);
+        (cx, state.write_u64(h))
     }
 
-    fn key_same(a: u32, b: u32) -> bool {
-        a == b
-    }
-}
-
-instance Key[usize] {
-    fn key_hash(key: usize) -> u64 {
-        mix(key as u64)
-    }
-
-    fn key_same(a: usize, b: usize) -> bool {
-        a == b
+    fn eq_in(cap: Cx!['k], a: Text['k], b: Text['k]) -> (Cx!['k], bool) {
+        var cx = cap;
+        let equal = a.eq(&cx, b);
+        (cx, equal)
     }
 }
 
-instance Key[bool] {
-    fn key_hash(key: bool) -> u64 {
-        if key { 1u64 } else { 2u64 }
-    }
-
-    fn key_same(a: bool, b: bool) -> bool {
-        a == b
-    }
-}
-
-forall A, B where Copy[A], Copy[B], Key[A], Key[B].
-instance Key[(A, B)] {
-    fn key_hash(key: (A, B)) -> u64 {
-        let (a, b) = key;
-        combine(Key::key_hash(a), Key::key_hash(b))
-    }
-
-    fn key_same(x: (A, B), y: (A, B)) -> bool {
-        let (a, b) = x;
-        let (c, d) = y;
-        Key::key_same(a, c) && Key::key_same(b, d)
-    }
-}
-
-forall A, B, C where Copy[A], Copy[B], Copy[C], Key[A], Key[B], Key[C].
-instance Key[(A, B, C)] {
-    fn key_hash(key: (A, B, C)) -> u64 {
-        let (a, b, c) = key;
-        combine(combine(Key::key_hash(a), Key::key_hash(b)), Key::key_hash(c))
-    }
-
-    fn key_same(x: (A, B, C), y: (A, B, C)) -> bool {
-        let (a, b, c) = x;
-        let (d, e, f) = y;
-        Key::key_same(a, d) && Key::key_same(b, e) && Key::key_same(c, f)
-    }
-}
-
-forall T where Copy[T], Key[T].
-instance Key[Seq[T]] {
-    fn key_hash(key: Seq[T]) -> u64 {
+forall T, 'k where Copy[T], HashIn[T, Cx!['k]].
+instance HashIn[Seq[T, 'k], Cx!['k]] {
+    fn hash_in(cap: Cx!['k], key: Seq[T, 'k], state: HashState) -> (Cx!['k], HashState) {
+        var cx = cap;
         var h = 7u64;
         var i = 0usize;
-        while i < key.len() {
-            h = combine(h, Key::key_hash(key.get(i)));
+        while i < key.len(&cx) {
+            h = combine(h, key_hash(&cx, key.get(&cx, i)));
             i = i + 1usize;
         }
-        h
+        (cx, state.write_u64(h))
     }
 
-    fn key_same(a: Seq[T], b: Seq[T]) -> bool {
-        a.same(b)
+    fn eq_in(cap: Cx!['k], a: Seq[T, 'k], b: Seq[T, 'k]) -> (Cx!['k], bool) {
+        var cx = cap;
+        let equal = a.same(&cx, b);
+        (cx, equal)
     }
 }
 
@@ -624,159 +541,146 @@ fn combine(h: u64, x: u64) -> u64 {
 
 // A hash map that remembers the order its keys were first inserted, as Python's dict does:
 // `keys` lists them in that order, and removing a key keeps the order of the rest.
-forall K, V.
+forall K, V, 'k.
 exposed struct Map {
-    head: *MapHead[K, V],
+    state: Ref[MapState[K, V, 'k], 'k],
 }
 
-forall K, V.
-exposed struct MapHead {
-    // Indices into `keys`/`values`, plus one; zero for an empty slot.
-    slots: *usize,
-    slot_count: usize,
-    keys: Seq[K],
-    values: Seq[V],
-    // The positions of removed keys, so `keys` can skip them.
-    live: Seq[bool],
+forall K, V, 'k.
+exposed struct MapState {
+    // Indices into `entries`, plus one; zero for an empty slot. A power of two long; none until
+    // the first key.
+    slots: Option[Slice[usize, 'k]],
+    // Every key ever inserted, in insertion order; a removed one stays, marked dead.
+    entries: ArenaVec[Entry[K, V], 'k],
     count: usize,
 }
 
-forall K, V where Copy[K], Copy[V], Key[K].
-impl Map[K, V] {
-    fn new() -> Map[K, V] {
-        let head: *MapHead[K, V] = alloc(1usize);
-        let slots: *usize = alloc(8usize);
-        var i = 0usize;
-        while i < 8usize {
-            store_at(slots, i, 0usize);
-            i = i + 1usize;
+forall K, V.
+exposed struct Entry {
+    key: K,
+    value: V,
+    live: bool,
+}
+
+forall K, V, 'k where Copy[K], Copy[V], HashIn[K, Cx!['k]].
+impl Map[K, V, 'k] {
+    fn new(&cx: Cx!['k]) -> Map[K, V, 'k] {
+        let state = MapState.{ slots: Option::None, entries: ArenaVec::new(&cx.tag, &cx.arena), count: 0usize };
+        Map.{ state: &cx.arena.alloc(&cx.tag, state) }
+    }
+
+    fn len(self, &cx: Cx!['k]) -> usize {
+        self.state.copy(&cx.tag).count
+    }
+
+    fn is_empty(self, &cx: Cx!['k]) -> bool {
+        self.len(&cx) == 0usize
+    }
+
+    // The map's identity: equal for copies of one map, different for different maps.
+    fn address(self) -> usize {
+        self.state.address()
+    }
+
+    // The slot holding `key`, or the empty slot where it would go, and what that slot holds.
+    fn slot(self, &cx: Cx!['k], slots: Slice[usize, 'k], entries: ArenaVec[Entry[K, V], 'k], key: K) -> (usize, usize) {
+        let mask = slots.len() - 1usize;
+        var i = (key_hash(&cx, key) as usize) & mask;
+        var entry = slot_at(&cx, slots, i);
+        while entry != 0usize && !key_same(&cx, item(&cx, entries, entry - 1usize).key, key) {
+            i = (i + 1usize) & mask;
+            entry = slot_at(&cx, slots, i);
         }
-        store_at(head, 0usize, MapHead.{ slots, slot_count: 8usize, keys: Seq::new(), values: Seq::new(), live: Seq::new(), count: 0usize });
-        Map.{ head }
+        (i, entry)
     }
 
-    fn state(self) -> MapHead[K, V] {
-        load_at(self.head, 0usize)
-    }
-
-    fn len(self) -> usize {
-        self.state().count
-    }
-
-    fn is_empty(self) -> bool {
-        self.len() == 0usize
-    }
-
-    // The slot holding `key`, or the empty slot where it would go.
-    fn slot(self, key: K) -> usize {
-        let h = self.state();
-        let mask = h.slot_count - 1usize;
-        var i = (Key::key_hash(key) as usize) & mask;
-        var going = true;
-        while going {
-            let entry = load_at(h.slots, i);
-            if entry == 0usize {
-                going = false;
-            } else if Key::key_same(h.keys.get(entry - 1usize), key) {
-                going = false;
-            } else {
-                i = (i + 1usize) & mask;
-            }
-        }
-        i
-    }
-
-    fn index(self, key: K) -> Option[usize] {
-        let h = self.state();
-        let entry = load_at(h.slots, self.slot(key));
-        if entry == 0usize || !h.live.get(entry - 1usize) {
+    // The position of a live key.
+    fn index(self, &cx: Cx!['k], key: K) -> Option[usize] {
+        let h = self.state.copy(&cx.tag);
+        let slots = match h.slots {
+            Option::Some(s) => s,
+            Option::None => return Option::None,
+        };
+        let (slot, entry) = self.slot(&cx, slots, h.entries, key);
+        if entry == 0usize || !item(&cx, h.entries, entry - 1usize).live {
             Option::None
         } else {
             Option::Some.(entry - 1usize)
         }
     }
 
-    fn has(self, key: K) -> bool {
-        self.index(key).is_some()
+    fn has(self, &cx: Cx!['k], key: K) -> bool {
+        self.index(&cx, key).is_some()
     }
 
-    fn get(self, key: K) -> Option[V] {
-        match self.index(key) {
-            Option::Some(i) => Option::Some.(self.state().values.get(i)),
+    fn get(self, &cx: Cx!['k], key: K) -> Option[V] {
+        match self.index(&cx, key) {
+            Option::Some(i) => Option::Some.(item(&cx, self.state.copy(&cx.tag).entries, i).value),
             Option::None => Option::None,
         }
     }
 
     // The value of a key that must be present.
-    fn at(self, key: K) -> V {
-        match self.get(key) {
+    fn at(self, &cx: Cx!['k], key: K) -> V {
+        match self.get(&cx, key) {
             Option::Some(v) => v,
             Option::None => fail_static("internal error: missing map key"),
         }
     }
 
-    fn get_or(self, key: K, default: V) -> V {
-        match self.get(key) {
+    fn get_or(self, &cx: Cx!['k], key: K, default: V) -> V {
+        match self.get(&cx, key) {
             Option::Some(v) => v,
             Option::None => default,
         }
     }
 
-    fn set(self, key: K, value: V) {
-        let h = self.state();
-        let slot = self.slot(key);
-        let entry = load_at(h.slots, slot);
-        if entry != 0usize {
-            h.values.set(entry - 1usize, value);
-            if !h.live.get(entry - 1usize) {
-                // A removed key comes back at the end of the order.
-                h.live.set(entry - 1usize, false);
-                store_at(h.slots, slot, h.keys.len() + 1usize);
-                h.keys.push(key);
-                h.values.push(value);
-                h.live.push(true);
-                self.count(h, h.count + 1usize);
-            }
-        } else {
-            store_at(h.slots, slot, h.keys.len() + 1usize);
-            h.keys.push(key);
-            h.values.push(value);
-            h.live.push(true);
-            self.count(h, h.count + 1usize);
-            if h.keys.len() * 2usize > h.slot_count {
-                self.grow();
-            }
+    fn set(self, &cx: Cx!['k], key: K, value: V) {
+        let h = self.state.copy(&cx.tag);
+        let slots = match h.slots {
+            Option::Some(s) => s,
+            Option::None => {
+                let fresh = &cx.arena.alloc_slice(&cx.tag, 8usize, 0usize);
+                let previous = self.state.replace(&cx.tag, MapState.{ slots: Option::Some.(fresh), entries: h.entries, count: h.count });
+                fresh
+            },
+        };
+        let (slot, entry) = self.slot(&cx, slots, h.entries, key);
+        if entry != 0usize && item(&cx, h.entries, entry - 1usize).live {
+            let old = h.entries.set(&cx.tag, entry - 1usize, Entry.{ key, value, live: true });
+            return;
+        }
+        // A new key, or a removed one coming back at the end of the order.
+        set_slot(&cx, slots, slot, h.entries.len(&cx.tag) + 1usize);
+        h.entries.push(&cx.tag, &cx.arena, Entry.{ key, value, live: true });
+        let previous = self.state.replace(&cx.tag, MapState.{ slots: Option::Some.(slots), entries: h.entries, count: h.count + 1usize });
+        if entry == 0usize && h.entries.len(&cx.tag) * 2usize > slots.len() {
+            self.grow(&cx, slots.len() * 2usize);
         }
     }
 
-    fn count(self, h: MapHead[K, V], count: usize) {
-        store_at(self.head, 0usize, MapHead.{ slots: h.slots, slot_count: h.slot_count, keys: h.keys, values: h.values, live: h.live, count });
-    }
-
-    fn remove(self, key: K) {
-        match self.index(key) {
+    fn remove(self, &cx: Cx!['k], key: K) {
+        match self.index(&cx, key) {
             Option::Some(i) => {
-                let h = self.state();
-                h.live.set(i, false);
-                self.count(h, h.count - 1usize);
+                let h = self.state.copy(&cx.tag);
+                let e = item(&cx, h.entries, i);
+                let old = h.entries.set(&cx.tag, i, Entry.{ key: e.key, value: e.value, live: false });
+                let previous = self.state.replace(&cx.tag, MapState.{ slots: h.slots, entries: h.entries, count: h.count - 1usize });
             },
             Option::None => (),
         }
     }
 
-    fn grow(self) {
-        let h = self.state();
-        let slot_count = h.slot_count * 2usize;
-        let slots: *usize = alloc(slot_count);
-        var i = 0usize;
-        while i < slot_count {
-            store_at(slots, i, 0usize);
-            i = i + 1usize;
-        }
-        store_at(self.head, 0usize, MapHead.{ slots, slot_count, keys: h.keys, values: h.values, live: h.live, count: h.count });
+    // `slot_count` slots, every key placed again.
+    fn grow(self, &cx: Cx!['k], slot_count: usize) {
+        let h = self.state.copy(&cx.tag);
+        let slots = &cx.arena.alloc_slice(&cx.tag, slot_count, 0usize);
+        let previous = self.state.replace(&cx.tag, MapState.{ slots: Option::Some.(slots), entries: h.entries, count: h.count });
         var k = 0usize;
-        while k < h.keys.len() {
-            store_at(slots, self.slot(h.keys.get(k)), k + 1usize);
+        while k < h.entries.len(&cx.tag) {
+            let (slot, entry) = self.slot(&cx, slots, h.entries, item(&cx, h.entries, k).key);
+            set_slot(&cx, slots, slot, k + 1usize);
             k = k + 1usize;
         }
     }
@@ -784,24 +688,25 @@ impl Map[K, V] {
     // The number of positions `entry` reads: one per key ever inserted, in insertion order. Reading
     // positions `0..positions()` visits the keys as `keys` lists them, without copying them;
     // removing a key meanwhile only empties its position.
-    fn positions(self) -> usize {
-        self.state().keys.len()
+    fn positions(self, &cx: Cx!['k]) -> usize {
+        self.state.copy(&cx.tag).entries.len(&cx.tag)
     }
 
     // The key at a position, unless it was removed.
-    fn entry(self, i: usize) -> Option[K] {
-        let h = self.state();
-        if h.live.get(i) { Option::Some.(h.keys.get(i)) } else { Option::None }
+    fn entry(self, &cx: Cx!['k], i: usize) -> Option[K] {
+        let e = item(&cx, self.state.copy(&cx.tag).entries, i);
+        if e.live { Option::Some.(e.key) } else { Option::None }
     }
 
     // The keys, in insertion order.
-    fn keys(self) -> Seq[K] {
-        let h = self.state();
-        let out: Seq[K] = Seq::new();
+    fn keys(self, &cx: Cx!['k]) -> Seq[K, 'k] {
+        let entries = self.state.copy(&cx.tag).entries;
+        let out: Seq[K, 'k] = Seq::new(&cx);
         var i = 0usize;
-        while i < h.keys.len() {
-            if h.live.get(i) {
-                out.push(h.keys.get(i));
+        while i < entries.len(&cx.tag) {
+            let e = item(&cx, entries, i);
+            if e.live {
+                out.push(&cx, e.key);
             }
             i = i + 1usize;
         }
@@ -809,49 +714,37 @@ impl Map[K, V] {
     }
 
     // The values, in their keys' insertion order.
-    fn values(self) -> Seq[V] {
-        let h = self.state();
-        let out: Seq[V] = Seq::new();
+    fn values(self, &cx: Cx!['k]) -> Seq[V, 'k] {
+        let entries = self.state.copy(&cx.tag).entries;
+        let out: Seq[V, 'k] = Seq::new(&cx);
         var i = 0usize;
-        while i < h.keys.len() {
-            if h.live.get(i) {
-                out.push(h.values.get(i));
+        while i < entries.len(&cx.tag) {
+            let e = item(&cx, entries, i);
+            if e.live {
+                out.push(&cx, e.value);
             }
             i = i + 1usize;
         }
         out
     }
 
-    // The same entries in a map of their own, allocated at the size they need.
-    fn copy(self) -> Map[K, V] {
-        let h = self.state();
+    // The same entries in a map of their own, with only the live keys.
+    fn copy(self, &cx: Cx!['k]) -> Map[K, V, 'k] {
+        let h = self.state.copy(&cx.tag);
+        let m: Map[K, V, 'k] = Map::new(&cx);
+        if h.count == 0usize {
+            return m;
+        }
         var slot_count = 8usize;
         while h.count * 2usize > slot_count {
             slot_count = slot_count * 2usize;
         }
-        let slots: *usize = alloc(slot_count);
-        var s = 0usize;
-        while s < slot_count {
-            store_at(slots, s, 0usize);
-            s = s + 1usize;
-        }
-        let keys: Seq[K] = Seq::new();
-        let values: Seq[V] = Seq::new();
-        let live: Seq[bool] = Seq::new();
-        keys.reserve(h.count);
-        values.reserve(h.count);
-        live.reserve(h.count);
-        let head: *MapHead[K, V] = alloc(1usize);
-        store_at(head, 0usize, MapHead.{ slots, slot_count, keys, values, live, count: h.count });
-        let m = Map.{ head };
+        m.grow(&cx, slot_count);
         var i = 0usize;
-        while i < h.keys.len() {
-            if h.live.get(i) {
-                let key = h.keys.get(i);
-                store_at(slots, m.slot(key), keys.len() + 1usize);
-                keys.push(key);
-                values.push(h.values.get(i));
-                live.push(true);
+        while i < h.entries.len(&cx.tag) {
+            let e = item(&cx, h.entries, i);
+            if e.live {
+                m.set(&cx, e.key, e.value);
             }
             i = i + 1usize;
         }
@@ -859,48 +752,75 @@ impl Map[K, V] {
     }
 }
 
-// A set, in insertion order.
-forall K.
-exposed struct Set {
-    map: Map[K, bool],
+// Element `i` of an arena vec, which must be in range.
+forall T, 'k where Copy[T].
+fn item(&cx: Cx!['k], items: ArenaVec[T, 'k], i: usize) -> T {
+    match items.get_ref(&cx.tag, i) {
+        Option::Some(at) => at.copy(&cx.tag),
+        Option::None => fail_static("internal error: sequence index out of range"),
+    }
 }
 
-forall K where Copy[K], Key[K].
-impl Set[K] {
-    fn new() -> Set[K] {
-        Set.{ map: Map::new() }
+forall 'k.
+fn slot_at(&cx: Cx!['k], slots: Slice[usize, 'k], i: usize) -> usize {
+    match slots.get_ref(&cx.tag, i) {
+        Option::Some(at) => at.copy(&cx.tag),
+        Option::None => fail_static("internal error: map slot out of range"),
+    }
+}
+
+forall 'k.
+fn set_slot(&cx: Cx!['k], slots: Slice[usize, 'k], i: usize, value: usize) {
+    match slots.get_ref(&cx.tag, i) {
+        Option::Some(at) => {
+            let old = at.replace(&cx.tag, value);
+        },
+        Option::None => fail_static("internal error: map slot out of range"),
+    }
+}
+
+// A set, in insertion order.
+forall K, 'k.
+exposed struct Set {
+    map: Map[K, bool, 'k],
+}
+
+forall K, 'k where Copy[K], HashIn[K, Cx!['k]].
+impl Set[K, 'k] {
+    fn new(&cx: Cx!['k]) -> Set[K, 'k] {
+        Set.{ map: Map::new(&cx) }
     }
 
-    fn add(self, key: K) {
-        self.map.set(key, true);
+    fn add(self, &cx: Cx!['k], key: K) {
+        self.map.set(&cx, key, true);
     }
 
-    fn has(self, key: K) -> bool {
-        self.map.has(key)
+    fn has(self, &cx: Cx!['k], key: K) -> bool {
+        self.map.has(&cx, key)
     }
 
-    fn remove(self, key: K) {
-        self.map.remove(key);
+    fn remove(self, &cx: Cx!['k], key: K) {
+        self.map.remove(&cx, key);
     }
 
-    fn len(self) -> usize {
-        self.map.len()
+    fn len(self, &cx: Cx!['k]) -> usize {
+        self.map.len(&cx)
     }
 
-    fn items(self) -> Seq[K] {
-        self.map.keys()
+    fn items(self, &cx: Cx!['k]) -> Seq[K, 'k] {
+        self.map.keys(&cx)
     }
 
     // As for `Map`: positions `0..positions()` hold the items, or none where one was removed.
-    fn positions(self) -> usize {
-        self.map.positions()
+    fn positions(self, &cx: Cx!['k]) -> usize {
+        self.map.positions(&cx)
     }
 
-    fn entry(self, i: usize) -> Option[K] {
-        self.map.entry(i)
+    fn entry(self, &cx: Cx!['k], i: usize) -> Option[K] {
+        self.map.entry(&cx, i)
     }
 
-    fn copy(self) -> Set[K] {
-        Set.{ map: self.map.copy() }
+    fn copy(self, &cx: Cx!['k]) -> Set[K, 'k] {
+        Set.{ map: self.map.copy(&cx) }
     }
 }

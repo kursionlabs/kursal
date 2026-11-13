@@ -4,8 +4,9 @@
 // declarations and renames binders, lives in `types`. An inference variable (`Meta`) is a type
 // too, compared by identity; checked programs contain none.
 
-use package::support::base::{Cell, Key, Map, Out, Seq, Text, combine, text};
+use package::support::base::{Cell, Cx, Map, Out, Seq, Text, combine, key_hash, text};
 use package::kurs::sexpr::Form;
+use std::hash::{HashIn, HashState};
 use std::slice::Slice;
 use package::syntax::ast::Pos;
 use std::option::Option;
@@ -32,81 +33,89 @@ fn kind_index(k: Kind) -> u32 {
 }
 
 // The width in bits of an integer type, or 0 for any other name.
-fn integer_bits(name: Text) -> u32 {
-    if name.is("i8") || name.is("u8") {
+forall 'k.
+fn integer_bits(&cx: Cx!['k], name: Text['k]) -> u32 {
+    if name.is(&cx, "i8") || name.is(&cx, "u8") {
         8u32
-    } else if name.is("i16") || name.is("u16") {
+    } else if name.is(&cx, "i16") || name.is(&cx, "u16") {
         16u32
-    } else if name.is("i32") || name.is("u32") {
+    } else if name.is(&cx, "i32") || name.is(&cx, "u32") {
         32u32
-    } else if name.is("i64") || name.is("u64") || name.is("isize") || name.is("usize") {
+    } else if name.is(&cx, "i64") || name.is(&cx, "u64") || name.is(&cx, "isize") || name.is(&cx, "usize") {
         64u32
     } else {
         0u32
     }
 }
 
-fn is_integer(name: Text) -> bool {
-    integer_bits(name) != 0u32
+forall 'k.
+fn is_integer(&cx: Cx!['k], name: Text['k]) -> bool {
+    integer_bits(&cx, name) != 0u32
 }
 
-fn is_float(name: Text) -> bool {
-    name.is("f32") || name.is("f64")
+forall 'k.
+fn is_float(&cx: Cx!['k], name: Text['k]) -> bool {
+    name.is(&cx, "f32") || name.is(&cx, "f64")
 }
 
-fn is_prim(name: Text) -> bool {
-    is_integer(name) || is_float(name) || name.is("bool")
+forall 'k.
+fn is_prim(&cx: Cx!['k], name: Text['k]) -> bool {
+    is_integer(&cx, name) || is_float(&cx, name) || name.is(&cx, "bool")
 }
 
 // ------------------------------------------------------------------ types --
 
+forall 'k.
 exposed enum Type {
-    Prim(Text),
+    Prim(Text['k]),
     Never,
-    Named(Text, Seq[Type]),
-    Struct(Seq[Member]),
+    Named(Text['k], Seq[Type['k], 'k]),
+    Struct(Seq[Member['k], 'k]),
     // variants in tag order
-    Enum(Seq[Member]),
-    Tuple(Seq[Type]),
-    Array(Cell[Type], u64),
-    Ptr(Cell[Type]),
+    Enum(Seq[Member['k], 'k]),
+    Tuple(Seq[Type['k], 'k]),
+    Array(Cell[Type['k], 'k], u64),
+    Ptr(Cell[Type['k], 'k]),
     // A brand variable or identity; of kind Brand, never a value type.
-    Skolem(Text),
+    Skolem(Text['k]),
     // `builtin::Brand $k`, the Copy witness type of brand `$k`: a Skolem in checked IR; inference may
     // use a brand metavariable.
-    Brand(Cell[Type]),
+    Brand(Cell[Type['k], 'k]),
     // brand labels, and the body they scope over
-    Exists(Seq[Text], Cell[Type]),
-    Foreach(ForeachType),
-    Fn(FnType),
+    Exists(Seq[Text['k], 'k], Cell[Type['k], 'k]),
+    Foreach(ForeachType['k]),
+    Fn(FnType['k]),
     // `_`: a retained brand slot of `fn`'s type arguments
     Ignored,
-    Meta(Meta),
+    Meta(Meta['k]),
 }
 
 // A field of a struct or a variant of an enum.
+forall 'k.
 exposed struct Member {
-    name: Text,
-    type: Type,
+    name: Text['k],
+    type: Type['k],
 }
 
+forall 'k.
 exposed struct ForeachType {
-    binder: Text,
+    binder: Text['k],
     // the `(builtin::Pointer F)` pattern
     indirect: bool,
-    source: Cell[Type],
-    body: Cell[Type],
-    retained: Seq[Text],
+    source: Cell[Type['k], 'k],
+    body: Cell[Type['k], 'k],
+    retained: Seq[Text['k], 'k],
 }
 
+forall 'k.
 exposed struct FnType {
-    params: Seq[Type],
-    ret: Cell[Type],
+    params: Seq[Type['k], 'k],
+    ret: Cell[Type['k], 'k],
     // retained brand parameters; a function value carries no premises
-    quantified: Seq[Param],
+    quantified: Seq[Param['k], 'k],
     is_unsafe: bool,
     // indices of place parameters, ascending
-    places: Seq[usize],
+    places: Seq[usize, 'k],
 }
 
 exposed enum MetaKind {
@@ -117,137 +126,155 @@ exposed enum MetaKind {
 }
 
 // An inference variable: its solution once it has one.
+forall 'k.
 exposed struct Meta {
-    state: Cell[MetaState],
+    state: Cell[MetaState['k], 'k],
 }
 
+forall 'k.
 exposed struct MetaState {
-    solution: Option[Type],
+    solution: Option[Type['k]],
     kind: MetaKind,
     pos: Pos,
 }
 
-impl Meta {
-    fn new(kind: MetaKind) -> Meta {
-        Meta.{ state: Cell::new(MetaState.{ solution: Option::None, kind, pos: Pos.{ line: 0u32, col: 0u32 } }) }
+forall 'k.
+impl Meta['k] {
+    fn new(&cx: Cx!['k], kind: MetaKind) -> Meta['k] {
+        Meta.{ state: Cell::new(&cx, MetaState.{ solution: Option::None, kind, pos: Pos.{ line: 0u32, col: 0u32 } }) }
     }
 
     fn id(self) -> usize {
-        unsafe (self.state.at as usize)
+        self.state.address()
     }
 
-    fn solution(self) -> Option[Type] {
-        self.state.get().solution
+    fn solution(self, &cx: Cx!['k]) -> Option[Type['k]] {
+        self.state.get(&cx).solution
     }
 
-    fn kind(self) -> MetaKind {
-        self.state.get().kind
+    fn kind(self, &cx: Cx!['k]) -> MetaKind {
+        self.state.get(&cx).kind
     }
 
-    fn pos(self) -> Pos {
-        self.state.get().pos
+    fn pos(self, &cx: Cx!['k]) -> Pos {
+        self.state.get(&cx).pos
     }
 
-    fn solve(self, t: Type) {
-        let s = self.state.get();
-        self.state.set(MetaState.{ solution: Option::Some.(t), kind: s.kind, pos: s.pos });
+    fn solve(self, &cx: Cx!['k], t: Type['k]) {
+        let s = self.state.get(&cx);
+        self.state.set(&cx, MetaState.{ solution: Option::Some.(t), kind: s.kind, pos: s.pos });
     }
 
-    fn set_kind(self, kind: MetaKind) {
-        let s = self.state.get();
-        self.state.set(MetaState.{ solution: s.solution, kind, pos: s.pos });
+    fn set_kind(self, &cx: Cx!['k], kind: MetaKind) {
+        let s = self.state.get(&cx);
+        self.state.set(&cx, MetaState.{ solution: s.solution, kind, pos: s.pos });
     }
 
-    fn set_pos(self, pos: Pos) {
-        let s = self.state.get();
-        self.state.set(MetaState.{ solution: s.solution, kind: s.kind, pos });
+    fn set_pos(self, &cx: Cx!['k], pos: Pos) {
+        let s = self.state.get(&cx);
+        self.state.set(&cx, MetaState.{ solution: s.solution, kind: s.kind, pos });
     }
 }
 
+forall 'k.
 exposed struct Param {
-    name: Text,
+    name: Text['k],
     kind: Kind,
 }
 
+forall 'k.
 exposed struct Premise {
-    trait_name: Text,
-    args: Seq[Type],
+    trait_name: Text['k],
+    args: Seq[Type['k], 'k],
 }
 
-fn prim(name: Slice[u8, 'static]) -> Type {
-    Type::Prim.(text(name))
+forall 'k.
+fn prim(&cx: Cx!['k], name: Slice[u8, 'static]) -> Type['k] {
+    Type::Prim.(text(&cx, name))
 }
 
-fn unit() -> Type {
-    Type::Tuple.(Seq::new())
+forall 'k.
+fn unit(&cx: Cx!['k]) -> Type['k] {
+    Type::Tuple.(Seq::new(&cx))
 }
 
-fn bool_type() -> Type {
-    prim("bool")
+forall 'k.
+fn bool_type(&cx: Cx!['k]) -> Type['k] {
+    prim(&cx, "bool")
 }
 
-fn u32_type() -> Type {
-    prim("u32")
+forall 'k.
+fn u32_type(&cx: Cx!['k]) -> Type['k] {
+    prim(&cx, "u32")
 }
 
-fn usize_type() -> Type {
-    prim("usize")
+forall 'k.
+fn usize_type(&cx: Cx!['k]) -> Type['k] {
+    prim(&cx, "usize")
 }
 
-fn ptr(inner: Type) -> Type {
-    Type::Ptr.(Cell::new(inner))
+forall 'k.
+fn ptr(&cx: Cx!['k], inner: Type['k]) -> Type['k] {
+    Type::Ptr.(Cell::new(&cx, inner))
 }
 
-fn named(name: Text, args: Seq[Type]) -> Type {
+forall 'k.
+fn named(name: Text['k], args: Seq[Type['k], 'k]) -> Type['k] {
     Type::Named.(name, args)
 }
 
 // A foreach type whose retained binders default to those of a foreach source.
-fn foreach_type(binder: Text, indirect: bool, source: Type, body: Type) -> Type {
-    let retained: Seq[Text] = Seq::new();
+forall 'k.
+fn foreach_type(&cx: Cx!['k], binder: Text['k], indirect: bool, source: Type['k], body: Type['k]) -> Type['k] {
+    let retained: Seq[Text['k], 'k] = Seq::new(&cx);
     let unit = match source {
         Type::Foreach(f) => {
-            retained.push(f.binder);
-            retained.append(f.retained);
+            retained.push(&cx, f.binder);
+            retained.append(&cx, f.retained);
         },
         _ => (),
     };
-    Type::Foreach.(ForeachType.{ binder, indirect, source: Cell::new(source), body: Cell::new(body), retained })
+    Type::Foreach.(ForeachType.{ binder, indirect, source: Cell::new(&cx, source), body: Cell::new(&cx, body), retained })
 }
 
-fn fn_type(params: Seq[Type], ret: Type, quantified: Seq[Param], is_unsafe: bool, places: Seq[usize]) -> Type {
-    Type::Fn.(FnType.{ params, ret: Cell::new(ret), quantified, is_unsafe, places })
+forall 'k.
+fn fn_type(&cx: Cx!['k], params: Seq[Type['k], 'k], ret: Type['k], quantified: Seq[Param['k], 'k], is_unsafe: bool, places: Seq[usize, 'k]) -> Type['k] {
+    Type::Fn.(FnType.{ params, ret: Cell::new(&cx, ret), quantified, is_unsafe, places })
 }
 
-fn types_same(a: Seq[Type], b: Seq[Type]) -> bool {
-    var equal = a.len() == b.len();
+forall 'k.
+fn types_same(&cx: Cx!['k], a: Seq[Type['k], 'k], b: Seq[Type['k], 'k]) -> bool {
+    var equal = a.len(&cx) == b.len(&cx);
     var i = 0usize;
-    while equal && i < a.len() {
-        equal = same(a.get(i), b.get(i));
+    while equal && i < a.len(&cx) {
+        equal = same(&cx, a.get(&cx, i), b.get(&cx, i));
         i = i + 1usize;
     }
     equal
 }
 
-fn members_same(a: Seq[Member], b: Seq[Member]) -> bool {
-    var equal = a.len() == b.len();
+forall 'k.
+fn members_same(&cx: Cx!['k], a: Seq[Member['k], 'k], b: Seq[Member['k], 'k]) -> bool {
+    var equal = a.len(&cx) == b.len(&cx);
     var i = 0usize;
-    while equal && i < a.len() {
-        equal = a.get(i).name.eq(b.get(i).name) && same(a.get(i).type, b.get(i).type);
+    while equal && i < a.len(&cx) {
+        equal = a.get(&cx, i).name.eq(&cx, b.get(&cx, i).name) && same(&cx, a.get(&cx, i).type, b.get(&cx, i).type);
         i = i + 1usize;
     }
     equal
 }
 
-fn texts_same(a: Seq[Text], b: Seq[Text]) -> bool {
-    a.same(b)
+forall 'k.
+fn texts_same(&cx: Cx!['k], a: Seq[Text['k], 'k], b: Seq[Text['k], 'k]) -> bool {
+    a.same(&cx, b)
 }
 
-fn params_same(a: Seq[Param], b: Seq[Param]) -> bool {
-    var equal = a.len() == b.len();
+forall 'k.
+fn params_same(&cx: Cx!['k], a: Seq[Param['k], 'k], b: Seq[Param['k], 'k]) -> bool {
+    var equal = a.len(&cx) == b.len(&cx);
     var i = 0usize;
-    while equal && i < a.len() {
-        equal = a.get(i).name.eq(b.get(i).name) && same_kind(a.get(i).kind, b.get(i).kind);
+    while equal && i < a.len(&cx) {
+        equal = a.get(&cx, i).name.eq(&cx, b.get(&cx, i).name) && same_kind(a.get(&cx, i).kind, b.get(&cx, i).kind);
         i = i + 1usize;
     }
     equal
@@ -255,10 +282,11 @@ fn params_same(a: Seq[Param], b: Seq[Param]) -> bool {
 
 // Structural equality: the same constructor with the same parts. Variables are equal only to
 // themselves.
-fn same(a: Type, b: Type) -> bool {
+forall 'k.
+fn same(&cx: Cx!['k], a: Type['k], b: Type['k]) -> bool {
     match a {
         Type::Prim(x) => match b {
-            Type::Prim(y) => x.eq(y),
+            Type::Prim(y) => x.eq(&cx, y),
             _ => false,
         },
         Type::Never => match b {
@@ -266,49 +294,49 @@ fn same(a: Type, b: Type) -> bool {
             _ => false,
         },
         Type::Named(x, xs) => match b {
-            Type::Named(y, ys) => x.eq(y) && types_same(xs, ys),
+            Type::Named(y, ys) => x.eq(&cx, y) && types_same(&cx, xs, ys),
             _ => false,
         },
         Type::Struct(xs) => match b {
-            Type::Struct(ys) => members_same(xs, ys),
+            Type::Struct(ys) => members_same(&cx, xs, ys),
             _ => false,
         },
         Type::Enum(xs) => match b {
-            Type::Enum(ys) => members_same(xs, ys),
+            Type::Enum(ys) => members_same(&cx, xs, ys),
             _ => false,
         },
         Type::Tuple(xs) => match b {
-            Type::Tuple(ys) => types_same(xs, ys),
+            Type::Tuple(ys) => types_same(&cx, xs, ys),
             _ => false,
         },
         Type::Array(x, n) => match b {
-            Type::Array(y, m) => n == m && same(x.get(), y.get()),
+            Type::Array(y, m) => n == m && same(&cx, x.get(&cx), y.get(&cx)),
             _ => false,
         },
         Type::Ptr(x) => match b {
-            Type::Ptr(y) => same(x.get(), y.get()),
+            Type::Ptr(y) => same(&cx, x.get(&cx), y.get(&cx)),
             _ => false,
         },
         Type::Skolem(x) => match b {
-            Type::Skolem(y) => x.eq(y),
+            Type::Skolem(y) => x.eq(&cx, y),
             _ => false,
         },
         Type::Brand(x) => match b {
-            Type::Brand(y) => same(x.get(), y.get()),
+            Type::Brand(y) => same(&cx, x.get(&cx), y.get(&cx)),
             _ => false,
         },
         Type::Exists(xs, x) => match b {
-            Type::Exists(ys, y) => texts_same(xs, ys) && same(x.get(), y.get()),
+            Type::Exists(ys, y) => texts_same(&cx, xs, ys) && same(&cx, x.get(&cx), y.get(&cx)),
             _ => false,
         },
         Type::Foreach(x) => match b {
-            Type::Foreach(y) => x.binder.eq(y.binder) && x.indirect == y.indirect && same(x.source.get(), y.source.get())
-                && same(x.body.get(), y.body.get()) && texts_same(x.retained, y.retained),
+            Type::Foreach(y) => x.binder.eq(&cx, y.binder) && x.indirect == y.indirect && same(&cx, x.source.get(&cx), y.source.get(&cx))
+                && same(&cx, x.body.get(&cx), y.body.get(&cx)) && texts_same(&cx, x.retained, y.retained),
             _ => false,
         },
         Type::Fn(x) => match b {
-            Type::Fn(y) => types_same(x.params, y.params) && same(x.ret.get(), y.ret.get()) && params_same(x.quantified, y.quantified)
-                && x.is_unsafe == y.is_unsafe && x.places.same(y.places),
+            Type::Fn(y) => types_same(&cx, x.params, y.params) && same(&cx, x.ret.get(&cx), y.ret.get(&cx)) && params_same(&cx, x.quantified, y.quantified)
+                && x.is_unsafe == y.is_unsafe && x.places.same(&cx, y.places),
             _ => false,
         },
         Type::Ignored => match b {
@@ -322,107 +350,132 @@ fn same(a: Type, b: Type) -> bool {
     }
 }
 
-fn hash_types(h: u64, ts: Seq[Type]) -> u64 {
+forall 'k.
+fn hash_types(&cx: Cx!['k], h: u64, ts: Seq[Type['k], 'k]) -> u64 {
     var h = h;
     var i = 0usize;
-    while i < ts.len() {
-        h = combine(h, hash(ts.get(i)));
+    while i < ts.len(&cx) {
+        h = combine(h, hash(&cx, ts.get(&cx, i)));
         i = i + 1usize;
     }
     h
 }
 
-fn hash_members(h: u64, ms: Seq[Member]) -> u64 {
+forall 'k.
+fn hash_members(&cx: Cx!['k], h: u64, ms: Seq[Member['k], 'k]) -> u64 {
     var h = h;
     var i = 0usize;
-    while i < ms.len() {
-        h = combine(combine(h, ms.get(i).name.hash()), hash(ms.get(i).type));
+    while i < ms.len(&cx) {
+        h = combine(combine(h, ms.get(&cx, i).name.hash(&cx)), hash(&cx, ms.get(&cx, i).type));
         i = i + 1usize;
     }
     h
 }
 
-fn hash(t: Type) -> u64 {
+forall 'k.
+fn hash(&cx: Cx!['k], t: Type['k]) -> u64 {
     match t {
-        Type::Prim(x) => combine(1u64, x.hash()),
+        Type::Prim(x) => combine(1u64, x.hash(&cx)),
         Type::Never => 2u64,
-        Type::Named(x, xs) => hash_types(combine(3u64, x.hash()), xs),
-        Type::Struct(xs) => hash_members(4u64, xs),
-        Type::Enum(xs) => hash_members(5u64, xs),
-        Type::Tuple(xs) => hash_types(6u64, xs),
-        Type::Array(x, n) => combine(combine(7u64, hash(x.get())), n),
-        Type::Ptr(x) => combine(8u64, hash(x.get())),
-        Type::Skolem(x) => combine(9u64, x.hash()),
-        Type::Brand(x) => combine(10u64, hash(x.get())),
-        Type::Exists(xs, x) => combine(combine(11u64, Key::key_hash(xs)), hash(x.get())),
-        Type::Foreach(x) => combine(combine(12u64, x.binder.hash()), combine(hash(x.source.get()), hash(x.body.get()))),
-        Type::Fn(x) => combine(hash_types(13u64, x.params), hash(x.ret.get())),
+        Type::Named(x, xs) => hash_types(&cx, combine(3u64, x.hash(&cx)), xs),
+        Type::Struct(xs) => hash_members(&cx, 4u64, xs),
+        Type::Enum(xs) => hash_members(&cx, 5u64, xs),
+        Type::Tuple(xs) => hash_types(&cx, 6u64, xs),
+        Type::Array(x, n) => combine(combine(7u64, hash(&cx, x.get(&cx))), n),
+        Type::Ptr(x) => combine(8u64, hash(&cx, x.get(&cx))),
+        Type::Skolem(x) => combine(9u64, x.hash(&cx)),
+        Type::Brand(x) => combine(10u64, hash(&cx, x.get(&cx))),
+        Type::Exists(xs, x) => combine(combine(11u64, key_hash(&cx, xs)), hash(&cx, x.get(&cx))),
+        Type::Foreach(x) => combine(combine(12u64, x.binder.hash(&cx)), combine(hash(&cx, x.source.get(&cx)), hash(&cx, x.body.get(&cx)))),
+        Type::Fn(x) => combine(hash_types(&cx, 13u64, x.params), hash(&cx, x.ret.get(&cx))),
         Type::Ignored => 14u64,
         Type::Meta(x) => combine(15u64, x.id() as u64),
     }
 }
 
-instance Key[Type] {
-    fn key_hash(key: Type) -> u64 {
-        hash(key)
+forall 'k.
+instance HashIn[Type['k], Cx!['k]] {
+    fn hash_in(cap: Cx!['k], key: Type['k], state: HashState) -> (Cx!['k], HashState) {
+        var cx = cap;
+        let h = hash(&cx, key);
+        (cx, state.write_u64(h))
     }
 
-    fn key_same(a: Type, b: Type) -> bool {
-        same(a, b)
-    }
-}
-
-instance Key[Param] {
-    fn key_hash(key: Param) -> u64 {
-        combine(key.name.hash(), kind_index(key.kind) as u64)
-    }
-
-    fn key_same(a: Param, b: Param) -> bool {
-        a.name.eq(b.name) && same_kind(a.kind, b.kind)
+    fn eq_in(cap: Cx!['k], a: Type['k], b: Type['k]) -> (Cx!['k], bool) {
+        var cx = cap;
+        let equal = same(&cx, a, b);
+        (cx, equal)
     }
 }
 
-instance Key[Premise] {
-    fn key_hash(key: Premise) -> u64 {
-        hash_types(key.trait_name.hash(), key.args)
+forall 'k.
+instance HashIn[Param['k], Cx!['k]] {
+    fn hash_in(cap: Cx!['k], key: Param['k], state: HashState) -> (Cx!['k], HashState) {
+        var cx = cap;
+        let h = combine(key.name.hash(&cx), kind_index(key.kind) as u64);
+        (cx, state.write_u64(h))
     }
 
-    fn key_same(a: Premise, b: Premise) -> bool {
-        a.trait_name.eq(b.trait_name) && types_same(a.args, b.args)
+    fn eq_in(cap: Cx!['k], a: Param['k], b: Param['k]) -> (Cx!['k], bool) {
+        var cx = cap;
+        let equal = a.name.eq(&cx, b.name) && same_kind(a.kind, b.kind);
+        (cx, equal)
+    }
+}
+
+forall 'k.
+instance HashIn[Premise['k], Cx!['k]] {
+    fn hash_in(cap: Cx!['k], key: Premise['k], state: HashState) -> (Cx!['k], HashState) {
+        var cx = cap;
+        let h = hash_types(&cx, key.trait_name.hash(&cx), key.args);
+        (cx, state.write_u64(h))
+    }
+
+    fn eq_in(cap: Cx!['k], a: Premise['k], b: Premise['k]) -> (Cx!['k], bool) {
+        var cx = cap;
+        let equal = a.trait_name.eq(&cx, b.trait_name) && types_same(&cx, a.args, b.args);
+        (cx, equal)
     }
 }
 
 // ---------------------------------------------------------------- modules --
 
+forall 'k.
 exposed struct ModuleId {
     package: usize,
-    path: Seq[Text],
+    path: Seq[Text['k], 'k],
 }
 
-impl ModuleId {
-    fn root(package: usize) -> ModuleId {
-        ModuleId.{ package, path: Seq::new() }
+forall 'k.
+impl ModuleId['k] {
+    fn root(&cx: Cx!['k], package: usize) -> ModuleId['k] {
+        ModuleId.{ package, path: Seq::new(&cx) }
     }
 
-    fn child(self, name: Text) -> ModuleId {
-        let path = self.path.copy();
-        path.push(name);
+    fn child(self, &cx: Cx!['k], name: Text['k]) -> ModuleId['k] {
+        let path = self.path.copy(&cx);
+        path.push(&cx, name);
         ModuleId.{ package: self.package, path }
     }
 
     // `self` is `scope` or a module inside it.
-    fn within(self, scope: ModuleId) -> bool {
-        self.package == scope.package && self.path.len() >= scope.path.len() && self.path.slice(0usize, scope.path.len()).same(scope.path)
+    fn within(self, &cx: Cx!['k], scope: ModuleId['k]) -> bool {
+        self.package == scope.package && self.path.len(&cx) >= scope.path.len(&cx) && self.path.slice(&cx, 0usize, scope.path.len(&cx)).same(&cx, scope.path)
     }
 }
 
-instance Key[ModuleId] {
-    fn key_hash(key: ModuleId) -> u64 {
-        combine(key.package as u64, Key::key_hash(key.path))
+forall 'k.
+instance HashIn[ModuleId['k], Cx!['k]] {
+    fn hash_in(cap: Cx!['k], key: ModuleId['k], state: HashState) -> (Cx!['k], HashState) {
+        var cx = cap;
+        let h = combine(key.package as u64, key_hash(&cx, key.path));
+        (cx, state.write_u64(h))
     }
 
-    fn key_same(a: ModuleId, b: ModuleId) -> bool {
-        a.package == b.package && a.path.same(b.path)
+    fn eq_in(cap: Cx!['k], a: ModuleId['k], b: ModuleId['k]) -> (Cx!['k], bool) {
+        var cx = cap;
+        let equal = a.package == b.package && a.path.same(&cx, b.path);
+        (cx, equal)
     }
 }
 
@@ -431,116 +484,128 @@ exposed enum ExposureMode {
     Within,
 }
 
+forall 'k.
 exposed struct Exposure {
     mode: ExposureMode,
-    home: ModuleId,
+    home: ModuleId['k],
 }
 
 // ----------------------------------------------------------- declarations --
 
+forall 'k.
 exposed struct TypeDecl {
-    name: Text,
+    name: Text['k],
     linear: bool,
-    params: Seq[Param],
-    premises: Seq[Premise],
-    body: Type,
-    home: Option[ModuleId],
+    params: Seq[Param['k], 'k],
+    premises: Seq[Premise['k], 'k],
+    body: Type['k],
+    home: Option[ModuleId['k]],
     // none: transparent
-    exposure: Option[Exposure],
+    exposure: Option[Exposure['k]],
 }
 
+forall 'k.
 exposed struct Instr {
-    lhs: Seq[Text],
-    op: Text,
-    args: Seq[Text],
+    lhs: Seq[Text['k], 'k],
+    op: Text['k],
+    args: Seq[Text['k], 'k],
     // the type operand
-    ty: Option[Type],
+    ty: Option[Type['k]],
     // type arguments
-    tys: Seq[Type],
-    lit: Option[Text],
+    tys: Seq[Type['k], 'k],
+    lit: Option[Text['k]],
     // the instruction's discharge marker
     is_unsafe: bool,
     // `open`'s brand binders
-    binders: Seq[Text],
+    binders: Seq[Text['k], 'k],
     pos: Pos,
 }
 
+forall 'k.
 exposed struct Edge {
-    target: Text,
-    args: Seq[Text],
-    tys: Seq[Type],
+    target: Text['k],
+    args: Seq[Text['k], 'k],
+    tys: Seq[Type['k], 'k],
 }
 
+forall 'k.
 exposed struct Arm {
-    variant: Text,
-    edge: Edge,
+    variant: Text['k],
+    edge: Edge['k],
 }
 
+forall 'k.
 exposed enum Terminator {
-    Ret(Text, Pos),
-    Jmp(Edge, Pos),
+    Ret(Text['k], Pos),
+    Jmp(Edge['k], Pos),
     // condition, then, other
-    Jnz(Text, Edge, Edge, Pos),
+    Jnz(Text['k], Edge['k], Edge['k], Pos),
     // scrutinee, its enum type, one arm per variant
-    Switch(Text, Type, Seq[Arm], Pos),
+    Switch(Text['k], Type['k], Seq[Arm['k], 'k], Pos),
     Unreachable(Pos),
 }
 
+forall 'k.
 exposed struct Binding {
-    name: Text,
-    type: Type,
+    name: Text['k],
+    type: Type['k],
 }
 
 // A known variant of a place: `known &path = Variant`.
+forall 'k.
 exposed struct Known {
-    path: Text,
-    variant: Text,
+    path: Text['k],
+    variant: Text['k],
 }
 
 // An opened package place and the brands of its view.
+forall 'k.
 exposed struct Opened {
-    path: Text,
-    brands: Seq[Text],
+    path: Text['k],
+    brands: Seq[Text['k], 'k],
 }
 
+forall 'k.
 exposed struct Block {
-    label: Text,
-    params: Seq[Binding],
-    instrs: Seq[Instr],
-    term: Terminator,
-    brands: Seq[Text],
+    label: Text['k],
+    params: Seq[Binding['k], 'k],
+    instrs: Seq[Instr['k], 'k],
+    term: Terminator['k],
+    brands: Seq[Text['k], 'k],
     // place paths declared empty
-    empty: Seq[Text],
-    known: Seq[Known],
-    opened: Seq[Opened],
+    empty: Seq[Text['k], 'k],
+    known: Seq[Known['k], 'k],
+    opened: Seq[Opened['k], 'k],
     pos: Pos,
 }
 
+forall 'k.
 exposed struct Fun {
-    name: Text,
+    name: Text['k],
     // quantified parameters
-    params: Seq[Param],
-    premises: Seq[Premise],
-    ret: Type,
+    params: Seq[Param['k], 'k],
+    premises: Seq[Premise['k], 'k],
+    ret: Type['k],
     // a place parameter's type is the root type; see `places`
-    ptypes: Seq[Type],
-    blocks: Seq[Block],
+    ptypes: Seq[Type['k], 'k],
+    blocks: Seq[Block['k], 'k],
     // whole-function places: `&name` and its type
-    locals: Seq[Binding],
+    locals: Seq[Binding['k], 'k],
     is_unsafe: bool,
-    home: Option[ModuleId],
+    home: Option[ModuleId['k]],
     pos: Pos,
 }
 
-impl Fun {
+forall 'k.
+impl Fun['k] {
     // The indices of the place parameters, whose entry names start with `&`.
-    fn places(self) -> Seq[usize] {
-        let out: Seq[usize] = Seq::new();
-        let params = self.blocks.get(0usize).params;
+    fn places(self, &cx: Cx!['k]) -> Seq[usize, 'k] {
+        let out: Seq[usize, 'k] = Seq::new(&cx);
+        let params = self.blocks.get(&cx, 0usize).params;
         var i = 0usize;
-        while i < params.len() {
-            if params.get(i).name.byte(0usize) == b'&' {
-                out.push(i);
+        while i < params.len(&cx) {
+            if params.get(&cx, i).name.byte(&cx, 0usize) == b'&' {
+                out.push(&cx, i);
             }
             i = i + 1usize;
         }
@@ -548,63 +613,70 @@ impl Fun {
     }
 }
 
+forall 'k.
 exposed struct Extern {
-    name: Text,
-    ret: Option[Type],
+    name: Text['k],
+    ret: Option[Type['k]],
     // none for an extern value
-    ptypes: Option[Seq[Type]],
+    ptypes: Option[Seq[Type['k], 'k]],
     pos: Pos,
 }
 
+forall 'k.
 exposed struct Method {
-    name: Text,
-    ret: Type,
-    ptypes: Seq[Type],
+    name: Text['k],
+    ret: Type['k],
+    ptypes: Seq[Type['k], 'k],
     is_unsafe: bool,
-    places: Seq[usize],
+    places: Seq[usize, 'k],
 }
 
+forall 'k.
 exposed struct Trait {
-    name: Text,
-    params: Seq[Text],
-    methods: Seq[Method],
-    home: Option[ModuleId],
+    name: Text['k],
+    params: Seq[Text['k], 'k],
+    methods: Seq[Method['k], 'k],
+    home: Option[ModuleId['k]],
     // omitted kinds are Any, as in plain KURS headers
-    param_kinds: Seq[Kind],
+    param_kinds: Seq[Kind, 'k],
 }
 
+forall 'k.
 exposed struct Instance {
-    trait_name: Text,
-    params: Seq[Param],
-    premises: Seq[Premise],
+    trait_name: Text['k],
+    params: Seq[Param['k], 'k],
+    premises: Seq[Premise['k], 'k],
     // one type per trait parameter
-    head: Seq[Type],
+    head: Seq[Type['k], 'k],
     // functions with bare method names
-    methods: Seq[Fun],
-    home: Option[ModuleId],
+    methods: Seq[Fun['k], 'k],
+    home: Option[ModuleId['k]],
     pos: Pos,
 }
 
+forall 'k.
 exposed struct Data {
-    name: Text,
-    ty: Type,
+    name: Text['k],
+    ty: Type['k],
     // the raw form
-    init: Form,
-    home: Option[ModuleId],
+    init: Form['k],
+    home: Option[ModuleId['k]],
 }
 
+forall 'k.
 exposed struct Program {
-    types: Map[Text, TypeDecl],
-    funs: Map[Text, Fun],
-    externs: Map[Text, Extern],
-    datas: Map[Text, Data],
-    traits: Map[Text, Trait],
+    types: Map[Text['k], TypeDecl['k], 'k],
+    funs: Map[Text['k], Fun['k], 'k],
+    externs: Map[Text['k], Extern['k], 'k],
+    datas: Map[Text['k], Data['k], 'k],
+    traits: Map[Text['k], Trait['k], 'k],
     // trait -> its instances
-    instances: Map[Text, Seq[Instance]],
+    instances: Map[Text['k], Seq[Instance['k], 'k], 'k],
 }
 
-impl Program {
-    fn new() -> Program {
-        Program.{ types: Map::new(), funs: Map::new(), externs: Map::new(), datas: Map::new(), traits: Map::new(), instances: Map::new() }
+forall 'k.
+impl Program['k] {
+    fn new(&cx: Cx!['k]) -> Program['k] {
+        Program.{ types: Map::new(&cx), funs: Map::new(&cx), externs: Map::new(&cx), datas: Map::new(&cx), traits: Map::new(&cx), instances: Map::new(&cx) }
     }
 }

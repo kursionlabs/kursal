@@ -7,7 +7,7 @@
 // method name, since methods of different instances share names with each other and with
 // functions.
 
-use package::support::base::{Cell, Key, Map, Out, Seq, Set, Text, combine, text};
+use package::support::base::{Cell, Cx, Map, Out, Seq, Set, Text, combine, text};
 use package::kurs::core::{Arm, Block, Edge, Fun, Instance, Instr, Kind, Member, Method, ModuleId, Opened, Param, Premise, Program, Terminator, Type};
 use package::kurs::core as C;
 use package::types::coherence::check_coherence;
@@ -19,40 +19,47 @@ use package::syntax::ast::{Pos, no_pos};
 use package::types::termination::check_instance_termination;
 use package::types::ops::{Fresh, Types, children, equal, fits, foreach_binders, foreach_item, free_brands, kurs_error, subst};
 use package::types::unify::match_head;
+use std::hash::{HashIn, HashState};
 use std::option::{Option, Result};
 use std::slice::Slice;
 
-fn is_arith(op: Text) -> bool {
-    op.is("add") || op.is("sub") || op.is("mul") || op.is("div") || op.is("mod")
+forall 'k.
+fn is_arith(&cx: Cx!['k], op: Text['k]) -> bool {
+    op.is(&cx, "add") || op.is(&cx, "sub") || op.is(&cx, "mul") || op.is(&cx, "div") || op.is(&cx, "mod")
 }
 
-fn is_order(op: Text) -> bool {
-    op.is("lt") || op.is("le") || op.is("gt") || op.is("ge")
+forall 'k.
+fn is_order(&cx: Cx!['k], op: Text['k]) -> bool {
+    op.is(&cx, "lt") || op.is(&cx, "le") || op.is(&cx, "gt") || op.is(&cx, "ge")
 }
 
-fn is_equality(op: Text) -> bool {
-    op.is("eq") || op.is("ne")
+forall 'k.
+fn is_equality(&cx: Cx!['k], op: Text['k]) -> bool {
+    op.is(&cx, "eq") || op.is(&cx, "ne")
 }
 
-fn is_bits(op: Text) -> bool {
-    op.is("bit_and") || op.is("bit_or") || op.is("bit_xor") || op.is("shl") || op.is("shr")
+forall 'k.
+fn is_bits(&cx: Cx!['k], op: Text['k]) -> bool {
+    op.is(&cx, "bit_and") || op.is(&cx, "bit_or") || op.is(&cx, "bit_xor") || op.is(&cx, "shl") || op.is(&cx, "shr")
 }
 
-fn is_ordering(order: Text) -> bool {
-    order.is("relaxed") || order.is("acquire") || order.is("release") || order.is("acq_rel") || order.is("seq_cst")
+forall 'k.
+fn is_ordering(&cx: Cx!['k], order: Text['k]) -> bool {
+    order.is(&cx, "relaxed") || order.is(&cx, "acquire") || order.is(&cx, "release") || order.is(&cx, "acq_rel") || order.is(&cx, "seq_cst")
 }
 
 // The failure orderings a compare-exchange allows with a success ordering; none for an unknown one.
-fn cas_failure(success: Text) -> Option[Seq[Text]] {
-    let relaxed = text("relaxed");
-    let acquire = text("acquire");
-    if success.is("relaxed") || success.is("release") {
-        Option::Some.(Seq::one(relaxed))
-    } else if success.is("acquire") || success.is("acq_rel") {
-        Option::Some.(Seq::two(relaxed, acquire))
-    } else if success.is("seq_cst") {
-        let all = Seq::two(relaxed, acquire);
-        all.push(text("seq_cst"));
+forall 'k.
+fn cas_failure(&cx: Cx!['k], success: Text['k]) -> Option[Seq[Text['k], 'k]] {
+    let relaxed = text(&cx, "relaxed");
+    let acquire = text(&cx, "acquire");
+    if success.is(&cx, "relaxed") || success.is(&cx, "release") {
+        Option::Some.(Seq::one(&cx, relaxed))
+    } else if success.is(&cx, "acquire") || success.is(&cx, "acq_rel") {
+        Option::Some.(Seq::two(&cx, relaxed, acquire))
+    } else if success.is(&cx, "seq_cst") {
+        let all = Seq::two(&cx, relaxed, acquire);
+        all.push(&cx, text(&cx, "seq_cst"));
         Option::Some.(all)
     } else {
         Option::None
@@ -60,97 +67,108 @@ fn cas_failure(success: Text) -> Option[Seq[Text]] {
 }
 
 // The number of operands of an atomic operation, if it is one.
-fn atomic_arity(kind: Text) -> Option[usize] {
-    if kind.is("fence") {
+forall 'k.
+fn atomic_arity(&cx: Cx!['k], kind: Text['k]) -> Option[usize] {
+    if kind.is(&cx, "fence") {
         Option::Some.(0usize)
-    } else if kind.is("load") {
+    } else if kind.is(&cx, "load") {
         Option::Some.(1usize)
-    } else if kind.is("compare_exchange") {
+    } else if kind.is(&cx, "compare_exchange") {
         Option::Some.(3usize)
-    } else if kind.is("store") || kind.is("swap") || kind.is("fetch_add") || kind.is("fetch_sub") || kind.is("fetch_and")
-        || kind.is("fetch_or") || kind.is("fetch_xor") {
+    } else if kind.is(&cx, "store") || kind.is(&cx, "swap") || kind.is(&cx, "fetch_add") || kind.is(&cx, "fetch_sub") || kind.is(&cx, "fetch_and")
+        || kind.is(&cx, "fetch_or") || kind.is(&cx, "fetch_xor") {
         Option::Some.(2usize)
     } else {
         Option::None
     }
 }
 
-fn static_brand() -> Text {
-    text("static")
+forall 'k.
+fn static_brand(&cx: Cx!['k]) -> Text['k] {
+    text(&cx, "static")
 }
 
 // The module of a declaration that names none: inside no exposure scope, so it has no shape
 // authority over restricted declarations.
-fn nowhere() -> ModuleId {
-    ModuleId.{ package: 18446744073709551615usize, path: Seq::one(text("<no module>")) }
+forall 'k.
+fn nowhere(&cx: Cx!['k]) -> ModuleId['k] {
+    ModuleId.{ package: 18446744073709551615usize, path: Seq::one(&cx, text(&cx, "<no module>")) }
 }
 
 // Compiler-reserved trait names: no user trait or instance.
-fn sealed(name: Text) -> bool {
-    name.starts_with(text("Copy")) || name.starts_with(text("builtin::"))
+forall 'k.
+fn sealed(&cx: Cx!['k], name: Text['k]) -> bool {
+    name.starts_with(&cx, text(&cx, "Copy")) || name.starts_with(&cx, text(&cx, "builtin::"))
 }
 
-fn segments(path: Text) -> Seq[Text] {
-    path.split(text("."))
+forall 'k.
+fn segments(&cx: Cx!['k], path: Text['k]) -> Seq[Text['k], 'k] {
+    path.split(&cx, text(&cx, "."))
 }
 
-fn join(parts: Seq[Text]) -> Text {
-    let out = Out::new();
+forall 'k.
+fn join(&cx: Cx!['k], parts: Seq[Text['k], 'k]) -> Text['k] {
+    let out = Out::new(&cx);
     var i = 0usize;
-    while i < parts.len() {
+    while i < parts.len(&cx) {
         if i > 0usize {
-            let unit = out.put(".");
+            let unit = out.put(&cx, ".");
         }
-        let unit = out.add(parts.get(i));
+        let unit = out.add(&cx, parts.get(&cx, i));
         i = i + 1usize;
     }
-    out.done()
+    out.done(&cx)
 }
 
 // Resolve a bounded decimal tuple component without parsing huge atoms.
-fn canonical_tuple_index(segment: Text, arity: usize) -> Option[usize] {
-    if arity == 0usize || segment.is_empty() || segment.len > 1usize && segment.byte(0usize) == b'0' {
+forall 'k.
+fn canonical_tuple_index(&cx: Cx!['k], segment: Text['k], arity: usize) -> Option[usize] {
+    if arity == 0usize || segment.is_empty() || segment.len() > 1usize && segment.byte(&cx, 0usize) == b'0' {
         return Option::None;
     }
     var i = 0usize;
-    while i < segment.len {
-        let b = segment.byte(i);
+    while i < segment.len() {
+        let b = segment.byte(&cx, i);
         if b < b'0' || b > b'9' {
             return Option::None;
         }
         i = i + 1usize;
     }
-    let largest = Out::new().usize(arity - 1usize).done();
-    if segment.len > largest.len || segment.len == largest.len && segment.compare(largest) > 0 {
+    let largest = Out::new(&cx).usize(&cx, arity - 1usize).done(&cx);
+    if segment.len() > largest.len() || segment.len() == largest.len() && segment.compare(&cx, largest) > 0 {
         return Option::None;
     }
-    segment.to_usize()
+    segment.to_usize(&cx)
 }
 
 // `parent` is an ancestor of `other_path`, or the path itself: its segments begin
 // `other_path`'s. A segment holds no `.`, so this compares bytes without splitting.
-fn prefix(parent: Text, other_path: Text) -> bool {
-    other_path.starts_with(parent) && (other_path.len == parent.len || other_path.byte(parent.len) == b'.')
+forall 'k.
+fn prefix(&cx: Cx!['k], parent: Text['k], other_path: Text['k]) -> bool {
+    other_path.starts_with(&cx, parent) && (other_path.len() == parent.len() || other_path.byte(&cx, parent.len()) == b'.')
 }
 
 // The end of the segment of `path` that starts at `start`: the next `.`, or the path's end.
-fn segment_end(path: Text, start: usize) -> usize {
+forall 'k.
+fn segment_end(&cx: Cx!['k], path: Text['k], start: usize) -> usize {
     var i = start;
-    while i < path.len && path.byte(i) != b'.' {
+    while i < path.len() && path.byte(&cx, i) != b'.' {
         i = i + 1usize;
     }
     i
 }
 
-fn overlap(path: Text, other_path: Text) -> bool {
-    prefix(path, other_path) || prefix(other_path, path)
+forall 'k.
+fn overlap(&cx: Cx!['k], path: Text['k], other_path: Text['k]) -> bool {
+    prefix(&cx, path, other_path) || prefix(&cx, other_path, path)
 }
 
 // Some path of `paths` is `path` or an ancestor of it.
-fn any_prefix(paths: Seq[Text], path: Text) -> bool {
+forall 'k.
+fn any_prefix(&cx: Cx!['k], paths: Seq[Text['k], 'k], path: Text['k]) -> bool {
     var i = 0usize;
-    while i < paths.len() {
-        if prefix(paths.get(i), path) {
+    while i < paths.len(&cx) {
+        if prefix(&cx, paths.get(&cx, i), path) {
             return true;
         }
         i = i + 1usize;
@@ -159,12 +177,12 @@ fn any_prefix(paths: Seq[Text], path: Text) -> bool {
 }
 
 // Some key of `map` passes `test`. The keys are read in place, not copied.
-forall V, Env where Copy[V], Copy[Env].
-fn any_key(map: Map[Text, V], test: closure[Env](Text) -> bool) -> bool {
+forall V, Env, 'k where Copy[V], Copy[Env].
+fn any_key(&cx: Cx!['k], map: Map[Text['k], V, 'k], test: closure[Env](&_: Cx!['k], Text['k]) -> bool) -> bool {
     var i = 0usize;
-    while i < map.positions() {
-        let found = match map.entry(i) {
-            Option::Some(key) => test(key),
+    while i < map.positions(&cx) {
+        let found = match map.entry(&cx, i) {
+            Option::Some(key) => test(&cx, key),
             Option::None => false,
         };
         if found {
@@ -175,21 +193,24 @@ fn any_key(map: Map[Text, V], test: closure[Env](Text) -> bool) -> bool {
     false
 }
 
-fn is_never(t: Type) -> bool {
+forall 'k.
+fn is_never(t: Type['k]) -> bool {
     match t {
         Type::Never => true,
         _ => false,
     }
 }
 
-fn is_exists(t: Type) -> bool {
+forall 'k.
+fn is_exists(t: Type['k]) -> bool {
     match t {
         Type::Exists(_binders, _body) => true,
         _ => false,
     }
 }
 
-fn is_struct_or_tuple(t: Type) -> bool {
+forall 'k.
+fn is_struct_or_tuple(t: Type['k]) -> bool {
     match t {
         Type::Struct(_fields) => true,
         Type::Tuple(_elems) => true,
@@ -197,63 +218,71 @@ fn is_struct_or_tuple(t: Type) -> bool {
     }
 }
 
-fn is_integer_type(t: Type) -> bool {
+forall 'k.
+fn is_integer_type(&cx: Cx!['k], t: Type['k]) -> bool {
     match t {
-        Type::Prim(name) => C::is_integer(name),
+        Type::Prim(name) => C::is_integer(&cx, name),
         _ => false,
     }
 }
 
 // The type of the last member named `name`, as `dict(members).get(name)` finds it.
-fn member(members: Seq[Member], name: Text) -> Option[Type] {
+forall 'k.
+fn member(&cx: Cx!['k], members: Seq[Member['k], 'k], name: Text['k]) -> Option[Type['k]] {
     var found = Option::None;
     var i = 0usize;
-    while i < members.len() {
-        if members.get(i).name.eq(name) {
-            found = Option::Some.(members.get(i).type);
+    while i < members.len(&cx) {
+        if members.get(&cx, i).name.eq(&cx, name) {
+            found = Option::Some.(members.get(&cx, i).type);
         }
         i = i + 1usize;
     }
     found
 }
 
-fn texts_set(names: Seq[Text]) -> Set[Text] {
-    let out: Set[Text] = Set::new();
+forall 'k.
+fn texts_set(&cx: Cx!['k], names: Seq[Text['k], 'k]) -> Set[Text['k], 'k] {
+    let out: Set[Text['k], 'k] = Set::new(&cx);
     var i = 0usize;
-    while i < names.len() {
-        out.add(names.get(i));
+    while i < names.len(&cx) {
+        out.add(&cx, names.get(&cx, i));
         i = i + 1usize;
     }
     out
 }
 
-fn subset(a: Set[Text], b: Set[Text]) -> bool {
-    !any_key(a.map, |x: Text| !b.has(x))
+forall 'k.
+fn subset(&cx: Cx!['k], a: Set[Text['k], 'k], b: Set[Text['k], 'k]) -> bool {
+    !any_key(&cx, a.map, |&cx, x: Text['k]| !b.has(&cx, x))
 }
 
-fn sets_meet(a: Set[Text], b: Set[Text]) -> bool {
-    !subset_none(a, b)
+forall 'k.
+fn sets_meet(&cx: Cx!['k], a: Set[Text['k], 'k], b: Set[Text['k], 'k]) -> bool {
+    !subset_none(&cx, a, b)
 }
 
-fn subset_none(a: Set[Text], b: Set[Text]) -> bool {
-    !any_key(a.map, |x: Text| b.has(x))
+forall 'k.
+fn subset_none(&cx: Cx!['k], a: Set[Text['k], 'k], b: Set[Text['k], 'k]) -> bool {
+    !any_key(&cx, a.map, |&cx, x: Text['k]| b.has(&cx, x))
 }
 
-fn opened_before(a: Opened, b: Opened) -> bool {
-    a.path.compare(b.path) < 0
+forall 'k.
+fn opened_before(&cx: Cx!['k], a: Opened['k], b: Opened['k]) -> bool {
+    a.path.compare(&cx, b.path) < 0
 }
 
 // The two maps hold the same keys with the same values.
-fn opened_same(a: Map[Text, Seq[Text]], b: Map[Text, Seq[Text]]) -> bool {
-    if a.len() != b.len() {
+forall 'k.
+fn opened_same(&cx: Cx!['k], a: Map[Text['k], Seq[Text['k], 'k], 'k], b: Map[Text['k], Seq[Text['k], 'k], 'k]) -> bool {
+    if a.len(&cx) != b.len(&cx) {
         return false;
     }
-    let keys = a.keys();
+    let keys = a.keys(&cx);
     var equal = true;
     var i = 0usize;
-    while equal && i < keys.len() {
-        equal = match b.get(keys.get(i)) {
-            Option::Some(v) => v.same(a.at(keys.get(i))),
+    while equal && i < keys.len(&cx) {
+        equal = match b.get(&cx, keys.get(&cx, i)) {
+            Option::Some(v) => v.same(&cx, a.at(&cx, keys.get(&cx, i))),
             Option::None => false,
         };
         i = i + 1usize;
@@ -263,69 +292,81 @@ fn opened_same(a: Map[Text, Seq[Text]], b: Map[Text, Seq[Text]]) -> bool {
 
 // ---------------------------------------------------------- function keys --
 
+forall 'k.
 exposed enum FunKey {
     // a function of the program, by name
-    Function(Text),
+    Function(Text['k]),
     // an instance method: its trait, the instance's index among the trait's instances, and the
     // method's bare name
-    Method(Text, usize, Text),
+    Method(Text['k], usize, Text['k]),
 }
 
-instance Key[FunKey] {
-    fn key_hash(key: FunKey) -> u64 {
-        match key {
-            FunKey::Function(name) => combine(1u64, name.hash()),
-            FunKey::Method(trait_name, index, name) => combine(combine(combine(2u64, trait_name.hash()), index as u64), name.hash()),
-        }
+forall 'k.
+instance HashIn[FunKey['k], Cx!['k]] {
+    fn hash_in(cap: Cx!['k], key: FunKey['k], state: HashState) -> (Cx!['k], HashState) {
+        var cx = cap;
+        let h = {
+            match key {
+                FunKey::Function(name) => combine(1u64, name.hash(&cx)),
+                FunKey::Method(trait_name, index, name) => combine(combine(combine(2u64, trait_name.hash(&cx)), index as u64), name.hash(&cx)),
+            }
+        };
+        (cx, state.write_u64(h))
     }
 
-    fn key_same(a: FunKey, b: FunKey) -> bool {
-        match a {
-            FunKey::Function(x) => match b {
-                FunKey::Function(y) => x.eq(y),
-                _ => false,
-            },
-            FunKey::Method(t, i, x) => match b {
-                FunKey::Method(u, j, y) => t.eq(u) && i == j && x.eq(y),
-                _ => false,
-            },
-        }
+    fn eq_in(cap: Cx!['k], a: FunKey['k], b: FunKey['k]) -> (Cx!['k], bool) {
+        var cx = cap;
+        let equal = {
+            match a {
+                FunKey::Function(x) => match b {
+                    FunKey::Function(y) => x.eq(&cx, y),
+                    _ => false,
+                },
+                FunKey::Method(t, i, x) => match b {
+                    FunKey::Method(u, j, y) => t.eq(&cx, u) && i == j && x.eq(&cx, y),
+                    _ => false,
+                },
+            }
+        };
+        (cx, equal)
     }
 }
 
 // ------------------------------------------------------------------ places --
 
 // P = (Z, K, O): empty paths, known variants, opened views.
+forall 'k.
 exposed struct Places {
-    empty: Set[Text],
-    known: Map[Text, Text],
-    opened: Map[Text, Seq[Text]],
+    empty: Set[Text['k], 'k],
+    known: Map[Text['k], Text['k], 'k],
+    opened: Map[Text['k], Seq[Text['k], 'k], 'k],
 }
 
-impl Places {
-    fn new(empty: Set[Text], known: Map[Text, Text], opened: Map[Text, Seq[Text]]) -> Places {
+forall 'k.
+impl Places['k] {
+    fn new(empty: Set[Text['k], 'k], known: Map[Text['k], Text['k], 'k], opened: Map[Text['k], Seq[Text['k], 'k], 'k]) -> Places['k] {
         Places.{ empty, known, opened }
     }
 
-    fn copy(self) -> Places {
-        Places.{ empty: self.empty.copy(), known: self.known.copy(), opened: self.opened.copy() }
+    fn copy(self, &cx: Cx!['k]) -> Places['k] {
+        Places.{ empty: self.empty.copy(&cx), known: self.known.copy(&cx), opened: self.opened.copy(&cx) }
     }
 
-    fn covered(self, path: Text) -> bool {
-        any_key(self.empty.map, |z: Text| prefix(z, path))
+    fn covered(self, &cx: Cx!['k], path: Text['k]) -> bool {
+        any_key(&cx, self.empty.map, |&cx, z: Text['k]| prefix(&cx, z, path))
     }
 
-    fn full(self, path: Text) -> bool {
-        !any_key(self.empty.map, |z: Text| overlap(z, path))
+    fn full(self, &cx: Cx!['k], path: Text['k]) -> bool {
+        !any_key(&cx, self.empty.map, |&cx, z: Text['k]| overlap(&cx, z, path))
     }
 
-    fn forget(self, path: Text, keep_own_view: bool) {
+    fn forget(self, &cx: Cx!['k], path: Text['k], keep_own_view: bool) {
         var i = 0usize;
-        while i < self.known.positions() {
-            match self.known.entry(i) {
+        while i < self.known.positions(&cx) {
+            match self.known.entry(&cx, i) {
                 Option::Some(q) => {
-                    if prefix(path, q) {
-                        self.known.remove(q);
+                    if prefix(&cx, path, q) {
+                        self.known.remove(&cx, q);
                     }
                 },
                 Option::None => (),
@@ -333,11 +374,11 @@ impl Places {
             i = i + 1usize;
         }
         var j = 0usize;
-        while j < self.opened.positions() {
-            match self.opened.entry(j) {
+        while j < self.opened.positions(&cx) {
+            match self.opened.entry(&cx, j) {
                 Option::Some(q) => {
-                    if prefix(path, q) && !(keep_own_view && q.eq(path)) {
-                        self.opened.remove(q);
+                    if prefix(&cx, path, q) && !(keep_own_view && q.eq(&cx, path)) {
+                        self.opened.remove(&cx, q);
                     }
                 },
                 Option::None => (),
@@ -347,240 +388,249 @@ impl Places {
     }
 
     // Retain views only when all their opened ancestors are retained too.
-    fn keep_opened(self, wanted: Map[Text, Seq[Text]]) {
-        let current = self.opened.keys();
-        let kept: Map[Text, Seq[Text]] = Map::new();
-        let paths = wanted.keys();
+    fn keep_opened(self, &cx: Cx!['k], wanted: Map[Text['k], Seq[Text['k], 'k], 'k]) {
+        let current = self.opened.keys(&cx);
+        let kept: Map[Text['k], Seq[Text['k], 'k], 'k] = Map::new(&cx);
+        let paths = wanted.keys(&cx);
         var i = 0usize;
-        while i < paths.len() {
-            let p = paths.get(i);
+        while i < paths.len(&cx) {
+            let p = paths.get(&cx, i);
             var all = true;
             var j = 0usize;
-            while all && j < current.len() {
-                let q = current.get(j);
-                if !q.eq(p) && prefix(q, p) {
-                    all = wanted.has(q);
+            while all && j < current.len(&cx) {
+                let q = current.get(&cx, j);
+                if !q.eq(&cx, p) && prefix(&cx, q, p) {
+                    all = wanted.has(&cx, q);
                 }
                 j = j + 1usize;
             }
             if all {
-                kept.set(p, wanted.at(p));
+                kept.set(&cx, p, wanted.at(&cx, p));
             }
             i = i + 1usize;
         }
-        let old = self.opened.keys();
+        let old = self.opened.keys(&cx);
         var k = 0usize;
-        while k < old.len() {
-            self.opened.remove(old.get(k));
+        while k < old.len(&cx) {
+            self.opened.remove(&cx, old.get(&cx, k));
             k = k + 1usize;
         }
-        let new = kept.keys();
+        let new = kept.keys(&cx);
         var n = 0usize;
-        while n < new.len() {
-            self.opened.set(new.get(n), kept.at(new.get(n)));
+        while n < new.len(&cx) {
+            self.opened.set(&cx, new.get(&cx, n), kept.at(&cx, new.get(&cx, n)));
             n = n + 1usize;
         }
     }
 }
 
 // (param types, result, unsafe, place indices) of a call's callee.
+forall 'k.
 exposed struct Signature {
-    ptypes: Seq[Type],
-    ret: Type,
+    ptypes: Seq[Type['k], 'k],
+    ret: Type['k],
     is_unsafe: bool,
-    places: Seq[usize],
+    places: Seq[usize, 'k],
 }
 
 // ----------------------------------------------------------------- checker --
 
+forall 'k.
 exposed struct Checker {
-    program: Program,
-    counter: Fresh,
-    formation: Formation[Checker],
-    types: Types,
+    program: Program['k],
+    counter: Fresh['k],
+    formation: Formation[Checker['k], 'k],
+    types: Types['k],
     // function -> (block label, SSA name) -> type, for the backend
-    typed: Map[FunKey, Map[(Text, Text), Type]],
-    home: Cell[Option[ModuleId]],
-    kinds: Cell[Map[Text, Kind]],
+    typed: Map[FunKey['k], Map[(Text['k], Text['k]), Type['k], 'k], 'k],
+    home: Cell[Option[ModuleId['k]], 'k],
+    kinds: Cell[Map[Text['k], Kind, 'k], 'k],
     // whether each type asked about is Copy, under the kinds map (by its identity) it was asked under
-    copies: Cell[(usize, Map[Type, bool])],
-    brands: Cell[Set[Text]],
-    premises: Cell[Seq[Premise]],
+    copies: Cell[(usize, Map[Type['k], bool, 'k]), 'k],
+    brands: Cell[Set[Text['k], 'k], 'k],
+    premises: Cell[Seq[Premise['k], 'k], 'k],
     // what is being checked, for messages
-    location: Cell[Text],
-    current: Cell[Option[Fun]],
-    params: Cell[Seq[Param]],
-    blocks: Cell[Map[Text, Block]],
-    record: Cell[Map[(Text, Text), Type]],
-    roots: Cell[Map[Text, Type]],
-    param_roots: Cell[Set[Text]],
+    location: Cell[Text['k], 'k],
+    current: Cell[Option[Fun['k]], 'k],
+    params: Cell[Seq[Param['k], 'k], 'k],
+    blocks: Cell[Map[Text['k], Block['k], 'k], 'k],
+    record: Cell[Map[(Text['k], Text['k]), Type['k], 'k], 'k],
+    roots: Cell[Map[Text['k], Type['k], 'k], 'k],
+    param_roots: Cell[Set[Text['k], 'k], 'k],
     // the free brands of each root's type, as `edge` asks for them
-    root_brand_cache: Cell[Map[Text, Set[Text]]],
-    label: Cell[Text],
-    env: Cell[Map[Text, Type]],
-    used: Cell[Set[Text]],
-    places: Cell[Places],
-    instr: Cell[Option[Instr]],
+    root_brand_cache: Cell[Map[Text['k], Set[Text['k], 'k], 'k], 'k],
+    label: Cell[Text['k], 'k],
+    env: Cell[Map[Text['k], Type['k], 'k], 'k],
+    used: Cell[Set[Text['k], 'k], 'k],
+    places: Cell[Places['k], 'k],
+    instr: Cell[Option[Instr['k]], 'k],
 }
 
-instance Discharge[Checker] {
-    fn discharge_premise(discharger: Checker, premise: Premise, env: Map[Text, Kind], premises: Seq[Premise], home: Option[ModuleId]) -> bool {
-        discharger.formation_holds(premise, env, premises, home)
+forall 'k.
+instance Discharge[Checker['k], 'k] {
+    fn discharge_premise(discharger: Checker['k], &cx: Cx!['k], premise: Premise['k], env: Map[Text['k], Kind, 'k], premises: Seq[Premise['k], 'k], home: Option[ModuleId['k]]) -> bool {
+        discharger.formation_holds(&cx, premise, env, premises, home)
     }
 }
 
-fn with_brands(kinds: Map[Text, Kind], brands: Set[Text]) -> Map[Text, Kind] {
-    let out = kinds.copy();
-    let names = brands.items();
+forall 'k.
+fn with_brands(&cx: Cx!['k], kinds: Map[Text['k], Kind, 'k], brands: Set[Text['k], 'k]) -> Map[Text['k], Kind, 'k] {
+    let out = kinds.copy(&cx);
+    let names = brands.items(&cx);
     var i = 0usize;
-    while i < names.len() {
-        out.set(names.get(i), Kind::Brand);
+    while i < names.len(&cx) {
+        out.set(&cx, names.get(&cx, i), Kind::Brand);
         i = i + 1usize;
     }
     out
 }
 
-fn concat_params(a: Seq[Param], b: Seq[Param]) -> Seq[Param] {
-    let out = a.copy();
-    out.append(b);
+forall 'k.
+fn concat_params(&cx: Cx!['k], a: Seq[Param['k], 'k], b: Seq[Param['k], 'k]) -> Seq[Param['k], 'k] {
+    let out = a.copy(&cx);
+    out.append(&cx, b);
     out
 }
 
-fn concat_premises(a: Seq[Premise], b: Seq[Premise]) -> Seq[Premise] {
-    let out = a.copy();
-    out.append(b);
+forall 'k.
+fn concat_premises(&cx: Cx!['k], a: Seq[Premise['k], 'k], b: Seq[Premise['k], 'k]) -> Seq[Premise['k], 'k] {
+    let out = a.copy(&cx);
+    out.append(&cx, b);
     out
 }
 
-fn brand_params(params: Seq[Param]) -> Set[Text] {
-    let out: Set[Text] = Set::new();
+forall 'k.
+fn brand_params(&cx: Cx!['k], params: Seq[Param['k], 'k]) -> Set[Text['k], 'k] {
+    let out: Set[Text['k], 'k] = Set::new(&cx);
     var i = 0usize;
-    while i < params.len() {
-        if C::same_kind(params.get(i).kind, Kind::Brand) {
-            out.add(params.get(i).name);
+    while i < params.len(&cx) {
+        if C::same_kind(params.get(&cx, i).kind, Kind::Brand) {
+            out.add(&cx, params.get(&cx, i).name);
         }
         i = i + 1usize;
     }
     out
 }
 
-fn subst_all(types: Seq[Type], sub: Map[Text, Type], counter: Fresh) -> Seq[Type] {
-    let out: Seq[Type] = Seq::new();
+forall 'k.
+fn subst_all(&cx: Cx!['k], types: Seq[Type['k], 'k], sub: Map[Text['k], Type['k], 'k], counter: Fresh['k]) -> Seq[Type['k], 'k] {
+    let out: Seq[Type['k], 'k] = Seq::new(&cx);
     var i = 0usize;
-    while i < types.len() {
-        out.push(subst(types.get(i), sub, counter));
+    while i < types.len(&cx) {
+        out.push(&cx, subst(&cx, types.get(&cx, i), sub, counter));
         i = i + 1usize;
     }
     out
 }
 
-impl Checker {
-    fn new(program: Program, counter: Fresh) -> Checker {
-        check_type_expansion(program, counter);
-        let formation: Formation[Checker] = Formation::new(program, counter);
-        formation.declarations();
-        let heads: Seq[(Premise, Seq[Param], Pos)] = Seq::new();
-        let headers: Seq[(Premise, Seq[Premise], Pos)] = Seq::new();
-        let groups = program.instances.values();
+forall 'k.
+impl Checker['k] {
+    fn new(&cx: Cx!['k], program: Program['k], counter: Fresh['k]) -> Checker['k] {
+        check_type_expansion(&cx, program, counter);
+        let formation: Formation[Checker['k], 'k] = Formation::new(&cx, program, counter);
+        formation.declarations(&cx);
+        let heads: Seq[(Premise['k], Seq[Param['k], 'k], Pos), 'k] = Seq::new(&cx);
+        let headers: Seq[(Premise['k], Seq[Premise['k], 'k], Pos), 'k] = Seq::new(&cx);
+        let groups = program.instances.values(&cx);
         var g = 0usize;
-        while g < groups.len() {
-            let insts = groups.get(g);
+        while g < groups.len(&cx) {
+            let insts = groups.get(&cx, g);
             var i = 0usize;
-            while i < insts.len() {
-                let inst = insts.get(i);
-                heads.push((Premise.{ trait_name: inst.trait_name, args: inst.head }, inst.params, inst.pos));
-                headers.push((Premise.{ trait_name: inst.trait_name, args: inst.head }, inst.premises, no_pos()));
+            while i < insts.len(&cx) {
+                let inst = insts.get(&cx, i);
+                heads.push(&cx, (Premise.{ trait_name: inst.trait_name, args: inst.head }, inst.params, inst.pos));
+                headers.push(&cx, (Premise.{ trait_name: inst.trait_name, args: inst.head }, inst.premises, no_pos()));
                 i = i + 1usize;
             }
             g = g + 1usize;
         }
-        check_coherence(heads, counter);
-        check_instance_termination(headers);
+        check_coherence(&cx, heads, counter);
+        check_instance_termination(&cx, headers);
         let checker = Checker.{
             program,
             counter,
             formation,
-            types: Types::new(program, counter),
-            typed: Map::new(),
-            home: Cell::new(Option::None),
-            kinds: Cell::new(Map::new()),
-            copies: Cell::new((0usize, Map::new())),
-            brands: Cell::new(Set::new()),
-            premises: Cell::new(Seq::new()),
-            location: Cell::new(text("")),
-            current: Cell::new(Option::None),
-            params: Cell::new(Seq::new()),
-            blocks: Cell::new(Map::new()),
-            record: Cell::new(Map::new()),
-            roots: Cell::new(Map::new()),
-            param_roots: Cell::new(Set::new()),
-            root_brand_cache: Cell::new(Map::new()),
-            label: Cell::new(text("")),
-            env: Cell::new(Map::new()),
-            used: Cell::new(Set::new()),
-            places: Cell::new(Places::new(Set::new(), Map::new(), Map::new())),
-            instr: Cell::new(Option::None),
+            types: Types::new(&cx, program, counter),
+            typed: Map::new(&cx),
+            home: Cell::new(&cx, Option::None),
+            kinds: Cell::new(&cx, Map::new(&cx)),
+            copies: Cell::new(&cx, (0usize, Map::new(&cx))),
+            brands: Cell::new(&cx, Set::new(&cx)),
+            premises: Cell::new(&cx, Seq::new(&cx)),
+            location: Cell::new(&cx, text(&cx, "")),
+            current: Cell::new(&cx, Option::None),
+            params: Cell::new(&cx, Seq::new(&cx)),
+            blocks: Cell::new(&cx, Map::new(&cx)),
+            record: Cell::new(&cx, Map::new(&cx)),
+            roots: Cell::new(&cx, Map::new(&cx)),
+            param_roots: Cell::new(&cx, Set::new(&cx)),
+            root_brand_cache: Cell::new(&cx, Map::new(&cx)),
+            label: Cell::new(&cx, text(&cx, "")),
+            env: Cell::new(&cx, Map::new(&cx)),
+            used: Cell::new(&cx, Set::new(&cx)),
+            places: Cell::new(&cx, Places::new(Set::new(&cx), Map::new(&cx), Map::new(&cx))),
+            instr: Cell::new(&cx, Option::None),
         };
-        checker.brands.get().add(static_brand());
-        formation.discharge.set(Option::Some.(checker));
-        formation.declarations();
+        checker.brands.get(&cx).add(&cx, static_brand(&cx));
+        formation.discharge.set(&cx, Option::Some.(checker));
+        formation.declarations(&cx);
         checker
     }
 
-    fn formation_holds(self, premise: Premise, kinds: Map[Text, Kind], premises: Seq[Premise], home: Option[ModuleId]) -> bool {
-        let saved_kinds = self.kinds.get();
-        let saved_premises = self.premises.get();
-        let saved_home = self.home.get();
-        let saved_brands = self.brands.get();
-        self.kinds.set(kinds.copy());
-        self.premises.set(premises);
-        self.home.set(home);
-        let brands: Set[Text] = Set::new();
-        let names = kinds.keys();
+    fn formation_holds(self, &cx: Cx!['k], premise: Premise['k], kinds: Map[Text['k], Kind, 'k], premises: Seq[Premise['k], 'k], home: Option[ModuleId['k]]) -> bool {
+        let saved_kinds = self.kinds.get(&cx);
+        let saved_premises = self.premises.get(&cx);
+        let saved_home = self.home.get(&cx);
+        let saved_brands = self.brands.get(&cx);
+        self.kinds.set(&cx, kinds.copy(&cx));
+        self.premises.set(&cx, premises);
+        self.home.set(&cx, home);
+        let brands: Set[Text['k], 'k] = Set::new(&cx);
+        let names = kinds.keys(&cx);
         var i = 0usize;
-        while i < names.len() {
-            if C::same_kind(kinds.at(names.get(i)), Kind::Brand) {
-                brands.add(names.get(i));
+        while i < names.len(&cx) {
+            if C::same_kind(kinds.at(&cx, names.get(&cx, i)), Kind::Brand) {
+                brands.add(&cx, names.get(&cx, i));
             }
             i = i + 1usize;
         }
-        self.brands.set(brands);
-        let result = self.holds(premise.trait_name, premise.args);
-        self.kinds.set(saved_kinds);
-        self.premises.set(saved_premises);
-        self.home.set(saved_home);
-        self.brands.set(saved_brands);
+        self.brands.set(&cx, brands);
+        let result = self.holds(&cx, premise.trait_name, premise.args);
+        self.kinds.set(&cx, saved_kinds);
+        self.premises.set(&cx, saved_premises);
+        self.home.set(&cx, saved_home);
+        self.brands.set(&cx, saved_brands);
         result
     }
 
-    fn fail(self, message: Slice[u8, 'static]) -> ! {
-        kurs_error(Out::new().add(self.location.get()).put(": ").put(message).done(), no_pos())
+    fn fail(self, &cx: Cx!['k], message: Slice[u8, 'static]) -> ! {
+        kurs_error(&cx, Out::new(&cx).add(&cx, self.location.get(&cx)).put(&cx, ": ").put(&cx, message).done(&cx), no_pos())
     }
 
-    fn fun(self) -> Fun {
-        match self.current.get() {
+    fn fun(self, &cx: Cx!['k]) -> Fun['k] {
+        match self.current.get(&cx) {
             Option::Some(fun) => fun,
-            Option::None => kurs_error(text("internal error: no function is being checked"), no_pos()),
+            Option::None => kurs_error(&cx, text(&cx, "internal error: no function is being checked"), no_pos()),
         }
     }
 
-    fn scope(self) -> Map[Text, Kind] {
-        with_brands(self.kinds.get(), self.brands.get())
+    fn scope(self, &cx: Cx!['k]) -> Map[Text['k], Kind, 'k] {
+        with_brands(&cx, self.kinds.get(&cx), self.brands.get(&cx))
     }
 
     // ----------------------------------------------------------------- program --
 
-    fn check(self) {
-        let externs = self.program.externs.values();
+    fn check(self, &cx: Cx!['k]) {
+        let externs = self.program.externs.values(&cx);
         var e = 0usize;
-        while e < externs.len() {
-            let ext = externs.get(e);
-            self.location.set(Out::new().put("extern ").add(ext.name).done());
+        while e < externs.len(&cx) {
+            let ext = externs.get(&cx, e);
+            self.location.set(&cx, Out::new(&cx).put(&cx, "extern ").add(&cx, ext.name).done(&cx));
             let unit = match ext.ptypes {
                 Option::Some(ptypes) => {
                     var i = 0usize;
-                    while i < ptypes.len() {
-                        self.has_memory_form(ptypes.get(i));
+                    while i < ptypes.len(&cx) {
+                        self.has_memory_form(&cx, ptypes.get(&cx, i));
                         i = i + 1usize;
                     }
                 },
@@ -588,432 +638,432 @@ impl Checker {
             };
             e = e + 1usize;
         }
-        let traits = self.program.traits.values();
+        let traits = self.program.traits.values(&cx);
         var t = 0usize;
-        while t < traits.len() {
-            let tr = traits.get(t);
-            self.location.set(Out::new().put("trait ").add(tr.name).done());
-            if sealed(tr.name) {
-                self.fail("trait_name_is_reserved");
+        while t < traits.len(&cx) {
+            let tr = traits.get(&cx, t);
+            self.location.set(&cx, Out::new(&cx).put(&cx, "trait ").add(&cx, tr.name).done(&cx));
+            if sealed(&cx, tr.name) {
+                self.fail(&cx, "trait_name_is_reserved");
             }
-            let names: Set[Text] = Set::new();
+            let names: Set[Text['k], 'k] = Set::new(&cx);
             var m = 0usize;
-            while m < tr.methods.len() {
-                names.add(tr.methods.get(m).name);
+            while m < tr.methods.len(&cx) {
+                names.add(&cx, tr.methods.get(&cx, m).name);
                 m = m + 1usize;
             }
-            if names.len() != tr.methods.len() {
-                self.fail("duplicate_trait_method");
+            if names.len(&cx) != tr.methods.len(&cx) {
+                self.fail(&cx, "duplicate_trait_method");
             }
             t = t + 1usize;
         }
-        let funs = self.program.funs.values();
+        let funs = self.program.funs.values(&cx);
         var f = 0usize;
-        while f < funs.len() {
-            self.check_fun(funs.get(f), Seq::new(), Seq::new(), FunKey::Function.(funs.get(f).name));
+        while f < funs.len(&cx) {
+            self.check_fun(&cx, funs.get(&cx, f), Seq::new(&cx), Seq::new(&cx), FunKey::Function.(funs.get(&cx, f).name));
             f = f + 1usize;
         }
-        let trait_names = self.program.instances.keys();
+        let trait_names = self.program.instances.keys(&cx);
         var g = 0usize;
-        while g < trait_names.len() {
-            let insts = self.program.instances.at(trait_names.get(g));
+        while g < trait_names.len(&cx) {
+            let insts = self.program.instances.at(&cx, trait_names.get(&cx, g));
             var i = 0usize;
-            while i < insts.len() {
-                self.check_instance(insts.get(i), trait_names.get(g), i);
+            while i < insts.len(&cx) {
+                self.check_instance(&cx, insts.get(&cx, i), trait_names.get(&cx, g), i);
                 i = i + 1usize;
             }
             g = g + 1usize;
         }
-        let datas = self.program.datas.values();
+        let datas = self.program.datas.values(&cx);
         var d = 0usize;
-        while d < datas.len() {
-            let data = datas.get(d);
-            self.location.set(data.name);
-            self.home.set(Option::Some.(match data.home {
+        while d < datas.len(&cx) {
+            let data = datas.get(&cx, d);
+            self.location.set(&cx, data.name);
+            self.home.set(&cx, Option::Some.(match data.home {
                 Option::Some(m) => m,
-                Option::None => nowhere(),
+                Option::None => nowhere(&cx),
             }));
-            self.check_data(data.ty, data.init);
+            self.check_data(&cx, data.ty, data.init);
             d = d + 1usize;
         }
     }
 
     // `group` is the key of the instance's list in the program, and `index` its place there.
-    fn check_instance(self, inst: Instance, group: Text, index: usize) {
-        let found = self.program.traits.get(inst.trait_name);
-        self.location.set(Out::new().put("instance ").add(inst.trait_name).done());
-        if sealed(inst.trait_name) {
-            self.fail("trait_name_is_reserved");
+    fn check_instance(self, &cx: Cx!['k], inst: Instance['k], group: Text['k], index: usize) {
+        let found = self.program.traits.get(&cx, inst.trait_name);
+        self.location.set(&cx, Out::new(&cx).put(&cx, "instance ").add(&cx, inst.trait_name).done(&cx));
+        if sealed(&cx, inst.trait_name) {
+            self.fail(&cx, "trait_name_is_reserved");
         }
         let tr = match found {
             Option::Some(tr) => tr,
-            Option::None => self.fail("instance_unknown_trait_wrong"),
+            Option::None => self.fail(&cx, "instance_unknown_trait_wrong"),
         };
-        if tr.params.len() != inst.head.len() {
-            self.fail("instance_unknown_trait_wrong");
+        if tr.params.len(&cx) != inst.head.len(&cx) {
+            self.fail(&cx, "instance_unknown_trait_wrong");
         }
-        let head: Map[Text, Type] = Map::new();
+        let head: Map[Text['k], Type['k], 'k] = Map::new(&cx);
         var h = 0usize;
-        while h < tr.params.len() {
-            head.set(tr.params.get(h), inst.head.get(h));
+        while h < tr.params.len(&cx) {
+            head.set(&cx, tr.params.get(&cx, h), inst.head.get(&cx, h));
             h = h + 1usize;
         }
-        let by_name: Map[Text, Fun] = Map::new();
+        let by_name: Map[Text['k], Fun['k], 'k] = Map::new(&cx);
         var i = 0usize;
-        while i < inst.methods.len() {
-            by_name.set(inst.methods.get(i).name, inst.methods.get(i));
+        while i < inst.methods.len(&cx) {
+            by_name.set(&cx, inst.methods.get(&cx, i).name, inst.methods.get(&cx, i));
             i = i + 1usize;
         }
-        if by_name.len() != inst.methods.len() {
-            self.fail("duplicate_instance_method");
+        if by_name.len(&cx) != inst.methods.len(&cx) {
+            self.fail(&cx, "duplicate_instance_method");
         }
-        let declared: Set[Text] = Set::new();
+        let declared: Set[Text['k], 'k] = Set::new(&cx);
         var s = 0usize;
-        while s < tr.methods.len() {
-            declared.add(tr.methods.get(s).name);
+        while s < tr.methods.len(&cx) {
+            declared.add(&cx, tr.methods.get(&cx, s).name);
             s = s + 1usize;
         }
-        if !subset(texts_set(by_name.keys()), declared) {
-            self.fail("instance_method_not_in_trait");
+        if !subset(&cx, texts_set(&cx, by_name.keys(&cx)), declared) {
+            self.fail(&cx, "instance_method_not_in_trait");
         }
         var m = 0usize;
-        while m < tr.methods.len() {
-            let sig = tr.methods.get(m);
-            let fun = match by_name.get(sig.name) {
+        while m < tr.methods.len(&cx) {
+            let sig = tr.methods.get(&cx, m);
+            let fun = match by_name.get(&cx, sig.name) {
                 Option::Some(fun) => fun,
-                Option::None => self.fail("instance_lacks_method"),
+                Option::None => self.fail(&cx, "instance_lacks_method"),
             };
-            if !fun.params.is_empty() || !fun.premises.is_empty() {
-                self.fail("instance_method_has_own_quantifier");
+            if !fun.params.is_empty(&cx) || !fun.premises.is_empty(&cx) {
+                self.fail(&cx, "instance_method_has_own_quantifier");
             }
-            let want = C::fn_type(subst_all(sig.ptypes, head, self.counter), subst(sig.ret, head, self.counter), Seq::new(), false, sig.places);
-            let got = C::fn_type(fun.ptypes, fun.ret, Seq::new(), false, fun.places());
-            if !equal(got, want) || (fun.is_unsafe && !sig.is_unsafe) {
-                self.fail("method_does_match_trait");
+            let want = C::fn_type(&cx, subst_all(&cx, sig.ptypes, head, self.counter), subst(&cx, sig.ret, head, self.counter), Seq::new(&cx), false, sig.places);
+            let got = C::fn_type(&cx, fun.ptypes, fun.ret, Seq::new(&cx), false, fun.places(&cx));
+            if !equal(&cx, got, want) || (fun.is_unsafe && !sig.is_unsafe) {
+                self.fail(&cx, "method_does_match_trait");
             }
-            self.check_fun(fun, inst.params, inst.premises, FunKey::Method.(group, index, sig.name));
+            self.check_fun(&cx, fun, inst.params, inst.premises, FunKey::Method.(group, index, sig.name));
             m = m + 1usize;
         }
     }
 
-    fn check_data(self, ty: Type, form: Form) {
-        let s = self.types.shape(ty, self.home.get());
+    fn check_data(self, &cx: Cx!['k], ty: Type['k], form: Form['k]) {
+        let s = self.types.shape(&cx, ty, self.home.get(&cx));
         let unit = match s {
             Type::Prim(_name) => {
                 if form.is_list() || form.is_str() {
-                    self.fail("data_scalar_requires_atom");
+                    self.fail(&cx, "data_scalar_requires_atom");
                 }
-                self.scalar_literal(s, form.text);
+                self.scalar_literal(&cx, s, form.text);
                 return ();
             },
             Type::Tuple(_elems) => (),
             Type::Struct(_fields) => (),
             Type::Array(_elem, _length) => (),
-            _ => self.fail("data_initializer_type"),
+            _ => self.fail(&cx, "data_initializer_type"),
         };
         if !form.is_list() {
-            self.fail("data_product_requires_list");
+            self.fail(&cx, "data_product_requires_list");
         }
         let unit = match s {
             Type::Array(elem, length) => {
                 var count = 0u64;
                 var i = 0usize;
-                while i < form.len() {
-                    let part = form.at(i);
-                    if C::same(elem.get(), C::prim("u8")) && part.is_str() {
-                        count = count + (part.text.len as u64);
+                while i < form.len(&cx) {
+                    let part = form.at(&cx, i);
+                    if C::same(&cx, elem.get(&cx), C::prim(&cx, "u8")) && part.is_str() {
+                        count = count + (part.text.len() as u64);
                     } else {
-                        self.check_data(elem.get(), part);
+                        self.check_data(&cx, elem.get(&cx), part);
                         count = count + 1u64;
                     }
                     i = i + 1usize;
                 }
                 if count != length {
-                    self.fail("data_initializer_wrong_number");
+                    self.fail(&cx, "data_initializer_wrong_number");
                 }
                 return ();
             },
             _ => (),
         };
-        let parts = self.types.fields(ty, self.home.get());
-        if form.len() != parts.len() {
-            self.fail("data_initializer_wrong_number");
+        let parts = self.types.fields(&cx, ty, self.home.get(&cx));
+        if form.len(&cx) != parts.len(&cx) {
+            self.fail(&cx, "data_initializer_wrong_number");
         }
         var i = 0usize;
-        while i < parts.len() {
-            self.check_data(parts.get(i), form.at(i));
+        while i < parts.len(&cx) {
+            self.check_data(&cx, parts.get(&cx, i), form.at(&cx, i));
             i = i + 1usize;
         }
     }
 
     // ---------------------------------------------------------------- function --
 
-    fn check_fun(self, fun: Fun, outer_params: Seq[Param], outer_premises: Seq[Premise], key: FunKey) {
-        self.formation.function(fun, outer_params, outer_premises);
-        self.current.set(Option::Some.(fun));
-        self.location.set(fun.name);
-        let params = concat_params(outer_params, fun.params);
-        self.params.set(params);
-        let kinds: Map[Text, Kind] = Map::new();
+    fn check_fun(self, &cx: Cx!['k], fun: Fun['k], outer_params: Seq[Param['k], 'k], outer_premises: Seq[Premise['k], 'k], key: FunKey['k]) {
+        self.formation.function(&cx, fun, outer_params, outer_premises);
+        self.current.set(&cx, Option::Some.(fun));
+        self.location.set(&cx, fun.name);
+        let params = concat_params(&cx, outer_params, fun.params);
+        self.params.set(&cx, params);
+        let kinds: Map[Text['k], Kind, 'k] = Map::new(&cx);
         var p = 0usize;
-        while p < params.len() {
-            kinds.set(params.get(p).name, params.get(p).kind);
+        while p < params.len(&cx) {
+            kinds.set(&cx, params.get(&cx, p).name, params.get(&cx, p).kind);
             p = p + 1usize;
         }
-        self.kinds.set(kinds);
-        self.premises.set(concat_premises(outer_premises, fun.premises));
-        self.home.set(Option::Some.(match fun.home {
+        self.kinds.set(&cx, kinds);
+        self.premises.set(&cx, concat_premises(&cx, outer_premises, fun.premises));
+        self.home.set(&cx, Option::Some.(match fun.home {
             Option::Some(m) => m,
-            Option::None => nowhere(),
+            Option::None => nowhere(&cx),
         }));
-        let blocks: Map[Text, Block] = Map::new();
+        let blocks: Map[Text['k], Block['k], 'k] = Map::new(&cx);
         var b = 0usize;
-        while b < fun.blocks.len() {
-            blocks.set(fun.blocks.get(b).label, fun.blocks.get(b));
+        while b < fun.blocks.len(&cx) {
+            blocks.set(&cx, fun.blocks.get(&cx, b).label, fun.blocks.get(&cx, b));
             b = b + 1usize;
         }
-        self.blocks.set(blocks);
-        let record = match self.typed.get(key) {
+        self.blocks.set(&cx, blocks);
+        let record = match self.typed.get(&cx, key) {
             Option::Some(r) => r,
             Option::None => {
-                let r: Map[(Text, Text), Type] = Map::new();
-                self.typed.set(key, r);
+                let r: Map[(Text['k], Text['k]), Type['k], 'k] = Map::new(&cx);
+                self.typed.set(&cx, key, r);
                 r
             },
         };
-        self.record.set(record);
-        if blocks.len() != fun.blocks.len() {
-            self.fail("duplicate_block_label");
+        self.record.set(&cx, record);
+        if blocks.len(&cx) != fun.blocks.len(&cx) {
+            self.fail(&cx, "duplicate_block_label");
         }
-        let entry = fun.blocks.get(0usize);
-        if entry.params.len() != fun.ptypes.len() || !entry.brands.is_empty() {
-            self.fail("entry_parameters_disagree_signature");
+        let entry = fun.blocks.get(&cx, 0usize);
+        if entry.params.len(&cx) != fun.ptypes.len(&cx) || !entry.brands.is_empty(&cx) {
+            self.fail(&cx, "entry_parameters_disagree_signature");
         }
-        let roots: Map[Text, Type] = Map::new();
+        let roots: Map[Text['k], Type['k], 'k] = Map::new(&cx);
         var l = 0usize;
-        while l < fun.locals.len() {
-            roots.set(fun.locals.get(l).name, fun.locals.get(l).type);
+        while l < fun.locals.len(&cx) {
+            roots.set(&cx, fun.locals.get(&cx, l).name, fun.locals.get(&cx, l).type);
             l = l + 1usize;
         }
-        self.roots.set(roots);
-        self.root_brand_cache.set(Map::new());
-        if roots.len() != fun.locals.len() {
-            self.fail("duplicate_place_root");
+        self.roots.set(&cx, roots);
+        self.root_brand_cache.set(&cx, Map::new(&cx));
+        if roots.len(&cx) != fun.locals.len(&cx) {
+            self.fail(&cx, "duplicate_place_root");
         }
-        let param_roots: Set[Text] = Set::new();
+        let param_roots: Set[Text['k], 'k] = Set::new(&cx);
         var i = 0usize;
-        while i < entry.params.len() {
-            let binding = entry.params.get(i);
-            if !equal(binding.type, fun.ptypes.get(i)) {
-                self.fail("entry_parameter_disagrees_signature");
+        while i < entry.params.len(&cx) {
+            let binding = entry.params.get(&cx, i);
+            if !equal(&cx, binding.type, fun.ptypes.get(&cx, i)) {
+                self.fail(&cx, "entry_parameter_disagrees_signature");
             }
-            if binding.name.starts_with(text("&")) {
-                if roots.has(binding.name) {
-                    self.fail("duplicate_place_root");
+            if binding.name.starts_with(&cx, text(&cx, "&")) {
+                if roots.has(&cx, binding.name) {
+                    self.fail(&cx, "duplicate_place_root");
                 }
-                roots.set(binding.name, binding.type);
+                roots.set(&cx, binding.name, binding.type);
             }
             i = i + 1usize;
         }
         var j = 0usize;
-        while j < entry.params.len() {
-            if entry.params.get(j).name.starts_with(text("&")) {
-                param_roots.add(entry.params.get(j).name);
+        while j < entry.params.len(&cx) {
+            if entry.params.get(&cx, j).name.starts_with(&cx, text(&cx, "&")) {
+                param_roots.add(&cx, entry.params.get(&cx, j).name);
             }
             j = j + 1usize;
         }
-        self.param_roots.set(param_roots);
+        self.param_roots.set(&cx, param_roots);
         var k = 0usize;
-        while k < fun.blocks.len() {
-            self.check_block(fun.blocks.get(k), k == 0usize);
+        while k < fun.blocks.len(&cx) {
+            self.check_block(&cx, fun.blocks.get(&cx, k), k == 0usize);
             k = k + 1usize;
         }
     }
 
-    fn check_block(self, block: Block, is_entry: bool) {
-        let fun = self.fun();
-        self.formation.pos.set(block.pos);
-        self.location.set(Out::new().add(fun.name).put("/").add(block.label).done());
-        self.label.set(block.label);
-        let brands = brand_params(self.params.get());
+    fn check_block(self, &cx: Cx!['k], block: Block['k], is_entry: bool) {
+        let fun = self.fun(&cx);
+        self.formation.pos.set(&cx, block.pos);
+        self.location.set(&cx, Out::new(&cx).add(&cx, fun.name).put(&cx, "/").add(&cx, block.label).done(&cx));
+        self.label.set(&cx, block.label);
+        let brands = brand_params(&cx, self.params.get(&cx));
         var b = 0usize;
-        while b < block.brands.len() {
-            brands.add(block.brands.get(b));
+        while b < block.brands.len(&cx) {
+            brands.add(&cx, block.brands.get(&cx, b));
             b = b + 1usize;
         }
-        brands.add(static_brand());
-        self.brands.set(brands);
-        self.env.set(Map::new());
-        self.used.set(Set::new());
+        brands.add(&cx, static_brand(&cx));
+        self.brands.set(&cx, brands);
+        self.env.set(&cx, Map::new(&cx));
+        self.used.set(&cx, Set::new(&cx));
         var p = 0usize;
-        while p < block.params.len() {
-            let binding = block.params.get(p);
-            if binding.name.starts_with(text("&")) {
+        while p < block.params.len(&cx) {
+            let binding = block.params.get(&cx, p);
+            if binding.name.starts_with(&cx, text(&cx, "&")) {
                 if !is_entry {
-                    self.fail("only_entry_declares_place");
+                    self.fail(&cx, "only_entry_declares_place");
                 }
             } else {
-                self.bind(binding.name, binding.type);
+                self.bind(&cx, binding.name, binding.type);
             }
             p = p + 1usize;
         }
         if is_entry {
-            if !block.opened.is_empty() {
-                self.fail("entry_cannot_assume_opened_views");
+            if !block.opened.is_empty(&cx) {
+                self.fail(&cx, "entry_cannot_assume_opened_views");
             }
-            let empty: Set[Text] = Set::new();
+            let empty: Set[Text['k], 'k] = Set::new(&cx);
             var l = 0usize;
-            while l < fun.locals.len() {
-                empty.add(fun.locals.get(l).name);
+            while l < fun.locals.len(&cx) {
+                empty.add(&cx, fun.locals.get(&cx, l).name);
                 l = l + 1usize;
             }
-            self.places.set(Places::new(empty, Map::new(), Map::new()));
+            self.places.set(&cx, Places::new(empty, Map::new(&cx), Map::new(&cx)));
         } else {
-            let known: Map[Text, Text] = Map::new();
+            let known: Map[Text['k], Text['k], 'k] = Map::new(&cx);
             var k = 0usize;
-            while k < block.known.len() {
-                known.set(block.known.get(k).path, block.known.get(k).variant);
+            while k < block.known.len(&cx) {
+                known.set(&cx, block.known.get(&cx, k).path, block.known.get(&cx, k).variant);
                 k = k + 1usize;
             }
-            self.places.set(Places::new(texts_set(block.empty), known, Map::new()));
-            let paths: Set[Text] = Set::new();
+            self.places.set(&cx, Places::new(texts_set(&cx, block.empty), known, Map::new(&cx)));
+            let paths: Set[Text['k], 'k] = Set::new(&cx);
             var o = 0usize;
-            while o < block.opened.len() {
-                paths.add(block.opened.get(o).path);
+            while o < block.opened.len(&cx) {
+                paths.add(&cx, block.opened.get(&cx, o).path);
                 o = o + 1usize;
             }
-            if paths.len() != block.opened.len() {
-                self.fail("duplicate_opened_view");
+            if paths.len(&cx) != block.opened.len(&cx) {
+                self.fail(&cx, "duplicate_opened_view");
             }
-            let sorted = block.opened.copy();
-            sorted.sort(opened_before);
-            let block_brands = texts_set(block.brands);
+            let sorted = block.opened.copy(&cx);
+            sorted.sort(&cx, opened_before);
+            let block_brands = texts_set(&cx, block.brands);
             var s = 0usize;
-            while s < sorted.len() {
-                let path = sorted.get(s).path;
-                let view = sorted.get(s).brands;
-                let view_set = texts_set(view);
-                let ty = self.path_type(path);
+            while s < sorted.len(&cx) {
+                let path = sorted.get(&cx, s).path;
+                let view = sorted.get(&cx, s).brands;
+                let view_set = texts_set(&cx, view);
+                let ty = self.path_type(&cx, path);
                 let fits_package = match ty {
-                    Type::Exists(binders, _body) => binders.len() == view.len() && view_set.len() == view.len(),
+                    Type::Exists(binders, _body) => binders.len(&cx) == view.len(&cx) && view_set.len(&cx) == view.len(&cx),
                     _ => false,
                 };
                 if !fits_package {
-                    self.fail("opened_contract_requires_package_brands");
+                    self.fail(&cx, "opened_contract_requires_package_brands");
                 }
-                if !subset(view_set, block_brands) {
-                    self.fail("opened_contract_requires_block_brands");
+                if !subset(&cx, view_set, block_brands) {
+                    self.fail(&cx, "opened_contract_requires_block_brands");
                 }
-                let others = self.places.get().opened.values();
+                let others = self.places.get(&cx).opened.values(&cx);
                 var x = 0usize;
-                while x < others.len() {
-                    if sets_meet(view_set, texts_set(others.get(x))) {
-                        self.fail("opened_contract_brand_names_one_view");
+                while x < others.len(&cx) {
+                    if sets_meet(&cx, view_set, texts_set(&cx, others.get(&cx, x))) {
+                        self.fail(&cx, "opened_contract_brand_names_one_view");
                     }
                     x = x + 1usize;
                 }
-                self.places.get().opened.set(path, view);
+                self.places.get(&cx).opened.set(&cx, path, view);
                 s = s + 1usize;
             }
             var e = 0usize;
-            while e < block.empty.len() {
-                let unit = self.path_type(block.empty.get(e));
+            while e < block.empty.len(&cx) {
+                let unit = self.path_type(&cx, block.empty.get(&cx, e));
                 e = e + 1usize;
             }
             var n = 0usize;
-            while n < block.known.len() {
-                let known = block.known.get(n);
-                let names_variant = match self.types.shape(self.path_type(known.path), self.home.get()) {
-                    Type::Enum(variants) => member(variants, known.variant).is_some(),
+            while n < block.known.len(&cx) {
+                let known = block.known.get(&cx, n);
+                let names_variant = match self.types.shape(&cx, self.path_type(&cx, known.path), self.home.get(&cx)) {
+                    Type::Enum(variants) => member(&cx, variants, known.variant).is_some(),
                     _ => false,
                 };
                 if !names_variant {
-                    self.fail("known_contract_names_a_variant");
+                    self.fail(&cx, "known_contract_names_a_variant");
                 }
                 n = n + 1usize;
             }
         }
-        var last: Option[Instr] = Option::None;
+        var last: Option[Instr['k]] = Option::None;
         var i = 0usize;
-        while i < block.instrs.len() {
-            self.check_instr(block.instrs.get(i));
-            last = Option::Some.(block.instrs.get(i));
+        while i < block.instrs.len(&cx) {
+            self.check_instr(&cx, block.instrs.get(&cx, i));
+            last = Option::Some.(block.instrs.get(&cx, i));
             i = i + 1usize;
         }
-        self.check_term(block.term, last);
+        self.check_term(&cx, block.term, last);
     }
 
     // -------------------------------------------------------------- SSA values --
 
-    fn bind(self, name: Text, ty: Type) {
-        self.formation.fits(ty, Kind::Any, self.scope());
-        let env = self.env.get();
-        if env.has(name) {
-            self.fail("defined_twice");
+    fn bind(self, &cx: Cx!['k], name: Text['k], ty: Type['k]) {
+        self.formation.fits(&cx, ty, Kind::Any, self.scope(&cx));
+        let env = self.env.get(&cx);
+        if env.has(&cx, name) {
+            self.fail(&cx, "defined_twice");
         }
-        env.set(name, ty);
-        self.record.get().set((self.label.get(), name), ty);
+        env.set(&cx, name, ty);
+        self.record.get(&cx).set(&cx, (self.label.get(&cx), name), ty);
     }
 
-    fn use_value(self, name: Text) -> Type {
-        let ty = self.peek(name);
-        self.used.get().add(name);
+    fn use_value(self, &cx: Cx!['k], name: Text['k]) -> Type['k] {
+        let ty = self.peek(&cx, name);
+        self.used.get(&cx).add(&cx, name);
         ty
     }
 
-    fn peek(self, name: Text) -> Type {
-        let ty = match self.env.get().get(name) {
+    fn peek(self, &cx: Cx!['k], name: Text['k]) -> Type['k] {
+        let ty = match self.env.get(&cx).get(&cx, name) {
             Option::Some(ty) => ty,
-            Option::None => self.fail("defined"),
+            Option::None => self.fail(&cx, "defined"),
         };
-        if self.used.get().has(name) {
-            self.fail("was_already_consumed");
+        if self.used.get(&cx).has(&cx, name) {
+            self.fail(&cx, "was_already_consumed");
         }
         ty
     }
 
     // `free_brands` of a root's type, computed once per function.
-    fn root_brands(self, root: Text) -> Set[Text] {
-        let cache = self.root_brand_cache.get();
-        match cache.get(root) {
+    fn root_brands(self, &cx: Cx!['k], root: Text['k]) -> Set[Text['k], 'k] {
+        let cache = self.root_brand_cache.get(&cx);
+        match cache.get(&cx, root) {
             Option::Some(brands) => brands,
             Option::None => {
-                let brands = free_brands(self.roots.get().at(root));
-                cache.set(root, brands);
+                let brands = free_brands(&cx, self.roots.get(&cx).at(&cx, root));
+                cache.set(&cx, root, brands);
                 brands
             },
         }
     }
 
-    fn copy_type(self, ty: Type) -> bool {
-        let kinds = self.kinds.get();
-        let identity = unsafe (kinds.head as usize);
-        let (asked, known) = self.copies.get();
+    fn copy_type(self, &cx: Cx!['k], ty: Type['k]) -> bool {
+        let kinds = self.kinds.get(&cx);
+        let identity = kinds.address();
+        let (asked, known) = self.copies.get(&cx);
         let cache = if asked == identity {
             known
         } else {
-            let fresh: Map[Type, bool] = Map::new();
-            self.copies.set((identity, fresh));
+            let fresh: Map[Type['k], bool, 'k] = Map::new(&cx);
+            self.copies.set(&cx, (identity, fresh));
             fresh
         };
-        match cache.get(ty) {
+        match cache.get(&cx, ty) {
             Option::Some(answer) => answer,
             Option::None => {
-                let answer = self.types.is_copy(ty, kinds);
-                cache.set(ty, answer);
+                let answer = self.types.is_copy(&cx, ty, kinds);
+                cache.set(&cx, ty, answer);
                 answer
             },
         }
     }
 
-    fn accounted(self, used: Set[Text]) {
-        let env = self.env.get();
+    fn accounted(self, &cx: Cx!['k], used: Set[Text['k], 'k]) {
+        let env = self.env.get(&cx);
         var i = 0usize;
-        while i < env.positions() {
-            match env.entry(i) {
+        while i < env.positions(&cx) {
+            match env.entry(&cx, i) {
                 Option::Some(name) => {
-                    if !used.has(name) && !self.copy_type(env.at(name)) {
-                        self.fail("linear_value_never_consumed");
+                    if !used.has(&cx, name) && !self.copy_type(&cx, env.at(&cx, name)) {
+                        self.fail(&cx, "linear_value_never_consumed");
                     }
                 },
                 Option::None => (),
@@ -1026,67 +1076,67 @@ impl Checker {
 
     // The value of a place query, stopping with its failure.
     forall T.
-    fn got(self, result: Result[T, Slice[u8, 'static]]) -> T {
+    fn got(self, &cx: Cx!['k], result: Result[T, Slice[u8, 'static]]) -> T {
         match result {
             Result::Ok(value) => value,
-            Result::Err(message) => self.fail(message),
+            Result::Err(message) => self.fail(&cx, message),
         }
     }
 
-    fn path_type(self, path: Text) -> Type {
-        self.got(self.place_type(path))
+    fn path_type(self, &cx: Cx!['k], path: Text['k]) -> Type['k] {
+        self.got(&cx, self.place_type(&cx, path))
     }
 
-    fn storage_type(self, path: Text) -> Type {
-        self.got(self.place_storage(path))
+    fn storage_type(self, &cx: Cx!['k], path: Text['k]) -> Type['k] {
+        self.got(&cx, self.place_storage(&cx, path))
     }
 
-    fn view(self, path: Text, ty: Type) -> Type {
-        self.got(self.place_view(path, ty))
+    fn view(self, &cx: Cx!['k], path: Text['k], ty: Type['k]) -> Type['k] {
+        self.got(&cx, self.place_view(&cx, path, ty))
     }
 
     // Whether p may be discarded; ty is its stored type, before its own view.
-    fn no_linear(self, path: Text, ty: Type) -> bool {
-        self.got(self.discardable(path, ty))
+    fn no_linear(self, &cx: Cx!['k], path: Text['k], ty: Type['k]) -> bool {
+        self.got(&cx, self.discardable(&cx, path, ty))
     }
 
     // The place queries return the checker's failure rather than stop, for place flow, which leaves
     // a malformed path to the checker.
-    fn place_type(self, path: Text) -> Result[Type, Slice[u8, 'static]] {
-        let stored = self.place_storage(path)?;
-        self.place_view(path, stored)
+    fn place_type(self, &cx: Cx!['k], path: Text['k]) -> Result[Type['k], Slice[u8, 'static]] {
+        let stored = self.place_storage(&cx, path)?;
+        self.place_view(&cx, path, stored)
     }
 
     // The final slot's stored type, applying views only to its ancestors.
-    fn place_storage(self, path: Text) -> Result[Type, Slice[u8, 'static]] {
+    fn place_storage(self, &cx: Cx!['k], path: Text['k]) -> Result[Type['k], Slice[u8, 'static]] {
         // The segments are read in place: `sofar` is the path up to the current one.
-        var end = segment_end(path, 0usize);
-        let roots = self.roots.get();
-        var ty = match roots.get(path.slice(0usize, end)) {
+        var end = segment_end(&cx, path, 0usize);
+        let roots = self.roots.get(&cx);
+        var ty = match roots.get(&cx, path.slice(0usize, end)) {
             Option::Some(t) => t,
             Option::None => return Result::Err.("place_function"),
         };
-        while end < path.len {
+        while end < path.len() {
             let sofar = path.slice(0usize, end);
-            let next = segment_end(path, end + 1usize);
+            let next = segment_end(&cx, path, end + 1usize);
             let seg = path.slice(end + 1usize, next);
-            ty = self.place_view(sofar, ty)?;
-            let component = match self.types.shape(ty, self.home.get()) {
+            ty = self.place_view(&cx, sofar, ty)?;
+            let component = match self.types.shape(&cx, ty, self.home.get(&cx)) {
                 Type::Enum(variants) => {
-                    let known = match self.places.get().known.get(sofar) {
-                        Option::Some(v) => v.eq(seg),
+                    let known = match self.places.get(&cx).known.get(&cx, sofar) {
+                        Option::Some(v) => v.eq(&cx, seg),
                         Option::None => false,
                     };
                     if !known {
                         return Result::Err.("known");
                     }
-                    member(variants, seg)
+                    member(&cx, variants, seg)
                 },
-                Type::Tuple(elems) => match canonical_tuple_index(seg, elems.len()) {
-                    Option::Some(index) => Option::Some.(elems.get(index)),
+                Type::Tuple(elems) => match canonical_tuple_index(&cx, seg, elems.len(&cx)) {
+                    Option::Some(index) => Option::Some.(elems.get(&cx, index)),
                     Option::None => Option::None,
                 },
-                Type::Struct(fields) => member(fields, seg),
+                Type::Struct(fields) => member(&cx, fields, seg),
                 _ => Option::None,
             };
             ty = match component {
@@ -1098,57 +1148,57 @@ impl Checker {
         Result::Ok.(ty)
     }
 
-    fn place_view(self, path: Text, ty: Type) -> Result[Type, Slice[u8, 'static]] {
-        let brands = match self.places.get().opened.get(path) {
+    fn place_view(self, &cx: Cx!['k], path: Text['k], ty: Type['k]) -> Result[Type['k], Slice[u8, 'static]] {
+        let brands = match self.places.get(&cx).opened.get(&cx, path) {
             Option::Some(b) => b,
             Option::None => return Result::Ok.(ty),
         };
         match ty {
             Type::Exists(binders, body) => {
-                let sub: Map[Text, Type] = Map::new();
+                let sub: Map[Text['k], Type['k], 'k] = Map::new(&cx);
                 var i = 0usize;
-                while i < binders.len() && i < brands.len() {
-                    sub.set(binders.get(i), Type::Skolem.(brands.get(i)));
+                while i < binders.len(&cx) && i < brands.len(&cx) {
+                    sub.set(&cx, binders.get(&cx, i), Type::Skolem.(brands.get(&cx, i)));
                     i = i + 1usize;
                 }
-                Result::Ok.(subst(body.get(), sub, self.counter))
+                Result::Ok.(subst(&cx, body.get(&cx), sub, self.counter))
             },
             _ => Result::Err.("opened_view_requires_existential"),
         }
     }
 
-    fn discardable(self, path: Text, ty: Type) -> Result[bool, Slice[u8, 'static]] {
-        let places = self.places.get();
-        if self.copy_type(ty) || places.covered(path) {
+    fn discardable(self, &cx: Cx!['k], path: Text['k], ty: Type['k]) -> Result[bool, Slice[u8, 'static]] {
+        let places = self.places.get(&cx);
+        if self.copy_type(&cx, ty) || places.covered(&cx, path) {
             return Result::Ok.(true);
         }
-        if places.opened.has(path) {
-            let viewed = self.place_view(path, ty)?;
-            return self.discardable_parts(path, viewed);
+        if places.opened.has(&cx, path) {
+            let viewed = self.place_view(&cx, path, ty)?;
+            return self.discardable_parts(&cx, path, viewed);
         }
-        self.discardable_parts(path, ty)
+        self.discardable_parts(&cx, path, ty)
     }
 
-    fn discardable_parts(self, path: Text, ty: Type) -> Result[bool, Slice[u8, 'static]] {
-        if self.copy_type(ty) {
+    fn discardable_parts(self, &cx: Cx!['k], path: Text['k], ty: Type['k]) -> Result[bool, Slice[u8, 'static]] {
+        if self.copy_type(&cx, ty) {
             return Result::Ok.(true);
         }
-        let places = self.places.get();
-        let decomposed = any_key(places.empty.map, |z: Text| prefix(path, z) && !z.eq(path));
-        let known = places.known.get(path);
+        let places = self.places.get(&cx);
+        let decomposed = any_key(&cx, places.empty.map, |&cx, z: Text['k]| prefix(&cx, path, z) && !z.eq(&cx, path));
+        let known = places.known.get(&cx, path);
         if !decomposed && known.is_none() {
             // A full non-Copy value cannot be discarded, irrespective of shape.
             // In particular, abstract parameters have no nominal body to unfold.
             return Result::Ok.(false);
         }
-        let rows: Seq[Member] = match self.types.shape(ty, self.home.get()) {
+        let rows: Seq[Member['k], 'k] = match self.types.shape(&cx, ty, self.home.get(&cx)) {
             Type::Enum(variants) => match known {
                 Option::Some(variant) => {
-                    let payload = match member(variants, variant) {
+                    let payload = match member(&cx, variants, variant) {
                         Option::Some(t) => t,
-                        Option::None => kurs_error(text("internal error: a known variant is not a variant"), no_pos()),
+                        Option::None => kurs_error(&cx, text(&cx, "internal error: a known variant is not a variant"), no_pos()),
                     };
-                    return self.discardable(Out::new().add(path).put(".").add(variant).done(), payload);
+                    return self.discardable(&cx, Out::new(&cx).add(&cx, path).put(&cx, ".").add(&cx, variant).done(&cx), payload);
                 },
                 Option::None => return Result::Ok.(false),
             },
@@ -1162,10 +1212,10 @@ impl Checker {
                 if !decomposed {
                     return Result::Ok.(false);
                 }
-                let out: Seq[Member] = Seq::new();
+                let out: Seq[Member['k], 'k] = Seq::new(&cx);
                 var k = 0usize;
-                while k < elems.len() {
-                    out.push(Member.{ name: Out::new().usize(k).done(), type: elems.get(k) });
+                while k < elems.len(&cx) {
+                    out.push(&cx, Member.{ name: Out::new(&cx).usize(&cx, k).done(&cx), type: elems.get(&cx, k) });
                     k = k + 1usize;
                 }
                 out
@@ -1173,8 +1223,8 @@ impl Checker {
             _ => return Result::Ok.(false),
         };
         var r = 0usize;
-        while r < rows.len() {
-            if !self.discardable(Out::new().add(path).put(".").add(rows.get(r).name).done(), rows.get(r).type)? {
+        while r < rows.len(&cx) {
+            if !self.discardable(&cx, Out::new(&cx).add(&cx, path).put(&cx, ".").add(&cx, rows.get(&cx, r).name).done(&cx), rows.get(&cx, r).type)? {
                 return Result::Ok.(false);
             }
             r = r + 1usize;
@@ -1183,107 +1233,107 @@ impl Checker {
     }
 
     // A view opened strictly inside `path` is closed (packed) before `path` is loaded or lent.
-    fn nested_view_closed(self, path: Text) {
-        if any_key(self.places.get().opened, |q: Text| prefix(path, q) && !q.eq(path)) {
-            self.fail("nested_view_open");
+    fn nested_view_closed(self, &cx: Cx!['k], path: Text['k]) {
+        if any_key(&cx, self.places.get(&cx).opened, |&cx, q: Text['k]| prefix(&cx, path, q) && !q.eq(&cx, path)) {
+            self.fail(&cx, "nested_view_open");
         }
     }
 
-    fn load(self, path: Text) -> Type {
-        let ty = self.path_type(path);
-        if !self.places.get().full(path) {
-            self.fail("full");
+    fn load(self, &cx: Cx!['k], path: Text['k]) -> Type['k] {
+        let ty = self.path_type(&cx, path);
+        if !self.places.get(&cx).full(&cx, path) {
+            self.fail(&cx, "full");
         }
-        self.nested_view_closed(path);
-        if !self.copy_type(ty) {
-            self.places.get().empty.add(path);
-            self.places.get().forget(path, true);
+        self.nested_view_closed(&cx, path);
+        if !self.copy_type(&cx, ty) {
+            self.places.get(&cx).empty.add(&cx, path);
+            self.places.get(&cx).forget(&cx, path, true);
         }
         ty
     }
 
-    fn store(self, path: Text, ty: Type) {
-        let want = self.path_type(path);
-        if !fits(ty, want) {
-            self.fail("storing_into");
+    fn store(self, &cx: Cx!['k], path: Text['k], ty: Type['k]) {
+        let want = self.path_type(&cx, path);
+        if !fits(&cx, ty, want) {
+            self.fail(&cx, "storing_into");
         }
-        let places = self.places.get();
-        if any_key(places.empty.map, |z: Text| prefix(z, path) && !z.eq(path)) {
-            self.fail("empty_ancestor_store_whole");
+        let places = self.places.get(&cx);
+        if any_key(&cx, places.empty.map, |&cx, z: Text['k]| prefix(&cx, z, path) && !z.eq(&cx, path)) {
+            self.fail(&cx, "empty_ancestor_store_whole");
         }
-        let empty = places.empty.items();
+        let empty = places.empty.items(&cx);
         // What the store overwrites holds no linear contents: a Copy value, or a place whose linear
         // parts were moved out (dropping that empty linear place is its destruct in the value-only
         // translation).
-        if !self.no_linear(path, self.storage_type(path)) {
-            self.fail("storing_into_discard_linear");
+        if !self.no_linear(&cx, path, self.storage_type(&cx, path)) {
+            self.fail(&cx, "storing_into_discard_linear");
         }
         var j = 0usize;
-        while j < empty.len() {
-            if prefix(path, empty.get(j)) {
-                places.empty.remove(empty.get(j));
+        while j < empty.len(&cx) {
+            if prefix(&cx, path, empty.get(&cx, j)) {
+                places.empty.remove(&cx, empty.get(&cx, j));
             }
             j = j + 1usize;
         }
-        places.forget(path, true);
+        places.forget(&cx, path, true);
     }
 
     // Any number of whole roots, and at most two paths below roots, which part at a struct or tuple.
-    fn lend(self, paths: Seq[Text]) {
+    fn lend(self, &cx: Cx!['k], paths: Seq[Text['k], 'k]) {
         var i = 0usize;
-        while i < paths.len() {
-            let p = paths.get(i);
-            if !self.places.get().full(p) {
-                self.fail("lent_place_full");
+        while i < paths.len(&cx) {
+            let p = paths.get(&cx, i);
+            if !self.places.get(&cx).full(&cx, p) {
+                self.fail(&cx, "lent_place_full");
             }
-            self.nested_view_closed(p);
+            self.nested_view_closed(&cx, p);
             var j = i + 1usize;
-            while j < paths.len() {
-                if overlap(p, paths.get(j)) {
-                    self.fail("lent_places_overlap");
+            while j < paths.len(&cx) {
+                if overlap(&cx, p, paths.get(&cx, j)) {
+                    self.fail(&cx, "lent_places_overlap");
                 }
                 j = j + 1usize;
             }
             i = i + 1usize;
         }
-        let nested: Seq[Text] = Seq::new();
+        let nested: Seq[Text['k], 'k] = Seq::new(&cx);
         var k = 0usize;
-        while k < paths.len() {
-            if paths.get(k).contains(text(".")) {
-                nested.push(paths.get(k));
+        while k < paths.len(&cx) {
+            if paths.get(&cx, k).contains(&cx, text(&cx, ".")) {
+                nested.push(&cx, paths.get(&cx, k));
             }
             k = k + 1usize;
         }
-        if nested.len() > 2usize {
-            self.fail("at_most_two_nested_lends");
+        if nested.len(&cx) > 2usize {
+            self.fail(&cx, "at_most_two_nested_lends");
         }
-        if nested.len() == 2usize && !self.product_branches(nested) {
-            self.fail("nested_lends_part_at_a_product");
+        if nested.len(&cx) == 2usize && !self.product_branches(&cx, nested) {
+            self.fail(&cx, "nested_lends_part_at_a_product");
         }
     }
 
-    fn common_parent(self, paths: Seq[Text]) -> Text {
-        let parts = split_all(paths);
-        join(parts.get(0usize).slice(0usize, common_depth(parts)))
+    fn common_parent(self, &cx: Cx!['k], paths: Seq[Text['k], 'k]) -> Text['k] {
+        let parts = split_all(&cx, paths);
+        join(&cx, parts.get(&cx, 0usize).slice(&cx, 0usize, common_depth(&cx, parts)))
     }
 
     // The paths part at a struct or tuple, and reach it through structs and tuples only, past no
     // known variant or opened view.
-    fn product_branches(self, paths: Seq[Text]) -> bool {
-        let parts = split_all(paths);
-        let common = common_depth(parts);
-        if segments_agree(parts, common) {
+    fn product_branches(self, &cx: Cx!['k], paths: Seq[Text['k], 'k]) -> bool {
+        let parts = split_all(&cx, paths);
+        let common = common_depth(&cx, parts);
+        if segments_agree(&cx, parts, common) {
             return false;
         }
-        let places = self.places.get();
+        let places = self.places.get(&cx);
         var i = 0usize;
-        while i < parts.len() {
-            let s = parts.get(i);
+        while i < parts.len(&cx) {
+            let s = parts.get(&cx, i);
             var depth = 1usize;
-            while depth < s.len() {
-                let step = join(s.slice(0usize, depth));
-                if places.known.has(step) || places.opened.has(step)
-                    || !is_struct_or_tuple(self.types.shape(self.path_type(step), self.home.get())) {
+            while depth < s.len(&cx) {
+                let step = join(&cx, s.slice(&cx, 0usize, depth));
+                if places.known.has(&cx, step) || places.opened.has(&cx, step)
+                    || !is_struct_or_tuple(self.types.shape(&cx, self.path_type(&cx, step), self.home.get(&cx))) {
                     return false;
                 }
                 depth = depth + 1usize;
@@ -1293,10 +1343,10 @@ impl Checker {
         true
     }
 
-    fn after_call(self, paths: Seq[Text]) {
+    fn after_call(self, &cx: Cx!['k], paths: Seq[Text['k], 'k]) {
         var i = 0usize;
-        while i < paths.len() {
-            self.places.get().forget(paths.get(i), true);
+        while i < paths.len(&cx) {
+            self.places.get(&cx).forget(&cx, paths.get(&cx, i), true);
             i = i + 1usize;
         }
     }
@@ -1305,19 +1355,19 @@ impl Checker {
 
     // A premise is discharged by an assumption, or by an instance whose head matches and whose own
     // premises hold.
-    fn holds(self, trait_name: Text, args: Seq[Type]) -> bool {
-        if trait_name.is("builtin::Exposed") {
-            return args.len() == 1usize && self.types.exposure_available(args.get(0usize), self.home.get(), self.kinds.get(), self.premises.get());
+    fn holds(self, &cx: Cx!['k], trait_name: Text['k], args: Seq[Type['k], 'k]) -> bool {
+        if trait_name.is(&cx, "builtin::Exposed") {
+            return args.len(&cx) == 1usize && self.types.exposure_available(&cx, args.get(&cx, 0usize), self.home.get(&cx), self.kinds.get(&cx), self.premises.get(&cx));
         }
-        let premises = self.premises.get();
+        let premises = self.premises.get(&cx);
         var i = 0usize;
-        while i < premises.len() {
-            let p = premises.get(i);
-            if p.trait_name.eq(trait_name) && p.args.len() == args.len() {
+        while i < premises.len(&cx) {
+            let p = premises.get(&cx, i);
+            if p.trait_name.eq(&cx, trait_name) && p.args.len(&cx) == args.len(&cx) {
                 var all = true;
                 var j = 0usize;
-                while all && j < args.len() {
-                    all = equal(p.args.get(j), args.get(j));
+                while all && j < args.len(&cx) {
+                    all = equal(&cx, p.args.get(&cx, j), args.get(&cx, j));
                     j = j + 1usize;
                 }
                 if all {
@@ -1326,22 +1376,22 @@ impl Checker {
             }
             i = i + 1usize;
         }
-        self.find_instance(trait_name, args).is_some()
+        self.find_instance(&cx, trait_name, args).is_some()
     }
 
     // Select the unique coherent head, with its index among the trait's instances; this does not
     // authorize its use.
-    fn matching_instance(self, trait_name: Text, args: Seq[Type]) -> Option[(usize, Instance, Map[Text, Type])] {
-        let insts = match self.program.instances.get(trait_name) {
+    fn matching_instance(self, &cx: Cx!['k], trait_name: Text['k], args: Seq[Type['k], 'k]) -> Option[(usize, Instance['k], Map[Text['k], Type['k], 'k])] {
+        let insts = match self.program.instances.get(&cx, trait_name) {
             Option::Some(insts) => insts,
             Option::None => {
                 return Option::None;
             },
         };
         var i = 0usize;
-        while i < insts.len() {
-            let inst = insts.get(i);
-            match match_head(inst.params, inst.head, args, true, self.counter) {
+        while i < insts.len(&cx) {
+            let inst = insts.get(&cx, i);
+            match match_head(&cx, inst.params, inst.head, args, true, self.counter) {
                 Option::Some(sub) => {
                     return Option::Some.((i, inst, sub));
                 },
@@ -1352,8 +1402,8 @@ impl Checker {
         Option::None
     }
 
-    fn find_instance(self, trait_name: Text, args: Seq[Type]) -> Option[(usize, Instance, Map[Text, Type])] {
-        let found = self.matching_instance(trait_name, args);
+    fn find_instance(self, &cx: Cx!['k], trait_name: Text['k], args: Seq[Type['k], 'k]) -> Option[(usize, Instance['k], Map[Text['k], Type['k], 'k])] {
+        let found = self.matching_instance(&cx, trait_name, args);
         let (_index, inst, sub) = match found {
             Option::Some(f) => f,
             Option::None => {
@@ -1361,32 +1411,32 @@ impl Checker {
             },
         };
         var p = 0usize;
-        while p < inst.params.len() {
-            let param = inst.params.get(p);
-            if C::same_kind(param.kind, Kind::Copy) && !self.copy_type(sub.at(param.name)) {
+        while p < inst.params.len(&cx) {
+            let param = inst.params.get(&cx, p);
+            if C::same_kind(param.kind, Kind::Copy) && !self.copy_type(&cx, sub.at(&cx, param.name)) {
                 return Option::None;
             }
             p = p + 1usize;
         }
         // A matched type can have been formed under a function type's own premises. Those
         // assumptions do not escape into this instance call.
-        let saved_premises = self.formation.premises.get();
-        let saved_home = self.formation.home.get();
-        self.formation.premises.set(self.premises.get());
-        self.formation.home.set(self.home.get());
-        let chosen: Seq[Type] = Seq::new();
+        let saved_premises = self.formation.premises.get(&cx);
+        let saved_home = self.formation.home.get(&cx);
+        self.formation.premises.set(&cx, self.premises.get(&cx));
+        self.formation.home.set(&cx, self.home.get(&cx));
+        let chosen: Seq[Type['k], 'k] = Seq::new(&cx);
         var c = 0usize;
-        while c < inst.params.len() {
-            chosen.push(sub.at(inst.params.get(c).name));
+        while c < inst.params.len(&cx) {
+            chosen.push(&cx, sub.at(&cx, inst.params.get(&cx, c).name));
             c = c + 1usize;
         }
-        self.formation.arguments(inst.params, chosen, self.scope(), false);
-        self.formation.premises.set(saved_premises);
-        self.formation.home.set(saved_home);
+        self.formation.arguments(&cx, inst.params, chosen, self.scope(&cx), false);
+        self.formation.premises.set(&cx, saved_premises);
+        self.formation.home.set(&cx, saved_home);
         var q = 0usize;
-        while q < inst.premises.len() {
-            let premise = inst.premises.get(q);
-            if !self.holds(premise.trait_name, subst_all(premise.args, sub, self.counter)) {
+        while q < inst.premises.len(&cx) {
+            let premise = inst.premises.get(&cx, q);
+            if !self.holds(&cx, premise.trait_name, subst_all(&cx, premise.args, sub, self.counter)) {
                 return Option::None;
             }
             q = q + 1usize;
@@ -1396,15 +1446,15 @@ impl Checker {
 
     // -------------------------------------------------------------- signatures --
 
-    fn instantiate(self, params: Seq[Param], premises: Seq[Premise], tys: Seq[Type]) -> Map[Text, Type] {
-        if tys.len() != params.len() {
-            self.fail("takes_type_arguments_got");
+    fn instantiate(self, &cx: Cx!['k], params: Seq[Param['k], 'k], premises: Seq[Premise['k], 'k], tys: Seq[Type['k], 'k]) -> Map[Text['k], Type['k], 'k] {
+        if tys.len(&cx) != params.len(&cx) {
+            self.fail(&cx, "takes_type_arguments_got");
         }
-        let sub: Map[Text, Type] = Map::new();
+        let sub: Map[Text['k], Type['k], 'k] = Map::new(&cx);
         var i = 0usize;
-        while i < params.len() {
-            let p = params.get(i);
-            let t = tys.get(i);
+        while i < params.len(&cx) {
+            let p = params.get(&cx, i);
+            let t = tys.get(&cx, i);
             var skip = false;
             if C::same_kind(p.kind, Kind::Brand) {
                 let unit = match t {
@@ -1412,358 +1462,358 @@ impl Checker {
                         skip = true;
                     },
                     Type::Skolem(label) => {
-                        if !self.brands.get().has(label) {
-                            self.fail("brand_argument_scope");
+                        if !self.brands.get(&cx).has(&cx, label) {
+                            self.fail(&cx, "brand_argument_scope");
                         }
                     },
-                    _ => self.fail("brand_argument_scope"),
+                    _ => self.fail(&cx, "brand_argument_scope"),
                 };
-            } else if C::same_kind(p.kind, Kind::Copy) && !self.copy_type(t) {
-                self.fail("copy");
+            } else if C::same_kind(p.kind, Kind::Copy) && !self.copy_type(&cx, t) {
+                self.fail(&cx, "copy");
             }
             if !skip {
-                sub.set(p.name, t);
+                sub.set(&cx, p.name, t);
             }
             i = i + 1usize;
         }
         var j = 0usize;
-        while j < premises.len() {
-            let premise = premises.get(j);
-            if !self.holds(premise.trait_name, subst_all(premise.args, sub, self.counter)) {
-                self.fail("unsatisfied_premise");
+        while j < premises.len(&cx) {
+            let premise = premises.get(&cx, j);
+            if !self.holds(&cx, premise.trait_name, subst_all(&cx, premise.args, sub, self.counter)) {
+                self.fail(&cx, "unsatisfied_premise");
             }
             j = j + 1usize;
         }
         sub
     }
 
-    fn signature(self, instr: Instr) -> Signature {
-        let callee = instr.args.get(0usize);
+    fn signature(self, &cx: Cx!['k], instr: Instr['k]) -> Signature['k] {
+        let callee = instr.args.get(&cx, 0usize);
         let tys = instr.tys;
-        if callee.starts_with(text("%")) {
-            let ty = self.use_value(callee);
+        if callee.starts_with(&cx, text(&cx, "%")) {
+            let ty = self.use_value(&cx, callee);
             let f = match ty {
                 Type::Fn(f) => f,
-                _ => self.fail("function_value"),
+                _ => self.fail(&cx, "function_value"),
             };
-            let sub = self.instantiate(f.quantified, Seq::new(), tys);
-            return Signature.{ ptypes: subst_all(f.params, sub, self.counter), ret: subst(f.ret.get(), sub, self.counter), is_unsafe: f.is_unsafe, places: f.places };
+            let sub = self.instantiate(&cx, f.quantified, Seq::new(&cx), tys);
+            return Signature.{ ptypes: subst_all(&cx, f.params, sub, self.counter), ret: subst(&cx, f.ret.get(&cx), sub, self.counter), is_unsafe: f.is_unsafe, places: f.places };
         }
-        match self.program.externs.get(callee) {
+        match self.program.externs.get(&cx, callee) {
             Option::Some(ext) => {
                 let ptypes = match ext.ptypes {
                     Option::Some(p) => p,
-                    Option::None => self.fail("extern_value_not_callable"),
+                    Option::None => self.fail(&cx, "extern_value_not_callable"),
                 };
                 let ret = match ext.ret {
                     Option::Some(r) => r,
-                    Option::None => self.fail("extern_value_not_callable"),
+                    Option::None => self.fail(&cx, "extern_value_not_callable"),
                 };
-                return Signature.{ ptypes, ret, is_unsafe: true, places: Seq::new() };
+                return Signature.{ ptypes, ret, is_unsafe: true, places: Seq::new(&cx) };
             },
             Option::None => (),
         };
-        let fun = match self.program.funs.get(callee) {
+        let fun = match self.program.funs.get(&cx, callee) {
             Option::Some(f) => f,
-            Option::None => self.fail("unknown_function"),
+            Option::None => self.fail(&cx, "unknown_function"),
         };
-        let sub = self.instantiate(fun.params, fun.premises, tys);
-        Signature.{ ptypes: subst_all(fun.ptypes, sub, self.counter), ret: subst(fun.ret, sub, self.counter), is_unsafe: fun.is_unsafe, places: fun.places() }
+        let sub = self.instantiate(&cx, fun.params, fun.premises, tys);
+        Signature.{ ptypes: subst_all(&cx, fun.ptypes, sub, self.counter), ret: subst(&cx, fun.ret, sub, self.counter), is_unsafe: fun.is_unsafe, places: fun.places(&cx) }
     }
 
-    fn arguments(self, ptypes: Seq[Type], args: Seq[Text], places: Seq[usize]) -> Seq[Text] {
-        if ptypes.len() != args.len() {
-            self.fail("expected_arguments_got");
+    fn arguments(self, &cx: Cx!['k], ptypes: Seq[Type['k], 'k], args: Seq[Text['k], 'k], places: Seq[usize, 'k]) -> Seq[Text['k], 'k] {
+        if ptypes.len(&cx) != args.len(&cx) {
+            self.fail(&cx, "expected_arguments_got");
         }
-        let lent: Seq[Text] = Seq::new();
+        let lent: Seq[Text['k], 'k] = Seq::new(&cx);
         var k = 0usize;
-        while k < ptypes.len() {
-            let want = ptypes.get(k);
-            let arg = args.get(k);
-            if places.has(k) != arg.starts_with(text("&")) {
-                self.fail("argument_mode");
+        while k < ptypes.len(&cx) {
+            let want = ptypes.get(&cx, k);
+            let arg = args.get(&cx, k);
+            if places.has(&cx, k) != arg.starts_with(&cx, text(&cx, "&")) {
+                self.fail(&cx, "argument_mode");
             }
-            if arg.starts_with(text("&*")) {
-                self.authorize(self.current_instr(), true);
-                let ty = self.use_value(arg.from(2usize));
+            if arg.starts_with(&cx, text(&cx, "&*")) {
+                self.authorize(&cx, self.current_instr(&cx), true);
+                let ty = self.use_value(&cx, arg.from(2usize));
                 let ok = match ty {
-                    Type::Ptr(inner) => equal(inner.get(), want),
+                    Type::Ptr(inner) => equal(&cx, inner.get(&cx), want),
                     _ => false,
                 };
                 if !ok {
-                    self.fail("raw_target_lend_wrong");
+                    self.fail(&cx, "raw_target_lend_wrong");
                 }
-            } else if arg.starts_with(text("&")) {
-                if !equal(self.path_type(arg), want) {
-                    self.fail("lent_place_type_expected");
+            } else if arg.starts_with(&cx, text(&cx, "&")) {
+                if !equal(&cx, self.path_type(&cx, arg), want) {
+                    self.fail(&cx, "lent_place_type_expected");
                 }
-                lent.push(arg);
+                lent.push(&cx, arg);
             } else {
-                let got = self.use_value(arg);
-                if !fits(got, want) {
-                    self.fail("argument_expected");
+                let got = self.use_value(&cx, arg);
+                if !fits(&cx, got, want) {
+                    self.fail(&cx, "argument_expected");
                 }
             }
             k = k + 1usize;
         }
-        self.lend(lent);
+        self.lend(&cx, lent);
         lent
     }
 
-    fn current_instr(self) -> Instr {
-        match self.instr.get() {
+    fn current_instr(self, &cx: Cx!['k]) -> Instr['k] {
+        match self.instr.get(&cx) {
             Option::Some(instr) => instr,
-            Option::None => kurs_error(text("internal error: no instruction is being checked"), no_pos()),
+            Option::None => kurs_error(&cx, text(&cx, "internal error: no instruction is being checked"), no_pos()),
         }
     }
 
-    fn authorize(self, instr: Instr, is_unsafe: bool) {
-        if is_unsafe && !(self.fun().is_unsafe || instr.is_unsafe) {
-            self.fail("unsafe_authorization");
+    fn authorize(self, &cx: Cx!['k], instr: Instr['k], is_unsafe: bool) {
+        if is_unsafe && !(self.fun(&cx).is_unsafe || instr.is_unsafe) {
+            self.fail(&cx, "unsafe_authorization");
         }
     }
 
     // ------------------------------------------------------------ instructions --
 
-    fn check_instr(self, instr: Instr) {
-        self.formation.pos.set(instr.pos);
+    fn check_instr(self, &cx: Cx!['k], instr: Instr['k]) {
+        self.formation.pos.set(&cx, instr.pos);
         let op = instr.op;
-        self.instr.set(Option::Some.(instr));
-        let outs: Seq[Type] = if op.is("const") {
-            Seq::one(self.op_const(instr))
-        } else if op.is("copy") {
-            Seq::one(self.op_copy(instr))
-        } else if op.is("construct") {
-            Seq::one(self.op_construct(instr))
-        } else if op.is("destruct") {
-            self.op_destruct(instr)
-        } else if op.is("construct_variant") {
-            Seq::one(self.op_construct_variant(instr))
-        } else if op.is("variant_tag") {
-            Seq::one(self.op_variant_tag(instr))
-        } else if op.is("builtin::int_cast") {
-            Seq::one(self.op_int_cast(instr))
-        } else if op.is("builtin::unsafe::cast") {
-            Seq::one(self.op_unsafe_cast(instr))
-        } else if op.is("call") {
-            Seq::one(self.op_call(instr))
-        } else if op.is("trait_call") {
-            Seq::one(self.op_trait_call(instr))
-        } else if op.is("fn") {
-            Seq::one(self.op_fn(instr))
-        } else if op.is("alloca") {
-            Seq::one(self.op_alloca(instr))
-        } else if op.is("builtin::sizeof") {
-            Seq::one(self.op_sizeof(instr))
-        } else if op.is("data") {
-            Seq::one(self.op_data(instr))
-        } else if op.is("builtin::unsafe::static_brand") {
-            Seq::one(self.op_unsafe_static_brand(instr))
-        } else if op.is("builtin::fresh") {
-            Seq::one(self.op_fresh(instr))
-        } else if op.is("pack") {
-            Seq::one(self.op_pack(instr))
-        } else if op.is("open") {
-            Seq::one(self.op_open(instr))
-        } else if op.is("builtin::unsafe::deref") || op.is("builtin::unsafe::load_volatile") {
-            Seq::one(self.op_unsafe_deref(instr))
-        } else if op.is("builtin::unsafe::store") || op.is("builtin::unsafe::store_volatile") {
-            Seq::one(self.op_unsafe_store(instr))
-        } else if op.is("load") {
-            Seq::one(self.op_load(instr))
-        } else if op.is("store") {
-            Seq::one(self.op_store(instr))
-        } else if op.is("foreach") {
-            Seq::one(self.op_foreach(instr))
-        } else if is_arith(op) || is_order(op) || is_equality(op) || is_bits(op) {
-            Seq::one(self.primitive(instr))
-        } else if op.starts_with(text("builtin::unsafe::atomic_")) {
-            Seq::one(self.atomic(instr))
+        self.instr.set(&cx, Option::Some.(instr));
+        let outs: Seq[Type['k], 'k] = if op.is(&cx, "const") {
+            Seq::one(&cx, self.op_const(&cx, instr))
+        } else if op.is(&cx, "copy") {
+            Seq::one(&cx, self.op_copy(&cx, instr))
+        } else if op.is(&cx, "construct") {
+            Seq::one(&cx, self.op_construct(&cx, instr))
+        } else if op.is(&cx, "destruct") {
+            self.op_destruct(&cx, instr)
+        } else if op.is(&cx, "construct_variant") {
+            Seq::one(&cx, self.op_construct_variant(&cx, instr))
+        } else if op.is(&cx, "variant_tag") {
+            Seq::one(&cx, self.op_variant_tag(&cx, instr))
+        } else if op.is(&cx, "builtin::int_cast") {
+            Seq::one(&cx, self.op_int_cast(&cx, instr))
+        } else if op.is(&cx, "builtin::unsafe::cast") {
+            Seq::one(&cx, self.op_unsafe_cast(&cx, instr))
+        } else if op.is(&cx, "call") {
+            Seq::one(&cx, self.op_call(&cx, instr))
+        } else if op.is(&cx, "trait_call") {
+            Seq::one(&cx, self.op_trait_call(&cx, instr))
+        } else if op.is(&cx, "fn") {
+            Seq::one(&cx, self.op_fn(&cx, instr))
+        } else if op.is(&cx, "alloca") {
+            Seq::one(&cx, self.op_alloca(&cx, instr))
+        } else if op.is(&cx, "builtin::sizeof") {
+            Seq::one(&cx, self.op_sizeof(&cx, instr))
+        } else if op.is(&cx, "data") {
+            Seq::one(&cx, self.op_data(&cx, instr))
+        } else if op.is(&cx, "builtin::unsafe::static_brand") {
+            Seq::one(&cx, self.op_unsafe_static_brand(&cx, instr))
+        } else if op.is(&cx, "builtin::fresh") {
+            Seq::one(&cx, self.op_fresh(&cx, instr))
+        } else if op.is(&cx, "pack") {
+            Seq::one(&cx, self.op_pack(&cx, instr))
+        } else if op.is(&cx, "open") {
+            Seq::one(&cx, self.op_open(&cx, instr))
+        } else if op.is(&cx, "builtin::unsafe::deref") || op.is(&cx, "builtin::unsafe::load_volatile") {
+            Seq::one(&cx, self.op_unsafe_deref(&cx, instr))
+        } else if op.is(&cx, "builtin::unsafe::store") || op.is(&cx, "builtin::unsafe::store_volatile") {
+            Seq::one(&cx, self.op_unsafe_store(&cx, instr))
+        } else if op.is(&cx, "load") {
+            Seq::one(&cx, self.op_load(&cx, instr))
+        } else if op.is(&cx, "store") {
+            Seq::one(&cx, self.op_store(&cx, instr))
+        } else if op.is(&cx, "foreach") {
+            Seq::one(&cx, self.op_foreach(&cx, instr))
+        } else if is_arith(&cx, op) || is_order(&cx, op) || is_equality(&cx, op) || is_bits(&cx, op) {
+            Seq::one(&cx, self.primitive(&cx, instr))
+        } else if op.starts_with(&cx, text(&cx, "builtin::unsafe::atomic_")) {
+            Seq::one(&cx, self.atomic(&cx, instr))
         } else {
-            self.fail("unknown_instruction")
+            self.fail(&cx, "unknown_instruction")
         };
-        if outs.len() != instr.lhs.len() {
-            self.fail("produces_results_named");
+        if outs.len(&cx) != instr.lhs.len(&cx) {
+            self.fail(&cx, "produces_results_named");
         }
         var i = 0usize;
-        while i < outs.len() {
-            self.bind(instr.lhs.get(i), outs.get(i));
+        while i < outs.len(&cx) {
+            self.bind(&cx, instr.lhs.get(&cx, i), outs.get(&cx, i));
             i = i + 1usize;
         }
     }
 
-    fn type_operand(self, instr: Instr) -> Type {
+    fn type_operand(self, &cx: Cx!['k], instr: Instr['k]) -> Type['k] {
         match instr.ty {
             Option::Some(t) => t,
-            Option::None => self.fail("instruction_requires_type"),
+            Option::None => self.fail(&cx, "instruction_requires_type"),
         }
     }
 
-    fn op_const(self, instr: Instr) -> Type {
+    fn op_const(self, &cx: Cx!['k], instr: Instr['k]) -> Type['k] {
         let lit = match instr.lit {
             Option::Some(l) => l,
-            Option::None => self.fail("const_requires_literal"),
+            Option::None => self.fail(&cx, "const_requires_literal"),
         };
         let t = match instr.ty {
             Option::Some(t) => t,
-            Option::None => self.fail("const_scalar_type"),
+            Option::None => self.fail(&cx, "const_scalar_type"),
         };
         let unit = match t {
             Type::Prim(_name) => (),
-            _ => self.fail("const_scalar_type"),
+            _ => self.fail(&cx, "const_scalar_type"),
         };
-        self.scalar_literal(t, lit);
+        self.scalar_literal(&cx, t, lit);
         t
     }
 
-    fn scalar_literal(self, t: Type, lit: Text) {
-        if !valid_literal(t, lit) {
-            self.fail("invalid");
+    fn scalar_literal(self, &cx: Cx!['k], t: Type['k], lit: Text['k]) {
+        if !valid_literal(&cx, t, lit) {
+            self.fail(&cx, "invalid");
         }
     }
 
-    fn op_copy(self, instr: Instr) -> Type {
-        let t = self.peek(instr.args.get(0usize));
-        if !self.copy_type(t) {
-            self.fail("copy_linear");
+    fn op_copy(self, &cx: Cx!['k], instr: Instr['k]) -> Type['k] {
+        let t = self.peek(&cx, instr.args.get(&cx, 0usize));
+        if !self.copy_type(&cx, t) {
+            self.fail(&cx, "copy_linear");
         }
         t
     }
 
-    fn op_construct(self, instr: Instr) -> Type {
-        let ty = self.type_operand(instr);
-        let want: Seq[Type] = match self.types.shape(ty, self.home.get()) {
+    fn op_construct(self, &cx: Cx!['k], instr: Instr['k]) -> Type['k] {
+        let ty = self.type_operand(&cx, instr);
+        let want: Seq[Type['k], 'k] = match self.types.shape(&cx, ty, self.home.get(&cx)) {
             Type::Array(elem, length) => {
-                let n = instr.args.len() as u64;
-                if !(n == length || 0u64 < n && n < length && self.copy_type(elem.get())) {
-                    self.fail("array_construct_element_copy");
+                let n = instr.args.len(&cx) as u64;
+                if !(n == length || 0u64 < n && n < length && self.copy_type(&cx, elem.get(&cx))) {
+                    self.fail(&cx, "array_construct_element_copy");
                 }
-                let out: Seq[Type] = Seq::new();
+                let out: Seq[Type['k], 'k] = Seq::new(&cx);
                 var i = 0u64;
                 while i < n {
-                    out.push(elem.get());
+                    out.push(&cx, elem.get(&cx));
                     i = i + 1u64;
                 }
                 out
             },
             _ => {
-                let fields = self.types.fields(ty, self.home.get());
-                if fields.len() != instr.args.len() {
-                    self.fail("components_given");
+                let fields = self.types.fields(&cx, ty, self.home.get(&cx));
+                if fields.len(&cx) != instr.args.len(&cx) {
+                    self.fail(&cx, "components_given");
                 }
                 fields
             },
         };
         var i = 0usize;
-        while i < instr.args.len() && i < want.len() {
-            let got = self.use_value(instr.args.get(i));
-            if !fits(got, want.get(i)) {
-                self.fail("component_expected");
+        while i < instr.args.len(&cx) && i < want.len(&cx) {
+            let got = self.use_value(&cx, instr.args.get(&cx, i));
+            if !fits(&cx, got, want.get(&cx, i)) {
+                self.fail(&cx, "component_expected");
             }
             i = i + 1usize;
         }
         ty
     }
 
-    fn op_destruct(self, instr: Instr) -> Seq[Type] {
-        let ty = self.type_operand(instr);
-        let arg = instr.args.get(0usize);
-        let got = if arg.starts_with(text("&")) { self.load(arg) } else { self.use_value(arg) };
+    fn op_destruct(self, &cx: Cx!['k], instr: Instr['k]) -> Seq[Type['k], 'k] {
+        let ty = self.type_operand(&cx, instr);
+        let arg = instr.args.get(&cx, 0usize);
+        let got = if arg.starts_with(&cx, text(&cx, "&")) { self.load(&cx, arg) } else { self.use_value(&cx, arg) };
         match got {
             Type::Ptr(inner) => {
-                if !equal(got, ty) {
-                    self.fail("destruct");
+                if !equal(&cx, got, ty) {
+                    self.fail(&cx, "destruct");
                 }
-                let fields = self.types.fields(inner.get(), self.home.get());
-                let out: Seq[Type] = Seq::new();
+                let fields = self.types.fields(&cx, inner.get(&cx), self.home.get(&cx));
+                let out: Seq[Type['k], 'k] = Seq::new(&cx);
                 var i = 0usize;
-                while i < fields.len() {
-                    out.push(C::ptr(fields.get(i)));
+                while i < fields.len(&cx) {
+                    out.push(&cx, C::ptr(&cx, fields.get(&cx, i)));
                     i = i + 1usize;
                 }
                 out
             },
             _ => {
-                if !equal(got, ty) {
-                    self.fail("destruct");
+                if !equal(&cx, got, ty) {
+                    self.fail(&cx, "destruct");
                 }
-                self.types.fields(ty, self.home.get()).copy()
+                self.types.fields(&cx, ty, self.home.get(&cx)).copy(&cx)
             },
         }
     }
 
-    fn op_construct_variant(self, instr: Instr) -> Type {
-        let ty = self.type_operand(instr);
-        let variants = self.types.variants(ty, self.home.get());
+    fn op_construct_variant(self, &cx: Cx!['k], instr: Instr['k]) -> Type['k] {
+        let ty = self.type_operand(&cx, instr);
+        let variants = self.types.variants(&cx, ty, self.home.get(&cx));
         let payload = match instr.lit {
-            Option::Some(lit) => match member(variants, lit) {
+            Option::Some(lit) => match member(&cx, variants, lit) {
                 Option::Some(t) => t,
-                Option::None => self.fail("variant"),
+                Option::None => self.fail(&cx, "variant"),
             },
-            Option::None => self.fail("variant"),
+            Option::None => self.fail(&cx, "variant"),
         };
-        let got = self.use_value(instr.args.get(0usize));
-        if !fits(got, payload) {
-            self.fail("payload_expected");
+        let got = self.use_value(&cx, instr.args.get(&cx, 0usize));
+        if !fits(&cx, got, payload) {
+            self.fail(&cx, "payload_expected");
         }
         ty
     }
 
-    fn op_variant_tag(self, instr: Instr) -> Type {
-        let ty = self.type_operand(instr);
-        let arg = instr.args.get(0usize);
-        let got = if arg.starts_with(text("&")) {
-            if !self.places.get().full(arg) {
-                self.fail("readable_tag");
+    fn op_variant_tag(self, &cx: Cx!['k], instr: Instr['k]) -> Type['k] {
+        let ty = self.type_operand(&cx, instr);
+        let arg = instr.args.get(&cx, 0usize);
+        let got = if arg.starts_with(&cx, text(&cx, "&")) {
+            if !self.places.get(&cx).full(&cx, arg) {
+                self.fail(&cx, "readable_tag");
             }
-            self.path_type(arg)
+            self.path_type(&cx, arg)
         } else {
-            self.peek(arg)
+            self.peek(&cx, arg)
         };
-        if !equal(got, ty) {
-            self.fail("variant_tag");
+        if !equal(&cx, got, ty) {
+            self.fail(&cx, "variant_tag");
         }
-        let unit = self.types.variants(ty, self.home.get());
-        C::u32_type()
+        let unit = self.types.variants(&cx, ty, self.home.get(&cx));
+        C::u32_type(&cx)
     }
 
-    fn op_int_cast(self, instr: Instr) -> Type {
-        let got = self.use_value(instr.args.get(0usize));
+    fn op_int_cast(self, &cx: Cx!['k], instr: Instr['k]) -> Type['k] {
+        let got = self.use_value(&cx, instr.args.get(&cx, 0usize));
         let target = match instr.ty {
-            Option::Some(t) => is_integer_type(t),
+            Option::Some(t) => is_integer_type(&cx, t),
             Option::None => false,
         };
-        let ok = is_integer_type(got) && target;
+        let ok = is_integer_type(&cx, got) && target;
         if !ok {
-            self.fail("int_cast_converts_between");
+            self.fail(&cx, "int_cast_converts_between");
         }
-        self.type_operand(instr)
+        self.type_operand(&cx, instr)
     }
 
-    fn op_unsafe_cast(self, instr: Instr) -> Type {
-        let ty = self.type_operand(instr);
-        self.authorize(instr, true);
-        let got = self.use_value(instr.args.get(0usize));
-        if self.contains(got) || self.contains(ty) {
-            self.fail("unsafe_cast_cannot_produce");
+    fn op_unsafe_cast(self, &cx: Cx!['k], instr: Instr['k]) -> Type['k] {
+        let ty = self.type_operand(&cx, instr);
+        self.authorize(&cx, instr, true);
+        let got = self.use_value(&cx, instr.args.get(&cx, 0usize));
+        if self.contains(&cx, got) || self.contains(&cx, ty) {
+            self.fail(&cx, "unsafe_cast_cannot_produce");
         }
         ty
     }
 
     // `uncastable` holds somewhere in the value representation of `ty`: a pointer's target is not
     // part of it.
-    fn contains(self, ty: Type) -> bool {
-        if self.uncastable(ty) {
+    fn contains(self, &cx: Cx!['k], ty: Type['k]) -> bool {
+        if self.uncastable(&cx, ty) {
             return true;
         }
         match ty {
             Type::Ptr(_inner) => false,
             _ => {
-                let parts = children(ty);
+                let parts = children(&cx, ty);
                 var found = false;
                 var i = 0usize;
-                while !found && i < parts.len() {
-                    found = self.contains(parts.get(i));
+                while !found && i < parts.len(&cx) {
+                    found = self.contains(&cx, parts.get(&cx, i));
                     i = i + 1usize;
                 }
                 found
@@ -1774,786 +1824,789 @@ impl Checker {
     // What no unsafe cast may conjure in a value: a package, a brand witness, a function value, a
     // transform, a value of an abstract type parameter, or Never. Behind a pointer, reading any of
     // them is a separate unsafe operation.
-    fn uncastable(self, ty: Type) -> bool {
+    fn uncastable(self, &cx: Cx!['k], ty: Type['k]) -> bool {
         match ty {
             Type::Exists(_binders, _body) => true,
             Type::Brand(_brand) => true,
             Type::Fn(_f) => true,
             Type::Foreach(_f) => true,
             Type::Never => true,
-            Type::Named(name, args) => args.is_empty() && self.kinds.get().has(name),
+            Type::Named(name, args) => args.is_empty(&cx) && self.kinds.get(&cx).has(&cx, name),
             _ => false,
         }
     }
 
-    fn primitive(self, instr: Instr) -> Type {
-        if instr.args.len() != 2usize {
-            self.fail("takes_two_operands");
+    fn primitive(self, &cx: Cx!['k], instr: Instr['k]) -> Type['k] {
+        if instr.args.len(&cx) != 2usize {
+            self.fail(&cx, "takes_two_operands");
         }
-        let x = self.use_value(instr.args.get(0usize));
-        let y = self.use_value(instr.args.get(1usize));
-        if !equal(x, y) {
-            self.fail("operands_differ");
+        let x = self.use_value(&cx, instr.args.get(&cx, 0usize));
+        let y = self.use_value(&cx, instr.args.get(&cx, 1usize));
+        if !equal(&cx, x, y) {
+            self.fail(&cx, "operands_differ");
         }
         let (integer, floating, scalar) = match x {
-            Type::Prim(name) => (C::is_integer(name), C::is_float(name), true),
+            Type::Prim(name) => (C::is_integer(&cx, name), C::is_float(&cx, name), true),
             Type::Ptr(_inner) => (false, false, true),
             _ => (false, false, false),
         };
         let op = instr.op;
-        let ok = if is_order(op) || is_arith(op) && !op.is("mod") {
+        let ok = if is_order(&cx, op) || is_arith(&cx, op) && !op.is(&cx, "mod") {
             integer || floating
-        } else if is_bits(op) || op.is("mod") {
+        } else if is_bits(&cx, op) || op.is(&cx, "mod") {
             integer
         } else {
             scalar
         };
         if !ok {
-            self.fail("does_apply");
+            self.fail(&cx, "does_apply");
         }
-        if is_order(op) || is_equality(op) { C::bool_type() } else { x }
+        if is_order(&cx, op) || is_equality(&cx, op) { C::bool_type(&cx) } else { x }
     }
 
-    fn op_call(self, instr: Instr) -> Type {
-        let sig = self.signature(instr);
-        self.authorize(instr, sig.is_unsafe);
-        self.after_call(self.arguments(sig.ptypes, instr.args.from(1usize), sig.places));
+    fn op_call(self, &cx: Cx!['k], instr: Instr['k]) -> Type['k] {
+        let sig = self.signature(&cx, instr);
+        self.authorize(&cx, instr, sig.is_unsafe);
+        self.after_call(&cx, self.arguments(&cx, sig.ptypes, instr.args.from(&cx, 1usize), sig.places));
         sig.ret
     }
 
-    fn op_trait_call(self, instr: Instr) -> Type {
-        let tr = match self.program.traits.get(instr.args.get(0usize)) {
+    fn op_trait_call(self, &cx: Cx!['k], instr: Instr['k]) -> Type['k] {
+        let tr = match self.program.traits.get(&cx, instr.args.get(&cx, 0usize)) {
             Option::Some(tr) => tr,
-            Option::None => self.fail("unknown_trait_wrong_arity"),
+            Option::None => self.fail(&cx, "unknown_trait_wrong_arity"),
         };
-        if tr.params.len() != instr.tys.len() {
-            self.fail("unknown_trait_wrong_arity");
+        if tr.params.len(&cx) != instr.tys.len(&cx) {
+            self.fail(&cx, "unknown_trait_wrong_arity");
         }
-        var found: Option[Method] = Option::None;
+        var found: Option[Method['k]] = Option::None;
         var i = 0usize;
-        while found.is_none() && i < tr.methods.len() {
-            if tr.methods.get(i).name.eq(instr.args.get(1usize)) {
-                found = Option::Some.(tr.methods.get(i));
+        while found.is_none() && i < tr.methods.len(&cx) {
+            if tr.methods.get(&cx, i).name.eq(&cx, instr.args.get(&cx, 1usize)) {
+                found = Option::Some.(tr.methods.get(&cx, i));
             }
             i = i + 1usize;
         }
         let sig = match found {
             Option::Some(m) => m,
-            Option::None => self.fail("trait_method"),
+            Option::None => self.fail(&cx, "trait_method"),
         };
-        if !self.holds(tr.name, instr.tys) {
-            self.fail("evidence");
+        if !self.holds(&cx, tr.name, instr.tys) {
+            self.fail(&cx, "evidence");
         }
-        let sub: Map[Text, Type] = Map::new();
+        let sub: Map[Text['k], Type['k], 'k] = Map::new(&cx);
         var p = 0usize;
-        while p < tr.params.len() {
-            sub.set(tr.params.get(p), instr.tys.get(p));
+        while p < tr.params.len(&cx) {
+            sub.set(&cx, tr.params.get(&cx, p), instr.tys.get(&cx, p));
             p = p + 1usize;
         }
-        self.authorize(instr, sig.is_unsafe);
-        self.after_call(self.arguments(subst_all(sig.ptypes, sub, self.counter), instr.args.from(2usize), sig.places));
-        subst(sig.ret, sub, self.counter)
+        self.authorize(&cx, instr, sig.is_unsafe);
+        self.after_call(&cx, self.arguments(&cx, subst_all(&cx, sig.ptypes, sub, self.counter), instr.args.from(&cx, 2usize), sig.places));
+        subst(&cx, sig.ret, sub, self.counter)
     }
 
-    fn op_fn(self, instr: Instr) -> Type {
-        let name = instr.args.get(0usize);
-        match self.program.externs.get(name) {
+    fn op_fn(self, &cx: Cx!['k], instr: Instr['k]) -> Type['k] {
+        let name = instr.args.get(&cx, 0usize);
+        match self.program.externs.get(&cx, name) {
             Option::Some(ext) => {
                 let ptypes = match ext.ptypes {
                     Option::Some(p) => p,
-                    Option::None => self.fail("extern_value_not_callable"),
+                    Option::None => self.fail(&cx, "extern_value_not_callable"),
                 };
                 let ret = match ext.ret {
                     Option::Some(r) => r,
-                    Option::None => self.fail("extern_value_not_callable"),
+                    Option::None => self.fail(&cx, "extern_value_not_callable"),
                 };
-                return C::fn_type(ptypes, ret, Seq::new(), true, Seq::new());
+                return C::fn_type(&cx, ptypes, ret, Seq::new(&cx), true, Seq::new(&cx));
             },
             Option::None => (),
         };
-        let fun = match self.program.funs.get(name) {
+        let fun = match self.program.funs.get(&cx, name) {
             Option::Some(f) => f,
-            Option::None => self.fail("unknown_function"),
+            Option::None => self.fail(&cx, "unknown_function"),
         };
-        let retained: Seq[Param] = Seq::new();
+        let retained: Seq[Param['k], 'k] = Seq::new(&cx);
         var i = 0usize;
-        while i < fun.params.len() && i < instr.tys.len() {
-            let p = fun.params.get(i);
-            let ignored = match instr.tys.get(i) {
+        while i < fun.params.len(&cx) && i < instr.tys.len(&cx) {
+            let p = fun.params.get(&cx, i);
+            let ignored = match instr.tys.get(&cx, i) {
                 Type::Ignored => true,
                 _ => false,
             };
             if C::same_kind(p.kind, Kind::Brand) && ignored {
-                retained.push(p);
+                retained.push(&cx, p);
             }
             i = i + 1usize;
         }
-        let retained_brands: Set[Text] = Set::new();
+        let retained_brands: Set[Text['k], 'k] = Set::new(&cx);
         var r = 0usize;
-        while r < retained.len() {
-            retained_brands.add(retained.get(r).name);
+        while r < retained.len(&cx) {
+            retained_brands.add(&cx, retained.get(&cx, r).name);
             r = r + 1usize;
         }
         // A function value may keep brands quantified, but no premise on them: every premise is
         // discharged where the value is made.
         var q = 0usize;
-        while q < fun.premises.len() {
-            let args = fun.premises.get(q).args;
+        while q < fun.premises.len(&cx) {
+            let args = fun.premises.get(&cx, q).args;
             var a = 0usize;
-            while a < args.len() {
-                if sets_meet(retained_brands, free_brands(args.get(a))) {
-                    self.fail("retained_brand_with_premise");
+            while a < args.len(&cx) {
+                if sets_meet(&cx, retained_brands, free_brands(&cx, args.get(&cx, a))) {
+                    self.fail(&cx, "retained_brand_with_premise");
                 }
                 a = a + 1usize;
             }
             q = q + 1usize;
         }
-        let sub = self.instantiate(fun.params, fun.premises, instr.tys);
-        C::fn_type(subst_all(fun.ptypes, sub, self.counter), subst(fun.ret, sub, self.counter), retained, fun.is_unsafe, fun.places())
+        let sub = self.instantiate(&cx, fun.params, fun.premises, instr.tys);
+        C::fn_type(&cx, subst_all(&cx, fun.ptypes, sub, self.counter), subst(&cx, fun.ret, sub, self.counter), retained, fun.is_unsafe, fun.places(&cx))
     }
 
     // How a zero-size type is laid out in memory is not decided yet, so nothing may observe it:
     // `sizeof`, `alloca`, unsafe memory operations and extern parameters reject zero-size types.
-    fn has_memory_form(self, ty: Type) {
-        if self.types.zero_size(ty) {
-            self.fail("zero_size_type_has_no_memory_form");
+    fn has_memory_form(self, &cx: Cx!['k], ty: Type['k]) {
+        if self.types.zero_size(&cx, ty) {
+            self.fail(&cx, "zero_size_type_has_no_memory_form");
         }
     }
 
-    fn op_alloca(self, instr: Instr) -> Type {
-        let ty = self.type_operand(instr);
-        self.authorize(instr, true);
-        self.has_memory_form(ty);
-        C::ptr(ty)
+    fn op_alloca(self, &cx: Cx!['k], instr: Instr['k]) -> Type['k] {
+        let ty = self.type_operand(&cx, instr);
+        self.authorize(&cx, instr, true);
+        self.has_memory_form(&cx, ty);
+        C::ptr(&cx, ty)
     }
 
-    fn op_sizeof(self, instr: Instr) -> Type {
-        let ty = self.type_operand(instr);
-        self.has_memory_form(ty);
-        C::usize_type()
+    fn op_sizeof(self, &cx: Cx!['k], instr: Instr['k]) -> Type['k] {
+        let ty = self.type_operand(&cx, instr);
+        self.has_memory_form(&cx, ty);
+        C::usize_type(&cx)
     }
 
-    fn op_data(self, instr: Instr) -> Type {
-        match self.program.datas.get(instr.args.get(0usize)) {
-            Option::Some(data) => C::ptr(data.ty),
-            Option::None => self.fail("unknown_data"),
+    fn op_data(self, &cx: Cx!['k], instr: Instr['k]) -> Type['k] {
+        match self.program.datas.get(&cx, instr.args.get(&cx, 0usize)) {
+            Option::Some(data) => C::ptr(&cx, data.ty),
+            Option::None => self.fail(&cx, "unknown_data"),
         }
     }
 
-    fn op_unsafe_static_brand(self, instr: Instr) -> Type {
-        self.authorize(instr, true);
-        Type::Brand.(Cell::new(Type::Skolem.(static_brand())))
+    fn op_unsafe_static_brand(self, &cx: Cx!['k], instr: Instr['k]) -> Type['k] {
+        self.authorize(&cx, instr, true);
+        Type::Brand.(Cell::new(&cx, Type::Skolem.(static_brand(&cx))))
     }
 
-    fn op_fresh(self, instr: Instr) -> Type {
-        Type::Exists.(Seq::one(text("k")), Cell::new(Type::Brand.(Cell::new(Type::Skolem.(text("k"))))))
+    fn op_fresh(self, &cx: Cx!['k], instr: Instr['k]) -> Type['k] {
+        Type::Exists.(Seq::one(&cx, text(&cx, "k")), Cell::new(&cx, Type::Brand.(Cell::new(&cx, Type::Skolem.(text(&cx, "k"))))))
     }
 
-    fn op_pack(self, instr: Instr) -> Type {
+    fn op_pack(self, &cx: Cx!['k], instr: Instr['k]) -> Type['k] {
         let t = match instr.ty {
             Option::Some(t) => t,
-            Option::None => self.fail("pack_existential_type_brand"),
+            Option::None => self.fail(&cx, "pack_existential_type_brand"),
         };
         let (binders, body) = match t {
-            Type::Exists(binders, body) => (binders, body.get()),
-            _ => self.fail("pack_existential_type_brand"),
+            Type::Exists(binders, body) => (binders, body.get(&cx)),
+            _ => self.fail(&cx, "pack_existential_type_brand"),
         };
-        if instr.tys.len() != binders.len() {
-            self.fail("pack_existential_type_brand");
+        if instr.tys.len(&cx) != binders.len(&cx) {
+            self.fail(&cx, "pack_existential_type_brand");
         }
-        let witnesses: Seq[Text] = Seq::new();
+        let witnesses: Seq[Text['k], 'k] = Seq::new(&cx);
         var i = 0usize;
-        while i < instr.tys.len() {
-            let unit = match instr.tys.get(i) {
+        while i < instr.tys.len(&cx) {
+            let unit = match instr.tys.get(&cx, i) {
                 Type::Skolem(label) => {
-                    if !self.brands.get().has(label) {
-                        self.fail("pack_witness_scope");
+                    if !self.brands.get(&cx).has(&cx, label) {
+                        self.fail(&cx, "pack_witness_scope");
                     }
-                    witnesses.push(label);
+                    witnesses.push(&cx, label);
                 },
-                _ => self.fail("pack_witness_scope"),
+                _ => self.fail(&cx, "pack_witness_scope"),
             };
             i = i + 1usize;
         }
-        let sub: Map[Text, Type] = Map::new();
+        let sub: Map[Text['k], Type['k], 'k] = Map::new(&cx);
         var j = 0usize;
-        while j < binders.len() {
-            sub.set(binders.get(j), instr.tys.get(j));
+        while j < binders.len(&cx) {
+            sub.set(&cx, binders.get(&cx, j), instr.tys.get(&cx, j));
             j = j + 1usize;
         }
-        let payload = subst(body, sub, self.counter);
-        let arg = instr.args.get(0usize);
-        if arg.starts_with(text("&")) {
-            let places = self.places.get();
-            let matches = match places.opened.get(arg) {
-                Option::Some(view) => view.same(witnesses),
+        let payload = subst(&cx, body, sub, self.counter);
+        let arg = instr.args.get(&cx, 0usize);
+        if arg.starts_with(&cx, text(&cx, "&")) {
+            let places = self.places.get(&cx);
+            let matches = match places.opened.get(&cx, arg) {
+                Option::Some(view) => view.same(&cx, witnesses),
                 Option::None => false,
             };
             if !matches {
-                self.fail("open_at_those_brands");
+                self.fail(&cx, "open_at_those_brands");
             }
-            if !equal(self.path_type(arg), payload) {
-                self.fail("packing");
+            if !equal(&cx, self.path_type(&cx, arg), payload) {
+                self.fail(&cx, "packing");
             }
-            if !places.full(arg) {
-                self.fail("pack_place_full");
+            if !places.full(&cx, arg) {
+                self.fail(&cx, "pack_place_full");
             }
-            places.forget(arg, false);
-            if !equal(self.path_type(arg), t) {
-                self.fail("pack_place_type");
+            places.forget(&cx, arg, false);
+            if !equal(&cx, self.path_type(&cx, arg), t) {
+                self.fail(&cx, "pack_place_type");
             }
-            return C::unit();
+            return C::unit(&cx);
         }
-        let got = self.use_value(arg);
-        if !fits(got, payload) {
-            self.fail("packing");
+        let got = self.use_value(&cx, arg);
+        if !fits(&cx, got, payload) {
+            self.fail(&cx, "packing");
         }
         t
     }
 
-    fn op_open(self, instr: Instr) -> Type {
-        let arg = instr.args.get(0usize);
-        let brands = self.brands.get();
+    fn op_open(self, &cx: Cx!['k], instr: Instr['k]) -> Type['k] {
+        let arg = instr.args.get(&cx, 0usize);
+        let brands = self.brands.get(&cx);
         var i = 0usize;
-        while i < instr.binders.len() {
-            if brands.has(instr.binders.get(i)) {
-                self.fail("open_binder_already_scope");
+        while i < instr.binders.len(&cx) {
+            if brands.has(&cx, instr.binders.get(&cx, i)) {
+                self.fail(&cx, "open_binder_already_scope");
             }
-            brands.add(instr.binders.get(i));
+            brands.add(&cx, instr.binders.get(&cx, i));
             i = i + 1usize;
         }
-        if arg.starts_with(text("&")) {
-            let places = self.places.get();
-            if places.opened.has(arg) {
-                self.fail("place_already_open");
+        if arg.starts_with(&cx, text(&cx, "&")) {
+            let places = self.places.get(&cx);
+            if places.opened.has(&cx, arg) {
+                self.fail(&cx, "place_already_open");
             }
-            let ok = match self.path_type(arg) {
-                Type::Exists(binders, _body) => binders.len() == instr.binders.len() && places.full(arg),
+            let ok = match self.path_type(&cx, arg) {
+                Type::Exists(binders, _body) => binders.len(&cx) == instr.binders.len(&cx) && places.full(&cx, arg),
                 _ => false,
             };
             if !ok {
-                self.fail("full_package_brands");
+                self.fail(&cx, "full_package_brands");
             }
-            places.opened.set(arg, instr.binders);
-            return C::unit();
+            places.opened.set(&cx, arg, instr.binders);
+            return C::unit(&cx);
         }
-        match self.use_value(arg) {
+        match self.use_value(&cx, arg) {
             Type::Exists(binders, body) => {
-                if binders.len() != instr.binders.len() {
-                    self.fail("open_binders");
+                if binders.len(&cx) != instr.binders.len(&cx) {
+                    self.fail(&cx, "open_binders");
                 }
-                let sub: Map[Text, Type] = Map::new();
+                let sub: Map[Text['k], Type['k], 'k] = Map::new(&cx);
                 var j = 0usize;
-                while j < binders.len() {
-                    sub.set(binders.get(j), Type::Skolem.(instr.binders.get(j)));
+                while j < binders.len(&cx) {
+                    sub.set(&cx, binders.get(&cx, j), Type::Skolem.(instr.binders.get(&cx, j)));
                     j = j + 1usize;
                 }
-                subst(body.get(), sub, self.counter)
+                subst(&cx, body.get(&cx), sub, self.counter)
             },
-            _ => self.fail("open_binders"),
+            _ => self.fail(&cx, "open_binders"),
         }
     }
 
     // Also `builtin::unsafe::load_volatile`.
-    fn op_unsafe_deref(self, instr: Instr) -> Type {
-        self.authorize(instr, true);
-        let inner = match self.use_value(instr.args.get(0usize)) {
-            Type::Ptr(inner) => inner.get(),
-            _ => self.fail("deref_non_pointer"),
+    fn op_unsafe_deref(self, &cx: Cx!['k], instr: Instr['k]) -> Type['k] {
+        self.authorize(&cx, instr, true);
+        let inner = match self.use_value(&cx, instr.args.get(&cx, 0usize)) {
+            Type::Ptr(inner) => inner.get(&cx),
+            _ => self.fail(&cx, "deref_non_pointer"),
         };
         if is_never(inner) {
-            self.fail("unsafe_read_cannot_produce_never");
+            self.fail(&cx, "unsafe_read_cannot_produce_never");
         }
-        self.has_memory_form(inner);
+        self.has_memory_form(&cx, inner);
         inner
     }
 
     // Also `builtin::unsafe::store_volatile`.
-    fn op_unsafe_store(self, instr: Instr) -> Type {
-        self.authorize(instr, true);
-        let p = self.use_value(instr.args.get(0usize));
-        let v = self.use_value(instr.args.get(1usize));
+    fn op_unsafe_store(self, &cx: Cx!['k], instr: Instr['k]) -> Type['k] {
+        self.authorize(&cx, instr, true);
+        let p = self.use_value(&cx, instr.args.get(&cx, 0usize));
+        let v = self.use_value(&cx, instr.args.get(&cx, 1usize));
         let inner = match p {
-            Type::Ptr(inner) => inner.get(),
-            _ => self.fail("store_through_pointer_another"),
+            Type::Ptr(inner) => inner.get(&cx),
+            _ => self.fail(&cx, "store_through_pointer_another"),
         };
-        if !fits(v, inner) {
-            self.fail("store_through_pointer_another");
+        if !fits(&cx, v, inner) {
+            self.fail(&cx, "store_through_pointer_another");
         }
-        self.has_memory_form(inner);
-        C::unit()
+        self.has_memory_form(&cx, inner);
+        C::unit(&cx)
     }
 
-    fn atomic(self, instr: Instr) -> Type {
-        self.authorize(instr, true);
-        let kind = instr.op.from(text("builtin::unsafe::atomic_").len);
-        let arity = match atomic_arity(kind) {
+    fn atomic(self, &cx: Cx!['k], instr: Instr['k]) -> Type['k] {
+        self.authorize(&cx, instr, true);
+        let kind = instr.op.from(text(&cx, "builtin::unsafe::atomic_").len());
+        let arity = match atomic_arity(&cx, kind) {
             Option::Some(n) => n,
-            Option::None => self.fail("unknown_atomic_operation"),
+            Option::None => self.fail(&cx, "unknown_atomic_operation"),
         };
-        if instr.args.len() != arity {
-            self.fail("atomic_operand_count");
+        if instr.args.len(&cx) != arity {
+            self.fail(&cx, "atomic_operand_count");
         }
         let order = match instr.lit {
             Option::Some(o) => o,
-            Option::None => self.fail("atomic_requires_ordering"),
+            Option::None => self.fail(&cx, "atomic_requires_ordering"),
         };
-        if kind.is("compare_exchange") {
-            let (success, failure) = match order.find(text("/"), 0usize) {
+        if kind.is(&cx, "compare_exchange") {
+            let (success, failure) = match order.find(&cx, text(&cx, "/"), 0usize) {
                 Option::Some(at) => (order.slice(0usize, at), order.from(at + 1usize)),
-                Option::None => (order, text("")),
+                Option::None => (order, text(&cx, "")),
             };
-            let allowed = match cas_failure(success) {
-                Option::Some(a) => a.has(failure),
+            let allowed = match cas_failure(&cx, success) {
+                Option::Some(a) => a.has(&cx, failure),
                 Option::None => false,
             };
             if !allowed {
-                self.fail("bad_compare_exchange_ordering");
+                self.fail(&cx, "bad_compare_exchange_ordering");
             }
-        } else if !is_ordering(order) || kind.is("load") && (order.is("release") || order.is("acq_rel"))
-            || kind.is("store") && (order.is("acquire") || order.is("acq_rel")) || kind.is("fence") && order.is("relaxed") {
-            self.fail("bad_ordering");
+        } else if !is_ordering(&cx, order) || kind.is(&cx, "load") && (order.is(&cx, "release") || order.is(&cx, "acq_rel"))
+            || kind.is(&cx, "store") && (order.is(&cx, "acquire") || order.is(&cx, "acq_rel")) || kind.is(&cx, "fence") && order.is(&cx, "relaxed") {
+            self.fail(&cx, "bad_ordering");
         }
-        if kind.is("fence") {
-            return C::unit();
+        if kind.is(&cx, "fence") {
+            return C::unit(&cx);
         }
-        let inner = match self.use_value(instr.args.get(0usize)) {
-            Type::Ptr(inner) => inner.get(),
-            _ => self.fail("atomic_operation_non_pointer"),
+        let inner = match self.use_value(&cx, instr.args.get(&cx, 0usize)) {
+            Type::Ptr(inner) => inner.get(&cx),
+            _ => self.fail(&cx, "atomic_operation_non_pointer"),
         };
-        let integer = is_integer_type(inner);
+        let integer = is_integer_type(&cx, inner);
         let pointer = match inner {
             Type::Ptr(_x) => true,
             _ => false,
         };
-        let transfer = C::same(inner, C::bool_type()) || pointer;
-        if kind.starts_with(text("fetch_")) && !integer || !(integer || transfer) {
-            self.fail("atomic_pointee_type");
+        let transfer = C::same(&cx, inner, C::bool_type(&cx)) || pointer;
+        if kind.starts_with(&cx, text(&cx, "fetch_")) && !integer || !(integer || transfer) {
+            self.fail(&cx, "atomic_pointee_type");
         }
         var i = 1usize;
-        while i < instr.args.len() {
-            if !equal(self.use_value(instr.args.get(i)), inner) {
-                self.fail("atomic_operand_wrong_type");
+        while i < instr.args.len(&cx) {
+            if !equal(&cx, self.use_value(&cx, instr.args.get(&cx, i)), inner) {
+                self.fail(&cx, "atomic_operand_wrong_type");
             }
             i = i + 1usize;
         }
-        if kind.is("store") {
-            C::unit()
-        } else if kind.is("compare_exchange") {
-            Type::Tuple.(Seq::two(inner, C::bool_type()))
+        if kind.is(&cx, "store") {
+            C::unit(&cx)
+        } else if kind.is(&cx, "compare_exchange") {
+            Type::Tuple.(Seq::two(&cx, inner, C::bool_type(&cx)))
         } else {
             inner
         }
     }
 
-    fn op_load(self, instr: Instr) -> Type {
-        self.load(instr.args.get(0usize))
+    fn op_load(self, &cx: Cx!['k], instr: Instr['k]) -> Type['k] {
+        self.load(&cx, instr.args.get(&cx, 0usize))
     }
 
-    fn op_store(self, instr: Instr) -> Type {
-        self.store(instr.args.get(0usize), self.use_value(instr.args.get(1usize)));
-        C::unit()
+    fn op_store(self, &cx: Cx!['k], instr: Instr['k]) -> Type['k] {
+        self.store(&cx, instr.args.get(&cx, 0usize), self.use_value(&cx, instr.args.get(&cx, 1usize)));
+        C::unit(&cx)
     }
 
-    fn op_foreach(self, instr: Instr) -> Type {
+    fn op_foreach(self, &cx: Cx!['k], instr: Instr['k]) -> Type['k] {
         let t = match instr.ty {
             Option::Some(ty) => ty,
-            Option::None => self.fail("foreach_builds_foreach_type"),
+            Option::None => self.fail(&cx, "foreach_builds_foreach_type"),
         };
         let f = match t {
             Type::Foreach(f) => f,
-            _ => self.fail("foreach_builds_foreach_type"),
+            _ => self.fail(&cx, "foreach_builds_foreach_type"),
         };
-        let got = self.use_value(instr.args.get(0usize));
-        if !equal(got, f.source.get()) {
-            self.fail("foreach_source");
+        let got = self.use_value(&cx, instr.args.get(&cx, 0usize));
+        if !equal(&cx, got, f.source.get(&cx)) {
+            self.fail(&cx, "foreach_source");
         }
-        if !self.holds(text("builtin::Exposed"), Seq::one(f.source.get())) {
-            self.fail("foreach_source_not_exposed");
+        if !self.holds(&cx, text(&cx, "builtin::Exposed"), Seq::one(&cx, f.source.get(&cx))) {
+            self.fail(&cx, "foreach_source_not_exposed");
         }
-        if !self.types.pattern_available(f, self.home.get(), self.kinds.get()) {
-            self.fail("foreach_pointer_pattern_requires_pointer_components");
+        if !self.types.pattern_available(&cx, f, self.home.get(&cx), self.kinds.get(&cx)) {
+            self.fail(&cx, "foreach_pointer_pattern_requires_pointer_components");
         }
-        let mapper = match self.program.funs.get(instr.args.get(1usize)) {
+        let mapper = match self.program.funs.get(&cx, instr.args.get(&cx, 1usize)) {
             Option::Some(m) => m,
-            Option::None => self.fail("unknown_mapper"),
+            Option::None => self.fail(&cx, "unknown_mapper"),
         };
-        let binders = foreach_binders(f);
-        if mapper.params.len() != binders.len() + instr.tys.len() || !mapper.places().is_empty() {
-            self.fail("mapper_takes_traversal_binders");
+        let binders = foreach_binders(&cx, f);
+        if mapper.params.len(&cx) != binders.len(&cx) + instr.tys.len(&cx) || !mapper.places(&cx).is_empty(&cx) {
+            self.fail(&cx, "mapper_takes_traversal_binders");
         }
-        let sub: Map[Text, Type] = Map::new();
+        let sub: Map[Text['k], Type['k], 'k] = Map::new(&cx);
         var i = 0usize;
-        while i < mapper.params.len() && i < binders.len() {
-            sub.set(mapper.params.get(i).name, C::named(binders.get(i), Seq::new()));
+        while i < mapper.params.len(&cx) && i < binders.len(&cx) {
+            sub.set(&cx, mapper.params.get(&cx, i).name, C::named(binders.get(&cx, i), Seq::new(&cx)));
             i = i + 1usize;
         }
-        var j = binders.len();
-        while j < mapper.params.len() {
-            sub.set(mapper.params.get(j).name, instr.tys.get(j - binders.len()));
+        var j = binders.len(&cx);
+        while j < mapper.params.len(&cx) {
+            sub.set(&cx, mapper.params.get(&cx, j).name, instr.tys.get(&cx, j - binders.len(&cx)));
             j = j + 1usize;
         }
         // The mapper is checked for an arbitrary component, not only today's rows.
-        let saved_kinds = self.kinds.get();
-        let kinds = saved_kinds.copy();
+        let saved_kinds = self.kinds.get(&cx);
+        let kinds = saved_kinds.copy(&cx);
         var b = 0usize;
-        while b < binders.len() {
-            kinds.set(binders.get(b), Kind::Any);
+        while b < binders.len(&cx) {
+            kinds.set(&cx, binders.get(&cx, b), Kind::Any);
             b = b + 1usize;
         }
-        self.kinds.set(kinds);
-        let chosen: Seq[Type] = Seq::new();
+        self.kinds.set(&cx, kinds);
+        let chosen: Seq[Type['k], 'k] = Seq::new(&cx);
         var c = 0usize;
-        while c < mapper.params.len() {
-            chosen.push(sub.at(mapper.params.get(c).name));
+        while c < mapper.params.len(&cx) {
+            chosen.push(&cx, sub.at(&cx, mapper.params.get(&cx, c).name));
             c = c + 1usize;
         }
-        let unit = self.instantiate(mapper.params, mapper.premises, chosen);
-        self.kinds.set(saved_kinds);
-        let item = foreach_item(f);
-        let ptypes = subst_all(mapper.ptypes, sub, self.counter);
-        if ptypes.is_empty() || !equal(ptypes.get(0usize), item) || !equal(subst(mapper.ret, sub, self.counter), f.body.get()) {
-            self.fail("mapper_does_map");
+        let unit = self.instantiate(&cx, mapper.params, mapper.premises, chosen);
+        self.kinds.set(&cx, saved_kinds);
+        let item = foreach_item(&cx, f);
+        let ptypes = subst_all(&cx, mapper.ptypes, sub, self.counter);
+        if ptypes.is_empty(&cx) || !equal(&cx, ptypes.get(&cx, 0usize), item) || !equal(&cx, subst(&cx, mapper.ret, sub, self.counter), f.body.get(&cx)) {
+            self.fail(&cx, "mapper_does_map");
         }
         var k = 2usize;
-        while k < instr.args.len() && k - 1usize < ptypes.len() {
-            let got = self.use_value(instr.args.get(k));
-            if !self.copy_type(got) || !fits(got, ptypes.get(k - 1usize)) {
-                self.fail("foreach_capture_copy_fit");
+        while k < instr.args.len(&cx) && k - 1usize < ptypes.len(&cx) {
+            let got = self.use_value(&cx, instr.args.get(&cx, k));
+            if !self.copy_type(&cx, got) || !fits(&cx, got, ptypes.get(&cx, k - 1usize)) {
+                self.fail(&cx, "foreach_capture_copy_fit");
             }
             k = k + 1usize;
         }
-        if instr.args.len() - 2usize != ptypes.len() - 1usize {
-            self.fail("foreach_capture_count_disagrees");
+        if instr.args.len(&cx) - 2usize != ptypes.len(&cx) - 1usize {
+            self.fail(&cx, "foreach_capture_count_disagrees");
         }
-        self.authorize(instr, mapper.is_unsafe);
+        self.authorize(&cx, instr, mapper.is_unsafe);
         t
     }
 
     // ------------------------------------------------------------- terminators --
 
-    fn check_term(self, term: Terminator, last: Option[Instr]) {
+    fn check_term(self, &cx: Cx!['k], term: Terminator['k], last: Option[Instr['k]]) {
         match term {
             Terminator::Ret(value, _pos) => {
-                let fun = self.fun();
-                let got = self.use_value(value);
-                if !fits(got, fun.ret) {
-                    self.fail("returning_function");
+                let fun = self.fun(&cx);
+                let got = self.use_value(&cx, value);
+                if !fits(&cx, got, fun.ret) {
+                    self.fail(&cx, "returning_function");
                 }
-                self.accounted(self.used.get());
-                let roots = self.roots.get();
-                let param_roots = self.param_roots.get();
-                let places = self.places.get();
-                let names = roots.keys();
+                self.accounted(&cx, self.used.get(&cx));
+                let roots = self.roots.get(&cx);
+                let param_roots = self.param_roots.get(&cx);
+                let places = self.places.get(&cx);
+                let names = roots.keys(&cx);
                 var i = 0usize;
-                while i < names.len() {
-                    let root = names.get(i);
-                    let ty = roots.at(root);
-                    if param_roots.has(root) && any_key(places.opened, |q: Text| prefix(root, q)) {
-                        self.fail("place_parameter_sealed");
+                while i < names.len(&cx) {
+                    let root = names.get(&cx, i);
+                    let ty = roots.at(&cx, root);
+                    if param_roots.has(&cx, root) && any_key(&cx, places.opened, |&cx, q: Text['k]| prefix(&cx, root, q)) {
+                        self.fail(&cx, "place_parameter_sealed");
                     }
-                    if param_roots.has(root) && !places.full(root) {
-                        self.fail("place_parameter_restored");
+                    if param_roots.has(&cx, root) && !places.full(&cx, root) {
+                        self.fail(&cx, "place_parameter_restored");
                     }
-                    if !param_roots.has(root) && !self.no_linear(root, ty) {
-                        self.fail("local_place_still_holds");
+                    if !param_roots.has(&cx, root) && !self.no_linear(&cx, root, ty) {
+                        self.fail(&cx, "local_place_still_holds");
                     }
                     i = i + 1usize;
                 }
-                let generic = brand_params(self.params.get());
-                let found = free_brands(got).items();
+                let generic = brand_params(&cx, self.params.get(&cx));
+                let found = free_brands(&cx, got).items(&cx);
                 var local = false;
                 var k = 0usize;
-                while k < found.len() {
-                    if !generic.has(found.get(k)) && !found.get(k).eq(static_brand()) {
+                while k < found.len(&cx) {
+                    if !generic.has(&cx, found.get(&cx, k)) && !found.get(&cx, k).eq(&cx, static_brand(&cx)) {
                         local = true;
                     }
                     k = k + 1usize;
                 }
                 if local && !is_never(got) {
-                    self.fail("result_mentions_local_brands");
+                    self.fail(&cx, "result_mentions_local_brands");
                 }
             },
-            Terminator::Jmp(edge, _pos) => self.edge(edge, self.used.get(), self.places.get(), Option::None),
+            Terminator::Jmp(edge, _pos) => self.edge(&cx, edge, self.used.get(&cx), self.places.get(&cx), Option::None),
             Terminator::Jnz(cond, then, other, _pos) => {
-                if !C::same(self.use_value(cond), C::bool_type()) {
-                    self.fail("jnz_bool_condition");
+                if !C::same(&cx, self.use_value(&cx, cond), C::bool_type(&cx)) {
+                    self.fail(&cx, "jnz_bool_condition");
                 }
-                let used = self.used.get().copy();
-                self.edge(then, used.copy(), self.places.get().copy(), Option::None);
-                self.edge(other, used.copy(), self.places.get().copy(), Option::None);
+                let used = self.used.get(&cx).copy(&cx);
+                self.edge(&cx, then, used.copy(&cx), self.places.get(&cx).copy(&cx), Option::None);
+                self.edge(&cx, other, used.copy(&cx), self.places.get(&cx).copy(&cx), Option::None);
             },
-            Terminator::Switch(scrutinee, ty, arms, _pos) => self.switch(scrutinee, ty, arms),
+            Terminator::Switch(scrutinee, ty, arms, _pos) => self.switch(&cx, scrutinee, ty, arms),
             Terminator::Unreachable(_pos) => {
                 let ok = match last {
-                    Option::Some(instr) => instr.lhs.len() == 1usize && is_never(self.env.get().at(instr.lhs.get(0usize))),
+                    Option::Some(instr) => instr.lhs.len(&cx) == 1usize && is_never(self.env.get(&cx).at(&cx, instr.lhs.get(&cx, 0usize))),
                     Option::None => false,
                 };
                 if !ok {
-                    self.fail("unreachable_follow_instruction_producing");
+                    self.fail(&cx, "unreachable_follow_instruction_producing");
                 }
             },
         };
     }
 
-    fn edge(self, edge: Edge, used: Set[Text], places: Places, payload: Option[Type]) {
-        let fun = self.fun();
-        let target = match self.blocks.get().get(edge.target) {
+    fn edge(self, &cx: Cx!['k], edge: Edge['k], used: Set[Text['k], 'k], places: Places['k], payload: Option[Type['k]]) {
+        let fun = self.fun(&cx);
+        let target = match self.blocks.get(&cx).get(&cx, edge.target) {
             Option::Some(b) => b,
-            Option::None => self.fail("jump"),
+            Option::None => self.fail(&cx, "jump"),
         };
-        if target.label.eq(fun.blocks.get(0usize).label) {
-            self.fail("jump");
+        if target.label.eq(&cx, fun.blocks.get(&cx, 0usize).label) {
+            self.fail(&cx, "jump");
         }
-        if edge.tys.len() != target.brands.len() {
-            self.fail("takes_brand_arguments");
+        if edge.tys.len(&cx) != target.brands.len(&cx) {
+            self.fail(&cx, "takes_brand_arguments");
         }
-        let sub: Map[Text, Type] = Map::new();
+        let sub: Map[Text['k], Type['k], 'k] = Map::new(&cx);
         var i = 0usize;
-        while i < target.brands.len() {
-            let t = edge.tys.get(i);
+        while i < target.brands.len(&cx) {
+            let t = edge.tys.get(&cx, i);
             let unit = match t {
                 Type::Skolem(label) => {
-                    if !self.brands.get().has(label) {
-                        self.fail("brand_argument_scope");
+                    if !self.brands.get(&cx).has(&cx, label) {
+                        self.fail(&cx, "brand_argument_scope");
                     }
                 },
-                _ => self.fail("brand_argument_scope"),
+                _ => self.fail(&cx, "brand_argument_scope"),
             };
-            sub.set(target.brands.get(i), t);
+            sub.set(&cx, target.brands.get(&cx, i), t);
             i = i + 1usize;
         }
         let offset = if payload.is_some() { 1usize } else { 0usize };
-        if edge.args.len() + offset != target.params.len() {
-            self.fail("takes_arguments_got");
+        if edge.args.len(&cx) + offset != target.params.len(&cx) {
+            self.fail(&cx, "takes_arguments_got");
         }
-        let saved = self.used.get();
-        self.used.set(used);
+        let saved = self.used.get(&cx);
+        self.used.set(&cx, used);
         var k = 0usize;
-        while k < target.params.len() {
+        while k < target.params.len(&cx) {
             let got = if k < offset {
                 match payload {
                     Option::Some(t) => t,
-                    Option::None => C::unit(),
+                    Option::None => C::unit(&cx),
                 }
             } else {
-                self.use_value(edge.args.get(k - offset))
+                self.use_value(&cx, edge.args.get(&cx, k - offset))
             };
-            if !fits(got, subst(target.params.get(k).type, sub, self.counter)) {
-                self.fail("argument_expected");
+            if !fits(&cx, got, subst(&cx, target.params.get(&cx, k).type, sub, self.counter)) {
+                self.fail(&cx, "argument_expected");
             }
             k = k + 1usize;
         }
-        self.accounted(self.used.get());
-        self.used.set(saved);
-        self.entails(places, target, sub);
-        let kept = brand_params(self.params.get());
-        kept.add(static_brand());
-        let names = sub.keys();
+        self.accounted(&cx, self.used.get(&cx));
+        self.used.set(&cx, saved);
+        self.entails(&cx, places, target, sub);
+        let kept = brand_params(&cx, self.params.get(&cx));
+        kept.add(&cx, static_brand(&cx));
+        let names = sub.keys(&cx);
         var n = 0usize;
-        while n < names.len() {
-            let unit = match sub.at(names.get(n)) {
+        while n < names.len(&cx) {
+            let unit = match sub.at(&cx, names.get(&cx, n)) {
                 Type::Skolem(label) => {
-                    if label.eq(names.get(n)) {
-                        kept.add(names.get(n));
+                    if label.eq(&cx, names.get(&cx, n)) {
+                        kept.add(&cx, names.get(&cx, n));
                     }
                 },
                 _ => (),
             };
             n = n + 1usize;
         }
-        let roots = self.roots.get();
-        let param_roots = self.param_roots.get();
+        let roots = self.roots.get(&cx);
+        let param_roots = self.param_roots.get(&cx);
         var r = 0usize;
-        while r < roots.positions() {
-            let root = match roots.entry(r) {
+        while r < roots.positions(&cx) {
+            let root = match roots.entry(&cx, r) {
                 Option::Some(name) => name,
-                Option::None => text(""),
+                Option::None => text(&cx, ""),
             };
             var emptied = false;
             var q = 0usize;
-            while !emptied && q < target.empty.len() {
-                emptied = prefix(target.empty.get(q), root);
+            while !emptied && q < target.empty.len(&cx) {
+                emptied = prefix(&cx, target.empty.get(&cx, q), root);
                 q = q + 1usize;
             }
-            if !param_roots.has(root) && !emptied && !subset(self.root_brands(root), kept) {
-                self.fail("full_local_block_brand");
+            if !param_roots.has(&cx, root) && !emptied && !subset(&cx, self.root_brands(&cx, root), kept) {
+                self.fail(&cx, "full_local_block_brand");
             }
             r = r + 1usize;
         }
     }
 
-    fn entails(self, places: Places, target: Block, sub: Map[Text, Type]) {
-        let saved = self.places.get();
-        self.places.set(places);
-        let wanted: Map[Text, Seq[Text]] = Map::new();
+    fn entails(self, &cx: Cx!['k], places: Places['k], target: Block['k], sub: Map[Text['k], Type['k], 'k]) {
+        let saved = self.places.get(&cx);
+        self.places.set(&cx, places);
+        let wanted: Map[Text['k], Seq[Text['k], 'k], 'k] = Map::new(&cx);
         var o = 0usize;
-        while o < target.opened.len() {
-            let brands = target.opened.get(o).brands;
-            let labels: Seq[Text] = Seq::new();
+        while o < target.opened.len(&cx) {
+            let brands = target.opened.get(&cx, o).brands;
+            let labels: Seq[Text['k], 'k] = Seq::new(&cx);
             var b = 0usize;
-            while b < brands.len() {
-                let label = match sub.get(brands.get(b)) {
+            while b < brands.len(&cx) {
+                let label = match sub.get(&cx, brands.get(&cx, b)) {
                     Option::Some(t) => match t {
                         Type::Skolem(l) => l,
-                        _ => brands.get(b),
+                        _ => brands.get(&cx, b),
                     },
-                    Option::None => brands.get(b),
+                    Option::None => brands.get(&cx, b),
                 };
-                labels.push(label);
+                labels.push(&cx, label);
                 b = b + 1usize;
             }
-            wanted.set(target.opened.get(o).path, labels);
+            wanted.set(&cx, target.opened.get(&cx, o).path, labels);
             o = o + 1usize;
         }
-        if !opened_same(places.opened, wanted) {
-            self.fail("opened_view_contract");
+        if !opened_same(&cx, places.opened, wanted) {
+            self.fail(&cx, "opened_view_contract");
         }
         let target_empty = target.empty;
-        if any_key(places.empty.map, |z: Text| !any_prefix(target_empty, z)) {
-            self.fail("empty_assumes_full");
+        if any_key(&cx, places.empty.map, |&cx, z: Text['k]| !any_prefix(&cx, target_empty, z)) {
+            self.fail(&cx, "empty_assumes_full");
         }
-        let fresh: Seq[Text] = Seq::new();
+        let fresh: Seq[Text['k], 'k] = Seq::new(&cx);
         var f = 0usize;
-        while f < target.empty.len() {
-            if !places.covered(target.empty.get(f)) {
-                fresh.push(target.empty.get(f));
+        while f < target.empty.len(&cx) {
+            if !places.covered(&cx, target.empty.get(&cx, f)) {
+                fresh.push(&cx, target.empty.get(&cx, f));
             }
             f = f + 1usize;
         }
-        let roots: Set[Text] = Set::new();
+        let roots: Set[Text['k], 'k] = Set::new(&cx);
         var s = 0usize;
-        while s < fresh.len() {
-            roots.add(segments(fresh.get(s)).get(0usize));
+        while s < fresh.len(&cx) {
+            roots.add(&cx, segments(&cx, fresh.get(&cx, s)).get(&cx, 0usize));
             s = s + 1usize;
         }
-        let root_names = roots.items();
+        let root_names = roots.items(&cx);
         var r = 0usize;
-        while r < root_names.len() {
-            let own: Seq[Text] = Seq::new();
+        while r < root_names.len(&cx) {
+            let own: Seq[Text['k], 'k] = Seq::new(&cx);
             var q = 0usize;
-            while q < fresh.len() {
-                if segments(fresh.get(q)).get(0usize).eq(root_names.get(r)) {
-                    own.push(fresh.get(q));
+            while q < fresh.len(&cx) {
+                if segments(&cx, fresh.get(&cx, q)).get(&cx, 0usize).eq(&cx, root_names.get(&cx, r)) {
+                    own.push(&cx, fresh.get(&cx, q));
                 }
                 q = q + 1usize;
             }
             // One newly empty path per root, or leaves of one full product tree.
-            if own.len() > 1usize && !(self.product_branches(own) && places.full(self.common_parent(own))) {
-                self.fail("edge_empties_one_path_or_product_leaves");
+            if own.len(&cx) > 1usize && !(self.product_branches(&cx, own) && places.full(&cx, self.common_parent(&cx, own))) {
+                self.fail(&cx, "edge_empties_one_path_or_product_leaves");
             }
             r = r + 1usize;
         }
         var e = 0usize;
-        while e < target.empty.len() {
-            let q = target.empty.get(e);
-            if !self.no_linear(q, self.storage_type(q)) {
-                self.fail("holds_linear_contents_assumes");
+        while e < target.empty.len(&cx) {
+            let q = target.empty.get(&cx, e);
+            if !self.no_linear(&cx, q, self.storage_type(&cx, q)) {
+                self.fail(&cx, "holds_linear_contents_assumes");
             }
             e = e + 1usize;
         }
         var k = 0usize;
-        while k < target.known.len() {
-            let known = target.known.get(k);
-            let ok = match places.known.get(known.path) {
-                Option::Some(v) => v.eq(known.variant),
+        while k < target.known.len(&cx) {
+            let known = target.known.get(&cx, k);
+            let ok = match places.known.get(&cx, known.path) {
+                Option::Some(v) => v.eq(&cx, known.variant),
                 Option::None => false,
             };
             if !ok {
-                self.fail("assumes");
+                self.fail(&cx, "assumes");
             }
             k = k + 1usize;
         }
-        self.places.set(saved);
+        self.places.set(&cx, saved);
     }
 
     // An enum switch: one arm per variant, each variant once. A value switch passes each arm its
     // variant's payload; a place switch tells each arm which variant the place holds.
-    fn switch(self, arg: Text, ty: Type, arms: Seq[Arm]) {
-        let place = arg.starts_with(text("&"));
+    fn switch(self, &cx: Cx!['k], arg: Text['k], ty: Type['k], arms: Seq[Arm['k], 'k]) {
+        let place = arg.starts_with(&cx, text(&cx, "&"));
         let got = if place {
-            let t = self.path_type(arg);
-            if !self.places.get().full(arg) {
-                self.fail("switch_which_full");
+            let t = self.path_type(&cx, arg);
+            if !self.places.get(&cx).full(&cx, arg) {
+                self.fail(&cx, "switch_which_full");
             }
             t
         } else {
-            self.use_value(arg)
+            self.use_value(&cx, arg)
         };
-        if !equal(got, ty) {
-            self.fail("switch");
+        if !equal(&cx, got, ty) {
+            self.fail(&cx, "switch");
         }
-        let unit = match self.types.shape(ty, self.home.get()) {
-            Type::Prim(_name) => self.fail("switch_on_enum"),
+        let unit = match self.types.shape(&cx, ty, self.home.get(&cx)) {
+            Type::Prim(_name) => self.fail(&cx, "switch_on_enum"),
             _ => (),
         };
-        let variants = self.types.variants(ty, self.home.get());
-        let names: Set[Text] = Set::new();
-        let arm_names: Set[Text] = Set::new();
+        let variants = self.types.variants(&cx, ty, self.home.get(&cx));
+        let names: Set[Text['k], 'k] = Set::new(&cx);
+        let arm_names: Set[Text['k], 'k] = Set::new(&cx);
         var v = 0usize;
-        while v < variants.len() {
-            names.add(variants.get(v).name);
+        while v < variants.len(&cx) {
+            names.add(&cx, variants.get(&cx, v).name);
             v = v + 1usize;
         }
         var a = 0usize;
-        while a < arms.len() {
-            arm_names.add(arms.get(a).variant);
+        while a < arms.len(&cx) {
+            arm_names.add(&cx, arms.get(&cx, a).variant);
             a = a + 1usize;
         }
-        if arm_names.len() != arms.len() || !subset(arm_names, names) || !subset(names, arm_names) {
-            self.fail("switch_arm_per_variant");
+        if arm_names.len(&cx) != arms.len(&cx) || !subset(&cx, arm_names, names) || !subset(&cx, names, arm_names) {
+            self.fail(&cx, "switch_arm_per_variant");
         }
-        let used = self.used.get().copy();
+        let used = self.used.get(&cx).copy(&cx);
         var i = 0usize;
-        while i < arms.len() {
-            let arm = arms.get(i);
-            let places = self.places.get().copy();
-            var payload: Option[Type] = Option::None;
+        while i < arms.len(&cx) {
+            let arm = arms.get(&cx, i);
+            let places = self.places.get(&cx).copy(&cx);
+            var payload: Option[Type['k]] = Option::None;
             if place {
-                places.known.set(arg, arm.variant);
+                places.known.set(&cx, arg, arm.variant);
             } else {
-                payload = member(variants, arm.variant);
+                payload = member(&cx, variants, arm.variant);
             }
-            self.edge(arm.edge, used.copy(), places, payload);
+            self.edge(&cx, arm.edge, used.copy(&cx), places, payload);
             i = i + 1usize;
         }
     }
 }
 
-fn split_all(paths: Seq[Text]) -> Seq[Seq[Text]] {
-    let out: Seq[Seq[Text]] = Seq::new();
+forall 'k.
+fn split_all(&cx: Cx!['k], paths: Seq[Text['k], 'k]) -> Seq[Seq[Text['k], 'k], 'k] {
+    let out: Seq[Seq[Text['k], 'k], 'k] = Seq::new(&cx);
     var i = 0usize;
-    while i < paths.len() {
-        out.push(segments(paths.get(i)));
+    while i < paths.len(&cx) {
+        out.push(&cx, segments(&cx, paths.get(&cx, i)));
         i = i + 1usize;
     }
     out
 }
 
 // Every path has the same segment at `depth`.
-fn segments_agree(parts: Seq[Seq[Text]], depth: usize) -> bool {
-    let first = parts.get(0usize).get(depth);
+forall 'k.
+fn segments_agree(&cx: Cx!['k], parts: Seq[Seq[Text['k], 'k], 'k], depth: usize) -> bool {
+    let first = parts.get(&cx, 0usize).get(&cx, depth);
     var all = true;
     var i = 1usize;
-    while all && i < parts.len() {
-        all = parts.get(i).get(depth).eq(first);
+    while all && i < parts.len(&cx) {
+        all = parts.get(&cx, i).get(&cx, depth).eq(&cx, first);
         i = i + 1usize;
     }
     all
 }
 
 // The number of leading segments the paths share, keeping at least one more segment in each.
-fn common_depth(parts: Seq[Seq[Text]]) -> usize {
+forall 'k.
+fn common_depth(&cx: Cx!['k], parts: Seq[Seq[Text['k], 'k], 'k]) -> usize {
     var common = 0usize;
     var going = true;
     while going {
         var long = true;
         var i = 0usize;
-        while long && i < parts.len() {
-            long = parts.get(i).len() > common + 1usize;
+        while long && i < parts.len(&cx) {
+            long = parts.get(&cx, i).len(&cx) > common + 1usize;
             i = i + 1usize;
         }
-        if long && segments_agree(parts, common) {
+        if long && segments_agree(&cx, parts, common) {
             common = common + 1usize;
         } else {
             going = false;
@@ -2562,8 +2615,9 @@ fn common_depth(parts: Seq[Seq[Text]]) -> usize {
     common
 }
 
-fn check_program(program: Program, counter: Fresh) -> Checker {
-    let checker = Checker::new(program, counter);
-    checker.check();
+forall 'k.
+fn check_program(&cx: Cx!['k], program: Program['k], counter: Fresh['k]) -> Checker['k] {
+    let checker = Checker::new(&cx, program, counter);
+    checker.check(&cx);
     checker
 }

@@ -1,7 +1,7 @@
 // Type operations shared by the checker and the backend: substitution, equality, multiplicity,
 // exposure and logical shape.
 
-use package::support::base::{Cell, Key, Map, Out, Seq, Set, Text, fail, text};
+use package::support::base::{Cell, Cx, Map, Out, Seq, Set, Text, fail, key_same, text};
 use package::kurs::core::{Exposure, ExposureMode, FnType, ForeachType, Kind, Member, ModuleId, Param, Premise, Program, Type, TypeDecl};
 use package::kurs::core as C;
 use package::kurs::sexpr::located;
@@ -10,11 +10,12 @@ use std::option::Option;
 
 // Stops the compiler with a KursError's text: `line:col: message` when `pos` is a position, the
 // message alone when it is none (line 0).
-fn kurs_error(message: Text, pos: Pos) -> ! {
+forall 'k.
+fn kurs_error(&cx: Cx!['k], message: Text['k], pos: Pos) -> ! {
     if pos.line == 0u32 {
-        fail(message)
+        fail(&cx, message)
     } else {
-        fail(located(message, pos))
+        fail(&cx, located(&cx, message, pos))
     }
 }
 
@@ -22,96 +23,106 @@ fn kurs_error(message: Text, pos: Pos) -> ! {
 
 // The counter that numbers fresh names. The compiler makes one and passes it to everything that
 // may rename a binder, so names are numbered in the order they are made.
+forall 'k.
 exposed struct Fresh {
-    next: Cell[u64],
+    next: Cell[u64, 'k],
 }
 
-impl Fresh {
-    fn new() -> Fresh {
-        Fresh.{ next: Cell::new(0u64) }
+forall 'k.
+impl Fresh['k] {
+    fn new(&cx: Cx!['k]) -> Fresh['k] {
+        Fresh.{ next: Cell::new(&cx, 0u64) }
     }
 }
 
 // `label` without any `#` suffix, numbered anew: `a#3`.
-fn fresh(label: Text, counter: Fresh) -> Text {
-    let n = counter.next.get();
-    counter.next.set(n + 1u64);
-    let stem = match label.find(text("#"), 0usize) {
+forall 'k.
+fn fresh(&cx: Cx!['k], label: Text['k], counter: Fresh['k]) -> Text['k] {
+    let n = counter.next.get(&cx);
+    counter.next.set(&cx, n + 1u64);
+    let stem = match label.find(&cx, text(&cx, "#"), 0usize) {
         Option::Some(at) => label.slice(0usize, at),
         Option::None => label,
     };
-    Out::new().add(stem).put("#").u64(n).done()
+    Out::new(&cx).add(&cx, stem).put(&cx, "#").u64(&cx, n).done(&cx)
 }
 
 // ------------------------------------------------------------- name sets --
 
-fn with_names(bound: Set[Text], names: Seq[Text]) -> Set[Text] {
-    let out = bound.copy();
+forall 'k.
+fn with_names(&cx: Cx!['k], bound: Set[Text['k], 'k], names: Seq[Text['k], 'k]) -> Set[Text['k], 'k] {
+    let out = bound.copy(&cx);
     var i = 0usize;
-    while i < names.len() {
-        out.add(names.get(i));
+    while i < names.len(&cx) {
+        out.add(&cx, names.get(&cx, i));
         i = i + 1usize;
     }
     out
 }
 
 // The two sets share a name.
-fn overlap(a: Set[Text], b: Set[Text]) -> bool {
-    let items = a.items();
+forall 'k.
+fn overlap(&cx: Cx!['k], a: Set[Text['k], 'k], b: Set[Text['k], 'k]) -> bool {
+    let items = a.items(&cx);
     var found = false;
     var i = 0usize;
-    while !found && i < items.len() {
-        found = b.has(items.get(i));
+    while !found && i < items.len(&cx) {
+        found = b.has(&cx, items.get(&cx, i));
         i = i + 1usize;
     }
     found
 }
 
-fn add_all(out: Set[Text], names: Set[Text]) {
-    let items = names.items();
+forall 'k.
+fn add_all(&cx: Cx!['k], out: Set[Text['k], 'k], names: Set[Text['k], 'k]) {
+    let items = names.items(&cx);
     var i = 0usize;
-    while i < items.len() {
-        out.add(items.get(i));
+    while i < items.len(&cx) {
+        out.add(&cx, items.get(&cx, i));
         i = i + 1usize;
     }
 }
 
-fn param_names(params: Seq[Param]) -> Seq[Text] {
-    let out: Seq[Text] = Seq::new();
+forall 'k.
+fn param_names(&cx: Cx!['k], params: Seq[Param['k], 'k]) -> Seq[Text['k], 'k] {
+    let out: Seq[Text['k], 'k] = Seq::new(&cx);
     var i = 0usize;
-    while i < params.len() {
-        out.push(params.get(i).name);
+    while i < params.len(&cx) {
+        out.push(&cx, params.get(&cx, i).name);
         i = i + 1usize;
     }
     out
 }
 
 // `t` with every non-overlapping `old` replaced by `new`, left to right.
-fn replace_all(t: Text, old: Text, new: Text) -> Text {
-    let out = Out::new();
+forall 'k.
+fn replace_all(&cx: Cx!['k], t: Text['k], old: Text['k], new: Text['k]) -> Text['k] {
+    let out = Out::new(&cx);
     var i = 0usize;
-    while i < t.len {
-        if i + old.len <= t.len && t.slice(i, i + old.len).eq(old) {
-            let unit = out.add(new);
-            i = i + old.len;
+    while i < t.len() {
+        if i + old.len() <= t.len() && t.slice(i, i + old.len()).eq(&cx, old) {
+            let unit = out.add(&cx, new);
+            i = i + old.len();
         } else {
-            let unit = out.byte(t.byte(i));
+            let unit = out.byte(&cx, t.byte(&cx, i));
             i = i + 1usize;
         }
     }
-    out.done()
+    out.done(&cx)
 }
 
-fn kind_name(k: Kind) -> Text {
+forall 'k.
+fn kind_name(&cx: Cx!['k], k: Kind) -> Text['k] {
     match k {
-        Kind::Brand => text("brand"),
-        Kind::Copy => text("copy"),
-        Kind::Any => text("any"),
+        Kind::Brand => text(&cx, "brand"),
+        Kind::Copy => text(&cx, "copy"),
+        Kind::Any => text(&cx, "any"),
     }
 }
 
 // Which constructor a type is: equal for two types exactly when Python's `type(a) is type(b)`.
-fn type_tag(t: Type) -> u32 {
+forall 'k.
+fn type_tag(t: Type['k]) -> u32 {
     match t {
         Type::Prim(_x) => 0u32,
         Type::Never => 1u32,
@@ -137,67 +148,67 @@ fn type_tag(t: Type) -> u32 {
 //
 // Binders, labels, lengths and calling conventions are preserved. The caller controls recursion
 // and scope; this helper does not substitute bound names.
-forall Env where Copy[Env].
-fn map_children(ty: Type, transform: closure[Env](Type) -> Type) -> Type {
+forall Env, 'k where Copy[Env].
+fn map_children(&cx: Cx!['k], ty: Type['k], transform: closure[Env](&_: Cx!['k], Type['k]) -> Type['k]) -> Type['k] {
     match ty {
         Type::Named(name, args) => {
-            if args.is_empty() {
+            if args.is_empty(&cx) {
                 ty
             } else {
-                let out: Seq[Type] = Seq::new();
+                let out: Seq[Type['k], 'k] = Seq::new(&cx);
                 var i = 0usize;
-                while i < args.len() {
-                    out.push(transform(args.get(i)));
+                while i < args.len(&cx) {
+                    out.push(&cx, transform(&cx, args.get(&cx, i)));
                     i = i + 1usize;
                 }
                 Type::Named.(name, out)
             }
         },
-        Type::Brand(brand) => Type::Brand.(Cell::new(transform(brand.get()))),
-        Type::Ptr(inner) => Type::Ptr.(Cell::new(transform(inner.get()))),
-        Type::Array(elem, length) => Type::Array.(Cell::new(transform(elem.get())), length),
+        Type::Brand(brand) => Type::Brand.(Cell::new(&cx, transform(&cx, brand.get(&cx)))),
+        Type::Ptr(inner) => Type::Ptr.(Cell::new(&cx, transform(&cx, inner.get(&cx)))),
+        Type::Array(elem, length) => Type::Array.(Cell::new(&cx, transform(&cx, elem.get(&cx))), length),
         Type::Tuple(elems) => {
-            let out: Seq[Type] = Seq::new();
+            let out: Seq[Type['k], 'k] = Seq::new(&cx);
             var i = 0usize;
-            while i < elems.len() {
-                out.push(transform(elems.get(i)));
+            while i < elems.len(&cx) {
+                out.push(&cx, transform(&cx, elems.get(&cx, i)));
                 i = i + 1usize;
             }
             Type::Tuple.(out)
         },
         Type::Struct(fields) => {
-            let out: Seq[Member] = Seq::new();
+            let out: Seq[Member['k], 'k] = Seq::new(&cx);
             var i = 0usize;
-            while i < fields.len() {
-                out.push(Member.{ name: fields.get(i).name, type: transform(fields.get(i).type) });
+            while i < fields.len(&cx) {
+                out.push(&cx, Member.{ name: fields.get(&cx, i).name, type: transform(&cx, fields.get(&cx, i).type) });
                 i = i + 1usize;
             }
             Type::Struct.(out)
         },
         Type::Enum(variants) => {
-            let out: Seq[Member] = Seq::new();
+            let out: Seq[Member['k], 'k] = Seq::new(&cx);
             var i = 0usize;
-            while i < variants.len() {
-                out.push(Member.{ name: variants.get(i).name, type: transform(variants.get(i).type) });
+            while i < variants.len(&cx) {
+                out.push(&cx, Member.{ name: variants.get(&cx, i).name, type: transform(&cx, variants.get(&cx, i).type) });
                 i = i + 1usize;
             }
             Type::Enum.(out)
         },
-        Type::Exists(binders, body) => Type::Exists.(binders, Cell::new(transform(body.get()))),
+        Type::Exists(binders, body) => Type::Exists.(binders, Cell::new(&cx, transform(&cx, body.get(&cx)))),
         Type::Foreach(f) => {
-            let source = transform(f.source.get());
-            let body = transform(f.body.get());
-            Type::Foreach.(ForeachType.{ binder: f.binder, indirect: f.indirect, source: Cell::new(source), body: Cell::new(body), retained: f.retained })
+            let source = transform(&cx, f.source.get(&cx));
+            let body = transform(&cx, f.body.get(&cx));
+            Type::Foreach.(ForeachType.{ binder: f.binder, indirect: f.indirect, source: Cell::new(&cx, source), body: Cell::new(&cx, body), retained: f.retained })
         },
         Type::Fn(f) => {
-            let params: Seq[Type] = Seq::new();
+            let params: Seq[Type['k], 'k] = Seq::new(&cx);
             var i = 0usize;
-            while i < f.params.len() {
-                params.push(transform(f.params.get(i)));
+            while i < f.params.len(&cx) {
+                params.push(&cx, transform(&cx, f.params.get(&cx, i)));
                 i = i + 1usize;
             }
-            let ret = transform(f.ret.get());
-            Type::Fn.(FnType.{ params, ret: Cell::new(ret), quantified: f.quantified, is_unsafe: f.is_unsafe, places: f.places })
+            let ret = transform(&cx, f.ret.get(&cx));
+            Type::Fn.(FnType.{ params, ret: Cell::new(&cx, ret), quantified: f.quantified, is_unsafe: f.is_unsafe, places: f.places })
         },
         _ => ty,
     }
@@ -207,126 +218,131 @@ fn map_children(ty: Type, transform: closure[Env](Type) -> Type) -> Type {
 //
 // `sub` maps type-variable names (written `Named(name)`) and brand labels (written
 // `Skolem(label)`) to types; a brand maps to a `Skolem`.
-fn subst(ty: Type, sub: Map[Text, Type], counter: Fresh) -> Type {
-    if sub.is_empty() {
+forall 'k.
+fn subst(&cx: Cx!['k], ty: Type['k], sub: Map[Text['k], Type['k], 'k], counter: Fresh['k]) -> Type['k] {
+    if sub.is_empty(&cx) {
         return ty;
     }
     match ty {
         Type::Named(name, args) => {
-            if args.is_empty() && sub.has(name) {
-                sub.at(name)
+            if args.is_empty(&cx) && sub.has(&cx, name) {
+                sub.at(&cx, name)
             } else {
-                map_children(ty, |child: Type| subst(child, sub, counter))
+                map_children(&cx, ty, |&cx, child: Type['k]| subst(&cx, child, sub, counter))
             }
         },
-        Type::Skolem(label) => sub.get_or(label, ty),
+        Type::Skolem(label) => sub.get_or(&cx, label, ty),
         Type::Exists(binders, body) => {
-            let (names, inner) = rebind(binders, sub, true, counter);
-            Type::Exists.(names, Cell::new(subst(body.get(), inner, counter)))
+            let (names, inner) = rebind(&cx, binders, sub, true, counter);
+            Type::Exists.(names, Cell::new(&cx, subst(&cx, body.get(&cx), inner, counter)))
         },
         Type::Foreach(f) => {
-            let (result, inner) = subst_foreach(f, sub, counter);
+            let (result, inner) = subst_foreach(&cx, f, sub, counter);
             Type::Foreach.(result)
         },
         Type::Fn(f) => {
-            let (names, inner) = rebind(param_names(f.quantified), sub, true, counter);
-            let params: Seq[Type] = Seq::new();
+            let (names, inner) = rebind(&cx, param_names(&cx, f.quantified), sub, true, counter);
+            let params: Seq[Type['k], 'k] = Seq::new(&cx);
             var i = 0usize;
-            while i < f.params.len() {
-                params.push(subst(f.params.get(i), inner, counter));
+            while i < f.params.len(&cx) {
+                params.push(&cx, subst(&cx, f.params.get(&cx, i), inner, counter));
                 i = i + 1usize;
             }
-            let ret = subst(f.ret.get(), inner, counter);
-            let quantified: Seq[Param] = Seq::new();
+            let ret = subst(&cx, f.ret.get(&cx), inner, counter);
+            let quantified: Seq[Param['k], 'k] = Seq::new(&cx);
             var j = 0usize;
-            while j < names.len() {
-                quantified.push(Param.{ name: names.get(j), kind: f.quantified.get(j).kind });
+            while j < names.len(&cx) {
+                quantified.push(&cx, Param.{ name: names.get(&cx, j), kind: f.quantified.get(&cx, j).kind });
                 j = j + 1usize;
             }
-            Type::Fn.(FnType.{ params, ret: Cell::new(ret), quantified, is_unsafe: f.is_unsafe, places: f.places })
+            Type::Fn.(FnType.{ params, ret: Cell::new(&cx, ret), quantified, is_unsafe: f.is_unsafe, places: f.places })
         },
-        _ => map_children(ty, |child: Type| subst(child, sub, counter)),
+        _ => map_children(&cx, ty, |&cx, child: Type['k]| subst(&cx, child, sub, counter)),
     }
 }
 
 // The binder prefix fixed when the transform was formed.
-fn foreach_binders(ty: ForeachType) -> Seq[Text] {
-    let out: Seq[Text] = Seq::one(ty.binder);
-    out.append(ty.retained);
+forall 'k.
+fn foreach_binders(&cx: Cx!['k], ty: ForeachType['k]) -> Seq[Text['k], 'k] {
+    let out: Seq[Text['k], 'k] = Seq::one(&cx, ty.binder);
+    out.append(&cx, ty.retained);
     out
 }
 
 // Abstract mapper input, using only the retained binders of this transform.
-fn foreach_item(ty: ForeachType) -> Type {
-    if !ty.retained.is_empty() {
-        let unit = match ty.source.get() {
+forall 'k.
+fn foreach_item(&cx: Cx!['k], ty: ForeachType['k]) -> Type['k] {
+    if !ty.retained.is_empty(&cx) {
+        let unit = match ty.source.get(&cx) {
             Type::Foreach(source) => {
-                return source.body.get();
+                return source.body.get(&cx);
             },
             _ => (),
         };
     }
-    let binder = C::named(ty.binder, Seq::new());
-    if ty.indirect { C::ptr(binder) } else { binder }
+    let binder = C::named(ty.binder, Seq::new(&cx));
+    if ty.indirect { C::ptr(&cx, binder) } else { binder }
 }
 
 // Transport retained binder renamings into each enclosing transform body.
-fn subst_foreach(ty: ForeachType, sub: Map[Text, Type], counter: Fresh) -> (ForeachType, Map[Text, Type]) {
-    let (source, retained) = match ty.source.get() {
+forall 'k.
+fn subst_foreach(&cx: Cx!['k], ty: ForeachType['k], sub: Map[Text['k], Type['k], 'k], counter: Fresh['k]) -> (ForeachType['k], Map[Text['k], Type['k], 'k]) {
+    let (source, retained) = match ty.source.get(&cx) {
         Type::Foreach(inner) => {
-            let (s, r) = subst_foreach(inner, sub, counter);
+            let (s, r) = subst_foreach(&cx, inner, sub, counter);
             (Type::Foreach.(s), r)
         },
-        _ => (subst(ty.source.get(), sub, counter), sub.copy()),
+        _ => (subst(&cx, ty.source.get(&cx), sub, counter), sub.copy(&cx)),
     };
-    let (binders, inner) = rebind(Seq::one(ty.binder), retained, false, counter);
-    let names: Seq[Text] = Seq::new();
+    let (binders, inner) = rebind(&cx, Seq::one(&cx, ty.binder), retained, false, counter);
+    let names: Seq[Text['k], 'k] = Seq::new(&cx);
     var i = 0usize;
-    while i < ty.retained.len() {
-        let b = ty.retained.get(i);
-        let name = match inner.get(b) {
+    while i < ty.retained.len(&cx) {
+        let b = ty.retained.get(&cx, i);
+        let name = match inner.get(&cx, b) {
             Option::Some(t) => match t {
                 Type::Named(n, _args) => n,
                 Type::Prim(n) => n,
-                _ => fail(text("internal error: a retained foreach binder renamed to a non-name")),
+                _ => fail(&cx, text(&cx, "internal error: a retained foreach binder renamed to a non-name")),
             },
             Option::None => b,
         };
-        names.push(name);
+        names.push(&cx, name);
         i = i + 1usize;
     }
-    let result = ForeachType.{ binder: binders.get(0usize), indirect: ty.indirect, source: Cell::new(source), body: Cell::new(subst(ty.body.get(), inner, counter)), retained: names };
+    let result = ForeachType.{ binder: binders.get(&cx, 0usize), indirect: ty.indirect, source: Cell::new(&cx, source), body: Cell::new(&cx, subst(&cx, ty.body.get(&cx), inner, counter)), retained: names };
     (result, inner)
 }
 
 // Drop `binders` from `sub`, renaming any a replacement would capture.
-fn rebind(binders: Seq[Text], sub: Map[Text, Type], brand: bool, counter: Fresh) -> (Seq[Text], Map[Text, Type]) {
-    let inner: Map[Text, Type] = Map::new();
-    let keys = sub.keys();
+forall 'k.
+fn rebind(&cx: Cx!['k], binders: Seq[Text['k], 'k], sub: Map[Text['k], Type['k], 'k], brand: bool, counter: Fresh['k]) -> (Seq[Text['k], 'k], Map[Text['k], Type['k], 'k]) {
+    let inner: Map[Text['k], Type['k], 'k] = Map::new(&cx);
+    let keys = sub.keys(&cx);
     var i = 0usize;
-    while i < keys.len() {
-        if !binders.has(keys.get(i)) {
-            inner.set(keys.get(i), sub.at(keys.get(i)));
+    while i < keys.len(&cx) {
+        if !binders.has(&cx, keys.get(&cx, i)) {
+            inner.set(&cx, keys.get(&cx, i), sub.at(&cx, keys.get(&cx, i)));
         }
         i = i + 1usize;
     }
-    let captured: Set[Text] = Set::new();
-    let values = inner.values();
+    let captured: Set[Text['k], 'k] = Set::new(&cx);
+    let values = inner.values(&cx);
     var j = 0usize;
-    while j < values.len() {
-        add_all(captured, free_names(values.get(j)));
+    while j < values.len(&cx) {
+        add_all(&cx, captured, free_names(&cx, values.get(&cx, j)));
         j = j + 1usize;
     }
-    let out: Seq[Text] = Seq::new();
+    let out: Seq[Text['k], 'k] = Seq::new(&cx);
     var k = 0usize;
-    while k < binders.len() {
-        let b = binders.get(k);
-        if captured.has(b) {
-            let new = fresh(b, counter);
-            inner.set(b, if brand { Type::Skolem.(new) } else { C::named(new, Seq::new()) });
-            out.push(new);
+    while k < binders.len(&cx) {
+        let b = binders.get(&cx, k);
+        if captured.has(&cx, b) {
+            let new = fresh(&cx, b, counter);
+            inner.set(&cx, b, if brand { Type::Skolem.(new) } else { C::named(new, Seq::new(&cx)) });
+            out.push(&cx, new);
         } else {
-            out.push(b);
+            out.push(&cx, b);
         }
         k = k + 1usize;
     }
@@ -335,76 +351,102 @@ fn rebind(binders: Seq[Text], sub: Map[Text, Type], brand: bool, counter: Fresh)
 
 // Free type-variable names and brand labels of `ty` (over-approximating nominal names as
 // variables, which only makes renaming more eager).
-fn free_names(ty: Type) -> Set[Text] {
-    let out: Set[Text] = Set::new();
-    free_names_in(ty, Set::new(), out);
+forall 'k.
+fn free_names(&cx: Cx!['k], ty: Type['k]) -> Set[Text['k], 'k] {
+    let out: Set[Text['k], 'k] = Set::new(&cx);
+    free_names_in(&cx, ty, Set::new(&cx), Option::None, out);
     out
 }
 
-fn free_names_in(ty: Type, bound: Set[Text], out: Set[Text]) {
+// Adds the names free in `ty` under `bound` to `out`, in the order they first occur; with `only`,
+// just the ones in it.
+forall 'k.
+fn free_names_in(&cx: Cx!['k], ty: Type['k], bound: Set[Text['k], 'k], only: Option[Set[Text['k], 'k]], out: Set[Text['k], 'k]) {
     match ty {
         Type::Named(name, args) => {
-            if args.is_empty() && !bound.has(name) {
-                out.add(name);
+            if args.is_empty(&cx) && !bound.has(&cx, name) {
+                add_name(&cx, name, only, out);
             }
-            var i = 0usize;
-            while i < args.len() {
-                free_names_in(args.get(i), bound, out);
-                i = i + 1usize;
-            }
+            free_names_all(&cx, args, bound, only, out);
         },
         Type::Skolem(label) => {
-            if !bound.has(label) {
-                out.add(label);
+            if !bound.has(&cx, label) {
+                add_name(&cx, label, only, out);
             }
         },
-        Type::Exists(binders, body) => free_names_in(body.get(), with_names(bound, binders), out),
+        Type::Exists(binders, body) => free_names_in(&cx, body.get(&cx), with_names(&cx, bound, binders), only, out),
         Type::Foreach(f) => {
-            free_names_in(f.source.get(), bound, out);
-            free_names_in(f.body.get(), with_names(bound, foreach_binders(f)), out);
+            free_names_in(&cx, f.source.get(&cx), bound, only, out);
+            free_names_in(&cx, f.body.get(&cx), with_names(&cx, bound, foreach_binders(&cx, f)), only, out);
         },
         Type::Fn(f) => {
-            let inner = with_names(bound, param_names(f.quantified));
-            free_names_in(f.ret.get(), inner, out);
-            var i = 0usize;
-            while i < f.params.len() {
-                free_names_in(f.params.get(i), inner, out);
-                i = i + 1usize;
-            }
+            let inner = with_names(&cx, bound, param_names(&cx, f.quantified));
+            free_names_in(&cx, f.ret.get(&cx), inner, only, out);
+            free_names_all(&cx, f.params, inner, only, out);
         },
-        _ => {
-            let parts = children(ty);
-            var i = 0usize;
-            while i < parts.len() {
-                free_names_in(parts.get(i), bound, out);
-                i = i + 1usize;
-            }
-        },
+        Type::Ptr(inner) => free_names_in(&cx, inner.get(&cx), bound, only, out),
+        Type::Brand(brand) => free_names_in(&cx, brand.get(&cx), bound, only, out),
+        Type::Array(elem, _length) => free_names_in(&cx, elem.get(&cx), bound, only, out),
+        Type::Tuple(elems) => free_names_all(&cx, elems, bound, only, out),
+        Type::Struct(fields) => free_names_members(&cx, fields, bound, only, out),
+        Type::Enum(variants) => free_names_members(&cx, variants, bound, only, out),
+        _ => (),
+    }
+}
+
+forall 'k.
+fn add_name(&cx: Cx!['k], name: Text['k], only: Option[Set[Text['k], 'k]], out: Set[Text['k], 'k]) {
+    let wanted = match only {
+        Option::Some(names) => names.has(&cx, name),
+        Option::None => true,
+    };
+    if wanted {
+        out.add(&cx, name);
+    }
+}
+
+forall 'k.
+fn free_names_all(&cx: Cx!['k], types: Seq[Type['k], 'k], bound: Set[Text['k], 'k], only: Option[Set[Text['k], 'k]], out: Set[Text['k], 'k]) {
+    var i = 0usize;
+    while i < types.len(&cx) {
+        free_names_in(&cx, types.get(&cx, i), bound, only, out);
+        i = i + 1usize;
+    }
+}
+
+forall 'k.
+fn free_names_members(&cx: Cx!['k], members: Seq[Member['k], 'k], bound: Set[Text['k], 'k], only: Option[Set[Text['k], 'k]], out: Set[Text['k], 'k]) {
+    var i = 0usize;
+    while i < members.len(&cx) {
+        free_names_in(&cx, members.get(&cx, i).type, bound, only, out);
+        i = i + 1usize;
     }
 }
 
 // Some brand label occurs in `ty`, free or bound. Unlike `free_brands`, this allocates nothing.
-fn mentions_brand(ty: Type) -> bool {
+forall 'k.
+fn mentions_brand(&cx: Cx!['k], ty: Type['k]) -> bool {
     match ty {
         Type::Skolem(_label) => true,
-        Type::Named(_name, args) => any_mentions_brand(args),
-        Type::Tuple(elems) => any_mentions_brand(elems),
-        Type::Struct(fields) => members_mention_brand(fields),
-        Type::Enum(variants) => members_mention_brand(variants),
-        Type::Array(elem, _length) => mentions_brand(elem.get()),
-        Type::Ptr(inner) => mentions_brand(inner.get()),
-        Type::Brand(brand) => mentions_brand(brand.get()),
-        Type::Exists(_binders, body) => mentions_brand(body.get()),
-        Type::Foreach(f) => mentions_brand(f.source.get()) || mentions_brand(f.body.get()),
-        Type::Fn(f) => any_mentions_brand(f.params) || mentions_brand(f.ret.get()),
+        Type::Named(_name, args) => any_mentions_brand(&cx, args),
+        Type::Tuple(elems) => any_mentions_brand(&cx, elems),
+        Type::Struct(fields) => members_mention_brand(&cx, fields),
+        Type::Enum(variants) => members_mention_brand(&cx, variants),
+        Type::Array(elem, _length) => mentions_brand(&cx, elem.get(&cx)),
+        Type::Ptr(inner) => mentions_brand(&cx, inner.get(&cx)),
+        Type::Brand(brand) => mentions_brand(&cx, brand.get(&cx)),
+        Type::Exists(_binders, body) => mentions_brand(&cx, body.get(&cx)),
+        Type::Foreach(f) => mentions_brand(&cx, f.source.get(&cx)) || mentions_brand(&cx, f.body.get(&cx)),
+        Type::Fn(f) => any_mentions_brand(&cx, f.params) || mentions_brand(&cx, f.ret.get(&cx)),
         _ => false,
     }
 }
 
-fn any_mentions_brand(types: Seq[Type]) -> bool {
+forall 'k.
+fn any_mentions_brand(&cx: Cx!['k], types: Seq[Type['k], 'k]) -> bool {
     var i = 0usize;
-    while i < types.len() {
-        if mentions_brand(types.get(i)) {
+    while i < types.len(&cx) {
+        if mentions_brand(&cx, types.get(&cx, i)) {
             return true;
         }
         i = i + 1usize;
@@ -412,10 +454,11 @@ fn any_mentions_brand(types: Seq[Type]) -> bool {
     false
 }
 
-fn members_mention_brand(members: Seq[Member]) -> bool {
+forall 'k.
+fn members_mention_brand(&cx: Cx!['k], members: Seq[Member['k], 'k]) -> bool {
     var i = 0usize;
-    while i < members.len() {
-        if mentions_brand(members.get(i).type) {
+    while i < members.len(&cx) {
+        if mentions_brand(&cx, members.get(&cx, i).type) {
             return true;
         }
         i = i + 1usize;
@@ -423,105 +466,133 @@ fn members_mention_brand(members: Seq[Member]) -> bool {
     false
 }
 
-fn free_brands(ty: Type) -> Set[Text] {
-    if !mentions_brand(ty) {
-        return Set::new();
+forall 'k.
+fn free_brands(&cx: Cx!['k], ty: Type['k]) -> Set[Text['k], 'k] {
+    let out: Set[Text['k], 'k] = Set::new(&cx);
+    if !mentions_brand(&cx, ty) {
+        return out;
     }
-    let found: Set[Text] = Set::new();
-    skolems(ty, found);
-    let free = free_names(ty).items();
-    let out: Set[Text] = Set::new();
-    var i = 0usize;
-    while i < free.len() {
-        if found.has(free.get(i)) {
-            out.add(free.get(i));
-        }
-        i = i + 1usize;
-    }
+    let found: Set[Text['k], 'k] = Set::new(&cx);
+    skolems(&cx, ty, found);
+    free_names_in(&cx, ty, Set::new(&cx), Option::Some.(found), out);
     out
 }
 
-fn skolems(part: Type, found: Set[Text]) {
-    let unit = match part {
-        Type::Skolem(label) => found.add(label),
+// Adds every brand label in `part`, free or bound, to `found`.
+forall 'k.
+fn skolems(&cx: Cx!['k], part: Type['k], found: Set[Text['k], 'k]) {
+    match part {
+        Type::Skolem(label) => found.add(&cx, label),
+        Type::Named(_name, args) => skolems_all(&cx, args, found),
+        Type::Tuple(elems) => skolems_all(&cx, elems, found),
+        Type::Struct(fields) => skolems_members(&cx, fields, found),
+        Type::Enum(variants) => skolems_members(&cx, variants, found),
+        Type::Array(elem, _length) => skolems(&cx, elem.get(&cx), found),
+        Type::Ptr(inner) => skolems(&cx, inner.get(&cx), found),
+        Type::Brand(brand) => skolems(&cx, brand.get(&cx), found),
+        Type::Exists(_binders, body) => skolems(&cx, body.get(&cx), found),
+        Type::Foreach(f) => {
+            skolems(&cx, f.source.get(&cx), found);
+            skolems(&cx, f.body.get(&cx), found);
+        },
+        Type::Fn(f) => {
+            skolems_all(&cx, f.params, found);
+            skolems(&cx, f.ret.get(&cx), found);
+        },
         _ => (),
-    };
-    let parts = children(part);
+    }
+}
+
+forall 'k.
+fn skolems_all(&cx: Cx!['k], types: Seq[Type['k], 'k], found: Set[Text['k], 'k]) {
     var i = 0usize;
-    while i < parts.len() {
-        skolems(parts.get(i), found);
+    while i < types.len(&cx) {
+        skolems(&cx, types.get(&cx, i), found);
         i = i + 1usize;
     }
 }
 
-fn children(ty: Type) -> Seq[Type] {
-    match ty {
-        Type::Ptr(inner) => Seq::one(inner.get()),
-        Type::Brand(brand) => Seq::one(brand.get()),
-        Type::Array(elem, _length) => Seq::one(elem.get()),
-        Type::Tuple(elems) => elems,
-        Type::Struct(fields) => member_types(fields),
-        Type::Enum(variants) => member_types(variants),
-        Type::Named(_name, args) => args,
-        Type::Exists(_binders, body) => Seq::one(body.get()),
-        Type::Foreach(f) => Seq::two(f.source.get(), f.body.get()),
-        Type::Fn(f) => {
-            let out = f.params.copy();
-            out.push(f.ret.get());
-            out
-        },
-        _ => Seq::new(),
+forall 'k.
+fn skolems_members(&cx: Cx!['k], members: Seq[Member['k], 'k], found: Set[Text['k], 'k]) {
+    var i = 0usize;
+    while i < members.len(&cx) {
+        skolems(&cx, members.get(&cx, i).type, found);
+        i = i + 1usize;
     }
 }
 
-fn member_types(members: Seq[Member]) -> Seq[Type] {
-    let out: Seq[Type] = Seq::new();
+forall 'k.
+fn children(&cx: Cx!['k], ty: Type['k]) -> Seq[Type['k], 'k] {
+    match ty {
+        Type::Ptr(inner) => Seq::one(&cx, inner.get(&cx)),
+        Type::Brand(brand) => Seq::one(&cx, brand.get(&cx)),
+        Type::Array(elem, _length) => Seq::one(&cx, elem.get(&cx)),
+        Type::Tuple(elems) => elems,
+        Type::Struct(fields) => member_types(&cx, fields),
+        Type::Enum(variants) => member_types(&cx, variants),
+        Type::Named(_name, args) => args,
+        Type::Exists(_binders, body) => Seq::one(&cx, body.get(&cx)),
+        Type::Foreach(f) => Seq::two(&cx, f.source.get(&cx), f.body.get(&cx)),
+        Type::Fn(f) => {
+            let out = f.params.copy(&cx);
+            out.push(&cx, f.ret.get(&cx));
+            out
+        },
+        _ => Seq::new(&cx),
+    }
+}
+
+forall 'k.
+fn member_types(&cx: Cx!['k], members: Seq[Member['k], 'k]) -> Seq[Type['k], 'k] {
+    let out: Seq[Type['k], 'k] = Seq::new(&cx);
     var i = 0usize;
-    while i < members.len() {
-        out.push(members.get(i).type);
+    while i < members.len(&cx) {
+        out.push(&cx, members.get(&cx, i).type);
         i = i + 1usize;
     }
     out
 }
 
 // Free names reachable by matching without crossing a type binder.
-fn extractable_names(ty: Type) -> Set[Text] {
-    let out: Set[Text] = Set::new();
-    extractable_in(ty, out);
+forall 'k.
+fn extractable_names(&cx: Cx!['k], ty: Type['k]) -> Set[Text['k], 'k] {
+    let out: Set[Text['k], 'k] = Set::new(&cx);
+    extractable_in(&cx, ty, out);
     out
 }
 
-fn extractable_in(ty: Type, out: Set[Text]) {
+forall 'k.
+fn extractable_in(&cx: Cx!['k], ty: Type['k], out: Set[Text['k], 'k]) {
     match ty {
         Type::Exists(_binders, _body) => (),
-        Type::Foreach(f) => extractable_in(f.source.get(), out),
+        Type::Foreach(f) => extractable_in(&cx, f.source.get(&cx), out),
         Type::Fn(f) => {
-            if f.quantified.is_empty() {
-                let parts = children(ty);
+            if f.quantified.is_empty(&cx) {
+                let parts = children(&cx, ty);
                 var i = 0usize;
-                while i < parts.len() {
-                    extractable_in(parts.get(i), out);
+                while i < parts.len(&cx) {
+                    extractable_in(&cx, parts.get(&cx, i), out);
                     i = i + 1usize;
                 }
             }
         },
         Type::Named(name, args) => {
-            if args.is_empty() {
-                out.add(name);
+            if args.is_empty(&cx) {
+                out.add(&cx, name);
             } else {
                 var i = 0usize;
-                while i < args.len() {
-                    extractable_in(args.get(i), out);
+                while i < args.len(&cx) {
+                    extractable_in(&cx, args.get(&cx, i), out);
                     i = i + 1usize;
                 }
             }
         },
-        Type::Skolem(label) => out.add(label),
+        Type::Skolem(label) => out.add(&cx, label),
         _ => {
-            let parts = children(ty);
+            let parts = children(&cx, ty);
             var i = 0usize;
-            while i < parts.len() {
-                extractable_in(parts.get(i), out);
+            while i < parts.len(&cx) {
+                extractable_in(&cx, parts.get(&cx, i), out);
                 i = i + 1usize;
             }
         },
@@ -529,18 +600,20 @@ fn extractable_in(ty: Type, out: Set[Text]) {
 }
 
 // `ty` and every type inside it, parents first.
-fn walk(ty: Type) -> Seq[Type] {
-    let out: Seq[Type] = Seq::new();
-    walk_into(ty, out);
+forall 'k.
+fn walk(&cx: Cx!['k], ty: Type['k]) -> Seq[Type['k], 'k] {
+    let out: Seq[Type['k], 'k] = Seq::new(&cx);
+    walk_into(&cx, ty, out);
     out
 }
 
-fn walk_into(ty: Type, out: Seq[Type]) {
-    out.push(ty);
-    let parts = children(ty);
+forall 'k.
+fn walk_into(&cx: Cx!['k], ty: Type['k], out: Seq[Type['k], 'k]) {
+    out.push(&cx, ty);
+    let parts = children(&cx, ty);
     var i = 0usize;
-    while i < parts.len() {
-        walk_into(parts.get(i), out);
+    while i < parts.len(&cx) {
+        walk_into(&cx, parts.get(&cx, i), out);
         i = i + 1usize;
     }
 }
@@ -548,200 +621,240 @@ fn walk_into(ty: Type, out: Seq[Type]) {
 // ---------------------------------------------------------------- equality --
 
 // The names bound on each side of an equality, each to a mark shared by the binder it pairs
-// with. Each side has its own scope: a name on the left may also occur on the right.
+// with. Each side has its own scope: a name on the left may also occur on the right. None until
+// the first binder, so comparing types without binders allocates nothing.
+forall 'k.
 exposed struct Alpha {
-    left: Map[Text, u64],
-    right: Map[Text, u64],
-    marks: Cell[u64],
+    scopes: Option[Scopes['k]],
 }
 
-fn alpha() -> Alpha {
-    Alpha.{ left: Map::new(), right: Map::new(), marks: Cell::new(0u64) }
+forall 'k.
+exposed struct Scopes {
+    left: Map[Text['k], u64, 'k],
+    right: Map[Text['k], u64, 'k],
+    marks: Cell[u64, 'k],
+}
+
+forall 'k.
+fn alpha() -> Alpha['k] {
+    Alpha.{ scopes: Option::None }
+}
+
+// Whether `x` is bound on the left or `y` on the right.
+forall 'k.
+fn binds(&cx: Cx!['k], env: Alpha['k], x: Text['k], y: Text['k]) -> bool {
+    match env.scopes {
+        Option::Some(s) => s.left.has(&cx, x) || s.right.has(&cx, y),
+        Option::None => false,
+    }
 }
 
 // `left.get(x, x) == right.get(y, y)`: two bound names with the same mark, or the same free name.
-fn same_name(env: Alpha, x: Text, y: Text) -> bool {
-    match env.left.get(x) {
-        Option::Some(m) => match env.right.get(y) {
+forall 'k.
+fn same_name(&cx: Cx!['k], env: Alpha['k], x: Text['k], y: Text['k]) -> bool {
+    let env = match env.scopes {
+        Option::Some(s) => s,
+        Option::None => return x.eq(&cx, y),
+    };
+    match env.left.get(&cx, x) {
+        Option::Some(m) => match env.right.get(&cx, y) {
             Option::Some(n) => m == n,
             Option::None => false,
         },
-        Option::None => match env.right.get(y) {
+        Option::None => match env.right.get(&cx, y) {
             Option::Some(_n) => false,
-            Option::None => x.eq(y),
+            Option::None => x.eq(&cx, y),
         },
     }
 }
 
-fn bind(env: Alpha, left: Seq[Text], right: Seq[Text]) -> Alpha {
-    let a = env.left.copy();
-    let b = env.right.copy();
+forall 'k.
+fn bind(&cx: Cx!['k], env: Alpha['k], left: Seq[Text['k], 'k], right: Seq[Text['k], 'k]) -> Alpha['k] {
+    let env = match env.scopes {
+        Option::Some(s) => s,
+        Option::None => Scopes.{ left: Map::new(&cx), right: Map::new(&cx), marks: Cell::new(&cx, 0u64) },
+    };
+    let a = env.left.copy(&cx);
+    let b = env.right.copy(&cx);
     var i = 0usize;
-    while i < left.len() && i < right.len() {
-        let mark = env.marks.get() + 1u64;
-        env.marks.set(mark);
-        a.set(left.get(i), mark);
-        b.set(right.get(i), mark);
+    while i < left.len(&cx) && i < right.len(&cx) {
+        let mark = env.marks.get(&cx) + 1u64;
+        env.marks.set(&cx, mark);
+        a.set(&cx, left.get(&cx, i), mark);
+        b.set(&cx, right.get(&cx, i), mark);
         i = i + 1usize;
     }
-    Alpha.{ left: a, right: b, marks: env.marks }
+    Alpha.{ scopes: Option::Some.(Scopes.{ left: a, right: b, marks: env.marks }) }
 }
 
 // Nominal/structural equality modulo renaming of bound names.
-fn equal(a: Type, b: Type) -> bool {
-    equal_in(a, b, alpha())
+forall 'k.
+fn equal(&cx: Cx!['k], a: Type['k], b: Type['k]) -> bool {
+    equal_in(&cx, a, b, alpha())
 }
 
-fn equal_all(xs: Seq[Type], ys: Seq[Type], env: Alpha) -> bool {
-    var ok = xs.len() == ys.len();
+forall 'k.
+fn equal_all(&cx: Cx!['k], xs: Seq[Type['k], 'k], ys: Seq[Type['k], 'k], env: Alpha['k]) -> bool {
+    var ok = xs.len(&cx) == ys.len(&cx);
     var i = 0usize;
-    while ok && i < xs.len() {
-        ok = equal_in(xs.get(i), ys.get(i), env);
+    while ok && i < xs.len(&cx) {
+        ok = equal_in(&cx, xs.get(&cx, i), ys.get(&cx, i), env);
         i = i + 1usize;
     }
     ok
 }
 
-fn equal_members(xs: Seq[Member], ys: Seq[Member], env: Alpha) -> bool {
-    var ok = xs.len() == ys.len();
+forall 'k.
+fn equal_members(&cx: Cx!['k], xs: Seq[Member['k], 'k], ys: Seq[Member['k], 'k], env: Alpha['k]) -> bool {
+    var ok = xs.len(&cx) == ys.len(&cx);
     var i = 0usize;
-    while ok && i < xs.len() {
-        ok = xs.get(i).name.eq(ys.get(i).name) && equal_in(xs.get(i).type, ys.get(i).type, env);
+    while ok && i < xs.len(&cx) {
+        ok = xs.get(&cx, i).name.eq(&cx, ys.get(&cx, i).name) && equal_in(&cx, xs.get(&cx, i).type, ys.get(&cx, i).type, env);
         i = i + 1usize;
     }
     ok
 }
 
-fn equal_in(a: Type, b: Type, env: Alpha) -> bool {
+forall 'k.
+fn equal_in(&cx: Cx!['k], a: Type['k], b: Type['k], env: Alpha['k]) -> bool {
     if type_tag(a) != type_tag(b) {
         return false;
     }
     match a {
         Type::Skolem(x) => match b {
-            Type::Skolem(y) => same_name(env, x, y),
+            Type::Skolem(y) => same_name(&cx, env, x, y),
             _ => false,
         },
         Type::Named(x, xs) => match b {
             Type::Named(y, ys) => {
-                if xs.is_empty() && ys.is_empty() && (env.left.has(x) || env.right.has(y)) {
-                    same_name(env, x, y)
+                if xs.is_empty(&cx) && ys.is_empty(&cx) && binds(&cx, env, x, y) {
+                    same_name(&cx, env, x, y)
                 } else {
-                    x.eq(y) && equal_all(xs, ys, env)
+                    x.eq(&cx, y) && equal_all(&cx, xs, ys, env)
                 }
             },
             _ => false,
         },
         Type::Exists(xs, p) => match b {
-            Type::Exists(ys, q) => xs.len() == ys.len() && equal_in(p.get(), q.get(), bind(env, xs, ys)),
+            Type::Exists(ys, q) => xs.len(&cx) == ys.len(&cx) && equal_in(&cx, p.get(&cx), q.get(&cx), bind(&cx, env, xs, ys)),
             _ => false,
         },
         Type::Foreach(x) => match b {
             Type::Foreach(y) => {
-                let xb = foreach_binders(x);
-                let yb = foreach_binders(y);
-                x.indirect == y.indirect && equal_in(x.source.get(), y.source.get(), env) && xb.len() == yb.len()
-                    && equal_in(x.body.get(), y.body.get(), bind(env, xb, yb))
+                let xb = foreach_binders(&cx, x);
+                let yb = foreach_binders(&cx, y);
+                x.indirect == y.indirect && equal_in(&cx, x.source.get(&cx), y.source.get(&cx), env) && xb.len(&cx) == yb.len(&cx)
+                    && equal_in(&cx, x.body.get(&cx), y.body.get(&cx), bind(&cx, env, xb, yb))
             },
             _ => false,
         },
         Type::Fn(x) => match b {
             Type::Fn(y) => {
-                if x.is_unsafe != y.is_unsafe || !x.places.same(y.places) || x.params.len() != y.params.len()
-                    || x.quantified.len() != y.quantified.len() || !same_kinds(x.quantified, y.quantified) {
+                if x.is_unsafe != y.is_unsafe || !x.places.same(&cx, y.places) || x.params.len(&cx) != y.params.len(&cx)
+                    || x.quantified.len(&cx) != y.quantified.len(&cx) || !same_kinds(&cx, x.quantified, y.quantified) {
                     return false;
                 }
-                let inner = bind(env, param_names(x.quantified), param_names(y.quantified));
-                equal_in(x.ret.get(), y.ret.get(), inner) && equal_all(x.params, y.params, inner)
+                let inner = bind(&cx, env, param_names(&cx, x.quantified), param_names(&cx, y.quantified));
+                equal_in(&cx, x.ret.get(&cx), y.ret.get(&cx), inner) && equal_all(&cx, x.params, y.params, inner)
             },
             _ => false,
         },
         Type::Struct(xs) => match b {
-            Type::Struct(ys) => equal_members(xs, ys, env),
+            Type::Struct(ys) => equal_members(&cx, xs, ys, env),
             _ => false,
         },
         Type::Enum(xs) => match b {
-            Type::Enum(ys) => equal_members(xs, ys, env),
+            Type::Enum(ys) => equal_members(&cx, xs, ys, env),
             _ => false,
         },
         Type::Array(x, n) => match b {
-            Type::Array(y, m) => n == m && equal_in(x.get(), y.get(), env),
+            Type::Array(y, m) => n == m && equal_in(&cx, x.get(&cx), y.get(&cx), env),
             _ => false,
         },
         Type::Tuple(xs) => match b {
-            Type::Tuple(ys) => equal_all(xs, ys, env),
+            Type::Tuple(ys) => equal_all(&cx, xs, ys, env),
             _ => false,
         },
-        Type::Ptr(_x) => equal_in(children(a).get(0usize), children(b).get(0usize), env),
-        Type::Brand(_x) => equal_in(children(a).get(0usize), children(b).get(0usize), env),
-        _ => C::same(a, b),
+        Type::Ptr(_x) => equal_in(&cx, children(&cx, a).get(&cx, 0usize), children(&cx, b).get(&cx, 0usize), env),
+        Type::Brand(_x) => equal_in(&cx, children(&cx, a).get(&cx, 0usize), children(&cx, b).get(&cx, 0usize), env),
+        _ => C::same(&cx, a, b),
     }
 }
 
 // The parameters have the same kinds, in order.
-fn same_kinds(a: Seq[Param], b: Seq[Param]) -> bool {
-    var ok = a.len() == b.len();
+forall 'k.
+fn same_kinds(&cx: Cx!['k], a: Seq[Param['k], 'k], b: Seq[Param['k], 'k]) -> bool {
+    var ok = a.len(&cx) == b.len(&cx);
     var i = 0usize;
-    while ok && i < a.len() {
-        ok = C::same_kind(a.get(i).kind, b.get(i).kind);
+    while ok && i < a.len(&cx) {
+        ok = C::same_kind(a.get(&cx, i).kind, b.get(&cx, i).kind);
         i = i + 1usize;
     }
     ok
 }
 
 // A value of type `a` may go where `b` is expected.
-fn fits(a: Type, b: Type) -> bool {
+forall 'k.
+fn fits(&cx: Cx!['k], a: Type['k], b: Type['k]) -> bool {
     match a {
         Type::Never => true,
-        _ => equal(a, b),
+        _ => equal(&cx, a, b),
     }
 }
 
 // --------------------------------------------------------- foreach rows --
 
 // One component of a foreach source: its label, item type, and retained bindings.
+forall 'k.
 exposed struct Row {
-    label: Text,
-    item: Type,
-    extra: Map[Text, Type],
+    label: Text['k],
+    item: Type['k],
+    extra: Map[Text['k], Type['k], 'k],
 }
 
 // A foreach source's outer skeleton (a structural type, or none for a leaf) and its rows.
+forall 'k.
 exposed struct Rows {
-    skeleton: Option[Type],
-    rows: Seq[Row],
+    skeleton: Option[Type['k]],
+    rows: Seq[Row['k], 'k],
 }
 
 // ------------------------------------------------------------------ Types --
 
 // Declaration-aware queries over one program.
+forall 'k.
 exposed struct Types {
-    program: Program,
+    program: Program['k],
     // (type, its parameters' kinds sorted by name) -> whether it is Copy
-    copy_cache: Map[(Type, Seq[(Text, u32)]), bool],
-    counter: Fresh,
+    copy_cache: Map[(Type['k], Seq[(Text['k], u32), 'k]), bool, 'k],
+    // a nominal type -> its unfolding, when making it renamed no binder
+    unfolded: Map[Type['k], Type['k], 'k],
+    counter: Fresh['k],
 }
 
-fn name_before(a: (Text, u32), b: (Text, u32)) -> bool {
+forall 'k.
+fn name_before(&cx: Cx!['k], a: (Text['k], u32), b: (Text['k], u32)) -> bool {
     let (x, _k) = a;
     let (y, _l) = b;
-    x.compare(y) < 0
+    x.compare(&cx, y) < 0
 }
 
-impl Types {
-    fn new(program: Program, counter: Fresh) -> Types {
-        Types.{ program, copy_cache: Map::new(), counter }
+forall 'k.
+impl Types['k] {
+    fn new(&cx: Cx!['k], program: Program['k], counter: Fresh['k]) -> Types['k] {
+        Types.{ program, copy_cache: Map::new(&cx), unfolded: Map::new(&cx), counter }
     }
 
-    fn decl(self, name: Text) -> TypeDecl {
-        match self.program.types.get(name) {
+    fn decl(self, &cx: Cx!['k], name: Text['k]) -> TypeDecl['k] {
+        match self.program.types.get(&cx, name) {
             Option::Some(decl) => decl,
-            Option::None => kurs_error(Out::new().put("unknown type ").add(name).done(), no_pos()),
+            Option::None => kurs_error(&cx, Out::new(&cx).put(&cx, "unknown type ").add(&cx, name).done(&cx), no_pos()),
         }
     }
 
     // `ty` has no bytes of its own: unit-like products, empty arrays, brand witnesses, Never. A
     // type parameter is answered when it is instantiated.
-    fn zero_size(self, ty: Type) -> bool {
+    fn zero_size(self, &cx: Cx!['k], ty: Type['k]) -> bool {
         let unit = match ty {
             Type::Brand(_b) => {
                 return true;
@@ -750,18 +863,18 @@ impl Types {
                 return true;
             },
             Type::Named(name, args) => {
-                if args.is_empty() && !self.program.types.has(name) {
+                if args.is_empty(&cx) && !self.program.types.has(&cx, name) {
                     return false;
                 }
             },
             _ => (),
         };
-        match self.shape(ty, Option::None) {
+        match self.shape(&cx, ty, Option::None) {
             Type::Tuple(elems) => {
                 var all = true;
                 var i = 0usize;
-                while all && i < elems.len() {
-                    all = self.zero_size(elems.get(i));
+                while all && i < elems.len(&cx) {
+                    all = self.zero_size(&cx, elems.get(&cx, i));
                     i = i + 1usize;
                 }
                 all
@@ -769,14 +882,14 @@ impl Types {
             Type::Struct(fields) => {
                 var all = true;
                 var i = 0usize;
-                while all && i < fields.len() {
-                    all = self.zero_size(fields.get(i).type);
+                while all && i < fields.len(&cx) {
+                    all = self.zero_size(&cx, fields.get(&cx, i).type);
                     i = i + 1usize;
                 }
                 all
             },
-            Type::Array(elem, length) => length == 0u64 || self.zero_size(elem.get()),
-            Type::Exists(_binders, body) => self.zero_size(body.get()),
+            Type::Array(elem, length) => length == 0u64 || self.zero_size(&cx, elem.get(&cx)),
+            Type::Exists(_binders, body) => self.zero_size(&cx, body.get(&cx)),
             _ => false,
         }
     }
@@ -784,35 +897,46 @@ impl Types {
     // One nominal step: the declaration's body at its arguments.
     //
     // With `home` given, the declaration must expose its shape there.
-    fn unfold(self, ty: Type, home: Option[ModuleId]) -> Type {
+    fn unfold(self, &cx: Cx!['k], ty: Type['k], home: Option[ModuleId['k]]) -> Type['k] {
         let (name, args) = match ty {
             Type::Named(name, args) => (name, args),
-            _ => fail(text("internal error: unfold of a type that is not nominal")),
+            _ => fail(&cx, text(&cx, "internal error: unfold of a type that is not nominal")),
         };
-        let decl = self.decl(name);
-        if args.len() != decl.params.len() {
-            kurs_error(Out::new().add(name).put(" takes ").usize(decl.params.len()).put(" type arguments").done(), no_pos());
+        let decl = self.decl(&cx, name);
+        if args.len(&cx) != decl.params.len(&cx) {
+            kurs_error(&cx, Out::new(&cx).add(&cx, name).put(&cx, " takes ").usize(&cx, decl.params.len(&cx)).put(&cx, " type arguments").done(&cx), no_pos());
         }
-        if !self.is_exposed(decl, home) {
-            kurs_error(Out::new().put("the shape of ").add(name).put(" is not exposed here").done(), no_pos());
+        if !self.is_exposed(&cx, decl, home) {
+            kurs_error(&cx, Out::new(&cx).put(&cx, "the shape of ").add(&cx, name).put(&cx, " is not exposed here").done(&cx), no_pos());
         }
-        let sub: Map[Text, Type] = Map::new();
+        match self.unfolded.get(&cx, ty) {
+            Option::Some(body) => return body,
+            Option::None => (),
+        }
+        let sub: Map[Text['k], Type['k], 'k] = Map::new(&cx);
         var i = 0usize;
-        while i < decl.params.len() {
-            sub.set(decl.params.get(i).name, args.get(i));
+        while i < decl.params.len(&cx) {
+            sub.set(&cx, decl.params.get(&cx, i).name, args.get(&cx, i));
             i = i + 1usize;
         }
-        subst(decl.body, sub, self.counter)
+        // An unfolding that drew a fresh name is made again each time, so that every unfolding
+        // draws the names it would have.
+        let before = self.counter.next.get(&cx);
+        let body = subst(&cx, decl.body, sub, self.counter);
+        if self.counter.next.get(&cx) == before {
+            self.unfolded.set(&cx, ty, body);
+        }
+        body
     }
 
-    fn is_exposed(self, decl: TypeDecl, home: Option[ModuleId]) -> bool {
+    fn is_exposed(self, &cx: Cx!['k], decl: TypeDecl['k], home: Option[ModuleId['k]]) -> bool {
         match decl.exposure {
             Option::None => true,
             Option::Some(exposure) => match home {
                 Option::None => true,
                 Option::Some(m) => match exposure.mode {
-                    ExposureMode::Owner => Key::key_same(m, exposure.home),
-                    ExposureMode::Within => m.within(exposure.home),
+                    ExposureMode::Owner => key_same(&cx, m, exposure.home),
+                    ExposureMode::Within => m.within(&cx, exposure.home),
                 },
             },
         }
@@ -823,26 +947,26 @@ impl Types {
     // Authority is not recursive field exposure. A derived foreach source cannot borrow an
     // assumption about its underlying source; it needs its own exact assumption or a concretely
     // visible shape.
-    fn exposure_available(self, source: Type, home: Option[ModuleId], kinds: Map[Text, Kind], premises: Seq[Premise]) -> bool {
+    fn exposure_available(self, &cx: Cx!['k], source: Type['k], home: Option[ModuleId['k]], kinds: Map[Text['k], Kind, 'k], premises: Seq[Premise['k], 'k]) -> bool {
         var i = 0usize;
-        while i < premises.len() {
-            let p = premises.get(i);
-            if p.trait_name.is("builtin::Exposed") && p.args.len() == 1usize && equal(p.args.get(0usize), source) {
+        while i < premises.len(&cx) {
+            let p = premises.get(&cx, i);
+            if p.trait_name.is(&cx, "builtin::Exposed") && p.args.len(&cx) == 1usize && equal(&cx, p.args.get(&cx, 0usize), source) {
                 return true;
             }
             i = i + 1usize;
         }
-        self.concrete_exposure(source, home, kinds)
+        self.concrete_exposure(&cx, source, home, kinds)
     }
 
-    fn concrete_exposure(self, source: Type, home: Option[ModuleId], kinds: Map[Text, Kind]) -> bool {
-        match self.visible_shape(source, home, kinds) {
+    fn concrete_exposure(self, &cx: Cx!['k], source: Type['k], home: Option[ModuleId['k]], kinds: Map[Text['k], Kind, 'k]) -> bool {
+        match self.visible_shape(&cx, source, home, kinds) {
             Option::None => false,
             Option::Some(shape) => match shape {
                 Type::Ptr(inner) => {
                     // An indirect traversal requires an explicit outer pointer.
                     match source {
-                        Type::Ptr(_s) => match self.visible_shape(inner.get(), home, kinds) {
+                        Type::Ptr(_s) => match self.visible_shape(&cx, inner.get(&cx), home, kinds) {
                             Option::None => false,
                             Option::Some(t) => match t {
                                 Type::Enum(_v) => false,
@@ -858,25 +982,25 @@ impl Types {
     }
 
     // Reveal only the outer shape, without treating abstract types as leaves.
-    fn visible_shape(self, ty: Type, home: Option[ModuleId], kinds: Map[Text, Kind]) -> Option[Type] {
+    fn visible_shape(self, &cx: Cx!['k], ty: Type['k], home: Option[ModuleId['k]], kinds: Map[Text['k], Kind, 'k]) -> Option[Type['k]] {
         var ty = ty;
         while true {
             match ty {
                 Type::Named(name, _args) => {
-                    if kinds.has(name) {
+                    if kinds.has(&cx, name) {
                         return Option::None;
                     }
-                    let decl = self.decl(name);
-                    if decl.exposure.is_some() && (home.is_none() || !self.is_exposed(decl, home)) {
+                    let decl = self.decl(&cx, name);
+                    if decl.exposure.is_some() && (home.is_none() || !self.is_exposed(&cx, decl, home)) {
                         return Option::None;
                     }
-                    ty = self.unfold(ty, home);
+                    ty = self.unfold(&cx, ty, home);
                 },
                 Type::Foreach(f) => {
-                    if !self.concrete_exposure(f.source.get(), home, kinds) {
+                    if !self.concrete_exposure(&cx, f.source.get(&cx), home, kinds) {
                         return Option::None;
                     }
-                    ty = self.expand(f, home);
+                    ty = self.expand(&cx, f, home);
                 },
                 _ => {
                     return Option::Some.(ty);
@@ -887,15 +1011,15 @@ impl Types {
     }
 
     // The outer structural type of `ty` (Named unfolded, foreach expanded).
-    fn shape(self, ty: Type, home: Option[ModuleId]) -> Type {
+    fn shape(self, &cx: Cx!['k], ty: Type['k], home: Option[ModuleId['k]]) -> Type['k] {
         var ty = ty;
         while true {
             match ty {
                 Type::Named(_name, _args) => {
-                    ty = self.unfold(ty, home);
+                    ty = self.unfold(&cx, ty, home);
                 },
                 Type::Foreach(f) => {
-                    ty = self.expand(f, home);
+                    ty = self.expand(&cx, f, home);
                 },
                 _ => {
                     return ty;
@@ -905,7 +1029,7 @@ impl Types {
         ty
     }
 
-    fn is_copy(self, ty: Type, kinds: Map[Text, Kind]) -> bool {
+    fn is_copy(self, &cx: Cx!['k], ty: Type['k], kinds: Map[Text['k], Kind, 'k]) -> bool {
         match ty {
             Type::Prim(_n) => true,
             Type::Ptr(_i) => true,
@@ -914,37 +1038,37 @@ impl Types {
             Type::Never => true,
             Type::Ignored => true,
             Type::Named(name, args) => {
-                if args.is_empty() && kinds.has(name) {
-                    return C::same_kind(kinds.at(name), Kind::Copy);
+                if args.is_empty(&cx) && kinds.has(&cx, name) {
+                    return C::same_kind(kinds.at(&cx, name), Kind::Copy);
                 }
-                if self.decl(name).linear {
+                if self.decl(&cx, name).linear {
                     return false;
                 }
                 // Whether `T` is Copy changes the answer for `Node[T]`.
-                let key = (ty, sorted_kinds(kinds));
-                if !self.copy_cache.has(key) {
+                let key = (ty, sorted_kinds(&cx, kinds));
+                if !self.copy_cache.has(&cx, key) {
                     // An active nominal Copy query cannot justify itself. A valid recursive type
                     // reaches a pointer, function, or zero-length array before demanding the
                     // same query.
-                    self.copy_cache.set(key, false);
-                    let answer = self.is_copy(self.unfold(ty, Option::None), kinds);
-                    self.copy_cache.set(key, answer);
+                    self.copy_cache.set(&cx, key, false);
+                    let answer = self.is_copy(&cx, self.unfold(&cx, ty, Option::None), kinds);
+                    self.copy_cache.set(&cx, key, answer);
                 }
-                self.copy_cache.at(key)
+                self.copy_cache.at(&cx, key)
             },
-            Type::Array(elem, length) => length == 0u64 || self.is_copy(elem.get(), kinds),
-            Type::Exists(_binders, body) => self.is_copy(body.get(), kinds),
+            Type::Array(elem, length) => length == 0u64 || self.is_copy(&cx, elem.get(&cx), kinds),
+            Type::Exists(_binders, body) => self.is_copy(&cx, body.get(&cx), kinds),
             Type::Foreach(f) => {
-                let body = f.body.get();
-                let binders: Set[Text] = with_names(Set::new(), foreach_binders(f));
-                !overlap(binders, free_names(body)) && self.is_copy(body, kinds)
+                let body = f.body.get(&cx);
+                let binders: Set[Text['k], 'k] = with_names(&cx, Set::new(&cx), foreach_binders(&cx, f));
+                !overlap(&cx, binders, free_names(&cx, body)) && self.is_copy(&cx, body, kinds)
             },
             _ => {
-                let parts = children(ty);
+                let parts = children(&cx, ty);
                 var all = true;
                 var i = 0usize;
-                while all && i < parts.len() {
-                    all = self.is_copy(parts.get(i), kinds);
+                while all && i < parts.len(&cx) {
+                    all = self.is_copy(&cx, parts.get(&cx, i), kinds);
                     i = i + 1usize;
                 }
                 all
@@ -953,76 +1077,76 @@ impl Types {
     }
 
     // The component types of a product (struct, tuple or array).
-    fn fields(self, ty: Type, home: Option[ModuleId]) -> Seq[Type] {
-        match self.shape(ty, home) {
-            Type::Struct(fields) => member_types(fields),
+    fn fields(self, &cx: Cx!['k], ty: Type['k], home: Option[ModuleId['k]]) -> Seq[Type['k], 'k] {
+        match self.shape(&cx, ty, home) {
+            Type::Struct(fields) => member_types(&cx, fields),
             Type::Tuple(elems) => elems,
             Type::Array(elem, length) => {
-                let out: Seq[Type] = Seq::new();
+                let out: Seq[Type['k], 'k] = Seq::new(&cx);
                 var i = 0u64;
                 while i < length {
-                    out.push(elem.get());
+                    out.push(&cx, elem.get(&cx));
                     i = i + 1u64;
                 }
                 out
             },
-            _ => kurs_error(Out::new().add(show(ty)).put(" is not a product").done(), no_pos()),
+            _ => kurs_error(&cx, Out::new(&cx).add(&cx, show(&cx, ty)).put(&cx, " is not a product").done(&cx), no_pos()),
         }
     }
 
-    fn variants(self, ty: Type, home: Option[ModuleId]) -> Seq[Member] {
-        match self.shape(ty, home) {
+    fn variants(self, &cx: Cx!['k], ty: Type['k], home: Option[ModuleId['k]]) -> Seq[Member['k], 'k] {
+        match self.shape(&cx, ty, home) {
             Type::Enum(variants) => variants,
-            _ => kurs_error(Out::new().add(show(ty)).put(" is not a sum").done(), no_pos()),
+            _ => kurs_error(&cx, Out::new(&cx).add(&cx, show(&cx, ty)).put(&cx, " is not a sum").done(&cx), no_pos()),
         }
     }
 
     // One-level traversal of a foreach source: its outer skeleton (a structural type, or none for
     // a leaf) and one (label, item type, retained bindings) row per component, in order. With
     // `schema`, an array contributes one element type even when its runtime length is zero.
-    fn rows(self, source: Type, home: Option[ModuleId], schema: bool) -> Rows {
+    fn rows(self, &cx: Cx!['k], source: Type['k], home: Option[ModuleId['k]], schema: bool) -> Rows['k] {
         let unit = match source {
             Type::Foreach(f) => {
-                let inner = self.rows(f.source.get(), home, schema);
-                let mapped: Seq[Row] = Seq::new();
+                let inner = self.rows(&cx, f.source.get(&cx), home, schema);
+                let mapped: Seq[Row['k], 'k] = Seq::new(&cx);
                 var i = 0usize;
-                while i < inner.rows.len() {
-                    let row = inner.rows.get(i);
-                    let bound = self.bind(f, row.item, row.extra);
-                    mapped.push(Row.{ label: row.label, item: subst(f.body.get(), bound, self.counter), extra: bound });
+                while i < inner.rows.len(&cx) {
+                    let row = inner.rows.get(&cx, i);
+                    let bound = self.bind(&cx, f, row.item, row.extra);
+                    mapped.push(&cx, Row.{ label: row.label, item: subst(&cx, f.body.get(&cx), bound, self.counter), extra: bound });
                     i = i + 1usize;
                 }
                 return Rows.{ skeleton: inner.skeleton, rows: mapped };
             },
             _ => (),
         };
-        var s = self.shape(source, home);
+        var s = self.shape(&cx, source, home);
         var pointer = false;
         let unit = match s {
             Type::Ptr(inner) => {
-                s = self.shape(inner.get(), home);
+                s = self.shape(&cx, inner.get(&cx), home);
                 pointer = true;
                 match s {
-                    Type::Enum(_v) => kurs_error(text("a pointer source cannot be a sum"), no_pos()),
+                    Type::Enum(_v) => kurs_error(&cx, text(&cx, "a pointer source cannot be a sum"), no_pos()),
                     _ => (),
                 }
             },
             _ => (),
         };
-        let rows: Seq[Row] = Seq::new();
+        let rows: Seq[Row['k], 'k] = Seq::new(&cx);
         match s {
             Type::Struct(fields) => {
                 var i = 0usize;
-                while i < fields.len() {
-                    rows.push(Row.{ label: fields.get(i).name, item: wrap(fields.get(i).type, pointer), extra: Map::new() });
+                while i < fields.len(&cx) {
+                    rows.push(&cx, Row.{ label: fields.get(&cx, i).name, item: wrap(&cx, fields.get(&cx, i).type, pointer), extra: Map::new(&cx) });
                     i = i + 1usize;
                 }
                 Rows.{ skeleton: Option::Some.(s), rows }
             },
             Type::Tuple(elems) => {
                 var i = 0usize;
-                while i < elems.len() {
-                    rows.push(Row.{ label: Out::new().usize(i).done(), item: wrap(elems.get(i), pointer), extra: Map::new() });
+                while i < elems.len(&cx) {
+                    rows.push(&cx, Row.{ label: Out::new(&cx).usize(&cx, i).done(&cx), item: wrap(&cx, elems.get(&cx, i), pointer), extra: Map::new(&cx) });
                     i = i + 1usize;
                 }
                 Rows.{ skeleton: Option::Some.(s), rows }
@@ -1031,45 +1155,45 @@ impl Types {
                 let count = if schema { 1u64 } else { length };
                 var i = 0u64;
                 while i < count {
-                    rows.push(Row.{ label: Out::new().u64(i).done(), item: wrap(elem.get(), pointer), extra: Map::new() });
+                    rows.push(&cx, Row.{ label: Out::new(&cx).u64(&cx, i).done(&cx), item: wrap(&cx, elem.get(&cx), pointer), extra: Map::new(&cx) });
                     i = i + 1u64;
                 }
                 Rows.{ skeleton: Option::Some.(s), rows }
             },
             Type::Enum(variants) => {
                 var i = 0usize;
-                while i < variants.len() {
-                    rows.push(Row.{ label: variants.get(i).name, item: variants.get(i).type, extra: Map::new() });
+                while i < variants.len(&cx) {
+                    rows.push(&cx, Row.{ label: variants.get(&cx, i).name, item: variants.get(&cx, i).type, extra: Map::new(&cx) });
                     i = i + 1usize;
                 }
                 Rows.{ skeleton: Option::Some.(s), rows }
             },
             _ => {
-                rows.push(Row.{ label: text("0"), item: source, extra: Map::new() });
+                rows.push(&cx, Row.{ label: text(&cx, "0"), item: source, extra: Map::new(&cx) });
                 Rows.{ skeleton: Option::None, rows }
             },
         }
     }
 
     // The substitution under which `ty`'s body maps one row.
-    fn bind(self, ty: ForeachType, item: Type, extra: Map[Text, Type]) -> Map[Text, Type] {
-        let out: Map[Text, Type] = Map::new();
+    fn bind(self, &cx: Cx!['k], ty: ForeachType['k], item: Type['k], extra: Map[Text['k], Type['k], 'k]) -> Map[Text['k], Type['k], 'k] {
+        let out: Map[Text['k], Type['k], 'k] = Map::new(&cx);
         var i = 0usize;
-        while i < ty.retained.len() {
-            let name = ty.retained.get(i);
-            let unit = match extra.get(name) {
-                Option::Some(t) => out.set(name, t),
+        while i < ty.retained.len(&cx) {
+            let name = ty.retained.get(&cx, i);
+            let unit = match extra.get(&cx, name) {
+                Option::Some(t) => out.set(&cx, name, t),
                 Option::None => (),
             };
             i = i + 1usize;
         }
         if ty.indirect {
             match item {
-                Type::Ptr(inner) => out.set(ty.binder, inner.get()),
-                _ => kurs_error(text("a pointer pattern needs pointer components"), no_pos()),
+                Type::Ptr(inner) => out.set(&cx, ty.binder, inner.get(&cx)),
+                _ => kurs_error(&cx, text(&cx, "a pointer pattern needs pointer components"), no_pos()),
             }
         } else {
-            out.set(ty.binder, item);
+            out.set(&cx, ty.binder, item);
         }
         out
     }
@@ -1078,59 +1202,61 @@ impl Types {
     //
     // Source exposure is a separate obligation. An explicit pointer gives pointer components even
     // when its authorized pointee shape is abstract.
-    fn pattern_available(self, ty: ForeachType, home: Option[ModuleId], kinds: Map[Text, Kind]) -> bool {
+    fn pattern_available(self, &cx: Cx!['k], ty: ForeachType['k], home: Option[ModuleId['k]], kinds: Map[Text['k], Kind, 'k]) -> bool {
         if !ty.indirect {
             return true;
         }
-        let unit = match ty.source.get() {
+        let unit = match ty.source.get(&cx) {
             Type::Foreach(source) => {
-                return is_ptr(source.body.get());
+                return is_ptr(source.body.get(&cx));
             },
             Type::Ptr(_inner) => {
                 return true;
             },
             _ => (),
         };
-        if self.visible_shape(ty.source.get(), home, kinds).is_none() {
+        if self.visible_shape(&cx, ty.source.get(&cx), home, kinds).is_none() {
             return false;
         }
-        let rows = self.rows(ty.source.get(), home, true).rows;
+        let rows = self.rows(&cx, ty.source.get(&cx), home, true).rows;
         var all = true;
         var i = 0usize;
-        while all && i < rows.len() {
-            all = is_ptr(rows.get(i).item);
+        while all && i < rows.len(&cx) {
+            all = is_ptr(rows.get(&cx, i).item);
             i = i + 1usize;
         }
         all
     }
 
     // The structural type a foreach transform denotes.
-    fn expand(self, ty: ForeachType, home: Option[ModuleId]) -> Type {
-        let found = self.rows(ty.source.get(), home, true);
-        let mapped: Seq[Member] = Seq::new();
+    fn expand(self, &cx: Cx!['k], ty: ForeachType['k], home: Option[ModuleId['k]]) -> Type['k] {
+        let found = self.rows(&cx, ty.source.get(&cx), home, true);
+        let mapped: Seq[Member['k], 'k] = Seq::new(&cx);
         var i = 0usize;
-        while i < found.rows.len() {
-            let row = found.rows.get(i);
-            mapped.push(Member.{ name: row.label, type: subst(ty.body.get(), self.bind(ty, row.item, row.extra), self.counter) });
+        while i < found.rows.len(&cx) {
+            let row = found.rows.get(&cx, i);
+            mapped.push(&cx, Member.{ name: row.label, type: subst(&cx, ty.body.get(&cx), self.bind(&cx, ty, row.item, row.extra), self.counter) });
             i = i + 1usize;
         }
         match found.skeleton {
             Option::Some(skeleton) => match skeleton {
                 Type::Struct(_f) => Type::Struct.(mapped),
                 Type::Enum(_v) => Type::Enum.(mapped),
-                Type::Array(_e, length) => Type::Array.(Cell::new(mapped.get(0usize).type), length),
-                _ => Type::Tuple.(member_types(mapped)),
+                Type::Array(_e, length) => Type::Array.(Cell::new(&cx, mapped.get(&cx, 0usize).type), length),
+                _ => Type::Tuple.(member_types(&cx, mapped)),
             },
-            Option::None => Type::Tuple.(member_types(mapped)),
+            Option::None => Type::Tuple.(member_types(&cx, mapped)),
         }
     }
 }
 
-fn wrap(t: Type, pointer: bool) -> Type {
-    if pointer { C::ptr(t) } else { t }
+forall 'k.
+fn wrap(&cx: Cx!['k], t: Type['k], pointer: bool) -> Type['k] {
+    if pointer { C::ptr(&cx, t) } else { t }
 }
 
-fn is_ptr(t: Type) -> bool {
+forall 'k.
+fn is_ptr(t: Type['k]) -> bool {
     match t {
         Type::Ptr(_inner) => true,
         _ => false,
@@ -1138,107 +1264,111 @@ fn is_ptr(t: Type) -> bool {
 }
 
 // The kinds as a map key: (name, kind) pairs sorted by name.
-fn sorted_kinds(kinds: Map[Text, Kind]) -> Seq[(Text, u32)] {
-    let out: Seq[(Text, u32)] = Seq::new();
-    let names = kinds.keys();
+forall 'k.
+fn sorted_kinds(&cx: Cx!['k], kinds: Map[Text['k], Kind, 'k]) -> Seq[(Text['k], u32), 'k] {
+    let out: Seq[(Text['k], u32), 'k] = Seq::new(&cx);
+    let names = kinds.keys(&cx);
     var i = 0usize;
-    while i < names.len() {
-        out.push((names.get(i), C::kind_index(kinds.at(names.get(i)))));
+    while i < names.len(&cx) {
+        out.push(&cx, (names.get(&cx, i), C::kind_index(kinds.at(&cx, names.get(&cx, i)))));
         i = i + 1usize;
     }
-    out.sort(name_before);
+    out.sort(&cx, name_before);
     out
 }
 
 // ------------------------------------------------------------------- show --
 
-fn show_all(out: Out, ts: Seq[Type]) -> Out {
+forall 'k.
+fn show_all(&cx: Cx!['k], out: Out['k], ts: Seq[Type['k], 'k]) -> Out['k] {
     var i = 0usize;
-    while i < ts.len() {
+    while i < ts.len(&cx) {
         if i > 0usize {
-            let unit = out.put(" ");
+            let unit = out.put(&cx, " ");
         }
-        let unit = out.add(show(ts.get(i)));
+        let unit = out.add(&cx, show(&cx, ts.get(&cx, i)));
         i = i + 1usize;
     }
     out
 }
 
-fn show_members(out: Out, ms: Seq[Member]) -> Out {
+forall 'k.
+fn show_members(&cx: Cx!['k], out: Out['k], ms: Seq[Member['k], 'k]) -> Out['k] {
     var i = 0usize;
-    while i < ms.len() {
+    while i < ms.len(&cx) {
         if i > 0usize {
-            let unit = out.put(" ");
+            let unit = out.put(&cx, " ");
         }
-        let unit = out.put("(").add(ms.get(i).name).put(" ").add(show(ms.get(i).type)).put(")");
+        let unit = out.put(&cx, "(").add(&cx, ms.get(&cx, i).name).put(&cx, " ").add(&cx, show(&cx, ms.get(&cx, i).type)).put(&cx, ")");
         i = i + 1usize;
     }
     out
 }
 
-fn show(ty: Type) -> Text {
+forall 'k.
+fn show(&cx: Cx!['k], ty: Type['k]) -> Text['k] {
     match ty {
         Type::Prim(name) => name,
-        Type::Never => text("!"),
+        Type::Never => text(&cx, "!"),
         Type::Named(name, args) => {
-            if args.is_empty() {
+            if args.is_empty(&cx) {
                 name
             } else {
-                show_all(Out::new().put("(").add(name).put(" "), args).put(")").done()
+                show_all(&cx, Out::new(&cx).put(&cx, "(").add(&cx, name).put(&cx, " "), args).put(&cx, ")").done(&cx)
             }
         },
-        Type::Skolem(label) => Out::new().put("$").add(label).done(),
-        Type::Brand(brand) => Out::new().put("(builtin::Brand ").add(show(brand.get())).put(")").done(),
-        Type::Ptr(inner) => Out::new().put("(builtin::Pointer ").add(show(inner.get())).put(")").done(),
-        Type::Tuple(elems) => replace_all(show_all(Out::new().put("(tuple "), elems).put(")").done(), text(" )"), text(")")),
-        Type::Array(elem, length) => Out::new().put("(array ").add(show(elem.get())).put(" ").u64(length).put(")").done(),
-        Type::Struct(fields) => show_members(Out::new().put("(struct "), fields).put(")").done(),
-        Type::Enum(variants) => show_members(Out::new().put("(enum "), variants).put(")").done(),
+        Type::Skolem(label) => Out::new(&cx).put(&cx, "$").add(&cx, label).done(&cx),
+        Type::Brand(brand) => Out::new(&cx).put(&cx, "(builtin::Brand ").add(&cx, show(&cx, brand.get(&cx))).put(&cx, ")").done(&cx),
+        Type::Ptr(inner) => Out::new(&cx).put(&cx, "(builtin::Pointer ").add(&cx, show(&cx, inner.get(&cx))).put(&cx, ")").done(&cx),
+        Type::Tuple(elems) => replace_all(&cx, show_all(&cx, Out::new(&cx).put(&cx, "(tuple "), elems).put(&cx, ")").done(&cx), text(&cx, " )"), text(&cx, ")")),
+        Type::Array(elem, length) => Out::new(&cx).put(&cx, "(array ").add(&cx, show(&cx, elem.get(&cx))).put(&cx, " ").u64(&cx, length).put(&cx, ")").done(&cx),
+        Type::Struct(fields) => show_members(&cx, Out::new(&cx).put(&cx, "(struct "), fields).put(&cx, ")").done(&cx),
+        Type::Enum(variants) => show_members(&cx, Out::new(&cx).put(&cx, "(enum "), variants).put(&cx, ")").done(&cx),
         Type::Exists(binders, body) => {
-            let out = Out::new().put("(exists (");
+            let out = Out::new(&cx).put(&cx, "(exists (");
             var i = 0usize;
-            while i < binders.len() {
+            while i < binders.len(&cx) {
                 if i > 0usize {
-                    let unit = out.put(" ");
+                    let unit = out.put(&cx, " ");
                 }
-                let unit = out.put("$").add(binders.get(i));
+                let unit = out.put(&cx, "$").add(&cx, binders.get(&cx, i));
                 i = i + 1usize;
             }
-            out.put(") ").add(show(body.get())).put(")").done()
+            out.put(&cx, ") ").add(&cx, show(&cx, body.get(&cx))).put(&cx, ")").done(&cx)
         },
         Type::Foreach(f) => {
-            let out = Out::new().put("(foreach (");
+            let out = Out::new(&cx).put(&cx, "(foreach (");
             if f.indirect {
-                let unit = out.put("(builtin::Pointer ").add(f.binder).put(")");
+                let unit = out.put(&cx, "(builtin::Pointer ").add(&cx, f.binder).put(&cx, ")");
             } else {
-                let unit = out.add(f.binder);
+                let unit = out.add(&cx, f.binder);
             }
-            let unit = out.put(" ").add(show(f.source.get())).put(") ").add(show(f.body.get()));
-            let inferred = match f.source.get() {
-                Type::Foreach(source) => foreach_binders(source),
-                _ => Seq::new(),
+            let unit = out.put(&cx, " ").add(&cx, show(&cx, f.source.get(&cx))).put(&cx, ") ").add(&cx, show(&cx, f.body.get(&cx)));
+            let inferred = match f.source.get(&cx) {
+                Type::Foreach(source) => foreach_binders(&cx, source),
+                _ => Seq::new(&cx),
             };
-            if !f.retained.same(inferred) {
-                let unit = out.put(" (retain ");
+            if !f.retained.same(&cx, inferred) {
+                let unit = out.put(&cx, " (retain ");
                 var i = 0usize;
-                while i < f.retained.len() {
+                while i < f.retained.len(&cx) {
                     if i > 0usize {
-                        let unit = out.put(" ");
+                        let unit = out.put(&cx, " ");
                     }
-                    let unit = out.add(f.retained.get(i));
+                    let unit = out.add(&cx, f.retained.get(&cx, i));
                     i = i + 1usize;
                 }
-                let unit = out.put(")");
+                let unit = out.put(&cx, ")");
             }
-            out.put(")").done()
+            out.put(&cx, ")").done(&cx)
         },
         Type::Fn(f) => {
-            let out = Out::new().put("(builtin::Fn ");
+            let out = Out::new(&cx).put(&cx, "(builtin::Fn ");
             if f.is_unsafe {
-                let unit = out.put("(unsafe) ");
+                let unit = out.put(&cx, "(unsafe) ");
             }
-            show_all(out.put("("), f.params).put(") ").add(show(f.ret.get())).put(")").done()
+            show_all(&cx, out.put(&cx, "("), f.params).put(&cx, ") ").add(&cx, show(&cx, f.ret.get(&cx))).put(&cx, ")").done(&cx)
         },
-        _ => text("_"),
+        _ => text(&cx, "_"),
     }
 }

@@ -3,20 +3,21 @@
 // The inference variable is `core::Meta` (`Type::Meta`): its kind is type, int, float or brand,
 // and solving it sets its solution.
 
-use package::support::base::{Map, Seq, Set, Text, text};
+use package::support::base::{Cx, Map, Seq, Set, Text, text};
 use package::kurs::core::{FnType, Kind, Member, Meta, MetaKind, Param, Type};
 use package::kurs::core as C;
 use package::types::ops::{Fresh, extractable_names, foreach_binders, free_names, fresh, map_children, subst, type_tag};
 use package::types::ops as T;
 use std::option::Option;
 
-fn prune(ty: Type) -> Type {
+forall 'k.
+fn prune(&cx: Cx!['k], ty: Type['k]) -> Type['k] {
     var ty = ty;
     var going = true;
     while going {
         going = false;
         let unit = match ty {
-            Type::Meta(m) => match m.solution() {
+            Type::Meta(m) => match m.solution(&cx) {
                 Option::Some(t) => {
                     ty = t;
                     going = true;
@@ -30,21 +31,23 @@ fn prune(ty: Type) -> Type {
 }
 
 // `ty` with every solved metavariable replaced by its solution.
-fn zonk(ty: Type) -> Type {
-    map_children(prune(ty), |child: Type| zonk(child))
+forall 'k.
+fn zonk(&cx: Cx!['k], ty: Type['k]) -> Type['k] {
+    map_children(&cx, prune(&cx, ty), |&cx, child: Type['k]| zonk(&cx, child))
 }
 
 // `ty` mentions no unsolved metavariable.
-fn ground(ty: Type) -> bool {
-    let ty = zonk(ty);
+forall 'k.
+fn ground(&cx: Cx!['k], ty: Type['k]) -> bool {
+    let ty = zonk(&cx, ty);
     match ty {
         Type::Meta(_m) => false,
         _ => {
-            let parts = T::children(ty);
+            let parts = T::children(&cx, ty);
             var all = true;
             var i = 0usize;
-            while all && i < parts.len() {
-                all = ground(parts.get(i));
+            while all && i < parts.len(&cx) {
+                all = ground(&cx, parts.get(&cx, i));
                 i = i + 1usize;
             }
             all
@@ -53,51 +56,55 @@ fn ground(ty: Type) -> bool {
 }
 
 // A fresh metavariable for each type parameter (brand parameters get brand-kind ones).
-fn instantiate(params: Seq[Param]) -> Map[Text, Type] {
-    let out: Map[Text, Type] = Map::new();
+forall 'k.
+fn instantiate(&cx: Cx!['k], params: Seq[Param['k], 'k]) -> Map[Text['k], Type['k], 'k] {
+    let out: Map[Text['k], Type['k], 'k] = Map::new(&cx);
     var i = 0usize;
-    while i < params.len() {
-        let p = params.get(i);
+    while i < params.len(&cx) {
+        let p = params.get(&cx, i);
         let kind = match p.kind {
             Kind::Brand => MetaKind::Brand,
             _ => MetaKind::Type,
         };
-        out.set(p.name, Type::Meta.(Meta::new(kind)));
+        out.set(&cx, p.name, Type::Meta.(Meta::new(&cx, kind)));
         i = i + 1usize;
     }
     out
 }
 
-fn is_meta(ty: Type, meta: Meta) -> bool {
+forall 'k.
+fn is_meta(ty: Type['k], meta: Meta['k]) -> bool {
     match ty {
         Type::Meta(m) => m.id() == meta.id(),
         _ => false,
     }
 }
 
-fn occurs(meta: Meta, ty: Type) -> bool {
-    let ty = prune(ty);
+forall 'k.
+fn occurs(&cx: Cx!['k], meta: Meta['k], ty: Type['k]) -> bool {
+    let ty = prune(&cx, ty);
     if is_meta(ty, meta) {
         return true;
     }
-    let parts = T::children(ty);
+    let parts = T::children(&cx, ty);
     var found = false;
     var i = 0usize;
-    while !found && i < parts.len() {
-        found = occurs(meta, parts.get(i));
+    while !found && i < parts.len(&cx) {
+        found = occurs(&cx, meta, parts.get(&cx, i));
         i = i + 1usize;
     }
     found
 }
 
-fn fits_kind(kind: MetaKind, ty: Type) -> bool {
+forall 'k.
+fn fits_kind(&cx: Cx!['k], kind: MetaKind, ty: Type['k]) -> bool {
     match kind {
         MetaKind::Int => match ty {
-            Type::Prim(name) => C::is_integer(name),
+            Type::Prim(name) => C::is_integer(&cx, name),
             _ => false,
         },
         MetaKind::Float => match ty {
-            Type::Prim(name) => C::is_float(name),
+            Type::Prim(name) => C::is_float(&cx, name),
             _ => false,
         },
         MetaKind::Brand => match ty {
@@ -125,160 +132,169 @@ fn is_type_kind(k: MetaKind) -> bool {
 }
 
 // The unsolved variables reachable through a type, including premises; each once.
-fn metas(ty: Type) -> Seq[Meta] {
-    let out: Seq[Meta] = Seq::new();
-    metas_into(ty, out, Set::new());
+forall 'k.
+fn metas(&cx: Cx!['k], ty: Type['k]) -> Seq[Meta['k], 'k] {
+    let out: Seq[Meta['k], 'k] = Seq::new(&cx);
+    metas_into(&cx, ty, out, Set::new(&cx));
     out
 }
 
-fn metas_into(ty: Type, out: Seq[Meta], seen: Set[usize]) {
-    let ty = prune(ty);
+forall 'k.
+fn metas_into(&cx: Cx!['k], ty: Type['k], out: Seq[Meta['k], 'k], seen: Set[usize, 'k]) {
+    let ty = prune(&cx, ty);
     match ty {
         Type::Meta(m) => {
-            if !seen.has(m.id()) {
-                seen.add(m.id());
-                out.push(m);
+            if !seen.has(&cx, m.id()) {
+                seen.add(&cx, m.id());
+                out.push(&cx, m);
             }
         },
         _ => {
-            let parts = T::children(ty);
+            let parts = T::children(&cx, ty);
             var i = 0usize;
-            while i < parts.len() {
-                metas_into(parts.get(i), out, seen);
+            while i < parts.len(&cx) {
+                metas_into(&cx, parts.get(&cx, i), out, seen);
                 i = i + 1usize;
             }
         },
     }
 }
 
-fn kinds_differ(left: Seq[Param], right: Seq[Param]) -> bool {
-    !T::same_kinds(left, right)
+forall 'k.
+fn kinds_differ(&cx: Cx!['k], left: Seq[Param['k], 'k], right: Seq[Param['k], 'k]) -> bool {
+    !T::same_kinds(&cx, left, right)
 }
 
-fn concat(xs: Seq[Type], ys: Seq[Type]) -> Seq[Type] {
-    let out = xs.copy();
-    out.append(ys);
+forall 'k.
+fn concat(&cx: Cx!['k], xs: Seq[Type['k], 'k], ys: Seq[Type['k], 'k]) -> Seq[Type['k], 'k] {
+    let out = xs.copy(&cx);
+    out.append(&cx, ys);
     out
 }
 
 // Instance variables live outside binders; body inference variables may live inside.
-fn quantified(left: Seq[Param], right: Seq[Param], xs: Seq[Type], ys: Seq[Type], closed: bool, counter: Fresh) -> bool {
-    if kinds_differ(left, right) || xs.len() != ys.len() {
+forall 'k.
+fn quantified(&cx: Cx!['k], left: Seq[Param['k], 'k], right: Seq[Param['k], 'k], xs: Seq[Type['k], 'k], ys: Seq[Type['k], 'k], closed: bool, counter: Fresh['k]) -> bool {
+    if kinds_differ(&cx, left, right) || xs.len(&cx) != ys.len(&cx) {
         return false;
     }
     if !closed {
-        let rename: Map[Text, Type] = Map::new();
+        let rename: Map[Text['k], Type['k], 'k] = Map::new(&cx);
         var i = 0usize;
-        while i < left.len() && i < right.len() {
-            let p = left.get(i);
-            let q = right.get(i);
-            rename.set(q.name, rigid(p.kind, p.name));
+        while i < left.len(&cx) && i < right.len(&cx) {
+            let p = left.get(&cx, i);
+            let q = right.get(&cx, i);
+            rename.set(&cx, q.name, rigid(&cx, p.kind, p.name));
             i = i + 1usize;
         }
         var all = true;
         var j = 0usize;
-        while all && j < xs.len() {
-            all = unify(zonk(xs.get(j)), subst(zonk(ys.get(j)), rename, counter), false, counter);
+        while all && j < xs.len(&cx) {
+            all = unify(&cx, zonk(&cx, xs.get(&cx, j)), subst(&cx, zonk(&cx, ys.get(&cx, j)), rename, counter), false, counter);
             j = j + 1usize;
         }
         return all;
     }
-    if left.is_empty() {
+    if left.is_empty(&cx) {
         var all = true;
         var j = 0usize;
-        while all && j < xs.len() {
-            all = unify(xs.get(j), ys.get(j), true, counter);
+        while all && j < xs.len(&cx) {
+            all = unify(&cx, xs.get(&cx, j), ys.get(&cx, j), true, counter);
             j = j + 1usize;
         }
         return all;
     }
-    let both = concat(xs, ys);
-    let variables: Seq[Meta] = Seq::new();
-    let seen: Set[usize] = Set::new();
-    let occupied: Set[Text] = Set::new();
+    let both = concat(&cx, xs, ys);
+    let variables: Seq[Meta['k], 'k] = Seq::new(&cx);
+    let seen: Set[usize, 'k] = Set::new(&cx);
+    let occupied: Set[Text['k], 'k] = Set::new(&cx);
     var k = 0usize;
-    while k < both.len() {
-        metas_into(both.get(k), variables, seen);
+    while k < both.len(&cx) {
+        metas_into(&cx, both.get(&cx, k), variables, seen);
         k = k + 1usize;
     }
     var k2 = 0usize;
-    while k2 < both.len() {
-        T::add_all(occupied, free_names(zonk(both.get(k2))));
+    while k2 < both.len(&cx) {
+        T::add_all(&cx, occupied, free_names(&cx, zonk(&cx, both.get(&cx, k2))));
         k2 = k2 + 1usize;
     }
-    let labels: Seq[Text] = Seq::new();
+    let labels: Seq[Text['k], 'k] = Seq::new(&cx);
     var n = 0usize;
-    while n < left.len() {
-        var label = fresh(text("rigid"), counter);
-        while occupied.has(label) {
-            label = fresh(text("rigid"), counter);
+    while n < left.len(&cx) {
+        var label = fresh(&cx, text(&cx, "rigid"), counter);
+        while occupied.has(&cx, label) {
+            label = fresh(&cx, text(&cx, "rigid"), counter);
         }
-        labels.push(label);
+        labels.push(&cx, label);
         n = n + 1usize;
     }
-    let a: Map[Text, Type] = Map::new();
-    let b: Map[Text, Type] = Map::new();
+    let a: Map[Text['k], Type['k], 'k] = Map::new(&cx);
+    let b: Map[Text['k], Type['k], 'k] = Map::new(&cx);
     var r = 0usize;
-    while r < left.len() {
-        let rigid_type = rigid(left.get(r).kind, labels.get(r));
-        a.set(left.get(r).name, rigid_type);
-        if r < right.len() {
-            b.set(right.get(r).name, rigid_type);
+    while r < left.len(&cx) {
+        let rigid_type = rigid(&cx, left.get(&cx, r).kind, labels.get(&cx, r));
+        a.set(&cx, left.get(&cx, r).name, rigid_type);
+        if r < right.len(&cx) {
+            b.set(&cx, right.get(&cx, r).name, rigid_type);
         }
         r = r + 1usize;
     }
     var all = true;
     var j = 0usize;
-    while all && j < xs.len() {
-        all = unify(subst(zonk(xs.get(j)), a, counter), subst(zonk(ys.get(j)), b, counter), true, counter);
+    while all && j < xs.len(&cx) {
+        all = unify(&cx, subst(&cx, zonk(&cx, xs.get(&cx, j)), a, counter), subst(&cx, zonk(&cx, ys.get(&cx, j)), b, counter), true, counter);
         j = j + 1usize;
     }
     if !all {
         return false;
     }
-    let label_set = T::with_names(Set::new(), labels);
+    let label_set = T::with_names(&cx, Set::new(&cx), labels);
     var escaped = false;
     var v = 0usize;
-    while !escaped && v < variables.len() {
-        escaped = T::overlap(free_names(zonk(Type::Meta.(variables.get(v)))), label_set);
+    while !escaped && v < variables.len(&cx) {
+        escaped = T::overlap(&cx, free_names(&cx, zonk(&cx, Type::Meta.(variables.get(&cx, v)))), label_set);
         v = v + 1usize;
     }
     !escaped
 }
 
 // A rigid stand-in for a quantified parameter: a brand label or a type variable.
-fn rigid(kind: Kind, name: Text) -> Type {
+forall 'k.
+fn rigid(&cx: Cx!['k], kind: Kind, name: Text['k]) -> Type['k] {
     match kind {
         Kind::Brand => Type::Skolem.(name),
-        _ => C::named(name, Seq::new()),
+        _ => C::named(name, Seq::new(&cx)),
     }
 }
 
-fn params_named(names: Seq[Text], kind: Kind) -> Seq[Param] {
-    let out: Seq[Param] = Seq::new();
+forall 'k.
+fn params_named(&cx: Cx!['k], names: Seq[Text['k], 'k], kind: Kind) -> Seq[Param['k], 'k] {
+    let out: Seq[Param['k], 'k] = Seq::new(&cx);
     var i = 0usize;
-    while i < names.len() {
-        out.push(Param.{ name: names.get(i), kind });
+    while i < names.len(&cx) {
+        out.push(&cx, Param.{ name: names.get(&cx, i), kind });
         i = i + 1usize;
     }
     out
 }
 
-fn unify_all(xs: Seq[Type], ys: Seq[Type], closed: bool, counter: Fresh) -> bool {
-    var ok = xs.len() == ys.len();
+forall 'k.
+fn unify_all(&cx: Cx!['k], xs: Seq[Type['k], 'k], ys: Seq[Type['k], 'k], closed: bool, counter: Fresh['k]) -> bool {
+    var ok = xs.len(&cx) == ys.len(&cx);
     var i = 0usize;
-    while ok && i < xs.len() {
-        ok = unify(xs.get(i), ys.get(i), closed, counter);
+    while ok && i < xs.len(&cx) {
+        ok = unify(&cx, xs.get(&cx, i), ys.get(&cx, i), closed, counter);
         i = i + 1usize;
     }
     ok
 }
 
-fn unify_members(xs: Seq[Member], ys: Seq[Member], closed: bool, counter: Fresh) -> bool {
-    var ok = xs.len() == ys.len();
+forall 'k.
+fn unify_members(&cx: Cx!['k], xs: Seq[Member['k], 'k], ys: Seq[Member['k], 'k], closed: bool, counter: Fresh['k]) -> bool {
+    var ok = xs.len(&cx) == ys.len(&cx);
     var i = 0usize;
-    while ok && i < xs.len() {
-        ok = xs.get(i).name.eq(ys.get(i).name) && unify(xs.get(i).type, ys.get(i).type, closed, counter);
+    while ok && i < xs.len(&cx) {
+        ok = xs.get(&cx, i).name.eq(&cx, ys.get(&cx, i).name) && unify(&cx, xs.get(&cx, i).type, ys.get(&cx, i).type, closed, counter);
         i = i + 1usize;
     }
     ok
@@ -287,19 +303,20 @@ fn unify_members(xs: Seq[Member], ys: Seq[Member], closed: bool, counter: Fresh)
 // Solve equality; closed instance solutions cannot depend on nested binders.
 //
 // Two identical metavariables unify at once; any other pair is compared by structure.
-fn unify(a: Type, b: Type, closed: bool, counter: Fresh) -> bool {
-    let a = prune(a);
-    let b = prune(b);
+forall 'k.
+fn unify(&cx: Cx!['k], a: Type['k], b: Type['k], closed: bool, counter: Fresh['k]) -> bool {
+    let a = prune(&cx, a);
+    let b = prune(&cx, b);
     let unit = match a {
         Type::Meta(x) => {
             if is_meta(b, x) {
                 return true;
             }
-            return solve(x, b);
+            return solve(&cx, x, b);
         },
         _ => match b {
             Type::Meta(y) => {
-                return solve(y, a);
+                return solve(&cx, y, a);
             },
             _ => (),
         },
@@ -309,76 +326,78 @@ fn unify(a: Type, b: Type, closed: bool, counter: Fresh) -> bool {
     }
     match a {
         Type::Named(n, xs) => match b {
-            Type::Named(m, ys) => n.eq(m) && unify_all(xs, ys, closed, counter),
+            Type::Named(m, ys) => n.eq(&cx, m) && unify_all(&cx, xs, ys, closed, counter),
             _ => false,
         },
-        Type::Prim(_n) => C::same(a, b),
-        Type::Skolem(_n) => C::same(a, b),
-        Type::Never => C::same(a, b),
-        Type::Ignored => C::same(a, b),
+        Type::Prim(_n) => C::same(&cx, a, b),
+        Type::Skolem(_n) => C::same(&cx, a, b),
+        Type::Never => C::same(&cx, a, b),
+        Type::Ignored => C::same(&cx, a, b),
         Type::Struct(fa) => match b {
-            Type::Struct(fb) => unify_members(fa, fb, closed, counter),
+            Type::Struct(fb) => unify_members(&cx, fa, fb, closed, counter),
             _ => false,
         },
         Type::Enum(fa) => match b {
-            Type::Enum(fb) => unify_members(fa, fb, closed, counter),
+            Type::Enum(fb) => unify_members(&cx, fa, fb, closed, counter),
             _ => false,
         },
         Type::Exists(xs, p) => match b {
-            Type::Exists(ys, q) => quantified(params_named(xs, Kind::Brand), params_named(ys, Kind::Brand), Seq::one(p.get()), Seq::one(q.get()), closed, counter),
+            Type::Exists(ys, q) => quantified(&cx, params_named(&cx, xs, Kind::Brand), params_named(&cx, ys, Kind::Brand), Seq::one(&cx, p.get(&cx)), Seq::one(&cx, q.get(&cx)), closed, counter),
             _ => false,
         },
         Type::Foreach(x) => match b {
-            Type::Foreach(y) => x.indirect == y.indirect && unify(x.source.get(), y.source.get(), closed, counter)
-                && quantified(params_named(foreach_binders(x), Kind::Any), params_named(foreach_binders(y), Kind::Any), Seq::one(x.body.get()), Seq::one(y.body.get()), closed, counter),
+            Type::Foreach(y) => x.indirect == y.indirect && unify(&cx, x.source.get(&cx), y.source.get(&cx), closed, counter)
+                && quantified(&cx, params_named(&cx, foreach_binders(&cx, x), Kind::Any), params_named(&cx, foreach_binders(&cx, y), Kind::Any), Seq::one(&cx, x.body.get(&cx)), Seq::one(&cx, y.body.get(&cx)), closed, counter),
             _ => false,
         },
         Type::Fn(x) => match b {
             Type::Fn(y) => {
-                if x.params.len() != y.params.len() || !x.places.same(y.places) || x.is_unsafe != y.is_unsafe {
+                if x.params.len(&cx) != y.params.len(&cx) || !x.places.same(&cx, y.places) || x.is_unsafe != y.is_unsafe {
                     return false;
                 }
-                quantified(x.quantified, y.quantified, with_ret(x), with_ret(y), closed, counter)
+                quantified(&cx, x.quantified, y.quantified, with_ret(&cx, x), with_ret(&cx, y), closed, counter)
             },
             _ => false,
         },
         Type::Array(_x, n) => match b {
-            Type::Array(_y, m) => n == m && unify_all(T::children(a), T::children(b), closed, counter),
+            Type::Array(_y, m) => n == m && unify_all(&cx, T::children(&cx, a), T::children(&cx, b), closed, counter),
             _ => false,
         },
-        _ => unify_all(T::children(a), T::children(b), closed, counter),
+        _ => unify_all(&cx, T::children(&cx, a), T::children(&cx, b), closed, counter),
     }
 }
 
-fn with_ret(f: FnType) -> Seq[Type] {
-    let out = f.params.copy();
-    out.push(f.ret.get());
+forall 'k.
+fn with_ret(&cx: Cx!['k], f: FnType['k]) -> Seq[Type['k], 'k] {
+    let out = f.params.copy(&cx);
+    out.push(&cx, f.ret.get(&cx));
     out
 }
 
 // Solves the variable `a` with `b`, which is not `a` itself. Of two variables, the less specific
 // is bound to the more specific one.
-fn solve(a: Meta, b: Type) -> bool {
+forall 'k.
+fn solve(&cx: Cx!['k], a: Meta['k], b: Type['k]) -> bool {
     match b {
         Type::Meta(other) => {
             var x = a;
             var y = other;
-            if !is_type_kind(x.kind()) && !is_type_kind(y.kind()) && meta_kind_index(x.kind()) != meta_kind_index(y.kind()) {
+            if !is_type_kind(x.kind(&cx)) && !is_type_kind(y.kind(&cx)) && meta_kind_index(x.kind(&cx)) != meta_kind_index(y.kind(&cx)) {
                 return false;
             }
-            if !is_type_kind(x.kind()) {
+            if !is_type_kind(x.kind(&cx)) {
                 let t = x;
                 x = y;
                 y = t;
             }
-            x.solve(Type::Meta.(y));
+            x.solve(&cx, Type::Meta.(y));
             true
         },
         _ => {
-            if !fits_kind(a.kind(), b) || occurs(a, b) {
+            if !fits_kind(&cx, a.kind(&cx), b) || occurs(&cx, a, b) {
                 return false;
             }
-            a.solve(b);
+            a.solve(&cx, b);
             true
         },
     }
@@ -389,47 +408,48 @@ fn solve(a: Meta, b: Type) -> bool {
 // Surface inference passes the input prefix; its output-only variables remain unsolved. Only
 // binder-free occurrences contribute extracted parameters. KURS passes the full head and requires
 // every parameter to be extractable. Failure discards all tentative bindings.
-fn match_head(params: Seq[Param], head: Seq[Type], query: Seq[Type], require_extractable: bool, counter: Fresh) -> Option[Map[Text, Type]] {
-    let reachable: Set[Text] = Set::new();
+forall 'k.
+fn match_head(&cx: Cx!['k], params: Seq[Param['k], 'k], head: Seq[Type['k], 'k], query: Seq[Type['k], 'k], require_extractable: bool, counter: Fresh['k]) -> Option[Map[Text['k], Type['k], 'k]] {
+    let reachable: Set[Text['k], 'k] = Set::new(&cx);
     var i = 0usize;
-    while i < head.len() {
-        T::add_all(reachable, extractable_names(head.get(i)));
+    while i < head.len(&cx) {
+        T::add_all(&cx, reachable, extractable_names(&cx, head.get(&cx, i)));
         i = i + 1usize;
     }
-    if head.len() != query.len() {
+    if head.len(&cx) != query.len(&cx) {
         return Option::None;
     }
     var j = 0usize;
-    while j < query.len() {
-        if !ground(query.get(j)) {
+    while j < query.len(&cx) {
+        if !ground(&cx, query.get(&cx, j)) {
             return Option::None;
         }
         j = j + 1usize;
     }
     if require_extractable {
         var k = 0usize;
-        while k < params.len() {
-            if !reachable.has(params.get(k).name) {
+        while k < params.len(&cx) {
+            if !reachable.has(&cx, params.get(&cx, k).name) {
                 return Option::None;
             }
             k = k + 1usize;
         }
     }
-    let sub = instantiate(params);
+    let sub = instantiate(&cx, params);
     var m = 0usize;
-    while m < head.len() {
-        if !unify(subst(head.get(m), sub, counter), query.get(m), true, counter) {
+    while m < head.len(&cx) {
+        if !unify(&cx, subst(&cx, head.get(&cx, m), sub, counter), query.get(&cx, m), true, counter) {
             return Option::None;
         }
         m = m + 1usize;
     }
-    let out: Map[Text, Type] = Map::new();
-    let names = sub.keys();
+    let out: Map[Text['k], Type['k], 'k] = Map::new(&cx);
+    let names = sub.keys(&cx);
     var n = 0usize;
-    while n < names.len() {
-        let t = sub.at(names.get(n));
-        if reachable.has(names.get(n)) && ground(t) {
-            out.set(names.get(n), zonk(t));
+    while n < names.len(&cx) {
+        let t = sub.at(&cx, names.get(&cx, n));
+        if reachable.has(&cx, names.get(&cx, n)) && ground(&cx, t) {
+            out.set(&cx, names.get(&cx, n), zonk(&cx, t));
         }
         n = n + 1usize;
     }

@@ -1,6 +1,6 @@
 // S-expressions: the forms serialized KURS is written in.
 
-use package::support::base::{Out, Seq, Text, fail, text};
+use package::support::base::{Cx, Out, Seq, Text, fail, text};
 use package::syntax::ast::Pos;
 use std::slice::Slice;
 use std::option::Option;
@@ -13,14 +13,16 @@ exposed enum FormKind {
     List,
 }
 
+forall 'k.
 exposed struct Form {
     kind: FormKind,
-    text: Text,
-    items: Seq[Form],
+    text: Text['k],
+    items: Seq[Form['k], 'k],
     pos: Pos,
 }
 
-impl Form {
+forall 'k.
+impl Form['k] {
     fn is_list(self) -> bool {
         match self.kind {
             FormKind::List => true,
@@ -42,33 +44,36 @@ impl Form {
         }
     }
 
-    fn len(self) -> usize {
-        self.items.len()
+    fn len(self, &cx: Cx!['k]) -> usize {
+        self.items.len(&cx)
     }
 
-    fn at(self, i: usize) -> Form {
-        self.items.get(i)
+    fn at(self, &cx: Cx!['k], i: usize) -> Form['k] {
+        self.items.get(&cx, i)
     }
 }
 
-fn located(message: Text, pos: Pos) -> Text {
-    Out::new().u64(pos.line as u64).put(":").u64(pos.col as u64).put(": ").add(message).done()
+forall 'k.
+fn located(&cx: Cx!['k], message: Text['k], pos: Pos) -> Text['k] {
+    Out::new(&cx).u64(&cx, pos.line as u64).put(&cx, ":").u64(&cx, pos.col as u64).put(&cx, ": ").add(&cx, message).done(&cx)
 }
 
-fn fail_at(message: Slice[u8, 'static], pos: Pos) -> ! {
-    fail(located(text(message), pos))
+forall 'k.
+fn fail_at(&cx: Cx!['k], message: Slice[u8, 'static], pos: Pos) -> ! {
+    fail(&cx, located(&cx, text(&cx, message), pos))
 }
 
 // Every top-level form of `source`, as one list.
-fn read(source: Text) -> Form {
-    let top = Form.{ kind: FormKind::List, text: text(""), items: Seq::new(), pos: Pos.{ line: 0u32, col: 0u32 } };
-    let stack: Seq[Form] = Seq::one(top);
+forall 'k.
+fn read(&cx: Cx!['k], source: Text['k]) -> Form['k] {
+    let top = Form.{ kind: FormKind::List, text: text(&cx, ""), items: Seq::new(&cx), pos: Pos.{ line: 0u32, col: 0u32 } };
+    let stack: Seq[Form['k], 'k] = Seq::one(&cx, top);
     var i = 0usize;
-    let n = source.len;
+    let n = source.len();
     var line = 1u32;
     var line_start = 0usize;
     while i < n {
-        let c = source.byte(i);
+        let c = source.byte(&cx, i);
         let pos = Pos.{ line, col: (i - line_start + 1usize) as u32 };
         if c == b'\n' {
             line = line + 1u32;
@@ -77,30 +82,30 @@ fn read(source: Text) -> Form {
         if c == b' ' || c == b'\t' || c == b'\r' || c == b'\n' {
             i = i + 1usize;
         } else if c == b';' {
-            while i < n && source.byte(i) != b'\n' {
+            while i < n && source.byte(&cx, i) != b'\n' {
                 i = i + 1usize;
             }
         } else if c == b'(' {
-            let form = Form.{ kind: FormKind::List, text: text(""), items: Seq::new(), pos };
-            stack.last().items.push(form);
-            stack.push(form);
+            let form = Form.{ kind: FormKind::List, text: text(&cx, ""), items: Seq::new(&cx), pos };
+            stack.last(&cx).items.push(&cx, form);
+            stack.push(&cx, form);
             i = i + 1usize;
         } else if c == b')' {
-            if stack.len() == 1usize {
-                fail_at("unbalanced ')'", pos);
+            if stack.len(&cx) == 1usize {
+                fail_at(&cx, "unbalanced ')'", pos);
             }
-            let unit = stack.pop();
+            let unit = stack.pop(&cx);
             i = i + 1usize;
         } else if c == b'"' {
             var j = i + 1usize;
-            let chars = Out::new();
-            while j < n && source.byte(j) != b'"' {
-                let d = source.byte(j);
-                if d == b'\\' && source.byte(j + 1usize) == b'x' {
-                    let unit = chars.byte(hex(source.byte(j + 2usize)) * 16u8 + hex(source.byte(j + 3usize)));
+            let chars = Out::new(&cx);
+            while j < n && source.byte(&cx, j) != b'"' {
+                let d = source.byte(&cx, j);
+                if d == b'\\' && source.byte(&cx, j + 1usize) == b'x' {
+                    let unit = chars.byte(&cx, hex(source.byte(&cx, j + 2usize)) * 16u8 + hex(source.byte(&cx, j + 3usize)));
                     j = j + 4usize;
                 } else if d == b'\\' {
-                    let e = source.byte(j + 1usize);
+                    let e = source.byte(&cx, j + 1usize);
                     let byte = if e == b'n' {
                         b'\n'
                     } else if e == b't' {
@@ -112,31 +117,31 @@ fn read(source: Text) -> Form {
                     } else if e == b'\\' || e == b'\'' || e == b'"' {
                         e
                     } else {
-                        fail_at("unknown escape in a string literal", pos)
+                        fail_at(&cx, "unknown escape in a string literal", pos)
                     };
-                    let unit = chars.byte(byte);
+                    let unit = chars.byte(&cx, byte);
                     j = j + 2usize;
                 } else {
-                    let unit = chars.byte(d);
+                    let unit = chars.byte(&cx, d);
                     j = j + 1usize;
                 }
             }
             if j >= n {
-                fail_at("unterminated string literal", pos);
+                fail_at(&cx, "unterminated string literal", pos);
             }
-            stack.last().items.push(Form.{ kind: FormKind::Str, text: chars.done(), items: Seq::new(), pos });
+            stack.last(&cx).items.push(&cx, Form.{ kind: FormKind::Str, text: chars.done(&cx), items: Seq::new(&cx), pos });
             i = j + 1usize;
         } else {
             var j = i;
-            while j < n && !is_delimiter(source.byte(j)) {
+            while j < n && !is_delimiter(source.byte(&cx, j)) {
                 j = j + 1usize;
             }
-            stack.last().items.push(Form.{ kind: FormKind::Atom, text: source.slice(i, j), items: Seq::new(), pos });
+            stack.last(&cx).items.push(&cx, Form.{ kind: FormKind::Atom, text: source.slice(i, j), items: Seq::new(&cx), pos });
             i = j;
         }
     }
-    if stack.len() != 1usize {
-        fail_at("unclosed '('", stack.last().pos);
+    if stack.len(&cx) != 1usize {
+        fail_at(&cx, "unclosed '('", stack.last(&cx).pos);
     }
     top
 }

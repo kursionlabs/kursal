@@ -14,7 +14,7 @@
 // writes OUTPUT.c and compiles it with the standard library's C helpers into OUTPUT, else it prints
 // the C. With --times it prints the time each stage takes, as `tools/build.py --times` does.
 
-use package::support::base::{Cell, Out, Seq, Text, fail, stop, text};
+use package::support::base::{Cell, Cx, Out, Seq, Text, fail, stop, text};
 use package::backend::cgen::emit_c;
 use package::check::checker::check_program;
 use package::syntax::dump as syntax_dump;
@@ -34,171 +34,185 @@ use package::types::ops::Fresh;
 use std::option::Option;
 use std::slice::Slice;
 
+// Every command keeps what it builds in one arena, made here and freed when the command is done.
+// A command that fails stops the process from inside, leaving the arena to the operating system.
 fn main(argc: i32, argv: *(*u8)) -> i32 {
-    let args = arguments(argc, argv);
-    if args.is_empty() {
-        fail(text("usage: kursal parse FILE... | kursal resolve PATH | kursal sigs PATH | kursal infer PATH | kursal kurs FILE | kursal check FILE | kursal c FILE [--entry NAME] | kursal readable FILE | kursal lower PATH | kursal build PATH [-o OUTPUT] [--times]"));
+    let exists 'k. cx = Cx::new();
+    var cx = cx;
+    let status = command(&cx, argc, argv);
+    cx.destroy();
+    status
+}
+
+forall 'k.
+fn command(&cx: Cx!['k], argc: i32, argv: *(*u8)) -> i32 {
+    let args = arguments(&cx, argc, argv);
+    if args.is_empty(&cx) {
+        fail(&cx, text(&cx, "usage: kursal parse FILE... | kursal resolve PATH | kursal sigs PATH | kursal infer PATH | kursal kurs FILE | kursal check FILE | kursal c FILE [--entry NAME] | kursal readable FILE | kursal lower PATH | kursal build PATH [-o OUTPUT] [--times]"));
     }
-    let command = args.get(0usize);
-    if command.is("parse") {
-        let ids = Cell::new(0u32);
+    let command = args.get(&cx, 0usize);
+    if command.is(&cx, "parse") {
+        let ids = Cell::new(&cx, 0u32);
         var i = 1usize;
-        while i < args.len() {
-            let file = args.get(i);
-            let source = match read(file) {
+        while i < args.len(&cx) {
+            let file = args.get(&cx, i);
+            let source = match read(&cx, file) {
                 Option::Some(s) => s,
-                Option::None => fail(Out::new().put("cannot read ").add(file).done()),
+                Option::None => fail(&cx, Out::new(&cx).put(&cx, "cannot read ").add(&cx, file).done(&cx)),
             };
-            Out::new().put("== ").add(file).put("\n").done().print(1);
-            syntax_dump::items(parse(source, file, ids)).print(1);
+            Out::new(&cx).put(&cx, "== ").add(&cx, file).put(&cx, "\n").done(&cx).print(&cx, 1);
+            syntax_dump::items(&cx, parse(&cx, source, file, ids)).print(&cx, 1);
             i = i + 1usize;
         }
         0
-    } else if command.is("selftest-types") {
-        selftest_types(args.from(1usize));
+    } else if command.is(&cx, "selftest-types") {
+        selftest_types(&cx, args.from(&cx, 1usize));
         0
-    } else if command.is("resolve") && args.len() == 2usize {
-        resolve_dump::program(resolve(args.get(1usize))).print(1);
+    } else if command.is(&cx, "resolve") && args.len(&cx) == 2usize {
+        resolve_dump::program(&cx, resolve(&cx, args.get(&cx, 1usize))).print(&cx, 1);
         0
-    } else if command.is("sigs") && args.len() == 2usize {
-        sigs_dump::program(signatures(resolve(args.get(1usize)), Fresh::new())).print(1);
+    } else if command.is(&cx, "sigs") && args.len(&cx) == 2usize {
+        sigs_dump::program(&cx, signatures(&cx, resolve(&cx, args.get(&cx, 1usize)), Fresh::new(&cx))).print(&cx, 1);
         0
-    } else if command.is("infer") && args.len() == 2usize {
-        let counter = Fresh::new();
-        let r = resolve(args.get(1usize));
-        infer_dump::program(infer(r, signatures(r, counter), counter)).print(1);
+    } else if command.is(&cx, "infer") && args.len(&cx) == 2usize {
+        let counter = Fresh::new(&cx);
+        let r = resolve(&cx, args.get(&cx, 1usize));
+        infer_dump::program(&cx, infer(&cx, r, signatures(&cx, r, counter), counter)).print(&cx, 1);
         0
-    } else if command.is("kurs") && args.len() == 2usize {
-        let file = args.get(1usize);
-        let source = match read(file) {
+    } else if command.is(&cx, "kurs") && args.len(&cx) == 2usize {
+        let file = args.get(&cx, 1usize);
+        let source = match read(&cx, file) {
             Option::Some(s) => s,
-            Option::None => fail(Out::new().put("cannot read ").add(file).done()),
+            Option::None => fail(&cx, Out::new(&cx).put(&cx, "cannot read ").add(&cx, file).done(&cx)),
         };
-        write_program(parse_program(source)).print(1);
+        write_program(&cx, parse_program(&cx, source)).print(&cx, 1);
         0
-    } else if command.is("check") && args.len() == 2usize {
-        let unit = check_program(parse_program(read_file(args.get(1usize))), Fresh::new());
+    } else if command.is(&cx, "check") && args.len(&cx) == 2usize {
+        let unit = check_program(&cx, parse_program(&cx, read_file(&cx, args.get(&cx, 1usize))), Fresh::new(&cx));
         0
-    } else if command.is("c") {
-        var file: Option[Text] = Option::None;
-        var entry: Option[Text] = Option::None;
+    } else if command.is(&cx, "c") {
+        var file: Option[Text['k]] = Option::None;
+        var entry: Option[Text['k]] = Option::None;
         var i = 1usize;
-        while i < args.len() {
-            if args.get(i).is("--entry") && i + 1usize < args.len() {
-                entry = Option::Some.(args.get(i + 1usize));
+        while i < args.len(&cx) {
+            if args.get(&cx, i).is(&cx, "--entry") && i + 1usize < args.len(&cx) {
+                entry = Option::Some.(args.get(&cx, i + 1usize));
                 i = i + 2usize;
             } else if file.is_none() {
-                file = Option::Some.(args.get(i));
+                file = Option::Some.(args.get(&cx, i));
                 i = i + 1usize;
             } else {
-                fail(text("usage: kursal c FILE [--entry NAME]"));
+                fail(&cx, text(&cx, "usage: kursal c FILE [--entry NAME]"));
             }
         }
         let path = match file {
             Option::Some(f) => f,
-            Option::None => fail(text("usage: kursal c FILE [--entry NAME]")),
+            Option::None => fail(&cx, text(&cx, "usage: kursal c FILE [--entry NAME]")),
         };
-        let counter = Fresh::new();
-        let program = parse_program(read_file(path));
-        emit_c(program, check_program(program, counter), entry, counter).print(1);
+        let counter = Fresh::new(&cx);
+        let program = parse_program(&cx, read_file(&cx, path));
+        emit_c(&cx, program, check_program(&cx, program, counter), entry, counter).print(&cx, 1);
         0
-    } else if command.is("lower") && args.len() == 2usize {
-        let counter = Fresh::new();
-        let r = resolve(args.get(1usize));
-        write_program(lower(r, signatures(r, counter), counter)).print(1);
+    } else if command.is(&cx, "lower") && args.len(&cx) == 2usize {
+        let counter = Fresh::new(&cx);
+        let r = resolve(&cx, args.get(&cx, 1usize));
+        write_program(&cx, lower(&cx, r, signatures(&cx, r, counter), counter)).print(&cx, 1);
         0
-    } else if command.is("build") {
-        build(args.from(1usize));
+    } else if command.is(&cx, "build") {
+        build(&cx, args.from(&cx, 1usize));
         0
-    } else if command.is("readable") && args.len() == 2usize {
-        emit_kurs(parse_program(read_file(args.get(1usize))), Fresh::new()).print(1);
+    } else if command.is(&cx, "readable") && args.len(&cx) == 2usize {
+        emit_kurs(&cx, parse_program(&cx, read_file(&cx, args.get(&cx, 1usize))), Fresh::new(&cx)).print(&cx, 1);
         0
     } else {
-        fail(Out::new().put("unknown command ").add(command).done())
+        fail(&cx, Out::new(&cx).put(&cx, "unknown command ").add(&cx, command).done(&cx))
     }
 }
 
-fn read_file(file: Text) -> Text {
-    match read(file) {
+forall 'k.
+fn read_file(&cx: Cx!['k], file: Text['k]) -> Text['k] {
+    match read(&cx, file) {
         Option::Some(s) => s,
-        Option::None => fail(Out::new().put("cannot read ").add(file).done()),
+        Option::None => fail(&cx, Out::new(&cx).put(&cx, "cannot read ").add(&cx, file).done(&cx)),
     }
 }
 
 // The time since `started` as `NAME: 1.5s` on stderr, when `times`; the time now.
-fn stage(times: bool, name: Slice[u8, 'static], started: u64) -> u64 {
+forall 'k.
+fn stage(&cx: Cx!['k], times: bool, name: Slice[u8, 'static], started: u64) -> u64 {
     let now = now_ms();
     if times {
         let ms = now - started;
-        Out::new().put(name).put(": ").u64(ms / 1000u64).put(".").u64(ms % 1000u64 / 100u64).put("s\n").done().print(2);
+        Out::new(&cx).put(&cx, name).put(&cx, ": ").u64(&cx, ms / 1000u64).put(&cx, ".").u64(&cx, ms % 1000u64 / 100u64).put(&cx, "s\n").done(&cx).print(&cx, 2);
     }
     now
 }
 
 // `kursal build PATH [-o OUTPUT] [--times]`.
-fn build(args: Seq[Text]) {
-    var path: Option[Text] = Option::None;
-    var output: Option[Text] = Option::None;
+forall 'k.
+fn build(&cx: Cx!['k], args: Seq[Text['k], 'k]) {
+    var path: Option[Text['k]] = Option::None;
+    var output: Option[Text['k]] = Option::None;
     var times = false;
     var i = 0usize;
-    while i < args.len() {
-        if args.get(i).is("--times") {
+    while i < args.len(&cx) {
+        if args.get(&cx, i).is(&cx, "--times") {
             times = true;
             i = i + 1usize;
-        } else if args.get(i).is("-o") && i + 1usize < args.len() && output.is_none() {
-            output = Option::Some.(args.get(i + 1usize));
+        } else if args.get(&cx, i).is(&cx, "-o") && i + 1usize < args.len(&cx) && output.is_none() {
+            output = Option::Some.(args.get(&cx, i + 1usize));
             i = i + 2usize;
         } else if path.is_none() {
-            path = Option::Some.(args.get(i));
+            path = Option::Some.(args.get(&cx, i));
             i = i + 1usize;
         } else {
-            fail(text("usage: kursal build PATH [-o OUTPUT] [--times]"));
+            fail(&cx, text(&cx, "usage: kursal build PATH [-o OUTPUT] [--times]"));
         }
     }
     let package = match path {
         Option::Some(p) => p,
-        Option::None => fail(text("usage: kursal build PATH [-o OUTPUT] [--times]")),
+        Option::None => fail(&cx, text(&cx, "usage: kursal build PATH [-o OUTPUT] [--times]")),
     };
     var started = now_ms();
-    let counter = Fresh::new();
-    let r = resolve(package);
-    let sigs = signatures(r, counter);
-    started = stage(times, "signatures", started);
-    let program = lower(r, sigs, counter);
-    started = stage(times, "lower", started);
-    let checker = check_program(program, counter);
-    started = stage(times, "check", started);
-    let entry = match r.packages.get(0usize).entry_decl.get() {
-        Option::Some(decl) => Option::Some.(sigs.name(decl)),
+    let counter = Fresh::new(&cx);
+    let r = resolve(&cx, package);
+    let sigs = signatures(&cx, r, counter);
+    started = stage(&cx, times, "signatures", started);
+    let program = lower(&cx, r, sigs, counter);
+    started = stage(&cx, times, "lower", started);
+    let checker = check_program(&cx, program, counter);
+    started = stage(&cx, times, "check", started);
+    let entry = match r.packages.get(&cx, 0usize).entry_decl.get(&cx) {
+        Option::Some(decl) => Option::Some.(sigs.name(&cx, decl)),
         Option::None => Option::None,
     };
-    let c_text = emit_c(program, checker, entry, counter);
-    started = stage(times, "C", started);
+    let c_text = emit_c(&cx, program, checker, entry, counter);
+    started = stage(&cx, times, "C", started);
     let out = match output {
         Option::Some(o) => o,
         Option::None => {
-            c_text.print(1);
+            c_text.print(&cx, 1);
             return;
         },
     };
-    let c_file = Out::new().add(out).put(".c").done();
-    if !write(c_file, c_text) {
-        fail(Out::new().put("cannot write ").add(c_file).done());
+    let c_file = Out::new(&cx).add(&cx, out).put(&cx, ".c").done(&cx);
+    if !write(&cx, c_file, c_text) {
+        fail(&cx, Out::new(&cx).put(&cx, "cannot write ").add(&cx, c_file).done(&cx));
     }
-    let lib = lib_dir();
-    let command: Seq[Text] = Seq::new();
-    command.push(text("cc"));
-    command.push(text("-O2"));
-    command.push(text("-w"));
-    command.push(text("-fno-builtin"));
-    command.push(c_file);
-    command.push(Out::new().add(lib).put("/libc/fs.c").done());
-    command.push(Out::new().add(lib).put("/libc/thread.c").done());
-    command.push(text("-lpthread"));
-    command.push(text("-o"));
-    command.push(out);
-    let built = run(command);
-    started = stage(times, "cc", started);
+    let lib = lib_dir(&cx);
+    let command: Seq[Text['k], 'k] = Seq::new(&cx);
+    command.push(&cx, text(&cx, "cc"));
+    command.push(&cx, text(&cx, "-O2"));
+    command.push(&cx, text(&cx, "-w"));
+    command.push(&cx, text(&cx, "-fno-builtin"));
+    command.push(&cx, c_file);
+    command.push(&cx, Out::new(&cx).add(&cx, lib).put(&cx, "/libc/fs.c").done(&cx));
+    command.push(&cx, Out::new(&cx).add(&cx, lib).put(&cx, "/libc/thread.c").done(&cx));
+    command.push(&cx, text(&cx, "-lpthread"));
+    command.push(&cx, text(&cx, "-o"));
+    command.push(&cx, out);
+    let built = run(&cx, command);
+    started = stage(&cx, times, "cc", started);
     if !built {
         stop(1);
     }

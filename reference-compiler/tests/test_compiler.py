@@ -62,8 +62,8 @@ ROOT = Path(__file__).resolve().parents[2]
 COMPILER = ROOT / "compiler"
 CACHE = Path(__file__).resolve().parents[1] / ".build"
 TESTS = Path(__file__).resolve().parent
-# Every run of the Kursal compiler is bounded: it frees nothing, so a runaway would take the machine's
-# memory.
+# Every run of the Kursal compiler is bounded: it keeps everything in one arena until the command ends,
+# so a runaway would take the machine's memory.
 MEMORY_LIMIT = 6 << 30
 TIME_LIMIT = 600
 

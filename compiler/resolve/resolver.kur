@@ -13,50 +13,57 @@
 //   NameRef::Prim(name)            a primitive type
 //   NameRef::Builtin(name)         a compiler-sealed name: Brand, Copy, builtin::fresh, ...
 
-use package::support::base::{Cell, Key, Map, Out, Seq, Set, Text, combine, fail, text};
+use package::support::base::{Cell, Cx, Map, Out, Seq, Set, Text, combine, fail, key_hash, key_same, text};
 use package::kurs::core::ModuleId;
 use package::syntax::parser::parse;
 use package::syntax::ast as S;
 use package::syntax::ast::{Expr, Pattern, Pos, Statement, Type, no_pos};
 use package::support::system::{environment, path_exists, list_directory, read, real_path};
+use std::hash::{HashIn, HashState};
 use std::option::{Option, Result};
 use std::slice::Slice;
 
 // Whether `name` is one of the space-separated `names`.
-fn among(name: Text, names: Slice[u8, 'static]) -> bool {
-    text(names).split(text(" ")).has(name)
+forall 'k.
+fn among(&cx: Cx!['k], name: Text['k], names: Slice[u8, 'static]) -> bool {
+    text(&cx, names).split(&cx, text(&cx, " ")).has(&cx, name)
 }
 
-fn is_prim(name: Text) -> bool {
-    among(name, "i8 i16 i32 i64 isize u8 u16 u32 u64 usize f32 f64 bool")
+forall 'k.
+fn is_prim(&cx: Cx!['k], name: Text['k]) -> bool {
+    among(&cx, name, "i8 i16 i32 i64 isize u8 u16 u32 u64 usize f32 f64 bool")
 }
 
-fn is_builtin_type(name: Text) -> bool {
-    among(name, "Brand Phantom Never")
+forall 'k.
+fn is_builtin_type(&cx: Cx!['k], name: Text['k]) -> bool {
+    among(&cx, name, "Brand Phantom Never")
 }
 
-fn is_builtin_trait(name: Text) -> bool {
-    among(name, "Copy Exposed")
+forall 'k.
+fn is_builtin_trait(&cx: Cx!['k], name: Text['k]) -> bool {
+    among(&cx, name, "Copy Exposed")
 }
 
 // Builtin values, unless a declaration of the name is in scope.
-fn is_builtin_value(name: Text) -> bool {
-    among(name, "alloca fence load_volatile store_volatile")
+forall 'k.
+fn is_builtin_value(&cx: Cx!['k], name: Text['k]) -> bool {
+    among(&cx, name, "alloca fence load_volatile store_volatile")
 }
 
 // The standard library's directory: `$KURSAL_LIB`, else `lib` beside the directory that holds the
 // compiler's binary (an installation's `bin/kursal` and `lib/`).
-fn lib_dir() -> Text {
-    let configured = match environment(text("KURSAL_LIB")) {
+forall 'k.
+fn lib_dir(&cx: Cx!['k]) -> Text['k] {
+    let configured = match environment(&cx, text(&cx, "KURSAL_LIB")) {
         Option::Some(v) => v,
-        Option::None => text(""),
+        Option::None => text(&cx, ""),
     };
     if !configured.is_empty() {
-        clean(configured)
+        clean(&cx, configured)
     } else {
-        match real_path(text("/proc/self/exe")) {
-            Option::Some(exe) => join(parent(parent(exe)), text("lib")),
-            Option::None => fail(text("set KURSAL_LIB to the standard library's directory")),
+        match real_path(&cx, text(&cx, "/proc/self/exe")) {
+            Option::Some(exe) => join(&cx, parent(&cx, parent(&cx, exe)), text(&cx, "lib")),
+            Option::None => fail(&cx, text(&cx, "set KURSAL_LIB to the standard library's directory")),
         }
     }
 }
@@ -64,100 +71,108 @@ fn lib_dir() -> Text {
 // ------------------------------------------------------------------ paths --
 
 // `path` as Python's `Path` spells it: no repeated, trailing or `.` separators.
-fn clean(path: Text) -> Text {
-    let parts = path.split(text("/"));
-    let out = Out::new();
-    if path.starts_with(text("/")) {
-        let unit = out.put("/");
+forall 'k.
+fn clean(&cx: Cx!['k], path: Text['k]) -> Text['k] {
+    let parts = path.split(&cx, text(&cx, "/"));
+    let out = Out::new(&cx);
+    if path.starts_with(&cx, text(&cx, "/")) {
+        let unit = out.put(&cx, "/");
     }
     var first = true;
     var i = 0usize;
-    while i < parts.len() {
-        let part = parts.get(i);
-        if !part.is_empty() && !part.is(".") {
+    while i < parts.len(&cx) {
+        let part = parts.get(&cx, i);
+        if !part.is_empty() && !part.is(&cx, ".") {
             if !first {
-                let unit = out.put("/");
+                let unit = out.put(&cx, "/");
             }
-            let unit = out.add(part);
+            let unit = out.add(&cx, part);
             first = false;
         }
         i = i + 1usize;
     }
-    if out.len() == 0usize { text(".") } else { out.done() }
+    if out.len(&cx) == 0usize { text(&cx, ".") } else { out.done(&cx) }
 }
 
 // `a / b`: `b` when it is absolute.
-fn join(a: Text, b: Text) -> Text {
-    if b.starts_with(text("/")) || a.is_empty() || a.is(".") {
+forall 'k.
+fn join(&cx: Cx!['k], a: Text['k], b: Text['k]) -> Text['k] {
+    if b.starts_with(&cx, text(&cx, "/")) || a.is_empty() || a.is(&cx, ".") {
         b
-    } else if a.ends_with(text("/")) {
-        a.concat(b)
+    } else if a.ends_with(&cx, text(&cx, "/")) {
+        a.concat(&cx, b)
     } else {
-        Out::new().add(a).put("/").add(b).done()
+        Out::new(&cx).add(&cx, a).put(&cx, "/").add(&cx, b).done(&cx)
     }
 }
 
-fn parent(path: Text) -> Text {
-    match path.rfind_byte(b'/') {
-        Option::Some(at) => if at == 0usize { text("/") } else { path.slice(0usize, at) },
-        Option::None => text("."),
+forall 'k.
+fn parent(&cx: Cx!['k], path: Text['k]) -> Text['k] {
+    match path.rfind_byte(&cx, b'/') {
+        Option::Some(at) => if at == 0usize { text(&cx, "/") } else { path.slice(0usize, at) },
+        Option::None => text(&cx, "."),
     }
 }
 
 // The last component.
-fn base_name(path: Text) -> Text {
-    match path.rfind_byte(b'/') {
+forall 'k.
+fn base_name(&cx: Cx!['k], path: Text['k]) -> Text['k] {
+    match path.rfind_byte(&cx, b'/') {
         Option::Some(at) => path.from(at + 1usize),
         Option::None => path,
     }
 }
 
 // The last component's extension, with its dot: `Path.suffix`.
-fn suffix(path: Text) -> Text {
-    let name = base_name(path);
-    match name.rfind_byte(b'.') {
-        Option::Some(at) => if at > 0usize && at + 1usize < name.len { name.from(at) } else { text("") },
-        Option::None => text(""),
+forall 'k.
+fn suffix(&cx: Cx!['k], path: Text['k]) -> Text['k] {
+    let name = base_name(&cx, path);
+    match name.rfind_byte(&cx, b'.') {
+        Option::Some(at) => if at > 0usize && at + 1usize < name.len() { name.from(at) } else { text(&cx, "") },
+        Option::None => text(&cx, ""),
     }
 }
 
 // The last component without its extension: `Path.stem`.
-fn stem(path: Text) -> Text {
-    let name = base_name(path);
-    name.slice(0usize, name.len - suffix(name).len)
+forall 'k.
+fn stem(&cx: Cx!['k], path: Text['k]) -> Text['k] {
+    let name = base_name(&cx, path);
+    name.slice(0usize, name.len() - suffix(&cx, name).len())
 }
 
 // The absolute path with no symbolic links that `path` names, existing or not: `Path.resolve()`.
 // The longest existing prefix has its links resolved; the rest is appended, with `..` removing the
 // component before it.
-fn resolved(path: Text) -> Text {
-    if path.starts_with(text("/")) {
-        resolve_absolute(path)
+forall 'k.
+fn resolved(&cx: Cx!['k], path: Text['k]) -> Text['k] {
+    if path.starts_with(&cx, text(&cx, "/")) {
+        resolve_absolute(&cx, path)
     } else {
-        let cwd = match real_path(text(".")) {
+        let cwd = match real_path(&cx, text(&cx, ".")) {
             Option::Some(c) => c,
-            Option::None => fail(text("cannot find the current directory")),
+            Option::None => fail(&cx, text(&cx, "cannot find the current directory")),
         };
-        resolve_absolute(join(cwd, path))
+        resolve_absolute(&cx, join(&cx, cwd, path))
     }
 }
 
-fn resolve_absolute(path: Text) -> Text {
-    match real_path(path) {
+forall 'k.
+fn resolve_absolute(&cx: Cx!['k], path: Text['k]) -> Text['k] {
+    match real_path(&cx, path) {
         Option::Some(r) => r,
         Option::None => {
-            if path.is("/") {
+            if path.is(&cx, "/") {
                 path
             } else {
-                let base = resolve_absolute(parent(path));
-                let name = base_name(path);
-                if name.is_empty() || name.is(".") {
+                let base = resolve_absolute(&cx, parent(&cx, path));
+                let name = base_name(&cx, path);
+                if name.is_empty() || name.is(&cx, ".") {
                     base
-                } else if name.is("..") {
-                    parent(base)
+                } else if name.is(&cx, "..") {
+                    parent(&cx, base)
                 } else {
-                    let joined = join(base, name);
-                    match real_path(joined) {
+                    let joined = join(&cx, base, name);
+                    match real_path(&cx, joined) {
                         Option::Some(r) => r,
                         Option::None => joined,
                     }
@@ -170,209 +185,218 @@ fn resolve_absolute(path: Text) -> Text {
 // --------------------------------------------------------- Python's repr --
 
 // A string as Python's `repr` writes it.
-fn repr(t: Text) -> Text {
-    let quote = if t.contains(text("'")) && !t.contains(text("\"")) { b'"' } else { b'\'' };
-    let out = Out::new().byte(quote);
+forall 'k.
+fn repr(&cx: Cx!['k], t: Text['k]) -> Text['k] {
+    let quote = if t.contains(&cx, text(&cx, "'")) && !t.contains(&cx, text(&cx, "\"")) { b'"' } else { b'\'' };
+    let out = Out::new(&cx).byte(&cx, quote);
     var i = 0usize;
-    while i < t.len {
-        let b = t.byte(i);
+    while i < t.len() {
+        let b = t.byte(&cx, i);
         if b == b'\\' || b == quote {
-            let unit = out.byte(b'\\').byte(b);
+            let unit = out.byte(&cx, b'\\').byte(&cx, b);
         } else if b == b'\n' {
-            let unit = out.put("\\n");
+            let unit = out.put(&cx, "\\n");
         } else if b == b'\t' {
-            let unit = out.put("\\t");
+            let unit = out.put(&cx, "\\t");
         } else if b == b'\r' {
-            let unit = out.put("\\r");
+            let unit = out.put(&cx, "\\r");
         } else if b < 32u8 || b == 127u8 {
-            let digits = text("0123456789abcdef");
-            let unit = out.put("\\x").byte(digits.byte((b / 16u8) as usize)).byte(digits.byte((b % 16u8) as usize));
+            let digits = text(&cx, "0123456789abcdef");
+            let unit = out.put(&cx, "\\x").byte(&cx, digits.byte(&cx, (b / 16u8) as usize)).byte(&cx, digits.byte(&cx, (b % 16u8) as usize));
         } else {
-            let unit = out.byte(b);
+            let unit = out.byte(&cx, b);
         }
         i = i + 1usize;
     }
-    out.byte(quote).done()
+    out.byte(&cx, quote).done(&cx)
 }
 
 // A tuple of strings as Python's `repr` writes it: `()`, `('a',)`, `('a', 'b')`.
-fn repr_tuple(names: Seq[Text]) -> Text {
-    let out = Out::new().put("(");
+forall 'k.
+fn repr_tuple(&cx: Cx!['k], names: Seq[Text['k], 'k]) -> Text['k] {
+    let out = Out::new(&cx).put(&cx, "(");
     var i = 0usize;
-    while i < names.len() {
+    while i < names.len(&cx) {
         if i > 0usize {
-            let unit = out.put(", ");
+            let unit = out.put(&cx, ", ");
         }
-        let unit = out.add(repr(names.get(i)));
+        let unit = out.add(&cx, repr(&cx, names.get(&cx, i)));
         i = i + 1usize;
     }
-    if names.len() == 1usize {
-        let unit = out.put(",");
+    if names.len(&cx) == 1usize {
+        let unit = out.put(&cx, ",");
     }
-    out.put(")").done()
+    out.put(&cx, ")").done(&cx)
 }
 
-fn repr_module(m: ModuleId) -> Text {
-    Out::new().put("ModuleId(package=").usize(m.package).put(", path=").add(repr_tuple(m.path)).put(")").done()
+forall 'k.
+fn repr_module(&cx: Cx!['k], m: ModuleId['k]) -> Text['k] {
+    Out::new(&cx).put(&cx, "ModuleId(package=").usize(&cx, m.package).put(&cx, ", path=").add(&cx, repr_tuple(&cx, m.path)).put(&cx, ")").done(&cx)
 }
 
 // `'::'.join(names)`.
-fn joined(names: Seq[Text]) -> Text {
-    let out = Out::new();
+forall 'k.
+fn joined(&cx: Cx!['k], names: Seq[Text['k], 'k]) -> Text['k] {
+    let out = Out::new(&cx);
     var i = 0usize;
-    while i < names.len() {
+    while i < names.len(&cx) {
         if i > 0usize {
-            let unit = out.put("::");
+            let unit = out.put(&cx, "::");
         }
-        let unit = out.add(names.get(i));
+        let unit = out.add(&cx, names.get(&cx, i));
         i = i + 1usize;
     }
-    out.done()
+    out.done(&cx)
 }
 
-fn text_before(a: Text, b: Text) -> bool {
-    a.compare(b) < 0
+forall 'k.
+fn text_before(&cx: Cx!['k], a: Text['k], b: Text['k]) -> bool {
+    a.compare(&cx, b) < 0
 }
 
 // ---------------------------------------------------------- the manifest --
 
 // A manifest value: a string, a table in key order, or any other TOML value.
+forall 'k.
 exposed enum Toml {
-    Str(Text),
-    Table(Map[Text, Toml]),
+    Str(Text['k]),
+    Table(Map[Text['k], Toml['k], 'k]),
     Other,
 }
 
 // A reader for the TOML that manifests use: tables, dotted keys and headers, strings, inline
 // tables, and other values (numbers, booleans, arrays, dates) read only as far as their extent.
+forall 'k.
 exposed struct TomlReader {
-    src: Text,
-    i: Cell[usize],
-    file: Text,
+    src: Text['k],
+    i: Cell[usize, 'k],
+    file: Text['k],
 }
 
-fn read_toml(source: Text, file: Text) -> Map[Text, Toml] {
-    let r = TomlReader.{ src: source, i: Cell::new(0usize), file };
-    r.document()
+forall 'k.
+fn read_toml(&cx: Cx!['k], source: Text['k], file: Text['k]) -> Map[Text['k], Toml['k], 'k] {
+    let r = TomlReader.{ src: source, i: Cell::new(&cx, 0usize), file };
+    r.document(&cx)
 }
 
-impl TomlReader {
-    fn at(self) -> u8 {
-        self.src.byte(self.i.get())
+forall 'k.
+impl TomlReader['k] {
+    fn at(self, &cx: Cx!['k]) -> u8 {
+        self.src.byte(&cx, self.i.get(&cx))
     }
 
-    fn done(self) -> bool {
-        self.i.get() >= self.src.len
+    fn done(self, &cx: Cx!['k]) -> bool {
+        self.i.get(&cx) >= self.src.len()
     }
 
-    fn advance(self) {
-        self.i.set(self.i.get() + 1usize);
+    fn advance(self, &cx: Cx!['k]) {
+        self.i.set(&cx, self.i.get(&cx) + 1usize);
     }
 
-    fn fail(self) -> ! {
+    fn fail(self, &cx: Cx!['k]) -> ! {
         var line = 1usize;
         var k = 0usize;
-        while k < self.i.get() && k < self.src.len {
-            if self.src.byte(k) == b'\n' {
+        while k < self.i.get(&cx) && k < self.src.len() {
+            if self.src.byte(&cx, k) == b'\n' {
                 line = line + 1usize;
             }
             k = k + 1usize;
         }
-        fail(Out::new().add(self.file).put(":").usize(line).put(": invalid manifest").done())
+        fail(&cx, Out::new(&cx).add(&cx, self.file).put(&cx, ":").usize(&cx, line).put(&cx, ": invalid manifest").done(&cx))
     }
 
-    fn expect(self, b: u8) {
-        if self.done() || self.at() != b {
-            self.fail();
+    fn expect(self, &cx: Cx!['k], b: u8) {
+        if self.done(&cx) || self.at(&cx) != b {
+            self.fail(&cx);
         }
-        self.advance();
+        self.advance(&cx);
     }
 
     // Spaces and tabs.
-    fn blank(self) {
-        while !self.done() && (self.at() == b' ' || self.at() == b'\t') {
-            self.advance();
+    fn blank(self, &cx: Cx!['k]) {
+        while !self.done(&cx) && (self.at(&cx) == b' ' || self.at(&cx) == b'\t') {
+            self.advance(&cx);
         }
     }
 
     // Spaces, newlines and comments.
-    fn space(self) {
+    fn space(self, &cx: Cx!['k]) {
         var going = true;
-        while going && !self.done() {
-            let b = self.at();
+        while going && !self.done(&cx) {
+            let b = self.at(&cx);
             if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
-                self.advance();
+                self.advance(&cx);
             } else if b == b'#' {
-                self.comment();
+                self.comment(&cx);
             } else {
                 going = false;
             }
         }
     }
 
-    fn comment(self) {
-        while !self.done() && self.at() != b'\n' {
-            self.advance();
+    fn comment(self, &cx: Cx!['k]) {
+        while !self.done(&cx) && self.at(&cx) != b'\n' {
+            self.advance(&cx);
         }
     }
 
     // The rest of a line after a key-value pair or a header: blanks and a comment.
-    fn line_end(self) {
-        self.blank();
-        if !self.done() && self.at() == b'#' {
-            self.comment();
+    fn line_end(self, &cx: Cx!['k]) {
+        self.blank(&cx);
+        if !self.done(&cx) && self.at(&cx) == b'#' {
+            self.comment(&cx);
         }
-        if !self.done() {
-            if self.at() == b'\r' {
-                self.advance();
+        if !self.done(&cx) {
+            if self.at(&cx) == b'\r' {
+                self.advance(&cx);
             }
-            self.expect(b'\n');
+            self.expect(&cx, b'\n');
         }
     }
 
-    fn document(self) -> Map[Text, Toml] {
-        let root: Map[Text, Toml] = Map::new();
+    fn document(self, &cx: Cx!['k]) -> Map[Text['k], Toml['k], 'k] {
+        let root: Map[Text['k], Toml['k], 'k] = Map::new(&cx);
         var current = root;
-        self.space();
-        while !self.done() {
-            if self.at() == b'[' {
-                self.advance();
-                if !self.done() && self.at() == b'[' {
-                    self.fail();
+        self.space(&cx);
+        while !self.done(&cx) {
+            if self.at(&cx) == b'[' {
+                self.advance(&cx);
+                if !self.done(&cx) && self.at(&cx) == b'[' {
+                    self.fail(&cx);
                 }
-                self.blank();
-                let keys = self.key();
-                self.blank();
-                self.expect(b']');
-                self.line_end();
-                current = self.descend(root, keys, keys.len());
+                self.blank(&cx);
+                let keys = self.key(&cx);
+                self.blank(&cx);
+                self.expect(&cx, b']');
+                self.line_end(&cx);
+                current = self.descend(&cx, root, keys, keys.len(&cx));
             } else {
-                let keys = self.key();
-                self.blank();
-                self.expect(b'=');
-                self.blank();
-                let value = self.value();
-                self.line_end();
-                self.define(current, keys, value);
+                let keys = self.key(&cx);
+                self.blank(&cx);
+                self.expect(&cx, b'=');
+                self.blank(&cx);
+                let value = self.value(&cx);
+                self.line_end(&cx);
+                self.define(&cx, current, keys, value);
             }
-            self.space();
+            self.space(&cx);
         }
         root
     }
 
     // The table `keys[..count]` names under `table`, made where missing.
-    fn descend(self, table: Map[Text, Toml], keys: Seq[Text], count: usize) -> Map[Text, Toml] {
+    fn descend(self, &cx: Cx!['k], table: Map[Text['k], Toml['k], 'k], keys: Seq[Text['k], 'k], count: usize) -> Map[Text['k], Toml['k], 'k] {
         var t = table;
         var k = 0usize;
         while k < count {
-            t = match t.get(keys.get(k)) {
+            t = match t.get(&cx, keys.get(&cx, k)) {
                 Option::Some(v) => match v {
                     Toml::Table(inner) => inner,
-                    _ => self.fail(),
+                    _ => self.fail(&cx),
                 },
                 Option::None => {
-                    let inner: Map[Text, Toml] = Map::new();
-                    t.set(keys.get(k), Toml::Table.(inner));
+                    let inner: Map[Text['k], Toml['k], 'k] = Map::new(&cx);
+                    t.set(&cx, keys.get(&cx, k), Toml::Table.(inner));
                     inner
                 },
             };
@@ -381,168 +405,168 @@ impl TomlReader {
         t
     }
 
-    fn define(self, table: Map[Text, Toml], keys: Seq[Text], value: Toml) {
-        let t = self.descend(table, keys, keys.len() - 1usize);
-        if t.has(keys.last()) {
-            self.fail();
+    fn define(self, &cx: Cx!['k], table: Map[Text['k], Toml['k], 'k], keys: Seq[Text['k], 'k], value: Toml['k]) {
+        let t = self.descend(&cx, table, keys, keys.len(&cx) - 1usize);
+        if t.has(&cx, keys.last(&cx)) {
+            self.fail(&cx);
         }
-        t.set(keys.last(), value);
+        t.set(&cx, keys.last(&cx), value);
     }
 
     // A dotted key.
-    fn key(self) -> Seq[Text] {
-        let keys: Seq[Text] = Seq::one(self.simple_key());
-        self.blank();
-        while !self.done() && self.at() == b'.' {
-            self.advance();
-            self.blank();
-            keys.push(self.simple_key());
-            self.blank();
+    fn key(self, &cx: Cx!['k]) -> Seq[Text['k], 'k] {
+        let keys: Seq[Text['k], 'k] = Seq::one(&cx, self.simple_key(&cx));
+        self.blank(&cx);
+        while !self.done(&cx) && self.at(&cx) == b'.' {
+            self.advance(&cx);
+            self.blank(&cx);
+            keys.push(&cx, self.simple_key(&cx));
+            self.blank(&cx);
         }
         keys
     }
 
-    fn simple_key(self) -> Text {
-        if self.done() {
-            self.fail();
+    fn simple_key(self, &cx: Cx!['k]) -> Text['k] {
+        if self.done(&cx) {
+            self.fail(&cx);
         }
-        let b = self.at();
+        let b = self.at(&cx);
         if b == b'"' || b == b'\'' {
-            self.string()
+            self.string(&cx)
         } else {
-            let start = self.i.get();
-            while !self.done() && is_bare(self.at()) {
-                self.advance();
+            let start = self.i.get(&cx);
+            while !self.done(&cx) && is_bare(self.at(&cx)) {
+                self.advance(&cx);
             }
-            if self.i.get() == start {
-                self.fail();
+            if self.i.get(&cx) == start {
+                self.fail(&cx);
             }
-            self.src.slice(start, self.i.get())
+            self.src.slice(start, self.i.get(&cx))
         }
     }
 
-    fn value(self) -> Toml {
-        if self.done() {
-            self.fail();
+    fn value(self, &cx: Cx!['k]) -> Toml['k] {
+        if self.done(&cx) {
+            self.fail(&cx);
         }
-        let b = self.at();
+        let b = self.at(&cx);
         if b == b'"' || b == b'\'' {
-            Toml::Str.(self.string())
+            Toml::Str.(self.string(&cx))
         } else if b == b'{' {
-            self.advance();
-            let table: Map[Text, Toml] = Map::new();
-            self.blank();
-            if !self.done() && self.at() == b'}' {
-                self.advance();
+            self.advance(&cx);
+            let table: Map[Text['k], Toml['k], 'k] = Map::new(&cx);
+            self.blank(&cx);
+            if !self.done(&cx) && self.at(&cx) == b'}' {
+                self.advance(&cx);
             } else {
                 var going = true;
                 while going {
-                    self.blank();
-                    let keys = self.key();
-                    self.blank();
-                    self.expect(b'=');
-                    self.blank();
-                    let value = self.value();
-                    self.define(table, keys, value);
-                    self.blank();
-                    if !self.done() && self.at() == b',' {
-                        self.advance();
+                    self.blank(&cx);
+                    let keys = self.key(&cx);
+                    self.blank(&cx);
+                    self.expect(&cx, b'=');
+                    self.blank(&cx);
+                    let value = self.value(&cx);
+                    self.define(&cx, table, keys, value);
+                    self.blank(&cx);
+                    if !self.done(&cx) && self.at(&cx) == b',' {
+                        self.advance(&cx);
                     } else {
-                        self.expect(b'}');
+                        self.expect(&cx, b'}');
                         going = false;
                     }
                 }
             }
             Toml::Table.(table)
         } else if b == b'[' {
-            self.advance();
-            self.space();
-            while !self.done() && self.at() != b']' {
-                let unit = self.value();
-                self.space();
-                if !self.done() && self.at() == b',' {
-                    self.advance();
-                    self.space();
-                } else if self.done() || self.at() != b']' {
-                    self.fail();
+            self.advance(&cx);
+            self.space(&cx);
+            while !self.done(&cx) && self.at(&cx) != b']' {
+                let unit = self.value(&cx);
+                self.space(&cx);
+                if !self.done(&cx) && self.at(&cx) == b',' {
+                    self.advance(&cx);
+                    self.space(&cx);
+                } else if self.done(&cx) || self.at(&cx) != b']' {
+                    self.fail(&cx);
                 }
             }
-            self.expect(b']');
+            self.expect(&cx, b']');
             Toml::Other
         } else {
-            let start = self.i.get();
-            while !self.done() && is_scalar(self.at()) {
-                self.advance();
+            let start = self.i.get(&cx);
+            while !self.done(&cx) && is_scalar(self.at(&cx)) {
+                self.advance(&cx);
             }
-            if self.i.get() == start {
-                self.fail();
+            if self.i.get(&cx) == start {
+                self.fail(&cx);
             }
             Toml::Other
         }
     }
 
     // A basic or literal string, on one line or several.
-    fn string(self) -> Text {
-        let quote = self.at();
-        let multi = self.src.slice(self.i.get(), self.i.get() + 3usize).eq(Out::new().byte(quote).byte(quote).byte(quote).done());
-        let out = Out::new();
+    fn string(self, &cx: Cx!['k]) -> Text['k] {
+        let quote = self.at(&cx);
+        let multi = self.src.slice(self.i.get(&cx), self.i.get(&cx) + 3usize).eq(&cx, Out::new(&cx).byte(&cx, quote).byte(&cx, quote).byte(&cx, quote).done(&cx));
+        let out = Out::new(&cx);
         if multi {
-            self.i.set(self.i.get() + 3usize);
-            if !self.done() && self.at() == b'\n' {
-                self.advance();
-            } else if self.src.slice(self.i.get(), self.i.get() + 2usize).is("\r\n") {
-                self.i.set(self.i.get() + 2usize);
+            self.i.set(&cx, self.i.get(&cx) + 3usize);
+            if !self.done(&cx) && self.at(&cx) == b'\n' {
+                self.advance(&cx);
+            } else if self.src.slice(self.i.get(&cx), self.i.get(&cx) + 2usize).is(&cx, "\r\n") {
+                self.i.set(&cx, self.i.get(&cx) + 2usize);
             }
         } else {
-            self.advance();
+            self.advance(&cx);
         }
         var going = true;
         while going {
-            if self.done() {
-                self.fail();
+            if self.done(&cx) {
+                self.fail(&cx);
             }
-            let b = self.at();
-            if b == quote && (!multi || (self.src.byte(self.i.get() + 1usize) == quote && self.src.byte(self.i.get() + 2usize) == quote)) {
+            let b = self.at(&cx);
+            if b == quote && (!multi || (self.src.byte(&cx, self.i.get(&cx) + 1usize) == quote && self.src.byte(&cx, self.i.get(&cx) + 2usize) == quote)) {
                 let width = if multi { 3usize } else { 1usize };
-                self.i.set(self.i.get() + width);
+                self.i.set(&cx, self.i.get(&cx) + width);
                 going = false;
             } else if b == b'\n' && !multi {
-                self.fail();
+                self.fail(&cx);
             } else if b == b'\\' && quote == b'"' {
-                self.advance();
-                self.escape(out, multi);
+                self.advance(&cx);
+                self.escape(&cx, out, multi);
             } else {
-                let unit = out.byte(b);
-                self.advance();
+                let unit = out.byte(&cx, b);
+                self.advance(&cx);
             }
         }
-        out.done()
+        out.done(&cx)
     }
 
-    fn escape(self, out: Out, multi: bool) {
-        if self.done() {
-            self.fail();
+    fn escape(self, &cx: Cx!['k], out: Out['k], multi: bool) {
+        if self.done(&cx) {
+            self.fail(&cx);
         }
-        let b = self.at();
-        self.advance();
+        let b = self.at(&cx);
+        self.advance(&cx);
         if b == b'n' {
-            let unit = out.byte(b'\n');
+            let unit = out.byte(&cx, b'\n');
         } else if b == b't' {
-            let unit = out.byte(b'\t');
+            let unit = out.byte(&cx, b'\t');
         } else if b == b'r' {
-            let unit = out.byte(b'\r');
+            let unit = out.byte(&cx, b'\r');
         } else if b == b'b' {
-            let unit = out.byte(8u8);
+            let unit = out.byte(&cx, 8u8);
         } else if b == b'f' {
-            let unit = out.byte(12u8);
+            let unit = out.byte(&cx, 12u8);
         } else if b == b'"' || b == b'\\' {
-            let unit = out.byte(b);
+            let unit = out.byte(&cx, b);
         } else if b == b'u' || b == b'U' {
             let count = if b == b'u' { 4usize } else { 8usize };
             var code = 0u32;
             var k = 0usize;
             while k < count {
-                let d = self.at();
+                let d = self.at(&cx);
                 let digit = if d >= b'0' && d <= b'9' {
                     (d - b'0') as u32
                 } else if d >= b'a' && d <= b'f' {
@@ -550,19 +574,19 @@ impl TomlReader {
                 } else if d >= b'A' && d <= b'F' {
                     (d - b'A') as u32 + 10u32
                 } else {
-                    self.fail()
+                    self.fail(&cx)
                 };
                 code = code * 16u32 + digit;
-                self.advance();
+                self.advance(&cx);
                 k = k + 1usize;
             }
-            utf8(out, code);
+            utf8(&cx, out, code);
         } else if multi && (b == b'\n' || b == b' ' || b == b'\t' || b == b'\r') {
             // A line-ending backslash drops the whitespace after it.
-            self.i.set(self.i.get() - 1usize);
-            self.space();
+            self.i.set(&cx, self.i.get(&cx) - 1usize);
+            self.space(&cx);
         } else {
-            self.fail();
+            self.fail(&cx);
         }
     }
 }
@@ -575,55 +599,64 @@ fn is_scalar(b: u8) -> bool {
     !(b == b' ' || b == b'\t' || b == b'\r' || b == b'\n' || b == b',' || b == b']' || b == b'}' || b == b'#')
 }
 
-fn utf8(out: Out, code: u32) {
+forall 'k.
+fn utf8(&cx: Cx!['k], out: Out['k], code: u32) {
     if code < 128u32 {
-        let unit = out.byte(code as u8);
+        let unit = out.byte(&cx, code as u8);
     } else if code < 2048u32 {
-        let unit = out.byte((192u32 | (code >> 6u32)) as u8).byte((128u32 | (code & 63u32)) as u8);
+        let unit = out.byte(&cx, (192u32 | (code >> 6u32)) as u8).byte(&cx, (128u32 | (code & 63u32)) as u8);
     } else if code < 65536u32 {
-        let unit = out.byte((224u32 | (code >> 12u32)) as u8).byte((128u32 | ((code >> 6u32) & 63u32)) as u8).byte((128u32 | (code & 63u32)) as u8);
+        let unit = out.byte(&cx, (224u32 | (code >> 12u32)) as u8).byte(&cx, (128u32 | ((code >> 6u32) & 63u32)) as u8).byte(&cx, (128u32 | (code & 63u32)) as u8);
     } else {
-        let unit = out.byte((240u32 | (code >> 18u32)) as u8).byte((128u32 | ((code >> 12u32) & 63u32)) as u8).byte((128u32 | ((code >> 6u32) & 63u32)) as u8).byte((128u32 | (code & 63u32)) as u8);
+        let unit = out.byte(&cx, (240u32 | (code >> 18u32)) as u8).byte(&cx, (128u32 | ((code >> 12u32) & 63u32)) as u8).byte(&cx, (128u32 | ((code >> 6u32) & 63u32)) as u8).byte(&cx, (128u32 | (code & 63u32)) as u8);
     }
 }
 
 // ------------------------------------------------------------ the graph --
 
 // A declaration: compared by its `id`, unique in the program.
+forall 'k.
 exposed struct Decl {
     id: u32,
     // struct enum tuple fn extern trait const method
-    kind: Text,
-    home: ModuleId,
+    kind: Text['k],
+    home: ModuleId['k],
     // a method's name is `Target::method`
-    name: Text,
-    node: Named,
+    name: Text['k],
+    node: Named['k],
     // a method's or associated const's impl
-    impl_block: Option[S::Impl],
+    impl_block: Option[S::Impl['k]],
 }
 
-instance Key[Decl] {
-    fn key_hash(key: Decl) -> u64 {
-        Key::key_hash(key.id)
+forall 'k.
+instance HashIn[Decl['k], Cx!['k]] {
+    fn hash_in(cap: Cx!['k], key: Decl['k], state: HashState) -> (Cx!['k], HashState) {
+        var cx = cap;
+        let h = key_hash(&cx, key.id);
+        (cx, state.write_u64(h))
     }
 
-    fn key_same(a: Decl, b: Decl) -> bool {
-        a.id == b.id
+    fn eq_in(cap: Cx!['k], a: Decl['k], b: Decl['k]) -> (Cx!['k], bool) {
+        var cx = cap;
+        let equal = a.id == b.id;
+        (cx, equal)
     }
 }
 
 // The item a declaration declares.
+forall 'k.
 exposed enum Named {
-    Struct(S::StructDecl),
-    Enum(S::EnumDecl),
-    Tuple(S::TupleDecl),
-    Fn(S::Fn),
-    Extern(S::Extern),
-    Trait(S::TraitDecl),
-    Const(S::Const),
+    Struct(S::StructDecl['k]),
+    Enum(S::EnumDecl['k]),
+    Tuple(S::TupleDecl['k]),
+    Fn(S::Fn['k]),
+    Extern(S::Extern['k]),
+    Trait(S::TraitDecl['k]),
+    Const(S::Const['k]),
 }
 
-fn named_pos(n: Named) -> Pos {
+forall 'k.
+fn named_pos(n: Named['k]) -> Pos {
     match n {
         Named::Struct(x) => x.pos,
         Named::Enum(x) => x.pos,
@@ -635,7 +668,8 @@ fn named_pos(n: Named) -> Pos {
     }
 }
 
-fn item_pos(item: S::Item) -> Pos {
+forall 'k.
+fn item_pos(item: S::Item['k]) -> Pos {
     match item {
         S::Item::Use(x) => x.pos,
         S::Item::Module(x) => x.pos,
@@ -651,139 +685,158 @@ fn item_pos(item: S::Item) -> Pos {
     }
 }
 
+forall 'k.
 exposed struct Package {
     id: usize,
-    name: Cell[Text],
+    name: Cell[Text['k], 'k],
     // its directory
-    root: Text,
-    source_root: Cell[Text],
+    root: Text['k],
+    source_root: Cell[Text['k], 'k],
     // alias -> package id
-    deps: Map[Text, usize],
+    deps: Map[Text['k], usize, 'k],
     // an executable's entry path
-    entry: Cell[Option[Seq[Text]]],
+    entry: Cell[Option[Seq[Text['k], 'k]], 'k],
     // module -> source path
-    files: Map[ModuleId, Text],
-    entry_decl: Cell[Option[Decl]],
+    files: Map[ModuleId['k], Text['k], 'k],
+    entry_decl: Cell[Option[Decl['k]], 'k],
 }
 
 // One module's namespace.
+forall 'k.
 exposed struct Scope {
-    home: ModuleId,
-    decls: Map[Text, Decl],
+    home: ModuleId['k],
+    decls: Map[Text['k], Decl['k], 'k],
     // alias -> path
-    imports: Map[Text, Seq[Text]],
-    globs: Seq[Seq[Text]],
-    exports: Set[Text],
-    items: Seq[S::Item],
+    imports: Map[Text['k], Seq[Text['k], 'k], 'k],
+    globs: Seq[Seq[Text['k], 'k], 'k],
+    exports: Set[Text['k], 'k],
+    items: Seq[S::Item['k], 'k],
 }
 
 // What a path names.
+forall 'k.
 exposed enum Target {
-    Decl(Decl),
-    Module(ModuleId),
-    Variant(Decl, Text),
-    TraitMethod(Decl, Text),
+    Decl(Decl['k]),
+    Module(ModuleId['k]),
+    Variant(Decl['k], Text['k]),
+    TraitMethod(Decl['k], Text['k]),
 }
 
 // What a resolved node names; see the top of this file.
+forall 'k.
 exposed enum NameRef {
-    Decl(Decl),
-    Variant(Decl, Text),
-    TraitMethod(Decl, Text),
-    Assoc(Text, Text),
-    Param(Text),
-    Prim(Text),
-    Builtin(Text),
-    Local(Text),
+    Decl(Decl['k]),
+    Variant(Decl['k], Text['k]),
+    TraitMethod(Decl['k], Text['k]),
+    Assoc(Text['k], Text['k]),
+    Param(Text['k]),
+    Prim(Text['k]),
+    Builtin(Text['k]),
+    Local(Text['k]),
 }
 
 // A resolution error, before its file is known; a `pos` on line 0 is no position.
+forall 'k.
 exposed struct Problem {
-    message: Text,
+    message: Text['k],
     pos: Pos,
 }
 
 // What a method or associated const is attached to: a type declaration, a primitive type, or
 // nothing, for a blanket impl whose methods are found by method calls only.
+forall 'k.
 exposed enum Owner {
-    Decl(Decl),
-    Prim(Text),
+    Decl(Decl['k]),
+    Prim(Text['k]),
     Blanket,
 }
 
-instance Key[Owner] {
-    fn key_hash(key: Owner) -> u64 {
-        match key {
-            Owner::Decl(d) => combine(1u64, Key::key_hash(d.id)),
-            Owner::Prim(name) => combine(2u64, name.hash()),
-            Owner::Blanket => 3u64,
-        }
+forall 'k.
+instance HashIn[Owner['k], Cx!['k]] {
+    fn hash_in(cap: Cx!['k], key: Owner['k], state: HashState) -> (Cx!['k], HashState) {
+        var cx = cap;
+        let h = {
+            match key {
+                Owner::Decl(d) => combine(1u64, key_hash(&cx, d.id)),
+                Owner::Prim(name) => combine(2u64, name.hash(&cx)),
+                Owner::Blanket => 3u64,
+            }
+        };
+        (cx, state.write_u64(h))
     }
 
-    fn key_same(a: Owner, b: Owner) -> bool {
-        match a {
-            Owner::Decl(x) => match b {
-                Owner::Decl(y) => x.id == y.id,
-                _ => false,
-            },
-            Owner::Prim(x) => match b {
-                Owner::Prim(y) => x.eq(y),
-                _ => false,
-            },
-            Owner::Blanket => match b {
-                Owner::Blanket => true,
-                _ => false,
-            },
-        }
+    fn eq_in(cap: Cx!['k], a: Owner['k], b: Owner['k]) -> (Cx!['k], bool) {
+        var cx = cap;
+        let equal = {
+            match a {
+                Owner::Decl(x) => match b {
+                    Owner::Decl(y) => x.id == y.id,
+                    _ => false,
+                },
+                Owner::Prim(x) => match b {
+                    Owner::Prim(y) => x.eq(&cx, y),
+                    _ => false,
+                },
+                Owner::Blanket => match b {
+                    Owner::Blanket => true,
+                    _ => false,
+                },
+            }
+        };
+        (cx, equal)
     }
 }
 
 // A file and a position errors inside it are reported at when they have none of their own.
+forall 'k.
 exposed struct Location {
-    file: Text,
+    file: Text['k],
     pos: Pos,
 }
 
 // An error as `KursError` prints it: `line:col: message`, or the message alone.
-fn error_text(message: Text, pos: Pos) -> Text {
+forall 'k.
+fn error_text(&cx: Cx!['k], message: Text['k], pos: Pos) -> Text['k] {
     if pos.line == 0u32 {
         message
     } else {
-        Out::new().u64(pos.line as u64).put(":").u64(pos.col as u64).put(": ").add(message).done()
+        Out::new(&cx).u64(&cx, pos.line as u64).put(&cx, ":").u64(&cx, pos.col as u64).put(&cx, ": ").add(&cx, message).done(&cx)
     }
 }
 
 // The error `message` at `pos`, printed as `full`, naming `file` and, when it has no position of
 // its own, the position `at` of the item it is in. Returns the new printed form and position.
-fn located(full: Text, message: Text, pos: Pos, file: Text, at: Pos) -> (Text, Pos) {
-    if full.starts_with(file) {
+forall 'k.
+fn located(&cx: Cx!['k], full: Text['k], message: Text['k], pos: Pos, file: Text['k], at: Pos) -> (Text['k], Pos) {
+    if full.starts_with(&cx, file) {
         (full, pos)
     } else {
         let at_pos = if pos.line != 0u32 { pos } else { at };
         let prefix = if at_pos.line != 0u32 {
-            Out::new().add(file).put(":").u64(at_pos.line as u64).put(":").u64(at_pos.col as u64).done()
+            Out::new(&cx).add(&cx, file).put(&cx, ":").u64(&cx, at_pos.line as u64).put(&cx, ":").u64(&cx, at_pos.col as u64).done(&cx)
         } else {
             file
         };
-        (Out::new().add(prefix).put(": ").add(message).done(), at_pos)
+        (Out::new(&cx).add(&cx, prefix).put(&cx, ": ").add(&cx, message).done(&cx), at_pos)
     }
 }
 
 // The package graph rooted at a package directory, its kur.toml, or one .kur file. A single file
 // depends on the standard library `std` when one is installed (KURSAL_LIB). `ids` numbers the
 // syntax nodes.
-fn load(path: Text, ids: Cell[u32]) -> Seq[Package] {
-    let path = resolved(path);
-    let packages: Seq[Package] = Seq::new();
-    let by_dir: Map[Text, usize] = Map::new();
-    if suffix(path).is(".kur") {
-        let items = parse(read_source(path), path, ids);
+forall 'k.
+fn load(&cx: Cx!['k], path: Text['k], ids: Cell[u32, 'k]) -> Seq[Package['k], 'k] {
+    let path = resolved(&cx, path);
+    let packages: Seq[Package['k], 'k] = Seq::new(&cx);
+    let by_dir: Map[Text['k], usize, 'k] = Map::new(&cx);
+    if suffix(&cx, path).is(&cx, ".kur") {
+        let items = parse(&cx, read_source(&cx, path), path, ids);
         var main = false;
         var i = 0usize;
-        while i < items.len() {
-            let unit = match items.get(i) {
+        while i < items.len(&cx) {
+            let unit = match items.get(&cx, i) {
                 S::Item::Fn(f) => {
-                    if f.name.is("main") {
+                    if f.name.is(&cx, "main") {
                         main = true;
                     }
                 },
@@ -791,151 +844,155 @@ fn load(path: Text, ids: Cell[u32]) -> Seq[Package] {
             };
             i = i + 1usize;
         }
-        let std: Map[Text, Text] = Map::new();
-        let lib = lib_dir();
-        if path_exists(join(join(lib, text("std")), text("kur.toml"))) {
-            std.set(text("std"), join(lib, text("std")));
+        let std: Map[Text['k], Text['k], 'k] = Map::new(&cx);
+        let lib = lib_dir(&cx);
+        if path_exists(&cx, join(&cx, join(&cx, lib, text(&cx, "std")), text(&cx, "kur.toml"))) {
+            std.set(&cx, text(&cx, "std"), join(&cx, lib, text(&cx, "std")));
         }
-        let entry = if main { Option::Some.(Seq::one(text("main"))) } else { Option::None };
-        let unit = add(packages, by_dir, path, Option::Some.(stem(path)), Option::Some.(parent(path)), Option::Some.(std), entry);
-        packages.get(0usize).files.set(ModuleId::root(0usize), path);
+        let entry = if main { Option::Some.(Seq::one(&cx, text(&cx, "main"))) } else { Option::None };
+        let unit = add(&cx, packages, by_dir, path, Option::Some.(stem(&cx, path)), Option::Some.(parent(&cx, path)), Option::Some.(std), entry);
+        packages.get(&cx, 0usize).files.set(&cx, ModuleId::root(&cx, 0usize), path);
     } else {
-        let manifest = if suffix(path).is(".toml") { path } else { join(path, text("kur.toml")) };
-        let unit = add(packages, by_dir, manifest, Option::None, Option::None, Option::None, Option::None);
+        let manifest = if suffix(&cx, path).is(&cx, ".toml") { path } else { join(&cx, path, text(&cx, "kur.toml")) };
+        let unit = add(&cx, packages, by_dir, manifest, Option::None, Option::None, Option::None, Option::None);
     }
     var p = 0usize;
-    while p < packages.len() {
-        let package = packages.get(p);
-        if package.files.is_empty() {
-            let found = discover(package);
-            let modules = found.keys();
+    while p < packages.len(&cx) {
+        let package = packages.get(&cx, p);
+        if package.files.is_empty(&cx) {
+            let found = discover(&cx, package);
+            let modules = found.keys(&cx);
             var k = 0usize;
-            while k < modules.len() {
-                package.files.set(modules.get(k), found.at(modules.get(k)));
+            while k < modules.len(&cx) {
+                package.files.set(&cx, modules.get(&cx, k), found.at(&cx, modules.get(&cx, k)));
                 k = k + 1usize;
             }
-            if !package.files.has(ModuleId::root(package.id)) {
-                fail(Out::new().put("package ").add(package.name.get()).put(" has no lib.kur in ").add(package.source_root.get()).done());
+            if !package.files.has(&cx, ModuleId::root(&cx, package.id)) {
+                fail(&cx, Out::new(&cx).put(&cx, "package ").add(&cx, package.name.get(&cx)).put(&cx, " has no lib.kur in ").add(&cx, package.source_root.get(&cx)).done(&cx));
             }
         }
         p = p + 1usize;
     }
-    check_acyclic(packages);
+    check_acyclic(&cx, packages);
     packages
 }
 
-fn read_source(path: Text) -> Text {
-    match read(path) {
+forall 'k.
+fn read_source(&cx: Cx!['k], path: Text['k]) -> Text['k] {
+    match read(&cx, path) {
         Option::Some(s) => s,
-        Option::None => fail(Out::new().put("cannot read ").add(path).done()),
+        Option::None => fail(&cx, Out::new(&cx).put(&cx, "cannot read ").add(&cx, path).done(&cx)),
     }
 }
 
 // The package of `manifest` (a kur.toml, or a single .kur file), added with its dependencies
 // unless its directory's manifest was added already.
-fn add(packages: Seq[Package], by_dir: Map[Text, usize], manifest: Text, name: Option[Text], source_root: Option[Text],
-       deps: Option[Map[Text, Text]], entry: Option[Seq[Text]]) -> usize {
-    let root = parent(manifest);
-    let is_toml = suffix(manifest).is(".toml");
+forall 'k.
+fn add(&cx: Cx!['k], packages: Seq[Package['k], 'k], by_dir: Map[Text['k], usize, 'k], manifest: Text['k], name: Option[Text['k]], source_root: Option[Text['k]],
+       deps: Option[Map[Text['k], Text['k], 'k]], entry: Option[Seq[Text['k], 'k]]) -> usize {
+    let root = parent(&cx, manifest);
+    let is_toml = suffix(&cx, manifest).is(&cx, ".toml");
     if is_toml {
-        let unit = match by_dir.get(root) {
+        let unit = match by_dir.get(&cx, root) {
             Option::Some(id) => return id,
             Option::None => (),
         };
     }
     let package = Package.{
-        id: packages.len(),
-        name: Cell::new(match name { Option::Some(n) => n, Option::None => base_name(root) }),
+        id: packages.len(&cx),
+        name: Cell::new(&cx, match name { Option::Some(n) => n, Option::None => base_name(&cx, root) }),
         root,
-        source_root: Cell::new(match source_root { Option::Some(s) => s, Option::None => root }),
-        deps: Map::new(),
-        entry: Cell::new(entry),
-        files: Map::new(),
-        entry_decl: Cell::new(Option::None),
+        source_root: Cell::new(&cx, match source_root { Option::Some(s) => s, Option::None => root }),
+        deps: Map::new(&cx),
+        entry: Cell::new(&cx, entry),
+        files: Map::new(&cx),
+        entry_decl: Cell::new(&cx, Option::None),
     };
-    packages.push(package);
-    var deps: Map[Text, Text] = match deps {
+    packages.push(&cx, package);
+    var deps: Map[Text['k], Text['k], 'k] = match deps {
         Option::Some(d) => d,
-        Option::None => Map::new(),
+        Option::None => Map::new(&cx),
     };
     if is_toml {
-        by_dir.set(root, package.id);
-        let config = table(Toml::Table.(read_toml(read_source(manifest), manifest)), manifest);
-        let info = table(config.get_or(text("package"), Toml::Table.(Map::new())), text("package"));
-        let unknown: Set[Text] = Set::new();
-        let config_keys = config.keys();
+        by_dir.set(&cx, root, package.id);
+        let config = table(&cx, Toml::Table.(read_toml(&cx, read_source(&cx, manifest), manifest)), manifest);
+        let info = table(&cx, config.get_or(&cx, text(&cx, "package"), Toml::Table.(Map::new(&cx))), text(&cx, "package"));
+        let unknown: Set[Text['k], 'k] = Set::new(&cx);
+        let config_keys = config.keys(&cx);
         var i = 0usize;
-        while i < config_keys.len() {
-            let key = config_keys.get(i);
-            if !key.is("package") && !key.is("dependencies") {
-                unknown.add(key);
+        while i < config_keys.len(&cx) {
+            let key = config_keys.get(&cx, i);
+            if !key.is(&cx, "package") && !key.is(&cx, "dependencies") {
+                unknown.add(&cx, key);
             }
             i = i + 1usize;
         }
-        let info_keys = info.keys();
+        let info_keys = info.keys(&cx);
         i = 0usize;
-        while i < info_keys.len() {
-            let key = info_keys.get(i);
-            if !among(key, "name kind source_root entry") {
-                unknown.add(key);
+        while i < info_keys.len(&cx) {
+            let key = info_keys.get(&cx, i);
+            if !among(&cx, key, "name kind source_root entry") {
+                unknown.add(&cx, key);
             }
             i = i + 1usize;
         }
-        if unknown.len() > 0usize {
-            let names = unknown.items();
-            names.sort(text_before);
-            let out = Out::new().add(manifest).put(": unknown manifest keys [");
+        if unknown.len(&cx) > 0usize {
+            let names = unknown.items(&cx);
+            names.sort(&cx, text_before);
+            let out = Out::new(&cx).add(&cx, manifest).put(&cx, ": unknown manifest keys [");
             var k = 0usize;
-            while k < names.len() {
-                let unit = out.put(if k > 0usize { ", " } else { "" }).add(repr(names.get(k)));
+            while k < names.len(&cx) {
+                let unit = out.put(&cx, if k > 0usize { ", " } else { "" }).add(&cx, repr(&cx, names.get(&cx, k)));
                 k = k + 1usize;
             }
-            fail(out.put("]").done());
+            fail(&cx, out.put(&cx, "]").done(&cx));
         }
-        package.name.set(string(info, "name", Option::None));
-        package.source_root.set(resolved(join(root, string(info, "source_root", Option::Some.(text("src"))))));
-        if string(info, "kind", Option::Some.(text("library"))).is("executable") {
-            let parts = string(info, "entry", Option::None).split(text("::"));
-            let path: Seq[Text] = Seq::new();
+        package.name.set(&cx, string(&cx, info, "name", Option::None));
+        package.source_root.set(&cx, resolved(&cx, join(&cx, root, string(&cx, info, "source_root", Option::Some.(text(&cx, "src"))))));
+        if string(&cx, info, "kind", Option::Some.(text(&cx, "library"))).is(&cx, "executable") {
+            let parts = string(&cx, info, "entry", Option::None).split(&cx, text(&cx, "::"));
+            let path: Seq[Text['k], 'k] = Seq::new(&cx);
             var k = 0usize;
-            while k < parts.len() {
-                if !parts.get(k).is("package") {
-                    path.push(parts.get(k));
+            while k < parts.len(&cx) {
+                if !parts.get(&cx, k).is(&cx, "package") {
+                    path.push(&cx, parts.get(&cx, k));
                 }
                 k = k + 1usize;
             }
-            package.entry.set(Option::Some.(path));
+            package.entry.set(&cx, Option::Some.(path));
         }
-        deps = Map::new();
-        let specs = table(config.get_or(text("dependencies"), Toml::Table.(Map::new())), text("dependencies"));
-        let aliases = specs.keys();
+        deps = Map::new(&cx);
+        let specs = table(&cx, config.get_or(&cx, text(&cx, "dependencies"), Toml::Table.(Map::new(&cx))), text(&cx, "dependencies"));
+        let aliases = specs.keys(&cx);
         var k = 0usize;
-        while k < aliases.len() {
-            let alias = aliases.get(k);
-            deps.set(alias, resolved(join(root, string(table(specs.at(alias), alias), "path", Option::None))));
+        while k < aliases.len(&cx) {
+            let alias = aliases.get(&cx, k);
+            deps.set(&cx, alias, resolved(&cx, join(&cx, root, string(&cx, table(&cx, specs.at(&cx, alias), alias), "path", Option::None))));
             k = k + 1usize;
         }
     }
-    let aliases = deps.keys();
+    let aliases = deps.keys(&cx);
     var k = 0usize;
-    while k < aliases.len() {
-        let target = deps.at(aliases.get(k));
-        let manifest_path = if suffix(target).is(".toml") { target } else { join(target, text("kur.toml")) };
-        package.deps.set(aliases.get(k), add(packages, by_dir, manifest_path, Option::None, Option::None, Option::None, Option::None));
+    while k < aliases.len(&cx) {
+        let target = deps.at(&cx, aliases.get(&cx, k));
+        let manifest_path = if suffix(&cx, target).is(&cx, ".toml") { target } else { join(&cx, target, text(&cx, "kur.toml")) };
+        package.deps.set(&cx, aliases.get(&cx, k), add(&cx, packages, by_dir, manifest_path, Option::None, Option::None, Option::None, Option::None));
         k = k + 1usize;
     }
     package.id
 }
 
-fn table(value: Toml, at_pos: Text) -> Map[Text, Toml] {
+forall 'k.
+fn table(&cx: Cx!['k], value: Toml['k], at_pos: Text['k]) -> Map[Text['k], Toml['k], 'k] {
     match value {
         Toml::Table(t) => t,
-        _ => fail(Out::new().add(at_pos).put(": expected a table").done()),
+        _ => fail(&cx, Out::new(&cx).add(&cx, at_pos).put(&cx, ": expected a table").done(&cx)),
     }
 }
 
-fn string(t: Map[Text, Toml], key: Slice[u8, 'static], default: Option[Text]) -> Text {
-    let value = match t.get(text(key)) {
+forall 'k.
+fn string(&cx: Cx!['k], t: Map[Text['k], Toml['k], 'k], key: Slice[u8, 'static], default: Option[Text['k]]) -> Text['k] {
+    let value = match t.get(&cx, text(&cx, key)) {
         Option::Some(v) => v,
         Option::None => match default {
             Option::Some(d) => Toml::Str.(d),
@@ -944,335 +1001,343 @@ fn string(t: Map[Text, Toml], key: Slice[u8, 'static], default: Option[Text]) ->
     };
     match value {
         Toml::Str(s) => s,
-        _ => fail(Out::new().put("manifest ").add(repr(text(key))).put(" must be a string").done()),
+        _ => fail(&cx, Out::new(&cx).put(&cx, "manifest ").add(&cx, repr(&cx, text(&cx, key))).put(&cx, " must be a string").done(&cx)),
     }
 }
 
 // Each .kur file under the source root, by the module its path assigns.
-fn discover(package: Package) -> Map[ModuleId, Text] {
-    let files: Map[ModuleId, Text] = Map::new();
-    walk(package, package.source_root.get(), Seq::new(), files);
+forall 'k.
+fn discover(&cx: Cx!['k], package: Package['k]) -> Map[ModuleId['k], Text['k], 'k] {
+    let files: Map[ModuleId['k], Text['k], 'k] = Map::new(&cx);
+    walk(&cx, package, package.source_root.get(&cx), Seq::new(&cx), files);
     files
 }
 
 // The files of directory `here`, at `rel` under the source root, then its subdirectories in order;
 // a subdirectory with its own kur.toml is another package.
-fn walk(package: Package, here: Text, rel: Seq[Text], files: Map[ModuleId, Text]) {
-    if !rel.is_empty() && path_exists(join(here, text("kur.toml"))) {
+forall 'k.
+fn walk(&cx: Cx!['k], package: Package['k], here: Text['k], rel: Seq[Text['k], 'k], files: Map[ModuleId['k], Text['k], 'k]) {
+    if !rel.is_empty(&cx) && path_exists(&cx, join(&cx, here, text(&cx, "kur.toml"))) {
         return;
     }
-    let entries = list_directory(here);
-    let dirs: Seq[Text] = Seq::new();
-    let names: Seq[Text] = Seq::new();
+    let entries = list_directory(&cx, here);
+    let dirs: Seq[Text['k], 'k] = Seq::new(&cx);
+    let names: Seq[Text['k], 'k] = Seq::new(&cx);
     var i = 0usize;
-    while i < entries.len() {
-        let (name, is_directory) = entries.get(i);
+    while i < entries.len(&cx) {
+        let (name, is_directory) = entries.get(&cx, i);
         if is_directory {
-            dirs.push(name);
+            dirs.push(&cx, name);
         } else {
-            names.push(name);
+            names.push(&cx, name);
         }
         i = i + 1usize;
     }
-    dirs.sort(text_before);
-    names.sort(text_before);
+    dirs.sort(&cx, text_before);
+    names.sort(&cx, text_before);
     i = 0usize;
-    while i < names.len() {
-        let name = names.get(i);
-        if name.ends_with(text(".kur")) {
-            let path = rel.copy();
-            let module_name = stem(name);
-            if !module_name.is("lib") {
-                path.push(module_name);
+    while i < names.len(&cx) {
+        let name = names.get(&cx, i);
+        if name.ends_with(&cx, text(&cx, ".kur")) {
+            let path = rel.copy(&cx);
+            let module_name = stem(&cx, name);
+            if !module_name.is(&cx, "lib") {
+                path.push(&cx, module_name);
             }
             let home = ModuleId.{ package: package.id, path };
-            if files.has(home) {
-                fail(Out::new().put("two files define module ").add(joined(path)).put(" of ").add(package.name.get()).done());
+            if files.has(&cx, home) {
+                fail(&cx, Out::new(&cx).put(&cx, "two files define module ").add(&cx, joined(&cx, path)).put(&cx, " of ").add(&cx, package.name.get(&cx)).done(&cx));
             }
-            files.set(home, join(here, name));
+            files.set(&cx, home, join(&cx, here, name));
         }
         i = i + 1usize;
     }
     i = 0usize;
-    while i < dirs.len() {
-        let sub = rel.copy();
-        sub.push(dirs.get(i));
-        walk(package, join(here, dirs.get(i)), sub, files);
+    while i < dirs.len(&cx) {
+        let sub = rel.copy(&cx);
+        sub.push(&cx, dirs.get(&cx, i));
+        walk(&cx, package, join(&cx, here, dirs.get(&cx, i)), sub, files);
         i = i + 1usize;
     }
 }
 
-fn check_acyclic(packages: Seq[Package]) {
-    let state: Map[usize, u32] = Map::new();
+forall 'k.
+fn check_acyclic(&cx: Cx!['k], packages: Seq[Package['k], 'k]) {
+    let state: Map[usize, u32, 'k] = Map::new(&cx);
     var p = 0usize;
-    while p < packages.len() {
-        visit(packages, state, p);
+    while p < packages.len(&cx) {
+        visit(&cx, packages, state, p);
         p = p + 1usize;
     }
 }
 
-fn visit(packages: Seq[Package], state: Map[usize, u32], package_id: usize) {
-    let s = state.get_or(package_id, 0u32);
+forall 'k.
+fn visit(&cx: Cx!['k], packages: Seq[Package['k], 'k], state: Map[usize, u32, 'k], package_id: usize) {
+    let s = state.get_or(&cx, package_id, 0u32);
     if s == 1u32 {
-        fail(Out::new().put("dependency cycle through package ").add(packages.get(package_id).name.get()).done());
+        fail(&cx, Out::new(&cx).put(&cx, "dependency cycle through package ").add(&cx, packages.get(&cx, package_id).name.get(&cx)).done(&cx));
     }
     if s == 0u32 {
-        state.set(package_id, 1u32);
-        let deps = packages.get(package_id).deps.values();
+        state.set(&cx, package_id, 1u32);
+        let deps = packages.get(&cx, package_id).deps.values(&cx);
         var i = 0usize;
-        while i < deps.len() {
-            visit(packages, state, deps.get(i));
+        while i < deps.len(&cx) {
+            visit(&cx, packages, state, deps.get(&cx, i));
             i = i + 1usize;
         }
-        state.set(package_id, 2u32);
+        state.set(&cx, package_id, 2u32);
     }
 }
 
 // ------------------------------------------------------------ namespaces --
 
 // A lookup: `("path", module, path)`, `("import", module, [alias])` or `("export", module, [name])`.
-fn lookup_key(kind: Slice[u8, 'static], home: ModuleId, names: Seq[Text]) -> (Text, ModuleId, Seq[Text]) {
-    (text(kind), home, names)
+forall 'k.
+fn lookup_key(&cx: Cx!['k], kind: Slice[u8, 'static], home: ModuleId['k], names: Seq[Text['k], 'k]) -> (Text['k], ModuleId['k], Seq[Text['k], 'k]) {
+    (text(&cx, kind), home, names)
 }
 
-fn problem(message: Text) -> Result[Target, Problem] {
+forall 'k.
+fn problem(message: Text['k]) -> Result[Target['k], Problem['k]] {
     Result::Err.(Problem.{ message, pos: no_pos() })
 }
 
+forall 'k.
 exposed struct Resolver {
-    packages: Seq[Package],
-    scopes: Map[ModuleId, Scope],
-    children: Map[ModuleId, Map[Text, ModuleId]],
-    instances: Seq[(ModuleId, S::InstanceDecl)],
+    packages: Seq[Package['k], 'k],
+    scopes: Map[ModuleId['k], Scope['k], 'k],
+    children: Map[ModuleId['k], Map[Text['k], ModuleId['k], 'k], 'k],
+    instances: Seq[(ModuleId['k], S::InstanceDecl['k]), 'k],
     // (owner, member) -> declarations
-    attached: Map[(Owner, Text), Seq[Decl]],
-    cache: Map[(Text, ModuleId, Seq[Text]), Target],
-    active: Set[(Text, ModuleId, Seq[Text])],
+    attached: Map[(Owner['k], Text['k]), Seq[Decl['k], 'k], 'k],
+    cache: Map[(Text['k], ModuleId['k], Seq[Text['k], 'k]), Target['k], 'k],
+    active: Set[(Text['k], ModuleId['k], Seq[Text['k], 'k]), 'k],
     // the glob imports being resolved, by module and path
-    expanding: Set[(ModuleId, Seq[Text])],
+    expanding: Set[(ModuleId['k], Seq[Text['k], 'k]), 'k],
     // node id -> what it names
-    refs: Map[u32, NameRef],
+    refs: Map[u32, NameRef['k], 'k],
     // The files and positions errors are reported in, innermost last.
-    locations: Seq[Location],
-    decl_ids: Cell[u32],
+    locations: Seq[Location['k], 'k],
+    decl_ids: Cell[u32, 'k],
 }
 
-impl Resolver {
-    fn new(packages: Seq[Package], ids: Cell[u32]) -> Resolver {
+forall 'k.
+impl Resolver['k] {
+    fn new(&cx: Cx!['k], packages: Seq[Package['k], 'k], ids: Cell[u32, 'k]) -> Resolver['k] {
         let r = Resolver.{
             packages,
-            scopes: Map::new(),
-            children: Map::new(),
-            instances: Seq::new(),
-            attached: Map::new(),
-            cache: Map::new(),
-            active: Set::new(),
-            expanding: Set::new(),
-            refs: Map::new(),
-            locations: Seq::new(),
-            decl_ids: Cell::new(0u32),
+            scopes: Map::new(&cx),
+            children: Map::new(&cx),
+            instances: Seq::new(&cx),
+            attached: Map::new(&cx),
+            cache: Map::new(&cx),
+            active: Set::new(&cx),
+            expanding: Set::new(&cx),
+            refs: Map::new(&cx),
+            locations: Seq::new(&cx),
+            decl_ids: Cell::new(&cx, 0u32),
         };
         var p = 0usize;
-        while p < packages.len() {
-            let package = packages.get(p);
-            let unit = r.children_of(ModuleId::root(package.id));
-            let modules = package.files.keys();
+        while p < packages.len(&cx) {
+            let package = packages.get(&cx, p);
+            let unit = r.children_of(&cx, ModuleId::root(&cx, package.id));
+            let modules = package.files.keys(&cx);
             var i = 0usize;
-            while i < modules.len() {
-                let home = modules.get(i);
-                let file = package.files.at(home);
-                r.collect(home, parse(read_source(file), file, ids));
+            while i < modules.len(&cx) {
+                let home = modules.get(&cx, i);
+                let file = package.files.at(&cx, home);
+                r.collect(&cx, home, parse(&cx, read_source(&cx, file), file, ids));
                 var k = 0usize;
-                while k < home.path.len() {
-                    let parent = ModuleId.{ package: home.package, path: home.path.slice(0usize, k) };
-                    let name = home.path.get(k);
-                    r.children_of(parent).set(name, parent.child(name));
-                    let unit = r.children_of(parent.child(name));
+                while k < home.path.len(&cx) {
+                    let parent = ModuleId.{ package: home.package, path: home.path.slice(&cx, 0usize, k) };
+                    let name = home.path.get(&cx, k);
+                    r.children_of(&cx, parent).set(&cx, name, parent.child(&cx, name));
+                    let unit = r.children_of(&cx, parent.child(&cx, name));
                     k = k + 1usize;
                 }
                 i = i + 1usize;
             }
             p = p + 1usize;
         }
-        let scopes = r.scopes.values();
+        let scopes = r.scopes.values(&cx);
         var s = 0usize;
-        while s < scopes.len() {
-            r.attach(scopes.get(s));
+        while s < scopes.len(&cx) {
+            r.attach(&cx, scopes.get(&cx, s));
             s = s + 1usize;
         }
         r
     }
 
     // `children.setdefault(module, {})`.
-    fn children_of(self, home: ModuleId) -> Map[Text, ModuleId] {
-        match self.children.get(home) {
+    fn children_of(self, &cx: Cx!['k], home: ModuleId['k]) -> Map[Text['k], ModuleId['k], 'k] {
+        match self.children.get(&cx, home) {
             Option::Some(c) => c,
             Option::None => {
-                let c: Map[Text, ModuleId] = Map::new();
-                self.children.set(home, c);
+                let c: Map[Text['k], ModuleId['k], 'k] = Map::new(&cx);
+                self.children.set(&cx, home, c);
                 c
             },
         }
     }
 
-    fn new_decl(self, kind: Slice[u8, 'static], home: ModuleId, name: Text, node: Named, impl_block: Option[S::Impl]) -> Decl {
-        let id = self.decl_ids.get();
-        self.decl_ids.set(id + 1u32);
-        Decl.{ id, kind: text(kind), home, name, node, impl_block }
+    fn new_decl(self, &cx: Cx!['k], kind: Slice[u8, 'static], home: ModuleId['k], name: Text['k], node: Named['k], impl_block: Option[S::Impl['k]]) -> Decl['k] {
+        let id = self.decl_ids.get(&cx);
+        self.decl_ids.set(&cx, id + 1u32);
+        Decl.{ id, kind: text(&cx, kind), home, name, node, impl_block }
     }
 
-    fn collect(self, home: ModuleId, items: Seq[S::Item]) {
-        let scope = Scope.{ home, decls: Map::new(), imports: Map::new(), globs: Seq::new(), exports: Set::new(), items };
-        self.scopes.set(home, scope);
+    fn collect(self, &cx: Cx!['k], home: ModuleId['k], items: Seq[S::Item['k], 'k]) {
+        let scope = Scope.{ home, decls: Map::new(&cx), imports: Map::new(&cx), globs: Seq::new(&cx), exports: Set::new(&cx), items };
+        self.scopes.set(&cx, home, scope);
         var i = 0usize;
-        while i < items.len() {
-            let unit = match items.get(i) {
-                S::Item::Module(m) => self.fail(text("package sources do not declare 'module'"), m.pos),
-                S::Item::Use(u) => self.use_tree(scope, Seq::new(), u.tree, u.is_export),
-                S::Item::Instance(n) => self.instances.push((home, n)),
-                S::Item::Struct(x) => self.declare(scope, self.new_decl("struct", home, x.name, Named::Struct.(x), Option::None)),
-                S::Item::Enum(x) => self.declare(scope, self.new_decl("enum", home, x.name, Named::Enum.(x), Option::None)),
-                S::Item::Tuple(x) => self.declare(scope, self.new_decl("tuple", home, x.name, Named::Tuple.(x), Option::None)),
-                S::Item::Fn(x) => self.declare(scope, self.new_decl("fn", home, x.name, Named::Fn.(x), Option::None)),
-                S::Item::Extern(x) => self.declare(scope, self.new_decl("extern", home, x.name, Named::Extern.(x), Option::None)),
-                S::Item::Trait(x) => self.declare(scope, self.new_decl("trait", home, x.name, Named::Trait.(x), Option::None)),
-                S::Item::Const(x) => self.declare(scope, self.new_decl("const", home, x.name, Named::Const.(x), Option::None)),
+        while i < items.len(&cx) {
+            let unit = match items.get(&cx, i) {
+                S::Item::Module(m) => self.fail(&cx, text(&cx, "package sources do not declare 'module'"), m.pos),
+                S::Item::Use(u) => self.use_tree(&cx, scope, Seq::new(&cx), u.tree, u.is_export),
+                S::Item::Instance(n) => self.instances.push(&cx, (home, n)),
+                S::Item::Struct(x) => self.declare(&cx, scope, self.new_decl(&cx, "struct", home, x.name, Named::Struct.(x), Option::None)),
+                S::Item::Enum(x) => self.declare(&cx, scope, self.new_decl(&cx, "enum", home, x.name, Named::Enum.(x), Option::None)),
+                S::Item::Tuple(x) => self.declare(&cx, scope, self.new_decl(&cx, "tuple", home, x.name, Named::Tuple.(x), Option::None)),
+                S::Item::Fn(x) => self.declare(&cx, scope, self.new_decl(&cx, "fn", home, x.name, Named::Fn.(x), Option::None)),
+                S::Item::Extern(x) => self.declare(&cx, scope, self.new_decl(&cx, "extern", home, x.name, Named::Extern.(x), Option::None)),
+                S::Item::Trait(x) => self.declare(&cx, scope, self.new_decl(&cx, "trait", home, x.name, Named::Trait.(x), Option::None)),
+                S::Item::Const(x) => self.declare(&cx, scope, self.new_decl(&cx, "const", home, x.name, Named::Const.(x), Option::None)),
                 S::Item::Impl(x) => (),
             };
             i = i + 1usize;
         }
     }
 
-    fn declare(self, scope: Scope, decl: Decl) {
-        if scope.decls.has(decl.name) || scope.imports.has(decl.name) {
-            self.fail(Out::new().put("duplicate name ").add(decl.name).done(), named_pos(decl.node));
+    fn declare(self, &cx: Cx!['k], scope: Scope['k], decl: Decl['k]) {
+        if scope.decls.has(&cx, decl.name) || scope.imports.has(&cx, decl.name) {
+            self.fail(&cx, Out::new(&cx).put(&cx, "duplicate name ").add(&cx, decl.name).done(&cx), named_pos(decl.node));
         }
-        scope.decls.set(decl.name, decl);
+        scope.decls.set(&cx, decl.name, decl);
     }
 
-    fn use_tree(self, scope: Scope, prefix: Seq[Text], tree: S::UseTree, exported: bool) {
-        let path = prefix.copy();
-        path.append(tree.path);
+    fn use_tree(self, &cx: Cx!['k], scope: Scope['k], prefix: Seq[Text['k], 'k], tree: S::UseTree['k], exported: bool) {
+        let path = prefix.copy(&cx);
+        path.append(&cx, tree.path);
         if tree.star {
-            scope.globs.push(path);
-        } else if !tree.children.is_empty() {
+            scope.globs.push(&cx, path);
+        } else if !tree.children.is_empty(&cx) {
             var i = 0usize;
-            while i < tree.children.len() {
-                self.use_tree(scope, path, tree.children.get(i), exported);
+            while i < tree.children.len(&cx) {
+                self.use_tree(&cx, scope, path, tree.children.get(&cx, i), exported);
                 i = i + 1usize;
             }
         } else {
             let name = match tree.alias {
                 Option::Some(a) => a,
-                Option::None => path.last(),
+                Option::None => path.last(&cx),
             };
             // `export name;` publishes an existing name
-            if exported && path.len() == 1usize && path.get(0usize).eq(name) {
-                scope.exports.add(name);
+            if exported && path.len(&cx) == 1usize && path.get(&cx, 0usize).eq(&cx, name) {
+                scope.exports.add(&cx, name);
                 return;
             }
-            if name.is("package") || name.is("builtin") || is_builtin_trait(name) {
-                self.fail(Out::new().put("'").add(name).put("' is compiler-sealed").done(), no_pos());
+            if name.is(&cx, "package") || name.is(&cx, "builtin") || is_builtin_trait(&cx, name) {
+                self.fail(&cx, Out::new(&cx).put(&cx, "'").add(&cx, name).put(&cx, "' is compiler-sealed").done(&cx), no_pos());
             }
-            if scope.imports.has(name) || scope.decls.has(name) {
-                self.fail(Out::new().put("duplicate import ").add(name).put(" in ").add(repr_module(scope.home)).done(), no_pos());
+            if scope.imports.has(&cx, name) || scope.decls.has(&cx, name) {
+                self.fail(&cx, Out::new(&cx).put(&cx, "duplicate import ").add(&cx, name).put(&cx, " in ").add(&cx, repr_module(&cx, scope.home)).done(&cx), no_pos());
             }
-            scope.imports.set(name, path);
+            scope.imports.set(&cx, name, path);
             if exported {
-                scope.exports.add(name);
+                scope.exports.add(&cx, name);
             }
         }
     }
 
     // Methods and associated consts are declared by their impl's module and attached to the impl's
     // target type for `Target::name` lookup.
-    fn attach(self, scope: Scope) {
+    fn attach(self, &cx: Cx!['k], scope: Scope['k]) {
         var i = 0usize;
-        while i < scope.items.len() {
-            let unit = match scope.items.get(i) {
-                S::Item::Impl(m) => self.attach_impl(scope, m),
+        while i < scope.items.len(&cx) {
+            let unit = match scope.items.get(&cx, i) {
+                S::Item::Impl(m) => self.attach_impl(&cx, scope, m),
                 _ => (),
             };
             i = i + 1usize;
         }
     }
 
-    fn attach_impl(self, scope: Scope, item: S::Impl) {
+    fn attach_impl(self, &cx: Cx!['k], scope: Scope['k], item: S::Impl['k]) {
         let target = match item.type {
             Type::Name(n) => n,
-            _ => self.fail(text("an impl target must be a named type"), item.pos),
+            _ => self.fail(&cx, text(&cx, "an impl target must be a named type"), item.pos),
         };
-        let spelled = target.path.last();
+        let spelled = target.path.last(&cx);
         let params = match item.quantifier {
             Option::Some(f) => f.params,
-            Option::None => Seq::new(),
+            Option::None => Seq::new(&cx),
         };
-        let owner = if target.path.len() == 1usize && is_prim(target.path.get(0usize)) {
-            Owner::Prim.(target.path.get(0usize))
-        } else if target.path.len() == 1usize && params.has(target.path.get(0usize)) {
+        let owner = if target.path.len(&cx) == 1usize && is_prim(&cx, target.path.get(&cx, 0usize)) {
+            Owner::Prim.(target.path.get(&cx, 0usize))
+        } else if target.path.len(&cx) == 1usize && params.has(&cx, target.path.get(&cx, 0usize)) {
             // a blanket impl: its methods are found by method calls only
             Owner::Blanket
         } else {
-            match self.need(scope.home, target.path, item.pos) {
+            match self.need(&cx, scope.home, target.path, item.pos) {
                 Target::Decl(d) => Owner::Decl.(d),
-                _ => self.fail(text("an impl target must name a type declaration"), item.pos),
+                _ => self.fail(&cx, text(&cx, "an impl target must name a type declaration"), item.pos),
             }
         };
         var k = 0usize;
-        while k < item.items.len() {
-            let decl = match item.items.get(k) {
-                S::Member::Fn(f) => self.new_decl("method", scope.home, Out::new().add(spelled).put("::").add(f.name).done(), Named::Fn.(f), Option::Some.(item)),
-                S::Member::Const(c) => self.new_decl("const", scope.home, Out::new().add(spelled).put("::").add(c.name).done(), Named::Const.(c), Option::Some.(item)),
+        while k < item.items.len(&cx) {
+            let decl = match item.items.get(&cx, k) {
+                S::Member::Fn(f) => self.new_decl(&cx, "method", scope.home, Out::new(&cx).add(&cx, spelled).put(&cx, "::").add(&cx, f.name).done(&cx), Named::Fn.(f), Option::Some.(item)),
+                S::Member::Const(c) => self.new_decl(&cx, "const", scope.home, Out::new(&cx).add(&cx, spelled).put(&cx, "::").add(&cx, c.name).done(&cx), Named::Const.(c), Option::Some.(item)),
             };
-            let member = match item.items.get(k) {
+            let member = match item.items.get(&cx, k) {
                 S::Member::Fn(f) => f.name,
                 S::Member::Const(c) => c.name,
             };
-            self.declare(scope, decl);
+            self.declare(&cx, scope, decl);
             let key = (owner, member);
-            match self.attached.get(key) {
-                Option::Some(found) => found.push(decl),
-                Option::None => self.attached.set(key, Seq::one(decl)),
+            match self.attached.get(&cx, key) {
+                Option::Some(found) => found.push(&cx, decl),
+                Option::None => self.attached.set(&cx, key, Seq::one(&cx, decl)),
             }
             k = k + 1usize;
         }
     }
 
     // ---- errors
-    fn file(self, home: ModuleId) -> Text {
-        self.packages.get(home.package).files.at(home)
+    fn file(self, &cx: Cx!['k], home: ModuleId['k]) -> Text['k] {
+        self.packages.get(&cx, home.package).files.at(&cx, home)
     }
 
     // Errors from here until `unlocate` are inside `module`'s file and, when they have no
     // position, at `pos`.
-    fn locate(self, home: ModuleId, pos: Pos) {
-        self.locations.push(Location.{ file: self.file(home), pos });
+    fn locate(self, &cx: Cx!['k], home: ModuleId['k], pos: Pos) {
+        self.locations.push(&cx, Location.{ file: self.file(&cx, home), pos });
     }
 
-    fn unlocate(self) {
-        let unit = self.locations.pop();
+    fn unlocate(self, &cx: Cx!['k]) {
+        let unit = self.locations.pop(&cx);
     }
 
     // Stops with `message` at `pos` (none on line 0), naming the files it is located in.
-    fn fail(self, message: Text, pos: Pos) -> ! {
-        var full = error_text(message, pos);
+    fn fail(self, &cx: Cx!['k], message: Text['k], pos: Pos) -> ! {
+        var full = error_text(&cx, message, pos);
         var at = pos;
-        var i = self.locations.len();
+        var i = self.locations.len(&cx);
         while i > 0usize {
             i = i - 1usize;
-            let l = self.locations.get(i);
-            let (f, p) = located(full, message, at, l.file, l.pos);
+            let l = self.locations.get(&cx, i);
+            let (f, p) = located(&cx, full, message, at, l.file, l.pos);
             full = f;
             at = p;
         }
-        fail(full)
+        fail(&cx, full)
     }
 
     // ---- path lookup
     // What `path` names from `module`, or why it names nothing; an error without a position gets
     // `pos`.
-    fn lookup(self, home: ModuleId, path: Seq[Text], pos: Pos) -> Result[Target, Problem] {
-        match self.solve(lookup_key("path", home, path)) {
+    fn lookup(self, &cx: Cx!['k], home: ModuleId['k], path: Seq[Text['k], 'k], pos: Pos) -> Result[Target['k], Problem['k]] {
+        match self.solve(&cx, lookup_key(&cx, "path", home, path)) {
             Result::Ok(t) => Result::Ok.(t),
             Result::Err(e) => if e.pos.line == 0u32 && pos.line != 0u32 {
                 Result::Err.(Problem.{ message: e.message, pos })
@@ -1283,95 +1348,95 @@ impl Resolver {
     }
 
     // What `path` names from `module`, stopping if it names nothing.
-    fn need(self, home: ModuleId, path: Seq[Text], pos: Pos) -> Target {
-        match self.lookup(home, path, pos) {
+    fn need(self, &cx: Cx!['k], home: ModuleId['k], path: Seq[Text['k], 'k], pos: Pos) -> Target['k] {
+        match self.lookup(&cx, home, path, pos) {
             Result::Ok(t) => t,
-            Result::Err(e) => self.fail(e.message, e.pos),
+            Result::Err(e) => self.fail(&cx, e.message, e.pos),
         }
     }
 
-    fn solve(self, key: (Text, ModuleId, Seq[Text])) -> Result[Target, Problem] {
-        let unit = match self.cache.get(key) {
+    fn solve(self, &cx: Cx!['k], key: (Text['k], ModuleId['k], Seq[Text['k], 'k])) -> Result[Target['k], Problem['k]] {
+        let unit = match self.cache.get(&cx, key) {
             Option::Some(t) => return Result::Ok.(t),
             Option::None => (),
         };
         let (kind, home, names) = key;
-        if self.active.has(key) {
-            let at = if kind.is("path") { repr_tuple(names) } else { names.get(0usize) };
-            return problem(Out::new().put("import cycle at ").add(at).done());
+        if self.active.has(&cx, key) {
+            let at = if kind.is(&cx, "path") { repr_tuple(&cx, names) } else { names.get(&cx, 0usize) };
+            return problem(Out::new(&cx).put(&cx, "import cycle at ").add(&cx, at).done(&cx));
         }
-        self.active.add(key);
-        let value = if kind.is("import") {
-            self.resolve_path(home, self.scopes.at(home).imports.at(names.get(0usize)), Option::Some.(names.get(0usize)))
+        self.active.add(&cx, key);
+        let value = if kind.is(&cx, "import") {
+            self.resolve_path(&cx, home, self.scopes.at(&cx, home).imports.at(&cx, names.get(&cx, 0usize)), Option::Some.(names.get(&cx, 0usize)))
         } else {
-            self.resolve_path(home, names, Option::None)
+            self.resolve_path(&cx, home, names, Option::None)
         };
-        self.active.remove(key);
+        self.active.remove(&cx, key);
         match value {
             Result::Ok(t) => {
-                self.cache.set(key, t);
+                self.cache.set(&cx, key, t);
                 Result::Ok.(t)
             },
             Result::Err(e) => Result::Err.(e),
         }
     }
 
-    fn resolve_path(self, home: ModuleId, path: Seq[Text], importing: Option[Text]) -> Result[Target, Problem] {
-        let first = path.get(0usize);
-        let rest = path.from(1usize);
-        let scope = self.scopes.at(home);
+    fn resolve_path(self, &cx: Cx!['k], home: ModuleId['k], path: Seq[Text['k], 'k], importing: Option[Text['k]]) -> Result[Target['k], Problem['k]] {
+        let first = path.get(&cx, 0usize);
+        let rest = path.from(&cx, 1usize);
+        let scope = self.scopes.at(&cx, home);
         let not_importing = match importing {
-            Option::Some(name) => !name.eq(first),
+            Option::Some(name) => !name.eq(&cx, first),
             Option::None => true,
         };
-        var target = if first.is("package") {
-            Target::Module.(ModuleId::root(home.package))
-        } else if scope.decls.has(first) {
-            Target::Decl.(scope.decls.at(first))
-        } else if scope.imports.has(first) && not_importing {
-            match self.solve(lookup_key("import", home, Seq::one(first))) {
+        var target = if first.is(&cx, "package") {
+            Target::Module.(ModuleId::root(&cx, home.package))
+        } else if scope.decls.has(&cx, first) {
+            Target::Decl.(scope.decls.at(&cx, first))
+        } else if scope.imports.has(&cx, first) && not_importing {
+            match self.solve(&cx, lookup_key(&cx, "import", home, Seq::one(&cx, first))) {
                 Result::Ok(t) => t,
                 Result::Err(e) => return Result::Err.(e),
             }
         } else {
-            match self.root_member(home, first) {
+            match self.root_member(&cx, home, first) {
                 Option::Some(t) => t,
-                Option::None => match self.glob(home, first) {
+                Option::None => match self.glob(&cx, home, first) {
                     Result::Ok(found) => match found {
                         Option::Some(t) => t,
-                        Option::None => return problem(Out::new().put("unknown name ").add(joined(path)).done()),
+                        Option::None => return problem(Out::new(&cx).put(&cx, "unknown name ").add(&cx, joined(&cx, path)).done(&cx)),
                     },
                     Result::Err(e) => return Result::Err.(e),
                 },
             }
         };
         var k = 0usize;
-        while k < rest.len() {
+        while k < rest.len(&cx) {
             target = match target {
-                Target::Decl(d) => return self.associated(d, joined(rest.from(k))),
-                Target::Module(m) => match self.member(home, m, rest.get(k)) {
+                Target::Decl(d) => return self.associated(&cx, d, joined(&cx, rest.from(&cx, k))),
+                Target::Module(m) => match self.member(&cx, home, m, rest.get(&cx, k)) {
                     Result::Ok(t) => t,
                     Result::Err(e) => return Result::Err.(e),
                 },
-                _ => return problem(Out::new().add(joined(path.slice(0usize, k + 1usize))).put(" is not a module").done()),
+                _ => return problem(Out::new(&cx).add(&cx, joined(&cx, path.slice(&cx, 0usize, k + 1usize))).put(&cx, " is not a module").done(&cx)),
             };
             k = k + 1usize;
         }
         Result::Ok.(target)
     }
 
-    fn root_member(self, home: ModuleId, name: Text) -> Option[Target] {
-        let package = self.packages.get(home.package);
-        let root = ModuleId::root(home.package);
-        if package.deps.has(name) {
-            return Option::Some.(Target::Module.(ModuleId::root(package.deps.at(name))));
+    fn root_member(self, &cx: Cx!['k], home: ModuleId['k], name: Text['k]) -> Option[Target['k]] {
+        let package = self.packages.get(&cx, home.package);
+        let root = ModuleId::root(&cx, home.package);
+        if package.deps.has(&cx, name) {
+            return Option::Some.(Target::Module.(ModuleId::root(&cx, package.deps.at(&cx, name))));
         }
-        let children = self.children.at(root);
-        if children.has(name) {
-            return Option::Some.(Target::Module.(children.at(name)));
+        let children = self.children.at(&cx, root);
+        if children.has(&cx, name) {
+            return Option::Some.(Target::Module.(children.at(&cx, name)));
         }
-        match self.scopes.get(root) {
-            Option::Some(scope) => match scope.decls.get(name) {
+        match self.scopes.get(&cx, root) {
+            Option::Some(scope) => match scope.decls.get(&cx, name) {
                 Option::Some(d) => Option::Some.(Target::Decl.(d)),
                 Option::None => Option::None,
             },
@@ -1381,25 +1446,25 @@ impl Resolver {
 
     // `name` through the module's glob imports, in order. A glob whose own path is being resolved
     // offers nothing more: its path's first name is unknown in the module itself.
-    fn glob(self, home: ModuleId, name: Text) -> Result[Option[Target], Problem] {
-        let globs = self.scopes.at(home).globs;
+    fn glob(self, &cx: Cx!['k], home: ModuleId['k], name: Text['k]) -> Result[Option[Target['k]], Problem['k]] {
+        let globs = self.scopes.at(&cx, home).globs;
         var i = 0usize;
-        while i < globs.len() {
-            let path = globs.get(i);
-            if !self.expanding.has((home, path)) {
-                self.expanding.add((home, path));
-                let found = self.resolve_path(home, path, Option::None);
-                self.expanding.remove((home, path));
+        while i < globs.len(&cx) {
+            let path = globs.get(&cx, i);
+            if !self.expanding.has(&cx, (home, path)) {
+                self.expanding.add(&cx, (home, path));
+                let found = self.resolve_path(&cx, home, path, Option::None);
+                self.expanding.remove(&cx, (home, path));
                 let source = match found {
                     Result::Ok(t) => t,
                     Result::Err(e) => return Result::Err.(e),
                 };
                 let unit = match source {
-                    Target::Module(m) => match self.member(home, m, name) {
+                    Target::Module(m) => match self.member(&cx, home, m, name) {
                         Result::Ok(t) => return Result::Ok.(Option::Some.(t)),
                         Result::Err(e) => (),
                     },
-                    _ => return Result::Err.(Problem.{ message: Out::new().add(joined(path)).put(" is not a module").done(), pos: no_pos() }),
+                    _ => return Result::Err.(Problem.{ message: Out::new(&cx).add(&cx, joined(&cx, path)).put(&cx, " is not a module").done(&cx), pos: no_pos() }),
                 };
             }
             i = i + 1usize;
@@ -1409,18 +1474,18 @@ impl Resolver {
 
     // `module::name`, seen from `caller`: its own declarations; within one package also its
     // children and imports; across packages only exports.
-    fn member(self, caller: ModuleId, home: ModuleId, name: Text) -> Result[Target, Problem] {
-        let scope = self.scopes.get(home);
+    fn member(self, &cx: Cx!['k], caller: ModuleId['k], home: ModuleId['k], name: Text['k]) -> Result[Target['k], Problem['k]] {
+        let scope = self.scopes.get(&cx, home);
         let unit = match scope {
-            Option::Some(s) => match s.decls.get(name) {
+            Option::Some(s) => match s.decls.get(&cx, name) {
                 Option::Some(d) => return Result::Ok.(Target::Decl.(d)),
                 Option::None => (),
             },
             Option::None => (),
         };
         if caller.package == home.package {
-            let unit = match self.children.get(home) {
-                Option::Some(c) => match c.get(name) {
+            let unit = match self.children.get(&cx, home) {
+                Option::Some(c) => match c.get(&cx, name) {
                     Option::Some(m) => return Result::Ok.(Target::Module.(m)),
                     Option::None => (),
                 },
@@ -1428,10 +1493,10 @@ impl Resolver {
             };
             let unit = match scope {
                 Option::Some(s) => {
-                    if s.imports.has(name) {
-                        return self.solve(lookup_key("import", home, Seq::one(name)));
+                    if s.imports.has(&cx, name) {
+                        return self.solve(&cx, lookup_key(&cx, "import", home, Seq::one(&cx, name)));
                     }
-                    let unit = match self.glob(home, name) {
+                    let unit = match self.glob(&cx, home, name) {
                         Result::Ok(found) => match found {
                             Option::Some(t) => return Result::Ok.(t),
                             Option::None => (),
@@ -1444,24 +1509,24 @@ impl Resolver {
         } else {
             let unit = match scope {
                 Option::Some(s) => {
-                    if s.exports.has(name) {
-                        return self.solve(lookup_key("export", home, Seq::one(name)));
+                    if s.exports.has(&cx, name) {
+                        return self.solve(&cx, lookup_key(&cx, "export", home, Seq::one(&cx, name)));
                     }
                 },
                 Option::None => (),
             };
         }
-        let owner = if home.path.is_empty() { self.packages.get(home.package).name.get() } else { joined(home.path) };
-        problem(Out::new().put("unknown or private member ").add(name).put(" of ").add(owner).done())
+        let owner = if home.path.is_empty(&cx) { self.packages.get(&cx, home.package).name.get(&cx) } else { joined(&cx, home.path) };
+        problem(Out::new(&cx).put(&cx, "unknown or private member ").add(&cx, name).put(&cx, " of ").add(&cx, owner).done(&cx))
     }
 
     // `Owner::name`: an enum variant, or a method or const attached to `Owner`.
-    fn associated(self, owner: Decl, name: Text) -> Result[Target, Problem] {
+    fn associated(self, &cx: Cx!['k], owner: Decl['k], name: Text['k]) -> Result[Target['k], Problem['k]] {
         let unit = match owner.node {
             Named::Enum(e) => {
                 var i = 0usize;
-                while i < e.variants.len() {
-                    if e.variants.get(i).name.eq(name) {
+                while i < e.variants.len(&cx) {
+                    if e.variants.get(&cx, i).name.eq(&cx, name) {
                         return Result::Ok.(Target::Variant.(owner, name));
                     }
                     i = i + 1usize;
@@ -1469,8 +1534,8 @@ impl Resolver {
             },
             Named::Trait(t) => {
                 var i = 0usize;
-                while i < t.methods.len() {
-                    if t.methods.get(i).name.eq(name) {
+                while i < t.methods.len(&cx) {
+                    if t.methods.get(&cx, i).name.eq(&cx, name) {
                         return Result::Ok.(Target::TraitMethod.(owner, name));
                     }
                     i = i + 1usize;
@@ -1478,52 +1543,55 @@ impl Resolver {
             },
             _ => (),
         };
-        let found = self.attached.get_or((Owner::Decl.(owner), name), Seq::new());
-        var own: Seq[Decl] = Seq::new();
+        let found = self.attached.get_or(&cx, (Owner::Decl.(owner), name), Seq::new(&cx));
+        var own: Seq[Decl['k], 'k] = Seq::new(&cx);
         var i = 0usize;
-        while i < found.len() {
-            if Key::key_same(found.get(i).home, owner.home) {
-                own.push(found.get(i));
+        while i < found.len(&cx) {
+            if key_same(&cx, found.get(&cx, i).home, owner.home) {
+                own.push(&cx, found.get(&cx, i));
             }
             i = i + 1usize;
         }
-        if own.is_empty() {
+        if own.is_empty(&cx) {
             own = found;
         }
-        if own.len() != 1usize {
-            return problem(Out::new().put(if own.is_empty() { "unknown" } else { "ambiguous" }).put(" associated name ").add(owner.name).put("::").add(name).done());
+        if own.len(&cx) != 1usize {
+            return problem(Out::new(&cx).put(&cx, if own.is_empty(&cx) { "unknown" } else { "ambiguous" }).put(&cx, " associated name ").add(&cx, owner.name).put(&cx, "::").add(&cx, name).done(&cx));
         }
-        Result::Ok.(Target::Decl.(own.get(0usize)))
+        Result::Ok.(Target::Decl.(own.get(&cx, 0usize)))
     }
 
     // A library item the compiler itself refers to (Slice for string literals, Buffer and Format
     // for f-strings, Ordering for atomics): through a direct dependency on its home library, else
     // through std, else in the module's own package.
-    fn library(self, home: ModuleId, library_name: Text, path: Seq[Text], std_path: Seq[Text]) -> Target {
-        let deps = self.packages.get(home.package).deps;
-        let root = if deps.has(library_name) { library_name } else if deps.has(text("std")) { text("std") } else { text("package") };
-        let full: Seq[Text] = Seq::one(root);
-        full.append(if root.is("std") { std_path } else { path });
-        self.need(home, full, no_pos())
+    fn library(self, &cx: Cx!['k], home: ModuleId['k], library_name: Text['k], path: Seq[Text['k], 'k], std_path: Seq[Text['k], 'k]) -> Target['k] {
+        let deps = self.packages.get(&cx, home.package).deps;
+        let root = if deps.has(&cx, library_name) { library_name } else if deps.has(&cx, text(&cx, "std")) { text(&cx, "std") } else { text(&cx, "package") };
+        let full: Seq[Text['k], 'k] = Seq::one(&cx, root);
+        full.append(&cx, if root.is(&cx, "std") { std_path } else { path });
+        self.need(&cx, home, full, no_pos())
     }
 }
 
 // ---------------------------------------------------------- references --
 
 // `names` with `more` added, as a new sequence: the sets of names in scope.
-fn with(names: Seq[Text], more: Seq[Text]) -> Seq[Text] {
-    let out = names.copy();
-    out.append(more);
+forall 'k.
+fn with(&cx: Cx!['k], names: Seq[Text['k], 'k], more: Seq[Text['k], 'k]) -> Seq[Text['k], 'k] {
+    let out = names.copy(&cx);
+    out.append(&cx, more);
     out
 }
 
-fn with_one(names: Seq[Text], name: Text) -> Seq[Text] {
-    let out = names.copy();
-    out.push(name);
+forall 'k.
+fn with_one(&cx: Cx!['k], names: Seq[Text['k], 'k], name: Text['k]) -> Seq[Text['k], 'k] {
+    let out = names.copy(&cx);
+    out.push(&cx, name);
     out
 }
 
-fn quantifier_of(item: S::Item) -> Option[S::Forall] {
+forall 'k.
+fn quantifier_of(item: S::Item['k]) -> Option[S::Forall['k]] {
     match item {
         S::Item::Use(x) => x.quantifier,
         S::Item::Module(x) => Option::None,
@@ -1540,15 +1608,16 @@ fn quantifier_of(item: S::Item) -> Option[S::Forall] {
 }
 
 // The type parameters a quantifier binds, without its brands.
-fn forall_params(quantifier: Option[S::Forall]) -> Seq[Text] {
-    let out: Seq[Text] = Seq::new();
+forall 'k.
+fn forall_params(&cx: Cx!['k], quantifier: Option[S::Forall['k]]) -> Seq[Text['k], 'k] {
+    let out: Seq[Text['k], 'k] = Seq::new(&cx);
     let unit = match quantifier {
         Option::Some(f) => {
-            let all = with(f.params, f.determined);
+            let all = with(&cx, f.params, f.determined);
             var i = 0usize;
-            while i < all.len() {
-                if !all.get(i).starts_with(text("'")) {
-                    out.push(all.get(i));
+            while i < all.len(&cx) {
+                if !all.get(&cx, i).starts_with(&cx, text(&cx, "'")) {
+                    out.push(&cx, all.get(&cx, i));
                 }
                 i = i + 1usize;
             }
@@ -1559,29 +1628,31 @@ fn forall_params(quantifier: Option[S::Forall]) -> Seq[Text] {
 }
 
 // Resolve every path in every item of every module.
+forall 'k.
 exposed struct Names {
-    r: Resolver,
-    home: Cell[ModuleId],
+    r: Resolver['k],
+    home: Cell[ModuleId['k], 'k],
 }
 
-impl Names {
-    fn new(r: Resolver) -> Names {
-        Names.{ r, home: Cell::new(ModuleId::root(0usize)) }
+forall 'k.
+impl Names['k] {
+    fn new(&cx: Cx!['k], r: Resolver['k]) -> Names['k] {
+        Names.{ r, home: Cell::new(&cx, ModuleId::root(&cx, 0usize)) }
     }
 
-    fn run(self) -> Resolver {
-        let modules = self.r.scopes.keys();
+    fn run(self, &cx: Cx!['k]) -> Resolver['k] {
+        let modules = self.r.scopes.keys(&cx);
         var m = 0usize;
-        while m < modules.len() {
-            let home = modules.get(m);
-            self.home.set(home);
-            let items = self.r.scopes.at(home).items;
+        while m < modules.len(&cx) {
+            let home = modules.get(&cx, m);
+            self.home.set(&cx, home);
+            let items = self.r.scopes.at(&cx, home).items;
             var i = 0usize;
-            while i < items.len() {
-                let item = items.get(i);
-                self.r.locate(home, item_pos(item));
-                self.item(item, Seq::new());
-                self.r.unlocate();
+            while i < items.len(&cx) {
+                let item = items.get(&cx, i);
+                self.r.locate(&cx, home, item_pos(item));
+                self.item(&cx, item, Seq::new(&cx));
+                self.r.unlocate(&cx);
                 i = i + 1usize;
             }
             m = m + 1usize;
@@ -1589,28 +1660,28 @@ impl Names {
         self.r
     }
 
-    fn set(self, id: u32, r: NameRef) {
-        self.r.refs.set(id, r);
+    fn set(self, &cx: Cx!['k], id: u32, r: NameRef['k]) {
+        self.r.refs.set(&cx, id, r);
     }
 
-    fn premises(self, quantifier: Option[S::Forall], types: Seq[Text]) {
+    fn premises(self, &cx: Cx!['k], quantifier: Option[S::Forall['k]], types: Seq[Text['k], 'k]) {
         let unit = match quantifier {
             Option::Some(f) => {
                 var i = 0usize;
-                while i < f.premises.len() {
-                    let premise = f.premises.get(i);
+                while i < f.premises.len(&cx) {
+                    let premise = f.premises.get(&cx, i);
                     let trait_path = premise.trait_path;
-                    let trait_ref = if trait_path.len() == 1usize && is_builtin_trait(trait_path.get(0usize)) {
-                        NameRef::Builtin.(trait_path.get(0usize))
+                    let trait_ref = if trait_path.len(&cx) == 1usize && is_builtin_trait(&cx, trait_path.get(&cx, 0usize)) {
+                        NameRef::Builtin.(trait_path.get(&cx, 0usize))
                     } else {
-                        NameRef::Decl.(self.decl(trait_path, "trait", no_pos()))
+                        NameRef::Decl.(self.decl(&cx, trait_path, "trait", no_pos()))
                     };
                     var k = 0usize;
-                    while k < premise.args.args.len() {
-                        self.type(premise.args.args.get(k), types, false);
+                    while k < premise.args.args.len(&cx) {
+                        self.type(&cx, premise.args.args.get(&cx, k), types, false);
                         k = k + 1usize;
                     }
-                    self.set(premise.args.id, trait_ref);
+                    self.set(&cx, premise.args.id, trait_ref);
                     i = i + 1usize;
                 }
             },
@@ -1618,74 +1689,74 @@ impl Names {
         };
     }
 
-    fn item(self, item: S::Item, types: Seq[Text]) {
+    fn item(self, &cx: Cx!['k], item: S::Item['k], types: Seq[Text['k], 'k]) {
         let unit = match item {
             S::Item::Use(x) => return,
             S::Item::Module(x) => return,
             _ => (),
         };
         let quantifier = quantifier_of(item);
-        let types = with(types, forall_params(quantifier));
-        self.premises(quantifier, types);
+        let types = with(&cx, types, forall_params(&cx, quantifier));
+        self.premises(&cx, quantifier, types);
         match item {
             S::Item::Struct(s) => {
                 var i = 0usize;
-                while i < s.fields.len() {
-                    self.type(s.fields.get(i).type, types, false);
+                while i < s.fields.len(&cx) {
+                    self.type(&cx, s.fields.get(&cx, i).type, types, false);
                     i = i + 1usize;
                 }
             },
-            S::Item::Tuple(t) => self.types(t.elems, types),
+            S::Item::Tuple(t) => self.types(&cx, t.elems, types),
             S::Item::Enum(e) => {
                 var i = 0usize;
-                while i < e.variants.len() {
-                    self.types(e.variants.get(i).payload, types);
+                while i < e.variants.len(&cx) {
+                    self.types(&cx, e.variants.get(&cx, i).payload, types);
                     i = i + 1usize;
                 }
             },
-            S::Item::Fn(f) => self.function(f, types),
+            S::Item::Fn(f) => self.function(&cx, f, types),
             S::Item::Extern(x) => {
                 var i = 0usize;
-                while i < x.params.len() {
-                    let unit = match x.params.get(i).type {
-                        Option::Some(t) => self.type(t, types, false),
+                while i < x.params.len(&cx) {
+                    let unit = match x.params.get(&cx, i).type {
+                        Option::Some(t) => self.type(&cx, t, types, false),
                         Option::None => (),
                     };
                     i = i + 1usize;
                 }
                 let unit = match x.ret {
-                    Option::Some(t) => self.type(t, types, false),
+                    Option::Some(t) => self.type(&cx, t, types, false),
                     Option::None => (),
                 };
             },
             S::Item::Const(c) => {
-                self.type(c.type, types, false);
-                self.expr(c.value, types, Seq::new());
+                self.type(&cx, c.type, types, false);
+                self.expr(&cx, c.value, types, Seq::new(&cx));
             },
             S::Item::Impl(m) => {
-                self.type(m.type, types, false);
+                self.type(&cx, m.type, types, false);
                 var i = 0usize;
-                while i < m.items.len() {
-                    let unit = match m.items.get(i) {
-                        S::Member::Fn(f) => self.item(S::Item::Fn.(f), types),
-                        S::Member::Const(c) => self.item(S::Item::Const.(c), types),
+                while i < m.items.len(&cx) {
+                    let unit = match m.items.get(&cx, i) {
+                        S::Member::Fn(f) => self.item(&cx, S::Item::Fn.(f), types),
+                        S::Member::Const(c) => self.item(&cx, S::Item::Const.(c), types),
                     };
                     i = i + 1usize;
                 }
             },
             S::Item::Trait(t) => {
-                let trait_types = if t.quantifier.is_none() { with_one(types, text("Self")) } else { types };
+                let trait_types = if t.quantifier.is_none() { with_one(&cx, types, text(&cx, "Self")) } else { types };
                 var i = 0usize;
-                while i < t.methods.len() {
-                    self.function(t.methods.get(i), trait_types);
+                while i < t.methods.len(&cx) {
+                    self.function(&cx, t.methods.get(&cx, i), trait_types);
                     i = i + 1usize;
                 }
             },
             S::Item::Instance(n) => {
-                self.type(n.type, types, true);
+                self.type(&cx, n.type, types, true);
                 var i = 0usize;
-                while i < n.methods.len() {
-                    self.item(S::Item::Fn.(n.methods.get(i)), types);
+                while i < n.methods.len(&cx) {
+                    self.item(&cx, S::Item::Fn.(n.methods.get(&cx, i)), types);
                     i = i + 1usize;
                 }
             },
@@ -1693,191 +1764,191 @@ impl Names {
         }
     }
 
-    fn function(self, f: S::Fn, types: Seq[Text]) {
-        let types = with(types, forall_params(f.quantifier));
-        self.premises(f.quantifier, types);
-        let names: Seq[Text] = Seq::new();
+    fn function(self, &cx: Cx!['k], f: S::Fn['k], types: Seq[Text['k], 'k]) {
+        let types = with(&cx, types, forall_params(&cx, f.quantifier));
+        self.premises(&cx, f.quantifier, types);
+        let names: Seq[Text['k], 'k] = Seq::new(&cx);
         var i = 0usize;
-        while i < f.params.len() {
-            let p = f.params.get(i);
+        while i < f.params.len(&cx) {
+            let p = f.params.get(&cx, i);
             let unit = match p.type {
-                Option::Some(t) => self.type(t, types, false),
+                Option::Some(t) => self.type(&cx, t, types, false),
                 Option::None => (),
             };
-            names.push(p.name);
+            names.push(&cx, p.name);
             i = i + 1usize;
         }
         let unit = match f.ret {
-            Option::Some(t) => self.type(t, types, false),
+            Option::Some(t) => self.type(&cx, t, types, false),
             Option::None => (),
         };
         let unit = match f.body {
-            Option::Some(b) => self.block(b, types, names),
+            Option::Some(b) => self.block(&cx, b, types, names),
             Option::None => (),
         };
     }
 
     // The declaration `path` names, of `kind` unless it is empty.
-    fn decl(self, path: Seq[Text], kind: Slice[u8, 'static], pos: Pos) -> Decl {
-        let target = self.r.need(self.home.get(), path, pos);
-        let k = text(kind);
+    fn decl(self, &cx: Cx!['k], path: Seq[Text['k], 'k], kind: Slice[u8, 'static], pos: Pos) -> Decl['k] {
+        let target = self.r.need(&cx, self.home.get(&cx), path, pos);
+        let k = text(&cx, kind);
         match target {
-            Target::Decl(d) => if k.is_empty() || d.kind.eq(k) {
+            Target::Decl(d) => if k.is_empty() || d.kind.eq(&cx, k) {
                 d
             } else {
-                self.not_a(path, k, pos)
+                self.not_a(&cx, path, k, pos)
             },
-            _ => self.not_a(path, k, pos),
+            _ => self.not_a(&cx, path, k, pos),
         }
     }
 
-    fn not_a(self, path: Seq[Text], kind: Text, pos: Pos) -> ! {
-        let what = if kind.is_empty() { text("declaration") } else { kind };
-        self.r.fail(Out::new().add(joined(path)).put(" is not a ").add(what).done(), pos)
+    fn not_a(self, &cx: Cx!['k], path: Seq[Text['k], 'k], kind: Text['k], pos: Pos) -> ! {
+        let what = if kind.is_empty() { text(&cx, "declaration") } else { kind };
+        self.r.fail(&cx, Out::new(&cx).add(&cx, joined(&cx, path)).put(&cx, " is not a ").add(&cx, what).done(&cx), pos)
     }
 
     // ---- types
-    fn types(self, ts: Seq[Type], types: Seq[Text]) {
+    fn types(self, &cx: Cx!['k], ts: Seq[Type['k], 'k], types: Seq[Text['k], 'k]) {
         var i = 0usize;
-        while i < ts.len() {
-            self.type(ts.get(i), types, false);
+        while i < ts.len(&cx) {
+            self.type(&cx, ts.get(&cx, i), types, false);
             i = i + 1usize;
         }
     }
 
-    fn type(self, t: Type, types: Seq[Text], is_trait: bool) {
+    fn type(self, &cx: Cx!['k], t: Type['k], types: Seq[Text['k], 'k], is_trait: bool) {
         match t {
             Type::Name(n) => {
                 let path = n.path;
-                let single = path.len() == 1usize;
-                let name = path.get(0usize);
-                if single && types.has(name) {
-                    self.set(n.id, NameRef::Param.(name));
-                } else if single && is_prim(name) {
-                    self.set(n.id, NameRef::Prim.(name));
-                } else if single && is_builtin_type(name) && !self.declared(name) {
-                    self.set(n.id, NameRef::Builtin.(name));
-                } else if name.is("builtin") {
-                    if path.len() != 2usize {
-                        self.r.fail(text("a builtin type path has exactly two components"), no_pos());
+                let single = path.len(&cx) == 1usize;
+                let name = path.get(&cx, 0usize);
+                if single && types.has(&cx, name) {
+                    self.set(&cx, n.id, NameRef::Param.(name));
+                } else if single && is_prim(&cx, name) {
+                    self.set(&cx, n.id, NameRef::Prim.(name));
+                } else if single && is_builtin_type(&cx, name) && !self.declared(&cx, name) {
+                    self.set(&cx, n.id, NameRef::Builtin.(name));
+                } else if name.is(&cx, "builtin") {
+                    if path.len(&cx) != 2usize {
+                        self.r.fail(&cx, text(&cx, "a builtin type path has exactly two components"), no_pos());
                     }
-                    self.set(n.id, NameRef::Builtin.(path.get(1usize)));
+                    self.set(&cx, n.id, NameRef::Builtin.(path.get(&cx, 1usize)));
                 } else {
-                    let d = self.decl(path, if is_trait { "trait" } else { "" }, no_pos());
-                    self.set(n.id, NameRef::Decl.(d));
-                    if !is_trait && !d.kind.is("struct") && !d.kind.is("enum") && !d.kind.is("tuple") {
-                        self.r.fail(Out::new().add(joined(path)).put(" is not a type").done(), no_pos());
+                    let d = self.decl(&cx, path, if is_trait { "trait" } else { "" }, no_pos());
+                    self.set(&cx, n.id, NameRef::Decl.(d));
+                    if !is_trait && !d.kind.is(&cx, "struct") && !d.kind.is(&cx, "enum") && !d.kind.is(&cx, "tuple") {
+                        self.r.fail(&cx, Out::new(&cx).add(&cx, joined(&cx, path)).put(&cx, " is not a type").done(&cx), no_pos());
                     }
                 }
-                self.types(n.args, types);
+                self.types(&cx, n.args, types);
             },
-            Type::Ptr(inner) => self.type(inner.get(), types, false),
-            Type::Tuple(elems) => self.types(elems, types),
+            Type::Ptr(inner) => self.type(&cx, inner.get(&cx), types, false),
+            Type::Tuple(elems) => self.types(&cx, elems, types),
             Type::Array(elem, length) => {
-                self.type(elem.get(), types, false);
-                self.expr(length.get(), types, Seq::new());
+                self.type(&cx, elem.get(&cx), types, false);
+                self.expr(&cx, length.get(&cx), types, Seq::new(&cx));
             },
             Type::Fn(f) => {
-                self.slots(f.params, types);
-                self.type(f.ret.get(), types, false);
+                self.slots(&cx, f.params, types);
+                self.type(&cx, f.ret.get(&cx), types, false);
             },
             Type::Closure(c) => {
-                self.slots(c.params, types);
-                self.type(c.ret.get(), types, false);
+                self.slots(&cx, c.params, types);
+                self.type(&cx, c.ret.get(&cx), types, false);
                 let unit = match c.env {
-                    Option::Some(env) => self.type(env.get(), types, false),
+                    Option::Some(env) => self.type(&cx, env.get(&cx), types, false),
                     Option::None => (),
                 };
             },
-            Type::Exists(brands, body) => self.type(body.get(), types, false),
+            Type::Exists(brands, body) => self.type(&cx, body.get(&cx), types, false),
             Type::Foreach(f) => {
-                self.type(f.source.get(), types, false);
-                self.type(f.body.get(), with_one(types, f.binder), false);
+                self.type(&cx, f.source.get(&cx), types, false);
+                self.type(&cx, f.body.get(&cx), with_one(&cx, types, f.binder), false);
             },
             Type::Forall(params, body) => {
-                let bound: Seq[Text] = Seq::new();
+                let bound: Seq[Text['k], 'k] = Seq::new(&cx);
                 var i = 0usize;
-                while i < params.len() {
-                    if !params.get(i).starts_with(text("'")) {
-                        bound.push(params.get(i));
+                while i < params.len(&cx) {
+                    if !params.get(&cx, i).starts_with(&cx, text(&cx, "'")) {
+                        bound.push(&cx, params.get(&cx, i));
                     }
                     i = i + 1usize;
                 }
-                self.type(body.get(), with(types, bound), false);
+                self.type(&cx, body.get(&cx), with(&cx, types, bound), false);
             },
             _ => (),
         }
     }
 
-    fn slots(self, slots: Seq[S::Slot], types: Seq[Text]) {
+    fn slots(self, &cx: Cx!['k], slots: Seq[S::Slot['k], 'k], types: Seq[Text['k], 'k]) {
         var i = 0usize;
-        while i < slots.len() {
-            self.type(slots.get(i).type, types, false);
+        while i < slots.len(&cx) {
+            self.type(&cx, slots.get(&cx, i).type, types, false);
             i = i + 1usize;
         }
     }
 
-    fn visible(self, name: Text) -> bool {
-        self.r.lookup(self.home.get(), Seq::one(name), no_pos()).is_ok()
+    fn visible(self, &cx: Cx!['k], name: Text['k]) -> bool {
+        self.r.lookup(&cx, self.home.get(&cx), Seq::one(&cx, name), no_pos()).is_ok()
     }
 
-    fn declared(self, name: Text) -> bool {
-        let scope = self.r.scopes.at(self.home.get());
-        scope.decls.has(name) || scope.imports.has(name)
+    fn declared(self, &cx: Cx!['k], name: Text['k]) -> bool {
+        let scope = self.r.scopes.at(&cx, self.home.get(&cx));
+        scope.decls.has(&cx, name) || scope.imports.has(&cx, name)
     }
 
     // ---- expressions
     // Resolve `e`; `values` are the locals in scope.
-    fn expr(self, e: Expr, types: Seq[Text], values: Seq[Text]) {
+    fn expr(self, &cx: Cx!['k], e: Expr['k], types: Seq[Text['k], 'k], values: Seq[Text['k], 'k]) {
         match e {
-            Expr::Path(p) => self.path(p, types, values),
-            Expr::Block(b) => self.block(b, types, values),
+            Expr::Path(p) => self.path(&cx, p, types, values),
+            Expr::Block(b) => self.block(&cx, b, types, values),
             Expr::StructLit(s) => {
-                let names = s.path.names();
-                if !names.get(0usize).is("builtin") {
-                    self.set(s.path.id, NameRef::Decl.(self.decl(names, "struct", s.pos)));
+                let names = s.path.names(&cx);
+                if !names.get(&cx, 0usize).is(&cx, "builtin") {
+                    self.set(&cx, s.path.id, NameRef::Decl.(self.decl(&cx, names, "struct", s.pos)));
                 }
-                self.segment_args(s.path, types);
+                self.segment_args(&cx, s.path, types);
                 var i = 0usize;
-                while i < s.fields.len() {
-                    let unit = match s.fields.get(i).value {
-                        Option::Some(v) => self.expr(v, types, values),
+                while i < s.fields.len(&cx) {
+                    let unit = match s.fields.get(&cx, i).value {
+                        Option::Some(v) => self.expr(&cx, v, types, values),
                         Option::None => (),
                     };
                     i = i + 1usize;
                 }
                 i = 0usize;
-                while i < s.fields.len() {
-                    let f = s.fields.get(i);
-                    if f.value.is_none() && !values.has(f.name) {
-                        self.r.fail(Out::new().put("unknown local ").add(f.name).done(), s.pos);
+                while i < s.fields.len(&cx) {
+                    let f = s.fields.get(&cx, i);
+                    if f.value.is_none() && !values.has(&cx, f.name) {
+                        self.r.fail(&cx, Out::new(&cx).put(&cx, "unknown local ").add(&cx, f.name).done(&cx), s.pos);
                     }
                     i = i + 1usize;
                 }
             },
             Expr::Match(m) => {
-                self.expr(m.scrutinee.get(), types, values);
+                self.expr(&cx, m.scrutinee.get(&cx), types, values);
                 var i = 0usize;
-                while i < m.arms.len() {
-                    let arm = m.arms.get(i);
-                    let bound: Seq[Text] = Seq::new();
+                while i < m.arms.len(&cx) {
+                    let arm = m.arms.get(&cx, i);
+                    let bound: Seq[Text['k], 'k] = Seq::new(&cx);
                     var k = 0usize;
-                    while k < arm.cases.len() {
-                        let case = arm.cases.get(k);
+                    while k < arm.cases.len(&cx) {
+                        let case = arm.cases.get(&cx, k);
                         let unit = match case.kind {
                             S::CaseKind::Variant => {
                                 let path = match case.path {
                                     Option::Some(p) => p,
-                                    Option::None => self.r.fail(text("internal error: a variant case without a path"), no_pos()),
+                                    Option::None => self.r.fail(&cx, text(&cx, "internal error: a variant case without a path"), no_pos()),
                                 };
-                                self.variant(path);
-                                self.segment_args(path, types);
+                                self.variant(&cx, path);
+                                self.segment_args(&cx, path, types);
                                 let unit = match case.binders {
                                     Option::Some(bs) => {
                                         var b = 0usize;
-                                        while b < bs.len() {
-                                            if !bs.get(b).is("_") && !bs.get(b).is_empty() {
-                                                bound.push(bs.get(b));
+                                        while b < bs.len(&cx) {
+                                            if !bs.get(&cx, b).is(&cx, "_") && !bs.get(&cx, b).is_empty() {
+                                                bound.push(&cx, bs.get(&cx, b));
                                             }
                                             b = b + 1usize;
                                         }
@@ -1889,169 +1960,170 @@ impl Names {
                         };
                         k = k + 1usize;
                     }
-                    self.expr(arm.body, types, with(values, bound));
+                    self.expr(&cx, arm.body, types, with(&cx, values, bound));
                     i = i + 1usize;
                 }
             },
             Expr::Closure(c) => {
-                let names: Seq[Text] = Seq::new();
+                let names: Seq[Text['k], 'k] = Seq::new(&cx);
                 var i = 0usize;
-                while i < c.params.len() {
-                    let p = c.params.get(i);
+                while i < c.params.len(&cx) {
+                    let p = c.params.get(&cx, i);
                     let unit = match p.type {
-                        Option::Some(t) => self.type(t, types, false),
+                        Option::Some(t) => self.type(&cx, t, types, false),
                         Option::None => (),
                     };
-                    names.push(p.name);
+                    names.push(&cx, p.name);
                     i = i + 1usize;
                 }
                 let unit = match c.ret {
-                    Option::Some(t) => self.type(t, types, false),
+                    Option::Some(t) => self.type(&cx, t, types, false),
                     Option::None => (),
                 };
-                self.expr(c.body.get(), types, with(values, names));
+                self.expr(&cx, c.body.get(&cx), types, with(&cx, values, names));
             },
             Expr::Foreach(f) => {
-                self.expr(f.source.get(), types, values);
+                self.expr(&cx, f.source.get(&cx), types, values);
                 let inner = match f.binder {
-                    Option::Some(b) => with_one(types, b),
+                    Option::Some(b) => with_one(&cx, types, b),
                     Option::None => types,
                 };
-                self.block(f.body, inner, with_one(values, f.name));
+                self.block(&cx, f.body, inner, with_one(&cx, values, f.name));
             },
             Expr::Cast(c) => {
-                self.expr(c.value.get(), types, values);
-                self.type(c.type, types, false);
+                self.expr(&cx, c.value.get(&cx), types, values);
+                self.type(&cx, c.type, types, false);
             },
-            Expr::Sizeof(n) => self.type(n.value, types, false),
+            Expr::Sizeof(n) => self.type(&cx, n.value, types, false),
             Expr::While(w) => {
-                self.expr(w.cond.get(), types, values);
-                self.block(w.body, types, values);
+                self.expr(&cx, w.cond.get(&cx), types, values);
+                self.block(&cx, w.body, types, values);
             },
             Expr::For(f) => {
-                self.expr(f.iterator.get(), types, values);
-                self.block(f.body, types, with_one(values, f.name));
+                self.expr(&cx, f.iterator.get(&cx), types, values);
+                self.block(&cx, f.body, types, with_one(&cx, values, f.name));
             },
             Expr::Lit(l) => (),
             _ => {
-                let parts = children(e);
+                let parts = children(&cx, e);
                 var i = 0usize;
-                while i < parts.len() {
-                    self.expr(parts.get(i), types, values);
+                while i < parts.len(&cx) {
+                    self.expr(&cx, parts.get(&cx, i), types, values);
                     i = i + 1usize;
                 }
             },
         }
     }
 
-    fn block(self, b: S::Block, types: Seq[Text], values: Seq[Text]) {
+    fn block(self, &cx: Cx!['k], b: S::Block['k], types: Seq[Text['k], 'k], values: Seq[Text['k], 'k]) {
         var values = values;
         var i = 0usize;
-        while i < b.stmts.len() {
-            values = self.stmt(b.stmts.get(i), types, values);
+        while i < b.stmts.len(&cx) {
+            values = self.stmt(&cx, b.stmts.get(&cx, i), types, values);
             i = i + 1usize;
         }
         let unit = match b.tail {
-            Option::Some(t) => self.expr(t.get(), types, values),
+            Option::Some(t) => self.expr(&cx, t.get(&cx), types, values),
             Option::None => (),
         };
     }
 
-    fn stmt(self, s: Statement, types: Seq[Text], values: Seq[Text]) -> Seq[Text] {
+    fn stmt(self, &cx: Cx!['k], s: Statement['k], types: Seq[Text['k], 'k], values: Seq[Text['k], 'k]) -> Seq[Text['k], 'k] {
         match s {
             Statement::Let(l) => {
-                self.expr(l.value, types, values);
+                self.expr(&cx, l.value, types, values);
                 let unit = match l.type {
-                    Option::Some(t) => self.type(t, types, false),
+                    Option::Some(t) => self.type(&cx, t, types, false),
                     Option::None => (),
                 };
-                with(values, bound(l.pattern))
+                with(&cx, values, bound(&cx, l.pattern))
             },
             Statement::Var(v) => {
-                self.expr(v.value, types, values);
+                self.expr(&cx, v.value, types, values);
                 let unit = match v.type {
-                    Option::Some(t) => self.type(t, types, false),
+                    Option::Some(t) => self.type(&cx, t, types, false),
                     Option::None => (),
                 };
-                with_one(values, v.name)
+                with_one(&cx, values, v.name)
             },
             Statement::Const(c) => {
-                self.type(c.type, types, false);
-                self.expr(c.value, types, values);
-                with_one(values, c.name)
+                self.type(&cx, c.type, types, false);
+                self.expr(&cx, c.value, types, values);
+                with_one(&cx, values, c.name)
             },
             Statement::Assign(a) => {
-                self.expr(a.target, types, values);
-                self.expr(a.value, types, values);
+                self.expr(&cx, a.target, types, values);
+                self.expr(&cx, a.value, types, values);
                 values
             },
             Statement::Expr(n) => {
-                self.expr(n.value, types, values);
+                self.expr(&cx, n.value, types, values);
                 values
             },
         }
     }
 
-    fn segment_args(self, p: S::Path, types: Seq[Text]) {
+    fn segment_args(self, &cx: Cx!['k], p: S::Path['k], types: Seq[Text['k], 'k]) {
         var i = 0usize;
-        while i < p.segments.len() {
-            self.types(p.segments.get(i).args, types);
+        while i < p.segments.len(&cx) {
+            self.types(&cx, p.segments.get(&cx, i).args, types);
             i = i + 1usize;
         }
     }
 
-    fn path(self, p: S::Path, types: Seq[Text], values: Seq[Text]) {
-        let names = p.names();
-        self.segment_args(p, types);
-        let first = names.get(0usize);
-        if names.len() == 1usize && values.has(first) {
-            self.set(p.id, NameRef::Local.(first));
-        } else if first.is("builtin") {
-            self.set(p.id, NameRef::Builtin.(joined(names.from(1usize))));
-        } else if names.len() == 1usize && is_builtin_value(first) && !self.visible(first) {
-            self.set(p.id, NameRef::Builtin.(first));
-        } else if names.len() == 2usize && is_prim(first) {
-            let found = self.r.attached.get_or((Owner::Prim.(first), names.get(1usize)), Seq::new());
-            if found.is_empty() {
-                self.r.fail(Out::new().put("unknown ").add(first).put("::").add(names.get(1usize)).done(), p.pos);
+    fn path(self, &cx: Cx!['k], p: S::Path['k], types: Seq[Text['k], 'k], values: Seq[Text['k], 'k]) {
+        let names = p.names(&cx);
+        self.segment_args(&cx, p, types);
+        let first = names.get(&cx, 0usize);
+        if names.len(&cx) == 1usize && values.has(&cx, first) {
+            self.set(&cx, p.id, NameRef::Local.(first));
+        } else if first.is(&cx, "builtin") {
+            self.set(&cx, p.id, NameRef::Builtin.(joined(&cx, names.from(&cx, 1usize))));
+        } else if names.len(&cx) == 1usize && is_builtin_value(&cx, first) && !self.visible(&cx, first) {
+            self.set(&cx, p.id, NameRef::Builtin.(first));
+        } else if names.len(&cx) == 2usize && is_prim(&cx, first) {
+            let found = self.r.attached.get_or(&cx, (Owner::Prim.(first), names.get(&cx, 1usize)), Seq::new(&cx));
+            if found.is_empty(&cx) {
+                self.r.fail(&cx, Out::new(&cx).put(&cx, "unknown ").add(&cx, first).put(&cx, "::").add(&cx, names.get(&cx, 1usize)).done(&cx), p.pos);
             }
-            self.set(p.id, NameRef::Decl.(found.get(0usize)));
-        } else if names.len() == 2usize && types.has(first) {
+            self.set(&cx, p.id, NameRef::Decl.(found.get(&cx, 0usize)));
+        } else if names.len(&cx) == 2usize && types.has(&cx, first) {
             // a member of a type parameter, found by inference
-            self.set(p.id, NameRef::Assoc.(first, names.get(1usize)));
+            self.set(&cx, p.id, NameRef::Assoc.(first, names.get(&cx, 1usize)));
         } else {
-            let r = match self.r.need(self.home.get(), names, p.pos) {
-                Target::Module(m) => self.r.fail(Out::new().add(joined(names)).put(" is a module, not a value").done(), p.pos),
+            let r = match self.r.need(&cx, self.home.get(&cx), names, p.pos) {
+                Target::Module(m) => self.r.fail(&cx, Out::new(&cx).add(&cx, joined(&cx, names)).put(&cx, " is a module, not a value").done(&cx), p.pos),
                 Target::Decl(d) => NameRef::Decl.(d),
                 Target::Variant(d, v) => NameRef::Variant.(d, v),
                 Target::TraitMethod(d, m) => NameRef::TraitMethod.(d, m),
             };
-            self.set(p.id, r);
+            self.set(&cx, p.id, r);
         }
     }
 
-    fn variant(self, path: S::Path) {
-        match self.r.need(self.home.get(), path.names(), path.pos) {
-            Target::Variant(d, v) => self.set(path.id, NameRef::Variant.(d, v)),
-            _ => self.r.fail(Out::new().add(joined(path.names())).put(" is not an enum variant").done(), path.pos),
+    fn variant(self, &cx: Cx!['k], path: S::Path['k]) {
+        match self.r.need(&cx, self.home.get(&cx), path.names(&cx), path.pos) {
+            Target::Variant(d, v) => self.set(&cx, path.id, NameRef::Variant.(d, v)),
+            _ => self.r.fail(&cx, Out::new(&cx).add(&cx, joined(&cx, path.names(&cx))).put(&cx, " is not an enum variant").done(&cx), path.pos),
         }
     }
 }
 
-fn bound(pattern: Pattern) -> Seq[Text] {
-    let out: Seq[Text] = Seq::new();
+forall 'k.
+fn bound(&cx: Cx!['k], pattern: Pattern['k]) -> Seq[Text['k], 'k] {
+    let out: Seq[Text['k], 'k] = Seq::new(&cx);
     let unit = match pattern {
-        Pattern::Bind(n) => out.push(n.value),
-        Pattern::Tuple(n) => bound_all(out, n.value),
-        Pattern::Array(n) => bound_all(out, n.value),
+        Pattern::Bind(n) => out.push(&cx, n.value),
+        Pattern::Tuple(n) => bound_all(&cx, out, n.value),
+        Pattern::Array(n) => bound_all(&cx, out, n.value),
         Pattern::Struct(s) => {
             var i = 0usize;
-            while i < s.fields.len() {
-                out.append(bound(s.fields.get(i).pattern));
+            while i < s.fields.len(&cx) {
+                out.append(&cx, bound(&cx, s.fields.get(&cx, i).pattern));
                 i = i + 1usize;
             }
             let unit = match s.rest {
-                Option::Some(r) => out.push(r),
+                Option::Some(r) => out.push(&cx, r),
                 Option::None => (),
             };
         },
@@ -2060,89 +2132,92 @@ fn bound(pattern: Pattern) -> Seq[Text] {
     out
 }
 
-fn bound_all(out: Seq[Text], patterns: Seq[Pattern]) {
+forall 'k.
+fn bound_all(&cx: Cx!['k], out: Seq[Text['k], 'k], patterns: Seq[Pattern['k], 'k]) {
     var i = 0usize;
-    while i < patterns.len() {
-        out.append(bound(patterns.get(i)));
+    while i < patterns.len(&cx) {
+        out.append(&cx, bound(&cx, patterns.get(&cx, i)));
         i = i + 1usize;
     }
 }
 
 // The subexpressions of the expression forms with no binding structure.
-fn children(e: Expr) -> Seq[Expr] {
-    let out: Seq[Expr] = Seq::new();
+forall 'k.
+fn children(&cx: Cx!['k], e: Expr['k]) -> Seq[Expr['k], 'k] {
+    let out: Seq[Expr['k], 'k] = Seq::new(&cx);
     let unit = match e {
-        Expr::Tuple(n) => out.append(n.value),
-        Expr::Array(a) => out.append(a.elems),
+        Expr::Tuple(n) => out.append(&cx, n.value),
+        Expr::Array(a) => out.append(&cx, a.elems),
         Expr::FStr(f) => {
             var i = 0usize;
-            while i < f.parts.len() {
-                let unit = match f.parts.get(i) {
-                    S::Piece::Expr(x) => out.push(x),
+            while i < f.parts.len(&cx) {
+                let unit = match f.parts.get(&cx, i) {
+                    S::Piece::Expr(x) => out.push(&cx, x),
                     S::Piece::Text(t) => (),
                 };
                 i = i + 1usize;
             }
         },
         Expr::If(n) => {
-            out.push(n.cond.get());
-            out.push(Expr::Block.(n.then));
+            out.push(&cx, n.cond.get(&cx));
+            out.push(&cx, Expr::Block.(n.then));
             let unit = match n.other {
-                Option::Some(o) => out.push(o.get()),
+                Option::Some(o) => out.push(&cx, o.get(&cx)),
                 Option::None => (),
             };
         },
         Expr::Return(n) => {
             let unit = match n.value {
-                Option::Some(v) => out.push(v.get()),
+                Option::Some(v) => out.push(&cx, v.get(&cx)),
                 Option::None => (),
             };
         },
-        Expr::Pack(p) => out.push(p.value.get()),
+        Expr::Pack(p) => out.push(&cx, p.value.get(&cx)),
         Expr::Binop(b) => {
-            out.push(b.left.get());
-            out.push(b.right.get());
+            out.push(&cx, b.left.get(&cx));
+            out.push(&cx, b.right.get(&cx));
         },
-        Expr::Unary(u) => out.push(u.operand.get()),
+        Expr::Unary(u) => out.push(&cx, u.operand.get(&cx)),
         Expr::UnsafeStore(s) => {
-            out.push(s.pointer.get());
-            out.push(s.value.get());
+            out.push(&cx, s.pointer.get(&cx));
+            out.push(&cx, s.value.get(&cx));
         },
-        Expr::Field(f) => out.push(f.value.get()),
-        Expr::Index(x) => out.push(x.value.get()),
-        Expr::Try(n) => out.push(n.value.get()),
+        Expr::Field(f) => out.push(&cx, f.value.get(&cx)),
+        Expr::Index(x) => out.push(&cx, x.value.get(&cx)),
+        Expr::Try(n) => out.push(&cx, n.value.get(&cx)),
         Expr::Call(c) => {
-            out.push(c.callee.get());
-            out.append(c.args);
+            out.push(&cx, c.callee.get(&cx));
+            out.append(&cx, c.args);
         },
-        _ => fail(text("no resolution rule for this expression")),
+        _ => fail(&cx, text(&cx, "no resolution rule for this expression")),
     };
     out
 }
 
 // The resolved package graph rooted at `path`.
-fn resolve(path: Text) -> Resolver {
-    let ids = Cell::new(0u32);
-    let resolver = Resolver::new(load(path, ids), ids);
-    if !resolver.packages.is_empty() {
-        let package = resolver.packages.get(0usize);
-        let unit = match package.entry.get() {
+forall 'k.
+fn resolve(&cx: Cx!['k], path: Text['k]) -> Resolver['k] {
+    let ids = Cell::new(&cx, 0u32);
+    let resolver = Resolver::new(&cx, load(&cx, path, ids), ids);
+    if !resolver.packages.is_empty(&cx) {
+        let package = resolver.packages.get(&cx, 0usize);
+        let unit = match package.entry.get(&cx) {
             Option::Some(entry) => {
-                if !entry.is_empty() {
-                    let target = resolver.need(ModuleId::root(package.id), entry, no_pos());
+                if !entry.is_empty(&cx) {
+                    let target = resolver.need(&cx, ModuleId::root(&cx, package.id), entry, no_pos());
                     let unit = match target {
                         Target::Decl(d) => {
-                            if !d.kind.is("fn") || d.home.package != package.id {
-                                fail(text("an executable's entry must be a function of its own package"));
+                            if !d.kind.is(&cx, "fn") || d.home.package != package.id {
+                                fail(&cx, text(&cx, "an executable's entry must be a function of its own package"));
                             }
-                            package.entry_decl.set(Option::Some.(d));
+                            package.entry_decl.set(&cx, Option::Some.(d));
                         },
-                        _ => fail(text("an executable's entry must be a function of its own package")),
+                        _ => fail(&cx, text(&cx, "an executable's entry must be a function of its own package")),
                     };
                 }
             },
             Option::None => (),
         };
     }
-    Names::new(resolver).run()
+    Names::new(&cx, resolver).run(&cx)
 }

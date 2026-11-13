@@ -1,11 +1,18 @@
-// The compiler's view of the operating system: arguments, files, directories and processes.
+// The compiler's view of the operating system: arguments, files, directories, processes, the
+// clock, and C's decimal-to-double conversion.
+//
+// This is the one module of the compiler that crosses the C boundary itself: paths are handed to
+// C as NUL-terminated copies in a `Buffer!`, freed once the call returns, and what C hands back
+// is copied into the context's arena.
 
-use package::support::base::{Out, Seq, Text, alloc, load_at, store_at, text};
+use package::support::base::{Cx, Seq, Text, text};
+use std::alloc::arena::save_buffer;
+use std::alloc::heap::HeapAllocator;
 use std::bytes::buffer::Buffer;
-use std::io::{close, open, read_file, write_all};
+use std::io::{close, open, read_file, write_span};
 use std::option::{Option, Result};
 use std::process::Args;
-use std::cstr::cstr_len;
+use std::raw::elem_ptr;
 use libc::fs::{canonicalize, environment_variable, open_directory};
 
 extern "C" fn fork() -> i32;
@@ -13,15 +20,17 @@ extern "C" fn execvp(file: *u8, argv: *(*u8)) -> i32;
 extern "C" fn waitpid(pid: i32, status: *i32, options: i32) -> i32;
 extern "C" fn _exit(status: i32) -> !;
 extern "C" fn clock_gettime(clock: i32, spec: *i64) -> i32;
+extern "C" fn strtod(text: *u8, end: *(*u8)) -> f64;
 
 // The arguments the program was started with, after its own name.
-fn arguments(argc: i32, argv: *(*u8)) -> Seq[Text] {
+forall 'k.
+fn arguments(&cx: Cx!['k], argc: i32, argv: *(*u8)) -> Seq[Text['k], 'k] {
     let args = unsafe Args::from_main(argc, argv);
-    let out: Seq[Text] = Seq::new();
+    let out: Seq[Text['k], 'k] = Seq::new(&cx);
     var i = 1usize;
     while i < args.len() {
         let unit = match args.bytes(i) {
-            Option::Some(bytes) => out.push(text(bytes)),
+            Option::Some(bytes) => out.push(&cx, text(&cx, bytes)),
             Option::None => (),
         };
         i = i + 1usize;
@@ -29,63 +38,70 @@ fn arguments(argc: i32, argv: *(*u8)) -> Seq[Text] {
     out
 }
 
-// `t` followed by a NUL, as C wants a path.
-fn c_string(t: Text) -> *u8 {
-    Out::new().add(t).byte(0u8).done().ptr
+// The bytes of `t`.
+forall 'k.
+fn buffer(&cx: Cx!['k], t: Text['k]) -> Buffer! {
+    Buffer::new().push_bytes(&cx.tag, t.bytes)
 }
 
-// The bytes of a buffer, as text that outlives it.
-fn take(b: Buffer!) -> Text {
-    let ptr = unsafe &b.as_ptr();
-    let len = &b.len();
-    let copy = Out::new();
-    copy.bytes.push_bytes(ptr, len);
-    b.destroy();
-    copy.done()
+// The bytes of `t` followed by a NUL, as C wants a path.
+forall 'k.
+fn c_string(&cx: Cx!['k], t: Text['k]) -> Buffer! {
+    buffer(&cx, t).push_byte(0u8)
 }
 
-fn buffer(t: Text) -> Buffer! {
-    unsafe Buffer::new().push_n(t.ptr, t.len)
+// The bytes of a buffer, as text in the arena; the buffer is freed.
+forall 'k.
+fn take(&cx: Cx!['k], b: Buffer!) -> Text['k] {
+    Text.{ bytes: save_buffer(&cx.arena, b) }
 }
 
 // The contents of the file at `path`, if it can be read.
-fn read(path: Text) -> Option[Text] {
-    match unsafe read_file(c_string(path)) {
-        Result::Ok(b) => Option::Some.(take(b)),
+forall 'k.
+fn read(&cx: Cx!['k], path: Text['k]) -> Option[Text['k]] {
+    var name = c_string(&cx, path);
+    let result = unsafe read_file(unsafe &name.as_ptr());
+    name.destroy();
+    match result {
+        Result::Ok(b) => Option::Some.(take(&cx, b)),
         Result::Err(code) => Option::None,
     }
 }
 
 // The absolute path with no symbolic links that `path` names, if it exists.
-fn real_path(path: Text) -> Option[Text] {
-    var b = buffer(path);
+forall 'k.
+fn real_path(&cx: Cx!['k], path: Text['k]) -> Option[Text['k]] {
+    var b = buffer(&cx, path);
     let result = canonicalize(&b);
     b.destroy();
     match result {
-        Result::Ok(r) => Option::Some.(take(r)),
+        Result::Ok(r) => Option::Some.(take(&cx, r)),
         Result::Err(code) => Option::None,
     }
 }
 
 // Whether `path` names an existing file or directory.
-fn path_exists(path: Text) -> bool {
-    real_path(path).is_some()
+forall 'k.
+fn path_exists(&cx: Cx!['k], path: Text['k]) -> bool {
+    real_path(&cx, path).is_some()
 }
 
-fn environment(name: Text) -> Option[Text] {
-    var b = buffer(name);
+forall 'k.
+fn environment(&cx: Cx!['k], name: Text['k]) -> Option[Text['k]] {
+    var b = buffer(&cx, name);
     let result = environment_variable(&b);
     b.destroy();
     match result {
-        Option::Some(r) => Option::Some.(take(r)),
+        Option::Some(r) => Option::Some.(take(&cx, r)),
         Option::None => Option::None,
     }
 }
 
 // The entries of a directory, other than `.` and `..`, with whether each is a directory.
-fn list_directory(path: Text) -> Seq[(Text, bool)] {
-    let out: Seq[(Text, bool)] = Seq::new();
-    var b = buffer(path);
+forall 'k.
+fn list_directory(&cx: Cx!['k], path: Text['k]) -> Seq[(Text['k], bool), 'k] {
+    let out: Seq[(Text['k], bool), 'k] = Seq::new(&cx);
+    var b = buffer(&cx, path);
     let opened = open_directory(&b);
     b.destroy();
     match opened {
@@ -97,9 +113,9 @@ fn list_directory(path: Text) -> Seq[(Text, bool)] {
                     Result::Ok(next) => match next {
                         Option::Some(entry) => {
                             let { name, is_directory } = entry;
-                            let n = take(name);
-                            if !n.is(".") && !n.is("..") {
-                                out.push((n, is_directory));
+                            let n = take(&cx, name);
+                            if !n.is(&cx, ".") && !n.is(&cx, "..") {
+                                out.push(&cx, (n, is_directory));
                             }
                         },
                         Option::None => {
@@ -119,49 +135,81 @@ fn list_directory(path: Text) -> Seq[(Text, bool)] {
 }
 
 // Writes `contents` to the file at `path`, replacing it; whether that succeeded.
-fn write(path: Text, contents: Text) -> bool {
+forall 'k.
+fn write(&cx: Cx!['k], path: Text['k], contents: Text['k]) -> bool {
+    var name = c_string(&cx, path);
     // O_WRONLY | O_CREAT | O_TRUNC, mode 0644
-    let fd = unsafe open(c_string(path), 577i32, 420i32);
+    let fd = unsafe open(unsafe &name.as_ptr(), 577i32, 420i32);
+    name.destroy();
     if fd < 0i32 {
         return false;
     }
-    let written = match unsafe write_all(fd, contents.ptr, contents.len) {
-        Result::Ok(_u) => true,
-        Result::Err(_code) => false,
-    };
+    let written = write_span(fd, &cx.tag, contents.bytes) == contents.len();
     unsafe close(fd) == 0i32 && written
 }
 
 // Runs the program `argv[0]`, found on the PATH, with the arguments `argv`, and waits for it;
 // whether it exited with status 0.
-fn run(argv: Seq[Text]) -> bool {
-    let pointers: *(*u8) = alloc(argv.len() + 1usize);
+forall 'k.
+fn run(&cx: Cx!['k], argv: Seq[Text['k], 'k]) -> bool {
+    let n = argv.len(&cx);
+    // Every argument with its NUL, one after another, and a table of where each starts.
+    var strings = Buffer::new();
     var i = 0usize;
-    while i < argv.len() {
-        store_at(pointers, i, c_string(argv.get(i)));
+    while i < n {
+        strings = strings.push_bytes(&cx.tag, argv.get(&cx, i).bytes).push_byte(0u8);
         i = i + 1usize;
     }
-    store_at(pointers, argv.len(), unsafe (0usize as *u8));
+    let base = unsafe &strings.as_ptr();
+    let pointers = unsafe (HeapAllocator::alloc((n + 1usize) * sizeof[*u8]()).into_raw() as *(*u8));
+    var offset = 0usize;
+    i = 0usize;
+    while i < n {
+        unsafe *(unsafe elem_ptr(pointers, i)) = unsafe elem_ptr(base, offset);
+        offset = offset + argv.get(&cx, i).len() + 1usize;
+        i = i + 1usize;
+    }
+    unsafe *(unsafe elem_ptr(pointers, n)) = unsafe (0usize as *u8);
     let pid = unsafe fork();
     if pid == 0i32 {
-        let unit = unsafe execvp(load_at(pointers, 0usize), pointers);
+        let unit = unsafe execvp(unsafe *pointers, pointers);
         unsafe _exit(127i32);
     }
+    HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(unsafe (pointers as *u8)));
+    strings.destroy();
     if pid < 0i32 {
         return false;
     }
-    let status: *i32 = alloc(1usize);
-    store_at(status, 0usize, 1i32);
+    let status = unsafe alloca[i32]();
+    unsafe *status = 1i32;
     if unsafe waitpid(pid, status, 0i32) != pid {
         return false;
     }
-    load_at(status, 0usize) == 0i32
+    unsafe *status == 0i32
+}
+
+// A C `struct timespec`.
+exposed struct Timespec {
+    seconds: i64,
+    nanoseconds: i64,
 }
 
 // Milliseconds on a monotonic clock, from an arbitrary start.
 fn now_ms() -> u64 {
-    let spec: *i64 = alloc(2usize);
+    let spec = unsafe alloca[Timespec]();
     // CLOCK_MONOTONIC
-    let unit = unsafe clock_gettime(1i32, spec);
-    (load_at(spec, 0usize) as u64) * 1000u64 + (load_at(spec, 1usize) as u64) / 1000000u64
+    let unit = unsafe clock_gettime(1i32, unsafe (spec as *i64));
+    let { seconds, nanoseconds } = unsafe *spec;
+    (seconds as u64) * 1000u64 + (nanoseconds as u64) / 1000000u64
+}
+
+// The nearest double to the decimal text, as Python's `float` rounds it: correctly, to infinity
+// past the largest double.
+forall 'k.
+fn parse_double(&cx: Cx!['k], t: Text['k]) -> f64 {
+    var digits = c_string(&cx, t);
+    let end = unsafe alloca[*u8]();
+    let value = unsafe strtod(unsafe &digits.as_ptr(), end);
+    digits.destroy();
+    value
 }
