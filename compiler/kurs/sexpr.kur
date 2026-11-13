@@ -1,7 +1,8 @@
 // S-expressions: the forms serialized KURS is written in.
 
-use package::support::base::{Cx, Out, Seq, Text, fail, text};
+use package::support::base::{Cx, Out, Seq, Text, fail, fail_static, text};
 use package::syntax::ast::Pos;
+use std::collections::vec::{OwnedVec, Popped};
 use std::slice::Slice;
 use std::option::Option;
 
@@ -67,7 +68,8 @@ fn fail_at(&cx: Cx!['k], message: Slice[u8, 'static], pos: Pos) -> ! {
 forall 'k.
 fn read(&cx: Cx!['k], source: Text['k]) -> Form['k] {
     let top = Form.{ kind: FormKind::List, text: text(&cx, ""), items: Seq::new(&cx), pos: Pos.{ line: 0u32, col: 0u32 } };
-    let stack: Seq[Form['k], 'k] = Seq::one(&cx, top);
+    // The lists open at this point, outermost first: the reader's own, freed when it is done.
+    var stack = OwnedVec::new[Form['k]]().push(top);
     var i = 0usize;
     let n = source.len();
     var line = 1u32;
@@ -87,14 +89,18 @@ fn read(&cx: Cx!['k], source: Text['k]) -> Form['k] {
             }
         } else if c == b'(' {
             let form = Form.{ kind: FormKind::List, text: text(&cx, ""), items: Seq::new(&cx), pos };
-            stack.last(&cx).items.push(&cx, form);
-            stack.push(&cx, form);
+            innermost(&stack).items.push(&cx, form);
+            stack = stack.push(form);
             i = i + 1usize;
         } else if c == b')' {
-            if stack.len(&cx) == 1usize {
+            let open = &stack.len();
+            if open == 1usize {
                 fail_at(&cx, "unbalanced ')'", pos);
             }
-            let unit = stack.pop(&cx);
+            let closed = match &stack.pop() {
+                Popped::Item(form) => form,
+                Popped::Empty => top,
+            };
             i = i + 1usize;
         } else if c == b'"' {
             var j = i + 1usize;
@@ -129,21 +135,33 @@ fn read(&cx: Cx!['k], source: Text['k]) -> Form['k] {
             if j >= n {
                 fail_at(&cx, "unterminated string literal", pos);
             }
-            stack.last(&cx).items.push(&cx, Form.{ kind: FormKind::Str, text: chars.done(&cx), items: Seq::new(&cx), pos });
+            innermost(&stack).items.push(&cx, Form.{ kind: FormKind::Str, text: chars.done(&cx), items: Seq::new(&cx), pos });
             i = j + 1usize;
         } else {
             var j = i;
             while j < n && !is_delimiter(source.byte(&cx, j)) {
                 j = j + 1usize;
             }
-            stack.last(&cx).items.push(&cx, Form.{ kind: FormKind::Atom, text: source.slice(i, j), items: Seq::new(&cx), pos });
+            innermost(&stack).items.push(&cx, Form.{ kind: FormKind::Atom, text: source.slice(i, j), items: Seq::new(&cx), pos });
             i = j;
         }
     }
-    if stack.len(&cx) != 1usize {
-        fail_at(&cx, "unclosed '('", stack.last(&cx).pos);
+    let open = &stack.len();
+    if open != 1usize {
+        fail_at(&cx, "unclosed '('", innermost(&stack).pos);
     }
+    stack.free();
     top
+}
+
+// The innermost open list.
+forall 'k.
+fn innermost(&stack: OwnedVec![Form['k]]) -> Form['k] {
+    let last = &stack.len() - 1usize;
+    match &stack.get(last) {
+        Option::Some(form) => form,
+        Option::None => fail_static("internal error: no list is open"),
+    }
 }
 
 fn is_delimiter(c: u8) -> bool {

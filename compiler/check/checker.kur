@@ -7,7 +7,8 @@
 // method name, since methods of different instances share names with each other and with
 // functions.
 
-use package::support::base::{Cell, Cx, Map, Out, Seq, Set, Text, combine, text};
+use package::support::base::{Cell, Cx, Map, Out, Seq, Set, Text, combine, copy_text, text};
+use package::kurs::transfer::copy_type;
 use package::kurs::core::{Arm, Block, Edge, Fun, Instance, Instr, Kind, Member, Method, ModuleId, Opened, Param, Premise, Program, Terminator, Type};
 use package::kurs::core as C;
 use package::types::coherence::check_coherence;
@@ -303,19 +304,17 @@ exposed enum FunKey {
 
 forall 'k.
 instance HashIn[FunKey['k], Cx!['k]] {
-    fn hash_in(cap: Cx!['k], key: FunKey['k], state: HashState) -> (Cx!['k], HashState) {
-        var cx = cap;
+    fn hash_in(&cx: Cx!['k], key: FunKey['k], state: HashState) -> HashState {
         let h = {
             match key {
                 FunKey::Function(name) => combine(1u64, name.hash(&cx)),
                 FunKey::Method(trait_name, index, name) => combine(combine(combine(2u64, trait_name.hash(&cx)), index as u64), name.hash(&cx)),
             }
         };
-        (cx, state.write_u64(h))
+        state.write_u64(h)
     }
 
-    fn eq_in(cap: Cx!['k], a: FunKey['k], b: FunKey['k]) -> (Cx!['k], bool) {
-        var cx = cap;
+    fn eq_in(&cx: Cx!['k], a: FunKey['k], b: FunKey['k]) -> bool {
         let equal = {
             match a {
                 FunKey::Function(x) => match b {
@@ -328,7 +327,7 @@ instance HashIn[FunKey['k], Cx!['k]] {
                 },
             }
         };
-        (cx, equal)
+        equal
     }
 }
 
@@ -1382,24 +1381,7 @@ impl Checker['k] {
     // Select the unique coherent head, with its index among the trait's instances; this does not
     // authorize its use.
     fn matching_instance(self, &cx: Cx!['k], trait_name: Text['k], args: Seq[Type['k], 'k]) -> Option[(usize, Instance['k], Map[Text['k], Type['k], 'k])] {
-        let insts = match self.program.instances.get(&cx, trait_name) {
-            Option::Some(insts) => insts,
-            Option::None => {
-                return Option::None;
-            },
-        };
-        var i = 0usize;
-        while i < insts.len(&cx) {
-            let inst = insts.get(&cx, i);
-            match match_head(&cx, inst.params, inst.head, args, true, self.counter) {
-                Option::Some(sub) => {
-                    return Option::Some.((i, inst, sub));
-                },
-                Option::None => (),
-            };
-            i = i + 1usize;
-        }
-        Option::None
+        matching_instance(&cx, self.program, self.counter, trait_name, args)
     }
 
     fn find_instance(self, &cx: Cx!['k], trait_name: Text['k], args: Seq[Type['k], 'k]) -> Option[(usize, Instance['k], Map[Text['k], Type['k], 'k])] {
@@ -2620,4 +2602,63 @@ fn check_program(&cx: Cx!['k], program: Program['k], counter: Fresh['k]) -> Chec
     let checker = Checker::new(&cx, program, counter);
     checker.check(&cx);
     checker
+}
+
+// The first instance of `trait_name` in `program` whose head matches `args`: its index among the
+// trait's instances, the instance, and the substitution of its parameters.
+forall 'k.
+fn matching_instance(&cx: Cx!['k], program: Program['k], counter: Fresh['k], trait_name: Text['k], args: Seq[Type['k], 'k]) -> Option[(usize, Instance['k], Map[Text['k], Type['k], 'k])] {
+    let insts = match program.instances.get(&cx, trait_name) {
+        Option::Some(insts) => insts,
+        Option::None => {
+            return Option::None;
+        },
+    };
+    var i = 0usize;
+    while i < insts.len(&cx) {
+        let inst = insts.get(&cx, i);
+        match match_head(&cx, inst.params, inst.head, args, true, counter) {
+            Option::Some(sub) => {
+                return Option::Some.((i, inst, sub));
+            },
+            Option::None => (),
+        };
+        i = i + 1usize;
+    }
+    Option::None
+}
+
+// What the checker recorded for the backend, `Checker.typed`, copied from the arena of `from` into
+// that of `to`, in the same order.
+forall 'a, 'b.
+fn copy_typed(&from: Cx!['a], &to: Cx!['b], typed: Map[FunKey['a], Map[(Text['a], Text['a]), Type['a], 'a], 'a]) -> Map[FunKey['b], Map[(Text['b], Text['b]), Type['b], 'b], 'b] {
+    let out: Map[FunKey['b], Map[(Text['b], Text['b]), Type['b], 'b], 'b] = Map::new(&to);
+    var i = 0usize;
+    while i < typed.positions(&from) {
+        match typed.entry(&from, i) {
+            Option::Some(key) => {
+                let key_b = match key {
+                    FunKey::Function(name) => FunKey::Function.(copy_text(&from, &to, name)),
+                    FunKey::Method(trait_name, index, name) => FunKey::Method.(copy_text(&from, &to, trait_name), index, copy_text(&from, &to, name)),
+                };
+                let values = typed.at(&from, key);
+                let values_b: Map[(Text['b], Text['b]), Type['b], 'b] = Map::new(&to);
+                var k = 0usize;
+                while k < values.positions(&from) {
+                    match values.entry(&from, k) {
+                        Option::Some(at) => {
+                            let (label, name) = at;
+                            values_b.set(&to, (copy_text(&from, &to, label), copy_text(&from, &to, name)), copy_type(&from, &to, values.at(&from, at)));
+                        },
+                        Option::None => (),
+                    };
+                    k = k + 1usize;
+                }
+                out.set(&to, key_b, values_b);
+            },
+            Option::None => (),
+        };
+        i = i + 1usize;
+    }
+    out
 }

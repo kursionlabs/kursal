@@ -8,78 +8,114 @@
 // might reset its arguments). Instance search instead requires structural descent on every
 // recursive edge.
 
-use package::support::base::{Cx, Map, Out, Seq, Set, Text, text};
+use package::support::base::{Cx, Map, Out, Seq, Set, Text, fail, text};
 use package::kurs::core::{Fun, Instr, Kind, Param, Premise, Program, Type};
 use package::kurs::core as C;
 use package::types::formation::strict_subterm;
 use package::syntax::ast::Pos;
 use package::types::ops::{free_names, kurs_error, overlap, show};
+use std::collections::hashmap::{Found, OwnedMap};
+use std::collections::vec::{OwnedVec, Popped};
 use std::option::Option;
 
 // Tarjan's algorithm: mutually reachable nodes receive the same ID. A node is a key: (function,)
-// or (trait, method).
+// or (trait, method). The walk's numbering, stack and active set are its own, freed when it ends;
+// only the components are kept.
 forall 'k.
 fn components(&cx: Cx!['k], graph: Map[Seq[Text['k], 'k], Set[Seq[Text['k], 'k], 'k], 'k]) -> Map[Seq[Text['k], 'k], usize, 'k] {
-    let state = Tarjan.{
-        graph,
-        indices: Map::new(&cx),
-        low: Map::new(&cx),
-        stack: Seq::new(&cx),
-        active: Set::new(&cx),
-        result: Map::new(&cx),
-    };
-    let nodes = graph.keys(&cx);
+    let result: Map[Seq[Text['k], 'k], usize, 'k] = Map::new(&cx);
+    var walk = Tarjan.{ indices: OwnedMap::new(), low: OwnedMap::new(), stack: OwnedVec::new(), active: OwnedMap::new() };
     var i = 0usize;
-    while i < nodes.len(&cx) {
-        if !state.indices.has(&cx, nodes.get(&cx, i)) {
-            state.visit(&cx, nodes.get(&cx, i));
-        }
+    while i < graph.positions(&cx) {
+        match graph.entry(&cx, i) {
+            Option::Some(node) => if !&walk.numbered(&cx, node) {
+                &walk.visit(&cx, graph, result, node);
+            },
+            Option::None => (),
+        };
         i = i + 1usize;
     }
-    state.result
+    let { indices, low, stack, active } = walk;
+    indices.free();
+    low.free();
+    stack.free();
+    active.free();
+    result
 }
 
 forall 'k.
-exposed struct Tarjan {
-    graph: Map[Seq[Text['k], 'k], Set[Seq[Text['k], 'k], 'k], 'k],
-    indices: Map[Seq[Text['k], 'k], usize, 'k],
-    low: Map[Seq[Text['k], 'k], usize, 'k],
-    stack: Seq[Seq[Text['k], 'k], 'k],
-    active: Set[Seq[Text['k], 'k], 'k],
-    result: Map[Seq[Text['k], 'k], usize, 'k],
+exposed struct Tarjan! {
+    indices: OwnedMap![Seq[Text['k], 'k], usize],
+    low: OwnedMap![Seq[Text['k], 'k], usize],
+    stack: OwnedVec![Seq[Text['k], 'k]],
+    active: OwnedMap![Seq[Text['k], 'k], bool],
 }
 
 fn min(a: usize, b: usize) -> usize {
     if a < b { a } else { b }
 }
 
+// The number `numbers` gives `node`, which it must have.
+forall 'k.
+fn number(&cx: Cx!['k], &numbers: OwnedMap![Seq[Text['k], 'k], usize], node: Seq[Text['k], 'k]) -> usize {
+    match &numbers.get_in(&cx, node) {
+        Found::Item(n) => n,
+        Found::Missing => fail(&cx, text(&cx, "internal error: a node the walk has not numbered")),
+    }
+}
+
 forall 'k.
 impl Tarjan['k] {
-    fn visit(self, &cx: Cx!['k], node: Seq[Text['k], 'k]) {
-        let index = self.indices.len(&cx);
-        self.indices.set(&cx, node, index);
-        self.low.set(&cx, node, index);
-        self.stack.push(&cx, node);
-        self.active.add(&cx, node);
-        let targets = self.graph.at(&cx, node).items(&cx);
+    fn numbered(&self, &cx: Cx!['k], node: Seq[Text['k], 'k]) -> bool {
+        match &self.indices.get_in(&cx, node) {
+            Found::Item(n) => true,
+            Found::Missing => false,
+        }
+    }
+
+    fn visit(&self, &cx: Cx!['k], graph: Map[Seq[Text['k], 'k], Set[Seq[Text['k], 'k], 'k], 'k], result: Map[Seq[Text['k], 'k], usize, 'k], node: Seq[Text['k], 'k]) {
+        let index = &self.indices.len();
+        let fresh = &self.indices.insert_in(&cx, node, index);
+        let first = &self.low.insert_in(&cx, node, index);
+        self.stack = self.stack.push(node);
+        let entered = &self.active.insert_in(&cx, node, true);
+        let targets = graph.at(&cx, node);
         var i = 0usize;
-        while i < targets.len(&cx) {
-            let target = targets.get(&cx, i);
-            if !self.indices.has(&cx, target) {
-                self.visit(&cx, target);
-                self.low.set(&cx, node, min(self.low.at(&cx, node), self.low.at(&cx, target)));
-            } else if self.active.has(&cx, target) {
-                self.low.set(&cx, node, min(self.low.at(&cx, node), self.indices.at(&cx, target)));
-            }
+        while i < targets.positions(&cx) {
+            match targets.entry(&cx, i) {
+                Option::Some(target) => {
+                    if !&self.numbered(&cx, target) {
+                        &self.visit(&cx, graph, result, target);
+                        let lowest = min(number(&cx, &self.low, node), number(&cx, &self.low, target));
+                        let old = &self.low.insert_in(&cx, node, lowest);
+                    } else {
+                        match &self.active.get_in(&cx, target) {
+                            Found::Item(on_stack) => {
+                                let lowest = min(number(&cx, &self.low, node), number(&cx, &self.indices, target));
+                                let old = &self.low.insert_in(&cx, node, lowest);
+                            },
+                            Found::Missing => (),
+                        };
+                    }
+                },
+                Option::None => (),
+            };
             i = i + 1usize;
         }
-        if self.low.at(&cx, node) == self.indices.at(&cx, node) {
+        let own = number(&cx, &self.indices, node);
+        if number(&cx, &self.low, node) == own {
             var going = true;
             while going {
-                let member = self.stack.pop(&cx);
-                self.active.remove(&cx, member);
-                self.result.set(&cx, member, self.indices.at(&cx, node));
-                going = !member.same(&cx, node);
+                match &self.stack.pop() {
+                    Popped::Item(member) => {
+                        let left = &self.active.remove_in(&cx, member);
+                        result.set(&cx, member, own);
+                        going = !member.same(&cx, node);
+                    },
+                    Popped::Empty => {
+                        going = false;
+                    },
+                };
             }
         }
     }

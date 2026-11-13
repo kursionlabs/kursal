@@ -6,8 +6,9 @@ it gives every package the same signatures, types and constant values, and rejec
 with the same message; it infers every function body to the same types, calls and bindings, and
 rejects ill-typed bodies with the same message; it lowers every package, the packages this compiler's own
 tests lower and small rejected programs to the same core program, or rejects them with the same message,
-and its `build` writes the same C as this compiler's pipeline; with KURSAL_SELFHOST=1, it builds itself,
-and the result builds itself to the same C;
+and its `build` writes the same C as this compiler's pipeline, freeing every byte it allocates (under
+valgrind, when it is installed); with KURSAL_SELFHOST=1, it builds itself, and the result builds itself to
+the same C, and builds it under valgrind freeing every byte;
 its KURS reader and writer read every lowered program and write it back as this compiler's writer
 does, and reject malformed KURS with the same message; its checker accepts and rejects, with the same
 message, every core program this compiler's own tests check; and from every lowered program it writes
@@ -20,6 +21,7 @@ import itertools
 import json
 import os
 import resource
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -72,6 +74,23 @@ def limit_memory() -> None:
     resource.setrlimit(resource.RLIMIT_AS, (MEMORY_LIMIT, MEMORY_LIMIT))
 
 
+# Under valgrind the compiler's memory grows by valgrind's own; never run two such self-builds at once.
+VALGRIND_MEMORY_LIMIT = 14_000_000 << 10
+VALGRIND = ["valgrind", "--leak-check=full", "--show-leak-kinds=all", "--errors-for-leak-kinds=all",
+            "--error-exitcode=99", "--trace-children=no"]
+
+
+def limit_valgrind_memory() -> None:
+    resource.setrlimit(resource.RLIMIT_AS, (VALGRIND_MEMORY_LIMIT, VALGRIND_MEMORY_LIMIT))
+
+
+def run_valgrind(binary: Path, *args: str, timeout: int) -> subprocess.CompletedProcess[str]:
+    """`binary ARGS` under valgrind's leak check: status 99 on any error or any byte not freed, whether
+    lost or still reachable. `cc`, which `build` runs, is not traced."""
+    return subprocess.run([*VALGRIND, str(binary), *args], capture_output=True, text=True, timeout=timeout,
+                          preexec_fn=limit_valgrind_memory, env=dict(os.environ, KURSAL_LIB=str(LIB)))
+
+
 def run_kursal(binary: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run([str(binary), *args], capture_output=True, text=True, timeout=TIME_LIMIT,
                           preexec_fn=limit_memory, env=dict(os.environ, KURSAL_LIB=str(LIB)))
@@ -98,6 +117,18 @@ def cached(stem: str, key: str, make: Callable[[], list]) -> list:
     temporary.write_text(json.dumps(value))
     temporary.replace(path)
     return value
+
+
+def self_built_compiler(kc1: Path) -> Path:
+    """kc2, the compiler kc1 builds from compiler/, kept in .build/ beside kc1; its C is kc2.c."""
+    kc2 = kc1.with_name(kc1.name.replace("kursal-", "kursal-self-"))
+    if not kc2.exists():
+        started = time.monotonic()
+        result = run_kursal(kc1, "build", str(COMPILER), "-o", str(kc2), "--times")
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr)
+        print(f"\nkc2 built in {time.monotonic() - started:.1f}s:\n{result.stderr}", file=sys.stderr)
+    return kc2
 
 
 def build_compiler() -> Path:
@@ -1467,16 +1498,48 @@ class CompilerTests(unittest.TestCase):
         """The compiler the reference built (kc1) builds compiler/ (kc2), which builds it again (kc3): kc2's C
         and kc3's are the same, and the reference's C for compiler/."""
         expected = reference_builds()[built_paths().index(COMPILER)]["c"]
+        kc2 = self_built_compiler(self.binary)
         with tempfile.TemporaryDirectory() as directory:
-            stages = [self.binary, Path(directory) / "kc2", Path(directory) / "kc3"]
-            for compiler, output in zip(stages, stages[1:]):
-                started = time.monotonic()
-                result = run_kursal(compiler, "build", str(COMPILER), "-o", str(output), "--times")
-                self.assertEqual(result.returncode, 0, result.stderr)
-                print(f"\n{output.name} built in {time.monotonic() - started:.1f}s:\n{result.stderr}", file=sys.stderr)
-            kc2, kc3 = (Path(f"{stage}.c").read_text() for stage in stages[1:])
-        self.assertEqual(kc2, kc3)
-        self.assertEqual(kc2, expected)
+            kc3 = Path(directory) / "kc3"
+            started = time.monotonic()
+            result = run_kursal(kc2, "build", str(COMPILER), "-o", str(kc3), "--times")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            print(f"\nkc3 built in {time.monotonic() - started:.1f}s:\n{result.stderr}", file=sys.stderr)
+            kc2_c, kc3_c = (Path(f"{stage}.c").read_text() for stage in (kc2, kc3))
+        self.assertEqual(kc2_c, kc3_c)
+        self.assertEqual(kc2_c, expected)
+
+    @unittest.skipUnless(os.environ.get("KURSAL_SELFHOST") == "1", "set KURSAL_SELFHOST=1 to compile the compiler with itself")
+    @unittest.skipUnless(shutil.which("valgrind"), "valgrind is not installed")
+    def test_self_build_frees_everything(self):
+        """kc2 builds compiler/ under valgrind with no error and every byte freed, and writes the reference's C."""
+        expected = reference_builds()[built_paths().index(COMPILER)]["c"]
+        kc2 = self_built_compiler(self.binary)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "kc3"
+            started = time.monotonic()
+            result = run_valgrind(kc2, "build", str(COMPILER), "-o", str(output), timeout=6 * 3600)
+            print(f"\nkc3 built under valgrind in {time.monotonic() - started:.1f}s:\n"
+                  + "\n".join(line for line in result.stderr.splitlines() if "in use at exit" in line or "ERROR SUMMARY" in line),
+                  file=sys.stderr)
+            self.assertEqual(result.returncode, 0, result.stderr[-4000:])
+            self.assertIn("All heap blocks were freed -- no leaks are possible", result.stderr)
+            self.assertIn("ERROR SUMMARY: 0 errors from 0 contexts", result.stderr)
+            self.assertEqual(Path(f"{output}.c").read_text(), expected)
+
+    @unittest.skipUnless(shutil.which("valgrind"), "valgrind is not installed")
+    def test_build_frees_everything(self):
+        """The compiler builds a program under valgrind with no error and every byte freed, and the program
+        it builds runs."""
+        package = ROOT / "examples/lisp"
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "lisp"
+            result = run_valgrind(self.binary, "build", str(package), "-o", str(output), timeout=TIME_LIMIT)
+            self.assertEqual(result.returncode, 0, result.stderr[-4000:])
+            self.assertIn("All heap blocks were freed -- no leaks are possible", result.stderr)
+            self.assertIn("ERROR SUMMARY: 0 errors from 0 contexts", result.stderr)
+            ran = subprocess.run([str(output)], input="(+ 1 (* 2 3))\n", capture_output=True, text=True, timeout=60)
+            self.assertEqual((ran.stdout, ran.returncode), ("7\n", 0))
 
     def check_resolution(self, cases: tuple[tuple[dict[str, str], str], ...], fails: bool) -> None:
         for index, (files, target) in enumerate(cases):

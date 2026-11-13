@@ -29,6 +29,8 @@ use package::syntax::ast::{Expr, Pattern, Pos, Statement, no_pos};
 use package::types::termination::check_instance_termination;
 use package::types::ops::{Fresh, Types, equal, foreach_binders, free_brands, free_names, show, subst};
 use package::types::unify::{instantiate, match_head, prune, unify, zonk};
+use std::collections::hashmap::{Found, OwnedMap};
+use std::collections::vec::{OwnedVec, Popped};
 use std::option::{Option, Result};
 use std::slice::Slice;
 
@@ -724,19 +726,44 @@ impl Infer['k] {
     // when every trait bounding the impl's type parameter is visible there (and it has one).
     // `package` is `target` or depends on it, directly or through other packages.
     fn depends_on(self, &cx: Cx!['k], package: usize, target: usize) -> bool {
-        let seen: Set[usize, 'k] = Set::new(&cx);
-        let pending: Seq[usize, 'k] = Seq::one(&cx, package);
-        while pending.len(&cx) > 0usize {
-            let p = pending.pop(&cx);
-            if p == target {
-                return true;
-            }
-            if !seen.has(&cx, p) {
-                seen.add(&cx, p);
-                pending.append(&cx, self.r.packages.get(&cx, p).deps.values(&cx));
-            }
+        // The walk's worklist and the packages it has seen are its own, freed when it ends.
+        var seen = OwnedMap::new[usize, bool]();
+        var pending = OwnedVec::new[usize]().push(package);
+        var found = false;
+        var going = true;
+        while going {
+            match &pending.pop() {
+                Popped::Item(p) => {
+                    if p == target {
+                        found = true;
+                        going = false;
+                    } else {
+                        match &seen.insert(p, true) {
+                            Found::Missing => {
+                                let deps = self.r.packages.get(&cx, p).deps;
+                                var i = 0usize;
+                                while i < deps.positions(&cx) {
+                                    match deps.entry(&cx, i) {
+                                        Option::Some(name) => {
+                                            pending = pending.push(deps.at(&cx, name));
+                                        },
+                                        Option::None => (),
+                                    };
+                                    i = i + 1usize;
+                                }
+                            },
+                            Found::Item(old) => (),
+                        };
+                    }
+                },
+                Popped::Empty => {
+                    going = false;
+                },
+            };
         }
-        false
+        pending.free();
+        seen.free();
+        found
     }
 
     fn blanket_visible(self, &cx: Cx!['k], method: Decl['k], home: ModuleId['k], visible: Set[u32, 'k]) -> bool {

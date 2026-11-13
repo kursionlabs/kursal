@@ -28,6 +28,7 @@ use package::sigs::signatures::{ConstValue, Sig, Signatures, const_type, int_tex
 use package::syntax::ast as S;
 use package::syntax::ast::{Expr, Pattern, Pos, Statement, expr_id, expr_pos, no_pos};
 use package::types::ops::{Fresh, Types, foreach_binders, foreach_item, free_brands, mentions_brand, subst};
+use std::collections::hashmap::{Found, OwnedMap};
 use std::option::Option;
 use std::slice::Slice;
 
@@ -2036,7 +2037,8 @@ impl FnLower['k] {
             Type::Enum(vs) => vs,
             _ => self.fails(&cx, "a match requires an integer or enum scrutinee", m.pos),
         };
-        let seen: Set[Text['k], 'k] = Set::new(&cx);
+        // The variants covered so far, freed once every arm is read.
+        var seen = OwnedMap::new[Text['k], bool]();
         let resolved: Seq[Seq[CoverItem['k], 'k], 'k] = Seq::new(&cx);
         var k = 0usize;
         while k < covers.len(&cx) {
@@ -2056,19 +2058,23 @@ impl FnLower['k] {
             if names.is_empty(&cx) {
                 j = 0usize;
                 while j < variants.len(&cx) {
-                    if !seen.has(&cx, variants.get(&cx, j).name) {
-                        names.push(&cx, variants.get(&cx, j).name);
-                    }
+                    match &seen.get_in(&cx, variants.get(&cx, j).name) {
+                        Found::Missing => names.push(&cx, variants.get(&cx, j).name),
+                        Found::Item(covered) => (),
+                    };
                     j = j + 1usize;
                 }
             }
             j = 0usize;
             while j < names.len(&cx) {
                 let name = names.get(&cx, j);
-                if !has_member(&cx, variants, name) || seen.has(&cx, name) {
+                let repeated = match &seen.insert_in(&cx, name, true) {
+                    Found::Missing => false,
+                    Found::Item(covered) => true,
+                };
+                if !has_member(&cx, variants, name) || repeated {
                     self.fails(&cx, "match variants must not repeat", m.pos);
                 }
-                seen.add(&cx, name);
                 j = j + 1usize;
             }
             let arm = m.arms.get(&cx, k);
@@ -2089,7 +2095,9 @@ impl FnLower['k] {
             resolved.push(&cx, items);
             k = k + 1usize;
         }
-        if seen.len(&cx) != variants.len(&cx) {
+        let covered = &seen.len();
+        seen.free();
+        if covered != variants.len(&cx) {
             self.fails(&cx, "a match must cover every enum variant", m.pos);
         }
         resolved

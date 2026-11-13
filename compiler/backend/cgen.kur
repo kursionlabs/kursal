@@ -5,7 +5,7 @@
 // separate from code-specialization identity.
 
 use package::support::base::{Cell, Cx, Map, Out, Seq, Set, Text, key_same, text};
-use package::check::checker::{Checker, FunKey};
+use package::check::checker::{FunKey, matching_instance};
 use package::kurs::core::{Arm, Block, Data, Edge, Fun, ForeachType, Instr, Member, Param, Program, Terminator, Type};
 use package::kurs::core as C;
 use package::backend::mangle::{decode_segment, encode, mangle, path_segments, type_key};
@@ -392,7 +392,8 @@ fn items_access(&cx: Cx!['k], count: usize) -> Seq[Text['k], 'k] {
 forall 'k.
 exposed struct Backend {
     program: Program['k],
-    checker: Checker['k],
+    // function -> (block label, SSA name) -> type, as the checker recorded them
+    recorded: Map[FunKey['k], Map[(Text['k], Text['k]), Type['k], 'k], 'k],
     counter: Fresh['k],
     types: Types['k],
     // representation key -> C type name
@@ -450,7 +451,7 @@ fn fail_text(&cx: Cx!['k], message: Text['k]) -> ! {
 
 forall 'k.
 impl Backend['k] {
-    fn new(&cx: Cx!['k], program: Program['k], checker: Checker['k], counter: Fresh['k]) -> Backend['k] {
+    fn new(&cx: Cx!['k], program: Program['k], typed: Map[FunKey['k], Map[(Text['k], Text['k]), Type['k], 'k], 'k], counter: Fresh['k]) -> Backend['k] {
         let taken = c_keywords(&cx);
         let runtime = runtime_names(&cx).items(&cx);
         var r = 0usize;
@@ -516,7 +517,7 @@ impl Backend['k] {
         }
         Backend.{
             program,
-            checker,
+            recorded: typed,
             counter,
             types: Types::new(&cx, program, counter),
             names: Map::new(&cx),
@@ -892,7 +893,7 @@ impl Backend['k] {
     fn resolve_trait(self, &cx: Cx!['k], trait_name: Text['k], method: Text['k], tys: Seq[Type['k], 'k]) -> (FunKey['k], Fun['k], Map[Text['k], Type['k], 'k]) {
         // Checking already discharged authority at the use site. Specialization selects its
         // coherent head; the callee's module need not own that shape.
-        let (index, inst, sub) = match self.checker.matching_instance(&cx, trait_name, tys) {
+        let (index, inst, sub) = match matching_instance(&cx, self.program, self.counter, trait_name, tys) {
             Option::Some(found) => found,
             Option::None => fail_text(&cx, Out::new(&cx).put(&cx, "no instance of ").add(&cx, trait_name).put(&cx, " for these types").done(&cx)),
         };
@@ -1110,7 +1111,7 @@ impl Backend['k] {
         self.fun.set(&cx, Option::Some.(fun));
         self.sub.set(&cx, sub);
         self.substituted.set(&cx, Map::new(&cx));
-        let typed = self.checker.typed.at(&cx, key);
+        let typed = self.recorded.at(&cx, key);
         self.locals.set(&cx, Map::new(&cx));
         self.lines.set(&cx, Seq::new(&cx));
         self.scratch.set(&cx, 0usize);
@@ -2059,6 +2060,6 @@ impl Walk['k] {
 }
 
 forall 'k.
-fn emit_c(&cx: Cx!['k], program: Program['k], checker: Checker['k], entry: Option[Text['k]], counter: Fresh['k]) -> Text['k] {
-    Backend::new(&cx, program, checker, counter).emit_program(&cx, entry)
+fn emit_c(&cx: Cx!['k], program: Program['k], typed: Map[FunKey['k], Map[(Text['k], Text['k]), Type['k], 'k], 'k], entry: Option[Text['k]], counter: Fresh['k]) -> Text['k] {
+    Backend::new(&cx, program, typed, counter).emit_program(&cx, entry)
 }

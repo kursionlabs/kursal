@@ -21,6 +21,7 @@ use package::kurs::core as C;
 use package::resolve::resolver::Resolver;
 use package::syntax::ast::Pos;
 use package::types::ops::{Fresh, free_brands};
+use std::collections::vec::{OwnedVec, Popped};
 use std::option::{Option, Result};
 use std::slice::Slice;
 
@@ -39,8 +40,6 @@ exposed struct Plan {
     branded: Seq[usize, 'k],
     // the state each block other than the entry starts in, so far
     header: Map[Text['k], Places['k], 'k],
-    // blocks to visit, with the state reaching them
-    work: Seq[(usize, Places['k]), 'k],
 }
 
 forall 'k.
@@ -355,19 +354,30 @@ impl PlaceFlow['k] {
             i = i + 1usize;
         }
         let header: Map[Text['k], Places['k], 'k] = Map::new(&cx);
-        let plan = Plan.{ fun, index, global, local_brands, local_copy, branded, header, work: Seq::one(&cx, (0usize, locals_empty(&cx, fun))) };
+        let plan = Plan.{ fun, index, global, local_brands, local_copy, branded, header };
         c.places.set(&cx, Places::new(Set::new(&cx), Map::new(&cx), Map::new(&cx)));
-        while !plan.work.is_empty(&cx) {
-            let (b, incoming) = plan.work.pop(&cx);
-            match self.arrive(&cx, plan, b, incoming) {
-                Option::Some(places) => {
-                    c.places.set(&cx, places);
-                    self.simulate(&cx, fun.blocks.get(&cx, b), false);
-                    self.leave(&cx, plan, fun.blocks.get(&cx, b), places);
+        // The blocks to visit, with the state reaching each: the walk's own, freed when it ends.
+        var work = OwnedVec::new[(usize, Places['k])]().push((0usize, locals_empty(&cx, fun)));
+        var going = true;
+        while going {
+            match &work.pop() {
+                Popped::Item(next) => {
+                    let (b, incoming) = next;
+                    match self.arrive(&cx, plan, b, incoming) {
+                        Option::Some(places) => {
+                            c.places.set(&cx, places);
+                            self.simulate(&cx, fun.blocks.get(&cx, b), false);
+                            self.leave(&cx, plan, &work, fun.blocks.get(&cx, b), places);
+                        },
+                        Option::None => (),
+                    };
                 },
-                Option::None => (),
+                Popped::Empty => {
+                    going = false;
+                },
             };
         }
+        work.free();
         i = 1usize;
         while i < fun.blocks.len(&cx) {
             let block = fun.blocks.get(&cx, i);
@@ -471,7 +481,7 @@ impl PlaceFlow['k] {
 
     // Sends the state `places` that `block` ends in along each of its edges. States are shared, and
     // never changed once sent: an edge that changes what it sends sends a copy.
-    fn leave(self, &cx: Cx!['k], plan: Plan['k], block: Block['k], places: Places['k]) {
+    fn leave(self, &cx: Cx!['k], plan: Plan['k], &work: OwnedVec![(usize, Places['k])], block: Block['k], places: Places['k]) {
         let fun = plan.fun;
         let out_edges = edges(&cx, block);
         var e = 0usize;
@@ -504,7 +514,7 @@ impl PlaceFlow['k] {
                 }
             }
             if arm_known.is_none() && forgotten.is_empty(&cx) && places.opened.is_empty(&cx) {
-                plan.work.push(&cx, (t, places));
+                work = work.push((t, places));
             } else {
                 let out = places.copy(&cx);
                 match arm_known {
@@ -538,7 +548,7 @@ impl PlaceFlow['k] {
                 if !out.opened.is_empty(&cx) {
                     self.rename_views(&cx, out, target, edge);
                 }
-                plan.work.push(&cx, (t, out));
+                work = work.push((t, out));
             }
             e = e + 1usize;
         }

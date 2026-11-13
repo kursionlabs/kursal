@@ -1,0 +1,346 @@
+// A core program copied from one arena to another, so that the phase which made it can drop its
+// arena. Every value is copied whole, with nothing left pointing into the arena it came from; a
+// part shared by two places in the original is copied for each, since nothing changes a program
+// once it is lowered.
+
+use package::support::base::{Cell, Cx, Map, Seq, Text, copy_text};
+use package::kurs::core::{Arm, Binding, Block, Data, Edge, Exposure, Extern, ForeachType, FnType, Fun, Instance, Instr, Known,
+    Member, Meta, MetaState, Method, ModuleId, Opened, Param, Premise, Program, Terminator, Trait, Type, TypeDecl};
+use package::kurs::sexpr::Form;
+use std::option::Option;
+
+forall 'a, 'b.
+fn copy_texts(&from: Cx!['a], &to: Cx!['b], items: Seq[Text['a], 'a]) -> Seq[Text['b], 'b] {
+    let out: Seq[Text['b], 'b] = Seq::new(&to);
+    var i = 0usize;
+    while i < items.len(&from) {
+        out.push(&to, copy_text(&from, &to, items.get(&from, i)));
+        i = i + 1usize;
+    }
+    out
+}
+
+forall 'a, 'b.
+fn copy_option_text(&from: Cx!['a], &to: Cx!['b], t: Option[Text['a]]) -> Option[Text['b]] {
+    match t {
+        Option::Some(x) => Option::Some.(copy_text(&from, &to, x)),
+        Option::None => Option::None,
+    }
+}
+
+// A sequence of values that hold no storage, such as indices and kinds.
+forall T, 'a, 'b where Copy[T].
+fn copy_plain(&from: Cx!['a], &to: Cx!['b], items: Seq[T, 'a]) -> Seq[T, 'b] {
+    let out: Seq[T, 'b] = Seq::new(&to);
+    var i = 0usize;
+    while i < items.len(&from) {
+        out.push(&to, items.get(&from, i));
+        i = i + 1usize;
+    }
+    out
+}
+
+// ------------------------------------------------------------------ types --
+
+forall 'a, 'b.
+fn copy_cell(&from: Cx!['a], &to: Cx!['b], t: Cell[Type['a], 'a]) -> Cell[Type['b], 'b] {
+    Cell::new(&to, copy_type(&from, &to, t.get(&from)))
+}
+
+forall 'a, 'b.
+fn copy_type(&from: Cx!['a], &to: Cx!['b], t: Type['a]) -> Type['b] {
+    match t {
+        Type::Prim(name) => Type::Prim.(copy_text(&from, &to, name)),
+        Type::Never => Type::Never,
+        Type::Named(name, args) => Type::Named.(copy_text(&from, &to, name), copy_types(&from, &to, args)),
+        Type::Struct(members) => Type::Struct.(copy_members(&from, &to, members)),
+        Type::Enum(members) => Type::Enum.(copy_members(&from, &to, members)),
+        Type::Tuple(items) => Type::Tuple.(copy_types(&from, &to, items)),
+        Type::Array(item, n) => Type::Array.(copy_cell(&from, &to, item), n),
+        Type::Ptr(inner) => Type::Ptr.(copy_cell(&from, &to, inner)),
+        Type::Skolem(name) => Type::Skolem.(copy_text(&from, &to, name)),
+        Type::Brand(inner) => Type::Brand.(copy_cell(&from, &to, inner)),
+        Type::Exists(labels, body) => Type::Exists.(copy_texts(&from, &to, labels), copy_cell(&from, &to, body)),
+        Type::Foreach(f) => Type::Foreach.(ForeachType.{ binder: copy_text(&from, &to, f.binder), indirect: f.indirect,
+            source: copy_cell(&from, &to, f.source), body: copy_cell(&from, &to, f.body), retained: copy_texts(&from, &to, f.retained) }),
+        Type::Fn(f) => Type::Fn.(FnType.{ params: copy_types(&from, &to, f.params), ret: copy_cell(&from, &to, f.ret),
+            quantified: copy_params(&from, &to, f.quantified), is_unsafe: f.is_unsafe, places: copy_plain(&from, &to, f.places) }),
+        Type::Ignored => Type::Ignored,
+        // A solved variable is its solution; an unsolved one stays a variable of its own.
+        Type::Meta(m) => match m.solution(&from) {
+            Option::Some(solution) => copy_type(&from, &to, solution),
+            Option::None => Type::Meta.(Meta.{ state: Cell::new(&to, MetaState.{ solution: Option::None, kind: m.kind(&from), pos: m.pos(&from) }) }),
+        },
+    }
+}
+
+forall 'a, 'b.
+fn copy_types(&from: Cx!['a], &to: Cx!['b], items: Seq[Type['a], 'a]) -> Seq[Type['b], 'b] {
+    let out: Seq[Type['b], 'b] = Seq::new(&to);
+    var i = 0usize;
+    while i < items.len(&from) {
+        out.push(&to, copy_type(&from, &to, items.get(&from, i)));
+        i = i + 1usize;
+    }
+    out
+}
+
+forall 'a, 'b.
+fn copy_option_type(&from: Cx!['a], &to: Cx!['b], t: Option[Type['a]]) -> Option[Type['b]] {
+    match t {
+        Option::Some(x) => Option::Some.(copy_type(&from, &to, x)),
+        Option::None => Option::None,
+    }
+}
+
+forall 'a, 'b.
+fn copy_members(&from: Cx!['a], &to: Cx!['b], items: Seq[Member['a], 'a]) -> Seq[Member['b], 'b] {
+    let out: Seq[Member['b], 'b] = Seq::new(&to);
+    var i = 0usize;
+    while i < items.len(&from) {
+        let m = items.get(&from, i);
+        out.push(&to, Member.{ name: copy_text(&from, &to, m.name), type: copy_type(&from, &to, m.type) });
+        i = i + 1usize;
+    }
+    out
+}
+
+forall 'a, 'b.
+fn copy_params(&from: Cx!['a], &to: Cx!['b], items: Seq[Param['a], 'a]) -> Seq[Param['b], 'b] {
+    let out: Seq[Param['b], 'b] = Seq::new(&to);
+    var i = 0usize;
+    while i < items.len(&from) {
+        let p = items.get(&from, i);
+        out.push(&to, Param.{ name: copy_text(&from, &to, p.name), kind: p.kind });
+        i = i + 1usize;
+    }
+    out
+}
+
+forall 'a, 'b.
+fn copy_premises(&from: Cx!['a], &to: Cx!['b], items: Seq[Premise['a], 'a]) -> Seq[Premise['b], 'b] {
+    let out: Seq[Premise['b], 'b] = Seq::new(&to);
+    var i = 0usize;
+    while i < items.len(&from) {
+        let p = items.get(&from, i);
+        out.push(&to, Premise.{ trait_name: copy_text(&from, &to, p.trait_name), args: copy_types(&from, &to, p.args) });
+        i = i + 1usize;
+    }
+    out
+}
+
+forall 'a, 'b.
+fn copy_home(&from: Cx!['a], &to: Cx!['b], home: Option[ModuleId['a]]) -> Option[ModuleId['b]] {
+    match home {
+        Option::Some(m) => Option::Some.(ModuleId.{ package: m.package, path: copy_texts(&from, &to, m.path) }),
+        Option::None => Option::None,
+    }
+}
+
+// ----------------------------------------------------------- declarations --
+
+forall 'a, 'b.
+fn copy_type_decl(&from: Cx!['a], &to: Cx!['b], d: TypeDecl['a]) -> TypeDecl['b] {
+    let exposure = match d.exposure {
+        Option::Some(e) => Option::Some.(Exposure.{ mode: e.mode, home: ModuleId.{ package: e.home.package, path: copy_texts(&from, &to, e.home.path) } }),
+        Option::None => Option::None,
+    };
+    TypeDecl.{ name: copy_text(&from, &to, d.name), linear: d.linear, params: copy_params(&from, &to, d.params),
+        premises: copy_premises(&from, &to, d.premises), body: copy_type(&from, &to, d.body), home: copy_home(&from, &to, d.home), exposure }
+}
+
+forall 'a, 'b.
+fn copy_instr(&from: Cx!['a], &to: Cx!['b], i: Instr['a]) -> Instr['b] {
+    Instr.{ lhs: copy_texts(&from, &to, i.lhs), op: copy_text(&from, &to, i.op), args: copy_texts(&from, &to, i.args),
+        ty: copy_option_type(&from, &to, i.ty), tys: copy_types(&from, &to, i.tys), lit: copy_option_text(&from, &to, i.lit),
+        is_unsafe: i.is_unsafe, binders: copy_texts(&from, &to, i.binders), pos: i.pos }
+}
+
+forall 'a, 'b.
+fn copy_edge(&from: Cx!['a], &to: Cx!['b], e: Edge['a]) -> Edge['b] {
+    Edge.{ target: copy_text(&from, &to, e.target), args: copy_texts(&from, &to, e.args), tys: copy_types(&from, &to, e.tys) }
+}
+
+forall 'a, 'b.
+fn copy_terminator(&from: Cx!['a], &to: Cx!['b], t: Terminator['a]) -> Terminator['b] {
+    match t {
+        Terminator::Ret(value, pos) => Terminator::Ret.(copy_text(&from, &to, value), pos),
+        Terminator::Jmp(edge, pos) => Terminator::Jmp.(copy_edge(&from, &to, edge), pos),
+        Terminator::Jnz(cond, then, other, pos) => Terminator::Jnz.(copy_text(&from, &to, cond), copy_edge(&from, &to, then), copy_edge(&from, &to, other), pos),
+        Terminator::Switch(scrutinee, ty, arms, pos) => {
+            let out: Seq[Arm['b], 'b] = Seq::new(&to);
+            var i = 0usize;
+            while i < arms.len(&from) {
+                let arm = arms.get(&from, i);
+                out.push(&to, Arm.{ variant: copy_text(&from, &to, arm.variant), edge: copy_edge(&from, &to, arm.edge) });
+                i = i + 1usize;
+            }
+            Terminator::Switch.(copy_text(&from, &to, scrutinee), copy_type(&from, &to, ty), out, pos)
+        },
+        Terminator::Unreachable(pos) => Terminator::Unreachable.(pos),
+    }
+}
+
+forall 'a, 'b.
+fn copy_bindings(&from: Cx!['a], &to: Cx!['b], items: Seq[Binding['a], 'a]) -> Seq[Binding['b], 'b] {
+    let out: Seq[Binding['b], 'b] = Seq::new(&to);
+    var i = 0usize;
+    while i < items.len(&from) {
+        let b = items.get(&from, i);
+        out.push(&to, Binding.{ name: copy_text(&from, &to, b.name), type: copy_type(&from, &to, b.type) });
+        i = i + 1usize;
+    }
+    out
+}
+
+forall 'a, 'b.
+fn copy_block(&from: Cx!['a], &to: Cx!['b], b: Block['a]) -> Block['b] {
+    let instrs: Seq[Instr['b], 'b] = Seq::new(&to);
+    var i = 0usize;
+    while i < b.instrs.len(&from) {
+        instrs.push(&to, copy_instr(&from, &to, b.instrs.get(&from, i)));
+        i = i + 1usize;
+    }
+    let known: Seq[Known['b], 'b] = Seq::new(&to);
+    i = 0usize;
+    while i < b.known.len(&from) {
+        let k = b.known.get(&from, i);
+        known.push(&to, Known.{ path: copy_text(&from, &to, k.path), variant: copy_text(&from, &to, k.variant) });
+        i = i + 1usize;
+    }
+    let opened: Seq[Opened['b], 'b] = Seq::new(&to);
+    i = 0usize;
+    while i < b.opened.len(&from) {
+        let o = b.opened.get(&from, i);
+        opened.push(&to, Opened.{ path: copy_text(&from, &to, o.path), brands: copy_texts(&from, &to, o.brands) });
+        i = i + 1usize;
+    }
+    Block.{ label: copy_text(&from, &to, b.label), params: copy_bindings(&from, &to, b.params), instrs, term: copy_terminator(&from, &to, b.term),
+        brands: copy_texts(&from, &to, b.brands), empty: copy_texts(&from, &to, b.empty), known, opened, pos: b.pos }
+}
+
+forall 'a, 'b.
+fn copy_fun(&from: Cx!['a], &to: Cx!['b], f: Fun['a]) -> Fun['b] {
+    let blocks: Seq[Block['b], 'b] = Seq::new(&to);
+    var i = 0usize;
+    while i < f.blocks.len(&from) {
+        blocks.push(&to, copy_block(&from, &to, f.blocks.get(&from, i)));
+        i = i + 1usize;
+    }
+    Fun.{ name: copy_text(&from, &to, f.name), params: copy_params(&from, &to, f.params), premises: copy_premises(&from, &to, f.premises),
+        ret: copy_type(&from, &to, f.ret), ptypes: copy_types(&from, &to, f.ptypes), blocks, locals: copy_bindings(&from, &to, f.locals),
+        is_unsafe: f.is_unsafe, home: copy_home(&from, &to, f.home), pos: f.pos }
+}
+
+forall 'a, 'b.
+fn copy_form(&from: Cx!['a], &to: Cx!['b], f: Form['a]) -> Form['b] {
+    let items: Seq[Form['b], 'b] = Seq::new(&to);
+    var i = 0usize;
+    while i < f.items.len(&from) {
+        items.push(&to, copy_form(&from, &to, f.items.get(&from, i)));
+        i = i + 1usize;
+    }
+    Form.{ kind: f.kind, text: copy_text(&from, &to, f.text), items, pos: f.pos }
+}
+
+forall 'a, 'b.
+fn copy_instance(&from: Cx!['a], &to: Cx!['b], inst: Instance['a]) -> Instance['b] {
+    let methods: Seq[Fun['b], 'b] = Seq::new(&to);
+    var i = 0usize;
+    while i < inst.methods.len(&from) {
+        methods.push(&to, copy_fun(&from, &to, inst.methods.get(&from, i)));
+        i = i + 1usize;
+    }
+    Instance.{ trait_name: copy_text(&from, &to, inst.trait_name), params: copy_params(&from, &to, inst.params),
+        premises: copy_premises(&from, &to, inst.premises), head: copy_types(&from, &to, inst.head), methods,
+        home: copy_home(&from, &to, inst.home), pos: inst.pos }
+}
+
+forall 'a, 'b.
+fn copy_trait(&from: Cx!['a], &to: Cx!['b], t: Trait['a]) -> Trait['b] {
+    let methods: Seq[Method['b], 'b] = Seq::new(&to);
+    var i = 0usize;
+    while i < t.methods.len(&from) {
+        let m = t.methods.get(&from, i);
+        methods.push(&to, Method.{ name: copy_text(&from, &to, m.name), ret: copy_type(&from, &to, m.ret), ptypes: copy_types(&from, &to, m.ptypes),
+            is_unsafe: m.is_unsafe, places: copy_plain(&from, &to, m.places) });
+        i = i + 1usize;
+    }
+    Trait.{ name: copy_text(&from, &to, t.name), params: copy_texts(&from, &to, t.params), methods, home: copy_home(&from, &to, t.home),
+        param_kinds: copy_plain(&from, &to, t.param_kinds) }
+}
+
+// The whole program, its maps in the same order.
+forall 'a, 'b.
+fn copy_program(&from: Cx!['a], &to: Cx!['b], p: Program['a]) -> Program['b] {
+    let out = Program::new(&to);
+    var i = 0usize;
+    while i < p.types.positions(&from) {
+        match p.types.entry(&from, i) {
+            Option::Some(name) => out.types.set(&to, copy_text(&from, &to, name), copy_type_decl(&from, &to, p.types.at(&from, name))),
+            Option::None => (),
+        };
+        i = i + 1usize;
+    }
+    i = 0usize;
+    while i < p.funs.positions(&from) {
+        match p.funs.entry(&from, i) {
+            Option::Some(name) => out.funs.set(&to, copy_text(&from, &to, name), copy_fun(&from, &to, p.funs.at(&from, name))),
+            Option::None => (),
+        };
+        i = i + 1usize;
+    }
+    i = 0usize;
+    while i < p.externs.positions(&from) {
+        match p.externs.entry(&from, i) {
+            Option::Some(name) => {
+                let x = p.externs.at(&from, name);
+                let ptypes = match x.ptypes {
+                    Option::Some(ts) => Option::Some.(copy_types(&from, &to, ts)),
+                    Option::None => Option::None,
+                };
+                out.externs.set(&to, copy_text(&from, &to, name), Extern.{ name: copy_text(&from, &to, x.name), ret: copy_option_type(&from, &to, x.ret), ptypes, pos: x.pos });
+            },
+            Option::None => (),
+        };
+        i = i + 1usize;
+    }
+    i = 0usize;
+    while i < p.datas.positions(&from) {
+        match p.datas.entry(&from, i) {
+            Option::Some(name) => {
+                let d = p.datas.at(&from, name);
+                out.datas.set(&to, copy_text(&from, &to, name), Data.{ name: copy_text(&from, &to, d.name), ty: copy_type(&from, &to, d.ty),
+                    init: copy_form(&from, &to, d.init), home: copy_home(&from, &to, d.home) });
+            },
+            Option::None => (),
+        };
+        i = i + 1usize;
+    }
+    i = 0usize;
+    while i < p.traits.positions(&from) {
+        match p.traits.entry(&from, i) {
+            Option::Some(name) => out.traits.set(&to, copy_text(&from, &to, name), copy_trait(&from, &to, p.traits.at(&from, name))),
+            Option::None => (),
+        };
+        i = i + 1usize;
+    }
+    i = 0usize;
+    while i < p.instances.positions(&from) {
+        match p.instances.entry(&from, i) {
+            Option::Some(name) => {
+                let insts = p.instances.at(&from, name);
+                let copied: Seq[Instance['b], 'b] = Seq::new(&to);
+                var k = 0usize;
+                while k < insts.len(&from) {
+                    copied.push(&to, copy_instance(&from, &to, insts.get(&from, k)));
+                    k = k + 1usize;
+                }
+                out.instances.set(&to, copy_text(&from, &to, name), copied);
+            },
+            Option::None => (),
+        };
+        i = i + 1usize;
+    }
+    out
+}

@@ -11,8 +11,8 @@ reference in the tests.
 
 | Module | Translates | |
 |---|---|---|
-| `support::base` | | storage on the standard library's arena: the context `Cx!`, text, sequences, maps, sets, cells; `fail` |
-| `support::system` | | arguments, files, directories, processes, the environment, the clock, C's `strtod` |
+| `support::base` | | storage on the standard library's arena: the context `Cx!`, text, sequences, maps, sets, cells, text copied between arenas; `fail` |
+| `support::system` | | arguments, files, directories, processes and the environment, through the standard library |
 | `syntax::ast`, `syntax::parser` | `syntax.py`, `parser.py` | the surface AST and the parser |
 | `syntax::dump` | | the AST as text |
 | `resolve::resolver` | `resolve.py` | manifests, the package graph, and what every name names |
@@ -20,6 +20,7 @@ reference in the tests.
 | `kurs::core`, `kurs::sexpr` | `core.py`, `sexpr.py` | the KURS core and S-expressions |
 | `kurs::serial` | `kurs.py` | serialized KURS: its reader and writer |
 | `kurs::readable` | `readable.py` | readable KURS |
+| `kurs::transfer` | | a core program copied from one arena into another |
 | `types::ops`, `types::unify` | `types.py`, `unify.py` | substitution, equality, shapes; unification over `kurs::core::Meta` |
 | `types::literals`, `formation`, `layout`, `termination`, `coherence` | the same names | checks of literals, types, declarations and instances |
 | `types::selftest` | | `kursal selftest-types`, the type modules on small cases, for the tests |
@@ -30,7 +31,7 @@ reference in the tests.
 | `lower::lowering`, `lower::placeflow`, `lower::promote` | `lower.py`, `placeflow.py`, `promote.py` | lowering inferred bodies to core: control flow, places and their contracts, branded locals as SSA values |
 | `check::checker` | `check.py` | the KURS checker; it records every SSA value's type by `FunKey` |
 | `backend::mangle`, `backend::cgen` | `mangle.py`, `cgen.py` | symbol names (with SHA-256); checked KURS to C |
-| `main` | `__main__.py` | the command line |
+| `main` | `__main__.py` | the command line, and an arena for each group of phases |
 
 ## Building and testing
 
@@ -58,12 +59,15 @@ programs the reference's other test modules check (gathered by running those tes
 `check_program` watched) with the reference's verdicts; the reference's lowering and whole-pipeline C
 of every package, bad example and `compiler/`; and the packages the other test modules lower
 (gathered with `lower` watched) with the reference's lowering of each. Each run of the compiler is
-limited to 6 GB of address space and a timeout.
+limited to 6 GB of address space and a timeout. When valgrind is installed, the compiler builds
+`examples/lisp` under its leak check, which fails on any error and on any byte not freed; with
+`KURSAL_SELFHOST=1`, the self-built compiler builds `compiler/` under it too (a long run, limited to
+14 GB).
 
 ## Storage
 
-The compiler keeps what it builds in an arena of the standard library, `std::alloc::arena::Arena!['k]`.
-`support::base::Cx!['k]` holds the arena with the one capability for its domain, `Exclusive!['k]`:
+The compiler keeps what it builds in arenas of the standard library, `std::alloc::arena::Arena!['k]`.
+`support::base::Cx!['k]` holds an arena with the one capability for its domain, `Exclusive!['k]`:
 
 ```kursal
 forall 'k.
@@ -73,9 +77,8 @@ exposed struct Cx! {
 }
 ```
 
-`main` makes one with `Cx::new()` for the command it runs, passes it down by place, `&cx`, and
-destroys it when the command is done; a command that fails stops the process from inside. Every
-value of the storage is a `Copy` view branded `'k`, built on the standard library's arena structures:
+Every value of the storage is a `Copy` view branded `'k`, built on the standard library's arena
+structures:
 
 - `Text['k]` is a `std::raw::Span['k]`: the bytes of a literal, of a file copied into the arena, or of
   text the compiler built.
@@ -98,7 +101,49 @@ capability are what make its views safe to read.
 Every type that holds storage carries the brand (`kurs::core::Type['k]`, `syntax::ast::Expr['k]`,
 `lower::lowering::FnLower['k]`), and every function that touches it is `forall 'k.` and takes
 `&cx: Cx!['k]`, first or right after `self`. The brand is always a parameter, never one brand for
-the whole compiler, so a phase's data could live in an arena of its own.
+the whole compiler, so each group of phases runs in an arena of its own.
+
+### An arena per group of phases
+
+`main` opens three arenas, one after another, each under a brand of its own:
+
+| Group | Phases | Hands on |
+|---|---|---|
+| front end, `'f` | the command line; parsing, resolving, signatures, inference, lowering with place flow and promotion; or reading KURS | `main::Handoff['f]`: the core program, the `Fresh` counter, the entry's name, `build`'s output path |
+| core, `'c` | checking | the program again, and `Checker.typed`, the type of every SSA value |
+| back end, `'b` | mangling and C | the C, printed or written; then `cc` runs |
+
+The core program is where the pipeline is narrowest: it is self-contained (the `check`, `c` and
+`readable` commands start from it, read from KURS), while the syntax trees, the resolver, the
+signatures and what inference found are not needed after lowering. Lowering stays in the front end
+because place flow and promotion report errors through the resolver, in their files.
+
+A group's hand-off is copied into the next arena with `kurs::transfer::copy_program` (every type,
+function, block, instruction, declaration and data form, maps in the same order),
+`check::checker::copy_typed`, `support::base::copy_text` (`std::alloc::arena::copy_span`, read under
+the first arena's capability) and `types::ops::carry_fresh`; then the first arena is destroyed. A
+part shared by two places in the original is copied for each: nothing changes a program once it is
+lowered. `fail` still stops the process from inside, leaving whichever arenas are open to the
+operating system; on success, every arena is destroyed and every byte the compiler allocated is
+freed, which `tests/test_compiler.py` checks under valgrind.
+
+Code is specialized for each brand it runs under, so each arena is opened once, in `main`, and
+`front_end`, `check_program` and `back_end` take it by place: every command's front end shares one
+specialization, as do the checks and the backends. Code that more than one group runs (the
+`support` and `types` modules, `kurs::core`, the checker that place flow uses) is made once for
+each of them.
+
+### Scratch state
+
+What a walk needs only while it runs, and that never escapes into its result, lives in the
+standard library's linear collections, `OwnedVec!` and `OwnedMap!`, on the heap, and is freed when
+the walk ends: the worklist of place flow (`PlaceFlow::plan`), the numbering, stack and active set
+of Tarjan's algorithm (`types::termination::components`), the open lists of the KURS reader
+(`kurs::sexpr::read`), the variables seen while collecting inference variables (`types::unify`),
+the variants a match has covered (`FnLower::match_coverage`), and the walk of package dependencies
+(`Infer::depends_on`). A scratch map with `Copy` keys that point into the arena hashes them under
+`&cx` (`insert_in`, `get_in`, `remove_in`). State that lives in a struct of handles shared with
+the rest of a phase stays in the arena, and so does everything that ends up in a result.
 
 | Python | Kursal |
 |---|---|
@@ -107,6 +152,7 @@ the whole compiler, so a phase's data could live in an arena of its own.
 | `list`, `tuple` of values | `Seq[T, 'k]` (`push`, `get`, `set`, `len`, `pop`, `last`, `copy`, `slice`, `append`, `insert`, `remove`, `sort`; each takes `&cx`) |
 | `dict` | `Map[K, V, 'k]` (insertion-ordered like `dict`: `set`, `get` → `Option`, `at`, `get_or`, `has`, `remove`, `keys`, `values`) |
 | `set` | `Set[K, 'k]` (insertion-ordered: `add`, `has`, `remove`, `items`) |
+| a worklist or visited set local to a walk | `OwnedVec![T]` (`push`, `pop` → `Popped`, `get`, `len`, `free`), `OwnedMap![K, V]` (`insert`, `get`; `insert_in(&cx, ...)` for keys in the arena; `free`) |
 | a mutable attribute | a field holding a `Cell[T, 'k]` (`get`, `set`), a `Seq` or a `Map` |
 | a dataclass | an `exposed struct` branded `'k`; a `HashIn[X['k], Cx!['k]]` instance if it is a map key |
 | a union of classes | an `exposed enum` whose variants carry structs |
@@ -115,18 +161,18 @@ the whole compiler, so a phase's data could live in an arena of its own.
 | a recursive field | `Cell[T, 'k]` (or a `Seq`), so the type has a finite size |
 | `x is y` on lists, dicts, cells | `a.address() == b.address()` |
 
-Nothing is freed until the arena is, so a loop that builds throwaway values on every step costs
-memory for the rest of the command. A sequence takes up to twice its length in room; a map's slots
-are made again, twice as many, as it grows, and the old ones stay; `Out::done` copies text longer
-than 32 bytes into one block. Where a pure computation is repeated on the same input, cache it in
-a map (`Backend::ctype`, `Types::unfold`, the layout walk's finished keys). In a hot loop, read a
-map's or set's keys in place with `positions` and `entry` rather than copying them with `keys` or
-`items`, and compare text without splitting it.
+Nothing in an arena is freed until the arena is, so a loop that builds throwaway values on every
+step costs memory for the rest of its group. A sequence takes up to twice its length in room; a
+map's slots are made again, twice as many, as it grows, and the old ones stay; `Out::done` copies
+text longer than 32 bytes into one block. Where a pure computation is repeated on the same input,
+cache it in a map (`Backend::ctype`, `Types::unfold`, the layout walk's finished keys). In a hot
+loop, read a map's or set's keys in place with `positions` and `entry` rather than copying them
+with `keys` or `items`, and compare text without splitting it.
 
-Map keys are hashed and compared through the standard library's `HashIn[K, Cx!['k]]`, which takes
-the context by value and hands it back; `key_hash(&cx, key)` and `key_same(&cx, a, b)` call it
-with the context by place. The standard library has the instances for the integers, `bool` and
-tuples of keys, `support::base` those for `Text` and `Seq`s of keys, and `kurs::core` adds `Type`,
+Map keys are hashed and compared through the standard library's `HashIn[K, Cx!['k]]`, which borrows
+the context by place: `HashIn[K, Cx!['k]]::hash_in(&cx, key, state)`, or `key_hash(&cx, key)` and
+`key_same(&cx, a, b)`. The standard library has the instances for the integers, `bool` and tuples
+of keys, `support::base` those for `Text` and `Seq`s of keys, and `kurs::core` adds `Type`,
 `Param`, `Premise` and `ModuleId`. `kurs::core::same` is structural type equality (Python's `==` on
 frozen dataclasses), `kurs::core::hash` its hash.
 
@@ -134,10 +180,21 @@ A class whose methods mutate `self` becomes a struct of handles (cells, sequence
 methods take `self` by value and `&cx`: the copies share the same storage. Its constructor allocates
 them.
 
+### The operating system
+
+`support::system` copies paths and command lines out of the arena into `Buffer!`s, calls the
+standard library and its `libc` package, and copies what comes back into the arena: arguments
+(`libc::process::arguments`), whole files (`libc::fs::open_read`, `std::io::File::read_to_buffer`),
+writing a file (`libc::fs::create`, `File::write_span`), directories, real paths and the
+environment (`libc::fs`), and running `cc` (`libc::process::run`). Times come from
+`std::time::Instant`, and float literals are read with `std::float::parse_f64` and taken apart with
+`f64::to_bits` and `f64::to_f32`. The compiler has no `unsafe` operation and no `extern`
+declaration of its own.
+
 ## Errors
 
 The compiler stops at the first error: `support::base::fail(&cx, message)` prints the message and exits
-with status 1, leaving the arena to the operating system; `fail_static(literal)` needs no context. A message is exactly what the reference compiler prints for the same error: `KursError`'s
+with status 1, leaving the open arenas to the operating system; `fail_static(literal)` needs no context. A message is exactly what the reference compiler prints for the same error: `KursError`'s
 `str()`, which is `line:col: message` when it carries a position and the message alone otherwise,
 and the file prefix the front end adds (`resolve.located`). Tests compare messages.
 `types::ops::kurs_error(&cx, message, pos)` stops with `KursError(message, pos)`'s text; a `Pos` with line 0
@@ -149,7 +206,8 @@ stands for no position.
 counter is a `types::ops::Fresh['k]`, made once and passed to everything that may rename a binder: `subst`,
 `unify`, `match_head`, `Types`, `Formation`, `check_type_expansion`, `check_coherence`, `Signatures`,
 `Infer`, `lower`, `check_program`, `emit_c`, `emit_kurs`. Passing the
-same one everywhere numbers names as the reference compiler does.
+same one everywhere numbers names as the reference compiler does; `carry_fresh` carries it into the
+next group's arena, counting on from where it stopped.
 
 Where the reference wraps a phase in `with resolver.located(module, pos):`, call
 `r.locate(&cx, module, pos)` before it and `r.unlocate(&cx)` after, and report errors inside it with
@@ -196,7 +254,7 @@ These are the places where Kursal differs from what one might expect.
   callee's changes to `cx` are the caller's. Fields of a lent struct can be lent in one call
   (`&cx.arena.alloc(&cx.tag, value)`), and a call may lend `cx` again in its arguments
   (`f(&cx, g(&cx, x))`). A function may move a place parameter out if it puts a value back before it
-  returns: `let (back, state) = HashIn[K, Cx!['k]]::hash_in(cx, key, state); cx = back;`. A
+  returns: `let { tag, arena } = cx; ...; cx = Cx.{ tag, arena };`. A
   `match`, `&&` or `if` may lend it in every branch.
 - **Brands.** `forall 'k.` binds a brand like a type parameter, and a type that holds branded storage
   takes it as its last argument (`Seq[Text['k], 'k]`). A brand is minted by a constructor that
