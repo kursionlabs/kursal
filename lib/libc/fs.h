@@ -10,6 +10,7 @@ uint8_t *kur_libc_fs_canonicalize(uint8_t *bytes, uintptr_t len);
 uint8_t *kur_libc_fs_getenv(uint8_t *bytes, uintptr_t len);
 int32_t kur_libc_fs_stat(uint8_t *bytes, uintptr_t len, uint8_t *output);
 int32_t kur_libc_fs_open_read(uint8_t *bytes, uintptr_t len);
+int32_t kur_libc_fs_create(uint8_t *bytes, uintptr_t len);
 uint8_t *kur_libc_fs_open_directory(uint8_t *bytes, uintptr_t len);
 uint8_t *kur_libc_fs_next_entry(uint8_t *handle);
 uint8_t *kur_libc_fs_entry_name(uint8_t *entry);

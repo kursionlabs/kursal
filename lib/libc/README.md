@@ -1,12 +1,14 @@
 # Host libc adapters
 
-`fs.kur` provides filesystem operations for hosted tools, and `thread.kur`
-provides a thin POSIX thread adapter. Their C halves are `fs.c` and
-`thread.c`; both target POSIX hosts, not freestanding kernels. Platform
+`fs.kur` provides filesystem operations for hosted tools, `process.kur`
+this program's arguments and running other programs, and `thread.kur` a
+thin POSIX thread adapter. The C halves are `fs.c` and `thread.c`
+(`process.kur` calls libc directly and reports errno through `fs.c`); they
+target POSIX hosts, not freestanding kernels. Platform
 structure layouts (`DIR`, `dirent`, `stat`, `pthread_t`) never cross the
 boundary.
 
-`lib.kur` is the package facade and exports the `fs` and `thread`
+`lib.kur` is the package facade and exports the `fs`, `process` and `thread`
 namespaces. Every module in the package is part of the build, so a program
 that depends on `libc` links both `fs.c` and `thread.c`, even if it uses
 only one adapter, for example
@@ -27,7 +29,9 @@ independently owned buffer without a trailing NUL in its logical length.
 nothing when it is unset. These values describe an observation, not
 authenticated ownership or a stable filesystem snapshot. `open_read`
 returns a `std::io::File!` over a fresh, close-on-exec descriptor; its
-usual read and close operations apply. Opening errors are positive errno
+usual read and close operations apply. `create` makes the file, or empties
+an existing one, and returns a `File!` open for writing (mode 0644 less the
+umask for a new file). Opening errors are positive errno
 values; later `File!` operations report errors as `std::io` does.
 
 `DirectoryStream!` is restricted and linear. `next` returns an owned entry
@@ -56,6 +60,18 @@ Code that uses these operations to enforce path containment must still
 compare canonical paths on component boundaries, check physical identities,
 and reject directory aliases and cycles. None of these operations prevents
 concurrent filesystem mutation (TOCTOU).
+
+## `process.kur`
+
+A command line is one `Buffer!` holding each argument followed by a NUL,
+the program's name first. `arguments` reads this program's from
+`/proc/self/cmdline`, so it is Linux-specific, and no `argv` pointer has to
+be trusted. `run(&command)` forks, runs the program with `execvp` (searching
+the `PATH`) and this program's environment, waits for it, and reports
+`Exit::Code(status)` or `Exit::Signal(number)`; a child that cannot run the
+program exits with 127. It fails with a positive errno: EINVAL for a
+command line that is empty or does not end in a NUL, otherwise what `fork`
+or `waitpid` reports. The command line is handed back unchanged.
 
 ## `thread.kur`
 

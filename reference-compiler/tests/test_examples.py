@@ -56,6 +56,14 @@ LISP_IN = (
 )
 LISP_OUT = "(0 2 4 6 8)\n5050\n(4 3 2 1 0)\n2432902008176640000\n15\n-6\n(1 . 2)\n(nested (list) #t #f -7)\n#f\n"
 
+HOST_OUT = (
+    "arguments: one two (3 with the name)\ngreeting: unset\nfile: written and read back\n"
+    "run: exit 0\nrun: exit 3\nrun: exit 127\nrun: error 22\nclock: monotonic\n"
+    "float 1: 4607182418800017408 f32 1065353216\nfloat -2.5e3: 13881088010067378176 f32 3306962944\n"
+    "float 0.1: 4591870180066957722 f32 1036831949\nfloat 1e400: 9218868437227405312 f32 2139095040\n"
+    "float 4.9e-324: 1 f32 0\nfloat  1: none\nfloat 1x: none\nfloat : none\n"
+)
+
 # Each program's runs, in order and sharing one directory: (arguments, stdin, stdout, exit status).
 # `{file}` in the arguments is SAMPLE written beside the build; `{store}` is a path there, missing at first.
 RUNS = {
@@ -64,6 +72,7 @@ RUNS = {
               "7\n9\n-12\ndivision by zero at column 4\nexpected a number or '(' at column 4\n", 2),),
     "wc": ((("{file}",), "", "2 5 24 {file}\n", 0),),
     "ring": (((), "", "", 211),),
+    "host": ((("one", "two"), "", HOST_OUT, 0),),
     "kvstore": (
         (("{store}", "list"), "", "", 0),
         (("{store}", "set", "name", "Ada"), "", "", 0),

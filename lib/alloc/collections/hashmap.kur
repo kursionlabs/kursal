@@ -559,85 +559,77 @@ unsafe fn resize_hashed(u_old: Uninit!, base: *(*Entry[K, V]), old_bc: usize) ->
 
 // The domain-keyed counterparts of the helpers above: `Copy` keys that
 // point into a domain, hashed and compared through its capability `cap`
-// (`HashIn`), which every helper threads and hands back.
+// (`HashIn`), which every helper borrows by place.
 
 forall K, C where Copy[K], HashIn[K, C].
-fn hash_key_in(cap: C, key: K) -> (C, u64) {
-    let (cap, state) = HashIn[K, C]::hash_in(cap, key, HashState::new());
-    (cap, state.finish())
+fn hash_key_in(&cap: C, key: K) -> u64 {
+    HashIn[K, C]::hash_in(&cap, key, HashState::new()).finish()
 }
 
 forall K, V, C where Copy[K], HashIn[K, C].
-unsafe fn find_chain_in(cap: C, head: *Entry[K, V], key: K) -> (C, Found[*V]) {
-    var cap = cap;
+unsafe fn find_chain_in(&cap: C, head: *Entry[K, V], key: K) -> Found[*V] {
     var cur = head;
     var found: Found[*V] = Found::Missing;
     while unsafe (cur as usize) != 0usize {
         let e = unsafe *cur;
         let { key: k, val: vp, next: nx } = e;
-        let (c, same) = HashIn[K, C]::eq_in(cap, unsafe *k, key);
-        cap = c;
-        cur = if same {
+        cur = if HashIn[K, C]::eq_in(&cap, unsafe *k, key) {
             found = Found::Item.(vp);
             unsafe null_entry[K, V]()
         } else {
             nx
         };
     }
-    (cap, found)
+    found
 }
 
 // Stores `val` under `key`, handing back the value it replaces.
 forall K, V, C where Copy[K], HashIn[K, C].
-unsafe fn put_chain_in(cap: C, head: *Entry[K, V], key: K, val: V) -> (C, *Entry[K, V], Found[V], bool) {
+unsafe fn put_chain_in(&cap: C, head: *Entry[K, V], key: K, val: V) -> (*Entry[K, V], Found[V], bool) {
     if unsafe is_null_entry[K, V](head) {
         let kp = unsafe alloc_one[K](key);
         let vp = unsafe alloc_one[V](val);
-        return (cap, unsafe alloc_entry[K, V](kp, vp, head), Found::Missing, true);
+        return (unsafe alloc_entry[K, V](kp, vp, head), Found::Missing, true);
     }
     let e = unsafe *head;
     let { key: k, val: vp, next: nx } = e;
-    let (cap, same) = HashIn[K, C]::eq_in(cap, unsafe *k, key);
-    if same {
+    if HashIn[K, C]::eq_in(&cap, unsafe *k, key) {
         let old = unsafe *vp;
         unsafe *vp = val;
-        return (cap, head, Found::Item.(old), false);
+        return (head, Found::Item.(old), false);
     }
-    let (cap, new_next, found, is_new) = unsafe put_chain_in[K, V, C](cap, nx, key, val);
+    let (new_next, found, is_new) = unsafe put_chain_in[K, V, C](&cap, nx, key, val);
     unsafe *head = Entry.{ key: k, val: vp, next: new_next };
-    (cap, head, found, is_new)
+    (head, found, is_new)
 }
 
 // Unlinks `key`'s entry, handing back its value.
 forall K, V, C where Copy[K], HashIn[K, C].
-unsafe fn take_chain_in(cap: C, head: *Entry[K, V], key: K) -> (C, *Entry[K, V], Found[V], bool) {
+unsafe fn take_chain_in(&cap: C, head: *Entry[K, V], key: K) -> (*Entry[K, V], Found[V], bool) {
     if unsafe is_null_entry[K, V](head) {
-        return (cap, head, Found::Missing, false);
+        return (head, Found::Missing, false);
     }
     let e = unsafe *head;
     let { key: k, val: vp, next: nx } = e;
-    let (cap, same) = HashIn[K, C]::eq_in(cap, unsafe *k, key);
-    if same {
+    if HashIn[K, C]::eq_in(&cap, unsafe *k, key) {
         let old = unsafe *vp;
         let u1 = unsafe free_one[K](k);
         let u2 = unsafe free_one[V](vp);
         let u3 = HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(unsafe (head as *u8)));
-        return (cap, nx, Found::Item.(old), true);
+        return (nx, Found::Item.(old), true);
     }
-    let (cap, new_next, found, removed) = unsafe take_chain_in[K, V, C](cap, nx, key);
+    let (new_next, found, removed) = unsafe take_chain_in[K, V, C](&cap, nx, key);
     unsafe *head = Entry.{ key: k, val: vp, next: new_next };
-    (cap, head, found, removed)
+    (head, found, removed)
 }
 
 forall K, V, C where Copy[K], HashIn[K, C].
-unsafe fn rehash_bucket_in(cap: C, head: *Entry[K, V], new_base: *(*Entry[K, V]), new_bc: usize) -> C {
-    var cap = cap;
+unsafe fn rehash_bucket_in(&cap: C, head: *Entry[K, V], new_base: *(*Entry[K, V]), new_bc: usize) -> () {
     var cur = head;
     while unsafe (cur as usize) != 0usize {
         let e = unsafe *cur;
         let { key: k, val: vp, next: nx } = e;
-        let (c, h) = hash_key_in[K, C](cap, unsafe *k);
-        cap = c;
+        let h = hash_key_in[K, C](&cap, unsafe *k);
         let idx = (h as usize) % new_bc;
         let slot = unsafe slot_ptr[K, V](new_base, idx);
         let old_head = unsafe *slot;
@@ -645,37 +637,33 @@ unsafe fn rehash_bucket_in(cap: C, head: *Entry[K, V], new_base: *(*Entry[K, V])
         unsafe *slot = cur;
         cur = nx;
     }
-    cap
 }
 
 forall K, V, C where Copy[K], HashIn[K, C].
-unsafe fn resize_in(cap: C, u_old: Uninit!, base: *(*Entry[K, V]), old_bc: usize) -> (C, Uninit!, usize) {
-    var cap = cap;
+unsafe fn resize_in(&cap: C, u_old: Uninit!, base: *(*Entry[K, V]), old_bc: usize) -> (Uninit!, usize) {
     let new_bc = checked_mul(old_bc, 2usize);
     let (u_new, new_base) = unsafe alloc_buckets[K, V](new_bc);
     var i = 0usize;
     while i < old_bc {
         let head = unsafe *(unsafe slot_ptr[K, V](base, i));
-        cap = unsafe rehash_bucket_in[K, V, C](cap, head, new_base, new_bc);
+        unsafe rehash_bucket_in[K, V, C](&cap, head, new_base, new_bc);
         i = i + 1usize;
     }
     let u2 = HeapAllocator::drop(u_old);
-    (cap, u_new, new_bc)
+    (u_new, new_bc)
 }
 
 forall K, V, 'k where Copy[K].
 impl HashMap[K, V, 'k] {
     // `get` for a `Copy` key that points into a domain, hashed and compared
-    // through that domain's capability `cap`, which comes back.
+    // through that domain's capability `cap` (lent by place).
     forall C where HashIn[K, C].
     fn get_in(&self, &tag: Exclusive!['k], &cap: C, key: K) -> Found[Ref[V, 'k]] {
         let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n } = self;
         let (base, m) = r.into_parts();
-        let (cap_back, h) = hash_key_in[K, C](cap, key);
-        cap = cap_back;
+        let h = hash_key_in[K, C](&cap, key);
         let head = unsafe *(unsafe slot_ptr[K, V](base, (h as usize) % bc));
-        let (cap_back, found_vp) = unsafe find_chain_in[K, V, C](cap, head, key);
-        cap = cap_back;
+        let found_vp = unsafe find_chain_in[K, V, C](&cap, head, key);
         let found: Found[Ref[V, 'k]] = match found_vp {
             Found::Item(vp) => Found::Item.(unsafe Ref::from_raw(vp, m)),
             Found::Missing => Found::Missing,
@@ -688,26 +676,26 @@ impl HashMap[K, V, 'k] {
     // value it replaces. The map comes back freshly branded, as from
     // `insert`.
     forall C where HashIn[K, C].
-    fn insert_in(self, tag: Exclusive!['k], cap: C, key: K, val: V) -> exists '2. (Exclusive!['2], C, HashMap![K, V, '2], Found[V]) {
+    fn insert_in(self, tag: Exclusive!['k], &cap: C, key: K, val: V) -> exists '2. (Exclusive!['2], HashMap![K, V, '2], Found[V]) {
         let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n } = self;
         let (base, m) = r.into_parts();
-        let (cap, h) = hash_key_in[K, C](cap, key);
+        let h = hash_key_in[K, C](&cap, key);
         let s = unsafe slot_ptr[K, V](base, (h as usize) % bc);
         let head = unsafe *s;
-        let (cap, new_head, found, is_new) = unsafe put_chain_in[K, V, C](cap, head, key, val);
+        let (new_head, found, is_new) = unsafe put_chain_in[K, V, C](&cap, head, key, val);
         unsafe *s = new_head;
         let new_len = if is_new { n + 1usize } else { n };
         let should_resize = is_new && new_len > bc * 3usize / 4usize;
         let rg = bk.resume(tag);
         let u0 = a.release(rg);
-        let (cap, u1, new_bc) = if should_resize {
-            unsafe resize_in[K, V, C](cap, u0, base, bc)
+        let (u1, new_bc) = if should_resize {
+            unsafe resize_in[K, V, C](&cap, u0, base, bc)
         } else {
-            (cap, u0, bc)
+            (u0, bc)
         };
         let exists 'open1. (a2, rg2) = Allocation::adopt[*Entry[K, V]](u1);
         let (tag2, r2, bk2) = rg2.share();
-        pack 'open1. (tag2, cap, HashMap.{ alloc: a2, back: bk2, buckets: r2, bucket_count: new_bc, len: new_len }, found)
+        pack 'open1. (tag2, HashMap.{ alloc: a2, back: bk2, buckets: r2, bucket_count: new_bc, len: new_len }, found)
     }
 
     // `remove` for a domain key, handing back its value.
@@ -715,12 +703,10 @@ impl HashMap[K, V, 'k] {
     fn remove_in(&self, &tag: Exclusive!['k], &cap: C, key: K) -> Found[V] {
         let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n } = self;
         let (base, m) = r.into_parts();
-        let (cap_back, h) = hash_key_in[K, C](cap, key);
-        cap = cap_back;
+        let h = hash_key_in[K, C](&cap, key);
         let s = unsafe slot_ptr[K, V](base, (h as usize) % bc);
         let head = unsafe *s;
-        let (cap_back, new_head, found, removed) = unsafe take_chain_in[K, V, C](cap, head, key);
-        cap = cap_back;
+        let (new_head, found, removed) = unsafe take_chain_in[K, V, C](&cap, head, key);
         unsafe *s = new_head;
         let new_len = if removed { n - 1usize } else { n };
         self = HashMap.{ alloc: a, back: bk, buckets: r, bucket_count: bc, len: new_len };
@@ -1122,8 +1108,7 @@ impl OwnedMap[K, V] {
     forall C where HashIn[K, C].
     fn insert_in(&self, &cap: C, key: K, val: V) -> Found[V] {
         let exists 'm. (tag, map) = self.inner;
-        let exists '2. (tag, cap_back, map, old) = map.insert_in(tag, cap, key, val);
-        cap = cap_back;
+        let exists '2. (tag, map, old) = map.insert_in(tag, &cap, key, val);
         self = OwnedMap.{ inner: pack '2. (tag, map) };
         old
     }

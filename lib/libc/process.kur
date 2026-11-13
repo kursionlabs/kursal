@@ -1,0 +1,96 @@
+// Processes on a POSIX host: this program's arguments, and running another
+// program and waiting for it. A command line is one `Buffer!` holding each
+// argument followed by a NUL, the program's name first, the way Linux
+// keeps `/proc/self/cmdline`.
+
+use std::alloc::heap::HeapAllocator;
+use std::bytes::buffer::Buffer;
+use std::option::Result;
+use std::raw::{elem_ptr, raw_byte_at};
+use package::fs::open_read;
+
+extern "C" fn kur_libc_fs_error() -> i32;
+extern "C" fn fork() -> i32;
+extern "C" fn execvp(file: *u8, argv: *(*u8)) -> i32;
+extern "C" fn waitpid(pid: i32, status: *i32, options: i32) -> i32;
+extern "C" fn _exit(status: i32) -> !;
+
+// How a child process ended: `exit` with a status, or a signal.
+exposed enum Exit {
+    Code(i32),
+    Signal(i32),
+}
+
+// This program's command line, read from `/proc/self/cmdline` (Linux), so
+// no `argv` pointer has to be trusted. An error is a positive errno value.
+fn arguments() -> Result[Buffer!, i32] {
+    var path = Buffer::new().push_static("/proc/self/cmdline");
+    let opened = open_read(&path);
+    path.destroy();
+    match opened {
+        Result::Err(code) => Result::Err.(code),
+        Result::Ok(file) => {
+            var file = file;
+            let line = &file.read_to_end();
+            let closed = file.close();
+            Result::Ok.(line)
+        },
+    }
+}
+
+// Runs the program `command` names, found on the `PATH` as `execvp` finds
+// it, with `command`'s arguments and this program's environment, and waits
+// for it. `command` is handed back unchanged. A child that cannot run the
+// program exits with status 127. An error is a positive errno value:
+// EINVAL (22) for a command line that is empty or does not end in a NUL,
+// or whatever `fork` or `waitpid` reports.
+fn run(&command: Buffer!) -> Result[Exit, i32] {
+    let base = unsafe &command.as_ptr();
+    let len = &command.len();
+    if len == 0usize || unsafe raw_byte_at(base, len, len - 1usize) != 0u8 {
+        return Result::Err.(22i32);
+    }
+    // The table `execvp` reads: where each argument starts, then a null.
+    var count = 0usize;
+    var i = 0usize;
+    while i < len {
+        if unsafe raw_byte_at(base, len, i) == 0u8 {
+            count = count + 1usize;
+        }
+        i = i + 1usize;
+    }
+    let table = unsafe (HeapAllocator::alloc((count + 1usize) * sizeof[*u8]()).into_raw() as *(*u8));
+    var start = 0usize;
+    var n = 0usize;
+    i = 0usize;
+    while i < len {
+        if unsafe raw_byte_at(base, len, i) == 0u8 {
+            unsafe *(unsafe elem_ptr(table, n)) = unsafe elem_ptr(base, start);
+            n = n + 1usize;
+            start = i + 1usize;
+        }
+        i = i + 1usize;
+    }
+    unsafe *(unsafe elem_ptr(table, count)) = unsafe (0usize as *u8);
+    let pid = unsafe fork();
+    if pid == 0i32 {
+        let failed = unsafe execvp(base, table);
+        unsafe _exit(127i32);
+    }
+    let fork_error = if pid < 0i32 { unsafe kur_libc_fs_error() } else { 0i32 };
+    HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(unsafe (table as *u8)));
+    if pid < 0i32 {
+        return Result::Err.(fork_error);
+    }
+    let status = unsafe alloca[i32]();
+    unsafe *status = 0i32;
+    if unsafe waitpid(pid, status, 0i32) != pid {
+        return Result::Err.(unsafe kur_libc_fs_error());
+    }
+    let s = unsafe *status;
+    if (s & 127i32) == 0i32 {
+        Result::Ok.(Exit::Code.((s >> 8i32) & 255i32))
+    } else {
+        Result::Ok.(Exit::Signal.(s & 127i32))
+    }
+}

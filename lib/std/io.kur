@@ -188,13 +188,14 @@ unsafe fn read_file_sized(fd: i32, sized: Result[usize, i32]) -> Result[Buffer!,
     }
 }
 
-// Reads stdin to EOF, 4096 bytes at a time, appending to `b` and
-// returning it. Recursion threads the linear buffer through each step.
-fn read_all_stdin_go(b: Buffer!) -> Buffer! {
+// Reads `fd` to EOF, 4096 bytes at a time, appending to `b` and returning
+// it; a read error ends the input. Recursion threads the linear buffer
+// through each step.
+fn read_to_end_go(fd: i32, b: Buffer!) -> Buffer! {
     let chunk = 4096usize;
     let w = b.writer(chunk);
     let (dest, avail) = unsafe &w.writable_tail();
-    let n = unsafe read(0i32, dest, chunk);
+    let n = unsafe read(fd, dest, chunk);
     let zero = 0isize;
     let done = n <= zero;
     if done {
@@ -206,12 +207,12 @@ fn read_all_stdin_go(b: Buffer!) -> Buffer! {
         // returning `n` wrote exactly `dest[0..n)`, with `n <= chunk`. The
         // `done` branch has ruled out `n <= 0`, so the cast cannot turn an
         // error code into a huge length.
-        read_all_stdin_go(unsafe w.commit_external(n_usize))
+        read_to_end_go(fd, unsafe w.commit_external(n_usize))
     }
 }
 
 fn read_all_stdin() -> Buffer! {
-    read_all_stdin_go(Buffer::new())
+    read_to_end_go(0i32, Buffer::new())
 }
 
 // One line of stdin, without its newline: reads through the next newline
@@ -347,6 +348,16 @@ impl File {
         (tag, result)
     }
 
+    // Writes all of a span's bytes, read under its domain's capability.
+    forall 'k.
+    fn write_span(&self, &cap: Exclusive!['k], bytes: Span['k]) -> Result[(), i32] {
+        let { fd } = self;
+        let (ptr, len) = bytes.into_parts();
+        let result = unsafe write_all(fd, ptr, len);
+        self = File.{ fd };
+        result
+    }
+
     fn write_static(&self, bytes: Slice[u8, 'static]) -> Result[(), i32] {
         let { fd } = self;
         let (ptr, len, marker) = bytes.into_parts();
@@ -370,6 +381,16 @@ impl File {
         let result = unsafe write_all(fd, ptr, len);
         self = File.{ fd };
         result
+    }
+
+    // Reads from the descriptor's offset to EOF into a fresh `Buffer!`,
+    // for files whose size is not known ahead, such as pipes and `/proc`;
+    // a read error ends the input. Does not close `self`.
+    fn read_to_end(&self) -> Buffer! {
+        let { fd } = self;
+        let b = read_to_end_go(fd, Buffer::new());
+        self = File.{ fd };
+        b
     }
 
     // Reads the descriptor's whole content, from the start, into a fresh

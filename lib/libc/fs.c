@@ -86,6 +86,18 @@ int32_t kur_libc_fs_open_read(uint8_t *bytes, uintptr_t len) {
     return fd < 0 ? -saved : fd;
 }
 
+/* Creates the file or empties it, for writing: a fresh descriptor on
+ * success, negative errno on failure. A new file gets mode 0644, less the
+ * umask. */
+int32_t kur_libc_fs_create(uint8_t *bytes, uintptr_t len) {
+    char *path = path_copy(bytes, len);
+    if (!path) return -errno;
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    int saved = errno;
+    free(path);
+    return fd < 0 ? -saved : fd;
+}
+
 /* Opaque entry borrowed until the next read or close on this DIR.
  * NULL with errno == 0 is EOF; otherwise NULL indicates an error.
  * No dirent layout crosses the ABI. */
