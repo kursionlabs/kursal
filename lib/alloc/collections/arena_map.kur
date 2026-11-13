@@ -1,774 +1,434 @@
-// A separate-chaining hash table whose entries live in the caller's
-// `Arena!['k]`, unlike `alloc::collections::hashmap::HashMap!`, whose
-// entries are individually heap-allocated. Suited to a registry built
-// alongside other arena data, populated and then only queried: entries
-// need no per-entry free, and destroying the arena reclaims them all.
+// A hash map, and a set on top of it, whose storage lives in the caller's
+// `Arena!['k]` and that remember the order their keys were first inserted.
 //
-// No `remove`: arena memory is never freed individually, so a removal
-// could reclaim nothing. `insert` keeps the arena's brand: values never
-// move and are never freed while the arena lives, so a `Ref[V,'k]` from
-// `get_ref` stays valid across later inserts and resizes.
+// The handles are `Copy`, like `ArenaVec`'s: each names one header in the
+// arena, so a change made through one copy is seen through every other, and
+// a map can sit inside other `Copy` arena data. Keys and values are `Copy`
+// and are read and written whole; nothing hands out a reference into the
+// map, so growing never leaves one dangling.
 //
-// The bucket array is a heap block, not arena memory: each resize
-// allocates a bigger array, rehashes every entry into it, and frees the
-// old one (see `resize` for why that is sound). Every `Entry` node and
-// every stored key and value lives in the arena. `freeze` moves the
-// final array into the arena.
+// Keys are hashed and compared through `core::hash::HashIn[K, C]`, under
+// the same context `C` that lends the domain's capability (`Access`) and,
+// to insert, the arena (`Allocate`): a key that points into the domain
+// (a span, a vec, a program's own tree) is read under that context.
 //
-// Search keys never touch the arena: `insert` and `get_ref` take
-// `key: K` by value and stage it in `unsafe alloca[K]()`, valid for the
-// enclosing call and reclaimed on return. A permanent arena copy is made
-// only on `insert`'s new-key path. Comparisons go through `*K`: a generic
-// `K` is not provably Copy, so a key compared against several entries is
-// read out of its slot and written back at each step rather than
-// consumed.
-//
-// `destroy` frees only the bucket array; the entries are reclaimed with
-// the arena. Using the map after its arena is destroyed is not caught
-// here: entry, key and value pointers are unbranded raw pointers once
-// taken out of the `Ref` the arena returned.
+// The entries are kept in insertion order in one `ArenaVec`, and the hash
+// slots, open-addressed with linear probing, hold their indices. Removing a
+// key marks its entry dead and keeps the order of the rest; inserting it
+// again puts it at the end. `keys` and `values` list the live entries in
+// order; `positions` and `key_at` read them in place, without copying. The
+// slots are made at the first key and made again, twice as many, when half
+// are in use; nothing is freed until the arena is, so the old ones stay.
 
 use package as alloc;
 
-use alloc::heap::Uninit;
-use alloc::heap::HeapAllocator;
-use alloc::heap::checked_mul;
-use core::hash::Hash;
-use core::hash::Eq;
-use core::hash::HashState;
-use core::cap::Exclusive;
+use alloc::arena::{Allocate, Domain};
+use alloc::collections::arena_vec::ArenaVec;
+use alloc::heap::out_of_range;
+use core::cap::Access;
+use core::hash::{HashIn, HashState};
 use core::mem::Ref;
-use alloc::arena::{Arena, copy_bytes};
+use core::option::Option;
+use core::slice::Slice;
 
-forall T.
-exposed enum Found {
-    Item(T),
-    Missing,
-}
-
-// `Entry` is `exposed` so another module can build and destructure
-// entries directly, e.g. a cache that hashes and compares keys itself
-// over the parts from `ArenaMap::into_parts`. It stores only pointers,
-// so it is Copy whatever `K` and `V` are.
-forall K, V.
-exposed struct Entry {
-    key: *K,
-    val: *V,
-    next: *Entry[K, V],
-}
-
-// `ArenaMap!` is not `exposed`: no other module can build or destructure
-// it, so none can write `ArenaMap { buckets: <forged address>, .. }` and
-// have `destroy` free that address without `unsafe`. Callers that need
-// the raw parts, such as caches that hash and compare keys themselves,
-// use `into_parts` (safe) and `adopt_parts` (`unsafe fn`).
 forall K, V, 'k.
-struct ArenaMap! {
-    buckets: *(*Entry[K, V]),
-    bucket_count: usize,
-    len: usize,
-    marker: Brand['k],
+struct ArenaMap {
+    state: Ref[MapState[K, V, 'k], 'k],
+}
+
+forall K, V, 'k.
+struct MapState {
+    // Indices into `entries`, plus one; zero for an empty slot. A power of
+    // two long; none until the first key.
+    slots: Option[Slice[usize, 'k]],
+    // Every key inserted, in insertion order; a removed one stays, dead.
+    entries: ArenaVec[Entry[K, V], 'k],
+    count: usize,
 }
 
 forall K, V.
-unsafe fn null_entry() -> *Entry[K, V] {
-    unsafe (0usize as *Entry[K, V])
+struct Entry {
+    key: K,
+    value: V,
+    live: bool,
 }
 
-forall K, V.
-unsafe fn is_null_entry(p: *Entry[K, V]) -> bool {
-    let a = unsafe (p as usize);
-    a == 0usize
+// The hash of a key, spread over the low bits the slots are picked by.
+forall K, C where HashIn[K, C].
+fn slot_hash(&cx: C, key: K) -> usize {
+    let x = HashIn[K, C]::hash_in(&cx, key, HashState::new()).finish();
+    let x = (x ^ (x >> 33u64)) * 18397679294719823053u64;
+    let x = (x ^ (x >> 33u64)) * 14181476777654086739u64;
+    (x ^ (x >> 33u64)) as usize
 }
 
-// Address of the i-th bucket slot: integer arithmetic on the base
-// address, for a slot type that is itself a pointer (the same helper as
-// in `alloc::collections::hashmap`).
-forall K, V.
-unsafe fn slot_ptr(base: *(*Entry[K, V]), i: usize) -> *(*Entry[K, V]) {
-    let addr = unsafe (base as usize);
-    let off = i * sizeof[*Entry[K, V]]();
-    let addr2 = addr + off;
-    unsafe (addr2 as *(*Entry[K, V]))
-}
-
-forall K, V.
-unsafe fn alloc_buckets(n: usize) -> *(*Entry[K, V]) {
-    let bytes = checked_mul(n, sizeof[*Entry[K, V]]());
-    let u = HeapAllocator::alloc(bytes);
-    let raw = u.into_raw();
-    let base = unsafe (raw as *(*Entry[K, V]));
-    var i = 0usize;
-    while i < n {
-        let s = unsafe slot_ptr[K, V](base, i);
-        unsafe *s = unsafe null_entry[K, V]();
-        i = i + 1usize;
-    }
-    base
-}
-
-// Bump-allocates one T in the arena, writes `val` there, and returns the
-// raw pointer. Never freed individually; reclaimed with the arena. The
-// `Ref[T,'k]` from `Arena::alloc` is flattened to its pointer so later
-// reads need not thread the `Exclusive!` (see the header for the cost).
-forall T, 'k.
-unsafe fn arena_alloc_one(&tag: Exclusive!['k], &arena: Arena!['k], val: T) -> *T {
-    let r = &arena.alloc(&tag, val);
-    let (p, m) = r.into_parts();
-    p
-}
-
-// Walks a chain comparing keys with `Eq`, returning the pointer to the
-// matching entry's arena-allocated value (or `Missing`); `get_ref` wraps
-// it as a `Ref[V,'k]`. A plain loop, not recursion: nothing here
-// allocates or moves a value out of storage across iterations (`Entry`
-// and `*K` are Copy; each key read out is written back).
-forall K, V where Eq[K, K].
-unsafe fn get_chain(head: *Entry[K, V], key_ptr: *K) -> Found[*V] {
-    var cur = head;
-    var found: Found[*V] = Found::Missing;
-    while unsafe (cur as usize) != 0usize {
-        let e = unsafe *cur;
-        let { key: k, val: vp, next: nx } = e;
-        let k_val = unsafe *k;
-        let key_val = unsafe *key_ptr;
-        let (k_val2, key_val2, is_match) = Eq[K, K]::eq(k_val, key_val);
-        unsafe *k = k_val2;
-        unsafe *key_ptr = key_val2;
-        cur = if is_match {
-            found = Found::Item.(vp);
-            unsafe null_entry[K, V]()
-        } else {
-            nx
-        };
-    }
-    found
-}
-
-// Inserts or updates in one bucket's chain, recursively, for the same
-// reason as `alloc::collections::hashmap`'s `insert_chain`: which node
-// consumes `val`, and whether a permanent key copy is arena-allocated at
-// all, depends on a runtime comparison the checker cannot resolve across
-// a loop's back edge. `key_slot` is the caller's `alloca` slot; the owned
-// key is moved out of it into the arena only on the new-key path, and
-// otherwise only compared through it.
-forall K, V, 'k where Eq[K, K].
-unsafe fn insert_chain(
-    head: *Entry[K, V],
-    tag: Exclusive!['k],
-    arena: Arena!['k],
-    key_slot: *K,
-    val: V,
-) -> (Exclusive!['k], Arena!['k], *Entry[K, V], Found[V], bool) {
-    let is_null = unsafe is_null_entry[K, V](head);
-    let result: (Exclusive!['k], Arena!['k], *Entry[K, V], Found[V], bool) = if is_null {
-        let k2 = unsafe *key_slot;
-        let key_ptr = unsafe arena_alloc_one[K, 'k](&tag, &arena, k2);
-        let vp = unsafe arena_alloc_one[V, 'k](&tag, &arena, val);
-        let entry_val = Entry.{ key: key_ptr, val: vp, next: head };
-        let new_entry = unsafe arena_alloc_one[Entry[K, V], 'k](&tag, &arena, entry_val);
-        (tag, arena, new_entry, Found::Missing, true)
-    } else {
-        let e = unsafe *head;
-        let { key: k, val: vp, next: nx } = e;
-        let k_val = unsafe *k;
-        let key_val = unsafe *key_slot;
-        let (k_val2, key_val2, is_match) = Eq[K, K]::eq(k_val, key_val);
-        unsafe *k = k_val2;
-        unsafe *key_slot = key_val2;
-        let result2: (Exclusive!['k], Arena!['k], *Entry[K, V], Found[V], bool) = if is_match {
-            let old_v = unsafe *vp;
-            unsafe *vp = val;
-            (tag, arena, head, Found::Item.(old_v), false)
-        } else {
-            let (tag, arena, new_next, found, is_new) = unsafe insert_chain[K, V, 'k](nx, tag, arena, key_slot, val);
-            let updated = Entry.{ key: k, val: vp, next: new_next };
-            unsafe *head = updated;
-            (tag, arena, head, found, is_new)
-        };
-        result2
-    };
-    result
-}
-
-// Relinks one old bucket's chain into the new, larger bucket array. Node
-// addresses are untouched; only each node's `next` changes, so a
-// `Ref[V,'k]` into a node's arena-allocated value stays valid across the
-// resize. Nothing is allocated here.
-forall K, V where Hash[K].
-unsafe fn rehash_bucket(head: *Entry[K, V], new_base: *(*Entry[K, V]), new_bc: usize) -> () {
-    var cur = head;
-    while unsafe (cur as usize) != 0usize {
-        let e = unsafe *cur;
-        let { key: k, val: vp, next: nx } = e;
-        let key_val = unsafe *k;
-        let (key_val2, state) = key_val.hash(HashState::new());
-        unsafe *k = key_val2;
-        let h = state.finish();
-        let idx = (h as usize) % new_bc;
-        let slot = unsafe slot_ptr[K, V](new_base, idx);
-        let old_head = unsafe *slot;
-        let updated = Entry.{ key: k, val: vp, next: old_head };
-        unsafe *cur = updated;
-        unsafe *slot = cur;
-        cur = nx;
+forall 'k, C, R where Access[C -> 'k, R].
+fn slot_at(&cx: C, slots: Slice[usize, 'k], i: usize) -> usize {
+    match slots.get_ref(&cx, i) {
+        Option::Some(at) => at.copy(&cx),
+        Option::None => out_of_range(),
     }
 }
 
-// Doubles the bucket count, rehashes every entry into a new array, then
-// frees the old array. Sound because nothing freed here is anything a
-// `Ref[V,'k]` points into: `rehash_bucket` reuses every `Entry` at its
-// address (only `next` changes), and every entry, key and value lives in
-// the arena, never in this array. The old array holds only head pointers
-// into those chains, and no `Ref` this module hands out points into it.
-// Nothing can still be traversing the old array: `ArenaMap!` is linear
-// and threaded through every operation, so no caller holds a stale copy
-// from before the resize.
-forall K, V where Hash[K].
-unsafe fn resize(base: *(*Entry[K, V]), old_bc: usize) -> (*(*Entry[K, V]), usize) {
-    let new_bc = checked_mul(old_bc, 2usize);
-    let new_base = unsafe alloc_buckets[K, V](new_bc);
-    var i = 0usize;
-    while i < old_bc {
-        let s = unsafe slot_ptr[K, V](base, i);
-        let head = unsafe *s;
-        let u = unsafe rehash_bucket[K, V](head, new_base, new_bc);
-        i = i + 1usize;
-    }
-    let old_raw = unsafe (base as *u8);
-    let u2 = HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(old_raw));
-    (new_base, new_bc)
-}
-
-// ------------------------------------------------- context-parameterized --
-// For a `K` whose hashing and equality need a live capability that a
-// `Hash[K]`/`Eq[K, K]` bound cannot state, e.g. a key containing `Ref`s
-// that must be read through the domain's `Exclusive!['k]`. The same
-// `get_chain`/`insert_chain`/`rehash_bucket`/`resize` shape, generic over
-// `K`/`V`, with `hash_fn`/`eq_fn` function values in place of `.hash()`/
-// `.eq()`, each threading the `Exclusive!['k]` in and back out.
-//
-// The helpers take `key_ptr: *K`, not `key: K`: a generic `K` is not
-// provably Copy, so a search key read once per chain node is staged in
-// `unsafe alloca[K]()` (in `get_ref_with`, `insert_with` and
-// `get_copy_with`) and read through a raw pointer at each level, rather
-// than passed as a value a recursive call could consume only once.
-//
-// They are `unsafe fn` because they take raw `*Entry[K,V]` and
-// `*(*Entry[K,V])` pointers: `head`, `base` and `new_base` must be live
-// allocations of the shape `alloc_buckets`/`resize_with` produce.
-forall K, V, 'k.
-unsafe fn get_chain_with(
-    tag: Exclusive!['k],
-    head: *Entry[K, V],
-    key_ptr: *K,
-    eq_fn: fn(Exclusive!['k], K, K) -> (Exclusive!['k], bool),
-) -> (Exclusive!['k], Found[*V]) {
-    let is_null = unsafe is_null_entry[K, V](head);
-    if is_null {
-        (tag, Found::Missing)
-    } else {
-        let e = unsafe *head;
-        let { key: k, val: vp, next: nx } = e;
-        let kv = unsafe *k;
-        let key_val = unsafe *key_ptr;
-        let (tag, is_match) = eq_fn(tag, kv, key_val);
-        if is_match {
-            (tag, Found::Item.(vp))
-        } else {
-            unsafe get_chain_with(tag, nx, key_ptr, eq_fn)
-        }
+forall 'k, C, R where Access[C -> 'k, R].
+fn set_slot(&cx: C, slots: Slice[usize, 'k], i: usize, value: usize) {
+    match slots.get_ref(&cx, i) {
+        Option::Some(at) => at.set(&cx, value),
+        Option::None => out_of_range(),
     }
 }
 
-forall K, V, 'k.
-unsafe fn insert_chain_with(
-    head: *Entry[K, V],
-    tag: Exclusive!['k],
-    arena: Arena!['k],
-    key_slot: *K,
-    val: V,
-    eq_fn: fn(Exclusive!['k], K, K) -> (Exclusive!['k], bool),
-) -> (Exclusive!['k], Arena!['k], *Entry[K, V], Found[V], bool) {
-    let is_null = unsafe is_null_entry[K, V](head);
-    if is_null {
-        let k2 = unsafe *key_slot;
-        let key_ptr = unsafe arena_alloc_one[K, 'k](&tag, &arena, k2);
-        let vp = unsafe arena_alloc_one[V, 'k](&tag, &arena, val);
-        let entry_val = Entry.{ key: key_ptr, val: vp, next: head };
-        let new_entry = unsafe arena_alloc_one[Entry[K, V], 'k](&tag, &arena, entry_val);
-        (tag, arena, new_entry, Found::Missing, true)
-    } else {
-        let e = unsafe *head;
-        let { key: k, val: vp, next: nx } = e;
-        let kv = unsafe *k;
-        let key_val = unsafe *key_slot;
-        let (tag, is_match) = eq_fn(tag, kv, key_val);
-        if is_match {
-            let old_v = unsafe *vp;
-            unsafe *vp = val;
-            (tag, arena, head, Found::Item.(old_v), false)
-        } else {
-            let (tag, arena, new_next, found, is_new) = unsafe insert_chain_with(nx, tag, arena, key_slot, val, eq_fn);
-            let updated = Entry.{ key: k, val: vp, next: new_next };
-            unsafe *head = updated;
-            (tag, arena, head, found, is_new)
-        }
-    }
-}
-
-forall K, V, 'k.
-unsafe fn rehash_bucket_with(
-    tag: Exclusive!['k],
-    head: *Entry[K, V],
-    new_base: *(*Entry[K, V]),
-    new_bc: usize,
-    hash_fn: fn(Exclusive!['k], K) -> (Exclusive!['k], u64),
-) -> Exclusive!['k] {
-    let is_null = unsafe is_null_entry[K, V](head);
-    if is_null {
-        tag
-    } else {
-        let e = unsafe *head;
-        let { key: k, val: vp, next: nx } = e;
-        let kv = unsafe *k;
-        let (tag, h) = hash_fn(tag, kv);
-        let idx = (h as usize) % new_bc;
-        let slot = unsafe slot_ptr[K, V](new_base, idx);
-        let old_head = unsafe *slot;
-        let updated = Entry.{ key: k, val: vp, next: old_head };
-        unsafe *head = updated;
-        unsafe *slot = head;
-        unsafe rehash_bucket_with(tag, nx, new_base, new_bc, hash_fn)
-    }
-}
-
-forall K, V, 'k.
-unsafe fn resize_go_with(
-    tag: Exclusive!['k],
-    base: *(*Entry[K, V]),
-    new_base: *(*Entry[K, V]),
-    new_bc: usize,
-    i: usize,
-    old_bc: usize,
-    hash_fn: fn(Exclusive!['k], K) -> (Exclusive!['k], u64),
-) -> Exclusive!['k] {
-    if i >= old_bc {
-        tag
-    } else {
-        let s = unsafe slot_ptr[K, V](base, i);
-        let head = unsafe *s;
-        let tag = unsafe rehash_bucket_with(tag, head, new_base, new_bc, hash_fn);
-        unsafe resize_go_with(tag, base, new_base, new_bc, i + 1usize, old_bc, hash_fn)
-    }
-}
-
-forall K, V, 'k.
-unsafe fn resize_with(
-    tag: Exclusive!['k],
-    base: *(*Entry[K, V]),
-    old_bc: usize,
-    hash_fn: fn(Exclusive!['k], K) -> (Exclusive!['k], u64),
-) -> (Exclusive!['k], *(*Entry[K, V]), usize) {
-    let new_bc = checked_mul(old_bc, 2usize);
-    let new_base = unsafe alloc_buckets[K, V](new_bc);
-    let tag = unsafe resize_go_with(tag, base, new_base, new_bc, 0usize, old_bc, hash_fn);
-    let old_raw = unsafe (base as *u8);
-    let u2 = HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(old_raw));
-    (tag, new_base, new_bc)
-}
-
-forall K, V.
-impl ArenaMap[K, V] {
-    forall 'k.
-    fn new(&tag: Exclusive!['k], &arena: Arena!['k]) -> ArenaMap![K, V, 'k] {
-        let initial_buckets = 8usize;
-        let base = unsafe alloc_buckets[K, V](initial_buckets);
-        let marker = &arena.marker();
-        ArenaMap.{ buckets: base, bucket_count: initial_buckets, len: 0usize, marker }
-    }
-
-    // Rebuilds a map from raw parts. Caller obligation: `buckets` is a live
-    // allocation of exactly `bucket_count` slots of `*Entry[K,V]`, each a
-    // chain head or the null sentinel (`null_entry`): either fresh from this
-    // module's `alloc_buckets`/`resize`, or the untouched result of exactly
-    // one earlier `into_parts` call on a genuine `ArenaMap!` with the same
-    // `marker`, consumed here once. `len` is the accurate count of entries
-    // reachable from `buckets`, and `marker` is the brand the parts were
-    // paired with. Not detected here: mixing parts from two maps (even two
-    // genuine ones), or passing the same parts to two `adopt_parts` calls.
-    // The tuple `into_parts` returns is `Copy`, so either would yield two
-    // `ArenaMap!` values that both believe they own one bucket array.
-    forall 'k.
-    unsafe fn adopt_parts(buckets: *(*Entry[K, V]), bucket_count: usize, len: usize, marker: Brand['k]) -> ArenaMap![K, V, 'k] {
-        ArenaMap.{ buckets: buckets, bucket_count: bucket_count, len: len, marker: marker }
-    }
-}
-
-forall K, V, 'k.
+forall K, V, 'k where Copy[K], Copy[V].
 impl ArenaMap[K, V, 'k] {
-    // `ArenaMap!` is linear, so even a read-only query hands `self` back. No
-    // `Exclusive!['k]` is needed to answer it.
-    fn len(&self) -> usize {
-        let { buckets: b, bucket_count: bc, len: n, marker: m } = self;
-        self = ArenaMap.{ buckets: b, bucket_count: bc, len: n, marker: m };
-        n
+    forall C, R where Allocate[C -> 'k, R].
+    fn new(&cx: C) -> ArenaMap[K, V, 'k] {
+        let state = MapState.{ slots: Option::None, entries: ArenaVec::new(&cx), count: 0usize };
+        ArenaMap.{ state: Ref::new(&cx, state) }
     }
 
-    // Consumes the map and hands back its raw parts. Safe: it grants no
-    // dereference, ownership or reconstruction authority by itself, since
-    // `ArenaMap!` is not `exposed` and only `adopt_parts` (`unsafe fn`) can
-    // rebuild one. For callers that hash and compare keys themselves and so
-    // cannot use `get_ref`/`insert`/`get_copy`.
-    fn into_parts(self) -> (*(*Entry[K, V]), usize, usize, Brand['k]) {
-        let { buckets: b, bucket_count: bc, len: n, marker: m } = self;
-        (b, bc, n, m)
+    // How many keys are in the map.
+    forall C, R where Access[C -> 'k, R].
+    fn len(self, &cx: C) -> usize {
+        self.state.copy(&cx).count
     }
 
-    // Frees the bucket array, the only part of the map not in the arena.
-    // Entries, keys and values are reclaimed when the arena is destroyed.
-    fn destroy(self) -> () {
-        let { buckets: base, bucket_count: bc, len: n, marker: m } = self;
-        let raw = unsafe (base as *u8);
-        HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(raw))
-    }
-}
-
-// `get_ref`/`insert` need `K` to hash and compare itself, so they get
-// their own impl block, as `get_copy` gets one for `Copy[V]`: a `where`
-// clause binds the whole `impl`, not one method.
-forall K, V, 'k where Hash[K], Eq[K, K].
-impl ArenaMap[K, V, 'k] {
-    // Read-only: `tag` is presented, never consumed. The returned
-    // `Ref[V,'k]`, if any, shares the arena's brand. The search key never
-    // touches the arena; `unsafe alloca[K]()` stages it for this call only.
-    fn get_ref(&self, &tag: Exclusive!['k], key: K) -> Found[Ref[V, 'k]] {
-        let { buckets: base, bucket_count: bc, len: n, marker: m } = self;
-        let key_slot = unsafe alloca[K]();
-        unsafe *key_slot = key;
-        let key_val = unsafe *key_slot;
-        let (key_val2, state) = key_val.hash(HashState::new());
-        unsafe *key_slot = key_val2;
-        let h = state.finish();
-        let idx = (h as usize) % bc;
-        let s = unsafe slot_ptr[K, V](base, idx);
-        let head = unsafe *s;
-        let found_vp = unsafe get_chain[K, V](head, key_slot);
-        let found_ref: Found[Ref[V, 'k]] = match found_vp {
-            // `vp` is a value slot inside this map's own bucket chains,
-            // which live in the domain `m` names.
-            Found::Item(vp) => Found::Item.(unsafe Ref::from_raw(vp, m)),
-            Found::Missing => Found::Missing,
-        };
-        self = ArenaMap.{ buckets: base, bucket_count: bc, len: n, marker: m };
-        found_ref
+    forall C, R where Access[C -> 'k, R].
+    fn is_empty(self, &cx: C) -> bool {
+        self.len(&cx) == 0usize
     }
 
-    // Keeps the arena's brand (there is no `remove` to invalidate it).
-    // Returns the previous value (`Found::Item`) if `key` already had one,
-    // so a linear `V` is never silently discarded.
-    fn insert(&self, &tag: Exclusive!['k], &arena: Arena!['k], key: K, val: V) -> Found[V] {
-        let { buckets: base, bucket_count: bc, len: n, marker: m } = self;
-        let key_slot = unsafe alloca[K]();
-        unsafe *key_slot = key;
-        let key_val = unsafe *key_slot;
-        let (key_val2, state) = key_val.hash(HashState::new());
-        unsafe *key_slot = key_val2;
-        let h = state.finish();
-        let idx = (h as usize) % bc;
-        let s = unsafe slot_ptr[K, V](base, idx);
-        let head = unsafe *s;
-        let (tag_back, arena_back, new_head, found, is_new) = unsafe insert_chain[K, V, 'k](head, tag, arena, key_slot, val);
-        arena = arena_back;
-        tag = tag_back;
-        unsafe *s = new_head;
-        let new_len = if is_new { n + 1usize } else { n };
-        let threshold = bc * 3usize / 4usize;
-        let should_resize = if is_new { new_len > threshold } else { false };
-        let final_state = if should_resize {
-            let (new_base, new_bc) = unsafe resize[K, V](base, bc);
-            ArenaMap.{ buckets: new_base, bucket_count: new_bc, len: new_len, marker: m }
-        } else {
-            ArenaMap.{ buckets: base, bucket_count: bc, len: new_len, marker: m }
-        };
-        self = final_state;
-        found
-    }
-}
-
-forall K, V, 'k where Hash[K], Eq[K, K], Copy[V].
-impl ArenaMap[K, V, 'k] {
-    // Like `get_ref`, but hands the found value back by copy (`Found[V]`)
-    // rather than as a `Ref[V,'k]`; bounded `V: Copy` so that copy is sound.
-    // Same lookup: hash, bucket, chain walk.
-    fn get_copy(&self, &tag: Exclusive!['k], key: K) -> Found[V] {
-        let { buckets: base, bucket_count: bc, len: n, marker: m } = self;
-        let key_slot = unsafe alloca[K]();
-        unsafe *key_slot = key;
-        let key_val = unsafe *key_slot;
-        let (key_val2, state) = key_val.hash(HashState::new());
-        unsafe *key_slot = key_val2;
-        let h = state.finish();
-        let idx = (h as usize) % bc;
-        let s = unsafe slot_ptr[K, V](base, idx);
-        let head = unsafe *s;
-        let found_vp = unsafe get_chain[K, V](head, key_slot);
-        let found: Found[V] = match found_vp {
-            Found::Item(vp) => Found::Item.(unsafe *vp),
-            Found::Missing => Found::Missing,
-        };
-        self = ArenaMap.{ buckets: base, bucket_count: bc, len: n, marker: m };
-        found
-    }
-}
-
-// The context-parameterized public API: `get_ref`/`insert`/`get_copy`
-// with `hash_fn`/`eq_fn` in place of `.hash()`/`.eq()`; see the section
-// comment above `get_chain_with`.
-forall K, V, 'k.
-impl ArenaMap[K, V, 'k] {
-    fn get_ref_with(
-        &self,
-        &tag: Exclusive!['k],
-        key: K,
-        hash_fn: fn(Exclusive!['k], K) -> (Exclusive!['k], u64),
-        eq_fn: fn(Exclusive!['k], K, K) -> (Exclusive!['k], bool),
-    ) -> Found[Ref[V, 'k]] {
-        let { buckets: base, bucket_count: bc, len: n, marker: m } = self;
-        let key_slot = unsafe alloca[K]();
-        unsafe *key_slot = key;
-        let key_val = unsafe *key_slot;
-        let (tag_back, h) = hash_fn(tag, key_val);
-        tag = tag_back;
-        let idx = (h as usize) % bc;
-        let s = unsafe slot_ptr[K, V](base, idx);
-        let head = unsafe *s;
-        let (tag_back, found_vp) = unsafe get_chain_with(tag, head, key_slot, eq_fn);
-        tag = tag_back;
-        let found_ref: Found[Ref[V, 'k]] = match found_vp {
-            // `vp` is a value slot inside this map's own bucket chains,
-            // which live in the domain `m` names.
-            Found::Item(vp) => Found::Item.(unsafe Ref::from_raw(vp, m)),
-            Found::Missing => Found::Missing,
-        };
-        self = ArenaMap.{ buckets: base, bucket_count: bc, len: n, marker: m };
-        found_ref
+    // The map's identity: equal for copies of one map, different for
+    // different maps.
+    fn address(self) -> usize {
+        self.state.address()
     }
 
-    // Keeps the arena's brand, as `insert` does.
-    fn insert_with(
-        &self,
-        &tag: Exclusive!['k],
-        &arena: Arena!['k],
-        key: K,
-        val: V,
-        hash_fn: fn(Exclusive!['k], K) -> (Exclusive!['k], u64),
-        eq_fn: fn(Exclusive!['k], K, K) -> (Exclusive!['k], bool),
-    ) -> Found[V] {
-        let { buckets: base, bucket_count: bc, len: n, marker: m } = self;
-        let key_slot = unsafe alloca[K]();
-        unsafe *key_slot = key;
-        let key_val = unsafe *key_slot;
-        let (tag_back, h) = hash_fn(tag, key_val);
-        tag = tag_back;
-        let idx = (h as usize) % bc;
-        let s = unsafe slot_ptr[K, V](base, idx);
-        let head = unsafe *s;
-        let (tag_back, arena_back, new_head, found, is_new) = unsafe insert_chain_with(head, tag, arena, key_slot, val, eq_fn);
-        arena = arena_back;
-        tag = tag_back;
-        unsafe *s = new_head;
-        let new_len = if is_new { n + 1usize } else { n };
-        let threshold = bc * 3usize / 4usize;
-        let should_resize = if is_new { new_len > threshold } else { false };
-        let final_state = if should_resize {
-            let (tag_back, new_base, new_bc) = unsafe resize_with(tag, base, bc, hash_fn);
-            tag = tag_back;
-            ArenaMap.{ buckets: new_base, bucket_count: new_bc, len: new_len, marker: m }
-        } else {
-            ArenaMap.{ buckets: base, bucket_count: bc, len: new_len, marker: m }
-        };
-        self = final_state;
-        found
-    }
-}
-
-// `get_copy_with` needs `Copy[V]` for the same reason as `get_copy`: it
-// reads the found value out by copy (`unsafe *vp`) rather than handing
-// back a `Ref`.
-forall K, V, 'k where Copy[V].
-impl ArenaMap[K, V, 'k] {
-    fn get_copy_with(
-        &self,
-        &tag: Exclusive!['k],
-        key: K,
-        hash_fn: fn(Exclusive!['k], K) -> (Exclusive!['k], u64),
-        eq_fn: fn(Exclusive!['k], K, K) -> (Exclusive!['k], bool),
-    ) -> Found[V] {
-        let { buckets: base, bucket_count: bc, len: n, marker: m } = self;
-        let key_slot = unsafe alloca[K]();
-        unsafe *key_slot = key;
-        let key_val = unsafe *key_slot;
-        let (tag_back, h) = hash_fn(tag, key_val);
-        tag = tag_back;
-        let idx = (h as usize) % bc;
-        let s = unsafe slot_ptr[K, V](base, idx);
-        let head = unsafe *s;
-        let (tag_back, found_vp) = unsafe get_chain_with(tag, head, key_slot, eq_fn);
-        tag = tag_back;
-        let found: Found[V] = match found_vp {
-            Found::Item(vp) => Found::Item.(unsafe *vp),
-            Found::Missing => Found::Missing,
-        };
-        self = ArenaMap.{ buckets: base, bucket_count: bc, len: n, marker: m };
-        found
+    // The number of positions `key_at` reads: one per key ever inserted,
+    // in insertion order. Reading positions `0..positions()` visits the
+    // keys as `keys` lists them; removing a key meanwhile only empties its
+    // position.
+    forall C, R where Access[C -> 'k, R].
+    fn positions(self, &cx: C) -> usize {
+        self.state.copy(&cx).entries.len(&cx)
     }
 
-    // The value under `key`, or `default` when there is none.
-    fn get_or_with(
-        &self,
-        &tag: Exclusive!['k],
-        key: K,
-        default: V,
-        hash_fn: fn(Exclusive!['k], K) -> (Exclusive!['k], u64),
-        eq_fn: fn(Exclusive!['k], K, K) -> (Exclusive!['k], bool),
-    ) -> V {
-        let found = &self.get_copy_with(&tag, key, hash_fn, eq_fn);
-        match found {
-            Found::Item(value) => value,
-            Found::Missing => default,
+    // The key at a position, unless it was removed.
+    forall C, R where Access[C -> 'k, R].
+    fn key_at(self, &cx: C, i: usize) -> Option[K] {
+        let e = self.state.copy(&cx).entries.at(&cx, i);
+        if e.live { Option::Some.(e.key) } else { Option::None }
+    }
+
+    // ------------------------------------------------------ combinators --
+    // As `ArenaVec`'s: each lends its closure the context, and visits the
+    // live entries in insertion order; searches stop at the first entry
+    // that decides them.
+
+    // `f` on each key and its value, for what it does through the context.
+    forall Env, C, R where Access[C -> 'k, R], Copy[Env].
+    fn each(self, &cx: C, f: closure[Env](&_: C, K, V) -> ()) {
+        let entries = self.state.copy(&cx).entries;
+        var i = 0usize;
+        while i < entries.len(&cx) {
+            let e = entries.at(&cx, i);
+            if e.live {
+                f(&cx, e.key, e.value);
+            }
+            i = i + 1usize;
         }
     }
 
-    // Whether there is a value under `key`.
-    fn has_with(
-        &self,
-        &tag: Exclusive!['k],
-        key: K,
-        hash_fn: fn(Exclusive!['k], K) -> (Exclusive!['k], u64),
-        eq_fn: fn(Exclusive!['k], K, K) -> (Exclusive!['k], bool),
-    ) -> bool {
-        let found = &self.get_copy_with(&tag, key, hash_fn, eq_fn);
-        match found {
-            Found::Item(_) => true,
-            Found::Missing => false,
+    // Whether `f` holds for some key and its value.
+    forall Env, C, R where Access[C -> 'k, R], Copy[Env].
+    fn any(self, &cx: C, f: closure[Env](&_: C, K, V) -> bool) -> bool {
+        let entries = self.state.copy(&cx).entries;
+        var found = false;
+        var i = 0usize;
+        while !found && i < entries.len(&cx) {
+            let e = entries.at(&cx, i);
+            found = e.live && f(&cx, e.key, e.value);
+            i = i + 1usize;
         }
+        found
+    }
+
+    // Whether `f` holds for every key and its value.
+    forall Env, C, R where Access[C -> 'k, R], Copy[Env].
+    fn all(self, &cx: C, f: closure[Env](&_: C, K, V) -> bool) -> bool {
+        !self.any(&cx, |&c, k, v| !f(&c, k, v))
+    }
+
+    // The live keys, in insertion order, in a new vec.
+    forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q].
+    fn keys(self, &cx: C) -> ArenaVec[K, 'k] {
+        let entries = self.state.copy(&cx).entries;
+        let out: ArenaVec[K, 'k] = ArenaVec::new(&cx);
+        var i = 0usize;
+        while i < entries.len(&cx) {
+            let e = entries.at(&cx, i);
+            if e.live {
+                out.push(&cx, e.key);
+            }
+            i = i + 1usize;
+        }
+        out
+    }
+
+    // The values, in their keys' insertion order, in a new vec.
+    forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q].
+    fn values(self, &cx: C) -> ArenaVec[V, 'k] {
+        let entries = self.state.copy(&cx).entries;
+        let out: ArenaVec[V, 'k] = ArenaVec::new(&cx);
+        var i = 0usize;
+        while i < entries.len(&cx) {
+            let e = entries.at(&cx, i);
+            if e.live {
+                out.push(&cx, e.value);
+            }
+            i = i + 1usize;
+        }
+        out
     }
 }
 
-// A read-only snapshot of a finished map. `freeze` consumes the linear
-// `ArenaMap!`, so nothing can insert into (or resize) the bucket array
-// afterwards, and the snapshot is Copy: it can live inside other Copy
-// structures, such as an index over an immutable declaration list. Not
-// `exposed`, for the same reason as `ArenaMap!`: its parts cannot be
-// forged outside this module. Freezing moves the bucket array into the
-// arena, so a snapshot lives exactly as long as the arena holding its
-// entries and is reclaimed with it. Reads present the arena's
-// `Exclusive!['k]` tag exactly as `Ref::copy` does.
-forall K, V, 'k.
-struct FrozenMap {
-    buckets: *(*Entry[K, V]),
-    bucket_count: usize,
-    len: usize,
-    marker: Brand['k],
-}
-
-forall K, V, 'k.
+forall K, V, 'k where Copy[K], Copy[V].
 impl ArenaMap[K, V, 'k] {
-    fn freeze(self, &arena: Arena!['k]) -> FrozenMap[K, V, 'k] {
-        let { buckets: b, bucket_count: bc, len: n, marker: m } = self;
-        let slot = sizeof[*Entry[K, V]]();
-        let bytes = checked_mul(bc, slot);
-        // Bump allocation is byte-granular: over-allocate one slot and round
-        // the start up so the pointer array is aligned.
-        let raw = unsafe &arena.alloc_bytes(bytes + slot);
-        let addr = unsafe (raw as usize);
-        let aligned = addr + ((slot - (addr % slot)) % slot);
-        let dest = unsafe (aligned as *u8);
-        let u = unsafe copy_bytes(dest, unsafe (b as *u8), bytes);
-        let old_raw = unsafe (b as *u8);
-        let u2 = HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(old_raw));
-        FrozenMap.{ buckets: unsafe (dest as *(*Entry[K, V])), bucket_count: bc, len: n, marker: m }
+    // The slot holding `key`, or the empty slot where it would go, and what
+    // that slot holds.
+    forall C, R where Access[C -> 'k, R], HashIn[K, C].
+    fn slot(self, &cx: C, slots: Slice[usize, 'k], entries: ArenaVec[Entry[K, V], 'k], key: K) -> (usize, usize) {
+        let mask = slots.len() - 1usize;
+        var i = slot_hash(&cx, key) & mask;
+        var entry = slot_at(&cx, slots, i);
+        while entry != 0usize && !HashIn[K, C]::eq_in(&cx, entries.at(&cx, entry - 1usize).key, key) {
+            i = (i + 1usize) & mask;
+            entry = slot_at(&cx, slots, i);
+        }
+        (i, entry)
     }
-}
 
-forall K, V, 'k where Hash[K], Eq[K, K], Copy[V].
-impl FrozenMap[K, V, 'k] {
-    fn get_copy(self, &tag: Exclusive!['k], key: K) -> Found[V] {
-        let { buckets: base, bucket_count: bc, len: n, marker: m } = self;
-        let key_slot = unsafe alloca[K]();
-        unsafe *key_slot = key;
-        let key_val = unsafe *key_slot;
-        let (key_val2, state) = key_val.hash(HashState::new());
-        unsafe *key_slot = key_val2;
-        let h = state.finish();
-        let idx = (h as usize) % bc;
-        let s = unsafe slot_ptr[K, V](base, idx);
-        let head = unsafe *s;
-        let found_vp = unsafe get_chain[K, V](head, key_slot);
-        let found: Found[V] = match found_vp {
-            Found::Item(vp) => Found::Item.(unsafe *vp),
-            Found::Missing => Found::Missing,
+    // The position of a live key.
+    forall C, R where Access[C -> 'k, R], HashIn[K, C].
+    fn index(self, &cx: C, key: K) -> Option[usize] {
+        let h = self.state.copy(&cx);
+        let slots = match h.slots {
+            Option::Some(s) => s,
+            Option::None => return Option::None,
         };
-        found
-    }
-}
-
-// `get_copy` for keys whose hash and equality read through the arena's
-// capability (e.g. `core::raw::Span`), mirroring `ArenaMap::get_copy_with`.
-// The snapshot must have been built with the same `hash_fn`.
-forall K, V, 'k where Copy[V].
-impl FrozenMap[K, V, 'k] {
-    fn get_copy_with(
-        self,
-        &tag: Exclusive!['k],
-        key: K,
-        hash_fn: fn(Exclusive!['k], K) -> (Exclusive!['k], u64),
-        eq_fn: fn(Exclusive!['k], K, K) -> (Exclusive!['k], bool),
-    ) -> Found[V] {
-        let { buckets: base, bucket_count: bc, len: n, marker: m } = self;
-        let key_slot = unsafe alloca[K]();
-        unsafe *key_slot = key;
-        let key_val = unsafe *key_slot;
-        let (tag_back, h) = hash_fn(tag, key_val);
-        tag = tag_back;
-        let idx = (h as usize) % bc;
-        let s = unsafe slot_ptr[K, V](base, idx);
-        let head = unsafe *s;
-        let (tag_back, found_vp) = unsafe get_chain_with(tag, head, key_slot, eq_fn);
-        tag = tag_back;
-        let found: Found[V] = match found_vp {
-            Found::Item(vp) => Found::Item.(unsafe *vp),
-            Found::Missing => Found::Missing,
-        };
-        found
-    }
-    // The value under `key`, or `default` when there is none.
-    fn get_or_with(
-        self,
-        &tag: Exclusive!['k],
-        key: K,
-        default: V,
-        hash_fn: fn(Exclusive!['k], K) -> (Exclusive!['k], u64),
-        eq_fn: fn(Exclusive!['k], K, K) -> (Exclusive!['k], bool),
-    ) -> V {
-        match self.get_copy_with(&tag, key, hash_fn, eq_fn) {
-            Found::Item(value) => value,
-            Found::Missing => default,
+        let (slot, entry) = self.slot(&cx, slots, h.entries, key);
+        if entry == 0usize || !h.entries.at(&cx, entry - 1usize).live {
+            Option::None
+        } else {
+            Option::Some.(entry - 1usize)
         }
     }
 
-    // Whether there is a value under `key`.
-    fn has_with(
-        self,
-        &tag: Exclusive!['k],
-        key: K,
-        hash_fn: fn(Exclusive!['k], K) -> (Exclusive!['k], u64),
-        eq_fn: fn(Exclusive!['k], K, K) -> (Exclusive!['k], bool),
-    ) -> bool {
-        match self.get_copy_with(&tag, key, hash_fn, eq_fn) {
-            Found::Item(_) => true,
-            Found::Missing => false,
+    forall C, R where Access[C -> 'k, R], HashIn[K, C].
+    fn contains(self, &cx: C, key: K) -> bool {
+        self.index(&cx, key).is_some()
+    }
+
+    // The value of `key`, or `None` when it is not in the map.
+    forall C, R where Access[C -> 'k, R], HashIn[K, C].
+    fn get(self, &cx: C, key: K) -> Option[V] {
+        match self.index(&cx, key) {
+            Option::Some(i) => Option::Some.(self.state.copy(&cx).entries.at(&cx, i).value),
+            Option::None => Option::None,
         }
+    }
+
+    // The value of a key that must be in the map: without it, the process
+    // stops (`alloc::heap::out_of_range`).
+    forall C, R where Access[C -> 'k, R], HashIn[K, C].
+    fn at(self, &cx: C, key: K) -> V {
+        match self.get(&cx, key) {
+            Option::Some(v) => v,
+            Option::None => out_of_range(),
+        }
+    }
+
+    // The value of `key`, or `default` when it is not in the map.
+    forall C, R where Access[C -> 'k, R], HashIn[K, C].
+    fn get_or(self, &cx: C, key: K, default: V) -> V {
+        match self.get(&cx, key) {
+            Option::Some(v) => v,
+            Option::None => default,
+        }
+    }
+
+    // Maps `key` to `value`, handing back the value it replaces, if any. A
+    // new key goes at the end of the order, and so does a removed one
+    // coming back; a present one keeps its place.
+    forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], HashIn[K, C].
+    fn insert(self, &cx: C, key: K, value: V) -> Option[V] {
+        let h = self.state.copy(&cx);
+        let slots = match h.slots {
+            Option::Some(s) => s,
+            Option::None => {
+                let fresh = slice_of_zeros(&cx, 8usize);
+                self.state.set(&cx, MapState.{ slots: Option::Some.(fresh), entries: h.entries, count: h.count });
+                fresh
+            },
+        };
+        let (slot, entry) = self.slot(&cx, slots, h.entries, key);
+        if entry != 0usize && h.entries.at(&cx, entry - 1usize).live {
+            let old = h.entries.replace(&cx, entry - 1usize, Entry.{ key, value, live: true });
+            return Option::Some.(old.value);
+        }
+        set_slot(&cx, slots, slot, h.entries.len(&cx) + 1usize);
+        h.entries.push(&cx, Entry.{ key, value, live: true });
+        self.state.set(&cx, MapState.{ slots: Option::Some.(slots), entries: h.entries, count: h.count + 1usize });
+        if entry == 0usize && h.entries.len(&cx) * 2usize > slots.len() {
+            self.grow(&cx, slots.len() * 2usize);
+        }
+        Option::None
+    }
+
+    // Takes `key` out of the map, handing back its value, if it was there.
+    forall C, R where Access[C -> 'k, R], HashIn[K, C].
+    fn remove(self, &cx: C, key: K) -> Option[V] {
+        match self.index(&cx, key) {
+            Option::Some(i) => {
+                let h = self.state.copy(&cx);
+                let e = h.entries.at(&cx, i);
+                h.entries.set(&cx, i, Entry.{ key: e.key, value: e.value, live: false });
+                self.state.set(&cx, MapState.{ slots: h.slots, entries: h.entries, count: h.count - 1usize });
+                Option::Some.(e.value)
+            },
+            Option::None => Option::None,
+        }
+    }
+
+    // `slot_count` slots, every key placed again.
+    forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], HashIn[K, C].
+    fn grow(self, &cx: C, slot_count: usize) {
+        let h = self.state.copy(&cx);
+        let slots = slice_of_zeros(&cx, slot_count);
+        self.state.set(&cx, MapState.{ slots: Option::Some.(slots), entries: h.entries, count: h.count });
+        var k = 0usize;
+        while k < h.entries.len(&cx) {
+            let (slot, entry) = self.slot(&cx, slots, h.entries, h.entries.at(&cx, k).key);
+            set_slot(&cx, slots, slot, k + 1usize);
+            k = k + 1usize;
+        }
+    }
+
+    // The same live entries, in the same order, in a map of their own.
+    forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], HashIn[K, C].
+    fn clone(self, &cx: C) -> ArenaMap[K, V, 'k] {
+        let h = self.state.copy(&cx);
+        let m: ArenaMap[K, V, 'k] = ArenaMap::new(&cx);
+        if h.count == 0usize {
+            return m;
+        }
+        var slot_count = 8usize;
+        while h.count * 2usize > slot_count {
+            slot_count = slot_count * 2usize;
+        }
+        m.grow(&cx, slot_count);
+        var i = 0usize;
+        while i < h.entries.len(&cx) {
+            let e = h.entries.at(&cx, i);
+            if e.live {
+                let old = m.insert(&cx, e.key, e.value);
+            }
+            i = i + 1usize;
+        }
+        m
+    }
+}
+
+// `count` zeros in one block of the arena.
+forall 'k, C, R where Allocate[C -> 'k, R].
+fn slice_of_zeros(&cx: C, count: usize) -> Slice[usize, 'k] {
+    let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
+    let slots = &arena.alloc_slice(&tag, count, 0usize);
+    cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
+    slots
+}
+
+// A set, in insertion order: an `ArenaMap` whose values say nothing.
+forall K, 'k.
+struct ArenaSet {
+    map: ArenaMap[K, bool, 'k],
+}
+
+forall K, 'k where Copy[K].
+impl ArenaSet[K, 'k] {
+    forall C, R where Allocate[C -> 'k, R].
+    fn new(&cx: C) -> ArenaSet[K, 'k] {
+        ArenaSet.{ map: ArenaMap::new(&cx) }
+    }
+
+    forall C, R where Access[C -> 'k, R].
+    fn len(self, &cx: C) -> usize {
+        self.map.len(&cx)
+    }
+
+    forall C, R where Access[C -> 'k, R].
+    fn is_empty(self, &cx: C) -> bool {
+        self.map.is_empty(&cx)
+    }
+
+    fn address(self) -> usize {
+        self.map.address()
+    }
+
+    // As for `ArenaMap`: positions `0..positions()` hold the keys, or none
+    // where one was removed.
+    forall C, R where Access[C -> 'k, R].
+    fn positions(self, &cx: C) -> usize {
+        self.map.positions(&cx)
+    }
+
+    forall C, R where Access[C -> 'k, R].
+    fn key_at(self, &cx: C, i: usize) -> Option[K] {
+        self.map.key_at(&cx, i)
+    }
+
+    // The keys, in insertion order, in a new vec.
+    forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q].
+    fn keys(self, &cx: C) -> ArenaVec[K, 'k] {
+        self.map.keys(&cx)
+    }
+
+    // `f` on each key, in insertion order.
+    forall Env, C, R where Access[C -> 'k, R], Copy[Env].
+    fn each(self, &cx: C, f: closure[Env](&_: C, K) -> ()) {
+        self.map.each(&cx, |&c, k, v| f(&c, k));
+    }
+
+    // Whether `f` holds for some key.
+    forall Env, C, R where Access[C -> 'k, R], Copy[Env].
+    fn any(self, &cx: C, f: closure[Env](&_: C, K) -> bool) -> bool {
+        self.map.any(&cx, |&c, k, v| f(&c, k))
+    }
+
+    // Whether `f` holds for every key.
+    forall Env, C, R where Access[C -> 'k, R], Copy[Env].
+    fn all(self, &cx: C, f: closure[Env](&_: C, K) -> bool) -> bool {
+        self.map.all(&cx, |&c, k, v| f(&c, k))
+    }
+
+    forall C, R where Access[C -> 'k, R], HashIn[K, C].
+    fn contains(self, &cx: C, key: K) -> bool {
+        self.map.contains(&cx, key)
+    }
+
+    // Adds `key`; whether it was not there before.
+    forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], HashIn[K, C].
+    fn insert(self, &cx: C, key: K) -> bool {
+        self.map.insert(&cx, key, true).is_none()
+    }
+
+    // Takes `key` out; whether it was there.
+    forall C, R where Access[C -> 'k, R], HashIn[K, C].
+    fn remove(self, &cx: C, key: K) -> bool {
+        self.map.remove(&cx, key).is_some()
+    }
+
+    forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], HashIn[K, C].
+    fn clone(self, &cx: C) -> ArenaSet[K, 'k] {
+        ArenaSet.{ map: self.map.clone(&cx) }
     }
 }

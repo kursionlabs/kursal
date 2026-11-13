@@ -119,6 +119,7 @@ RUNS = {
     ),
     # Programs whose result is their exit status, or that print without input.
     "arena_text": (((), "", "the 2\ncat 1\nand 1\nhat 1\n", 3),),
+    "arena_tables": (((), "", "to 2\nbe 2\nor 1\nnot 1\nbe 2\nor 1\nnot 1\nto 7\n", 0),),
     "at_sugar": (((), "", "", 0),),
     "borrow_trait": (((), "", "", 0),),
     "box_store_liveness": (((), "", "", 2),),

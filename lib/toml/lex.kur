@@ -1,8 +1,7 @@
 // toml::lex -- the TOML lexical layer. Table construction is
 // `toml::document`'s; tokens alone do not establish valid TOML.
 
-use std::raw::span_byte_or_zero;
-use std::alloc::arena::{Arena, save_buffer};
+use std::alloc::arena::Domain;
 use std::utf8::decode;
 use std::bytes::buffer::Buffer;
 use std::collections::list::List;
@@ -83,7 +82,7 @@ unsafe fn toml_unicode_escape(&tag: Exclusive!['k], text: Span['k], start: usize
         var i = 0usize;
         var valid = true;
         while i < count {
-            let byte = span_byte_or_zero(&tag, text, start + i);
+            let byte = text.byte_or_zero(&tag, start + i);
             let digit = toml_hex(byte);
             let unit = match digit {
                 Result::Err(error) => {
@@ -135,14 +134,14 @@ unsafe fn toml_string(&tag: Exclusive!['k], text: Span['k], start: usize) -> Res
         let span_result = Result[(Buffer!, usize, bool), TomlError]::Err.(TomlError::Syntax.(start));
         return span_result;
     }
-    let quote = span_byte_or_zero(&tag, text, start);
+    let quote = text.byte_or_zero(&tag, start);
     if quote != b'"' && quote != b'\'' {
         let span_result = Result[(Buffer!, usize, bool), TomlError]::Err.(TomlError::Syntax.(start));
         return span_result;
     }
     let basic = quote == b'"';
     let multiline = if text.len() - start >= 3usize {
-        span_byte_or_zero(&tag, text, start + 1usize) == quote && span_byte_or_zero(&tag, text, start + 2usize) == quote
+        text.byte_or_zero(&tag, start + 1usize) == quote && text.byte_or_zero(&tag, start + 2usize) == quote
     } else {
         false
     };
@@ -154,12 +153,12 @@ unsafe fn toml_string(&tag: Exclusive!['k], text: Span['k], start: usize) -> Res
     var closed = false;
     // A single immediately following newline is trimmed in multiline strings.
     if multiline && i < text.len() {
-        let first = span_byte_or_zero(&tag, text, i);
+        let first = text.byte_or_zero(&tag, i);
         if first == b'\n' {
             i = i + 1usize;
         } else {
             if first == b'\r' && i + 1usize < text.len() {
-                if span_byte_or_zero(&tag, text, i + 1usize) == b'\n' {
+                if text.byte_or_zero(&tag, i + 1usize) == b'\n' {
                     i = i + 2usize;
                 }
                 let unit = ();
@@ -168,14 +167,14 @@ unsafe fn toml_string(&tag: Exclusive!['k], text: Span['k], start: usize) -> Res
         }
     }
     while i < text.len() && !failed && !closed {
-        let byte = span_byte_or_zero(&tag, text, i);
+        let byte = text.byte_or_zero(&tag, i);
         error_at = i;
         if byte == quote {
             var end = i;
-            var same = span_byte_or_zero(&tag, text, end) == quote;
+            var same = text.byte_or_zero(&tag, end) == quote;
             while end < text.len() && same {
                 end = end + 1usize;
-                same = span_byte_or_zero(&tag, text, end) == quote;
+                same = text.byte_or_zero(&tag, end) == quote;
             }
             let count = end - i;
             if !multiline {
@@ -209,7 +208,7 @@ unsafe fn toml_string(&tag: Exclusive!['k], text: Span['k], start: usize) -> Res
                 if i == text.len() {
                     failed = true;
                 } else {
-                    let escape = span_byte_or_zero(&tag, text, i);
+                    let escape = text.byte_or_zero(&tag, i);
                     if escape == b'u' || escape == b'U' {
                         let count = if escape == b'u' { 4usize } else { 8usize };
                         match unsafe toml_unicode_escape(&tag, text, i + 1usize, count) {
@@ -227,7 +226,7 @@ unsafe fn toml_string(&tag: Exclusive!['k], text: Span['k], start: usize) -> Res
                             var newline = false;
                             var trimming = true;
                             while trimming && i < text.len() && !failed {
-                                let space = span_byte_or_zero(&tag, text, i);
+                                let space = text.byte_or_zero(&tag, i);
                                 if space == b' ' || space == b'\t' {
                                     i = i + 1usize;
                                 } else {
@@ -237,7 +236,7 @@ unsafe fn toml_string(&tag: Exclusive!['k], text: Span['k], start: usize) -> Res
                                     } else {
                                         if space == b'\r' {
                                             let crlf = if i + 1usize < text.len() {
-                                                span_byte_or_zero(&tag, text, i + 1usize) == b'\n'
+                                                text.byte_or_zero(&tag, i + 1usize) == b'\n'
                                             } else {
                                                 false
                                             };
@@ -302,7 +301,7 @@ unsafe fn toml_string(&tag: Exclusive!['k], text: Span['k], start: usize) -> Res
                 } else {
                     if byte == b'\r' {
                         let crlf = if i + 1usize < text.len() {
-                            span_byte_or_zero(&tag, text, i + 1usize) == b'\n'
+                            text.byte_or_zero(&tag, i + 1usize) == b'\n'
                         } else {
                             false
                         };
@@ -389,7 +388,7 @@ unsafe fn toml_bare(&tag: Exclusive!['k], text: Span['k], start: usize) -> Resul
     var scanning = true;
     var valid = start < text.len();
     while end < text.len() && scanning && valid {
-        let byte = span_byte_or_zero(&tag, text, end);
+        let byte = text.byte_or_zero(&tag, end);
         if toml_boundary(byte) {
             scanning = false;
         } else {
@@ -412,15 +411,15 @@ unsafe fn toml_bare(&tag: Exclusive!['k], text: Span['k], start: usize) -> Resul
 // The owning input remains live throughout scanning; all token text is copied
 // into the supplied arena before the input is destroyed, including on error.
 forall 'k.
-fn tokenize(&tag: Exclusive!['k], &arena: Arena!['k], input: Buffer!) -> Result[List[TomlToken['k], 'k], TomlError] {
+fn tokenize(&cx: Domain!['k], input: Buffer!) -> Result[List[TomlToken['k], 'k], TomlError] {
     let p = unsafe &input.as_ptr();
     let n = &input.len();
-    let text = unsafe Span::from_raw_parts(&tag, p, n);
+    let text = unsafe Span::from_raw_parts(&cx.tag, p, n);
     var i = 0usize;
     var status = Result[(), TomlError]::Ok.(());
     var running = true;
     while i < n && running {
-        match toml_codepoint(&tag, text, i) {
+        match toml_codepoint(&cx.tag, text, i) {
             Result::Err(error) => {
                 status = Result[(), TomlError]::Err.(error);
                 running = false;
@@ -457,15 +456,15 @@ fn tokenize(&tag: Exclusive!['k], &arena: Arena!['k], input: Buffer!) -> Result[
                 }
             } else {
                 if byte == b'"' || byte == b'\'' {
-                    match unsafe toml_string(&tag, text, i) {
+                    match unsafe toml_string(&cx.tag, text, i) {
                         Result::Err(error) => {
                             status = Result[(), TomlError]::Err.(error);
                             running = false;
                         },
                         Result::Ok(decoded) => {
                             let (buffer, next, multiline) = decoded;
-                            let value = save_buffer(&arena, buffer);
-                            tokens = tokens.cons(&tag, &arena, TomlToken.{ kind: TomlTokenKind::Text.(value), offset, multiline });
+                            let value = buffer.save(&cx);
+                            tokens = tokens.cons(&cx, TomlToken.{ kind: TomlTokenKind::Text.(value), offset, multiline });
                             i = next;
                         },
                     }
@@ -494,11 +493,11 @@ fn tokenize(&tag: Exclusive!['k], &arena: Arena!['k], input: Buffer!) -> Result[
                                         Result::Err.(TomlError::Syntax.(i))
                                     }
                                 } else {
-                                    match unsafe toml_bare(&tag, text, i) {
+                                    match unsafe toml_bare(&cx.tag, text, i) {
                                         Result::Err(error) => Result::Err.(error),
                                         Result::Ok(decoded) => {
                                             let (buffer, next) = decoded;
-                                            let value = save_buffer(&arena, buffer);
+                                            let value = buffer.save(&cx);
                                             i = next;
                                             Result::Ok.(TomlTokenKind::Bare.(value))
                                         },
@@ -513,7 +512,7 @@ fn tokenize(&tag: Exclusive!['k], &arena: Arena!['k], input: Buffer!) -> Result[
                             running = false;
                         },
                         Result::Ok(value) => {
-                            tokens = tokens.cons(&tag, &arena, TomlToken.{ kind: value, offset, multiline: false });
+                            tokens = tokens.cons(&cx, TomlToken.{ kind: value, offset, multiline: false });
                         },
                     }
                 }
@@ -524,7 +523,7 @@ fn tokenize(&tag: Exclusive!['k], &arena: Arena!['k], input: Buffer!) -> Result[
     match status {
         Result::Err(error) => Result::Err.(error),
         Result::Ok(unit) => {
-            let ordered = tokens.reverse(&tag, &arena, List::Empty);
+            let ordered = tokens.reverse(&cx, List::Empty);
             Result::Ok.(ordered)
         },
     }

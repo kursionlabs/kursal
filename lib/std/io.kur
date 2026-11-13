@@ -14,7 +14,7 @@ use core::fmt::Writable;
 use core::option::Result;
 use core::cstr::CStr;
 use alloc::arena::ArenaByteWriter;
-use core::cap::Exclusive;
+use core::cap::{Access, Exclusive};
 
 extern "C" fn read(fd: i32, buf: *u8, count: usize) -> isize;
 extern "C" fn write(fd: i32, buf: *u8, count: usize) -> isize;
@@ -52,12 +52,14 @@ unsafe fn write_all_from(fd: i32, ptr: *u8, len: usize, offset: usize) -> Result
     }
 }
 
-// Writes a span's bytes, reading them under the domain's capability, and
-// returns how many there were.
-forall 'k.
-fn write_span(fd: i32, &cap: Exclusive!['k], sp: Span['k]) -> usize {
+// Writes a span's bytes, reading them under the domain's capability, which
+// `cx` lends, and returns how many there were.
+forall 'k, C, R where Access[C -> 'k, R].
+fn write_span(fd: i32, &cx: C, sp: Span['k]) -> usize {
+    let (tag, rest) = Access[C -> 'k, R]::open(cx);
     let (p, n) = sp.into_parts();
     let u = unsafe write_all(fd, p, n);
+    cx = Access[C -> 'k, R]::close(tag, rest);
     n
 }
 
@@ -348,13 +350,16 @@ impl File {
         (tag, result)
     }
 
-    // Writes all of a span's bytes, read under its domain's capability.
-    forall 'k.
-    fn write_span(&self, &cap: Exclusive!['k], bytes: Span['k]) -> Result[(), i32] {
+    // Writes all of a span's bytes, read under its domain's capability,
+    // which `cx` lends.
+    forall 'k, C, R where Access[C -> 'k, R].
+    fn write_span(&self, &cx: C, bytes: Span['k]) -> Result[(), i32] {
+        let (tag, rest) = Access[C -> 'k, R]::open(cx);
         let { fd } = self;
         let (ptr, len) = bytes.into_parts();
         let result = unsafe write_all(fd, ptr, len);
         self = File.{ fd };
+        cx = Access[C -> 'k, R]::close(tag, rest);
         result
     }
 

@@ -1,11 +1,19 @@
 // Arena-backed singly linked list. Nodes live until the arena is
 // destroyed; list handles are Copy when their fields are Copy.
+//
+// A list is persistent: `cons` shares the tail it is given, so extending a
+// list never changes it, and a scope that adds bindings for a while and
+// then goes back to the list it started from needs nothing undone.
+//
+// Every method that reads cells takes the context that lends the domain's
+// capability by place (`&cx`, `core::cap::Access`), and one that makes
+// cells takes one that lends the arena too (`alloc::arena::Allocate`).
 
 use package as alloc;
 
-use core::cap::Exclusive;
+use core::cap::{Access, Exclusive};
 use core::mem::Ref;
-use alloc::arena::Arena;
+use alloc::arena::Allocate;
 use core::option::{Option, Result};
 use core::iter::Iterator;
 
@@ -25,9 +33,9 @@ forall T, 'k.
 impl List[T, 'k] {
     // Prepends `head`. The cell is arena-allocated, so it needs no free
     // of its own; the whole arena is freed as a unit.
-    fn cons(self, &tag: Exclusive!['k], &arena: Arena!['k], head: T) -> List[T, 'k] {
-        let r = &arena.alloc(&tag, Cons.{ head, tail: self });
-        List::Cell.(r)
+    forall C, R where Allocate[C -> 'k, R].
+    fn cons(self, &cx: C, head: T) -> List[T, 'k] {
+        List::Cell.(Ref::new(&cx, Cons.{ head, tail: self }))
     }
 
     fn is_empty(self) -> bool {
@@ -42,527 +50,316 @@ impl List[T, 'k] {
 // `Cons[T, 'k]` out, head included, even to look only at its tail.
 forall T, 'k where Copy[T].
 impl List[T, 'k] {
-    fn len(self, &tag: Exclusive!['k]) -> usize {
-        var current = self;
+    // The first element, leaving the rest in `self`: a loop over a list
+    // whose body needs the context.
+    forall C, R where Access[C -> 'k, R].
+    fn pop(&self, &cx: C) -> Option[T] {
+        match self {
+            List::Empty => Option::None,
+            List::Cell(r) => {
+                let cell = r.copy(&cx);
+                self = cell.tail;
+                Option::Some.(cell.head)
+            },
+        }
+    }
+
+    forall C, R where Access[C -> 'k, R].
+    fn len(self, &cx: C) -> usize {
+        var rest = self;
         var count = 0usize;
-        var scanning = true;
-        while scanning {
-            match current {
-                List::Empty => {
-                    scanning = false;
-                },
-                List::Cell(r) => {
-                    let cell = r.copy(&tag);
-                    current = cell.tail;
-                    count = count + 1usize;
-                },
-            }
+        while !rest.is_empty() {
+            rest = rest.tail(&cx);
+            count = count + 1usize;
         }
         count
     }
 
-    fn append(self, &tag: Exclusive!['k], &arena: Arena!['k], other: List[T, 'k]) -> List[T, 'k] {
+    forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q].
+    fn append(self, &cx: C, other: List[T, 'k]) -> List[T, 'k] {
         match self {
             List::Empty => other,
             List::Cell(r) => {
-                let cell = r.copy(&tag);
-                let rest = cell.tail.append(&tag, &arena, other);
-                let r2 = &arena.alloc(&tag, Cons.{ head: cell.head, tail: rest });
-                List::Cell.(r2)
+                let cell = r.copy(&cx);
+                cell.tail.append(&cx, other).cons(&cx, cell.head)
             },
         }
     }
 
     // Reverses `self` onto the front of `acc`; a nonempty `acc` merges
     // the list onto a running result.
-    fn reverse(self, &tag: Exclusive!['k], &arena: Arena!['k], acc: List[T, 'k]) -> List[T, 'k] {
-        match self {
-            List::Empty => acc,
-            List::Cell(r) => {
-                let cell = r.copy(&tag);
-                let acc_r = &arena.alloc(&tag, Cons.{ head: cell.head, tail: acc });
-                cell.tail.reverse(&tag, &arena, List::Cell.(acc_r))
-            },
+    forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q].
+    fn reverse(self, &cx: C, acc: List[T, 'k]) -> List[T, 'k] {
+        var rest = self;
+        var out = acc;
+        var going = true;
+        while going {
+            let next = &rest.pop(&cx);
+            match next {
+                Option::Some(x) => {
+                    out = out.cons(&cx, x);
+                },
+                Option::None => {
+                    going = false;
+                },
+            }
         }
+        out
     }
 
     // The element at `index`, counting from 0, if the list is that long.
-    fn nth(self, &tag: Exclusive!['k], index: usize) -> Option[T] {
-        match self {
-            List::Empty => Option::None,
-            List::Cell(r) => {
-                let cell = r.copy(&tag);
-                if index == 0usize {
-                    Option::Some.(cell.head)
-                } else {
-                    cell.tail.nth(&tag, index - 1usize)
-                }
-            },
-        }
+    forall C, R where Access[C -> 'k, R].
+    fn nth(self, &cx: C, index: usize) -> Option[T] {
+        self.skip(&cx, index).first(&cx)
     }
 
-    fn first(self, &tag: Exclusive!['k]) -> Option[T] {
+    forall C, R where Access[C -> 'k, R].
+    fn first(self, &cx: C) -> Option[T] {
         match self {
             List::Empty => Option::None,
-            List::Cell(r) => Option::Some.(r.copy(&tag).head),
+            List::Cell(r) => Option::Some.(r.copy(&cx).head),
         }
     }
 
     // The list without its first element (empty when it is empty).
-    fn tail(self, &tag: Exclusive!['k]) -> List[T, 'k] {
+    forall C, R where Access[C -> 'k, R].
+    fn tail(self, &cx: C) -> List[T, 'k] {
         match self {
             List::Empty => List::Empty,
-            List::Cell(r) => r.copy(&tag).tail,
+            List::Cell(r) => r.copy(&cx).tail,
         }
     }
 
     // The list without its first `count` elements.
-    fn skip(self, &tag: Exclusive!['k], count: usize) -> List[T, 'k] {
+    forall C, R where Access[C -> 'k, R].
+    fn skip(self, &cx: C, count: usize) -> List[T, 'k] {
         var rest = self;
         var left = count;
-        var going = left > 0usize;
-        while going {
-            match rest {
-                List::Empty => {
-                    going = false;
-                },
-                List::Cell(r) => {
-                    rest = r.copy(&tag).tail;
-                    left = left - 1usize;
-                    going = left > 0usize;
-                },
-            }
+        while left > 0usize && !rest.is_empty() {
+            rest = rest.tail(&cx);
+            left = left - 1usize;
         }
         rest
     }
 
-    fn last(self, &tag: Exclusive!['k]) -> Option[T] {
-        match self {
-            List::Empty => Option::None,
-            List::Cell(r) => {
-                let cell = r.copy(&tag);
-                match cell.tail {
-                    List::Empty => Option::Some.(cell.head),
-                    List::Cell(_) => cell.tail.last(&tag),
-                }
-            },
+    forall C, R where Access[C -> 'k, R].
+    fn last(self, &cx: C) -> Option[T] {
+        var rest = self;
+        var found = Option::None;
+        var going = true;
+        while going {
+            let next = &rest.pop(&cx);
+            match next {
+                Option::Some(x) => {
+                    found = Option::Some.(x);
+                },
+                Option::None => {
+                    going = false;
+                },
+            }
         }
+        found
     }
 
     // Same length and `eq` holds pairwise, in order.
-    fn eq_with(self, &tag: Exclusive!['k], other: List[T, 'k], eq: fn(Exclusive!['k], T, T) -> (Exclusive!['k], bool)) -> bool {
-        match self {
-            List::Empty => other.is_empty(),
-            List::Cell(ar) => {
-                match other {
-                    List::Empty => false,
-                    List::Cell(br) => {
-                        let acell = ar.copy(&tag);
-                        let bcell = br.copy(&tag);
-                        let (tag_back, hit) = eq(tag, acell.head, bcell.head);
-                        tag = tag_back;
-                        if hit {
-                            acell.tail.eq_with(&tag, bcell.tail, eq)
-                        } else {
-                            false
-                        }
-                    },
-                }
-            },
+    forall Env, C, R where Access[C -> 'k, R], Copy[Env].
+    fn eq_with(self, &cx: C, other: List[T, 'k], eq: closure[Env](&_: C, T, T) -> bool) -> bool {
+        var a = self;
+        var b = other;
+        var same = true;
+        var going = true;
+        while same && going {
+            let x = &a.pop(&cx);
+            let y = &b.pop(&cx);
+            match x {
+                Option::Some(u) => {
+                    match y {
+                        Option::Some(v) => {
+                            same = eq(&cx, u, v);
+                        },
+                        Option::None => {
+                            same = false;
+                        },
+                    }
+                },
+                Option::None => {
+                    same = y.is_none();
+                    going = false;
+                },
+            }
         }
+        same
     }
 
     // This list's elements start `list`, compared pairwise with `eq`.
-    fn is_prefix_with(self, &tag: Exclusive!['k], list: List[T, 'k], eq: fn(Exclusive!['k], T, T) -> (Exclusive!['k], bool)) -> bool {
-        match self {
-            List::Empty => true,
-            List::Cell(pr) => {
-                match list {
-                    List::Empty => false,
-                    List::Cell(lr) => {
-                        let pcell = pr.copy(&tag);
-                        let lcell = lr.copy(&tag);
-                        let (tag_back, hit) = eq(tag, pcell.head, lcell.head);
-                        tag = tag_back;
-                        if hit {
-                            pcell.tail.is_prefix_with(&tag, lcell.tail, eq)
-                        } else {
-                            false
-                        }
-                    },
-                }
-            },
+    forall Env, C, R where Access[C -> 'k, R], Copy[Env].
+    fn is_prefix_with(self, &cx: C, list: List[T, 'k], eq: closure[Env](&_: C, T, T) -> bool) -> bool {
+        var a = self;
+        var b = list;
+        var same = true;
+        var going = true;
+        while same && going {
+            let x = &a.pop(&cx);
+            match x {
+                Option::Some(u) => {
+                    let next = &b.pop(&cx);
+                    match next {
+                        Option::Some(v) => {
+                            same = eq(&cx, u, v);
+                        },
+                        Option::None => {
+                            same = false;
+                        },
+                    }
+                },
+                Option::None => {
+                    going = false;
+                },
+            }
         }
+        same
     }
 
-    // The first element, leaving the rest in `self`: a loop over a list
-    // whose body needs the capability.
-    fn pop(&self, &tag: Exclusive!['k]) -> Option[T] {
-        match self {
-            List::Empty => Option::None,
-            List::Cell(r) => {
-                let cell = r.copy(&tag);
-                self = cell.tail;
-                Option::Some.(cell.head)
-            },
-        }
-    }
-}
+    // ------------------------------------------------------ combinators --
+    // The computation goes to the list: each combinator lends its closure
+    // the context, so the closure reads other data of the domain and
+    // captures only `Copy` values. Searches stop at the first element that
+    // decides them; results keep the list's order.
 
-// ---------------------------------------------------------- combinators --
-// The computation goes to the list: each combinator lends its closure what
-// reads the list, so the closure reads other data in the same domain and
-// captures only `Copy` values. Searches stop at the first element that
-// decides them; results keep the list's order.
-//
-// A search takes any context that reads the list (`ListAccess`): the
-// domain's capability itself, or a context holding it, which the closure is
-// then lent whole. The builders and folds take the capability and the arena;
-// their `_on` forms take one context that reads and builds (`ListBuild`)
-// instead. The `_in` forms lend one more context beside the capability (and
-// the arena), such as a map the walk updates.
-
-// A context that reads the lists of a domain.
-forall Self, L -> T.
-trait ListAccess {
-    // The first element, leaving the rest in `list`.
-    fn take_head(&cx: Self, &list: L) -> Option[T];
-}
-
-// A context that also allocates in the domain.
-forall Self, L -> T.
-trait ListBuild {
-    fn prepend(&cx: Self, list: L, head: T) -> L;
-}
-
-forall T, 'k where Copy[T].
-instance ListAccess[Exclusive!['k], List[T, 'k] -> T] {
-    fn take_head(&cx: Exclusive!['k], &list: List[T, 'k]) -> Option[T] {
-        &list.pop(&cx)
-    }
-}
-
-forall T, 'k where Copy[T].
-impl List[T, 'k] {
     // The first element `f` returns a value for, and that value.
-    forall U, C, Env where Copy[Env].
-    fn find_map_in(self, &tag: Exclusive!['k], &cx: C, f: closure[Env](&_: Exclusive!['k], &_: C, T) -> Option[U]) -> Option[U] {
-        match self {
-            List::Empty => Option::None,
-            List::Cell(r) => {
-                let cell = r.copy(&tag);
-                match f(&tag, &cx, cell.head) {
-                    Option::Some(u) => Option::Some.(u),
-                    Option::None => cell.tail.find_map_in(&tag, &cx, f),
-                }
-            },
-        }
-    }
-
-    forall U, C, Env where ListAccess[C, List[T, 'k] -> T], Copy[Env].
+    forall U, Env, C, R where Access[C -> 'k, R], Copy[U], Copy[Env].
     fn find_map(self, &cx: C, f: closure[Env](&_: C, T) -> Option[U]) -> Option[U] {
         var rest = self;
-        let next = ListAccess[C, List[T, 'k] -> _]::take_head(&cx, &rest);
-        match next {
-            Option::Some(x) => {
-                match f(&cx, x) {
-                    Option::Some(u) => Option::Some.(u),
-                    Option::None => rest.find_map(&cx, f),
-                }
-            },
-            Option::None => Option::None,
+        var found = Option::None;
+        var going = true;
+        while going {
+            let next = &rest.pop(&cx);
+            match next {
+                Option::Some(x) => {
+                    found = f(&cx, x);
+                    going = found.is_none();
+                },
+                Option::None => {
+                    going = false;
+                },
+            }
         }
+        found
     }
 
     // The first element `f` holds for.
-    forall C, Env where Copy[Env].
-    fn find_in(self, &tag: Exclusive!['k], &cx: C, f: closure[Env](&_: Exclusive!['k], &_: C, T) -> bool) -> Option[T] {
-        self.find_map_in(&tag, &cx, |&t, &c, x| if f(&t, &c, x) { Option::Some.(x) } else { Option::None })
-    }
-
-    forall C, Env where ListAccess[C, List[T, 'k] -> T], Copy[Env].
+    forall Env, C, R where Access[C -> 'k, R], Copy[Env].
     fn find(self, &cx: C, f: closure[Env](&_: C, T) -> bool) -> Option[T] {
         self.find_map(&cx, |&c, x| if f(&c, x) { Option::Some.(x) } else { Option::None })
     }
 
     // Whether `f` holds for some element.
-    forall C, Env where Copy[Env].
-    fn any_in(self, &tag: Exclusive!['k], &cx: C, f: closure[Env](&_: Exclusive!['k], &_: C, T) -> bool) -> bool {
-        self.find_in(&tag, &cx, f).is_some()
-    }
-
-    forall C, Env where ListAccess[C, List[T, 'k] -> T], Copy[Env].
+    forall Env, C, R where Access[C -> 'k, R], Copy[Env].
     fn any(self, &cx: C, f: closure[Env](&_: C, T) -> bool) -> bool {
         self.find(&cx, f).is_some()
     }
 
     // Whether `f` holds for every element.
-    forall C, Env where Copy[Env].
-    fn all_in(self, &tag: Exclusive!['k], &cx: C, f: closure[Env](&_: Exclusive!['k], &_: C, T) -> bool) -> bool {
-        !self.any_in(&tag, &cx, |&t, &c, x| !f(&t, &c, x))
-    }
-
-    forall C, Env where ListAccess[C, List[T, 'k] -> T], Copy[Env].
+    forall Env, C, R where Access[C -> 'k, R], Copy[Env].
     fn all(self, &cx: C, f: closure[Env](&_: C, T) -> bool) -> bool {
         !self.any(&cx, |&c, x| !f(&c, x))
     }
 
-    // `f` on each element, for what it does through the capability and `cx`.
-    forall C, Env where Copy[Env].
-    fn each_in(self, &tag: Exclusive!['k], &cx: C, f: closure[Env](&_: Exclusive!['k], &_: C, T) -> ()) {
-        var rest = self;
-        var scanning = true;
-        while scanning {
-            let next = &rest.pop(&tag);
-            match next {
-                Option::Some(x) => {
-                    f(&tag, &cx, x);
-                },
-                Option::None => {
-                    scanning = false;
-                },
-            }
-        }
-    }
-
     // `f` on each element, for what it does through the context.
-    forall C, Env where ListAccess[C, List[T, 'k] -> T], Copy[Env].
+    forall Env, C, R where Access[C -> 'k, R], Copy[Env].
     fn each(self, &cx: C, f: closure[Env](&_: C, T) -> ()) {
         var rest = self;
-        var scanning = true;
-        while scanning {
-            let next = ListAccess[C, List[T, 'k] -> _]::take_head(&cx, &rest);
+        var going = true;
+        while going {
+            let next = &rest.pop(&cx);
             match next {
-                Option::Some(x) => {
-                    f(&cx, x);
-                },
+                Option::Some(x) => f(&cx, x),
                 Option::None => {
-                    scanning = false;
+                    going = false;
                 },
             }
         }
     }
 
     // How many elements `f` holds for.
-    forall C, Env where ListAccess[C, List[T, 'k] -> T], Copy[Env].
+    forall Env, C, R where Access[C -> 'k, R], Copy[Env].
     fn count(self, &cx: C, f: closure[Env](&_: C, T) -> bool) -> usize {
-        var rest = self;
-        var n = 0usize;
-        var scanning = true;
-        while scanning {
-            let next = ListAccess[C, List[T, 'k] -> _]::take_head(&cx, &rest);
-            match next {
-                Option::Some(x) => {
-                    if f(&cx, x) {
-                        n = n + 1usize;
-                    }
-                },
-                Option::None => {
-                    scanning = false;
-                },
-            }
-        }
-        n
+        self.fold(&cx, 0usize, |&c, n, x| if f(&c, x) { n + 1usize } else { n })
     }
 
     // `acc` through `f` with each element, head first.
-    forall A, C, Env where Copy[Env].
-    fn fold_in(self, &tag: Exclusive!['k], &arena: Arena!['k], &cx: C, acc: A, f: closure[Env](&_: Exclusive!['k], &_: Arena!['k], &_: C, A, T) -> A) -> A {
+    forall A, Env, C, R where Access[C -> 'k, R], Copy[Env].
+    fn fold(self, &cx: C, acc: A, f: closure[Env](&_: C, A, T) -> A) -> A {
         var rest = self;
         var acc = acc;
-        var scanning = true;
-        while scanning {
-            let next = &rest.pop(&tag);
-            match next {
-                Option::Some(x) => {
-                    acc = f(&tag, &arena, &cx, acc, x);
-                },
-                Option::None => {
-                    scanning = false;
-                },
-            }
-        }
-        acc
-    }
-
-    forall A, Env where Copy[Env].
-    fn fold(self, &tag: Exclusive!['k], &arena: Arena!['k], acc: A, f: closure[Env](&_: Exclusive!['k], &_: Arena!['k], A, T) -> A) -> A {
-        var unit = ();
-        self.fold_in(&tag, &arena, &unit, acc, |&t, &a, &u, acc, x| f(&t, &a, acc, x))
-    }
-
-    // Each element through `f`.
-    forall U, C, Env where Copy[Env].
-    fn map_in(self, &tag: Exclusive!['k], &arena: Arena!['k], &cx: C, f: closure[Env](&_: Exclusive!['k], &_: Arena!['k], &_: C, T) -> U) -> List[U, 'k] {
-        match self {
-            List::Empty => List::Empty,
-            List::Cell(r) => {
-                let cell = r.copy(&tag);
-                let head = f(&tag, &arena, &cx, cell.head);
-                cell.tail.map_in(&tag, &arena, &cx, f).cons(&tag, &arena, head)
-            },
-        }
-    }
-
-    forall U, Env where Copy[Env].
-    fn map(self, &tag: Exclusive!['k], &arena: Arena!['k], f: closure[Env](&_: Exclusive!['k], &_: Arena!['k], T) -> U) -> List[U, 'k] {
-        var unit = ();
-        self.map_in(&tag, &arena, &unit, |&t, &a, &u, x| f(&t, &a, x))
-    }
-
-    // The values `f` returns, skipping the elements it returns none for.
-    forall U, Env where Copy[Env].
-    fn filter_map(self, &tag: Exclusive!['k], &arena: Arena!['k], f: closure[Env](&_: Exclusive!['k], &_: Arena!['k], T) -> Option[U]) -> List[U, 'k] {
-        match self {
-            List::Empty => List::Empty,
-            List::Cell(r) => {
-                let cell = r.copy(&tag);
-                let head = f(&tag, &arena, cell.head);
-                let rest = cell.tail.filter_map(&tag, &arena, f);
-                match head {
-                    Option::Some(u) => rest.cons(&tag, &arena, u),
-                    Option::None => rest,
-                }
-            },
-        }
-    }
-
-    // The elements `f` holds for.
-    forall Env where Copy[Env].
-    fn filter(self, &tag: Exclusive!['k], &arena: Arena!['k], f: closure[Env](&_: Exclusive!['k], &_: Arena!['k], T) -> bool) -> List[T, 'k] {
-        self.filter_map(&tag, &arena, |&t, &a, x| if f(&t, &a, x) { Option::Some.(x) } else { Option::None })
-    }
-
-    // `f` on each element, stopping at the first error.
-    forall E, C, Env where Copy[Env].
-    fn try_each_in(self, &tag: Exclusive!['k], &arena: Arena!['k], &cx: C, f: closure[Env](&_: Exclusive!['k], &_: Arena!['k], &_: C, T) -> Result[(), E]) -> Result[(), E] {
-        match self {
-            List::Empty => Result::Ok.(()),
-            List::Cell(r) => {
-                let cell = r.copy(&tag);
-                f(&tag, &arena, &cx, cell.head)?;
-                cell.tail.try_each_in(&tag, &arena, &cx, f)
-            },
-        }
-    }
-
-    forall E, Env where Copy[Env].
-    fn try_each(self, &tag: Exclusive!['k], &arena: Arena!['k], f: closure[Env](&_: Exclusive!['k], &_: Arena!['k], T) -> Result[(), E]) -> Result[(), E] {
-        var unit = ();
-        self.try_each_in(&tag, &arena, &unit, |&t, &a, &u, x| f(&t, &a, x))
-    }
-
-    // `acc` through `f` with each element, stopping at the first error.
-    forall A, E, Env where Copy[Env].
-    fn try_fold(self, &tag: Exclusive!['k], &arena: Arena!['k], acc: A, f: closure[Env](&_: Exclusive!['k], &_: Arena!['k], A, T) -> Result[A, E]) -> Result[A, E] {
-        match self {
-            List::Empty => Result::Ok.(acc),
-            List::Cell(r) => {
-                let cell = r.copy(&tag);
-                let next = f(&tag, &arena, acc, cell.head)?;
-                cell.tail.try_fold(&tag, &arena, next, f)
-            },
-        }
-    }
-
-    // Each element through `f`, stopping at the first error.
-    forall U, E, C, Env where Copy[U], Copy[Env].
-    fn try_map_in(self, &tag: Exclusive!['k], &arena: Arena!['k], &cx: C, f: closure[Env](&_: Exclusive!['k], &_: Arena!['k], &_: C, T) -> Result[U, E]) -> Result[List[U, 'k], E] {
-        match self {
-            List::Empty => Result::Ok.(List::Empty),
-            List::Cell(r) => {
-                let cell = r.copy(&tag);
-                let head = f(&tag, &arena, &cx, cell.head)?;
-                let rest = cell.tail.try_map_in(&tag, &arena, &cx, f)?;
-                Result::Ok.(rest.cons(&tag, &arena, head))
-            },
-        }
-    }
-
-    forall U, E, Env where Copy[U], Copy[Env].
-    fn try_map(self, &tag: Exclusive!['k], &arena: Arena!['k], f: closure[Env](&_: Exclusive!['k], &_: Arena!['k], T) -> Result[U, E]) -> Result[List[U, 'k], E] {
-        match self {
-            List::Empty => Result::Ok.(List::Empty),
-            List::Cell(r) => {
-                let cell = r.copy(&tag);
-                let head = f(&tag, &arena, cell.head)?;
-                let rest = cell.tail.try_map(&tag, &arena, f)?;
-                Result::Ok.(rest.cons(&tag, &arena, head))
-            },
-        }
-    }
-
-    // The builders and folds through one context that reads the list and,
-    // for the builders, allocates the result.
-    forall A, C, Env where ListAccess[C, List[T, 'k] -> T], Copy[Env].
-    fn fold_on(self, &cx: C, acc: A, f: closure[Env](&_: C, A, T) -> A) -> A {
-        var rest = self;
-        var acc = acc;
-        var scanning = true;
-        while scanning {
-            let next = ListAccess[C, List[T, 'k] -> _]::take_head(&cx, &rest);
+        var going = true;
+        while going {
+            let next = &rest.pop(&cx);
             match next {
                 Option::Some(x) => {
                     acc = f(&cx, acc, x);
                 },
                 Option::None => {
-                    scanning = false;
+                    going = false;
                 },
             }
         }
         acc
     }
 
-    forall E, C, Env where ListAccess[C, List[T, 'k] -> T], Copy[Env].
-    fn try_each_on(self, &cx: C, f: closure[Env](&_: C, T) -> Result[(), E]) -> Result[(), E] {
+    // `f` on each element, stopping at the first error.
+    forall E, Env, C, R where Access[C -> 'k, R], Copy[Env].
+    fn try_each(self, &cx: C, f: closure[Env](&_: C, T) -> Result[(), E]) -> Result[(), E] {
         var rest = self;
-        let next = ListAccess[C, List[T, 'k] -> _]::take_head(&cx, &rest);
+        let next = &rest.pop(&cx);
         match next {
             Option::Some(x) => {
                 f(&cx, x)?;
-                rest.try_each_on(&cx, f)
+                rest.try_each(&cx, f)
             },
             Option::None => Result::Ok.(()),
         }
     }
 
-    forall A, E, C, Env where ListAccess[C, List[T, 'k] -> T], Copy[Env].
-    fn try_fold_on(self, &cx: C, acc: A, f: closure[Env](&_: C, A, T) -> Result[A, E]) -> Result[A, E] {
+    // `acc` through `f` with each element, stopping at the first error.
+    forall A, E, Env, C, R where Access[C -> 'k, R], Copy[Env].
+    fn try_fold(self, &cx: C, acc: A, f: closure[Env](&_: C, A, T) -> Result[A, E]) -> Result[A, E] {
         var rest = self;
-        let next = ListAccess[C, List[T, 'k] -> _]::take_head(&cx, &rest);
+        let next = &rest.pop(&cx);
         match next {
             Option::Some(x) => {
-                let acc2 = f(&cx, acc, x)?;
-                rest.try_fold_on(&cx, acc2, f)
+                let next = f(&cx, acc, x)?;
+                rest.try_fold(&cx, next, f)
             },
             Option::None => Result::Ok.(acc),
         }
     }
 
-    forall U, C, Env where ListAccess[C, List[T, 'k] -> T], ListBuild[C, List[U, 'k] -> U], Copy[Env].
-    fn map_on(self, &cx: C, f: closure[Env](&_: C, T) -> U) -> List[U, 'k] {
+    // Each element through `f`.
+    forall U, Env, C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], Copy[Env].
+    fn map(self, &cx: C, f: closure[Env](&_: C, T) -> U) -> List[U, 'k] {
         var rest = self;
-        let next = ListAccess[C, List[T, 'k] -> _]::take_head(&cx, &rest);
+        let next = &rest.pop(&cx);
         match next {
             Option::Some(x) => {
                 let head = f(&cx, x);
-                let tail = rest.map_on(&cx, f);
-                ListBuild[C, List[U, 'k] -> _]::prepend(&cx, tail, head)
+                rest.map(&cx, f).cons(&cx, head)
             },
             Option::None => List::Empty,
         }
     }
 
-    forall U, C, Env where ListAccess[C, List[T, 'k] -> T], ListBuild[C, List[U, 'k] -> U], Copy[Env].
-    fn filter_map_on(self, &cx: C, f: closure[Env](&_: C, T) -> Option[U]) -> List[U, 'k] {
+    // The values `f` returns, skipping the elements it returns none for.
+    forall U, Env, C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], Copy[Env].
+    fn filter_map(self, &cx: C, f: closure[Env](&_: C, T) -> Option[U]) -> List[U, 'k] {
         var rest = self;
-        let next = ListAccess[C, List[T, 'k] -> _]::take_head(&cx, &rest);
+        let next = &rest.pop(&cx);
         match next {
             Option::Some(x) => {
                 let head = f(&cx, x);
-                let tail = rest.filter_map_on(&cx, f);
+                let tail = rest.filter_map(&cx, f);
                 match head {
-                    Option::Some(u) => ListBuild[C, List[U, 'k] -> _]::prepend(&cx, tail, u),
+                    Option::Some(u) => tail.cons(&cx, u),
                     Option::None => tail,
                 }
             },
@@ -570,15 +367,22 @@ impl List[T, 'k] {
         }
     }
 
-    forall U, E, C, Env where ListAccess[C, List[T, 'k] -> T], ListBuild[C, List[U, 'k] -> U], Copy[U], Copy[Env].
-    fn try_map_on(self, &cx: C, f: closure[Env](&_: C, T) -> Result[U, E]) -> Result[List[U, 'k], E] {
+    // The elements `f` holds for.
+    forall Env, C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], Copy[Env].
+    fn filter(self, &cx: C, f: closure[Env](&_: C, T) -> bool) -> List[T, 'k] {
+        self.filter_map(&cx, |&c, x| if f(&c, x) { Option::Some.(x) } else { Option::None })
+    }
+
+    // Each element through `f`, stopping at the first error.
+    forall U, E, Env, C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], Copy[U], Copy[Env].
+    fn try_map(self, &cx: C, f: closure[Env](&_: C, T) -> Result[U, E]) -> Result[List[U, 'k], E] {
         var rest = self;
-        let next = ListAccess[C, List[T, 'k] -> _]::take_head(&cx, &rest);
+        let next = &rest.pop(&cx);
         match next {
             Option::Some(x) => {
                 let head = f(&cx, x)?;
-                let tail = rest.try_map_on(&cx, f)?;
-                Result::Ok.(ListBuild[C, List[U, 'k] -> _]::prepend(&cx, tail, head))
+                let tail = rest.try_map(&cx, f)?;
+                Result::Ok.(tail.cons(&cx, head))
             },
             Option::None => Result::Ok.(List::Empty),
         }
@@ -586,12 +390,12 @@ impl List[T, 'k] {
 }
 
 // `count` copies of `value`.
-forall T, 'k where Copy[T].
-fn repeat(&tag: Exclusive!['k], &arena: Arena!['k], value: T, count: usize) -> List[T, 'k] {
+forall T, 'k, C, R where Copy[T], Allocate[C -> 'k, R].
+fn repeat(&cx: C, value: T, count: usize) -> List[T, 'k] {
     var list = List::Empty;
     var left = count;
     while left > 0usize {
-        list = list.cons(&tag, &arena, value);
+        list = list.cons(&cx, value);
         left = left - 1usize;
     }
     list

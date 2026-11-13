@@ -16,8 +16,12 @@
 // piece; `span` copies longer ones into one block of the arena.
 //
 // Elements are `Copy` and are read and written whole. Every access
-// presents the arena's `Exclusive!['k]`; growing also needs the arena
-// itself, which alone may put new blocks in its domain.
+// presents the domain's `Exclusive!['k]`, lent by a context (`Access`);
+// growing also needs the arena itself (`Allocate`), which alone may put new
+// blocks in its domain. Two accessors read an element: `get` (`None` past
+// the end) and `at` (the element must be there; past the end the process
+// stops), and `set`/`replace`/`insert`/`remove` take an index that must be
+// in range.
 //
 // `Header` and `ArenaVec` are restricted: only this module builds or opens
 // them. The unsafe reads and writes below rely on what that protects: the
@@ -27,8 +31,11 @@
 
 use package as alloc;
 
-use alloc::arena::Arena;
-use core::cap::Exclusive;
+use alloc::arena::{Allocate, Arena, Domain};
+use alloc::heap::out_of_range;
+use core::cap::{Access, Exclusive};
+use core::cmp::Order;
+use core::hash::{HashIn, HashState};
 use core::mem::Ref;
 use core::option::Option;
 use core::raw::{Span, elem_ptr};
@@ -152,27 +159,53 @@ fn add_segment(&tag: Exclusive!['k], &arena: Arena!['k], h: Header[T, 'k], fill:
     Header.{ len: h.len, segments: k + 1usize, first: h.first, table }
 }
 
+// Every method takes the context by place, `&cx`: one that lends the
+// domain's capability (`Access`) to read and write, one that lends the arena
+// too (`Allocate`) to grow.
 forall T, 'k where Copy[T].
 impl ArenaVec[T, 'k] {
     // An empty vec. It takes no room for elements until its first one.
-    fn new(&tag: Exclusive!['k], &arena: Arena!['k]) -> ArenaVec[T, 'k] {
+    forall C, R where Allocate[C -> 'k, R].
+    fn new(&cx: C) -> ArenaVec[T, 'k] {
+        let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
         let header = &arena.alloc(&tag, Header.{ len: 0usize, segments: 0usize, first: null_of[T](), table: null_of[*T]() });
+        cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
         ArenaVec.{ header }
     }
 
-    // `count` copies of `fill`.
-    fn filled(&tag: Exclusive!['k], &arena: Arena!['k], count: usize, fill: T) -> ArenaVec[T, 'k] {
-        let v: ArenaVec[T, 'k] = ArenaVec::new(&tag, &arena);
-        v.resize(&tag, &arena, count, fill);
+    // A vec holding `value`.
+    forall C, R where Allocate[C -> 'k, R].
+    fn one(&cx: C, value: T) -> ArenaVec[T, 'k] {
+        let v: ArenaVec[T, 'k] = ArenaVec::new(&cx);
+        v.push(&cx, value);
         v
     }
 
-    fn len(self, &tag: Exclusive!['k]) -> usize {
-        self.header.copy(&tag).len
+    // A vec holding `a` then `b`.
+    forall C, R where Allocate[C -> 'k, R].
+    fn two(&cx: C, a: T, b: T) -> ArenaVec[T, 'k] {
+        let v: ArenaVec[T, 'k] = ArenaVec::new(&cx);
+        v.push(&cx, a);
+        v.push(&cx, b);
+        v
     }
 
-    fn is_empty(self, &tag: Exclusive!['k]) -> bool {
-        self.header.copy(&tag).len == 0usize
+    // `count` copies of `fill`.
+    forall C, R where Allocate[C -> 'k, R].
+    fn filled(&cx: C, count: usize, fill: T) -> ArenaVec[T, 'k] {
+        let v: ArenaVec[T, 'k] = ArenaVec::new(&cx);
+        v.resize(&cx, count, fill);
+        v
+    }
+
+    forall C, R where Access[C -> 'k, R].
+    fn len(self, &cx: C) -> usize {
+        self.header.copy(&cx).len
+    }
+
+    forall C, R where Access[C -> 'k, R].
+    fn is_empty(self, &cx: C) -> bool {
+        self.header.copy(&cx).len == 0usize
     }
 
     // The vec's identity, as a number: equal for copies of one handle,
@@ -182,91 +215,136 @@ impl ArenaVec[T, 'k] {
     }
 
     // Element `i`, or `None` past the end.
-    fn get(self, &tag: Exclusive!['k], i: usize) -> Option[T] {
+    forall C, R where Access[C -> 'k, R].
+    fn get(self, &cx: C, i: usize) -> Option[T] {
+        let (tag, rest) = Access[C -> 'k, R]::open(cx);
         let h = self.header.copy(&tag);
-        if i < h.len {
+        let value = if i < h.len {
             Option::Some.(unsafe *(unsafe place(h, i)))
         } else {
             Option::None
+        };
+        cx = Access[C -> 'k, R]::close(tag, rest);
+        value
+    }
+
+    // Element `i`, which must be there: past the end, the process stops
+    // (`alloc::heap::out_of_range`).
+    forall C, R where Access[C -> 'k, R].
+    fn at(self, &cx: C, i: usize) -> T {
+        let (tag, rest) = Access[C -> 'k, R]::open(cx);
+        let h = self.header.copy(&tag);
+        if i >= h.len {
+            out_of_range();
         }
+        let value = unsafe *(unsafe place(h, i));
+        cx = Access[C -> 'k, R]::close(tag, rest);
+        value
     }
 
     // Where element `i` lives, or `None` past the end. Elements never move,
     // so the place is the element's for as long as the arena lives.
-    fn get_ref(self, &tag: Exclusive!['k], i: usize) -> Option[Ref[T, 'k]] {
+    forall C, R where Access[C -> 'k, R].
+    fn get_ref(self, &cx: C, i: usize) -> Option[Ref[T, 'k]] {
+        let (tag, rest) = Access[C -> 'k, R]::open(cx);
         let h = self.header.copy(&tag);
-        if i < h.len {
+        let found = if i < h.len {
             let (at, marker) = self.header.into_parts();
             // In range of the vec's segments, which are memory of this
             // arena's domain, the one the header's own brand names.
             Option::Some.(unsafe Ref::from_raw(unsafe place(h, i), marker))
         } else {
             Option::None
-        }
+        };
+        cx = Access[C -> 'k, R]::close(tag, rest);
+        found
     }
 
-    // Replaces element `i`, handing back the value it held; `None`, and no
-    // change, past the end.
-    fn set(self, &tag: Exclusive!['k], i: usize, value: T) -> Option[T] {
+    // Puts `value` at `i`, which must be there, and hands back the value
+    // it replaces.
+    forall C, R where Access[C -> 'k, R].
+    fn replace(self, &cx: C, i: usize, value: T) -> T {
+        let (tag, rest) = Access[C -> 'k, R]::open(cx);
         let h = self.header.copy(&tag);
-        if i < h.len {
-            let at = unsafe place(h, i);
-            let old = unsafe *at;
-            unsafe *at = value;
-            Option::Some.(old)
-        } else {
+        if i >= h.len {
+            out_of_range();
+        }
+        let at = unsafe place(h, i);
+        let old = unsafe *at;
+        unsafe *at = value;
+        cx = Access[C -> 'k, R]::close(tag, rest);
+        old
+    }
+
+    // Puts `value` at `i`, which must be there.
+    forall C, R where Access[C -> 'k, R].
+    fn set(self, &cx: C, i: usize, value: T) {
+        let old = self.replace(&cx, i, value);
+    }
+
+    forall C, R where Access[C -> 'k, R].
+    fn first(self, &cx: C) -> Option[T] {
+        self.get(&cx, 0usize)
+    }
+
+    forall C, R where Access[C -> 'k, R].
+    fn last(self, &cx: C) -> Option[T] {
+        let n = self.len(&cx);
+        if n == 0usize {
             Option::None
+        } else {
+            self.get(&cx, n - 1usize)
         }
     }
 
-    fn last(self, &tag: Exclusive!['k]) -> Option[T] {
-        let h = self.header.copy(&tag);
-        if h.len == 0usize {
-            Option::None
-        } else {
-            Option::Some.(unsafe *(unsafe place(h, h.len - 1usize)))
-        }
-    }
-
-    fn push(self, &tag: Exclusive!['k], &arena: Arena!['k], value: T) {
+    forall C, R where Allocate[C -> 'k, R].
+    fn push(self, &cx: C, value: T) {
+        let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
         let h = self.header.copy(&tag);
         let h = if h.len < capacity(h) { h } else { add_segment(&tag, &arena, h, value) };
         unsafe *(unsafe place(h, h.len)) = value;
-        let previous = self.header.replace(&tag, Header.{ len: h.len + 1usize, segments: h.segments, first: h.first, table: h.table });
+        self.header.set(&tag, Header.{ len: h.len + 1usize, segments: h.segments, first: h.first, table: h.table });
+        cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
     }
 
     // Removes and hands back the last element, or `None` when empty.
-    fn pop(self, &tag: Exclusive!['k]) -> Option[T] {
+    forall C, R where Access[C -> 'k, R].
+    fn pop(self, &cx: C) -> Option[T] {
+        let (tag, rest) = Access[C -> 'k, R]::open(cx);
         let h = self.header.copy(&tag);
-        if h.len == 0usize {
-            return Option::None;
-        }
-        let value = unsafe *(unsafe place(h, h.len - 1usize));
-        let previous = self.header.replace(&tag, Header.{ len: h.len - 1usize, segments: h.segments, first: h.first, table: h.table });
-        Option::Some.(value)
+        let value = if h.len == 0usize {
+            Option::None
+        } else {
+            self.header.set(&tag, Header.{ len: h.len - 1usize, segments: h.segments, first: h.first, table: h.table });
+            Option::Some.(unsafe *(unsafe place(h, h.len - 1usize)))
+        };
+        cx = Access[C -> 'k, R]::close(tag, rest);
+        value
     }
 
     // Keeps the first `len` elements; nothing changes when there are no
     // more than that.
-    fn truncate(self, &tag: Exclusive!['k], len: usize) {
+    forall C, R where Access[C -> 'k, R].
+    fn truncate(self, &cx: C, len: usize) {
+        let (tag, rest) = Access[C -> 'k, R]::open(cx);
         let h = self.header.copy(&tag);
         if len < h.len {
-            let previous = self.header.replace(&tag, Header.{ len, segments: h.segments, first: h.first, table: h.table });
+            self.header.set(&tag, Header.{ len, segments: h.segments, first: h.first, table: h.table });
         }
+        cx = Access[C -> 'k, R]::close(tag, rest);
     }
 
-    fn clear(self, &tag: Exclusive!['k]) {
-        self.truncate(&tag, 0usize);
+    forall C, R where Access[C -> 'k, R].
+    fn clear(self, &cx: C) {
+        self.truncate(&cx, 0usize);
     }
 
     // Grows to `len` elements, the new ones set to `fill`, or keeps the
     // first `len`.
-    fn resize(self, &tag: Exclusive!['k], &arena: Arena!['k], len: usize, fill: T) {
+    forall C, R where Allocate[C -> 'k, R].
+    fn resize(self, &cx: C, len: usize, fill: T) {
+        let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
         var h = self.header.copy(&tag);
-        if len <= h.len {
-            self.truncate(&tag, len);
-            return;
-        }
         while capacity(h) < len {
             h = add_segment(&tag, &arena, h, fill);
         }
@@ -275,38 +353,314 @@ impl ArenaVec[T, 'k] {
             unsafe *(unsafe place(h, i)) = fill;
             i = i + 1usize;
         }
-        let previous = self.header.replace(&tag, Header.{ len, segments: h.segments, first: h.first, table: h.table });
+        self.header.set(&tag, Header.{ len, segments: h.segments, first: h.first, table: h.table });
+        cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
     }
 
     // Pushes every element of `other`, in order. `other` may be `self`.
-    fn append(self, &tag: Exclusive!['k], &arena: Arena!['k], other: ArenaVec[T, 'k]) {
-        let n = other.len(&tag);
+    forall C, R where Allocate[C -> 'k, R].
+    fn append(self, &cx: C, other: ArenaVec[T, 'k]) {
+        let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
+        var d = Domain.{ tag, arena };
+        let n = other.len(&d);
         var i = 0usize;
         while i < n {
-            let unit = match other.get(&tag, i) {
-                Option::Some(value) => self.push(&tag, &arena, value),
-                Option::None => (),
-            };
+            self.push(&d, other.at(&d, i));
+            i = i + 1usize;
+        }
+        let { tag, arena } = d;
+        cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
+    }
+
+    // A new vec holding the same elements.
+    forall C, R where Allocate[C -> 'k, R].
+    fn clone(self, &cx: C) -> ArenaVec[T, 'k] {
+        let copy: ArenaVec[T, 'k] = ArenaVec::new(&cx);
+        copy.append(&cx, self);
+        copy
+    }
+
+    // Elements `start` to `end`, each clamped to the vec, as a new vec.
+    forall C, R where Allocate[C -> 'k, R].
+    fn slice(self, &cx: C, start: usize, end: usize) -> ArenaVec[T, 'k] {
+        let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
+        var d = Domain.{ tag, arena };
+        let out: ArenaVec[T, 'k] = ArenaVec::new(&d);
+        let n = self.len(&d);
+        var i = start;
+        while i < end && i < n {
+            out.push(&d, self.at(&d, i));
+            i = i + 1usize;
+        }
+        let { tag, arena } = d;
+        cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
+        out
+    }
+
+    // The elements from `start` on, as a new vec.
+    forall C, R where Allocate[C -> 'k, R].
+    fn skip(self, &cx: C, start: usize) -> ArenaVec[T, 'k] {
+        let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
+        var d = Domain.{ tag, arena };
+        let out = self.slice(&d, start, self.len(&d));
+        let { tag, arena } = d;
+        cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
+        out
+    }
+
+    // Puts `value` at `i`, at most the length, moving the elements from
+    // there on one place up.
+    forall C, R where Allocate[C -> 'k, R].
+    fn insert(self, &cx: C, i: usize, value: T) {
+        let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
+        var d = Domain.{ tag, arena };
+        if i > self.len(&d) {
+            out_of_range();
+        }
+        self.push(&d, value);
+        var j = self.len(&d) - 1usize;
+        while j > i {
+            self.set(&d, j, self.at(&d, j - 1usize));
+            j = j - 1usize;
+        }
+        self.set(&d, i, value);
+        let { tag, arena } = d;
+        cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
+    }
+
+    // Takes out the element at `i`, which must be there, moving the ones
+    // after it one place down.
+    forall C, R where Access[C -> 'k, R].
+    fn remove(self, &cx: C, i: usize) -> T {
+        let (tag, rest) = Access[C -> 'k, R]::open(cx);
+        let value = self.at(&tag, i);
+        var j = i;
+        let n = self.len(&tag);
+        while j + 1usize < n {
+            self.set(&tag, j, self.at(&tag, j + 1usize));
+            j = j + 1usize;
+        }
+        self.truncate(&tag, n - 1usize);
+        cx = Access[C -> 'k, R]::close(tag, rest);
+        value
+    }
+
+    // Reverses the elements in place.
+    forall C, R where Access[C -> 'k, R].
+    fn reverse(self, &cx: C) {
+        let (tag, rest) = Access[C -> 'k, R]::open(cx);
+        var i = 0usize;
+        var j = self.len(&tag);
+        while i + 1usize < j {
+            j = j - 1usize;
+            let a = self.at(&tag, i);
+            self.set(&tag, i, self.at(&tag, j));
+            self.set(&tag, j, a);
+            i = i + 1usize;
+        }
+        cx = Access[C -> 'k, R]::close(tag, rest);
+    }
+
+    // Sorts in place by `cmp`, keeping equal elements in their order (an
+    // insertion sort: stable, and quick on the short or nearly sorted runs
+    // arena data tends to hold).
+    forall Env, C, R where Access[C -> 'k, R], Copy[Env].
+    fn sort_by(self, &cx: C, cmp: closure[Env](&_: C, T, T) -> Order) {
+        var i = 1usize;
+        while i < self.len(&cx) {
+            let value = self.at(&cx, i);
+            var j = i;
+            var moving = true;
+            while moving && j > 0usize {
+                let before = self.at(&cx, j - 1usize);
+                moving = match cmp(&cx, value, before) {
+                    Order::Less => true,
+                    _ => false,
+                };
+                if moving {
+                    self.set(&cx, j, before);
+                    j = j - 1usize;
+                }
+            }
+            self.set(&cx, j, value);
             i = i + 1usize;
         }
     }
 
-    // A new vec holding the same elements.
-    fn clone(self, &tag: Exclusive!['k], &arena: Arena!['k]) -> ArenaVec[T, 'k] {
-        let copy: ArenaVec[T, 'k] = ArenaVec::new(&tag, &arena);
-        copy.append(&tag, &arena, self);
-        copy
+    // ------------------------------------------------------ combinators --
+    // The computation goes to the vec: each lends its closure the context,
+    // so the closure reads other data of the domain and captures only
+    // `Copy` values. Searches stop at the first element that decides them.
+
+    // `f` on each element, in order, for what it does through the context.
+    forall Env, C, R where Access[C -> 'k, R], Copy[Env].
+    fn each(self, &cx: C, f: closure[Env](&_: C, T) -> ()) {
+        var i = 0usize;
+        while i < self.len(&cx) {
+            f(&cx, self.at(&cx, i));
+            i = i + 1usize;
+        }
+    }
+
+    // The first element `f` returns a value for, and that value.
+    forall U, Env, C, R where Access[C -> 'k, R], Copy[U], Copy[Env].
+    fn find_map(self, &cx: C, f: closure[Env](&_: C, T) -> Option[U]) -> Option[U] {
+        let n = self.len(&cx);
+        var i = 0usize;
+        var found = Option::None;
+        while found.is_none() && i < n {
+            found = f(&cx, self.at(&cx, i));
+            i = i + 1usize;
+        }
+        found
+    }
+
+    // The first element `f` holds for.
+    forall Env, C, R where Access[C -> 'k, R], Copy[Env].
+    fn find(self, &cx: C, f: closure[Env](&_: C, T) -> bool) -> Option[T] {
+        self.find_map(&cx, |&c, x| if f(&c, x) { Option::Some.(x) } else { Option::None })
+    }
+
+    // The index of the first element `f` holds for.
+    forall Env, C, R where Access[C -> 'k, R], Copy[Env].
+    fn position(self, &cx: C, f: closure[Env](&_: C, T) -> bool) -> Option[usize] {
+        let n = self.len(&cx);
+        var i = 0usize;
+        var found = Option::None;
+        while found.is_none() && i < n {
+            if f(&cx, self.at(&cx, i)) {
+                found = Option::Some.(i);
+            }
+            i = i + 1usize;
+        }
+        found
+    }
+
+    // Whether `f` holds for some element.
+    forall Env, C, R where Access[C -> 'k, R], Copy[Env].
+    fn any(self, &cx: C, f: closure[Env](&_: C, T) -> bool) -> bool {
+        self.position(&cx, f).is_some()
+    }
+
+    // Whether `f` holds for every element.
+    forall Env, C, R where Access[C -> 'k, R], Copy[Env].
+    fn all(self, &cx: C, f: closure[Env](&_: C, T) -> bool) -> bool {
+        !self.any(&cx, |&c, x| !f(&c, x))
+    }
+
+    // How many elements `f` holds for.
+    forall Env, C, R where Access[C -> 'k, R], Copy[Env].
+    fn count(self, &cx: C, f: closure[Env](&_: C, T) -> bool) -> usize {
+        var n = 0usize;
+        var i = 0usize;
+        while i < self.len(&cx) {
+            if f(&cx, self.at(&cx, i)) {
+                n = n + 1usize;
+            }
+            i = i + 1usize;
+        }
+        n
+    }
+
+    // `acc` through `f` with each element, in order.
+    forall A, Env, C, R where Access[C -> 'k, R], Copy[Env].
+    fn fold(self, &cx: C, acc: A, f: closure[Env](&_: C, A, T) -> A) -> A {
+        var acc = acc;
+        var i = 0usize;
+        while i < self.len(&cx) {
+            acc = f(&cx, acc, self.at(&cx, i));
+            i = i + 1usize;
+        }
+        acc
+    }
+
+    // Each element through `f`, in a new vec.
+    forall U, Env, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], Copy[U], Copy[Env].
+    fn map(self, &cx: C, f: closure[Env](&_: C, T) -> U) -> ArenaVec[U, 'k] {
+        let out: ArenaVec[U, 'k] = ArenaVec::new(&cx);
+        var i = 0usize;
+        while i < self.len(&cx) {
+            let u = f(&cx, self.at(&cx, i));
+            out.push(&cx, u);
+            i = i + 1usize;
+        }
+        out
+    }
+
+    // The elements `f` holds for, in a new vec.
+    forall Env, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], Copy[Env].
+    fn filter(self, &cx: C, f: closure[Env](&_: C, T) -> bool) -> ArenaVec[T, 'k] {
+        let out: ArenaVec[T, 'k] = ArenaVec::new(&cx);
+        var i = 0usize;
+        while i < self.len(&cx) {
+            let x = self.at(&cx, i);
+            if f(&cx, x) {
+                out.push(&cx, x);
+            }
+            i = i + 1usize;
+        }
+        out
+    }
+}
+
+// Elements compared as keys are, through `HashIn` under the context.
+forall T, 'k where Copy[T].
+impl ArenaVec[T, 'k] {
+    // The index of the first element equal to `value`.
+    forall C, R where Access[C -> 'k, R], HashIn[T, C].
+    fn index_of(self, &cx: C, value: T) -> Option[usize] {
+        self.position(&cx, |&c, x| HashIn[T, C]::eq_in(&c, x, value))
+    }
+
+    forall C, R where Access[C -> 'k, R], HashIn[T, C].
+    fn contains(self, &cx: C, value: T) -> bool {
+        self.index_of(&cx, value).is_some()
+    }
+
+    // The same length, and equal elements in the same order.
+    forall C, R where Access[C -> 'k, R], HashIn[T, C].
+    fn eq(self, &cx: C, other: ArenaVec[T, 'k]) -> bool {
+        let n = self.len(&cx);
+        var same = n == other.len(&cx);
+        var i = 0usize;
+        while same && i < n {
+            same = HashIn[T, C]::eq_in(&cx, self.at(&cx, i), other.at(&cx, i));
+            i = i + 1usize;
+        }
+        same
+    }
+}
+
+// A vec as a key, hashed and compared element by element under the
+// domain's context.
+forall T, 'k where Copy[T], HashIn[T, Domain!['k]].
+instance HashIn[ArenaVec[T, 'k], Domain!['k]] {
+    fn hash_in(&cx: Domain!['k], key: ArenaVec[T, 'k], state: HashState) -> HashState {
+        let n = key.len(&cx);
+        var state = state.write_u64(n as u64);
+        var i = 0usize;
+        while i < n {
+            state = HashIn[T, Domain!['k]]::hash_in(&cx, key.at(&cx, i), state);
+            i = i + 1usize;
+        }
+        state
+    }
+
+    fn eq_in(&cx: Domain!['k], a: ArenaVec[T, 'k], b: ArenaVec[T, 'k]) -> bool {
+        a.eq(&cx, b)
     }
 }
 
 forall 'k.
 impl ArenaVec[u8, 'k] {
     // Pushes the bytes of `bytes`, a span of the same domain.
-    fn push_span(self, &tag: Exclusive!['k], &arena: Arena!['k], bytes: Span['k]) {
+    forall C, R where Allocate[C -> 'k, R].
+    fn push_span(self, &cx: C, bytes: Span['k]) {
         let n = bytes.len();
         if n == 0usize {
             return;
         }
+        let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
         var h = self.header.copy(&tag);
         while capacity(h) < h.len + n {
             h = add_segment(&tag, &arena, h, 0u8);
@@ -318,35 +672,74 @@ impl ArenaVec[u8, 'k] {
             unsafe *(unsafe place(h, h.len + i)) = unsafe *(unsafe elem_ptr(source, i));
             i = i + 1usize;
         }
-        let previous = self.header.replace(&tag, Header.{ len: h.len + n, segments: h.segments, first: h.first, table: h.table });
+        self.header.set(&tag, Header.{ len: h.len + n, segments: h.segments, first: h.first, table: h.table });
+        cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
     }
 
     // Pushes the bytes of a literal.
-    fn push_static(self, &tag: Exclusive!['k], &arena: Arena!['k], bytes: Slice[u8, 'static]) {
-        self.push_span(&tag, &arena, Span::from_static(&tag, bytes));
+    forall C, R where Allocate[C -> 'k, R].
+    fn push_static(self, &cx: C, bytes: Slice[u8, 'static]) {
+        let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
+        var d = Domain.{ tag, arena };
+        self.push_span(&d, Span::from_static(&d, bytes));
+        let { tag, arena } = d;
+        cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
     }
 
     // The bytes the vec holds now, as one span: a view of them while they
     // fit the first segment, else a copy in one block of the arena. Later
     // pushes do not lengthen it; a `set`, or a push after a `truncate`,
     // rewrites the bytes of a view.
-    fn span(self, &tag: Exclusive!['k], &arena: Arena!['k]) -> Span['k] {
+    forall C, R where Allocate[C -> 'k, R].
+    fn span(self, &cx: C) -> Span['k] {
+        let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
         let h = self.header.copy(&tag);
-        if h.len == 0usize {
-            return Span::empty(&tag);
-        }
-        if h.segments == 1usize {
+        let s = if h.len == 0usize {
+            Span::empty(&tag)
+        } else if h.segments == 1usize {
             // The first `len` bytes of segment 0: initialized, and arena
             // memory of the domain `tag` governs.
-            return unsafe Span::from_raw_parts(&tag, h.first, h.len);
+            unsafe Span::from_raw_parts(&tag, h.first, h.len)
+        } else {
+            let block = &arena.alloc_slice(&tag, h.len, 0u8);
+            let (dest, size, marker) = block.into_parts();
+            var i = 0usize;
+            while i < h.len {
+                unsafe *(unsafe elem_ptr(dest, i)) = unsafe *(unsafe place(h, i));
+                i = i + 1usize;
+            }
+            Span::from_slice(block)
+        };
+        cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
+        s
+    }
+}
+
+forall 'k.
+impl Span['k] {
+    // The pieces between occurrences of `separator`, in order: one more
+    // than there are occurrences, empty ones included.
+    forall C, R where Allocate[C -> 'k, R].
+    fn split(self, &cx: C, separator: Span['k]) -> ArenaVec[Span['k], 'k] {
+        let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
+        var d = Domain.{ tag, arena };
+        let pieces: ArenaVec[Span['k], 'k] = ArenaVec::new(&d);
+        var start = 0usize;
+        var going = true;
+        while going {
+            match self.find(&d, separator, start) {
+                Option::Some(at) => {
+                    pieces.push(&d, self.slice(start, at));
+                    start = at + separator.len();
+                },
+                Option::None => {
+                    pieces.push(&d, self.skip(start));
+                    going = false;
+                },
+            }
         }
-        let block = &arena.alloc_slice(&tag, h.len, 0u8);
-        let (dest, size, marker) = block.into_parts();
-        var i = 0usize;
-        while i < h.len {
-            unsafe *(unsafe elem_ptr(dest, i)) = unsafe *(unsafe place(h, i));
-            i = i + 1usize;
-        }
-        Span::from_slice(block)
+        let { tag, arena } = d;
+        cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
+        pieces
     }
 }

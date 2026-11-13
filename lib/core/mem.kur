@@ -152,7 +152,7 @@
 //
 use package as core;
 
-use core::cap::{Exclusive, Shared};
+use core::cap::{Access, Exclusive, Shared};
 use core::ptr::NonNull;
 
 // Every owner and capability type here is `restricted`: construction and
@@ -310,43 +310,56 @@ impl Ref[T, 'k] {
     }
 
     // The only way to look at or change a shared value -- requires
-    // presenting the live `Exclusive!` of the matching brand as a witness;
-    // nothing about `self` or `tag` is inspected at runtime, the
-    // brand match is already enforced by the call's own type-check.
-    forall Ret.
-    fn with(self, &tag: Exclusive!['k], f: closure(T) -> (T, Ret)) -> Ret {
+    // presenting the live `Exclusive!` of the matching brand, lent by a
+    // context that holds it (`core::cap::Access`); nothing about `self` or
+    // the capability is inspected at runtime, the brand match is already
+    // enforced by the call's own type-check.
+    forall Ret, C, R where Access[C -> 'k, R].
+    fn with(self, &cx: C, f: closure(T) -> (T, Ret)) -> Ret {
+        let (tag, rest) = Access[C -> 'k, R]::open(cx);
         let { ptr: nn, marker: m } = self;
         let p = nn.as_ptr();
         let v = unsafe *p;
         let (v2, ret) = f(v);
         unsafe *p = v2;
+        cx = Access[C -> 'k, R]::close(tag, rest);
         ret
     }
 
     // Calls `f` on the value where it lives: `f` gets it through `&` and
     // its changes land in place, with no copy of the value in or out. The
     // same witness as `with`.
-    forall Ret.
-    fn update(self, &tag: Exclusive!['k], f: closure(&_: T) -> Ret) -> Ret {
+    forall Ret, C, R where Access[C -> 'k, R].
+    fn update(self, &cx: C, f: closure(&_: T) -> Ret) -> Ret {
+        let (tag, rest) = Access[C -> 'k, R]::open(cx);
         let { ptr: nn, marker: m } = self;
-        unsafe lend(nn.as_ptr(), f)
+        let ret = unsafe lend(nn.as_ptr(), f);
+        cx = Access[C -> 'k, R]::close(tag, rest);
+        ret
     }
 
     // Puts `val` in the place and hands back the value that was there:
     // `with`'s store, with no closure. The same witness as `with`.
-    fn replace(self, &tag: Exclusive!['k], val: T) -> T {
+    forall C, R where Access[C -> 'k, R].
+    fn replace(self, &cx: C, val: T) -> T {
+        let (tag, rest) = Access[C -> 'k, R]::open(cx);
         let { ptr: nn, marker: m } = self;
         let p = nn.as_ptr();
         let old = unsafe *p;
         unsafe *p = val;
+        cx = Access[C -> 'k, R]::close(tag, rest);
         old
     }
 
-    // `update`, with a context `cx` lent to `f` beside the value (`lend_in`).
-    forall C, Ret.
-    fn update_in(self, &tag: Exclusive!['k], &cx: C, f: closure(&_: T, &_: C) -> Ret) -> Ret {
+    // `update`, with a second place `other` lent to `f` beside the value
+    // (`lend_in`).
+    forall X, Ret, C, R where Access[C -> 'k, R].
+    fn update_in(self, &cx: C, &other: X, f: closure(&_: T, &_: X) -> Ret) -> Ret {
+        let (tag, rest) = Access[C -> 'k, R]::open(cx);
         let { ptr: nn, marker: m } = self;
-        unsafe lend_in(nn.as_ptr(), &cx, f)
+        let ret = unsafe lend_in(nn.as_ptr(), &other, f);
+        cx = Access[C -> 'k, R]::close(tag, rest);
+        ret
     }
 
     // Projects this `Ref` onto a different pointer of the same brand, via
@@ -379,13 +392,23 @@ impl Ref[T, 'k] {
     // it. `T` comes from `r`'s own type, so a bare `r.copy(&tag)` needs no
     // annotation. Needs `T: Copy` because the value is handed back as the
     // result while also staying in place, which duplicates it.
-    fn copy(self, &tag: Exclusive!['k]) -> T {
-        // The same read `with(tag, |v| (v, v))` performs, without the
+    forall C, R where Access[C -> 'k, R].
+    fn copy(self, &cx: C) -> T {
+        // The same read `with(&cx, |v| (v, v))` performs, without the
         // closure call and the store of an unchanged value.
+        let (tag, rest) = Access[C -> 'k, R]::open(cx);
         let { ptr: nn, marker: m } = self;
         let p = nn.as_ptr();
         let v = unsafe *p;
+        cx = Access[C -> 'k, R]::close(tag, rest);
         v
+    }
+
+    // Puts `val` in the place; the value there before is dropped, which
+    // `T: Copy` allows. `replace` hands it back.
+    forall C, R where Access[C -> 'k, R].
+    fn set(self, &cx: C, val: T) {
+        let old = self.replace(&cx, val);
     }
 
     // A read through one node of the domain's shared-read tree. Any node

@@ -47,7 +47,7 @@ its body reads through the slice's pointer, while
 `std::io::write_all(fd: i32, ptr: *u8, len: usize)` is class B: the same
 pointer, spelled bare. Unfolding would put nearly every function that takes
 or returns a `Slice`, `Span`, `Ref`, `Buffer!`, `Vec!`, `Arena!`, `HashMap!`
-or `ArenaMap!` into class B and make the class useless as a signal. The
+or `ArenaVec` into class B and make the class useless as a signal. The
 walk under-reports in one predictable direction: **a pointer that reaches a
 caller inside a checked structure is the structure's obligation, not the
 function's.** Where that structure's invariant is at issue, the remedy is
@@ -62,8 +62,8 @@ written ruling (section 2.0b).
 
 ## 1. Class A: brand-to-authority constructors (empty)
 
-A brand value is `Copy` and can be read from any `Ref`, `Slice`, `Span` or
-`ArenaMap!` that carries one. A function turning a brand value into a
+A brand value is `Copy` and can be read from any `Ref`, `Slice` or `Span`
+that carries one. A function turning a brand value into a
 capability for that brand would therefore make the authority copyable too.
 
 **No library function does this.** The only ways to obtain an
@@ -77,9 +77,8 @@ caught but **unspellable**: no function accepts the brand that such a forgery
 would need to pass.
 
 The functions that take a `Brand` value and return a branded object
-(`Ref::from_raw`, `Slice::from_raw_parts`, `Span::from_raw_parts_branded`,
-`ArenaMap::adopt_parts`) return data, not a capability, and are all
-`unsafe fn` (section 2).
+(`Ref::from_raw`, `Slice::from_raw_parts`, `Span::from_raw_parts_branded`)
+return data, not a capability, and are all `unsafe fn` (section 2).
 
 ### 1.1 Reading a brand out of a capability
 
@@ -122,7 +121,6 @@ yes. A blanket "class B means `unsafe fn`" rule would get them wrong.
 | `alloc::heap::Uninit::into_raw` | Consumes the linear `Uninit!` and returns its address. `Uninit!` is restricted to `alloc::heap`, so the address has no safe way back to an owner; it grants no dereference, ownership or reconstruction authority. |
 | `alloc::heap::Uninit::into_parts` | `into_raw`, plus the block's `usize` extent, which is plain data. |
 | `alloc::heap::null_u8` | Returns the null `*u8`, for comparing allocator results against. Dereferencing it is a separate unsafe operation, checked at that site. |
-| `alloc::collections::arena_map::ArenaMap::into_parts` | Consumes the restricted, linear `ArenaMap!` and returns its raw parts. The only way back to an owner is the `unsafe fn adopt_parts` (section 2.1). |
 | `core::slice::Slice::into_parts` | Returns the `(ptr, len, marker)` a `Slice` was built from. Rebuilding a `Slice` needs the `unsafe fn from_raw_parts`, so it grants no new authority. |
 | `core::mem::Ref::into_parts` | Returns the `(ptr, marker)` a `Ref` was built from; rebuilding one needs the `unsafe fn Ref::from_raw`, so a stale pointer cannot be re-wrapped under a live brand in safe code. |
 | `core::raw::Span::into_parts` | Returns the `(ptr, len)` a `Span` was built from, never its brand: a span must not hand out a witness for its domain. Reading through the pointer needs `unsafe`, and rebuilding a span needs the `unsafe fn Span::from_raw_parts`. |
@@ -183,12 +181,10 @@ double free.
 | `alloc::collections::hashmap::destroy_chain` | `head` is a well-formed, uniquely owned entry chain; every entry, key box and value box along it is freed |
 | `alloc::collections::hashmap::remove_chain` | `head` is a well-formed chain and `key_ptr` a live key box; the matched entry *and* `key_ptr` are freed |
 | `alloc::collections::hashmap::resize` | `base` is a live bucket array of exactly `old_bc` slots; it is freed and replaced, so every outstanding `slot_ptr` into it dies |
-| `alloc::collections::arena_map::resize`, `resize_with` | the same, for the arena-backed map (entries live in the arena; only the bucket array is freed); `resize_with` calls `hash_fn` in place of `Hash` |
 | `alloc::arena::free_chain_after_root_release` | `c` heads a chunk chain this arena built, **and** `Arena::destroy` has already retired the root chunk's data buffer through `Allocation::release`. Every header and every non-root data buffer is freed, so every arena pointer dies. Calling it without the prior `release` leaks the root buffer; calling it on a chain whose root was freed some other way double-frees it |
 | `alloc::heap::HeapAllocator::adopt_raw` | `p` is a live `malloc`/`realloc` result with no other owner; it becomes a linear, freeable `Uninit!`. Records extent 0, since the size did not travel with the address |
 | `alloc::heap::HeapAllocator::adopt_raw_sized` | `adopt_raw`'s obligation, **plus** `extent` is the size most recently requested for that block. With `adopt_raw`, the only way into an `Uninit!` from a bare pointer |
 | `alloc::buffer::Buffer::from_owned_ptr` | `adopt_raw` one layer up: `p` is a live `malloc`/`realloc` result of at least `cap` bytes with no other owner, `len <= cap`, and `p[0..len)` is initialized. The result is linear and frees `p` at `destroy` |
-| `alloc::collections::arena_map::ArenaMap::adopt_parts` | `buckets` is a live allocation of exactly `bucket_count` slots, each a real chain head or the null sentinel, either fresh from this module or the untouched result of exactly **one** earlier `into_parts` call on a genuine `ArenaMap!` with the same `marker`; `len` is that map's accurate entry count. It cannot detect parts mixed from two maps, or the same (Copy) parts fed to two calls, which would make two owners of one bucket array |
 
 ### 2.2 Writes through an arbitrary pointer
 
@@ -199,14 +195,10 @@ double free.
 | `alloc::collections::hashmap::alloc_entry` | `key`, `val` and `next` are taken over by the new entry; none may be freed separately afterwards |
 | `alloc::collections::hashmap::insert_chain` | `head` is a well-formed chain; `key_ptr` is consumed into a new entry *or* freed (`is_new` says which) |
 | `alloc::collections::hashmap::rehash_bucket` | `new_base[0..new_bc)` is a live bucket array; every entry on `head` is relinked into it, and `head` must not be walked afterwards |
-| `alloc::collections::arena_map::insert_chain`, `insert_chain_with` | `head` is well-formed and `key_slot` a readable staging slot; the key is copied into the arena, never the slot itself. `_with` calls `eq_fn` in place of `Eq` |
-| `alloc::collections::arena_map::rehash_bucket`, `rehash_bucket_with` | as `hashmap::rehash_bucket` |
-| `alloc::collections::arena_map::arena_alloc_one` | the returned `*T` is arena-owned: it must not be freed or outlive its arena |
 | `alloc::arena::bump_chunk` | `cur` is the arena's live current chunk; the reserved bytes and the returned chunk belong to that arena |
 | `alloc::arena::new_chunk` | `next` is a chain head or the chain terminator; the returned header is owned by the chain |
 | `alloc::arena::new_header` | `next` is a chain head or the terminator, and `data` is a live buffer of at least `cap` bytes that the returned header takes over; passing a `data` still owned elsewhere makes two owners of one block |
 | `alloc::arena::copy_bytes` | `dest[0..count)` is writable, `src[0..count)` readable, and the two ranges do not overlap |
-| `core::raw::copy_span_bytes` | `dest` has room for `s.len()` bytes and does not overlap the span; the span is read under the presented `Exclusive!['k]` |
 | `alloc::buffer::Buffer::commit`, `BufferWriter::commit_external` | every byte being published (`p[len..len+n)`) has been written since the last reserve/grow. Publishing past `cap` aborts |
 | `alloc::arena::ArenaByteWriter::commit_external` | exactly `count` bytes at the pointer `writable_tail` returned have been initialized |
 | `alloc::collections::vec::Vec::reserve_n` | before any of `[old_len, old_len + extra)` is read through the returned `Slice`, or the returned `Vec!` is observed by anything that could read them, a valid `T` is written to every one of those slots |
@@ -226,8 +218,6 @@ double free.
 | `core::hash::HashState::write_bytes` | `ptr[0..len)` is readable for the whole call |
 | `core::fmt::Writable::write_raw` (and its instances) | `ptr[0..len)` is readable for the whole call; the writer reads the bytes before returning and keeps no pointer to them |
 | `alloc::collections::hashmap::get_ref_chain` | `head` is a well-formed chain and `key_ptr` a readable key; `eq_fn` is called with raw pointers (section 2.5) |
-| `alloc::collections::arena_map::get_chain`, `get_chain_with` | the same |
-| `alloc::collections::arena_map::resize_go_with` | `base` is a live bucket array of exactly `old_bc` slots and `new_base` a fresh one of exactly `new_bc`; each chain in `base` is relinked into `new_base` |
 | `alloc::buffer::Buffer::push_n` | `src[0..count)` is readable and does not alias the buffer's own storage, which the growth on entry may reallocate |
 | `std::io::write_all`, `write_all_from` | `ptr[0..len)` is readable; for `write_all_from`, also `offset <= len` |
 | `std::io::File::write_all_raw`, `std::io::write_file_raw` | `ptr[0..len)` is readable throughout the write |
@@ -246,7 +236,7 @@ a checked type; their obligation is the same kind of thing.
 | `alloc::owned::Allocation::base` | the returned `*T` addresses memory the caller **still owns**, since the `Allocation!` stays with it (`Buffer::as_ptr`'s situation, not `into_raw`'s). It is invalidated by the `release`/`grow` that retires or moves the block, and it cannot be turned back into an `Allocation!` |
 | `core::slice::Slice::from_raw_parts` | `ptr[0..len)` is live, initialized and accessible under `marker`'s brand |
 | `core::mem::Ref::from_raw` | `ptr` points at a live `T` inside the domain `marker` names, so presenting that domain's capability really authorizes the access |
-| `core::raw::Span::from_raw_parts` | `ptr[0..len)` is initialized and stays readable while the domain of the `&cap` it is handed has its capability. Literal-backed spans use the safe `Span::from_static` |
+| `core::raw::Span::from_raw_parts` | `ptr[0..len)` is initialized and stays readable while the domain of the context `&cx` lends has its capability. Literal-backed spans use the safe `Span::from_static` |
 | `core::raw::Span::from_raw_parts_branded` | as `from_raw_parts`, for a module whose own object holds the domain's brand (an arena's `marker`); `marker` must be a witness that object really holds, since a span planted in another domain reads that domain's bytes |
 | `core::raw::Span::with_len` | the `len` bytes from the span's start are initialized and lie in the buffer the span points into |
 | `alloc::arena::ArenaByteWriter::writable_tail` | the destination is valid only while the writer owns the arena; external code must commit exactly the bytes it initialized |
@@ -256,10 +246,10 @@ a checked type; their obligation is the same kind of thing.
 | `alloc::arena::Arena::alloc_bytes` | the returned run is reserved but **uninitialized** and unaligned; it must not outlive the arena |
 | `core::raw::elem_ptr`, `core::slice::elem_ptr`, `alloc::collections::vec::elem_ptr`, `alloc::buffer::buffer_elem_ptr` | `base` is an array with more than `i` elements; no bound is passed or checked |
 | `alloc::arena::byte_ptr_at` | `base + off` lies within one live chunk's data buffer |
-| `alloc::collections::hashmap::slot_ptr`, `arena_map::slot_ptr` | `i` is below the bucket count `base` was allocated with |
-| `alloc::collections::hashmap::alloc_buckets`, `arena_map::alloc_buckets` | the returned array is owned: exactly one `resize`/`destroy` must free it |
-| `alloc::collections::hashmap::null_entry`, `arena_map::null_entry` | the null entry pointer must only be compared, never dereferenced |
-| `alloc::collections::hashmap::is_null_entry`, `arena_map::is_null_entry` | accepts any pointer; `false` means only non-null, not valid |
+| `alloc::collections::hashmap::slot_ptr` | `i` is below the bucket count `base` was allocated with |
+| `alloc::collections::hashmap::alloc_buckets` | the returned array is owned: exactly one `resize`/`destroy` must free it |
+| `alloc::collections::hashmap::null_entry` | the null entry pointer must only be compared, never dereferenced |
+| `alloc::collections::hashmap::is_null_entry` | accepts any pointer; `false` means only non-null, not valid |
 | `core::mem::make_split_part` | `field` addresses initialized storage of `Field` that no other live capability covers, as for `Region::from_raw`: the returned `Region!` is fresh authority over it. It returns only the part's fresh brand, never a `Link!`; `Link!` is restricted to `core::mem` and built only by `Region::split`, so a part over unrelated storage cannot be merged into a parent |
 | `core::mem::Region::from_raw` | `ptr` points at storage for a `T` that nothing else can reach while `'r` lives, and `cap` is the only capability over `'r` (in practice fresh from `Exclusive::fresh`). `Allocation::adopt` discharges it with a fresh capability over a block its `Uninit!` owned outright |
 | `core::mem::lend`, `lend_in` | `p` points at a live `T` that nothing else reads or writes while `f` runs. `Ref::update`/`update_in` discharge it with the brand's `Exclusive!`; `Owned::update`/`update_in` with the `Owned!` they hold. `lend_in`'s `cx` carries no obligation |
@@ -293,7 +283,7 @@ callback's type, and the difference matters:
 | `alloc::collections::hashmap::find_chain_in`, `put_chain_in`, `take_chain_in`, `rehash_bucket_in`, `resize_in` | the same invariants, for keys read through a domain's capability; reached from the safe `get_in`/`insert_in`/`remove_in` |
 | `core::mem::Ref::map` | `f` returns a pointer *into the same allocation* as its argument; the result is stamped with the original brand `'k` with no check that the new address belongs to it |
 
-`HashMap::get`/`insert`/`remove`, like `ArenaMap::get_ref`/`insert`, are
+`HashMap::get`/`insert`/`remove` are
 class C: they dispatch through the `Hash[K]`/`Eq[K]` traits instead of raw
 function pointers, and they hand back every key they do not keep, so a
 linear key is never lost.
@@ -412,8 +402,8 @@ Types whose hidden representation protects authority or bounds:
 | `Vec![T,'k]` | `alloc::collections::vec` | a pointer with a `len`/`cap` the module maintains; a forged one is indexed and freed through |
 | `HashMap![K,V,'k]`, `Entry[K,V]` | `alloc::collections::hashmap` | `buckets` matches `bucket_count`; entries are the chain nodes `free_one`/`destroy_chain` free |
 | `Drain!` | `alloc::collections::hashmap` | a map being taken apart; holds the map's capability so nothing else touches the entries meanwhile |
-| `ArenaMap![K,V,'k]` | `alloc::collections::arena_map` | `buckets` matches `bucket_count`/`len`; a forged map could be destroyed over arbitrary storage |
-| `FrozenMap` | `alloc::collections::arena_map` | a snapshot whose bucket array lives in the arena; its parts cannot be forged |
+| `ArenaVec[T,'k]`, `Header` | `alloc::collections::arena_vec` | a header naming segments of the sizes `locate` computes, with `len` within them; a forged one is read and written through |
+| `ArenaMap[K,V,'k]`, `ArenaSet[K,'k]`, `MapState`, `Entry` | `alloc::collections::arena_map` | slots that index live entries; a forged map probes out of range, which `out_of_range` stops |
 | `Arena!['k]`, `Chunk` | `alloc::arena` | one long-lived brand tied to a chunk chain this module built |
 | `ArenaByteWriter!`, `ArenaBytes` | `alloc::arena` | arena byte runs whose public length is exactly the initialized prefix |
 | `Buffer!`, `BufferRestore!['k]` | `alloc::buffer` | `Buffer!` owns a heap byte run that `destroy` frees with no capability; `BufferRestore!` plus the matching `Exclusive!` yields the owning `Buffer!` back |
@@ -428,11 +418,9 @@ that restricting a type costs nothing: it only sees the code it is run on.
 
 ### 4.2 Deliberately exposed
 
-- **`alloc::collections::arena_map::Entry`.** Arena-map entries are never
-  freed individually (the arena is freed as a unit), so a forged entry has
-  no arbitrary-free hazard. The map itself is restricted; code outside the
-  module reaches its raw parts through `into_parts` and rebuilds through the
-  `unsafe fn adopt_parts`.
+- **`alloc::arena::Domain!`.** An arena with its capability, and nothing
+  else: building one needs both, and taking one apart gives back only what
+  went in.
 - **`core::raw::Pos`.** A plain source position; no invariant to protect.
 - **`core::option::Option`/`Result`, `alloc::collections::list::List`/
   `Cons`, `alloc::collections::vec::Popped!`, the `Found` enums.** These

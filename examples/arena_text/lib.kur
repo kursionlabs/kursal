@@ -1,75 +1,99 @@
-// Counting words with text and tables that live in one arena. The text is
-// built in an `ArenaVec[u8, 'k]` and read as `Span`s; the table of distinct
-// words is an `ArenaVec` of `(Span, u32)` rows, compared through `HashIn`
-// under the arena's capability. Every handle is `Copy`, and nothing here is
-// unsafe or freed one at a time: destroying the arena frees it all. Each line
-// printed is built in a `Buffer!` on the heap, numbers in decimal included,
-// and saved into the arena (`save_buffer`), which frees the buffer.
+// Counting words with text and tables that live in one arena. The program's
+// own context, `Mem!`, holds the arena, its capability and a count of the
+// lines it printed, and lends the first two to the standard library through
+// `Access` (reads and writes), `Allocate` (allocation) and `ReadBytes` (the
+// bytes of spans), so every call takes the one `&mem`. The text is built in
+// an `ArenaVec[u8, 'k]` and read as `Span`s; the table of distinct words is
+// an `ArenaVec` of `(Span, u32)` rows, compared through `HashIn`. Every
+// handle is `Copy`, and nothing here is unsafe or freed one at a time:
+// destroying the arena frees it all. Each line printed is built in a
+// `Buffer!` on the heap, numbers in decimal included, and saved into the
+// arena (`Buffer::save`), which frees the buffer.
 //
 // It prints each distinct word with its count, in first-seen order, then
-// checks the rest of the arena vec's operations, and exits with status 3
-// through `std::process::exit`.
-use std::alloc::arena::{Arena, save_buffer};
+// checks the rest of the arena vec's and span's operations, and exits with
+// status 3 through `std::process::exit`.
+use std::alloc::arena::{Allocate, Arena, Domain};
 use std::bytes::buffer::Buffer;
-use std::cap::Exclusive;
+use std::cap::{Access, Exclusive};
+use std::cmp::Order;
 use std::collections::arena_vec::ArenaVec;
 use std::hash::{HashIn, HashState};
 use std::io::{print, write_span};
 use std::option::Option;
 use std::process::exit;
-use std::raw::{Span, span_bytes_eq_lit};
-use std::slice::{Slice, find_byte, find_bytes};
+use std::raw::Span;
+use std::slice::{ReadBytes, Slice};
 
 forall 'k.
 exposed struct Mem! {
     tag: Exclusive!['k],
     arena: Arena!['k],
+    printed: u32,
 }
 
-// The words of `text`, between single spaces.
+// What `Mem!` holds besides the capability, or besides the capability and
+// the arena, while it is open.
 forall 'k.
-fn words(&mem: Mem!['k], text: Span['k]) -> ArenaVec[Span['k], 'k] {
-    let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&mem.tag, &mem.arena);
-    var start = 0usize;
-    var going = true;
-    while going {
-        let unit = match find_byte(&mem.tag, text, start, b' ') {
-            Option::Some(at) => {
-                out.push(&mem.tag, &mem.arena, text.skip(start).take(at - start));
-                start = at + 1usize;
-            },
-            Option::None => {
-                out.push(&mem.tag, &mem.arena, text.skip(start));
-                going = false;
-            },
-        };
+exposed struct MemRest! {
+    arena: Arena!['k],
+    printed: u32,
+}
+
+forall 'k.
+instance Access[Mem!['k] -> 'k, MemRest!['k]] {
+    fn open(cx: Mem!['k]) -> (Exclusive!['k], MemRest!['k]) {
+        let { tag, arena, printed } = cx;
+        (tag, MemRest.{ arena, printed })
     }
-    out
+
+    fn close(tag: Exclusive!['k], rest: MemRest!['k]) -> Mem!['k] {
+        let { arena, printed } = rest;
+        Mem.{ tag, arena, printed }
+    }
+}
+
+forall 'k.
+instance Allocate[Mem!['k] -> 'k, u32] {
+    fn open(cx: Mem!['k]) -> (Exclusive!['k], Arena!['k], u32) {
+        let { tag, arena, printed } = cx;
+        (tag, arena, printed)
+    }
+
+    fn close(tag: Exclusive!['k], arena: Arena!['k], rest: u32) -> Mem!['k] {
+        Mem.{ tag, arena, printed: rest }
+    }
+}
+
+forall 'k.
+instance ReadBytes[Mem!['k], Span['k]] {
+    fn get(&mem: Mem!['k], bytes: Span['k], index: usize) -> Option[u8] {
+        bytes.get(&mem, index)
+    }
+
+    fn len(&mem: Mem!['k], bytes: Span['k]) -> usize {
+        bytes.len()
+    }
 }
 
 // Adds one to `word`'s row, or adds a row for it.
 forall 'k.
 fn count(&mem: Mem!['k], table: ArenaVec[(Span['k], u32), 'k], word: Span['k]) {
-    var i = 0usize;
-    while i < table.len(&mem.tag) {
-        let unit = match table.get(&mem.tag, i) {
-            Option::Some(row) => {
-                let (seen, n) = row;
-                if HashIn[Span['k], Exclusive!['k]]::eq_in(&mem.tag, seen, word) {
-                    let old = table.set(&mem.tag, i, (seen, n + 1u32));
-                    return;
-                }
-            },
-            Option::None => (),
-        };
-        i = i + 1usize;
+    match table.position(&mem, |&m, row| {
+        let (seen, n) = row;
+        HashIn[Span['k], Mem!['k]]::eq_in(&m, seen, word)
+    }) {
+        Option::Some(i) => {
+            let (seen, n) = table.at(&mem, i);
+            table.set(&mem, i, (seen, n + 1u32));
+        },
+        Option::None => table.push(&mem, (word, 1u32)),
     }
-    table.push(&mem.tag, &mem.arena, (word, 1u32));
 }
 
 forall 'k.
 fn hash(&mem: Mem!['k], key: (Span['k], u32)) -> u64 {
-    HashIn[(Span['k], u32), Exclusive!['k]]::hash_in(&mem.tag, key, HashState::new()).finish()
+    HashIn[(Span['k], u32), Mem!['k]]::hash_in(&mem, key, HashState::new()).finish()
 }
 
 fn check(ok: bool, what: Slice[u8, 'static]) {
@@ -79,80 +103,101 @@ fn check(ok: bool, what: Slice[u8, 'static]) {
     }
 }
 
-fn main() -> i32 {
-    let exists 'k. (tag, arena) = Arena::new();
-    var mem = Mem.{ tag, arena };
-    let text: ArenaVec[u8, 'k] = ArenaVec::new(&mem.tag, &mem.arena);
-    text.push_static(&mem.tag, &mem.arena, "the cat and ");
-    text.push_static(&mem.tag, &mem.arena, "the hat");
-    let all = text.span(&mem.tag, &mem.arena);
-    let table: ArenaVec[(Span['k], u32), 'k] = ArenaVec::new(&mem.tag, &mem.arena);
-    let ws = words(&mem, all);
-    var i = 0usize;
-    while i < ws.len(&mem.tag) {
-        let unit = match ws.get(&mem.tag, i) {
-            Option::Some(w) => count(&mem, table, w),
-            Option::None => (),
-        };
-        i = i + 1usize;
-    }
+forall 'k.
+fn by_value(&mem: Mem!['k], a: u32, b: u32) -> Order {
+    if a < b { Order::Less } else if a > b { Order::Greater } else { Order::Equal }
+}
+
+// Everything the program does, in the domain `mem` lends.
+forall 'k.
+fn run(&mem: Mem!['k]) {
+    let text: ArenaVec[u8, 'k] = ArenaVec::new(&mem);
+    text.push_static(&mem, "the cat and ");
+    text.push_static(&mem, "the hat");
+    let all = text.span(&mem);
+    let table: ArenaVec[(Span['k], u32), 'k] = ArenaVec::new(&mem);
+    let ws = all.split(&mem, Span::from_static(&mem, " "));
+    ws.each(&mem, |&m, w| count(&m, table, w));
     var j = 0usize;
-    while j < table.len(&mem.tag) {
-        let unit = match table.get(&mem.tag, j) {
-            Option::Some(row) => {
-                let (w, n) = row;
-                // Each line is built in a `Buffer!` on the heap, the word read under the arena's
-                // capability, then copied into the arena in one block, and the buffer freed.
-                let line = Buffer::new().push_bytes(&mem.tag, w).push_byte(b' ').push_u64(n as u64).push_static("\n");
-                let written = write_span(1, &mem.tag, save_buffer(&mem.arena, line));
-            },
-            Option::None => (),
-        };
+    while j < table.len(&mem) {
+        let (w, n) = table.at(&mem, j);
+        // Each line is built in a `Buffer!` on the heap, the word read under
+        // the context, then copied into the arena in one block, and the
+        // buffer freed.
+        let line = Buffer::new().push_bytes(&mem, w).push_byte(b' ').push_u64(n as u64).push_static("\n").save(&mem);
+        let written = write_span(1, &mem, line);
+        mem.printed = mem.printed + 1u32;
         j = j + 1usize;
     }
+    check(mem.printed == 4u32, "printed");
 
-    // `find_bytes` finds a word's bytes inside the text.
-    let hat = Span::from_static(&mem.tag, "hat");
-    check(find_bytes(&mem.tag, all, 0usize, hat).unwrap_or(0usize) == 16usize, "find_bytes");
-    check(find_bytes(&mem.tag, all, 17usize, hat).is_none(), "find_bytes past");
+    // Spans: searching, comparing, slicing, joining.
+    let hat = Span::from_static(&mem, "hat");
+    check(all.find(&mem, hat, 0usize).unwrap_or(0usize) == 16usize, "find");
+    check(all.find(&mem, hat, 17usize).is_none(), "find past");
+    check(all.contains(&mem, hat) && all.ends_with(&mem, hat) && all.starts_with(&mem, ws.at(&mem, 0usize)), "contains");
+    check(all.find_byte(&mem, b'a', 6usize).unwrap_or(0usize) == 8usize && all.rfind_byte(&mem, b't').unwrap_or(0usize) == 18usize, "find_byte");
+    check(all.slice(4usize, 7usize).is(&mem, "cat") && all.slice(17usize, 99usize).is(&mem, "at"), "slice");
+    check(all.byte_or_zero(&mem, 1usize) == b'h' && all.byte_or_zero(&mem, 99usize) == 0u8 && all.get(&mem, 99usize).is_none(), "byte_or_zero");
+    let catch = ws.at(&mem, 1usize).concat(&mem, Span::from_static(&mem, "ch"));
+    check(catch.is(&mem, "catch") && catch.cmp(&mem, all).is_lt() && hat.eq(&mem, ws.at(&mem, 4usize)), "concat, cmp, eq");
+    check(catch.hash(&mem) == Span::from_static(&mem, "catch").hash(&mem), "hash");
     // Equal tuple keys hash alike, whatever span they view.
-    let the_first = ws.get(&mem.tag, 0usize).unwrap_or(all);
-    let the_again = ws.get(&mem.tag, 3usize).unwrap_or(all);
-    check(hash(&mem, (the_first, 7u32)) == hash(&mem, (the_again, 7u32)), "hash_in");
+    check(hash(&mem, (ws.at(&mem, 0usize), 7u32)) == hash(&mem, (ws.at(&mem, 3usize), 7u32)), "hash_in");
 
-    // The rest of the vec: filled, set, resize, pop, truncate, append, clone.
-    let xs: ArenaVec[u32, 'k] = ArenaVec::filled(&mem.tag, &mem.arena, 3usize, 5u32);
-    let old = xs.set(&mem.tag, 1usize, 6u32);
-    check(old.unwrap_or(0u32) == 5u32 && xs.set(&mem.tag, 3usize, 1u32).is_none(), "set");
-    xs.resize(&mem.tag, &mem.arena, 40usize, 9u32);
-    check(xs.len(&mem.tag) == 40usize && xs.last(&mem.tag).unwrap_or(0u32) == 9u32, "resize");
-    check(xs.pop(&mem.tag).unwrap_or(0u32) == 9u32 && xs.len(&mem.tag) == 39usize, "pop");
-    xs.truncate(&mem.tag, 2usize);
-    let ys = xs.clone(&mem.tag, &mem.arena);
-    ys.append(&mem.tag, &mem.arena, ys);
-    let sum = ys.get(&mem.tag, 0usize).unwrap_or(0u32) + ys.get(&mem.tag, 1usize).unwrap_or(0u32)
-        + ys.get(&mem.tag, 2usize).unwrap_or(0u32) + ys.get(&mem.tag, 3usize).unwrap_or(0u32);
-    check(ys.len(&mem.tag) == 4usize && sum == 22u32 && xs.len(&mem.tag) == 2usize, "append");
+    // Text moves between arenas: copied out of this one under its capability.
+    let exists 'o. other = Domain::new();
+    var other = other;
+    let moved = catch.copy_to(&mem, &other);
+    check(moved.is(&other, "catch"), "copy_to");
+    other.destroy();
+
+    // The rest of the vec.
+    let xs: ArenaVec[u32, 'k] = ArenaVec::filled(&mem, 3usize, 5u32);
+    check(xs.replace(&mem, 1usize, 6u32) == 5u32 && xs.get(&mem, 3usize).is_none(), "replace, get");
+    xs.resize(&mem, 40usize, 9u32);
+    check(xs.len(&mem) == 40usize && xs.last(&mem).unwrap_or(0u32) == 9u32, "resize");
+    check(xs.pop(&mem).unwrap_or(0u32) == 9u32 && xs.len(&mem) == 39usize, "pop");
+    xs.truncate(&mem, 2usize);
+    let ys = xs.clone(&mem);
+    ys.append(&mem, ys);
+    check(ys.len(&mem) == 4usize && ys.fold(&mem, 0u32, |&m, a, x| a + x) == 22u32 && xs.len(&mem) == 2usize, "append");
+    ys.insert(&mem, 1usize, 1u32);
+    ys.insert(&mem, 5usize, 7u32);
+    check(ys.remove(&mem, 0usize) == 5u32 && ys.first(&mem).unwrap_or(0u32) == 1u32, "insert, remove");
+    ys.sort_by(&mem, |&m, a, b| by_value(&m, a, b));
+    let sorted = ys.map(&mem, |&m, x| x * 10u32);
+    check(sorted.eq(&mem, ArenaVec::two(&mem, 10u32, 50u32).slice(&mem, 0usize, 1usize)) == false, "eq");
+    check(sorted.at(&mem, 0usize) == 10u32 && sorted.at(&mem, 4usize) == 70u32 && sorted.index_of(&mem, 60u32).unwrap_or(9usize) == 2usize, "sort_by, map, index_of");
+    sorted.reverse(&mem);
+    check(sorted.at(&mem, 0usize) == 70u32 && sorted.skip(&mem, 3usize).eq(&mem, ArenaVec::two(&mem, 50u32, 10u32)), "reverse, skip");
+    check(sorted.any(&mem, |&m, x| x == 50u32) && !sorted.all(&mem, |&m, x| x > 10u32) && sorted.count(&mem, |&m, x| x > 40u32) == 4usize, "any, all, count");
+    check(sorted.find(&mem, |&m, x| x < 60u32).unwrap_or(0u32) == 50u32 && sorted.filter(&mem, |&m, x| x < 60u32).len(&mem) == 2usize, "find, filter");
+    check(sorted.contains(&mem, 10u32) && !sorted.contains(&mem, 11u32) && ArenaVec::one(&mem, 4u32).len(&mem) == 1usize, "contains");
     // Elements never move: a place taken before the vec grew is still its element.
-    let early = xs.get_ref(&mem.tag, 0usize);
-    xs.resize(&mem.tag, &mem.arena, 100usize, 0u32);
-    let unit = match early {
+    let early = xs.get_ref(&mem, 0usize);
+    xs.resize(&mem, 100usize, 0u32);
+    match early {
         Option::Some(r) => {
-            let before = r.replace(&mem.tag, 8u32);
-            check(before == 5u32 && xs.get(&mem.tag, 0usize).unwrap_or(0u32) == 8u32, "get_ref");
+            let before = r.replace(&mem, 8u32);
+            check(before == 5u32 && xs.at(&mem, 0usize) == 8u32, "get_ref");
         },
         Option::None => check(false, "get_ref"),
-    };
+    }
     // Numbers in decimal, the most negative one included.
     let numbers = Buffer::new().push_u64(18446744073709551615u64).push_byte(b' ').push_i64(-9223372036854775807i64 - 1i64)
-        .push_byte(b' ').push_i64(-42i64).push_byte(b' ').push_usize(0usize);
-    let numbers = save_buffer(&mem.arena, numbers);
-    check(span_bytes_eq_lit(&mem.tag, numbers, "18446744073709551615 -9223372036854775808 -42 0"), "push_u64, push_i64");
+        .push_byte(b' ').push_i64(-42i64).push_byte(b' ').push_usize(0usize).save(&mem);
+    check(numbers.is(&mem, "18446744073709551615 -9223372036854775808 -42 0"), "push_u64, push_i64");
     // `alloc_slice` fills a block in one step.
     let block = &mem.arena.alloc_slice(&mem.tag, 4usize, 2u64);
     check(block.len() == 4usize, "alloc_slice");
+}
 
-    let { tag, arena } = mem;
+fn main() -> i32 {
+    let exists 'k. (tag, arena) = Arena::new();
+    var mem = Mem.{ tag, arena, printed: 0u32 };
+    run(&mem);
+    let { tag, arena, printed } = mem;
     arena.destroy(tag);
     exit(3)
 }

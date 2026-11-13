@@ -32,14 +32,15 @@ use package as alloc;
 
 use alloc::heap::Uninit;
 use alloc::heap::HeapAllocator;
-use core::cap::Exclusive;
+use core::cap::{Access, Exclusive};
 use core::mem::Ref;
 use alloc::owned::Allocation;
 use core::mem::Region;
 use core::mem::RegionResume;
 use alloc::buffer::Buffer;
 use core::raw::{Span, elem_ptr};
-use core::slice::Slice;
+use core::slice::{ReadBytes, Slice};
+use core::option::Option;
 use alloc::heap::checked_mul;
 
 struct Chunk {
@@ -251,8 +252,8 @@ impl Arena {
 
 forall 'k.
 impl Arena['k] {
-    // The arena's brand, for a container that lives in its domain
-    // (`ArenaMap::new`). Holding the arena is what entitles a caller to
+    // The arena's brand, for code that builds objects in its domain
+    // itself. Holding the arena is what entitles a caller to
     // put new objects in its domain; the capability alone never does.
     fn marker(&self) -> Brand['k] {
         self.marker
@@ -342,28 +343,146 @@ impl Arena['k] {
     }
 }
 
-// `buffer`'s bytes copied into the arena, as a span that lives as long as
-// the arena; the buffer is freed.
-forall 'k.
-fn save_buffer(&arena: Arena!['k], buffer: Buffer!) -> Span['k] {
-    let p = unsafe &buffer.as_ptr();
-    let n = &buffer.len();
-    let dest = unsafe &arena.alloc_bytes(n);
-    let u = unsafe copy_bytes(dest, p, n);
-    let u2 = buffer.destroy();
-    unsafe Span::from_raw_parts_branded(dest, n, arena.marker)
+// ------------------------------------------------------------- contexts --
+// A context that lends an arena with its capability: what code that
+// allocates in domain `'k` takes, as `&cx: C` with
+// `where Allocate[C -> 'k, R]`, the way code that only reads or writes it
+// takes `core::cap::Access`. `Domain!['k]` is the plain pair; a program may
+// keep both in a context of its own and lend them through these instances.
+//
+//     let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
+//     let r = &arena.alloc(&tag, value);
+//     cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
+//
+// `Arena::alloc`, `alloc_slice` and `alloc_bytes` are the primitives the
+// context forms below call once a context is open.
+forall Self -> 'k, R.
+trait Allocate {
+    fn open(cx: Self) -> (Exclusive!['k], Arena!['k], R);
+    fn close(tag: Exclusive!['k], arena: Arena!['k], rest: R) -> Self;
 }
 
-// `s`'s bytes, read under the capability of their own domain `'j`, copied
-// into the arena: how text moves from one arena to another, so that the
-// first can be destroyed while the copy lives on.
-forall 'k, 'j.
-fn copy_span(&arena: Arena!['k], &from: Exclusive!['j], s: Span['j]) -> Span['k] {
-    let (p, n) = s.into_parts();
-    let dest = unsafe &arena.alloc_bytes(n);
-    let u = unsafe copy_bytes(dest, p, n);
-    unsafe Span::from_raw_parts_branded(dest, n, arena.marker)
+// An arena with the one capability for its domain: the context for code
+// that reads, writes and allocates there (`Access`, `Allocate`), and reads
+// spans of it (`ReadBytes`).
+forall 'k.
+exposed struct Domain! {
+    tag: Exclusive!['k],
+    arena: Arena!['k],
 }
+
+impl Domain {
+    // A fresh, empty arena under a brand of its own.
+    fn new() -> exists 'k. Domain!['k] {
+        let exists 'k. (tag, arena) = Arena::new();
+        pack 'k. Domain.{ tag, arena }
+    }
+}
+
+forall 'k.
+impl Domain['k] {
+    // Frees everything in the arena; nothing of its domain can be read after.
+    fn destroy(self) {
+        let { tag, arena } = self;
+        arena.destroy(tag);
+    }
+}
+
+forall 'k.
+instance Access[Domain!['k] -> 'k, Arena!['k]] {
+    fn open(cx: Domain!['k]) -> (Exclusive!['k], Arena!['k]) {
+        let { tag, arena } = cx;
+        (tag, arena)
+    }
+
+    fn close(tag: Exclusive!['k], rest: Arena!['k]) -> Domain!['k] {
+        Domain.{ tag, arena: rest }
+    }
+}
+
+forall 'k.
+instance Allocate[Domain!['k] -> 'k, ()] {
+    fn open(cx: Domain!['k]) -> (Exclusive!['k], Arena!['k], ()) {
+        let { tag, arena } = cx;
+        (tag, arena, ())
+    }
+
+    fn close(tag: Exclusive!['k], arena: Arena!['k], rest: ()) -> Domain!['k] {
+        Domain.{ tag, arena }
+    }
+}
+
+forall 'k.
+instance ReadBytes[Domain!['k], Span['k]] {
+    fn get(&cx: Domain!['k], bytes: Span['k], index: usize) -> Option[u8] {
+        bytes.get(&cx, index)
+    }
+
+    fn len(&cx: Domain!['k], bytes: Span['k]) -> usize {
+        bytes.len()
+    }
+}
+
+forall T, 'k.
+impl Ref[T, 'k] {
+    // `value`, put in the context's arena.
+    forall C, R where Allocate[C -> 'k, R].
+    fn new(&cx: C, value: T) -> Ref[T, 'k] {
+        let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
+        let r = &arena.alloc(&tag, value);
+        cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
+        r
+    }
+}
+
+impl Buffer {
+    // The buffer's bytes copied into the context's arena in one block of
+    // exactly their length, as a span that lives as long as the arena; the
+    // buffer is freed. `Buffer::new().push_static("x").push_u64(n).save(&cx)`.
+    forall 'k, C, R where Allocate[C -> 'k, R].
+    fn save(self, &cx: C) -> Span['k] {
+        let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
+        let p = unsafe &self.as_ptr();
+        let n = &self.len();
+        let dest = unsafe &arena.alloc_bytes(n);
+        let u = unsafe copy_bytes(dest, p, n);
+        let u2 = self.destroy();
+        let saved = unsafe Span::from_raw_parts_branded(dest, n, arena.marker);
+        cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
+        saved
+    }
+}
+
+forall 'j.
+impl Span['j] {
+    // The span's bytes, read under the capability `from` lends, copied into
+    // the arena `to` lends: how text moves from one arena to another, so
+    // that the first can be destroyed while the copy lives on.
+    forall 'k, C, R, D, Q where Access[C -> 'j, R], Allocate[D -> 'k, Q].
+    fn copy_to(self, &from: C, &to: D) -> Span['k] {
+        let (from_tag, from_rest) = Access[C -> 'j, R]::open(from);
+        let (tag, arena, rest) = Allocate[D -> 'k, Q]::open(to);
+        let (p, n) = self.into_parts();
+        let dest = unsafe &arena.alloc_bytes(n);
+        let u = unsafe copy_bytes(dest, p, n);
+        let copied = unsafe Span::from_raw_parts_branded(dest, n, arena.marker);
+        to = Allocate[D -> 'k, Q]::close(tag, arena, rest);
+        from = Access[C -> 'j, R]::close(from_tag, from_rest);
+        copied
+    }
+
+    // The bytes of `self` then `other`, in one new block of the arena.
+    forall C, R where Allocate[C -> 'j, R].
+    fn concat(self, &cx: C, other: Span['j]) -> Span['j] {
+        let (tag, arena, rest) = Allocate[C -> 'j, R]::open(cx);
+        var d = Domain.{ tag, arena };
+        let joined = Buffer::new().push_bytes(&d, self).push_bytes(&d, other).save(&d);
+        let { tag, arena } = d;
+        cx = Allocate[C -> 'j, R]::close(tag, arena, rest);
+        joined
+    }
+}
+
 
 forall 'k.
 fn arena_byte_writer(arena: Arena!['k], capacity: usize) -> ArenaByteWriter!['k] {
