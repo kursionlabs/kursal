@@ -5,7 +5,8 @@
 // bound names; nominal names and free brands remain distinct. A specialization's type arguments are
 // keyed `unbranded`, so code made for them does not depend on their brands.
 
-use package::support::base::{Cx, Out, Seq, Text, text};
+use package::support::base::{Cx, Seq, Text, text, text_of};
+use std::bytes::buffer::Buffer;
 use package::kurs::core::{Member, Type};
 use package::types::ops::{foreach_binders, kind_name, kurs_error, map_children};
 use package::syntax::ast::no_pos;
@@ -28,13 +29,13 @@ fn char_count(&cx: Cx!['k], t: Text['k]) -> usize {
 // Length framing avoids ambiguity without recursively escaping nested keys.
 forall 'k.
 fn encode(&cx: Cx!['k], parts: Seq[Text['k], 'k]) -> Text['k] {
-    let out = Out::new(&cx);
+    var out = Buffer::new();
     var i = 0usize;
     while i < parts.len(&cx) {
-        let unit = out.usize(&cx, char_count(&cx, parts.get(&cx, i))).put(&cx, ":").add(&cx, parts.get(&cx, i));
+        out = out.push_usize(char_count(&cx, parts.get(&cx, i))).push_static(":").push_bytes(&cx, parts.get(&cx, i));
         i = i + 1usize;
     }
-    out.done(&cx)
+    text_of(&cx, out)
 }
 
 forall 'k.
@@ -44,7 +45,7 @@ fn bool_text(&cx: Cx!['k], b: bool) -> Text['k] {
 
 forall 'k.
 fn number(&cx: Cx!['k], n: u64) -> Text['k] {
-    Out::new(&cx).u64(&cx, n).done(&cx)
+    text_of(&cx, Buffer::new().push_u64(n))
 }
 
 forall 'k.
@@ -133,7 +134,7 @@ fn bound(&cx: Cx!['k], scope: Seq[Text['k], 'k], name: Text['k]) -> Text['k] {
             going = false;
         }
     }
-    Out::new(&cx).usize(&cx, found).done(&cx)
+    text_of(&cx, Buffer::new().push_usize(found))
 }
 
 forall 'k.
@@ -254,16 +255,17 @@ fn decode_segment(&cx: Cx!['k], seg: Text['k]) -> Option[Text['k]] {
     if seg.len() < 3usize || seg.len() % 2usize == 0usize || seg.byte(&cx, 0usize) != b'm' && seg.byte(&cx, 0usize) != b'd' {
         return Option::None;
     }
-    let out = Out::new(&cx);
+    var out = Buffer::new();
     var i = 1usize;
     while i < seg.len() {
         if !is_lower_hex(seg.byte(&cx, i)) || !is_lower_hex(seg.byte(&cx, i + 1usize)) {
+            out.destroy();
             return Option::None;
         }
-        let unit = out.byte(&cx, hex_value(seg.byte(&cx, i)) * 16u8 + hex_value(seg.byte(&cx, i + 1usize)));
+        out = out.push_byte(hex_value(seg.byte(&cx, i)) * 16u8 + hex_value(seg.byte(&cx, i + 1usize)));
         i = i + 2usize;
     }
-    let bytes = out.done(&cx);
+    let bytes = text_of(&cx, out);
     if valid_utf8(&cx, bytes) { Option::Some.(bytes) } else { Option::None }
 }
 
@@ -321,18 +323,23 @@ fn path_segments(&cx: Cx!['k], name: Text['k]) -> Seq[Text['k], 'k] {
             Option::None => pieces.get(&cx, i),
         };
         // Escape underscores too, so punctuation cannot alias literal escapes.
-        let out = Out::new(&cx);
+        var out = Buffer::new();
         var j = 0usize;
         while j < part.len() {
             let b = part.byte(&cx, j);
             if b >= b'0' && b <= b'9' || b >= b'A' && b <= b'Z' || b >= b'a' && b <= b'z' {
-                let unit = out.byte(&cx, b);
+                out = out.push_byte(b);
             } else {
-                let unit = hex_byte(&cx, out.put(&cx, "_"), b);
+                out = hex_byte(&cx, out.push_static("_"), b);
             }
             j = j + 1usize;
         }
-        parts.push(&cx, if part.is_empty() { text(&cx, "_empty") } else { out.done(&cx) });
+        parts.push(&cx, if part.is_empty() {
+            out.destroy();
+            text(&cx, "_empty")
+        } else {
+            text_of(&cx, out)
+        });
         i = i + 1usize;
     }
     parts
@@ -340,9 +347,9 @@ fn path_segments(&cx: Cx!['k], name: Text['k]) -> Seq[Text['k], 'k] {
 
 // `b` as two lowercase hex digits.
 forall 'k.
-fn hex_byte(&cx: Cx!['k], out: Out['k], b: u8) -> Out['k] {
+fn hex_byte(&cx: Cx!['k], out: Buffer!, b: u8) -> Buffer! {
     let digits = text(&cx, "0123456789abcdef");
-    out.byte(&cx, digits.byte(&cx, (b / 16u8) as usize)).byte(&cx, digits.byte(&cx, (b % 16u8) as usize))
+    out.push_byte(digits.byte(&cx, (b / 16u8) as usize)).push_byte(digits.byte(&cx, (b % 16u8) as usize))
 }
 
 forall 'k.
@@ -352,14 +359,14 @@ fn mangle(&cx: Cx!['k], path: Seq[Text['k], 'k], identity: Text['k], salt: u64) 
     let digest = sha256_hex(&cx, encode(&cx, framed)).slice(0usize, 16usize);
     let parts: Seq[Text['k], 'k] = Seq::one(&cx, text(&cx, "kurs"));
     parts.append(&cx, path);
-    parts.push(&cx, Out::new(&cx).put(&cx, "h").add(&cx, digest).done(&cx));
-    let out = Out::new(&cx).put(&cx, "_ZN");
+    parts.push(&cx, text_of(&cx, Buffer::new().push_static("h").push_bytes(&cx, digest)));
+    var out = Buffer::new().push_static("_ZN");
     var i = 0usize;
     while i < parts.len(&cx) {
-        let unit = out.usize(&cx, char_count(&cx, parts.get(&cx, i))).add(&cx, parts.get(&cx, i));
+        out = out.push_usize(char_count(&cx, parts.get(&cx, i))).push_bytes(&cx, parts.get(&cx, i));
         i = i + 1usize;
     }
-    out.put(&cx, "E").done(&cx)
+    text_of(&cx, out.push_static("E"))
 }
 
 // ---------------------------------------------------------------- SHA-256 --
@@ -471,12 +478,12 @@ fn sha256_hex(&cx: Cx!['k], data: Text['k]) -> Text['k] {
         h.set(&cx, 7usize, h.get(&cx, 7usize) + hh);
         chunk = chunk + 64usize;
     }
-    let out = Out::new(&cx);
+    var out = Buffer::new();
     var i = 0usize;
     while i < 8usize {
         let word = h.get(&cx, i);
-        let unit = hex_byte(&cx, hex_byte(&cx, hex_byte(&cx, hex_byte(&cx, out, (word >> 24u32) as u8), ((word >> 16u32) & 255u32) as u8), ((word >> 8u32) & 255u32) as u8), (word & 255u32) as u8);
+        out = hex_byte(&cx, hex_byte(&cx, hex_byte(&cx, hex_byte(&cx, out, (word >> 24u32) as u8), ((word >> 16u32) & 255u32) as u8), ((word >> 8u32) & 255u32) as u8), (word & 255u32) as u8);
         i = i + 1usize;
     }
-    out.done(&cx)
+    text_of(&cx, out)
 }

@@ -3,7 +3,8 @@
 // The grammar is LL(1): the current token alone decides every choice. The parser never looks
 // further ahead and never backtracks. Errors stop the compiler with the file, line and column.
 
-use package::support::base::{Cell, Cx, Out, Seq, Text, fail, text};
+use package::support::base::{Cell, Cx, Seq, Text, fail, text, text_of};
+use std::bytes::buffer::Buffer;
 use package::syntax::ast as S;
 use package::syntax::ast::{Expr, Pos, Statement, Type};
 use std::slice::Slice;
@@ -59,7 +60,7 @@ fn is_name_byte(b: u8) -> bool {
 
 forall 'k.
 fn is_keyword(&cx: Cx!['k], word: Text['k]) -> bool {
-    keywords(&cx).contains(&cx, Out::new(&cx).put(&cx, " ").add(&cx, word).put(&cx, " ").done(&cx))
+    keywords(&cx).contains(&cx, text_of(&cx, Buffer::new().push_static(" ").push_bytes(&cx, word).push_static(" ")))
 }
 
 forall 'k.
@@ -114,7 +115,7 @@ impl Lexer['k] {
 
     fn fail_at(self, &cx: Cx!['k], offset: usize) -> ! {
         let (line, col) = self.loc(&cx, offset);
-        fail(&cx, Out::new(&cx).add(&cx, self.file).put(&cx, ":").u64(&cx, line as u64).put(&cx, ":").u64(&cx, col as u64).put(&cx, ": syntax error").done(&cx))
+        fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, self.file).push_static(":").push_u64(line as u64).push_static(":").push_u64(col as u64).push_static(": syntax error")))
     }
 
     fn run(self, &cx: Cx!['k]) -> Seq[Tok['k], 'k] {
@@ -368,7 +369,7 @@ impl Lexer['k] {
             return start + 3usize;
         }
         let pairs = text(&cx, " .{ .( .. :: -> => == != <= >= << >> || && ");
-        if rest.len() >= 2usize && pairs.contains(&cx, Out::new(&cx).put(&cx, " ").add(&cx, rest.slice(0usize, 2usize)).put(&cx, " ").done(&cx)) {
+        if rest.len() >= 2usize && pairs.contains(&cx, text_of(&cx, Buffer::new().push_static(" ").push_bytes(&cx, rest.slice(0usize, 2usize)).push_static(" "))) {
             return start + 2usize;
         }
         let singles = text(&cx, "-+*/%&|^!<>=.,;:()[]{}?");
@@ -389,7 +390,7 @@ impl Lexer['k] {
         var i = self.at(&cx);
         var going = true;
         while going {
-            let chunk = Out::new(&cx);
+            var chunk = Buffer::new();
             let begin = i;
             var scanning = true;
             while scanning {
@@ -399,22 +400,22 @@ impl Lexer['k] {
                 let ch = self.byte(&cx, i);
                 if ch == b'\\' {
                     let width = if self.byte(&cx, i + 1usize) == b'x' { 4usize } else { 2usize };
-                    let unit = chunk.add(&cx, self.source.slice(i, i + width));
+                    chunk = chunk.push_bytes(&cx, self.source.slice(i, i + width));
                     i = i + width;
                 } else if (ch == b'{' || ch == b'}') && self.byte(&cx, i + 1usize) == ch {
-                    let unit = chunk.byte(&cx, ch);
+                    chunk = chunk.push_byte(ch);
                     i = i + 2usize;
                 } else if ch == b'}' {
                     let (line, col) = self.loc(&cx, begin);
-                    fail(&cx, Out::new(&cx).u64(&cx, line as u64).put(&cx, ":").u64(&cx, col as u64).put(&cx, ": a lone '}' in an f-string").done(&cx));
+                    fail(&cx, text_of(&cx, Buffer::new().push_u64(line as u64).push_static(":").push_u64(col as u64).push_static(": a lone '}' in an f-string")));
                 } else if ch == b'{' || ch == b'"' {
                     scanning = false;
                 } else {
-                    let unit = chunk.byte(&cx, ch);
+                    chunk = chunk.push_byte(ch);
                     i = i + 1usize;
                 }
             }
-            self.token(&cx, text(&cx, "FSTRING_TEXT"), chunk.done(&cx), begin);
+            self.token(&cx, text(&cx, "FSTRING_TEXT"), text_of(&cx, chunk), begin);
             if self.byte(&cx, i) == b'"' {
                 self.token(&cx, text(&cx, "FSTRING_END"), text(&cx, "\""), i);
                 self.i.set(&cx, i + 1usize);
@@ -541,7 +542,7 @@ impl Parser['k] {
 
     fn fail(self, &cx: Cx!['k]) -> ! {
         let t = self.tok(&cx);
-        fail(&cx, Out::new(&cx).add(&cx, self.file).put(&cx, ":").u64(&cx, t.line as u64).put(&cx, ":").u64(&cx, t.col as u64).put(&cx, ": syntax error").done(&cx))
+        fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, self.file).push_static(":").push_u64(t.line as u64).push_static(":").push_u64(t.col as u64).push_static(": syntax error")))
     }
 
     fn id(self, &cx: Cx!['k]) -> u32 {
@@ -1651,7 +1652,7 @@ impl Parser['k] {
             let (digits, suffix) = split_int_suffix(&cx, word);
             let (value, ok) = int_value(&cx, digits);
             if !ok {
-                fail(&cx, Out::new(&cx).add(&cx, self.file).put(&cx, ":").u64(&cx, tok.line as u64).put(&cx, ":").u64(&cx, tok.col as u64).put(&cx, ": integer literal out of range").done(&cx));
+                fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, self.file).push_static(":").push_u64(tok.line as u64).push_static(":").push_u64(tok.col as u64).push_static(": integer literal out of range")));
             }
             return S::Lit.{ id, kind: S::LitKind::Int, int: value, negative: false, text: word, suffix, pos: p };
         }
@@ -1704,15 +1705,15 @@ fn split_int_suffix(&cx: Cx!['k], word: Text['k]) -> (Text['k], Option[Text['k]]
 
 forall 'k.
 fn without_underscores(&cx: Cx!['k], word: Text['k]) -> Text['k] {
-    let out = Out::new(&cx);
+    var out = Buffer::new();
     var i = 0usize;
     while i < word.len() {
         if word.byte(&cx, i) != b'_' {
-            let unit = out.byte(&cx, word.byte(&cx, i));
+            out = out.push_byte(word.byte(&cx, i));
         }
         i = i + 1usize;
     }
-    out.done(&cx)
+    text_of(&cx, out)
 }
 
 // The value of decimal, `0x`, `0o` or `0b` digits; false when it does not fit in 64 bits.
@@ -1740,13 +1741,13 @@ fn int_value(&cx: Cx!['k], word: Text['k]) -> (u64, bool) {
 // The bytes `\n`, `\t`, `\r`, `\0`, `\\`, `\'`, `\"` and `\xHH` stand for.
 forall 'k.
 fn unescape(&cx: Cx!['k], raw: Text['k]) -> Text['k] {
-    let out = Out::new(&cx);
+    var out = Buffer::new();
     var i = 0usize;
     while i < raw.len() {
         let b = raw.byte(&cx, i);
         if b == b'\\' && raw.byte(&cx, i + 1usize) == b'x' {
-            let (value, ok) = int_value(&cx, Out::new(&cx).put(&cx, "0x").add(&cx, raw.slice(i + 2usize, i + 4usize)).done(&cx));
-            let unit = out.byte(&cx, value as u8);
+            let (value, ok) = int_value(&cx, text_of(&cx, Buffer::new().push_static("0x").push_bytes(&cx, raw.slice(i + 2usize, i + 4usize))));
+            out = out.push_byte(value as u8);
             i = i + 4usize;
         } else if b == b'\\' {
             let c = raw.byte(&cx, i + 1usize);
@@ -1761,14 +1762,14 @@ fn unescape(&cx: Cx!['k], raw: Text['k]) -> Text['k] {
             } else if c == b'\\' || c == b'\'' || c == b'"' {
                 c
             } else {
-                fail(&cx, Out::new(&cx).put(&cx, "unknown escape \\").add(&cx, raw.slice(i + 1usize, i + 2usize)).done(&cx))
+                fail(&cx, text_of(&cx, Buffer::new().push_static("unknown escape \\").push_bytes(&cx, raw.slice(i + 1usize, i + 2usize))))
             };
-            let unit = out.byte(&cx, byte);
+            out = out.push_byte(byte);
             i = i + 2usize;
         } else {
-            let unit = out.byte(&cx, b);
+            out = out.push_byte(b);
             i = i + 1usize;
         }
     }
-    out.done(&cx)
+    text_of(&cx, out)
 }

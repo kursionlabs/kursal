@@ -14,7 +14,8 @@
 //
 // The result is a core program, ready for core checking before C emission.
 
-use package::support::base::{Cell, Cx, Map, Out, Seq, Set, Text, text};
+use package::support::base::{Cell, Cx, Map, Seq, Set, Text, text, text_of};
+use std::bytes::buffer::Buffer;
 use package::check::checker::overlap;
 use package::kurs::core::{Block, Data, Edge, Extern, Fun, Instance, Instr, Kind, ModuleId, Param, Program, Terminator, Type};
 use package::kurs::core as C;
@@ -71,7 +72,7 @@ fn is_unit(&cx: Cx!['k], t: Type['k]) -> bool {
 
 forall 'k.
 fn id_text(&cx: Cx!['k], id: u32) -> Text['k] {
-    Out::new(&cx).u64(&cx, id as u64).done(&cx)
+    text_of(&cx, Buffer::new().push_u64(id as u64))
 }
 
 // ---------------------------------------------------------- match coverage --
@@ -104,9 +105,9 @@ fn int_eq(a: Int, b: Int) -> bool {
 forall 'k.
 fn int_spelled(&cx: Cx!['k], a: Int) -> Text['k] {
     if a.negative {
-        Out::new(&cx).put(&cx, "-").u64(&cx, a.magnitude).done(&cx)
+        text_of(&cx, Buffer::new().push_static("-").push_u64(a.magnitude))
     } else {
-        Out::new(&cx).u64(&cx, a.magnitude).done(&cx)
+        text_of(&cx, Buffer::new().push_u64(a.magnitude))
     }
 }
 
@@ -283,7 +284,7 @@ impl Lowering['k] {
             Option::Some(label) => return (label, bytes.len()),
             Option::None => (),
         };
-        let label = Out::new(&cx).put(&cx, "string#").usize(&cx, self.datas.len(&cx)).done(&cx);
+        let label = text_of(&cx, Buffer::new().push_static("string#").push_usize(self.datas.len(&cx)));
         let item = Form.{ kind: FormKind::Str, text: bytes, items: Seq::new(&cx), pos: no_pos() };
         let init = Form.{ kind: FormKind::List, text: text(&cx, ""), items: Seq::one(&cx, item), pos: no_pos() };
         self.datas.set(&cx, bytes, label);
@@ -477,7 +478,7 @@ impl FnLower['k] {
 
     fn fresh(self, &cx: Cx!['k], hint: Slice[u8, 'static]) -> Text['k] {
         self.n.set(&cx, self.n.get(&cx) + 1u64);
-        Out::new(&cx).put(&cx, "%").put(&cx, hint).u64(&cx, self.n.get(&cx)).done(&cx)
+        text_of(&cx, Buffer::new().push_static("%").push_static(hint).push_u64(self.n.get(&cx)))
     }
 
     fn lifted(self) -> bool {
@@ -540,7 +541,7 @@ impl FnLower['k] {
                 Option::Some(t) => match t {
                     Type::Prim(prim) => match o.lit {
                         Option::Some(lit) => if !valid_literal(&cx, t, lit) {
-                            self.fail(&cx, Out::new(&cx).put(&cx, "literal ").add(&cx, lit).put(&cx, " does not fit ").add(&cx, prim).done(&cx),
+                            self.fail(&cx, text_of(&cx, Buffer::new().push_static("literal ").push_bytes(&cx, lit).push_static(" does not fit ").push_bytes(&cx, prim)),
                                 if pos.line != 0u32 { pos } else { self.at.get(&cx) });
                         },
                         Option::None => (),
@@ -574,7 +575,7 @@ impl FnLower['k] {
         };
         let discharged = o.discharged || self.discharge_all || marked;
         if (o.name.starts_with(&cx, text(&cx, "builtin::unsafe::")) || o.name.is(&cx, "alloca")) && !(discharged || self.sig.is_unsafe) {
-            self.fail(&cx, Out::new(&cx).add(&cx, o.name).put(&cx, " requires unsafe authorization").done(&cx), pos);
+            self.fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, o.name).push_static(" requires unsafe authorization")), pos);
         }
         self.current(&cx).instrs.push(&cx, Instr.{ lhs: Seq::one(&cx, name), op: o.name, args: o.args, ty: o.ty, tys: o.tys, lit: o.lit,
             is_unsafe: discharged, binders: o.binders, pos });
@@ -619,7 +620,7 @@ impl FnLower['k] {
 
     fn new_block(self, &cx: Cx!['k], params: Seq[C::Binding['k], 'k], hint: Slice[u8, 'static]) -> BlockB['k] {
         self.n.set(&cx, self.n.get(&cx) + 1u64);
-        self.block_named(&cx, Out::new(&cx).put(&cx, hint).u64(&cx, self.n.get(&cx)).done(&cx), params)
+        self.block_named(&cx, text_of(&cx, Buffer::new().push_static(hint).push_u64(self.n.get(&cx))), params)
     }
 
     fn start(self, &cx: Cx!['k], block: BlockB['k]) {
@@ -662,7 +663,7 @@ impl FnLower['k] {
     }
 
     fn temporary(self, &cx: Cx!['k], ty: Type['k]) -> Text['k] {
-        let root = Out::new(&cx).put(&cx, "&#tmp").usize(&cx, self.locals.len(&cx)).done(&cx);
+        let root = text_of(&cx, Buffer::new().push_static("&#tmp").push_usize(self.locals.len(&cx)));
         self.locals.push(&cx, C::Binding.{ name: root, type: ty });
         root
     }
@@ -745,7 +746,7 @@ impl FnLower['k] {
         i = 0usize;
         while i < saved.len(&cx) {
             let (k, raw, root, ty) = saved.get(&cx, i);
-            values.set(&cx, k, Out::new(&cx).add(&cx, raw).add(&cx, self.emit(&cx, Op::new(&cx, "load", ty, Seq::one(&cx, root)))).done(&cx));
+            values.set(&cx, k, text_of(&cx, Buffer::new().push_bytes(&cx, raw).push_bytes(&cx, self.emit(&cx, Op::new(&cx, "load", ty, Seq::one(&cx, root))))));
             i = i + 1usize;
         }
         i = 0usize;
@@ -862,7 +863,7 @@ impl FnLower['k] {
     // Binds a variable: a new root of the function, holding `value`.
     fn declare(self, &cx: Cx!['k], bid: Text['k], name: Text['k], ty: Type['k], value: Text['k]) {
         let ty = self.substitute_type(&cx, ty);
-        let root = Out::new(&cx).put(&cx, "&").add(&cx, name).put(&cx, "#").add(&cx, bid).done(&cx);
+        let root = text_of(&cx, Buffer::new().push_static("&").push_bytes(&cx, name).push_static("#").push_bytes(&cx, bid));
         self.locals.push(&cx, C::Binding.{ name: root, type: ty });
         self.bindings.set(&cx, bid, Binding.{ name, type: ty, path: Option::Some.(root), fields: Option::None });
         let unit = self.emit(&cx, Op::new(&cx, "store", C::unit(&cx), Seq::two(&cx, root, value)));
@@ -871,7 +872,7 @@ impl FnLower['k] {
     fn read(self, &cx: Cx!['k], binding: Binding['k]) -> Text['k] {
         match binding.path {
             Option::Some(path) => self.emit(&cx, Op::new(&cx, "load", binding.type, Seq::one(&cx, path))),
-            Option::None => self.fail(&cx, Out::new(&cx).add(&cx, binding.name).put(&cx, " is a ..rest bundle, not a value").done(&cx), self.at.get(&cx)),
+            Option::None => self.fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, binding.name).push_static(" is a ..rest bundle, not a value")), self.at.get(&cx)),
         }
     }
 
@@ -884,11 +885,11 @@ impl FnLower['k] {
         match e {
             Expr::Path(p) => if self.local_ref(&cx, p) { self.local(&cx, p.id).path } else { Option::None },
             Expr::Field(f) => match self.place_path(&cx, f.value.get(&cx)) {
-                Option::Some(base) => Option::Some.(Out::new(&cx).add(&cx, base).put(&cx, ".").add(&cx, f.name).done(&cx)),
+                Option::Some(base) => Option::Some.(text_of(&cx, Buffer::new().push_bytes(&cx, base).push_static(".").push_bytes(&cx, f.name))),
                 Option::None => Option::None,
             },
             Expr::Index(x) => match self.place_path(&cx, x.value.get(&cx)) {
-                Option::Some(base) => Option::Some.(Out::new(&cx).add(&cx, base).put(&cx, ".").usize(&cx, x.index).done(&cx)),
+                Option::Some(base) => Option::Some.(text_of(&cx, Buffer::new().push_bytes(&cx, base).push_static(".").push_usize(x.index))),
                 Option::None => Option::None,
             },
             _ => Option::None,
@@ -915,7 +916,7 @@ impl FnLower['k] {
             let source = if !sources.is_empty(&cx) {
                 sources.get(&cx, k - offset)
             } else {
-                Out::new(&cx).put(&cx, if place { "&" } else { "%a_" }).add(&cx, name).done(&cx)
+                text_of(&cx, Buffer::new().push_static(if place { "&" } else { "%a_" }).push_bytes(&cx, name))
             };
             self.current(&cx).params.push(&cx, C::Binding.{ name: source, type: ty });
             if place {
@@ -959,7 +960,7 @@ impl FnLower['k] {
                 var i = 0usize;
                 while i < captures.len(&cx) {
                     ids.push(&cx, captures.get(&cx, i).binder);
-                    sources.push(&cx, Out::new(&cx).put(&cx, "%a_").add(&cx, captures.get(&cx, i).name).done(&cx));
+                    sources.push(&cx, text_of(&cx, Buffer::new().push_static("%a_").push_bytes(&cx, captures.get(&cx, i).name)));
                     i = i + 1usize;
                 }
                 self.parameters(&cx, ids, 0usize, sources);
@@ -1064,7 +1065,7 @@ impl FnLower['k] {
             i = i + 1usize;
         }
         match least {
-            Option::Some(b) => self.fail(&cx, Out::new(&cx).put(&cx, "a closure or foreach body cannot mention the block-local brand ").add(&cx, b).done(&cx), self.at.get(&cx)),
+            Option::Some(b) => self.fail(&cx, text_of(&cx, Buffer::new().push_static("a closure or foreach body cannot mention the block-local brand ").push_bytes(&cx, b)), self.at.get(&cx)),
             Option::None => (),
         };
     }
@@ -1121,7 +1122,7 @@ impl FnLower['k] {
             S::LitKind::Str => self.string(&cx, l.text),
             S::LitKind::Bool => self.constant(&cx, ty, text(&cx, if l.int != 0u64 { "true" } else { "false" })),
             S::LitKind::Float => self.constant(&cx, ty, l.text),
-            S::LitKind::Int => self.constant(&cx, ty, Out::new(&cx).u64(&cx, l.int).done(&cx)),
+            S::LitKind::Int => self.constant(&cx, ty, text_of(&cx, Buffer::new().push_u64(l.int))),
         }
     }
 
@@ -1133,7 +1134,7 @@ impl FnLower['k] {
         let d = self.emit(&cx, Op::new(&cx, "data", C::ptr(&cx, Type::Array.(Cell::new(&cx, u8_type), n as u64)), Seq::one(&cx, data)));
         let p = self.emit(&cx, Op::new(&cx, "builtin::unsafe::cast", C::ptr(&cx, u8_type), Seq::one(&cx, d)).typed(C::ptr(&cx, u8_type)).discharge(true));
         let brand = self.emit(&cx, Op::new(&cx, "builtin::unsafe::static_brand", Type::Brand.(Cell::new(&cx, fixed)), Seq::new(&cx)).discharge(true));
-        let length = self.constant(&cx, C::usize_type(&cx), Out::new(&cx).usize(&cx, n).done(&cx));
+        let length = self.constant(&cx, C::usize_type(&cx), text_of(&cx, Buffer::new().push_usize(n)));
         let sig = self.lowering.library_sig(&cx, "Slice::from_raw_parts", self.home);
         let slice_ty = Type::Named.(self.lowering.library_name(&cx, "Slice", self.home), Seq::two(&cx, u8_type, fixed));
         let args = Seq::one(&cx, sig.name);
@@ -1191,16 +1192,16 @@ impl FnLower['k] {
             Option::None => (),
         };
         let names = p.names(&cx);
-        let joined = Out::new(&cx);
+        var message = Buffer::new().push_static("cannot lower the path ");
         var i = 0usize;
         while i < names.len(&cx) {
             if i > 0usize {
-                let unit = joined.put(&cx, "::");
+                message = message.push_static("::");
             }
-            let unit = joined.add(&cx, names.get(&cx, i));
+            message = message.push_bytes(&cx, names.get(&cx, i));
             i = i + 1usize;
         }
-        self.fail(&cx, Out::new(&cx).put(&cx, "cannot lower the path ").add(&cx, joined.done(&cx)).done(&cx), p.pos)
+        self.fail(&cx, text_of(&cx, message), p.pos)
     }
 
     fn constant_value(self, &cx: Cx!['k], value: ConstValue['k]) -> Text['k] {
@@ -1208,7 +1209,7 @@ impl FnLower['k] {
             ConstValue::Str(t, _ty) => self.string(&cx, t),
             ConstValue::Int(v, ty) => match ty {
                 Type::Prim(name) => self.constant(&cx, ty, int_text(&cx, v, name)),
-                _ => self.constant(&cx, ty, Out::new(&cx).u64(&cx, v).done(&cx)),
+                _ => self.constant(&cx, ty, text_of(&cx, Buffer::new().push_u64(v))),
             },
             ConstValue::Bool(b) => self.constant(&cx, C::bool_type(&cx), text(&cx, if b { "true" } else { "false" })),
             ConstValue::Float(digits, ty) => self.constant(&cx, ty, digits),
@@ -1270,8 +1271,8 @@ impl FnLower['k] {
         if op.is(&cx, "-") {
             match u.operand.get(&cx) {
                 Expr::Lit(l) => match l.kind {
-                    S::LitKind::Int => return Option::Some.(self.constant(&cx, ty, Out::new(&cx).put(&cx, "-").u64(&cx, l.int).done(&cx))),
-                    S::LitKind::Float => return Option::Some.(self.constant(&cx, ty, Out::new(&cx).put(&cx, "-").add(&cx, l.text).done(&cx))),
+                    S::LitKind::Int => return Option::Some.(self.constant(&cx, ty, text_of(&cx, Buffer::new().push_static("-").push_u64(l.int)))),
+                    S::LitKind::Float => return Option::Some.(self.constant(&cx, ty, text_of(&cx, Buffer::new().push_static("-").push_bytes(&cx, l.text)))),
                     _ => (),
                 },
                 _ => (),
@@ -1301,9 +1302,9 @@ impl FnLower['k] {
         let ones = if prim.starts_with(&cx, text(&cx, "i")) {
             text(&cx, "-1")
         } else if bits == 64u32 {
-            Out::new(&cx).u64(&cx, 18446744073709551615u64).done(&cx)
+            text_of(&cx, Buffer::new().push_u64(18446744073709551615u64))
         } else {
-            Out::new(&cx).u64(&cx, (1u64 << (bits as u64)) - 1u64).done(&cx)
+            text_of(&cx, Buffer::new().push_u64((1u64 << (bits as u64)) - 1u64))
         };
         let mask = self.constant(&cx, ty, ones);
         Option::Some.(self.emit(&cx, Op::new(&cx, "bit_xor", ty, Seq::two(&cx, v, mask))))
@@ -1486,7 +1487,7 @@ impl FnLower['k] {
         };
         let payload = if given.is_empty(&cx) {
             if !is_unit(&cx, payload_ty) {
-                self.fail(&cx, Out::new(&cx).put(&cx, "variant ").add(&cx, name).put(&cx, " used as a function value").done(&cx), self.at.get(&cx));
+                self.fail(&cx, text_of(&cx, Buffer::new().push_static("variant ").push_bytes(&cx, name).push_static(" used as a function value")), self.at.get(&cx));
             }
             Option::Some.(self.emit(&cx, Op::new(&cx, "construct", C::unit(&cx), Seq::new(&cx)).typed(C::unit(&cx))))
         } else if given.len(&cx) == 1usize {
@@ -1656,7 +1657,7 @@ impl FnLower['k] {
                                 if !(explicit || self.authorized(&cx, c.id)) {
                                     self.fails(&cx, "lending a raw pointer target requires unsafe authorization", expr_pos(arg));
                                 }
-                                Option::Some.(Out::new(&cx).put(&cx, "&*").add(&cx, p).done(&cx))
+                                Option::Some.(text_of(&cx, Buffer::new().push_static("&*").push_bytes(&cx, p)))
                             },
                             Option::None => Option::None,
                         };
@@ -1758,10 +1759,10 @@ impl FnLower['k] {
         } else if name.starts_with(&cx, text(&cx, "store")) || name.starts_with(&cx, text(&cx, "load_")) || name.starts_with(&cx, text(&cx, "atomic_")) {
             name
         } else {
-            Out::new(&cx).put(&cx, "atomic_").add(&cx, name).done(&cx)
+            text_of(&cx, Buffer::new().push_static("atomic_").push_bytes(&cx, name))
         };
         let rty = self.substitute_type(&cx, self.type_of(&cx, c.id));
-        Option::Some.(self.emit(&cx, Op::named(&cx, Out::new(&cx).put(&cx, "builtin::unsafe::").add(&cx, op).done(&cx), rty, operands).maybe_literal(orders)
+        Option::Some.(self.emit(&cx, Op::named(&cx, text_of(&cx, Buffer::new().push_static("builtin::unsafe::").push_bytes(&cx, op)), rty, operands).maybe_literal(orders)
             .from_node(c.id, c.pos)))
     }
 
@@ -1779,24 +1780,24 @@ impl FnLower['k] {
                 || failure.is(&cx, "acquire") && (order.is(&cx, "acquire") || order.is(&cx, "acq_rel") || order.is(&cx, "seq_cst"))
                 || failure.is(&cx, "seq_cst") && order.is(&cx, "seq_cst");
             if !allowed {
-                self.fail(&cx, Out::new(&cx).put(&cx, "compare_exchange failure ordering ").add(&cx, failure).put(&cx, " is invalid for success ordering ")
-                    .add(&cx, order).done(&cx), expr_pos(args.get(&cx, 1usize)));
+                self.fail(&cx, text_of(&cx, Buffer::new().push_static("compare_exchange failure ordering ").push_bytes(&cx, failure).push_static(" is invalid for success ordering ")
+                    .push_bytes(&cx, order)), expr_pos(args.get(&cx, 1usize)));
             }
         } else if kind.is(&cx, "load") && (order.is(&cx, "release") || order.is(&cx, "acq_rel"))
             || kind.is(&cx, "store") && (order.is(&cx, "acquire") || order.is(&cx, "acq_rel"))
             || kind.is(&cx, "fence") && order.is(&cx, "relaxed") {
-            self.fail(&cx, Out::new(&cx).put(&cx, "atomic ").add(&cx, kind).put(&cx, " does not support ordering ").add(&cx, order).done(&cx), expr_pos(args.get(&cx, 0usize)));
+            self.fail(&cx, text_of(&cx, Buffer::new().push_static("atomic ").push_bytes(&cx, kind).push_static(" does not support ordering ").push_bytes(&cx, order)), expr_pos(args.get(&cx, 0usize)));
         }
-        let out = Out::new(&cx);
+        var out = Buffer::new();
         i = 0usize;
         while i < orders.len(&cx) {
             if i > 0usize {
-                let unit = out.put(&cx, "/");
+                out = out.push_static("/");
             }
-            let unit = out.add(&cx, orders.get(&cx, i));
+            out = out.push_bytes(&cx, orders.get(&cx, i));
             i = i + 1usize;
         }
-        out.done(&cx)
+        text_of(&cx, out)
     }
 
     // ---- control flow
@@ -2207,13 +2208,13 @@ impl FnLower['k] {
         let types = if whole { Seq::one(&cx, ty) } else { self.lowering.types.fields(&cx, ty, Option::None) };
         let sources: Seq[Text['k], 'k] = Seq::new(&cx);
         if lent {
-            let path = Out::new(&cx).add(&cx, payload).put(&cx, ".").add(&cx, self.case_variant(&cx, case)).done(&cx);
+            let path = text_of(&cx, Buffer::new().push_bytes(&cx, payload).push_static(".").push_bytes(&cx, self.case_variant(&cx, case)));
             if whole {
                 sources.push(&cx, path);
             } else {
                 var k = 0usize;
                 while k < types.len(&cx) {
-                    sources.push(&cx, Out::new(&cx).add(&cx, path).put(&cx, ".").usize(&cx, k).done(&cx));
+                    sources.push(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, path).push_static(".").push_usize(k)));
                     k = k + 1usize;
                 }
             }
@@ -2285,7 +2286,7 @@ impl FnLower['k] {
     fn next_lifted(self, &cx: Cx!['k], kind: Slice[u8, 'static]) -> Text['k] {
         let n = self.lowering.closures.get(&cx);
         self.lowering.closures.set(&cx, n + 1u64);
-        Out::new(&cx).add(&cx, self.name).put(&cx, "#").put(&cx, kind).u64(&cx, n).done(&cx)
+        text_of(&cx, Buffer::new().push_bytes(&cx, self.name).push_static("#").push_static(kind).push_u64(n))
     }
 
     fn expr_closure(self, &cx: Cx!['k], c: S::Closure['k]) -> Option[Text['k]] {
@@ -2488,7 +2489,7 @@ impl FnLower['k] {
             let actual: Seq[Text['k], 'k] = Seq::new(&cx);
             var i = 0usize;
             while i < opened.len(&cx) {
-                actual.push(&cx, Out::new(&cx).add(&cx, opened.get(&cx, i)).put(&cx, "#").add(&cx, self.fresh(&cx, "").from(1usize)).done(&cx));
+                actual.push(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, opened.get(&cx, i)).push_static("#").push_bytes(&cx, self.fresh(&cx, "").from(1usize))));
                 i = i + 1usize;
             }
             let sub: Map[Text['k], Type['k], 'k] = Map::new(&cx);
@@ -2538,10 +2539,10 @@ impl FnLower['k] {
                         Option::Some(sub) => self.pattern(&cx, sub, c.name),
                         Option::None => match ps.rest {
                             Option::Some(_r) => {
-                                let bid = Out::new(&cx).add(&cx, id_text(&cx, match rest_id {
+                                let bid = text_of(&cx, Buffer::new().push_bytes(&cx, id_text(&cx, match rest_id {
                                     Option::Some(id) => id,
                                     Option::None => self.fails(&cx, "internal error: a rest pattern without an id", self.at.get(&cx)),
-                                })).put(&cx, "_").add(&cx, name).done(&cx);
+                                })).push_static("_").push_bytes(&cx, name));
                                 rest.set(&cx, name, bid);
                                 self.declare(&cx, bid, name, c.type, c.name);
                             },

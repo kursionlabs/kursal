@@ -11,7 +11,7 @@ reference in the tests.
 
 | Module | Translates | |
 |---|---|---|
-| `support::base` | | storage on the standard library's arena: the context `Cx!`, text, sequences, maps, sets, cells, text copied between arenas; `fail` |
+| `support::base` | | storage on the standard library's arena: the context `Cx!`, text, sequences, maps, sets, cells, text copied between arenas, text built in a `Buffer!` kept in the arena; `fail` |
 | `support::system` | | arguments, files, directories, processes and the environment, through the standard library |
 | `syntax::ast`, `syntax::parser` | `syntax.py`, `parser.py` | the surface AST and the parser |
 | `syntax::dump` | | the AST as text |
@@ -145,10 +145,30 @@ the variants a match has covered (`FnLower::match_coverage`), and the walk of pa
 `&cx` (`insert_in`, `get_in`, `remove_in`). State that lives in a struct of handles shared with
 the rest of a phase stays in the arena, and so does everything that ends up in a result.
 
+### Text being built
+
+Text is built in the standard library's linear `Buffer!`, on the heap, threaded by value through
+the chain of pushes: `Buffer::new().push_static("(").push_bytes(&cx, t).push_u64(n)`. A `Text`
+is read under the context's capability (`support::base` has `ReadBytes[Cx!['k], Text['k]]`), so
+`push_bytes(&cx, t)` takes it whole. Text that must outlive the builder ends in the arena through
+`support::base::text_of(&cx, buffer)`, which copies the finished bytes into one block of exactly
+their length and frees the buffer; a builder that is dropped on a path is destroyed there
+(`out.destroy()`), and the leak check under valgrind would see one that is not.
+
+A helper that adds to text being built either takes the buffer and returns it
+(`fn str(&cx, out: Buffer!, t: Text['k]) -> Buffer!`, called `out = str(&cx, out, t)`), or, when
+it writes many lines from deep in a walk, takes it by place: `resolve::dump::Walk` and
+`infer::dump::Walk` pass `&out: Buffer!` to every method, `sigs::dump::sig` takes `&out`, and the
+C of a function's body is written into `&lines: Buffer!`, which `backend::cgen::line` appends to
+and which every method that emits an instruction or a terminator takes. A function's body is
+copied into the arena once, when it is finished (its declarations come first, and emitting the
+lines may add to them), and `emit_c` returns the whole C as a `Buffer!`, written to the file or
+printed with `std::io::print_buffer`.
+
 | Python | Kursal |
 |---|---|
 | `str` | `Text['k]` (a byte view; `text(&cx, "literal")`, `t.is(&cx, "literal")`, `t.eq(&cx, u)`, `t.len()`, `slice`, `find`, `split`, `starts_with`) |
-| building a `str` | `Out::new(&cx).put(&cx, "a").add(&cx, t).u64(&cx, n).done(&cx)` |
+| building a `str` | `text_of(&cx, Buffer::new().push_static("a").push_bytes(&cx, t).push_u64(n))`; in a loop, `var out = Buffer::new();` and `out = out.push_static(", ");` |
 | `list`, `tuple` of values | `Seq[T, 'k]` (`push`, `get`, `set`, `len`, `pop`, `last`, `copy`, `slice`, `append`, `insert`, `remove`, `sort`; each takes `&cx`) |
 | `dict` | `Map[K, V, 'k]` (insertion-ordered like `dict`: `set`, `get` → `Option`, `at`, `get_or`, `has`, `remove`, `keys`, `values`) |
 | `set` | `Set[K, 'k]` (insertion-ordered: `add`, `has`, `remove`, `items`) |
@@ -163,9 +183,10 @@ the rest of a phase stays in the arena, and so does everything that ends up in a
 
 Nothing in an arena is freed until the arena is, so a loop that builds throwaway values on every
 step costs memory for the rest of its group. A sequence takes up to twice its length in room; a
-map's slots are made again, twice as many, as it grows, and the old ones stay; `Out::done` copies
-text longer than 32 bytes into one block. Where a pure computation is repeated on the same input,
-cache it in a map (`Backend::ctype`, `Types::unfold`, the layout walk's finished keys). In a hot
+map's slots are made again, twice as many, as it grows, and the old ones stay. Text built in a
+`Buffer!` costs the arena only its final length, in `text_of`; one buffer pushed into another
+(`push_buffer`) costs it nothing. Where a pure computation is repeated on the same input, cache it
+in a map (`Backend::ctype`, `Types::unfold`, the layout walk's finished keys). In a hot
 loop, read a map's or set's keys in place with `positions` and `entry` rather than copying them
 with `keys` or `items`, and compare text without splitting it.
 

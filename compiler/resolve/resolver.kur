@@ -13,7 +13,8 @@
 //   NameRef::Prim(name)            a primitive type
 //   NameRef::Builtin(name)         a compiler-sealed name: Brand, Copy, builtin::fresh, ...
 
-use package::support::base::{Cell, Cx, Map, Out, Seq, Set, Text, combine, fail, key_hash, key_same, text};
+use package::support::base::{Cell, Cx, Map, Seq, Set, Text, combine, fail, key_hash, key_same, text, text_of};
+use std::bytes::buffer::Buffer;
 use package::kurs::core::ModuleId;
 use package::syntax::parser::parse;
 use package::syntax::ast as S;
@@ -74,9 +75,9 @@ fn lib_dir(&cx: Cx!['k]) -> Text['k] {
 forall 'k.
 fn clean(&cx: Cx!['k], path: Text['k]) -> Text['k] {
     let parts = path.split(&cx, text(&cx, "/"));
-    let out = Out::new(&cx);
+    var out = Buffer::new();
     if path.starts_with(&cx, text(&cx, "/")) {
-        let unit = out.put(&cx, "/");
+        out = out.push_static("/");
     }
     var first = true;
     var i = 0usize;
@@ -84,14 +85,20 @@ fn clean(&cx: Cx!['k], path: Text['k]) -> Text['k] {
         let part = parts.get(&cx, i);
         if !part.is_empty() && !part.is(&cx, ".") {
             if !first {
-                let unit = out.put(&cx, "/");
+                out = out.push_static("/");
             }
-            let unit = out.add(&cx, part);
+            out = out.push_bytes(&cx, part);
             first = false;
         }
         i = i + 1usize;
     }
-    if out.len(&cx) == 0usize { text(&cx, ".") } else { out.done(&cx) }
+    let n = &out.len();
+    if n == 0usize {
+        out.destroy();
+        text(&cx, ".")
+    } else {
+        text_of(&cx, out)
+    }
 }
 
 // `a / b`: `b` when it is absolute.
@@ -102,7 +109,7 @@ fn join(&cx: Cx!['k], a: Text['k], b: Text['k]) -> Text['k] {
     } else if a.ends_with(&cx, text(&cx, "/")) {
         a.concat(&cx, b)
     } else {
-        Out::new(&cx).add(&cx, a).put(&cx, "/").add(&cx, b).done(&cx)
+        text_of(&cx, Buffer::new().push_bytes(&cx, a).push_static("/").push_bytes(&cx, b))
     }
 }
 
@@ -188,65 +195,65 @@ fn resolve_absolute(&cx: Cx!['k], path: Text['k]) -> Text['k] {
 forall 'k.
 fn repr(&cx: Cx!['k], t: Text['k]) -> Text['k] {
     let quote = if t.contains(&cx, text(&cx, "'")) && !t.contains(&cx, text(&cx, "\"")) { b'"' } else { b'\'' };
-    let out = Out::new(&cx).byte(&cx, quote);
+    var out = Buffer::new().push_byte(quote);
     var i = 0usize;
     while i < t.len() {
         let b = t.byte(&cx, i);
         if b == b'\\' || b == quote {
-            let unit = out.byte(&cx, b'\\').byte(&cx, b);
+            out = out.push_byte(b'\\').push_byte(b);
         } else if b == b'\n' {
-            let unit = out.put(&cx, "\\n");
+            out = out.push_static("\\n");
         } else if b == b'\t' {
-            let unit = out.put(&cx, "\\t");
+            out = out.push_static("\\t");
         } else if b == b'\r' {
-            let unit = out.put(&cx, "\\r");
+            out = out.push_static("\\r");
         } else if b < 32u8 || b == 127u8 {
             let digits = text(&cx, "0123456789abcdef");
-            let unit = out.put(&cx, "\\x").byte(&cx, digits.byte(&cx, (b / 16u8) as usize)).byte(&cx, digits.byte(&cx, (b % 16u8) as usize));
+            out = out.push_static("\\x").push_byte(digits.byte(&cx, (b / 16u8) as usize)).push_byte(digits.byte(&cx, (b % 16u8) as usize));
         } else {
-            let unit = out.byte(&cx, b);
+            out = out.push_byte(b);
         }
         i = i + 1usize;
     }
-    out.byte(&cx, quote).done(&cx)
+    text_of(&cx, out.push_byte(quote))
 }
 
 // A tuple of strings as Python's `repr` writes it: `()`, `('a',)`, `('a', 'b')`.
 forall 'k.
 fn repr_tuple(&cx: Cx!['k], names: Seq[Text['k], 'k]) -> Text['k] {
-    let out = Out::new(&cx).put(&cx, "(");
+    var out = Buffer::new().push_static("(");
     var i = 0usize;
     while i < names.len(&cx) {
         if i > 0usize {
-            let unit = out.put(&cx, ", ");
+            out = out.push_static(", ");
         }
-        let unit = out.add(&cx, repr(&cx, names.get(&cx, i)));
+        out = out.push_bytes(&cx, repr(&cx, names.get(&cx, i)));
         i = i + 1usize;
     }
     if names.len(&cx) == 1usize {
-        let unit = out.put(&cx, ",");
+        out = out.push_static(",");
     }
-    out.put(&cx, ")").done(&cx)
+    text_of(&cx, out.push_static(")"))
 }
 
 forall 'k.
 fn repr_module(&cx: Cx!['k], m: ModuleId['k]) -> Text['k] {
-    Out::new(&cx).put(&cx, "ModuleId(package=").usize(&cx, m.package).put(&cx, ", path=").add(&cx, repr_tuple(&cx, m.path)).put(&cx, ")").done(&cx)
+    text_of(&cx, Buffer::new().push_static("ModuleId(package=").push_usize(m.package).push_static(", path=").push_bytes(&cx, repr_tuple(&cx, m.path)).push_static(")"))
 }
 
 // `'::'.join(names)`.
 forall 'k.
 fn joined(&cx: Cx!['k], names: Seq[Text['k], 'k]) -> Text['k] {
-    let out = Out::new(&cx);
+    var out = Buffer::new();
     var i = 0usize;
     while i < names.len(&cx) {
         if i > 0usize {
-            let unit = out.put(&cx, "::");
+            out = out.push_static("::");
         }
-        let unit = out.add(&cx, names.get(&cx, i));
+        out = out.push_bytes(&cx, names.get(&cx, i));
         i = i + 1usize;
     }
-    out.done(&cx)
+    text_of(&cx, out)
 }
 
 forall 'k.
@@ -302,7 +309,7 @@ impl TomlReader['k] {
             }
             k = k + 1usize;
         }
-        fail(&cx, Out::new(&cx).add(&cx, self.file).put(&cx, ":").usize(&cx, line).put(&cx, ": invalid manifest").done(&cx))
+        fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, self.file).push_static(":").push_usize(line).push_static(": invalid manifest")))
     }
 
     fn expect(self, &cx: Cx!['k], b: u8) {
@@ -508,8 +515,8 @@ impl TomlReader['k] {
     // A basic or literal string, on one line or several.
     fn string(self, &cx: Cx!['k]) -> Text['k] {
         let quote = self.at(&cx);
-        let multi = self.src.slice(self.i.get(&cx), self.i.get(&cx) + 3usize).eq(&cx, Out::new(&cx).byte(&cx, quote).byte(&cx, quote).byte(&cx, quote).done(&cx));
-        let out = Out::new(&cx);
+        let multi = self.src.slice(self.i.get(&cx), self.i.get(&cx) + 3usize).eq(&cx, text_of(&cx, Buffer::new().push_byte(quote).push_byte(quote).push_byte(quote)));
+        var out = Buffer::new();
         if multi {
             self.i.set(&cx, self.i.get(&cx) + 3usize);
             if !self.done(&cx) && self.at(&cx) == b'\n' {
@@ -534,33 +541,33 @@ impl TomlReader['k] {
                 self.fail(&cx);
             } else if b == b'\\' && quote == b'"' {
                 self.advance(&cx);
-                self.escape(&cx, out, multi);
+                self.escape(&cx, &out, multi);
             } else {
-                let unit = out.byte(&cx, b);
+                out = out.push_byte(b);
                 self.advance(&cx);
             }
         }
-        out.done(&cx)
+        text_of(&cx, out)
     }
 
-    fn escape(self, &cx: Cx!['k], out: Out['k], multi: bool) {
+    fn escape(self, &cx: Cx!['k], &out: Buffer!, multi: bool) {
         if self.done(&cx) {
             self.fail(&cx);
         }
         let b = self.at(&cx);
         self.advance(&cx);
         if b == b'n' {
-            let unit = out.byte(&cx, b'\n');
+            out = out.push_byte(b'\n');
         } else if b == b't' {
-            let unit = out.byte(&cx, b'\t');
+            out = out.push_byte(b'\t');
         } else if b == b'r' {
-            let unit = out.byte(&cx, b'\r');
+            out = out.push_byte(b'\r');
         } else if b == b'b' {
-            let unit = out.byte(&cx, 8u8);
+            out = out.push_byte(8u8);
         } else if b == b'f' {
-            let unit = out.byte(&cx, 12u8);
+            out = out.push_byte(12u8);
         } else if b == b'"' || b == b'\\' {
-            let unit = out.byte(&cx, b);
+            out = out.push_byte(b);
         } else if b == b'u' || b == b'U' {
             let count = if b == b'u' { 4usize } else { 8usize };
             var code = 0u32;
@@ -580,7 +587,7 @@ impl TomlReader['k] {
                 self.advance(&cx);
                 k = k + 1usize;
             }
-            utf8(&cx, out, code);
+            utf8(&cx, &out, code);
         } else if multi && (b == b'\n' || b == b' ' || b == b'\t' || b == b'\r') {
             // A line-ending backslash drops the whitespace after it.
             self.i.set(&cx, self.i.get(&cx) - 1usize);
@@ -600,15 +607,15 @@ fn is_scalar(b: u8) -> bool {
 }
 
 forall 'k.
-fn utf8(&cx: Cx!['k], out: Out['k], code: u32) {
+fn utf8(&cx: Cx!['k], &out: Buffer!, code: u32) {
     if code < 128u32 {
-        let unit = out.byte(&cx, code as u8);
+        out = out.push_byte(code as u8);
     } else if code < 2048u32 {
-        let unit = out.byte(&cx, (192u32 | (code >> 6u32)) as u8).byte(&cx, (128u32 | (code & 63u32)) as u8);
+        out = out.push_byte((192u32 | (code >> 6u32)) as u8).push_byte((128u32 | (code & 63u32)) as u8);
     } else if code < 65536u32 {
-        let unit = out.byte(&cx, (224u32 | (code >> 12u32)) as u8).byte(&cx, (128u32 | ((code >> 6u32) & 63u32)) as u8).byte(&cx, (128u32 | (code & 63u32)) as u8);
+        out = out.push_byte((224u32 | (code >> 12u32)) as u8).push_byte((128u32 | ((code >> 6u32) & 63u32)) as u8).push_byte((128u32 | (code & 63u32)) as u8);
     } else {
-        let unit = out.byte(&cx, (240u32 | (code >> 18u32)) as u8).byte(&cx, (128u32 | ((code >> 12u32) & 63u32)) as u8).byte(&cx, (128u32 | ((code >> 6u32) & 63u32)) as u8).byte(&cx, (128u32 | (code & 63u32)) as u8);
+        out = out.push_byte((240u32 | (code >> 18u32)) as u8).push_byte((128u32 | ((code >> 12u32) & 63u32)) as u8).push_byte((128u32 | ((code >> 6u32) & 63u32)) as u8).push_byte((128u32 | (code & 63u32)) as u8);
     }
 }
 
@@ -796,7 +803,7 @@ fn error_text(&cx: Cx!['k], message: Text['k], pos: Pos) -> Text['k] {
     if pos.line == 0u32 {
         message
     } else {
-        Out::new(&cx).u64(&cx, pos.line as u64).put(&cx, ":").u64(&cx, pos.col as u64).put(&cx, ": ").add(&cx, message).done(&cx)
+        text_of(&cx, Buffer::new().push_u64(pos.line as u64).push_static(":").push_u64(pos.col as u64).push_static(": ").push_bytes(&cx, message))
     }
 }
 
@@ -809,11 +816,11 @@ fn located(&cx: Cx!['k], full: Text['k], message: Text['k], pos: Pos, file: Text
     } else {
         let at_pos = if pos.line != 0u32 { pos } else { at };
         let prefix = if at_pos.line != 0u32 {
-            Out::new(&cx).add(&cx, file).put(&cx, ":").u64(&cx, at_pos.line as u64).put(&cx, ":").u64(&cx, at_pos.col as u64).done(&cx)
+            text_of(&cx, Buffer::new().push_bytes(&cx, file).push_static(":").push_u64(at_pos.line as u64).push_static(":").push_u64(at_pos.col as u64))
         } else {
             file
         };
-        (Out::new(&cx).add(&cx, prefix).put(&cx, ": ").add(&cx, message).done(&cx), at_pos)
+        (text_of(&cx, Buffer::new().push_bytes(&cx, prefix).push_static(": ").push_bytes(&cx, message)), at_pos)
     }
 }
 
@@ -864,7 +871,7 @@ fn load(&cx: Cx!['k], path: Text['k], ids: Cell[u32, 'k]) -> Seq[Package['k], 'k
                 k = k + 1usize;
             }
             if !package.files.has(&cx, ModuleId::root(&cx, package.id)) {
-                fail(&cx, Out::new(&cx).put(&cx, "package ").add(&cx, package.name.get(&cx)).put(&cx, " has no lib.kur in ").add(&cx, package.source_root.get(&cx)).done(&cx));
+                fail(&cx, text_of(&cx, Buffer::new().push_static("package ").push_bytes(&cx, package.name.get(&cx)).push_static(" has no lib.kur in ").push_bytes(&cx, package.source_root.get(&cx))));
             }
         }
         p = p + 1usize;
@@ -877,7 +884,7 @@ forall 'k.
 fn read_source(&cx: Cx!['k], path: Text['k]) -> Text['k] {
     match read(&cx, path) {
         Option::Some(s) => s,
-        Option::None => fail(&cx, Out::new(&cx).put(&cx, "cannot read ").add(&cx, path).done(&cx)),
+        Option::None => fail(&cx, text_of(&cx, Buffer::new().push_static("cannot read ").push_bytes(&cx, path))),
     }
 }
 
@@ -935,13 +942,13 @@ fn add(&cx: Cx!['k], packages: Seq[Package['k], 'k], by_dir: Map[Text['k], usize
         if unknown.len(&cx) > 0usize {
             let names = unknown.items(&cx);
             names.sort(&cx, text_before);
-            let out = Out::new(&cx).add(&cx, manifest).put(&cx, ": unknown manifest keys [");
+            var out = Buffer::new().push_bytes(&cx, manifest).push_static(": unknown manifest keys [");
             var k = 0usize;
             while k < names.len(&cx) {
-                let unit = out.put(&cx, if k > 0usize { ", " } else { "" }).add(&cx, repr(&cx, names.get(&cx, k)));
+                out = out.push_static(if k > 0usize { ", " } else { "" }).push_bytes(&cx, repr(&cx, names.get(&cx, k)));
                 k = k + 1usize;
             }
-            fail(&cx, out.put(&cx, "]").done(&cx));
+            fail(&cx, text_of(&cx, out.push_static("]")));
         }
         package.name.set(&cx, string(&cx, info, "name", Option::None));
         package.source_root.set(&cx, resolved(&cx, join(&cx, root, string(&cx, info, "source_root", Option::Some.(text(&cx, "src"))))));
@@ -982,7 +989,7 @@ forall 'k.
 fn table(&cx: Cx!['k], value: Toml['k], at_pos: Text['k]) -> Map[Text['k], Toml['k], 'k] {
     match value {
         Toml::Table(t) => t,
-        _ => fail(&cx, Out::new(&cx).add(&cx, at_pos).put(&cx, ": expected a table").done(&cx)),
+        _ => fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, at_pos).push_static(": expected a table"))),
     }
 }
 
@@ -997,7 +1004,7 @@ fn string(&cx: Cx!['k], t: Map[Text['k], Toml['k], 'k], key: Slice[u8, 'static],
     };
     match value {
         Toml::Str(s) => s,
-        _ => fail(&cx, Out::new(&cx).put(&cx, "manifest ").add(&cx, repr(&cx, text(&cx, key))).put(&cx, " must be a string").done(&cx)),
+        _ => fail(&cx, text_of(&cx, Buffer::new().push_static("manifest ").push_bytes(&cx, repr(&cx, text(&cx, key))).push_static(" must be a string"))),
     }
 }
 
@@ -1042,7 +1049,7 @@ fn walk(&cx: Cx!['k], package: Package['k], here: Text['k], rel: Seq[Text['k], '
             }
             let home = ModuleId.{ package: package.id, path };
             if files.has(&cx, home) {
-                fail(&cx, Out::new(&cx).put(&cx, "two files define module ").add(&cx, joined(&cx, path)).put(&cx, " of ").add(&cx, package.name.get(&cx)).done(&cx));
+                fail(&cx, text_of(&cx, Buffer::new().push_static("two files define module ").push_bytes(&cx, joined(&cx, path)).push_static(" of ").push_bytes(&cx, package.name.get(&cx))));
             }
             files.set(&cx, home, join(&cx, here, name));
         }
@@ -1071,7 +1078,7 @@ forall 'k.
 fn visit(&cx: Cx!['k], packages: Seq[Package['k], 'k], state: Map[usize, u32, 'k], package_id: usize) {
     let s = state.get_or(&cx, package_id, 0u32);
     if s == 1u32 {
-        fail(&cx, Out::new(&cx).put(&cx, "dependency cycle through package ").add(&cx, packages.get(&cx, package_id).name.get(&cx)).done(&cx));
+        fail(&cx, text_of(&cx, Buffer::new().push_static("dependency cycle through package ").push_bytes(&cx, packages.get(&cx, package_id).name.get(&cx))));
     }
     if s == 0u32 {
         state.set(&cx, package_id, 1u32);
@@ -1206,7 +1213,7 @@ impl Resolver['k] {
 
     fn declare(self, &cx: Cx!['k], scope: Scope['k], decl: Decl['k]) {
         if scope.decls.has(&cx, decl.name) || scope.imports.has(&cx, decl.name) {
-            self.fail(&cx, Out::new(&cx).put(&cx, "duplicate name ").add(&cx, decl.name).done(&cx), named_pos(decl.node));
+            self.fail(&cx, text_of(&cx, Buffer::new().push_static("duplicate name ").push_bytes(&cx, decl.name)), named_pos(decl.node));
         }
         scope.decls.set(&cx, decl.name, decl);
     }
@@ -1233,10 +1240,10 @@ impl Resolver['k] {
                 return;
             }
             if name.is(&cx, "package") || name.is(&cx, "builtin") || is_builtin_trait(&cx, name) {
-                self.fail(&cx, Out::new(&cx).put(&cx, "'").add(&cx, name).put(&cx, "' is compiler-sealed").done(&cx), no_pos());
+                self.fail(&cx, text_of(&cx, Buffer::new().push_static("'").push_bytes(&cx, name).push_static("' is compiler-sealed")), no_pos());
             }
             if scope.imports.has(&cx, name) || scope.decls.has(&cx, name) {
-                self.fail(&cx, Out::new(&cx).put(&cx, "duplicate import ").add(&cx, name).put(&cx, " in ").add(&cx, repr_module(&cx, scope.home)).done(&cx), no_pos());
+                self.fail(&cx, text_of(&cx, Buffer::new().push_static("duplicate import ").push_bytes(&cx, name).push_static(" in ").push_bytes(&cx, repr_module(&cx, scope.home))), no_pos());
             }
             scope.imports.set(&cx, name, path);
             if exported {
@@ -1282,8 +1289,8 @@ impl Resolver['k] {
         var k = 0usize;
         while k < item.items.len(&cx) {
             let decl = match item.items.get(&cx, k) {
-                S::Member::Fn(f) => self.new_decl(&cx, "method", scope.home, Out::new(&cx).add(&cx, spelled).put(&cx, "::").add(&cx, f.name).done(&cx), Named::Fn.(f), Option::Some.(item)),
-                S::Member::Const(c) => self.new_decl(&cx, "const", scope.home, Out::new(&cx).add(&cx, spelled).put(&cx, "::").add(&cx, c.name).done(&cx), Named::Const.(c), Option::Some.(item)),
+                S::Member::Fn(f) => self.new_decl(&cx, "method", scope.home, text_of(&cx, Buffer::new().push_bytes(&cx, spelled).push_static("::").push_bytes(&cx, f.name)), Named::Fn.(f), Option::Some.(item)),
+                S::Member::Const(c) => self.new_decl(&cx, "const", scope.home, text_of(&cx, Buffer::new().push_bytes(&cx, spelled).push_static("::").push_bytes(&cx, c.name)), Named::Const.(c), Option::Some.(item)),
             };
             let member = match item.items.get(&cx, k) {
                 S::Member::Fn(f) => f.name,
@@ -1359,7 +1366,7 @@ impl Resolver['k] {
         let (kind, home, names) = key;
         if self.active.has(&cx, key) {
             let at = if kind.is(&cx, "path") { repr_tuple(&cx, names) } else { names.get(&cx, 0usize) };
-            return problem(Out::new(&cx).put(&cx, "import cycle at ").add(&cx, at).done(&cx));
+            return problem(text_of(&cx, Buffer::new().push_static("import cycle at ").push_bytes(&cx, at)));
         }
         self.active.add(&cx, key);
         let value = if kind.is(&cx, "import") {
@@ -1400,7 +1407,7 @@ impl Resolver['k] {
                 Option::None => match self.glob(&cx, home, first) {
                     Result::Ok(found) => match found {
                         Option::Some(t) => t,
-                        Option::None => return problem(Out::new(&cx).put(&cx, "unknown name ").add(&cx, joined(&cx, path)).done(&cx)),
+                        Option::None => return problem(text_of(&cx, Buffer::new().push_static("unknown name ").push_bytes(&cx, joined(&cx, path)))),
                     },
                     Result::Err(e) => return Result::Err.(e),
                 },
@@ -1414,7 +1421,7 @@ impl Resolver['k] {
                     Result::Ok(t) => t,
                     Result::Err(e) => return Result::Err.(e),
                 },
-                _ => return problem(Out::new(&cx).add(&cx, joined(&cx, path.slice(&cx, 0usize, k + 1usize))).put(&cx, " is not a module").done(&cx)),
+                _ => return problem(text_of(&cx, Buffer::new().push_bytes(&cx, joined(&cx, path.slice(&cx, 0usize, k + 1usize))).push_static(" is not a module"))),
             };
             k = k + 1usize;
         }
@@ -1460,7 +1467,7 @@ impl Resolver['k] {
                         Result::Ok(t) => return Result::Ok.(Option::Some.(t)),
                         Result::Err(e) => (),
                     },
-                    _ => return Result::Err.(Problem.{ message: Out::new(&cx).add(&cx, joined(&cx, path)).put(&cx, " is not a module").done(&cx), pos: no_pos() }),
+                    _ => return Result::Err.(Problem.{ message: text_of(&cx, Buffer::new().push_bytes(&cx, joined(&cx, path)).push_static(" is not a module")), pos: no_pos() }),
                 };
             }
             i = i + 1usize;
@@ -1513,7 +1520,7 @@ impl Resolver['k] {
             };
         }
         let owner = if home.path.is_empty(&cx) { self.packages.get(&cx, home.package).name.get(&cx) } else { joined(&cx, home.path) };
-        problem(Out::new(&cx).put(&cx, "unknown or private member ").add(&cx, name).put(&cx, " of ").add(&cx, owner).done(&cx))
+        problem(text_of(&cx, Buffer::new().push_static("unknown or private member ").push_bytes(&cx, name).push_static(" of ").push_bytes(&cx, owner)))
     }
 
     // `Owner::name`: an enum variant, or a method or const attached to `Owner`.
@@ -1552,7 +1559,7 @@ impl Resolver['k] {
             own = found;
         }
         if own.len(&cx) != 1usize {
-            return problem(Out::new(&cx).put(&cx, if own.is_empty(&cx) { "unknown" } else { "ambiguous" }).put(&cx, " associated name ").add(&cx, owner.name).put(&cx, "::").add(&cx, name).done(&cx));
+            return problem(text_of(&cx, Buffer::new().push_static(if own.is_empty(&cx) { "unknown" } else { "ambiguous" }).push_static(" associated name ").push_bytes(&cx, owner.name).push_static("::").push_bytes(&cx, name)));
         }
         Result::Ok.(Target::Decl.(own.get(&cx, 0usize)))
     }
@@ -1800,7 +1807,7 @@ impl Names['k] {
 
     fn not_a(self, &cx: Cx!['k], path: Seq[Text['k], 'k], kind: Text['k], pos: Pos) -> ! {
         let what = if kind.is_empty() { text(&cx, "declaration") } else { kind };
-        self.r.fail(&cx, Out::new(&cx).add(&cx, joined(&cx, path)).put(&cx, " is not a ").add(&cx, what).done(&cx), pos)
+        self.r.fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, joined(&cx, path)).push_static(" is not a ").push_bytes(&cx, what)), pos)
     }
 
     // ---- types
@@ -1833,7 +1840,7 @@ impl Names['k] {
                     let d = self.decl(&cx, path, if is_trait { "trait" } else { "" }, no_pos());
                     self.set(&cx, n.id, NameRef::Decl.(d));
                     if !is_trait && !d.kind.is(&cx, "struct") && !d.kind.is(&cx, "enum") && !d.kind.is(&cx, "tuple") {
-                        self.r.fail(&cx, Out::new(&cx).add(&cx, joined(&cx, path)).put(&cx, " is not a type").done(&cx), no_pos());
+                        self.r.fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, joined(&cx, path)).push_static(" is not a type")), no_pos());
                     }
                 }
                 self.types(&cx, n.args, types);
@@ -1917,7 +1924,7 @@ impl Names['k] {
                 while i < s.fields.len(&cx) {
                     let f = s.fields.get(&cx, i);
                     if f.value.is_none() && !values.has(&cx, f.name) {
-                        self.r.fail(&cx, Out::new(&cx).put(&cx, "unknown local ").add(&cx, f.name).done(&cx), s.pos);
+                        self.r.fail(&cx, text_of(&cx, Buffer::new().push_static("unknown local ").push_bytes(&cx, f.name)), s.pos);
                     }
                     i = i + 1usize;
                 }
@@ -2080,7 +2087,7 @@ impl Names['k] {
         } else if names.len(&cx) == 2usize && is_prim(&cx, first) {
             let found = self.r.attached.get_or(&cx, (Owner::Prim.(first), names.get(&cx, 1usize)), Seq::new(&cx));
             if found.is_empty(&cx) {
-                self.r.fail(&cx, Out::new(&cx).put(&cx, "unknown ").add(&cx, first).put(&cx, "::").add(&cx, names.get(&cx, 1usize)).done(&cx), p.pos);
+                self.r.fail(&cx, text_of(&cx, Buffer::new().push_static("unknown ").push_bytes(&cx, first).push_static("::").push_bytes(&cx, names.get(&cx, 1usize))), p.pos);
             }
             self.set(&cx, p.id, NameRef::Decl.(found.get(&cx, 0usize)));
         } else if names.len(&cx) == 2usize && types.has(&cx, first) {
@@ -2088,7 +2095,7 @@ impl Names['k] {
             self.set(&cx, p.id, NameRef::Assoc.(first, names.get(&cx, 1usize)));
         } else {
             let r = match self.r.need(&cx, self.home.get(&cx), names, p.pos) {
-                Target::Module(m) => self.r.fail(&cx, Out::new(&cx).add(&cx, joined(&cx, names)).put(&cx, " is a module, not a value").done(&cx), p.pos),
+                Target::Module(m) => self.r.fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, joined(&cx, names)).push_static(" is a module, not a value")), p.pos),
                 Target::Decl(d) => NameRef::Decl.(d),
                 Target::Variant(d, v) => NameRef::Variant.(d, v),
                 Target::TraitMethod(d, m) => NameRef::TraitMethod.(d, m),
@@ -2100,7 +2107,7 @@ impl Names['k] {
     fn variant(self, &cx: Cx!['k], path: S::Path['k]) {
         match self.r.need(&cx, self.home.get(&cx), path.names(&cx), path.pos) {
             Target::Variant(d, v) => self.set(&cx, path.id, NameRef::Variant.(d, v)),
-            _ => self.r.fail(&cx, Out::new(&cx).add(&cx, joined(&cx, path.names(&cx))).put(&cx, " is not an enum variant").done(&cx), path.pos),
+            _ => self.r.fail(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, joined(&cx, path.names(&cx))).push_static(" is not an enum variant")), path.pos),
         }
     }
 }

@@ -4,7 +4,8 @@
 // Generic functions are specialized on demand by logical type arguments, up to their brands.
 // Representation erasure is separate from code-specialization identity.
 
-use package::support::base::{Cell, Cx, Map, Out, Seq, Set, Text, text};
+use package::support::base::{Cell, Cx, Map, Seq, Set, Text, text, text_of};
+use std::bytes::buffer::Buffer;
 use package::check::checker::{FunKey, matching_instance};
 use package::kurs::core::{Arm, Block, Data, Edge, Fun, ForeachType, Instr, Member, Param, Program, Terminator, Type};
 use package::kurs::core as C;
@@ -16,21 +17,31 @@ use package::types::ops::{Fresh, Row, Types, equal, foreach_binders, kurs_error,
 use std::option::Option;
 use std::slice::Slice;
 
+fn prelude() -> Buffer! {
+    Buffer::new()
+        .push_static("#include <stddef.h>\n")
+        .push_static("#include <stdint.h>\n")
+        .push_static("typedef struct { unsigned char dummy; } KurUnit;\n")
+        .push_static("#define KUR_TRAP() __builtin_trap()\n")
+        .push_static("/* A component's address by integer arithmetic: projection never dereferences, so it is defined for any\n")
+        .push_static("   pointer value, null and dangling included. The `__typeof__` operands are not evaluated. */\n")
+        .push_static("#define KUR_FIELD(p, m) ((__typeof__(&(p)->m))((uintptr_t)(p) + offsetof(__typeof__(*(p)), m)))\n")
+        .push_static("static inline int8_t kur_dec_i8(uint64_t b) { b &= 0xFF; return b < 0x80 ? (int8_t)b : (int8_t)((int64_t)b - 0x100); }\n")
+        .push_static("static inline int16_t kur_dec_i16(uint64_t b) { b &= 0xFFFF; return b < 0x8000 ? (int16_t)b : (int16_t)((int64_t)b - 0x10000); }\n")
+        .push_static("static inline int32_t kur_dec_i32(uint64_t b) { b &= 0xFFFFFFFF; return b < 0x80000000 ? (int32_t)b : (int32_t)((int64_t)b - 0x100000000); }\n")
+        .push_static("static inline int64_t kur_dec_i64(uint64_t b) { return b <= (uint64_t)INT64_MAX ? (int64_t)b : -INT64_C(1) - (int64_t)(UINT64_MAX - b); }\n")
+}
+
+// Each of `items`, followed by a newline.
 forall 'k.
-fn prelude(&cx: Cx!['k]) -> Text['k] {
-    Out::new(&cx)
-        .put(&cx, "#include <stddef.h>\n")
-        .put(&cx, "#include <stdint.h>\n")
-        .put(&cx, "typedef struct { unsigned char dummy; } KurUnit;\n")
-        .put(&cx, "#define KUR_TRAP() __builtin_trap()\n")
-        .put(&cx, "/* A component's address by integer arithmetic: projection never dereferences, so it is defined for any\n")
-        .put(&cx, "   pointer value, null and dangling included. The `__typeof__` operands are not evaluated. */\n")
-        .put(&cx, "#define KUR_FIELD(p, m) ((__typeof__(&(p)->m))((uintptr_t)(p) + offsetof(__typeof__(*(p)), m)))\n")
-        .put(&cx, "static inline int8_t kur_dec_i8(uint64_t b) { b &= 0xFF; return b < 0x80 ? (int8_t)b : (int8_t)((int64_t)b - 0x100); }\n")
-        .put(&cx, "static inline int16_t kur_dec_i16(uint64_t b) { b &= 0xFFFF; return b < 0x8000 ? (int16_t)b : (int16_t)((int64_t)b - 0x10000); }\n")
-        .put(&cx, "static inline int32_t kur_dec_i32(uint64_t b) { b &= 0xFFFFFFFF; return b < 0x80000000 ? (int32_t)b : (int32_t)((int64_t)b - 0x100000000); }\n")
-        .put(&cx, "static inline int64_t kur_dec_i64(uint64_t b) { return b <= (uint64_t)INT64_MAX ? (int64_t)b : -INT64_C(1) - (int64_t)(UINT64_MAX - b); }\n")
-        .done(&cx)
+fn text_lines(&cx: Cx!['k], c: Buffer!, items: Seq[Text['k], 'k]) -> Buffer! {
+    var c = c;
+    var i = 0usize;
+    while i < items.len(&cx) {
+        c = c.push_bytes(&cx, items.get(&cx, i)).push_static("\n");
+        i = i + 1usize;
+    }
+    c
 }
 
 forall 'k.
@@ -46,10 +57,15 @@ fn c_prim(&cx: Cx!['k], name: Text['k]) -> Text['k] {
     } else if name.is(&cx, "isize") {
         text(&cx, "int64_t")
     } else if name.byte(&cx, 0usize) == b'u' {
-        Out::new(&cx).put(&cx, "uint").add(&cx, name.from(1usize)).put(&cx, "_t").done(&cx)
+        text_of(&cx, Buffer::new().push_static("uint").push_bytes(&cx, name.from(1usize)).push_static("_t"))
     } else {
-        Out::new(&cx).put(&cx, "int").add(&cx, name.from(1usize)).put(&cx, "_t").done(&cx)
+        text_of(&cx, Buffer::new().push_static("int").push_bytes(&cx, name.from(1usize)).push_static("_t"))
     }
+}
+
+// One line of a function's body, indented, appended to `lines`; `l` is freed.
+fn line(&lines: Buffer!, l: Buffer!) {
+    lines = lines.push_static("  ").push_buffer(l).push_static("\n");
 }
 
 // The width of a signed integer type, or 0 for any other.
@@ -60,14 +76,14 @@ fn signed_bits(&cx: Cx!['k], name: Text['k]) -> u32 {
 
 forall 'k.
 fn c_order(&cx: Cx!['k], order: Text['k]) -> Text['k] {
-    let out = Out::new(&cx).put(&cx, "__ATOMIC_");
+    var out = Buffer::new().push_static("__ATOMIC_");
     var i = 0usize;
     while i < order.len() {
         let b = order.byte(&cx, i);
-        let unit = out.byte(&cx, if b >= b'a' && b <= b'z' { b - 32u8 } else { b });
+        out = out.push_byte(if b >= b'a' && b <= b'z' { b - 32u8 } else { b });
         i = i + 1usize;
     }
-    out.done(&cx)
+    text_of(&cx, out)
 }
 
 forall 'k.
@@ -143,10 +159,10 @@ fn runtime_names(&cx: Cx!['k]) -> Set[Text['k], 'k] {
         var u = 0usize;
         while u < 2usize {
             let unsigned = if u == 1usize { text(&cx, "U") } else { text(&cx, "") };
-            out.add(&cx, Out::new(&cx).add(&cx, lower(&cx, unsigned)).put(&cx, "int").add(&cx, lower(&cx, stem)).put(&cx, "_t").done(&cx));
+            out.add(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, lower(&cx, unsigned)).push_static("int").push_bytes(&cx, lower(&cx, stem)).push_static("_t")));
             var s = 0usize;
             while s < suffixes.len(&cx) {
-                out.add(&cx, Out::new(&cx).add(&cx, unsigned).put(&cx, "INT").add(&cx, stem).put(&cx, "_").add(&cx, suffixes.get(&cx, s)).done(&cx));
+                out.add(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, unsigned).push_static("INT").push_bytes(&cx, stem).push_static("_").push_bytes(&cx, suffixes.get(&cx, s))));
                 s = s + 1usize;
             }
             u = u + 1usize;
@@ -158,14 +174,14 @@ fn runtime_names(&cx: Cx!['k]) -> Set[Text['k], 'k] {
 
 forall 'k.
 fn lower(&cx: Cx!['k], t: Text['k]) -> Text['k] {
-    let out = Out::new(&cx);
+    var out = Buffer::new();
     var i = 0usize;
     while i < t.len() {
         let b = t.byte(&cx, i);
-        let unit = out.byte(&cx, if b >= b'A' && b <= b'Z' { b + 32u8 } else { b });
+        out = out.push_byte(if b >= b'A' && b <= b'Z' { b + 32u8 } else { b });
         i = i + 1usize;
     }
-    out.done(&cx)
+    text_of(&cx, out)
 }
 
 fn is_digit(b: u8) -> bool {
@@ -195,14 +211,14 @@ impl Pool['k] {
 // Allocate a C identifier; the readable spelling is only a hint.
 forall 'k.
 fn allocate(&cx: Cx!['k], base: Text['k], pool: Pool['k]) -> Text['k] {
-    let start = if is_digit(base.byte(&cx, 0usize)) { Out::new(&cx).put(&cx, "k_").add(&cx, base).done(&cx) } else { base };
+    let start = if is_digit(base.byte(&cx, 0usize)) { text_of(&cx, Buffer::new().push_static("k_").push_bytes(&cx, base)) } else { base };
     var name = start;
     if pool.taken.has(&cx, name) {
         var index = pool.last.get_or(&cx, start, 0usize);
         var going = true;
         while going {
             index = index + 1usize;
-            name = Out::new(&cx).add(&cx, start).put(&cx, "_").usize(&cx, index).done(&cx);
+            name = text_of(&cx, Buffer::new().push_bytes(&cx, start).push_static("_").push_usize(index));
             going = pool.taken.has(&cx, name);
         }
         pool.last.set(&cx, start, index);
@@ -214,14 +230,14 @@ fn allocate(&cx: Cx!['k], base: Text['k], pool: Pool['k]) -> Text['k] {
 // Decode the linker's hex-encoded identity segments, then make a C identifier.
 forall 'k.
 fn readable(&cx: Cx!['k], name: Text['k]) -> Text['k] {
-    let joined = Out::new(&cx);
+    var joined = Buffer::new();
     let pieces = name.split(&cx, text(&cx, "::"));
     var i = 0usize;
     while i < pieces.len(&cx) {
         if i > 0usize {
-            let unit = joined.put(&cx, "_");
+            joined = joined.push_static("_");
         }
-        let unit = joined.add(&cx, match decode_segment(&cx, pieces.get(&cx, i)) {
+        joined = joined.push_bytes(&cx, match decode_segment(&cx, pieces.get(&cx, i)) {
             Option::Some(bytes) => bytes,
             Option::None => pieces.get(&cx, i),
         });
@@ -229,19 +245,19 @@ fn readable(&cx: Cx!['k], name: Text['k]) -> Text['k] {
     }
     // Every character outside [A-Za-z0-9_] becomes one `_`; the text is UTF-8, so a character's
     // continuation bytes add nothing.
-    let all = joined.done(&cx);
-    let out = Out::new(&cx);
+    let all = text_of(&cx, joined);
+    var out = Buffer::new();
     var j = 0usize;
     while j < all.len() {
         let b = all.byte(&cx, j);
         if is_word_byte(b) {
-            let unit = out.byte(&cx, b);
+            out = out.push_byte(b);
         } else if (b & 192u8) != 128u8 {
-            let unit = out.put(&cx, "_");
+            out = out.push_static("_");
         }
         j = j + 1usize;
     }
-    let made = out.done(&cx);
+    let made = text_of(&cx, out);
     var start = 0usize;
     var end = made.len();
     while start < end && made.byte(&cx, start) == b'_' {
@@ -306,16 +322,16 @@ fn is_foreach(t: Type['k]) -> bool {
 
 forall 'k.
 fn joined(&cx: Cx!['k], parts: Seq[Text['k], 'k], separator: Slice[u8, 'static]) -> Text['k] {
-    let out = Out::new(&cx);
+    var out = Buffer::new();
     var i = 0usize;
     while i < parts.len(&cx) {
         if i > 0usize {
-            let unit = out.put(&cx, separator);
+            out = out.push_static(separator);
         }
-        let unit = out.add(&cx, parts.get(&cx, i));
+        out = out.push_bytes(&cx, parts.get(&cx, i));
         i = i + 1usize;
     }
-    out.done(&cx)
+    text_of(&cx, out)
 }
 
 forall 'k.
@@ -343,27 +359,27 @@ fn is_c_identifier(&cx: Cx!['k], t: Text['k]) -> bool {
 forall 'k.
 fn repr(&cx: Cx!['k], t: Text['k]) -> Text['k] {
     let quote = if t.contains(&cx, text(&cx, "'")) && !t.contains(&cx, text(&cx, "\"")) { b'"' } else { b'\'' };
-    let out = Out::new(&cx).byte(&cx, quote);
+    var out = Buffer::new().push_byte(quote);
     let digits = text(&cx, "0123456789abcdef");
     var i = 0usize;
     while i < t.len() {
         let b = t.byte(&cx, i);
         if b == b'\\' || b == quote {
-            let unit = out.byte(&cx, b'\\').byte(&cx, b);
+            out = out.push_byte(b'\\').push_byte(b);
         } else if b == b'\n' {
-            let unit = out.put(&cx, "\\n");
+            out = out.push_static("\\n");
         } else if b == b'\r' {
-            let unit = out.put(&cx, "\\r");
+            out = out.push_static("\\r");
         } else if b == b'\t' {
-            let unit = out.put(&cx, "\\t");
+            out = out.push_static("\\t");
         } else if b < 32u8 || b == 127u8 {
-            let unit = out.put(&cx, "\\x").byte(&cx, digits.byte(&cx, (b / 16u8) as usize)).byte(&cx, digits.byte(&cx, (b % 16u8) as usize));
+            out = out.push_static("\\x").push_byte(digits.byte(&cx, (b / 16u8) as usize)).push_byte(digits.byte(&cx, (b % 16u8) as usize));
         } else {
-            let unit = out.byte(&cx, b);
+            out = out.push_byte(b);
         }
         i = i + 1usize;
     }
-    out.byte(&cx, quote).done(&cx)
+    text_of(&cx, out.push_byte(quote))
 }
 
 forall 'k.
@@ -383,7 +399,7 @@ fn items_access(&cx: Cx!['k], count: usize) -> Seq[Text['k], 'k] {
     let out: Seq[Text['k], 'k] = Seq::new(&cx);
     var k = 0usize;
     while k < count {
-        out.push(&cx, Out::new(&cx).put(&cx, "items[").usize(&cx, k).put(&cx, "]").done(&cx));
+        out.push(&cx, text_of(&cx, Buffer::new().push_static("items[").push_usize(k).push_static("]")));
         k = k + 1usize;
     }
     out
@@ -428,7 +444,7 @@ exposed struct Backend {
     // types under `sub`, when substituting renamed no binder
     substituted: Cell[Map[Type['k], Type['k], 'k], 'k],
     locals: Cell[Map[(Text['k], Text['k]), Text['k], 'k], 'k],
-    lines: Cell[Seq[Text['k], 'k], 'k],
+
     scratch: Cell[usize, 'k],
     labels: Cell[Map[Text['k], Text['k], 'k], 'k],
     decls: Cell[Seq[Text['k], 'k], 'k],
@@ -542,7 +558,7 @@ impl Backend['k] {
             sub: Cell::new(&cx, Map::new(&cx)),
             substituted: Cell::new(&cx, Map::new(&cx)),
             locals: Cell::new(&cx, Map::new(&cx)),
-            lines: Cell::new(&cx, Seq::new(&cx)),
+
             scratch: Cell::new(&cx, 0usize),
             labels: Cell::new(&cx, Map::new(&cx)),
             decls: Cell::new(&cx, Seq::new(&cx)),
@@ -569,7 +585,7 @@ impl Backend['k] {
     }
 
     fn fresh_name(self, &cx: Cx!['k], hint: Text['k]) -> Text['k] {
-        allocate(&cx, Out::new(&cx).put(&cx, "K_").add(&cx, tail(self.readable(&cx, hint), 48usize)).done(&cx), self.taken)
+        allocate(&cx, text_of(&cx, Buffer::new().push_static("K_").push_bytes(&cx, tail(self.readable(&cx, hint), 48usize))), self.taken)
     }
 
     // The C type of `ty`; through a pointer, an aggregate needs only its name.
@@ -596,7 +612,7 @@ impl Backend['k] {
             },
             Type::Ptr(inner) => {
                 let inner = erase(&cx, inner.get(&cx), self.types);
-                return if is_never(inner) { text(&cx, "void*") } else { Out::new(&cx).add(&cx, self.ctype(&cx, inner, false)).put(&cx, "*").done(&cx) };
+                return if is_never(inner) { text(&cx, "void*") } else { text_of(&cx, Buffer::new().push_bytes(&cx, self.ctype(&cx, inner, false)).push_static("*")) };
             },
             _ => (),
         };
@@ -646,10 +662,10 @@ impl Backend['k] {
                 var k = 0usize;
                 while k < f.params.len(&cx) {
                     let ct = self.ctype(&cx, f.params.get(&cx, k), false);
-                    params.push(&cx, if f.places.has(&cx, k) { Out::new(&cx).add(&cx, ct).put(&cx, "*").done(&cx) } else { ct });
+                    params.push(&cx, if f.places.has(&cx, k) { text_of(&cx, Buffer::new().push_bytes(&cx, ct).push_static("*")) } else { ct });
                     k = k + 1usize;
                 }
-                self.defs.push(&cx, Out::new(&cx).put(&cx, "typedef ").add(&cx, result).put(&cx, " (*").add(&cx, name).put(&cx, ")(").add(&cx, or_void(&cx, joined(&cx, params, ", "))).put(&cx, ");").done(&cx));
+                self.defs.push(&cx, text_of(&cx, Buffer::new().push_static("typedef ").push_bytes(&cx, result).push_static(" (*").push_bytes(&cx, name).push_static(")(").push_bytes(&cx, or_void(&cx, joined(&cx, params, ", "))).push_static(");")));
             },
             _ => {
                 let name = self.c(&cx, s);
@@ -665,7 +681,7 @@ impl Backend['k] {
         };
         let name = self.fresh_name(&cx, hint);
         self.names.set(&cx, ty, name);
-        self.forward.push(&cx, Out::new(&cx).put(&cx, "typedef struct ").add(&cx, name).put(&cx, " ").add(&cx, name).put(&cx, ";").done(&cx));
+        self.forward.push(&cx, text_of(&cx, Buffer::new().push_static("typedef struct ").push_bytes(&cx, name).push_static(" ").push_bytes(&cx, name).push_static(";")));
         self.pending.set(&cx, ty, s);
     }
 
@@ -675,7 +691,7 @@ impl Backend['k] {
         let body = match s {
             Type::Array(elem, length) => {
                 if length != 0u64 {
-                    Out::new(&cx).add(&cx, self.c(&cx, elem.get(&cx))).put(&cx, " items[").u64(&cx, length).put(&cx, "];").done(&cx)
+                    text_of(&cx, Buffer::new().push_bytes(&cx, self.c(&cx, elem.get(&cx))).push_static(" items[").push_u64(length).push_static("];"))
                 } else {
                     text(&cx, "unsigned char dummy;")
                 }
@@ -685,10 +701,10 @@ impl Backend['k] {
                 var i = 0usize;
                 while i < variants.len(&cx) {
                     let ct = self.c(&cx, variants.get(&cx, i).type);
-                    members.push(&cx, Out::new(&cx).add(&cx, ct).put(&cx, " ").add(&cx, self.variant(&cx, variants.get(&cx, i).name)).put(&cx, ";").done(&cx));
+                    members.push(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, ct).push_static(" ").push_bytes(&cx, self.variant(&cx, variants.get(&cx, i).name)).push_static(";")));
                     i = i + 1usize;
                 }
-                Out::new(&cx).put(&cx, "uint32_t tag; union { ").add(&cx, joined(&cx, members, " ")).put(&cx, " } payload;").done(&cx)
+                text_of(&cx, Buffer::new().push_static("uint32_t tag; union { ").push_bytes(&cx, joined(&cx, members, " ")).push_static(" } payload;"))
             },
             _ => {
                 let rows = self.members(&cx, s);
@@ -696,13 +712,13 @@ impl Backend['k] {
                 var i = 0usize;
                 while i < rows.len(&cx) {
                     let (m, f) = rows.get(&cx, i);
-                    parts.push(&cx, Out::new(&cx).add(&cx, self.c(&cx, f)).put(&cx, " ").add(&cx, m).put(&cx, ";").done(&cx));
+                    parts.push(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, self.c(&cx, f)).push_static(" ").push_bytes(&cx, m).push_static(";")));
                     i = i + 1usize;
                 }
                 joined(&cx, parts, " ")
             },
         };
-        self.defs.push(&cx, Out::new(&cx).put(&cx, "struct ").add(&cx, self.names.at(&cx, ty)).put(&cx, " { ").add(&cx, body).put(&cx, " };").done(&cx));
+        self.defs.push(&cx, text_of(&cx, Buffer::new().push_static("struct ").push_bytes(&cx, self.names.at(&cx, ty)).push_static(" { ").push_bytes(&cx, body).push_static(" };")));
     }
 
     // (C member, component type) of a struct or tuple shape, in order.
@@ -712,7 +728,7 @@ impl Backend['k] {
             Type::Tuple(elems) => {
                 var i = 0usize;
                 while i < elems.len(&cx) {
-                    out.push(&cx, (Out::new(&cx).put(&cx, "e").usize(&cx, i).done(&cx), elems.get(&cx, i)));
+                    out.push(&cx, (text_of(&cx, Buffer::new().push_static("e").push_usize(i)), elems.get(&cx, i)));
                     i = i + 1usize;
                 }
             },
@@ -731,7 +747,7 @@ impl Backend['k] {
     fn component(self, &cx: Cx!['k], name: Text['k], prefix: Text['k]) -> Text['k] {
         let key = (prefix, name);
         if !self.component_names.has(&cx, key) {
-            self.component_names.set(&cx, key, allocate(&cx, Out::new(&cx).add(&cx, prefix).put(&cx, "_").add(&cx, self.readable(&cx, name)).done(&cx), self.component_taken));
+            self.component_names.set(&cx, key, allocate(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, prefix).push_static("_").push_bytes(&cx, self.readable(&cx, name))), self.component_taken));
         }
         self.component_names.at(&cx, key)
     }
@@ -759,7 +775,7 @@ impl Backend['k] {
             p = p + 1usize;
         }
         if !agree {
-            fail_text(&cx, Out::new(&cx).put(&cx, "specialization arguments disagree for ").add(&cx, fun.name).done(&cx));
+            fail_text(&cx, text_of(&cx, Buffer::new().push_static("specialization arguments disagree for ").push_bytes(&cx, fun.name)));
         }
         // One specialization for type arguments that differ only in brands, made for the first
         // request's. Otherwise logical alpha-equivalence, not representation equality.
@@ -840,7 +856,7 @@ impl Backend['k] {
             let value = match t {
                 Type::Ignored => {
                     let identity = Seq::two(&cx, text(&cx, "#retained"), fun.name);
-                    identity.push(&cx, Out::new(&cx).usize(&cx, k).done(&cx));
+                    identity.push(&cx, text_of(&cx, Buffer::new().push_usize(k)));
                     Type::Skolem.(encode(&cx, identity))
                 },
                 _ => self.substitute_type(&cx, t),
@@ -880,21 +896,21 @@ impl Backend['k] {
         let names: Seq[Text['k], 'k] = Seq::new(&cx);
         var k = 0usize;
         while k < ptypes.len(&cx) {
-            names.push(&cx, allocate(&cx, Out::new(&cx).put(&cx, "a").usize(&cx, k).done(&cx), self.taken));
+            names.push(&cx, allocate(&cx, text_of(&cx, Buffer::new().push_static("a").push_usize(k)), self.taken));
             k = k + 1usize;
         }
         let params: Seq[Text['k], 'k] = Seq::new(&cx);
         var p = 0usize;
         while p < ptypes.len(&cx) {
-            params.push(&cx, Out::new(&cx).add(&cx, self.c(&cx, ptypes.get(&cx, p))).put(&cx, " ").add(&cx, names.get(&cx, p)).done(&cx));
+            params.push(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, self.c(&cx, ptypes.get(&cx, p))).push_static(" ").push_bytes(&cx, names.get(&cx, p))));
             p = p + 1usize;
         }
         let args = joined(&cx, names, ", ");
         let result = allocate(&cx, text(&cx, "result"), self.taken);
-        let head = Out::new(&cx).put(&cx, "static KurUnit ").add(&cx, symbol).put(&cx, "(").add(&cx, or_void(&cx, joined(&cx, params, ", "))).put(&cx, ")").done(&cx);
-        self.protos.push(&cx, Out::new(&cx).add(&cx, head).put(&cx, ";").done(&cx));
-        self.bodies.push(&cx, Out::new(&cx).add(&cx, head).put(&cx, " {\n  ").add(&cx, name).put(&cx, "(").add(&cx, args).put(&cx, ");\n")
-            .put(&cx, "  KurUnit ").add(&cx, result).put(&cx, " = { 0 };\n  return ").add(&cx, result).put(&cx, ";\n}").done(&cx));
+        let head = text_of(&cx, Buffer::new().push_static("static KurUnit ").push_bytes(&cx, symbol).push_static("(").push_bytes(&cx, or_void(&cx, joined(&cx, params, ", "))).push_static(")"));
+        self.protos.push(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, head).push_static(";")));
+        self.bodies.push(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, head).push_static(" {\n  ").push_bytes(&cx, name).push_static("(").push_bytes(&cx, args).push_static(");\n")
+            .push_static("  KurUnit ").push_bytes(&cx, result).push_static(" = { 0 };\n  return ").push_bytes(&cx, result).push_static(";\n}")));
         symbol
     }
 
@@ -903,7 +919,7 @@ impl Backend['k] {
         // coherent head; the callee's module need not own that shape.
         let (index, inst, sub) = match matching_instance(&cx, self.program, self.counter, trait_name, tys) {
             Option::Some(found) => found,
-            Option::None => fail_text(&cx, Out::new(&cx).put(&cx, "no instance of ").add(&cx, trait_name).put(&cx, " for these types").done(&cx)),
+            Option::None => fail_text(&cx, text_of(&cx, Buffer::new().push_static("no instance of ").push_bytes(&cx, trait_name).push_static(" for these types"))),
         };
         var i = 0usize;
         while i < inst.methods.len(&cx) {
@@ -912,12 +928,12 @@ impl Backend['k] {
             }
             i = i + 1usize;
         }
-        fail_text(&cx, Out::new(&cx).put(&cx, "internal error: no method ").add(&cx, method).done(&cx))
+        fail_text(&cx, text_of(&cx, Buffer::new().push_static("internal error: no method ").push_bytes(&cx, method)))
     }
 
     // ------------------------------------------------------------------- program --
 
-    fn emit_program(self, &cx: Cx!['k], entry: Option[Text['k]]) -> Text['k] {
+    fn emit_program(self, &cx: Cx!['k], entry: Option[Text['k]]) -> Buffer! {
         check_mono_termination(&cx, self.program);
         let keywords = c_keywords(&cx);
         let runtime = runtime_names(&cx);
@@ -927,19 +943,19 @@ impl Backend['k] {
         while e < all.len(&cx) {
             let ext = all.get(&cx, e);
             if !is_c_identifier(&cx, ext.name) || keywords.has(&cx, ext.name) {
-                fail_at(&cx, Out::new(&cx).put(&cx, "backend: foreign symbol ").add(&cx, repr(&cx, ext.name)).put(&cx, " is not a C identifier").done(&cx), ext.pos);
+                fail_at(&cx, text_of(&cx, Buffer::new().push_static("backend: foreign symbol ").push_bytes(&cx, repr(&cx, ext.name)).push_static(" is not a C identifier")), ext.pos);
             }
             if runtime.has(&cx, ext.name) || ext.name.starts_with(&cx, text(&cx, "__builtin_")) || ext.name.starts_with(&cx, text(&cx, "__atomic_"))
                 || ext.name.is(&cx, "main") && entry.is_some() {
-                fail_at(&cx, Out::new(&cx).put(&cx, "backend: foreign symbol ").add(&cx, repr(&cx, ext.name))
-                    .put(&cx, " conflicts with the C runtime prelude or entry wrapper").done(&cx), ext.pos);
+                fail_at(&cx, text_of(&cx, Buffer::new().push_static("backend: foreign symbol ").push_bytes(&cx, repr(&cx, ext.name))
+                    .push_static(" conflicts with the C runtime prelude or entry wrapper")), ext.pos);
             }
             let ret = match ext.ret {
                 Option::Some(r) => r,
                 Option::None => fail_text(&cx, text(&cx, "internal error: an extern without a type")),
             };
             match ext.ptypes {
-                Option::None => externs.push(&cx, Out::new(&cx).put(&cx, "extern ").add(&cx, self.c(&cx, ret)).put(&cx, " ").add(&cx, ext.name).put(&cx, ";").done(&cx)),
+                Option::None => externs.push(&cx, text_of(&cx, Buffer::new().push_static("extern ").push_bytes(&cx, self.c(&cx, ret)).push_static(" ").push_bytes(&cx, ext.name).push_static(";"))),
                 Option::Some(ptypes) => {
                     let result = if self.is_foreign_void(&cx, ret) { text(&cx, "void") } else { self.c(&cx, ret) };
                     let noreturn = if is_never(ret) { text(&cx, "_Noreturn ") } else { text(&cx, "") };
@@ -949,7 +965,7 @@ impl Backend['k] {
                         params.push(&cx, self.c(&cx, ptypes.get(&cx, p)));
                         p = p + 1usize;
                     }
-                    externs.push(&cx, Out::new(&cx).add(&cx, noreturn).add(&cx, result).put(&cx, " ").add(&cx, ext.name).put(&cx, "(").add(&cx, or_void(&cx, joined(&cx, params, ", "))).put(&cx, ");").done(&cx));
+                    externs.push(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, noreturn).push_bytes(&cx, result).push_static(" ").push_bytes(&cx, ext.name).push_static("(").push_bytes(&cx, or_void(&cx, joined(&cx, params, ", "))).push_static(");")));
                 },
             };
             e = e + 1usize;
@@ -969,8 +985,8 @@ impl Backend['k] {
                     Option::None => false,
                 };
                 if !ok {
-                    fail_text(&cx, Out::new(&cx).put(&cx, "backend: the entry ").add(&cx, name).put(&cx, " must be a safe, non-generic ")
-                        .put(&cx, "`fn() -> i32` or `fn(i32, *(*u8)) -> i32` without premises").done(&cx));
+                    fail_text(&cx, text_of(&cx, Buffer::new().push_static("backend: the entry ").push_bytes(&cx, name).push_static(" must be a safe, non-generic ")
+                        .push_static("`fn() -> i32` or `fn(i32, *(*u8)) -> i32` without premises")));
                 }
                 main = Option::Some.(self.request(&cx, FunKey::Function.(name), self.program.funs.at(&cx, name), Map::new(&cx)));
             },
@@ -1009,13 +1025,13 @@ impl Backend['k] {
                 },
             };
         }
-        let out: Seq[Text['k], 'k] = Seq::one(&cx, prelude(&cx));
-        out.append(&cx, self.forward);
-        out.append(&cx, self.defs);
-        out.append(&cx, externs);
-        out.append(&cx, datas);
-        out.append(&cx, self.protos);
-        out.append(&cx, self.bodies);
+        var c = prelude().push_static("\n");
+        c = text_lines(&cx, c, self.forward);
+        c = text_lines(&cx, c, self.defs);
+        c = text_lines(&cx, c, externs);
+        c = text_lines(&cx, c, datas);
+        c = text_lines(&cx, c, self.protos);
+        c = text_lines(&cx, c, self.bodies);
         match main {
             Option::Some(symbol) => {
                 let fun = self.program.funs.at(&cx, match entry {
@@ -1023,15 +1039,14 @@ impl Backend['k] {
                     Option::None => text(&cx, ""),
                 });
                 if !fun.ptypes.is_empty(&cx) {
-                    out.push(&cx, Out::new(&cx).put(&cx, "int main(int argc, char **argv) { return (int)").add(&cx, symbol).put(&cx, "((int32_t)argc, ")
-                        .put(&cx, "(").add(&cx, self.c(&cx, fun.ptypes.get(&cx, 1usize))).put(&cx, ")argv); }").done(&cx));
+                    c.push_static("int main(int argc, char **argv) { return (int)").push_bytes(&cx, symbol).push_static("((int32_t)argc, ")
+                        .push_static("(").push_bytes(&cx, self.c(&cx, fun.ptypes.get(&cx, 1usize))).push_static(")argv); }\n")
                 } else {
-                    out.push(&cx, Out::new(&cx).put(&cx, "int main(void) { return (int)").add(&cx, symbol).put(&cx, "(); }").done(&cx));
+                    c.push_static("int main(void) { return (int)").push_bytes(&cx, symbol).push_static("(); }\n")
                 }
             },
-            Option::None => (),
-        };
-        Out::new(&cx).add(&cx, joined(&cx, out, "\n")).put(&cx, "\n").done(&cx)
+            Option::None => c,
+        }
     }
 
     fn is_foreign_void(self, &cx: Cx!['k], ty: Type['k]) -> bool {
@@ -1042,7 +1057,7 @@ impl Backend['k] {
 
     fn data_symbol(self, &cx: Cx!['k], name: Text['k]) -> Text['k] {
         if !self.datas.has(&cx, name) {
-            let symbol = allocate(&cx, Out::new(&cx).put(&cx, "d").usize(&cx, self.datas.len(&cx)).put(&cx, "_").add(&cx, tail(self.readable(&cx, name), 40usize)).done(&cx), self.taken);
+            let symbol = allocate(&cx, text_of(&cx, Buffer::new().push_static("d").push_usize(self.datas.len(&cx)).push_static("_").push_bytes(&cx, tail(self.readable(&cx, name), 40usize))), self.taken);
             self.datas.set(&cx, name, (symbol, self.program.datas.at(&cx, name)));
         }
         let (symbol, _data) = self.datas.at(&cx, name);
@@ -1052,7 +1067,7 @@ impl Backend['k] {
     fn emit_data(self, &cx: Cx!['k], entry: (Text['k], Data['k])) -> Text['k] {
         let (symbol, data) = entry;
         let ct = self.c(&cx, data.ty);
-        Out::new(&cx).put(&cx, "static ").add(&cx, ct).put(&cx, " ").add(&cx, symbol).put(&cx, " = ").add(&cx, self.initializer(&cx, data.ty, data.init)).put(&cx, ";").done(&cx)
+        text_of(&cx, Buffer::new().push_static("static ").push_bytes(&cx, ct).push_static(" ").push_bytes(&cx, symbol).push_static(" = ").push_bytes(&cx, self.initializer(&cx, data.ty, data.init)).push_static(";"))
     }
 
     fn initializer(self, &cx: Cx!['k], ty: Type['k], form: Form['k]) -> Text['k] {
@@ -1069,7 +1084,7 @@ impl Backend['k] {
                     if C::same(&cx, elem.get(&cx), C::prim(&cx, "u8")) && part.is_str() {
                         var b = 0usize;
                         while b < part.text.len() {
-                            values.push(&cx, Out::new(&cx).u64(&cx, part.text.byte(&cx, b) as u64).done(&cx));
+                            values.push(&cx, text_of(&cx, Buffer::new().push_u64(part.text.byte(&cx, b) as u64)));
                             b = b + 1usize;
                         }
                     } else {
@@ -1077,7 +1092,7 @@ impl Backend['k] {
                     }
                     i = i + 1usize;
                 }
-                return if length != 0u64 { Out::new(&cx).put(&cx, "{ { ").add(&cx, joined(&cx, values, ", ")).put(&cx, " } }").done(&cx) } else { text(&cx, "{ 0 }") };
+                return if length != 0u64 { text_of(&cx, Buffer::new().push_static("{ { ").push_bytes(&cx, joined(&cx, values, ", ")).push_static(" } }")) } else { text(&cx, "{ 0 }") };
             },
             _ => (),
         };
@@ -1092,7 +1107,7 @@ impl Backend['k] {
             parts.push(&cx, self.initializer(&cx, f, form.at(&cx, i)));
             i = i + 1usize;
         }
-        Out::new(&cx).put(&cx, "{ ").add(&cx, joined(&cx, parts, ", ")).put(&cx, " }").done(&cx)
+        text_of(&cx, Buffer::new().push_static("{ ").push_bytes(&cx, joined(&cx, parts, ", ")).push_static(" }"))
     }
 
     fn literal(self, &cx: Cx!['k], ty: Type['k], lit: Text['k]) -> Text['k] {
@@ -1108,9 +1123,9 @@ impl Backend['k] {
             return if name.is(&cx, "f32") { digits.concat(&cx, text(&cx, "f")) } else { digits };
         }
         if signed_bits(&cx, name) != 0u32 {
-            return if lit.is(&cx, "-9223372036854775808") { text(&cx, "(-INT64_C(9223372036854775807) - 1)") } else { Out::new(&cx).put(&cx, "INT64_C(").add(&cx, lit).put(&cx, ")").done(&cx) };
+            return if lit.is(&cx, "-9223372036854775808") { text(&cx, "(-INT64_C(9223372036854775807) - 1)") } else { text_of(&cx, Buffer::new().push_static("INT64_C(").push_bytes(&cx, lit).push_static(")")) };
         }
-        Out::new(&cx).put(&cx, "UINT64_C(").add(&cx, lit).put(&cx, ")").done(&cx)
+        text_of(&cx, Buffer::new().push_static("UINT64_C(").push_bytes(&cx, lit).push_static(")"))
     }
 
     // ----------------------------------------------------------------- functions --
@@ -1121,14 +1136,14 @@ impl Backend['k] {
         self.substituted.set(&cx, Map::new(&cx));
         let typed = self.recorded.at(&cx, key);
         self.locals.set(&cx, Map::new(&cx));
-        self.lines.set(&cx, Seq::new(&cx));
+
         self.scratch.set(&cx, 0usize);
         let label_taken = Pool::new(&cx, Set::new(&cx));
         let labels: Map[Text['k], Text['k], 'k] = Map::new(&cx);
         var b = 0usize;
         while b < fun.blocks.len(&cx) {
             let label = fun.blocks.get(&cx, b).label;
-            labels.set(&cx, label, allocate(&cx, Out::new(&cx).put(&cx, "L_").add(&cx, self.readable(&cx, label)).done(&cx), label_taken));
+            labels.set(&cx, label, allocate(&cx, text_of(&cx, Buffer::new().push_static("L_").push_bytes(&cx, self.readable(&cx, label))), label_taken));
             b = b + 1usize;
         }
         self.labels.set(&cx, labels);
@@ -1143,19 +1158,19 @@ impl Backend['k] {
             let binding = entry.params.get(&cx, p);
             let cname = self.cname(&cx, entry.label, binding.name);
             if binding.name.starts_with(&cx, text(&cx, "&")) {
-                place_c.set(&cx, binding.name, Out::new(&cx).put(&cx, "(*").add(&cx, cname).put(&cx, ")").done(&cx));
-                cparams.push(&cx, Out::new(&cx).add(&cx, self.c(&cx, self.substitute_type(&cx, binding.type))).put(&cx, "* ").add(&cx, cname).done(&cx));
+                place_c.set(&cx, binding.name, text_of(&cx, Buffer::new().push_static("(*").push_bytes(&cx, cname).push_static(")")));
+                cparams.push(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, self.c(&cx, self.substitute_type(&cx, binding.type))).push_static("* ").push_bytes(&cx, cname)));
             } else {
-                cparams.push(&cx, Out::new(&cx).add(&cx, self.c(&cx, self.substitute_type(&cx, binding.type))).put(&cx, " ").add(&cx, cname).done(&cx));
+                cparams.push(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, self.c(&cx, self.substitute_type(&cx, binding.type))).push_static(" ").push_bytes(&cx, cname)));
             }
             p = p + 1usize;
         }
         var l = 0usize;
         while l < fun.locals.len(&cx) {
             let binding = fun.locals.get(&cx, l);
-            let cname = allocate(&cx, Out::new(&cx).put(&cx, "p_").add(&cx, self.readable(&cx, binding.name)).done(&cx), self.taken);
+            let cname = allocate(&cx, text_of(&cx, Buffer::new().push_static("p_").push_bytes(&cx, self.readable(&cx, binding.name))), self.taken);
             place_c.set(&cx, binding.name, cname);
-            decls.push(&cx, Out::new(&cx).add(&cx, self.c(&cx, self.substitute_type(&cx, binding.type))).put(&cx, " ").add(&cx, cname).put(&cx, ";").done(&cx));
+            decls.push(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, self.c(&cx, self.substitute_type(&cx, binding.type))).push_static(" ").push_bytes(&cx, cname).push_static(";")));
             l = l + 1usize;
         }
         let roots: Map[Text['k], Type['k], 'k] = Map::new(&cx);
@@ -1191,7 +1206,7 @@ impl Backend['k] {
             }
             if !parameter && !is_never(self.substitute_type(&cx, ty)) {
                 let ct = self.c(&cx, self.substitute_type(&cx, ty));
-                decls.push(&cx, Out::new(&cx).add(&cx, ct).put(&cx, " ").add(&cx, self.cname(&cx, label, name)).put(&cx, ";").done(&cx));
+                decls.push(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, ct).push_static(" ").push_bytes(&cx, self.cname(&cx, label, name)).push_static(";")));
             }
             v = v + 1usize;
         }
@@ -1202,37 +1217,33 @@ impl Backend['k] {
             k = k + 1usize;
         }
         self.blocks.set(&cx, blocks);
+        // The lines of the body, after the declarations that emitting them may add to.
+        var lines = Buffer::new();
         var n = 0usize;
         while n < fun.blocks.len(&cx) {
             let block = fun.blocks.get(&cx, n);
             self.label.set(&cx, block.label);
-            self.line(&cx, Out::new(&cx).add(&cx, labels.at(&cx, block.label)).put(&cx, ": ;").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, labels.at(&cx, block.label)).push_static(": ;"));
             var i = 0usize;
             while i < block.instrs.len(&cx) {
-                self.instr(&cx, block.instrs.get(&cx, i));
+                self.instr(&cx, &lines, block.instrs.get(&cx, i));
                 i = i + 1usize;
             }
-            self.term(&cx, block.term);
+            self.term(&cx, &lines, block.term);
             n = n + 1usize;
         }
         let ret_type = self.substitute_type(&cx, fun.ret);
         let ret = if is_never(ret_type) { text(&cx, "void") } else { self.c(&cx, ret_type) };
-        let head = Out::new(&cx).put(&cx, if ret.is(&cx, "void") { "_Noreturn " } else { "" }).put(&cx, "static ").add(&cx, ret).put(&cx, " ").add(&cx, symbol)
-            .put(&cx, "(").add(&cx, or_void(&cx, joined(&cx, cparams, ", "))).put(&cx, ")").done(&cx);
-        self.protos.push(&cx, Out::new(&cx).add(&cx, head).put(&cx, ";").done(&cx));
-        let body = Out::new(&cx).add(&cx, head).put(&cx, " {\n");
+        let head = text_of(&cx, Buffer::new().push_static(if ret.is(&cx, "void") { "_Noreturn " } else { "" }).push_static("static ").push_bytes(&cx, ret).push_static(" ").push_bytes(&cx, symbol)
+            .push_static("(").push_bytes(&cx, or_void(&cx, joined(&cx, cparams, ", "))).push_static(")"));
+        self.protos.push(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, head).push_static(";")));
+        var body = Buffer::new().push_bytes(&cx, head).push_static(" {\n");
         var d = 0usize;
         while d < decls.len(&cx) {
-            let unit = body.put(&cx, "  ").add(&cx, decls.get(&cx, d)).put(&cx, "\n");
+            body = body.push_static("  ").push_bytes(&cx, decls.get(&cx, d)).push_static("\n");
             d = d + 1usize;
         }
-        let lines = self.lines.get(&cx);
-        var j = 0usize;
-        while j < lines.len(&cx) {
-            let unit = body.put(&cx, "  ").add(&cx, lines.get(&cx, j)).put(&cx, "\n");
-            j = j + 1usize;
-        }
-        self.bodies.push(&cx, body.put(&cx, "}\n").done(&cx));
+        self.bodies.push(&cx, text_of(&cx, body.push_buffer(lines).push_static("}\n")));
     }
 
     fn substitute_type(self, &cx: Cx!['k], ty: Type['k]) -> Type['k] {
@@ -1253,7 +1264,7 @@ impl Backend['k] {
         let key = (label, name);
         let locals = self.locals.get(&cx);
         if !locals.has(&cx, key) {
-            locals.set(&cx, key, allocate(&cx, Out::new(&cx).add(&cx, self.readable(&cx, label)).put(&cx, "_").add(&cx, self.readable(&cx, name)).done(&cx), self.taken));
+            locals.set(&cx, key, allocate(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, self.readable(&cx, label)).push_static("_").push_bytes(&cx, self.readable(&cx, name))), self.taken));
         }
         locals.at(&cx, key)
     }
@@ -1266,9 +1277,6 @@ impl Backend['k] {
         self.substitute_type(&cx, self.typed.get(&cx).at(&cx, (self.label.get(&cx), name)))
     }
 
-    fn line(self, &cx: Cx!['k], t: Text['k]) {
-        self.lines.get(&cx).push(&cx, t);
-    }
 
     // ------------------------------------------------------------------- places --
 
@@ -1284,7 +1292,7 @@ impl Backend['k] {
             let s = self.shape(&cx, ty);
             match s {
                 Type::Enum(variants) => {
-                    expr = Out::new(&cx).add(&cx, expr).put(&cx, ".payload.").add(&cx, self.variant(&cx, seg)).done(&cx);
+                    expr = text_of(&cx, Buffer::new().push_bytes(&cx, expr).push_static(".payload.").push_bytes(&cx, self.variant(&cx, seg)));
                     ty = last_member(&cx, variants, seg);
                 },
                 _ => {
@@ -1302,7 +1310,7 @@ impl Backend['k] {
                             let out: Seq[Text['k], 'k] = Seq::new(&cx);
                             var e = 0usize;
                             while e < elems.len(&cx) {
-                                out.push(&cx, Out::new(&cx).usize(&cx, e).done(&cx));
+                                out.push(&cx, text_of(&cx, Buffer::new().push_usize(e)));
                                 e = e + 1usize;
                             }
                             out
@@ -1316,7 +1324,7 @@ impl Backend['k] {
                         k = k - 1usize;
                         if names.get(&cx, k).eq(&cx, seg) {
                             let (m, t) = rows.get(&cx, k);
-                            expr = Out::new(&cx).add(&cx, expr).put(&cx, ".").add(&cx, m).done(&cx);
+                            expr = text_of(&cx, Buffer::new().push_bytes(&cx, expr).push_static(".").push_bytes(&cx, m));
                             ty = t;
                             found = true;
                         }
@@ -1346,14 +1354,14 @@ impl Backend['k] {
         }
         if arg.starts_with(&cx, text(&cx, "&")) {
             let (expr, _ty) = self.place(&cx, arg);
-            return Out::new(&cx).put(&cx, "&").add(&cx, expr).done(&cx);
+            return text_of(&cx, Buffer::new().push_static("&").push_bytes(&cx, expr));
         }
         self.value_name(&cx, arg)
     }
 
     // ------------------------------------------------------------- instructions --
 
-    fn instr(self, &cx: Cx!['k], instr: Instr['k]) {
+    fn instr(self, &cx: Cx!['k], &lines: Buffer!, instr: Instr['k]) {
         let op = instr.op;
         let a = instr.args;
         let dst = if instr.lhs.len(&cx) == 1usize { Option::Some.(self.value_name(&cx, instr.lhs.get(&cx, 0usize))) } else { Option::None };
@@ -1367,9 +1375,9 @@ impl Backend['k] {
                 Option::Some(l) => l,
                 Option::None => text(&cx, ""),
             };
-            self.line(&cx, Out::new(&cx).add(&cx, d).put(&cx, " = ").add(&cx, self.literal(&cx, self.type_operand_raw(&cx, instr), lit)).put(&cx, ";").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, self.literal(&cx, self.type_operand_raw(&cx, instr), lit)).push_static(";"));
         } else if op.is(&cx, "copy") {
-            self.line(&cx, Out::new(&cx).add(&cx, d).put(&cx, " = ").add(&cx, self.value_name(&cx, a.get(&cx, 0usize))).put(&cx, ";").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, self.value_name(&cx, a.get(&cx, 0usize))).push_static(";"));
         } else if op.is(&cx, "construct") {
             let ty = self.type_operand(&cx, instr);
             let values: Seq[Text['k], 'k] = Seq::new(&cx);
@@ -1378,9 +1386,9 @@ impl Backend['k] {
                 values.push(&cx, self.value_name(&cx, a.get(&cx, i)));
                 i = i + 1usize;
             }
-            self.construct(&cx, d, ty, values);
+            self.construct(&cx, &lines, d, ty, values);
         } else if op.is(&cx, "destruct") {
-            self.destruct(&cx, instr);
+            self.destruct(&cx, &lines, instr);
         } else if op.is(&cx, "construct_variant") {
             let lit = match instr.lit {
                 Option::Some(l) => l,
@@ -1397,8 +1405,8 @@ impl Backend['k] {
                 }
             }
             let member = self.variant(&cx, lit);
-            self.line(&cx, Out::new(&cx).add(&cx, d).put(&cx, ".payload.").add(&cx, member).put(&cx, " = ").add(&cx, self.value_name(&cx, a.get(&cx, 0usize))).put(&cx, ";").done(&cx));
-            self.line(&cx, Out::new(&cx).add(&cx, d).put(&cx, ".tag = ").usize(&cx, index).put(&cx, ";").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(".payload.").push_bytes(&cx, member).push_static(" = ").push_bytes(&cx, self.value_name(&cx, a.get(&cx, 0usize))).push_static(";"));
+            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(".tag = ").push_usize(index).push_static(";"));
         } else if op.is(&cx, "variant_tag") {
             let source = if a.get(&cx, 0usize).starts_with(&cx, text(&cx, "&")) {
                 let (expr, _ty) = self.place(&cx, a.get(&cx, 0usize));
@@ -1406,18 +1414,18 @@ impl Backend['k] {
             } else {
                 self.value_name(&cx, a.get(&cx, 0usize))
             };
-            self.line(&cx, Out::new(&cx).add(&cx, d).put(&cx, " = ").add(&cx, source).put(&cx, ".tag;").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, source).push_static(".tag;"));
         } else if op.is(&cx, "builtin::int_cast") {
             let value = self.value_name(&cx, a.get(&cx, 0usize));
-            self.line(&cx, Out::new(&cx).add(&cx, d).put(&cx, " = ").add(&cx, self.convert(&cx, value, self.type_operand(&cx, instr))).put(&cx, ";").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, self.convert(&cx, value, self.type_operand(&cx, instr))).push_static(";"));
         } else if op.is(&cx, "builtin::unsafe::cast") {
             let value = self.value_name(&cx, a.get(&cx, 0usize));
             let src = self.type_of(&cx, a.get(&cx, 0usize));
-            self.cast(&cx, d, value, src, self.type_operand(&cx, instr));
+            self.cast(&cx, &lines, d, value, src, self.type_operand(&cx, instr));
         } else if is_c_op(&cx, op) || op.is(&cx, "shl") || op.is(&cx, "shr") {
-            self.primitive(&cx, d, op, a);
+            self.primitive(&cx, &lines, d, op, a);
         } else if op.is(&cx, "call") {
-            self.call(&cx, instr);
+            self.call(&cx, &lines, instr);
         } else if op.is(&cx, "trait_call") {
             let tys: Seq[Type['k], 'k] = Seq::new(&cx);
             var i = 0usize;
@@ -1427,55 +1435,55 @@ impl Backend['k] {
             }
             let (key, fun, sub) = self.resolve_trait(&cx, a.get(&cx, 0usize), a.get(&cx, 1usize), tys);
             let symbol = self.request(&cx, key, fun, sub);
-            self.emit_call(&cx, instr, symbol, fun.ret, sub, a.from(&cx, 2usize), false);
+            self.emit_call(&cx, &lines, instr, symbol, fun.ret, sub, a.from(&cx, 2usize), false);
         } else if op.is(&cx, "fn") {
-            self.line(&cx, Out::new(&cx).add(&cx, d).put(&cx, " = ").add(&cx, self.function_address(&cx, instr)).put(&cx, ";").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, self.function_address(&cx, instr)).push_static(";"));
         } else if op.is(&cx, "alloca") {
             self.has_memory_form(&cx, self.type_operand(&cx, instr), instr);
             let ct = self.c(&cx, self.type_operand(&cx, instr));
-            self.line(&cx, Out::new(&cx).add(&cx, d).put(&cx, " = (").add(&cx, ct).put(&cx, "*)__builtin_alloca(sizeof(").add(&cx, ct).put(&cx, "));").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = (").push_bytes(&cx, ct).push_static("*)__builtin_alloca(sizeof(").push_bytes(&cx, ct).push_static("));"));
         } else if op.is(&cx, "builtin::sizeof") {
             self.has_memory_form(&cx, self.type_operand(&cx, instr), instr);
-            self.line(&cx, Out::new(&cx).add(&cx, d).put(&cx, " = (uint64_t)sizeof(").add(&cx, self.c(&cx, self.type_operand(&cx, instr))).put(&cx, ");").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = (uint64_t)sizeof(").push_bytes(&cx, self.c(&cx, self.type_operand(&cx, instr))).push_static(");"));
         } else if op.is(&cx, "data") {
-            self.line(&cx, Out::new(&cx).add(&cx, d).put(&cx, " = &").add(&cx, self.data_symbol(&cx, a.get(&cx, 0usize))).put(&cx, ";").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = &").push_bytes(&cx, self.data_symbol(&cx, a.get(&cx, 0usize))).push_static(";"));
         } else if op.is(&cx, "builtin::unsafe::static_brand") || op.is(&cx, "builtin::fresh") {
-            self.line(&cx, Out::new(&cx).add(&cx, d).put(&cx, ".dummy = 0;").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(".dummy = 0;"));
         } else if op.is(&cx, "pack") || op.is(&cx, "open") {
             if a.get(&cx, 0usize).starts_with(&cx, text(&cx, "&")) {
-                self.unit(&cx, dst);
+                self.unit(&cx, &lines, dst);
             } else {
-                self.line(&cx, Out::new(&cx).add(&cx, d).put(&cx, " = ").add(&cx, self.value_name(&cx, a.get(&cx, 0usize))).put(&cx, ";").done(&cx));
+                line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, self.value_name(&cx, a.get(&cx, 0usize))).push_static(";"));
             }
         } else if op.is(&cx, "builtin::unsafe::deref") {
             let inner = self.pointee(&cx, self.type_of(&cx, a.get(&cx, 0usize)));
             self.has_memory_form(&cx, inner, instr);
-            self.line(&cx, Out::new(&cx).add(&cx, d).put(&cx, " = *").add(&cx, self.value_name(&cx, a.get(&cx, 0usize))).put(&cx, ";").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = *").push_bytes(&cx, self.value_name(&cx, a.get(&cx, 0usize))).push_static(";"));
         } else if op.is(&cx, "builtin::unsafe::load_volatile") {
             let inner = self.pointee(&cx, self.type_of(&cx, a.get(&cx, 0usize)));
             self.has_memory_form(&cx, inner, instr);
             let ct = self.c(&cx, inner);
-            self.line(&cx, Out::new(&cx).add(&cx, d).put(&cx, " = *(").add(&cx, ct).put(&cx, " volatile*)").add(&cx, self.value_name(&cx, a.get(&cx, 0usize))).put(&cx, ";").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = *(").push_bytes(&cx, ct).push_static(" volatile*)").push_bytes(&cx, self.value_name(&cx, a.get(&cx, 0usize))).push_static(";"));
         } else if op.is(&cx, "builtin::unsafe::store") || op.is(&cx, "builtin::unsafe::store_volatile") {
             let inner = self.pointee(&cx, self.type_of(&cx, a.get(&cx, 0usize)));
             self.has_memory_form(&cx, inner, instr);
-            let qual = if op.ends_with(&cx, text(&cx, "volatile")) { Out::new(&cx).put(&cx, "(").add(&cx, self.c(&cx, inner)).put(&cx, " volatile*)").done(&cx) } else { text(&cx, "") };
+            let qual = if op.ends_with(&cx, text(&cx, "volatile")) { text_of(&cx, Buffer::new().push_static("(").push_bytes(&cx, self.c(&cx, inner)).push_static(" volatile*)")) } else { text(&cx, "") };
             let target = self.value_name(&cx, a.get(&cx, 0usize));
-            self.line(&cx, Out::new(&cx).put(&cx, "*").add(&cx, qual).add(&cx, target).put(&cx, " = ").add(&cx, self.value_name(&cx, a.get(&cx, 1usize))).put(&cx, ";").done(&cx));
-            self.unit(&cx, dst);
+            line(&lines, Buffer::new().push_static("*").push_bytes(&cx, qual).push_bytes(&cx, target).push_static(" = ").push_bytes(&cx, self.value_name(&cx, a.get(&cx, 1usize))).push_static(";"));
+            self.unit(&cx, &lines, dst);
         } else if op.starts_with(&cx, text(&cx, "builtin::unsafe::atomic_")) {
-            self.atomic(&cx, instr, dst);
+            self.atomic(&cx, &lines, instr, dst);
         } else if op.is(&cx, "load") {
             let (expr, _ty) = self.place(&cx, a.get(&cx, 0usize));
-            self.line(&cx, Out::new(&cx).add(&cx, d).put(&cx, " = ").add(&cx, expr).put(&cx, ";").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, expr).push_static(";"));
         } else if op.is(&cx, "store") {
             let (expr, _ty) = self.place(&cx, a.get(&cx, 0usize));
-            self.line(&cx, Out::new(&cx).add(&cx, expr).put(&cx, " = ").add(&cx, self.value_name(&cx, a.get(&cx, 1usize))).put(&cx, ";").done(&cx));
-            self.unit(&cx, dst);
+            line(&lines, Buffer::new().push_bytes(&cx, expr).push_static(" = ").push_bytes(&cx, self.value_name(&cx, a.get(&cx, 1usize))).push_static(";"));
+            self.unit(&cx, &lines, dst);
         } else if op.is(&cx, "foreach") {
-            self.foreach_instr(&cx, instr, d);
+            self.foreach_instr(&cx, &lines, instr, d);
         } else {
-            fail_text(&cx, Out::new(&cx).put(&cx, "no C recipe for ").add(&cx, op).done(&cx));
+            fail_text(&cx, text_of(&cx, Buffer::new().push_static("no C recipe for ").push_bytes(&cx, op)));
         }
     }
 
@@ -1504,28 +1512,28 @@ impl Backend['k] {
         self.substitute_type(&cx, self.type_operand_raw(&cx, instr))
     }
 
-    fn unit(self, &cx: Cx!['k], dst: Option[Text['k]]) {
+    fn unit(self, &cx: Cx!['k], &lines: Buffer!, dst: Option[Text['k]]) {
         match dst {
-            Option::Some(d) => self.line(&cx, Out::new(&cx).add(&cx, d).put(&cx, ".dummy = 0;").done(&cx)),
+            Option::Some(d) => line(&lines, Buffer::new().push_bytes(&cx, d).push_static(".dummy = 0;")),
             Option::None => (),
         };
     }
 
-    fn construct(self, &cx: Cx!['k], dst: Text['k], ty: Type['k], values: Seq[Text['k], 'k]) {
+    fn construct(self, &cx: Cx!['k], &lines: Buffer!, dst: Text['k], ty: Type['k], values: Seq[Text['k], 'k]) {
         let s = self.shape(&cx, ty);
         if self.is_unit(&cx, ty) {
-            self.line(&cx, Out::new(&cx).add(&cx, dst).put(&cx, ".dummy = 0;").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(".dummy = 0;"));
             return ();
         }
         match s {
             Type::Array(_elem, length) => {
                 if length == 0u64 {
-                    self.line(&cx, Out::new(&cx).add(&cx, dst).put(&cx, ".dummy = 0;").done(&cx));
+                    line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(".dummy = 0;"));
                 }
                 var k = 0u64;
                 while k < length {
                     let at = if (k as usize) < values.len(&cx) - 1usize { k as usize } else { values.len(&cx) - 1usize };
-                    self.line(&cx, Out::new(&cx).add(&cx, dst).put(&cx, ".items[").u64(&cx, k).put(&cx, "] = ").add(&cx, values.get(&cx, at)).put(&cx, ";").done(&cx));
+                    line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(".items[").push_u64(k).push_static("] = ").push_bytes(&cx, values.get(&cx, at)).push_static(";"));
                     k = k + 1u64;
                 }
             },
@@ -1534,14 +1542,14 @@ impl Backend['k] {
                 var i = 0usize;
                 while i < rows.len(&cx) && i < values.len(&cx) {
                     let (m, _t) = rows.get(&cx, i);
-                    self.line(&cx, Out::new(&cx).add(&cx, dst).put(&cx, ".").add(&cx, m).put(&cx, " = ").add(&cx, values.get(&cx, i)).put(&cx, ";").done(&cx));
+                    line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(".").push_bytes(&cx, m).push_static(" = ").push_bytes(&cx, values.get(&cx, i)).push_static(";"));
                     i = i + 1usize;
                 }
             },
         };
     }
 
-    fn destruct(self, &cx: Cx!['k], instr: Instr['k]) {
+    fn destruct(self, &cx: Cx!['k], &lines: Buffer!, instr: Instr['k]) {
         let arg = instr.args.get(&cx, 0usize);
         let (source, ty) = if arg.starts_with(&cx, text(&cx, "&")) {
             self.place(&cx, arg)
@@ -1564,9 +1572,9 @@ impl Backend['k] {
         while i < instr.lhs.len(&cx) && i < access.len(&cx) {
             let name = self.value_name(&cx, instr.lhs.get(&cx, i));
             if pointer {
-                self.line(&cx, Out::new(&cx).add(&cx, name).put(&cx, " = KUR_FIELD(").add(&cx, source).put(&cx, ", ").add(&cx, access.get(&cx, i)).put(&cx, ");").done(&cx));
+                line(&lines, Buffer::new().push_bytes(&cx, name).push_static(" = KUR_FIELD(").push_bytes(&cx, source).push_static(", ").push_bytes(&cx, access.get(&cx, i)).push_static(");"));
             } else {
-                self.line(&cx, Out::new(&cx).add(&cx, name).put(&cx, " = ").add(&cx, source).put(&cx, ".").add(&cx, access.get(&cx, i)).put(&cx, ";").done(&cx));
+                line(&lines, Buffer::new().push_bytes(&cx, name).push_static(" = ").push_bytes(&cx, source).push_static(".").push_bytes(&cx, access.get(&cx, i)).push_static(";"));
             }
             i = i + 1usize;
         }
@@ -1580,12 +1588,12 @@ impl Backend['k] {
         };
         let bits = signed_bits(&cx, name);
         if bits != 0u32 {
-            return Out::new(&cx).put(&cx, "kur_dec_i").u64(&cx, bits as u64).put(&cx, "((uint64_t)(").add(&cx, expr).put(&cx, "))").done(&cx);
+            return text_of(&cx, Buffer::new().push_static("kur_dec_i").push_u64(bits as u64).push_static("((uint64_t)(").push_bytes(&cx, expr).push_static("))"));
         }
-        Out::new(&cx).put(&cx, "(").add(&cx, c_prim(&cx, name)).put(&cx, ")((uint64_t)(").add(&cx, expr).put(&cx, "))").done(&cx)
+        text_of(&cx, Buffer::new().push_static("(").push_bytes(&cx, c_prim(&cx, name)).push_static(")((uint64_t)(").push_bytes(&cx, expr).push_static("))"))
     }
 
-    fn cast(self, &cx: Cx!['k], dst: Text['k], expr: Text['k], src: Type['k], dst_ty: Type['k]) {
+    fn cast(self, &cx: Cx!['k], &lines: Buffer!, dst: Text['k], expr: Text['k], src: Type['k], dst_ty: Type['k]) {
         let s = self.shape(&cx, src);
         let d = self.shape(&cx, dst_ty);
         let cd = self.c(&cx, dst_ty);
@@ -1602,11 +1610,11 @@ impl Backend['k] {
                 _ => false,
             };
             if is_ptr(s) && is_ptr(d) {
-                self.line(&cx, Out::new(&cx).add(&cx, dst).put(&cx, " = (").add(&cx, cd).put(&cx, ")").add(&cx, expr).put(&cx, ";").done(&cx));
+                line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = (").push_bytes(&cx, cd).push_static(")").push_bytes(&cx, expr).push_static(";"));
             } else if is_ptr(s) && d_int || is_ptr(d) && s_int {
-                let value = Out::new(&cx).put(&cx, "(uintptr_t)").add(&cx, expr).done(&cx);
-                let converted = if d_int { self.convert(&cx, value, d) } else { Out::new(&cx).put(&cx, "(").add(&cx, cd).put(&cx, ")").add(&cx, value).done(&cx) };
-                self.line(&cx, Out::new(&cx).add(&cx, dst).put(&cx, " = ").add(&cx, converted).put(&cx, ";").done(&cx));
+                let value = text_of(&cx, Buffer::new().push_static("(uintptr_t)").push_bytes(&cx, expr));
+                let converted = if d_int { self.convert(&cx, value, d) } else { text_of(&cx, Buffer::new().push_static("(").push_bytes(&cx, cd).push_static(")").push_bytes(&cx, value)) };
+                line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = ").push_bytes(&cx, converted).push_static(";"));
             } else {
                 fail_text(&cx, text(&cx, "backend cast supports raw pointers only with pointers or integers"));
             }
@@ -1618,105 +1626,105 @@ impl Backend['k] {
                 _ => {
                     // Layout belongs to C. Never silently truncate a source or leave a destination
                     // tail uninitialized; exact size is a target obligation.
-                    self.reinterpret(&cx, dst, expr);
+                    self.reinterpret(&cx, &lines, dst, expr);
                     return ();
                 },
             },
             _ => {
-                self.reinterpret(&cx, dst, expr);
+                self.reinterpret(&cx, &lines, dst, expr);
                 return ();
             },
         };
         if sn.is(&cx, "bool") || dn.is(&cx, "bool") || C::is_float(&cx, sn) && C::is_float(&cx, dn) {
-            self.line(&cx, Out::new(&cx).add(&cx, dst).put(&cx, " = (").add(&cx, cd).put(&cx, ")").add(&cx, expr).put(&cx, ";").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = (").push_bytes(&cx, cd).push_static(")").push_bytes(&cx, expr).push_static(";"));
         } else if C::is_float(&cx, sn) != C::is_float(&cx, dn) {
             if width(&cx, sn) != width(&cx, dn) {
                 fail_text(&cx, text(&cx, "backend integer/float reinterpretation requires equal widths"));
             }
-            self.reinterpret(&cx, dst, expr);
+            self.reinterpret(&cx, &lines, dst, expr);
         } else {
-            self.line(&cx, Out::new(&cx).add(&cx, dst).put(&cx, " = ").add(&cx, self.convert(&cx, expr, d)).put(&cx, ";").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = ").push_bytes(&cx, self.convert(&cx, expr, d)).push_static(";"));
         }
     }
 
-    fn reinterpret(self, &cx: Cx!['k], dst: Text['k], expr: Text['k]) {
-        self.line(&cx, Out::new(&cx).put(&cx, "_Static_assert(sizeof(").add(&cx, dst).put(&cx, ") == sizeof(").add(&cx, expr)
-            .put(&cx, "), \"KURS cast requires equal representation sizes\");").done(&cx));
-        self.line(&cx, Out::new(&cx).put(&cx, "__builtin_memcpy(&").add(&cx, dst).put(&cx, ", &").add(&cx, expr).put(&cx, ", sizeof(").add(&cx, dst).put(&cx, "));").done(&cx));
+    fn reinterpret(self, &cx: Cx!['k], &lines: Buffer!, dst: Text['k], expr: Text['k]) {
+        line(&lines, Buffer::new().push_static("_Static_assert(sizeof(").push_bytes(&cx, dst).push_static(") == sizeof(").push_bytes(&cx, expr)
+            .push_static("), \"KURS cast requires equal representation sizes\");"));
+        line(&lines, Buffer::new().push_static("__builtin_memcpy(&").push_bytes(&cx, dst).push_static(", &").push_bytes(&cx, expr).push_static(", sizeof(").push_bytes(&cx, dst).push_static("));"));
     }
 
-    fn primitive(self, &cx: Cx!['k], dst: Text['k], op: Text['k], args: Seq[Text['k], 'k]) {
+    fn primitive(self, &cx: Cx!['k], &lines: Buffer!, dst: Text['k], op: Text['k], args: Seq[Text['k], 'k]) {
         let x = self.value_name(&cx, args.get(&cx, 0usize));
         let y = self.value_name(&cx, args.get(&cx, 1usize));
         let t = self.shape(&cx, self.type_of(&cx, args.get(&cx, 0usize)));
         let name = match t {
             Type::Ptr(_inner) => {
-                self.line(&cx, Out::new(&cx).add(&cx, dst).put(&cx, " = ((uintptr_t)").add(&cx, x).put(&cx, " ").add(&cx, c_op(&cx, op)).put(&cx, " (uintptr_t)").add(&cx, y).put(&cx, ");").done(&cx));
+                line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = ((uintptr_t)").push_bytes(&cx, x).push_static(" ").push_bytes(&cx, c_op(&cx, op)).push_static(" (uintptr_t)").push_bytes(&cx, y).push_static(");"));
                 return ();
             },
             Type::Prim(n) => n,
             _ => fail_text(&cx, text(&cx, "internal error: a primitive operation on a value that is not primitive")),
         };
         if !C::is_integer(&cx, name) || op.is(&cx, "eq") || op.is(&cx, "ne") || op.is(&cx, "lt") || op.is(&cx, "le") || op.is(&cx, "gt") || op.is(&cx, "ge") {
-            self.line(&cx, Out::new(&cx).add(&cx, dst).put(&cx, " = (").add(&cx, x).put(&cx, " ").add(&cx, c_op(&cx, op)).put(&cx, " ").add(&cx, y).put(&cx, ");").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = (").push_bytes(&cx, x).push_static(" ").push_bytes(&cx, c_op(&cx, op)).push_static(" ").push_bytes(&cx, y).push_static(");"));
             return ();
         }
         let bits = C::integer_bits(&cx, name);
         let ct = c_prim(&cx, name);
         let signed = signed_bits(&cx, name) != 0u32;
         if op.is(&cx, "div") || op.is(&cx, "mod") {
-            self.line(&cx, Out::new(&cx).put(&cx, "if (").add(&cx, y).put(&cx, " == 0) KUR_TRAP();").done(&cx));
+            line(&lines, Buffer::new().push_static("if (").push_bytes(&cx, y).push_static(" == 0) KUR_TRAP();"));
             if signed {
                 let minus = if op.is(&cx, "div") {
-                    wrap(&cx, Out::new(&cx).put(&cx, "(uint64_t)0 - (uint64_t)(").add(&cx, x).put(&cx, ")").done(&cx), bits, signed, ct)
+                    wrap(&cx, text_of(&cx, Buffer::new().push_static("(uint64_t)0 - (uint64_t)(").push_bytes(&cx, x).push_static(")")), bits, signed, ct)
                 } else {
                     text(&cx, "0")
                 };
-                self.line(&cx, Out::new(&cx).add(&cx, dst).put(&cx, " = (").add(&cx, y).put(&cx, " == -1) ? ").add(&cx, minus).put(&cx, " : (").add(&cx, ct).put(&cx, ")(")
-                    .add(&cx, x).put(&cx, " ").add(&cx, c_op(&cx, op)).put(&cx, " ").add(&cx, y).put(&cx, ");").done(&cx));
+                line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = (").push_bytes(&cx, y).push_static(" == -1) ? ").push_bytes(&cx, minus).push_static(" : (").push_bytes(&cx, ct).push_static(")(")
+                    .push_bytes(&cx, x).push_static(" ").push_bytes(&cx, c_op(&cx, op)).push_static(" ").push_bytes(&cx, y).push_static(");"));
             } else {
-                self.line(&cx, Out::new(&cx).add(&cx, dst).put(&cx, " = (").add(&cx, ct).put(&cx, ")((uint64_t)").add(&cx, x).put(&cx, " ").add(&cx, c_op(&cx, op))
-                    .put(&cx, " (uint64_t)").add(&cx, y).put(&cx, ");").done(&cx));
+                line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = (").push_bytes(&cx, ct).push_static(")((uint64_t)").push_bytes(&cx, x).push_static(" ").push_bytes(&cx, c_op(&cx, op))
+                    .push_static(" (uint64_t)").push_bytes(&cx, y).push_static(");"));
             }
             return ();
         }
         if op.is(&cx, "shl") || op.is(&cx, "shr") {
-            let amount = Out::new(&cx).put(&cx, "((uint64_t)(").add(&cx, y).put(&cx, ") & ").u64(&cx, (bits - 1u32) as u64).put(&cx, ")").done(&cx);
+            let amount = text_of(&cx, Buffer::new().push_static("((uint64_t)(").push_bytes(&cx, y).push_static(") & ").push_u64((bits - 1u32) as u64).push_static(")"));
             let bits_of = if bits < 64u32 || signed {
-                Out::new(&cx).put(&cx, "(uint64_t)(uint").u64(&cx, bits as u64).put(&cx, "_t)(").add(&cx, x).put(&cx, ")").done(&cx)
+                text_of(&cx, Buffer::new().push_static("(uint64_t)(uint").push_u64(bits as u64).push_static("_t)(").push_bytes(&cx, x).push_static(")"))
             } else {
-                Out::new(&cx).put(&cx, "(uint64_t)(").add(&cx, x).put(&cx, ")").done(&cx)
+                text_of(&cx, Buffer::new().push_static("(uint64_t)(").push_bytes(&cx, x).push_static(")"))
             };
             let shifted = if op.is(&cx, "shl") {
-                Out::new(&cx).add(&cx, bits_of).put(&cx, " << ").add(&cx, amount).done(&cx)
+                text_of(&cx, Buffer::new().push_bytes(&cx, bits_of).push_static(" << ").push_bytes(&cx, amount))
             } else if !signed {
-                Out::new(&cx).add(&cx, bits_of).put(&cx, " >> ").add(&cx, amount).done(&cx)
+                text_of(&cx, Buffer::new().push_bytes(&cx, bits_of).push_static(" >> ").push_bytes(&cx, amount))
             } else {
-                let fill = Out::new(&cx).put(&cx, "(").add(&cx, x).put(&cx, " < 0 && ").add(&cx, amount).put(&cx, " ? (UINT64_MAX << (").u64(&cx, bits as u64)
-                    .put(&cx, " - ").add(&cx, amount).put(&cx, ")) : 0)").done(&cx);
-                Out::new(&cx).put(&cx, "(").add(&cx, bits_of).put(&cx, " >> ").add(&cx, amount).put(&cx, ") | ").add(&cx, fill).done(&cx)
+                let fill = text_of(&cx, Buffer::new().push_static("(").push_bytes(&cx, x).push_static(" < 0 && ").push_bytes(&cx, amount).push_static(" ? (UINT64_MAX << (").push_u64(bits as u64)
+                    .push_static(" - ").push_bytes(&cx, amount).push_static(")) : 0)"));
+                text_of(&cx, Buffer::new().push_static("(").push_bytes(&cx, bits_of).push_static(" >> ").push_bytes(&cx, amount).push_static(") | ").push_bytes(&cx, fill))
             };
-            self.line(&cx, Out::new(&cx).add(&cx, dst).put(&cx, " = ").add(&cx, wrap(&cx, shifted, bits, signed, ct)).put(&cx, ";").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = ").push_bytes(&cx, wrap(&cx, shifted, bits, signed, ct)).push_static(";"));
             return ();
         }
-        let expr = Out::new(&cx).put(&cx, "(uint64_t)(").add(&cx, x).put(&cx, ") ").add(&cx, c_op(&cx, op)).put(&cx, " (uint64_t)(").add(&cx, y).put(&cx, ")").done(&cx);
-        self.line(&cx, Out::new(&cx).add(&cx, dst).put(&cx, " = ").add(&cx, wrap(&cx, expr, bits, signed, ct)).put(&cx, ";").done(&cx));
+        let expr = text_of(&cx, Buffer::new().push_static("(uint64_t)(").push_bytes(&cx, x).push_static(") ").push_bytes(&cx, c_op(&cx, op)).push_static(" (uint64_t)(").push_bytes(&cx, y).push_static(")"));
+        line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = ").push_bytes(&cx, wrap(&cx, expr, bits, signed, ct)).push_static(";"));
     }
 
-    fn call(self, &cx: Cx!['k], instr: Instr['k]) {
+    fn call(self, &cx: Cx!['k], &lines: Buffer!, instr: Instr['k]) {
         let callee = instr.args.get(&cx, 0usize);
         if callee.starts_with(&cx, text(&cx, "%")) {
             let ret = match erase(&cx, self.type_of(&cx, callee), self.types) {
                 Type::Fn(f) => f.ret.get(&cx),
                 _ => fail_text(&cx, text(&cx, "internal error: a call of a value that is not a function")),
             };
-            self.emit_call(&cx, instr, self.value_name(&cx, callee), ret, Map::new(&cx), instr.args.from(&cx, 1usize), false);
+            self.emit_call(&cx, &lines, instr, self.value_name(&cx, callee), ret, Map::new(&cx), instr.args.from(&cx, 1usize), false);
         } else if self.program.externs.has(&cx, callee) {
             let ret = match self.program.externs.at(&cx, callee).ret {
                 Option::Some(r) => r,
                 Option::None => fail_text(&cx, text(&cx, "internal error: an extern without a type")),
             };
-            self.emit_call(&cx, instr, callee, ret, Map::new(&cx), instr.args.from(&cx, 1usize), true);
+            self.emit_call(&cx, &lines, instr, callee, ret, Map::new(&cx), instr.args.from(&cx, 1usize), true);
         } else {
             let fun = self.program.funs.at(&cx, callee);
             let sub: Map[Text['k], Type['k], 'k] = Map::new(&cx);
@@ -1726,31 +1734,31 @@ impl Backend['k] {
                 i = i + 1usize;
             }
             let symbol = self.request(&cx, FunKey::Function.(callee), fun, sub);
-            self.emit_call(&cx, instr, symbol, fun.ret, sub, instr.args.from(&cx, 1usize), false);
+            self.emit_call(&cx, &lines, instr, symbol, fun.ret, sub, instr.args.from(&cx, 1usize), false);
         }
     }
 
-    fn emit_call(self, &cx: Cx!['k], instr: Instr['k], callee: Text['k], ret: Type['k], sub: Map[Text['k], Type['k], 'k], args: Seq[Text['k], 'k], foreign: bool) {
+    fn emit_call(self, &cx: Cx!['k], &lines: Buffer!, instr: Instr['k], callee: Text['k], ret: Type['k], sub: Map[Text['k], Type['k], 'k], args: Seq[Text['k], 'k], foreign: bool) {
         let operands: Seq[Text['k], 'k] = Seq::new(&cx);
         var i = 0usize;
         while i < args.len(&cx) {
             operands.push(&cx, self.operand(&cx, args.get(&cx, i)));
             i = i + 1usize;
         }
-        let call = Out::new(&cx).add(&cx, callee).put(&cx, "(").add(&cx, joined(&cx, operands, ", ")).put(&cx, ")").done(&cx);
+        let call = text_of(&cx, Buffer::new().push_bytes(&cx, callee).push_static("(").push_bytes(&cx, joined(&cx, operands, ", ")).push_static(")"));
         let ret = subst(&cx, ret, sub, self.counter);
         let dst = self.value_name(&cx, instr.lhs.get(&cx, 0usize));
         if is_never(ret) {
-            self.line(&cx, Out::new(&cx).add(&cx, call).put(&cx, ";").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, call).push_static(";"));
         } else if foreign && self.is_unit(&cx, ret) {
-            self.line(&cx, Out::new(&cx).add(&cx, call).put(&cx, ";").done(&cx));
-            self.line(&cx, Out::new(&cx).add(&cx, dst).put(&cx, ".dummy = 0;").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, call).push_static(";"));
+            line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(".dummy = 0;"));
         } else {
-            self.line(&cx, Out::new(&cx).add(&cx, dst).put(&cx, " = ").add(&cx, call).put(&cx, ";").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = ").push_bytes(&cx, call).push_static(";"));
         }
     }
 
-    fn atomic(self, &cx: Cx!['k], instr: Instr['k], dst: Option[Text['k]]) {
+    fn atomic(self, &cx: Cx!['k], &lines: Buffer!, instr: Instr['k], dst: Option[Text['k]]) {
         let order = match instr.lit {
             Option::Some(o) => o,
             Option::None => fail_text(&cx, text(&cx, "internal error: an atomic operation without its ordering")),
@@ -1774,36 +1782,36 @@ impl Backend['k] {
                 _ => (false, false),
             };
             if !integer && (kind.starts_with(&cx, text(&cx, "fetch_")) || !transfer) {
-                fail_at(&cx, Out::new(&cx).put(&cx, "backend atomic ").add(&cx, kind).put(&cx, " does not support this pointee type; ")
-                    .put(&cx, "fetch operations require integers, transfers require integers, bool or raw pointers").done(&cx), instr.pos);
+                fail_at(&cx, text_of(&cx, Buffer::new().push_static("backend atomic ").push_bytes(&cx, kind).push_static(" does not support this pointee type; ")
+                    .push_static("fetch operations require integers, transfers require integers, bool or raw pointers")), instr.pos);
             }
         }
         if kind.is(&cx, "fence") {
-            self.line(&cx, Out::new(&cx).put(&cx, "__atomic_thread_fence(").add(&cx, c_order(&cx, order)).put(&cx, ");").done(&cx));
-            self.unit(&cx, dst);
+            line(&lines, Buffer::new().push_static("__atomic_thread_fence(").push_bytes(&cx, c_order(&cx, order)).push_static(");"));
+            self.unit(&cx, &lines, dst);
         } else if kind.is(&cx, "load") {
-            self.line(&cx, Out::new(&cx).add(&cx, d).put(&cx, " = __atomic_load_n(").add(&cx, args.get(&cx, 0usize)).put(&cx, ", ").add(&cx, c_order(&cx, order)).put(&cx, ");").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = __atomic_load_n(").push_bytes(&cx, args.get(&cx, 0usize)).push_static(", ").push_bytes(&cx, c_order(&cx, order)).push_static(");"));
         } else if kind.is(&cx, "store") {
-            self.line(&cx, Out::new(&cx).put(&cx, "__atomic_store_n(").add(&cx, args.get(&cx, 0usize)).put(&cx, ", ").add(&cx, args.get(&cx, 1usize)).put(&cx, ", ").add(&cx, c_order(&cx, order)).put(&cx, ");").done(&cx));
-            self.unit(&cx, dst);
+            line(&lines, Buffer::new().push_static("__atomic_store_n(").push_bytes(&cx, args.get(&cx, 0usize)).push_static(", ").push_bytes(&cx, args.get(&cx, 1usize)).push_static(", ").push_bytes(&cx, c_order(&cx, order)).push_static(");"));
+            self.unit(&cx, &lines, dst);
         } else if kind.is(&cx, "swap") {
-            self.line(&cx, Out::new(&cx).add(&cx, d).put(&cx, " = __atomic_exchange_n(").add(&cx, args.get(&cx, 0usize)).put(&cx, ", ").add(&cx, args.get(&cx, 1usize)).put(&cx, ", ")
-                .add(&cx, c_order(&cx, order)).put(&cx, ");").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = __atomic_exchange_n(").push_bytes(&cx, args.get(&cx, 0usize)).push_static(", ").push_bytes(&cx, args.get(&cx, 1usize)).push_static(", ")
+                .push_bytes(&cx, c_order(&cx, order)).push_static(");"));
         } else if kind.is(&cx, "compare_exchange") {
             let (success, failure) = match order.find(&cx, text(&cx, "/"), 0usize) {
                 Option::Some(at) => (order.slice(0usize, at), order.from(at + 1usize)),
                 Option::None => (order, text(&cx, "")),
             };
-            self.line(&cx, Out::new(&cx).add(&cx, d).put(&cx, ".e0 = ").add(&cx, args.get(&cx, 1usize)).put(&cx, ";").done(&cx));
-            self.line(&cx, Out::new(&cx).add(&cx, d).put(&cx, ".e1 = __atomic_compare_exchange_n(").add(&cx, args.get(&cx, 0usize)).put(&cx, ", &").add(&cx, d).put(&cx, ".e0, ")
-                .add(&cx, args.get(&cx, 2usize)).put(&cx, ", 0, ").add(&cx, c_order(&cx, success)).put(&cx, ", ").add(&cx, c_order(&cx, failure)).put(&cx, ");").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(".e0 = ").push_bytes(&cx, args.get(&cx, 1usize)).push_static(";"));
+            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(".e1 = __atomic_compare_exchange_n(").push_bytes(&cx, args.get(&cx, 0usize)).push_static(", &").push_bytes(&cx, d).push_static(".e0, ")
+                .push_bytes(&cx, args.get(&cx, 2usize)).push_static(", 0, ").push_bytes(&cx, c_order(&cx, success)).push_static(", ").push_bytes(&cx, c_order(&cx, failure)).push_static(");"));
         } else {
-            self.line(&cx, Out::new(&cx).add(&cx, d).put(&cx, " = __atomic_").add(&cx, kind).put(&cx, "(").add(&cx, args.get(&cx, 0usize)).put(&cx, ", ").add(&cx, args.get(&cx, 1usize)).put(&cx, ", ")
-                .add(&cx, c_order(&cx, order)).put(&cx, ");").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = __atomic_").push_bytes(&cx, kind).push_static("(").push_bytes(&cx, args.get(&cx, 0usize)).push_static(", ").push_bytes(&cx, args.get(&cx, 1usize)).push_static(", ")
+                .push_bytes(&cx, c_order(&cx, order)).push_static(");"));
         }
     }
 
-    fn foreach_instr(self, &cx: Cx!['k], instr: Instr['k], dst: Text['k]) {
+    fn foreach_instr(self, &cx: Cx!['k], &lines: Buffer!, instr: Instr['k], dst: Text['k]) {
         let original = match instr.ty {
             Option::Some(ty) => match ty {
                 Type::Foreach(f) => f,
@@ -1858,24 +1866,24 @@ impl Backend['k] {
         let skeleton = match found.skeleton {
             Option::Some(s) => s,
             Option::None => {
-                let component = if is_foreach(t.source.get(&cx)) { Out::new(&cx).add(&cx, source).put(&cx, ".e0").done(&cx) } else { source };
-                self.line(&cx, Out::new(&cx).add(&cx, dst).put(&cx, ".e0 = ").add(&cx, walk.apply(&cx, rows.get(&cx, 0usize), component)).put(&cx, ";").done(&cx));
+                let component = if is_foreach(t.source.get(&cx)) { text_of(&cx, Buffer::new().push_bytes(&cx, source).push_static(".e0")) } else { source };
+                line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(".e0 = ").push_bytes(&cx, walk.apply(&cx, rows.get(&cx, 0usize), component)).push_static(";"));
                 return ();
             },
         };
         let unit = match skeleton {
             Type::Enum(_variants) => {
-                self.line(&cx, Out::new(&cx).put(&cx, "switch (").add(&cx, source).put(&cx, ".tag) {").done(&cx));
+                line(&lines, Buffer::new().push_static("switch (").push_bytes(&cx, source).push_static(".tag) {"));
                 var k = 0usize;
                 while k < rows.len(&cx) {
                     let row = rows.get(&cx, k);
                     let member = self.variant(&cx, row.label);
-                    let applied = walk.apply(&cx, row, Out::new(&cx).add(&cx, source).put(&cx, ".payload.").add(&cx, member).done(&cx));
-                    self.line(&cx, Out::new(&cx).put(&cx, "case ").usize(&cx, k).put(&cx, ": ").add(&cx, dst).put(&cx, ".payload.").add(&cx, member).put(&cx, " = ").add(&cx, applied)
-                        .put(&cx, "; ").add(&cx, dst).put(&cx, ".tag = ").usize(&cx, k).put(&cx, "; break;").done(&cx));
+                    let applied = walk.apply(&cx, row, text_of(&cx, Buffer::new().push_bytes(&cx, source).push_static(".payload.").push_bytes(&cx, member)));
+                    line(&lines, Buffer::new().push_static("case ").push_usize(k).push_static(": ").push_bytes(&cx, dst).push_static(".payload.").push_bytes(&cx, member).push_static(" = ").push_bytes(&cx, applied)
+                        .push_static("; ").push_bytes(&cx, dst).push_static(".tag = ").push_usize(k).push_static("; break;"));
                     k = k + 1usize;
                 }
-                self.line(&cx, text(&cx, "default: KUR_TRAP();\n  }"));
+                line(&lines, Buffer::new().push_static("default: KUR_TRAP();\n  }"));
                 return ();
             },
             _ => (),
@@ -1895,39 +1903,39 @@ impl Backend['k] {
         var k = 0usize;
         while k < rows.len(&cx) && k < source_access.len(&cx) && k < dst_access.len(&cx) {
             let component = if pointer {
-                Out::new(&cx).put(&cx, "KUR_FIELD(").add(&cx, source).put(&cx, ", ").add(&cx, source_access.get(&cx, k)).put(&cx, ")").done(&cx)
+                text_of(&cx, Buffer::new().push_static("KUR_FIELD(").push_bytes(&cx, source).push_static(", ").push_bytes(&cx, source_access.get(&cx, k)).push_static(")"))
             } else {
-                Out::new(&cx).add(&cx, source).put(&cx, ".").add(&cx, source_access.get(&cx, k)).done(&cx)
+                text_of(&cx, Buffer::new().push_bytes(&cx, source).push_static(".").push_bytes(&cx, source_access.get(&cx, k)))
             };
             let applied = walk.apply(&cx, rows.get(&cx, k), component);
-            self.line(&cx, Out::new(&cx).add(&cx, dst).put(&cx, ".").add(&cx, dst_access.get(&cx, k)).put(&cx, " = ").add(&cx, applied).put(&cx, ";").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(".").push_bytes(&cx, dst_access.get(&cx, k)).push_static(" = ").push_bytes(&cx, applied).push_static(";"));
             k = k + 1usize;
         }
         if rows.is_empty(&cx) {
-            self.line(&cx, Out::new(&cx).add(&cx, dst).put(&cx, ".dummy = 0;").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(".dummy = 0;"));
         }
     }
 
     // ---------------------------------------------------------------- terminators --
 
-    fn term(self, &cx: Cx!['k], term: Terminator['k]) {
+    fn term(self, &cx: Cx!['k], &lines: Buffer!, term: Terminator['k]) {
         match term {
-            Terminator::Ret(value, _pos) => self.line(&cx, Out::new(&cx).put(&cx, "return ").add(&cx, self.value_name(&cx, value)).put(&cx, ";").done(&cx)),
-            Terminator::Jmp(edge, _pos) => self.edge(&cx, edge, Option::None, text(&cx, "")),
+            Terminator::Ret(value, _pos) => line(&lines, Buffer::new().push_static("return ").push_bytes(&cx, self.value_name(&cx, value)).push_static(";")),
+            Terminator::Jmp(edge, _pos) => self.edge(&cx, &lines, edge, Option::None, text(&cx, "")),
             Terminator::Jnz(cond, then, other, _pos) => {
-                self.line(&cx, Out::new(&cx).put(&cx, "if (").add(&cx, self.value_name(&cx, cond)).put(&cx, ") {").done(&cx));
-                self.edge(&cx, then, Option::None, text(&cx, "  "));
-                self.line(&cx, text(&cx, "} else {"));
-                self.edge(&cx, other, Option::None, text(&cx, "  "));
-                self.line(&cx, text(&cx, "}"));
+                line(&lines, Buffer::new().push_static("if (").push_bytes(&cx, self.value_name(&cx, cond)).push_static(") {"));
+                self.edge(&cx, &lines, then, Option::None, text(&cx, "  "));
+                line(&lines, Buffer::new().push_static("} else {"));
+                self.edge(&cx, &lines, other, Option::None, text(&cx, "  "));
+                line(&lines, Buffer::new().push_static("}"));
             },
-            Terminator::Switch(scrutinee, ty, arms, _pos) => self.switch(&cx, scrutinee, ty, arms),
-            Terminator::Unreachable(_pos) => self.line(&cx, text(&cx, "KUR_TRAP();")),
+            Terminator::Switch(scrutinee, ty, arms, _pos) => self.switch(&cx, &lines, scrutinee, ty, arms),
+            Terminator::Unreachable(_pos) => line(&lines, Buffer::new().push_static("KUR_TRAP();")),
         };
     }
 
     // A jump assigns every target parameter at once, through scratch locals.
-    fn edge(self, &cx: Cx!['k], edge: Edge['k], payload: Option[Text['k]], indent: Text['k]) {
+    fn edge(self, &cx: Cx!['k], &lines: Buffer!, edge: Edge['k], payload: Option[Text['k]], indent: Text['k]) {
         let target = self.blocks.get(&cx).at(&cx, edge.target);
         let values: Seq[Text['k], 'k] = Seq::new(&cx);
         match payload {
@@ -1949,23 +1957,23 @@ impl Backend['k] {
         var i = 0usize;
         while i < params.len(&cx) && i < values.len(&cx) {
             let (_cname, t) = params.get(&cx, i);
-            let temp = allocate(&cx, Out::new(&cx).put(&cx, "edge_").usize(&cx, self.scratch.get(&cx)).done(&cx), self.taken);
+            let temp = allocate(&cx, text_of(&cx, Buffer::new().push_static("edge_").push_usize(self.scratch.get(&cx))), self.taken);
             self.scratch.set(&cx, self.scratch.get(&cx) + 1usize);
-            self.decls.get(&cx).push(&cx, Out::new(&cx).add(&cx, self.c(&cx, self.substitute_type(&cx, t))).put(&cx, " ").add(&cx, temp).put(&cx, ";").done(&cx));
-            self.line(&cx, Out::new(&cx).add(&cx, indent).add(&cx, temp).put(&cx, " = ").add(&cx, values.get(&cx, i)).put(&cx, ";").done(&cx));
+            self.decls.get(&cx).push(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, self.c(&cx, self.substitute_type(&cx, t))).push_static(" ").push_bytes(&cx, temp).push_static(";")));
+            line(&lines, Buffer::new().push_bytes(&cx, indent).push_bytes(&cx, temp).push_static(" = ").push_bytes(&cx, values.get(&cx, i)).push_static(";"));
             temps.push(&cx, temp);
             i = i + 1usize;
         }
         var j = 0usize;
         while j < params.len(&cx) && j < temps.len(&cx) {
             let (cname, _t) = params.get(&cx, j);
-            self.line(&cx, Out::new(&cx).add(&cx, indent).add(&cx, cname).put(&cx, " = ").add(&cx, temps.get(&cx, j)).put(&cx, ";").done(&cx));
+            line(&lines, Buffer::new().push_bytes(&cx, indent).push_bytes(&cx, cname).push_static(" = ").push_bytes(&cx, temps.get(&cx, j)).push_static(";"));
             j = j + 1usize;
         }
-        self.line(&cx, Out::new(&cx).add(&cx, indent).put(&cx, "goto ").add(&cx, self.labels.get(&cx).at(&cx, target.label)).put(&cx, ";").done(&cx));
+        line(&lines, Buffer::new().push_bytes(&cx, indent).push_static("goto ").push_bytes(&cx, self.labels.get(&cx).at(&cx, target.label)).push_static(";"));
     }
 
-    fn switch(self, &cx: Cx!['k], arg: Text['k], ty: Type['k], arms: Seq[Arm['k], 'k]) {
+    fn switch(self, &cx: Cx!['k], &lines: Buffer!, arg: Text['k], ty: Type['k], arms: Seq[Arm['k], 'k]) {
         let place = arg.starts_with(&cx, text(&cx, "&"));
         let source = if place {
             let (expr, _t) = self.place(&cx, arg);
@@ -1974,7 +1982,7 @@ impl Backend['k] {
             self.value_name(&cx, arg)
         };
         let variants = self.types.variants(&cx, erase(&cx, self.substitute_type(&cx, ty), self.types), Option::None);
-        self.line(&cx, Out::new(&cx).put(&cx, "switch (").add(&cx, source).put(&cx, ".tag) {").done(&cx));
+        line(&lines, Buffer::new().push_static("switch (").push_bytes(&cx, source).push_static(".tag) {"));
         var i = 0usize;
         while i < arms.len(&cx) {
             let arm = arms.get(&cx, i);
@@ -1987,19 +1995,19 @@ impl Backend['k] {
                     index = index + 1usize;
                 }
             }
-            self.line(&cx, Out::new(&cx).put(&cx, "case ").usize(&cx, index).put(&cx, ":").done(&cx));
+            line(&lines, Buffer::new().push_static("case ").push_usize(index).push_static(":"));
             let payload = if place {
                 Option::None
             } else {
-                Option::Some.(Out::new(&cx).add(&cx, source).put(&cx, ".payload.").add(&cx, self.variant(&cx, arm.variant)).done(&cx))
+                Option::Some.(text_of(&cx, Buffer::new().push_bytes(&cx, source).push_static(".payload.").push_bytes(&cx, self.variant(&cx, arm.variant))))
             };
-            self.line(&cx, text(&cx, "  {"));
-            self.edge(&cx, arm.edge, payload, text(&cx, "    "));
-            self.line(&cx, text(&cx, "  }"));
+            line(&lines, Buffer::new().push_static("  {"));
+            self.edge(&cx, &lines, arm.edge, payload, text(&cx, "    "));
+            line(&lines, Buffer::new().push_static("  }"));
             i = i + 1usize;
         }
-        self.line(&cx, text(&cx, "default: KUR_TRAP();"));
-        self.line(&cx, text(&cx, "}"));
+        line(&lines, Buffer::new().push_static("default: KUR_TRAP();"));
+        line(&lines, Buffer::new().push_static("}"));
     }
 }
 
@@ -2011,9 +2019,9 @@ fn width(&cx: Cx!['k], name: Text['k]) -> u32 {
 forall 'k.
 fn wrap(&cx: Cx!['k], expr: Text['k], bits: u32, signed: bool, ct: Text['k]) -> Text['k] {
     if signed {
-        Out::new(&cx).put(&cx, "kur_dec_i").u64(&cx, bits as u64).put(&cx, "(").add(&cx, expr).put(&cx, ")").done(&cx)
+        text_of(&cx, Buffer::new().push_static("kur_dec_i").push_u64(bits as u64).push_static("(").push_bytes(&cx, expr).push_static(")"))
     } else {
-        Out::new(&cx).put(&cx, "(").add(&cx, ct).put(&cx, ")(").add(&cx, expr).put(&cx, ")").done(&cx)
+        text_of(&cx, Buffer::new().push_static("(").push_bytes(&cx, ct).push_static(")(").push_bytes(&cx, expr).push_static(")"))
     }
 }
 
@@ -2063,11 +2071,11 @@ impl Walk['k] {
         }
         let arguments = Seq::one(&cx, component);
         arguments.append(&cx, self.caps);
-        Out::new(&cx).add(&cx, self.backend.request(&cx, FunKey::Function.(self.mapper_name), self.mapper, sub)).put(&cx, "(").add(&cx, joined(&cx, arguments, ", ")).put(&cx, ")").done(&cx)
+        text_of(&cx, Buffer::new().push_bytes(&cx, self.backend.request(&cx, FunKey::Function.(self.mapper_name), self.mapper, sub)).push_static("(").push_bytes(&cx, joined(&cx, arguments, ", ")).push_static(")"))
     }
 }
 
 forall 'k.
-fn emit_c(&cx: Cx!['k], program: Program['k], typed: Map[FunKey['k], Map[(Text['k], Text['k]), Type['k], 'k], 'k], entry: Option[Text['k]], counter: Fresh['k]) -> Text['k] {
+fn emit_c(&cx: Cx!['k], program: Program['k], typed: Map[FunKey['k], Map[(Text['k], Text['k]), Type['k], 'k], 'k], entry: Option[Text['k]], counter: Fresh['k]) -> Buffer! {
     Backend::new(&cx, program, typed, counter).emit_program(&cx, entry)
 }

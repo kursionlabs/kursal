@@ -8,8 +8,11 @@
 // writes takes the context by place, `&cx`, and presents its capability; one that may allocate
 // also hands the arena to the standard library. Elements are `Copy` values, read and written
 // whole; nothing hands out a reference into storage, and nothing is freed until the arena is.
+// Text is built in the standard library's linear `Buffer!`, on the heap, and `text_of` copies a
+// finished one into the arena.
 
-use std::alloc::arena::{Arena, copy_span};
+use std::alloc::arena::{Arena, copy_span, save_buffer};
+use std::bytes::buffer::Buffer;
 use std::cap::Exclusive;
 use std::cmp::Order;
 use std::collections::arena_vec::ArenaVec;
@@ -19,7 +22,7 @@ use std::mem::Ref;
 use std::option::Option;
 use std::process::exit;
 use std::raw::{Span, span_byte_or_zero, span_bytes_eq, span_bytes_eq_lit, span_bytes_hash};
-use std::slice::{Slice, bytes_cmp_within, find_bytes};
+use std::slice::{ReadBytes, Slice, byte_at, bytes_cmp_within, find_bytes};
 
 // ---------------------------------------------------------------- context --
 
@@ -113,6 +116,25 @@ fn copy_text(&from: Cx!['a], &to: Cx!['b], t: Text['a]) -> Text['b] {
     Text.{ bytes: copy_span(&to.arena, &from.tag, t.bytes) }
 }
 
+// The text a finished buffer holds, copied into the arena in one block; the buffer is freed.
+forall 'k.
+fn text_of(&cx: Cx!['k], b: Buffer!) -> Text['k] {
+    Text.{ bytes: save_buffer(&cx.arena, b) }
+}
+
+// Text is read under the context's capability, so a buffer takes it whole:
+// `Buffer::new().push_static("(").push_bytes(&cx, t)`.
+forall 'k.
+instance ReadBytes[Cx!['k], Text['k]] {
+    fn get(&cx: Cx!['k], t: Text['k], index: usize) -> Option[u8] {
+        byte_at(&cx.tag, t.bytes, index)
+    }
+
+    fn len(&cx: Cx!['k], t: Text['k]) -> usize {
+        t.bytes.len()
+    }
+}
+
 forall 'k.
 fn empty_text(&cx: Cx!['k]) -> Text['k] {
     text(&cx, "")
@@ -196,7 +218,7 @@ impl Text['k] {
     }
 
     fn concat(self, &cx: Cx!['k], other: Text['k]) -> Text['k] {
-        Out::new(&cx).add(&cx, self).add(&cx, other).done(&cx)
+        text_of(&cx, Buffer::new().push_bytes(&cx, self).push_bytes(&cx, other))
     }
 
     // The pieces between occurrences of `separator`.
@@ -238,62 +260,6 @@ impl Text['k] {
 
     fn print(self, &cx: Cx!['k], fd: i32) {
         let written = write_span(fd, &cx.tag, self.bytes);
-    }
-}
-
-// Text being built. `done` returns what was written; the builder may go on growing after it.
-forall 'k.
-exposed struct Out {
-    bytes: ArenaVec[u8, 'k],
-}
-
-forall 'k.
-impl Out['k] {
-    fn new(&cx: Cx!['k]) -> Out['k] {
-        Out.{ bytes: ArenaVec::new(&cx.tag, &cx.arena) }
-    }
-
-    fn byte(self, &cx: Cx!['k], b: u8) -> Out['k] {
-        self.bytes.push(&cx.tag, &cx.arena, b);
-        self
-    }
-
-    fn add(self, &cx: Cx!['k], t: Text['k]) -> Out['k] {
-        self.bytes.push_span(&cx.tag, &cx.arena, t.bytes);
-        self
-    }
-
-    fn put(self, &cx: Cx!['k], literal: Slice[u8, 'static]) -> Out['k] {
-        self.bytes.push_static(&cx.tag, &cx.arena, literal);
-        self
-    }
-
-    fn u64(self, &cx: Cx!['k], n: u64) -> Out['k] {
-        if n >= 10u64 {
-            let unit = self.u64(&cx, n / 10u64);
-        }
-        self.byte(&cx, b'0' + ((n % 10u64) as u8))
-    }
-
-    fn usize(self, &cx: Cx!['k], n: usize) -> Out['k] {
-        self.u64(&cx, n as u64)
-    }
-
-    fn i64(self, &cx: Cx!['k], n: i64) -> Out['k] {
-        if n < 0i64 {
-            // The magnitude of the most negative value is one past the largest positive one.
-            self.byte(&cx, b'-').u64(&cx, ((0i64 - (n + 1i64)) as u64) + 1u64)
-        } else {
-            self.u64(&cx, n as u64)
-        }
-    }
-
-    fn len(self, &cx: Cx!['k]) -> usize {
-        self.bytes.len(&cx.tag)
-    }
-
-    fn done(self, &cx: Cx!['k]) -> Text['k] {
-        Text.{ bytes: self.bytes.span(&cx.tag, &cx.arena) }
     }
 }
 

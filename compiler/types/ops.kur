@@ -1,7 +1,8 @@
 // Type operations shared by the checker and the backend: substitution, equality, multiplicity,
 // exposure and logical shape.
 
-use package::support::base::{Cell, Cx, Map, Out, Seq, Set, Text, fail, key_same, text};
+use package::support::base::{Cell, Cx, Map, Seq, Set, Text, fail, key_same, text, text_of};
+use std::bytes::buffer::Buffer;
 use package::kurs::core::{Exposure, ExposureMode, FnType, ForeachType, Kind, Member, ModuleId, Param, Premise, Program, Type, TypeDecl};
 use package::kurs::core as C;
 use package::kurs::sexpr::located;
@@ -51,7 +52,7 @@ fn fresh(&cx: Cx!['k], label: Text['k], counter: Fresh['k]) -> Text['k] {
         Option::Some(at) => label.slice(0usize, at),
         Option::None => label,
     };
-    Out::new(&cx).add(&cx, stem).put(&cx, "#").u64(&cx, n).done(&cx)
+    text_of(&cx, Buffer::new().push_bytes(&cx, stem).push_static("#").push_u64(n))
 }
 
 // ------------------------------------------------------------- name sets --
@@ -104,18 +105,18 @@ fn param_names(&cx: Cx!['k], params: Seq[Param['k], 'k]) -> Seq[Text['k], 'k] {
 // `t` with every non-overlapping `old` replaced by `new`, left to right.
 forall 'k.
 fn replace_all(&cx: Cx!['k], t: Text['k], old: Text['k], new: Text['k]) -> Text['k] {
-    let out = Out::new(&cx);
+    var out = Buffer::new();
     var i = 0usize;
     while i < t.len() {
         if i + old.len() <= t.len() && t.slice(i, i + old.len()).eq(&cx, old) {
-            let unit = out.add(&cx, new);
+            out = out.push_bytes(&cx, new);
             i = i + old.len();
         } else {
-            let unit = out.byte(&cx, t.byte(&cx, i));
+            out = out.push_byte(t.byte(&cx, i));
             i = i + 1usize;
         }
     }
-    out.done(&cx)
+    text_of(&cx, out)
 }
 
 forall 'k.
@@ -855,7 +856,7 @@ impl Types['k] {
     fn decl(self, &cx: Cx!['k], name: Text['k]) -> TypeDecl['k] {
         match self.program.types.get(&cx, name) {
             Option::Some(decl) => decl,
-            Option::None => kurs_error(&cx, Out::new(&cx).put(&cx, "unknown type ").add(&cx, name).done(&cx), no_pos()),
+            Option::None => kurs_error(&cx, text_of(&cx, Buffer::new().push_static("unknown type ").push_bytes(&cx, name)), no_pos()),
         }
     }
 
@@ -911,10 +912,10 @@ impl Types['k] {
         };
         let decl = self.decl(&cx, name);
         if args.len(&cx) != decl.params.len(&cx) {
-            kurs_error(&cx, Out::new(&cx).add(&cx, name).put(&cx, " takes ").usize(&cx, decl.params.len(&cx)).put(&cx, " type arguments").done(&cx), no_pos());
+            kurs_error(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, name).push_static(" takes ").push_usize(decl.params.len(&cx)).push_static(" type arguments")), no_pos());
         }
         if !self.is_exposed(&cx, decl, home) {
-            kurs_error(&cx, Out::new(&cx).put(&cx, "the shape of ").add(&cx, name).put(&cx, " is not exposed here").done(&cx), no_pos());
+            kurs_error(&cx, text_of(&cx, Buffer::new().push_static("the shape of ").push_bytes(&cx, name).push_static(" is not exposed here")), no_pos());
         }
         match self.unfolded.get(&cx, ty) {
             Option::Some(body) => return body,
@@ -1097,14 +1098,14 @@ impl Types['k] {
                 }
                 out
             },
-            _ => kurs_error(&cx, Out::new(&cx).add(&cx, show(&cx, ty)).put(&cx, " is not a product").done(&cx), no_pos()),
+            _ => kurs_error(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, show(&cx, ty)).push_static(" is not a product")), no_pos()),
         }
     }
 
     fn variants(self, &cx: Cx!['k], ty: Type['k], home: Option[ModuleId['k]]) -> Seq[Member['k], 'k] {
         match self.shape(&cx, ty, home) {
             Type::Enum(variants) => variants,
-            _ => kurs_error(&cx, Out::new(&cx).add(&cx, show(&cx, ty)).put(&cx, " is not a sum").done(&cx), no_pos()),
+            _ => kurs_error(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, show(&cx, ty)).push_static(" is not a sum")), no_pos()),
         }
     }
 
@@ -1153,7 +1154,7 @@ impl Types['k] {
             Type::Tuple(elems) => {
                 var i = 0usize;
                 while i < elems.len(&cx) {
-                    rows.push(&cx, Row.{ label: Out::new(&cx).usize(&cx, i).done(&cx), item: wrap(&cx, elems.get(&cx, i), pointer), extra: Map::new(&cx) });
+                    rows.push(&cx, Row.{ label: text_of(&cx, Buffer::new().push_usize(i)), item: wrap(&cx, elems.get(&cx, i), pointer), extra: Map::new(&cx) });
                     i = i + 1usize;
                 }
                 Rows.{ skeleton: Option::Some.(s), rows }
@@ -1162,7 +1163,7 @@ impl Types['k] {
                 let count = if schema { 1u64 } else { length };
                 var i = 0u64;
                 while i < count {
-                    rows.push(&cx, Row.{ label: Out::new(&cx).u64(&cx, i).done(&cx), item: wrap(&cx, elem.get(&cx), pointer), extra: Map::new(&cx) });
+                    rows.push(&cx, Row.{ label: text_of(&cx, Buffer::new().push_u64(i)), item: wrap(&cx, elem.get(&cx), pointer), extra: Map::new(&cx) });
                     i = i + 1u64;
                 }
                 Rows.{ skeleton: Option::Some.(s), rows }
@@ -1287,26 +1288,28 @@ fn sorted_kinds(&cx: Cx!['k], kinds: Map[Text['k], Kind, 'k]) -> Seq[(Text['k], 
 // ------------------------------------------------------------------- show --
 
 forall 'k.
-fn show_all(&cx: Cx!['k], out: Out['k], ts: Seq[Type['k], 'k]) -> Out['k] {
+fn show_all(&cx: Cx!['k], out: Buffer!, ts: Seq[Type['k], 'k]) -> Buffer! {
+    var out = out;
     var i = 0usize;
     while i < ts.len(&cx) {
         if i > 0usize {
-            let unit = out.put(&cx, " ");
+            out = out.push_static(" ");
         }
-        let unit = out.add(&cx, show(&cx, ts.get(&cx, i)));
+        out = out.push_bytes(&cx, show(&cx, ts.get(&cx, i)));
         i = i + 1usize;
     }
     out
 }
 
 forall 'k.
-fn show_members(&cx: Cx!['k], out: Out['k], ms: Seq[Member['k], 'k]) -> Out['k] {
+fn show_members(&cx: Cx!['k], out: Buffer!, ms: Seq[Member['k], 'k]) -> Buffer! {
+    var out = out;
     var i = 0usize;
     while i < ms.len(&cx) {
         if i > 0usize {
-            let unit = out.put(&cx, " ");
+            out = out.push_static(" ");
         }
-        let unit = out.put(&cx, "(").add(&cx, ms.get(&cx, i).name).put(&cx, " ").add(&cx, show(&cx, ms.get(&cx, i).type)).put(&cx, ")");
+        out = out.push_static("(").push_bytes(&cx, ms.get(&cx, i).name).push_static(" ").push_bytes(&cx, show(&cx, ms.get(&cx, i).type)).push_static(")");
         i = i + 1usize;
     }
     out
@@ -1321,60 +1324,60 @@ fn show(&cx: Cx!['k], ty: Type['k]) -> Text['k] {
             if args.is_empty(&cx) {
                 name
             } else {
-                show_all(&cx, Out::new(&cx).put(&cx, "(").add(&cx, name).put(&cx, " "), args).put(&cx, ")").done(&cx)
+                text_of(&cx, show_all(&cx, Buffer::new().push_static("(").push_bytes(&cx, name).push_static(" "), args).push_static(")"))
             }
         },
-        Type::Skolem(label) => Out::new(&cx).put(&cx, "$").add(&cx, label).done(&cx),
-        Type::Brand(brand) => Out::new(&cx).put(&cx, "(builtin::Brand ").add(&cx, show(&cx, brand.get(&cx))).put(&cx, ")").done(&cx),
-        Type::Ptr(inner) => Out::new(&cx).put(&cx, "(builtin::Pointer ").add(&cx, show(&cx, inner.get(&cx))).put(&cx, ")").done(&cx),
-        Type::Tuple(elems) => replace_all(&cx, show_all(&cx, Out::new(&cx).put(&cx, "(tuple "), elems).put(&cx, ")").done(&cx), text(&cx, " )"), text(&cx, ")")),
-        Type::Array(elem, length) => Out::new(&cx).put(&cx, "(array ").add(&cx, show(&cx, elem.get(&cx))).put(&cx, " ").u64(&cx, length).put(&cx, ")").done(&cx),
-        Type::Struct(fields) => show_members(&cx, Out::new(&cx).put(&cx, "(struct "), fields).put(&cx, ")").done(&cx),
-        Type::Enum(variants) => show_members(&cx, Out::new(&cx).put(&cx, "(enum "), variants).put(&cx, ")").done(&cx),
+        Type::Skolem(label) => text_of(&cx, Buffer::new().push_static("$").push_bytes(&cx, label)),
+        Type::Brand(brand) => text_of(&cx, Buffer::new().push_static("(builtin::Brand ").push_bytes(&cx, show(&cx, brand.get(&cx))).push_static(")")),
+        Type::Ptr(inner) => text_of(&cx, Buffer::new().push_static("(builtin::Pointer ").push_bytes(&cx, show(&cx, inner.get(&cx))).push_static(")")),
+        Type::Tuple(elems) => replace_all(&cx, text_of(&cx, show_all(&cx, Buffer::new().push_static("(tuple "), elems).push_static(")")), text(&cx, " )"), text(&cx, ")")),
+        Type::Array(elem, length) => text_of(&cx, Buffer::new().push_static("(array ").push_bytes(&cx, show(&cx, elem.get(&cx))).push_static(" ").push_u64(length).push_static(")")),
+        Type::Struct(fields) => text_of(&cx, show_members(&cx, Buffer::new().push_static("(struct "), fields).push_static(")")),
+        Type::Enum(variants) => text_of(&cx, show_members(&cx, Buffer::new().push_static("(enum "), variants).push_static(")")),
         Type::Exists(binders, body) => {
-            let out = Out::new(&cx).put(&cx, "(exists (");
+            var out = Buffer::new().push_static("(exists (");
             var i = 0usize;
             while i < binders.len(&cx) {
                 if i > 0usize {
-                    let unit = out.put(&cx, " ");
+                    out = out.push_static(" ");
                 }
-                let unit = out.put(&cx, "$").add(&cx, binders.get(&cx, i));
+                out = out.push_static("$").push_bytes(&cx, binders.get(&cx, i));
                 i = i + 1usize;
             }
-            out.put(&cx, ") ").add(&cx, show(&cx, body.get(&cx))).put(&cx, ")").done(&cx)
+            text_of(&cx, out.push_static(") ").push_bytes(&cx, show(&cx, body.get(&cx))).push_static(")"))
         },
         Type::Foreach(f) => {
-            let out = Out::new(&cx).put(&cx, "(foreach (");
+            var out = Buffer::new().push_static("(foreach (");
             if f.indirect {
-                let unit = out.put(&cx, "(builtin::Pointer ").add(&cx, f.binder).put(&cx, ")");
+                out = out.push_static("(builtin::Pointer ").push_bytes(&cx, f.binder).push_static(")");
             } else {
-                let unit = out.add(&cx, f.binder);
+                out = out.push_bytes(&cx, f.binder);
             }
-            let unit = out.put(&cx, " ").add(&cx, show(&cx, f.source.get(&cx))).put(&cx, ") ").add(&cx, show(&cx, f.body.get(&cx)));
+            out = out.push_static(" ").push_bytes(&cx, show(&cx, f.source.get(&cx))).push_static(") ").push_bytes(&cx, show(&cx, f.body.get(&cx)));
             let inferred = match f.source.get(&cx) {
                 Type::Foreach(source) => foreach_binders(&cx, source),
                 _ => Seq::new(&cx),
             };
             if !f.retained.same(&cx, inferred) {
-                let unit = out.put(&cx, " (retain ");
+                out = out.push_static(" (retain ");
                 var i = 0usize;
                 while i < f.retained.len(&cx) {
                     if i > 0usize {
-                        let unit = out.put(&cx, " ");
+                        out = out.push_static(" ");
                     }
-                    let unit = out.add(&cx, f.retained.get(&cx, i));
+                    out = out.push_bytes(&cx, f.retained.get(&cx, i));
                     i = i + 1usize;
                 }
-                let unit = out.put(&cx, ")");
+                out = out.push_static(")");
             }
-            out.put(&cx, ")").done(&cx)
+            text_of(&cx, out.push_static(")"))
         },
         Type::Fn(f) => {
-            let out = Out::new(&cx).put(&cx, "(builtin::Fn ");
+            var out = Buffer::new().push_static("(builtin::Fn ");
             if f.is_unsafe {
-                let unit = out.put(&cx, "(unsafe) ");
+                out = out.push_static("(unsafe) ");
             }
-            show_all(&cx, out.put(&cx, "("), f.params).put(&cx, ") ").add(&cx, show(&cx, f.ret.get(&cx))).put(&cx, ")").done(&cx)
+            text_of(&cx, show_all(&cx, out.push_static("("), f.params).push_static(") ").push_bytes(&cx, show(&cx, f.ret.get(&cx))).push_static(")"))
         },
         _ => text(&cx, "_"),
     }

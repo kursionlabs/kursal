@@ -3,8 +3,7 @@
 // handed over as `Buffer!` copies, freed once the call returns, and what comes back is copied
 // into the context's arena.
 
-use package::support::base::{Cx, Seq, Text};
-use std::alloc::arena::save_buffer;
+use package::support::base::{Cx, Seq, Text, text_of};
 use std::bytes::buffer::Buffer;
 use std::option::{Option, Result};
 use libc::fs::{canonicalize, create, environment_variable, open_directory, open_read};
@@ -13,14 +12,9 @@ use libc::process::{Exit, arguments as process_arguments, run as run_command};
 // The bytes of `t`.
 forall 'k.
 fn buffer(&cx: Cx!['k], t: Text['k]) -> Buffer! {
-    Buffer::new().push_bytes(&cx.tag, t.bytes)
+    Buffer::new().push_bytes(&cx, t)
 }
 
-// The bytes of a buffer, as text in the arena; the buffer is freed.
-forall 'k.
-fn take(&cx: Cx!['k], b: Buffer!) -> Text['k] {
-    Text.{ bytes: save_buffer(&cx.arena, b) }
-}
 
 // The arguments the program was started with, after its own name.
 forall 'k.
@@ -29,7 +23,7 @@ fn arguments(&cx: Cx!['k]) -> Seq[Text['k], 'k] {
     match process_arguments() {
         Result::Ok(line) => {
             // The program's name, then each argument, each followed by a NUL.
-            let all = take(&cx, line);
+            let all = text_of(&cx, line);
             var start = 0usize;
             var i = 0usize;
             while i < all.len() {
@@ -61,7 +55,7 @@ fn read(&cx: Cx!['k], path: Text['k]) -> Option[Text['k]] {
             let contents = &file.read_to_buffer();
             let closed = file.close();
             match contents {
-                Result::Ok(b) => Option::Some.(take(&cx, b)),
+                Result::Ok(b) => Option::Some.(text_of(&cx, b)),
                 Result::Err(code) => Option::None,
             }
         },
@@ -76,7 +70,7 @@ fn real_path(&cx: Cx!['k], path: Text['k]) -> Option[Text['k]] {
     let result = canonicalize(&b);
     b.destroy();
     match result {
-        Result::Ok(r) => Option::Some.(take(&cx, r)),
+        Result::Ok(r) => Option::Some.(text_of(&cx, r)),
         Result::Err(code) => Option::None,
     }
 }
@@ -93,7 +87,7 @@ fn environment(&cx: Cx!['k], name: Text['k]) -> Option[Text['k]] {
     let result = environment_variable(&b);
     b.destroy();
     match result {
-        Option::Some(r) => Option::Some.(take(&cx, r)),
+        Option::Some(r) => Option::Some.(text_of(&cx, r)),
         Option::None => Option::None,
     }
 }
@@ -114,7 +108,7 @@ fn list_directory(&cx: Cx!['k], path: Text['k]) -> Seq[(Text['k], bool), 'k] {
                     Result::Ok(next) => match next {
                         Option::Some(entry) => {
                             let { name, is_directory } = entry;
-                            let n = take(&cx, name);
+                            let n = text_of(&cx, name);
                             if !n.is(&cx, ".") && !n.is(&cx, "..") {
                                 out.push(&cx, (n, is_directory));
                             }
@@ -135,20 +129,23 @@ fn list_directory(&cx: Cx!['k], path: Text['k]) -> Seq[(Text['k], bool), 'k] {
     out
 }
 
-// Writes `contents` to the file at `path`, replacing it; whether that succeeded.
+// Writes `contents` to the file at `path`, replacing it, and frees it; whether that succeeded.
 forall 'k.
-fn write(&cx: Cx!['k], path: Text['k], contents: Text['k]) -> bool {
+fn write(&cx: Cx!['k], path: Text['k], contents: Buffer!) -> bool {
     var name = buffer(&cx, path);
     let created = create(&name);
     name.destroy();
     match created {
         Result::Ok(file) => {
             var file = file;
-            let written = &file.write_span(&cx.tag, contents.bytes);
+            let written = &file.write_buffer(contents);
             let closed = file.close();
             written.is_ok() && closed.is_ok()
         },
-        Result::Err(code) => false,
+        Result::Err(code) => {
+            contents.destroy();
+            false
+        },
     }
 }
 
@@ -159,7 +156,7 @@ fn command_line(&cx: Cx!['k], argv: Seq[Text['k], 'k]) -> Buffer! {
     var line = Buffer::new();
     var i = 0usize;
     while i < argv.len(&cx) {
-        line = line.push_bytes(&cx.tag, argv.get(&cx, i).bytes).push_byte(0u8);
+        line = line.push_bytes(&cx, argv.get(&cx, i)).push_byte(0u8);
         i = i + 1usize;
     }
     line

@@ -1,7 +1,8 @@
 // The KURS S-expression serialization of the core: `parse_program` reads it into a `Program`, and
 // `write_program` writes a program as text that `parse_program` reads back into the same program.
 
-use package::support::base::{Cell, Cx, Out, Seq, Text, fail, text};
+use package::support::base::{Cell, Cx, Seq, Text, fail, text, text_of};
+use std::bytes::buffer::Buffer;
 use package::kurs::core as C;
 use package::kurs::core::{Arm, Binding, Block, Data, Edge, Exposure, ExposureMode, Extern, Fun, ForeachType, Instance, Instr, Kind, Known, Member, Method, ModuleId, Opened, Param, Premise, Program, Terminator, Trait, Type, TypeDecl};
 use package::kurs::sexpr::{Form, FormKind, located, read};
@@ -69,57 +70,59 @@ fn atom_of(&cx: Cx!['k], form: Form['k]) -> Form['k] {
 forall 'k.
 fn str_of(&cx: Cx!['k], form: Form['k]) -> Text['k] {
     if form.is_list() {
-        repr_list(&cx, Out::new(&cx), form).done(&cx)
+        text_of(&cx, repr_list(&cx, Buffer::new(), form))
     } else {
         form.text
     }
 }
 
 forall 'k.
-fn repr_list(&cx: Cx!['k], out: Out['k], form: Form['k]) -> Out['k] {
-    let unit = out.byte(&cx, b'[');
+fn repr_list(&cx: Cx!['k], out: Buffer!, form: Form['k]) -> Buffer! {
+    var out = out;
+    out = out.push_byte(b'[');
     var i = 0usize;
     while i < form.len(&cx) {
         if i > 0usize {
-            let unit = out.put(&cx, ", ");
+            out = out.push_static(", ");
         }
         let item = form.at(&cx, i);
-        let unit = if item.is_list() { repr_list(&cx, out, item) } else { repr_text(&cx, out, item.text) };
+        out = if item.is_list() { repr_list(&cx, out, item) } else { repr_text(&cx, out, item.text) };
         i = i + 1usize;
     }
-    out.byte(&cx, b']')
+    out.push_byte(b']')
 }
 
 // A string as Python's `repr` writes it.
 forall 'k.
-fn repr_text(&cx: Cx!['k], out: Out['k], t: Text['k]) -> Out['k] {
+fn repr_text(&cx: Cx!['k], out: Buffer!, t: Text['k]) -> Buffer! {
+    var out = out;
     let quote = if t.contains(&cx, text(&cx, "'")) && !t.contains(&cx, text(&cx, "\"")) { b'"' } else { b'\'' };
-    let unit = out.byte(&cx, quote);
+    out = out.push_byte(quote);
     var i = 0usize;
     while i < t.len() {
         let b = t.byte(&cx, i);
-        let unit = if b == b'\\' || b == quote {
-            out.byte(&cx, b'\\').byte(&cx, b)
+        out = if b == b'\\' || b == quote {
+            out.push_byte(b'\\').push_byte(b)
         } else if b == b'\n' {
-            out.put(&cx, "\\n")
+            out.push_static("\\n")
         } else if b == b'\t' {
-            out.put(&cx, "\\t")
+            out.push_static("\\t")
         } else if b == b'\r' {
-            out.put(&cx, "\\r")
+            out.push_static("\\r")
         } else if b < 32u8 || b == 127u8 {
             hex_escape(&cx, out, b)
         } else {
-            out.byte(&cx, b)
+            out.push_byte(b)
         };
         i = i + 1usize;
     }
-    out.byte(&cx, quote)
+    out.push_byte(quote)
 }
 
 forall 'k.
-fn hex_escape(&cx: Cx!['k], out: Out['k], b: u8) -> Out['k] {
+fn hex_escape(&cx: Cx!['k], out: Buffer!, b: u8) -> Buffer! {
     let digits = text(&cx, "0123456789abcdef");
-    out.put(&cx, "\\x").byte(&cx, digits.byte(&cx, (b / 16u8) as usize)).byte(&cx, digits.byte(&cx, (b % 16u8) as usize))
+    out.push_static("\\x").push_byte(digits.byte(&cx, (b / 16u8) as usize)).push_byte(digits.byte(&cx, (b % 16u8) as usize))
 }
 
 forall 'k.
@@ -136,7 +139,7 @@ fn strs(&cx: Cx!['k], forms: Seq[Form['k], 'k]) -> Seq[Text['k], 'k] {
 forall 'k.
 fn brand_of(&cx: Cx!['k], form: Form['k]) -> Text['k] {
     if form.is_list() || !form.text.starts_with(&cx, text(&cx, "$")) || form.text.len() < 2usize {
-        fail_text_on(&cx, Out::new(&cx).put(&cx, "expected a brand such as $k, got ").add(&cx, str_of(&cx, form)).done(&cx), form);
+        fail_text_on(&cx, text_of(&cx, Buffer::new().push_static("expected a brand such as $k, got ").push_bytes(&cx, str_of(&cx, form))), form);
     }
     form.text.from(1usize)
 }
@@ -157,7 +160,7 @@ forall 'k.
 fn int_of(&cx: Cx!['k], form: Form['k]) -> usize {
     match form.text.to_usize(&cx) {
         Option::Some(n) => n,
-        Option::None => fail(&cx, Out::new(&cx).put(&cx, "invalid literal for int() with base 10: ").add(&cx, repr_text(&cx, Out::new(&cx), form.text).done(&cx)).done(&cx)),
+        Option::None => fail(&cx, text_of(&cx, Buffer::new().push_static("invalid literal for int() with base 10: ").push_buffer(repr_text(&cx, Buffer::new(), form.text)))),
     }
 }
 
@@ -458,7 +461,7 @@ fn parse_term(&cx: Cx!['k], form: Form['k]) -> Terminator['k] {
         let scrutinee = str_of(&cx, form.at(&cx, 1usize));
         return Terminator::Switch.(scrutinee, parse_type(&cx, form.at(&cx, 2usize)), arms, pos);
     }
-    fail_text_on(&cx, Out::new(&cx).put(&cx, "unknown terminator ").add(&cx, str_of(&cx, head)).done(&cx), form)
+    fail_text_on(&cx, text_of(&cx, Buffer::new().push_static("unknown terminator ").push_bytes(&cx, str_of(&cx, head))), form)
 }
 
 forall 'k.
@@ -777,7 +780,7 @@ fn parse_program(&cx: Cx!['k], source: Text['k]) -> Program['k] {
             let name = str_of(&cx, rest.get(&cx, 0usize));
             program.datas.set(&cx, name, Data.{ name, ty: parse_type(&cx, rest.get(&cx, 1usize)), init: rest.get(&cx, 2usize), home });
         } else {
-            fail_text_on(&cx, Out::new(&cx).put(&cx, "unknown declaration ").add(&cx, str_of(&cx, head)).done(&cx), form);
+            fail_text_on(&cx, text_of(&cx, Buffer::new().push_static("unknown declaration ").push_bytes(&cx, str_of(&cx, head))), form);
         }
         n = n + 1usize;
     }
@@ -792,32 +795,32 @@ fn parse_program(&cx: Cx!['k], source: Text['k]) -> Program['k] {
 
 forall 'k.
 fn cannot(&cx: Cx!['k], what: Text['k]) -> ! {
-    fail(&cx, Out::new(&cx).put(&cx, "cannot write ").add(&cx, what).put(&cx, " as KURS").done(&cx))
+    fail(&cx, text_of(&cx, Buffer::new().push_static("cannot write ").push_bytes(&cx, what).push_static(" as KURS")))
 }
 
 // `t` as a string literal.
 forall 'k.
 fn write_string(&cx: Cx!['k], t: Text['k]) -> Text['k] {
-    let out = Out::new(&cx).byte(&cx, b'"');
+    var out = Buffer::new().push_byte(b'"');
     var i = 0usize;
     while i < t.len() {
         let c = t.byte(&cx, i);
-        let unit = if c == b'\n' {
-            out.put(&cx, "\\n")
+        out = if c == b'\n' {
+            out.push_static("\\n")
         } else if c == b'\t' {
-            out.put(&cx, "\\t")
+            out.push_static("\\t")
         } else if c == b'\r' {
-            out.put(&cx, "\\r")
+            out.push_static("\\r")
         } else if c == b'\\' || c == b'"' {
-            out.byte(&cx, b'\\').byte(&cx, c)
+            out.push_byte(b'\\').push_byte(c)
         } else if c < 32u8 || c == 127u8 {
             hex_escape(&cx, out, c)
         } else {
-            out.byte(&cx, c)
+            out.push_byte(c)
         };
         i = i + 1usize;
     }
-    out.byte(&cx, b'"').done(&cx)
+    text_of(&cx, out.push_byte(b'"'))
 }
 
 // `t` as an atom, or as a string literal when it is not a single word.
@@ -835,16 +838,16 @@ fn write_atom(&cx: Cx!['k], t: Text['k]) -> Text['k] {
 
 forall 'k.
 fn form_text(&cx: Cx!['k], parts: Seq[Text['k], 'k]) -> Text['k] {
-    let out = Out::new(&cx).byte(&cx, b'(');
+    var out = Buffer::new().push_byte(b'(');
     var i = 0usize;
     while i < parts.len(&cx) {
         if i > 0usize {
-            let unit = out.byte(&cx, b' ');
+            out = out.push_byte(b' ');
         }
-        let unit = out.add(&cx, parts.get(&cx, i));
+        out = out.push_bytes(&cx, parts.get(&cx, i));
         i = i + 1usize;
     }
-    out.byte(&cx, b')').done(&cx)
+    text_of(&cx, out.push_byte(b')'))
 }
 
 // `(head part*)`
@@ -916,7 +919,7 @@ fn write_type(&cx: Cx!['k], ty: Type['k]) -> Text['k] {
         Type::Struct(fields) => headed(&cx, "struct", members(&cx, fields)),
         Type::Enum(variants) => headed(&cx, "enum", members(&cx, variants)),
         Type::Tuple(elems) => headed(&cx, "tuple", write_types(&cx, elems)),
-        Type::Array(elem, length) => headed(&cx, "array", Seq::two(&cx, write_type(&cx, elem.get(&cx)), Out::new(&cx).u64(&cx, length).done(&cx))),
+        Type::Array(elem, length) => headed(&cx, "array", Seq::two(&cx, write_type(&cx, elem.get(&cx)), text_of(&cx, Buffer::new().push_u64(length)))),
         Type::Ptr(inner) => headed(&cx, "builtin::Pointer", Seq::one(&cx, write_type(&cx, inner.get(&cx)))),
         Type::Brand(brand) => match brand.get(&cx) {
             Type::Skolem(label) => headed(&cx, "builtin::Brand", Seq::one(&cx, brand_atom(&cx, label))),
@@ -930,8 +933,8 @@ fn write_type(&cx: Cx!['k], ty: Type['k]) -> Text['k] {
                 parts.push(&cx, text(&cx, "(unsafe)"));
             }
             if f.quantified.len(&cx) > 0usize {
-                parts.push(&cx, Out::new(&cx).put(&cx, "(").add(&cx, write_forall(&cx, f.quantified, Seq::new(&cx))).put(&cx, " ").add(&cx, write_type(&cx, f.ret.get(&cx)))
-                    .put(&cx, " ").add(&cx, write_ptypes(&cx, f.params, f.places)).put(&cx, ")").done(&cx));
+                parts.push(&cx, text_of(&cx, Buffer::new().push_static("(").push_bytes(&cx, write_forall(&cx, f.quantified, Seq::new(&cx))).push_static(" ").push_bytes(&cx, write_type(&cx, f.ret.get(&cx)))
+                    .push_static(" ").push_bytes(&cx, write_ptypes(&cx, f.params, f.places)).push_static(")")));
             } else {
                 parts.push(&cx, write_ptypes(&cx, f.params, f.places));
                 parts.push(&cx, write_type(&cx, f.ret.get(&cx)));
@@ -1034,7 +1037,7 @@ fn write_forall(&cx: Cx!['k], params: Seq[Param['k], 'k], premises: Seq[Premise[
         bounds.push(&cx, form_text(&cx, parts));
         i = i + 1usize;
     }
-    Out::new(&cx).put(&cx, "forall ").add(&cx, form_text(&cx, names)).put(&cx, " ").add(&cx, form_text(&cx, bounds)).done(&cx)
+    text_of(&cx, Buffer::new().push_static("forall ").push_bytes(&cx, form_text(&cx, names)).push_static(" ").push_bytes(&cx, form_text(&cx, bounds)))
 }
 
 // `name` or `(name T*)`: a callee, mapper, function-value name or edge target.
@@ -1198,16 +1201,16 @@ fn write_block(&cx: Cx!['k], block: Block['k], indent: Text['k]) -> Seq[Text['k]
 // The parts, separated by spaces.
 forall 'k.
 fn join(&cx: Cx!['k], parts: Seq[Text['k], 'k]) -> Text['k] {
-    let out = Out::new(&cx);
+    var out = Buffer::new();
     var i = 0usize;
     while i < parts.len(&cx) {
         if i > 0usize {
-            let unit = out.byte(&cx, b' ');
+            out = out.push_byte(b' ');
         }
-        let unit = out.add(&cx, parts.get(&cx, i));
+        out = out.push_bytes(&cx, parts.get(&cx, i));
         i = i + 1usize;
     }
-    out.done(&cx)
+    text_of(&cx, out)
 }
 
 // `(HEAD... NAME RET (PTYPES) (locals ...)? BLOCK+)`, forall-wrapped from RET on when generic.
@@ -1237,7 +1240,7 @@ fn write_fun(&cx: Cx!['k], fun: Fun['k], head: Seq[Text['k], 'k], indent: Text['
 
 forall 'k.
 fn write_module(&cx: Cx!['k], home: ModuleId['k]) -> Text['k] {
-    let parts = Seq::two(&cx, text(&cx, "module"), Out::new(&cx).usize(&cx, home.package).done(&cx));
+    let parts = Seq::two(&cx, text(&cx, "module"), text_of(&cx, Buffer::new().push_usize(home.package)));
     parts.append(&cx, atoms(&cx, home.path));
     form_text(&cx, parts)
 }
@@ -1296,7 +1299,7 @@ fn write_type_decl(&cx: Cx!['k], decl: TypeDecl['k]) -> Text['k] {
     };
     var body = write_type(&cx, decl.body);
     if !decl.params.is_empty(&cx) || !decl.premises.is_empty(&cx) {
-        body = Out::new(&cx).put(&cx, "(").add(&cx, write_forall(&cx, decl.params, decl.premises)).put(&cx, " ").add(&cx, body).put(&cx, ")").done(&cx);
+        body = text_of(&cx, Buffer::new().push_static("(").push_bytes(&cx, write_forall(&cx, decl.params, decl.premises)).push_static(" ").push_bytes(&cx, body).push_static(")"));
     }
     let name = if decl.linear { decl.name.concat(&cx, text(&cx, "!")) } else { decl.name };
     let parts = in_clause(&cx, decl.home, policy);
@@ -1309,7 +1312,7 @@ forall 'k.
 fn write_extern(&cx: Cx!['k], ext: Extern['k]) -> Text['k] {
     let ret = match ext.ret {
         Option::Some(t) => write_type(&cx, t),
-        Option::None => cannot(&cx, Out::new(&cx).put(&cx, "the extern ").add(&cx, ext.name).put(&cx, " without a type").done(&cx)),
+        Option::None => cannot(&cx, text_of(&cx, Buffer::new().push_static("the extern ").push_bytes(&cx, ext.name).push_static(" without a type"))),
     };
     match ext.ptypes {
         Option::None => {
@@ -1374,7 +1377,7 @@ forall 'k.
 fn write_instance(&cx: Cx!['k], inst: Instance['k]) -> Seq[Text['k], 'k] {
     var head = form_text(&cx, write_types(&cx, inst.head));
     if !inst.params.is_empty(&cx) || !inst.premises.is_empty(&cx) {
-        head = Out::new(&cx).put(&cx, "(").add(&cx, write_forall(&cx, inst.params, inst.premises)).put(&cx, " ").add(&cx, head).put(&cx, ")").done(&cx);
+        head = text_of(&cx, Buffer::new().push_static("(").push_bytes(&cx, write_forall(&cx, inst.params, inst.premises)).push_static(" ").push_bytes(&cx, head).push_static(")"));
     }
     let first = Seq::one(&cx, text(&cx, "instance"));
     first.append(&cx, in_clause(&cx, inst.home, Option::None));
@@ -1385,7 +1388,7 @@ fn write_instance(&cx: Cx!['k], inst: Instance['k]) -> Seq[Text['k], 'k] {
     while i < inst.methods.len(&cx) {
         let method = inst.methods.get(&cx, i);
         if !same_module(&cx, method.home, inst.home) {
-            cannot(&cx, Out::new(&cx).put(&cx, "the method ").add(&cx, method.name).put(&cx, " of an instance of ").add(&cx, inst.trait_name).put(&cx, " from another module").done(&cx));
+            cannot(&cx, text_of(&cx, Buffer::new().push_static("the method ").push_bytes(&cx, method.name).push_static(" of an instance of ").push_bytes(&cx, inst.trait_name).push_static(" from another module")));
         }
         let method_head = Seq::one(&cx, text(&cx, "fun"));
         if method.is_unsafe {
@@ -1445,11 +1448,11 @@ fn write_program(&cx: Cx!['k], program: Program['k]) -> Text['k] {
         }
         i = i + 1usize;
     }
-    let out = Out::new(&cx);
+    var out = Buffer::new();
     i = 0usize;
     while i < lines.len(&cx) {
-        let unit = out.add(&cx, lines.get(&cx, i)).byte(&cx, b'\n');
+        out = out.push_bytes(&cx, lines.get(&cx, i)).push_byte(b'\n');
         i = i + 1usize;
     }
-    out.done(&cx)
+    text_of(&cx, out)
 }

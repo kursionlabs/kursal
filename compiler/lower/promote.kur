@@ -5,7 +5,8 @@
 // and rebuilt; lends use a generic value adapter. Sum refinements and opened root views require a
 // further representation extension.
 
-use package::support::base::{Cell, Cx, Map, Out, Seq, Set, Text, text};
+use package::support::base::{Cell, Cx, Map, Seq, Set, Text, text, text_of};
+use std::bytes::buffer::Buffer;
 use package::check::checker::overlap;
 use package::kurs::core::{Binding, Block, Edge, Fun, Instr, Kind, Param, Premise, Terminator, Type};
 use package::kurs::core as C;
@@ -78,7 +79,7 @@ impl Promotion['k] {
         var name = text(&cx, "");
         var going = true;
         while going {
-            name = Out::new(&cx).put(&cx, "%#contents").u64(&cx, self.serial.get(&cx)).done(&cx);
+            name = text_of(&cx, Buffer::new().push_static("%#contents").push_u64(self.serial.get(&cx)));
             self.serial.set(&cx, self.serial.get(&cx) + 1u64);
             going = self.taken.has(&cx, name);
         }
@@ -91,8 +92,8 @@ impl Promotion['k] {
     }
 
     fn unsupported(self, &cx: Cx!['k], path: Text['k]) -> ! {
-        self.r.fail(&cx, Out::new(&cx).put(&cx, "frontend limitation: locally branded value ").add(&cx, path)
-            .put(&cx, " requires structural SSA lowering; pass it by value to a generic function").done(&cx), self.fun.pos)
+        self.r.fail(&cx, text_of(&cx, Buffer::new().push_static("frontend limitation: locally branded value ").push_bytes(&cx, path)
+            .push_static(" requires structural SSA lowering; pass it by value to a generic function")), self.fun.pos)
     }
 
     fn expose(self, &cx: Cx!['k], path: Text['k]) {
@@ -107,7 +108,7 @@ impl Promotion['k] {
                 Type::Tuple(elems) => {
                     var k = 0usize;
                     while k < elems.len(&cx) {
-                        fields.push(&cx, Binding.{ name: Out::new(&cx).usize(&cx, k).done(&cx), type: elems.get(&cx, k) });
+                        fields.push(&cx, Binding.{ name: text_of(&cx, Buffer::new().push_usize(k)), type: elems.get(&cx, k) });
                         k = k + 1usize;
                     }
                 },
@@ -123,7 +124,7 @@ impl Promotion['k] {
             let children: Seq[Binding['k], 'k] = Seq::new(&cx);
             var k = 0usize;
             while k < fields.len(&cx) {
-                let child = Out::new(&cx).add(&cx, parent).put(&cx, ".").add(&cx, fields.get(&cx, k).name).done(&cx);
+                let child = text_of(&cx, Buffer::new().push_bytes(&cx, parent).push_static(".").push_bytes(&cx, fields.get(&cx, k).name));
                 children.push(&cx, Binding.{ name: child, type: fields.get(&cx, k).type });
                 self.path_types.set(&cx, child, fields.get(&cx, k).type);
                 k = k + 1usize;
@@ -207,7 +208,7 @@ impl Promotion['k] {
     fn read(self, &cx: Cx!['k], w: Rewrite['k], path: Text['k]) -> Text['k] {
         match w.contents.get(&cx, path) {
             Option::Some(v) => v,
-            Option::None => self.r.fail(&cx, Out::new(&cx).put(&cx, "locally branded value ").add(&cx, path).put(&cx, " is unavailable").done(&cx), self.fun.pos),
+            Option::None => self.r.fail(&cx, text_of(&cx, Buffer::new().push_static("locally branded value ").push_bytes(&cx, path).push_static(" is unavailable")), self.fun.pos),
         }
     }
 
@@ -260,7 +261,7 @@ impl Promotion['k] {
     fn value(self, &cx: Cx!['k], w: Rewrite['k], name: Text['k]) -> Text['k] {
         if name.starts_with(&cx, text(&cx, "&*")) {
             let inner = name.from(2usize);
-            return Out::new(&cx).put(&cx, "&*").add(&cx, w.aliases.get_or(&cx, inner, inner)).done(&cx);
+            return text_of(&cx, Buffer::new().push_static("&*").push_bytes(&cx, w.aliases.get_or(&cx, inner, inner)));
         }
         w.aliases.get_or(&cx, name, name)
     }
@@ -368,15 +369,15 @@ impl Promotion['k] {
             generic.push(&cx, Param.{ name: w.brands.get(&cx, k), kind: Kind::Brand });
             k = k + 1usize;
         }
-        var name = Out::new(&cx).add(&cx, self.fun.name).put(&cx, "#lend").add(&cx, self.fresh(&cx).from(1usize)).done(&cx);
+        var name = text_of(&cx, Buffer::new().push_bytes(&cx, self.fun.name).push_static("#lend").push_bytes(&cx, self.fresh(&cx).from(1usize)));
         while self.types.program.funs.has(&cx, name) {
-            name = Out::new(&cx).add(&cx, name).put(&cx, "_").done(&cx);
+            name = text_of(&cx, Buffer::new().push_bytes(&cx, name).push_static("_"));
         }
         let argument_names: Seq[Text['k], 'k] = Seq::new(&cx);
         k = 0usize;
         while k < operands.len(&cx) {
             let p = operands.get(&cx, k);
-            argument_names.push(&cx, Out::new(&cx).put(&cx, if p.starts_with(&cx, text(&cx, "&")) && !self.restricted(&cx, p) { "&a" } else { "%a" }).usize(&cx, k).done(&cx));
+            argument_names.push(&cx, text_of(&cx, Buffer::new().push_static(if p.starts_with(&cx, text(&cx, "&")) && !self.restricted(&cx, p) { "&a" } else { "%a" }).push_usize(k)));
             k = k + 1usize;
         }
         let bindings: Seq[Binding['k], 'k] = Seq::new(&cx);
@@ -404,9 +405,9 @@ impl Promotion['k] {
         k = 0usize;
         while k < borrowed.len(&cx) {
             let b = borrowed.get(&cx, k);
-            let slot = Out::new(&cx).put(&cx, "&slot").usize(&cx, b).done(&cx);
+            let slot = text_of(&cx, Buffer::new().push_static("&slot").push_usize(b));
             locals.push(&cx, Binding.{ name: slot, type: ptypes.get(&cx, b) });
-            body.push(&cx, instr(&cx, Seq::one(&cx, Out::new(&cx).put(&cx, "%unit").usize(&cx, b).done(&cx)), "store", Seq::two(&cx, slot, argument_names.get(&cx, b)), Option::None, ins.pos));
+            body.push(&cx, instr(&cx, Seq::one(&cx, text_of(&cx, Buffer::new().push_static("%unit").push_usize(b))), "store", Seq::two(&cx, slot, argument_names.get(&cx, b)), Option::None, ins.pos));
             forwarded.set(&cx, b, slot);
             k = k + 1usize;
         }
@@ -426,10 +427,10 @@ impl Promotion['k] {
             k = 0usize;
             while k < borrowed.len(&cx) {
                 let b = borrowed.get(&cx, k);
-                let n = Out::new(&cx).put(&cx, "%restored").usize(&cx, b).done(&cx);
+                let n = text_of(&cx, Buffer::new().push_static("%restored").push_usize(b));
                 restored.push(&cx, n);
                 elems.push(&cx, ptypes.get(&cx, b));
-                body.push(&cx, instr(&cx, Seq::one(&cx, n), "load", Seq::one(&cx, Out::new(&cx).put(&cx, "&slot").usize(&cx, b).done(&cx)), Option::None, ins.pos));
+                body.push(&cx, instr(&cx, Seq::one(&cx, n), "load", Seq::one(&cx, text_of(&cx, Buffer::new().push_static("&slot").push_usize(b))), Option::None, ins.pos));
                 k = k + 1usize;
             }
             elems.push(&cx, result);
@@ -664,7 +665,7 @@ fn promote_locals(&cx: Cx!['k], fun: Fun['k], types: Types['k], params: Seq[Para
                 var z = 0usize;
                 while !emptied && z < block.empty.len(&cx) {
                     let e = block.empty.get(&cx, z);
-                    emptied = leaf.eq(&cx, e) || leaf.starts_with(&cx, Out::new(&cx).add(&cx, e).put(&cx, ".").done(&cx));
+                    emptied = leaf.eq(&cx, e) || leaf.starts_with(&cx, text_of(&cx, Buffer::new().push_bytes(&cx, e).push_static(".")));
                     z = z + 1usize;
                 }
                 if !emptied {
