@@ -19,6 +19,9 @@ produce the same output.
 | `sigs` | `sigs.py` | signatures: type declarations, function, method, extern and trait signatures, instances, folded constants |
 | `sigdump` | | signatures as text, for comparison with the reference |
 | `kurs` | `kurs.py` | serialized KURS: its reader and writer |
+| `check` | `check.py` | the KURS checker; it records every SSA value's type by `FunKey` |
+| `mangle`, `cgen` | `mangle.py`, `cgen.py` | symbol names (with SHA-256); checked KURS to C |
+| `readable` | `readable.py` | readable KURS |
 | `main` | `__main__.py` | the command line |
 | `selftest` | | `kursalc selftest-types`, the type modules on small cases, for the tests |
 
@@ -31,11 +34,18 @@ uv run python tools/build.py ../compiler /tmp/kursalc --times   # build with the
 /tmp/kursalc parse ../examples/lisp/lib.kur                      # one command of the compiler
 uv run python tools/build.py ../examples/wc /tmp/wc --kurs /tmp/wc.kurs   # also write its KURS
 /tmp/kursalc kurs /tmp/wc.kurs                                   # read KURS and write it back
+/tmp/kursalc check /tmp/wc.kurs                                  # check it: silent when it is sound
+/tmp/kursalc c /tmp/wc.kurs --entry example_wc::main             # its C, as `python -m kursal --emit-c`
+/tmp/kursalc readable /tmp/wc.kurs                               # readable KURS
 uv run python tools/test.py tests.test_compiler                  # compare with the reference compiler
 ```
 
 `tests/test_compiler.py` builds the compiler once per change to its sources (cached in
-`reference-compiler/.build/`) and compares its output with the reference compiler's.
+`reference-compiler/.build/`) and compares its output with the reference compiler's. It also caches
+there every package's lowered KURS with the reference's C and readable KURS for it, and the core
+programs the reference's other test modules check (gathered by running those tests with
+`check_program` watched) with the reference's verdicts. Each run of the compiler is limited to 6 GB of
+address space and a timeout.
 
 ## Storage
 
@@ -59,6 +69,10 @@ no brands, and read like the Python it translates.
 | `Optional[T]` | `Option[T]` |
 | a recursive field | `Cell[T]` (or a `Seq`), so the type has a finite size |
 
+Nothing is freed, so a loop that builds throwaway values on every step costs memory for good. In a
+hot loop, read a map's or set's keys in place with `positions` and `entry` rather than copying them
+with `keys` or `items`, and compare text without splitting it.
+
 Map keys need an instance of `base::Key`; `Text`, `u32`, `usize`, `bool`, 2- and 3-tuples and
 `Seq`s of keys have one, and `core` adds `Type`, `Param`, `Premise` and `ModuleId`. `core::same` is
 structural type equality (Python's `==` on frozen dataclasses), `core::hash` its hash.
@@ -79,7 +93,8 @@ stands for no position.
 
 `types.fresh` numbers renamed binders (`a#3`) from one counter for the whole compilation. Here that
 counter is a `types::Fresh`, made once and passed to everything that may rename a binder: `subst`,
-`unify`, `match_head`, `Types`, `Formation`, `check_type_expansion`, `check_coherence`, `Signatures`. Passing the
+`unify`, `match_head`, `Types`, `Formation`, `check_type_expansion`, `check_coherence`, `Signatures`,
+`check_program`, `emit_c`, `emit_kurs`. Passing the
 same one everywhere numbers names as the reference compiler does.
 
 Where the reference wraps a phase in `with resolver.located(module, pos):`, call

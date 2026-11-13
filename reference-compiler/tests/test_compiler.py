@@ -5,18 +5,23 @@ every package in the repository to the same names, and rejects bad packages with
 it gives every package the same signatures, types and constant values, and rejects bad declarations
 with the same message;
 its KURS reader and writer read every lowered program and write it back as this compiler's writer
-does, and reject malformed KURS with the same message."""
+does, and reject malformed KURS with the same message; its checker accepts and rejects, with the same
+message, every core program this compiler's own tests check; and from every lowered program it writes
+the same C and the same readable KURS."""
 
 import dataclasses
 import hashlib
+import importlib
 import itertools
+import json
 import os
 import resource
 import subprocess
 import sys
 import tempfile
 import unittest
-from concurrent.futures import ProcessPoolExecutor
+from collections.abc import Callable
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -36,13 +41,53 @@ from kursal.core import ModuleId
 from kursal.resolve import LIB, Decl, Resolver, resolve
 from kursal.kurs import (_form, _write_ptypes, parse_program, write_atom, write_forall, write_program, write_type,
                          write_type_decl)
+from kursal.cgen import emit_c
+from kursal.check import check_program
 from kursal.lower import lower
+from kursal.readable import emit_kurs
 from kursal.sigs import ConstValue, Sig, Signatures, signatures
 from tests.test_kurs import CANONICAL, VARIANTS, packages
 
 ROOT = Path(__file__).resolve().parents[2]
 COMPILER = ROOT / "compiler"
 CACHE = Path(__file__).resolve().parents[1] / ".build"
+TESTS = Path(__file__).resolve().parent
+# Every run of the Kursal compiler is bounded: it frees nothing, so a runaway would take the machine's
+# memory.
+MEMORY_LIMIT = 6 << 30
+TIME_LIMIT = 600
+
+
+def limit_memory() -> None:
+    resource.setrlimit(resource.RLIMIT_AS, (MEMORY_LIMIT, MEMORY_LIMIT))
+
+
+def run_kursalc(binary: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([str(binary), *args], capture_output=True, text=True, timeout=TIME_LIMIT,
+                          preexec_fn=limit_memory, env=dict(os.environ, KURSAL_LIB=str(LIB)))
+
+
+def digest_of(paths: list[Path]) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(paths):
+        digest.update(str(path.relative_to(ROOT)).encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:16]
+
+
+def cached(stem: str, key: str, make: Callable[[], list]) -> list:
+    """`make()`, a JSON value, kept in .build/ as STEM-KEY.json until KEY changes."""
+    path = CACHE / f"{stem}-{key}.json"
+    if path.exists():
+        return json.loads(path.read_text())
+    value = make()
+    CACHE.mkdir(exist_ok=True)
+    for old in CACHE.glob(f"{stem}-*.json"):
+        old.unlink()
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value))
+    temporary.replace(path)
+    return value
 
 
 def build_compiler() -> Path:
@@ -471,14 +516,125 @@ KURS_ERRORS = (
 )
 
 
-def serialized(package: Path) -> tuple[str, Optional[str]]:
-    """(package, its lowered program as KURS, or None if it does not build)."""
+def fresh_result(make: Callable[[], str]) -> str:
+    """`make()`, or `error: ` and the KursError it raises, with fresh names numbered from 0 as one run of
+    the Kursal compiler numbers them."""
+    T._fresh = itertools.count()
+    try:
+        return make()
+    except KursError as error:
+        return f"error: {error}"
+
+
+def serialized(package: Path) -> Optional[dict[str, Optional[str]]]:
+    """A package's lowered program as KURS, the function its executable enters, and what this compiler
+    makes of that KURS: its C and its readable form. None if the package does not build."""
     sys.setrecursionlimit(20000)
     try:
         resolver = resolve(package)
-        return package.name, write_program(lower(resolver, signatures(resolver)))
+        sigs = signatures(resolver)
+        text = write_program(lower(resolver, sigs))
     except KursError:
-        return package.name, None
+        return None
+    entry_decl = resolver.packages[0].entry_decl
+    entry = sigs.name(entry_decl) if entry_decl is not None else None
+
+    def c() -> str:
+        program = parse_program(text)
+        return emit_c(program, check_program(program), entry)
+
+    return {"name": package.name, "kurs": text, "entry": entry, "c": fresh_result(c),
+            "readable": fresh_result(lambda: emit_kurs(parse_program(text)))}
+
+
+def lowered_programs() -> list[dict[str, Optional[str]]]:
+    """`serialized` for every package that builds, computed once per change to the sources."""
+    sources = [*(ROOT / "lib").rglob("*.kur"), *(ROOT / "lib").rglob("*.toml"), *(ROOT / "examples").rglob("*.kur"),
+               *(ROOT / "examples").rglob("*.toml"), *(ROOT / "reference-compiler/kursal").glob("*.py")]
+
+    def make() -> list:
+        with ProcessPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
+            return [p for p in pool.map(serialized, packages()) if p is not None]
+
+    return cached("lowered", digest_of(sources), make)
+
+
+def recorded_programs(module_name: str) -> list[str]:
+    """The core programs a test module checks, as KURS: its tests run with `check_program` and
+    `parse_program` watched. A program checked as it was read is its own text, so positions stay as the
+    test wrote them; any other is written out."""
+    sys.setrecursionlimit(20000)
+    module = importlib.import_module(module_name)
+    texts: dict[int, str] = {}
+    found: list[str] = []
+    real_parse, real_check = module.__dict__.get("parse_program"), module.__dict__.get("check_program")
+
+    def parse(text, *args, **kwargs):
+        program = real_parse(text, *args, **kwargs)
+        texts[id(program)] = text
+        return program
+
+    def check(program, *args, **kwargs):
+        try:
+            written = write_program(program)
+            original = texts.get(id(program))
+            found.append(original if original is not None and write_program(parse_program(original)) == written
+                         else written)
+        except Exception:  # noqa: BLE001 - a program the writer cannot write is not recorded
+            pass
+        return real_check(program, *args, **kwargs)
+
+    if real_parse is not None:
+        module.parse_program = parse
+    if real_check is not None:
+        module.check_program = check
+    unittest.TestLoader().loadTestsFromModule(module).run(unittest.TestResult())
+    return found
+
+
+def checked_case(text: str) -> Optional[dict[str, Optional[str]]]:
+    """This compiler's verdict on a core program, with its message for one it rejects; for one it
+    accepts, its C (of every root function, as without an entry) and its readable form. None if the
+    program is not read, or checking it crashes rather than ending in a verdict."""
+    try:
+        program = parse_program(text)
+    except KursError:
+        return None
+    T._fresh = itertools.count()
+    try:
+        checker = check_program(program)
+    except KursError as error:
+        # An array length is unsigned in the Kursal compiler's core, so it rejects a negative one as it
+        # reads the program, with the reader's message.
+        if str(error) == "type formation: negative array length":
+            return None
+        return {"kurs": text, "check": str(error), "c": None, "readable": None}
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        c: Optional[str] = fresh_result(lambda: emit_c(program, checker))
+    except Exception:  # noqa: BLE001
+        c = None
+    try:
+        readable: Optional[str] = fresh_result(lambda: emit_kurs(parse_program(text)))
+    except Exception:  # noqa: BLE001
+        readable = None
+    return {"kurs": text, "check": None, "c": c, "readable": readable}
+
+
+def core_cases() -> list[dict[str, Optional[str]]]:
+    """Every distinct core program the other test modules check, with `checked_case`'s verdict."""
+    modules = sorted(path.stem for path in TESTS.glob("test_*.py") if "check_program" in path.read_text()
+                     and path.stem not in ("test_compiler", "test_examples", "test_library", "test_kurs"))
+
+    def make() -> list:
+        with ProcessPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
+            found = pool.map(recorded_programs, [f"tests.{module}" for module in modules])
+            texts = list(dict.fromkeys(text for group in found for text in group))
+            return [case for case in pool.map(checked_case, texts, chunksize=16) if case is not None]
+
+    sources = [*TESTS.glob("*.py"), *(ROOT / "reference-compiler/kursal").glob("*.py")]
+    return cached("core", digest_of(sources), make)
 
 
 # Cases for `kursalc selftest-types`; compiler/selftest.kur describes their forms.
@@ -787,19 +943,22 @@ def type_case(case: str) -> str:
     raise ValueError(f"unknown case {op}")
 
 
-def limit_memory() -> None:
-    """Caps a compiler process's address space at 4 GB, so a runaway one fails instead of exhausting the machine."""
-    resource.setrlimit(resource.RLIMIT_AS, (4 << 30, 4 << 30))
-
-
 class CompilerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.binary = build_compiler()
 
     def run_compiler(self, *args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([str(self.binary), *args], capture_output=True, text=True, timeout=600,
-                              env=dict(os.environ, KURSAL_LIB=str(LIB)), preexec_fn=limit_memory)
+        return run_kursalc(self.binary, *args)
+
+    def run_all(self, runs: list[tuple[str, ...]]) -> list[subprocess.CompletedProcess[str]]:
+        """Each run's result, in order; the runs go in parallel."""
+        with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
+            return list(pool.map(lambda args: self.run_compiler(*args), runs))
+
+    @staticmethod
+    def outcome(result: subprocess.CompletedProcess[str]) -> str:
+        return result.stdout if result.returncode == 0 else f"error: {result.stderr.strip()}"
 
     def compiler_resolution(self, path: Path) -> str:
         result = self.run_compiler("resolve", str(path))
@@ -830,7 +989,7 @@ class CompilerTests(unittest.TestCase):
                                             env=dict(os.environ, KURSAL_LIB=str(LIB)))
                            for path in paths[start:start + workers]]
                 for process in running:
-                    stdout, stderr = process.communicate(timeout=600)
+                    stdout, stderr = process.communicate(timeout=TIME_LIMIT)
                     results.append(stdout if process.returncode == 0 else f"error: {stderr.strip()}")
             for path, want, got in zip(paths, expected, results):
                 with self.subTest(path=str(path)):
@@ -922,8 +1081,7 @@ class CompilerTests(unittest.TestCase):
         cases = [("canonical", CANONICAL, CANONICAL)]
         cases += [(f"variant{i}", CANONICAL.replace(canonical, variant), CANONICAL)
                   for i, (canonical, variant) in enumerate(VARIANTS)]
-        with ProcessPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
-            programs = [(name, text, text) for name, text in pool.map(serialized, packages()) if text is not None]
+        programs = [(p["name"], p["kurs"], p["kurs"]) for p in lowered_programs()]
         self.assertGreaterEqual(len(programs), 50)
         with tempfile.TemporaryDirectory() as directory:
             for name, text, expected in cases + programs:
@@ -933,6 +1091,50 @@ class CompilerTests(unittest.TestCase):
                     result = self.run_compiler("kurs", str(path))
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout, expected)
+
+    def test_c_and_readable_match_reference(self):
+        """Every package that builds: the C of its lowered program, entered as its executable is, and
+        its readable KURS."""
+        programs = lowered_programs()
+        self.assertGreaterEqual(len(programs), 50)
+        with tempfile.TemporaryDirectory() as directory:
+            runs: list[tuple[str, ...]] = []
+            for program in programs:
+                path = Path(directory) / f"{program['name']}.kurs"
+                path.write_text(program["kurs"])
+                entry = ("--entry", program["entry"]) if program["entry"] else ()
+                runs += [("c", str(path), *entry), ("readable", str(path))]
+            results = self.run_all(runs)
+        for index, program in enumerate(programs):
+            with self.subTest(package=program["name"]):
+                self.assertEqual(self.outcome(results[2 * index]), program["c"])
+                self.assertEqual(self.outcome(results[2 * index + 1]), program["readable"])
+
+    def test_checker_matches_reference(self):
+        """Every core program the reference's own tests check: the same verdict, with the same message
+        for one it rejects; for one it accepts, the same C and readable KURS."""
+        cases = core_cases()
+        rejected = [case for case in cases if case["check"] is not None]
+        self.assertGreater(len(rejected), 150)
+        self.assertGreater(len(cases) - len(rejected), 100)
+        with tempfile.TemporaryDirectory() as directory:
+            runs: list[tuple[str, ...]] = []
+            for index, case in enumerate(cases):
+                path = Path(directory) / f"case{index}.kurs"
+                path.write_text(case["kurs"])
+                runs += [("check", str(path)), ("c", str(path)), ("readable", str(path))]
+            results = self.run_all(runs)
+        for index, case in enumerate(cases):
+            with self.subTest(case=index, kurs=case["kurs"]):
+                check, c, readable = results[3 * index: 3 * index + 3]
+                if case["check"] is not None:
+                    self.assertEqual((check.returncode, check.stderr.strip()), (1, case["check"]))
+                    continue
+                self.assertEqual((check.returncode, check.stdout, check.stderr), (0, "", ""))
+                if case["c"] is not None:
+                    self.assertEqual(self.outcome(c), case["c"])
+                if case["readable"] is not None:
+                    self.assertEqual(self.outcome(readable), case["readable"])
 
     def test_kurs_errors_match_reference(self):
         with tempfile.TemporaryDirectory() as directory:

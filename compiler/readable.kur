@@ -1,0 +1,655 @@
+// Readable rendering of typed KURS; the interchange reader remains `kurs`.
+//
+// This is a display format, not an alternate checker or a reconstruction from C.
+
+use package::base::{Map, Out, Seq, Set, Text, text};
+use package::core::{Binding, Edge, ExposureMode, Fun, Instr, Kind, Member, ModuleId, Param, Premise, Program, Terminator, Type};
+use package::core as C;
+use package::sexpr::Form;
+use package::syntax::no_pos;
+use package::types::{Fresh, kurs_error, subst};
+use std::option::Option;
+use std::slice::Slice;
+
+fn brand(name: Text) -> Text {
+    Out::new().put("'").add(name).done()
+}
+
+fn is_brand(kind: Kind) -> bool {
+    C::same_kind(kind, Kind::Brand)
+}
+
+fn is_copy(kind: Kind) -> bool {
+    C::same_kind(kind, Kind::Copy)
+}
+
+fn joined(parts: Seq[Text], separator: Slice[u8, 'static]) -> Text {
+    let out = Out::new();
+    var i = 0usize;
+    while i < parts.len() {
+        if i > 0usize {
+            let unit = out.put(separator);
+        }
+        let unit = out.add(parts.get(i));
+        i = i + 1usize;
+    }
+    out.done()
+}
+
+fn brands(names: Seq[Text]) -> Text {
+    let out: Seq[Text] = Seq::new();
+    var i = 0usize;
+    while i < names.len() {
+        out.push(brand(names.get(i)));
+        i = i + 1usize;
+    }
+    joined(out, ", ")
+}
+
+fn indentation(depth: usize) -> Text {
+    let out = Out::new();
+    var i = 0usize;
+    while i < depth {
+        let unit = out.put("    ");
+        i = i + 1usize;
+    }
+    out.done()
+}
+
+fn type_texts(types: Seq[Type], depth: usize) -> Seq[Text] {
+    let out: Seq[Text] = Seq::new();
+    var i = 0usize;
+    while i < types.len() {
+        out.push(type_text(types.get(i), depth));
+        i = i + 1usize;
+    }
+    out
+}
+
+fn arguments(types: Seq[Type], depth: usize) -> Text {
+    if types.is_empty() {
+        text("")
+    } else {
+        Out::new().put("[").add(joined(type_texts(types, depth), ", ")).put("]").done()
+    }
+}
+
+fn premise_text(premise: Premise) -> Text {
+    Out::new().add(premise.trait_name).put("[").add(joined(type_texts(premise.args, 0usize), ", ")).put("]").done()
+}
+
+fn quantifier(params: Seq[Param], premises: Seq[Premise]) -> Text {
+    let names: Seq[Text] = Seq::new();
+    let bounds: Seq[Text] = Seq::new();
+    var i = 0usize;
+    while i < params.len() {
+        let param = params.get(i);
+        names.push(if is_brand(param.kind) { brand(param.name) } else { param.name });
+        if is_copy(param.kind) {
+            bounds.push(Out::new().put("Copy[").add(param.name).put("]").done());
+        }
+        i = i + 1usize;
+    }
+    var j = 0usize;
+    while j < premises.len() {
+        bounds.push(premise_text(premises.get(j)));
+        j = j + 1usize;
+    }
+    if names.is_empty() && bounds.is_empty() {
+        return text("");
+    }
+    let out = Out::new().put("forall ").add(joined(names, ", "));
+    if !bounds.is_empty() {
+        let unit = out.put(" where ").add(joined(bounds, ", "));
+    }
+    out.put(". ").done()
+}
+
+fn is_binder_type(t: Type) -> bool {
+    match t {
+        Type::Exists(_binders, _body) => true,
+        Type::Foreach(_f) => true,
+        Type::Fn(_f) => true,
+        _ => false,
+    }
+}
+
+fn members_text(kind: Slice[u8, 'static], members: Seq[Member], depth: usize) -> Text {
+    if members.is_empty() {
+        return Out::new().put(kind).put(" {}").done();
+    }
+    let rows: Seq[Text] = Seq::new();
+    var i = 0usize;
+    while i < members.len() {
+        rows.push(Out::new().add(indentation(depth + 1usize)).add(members.get(i).name).put(": ")
+            .add(type_text(members.get(i).type, depth + 1usize)).put(";").done());
+        i = i + 1usize;
+    }
+    Out::new().put(kind).put(" {\n").add(joined(rows, "\n")).put("\n").add(indentation(depth)).put("}").done()
+}
+
+fn type_text(ty: Type, depth: usize) -> Text {
+    match ty {
+        Type::Prim(name) => name,
+        Type::Named(name, args) => if args.is_empty() { name } else { name.concat(arguments(args, depth)) },
+        Type::Never => text("Never"),
+        Type::Ignored => text("_"),
+        Type::Skolem(label) => brand(label),
+        Type::Brand(witness) => Out::new().put("Brand[").add(type_text(witness.get(), depth)).put("]").done(),
+        Type::Ptr(inner) => {
+            let t = type_text(inner.get(), depth);
+            if is_binder_type(inner.get()) { Out::new().put("*(").add(t).put(")").done() } else { Out::new().put("*").add(t).done() }
+        },
+        Type::Tuple(elems) => {
+            if elems.is_empty() {
+                text("unit")
+            } else {
+                Out::new().put("(").add(joined(type_texts(elems, depth), ", ")).put(if elems.len() == 1usize { "," } else { "" }).put(")").done()
+            }
+        },
+        Type::Array(elem, length) => Out::new().put("[").add(type_text(elem.get(), depth)).put("; ").u64(length).put("]").done(),
+        Type::Struct(fields) => members_text("struct", fields, depth),
+        Type::Enum(variants) => members_text("enum", variants, depth),
+        Type::Exists(binders, body) => Out::new().put("exists ").add(brands(binders)).put(". ").add(type_text(body.get(), depth)).done(),
+        Type::Foreach(f) => {
+            let inferred: Seq[Text] = match f.source.get() {
+                Type::Foreach(source) => {
+                    let names = Seq::one(source.binder);
+                    names.append(source.retained);
+                    names
+                },
+                _ => Seq::new(),
+            };
+            let retained = if f.retained.same(inferred) {
+                text("")
+            } else {
+                Out::new().put(" retain (").add(joined(f.retained, ", ")).put(")").done()
+            };
+            Out::new().put("foreach ").put(if f.indirect { "*" } else { "" }).add(f.binder).add(retained).put(" of ")
+                .add(type_text(f.source.get(), depth)).put(" => ").add(type_text(f.body.get(), depth)).done()
+        },
+        Type::Fn(f) => {
+            let modes: Seq[Text] = Seq::new();
+            var i = 0usize;
+            while i < f.params.len() {
+                modes.push(Out::new().put(if f.places.has(i) { "&" } else { "" }).add(type_text(f.params.get(i), depth)).done());
+                i = i + 1usize;
+            }
+            Out::new().add(quantifier(f.quantified, Seq::new())).put(if f.is_unsafe { "unsafe " } else { "" }).put("fn(")
+                .add(joined(modes, ", ")).put(") -> ").add(type_text(f.ret.get(), depth)).done()
+        },
+        Type::Meta(_m) => kurs_error(text("unsupported readable KURS type: an inference variable"), no_pos()),
+    }
+}
+
+fn edge_text(edge: Edge) -> Text {
+    Out::new().add(edge.target).add(arguments(edge.tys, 0usize)).put("(").add(joined(edge.args, ", ")).put(")").done()
+}
+
+fn instruction_text(instr: Instr, depth: usize, omit_unit: bool, counter: Fresh) -> Text {
+    let op = instr.op;
+    let args = instr.args;
+    let ty = match instr.ty {
+        Option::Some(t) => type_text(t, depth),
+        Option::None => text(""),
+    };
+    let literal = match instr.lit {
+        Option::Some(l) => l,
+        Option::None => text(""),
+    };
+    let lhs = if instr.lhs.len() == 1usize { instr.lhs.get(0usize) } else { Out::new().put("(").add(joined(instr.lhs, ", ")).put(")").done() };
+    let prefix = if instr.is_unsafe { text("unsafe ") } else { text("") };
+    if op.is("open") {
+        let binding = if omit_unit && args.get(0usize).starts_with(text("&")) { text("") } else { lhs.concat(text(" = ")) };
+        return Out::new().add(prefix).put("exists ").add(brands(instr.binders)).put(". ").add(binding).put("open ").add(args.get(0usize)).put(";").done();
+    }
+    let rhs = if op.is("pack") {
+        let (binders, body) = match instr.ty {
+            Option::Some(t) => match t {
+                Type::Exists(binders, body) => (binders, body.get()),
+                _ => kurs_error(text("unsupported readable instruction: a pack of a type that is not a package"), no_pos()),
+            },
+            Option::None => kurs_error(text("unsupported readable instruction: a pack without its type"), no_pos()),
+        };
+        let sub: Map[Text, Type] = Map::new();
+        var i = 0usize;
+        while i < binders.len() && i < instr.tys.len() {
+            sub.set(binders.get(i), instr.tys.get(i));
+            i = i + 1usize;
+        }
+        let payload = subst(body, sub, counter);
+        Out::new().put("pack ").add(joined(type_texts(instr.tys, 0usize), ", ")).put(". ").add(args.get(0usize)).put(" as ")
+            .add(type_text(payload, depth)).done()
+    } else if op.is("call") || op.is("fn") {
+        let out = Out::new().add(op).put(" ").add(args.get(0usize)).add(arguments(instr.tys, depth));
+        if op.is("call") {
+            let unit = out.put("(").add(joined(args.from(1usize), ", ")).put(")");
+        }
+        out.done()
+    } else if op.is("trait_call") {
+        Out::new().put("trait_call ").add(args.get(0usize)).add(arguments(instr.tys, depth)).put("::").add(args.get(1usize))
+            .put("(").add(joined(args.from(2usize), ", ")).put(")").done()
+    } else if op.is("foreach") {
+        let f = match instr.ty {
+            Option::Some(t) => match t {
+                Type::Foreach(f) => f,
+                _ => kurs_error(text("unsupported readable instruction: a foreach of a type that is not a transform"), no_pos()),
+            },
+            Option::None => kurs_error(text("unsupported readable instruction: a foreach without its type"), no_pos()),
+        };
+        Out::new().put("foreach ").put(if f.indirect { "*" } else { "" }).add(f.binder).put(" of ").add(args.get(0usize)).put(" : ")
+            .add(type_text(f.source.get(), depth)).put(" => ").add(type_text(f.body.get(), depth))
+            .put(" using ").add(args.get(1usize)).add(arguments(instr.tys, depth)).put("(").add(joined(args.from(2usize), ", ")).put(")").done()
+    } else {
+        let operands: Seq[Text] = if op.is("const") {
+            Seq::two(ty, literal)
+        } else if op.is("construct") || op.is("destruct") || op.is("variant_tag") {
+            let out = Seq::one(ty);
+            out.append(args);
+            out
+        } else if op.is("construct_variant") {
+            let out = Seq::two(ty, literal);
+            out.append(args);
+            out
+        } else if op.is("builtin::int_cast") || op.is("builtin::unsafe::cast") {
+            let out = args.copy();
+            out.push(ty);
+            out
+        } else if op.is("alloca") || op.is("builtin::sizeof") {
+            Seq::one(ty)
+        } else if instr.lit.is_some() {
+            let out = Seq::one(literal);
+            out.append(args);
+            out
+        } else if instr.ty.is_some() || !instr.tys.is_empty() || !instr.binders.is_empty() {
+            kurs_error(Out::new().put("unsupported readable instruction metadata: ").add(op).done(), no_pos())
+        } else {
+            args
+        };
+        if operands.is_empty() { op } else { Out::new().add(op).put(" ").add(joined(operands, ", ")).done() }
+    };
+    Out::new().add(prefix).add(lhs).put(" = ").add(rhs).put(";").done()
+}
+
+fn terminator_text(term: Terminator) -> Text {
+    match term {
+        Terminator::Ret(value, _pos) => Out::new().put("return ").add(value).put(";").done(),
+        Terminator::Jmp(edge, _pos) => Out::new().put("jump ").add(edge_text(edge)).put(";").done(),
+        Terminator::Jnz(cond, then, other, _pos) => Out::new().put("branch ").add(cond).put(", ").add(edge_text(then)).put(", ")
+            .add(edge_text(other)).put(";").done(),
+        Terminator::Switch(scrutinee, ty, arms, _pos) => {
+            let lines = Seq::one(Out::new().put("switch ").add(scrutinee).put(" : ").add(type_text(ty, 0usize)).put(" {").done());
+            var i = 0usize;
+            while i < arms.len() {
+                lines.push(Out::new().put("    ").add(arms.get(i).variant).put(" => ").add(edge_text(arms.get(i).edge)).put(";").done());
+                i = i + 1usize;
+            }
+            lines.push(text("}"));
+            joined(lines, "\n")
+        },
+        Terminator::Unreachable(_pos) => text("unreachable;"),
+    }
+}
+
+// `t` as a JSON string with only ASCII characters, as Python's `json.dumps` writes it.
+fn json_string(t: Text) -> Text {
+    let out = Out::new().put("\"");
+    var i = 0usize;
+    while i < t.len {
+        let b = t.byte(i);
+        let (code, count) = decode(t, i);
+        if b == b'"' {
+            let unit = out.put("\\\"");
+        } else if b == b'\\' {
+            let unit = out.put("\\\\");
+        } else if b == b'\n' {
+            let unit = out.put("\\n");
+        } else if b == b'\r' {
+            let unit = out.put("\\r");
+        } else if b == b'\t' {
+            let unit = out.put("\\t");
+        } else if b == 8u8 {
+            let unit = out.put("\\b");
+        } else if b == 12u8 {
+            let unit = out.put("\\f");
+        } else if code >= 32u32 && code < 127u32 {
+            let unit = out.byte(b);
+        } else if code >= 65536u32 {
+            let v = code - 65536u32;
+            let unit = unicode_escape(unicode_escape(out, 55296u32 + (v >> 10u32)), 56320u32 + (v & 1023u32));
+        } else {
+            let unit = unicode_escape(out, code);
+        }
+        i = i + count;
+    }
+    out.put("\"").done()
+}
+
+fn unicode_escape(out: Out, code: u32) -> Out {
+    let digits = text("0123456789abcdef");
+    out.put("\\u").byte(digits.byte(((code >> 12u32) & 15u32) as usize)).byte(digits.byte(((code >> 8u32) & 15u32) as usize))
+        .byte(digits.byte(((code >> 4u32) & 15u32) as usize)).byte(digits.byte((code & 15u32) as usize))
+}
+
+// The code point of the UTF-8 character at `i` and its length in bytes; a byte that starts no
+// well-formed character stands for itself.
+fn decode(t: Text, i: usize) -> (u32, usize) {
+    let b = t.byte(i);
+    let (count, initial) = if b < 128u8 {
+        (0usize, b as u32)
+    } else if b >= 192u8 && b < 224u8 {
+        (1usize, (b & 31u8) as u32)
+    } else if b >= 224u8 && b < 240u8 {
+        (2usize, (b & 15u8) as u32)
+    } else if b >= 240u8 && b < 248u8 {
+        (3usize, (b & 7u8) as u32)
+    } else {
+        (0usize, b as u32)
+    };
+    if i + count >= t.len && count > 0usize {
+        return (b as u32, 1usize);
+    }
+    var code = initial;
+    var k = 1usize;
+    while k <= count {
+        let c = t.byte(i + k);
+        if (c & 192u8) != 128u8 {
+            return (b as u32, 1usize);
+        }
+        code = (code << 6u32) | ((c & 63u8) as u32);
+        k = k + 1usize;
+    }
+    (code, count + 1usize)
+}
+
+fn json_list(items: Seq[Text]) -> Text {
+    let parts: Seq[Text] = Seq::new();
+    var i = 0usize;
+    while i < items.len() {
+        parts.push(json_string(items.get(i)));
+        i = i + 1usize;
+    }
+    Out::new().put("[").add(joined(parts, ", ")).put("]").done()
+}
+
+fn metadata(home: Option[ModuleId], depth: usize) -> Seq[Text] {
+    match home {
+        Option::Some(m) => Seq::one(Out::new().add(indentation(depth)).put("// owner: package ").usize(m.package).put(", module ")
+            .add(json_list(m.path)).done()),
+        Option::None => Seq::new(),
+    }
+}
+
+// `t` without trailing whitespace.
+fn rstrip(t: Text) -> Text {
+    var end = t.len;
+    while end > 0usize && (t.byte(end - 1usize) == b' ' || t.byte(end - 1usize) == b'\n' || t.byte(end - 1usize) == b'\t' || t.byte(end - 1usize) == b'\r') {
+        end = end - 1usize;
+    }
+    t.slice(0usize, end)
+}
+
+fn bindings_text(bindings: Seq[Binding], depth: usize) -> Text {
+    let parts: Seq[Text] = Seq::new();
+    var i = 0usize;
+    while i < bindings.len() {
+        parts.push(Out::new().add(bindings.get(i).name).put(": ").add(type_text(bindings.get(i).type, depth)).done());
+        i = i + 1usize;
+    }
+    joined(parts, ", ")
+}
+
+fn add_all(used: Set[Text], names: Seq[Text]) {
+    var i = 0usize;
+    while i < names.len() {
+        used.add(names.get(i));
+        i = i + 1usize;
+    }
+}
+
+fn function_lines(fun: Fun, depth: usize, counter: Fresh) -> Seq[Text] {
+    let indent = indentation(depth);
+    let lines = metadata(fun.home, depth);
+    let quant = quantifier(fun.params, fun.premises);
+    if !quant.is_empty() {
+        lines.push(indent.concat(rstrip(quant)));
+    }
+    let params = bindings_text(fun.blocks.get(0usize).params, depth);
+    lines.push(Out::new().add(indent).put(if fun.is_unsafe { "unsafe " } else { "" }).put("fn ").add(fun.name).put("(").add(params)
+        .put(") -> ").add(type_text(fun.ret, depth)).put(" {").done());
+    if !fun.locals.is_empty() {
+        lines.push(indent.concat(text("    locals {")));
+        var l = 0usize;
+        while l < fun.locals.len() {
+            lines.push(Out::new().add(indent).put("        ").add(fun.locals.get(l).name).put(": ")
+                .add(type_text(fun.locals.get(l).type, depth + 2usize)).put(";").done());
+            l = l + 1usize;
+        }
+        lines.push(indent.concat(text("    }")));
+    }
+    var index = 0usize;
+    while index < fun.blocks.len() {
+        let block = fun.blocks.get(index);
+        let block_brands = if block.brands.is_empty() { text("") } else { Out::new().put("[").add(brands(block.brands)).put("]").done() };
+        let block_params = bindings_text(block.params, depth + 1usize);
+        let header = if index == 0usize {
+            text("entry")
+        } else {
+            Out::new().put("block ").add(block.label).add(block_brands).put("(").add(block_params).put(")").done()
+        };
+        if index == 0usize && !block.label.is("entry") {
+            lines.push(Out::new().add(indent).put("    // entry label: ").add(block.label).done());
+        }
+        lines.push(Out::new().add(indent).put("    ").add(header).put(" {").done());
+        if !block.empty.is_empty() || !block.known.is_empty() || !block.opened.is_empty() {
+            lines.push(indent.concat(text("        state {")));
+            var o = 0usize;
+            while o < block.opened.len() {
+                lines.push(Out::new().add(indent).put("            open ").add(brands(block.opened.get(o).brands)).put(". ")
+                    .add(block.opened.get(o).path).put(";").done());
+                o = o + 1usize;
+            }
+            var e = 0usize;
+            while e < block.empty.len() {
+                lines.push(Out::new().add(indent).put("            empty ").add(block.empty.get(e)).put(";").done());
+                e = e + 1usize;
+            }
+            var k = 0usize;
+            while k < block.known.len() {
+                lines.push(Out::new().add(indent).put("            known ").add(block.known.get(k).path).put(" = ")
+                    .add(block.known.get(k).variant).put(";").done());
+                k = k + 1usize;
+            }
+            lines.push(indent.concat(text("        }")));
+        }
+        // Preserve a unit binding if later code actually refers to it.
+        let used: Set[Text] = Set::new();
+        var u = 0usize;
+        while u < block.instrs.len() {
+            add_all(used, block.instrs.get(u).args);
+            u = u + 1usize;
+        }
+        match block.term {
+            Terminator::Ret(value, _pos) => used.add(value),
+            Terminator::Jmp(edge, _pos) => add_all(used, edge.args),
+            Terminator::Jnz(cond, then, other, _pos) => {
+                used.add(cond);
+                add_all(used, then.args);
+                add_all(used, other.args);
+            },
+            Terminator::Switch(scrutinee, _ty, arms, _pos) => {
+                used.add(scrutinee);
+                var a = 0usize;
+                while a < arms.len() {
+                    add_all(used, arms.get(a).edge.args);
+                    a = a + 1usize;
+                }
+            },
+            Terminator::Unreachable(_pos) => (),
+        };
+        var i = 0usize;
+        while i < block.instrs.len() {
+            let instr = block.instrs.get(i);
+            var any = false;
+            var n = 0usize;
+            while n < instr.lhs.len() {
+                if used.has(instr.lhs.get(n)) {
+                    any = true;
+                }
+                n = n + 1usize;
+            }
+            lines.push(Out::new().add(indent).put("        ").add(instruction_text(instr, depth + 2usize, !any, counter)).done());
+            i = i + 1usize;
+        }
+        let term_lines = terminator_text(block.term).split(text("\n"));
+        var t = 0usize;
+        while t < term_lines.len() {
+            lines.push(Out::new().add(indent).put("        ").add(term_lines.get(t)).done());
+            t = t + 1usize;
+        }
+        lines.push(indent.concat(text("    }")));
+        index = index + 1usize;
+    }
+    lines.push(indent.concat(text("}")));
+    lines
+}
+
+fn initializer_text(form: Form) -> Text {
+    if form.is_str() {
+        return json_string(form.text);
+    }
+    if form.is_list() {
+        let parts: Seq[Text] = Seq::new();
+        var i = 0usize;
+        while i < form.len() {
+            parts.push(initializer_text(form.at(i)));
+            i = i + 1usize;
+        }
+        return Out::new().put("[").add(joined(parts, ", ")).put("]").done();
+    }
+    form.text
+}
+
+// Render all declarations without changing or checking the program.
+fn emit_kurs(program: Program, counter: Fresh) -> Text {
+    let sections: Seq[Text] = Seq::new();
+    let decls = program.types.values();
+    var d = 0usize;
+    while d < decls.len() {
+        let decl = decls.get(d);
+        let lines = metadata(decl.home, 0usize);
+        match decl.exposure {
+            Option::Some(exposure) => {
+                let mode = match exposure.mode {
+                    ExposureMode::Owner => text("owner"),
+                    ExposureMode::Within => text("within"),
+                };
+                lines.push(Out::new().put("// exposure: ").add(mode).put(", package ").usize(exposure.home.package).put(", module ")
+                    .add(json_list(exposure.home.path)).done());
+            },
+            Option::None => (),
+        };
+        let quant = quantifier(decl.params, decl.premises);
+        if !quant.is_empty() {
+            lines.push(rstrip(quant));
+        }
+        lines.push(Out::new().put("type ").add(decl.name).put(if decl.linear { "!" } else { "" }).put(" = ").add(type_text(decl.body, 0usize))
+            .put(";").done());
+        sections.push(joined(lines, "\n"));
+        d = d + 1usize;
+    }
+    let externs = program.externs.values();
+    var e = 0usize;
+    while e < externs.len() {
+        let external = externs.get(e);
+        let ty = match external.ret {
+            Option::Some(r) => type_text(r, 0usize),
+            Option::None => kurs_error(text("unsupported readable extern: an extern without a type"), no_pos()),
+        };
+        match external.ptypes {
+            Option::None => sections.push(Out::new().put("extern val ").add(external.name).put(": ").add(ty).put(";").done()),
+            Option::Some(ptypes) => sections.push(Out::new().put("extern fn ").add(external.name).put("(")
+                .add(joined(type_texts(ptypes, 0usize), ", ")).put(") -> ").add(ty).put(";").done()),
+        };
+        e = e + 1usize;
+    }
+    let datas = program.datas.values();
+    var a = 0usize;
+    while a < datas.len() {
+        let data = datas.get(a);
+        let lines = metadata(data.home, 0usize);
+        lines.push(Out::new().put("data ").add(data.name).put(": ").add(type_text(data.ty, 0usize)).put(" = ")
+            .add(initializer_text(data.init)).put(";").done());
+        sections.push(joined(lines, "\n"));
+        a = a + 1usize;
+    }
+    let traits = program.traits.values();
+    var t = 0usize;
+    while t < traits.len() {
+        let tr = traits.get(t);
+        let names: Seq[Text] = Seq::new();
+        let bounds: Seq[Text] = Seq::new();
+        var p = 0usize;
+        while p < tr.params.len() {
+            let kind = if tr.param_kinds.is_empty() { Kind::Any } else { tr.param_kinds.get(p) };
+            names.push(if is_brand(kind) { brand(tr.params.get(p)) } else { tr.params.get(p) });
+            if is_copy(kind) {
+                bounds.push(Out::new().put("Copy[").add(tr.params.get(p)).put("]").done());
+            }
+            p = p + 1usize;
+        }
+        let header = Out::new().put("trait ").add(tr.name).put("[").add(joined(names, ", ")).put("]");
+        if !bounds.is_empty() {
+            let unit = header.put(" where ").add(joined(bounds, ", "));
+        }
+        let lines = metadata(tr.home, 0usize);
+        lines.push(header.put(" {").done());
+        var m = 0usize;
+        while m < tr.methods.len() {
+            let method = tr.methods.get(m);
+            let modes: Seq[Text] = Seq::new();
+            var i = 0usize;
+            while i < method.ptypes.len() {
+                modes.push(Out::new().put(if method.places.has(i) { "&" } else { "" }).add(type_text(method.ptypes.get(i), 1usize)).done());
+                i = i + 1usize;
+            }
+            lines.push(Out::new().put("    ").put(if method.is_unsafe { "unsafe " } else { "" }).put("fn ").add(method.name).put("(")
+                .add(joined(modes, ", ")).put(") -> ").add(type_text(method.ret, 1usize)).put(";").done());
+            m = m + 1usize;
+        }
+        lines.push(text("}"));
+        sections.push(joined(lines, "\n"));
+        t = t + 1usize;
+    }
+    let groups = program.instances.values();
+    var g = 0usize;
+    while g < groups.len() {
+        let insts = groups.get(g);
+        var i = 0usize;
+        while i < insts.len() {
+            let inst = insts.get(i);
+            let lines = metadata(inst.home, 0usize);
+            let quant = quantifier(inst.params, inst.premises);
+            if !quant.is_empty() {
+                lines.push(rstrip(quant));
+            }
+            lines.push(Out::new().put("instance ").add(inst.trait_name).add(arguments(inst.head, 0usize)).put(" {").done());
+            var m = 0usize;
+            while m < inst.methods.len() {
+                lines.append(function_lines(inst.methods.get(m), 1usize, counter));
+                m = m + 1usize;
+            }
+            lines.push(text("}"));
+            sections.push(joined(lines, "\n"));
+            i = i + 1usize;
+        }
+        g = g + 1usize;
+    }
+    let funs = program.funs.values();
+    var f = 0usize;
+    while f < funs.len() {
+        sections.push(joined(function_lines(funs.get(f), 0usize, counter), "\n"));
+        f = f + 1usize;
+    }
+    Out::new().add(joined(sections, "\n\n")).put("\n").done()
+}
