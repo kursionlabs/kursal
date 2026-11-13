@@ -2,6 +2,8 @@
 produces the same syntax tree for every source file in the repository, and rejects bad syntax with the
 same message; its type modules give the same results as these on small cases; its resolver resolves
 every package in the repository to the same names, and rejects bad packages with the same message;
+it gives every package the same signatures, types and constant values, and rejects bad declarations
+with the same message;
 its KURS reader and writer read every lowered program and write it back as this compiler's writer
 does, and reject malformed KURS with the same message."""
 
@@ -9,6 +11,7 @@ import dataclasses
 import hashlib
 import itertools
 import os
+import resource
 import subprocess
 import sys
 import tempfile
@@ -31,9 +34,10 @@ from kursal.unify import Meta, match_head, unify, zonk
 from kursal import syntax as S
 from kursal.core import ModuleId
 from kursal.resolve import LIB, Decl, Resolver, resolve
-from kursal.kurs import parse_program, write_program
+from kursal.kurs import (_form, _write_ptypes, parse_program, write_atom, write_forall, write_program, write_type,
+                         write_type_decl)
 from kursal.lower import lower
-from kursal.sigs import signatures
+from kursal.sigs import ConstValue, Sig, Signatures, signatures
 from tests.test_kurs import CANONICAL, VARIANTS, packages
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -195,6 +199,61 @@ def reference_resolution(path: Path) -> str:
         return f"error: {error}"
 
 
+def sig_lines(sig: Sig, indent: str, out: list[str]) -> None:
+    out.append(f"{indent}sig {write_atom(sig.name)} {'unsafe' if sig.unsafe else 'safe'}")
+    out.append(f"{indent}  decl {'_' if sig.decl is None else decl_text(sig.decl)}")
+    out.append(f"{indent}  module {'_' if sig.module is None else module_text(sig.module)}")
+    out.append(f"{indent}  {write_forall(sig.params, sig.premises)}")
+    params = [_form([*(["&"] if i in sig.places else []), write_atom(n), write_type(t)])
+              for i, (n, t) in enumerate(zip(sig.pnames, sig.ptypes))]
+    out.append(f"{indent}  params {_form(params)}")
+    out.append(f"{indent}  ret {write_type(sig.ret)}")
+
+
+def const_text(value: ConstValue) -> str:
+    kind, v, ty = value
+    if kind == "int":
+        spelled = str(v)
+    elif kind == "bool":
+        spelled = "true" if v else "false"
+    elif kind == "float":
+        assert isinstance(v, str)
+        spelled = v
+    else:
+        spelled = dump(v)
+    return f"{kind} {spelled} {'_' if ty is None else write_type(ty)}"
+
+
+def signatures_dump(sigs: Signatures) -> str:
+    """The canonical text of a program's signatures, as compiler/sigdump.kur writes it."""
+    out = [f"type {write_type_decl(decl)}" for decl in sigs.types.values()]
+    for trait in sigs.traits.values():
+        params, kinds = _form([write_atom(p) for p in trait.params]), _form(list(trait.param_kinds))
+        out.append(f"trait {write_atom(trait.name)} {params} {kinds}")
+        out.append(f"  module {'_' if trait.module is None else module_text(trait.module)}")
+        out.extend(f"  method {write_atom(m.name)} {'unsafe ' if m.unsafe else ''}{_write_ptypes(m.ptypes, m.places)} "
+                   f"{write_type(m.ret)}" for m in trait.methods)
+    for sig in sigs.sigs.values():
+        sig_lines(sig, "", out)
+    for inst, _, module in sigs.instances:
+        pos = f"{inst.pos[0]}:{inst.pos[1]}" if inst.pos else "_"
+        out.append(f"instance {write_atom(inst.trait)} {module_text(module)} {pos}")
+        out.append(f"  {write_forall(inst.params, inst.premises)} {_form([write_type(t) for t in inst.head])}")
+        for method in inst.methods:
+            sig_lines(method, "  ", out)
+    out.extend(f"const {decl_text(decl)} {const_text(value)}" for decl, value in sigs.consts.items())
+    return "".join(line + "\n" for line in out)
+
+
+def reference_signatures(path: Path) -> str:
+    """The reference compiler's signatures of the package at `path`, or its error."""
+    sys.setrecursionlimit(20000)
+    try:
+        return signatures_dump(signatures(resolve(path)))
+    except KursError as error:
+        return f"error: {error}"
+
+
 def manifest(name: str, deps: tuple[str, ...] = (), entry: str | None = None) -> str:
     text = f'[package]\nname="{name}"\nsource_root="."\n'
     if entry:
@@ -287,6 +346,83 @@ RESOLVED: tuple[tuple[dict[str, str], str], ...] = (
           "app/run.kur": "fn main() -> i32 { 0i32 }\n"}), "app"),
 )
 
+
+# Packages of one module, without dependencies, for signatures: sources the reference accepts, and
+# sources it rejects at the signature stage.
+SIGNATURES = (
+    "const A: u8 = 200u8 + 100u8;\nconst B: i8 = -128;\nconst C: i8 = -B;\nconst D: i32 = -7 / 2;\n"
+    "const E: i32 = -7 % 2;\nconst F: i64 = -9223372036854775808 / -1;\nconst G: u64 = 18446744073709551615 * 3;\n"
+    "const H: i16 = -1 >> 3;\nconst I: u32 = 1 << 35;\nconst J: i32 = 1i32 << -1i32;\nconst K: bool = -1i32 < 1i32;\n"
+    "const L: bool = 18446744073709551615u64 > 1u64;\nconst M: u8 = (-1i64) as u8;\nconst N: i64 = 255u8 as i8 as i64;\n"
+    "const O: f64 = -1.5;\nconst P: f32 = -(-2.5);\nconst Q: bool = !(A == 44u8) || true;\nconst R: u32 = !0u32;\n"
+    "const S: bool = false && (1u32 / 0u32 == 0u32);\nconst T: u32 = \"te\\\"xt\\n\";\nconst U: usize = 3;\n"
+    "const V: i8 = (-128i8) / (-1i8);\nconst W: u16 = 65535 + 1;\nconst X: i64 = -9223372036854775808 % -1;\n"
+    "const Y: u64 = 1u64 >> 64u64;\nconst Z: i8 = -128 >> 1;\nconst AA: bool = 1 == 2u8;\nconst AB: u8 = b'a' ^ 255u8;\n"
+    "const AC: i64 = -5 / 3 + -5 % 3 + 7 % -2 + -7 / -2;\nconst AD: bool = -1i8 >= -2i8 && 3u16 <= 3u16 && 1i32 != 2i32;\n"
+    "const AE: u32 = 4294967295u32 as i64 as u32;\nconst AF: bool = true != (1u8 > 0u8);\n"
+    "struct Arr { a: [u8; U], b: [u8; 2 * U], c: [u8; 2u8] }\n",
+    "forall T where Copy[T]. trait Dup { fn dup(x: T) -> (T, T); }\ntrait Show { fn show(&x: Self) -> u32; }\n"
+    "instance Dup[u32] { fn dup(x: u32) -> (u32, u32) { (x, x) } }\n"
+    "forall T where Exposed[T], Show[T]. instance Show[(T, T)] { fn show(&x: (T, T)) -> u32 { 0u32 } }\n"
+    "forall 'k. exposed struct Tag! { n: u32 }\nforall T, 'a. struct P { p: *T, w: Brand['a], e: exists 'b. Brand['b] }\n"
+    "forall T. impl P[T, 'static] { fn get(self, f: closure(u32) -> u32, g: closure[u8](&_: u32) -> u32) -> u32 { 0u32 } }\n"
+    "forall T where Copy[T]. fn pair(x: T, h: unsafe fn(&_: T) -> !, k: forall 'q. fn(Brand['q]) -> u32) -> (T, T) { (x, x) }\n"
+    "extern \"C\" fn puts(s: *u8) -> i32;\nenum E { A, B(u32), C(u8, u16) }\ntuple Pt(u32, i64);\n"
+    "struct F { f: foreach F of (u32, u8) => *F }\nfn h(g: fn(closure(u32) -> u32) -> u32, k: closure(u8) -> u8) -> u32 { 0u32 }\n",
+)
+
+SIGNATURE_ERRORS = (
+    "struct S { a: Phantom }\n",
+    "struct S { a: builtin::Foo }\n",
+    "forall T. struct S { a: T[u32] }\n",
+    "struct S { a: u32[u8] }\n",
+    "struct S { a: Brand[u32] }\n",
+    "struct S { a: Never[u32] }\n",
+    "forall T. struct B { a: T }\nstruct S { b: B }\n",
+    "forall 'a. struct B { x: Brand['a] }\nstruct S { b: B[u32] }\n",
+    "struct S { a: Brand['k] }\n",
+    "struct S { f: fn(closure(u32) -> u32) -> u32 }\n",
+    "forall T. struct B { a: *T }\nstruct S { b: B[_] }\n",
+    "struct S { f: forall 'a. u32 }\n",
+    "forall T where Copy[(T, T)]. fn f(x: T) {}\n",
+    "forall T where Copy[u32]. fn f(x: T) {}\n",
+    "forall T where Copy[T]. struct B { a: T }\nstruct L! { x: u32 }\nstruct S { b: B[L] }\n",
+    "forall T where Copy[T]. struct B { a: T }\nstruct L! { x: u32 }\nfn f(b: B[L]) {}\n",
+    "trait Show { fn show(x: Self) -> u32; }\nforall T where Show[T]. trait Bad { fn bad(x: T) -> u32; }\n",
+    "trait Show { fn show(x: Self, f: closure(u32) -> u32) -> u32; }\n",
+    "fn f(self) -> u32 { 0u32 }\n",
+    "fn g() {}\nexposed(package::g) struct S { a: u32 }\n",
+    "forall T. struct R { r: *R[(T, T)] }\n",
+    "struct S { s: S }\n",
+    "const C: bool = 1;\n",
+    "const C: u8 = 300;\n",
+    "const C: i8 = -129;\n",
+    "const C: f32 = 340282366920938463463374607431768211456.0;\n",
+    "const C: u32 = 1.5;\n",
+    "const B: u32 = 1u32;\nconst C: u32 = B[u32];\n",
+    "fn g() -> u32 { 0u32 }\nconst C: u32 = g;\n",
+    "const C: bool = -true;\n",
+    "const C: u32 = true as u32;\n",
+    "const C: bool = 1u32 && true;\n",
+    "const C: bool = true || 1u32;\n",
+    "const C: bool = true == 1u32;\n",
+    "const C: u32 = 1u32 + 1u8;\n",
+    "const C: u32 = 1u32 / 0u32;\n",
+    "const C: u32 = 1u32 % (2u32 - 2u32);\n",
+    "const C: u32 = C + 1u32;\n",
+    "const A: u32 = B;\nconst B: u32 = A;\n",
+    "const C: u64 = 1u32;\n",
+    "const C: (u32, *u8) = 1u32;\n",
+    "const C: u32 = 1 == 2;\n",
+    "struct S { a: [u8; true] }\n",
+    "const C: u32 = 1u32 + 1.5;\n",
+    "fn g() -> u32 { 0u32 }\nconst C: u32 = g();\n",
+    "trait Show { fn show(x: Self) -> u32; }\ninstance Show[u32, u8] { fn show(x: u32) -> u32 { x } }\n",
+    "forall T where Copy[T]. trait Dup { fn dup(x: T) -> T; }\nstruct L! { x: u32 }\n"
+    "instance Dup[L] { fn dup(x: L) -> L { x } }\n",
+    "forall T where Nope[T]. fn f(x: T) {}\n",
+    "struct S { a: (u32, [u8; 1u8 - 2u8 > 0u8]) }\n",
+)
 
 SYNTAX_ERRORS = (
     "fn f() -> Point { Point { x: 1u32 } }",
@@ -647,6 +783,11 @@ def type_case(case: str) -> str:
     raise ValueError(f"unknown case {op}")
 
 
+def limit_memory() -> None:
+    """Caps a compiler process's address space at 4 GB, so a runaway one fails instead of exhausting the machine."""
+    resource.setrlimit(resource.RLIMIT_AS, (4 << 30, 4 << 30))
+
+
 class CompilerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -654,7 +795,7 @@ class CompilerTests(unittest.TestCase):
 
     def run_compiler(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([str(self.binary), *args], capture_output=True, text=True, timeout=600,
-                              env=dict(os.environ, KURSAL_LIB=str(LIB)))
+                              env=dict(os.environ, KURSAL_LIB=str(LIB)), preexec_fn=limit_memory)
 
     def compiler_resolution(self, path: Path) -> str:
         result = self.run_compiler("resolve", str(path))
@@ -671,6 +812,48 @@ class CompilerTests(unittest.TestCase):
                 expected = reference_resolution(path)
                 self.assertFalse(expected.startswith("error:"), expected)
                 self.assertEqual(self.compiler_resolution(path), expected)
+
+    def compare_signatures(self, paths: list[Path]) -> None:
+        """Each package's signatures from the reference and from `kursalc sigs`, both computed in parallel."""
+        workers = min(8, os.cpu_count() or 1)
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            expected = pool.map(reference_signatures, paths)
+            results: list[str] = []
+            # Started from this thread, a batch at a time, so that `limit_memory` runs in no threaded child.
+            for start in range(0, len(paths), workers):
+                running = [subprocess.Popen([str(self.binary), "sigs", str(path)], stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE, text=True, preexec_fn=limit_memory,
+                                            env=dict(os.environ, KURSAL_LIB=str(LIB)))
+                           for path in paths[start:start + workers]]
+                for process in running:
+                    stdout, stderr = process.communicate(timeout=600)
+                    results.append(stdout if process.returncode == 0 else f"error: {stderr.strip()}")
+            for path, want, got in zip(paths, expected, results):
+                with self.subTest(path=str(path)):
+                    self.assertEqual(got, want)
+
+    def test_signatures_match_reference(self):
+        packages = sorted({p.parent for top in ("examples", "lib") for p in (ROOT / top).glob("*/kur.toml")})
+        singles = sorted((ROOT / "examples/bad").glob("*.kur"))
+        self.assertGreater(len(packages), 40)
+        self.compare_signatures([*packages, *singles, COMPILER])
+
+    def test_signature_cases_match_reference(self):
+        """Small packages: SIGNATURES, which the reference accepts, and SIGNATURE_ERRORS, which it rejects."""
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for index, source in enumerate((*SIGNATURES, *SIGNATURE_ERRORS)):
+                root = Path(directory) / f"case{index}"
+                root.mkdir()
+                (root / "kur.toml").write_text(manifest("p"))
+                (root / "lib.kur").write_text(source)
+                paths.append(root)
+            for index, path in enumerate(paths):
+                with self.subTest(source=(*SIGNATURES, *SIGNATURE_ERRORS)[index]):
+                    expected = reference_signatures(path)
+                    self.assertEqual(expected.startswith("error:"), index >= len(SIGNATURES), expected)
+                    self.assertNotIn("syntax error", expected)
+            self.compare_signatures(paths)
 
     def check_resolution(self, cases: tuple[tuple[dict[str, str], str], ...], fails: bool) -> None:
         for index, (files, target) in enumerate(cases):

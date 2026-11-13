@@ -16,6 +16,8 @@ produce the same output.
 | `literals`, `formation`, `layout`, `termination`, `coherence` | the same names | checks of literals, types, declarations and instances |
 | `resolve` | `resolve.py` | manifests, the package graph, and what every name names |
 | `resolved` | | a resolved program as text, for comparison with the reference resolver |
+| `sigs` | `sigs.py` | signatures: type declarations, function, method, extern and trait signatures, instances, folded constants |
+| `sigdump` | | signatures as text, for comparison with the reference |
 | `kurs` | `kurs.py` | serialized KURS: its reader and writer |
 | `main` | `__main__.py` | the command line |
 | `selftest` | | `kursalc selftest-types`, the type modules on small cases, for the tests |
@@ -77,7 +79,7 @@ stands for no position.
 
 `types.fresh` numbers renamed binders (`a#3`) from one counter for the whole compilation. Here that
 counter is a `types::Fresh`, made once and passed to everything that may rename a binder: `subst`,
-`unify`, `match_head`, `Types`, `Formation`, `check_type_expansion`, `check_coherence`. Passing the
+`unify`, `match_head`, `Types`, `Formation`, `check_type_expansion`, `check_coherence`, `Signatures`. Passing the
 same one everywhere numbers names as the reference compiler does.
 
 Where the reference wraps a phase in `with resolver.located(module, pos):`, call
