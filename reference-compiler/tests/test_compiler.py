@@ -3,7 +3,8 @@ produces the same syntax tree for every source file in the repository, and rejec
 same message; its type modules give the same results as these on small cases; its resolver resolves
 every package in the repository to the same names, and rejects bad packages with the same message;
 it gives every package the same signatures, types and constant values, and rejects bad declarations
-with the same message;
+with the same message; it infers every function body to the same types, calls and bindings, and
+rejects ill-typed bodies with the same message;
 its KURS reader and writer read every lowered program and write it back as this compiler's writer
 does, and reject malformed KURS with the same message; its checker accepts and rejects, with the same
 message, every core program this compiler's own tests check; and from every lowered program it writes
@@ -20,7 +21,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
@@ -35,7 +36,8 @@ from kursal.literals import valid_literal
 from kursal.parser import parse
 from kursal.sexpr import KursError, List, read
 from kursal.termination import check_instance_termination, check_mono_termination
-from kursal.unify import Meta, match_head, unify, zonk
+from kursal.unify import Meta, match_head, prune, unify, zonk
+from kursal import infer as I
 from kursal import syntax as S
 from kursal.core import ModuleId
 from kursal.resolve import LIB, Decl, Resolver, resolve
@@ -46,6 +48,7 @@ from kursal.check import check_program
 from kursal.lower import lower
 from kursal.readable import emit_kurs
 from kursal.sigs import ConstValue, Sig, Signatures, signatures
+from tests.infer_cases import INFER_ERRORS, INFERENCES
 from tests.test_kurs import CANONICAL, VARIANTS, packages
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -297,6 +300,204 @@ def reference_signatures(path: Path) -> str:
         return signatures_dump(signatures(resolve(path)))
     except KursError as error:
         return f"error: {error}"
+
+
+def inferred_type(ty: C.Type) -> str:
+    """`ty` as KURS writes it, an unsolved metavariable written `?` (`$?` for a brand)."""
+    def filled(t: C.Type) -> C.Type:
+        t = prune(t)
+        if isinstance(t, Meta):
+            return C.Skolem("?") if t.kind == "brand" else C.Named("?")
+        return T.map_children(t, filled)
+    return write_type(filled(ty))
+
+
+def inferred_types(types: Sequence[C.Type]) -> str:
+    return _form([inferred_type(t) for t in types])
+
+
+def receiver_text(receiver: Optional[I.Receiver]) -> str:
+    return "" if receiver is None else " &recv" if receiver.lend else " recv"
+
+
+def trait_call_text(call: I.TraitCall) -> str:
+    return (f"(trait {write_atom(call.trait)} {write_atom(call.method)} {inferred_types(call.targs)}"
+            f"{receiver_text(call.receiver)})")
+
+
+def callee_text(call: I.Callee) -> str:
+    match call:
+        case I.FnCall():
+            return (f"(fn {write_atom(call.name)} {write_atom(call.sig.name)} {inferred_types(call.targs)}"
+                    f"{receiver_text(call.receiver)})")
+        case I.TraitCall():
+            return trait_call_text(call)
+        case I.ValueCall():
+            return f"(value {inferred_types(call.targs)})"
+        case I.ClosureCall():
+            return "(closure)"
+        case I.VariantCall():
+            return f"(variant {write_atom(call.variant)})"
+        case I.TupleCall():
+            return "(tuple)"
+        case I.BuiltinCall():
+            return f"(builtin {write_atom(call.name)})"
+        case I.AllocaCall():
+            return f"(alloca {inferred_type(call.target)})"
+        case I.PointerCall():
+            return f"(pointer {write_atom(call.name)})"
+        case I.FStringWrite():
+            return "(fwrite)"
+    raise TypeError(f"cannot print {call!r}")
+
+
+def position(node: object) -> str:
+    pos = getattr(node, "pos")
+    return f"{pos[0]}:{pos[1]}" if pos else "_"
+
+
+def inferred_line(tag: str, node: object, positioned: bool = True) -> str:
+    """One node's line, as compiler/inferdump.kur writes it: tag, position, type and annotations."""
+    parts = [tag, *([position(node)] if positioned else []), inferred_type(node.ty) if hasattr(node, "ty") else "-"]
+    binder = getattr(node, "name_id" if isinstance(node, S.Foreach) else "binder", None)
+    if isinstance(binder, int):
+        parts.append(f"binder {binder}")
+    if getattr(node, "folded", None) is not None:
+        parts.append(f"folded ({const_text(node.folded)})")
+    if getattr(node, "call", None) is not None:
+        parts.append(f"call {callee_text(node.call)}")
+    if hasattr(node, "target"):
+        parts.append(f"target {inferred_type(node.target)}")
+    if hasattr(node, "field_ids"):
+        parts.append("fields " + _form([f"({write_atom(n)} {i})" for n, i in node.field_ids.items()]))
+    if hasattr(node, "spread_id"):
+        parts.append(f"spread {node.spread_id}")
+    if hasattr(node, "binder_ids"):
+        parts.append("binders " + _form(["_" if i is None else str(i) for i in node.binder_ids]))
+    if hasattr(node, "lent"):
+        parts.append("lent #t" if node.lent else "lent #f")
+    if isinstance(node, S.Closure) and hasattr(node, "param_ids"):
+        parts.append("params " + _form([str(i) for i in node.param_ids]))
+    if hasattr(node, "captures"):
+        parts.append("captures " + _form([f"({write_atom(c.name)} {c.binder_id})" for c in node.captures]))
+    if hasattr(node, "witnesses"):
+        parts.append(f"witnesses {inferred_types(node.witnesses)}")
+    if isinstance(node, S.Try) and hasattr(node, "kind"):
+        parts.append(f"kind {node.kind}")
+    if hasattr(node, "opened_brands"):
+        parts.append("opened " + _form([write_atom(b) for b in node.opened_brands]))
+    if hasattr(node, "option"):
+        parts.append(f"option {inferred_type(node.option)}")
+    if hasattr(node, "next_call"):
+        parts.append(f"next {trait_call_text(node.next_call)}")
+    if hasattr(node, "rest_id"):
+        parts.append(f"rest {node.rest_id}")
+    return "  " + " ".join(parts)
+
+
+# Each syntax node with a body's tag, and its children in the order compiler/inferdump.kur walks them.
+WALKED = {
+    S.Block: ("block", lambda n: (*n.stmts, n.tail)), S.Lit: ("lit", lambda n: ()),
+    S.FStr: ("fstr", lambda n: n.parts), S.Path: ("path", lambda n: ()), S.Tuple: ("tuple", lambda n: n.elems),
+    S.Array: ("array", lambda n: n.elems), S.Sizeof: ("sizeof", lambda n: ()),
+    S.StructLit: ("struct", lambda n: tuple(v for _, v in n.fields)), S.If: ("if", lambda n: (n.cond, n.then, n.other)),
+    S.Closure: ("closure", lambda n: (n.body,)), S.Return: ("return", lambda n: (n.value,)),
+    S.Pack: ("pack", lambda n: (n.value,)), S.Foreach: ("foreach", lambda n: (n.source, n.body)),
+    S.Binop: ("binop", lambda n: (n.left, n.right)), S.Unary: ("unary", lambda n: (n.operand,)),
+    S.Cast: ("cast", lambda n: (n.value,)), S.UnsafeStore: ("store", lambda n: (n.pointer, n.value)),
+    S.Field: ("field", lambda n: (n.value,)), S.Index: ("index", lambda n: (n.value,)),
+    S.Call: ("call", lambda n: (n.callee, *n.args)), S.Try: ("try", lambda n: (n.value,)),
+    S.While: ("while", lambda n: (n.cond, n.body)), S.For: ("for", lambda n: (n.iterator, n.body)),
+    S.Let: ("let", lambda n: (n.pattern, n.value)), S.Var: ("var", lambda n: (n.value,)),
+    S.Const: ("const", lambda n: (n.value,)),
+}
+PATTERNS = {
+    S.PBind: ("pbind", lambda n: ()), S.PWild: ("pwild", lambda n: ()), S.PTuple: ("ptuple", lambda n: n.elems),
+    S.PArray: ("parray", lambda n: n.elems), S.PStruct: ("pstruct", lambda n: tuple(q for _, q in n.fields)),
+}
+
+
+def inferred_body(node: object, out: list[str]) -> None:
+    """The lines of a body's nodes, in syntax order, as compiler/inferdump.kur walks them."""
+    def walk(children: Sequence[object]) -> None:
+        for child in children:
+            if child is not None and not isinstance(child, str):
+                inferred_body(child, out)
+    if isinstance(node, S.Match):
+        out.append(inferred_line("match", node))
+        walk((node.scrutinee,))
+        for arm in node.arms:
+            out.extend(inferred_line("case", case) for case in arm.cases)
+            walk((arm.body,))
+    elif isinstance(node, S.Assign):
+        out.append(f"  assign {position(node)}")
+        walk((node.target, node.value))
+    elif isinstance(node, S.ExprStmt):
+        walk((node.value,))
+    elif type(node) in PATTERNS:
+        tag, children = PATTERNS[type(node)]
+        out.append(inferred_line(tag, node, positioned=False))
+        walk(children(node))
+    else:
+        tag, children = WALKED[type(node)]
+        out.append(inferred_line(tag, node))
+        walk(children(node))
+
+
+def inference_dump(sigs: Signatures) -> str:
+    """The canonical text of what inference found, as compiler/inferdump.kur writes it."""
+    out: list[str] = []
+
+    def function(name: str, node: S.Fn) -> None:
+        out.append(f"fn {write_atom(name)} {position(node)} params {_form([str(i) for i in node.param_ids])}")
+        inferred_body(node.body, out)
+    for decl, sig in sigs.sigs.items():
+        if isinstance(decl.node, S.Fn) and decl.node.body is not None:
+            function(sig.name, decl.node)
+    for inst, item, _ in sigs.instances:
+        for node in item.methods:
+            function(f"{inst.trait}::{node.name}", node)
+    return "".join(line + "\n" for line in out)
+
+
+def reference_inference(path: Path) -> tuple[str, bool]:
+    """The reference compiler's inference of the package at `path`, or its error; and whether
+    resolution and signatures succeeded, so that an error is inference's own."""
+    sys.setrecursionlimit(20000)
+    T._fresh = itertools.count()   # the Kursal compiler numbers fresh names and bindings from 0
+    I._ids = itertools.count()
+    try:
+        resolver = resolve(path)
+        sigs = signatures(resolver)
+    except KursError as error:
+        return f"error: {error}", False
+    try:
+        I.Infer(resolver, sigs).run()
+        return inference_dump(sigs), True
+    except KursError as error:
+        return f"error: {error}", True
+
+
+def reference_inference_text(path: Path) -> str:
+    return reference_inference(path)[0]
+
+
+def place_case(directory: Path, index: int, case: str | dict[str, str]) -> Path:
+    """Where an inference case is written (see tests/infer_cases.py)."""
+    root = directory / f"case{index}"
+    if isinstance(case, dict):
+        for rel, text in case.items():
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_text(text)
+        return root / "a"
+    if "std::" in case:
+        path = directory / f"case{index}.kur"
+        path.write_text(case)
+        return path
+    root.mkdir()
+    (root / "kur.toml").write_text(manifest("p"))
+    (root / "lib.kur").write_text(case)
+    return root
 
 
 def manifest(name: str, deps: tuple[str, ...] = (), entry: str | None = None) -> str:
@@ -976,24 +1177,32 @@ class CompilerTests(unittest.TestCase):
                 self.assertFalse(expected.startswith("error:"), expected)
                 self.assertEqual(self.compiler_resolution(path), expected)
 
-    def compare_signatures(self, paths: list[Path]) -> None:
-        """Each package's signatures from the reference and from `kursalc sigs`, both computed in parallel."""
+    def run_batches(self, command: str, paths: list[Path]) -> list[str]:
+        """`kursalc COMMAND PATH` for each path, a batch of processes at a time: its output, or its error."""
         workers = min(8, os.cpu_count() or 1)
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            expected = pool.map(reference_signatures, paths)
-            results: list[str] = []
-            # Started from this thread, a batch at a time, so that `limit_memory` runs in no threaded child.
-            for start in range(0, len(paths), workers):
-                running = [subprocess.Popen([str(self.binary), "sigs", str(path)], stdout=subprocess.PIPE,
-                                            stderr=subprocess.PIPE, text=True, preexec_fn=limit_memory,
-                                            env=dict(os.environ, KURSAL_LIB=str(LIB)))
-                           for path in paths[start:start + workers]]
-                for process in running:
-                    stdout, stderr = process.communicate(timeout=TIME_LIMIT)
-                    results.append(stdout if process.returncode == 0 else f"error: {stderr.strip()}")
+        results: list[str] = []
+        # Started from this thread, so that `limit_memory` runs in no threaded child.
+        for start in range(0, len(paths), workers):
+            running = [subprocess.Popen([str(self.binary), command, str(path)], stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, text=True, preexec_fn=limit_memory,
+                                        env=dict(os.environ, KURSAL_LIB=str(LIB)))
+                       for path in paths[start:start + workers]]
+            for process in running:
+                stdout, stderr = process.communicate(timeout=TIME_LIMIT)
+                results.append(stdout if process.returncode == 0 else f"error: {stderr.strip()}")
+        return results
+
+    def compare_outputs(self, command: str, reference, paths: list[Path]) -> None:
+        """Each package's result from the reference and from `kursalc COMMAND`, both computed in parallel."""
+        with ProcessPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
+            expected = pool.map(reference, paths)
+            results = self.run_batches(command, paths)
             for path, want, got in zip(paths, expected, results):
                 with self.subTest(path=str(path)):
                     self.assertEqual(got, want)
+
+    def compare_signatures(self, paths: list[Path]) -> None:
+        self.compare_outputs("sigs", reference_signatures, paths)
 
     def test_signatures_match_reference(self):
         packages = sorted({p.parent for top in ("examples", "lib") for p in (ROOT / top).glob("*/kur.toml")})
@@ -1018,6 +1227,34 @@ class CompilerTests(unittest.TestCase):
                     self.assertEqual(expected.startswith("error:"), index >= len(SIGNATURES), expected)
                     self.assertNotIn("syntax error", expected)
             self.compare_signatures(paths)
+
+    def test_inference_matches_reference(self):
+        packages = sorted({p.parent for top in ("examples", "lib") for p in (ROOT / top).glob("*/kur.toml")})
+        singles = sorted((ROOT / "examples/bad").glob("*.kur"))
+        self.assertGreater(len(packages), 40)
+        self.compare_outputs("infer", reference_inference_text, [*packages, *singles, COMPILER])
+
+    def test_inference_cases_match_reference(self):
+        """Small programs: INFERENCES, which the reference infers, and INFER_ERRORS, which its inference
+        rejects, each with a message containing the fragment given; resolution and signatures accept them all."""
+        cases = [*INFERENCES, *(case for case, _ in INFER_ERRORS)]
+        fragments = [None] * len(INFERENCES) + [fragment for _, fragment in INFER_ERRORS]
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [place_case(Path(directory), index, case) for index, case in enumerate(cases)]
+            with ProcessPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
+                expected = list(pool.map(reference_inference, paths))
+            for case, fragment, (text, inferred) in zip(cases, fragments, expected):
+                with self.subTest(case=case):
+                    self.assertTrue(inferred, text)
+                    self.assertNotIn("syntax error", text)
+                    if fragment is None:
+                        self.assertFalse(text.startswith("error:"), text)
+                    else:
+                        self.assertTrue(text.startswith("error:"), text[:200])
+                        self.assertIn(fragment, text)
+            for path, (want, _), got in zip(paths, expected, self.run_batches("infer", paths)):
+                with self.subTest(path=str(path)):
+                    self.assertEqual(got, want)
 
     def check_resolution(self, cases: tuple[tuple[dict[str, str], str], ...], fails: bool) -> None:
         for index, (files, target) in enumerate(cases):

@@ -18,6 +18,8 @@ produce the same output.
 | `resolved` | | a resolved program as text, for comparison with the reference resolver |
 | `sigs` | `sigs.py` | signatures: type declarations, function, method, extern and trait signatures, instances, folded constants |
 | `sigdump` | | signatures as text, for comparison with the reference |
+| `infer` | `infer.py` | type inference of function bodies: each node's type, what each call calls, local bindings and captures |
+| `inferdump` | | what inference found, as text, for comparison with the reference |
 | `kurs` | `kurs.py` | serialized KURS: its reader and writer |
 | `check` | `check.py` | the KURS checker; it records every SSA value's type by `FunKey` |
 | `mangle`, `cgen` | `mangle.py`, `cgen.py` | symbol names (with SHA-256); checked KURS to C |
@@ -94,7 +96,7 @@ stands for no position.
 `types.fresh` numbers renamed binders (`a#3`) from one counter for the whole compilation. Here that
 counter is a `types::Fresh`, made once and passed to everything that may rename a binder: `subst`,
 `unify`, `match_head`, `Types`, `Formation`, `check_type_expansion`, `check_coherence`, `Signatures`,
-`check_program`, `emit_c`, `emit_kurs`. Passing the
+`Infer`, `check_program`, `emit_c`, `emit_kurs`. Passing the
 same one everywhere numbers names as the reference compiler does.
 
 Where the reference wraps a phase in `with resolver.located(module, pos):`, call
@@ -114,11 +116,15 @@ These are the places where Kursal differs from what one might expect.
   enum fn extern impl trait instance const forall where as exposed unsafe closure exists foreach of in
   for while if else match let var return pack sizeof true false self _`. Fields here are named
   `is_unsafe`, `home`, `quantifier`, `trait_name` and the like instead.
-- **Method lookup is global.** `x.name()` looks for `name` among the methods of `x`'s type, and
-  otherwise among every single-parameter trait in the whole program. A trait method that shares a
-  name with another trait's (`hash`, `eq`, `cmp`, `len`, ...) makes such calls ambiguous everywhere,
-  including in the standard library. Give trait methods distinctive names (`key_hash`), or call them
-  as `Trait::method(x)`.
+- **Method lookup sees what the caller sees.** `x.name()` looks for `name` among the methods of
+  `x`'s type, and otherwise among the single-parameter traits visible in the calling module
+  (declared there, imported by name or glob, or re-exported to it), and the methods of blanket impls
+  (`forall I where Iterator[I -> T]. impl I`) whose bounding traits are visible there and whose
+  package is the caller's or one it depends on, directly or not. Import the trait (`use package::base::Key;`)
+  to call its methods with a dot; two visible traits sharing a method name make such calls ambiguous,
+  and are called as `Trait::method(x)`, which works whether or not the trait is imported. Calling
+  the standard library's iterator adapters (`range(0, n).map(...)`) needs `core` as a direct
+  dependency and `Iterator` imported.
 - **No indexing operator.** `a[i]` is not an expression; `[` after a name starts type arguments. Use
   a `Seq` and `get`.
 - **No nested patterns.** A match case binds names: `Option::Some(x) =>`, never

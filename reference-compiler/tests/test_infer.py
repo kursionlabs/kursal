@@ -173,6 +173,67 @@ instance Next[Wrap[T] -> I] {
         self.assertEqual(body.tail.ty, named("Pair"))
 
 
+SHOW = "trait Show { fn show(x: Self) -> u32; }\ninstance Show[u32] { fn show(x: u32) -> u32 { x } }\n"
+OTHER = "trait Other { fn show(x: Self) -> u32; }\ninstance Other[u32] { fn show(x: u32) -> u32 { 0u32 } }\n"
+NEXT = ("trait Next { fn step(x: Self) -> u32; }\ninstance Next[u32] { fn step(x: u32) -> u32 { x } }\n"
+        "forall I where Next[I]. impl I { fn twice(self) -> u32 { 0u32 } }\n")
+
+
+def run_modules(source, **modules):
+    """Infer a package whose lib.kur is `source`, with the other modules given."""
+    files = {"p/kur.toml": manifest("p"), "p/lib.kur": source, **{f"p/{m}.kur": t for m, t in modules.items()}}
+    resolver = resolve(tree(files) / "p")
+    infer(resolver, signatures(resolver))
+    return resolver
+
+
+class MethodVisibilityTests(unittest.TestCase):
+    """A method call finds a trait's method only when the trait is visible in the calling module."""
+
+    def test_method_of_an_imported_trait_resolves(self):
+        for imported in ("use package::m::Show;\n", "use package::m::*;\n"):
+            with self.subTest(imported=imported):
+                r = run_modules(imported + "fn f(x: u32) -> u32 { x.show() }\n", m=SHOW)
+                call = fn(r, "f").body.tail.call
+                self.assertIsInstance(call, TraitCall)
+                self.assertEqual(call.trait, "p::m::Show")
+
+    def test_method_of_a_trait_not_imported_is_not_found(self):
+        with self.assertRaisesRegex(InferError, "u32 has no method show"):
+            run_modules("use package::m;\nfn f(x: u32) -> u32 { x.show() }\n", m=SHOW)
+        run_modules("fn f(x: u32) -> u32 { package::m::Show::show(x) }\n", m=SHOW)
+
+    def test_a_shared_method_name_is_ambiguous_only_when_both_traits_are_visible(self):
+        r = run_modules("use package::m::Show;\nfn f(x: u32) -> u32 { x.show() }\n", m=SHOW, n=OTHER)
+        self.assertEqual(fn(r, "f").body.tail.call.trait, "p::m::Show")
+        with self.assertRaisesRegex(InferError, "u32 has several method show"):
+            run_modules("use package::m::Show;\nuse package::n::Other;\nfn f(x: u32) -> u32 { x.show() }\n",
+                        m=SHOW, n=OTHER)
+
+    def test_blanket_methods_need_their_bound_visible_and_their_package_a_dependency(self):
+        run_modules("use package::m::Next;\nfn f(x: u32) -> u32 { x.twice() }\n", m=NEXT)
+        with self.assertRaisesRegex(InferError, "u32 has no method twice"):
+            run_modules("fn f(x: u32) -> u32 { x.twice() }\n", m=NEXT)
+        # Through a re-export: `a` depends on `c`, which declares the impl, only through `b`.
+        root = tree({"a/kur.toml": manifest("a", ("b",)),
+                     "a/lib.kur": "use b::Next;\nfn f(x: u32) -> u32 { x.twice() }\n",
+                     "b/kur.toml": manifest("b", ("c",)), "b/lib.kur": "use c::Next;\nexport Next;\n",
+                     "c/kur.toml": manifest("c"), "c/lib.kur": NEXT})
+        resolver = resolve(root / "a")
+        infer(resolver, signatures(resolver))
+        # `b` declares the trait; `c` depends on `b` and declares a blanket impl that `b` cannot see.
+        root = tree({"a/kur.toml": manifest("a", ("b", "c")), "a/lib.kur": "",
+                     "b/kur.toml": manifest("b"),
+                     "b/lib.kur": "trait Next { fn step(x: Self) -> u32; }\nexport Next;\n"
+                                  "instance Next[u32] { fn step(x: u32) -> u32 { x } }\n"
+                                  "fn f(x: u32) -> u32 { x.twice() }\n",
+                     "c/kur.toml": manifest("c", ("b",)),
+                     "c/lib.kur": "use b::Next;\nforall I where Next[I]. impl I { fn twice(self) -> u32 { 0u32 } }\n"})
+        resolver = resolve(root / "a")
+        with self.assertRaisesRegex(InferError, "u32 has no method twice"):
+            infer(resolver, signatures(resolver))
+
+
 class ErrorTests(unittest.TestCase):
     def test_lending_function_name_does_not_implicitly_return_its_argument(self):
         self.rejects("fn bump(&c: Cur) -> u32 { 0u32 }\n"
@@ -224,6 +285,10 @@ class ErrorTests(unittest.TestCase):
 
     def test_let_exists_needs_a_package(self):
         self.rejects("fn f() -> u32 { let exists 'a. x = 5u32; 0u32 }\n")
+
+    def test_a_method_call_needs_a_receiver_parameter(self):
+        with self.assertRaisesRegex(InferError, "make takes no receiver"):
+            run("impl Cur { fn make() -> Cur { Cur.{ pos: 0u32 } } }\nfn f(c: Cur) -> Cur { c.make() }\n")
 
     def test_not_callable(self):
         self.rejects("fn f(n: u32) -> u32 { n(1u32) }\n")

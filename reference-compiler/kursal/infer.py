@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from itertools import count
 from . import core as C
 from . import syntax as S
-from .resolve import Decl, Resolver
+from .resolve import Decl, ResolveError, Resolver
 from .sigs import InstanceSig, Scope, Sig, Signatures
 from .sexpr import KursError, Position
 from .types import foreach_binders, Types, equal, free_brands, free_names, show, subst
@@ -211,6 +211,7 @@ class Infer:
         self.inputs = {name: len(decl.node.forall.params) if decl.node.forall else 1
                        for name, decl in self.decl_of.items() if decl.kind == "trait"}
         self.instances: dict[str, list[InstanceSig]] = {}
+        self.visible: dict[C.ModuleId, set[Decl]] = {}
         for inst, item, module in sigs.instances:
             self.instances.setdefault(inst.trait, []).append(inst)
 
@@ -824,7 +825,7 @@ class Infer:
             bundle = rest.rest
 
             def spread() -> None:
-                for name in fields.keys() - given:
+                for name in [n for n in fields if n not in given]:
                     if name not in bundle.types:
                         fail(f"..{expr.spread} has no field {name}", expr.pos)
                     self.unify(bundle.types[name], fields[name], expr.pos)
@@ -1311,6 +1312,8 @@ class Infer:
                     fail(f"{name} takes its receiver {'by &' if 0 in method.places else 'by value'}", expr.pos)
                 return self.trait_method(expr, trait, name, targs, got, receiver=receiver)
             case ("method", sig):
+                if not sig.ptypes:
+                    fail(f"{name} takes no receiver", expr.pos)
                 if (0 in sig.places) != receiver.lend:
                     fail(f"{name} takes its receiver {'by &' if 0 in sig.places else 'by value'}", expr.pos)
                 sub = instantiate(sig.params)
@@ -1320,7 +1323,8 @@ class Infer:
 
     def find_method(self, receiver_ty: C.Type, name: str, pos: Optional[Position]) -> MethodLookup:
         """Method lookup by name: the receiver type's own method, else the one trait (of a single input) or
-        extension method of that name. A name that several of them share is written `Trait::name(x)`."""
+        blanket impl method of that name visible in the calling module. A name that several of them share
+        is written `Trait::name(x)`."""
         t = zonk(receiver_ty)
         if isinstance(t, C.Ptr) and name in POINTER_METHODS:
             return ("pointer",)
@@ -1334,12 +1338,67 @@ class Infer:
         if own:
             candidates = [("method", self.sigs.sigs[d]) for d in own]
         else:
+            visible = self.visible_traits(self.module)
             candidates = [("trait", tr, [t] + [Meta("brand" if kind == C.BRAND else "type") for kind in tr.param_kinds[1:]]) for n, tr in self.sigs.traits.items()
-                          if self.inputs.get(n) == 1 and any(m.name == name for m in tr.methods)]
-            candidates.extend(("method", self.sigs.sigs[d]) for d in self.r.attached.get((None, name), []) if d.kind == "method")
+                          if self.inputs.get(n) == 1 and self.decl_of[n] in visible and any(m.name == name for m in tr.methods)]
+            candidates.extend(("method", self.sigs.sigs[d]) for d in self.r.attached.get((None, name), [])
+                              if d.kind == "method" and self.blanket_visible(d, visible))
         if len(candidates) != 1:
             fail(f"{show(t)} has {'no' if not candidates else 'several'} method {name}", pos)
         return candidates[0]
+
+    def visible_traits(self, module: C.ModuleId) -> set[Decl]:
+        """The traits a name in `module`'s scope resolves to: declared, imported by name or glob, or
+        re-exported. A glob's names are those its source module declares, imports or exports, and
+        every trait's own name."""
+        if module in self.visible:
+            return self.visible[module]
+        scope = self.r.scopes[module]
+        names = [*scope.decls, *scope.imports, *(d.name for d in self.decl_of.values() if d.kind == "trait")]
+        for path in scope.globs:
+            try:
+                source = self.r.lookup(module, path)
+            except ResolveError:
+                continue
+            if isinstance(source, C.ModuleId) and source in self.r.scopes:
+                other = self.r.scopes[source]
+                names += [*other.decls, *other.imports, *other.exports]
+        found: set[Decl] = set()
+        for name in dict.fromkeys(names):
+            try:
+                target = self.r.lookup(module, (name,))
+            except ResolveError:
+                continue
+            if isinstance(target, Decl) and target.kind == "trait":
+                found.add(target)
+        self.visible[module] = found
+        return found
+
+    def blanket_visible(self, method: Decl, visible: set[Decl]) -> bool:
+        """A blanket impl's method is found from a package that is the impl's or depends on it, directly
+        or through other packages, when every trait bounding the impl's type parameter is visible there
+        (and it has one)."""
+        if not self.depends_on(self.module.package, method.module.package):
+            return False
+        impl = method.impl
+        assert impl is not None and impl.forall is not None and isinstance(impl.type, S.TName)
+        param = impl.type.path[0]
+        bounds = [args.ref[1] for _, args in impl.forall.premises
+                  if args.args and isinstance(args.args[0], S.TName) and args.args[0].path == (param,)
+                  and args.ref is not None and args.ref[0] == "decl"]
+        return bool(bounds) and all(b in visible for b in bounds)
+
+    def depends_on(self, package: int, target: int) -> bool:
+        """`package` is `target` or depends on it, directly or through other packages."""
+        seen, pending = set(), [package]
+        while pending:
+            p = pending.pop()
+            if p == target:
+                return True
+            if p not in seen:
+                seen.add(p)
+                pending.extend(self.r.packages[p].deps.values())
+        return False
 
     def pointer_op(self, expr: S.Call, name: str, pointer: C.Type, operands: Sequence[C.Type]) -> C.Type:
         """A pointer operation: its operands held to their types, once the pointee is known."""

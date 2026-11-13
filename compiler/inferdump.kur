@@ -1,0 +1,459 @@
+// A canonical text form of what inference found, for comparing `infer` with the reference: each
+// function with a body, in the order inference visits them, and then each node of its body in
+// syntax order, with its type and the annotations inference made on it. Types are written as KURS
+// writes them; a metavariable left unsolved is written `?` (`$?` for a brand).
+
+use package::base::{Out, Seq, Text, text};
+use package::core::{MetaKind, Type};
+use package::infer::{Callee, Capture, Infer, Receiver, TraitCall};
+use package::kurs::{form_text, write_atom, write_type};
+use package::resolve::Named;
+use package::sigdump::const_text;
+use package::syntax as S;
+use package::syntax::{Expr, Pattern, Pos, Statement};
+use package::types::map_children;
+use package::unify::prune;
+use std::option::Option;
+use std::slice::Slice;
+
+fn filled(ty: Type) -> Type {
+    let t = prune(ty);
+    match t {
+        Type::Meta(m) => match m.kind() {
+            MetaKind::Brand => Type::Skolem.(text("?")),
+            _ => Type::Named.(text("?"), Seq::new()),
+        },
+        _ => map_children(t, |child: Type| filled(child)),
+    }
+}
+
+fn type_text(ty: Type) -> Text {
+    write_type(filled(ty))
+}
+
+fn types_text(ts: Seq[Type]) -> Text {
+    let parts: Seq[Text] = Seq::new();
+    var i = 0usize;
+    while i < ts.len() {
+        parts.push(type_text(ts.get(i)));
+        i = i + 1usize;
+    }
+    form_text(parts)
+}
+
+fn ids_text(ids: Seq[u32]) -> Text {
+    let parts: Seq[Text] = Seq::new();
+    var i = 0usize;
+    while i < ids.len() {
+        parts.push(Out::new().u64(ids.get(i) as u64).done());
+        i = i + 1usize;
+    }
+    form_text(parts)
+}
+
+fn receiver_text(r: Option[Receiver]) -> Text {
+    match r {
+        Option::Some(x) => text(if x.lend { " &recv" } else { " recv" }),
+        Option::None => text(""),
+    }
+}
+
+fn trait_text(t: TraitCall) -> Text {
+    Out::new().put("(trait ").add(write_atom(t.trait_name)).put(" ").add(write_atom(t.method)).put(" ").add(types_text(t.targs))
+        .add(receiver_text(t.receiver)).put(")").done()
+}
+
+fn callee_text(c: Callee) -> Text {
+    match c {
+        Callee::Fn(f) => Out::new().put("(fn ").add(write_atom(f.call_name())).put(" ").add(write_atom(f.sig.name)).put(" ")
+            .add(types_text(f.targs())).add(receiver_text(f.receiver)).put(")").done(),
+        Callee::Trait(t) => trait_text(t),
+        Callee::Value(sub) => Out::new().put("(value ").add(types_text(sub.values())).put(")").done(),
+        Callee::Closure => text("(closure)"),
+        Callee::Variant(name) => Out::new().put("(variant ").add(write_atom(name)).put(")").done(),
+        Callee::Tuple => text("(tuple)"),
+        Callee::Builtin(name) => Out::new().put("(builtin ").add(write_atom(name)).put(")").done(),
+        Callee::Alloca(t) => Out::new().put("(alloca ").add(type_text(t)).put(")").done(),
+        Callee::Pointer(name, _receiver) => Out::new().put("(pointer ").add(write_atom(name)).put(")").done(),
+        Callee::FStringWrite(_f) => text("(fwrite)"),
+    }
+}
+
+fn captures_text(cs: Seq[Capture]) -> Text {
+    let parts: Seq[Text] = Seq::new();
+    var i = 0usize;
+    while i < cs.len() {
+        parts.push(Out::new().put("(").add(write_atom(cs.get(i).name)).put(" ").u64(cs.get(i).binder as u64).put(")").done());
+        i = i + 1usize;
+    }
+    form_text(parts)
+}
+
+fn pos_text(p: Pos) -> Text {
+    if p.line == 0u32 {
+        text("_")
+    } else {
+        Out::new().u64(p.line as u64).put(":").u64(p.col as u64).done()
+    }
+}
+
+exposed struct Walk {
+    inf: Infer,
+    out: Out,
+}
+
+impl Walk {
+    // One node's line: its tag, position, type and annotations.
+    fn line(self, tag: Slice[u8, 'static], id: u32, p: Option[Pos]) {
+        let r = self.inf.out;
+        let out = self.out.put("  ").put(tag);
+        let unit = match p {
+            Option::Some(at) => out.put(" ").add(pos_text(at)),
+            Option::None => out,
+        };
+        let unit = match r.types.get(id) {
+            Option::Some(t) => out.put(" ").add(type_text(t)),
+            Option::None => out.put(" -"),
+        };
+        let unit = match r.binders.get(id) {
+            Option::Some(b) => out.put(" binder ").u64(b as u64),
+            Option::None => out,
+        };
+        let unit = match r.folded.get(id) {
+            Option::Some(v) => out.put(" folded (").add(const_text(v)).put(")"),
+            Option::None => out,
+        };
+        let unit = match r.calls.get(id) {
+            Option::Some(c) => out.put(" call ").add(callee_text(c)),
+            Option::None => out,
+        };
+        let unit = match r.targets.get(id) {
+            Option::Some(t) => out.put(" target ").add(type_text(t)),
+            Option::None => out,
+        };
+        let unit = match r.field_ids.get(id) {
+            Option::Some(fields) => {
+                let names = fields.keys();
+                let parts: Seq[Text] = Seq::new();
+                var i = 0usize;
+                while i < names.len() {
+                    parts.push(Out::new().put("(").add(write_atom(names.get(i))).put(" ").u64(fields.at(names.get(i)) as u64).put(")").done());
+                    i = i + 1usize;
+                }
+                out.put(" fields ").add(form_text(parts))
+            },
+            Option::None => out,
+        };
+        let unit = match r.spread_ids.get(id) {
+            Option::Some(b) => out.put(" spread ").u64(b as u64),
+            Option::None => out,
+        };
+        let unit = match r.case_binders.get(id) {
+            Option::Some(ids) => {
+                let parts: Seq[Text] = Seq::new();
+                var i = 0usize;
+                while i < ids.len() {
+                    parts.push(match ids.get(i) {
+                        Option::Some(b) => Out::new().u64(b as u64).done(),
+                        Option::None => text("_"),
+                    });
+                    i = i + 1usize;
+                }
+                out.put(" binders ").add(form_text(parts))
+            },
+            Option::None => out,
+        };
+        let unit = match r.lent.get(id) {
+            Option::Some(b) => out.put(if b { " lent #t" } else { " lent #f" }),
+            Option::None => out,
+        };
+        let unit = match r.param_ids.get(id) {
+            Option::Some(ids) => out.put(" params ").add(ids_text(ids)),
+            Option::None => out,
+        };
+        let unit = match r.captures.get(id) {
+            Option::Some(cs) => out.put(" captures ").add(captures_text(cs)),
+            Option::None => out,
+        };
+        let unit = match r.witnesses.get(id) {
+            Option::Some(ts) => out.put(" witnesses ").add(types_text(ts)),
+            Option::None => out,
+        };
+        let unit = match r.try_kinds.get(id) {
+            Option::Some(k) => out.put(" kind ").add(k),
+            Option::None => out,
+        };
+        let unit = match r.opened.get(id) {
+            Option::Some(labels) => {
+                let parts: Seq[Text] = Seq::new();
+                var i = 0usize;
+                while i < labels.len() {
+                    parts.push(write_atom(labels.get(i)));
+                    i = i + 1usize;
+                }
+                out.put(" opened ").add(form_text(parts))
+            },
+            Option::None => out,
+        };
+        let unit = match r.options.get(id) {
+            Option::Some(t) => out.put(" option ").add(type_text(t)),
+            Option::None => out,
+        };
+        let unit = match r.next_calls.get(id) {
+            Option::Some(t) => out.put(" next ").add(trait_text(t)),
+            Option::None => out,
+        };
+        let unit = match r.rest_ids.get(id) {
+            Option::Some(b) => out.put(" rest ").u64(b as u64),
+            Option::None => out,
+        };
+        let unit = out.put("\n");
+    }
+
+    fn exprs(self, es: Seq[Expr]) {
+        var i = 0usize;
+        while i < es.len() {
+            self.expr(es.get(i));
+            i = i + 1usize;
+        }
+    }
+
+    fn block(self, b: S::Block) {
+        self.line("block", b.id, Option::Some.(b.pos));
+        var i = 0usize;
+        while i < b.stmts.len() {
+            self.statement(b.stmts.get(i));
+            i = i + 1usize;
+        }
+        let unit = match b.tail {
+            Option::Some(t) => self.expr(t.get()),
+            Option::None => (),
+        };
+    }
+
+    fn expr(self, e: Expr) {
+        let id = S::expr_id(e);
+        let at = Option::Some.(S::expr_pos(e));
+        match e {
+            Expr::Lit(_l) => self.line("lit", id, at),
+            Expr::FStr(f) => {
+                self.line("fstr", id, at);
+                var i = 0usize;
+                while i < f.parts.len() {
+                    let unit = match f.parts.get(i) {
+                        S::Piece::Expr(x) => self.expr(x),
+                        S::Piece::Text(_t) => (),
+                    };
+                    i = i + 1usize;
+                }
+            },
+            Expr::Path(_p) => self.line("path", id, at),
+            Expr::Tuple(n) => {
+                self.line("tuple", id, at);
+                self.exprs(n.value);
+            },
+            Expr::Array(a) => {
+                self.line("array", id, at);
+                self.exprs(a.elems);
+            },
+            Expr::Sizeof(_n) => self.line("sizeof", id, at),
+            Expr::StructLit(s) => {
+                self.line("struct", id, at);
+                var i = 0usize;
+                while i < s.fields.len() {
+                    let unit = match s.fields.get(i).value {
+                        Option::Some(v) => self.expr(v),
+                        Option::None => (),
+                    };
+                    i = i + 1usize;
+                }
+            },
+            Expr::Block(b) => self.block(b),
+            Expr::If(n) => {
+                self.line("if", id, at);
+                self.expr(n.cond.get());
+                self.block(n.then);
+                let unit = match n.other {
+                    Option::Some(o) => self.expr(o.get()),
+                    Option::None => (),
+                };
+            },
+            Expr::Match(m) => {
+                self.line("match", id, at);
+                self.expr(m.scrutinee.get());
+                var i = 0usize;
+                while i < m.arms.len() {
+                    let arm = m.arms.get(i);
+                    var k = 0usize;
+                    while k < arm.cases.len() {
+                        let c = arm.cases.get(k);
+                        self.line("case", c.id, Option::Some.(c.pos));
+                        k = k + 1usize;
+                    }
+                    self.expr(arm.body);
+                    i = i + 1usize;
+                }
+            },
+            Expr::Closure(c) => {
+                self.line("closure", id, at);
+                self.expr(c.body.get());
+            },
+            Expr::Return(n) => {
+                self.line("return", id, at);
+                let unit = match n.value {
+                    Option::Some(v) => self.expr(v.get()),
+                    Option::None => (),
+                };
+            },
+            Expr::Pack(p) => {
+                self.line("pack", id, at);
+                self.expr(p.value.get());
+            },
+            Expr::Foreach(f) => {
+                self.line("foreach", id, at);
+                self.expr(f.source.get());
+                self.block(f.body);
+            },
+            Expr::Binop(b) => {
+                self.line("binop", id, at);
+                self.expr(b.left.get());
+                self.expr(b.right.get());
+            },
+            Expr::Unary(u) => {
+                self.line("unary", id, at);
+                self.expr(u.operand.get());
+            },
+            Expr::Cast(c) => {
+                self.line("cast", id, at);
+                self.expr(c.value.get());
+            },
+            Expr::UnsafeStore(s) => {
+                self.line("store", id, at);
+                self.expr(s.pointer.get());
+                self.expr(s.value.get());
+            },
+            Expr::Field(f) => {
+                self.line("field", id, at);
+                self.expr(f.value.get());
+            },
+            Expr::Index(x) => {
+                self.line("index", id, at);
+                self.expr(x.value.get());
+            },
+            Expr::Call(c) => {
+                self.line("call", id, at);
+                self.expr(c.callee.get());
+                self.exprs(c.args);
+            },
+            Expr::Try(n) => {
+                self.line("try", id, at);
+                self.expr(n.value.get());
+            },
+            Expr::While(w) => {
+                self.line("while", id, at);
+                self.expr(w.cond.get());
+                self.block(w.body);
+            },
+            Expr::For(f) => {
+                self.line("for", id, at);
+                self.expr(f.iterator.get());
+                self.block(f.body);
+            },
+        }
+    }
+
+    fn statement(self, s: Statement) {
+        match s {
+            Statement::Let(l) => {
+                self.line("let", l.id, Option::Some.(l.pos));
+                self.pattern(l.pattern);
+                self.expr(l.value);
+            },
+            Statement::Var(v) => {
+                self.line("var", v.id, Option::Some.(v.pos));
+                self.expr(v.value);
+            },
+            Statement::Assign(a) => {
+                let unit = self.out.put("  assign ").add(pos_text(a.pos)).put("\n");
+                self.expr(a.target);
+                self.expr(a.value);
+            },
+            Statement::Expr(n) => self.expr(n.value),
+            Statement::Const(c) => {
+                self.line("const", c.id, Option::Some.(c.pos));
+                self.expr(c.value);
+            },
+        }
+    }
+
+    fn pattern(self, p: Pattern) {
+        let id = S::pattern_id(p);
+        match p {
+            Pattern::Bind(_n) => self.line("pbind", id, Option::None),
+            Pattern::Wild(_id) => self.line("pwild", id, Option::None),
+            Pattern::Tuple(n) => {
+                self.line("ptuple", id, Option::None);
+                self.patterns(n.value);
+            },
+            Pattern::Array(n) => {
+                self.line("parray", id, Option::None);
+                self.patterns(n.value);
+            },
+            Pattern::Struct(ps) => {
+                self.line("pstruct", id, Option::None);
+                var i = 0usize;
+                while i < ps.fields.len() {
+                    self.pattern(ps.fields.get(i).pattern);
+                    i = i + 1usize;
+                }
+            },
+        }
+    }
+
+    fn patterns(self, ps: Seq[Pattern]) {
+        var i = 0usize;
+        while i < ps.len() {
+            self.pattern(ps.get(i));
+            i = i + 1usize;
+        }
+    }
+
+    fn function(self, name: Text, node: S::Fn) {
+        let unit = self.out.put("fn ").add(write_atom(name)).put(" ").add(pos_text(node.pos)).put(" params ")
+            .add(ids_text(self.inf.out.param_ids.get_or(node.id, Seq::new()))).put("\n");
+        let unit = match node.body {
+            Option::Some(b) => self.block(b),
+            Option::None => (),
+        };
+    }
+}
+
+fn program(inf: Infer) -> Text {
+    let w = Walk.{ inf, out: Out::new() };
+    let sigs = inf.sigs.sigs.values();
+    var i = 0usize;
+    while i < sigs.len() {
+        let sig = sigs.get(i);
+        let unit = match sig.decl {
+            Option::Some(decl) => match decl.node {
+                Named::Fn(node) => if node.body.is_some() {
+                    w.function(sig.name, node);
+                },
+                _ => (),
+            },
+            Option::None => (),
+        };
+        i = i + 1usize;
+    }
+    i = 0usize;
+    while i < inf.sigs.instances.len() {
+        let (inst, item, _home) = inf.sigs.instances.get(i);
+        var k = 0usize;
+        while k < inst.methods.len() {
+            w.function(Out::new().add(inst.trait_name).put("::").add(item.methods.get(k).name).done(), item.methods.get(k));
+            k = k + 1usize;
+        }
+        i = i + 1usize;
+    }
+    w.out.done()
+}
