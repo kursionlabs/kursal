@@ -37,10 +37,10 @@ class SpecializationTests(unittest.TestCase):
         backend = Backend(program, check_program(program))
         backend.emit_program()
         choose = program.funs["choose"]
-        keys = [args for (identity, args) in backend.symbols if identity == id(choose)]
+        keys = [args for args, _symbol in backend.symbols[id(choose)]]
         self.assertCountEqual(keys, [(C.Brand(C.Skolem("static")),), (C.UNIT,)])
         methods = {id(i.methods[0]) for i in program.instances["Pick"]}
-        self.assertEqual({identity for identity, _ in backend.symbols} & methods, methods)
+        self.assertEqual(set(backend.symbols) & methods, methods)
 
     def test_logical_keys_preserve_contracts_and_share_alpha_renamings(self):
         fun = constant("f", 0)
@@ -81,7 +81,7 @@ class SpecializationTests(unittest.TestCase):
         program = C.Program(funs={"mapper": mapper, "walk": walk, "caller": caller})
         backend = Backend(program, check_program(program))
         backend.emit_program()
-        keys = [args for (identity, args) in backend.symbols if identity == id(mapper)]
+        keys = [args for args, _symbol in backend.symbols[id(mapper)]]
         self.assertEqual(keys, [(C.U32, source)])
 
 

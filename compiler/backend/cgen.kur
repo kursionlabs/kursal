@@ -4,7 +4,7 @@
 // Generic functions are specialized on demand by logical type arguments. Representation erasure is
 // separate from code-specialization identity.
 
-use package::support::base::{Cell, Cx, Map, Out, Seq, Set, Text, key_same, text};
+use package::support::base::{Cell, Cx, Map, Out, Seq, Set, Text, text};
 use package::check::checker::{FunKey, matching_instance};
 use package::kurs::core::{Arm, Block, Data, Edge, Fun, ForeachType, Instr, Member, Param, Program, Terminator, Type};
 use package::kurs::core as C;
@@ -406,8 +406,8 @@ exposed struct Backend {
     pending: Map[Type['k], Type['k], 'k],
     forward: Seq[Text['k], 'k],
     defs: Seq[Text['k], 'k],
-    // specialization key (function, type arguments) -> C symbol
-    symbols: Seq[(FunKey['k], Seq[Type['k], 'k], Text['k]), 'k],
+    // function -> the type arguments of each of its specializations, and its C symbol
+    symbols: Map[FunKey['k], Seq[(Seq[Type['k], 'k], Text['k]), 'k], 'k],
     // the same, by structure: an earlier request with these very arguments
     symbol_index: Map[(FunKey['k], Seq[Type['k], 'k]), Text['k], 'k],
     queue: Seq[(FunKey['k], Fun['k], Map[Text['k], Type['k], 'k], Text['k]), 'k],
@@ -526,7 +526,7 @@ impl Backend['k] {
             pending: Map::new(&cx),
             forward: Seq::new(&cx),
             defs: Seq::new(&cx),
-            symbols: Seq::new(&cx),
+            symbols: Map::new(&cx),
             symbol_index: Map::new(&cx),
             queue: Seq::new(&cx),
             bodies: Seq::new(&cx),
@@ -776,19 +776,25 @@ impl Backend['k] {
             },
             Option::None => (),
         };
+        let earlier = match self.symbols.get(&cx, key) {
+            Option::Some(found) => found,
+            Option::None => {
+                let found: Seq[(Seq[Type['k], 'k], Text['k]), 'k] = Seq::new(&cx);
+                self.symbols.set(&cx, key, found);
+                found
+            },
+        };
         var s = 0usize;
-        while s < self.symbols.len(&cx) {
-            let (identity, previous, symbol) = self.symbols.get(&cx, s);
-            if key_same(&cx, identity, key) {
-                var same = true;
-                var i = 0usize;
-                while same && i < args.len(&cx) && i < previous.len(&cx) {
-                    same = equal(&cx, args.get(&cx, i), previous.get(&cx, i));
-                    i = i + 1usize;
-                }
-                if same {
-                    return symbol;
-                }
+        while s < earlier.len(&cx) {
+            let (previous, symbol) = earlier.get(&cx, s);
+            var same = true;
+            var i = 0usize;
+            while same && i < args.len(&cx) && i < previous.len(&cx) {
+                same = equal(&cx, args.get(&cx, i), previous.get(&cx, i));
+                i = i + 1usize;
+            }
+            if same {
+                return symbol;
             }
             s = s + 1usize;
         }
@@ -801,7 +807,7 @@ impl Backend['k] {
             t = t + 1usize;
         }
         let symbol = self.function_name(&cx, path, encode(&cx, identity));
-        self.symbols.push(&cx, (key, args, symbol));
+        earlier.push(&cx, (args, symbol));
         self.symbol_index.set(&cx, (key, args), symbol);
         self.queue.push(&cx, (key, fun, sub.copy(&cx), symbol));
         symbol

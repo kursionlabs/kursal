@@ -102,7 +102,7 @@ class Backend:
         self.pending: dict[Type, Tuple | Struct | Array | Enum] = {}      # named but not yet defined aggregates
         self.forward: list[str] = []
         self.defs: list[str] = []
-        self.symbols: dict[tuple[int, tuple[Type, ...]], str] = {}      # specialization key -> C symbol
+        self.symbols: dict[int, list[tuple[tuple[Type, ...], str]]] = {}  # function -> its specializations' arguments and C symbols
         self.queue: list[tuple[Fun, Mapping[str, Type], str]] = []
         self.bodies: list[str] = []
         self.protos: list[str] = []
@@ -209,15 +209,14 @@ class Backend:
         args = tuple(sub[p.name] for p in params)
         # Logical alpha-equivalence, not representation equality. Capture-avoiding
         # substitution may freshen bound names on recursive requests.
-        for (identity, previous), symbol in self.symbols.items():
-            if identity == id(fun) and all(equal(a, b) for a, b in zip(args, previous)):
+        for previous, symbol in self.symbols.get(id(fun), ()):
+            if all(equal(a, b) for a, b in zip(args, previous)):
                 return symbol
-        key = (id(fun), args)
         path, function_id = self.function_ids[id(fun)]
         signature = Fn(fun.ptypes, fun.ret, params, fun.unsafe, fun.places)
         symbol = self.function_name(path, encode((function_id, type_key(signature),
                                                   *(type_key(t) for t in args))))
-        self.symbols[key] = symbol
+        self.symbols.setdefault(id(fun), []).append((args, symbol))
         self.queue.append((fun, dict(sub), symbol))
         return symbol
 
