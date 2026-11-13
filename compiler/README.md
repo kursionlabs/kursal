@@ -14,6 +14,8 @@ produce the same output.
 | `core`, `sexpr` | `core.py`, `sexpr.py` | the KURS core and S-expressions |
 | `types`, `unify` | `types.py`, `unify.py` | substitution, equality, shapes; unification over `core::Meta` |
 | `literals`, `formation`, `layout`, `termination`, `coherence` | the same names | checks of literals, types, declarations and instances |
+| `resolve` | `resolve.py` | manifests, the package graph, and what every name names |
+| `resolved` | | a resolved program as text, for comparison with the reference resolver |
 | `main` | `__main__.py` | the command line |
 | `selftest` | | `kursalc selftest-types`, the type modules on small cases, for the tests |
 
@@ -74,6 +76,15 @@ stands for no position.
 counter is a `types::Fresh`, made once and passed to everything that may rename a binder: `subst`,
 `unify`, `match_head`, `Types`, `Formation`, `check_type_expansion`, `check_coherence`. Passing the
 same one everywhere numbers names as the reference compiler does.
+
+Where the reference wraps a phase in `with resolver.located(module, pos):`, call
+`r.locate(module, pos)` before it and `r.unlocate()` after, and report errors inside it with
+`r.fail(message, pos)` (a `pos` on line 0 is none): it adds the file, and the item's position when
+the error has none of its own. Lookups that the reference may catch (`ResolveError`) return a
+`Result[Target, Problem]` instead of stopping (`Resolver.lookup`); `Resolver.need` stops.
+
+The standard library is found as the reference finds it, in `$KURSAL_LIB`; without it, in `lib`
+beside the directory holding the compiler's binary (`PREFIX/bin/kursalc` reads `PREFIX/lib`).
 
 ## The language, for a compiler author
 

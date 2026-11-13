@@ -1,10 +1,12 @@
 """The self-hosted compiler in compiler/ agrees with this one: built by the reference compiler, its parser
 produces the same syntax tree for every source file in the repository, and rejects bad syntax with the
-same message; its type modules give the same results as these on small cases."""
+same message; its type modules give the same results as these on small cases; its resolver resolves
+every package in the repository to the same names, and rejects bad packages with the same message."""
 
 import dataclasses
 import hashlib
 import itertools
+import os
 import subprocess
 import sys
 import tempfile
@@ -22,6 +24,9 @@ from kursal.parser import parse
 from kursal.sexpr import KursError, List, read
 from kursal.termination import check_instance_termination, check_mono_termination
 from kursal.unify import Meta, match_head, unify, zonk
+from kursal import syntax as S
+from kursal.core import ModuleId
+from kursal.resolve import LIB, Decl, Resolver, resolve
 
 ROOT = Path(__file__).resolve().parents[2]
 COMPILER = ROOT / "compiler"
@@ -104,6 +109,174 @@ def normalized(text: str) -> str:
 
 def reference_dump(path: Path) -> str:
     return "".join(dump(item) + "\n" for item in parse(path.read_text(), str(path)))
+
+
+def module_text(module: ModuleId) -> str:
+    return f"{module.package}:{'::'.join(module.path)}"
+
+
+def decl_text(decl: Decl) -> str:
+    return f"{decl.kind} {module_text(decl.module)}:{decl.name}"
+
+
+def ref_text(ref: S.NameRef) -> str:
+    match ref:
+        case ("decl", decl):
+            return f"decl {decl_text(decl)}"
+        case ("variant" | "trait_method" as kind, decl, name):
+            return f"{kind} {decl_text(decl)} {name}"
+        case ("assoc", param, name):
+            return f"assoc {param} {name}"
+        case (kind, name):
+            return f"{kind} {name}"
+    raise TypeError(f"cannot print {ref!r}")
+
+
+def ref_lines(node: object, out: list[str]) -> None:
+    """The references in `node`, in the order of its dataclass fields, as compiler/resolved.kur
+    writes them. A declaration's `forall`, when it is not a field, comes last."""
+    if isinstance(node, (list, tuple)):
+        for child in node:
+            ref_lines(child, out)
+        return
+    if not dataclasses.is_dataclass(node):
+        return
+    if isinstance(node, S.ResolvedName) and node.ref is not None:
+        match node:
+            case S.TName():
+                label = "TName " + "::".join(node.path)
+            case S.Path():
+                label = "Path " + "::".join(node.names)
+            case _:
+                label = type(node).__name__
+        out.append(f"  {label} -> {ref_text(node.ref)}")
+    names = [f.name for f in dataclasses.fields(node) if f.init]
+    for name in names:
+        ref_lines(getattr(node, name), out)
+    if isinstance(node, S.Declaration) and "forall" not in names:
+        ref_lines(node.forall, out)
+
+
+def resolve_dump(resolver: Resolver) -> str:
+    """The canonical text of a resolved program, as compiler/resolved.kur writes it."""
+    out = []
+    for package in resolver.packages:
+        out.append(f"package {package.id} {package.name}")
+        out.append(f"  source_root {package.source_root}")
+        out.append("  entry " + ("_" if package.entry is None else "::".join(package.entry)))
+        out.append("  entry_decl " + ("_" if package.entry_decl is None else decl_text(package.entry_decl)))
+        out.extend(f"  dep {alias} {target}" for alias, target in package.deps.items())
+        out.extend(f"  file {module_text(module)} {file}" for module, file in package.files.items())
+    for scope in resolver.scopes.values():
+        out.append(f"scope {module_text(scope.module)}")
+        out.extend(f"  decl {name} {decl_text(decl)}" for name, decl in scope.decls.items())
+        out.extend(f"  import {alias} {'::'.join(path)}" for alias, path in scope.imports.items())
+        out.extend(f"  glob {'::'.join(path)}" for path in scope.globs)
+        out.extend(f"  export {name}" for name in sorted(scope.exports))
+    for scope in resolver.scopes.values():
+        out.append(f"refs {module_text(scope.module)}")
+        ref_lines(scope.items, out)
+    return "".join(line + "\n" for line in out)
+
+
+def reference_resolution(path: Path) -> str:
+    """The reference resolver's dump of the package at `path`, or its error."""
+    try:
+        return resolve_dump(resolve(path))
+    except KursError as error:
+        return f"error: {error}"
+
+
+def manifest(name: str, deps: tuple[str, ...] = (), entry: str | None = None) -> str:
+    text = f'[package]\nname="{name}"\nsource_root="."\n'
+    if entry:
+        text += f'kind="executable"\nentry="{entry}"\n'
+    for dep in deps:
+        text += f'[dependencies.{dep}]\npath="../{dep}"\n'
+    return text
+
+
+SHAPES = {
+    "lib/kur.toml": manifest("lib"),
+    "lib/lib.kur": "use package::shapes;\nexport shapes;\n",
+    "lib/shapes.kur": "exposed struct Point { x: u32 }\nfn make(a: u32) -> Point { Point.{ x: a } }\n"
+                      "enum Shape { Dot(Point), Empty }\nimpl Point { fn get(self) -> u32 { 0u32 } }\n"
+                      "trait Show { fn show(x: u32) -> u32; }\n",
+    "lib/hidden.kur": "fn secret() -> u32 { 0u32 }\n",
+    "app/kur.toml": manifest("app", ("lib",)),
+}
+
+
+def app(source: str, files: dict[str, str] | None = None) -> dict[str, str]:
+    """A package `app`, depending on a package `lib`, whose lib.kur is `source`; `files` adds or replaces files."""
+    return {**SHAPES, "app/lib.kur": source, **(files or {})}
+
+
+# Packages that resolution rejects: their files, by path, and the path to resolve.
+RESOLUTION_ERRORS: tuple[tuple[dict[str, str], str], ...] = (
+    (app("fn f() -> u32 { nothing() }\n"), "app"),
+    (app("fn f(x: Nothing) -> u32 { 0u32 }\n"), "app"),
+    (app("fn f() -> u32 { 0u32 }\nfn f() -> u32 { 1u32 }\n"), "app"),
+    (app("use lib::shapes::Point;\nuse lib::shapes::Point;\n"), "app"),
+    (app("use lib::shapes::make;\nfn make() -> u32 { 0u32 }\n"), "app"),
+    (app("use lib::shapes::Point as Copy;\n"), "app"),
+    (app("use lib::shapes as package;\n"), "app"),
+    (app("use package::a::X;\nfn f() -> u32 { X.() }\n", {"app/a.kur": "use package::X;\n"}), "app"),
+    (app("fn f() -> u32 { lib::hidden::secret() }\n"), "app"),
+    (app("fn f() -> u32 { lib::shapes }\n"), "app"),
+    (app("fn f() -> u32 { lib::shapes::Point::nope() }\n"), "app"),
+    (app("use lib::shapes::Shape;\nfn f() -> u32 { Shape::Dot::x() }\n"), "app"),
+    (app("use lib::shapes::Shape::Dot;\nfn f() -> u32 { Dot::x() }\n"), "app"),
+    (app("use package::f::*;\nfn f() -> u32 { g() }\n"), "app"),
+    (app("use lib::shapes::make;\nfn f(x: make) -> u32 { 0u32 }\n"), "app"),
+    (app("use lib::shapes::make;\nfn f() -> u32 { make.{ x: 1u32 } }\n"), "app"),
+    (app("use lib::shapes::Point;\nfn f() -> Point { Point.{ x } }\n"), "app"),
+    (app("use lib::shapes::Point;\nfn f(p: Point) -> u32 { match p { Point(x) => 0u32 } }\n"), "app"),
+    (app("fn f(x: builtin) -> () { () }\n"), "app"),
+    (app("fn f() -> u32 { u32::nope() }\n"), "app"),
+    (app("forall T where lib::shapes::make[T]. fn f(x: T) -> u32 { 0u32 }\n"), "app"),
+    (app("impl (u32, u32) { fn f(self) -> u32 { 0u32 } }\n"), "app"),
+    (app("use lib::shapes;\nimpl shapes { fn f(self) -> u32 { 0u32 } }\n"), "app"),
+    (app("struct P { x: u32 }\nimpl P { fn f(self) -> u32 { 0u32 } }\nimpl P { fn f(self) -> u32 { 1u32 } }\n"), "app"),
+    (app("module x;\n"), "app"),
+    (app("", {"app/kur.toml": manifest("app", ("lib",), "package::Nope")}), "app"),
+    (app("struct Main {}\n", {"app/kur.toml": manifest("app", ("lib",), "Main")}), "app"),
+    (app("", {"app/kur.toml": manifest("app", ("lib",), "lib::shapes::make")}), "app"),
+    ({"p/kur.toml": manifest("p"), "p/a.kur": ""}, "p"),
+    ({"p/kur.toml": '[package]\nname="p"\nsource_root="missing"\n'}, "p"),
+    ({"p/kur.toml": manifest("p"), "p/m.kur": "", "p/m/lib.kur": ""}, "p"),
+    ({"a/kur.toml": manifest("a", ("b",)), "a/lib.kur": "", "b/kur.toml": manifest("b", ("a",)), "b/lib.kur": ""}, "a"),
+    ({"p/kur.toml": '[package]\nname=12\nsource_root="."\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": '[package]\nname="p"\nsource_root=false\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": '[package]\nname="p"\nsyntax=12\nversion="1"\n[extra]\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": 'dependencies=[]\n[package]\nname="p"\nsource_root="."\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": manifest("p") + '[dependencies.x]\npath=3\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": manifest("p") + '[dependencies]\nx="../x"\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": 'package="p"\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": '# no name\n[package]\nsource_root="."\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": '[package]\nname="p"\nsource_root="."\nkind="executable"\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": '[package]\nname = "p" # the name\n"source_root" = "."\n[package.x]\n', "p/lib.kur": ""}, "p"),
+    ({"one.kur": "fn main() -> i32 { nothing() }\n"}, "one.kur"),
+    ({"one.kur": "fn f() -> Nothing { 0i32 }\n"}, "one.kur"),
+    (app("use package::a;\n", {"app/a.kur": "fn f() -> u32 {\n    g()\n}\n"}), "app"),
+    (app("use package::a;\n", {"app/a.kur": "fn f( {\n"}), "app"),
+    (app("use package::b::c::X;\nfn f() -> u32 { X() }\n", {"app/b/lib.kur": "", "app/b/c.kur": "use package::b::c::X;\n"}), "app/kur.toml"),
+    ({"p/kur.toml": manifest("p") + '[dependencies]\nx = { path = 3 }\n', "p/lib.kur": ""}, "p"),
+)
+
+
+# Packages that resolution accepts, spelled in other ways than the repository's.
+RESOLVED: tuple[tuple[dict[str, str], str], ...] = (
+    (app("use lib::shapes::*;\nfn f(a: u32) -> Point { make(a) }\n",
+         {"app/kur.toml": "# app\n[package]\n'name' = 'app'   # literal\nsource_root = \"\"\"\n.\"\"\"\n"
+                          "[dependencies]\nlib = { path = \"../lib/kur.toml\" }\n"}), "app/../app"),
+    (app("use lib::shapes::{Point, Shape, Show, make as mk};\n"
+         "forall T where Copy[T], Show[T]. fn f(a: u32, x: T) -> Point {\n"
+         "    let p = mk(a); let n = p.x; let q = Point::get(p); let s = Show::show(n);\n"
+         "    match Shape::Empty { Shape::Dot(d) => d, _ => Point.{ x: T::size } }\n}\n",
+         {"app/kur.toml": manifest("app", ("lib",)).replace('"', "'") + "kind = \"executable\"\nentry = \"package::run::main\"\n",
+          "app/run.kur": "fn main() -> i32 { 0i32 }\n"}), "app"),
+)
 
 
 SYNTAX_ERRORS = (
@@ -435,7 +608,41 @@ class CompilerTests(unittest.TestCase):
         cls.binary = build_compiler()
 
     def run_compiler(self, *args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([str(self.binary), *args], capture_output=True, text=True, timeout=600)
+        return subprocess.run([str(self.binary), *args], capture_output=True, text=True, timeout=600,
+                              env=dict(os.environ, KURSAL_LIB=str(LIB)))
+
+    def compiler_resolution(self, path: Path) -> str:
+        result = self.run_compiler("resolve", str(path))
+        if result.returncode != 0:
+            return f"error: {result.stderr.strip()}"
+        return result.stdout
+
+    def test_resolver_matches_reference(self):
+        packages = sorted({p.parent for top in ("examples", "lib") for p in (ROOT / top).glob("*/kur.toml")})
+        singles = sorted((ROOT / "examples/bad").glob("*.kur"))
+        self.assertGreater(len(packages), 40)
+        for path in [*packages, *singles, COMPILER]:
+            with self.subTest(path=str(path.relative_to(ROOT))):
+                expected = reference_resolution(path)
+                self.assertFalse(expected.startswith("error:"), expected)
+                self.assertEqual(self.compiler_resolution(path), expected)
+
+    def check_resolution(self, cases: tuple[tuple[dict[str, str], str], ...], fails: bool) -> None:
+        for index, (files, target) in enumerate(cases):
+            with self.subTest(case=index, files=files), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                for rel, text in files.items():
+                    (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                    (root / rel).write_text(text)
+                expected = reference_resolution(root / target)
+                self.assertEqual(expected.startswith("error:"), fails, expected)
+                self.assertEqual(self.compiler_resolution(root / target), expected)
+
+    def test_resolution_errors_match_reference(self):
+        self.check_resolution(RESOLUTION_ERRORS, True)
+
+    def test_manifests_and_names_match_reference(self):
+        self.check_resolution(RESOLVED, False)
 
     def test_parser_matches_reference(self):
         paths = sorted(p for top in ("lib", "examples", "compiler", "reference-compiler/examples")

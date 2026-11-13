@@ -1,0 +1,441 @@
+// A canonical text form of a resolved program, for comparing `resolve` with the reference
+// resolver: the packages, each module's scope, and then, module by module, every node that names
+// something, in the order the fields of the reference's `syntax.py` dataclasses list them (the
+// order `dump` prints them in).
+
+use package::base::{Map, Out, Seq, Text, text};
+use package::core::ModuleId;
+use package::resolve::{Decl, NameRef, Resolver, Scope, joined};
+use package::syntax as S;
+use package::syntax::{Expr, Pattern, Statement, Type};
+use std::option::Option;
+
+fn module_text(m: ModuleId) -> Text {
+    Out::new().usize(m.package).put(":").add(joined(m.path)).done()
+}
+
+fn decl_text(d: Decl) -> Text {
+    Out::new().add(d.kind).put(" ").add(module_text(d.home)).put(":").add(d.name).done()
+}
+
+fn ref_text(r: NameRef) -> Text {
+    match r {
+        NameRef::Decl(d) => text("decl ").concat(decl_text(d)),
+        NameRef::Variant(d, name) => Out::new().put("variant ").add(decl_text(d)).put(" ").add(name).done(),
+        NameRef::TraitMethod(d, name) => Out::new().put("trait_method ").add(decl_text(d)).put(" ").add(name).done(),
+        NameRef::Assoc(param, name) => Out::new().put("assoc ").add(param).put(" ").add(name).done(),
+        NameRef::Param(name) => text("param ").concat(name),
+        NameRef::Prim(name) => text("prim ").concat(name),
+        NameRef::Builtin(name) => text("builtin ").concat(name),
+        NameRef::Local(name) => text("local ").concat(name),
+    }
+}
+
+fn text_before(a: Text, b: Text) -> bool {
+    a.compare(b) < 0
+}
+
+fn program(r: Resolver) -> Text {
+    let out = Out::new();
+    var p = 0usize;
+    while p < r.packages.len() {
+        let package = r.packages.get(p);
+        let unit = out.put("package ").usize(package.id).put(" ").add(package.name.get()).put("\n");
+        let unit = out.put("  source_root ").add(package.source_root.get()).put("\n");
+        let unit = match package.entry.get() {
+            Option::Some(e) => out.put("  entry ").add(joined(e)).put("\n"),
+            Option::None => out.put("  entry _\n"),
+        };
+        let unit = match package.entry_decl.get() {
+            Option::Some(d) => out.put("  entry_decl ").add(decl_text(d)).put("\n"),
+            Option::None => out.put("  entry_decl _\n"),
+        };
+        let aliases = package.deps.keys();
+        var i = 0usize;
+        while i < aliases.len() {
+            let unit = out.put("  dep ").add(aliases.get(i)).put(" ").usize(package.deps.at(aliases.get(i))).put("\n");
+            i = i + 1usize;
+        }
+        let modules = package.files.keys();
+        i = 0usize;
+        while i < modules.len() {
+            let unit = out.put("  file ").add(module_text(modules.get(i))).put(" ").add(package.files.at(modules.get(i))).put("\n");
+            i = i + 1usize;
+        }
+        p = p + 1usize;
+    }
+    let scopes = r.scopes.values();
+    var s = 0usize;
+    while s < scopes.len() {
+        scope(out, scopes.get(s));
+        s = s + 1usize;
+    }
+    s = 0usize;
+    while s < scopes.len() {
+        let unit = out.put("refs ").add(module_text(scopes.get(s).home)).put("\n");
+        let w = Walk.{ refs: r.refs, out };
+        let items = scopes.get(s).items;
+        var i = 0usize;
+        while i < items.len() {
+            w.item(items.get(i));
+            i = i + 1usize;
+        }
+        s = s + 1usize;
+    }
+    out.done()
+}
+
+fn scope(out: Out, sc: Scope) {
+    let unit = out.put("scope ").add(module_text(sc.home)).put("\n");
+    let names = sc.decls.keys();
+    var i = 0usize;
+    while i < names.len() {
+        let unit = out.put("  decl ").add(names.get(i)).put(" ").add(decl_text(sc.decls.at(names.get(i)))).put("\n");
+        i = i + 1usize;
+    }
+    let aliases = sc.imports.keys();
+    i = 0usize;
+    while i < aliases.len() {
+        let unit = out.put("  import ").add(aliases.get(i)).put(" ").add(joined(sc.imports.at(aliases.get(i)))).put("\n");
+        i = i + 1usize;
+    }
+    i = 0usize;
+    while i < sc.globs.len() {
+        let unit = out.put("  glob ").add(joined(sc.globs.get(i))).put("\n");
+        i = i + 1usize;
+    }
+    let exports = sc.exports.items();
+    exports.sort(text_before);
+    i = 0usize;
+    while i < exports.len() {
+        let unit = out.put("  export ").add(exports.get(i)).put("\n");
+        i = i + 1usize;
+    }
+}
+
+// The references of the syntax tree, in field order.
+exposed struct Walk {
+    refs: Map[u32, NameRef],
+    out: Out,
+}
+
+impl Walk {
+    fn note(self, id: u32, label: Text) {
+        let unit = match self.refs.get(id) {
+            Option::Some(r) => self.out.put("  ").add(label).put(" -> ").add(ref_text(r)).put("\n"),
+            Option::None => self.out,
+        };
+    }
+
+    fn types(self, ts: Seq[Type]) {
+        var i = 0usize;
+        while i < ts.len() {
+            self.type(ts.get(i));
+            i = i + 1usize;
+        }
+    }
+
+    fn opt_type(self, t: Option[Type]) {
+        let unit = match t {
+            Option::Some(v) => self.type(v),
+            Option::None => (),
+        };
+    }
+
+    fn type(self, t: Type) {
+        match t {
+            Type::Name(n) => {
+                self.note(n.id, text("TName ").concat(joined(n.path)));
+                self.types(n.args);
+            },
+            Type::Ptr(inner) => self.type(inner.get()),
+            Type::Tuple(elems) => self.types(elems),
+            Type::Array(elem, length) => {
+                self.type(elem.get());
+                self.expr(length.get());
+            },
+            Type::Fn(f) => {
+                self.slots(f.params);
+                self.type(f.ret.get());
+            },
+            Type::Closure(c) => {
+                let unit = match c.env {
+                    Option::Some(env) => self.type(env.get()),
+                    Option::None => (),
+                };
+                self.slots(c.params);
+                self.type(c.ret.get());
+            },
+            Type::Exists(brands, body) => self.type(body.get()),
+            Type::Foreach(f) => {
+                self.type(f.source.get());
+                self.type(f.body.get());
+            },
+            Type::Forall(params, body) => self.type(body.get()),
+            _ => (),
+        }
+    }
+
+    fn slots(self, ss: Seq[S::Slot]) {
+        var i = 0usize;
+        while i < ss.len() {
+            self.type(ss.get(i).type);
+            i = i + 1usize;
+        }
+    }
+
+    fn exprs(self, es: Seq[Expr]) {
+        var i = 0usize;
+        while i < es.len() {
+            self.expr(es.get(i));
+            i = i + 1usize;
+        }
+    }
+
+    fn path(self, p: S::Path) {
+        self.note(p.id, text("Path ").concat(joined(p.names())));
+        var i = 0usize;
+        while i < p.segments.len() {
+            self.types(p.segments.get(i).args);
+            i = i + 1usize;
+        }
+    }
+
+    fn block(self, b: S::Block) {
+        var i = 0usize;
+        while i < b.stmts.len() {
+            self.statement(b.stmts.get(i));
+            i = i + 1usize;
+        }
+        let unit = match b.tail {
+            Option::Some(t) => self.expr(t.get()),
+            Option::None => (),
+        };
+    }
+
+    fn expr(self, e: Expr) {
+        match e {
+            Expr::FStr(f) => {
+                var i = 0usize;
+                while i < f.parts.len() {
+                    let unit = match f.parts.get(i) {
+                        S::Piece::Expr(x) => self.expr(x),
+                        S::Piece::Text(t) => (),
+                    };
+                    i = i + 1usize;
+                }
+            },
+            Expr::Path(p) => self.path(p),
+            Expr::Tuple(n) => self.exprs(n.value),
+            Expr::Array(a) => self.exprs(a.elems),
+            Expr::Sizeof(n) => self.type(n.value),
+            Expr::StructLit(s) => {
+                self.path(s.path);
+                var i = 0usize;
+                while i < s.fields.len() {
+                    let unit = match s.fields.get(i).value {
+                        Option::Some(v) => self.expr(v),
+                        Option::None => (),
+                    };
+                    i = i + 1usize;
+                }
+            },
+            Expr::Block(b) => self.block(b),
+            Expr::If(n) => {
+                self.expr(n.cond.get());
+                self.block(n.then);
+                let unit = match n.other {
+                    Option::Some(o) => self.expr(o.get()),
+                    Option::None => (),
+                };
+            },
+            Expr::Match(m) => {
+                self.expr(m.scrutinee.get());
+                var i = 0usize;
+                while i < m.arms.len() {
+                    let arm = m.arms.get(i);
+                    var k = 0usize;
+                    while k < arm.cases.len() {
+                        let unit = match arm.cases.get(k).path {
+                            Option::Some(p) => self.path(p),
+                            Option::None => (),
+                        };
+                        k = k + 1usize;
+                    }
+                    self.expr(arm.body);
+                    i = i + 1usize;
+                }
+            },
+            Expr::Closure(c) => {
+                var i = 0usize;
+                while i < c.params.len() {
+                    self.opt_type(c.params.get(i).type);
+                    i = i + 1usize;
+                }
+                self.opt_type(c.ret);
+                self.expr(c.body.get());
+            },
+            Expr::Return(n) => {
+                let unit = match n.value {
+                    Option::Some(v) => self.expr(v.get()),
+                    Option::None => (),
+                };
+            },
+            Expr::Pack(p) => self.expr(p.value.get()),
+            Expr::Foreach(f) => {
+                self.expr(f.source.get());
+                self.block(f.body);
+            },
+            Expr::Binop(b) => {
+                self.expr(b.left.get());
+                self.expr(b.right.get());
+            },
+            Expr::Unary(u) => self.expr(u.operand.get()),
+            Expr::Cast(c) => {
+                self.expr(c.value.get());
+                self.type(c.type);
+            },
+            Expr::UnsafeStore(s) => {
+                self.expr(s.pointer.get());
+                self.expr(s.value.get());
+            },
+            Expr::Field(f) => self.expr(f.value.get()),
+            Expr::Index(x) => self.expr(x.value.get()),
+            Expr::Call(c) => {
+                self.expr(c.callee.get());
+                self.exprs(c.args);
+            },
+            Expr::Try(n) => self.expr(n.value.get()),
+            Expr::While(w) => {
+                self.expr(w.cond.get());
+                self.block(w.body);
+            },
+            Expr::For(f) => {
+                self.expr(f.iterator.get());
+                self.block(f.body);
+            },
+            Expr::Lit(l) => (),
+        }
+    }
+
+    fn statement(self, s: Statement) {
+        match s {
+            Statement::Let(l) => {
+                self.opt_type(l.type);
+                self.expr(l.value);
+            },
+            Statement::Var(v) => {
+                self.opt_type(v.type);
+                self.expr(v.value);
+            },
+            Statement::Assign(a) => {
+                self.expr(a.target);
+                self.expr(a.value);
+            },
+            Statement::Expr(n) => self.expr(n.value),
+            Statement::Const(c) => self.const_decl(c),
+        }
+    }
+
+    fn quantifier(self, q: Option[S::Forall]) {
+        let unit = match q {
+            Option::Some(f) => {
+                var i = 0usize;
+                while i < f.premises.len() {
+                    let args = f.premises.get(i).args;
+                    self.note(args.id, text("TypeArgs"));
+                    self.types(args.args);
+                    i = i + 1usize;
+                }
+            },
+            Option::None => (),
+        };
+    }
+
+    fn params(self, ps: Seq[S::Param]) {
+        var i = 0usize;
+        while i < ps.len() {
+            self.opt_type(ps.get(i).type);
+            i = i + 1usize;
+        }
+    }
+
+    fn function(self, f: S::Fn) {
+        self.params(f.params);
+        self.opt_type(f.ret);
+        let unit = match f.body {
+            Option::Some(b) => self.block(b),
+            Option::None => (),
+        };
+        self.quantifier(f.quantifier);
+    }
+
+    fn const_decl(self, c: S::Const) {
+        self.type(c.type);
+        self.expr(c.value);
+        self.quantifier(c.quantifier);
+    }
+
+    fn item(self, it: S::Item) {
+        match it {
+            S::Item::Use(u) => self.quantifier(u.quantifier),
+            S::Item::Module(m) => (),
+            S::Item::Struct(s) => {
+                var i = 0usize;
+                while i < s.fields.len() {
+                    self.type(s.fields.get(i).type);
+                    i = i + 1usize;
+                }
+                self.quantifier(s.quantifier);
+            },
+            S::Item::Tuple(t) => {
+                self.types(t.elems);
+                self.quantifier(t.quantifier);
+            },
+            S::Item::Enum(e) => {
+                var i = 0usize;
+                while i < e.variants.len() {
+                    self.types(e.variants.get(i).payload);
+                    i = i + 1usize;
+                }
+                self.quantifier(e.quantifier);
+            },
+            S::Item::Fn(f) => self.function(f),
+            S::Item::Extern(x) => {
+                self.params(x.params);
+                self.opt_type(x.ret);
+                self.quantifier(x.quantifier);
+            },
+            S::Item::Const(c) => self.const_decl(c),
+            S::Item::Impl(m) => {
+                self.type(m.type);
+                var i = 0usize;
+                while i < m.items.len() {
+                    let unit = match m.items.get(i) {
+                        S::Member::Fn(f) => self.function(f),
+                        S::Member::Const(c) => self.const_decl(c),
+                    };
+                    i = i + 1usize;
+                }
+                self.quantifier(m.quantifier);
+            },
+            S::Item::Trait(t) => {
+                var i = 0usize;
+                while i < t.methods.len() {
+                    self.function(t.methods.get(i));
+                    i = i + 1usize;
+                }
+                self.quantifier(t.quantifier);
+            },
+            S::Item::Instance(n) => {
+                self.type(n.type);
+                var i = 0usize;
+                while i < n.methods.len() {
+                    self.function(n.methods.get(i));
+                    i = i + 1usize;
+                }
+                self.quantifier(n.quantifier);
+            },
+        }
+    }
+}
