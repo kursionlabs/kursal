@@ -38,7 +38,9 @@ use alloc::owned::Allocation;
 use core::mem::Region;
 use core::mem::RegionResume;
 use alloc::buffer::Buffer;
-use core::raw::Span;
+use core::raw::{Span, elem_ptr};
+use core::slice::Slice;
+use alloc::heap::checked_mul;
 
 struct Chunk {
     data: *u8,
@@ -276,6 +278,26 @@ impl Arena['k] {
         // `exists` (unlike `Vec::push`, which may relocate its one block).
         self = Arena.{ root: a, back: bk, current: cur2, marker: m };
         r
+    }
+
+    // Allocates room for `count` values of `T` in one naturally aligned
+    // block, writes `fill` into each, and hands back a view of them under
+    // the arena's brand, which, as with `alloc`, never changes. `T` is
+    // `Copy` because `fill` is written `count` times.
+    forall T where Copy[T].
+    fn alloc_slice(&self, &tag: Exclusive!['k], count: usize, fill: T) -> Slice[T, 'k] {
+        let { root: a, back: bk, current: cur, marker: m } = self;
+        let (cur2, target) = unsafe bump_chunk(cur, checked_mul(count, sizeof[T]()), type_align[T]());
+        let base = unsafe (target as *T);
+        var i = 0usize;
+        while i < count {
+            unsafe *(unsafe elem_ptr(base, i)) = fill;
+            i = i + 1usize;
+        }
+        self = Arena.{ root: a, back: bk, current: cur2, marker: m };
+        // `count` values were just carved out of this arena's own chunk and
+        // initialized; the arena's chunks are the domain `m` names.
+        unsafe Slice::from_raw_parts(base, count, m)
     }
 
     // Frees every chunk. See the module comment for why this cannot route

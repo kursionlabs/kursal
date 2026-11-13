@@ -1,0 +1,352 @@
+// A growable sequence whose storage lives in the caller's `Arena!['k]`.
+//
+// The handle is `Copy`: it names one header in the arena, so every copy of
+// it sees every change made through any other, and its brand never
+// changes. That is the difference from `Vec!`, which owns one heap block
+// and rebrands on every growth: an `ArenaVec` can sit inside other `Copy`
+// arena data (a syntax tree's children, a table's rows).
+//
+// Elements never move. The storage is a run of segments, each twice the
+// size of the one before, and growing adds a segment rather than copying
+// into a bigger block, so nothing is left behind for the arena to hold: a
+// vec of `n` elements takes under `2n` elements of room, plus a table of
+// one pointer per segment after the first. A `Ref` from `get_ref` names its
+// element for as long as the arena lives. The first segment holds at least
+// 4 elements and at least 32 bytes, so short runs of bytes stay in one
+// piece; `span` copies longer ones into one block of the arena.
+//
+// Elements are `Copy` and are read and written whole. Every access
+// presents the arena's `Exclusive!['k]`; growing also needs the arena
+// itself, which alone may put new blocks in its domain.
+//
+// `Header` and `ArenaVec` are restricted: only this module builds or opens
+// them. The unsafe reads and writes below rely on what that protects: the
+// header's `segments` blocks are live arena memory of the sizes `locate`
+// computes, segment 0 at `first` and segment `k` at `table[k - 1]`, and
+// `len` never exceeds their total.
+
+use package as alloc;
+
+use alloc::arena::Arena;
+use core::cap::Exclusive;
+use core::mem::Ref;
+use core::option::Option;
+use core::raw::{Span, elem_ptr};
+use core::slice::Slice;
+
+forall T, 'k.
+struct Header {
+    len: usize,
+    segments: usize,
+    // Segment 0, or null before the first element.
+    first: *T,
+    // Segments 1 and on, or null; room for the next power of two of
+    // `segments - 1` pointers.
+    table: *(*T),
+}
+
+forall T, 'k.
+struct ArenaVec {
+    header: Ref[Header[T, 'k], 'k],
+}
+
+// The size of segment 0: at least 4 elements and 32 bytes, a power of two.
+forall T.
+fn first_capacity() -> usize {
+    let size = sizeof[T]();
+    if size >= 8usize {
+        4usize
+    } else if size >= 4usize {
+        8usize
+    } else if size >= 2usize {
+        16usize
+    } else {
+        32usize
+    }
+}
+
+// The segment holding element `i`, and its offset there. Segment `k` holds
+// `first_capacity() << k` elements, and the segments before it
+// `first_capacity() * (2^k - 1)`.
+forall T.
+fn locate(i: usize) -> (usize, usize) {
+    let b = first_capacity[T]();
+    if i < b {
+        return (0usize, i);
+    }
+    var q = i / b + 1usize;
+    var k = 0usize;
+    if q >= 65536usize {
+        k = k + 16usize;
+        q = q >> 16usize;
+    }
+    if q >= 256usize {
+        k = k + 8usize;
+        q = q >> 8usize;
+    }
+    if q >= 16usize {
+        k = k + 4usize;
+        q = q >> 4usize;
+    }
+    if q >= 4usize {
+        k = k + 2usize;
+        q = q >> 2usize;
+    }
+    if q >= 2usize {
+        k = k + 1usize;
+    }
+    (k, i - b * ((1usize << k) - 1usize))
+}
+
+forall T.
+fn null_of() -> *T {
+    unsafe (0usize as *T)
+}
+
+// Where element `i` of `h`'s storage lives. `unsafe`: `i` is below the
+// capacity of `h`'s segments.
+forall T, 'k.
+unsafe fn place(h: Header[T, 'k], i: usize) -> *T {
+    if i < first_capacity[T]() {
+        return unsafe elem_ptr(h.first, i);
+    }
+    let (k, offset) = locate[T](i);
+    let base = if k == 0usize {
+        h.first
+    } else {
+        unsafe *(unsafe elem_ptr(h.table, k - 1usize))
+    };
+    unsafe elem_ptr(base, offset)
+}
+
+// The number of elements `h`'s segments hold.
+forall T, 'k.
+fn capacity(h: Header[T, 'k]) -> usize {
+    first_capacity[T]() * ((1usize << h.segments) - 1usize)
+}
+
+// `h` with one more segment, its elements set to `fill`.
+forall T, 'k where Copy[T].
+fn add_segment(&tag: Exclusive!['k], &arena: Arena!['k], h: Header[T, 'k], fill: T) -> Header[T, 'k] {
+    let k = h.segments;
+    let block = &arena.alloc_slice(&tag, first_capacity[T]() << k, fill);
+    let (base, size, marker) = block.into_parts();
+    if k == 0usize {
+        return Header.{ len: h.len, segments: 1usize, first: base, table: h.table };
+    }
+    // The table holds `k - 1` pointers; at a power of two it is full.
+    let used = k - 1usize;
+    let table = if used == 0usize || (used & (used - 1usize)) == 0usize {
+        let grown = &arena.alloc_slice(&tag, if used == 0usize { 1usize } else { used * 2usize }, base);
+        let (fresh, room, m) = grown.into_parts();
+        var j = 0usize;
+        while j < used {
+            unsafe *(unsafe elem_ptr(fresh, j)) = unsafe *(unsafe elem_ptr(h.table, j));
+            j = j + 1usize;
+        }
+        fresh
+    } else {
+        h.table
+    };
+    unsafe *(unsafe elem_ptr(table, used)) = base;
+    Header.{ len: h.len, segments: k + 1usize, first: h.first, table }
+}
+
+forall T, 'k where Copy[T].
+impl ArenaVec[T, 'k] {
+    // An empty vec. It takes no room for elements until its first one.
+    fn new(&tag: Exclusive!['k], &arena: Arena!['k]) -> ArenaVec[T, 'k] {
+        let header = &arena.alloc(&tag, Header.{ len: 0usize, segments: 0usize, first: null_of[T](), table: null_of[*T]() });
+        ArenaVec.{ header }
+    }
+
+    // `count` copies of `fill`.
+    fn filled(&tag: Exclusive!['k], &arena: Arena!['k], count: usize, fill: T) -> ArenaVec[T, 'k] {
+        let v: ArenaVec[T, 'k] = ArenaVec::new(&tag, &arena);
+        v.resize(&tag, &arena, count, fill);
+        v
+    }
+
+    fn len(self, &tag: Exclusive!['k]) -> usize {
+        self.header.copy(&tag).len
+    }
+
+    fn is_empty(self, &tag: Exclusive!['k]) -> bool {
+        self.header.copy(&tag).len == 0usize
+    }
+
+    // The vec's identity, as a number: equal for copies of one handle,
+    // different for different vecs (`Ref::address`).
+    fn address(self) -> usize {
+        self.header.address()
+    }
+
+    // Element `i`, or `None` past the end.
+    fn get(self, &tag: Exclusive!['k], i: usize) -> Option[T] {
+        let h = self.header.copy(&tag);
+        if i < h.len {
+            Option::Some.(unsafe *(unsafe place(h, i)))
+        } else {
+            Option::None
+        }
+    }
+
+    // Where element `i` lives, or `None` past the end. Elements never move,
+    // so the place is the element's for as long as the arena lives.
+    fn get_ref(self, &tag: Exclusive!['k], i: usize) -> Option[Ref[T, 'k]] {
+        let h = self.header.copy(&tag);
+        if i < h.len {
+            let (at, marker) = self.header.into_parts();
+            // In range of the vec's segments, which are memory of this
+            // arena's domain, the one the header's own brand names.
+            Option::Some.(unsafe Ref::from_raw(unsafe place(h, i), marker))
+        } else {
+            Option::None
+        }
+    }
+
+    // Replaces element `i`, handing back the value it held; `None`, and no
+    // change, past the end.
+    fn set(self, &tag: Exclusive!['k], i: usize, value: T) -> Option[T] {
+        let h = self.header.copy(&tag);
+        if i < h.len {
+            let at = unsafe place(h, i);
+            let old = unsafe *at;
+            unsafe *at = value;
+            Option::Some.(old)
+        } else {
+            Option::None
+        }
+    }
+
+    fn last(self, &tag: Exclusive!['k]) -> Option[T] {
+        let h = self.header.copy(&tag);
+        if h.len == 0usize {
+            Option::None
+        } else {
+            Option::Some.(unsafe *(unsafe place(h, h.len - 1usize)))
+        }
+    }
+
+    fn push(self, &tag: Exclusive!['k], &arena: Arena!['k], value: T) {
+        let h = self.header.copy(&tag);
+        let h = if h.len < capacity(h) { h } else { add_segment(&tag, &arena, h, value) };
+        unsafe *(unsafe place(h, h.len)) = value;
+        let previous = self.header.replace(&tag, Header.{ len: h.len + 1usize, segments: h.segments, first: h.first, table: h.table });
+    }
+
+    // Removes and hands back the last element, or `None` when empty.
+    fn pop(self, &tag: Exclusive!['k]) -> Option[T] {
+        let h = self.header.copy(&tag);
+        if h.len == 0usize {
+            return Option::None;
+        }
+        let value = unsafe *(unsafe place(h, h.len - 1usize));
+        let previous = self.header.replace(&tag, Header.{ len: h.len - 1usize, segments: h.segments, first: h.first, table: h.table });
+        Option::Some.(value)
+    }
+
+    // Keeps the first `len` elements; nothing changes when there are no
+    // more than that.
+    fn truncate(self, &tag: Exclusive!['k], len: usize) {
+        let h = self.header.copy(&tag);
+        if len < h.len {
+            let previous = self.header.replace(&tag, Header.{ len, segments: h.segments, first: h.first, table: h.table });
+        }
+    }
+
+    fn clear(self, &tag: Exclusive!['k]) {
+        self.truncate(&tag, 0usize);
+    }
+
+    // Grows to `len` elements, the new ones set to `fill`, or keeps the
+    // first `len`.
+    fn resize(self, &tag: Exclusive!['k], &arena: Arena!['k], len: usize, fill: T) {
+        var h = self.header.copy(&tag);
+        if len <= h.len {
+            self.truncate(&tag, len);
+            return;
+        }
+        while capacity(h) < len {
+            h = add_segment(&tag, &arena, h, fill);
+        }
+        var i = h.len;
+        while i < len {
+            unsafe *(unsafe place(h, i)) = fill;
+            i = i + 1usize;
+        }
+        let previous = self.header.replace(&tag, Header.{ len, segments: h.segments, first: h.first, table: h.table });
+    }
+
+    // Pushes every element of `other`, in order. `other` may be `self`.
+    fn append(self, &tag: Exclusive!['k], &arena: Arena!['k], other: ArenaVec[T, 'k]) {
+        let n = other.len(&tag);
+        var i = 0usize;
+        while i < n {
+            let unit = match other.get(&tag, i) {
+                Option::Some(value) => self.push(&tag, &arena, value),
+                Option::None => (),
+            };
+            i = i + 1usize;
+        }
+    }
+
+    // A new vec holding the same elements.
+    fn clone(self, &tag: Exclusive!['k], &arena: Arena!['k]) -> ArenaVec[T, 'k] {
+        let copy: ArenaVec[T, 'k] = ArenaVec::new(&tag, &arena);
+        copy.append(&tag, &arena, self);
+        copy
+    }
+}
+
+forall 'k.
+impl ArenaVec[u8, 'k] {
+    // Pushes the bytes of `bytes`, a span of the same domain.
+    fn push_span(self, &tag: Exclusive!['k], &arena: Arena!['k], bytes: Span['k]) {
+        let n = bytes.len();
+        if n == 0usize {
+            return;
+        }
+        var h = self.header.copy(&tag);
+        while capacity(h) < h.len + n {
+            h = add_segment(&tag, &arena, h, 0u8);
+        }
+        // `bytes` is read under the domain's capability, which `tag` is.
+        let (source, count) = bytes.into_parts();
+        var i = 0usize;
+        while i < n {
+            unsafe *(unsafe place(h, h.len + i)) = unsafe *(unsafe elem_ptr(source, i));
+            i = i + 1usize;
+        }
+        let previous = self.header.replace(&tag, Header.{ len: h.len + n, segments: h.segments, first: h.first, table: h.table });
+    }
+
+    // Pushes the bytes of a literal.
+    fn push_static(self, &tag: Exclusive!['k], &arena: Arena!['k], bytes: Slice[u8, 'static]) {
+        self.push_span(&tag, &arena, Span::from_static(&tag, bytes));
+    }
+
+    // The bytes the vec holds now, as one span: a view of them while they
+    // fit the first segment, else a copy in one block of the arena. Later
+    // pushes do not lengthen it; a `set`, or a push after a `truncate`,
+    // rewrites the bytes of a view.
+    fn span(self, &tag: Exclusive!['k], &arena: Arena!['k]) -> Span['k] {
+        let h = self.header.copy(&tag);
+        if h.len == 0usize {
+            return Span::empty(&tag);
+        }
+        if h.segments == 1usize {
+            // The first `len` bytes of segment 0: initialized, and arena
+            // memory of the domain `tag` governs.
+            return unsafe Span::from_raw_parts(&tag, h.first, h.len);
+        }
+        let block = &arena.alloc_slice(&tag, h.len, 0u8);
+        let (dest, size, marker) = block.into_parts();
+        var i = 0usize;
+        while i < h.len {
+            unsafe *(unsafe elem_ptr(dest, i)) = unsafe *(unsafe place(h, i));
+            i = i + 1usize;
+        }
+        Span::from_slice(block)
+    }
+}
