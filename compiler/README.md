@@ -16,6 +16,7 @@ produce the same output.
 | `literals`, `formation`, `layout`, `termination`, `coherence` | the same names | checks of literals, types, declarations and instances |
 | `resolve` | `resolve.py` | manifests, the package graph, and what every name names |
 | `resolved` | | a resolved program as text, for comparison with the reference resolver |
+| `kurs` | `kurs.py` | serialized KURS: its reader and writer |
 | `main` | `__main__.py` | the command line |
 | `selftest` | | `kursalc selftest-types`, the type modules on small cases, for the tests |
 
@@ -26,6 +27,8 @@ From `reference-compiler/`:
 ```sh
 uv run python tools/build.py ../compiler /tmp/kursalc --times   # build with the reference compiler
 /tmp/kursalc parse ../examples/lisp/lib.kur                      # one command of the compiler
+uv run python tools/build.py ../examples/wc /tmp/wc --kurs /tmp/wc.kurs   # also write its KURS
+/tmp/kursalc kurs /tmp/wc.kurs                                   # read KURS and write it back
 uv run python tools/test.py tests.test_compiler                  # compare with the reference compiler
 ```
 

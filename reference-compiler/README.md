@@ -20,7 +20,7 @@ development tools (`pyproject.toml`, `uv.lock`); mypy checks `kursal/`.
 | Checking | `check.py` | acceptance by the core rules |
 | C | `cgen.py`, `mangle.py` | one C translation unit |
 
-`kurs.py` reads serialized KURS (S-expressions, `sexpr.py`), and `readable.py`
+`kurs.py` reads and writes serialized KURS (S-expressions, `sexpr.py`), and `readable.py`
 prints it in the readable notation.
 
 ## A worked example: Counter

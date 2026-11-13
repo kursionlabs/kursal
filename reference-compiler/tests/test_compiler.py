@@ -1,7 +1,9 @@
 """The self-hosted compiler in compiler/ agrees with this one: built by the reference compiler, its parser
 produces the same syntax tree for every source file in the repository, and rejects bad syntax with the
 same message; its type modules give the same results as these on small cases; its resolver resolves
-every package in the repository to the same names, and rejects bad packages with the same message."""
+every package in the repository to the same names, and rejects bad packages with the same message;
+its KURS reader and writer read every lowered program and write it back as this compiler's writer
+does, and reject malformed KURS with the same message."""
 
 import dataclasses
 import hashlib
@@ -11,7 +13,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+from typing import Optional
 
 from kursal import core as C
 from kursal import types as T
@@ -27,6 +31,10 @@ from kursal.unify import Meta, match_head, unify, zonk
 from kursal import syntax as S
 from kursal.core import ModuleId
 from kursal.resolve import LIB, Decl, Resolver, resolve
+from kursal.kurs import parse_program, write_program
+from kursal.lower import lower
+from kursal.sigs import signatures
+from tests.test_kurs import CANONICAL, VARIANTS, packages
 
 ROOT = Path(__file__).resolve().parents[2]
 COMPILER = ROOT / "compiler"
@@ -294,6 +302,42 @@ SYNTAX_ERRORS = (
     "fn f() { let s = \"\\q\"; }",
     "fn f() -> u32 { p.0.1 }",
 )
+
+KURS_ERRORS = (
+    "garbage",
+    "(fun main i32 () garbage)",
+    "(type T (struct u32))",
+    "(type T (forall (A) ((Copy (tuple u32))) A))",
+    "(type T (forall (A) ((Copy B)) A))",
+    "(widget x)",
+    "((widget) x)",
+    "(fun f u32 ()\n  (entry ()\n    (leap)))",
+    "(fun f u32 () (entry () ((a 'b' \"c\\n\") c)))",
+    "(fun f u32 () (entry () (= %x) (ret %x)))",
+    "(type T (exists (a) u32))",
+    "(type T (exists (($a it's)) u32))",
+    "(type T $)",
+    "(type T ())",
+    "(type T ((tuple) u32))",
+    "(type T (foreach (F u32) u32 (keep F)))",
+    "(type T (foreach (F u32)))",
+    "(type T (builtin::Fn (forall () ((Eq u32)) u32 ())))",
+    "(fun f u32 () (entry () (opened &p) (ret %x)))",
+    "(type T u32",
+    ")",
+    '(data d u8 "\\q")',
+    '(data d u8 "abc',
+)
+
+
+def serialized(package: Path) -> tuple[str, Optional[str]]:
+    """(package, its lowered program as KURS, or None if it does not build)."""
+    sys.setrecursionlimit(20000)
+    try:
+        resolver = resolve(package)
+        return package.name, write_program(lower(resolver, signatures(resolver)))
+    except KursError:
+        return package.name, None
 
 
 # Cases for `kursalc selftest-types`; compiler/selftest.kur describes their forms.
@@ -681,6 +725,35 @@ class CompilerTests(unittest.TestCase):
                     with self.assertRaises(KursError) as raised:
                         parse(source, str(path))
                     result = self.run_compiler("parse", str(path))
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.stderr.strip(), str(raised.exception))
+
+    def test_kurs_matches_reference(self):
+        """Each case is (name, KURS text, what the reference writer writes for it)."""
+        cases = [("canonical", CANONICAL, CANONICAL)]
+        cases += [(f"variant{i}", CANONICAL.replace(canonical, variant), CANONICAL)
+                  for i, (canonical, variant) in enumerate(VARIANTS)]
+        with ProcessPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
+            programs = [(name, text, text) for name, text in pool.map(serialized, packages()) if text is not None]
+        self.assertGreaterEqual(len(programs), 50)
+        with tempfile.TemporaryDirectory() as directory:
+            for name, text, expected in cases + programs:
+                with self.subTest(case=name):
+                    path = Path(directory) / f"{name}.kurs"
+                    path.write_text(text)
+                    result = self.run_compiler("kurs", str(path))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, expected)
+
+    def test_kurs_errors_match_reference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for index, source in enumerate(KURS_ERRORS):
+                with self.subTest(source=source):
+                    path = Path(directory) / f"case{index}.kurs"
+                    path.write_text(source)
+                    with self.assertRaises(KursError) as raised:
+                        parse_program(source)
+                    result = self.run_compiler("kurs", str(path))
                     self.assertEqual(result.returncode, 1)
                     self.assertEqual(result.stderr.strip(), str(raised.exception))
 

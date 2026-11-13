@@ -1,6 +1,6 @@
-"""Read the KURS S-expression serialization into the core IR.
+"""Read the KURS S-expression serialization into the core IR, and write it back.
 
-This input adapter is separate from the strictly typed IR and type operations.
+This adapter is separate from the strictly typed IR and type operations.
 """
 
 from __future__ import annotations
@@ -8,7 +8,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import replace
 from typing import NoReturn, TypeGuard, Optional
-from .sexpr import Atom, Form, KursError, List, Position, read
+from .sexpr import Atom, Form, KursError, List, Position, Str, read
 from .core import (ANY, BRAND, COPY, PRIMS, Array, Arm, Block, Brand, Data,
                    Edge, Enum, Exists, Exposure, Extern, Fn, Foreach, Fun, Ignored, Instance,
                    Instr, Jmp, Jnz, Method, ModuleId, Named, Never, Param, Premise,
@@ -94,9 +94,18 @@ def parse_type(form: Form) -> Type:
             params, premises = parse_forall(header[1], header[2])
             if premises:
                 _fail("a function type has no premises", header)
-            return Fn(tuple(parse_type(t) for t in _list(header[4])), parse_type(header[3]), params, unsafe)
-        return Fn(tuple(parse_type(t) for t in _list(rest[0])), parse_type(rest[1]), unsafe=unsafe)
+            ptypes, places = _ptypes(header[4])
+            return Fn(ptypes, parse_type(header[3]), params, unsafe, places)
+        ptypes, places = _ptypes(rest[0])
+        return Fn(ptypes, parse_type(rest[1]), unsafe=unsafe, places=places)
     return Named(head.rstrip("!"), tuple(parse_type(t) for t in rest))
+
+
+def _ptypes(form: Form) -> tuple[tuple[Type, ...], frozenset[int]]:
+    """A function type's or trait method's `(PTYPE*)`, where `(& T)` is a place parameter of type T."""
+    forms = _list(form)
+    places = frozenset(i for i, f in enumerate(forms) if _is(f, "&", 2))
+    return tuple(parse_type(f[1] if _is(f, "&", 2) else f) for f in forms), places
 
 
 def parse_forall(
@@ -289,7 +298,9 @@ def parse_program(text: str) -> Program:
             for method in map(_list, rest[2:]):
                 m_unsafe = _is(method[0], "unsafe", 1)
                 m = method[1:] if m_unsafe else method
-                trait_methods.append(Method(str(m[0]), parse_type(m[1]), tuple(parse_type(t) for t in _list(m[2])), m_unsafe))
+                ret = parse_type(m[1])
+                ptypes, places = _ptypes(m[2])
+                trait_methods.append(Method(str(m[0]), ret, ptypes, m_unsafe, places))
             params, _ = parse_forall(rest[1], List())
             program.traits[str(rest[0])] = Trait(str(rest[0]), tuple(p.name for p in params),
                                                 tuple(trait_methods), module, tuple(p.kind for p in params))
@@ -310,3 +321,300 @@ def parse_program(text: str) -> Program:
         else:
             _fail(f"unknown declaration {head}", form)
     return program
+
+
+# ------------------------------------------------------------------ writing --
+#
+# `write_program` is the inverse of `parse_program`: one top-level form per declaration, and in a
+# function one block header, clause, instruction or terminator per line. Every part has one spelling,
+# so equal programs are written as equal text.
+
+_ESCAPES = {"\n": "\\n", "\t": "\\t", "\r": "\\r", "\\": "\\\\", '"': '\\"'}
+
+
+def _cannot(what: str) -> NoReturn:
+    raise KursError(f"cannot write {what} as KURS")
+
+
+def write_string(text: str) -> str:
+    """`text` as a string literal."""
+    out = []
+    for c in text:
+        if c in _ESCAPES:
+            out.append(_ESCAPES[c])
+        elif c < " " or c == "\x7f":
+            out.append(f"\\x{ord(c):02x}")
+        else:
+            out.append(c)
+    return '"' + "".join(out) + '"'
+
+
+def write_atom(text: str) -> str:
+    """`text` as an atom, or as a string literal when it is not a single word."""
+    if not text or any(c <= " " or c in '();"\x7f' for c in text):
+        return write_string(text)
+    return text
+
+
+def _form(parts: Sequence[str]) -> str:
+    return "(" + " ".join(parts) + ")"
+
+
+def write_form(form: Form) -> str:
+    if isinstance(form, List):
+        return _form([write_form(f) for f in form])
+    if isinstance(form, Str):
+        return write_string(form)
+    return write_atom(form)
+
+
+def write_type(ty: Type) -> str:
+    match ty:
+        case Ignored():
+            return "_"
+        case Never():
+            return "!"
+        case Skolem(label=label):
+            return write_atom("$" + label)
+        case Prim(name=name):
+            return name
+        case Named(name=name, args=()):
+            return write_atom(name)
+        case Named(name=name, args=args):
+            return _form([write_atom(name), *map(write_type, args)])
+        case Struct(fields=fields):
+            return _form(["struct", *_bindings(fields)])
+        case Enum(variants=variants):
+            return _form(["enum", *_bindings(variants)])
+        case Tuple(elems=elems):
+            return _form(["tuple", *map(write_type, elems)])
+        case Array(elem=elem, length=length):
+            return _form(["array", write_type(elem), str(length)])
+        case Ptr(inner=inner):
+            return _form(["builtin::Pointer", write_type(inner)])
+        case Brand(brand=Skolem(label=label)):
+            return _form(["builtin::Brand", write_atom("$" + label)])
+        case Exists(binders=binders, body=body):
+            return _form(["exists", _brands(binders), write_type(body)])
+        case Foreach(binder=binder, indirect=indirect, source=source, body=body, retained=retained):
+            pattern = _form(["builtin::Pointer", write_atom(binder)]) if indirect else write_atom(binder)
+            parts = ["foreach", _form([pattern, write_type(source)]), write_type(body)]
+            inferred = (source.binder, *(source.retained or ())) if isinstance(source, Foreach) else ()
+            if retained != inferred:
+                parts.append(_form(["retain", *map(write_atom, retained or ())]))
+            return _form(parts)
+        case Fn(params=params, ret=ret, forall=forall, unsafe=unsafe, places=places):
+            parts = ["builtin::Fn", *(["(unsafe)"] if unsafe else [])]
+            if forall:
+                parts.append("(" + write_forall(forall, ()) + " " + write_type(ret) + " "
+                             + _write_ptypes(params, places) + ")")
+            else:
+                parts += [_write_ptypes(params, places), write_type(ret)]
+            return _form(parts)
+    _cannot(f"the type {ty}")
+
+
+def _brands(labels: Sequence[str]) -> str:
+    return _form([write_atom("$" + label) for label in labels])
+
+
+def _bindings(bindings: Sequence[tuple[str, Type]]) -> list[str]:
+    """`(name TYPE)` for each pair: fields, variants, parameters, locals."""
+    return [_form([write_atom(name), write_type(ty)]) for name, ty in bindings]
+
+
+def _write_ptypes(ptypes: Sequence[Type], places: frozenset[int]) -> str:
+    return _form([_form(["&", write_type(t)]) if i in places else write_type(t) for i, t in enumerate(ptypes)])
+
+
+def write_forall(params: Sequence[Param], premises: Sequence[Premise]) -> str:
+    """`forall (PARAM*) (PREMISE*)`, the start of a forall form; a Copy parameter has a `(Copy T)` premise."""
+    names = [write_atom("$" + p.name if p.kind == BRAND else p.name) for p in params]
+    copies = [_form(["Copy", write_atom(p.name)]) for p in params if p.kind == COPY]
+    others = [_form([write_atom(p.trait), *map(write_type, p.args)]) for p in premises]
+    return "forall " + _form(names) + " " + _form(copies + others)
+
+
+def _applied_text(name: str, tys: Sequence[Type]) -> str:
+    """`name` or `(name T*)`: a callee, mapper, function-value name or edge target."""
+    return _form([write_atom(name), *map(write_type, tys)]) if tys else write_atom(name)
+
+
+def _write_edge(edge: Edge) -> list[str]:
+    return [_applied_text(edge.target, edge.tys), *map(write_atom, edge.args)]
+
+
+def write_term(term: Terminator) -> str:
+    match term:
+        case Ret(value=value):
+            return _form(["ret", write_atom(value)])
+        case Unreachable():
+            return "(unreachable)"
+        case Jmp(edge=edge):
+            return _form(["jmp", *_write_edge(edge)])
+        case Jnz(cond=cond, then=then, other=other):
+            return _form(["jnz", write_atom(cond), _form(_write_edge(then)), _form(_write_edge(other))])
+        case Switch(scrutinee=scrutinee, ty=ty, arms=arms):
+            return _form(["switch", write_atom(scrutinee), write_type(ty),
+                          *(_form([write_atom(arm.variant), *_write_edge(arm.edge)]) for arm in arms)])
+
+
+def _type_operand(instr: Instr) -> str:
+    if instr.ty is None:
+        _cannot(f"{instr.op} without a type operand")
+    return write_type(instr.ty)
+
+
+def _literal(instr: Instr) -> str:
+    if instr.lit is None:
+        _cannot(f"{instr.op} without a literal")
+    return write_atom(instr.lit)
+
+
+def write_instr(instr: Instr) -> str:
+    op, args = instr.op, [write_atom(a) for a in instr.args]
+    operation: list[str]
+    if op == "const":
+        operation = [op, _type_operand(instr), _literal(instr)]
+    elif op == "construct":
+        operation = [op, _type_operand(instr), *args]
+    elif op in ("destruct", "variant_tag", "builtin::unsafe::cast", "builtin::int_cast"):
+        operation = [op, args[0], _type_operand(instr)]
+    elif op == "construct_variant":
+        operation = [op, _type_operand(instr), _literal(instr), args[0]]
+    elif op in ("alloca", "builtin::sizeof"):
+        operation = [op, _type_operand(instr)]
+    elif op == "pack":
+        operation = [op, _type_operand(instr), _form([write_type(t) for t in instr.tys]), args[0]]
+    elif op == "open":
+        operation = [op, args[0], _brands(instr.binders)]
+    elif op in ("call", "fn"):
+        operation = [op, _applied_text(instr.args[0], instr.tys), *args[1:]]
+    elif op == "foreach":
+        operation = [op, _type_operand(instr), args[0], _applied_text(instr.args[1], instr.tys), *args[2:]]
+    elif op == "trait_call":
+        operation = [op, args[0], args[1], _form([write_type(t) for t in instr.tys]), *args[2:]]
+    elif op.startswith("builtin::unsafe::atomic_"):
+        operation = [op, _literal(instr), *args]
+    else:
+        operation = [op, *args]
+    lhs = write_atom(instr.lhs[0]) if len(instr.lhs) == 1 else _form([write_atom(n) for n in instr.lhs])
+    text = _form(["=", lhs, _form(operation)])
+    return _form(["unsafe", text]) if instr.unsafe else text
+
+
+def write_block(block: Block, indent: str) -> list[str]:
+    """The block's lines: its header, then its clauses, instructions and terminator, indented further."""
+    header = [write_atom(block.label), *([_brands(block.brands)] if block.brands else []),
+              _form(_bindings(block.params))]
+    inner = indent + "  "
+    lines = [indent + "(" + " ".join(header)]
+    if block.empty:
+        lines.append(inner + _form(["empty", *map(write_atom, block.empty)]))
+    lines += [inner + _form(["known", write_atom(path), write_atom(variant)]) for path, variant in block.known]
+    lines += [inner + _form(["opened", write_atom(path), _brands(brands)]) for path, brands in block.opened]
+    lines += [inner + write_instr(instr) for instr in block.instrs]
+    lines.append(inner + write_term(block.term) + ")")
+    return lines
+
+
+def write_fun(fun: Fun, head: Sequence[str], indent: str = "") -> list[str]:
+    """`(HEAD... NAME RET (PTYPES) (locals ...)? BLOCK+)`, forall-wrapped from RET on when generic."""
+    signature = [write_type(fun.ret), _form([write_type(t) for t in fun.ptypes])]
+    generic = bool(fun.params or fun.premises)
+    if generic:
+        signature = ["(" + write_forall(fun.params, fun.premises), *signature]
+    lines = [indent + "(" + " ".join([*head, write_atom(fun.name), *signature])]
+    inner = indent + "  "
+    if fun.locals:
+        lines.append(inner + _form(["locals", *_bindings(fun.locals)]))
+    for block in fun.blocks:
+        lines += write_block(block, inner)
+    lines[-1] += "))" if generic else ")"
+    return lines
+
+
+def write_module(module: ModuleId) -> str:
+    return _form(["module", str(module.package), *map(write_atom, module.path)])
+
+
+def _in(module: Optional[ModuleId], policy: Optional[str] = None) -> list[str]:
+    """The `(in MODULE POLICY?)` clause, if the declaration has a module."""
+    if module is None:
+        return []
+    return [_form(["in", write_module(module), *([policy] if policy else [])])]
+
+
+def _fun_clause(module: Optional[ModuleId], unsafe: bool) -> list[str]:
+    """A function's `(unsafe)` or `(in MODULE unsafe?)` clause."""
+    if module is None:
+        return ["(unsafe)"] if unsafe else []
+    return _in(module, "unsafe" if unsafe else None)
+
+
+def write_type_decl(decl: TypeDecl) -> str:
+    policy: Optional[str] = None
+    if decl.exposure is not None:
+        mode, scope = decl.exposure
+        if decl.module is None or mode == "owner" and scope != decl.module:
+            _cannot(f"the exposure of {decl.name}")
+        policy = "abstract" if mode == "owner" else _form(["exposed", write_module(scope)])
+    body = write_type(decl.body)
+    if decl.params or decl.premises:
+        body = "(" + write_forall(decl.params, decl.premises) + " " + body + ")"
+    name = decl.name + "!" if decl.linear else decl.name
+    return _form(["type", *_in(decl.module, policy), write_atom(name), body])
+
+
+def write_extern(extern: Extern) -> str:
+    if extern.ret is None:
+        _cannot(f"the extern {extern.name} without a type")
+    if extern.ptypes is None:
+        return _form(["extern", "value", write_atom(extern.name), write_type(extern.ret)])
+    return _form(["extern", "fun", write_atom(extern.name), write_type(extern.ret),
+                  _form([write_type(t) for t in extern.ptypes])])
+
+
+def write_data(data: Data) -> str:
+    return _form(["data", *_in(data.module), write_atom(data.name), write_type(data.ty), write_form(data.init)])
+
+
+def write_trait(trait: Trait) -> list[str]:
+    kinds = trait.param_kinds or (ANY,) * len(trait.params)
+    if COPY in kinds:
+        _cannot(f"the Copy parameter of trait {trait.name}")
+    params = [write_atom("$" + name if kind == BRAND else name) for name, kind in zip(trait.params, kinds)]
+    lines = ["(" + " ".join(["trait", *_in(trait.module), write_atom(trait.name), _form(params)])]
+    for method in trait.methods:
+        lines.append("  " + _form([*(["(unsafe)"] if method.unsafe else []), write_atom(method.name),
+                                   write_type(method.ret), _write_ptypes(method.ptypes, method.places)]))
+    lines[-1] += ")"
+    return lines
+
+
+def write_instance(instance: Instance) -> list[str]:
+    head = _form([write_type(t) for t in instance.head])
+    if instance.params or instance.premises:
+        head = "(" + write_forall(instance.params, instance.premises) + " " + head + ")"
+    lines = ["(" + " ".join(["instance", *_in(instance.module), write_atom(instance.trait), head])]
+    for method in instance.methods:
+        if method.module != instance.module:
+            _cannot(f"the method {method.name} of an instance of {instance.trait} from another module")
+        lines += write_fun(method, ["fun", *(["(unsafe)"] if method.unsafe else [])], "  ")
+    lines[-1] += ")"
+    return lines
+
+
+def write_program(program: Program) -> str:
+    """The program as KURS text that `parse_program` reads back into the same program."""
+    lines = [write_type_decl(decl) for decl in program.types.values()]
+    for fun in program.funs.values():
+        lines += write_fun(fun, ["fun", *_fun_clause(fun.module, fun.unsafe)])
+    lines += [write_extern(extern) for extern in program.externs.values()]
+    lines += [write_data(data) for data in program.datas.values()]
+    for trait in program.traits.values():
+        lines += write_trait(trait)
+    for instances in program.instances.values():
+        for instance in instances:
+            lines += write_instance(instance)
+    return "".join(line + "\n" for line in lines)

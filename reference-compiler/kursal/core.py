@@ -1,4 +1,4 @@
-"""The typed KURS core. Text serialization is read by kurs.py.
+"""The typed KURS core. Its text serialization is read and written by kurs.py.
 
 Types are frozen and compared structurally; language-level equality
 (nominal declarations, alpha-renamed binders) lives in `types`.
