@@ -222,6 +222,7 @@ def app(source: str, files: dict[str, str] | None = None) -> dict[str, str]:
 
 # Packages that resolution rejects: their files, by path, and the path to resolve.
 RESOLUTION_ERRORS: tuple[tuple[dict[str, str], str], ...] = (
+    (app("use nothing::*;\nfn f() -> u32 { g() }\n"), "app"),
     (app("fn f() -> u32 { nothing() }\n"), "app"),
     (app("fn f(x: Nothing) -> u32 { 0u32 }\n"), "app"),
     (app("fn f() -> u32 { 0u32 }\nfn f() -> u32 { 1u32 }\n"), "app"),

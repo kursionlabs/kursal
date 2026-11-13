@@ -217,6 +217,7 @@ class Resolver:
         self.attached: dict[tuple[Optional[Decl | str], str], list[Decl]] = {}           # (Decl or prim name, member) -> [Decl]
         self.cache: dict[LookupKey, Target] = {}
         self.active: set[LookupKey] = set()
+        self.globbing: set[tuple[ModuleId, S.NamePath]] = set()
         for package in packages:
             self.children.setdefault(ModuleId(package.id), {})
             for module, file in package.files.items():
@@ -368,7 +369,13 @@ class Resolver:
 
     def glob(self, module: ModuleId, name: str) -> Optional[Target]:
         for path in self.scopes[module].globs:
-            source = self.resolve_path(module, path)
+            if (module, path) in self.globbing:
+                continue                # the glob's own path is being resolved: it cannot name itself
+            self.globbing.add((module, path))
+            try:
+                source = self.resolve_path(module, path)
+            finally:
+                self.globbing.discard((module, path))
             if not isinstance(source, ModuleId):
                 fail(f"{'::'.join(path)} is not a module")
             try:
