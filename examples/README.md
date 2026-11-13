@@ -43,7 +43,7 @@ printf 'the cat and the hat\n' | /tmp/wordfreq
 | `ring` | a fixed-capacity ring buffer over `OwnedVec!` |
 | `dlist`, `graph` | a doubly linked list and a cyclic graph in one capability domain |
 | `host` | the host without `unsafe`: arguments, the environment, files, running programs, a monotonic clock, floats from text and their bits |
-| `arena_text` | text and tables in one arena: `ArenaVec`, spans, and keys compared through `HashIn` |
+| `arena_text` | text and tables in one arena: `ArenaVec`, spans, keys compared through `HashIn`, and text built in a `Buffer!` (with decimal numbers) saved into the arena |
 | `blockalloc` | a fixed-size block allocator under a scripted workload |
 | `thread_sum` | two OS threads, each owning its own buffer |
 | `core_only` | a program that needs only `core`: no allocator, no operating system |

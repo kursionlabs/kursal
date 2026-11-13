@@ -2,19 +2,22 @@
 // built in an `ArenaVec[u8, 'k]` and read as `Span`s; the table of distinct
 // words is an `ArenaVec` of `(Span, u32)` rows, compared through `HashIn`
 // under the arena's capability. Every handle is `Copy`, and nothing here is
-// unsafe or freed one at a time: destroying the arena frees it all.
+// unsafe or freed one at a time: destroying the arena frees it all. Each line
+// printed is built in a `Buffer!` on the heap, numbers in decimal included,
+// and saved into the arena (`save_buffer`), which frees the buffer.
 //
 // It prints each distinct word with its count, in first-seen order, then
 // checks the rest of the arena vec's operations, and exits with status 3
 // through `std::process::exit`.
-use std::alloc::arena::Arena;
+use std::alloc::arena::{Arena, save_buffer};
+use std::bytes::buffer::Buffer;
 use std::cap::Exclusive;
 use std::collections::arena_vec::ArenaVec;
 use std::hash::{HashIn, HashState};
 use std::io::{print, write_span};
 use std::option::Option;
 use std::process::exit;
-use std::raw::Span;
+use std::raw::{Span, span_bytes_eq_lit};
 use std::slice::{Slice, find_byte, find_bytes};
 
 forall 'k.
@@ -69,10 +72,6 @@ fn hash(&mem: Mem!['k], key: (Span['k], u32)) -> u64 {
     HashIn[(Span['k], u32), Exclusive!['k]]::hash_in(&mem.tag, key, HashState::new()).finish()
 }
 
-fn digit(n: usize) -> u8 {
-    b'0' + ((n % 10usize) as u8)
-}
-
 fn check(ok: bool, what: Slice[u8, 'static]) {
     if !ok {
         print(1, what);
@@ -102,13 +101,10 @@ fn main() -> i32 {
         let unit = match table.get(&mem.tag, j) {
             Option::Some(row) => {
                 let (w, n) = row;
-                // Each line is built in the arena too: the word, a space, the count.
-                let line: ArenaVec[u8, 'k] = ArenaVec::new(&mem.tag, &mem.arena);
-                line.push_span(&mem.tag, &mem.arena, w);
-                line.push(&mem.tag, &mem.arena, b' ');
-                line.push(&mem.tag, &mem.arena, digit((n as usize)));
-                line.push(&mem.tag, &mem.arena, b'\n');
-                let written = write_span(1, &mem.tag, line.span(&mem.tag, &mem.arena));
+                // Each line is built in a `Buffer!` on the heap, the word read under the arena's
+                // capability, then copied into the arena in one block, and the buffer freed.
+                let line = Buffer::new().push_bytes(&mem.tag, w).push_byte(b' ').push_u64(n as u64).push_static("\n");
+                let written = write_span(1, &mem.tag, save_buffer(&mem.arena, line));
             },
             Option::None => (),
         };
@@ -147,6 +143,11 @@ fn main() -> i32 {
         },
         Option::None => check(false, "get_ref"),
     };
+    // Numbers in decimal, the most negative one included.
+    let numbers = Buffer::new().push_u64(18446744073709551615u64).push_byte(b' ').push_i64(-9223372036854775807i64 - 1i64)
+        .push_byte(b' ').push_i64(-42i64).push_byte(b' ').push_usize(0usize);
+    let numbers = save_buffer(&mem.arena, numbers);
+    check(span_bytes_eq_lit(&mem.tag, numbers, "18446744073709551615 -9223372036854775808 -42 0"), "push_u64, push_i64");
     // `alloc_slice` fills a block in one step.
     let block = &mem.arena.alloc_slice(&mem.tag, 4usize, 2u64);
     check(block.len() == 4usize, "alloc_slice");
