@@ -4,6 +4,7 @@ import unittest
 from kursal.check import CheckError, check_program
 from kursal.infer import InferError
 from kursal.lower import LowerError
+from kursal.sexpr import KursError
 from kursal.sigs import SigError
 from kursal.kurs import parse_program
 from tests import test_closure_boundary
@@ -14,9 +15,13 @@ class ScalarBoundaryTests(unittest.TestCase):
 
     def test_surface_integer_ranges_are_diagnosed_upstream(self):
         for ty, text in (('i8', '128'), ('i8', '-129'), ('u8', '256'), ('u8', '-1'),
-                         ('i64', '9223372036854775808'), ('u64', '18446744073709551616')):
+                         ('i64', '9223372036854775808'), ('u32', '4294967296')):
             with self.subTest(ty=ty, text=text), self.assertRaisesRegex(LowerError, 'literal.*fit'):
                 self.run_source('fn f() -> ' + ty + ' { ' + text + ' } fn main() -> i32 { 0i32 }', 0)
+
+    def test_an_integer_literal_beyond_64_bits_is_a_parse_error(self):
+        with self.assertRaisesRegex(KursError, 'integer literal out of range'):
+            self.run_source('fn f() -> u64 { 18446744073709551616 } fn main() -> i32 { 0i32 }', 0)
 
     def test_surface_float_overflow_is_diagnosed_upstream(self):
         for ty, text in (('f32', '1' + '0' * 39 + '.0'), ('f32', '-1' + '0' * 39 + '.0'), ('f64', '1' + '0' * 309 + '.0')):

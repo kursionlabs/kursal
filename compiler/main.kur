@@ -1,13 +1,18 @@
-// The command line: `kursalc parse FILE...` prints each file's syntax tree; `kursalc resolve PATH`
+// The command line: `kursal parse FILE...` prints each file's syntax tree; `kursal resolve PATH`
 // resolves the package at PATH (a directory, its kur.toml, or one .kur file) and prints what every
-// name names; `kursalc selftest-types CASE...` runs the type modules on small cases (see `selftest`).
-// `kursalc kurs FILE` reads serialized KURS and prints it as `kurs::write_program` writes it.
-// `kursalc sigs PATH` resolves the package at PATH, builds its signatures and prints them (see
-// `sigdump`). `kursalc infer PATH` also infers every function body and prints what it found (see
+// name names; `kursal selftest-types CASE...` runs the type modules on small cases (see `selftest`).
+// `kursal kurs FILE` reads serialized KURS and prints it as `kurs::write_program` writes it.
+// `kursal sigs PATH` resolves the package at PATH, builds its signatures and prints them (see
+// `sigdump`). `kursal infer PATH` also infers every function body and prints what it found (see
 // `inferdump`).
-// `kursalc check FILE` reads serialized KURS and checks it, printing nothing when it is sound;
-// `kursalc c FILE [--entry NAME]` also prints its C, entered from C's `main` through the function
-// NAME; `kursalc readable FILE` prints it as readable KURS.
+// `kursal check FILE` reads serialized KURS and checks it, printing nothing when it is sound;
+// `kursal c FILE [--entry NAME]` also prints its C, entered from C's `main` through the function
+// NAME; `kursal readable FILE` prints it as readable KURS.
+// `kursal lower PATH` lowers the package at PATH to core and prints it as KURS. `kursal build PATH
+// [-o OUTPUT] [--times]` runs the whole pipeline: it lowers and checks the package and makes its C,
+// entered through the package's entry (every root function's C for a library); with OUTPUT, it
+// writes OUTPUT.c and compiles it with the standard library's C helpers into OUTPUT, else it prints
+// the C. With --times it prints the time each stage takes, as `tools/build.py --times` does.
 
 use package::base::{Cell, Out, Seq, Text, fail, stop, text};
 use package::cgen::emit_c;
@@ -16,21 +21,23 @@ use package::dump;
 use package::infer::infer;
 use package::inferdump;
 use package::kurs;
+use package::lower::lower;
 use package::parser::parse;
 use package::readable::emit_kurs;
-use package::resolve::resolve;
+use package::resolve::{lib_dir, resolve};
 use package::resolved;
 use package::selftest::selftest_types;
 use package::sigdump;
 use package::sigs::signatures;
-use package::system::{arguments, read};
+use package::system::{arguments, now_ms, read, run, write};
 use package::types::Fresh;
 use std::option::Option;
+use std::slice::Slice;
 
 fn main(argc: i32, argv: *(*u8)) -> i32 {
     let args = arguments(argc, argv);
     if args.is_empty() {
-        fail(text("usage: kursalc parse FILE... | kursalc resolve PATH | kursalc sigs PATH | kursalc infer PATH | kursalc kurs FILE | kursalc check FILE | kursalc c FILE [--entry NAME] | kursalc readable FILE"));
+        fail(text("usage: kursal parse FILE... | kursal resolve PATH | kursal sigs PATH | kursal infer PATH | kursal kurs FILE | kursal check FILE | kursal c FILE [--entry NAME] | kursal readable FILE | kursal lower PATH | kursal build PATH [-o OUTPUT] [--times]"));
     }
     let command = args.get(0usize);
     if command.is("parse") {
@@ -84,16 +91,24 @@ fn main(argc: i32, argv: *(*u8)) -> i32 {
                 file = Option::Some.(args.get(i));
                 i = i + 1usize;
             } else {
-                fail(text("usage: kursalc c FILE [--entry NAME]"));
+                fail(text("usage: kursal c FILE [--entry NAME]"));
             }
         }
         let path = match file {
             Option::Some(f) => f,
-            Option::None => fail(text("usage: kursalc c FILE [--entry NAME]")),
+            Option::None => fail(text("usage: kursal c FILE [--entry NAME]")),
         };
         let counter = Fresh::new();
         let program = kurs::parse_program(read_file(path));
         emit_c(program, check_program(program, counter), entry, counter).print(1);
+        0
+    } else if command.is("lower") && args.len() == 2usize {
+        let counter = Fresh::new();
+        let r = resolve(args.get(1usize));
+        kurs::write_program(lower(r, signatures(r, counter), counter)).print(1);
+        0
+    } else if command.is("build") {
+        build(args.from(1usize));
         0
     } else if command.is("readable") && args.len() == 2usize {
         emit_kurs(kurs::parse_program(read_file(args.get(1usize))), Fresh::new()).print(1);
@@ -107,5 +122,84 @@ fn read_file(file: Text) -> Text {
     match read(file) {
         Option::Some(s) => s,
         Option::None => fail(Out::new().put("cannot read ").add(file).done()),
+    }
+}
+
+// The time since `started` as `NAME: 1.5s` on stderr, when `times`; the time now.
+fn stage(times: bool, name: Slice[u8, 'static], started: u64) -> u64 {
+    let now = now_ms();
+    if times {
+        let ms = now - started;
+        Out::new().put(name).put(": ").u64(ms / 1000u64).put(".").u64(ms % 1000u64 / 100u64).put("s\n").done().print(2);
+    }
+    now
+}
+
+// `kursal build PATH [-o OUTPUT] [--times]`.
+fn build(args: Seq[Text]) {
+    var path: Option[Text] = Option::None;
+    var output: Option[Text] = Option::None;
+    var times = false;
+    var i = 0usize;
+    while i < args.len() {
+        if args.get(i).is("--times") {
+            times = true;
+            i = i + 1usize;
+        } else if args.get(i).is("-o") && i + 1usize < args.len() && output.is_none() {
+            output = Option::Some.(args.get(i + 1usize));
+            i = i + 2usize;
+        } else if path.is_none() {
+            path = Option::Some.(args.get(i));
+            i = i + 1usize;
+        } else {
+            fail(text("usage: kursal build PATH [-o OUTPUT] [--times]"));
+        }
+    }
+    let package = match path {
+        Option::Some(p) => p,
+        Option::None => fail(text("usage: kursal build PATH [-o OUTPUT] [--times]")),
+    };
+    var started = now_ms();
+    let counter = Fresh::new();
+    let r = resolve(package);
+    let sigs = signatures(r, counter);
+    started = stage(times, "signatures", started);
+    let program = lower(r, sigs, counter);
+    started = stage(times, "lower", started);
+    let checker = check_program(program, counter);
+    started = stage(times, "check", started);
+    let entry = match r.packages.get(0usize).entry_decl.get() {
+        Option::Some(decl) => Option::Some.(sigs.name(decl)),
+        Option::None => Option::None,
+    };
+    let c_text = emit_c(program, checker, entry, counter);
+    started = stage(times, "C", started);
+    let out = match output {
+        Option::Some(o) => o,
+        Option::None => {
+            c_text.print(1);
+            return;
+        },
+    };
+    let c_file = Out::new().add(out).put(".c").done();
+    if !write(c_file, c_text) {
+        fail(Out::new().put("cannot write ").add(c_file).done());
+    }
+    let lib = lib_dir();
+    let command: Seq[Text] = Seq::new();
+    command.push(text("cc"));
+    command.push(text("-O2"));
+    command.push(text("-w"));
+    command.push(text("-fno-builtin"));
+    command.push(c_file);
+    command.push(Out::new().add(lib).put("/libc/fs.c").done());
+    command.push(Out::new().add(lib).put("/libc/thread.c").done());
+    command.push(text("-lpthread"));
+    command.push(text("-o"));
+    command.push(out);
+    let built = run(command);
+    started = stage(times, "cc", started);
+    if !built {
+        stop(1);
     }
 }

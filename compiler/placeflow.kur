@@ -1,0 +1,900 @@
+// Infer block place contracts after surface expressions have been lowered.
+//
+// This pass follows the finished control-flow graph. It is separate from the syntax-directed
+// translation rules in `lower` and reuses the core checker's path typing and place-state helpers to
+// compute candidate block contracts. Planning assumes the graph structure supplied by lowering; it
+// does not validate instructions or prove the contracts. A subsequent replay of the finalized
+// headers reports named-place ownership errors. This does not check SSA accounting or all contract
+// obligations: the lowered program must still pass `check_program` before C is made from it.
+//
+// Each block's declared place state (`empty`, `known`, `opened`) comes from a forward dataflow over
+// the finished graph, tracking the place effects of instructions: a block assumes empty whatever any
+// incoming edge leaves empty. Known variants and opened views are retained only when incoming edges
+// agree after brand renaming. This intersection is only a candidate: dropping an incoming view does
+// not close it, and exact edge checking will reject that predecessor unless lowering explicitly
+// closes it first.
+
+use package::base::{Cell, Map, Out, Seq, Set, Text, text};
+use package::check::{Checker, Places, prefix};
+use package::core::{Block, Edge, Fun, Kind, Known, Opened, Param, Program, Terminator, Type};
+use package::core as C;
+use package::resolve::Resolver;
+use package::syntax::Pos;
+use package::types::{Fresh, free_brands};
+use std::option::{Option, Result};
+use std::slice::Slice;
+
+// The state of planning one function.
+exposed struct Plan {
+    fun: Fun,
+    // block label -> its index
+    index: Map[Text, usize],
+    // the brands every block may mention
+    global: Set[Text],
+    // each local's free brands, and whether it is Copy once that is asked
+    local_brands: Seq[Set[Text]],
+    local_copy: Seq[Option[bool]],
+    // the locals whose types mention brands
+    branded: Seq[usize],
+    // the state each block other than the entry starts in, so far
+    header: Map[Text, Places],
+    // blocks to visit, with the state reaching them
+    work: Seq[(usize, Places)],
+}
+
+exposed struct PlaceFlow {
+    checker: Checker,
+    r: Resolver,
+    // the first store into each place path, for diagnostics
+    origins: Cell[Map[Text, Pos]],
+}
+
+fn text_before(a: Text, b: Text) -> bool {
+    a.compare(b) < 0
+}
+
+fn known_before(a: Known, b: Known) -> bool {
+    a.path.compare(b.path) < 0
+}
+
+fn opened_before(a: Opened, b: Opened) -> bool {
+    a.path.compare(b.path) < 0
+}
+
+fn term_pos(t: Terminator) -> Pos {
+    match t {
+        Terminator::Ret(_v, p) => p,
+        Terminator::Jmp(_e, p) => p,
+        Terminator::Jnz(_c, _a, _b, p) => p,
+        Terminator::Switch(_s, _t, _arms, p) => p,
+        Terminator::Unreachable(p) => p,
+    }
+}
+
+// A block's outgoing edges, each with the variant it makes known of a switched place.
+fn edges(block: Block) -> Seq[(Edge, Option[(Text, Text)])] {
+    let out: Seq[(Edge, Option[(Text, Text)])] = Seq::new();
+    match block.term {
+        Terminator::Jmp(e, _p) => out.push((e, Option::None)),
+        Terminator::Jnz(_c, a, b, _p) => {
+            out.push((a, Option::None));
+            out.push((b, Option::None));
+        },
+        Terminator::Switch(scrutinee, _t, arms, _p) => {
+            let place = scrutinee.starts_with(text("&"));
+            var i = 0usize;
+            while i < arms.len() {
+                let arm = arms.get(i);
+                out.push((arm.edge, if place { Option::Some.((scrutinee, arm.variant)) } else { Option::None }));
+                i = i + 1usize;
+            }
+        },
+        _ => (),
+    };
+    out
+}
+
+fn texts_equal(a: Seq[Text], b: Seq[Text]) -> bool {
+    a.same(b)
+}
+
+// `a` and `b` hold the same paths, variants and views.
+fn same_places(a: Places, b: Places) -> bool {
+    if a.empty.len() != b.empty.len() || a.known.len() != b.known.len() || a.opened.len() != b.opened.len() {
+        return false;
+    }
+    var i = 0usize;
+    while i < a.empty.positions() {
+        match a.empty.entry(i) {
+            Option::Some(p) => if !b.empty.has(p) {
+                return false;
+            },
+            Option::None => (),
+        };
+        i = i + 1usize;
+    }
+    i = 0usize;
+    while i < a.known.positions() {
+        match a.known.entry(i) {
+            Option::Some(p) => match b.known.get(p) {
+                Option::Some(v) => if !v.eq(a.known.at(p)) {
+                    return false;
+                },
+                Option::None => return false,
+            },
+            Option::None => (),
+        };
+        i = i + 1usize;
+    }
+    i = 0usize;
+    while i < a.opened.positions() {
+        match a.opened.entry(i) {
+            Option::Some(p) => match b.opened.get(p) {
+                Option::Some(v) => if !texts_equal(v, a.opened.at(p)) {
+                    return false;
+                },
+                Option::None => return false,
+            },
+            Option::None => (),
+        };
+        i = i + 1usize;
+    }
+    true
+}
+
+// Removes from `empty` every path at or below `path`.
+fn clear_below(empty: Set[Text], path: Text) {
+    var i = 0usize;
+    while i < empty.positions() {
+        match empty.entry(i) {
+            Option::Some(z) => if prefix(path, z) {
+                empty.remove(z);
+            },
+            Option::None => (),
+        };
+        i = i + 1usize;
+    }
+}
+
+// Some other path of `empty` is an ancestor of `p`. A root has none.
+fn covered_by_other(empty: Set[Text], p: Text) -> bool {
+    if !p.contains(text(".")) {
+        return false;
+    }
+    var k = 0usize;
+    while k < empty.positions() {
+        match empty.entry(k) {
+            Option::Some(q) => if !q.eq(p) && prefix(q, p) {
+                return true;
+            },
+            Option::None => (),
+        };
+        k = k + 1usize;
+    }
+    false
+}
+
+// Keeps only the outermost paths of `empty`. Removing a path that has an ancestor leaves the
+// outermost ancestor, so the paths left over answer the same.
+fn outermost(empty: Set[Text]) {
+    var i = 0usize;
+    while i < empty.positions() {
+        match empty.entry(i) {
+            Option::Some(p) => if covered_by_other(empty, p) {
+                empty.remove(p);
+            },
+            Option::None => (),
+        };
+        i = i + 1usize;
+    }
+}
+
+// `empty` holds only outermost paths.
+fn is_outermost(empty: Set[Text]) -> bool {
+    var i = 0usize;
+    while i < empty.positions() {
+        match empty.entry(i) {
+            Option::Some(p) => if covered_by_other(empty, p) {
+                return false;
+            },
+            Option::None => (),
+        };
+        i = i + 1usize;
+    }
+    true
+}
+
+fn locals_empty(fun: Fun) -> Places {
+    let empty: Set[Text] = Set::new();
+    var i = 0usize;
+    while i < fun.locals.len() {
+        empty.add(fun.locals.get(i).name);
+        i = i + 1usize;
+    }
+    Places::new(empty, Map::new(), Map::new())
+}
+
+// Merging `incoming` into the header `state` would leave it as it is: `incoming` empties no other
+// path, agrees on every known variant and view and knows no other, and `state` empties only
+// outermost paths.
+fn adds_nothing(state: Places, incoming: Places) -> bool {
+    if incoming.known.len() != state.known.len() || !subset(incoming.empty, state.empty) {
+        return false;
+    }
+    var k = 0usize;
+    while k < state.known.positions() {
+        match state.known.entry(k) {
+            Option::Some(p) => match incoming.known.get(p) {
+                Option::Some(v) => if !v.eq(state.known.at(p)) {
+                    return false;
+                },
+                Option::None => return false,
+            },
+            Option::None => (),
+        };
+        k = k + 1usize;
+    }
+    k = 0usize;
+    while k < state.opened.positions() {
+        match state.opened.entry(k) {
+            Option::Some(p) => match incoming.opened.get(p) {
+                Option::Some(v) => if !texts_equal(v, state.opened.at(p)) {
+                    return false;
+                },
+                Option::None => return false,
+            },
+            Option::None => (),
+        };
+        k = k + 1usize;
+    }
+    is_outermost(state.empty)
+}
+
+fn subset(a: Set[Text], b: Set[Text]) -> bool {
+    var i = 0usize;
+    while i < a.positions() {
+        match a.entry(i) {
+            Option::Some(x) => if !b.has(x) {
+                return false;
+            },
+            Option::None => (),
+        };
+        i = i + 1usize;
+    }
+    true
+}
+
+impl PlaceFlow {
+    fn new(program: Program, r: Resolver, counter: Fresh) -> PlaceFlow {
+        PlaceFlow.{ checker: Checker::new(program, counter), r, origins: Cell::new(Map::new()) }
+    }
+
+    fn places(self) -> Places {
+        self.checker.places.get()
+    }
+
+    fn fun(self) -> Fun {
+        self.checker.fun()
+    }
+
+    // Plans the contracts of `fun`'s blocks, an instance method's with the instance's parameters
+    // `outer`, then reports its ownership errors.
+    fn plan(self, fun: Fun, outer: Seq[Param]) {
+        let c = self.checker;
+        let params = outer.copy();
+        params.append(fun.params);
+        c.current.set(Option::Some.(fun));
+        c.params.set(params);
+        c.location.set(fun.name);
+        let kinds: Map[Text, Kind] = Map::new();
+        var i = 0usize;
+        while i < params.len() {
+            kinds.set(params.get(i).name, params.get(i).kind);
+            i = i + 1usize;
+        }
+        c.kinds.set(kinds);
+        c.home.set(fun.home);
+        let roots: Map[Text, Type] = Map::new();
+        i = 0usize;
+        while i < fun.locals.len() {
+            roots.set(fun.locals.get(i).name, fun.locals.get(i).type);
+            i = i + 1usize;
+        }
+        let entry = fun.blocks.get(0usize);
+        i = 0usize;
+        while i < entry.params.len() {
+            if entry.params.get(i).name.starts_with(text("&")) {
+                roots.set(entry.params.get(i).name, entry.params.get(i).type);
+            }
+            i = i + 1usize;
+        }
+        c.roots.set(roots);
+        let index: Map[Text, usize] = Map::new();
+        i = 0usize;
+        while i < fun.blocks.len() {
+            index.set(fun.blocks.get(i).label, i);
+            i = i + 1usize;
+        }
+        let global: Set[Text] = Set::new();
+        i = 0usize;
+        while i < params.len() {
+            if C::same_kind(params.get(i).kind, Kind::Brand) {
+                global.add(params.get(i).name);
+            }
+            i = i + 1usize;
+        }
+        global.add(text("static"));
+        let local_brands: Seq[Set[Text]] = Seq::new();
+        let local_copy: Seq[Option[bool]] = Seq::new();
+        let branded: Seq[usize] = Seq::new();
+        i = 0usize;
+        while i < fun.locals.len() {
+            let brands = free_brands(fun.locals.get(i).type);
+            local_brands.push(brands);
+            local_copy.push(Option::None);
+            if brands.len() > 0usize {
+                branded.push(i);
+            }
+            i = i + 1usize;
+        }
+        let header: Map[Text, Places] = Map::new();
+        let plan = Plan.{ fun, index, global, local_brands, local_copy, branded, header, work: Seq::one((0usize, locals_empty(fun))) };
+        c.places.set(Places::new(Set::new(), Map::new(), Map::new()));
+        while !plan.work.is_empty() {
+            let (b, incoming) = plan.work.pop();
+            match self.arrive(plan, b, incoming) {
+                Option::Some(places) => {
+                    c.places.set(places);
+                    self.simulate(fun.blocks.get(b), false);
+                    self.leave(plan, fun.blocks.get(b), places);
+                },
+                Option::None => (),
+            };
+        }
+        i = 1usize;
+        while i < fun.blocks.len() {
+            let block = fun.blocks.get(i);
+            match header.get(block.label) {
+                Option::Some(state) => {
+                    let empty = state.empty.items();
+                    empty.sort(text_before);
+                    let known: Seq[Known] = Seq::new();
+                    var k = 0usize;
+                    while k < state.known.positions() {
+                        match state.known.entry(k) {
+                            Option::Some(p) => known.push(Known.{ path: p, variant: state.known.at(p) }),
+                            Option::None => (),
+                        };
+                        k = k + 1usize;
+                    }
+                    known.sort(known_before);
+                    let opened: Seq[Opened] = Seq::new();
+                    k = 0usize;
+                    while k < state.opened.positions() {
+                        match state.opened.entry(k) {
+                            Option::Some(p) => opened.push(Opened.{ path: p, brands: state.opened.at(p) }),
+                            Option::None => (),
+                        };
+                        k = k + 1usize;
+                    }
+                    opened.sort(opened_before);
+                    let { empty: _e, known: _k, opened: _o, ..rest } = block;
+                    fun.blocks.set(i, Block.{ empty, known, opened, ..rest });
+                },
+                Option::None => (),
+            };
+            i = i + 1usize;
+        }
+        self.diagnose_places(fun, header);
+    }
+
+    // The state block `b` starts in when `incoming` reaches it, or none if its header already holds
+    // what `incoming` brings.
+    fn arrive(self, plan: Plan, b: usize, incoming: Places) -> Option[Places] {
+        if b == 0usize {
+            return Option::Some.(incoming.copy());
+        }
+        let label = plan.fun.blocks.get(b).label;
+        let state = match plan.header.get(label) {
+            Option::None => {
+                plan.header.set(label, incoming);
+                return Option::Some.(incoming.copy());
+            },
+            Option::Some(state) => state,
+        };
+        if adds_nothing(state, incoming) {
+            return Option::None;
+        }
+        let empty = state.empty.copy();
+        var k = 0usize;
+        while k < incoming.empty.positions() {
+            match incoming.empty.entry(k) {
+                Option::Some(p) => empty.add(p),
+                Option::None => (),
+            };
+            k = k + 1usize;
+        }
+        let known: Map[Text, Text] = Map::new();
+        k = 0usize;
+        while k < state.known.positions() {
+            match state.known.entry(k) {
+                Option::Some(p) => match incoming.known.get(p) {
+                    Option::Some(v) => if v.eq(state.known.at(p)) {
+                        known.set(p, v);
+                    },
+                    Option::None => (),
+                },
+                Option::None => (),
+            };
+            k = k + 1usize;
+        }
+        let merged = Places::new(empty, known, state.opened.copy());
+        let agreed: Map[Text, Seq[Text]] = Map::new();
+        k = 0usize;
+        while k < state.opened.positions() {
+            match state.opened.entry(k) {
+                Option::Some(p) => match incoming.opened.get(p) {
+                    Option::Some(v) => if texts_equal(v, state.opened.at(p)) {
+                        agreed.set(p, v);
+                    },
+                    Option::None => (),
+                },
+                Option::None => (),
+            };
+            k = k + 1usize;
+        }
+        merged.keep_opened(agreed);
+        self.abstract_variants(merged, state, incoming);
+        if same_places(merged, state) {
+            return Option::None;
+        }
+        plan.header.set(label, merged);
+        Option::Some.(merged.copy())
+    }
+
+    // Sends the state `places` that `block` ends in along each of its edges. States are shared, and
+    // never changed once sent: an edge that changes what it sends sends a copy.
+    fn leave(self, plan: Plan, block: Block, places: Places) {
+        let fun = plan.fun;
+        let out_edges = edges(block);
+        var e = 0usize;
+        while e < out_edges.len() {
+            let (edge, arm_known) = out_edges.get(e);
+            let t = plan.index.at(edge.target);
+            let target = fun.blocks.get(t);
+            // Existing edge entailment permits forgetting Copy contents. A dead local brand need not
+            // survive in an unreadable slot.
+            let forgotten: Seq[usize] = Seq::new();
+            if !plan.branded.is_empty() {
+                let kept = plan.global.copy();
+                var k = 0usize;
+                while k < target.brands.len() && k < edge.tys.len() {
+                    match edge.tys.get(k) {
+                        Type::Skolem(label) => if label.eq(target.brands.get(k)) {
+                            kept.add(label);
+                        },
+                        _ => (),
+                    };
+                    k = k + 1usize;
+                }
+                k = 0usize;
+                while k < plan.branded.len() {
+                    let l = plan.branded.get(k);
+                    if !subset(plan.local_brands.get(l), kept) && self.local_is_copy(plan, l) {
+                        forgotten.push(l);
+                    }
+                    k = k + 1usize;
+                }
+            }
+            if arm_known.is_none() && forgotten.is_empty() && places.opened.is_empty() {
+                plan.work.push((t, places));
+            } else {
+                let out = places.copy();
+                match arm_known {
+                    Option::Some(pair) => {
+                        let (path, variant) = pair;
+                        out.known.set(path, variant);
+                    },
+                    Option::None => (),
+                };
+                var k = 0usize;
+                while k < forgotten.len() {
+                    let root = fun.locals.get(forgotten.get(k)).name;
+                    var viewed = false;
+                    var o = 0usize;
+                    while !viewed && o < out.opened.positions() {
+                        match out.opened.entry(o) {
+                            Option::Some(p) => {
+                                viewed = prefix(root, p);
+                            },
+                            Option::None => (),
+                        };
+                        o = o + 1usize;
+                    }
+                    if !viewed {
+                        clear_below(out.empty, root);
+                        out.empty.add(root);
+                        out.forget(root, true);
+                    }
+                    k = k + 1usize;
+                }
+                if !out.opened.is_empty() {
+                    self.rename_views(out, target, edge);
+                }
+                plan.work.push((t, out));
+            }
+            e = e + 1usize;
+        }
+    }
+
+    // Renames `out`'s views into the brands of the block an edge enters, and keeps those whose
+    // brands are in scope there.
+    fn rename_views(self, out: Places, target: Block, edge: Edge) {
+        let rename: Map[Text, Text] = Map::new();
+        let available = self.global_brands();
+        var k = 0usize;
+        while k < target.brands.len() {
+            let brand = target.brands.get(k);
+            available.add(brand);
+            if k < edge.tys.len() {
+                match edge.tys.get(k) {
+                    Type::Skolem(label) => rename.set(label, brand),
+                    _ => (),
+                };
+            }
+            k = k + 1usize;
+        }
+        let opened: Map[Text, Seq[Text]] = Map::new();
+        k = 0usize;
+        while k < out.opened.positions() {
+            match out.opened.entry(k) {
+                Option::Some(p) => {
+                    let brands = out.opened.at(p);
+                    let renamed: Seq[Text] = Seq::new();
+                    var all = true;
+                    var j = 0usize;
+                    while j < brands.len() {
+                        let brand = rename.get_or(brands.get(j), brands.get(j));
+                        renamed.push(brand);
+                        all = all && available.has(brand);
+                        j = j + 1usize;
+                    }
+                    if all {
+                        opened.set(p, renamed);
+                    }
+                },
+                Option::None => (),
+            };
+            k = k + 1usize;
+        }
+        out.keep_opened(opened);
+    }
+
+    // The brand parameters of the function being planned, and `static`.
+    fn global_brands(self) -> Set[Text] {
+        let out: Set[Text] = Set::new();
+        let params = self.checker.params.get();
+        var i = 0usize;
+        while i < params.len() {
+            if C::same_kind(params.get(i).kind, Kind::Brand) {
+                out.add(params.get(i).name);
+            }
+            i = i + 1usize;
+        }
+        out.add(text("static"));
+        out
+    }
+
+    fn local_is_copy(self, plan: Plan, l: usize) -> bool {
+        match plan.local_copy.get(l) {
+            Option::Some(b) => b,
+            Option::None => {
+                let b = self.checker.copy_type(plan.fun.locals.get(l).type);
+                plan.local_copy.set(l, Option::Some.(b));
+                b
+            },
+        }
+    }
+
+    // Stops with `message` about the place `path`: the message reads `before`, the variable's name,
+    // then `after`.
+    fn ownership_error(self, path: Text, before: Slice[u8, 'static], after: Text, pos: Pos, origin: bool) -> ! {
+        let stripped = path.from(1usize);
+        let (root, fields) = match stripped.find(text("."), 0usize) {
+            Option::Some(at) => (stripped.slice(0usize, at), stripped.from(at)),
+            Option::None => (stripped, text("")),
+        };
+        let temporary = root.starts_with(text("#tmp"));
+        let name = if temporary {
+            text("temporary expression result")
+        } else {
+            match root.find(text("#"), 0usize) {
+                Option::Some(at) => root.slice(0usize, at),
+                Option::None => root,
+            }
+        };
+        let fun = self.fun();
+        var at = pos;
+        if temporary || origin {
+            at = match self.origins.get().get(Out::new().put("&").add(root).done()) {
+                Option::Some(p) => p,
+                Option::None => Pos.{ line: 0u32, col: 0u32 },
+            };
+            if at.line == 0u32 {
+                at = fun.pos;
+            }
+            if at.line == 0u32 {
+                at = pos;
+            }
+        }
+        self.r.fail(Out::new().add(fun.name).put(": ").put(before).add(name).add(fields).add(after).done(), at)
+    }
+
+    // Replays the finalized headers for source diagnostics, without checking SSA. Do not diagnose
+    // while the fixed point is evolving: a provisional header can still change. This reuses the
+    // checker's path and state helpers, but none of its instruction, edge or function validators.
+    fn diagnose_places(self, fun: Fun, header: Map[Text, Places]) {
+        let c = self.checker;
+        let index: Map[Text, usize] = Map::new();
+        var i = 0usize;
+        while i < fun.blocks.len() {
+            index.set(fun.blocks.get(i).label, i);
+            i = i + 1usize;
+        }
+        let origins: Map[Text, Pos] = Map::new();
+        i = 0usize;
+        while i < fun.blocks.len() {
+            let instrs = fun.blocks.get(i).instrs;
+            var k = 0usize;
+            while k < instrs.len() {
+                let instr = instrs.get(k);
+                if instr.op.is("store") && !origins.has(instr.args.get(0usize)) {
+                    origins.set(instr.args.get(0usize), instr.pos);
+                }
+                k = k + 1usize;
+            }
+            i = i + 1usize;
+        }
+        self.origins.set(origins);
+        let flow = self;
+        let parameters: Set[Text] = Set::new();
+        let entry = fun.blocks.get(0usize);
+        i = 0usize;
+        while i < entry.params.len() {
+            if entry.params.get(i).name.starts_with(text("&")) {
+                parameters.add(entry.params.get(i).name);
+            }
+            i = i + 1usize;
+        }
+        let roots = c.roots.get();
+        i = 0usize;
+        while i < fun.blocks.len() {
+            let block = fun.blocks.get(i);
+            // the blocks reached: the entry, and those with a header
+            let reached = if i == 0usize { Option::Some.(locals_empty(fun)) } else { header.get(block.label) };
+            if reached.is_some() {
+                c.places.set(match reached {
+                    Option::Some(places) => if i == 0usize { places } else { places.copy() },
+                    Option::None => locals_empty(fun),
+                });
+                flow.simulate(block, true);
+                match block.term {
+                    Terminator::Ret(_v, pos) => {
+                        var k = 0usize;
+                        while k < roots.positions() {
+                            match roots.entry(k) {
+                                Option::Some(root) => {
+                                    if parameters.has(root) {
+                                        if !flow.places().full(root) {
+                                            flow.ownership_error(root, "lent value '", text("' must be restored before return"), pos, false);
+                                        }
+                                    } else {
+                                        match c.discardable(root, roots.at(root)) {
+                                            Result::Ok(free) => if !free {
+                                                flow.ownership_error(root, "linear value '", text("' is not consumed before return"), pos, true);
+                                            },
+                                            Result::Err(_m) => (),
+                                        };
+                                    }
+                                },
+                                Option::None => (),
+                            };
+                            k = k + 1usize;
+                        }
+                    },
+                    _ => (),
+                };
+                let out_edges = edges(block);
+                var e = 0usize;
+                while e < out_edges.len() {
+                    let (edge, known) = out_edges.get(e);
+                    let saved = flow.places();
+                    match known {
+                        Option::Some(pair) => {
+                            let (path, variant) = pair;
+                            let places = saved.copy();
+                            places.known.set(path, variant);
+                            c.places.set(places);
+                        },
+                        Option::None => (),
+                    };
+                    let empty = fun.blocks.get(index.at(edge.target)).empty;
+                    var k = 0usize;
+                    while k < empty.len() {
+                        let path = empty.get(k);
+                        match c.place_storage(path) {
+                            Result::Ok(t) => match c.discardable(path, t) {
+                                Result::Ok(free) => if !free {
+                                    flow.ownership_error(path, "linear value '",
+                                        Out::new().put("' remains live on some paths to ").add(edge.target).done(), term_pos(block.term), false);
+                                },
+                                Result::Err(_m) => (),
+                            },
+                            Result::Err(_m) => (),
+                        };
+                        k = k + 1usize;
+                    }
+                    c.places.set(saved);
+                    e = e + 1usize;
+                }
+            }
+            i = i + 1usize;
+        }
+    }
+
+    // Forget a lost variant's payload only if both states can discard it. Keep live linear contents
+    // and opened views for the core to diagnose: intersecting knowledge must never silently consume
+    // or close them.
+    fn abstract_variants(self, merged: Places, left: Places, right: Places) {
+        if left.known.is_empty() && right.known.is_empty() {
+            outermost(merged.empty);
+            return;
+        }
+        let c = self.checker;
+        let lost: Seq[Text] = Seq::new();
+        let states = Seq::two(left, right);
+        var s = 0usize;
+        while s < states.len() {
+            let known = states.get(s).known;
+            var k = 0usize;
+            while k < known.positions() {
+                match known.entry(k) {
+                    Option::Some(p) => if !merged.known.has(p) && !lost.has(p) {
+                        lost.push(p);
+                    },
+                    Option::None => (),
+                };
+                k = k + 1usize;
+            }
+            s = s + 1usize;
+        }
+        lost.sort(text_before);
+        let saved = c.places.get();
+        var i = 0usize;
+        while i < lost.len() {
+            let path = lost.get(i);
+            var below = false;
+            var k = 0usize;
+            while !below && k < merged.empty.positions() {
+                match merged.empty.entry(k) {
+                    Option::Some(p) => {
+                        below = prefix(path, p) && !path.eq(p);
+                    },
+                    Option::None => (),
+                };
+                k = k + 1usize;
+            }
+            var viewed = false;
+            s = 0usize;
+            while below && !viewed && s < states.len() {
+                let opened = states.get(s).opened;
+                k = 0usize;
+                while !viewed && k < opened.positions() {
+                    match opened.entry(k) {
+                        Option::Some(p) => {
+                            viewed = prefix(path, p);
+                        },
+                        Option::None => (),
+                    };
+                    k = k + 1usize;
+                }
+                s = s + 1usize;
+            }
+            if below && !viewed {
+                var discardable = true;
+                s = 0usize;
+                while s < states.len() {
+                    c.places.set(states.get(s));
+                    if discardable {
+                        discardable = match c.place_storage(path) {
+                            Result::Ok(t) => match c.discardable(path, t) {
+                                Result::Ok(free) => free,
+                                Result::Err(_m) => false,
+                            },
+                            Result::Err(_m) => false,
+                        };
+                    }
+                    s = s + 1usize;
+                }
+                if discardable {
+                    clear_below(merged.empty, path);
+                    merged.empty.add(path);
+                    merged.forget(path, true);
+                }
+            }
+            i = i + 1usize;
+        }
+        outermost(merged.empty);
+        c.places.set(saved);
+    }
+
+    // Tracks moves, stores, lends and package views without checking SSA values. A load needs its
+    // path's type to decide whether it moves linear contents; if that query fails, the place state is
+    // left unchanged for this instruction. Unknown roots, unrefined enum projections and invalid
+    // opened views are diagnosed by the core checker, which checks every instruction and requires
+    // each edge to satisfy its target's contract.
+    fn simulate(self, block: Block, diagnose: bool) {
+        let c = self.checker;
+        var i = 0usize;
+        while i < block.instrs.len() {
+            let instr = block.instrs.get(i);
+            let op = instr.op;
+            let first = if instr.args.is_empty() { text("") } else { instr.args.get(0usize) };
+            let place = first.starts_with(text("&"));
+            let places = c.places.get();
+            if op.is("load") || op.is("destruct") && place {
+                if diagnose && !places.full(first) {
+                    self.ownership_error(first, "value '", text("' has been moved or is only partially available"), instr.pos, false);
+                }
+                match c.place_type(first) {
+                    Result::Ok(t) => if !c.copy_type(t) {
+                        places.empty.add(first);
+                        places.forget(first, true);
+                    },
+                    Result::Err(_m) => (),
+                };
+            } else if op.is("store") {
+                var known = true;
+                if diagnose {
+                    known = match c.place_storage(first) {
+                        Result::Ok(t) => match c.discardable(first, t) {
+                            Result::Ok(free) => {
+                                if !free {
+                                    self.ownership_error(first, "cannot overwrite live linear value '", text("'"), instr.pos, false);
+                                }
+                                true
+                            },
+                            Result::Err(_m) => false,
+                        },
+                        Result::Err(_m) => false,
+                    };
+                }
+                if known {
+                    clear_below(places.empty, first);
+                    places.forget(first, true);
+                }
+            } else if op.is("variant_tag") && place {
+                if diagnose && places.covered(first) {
+                    self.ownership_error(first, "enum value '", text("' has been moved; its tag is unavailable"), instr.pos, false);
+                }
+            } else if op.is("call") || op.is("trait_call") {
+                var k = 0usize;
+                while k < instr.args.len() {
+                    let arg = instr.args.get(k);
+                    if arg.starts_with(text("&")) && !arg.starts_with(text("&*")) {
+                        if diagnose && !places.full(arg) {
+                            self.ownership_error(arg, "value '", text("' has been moved and cannot be lent"), instr.pos, false);
+                        }
+                        places.forget(arg, true);
+                    }
+                    k = k + 1usize;
+                }
+            } else if op.is("open") && place {
+                places.opened.set(first, instr.binders);
+            } else if op.is("pack") && place {
+                places.forget(first, false);
+            }
+            i = i + 1usize;
+        }
+    }
+}

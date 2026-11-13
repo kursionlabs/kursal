@@ -4,7 +4,10 @@ same message; its type modules give the same results as these on small cases; it
 every package in the repository to the same names, and rejects bad packages with the same message;
 it gives every package the same signatures, types and constant values, and rejects bad declarations
 with the same message; it infers every function body to the same types, calls and bindings, and
-rejects ill-typed bodies with the same message;
+rejects ill-typed bodies with the same message; it lowers every package, the packages this compiler's own
+tests lower and small rejected programs to the same core program, or rejects them with the same message,
+and its `build` writes the same C as this compiler's pipeline; with KURSAL_SELFHOST=1, it builds itself,
+and the result builds itself to the same C;
 its KURS reader and writer read every lowered program and write it back as this compiler's writer
 does, and reject malformed KURS with the same message; its checker accepts and rejects, with the same
 message, every core program this compiler's own tests check; and from every lowered program it writes
@@ -20,6 +23,8 @@ import resource
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from collections.abc import Callable, Sequence
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -45,10 +50,12 @@ from kursal.kurs import (_form, _write_ptypes, parse_program, write_atom, write_
                          write_type_decl)
 from kursal.cgen import emit_c
 from kursal.check import check_program
+from kursal import lower as lower_module
 from kursal.lower import lower
 from kursal.readable import emit_kurs
 from kursal.sigs import ConstValue, Sig, Signatures, signatures
 from tests.infer_cases import INFER_ERRORS, INFERENCES
+from tests.lower_cases import LOWER_ERRORS
 from tests.test_kurs import CANONICAL, VARIANTS, packages
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -65,7 +72,7 @@ def limit_memory() -> None:
     resource.setrlimit(resource.RLIMIT_AS, (MEMORY_LIMIT, MEMORY_LIMIT))
 
 
-def run_kursalc(binary: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def run_kursal(binary: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run([str(binary), *args], capture_output=True, text=True, timeout=TIME_LIMIT,
                           preexec_fn=limit_memory, env=dict(os.environ, KURSAL_LIB=str(LIB)))
 
@@ -101,10 +108,10 @@ def build_compiler() -> Path:
     for path in sources:
         digest.update(str(path.relative_to(ROOT)).encode())
         digest.update(path.read_bytes())
-    binary = CACHE / f"kursalc-{digest.hexdigest()[:16]}"
+    binary = CACHE / f"kursal-{digest.hexdigest()[:16]}"
     if not binary.exists():
         CACHE.mkdir(exist_ok=True)
-        for old in CACHE.glob("kursalc-*"):
+        for old in CACHE.glob("kursal-*"):
             old.unlink()
         built = subprocess.run([sys.executable, str(ROOT / "reference-compiler/tools/build.py"), str(COMPILER), str(binary)],
                                capture_output=True, text=True)
@@ -482,6 +489,76 @@ def reference_inference_text(path: Path) -> str:
     return reference_inference(path)[0]
 
 
+def in_deep_thread[R](make: Callable[[], R]) -> R:
+    """`make()`, on a thread with room to recurse through a large package, as tools/build.py runs it."""
+    sys.setrecursionlimit(1_000_000)
+    threading.stack_size(1 << 30)
+    result: list[R] = []
+    failure: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            result.append(make())
+        except BaseException as error:  # noqa: BLE001 - re-raised on the calling thread
+            failure.append(error)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    worker.join()
+    if failure:
+        raise failure[0]
+    return result[0]
+
+
+def reference_build(path: Path) -> dict[str, Optional[str]]:
+    """What the reference makes of the package at `path`, numbering fresh names and bindings from 0 as one
+    run of the Kursal compiler does: its lowered program as KURS (`kursal lower`), or the error of an
+    earlier stage or of lowering; and, when that succeeds, the C of the whole pipeline as tools/build.py
+    runs it (`kursal build`), entered through the package's entry, or none if checking or C rejects it."""
+    def make() -> dict[str, Optional[str]]:
+        T._fresh = itertools.count()
+        I._ids = itertools.count()
+        try:
+            resolver = resolve(path)
+            sigs = signatures(resolver)
+            program = lower(resolver, sigs)
+            text = write_program(program)
+        except KursError as error:
+            return {"lower": f"error: {error}", "c": None}
+        entry_decl = resolver.packages[0].entry_decl
+        try:
+            c: Optional[str] = emit_c(program, check_program(program),
+                                      sigs.name(entry_decl) if entry_decl is not None else None)
+        except KursError:
+            c = None
+        return {"lower": text, "c": c}
+    return in_deep_thread(make)
+
+
+def reference_lowering(path: Path) -> str:
+    return reference_build(path)["lower"]
+
+
+def built_paths() -> list[Path]:
+    """Every package in the repository, every bad example, and the compiler itself."""
+    packages = sorted({p.parent for top in ("examples", "lib") for p in (ROOT / top).glob("*/kur.toml")})
+    return [*packages, *sorted((ROOT / "examples/bad").glob("*.kur")), COMPILER]
+
+
+def reference_builds() -> list[dict[str, Optional[str]]]:
+    """`reference_build` for each of `built_paths`, computed once per change to the sources."""
+    paths = built_paths()
+    sources = [*(ROOT / "lib").rglob("*.kur"), *(ROOT / "lib").rglob("*.toml"), *(ROOT / "examples").rglob("*.kur"),
+               *(ROOT / "examples").rglob("*.toml"), *COMPILER.rglob("*.kur"), *COMPILER.rglob("*.toml"),
+               *(ROOT / "reference-compiler/kursal").glob("*.py")]
+
+    def make() -> list:
+        with ProcessPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
+            return list(pool.map(reference_build, paths))
+
+    return cached("built", digest_of(sources), make)
+
+
 def place_case(directory: Path, index: int, case: str | dict[str, str]) -> Path:
     """Where an inference case is written (see tests/infer_cases.py)."""
     root = directory / f"case{index}"
@@ -507,6 +584,87 @@ def manifest(name: str, deps: tuple[str, ...] = (), entry: str | None = None) ->
     for dep in deps:
         text += f'[dependencies.{dep}]\npath="../{dep}"\n'
     return text
+
+
+def case_files(case: str | dict[str, str]) -> tuple[dict[str, str], str]:
+    """A case of tests/lower_cases.py as files, by relative path, and the path to lower (see `place_case`)."""
+    if isinstance(case, dict):
+        return case, "a"
+    if "std::" in case:
+        return {"case.kur": case}, "case.kur"
+    return {"kur.toml": manifest("p"), "lib.kur": case}, "."
+
+
+LOWER_CASES = tuple(case_files(case) for case, _ in LOWER_ERRORS)
+
+
+def recorded_lowerings(module_name: str) -> list[tuple[dict[str, str], str]]:
+    """The packages a test module lowers, outside the repository: its tests run with `lower` watched. Each
+    is the files of the directory holding the packages lowered, by relative path, and the path lowered."""
+    sys.setrecursionlimit(20000)
+    real_lower = lower_module.lower
+    found: list[tuple[dict[str, str], str]] = []
+
+    def watched(resolver, *args, **kwargs):
+        try:
+            roots = [p.root for p in resolver.packages if not p.root.is_relative_to(LIB)]
+            first = resolver.packages[0]
+            single = not (first.root / "kur.toml").exists()
+            target = next(iter(first.files.values())) if single else first.root
+            base = Path(os.path.commonpath(roots))
+            files = [f for f in base.rglob("*") if f.is_file() and f.suffix in (".kur", ".toml")]
+            if not base.is_relative_to(ROOT) and len(files) <= 20:
+                found.append(({str(f.relative_to(base)): f.read_text() for f in files}, str(target.relative_to(base))))
+        except Exception:  # noqa: BLE001 - a package that cannot be recorded is left out
+            pass
+        return real_lower(resolver, *args, **kwargs)
+
+    module = importlib.import_module(module_name)
+    patched = [m for name, m in list(sys.modules.items())
+               if (name.startswith("tests.") or name == module_name) and getattr(m, "lower", None) is real_lower]
+    for m in patched:
+        m.lower = watched
+    try:
+        unittest.TestLoader().loadTestsFromModule(module).run(unittest.TestResult())
+    finally:
+        for m in patched:
+            m.lower = real_lower
+    return found
+
+
+def materialize(directory: Path, files: dict[str, str]) -> None:
+    for rel, text in files.items():
+        (directory / rel).parent.mkdir(parents=True, exist_ok=True)
+        (directory / rel).write_text(text)
+
+
+def reference_case_lowering(case: tuple[dict[str, str], str]) -> str:
+    """The reference's lowering of a recorded or written package, its directory spelled `<DIR>`."""
+    files, target = case
+    with tempfile.TemporaryDirectory() as directory:
+        base = Path(directory).resolve()
+        materialize(base, files)
+        return reference_lowering(base / target).replace(str(base), "<DIR>")
+
+
+def lowering_cases() -> list[dict]:
+    """Every distinct package the reference's own tests lower outside the repository, and the cases of
+    tests/lower_cases.py, each with the reference's lowering: {files, target, lower}."""
+    modules = sorted(path.stem for path in TESTS.glob("test_*.py")
+                     if path.stem not in ("test_compiler", "test_examples", "test_library", "test_kurs", "test_parallel_runner"))
+
+    def make() -> list:
+        with ProcessPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
+            found = pool.map(recorded_lowerings, [f"tests.{module}" for module in modules])
+            cases: dict[str, tuple[dict[str, str], str]] = {}
+            for files, target in [case for group in found for case in group] + list(LOWER_CASES):
+                cases.setdefault(json.dumps([files, target], sort_keys=True), (files, target))
+            unique = list(cases.values())
+            return [{"files": files, "target": target, "lower": text}
+                    for (files, target), text in zip(unique, pool.map(reference_case_lowering, unique, chunksize=4))]
+
+    sources = [*TESTS.glob("*.py"), *(ROOT / "reference-compiler/kursal").glob("*.py"), *(ROOT / "lib").rglob("*.kur")]
+    return cached("lowerings", digest_of(sources), make)
 
 
 SHAPES = {
@@ -688,6 +846,7 @@ SYNTAX_ERRORS = (
     "struct S { a: u32 b: u32 }",
     "fn f() { let s = \"\\q\"; }",
     "fn f() -> u32 { p.0.1 }",
+    "fn f() -> u64 { 18446744073709551616 }",
 )
 
 KURS_ERRORS = (
@@ -838,7 +997,7 @@ def core_cases() -> list[dict[str, Optional[str]]]:
     return cached("core", digest_of(sources), make)
 
 
-# Cases for `kursalc selftest-types`; compiler/selftest.kur describes their forms.
+# Cases for `kursal selftest-types`; compiler/selftest.kur describes their forms.
 TYPE_CASES = (
     # show
     "(show (tuple))",
@@ -1069,7 +1228,7 @@ def _set(names: set[str]) -> str:
 
 
 def type_case(case: str) -> str:
-    """What `kursalc selftest-types CASE` prints for one case, computed with these modules."""
+    """What `kursal selftest-types CASE` prints for one case, computed with these modules."""
     form = read(case)[0]
     op = str(form[0])
     if op == "show":
@@ -1150,7 +1309,7 @@ class CompilerTests(unittest.TestCase):
         cls.binary = build_compiler()
 
     def run_compiler(self, *args: str) -> subprocess.CompletedProcess[str]:
-        return run_kursalc(self.binary, *args)
+        return run_kursal(self.binary, *args)
 
     def run_all(self, runs: list[tuple[str, ...]]) -> list[subprocess.CompletedProcess[str]]:
         """Each run's result, in order; the runs go in parallel."""
@@ -1178,7 +1337,7 @@ class CompilerTests(unittest.TestCase):
                 self.assertEqual(self.compiler_resolution(path), expected)
 
     def run_batches(self, command: str, paths: list[Path]) -> list[str]:
-        """`kursalc COMMAND PATH` for each path, a batch of processes at a time: its output, or its error."""
+        """`kursal COMMAND PATH` for each path, a batch of processes at a time: its output, or its error."""
         workers = min(8, os.cpu_count() or 1)
         results: list[str] = []
         # Started from this thread, so that `limit_memory` runs in no threaded child.
@@ -1193,7 +1352,7 @@ class CompilerTests(unittest.TestCase):
         return results
 
     def compare_outputs(self, command: str, reference, paths: list[Path]) -> None:
-        """Each package's result from the reference and from `kursalc COMMAND`, both computed in parallel."""
+        """Each package's result from the reference and from `kursal COMMAND`, both computed in parallel."""
         with ProcessPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
             expected = pool.map(reference, paths)
             results = self.run_batches(command, paths)
@@ -1255,6 +1414,69 @@ class CompilerTests(unittest.TestCase):
             for path, (want, _), got in zip(paths, expected, self.run_batches("infer", paths)):
                 with self.subTest(path=str(path)):
                     self.assertEqual(got, want)
+
+    def test_lowering_matches_reference(self):
+        """Every package, bad example and the compiler itself: the same core program, or the same error."""
+        paths, expected = built_paths(), reference_builds()
+        self.assertGreater(len(paths), 50)
+        for path, want, got in zip(paths, expected, self.run_batches("lower", paths)):
+            with self.subTest(path=str(path.relative_to(ROOT))):
+                self.assertEqual(got, want["lower"])
+
+    def test_build_matches_reference(self):
+        """Every package that builds: `kursal build` writes the C of the reference's whole pipeline."""
+        paths, expected = built_paths(), reference_builds()
+        buildable = [(path, want["c"]) for path, want in zip(paths, expected) if want["c"] is not None]
+        self.assertGreater(len(buildable), 50)
+        self.assertIn(COMPILER, [path for path, _ in buildable])
+        results = self.run_batches("build", [path for path, _ in buildable])
+        for (path, want), got in zip(buildable, results):
+            with self.subTest(path=str(path.relative_to(ROOT))):
+                self.assertEqual(got, want)
+
+    def test_lowering_cases_match_reference(self):
+        """The packages the reference's own tests lower, and the cases of tests/lower_cases.py, which the
+        reference rejects with a message containing the fragment given: the same core program, or the same
+        error. No case is a syntax error."""
+        cases = lowering_cases()
+        fragments = {json.dumps(list(case_files(case)), sort_keys=True): fragment for case, fragment in LOWER_ERRORS}
+        self.assertGreater(len(cases), 300)
+        written = 0
+        for case in cases:
+            with self.subTest(files=case["files"]):
+                self.assertNotIn("syntax error", case["lower"])
+                fragment = fragments.get(json.dumps([case["files"], case["target"]], sort_keys=True))
+                if fragment is not None:
+                    written += 1
+                    self.assertTrue(case["lower"].startswith("error:"), case["lower"][:200])
+                    self.assertIn(fragment, case["lower"])
+        self.assertEqual(written, len(LOWER_ERRORS))
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            paths = []
+            for index, case in enumerate(cases):
+                materialize(base / f"case{index}", case["files"])
+                paths.append(base / f"case{index}" / case["target"])
+            results = self.run_batches("lower", paths)
+        for index, (case, got) in enumerate(zip(cases, results)):
+            with self.subTest(files=case["files"]):
+                self.assertEqual(got.replace(str(base / f"case{index}"), "<DIR>"), case["lower"])
+
+    @unittest.skipUnless(os.environ.get("KURSAL_SELFHOST") == "1", "set KURSAL_SELFHOST=1 to compile the compiler with itself")
+    def test_self_compilation_reaches_a_fixpoint(self):
+        """The compiler the reference built (kc1) builds compiler/ (kc2), which builds it again (kc3): kc2's C
+        and kc3's are the same, and the reference's C for compiler/."""
+        expected = reference_builds()[built_paths().index(COMPILER)]["c"]
+        with tempfile.TemporaryDirectory() as directory:
+            stages = [self.binary, Path(directory) / "kc2", Path(directory) / "kc3"]
+            for compiler, output in zip(stages, stages[1:]):
+                started = time.monotonic()
+                result = run_kursal(compiler, "build", str(COMPILER), "-o", str(output), "--times")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                print(f"\n{output.name} built in {time.monotonic() - started:.1f}s:\n{result.stderr}", file=sys.stderr)
+            kc2, kc3 = (Path(f"{stage}.c").read_text() for stage in stages[1:])
+        self.assertEqual(kc2, kc3)
+        self.assertEqual(kc2, expected)
 
     def check_resolution(self, cases: tuple[tuple[dict[str, str], str], ...], fails: bool) -> None:
         for index, (files, target) in enumerate(cases):

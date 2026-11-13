@@ -931,7 +931,10 @@ class Parser:
             digits, suffix = S.split_suffix(text, S.INT_SUFFIXES)
             digits = digits.replace("_", "")
             base = {"0x": 16, "0o": 8, "0b": 2}.get(digits[:2], 10)
-            return S.Lit("int", int(digits[2:] if base != 10 else digits, base), suffix, p)
+            value = int(digits[2:] if base != 10 else digits, base)
+            if value >= 1 << 64:   # no integer type holds it; its magnitude must fit 64 bits
+                raise KursError(f"{self.filename}:{tok.line}:{tok.col}: integer literal out of range")
+            return S.Lit("int", value, suffix, p)
         if k == "FLOAT":
             digits, suffix = S.split_suffix(text, ("f32", "f64"))
             return S.Lit("float", digits.replace("_", ""), suffix, p)

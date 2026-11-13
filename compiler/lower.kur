@@ -1,0 +1,2593 @@
+// Lowering: inferred surface to KURS.
+//
+// Ordinary local variables start in places, with loads and stores, and explicit CFG contracts
+// computed by forward dataflow (`placeflow`). A final frontend pass (`promote`) promotes roots whose
+// contents mention nongeneric brands to SSA block arguments, decomposing projected products and
+// generating generic value adapters for lending. Only function-generic brands may remain in core
+// local declarations.
+//
+// `lower` first infers every function body in the resolved, signature-built graph. `FnLower` reads
+// what inference found, by syntax node id: local uses and binders have matching ids, calls have
+// targets, and closures have captures. Core types and call substitutions have their solved
+// metavariables replaced. Annotations conditional on syntax (such as a struct spread's id) are read
+// only for that form; lookup-only paths and folded constant subexpressions need no type.
+//
+// The result is a core program, ready for core checking before C emission.
+
+use package::base::{Cell, Map, Out, Seq, Set, Text, text};
+use package::check::overlap;
+use package::core::{Block, Data, Edge, Extern, Fun, Instance, Instr, Kind, ModuleId, Param, Program, Terminator, Type};
+use package::core as C;
+use package::infer::{Callee, Capture, Results, infer, pointer_params};
+use package::literals::valid_literal;
+use package::placeflow::PlaceFlow;
+use package::promote::promote_locals;
+use package::resolve::{NameRef, Named, Resolver};
+use package::sexpr::{Form, FormKind};
+use package::sigs::{ConstValue, Sig, Signatures, const_type, int_text};
+use package::syntax as S;
+use package::syntax::{Expr, Pattern, Pos, Statement, expr_id, expr_pos, no_pos};
+use package::types::{Fresh, Types, foreach_binders, foreach_item, free_brands, mentions_brand, subst};
+use std::option::Option;
+use std::slice::Slice;
+
+fn binop_name(op: Text) -> Slice[u8, 'static] {
+    if op.is("+") { "add" } else if op.is("-") { "sub" } else if op.is("*") { "mul" } else if op.is("/") { "div" }
+    else if op.is("%") { "mod" } else if op.is("&") { "bit_and" } else if op.is("|") { "bit_or" }
+    else if op.is("^") { "bit_xor" } else if op.is("<<") { "shl" } else if op.is(">>") { "shr" }
+    else if op.is("==") { "eq" } else if op.is("!=") { "ne" } else if op.is("<") { "lt" } else if op.is("<=") { "le" }
+    else if op.is(">") { "gt" } else { "ge" }
+}
+
+// An `Ordering` variant's core spelling.
+fn ordering_name(variant: Text) -> Option[Slice[u8, 'static]] {
+    if variant.is("Relaxed") {
+        Option::Some.("relaxed")
+    } else if variant.is("Acquire") {
+        Option::Some.("acquire")
+    } else if variant.is("Release") {
+        Option::Some.("release")
+    } else if variant.is("AcqRel") {
+        Option::Some.("acq_rel")
+    } else if variant.is("SeqCst") {
+        Option::Some.("seq_cst")
+    } else {
+        Option::None
+    }
+}
+
+fn lends(arg: Text) -> bool {
+    arg.starts_with(text("&")) && !arg.starts_with(text("&*"))
+}
+
+fn is_unit(t: Type) -> bool {
+    C::same(t, C::unit())
+}
+
+fn id_text(id: u32) -> Text {
+    Out::new().u64(id as u64).done()
+}
+
+// ---------------------------------------------------------- match coverage --
+
+// An integer of any primitive type: its sign and magnitude, zero never negative.
+exposed struct Int {
+    negative: bool,
+    magnitude: u64,
+}
+
+fn int_of(l: S::Lit) -> Int {
+    Int.{ negative: l.negative && l.int != 0u64, magnitude: l.int }
+}
+
+fn int_le(a: Int, b: Int) -> bool {
+    if a.negative != b.negative {
+        a.negative
+    } else if a.negative {
+        a.magnitude >= b.magnitude
+    } else {
+        a.magnitude <= b.magnitude
+    }
+}
+
+fn int_eq(a: Int, b: Int) -> bool {
+    a.negative == b.negative && a.magnitude == b.magnitude
+}
+
+fn int_spelled(a: Int) -> Text {
+    if a.negative {
+        Out::new().put("-").u64(a.magnitude).done()
+    } else {
+        Out::new().u64(a.magnitude).done()
+    }
+}
+
+// What a match arm covers: enum variant names, or integer ranges; nothing for the wildcard.
+exposed enum CoverItem {
+    Variant(Text),
+    Range(Int, Int),
+}
+
+// ------------------------------------------------------------ the program --
+
+// A source binding: a variable and the place that holds it, or a `..rest` bundle, whose fields are
+// the ids of bindings.
+exposed struct Binding {
+    name: Text,
+    type: Type,
+    path: Option[Text],
+    fields: Option[Map[Text, Text]],
+}
+
+// A block under construction.
+exposed struct BlockB {
+    label: Text,
+    params: Seq[C::Binding],
+    instrs: Seq[Instr],
+    term: Cell[Option[Terminator]],
+    brands: Seq[Text],
+}
+
+// The program-wide state.
+exposed struct Lowering {
+    r: Resolver,
+    sigs: Signatures,
+    results: Results,
+    program: Program,
+    types: Types,
+    counter: Fresh,
+    // string bytes -> the data holding them
+    datas: Map[Text, Text],
+    closures: Cell[u64],
+    // a function with branded locals (by `fun_key`) -> the types of its SSA values, for promotion
+    value_types: Map[usize, Map[Text, Type]],
+}
+
+// A function's identity, as long as it lives: its block sequence's.
+fn fun_key(fun: Fun) -> usize {
+    unsafe (fun.blocks.head as usize)
+}
+
+impl Lowering {
+    fn library_name(self, name: Slice[u8, 'static], home: ModuleId) -> Text {
+        self.sigs.name(self.sigs.library(home, text(name)))
+    }
+
+    fn library_sig(self, name: Slice[u8, 'static], home: ModuleId) -> Sig {
+        self.sigs.sigs.at(self.sigs.library(home, text(name)).id)
+    }
+
+    fn run(self) -> Program {
+        let program = self.program;
+        let sigs = self.sigs.sigs.values();
+        var i = 0usize;
+        while i < sigs.len() {
+            let sig = sigs.get(i);
+            match sig.decl {
+                Option::Some(decl) => match decl.node {
+                    Named::Extern(x) => if decl.kind.is("extern") {
+                        program.externs.set(x.name, Extern.{ name: x.name, ret: Option::Some.(sig.ret), ptypes: Option::Some.(sig.ptypes), pos: no_pos() });
+                    },
+                    Named::Fn(node) => if node.body.is_some() {
+                        self.r.locate(decl.home, node.pos);
+                        let fun = FnLower::new(self, sig, Mode::Plain.(node), sig.name, node.pos).run();
+                        self.r.unlocate();
+                        program.funs.set(sig.name, fun);
+                    },
+                    _ => (),
+                },
+                Option::None => (),
+            };
+            i = i + 1usize;
+        }
+        i = 0usize;
+        while i < self.sigs.instances.len() {
+            let (inst, item, home) = self.sigs.instances.get(i);
+            let methods: Seq[Fun] = Seq::new();
+            var k = 0usize;
+            while k < inst.methods.len() && k < item.methods.len() {
+                let sig = inst.methods.get(k);
+                let node = item.methods.get(k);
+                self.r.locate(home, node.pos);
+                let fun = FnLower::new(self, sig, Mode::Plain.(node), node.name, node.pos).run();
+                self.r.unlocate();
+                let { params: _p, premises: _q, ..rest } = fun;
+                methods.push(Fun.{ params: sig.params.from(inst.params.len()), premises: sig.premises.from(inst.premises.len()), ..rest });
+                k = k + 1usize;
+            }
+            let lowered = Instance.{ trait_name: inst.trait_name, params: inst.params, premises: inst.premises, head: inst.head, methods,
+                home: Option::Some.(inst.home), pos: inst.pos };
+            match program.instances.get(inst.trait_name) {
+                Option::Some(list) => list.push(lowered),
+                Option::None => program.instances.set(inst.trait_name, Seq::one(lowered)),
+            };
+            i = i + 1usize;
+        }
+        let flow = PlaceFlow::new(program, self.r, self.counter);
+        // functions' formation errors are located in their files
+        flow.checker.formation.reporter.set(Option::Some.(self.r));
+        let funs = program.funs.values();
+        i = 0usize;
+        while i < funs.len() {
+            self.plan(flow, funs.get(i), Seq::new(), Seq::new());
+            i = i + 1usize;
+        }
+        let groups = program.instances.values();
+        i = 0usize;
+        while i < groups.len() {
+            let insts = groups.get(i);
+            var k = 0usize;
+            while k < insts.len() {
+                let inst = insts.get(k);
+                var m = 0usize;
+                while m < inst.methods.len() {
+                    self.plan(flow, inst.methods.get(m), inst.params, inst.premises);
+                    m = m + 1usize;
+                }
+                k = k + 1usize;
+            }
+            i = i + 1usize;
+        }
+        program
+    }
+
+    // Plans `fun`'s place contracts and promotes its branded roots; an instance method's `outer`
+    // parameters and premises are its instance's.
+    fn plan(self, flow: PlaceFlow, fun: Fun, outer: Seq[Param], outer_premises: Seq[C::Premise]) {
+        let located = match fun.home {
+            Option::Some(home) => {
+                self.r.locate(home, fun.pos);
+                true
+            },
+            Option::None => false,
+        };
+        flow.plan(fun, outer);
+        let params = outer.copy();
+        params.append(fun.params);
+        let premises = outer_premises.copy();
+        premises.append(fun.premises);
+        let key = fun_key(fun);
+        let value_types = self.value_types.get_or(key, Map::new());
+        self.value_types.remove(key);
+        let helpers = promote_locals(fun, self.types, params, premises, value_types, self.r, self.counter);
+        var i = 0usize;
+        while i < helpers.len() {
+            let helper = helpers.get(i);
+            self.program.funs.set(helper.name, helper);
+            flow.checker.formation.function(helper, Seq::new(), Seq::new());
+            i = i + 1usize;
+        }
+        flow.checker.formation.function(fun, outer, outer_premises);
+        if located {
+            self.r.unlocate();
+        }
+    }
+
+    // A static byte array holding `bytes`: its name and length.
+    fn data(self, bytes: Text) -> (Text, usize) {
+        match self.datas.get(bytes) {
+            Option::Some(label) => return (label, bytes.len),
+            Option::None => (),
+        };
+        let label = Out::new().put("string#").usize(self.datas.len()).done();
+        let item = Form.{ kind: FormKind::Str, text: bytes, items: Seq::new(), pos: no_pos() };
+        let init = Form.{ kind: FormKind::List, text: text(""), items: Seq::one(item), pos: no_pos() };
+        self.datas.set(bytes, label);
+        self.program.datas.set(label, Data.{ name: label, ty: Type::Array.(Cell::new(C::prim("u8")), bytes.len as u64), init, home: Option::None });
+        (label, bytes.len)
+    }
+}
+
+// --------------------------------------------------------- one function --
+
+// What is being lowered: a function's body, a closure's (with its environment's type) or a foreach
+// body's, the last two lifted out of the function containing them.
+exposed enum Mode {
+    Plain(S::Fn),
+    Closure(S::Closure, Type),
+    Mapper(S::Foreach),
+}
+
+// An operand to evaluate: an expression, a binding to read, or a place path or value already known.
+exposed enum Item {
+    Expr(Expr),
+    Bind(Binding),
+    Path(Text),
+}
+
+// What one arm of a branch evaluates.
+exposed enum ArmBody {
+    Value(Expr),
+    Unit,
+    Constant(Text),
+    // a match arm, its block, and the place a lent match switches on
+    Case(S::Arm, BlockB, Option[Text]),
+}
+
+// An instruction to emit: its operation, result type and arguments; the node it comes from, whose
+// `unsafe` discharges it and whose position it takes; and its other parts.
+exposed struct Op {
+    name: Text,
+    rty: Type,
+    args: Seq[Text],
+    node: Option[(u32, Pos)],
+    discharged: bool,
+    ty: Option[Type],
+    tys: Seq[Type],
+    lit: Option[Text],
+    binders: Seq[Text],
+    pos: Pos,
+}
+
+impl Op {
+    fn new(name: Slice[u8, 'static], rty: Type, args: Seq[Text]) -> Op {
+        Op.{ name: text(name), rty, args, node: Option::None, discharged: false, ty: Option::None, tys: Seq::new(),
+            lit: Option::None, binders: Seq::new(), pos: no_pos() }
+    }
+
+    fn named(name: Text, rty: Type, args: Seq[Text]) -> Op {
+        let { name: _n, ..rest } = Op::new("", rty, args);
+        Op.{ name, ..rest }
+    }
+
+    fn typed(self, t: Type) -> Op {
+        let { ty: _t, ..rest } = self;
+        Op.{ ty: Option::Some.(t), ..rest }
+    }
+
+    fn with_tys(self, tys: Seq[Type]) -> Op {
+        let { tys: _t, ..rest } = self;
+        Op.{ tys, ..rest }
+    }
+
+    fn literal(self, lit: Text) -> Op {
+        let { lit: _l, ..rest } = self;
+        Op.{ lit: Option::Some.(lit), ..rest }
+    }
+
+    fn maybe_literal(self, lit: Option[Text]) -> Op {
+        let { lit: _l, ..rest } = self;
+        Op.{ lit, ..rest }
+    }
+
+    fn from_node(self, id: u32, pos: Pos) -> Op {
+        let { node: _n, ..rest } = self;
+        Op.{ node: Option::Some.((id, pos)), ..rest }
+    }
+
+    fn discharge(self, yes: bool) -> Op {
+        let { discharged: _d, ..rest } = self;
+        Op.{ discharged: yes, ..rest }
+    }
+
+    fn opening(self, binders: Seq[Text]) -> Op {
+        let { binders: _b, ..rest } = self;
+        Op.{ binders, ..rest }
+    }
+
+    fn located(self, pos: Pos) -> Op {
+        let { pos: _p, ..rest } = self;
+        Op.{ pos, ..rest }
+    }
+}
+
+// Translates one function, appending instructions to the current block. `cur` is none before the
+// entry and after a terminator. `start` selects an open block; `terminate` closes it. Expression
+// rules return a value name on paths that continue, including a constructed unit value for unit
+// expressions; they return none when no path continues, leaving `cur` none.
+exposed struct FnLower {
+    lowering: Lowering,
+    sig: Sig,
+    name: Text,
+    home: ModuleId,
+    node_pos: Pos,
+    mode: Mode,
+    kinds: Map[Text, Kind],
+    // whether each type asked about is Copy
+    copies: Map[Type, bool],
+    blocks: Seq[BlockB],
+    cur: Cell[Option[BlockB]],
+    vty: Map[Text, Type],
+    bindings: Map[Text, Binding],
+    locals: Seq[C::Binding],
+    open_brands: Cell[Seq[Text]],
+    brand_map: Cell[Map[Text, Type]],
+    unsafe_nodes: Set[u32],
+    // inside an unsafe function's lifted closures every operation is discharged
+    discharge_all: bool,
+    lend_frames: Seq[Seq[Text]],
+    n: Cell[u64],
+    at: Cell[Pos],
+}
+
+impl FnLower {
+    fn new(lowering: Lowering, sig: Sig, mode: Mode, name: Text, node_pos: Pos) -> FnLower {
+        let kinds: Map[Text, Kind] = Map::new();
+        var i = 0usize;
+        while i < sig.params.len() {
+            kinds.set(sig.params.get(i).name, sig.params.get(i).kind);
+            i = i + 1usize;
+        }
+        let home = match sig.home {
+            Option::Some(m) => m,
+            Option::None => lowering.r.fail(text("internal error: a function without a module"), node_pos),
+        };
+        FnLower.{
+            lowering, sig, name, home, node_pos, mode, kinds, copies: Map::new(), blocks: Seq::new(), cur: Cell::new(Option::None), vty: Map::new(),
+            bindings: Map::new(), locals: Seq::new(), open_brands: Cell::new(Seq::new()), brand_map: Cell::new(Map::new()),
+            unsafe_nodes: Set::new(), discharge_all: false, lend_frames: Seq::new(), n: Cell::new(0u64), at: Cell::new(no_pos()),
+        }
+    }
+
+    // ---- machinery
+    fn fail(self, message: Text, pos: Pos) -> ! {
+        self.lowering.r.fail(message, pos)
+    }
+
+    fn fails(self, message: Slice[u8, 'static], pos: Pos) -> ! {
+        self.lowering.r.fail(text(message), pos)
+    }
+
+    fn results(self) -> Results {
+        self.lowering.results
+    }
+
+    fn type_of(self, id: u32) -> Type {
+        match self.lowering.results.types.get(id) {
+            Option::Some(t) => t,
+            Option::None => self.fails("internal error: a node without a type", self.at.get()),
+        }
+    }
+
+    fn binder(self, id: u32) -> Text {
+        id_text(self.lowering.results.binders.at(id))
+    }
+
+    fn current(self) -> BlockB {
+        match self.cur.get() {
+            Option::Some(b) => b,
+            Option::None => self.fails("internal error: no current block", self.at.get()),
+        }
+    }
+
+    fn live(self) -> bool {
+        self.cur.get().is_some()
+    }
+
+    fn fresh(self, hint: Slice[u8, 'static]) -> Text {
+        self.n.set(self.n.get() + 1u64);
+        Out::new().put("%").put(hint).u64(self.n.get()).done()
+    }
+
+    fn lifted(self) -> bool {
+        match self.mode {
+            Mode::Plain(_f) => false,
+            _ => true,
+        }
+    }
+
+    // A lifted body's types may mention only the brands it may name: those of its function's
+    // parameters, and those opened in it so far.
+    fn substitute_type(self, ty: Type) -> Type {
+        let mapping = self.brand_map.get();
+        let t = if mapping.is_empty() { ty } else { subst(ty, mapping, self.lowering.counter) };
+        if self.lifted() {
+            self.check_closed(t, self.open_brands.get());
+        }
+        t
+    }
+
+    fn substitute_all(self, ts: Seq[Type]) -> Seq[Type] {
+        let out: Seq[Type] = Seq::new();
+        var i = 0usize;
+        while i < ts.len() {
+            out.push(self.substitute_type(ts.get(i)));
+            i = i + 1usize;
+        }
+        out
+    }
+
+    fn copy(self, ty: Type) -> bool {
+        match self.copies.get(ty) {
+            Option::Some(answer) => answer,
+            Option::None => {
+                let answer = self.lowering.types.is_copy(ty, self.kinds);
+                self.copies.set(ty, answer);
+                answer
+            },
+        }
+    }
+
+    fn authorized(self, id: u32) -> bool {
+        self.sig.is_unsafe || self.discharge_all || self.unsafe_nodes.has(id)
+    }
+
+    fn emit(self, o: Op) -> Text {
+        let pos = if o.pos.line != 0u32 {
+            o.pos
+        } else {
+            match o.node {
+                Option::Some(node) => {
+                    let (_id, p) = node;
+                    p
+                },
+                Option::None => self.at.get(),
+            }
+        };
+        if o.name.is("const") {
+            match o.ty {
+                Option::Some(t) => match t {
+                    Type::Prim(prim) => match o.lit {
+                        Option::Some(lit) => if !valid_literal(t, lit) {
+                            self.fail(Out::new().put("literal ").add(lit).put(" does not fit ").add(prim).done(),
+                                if pos.line != 0u32 { pos } else { self.at.get() });
+                        },
+                        Option::None => (),
+                    },
+                    _ => (),
+                },
+                Option::None => (),
+            };
+        }
+        let name = self.fresh("v");
+        if o.name.is("call") || o.name.is("trait_call") {
+            var f = 0usize;
+            while f < self.lend_frames.len() {
+                let frame = self.lend_frames.get(f);
+                var k = 0usize;
+                while k < o.args.len() {
+                    if lends(o.args.get(k)) {
+                        frame.push(o.args.get(k));
+                    }
+                    k = k + 1usize;
+                }
+                f = f + 1usize;
+            }
+        }
+        let marked = match o.node {
+            Option::Some(node) => {
+                let (id, _p) = node;
+                self.unsafe_nodes.has(id)
+            },
+            Option::None => false,
+        };
+        let discharged = o.discharged || self.discharge_all || marked;
+        if (o.name.starts_with(text("builtin::unsafe::")) || o.name.is("alloca")) && !(discharged || self.sig.is_unsafe) {
+            self.fail(Out::new().add(o.name).put(" requires unsafe authorization").done(), pos);
+        }
+        self.current().instrs.push(Instr.{ lhs: Seq::one(name), op: o.name, args: o.args, ty: o.ty, tys: o.tys, lit: o.lit,
+            is_unsafe: discharged, binders: o.binders, pos });
+        self.vty.set(name, o.rty);
+        name
+    }
+
+    fn unit(self) -> Text {
+        self.emit(Op::new("construct", C::unit(), Seq::new()).typed(C::unit()))
+    }
+
+    fn constant(self, ty: Type, lit: Text) -> Text {
+        self.emit(Op::new("const", ty, Seq::new()).typed(ty).literal(lit))
+    }
+
+    fn destruct(self, value: Text, ty: Type) -> Seq[C::Binding] {
+        let comps = self.lowering.types.fields(ty, Option::None);
+        let names: Seq[Text] = Seq::new();
+        let out: Seq[C::Binding] = Seq::new();
+        var i = 0usize;
+        while i < comps.len() {
+            let n = self.fresh("c");
+            names.push(n);
+            out.push(C::Binding.{ name: n, type: comps.get(i) });
+            i = i + 1usize;
+        }
+        self.current().instrs.push(Instr.{ lhs: names, op: text("destruct"), args: Seq::one(value), ty: Option::Some.(ty), tys: Seq::new(),
+            lit: Option::None, is_unsafe: false, binders: Seq::new(), pos: self.at.get() });
+        i = 0usize;
+        while i < comps.len() {
+            self.vty.set(names.get(i), comps.get(i));
+            i = i + 1usize;
+        }
+        out
+    }
+
+    fn block_named(self, label: Text, params: Seq[C::Binding]) -> BlockB {
+        let block = BlockB.{ label, params, instrs: Seq::new(), term: Cell::new(Option::None), brands: self.open_brands.get().copy() };
+        self.blocks.push(block);
+        block
+    }
+
+    fn new_block(self, params: Seq[C::Binding], hint: Slice[u8, 'static]) -> BlockB {
+        self.n.set(self.n.get() + 1u64);
+        self.block_named(Out::new().put(hint).u64(self.n.get()).done(), params)
+    }
+
+    fn start(self, block: BlockB) {
+        self.cur.set(Option::Some.(block));
+        var i = 0usize;
+        while i < block.params.len() {
+            self.vty.set(block.params.get(i).name, block.params.get(i).type);
+            i = i + 1usize;
+        }
+        self.open_brands.set(block.brands.copy());
+    }
+
+    fn terminate(self, term: Terminator) {
+        self.current().term.set(Option::Some.(term));
+        self.cur.set(Option::None);
+    }
+
+    fn edge(self, block: BlockB, extra: Seq[Text]) -> Edge {
+        let tys: Seq[Type] = Seq::new();
+        var i = 0usize;
+        while i < block.brands.len() {
+            tys.push(Type::Skolem.(block.brands.get(i)));
+            i = i + 1usize;
+        }
+        Edge.{ target: block.label, args: extra, tys }
+    }
+
+    fn jump(self, block: BlockB, extra: Seq[Text]) {
+        self.terminate(Terminator::Jmp.(self.edge(block, extra), self.at.get()));
+    }
+
+    fn local_ref(self, p: S::Path) -> bool {
+        match self.lowering.r.refs.get(p.id) {
+            Option::Some(r) => match r {
+                NameRef::Local(_n) => true,
+                _ => false,
+            },
+            Option::None => false,
+        }
+    }
+
+    fn temporary(self, ty: Type) -> Text {
+        let root = Out::new().put("&#tmp").usize(self.locals.len()).done();
+        self.locals.push(C::Binding.{ name: root, type: ty });
+        root
+    }
+
+    fn value(self, item: Item) -> Option[Text] {
+        match item {
+            Item::Bind(b) => Option::Some.(self.read(b)),
+            Item::Path(t) => Option::Some.(t),
+            Item::Expr(e) => self.expr(e),
+        }
+    }
+
+    // Evaluates strictly left to right. Items are expressions, bindings to read, or already resolved
+    // place paths. A value preceding another operand waits in a temporary place, then is reloaded
+    // in the final block. Calls (`call`) interpret explicit lends. A plain read of a place that the
+    // same group lends is rejected, whatever its type: the program states the order with a binding
+    // before the expression.
+    fn operands(self, items: Seq[Item], call: Option[S::Call]) -> Option[Seq[Text]] {
+        let reads: Seq[Text] = Seq::new();
+        var i = 0usize;
+        while i < items.len() {
+            match items.get(i) {
+                Item::Bind(b) => match b.path {
+                    Option::Some(p) => reads.push(p),
+                    Option::None => (),
+                },
+                Item::Expr(e) => {
+                    let place = match e {
+                        Expr::Path(_p) => true,
+                        Expr::Field(_f) => true,
+                        Expr::Index(_x) => true,
+                        _ => false,
+                    };
+                    if place {
+                        let path = self.place_path(e);
+                        let unit = self.substitute_type(self.type_of(expr_id(e)));
+                        match path {
+                            Option::Some(p) => reads.push(p),
+                            Option::None => (),
+                        };
+                    }
+                },
+                Item::Path(_t) => (),
+            };
+            i = i + 1usize;
+        }
+        let lent: Seq[Text] = Seq::new();
+        self.lend_frames.push(lent);
+        let values: Seq[Text] = Seq::new();
+        let saved: Seq[(usize, Text, Text, Type)] = Seq::new();
+        i = 0usize;
+        while i < items.len() {
+            let item = items.get(i);
+            let v = match call {
+                Option::Some(c) => self.operand(item, c),
+                Option::None => self.value(item),
+            };
+            let v = match v {
+                Option::Some(v) => v,
+                Option::None => {
+                    let unit = self.lend_frames.pop();
+                    return Option::None;
+                },
+            };
+            values.push(v);
+            let raw = v.starts_with(text("&*"));
+            let name = if raw { v.from(2usize) } else { v };
+            if !name.starts_with(text("&")) && i + 1usize < items.len() {
+                let ty = self.vty.at(name);
+                let root = self.temporary(ty);
+                let origin = match item {
+                    Item::Expr(e) => expr_pos(e),
+                    _ => self.at.get(),
+                };
+                let unit = self.emit(Op::new("store", C::unit(), Seq::two(root, name)).located(origin));
+                saved.push((i, if raw { text("&*") } else { text("") }, root, ty));
+            }
+            i = i + 1usize;
+        }
+        i = 0usize;
+        while i < saved.len() {
+            let (k, raw, root, ty) = saved.get(i);
+            values.set(k, Out::new().add(raw).add(self.emit(Op::new("load", ty, Seq::one(root)))).done());
+            i = i + 1usize;
+        }
+        i = 0usize;
+        while i < values.len() {
+            if lends(values.get(i)) {
+                lent.push(values.get(i));
+            }
+            i = i + 1usize;
+        }
+        i = 0usize;
+        while i < reads.len() {
+            var k = 0usize;
+            while k < lent.len() {
+                if overlap(reads.get(i), lent.get(k)) {
+                    self.fails("a plain read overlaps a lend in the same operand group; bind the value before the expression", self.at.get());
+                }
+                k = k + 1usize;
+            }
+            i = i + 1usize;
+        }
+        let unit = self.lend_frames.pop();
+        Option::Some.(values)
+    }
+
+    fn exprs(es: Seq[Expr]) -> Seq[Item] {
+        let out: Seq[Item] = Seq::new();
+        var i = 0usize;
+        while i < es.len() {
+            out.push(Item::Expr.(es.get(i)));
+            i = i + 1usize;
+        }
+        out
+    }
+
+    fn run_arm(self, body: ArmBody) -> Option[Text] {
+        match body {
+            ArmBody::Value(e) => self.expr(e),
+            ArmBody::Unit => Option::Some.(self.unit()),
+            ArmBody::Constant(lit) => Option::Some.(self.constant(C::bool_type(), lit)),
+            ArmBody::Case(arm, block, place) => {
+                let case = arm.cases.get(0usize);
+                let variant = match case.kind {
+                    S::CaseKind::Variant => case.binders.is_some(),
+                    _ => false,
+                };
+                let binds = arm.cases.len() == 1usize && variant;
+                if binds {
+                    let payload = match place {
+                        Option::Some(p) => p,
+                        Option::None => block.params.get(0usize).name,
+                    };
+                    self.bind_payload(case, payload, place.is_some());
+                }
+                let saved = self.save_scope();
+                let v = self.expr(arm.body);
+                self.restore_scope(saved);
+                v
+            },
+        }
+    }
+
+    // Runs each arm in its block; the arms that finish meet in a join block taking their results.
+    fn arms(self, blocks: Seq[BlockB], bodies: Seq[ArmBody], ty: Type) -> Option[Text] {
+        let outer = self.open_brands.get().copy();
+        let mapping = self.brand_map.get().copy();
+        let ends: Seq[(BlockB, Text)] = Seq::new();
+        var i = 0usize;
+        while i < blocks.len() {
+            self.start(blocks.get(i));
+            let result = self.run_arm(bodies.get(i));
+            match self.cur.get() {
+                Option::Some(b) => match result {
+                    Option::Some(v) => ends.push((b, v)),
+                    Option::None => self.fails("internal error: an arm continues without a value", self.at.get()),
+                },
+                Option::None => (),
+            };
+            self.open_brands.set(outer.copy());
+            self.brand_map.set(mapping.copy());
+            i = i + 1usize;
+        }
+        if ends.is_empty() {
+            self.cur.set(Option::None);
+            return Option::None;
+        }
+        let r = self.fresh("r");
+        let join = self.new_block(Seq::one(C::Binding.{ name: r, type: self.substitute_type(ty) }), "join");
+        i = 0usize;
+        while i < ends.len() {
+            let (block, result) = ends.get(i);
+            self.cur.set(Option::Some.(block));
+            self.jump(join, Seq::one(result));
+            i = i + 1usize;
+        }
+        self.start(join);
+        Option::Some.(r)
+    }
+
+    // The brands open and their renaming, to restore when a lexical scope ends.
+    fn save_scope(self) -> (Seq[Text], Map[Text, Type]) {
+        (self.open_brands.get().copy(), self.brand_map.get().copy())
+    }
+
+    // The brands a scope opened go out of scope with it.
+    fn restore_scope(self, saved: (Seq[Text], Map[Text, Type])) {
+        let (brands, mapping) = saved;
+        self.brand_map.set(mapping);
+        if self.live() {
+            self.open_brands.set(brands);
+        }
+    }
+
+    // ---- bindings
+    // Binds a variable: a new root of the function, holding `value`.
+    fn declare(self, bid: Text, name: Text, ty: Type, value: Text) {
+        let ty = self.substitute_type(ty);
+        let root = Out::new().put("&").add(name).put("#").add(bid).done();
+        self.locals.push(C::Binding.{ name: root, type: ty });
+        self.bindings.set(bid, Binding.{ name, type: ty, path: Option::Some.(root), fields: Option::None });
+        let unit = self.emit(Op::new("store", C::unit(), Seq::two(root, value)));
+    }
+
+    fn read(self, binding: Binding) -> Text {
+        match binding.path {
+            Option::Some(path) => self.emit(Op::new("load", binding.type, Seq::one(path))),
+            Option::None => self.fail(Out::new().add(binding.name).put(" is a ..rest bundle, not a value").done(), self.at.get()),
+        }
+    }
+
+    fn local(self, id: u32) -> Binding {
+        self.bindings.at(self.binder(id))
+    }
+
+    // The place path `e` names, or none if it is not rooted at a place.
+    fn place_path(self, e: Expr) -> Option[Text] {
+        match e {
+            Expr::Path(p) => if self.local_ref(p) { self.local(p.id).path } else { Option::None },
+            Expr::Field(f) => match self.place_path(f.value.get()) {
+                Option::Some(base) => Option::Some.(Out::new().add(base).put(".").add(f.name).done()),
+                Option::None => Option::None,
+            },
+            Expr::Index(x) => match self.place_path(x.value.get()) {
+                Option::Some(base) => Option::Some.(Out::new().add(base).put(".").usize(x.index).done()),
+                Option::None => Option::None,
+            },
+            _ => Option::None,
+        }
+    }
+
+    // ---- the function
+    fn start_entry(self, params: Seq[C::Binding]) {
+        self.n.set(self.n.get() + 1u64);
+        self.start(self.block_named(text("entry"), params));
+    }
+
+    // Lent parameters are roots already; value parameters start in local places. An offset skips
+    // raw parameters such as a closure environment. Explicit sources keep the SSA names generated
+    // functions use.
+    fn parameters(self, ids: Seq[u32], offset: usize, sources: Seq[Text]) {
+        let sig = self.sig;
+        var k = offset;
+        while k < sig.pnames.len() && k < sig.ptypes.len() && k - offset < ids.len() {
+            let name = sig.pnames.get(k);
+            let ty = sig.ptypes.get(k);
+            let bid = id_text(ids.get(k - offset));
+            let place = sig.places.has(k);
+            let source = if !sources.is_empty() {
+                sources.get(k - offset)
+            } else {
+                Out::new().put(if place { "&" } else { "%a_" }).add(name).done()
+            };
+            self.current().params.push(C::Binding.{ name: source, type: ty });
+            if place {
+                self.bindings.set(bid, Binding.{ name, type: ty, path: Option::Some.(source), fields: Option::None });
+            } else {
+                self.vty.set(source, ty);
+                self.declare(bid, name, ty, source);
+            }
+            k = k + 1usize;
+        }
+    }
+
+    fn run(self) -> Fun {
+        match self.mode {
+            Mode::Plain(node) => {
+                self.start_entry(Seq::new());
+                self.parameters(self.results().param_ids.get_or(node.id, Seq::new()), 0usize, Seq::new());
+                match node.body {
+                    Option::Some(body) => self.finish_body(Expr::Block.(body)),
+                    Option::None => self.fails("internal error: a function without a body", node.pos),
+                }
+            },
+            Mode::Closure(e, env_ty) => {
+                self.start_entry(Seq::one(C::Binding.{ name: text("%env"), type: env_ty }));
+                self.parameters(self.results().param_ids.get_or(e.id, Seq::new()), 1usize, Seq::new());
+                let captures = self.results().captures.get_or(e.id, Seq::new());
+                let parts = self.destruct(text("%env"), env_ty);
+                var i = 0usize;
+                while i < captures.len() && i < parts.len() {
+                    let capture = captures.get(i);
+                    self.declare(id_text(capture.binder), capture.name, parts.get(i).type, parts.get(i).name);
+                    i = i + 1usize;
+                }
+                self.finish_body(e.body.get())
+            },
+            Mode::Mapper(e) => {
+                self.start_entry(Seq::new());
+                let captures = self.results().captures.get_or(e.id, Seq::new());
+                let ids = Seq::one(self.results().binders.at(e.id));
+                let sources = Seq::one(text("%item"));
+                var i = 0usize;
+                while i < captures.len() {
+                    ids.push(captures.get(i).binder);
+                    sources.push(Out::new().put("%a_").add(captures.get(i).name).done());
+                    i = i + 1usize;
+                }
+                self.parameters(ids, 0usize, sources);
+                self.finish_body(Expr::Block.(e.body))
+            },
+        }
+    }
+
+    fn finish_body(self, body: Expr) -> Fun {
+        let value = self.expr(body);
+        if self.live() {
+            let result_pos = match body {
+                Expr::Block(b) => match b.tail {
+                    Option::Some(t) => expr_pos(t.get()),
+                    Option::None => b.pos,
+                },
+                _ => expr_pos(body),
+            };
+            match value {
+                Option::Some(v) => self.terminate(Terminator::Ret.(v, result_pos)),
+                Option::None => self.fails("internal error: a body continues without a value", result_pos),
+            };
+        }
+        self.finish()
+    }
+
+    fn finish(self) -> Fun {
+        let sig = self.sig;
+        let blocks: Seq[Block] = Seq::new();
+        var i = 0usize;
+        while i < self.blocks.len() {
+            let b = self.blocks.get(i);
+            let term = match b.term.get() {
+                Option::Some(t) => t,
+                Option::None => self.fails("internal error: an unterminated block", self.node_pos),
+            };
+            blocks.push(Block.{ label: b.label, params: b.params, instrs: b.instrs, term, brands: b.brands, empty: Seq::new(),
+                known: Seq::new(), opened: Seq::new(), pos: no_pos() });
+            i = i + 1usize;
+        }
+        let fun = Fun.{ name: self.name, params: sig.params, premises: sig.premises, ret: sig.ret, ptypes: sig.ptypes, blocks,
+            locals: self.locals, is_unsafe: sig.is_unsafe, home: Option::Some.(self.home), pos: self.node_pos };
+        let brands: Set[Text] = Set::new();
+        i = 0usize;
+        while i < sig.params.len() {
+            if C::same_kind(sig.params.get(i).kind, Kind::Brand) {
+                brands.add(sig.params.get(i).name);
+            }
+            i = i + 1usize;
+        }
+        var branded = false;
+        i = 0usize;
+        while !branded && i < self.locals.len() {
+            let free = free_brands(self.locals.get(i).type).items();
+            var k = 0usize;
+            while k < free.len() {
+                branded = branded || !brands.has(free.get(k));
+                k = k + 1usize;
+            }
+            i = i + 1usize;
+        }
+        if branded {
+            self.lowering.value_types.set(fun_key(fun), self.vty.copy());
+        }
+        fun
+    }
+
+    // The enclosing function's own parameters, as the type arguments that instantiate a lifted
+    // function.
+    fn identity_args(self) -> Seq[Type] {
+        let out: Seq[Type] = Seq::new();
+        var i = 0usize;
+        while i < self.sig.params.len() {
+            let p = self.sig.params.get(i);
+            out.push(if C::same_kind(p.kind, Kind::Brand) { Type::Skolem.(p.name) } else { Type::Named.(p.name, Seq::new()) });
+            i = i + 1usize;
+        }
+        out
+    }
+
+    // A lifted type may mention function parameters and brands opened inside that body.
+    fn check_closed(self, ty: Type, local_brands: Seq[Text]) {
+        if !mentions_brand(ty) {
+            return;
+        }
+        let brands = free_brands(ty).items();
+        var least: Option[Text] = Option::None;
+        var i = 0usize;
+        while i < brands.len() {
+            let b = brands.get(i);
+            let parameter = match self.kinds.get(b) {
+                Option::Some(k) => C::same_kind(k, Kind::Brand),
+                Option::None => false,
+            };
+            let allowed = b.is("static") || local_brands.has(b) || parameter;
+            if !allowed {
+                least = match least {
+                    Option::Some(l) => if b.compare(l) < 0 { Option::Some.(b) } else { Option::Some.(l) },
+                    Option::None => Option::Some.(b),
+                };
+            }
+            i = i + 1usize;
+        }
+        match least {
+            Option::Some(b) => self.fail(Out::new().put("a closure or foreach body cannot mention the block-local brand ").add(b).done(), self.at.get()),
+            Option::None => (),
+        };
+    }
+
+    // ---- expressions
+    // The expression's value in the current block, or none if control cannot continue.
+    fn expr(self, e: Expr) -> Option[Text] {
+        if !self.live() {
+            return Option::None;
+        }
+        let previous = self.at.get();
+        self.at.set(expr_pos(e));
+        let v = self.lower_expr(e);
+        self.at.set(previous);
+        v
+    }
+
+    fn lower_expr(self, e: Expr) -> Option[Text] {
+        match e {
+            Expr::Lit(l) => Option::Some.(self.expr_lit(l)),
+            Expr::FStr(f) => self.expr_fstring(f),
+            Expr::Path(p) => self.expr_path(p),
+            Expr::Tuple(n) => self.expr_tuple(n.id, n.value),
+            Expr::Array(a) => self.expr_tuple(a.id, a.elems),
+            Expr::Sizeof(n) => Option::Some.(self.emit(Op::new("builtin::sizeof", C::usize_type(), Seq::new())
+                .typed(self.substitute_type(self.results().targets.at(n.id))))),
+            Expr::StructLit(s) => self.expr_struct_lit(s),
+            Expr::Block(b) => self.expr_block(b),
+            Expr::If(x) => self.expr_if(x),
+            Expr::Match(m) => self.expr_match(m),
+            Expr::Closure(c) => self.expr_closure(c),
+            Expr::Return(n) => self.expr_return(n.value),
+            Expr::Pack(p) => self.expr_pack(p),
+            Expr::Foreach(f) => self.expr_foreach(f),
+            Expr::Binop(b) => self.expr_binop(b),
+            Expr::Unary(u) => self.expr_unary(u),
+            Expr::Cast(c) => self.expr_cast(c),
+            Expr::UnsafeStore(s) => match self.operands(Seq::two(Item::Expr.(s.pointer.get()), Item::Expr.(s.value.get())), Option::None) {
+                Option::Some(vals) => Option::Some.(self.emit(Op::new("builtin::unsafe::store", C::unit(), vals).from_node(s.id, s.pos))),
+                Option::None => Option::None,
+            },
+            Expr::Field(f) => self.expr_field(e, f.id),
+            Expr::Index(x) => self.expr_field(e, x.id),
+            Expr::Call(c) => self.expr_call(c),
+            Expr::Try(n) => self.expr_try(n.id, n.value.get()),
+            Expr::While(w) => self.expr_while(w),
+            Expr::For(f) => self.expr_for(f),
+        }
+    }
+
+    fn expr_lit(self, l: S::Lit) -> Text {
+        let ty = self.substitute_type(self.type_of(l.id));
+        match l.kind {
+            S::LitKind::Str => self.string(l.text),
+            S::LitKind::Bool => self.constant(ty, text(if l.int != 0u64 { "true" } else { "false" })),
+            S::LitKind::Float => self.constant(ty, l.text),
+            S::LitKind::Int => self.constant(ty, Out::new().u64(l.int).done()),
+        }
+    }
+
+    // A string literal: a `Slice[u8, 'static]` over static bytes.
+    fn string(self, bytes: Text) -> Text {
+        let (data, n) = self.lowering.data(bytes);
+        let u8_type = C::prim("u8");
+        let fixed = Type::Skolem.(text("static"));
+        let d = self.emit(Op::new("data", C::ptr(Type::Array.(Cell::new(u8_type), n as u64)), Seq::one(data)));
+        let p = self.emit(Op::new("builtin::unsafe::cast", C::ptr(u8_type), Seq::one(d)).typed(C::ptr(u8_type)).discharge(true));
+        let brand = self.emit(Op::new("builtin::unsafe::static_brand", Type::Brand.(Cell::new(fixed)), Seq::new()).discharge(true));
+        let length = self.constant(C::usize_type(), Out::new().usize(n).done());
+        let sig = self.lowering.library_sig("Slice::from_raw_parts", self.home);
+        let slice_ty = Type::Named.(self.lowering.library_name("Slice", self.home), Seq::two(u8_type, fixed));
+        let args = Seq::one(sig.name);
+        args.push(p);
+        args.push(length);
+        args.push(brand);
+        self.emit(Op::new("call", slice_ty, args).with_tys(Seq::two(u8_type, fixed)).discharge(true))
+    }
+
+    fn expr_tuple(self, id: u32, elems: Seq[Expr]) -> Option[Text] {
+        let vals = match self.operands(FnLower::exprs(elems), Option::None) {
+            Option::Some(v) => v,
+            Option::None => return Option::None,
+        };
+        let ty = self.substitute_type(self.type_of(id));
+        Option::Some.(self.emit(Op::new("construct", ty, vals).typed(ty)))
+    }
+
+    fn expr_block(self, b: S::Block) -> Option[Text] {
+        let saved = self.save_scope();
+        var i = 0usize;
+        while self.live() && i < b.stmts.len() {
+            self.stmt(b.stmts.get(i));
+            i = i + 1usize;
+        }
+        let v = if !self.live() {
+            Option::None
+        } else {
+            match b.tail {
+                Option::Some(t) => self.expr(t.get()),
+                Option::None => Option::Some.(self.unit()),
+            }
+        };
+        self.restore_scope(saved);
+        v
+    }
+
+    fn expr_path(self, p: S::Path) -> Option[Text] {
+        if self.local_ref(p) {
+            return Option::Some.(self.read(self.local(p.id)));
+        }
+        match self.results().folded.get(p.id) {
+            Option::Some(value) => return Option::Some.(self.constant_value(value)),
+            Option::None => (),
+        };
+        match self.results().calls.get(p.id) {
+            Option::Some(call) => match call {
+                Callee::Fn(f) => {
+                    let ty = self.substitute_type(self.type_of(p.id));
+                    return Option::Some.(self.emit(Op::new("fn", ty, Seq::one(f.call_name())).with_tys(self.substitute_all(f.targs()))));
+                },
+                Callee::Variant(name) => return self.variant(name, self.type_of(p.id), Option::None),
+                _ => (),
+            },
+            Option::None => (),
+        };
+        let names = p.names();
+        let joined = Out::new();
+        var i = 0usize;
+        while i < names.len() {
+            if i > 0usize {
+                let unit = joined.put("::");
+            }
+            let unit = joined.add(names.get(i));
+            i = i + 1usize;
+        }
+        self.fail(Out::new().put("cannot lower the path ").add(joined.done()).done(), p.pos)
+    }
+
+    fn constant_value(self, value: ConstValue) -> Text {
+        match value {
+            ConstValue::Str(t, _ty) => self.string(t),
+            ConstValue::Int(v, ty) => match ty {
+                Type::Prim(name) => self.constant(ty, int_text(v, name)),
+                _ => self.constant(ty, Out::new().u64(v).done()),
+            },
+            ConstValue::Bool(b) => self.constant(C::bool_type(), text(if b { "true" } else { "false" })),
+            ConstValue::Float(digits, ty) => self.constant(ty, digits),
+        }
+    }
+
+    fn expr_binop(self, b: S::Binop) -> Option[Text] {
+        if b.op.is("&&") || b.op.is("||") {
+            let c = match self.expr(b.left.get()) {
+                Option::Some(c) => c,
+                Option::None => return Option::None,
+            };
+            let right = ArmBody::Value.(b.right.get());
+            if b.op.is("&&") {
+                return self.branch(c, right, ArmBody::Constant.(text("false")), C::bool_type());
+            }
+            return self.branch(c, ArmBody::Constant.(text("true")), right, C::bool_type());
+        }
+        match self.operands(Seq::two(Item::Expr.(b.left.get()), Item::Expr.(b.right.get())), Option::None) {
+            Option::Some(vals) => Option::Some.(self.emit(Op::new(binop_name(b.op), self.substitute_type(self.type_of(b.id)), vals))),
+            Option::None => Option::None,
+        }
+    }
+
+    fn expr_unary(self, u: S::Unary) -> Option[Text] {
+        let op = u.op;
+        if op.is("unsafe") {
+            var node = u.operand.get();
+            var going = true;
+            while going {
+                node = match node {
+                    Expr::Try(t) => t.value.get(),
+                    Expr::Unary(inner) => if inner.op.is("&") {
+                        inner.operand.get()
+                    } else {
+                        going = false;
+                        node
+                    },
+                    _ => {
+                        going = false;
+                        node
+                    },
+                };
+            }
+            self.unsafe_nodes.add(expr_id(node));
+            return self.expr(u.operand.get());
+        }
+        if op.is("&") {
+            return self.expr(u.operand.get());
+        }
+        if op.is("*") {
+            return match self.expr(u.operand.get()) {
+                Option::Some(p) => Option::Some.(self.emit(Op::new("builtin::unsafe::deref", self.substitute_type(self.type_of(u.id)), Seq::one(p))
+                    .from_node(u.id, u.pos))),
+                Option::None => Option::None,
+            };
+        }
+        let ty = self.substitute_type(self.type_of(u.id));
+        if op.is("-") {
+            match u.operand.get() {
+                Expr::Lit(l) => match l.kind {
+                    S::LitKind::Int => return Option::Some.(self.constant(ty, Out::new().put("-").u64(l.int).done())),
+                    S::LitKind::Float => return Option::Some.(self.constant(ty, Out::new().put("-").add(l.text).done())),
+                    _ => (),
+                },
+                _ => (),
+            };
+        }
+        let v = match self.expr(u.operand.get()) {
+            Option::Some(v) => v,
+            Option::None => return Option::None,
+        };
+        let prim = match self.lowering.types.shape(ty, Option::None) {
+            Type::Prim(name) => name,
+            _ => self.fails("internal error: a unary operator on a non-primitive", u.pos),
+        };
+        if op.is("-") {
+            if C::is_float(prim) {
+                let minus = self.constant(ty, text("-1.0"));
+                return Option::Some.(self.emit(Op::new("mul", ty, Seq::two(v, minus))));
+            }
+            let zero = self.constant(ty, text("0"));
+            return Option::Some.(self.emit(Op::new("sub", ty, Seq::two(zero, v))));
+        }
+        if prim.is("bool") {
+            let f = self.constant(ty, text("false"));
+            return Option::Some.(self.emit(Op::new("eq", ty, Seq::two(v, f))));
+        }
+        let bits = C::integer_bits(prim);
+        let ones = if prim.starts_with(text("i")) {
+            text("-1")
+        } else if bits == 64u32 {
+            Out::new().u64(18446744073709551615u64).done()
+        } else {
+            Out::new().u64((1u64 << (bits as u64)) - 1u64).done()
+        };
+        let mask = self.constant(ty, ones);
+        Option::Some.(self.emit(Op::new("bit_xor", ty, Seq::two(v, mask))))
+    }
+
+    fn expr_cast(self, c: S::Cast) -> Option[Text] {
+        let v = match self.expr(c.value.get()) {
+            Option::Some(v) => v,
+            Option::None => return Option::None,
+        };
+        let src = self.vty.at(v);
+        let dst = self.substitute_type(self.type_of(c.id));
+        let integers = match src {
+            Type::Prim(a) => match dst {
+                Type::Prim(b) => C::is_integer(a) && C::is_integer(b),
+                _ => false,
+            },
+            _ => false,
+        };
+        if integers {
+            return Option::Some.(self.emit(Op::new("builtin::int_cast", dst, Seq::one(v)).typed(dst)));
+        }
+        // Casts do not inspect nominal layout or unfold abstract type parameters. Those
+        // representation obligations belong to the unsafe C boundary.
+        let package = match src {
+            Type::Exists(_b, _t) => true,
+            _ => match dst {
+                Type::Exists(_b, _t) => true,
+                _ => false,
+            },
+        };
+        if package {
+            self.fails("a cast cannot consume or produce an outer existential package; use opening or packing", c.pos);
+        }
+        Option::Some.(self.emit(Op::new("builtin::unsafe::cast", dst, Seq::one(v)).typed(dst).from_node(c.id, c.pos)))
+    }
+
+    fn expr_field(self, e: Expr, id: u32) -> Option[Text] {
+        match self.place_path(e) {
+            Option::Some(path) => Option::Some.(self.emit(Op::new("load", self.substitute_type(self.type_of(id)), Seq::one(path)))),
+            Option::None => self.project(e),
+        }
+    }
+
+    // Reads a field of a value that is not a place: takes the value apart, once per step.
+    fn project(self, e: Expr) -> Option[Text] {
+        let steps: Seq[(Option[Text], usize)] = Seq::new();
+        var base = e;
+        var going = true;
+        while going {
+            base = match base {
+                Expr::Field(f) => {
+                    steps.push((Option::Some.(f.name), 0usize));
+                    f.value.get()
+                },
+                Expr::Index(x) => {
+                    steps.push((Option::None, x.index));
+                    x.value.get()
+                },
+                _ => {
+                    going = false;
+                    base
+                },
+            };
+        }
+        var v = match self.expr(base) {
+            Option::Some(v) => v,
+            Option::None => return Option::None,
+        };
+        var ty = self.vty.at(v);
+        var i = steps.len();
+        while i > 0usize {
+            i = i - 1usize;
+            let (name, index) = steps.get(i);
+            let selected = match name {
+                Option::Some(field) => self.field_index(ty, field),
+                Option::None => index,
+            };
+            let parts = self.destruct(v, ty);
+            var k = 0usize;
+            while k < parts.len() {
+                if k != selected && !self.copy(parts.get(k).type) {
+                    self.fails("a projection cannot discard a linear sibling; destructure the value explicitly", expr_pos(e));
+                }
+                k = k + 1usize;
+            }
+            v = parts.get(selected).name;
+            ty = parts.get(selected).type;
+        }
+        Option::Some.(v)
+    }
+
+    fn field_index(self, ty: Type, field: Text) -> usize {
+        match self.lowering.types.shape(ty, Option::None) {
+            Type::Struct(fields) => {
+                var i = 0usize;
+                while i < fields.len() {
+                    if fields.get(i).name.eq(field) {
+                        return i;
+                    }
+                    i = i + 1usize;
+                }
+                self.fails("internal error: no such field", self.at.get())
+            },
+            _ => self.fails("internal error: a field of a non-struct", self.at.get()),
+        }
+    }
+
+    // ---- constructors
+    fn expr_struct_lit(self, s: S::StructLit) -> Option[Text] {
+        let ty = self.substitute_type(self.type_of(s.id));
+        let shape = match self.lowering.types.shape(ty, Option::None) {
+            Type::Struct(fields) => fields,
+            _ => self.fails("internal error: a struct literal of a non-struct", s.pos),
+        };
+        let names: Seq[Text] = Seq::new();
+        let items: Seq[Item] = Seq::new();
+        var i = 0usize;
+        while i < s.fields.len() {
+            let f = s.fields.get(i);
+            names.push(f.name);
+            items.push(match f.value {
+                Option::Some(v) => Item::Expr.(v),
+                Option::None => Item::Bind.(self.bindings.at(id_text(self.results().field_ids.at(s.id).at(f.name)))),
+            });
+            i = i + 1usize;
+        }
+        if s.spread.is_some() {
+            let rest = self.bindings.at(id_text(self.results().spread_ids.at(s.id)));
+            let fields = match rest.fields {
+                Option::Some(f) => f,
+                Option::None => self.fails("internal error: a spread of a non-bundle", s.pos),
+            };
+            i = 0usize;
+            while i < shape.len() {
+                let name = shape.get(i).name;
+                if !names.has(name) {
+                    names.push(name);
+                    items.push(Item::Bind.(self.bindings.at(fields.at(name))));
+                }
+                i = i + 1usize;
+            }
+        }
+        let results = match self.operands(items, Option::None) {
+            Option::Some(r) => r,
+            Option::None => return Option::None,
+        };
+        let values: Map[Text, Text] = Map::new();
+        i = 0usize;
+        while i < names.len() {
+            values.set(names.get(i), results.get(i));
+            i = i + 1usize;
+        }
+        let ordered: Seq[Text] = Seq::new();
+        i = 0usize;
+        while i < shape.len() {
+            ordered.push(values.at(shape.get(i).name));
+            i = i + 1usize;
+        }
+        Option::Some.(self.emit(Op::new("construct", ty, ordered).typed(ty)))
+    }
+
+    fn variant(self, name: Text, ty: Type, args: Option[Seq[Expr]]) -> Option[Text] {
+        let enum_ty = self.substitute_type(ty);
+        let variants = match self.lowering.types.shape(enum_ty, Option::None) {
+            Type::Enum(vs) => vs,
+            _ => self.fails("internal error: a variant of a non-enum", self.at.get()),
+        };
+        var payload_ty = C::unit();
+        var i = 0usize;
+        while i < variants.len() {
+            if variants.get(i).name.eq(name) {
+                payload_ty = variants.get(i).type;
+            }
+            i = i + 1usize;
+        }
+        let given = match args {
+            Option::Some(a) => a,
+            Option::None => Seq::new(),
+        };
+        let payload = if given.is_empty() {
+            if !is_unit(payload_ty) {
+                self.fail(Out::new().put("variant ").add(name).put(" used as a function value").done(), self.at.get());
+            }
+            Option::Some.(self.emit(Op::new("construct", C::unit(), Seq::new()).typed(C::unit())))
+        } else if given.len() == 1usize {
+            self.expr(given.get(0usize))
+        } else {
+            match self.operands(FnLower::exprs(given), Option::None) {
+                Option::Some(vals) => Option::Some.(self.emit(Op::new("construct", payload_ty, vals).typed(payload_ty))),
+                Option::None => Option::None,
+            }
+        };
+        match payload {
+            Option::Some(p) => Option::Some.(self.emit(Op::new("construct_variant", enum_ty, Seq::one(p)).typed(enum_ty).literal(name))),
+            Option::None => Option::None,
+        }
+    }
+
+    // ---- calls
+    fn expr_call(self, c: S::Call) -> Option[Text] {
+        let call = match self.results().calls.get(c.id) {
+            Option::Some(call) => call,
+            Option::None => self.fails("internal error: an unresolved call", c.pos),
+        };
+        let items: Seq[Item] = Seq::new();
+        let receiver = match call {
+            Callee::Variant(name) => return self.variant(name, self.type_of(c.id), Option::Some.(c.args)),
+            Callee::Tuple => {
+                let vals = self.operands(FnLower::exprs(c.args), Option::None);
+                let ty = self.substitute_type(self.type_of(c.id));
+                return match vals {
+                    Option::Some(v) => Option::Some.(self.emit(Op::new("construct", ty, v).typed(ty))),
+                    Option::None => Option::None,
+                };
+            },
+            Callee::Alloca(target) => {
+                let rty = self.substitute_type(self.type_of(c.id));
+                return Option::Some.(self.emit(Op::new("alloca", rty, Seq::new()).typed(self.substitute_type(target)).from_node(c.id, c.pos)));
+            },
+            Callee::Builtin(name) => return self.builtin(c, name),
+            Callee::Pointer(name, recv) => return self.pointer_method(c, name, recv),
+            Callee::FStringWrite(f) => return match self.expr(c.args.get(0usize)) {
+                Option::Some(out) => self.fstring(f, out),
+                Option::None => Option::None,
+            },
+            Callee::Value(_sub) => {
+                items.push(Item::Expr.(c.callee.get()));
+                Option::None
+            },
+            Callee::Closure => {
+                items.push(Item::Expr.(c.callee.get()));
+                Option::None
+            },
+            Callee::Fn(f) => f.receiver,
+            Callee::Trait(t) => t.receiver,
+        };
+        match receiver {
+            Option::Some(r) => if r.lend {
+                match self.place_path(r.value) {
+                    Option::Some(path) => items.push(Item::Path.(path)),
+                    Option::None => self.fails("a lent receiver is not a place", c.pos),
+                };
+            } else {
+                items.push(Item::Expr.(r.value));
+            },
+            Option::None => (),
+        };
+        items.append(FnLower::exprs(c.args));
+        let operands = match self.operands(items, Option::Some.(c)) {
+            Option::Some(o) => o,
+            Option::None => return Option::None,
+        };
+        let by_value = match call {
+            Callee::Value(_sub) => true,
+            Callee::Closure => true,
+            _ => false,
+        };
+        var callee_value = text("");
+        if by_value {
+            callee_value = operands.remove(0usize);
+        }
+        match call {
+            Callee::Closure => {
+                // a closure is {env, code}: the code takes the environment first
+                let parts = self.destruct(callee_value, self.vty.at(callee_value));
+                callee_value = parts.get(1usize).name;
+                operands.insert(0usize, parts.get(0usize).name);
+            },
+            _ => (),
+        };
+        let rty = self.substitute_type(self.type_of(c.id));
+        let (target, targs, requires_unsafe) = match call {
+            Callee::Trait(t) => {
+                var needs = false;
+                let methods = self.lowering.sigs.traits.at(t.trait_name).methods;
+                var i = 0usize;
+                while i < methods.len() {
+                    if methods.get(i).name.eq(t.method) {
+                        needs = methods.get(i).is_unsafe;
+                        i = methods.len();
+                    } else {
+                        i = i + 1usize;
+                    }
+                }
+                (Seq::two(t.trait_name, t.method), t.targs, needs)
+            },
+            Callee::Fn(f) => (Seq::one(f.call_name()), f.targs(), f.sig.is_unsafe),
+            Callee::Value(sub) => (Seq::one(callee_value), sub.values(), self.fn_unsafe(callee_value)),
+            _ => (Seq::one(callee_value), Seq::new(), self.fn_unsafe(callee_value)),
+        };
+        if requires_unsafe && !self.authorized(c.id) {
+            self.fails("calling an unsafe function requires unsafe authorization", c.pos);
+        }
+        // A raw lend's explicit authorization discharges the core call instruction, but must not
+        // authorize an independently unsafe callee in the surface.
+        var raw_lend = false;
+        var i = 0usize;
+        while i < operands.len() {
+            raw_lend = raw_lend || operands.get(i).starts_with(text("&*"));
+            i = i + 1usize;
+        }
+        let args = target.copy();
+        args.append(operands);
+        let is_trait = match call {
+            Callee::Trait(_t) => true,
+            _ => false,
+        };
+        let result = self.emit(Op::new(if is_trait { "trait_call" } else { "call" }, rty, args).with_tys(self.substitute_all(targs))
+            .from_node(c.id, c.pos).discharge(raw_lend));
+        match rty {
+            Type::Never => {
+                self.terminate(Terminator::Unreachable.(self.at.get()));
+                Option::None
+            },
+            _ => Option::Some.(result),
+        }
+    }
+
+    fn fn_unsafe(self, callee: Text) -> bool {
+        match self.vty.at(callee) {
+            Type::Fn(f) => f.is_unsafe,
+            _ => self.fails("internal error: a called value is not a function", self.at.get()),
+        }
+    }
+
+    // A call argument: a value, a lent place's path, or a raw pointer's target.
+    fn operand(self, item: Item, c: S::Call) -> Option[Text] {
+        let arg = match item {
+            Item::Expr(e) => e,
+            _ => return self.value(item),
+        };
+        var node = arg;
+        var explicit = false;
+        match node {
+            Expr::Unary(u) => if u.op.is("unsafe") {
+                explicit = true;
+                node = u.operand.get();
+            },
+            _ => (),
+        };
+        match node {
+            Expr::Unary(u) => if u.op.is("&") {
+                let target = u.operand.get();
+                match target {
+                    Expr::Unary(deref) => if deref.op.is("*") {
+                        let p = self.expr(deref.operand.get());
+                        return match p {
+                            Option::Some(p) => {
+                                if !(explicit || self.authorized(c.id)) {
+                                    self.fails("lending a raw pointer target requires unsafe authorization", expr_pos(arg));
+                                }
+                                Option::Some.(Out::new().put("&*").add(p).done())
+                            },
+                            Option::None => Option::None,
+                        };
+                    },
+                    _ => (),
+                };
+                match self.place_path(target) {
+                    Option::Some(path) => return Option::Some.(path),
+                    Option::None => (),
+                };
+            },
+            _ => (),
+        };
+        // `&x.m().n`: the & lends the receiver of the first call, not the argument
+        self.expr(arg)
+    }
+
+    fn builtin(self, c: S::Call, name: Text) -> Option[Text] {
+        let rty = self.substitute_type(self.type_of(c.id));
+        if name.is("fresh") {
+            return Option::Some.(self.emit(Op::new("builtin::fresh", rty, Seq::new())));
+        }
+        if name.is("static_brand") {
+            return Option::Some.(self.emit(Op::new("builtin::unsafe::static_brand", rty, Seq::new()).from_node(c.id, c.pos)));
+        }
+        if name.is("enum_variant") {
+            let arg = c.args.get(0usize);
+            match arg {
+                Expr::Unary(u) => if u.op.is("&") {
+                    let path = match self.place_path(u.operand.get()) {
+                        Option::Some(p) => p,
+                        Option::None => self.fails("enum_variant(&x) needs a local", c.pos),
+                    };
+                    return Option::Some.(self.emit(Op::new("variant_tag", C::u32_type(), Seq::one(path)).typed(self.substitute_type(self.type_of(u.id)))));
+                },
+                _ => (),
+            };
+            let v = match self.expr(arg) {
+                Option::Some(v) => v,
+                Option::None => return Option::None,
+            };
+            let tag = self.emit(Op::new("variant_tag", C::u32_type(), Seq::one(v)).typed(self.vty.at(v)));
+            return Option::Some.(self.emit(Op::new("construct", rty, Seq::two(v, tag)).typed(rty)));
+        }
+        if name.is("fence") {
+            let order = self.atomic_ordering(text("fence"), c.args);
+            return Option::Some.(self.emit(Op::new("builtin::unsafe::atomic_fence", C::unit(), Seq::new()).literal(order).from_node(c.id, c.pos)));
+        }
+        let operands = match self.operands(FnLower::exprs(c.args), Option::None) {
+            Option::Some(o) => o,
+            Option::None => return Option::None,
+        };
+        if name.is("load_volatile") {
+            return Option::Some.(self.emit(Op::new("builtin::unsafe::load_volatile", rty, operands).from_node(c.id, c.pos)));
+        }
+        Option::Some.(self.emit(Op::new("builtin::unsafe::store_volatile", C::unit(), operands).from_node(c.id, c.pos)))
+    }
+
+    fn ordering(self, e: Expr) -> Text {
+        match e {
+            Expr::Path(p) => match self.lowering.r.refs.get(p.id) {
+                Option::Some(r) => match r {
+                    NameRef::Variant(_d, name) => match ordering_name(name) {
+                        Option::Some(o) => return text(o),
+                        Option::None => (),
+                    },
+                    _ => (),
+                },
+                Option::None => (),
+            },
+            _ => (),
+        };
+        self.fails("a memory ordering is written as an Ordering variant", expr_pos(e))
+    }
+
+    fn pointer_method(self, c: S::Call, name: Text, receiver: Expr) -> Option[Text] {
+        let params = pointer_params(name);
+        let items = Seq::one(Item::Expr.(receiver));
+        let order_args: Seq[Expr] = Seq::new();
+        var i = 0usize;
+        while i < c.args.len() && i < params.len {
+            if params.byte(i) == b'O' {
+                order_args.push(c.args.get(i));
+            } else {
+                items.push(Item::Expr.(c.args.get(i)));
+            }
+            i = i + 1usize;
+        }
+        let kind = if name.starts_with(text("atomic_")) { name.from(7usize) } else { name };
+        let orders = if order_args.is_empty() { Option::None } else { Option::Some.(self.atomic_ordering(kind, order_args)) };
+        let operands = match self.operands(items, Option::None) {
+            Option::Some(o) => o,
+            Option::None => return Option::None,
+        };
+        let op = if name.is("load") {
+            text("deref")
+        } else if name.is("compare_exchange") {
+            text("atomic_compare_exchange")
+        } else if name.starts_with(text("store")) || name.starts_with(text("load_")) || name.starts_with(text("atomic_")) {
+            name
+        } else {
+            Out::new().put("atomic_").add(name).done()
+        };
+        let rty = self.substitute_type(self.type_of(c.id));
+        Option::Some.(self.emit(Op::named(Out::new().put("builtin::unsafe::").add(op).done(), rty, operands).maybe_literal(orders)
+            .from_node(c.id, c.pos)))
+    }
+
+    fn atomic_ordering(self, kind: Text, args: Seq[Expr]) -> Text {
+        let orders: Seq[Text] = Seq::new();
+        var i = 0usize;
+        while i < args.len() {
+            orders.push(self.ordering(args.get(i)));
+            i = i + 1usize;
+        }
+        let order = orders.get(0usize);
+        if kind.is("compare_exchange") {
+            let failure = orders.get(1usize);
+            let allowed = failure.is("relaxed")
+                || failure.is("acquire") && (order.is("acquire") || order.is("acq_rel") || order.is("seq_cst"))
+                || failure.is("seq_cst") && order.is("seq_cst");
+            if !allowed {
+                self.fail(Out::new().put("compare_exchange failure ordering ").add(failure).put(" is invalid for success ordering ")
+                    .add(order).done(), expr_pos(args.get(1usize)));
+            }
+        } else if kind.is("load") && (order.is("release") || order.is("acq_rel"))
+            || kind.is("store") && (order.is("acquire") || order.is("acq_rel"))
+            || kind.is("fence") && order.is("relaxed") {
+            self.fail(Out::new().put("atomic ").add(kind).put(" does not support ordering ").add(order).done(), expr_pos(args.get(0usize)));
+        }
+        let out = Out::new();
+        i = 0usize;
+        while i < orders.len() {
+            if i > 0usize {
+                let unit = out.put("/");
+            }
+            let unit = out.add(orders.get(i));
+            i = i + 1usize;
+        }
+        out.done()
+    }
+
+    // ---- control flow
+    fn branch(self, cond: Text, then: ArmBody, other: ArmBody, ty: Type) -> Option[Text] {
+        let a = self.new_block(Seq::new(), "b");
+        let b = self.new_block(Seq::new(), "b");
+        self.terminate(Terminator::Jnz.(cond, self.edge(a, Seq::new()), self.edge(b, Seq::new()), self.at.get()));
+        self.arms(Seq::two(a, b), Seq::two(then, other), ty)
+    }
+
+    fn expr_if(self, x: S::If) -> Option[Text] {
+        let c = match self.expr(x.cond.get()) {
+            Option::Some(c) => c,
+            Option::None => return Option::None,
+        };
+        let other = match x.other {
+            Option::Some(o) => ArmBody::Value.(o.get()),
+            Option::None => ArmBody::Unit,
+        };
+        self.branch(c, ArmBody::Value.(Expr::Block.(x.then)), other, self.type_of(x.id))
+    }
+
+    fn expr_return(self, value: Option[Cell[Expr]]) -> Option[Text] {
+        let v = match value {
+            Option::Some(e) => self.expr(e.get()),
+            Option::None => Option::Some.(self.unit()),
+        };
+        if self.live() {
+            match v {
+                Option::Some(v) => self.terminate(Terminator::Ret.(v, self.at.get())),
+                Option::None => (),
+            };
+        }
+        Option::None
+    }
+
+    fn expr_while(self, w: S::While) -> Option[Text] {
+        let head = self.new_block(Seq::new(), "while");
+        self.jump(head, Seq::new());
+        self.start(head);
+        let c = match self.expr(w.cond.get()) {
+            Option::Some(c) => c,
+            Option::None => return Option::None,
+        };
+        let body = self.new_block(Seq::new(), "b");
+        let exit = self.new_block(Seq::new(), "after");
+        self.terminate(Terminator::Jnz.(c, self.edge(body, Seq::new()), self.edge(exit, Seq::new()), self.at.get()));
+        self.start(body);
+        let unit = self.expr(Expr::Block.(w.body));
+        if self.live() {
+            self.jump(head, Seq::new());
+        }
+        self.start(exit);
+        Option::Some.(self.unit())
+    }
+
+    fn expr_for(self, f: S::For) -> Option[Text] {
+        let path = match f.iterator.get() {
+            Expr::Unary(u) => self.place_path(u.operand.get()),
+            _ => Option::None,
+        };
+        let path = match path {
+            Option::Some(p) => p,
+            Option::None => self.fails("a for loop's iterator is not a place", f.pos),
+        };
+        let call = self.results().next_calls.at(f.id);
+        let iterator_ty = self.substitute_type(call.targs.get(0usize));
+        let item = self.substitute_type(call.targs.get(1usize));
+        let option = self.substitute_type(self.results().options.at(f.id));
+        let head = self.new_block(Seq::new(), "for");
+        self.jump(head, Seq::new());
+        self.start(head);
+        let args = Seq::two(call.trait_name, call.method);
+        args.push(path);
+        let step = self.emit(Op::new("trait_call", option, args).with_tys(Seq::two(iterator_ty, item)));
+        let item_ty = self.substitute_type(item);
+        let item_name = self.fresh("item");
+        let some = self.new_block(Seq::one(C::Binding.{ name: item_name, type: item_ty }), "some");
+        let unit_name = self.fresh("unit");
+        let none = self.new_block(Seq::one(C::Binding.{ name: unit_name, type: C::unit() }), "none");
+        let arms = Seq::two(C::Arm.{ variant: text("Some"), edge: self.edge(some, Seq::new()) }, C::Arm.{ variant: text("None"), edge: self.edge(none, Seq::new()) });
+        self.terminate(Terminator::Switch.(step, option, arms, self.at.get()));
+        self.start(some);
+        let saved = self.save_scope();
+        self.declare(self.binder(f.id), f.name, item_ty, item_name);
+        let unit = self.expr(Expr::Block.(f.body));
+        self.restore_scope(saved);
+        if self.live() {
+            self.jump(head, Seq::new());
+        }
+        self.start(none);
+        Option::Some.(self.unit())
+    }
+
+    fn discard_pattern(self, ty: Type) {
+        if !self.copy(ty) {
+            self.fails("a pattern cannot discard a linear value", self.at.get());
+        }
+    }
+
+    // One core arm per variant. A value arm covering several variants, or none by name, gets one
+    // block per variant that takes the payload and jumps on; the coverage check discarded it.
+    fn enum_switch(self, s: Text, ty: Type, variants: Seq[C::Member], covers: Seq[Seq[CoverItem]], blocks: Seq[BlockB], place: bool) {
+        let arms: Seq[C::Arm] = Seq::new();
+        let hops: Seq[(BlockB, BlockB)] = Seq::new();
+        var i = 0usize;
+        while i < covers.len() {
+            let cover = covers.get(i);
+            let block = blocks.get(i);
+            var k = 0usize;
+            while k < cover.len() {
+                let variant = match cover.get(k) {
+                    CoverItem::Variant(v) => v,
+                    CoverItem::Range(_a, _b) => self.fails("internal error: a range in an enum match", self.at.get()),
+                };
+                if place || !block.params.is_empty() {
+                    arms.push(C::Arm.{ variant, edge: self.edge(block, Seq::new()) });
+                } else {
+                    let pay = self.fresh("pay");
+                    let hop = self.new_block(Seq::one(C::Binding.{ name: pay, type: member_type(variants, variant) }), "b");
+                    arms.push(C::Arm.{ variant, edge: self.edge(hop, Seq::new()) });
+                    hops.push((hop, block));
+                }
+                k = k + 1usize;
+            }
+            i = i + 1usize;
+        }
+        self.terminate(Terminator::Switch.(s, ty, arms, self.at.get()));
+        i = 0usize;
+        while i < hops.len() {
+            let (hop, block) = hops.get(i);
+            self.start(hop);
+            self.jump(block, Seq::new());
+            i = i + 1usize;
+        }
+    }
+
+    fn compare(self, s: Text, ty: Type, op: Slice[u8, 'static], bound: Int) -> Text {
+        let value = self.emit(Op::new("load", ty, Seq::one(s)));
+        let limit = self.constant(ty, int_spelled(bound));
+        self.emit(Op::new(op, C::bool_type(), Seq::two(value, limit)))
+    }
+
+    // An integer match as comparisons in arm order: each range is tested, and a miss goes on to the
+    // next test; the wildcard arm takes what is left. The tests run in several blocks, so a
+    // scrutinee value is kept in a temporary place and loaded by each.
+    fn integer_tests(self, scrutinee: Text, ty: Type, covers: Seq[Seq[CoverItem]], blocks: Seq[BlockB]) {
+        var s = scrutinee;
+        if !s.starts_with(text("&")) {
+            let root = self.temporary(ty);
+            let unit = self.emit(Op::new("store", C::unit(), Seq::two(root, s)));
+            s = root;
+        }
+        var i = 0usize;
+        while i < covers.len() {
+            let cover = covers.get(i);
+            let block = blocks.get(i);
+            if cover.is_empty() {
+                self.jump(block, Seq::new());
+                return;
+            }
+            var k = 0usize;
+            while k < cover.len() {
+                let (lo, hi) = match cover.get(k) {
+                    CoverItem::Range(lo, hi) => (lo, hi),
+                    CoverItem::Variant(_v) => self.fails("internal error: a variant in an integer match", self.at.get()),
+                };
+                let miss = self.new_block(Seq::new(), "b");
+                if int_eq(lo, hi) {
+                    let test = self.compare(s, ty, "eq", lo);
+                    self.terminate(Terminator::Jnz.(test, self.edge(block, Seq::new()), self.edge(miss, Seq::new()), self.at.get()));
+                } else {
+                    let upper = self.new_block(Seq::new(), "b");
+                    let low_test = self.compare(s, ty, "ge", lo);
+                    self.terminate(Terminator::Jnz.(low_test, self.edge(upper, Seq::new()), self.edge(miss, Seq::new()), self.at.get()));
+                    self.start(upper);
+                    let high_test = self.compare(s, ty, "le", hi);
+                    self.terminate(Terminator::Jnz.(high_test, self.edge(block, Seq::new()), self.edge(miss, Seq::new()), self.at.get()));
+                }
+                self.start(miss);
+                k = k + 1usize;
+            }
+            i = i + 1usize;
+        }
+    }
+
+    // Checks that the arms partition the scrutinee's values; returns each arm's cover with its
+    // wildcard resolved: an integer arm's ranges, or an enum arm's variants.
+    fn match_coverage(self, m: S::Match, lent: bool, shape: Type, covers: Seq[Seq[CoverItem]]) -> Seq[Seq[CoverItem]] {
+        let integer = match shape {
+            Type::Prim(name) => if C::is_integer(name) { Option::Some.(name) } else { Option::None },
+            _ => Option::None,
+        };
+        match integer {
+            Option::Some(name) => {
+                if covers.is_empty() || !covers.last().is_empty() {
+                    self.fails("an integer match must end with a wildcard", m.pos);
+                }
+                let bits = C::integer_bits(name);
+                let signed = name.starts_with(text("i"));
+                let top = if bits == 64u32 { 18446744073709551615u64 } else { (1u64 << (bits as u64)) - 1u64 };
+                let half = 1u64 << ((bits - 1u32) as u64);
+                let low = if signed { Int.{ negative: true, magnitude: half } } else { Int.{ negative: false, magnitude: 0u64 } };
+                let high = if signed { Int.{ negative: false, magnitude: half - 1u64 } } else { Int.{ negative: false, magnitude: top } };
+                let spans: Seq[(Int, Int)] = Seq::new();
+                var k = 0usize;
+                while k < covers.len() {
+                    let cover = covers.get(k);
+                    if cover.is_empty() && k + 1usize != covers.len() {
+                        self.fails("a match wildcard must come last", m.pos);
+                    }
+                    var j = 0usize;
+                    while j < cover.len() {
+                        let (lo, hi) = match cover.get(j) {
+                            CoverItem::Range(lo, hi) => (lo, hi),
+                            CoverItem::Variant(_v) => self.fails("internal error: a variant in an integer match", m.pos),
+                        };
+                        var bad = !(int_le(low, lo) && int_le(lo, hi) && int_le(hi, high));
+                        var s = 0usize;
+                        while !bad && s < spans.len() {
+                            let (l, h) = spans.get(s);
+                            bad = int_le(lo, h) && int_le(l, hi);
+                            s = s + 1usize;
+                        }
+                        if bad {
+                            self.fails("match ranges must fit the integer type and not overlap", m.pos);
+                        }
+                        spans.push((lo, hi));
+                        j = j + 1usize;
+                    }
+                    k = k + 1usize;
+                }
+                return covers;
+            },
+            Option::None => (),
+        };
+        let variants = match shape {
+            Type::Enum(vs) => vs,
+            _ => self.fails("a match requires an integer or enum scrutinee", m.pos),
+        };
+        let seen: Set[Text] = Set::new();
+        let resolved: Seq[Seq[CoverItem]] = Seq::new();
+        var k = 0usize;
+        while k < covers.len() {
+            let cover = covers.get(k);
+            if cover.is_empty() && k + 1usize != covers.len() {
+                self.fails("a match wildcard must come last", m.pos);
+            }
+            let names: Seq[Text] = Seq::new();
+            var j = 0usize;
+            while j < cover.len() {
+                match cover.get(j) {
+                    CoverItem::Variant(v) => names.push(v),
+                    CoverItem::Range(_a, _b) => (),
+                };
+                j = j + 1usize;
+            }
+            if names.is_empty() {
+                j = 0usize;
+                while j < variants.len() {
+                    if !seen.has(variants.get(j).name) {
+                        names.push(variants.get(j).name);
+                    }
+                    j = j + 1usize;
+                }
+            }
+            j = 0usize;
+            while j < names.len() {
+                let name = names.get(j);
+                if !has_member(variants, name) || seen.has(name) {
+                    self.fails("match variants must not repeat", m.pos);
+                }
+                seen.add(name);
+                j = j + 1usize;
+            }
+            let arm = m.arms.get(k);
+            let binds = arm.cases.len() == 1usize && arm.cases.get(0usize).binders.is_some();
+            if !lent && !binds {
+                j = 0usize;
+                while j < names.len() {
+                    self.discard_pattern(member_type(variants, names.get(j)));
+                    j = j + 1usize;
+                }
+            }
+            let items: Seq[CoverItem] = Seq::new();
+            j = 0usize;
+            while j < names.len() {
+                items.push(CoverItem::Variant.(names.get(j)));
+                j = j + 1usize;
+            }
+            resolved.push(items);
+            k = k + 1usize;
+        }
+        if seen.len() != variants.len() {
+            self.fails("a match must cover every enum variant", m.pos);
+        }
+        resolved
+    }
+
+    fn expr_match(self, m: S::Match) -> Option[Text] {
+        let lent = self.results().lent.get_or(m.id, false);
+        let scrutinee = if lent {
+            match m.scrutinee.get() {
+                Expr::Unary(u) => u.operand.get(),
+                _ => self.fails("internal error: a lent match without &", m.pos),
+            }
+        } else {
+            m.scrutinee.get()
+        };
+        let place = if lent { self.place_path(scrutinee) } else { Option::None };
+        if lent && place.is_none() {
+            self.fails("match & needs a place", m.pos);
+        }
+        let s = match place {
+            Option::Some(p) => p,
+            Option::None => match self.expr(m.scrutinee.get()) {
+                Option::Some(v) => v,
+                Option::None => return Option::None,
+            },
+        };
+        let sty = self.substitute_type(self.type_of(expr_id(scrutinee)));
+        match sty {
+            Type::Named(name, _args) => if self.kinds.has(name) {
+                self.fails("a match requires an integer or enum scrutinee; an abstract type has no known matchable shape", m.pos);
+            },
+            _ => (),
+        };
+        let shape = self.lowering.types.shape(sty, Option::None);
+        let covers: Seq[Seq[CoverItem]] = Seq::new();
+        let blocks: Seq[BlockB] = Seq::new();
+        var i = 0usize;
+        while i < m.arms.len() {
+            let arm = m.arms.get(i);
+            let variant = match arm.cases.get(0usize).kind {
+                S::CaseKind::Variant => true,
+                _ => false,
+            };
+            let single = arm.cases.len() == 1usize && variant;
+            let payload: Seq[C::Binding] = Seq::new();
+            if place.is_none() && single {
+                let pay = self.fresh("pay");
+                payload.push(C::Binding.{ name: pay, type: self.substitute_type(self.type_of(arm.cases.get(0usize).id)) });
+            }
+            blocks.push(self.new_block(payload, "b"));
+            let cover: Seq[CoverItem] = Seq::new();
+            var k = 0usize;
+            while k < arm.cases.len() {
+                let case = arm.cases.get(k);
+                match case.kind {
+                    S::CaseKind::Variant => cover.push(CoverItem::Variant.(self.case_variant(case))),
+                    S::CaseKind::Value => match case.low {
+                        Option::Some(low) => match case.high {
+                            Option::Some(high) => cover.push(CoverItem::Range.(int_of(low), int_of(high))),
+                            Option::None => (),
+                        },
+                        Option::None => (),
+                    },
+                    S::CaseKind::Wild => (),
+                };
+                k = k + 1usize;
+            }
+            covers.push(cover);
+            i = i + 1usize;
+        }
+        let covers = self.match_coverage(m, lent, shape, covers);
+        match shape {
+            Type::Enum(variants) => self.enum_switch(s, sty, variants, covers, blocks, place.is_some()),
+            _ => self.integer_tests(s, sty, covers, blocks),
+        };
+        let bodies: Seq[ArmBody] = Seq::new();
+        i = 0usize;
+        while i < m.arms.len() {
+            bodies.push(ArmBody::Case.(m.arms.get(i), blocks.get(i), place));
+            i = i + 1usize;
+        }
+        self.arms(blocks, bodies, self.type_of(m.id))
+    }
+
+    fn case_variant(self, case: S::Case) -> Text {
+        match case.path {
+            Option::Some(p) => match self.lowering.r.refs.get(p.id) {
+                Option::Some(r) => match r {
+                    NameRef::Variant(_d, name) => name,
+                    _ => self.fails("internal error: a variant case that names no variant", case.pos),
+                },
+                Option::None => self.fails("internal error: an unresolved variant case", case.pos),
+            },
+            Option::None => self.fails("internal error: a variant case without a path", case.pos),
+        }
+    }
+
+    // Binds the whole payload or its components, by value or by place alias.
+    fn bind_payload(self, case: S::Case, payload: Text, lent: bool) {
+        let ty = self.substitute_type(self.type_of(case.id));
+        let binders = match case.binders {
+            Option::Some(b) => b,
+            Option::None => Seq::new(),
+        };
+        let ids = self.results().case_binders.get_or(case.id, Seq::new());
+        let whole = binders.len() == 1usize;
+        let types = if whole { Seq::one(ty) } else { self.lowering.types.fields(ty, Option::None) };
+        let sources: Seq[Text] = Seq::new();
+        if lent {
+            let path = Out::new().add(payload).put(".").add(self.case_variant(case)).done();
+            if whole {
+                sources.push(path);
+            } else {
+                var k = 0usize;
+                while k < types.len() {
+                    sources.push(Out::new().add(path).put(".").usize(k).done());
+                    k = k + 1usize;
+                }
+            }
+        } else if whole {
+            sources.push(payload);
+        } else {
+            let parts = self.destruct(payload, ty);
+            var k = 0usize;
+            while k < parts.len() {
+                sources.push(parts.get(k).name);
+                k = k + 1usize;
+            }
+        }
+        var i = 0usize;
+        while i < ids.len() && i < binders.len() && i < types.len() && i < sources.len() {
+            let t = types.get(i);
+            match ids.get(i) {
+                Option::Some(bid) => if lent {
+                    self.bindings.set(id_text(bid), Binding.{ name: binders.get(i), type: t, path: Option::Some.(sources.get(i)), fields: Option::None });
+                } else {
+                    self.declare(id_text(bid), binders.get(i), t, sources.get(i));
+                },
+                Option::None => if !lent {
+                    self.discard_pattern(t);
+                },
+            };
+            i = i + 1usize;
+        }
+    }
+
+    fn expr_try(self, id: u32, value: Expr) -> Option[Text] {
+        let v = match self.expr(value) {
+            Option::Some(v) => v,
+            Option::None => return Option::None,
+        };
+        let enum_ty = self.vty.at(v);
+        let result = self.results().try_kinds.get_or(id, text("")).is("result");
+        let ok = text(if result { "Ok" } else { "Some" });
+        let err = text(if result { "Err" } else { "None" });
+        let variants = match self.lowering.types.shape(enum_ty, Option::None) {
+            Type::Enum(vs) => vs,
+            _ => self.fails("internal error: `?` on a non-enum", self.at.get()),
+        };
+        let ok_name = self.fresh("ok");
+        let ok_block = self.new_block(Seq::one(C::Binding.{ name: ok_name, type: member_type(variants, ok) }), "b");
+        let err_name = self.fresh("err");
+        let err_block = self.new_block(Seq::one(C::Binding.{ name: err_name, type: member_type(variants, err) }), "b");
+        let arms = Seq::two(C::Arm.{ variant: ok, edge: self.edge(ok_block, Seq::new()) }, C::Arm.{ variant: err, edge: self.edge(err_block, Seq::new()) });
+        self.terminate(Terminator::Switch.(v, enum_ty, arms, self.at.get()));
+        self.start(err_block);
+        let ret = self.substitute_type(self.sig.ret);
+        let failure = self.emit(Op::new("construct_variant", ret, Seq::one(err_name)).typed(ret).literal(err));
+        self.terminate(Terminator::Ret.(failure, self.at.get()));
+        self.start(ok_block);
+        Option::Some.(ok_name)
+    }
+
+    // ---- closures, foreach, f-strings
+    fn capture_items(self, captures: Seq[Capture]) -> Seq[Item] {
+        let items: Seq[Item] = Seq::new();
+        var i = 0usize;
+        while i < captures.len() {
+            items.push(Item::Bind.(self.bindings.at(id_text(captures.get(i).binder))));
+            i = i + 1usize;
+        }
+        items
+    }
+
+    fn next_lifted(self, kind: Slice[u8, 'static]) -> Text {
+        let n = self.lowering.closures.get();
+        self.lowering.closures.set(n + 1u64);
+        Out::new().add(self.name).put("#").put(kind).u64(n).done()
+    }
+
+    fn expr_closure(self, c: S::Closure) -> Option[Text] {
+        let ty = self.substitute_type(self.type_of(c.id));
+        self.check_closed(ty, Seq::new());
+        let (env_ty, code_ty) = match ty {
+            Type::Struct(fields) => (fields.get(0usize).type, fields.get(1usize).type),
+            _ => self.fails("internal error: a closure type is not a struct", c.pos),
+        };
+        let captures = self.results().captures.get_or(c.id, Seq::new());
+        let vals = match self.operands(self.capture_items(captures), Option::None) {
+            Option::Some(v) => v,
+            Option::None => return Option::None,
+        };
+        let env = self.emit(Op::new("construct", env_ty, vals).typed(env_ty));
+        let code = match code_ty {
+            Type::Fn(f) => f,
+            _ => self.fails("internal error: a closure's code is not a function", c.pos),
+        };
+        let name = self.next_lifted("closure");
+        let places: Seq[usize] = Seq::new();
+        let pnames = Seq::one(text("env"));
+        var i = 0usize;
+        while i < c.params.len() {
+            if c.params.get(i).lend {
+                places.push(i + 1usize);
+            }
+            pnames.push(c.params.get(i).name);
+            i = i + 1usize;
+        }
+        let sig = Sig.{ name, decl: Option::None, params: self.sig.params, premises: self.sig.premises, pnames, ptypes: code.params,
+            places, ret: code.ret.get(), is_unsafe: false, home: self.sig.home };
+        self.lift(sig, Mode::Closure.(c, env_ty), c.pos);
+        let code_value = self.emit(Op::new("fn", code_ty, Seq::one(name)).with_tys(self.identity_args()));
+        Option::Some.(self.emit(Op::new("construct", ty, Seq::two(env, code_value)).typed(ty)))
+    }
+
+    // Lowers a closure or foreach body to a function of its own.
+    fn lift(self, sig: Sig, mode: Mode, pos: Pos) {
+        let inner = FnLower::new(self.lowering, sig, mode, sig.name, pos);
+        let { discharge_all: _d, ..rest } = inner;
+        let inner = FnLower.{ discharge_all: self.discharge_all || self.sig.is_unsafe, ..rest };
+        let fun = inner.run();
+        self.lowering.program.funs.set(sig.name, fun);
+    }
+
+    fn expr_foreach(self, f: S::Foreach) -> Option[Text] {
+        let ty = self.substitute_type(self.type_of(f.id));
+        self.check_closed(ty, Seq::new());
+        let captures = self.results().captures.get_or(f.id, Seq::new());
+        let items = Seq::one(Item::Expr.(f.source.get()));
+        items.append(self.capture_items(captures));
+        let vals = match self.operands(items, Option::None) {
+            Option::Some(v) => v,
+            Option::None => return Option::None,
+        };
+        let each = match ty {
+            Type::Foreach(x) => x,
+            _ => self.fails("internal error: a foreach type is not a foreach", f.pos),
+        };
+        let name = self.next_lifted("foreach");
+        let params: Seq[Param] = Seq::new();
+        let binders = foreach_binders(each);
+        var i = 0usize;
+        while i < binders.len() {
+            params.push(Param.{ name: binders.get(i), kind: Kind::Any });
+            i = i + 1usize;
+        }
+        params.append(self.sig.params);
+        let pnames = Seq::one(f.name);
+        let ptypes = Seq::one(foreach_item(each));
+        i = 0usize;
+        while i < captures.len() {
+            pnames.push(captures.get(i).name);
+            ptypes.push(self.bindings.at(id_text(captures.get(i).binder)).type);
+            i = i + 1usize;
+        }
+        let sig = Sig.{ name, decl: Option::None, params, premises: self.sig.premises, pnames, ptypes, places: Seq::new(),
+            ret: each.body.get(), is_unsafe: false, home: self.sig.home };
+        self.lift(sig, Mode::Mapper.(f), f.pos);
+        let args = Seq::two(vals.get(0usize), name);
+        args.append(vals.from(1usize));
+        Option::Some.(self.emit(Op::new("foreach", ty, args).typed(ty).with_tys(self.identity_args()).from_node(f.id, f.pos)))
+    }
+
+    fn expr_fstring(self, f: S::FStr) -> Option[Text] {
+        let sig = self.lowering.library_sig("Buffer::new", self.home);
+        let writer = self.emit(Op::new("call", self.substitute_type(self.type_of(f.id)), Seq::one(sig.name)));
+        self.fstring(f, writer)
+    }
+
+    // Writes each piece into the writer: text through `Writable::write_static`, `{expr}` through
+    // `Format::format`, which hands the value back (`{&x}` stores it again).
+    fn fstring(self, f: S::FStr, start: Text) -> Option[Text] {
+        var writer = start;
+        let wty = self.vty.at(writer);
+        let writable = self.lowering.library_name("Writable", self.home);
+        let format = self.lowering.library_name("Format", self.home);
+        var i = 0usize;
+        while i < f.parts.len() {
+            match f.parts.get(i) {
+                S::Piece::Text(t) => if !t.is_empty() {
+                    let s = self.string(t);
+                    let args = Seq::two(writable, text("write_static"));
+                    args.push(writer);
+                    args.push(s);
+                    writer = self.emit(Op::new("trait_call", wty, args).with_tys(Seq::one(wty)));
+                },
+                S::Piece::Expr(part) => {
+                    let (lend, operand) = match part {
+                        Expr::Unary(u) => if u.op.is("&") { (true, u.operand.get()) } else { (false, part) },
+                        _ => (false, part),
+                    };
+                    let values = match self.operands(Seq::two(Item::Path.(writer), Item::Expr.(operand)), Option::None) {
+                        Option::Some(v) => v,
+                        Option::None => return Option::None,
+                    };
+                    writer = values.get(0usize);
+                    let v = values.get(1usize);
+                    let vty = self.vty.at(v);
+                    let pair = Type::Tuple.(Seq::two(vty, wty));
+                    let args = Seq::two(format, text("format"));
+                    args.push(v);
+                    args.push(writer);
+                    let both = self.emit(Op::new("trait_call", pair, args).with_tys(Seq::two(vty, wty)));
+                    let parts = self.destruct(both, pair);
+                    writer = parts.get(1usize).name;
+                    if lend {
+                        let path = match self.place_path(operand) {
+                            Option::Some(p) => p,
+                            Option::None => self.fails("{&x} in an f-string needs a local or a place", self.at.get()),
+                        };
+                        let unit = self.emit(Op::new("store", C::unit(), Seq::two(path, parts.get(0usize).name)));
+                    }
+                },
+            };
+            i = i + 1usize;
+        }
+        Option::Some.(writer)
+    }
+
+    // ---- brands
+    fn expr_pack(self, p: S::Pack) -> Option[Text] {
+        let v = match self.expr(p.value.get()) {
+            Option::Some(v) => v,
+            Option::None => return Option::None,
+        };
+        let witnesses = self.substitute_all(self.results().witnesses.get_or(p.id, Seq::new()));
+        let ty = self.substitute_type(self.type_of(p.id));
+        Option::Some.(self.emit(Op::new("pack", ty, Seq::one(v)).typed(ty).with_tys(witnesses)))
+    }
+
+    // ---- statements
+    fn stmt(self, s: Statement) {
+        let previous = self.at.get();
+        let pos = match s {
+            Statement::Let(l) => l.pos,
+            Statement::Var(v) => v.pos,
+            Statement::Assign(a) => a.pos,
+            Statement::Expr(n) => n.pos,
+            Statement::Const(c) => c.pos,
+        };
+        self.at.set(pos);
+        match s {
+            Statement::Let(l) => self.let_stmt(l),
+            Statement::Var(v) => match self.expr(v.value) {
+                Option::Some(value) => self.declare(self.binder(v.id), v.name, self.vty.at(value), value),
+                Option::None => (),
+            },
+            Statement::Const(c) => {
+                let value = self.results().folded.at(c.id);
+                let ty = match const_type(value) {
+                    Option::Some(t) => t,
+                    Option::None => self.fails("internal error: an untyped constant", c.pos),
+                };
+                self.declare(self.binder(c.id), c.name, ty, self.constant_value(value));
+            },
+            Statement::Assign(a) => self.assign(a),
+            Statement::Expr(n) => match self.expr(n.value) {
+                Option::Some(value) => if !self.copy(self.vty.at(value)) {
+                    self.fails("cannot discard a linear expression result; bind or consume it", expr_pos(n.value));
+                },
+                Option::None => (),
+            },
+        };
+        self.at.set(previous);
+    }
+
+    fn let_stmt(self, l: S::Let) {
+        var v = match self.expr(l.value) {
+            Option::Some(v) => v,
+            Option::None => return,
+        };
+        if !l.brands.is_empty() {
+            let (binders, body) = match self.lowering.types.shape(self.vty.at(v), Option::None) {
+                Type::Exists(binders, body) => (binders, body.get()),
+                _ => self.fails("internal error: opening a non-package", l.pos),
+            };
+            let opened = self.results().opened.get_or(l.id, Seq::new());
+            let actual: Seq[Text] = Seq::new();
+            var i = 0usize;
+            while i < opened.len() {
+                actual.push(Out::new().add(opened.get(i)).put("#").add(self.fresh("").from(1usize)).done());
+                i = i + 1usize;
+            }
+            let sub: Map[Text, Type] = Map::new();
+            i = 0usize;
+            while i < binders.len() && i < actual.len() {
+                sub.set(binders.get(i), Type::Skolem.(actual.get(i)));
+                i = i + 1usize;
+            }
+            let payload = subst(body, sub, self.lowering.counter);
+            v = self.emit(Op::new("open", payload, Seq::one(v)).opening(actual));
+            i = 0usize;
+            while i < opened.len() && i < actual.len() {
+                self.brand_map.get().set(opened.get(i), Type::Skolem.(actual.get(i)));
+                i = i + 1usize;
+            }
+            self.open_brands.get().append(actual);
+        }
+        self.pattern(l.pattern, v);
+    }
+
+    fn pattern(self, p: Pattern, value: Text) {
+        match p {
+            Pattern::Bind(n) => self.declare(self.binder(n.id), n.value, self.type_of(n.id), value),
+            Pattern::Wild(_id) => self.discard_pattern(self.vty.at(value)),
+            Pattern::Tuple(n) => self.elements(n.value, value),
+            Pattern::Array(n) => self.elements(n.value, value),
+            Pattern::Struct(ps) => {
+                let ty = self.vty.at(value);
+                let comps = self.destruct(value, ty);
+                let fields = match self.lowering.types.shape(ty, Option::None) {
+                    Type::Struct(fields) => fields,
+                    _ => self.fails("internal error: a struct pattern on a non-struct", self.at.get()),
+                };
+                let named: Map[Text, Pattern] = Map::new();
+                var i = 0usize;
+                while i < ps.fields.len() {
+                    named.set(ps.fields.get(i).name, ps.fields.get(i).pattern);
+                    i = i + 1usize;
+                }
+                let rest: Map[Text, Text] = Map::new();
+                let rest_id = self.results().rest_ids.get(ps.id);
+                i = 0usize;
+                while i < fields.len() && i < comps.len() {
+                    let name = fields.get(i).name;
+                    let c = comps.get(i);
+                    match named.get(name) {
+                        Option::Some(sub) => self.pattern(sub, c.name),
+                        Option::None => match ps.rest {
+                            Option::Some(_r) => {
+                                let bid = Out::new().add(id_text(match rest_id {
+                                    Option::Some(id) => id,
+                                    Option::None => self.fails("internal error: a rest pattern without an id", self.at.get()),
+                                })).put("_").add(name).done();
+                                rest.set(name, bid);
+                                self.declare(bid, name, c.type, c.name);
+                            },
+                            Option::None => self.discard_pattern(c.type),
+                        },
+                    };
+                    i = i + 1usize;
+                }
+                match ps.rest {
+                    Option::Some(r) => match rest_id {
+                        Option::Some(id) => self.bindings.set(id_text(id), Binding.{ name: r, type: C::unit(), path: Option::None, fields: Option::Some.(rest) }),
+                        Option::None => (),
+                    },
+                    Option::None => (),
+                };
+            },
+        }
+    }
+
+    fn elements(self, elems: Seq[Pattern], value: Text) {
+        let parts = self.destruct(value, self.vty.at(value));
+        var i = 0usize;
+        while i < elems.len() && i < parts.len() {
+            self.pattern(elems.get(i), parts.get(i).name);
+            i = i + 1usize;
+        }
+    }
+
+    fn assign(self, a: S::Assign) {
+        let v = match self.expr(a.value) {
+            Option::Some(v) => v,
+            Option::None => return,
+        };
+        let path = match a.target {
+            Expr::Path(p) => self.local(p.id).path,
+            _ => self.place_path(a.target),
+        };
+        match path {
+            Option::Some(p) => {
+                let unit = self.emit(Op::new("store", C::unit(), Seq::two(p, v)));
+            },
+            Option::None => self.fails("assignment through a field needs a place", a.pos),
+        };
+    }
+}
+
+fn member_type(members: Seq[C::Member], name: Text) -> Type {
+    var i = 0usize;
+    while i < members.len() {
+        if members.get(i).name.eq(name) {
+            return members.get(i).type;
+        }
+        i = i + 1usize;
+    }
+    C::unit()
+}
+
+fn has_member(members: Seq[C::Member], name: Text) -> bool {
+    var i = 0usize;
+    while i < members.len() {
+        if members.get(i).name.eq(name) {
+            return true;
+        }
+        i = i + 1usize;
+    }
+    false
+}
+
+// The core program for a resolved, signature-built package graph: every body inferred, lowered,
+// its place contracts planned and its branded roots promoted.
+fn lower(r: Resolver, sigs: Signatures, counter: Fresh) -> Program {
+    let inf = infer(r, sigs, counter);
+    let program = Program.{ types: sigs.types, funs: Map::new(), externs: Map::new(), datas: Map::new(), traits: sigs.traits, instances: Map::new() };
+    let lowering = Lowering.{ r, sigs, results: inf.out, program, types: Types::new(program, counter), counter, datas: Map::new(),
+        closures: Cell::new(0u64), value_types: Map::new() };
+    lowering.run()
+}

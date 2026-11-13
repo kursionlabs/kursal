@@ -356,6 +356,13 @@ class ExpressionShapeTests(unittest.TestCase):
         self.assertEqual(expr("2.5f64").suffix, "f64")
         self.assertEqual(expr('"a\\tb"').value, "a\tb")
 
+    def test_an_integer_literal_fits_64_bits(self):
+        self.assertEqual(expr("18446744073709551615").value, (1 << 64) - 1)
+        self.assertEqual(expr("0xFFFF_FFFF_FFFF_FFFF").value, (1 << 64) - 1)
+        for src in ("18446744073709551616", "0x1_0000_0000_0000_0000u64", "fn f() -> u32 { match 1u32 { 18446744073709551616 => 0u32, _ => 1u32 } }"):
+            with self.subTest(src=src), self.assertRaisesRegex(KursError, "integer literal out of range"):
+                S.parse(src) if src.startswith("fn") else expr(src)
+
     def test_format_string(self):
         e = expr('f"{dst}.tag = {index(&t, "}")};"')
         self.assertEqual(e.parts[0], "")

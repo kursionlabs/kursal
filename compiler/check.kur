@@ -19,7 +19,7 @@ use package::syntax::{Pos, no_pos};
 use package::termination::check_instance_termination;
 use package::types::{Fresh, Types, children, equal, fits, foreach_binders, foreach_item, free_brands, kurs_error, subst};
 use package::unify::match_head;
-use std::option::Option;
+use std::option::{Option, Result};
 use std::slice::Slice;
 
 fn is_arith(op: Text) -> bool {
@@ -131,6 +131,15 @@ fn canonical_tuple_index(segment: Text, arity: usize) -> Option[usize] {
 // `other_path`'s. A segment holds no `.`, so this compares bytes without splitting.
 fn prefix(parent: Text, other_path: Text) -> bool {
     other_path.starts_with(parent) && (other_path.len == parent.len || other_path.byte(parent.len) == b'.')
+}
+
+// The end of the segment of `path` that starts at `start`: the next `.`, or the path's end.
+fn segment_end(path: Text, start: usize) -> usize {
+    var i = start;
+    while i < path.len && path.byte(i) != b'.' {
+        i = i + 1usize;
+    }
+    i
 }
 
 fn overlap(path: Text, other_path: Text) -> bool {
@@ -393,6 +402,8 @@ exposed struct Checker {
     typed: Map[FunKey, Map[(Text, Text), Type]],
     home: Cell[Option[ModuleId]],
     kinds: Cell[Map[Text, Kind]],
+    // whether each type asked about is Copy, under the kinds map (by its identity) it was asked under
+    copies: Cell[(usize, Map[Type, bool])],
     brands: Cell[Set[Text]],
     premises: Cell[Seq[Premise]],
     // what is being checked, for messages
@@ -493,6 +504,7 @@ impl Checker {
             typed: Map::new(),
             home: Cell::new(Option::None),
             kinds: Cell::new(Map::new()),
+            copies: Cell::new((0usize, Map::new())),
             brands: Cell::new(Set::new()),
             premises: Cell::new(Seq::new()),
             location: Cell::new(text("")),
@@ -974,7 +986,24 @@ impl Checker {
     }
 
     fn copy_type(self, ty: Type) -> bool {
-        self.types.is_copy(ty, self.kinds.get())
+        let kinds = self.kinds.get();
+        let identity = unsafe (kinds.head as usize);
+        let (asked, known) = self.copies.get();
+        let cache = if asked == identity {
+            known
+        } else {
+            let fresh: Map[Type, bool] = Map::new();
+            self.copies.set((identity, fresh));
+            fresh
+        };
+        match cache.get(ty) {
+            Option::Some(answer) => answer,
+            Option::None => {
+                let answer = self.types.is_copy(ty, kinds);
+                cache.set(ty, answer);
+                answer
+            },
+        }
     }
 
     fn accounted(self, used: Set[Text]) {
@@ -995,23 +1024,53 @@ impl Checker {
 
     // ------------------------------------------------------------------ places --
 
+    // The value of a place query, stopping with its failure.
+    forall T.
+    fn got(self, result: Result[T, Slice[u8, 'static]]) -> T {
+        match result {
+            Result::Ok(value) => value,
+            Result::Err(message) => self.fail(message),
+        }
+    }
+
     fn path_type(self, path: Text) -> Type {
-        self.view(path, self.storage_type(path))
+        self.got(self.place_type(path))
+    }
+
+    fn storage_type(self, path: Text) -> Type {
+        self.got(self.place_storage(path))
+    }
+
+    fn view(self, path: Text, ty: Type) -> Type {
+        self.got(self.place_view(path, ty))
+    }
+
+    // Whether p may be discarded; ty is its stored type, before its own view.
+    fn no_linear(self, path: Text, ty: Type) -> bool {
+        self.got(self.discardable(path, ty))
+    }
+
+    // The place queries return the checker's failure rather than stop, for place flow, which leaves
+    // a malformed path to the checker.
+    fn place_type(self, path: Text) -> Result[Type, Slice[u8, 'static]] {
+        let stored = self.place_storage(path)?;
+        self.place_view(path, stored)
     }
 
     // The final slot's stored type, applying views only to its ancestors.
-    fn storage_type(self, path: Text) -> Type {
-        let parts = segments(path);
+    fn place_storage(self, path: Text) -> Result[Type, Slice[u8, 'static]] {
+        // The segments are read in place: `sofar` is the path up to the current one.
+        var end = segment_end(path, 0usize);
         let roots = self.roots.get();
-        var ty = match roots.get(parts.get(0usize)) {
+        var ty = match roots.get(path.slice(0usize, end)) {
             Option::Some(t) => t,
-            Option::None => self.fail("place_function"),
+            Option::None => return Result::Err.("place_function"),
         };
-        var sofar = parts.get(0usize);
-        var i = 1usize;
-        while i < parts.len() {
-            let seg = parts.get(i);
-            ty = self.view(sofar, ty);
+        while end < path.len {
+            let sofar = path.slice(0usize, end);
+            let next = segment_end(path, end + 1usize);
+            let seg = path.slice(end + 1usize, next);
+            ty = self.place_view(sofar, ty)?;
             let component = match self.types.shape(ty, self.home.get()) {
                 Type::Enum(variants) => {
                     let known = match self.places.get().known.get(sofar) {
@@ -1019,7 +1078,7 @@ impl Checker {
                         Option::None => false,
                     };
                     if !known {
-                        self.fail("known");
+                        return Result::Err.("known");
                     }
                     member(variants, seg)
                 },
@@ -1032,20 +1091,17 @@ impl Checker {
             };
             ty = match component {
                 Option::Some(t) => t,
-                Option::None => self.fail("names_component"),
+                Option::None => return Result::Err.("names_component"),
             };
-            sofar = Out::new().add(sofar).put(".").add(seg).done();
-            i = i + 1usize;
+            end = next;
         }
-        ty
+        Result::Ok.(ty)
     }
 
-    fn view(self, path: Text, ty: Type) -> Type {
+    fn place_view(self, path: Text, ty: Type) -> Result[Type, Slice[u8, 'static]] {
         let brands = match self.places.get().opened.get(path) {
             Option::Some(b) => b,
-            Option::None => {
-                return ty;
-            },
+            Option::None => return Result::Ok.(ty),
         };
         match ty {
             Type::Exists(binders, body) => {
@@ -1055,27 +1111,27 @@ impl Checker {
                     sub.set(binders.get(i), Type::Skolem.(brands.get(i)));
                     i = i + 1usize;
                 }
-                subst(body.get(), sub, self.counter)
+                Result::Ok.(subst(body.get(), sub, self.counter))
             },
-            _ => self.fail("opened_view_requires_existential"),
+            _ => Result::Err.("opened_view_requires_existential"),
         }
     }
 
-    // Whether p may be discarded; ty is its stored type, before its own view.
-    fn no_linear(self, path: Text, ty: Type) -> bool {
+    fn discardable(self, path: Text, ty: Type) -> Result[bool, Slice[u8, 'static]] {
         let places = self.places.get();
         if self.copy_type(ty) || places.covered(path) {
-            return true;
+            return Result::Ok.(true);
         }
         if places.opened.has(path) {
-            return self.no_linear_parts(path, self.view(path, ty));
+            let viewed = self.place_view(path, ty)?;
+            return self.discardable_parts(path, viewed);
         }
-        self.no_linear_parts(path, ty)
+        self.discardable_parts(path, ty)
     }
 
-    fn no_linear_parts(self, path: Text, ty: Type) -> bool {
+    fn discardable_parts(self, path: Text, ty: Type) -> Result[bool, Slice[u8, 'static]] {
         if self.copy_type(ty) {
-            return true;
+            return Result::Ok.(true);
         }
         let places = self.places.get();
         let decomposed = any_key(places.empty.map, |z: Text| prefix(path, z) && !z.eq(path));
@@ -1083,7 +1139,7 @@ impl Checker {
         if !decomposed && known.is_none() {
             // A full non-Copy value cannot be discarded, irrespective of shape.
             // In particular, abstract parameters have no nominal body to unfold.
-            return false;
+            return Result::Ok.(false);
         }
         let rows: Seq[Member] = match self.types.shape(ty, self.home.get()) {
             Type::Enum(variants) => match known {
@@ -1092,21 +1148,19 @@ impl Checker {
                         Option::Some(t) => t,
                         Option::None => kurs_error(text("internal error: a known variant is not a variant"), no_pos()),
                     };
-                    return self.no_linear(Out::new().add(path).put(".").add(variant).done(), payload);
+                    return self.discardable(Out::new().add(path).put(".").add(variant).done(), payload);
                 },
-                Option::None => {
-                    return false;
-                },
+                Option::None => return Result::Ok.(false),
             },
             Type::Struct(fields) => {
                 if !decomposed {
-                    return false;
+                    return Result::Ok.(false);
                 }
                 fields
             },
             Type::Tuple(elems) => {
                 if !decomposed {
-                    return false;
+                    return Result::Ok.(false);
                 }
                 let out: Seq[Member] = Seq::new();
                 var k = 0usize;
@@ -1116,17 +1170,16 @@ impl Checker {
                 }
                 out
             },
-            _ => {
-                return false;
-            },
+            _ => return Result::Ok.(false),
         };
-        var all = true;
         var r = 0usize;
-        while all && r < rows.len() {
-            all = self.no_linear(Out::new().add(path).put(".").add(rows.get(r).name).done(), rows.get(r).type);
+        while r < rows.len() {
+            if !self.discardable(Out::new().add(path).put(".").add(rows.get(r).name).done(), rows.get(r).type)? {
+                return Result::Ok.(false);
+            }
             r = r + 1usize;
         }
-        all
+        Result::Ok.(true)
     }
 
     // A view opened strictly inside `path` is closed (packed) before `path` is loaded or lent.

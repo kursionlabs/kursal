@@ -21,33 +21,40 @@ produce the same output.
 | `infer` | `infer.py` | type inference of function bodies: each node's type, what each call calls, local bindings and captures |
 | `inferdump` | | what inference found, as text, for comparison with the reference |
 | `kurs` | `kurs.py` | serialized KURS: its reader and writer |
+| `lower`, `placeflow`, `promote` | `lower.py`, `placeflow.py`, `promote.py` | lowering inferred bodies to core: control flow, places and their contracts, branded locals as SSA values |
 | `check` | `check.py` | the KURS checker; it records every SSA value's type by `FunKey` |
 | `mangle`, `cgen` | `mangle.py`, `cgen.py` | symbol names (with SHA-256); checked KURS to C |
 | `readable` | `readable.py` | readable KURS |
 | `main` | `__main__.py` | the command line |
-| `selftest` | | `kursalc selftest-types`, the type modules on small cases, for the tests |
+| `selftest` | | `kursal selftest-types`, the type modules on small cases, for the tests |
 
 ## Building and testing
 
 From `reference-compiler/`:
 
 ```sh
-uv run python tools/build.py ../compiler /tmp/kursalc --times   # build with the reference compiler
-/tmp/kursalc parse ../examples/lisp/lib.kur                      # one command of the compiler
+uv run python tools/build.py ../compiler /tmp/kursal --times   # build with the reference compiler
+/tmp/kursal parse ../examples/lisp/lib.kur                      # one command of the compiler
 uv run python tools/build.py ../examples/wc /tmp/wc --kurs /tmp/wc.kurs   # also write its KURS
-/tmp/kursalc kurs /tmp/wc.kurs                                   # read KURS and write it back
-/tmp/kursalc check /tmp/wc.kurs                                  # check it: silent when it is sound
-/tmp/kursalc c /tmp/wc.kurs --entry example_wc::main             # its C, as `python -m kursal --emit-c`
-/tmp/kursalc readable /tmp/wc.kurs                               # readable KURS
+/tmp/kursal kurs /tmp/wc.kurs                                   # read KURS and write it back
+/tmp/kursal check /tmp/wc.kurs                                  # check it: silent when it is sound
+/tmp/kursal c /tmp/wc.kurs --entry example_wc::main             # its C, as `python -m kursal --emit-c`
+/tmp/kursal readable /tmp/wc.kurs                               # readable KURS
+/tmp/kursal lower ../examples/wc                                 # the package lowered to KURS
+/tmp/kursal build ../examples/wc -o /tmp/wc2 --times             # the whole pipeline, as tools/build.py
+/tmp/kursal build ../compiler -o /tmp/kursal2                     # the compiler builds itself
 uv run python tools/test.py tests.test_compiler                  # compare with the reference compiler
+KURSAL_SELFHOST=1 uv run python tools/test.py tests.test_compiler   # also check the self-build's fixpoint
 ```
 
 `tests/test_compiler.py` builds the compiler once per change to its sources (cached in
 `reference-compiler/.build/`) and compares its output with the reference compiler's. It also caches
 there every package's lowered KURS with the reference's C and readable KURS for it, and the core
 programs the reference's other test modules check (gathered by running those tests with
-`check_program` watched) with the reference's verdicts. Each run of the compiler is limited to 6 GB of
-address space and a timeout.
+`check_program` watched) with the reference's verdicts; the reference's lowering and whole-pipeline C
+of every package, bad example and `compiler/`; and the packages the other test modules lower
+(gathered with `lower` watched) with the reference's lowering of each. Each run of the compiler is
+limited to 6 GB of address space and a timeout.
 
 ## Storage
 
@@ -96,7 +103,7 @@ stands for no position.
 `types.fresh` numbers renamed binders (`a#3`) from one counter for the whole compilation. Here that
 counter is a `types::Fresh`, made once and passed to everything that may rename a binder: `subst`,
 `unify`, `match_head`, `Types`, `Formation`, `check_type_expansion`, `check_coherence`, `Signatures`,
-`Infer`, `check_program`, `emit_c`, `emit_kurs`. Passing the
+`Infer`, `lower`, `check_program`, `emit_c`, `emit_kurs`. Passing the
 same one everywhere numbers names as the reference compiler does.
 
 Where the reference wraps a phase in `with resolver.located(module, pos):`, call
@@ -106,7 +113,7 @@ the error has none of its own. Lookups that the reference may catch (`ResolveErr
 `Result[Target, Problem]` instead of stopping (`Resolver.lookup`); `Resolver.need` stops.
 
 The standard library is found as the reference finds it, in `$KURSAL_LIB`; without it, in `lib`
-beside the directory holding the compiler's binary (`PREFIX/bin/kursalc` reads `PREFIX/lib`).
+beside the directory holding the compiler's binary (`PREFIX/bin/kursal` reads `PREFIX/lib`).
 
 ## The language, for a compiler author
 
