@@ -272,6 +272,8 @@ class Signatures:
         value = self.fold(expr, C.USIZE)
         if value[0] != "int":
             fail("an array length is an integer constant")
+        if value[1] < 0:
+            fail("negative array length")
         return value[1]
 
     # ---- declarations

@@ -372,6 +372,8 @@ SIGNATURES = (
 )
 
 SIGNATURE_ERRORS = (
+    "struct S { a: [u8; -1i32] }\n",
+    "const N: i64 = 0i64 - 2i64;\nstruct S { a: [u8; N] }\n",
     "struct S { a: Phantom }\n",
     "struct S { a: builtin::Foo }\n",
     "forall T. struct S { a: T[u32] }\n",
