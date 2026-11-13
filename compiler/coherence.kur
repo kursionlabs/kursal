@@ -1,0 +1,112 @@
+// At most one instance head matches any fully specified trait application.
+//
+// Compare full heads, including output parameters. Premises and Copy constraints cannot establish
+// disjointness. Each side gets fresh metavariables so coincident parameter names never identify
+// the two instances' scopes. Every quantified parameter needs a binder-free occurrence in its
+// full head.
+//
+// The test over-approximates: every subterm that binds names (a package, a transform, a
+// quantified function type) is compared as a wildcard. Two heads that differ only under binders
+// count as overlapping, so no overlap can hide in how binders are compared.
+
+use package::base::{Map, Out, Seq, Set, Text};
+use package::core::{Kind, Meta, MetaKind, Param, Premise, Type};
+use package::core as C;
+use package::syntax::Pos;
+use package::types::{Fresh, add_all, extractable_names, kurs_error, map_children, show, subst};
+use package::unify::{instantiate, unify};
+use std::option::Option;
+
+fn binders_as_wildcards(ty: Type) -> Type {
+    match ty {
+        Type::Exists(_binders, _body) => Type::Meta.(Meta::new(MetaKind::Type)),
+        Type::Foreach(_f) => Type::Meta.(Meta::new(MetaKind::Type)),
+        Type::Fn(f) => {
+            if f.quantified.is_empty() {
+                map_children(ty, |child: Type| binders_as_wildcards(child))
+            } else {
+                Type::Meta.(Meta::new(MetaKind::Type))
+            }
+        },
+        _ => map_children(ty, |child: Type| binders_as_wildcards(child)),
+    }
+}
+
+// Every quantified parameter is extractable without crossing a binder.
+fn check_instance_range(head: Premise, params: Seq[Param], pos: Pos) {
+    let used: Set[Text] = Set::new();
+    var i = 0usize;
+    while i < head.args.len() {
+        add_all(used, extractable_names(head.args.get(i)));
+        i = i + 1usize;
+    }
+    var j = 0usize;
+    while j < params.len() {
+        let param = params.get(j);
+        if !used.has(param.name) {
+            let name = if C::same_kind(param.kind, Kind::Brand) { Out::new().put("$").add(param.name).done() } else { param.name };
+            kurs_error(Out::new().put("instance of ").add(head.trait_name).put(": parameter ").add(name)
+                .put(" needs a binder-free head occurrence").done(), pos);
+        }
+        j = j + 1usize;
+    }
+}
+
+fn show_args(args: Seq[Type]) -> Text {
+    let out = Out::new();
+    var i = 0usize;
+    while i < args.len() {
+        if i > 0usize {
+            let unit = out.put(", ");
+        }
+        let unit = out.add(show(args.get(i)));
+        i = i + 1usize;
+    }
+    out.done()
+}
+
+fn wildcards(args: Seq[Type], sub: Map[Text, Type], counter: Fresh) -> Seq[Type] {
+    let out: Seq[Type] = Seq::new();
+    var i = 0usize;
+    while i < args.len() {
+        out.push(binders_as_wildcards(subst(args.get(i), sub, counter)));
+        i = i + 1usize;
+    }
+    out
+}
+
+fn check_coherence(headers: Seq[(Premise, Seq[Param], Pos)], counter: Fresh) {
+    let seen: Map[Text, Seq[(Premise, Seq[Param])]] = Map::new();
+    var h = 0usize;
+    while h < headers.len() {
+        let (head, params, pos) = headers.get(h);
+        check_instance_range(head, params, pos);
+        let earlier_heads = seen.get_or(head.trait_name, Seq::new());
+        var e = 0usize;
+        while e < earlier_heads.len() {
+            let (earlier, earlier_params) = earlier_heads.get(e);
+            // Freshen for every comparison: failed unification can leave some variables solved,
+            // so its substitutions must not reach another pair.
+            let left = instantiate(params);
+            let right = instantiate(earlier_params);
+            let xs = wildcards(head.args, left, counter);
+            let ys = wildcards(earlier.args, right, counter);
+            var overlapping = xs.len() == ys.len();
+            var i = 0usize;
+            while overlapping && i < xs.len() {
+                overlapping = unify(xs.get(i), ys.get(i), true, counter);
+                i = i + 1usize;
+            }
+            if overlapping {
+                kurs_error(Out::new().put("overlapping instances of ").add(head.trait_name).put(": (").add(show_args(head.args))
+                    .put(") and (").add(show_args(earlier.args)).put(")").done(), pos);
+            }
+            e = e + 1usize;
+        }
+        if !seen.has(head.trait_name) {
+            seen.set(head.trait_name, Seq::new());
+        }
+        seen.at(head.trait_name).push((head, params));
+        h = h + 1usize;
+    }
+}

@@ -1,0 +1,498 @@
+// `kursalc selftest-types CASE...`: runs the type modules (types, unify, literals, formation,
+// layout, termination, coherence) on small cases and prints one line per case, for comparison with
+// the reference compiler's modules (reference-compiler/tests/test_compiler.py).
+//
+// A case is one S-expression. Types are written in KURS syntax; `?a` (or `$?a` in a brand
+// position) names a metavariable that the case declares. Declarations are
+// `(type NAME (PARAM...) BODY)`, `(linear NAME (PARAM...) BODY)` or `(opaque NAME (PARAM...) BODY)`,
+// where a parameter is `T`, `+T` (Copy) or `$k` (a brand). A failing case stops with the reference
+// compiler's message.
+//
+//   (show T)                         the type as text
+//   (subst T ((NAME T)...))          the substitution's result
+//   (free T) (brands T) (extractable T)
+//                                    free names, free brands, extractable names, sorted
+//   (equal A B) (fits A B)           equality modulo bound names; Never fits anything
+//   (unify METAS A B) (unify-closed METAS A B)
+//                                    whether they unify, both sides afterwards, every metavariable's
+//                                    solution; METAS is ((NAME KIND)...), KIND type, int, float or brand
+//   (match-head (PARAM...) (HEAD...) (QUERY...) REQUIRE)
+//                                    the extracted parameters, or none
+//   (literal PRIM "TEXT")            whether TEXT is a literal of PRIM
+//   (copy (DECL...) ((NAME KIND)...) T) (zero (DECL...) T) (expand (DECL...) T)
+//                                    is_copy, zero_size, the outer shape
+//   (layout DECL...) (formation DECL...)
+//                                    check_type_expansion, Formation.declarations
+//   (kind (DECL...) ((NAME KIND)...) T)
+//                                    Formation.kind
+//   (instances ((TRAIT T...) (TRAIT T...)...)...)
+//                                    check_instance_termination of heads and their premises
+//   (coherence ((PARAM...) (TRAIT T...))...)
+//                                    check_coherence
+//   (fields (DECL...) T) (variants (DECL...) T)
+//                                    a product's components, a sum's variants
+//   (exposure (DECL...) ((NAME KIND)...) T)
+//                                    the visible outer shape (or hidden), and whether it is a concrete
+//                                    exposure; an `(opaque NAME ...)` declaration is exposed only
+//                                    in a module m
+//   (pattern (DECL...) ((NAME KIND)...) FOREACH-TYPE)
+//                                    whether the foreach pattern matches every component
+//   (function (DECL...) FUN...)      Formation.function of each FUN, written as for mono
+//   (mono (NAME (PARAM...) INSTR...)...)
+//                                    check_mono_termination; INSTR is (call F T...), (fn F T...),
+//                                    (trait_call TRAIT METHOD T...) or (foreach F FOREACH-TYPE T...)
+
+use package::base::{Cell, Map, Out, Seq, Set, Text, fail, text};
+use package::coherence::check_coherence;
+use package::core::{Block, Exposure, ExposureMode, Fun, ModuleId, Instr, Kind, Member, Meta, MetaKind, Param, Premise, Program, Terminator, Type, TypeDecl};
+use package::core as C;
+use package::formation::{Formation, NoDischarge};
+use package::layout::check_type_expansion;
+use package::literals::valid_literal;
+use package::sexpr::{Form, read};
+use package::syntax::{Pos, no_pos};
+use package::termination::{check_instance_termination, check_mono_termination};
+use package::types::{Fresh, Types, equal, extractable_names, fits, free_brands, free_names, kind_name, show, subst};
+use package::unify::{match_head, unify, zonk};
+use std::option::Option;
+
+// ---------------------------------------------------------------- reading --
+
+fn strip_bang(name: Text) -> Text {
+    if name.len > 1usize && name.byte(name.len - 1usize) == b'!' {
+        strip_bang(name.slice(0usize, name.len - 1usize))
+    } else {
+        name
+    }
+}
+
+fn parse_types(forms: Seq[Form], start: usize) -> Seq[Type] {
+    let out: Seq[Type] = Seq::new();
+    var i = start;
+    while i < forms.len() {
+        out.push(parse_type(forms.get(i)));
+        i = i + 1usize;
+    }
+    out
+}
+
+fn parse_members(forms: Seq[Form]) -> Seq[Member] {
+    let out: Seq[Member] = Seq::new();
+    var i = 1usize;
+    while i < forms.len() {
+        let f = forms.get(i);
+        out.push(Member.{ name: f.at(0usize).text, type: parse_type(f.at(1usize)) });
+        i = i + 1usize;
+    }
+    out
+}
+
+fn brand_label(f: Form) -> Text {
+    f.text.from(1usize)
+}
+
+// A KURS type, as `kurs.parse_type` reads it.
+fn parse_type(f: Form) -> Type {
+    if !f.is_list() {
+        let t = f.text;
+        if t.is("_") {
+            return Type::Ignored;
+        }
+        if t.is("!") {
+            return Type::Never;
+        }
+        if t.byte(0usize) == b'$' {
+            return Type::Skolem.(brand_label(f));
+        }
+        if C::is_prim(t) {
+            return Type::Prim.(t);
+        }
+        return C::named(strip_bang(t), Seq::new());
+    }
+    let head = f.at(0usize).text;
+    if head.is("struct") {
+        Type::Struct.(parse_members(f.items))
+    } else if head.is("enum") {
+        Type::Enum.(parse_members(f.items))
+    } else if head.is("tuple") {
+        Type::Tuple.(parse_types(f.items, 1usize))
+    } else if head.is("array") {
+        Type::Array.(Cell::new(parse_type(f.at(1usize))), f.at(2usize).text.to_usize().unwrap_or(0usize) as u64)
+    } else if head.is("builtin::Pointer") {
+        C::ptr(parse_type(f.at(1usize)))
+    } else if head.is("builtin::Brand") {
+        Type::Brand.(Cell::new(Type::Skolem.(brand_label(f.at(1usize)))))
+    } else if head.is("exists") {
+        let binders: Seq[Text] = Seq::new();
+        var i = 0usize;
+        while i < f.at(1usize).len() {
+            binders.push(brand_label(f.at(1usize).at(i)));
+            i = i + 1usize;
+        }
+        Type::Exists.(binders, Cell::new(parse_type(f.at(2usize))))
+    } else if head.is("foreach") {
+        let pattern = f.at(1usize).at(0usize);
+        let source = parse_type(f.at(1usize).at(1usize));
+        let indirect = pattern.is_list() && pattern.len() == 2usize && pattern.at(0usize).text.is("builtin::Pointer");
+        let binder = if indirect { pattern.at(1usize).text } else { pattern.text };
+        let body = parse_type(f.at(2usize));
+        if f.len() == 4usize {
+            let retained: Seq[Text] = Seq::new();
+            var i = 1usize;
+            while i < f.at(3usize).len() {
+                retained.push(f.at(3usize).at(i).text);
+                i = i + 1usize;
+            }
+            Type::Foreach.(C::ForeachType.{ binder, indirect, source: Cell::new(source), body: Cell::new(body), retained })
+        } else {
+            C::foreach_type(binder, indirect, source, body)
+        }
+    } else if head.is("builtin::Fn") {
+        var at = 1usize;
+        let first = f.at(1usize);
+        let is_unsafe = first.is_list() && first.len() == 1usize && first.at(0usize).text.is("unsafe");
+        if is_unsafe {
+            at = 2usize;
+        }
+        let header = f.at(at);
+        if header.is_list() && header.len() == 5usize && header.at(0usize).is_atom() && header.at(0usize).text.is("forall") {
+            let params = parse_params(header.at(1usize));
+            C::fn_type(parse_types(header.at(4usize).items, 0usize), parse_type(header.at(3usize)), params, is_unsafe, Seq::new())
+        } else {
+            C::fn_type(parse_types(header.items, 0usize), parse_type(f.at(at + 1usize)), Seq::new(), is_unsafe, Seq::new())
+        }
+    } else {
+        C::named(strip_bang(head), parse_types(f.items, 1usize))
+    }
+}
+
+// Parameters: `$k` a brand, `+T` a Copy type, `T` any type.
+fn parse_params(f: Form) -> Seq[Param] {
+    let out: Seq[Param] = Seq::new();
+    var i = 0usize;
+    while i < f.len() {
+        let t = f.at(i).text;
+        if t.byte(0usize) == b'$' {
+            out.push(Param.{ name: t.from(1usize), kind: Kind::Brand });
+        } else if t.byte(0usize) == b'+' {
+            out.push(Param.{ name: t.from(1usize), kind: Kind::Copy });
+        } else {
+            out.push(Param.{ name: t, kind: Kind::Any });
+        }
+        i = i + 1usize;
+    }
+    out
+}
+
+fn parse_kind(t: Text) -> Kind {
+    if t.is("brand") {
+        Kind::Brand
+    } else if t.is("copy") {
+        Kind::Copy
+    } else {
+        Kind::Any
+    }
+}
+
+fn parse_kinds(f: Form) -> Map[Text, Kind] {
+    let out: Map[Text, Kind] = Map::new();
+    var i = 0usize;
+    while i < f.len() {
+        out.set(f.at(i).at(0usize).text, parse_kind(f.at(i).at(1usize).text));
+        i = i + 1usize;
+    }
+    out
+}
+
+fn parse_premise(f: Form) -> Premise {
+    Premise.{ trait_name: f.at(0usize).text, args: parse_types(f.items, 1usize) }
+}
+
+fn parse_decl(f: Form) -> TypeDecl {
+    TypeDecl.{
+        name: f.at(1usize).text,
+        linear: f.at(0usize).text.is("linear"),
+        params: parse_params(f.at(2usize)),
+        premises: Seq::new(),
+        body: parse_type(f.at(3usize)),
+        home: Option::None,
+        exposure: if f.at(0usize).text.is("opaque") {
+            Option::Some.(Exposure.{ mode: ExposureMode::Owner, home: ModuleId::root(0usize).child(text("m")) })
+        } else {
+            Option::None
+        },
+    }
+}
+
+fn parse_program(forms: Seq[Form], start: usize) -> Program {
+    let program = Program::new();
+    var i = start;
+    while i < forms.len() {
+        let decl = parse_decl(forms.get(i));
+        program.types.set(decl.name, decl);
+        i = i + 1usize;
+    }
+    program
+}
+
+fn parse_instr(f: Form) -> Instr {
+    let op = f.at(0usize).text;
+    let args: Seq[Text] = Seq::new();
+    var ty: Option[Type] = Option::None;
+    var first = 2usize;
+    if op.is("trait_call") {
+        args.push(f.at(1usize).text);
+        args.push(f.at(2usize).text);
+        first = 3usize;
+    } else if op.is("foreach") {
+        args.push(text("items"));
+        args.push(f.at(1usize).text);
+        ty = Option::Some.(parse_type(f.at(2usize)));
+        first = 3usize;
+    } else {
+        args.push(f.at(1usize).text);
+    }
+    Instr.{ lhs: Seq::new(), op, args, ty, tys: parse_types(f.items, first), lit: Option::None, is_unsafe: false, binders: Seq::new(), pos: f.pos }
+}
+
+fn parse_fun(f: Form) -> Fun {
+    let instrs: Seq[Instr] = Seq::new();
+    var i = 2usize;
+    while i < f.len() {
+        instrs.push(parse_instr(f.at(i)));
+        i = i + 1usize;
+    }
+    let entry = Block.{ label: text("entry"), params: Seq::new(), instrs, term: Terminator::Ret.(text("x"), no_pos()), brands: Seq::new(), empty: Seq::new(), known: Seq::new(), opened: Seq::new(), pos: no_pos() };
+    Fun.{ name: f.at(0usize).text, params: parse_params(f.at(1usize)), premises: Seq::new(), ret: C::unit(), ptypes: Seq::new(), blocks: Seq::one(entry), locals: Seq::new(), is_unsafe: false, home: Option::None, pos: no_pos() }
+}
+
+// --------------------------------------------------------------- printing --
+
+fn text_before(a: Text, b: Text) -> bool {
+    a.compare(b) < 0
+}
+
+fn show_set(names: Set[Text]) -> Text {
+    let items = names.items();
+    items.sort(text_before);
+    let out = Out::new().put("[");
+    var i = 0usize;
+    while i < items.len() {
+        if i > 0usize {
+            let unit = out.put(" ");
+        }
+        let unit = out.add(items.get(i));
+        i = i + 1usize;
+    }
+    out.put("]").done()
+}
+
+fn flag(b: bool) -> Text {
+    if b { text("true") } else { text("false") }
+}
+
+fn meta_kind(t: Text) -> MetaKind {
+    if t.is("int") {
+        MetaKind::Int
+    } else if t.is("float") {
+        MetaKind::Float
+    } else if t.is("brand") {
+        MetaKind::Brand
+    } else {
+        MetaKind::Type
+    }
+}
+
+// ------------------------------------------------------------------ cases --
+
+fn run_case(source: Text, counter: Fresh) -> Text {
+    let form = read(source).at(0usize);
+    let op = form.at(0usize).text;
+    if op.is("show") {
+        show(parse_type(form.at(1usize)))
+    } else if op.is("subst") {
+        let sub: Map[Text, Type] = Map::new();
+        let pairs = form.at(2usize);
+        var i = 0usize;
+        while i < pairs.len() {
+            sub.set(pairs.at(i).at(0usize).text, parse_type(pairs.at(i).at(1usize)));
+            i = i + 1usize;
+        }
+        show(subst(parse_type(form.at(1usize)), sub, counter))
+    } else if op.is("free") {
+        show_set(free_names(parse_type(form.at(1usize))))
+    } else if op.is("brands") {
+        show_set(free_brands(parse_type(form.at(1usize))))
+    } else if op.is("extractable") {
+        show_set(extractable_names(parse_type(form.at(1usize))))
+    } else if op.is("equal") {
+        flag(equal(parse_type(form.at(1usize)), parse_type(form.at(2usize))))
+    } else if op.is("fits") {
+        flag(fits(parse_type(form.at(1usize)), parse_type(form.at(2usize))))
+    } else if op.is("unify") || op.is("unify-closed") {
+        let metas: Map[Text, Type] = Map::new();
+        let names: Seq[Text] = Seq::new();
+        let declared = form.at(1usize);
+        var i = 0usize;
+        while i < declared.len() {
+            let name = Out::new().put("?").add(declared.at(i).at(0usize).text).done();
+            names.push(name);
+            metas.set(name, Type::Meta.(Meta::new(meta_kind(declared.at(i).at(1usize).text))));
+            i = i + 1usize;
+        }
+        let a = subst(parse_type(form.at(2usize)), metas, counter);
+        let b = subst(parse_type(form.at(3usize)), metas, counter);
+        let ok = unify(a, b, op.is("unify-closed"), counter);
+        let out = Out::new().add(flag(ok)).put(" | ").add(show(zonk(a))).put(" | ").add(show(zonk(b))).put(" |");
+        var j = 0usize;
+        while j < names.len() {
+            let unit = out.put(" ").add(names.get(j)).put("=").add(show(zonk(metas.at(names.get(j)))));
+            j = j + 1usize;
+        }
+        out.done()
+    } else if op.is("match-head") {
+        let params = parse_params(form.at(1usize));
+        let found = match_head(params, parse_types(form.at(2usize).items, 0usize), parse_types(form.at(3usize).items, 0usize), form.at(4usize).text.is("true"), counter);
+        match found {
+            Option::None => text("none"),
+            Option::Some(sub) => {
+                let out = Out::new().put("{");
+                let keys = sub.keys();
+                var i = 0usize;
+                while i < keys.len() {
+                    if i > 0usize {
+                        let unit = out.put(" ");
+                    }
+                    let unit = out.add(keys.get(i)).put("=").add(show(sub.at(keys.get(i))));
+                    i = i + 1usize;
+                }
+                out.put("}").done()
+            },
+        }
+    } else if op.is("literal") {
+        flag(valid_literal(parse_type(form.at(1usize)), form.at(2usize).text))
+    } else if op.is("copy") {
+        let types = Types::new(parse_program(form.at(1usize).items, 0usize), counter);
+        flag(types.is_copy(parse_type(form.at(3usize)), parse_kinds(form.at(2usize))))
+    } else if op.is("zero") {
+        let types = Types::new(parse_program(form.at(1usize).items, 0usize), counter);
+        flag(types.zero_size(parse_type(form.at(2usize))))
+    } else if op.is("expand") {
+        let types = Types::new(parse_program(form.at(1usize).items, 0usize), counter);
+        show(types.shape(parse_type(form.at(2usize)), Option::None))
+    } else if op.is("layout") {
+        check_type_expansion(parse_program(form.items, 1usize), counter);
+        text("ok")
+    } else if op.is("formation") {
+        let formation: Formation[NoDischarge] = Formation::new(parse_program(form.items, 1usize), counter);
+        formation.declarations();
+        text("ok")
+    } else if op.is("kind") {
+        let formation: Formation[NoDischarge] = Formation::new(parse_program(form.at(1usize).items, 0usize), counter);
+        kind_name(formation.kind(parse_type(form.at(3usize)), parse_kinds(form.at(2usize))))
+    } else if op.is("instances") {
+        let headers: Seq[(Premise, Seq[Premise], Pos)] = Seq::new();
+        var i = 1usize;
+        while i < form.len() {
+            let h = form.at(i);
+            let premises: Seq[Premise] = Seq::new();
+            var j = 1usize;
+            while j < h.len() {
+                premises.push(parse_premise(h.at(j)));
+                j = j + 1usize;
+            }
+            headers.push((parse_premise(h.at(0usize)), premises, h.pos));
+            i = i + 1usize;
+        }
+        check_instance_termination(headers);
+        text("ok")
+    } else if op.is("coherence") {
+        let headers: Seq[(Premise, Seq[Param], Pos)] = Seq::new();
+        var i = 1usize;
+        while i < form.len() {
+            let h = form.at(i);
+            headers.push((parse_premise(h.at(1usize)), parse_params(h.at(0usize)), h.pos));
+            i = i + 1usize;
+        }
+        check_coherence(headers, counter);
+        text("ok")
+    } else if op.is("mono") {
+        let program = Program::new();
+        var i = 1usize;
+        while i < form.len() {
+            let fun = parse_fun(form.at(i));
+            program.funs.set(fun.name, fun);
+            i = i + 1usize;
+        }
+        check_mono_termination(program);
+        text("ok")
+    } else if op.is("function") {
+        let program = parse_program(form.at(1usize).items, 0usize);
+        let funs: Seq[Fun] = Seq::new();
+        var i = 2usize;
+        while i < form.len() {
+            let fun = parse_fun(form.at(i));
+            program.funs.set(fun.name, fun);
+            funs.push(fun);
+            i = i + 1usize;
+        }
+        let formation: Formation[NoDischarge] = Formation::new(program, counter);
+        var j = 0usize;
+        while j < funs.len() {
+            formation.function(funs.get(j), Seq::new(), Seq::new());
+            j = j + 1usize;
+        }
+        text("ok")
+    } else if op.is("fields") {
+        let types = Types::new(parse_program(form.at(1usize).items, 0usize), counter);
+        let found = types.fields(parse_type(form.at(2usize)), Option::None);
+        let out = Out::new().put("[");
+        var i = 0usize;
+        while i < found.len() {
+            if i > 0usize {
+                let unit = out.put(" ");
+            }
+            let unit = out.add(show(found.get(i)));
+            i = i + 1usize;
+        }
+        out.put("]").done()
+    } else if op.is("variants") {
+        let types = Types::new(parse_program(form.at(1usize).items, 0usize), counter);
+        let found = types.variants(parse_type(form.at(2usize)), Option::None);
+        let out = Out::new().put("[");
+        var i = 0usize;
+        while i < found.len() {
+            if i > 0usize {
+                let unit = out.put(" ");
+            }
+            let unit = out.add(found.get(i).name).put(":").add(show(found.get(i).type));
+            i = i + 1usize;
+        }
+        out.put("]").done()
+    } else if op.is("exposure") {
+        let types = Types::new(parse_program(form.at(1usize).items, 0usize), counter);
+        let unit = match types.visible_shape(parse_type(form.at(3usize)), Option::None, parse_kinds(form.at(2usize))) {
+            Option::Some(t) => Out::new().add(show(t)).done(),
+            Option::None => text("hidden"),
+        };
+        Out::new().add(unit).put(" ").add(flag(types.concrete_exposure(parse_type(form.at(3usize)), Option::None, parse_kinds(form.at(2usize))))).done()
+    } else if op.is("pattern") {
+        let types = Types::new(parse_program(form.at(1usize).items, 0usize), counter);
+        match parse_type(form.at(3usize)) {
+            Type::Foreach(f) => flag(types.pattern_available(f, Option::None, parse_kinds(form.at(2usize)))),
+            _ => fail(text("a pattern case needs a foreach type")),
+        }
+    } else {
+        fail(Out::new().put("unknown case ").add(op).done())
+    }
+}
+
+// Runs each case in order, printing its result on a line of its own.
+fn selftest_types(cases: Seq[Text]) {
+    let counter = Fresh::new();
+    var i = 0usize;
+    while i < cases.len() {
+        Out::new().add(run_case(cases.get(i), counter)).put("\n").done().print(1);
+        i = i + 1usize;
+    }
+}

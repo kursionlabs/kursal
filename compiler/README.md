@@ -12,7 +12,10 @@ produce the same output.
 | `syntax`, `parser` | `syntax.py`, `parser.py` | the surface AST and the parser |
 | `dump` | | the AST as text, for comparison with the reference parser |
 | `core`, `sexpr` | `core.py`, `sexpr.py` | the KURS core and S-expressions |
+| `types`, `unify` | `types.py`, `unify.py` | substitution, equality, shapes; unification over `core::Meta` |
+| `literals`, `formation`, `layout`, `termination`, `coherence` | the same names | checks of literals, types, declarations and instances |
 | `main` | `__main__.py` | the command line |
+| `selftest` | | `kursalc selftest-types`, the type modules on small cases, for the tests |
 
 ## Building and testing
 
@@ -62,6 +65,15 @@ The compiler stops at the first error: `base::fail(message)` prints the message 
 status 1. A message is exactly what the reference compiler prints for the same error: `KursError`'s
 `str()`, which is `line:col: message` when it carries a position and the message alone otherwise,
 and the file prefix the front end adds (`resolve.located`). Tests compare messages.
+`types::kurs_error(message, pos)` stops with `KursError(message, pos)`'s text; a `Pos` with line 0
+stands for no position.
+
+## Fresh names
+
+`types.fresh` numbers renamed binders (`a#3`) from one counter for the whole compilation. Here that
+counter is a `types::Fresh`, made once and passed to everything that may rename a binder: `subst`,
+`unify`, `match_head`, `Types`, `Formation`, `check_type_expansion`, `check_coherence`. Passing the
+same one everywhere numbers names as the reference compiler does.
 
 ## The language, for a compiler author
 

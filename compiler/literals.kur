@@ -1,0 +1,135 @@
+// Pure scalar-literal contract shared by source lowering and core assertions.
+
+use package::base::{Out, Text, alloc, fail, text};
+use package::core::Type;
+use package::core as C;
+use std::slice::Slice;
+
+extern "C" fn strtod(s: *u8, end: *(*u8)) -> f64;
+
+fn is_digit(b: u8) -> bool {
+    b >= b'0' && b <= b'9'
+}
+
+// The end of the digits of `t` starting at `i`.
+fn digits_end(t: Text, i: usize) -> usize {
+    var j = i;
+    while j < t.len && is_digit(t.byte(j)) {
+        j = j + 1usize;
+    }
+    j
+}
+
+// `t` matches `[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?` entirely.
+fn float_syntax(t: Text) -> bool {
+    var i = 0usize;
+    if t.byte(i) == b'+' || t.byte(i) == b'-' {
+        i = i + 1usize;
+    }
+    let whole = digits_end(t, i);
+    if whole > i {
+        i = whole;
+        if i < t.len && t.byte(i) == b'.' {
+            i = digits_end(t, i + 1usize);
+        }
+    } else if i < t.len && t.byte(i) == b'.' && digits_end(t, i + 1usize) > i + 1usize {
+        i = digits_end(t, i + 1usize);
+    } else {
+        return false;
+    }
+    if i < t.len && (t.byte(i) == b'e' || t.byte(i) == b'E') {
+        var j = i + 1usize;
+        if j < t.len && (t.byte(j) == b'+' || t.byte(j) == b'-') {
+            j = j + 1usize;
+        }
+        let end = digits_end(t, j);
+        if end == j {
+            return false;
+        }
+        i = end;
+    }
+    i == t.len
+}
+
+// `t` matches `0|-?[1-9][0-9]*` entirely.
+fn integer_syntax(t: Text) -> bool {
+    if t.is("0") {
+        return true;
+    }
+    let start = if t.byte(0usize) == b'-' { 1usize } else { 0usize };
+    start < t.len && t.byte(start) != b'0' && digits_end(t, start) == t.len
+}
+
+// The decimal digits of `n` are at most `bound`'s digits, as numbers: neither has leading zeros.
+fn at_most(n: Text, bound: Slice[u8, 'static]) -> bool {
+    let b = text(bound);
+    n.len < b.len || (n.len == b.len && n.compare(b) <= 0)
+}
+
+// The largest magnitude of a non-negative and of a negative value of an integer type, in decimal.
+// Integer literals are compared as digit strings, so a literal of any length is judged exactly.
+fn bounds(name: Text) -> (Slice[u8, 'static], Slice[u8, 'static]) {
+    if name.is("i8") {
+        ("127", "128")
+    } else if name.is("i16") {
+        ("32767", "32768")
+    } else if name.is("i32") {
+        ("2147483647", "2147483648")
+    } else if name.is("i64") || name.is("isize") {
+        ("9223372036854775807", "9223372036854775808")
+    } else if name.is("u8") {
+        ("255", "0")
+    } else if name.is("u16") {
+        ("65535", "0")
+    } else if name.is("u32") {
+        ("4294967295", "0")
+    } else {
+        ("18446744073709551615", "0")
+    }
+}
+
+// The nearest double to the decimal text, as Python's `float` rounds it: correctly, to infinity
+// past the largest double.
+fn parse_double(t: Text) -> f64 {
+    let z = Out::new().add(t).byte(0u8).done();
+    let end: *(*u8) = alloc(1usize);
+    unsafe strtod(z.ptr, end)
+}
+
+fn valid_literal(ty: Type, t: Text) -> bool {
+    let name = match ty {
+        Type::Prim(name) => name,
+        _ => fail(text("internal error: a literal of a non-primitive type")),
+    };
+    if name.is("bool") {
+        return t.is("true") || t.is("false");
+    }
+    if C::is_float(name) {
+        if !float_syntax(t) {
+            return false;
+        }
+        let value = parse_double(t);
+        // A cast between a float and an integer of the same width keeps the bits.
+        let bits = unsafe (value as u64);
+        if ((bits >> 52u64) & 2047u64) == 2047u64 {
+            return false;
+        }
+        if name.is("f32") {
+            // Python packs the double into four bytes, failing when it rounds past the largest
+            // f32; the conversion here rounds the same way, to an infinity.
+            let single = unsafe (value as f32);
+            let single_bits = unsafe (single as u32);
+            return (single_bits & 2139095040u32) != 2139095040u32;
+        }
+        return true;
+    }
+    if !C::is_integer(name) || !integer_syntax(t) {
+        return false;
+    }
+    let (positive, negative) = bounds(name);
+    if t.byte(0usize) == b'-' {
+        at_most(t.from(1usize), negative)
+    } else {
+        at_most(t, positive)
+    }
+}

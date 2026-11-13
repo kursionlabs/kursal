@@ -1,0 +1,285 @@
+// SCC restrictions for instance search and function specialization.
+//
+// For specialization inside a recursive component, pass parameters unchanged or choose fixed
+// types. Across components, arbitrary construction is finite because the SCC graph is a DAG.
+// Instance matching only extracts subterms of the trait arguments. Thus each component draws from
+// a finite set of incoming types, constants and subterms; memoizing specialization tuples
+// exhausts that set. This is conservative: a rejected cycle need not actually grow (another edge
+// might reset its arguments). Instance search instead requires structural descent on every
+// recursive edge.
+
+use package::base::{Map, Out, Seq, Set, Text, text};
+use package::core::{Fun, Instr, Kind, Param, Premise, Program, Type};
+use package::core as C;
+use package::formation::strict_subterm;
+use package::syntax::Pos;
+use package::types::{free_names, kurs_error, overlap, show};
+use std::option::Option;
+
+// Tarjan's algorithm: mutually reachable nodes receive the same ID. A node is a key: (function,)
+// or (trait, method).
+fn components(graph: Map[Seq[Text], Set[Seq[Text]]]) -> Map[Seq[Text], usize] {
+    let state = Tarjan.{
+        graph,
+        indices: Map::new(),
+        low: Map::new(),
+        stack: Seq::new(),
+        active: Set::new(),
+        result: Map::new(),
+    };
+    let nodes = graph.keys();
+    var i = 0usize;
+    while i < nodes.len() {
+        if !state.indices.has(nodes.get(i)) {
+            state.visit(nodes.get(i));
+        }
+        i = i + 1usize;
+    }
+    state.result
+}
+
+exposed struct Tarjan {
+    graph: Map[Seq[Text], Set[Seq[Text]]],
+    indices: Map[Seq[Text], usize],
+    low: Map[Seq[Text], usize],
+    stack: Seq[Seq[Text]],
+    active: Set[Seq[Text]],
+    result: Map[Seq[Text], usize],
+}
+
+fn min(a: usize, b: usize) -> usize {
+    if a < b { a } else { b }
+}
+
+impl Tarjan {
+    fn visit(self, node: Seq[Text]) {
+        let index = self.indices.len();
+        self.indices.set(node, index);
+        self.low.set(node, index);
+        self.stack.push(node);
+        self.active.add(node);
+        let targets = self.graph.at(node).items();
+        var i = 0usize;
+        while i < targets.len() {
+            let target = targets.get(i);
+            if !self.indices.has(target) {
+                self.visit(target);
+                self.low.set(node, min(self.low.at(node), self.low.at(target)));
+            } else if self.active.has(target) {
+                self.low.set(node, min(self.low.at(node), self.indices.at(target)));
+            }
+            i = i + 1usize;
+        }
+        if self.low.at(node) == self.indices.at(node) {
+            var going = true;
+            while going {
+                let member = self.stack.pop();
+                self.active.remove(member);
+                self.result.set(member, self.indices.at(node));
+                going = !member.same(node);
+            }
+        }
+    }
+}
+
+fn node1(a: Text) -> Seq[Text] {
+    Seq::one(a)
+}
+
+fn add_node(graph: Map[Seq[Text], Set[Seq[Text]]], node: Seq[Text]) {
+    if !graph.has(node) {
+        graph.set(node, Set::new());
+    }
+}
+
+// Every premise edge within a trait SCC decreases its first argument.
+//
+// A finite proof tree follows: each recursive component strictly decreases a finite type term,
+// and edges between components follow a finite DAG. Headers are shared by surface inference and
+// KURS, before either searches.
+fn check_instance_termination(headers: Seq[(Premise, Seq[Premise], Pos)]) {
+    let graph: Map[Seq[Text], Set[Seq[Text]]] = Map::new();
+    var i = 0usize;
+    while i < headers.len() {
+        let (head, premises, _pos) = headers.get(i);
+        add_node(graph, node1(head.trait_name));
+        var j = 0usize;
+        while j < premises.len() {
+            add_node(graph, node1(premises.get(j).trait_name));
+            graph.at(node1(head.trait_name)).add(node1(premises.get(j).trait_name));
+            j = j + 1usize;
+        }
+        i = i + 1usize;
+    }
+    let scc = components(graph);
+    var k = 0usize;
+    while k < headers.len() {
+        let (head, premises, pos) = headers.get(k);
+        var j = 0usize;
+        while j < premises.len() {
+            let premise = premises.get(j);
+            if scc.at(node1(head.trait_name)) == scc.at(node1(premise.trait_name)) {
+                if head.args.is_empty() || premise.args.is_empty() || !strict_subterm(premise.args.get(0usize), head.args.get(0usize)) {
+                    kurs_error(Out::new().put("recursive instance premise ").add(head.trait_name).put(" -> ").add(premise.trait_name)
+                        .put(": first argument must be a strict structural subterm of the head's first argument").done(), pos);
+                }
+            }
+            j = j + 1usize;
+        }
+        k = k + 1usize;
+    }
+}
+
+// A specialization request: the calling body, the body it requests, the caller's value
+// parameters, and the instruction.
+exposed struct Site {
+    caller: Seq[Text],
+    callee: Seq[Text],
+    scope: Set[Text],
+    instr: Instr,
+}
+
+fn join(key: Seq[Text]) -> Text {
+    let out = Out::new();
+    var i = 0usize;
+    while i < key.len() {
+        if i > 0usize {
+            let unit = out.put("::");
+        }
+        let unit = out.add(key.get(i));
+        i = i + 1usize;
+    }
+    out.done()
+}
+
+// Check every specialization request before starting the backend worklist.
+//
+// Trait-method nodes unite all their instance bodies. Indirect calls require no edge: their code
+// was already requested at a statically named `fn` site. Lifted closures and foreach mappers are
+// ordinary functions in this graph.
+fn check_mono_termination(program: Program) {
+    let keys: Seq[Seq[Text]] = Seq::new();
+    let bodies: Seq[Fun] = Seq::new();
+    let scopes: Seq[Seq[Param]] = Seq::new();
+    let funs = program.funs.values();
+    var f = 0usize;
+    while f < funs.len() {
+        keys.push(node1(funs.get(f).name));
+        bodies.push(funs.get(f));
+        scopes.push(funs.get(f).params);
+        f = f + 1usize;
+    }
+    let groups = program.instances.values();
+    var g = 0usize;
+    while g < groups.len() {
+        let instances = groups.get(g);
+        var n = 0usize;
+        while n < instances.len() {
+            let inst = instances.get(n);
+            var m = 0usize;
+            while m < inst.methods.len() {
+                let fun = inst.methods.get(m);
+                keys.push(Seq::two(inst.trait_name, fun.name));
+                bodies.push(fun);
+                let params = inst.params.copy();
+                params.append(fun.params);
+                scopes.push(params);
+                m = m + 1usize;
+            }
+            n = n + 1usize;
+        }
+        g = g + 1usize;
+    }
+    let graph: Map[Seq[Text], Set[Seq[Text]]] = Map::new();
+    var b = 0usize;
+    while b < keys.len() {
+        graph.set(keys.get(b), Set::new());
+        b = b + 1usize;
+    }
+    let sites: Seq[Site] = Seq::new();
+    var c = 0usize;
+    while c < keys.len() {
+        let key = keys.get(c);
+        let fun = bodies.get(c);
+        // Brands have no type constructors and cannot grow.
+        let scope: Set[Text] = Set::new();
+        let params = scopes.get(c);
+        var p = 0usize;
+        while p < params.len() {
+            if !C::same_kind(params.get(p).kind, Kind::Brand) {
+                scope.add(params.get(p).name);
+            }
+            p = p + 1usize;
+        }
+        var k = 0usize;
+        while k < fun.blocks.len() {
+            let instrs = fun.blocks.get(k).instrs;
+            var i = 0usize;
+            while i < instrs.len() {
+                let instr = instrs.get(i);
+                let target: Option[Seq[Text]] = if instr.op.is("call") || instr.op.is("fn") {
+                    Option::Some.(node1(instr.args.get(0usize)))
+                } else if instr.op.is("trait_call") {
+                    Option::Some.(Seq::two(instr.args.get(0usize), instr.args.get(1usize)))
+                } else if instr.op.is("foreach") {
+                    Option::Some.(node1(instr.args.get(1usize)))
+                } else {
+                    Option::None
+                };
+                let unit = match target {
+                    Option::Some(t) => {
+                        if graph.has(t) {
+                            graph.at(key).add(t);
+                            sites.push(Site.{ caller: key, callee: t, scope, instr });
+                        }
+                    },
+                    Option::None => (),
+                };
+                i = i + 1usize;
+            }
+            k = k + 1usize;
+        }
+        c = c + 1usize;
+    }
+    let scc = components(graph);
+    var s = 0usize;
+    while s < sites.len() {
+        let site = sites.get(s);
+        if scc.at(site.caller) == scc.at(site.callee) {
+            check_site(site);
+        }
+        s = s + 1usize;
+    }
+}
+
+fn check_site(site: Site) {
+    let instr = site.instr;
+    let context = Out::new().put("recursive specialization ").add(join(site.caller)).put(" -> ").add(join(site.callee)).done();
+    var i = 0usize;
+    while i < instr.tys.len() {
+        let ty = instr.tys.get(i);
+        let unchanged = match ty {
+            Type::Named(name, args) => args.is_empty() && site.scope.has(name),
+            _ => false,
+        };
+        if !unchanged && overlap(free_names(ty), site.scope) {
+            kurs_error(Out::new().add(context).put(": ").add(show(ty))
+                .put(" must be an unchanged parameter or independent of the caller's parameters").done(), instr.pos);
+        }
+        i = i + 1usize;
+    }
+    // A nominal component need not be a subterm of its source: unfolding Node[T] may yield
+    // Node[(tuple T T)]. Without a separate structural descent proof, only parameter-independent
+    // traversal is safe in a cycle.
+    let unit = match instr.ty {
+        Option::Some(t) => match t {
+            Type::Foreach(f) => {
+                if instr.op.is("foreach") && overlap(free_names(f.source.get()), site.scope) {
+                    kurs_error(Out::new().add(context).put(": recursive foreach requires a parameter-independent source").done(), instr.pos);
+                }
+            },
+            _ => (),
+        },
+        Option::None => (),
+    };
+}
