@@ -114,19 +114,15 @@ class FunctionAddressTests(unittest.TestCase):
         main.blocks[0].instrs[1].tys = ()
         self.assertIn("chosen", emit_c(program, check_program(program)))
 
-    def test_foreign_unit_address_uses_one_internal_abi_adapter(self):
+    def test_a_foreign_unit_function_is_its_own_address(self):
+        # A unit result is `void` in C, for Kursal and foreign functions alike: no adapter.
         main = C.Fun("main", (), (), C.UNIT, (),
                      (C.Block("entry", (),
                               (C.Instr(("%f",), "fn", ("foreign",)),
-                               C.Instr(("%g",), "fn", ("foreign",)),
                                C.Instr(("%u",), "call", ("%f",), unsafe=True)), C.Ret("%u")),))
         program = C.Program(funs={"main": main}, externs={"foreign": C.Extern("foreign", C.UNIT, ())})
-        backend = Backend(program, check_program(program))
-        output = backend.emit_program()
-        self.assertEqual(len(backend.foreign_adapters), 1)
-        adapter = backend.foreign_adapters["foreign"]
-        self.assertIn(f"static KurUnit {adapter}(void)", output)
+        output = Backend(program, check_program(program)).emit_program()
         self.assertIn("void foreign(void);", output)
-        self.assertIn("foreign();", output)
-        self.assertIn(f"entry_f = {adapter};", output)
-        self.assertIn("entry_u = entry_f();", output)
+        self.assertIn("entry_f = foreign;", output)
+        self.assertIn("entry_f();", output)
+        self.assertIn("return;", output)

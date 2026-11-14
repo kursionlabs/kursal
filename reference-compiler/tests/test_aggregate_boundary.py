@@ -72,7 +72,7 @@ class AggregateBoundaryTests(unittest.TestCase):
             (fun main i32 () (entry ()
             (= %empty (construct (array u8 0)))
             (= %r (call keep %empty)) (ret %r)))''', 7)
-        self.assertIn('entry_empty.dummy = 0;', output)
+        self.assertNotIn('entry_empty', output)
 
     def test_nested_empty_data(self):
         self.run_core('''(data values (tuple (array u8 0) (tuple) i32) (() () 7))

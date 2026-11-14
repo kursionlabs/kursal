@@ -137,7 +137,7 @@ class Checker:
     def check(self) -> None:
         for ext in self.program.externs.values():
             self.where = f"extern {ext.name}"
-            for t in ext.ptypes or ():
+            for t in ext.ptypes if ext.ptypes is not None else (ext.ret,):
                 self.has_memory_form(t)
         for trait in self.program.traits.values():
             self.where = f"trait {trait.name}"
@@ -671,6 +671,8 @@ class Checker:
         got = self.use(instr.args[0])
         if any(contains(t, self.uncastable) for t in (got, instr.ty)):
             self.fail("unsafe_cast_cannot_produce")
+        self.has_memory_form(got)
+        self.has_memory_form(instr.ty)
         return instr.ty
 
     def uncastable(self, ty: Type) -> bool:
@@ -738,8 +740,9 @@ class Checker:
         return Fn(tuple(subst(t, sub) for t in fun.ptypes), subst(fun.ret, sub), retained, fun.unsafe, fun.places)
 
     def has_memory_form(self, ty: Type) -> None:
-        """How a zero-size type is laid out in memory is not decided yet, so nothing may observe it:
-        `sizeof`, `alloca`, unsafe memory operations and extern parameters reject zero-size types."""
+        """A zero-size type is erased: it has no memory form, no C object and no C value. So `alloca`, the
+        unsafe memory operations (a load or store through a pointer, volatile or not), unsafe casts, and
+        extern parameters and values reject zero-size types; `sizeof` of one is 0."""
         if self.types.zero_size(ty):
             self.fail("zero_size_type_has_no_memory_form")
 
@@ -753,7 +756,6 @@ class Checker:
     def op_sizeof(self, instr: Instr) -> Type:
         if instr.ty is None:
             self.fail("instruction_requires_type")
-        self.has_memory_form(instr.ty)
         return USIZE
 
     def op_data(self, instr: Instr) -> Type:

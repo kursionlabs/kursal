@@ -3,6 +3,9 @@
 //
 // Generic functions are specialized on demand by logical type arguments, up to their brands.
 // Representation erasure is separate from code-specialization identity.
+//
+// A zero-size type (`Types::zero_size`) has no C representation: its C type is `void` (`erased`),
+// and no struct member, parameter, local, argument or assignment has it, as in cgen.py.
 
 use std::collections::arena_vec::ArenaVec;
 use std::collections::arena_map::{ArenaMap, ArenaSet};
@@ -26,7 +29,6 @@ fn prelude() -> Buffer! {
     Buffer::new()
         .push_static("#include <stddef.h>\n")
         .push_static("#include <stdint.h>\n")
-        .push_static("typedef struct { unsigned char dummy; } KurUnit;\n")
         .push_static("#define KUR_TRAP() __builtin_trap()\n")
         .push_static("/* A call the C compiler must make a tail call, where it can be told to: Clang's `musttail`. */\n")
         .push_static("#if defined(__clang__) && defined(__has_attribute)\n")
@@ -162,7 +164,7 @@ fn c_keywords(&cx: Domain!['k]) -> ArenaSet[Span['k], 'k] {
 forall 'k.
 fn runtime_names(&cx: Domain!['k]) -> ArenaSet[Span['k], 'k] {
     let out: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
-    add_words(&cx, out, "KurUnit KUR_TRAP KUR_MUSTTAIL kur_dec_i8 kur_dec_i16 kur_dec_i32 kur_dec_i64");
+    add_words(&cx, out, "KUR_TRAP KUR_MUSTTAIL KUR_FIELD kur_dec_i8 kur_dec_i16 kur_dec_i32 kur_dec_i64");
     add_words(&cx, out, "SIZE_MAX PTRDIFF_MIN PTRDIFF_MAX SIG_ATOMIC_MIN SIG_ATOMIC_MAX WCHAR_MIN WCHAR_MAX WINT_MIN WINT_MAX");
     add_words(&cx, out, "__ATOMIC_RELAXED __ATOMIC_ACQUIRE __ATOMIC_RELEASE __ATOMIC_ACQ_REL __ATOMIC_SEQ_CST");
     let stems = Span::from_static(&cx, "8 16 32 64 _LEAST8 _LEAST16 _LEAST32 _LEAST64 _FAST8 _FAST16 _FAST32 _FAST64 PTR MAX").split(&cx, Span::from_static(&cx, " "));
@@ -394,6 +396,19 @@ fn member_names(&cx: Domain!['k], members: ArenaVec[(Span['k], Type['k]), 'k]) -
     out
 }
 
+// The members `items[k]` of an array of `count` elements of type `elem`, as `Backend::members`
+// gives a struct's.
+forall 'k.
+fn items_of(&cx: Domain!['k], count: usize, elem: Type['k]) -> ArenaVec[(Span['k], Type['k]), 'k] {
+    let out: ArenaVec[(Span['k], Type['k]), 'k] = ArenaVec::new(&cx);
+    var k = 0usize;
+    while k < count {
+        out.push(&cx, (Buffer::new().push_static("items[").push_usize(k).push_static("]").save(&cx), elem));
+        k = k + 1usize;
+    }
+    out
+}
+
 forall 'k.
 fn items_access(&cx: Domain!['k], count: usize) -> ArenaVec[Span['k], 'k] {
     let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
@@ -457,8 +472,9 @@ exposed struct Backend {
     queue: ArenaVec[(FunKey['k], Fun['k], ArenaMap[Span['k], Type['k], 'k], Span['k]), 'k],
     // Each function in order: its symbol, when its head waits for `qualifiers`, else its head; its body.
     emitted: ArenaVec[(Option[Span['k]], Span['k], Span['k]), 'k],
-    // symbol -> its C result and parameters
-    heads: ArenaMap[Span['k], (Span['k], ArenaVec[CParam['k], 'k]), 'k],
+    // symbol -> its C result, whether it never returns, and its parameters; a parameter of a zero-size
+    // type has the C type `void` and no name, and is not written
+    heads: ArenaMap[Span['k], (Span['k], bool, ArenaVec[CParam['k], 'k]), 'k],
     // Every place lent to a function by symbol: (callee, its parameter, where the place is: "param"
     // under the caller's place parameter, "local" in its local place, "raw" behind a pointer; the
     // caller, and its parameter for "param").
@@ -474,7 +490,6 @@ exposed struct Backend {
     taken: Pool['k],
     component_names: ArenaMap[(Span['k], Span['k]), Span['k], 'k],
     component_taken: Pool['k],
-    foreign_adapters: ArenaMap[Span['k], Span['k], 'k],
     instance_params: ArenaMap[FunKey['k], ArenaVec[Param['k], 'k], 'k],
     function_ids: ArenaMap[FunKey['k], (ArenaVec[Span['k], 'k], Span['k]), 'k],
     // the function being emitted
@@ -603,7 +618,6 @@ impl Backend['k] {
             taken: Pool::new(&cx, taken),
             component_names: ArenaMap::new(&cx),
             component_taken: Pool::new(&cx, ArenaSet::new(&cx)),
-            foreign_adapters: ArenaMap::new(&cx),
             instance_params,
             function_ids,
             fun: Ref::new(&cx, Option::None),
@@ -669,7 +683,7 @@ impl Backend['k] {
             },
             Type::Ptr(inner) => {
                 let inner = erase(&cx, inner.copy(&cx), self.types);
-                return if is_never(inner) { Span::from_static(&cx, "void*") } else { Buffer::new().push_bytes(&cx, self.ctype(&cx, inner, false)).push_static("*").save(&cx) };
+                return Buffer::new().push_bytes(&cx, self.ctype(&cx, inner, false)).push_static("*").save(&cx);
             },
             _ => (),
         };
@@ -687,25 +701,17 @@ impl Backend['k] {
     }
 
     fn register(self, &cx: Domain!['k], ty: Type['k]) {
+        if self.types.zero_size(&cx, ty) {
+            self.names.insert(&cx, ty, Span::from_static(&cx, "void"));
+            return;
+        }
         let s = match ty {
             Type::Named(_name, _args) => self.types.shape(&cx, ty, Option::None),
             _ => ty,
         };
         match s {
-            Type::Tuple(elems) => {
-                if elems.is_empty(&cx) {
-                    self.names.insert(&cx, ty, Span::from_static(&cx, "KurUnit"));
-                } else {
-                    self.aggregate(&cx, ty, s, Span::from_static(&cx, "tuple"));
-                }
-            },
-            Type::Struct(fields) => {
-                if fields.is_empty(&cx) {
-                    self.names.insert(&cx, ty, Span::from_static(&cx, "KurUnit"));
-                } else {
-                    self.aggregate(&cx, ty, s, Span::from_static(&cx, "struct"));
-                }
-            },
+            Type::Tuple(_elems) => self.aggregate(&cx, ty, s, Span::from_static(&cx, "tuple")),
+            Type::Struct(_fields) => self.aggregate(&cx, ty, s, Span::from_static(&cx, "struct")),
             Type::Array(_elem, _length) => self.aggregate(&cx, ty, s, Span::from_static(&cx, "array")),
             Type::Enum(_variants) => self.aggregate(&cx, ty, s, Span::from_static(&cx, "enum")),
             Type::Fn(f) => {
@@ -713,13 +719,14 @@ impl Backend['k] {
                 self.names.insert(&cx, ty, name);
                 // Function declarations may name forward-declared aggregates. Define their
                 // fields after this typedef, which they may use.
-                let ret = f.ret.copy(&cx);
-                let result = if is_never(ret) { Span::from_static(&cx, "void") } else { self.ctype(&cx, ret, false) };
+                let result = self.ctype(&cx, f.ret.copy(&cx), false);
                 let params: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
                 var k = 0usize;
                 while k < f.params.len(&cx) {
                     let ct = self.ctype(&cx, f.params.at(&cx, k), false);
-                    params.push(&cx, if f.places.contains(&cx, k) { Buffer::new().push_bytes(&cx, ct).push_static("*").save(&cx) } else { ct });
+                    if !ct.is(&cx, "void") {
+                        params.push(&cx, if f.places.contains(&cx, k) { Buffer::new().push_bytes(&cx, ct).push_static("*").save(&cx) } else { ct });
+                    }
                     k = k + 1usize;
                 }
                 self.defs.push(&cx, Buffer::new().push_static("typedef ").push_bytes(&cx, result).push_static(" (*").push_bytes(&cx, name).push_static(")(").push_bytes(&cx, or_void(&cx, params.join(&cx, ", "))).push_static(");").save(&cx));
@@ -746,22 +753,23 @@ impl Backend['k] {
         let s = self.pending.at(&cx, ty);
         self.pending.remove(&cx, ty);
         let body = match s {
-            Type::Array(elem, length) => {
-                if length != 0u64 {
-                    Buffer::new().push_bytes(&cx, self.c(&cx, elem.copy(&cx))).push_static(" items[").push_u64(length).push_static("];").save(&cx)
-                } else {
-                    Span::from_static(&cx, "unsigned char dummy;")
-                }
-            },
+            Type::Array(elem, length) => Buffer::new().push_bytes(&cx, self.c(&cx, elem.copy(&cx))).push_static(" items[").push_u64(length).push_static("];").save(&cx),
             Type::Enum(variants) => {
                 let members: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
                 var i = 0usize;
                 while i < variants.len(&cx) {
-                    let ct = self.c(&cx, variants.at(&cx, i).type);
-                    members.push(&cx, Buffer::new().push_bytes(&cx, ct).push_static(" ").push_bytes(&cx, self.variant(&cx, variants.at(&cx, i).name)).push_static(";").save(&cx));
+                    let t = variants.at(&cx, i).type;
+                    if !self.erased(&cx, t) {
+                        let ct = self.c(&cx, t);
+                        members.push(&cx, Buffer::new().push_bytes(&cx, ct).push_static(" ").push_bytes(&cx, self.variant(&cx, variants.at(&cx, i).name)).push_static(";").save(&cx));
+                    }
                     i = i + 1usize;
                 }
-                Buffer::new().push_static("uint32_t tag; union { ").push_bytes(&cx, members.join(&cx, " ")).push_static(" } payload;").save(&cx)
+                if members.is_empty(&cx) {
+                    Span::from_static(&cx, "uint32_t tag;")
+                } else {
+                    Buffer::new().push_static("uint32_t tag; union { ").push_bytes(&cx, members.join(&cx, " ")).push_static(" } payload;").save(&cx)
+                }
             },
             _ => {
                 let rows = self.members(&cx, s);
@@ -769,7 +777,9 @@ impl Backend['k] {
                 var i = 0usize;
                 while i < rows.len(&cx) {
                     let (m, f) = rows.at(&cx, i);
-                    parts.push(&cx, Buffer::new().push_bytes(&cx, self.c(&cx, f)).push_static(" ").push_bytes(&cx, m).push_static(";").save(&cx));
+                    if !self.erased(&cx, f) {
+                        parts.push(&cx, Buffer::new().push_bytes(&cx, self.c(&cx, f)).push_static(" ").push_bytes(&cx, m).push_static(";").save(&cx));
+                    }
                     i = i + 1usize;
                 }
                 parts.join(&cx, " ")
@@ -817,8 +827,21 @@ impl Backend['k] {
         self.types.shape(&cx, erase(&cx, ty, self.types), Option::None)
     }
 
-    fn is_unit(self, &cx: Domain!['k], ty: Type['k]) -> bool {
-        self.c(&cx, ty).is(&cx, "KurUnit")
+    // `ty` has no C representation: it is zero-size (Never included).
+    fn erased(self, &cx: Domain!['k], ty: Type['k]) -> bool {
+        self.c(&cx, ty).is(&cx, "void")
+    }
+
+    // A call argument passes nothing: a value, a lent place or a raw target of a zero-size type.
+    fn erased_arg(self, &cx: Domain!['k], arg: Span['k]) -> bool {
+        if arg.starts_with(&cx, Span::from_static(&cx, "&*")) {
+            return self.erased(&cx, self.pointee(&cx, self.type_of(&cx, arg.skip(2usize))));
+        }
+        if arg.starts_with(&cx, Span::from_static(&cx, "&")) {
+            let (_expr, ty) = self.place(&cx, arg);
+            return self.erased(&cx, ty);
+        }
+        self.erased(&cx, self.type_of(&cx, arg))
     }
 
     // ------------------------------------------------------------ specialization --
@@ -902,7 +925,7 @@ impl Backend['k] {
     fn function_address(self, &cx: Domain!['k], instr: Instr['k]) -> Span['k] {
         let name = instr.args.at(&cx, 0usize);
         if self.program.externs.contains(&cx, name) {
-            return self.foreign_address(&cx, name);
+            return name;
         }
         let fun = self.program.funs.at(&cx, name);
         // Stable distinct rigid identities: not a wildcard and not static.
@@ -923,52 +946,6 @@ impl Backend['k] {
         }
         let symbol = self.request(&cx, FunKey::Function.(name), fun, sub);
         let added = self.address_taken.insert(&cx, symbol);
-        symbol
-    }
-
-    fn foreign_address(self, &cx: Domain!['k], name: Span['k]) -> Span['k] {
-        let ext = self.program.externs.at(&cx, name);
-        let ret = match ext.ret {
-            Option::Some(r) => r,
-            Option::None => fail_text(&cx, Span::from_static(&cx, "internal error: an extern without a type")),
-        };
-        let ptypes = match ext.ptypes {
-            Option::Some(p) => p,
-            Option::None => fail_text(&cx, Span::from_static(&cx, "internal error: an extern value has no address")),
-        };
-        if !self.is_unit(&cx, ret) {
-            return name;
-        }
-        match self.foreign_adapters.get(&cx, name) {
-            Option::Some(symbol) => {
-                return symbol;
-            },
-            Option::None => (),
-        };
-        let signature = C::fn_type(&cx, ptypes, ret, ArenaVec::new(&cx), true, ArenaVec::new(&cx));
-        let path = ArenaVec::one(&cx, Span::from_static(&cx, "adapter"));
-        path.append(&cx, path_segments(&cx, name));
-        let identity = ArenaVec::two(&cx, Span::from_static(&cx, "adapter"), name);
-        identity.push(&cx, type_key(&cx, signature, ArenaVec::new(&cx)));
-        let symbol = self.function_name(&cx, path, encode(&cx, identity));
-        self.foreign_adapters.insert(&cx, name, symbol);
-        let names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
-        var k = 0usize;
-        while k < ptypes.len(&cx) {
-            names.push(&cx, allocate(&cx, Buffer::new().push_static("a").push_usize(k).save(&cx), self.taken));
-            k = k + 1usize;
-        }
-        let params: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
-        var p = 0usize;
-        while p < ptypes.len(&cx) {
-            params.push(&cx, Buffer::new().push_bytes(&cx, self.c(&cx, ptypes.at(&cx, p))).push_static(" ").push_bytes(&cx, names.at(&cx, p)).save(&cx));
-            p = p + 1usize;
-        }
-        let args = names.join(&cx, ", ");
-        let result = allocate(&cx, Span::from_static(&cx, "result"), self.taken);
-        let head = Buffer::new().push_static("static KurUnit ").push_bytes(&cx, symbol).push_static("(").push_bytes(&cx, or_void(&cx, params.join(&cx, ", "))).push_static(")").save(&cx);
-        self.emitted.push(&cx, (Option::None, head, Buffer::new().push_static(" {\n  ").push_bytes(&cx, name).push_static("(").push_bytes(&cx, args).push_static(");\n")
-            .push_static("  KurUnit ").push_bytes(&cx, result).push_static(" = { 0 };\n  return ").push_bytes(&cx, result).push_static(";\n}").save(&cx)));
         symbol
     }
 
@@ -1015,7 +992,7 @@ impl Backend['k] {
             match ext.ptypes {
                 Option::None => externs.push(&cx, Buffer::new().push_static("extern ").push_bytes(&cx, self.c(&cx, ret)).push_static(" ").push_bytes(&cx, ext.name).push_static(";").save(&cx)),
                 Option::Some(ptypes) => {
-                    let result = if self.is_foreign_void(&cx, ret) { Span::from_static(&cx, "void") } else { self.c(&cx, ret) };
+                    let result = self.c(&cx, ret);
                     let noreturn = if is_never(ret) { Span::from_static(&cx, "_Noreturn ") } else { Span::from_static(&cx, "") };
                     let params: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
                     var p = 0usize;
@@ -1124,10 +1101,6 @@ impl Backend['k] {
         }
     }
 
-    fn is_foreign_void(self, &cx: Domain!['k], ty: Type['k]) -> bool {
-        is_never(ty) || self.is_unit(&cx, ty)
-    }
-
     // ---------------------------------------------------------------------- data --
 
     fn data_symbol(self, &cx: Domain!['k], name: Span['k]) -> Span['k] {
@@ -1139,8 +1112,12 @@ impl Backend['k] {
         symbol
     }
 
+    // A data's C object; one of a zero-size type is a `char`, for the address the program sees.
     fn emit_data(self, &cx: Domain!['k], entry: (Span['k], Data['k])) -> Span['k] {
         let (symbol, data) = entry;
+        if self.erased(&cx, data.ty) {
+            return Buffer::new().push_static("static char ").push_bytes(&cx, symbol).push_static(";").save(&cx);
+        }
         let ct = self.c(&cx, data.ty);
         Buffer::new().push_static("static ").push_bytes(&cx, ct).push_static(" ").push_bytes(&cx, symbol).push_static(" = ").push_bytes(&cx, self.initializer(&cx, data.ty, data.init)).push_static(";").save(&cx)
     }
@@ -1167,19 +1144,18 @@ impl Backend['k] {
                     }
                     i = i + 1usize;
                 }
-                return if length != 0u64 { Buffer::new().push_static("{ { ").push_bytes(&cx, values.join(&cx, ", ")).push_static(" } }").save(&cx) } else { Span::from_static(&cx, "{ 0 }") };
+                return Buffer::new().push_static("{ { ").push_bytes(&cx, values.join(&cx, ", ")).push_static(" } }").save(&cx);
             },
             _ => (),
         };
-        if self.is_unit(&cx, ty) {
-            return Span::from_static(&cx, "{ 0 }");
-        }
         let rows = self.members(&cx, s);
         let parts: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < rows.len(&cx) && i < form.len(&cx) {
             let (_m, f) = rows.at(&cx, i);
-            parts.push(&cx, self.initializer(&cx, f, form.at(&cx, i)));
+            if !self.erased(&cx, f) {
+                parts.push(&cx, self.initializer(&cx, f, form.at(&cx, i)));
+            }
             i = i + 1usize;
         }
         Buffer::new().push_static("{ ").push_bytes(&cx, parts.join(&cx, ", ")).push_static(" }").save(&cx)
@@ -1243,21 +1219,25 @@ impl Backend['k] {
         var p = 0usize;
         while p < entry.params.len(&cx) {
             let binding = entry.params.at(&cx, p);
-            let cname = self.cname(&cx, entry.label, binding.name);
+            let ctype = self.c(&cx, self.substitute_type(&cx, binding.type));
             let place = binding.name.starts_with(&cx, Span::from_static(&cx, "&"));
-            if place {
-                place_c.insert(&cx, binding.name, Buffer::new().push_static("(*").push_bytes(&cx, cname).push_static(")").save(&cx));
+            if ctype.is(&cx, "void") {
+                cparams.push(&cx, CParam.{ ctype, cname: Span::from_static(&cx, ""), place });
+            } else {
+                let cname = self.cname(&cx, entry.label, binding.name);
+                if place {
+                    place_c.insert(&cx, binding.name, Buffer::new().push_static("(*").push_bytes(&cx, cname).push_static(")").save(&cx));
+                }
+                cparams.push(&cx, CParam.{ ctype, cname, place });
             }
-            cparams.push(&cx, CParam.{ ctype: self.c(&cx, self.substitute_type(&cx, binding.type)), cname, place });
             p = p + 1usize;
         }
         let ret_type = self.substitute_type(&cx, fun.ret);
-        let ret = if is_never(ret_type) { Span::from_static(&cx, "void") } else { self.c(&cx, ret_type) };
-        let unit = self.heads.insert(&cx, symbol, (ret, cparams));
+        let unit = self.heads.insert(&cx, symbol, (self.c(&cx, ret_type), is_never(ret_type), cparams));
         var l = 0usize;
         while l < fun.locals.len(&cx) {
             let binding = fun.locals.at(&cx, l);
-            if !plan.forwarded.contains(&cx, binding.name) {
+            if !plan.forwarded.contains(&cx, binding.name) && !self.erased(&cx, self.substitute_type(&cx, binding.type)) {
                 let cname = allocate(&cx, Buffer::new().push_static("p_").push_bytes(&cx, self.readable(&cx, binding.name)).save(&cx), self.taken);
                 place_c.insert(&cx, binding.name, cname);
                 decls.push(&cx, Buffer::new().push_bytes(&cx, self.c(&cx, self.substitute_type(&cx, binding.type))).push_static(" ").push_bytes(&cx, cname).push_static(";").save(&cx));
@@ -1297,7 +1277,7 @@ impl Backend['k] {
                     q = q + 1usize;
                 }
             }
-            if !parameter && !is_never(self.substitute_type(&cx, ty)) {
+            if !parameter && !self.erased(&cx, self.substitute_type(&cx, ty)) {
                 values.push(&cx, (label, name, ty, self.cname(&cx, label, name)));
             }
             v = v + 1usize;
@@ -1351,25 +1331,27 @@ impl Backend['k] {
 
     // A function's head, with its place parameters qualified as `qualifiers` allows.
     fn head(self, &cx: Domain!['k], symbol: Span['k], const_params: ArenaSet[(Span['k], usize), 'k], restrict_params: ArenaSet[(Span['k], usize), 'k]) -> Span['k] {
-        let (ret, cparams) = self.heads.at(&cx, symbol);
+        let (ret, noreturn, cparams) = self.heads.at(&cx, symbol);
         let params: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         var k = 0usize;
         while k < cparams.len(&cx) {
             let cp = cparams.at(&cx, k);
-            var t = Buffer::new().push_bytes(&cx, cp.ctype);
-            if cp.place {
-                if const_params.contains(&cx, (symbol, k)) {
-                    t = t.push_static(" const");
+            if !cp.ctype.is(&cx, "void") {
+                var t = Buffer::new().push_bytes(&cx, cp.ctype);
+                if cp.place {
+                    if const_params.contains(&cx, (symbol, k)) {
+                        t = t.push_static(" const");
+                    }
+                    t = t.push_static("*");
+                    if restrict_params.contains(&cx, (symbol, k)) {
+                        t = t.push_static(" restrict");
+                    }
                 }
-                t = t.push_static("*");
-                if restrict_params.contains(&cx, (symbol, k)) {
-                    t = t.push_static(" restrict");
-                }
+                params.push(&cx, t.push_static(" ").push_bytes(&cx, cp.cname).save(&cx));
             }
-            params.push(&cx, t.push_static(" ").push_bytes(&cx, cp.cname).save(&cx));
             k = k + 1usize;
         }
-        Buffer::new().push_static(if ret.is(&cx, "void") { "_Noreturn " } else { "" }).push_static("static ").push_bytes(&cx, ret).push_static(" ").push_bytes(&cx, symbol)
+        Buffer::new().push_static(if noreturn { "_Noreturn " } else { "" }).push_static("static ").push_bytes(&cx, ret).push_static(" ").push_bytes(&cx, symbol)
             .push_static("(").push_bytes(&cx, or_void(&cx, params.join(&cx, ", "))).push_static(")").save(&cx)
     }
 
@@ -1425,7 +1407,7 @@ impl Backend['k] {
     // The C lvalue and type of a place path.
     fn place(self, &cx: Domain!['k], path: Span['k]) -> (Span['k], Type['k]) {
         let parts = path.split(&cx, Span::from_static(&cx, "."));
-        var expr = self.place_c.copy(&cx).at(&cx, parts.at(&cx, 0usize));
+        var expr = self.place_c.copy(&cx).get_or(&cx, parts.at(&cx, 0usize), Span::from_static(&cx, ""));
         var ty = self.roots.copy(&cx).at(&cx, parts.at(&cx, 0usize));
         var i = 1usize;
         while i < parts.len(&cx) {
@@ -1506,22 +1488,25 @@ impl Backend['k] {
     fn instr(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k]) {
         let op = instr.op;
         let a = instr.args;
+        // A pure instruction is written when the C reads one of its results: one that is live and not
+        // of a zero-size type (so never `static_brand`, `fresh`, nor `pack` and `open` of a place).
         if is_pure(&cx, op) {
-            var any_live = false;
+            var read = false;
             var l = 0usize;
-            while l < instr.lhs.len(&cx) {
-                if self.is_live(&cx, instr.lhs.at(&cx, l)) {
-                    any_live = true;
-                }
+            while !read && l < instr.lhs.len(&cx) {
+                let name = instr.lhs.at(&cx, l);
+                read = self.is_live(&cx, name) && !self.erased(&cx, self.type_of(&cx, name));
                 l = l + 1usize;
             }
-            if !any_live {
+            if !read {
                 return;
             }
         }
-        let dst = if instr.lhs.len(&cx) == 1usize { Option::Some.(self.value_name(&cx, instr.lhs.at(&cx, 0usize))) } else { Option::None };
-        // A unit result the C does not assign: one nothing reads.
-        let unit_dst = if instr.lhs.len(&cx) == 1usize && self.is_live(&cx, instr.lhs.at(&cx, 0usize)) { dst } else { Option::None };
+        let dst = if instr.lhs.len(&cx) == 1usize && !self.erased(&cx, self.type_of(&cx, instr.lhs.at(&cx, 0usize))) {
+            Option::Some.(self.value_name(&cx, instr.lhs.at(&cx, 0usize)))
+        } else {
+            Option::None
+        };
         let plan = self.the_plan(&cx);
         // `None` where an instruction without one result would name it, as the f-strings print it.
         let d = match dst {
@@ -1539,17 +1524,11 @@ impl Backend['k] {
         } else if op.is(&cx, "load") && plan.forwarded.contains(&cx, a.at(&cx, 0usize)) {
             let unit = self.aliases.copy(&cx).insert(&cx, (self.label.copy(&cx), instr.lhs.at(&cx, 0usize)), self.forwards.copy(&cx).at(&cx, a.at(&cx, 0usize)));
         } else if op.is(&cx, "store") && plan.forwarded.contains(&cx, a.at(&cx, 0usize)) {
-            let unit = self.forwards.copy(&cx).insert(&cx, a.at(&cx, 0usize), self.value_name(&cx, a.at(&cx, 1usize)));
-            self.unit(&cx, &lines, unit_dst);
-        } else if op.is(&cx, "construct") {
-            let ty = self.type_operand(&cx, instr);
-            let values: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
-            var i = 0usize;
-            while i < a.len(&cx) {
-                values.push(&cx, self.value_name(&cx, a.at(&cx, i)));
-                i = i + 1usize;
+            if !self.erased(&cx, self.type_of(&cx, a.at(&cx, 1usize))) {
+                let unit = self.forwards.copy(&cx).insert(&cx, a.at(&cx, 0usize), self.value_name(&cx, a.at(&cx, 1usize)));
             }
-            self.construct(&cx, &lines, d, ty, values);
+        } else if op.is(&cx, "construct") {
+            self.construct(&cx, &lines, d, self.type_operand(&cx, instr), a);
         } else if op.is(&cx, "destruct") {
             self.destruct(&cx, &lines, instr);
         } else if op.is(&cx, "construct_variant") {
@@ -1567,8 +1546,10 @@ impl Backend['k] {
                     index = index + 1usize;
                 }
             }
-            let member = self.variant(&cx, lit);
-            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(".payload.").push_bytes(&cx, member).push_static(" = ").push_bytes(&cx, self.value_name(&cx, a.at(&cx, 0usize))).push_static(";"));
+            if !self.erased(&cx, variants.at(&cx, index).type) {
+                let member = self.variant(&cx, lit);
+                line(&lines, Buffer::new().push_bytes(&cx, d).push_static(".payload.").push_bytes(&cx, member).push_static(" = ").push_bytes(&cx, self.value_name(&cx, a.at(&cx, 0usize))).push_static(";"));
+            }
             line(&lines, Buffer::new().push_bytes(&cx, d).push_static(".tag = ").push_usize(index).push_static(";"));
         } else if op.is(&cx, "variant_tag") {
             let source = if a.at(&cx, 0usize).starts_with(&cx, Span::from_static(&cx, "&")) {
@@ -1582,6 +1563,8 @@ impl Backend['k] {
             let value = self.value_name(&cx, a.at(&cx, 0usize));
             line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, self.convert(&cx, value, self.type_operand(&cx, instr))).push_static(";"));
         } else if op.is(&cx, "builtin::unsafe::cast") {
+            self.has_memory_form(&cx, self.type_of(&cx, a.at(&cx, 0usize)), instr);
+            self.has_memory_form(&cx, self.type_operand(&cx, instr), instr);
             let value = self.value_name(&cx, a.at(&cx, 0usize));
             let src = self.type_of(&cx, a.at(&cx, 0usize));
             self.cast(&cx, &lines, d, value, src, self.type_operand(&cx, instr));
@@ -1599,7 +1582,7 @@ impl Backend['k] {
             let (key, fun, sub) = self.resolve_trait(&cx, a.at(&cx, 0usize), a.at(&cx, 1usize), tys);
             let symbol = self.request(&cx, key, fun, sub);
             self.lend(&cx, Option::Some.(symbol), a.skip(&cx, 2usize));
-            self.emit_call(&cx, &lines, instr, symbol, fun.ret, sub, a.skip(&cx, 2usize), false);
+            self.emit_call(&cx, &lines, instr, symbol, fun.ret, sub, a.skip(&cx, 2usize));
         } else if op.is(&cx, "fn") {
             line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, self.function_address(&cx, instr)).push_static(";"));
         } else if op.is(&cx, "alloca") {
@@ -1607,18 +1590,16 @@ impl Backend['k] {
             let ct = self.c(&cx, self.type_operand(&cx, instr));
             line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = (").push_bytes(&cx, ct).push_static("*)__builtin_alloca(sizeof(").push_bytes(&cx, ct).push_static("));"));
         } else if op.is(&cx, "builtin::sizeof") {
-            self.has_memory_form(&cx, self.type_operand(&cx, instr), instr);
-            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = (uint64_t)sizeof(").push_bytes(&cx, self.c(&cx, self.type_operand(&cx, instr))).push_static(");"));
+            let ct = self.c(&cx, self.type_operand(&cx, instr));
+            if ct.is(&cx, "void") {
+                line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = UINT64_C(0);"));
+            } else {
+                line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = (uint64_t)sizeof(").push_bytes(&cx, ct).push_static(");"));
+            }
         } else if op.is(&cx, "data") {
             line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = &").push_bytes(&cx, self.data_symbol(&cx, a.at(&cx, 0usize))).push_static(";"));
-        } else if op.is(&cx, "builtin::unsafe::static_brand") || op.is(&cx, "builtin::fresh") {
-            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(".dummy = 0;"));
         } else if op.is(&cx, "pack") || op.is(&cx, "open") {
-            if a.at(&cx, 0usize).starts_with(&cx, Span::from_static(&cx, "&")) {
-                self.unit(&cx, &lines, dst);
-            } else {
-                line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, self.value_name(&cx, a.at(&cx, 0usize))).push_static(";"));
-            }
+            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, self.value_name(&cx, a.at(&cx, 0usize))).push_static(";"));
         } else if op.is(&cx, "builtin::unsafe::deref") {
             let inner = self.pointee(&cx, self.type_of(&cx, a.at(&cx, 0usize)));
             self.has_memory_form(&cx, inner, instr);
@@ -1634,22 +1615,22 @@ impl Backend['k] {
             let qual = if op.ends_with(&cx, Span::from_static(&cx, "volatile")) { Buffer::new().push_static("(").push_bytes(&cx, self.c(&cx, inner)).push_static(" volatile*)").save(&cx) } else { Span::from_static(&cx, "") };
             let target = self.value_name(&cx, a.at(&cx, 0usize));
             line(&lines, Buffer::new().push_static("*").push_bytes(&cx, qual).push_bytes(&cx, target).push_static(" = ").push_bytes(&cx, self.value_name(&cx, a.at(&cx, 1usize))).push_static(";"));
-            self.unit(&cx, &lines, unit_dst);
         } else if op.starts_with(&cx, Span::from_static(&cx, "builtin::unsafe::atomic_")) {
-            self.atomic(&cx, &lines, instr, dst, unit_dst);
+            self.atomic(&cx, &lines, instr, dst);
         } else if op.is(&cx, "load") {
             let (expr, _ty) = self.place(&cx, a.at(&cx, 0usize));
             line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, expr).push_static(";"));
         } else if op.is(&cx, "store") {
-            match self.param_index(&cx, root(&cx, a.at(&cx, 0usize))) {
-                Option::Some(j) => {
-                    let added = self.written.insert(&cx, (self.symbol.copy(&cx), j));
-                },
-                Option::None => (),
-            };
-            let (expr, _ty) = self.place(&cx, a.at(&cx, 0usize));
-            line(&lines, Buffer::new().push_bytes(&cx, expr).push_static(" = ").push_bytes(&cx, self.value_name(&cx, a.at(&cx, 1usize))).push_static(";"));
-            self.unit(&cx, &lines, unit_dst);
+            let (expr, ty) = self.place(&cx, a.at(&cx, 0usize));
+            if !self.erased(&cx, ty) {
+                match self.param_index(&cx, root(&cx, a.at(&cx, 0usize))) {
+                    Option::Some(j) => {
+                        let added = self.written.insert(&cx, (self.symbol.copy(&cx), j));
+                    },
+                    Option::None => (),
+                };
+                line(&lines, Buffer::new().push_bytes(&cx, expr).push_static(" = ").push_bytes(&cx, self.value_name(&cx, a.at(&cx, 1usize))).push_static(";"));
+            }
         } else if op.is(&cx, "foreach") {
             self.foreach_instr(&cx, &lines, instr, d);
         } else {
@@ -1667,7 +1648,7 @@ impl Backend['k] {
     // The checker's zero-size rule, for types a specialization chose.
     fn has_memory_form(self, &cx: Domain!['k], ty: Type['k], instr: Instr['k]) {
         if self.types.zero_size(&cx, ty) {
-            fail_at(&cx, Span::from_static(&cx, "a zero-size type has no memory form yet"), instr.pos);
+            fail_at(&cx, Span::from_static(&cx, "a zero-size type has no memory form"), instr.pos);
         }
     }
 
@@ -1682,37 +1663,25 @@ impl Backend['k] {
         self.substitute_type(&cx, self.type_operand_raw(&cx, instr))
     }
 
-    fn unit(self, &cx: Domain!['k], &lines: Buffer!, dst: Option[Span['k]]) {
-        match dst {
-            Option::Some(d) => line(&lines, Buffer::new().push_bytes(&cx, d).push_static(".dummy = 0;")),
-            Option::None => (),
-        };
-    }
-
-    fn construct(self, &cx: Domain!['k], &lines: Buffer!, dst: Span['k], ty: Type['k], values: ArenaVec[Span['k], 'k]) {
+    fn construct(self, &cx: Domain!['k], &lines: Buffer!, dst: Span['k], ty: Type['k], args: ArenaVec[Span['k], 'k]) {
         let s = self.shape(&cx, ty);
-        if self.is_unit(&cx, ty) {
-            line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(".dummy = 0;"));
-            return ();
-        }
         match s {
             Type::Array(_elem, length) => {
-                if length == 0u64 {
-                    line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(".dummy = 0;"));
-                }
                 var k = 0u64;
                 while k < length {
-                    let at = if (k as usize) < values.len(&cx) - 1usize { k as usize } else { values.len(&cx) - 1usize };
-                    line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(".items[").push_u64(k).push_static("] = ").push_bytes(&cx, values.at(&cx, at)).push_static(";"));
+                    let at = if (k as usize) < args.len(&cx) - 1usize { k as usize } else { args.len(&cx) - 1usize };
+                    line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(".items[").push_u64(k).push_static("] = ").push_bytes(&cx, self.value_name(&cx, args.at(&cx, at))).push_static(";"));
                     k = k + 1u64;
                 }
             },
             _ => {
                 let rows = self.members(&cx, s);
                 var i = 0usize;
-                while i < rows.len(&cx) && i < values.len(&cx) {
-                    let (m, _t) = rows.at(&cx, i);
-                    line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(".").push_bytes(&cx, m).push_static(" = ").push_bytes(&cx, values.at(&cx, i)).push_static(";"));
+                while i < rows.len(&cx) && i < args.len(&cx) {
+                    let (m, t) = rows.at(&cx, i);
+                    if !self.erased(&cx, t) {
+                        line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(".").push_bytes(&cx, m).push_static(" = ").push_bytes(&cx, self.value_name(&cx, args.at(&cx, i))).push_static(";"));
+                    }
                     i = i + 1usize;
                 }
             },
@@ -1735,17 +1704,23 @@ impl Backend['k] {
         };
         let s = self.shape(&cx, component_type);
         let access = match s {
-            Type::Array(_elem, length) => items_access(&cx, length as usize),
-            _ => if !self.is_unit(&cx, component_type) { member_names(&cx, self.members(&cx, s)) } else { ArenaVec::new(&cx) },
+            Type::Array(elem, length) => items_of(&cx, length as usize, elem.copy(&cx)),
+            _ => self.members(&cx, s),
         };
         var i = 0usize;
         while i < instr.lhs.len(&cx) && i < access.len(&cx) {
-            let name = self.value_name(&cx, instr.lhs.at(&cx, i));
-            if !self.is_live(&cx, instr.lhs.at(&cx, i)) {
-            } else if pointer {
-                line(&lines, Buffer::new().push_bytes(&cx, name).push_static(" = KUR_FIELD(").push_bytes(&cx, source).push_static(", ").push_bytes(&cx, access.at(&cx, i)).push_static(");"));
-            } else {
-                line(&lines, Buffer::new().push_bytes(&cx, name).push_static(" = ").push_bytes(&cx, source).push_static(".").push_bytes(&cx, access.at(&cx, i)).push_static(";"));
+            let lhs = instr.lhs.at(&cx, i);
+            let (member, t) = access.at(&cx, i);
+            if self.is_live(&cx, lhs) && !self.erased(&cx, self.type_of(&cx, lhs)) {
+                let name = self.value_name(&cx, lhs);
+                // A pointer to a zero-size component is the pointer to the whole: they may share an address.
+                if pointer && self.erased(&cx, t) {
+                    line(&lines, Buffer::new().push_bytes(&cx, name).push_static(" = (void*)").push_bytes(&cx, source).push_static(";"));
+                } else if pointer {
+                    line(&lines, Buffer::new().push_bytes(&cx, name).push_static(" = KUR_FIELD(").push_bytes(&cx, source).push_static(", ").push_bytes(&cx, member).push_static(");"));
+                } else {
+                    line(&lines, Buffer::new().push_bytes(&cx, name).push_static(" = ").push_bytes(&cx, source).push_static(".").push_bytes(&cx, member).push_static(";"));
+                }
             }
             i = i + 1usize;
         }
@@ -1768,9 +1743,6 @@ impl Backend['k] {
         let s = self.shape(&cx, src);
         let d = self.shape(&cx, dst_ty);
         let cd = self.c(&cx, dst_ty);
-        if is_never(s) || is_never(d) {
-            fail_text(&cx, Span::from_static(&cx, "backend cast does not support a never representation"));
-        }
         if is_ptr(s) || is_ptr(d) {
             let s_int = match s {
                 Type::Prim(n) => C::is_integer(&cx, n),
@@ -1890,13 +1862,13 @@ impl Backend['k] {
                 _ => fail_text(&cx, Span::from_static(&cx, "internal error: a call of a value that is not a function")),
             };
             self.lend(&cx, Option::None, instr.args.skip(&cx, 1usize));
-            self.emit_call(&cx, &lines, instr, self.value_name(&cx, callee), ret, ArenaMap::new(&cx), instr.args.skip(&cx, 1usize), false);
+            self.emit_call(&cx, &lines, instr, self.value_name(&cx, callee), ret, ArenaMap::new(&cx), instr.args.skip(&cx, 1usize));
         } else if self.program.externs.contains(&cx, callee) {
             let ret = match self.program.externs.at(&cx, callee).ret {
                 Option::Some(r) => r,
                 Option::None => fail_text(&cx, Span::from_static(&cx, "internal error: an extern without a type")),
             };
-            self.emit_call(&cx, &lines, instr, callee, ret, ArenaMap::new(&cx), instr.args.skip(&cx, 1usize), true);
+            self.emit_call(&cx, &lines, instr, callee, ret, ArenaMap::new(&cx), instr.args.skip(&cx, 1usize));
         } else {
             let fun = self.program.funs.at(&cx, callee);
             let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
@@ -1907,33 +1879,33 @@ impl Backend['k] {
             }
             let symbol = self.request(&cx, FunKey::Function.(callee), fun, sub);
             self.lend(&cx, Option::Some.(symbol), instr.args.skip(&cx, 1usize));
-            self.emit_call(&cx, &lines, instr, symbol, fun.ret, sub, instr.args.skip(&cx, 1usize), false);
+            self.emit_call(&cx, &lines, instr, symbol, fun.ret, sub, instr.args.skip(&cx, 1usize));
         }
     }
 
-    fn emit_call(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k], callee: Span['k], ret: Type['k], sub: ArenaMap[Span['k], Type['k], 'k], args: ArenaVec[Span['k], 'k], foreign: bool) {
-        let operands: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+    // The C arguments of a call: those that pass something.
+    fn operands(self, &cx: Domain!['k], args: ArenaVec[Span['k], 'k]) -> Span['k] {
+        let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < args.len(&cx) {
-            operands.push(&cx, self.operand(&cx, args.at(&cx, i)));
+            if !self.erased_arg(&cx, args.at(&cx, i)) {
+                out.push(&cx, self.operand(&cx, args.at(&cx, i)));
+            }
             i = i + 1usize;
         }
-        let call = Buffer::new().push_bytes(&cx, callee).push_static("(").push_bytes(&cx, operands.join(&cx, ", ")).push_static(")").save(&cx);
-        let ret = subst(&cx, ret, sub, self.counter);
-        let dst = self.value_name(&cx, instr.lhs.at(&cx, 0usize));
-        if is_never(ret) {
+        out.join(&cx, ", ")
+    }
+
+    fn emit_call(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k], callee: Span['k], ret: Type['k], sub: ArenaMap[Span['k], Type['k], 'k], args: ArenaVec[Span['k], 'k]) {
+        let call = Buffer::new().push_bytes(&cx, callee).push_static("(").push_bytes(&cx, self.operands(&cx, args)).push_static(")").save(&cx);
+        if self.erased(&cx, subst(&cx, ret, sub, self.counter)) || !self.is_live(&cx, instr.lhs.at(&cx, 0usize)) {
             line(&lines, Buffer::new().push_bytes(&cx, call).push_static(";"));
-        } else if !self.is_live(&cx, instr.lhs.at(&cx, 0usize)) {
-            line(&lines, Buffer::new().push_bytes(&cx, call).push_static(";"));
-        } else if foreign && self.is_unit(&cx, ret) {
-            line(&lines, Buffer::new().push_bytes(&cx, call).push_static(";"));
-            line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(".dummy = 0;"));
         } else {
-            line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = ").push_bytes(&cx, call).push_static(";"));
+            line(&lines, Buffer::new().push_bytes(&cx, self.value_name(&cx, instr.lhs.at(&cx, 0usize))).push_static(" = ").push_bytes(&cx, call).push_static(";"));
         }
     }
 
-    fn atomic(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k], dst: Option[Span['k]], unit_dst: Option[Span['k]]) {
+    fn atomic(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k], dst: Option[Span['k]]) {
         let order = match instr.lit {
             Option::Some(o) => o,
             Option::None => fail_text(&cx, Span::from_static(&cx, "internal error: an atomic operation without its ordering")),
@@ -1963,12 +1935,10 @@ impl Backend['k] {
         }
         if kind.is(&cx, "fence") {
             line(&lines, Buffer::new().push_static("__atomic_thread_fence(").push_bytes(&cx, c_order(&cx, order)).push_static(");"));
-            self.unit(&cx, &lines, unit_dst);
         } else if kind.is(&cx, "load") {
             line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = __atomic_load_n(").push_bytes(&cx, args.at(&cx, 0usize)).push_static(", ").push_bytes(&cx, c_order(&cx, order)).push_static(");"));
         } else if kind.is(&cx, "store") {
             line(&lines, Buffer::new().push_static("__atomic_store_n(").push_bytes(&cx, args.at(&cx, 0usize)).push_static(", ").push_bytes(&cx, args.at(&cx, 1usize)).push_static(", ").push_bytes(&cx, c_order(&cx, order)).push_static(");"));
-            self.unit(&cx, &lines, unit_dst);
         } else if kind.is(&cx, "swap") {
             line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = __atomic_exchange_n(").push_bytes(&cx, args.at(&cx, 0usize)).push_static(", ").push_bytes(&cx, args.at(&cx, 1usize)).push_static(", ")
                 .push_bytes(&cx, c_order(&cx, order)).push_static(");"));
@@ -1995,7 +1965,7 @@ impl Backend['k] {
             Option::None => fail_text(&cx, Span::from_static(&cx, "internal error: a foreach without its type")),
         };
         let (t, renamed) = subst_foreach(&cx, original, self.sub.copy(&cx), self.counter);
-        let source = self.value_name(&cx, instr.args.at(&cx, 0usize));
+        let source = if self.erased(&cx, self.type_of(&cx, instr.args.at(&cx, 0usize))) { Span::from_static(&cx, "") } else { self.value_name(&cx, instr.args.at(&cx, 0usize)) };
         let mapper_name = instr.args.at(&cx, 1usize);
         let mapper = self.program.funs.at(&cx, mapper_name);
         let binders: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
@@ -2030,44 +2000,59 @@ impl Backend['k] {
         let caps: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         var c = 2usize;
         while c < instr.args.len(&cx) {
-            caps.push(&cx, self.value_name(&cx, instr.args.at(&cx, c)));
+            if !self.erased(&cx, self.type_of(&cx, instr.args.at(&cx, c))) {
+                caps.push(&cx, self.value_name(&cx, instr.args.at(&cx, c)));
+            }
             c = c + 1usize;
         }
         let found = self.types.rows(&cx, t.source.copy(&cx), Option::None, false);
         let rows = found.rows;
         let pointer = is_ptr(self.shape(&cx, t.source.copy(&cx))) && !is_foreach(t.source.copy(&cx));
         let out_shape = self.shape(&cx, Type::Foreach.(t));
-        let walk = Walk.{ backend: self, t, mapper, mapper_name, binders, own, caps };
+        let walk = Walk.{ backend: self, t, mapper, mapper_name, binders, own, caps, pointer };
+        match found.skeleton {
+            Option::Some(skeleton) => match skeleton {
+                Type::Enum(_variants) => {
+                    let results = match out_shape {
+                        Type::Enum(variants) => variants,
+                        _ => fail_text(&cx, Span::from_static(&cx, "internal error: a foreach over an enum that makes no enum")),
+                    };
+                    line(&lines, Buffer::new().push_static("switch (").push_bytes(&cx, source).push_static(".tag) {"));
+                    var k = 0usize;
+                    while k < rows.len(&cx) && k < results.len(&cx) {
+                        let row = rows.at(&cx, k);
+                        let member = self.variant(&cx, row.label);
+                        let target = Buffer::new().push_bytes(&cx, dst).push_static(".payload.").push_bytes(&cx, member).save(&cx);
+                        let applied = walk.apply(&cx, row, Buffer::new().push_bytes(&cx, source).push_static(".payload.").push_bytes(&cx, member).save(&cx));
+                        line(&lines, Buffer::new().push_static("case ").push_usize(k).push_static(": ").push_bytes(&cx, self.assign_result(&cx, target, results.at(&cx, k).type, applied))
+                            .push_static(" ").push_bytes(&cx, dst).push_static(".tag = ").push_usize(k).push_static("; break;"));
+                        k = k + 1usize;
+                    }
+                    line(&lines, Buffer::new().push_static("default: KUR_TRAP();\n  }"));
+                    return ();
+                },
+                _ => (),
+            },
+            Option::None => (),
+        };
+        let out = match out_shape {
+            Type::Array(elem, _length) => items_of(&cx, rows.len(&cx), elem.copy(&cx)),
+            _ => self.members(&cx, out_shape),
+        };
         let skeleton = match found.skeleton {
             Option::Some(s) => s,
             Option::None => {
                 let component = if is_foreach(t.source.copy(&cx)) { Buffer::new().push_bytes(&cx, source).push_static(".e0").save(&cx) } else { source };
-                line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(".e0 = ").push_bytes(&cx, walk.apply(&cx, rows.at(&cx, 0usize), component)).push_static(";"));
+                let (member, result) = out.at(&cx, 0usize);
+                let applied = walk.apply(&cx, rows.at(&cx, 0usize), component);
+                line(&lines, Buffer::new().push_bytes(&cx, self.assign_result(&cx, Buffer::new().push_bytes(&cx, dst).push_static(".").push_bytes(&cx, member).save(&cx), result, applied)));
                 return ();
             },
         };
-        let unit = match skeleton {
-            Type::Enum(_variants) => {
-                line(&lines, Buffer::new().push_static("switch (").push_bytes(&cx, source).push_static(".tag) {"));
-                var k = 0usize;
-                while k < rows.len(&cx) {
-                    let row = rows.at(&cx, k);
-                    let member = self.variant(&cx, row.label);
-                    let applied = walk.apply(&cx, row, Buffer::new().push_bytes(&cx, source).push_static(".payload.").push_bytes(&cx, member).save(&cx));
-                    line(&lines, Buffer::new().push_static("case ").push_usize(k).push_static(": ").push_bytes(&cx, dst).push_static(".payload.").push_bytes(&cx, member).push_static(" = ").push_bytes(&cx, applied)
-                        .push_static("; ").push_bytes(&cx, dst).push_static(".tag = ").push_usize(k).push_static("; break;"));
-                    k = k + 1usize;
-                }
-                line(&lines, Buffer::new().push_static("default: KUR_TRAP();\n  }"));
-                return ();
-            },
-            _ => (),
+        var source_access = match skeleton {
+            Type::Array(_elem, _length) => items_access(&cx, rows.len(&cx)),
+            _ => member_names(&cx, self.members(&cx, skeleton)),
         };
-        let (src_access, dst_access) = match skeleton {
-            Type::Array(_elem, _length) => (items_access(&cx, rows.len(&cx)), items_access(&cx, rows.len(&cx))),
-            _ => (member_names(&cx, self.members(&cx, skeleton)), member_names(&cx, self.members(&cx, out_shape))),
-        };
-        var source_access = src_access;
         if is_foreach(t.source.copy(&cx)) {
             let inner_shape = self.shape(&cx, t.source.copy(&cx));
             source_access = match inner_shape {
@@ -2076,18 +2061,29 @@ impl Backend['k] {
             };
         }
         var k = 0usize;
-        while k < rows.len(&cx) && k < source_access.len(&cx) && k < dst_access.len(&cx) {
-            let component = if pointer {
+        while k < rows.len(&cx) && k < source_access.len(&cx) && k < out.len(&cx) {
+            let row = rows.at(&cx, k);
+            // A pointer to a zero-size component is the pointer to the whole, as `destruct` makes it.
+            let component = if pointer && self.erased(&cx, row.item) {
+                Buffer::new().push_static("(void*)").push_bytes(&cx, source).save(&cx)
+            } else if pointer {
                 Buffer::new().push_static("KUR_FIELD(").push_bytes(&cx, source).push_static(", ").push_bytes(&cx, source_access.at(&cx, k)).push_static(")").save(&cx)
             } else {
                 Buffer::new().push_bytes(&cx, source).push_static(".").push_bytes(&cx, source_access.at(&cx, k)).save(&cx)
             };
-            let applied = walk.apply(&cx, rows.at(&cx, k), component);
-            line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(".").push_bytes(&cx, dst_access.at(&cx, k)).push_static(" = ").push_bytes(&cx, applied).push_static(";"));
+            let (member, result) = out.at(&cx, k);
+            let applied = walk.apply(&cx, row, component);
+            line(&lines, Buffer::new().push_bytes(&cx, self.assign_result(&cx, Buffer::new().push_bytes(&cx, dst).push_static(".").push_bytes(&cx, member).save(&cx), result, applied)));
             k = k + 1usize;
         }
-        if rows.is_empty(&cx) {
-            line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(".dummy = 0;"));
+    }
+
+    // `target = call;`, or the call alone for a result of a zero-size type.
+    fn assign_result(self, &cx: Domain!['k], target: Span['k], result: Type['k], call: Span['k]) -> Span['k] {
+        if self.erased(&cx, result) {
+            Buffer::new().push_bytes(&cx, call).push_static(";").save(&cx)
+        } else {
+            Buffer::new().push_bytes(&cx, target).push_static(" = ").push_bytes(&cx, call).push_static(";").save(&cx)
         }
     }
 
@@ -2095,7 +2091,11 @@ impl Backend['k] {
 
     fn term(self, &cx: Domain!['k], &lines: Buffer!, term: Terminator['k]) {
         match term {
-            Terminator::Ret(value, _pos) => line(&lines, Buffer::new().push_static("return ").push_bytes(&cx, self.value_name(&cx, value)).push_static(";")),
+            Terminator::Ret(value, _pos) => if self.erased(&cx, self.type_of(&cx, value)) {
+                line(&lines, Buffer::new().push_static("return;"));
+            } else {
+                line(&lines, Buffer::new().push_static("return ").push_bytes(&cx, self.value_name(&cx, value)).push_static(";"));
+            },
             Terminator::Jmp(edge, _pos) => self.edge(&cx, &lines, edge, Option::None, Span::from_static(&cx, ""), Span::from_static(&cx, "")),
             Terminator::Jnz(cond, then, other, _pos) => {
                 line(&lines, Buffer::new().push_static("if (").push_bytes(&cx, self.value_name(&cx, cond)).push_static(") {"));
@@ -2110,7 +2110,8 @@ impl Backend['k] {
     }
 
     // A jump assigns the target's live parameters (`source` is the C variable `payload` reads); a jump
-    // to a return join returns the value it passes there.
+    // to a return join returns the value it passes there. A value of a zero-size type is empty: nothing
+    // is assigned or returned.
     fn edge(self, &cx: Domain!['k], &lines: Buffer!, edge: Edge['k], payload: Option[Span['k]], source: Span['k], indent: Span['k]) {
         let plan = self.the_plan(&cx);
         let target = self.blocks.copy(&cx).at(&cx, edge.target);
@@ -2122,14 +2123,23 @@ impl Backend['k] {
         };
         var a = 0usize;
         while a < edge.args.len(&cx) {
-            let value = self.value_name(&cx, edge.args.at(&cx, a));
-            values.push(&cx, (value, value));
+            let arg = edge.args.at(&cx, a);
+            if self.erased(&cx, self.type_of(&cx, arg)) {
+                values.push(&cx, (Span::from_static(&cx, ""), Span::from_static(&cx, "")));
+            } else {
+                let value = self.value_name(&cx, arg);
+                values.push(&cx, (value, value));
+            }
             a = a + 1usize;
         }
         match plan.return_index.get(&cx, target.label) {
             Option::Some(index) => {
                 let (value, _base) = values.at(&cx, index);
-                line(&lines, Buffer::new().push_bytes(&cx, indent).push_static("return ").push_bytes(&cx, value).push_static(";"));
+                if value.is_empty() {
+                    line(&lines, Buffer::new().push_bytes(&cx, indent).push_static("return;"));
+                } else {
+                    line(&lines, Buffer::new().push_bytes(&cx, indent).push_static("return ").push_bytes(&cx, value).push_static(";"));
+                }
                 return;
             },
             Option::None => (),
@@ -2138,8 +2148,8 @@ impl Backend['k] {
         var p = 0usize;
         while p < target.params.len(&cx) && p < values.len(&cx) {
             let binding = target.params.at(&cx, p);
-            if plan.is_live(&cx, target.label, binding.name) {
-                let (value, base) = values.at(&cx, p);
+            let (value, base) = values.at(&cx, p);
+            if !value.is_empty() && plan.is_live(&cx, target.label, binding.name) {
                 moves.push(&cx, Move.{ dst: self.cname(&cx, target.label, binding.name), ty: binding.type, place: false, value, base });
             }
             p = p + 1usize;
@@ -2223,6 +2233,8 @@ impl Backend['k] {
             line(&lines, Buffer::new().push_static("case ").push_usize(index).push_static(":"));
             let payload = if place {
                 Option::None
+            } else if self.erased(&cx, variants.at(&cx, index).type) {
+                Option::Some.(Span::from_static(&cx, ""))
             } else {
                 Option::Some.(Buffer::new().push_bytes(&cx, source).push_static(".payload.").push_bytes(&cx, self.variant(&cx, arm.variant)).save(&cx))
             };
@@ -2243,12 +2255,13 @@ impl Backend['k] {
     }
 
     // Records where each place lent to `callee` lies, for `qualifiers`; `None` for a call through a
-    // function value, whose place parameters are neither `const` nor `restrict`.
+    // function value, whose place parameters are neither `const` nor `restrict`. A place of a zero-size
+    // type passes nothing.
     fn lend(self, &cx: Domain!['k], callee: Option[Span['k]], args: ArenaVec[Span['k], 'k]) {
         var k = 0usize;
         while k < args.len(&cx) {
             let arg = args.at(&cx, k);
-            if arg.starts_with(&cx, Span::from_static(&cx, "&")) {
+            if arg.starts_with(&cx, Span::from_static(&cx, "&")) && !self.erased_arg(&cx, arg) {
                 var kind = Span::from_static(&cx, "local");
                 var j = 0usize;
                 if arg.starts_with(&cx, Span::from_static(&cx, "&*")) {
@@ -2315,13 +2328,15 @@ impl Backend['k] {
             self.lend(&cx, Option::Some.(symbol), args);
             let plan = self.the_plan(&cx);
             let entry = fun.blocks.at(&cx, 0usize);
+            let (_ret, _noreturn, cparams) = self.heads.at(&cx, current);
             let moves: ArenaVec[Move['k], 'k] = ArenaVec::new(&cx);
             var p = 0usize;
-            while p < entry.params.len(&cx) && p < args.len(&cx) {
+            while p < entry.params.len(&cx) && p < args.len(&cx) && p < cparams.len(&cx) {
                 let binding = entry.params.at(&cx, p);
                 let arg = args.at(&cx, p);
                 let place = binding.name.starts_with(&cx, Span::from_static(&cx, "&"));
-                if place && !arg.eq(&cx, binding.name) {
+                if cparams.at(&cx, p).ctype.is(&cx, "void") {
+                } else if place && !arg.eq(&cx, binding.name) {
                     let added = self.looping.insert(&cx, current);
                     let base = if arg.starts_with(&cx, Span::from_static(&cx, "&*")) { self.value_name(&cx, arg.skip(2usize)) } else { self.cname(&cx, entry.label, root(&cx, arg)) };
                     moves.push(&cx, Move.{ dst: self.cname(&cx, entry.label, binding.name), ty: binding.type, place: true, value: self.operand(&cx, arg), base });
@@ -2335,15 +2350,25 @@ impl Backend['k] {
             line(&lines, Buffer::new().push_static("goto ").push_bytes(&cx, self.labels.copy(&cx).at(&cx, entry.label)).push_static(";"));
             return true;
         }
-        let (ret, params) = self.heads.at(&cx, current);
+        let (ret, _noreturn, all_params) = self.heads.at(&cx, current);
         let callee_ret = subst(&cx, fun.ret, sub, self.counter);
         let places = fun.places(&cx);
         let callee_params: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         var t = 0usize;
         while t < fun.ptypes.len(&cx) {
-            callee_params.push(&cx, Buffer::new().push_bytes(&cx, self.c(&cx, subst(&cx, fun.ptypes.at(&cx, t), sub, self.counter)))
-                .push_static(if places.contains(&cx, t) { "*" } else { "" }).save(&cx));
+            let ct = self.c(&cx, subst(&cx, fun.ptypes.at(&cx, t), sub, self.counter));
+            if !ct.is(&cx, "void") {
+                callee_params.push(&cx, Buffer::new().push_bytes(&cx, ct).push_static(if places.contains(&cx, t) { "*" } else { "" }).save(&cx));
+            }
             t = t + 1usize;
+        }
+        let params: ArenaVec[CParam['k], 'k] = ArenaVec::new(&cx);
+        var q = 0usize;
+        while q < all_params.len(&cx) {
+            if !all_params.at(&cx, q).ctype.is(&cx, "void") {
+                params.push(&cx, all_params.at(&cx, q));
+            }
+            q = q + 1usize;
         }
         var same = !is_never(callee_ret) && self.c(&cx, callee_ret).eq(&cx, ret) && callee_params.len(&cx) == params.len(&cx);
         var s = 0usize;
@@ -2366,13 +2391,7 @@ impl Backend['k] {
             return false;
         }
         self.lend(&cx, Option::Some.(symbol), args);
-        let operands: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
-        var o = 0usize;
-        while o < args.len(&cx) {
-            operands.push(&cx, self.operand(&cx, args.at(&cx, o)));
-            o = o + 1usize;
-        }
-        line(&lines, Buffer::new().push_static("KUR_MUSTTAIL return ").push_bytes(&cx, symbol).push_static("(").push_bytes(&cx, operands.join(&cx, ", ")).push_static(");"));
+        line(&lines, Buffer::new().push_static("KUR_MUSTTAIL return ").push_bytes(&cx, symbol).push_static("(").push_bytes(&cx, self.operands(&cx, args)).push_static(");"));
         true
     }
 
@@ -2387,7 +2406,7 @@ impl Backend['k] {
         while h < self.heads.positions(&cx) {
             match self.heads.key_at(&cx, h) {
                 Option::Some(s) => {
-                    let (_ret, params) = self.heads.at(&cx, s);
+                    let (_ret, _noreturn, params) = self.heads.at(&cx, s);
                     var k = 0usize;
                     while k < params.len(&cx) {
                         if params.at(&cx, k).place && !self.address_taken.contains(&cx, s) {
@@ -2458,7 +2477,8 @@ fn last_member(&cx: Domain!['k], members: ArenaVec[Member['k], 'k], name: Span['
 }
 
 // One foreach instruction's mapping of its rows: the transform at the specialization, the mapper,
-// its traversal binders, its own type arguments and the captured values.
+// its traversal binders, its own type arguments, the captured values that pass something, and
+// whether the source is a pointer whose components are pointers.
 forall 'k.
 exposed struct Walk {
     backend: Backend['k],
@@ -2468,6 +2488,7 @@ exposed struct Walk {
     binders: ArenaVec[Span['k], 'k],
     own: ArenaVec[Type['k], 'k],
     caps: ArenaVec[Span['k], 'k],
+    pointer: bool,
 }
 
 forall 'k.
@@ -2485,7 +2506,10 @@ impl Walk['k] {
             sub.insert(&cx, self.mapper.params.at(&cx, j).name, self.own.at(&cx, j - self.binders.len(&cx)));
             j = j + 1usize;
         }
-        let arguments = ArenaVec::one(&cx, component);
+        let arguments: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        if self.pointer || !self.backend.erased(&cx, row.item) {
+            arguments.push(&cx, component);
+        }
         arguments.append(&cx, self.caps);
         Buffer::new().push_bytes(&cx, self.backend.request(&cx, FunKey::Function.(self.mapper_name), self.mapper, sub)).push_static("(").push_bytes(&cx, arguments.join(&cx, ", ")).push_static(")").save(&cx)
     }

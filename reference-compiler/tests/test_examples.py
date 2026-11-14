@@ -148,6 +148,7 @@ RUNS = {
     "thread_sum": (((), "", "", 126),),
     "traits": (((), "", "", 0),),
     "tuple_decl": (((), "", "", 0),),
+    "zero_size": (((), "", "", 0),),
 }
 
 # examples/bad/: each program, and the diagnostic that rejects it.

@@ -88,7 +88,7 @@ class CNameTests(unittest.TestCase):
 
     def test_foreign_names_conflicting_with_c_are_diagnosed(self):
         from kursal.sexpr import KursError
-        for name in ('for', 'not-a-c-name', 'KurUnit', 'kur_dec_i8', 'UINT8_MAX', 'main'):
+        for name in ('for', 'not-a-c-name', 'KUR_FIELD', 'kur_dec_i8', 'UINT8_MAX', 'main'):
             with self.subTest(name=name):
                 program = parse_program('(extern fun ' + name + ' i32 ()) '
                     '(fun entry i32 () (entry () (= %r (const i32 7)) (ret %r)))')

@@ -1,6 +1,5 @@
 #include <stddef.h>
 #include <stdint.h>
-typedef struct { unsigned char dummy; } KurUnit;
 #define KUR_TRAP() __builtin_trap()
 /* A call the C compiler must make a tail call, where it can be told to: Clang's `musttail`. */
 #if defined(__clang__) && defined(__has_attribute)
@@ -65,14 +64,14 @@ static int32_t _ZN4kurs7counter4main17h3c4d00f3096e51d3E(void) {
 
 static uint32_t _ZN4kurs7counter4bump17hb7ec39266b253daeE(K_counter_Counter* restrict entry_counter) {
   uint32_t entry_v2_1;
-  uint32_t entry_v4_1;
-  uint32_t entry_v6_1;
+  uint32_t entry_v4;
+  uint32_t entry_v6;
   uint32_t entry_v8_1;
   L_entry: ;
   entry_v2_1 = (*entry_counter).f_value;
-  entry_v4_1 = UINT64_C(1);
-  entry_v6_1 = (uint32_t)((uint64_t)(entry_v2_1) + (uint64_t)(entry_v4_1));
-  (*entry_counter).f_value = entry_v6_1;
+  entry_v4 = UINT64_C(1);
+  entry_v6 = (uint32_t)((uint64_t)(entry_v2_1) + (uint64_t)(entry_v4));
+  (*entry_counter).f_value = entry_v6;
   entry_v8_1 = (*entry_counter).f_value;
   return entry_v8_1;
 }

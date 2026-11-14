@@ -86,7 +86,7 @@ class LayoutTests(unittest.TestCase):
 
     def test_erased_arguments_and_empty_arrays_do_not_store_their_types(self):
         self.compiles("(type Phantom (forall (T) () u32)) (type A (Phantom A))", C.Named("A"))
-        self.compiles("(type A (array A 0))", C.Named("A"))
+        self.compiles("(type A (array A 0)) (type B (struct (a A) (n u32)))", C.Named("B"))
 
     def test_recursive_aliases_require_an_aggregate_name(self):
         for body in ("A", "(builtin::Pointer A)", "(builtin::Fn () A)"):

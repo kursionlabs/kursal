@@ -297,6 +297,56 @@ while the call runs (by induction on the calls, from the locals). Where the argu
 `const` needs no such argument: it only records that the function's C does not write through the
 pointer, which the checker's place rules let the backend see.
 
+### Zero-size types are erased
+
+A type is zero-size when `zero_size` (`types::ops`, `types.py`) says so: `()`, a brand witness
+(`Brand['k]`), `!`, a struct or tuple whose components are all zero-size (an empty struct, a
+capability such as `Exclusive!['k]`, `(Brand['k], ())`), an array of length 0 or of zero-size
+elements, an `exists` whose body is, and a `foreach` whose expansion is. An enum never is: its tag
+has bytes. A type parameter is answered at each specialization, after brands are erased.
+
+Such a type has no C representation. Its C type is `void` (`erased` asks), and:
+
+- no struct or tuple member has it, an enum's payload union has no member for it (an enum whose
+  payloads are all zero-size is `struct { uint32_t tag; }`), and no array has it as elements (the
+  array is zero-size itself);
+- no C variable has it: an SSA value, a block parameter or a local place of one has none, a pure
+  instruction whose results are all of one is not written (constructing, destructuring, copying,
+  loading, `pack`, `open`, `fresh`, `static_brand`), a store of one writes nothing and does not make
+  the place parameter it stores under non-`const`, and an edge or a self tail call assigns nothing
+  for it;
+- a function returning one returns `void` (`return;`), and a parameter of one, by value or by place,
+  is not in its C parameters nor in the arguments of any call, direct, through a function value,
+  foreign, a tail call or a `foreach` mapper's; a call whose result is one is a statement;
+- a pointer to one is a `void*`; destructuring a pointer gives a pointer to a zero-size component
+  the address of the whole (`(void*)p`), since zero-size objects may share an address;
+- `sizeof` of one is `UINT64_C(0)`, and the sizes C gives the types holding one leave it out, so
+  `sizeof[(u64, Exclusive!['k])]()` is `sizeof[u64]()`;
+- the one C object a zero-size type gets is a `data` of it (an empty string's bytes, `[u8; 0]`),
+  whose address the program can observe and compare with null: a `static char`.
+
+There is no `KurUnit` and no adapter for foreign functions returning `()`: a foreign `void`
+function is its own function pointer. A function that takes and returns only zero-size values is
+`static void f(void)`, and a call of it still runs it.
+
+The language keeps its zero-size types out of memory, so erasing them never changes what a
+program reads or writes. `alloca`, the unsafe loads and stores (volatile or not), unsafe casts from
+or to one, extern parameters and extern values reject a zero-size type
+(`zero_size_type_has_no_memory_form`), and so does the backend where a specialization chooses one
+(`a zero-size type has no memory form`). So `Ref::new(&cx, ())`, `ArenaVec[(), 'k]` and a
+`Vec![Marker]` do not build: they read and write their elements through pointers; an element that
+holds a zero-size part beside bytes (`ArenaVec[(Marker, u32), 'k]`) does. `sizeof` is the one
+operation that observes a zero-size type, and it is 0; the arithmetic the standard library does
+with sizes is defined at 0 (`checked_mul` does not divide by it, `bump_chunk` reserves no bytes and
+returns the current address, `HeapAllocator::alloc(0)` asks `malloc` for one byte so that it is
+never null).
+
+Two zero-size objects may share an address, with each other and with what holds them. Nothing relies on distinct addresses for zero-size data: the identities the
+compiler and the standard library compare (`Ref::address`, `ArenaVec::address` and
+`ArenaMap::address`, which `Meta::id`, `fun_key` and the checker's copy cache use, and `Span`'s
+equal-address shortcut) are addresses of headers and states that have bytes, and a `Ref` to a
+zero-size value cannot be read, so it cannot be built by `Ref::new`.
+
 ### The C compiler
 
 `kursal build` compiles the C with `$KURSAL_CC`, else `clang`, with `-O3 -w -fno-builtin`, and so do
@@ -374,8 +424,9 @@ These are the places where Kursal differs from what one might expect.
   takes it as its last argument (`ArenaVec[Span['k], 'k]`). A brand is minted by a constructor that
   returns `exists 'k. ...` and is opened by `let exists 'k. cx = Domain::new();`; a trait may take one
   as a parameter (`forall D, 'k. trait Discharge`, `instance Discharge[Checker['k], 'k]`).
-- **Zero-size types** (`()`, empty structs) have no memory form: no `sizeof`, no storage. Use `bool`
-  as a placeholder value (`ArenaSet` is an `ArenaMap[K, bool]`).
+- **Zero-size types** (`()`, empty structs, brands, capabilities) take no bytes (`sizeof` is 0, see
+  "Zero-size types are erased") and have no memory form: no `Ref`, vec or map stores one as a whole
+  value. Use `bool` as a placeholder value (`ArenaSet` is an `ArenaMap[K, bool]`).
 - **Expressions as statements.** `f(x);` discards a Copy result. A block's value is its last
   expression, without a `;`. `return` is allowed anywhere; a function whose type is `!` (such as
   `fail`) can stand in any expression position.

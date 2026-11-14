@@ -154,15 +154,25 @@ REJECTED = {
         (fun f u32 (Pk) (entry ((&k Pk)) (= %o (open &k.pkg ($o))) (= %r (call g &k))
           (= %c (pack (exists ($h) (tuple u32 (builtin::Brand $h))) $o &k.pkg)) (ret %r)))"""),
 
-    # A zero-size type's memory form is not decided: nothing observes it.
-    "sizeof_unit": ("zero_size_type_has_no_memory_form",
-                    "(fun h usize () (entry () (= %n (builtin::sizeof (tuple))) (ret %n)))"),
+    # A zero-size type is erased: it has no memory form for unsafe memory operations, casts or externs.
     "alloca_empty_array": ("zero_size_type_has_no_memory_form", """
         (fun (unsafe) h u32 () (entry () (= %p (alloca (array u32 0))) (= %r (const u32 0)) (ret %r)))"""),
     "deref_unit": ("zero_size_type_has_no_memory_form", """
         (fun (unsafe) h u32 ((builtin::Pointer (tuple))) (entry ((%p (builtin::Pointer (tuple))))
           (= %v (builtin::unsafe::deref %p)) (= %r (const u32 0)) (ret %r)))"""),
+    "load_volatile_unit": ("zero_size_type_has_no_memory_form", """
+        (fun (unsafe) h u32 ((builtin::Pointer (tuple))) (entry ((%p (builtin::Pointer (tuple))))
+          (= %v (builtin::unsafe::load_volatile %p)) (= %r (const u32 0)) (ret %r)))"""),
+    "store_empty_array": ("zero_size_type_has_no_memory_form", """
+        (fun (unsafe) h u32 ((builtin::Pointer (array u32 0)) (array u32 0))
+          (entry ((%p (builtin::Pointer (array u32 0))) (%v (array u32 0)))
+            (= %u (builtin::unsafe::store %p %v)) (= %r (const u32 0)) (ret %r)))"""),
+    "cast_to_unit": ("zero_size_type_has_no_memory_form", """
+        (fun (unsafe) h (tuple) (u8) (entry ((%x u8)) (= %u (builtin::unsafe::cast %x (tuple))) (ret %u)))"""),
+    "cast_from_unit": ("zero_size_type_has_no_memory_form", """
+        (fun (unsafe) h u8 ((tuple)) (entry ((%u (tuple))) (= %x (builtin::unsafe::cast %u u8)) (ret %x)))"""),
     "extern_unit_parameter": ("zero_size_type_has_no_memory_form", "(extern fun f u32 ((tuple)))"),
+    "extern_unit_value": ("zero_size_type_has_no_memory_form", "(extern value v (tuple (array u8 0)))"),
 
     # Compiler-reserved traits are sealed, and a Copy premise names a parameter.
     "user_exposed_trait": ("trait_name_is_reserved", "(trait builtin::Exposed (T)) (instance builtin::Exposed (u32))"),
@@ -216,8 +226,10 @@ class CoreSoundnessTests(unittest.TestCase):
 class ZeroSizeTests(unittest.TestCase):
     def test_a_specialization_cannot_choose_a_zero_size_type(self):
         from kursal.cgen import emit_c
-        program = parse_program("""(fun size (forall (T) () usize () (entry () (= %n (builtin::sizeof T)) (ret %n))))
-            (fun main i32 () (entry () (= %n (call (size (tuple)))) (= %r (const i32 0)) (ret %r)))""")
+        program = parse_program("""(fun (unsafe) read (forall (T) () T ((builtin::Pointer T))
+              (entry ((%p (builtin::Pointer T))) (= %v (builtin::unsafe::deref %p)) (ret %v))))
+            (fun main i32 () (entry () (= %z (const usize 8)) (unsafe (= %p (builtin::unsafe::cast %z (builtin::Pointer (tuple)))))
+              (unsafe (= %v (call (read (tuple)) %p))) (= %r (const i32 0)) (ret %r)))""")
         with self.assertRaisesRegex(KursError, "zero-size type has no memory form"):
             emit_c(program, check_program(program), "main")
 

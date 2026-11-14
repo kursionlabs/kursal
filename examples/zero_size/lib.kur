@@ -1,0 +1,135 @@
+// Zero-size types: `()`, brands, capabilities such as `Exclusive!`, structs
+// and tuples of nothing else, enums aside (a tag is a byte or more), and arrays
+// of length 0 or of zero-size elements. They have no bytes: `sizeof` of one
+// is 0, a struct holding one is no bigger for it, and passing, returning,
+// storing, matching and keeping them in the arena costs nothing. A check that
+// fails prints its name.
+use std::alloc::arena::Domain;
+use std::cap::Exclusive;
+use std::collections::arena_vec::ArenaVec;
+use std::io::print;
+use std::mem::Ref;
+use std::slice::Slice;
+
+fn check(ok: bool, what: Slice[u8, 'static]) {
+    if !ok {
+        print(1, what);
+        print(1, ": wrong\n");
+    }
+}
+
+exposed struct Marker {}
+
+// A value with its domain's capability and zero-size company: as big as its
+// `value`.
+forall 'k.
+exposed struct Tagged! {
+    tag: Exclusive!['k],
+    unit: (),
+    nothing: [u64; 0],
+    value: u64,
+    marker: Marker,
+}
+
+exposed enum Shape {
+    Empty,
+    Mark(Marker),
+    Pair(Marker, ()),
+    Value(u64),
+}
+
+fn mark() -> Marker {
+    Marker.{}
+}
+
+// Takes and returns nothing that has bytes.
+fn ignore(m: Marker, u: ()) -> () {
+    u
+}
+
+forall T.
+fn same(x: T) -> T {
+    x
+}
+
+fn score(s: Shape) -> u64 {
+    match s {
+        Shape::Empty => 1,
+        Shape::Mark(m) => 2,
+        Shape::Pair(m, u) => 3,
+        Shape::Value(v) => v,
+    }
+}
+
+forall T.
+exposed struct Wrapped {
+    v: T,
+}
+
+forall T.
+fn wrap(x: T) -> Wrapped[T] {
+    Wrapped.{ v: x }
+}
+
+exposed struct Mixed {
+    a: Marker,
+    b: u32,
+    c: (),
+}
+
+// A zero-size place beside one with bytes.
+fn bump(&m: Marker, &n: u64) {
+    m = mark();
+    n = n + 1;
+}
+
+forall 'k.
+fn take(t: Tagged!['k]) -> u64 {
+    let { tag, unit, nothing, value, marker } = t;
+    let done = tag.retire();
+    value
+}
+
+fn main() -> i32 {
+    check(sizeof[()]() == 0 && sizeof[Marker]() == 0 && sizeof[[u64; 0]]() == 0
+        && sizeof[[Marker; 4]]() == 0 && sizeof[(Marker, ())]() == 0, "zero sizes");
+    check(sizeof[(u64, Marker, ())]() == sizeof[u64](), "a tuple's size");
+
+    let exists 'k. (brand, tag) = Exclusive::fresh();
+    check(sizeof[Exclusive!['k]]() == 0 && sizeof[Tagged!['k]]() == sizeof[u64](), "a capability's size");
+    let tagged = Tagged.{ tag, unit: (), nothing: [], value: 40, marker: same(mark()) };
+    check(take(tagged) == 40, "a struct with zero-size fields");
+
+    var m = mark();
+    var n = 1u64;
+    bump(&m, &n);
+    check(n == 2, "a zero-size place parameter");
+
+    let f = ignore;
+    let unit = f(same(m), same(()));
+    let shapes = score(Shape::Empty) + score(Shape::Mark.(m)) + score(Shape::Pair.(m, ())) + score(Shape::Value.(10));
+    check(shapes == 16, "an enum with zero-size payloads");
+
+    let mixed = Mixed.{ a: mark(), b: 5, c: () };
+    let wrapped = foreach f of mixed { (wrap(f), m) };
+    let { a: wa, b: wb, c: wc } = wrapped;
+    let (inner, _marker) = wb;
+    check(inner.v == 5, "a foreach over zero-size components");
+
+    let empty = "";
+    check(empty.len() == 0, "an empty string");
+
+    let exists 'a. cx = Domain::new();
+    let pairs: ArenaVec[(Marker, u32), 'a] = ArenaVec::new(&cx);
+    var i = 0u32;
+    while i < 100 {
+        pairs.push(&cx, (mark(), i));
+        i = i + 1;
+    }
+    let held = Ref::new(&cx, (mark(), 7u32));
+    let (_m, seven) = held.copy(&cx);
+    let (_n, last) = pairs.at(&cx, 99usize);
+    check(seven == 7 && last == 99 && pairs.len(&cx) == 100usize, "arena values with zero-size parts");
+    cx.destroy();
+    0
+}

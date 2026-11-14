@@ -331,6 +331,28 @@ signature". It does not mean "verified correct".**
   than the allocation, and the slice's own bounds check would admit
   out-of-bounds indices.
 
+**Zero sizes.** A zero-size type (`()`, a brand, a capability, an empty
+struct, `[T; 0]`) has size 0 and no memory form: `sizeof[T]()` is `0`, and
+the compiler rejects every load or store of one through a pointer, also
+where a specialization chooses it. So `Arena::alloc`, `alloc_slice`,
+`Ref::new`, `Ref::copy` and the vectors do not build at a zero-size element
+type (one holding a zero-size part beside bytes is ordinary). The size
+arithmetic is still defined at 0, for raw code and for `T`s that only
+compute with their size:
+
+- `alloc::heap::Storage::try_alloc`/`try_grow` (and `alloc`/`grow`) ask
+  `malloc`/`realloc` for one byte where the size is 0, so a block is never
+  null and `realloc` never frees; the `Uninit!` records the requested 0;
+- `checked_mul(n, 0usize)` is 0 without dividing by 0;
+- `alloc::arena`'s `bump_chunk` reserves no bytes for a 0-byte request and
+  returns the current address, so zero-size requests may share an address
+  with each other and with the next allocation.
+
+Identities taken from addresses (`Ref::address`, `ArenaVec::address`,
+`ArenaMap::address`) are of headers that have bytes; two `Ref`s to
+zero-size values, which only `Ref::from_raw` can make, may share an
+address.
+
 **`Option` where a request is merely out of range.** An index past the end
 is an ordinary, recoverable condition:
 

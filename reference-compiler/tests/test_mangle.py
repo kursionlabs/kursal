@@ -82,13 +82,6 @@ class ManglingTests(unittest.TestCase):
         self.assertEqual(len(symbols), 2)
         self.assertTrue(all(re.fullmatch(r'_ZN\w+17h[0-9a-f]{16}E', s) for s in symbols))
 
-    def test_foreign_adapter_is_mangled(self):
-        output = self.run_core('''(extern fun sink (tuple) (i32))
-            (fun main i32 () (entry () (= %f (fn sink)) (= %n (const i32 7))
-              (unsafe (= %u (call %f %n))) (= %r (const i32 3)) (ret %r)))''',
-            3, 'void sink(int32_t value) { (void)value; }')
-        self.assertRegex(output, r'_ZN4kurs7adapter4sink17h[0-9a-f]{16}E')
-
     def test_instance_heads_distinguish_same_named_methods(self):
         source = '''(trait Test (Self) (run u32 ()))
           (instance Test (u32) (fun run u32 () (entry () (= %n (const u32 1)) (ret %n))))
