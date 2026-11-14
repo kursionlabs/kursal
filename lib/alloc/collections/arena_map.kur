@@ -26,7 +26,7 @@ use alloc::arena::{Allocate, Domain};
 use alloc::collections::arena_vec::ArenaVec;
 use alloc::heap::out_of_range;
 use core::cap::Access;
-use core::hash::{HashIn, HashState};
+use core::hash::{HashIn, key_hash};
 use core::mem::Ref;
 use core::option::Option;
 use core::slice::Slice;
@@ -51,15 +51,6 @@ struct Entry {
     key: K,
     value: V,
     live: bool,
-}
-
-// The hash of a key, spread over the low bits the slots are picked by.
-forall K, C where HashIn[K, C].
-fn slot_hash(&cx: C, key: K) -> usize {
-    let x = HashIn[K, C]::hash_in(&cx, key, HashState::new()).finish();
-    let x = (x ^ (x >> 33u64)) * 18397679294719823053u64;
-    let x = (x ^ (x >> 33u64)) * 14181476777654086739u64;
-    (x ^ (x >> 33u64)) as usize
 }
 
 forall 'k, C, R where Access[C -> 'k, R].
@@ -198,7 +189,7 @@ impl ArenaMap[K, V, 'k] {
     forall C, R where Access[C -> 'k, R], HashIn[K, C].
     fn slot(self, &cx: C, slots: Slice[usize, 'k], entries: ArenaVec[Entry[K, V], 'k], key: K) -> (usize, usize) {
         let mask = slots.len() - 1usize;
-        var i = slot_hash(&cx, key) & mask;
+        var i = (key_hash(&cx, key) as usize) & mask;
         var entry = slot_at(&cx, slots, i);
         while entry != 0usize && !HashIn[K, C]::eq_in(&cx, entries.at(&cx, entry - 1usize).key, key) {
             i = (i + 1usize) & mask;
@@ -419,6 +410,24 @@ impl ArenaSet[K, 'k] {
     forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], HashIn[K, C].
     fn insert(self, &cx: C, key: K) -> bool {
         self.map.insert(&cx, key, true).is_none()
+    }
+
+    // Adds each of `keys`, in order.
+    forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], HashIn[K, C].
+    fn insert_all(self, &cx: C, keys: ArenaVec[K, 'k]) {
+        var i = 0usize;
+        while i < keys.len(&cx) {
+            let fresh = self.insert(&cx, keys.at(&cx, i));
+            i = i + 1usize;
+        }
+    }
+
+    // The keys of `self`, then those of `other` it lacks, in a new set.
+    forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], HashIn[K, C].
+    fn union(self, &cx: C, other: ArenaSet[K, 'k]) -> ArenaSet[K, 'k] {
+        let out = self.clone(&cx);
+        out.insert_all(&cx, other.keys(&cx));
+        out
     }
 
     // Takes `key` out; whether it was there.
