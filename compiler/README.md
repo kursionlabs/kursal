@@ -35,6 +35,10 @@ reference in the tests.
 
 ## Building and testing
 
+From the repository root, `scripts/bootstrap.sh` builds the compiler with the reference compiler
+(`bin/stage0/kursal`), then has that compiler build itself into `bin/kursal`. With `--check` it also
+has `bin/kursal` build itself once more and requires the same C.
+
 From `reference-compiler/`:
 
 ```sh
