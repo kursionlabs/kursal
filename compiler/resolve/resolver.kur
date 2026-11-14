@@ -43,7 +43,13 @@ fn is_prim(&cx: Domain!['k], name: Span['k]) -> bool {
 
 forall 'k.
 fn is_builtin_type(&cx: Domain!['k], name: Span['k]) -> bool {
-    among(&cx, name, "Brand Phantom Never")
+    among(&cx, name, "Brand Phantom Never NonNull")
+}
+
+// The builtin types an impl may give methods, as it may a primitive: `impl NonNull[T]` in core::ptr.
+forall 'k.
+fn is_owned_builtin(&cx: Domain!['k], name: Span['k]) -> bool {
+    name.is(&cx, "NonNull")
 }
 
 forall 'k.
@@ -733,8 +739,9 @@ exposed struct Problem {
     pos: Pos,
 }
 
-// What a method or associated const is attached to: a type declaration, a primitive type, or
-// nothing, for a blanket impl whose methods are found by method calls only.
+// What a method or associated const is attached to: a type declaration, a primitive type or a
+// builtin type (`NonNull`), by name, or nothing, for a blanket impl whose methods are found by method
+// calls only.
 forall 'k.
 exposed enum Owner {
     Decl(Decl['k]),
@@ -1261,7 +1268,9 @@ impl Resolver['k] {
             Option::Some(f) => f.params,
             Option::None => ArenaVec::new(&cx),
         };
-        let owner = if target.path.len(&cx) == 1usize && is_prim(&cx, target.path.at(&cx, 0usize)) {
+        let alone = target.path.at(&cx, 0usize);
+        let owner = if target.path.len(&cx) == 1usize && (is_prim(&cx, alone) || is_owned_builtin(&cx, alone)
+                && !scope.decls.contains(&cx, alone) && !scope.imports.contains(&cx, alone)) {
             Owner::Prim.(target.path.at(&cx, 0usize))
         } else if target.path.len(&cx) == 1usize && params.contains(&cx, target.path.at(&cx, 0usize)) {
             // a blanket impl: its methods are found by method calls only
@@ -2070,7 +2079,7 @@ impl Names['k] {
             self.set(&cx, p.id, NameRef::Builtin.(names.skip(&cx, 1usize).join(&cx, "::")));
         } else if names.len(&cx) == 1usize && is_builtin_value(&cx, first) && !self.visible(&cx, first) {
             self.set(&cx, p.id, NameRef::Builtin.(first));
-        } else if names.len(&cx) == 2usize && is_prim(&cx, first) {
+        } else if names.len(&cx) == 2usize && (is_prim(&cx, first) || is_owned_builtin(&cx, first) && !self.declared(&cx, first)) {
             let found = self.r.attached.get_or(&cx, (Owner::Prim.(first), names.at(&cx, 1usize)), ArenaVec::new(&cx));
             if found.is_empty(&cx) {
                 self.r.fail(&cx, Buffer::new().push_static("unknown ").push_bytes(&cx, first).push_static("::").push_bytes(&cx, names.at(&cx, 1usize)).save(&cx), p.pos);

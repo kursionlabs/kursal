@@ -216,6 +216,10 @@ class Signatures:
                         if len(args) != 1 or not isinstance(args[0], C.Skolem):
                             fail("Brand requires exactly one brand argument")
                         return C.Brand(args[0])
+                    case ("builtin", "NonNull"):
+                        if len(args) != 1 or isinstance(args[0], C.Skolem):
+                            fail("NonNull requires exactly one type argument")
+                        return C.NonNull(args[0])
                     case ("builtin", "Never"):
                         if args:
                             fail("Never takes no type arguments")

@@ -179,6 +179,24 @@ fn is_never(t: Type['k]) -> bool {
 }
 
 forall 'k.
+fn is_non_null(t: Type['k]) -> bool {
+    match t {
+        Type::NonNull(_inner) => true,
+        _ => false,
+    }
+}
+
+// A pointer or a `NonNull`.
+forall 'k.
+fn is_pointer_like(t: Type['k]) -> bool {
+    match t {
+        Type::Ptr(_inner) => true,
+        Type::NonNull(_inner) => true,
+        _ => false,
+    }
+}
+
+forall 'k.
 fn is_exists(t: Type['k]) -> bool {
     match t {
         Type::Exists(_binders, _body) => true,
@@ -1535,6 +1553,8 @@ impl Checker['k] {
             ArenaVec::one(&cx, self.op_variant_tag(&cx, instr))
         } else if op.is(&cx, "builtin::int_cast") {
             ArenaVec::one(&cx, self.op_int_cast(&cx, instr))
+        } else if op.is(&cx, "builtin::as_pointer") {
+            ArenaVec::one(&cx, self.op_as_pointer(&cx, instr))
         } else if op.is(&cx, "builtin::unsafe::cast") {
             ArenaVec::one(&cx, self.op_unsafe_cast(&cx, instr))
         } else if op.is(&cx, "call") {
@@ -1741,7 +1761,41 @@ impl Checker['k] {
         }
         self.has_memory_form(&cx, got);
         self.has_memory_form(&cx, ty);
+        self.castable(&cx, got, ty);
         ty
+    }
+
+    // `NonNull T` to `*T`: forgetting that a pointer is not null is safe.
+    fn op_as_pointer(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
+        let got = self.use_value(&cx, instr.args.at(&cx, 0usize));
+        let ty = match instr.ty {
+            Option::Some(t) => t,
+            Option::None => self.fail(&cx, "as_pointer_converts_non_null"),
+        };
+        let ok = match got {
+            Type::NonNull(inner) => equal(&cx, C::ptr(&cx, inner.copy(&cx)), ty),
+            _ => false,
+        };
+        if !ok {
+            self.fail(&cx, "as_pointer_converts_non_null");
+        }
+        ty
+    }
+
+    // An unsafe cast reinterprets only representations the program fixes: a `NonNull` is cast only
+    // from or to a pointer (whose obligation is that it is not null), and nothing that holds an enum
+    // or a `NonNull` within it is cast, since the compiler chooses an enum's layout (a tag, or the
+    // niche of a `NonNull`: `Types::niche_variant`). A type parameter cannot be cast at all.
+    fn castable(self, &cx: Domain!['k], got: Type['k], want: Type['k]) {
+        if is_non_null(got) || is_non_null(want) {
+            if !(is_pointer_like(got) && is_pointer_like(want)) {
+                self.fail(&cx, "non_null_cast_pointer");
+            }
+            return ();
+        }
+        if self.types.chosen_layout(&cx, got) || self.types.chosen_layout(&cx, want) {
+            self.fail(&cx, "unsafe_cast_layout_chosen");
+        }
     }
 
     // `uncastable` holds somewhere in the value representation of `ty`: a pointer's target is not
@@ -1752,6 +1806,7 @@ impl Checker['k] {
         }
         match ty {
             Type::Ptr(_inner) => false,
+            Type::NonNull(_inner) => false,
             _ => {
                 let parts = children(&cx, ty);
                 var found = false;
@@ -1792,6 +1847,7 @@ impl Checker['k] {
         let (integer, floating, scalar) = match x {
             Type::Prim(name) => (C::is_integer(&cx, name), C::is_float(&cx, name), true),
             Type::Ptr(_inner) => (false, false, true),
+            Type::NonNull(_inner) => (false, false, true),
             _ => (false, false, false),
         };
         let op = instr.op;

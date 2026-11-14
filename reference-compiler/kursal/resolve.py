@@ -26,7 +26,9 @@ from .sexpr import KursError, Position
 from .core import ModuleId
 
 PRIMS = {"i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize", "f32", "f64", "bool"}
-BUILTIN_TYPES = {"Brand", "Phantom", "Never"}
+BUILTIN_TYPES = {"Brand", "Phantom", "Never", "NonNull"}
+# The builtin types an impl may give methods, as it may a primitive: `impl NonNull[T]` in core::ptr.
+OWNED_BUILTINS = {"NonNull"}
 BUILTIN_TRAITS = {"Copy", "Exposed"}
 BUILTIN_VALUES = {"alloca", "fence", "load_volatile", "store_volatile"}  # unless a declaration is in scope
 LIB = Path(os.environ.get("KURSAL_LIB") or Path(__file__).resolve().parents[2] / "lib")
@@ -282,7 +284,9 @@ class Resolver:
             owner: Optional[Decl | str]
             spelled = target.path[-1] if isinstance(target, S.TName) else "?"
             params = item.forall.params if item.forall else ()
-            if isinstance(target, S.TName) and len(target.path) == 1 and target.path[0] in PRIMS:
+            if isinstance(target, S.TName) and len(target.path) == 1 and (
+                    target.path[0] in PRIMS or target.path[0] in OWNED_BUILTINS
+                    and target.path[0] not in scope.decls and target.path[0] not in scope.imports):
                 owner = target.path[0]
             elif isinstance(target, S.TName) and len(target.path) == 1 and target.path[0] in params:
                 owner = None  # a blanket impl: its methods are found by method calls only
@@ -667,7 +671,7 @@ class Names:
             expr.ref = ("builtin", "::".join(names[1:]))
         elif len(names) == 1 and names[0] in BUILTIN_VALUES and not self.visible(names[0]):
             expr.ref = ("builtin", names[0])
-        elif len(names) == 2 and names[0] in PRIMS:
+        elif len(names) == 2 and (names[0] in PRIMS or names[0] in OWNED_BUILTINS and not self.declared(names[0])):
             found = self.r.attached.get((names[0], names[1]))
             if not found:
                 fail(f"unknown {names[0]}::{names[1]}", expr.pos)

@@ -70,6 +70,13 @@ class Ptr(Type):
 
 
 @dataclass(frozen=True)
+class NonNull(Type):
+    """`builtin::NonNull T`: a pointer like `*T` that is never null. Its all-zero value is no value of the
+    type, the niche an enum's layout may use (`Types.niche`)."""
+    inner: Type
+
+
+@dataclass(frozen=True)
 class Skolem(Type):
     """A brand variable or identity; kind Brand, never a value type."""
     label: str

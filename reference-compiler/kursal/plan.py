@@ -32,7 +32,8 @@ from .core import Block, Edge, Fun, Instr, Jmp, Jnz, Ret, Switch, Terminator
 
 # Instructions whose C writes only their results: left out when every result is dead.
 PURE = frozenset({"const", "copy", "construct", "construct_variant", "destruct", "variant_tag", "load",
-                  "builtin::int_cast", "pack", "open", "builtin::unsafe::static_brand", "builtin::fresh",
+                  "builtin::int_cast", "builtin::as_pointer", "pack", "open", "builtin::unsafe::static_brand",
+                  "builtin::fresh",
                   "add", "sub", "mul", "bit_and", "bit_or", "bit_xor", "shl", "shr",
                   "eq", "ne", "lt", "le", "gt", "ge"})
 # Instructions whose dead result the C does not assign: unit results of stores, and call results.

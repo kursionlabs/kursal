@@ -144,6 +144,7 @@ RUNS = {
     "mem_shared_view": (((), "", "", 0),),
     "mem_split_fields": (((), "", "", 0),),
     "modules": (((), "", "", 0),),
+    "non_null": (((), "", "", 0),),
     "sayhi": (((), "", "Hello, !\n", 0),),
     "thread_sum": (((), "", "", 126),),
     "traits": (((), "", "", 0),),

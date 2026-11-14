@@ -128,8 +128,8 @@ yes. A blanket "class B means `unsafe fn`" rule would get them wrong.
 | `std::process::Args::as_raw` | Returns the unchanged argv table of an already-adopted `Args`; dereferencing it requires `unsafe`. |
 | `alloc::arena::ArenaBytes::into_parts` | Returns the exact pointer and initialized extent of a restricted arena byte run; grants no safe dereference or way to forge another checked view. |
 | `core::array::Array::into_parts` | Consumes the restricted, linear `Array!` and returns its storage. The only way back is the `unsafe fn from_parts` (section 2.4). |
-| `core::ptr::NonNull::new` | Checks its argument: a null pointer gives `None`. The one fact a `NonNull` carries is the one just checked. |
-| `core::ptr::NonNull::as_ptr` | Returns the unchanged pointer; using it still requires `unsafe`, and turning it back into a `NonNull` goes through `new` or the `unsafe fn new_unchecked`. |
+| `core::ptr::NonNull::new` | Checks its argument: a null pointer gives `None`, any other the unsafe cast `p as NonNull[T]`, whose one obligation (not null) the check has just discharged. |
+| `core::ptr::NonNull::as_ptr` | `self as *T`, which the language makes safe: forgetting that a pointer is not null grants nothing. Using the pointer still requires `unsafe`, and turning it back into a `NonNull` goes through `new` or the `unsafe fn new_unchecked`. |
 
 ### 2.0b Members that cannot be declared
 
@@ -256,7 +256,7 @@ a checked type; their obligation is the same kind of thing.
 | `core::array::Array::from_parts` | `base` addresses `len` initialized `T`s that nothing else reads or writes while the array exists; every later access is checked against `len` |
 | `alloc::collections::vec::before`, `swap_at`, `sift_down` | `p` addresses the vector's own initialized elements and every index is below its length |
 | `alloc::collections::vec::merge_pass` | `src` and `dst` each address `n` elements and do not overlap |
-| `core::ptr::NonNull::new_unchecked` | `p` is not null. A null one would read as the empty variant of any enum that stores the `NonNull` in its word (`Option[NonNull[T]]`, `Option[Ref[T,'k]]`, `List`) |
+| `core::ptr::NonNull::new_unchecked` | `p` is not null: it is `unsafe (p as NonNull[T])`, and a null one would read as the dataless variant of any enum in the niche layout that holds it (`Option[NonNull[T]]`, `Option[Ref[T,'k]]`, a `List` link; section 2.6) |
 
 ### 2.5 Hands a raw pointer to caller-supplied code
 
@@ -288,7 +288,32 @@ class C: they dispatch through the `Hash[K]`/`Eq[K]` traits instead of raw
 function pointers, and they hand back every key they do not keep, so a
 linear key is never lost.
 
-### 2.6 What class B does not claim
+### 2.6 `NonNull` and unsafe casts
+
+`NonNull[T]` is a builtin type of the language, not a library struct:
+a pointer like `*T` whose all-zero value is no value of the type. It is
+Copy, as wide as `*T`, and compares with `==`/`!=`; it is not ordered and
+has no fields. Its methods (`new`, `new_unchecked`, `as_ptr`) are declared
+in `core::ptr`. The ways to make one are:
+
+- `NonNull::new(p)`, which checks;
+- an unsafe cast `unsafe (p as NonNull[T])` from a pointer or another
+  `NonNull`, whose obligation is that `p` is not null (`new_unchecked`).
+
+`n as *T` needs no `unsafe`. Nothing else casts to or from a `NonNull`:
+not an integer, and not a struct, tuple or array that holds one, which
+would make the same claim without saying so.
+
+The niche of a `NonNull` lets the compiler represent an enum of a
+dataless variant and a variant whose payload holds a `NonNull` as that
+payload alone, the dataless variant written as the null (compiler/README.md,
+"Enum layout"). So an enum's layout is the compiler's choice, and **no
+unsafe cast takes or makes a value whose representation holds an enum or a
+`NonNull`** (`unsafe_cast_layout_chosen`): reinterpreting an
+`Option[NonNull[T]]` as a `*T` is rejected, not defined. Code that needs
+the pointer matches the `Option`.
+
+### 2.7 What class B does not claim
 
 Class B is an inventory of trusted obligations, not a deprecation list.
 `unsafe fn` changes nothing about what is callable: it records who owes
@@ -419,7 +444,6 @@ Types whose hidden representation protects authority or bounds:
 | `StaticRead` | `core::slice` | the read capability for `'static` byte slices; harmless to duplicate, since it grants no write, resume or deallocation |
 | `Span['k]` | `core::raw` | bytes in domain `'k`, readable in safe code only through that domain's capability; built only by `from_static` or the unsafe constructors |
 | `CStr` | `core::cstr` | a live NUL-terminated string, built only by unsafe adoption or `Args` |
-| `NonNull[T]` | `core::ptr` | a non-null pointer |
 | `Array![T]` | `core::array` | storage with exactly `len` initialized elements |
 | `Vec![T,'k]` | `alloc::collections::vec` | a pointer with a `len`/`cap` the module maintains; a forged one is indexed and freed through |
 | `HashMap![K,V,'k]`, `Entry[K,V]` | `alloc::collections::hashmap` | `buckets` matches `bucket_count`; entries are the chain nodes `free_one`/`destroy_chain` free |

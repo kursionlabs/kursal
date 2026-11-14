@@ -22,7 +22,7 @@ import re
 from typing import Optional
 
 from .core import (FLOATS, INTEGERS, UNIT, Array, Brand, Enum, Exists, Fn, Foreach, Ignored, Jmp, Jnz,
-                   Named, Never, Param, Prim, Ptr, Ret, Skolem, Struct, Switch, Tuple, Unreachable,
+                   Named, Never, NonNull, Param, Prim, Ptr, Ret, Skolem, Struct, Switch, Tuple, Unreachable,
                    Type, Program, Fun, Data, Instr, Edge, Terminator)
 from .check import Checker
 from .sexpr import Form, KursError, List, Str
@@ -119,6 +119,7 @@ class Backend:
         self.program, self.checker = program, checker
         self.types = Types(program)
         self.names: dict[Type, str] = {}        # representation key -> C type name
+        self.represented: dict[Type, Type] = {}   # an enum in the niche layout -> its payload's key
         self.pending: dict[Type, Tuple | Struct | Array | Enum] = {}      # named but not yet defined aggregates
         self.forward: list[str] = []
         self.defs: list[str] = []
@@ -167,13 +168,14 @@ class Backend:
             return C_PRIMS[ty.name]
         if isinstance(ty, Never):
             return "void"
-        if isinstance(ty, Ptr):
+        if isinstance(ty, (Ptr, NonNull)):
             inner = erase(ty.inner, self.types)
             return self.ctype(inner, False) + "*"
         if ty not in self.names:
             self.register(ty)
-        if defined and ty in self.pending:
-            self.define(ty)
+        key = self.represented.get(ty, ty)
+        if defined and key in self.pending:
+            self.define(key)
         return self.names[ty]
 
     def register(self, ty: Type) -> None:
@@ -190,6 +192,11 @@ class Backend:
                 cparams = [(self.ctype(p, False), k in places) for k, p in enumerate(params)]
                 plist = ", ".join(ct + ("*" if place else "") for ct, place in cparams if ct != "void") or "void"
                 self.defs.append(f"typedef {result} (*{name})({plist});")
+            case Enum(variants=variants) if self.types.niche_variant(variants) is not None:
+                # The niche layout: the payload's C type, the other variant a null at the niche.
+                payload = erase(variants[self.types.niche_variant(variants)][1], self.types)
+                self.names[ty] = self.ctype(payload, False)
+                self.represented[ty] = payload
             case Tuple() | Struct() | Array() | Enum():
                 name = self.names[ty] = self.fresh_name(ty.name if isinstance(ty, Named) else type(s).__name__.lower())
                 self.forward.append(f"typedef struct {name} {name};")
@@ -216,6 +223,13 @@ class Backend:
         assert isinstance(shape, Struct)
         return [(self.component(n, "f"), f) for n, f in shape.fields]
 
+    def member_of(self, shape: Type, label: str) -> tuple[str, Type]:
+        """(C member, component type) of the component `label` (a field name or a tuple index) of a
+        struct or tuple shape."""
+        assert isinstance(shape, (Struct, Tuple))
+        names = [n for n, _ in shape.fields] if isinstance(shape, Struct) else [str(i) for i in range(len(shape.elems))]
+        return dict(zip(names, self.members(shape)))[label]
+
     def component(self, name: str, prefix: str) -> str:
         key = (prefix, name)
         if key not in self.component_names:
@@ -227,6 +241,54 @@ class Backend:
 
     def shape(self, ty: Type) -> Type:
         return self.types.shape(erase(ty, self.types))
+
+    # ------------------------------------------------------- enum layouts --
+
+    def niche_layout(self, ty: Type) -> Optional[tuple[int, str]]:
+        """For an enum in the niche layout (`Types.niche_variant`): the index of the variant it is
+        represented as, and the C access from a value of it to the niche's pointer (`""` when the
+        payload is that pointer)."""
+        variants = self.types.variants(erase(ty, self.types))
+        k = self.types.niche_variant(variants)
+        if k is None:
+            return None
+        payload = variants[k][1]
+        path = self.types.niche(payload)
+        assert path is not None
+        access = ""
+        for label in path:
+            s = self.shape(payload)
+            if isinstance(s, Array):
+                access, payload = access + ".items[0]", s.elem
+            else:
+                member, payload = self.member_of(s, label)
+                access += "." + member
+        return k, access
+
+    def tag(self, source: str, ty: Type) -> str:
+        """The index of the variant a value of the enum `ty` holds, as C."""
+        layout = self.niche_layout(ty)
+        if layout is None:
+            return f"{source}.tag"
+        k, access = layout
+        return f"({source}{access} == 0 ? {1 - k} : {k})"
+
+    def payload(self, source: str, ty: Type, variant: str) -> str:
+        """The C object of one variant's payload within a value or place of the enum `ty`."""
+        return source if self.niche_layout(ty) is not None else f"{source}.payload.{self.variant(variant)}"
+
+    def set_variant(self, dst: str, ty: Type, variant: str, value: Optional[str]) -> list[str]:
+        """C that makes `dst` hold `variant` of the enum `ty`, with the payload `value` (None for a payload
+        of a zero-size type). In the niche layout, the payload variant is its payload; the other is
+        the null at the niche, and the rest of the object is not written."""
+        names = [n for n, _ in self.types.variants(erase(ty, self.types))]
+        index = names.index(variant)
+        layout = self.niche_layout(ty)
+        if layout is not None:
+            k, access = layout
+            return [f"{dst} = {value};" if index == k else f"{dst}{access} = 0;"]
+        payload = [f"{dst}.payload.{self.variant(variant)} = {value};"] if value is not None else []
+        return [*payload, f"{dst}.tag = {index};"]
 
     def erased(self, ty: Type) -> bool:
         """`ty` has no C representation: it is zero-size (Never included)."""
@@ -498,11 +560,9 @@ class Backend:
             ty = self.view(ty)
             s = self.shape(ty)
             if isinstance(s, Enum):
-                expr, ty = f"{expr}.payload.{self.variant(seg)}", dict(s.variants)[seg]
+                expr, ty = self.payload(expr, ty, seg), dict(s.variants)[seg]
             else:
-                assert isinstance(s, (Struct, Tuple))
-                names = [n for n, _ in s.fields] if isinstance(s, Struct) else [str(i) for i in range(len(s.elems))]
-                member, ty = dict(zip(names, self.members(s)))[seg]
+                member, ty = self.member_of(s, seg)
                 expr = f"{expr}.{member}"
         return expr, ty
 
@@ -544,15 +604,17 @@ class Backend:
         elif op == "destruct":
             self.destruct(instr)
         elif op == "construct_variant":
-            assert instr.lit is not None
-            variants = self.types.variants(erase(self.type_operand(instr), self.types))
-            index = [n for n, _ in variants].index(instr.lit)
-            if not self.erased(variants[index][1]):
-                self.line(f"{dst}.payload.{self.variant(instr.lit)} = {self.value_name(a[0])};")
-            self.line(f"{dst}.tag = {index};")
+            assert instr.lit is not None and dst is not None
+            ty = self.type_operand(instr)
+            payload = dict(self.types.variants(erase(ty, self.types)))[instr.lit]
+            value = None if self.erased(payload) else self.value_name(a[0])
+            for statement in self.set_variant(dst, ty, instr.lit, value):
+                self.line(statement)
         elif op == "variant_tag":
             source = self.place(a[0])[0] if a[0].startswith("&") else self.value_name(a[0])
-            self.line(f"{dst} = {source}.tag;")
+            self.line(f"{dst} = {self.tag(source, self.type_operand(instr))};")
+        elif op == "builtin::as_pointer":
+            self.line(f"{dst} = {self.value_name(a[0])};")
         elif op == "builtin::int_cast":
             self.line(f"{dst} = {self.convert(self.value_name(a[0]), self.type_operand(instr))};")
         elif op == "builtin::unsafe::cast":
@@ -667,8 +729,8 @@ class Backend:
     def cast(self, dst: str, expr: str, src: Type, dst_ty: Type) -> None:
         s, d = self.shape(src), self.shape(dst_ty)
         cd = self.ctype(dst_ty)
-        if isinstance(s, Ptr) or isinstance(d, Ptr):
-            if isinstance(s, Ptr) and isinstance(d, Ptr):
+        if isinstance(s, (Ptr, NonNull)) or isinstance(d, (Ptr, NonNull)):
+            if isinstance(s, (Ptr, NonNull)) and isinstance(d, (Ptr, NonNull)):
                 self.line(f"{dst} = ({cd}){expr};")
             elif (isinstance(s, Ptr) and isinstance(d, Prim) and d.name in INTEGERS or
                   isinstance(d, Ptr) and isinstance(s, Prim) and s.name in INTEGERS):
@@ -699,7 +761,7 @@ class Backend:
     def primitive(self, dst: str, op: str, args: tuple[str, ...]) -> None:
         x, y = (self.value_name(a) for a in args)
         t = self.shape(self.type_of(args[0]))
-        if isinstance(t, Ptr):
+        if isinstance(t, (Ptr, NonNull)):
             self.line(f"{dst} = ((uintptr_t){x} {C_OPS[op]} (uintptr_t){y});")
             return
         assert isinstance(t, Prim)
@@ -843,12 +905,17 @@ class Backend:
             return f"{call};" if self.erased(result) else f"{target} = {call};"
 
         if isinstance(skeleton, Enum):
-            assert isinstance(out_shape, Enum)
-            self.line(f"switch ({source}.tag) {{")
+            assert isinstance(out_shape, Enum) and dst is not None
+            source_type = self.type_of(instr.args[0])
+            self.line(f"switch ({self.tag(source, source_type)}) {{")
             for k, (row, (_, result)) in enumerate(zip(rows, out_shape.variants)):
-                member = self.variant(row[0])
-                self.line(f"case {k}: {assign(f'{dst}.payload.{member}', result, apply(row, f'{source}.payload.{member}'))} "
-                          f"{dst}.tag = {k}; break;")
+                call = apply(row, self.payload(source, source_type, row[0]))
+                if self.erased(result):
+                    self.line(f"case {k}: {call}; {' '.join(self.set_variant(dst, t, row[0], None))} break;")
+                elif self.niche_layout(t) is not None:
+                    self.line(f"case {k}: {dst} = {call}; break;")
+                else:
+                    self.line(f"case {k}: {' '.join(self.set_variant(dst, t, row[0], call))} break;")
             self.line("default: KUR_TRAP();\n  }")
             return
         out = [(f"items[{k}]", out_shape.elem) for k in range(len(rows))] if isinstance(out_shape, Array) \
@@ -931,9 +998,10 @@ class Backend:
             source, _ = self.place(arg)
         else:
             source = self.value_name(arg)
-        variants = self.types.variants(erase(self.substitute_type(term.ty), self.types))
+        ty = self.substitute_type(term.ty)
+        variants = self.types.variants(erase(ty, self.types))
         names = [n for n, _ in variants]
-        self.line(f"switch ({source}.tag) {{")
+        self.line(f"switch ({self.tag(source, ty)}) {{")
         for arm in term.arms:
             index = names.index(arm.variant)
             self.line(f"case {index}:")
@@ -942,7 +1010,7 @@ class Backend:
             elif self.erased(variants[index][1]):
                 payload = ""
             else:
-                payload = f"{source}.payload.{self.variant(arm.variant)}"
+                payload = self.payload(source, ty, arm.variant)
             self.line("  {")
             self.edge(arm.edge, payload, source, indent="    ")
             self.line("  }")

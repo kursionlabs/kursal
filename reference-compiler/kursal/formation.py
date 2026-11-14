@@ -168,7 +168,7 @@ class Formation:
                 self.fail("duplicate component name")
             case C.Ignored():
                 self.fail("_ is only a retained fn brand argument")
-            case C.Ptr() | C.Tuple() | C.Array() | C.Struct() | C.Enum() | C.Never():
+            case C.Ptr() | C.NonNull() | C.Tuple() | C.Array() | C.Struct() | C.Enum() | C.Never():
                 for t in children(ty):
                     self.fits(t, C.ANY, env)
             case _:

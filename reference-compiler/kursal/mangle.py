@@ -60,7 +60,7 @@ def type_key(ty: C.Type, scope: tuple[str, ...] = ()) -> str:
             parts = (type(ty).__name__, *(encode((n, key(t))) for n, t in fields))
         case C.Array(elem=t, length=n):
             parts = ("array", str(n), key(t))
-        case C.Ptr(inner=t) | C.Brand(brand=t):
+        case C.Ptr(inner=t) | C.NonNull(inner=t) | C.Brand(brand=t):
             parts = (type(ty).__name__, key(t))
         case C.Exists(binders=names, body=t):
             parts = ("exists", str(len(names)), type_key(t, scope + names))

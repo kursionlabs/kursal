@@ -57,6 +57,7 @@ printf 'the cat and the hat\n' | /tmp/wordfreq
 | `at_sugar` | `&` in-out parameters |
 | `functions` | function values, indirect calls and closures |
 | `tuple_decl` | `tuple Name(T, ...);` declarations |
+| `non_null` | `NonNull[T]`, the pointer that is never null, and the enums whose layout it fills: `Option[NonNull[T]]`, `Option[Ref[T, 'k]]`, a `List` link and a user's own enum are one word |
 | `zero_size` | zero-size types (`()`, brands, capabilities, markers, empty arrays): no bytes in `sizeof`, in the structs that hold them, or in calls, matches and the arena |
 | `box_store_liveness` | storing a linear value through a raw pointer |
 

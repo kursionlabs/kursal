@@ -46,6 +46,8 @@ def type_text(ty: C.Type, depth: int = 0) -> str:
             return brand(label)
         case C.Brand(brand=witness):
             return "Brand[" + type_text(witness, depth) + "]"
+        case C.NonNull(inner=inner):
+            return "NonNull[" + type_text(inner, depth) + "]"
         case C.Ptr(inner=inner):
             text = type_text(inner, depth)
             return "*(" + text + ")" if isinstance(inner, (C.Exists, C.Foreach, C.Fn)) else "*" + text
@@ -110,7 +112,7 @@ def instruction_text(instr: C.Instr, depth: int, omit_unit: bool = False) -> str
             operands = [ty, *args]
         elif op == "construct_variant":
             operands = [ty, literal, *args]
-        elif op in ("builtin::int_cast", "builtin::unsafe::cast"):
+        elif op in ("builtin::int_cast", "builtin::unsafe::cast", "builtin::as_pointer"):
             operands = [*args, ty]
         elif op in ("alloca", "builtin::sizeof"):
             operands = [ty]

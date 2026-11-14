@@ -612,7 +612,7 @@ class Infer:
             if unary:
                 valid = numeric if op == "-" else integer or ty == C.BOOL
             elif op in {"==", "!="}:
-                valid = isinstance(ty, (C.Prim, C.Ptr))
+                valid = isinstance(ty, (C.Prim, C.Ptr, C.NonNull))
             elif op in {"%", "&", "|", "^", "<<", ">>"}:
                 valid = integer
             else:
@@ -1333,6 +1333,8 @@ class Infer:
             owner = self.decl_of.get(t.name)
         elif isinstance(t, C.Prim):
             owner = t.name
+        elif isinstance(t, C.NonNull):
+            owner = "NonNull"
         own = [d for d in self.r.attached.get((owner, name), []) if d.kind == "method"] if owner else []
         candidates: list[MethodLookup]
         if own:

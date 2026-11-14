@@ -274,7 +274,9 @@ that so for places lent by path:
    and each lend's pointer is derived from the lender's.
 2. The places one call lends are disjoint: no lent path is a prefix of another. An enum's payload
    is lent only under its known variant, so two payloads of one enum, which share storage, are never
-   lent together; two fields of one struct are separate objects.
+   lent together; two fields of one struct are separate objects. In the niche layout (below) the
+   payload is the whole enum's object, and the other variant is zero-size, so nothing is lent beside
+   it either.
 3. While a callee runs its caller is suspended, so the caller's own pointer to the place is not
    used.
 
@@ -346,6 +348,60 @@ compiler and the standard library compare (`Ref::address`, `ArenaVec::address` a
 `ArenaMap::address`, which `Meta::id`, `fun_key` and the checker's copy cache use, and `Span`'s
 equal-address shortcut) are addresses of headers and states that have bytes, and a `Ref` to a
 zero-size value cannot be read, so it cannot be built by `Ref::new`.
+
+### Enum layout: tags and niches
+
+An enum is a `uint32_t tag` and a union of its payloads, except where its types give it a cheaper
+form. `NonNull[T]` (`builtin::NonNull T`), a pointer that is never null, has a **niche**: its
+all-zero value is none of its values. `niche` (`types::ops`, `types.py`) finds a type's niche from
+its structure alone:
+
+- a `NonNull` has one, at offset 0, and offers one invalid value, the null pointer;
+- a struct or tuple has the niche of its first component, in declaration order, that has one, and a
+  non-empty array that of its element 0;
+- an `exists` has its body's;
+- nothing else has one: a raw pointer, a primitive (`bool` included), a function value, a zero-size
+  type, and an enum, whatever its layout (a tagged enum's unused tags are not used; a niche-layout
+  enum has spent its one invalid value);
+- a type parameter is answered at each specialization, after brands are erased.
+
+An enum is in the **niche layout** when `niche_variant` says so: it has exactly two variants, one of
+a zero-size type and one whose payload has a niche (a `NonNull` offers one invalid value, so one
+dataless variant; a source that offered more would admit as many). Its C type is the payload's C
+type: `Option[NonNull[T]]`, `Option[Ref[T, 'k]]`, a `List` link and a user's own enum of that shape
+are one pointer (or the payload's struct), and `sizeof` is the payload's. The dataless variant is the
+null at the niche. In C:
+
+- `construct_variant` of the payload variant assigns the payload; of the other, assigns `0` to the
+  niche's member path (`dst.f_ptr = 0;`) and writes nothing else;
+- `variant_tag`, `switch` and `foreach` over the enum read the variant as
+  `(x.path == 0 ? dataless : payload)`, the variants' indices in declaration order;
+- the payload, as a value of a switch arm, a place path `x.Some` or a `foreach` component, is the
+  enum's own object.
+
+Every specialization is laid out by its own arguments: `Option[T]` at `NonNull[u8]` is a pointer and
+at `u32` a tag. Names play no part; nothing in the compiler knows `Option` or `NonNull` by name
+beyond the surface spelling of the builtin type.
+
+The layout is sound because no program can observe or break it:
+
+- **The niche holds a valid value whenever it is read.** A `NonNull` value is made only by an unsafe
+  cast from a pointer, whose obligation is that it is not null, or by `NonNull::new`, which checks.
+  `variant_tag` and `switch` of a place need the place full, so its niche holds a `NonNull` it was
+  given; a store under a known variant stores a whole `NonNull`, never a null, and a payload that is
+  moved out keeps its bytes. The dataless variant's null is written only by `construct_variant`.
+- **Nothing reads the bytes the dataless variant leaves unwritten.** Only the niche is read to tell
+  the variants apart, and a payload is read only under the payload variant, so valgrind sees no use
+  of an undefined byte; copying the whole object copies them as C copies any partly written struct.
+- **No cast sees the layout.** An unsafe cast converts a `NonNull` only from or to a pointer, and
+  rejects a type that holds an enum or a `NonNull` within its value representation
+  (`unsafe_cast_layout_chosen`, `non_null_cast_pointer`): the layout of an enum, tagged or not, is the
+  compiler's choice, and a cast between, say, `Option[NonNull[u8]]` and `*u8` would make it a
+  contract. A cast of a type parameter is already rejected, so no specialization can bring an enum
+  into one.
+- **Places, lends, `const` and `restrict`** are as before: a place under its known variant is the
+  enum's object (see "Why `restrict` is sound"); packing and opening a niche-layout enum copy its
+  value like any other.
 
 ### The C compiler
 
@@ -424,6 +480,10 @@ These are the places where Kursal differs from what one might expect.
   takes it as its last argument (`ArenaVec[Span['k], 'k]`). A brand is minted by a constructor that
   returns `exists 'k. ...` and is opened by `let exists 'k. cx = Domain::new();`; a trait may take one
   as a parameter (`forall D, 'k. trait Discharge`, `instance Discharge[Checker['k], 'k]`).
+- **`NonNull[T]`** is a builtin type, like `*T` but never null: `NonNull::new(p)` checks and returns
+  an `Option`, `unsafe (p as NonNull[T])` asserts it, `n as *T` (or `n.as_ptr()`) is safe, and `==`
+  compares two. Its niche makes `Option[NonNull[T]]` and `Option[Ref[T, 'k]]` one word (see "Enum
+  layout").
 - **Zero-size types** (`()`, empty structs, brands, capabilities) take no bytes (`sizeof` is 0, see
   "Zero-size types are erased") and have no memory form: no `Ref`, vec or map stores one as a whole
   value. Use `bool` as a placeholder value (`ArenaSet` is an `ArenaMap[K, bool]`).

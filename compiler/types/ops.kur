@@ -144,6 +144,7 @@ fn type_tag(t: Type['k]) -> u32 {
         Type::Fn(_x) => 12u32,
         Type::Ignored => 13u32,
         Type::Meta(_x) => 14u32,
+        Type::NonNull(_x) => 15u32,
     }
 }
 
@@ -171,6 +172,7 @@ fn map_children(&cx: Domain!['k], ty: Type['k], transform: closure[Env](&_: Doma
         },
         Type::Brand(brand) => Type::Brand.(Ref::new(&cx, transform(&cx, brand.copy(&cx)))),
         Type::Ptr(inner) => Type::Ptr.(Ref::new(&cx, transform(&cx, inner.copy(&cx)))),
+        Type::NonNull(inner) => Type::NonNull.(Ref::new(&cx, transform(&cx, inner.copy(&cx)))),
         Type::Array(elem, length) => Type::Array.(Ref::new(&cx, transform(&cx, elem.copy(&cx))), length),
         Type::Tuple(elems) => {
             let out: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
@@ -390,6 +392,7 @@ fn free_names_in(&cx: Domain!['k], ty: Type['k], bound: ArenaSet[Span['k], 'k], 
             free_names_all(&cx, f.params, inner, only, out);
         },
         Type::Ptr(inner) => free_names_in(&cx, inner.copy(&cx), bound, only, out),
+        Type::NonNull(inner) => free_names_in(&cx, inner.copy(&cx), bound, only, out),
         Type::Brand(brand) => free_names_in(&cx, brand.copy(&cx), bound, only, out),
         Type::Array(elem, _length) => free_names_in(&cx, elem.copy(&cx), bound, only, out),
         Type::Tuple(elems) => free_names_all(&cx, elems, bound, only, out),
@@ -439,6 +442,7 @@ fn mentions_brand(&cx: Domain!['k], ty: Type['k]) -> bool {
         Type::Enum(variants) => members_mention_brand(&cx, variants),
         Type::Array(elem, _length) => mentions_brand(&cx, elem.copy(&cx)),
         Type::Ptr(inner) => mentions_brand(&cx, inner.copy(&cx)),
+        Type::NonNull(inner) => mentions_brand(&cx, inner.copy(&cx)),
         Type::Brand(brand) => mentions_brand(&cx, brand.copy(&cx)),
         Type::Exists(_binders, body) => mentions_brand(&cx, body.copy(&cx)),
         Type::Foreach(f) => mentions_brand(&cx, f.source.copy(&cx)) || mentions_brand(&cx, f.body.copy(&cx)),
@@ -494,6 +498,7 @@ fn skolems(&cx: Domain!['k], part: Type['k], found: ArenaSet[Span['k], 'k]) {
         Type::Enum(variants) => skolems_members(&cx, variants, found),
         Type::Array(elem, _length) => skolems(&cx, elem.copy(&cx), found),
         Type::Ptr(inner) => skolems(&cx, inner.copy(&cx), found),
+        Type::NonNull(inner) => skolems(&cx, inner.copy(&cx), found),
         Type::Brand(brand) => skolems(&cx, brand.copy(&cx), found),
         Type::Exists(_binders, body) => skolems(&cx, body.copy(&cx), found),
         Type::Foreach(f) => {
@@ -530,6 +535,7 @@ forall 'k.
 fn children(&cx: Domain!['k], ty: Type['k]) -> ArenaVec[Type['k], 'k] {
     match ty {
         Type::Ptr(inner) => ArenaVec::one(&cx, inner.copy(&cx)),
+        Type::NonNull(inner) => ArenaVec::one(&cx, inner.copy(&cx)),
         Type::Brand(brand) => ArenaVec::one(&cx, brand.copy(&cx)),
         Type::Array(elem, _length) => ArenaVec::one(&cx, elem.copy(&cx)),
         Type::Tuple(elems) => elems,
@@ -781,6 +787,7 @@ fn equal_in(&cx: Domain!['k], a: Type['k], b: Type['k], env: Alpha['k]) -> bool 
             _ => false,
         },
         Type::Ptr(_x) => equal_in(&cx, children(&cx, a).at(&cx, 0usize), children(&cx, b).at(&cx, 0usize), env),
+        Type::NonNull(_x) => equal_in(&cx, children(&cx, a).at(&cx, 0usize), children(&cx, b).at(&cx, 0usize), env),
         Type::Brand(_x) => equal_in(&cx, children(&cx, a).at(&cx, 0usize), children(&cx, b).at(&cx, 0usize), env),
         _ => C::same(&cx, a, b),
     }
@@ -896,6 +903,114 @@ impl Types['k] {
             Type::Array(elem, length) => length == 0u64 || self.zero_size(&cx, elem.copy(&cx)),
             Type::Exists(_binders, body) => self.zero_size(&cx, body.copy(&cx)),
             _ => false,
+        }
+    }
+
+    // Where a value of `ty` has bytes that hold no value of it: the path (field names, tuple indices,
+    // `0` for an array's first element) to its first `NonNull` in layout order, whose all-zero value
+    // is none of its values. A struct, tuple or non-empty array has the niche of its first component
+    // that has one; a pointer, a primitive, a zero-size type and an enum have none. A type parameter
+    // is answered when it is instantiated.
+    fn niche(self, &cx: Domain!['k], ty: Type['k]) -> Option[ArenaVec[Span['k], 'k]] {
+        let unit = match ty {
+            Type::NonNull(_inner) => {
+                return Option::Some.(ArenaVec::new(&cx));
+            },
+            Type::Named(name, args) => {
+                if args.is_empty(&cx) && !self.program.types.contains(&cx, name) {
+                    return Option::None;
+                }
+            },
+            _ => (),
+        };
+        let parts: ArenaVec[Member['k], 'k] = ArenaVec::new(&cx);
+        let unit = match self.shape(&cx, ty, Option::None) {
+            Type::NonNull(_inner) => {
+                return Option::Some.(ArenaVec::new(&cx));
+            },
+            Type::Struct(fields) => {
+                parts.append(&cx, fields);
+            },
+            Type::Tuple(elems) => {
+                var i = 0usize;
+                while i < elems.len(&cx) {
+                    parts.push(&cx, Member.{ name: Buffer::new().push_u64(i as u64).save(&cx), type: elems.at(&cx, i) });
+                    i = i + 1usize;
+                }
+            },
+            Type::Array(elem, length) => {
+                if length > 0u64 {
+                    parts.push(&cx, Member.{ name: Span::from_static(&cx, "0"), type: elem.copy(&cx) });
+                }
+            },
+            Type::Exists(_binders, body) => {
+                return self.niche(&cx, body.copy(&cx));
+            },
+            _ => (),
+        };
+        var i = 0usize;
+        while i < parts.len(&cx) {
+            let unit = match self.niche(&cx, parts.at(&cx, i).type) {
+                Option::Some(path) => {
+                    let out = ArenaVec::one(&cx, parts.at(&cx, i).name);
+                    out.append(&cx, path);
+                    return Option::Some.(out);
+                },
+                Option::None => (),
+            };
+            i = i + 1usize;
+        }
+        Option::None
+    }
+
+    // The variant an enum of these variants is represented as, when it has the niche layout: one
+    // variant's payload has a niche, and the one other variant is zero-size, written as the niche's
+    // invalid value. A `NonNull` offers one invalid value, so one dataless variant. Otherwise the
+    // enum is a tag and a union of its payloads.
+    fn niche_variant(self, &cx: Domain!['k], variants: ArenaVec[Member['k], 'k]) -> Option[usize] {
+        if variants.len(&cx) != 2usize {
+            return Option::None;
+        }
+        let first = self.zero_size(&cx, variants.at(&cx, 0usize).type);
+        let second = self.zero_size(&cx, variants.at(&cx, 1usize).type);
+        if first == second {
+            return Option::None;
+        }
+        let k = if first { 1usize } else { 0usize };
+        match self.niche(&cx, variants.at(&cx, k).type) {
+            Option::Some(_path) => Option::Some.(k),
+            Option::None => Option::None,
+        }
+    }
+
+    // The compiler chooses how `ty`'s value is laid out: an enum or a `NonNull` is in its value
+    // representation (named types unfolded; not through a pointer or a function; a type parameter
+    // is a leaf).
+    fn chosen_layout(self, &cx: Domain!['k], ty: Type['k]) -> bool {
+        match ty {
+            Type::Enum(_variants) => true,
+            Type::NonNull(_inner) => true,
+            Type::Ptr(_inner) => false,
+            Type::Fn(_f) => false,
+            Type::Brand(_brand) => false,
+            Type::Named(name, args) => {
+                if args.is_empty(&cx) && !self.program.types.contains(&cx, name) {
+                    false
+                } else {
+                    self.chosen_layout(&cx, self.shape(&cx, ty, Option::None))
+                }
+            },
+            Type::Foreach(_f) => self.chosen_layout(&cx, self.shape(&cx, ty, Option::None)),
+            _ => {
+                let parts = children(&cx, ty);
+                var found = false;
+                var i = 0usize;
+                while !found && i < parts.len(&cx) {
+                    found = self.chosen_layout(&cx, parts.at(&cx, i));
+                    i = i + 1usize;
+                }
+                found
+            },
         }
     }
 
@@ -1038,6 +1153,7 @@ impl Types['k] {
         match ty {
             Type::Prim(_n) => true,
             Type::Ptr(_i) => true,
+            Type::NonNull(_i) => true,
             Type::Brand(_b) => true,
             Type::Fn(_f) => true,
             Type::Never => true,
@@ -1327,6 +1443,7 @@ fn show(&cx: Domain!['k], ty: Type['k]) -> Span['k] {
         Type::Skolem(label) => Buffer::new().push_static("$").push_bytes(&cx, label).save(&cx),
         Type::Brand(brand) => Buffer::new().push_static("(builtin::Brand ").push_bytes(&cx, show(&cx, brand.copy(&cx))).push_static(")").save(&cx),
         Type::Ptr(inner) => Buffer::new().push_static("(builtin::Pointer ").push_bytes(&cx, show(&cx, inner.copy(&cx))).push_static(")").save(&cx),
+        Type::NonNull(inner) => Buffer::new().push_static("(builtin::NonNull ").push_bytes(&cx, show(&cx, inner.copy(&cx))).push_static(")").save(&cx),
         Type::Tuple(elems) => replace_all(&cx, show_all(&cx, Buffer::new().push_static("(tuple "), elems).push_static(")").save(&cx), Span::from_static(&cx, " )"), Span::from_static(&cx, ")")),
         Type::Array(elem, length) => Buffer::new().push_static("(array ").push_bytes(&cx, show(&cx, elem.copy(&cx))).push_static(" ").push_u64(length).push_static(")").save(&cx),
         Type::Struct(fields) => show_members(&cx, Buffer::new().push_static("(struct "), fields).push_static(")").save(&cx),

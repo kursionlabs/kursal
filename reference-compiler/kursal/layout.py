@@ -93,7 +93,7 @@ def check_type_expansion(program: C.Program) -> None:
             walk(ty.body, active, bound | set(foreach_binders(ty)), aliases)
         elif isinstance(ty, C.Brand):
             return
-        elif isinstance(ty, (C.Ptr, C.Fn)) and not aliases:
+        elif isinstance(ty, (C.Ptr, C.NonNull, C.Fn)) and not aliases:
             return
         elif isinstance(ty, (C.Tuple, C.Struct, C.Enum, C.Array)) and aliases:
             return

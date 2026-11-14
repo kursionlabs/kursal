@@ -12,7 +12,7 @@ from .sexpr import Atom, Form, KursError, List, Position, Str, read
 from .core import (ANY, BRAND, COPY, PRIMS, Array, Arm, Block, Brand, Data,
                    Edge, Enum, Exists, Exposure, Extern, Fn, Foreach, Fun, Ignored, Instance,
                    Instr, Jmp, Jnz, Method, ModuleId, Named, Never, Param, Premise,
-                   Prim, Program, Ptr, Ret, Skolem, Struct, Switch, Trait, Tuple,
+                   NonNull, Prim, Program, Ptr, Ret, Skolem, Struct, Switch, Trait, Tuple,
                    Type, TypeDecl, Terminator, Unreachable)
 
 
@@ -69,6 +69,8 @@ def parse_type(form: Form) -> Type:
         return Array(parse_type(rest[0]), int(_text(rest[1])))
     if head == "builtin::Pointer":
         return Ptr(parse_type(rest[0]))
+    if head == "builtin::NonNull":
+        return NonNull(parse_type(rest[0]))
     if head == "builtin::Brand":
         return Brand(Skolem(_brand(rest[0])))
     if head == "exists":
@@ -174,7 +176,7 @@ def parse_instr(form: Form) -> Instr:
         return Instr(lhs, op, pos=pos, ty=parse_type(rest[0]), lit=str(rest[1]))
     if op in ("construct",):
         return Instr(lhs, op, pos=pos, ty=parse_type(rest[0]), args=tuple(map(str, rest[1:])))
-    if op in ("destruct", "variant_tag", "builtin::unsafe::cast", "builtin::int_cast"):
+    if op in ("destruct", "variant_tag", "builtin::unsafe::cast", "builtin::int_cast", "builtin::as_pointer"):
         return Instr(lhs, op, pos=pos, args=(str(rest[0]),), ty=parse_type(rest[1]))
     if op == "construct_variant":
         return Instr(lhs, op, pos=pos, ty=parse_type(rest[0]), lit=str(rest[1]), args=(str(rest[2]),))
@@ -392,6 +394,8 @@ def write_type(ty: Type) -> str:
             return _form(["array", write_type(elem), str(length)])
         case Ptr(inner=inner):
             return _form(["builtin::Pointer", write_type(inner)])
+        case NonNull(inner=inner):
+            return _form(["builtin::NonNull", write_type(inner)])
         case Brand(brand=Skolem(label=label)):
             return _form(["builtin::Brand", write_atom("$" + label)])
         case Exists(binders=binders, body=body):
@@ -478,7 +482,7 @@ def write_instr(instr: Instr) -> str:
         operation = [op, _type_operand(instr), _literal(instr)]
     elif op == "construct":
         operation = [op, _type_operand(instr), *args]
-    elif op in ("destruct", "variant_tag", "builtin::unsafe::cast", "builtin::int_cast"):
+    elif op in ("destruct", "variant_tag", "builtin::unsafe::cast", "builtin::int_cast", "builtin::as_pointer"):
         operation = [op, args[0], _type_operand(instr)]
     elif op == "construct_variant":
         operation = [op, _type_operand(instr), _literal(instr), args[0]]

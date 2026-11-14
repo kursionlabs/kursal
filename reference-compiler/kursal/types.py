@@ -7,7 +7,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Set
 from itertools import count
 from typing import Optional
 
-from .core import (COPY, Array, Brand, Enum, Exists, Fn, Foreach, Ignored, Named, Never, Param, Prim, Ptr,
+from .core import (COPY, Array, Brand, Enum, Exists, Fn, Foreach, Ignored, Named, Never, NonNull, Param, Prim, Ptr,
                    Kind, ModuleId, Premise, Program, Skolem, Struct, Tuple, Type, TypeDecl)
 from .sexpr import KursError
 
@@ -37,6 +37,8 @@ def map_children(ty: Type, transform: Callable[[Type], Type]) -> Type:
             return Brand(transform(brand))
         case Ptr(inner=inner):
             return Ptr(transform(inner))
+        case NonNull(inner=inner):
+            return NonNull(transform(inner))
         case Array(elem=elem, length=length):
             return Array(transform(elem), length)
         case Tuple(elems=elems):
@@ -148,7 +150,7 @@ def free_brands(ty: Type) -> set[str]:
 
 def children(ty: Type) -> tuple[Type, ...]:
     match ty:
-        case Ptr(inner=inner):
+        case Ptr(inner=inner) | NonNull(inner=inner):
             return (inner,)
         case Brand(brand=brand):
             return (brand,)
@@ -229,7 +231,7 @@ def equal(a: Type, b: Type, env: Optional[AlphaEnv] = None) -> bool:
             return a.length == b.length and equal(a.elem, b.elem, env)
         case Tuple(elems=xs), Tuple(elems=ys):
             return len(xs) == len(ys) and all(equal(x, y, env) for x, y in zip(xs, ys))
-        case (Ptr() | Brand()), _:
+        case (Ptr() | NonNull() | Brand()), _:
             return equal(children(a)[0], children(b)[0], env)
     return a == b
 
@@ -279,6 +281,63 @@ class Types:
             case Exists(body=body):
                 return self.zero_size(body)
         return False
+
+    def niche(self, ty: Type) -> Optional[tuple[str, ...]]:
+        """Where a value of `ty` has bytes that hold no value of it: the path (field names, tuple indices,
+        `0` for an array's first element) to its first `NonNull` in layout order, whose all-zero value is
+        none of its values. A struct, tuple or non-empty array has the niche of its first component that
+        has one; a pointer, a primitive, a zero-size type and an enum have none. A type parameter is
+        answered when it is instantiated."""
+        match ty:
+            case NonNull():
+                return ()
+            case Named(args=()) if ty.name not in self.program.types:
+                return None
+        match self.shape(ty):
+            case NonNull():
+                return ()
+            case Struct(fields=fields):
+                parts = list(fields)
+            case Tuple(elems=elems):
+                parts = [(str(k), e) for k, e in enumerate(elems)]
+            case Array(elem=elem, length=length) if length > 0:
+                parts = [("0", elem)]
+            case Exists(body=body):
+                return self.niche(body)
+            case _:
+                return None
+        for label, part in parts:
+            path = self.niche(part)
+            if path is not None:
+                return (label, *path)
+        return None
+
+    def niche_variant(self, variants: tuple[tuple[str, Type], ...]) -> Optional[int]:
+        """The variant an enum of these variants is represented as, when it has the niche layout: one
+        variant's payload has a niche, and the one other variant is zero-size, written as the niche's
+        invalid value. A `NonNull` offers one invalid value, so one dataless variant. Otherwise the enum
+        is a tag and a union of its payloads."""
+        if len(variants) != 2:
+            return None
+        full = [k for k, (_, t) in enumerate(variants) if not self.zero_size(t)]
+        if len(full) != 1 or self.niche(variants[full[0]][1]) is None:
+            return None
+        return full[0]
+
+    def chosen_layout(self, ty: Type) -> bool:
+        """The compiler chooses how `ty`'s value is laid out: an enum or a `NonNull` is in its value
+        representation (named types unfolded; not through a pointer or a function; a type parameter is a
+        leaf)."""
+        match ty:
+            case Enum() | NonNull():
+                return True
+            case Ptr() | Fn() | Brand():
+                return False
+            case Named(args=()) if ty.name not in self.program.types:
+                return False
+            case Named() | Foreach():
+                return self.chosen_layout(self.shape(ty))
+        return any(self.chosen_layout(c) for c in children(ty))
 
     def unfold(self, ty: Named, module: Optional[ModuleId] = None) -> Type:
         """One nominal step: the declaration's body at its arguments.
@@ -353,7 +412,7 @@ class Types:
     def is_copy(self, ty: Type, kinds: Optional[Kinds] = None) -> bool:
         kinds = kinds or {}
         match ty:
-            case Prim() | Ptr() | Brand() | Fn() | Never() | Ignored():
+            case Prim() | Ptr() | NonNull() | Brand() | Fn() | Never() | Ignored():
                 return True
             case Named(name=name, args=()) if name in kinds:
                 return kinds[name] == COPY
@@ -483,6 +542,8 @@ def show(ty: Type) -> str:
             return f"(builtin::Brand {show(brand)})"
         case Ptr(inner=inner):
             return f"(builtin::Pointer {show(inner)})"
+        case NonNull(inner=inner):
+            return f"(builtin::NonNull {show(inner)})"
         case Tuple(elems=elems):
             return f"(tuple {' '.join(map(show, elems))})".replace(" )", ")")
         case Array(elem=elem, length=length):

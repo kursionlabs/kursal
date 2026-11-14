@@ -7,7 +7,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence, Set
 from typing import Never as NoReturn, Optional
 from dataclasses import dataclass, field
 from .core import (BOOL, BRAND, COPY, FLOATS, INTEGERS, U32, UNIT, USIZE, Array, Brand, Enum, Exists, Fn,
-                   Foreach, Ignored, Jmp, Jnz, Named, Never, Prim, Ptr, Ret, Skolem, Struct, Switch, Tuple,
+                   Foreach, Ignored, Jmp, Jnz, Named, Never, NonNull, Prim, Ptr, Ret, Skolem, Struct, Switch, Tuple,
                    Unreachable, Type, Kind, Program, Fun, Instance, Param, Premise, Block, Instr, Terminator, Edge, ModuleId)
 from .sexpr import Form, KursError, List, Position, Str
 from .types import Kinds, children, foreach_binders, foreach_item, Types, equal, fits, free_brands, subst
@@ -37,7 +37,7 @@ SEALED = ("Copy", "builtin::")      # compiler-reserved trait names: no user tra
 
 def contains(ty: Type, pred: Callable[[Type], bool]) -> bool:
     """`pred` holds somewhere in the value representation of `ty`: a pointer's target is not part of it."""
-    return pred(ty) or not isinstance(ty, Ptr) and any(contains(t, pred) for t in children(ty))
+    return pred(ty) or not isinstance(ty, (Ptr, NonNull)) and any(contains(t, pred) for t in children(ty))
 
 
 class CheckError(KursError):
@@ -664,6 +664,13 @@ class Checker:
             self.fail("int_cast_converts_between")
         return instr.ty
 
+    def op_as_pointer(self, instr: Instr) -> Type:
+        """`NonNull T` to `*T`: forgetting that a pointer is not null is safe."""
+        got = self.use(instr.args[0])
+        if not (isinstance(got, NonNull) and equal(Ptr(got.inner), instr.ty)):
+            self.fail("as_pointer_converts_non_null")
+        return instr.ty
+
     def op_unsafe_cast(self, instr: Instr) -> Type:
         if instr.ty is None:
             self.fail("instruction_requires_type")
@@ -673,7 +680,21 @@ class Checker:
             self.fail("unsafe_cast_cannot_produce")
         self.has_memory_form(got)
         self.has_memory_form(instr.ty)
+        self.castable(got, instr.ty)
         return instr.ty
+
+    def castable(self, got: Type, want: Type) -> None:
+        """An unsafe cast reinterprets only representations the program fixes: a `NonNull` is cast
+        only from or to a pointer (whose obligation is that it is not null), and nothing that holds an
+        enum or a `NonNull` within it is cast, since the compiler chooses an enum's layout (a tag, or
+        the niche of a `NonNull`: `Types.niche_variant`). A type parameter cannot be cast at all."""
+        pointers = (Ptr, NonNull)
+        if isinstance(got, NonNull) or isinstance(want, NonNull):
+            if not (isinstance(got, pointers) and isinstance(want, pointers)):
+                self.fail("non_null_cast_pointer")
+            return
+        if self.types.chosen_layout(got) or self.types.chosen_layout(want):
+            self.fail("unsafe_cast_layout_chosen")
 
     def uncastable(self, ty: Type) -> bool:
         """What no unsafe cast may conjure in a value: a package, a brand witness, a function value, a
@@ -695,7 +716,7 @@ class Checker:
         elif instr.op in BITS | {"mod"}:
             ok = integer
         else:
-            ok = isinstance(x, (Prim, Ptr))
+            ok = isinstance(x, (Prim, Ptr, NonNull))
         if not ok:
             self.fail("does_apply")
         return BOOL if instr.op in ORDER | EQUALITY else x
@@ -1045,6 +1066,7 @@ OPERATIONS: dict[str, Callable[[Checker, Instr], Type | list[Type]]] = {
     "construct_variant": Checker.op_construct_variant,
     "variant_tag": Checker.op_variant_tag,
     "builtin::int_cast": Checker.op_int_cast,
+    "builtin::as_pointer": Checker.op_as_pointer,
     "builtin::unsafe::cast": Checker.op_unsafe_cast,
     "call": Checker.op_call,
     "trait_call": Checker.op_trait_call,

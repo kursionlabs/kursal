@@ -35,7 +35,7 @@ from .infer import (POINTER_OPS, AllocaCall, BuiltinCall, ClosureCall, FnCall, F
 from .sexpr import KursError, List, Position, Str
 from .sigs import ConstValue, Sig, Signatures
 from .resolve import Resolver
-from .types import foreach_binders, foreach_item, Types, free_brands, subst
+from .types import equal, foreach_binders, foreach_item, Types, free_brands, subst
 
 BINOPS = {"+": "add", "-": "sub", "*": "mul", "/": "div", "%": "mod", "&": "bit_and", "|": "bit_or",
           "^": "bit_xor", "<<": "shl", ">>": "shr", "==": "eq", "!=": "ne", "<": "lt", "<=": "le",
@@ -619,6 +619,9 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         src, dst = self.vty[v], self.substitute_type(expr.ty)
         if isinstance(src, C.Prim) and isinstance(dst, C.Prim) and src.name in C.INTEGERS and dst.name in C.INTEGERS:
             return self.emit("builtin::int_cast", dst, (v,), ty=dst)
+        # Forgetting that a pointer is not null is safe.
+        if isinstance(src, C.NonNull) and isinstance(dst, C.Ptr) and equal(src.inner, dst.inner):
+            return self.emit("builtin::as_pointer", dst, (v,), ty=dst)
         # Casts do not inspect nominal layout or unfold abstract type parameters.
         # Those representation obligations belong to the unsafe C boundary.
         if isinstance(src, C.Exists) or isinstance(dst, C.Exists):

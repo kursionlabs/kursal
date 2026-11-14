@@ -328,6 +328,16 @@ fn is_ptr(t: Type['k]) -> bool {
     }
 }
 
+// A pointer or a `NonNull`.
+forall 'k.
+fn is_pointer_like(t: Type['k]) -> bool {
+    match t {
+        Type::Ptr(_inner) => true,
+        Type::NonNull(_inner) => true,
+        _ => false,
+    }
+}
+
 forall 'k.
 fn is_foreach(t: Type['k]) -> bool {
     match t {
@@ -457,6 +467,8 @@ exposed struct Backend {
     types: Types['k],
     // representation key -> C type name
     names: ArenaMap[Type['k], Span['k], 'k],
+    // an enum in the niche layout -> its payload's representation key
+    represented: ArenaMap[Type['k], Type['k], 'k],
     // a type as written -> its C type, once `ctype` has named and defined it
     ctypes: ArenaMap[Type['k], Span['k], 'k],
     // a name -> `readable` of it
@@ -600,6 +612,7 @@ impl Backend['k] {
             counter,
             types: Types::new(&cx, program, counter),
             names: ArenaMap::new(&cx),
+            represented: ArenaMap::new(&cx),
             ctypes: ArenaMap::new(&cx),
             readables: ArenaMap::new(&cx),
             pending: ArenaMap::new(&cx),
@@ -685,13 +698,18 @@ impl Backend['k] {
                 let inner = erase(&cx, inner.copy(&cx), self.types);
                 return Buffer::new().push_bytes(&cx, self.ctype(&cx, inner, false)).push_static("*").save(&cx);
             },
+            Type::NonNull(inner) => {
+                let inner = erase(&cx, inner.copy(&cx), self.types);
+                return Buffer::new().push_bytes(&cx, self.ctype(&cx, inner, false)).push_static("*").save(&cx);
+            },
             _ => (),
         };
         if !self.names.contains(&cx, ty) {
             self.register(&cx, ty);
         }
-        if defined && self.pending.contains(&cx, ty) {
-            self.define(&cx, ty);
+        let key = self.represented.get_or(&cx, ty, ty);
+        if defined && self.pending.contains(&cx, key) {
+            self.define(&cx, key);
         }
         self.names.at(&cx, ty)
     }
@@ -713,7 +731,16 @@ impl Backend['k] {
             Type::Tuple(_elems) => self.aggregate(&cx, ty, s, Span::from_static(&cx, "tuple")),
             Type::Struct(_fields) => self.aggregate(&cx, ty, s, Span::from_static(&cx, "struct")),
             Type::Array(_elem, _length) => self.aggregate(&cx, ty, s, Span::from_static(&cx, "array")),
-            Type::Enum(_variants) => self.aggregate(&cx, ty, s, Span::from_static(&cx, "enum")),
+            Type::Enum(variants) => match self.types.niche_variant(&cx, variants) {
+                // The niche layout: the payload's C type, the other variant a null at the niche.
+                Option::Some(k) => {
+                    let payload = erase(&cx, variants.at(&cx, k).type, self.types);
+                    let name = self.ctype(&cx, payload, false);
+                    self.names.insert(&cx, ty, name);
+                    self.represented.insert(&cx, ty, payload);
+                },
+                Option::None => self.aggregate(&cx, ty, s, Span::from_static(&cx, "enum")),
+            },
             Type::Fn(f) => {
                 let name = self.fresh_name(&cx, Span::from_static(&cx, "fn"));
                 self.names.insert(&cx, ty, name);
@@ -811,6 +838,41 @@ impl Backend['k] {
         out
     }
 
+    // (C member, component type) of the component `label` (a field name or a tuple index) of a
+    // struct or tuple shape.
+    fn member_of(self, &cx: Domain!['k], shape: Type['k], label: Span['k]) -> (Span['k], Type['k]) {
+        let names: ArenaVec[Span['k], 'k] = match shape {
+            Type::Struct(fields) => {
+                let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+                var f = 0usize;
+                while f < fields.len(&cx) {
+                    out.push(&cx, fields.at(&cx, f).name);
+                    f = f + 1usize;
+                }
+                out
+            },
+            Type::Tuple(elems) => {
+                let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+                var e = 0usize;
+                while e < elems.len(&cx) {
+                    out.push(&cx, Buffer::new().push_usize(e).save(&cx));
+                    e = e + 1usize;
+                }
+                out
+            },
+            _ => fail_text(&cx, Span::from_static(&cx, "internal error: a component of a type that is not a product")),
+        };
+        let rows = self.members(&cx, shape);
+        var k = names.len(&cx);
+        while k > 0usize {
+            k = k - 1usize;
+            if names.at(&cx, k).eq(&cx, label) {
+                return rows.at(&cx, k);
+            }
+        }
+        fail_text(&cx, Span::from_static(&cx, "internal error: no such component"))
+    }
+
     fn component(self, &cx: Domain!['k], name: Span['k], prefix: Span['k]) -> Span['k] {
         let key = (prefix, name);
         if !self.component_names.contains(&cx, key) {
@@ -825,6 +887,99 @@ impl Backend['k] {
 
     fn shape(self, &cx: Domain!['k], ty: Type['k]) -> Type['k] {
         self.types.shape(&cx, erase(&cx, ty, self.types), Option::None)
+    }
+
+    // ------------------------------------------------------------ enum layouts --
+
+    // For an enum in the niche layout (`Types::niche_variant`): the index of the variant it is
+    // represented as, and the C access from a value of it to the niche's pointer (`""` when the
+    // payload is that pointer).
+    fn niche_layout(self, &cx: Domain!['k], ty: Type['k]) -> Option[(usize, Span['k])] {
+        let variants = self.types.variants(&cx, erase(&cx, ty, self.types), Option::None);
+        let k = match self.types.niche_variant(&cx, variants) {
+            Option::Some(k) => k,
+            Option::None => return Option::None,
+        };
+        var payload = variants.at(&cx, k).type;
+        let path = match self.types.niche(&cx, payload) {
+            Option::Some(p) => p,
+            Option::None => fail_text(&cx, Span::from_static(&cx, "internal error: a niche variant without a niche")),
+        };
+        var access = Span::from_static(&cx, "");
+        var i = 0usize;
+        while i < path.len(&cx) {
+            let s = self.shape(&cx, payload);
+            let unit = match s {
+                Type::Array(elem, _length) => {
+                    access = access.concat(&cx, Span::from_static(&cx, ".items[0]"));
+                    payload = elem.copy(&cx);
+                },
+                _ => {
+                    let (member, t) = self.member_of(&cx, s, path.at(&cx, i));
+                    access = Buffer::new().push_bytes(&cx, access).push_static(".").push_bytes(&cx, member).save(&cx);
+                    payload = t;
+                },
+            };
+            i = i + 1usize;
+        }
+        Option::Some.((k, access))
+    }
+
+    // The index of the variant a value of the enum `ty` holds, as C.
+    fn tag(self, &cx: Domain!['k], source: Span['k], ty: Type['k]) -> Span['k] {
+        match self.niche_layout(&cx, ty) {
+            Option::Some(layout) => {
+                let (k, access) = layout;
+                Buffer::new().push_static("(").push_bytes(&cx, source).push_bytes(&cx, access).push_static(" == 0 ? ").push_usize(1usize - k)
+                    .push_static(" : ").push_usize(k).push_static(")").save(&cx)
+            },
+            Option::None => Buffer::new().push_bytes(&cx, source).push_static(".tag").save(&cx),
+        }
+    }
+
+    // The C object of one variant's payload within a value or place of the enum `ty`.
+    fn payload(self, &cx: Domain!['k], source: Span['k], ty: Type['k], variant: Span['k]) -> Span['k] {
+        match self.niche_layout(&cx, ty) {
+            Option::Some(_layout) => source,
+            Option::None => Buffer::new().push_bytes(&cx, source).push_static(".payload.").push_bytes(&cx, self.variant(&cx, variant)).save(&cx),
+        }
+    }
+
+    // C that makes `dst` hold `variant` of the enum `ty`, with the payload `value` (none for a payload
+    // of a zero-size type). In the niche layout, the payload variant is its payload; the other is the
+    // null at the niche, and the rest of the object is not written.
+    fn set_variant(self, &cx: Domain!['k], dst: Span['k], ty: Type['k], variant: Span['k], value: Option[Span['k]]) -> ArenaVec[Span['k], 'k] {
+        let variants = self.types.variants(&cx, erase(&cx, ty, self.types), Option::None);
+        var index = 0usize;
+        while index < variants.len(&cx) && !variants.at(&cx, index).name.eq(&cx, variant) {
+            index = index + 1usize;
+        }
+        let value_text = match value {
+            Option::Some(v) => v,
+            Option::None => Span::from_static(&cx, "None"),
+        };
+        match self.niche_layout(&cx, ty) {
+            Option::Some(layout) => {
+                let (k, access) = layout;
+                if index == k {
+                    ArenaVec::one(&cx, Buffer::new().push_bytes(&cx, dst).push_static(" = ").push_bytes(&cx, value_text).push_static(";").save(&cx))
+                } else {
+                    ArenaVec::one(&cx, Buffer::new().push_bytes(&cx, dst).push_bytes(&cx, access).push_static(" = 0;").save(&cx))
+                }
+            },
+            Option::None => {
+                let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+                let unit = match value {
+                    Option::Some(v) => {
+                        out.push(&cx, Buffer::new().push_bytes(&cx, dst).push_static(".payload.").push_bytes(&cx, self.variant(&cx, variant)).push_static(" = ")
+                            .push_bytes(&cx, v).push_static(";").save(&cx));
+                    },
+                    Option::None => (),
+                };
+                out.push(&cx, Buffer::new().push_bytes(&cx, dst).push_static(".tag = ").push_usize(index).push_static(";").save(&cx));
+                out
+            },
+        }
     }
 
     // `ty` has no C representation: it is zero-size (Never included).
@@ -1416,7 +1571,7 @@ impl Backend['k] {
             let s = self.shape(&cx, ty);
             match s {
                 Type::Enum(variants) => {
-                    expr = Buffer::new().push_bytes(&cx, expr).push_static(".payload.").push_bytes(&cx, self.variant(&cx, seg)).save(&cx);
+                    expr = self.payload(&cx, expr, ty, seg);
                     ty = last_member(&cx, variants, seg);
                 },
                 _ => {
@@ -1536,21 +1691,16 @@ impl Backend['k] {
                 Option::Some(l) => l,
                 Option::None => Span::from_static(&cx, ""),
             };
-            let variants = self.types.variants(&cx, erase(&cx, self.type_operand(&cx, instr), self.types), Option::None);
-            var index = 0usize;
-            var found = false;
-            while !found && index < variants.len(&cx) {
-                if variants.at(&cx, index).name.eq(&cx, lit) {
-                    found = true;
-                } else {
-                    index = index + 1usize;
-                }
+            let ty = self.type_operand(&cx, instr);
+            let variants = self.types.variants(&cx, erase(&cx, ty, self.types), Option::None);
+            let payload = last_member(&cx, variants, lit);
+            let value = if self.erased(&cx, payload) { Option::None } else { Option::Some.(self.value_name(&cx, a.at(&cx, 0usize))) };
+            let statements = self.set_variant(&cx, d, ty, lit, value);
+            var s = 0usize;
+            while s < statements.len(&cx) {
+                line(&lines, Buffer::new().push_bytes(&cx, statements.at(&cx, s)));
+                s = s + 1usize;
             }
-            if !self.erased(&cx, variants.at(&cx, index).type) {
-                let member = self.variant(&cx, lit);
-                line(&lines, Buffer::new().push_bytes(&cx, d).push_static(".payload.").push_bytes(&cx, member).push_static(" = ").push_bytes(&cx, self.value_name(&cx, a.at(&cx, 0usize))).push_static(";"));
-            }
-            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(".tag = ").push_usize(index).push_static(";"));
         } else if op.is(&cx, "variant_tag") {
             let source = if a.at(&cx, 0usize).starts_with(&cx, Span::from_static(&cx, "&")) {
                 let (expr, _ty) = self.place(&cx, a.at(&cx, 0usize));
@@ -1558,7 +1708,9 @@ impl Backend['k] {
             } else {
                 self.value_name(&cx, a.at(&cx, 0usize))
             };
-            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, source).push_static(".tag;"));
+            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, self.tag(&cx, source, self.type_operand(&cx, instr))).push_static(";"));
+        } else if op.is(&cx, "builtin::as_pointer") {
+            line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, self.value_name(&cx, a.at(&cx, 0usize))).push_static(";"));
         } else if op.is(&cx, "builtin::int_cast") {
             let value = self.value_name(&cx, a.at(&cx, 0usize));
             line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, self.convert(&cx, value, self.type_operand(&cx, instr))).push_static(";"));
@@ -1743,7 +1895,7 @@ impl Backend['k] {
         let s = self.shape(&cx, src);
         let d = self.shape(&cx, dst_ty);
         let cd = self.c(&cx, dst_ty);
-        if is_ptr(s) || is_ptr(d) {
+        if is_pointer_like(s) || is_pointer_like(d) {
             let s_int = match s {
                 Type::Prim(n) => C::is_integer(&cx, n),
                 _ => false,
@@ -1752,9 +1904,9 @@ impl Backend['k] {
                 Type::Prim(n) => C::is_integer(&cx, n),
                 _ => false,
             };
-            if is_ptr(s) && is_ptr(d) {
+            if is_pointer_like(s) && is_pointer_like(d) {
                 line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = (").push_bytes(&cx, cd).push_static(")").push_bytes(&cx, expr).push_static(";"));
-            } else if is_ptr(s) && d_int || is_ptr(d) && s_int {
+            } else if is_pointer_like(s) && d_int || is_pointer_like(d) && s_int {
                 let value = Buffer::new().push_static("(uintptr_t)").push_bytes(&cx, expr).save(&cx);
                 let converted = if d_int { self.convert(&cx, value, d) } else { Buffer::new().push_static("(").push_bytes(&cx, cd).push_static(")").push_bytes(&cx, value).save(&cx) };
                 line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = ").push_bytes(&cx, converted).push_static(";"));
@@ -1800,11 +1952,11 @@ impl Backend['k] {
         let x = self.value_name(&cx, args.at(&cx, 0usize));
         let y = self.value_name(&cx, args.at(&cx, 1usize));
         let t = self.shape(&cx, self.type_of(&cx, args.at(&cx, 0usize)));
+        if is_pointer_like(t) {
+            line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = ((uintptr_t)").push_bytes(&cx, x).push_static(" ").push_bytes(&cx, c_op(&cx, op)).push_static(" (uintptr_t)").push_bytes(&cx, y).push_static(");"));
+            return ();
+        }
         let name = match t {
-            Type::Ptr(_inner) => {
-                line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = ((uintptr_t)").push_bytes(&cx, x).push_static(" ").push_bytes(&cx, c_op(&cx, op)).push_static(" (uintptr_t)").push_bytes(&cx, y).push_static(");"));
-                return ();
-            },
             Type::Prim(n) => n,
             _ => fail_text(&cx, Span::from_static(&cx, "internal error: a primitive operation on a value that is not primitive")),
         };
@@ -2017,15 +2169,22 @@ impl Backend['k] {
                         Type::Enum(variants) => variants,
                         _ => fail_text(&cx, Span::from_static(&cx, "internal error: a foreach over an enum that makes no enum")),
                     };
-                    line(&lines, Buffer::new().push_static("switch (").push_bytes(&cx, source).push_static(".tag) {"));
+                    let source_type = self.type_of(&cx, instr.args.at(&cx, 0usize));
+                    let result_type = Type::Foreach.(t);
+                    line(&lines, Buffer::new().push_static("switch (").push_bytes(&cx, self.tag(&cx, source, source_type)).push_static(") {"));
                     var k = 0usize;
                     while k < rows.len(&cx) && k < results.len(&cx) {
                         let row = rows.at(&cx, k);
-                        let member = self.variant(&cx, row.label);
-                        let target = Buffer::new().push_bytes(&cx, dst).push_static(".payload.").push_bytes(&cx, member).save(&cx);
-                        let applied = walk.apply(&cx, row, Buffer::new().push_bytes(&cx, source).push_static(".payload.").push_bytes(&cx, member).save(&cx));
-                        line(&lines, Buffer::new().push_static("case ").push_usize(k).push_static(": ").push_bytes(&cx, self.assign_result(&cx, target, results.at(&cx, k).type, applied))
-                            .push_static(" ").push_bytes(&cx, dst).push_static(".tag = ").push_usize(k).push_static("; break;"));
+                        let applied = walk.apply(&cx, row, self.payload(&cx, source, source_type, row.label));
+                        let body = if self.erased(&cx, results.at(&cx, k).type) {
+                            Buffer::new().push_bytes(&cx, applied).push_static("; ").push_bytes(&cx, self.set_variant(&cx, dst, result_type, row.label, Option::None).join(&cx, " ")).save(&cx)
+                        } else {
+                            match self.niche_layout(&cx, result_type) {
+                                Option::Some(_layout) => Buffer::new().push_bytes(&cx, dst).push_static(" = ").push_bytes(&cx, applied).push_static(";").save(&cx),
+                                Option::None => self.set_variant(&cx, dst, result_type, row.label, Option::Some.(applied)).join(&cx, " "),
+                            }
+                        };
+                        line(&lines, Buffer::new().push_static("case ").push_usize(k).push_static(": ").push_bytes(&cx, body).push_static(" break;"));
                         k = k + 1usize;
                     }
                     line(&lines, Buffer::new().push_static("default: KUR_TRAP();\n  }"));
@@ -2216,8 +2375,9 @@ impl Backend['k] {
         } else {
             self.value_name(&cx, arg)
         };
-        let variants = self.types.variants(&cx, erase(&cx, self.substitute_type(&cx, ty), self.types), Option::None);
-        line(&lines, Buffer::new().push_static("switch (").push_bytes(&cx, source).push_static(".tag) {"));
+        let ty = self.substitute_type(&cx, ty);
+        let variants = self.types.variants(&cx, erase(&cx, ty, self.types), Option::None);
+        line(&lines, Buffer::new().push_static("switch (").push_bytes(&cx, self.tag(&cx, source, ty)).push_static(") {"));
         var i = 0usize;
         while i < arms.len(&cx) {
             let arm = arms.at(&cx, i);
@@ -2236,7 +2396,7 @@ impl Backend['k] {
             } else if self.erased(&cx, variants.at(&cx, index).type) {
                 Option::Some.(Span::from_static(&cx, ""))
             } else {
-                Option::Some.(Buffer::new().push_bytes(&cx, source).push_static(".payload.").push_bytes(&cx, self.variant(&cx, arm.variant)).save(&cx))
+                Option::Some.(self.payload(&cx, source, ty, arm.variant))
             };
             line(&lines, Buffer::new().push_static("  {"));
             self.edge(&cx, &lines, arm.edge, payload, source, Span::from_static(&cx, "    "));
