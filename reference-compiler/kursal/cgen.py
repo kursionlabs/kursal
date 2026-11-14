@@ -11,6 +11,9 @@ returns `void`; constructing, destructuring, copying, loading or storing one wri
 to one is a `void*`. The one C object a zero-size type gets is a `data` of it, whose address the
 program observes: a `char`.
 
+An enum is a tag and a union of its payloads, or, in the niche layout (`Types.niche_variant`), its one
+payload with a niche, the other variant a null there (`niche_layout`, `tag`, `payload`, `set_variant`).
+
 What a function's C leaves out (dead values, copies, forwarded places, return joins) is decided by
 plan.py. Beyond that the backend makes calls in tail position jumps (`tail_call`), and qualifies
 place parameters `const` and `restrict` where the whole program allows it (`qualifiers`)."""

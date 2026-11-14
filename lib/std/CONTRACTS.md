@@ -20,8 +20,8 @@ Each function is classified by **signature alone**:
 - **class A**: some parameter's type mentions a `Brand` **and** the return
   type mentions a capability (`core::cap::Exclusive`/`Shared`/`SharedJoin`/
   `SharedResume`, or `core::mem::Region`/`RegionResume`);
-- **class B**: not class A, and a raw pointer type occurs anywhere in a
-  parameter type or the return type;
+- **class B**: not class A, and a raw pointer type (`*T`, or the builtin
+  `NonNull[T]`) occurs anywhere in a parameter type or the return type;
 - **class C**: neither.
 
 Classification is **never by name.** There is no function visibility: every
