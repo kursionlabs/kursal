@@ -10,12 +10,12 @@ TYPES = """
 (fun touch u32 (H) (entry ((&h H)) (= %r (const u32 1)) (ret %r)))
 (fun two u32 (H Box) (entry ((&h H) (&x Box)) (= %r (const u32 2)) (ret %r)))
 (fun eat u32 (H) (entry ((%h H)) (= %n (destruct %h H)) (ret %n)))
-(type Pk! (struct (pkg (exists ($h) (tuple u32 (builtin::Brand $h))))))
-(fun peek_t (forall ($b) () u32 ((tuple u32 (builtin::Brand $b)))
-  (entry ((&t (tuple u32 (builtin::Brand $b)))) (= %n (load &t.0)) (ret %n))))
+(type Pk! (struct (pkg (exists ($h) (tuple u32 (brand $h))))))
+(fun peek_t (forall ($b) () u32 ((tuple u32 (brand $b)))
+  (entry ((&t (tuple u32 (brand $b)))) (= %n (load &t.0)) (ret %n))))
 """
 
-PACK = "(exists ($h) (tuple u32 (builtin::Brand $h)))"
+PACK = "(exists ($h) (tuple u32 (brand $h)))"
 
 CASES = {
     "copy_field": (True, None, """(fun bump u32 (Cur u32) (entry ((&c Cur) (%by u32))
@@ -85,8 +85,8 @@ CASES = {
     "pack_place_not_open": (False, 'open_at_those_brands', """(fun f u32 (Pk) (entry ((&k Pk)) (= %u (pack PACK $static &k.pkg)) (= %r (const u32 0)) (ret %r)))"""),
     "open_place_twice": (False, 'place_already_open', """(fun f u32 (Pk) (entry ((&k Pk)) (= %u (open &k.pkg ($a))) (= %u2 (open &k.pkg ($b))) (= %r (const u32 0)) (ret %r)))"""),
     "variant_tag_place": (True, None, """(fun f u32 (Holder) (entry ((&x Holder)) (= %t (variant_tag &x.e E)) (ret %t)))"""),
-    "target_lend": (True, None, """(fun f u32 ((builtin::Pointer H)) (entry ((%p (builtin::Pointer H))) (unsafe (= %r (call touch &*%p))) (ret %r)))"""),
-    "target_lend_needs_unsafe": (False, 'unsafe_authorization', """(fun f u32 ((builtin::Pointer H)) (entry ((%p (builtin::Pointer H))) (= %r (call touch &*%p)) (ret %r)))"""),
+    "target_lend": (True, None, """(fun f u32 ((ptr H)) (entry ((%p (ptr H))) (unsafe (= %r (call touch &*%p))) (ret %r)))"""),
+    "target_lend_needs_unsafe": (False, 'unsafe_authorization', """(fun f u32 ((ptr H)) (entry ((%p (ptr H))) (= %r (call touch &*%p)) (ret %r)))"""),
     # Every edge carries the place state, a one-variant arm of a switch over
     # a value too: here the arm would load `&b.h` a second time.
     "value_switch_arm_state": (False, 'empty_assumes_full', """(fun f u32 (Box E) (entry ((&b Box) (%e E))
@@ -96,17 +96,17 @@ CASES = {
     # A local place whose type names a block's own brand may not reach the
     # next block full: the `open` in the loop names the same brand each time,
     # so the witness kept in it would pass for the next package's.
-    "local_block_brand_across_edge": (False, 'local types may mention only', """(fun g u32 () (locals (&q (builtin::Brand $a)))
-  (entry () (= %f (builtin::fresh)) (= %b (open %f ($a))) (= %u (store &q %b)) (jmp loop))
-  (loop () (= %f2 (builtin::fresh)) (= %b2 (open %f2 ($a))) (= %c (load &q)) (= %u2 (store &q %b2)) (jmp loop)))"""),
+    "local_block_brand_across_edge": (False, 'local types may mention only', """(fun g u32 () (locals (&q (brand $a)))
+  (entry () (= %f (fresh)) (= %b (open %f ($a))) (= %u (store &q %b)) (jmp loop))
+  (loop () (= %f2 (fresh)) (= %b2 (open %f2 ($a))) (= %c (load &q)) (= %u2 (store &q %b2)) (jmp loop)))"""),
     # Even an empty declaration cannot mention a body-local brand.
-    "local_block_brand_dropped": (False, 'local types may mention only', """(fun g u32 () (locals (&q (builtin::Brand $a)))
+    "local_block_brand_dropped": (False, 'local types may mention only', """(fun g u32 () (locals (&q (brand $a)))
   (entry () (jmp loop))
-  (loop () (empty &q) (= %f (builtin::fresh)) (= %b (open %f ($a))) (= %u (store &q %b)) (jmp loop)))"""),
+  (loop () (empty &q) (= %f (fresh)) (= %b (open %f ($a))) (= %u (store &q %b)) (jmp loop)))"""),
     # Emptying or reading the slot before an edge does not repair its declaration.
-    "local_block_brand_emptied": (False, 'local types may mention only', """(fun g u32 () (locals (&q (builtin::Brand $a)))
+    "local_block_brand_emptied": (False, 'local types may mention only', """(fun g u32 () (locals (&q (brand $a)))
   (entry () (jmp loop))
-  (loop () (empty &q) (= %f (builtin::fresh)) (= %b (open %f ($a))) (= %u (store &q %b)) (= %c (load &q)) (jmp loop)))"""),
+  (loop () (empty &q) (= %f (fresh)) (= %b (open %f ($a))) (= %u (store &q %b)) (= %c (load &q)) (jmp loop)))"""),
 }
 
 CASES = {name: (accepted, message, program.replace("PACK", PACK))

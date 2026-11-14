@@ -112,9 +112,9 @@ def instruction_text(instr: C.Instr, depth: int, omit_unit: bool = False) -> str
             operands = [ty, *args]
         elif op == "construct_variant":
             operands = [ty, literal, *args]
-        elif op in ("builtin::int_cast", "builtin::unsafe::cast", "builtin::as_pointer"):
+        elif op in ("int_cast", "cast", "to_ptr"):
             operands = [*args, ty]
-        elif op in ("alloca", "builtin::sizeof"):
+        elif op in ("alloca", "sizeof"):
             operands = [ty]
         elif instr.lit is not None:
             operands = [literal, *args]

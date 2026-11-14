@@ -578,7 +578,7 @@ impl FnLower['k] {
             Option::None => false,
         };
         let discharged = o.discharged || self.discharge_all || marked;
-        if (o.name.starts_with(&cx, Span::from_static(&cx, "builtin::unsafe::")) || o.name.is(&cx, "alloca")) && !(discharged || self.sig.is_unsafe) {
+        if C::is_unsafe_op(&cx, o.name) && !(discharged || self.sig.is_unsafe) {
             self.fail(&cx, Buffer::new().push_bytes(&cx, o.name).push_static(" requires unsafe authorization").save(&cx), pos);
         }
         self.current(&cx).instrs.push(&cx, Instr.{ lhs: ArenaVec::one(&cx, name), op: o.name, args: o.args, ty: o.ty, tys: o.tys, lit: o.lit,
@@ -1094,7 +1094,7 @@ impl FnLower['k] {
             Expr::Path(p) => self.expr_path(&cx, p),
             Expr::Tuple(n) => self.expr_tuple(&cx, n.id, n.value),
             Expr::Array(a) => self.expr_tuple(&cx, a.id, a.elems),
-            Expr::Sizeof(n) => Option::Some.(self.emit(&cx, Op::new(&cx, "builtin::sizeof", C::usize_type(&cx), ArenaVec::new(&cx))
+            Expr::Sizeof(n) => Option::Some.(self.emit(&cx, Op::new(&cx, "sizeof", C::usize_type(&cx), ArenaVec::new(&cx))
                 .typed(self.substitute_type(&cx, self.results().targets.at(&cx, n.id))))),
             Expr::StructLit(s) => self.expr_struct_lit(&cx, s),
             Expr::Block(b) => self.expr_block(&cx, b),
@@ -1108,7 +1108,7 @@ impl FnLower['k] {
             Expr::Unary(u) => self.expr_unary(&cx, u),
             Expr::Cast(c) => self.expr_cast(&cx, c),
             Expr::UnsafeStore(s) => match self.operands(&cx, ArenaVec::two(&cx, Item::Expr.(s.pointer.copy(&cx)), Item::Expr.(s.value.copy(&cx))), Option::None) {
-                Option::Some(vals) => Option::Some.(self.emit(&cx, Op::new(&cx, "builtin::unsafe::store", C::unit(&cx), vals).from_node(s.id, s.pos))),
+                Option::Some(vals) => Option::Some.(self.emit(&cx, Op::new(&cx, "ptr_store", C::unit(&cx), vals).from_node(s.id, s.pos))),
                 Option::None => Option::None,
             },
             Expr::Field(f) => self.expr_field(&cx, e, f.id),
@@ -1136,8 +1136,8 @@ impl FnLower['k] {
         let u8_type = C::prim(&cx, "u8");
         let fixed = Type::Skolem.(Span::from_static(&cx, "static"));
         let d = self.emit(&cx, Op::new(&cx, "data", C::ptr(&cx, Type::Array.(Ref::new(&cx, u8_type), n as u64)), ArenaVec::one(&cx, data)));
-        let p = self.emit(&cx, Op::new(&cx, "builtin::unsafe::cast", C::ptr(&cx, u8_type), ArenaVec::one(&cx, d)).typed(C::ptr(&cx, u8_type)).discharge(true));
-        let brand = self.emit(&cx, Op::new(&cx, "builtin::unsafe::static_brand", Type::Brand.(Ref::new(&cx, fixed)), ArenaVec::new(&cx)).discharge(true));
+        let p = self.emit(&cx, Op::new(&cx, "cast", C::ptr(&cx, u8_type), ArenaVec::one(&cx, d)).typed(C::ptr(&cx, u8_type)).discharge(true));
+        let brand = self.emit(&cx, Op::new(&cx, "static_brand", Type::Brand.(Ref::new(&cx, fixed)), ArenaVec::new(&cx)).discharge(true));
         let length = self.constant(&cx, C::usize_type(&cx), Buffer::new().push_usize(n).save(&cx));
         let sig = self.lowering.library_sig(&cx, "Slice::from_raw_parts", self.home);
         let slice_ty = Type::Named.(self.lowering.library_name(&cx, "Slice", self.home), ArenaVec::two(&cx, u8_type, fixed));
@@ -1266,7 +1266,7 @@ impl FnLower['k] {
         }
         if op.is(&cx, "*") {
             return match self.expr(&cx, u.operand.copy(&cx)) {
-                Option::Some(p) => Option::Some.(self.emit(&cx, Op::new(&cx, "builtin::unsafe::deref", self.substitute_type(&cx, self.type_of(&cx, u.id)), ArenaVec::one(&cx, p))
+                Option::Some(p) => Option::Some.(self.emit(&cx, Op::new(&cx, "ptr_load", self.substitute_type(&cx, self.type_of(&cx, u.id)), ArenaVec::one(&cx, p))
                     .from_node(u.id, u.pos))),
                 Option::None => Option::None,
             };
@@ -1329,7 +1329,7 @@ impl FnLower['k] {
             _ => false,
         };
         if integers {
-            return Option::Some.(self.emit(&cx, Op::new(&cx, "builtin::int_cast", dst, ArenaVec::one(&cx, v)).typed(dst)));
+            return Option::Some.(self.emit(&cx, Op::new(&cx, "int_cast", dst, ArenaVec::one(&cx, v)).typed(dst)));
         }
         // Forgetting that a pointer is not null is safe.
         let forgets = match src {
@@ -1340,7 +1340,7 @@ impl FnLower['k] {
             _ => false,
         };
         if forgets {
-            return Option::Some.(self.emit(&cx, Op::new(&cx, "builtin::as_pointer", dst, ArenaVec::one(&cx, v)).typed(dst)));
+            return Option::Some.(self.emit(&cx, Op::new(&cx, "to_ptr", dst, ArenaVec::one(&cx, v)).typed(dst)));
         }
         // Casts do not inspect nominal layout or unfold abstract type parameters. Those
         // representation obligations belong to the unsafe C boundary.
@@ -1354,7 +1354,7 @@ impl FnLower['k] {
         if package {
             self.fails(&cx, "a cast cannot consume or produce an outer existential package; use opening or packing", c.pos);
         }
-        Option::Some.(self.emit(&cx, Op::new(&cx, "builtin::unsafe::cast", dst, ArenaVec::one(&cx, v)).typed(dst).from_node(c.id, c.pos)))
+        Option::Some.(self.emit(&cx, Op::new(&cx, "cast", dst, ArenaVec::one(&cx, v)).typed(dst).from_node(c.id, c.pos)))
     }
 
     fn expr_field(self, &cx: Domain!['k], e: Expr['k], id: u32) -> Option[Span['k]] {
@@ -1693,10 +1693,10 @@ impl FnLower['k] {
     fn builtin(self, &cx: Domain!['k], c: S::Call['k], name: Span['k]) -> Option[Span['k]] {
         let rty = self.substitute_type(&cx, self.type_of(&cx, c.id));
         if name.is(&cx, "fresh") {
-            return Option::Some.(self.emit(&cx, Op::new(&cx, "builtin::fresh", rty, ArenaVec::new(&cx))));
+            return Option::Some.(self.emit(&cx, Op::new(&cx, "fresh", rty, ArenaVec::new(&cx))));
         }
         if name.is(&cx, "static_brand") {
-            return Option::Some.(self.emit(&cx, Op::new(&cx, "builtin::unsafe::static_brand", rty, ArenaVec::new(&cx)).from_node(c.id, c.pos)));
+            return Option::Some.(self.emit(&cx, Op::new(&cx, "static_brand", rty, ArenaVec::new(&cx)).from_node(c.id, c.pos)));
         }
         if name.is(&cx, "enum_variant") {
             let arg = c.args.at(&cx, 0usize);
@@ -1719,16 +1719,16 @@ impl FnLower['k] {
         }
         if name.is(&cx, "fence") {
             let order = self.atomic_ordering(&cx, Span::from_static(&cx, "fence"), c.args);
-            return Option::Some.(self.emit(&cx, Op::new(&cx, "builtin::unsafe::atomic_fence", C::unit(&cx), ArenaVec::new(&cx)).literal(order).from_node(c.id, c.pos)));
+            return Option::Some.(self.emit(&cx, Op::new(&cx, "fence", C::unit(&cx), ArenaVec::new(&cx)).literal(order).from_node(c.id, c.pos)));
         }
         let operands = match self.operands(&cx, FnLower::exprs(&cx, c.args), Option::None) {
             Option::Some(o) => o,
             Option::None => return Option::None,
         };
         if name.is(&cx, "load_volatile") {
-            return Option::Some.(self.emit(&cx, Op::new(&cx, "builtin::unsafe::load_volatile", rty, operands).from_node(c.id, c.pos)));
+            return Option::Some.(self.emit(&cx, Op::new(&cx, "ptr_load_volatile", rty, operands).from_node(c.id, c.pos)));
         }
-        Option::Some.(self.emit(&cx, Op::new(&cx, "builtin::unsafe::store_volatile", C::unit(&cx), operands).from_node(c.id, c.pos)))
+        Option::Some.(self.emit(&cx, Op::new(&cx, "ptr_store_volatile", C::unit(&cx), operands).from_node(c.id, c.pos)))
     }
 
     fn ordering(self, &cx: Domain!['k], e: Expr['k]) -> Span['k] {
@@ -1767,17 +1767,13 @@ impl FnLower['k] {
             Option::Some(o) => o,
             Option::None => return Option::None,
         };
-        let op = if name.is(&cx, "load") {
-            Span::from_static(&cx, "deref")
-        } else if name.is(&cx, "compare_exchange") {
-            Span::from_static(&cx, "atomic_compare_exchange")
-        } else if name.starts_with(&cx, Span::from_static(&cx, "store")) || name.starts_with(&cx, Span::from_static(&cx, "load_")) || name.starts_with(&cx, Span::from_static(&cx, "atomic_")) {
-            name
+        let op = if name.is(&cx, "load") || name.is(&cx, "store") || name.is(&cx, "load_volatile") || name.is(&cx, "store_volatile") {
+            Buffer::new().push_static("ptr_").push_bytes(&cx, name).save(&cx)
         } else {
-            Buffer::new().push_static("atomic_").push_bytes(&cx, name).save(&cx)
+            Buffer::new().push_static("ptr_atomic_").push_bytes(&cx, kind).save(&cx)
         };
         let rty = self.substitute_type(&cx, self.type_of(&cx, c.id));
-        Option::Some.(self.emit(&cx, Op::named(&cx, Buffer::new().push_static("builtin::unsafe::").push_bytes(&cx, op).save(&cx), rty, operands).maybe_literal(orders)
+        Option::Some.(self.emit(&cx, Op::named(&cx, op, rty, operands).maybe_literal(orders)
             .from_node(c.id, c.pos)))
     }
 

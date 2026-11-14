@@ -11,8 +11,8 @@ class LocalScopeTests(unittest.TestCase):
     run_source = test_closure_boundary.ClosureBoundaryTests.run_source
 
     def test_unused_local_cannot_reference_open_block_or_static_brand(self):
-        for ty in ('(builtin::Brand $k)', '(builtin::Pointer (builtin::Brand $k))',
-                   '(builtin::Brand $static)'):
+        for ty in ('(brand $k)', '(ptr (brand $k))',
+                   '(brand $static)'):
             with self.subTest(ty=ty), self.assertRaisesRegex(KursError, 'function-generic free brands'):
                 check_program(parse_program(f'''(fun f u32 () (locals (&slot {ty}))
                     (entry () (= %r (const u32 0)) (ret %r))
@@ -20,7 +20,7 @@ class LocalScopeTests(unittest.TestCase):
 
     def test_generic_and_existentially_bound_local_brands(self):
         check_program(parse_program('''(fun f (forall ($k) () u32 ()
-            (locals (&x (builtin::Brand $k)) (&p (exists ($a) (builtin::Brand $a))))
+            (locals (&x (brand $k)) (&p (exists ($a) (brand $a))))
             (entry () (= %r (const u32 0)) (ret %r))))'''))
 
     def test_local_witness_is_threaded_through_branches_and_loops(self):

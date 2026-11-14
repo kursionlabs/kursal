@@ -14,9 +14,9 @@ class NominalPremiseTests(unittest.TestCase):
         return check_program(parse_program(HEADER + source))
 
     def test_unused_nested_type_applications_require_premises(self):
-        for ty in ('(Box u32)', '(builtin::Pointer (Box u32))',
+        for ty in ('(Box u32)', '(ptr (Box u32))',
                    '(array (Box u32) 0)', '(tuple (Box u32))',
-                   '(builtin::Fn () (Box u32))'):
+                   '(fn () (Box u32))'):
             with self.subTest(ty=ty):
                 with self.assertRaisesRegex(KursError, 'unsatisfied nominal premise'):
                     self.check('(type Bad ' + ty + ')')
@@ -56,12 +56,12 @@ class NominalPremiseTests(unittest.TestCase):
             (instance P (forall (T) ((P T)) ((Box T))))
             (type Nested (Box (Box u32)))
             (type Node (forall (T) ((P T))
-                (struct (value T) (next (builtin::Pointer (Node T))))))''')
+                (struct (value T) (next (ptr (Node T))))))''')
 
     def test_function_types_have_no_premises(self):
         with self.assertRaisesRegex(KursError, 'a function type has no premises'):
             parse_program('''(trait P ($k))
-                (type Bad (builtin::Fn (forall ($k) ((P $k)) (builtin::Brand $k) ((builtin::Brand $k)))))''')
+                (type Bad (fn (forall ($k) ((P $k)) (brand $k) ((brand $k)))))''')
 
     def test_surface_signature_and_nested_type_fail_before_core_assertion(self):
         from tests import test_closure_boundary

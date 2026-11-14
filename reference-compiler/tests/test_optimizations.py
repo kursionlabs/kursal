@@ -73,7 +73,7 @@ class LeftOutTests(unittest.TestCase):
 (fun bump u32 (Cur) (entry ((&c Cur)) (= %one (const u32 1)) (= %again (copy %one)) (= %u (store &c.pos %one)) (ret %again)))
 (fun main i32 () (locals (&x Cur))
   (entry () (= %z (const u32 0)) (= %c (construct Cur %z)) (= %u (store &x %c)) (= %ignored (call bump &x))
-    (= %p (load &x.pos)) (= %r (builtin::int_cast %p i32)) (ret %r)))""")
+    (= %p (load &x.pos)) (= %r (int_cast %p i32)) (ret %r)))""")
         main = body(c, "main")
         self.assertNotIn(".dummy", main)
         self.assertNotIn("ignored", main)
@@ -114,7 +114,7 @@ SUM = """
   (fin ((%a u64)) (ret %a))
   (more ((%n u64) (%acc u64)) (= %one (const u64 1)) (= %n2 (copy %n)) (= %m (sub %n2 %one)) (= %s (add %acc %n)) (= %r (call sum %m %s)) (ret %r)))
 (fun main i32 () (entry () (= %n (const u64 10000000)) (= %z (const u64 0)) (= %s (call sum %n %z)) (= %k (const u64 256))
-  (= %m (mod %s %k)) (= %r (builtin::int_cast %m i32)) (ret %r)))"""
+  (= %m (mod %s %k)) (= %r (int_cast %m i32)) (ret %r)))"""
 
 PARITY = """
 (fun even bool (u64) (entry ((%n u64)) (= %z (const u64 0)) (= %n2 (copy %n)) (= %done (eq %n2 %z)) (jnz %done (yes) (no %n)))
@@ -155,7 +155,7 @@ class TailCallTests(unittest.TestCase):
         c = c_of("""
 (fun f u64 (u64) (entry ((%n u64)) (= %k (const u32 3)) (= %r (call g %n %k)) (ret %r)))
 (fun g u64 (u64 u32) (entry ((%n u64) (%k u32)) (ret %n)))
-(fun main i32 () (entry () (= %n (const u64 5)) (= %r (call f %n)) (= %i (builtin::int_cast %r i32)) (ret %i)))""")
+(fun main i32 () (entry () (= %n (const u64 5)) (= %r (call f %n)) (= %i (int_cast %r i32)) (ret %i)))""")
         self.assertNotIn("KUR_MUSTTAIL return", c)
         self.assertEqual(run(c), 5)
 
@@ -165,7 +165,7 @@ class TailCallTests(unittest.TestCase):
 (fun f u64 (P) (entry ((%p P)) (= %r (call g %p)) (ret %r)))
 (fun g u64 (P) (entry ((%p P)) (= (%a %b) (destruct %p P)) (= %r (add %a %b)) (ret %r)))
 (fun main i32 () (entry () (= %a (const u64 2)) (= %b (const u64 3)) (= %p (construct P %a %b)) (= %r (call f %p))
-  (= %i (builtin::int_cast %r i32)) (ret %i)))""")
+  (= %i (int_cast %r i32)) (ret %i)))""")
         self.assertNotIn("KUR_MUSTTAIL return", c)
         self.assertEqual(run(c), 5)
 
@@ -181,8 +181,8 @@ class TailCallTests(unittest.TestCase):
     (= %u (store &mine %fresh)) (= %r (call g &mine %m)) (= %back (load &mine)) (= %v (store &c %back)) (ret %r)))
 (fun main i32 () (locals (&x Cur))
   (entry () (= %seven (const u32 7)) (= %c (construct Cur %seven)) (= %u (store &x %c)) (= %n (const u32 3))
-    (= %r (call g &x %n)) (= %k (const u64 4)) (= %s (call f %k)) (= %s32 (builtin::int_cast %s u32)) (= %t (add %r %s32))
-    (= %i (builtin::int_cast %t i32)) (ret %i)))""")
+    (= %r (call g &x %n)) (= %k (const u64 4)) (= %s (call f %k)) (= %s32 (int_cast %s u32)) (= %t (add %r %s32))
+    (= %i (int_cast %t i32)) (ret %i)))""")
         self.assertNotIn("KUR_MUSTTAIL", body(c, "f"))
         self.assertNotIn("goto L_entry", body(c, "g"))
         self.assertEqual(run(c), 11)
@@ -197,9 +197,9 @@ QUALIFIED = CUR + """
 (fun pointed u32 (Cur) (entry ((&c Cur)) (= %p (load &c.pos)) (ret %p)))
 (fun main i32 () (locals (&x Cur))
   (entry () (= %z (const u32 0)) (= %c (construct Cur %z)) (= %u (store &x %c)) (= %a (call poke &x))
-    (unsafe (= %raw (alloca Cur))) (= %raw2 (copy %raw)) (= %five (const u32 5)) (= %d (construct Cur %five)) (unsafe (= %w (builtin::unsafe::store %raw2 %d)))
+    (unsafe (= %raw (alloca Cur))) (= %raw2 (copy %raw)) (= %five (const u32 5)) (= %d (construct Cur %five)) (unsafe (= %w (ptr_store %raw2 %d)))
     (unsafe (= %b (call outer &*%raw))) (= %f (fn pointed)) (= %e (call %f &x))
-    (= %ab (add %a %b)) (= %s (add %ab %e)) (= %r (builtin::int_cast %s i32)) (ret %r)))"""
+    (= %ab (add %a %b)) (= %s (add %ab %e)) (= %r (int_cast %s i32)) (ret %r)))"""
 
 
 class QualifierTests(unittest.TestCase):
@@ -225,7 +225,7 @@ class QualifierTests(unittest.TestCase):
 (fun main i32 () (locals (&x Cur) (&y Cur))
   (entry () (= %one (const u32 1)) (= %c (construct Cur %one)) (= %u (store &x %c)) (= %two (const u32 2))
     (= %d (construct Cur %two)) (= %v (store &y %d)) (= %n (const u32 3)) (= %r (call swapdown &x &y %n))
-    (= %i (builtin::int_cast %r i32)) (ret %i)))""")
+    (= %i (int_cast %r i32)) (ret %i)))""")
         self.assertIn("goto L_entry;", body(c, "swapdown"))
         self.assertNotIn("restrict", head(c, "swapdown"))
         self.assertEqual(run(c), 2)

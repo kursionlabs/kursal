@@ -71,7 +71,7 @@ class Ptr(Type):
 
 @dataclass(frozen=True)
 class NonNull(Type):
-    """`builtin::NonNull T`: a pointer like `*T` that is never null. Its all-zero value is no value of the
+    """`non_null T`: a pointer like `*T` that is never null. Its all-zero value is no value of the
     type, the niche an enum's layout may use (`Types.niche`)."""
     inner: Type
 
@@ -84,7 +84,7 @@ class Skolem(Type):
 
 @dataclass(frozen=True)
 class Brand(Type):
-    """`builtin::Brand $k`, the Copy witness type of brand `$k`."""
+    """`brand $k`, the Copy witness type of brand `$k`."""
     brand: Type  # Skolem in checked IR; inference may use a brand metavariable.
 
 
@@ -109,7 +109,7 @@ class Premise:
 @dataclass(frozen=True)
 class Foreach(Type):
     binder: str
-    indirect: bool  # the `(builtin::Pointer F)` pattern
+    indirect: bool  # the `(ptr F)` pattern
     source: Type
     body: Type
     retained: tuple[str, ...] | None = None
@@ -165,6 +165,16 @@ class TypeDecl:
     body: Type
     module: Optional[ModuleId] = None
     exposure: Optional[Exposure] = None  # None: transparent; ("owner", m) or ("within", m)
+
+
+# The atomic operations, each by its kind: one per atomic method of `*T` (`ptr_atomic_` and the kind,
+# whatever the method's own name), and the fence, which takes no pointer. Each carries its ordering.
+ATOMIC_OPS = {"ptr_atomic_" + kind: kind for kind in ("load", "store", "swap", "compare_exchange", "fetch_add",
+                                                       "fetch_sub", "fetch_and", "fetch_or", "fetch_xor")}
+ATOMIC_OPS["fence"] = "fence"
+# The operations that need an unsafe context: the instruction's `(unsafe ...)` marker, or an unsafe function.
+UNSAFE_OPS = frozenset({"cast", "alloca", "static_brand", "ptr_load", "ptr_store", "ptr_load_volatile",
+                        "ptr_store_volatile", *ATOMIC_OPS})
 
 
 @dataclass

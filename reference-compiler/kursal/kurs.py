@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 from typing import NoReturn, TypeGuard, Optional
 from .sexpr import Atom, Form, KursError, List, Position, Str, read
-from .core import (ANY, BRAND, COPY, PRIMS, Array, Arm, Block, Brand, Data,
+from .core import (ANY, ATOMIC_OPS, BRAND, COPY, PRIMS, Array, Arm, Block, Brand, Data,
                    Edge, Enum, Exists, Exposure, Extern, Fn, Foreach, Fun, Ignored, Instance,
                    Instr, Jmp, Jnz, Method, ModuleId, Named, Never, Param, Premise,
                    NonNull, Prim, Program, Ptr, Ret, Skolem, Struct, Switch, Trait, Tuple,
@@ -67,17 +67,17 @@ def parse_type(form: Form) -> Type:
         return Tuple(tuple(parse_type(f) for f in rest))
     if head == "array":
         return Array(parse_type(rest[0]), int(_text(rest[1])))
-    if head == "builtin::Pointer":
+    if head == "ptr":
         return Ptr(parse_type(rest[0]))
-    if head == "builtin::NonNull":
+    if head == "non_null":
         return NonNull(parse_type(rest[0]))
-    if head == "builtin::Brand":
+    if head == "brand":
         return Brand(Skolem(_brand(rest[0])))
     if head == "exists":
         return Exists(tuple(_brand(b) for b in _list(rest[0])), parse_type(rest[1]))
     if head == "foreach":
         pattern, source = _list(rest[0])
-        indirect = _is(pattern, "builtin::Pointer", 2)
+        indirect = _is(pattern, "ptr", 2)
         binder = str(_list(pattern)[1] if indirect else pattern)
         retained = None
         if len(rest) == 3:
@@ -88,7 +88,7 @@ def parse_type(form: Form) -> Type:
         elif len(rest) != 2:
             _fail("foreach requires source and body", form)
         return Foreach(binder, indirect, parse_type(source), parse_type(rest[1]), retained)
-    if head == "builtin::Fn":
+    if head == "fn":
         unsafe = _is(rest[0], "unsafe", 1)
         rest = rest[1:] if unsafe else rest
         header = rest[0]
@@ -176,11 +176,11 @@ def parse_instr(form: Form) -> Instr:
         return Instr(lhs, op, pos=pos, ty=parse_type(rest[0]), lit=str(rest[1]))
     if op in ("construct",):
         return Instr(lhs, op, pos=pos, ty=parse_type(rest[0]), args=tuple(map(str, rest[1:])))
-    if op in ("destruct", "variant_tag", "builtin::unsafe::cast", "builtin::int_cast", "builtin::as_pointer"):
+    if op in ("destruct", "variant_tag", "cast", "int_cast", "to_ptr"):
         return Instr(lhs, op, pos=pos, args=(str(rest[0]),), ty=parse_type(rest[1]))
     if op == "construct_variant":
         return Instr(lhs, op, pos=pos, ty=parse_type(rest[0]), lit=str(rest[1]), args=(str(rest[2]),))
-    if op in ("alloca", "builtin::sizeof"):
+    if op in ("alloca", "sizeof"):
         return Instr(lhs, op, pos=pos, ty=parse_type(rest[0]))
     if op == "pack":
         witnesses = rest[1] if isinstance(rest[1], List) else [rest[1]]
@@ -196,7 +196,7 @@ def parse_instr(form: Form) -> Instr:
     if op == "trait_call":
         return Instr(lhs, op, pos=pos, args=(str(rest[0]), str(rest[1]), *map(str, rest[3:])),
                     tys=tuple(parse_type(t) for t in _list(rest[2])))
-    if op.startswith("builtin::unsafe::atomic_"):
+    if op in ATOMIC_OPS:
         return Instr(lhs, op, pos=pos, lit=str(rest[0]), args=tuple(map(str, rest[1:])))
     return Instr(lhs, op, pos=pos, args=tuple(map(str, rest)))
 
@@ -393,22 +393,22 @@ def write_type(ty: Type) -> str:
         case Array(elem=elem, length=length):
             return _form(["array", write_type(elem), str(length)])
         case Ptr(inner=inner):
-            return _form(["builtin::Pointer", write_type(inner)])
+            return _form(["ptr", write_type(inner)])
         case NonNull(inner=inner):
-            return _form(["builtin::NonNull", write_type(inner)])
+            return _form(["non_null", write_type(inner)])
         case Brand(brand=Skolem(label=label)):
-            return _form(["builtin::Brand", write_atom("$" + label)])
+            return _form(["brand", write_atom("$" + label)])
         case Exists(binders=binders, body=body):
             return _form(["exists", _brands(binders), write_type(body)])
         case Foreach(binder=binder, indirect=indirect, source=source, body=body, retained=retained):
-            pattern = _form(["builtin::Pointer", write_atom(binder)]) if indirect else write_atom(binder)
+            pattern = _form(["ptr", write_atom(binder)]) if indirect else write_atom(binder)
             parts = ["foreach", _form([pattern, write_type(source)]), write_type(body)]
             inferred = (source.binder, *(source.retained or ())) if isinstance(source, Foreach) else ()
             if retained != inferred:
                 parts.append(_form(["retain", *map(write_atom, retained or ())]))
             return _form(parts)
         case Fn(params=params, ret=ret, forall=forall, unsafe=unsafe, places=places):
-            parts = ["builtin::Fn", *(["(unsafe)"] if unsafe else [])]
+            parts = ["fn", *(["(unsafe)"] if unsafe else [])]
             if forall:
                 parts.append("(" + write_forall(forall, ()) + " " + write_type(ret) + " "
                              + _write_ptypes(params, places) + ")")
@@ -482,11 +482,11 @@ def write_instr(instr: Instr) -> str:
         operation = [op, _type_operand(instr), _literal(instr)]
     elif op == "construct":
         operation = [op, _type_operand(instr), *args]
-    elif op in ("destruct", "variant_tag", "builtin::unsafe::cast", "builtin::int_cast", "builtin::as_pointer"):
+    elif op in ("destruct", "variant_tag", "cast", "int_cast", "to_ptr"):
         operation = [op, args[0], _type_operand(instr)]
     elif op == "construct_variant":
         operation = [op, _type_operand(instr), _literal(instr), args[0]]
-    elif op in ("alloca", "builtin::sizeof"):
+    elif op in ("alloca", "sizeof"):
         operation = [op, _type_operand(instr)]
     elif op == "pack":
         operation = [op, _type_operand(instr), _form([write_type(t) for t in instr.tys]), args[0]]
@@ -498,7 +498,7 @@ def write_instr(instr: Instr) -> str:
         operation = [op, _type_operand(instr), args[0], _applied_text(instr.args[1], instr.tys), *args[2:]]
     elif op == "trait_call":
         operation = [op, args[0], args[1], _form([write_type(t) for t in instr.tys]), *args[2:]]
-    elif op.startswith("builtin::unsafe::atomic_"):
+    elif op in ATOMIC_OPS:
         operation = [op, _literal(instr), *args]
     else:
         operation = [op, *args]

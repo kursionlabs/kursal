@@ -14,6 +14,6 @@ Captures to note:
 - a value (`%v2`): `@variable`
 - a place (`&counter#1.value`) or raw target (`&*%p`): `@variable.parameter`
 - a brand (`'1`): `@label`
-- an instruction (`load`, `builtin::int_cast`): `@function.builtin`
+- an instruction (`load`, `int_cast`, `ptr_atomic_load`): `@function.builtin`
 - a declared or called function: `@function`, `@function.call`
 - a block label, at its declaration and on every edge: `@label`

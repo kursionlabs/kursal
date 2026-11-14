@@ -74,20 +74,17 @@ fn cas_failure(&cx: Domain!['k], success: Span['k]) -> Option[ArenaVec[Span['k],
     }
 }
 
-// The number of operands of an atomic operation, if it is one.
+// The number of operands of an atomic operation of kind `kind` (`kurs::core::atomic_kind`).
 forall 'k.
-fn atomic_arity(&cx: Domain!['k], kind: Span['k]) -> Option[usize] {
+fn atomic_arity(&cx: Domain!['k], kind: Span['k]) -> usize {
     if kind.is(&cx, "fence") {
-        Option::Some.(0usize)
+        0usize
     } else if kind.is(&cx, "load") {
-        Option::Some.(1usize)
+        1usize
     } else if kind.is(&cx, "compare_exchange") {
-        Option::Some.(3usize)
-    } else if kind.is(&cx, "store") || kind.is(&cx, "swap") || kind.is(&cx, "fetch_add") || kind.is(&cx, "fetch_sub") || kind.is(&cx, "fetch_and")
-        || kind.is(&cx, "fetch_or") || kind.is(&cx, "fetch_xor") {
-        Option::Some.(2usize)
+        3usize
     } else {
-        Option::None
+        2usize
     }
 }
 
@@ -106,7 +103,7 @@ fn nowhere(&cx: Domain!['k]) -> ModuleId['k] {
 // Compiler-reserved trait names: no user trait or instance.
 forall 'k.
 fn sealed(&cx: Domain!['k], name: Span['k]) -> bool {
-    name.starts_with(&cx, Span::from_static(&cx, "Copy")) || name.starts_with(&cx, Span::from_static(&cx, "builtin::"))
+    name.is(&cx, "Copy") || name.is(&cx, "Exposed")
 }
 
 forall 'k.
@@ -1333,7 +1330,7 @@ impl Checker['k] {
     // A premise is discharged by an assumption, or by an instance whose head matches and whose own
     // premises hold.
     fn holds(self, &cx: Domain!['k], trait_name: Span['k], args: ArenaVec[Type['k], 'k]) -> bool {
-        if trait_name.is(&cx, "builtin::Exposed") {
+        if trait_name.is(&cx, "Exposed") {
             return args.len(&cx) == 1usize && self.types.exposure_available(&cx, args.at(&cx, 0usize), self.home.copy(&cx), self.kinds.copy(&cx), self.premises.copy(&cx));
         }
         let premises = self.premises.copy(&cx);
@@ -1539,6 +1536,9 @@ impl Checker['k] {
         self.formation.pos.set(&cx, instr.pos);
         let op = instr.op;
         self.instr.set(&cx, Option::Some.(instr));
+        if C::is_unsafe_op(&cx, op) {
+            self.authorize(&cx, instr, true);
+        }
         let outs: ArenaVec[Type['k], 'k] = if op.is(&cx, "const") {
             ArenaVec::one(&cx, self.op_const(&cx, instr))
         } else if op.is(&cx, "copy") {
@@ -1551,12 +1551,12 @@ impl Checker['k] {
             ArenaVec::one(&cx, self.op_construct_variant(&cx, instr))
         } else if op.is(&cx, "variant_tag") {
             ArenaVec::one(&cx, self.op_variant_tag(&cx, instr))
-        } else if op.is(&cx, "builtin::int_cast") {
+        } else if op.is(&cx, "int_cast") {
             ArenaVec::one(&cx, self.op_int_cast(&cx, instr))
-        } else if op.is(&cx, "builtin::as_pointer") {
-            ArenaVec::one(&cx, self.op_as_pointer(&cx, instr))
-        } else if op.is(&cx, "builtin::unsafe::cast") {
-            ArenaVec::one(&cx, self.op_unsafe_cast(&cx, instr))
+        } else if op.is(&cx, "to_ptr") {
+            ArenaVec::one(&cx, self.op_to_ptr(&cx, instr))
+        } else if op.is(&cx, "cast") {
+            ArenaVec::one(&cx, self.op_cast(&cx, instr))
         } else if op.is(&cx, "call") {
             ArenaVec::one(&cx, self.op_call(&cx, instr))
         } else if op.is(&cx, "trait_call") {
@@ -1565,22 +1565,22 @@ impl Checker['k] {
             ArenaVec::one(&cx, self.op_fn(&cx, instr))
         } else if op.is(&cx, "alloca") {
             ArenaVec::one(&cx, self.op_alloca(&cx, instr))
-        } else if op.is(&cx, "builtin::sizeof") {
+        } else if op.is(&cx, "sizeof") {
             ArenaVec::one(&cx, self.op_sizeof(&cx, instr))
         } else if op.is(&cx, "data") {
             ArenaVec::one(&cx, self.op_data(&cx, instr))
-        } else if op.is(&cx, "builtin::unsafe::static_brand") {
-            ArenaVec::one(&cx, self.op_unsafe_static_brand(&cx, instr))
-        } else if op.is(&cx, "builtin::fresh") {
+        } else if op.is(&cx, "static_brand") {
+            ArenaVec::one(&cx, self.op_static_brand(&cx, instr))
+        } else if op.is(&cx, "fresh") {
             ArenaVec::one(&cx, self.op_fresh(&cx, instr))
         } else if op.is(&cx, "pack") {
             ArenaVec::one(&cx, self.op_pack(&cx, instr))
         } else if op.is(&cx, "open") {
             ArenaVec::one(&cx, self.op_open(&cx, instr))
-        } else if op.is(&cx, "builtin::unsafe::deref") || op.is(&cx, "builtin::unsafe::load_volatile") {
-            ArenaVec::one(&cx, self.op_unsafe_deref(&cx, instr))
-        } else if op.is(&cx, "builtin::unsafe::store") || op.is(&cx, "builtin::unsafe::store_volatile") {
-            ArenaVec::one(&cx, self.op_unsafe_store(&cx, instr))
+        } else if op.is(&cx, "ptr_load") || op.is(&cx, "ptr_load_volatile") {
+            ArenaVec::one(&cx, self.op_ptr_load(&cx, instr))
+        } else if op.is(&cx, "ptr_store") || op.is(&cx, "ptr_store_volatile") {
+            ArenaVec::one(&cx, self.op_ptr_store(&cx, instr))
         } else if op.is(&cx, "load") {
             ArenaVec::one(&cx, self.op_load(&cx, instr))
         } else if op.is(&cx, "store") {
@@ -1589,7 +1589,7 @@ impl Checker['k] {
             ArenaVec::one(&cx, self.op_foreach(&cx, instr))
         } else if is_arith(&cx, op) || is_order(&cx, op) || is_equality(&cx, op) || is_bits(&cx, op) {
             ArenaVec::one(&cx, self.primitive(&cx, instr))
-        } else if op.starts_with(&cx, Span::from_static(&cx, "builtin::unsafe::atomic_")) {
+        } else if C::atomic_kind(&cx, op).is_some() {
             ArenaVec::one(&cx, self.atomic(&cx, instr))
         } else {
             self.fail(&cx, "unknown_instruction")
@@ -1752,9 +1752,8 @@ impl Checker['k] {
         self.type_operand(&cx, instr)
     }
 
-    fn op_unsafe_cast(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
+    fn op_cast(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
         let ty = self.type_operand(&cx, instr);
-        self.authorize(&cx, instr, true);
         let got = self.use_value(&cx, instr.args.at(&cx, 0usize));
         if self.contains(&cx, got) || self.contains(&cx, ty) {
             self.fail(&cx, "unsafe_cast_cannot_produce");
@@ -1766,18 +1765,18 @@ impl Checker['k] {
     }
 
     // `NonNull T` to `*T`: forgetting that a pointer is not null is safe.
-    fn op_as_pointer(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
+    fn op_to_ptr(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
         let got = self.use_value(&cx, instr.args.at(&cx, 0usize));
         let ty = match instr.ty {
             Option::Some(t) => t,
-            Option::None => self.fail(&cx, "as_pointer_converts_non_null"),
+            Option::None => self.fail(&cx, "to_ptr_converts_non_null"),
         };
         let ok = match got {
             Type::NonNull(inner) => equal(&cx, C::ptr(&cx, inner.copy(&cx)), ty),
             _ => false,
         };
         if !ok {
-            self.fail(&cx, "as_pointer_converts_non_null");
+            self.fail(&cx, "to_ptr_converts_non_null");
         }
         ty
     }
@@ -1973,7 +1972,6 @@ impl Checker['k] {
 
     fn op_alloca(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
         let ty = self.type_operand(&cx, instr);
-        self.authorize(&cx, instr, true);
         self.has_memory_form(&cx, ty);
         C::ptr(&cx, ty)
     }
@@ -1990,8 +1988,7 @@ impl Checker['k] {
         }
     }
 
-    fn op_unsafe_static_brand(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
-        self.authorize(&cx, instr, true);
+    fn op_static_brand(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
         Type::Brand.(Ref::new(&cx, Type::Skolem.(static_brand(&cx))))
     }
 
@@ -2104,12 +2101,11 @@ impl Checker['k] {
         }
     }
 
-    // Also `builtin::unsafe::load_volatile`.
-    fn op_unsafe_deref(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
-        self.authorize(&cx, instr, true);
+    // Also `ptr_load_volatile`.
+    fn op_ptr_load(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
         let inner = match self.use_value(&cx, instr.args.at(&cx, 0usize)) {
             Type::Ptr(inner) => inner.copy(&cx),
-            _ => self.fail(&cx, "deref_non_pointer"),
+            _ => self.fail(&cx, "ptr_load_non_pointer"),
         };
         if is_never(inner) {
             self.fail(&cx, "unsafe_read_cannot_produce_never");
@@ -2118,9 +2114,8 @@ impl Checker['k] {
         inner
     }
 
-    // Also `builtin::unsafe::store_volatile`.
-    fn op_unsafe_store(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
-        self.authorize(&cx, instr, true);
+    // Also `ptr_store_volatile`.
+    fn op_ptr_store(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
         let p = self.use_value(&cx, instr.args.at(&cx, 0usize));
         let v = self.use_value(&cx, instr.args.at(&cx, 1usize));
         let inner = match p {
@@ -2135,12 +2130,11 @@ impl Checker['k] {
     }
 
     fn atomic(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
-        self.authorize(&cx, instr, true);
-        let kind = instr.op.skip(Span::from_static(&cx, "builtin::unsafe::atomic_").len());
-        let arity = match atomic_arity(&cx, kind) {
-            Option::Some(n) => n,
-            Option::None => self.fail(&cx, "unknown_atomic_operation"),
+        let kind = match C::atomic_kind(&cx, instr.op) {
+            Option::Some(k) => k,
+            Option::None => self.fail(&cx, "unknown_instruction"),
         };
+        let arity = atomic_arity(&cx, kind);
         if instr.args.len(&cx) != arity {
             self.fail(&cx, "atomic_operand_count");
         }
@@ -2218,7 +2212,7 @@ impl Checker['k] {
         if !equal(&cx, got, f.source.copy(&cx)) {
             self.fail(&cx, "foreach_source");
         }
-        if !self.holds(&cx, Span::from_static(&cx, "builtin::Exposed"), ArenaVec::one(&cx, f.source.copy(&cx))) {
+        if !self.holds(&cx, Span::from_static(&cx, "Exposed"), ArenaVec::one(&cx, f.source.copy(&cx))) {
             self.fail(&cx, "foreach_source_not_exposed");
         }
         if !self.types.pattern_available(&cx, f, self.home.copy(&cx), self.kinds.copy(&cx)) {

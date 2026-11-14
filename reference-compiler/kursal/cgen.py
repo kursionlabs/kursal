@@ -24,7 +24,7 @@ from collections.abc import Mapping, Sequence
 import re
 from typing import Optional
 
-from .core import (FLOATS, INTEGERS, UNIT, Array, Brand, Enum, Exists, Fn, Foreach, Ignored, Jmp, Jnz,
+from .core import (ATOMIC_OPS, FLOATS, INTEGERS, UNIT, Array, Brand, Enum, Exists, Fn, Foreach, Ignored, Jmp, Jnz,
                    Named, Never, NonNull, Param, Prim, Ptr, Ret, Skolem, Struct, Switch, Tuple, Unreachable,
                    Type, Program, Fun, Data, Instr, Edge, Terminator)
 from .check import Checker
@@ -616,11 +616,11 @@ class Backend:
         elif op == "variant_tag":
             source = self.place(a[0])[0] if a[0].startswith("&") else self.value_name(a[0])
             self.line(f"{dst} = {self.tag(source, self.type_operand(instr))};")
-        elif op == "builtin::as_pointer":
+        elif op == "to_ptr":
             self.line(f"{dst} = {self.value_name(a[0])};")
-        elif op == "builtin::int_cast":
+        elif op == "int_cast":
             self.line(f"{dst} = {self.convert(self.value_name(a[0]), self.type_operand(instr))};")
-        elif op == "builtin::unsafe::cast":
+        elif op == "cast":
             self.has_memory_form(self.type_of(a[0]), instr)
             self.has_memory_form(self.type_operand(instr), instr)
             assert dst is not None
@@ -641,30 +641,30 @@ class Backend:
             self.has_memory_form(self.type_operand(instr), instr)
             ct = self.ctype(self.type_operand(instr))
             self.line(f"{dst} = ({ct}*)__builtin_alloca(sizeof({ct}));")
-        elif op == "builtin::sizeof":
+        elif op == "sizeof":
             ct = self.ctype(self.type_operand(instr))
             self.line(f"{dst} = UINT64_C(0);" if ct == "void" else f"{dst} = (uint64_t)sizeof({ct});")
         elif op == "data":
             self.line(f"{dst} = &{self.data_symbol(a[0])};")
         elif op in ("pack", "open"):
             self.line(f"{dst} = {self.value_name(a[0])};")
-        elif op == "builtin::unsafe::deref":
+        elif op == "ptr_load":
             pointer = self.type_of(a[0])
             assert isinstance(pointer, Ptr)
             self.has_memory_form(pointer.inner, instr)
             self.line(f"{dst} = *{self.value_name(a[0])};")
-        elif op == "builtin::unsafe::load_volatile":
+        elif op == "ptr_load_volatile":
             pointer = self.type_of(a[0])
             assert isinstance(pointer, Ptr)
             self.has_memory_form(pointer.inner, instr)
             self.line(f"{dst} = *({self.ctype(pointer.inner)} volatile*){self.value_name(a[0])};")
-        elif op in ("builtin::unsafe::store", "builtin::unsafe::store_volatile"):
+        elif op in ("ptr_store", "ptr_store_volatile"):
             pointer = self.type_of(a[0])
             assert isinstance(pointer, Ptr)
             self.has_memory_form(pointer.inner, instr)
             qual = f"({self.ctype(pointer.inner)} volatile*)" if op.endswith("volatile") else ""
             self.line(f"*{qual}{self.value_name(a[0])} = {self.value_name(a[1])};")
-        elif op.startswith("builtin::unsafe::atomic_"):
+        elif op in ATOMIC_OPS:
             self.atomic(instr, dst)
         elif op == "load":
             self.line(f"{dst} = {self.place(a[0])[0]};")
@@ -851,7 +851,7 @@ class Backend:
 
     def atomic(self, instr: Instr, dst: Optional[str]) -> None:
         assert instr.lit is not None
-        kind, args = instr.op[len("builtin::unsafe::atomic_"):], [self.value_name(a) for a in instr.args]
+        kind, args = ATOMIC_OPS[instr.op], [self.value_name(a) for a in instr.args]
         if kind != "fence":
             pointer = self.type_of(instr.args[0])
             assert isinstance(pointer, Ptr)

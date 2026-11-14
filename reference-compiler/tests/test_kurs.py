@@ -21,25 +21,25 @@ LIBRARY = ("core", "alloc", "std", "libc", "thread", "toml")
 
 # Every form of the serialization, written the way `write_program` writes it.
 CANONICAL = r'''(type (in (module 0 a) abstract) Secret (struct (k u32)))
-(type (in (module 0 a b) (exposed (module 0 a))) Handle! (forall (T $k) ((Copy T) (Eq T)) (struct (at (builtin::Pointer T)) (brand (builtin::Brand $k)))))
+(type (in (module 0 a b) (exposed (module 0 a))) Handle! (forall (T $k) ((Copy T) (Eq T)) (struct (at (ptr T)) (brand (brand $k)))))
 (type Choice (enum (None (tuple)) (Some (array u8 4))))
-(type Any (exists ($a $b) (foreach ((builtin::Pointer F) (Handle u32 $a)) (foreach (G F) (tuple F G)) (retain F))))
-(type Callback (struct (plain (builtin::Fn ((& u32) u64) !)) (risky (builtin::Fn (unsafe) (forall ($r U) ((Copy U)) _ (U (& (builtin::Pointer U))))))))
+(type Any (exists ($a $b) (foreach ((ptr F) (Handle u32 $a)) (foreach (G F) (tuple F G)) (retain F))))
+(type Callback (struct (plain (fn ((& u32) u64) !)) (risky (fn (unsafe) (forall ($r U) ((Copy U)) _ (U (& (ptr U))))))))
 (fun (in (module 0 a)) main i32 ()
   (locals (&x u32) ("&odd name" (tuple)))
   (entry ()
     (= %n (const i32 0))
     (unsafe (= %p (alloca u32)))
     (= (%a %b) (destruct %t (tuple u32 u32)))
-    (= %s (builtin::sizeof Secret))
+    (= %s (sizeof Secret))
     (= %v (construct_variant Choice Some %bytes))
-    (= %h (pack (exists ($a) (Handle u32 $a)) ((builtin::Brand $k)) %raw))
+    (= %h (pack (exists ($a) (Handle u32 $a)) ((brand $k)) %raw))
     (= %o (open %h ($a)))
     (= %c (call (f u32 $a) %x %y))
     (= %g (fn g))
     (= %m (foreach Any %src (mapper u32) %env))
     (= %t (trait_call Eq eq (u32) %x %y))
-    (= %l (builtin::unsafe::atomic_load seq_cst %p))
+    (= %l (ptr_atomic_load seq_cst %p))
     (= %q (store &x %n))
     (jnz %c (next u32 %n) (done)))
   (next ($k) ((%m u32))
@@ -51,15 +51,15 @@ CANONICAL = r'''(type (in (module 0 a) abstract) Secret (struct (k u32)))
     (jmp done %n))
   (done ()
     (unreachable)))
-(fun (unsafe) raw (forall (T) () T ((builtin::Pointer T))
-  (entry ((%p (builtin::Pointer T)))
+(fun (unsafe) raw (forall (T) () T ((ptr T))
+  (entry ((%p (ptr T)))
     (= %v (load %p))
     (ret %v))))
 (fun (in (module 1) unsafe) helper (tuple) ()
   (entry ()
     (= %u (construct (tuple)))
     (ret %u)))
-(extern fun puts i32 ((builtin::Pointer u8)))
+(extern fun puts i32 ((ptr u8)))
 (extern value errno i32)
 (data (in (module 0)) greeting (array u8 13) ("hello,\t\"world\"\\\n" 7 (nested "café\x01" "")))
 (trait (in (module 0)) Eq (T)
@@ -82,8 +82,8 @@ CANONICAL = r'''(type (in (module 0 a) abstract) Secret (struct (k u32)))
 VARIANTS = (
     ("(= %n (const i32 0))", "(= %n (const i32 0) (evidence))"),
     ("(type Choice (enum", "(type (unsafe) Choice (enum"),
-    ("(forall (T $k) ((Copy T) (Eq T)) (struct (at (builtin::Pointer T)) (brand (builtin::Brand $k))))",
-     "(forall (T) ((Copy T)) (forall ($k) ((Eq T)) (struct (at (builtin::Pointer T)) (brand (builtin::Brand $k)))))"),
+    ("(forall (T $k) ((Copy T) (Eq T)) (struct (at (ptr T)) (brand (brand $k))))",
+     "(forall (T) ((Copy T)) (forall ($k) ((Eq T)) (struct (at (ptr T)) (brand (brand $k)))))"),
     ("(empty &x &y)", "(empty &x) (empty) (empty &y)"),
     ("(jmp done %n)", "(jmp (done) %n)"),
     ("(fun eq bool", "(method eq bool"),

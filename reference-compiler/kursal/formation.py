@@ -87,7 +87,7 @@ class Formation:
 
     def premise(self, premise: C.Premise, env: Kinds) -> None:
         params: tuple[C.Param, ...]
-        if premise.trait == "builtin::Exposed":
+        if premise.trait == "Exposed":
             params = (C.Param("T"),)
         else:
             trait = self.program.traits.get(premise.trait)

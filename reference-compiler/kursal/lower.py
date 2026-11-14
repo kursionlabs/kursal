@@ -240,7 +240,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
             for frame in self.lend_frames:
                 frame.extend(a for a in args if a.startswith("&") and not a.startswith("&*"))
         discharged = unsafe or self.discharge_all or node is not None and id(node) in self.unsafe_nodes
-        if (op.startswith("builtin::unsafe::") or op == "alloca") and not (discharged or self.sig.unsafe):
+        if op in C.UNSAFE_OPS and not (discharged or self.sig.unsafe):
             fail(f"{op} requires unsafe authorization", pos)
         self.current.instrs.append(C.Instr((name,), op, tuple(args), unsafe=discharged, pos=pos, ty=ty, tys=tys, lit=lit, binders=binders))
         self.vty[name] = rty
@@ -516,8 +516,8 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         data, n = self.lowering.data(text)
         u8, static = C.Prim("u8"), C.Skolem("static")
         d = self.emit("data", C.Ptr(C.Array(u8, n)), (data,))
-        p = self.emit("builtin::unsafe::cast", C.Ptr(u8), (d,), ty=C.Ptr(u8), unsafe=True)
-        brand = self.emit("builtin::unsafe::static_brand", C.Brand(static), unsafe=True)
+        p = self.emit("cast", C.Ptr(u8), (d,), ty=C.Ptr(u8), unsafe=True)
+        brand = self.emit("static_brand", C.Brand(static), unsafe=True)
         length = self.emit("const", C.USIZE, ty=C.USIZE, lit=str(n))
         sig = self.lowering.library_sig("Slice::from_raw_parts", self.module)
         slice_ty = C.Named(self.lowering.library_name("Slice", self.module), (u8, static))
@@ -531,7 +531,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         return self.emit("construct", ty, vals, ty=ty)
 
     def expr_sizeof(self, expr: S.Sizeof) -> Optional[str]:
-        return self.emit("builtin::sizeof", C.USIZE, ty=self.substitute_type(expr.target))
+        return self.emit("sizeof", C.USIZE, ty=self.substitute_type(expr.target))
 
     def expr_block(self, expr: S.Block) -> Optional[str]:
         def body() -> Optional[str]:
@@ -591,7 +591,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
             return self.expr(expr.operand)
         if op == "*":
             p = self.expr(expr.operand)
-            return None if p is None else self.emit("builtin::unsafe::deref", self.substitute_type(expr.ty), (p,), node=expr)
+            return None if p is None else self.emit("ptr_load", self.substitute_type(expr.ty), (p,), node=expr)
         ty = self.substitute_type(expr.ty)
         if op == "-" and isinstance(expr.operand, S.Lit) and expr.operand.kind in ("int", "float"):
             return self.emit("const", ty, ty=ty, lit="-" + str(expr.operand.value))
@@ -618,19 +618,19 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
             return None
         src, dst = self.vty[v], self.substitute_type(expr.ty)
         if isinstance(src, C.Prim) and isinstance(dst, C.Prim) and src.name in C.INTEGERS and dst.name in C.INTEGERS:
-            return self.emit("builtin::int_cast", dst, (v,), ty=dst)
+            return self.emit("int_cast", dst, (v,), ty=dst)
         # Forgetting that a pointer is not null is safe.
         if isinstance(src, C.NonNull) and isinstance(dst, C.Ptr) and equal(src.inner, dst.inner):
-            return self.emit("builtin::as_pointer", dst, (v,), ty=dst)
+            return self.emit("to_ptr", dst, (v,), ty=dst)
         # Casts do not inspect nominal layout or unfold abstract type parameters.
         # Those representation obligations belong to the unsafe C boundary.
         if isinstance(src, C.Exists) or isinstance(dst, C.Exists):
             fail("a cast cannot consume or produce an outer existential package; use opening or packing", expr.pos)
-        return self.emit("builtin::unsafe::cast", dst, (v,), ty=dst, node=expr)
+        return self.emit("cast", dst, (v,), ty=dst, node=expr)
 
     def expr_unsafe_store(self, expr: S.UnsafeStore) -> Optional[str]:
         operands = self.operands([expr.pointer, expr.value])
-        return None if operands is None else self.emit("builtin::unsafe::store", C.UNIT, operands, node=expr)
+        return None if operands is None else self.emit("ptr_store", C.UNIT, operands, node=expr)
 
     def expr_field(self, expr: S.Field | S.Index) -> Optional[str]:
         path = self.place_path(expr)
@@ -797,9 +797,9 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         name = call.name
         rty = self.substitute_type(expr.ty)
         if name == "fresh":
-            return self.emit("builtin::fresh", rty)
+            return self.emit("fresh", rty)
         if name == "static_brand":
-            return self.emit("builtin::unsafe::static_brand", rty, node=expr)
+            return self.emit("static_brand", rty, node=expr)
         if name == "enum_variant":
             arg = expr.args[0]
             if isinstance(arg, S.Unary) and arg.op == "&":
@@ -813,14 +813,14 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
             tag = self.emit("variant_tag", C.U32, (v,), ty=self.vty[v])
             return self.emit("construct", rty, (v, tag), ty=rty)
         if name == "fence":
-            return self.emit("builtin::unsafe::atomic_fence", C.UNIT,
+            return self.emit("fence", C.UNIT,
                              lit=self.atomic_ordering("fence", expr.args), node=expr)
         operands = self.operands(list(expr.args))
         if operands is None:
             return None
         if name == "load_volatile":
-            return self.emit("builtin::unsafe::load_volatile", rty, operands, node=expr)
-        return self.emit("builtin::unsafe::store_volatile", C.UNIT, operands, node=expr)
+            return self.emit("ptr_load_volatile", rty, operands, node=expr)
+        return self.emit("ptr_store_volatile", C.UNIT, operands, node=expr)
 
     def ordering(self, expr: S.Expr) -> str:
         if isinstance(expr, S.Path) and expr.ref is not None and expr.ref[0] == "variant" and expr.ref[2] in ORDERINGS:
@@ -837,9 +837,8 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         operands = self.operands([call.receiver, *values])
         if operands is None:
             return None
-        op = {"load": "deref", "compare_exchange": "atomic_compare_exchange"}.get(
-            name, name if name.startswith(("store", "load_", "atomic_")) else "atomic_" + name)
-        return self.emit("builtin::unsafe::" + op, self.substitute_type(expr.ty), operands, lit=orders, node=expr)
+        op = "ptr_" + name if name in ("load", "store", "load_volatile", "store_volatile") else "ptr_atomic_" + kind
+        return self.emit(op, self.substitute_type(expr.ty), operands, lit=orders, node=expr)
 
     def atomic_ordering(self, kind: str, args: Sequence[S.Expr]) -> str:
         orders = [self.ordering(arg) for arg in args]

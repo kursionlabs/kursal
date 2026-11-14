@@ -68,6 +68,36 @@ fn is_prim(&cx: Domain!['k], name: Span['k]) -> bool {
     is_integer(&cx, name) || is_float(&cx, name) || name.is(&cx, "bool")
 }
 
+// The kind of an atomic operation, if `op` is one: one per atomic method of `*T` (`ptr_atomic_` and
+// the kind, whatever the method's own name), and the fence, which takes no pointer. Each carries its
+// ordering.
+forall 'k.
+fn atomic_kind(&cx: Domain!['k], op: Span['k]) -> Option[Span['k]] {
+    if op.is(&cx, "fence") {
+        return Option::Some.(op);
+    }
+    let prefix = Span::from_static(&cx, "ptr_atomic_");
+    if !op.starts_with(&cx, prefix) {
+        return Option::None;
+    }
+    let kind = op.skip(prefix.len());
+    if kind.is(&cx, "load") || kind.is(&cx, "store") || kind.is(&cx, "swap") || kind.is(&cx, "compare_exchange")
+        || kind.is(&cx, "fetch_add") || kind.is(&cx, "fetch_sub") || kind.is(&cx, "fetch_and") || kind.is(&cx, "fetch_or")
+        || kind.is(&cx, "fetch_xor") {
+        Option::Some.(kind)
+    } else {
+        Option::None
+    }
+}
+
+// The operations that need an unsafe context: the instruction's `(unsafe ...)` marker, or an unsafe
+// function.
+forall 'k.
+fn is_unsafe_op(&cx: Domain!['k], op: Span['k]) -> bool {
+    op.is(&cx, "cast") || op.is(&cx, "alloca") || op.is(&cx, "static_brand") || op.is(&cx, "ptr_load") || op.is(&cx, "ptr_store")
+        || op.is(&cx, "ptr_load_volatile") || op.is(&cx, "ptr_store_volatile") || atomic_kind(&cx, op).is_some()
+}
+
 // ------------------------------------------------------------------ types --
 
 forall 'k.
@@ -81,12 +111,12 @@ exposed enum Type {
     Tuple(ArenaVec[Type['k], 'k]),
     Array(Ref[Type['k], 'k], u64),
     Ptr(Ref[Type['k], 'k]),
-    // `builtin::NonNull T`: a pointer like `*T` that is never null. Its all-zero value is no value of the
+    // `non_null T`: a pointer like `*T` that is never null. Its all-zero value is no value of the
     // type, the niche an enum's layout may use (`types::ops::Types::niche`).
     NonNull(Ref[Type['k], 'k]),
     // A brand variable or identity; of kind Brand, never a value type.
     Skolem(Span['k]),
-    // `builtin::Brand $k`, the Copy witness type of brand `$k`: a Skolem in checked IR; inference may
+    // `brand $k`, the Copy witness type of brand `$k`: a Skolem in checked IR; inference may
     // use a brand metavariable.
     Brand(Ref[Type['k], 'k]),
     // brand labels, and the body they scope over
@@ -108,7 +138,7 @@ exposed struct Member {
 forall 'k.
 exposed struct ForeachType {
     binder: Span['k],
-    // the `(builtin::Pointer F)` pattern
+    // the `(ptr F)` pattern
     indirect: bool,
     source: Ref[Type['k], 'k],
     body: Ref[Type['k], 'k],

@@ -43,7 +43,7 @@ class InstanceRangeTests(unittest.TestCase):
             "(trait P (Self)) (trait Q (T)) (instance P (forall (T) ((Q T)) (u32)))",
             """(trait P (Self) (run usize ()))
             (instance P (forall (T) () (u32))
-              (fun run usize () (entry () (= %r (builtin::sizeof T)) (ret %r))))""",
+              (fun run usize () (entry () (= %r (sizeof T)) (ret %r))))""",
         ):
             with self.subTest(source=source), self.assertRaisesRegex(KursError, "parameter T needs a binder-free head occurrence"):
                 check_program(parse_program(source))

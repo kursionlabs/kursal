@@ -6,7 +6,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping, Sequence, Set
 from typing import Never as NoReturn, Optional
 from dataclasses import dataclass, field
-from .core import (BOOL, BRAND, COPY, FLOATS, INTEGERS, U32, UNIT, USIZE, Array, Brand, Enum, Exists, Fn,
+from .core import (ATOMIC_OPS, UNSAFE_OPS, BOOL, BRAND, COPY, FLOATS, INTEGERS, U32, UNIT, USIZE, Array, Brand, Enum, Exists, Fn,
                    Foreach, Ignored, Jmp, Jnz, Named, Never, NonNull, Prim, Ptr, Ret, Skolem, Struct, Switch, Tuple,
                    Unreachable, Type, Kind, Program, Fun, Instance, Param, Premise, Block, Instr, Terminator, Edge, ModuleId)
 from .sexpr import Form, KursError, List, Position, Str
@@ -32,7 +32,7 @@ STATIC = "static"
 # The module of a declaration that names none: inside no exposure scope, so it has no shape authority over
 # restricted declarations.
 NOWHERE = ModuleId(-1, ("<no module>",))
-SEALED = ("Copy", "builtin::")      # compiler-reserved trait names: no user trait or instance
+SEALED = {"Copy", "Exposed"}      # compiler-reserved trait names: no user trait or instance
 
 
 def contains(ty: Type, pred: Callable[[Type], bool]) -> bool:
@@ -141,7 +141,7 @@ class Checker:
                 self.has_memory_form(t)
         for trait in self.program.traits.values():
             self.where = f"trait {trait.name}"
-            if trait.name.startswith(SEALED):
+            if trait.name in SEALED:
                 self.fail("trait_name_is_reserved")
             if len({m.name for m in trait.methods}) != len(trait.methods):
                 self.fail("duplicate_trait_method")
@@ -158,7 +158,7 @@ class Checker:
     def check_instance(self, inst: Instance) -> None:
         trait = self.program.traits.get(inst.trait)
         self.where = f"instance {inst.trait}"
-        if inst.trait.startswith(SEALED):
+        if inst.trait in SEALED:
             self.fail("trait_name_is_reserved")
         if trait is None or len(trait.params) != len(inst.head):
             self.fail("instance_unknown_trait_wrong")
@@ -454,7 +454,7 @@ class Checker:
     def holds(self, trait: str, args: tuple[Type, ...]) -> bool:
         """A premise is discharged by an assumption, or by an instance whose
         head matches and whose own premises hold."""
-        if trait == "builtin::Exposed":
+        if trait == "Exposed":
             return len(args) == 1 and self.types.exposure_available(args[0], self.module, self.kinds, self.premises)
         for p in self.premises:
             if p.trait == trait and len(p.args) == len(args) and all(equal(a, b) for a, b in zip(p.args, args)):
@@ -563,12 +563,14 @@ class Checker:
         self.formation.pos = instr.pos
         op = instr.op
         self.instr = instr
+        if op in UNSAFE_OPS:
+            self.authorize(instr, True)
         result = OPERATIONS.get(op)
         if result is not None:
             out = result(self, instr)
         elif op in ARITH | ORDER | EQUALITY | BITS:
             out = self.primitive(instr)
-        elif op.startswith("builtin::unsafe::atomic_"):
+        elif op in ATOMIC_OPS:
             out = self.atomic(instr)
         else:
             self.fail("unknown_instruction")
@@ -664,17 +666,16 @@ class Checker:
             self.fail("int_cast_converts_between")
         return instr.ty
 
-    def op_as_pointer(self, instr: Instr) -> Type:
+    def op_to_ptr(self, instr: Instr) -> Type:
         """`NonNull T` to `*T`: forgetting that a pointer is not null is safe."""
         got = self.use(instr.args[0])
         if not (isinstance(got, NonNull) and equal(Ptr(got.inner), instr.ty)):
-            self.fail("as_pointer_converts_non_null")
+            self.fail("to_ptr_converts_non_null")
         return instr.ty
 
-    def op_unsafe_cast(self, instr: Instr) -> Type:
+    def op_cast(self, instr: Instr) -> Type:
         if instr.ty is None:
             self.fail("instruction_requires_type")
-        self.authorize(instr, True)
         got = self.use(instr.args[0])
         if any(contains(t, self.uncastable) for t in (got, instr.ty)):
             self.fail("unsafe_cast_cannot_produce")
@@ -770,7 +771,6 @@ class Checker:
     def op_alloca(self, instr: Instr) -> Type:
         if instr.ty is None:
             self.fail("instruction_requires_type")
-        self.authorize(instr, True)
         self.has_memory_form(instr.ty)
         return Ptr(instr.ty)
 
@@ -785,8 +785,7 @@ class Checker:
             self.fail("unknown_data")
         return Ptr(data.ty)
 
-    def op_unsafe_static_brand(self, instr: Instr) -> Type:
-        self.authorize(instr, True)
+    def op_static_brand(self, instr: Instr) -> Type:
         return Brand(Skolem(STATIC))
 
     def op_fresh(self, instr: Instr) -> Type:
@@ -839,33 +838,28 @@ class Checker:
             self.fail("open_binders")
         return subst(t.body, {b: Skolem(c) for b, c in zip(t.binders, instr.binders)})
 
-    def op_unsafe_deref(self, instr: Instr) -> Type:
-        self.authorize(instr, True)
+    def op_ptr_load(self, instr: Instr) -> Type:
         t = self.use(instr.args[0])
         if not isinstance(t, Ptr):
-            self.fail("deref_non_pointer")
+            self.fail("ptr_load_non_pointer")
         if isinstance(t.inner, Never):
             self.fail("unsafe_read_cannot_produce_never")
         self.has_memory_form(t.inner)
         return t.inner
 
-    op_unsafe_load_volatile = op_unsafe_deref
+    op_ptr_load_volatile = op_ptr_load
 
-    def op_unsafe_store(self, instr: Instr) -> Type:
-        self.authorize(instr, True)
+    def op_ptr_store(self, instr: Instr) -> Type:
         p, v = self.use(instr.args[0]), self.use(instr.args[1])
         if not isinstance(p, Ptr) or not fits(v, p.inner):
             self.fail("store_through_pointer_another")
         self.has_memory_form(p.inner)
         return UNIT
 
-    op_unsafe_store_volatile = op_unsafe_store
+    op_ptr_store_volatile = op_ptr_store
 
     def atomic(self, instr: Instr) -> Type:
-        self.authorize(instr, True)
-        kind = instr.op[len("builtin::unsafe::atomic_"):]
-        if kind not in ATOMIC_ARITY:
-            self.fail("unknown_atomic_operation")
+        kind = ATOMIC_OPS[instr.op]
         if len(instr.args) != ATOMIC_ARITY[kind]:
             self.fail("atomic_operand_count")
         order = instr.lit
@@ -906,7 +900,7 @@ class Checker:
         got = self.use(instr.args[0])
         if not equal(got, t.source):
             self.fail("foreach_source")
-        if not self.holds("builtin::Exposed", (t.source,)):
+        if not self.holds("Exposed", (t.source,)):
             self.fail("foreach_source_not_exposed")
         if not self.types.pattern_available(t, self.module, self.kinds):
             self.fail("foreach_pointer_pattern_requires_pointer_components")
@@ -1065,23 +1059,23 @@ OPERATIONS: dict[str, Callable[[Checker, Instr], Type | list[Type]]] = {
     "destruct": Checker.op_destruct,
     "construct_variant": Checker.op_construct_variant,
     "variant_tag": Checker.op_variant_tag,
-    "builtin::int_cast": Checker.op_int_cast,
-    "builtin::as_pointer": Checker.op_as_pointer,
-    "builtin::unsafe::cast": Checker.op_unsafe_cast,
+    "int_cast": Checker.op_int_cast,
+    "to_ptr": Checker.op_to_ptr,
+    "cast": Checker.op_cast,
     "call": Checker.op_call,
     "trait_call": Checker.op_trait_call,
     "fn": Checker.op_fn,
     "alloca": Checker.op_alloca,
-    "builtin::sizeof": Checker.op_sizeof,
+    "sizeof": Checker.op_sizeof,
     "data": Checker.op_data,
-    "builtin::unsafe::static_brand": Checker.op_unsafe_static_brand,
-    "builtin::fresh": Checker.op_fresh,
+    "static_brand": Checker.op_static_brand,
+    "fresh": Checker.op_fresh,
     "pack": Checker.op_pack,
     "open": Checker.op_open,
-    "builtin::unsafe::deref": Checker.op_unsafe_deref,
-    "builtin::unsafe::load_volatile": Checker.op_unsafe_load_volatile,
-    "builtin::unsafe::store": Checker.op_unsafe_store,
-    "builtin::unsafe::store_volatile": Checker.op_unsafe_store_volatile,
+    "ptr_load": Checker.op_ptr_load,
+    "ptr_load_volatile": Checker.op_ptr_load_volatile,
+    "ptr_store": Checker.op_ptr_store,
+    "ptr_store_volatile": Checker.op_ptr_store_volatile,
     "load": Checker.op_load,
     "store": Checker.op_store,
     "foreach": Checker.op_foreach,

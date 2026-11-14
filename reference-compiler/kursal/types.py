@@ -364,7 +364,7 @@ class Types:
         cannot borrow an assumption about its underlying source; it needs its
         own exact assumption or a concretely visible shape.
         """
-        if any(p.trait == "builtin::Exposed" and len(p.args) == 1 and equal(p.args[0], source)
+        if any(p.trait == "Exposed" and len(p.args) == 1 and equal(p.args[0], source)
                for p in premises):
             return True
         return self.concrete_exposure(source, module, kinds)
@@ -539,11 +539,11 @@ def show(ty: Type) -> str:
         case Skolem(label=label):
             return "$" + label
         case Brand(brand=brand):
-            return f"(builtin::Brand {show(brand)})"
+            return f"(brand {show(brand)})"
         case Ptr(inner=inner):
-            return f"(builtin::Pointer {show(inner)})"
+            return f"(ptr {show(inner)})"
         case NonNull(inner=inner):
-            return f"(builtin::NonNull {show(inner)})"
+            return f"(non_null {show(inner)})"
         case Tuple(elems=elems):
             return f"(tuple {' '.join(map(show, elems))})".replace(" )", ")")
         case Array(elem=elem, length=length):
@@ -555,10 +555,10 @@ def show(ty: Type) -> str:
         case Exists(binders=binders, body=body):
             return f"(exists ({' '.join('$' + b for b in binders)}) {show(body)})"
         case Foreach(binder=binder, indirect=indirect, source=source, body=body):
-            pattern = f"(builtin::Pointer {binder})" if indirect else binder
+            pattern = f"(ptr {binder})" if indirect else binder
             inferred = (source.binder, *(source.retained or ())) if isinstance(source, Foreach) else ()
             suffix = "" if ty.retained == inferred else " (retain " + " ".join(ty.retained or ()) + ")"
             return f"(foreach ({pattern} {show(source)}) {show(body)}{suffix})"
         case Fn(params=params, ret=ret, unsafe=unsafe):
-            return f"(builtin::Fn {'(unsafe) ' if unsafe else ''}({' '.join(map(show, params))}) {show(ret)})"
+            return f"(fn {'(unsafe) ' if unsafe else ''}({' '.join(map(show, params))}) {show(ret)})"
     return "_"

@@ -22,20 +22,20 @@ def generate(program):
 class VolatileTests(unittest.TestCase):
     def test_pointer_cell_qualifies_the_pointer_object(self):
         item = C.Ptr(C.U32)
-        load = operation("builtin::unsafe::load_volatile", (("%p", C.Ptr(item)),), item, ("%p",))
+        load = operation("ptr_load_volatile", (("%p", C.Ptr(item)),), item, ("%p",))
         self.assertIn("*(uint32_t* volatile*)entry_p", generate(load))
-        store = operation("builtin::unsafe::store_volatile", (("%p", C.Ptr(item)), ("%v", item)),
+        store = operation("ptr_store_volatile", (("%p", C.Ptr(item)), ("%v", item)),
                           C.UNIT, ("%p", "%v"))
         self.assertIn("*(uint32_t* volatile*)entry_p = entry_v;", generate(store))
 
     def test_scalar_volatile_access_stays_qualified(self):
-        load = operation("builtin::unsafe::load_volatile", (("%p", C.Ptr(C.U32)),), C.U32, ("%p",))
+        load = operation("ptr_load_volatile", (("%p", C.Ptr(C.U32)),), C.U32, ("%p",))
         self.assertIn("*(uint32_t volatile*)entry_p", generate(load))
 
 
 class CastTests(unittest.TestCase):
     def cast(self, source, target):
-        return operation("builtin::unsafe::cast", (("%x", source),), target, ("%x",), ty=target)
+        return operation("cast", (("%x", source),), target, ("%x",), ty=target)
 
     def test_cross_integer_float_cast_requires_equal_widths(self):
         for source, target in ((C.U32, C.Prim("f64")), (C.Prim("f32"), C.Prim("u64"))):
@@ -70,11 +70,11 @@ class AtomicTests(unittest.TestCase):
     def atomic(self, kind, item=C.U32, values=0, order="relaxed"):
         params = (("%p", C.Ptr(item)),) + tuple((f"%v{k}", item) for k in range(values))
         result = C.UNIT if kind in {"store", "fence"} else C.Tuple((item, C.BOOL)) if kind == "compare_exchange" else item
-        return operation("builtin::unsafe::atomic_" + kind, params, result,
+        return operation("fence" if kind == "fence" else "ptr_atomic_" + kind, params, result,
                          tuple(n for n, _ in params), order=order)
 
     def test_unknown_operations_and_wrong_arities_fail_core_assertion(self):
-        with self.assertRaisesRegex(KursError, "unknown_atomic_operation"):
+        with self.assertRaisesRegex(KursError, "unknown_instruction"):
             check_program(self.atomic("typo"))
         for kind, values in (("store", 0), ("load", 1), ("swap", 0), ("compare_exchange", 1),
                              ("fetch_add", 0), ("fence", 0)):
@@ -102,5 +102,5 @@ class AtomicTests(unittest.TestCase):
             check_program(self.atomic("compare_exchange", values=2, order="release/acquire"))
 
     def test_fence_has_no_operands(self):
-        program = operation("builtin::unsafe::atomic_fence", (), C.UNIT, (), order="seq_cst")
+        program = operation("fence", (), C.UNIT, (), order="seq_cst")
         self.assertIn('__atomic_thread_fence(__ATOMIC_SEQ_CST)', generate(program))

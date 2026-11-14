@@ -146,7 +146,7 @@ class MatchingTests(unittest.TestCase):
     def test_copy_constraints_use_the_parameter_extracted_from_a_function_type(self):
         program = parse_program("""(type Linear! (tuple))
           (trait Test (Self) (run u32 ()))
-          (instance Test (forall (T) ((Copy T)) ((builtin::Fn () T)))
+          (instance Test (forall (T) ((Copy T)) ((fn () T)))
             (fun run u32 () (entry () (= %n (const u32 0)) (ret %n))))""")
         checker = check_program(program)
         self.assertIsNotNone(checker.find_instance("Test", (C.Fn((), C.U32),)))
@@ -158,14 +158,14 @@ class MatchingTests(unittest.TestCase):
 
     def test_kurs_dispatch_compiles_and_runs_for_unbound_function_head(self):
         for pattern, query in (
-            ("(builtin::Fn () T)", "(builtin::Fn () u32)"),
+            ("(fn () T)", "(fn () u32)"),
         ):
             with self.subTest(pattern=pattern), tempfile.TemporaryDirectory() as directory:
                 program = parse_program(f"""(trait Test (Self) (run u32 ()))
                   (instance Test (forall (T) () ({pattern}))
                     (fun run u32 () (entry () (= %n (const u32 7)) (ret %n))))
                   (fun main i32 () (entry () (= %n (trait_call Test run ({query})))
-                    (= %r (builtin::int_cast %n i32)) (ret %r)))""")
+                    (= %r (int_cast %n i32)) (ret %r)))""")
                 c = emit_c(program, check_program(program), "main")
                 binary = str(Path(directory) / "test")
                 built = subprocess.run([c_compiler(), *FLAGS, "-x", "c", "-o", binary, "-"],

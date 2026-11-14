@@ -352,7 +352,7 @@ zero-size value cannot be read, so it cannot be built by `Ref::new`.
 ### Enum layout: tags and niches
 
 An enum is a `uint32_t tag` and a union of its payloads, except where its types give it a cheaper
-form. `NonNull[T]` (`builtin::NonNull T`), a pointer that is never null, has a **niche**: its
+form. `NonNull[T]` (`non_null T` in KURS), a pointer that is never null, has a **niche**: its
 all-zero value is none of its values. `niche` (`types::ops`, `types.py`) finds a type's niche from
 its structure alone:
 

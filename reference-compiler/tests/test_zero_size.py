@@ -22,17 +22,17 @@ class ZeroSizeTests(unittest.TestCase):
 
     def test_zero_size_components_have_no_members(self):
         output = self.run_core('''(type Marker (struct))
-            (type Tagged (forall ($k) () (struct (brand (builtin::Brand $k)) (unit (tuple)) (empty (array u64 0))
+            (type Tagged (forall ($k) () (struct (brand (brand $k)) (unit (tuple)) (empty (array u64 0))
               (value u32) (markers (array Marker 3)))))
             (type Shape (enum (Empty (tuple)) (Mark Marker)))
             (fun main i32 () (entry ()
-              (unsafe (= %b (builtin::unsafe::static_brand))) (= %u (construct (tuple))) (= %e (construct (array u64 0)))
+              (unsafe (= %b (static_brand))) (= %u (construct (tuple))) (= %e (construct (array u64 0)))
               (= %v (const u32 7)) (= %m (construct Marker)) (= %ms (construct (array Marker 3) %m))
               (= %t (construct (Tagged $static) %b %u %e %v %ms))
               (= (%b2 %u2 %e2 %v2 %ms2) (destruct %t (Tagged $static)))
               (= %m2 (construct Marker)) (= %s (construct_variant Shape Mark %m2)) (= %n (variant_tag %s Shape))
-              (= %w (builtin::int_cast %n u32)) (= %x (add %v2 %w))
-              (= %r (builtin::int_cast %x i32)) (ret %r)))''', 8)
+              (= %w (int_cast %n u32)) (= %x (add %v2 %w))
+              (= %r (int_cast %x i32)) (ret %r)))''', 8)
         self.assertNotIn("KurUnit", output)
         self.assertIn("struct K_Tagged { uint32_t f_value; };", output)
         self.assertIn("struct K_Shape { uint32_t tag; };", output)
@@ -48,7 +48,7 @@ class ZeroSizeTests(unittest.TestCase):
               (entry () (= %m (call mark)) (= %a (store &m %m)) (= %z (const u32 6)) (= %b (store &n %z))
                 (= %u (construct (tuple))) (= %f (fn keep)) (= %v (call keep &m &n %u))
                 (= %u2 (construct (tuple))) (= %w (call %f &m &n %u2))
-                (= %x (load &n)) (= %r (builtin::int_cast %x i32)) (ret %r)))''', 8)
+                (= %x (load &n)) (= %r (int_cast %x i32)) (ret %r)))''', 8)
         keep = re.search(r"static void (\w+)\(uint32_t\* entry_n\)", output)
         self.assertIsNotNone(keep, output)
         self.assertRegex(output, r"static void \w+\(void\)")
@@ -59,11 +59,11 @@ class ZeroSizeTests(unittest.TestCase):
 
     def test_sizeof_of_a_zero_size_type_is_zero(self):
         output = self.run_core('''(type Marker (struct))
-            (fun size (forall (T) () usize () (entry () (= %n (builtin::sizeof T)) (ret %n))))
+            (fun size (forall (T) () usize () (entry () (= %n (sizeof T)) (ret %n))))
             (fun main i32 () (entry ()
               (= %a (call (size (tuple)))) (= %b (call (size (array u64 0)))) (= %c (call (size (tuple Marker (tuple)))))
-              (= %d (builtin::sizeof (tuple u32 Marker))) (= %e (builtin::sizeof u32))
-              (= %ab (add %a %b)) (= %abc (add %ab %c)) (= %r (builtin::int_cast %abc i32)) (= %same (eq %d %e))
+              (= %d (sizeof (tuple u32 Marker))) (= %e (sizeof u32))
+              (= %ab (add %a %b)) (= %abc (add %ab %c)) (= %r (int_cast %abc i32)) (= %same (eq %d %e))
               (jnz %same (done %r) (wrong)))
             (done ((%x i32)) (ret %x))
             (wrong () (= %w (const i32 9)) (ret %w)))''', 0)
@@ -72,7 +72,7 @@ class ZeroSizeTests(unittest.TestCase):
     def test_zero_size_data_has_an_address(self):
         output = self.run_core('''(data empty (array u8 0) ())
             (fun main i32 () (entry ()
-              (= %p (data empty)) (= %z (const usize 0)) (unsafe (= %q (builtin::unsafe::cast %p usize)))
+              (= %p (data empty)) (= %z (const usize 0)) (unsafe (= %q (cast %p usize)))
               (= %b (ne %q %z)) (jnz %b (yes) (no)))
             (yes () (= %r (const i32 1)) (ret %r))
             (no () (= %r (const i32 0)) (ret %r)))''', 1)
@@ -90,7 +90,7 @@ class ZeroSizeTests(unittest.TestCase):
               (= %a (construct_variant Shape Empty %u)) (= %b (construct_variant Shape Mark %m))
               (= %c (construct_variant Shape Value %v))
               (= %x (call score %a)) (= %y (call score %b)) (= %z (call score %c))
-              (= %xy (add %x %y)) (= %n (add %xy %z)) (= %r (builtin::int_cast %n i32)) (ret %r)))''', 7)
+              (= %xy (add %x %y)) (= %n (add %xy %z)) (= %r (int_cast %n i32)) (ret %r)))''', 7)
 
     def test_a_specialization_at_a_zero_size_type_is_void(self):
         output = self.run_core('''(fun same (forall (T) () T (T) (entry ((%x T)) (ret %x))))

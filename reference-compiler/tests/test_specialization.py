@@ -70,7 +70,7 @@ class SpecializationTests(unittest.TestCase):
         mapped = C.Foreach("F", False, s, f)
         mapper = C.Fun("mapper", (C.Param("F"), C.Param("S")), (), f, (f,),
                        (C.Block("entry", (("%x", f),), (), C.Ret("%x")),))
-        walk = C.Fun("walk", (C.Param("S"),), (C.Premise("builtin::Exposed", (s,)),), mapped, (s,),
+        walk = C.Fun("walk", (C.Param("S"),), (C.Premise("Exposed", (s,)),), mapped, (s,),
                      (C.Block("entry", (("%x", s),),
                               (C.Instr(("%y",), "foreach", ("%x", "mapper"), ty=mapped, tys=(s,)),),
                               C.Ret("%y")),))

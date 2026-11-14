@@ -366,7 +366,7 @@ class Infer:
 
     def discharge(self, trait: str, args: Sequence[C.Type], input_count: int, pos: Optional[Position]) -> None:
         """An assumption or a unique matching instance solves the output arguments."""
-        if trait == "builtin::Exposed":
+        if trait == "Exposed":
             concrete = tuple(zonk(arg) for arg in args)
             if len(concrete) != 1 or not self.types.exposure_available(
                     concrete[0], self.module, self.kinds, self.assumptions):
@@ -955,7 +955,7 @@ class Infer:
         source = zonk(self.expr(expr.source))
         if isinstance(source, Meta):
             source = self.shape(source, expr.pos)
-        self.require("builtin::Exposed", (source,), expr.pos)
+        self.require("Exposed", (source,), expr.pos)
         binder = expr.binder or f"#F{next(_ids)}"
         self.kinds[binder] = C.ANY
         if isinstance(source, C.Foreach):     # a transformed source: its items are its body

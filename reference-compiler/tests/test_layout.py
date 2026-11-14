@@ -44,44 +44,44 @@ class LayoutTests(unittest.TestCase):
         for source in ("(type A (struct (self A)))",
                        "(type A (tuple B)) (type B (enum (Back A)))",
                        "(type Value (forall (T) () (struct (value T)))) (type A (Value A))",
-                       "(type A (exists ($k) (tuple A (builtin::Brand $k))))"):
+                       "(type A (exists ($k) (tuple A (brand $k))))"):
             with self.subTest(source=source):
                 self.rejects(source, "infinite by-value layout")
 
     def test_pointers_and_pointer_wrappers_break_storage_cycles(self):
-        self.compiles("(type A (struct (next (builtin::Pointer A))))", C.Named("A"))
+        self.compiles("(type A (struct (next (ptr A))))", C.Named("A"))
         self.compiles("""
-(type Ref (forall (T) () (struct (ptr (builtin::Pointer T)))))
+(type Ref (forall (T) () (struct (ptr (ptr T)))))
 (type Node (forall (T) () (struct (value T) (next (Ref (Node T))))))
 """, C.Named("Node", (C.U32,)))
 
     def test_function_fields_break_storage_cycles(self):
-        self.compiles("(type A (struct (callback (builtin::Fn (A) A))))", C.Named("A"))
+        self.compiles("(type A (struct (callback (fn (A) A))))", C.Named("A"))
 
     def test_generic_pointer_recursion_permits_permutations_and_fixed_resets(self):
         self.compiles("""(type Pair (forall (T U) ()
-          (struct (next (builtin::Pointer (Pair U T))))))""", C.Named("Pair", (C.U32, C.BOOL)))
+          (struct (next (ptr (Pair U T))))))""", C.Named("Pair", (C.U32, C.BOOL)))
         self.compiles("""(type Node (forall (T) ()
-          (struct (next (builtin::Pointer (Node u32))))))""", C.Named("Node", (C.BOOL,)))
+          (struct (next (ptr (Node u32))))))""", C.Named("Node", (C.BOOL,)))
 
     def test_growing_arguments_are_rejected_even_behind_pointers(self):
         self.rejects("""(type Node (forall (T) ()
-          (struct (next (builtin::Pointer (Node (tuple T T)))))))""", "recursive type expansion")
+          (struct (next (ptr (Node (tuple T T)))))))""", "recursive type expansion")
         self.rejects("""
-(type A (forall (T) () (struct (p (builtin::Pointer (B T))))))
-(type B (forall (U) () (struct (p (builtin::Pointer (A (tuple U U)))))))
+(type A (forall (T) () (struct (p (ptr (B T))))))
+(type B (forall (U) () (struct (p (ptr (A (tuple U U)))))))
 """, "recursive type expansion")
 
     def test_foreach_cannot_hide_growth_in_a_fresh_binder(self):
         self.rejects("""(type A (forall (T) ()
-          (struct (p (builtin::Pointer (foreach (F (tuple (tuple T T))) (A F)))))))""",
+          (struct (p (ptr (foreach (F (tuple (tuple T T))) (A F)))))))""",
                      "foreach components.*may grow")
 
     def test_foreach_sources_and_bodies_must_terminate(self):
         self.rejects("(type A (foreach (F A) u32))", "recursive foreach source")
-        self.rejects("(type A (foreach (F (builtin::Pointer A)) u32))", "recursive foreach source")
+        self.rejects("(type A (foreach (F (ptr A)) u32))", "recursive foreach source")
         self.rejects("(type A (foreach (F (tuple u32)) (tuple A F)))", "infinite by-value layout")
-        self.compiles("(type A (foreach (F (tuple u32)) (builtin::Pointer A)))", C.Named("A"))
+        self.compiles("(type A (foreach (F (tuple u32)) (ptr A)))", C.Named("A"))
         self.compiles("(type A (foreach (A (tuple u32)) A))", C.Named("A"))
 
     def test_erased_arguments_and_empty_arrays_do_not_store_their_types(self):
@@ -89,12 +89,12 @@ class LayoutTests(unittest.TestCase):
         self.compiles("(type A (array A 0)) (type B (struct (a A) (n u32)))", C.Named("B"))
 
     def test_recursive_aliases_require_an_aggregate_name(self):
-        for body in ("A", "(builtin::Pointer A)", "(builtin::Fn () A)"):
+        for body in ("A", "(ptr A)", "(fn () A)"):
             with self.subTest(body=body):
                 self.rejects(f"(type A {body})", "infinite by-value layout|aggregate boundary")
 
     def test_function_alias_can_recur_through_a_named_aggregate(self):
-        self.compiles("(type Callback (builtin::Fn () Node)) (type Node (struct (run Callback)))",
+        self.compiles("(type Callback (fn () Node)) (type Node (struct (run Callback)))",
                       C.Named("Callback"))
 
     def test_repeated_names_can_be_finite_nested_applications(self):

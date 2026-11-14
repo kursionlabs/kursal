@@ -56,7 +56,7 @@ def instruction_text(instr: C.Instr) -> str:
         case "construct":
             assert instr.ty is not None
             operands = [type_text(instr.ty), *instr.args]
-        case "builtin::int_cast":
+        case "int_cast":
             assert instr.ty is not None
             operands = [*instr.args, type_text(instr.ty)]
         case "load" | "store" | "add" | "eq" | "call":

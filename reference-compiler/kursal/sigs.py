@@ -173,7 +173,7 @@ class Signatures:
 
     def premise(self, trait: S.NamePath, args: S.TypeArgs, scope: Scope) -> C.Premise:
         if args.ref == ("builtin", "Exposed"):
-            return C.Premise("builtin::Exposed", tuple(self.type(a, scope) for a in args.args))
+            return C.Premise("Exposed", tuple(self.type(a, scope) for a in args.args))
         ref = args.ref
         assert ref is not None and ref[0] == "decl"
         actual = tuple(self.type(a, scope) for a in args.args)

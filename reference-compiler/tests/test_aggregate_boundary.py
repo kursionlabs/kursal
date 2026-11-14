@@ -26,15 +26,15 @@ class AggregateBoundaryTests(unittest.TestCase):
                 check_program(parse_program(source))
 
     def test_unsupported_data_types_are_rejected(self):
-        for ty in ('(builtin::Pointer u8)', '(exists ($a) (builtin::Brand $a))',
-                   '(enum (A u8))', '(builtin::Brand $static)'):
+        for ty in ('(ptr u8)', '(exists ($a) (brand $a))',
+                   '(enum (A u8))', '(brand $static)'):
             with self.subTest(ty=ty), self.assertRaises(CheckError):
                 check_program(parse_program('(data x ' + ty + ' ())'))
 
     def test_nested_data_executes(self):
         self.run_core('''(data values (tuple (array i32 2) i32) ((7 9) 3))
             (fun main i32 ()
-              (entry () (= %p (data values)) (unsafe (= %v (builtin::unsafe::deref %p)))
+              (entry () (= %p (data values)) (unsafe (= %v (ptr_load %p)))
                 (= (%array %c) (destruct %v (tuple (array i32 2) i32)))
                 (= (%a %b) (destruct %array (array i32 2)))
                 (= %n (add %a %b)) (= %r (add %n %c)) (ret %r)))''', 19)
@@ -61,9 +61,9 @@ class AggregateBoundaryTests(unittest.TestCase):
     def test_mixed_byte_strings_use_decoded_utf8_counts(self):
         self.run_core('''(data bytes (array u8 4) ("é" 7 "!"))
             (fun main i32 () (entry () (= %p (data bytes))
-              (unsafe (= %v (builtin::unsafe::deref %p)))
+              (unsafe (= %v (ptr_load %p)))
               (= (%a %b %c %d) (destruct %v (array u8 4)))
-              (= %x (builtin::int_cast %c i32)) (= %y (builtin::int_cast %d i32))
+              (= %x (int_cast %c i32)) (= %y (int_cast %d i32))
               (= %r (add %x %y)) (ret %r)))''', 40)
 
     def test_empty_array_representation_is_initialized(self):
@@ -77,7 +77,7 @@ class AggregateBoundaryTests(unittest.TestCase):
     def test_nested_empty_data(self):
         self.run_core('''(data values (tuple (array u8 0) (tuple) i32) (() () 7))
             (fun main i32 () (entry () (= %p (data values))
-              (unsafe (= %v (builtin::unsafe::deref %p)))
+              (unsafe (= %v (ptr_load %p)))
               (= (%a %b %n) (destruct %v (tuple (array u8 0) (tuple) i32)))
               (ret %n)))''', 7)
 
@@ -98,7 +98,7 @@ class AggregateBoundaryTests(unittest.TestCase):
     def test_finite_float_data(self):
         self.run_core('''(data value f32 1.5)
             (fun main i32 () (entry () (= %p (data value))
-              (unsafe (= %x (builtin::unsafe::deref %p)))
+              (unsafe (= %x (ptr_load %p)))
               (= %expected (const f32 1.5)) (= %same (eq %x %expected))
               (jnz %same (yes) (no)))
               (yes () (= %r (const i32 7)) (ret %r))

@@ -92,7 +92,7 @@ class TerminationTests(unittest.TestCase):
     def test_checked_recursive_traversal_is_rejected_before_emission(self):
         program = Program()
         t = Named("T")
-        program.funs["f"] = Fun("f", (Param("T"),), (Premise("builtin::Exposed", (t,)),), U32, (t,), (
+        program.funs["f"] = Fun("f", (Param("T"),), (Premise("Exposed", (t,)),), U32, (t,), (
             Block("entry", (("%x", t),), (
                 Instr(("%mapped",), "foreach", ("%x", "mapper"), ty=Foreach("Item", False, t, UNIT)),
                 Instr(("%r",), "const", ty=U32, lit="0")), Ret("%r")),))

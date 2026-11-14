@@ -14,10 +14,10 @@ from kursal.placeflow import PlaceFlow
 from kursal.sexpr import KursError
 
 
-PACKAGE = "(exists ($h) (tuple u32 (builtin::Brand $h)))"
+PACKAGE = "(exists ($h) (tuple u32 (brand $h)))"
 SETUP = f"""
-  (= %fresh (builtin::fresh)) (= %w (open %fresh ($a)))
-  (= %seven (const u32 7)) (= %body (construct (tuple u32 (builtin::Brand $a)) %seven %w))
+  (= %fresh (fresh)) (= %w (open %fresh ($a)))
+  (= %seven (const u32 7)) (= %body (construct (tuple u32 (brand $a)) %seven %w))
   (= %pkg (pack {PACKAGE} $a %body)) (= %holder (construct Pk %pkg)) (= %u (store &k %holder))
 """
 BRANCH = f"""
@@ -30,7 +30,7 @@ BRANCH = f"""
   (right ($r) () (opened &k.pkg ($r))
     (= %v (load &k.pkg.0)) (= %n (const u32 3)) (= %r (mul %v %n)) (jmp (join $r) %r))
   (join ($j) ((%n u32)) (opened &k.pkg ($j))
-    (= %closed (pack {PACKAGE} $j &k.pkg)) (= %r (builtin::int_cast %n i32)) (ret %r)))
+    (= %closed (pack {PACKAGE} $j &k.pkg)) (= %r (int_cast %n i32)) (ret %r)))
 """
 
 
@@ -122,7 +122,7 @@ class OpenedContractTests(unittest.TestCase):
                 parse_program(f"(fun f u32 () (entry () {contract} (= %n (const u32 0)) (ret %n)))")
 
     def test_partial_linear_payload_survives_a_branch_and_is_restored(self):
-        pkg = "(exists ($k) (tuple H (builtin::Brand $k)))"
+        pkg = "(exists ($k) (tuple H (brand $k)))"
         source = f"""(type H! (struct (n u32)))
           (fun f u32 ({pkg}) (entry ((&p {pkg}))
             (= %u (open &p ($o))) (= %h (load &p.0)) (= %c (const bool true))
@@ -150,27 +150,27 @@ class OpenedContractTests(unittest.TestCase):
               (= %inc (add %v %one)) (= %u (store &k.pkg.0 %inc))
               (= %tick (const u32 1)) (= %next (add %n %tick)) (jmp (loop $c) %next))
             (done ($d) () (= %v (load &k.pkg.0)) (= %p (pack {PACKAGE} $d &k.pkg))
-              (= %r (builtin::int_cast %v i32)) (ret %r)))"""
+              (= %r (int_cast %v i32)) (ret %r)))"""
         program = parse_program(source)
         PlaceFlow(program).plan(program.funs["main"])
         self.assertEqual(program.funs["main"].blocks[1].opened, (("&k.pkg", ("b",)),))
         self.runs(program, 10)
 
     def test_nested_views_are_installed_parent_first_and_close_with_the_parent(self):
-        outer = f"(exists ($a) (tuple (builtin::Brand $a) {PACKAGE}))"
+        outer = f"(exists ($a) (tuple (brand $a) {PACKAGE}))"
         source = f"""(type Pk (struct (pkg {outer})))
           (fun main i32 () (locals (&k Pk))
-            (entry () (= %fa (builtin::fresh)) (= %wa (open %fa ($a)))
-              (= %fb (builtin::fresh)) (= %wb (open %fb ($b))) (= %n (const u32 7))
-              (= %ib (construct (tuple u32 (builtin::Brand $b)) %n %wb))
+            (entry () (= %fa (fresh)) (= %wa (open %fa ($a)))
+              (= %fb (fresh)) (= %wb (open %fb ($b))) (= %n (const u32 7))
+              (= %ib (construct (tuple u32 (brand $b)) %n %wb))
               (= %inner (pack {PACKAGE} $b %ib))
-              (= %ob (construct (tuple (builtin::Brand $a) {PACKAGE}) %wa %inner))
+              (= %ob (construct (tuple (brand $a) {PACKAGE}) %wa %inner))
               (= %pkg (pack {outer} $a %ob)) (= %root (construct Pk %pkg)) (= %u (store &k %root))
               (= %op (open &k.pkg ($o))) (= %ip (open &k.pkg.1 ($i))) (jmp (next $o $i)))
             (next ($x $y) () (opened &k.pkg.1 ($y)) (opened &k.pkg ($x))
               (= %v (load &k.pkg.1.0)) (= %ip (pack {PACKAGE} $y &k.pkg.1))
               (= %op (pack {outer} $x &k.pkg)) (jmp done %v))
-            (done ((%v u32)) (= %r (builtin::int_cast %v i32)) (ret %r)))"""
+            (done ((%v u32)) (= %r (int_cast %v i32)) (ret %r)))"""
         self.runs(parse_program(source), 7)
         # Closing the parent also implicitly closes its nested view.
         source = source.replace(f"(= %ip (pack {PACKAGE} $y &k.pkg.1))", "")
@@ -182,17 +182,17 @@ class OpenedContractTests(unittest.TestCase):
         self.runs(program, 7)
 
     def test_switch_edges_preserve_views_and_known_variants_together(self):
-        pkg = "(exists ($h) (tuple E (builtin::Brand $h)))"
+        pkg = "(exists ($h) (tuple E (brand $h)))"
         source = f"""(type E (enum (A u32) (B u32))) (type Pk (struct (pkg {pkg})))
           (fun main i32 () (locals (&k Pk))
-            (entry () (= %fresh (builtin::fresh)) (= %w (open %fresh ($a))) (= %n (const u32 7))
-              (= %e (construct_variant E A %n)) (= %body (construct (tuple E (builtin::Brand $a)) %e %w))
+            (entry () (= %fresh (fresh)) (= %w (open %fresh ($a))) (= %n (const u32 7))
+              (= %e (construct_variant E A %n)) (= %body (construct (tuple E (brand $a)) %e %w))
               (= %pkg (pack {pkg} $a %body)) (= %root (construct Pk %pkg)) (= %u (store &k %root))
               (= %op (open &k.pkg ($o))) (switch &k.pkg.0 E (A (left $o)) (B (right $o))))
             (left ($l) () (= %v (load &k.pkg.0.A)) (jmp (done $l) %v))
             (right ($r) () (= %v (load &k.pkg.0.B)) (jmp (done $r) %v))
             (done ($d) ((%v u32)) (= %p (pack {pkg} $d &k.pkg))
-              (= %r (builtin::int_cast %v i32)) (ret %r)))"""
+              (= %r (int_cast %v i32)) (ret %r)))"""
         program = parse_program(source)
         PlaceFlow(program).plan(program.funs["main"])
         left = program.funs["main"].blocks[1]
@@ -201,24 +201,24 @@ class OpenedContractTests(unittest.TestCase):
         self.runs(program, 7)
 
     def test_closing_a_view_checks_the_package_type(self):
-        other = "(exists ($h) (tuple bool (builtin::Brand $h)))"
+        other = "(exists ($h) (tuple bool (brand $h)))"
         self.rejects(BRANCH.replace(f"(pack {PACKAGE} $j &k.pkg)", f"(pack {other} $j &k.pkg)"), "packing")
-        same_payload = "(exists ($h) (tuple u32 (builtin::Brand $j)))"
+        same_payload = "(exists ($h) (tuple u32 (brand $j)))"
         self.rejects(BRANCH.replace(f"(pack {PACKAGE} $j &k.pkg)", f"(pack {same_payload} $j &k.pkg)"),
                      "existential brand binder is unused")
-        pkg = "(exists ($a) (tuple (builtin::Brand $a)))"
+        pkg = "(exists ($a) (tuple (brand $a)))"
         self.rejects(f"""(fun f u32 ({pkg}) (entry ((&p {pkg}))
           (= %a (open &p ($x))) (= %b (open &p ($y))) (= %n (const u32 0)) (ret %n)))""",
                      "place_already_open")
 
     def test_an_empty_successor_cannot_implicitly_close_an_open_payload(self):
-        pkg = "(exists ($k) (tuple H (builtin::Brand $k)))"
+        pkg = "(exists ($k) (tuple H (brand $k)))"
         source = f"""(type H! (struct (n u32)))
           (fun f u32 ({pkg}) (entry ((&p {pkg}))
             (= %u (open &p ($o))) (= %h (load &p.0)) (jmp next %h))
             (next ((%h H)) (empty &p)
-              (= %fresh (builtin::fresh)) (= %w (open %fresh ($new)))
-              (= %body (construct (tuple H (builtin::Brand $new)) %h %w))
+              (= %fresh (fresh)) (= %w (open %fresh ($new)))
+              (= %body (construct (tuple H (brand $new)) %h %w))
               (= %pkg (pack {pkg} $new %body)) (= %u (store &p %pkg))
               (= %r (const u32 0)) (ret %r)))"""
         self.rejects(source, "opened_view_contract")
@@ -233,11 +233,11 @@ class OpenedContractTests(unittest.TestCase):
         check_program(parse_program(source))
 
     def test_loading_whole_payload_retains_the_view_until_explicit_close(self):
-        pkg = "(exists ($k) (tuple H (builtin::Brand $k)))"
+        pkg = "(exists ($k) (tuple H (brand $k)))"
         source = f"""(type H! (struct (n u32)))
           (fun f (tuple) ({pkg}) (entry ((&p {pkg}))
             (= %o (open &p ($a))) (= %body (load &p)) (jmp (next $a) %body))
-          (next ($b) ((%body (tuple H (builtin::Brand $b))))
+          (next ($b) ((%body (tuple H (brand $b))))
             (opened &p ($b)) (empty &p)
             (= %s (store &p %body)) (= %closed (pack {pkg} $b &p)) (ret %closed)))"""
         program = parse_program(source)
@@ -249,7 +249,7 @@ class OpenedContractTests(unittest.TestCase):
         check_program(program)
 
     def test_close_needs_the_whole_payload(self):
-        pkg = "(exists ($k) (tuple H (builtin::Brand $k)))"
+        pkg = "(exists ($k) (tuple H (brand $k)))"
         partial = f"""(type H! (struct (n u32)))
           (fun f H ({pkg}) (entry ((&p {pkg}))
             (= %o (open &p ($a))) (= %h (load &p.0))

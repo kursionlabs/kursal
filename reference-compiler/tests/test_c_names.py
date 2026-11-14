@@ -99,7 +99,7 @@ class CNameTests(unittest.TestCase):
     def test_foreign_name_is_not_reused_for_data(self):
         self.run_core('''(extern fun d0_blob i32 ()) (data blob i32 7)
             (fun main i32 () (entry () (= %p (data blob))
-              (unsafe (= %a (builtin::unsafe::deref %p)))
+              (unsafe (= %a (ptr_load %p)))
               (unsafe (= %b (call d0_blob))) (= %r (add %a %b)) (ret %r)))''',
                       16, 'int32_t d0_blob(void) { return 9; }')
 

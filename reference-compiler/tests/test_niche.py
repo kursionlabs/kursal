@@ -13,11 +13,11 @@ from kursal.sexpr import KursError
 from kursal.types import Types
 from tests import test_c_names
 
-NN = "(builtin::NonNull u8)"
+NN = "(non_null u8)"
 OPT = "(type Opt (forall (T) () (enum (None (tuple)) (Some T))))"
 # A pointer to a `u8` holding 5, as a `NonNull`.
 MAKE = """(unsafe (= %a (alloca u8))) (= %a2 (copy %a)) (= %v (const u8 5))
-          (unsafe (= %st (builtin::unsafe::store %a %v))) (unsafe (= %n (builtin::unsafe::cast %a2 (builtin::NonNull u8))))
+          (unsafe (= %st (ptr_store %a %v))) (unsafe (= %n (cast %a2 (non_null u8))))
           (= %n2 (copy %n)) (= %n3 (copy %n))"""
 
 
@@ -62,15 +62,15 @@ class NicheLayoutTests(unittest.TestCase):
             (fun read u32 ((Opt {NN}))
               (entry ((%o (Opt {NN}))) (switch %o (Opt {NN}) (None none) (Some some)))
               (none ((%u (tuple))) (= %r (const u32 100)) (ret %r))
-              (some ((%n {NN})) (= %p (builtin::as_pointer %n (builtin::Pointer u8)))
-                (unsafe (= %b (builtin::unsafe::deref %p))) (= %r (builtin::int_cast %b u32)) (ret %r)))
+              (some ((%n {NN})) (= %p (to_ptr %n (ptr u8)))
+                (unsafe (= %b (ptr_load %p))) (= %r (int_cast %b u32)) (ret %r)))
             (fun main i32 () (entry () {MAKE}
               (= %o (construct_variant (Opt {NN}) Some %n))
               (= %u (construct (tuple))) (= %z (construct_variant (Opt {NN}) None %u))
               (= %t (variant_tag %z (Opt {NN})))
               (= %x (call read %o)) (= %y (call read %z)) (= %xy (add %x %y)) (= %xyt (add %xy %t))
-              (= %size (builtin::sizeof (Opt {NN}))) (= %word (builtin::sizeof (builtin::Pointer u8)))
-              (= %same (eq %size %word)) (= %r (builtin::int_cast %xyt i32)) (jnz %same (done %r) (bad)))
+              (= %size (sizeof (Opt {NN}))) (= %word (sizeof (ptr u8)))
+              (= %same (eq %size %word)) (= %r (int_cast %xyt i32)) (jnz %same (done %r) (bad)))
             (done ((%r i32)) (ret %r))
             (bad () (= %r (const i32 1)) (ret %r)))''', 105)
         self.assertRegex(output, r"static uint32_t \w+\(uint8_t\* entry_o_1\)")
@@ -93,8 +93,8 @@ class NicheLayoutTests(unittest.TestCase):
               (= %o (construct_variant (Opt Run) Some %run))
               (= %u2 (construct (tuple))) (= %z (construct_variant (Opt Run) None %u2))
               (= %x (call len %o)) (= %y (call len %z)) (= %xy (add %x %y))
-              (= %size (builtin::sizeof (Opt Run))) (= %run-size (builtin::sizeof Run))
-              (= %same (eq %size %run-size)) (= %r (builtin::int_cast %xy i32)) (jnz %same (done %r) (bad)))
+              (= %size (sizeof (Opt Run))) (= %run-size (sizeof Run))
+              (= %same (eq %size %run-size)) (= %r (int_cast %xy i32)) (jnz %same (done %r) (bad)))
             (done ((%r i32)) (ret %r))
             (bad () (= %r (const i32 1)) (ret %r)))''', 7)
         self.assertIn("struct K_Run { uint64_t f_len; uint8_t* f_start; uint8_t* f_end; };", output)
@@ -110,11 +110,11 @@ class NicheLayoutTests(unittest.TestCase):
               (= %arr (construct (array {NN} 2) %n2 %n3)) (= %u (construct (tuple)))
               (= %z (construct_variant (Opt (array {NN} 2)) None %u))
               (= %s (variant_tag %z (Opt (array {NN} 2))))
-              (= %x1 (builtin::sizeof (Opt (tuple u32 {NN})))) (= %y1 (builtin::sizeof (tuple u32 {NN})))
-              (= %x2 (builtin::sizeof (Opt (array {NN} 2)))) (= %y2 (builtin::sizeof (array {NN} 2)))
+              (= %x1 (sizeof (Opt (tuple u32 {NN})))) (= %y1 (sizeof (tuple u32 {NN})))
+              (= %x2 (sizeof (Opt (array {NN} 2)))) (= %y2 (sizeof (array {NN} 2)))
               (= %sa (add %x1 %y1)) (= %sb (add %x2 %y2)) (= %ab (add %sa %sb)) (= %ts (add %t %s))
-              (= %wide (builtin::int_cast %ts usize)) (= %all (add %ab %wide))
-              (= %r (builtin::int_cast %all i32)) (ret %r)))''', 4 * 16 + 1)
+              (= %wide (int_cast %ts usize)) (= %all (add %ab %wide))
+              (= %r (int_cast %all i32)) (ret %r)))''', 4 * 16 + 1)
         self.assertIn(".e1 == 0 ? 0 : 1)", output)
         self.assertIn(".items[0] = 0;", output)
 
@@ -123,11 +123,11 @@ class NicheLayoutTests(unittest.TestCase):
             (type Three (enum (A (tuple)) (B (tuple)) (C {NN})))
             (type Two (enum (A {NN}) (B u32)))
             (fun main i32 () (entry ()
-              (= %raw (builtin::sizeof (Opt (builtin::Pointer u8))))
-              (= %three (builtin::sizeof Three)) (= %two (builtin::sizeof Two))
-              (= %nested (builtin::sizeof (Opt (Opt {NN})))) (= %number (builtin::sizeof (Opt u32)))
+              (= %raw (sizeof (Opt (ptr u8))))
+              (= %three (sizeof Three)) (= %two (sizeof Two))
+              (= %nested (sizeof (Opt (Opt {NN})))) (= %number (sizeof (Opt u32)))
               (= %a (add %raw %three)) (= %b (add %a %two)) (= %c (add %b %nested)) (= %d (add %c %number))
-              (= %r (builtin::int_cast %d i32)) (ret %r)))''', 4 * 16 + 8)
+              (= %r (int_cast %d i32)) (ret %r)))''', 4 * 16 + 8)
         self.assertIn("struct K_Three { uint32_t tag; union { uint8_t* v_C; } payload; };", output)
         self.assertIn("struct K_Two { uint32_t tag; union { uint8_t* v_A; uint32_t v_B; } payload; };", output)
         # Opt at a raw pointer, at Opt[NonNull] (whose pointer is a value of the inner enum) and at u32.
@@ -142,7 +142,7 @@ class NicheLayoutTests(unittest.TestCase):
             (fun main i32 () (entry () {MAKE}
               (= %o (call (some {NN}) %n)) (= %k (const u32 3)) (= %q (call (some u32) %k))
               (= %x (call (tag {NN}) %o)) (= %y (call (tag u32) %q))
-              (= %xy (add %x %y)) (= %r (builtin::int_cast %xy i32)) (ret %r)))''', 2)
+              (= %xy (add %x %y)) (= %r (int_cast %xy i32)) (ret %r)))''', 2)
         self.assertRegex(output, r"static uint8_t\* \w+\(uint8_t\* entry_x_\d\);")
         self.assertRegex(output, r"static K_Opt \w+\(uint32_t entry_x_\d\);")
         self.assertRegex(output, r"static uint32_t \w+\(uint8_t\* entry_o_\d\);")
@@ -159,47 +159,47 @@ class NicheLayoutTests(unittest.TestCase):
             (fun peek u8 ((Opt {NN}))
               (entry ((&o (Opt {NN}))) (switch &o (Opt {NN}) (None none) (Some some)))
               (none () (known &o None) (= %r (const u8 0)) (ret %r))
-              (some () (known &o Some) (= %n (load &o.Some)) (= %p (builtin::as_pointer %n (builtin::Pointer u8)))
-                (unsafe (= %r (builtin::unsafe::deref %p))) (ret %r)))
+              (some () (known &o Some) (= %n (load &o.Some)) (= %p (to_ptr %n (ptr u8)))
+                (unsafe (= %r (ptr_load %p))) (ret %r)))
             (fun main i32 () (locals (&o (Opt {NN})) (&c (Opt u64))) (entry () {MAKE}
               (= %o (construct_variant (Opt {NN}) Some %n)) (= %s (store &o %o)) (= %b (call peek &o))
               (= %six (const u64 6)) (= %c (construct_variant (Opt u64) Some %six)) (= %t (store &c %c))
-              (= %u (call bump &c)) (= %r (builtin::int_cast %b i32)) (ret %r)))''', 5)
+              (= %u (call bump &c)) (= %r (int_cast %b i32)) (ret %r)))''', 5)
         self.assertRegex(output, r"static uint8_t \w+\(uint8_t\* const\* restrict entry_o_\d\);")
         self.assertRegex(output, r"switch \(\(\(\*entry_o_\d\) == 0 \? 0 : 1\)\) \{")
         self.assertRegex(output, r"switch \(\(\*entry_o_\d\)\.tag\) \{")
 
 
 REJECTED = {
-    "as_pointer_other_pointee": ("as_pointer_converts_non_null", f"""
-        (fun f (builtin::Pointer u16) ({NN}) (entry ((%n {NN}))
-          (= %p (builtin::as_pointer %n (builtin::Pointer u16))) (ret %p)))"""),
-    "as_pointer_of_a_pointer": ("as_pointer_converts_non_null", """
-        (fun f (builtin::Pointer u8) ((builtin::Pointer u8)) (entry ((%n (builtin::Pointer u8)))
-          (= %p (builtin::as_pointer %n (builtin::Pointer u8))) (ret %p)))"""),
+    "to_ptr_other_pointee": ("to_ptr_converts_non_null", f"""
+        (fun f (ptr u16) ({NN}) (entry ((%n {NN}))
+          (= %p (to_ptr %n (ptr u16))) (ret %p)))"""),
+    "to_ptr_of_a_pointer": ("to_ptr_converts_non_null", """
+        (fun f (ptr u8) ((ptr u8)) (entry ((%n (ptr u8)))
+          (= %p (to_ptr %n (ptr u8))) (ret %p)))"""),
     "cast_to_non_null_is_unsafe": ("unsafe_authorization", f"""
-        (fun f {NN} ((builtin::Pointer u8)) (entry ((%p (builtin::Pointer u8)))
-          (= %n (builtin::unsafe::cast %p {NN})) (ret %n)))"""),
+        (fun f {NN} ((ptr u8)) (entry ((%p (ptr u8)))
+          (= %n (cast %p {NN})) (ret %n)))"""),
     "integer_to_non_null": ("non_null_cast_pointer", f"""
-        (fun f {NN} (usize) (entry ((%p usize)) (unsafe (= %n (builtin::unsafe::cast %p {NN}))) (ret %n)))"""),
+        (fun f {NN} (usize) (entry ((%p usize)) (unsafe (= %n (cast %p {NN}))) (ret %n)))"""),
     "non_null_to_integer": ("non_null_cast_pointer", f"""
-        (fun f usize ({NN}) (entry ((%n {NN})) (unsafe (= %p (builtin::unsafe::cast %n usize))) (ret %p)))"""),
+        (fun f usize ({NN}) (entry ((%n {NN})) (unsafe (= %p (cast %n usize))) (ret %p)))"""),
     "enum_to_pointer": ("unsafe_cast_layout_chosen", OPT + f"""
-        (fun f (builtin::Pointer u8) ((Opt {NN})) (entry ((%o (Opt {NN})))
-          (unsafe (= %p (builtin::unsafe::cast %o (builtin::Pointer u8)))) (ret %p)))"""),
+        (fun f (ptr u8) ((Opt {NN})) (entry ((%o (Opt {NN})))
+          (unsafe (= %p (cast %o (ptr u8)))) (ret %p)))"""),
     "pointer_to_enum": ("unsafe_cast_layout_chosen", OPT + f"""
-        (fun f (Opt {NN}) ((builtin::Pointer u8)) (entry ((%p (builtin::Pointer u8)))
-          (unsafe (= %o (builtin::unsafe::cast %p (Opt {NN})))) (ret %o)))"""),
+        (fun f (Opt {NN}) ((ptr u8)) (entry ((%p (ptr u8)))
+          (unsafe (= %o (cast %p (Opt {NN})))) (ret %o)))"""),
     "tagged_enum_to_integer": ("unsafe_cast_layout_chosen", OPT + """
-        (fun f u64 ((Opt u32)) (entry ((%o (Opt u32))) (unsafe (= %p (builtin::unsafe::cast %o u64))) (ret %p)))"""),
+        (fun f u64 ((Opt u32)) (entry ((%o (Opt u32))) (unsafe (= %p (cast %o u64))) (ret %p)))"""),
     "struct_holding_non_null": ("unsafe_cast_layout_chosen", f"""
         (type Box (struct (p {NN})))
-        (fun f Box ((tuple (builtin::Pointer u8))) (entry ((%t (tuple (builtin::Pointer u8))))
-          (unsafe (= %b (builtin::unsafe::cast %t Box))) (ret %b)))"""),
+        (fun f Box ((tuple (ptr u8))) (entry ((%t (tuple (ptr u8))))
+          (unsafe (= %b (cast %t Box))) (ret %b)))"""),
     "non_null_order": ("does_apply", f"""
         (fun f bool ({NN} {NN}) (entry ((%a {NN}) (%b {NN})) (= %r (lt %a %b)) (ret %r)))"""),
     "non_null_construct": ("not a product", f"""
-        (fun f {NN} ((builtin::Pointer u8)) (entry ((%p (builtin::Pointer u8)))
+        (fun f {NN} ((ptr u8)) (entry ((%p (ptr u8)))
           (= %n (construct {NN} %p)) (ret %n)))"""),
 }
 
@@ -209,11 +209,11 @@ ACCEPTED = {
           (= %r (eq %a %b)) (ret %r)))
         (fun g bool ({NN} {NN}) (entry ((%a {NN}) (%b {NN})) (= %c (copy %a)) (= %r (ne %a %b)) (ret %r)))""",
     "pointer_casts": f"""
-        (fun f (builtin::NonNull u16) ({NN}) (entry ((%n {NN}))
-          (unsafe (= %m (builtin::unsafe::cast %n (builtin::NonNull u16)))) (ret %m)))""",
+        (fun f (non_null u16) ({NN}) (entry ((%n {NN}))
+          (unsafe (= %m (cast %n (non_null u16)))) (ret %m)))""",
     "non_null_of_anything": OPT + f"""
-        (fun f (builtin::Pointer (Opt {NN})) ((builtin::NonNull (Opt {NN}))) (entry ((%n (builtin::NonNull (Opt {NN}))))
-          (= %p (builtin::as_pointer %n (builtin::Pointer (Opt {NN})))) (ret %p)))""",
+        (fun f (ptr (Opt {NN})) ((non_null (Opt {NN}))) (entry ((%n (non_null (Opt {NN}))))
+          (= %p (to_ptr %n (ptr (Opt {NN})))) (ret %p)))""",
 }
 
 

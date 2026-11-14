@@ -32,13 +32,13 @@ from .core import Block, Edge, Fun, Instr, Jmp, Jnz, Ret, Switch, Terminator
 
 # Instructions whose C writes only their results: left out when every result is dead.
 PURE = frozenset({"const", "copy", "construct", "construct_variant", "destruct", "variant_tag", "load",
-                  "builtin::int_cast", "builtin::as_pointer", "pack", "open", "builtin::unsafe::static_brand",
-                  "builtin::fresh",
+                  "int_cast", "to_ptr", "pack", "open", "static_brand",
+                  "fresh",
                   "add", "sub", "mul", "bit_and", "bit_or", "bit_xor", "shl", "shr",
                   "eq", "ne", "lt", "le", "gt", "ge"})
 # Instructions whose dead result the C does not assign: unit results of stores, and call results.
-UNASSIGNED = frozenset({"store", "builtin::unsafe::store", "builtin::unsafe::store_volatile",
-                        "builtin::unsafe::atomic_store", "builtin::unsafe::atomic_fence", "call", "trait_call"})
+UNASSIGNED = frozenset({"store", "ptr_store", "ptr_store_volatile",
+                        "ptr_atomic_store", "fence", "call", "trait_call"})
 
 
 def value_read(arg: str) -> Optional[str]:

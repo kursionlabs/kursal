@@ -12,16 +12,16 @@ REJECTED = {
     # A block brand parameter cannot rebind `static` or a function brand: the jump would turn a fresh
     # witness into `Brand[static]` or into the caller's brand.
     "block_brand_rebinds_static": ("cannot rebind a function brand", """
-        (fun forge (builtin::Brand $static) ()
-          (entry () (= %f (builtin::fresh)) (= %w (open %f ($a))) (jmp (next $a) %w))
-          (next ($static) ((%x (builtin::Brand $static))) (ret %x)))"""),
+        (fun forge (brand $static) ()
+          (entry () (= %f (fresh)) (= %w (open %f ($a))) (jmp (next $a) %w))
+          (next ($static) ((%x (brand $static))) (ret %x)))"""),
     "block_brand_rebinds_generic": ("cannot rebind a function brand", """
-        (fun g (forall ($b) () (builtin::Brand $b) ()
-          (entry () (= %f (builtin::fresh)) (= %w (open %f ($a))) (jmp (next $a) %w))
-          (next ($b) ((%x (builtin::Brand $b))) (ret %x))))"""),
+        (fun g (forall ($b) () (brand $b) ()
+          (entry () (= %f (fresh)) (= %w (open %f ($a))) (jmp (next $a) %w))
+          (next ($b) ((%x (brand $b))) (ret %x))))"""),
     "static_as_generic_brand": ("static is not a parameter name", """
-        (fun h (forall ($static) () u32 ((builtin::Brand $static))
-          (entry ((%x (builtin::Brand $static))) (= %r (const u32 0)) (ret %r))))"""),
+        (fun h (forall ($static) () u32 ((brand $static))
+          (entry ((%x (brand $static))) (= %r (const u32 0)) (ret %r))))"""),
 
     # A block's `known` contract names a variant of the enum at its path.
     "known_unknown_variant": ("known_contract_names_a_variant", """
@@ -68,35 +68,35 @@ REJECTED = {
     # Unsafe operations do not conjure Never, packages, brand witnesses or values of abstract types.
     "cast_to_never": ("unsafe_cast_cannot_produce", """
         (type L! (struct (a u32)))
-        (fun (unsafe) h u32 (L u32) (entry ((%l L) (%x u32)) (= %n (builtin::unsafe::cast %x !)) (unreachable)))"""),
+        (fun (unsafe) h u32 (L u32) (entry ((%l L) (%x u32)) (= %n (cast %x !)) (unreachable)))"""),
     "deref_to_never": ("unsafe_read_cannot_produce_never", """
-        (fun (unsafe) h u32 ((builtin::Pointer !)) (entry ((%p (builtin::Pointer !)))
-          (= %n (builtin::unsafe::deref %p)) (unreachable)))"""),
+        (fun (unsafe) h u32 ((ptr !)) (entry ((%p (ptr !)))
+          (= %n (ptr_load %p)) (unreachable)))"""),
     "cast_to_static_brand": ("unsafe_cast_cannot_produce", """
-        (fun (unsafe) h (builtin::Brand $static) (u32)
-          (entry ((%x u32)) (= %b (builtin::unsafe::cast %x (builtin::Brand $static))) (ret %b)))"""),
+        (fun (unsafe) h (brand $static) (u32)
+          (entry ((%x u32)) (= %b (cast %x (brand $static))) (ret %b)))"""),
     "cast_to_nested_package": ("unsafe_cast_cannot_produce", """
-        (fun (unsafe) h (tuple (exists ($k) (builtin::Brand $k))) ((tuple u32))
-          (entry ((%x (tuple u32))) (= %n (builtin::unsafe::cast %x (tuple (exists ($k) (builtin::Brand $k))))) (ret %n)))"""),
+        (fun (unsafe) h (tuple (exists ($k) (brand $k))) ((tuple u32))
+          (entry ((%x (tuple u32))) (= %n (cast %x (tuple (exists ($k) (brand $k))))) (ret %n)))"""),
     "cast_from_abstract": ("unsafe_cast_cannot_produce", """
-        (fun (unsafe) h (forall (T) () u32 (T) (entry ((%x T)) (= %n (builtin::unsafe::cast %x u32)) (ret %n))))"""),
+        (fun (unsafe) h (forall (T) () u32 (T) (entry ((%x T)) (= %n (cast %x u32)) (ret %n))))"""),
 
     # Atomic read-modify-write takes integers; other atomics take integers, bools or pointers.
     "atomic_fetch_on_struct": ("atomic_pointee_type", """
         (type S (struct (a u32)))
-        (fun (unsafe) h u32 ((builtin::Pointer S) S) (entry ((%p (builtin::Pointer S)) (%s S))
-          (= %v (builtin::unsafe::atomic_fetch_add seq_cst %p %s)) (= %r (const u32 0)) (ret %r)))"""),
+        (fun (unsafe) h u32 ((ptr S) S) (entry ((%p (ptr S)) (%s S))
+          (= %v (ptr_atomic_fetch_add seq_cst %p %s)) (= %r (const u32 0)) (ret %r)))"""),
 
     # A function value carries no premises: they are discharged where the value is made.
     "function_type_premise": ("a function type has no premises", """
         (trait Q (T))
-        (fun h u32 ((builtin::Fn (forall () ((Q u32)) u32 ())))
-          (entry ((%f (builtin::Fn (forall () ((Q u32)) u32 ())))) (= %r (const u32 0)) (ret %r)))"""),
+        (fun h u32 ((fn (forall () ((Q u32)) u32 ())))
+          (entry ((%f (fn (forall () ((Q u32)) u32 ())))) (= %r (const u32 0)) (ret %r)))"""),
 
     # Pointer projection names the pointer's type exactly.
     "pointer_destruct_wrong_type": ("destruct", """
         (type S (struct (a u32)))
-        (fun h u32 ((builtin::Pointer S)) (entry ((%p (builtin::Pointer S)))
+        (fun h u32 ((ptr S)) (entry ((%p (ptr S)))
           (= %a (destruct %p u64)) (= %r (const u32 0)) (ret %r)))"""),
 
     # Literals have one spelling.
@@ -145,37 +145,37 @@ REJECTED = {
 
     # A view opened inside a place is closed before the place is loaded or lent.
     "load_over_an_open_view": ("nested_view_open", """
-        (type Pk (struct (pkg (exists ($h) (tuple u32 (builtin::Brand $h))))))
+        (type Pk (struct (pkg (exists ($h) (tuple u32 (brand $h))))))
         (fun f u32 (Pk) (entry ((&k Pk)) (= %o (open &k.pkg ($o))) (= %whole (load &k))
           (= (%pkg) (destruct %whole Pk)) (= %r (const u32 0)) (ret %r)))"""),
     "lend_over_an_open_view": ("nested_view_open", """
-        (type Pk (struct (pkg (exists ($h) (tuple u32 (builtin::Brand $h))))))
+        (type Pk (struct (pkg (exists ($h) (tuple u32 (brand $h))))))
         (fun g u32 (Pk) (entry ((&k Pk)) (= %r (const u32 0)) (ret %r)))
         (fun f u32 (Pk) (entry ((&k Pk)) (= %o (open &k.pkg ($o))) (= %r (call g &k))
-          (= %c (pack (exists ($h) (tuple u32 (builtin::Brand $h))) $o &k.pkg)) (ret %r)))"""),
+          (= %c (pack (exists ($h) (tuple u32 (brand $h))) $o &k.pkg)) (ret %r)))"""),
 
     # A zero-size type is erased: it has no memory form for unsafe memory operations, casts or externs.
     "alloca_empty_array": ("zero_size_type_has_no_memory_form", """
         (fun (unsafe) h u32 () (entry () (= %p (alloca (array u32 0))) (= %r (const u32 0)) (ret %r)))"""),
     "deref_unit": ("zero_size_type_has_no_memory_form", """
-        (fun (unsafe) h u32 ((builtin::Pointer (tuple))) (entry ((%p (builtin::Pointer (tuple))))
-          (= %v (builtin::unsafe::deref %p)) (= %r (const u32 0)) (ret %r)))"""),
+        (fun (unsafe) h u32 ((ptr (tuple))) (entry ((%p (ptr (tuple))))
+          (= %v (ptr_load %p)) (= %r (const u32 0)) (ret %r)))"""),
     "load_volatile_unit": ("zero_size_type_has_no_memory_form", """
-        (fun (unsafe) h u32 ((builtin::Pointer (tuple))) (entry ((%p (builtin::Pointer (tuple))))
-          (= %v (builtin::unsafe::load_volatile %p)) (= %r (const u32 0)) (ret %r)))"""),
+        (fun (unsafe) h u32 ((ptr (tuple))) (entry ((%p (ptr (tuple))))
+          (= %v (ptr_load_volatile %p)) (= %r (const u32 0)) (ret %r)))"""),
     "store_empty_array": ("zero_size_type_has_no_memory_form", """
-        (fun (unsafe) h u32 ((builtin::Pointer (array u32 0)) (array u32 0))
-          (entry ((%p (builtin::Pointer (array u32 0))) (%v (array u32 0)))
-            (= %u (builtin::unsafe::store %p %v)) (= %r (const u32 0)) (ret %r)))"""),
+        (fun (unsafe) h u32 ((ptr (array u32 0)) (array u32 0))
+          (entry ((%p (ptr (array u32 0))) (%v (array u32 0)))
+            (= %u (ptr_store %p %v)) (= %r (const u32 0)) (ret %r)))"""),
     "cast_to_unit": ("zero_size_type_has_no_memory_form", """
-        (fun (unsafe) h (tuple) (u8) (entry ((%x u8)) (= %u (builtin::unsafe::cast %x (tuple))) (ret %u)))"""),
+        (fun (unsafe) h (tuple) (u8) (entry ((%x u8)) (= %u (cast %x (tuple))) (ret %u)))"""),
     "cast_from_unit": ("zero_size_type_has_no_memory_form", """
-        (fun (unsafe) h u8 ((tuple)) (entry ((%u (tuple))) (= %x (builtin::unsafe::cast %u u8)) (ret %x)))"""),
+        (fun (unsafe) h u8 ((tuple)) (entry ((%u (tuple))) (= %x (cast %u u8)) (ret %x)))"""),
     "extern_unit_parameter": ("zero_size_type_has_no_memory_form", "(extern fun f u32 ((tuple)))"),
     "extern_unit_value": ("zero_size_type_has_no_memory_form", "(extern value v (tuple (array u8 0)))"),
 
     # Compiler-reserved traits are sealed, and a Copy premise names a parameter.
-    "user_exposed_trait": ("trait_name_is_reserved", "(trait builtin::Exposed (T)) (instance builtin::Exposed (u32))"),
+    "user_exposed_trait": ("trait_name_is_reserved", "(trait Exposed (T)) (instance Exposed (u32))"),
     "copy_premise_on_a_type": ("Copy requires a type parameter name",
                                "(fun h (forall (T) ((Copy u32)) u32 () (entry () (= %r (const u32 0)) (ret %r))))"),
     "copy_premise_on_an_unknown_name": ("Copy requires a type parameter name",
@@ -193,17 +193,17 @@ class CoreSoundnessTests(unittest.TestCase):
         for source in (
             # A block brand that is new to the function.
             """(fun f u32 ()
-                 (entry () (= %f (builtin::fresh)) (= %w (open %f ($a))) (jmp (next $a) %w))
-                 (next ($n) ((%x (builtin::Brand $n))) (= %r (const u32 0)) (ret %r)))""",
+                 (entry () (= %f (fresh)) (= %w (open %f ($a))) (jmp (next $a) %w))
+                 (next ($n) ((%x (brand $n))) (= %r (const u32 0)) (ret %r)))""",
             # A restricted declaration used by its owner.
             """(type (in (module 0 a) abstract) Secret (struct (k u32)))
                (fun (in (module 0 a)) h u32 (Secret) (entry ((%s Secret)) (= %k (destruct %s Secret)) (ret %k)))
                (data (in (module 0 a)) made Secret (7))""",
             # Sizes are public: of a hidden type, of a type holding one, of a type parameter.
             """(type (in (module 0 a) abstract) Secret (struct (k u32)))
-               (fun (in (module 0 b)) h usize () (entry () (= %n (builtin::sizeof Secret)) (ret %n)))
-               (fun (in (module 0 b)) i usize () (entry () (= %n (builtin::sizeof (tuple u8 Secret))) (ret %n)))
-               (fun (in (module 0 b)) g (forall (T) () usize () (entry () (= %n (builtin::sizeof T)) (ret %n))))""",
+               (fun (in (module 0 b)) h usize () (entry () (= %n (sizeof Secret)) (ret %n)))
+               (fun (in (module 0 b)) i usize () (entry () (= %n (sizeof (tuple u8 Secret))) (ret %n)))
+               (fun (in (module 0 b)) g (forall (T) () usize () (entry () (= %n (sizeof T)) (ret %n))))""",
             # Two sibling fields lent together, beside a whole root.
             """(type T3 (struct (a u32) (b u32) (c u32)))
                (fun three u32 (u32 u32 T3) (entry ((&a u32) (&b u32) (&t T3)) (= %r (const u32 0)) (ret %r)))
@@ -216,19 +216,69 @@ class CoreSoundnessTests(unittest.TestCase):
                    (= %r (const u32 1)) (ret %r)))""",
             # Pointer projection at the pointer's own type.
             """(type S (struct (a u32)))
-               (fun h u32 ((builtin::Pointer S)) (entry ((%p (builtin::Pointer S)))
-                 (= %a (destruct %p (builtin::Pointer S))) (= %r (const u32 0)) (ret %r)))""",
+               (fun h u32 ((ptr S)) (entry ((%p (ptr S)))
+                 (= %a (destruct %p (ptr S))) (= %r (const u32 0)) (ret %r)))""",
         ):
             with self.subTest(source=source.split("\n")[0]):
                 check_program(parse_program(source))
 
 
+# One instruction of each unsafe operation, in a safe function with `%p: (ptr u32)` and `%x, %y: u32`.
+UNSAFE_INSTRUCTIONS = {
+    "cast": "(= %v (cast %x i32))",
+    "alloca": "(= %v (alloca u32))",
+    "static_brand": "(= %v (static_brand))",
+    "ptr_load": "(= %v (ptr_load %p))",
+    "ptr_store": "(= %v (ptr_store %p %x))",
+    "ptr_load_volatile": "(= %v (ptr_load_volatile %p))",
+    "ptr_store_volatile": "(= %v (ptr_store_volatile %p %x))",
+    "ptr_atomic_load": "(= %v (ptr_atomic_load acquire %p))",
+    "ptr_atomic_store": "(= %v (ptr_atomic_store release %p %x))",
+    "ptr_atomic_swap": "(= %v (ptr_atomic_swap seq_cst %p %x))",
+    "ptr_atomic_compare_exchange": "(= %v (ptr_atomic_compare_exchange seq_cst/seq_cst %p %x %y))",
+    "ptr_atomic_fetch_add": "(= %v (ptr_atomic_fetch_add seq_cst %p %x))",
+    "ptr_atomic_fetch_sub": "(= %v (ptr_atomic_fetch_sub seq_cst %p %x))",
+    "ptr_atomic_fetch_and": "(= %v (ptr_atomic_fetch_and seq_cst %p %x))",
+    "ptr_atomic_fetch_or": "(= %v (ptr_atomic_fetch_or seq_cst %p %x))",
+    "ptr_atomic_fetch_xor": "(= %v (ptr_atomic_fetch_xor seq_cst %p %x))",
+    "fence": "(= %v (fence seq_cst))",
+}
+
+
+class UnsafeOperationTests(unittest.TestCase):
+    """Each operation of `UNSAFE_OPS` needs the `(unsafe ...)` marker in a safe function, and only those do."""
+
+    def program(self, instr: str) -> str:
+        return f"(fun f u32 ((ptr u32) u32 u32) (entry ((%p (ptr u32)) (%x u32) (%y u32)) {instr} (= %r (const u32 0)) (ret %r)))"
+
+    def test_every_unsafe_operation_is_covered(self):
+        from kursal.core import UNSAFE_OPS
+        self.assertEqual(set(UNSAFE_INSTRUCTIONS), set(UNSAFE_OPS))
+
+    def test_a_missing_marker_is_rejected(self):
+        for op, instr in UNSAFE_INSTRUCTIONS.items():
+            with self.subTest(op=op):
+                check_program(parse_program(self.program(f"(unsafe {instr})")))
+                with self.assertRaisesRegex(KursError, "unsafe_authorization"):
+                    check_program(parse_program(self.program(instr)))
+
+    def test_an_unsafe_function_needs_no_marker(self):
+        for op, instr in UNSAFE_INSTRUCTIONS.items():
+            with self.subTest(op=op):
+                check_program(parse_program(self.program(instr).replace("(fun f", "(fun (unsafe) f", 1)))
+
+    def test_safe_operations_need_no_marker(self):
+        for instr in ("(= %v (int_cast %x u64))", "(= %v (sizeof u32))", "(= %v (fresh))"):
+            with self.subTest(instr=instr):
+                check_program(parse_program(self.program(instr)))
+
+
 class ZeroSizeTests(unittest.TestCase):
     def test_a_specialization_cannot_choose_a_zero_size_type(self):
         from kursal.cgen import emit_c
-        program = parse_program("""(fun (unsafe) read (forall (T) () T ((builtin::Pointer T))
-              (entry ((%p (builtin::Pointer T))) (= %v (builtin::unsafe::deref %p)) (ret %v))))
-            (fun main i32 () (entry () (= %z (const usize 8)) (unsafe (= %p (builtin::unsafe::cast %z (builtin::Pointer (tuple)))))
+        program = parse_program("""(fun (unsafe) read (forall (T) () T ((ptr T))
+              (entry ((%p (ptr T))) (= %v (ptr_load %p)) (ret %v))))
+            (fun main i32 () (entry () (= %z (const usize 8)) (unsafe (= %p (cast %z (ptr (tuple)))))
               (unsafe (= %v (call (read (tuple)) %p))) (= %r (const i32 0)) (ret %r)))""")
         with self.assertRaisesRegex(KursError, "zero-size type has no memory form"):
             emit_c(program, check_program(program), "main")
@@ -245,8 +295,8 @@ class EntryTests(unittest.TestCase):
     def test_the_two_entry_signatures(self):
         self.assertIn("int main(void)", self.emit("(fun main i32 () (entry () (= %r (const i32 0)) (ret %r)))"))
         self.assertIn("int main(int argc, char **argv)", self.emit(
-            """(fun main i32 (i32 (builtin::Pointer (builtin::Pointer u8)))
-                 (entry ((%n i32) (%v (builtin::Pointer (builtin::Pointer u8)))) (ret %n)))"""))
+            """(fun main i32 (i32 (ptr (ptr u8)))
+                 (entry ((%n i32) (%v (ptr (ptr u8)))) (ret %n)))"""))
 
     def test_other_entries_are_rejected(self):
         for source in (

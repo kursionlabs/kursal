@@ -18,7 +18,7 @@ F = C.Named("F")
 
 
 def exposed(ty):
-    return C.Premise("builtin::Exposed", (ty,))
+    return C.Premise("Exposed", (ty,))
 
 
 def declarations():
