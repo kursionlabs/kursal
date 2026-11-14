@@ -1,8 +1,12 @@
-"""Checked KURS to C, by the canonical profile: no optimization, one C local
-per SSA definition, places as fixed C objects, parallel edge assignment.
+"""Checked KURS to C: one C local per SSA value the C needs, places as fixed C objects, edges as
+assignments to the target's parameters.
 
 Generic functions are specialized on demand by logical type arguments, up to their brands.
-Representation erasure is separate from code-specialization identity."""
+Representation erasure is separate from code-specialization identity.
+
+What a function's C leaves out (dead values, copies, forwarded places, return joins) is decided by
+plan.py. Beyond that the backend makes calls in tail position jumps (`tail_call`), and qualifies
+place parameters `const` and `restrict` where the whole program allows it (`qualifiers`)."""
 
 from __future__ import annotations
 
@@ -18,11 +22,21 @@ from .sexpr import Form, KursError, List, Str
 from .types import foreach_binders, ForeachRow, Types, equal, map_children, subst, subst_foreach
 from .termination import check_mono_termination
 from .mangle import encode, mangle, path_segments, type_key, unbranded
+from .plan import PURE, Plan, root
 
 PRELUDE = """#include <stddef.h>
 #include <stdint.h>
 typedef struct { unsigned char dummy; } KurUnit;
 #define KUR_TRAP() __builtin_trap()
+/* A call the C compiler must make a tail call, where it can be told to: Clang's `musttail`. */
+#if defined(__clang__) && defined(__has_attribute)
+#if __has_attribute(musttail)
+#define KUR_MUSTTAIL __attribute__((musttail))
+#endif
+#endif
+#ifndef KUR_MUSTTAIL
+#define KUR_MUSTTAIL
+#endif
 /* A component's address by integer arithmetic: projection never dereferences, so it is defined for any
    pointer value, null and dangling included. The `__typeof__` operands are not evaluated. */
 #define KUR_FIELD(p, m) ((__typeof__(&(p)->m))((uintptr_t)(p) + offsetof(__typeof__(*(p)), m)))
@@ -44,7 +58,7 @@ C_KEYWORDS = set("auto break case char const continue default do double else enu
                  "inline int long register restrict return short signed sizeof static struct switch typedef "
                  "union unsigned void volatile while _Alignas _Alignof _Atomic _Bool _Complex _Generic "
                  "_Imaginary _Noreturn _Static_assert _Thread_local".split())
-RUNTIME_NAMES = {"KurUnit", "KUR_TRAP", *(f"kur_dec_i{n}" for n in (8, 16, 32, 64)),
+RUNTIME_NAMES = {"KurUnit", "KUR_TRAP", "KUR_MUSTTAIL", *(f"kur_dec_i{n}" for n in (8, 16, 32, 64)),
                  "SIZE_MAX", "PTRDIFF_MIN", "PTRDIFF_MAX", "SIG_ATOMIC_MIN", "SIG_ATOMIC_MAX",
                  "WCHAR_MIN", "WCHAR_MAX", "WINT_MIN", "WINT_MAX", *C_ORDER.values()}
 for _stem in ("8", "16", "32", "64", "_LEAST8", "_LEAST16", "_LEAST32", "_LEAST64",
@@ -104,8 +118,17 @@ class Backend:
         self.defs: list[str] = []
         self.symbols: dict[int, list[tuple[tuple[Type, ...], str]]] = {}  # function -> its specializations' unbranded arguments and C symbols
         self.queue: list[tuple[Fun, Mapping[str, Type], str]] = []
-        self.bodies: list[str] = []
-        self.protos: list[str] = []
+        # Each function in order: its symbol, when its head waits for `qualifiers`, else its head; its body.
+        self.emitted: list[tuple[Optional[str], str, str]] = []
+        # symbol -> its C result and parameters: (C type, C name, whether a place)
+        self.heads: dict[str, tuple[str, list[tuple[str, str, bool]]]] = {}
+        # Every place lent to a function by symbol: (callee, its parameter, where the place is: "param" under
+        # the caller's place parameter, "local" in its local place, "raw" behind a pointer; the caller, and
+        # its parameter for "param").
+        self.lends: list[tuple[str, int, str, str, int]] = []
+        self.written: set[tuple[str, int]] = set()      # place parameters the function may write
+        self.address_taken: set[str] = set()
+        self.looping: set[str] = set()     # functions whose tail call to themselves moves a place parameter
         self.datas: dict[str, tuple[str, Data]] = {}
         # One conservative pool for ordinary identifiers, including function
         # locals: later global declarations must not be shadowed by earlier locals.
@@ -238,7 +261,9 @@ class Backend:
         # Stable distinct rigid identities: not a wildcard and not static.
         sub = {p.name: Skolem(encode(("#retained", fun.name, str(k)))) if isinstance(t, Ignored)
                else self.substitute_type(t) for k, (p, t) in enumerate(zip(fun.params, instr.tys))}
-        return self.request(fun, sub)
+        symbol = self.request(fun, sub)
+        self.address_taken.add(symbol)
+        return symbol
 
     def foreign_address(self, name: str) -> str:
         ext = self.program.externs[name]
@@ -255,9 +280,8 @@ class Backend:
             args = ", ".join(names)
             result = allocate("result", self.taken)
             head = f"static KurUnit {symbol}({params})"
-            self.protos.append(head + ";")
-            self.bodies.append(head + " {\n  " + name + "(" + args + ");\n"
-                               f"  KurUnit {result} = {{ 0 }};\n  return {result};\n}}")
+            self.emitted.append((None, head, " {\n  " + name + "(" + args + ");\n"
+                                 f"  KurUnit {result} = {{ 0 }};\n  return {result};\n}}"))
             return symbol
         return self.foreign_adapters[name]
 
@@ -309,7 +333,14 @@ class Backend:
         datas = [self.emit_data(d) for d in self.datas.values()]
         while self.pending:
             self.define(next(iter(self.pending)))
-        out = [PRELUDE, *self.forward, *self.defs, *externs, *datas, *self.protos, *self.bodies]
+        const, restrict = self.qualifiers()
+        protos, bodies = [], []
+        for symbol, head, body in self.emitted:
+            if symbol is not None:
+                head = self.head(symbol, const, restrict)
+            protos.append(head + ";")
+            bodies.append(head + body)
+        out = [PRELUDE, *self.forward, *self.defs, *externs, *datas, *protos, *bodies]
         if entry is not None:
             assert main is not None
             fun = self.program.funs[entry]
@@ -364,49 +395,71 @@ class Backend:
     # ---------------------------------------------------------- functions --
 
     def emit_function(self, fun: Fun, sub: Mapping[str, Type], symbol: str) -> None:
-        self.fun, self.sub = fun, sub
+        self.fun, self.sub, self.symbol = fun, sub, symbol
+        self.plan = Plan(fun)
         typed = self.checker.typed[id(fun)]
         substitute_type = self.substitute_type
         self.locals: dict[tuple[str, str], str] = {}
+        self.aliases: dict[tuple[str, str], str] = {}
+        self.forwards: dict[str, str] = {}
         self.lines: list[str] = []
         self.scratch = 0
         label_taken: set[str] = set()
         self.labels = {b.label: allocate(f"L_{readable(b.label)}", label_taken) for b in fun.blocks}
-        self.decls: list[str] = []
-        decls = self.decls
+        decls: list[str] = []
+        self.temps: list[str] = []
         entry = fun.blocks[0]
+        self.params = [name for name, _ in entry.params]
         self.place_c: dict[str, str] = {}
         cparams = []
         for name, ty in entry.params:
             cname = self.cname(entry.label, name)
             if name.startswith("&"):
                 self.place_c[name] = f"(*{cname})"
-                cparams.append(f"{self.ctype(substitute_type(ty))}* {cname}")
-            else:
-                cparams.append(f"{self.ctype(substitute_type(ty))} {cname}")
+            cparams.append((self.ctype(substitute_type(ty)), cname, name.startswith("&")))
+        ret_type = substitute_type(fun.ret)
+        ret = "void" if isinstance(ret_type, Never) else self.ctype(ret_type)
+        self.heads[symbol] = (ret, cparams)
         for name, ty in fun.locals:
+            if name in self.plan.forwarded:
+                continue
             cname = allocate("p_" + readable(name), self.taken)
             self.place_c[name] = cname
             decls.append(f"{self.ctype(substitute_type(ty))} {cname};")
         self.roots = {**{n: substitute_type(t) for n, t in entry.params if n.startswith("&")},
                       **{n: substitute_type(t) for n, t in fun.locals}}
         self.typed = typed
+        values = []
         for (label, name), ty in typed.items():
             if label == entry.label and any(name == n for n, _ in entry.params) or isinstance(substitute_type(ty), Never):
                 continue
-            decls.append(f"{self.ctype(substitute_type(ty))} {self.cname(label, name)};")
+            values.append((label, name, ty, self.cname(label, name)))
         self.blocks = {b.label: b for b in fun.blocks}
-        for block in fun.blocks:
+        for block in self.plan.emitted:
             self.label = block.label
             self.line(f"{self.labels[block.label]}: ;")
+            call = self.plan.tail_call(block)
             for instr in block.instrs:
-                self.instr(instr)
-            self.term(block.term)
-        ret = "void" if isinstance(substitute_type(fun.ret), Never) else self.ctype(substitute_type(fun.ret))
-        head = f"{'_Noreturn ' if ret == 'void' else ''}static {ret} {symbol}({', '.join(cparams) or 'void'})"
-        self.protos.append(head + ";")
-        self.bodies.append(head + " {\n" + "".join(f"  {d}\n" for d in decls) +
-                           "".join(f"  {line}\n" for line in self.lines) + "}\n")
+                if instr is not call:
+                    self.instr(instr)
+            if call is None or not self.tail_call(call):
+                if call is not None:
+                    self.instr(call)
+                self.term(block.term)
+        decls.extend(f"{self.ctype(substitute_type(ty))} {cname};" for label, name, ty, cname in values
+                     if (label, name) in self.plan.variables)
+        self.emitted.append((symbol, "", " {\n" + "".join(f"  {d}\n" for d in decls + self.temps) +
+                             "".join(f"  {line}\n" for line in self.lines) + "}\n"))
+
+    def head(self, symbol: str, const: set[tuple[str, int]], restrict: set[tuple[str, int]]) -> str:
+        """A function's head, with its place parameters qualified as `qualifiers` allows."""
+        ret, cparams = self.heads[symbol]
+        params = []
+        for k, (ctype, cname, place) in enumerate(cparams):
+            if place:
+                ctype += (" const" if (symbol, k) in const else "") + "*" + (" restrict" if (symbol, k) in restrict else "")
+            params.append(f"{ctype} {cname}")
+        return f"{'_Noreturn ' if ret == 'void' else ''}static {ret} {symbol}({', '.join(params) or 'void'})"
 
     def substitute_type(self, ty: Type) -> Type:
         return subst(ty, self.sub)
@@ -419,7 +472,12 @@ class Backend:
         return self.locals[key]
 
     def value_name(self, name: str) -> str:
-        return self.cname(self.label, name)
+        """The C variable holding a value of the current block: its own, or the one it reads (`Plan`)."""
+        key = (self.label, name)
+        return self.aliases[key] if key in self.aliases else self.cname(self.label, name)
+
+    def is_live(self, name: str) -> bool:
+        return self.plan.is_live(self.label, name)
 
     def type_of(self, name: str) -> Type:
         return self.substitute_type(self.typed[self.label, name])
@@ -461,13 +519,22 @@ class Backend:
 
     def instr(self, instr: Instr) -> None:
         op, a = instr.op, instr.args
+        if op in PURE and not any(self.is_live(name) for name in instr.lhs):
+            return
         dst = self.value_name(instr.lhs[0]) if len(instr.lhs) == 1 else None
+        # A unit result the C does not assign: one nothing reads.
+        unit_dst = dst if len(instr.lhs) == 1 and self.is_live(instr.lhs[0]) else None
         substitute_type = self.substitute_type
         if op == "const":
             assert isinstance(instr.ty, Prim) and instr.lit is not None
             self.line(f"{dst} = {self.literal(instr.ty, instr.lit)};")
         elif op == "copy":
-            self.line(f"{dst} = {self.value_name(a[0])};")
+            self.aliases[self.label, instr.lhs[0]] = self.value_name(a[0])
+        elif op == "load" and a[0] in self.plan.forwarded:
+            self.aliases[self.label, instr.lhs[0]] = self.forwards[a[0]]
+        elif op == "store" and a[0] in self.plan.forwarded:
+            self.forwards[a[0]] = self.value_name(a[1])
+            self.unit(unit_dst)
         elif op == "construct":
             assert dst is not None
             self.construct(dst, self.type_operand(instr), [self.value_name(x) for x in a])
@@ -495,6 +562,7 @@ class Backend:
         elif op == "trait_call":
             fun, sub = self.resolve_trait(a[0], a[1], tuple(substitute_type(t) for t in instr.tys))
             symbol = self.request(fun, sub)
+            self.lend(symbol, a[2:])
             self.emit_call(instr, symbol, fun.ret, sub, a[2:], foreign=False)
         elif op == "fn":
             self.line(f"{dst} = {self.function_address(instr)};")
@@ -531,14 +599,16 @@ class Backend:
             self.has_memory_form(pointer.inner, instr)
             qual = f"({self.ctype(pointer.inner)} volatile*)" if op.endswith("volatile") else ""
             self.line(f"*{qual}{self.value_name(a[0])} = {self.value_name(a[1])};")
-            self.unit(dst)
+            self.unit(unit_dst)
         elif op.startswith("builtin::unsafe::atomic_"):
-            self.atomic(instr, dst)
+            self.atomic(instr, dst, unit_dst)
         elif op == "load":
             self.line(f"{dst} = {self.place(a[0])[0]};")
         elif op == "store":
+            if root(a[0]) in self.params:
+                self.written.add((self.symbol, self.params.index(root(a[0]))))
             self.line(f"{self.place(a[0])[0]} = {self.value_name(a[1])};")
-            self.unit(dst)
+            self.unit(unit_dst)
         elif op == "foreach":
             assert dst is not None
             self.foreach(instr, dst)
@@ -586,6 +656,8 @@ class Backend:
         else:
             access = [m for m, _ in self.members(s)] if not self.is_unit(component_type) else []
         for name, member in zip(instr.lhs, access):
+            if not self.is_live(name):
+                continue
             self.line(f"{self.value_name(name)} = KUR_FIELD({source}, {member});" if pointer
                       else f"{self.value_name(name)} = {source}.{member};")
 
@@ -672,6 +744,7 @@ class Backend:
         if callee.startswith("%"):
             fn = erase(self.type_of(callee), self.types)
             assert isinstance(fn, Fn)
+            self.lend(None, instr.args[1:])
             self.emit_call(instr, self.value_name(callee), fn.ret, {}, instr.args[1:], foreign=False)
         elif callee in self.program.externs:
             ext = self.program.externs[callee]
@@ -680,7 +753,9 @@ class Backend:
         else:
             fun = self.program.funs[callee]
             sub = {p.name: substitute_type(t) for p, t in zip(fun.params, instr.tys)}
-            self.emit_call(instr, self.request(fun, sub), fun.ret, sub, instr.args[1:], foreign=False)
+            symbol = self.request(fun, sub)
+            self.lend(symbol, instr.args[1:])
+            self.emit_call(instr, symbol, fun.ret, sub, instr.args[1:], foreign=False)
 
     def emit_call(self, instr: Instr, callee: str, ret: Type, sub: Mapping[str, Type],
                   args: tuple[str, ...], foreign: bool) -> None:
@@ -689,13 +764,32 @@ class Backend:
         dst = self.value_name(instr.lhs[0])
         if isinstance(ret, Never):
             self.line(f"{call};")
+        elif not self.is_live(instr.lhs[0]):
+            self.line(f"{call};")
         elif foreign and self.is_unit(ret):
             self.line(f"{call};")
             self.line(f"{dst}.dummy = 0;")
         else:
             self.line(f"{dst} = {call};")
 
-    def atomic(self, instr: Instr, dst: Optional[str]) -> None:
+    def lend(self, callee: Optional[str], args: Sequence[str]) -> None:
+        """Records where each place lent to `callee` lies, for `qualifiers`; `None` for a call through a
+        function value, whose place parameters are neither `const` nor `restrict`."""
+        for k, arg in enumerate(args):
+            if not arg.startswith("&"):
+                continue
+            if arg.startswith("&*"):
+                kind, j = "raw", -1
+            elif root(arg) in self.params:
+                kind, j = "param", self.params.index(root(arg))
+            else:
+                kind, j = "local", -1
+            if callee is not None:
+                self.lends.append((callee, k, kind, self.symbol, j))
+            elif kind == "param":
+                self.written.add((self.symbol, j))
+
+    def atomic(self, instr: Instr, dst: Optional[str], unit_dst: Optional[str]) -> None:
         assert instr.lit is not None
         kind, args = instr.op[len("builtin::unsafe::atomic_"):], [self.value_name(a) for a in instr.args]
         if kind != "fence":
@@ -710,12 +804,12 @@ class Backend:
                                 instr.pos)
         if kind == "fence":
             self.line(f"__atomic_thread_fence({C_ORDER[instr.lit]});")
-            self.unit(dst)
+            self.unit(unit_dst)
         elif kind == "load":
             self.line(f"{dst} = __atomic_load_n({args[0]}, {C_ORDER[instr.lit]});")
         elif kind == "store":
             self.line(f"__atomic_store_n({args[0]}, {args[1]}, {C_ORDER[instr.lit]});")
-            self.unit(dst)
+            self.unit(unit_dst)
         elif kind == "swap":
             self.line(f"{dst} = __atomic_exchange_n({args[0]}, {args[1]}, {C_ORDER[instr.lit]});")
         elif kind == "compare_exchange":
@@ -799,21 +893,36 @@ class Backend:
             case Unreachable():
                 self.line("KUR_TRAP();")
 
-    def edge(self, edge: Edge, payload: Optional[str] = None, indent: str = "") -> None:
-        """A jump assigns every target parameter at once, through scratch locals."""
+    def edge(self, edge: Edge, payload: Optional[str] = None, source: str = "", indent: str = "") -> None:
+        """A jump assigns the target's live parameters (`source` is the C variable `payload` reads); a
+        jump to a return join returns the value it passes there."""
         target = self.blocks[edge.target]
-        values = ([payload] if payload is not None else []) + [self.value_name(a) for a in edge.args]
-        params = [(self.cname(target.label, n), t) for n, t in target.params]
-        temps: list[str] = []
-        for (_, t), value in zip(params, values):
-            temp = allocate(f"edge_{self.scratch}", self.taken)
-            self.scratch += 1
-            self.decls.append(f"{self.ctype(self.substitute_type(t))} {temp};")
-            self.line(f"{indent}{temp} = {value};")
-            temps.append(temp)
-        for (cname, _), temp in zip(params, temps):
-            self.line(f"{indent}{cname} = {temp};")
+        values = ([(payload, source)] if payload is not None else []) + \
+            [(self.value_name(a), self.value_name(a)) for a in edge.args]
+        if target.label in self.plan.return_index:
+            self.line(f"{indent}return {values[self.plan.return_index[target.label]][0]};")
+            return
+        self.assign([(self.cname(target.label, n), t, False, value, base)
+                     for (n, t), (value, base) in zip(target.params, values) if self.plan.is_live(target.label, n)], indent)
         self.line(f"{indent}goto {self.labels[target.label]};")
+
+    def assign(self, moves: Sequence[tuple[str, Type, bool, str, str]], indent: str) -> None:
+        """Assigns each `(variable, type, whether a place's pointer, value, the variable it reads)` at once:
+        one after another when no assignment overwrites what a later one reads, else through scratch locals."""
+        moves = [move for move in moves if move[0] != move[3]]
+        if any(moves[k][0] == later[4] for k in range(len(moves)) for later in moves[k + 1:]):
+            temps: list[str] = []
+            for _, t, place, value, _ in moves:
+                temp = allocate(f"edge_{self.scratch}", self.taken)
+                self.scratch += 1
+                self.temps.append(f"{self.ctype(self.substitute_type(t))}{'*' if place else ''} {temp};")
+                self.line(f"{indent}{temp} = {value};")
+                temps.append(temp)
+            for move, temp in zip(moves, temps):
+                self.line(f"{indent}{move[0]} = {temp};")
+        else:
+            for dst, _, _, value, _ in moves:
+                self.line(f"{indent}{dst} = {value};")
 
     def switch(self, term: Switch) -> None:
         arg = term.scrutinee
@@ -827,10 +936,97 @@ class Backend:
             self.line(f"case {variants.index(arm.variant)}:")
             payload = None if arg.startswith("&") else f"{source}.payload.{self.variant(arm.variant)}"
             self.line("  {")
-            self.edge(arm.edge, payload, indent="    ")
+            self.edge(arm.edge, payload, source, indent="    ")
             self.line("  }")
         self.line("default: KUR_TRAP();")
         self.line("}")
+
+    # ---------------------------------------------------------- tail calls --
+
+    def tail_call(self, call: Instr) -> bool:
+        """A call whose result its block returns (`Plan.tail_call`), as a jump when the C allows one:
+
+        - a call of the function being emitted, with the same specialization, assigns the call's
+          arguments to the parameters and jumps to the entry block, unless it lends a local place, whose
+          storage the next round would reuse;
+        - a call of another Kursal function is `KUR_MUSTTAIL return f(...)` when Clang's `musttail`
+          holds without question: the callee's C parameter and result types are the caller's, each a
+          scalar (a C integer, float or pointer type), and the call lends no local place and the caller
+          has no `alloca`, so no argument points into the caller's frame, which the tail call frees.
+
+        Returns whether it wrote the call; otherwise the block is written as usual."""
+        a = call.args
+        if call.op == "call":
+            if a[0].startswith("%") or a[0] in self.program.externs:
+                return False
+            fun = self.program.funs[a[0]]
+            sub = {p.name: self.substitute_type(t) for p, t in zip(fun.params, call.tys)}
+            args = a[1:]
+        else:
+            fun, sub = self.resolve_trait(a[0], a[1], tuple(self.substitute_type(t) for t in call.tys))
+            args = a[2:]
+        if any(arg.startswith("&") and not arg.startswith("&*") and root(arg) not in self.params for arg in args):
+            return False
+        symbol = self.request(fun, sub)
+        if symbol == self.symbol:
+            self.lend(symbol, args)
+            entry = self.fun.blocks[0]
+            moves = []
+            for (name, ty), arg in zip(entry.params, args):
+                if name.startswith("&") and arg != name:
+                    self.looping.add(self.symbol)
+                    base = self.value_name(arg[2:]) if arg.startswith("&*") else self.cname(entry.label, root(arg))
+                    moves.append((self.cname(entry.label, name), ty, True, self.operand(arg), base))
+                elif not name.startswith("&") and self.plan.is_live(entry.label, name):
+                    moves.append((self.cname(entry.label, name), ty, False, self.value_name(arg), self.value_name(arg)))
+            self.assign(moves, "")
+            self.line(f"goto {self.labels[entry.label]};")
+            return True
+        ret, params = self.heads[self.symbol]
+        callee_ret = subst(fun.ret, sub)
+        callee_params = [self.ctype(subst(t, sub)) + ("*" if k in fun.places else "") for k, t in enumerate(fun.ptypes)]
+        scalar = set(C_PRIMS.values())
+        same = (not isinstance(callee_ret, Never) and self.ctype(callee_ret) == ret and
+                callee_params == [ctype + ("*" if place else "") for ctype, _, place in params])
+        if not same or self.plan.has_alloca() or \
+                not all(t in scalar or t.endswith("*") for t in [ret, *callee_params]):
+            return False
+        self.lend(symbol, args)
+        self.line(f"KUR_MUSTTAIL return {symbol}({', '.join(self.operand(arg) for arg in args)});")
+        return True
+
+    # ---------------------------------------------------------- qualifiers --
+
+    def qualifiers(self) -> tuple[set[tuple[str, int]], set[tuple[str, int]]]:
+        """The place parameters that are `const` and that are `restrict`, as the greatest sets closed under
+        every lend in the program.
+
+        A place parameter is `const` when its function stores into no path under it and lends it only to
+        `const` place parameters. It is `restrict` when nothing reaches the place it designates during the
+        call except through it: the place is a local of some caller, or under a `restrict` parameter of
+        the caller, at every call. The core language makes that so for places lent by path: a place is no
+        value, so a local place's C object has no address but the ones lends pass, and the places one call
+        lends are disjoint (an enum's payloads are lent only under a known variant, so never two of them).
+        It is not so for a raw target `&*p`, whose memory any copy of `p` reaches; for a function whose
+        address is taken, which a call through a function value may lend anything; and for a function whose
+        tail call to itself moves a place parameter to another place (`tail_call`), which would reach two
+        places through one pointer in one execution of the C function."""
+        heads = self.heads
+        const = {(s, k) for s, (_, params) in heads.items() for k, (_, _, place) in enumerate(params)
+                 if place and s not in self.address_taken and (s, k) not in self.written}
+        restrict = {(s, k) for s, (_, params) in heads.items() for k, (_, _, place) in enumerate(params)
+                    if place and s not in self.address_taken and s not in self.looping}
+        changed = True
+        while changed:
+            changed = False
+            for callee, k, kind, caller, j in self.lends:
+                if (callee, k) in restrict and (kind == "raw" or kind == "param" and (caller, j) not in restrict):
+                    restrict.discard((callee, k))
+                    changed = True
+                if kind == "param" and (caller, j) in const and (callee, k) not in const:
+                    const.discard((caller, j))
+                    changed = True
+        return const, restrict
 
 
 def emit_c(program: Program, checker: Checker, entry: Optional[str] = None) -> str:

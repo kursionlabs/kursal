@@ -67,9 +67,11 @@ class AggregateBoundaryTests(unittest.TestCase):
               (= %r (add %x %y)) (ret %r)))''', 40)
 
     def test_empty_array_representation_is_initialized(self):
-        output = self.run_core('''(fun main i32 () (entry ()
+        output = self.run_core('''(fun keep i32 ((array u8 0)) (entry ((%a (array u8 0)))
+              (= () (destruct %a (array u8 0))) (= %r (const i32 7)) (ret %r)))
+            (fun main i32 () (entry ()
             (= %empty (construct (array u8 0)))
-            (= %r (const i32 7)) (ret %r)))''', 7)
+            (= %r (call keep %empty)) (ret %r)))''', 7)
         self.assertIn('entry_empty.dummy = 0;', output)
 
     def test_nested_empty_data(self):

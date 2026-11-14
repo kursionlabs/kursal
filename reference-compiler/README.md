@@ -2,8 +2,9 @@
 
 The reference compiler for Kursal (Python package `kursal`). It is a direct,
 spec-driven implementation of the language: source text is parsed, resolved,
-typed, lowered to KURS (the core language), checked, and translated to C by
-the canonical translation. There are no optimization passes.
+typed, lowered to KURS (the core language), checked, and translated to C. The
+translation leaves out what the C would not use and turns calls in tail position into
+jumps (`plan.py`, `cgen.py`); there are no passes over KURS.
 
 It needs only Python 3.12+. [uv](https://docs.astral.sh/uv/) manages the
 development tools (`pyproject.toml`, `uv.lock`); mypy checks `kursal/`.
@@ -18,7 +19,7 @@ development tools (`pyproject.toml`, `uv.lock`); mypy checks `kursal/`.
 | Inference | `infer.py`, `unify.py`, `types.py` | the type of every expression; call targets; closure captures |
 | Lowering | `lower.py`, `placeflow.py`, `promote.py` | a KURS program (`core.py`), with `&` places and block contracts |
 | Checking | `check.py` | acceptance by the core rules |
-| C | `cgen.py`, `mangle.py` | one C translation unit |
+| C | `plan.py`, `cgen.py`, `mangle.py` | one C translation unit |
 
 `kurs.py` reads and writes serialized KURS (S-expressions, `sexpr.py`), and `readable.py`
 prints it in the readable notation.
@@ -109,5 +110,6 @@ uv run python tools/test.py -j 1 -v          # serial, full unittest output
 uv run mypy                                  # static types
 ```
 
-End-to-end tests build C with `cc` and run it; each test program's exit code
+End-to-end tests build C with the command of `kursal/cc.py` (`$KURSAL_CC`, else
+`clang`, with `-O3 -w -fno-builtin`), the one `tools/build.py` and the self-hosted compiler use, and run it; each test program's exit code
 is a checksum of its behavior.

@@ -30,7 +30,7 @@ reference in the tests.
 | `infer::dump` | | what inference found, as text |
 | `lower::lowering`, `lower::placeflow`, `lower::promote` | `lower.py`, `placeflow.py`, `promote.py` | lowering inferred bodies to core: control flow, places and their contracts, branded locals as SSA values |
 | `check::checker` | `check.py` | the KURS checker; it records every SSA value's type by `FunKey` |
-| `backend::mangle`, `backend::cgen` | `mangle.py`, `cgen.py` | symbol names (with SHA-256); checked KURS to C |
+| `backend::mangle`, `backend::plan`, `backend::cgen` | `mangle.py`, `plan.py`, `cgen.py` | symbol names (with SHA-256); what a function's C leaves out; checked KURS to C |
 | `main` | `__main__.py` | the command line, and an arena for each group of phases |
 
 ## Building and testing
@@ -216,6 +216,94 @@ environment (`libc::fs`), and running `cc` (`libc::process::run`). Times come fr
 `std::time::Instant`, and float literals are read with `std::float::parse_f64` and taken apart with
 `f64::to_bits` and `f64::to_f32`. The compiler has no `unsafe` operation and no `extern`
 declaration of its own.
+
+## The C backend
+
+`backend::cgen` translates checked KURS to one C file, as `cgen.py` does, byte for byte. The
+translation gives a C variable to each SSA value the C reads, a C object to each place, and a
+label to each block; on top of that it applies the steps below, all of them in both compilers. They
+read the checked program and change only what C is written: the KURS is never rewritten, so the
+checker's verdict covers the program the C translates.
+
+What a function leaves out is decided first, from its KURS alone (`backend::plan`, `plan.py`):
+
+- **Dead values.** A value is live when the C reads it: a kept instruction, a terminator, or an edge
+  into a live block parameter (a fixpoint over the blocks). A pure instruction (constants, copies,
+  loads, arithmetic other than division, construction and destruction, tags, casts between integers,
+  `pack` and `open`) whose results are all dead is not written. A store's unit result and a call's
+  result that nothing reads are not assigned, and a dead block parameter is assigned by no edge.
+- **Copies.** `copy` gets no variable: it reads its source's. Within one execution of a block every C
+  variable is assigned once before it is read, and a block's parameters only on the edges into it.
+- **Forwarded places.** A local place that exactly two instructions of the function name, a store
+  of the whole place and, later in the same block, a load of the whole place, has no C object: the
+  load reads the stored value's variable. Lowering makes one for each operand that waits while the
+  next one is evaluated.
+- **Return joins.** A block with no instructions that returns one of its parameters, or passes its
+  parameters on to another such block, is not written: an edge into it returns the value it passes.
+
+Then, while writing the C (`backend::cgen`, `cgen.py`):
+
+- **Edges** assign the target's live parameters one after another, and go through scratch
+  variables (`edge_N`) only when an assignment would overwrite a variable a later one reads (a
+  block jumping to itself with its parameters swapped).
+- **Tail calls.** A call that is its block's last instruction, whose result the block returns
+  directly or through return joins:
+  - to the function being written, with the same specialization, assigns the arguments to the
+    parameters and jumps to the entry block, unless it lends a local place (whose object the next
+    round would reuse);
+  - to another Kursal function, is `KUR_MUSTTAIL return f(...);` when Clang's `musttail` holds
+    without question: the callee's C parameter and result types are exactly the caller's, each a C
+    integer, floating or pointer type; the call lends no local place; and the caller has no
+    `alloca`, so no argument can point into the frame the tail call frees. `KUR_MUSTTAIL` is
+    `__attribute__((musttail))` under Clang and nothing elsewhere.
+- **`const` and `restrict` place parameters.** A place parameter `&x: T` is a `T*`. When the whole
+  program has been written, `qualifiers` makes it `T const*` when the function stores into no path
+  under it and lends it only to `const` place parameters, and `T* restrict` when nothing reaches the
+  place it designates during the call except through it, as the greatest sets closed under every
+  lend in the program.
+
+### Why `restrict` is sound where it is written
+
+`restrict` on a parameter promises C that, while the function runs, an object reached through the
+pointer is reached through no other pointer that is not derived from it. The core language makes
+that so for places lent by path:
+
+1. A place is not a value (the escape rule): no instruction gives a place's address, it is never
+   stored, returned, captured or passed except by a lend, and the callee can only read it, store
+   into it and lend it on. So the C object of a local place has no address but the ones lends pass,
+   and each lend's pointer is derived from the lender's.
+2. The places one call lends are disjoint: no lent path is a prefix of another. An enum's payload
+   is lent only under its known variant, so two payloads of one enum, which share storage, are never
+   lent together; two fields of one struct are separate objects.
+3. While a callee runs its caller is suspended, so the caller's own pointer to the place is not
+   used.
+
+So a place parameter lent, at every call, a path under a local place of the caller, or under a
+place parameter of the caller that is itself `restrict`, is reached only through the parameter
+while the call runs (by induction on the calls, from the locals). Where the argument does not hold,
+`restrict` is not written:
+
+- **Raw targets.** `f(&*p)` lends the memory behind a raw pointer, which any copy of `p` (another
+  argument, a field of something reachable, another thread) may reach. Its exclusivity is the
+  unsafe caller's obligation, which nothing checks, so the callee's parameter is not `restrict`, nor
+  is any parameter that place is lent on to.
+- **Functions whose address is taken.** A call through a function value may lend anything, and a
+  function pointer's type has no qualifiers: such a function's place parameters are neither
+  `restrict` nor `const`, and a parameter lent through a function value is not `const`.
+- **A tail call to itself that moves a place parameter** (`f(&b, &a)` from `f(&a, &b)`): the jump
+  to the entry block reuses the parameters, so one C pointer would reach two places within one
+  execution of the function.
+
+`const` needs no such argument: it only records that the function's C does not write through the
+pointer, which the checker's place rules let the backend see.
+
+### The C compiler
+
+`kursal build` compiles the C with `$KURSAL_CC`, else `clang`, with `-O3 -w -fno-builtin`, and so do
+`tools/build.py` and every test (the reference's `kursal/cc.py`). `-w` silences warnings about
+generated code (unused labels, the standard library's own prototypes of C functions);
+`-fno-builtin` keeps the C compiler from giving a function the meaning of the C library function of
+the same name, which an extern or a Kursal function may declare with another type.
 
 ## Errors
 

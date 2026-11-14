@@ -1,0 +1,429 @@
+// What the C backend leaves out of one function, decided from its checked KURS before any C is
+// written: live values, copies, forwarded places, return joins and tail calls. It translates
+// `plan.py`, whose docstring states each rule.
+
+use std::collections::arena_vec::ArenaVec;
+use std::collections::arena_map::{ArenaMap, ArenaSet};
+use std::raw::Span;
+use std::alloc::arena::Domain;
+use package::kurs::core::{Block, Edge, Fun, Instr, Terminator};
+use std::option::Option;
+
+// Instructions whose C writes only their results: left out when every result is dead.
+forall 'k.
+fn is_pure(&cx: Domain!['k], op: Span['k]) -> bool {
+    op.is(&cx, "const") || op.is(&cx, "copy") || op.is(&cx, "construct") || op.is(&cx, "construct_variant")
+        || op.is(&cx, "destruct") || op.is(&cx, "variant_tag") || op.is(&cx, "load") || op.is(&cx, "builtin::int_cast")
+        || op.is(&cx, "pack") || op.is(&cx, "open") || op.is(&cx, "builtin::unsafe::static_brand") || op.is(&cx, "builtin::fresh")
+        || op.is(&cx, "add") || op.is(&cx, "sub") || op.is(&cx, "mul") || op.is(&cx, "bit_and") || op.is(&cx, "bit_or")
+        || op.is(&cx, "bit_xor") || op.is(&cx, "shl") || op.is(&cx, "shr") || op.is(&cx, "eq") || op.is(&cx, "ne")
+        || op.is(&cx, "lt") || op.is(&cx, "le") || op.is(&cx, "gt") || op.is(&cx, "ge")
+}
+
+// Instructions whose dead result the C does not assign: unit results of stores, and call results.
+forall 'k.
+fn is_unassigned(&cx: Domain!['k], op: Span['k]) -> bool {
+    op.is(&cx, "store") || op.is(&cx, "builtin::unsafe::store") || op.is(&cx, "builtin::unsafe::store_volatile")
+        || op.is(&cx, "builtin::unsafe::atomic_store") || op.is(&cx, "builtin::unsafe::atomic_fence")
+        || op.is(&cx, "call") || op.is(&cx, "trait_call")
+}
+
+// The SSA value an operand reads: `%x`, or the pointer of a raw target `&*%x`; none for a place.
+forall 'k.
+fn value_read(&cx: Domain!['k], arg: Span['k]) -> Option[Span['k]] {
+    if arg.starts_with(&cx, Span::from_static(&cx, "%")) {
+        Option::Some.(arg)
+    } else if arg.starts_with(&cx, Span::from_static(&cx, "&*")) {
+        Option::Some.(arg.skip(2usize))
+    } else {
+        Option::None
+    }
+}
+
+// Whether an operand is a place path (not a raw target).
+forall 'k.
+fn is_place(&cx: Domain!['k], arg: Span['k]) -> bool {
+    arg.starts_with(&cx, Span::from_static(&cx, "&")) && !arg.starts_with(&cx, Span::from_static(&cx, "&*"))
+}
+
+forall 'k.
+fn root(&cx: Domain!['k], path: Span['k]) -> Span['k] {
+    match path.find(&cx, Span::from_static(&cx, "."), 0usize) {
+        Option::Some(at) => path.slice(0usize, at),
+        Option::None => path,
+    }
+}
+
+// Adds what `instr` reads to `used`.
+forall 'k.
+fn add_reads(&cx: Domain!['k], used: ArenaSet[Span['k], 'k], instr: Instr['k]) {
+    var i = 0usize;
+    while i < instr.args.len(&cx) {
+        match value_read(&cx, instr.args.at(&cx, i)) {
+            Option::Some(v) => {
+                let added = used.insert(&cx, v);
+            },
+            Option::None => (),
+        };
+        i = i + 1usize;
+    }
+}
+
+// Each edge of a terminator, with the number of target parameters before its arguments: a switch
+// on a value passes the variant's payload first.
+forall 'k.
+fn term_edges(&cx: Domain!['k], term: Terminator['k]) -> ArenaVec[(Edge['k], usize), 'k] {
+    let out: ArenaVec[(Edge['k], usize), 'k] = ArenaVec::new(&cx);
+    match term {
+        Terminator::Jmp(edge, _pos) => out.push(&cx, (edge, 0usize)),
+        Terminator::Jnz(_cond, then, other, _pos) => {
+            out.push(&cx, (then, 0usize));
+            out.push(&cx, (other, 0usize));
+        },
+        Terminator::Switch(scrutinee, _ty, arms, _pos) => {
+            let skip = if scrutinee.starts_with(&cx, Span::from_static(&cx, "&")) { 0usize } else { 1usize };
+            var a = 0usize;
+            while a < arms.len(&cx) {
+                out.push(&cx, (arms.at(&cx, a).edge, skip));
+                a = a + 1usize;
+            }
+        },
+        _ => (),
+    };
+    out
+}
+
+// The index of `name` among `block`'s parameters.
+forall 'k.
+fn param_index(&cx: Domain!['k], block: Block['k], name: Span['k]) -> Option[usize] {
+    var i = 0usize;
+    while i < block.params.len(&cx) {
+        if block.params.at(&cx, i).name.eq(&cx, name) {
+            return Option::Some.(i);
+        }
+        i = i + 1usize;
+    }
+    Option::None
+}
+
+forall 'k.
+exposed struct Plan {
+    fun: Fun['k],
+    blocks: ArenaMap[Span['k], Block['k], 'k],
+    // the local places a store and a load alone name
+    forwarded: ArenaSet[Span['k], 'k],
+    // a return join -> the position of the parameter it returns
+    return_index: ArenaMap[Span['k], usize, 'k],
+    // the blocks the C has: every edge into a return join returns instead
+    emitted: ArenaVec[Block['k], 'k],
+    // (block label, SSA name) of every value the C reads
+    live: ArenaSet[(Span['k], Span['k]), 'k],
+    // the values that need a C variable
+    variables: ArenaSet[(Span['k], Span['k]), 'k],
+}
+
+forall 'k.
+impl Plan['k] {
+    fn new(&cx: Domain!['k], fun: Fun['k]) -> Plan['k] {
+        let blocks: ArenaMap[Span['k], Block['k], 'k] = ArenaMap::new(&cx);
+        var b = 0usize;
+        while b < fun.blocks.len(&cx) {
+            let unit = blocks.insert(&cx, fun.blocks.at(&cx, b).label, fun.blocks.at(&cx, b));
+            b = b + 1usize;
+        }
+        let plan = Plan.{ fun, blocks, forwarded: ArenaSet::new(&cx), return_index: ArenaMap::new(&cx), emitted: ArenaVec::new(&cx),
+            live: ArenaSet::new(&cx), variables: ArenaSet::new(&cx) };
+        plan.forwarded_places(&cx);
+        var r = 1usize;
+        while r < fun.blocks.len(&cx) {
+            let label = fun.blocks.at(&cx, r).label;
+            match plan.returned(&cx, label, ArenaSet::new(&cx)) {
+                Option::Some(index) => {
+                    let unit = plan.return_index.insert(&cx, label, index);
+                },
+                Option::None => (),
+            };
+            r = r + 1usize;
+        }
+        var e = 0usize;
+        while e < fun.blocks.len(&cx) {
+            let block = fun.blocks.at(&cx, e);
+            if !plan.return_index.contains(&cx, block.label) {
+                plan.emitted.push(&cx, block);
+            }
+            e = e + 1usize;
+        }
+        plan.liveness(&cx);
+        plan.c_variables(&cx);
+        plan
+    }
+
+    fn is_live(self, &cx: Domain!['k], label: Span['k], name: Span['k]) -> bool {
+        self.live.contains(&cx, (label, name))
+    }
+
+    // ---------------------------------------------------------------- forwarding --
+
+    // The local places a store and a load alone name, the load later in the store's block.
+    fn forwarded_places(self, &cx: Domain!['k]) {
+        // place root -> each (block, instruction index, opcode or "" for a switch, path) naming it
+        let named: ArenaMap[Span['k], ArenaVec[(usize, usize, Span['k], Span['k]), 'k], 'k] = ArenaMap::new(&cx);
+        var b = 0usize;
+        while b < self.fun.blocks.len(&cx) {
+            let block = self.fun.blocks.at(&cx, b);
+            var i = 0usize;
+            while i < block.instrs.len(&cx) {
+                let instr = block.instrs.at(&cx, i);
+                var a = 0usize;
+                while a < instr.args.len(&cx) {
+                    let arg = instr.args.at(&cx, a);
+                    if is_place(&cx, arg) {
+                        name_place(&cx, named, (b, i, instr.op, arg));
+                    }
+                    a = a + 1usize;
+                }
+                i = i + 1usize;
+            }
+            match block.term {
+                Terminator::Switch(scrutinee, _ty, _arms, _pos) => {
+                    if scrutinee.starts_with(&cx, Span::from_static(&cx, "&")) {
+                        name_place(&cx, named, (b, block.instrs.len(&cx), Span::from_static(&cx, ""), scrutinee));
+                    }
+                },
+                _ => (),
+            };
+            b = b + 1usize;
+        }
+        var l = 0usize;
+        while l < self.fun.locals.len(&cx) {
+            let name = self.fun.locals.at(&cx, l).name;
+            match named.get(&cx, name) {
+                Option::Some(uses) => {
+                    if uses.len(&cx) == 2usize {
+                        let (b1, i1, op1, path1) = uses.at(&cx, 0usize);
+                        let (b2, i2, op2, path2) = uses.at(&cx, 1usize);
+                        if op1.is(&cx, "store") && op2.is(&cx, "load") && path1.eq(&cx, name) && path2.eq(&cx, name) && b1 == b2 && i1 < i2 {
+                            let added = self.forwarded.insert(&cx, name);
+                        }
+                    }
+                },
+                Option::None => (),
+            };
+            l = l + 1usize;
+        }
+    }
+
+    fn is_forwarded_load(self, &cx: Domain!['k], instr: Instr['k]) -> bool {
+        instr.op.is(&cx, "load") && self.forwarded.contains(&cx, instr.args.at(&cx, 0usize))
+    }
+
+    // ------------------------------------------------------------------ liveness --
+
+    fn liveness(self, &cx: Domain!['k]) {
+        let live_params: ArenaSet[(Span['k], Span['k]), 'k] = ArenaSet::new(&cx);
+        var changed = true;
+        while changed {
+            changed = false;
+            var b = self.emitted.len(&cx);
+            while b > 0usize {
+                b = b - 1usize;
+                let block = self.emitted.at(&cx, b);
+                let used = self.block_reads(&cx, block, live_params);
+                var p = 0usize;
+                while p < block.params.len(&cx) {
+                    let name = block.params.at(&cx, p).name;
+                    if used.contains(&cx, name) && live_params.insert(&cx, (block.label, name)) {
+                        changed = true;
+                    }
+                    p = p + 1usize;
+                }
+            }
+        }
+        var k = 0usize;
+        while k < self.emitted.len(&cx) {
+            let block = self.emitted.at(&cx, k);
+            let used = self.block_reads(&cx, block, live_params);
+            var u = 0usize;
+            while u < used.positions(&cx) {
+                match used.key_at(&cx, u) {
+                    Option::Some(name) => {
+                        let added = self.live.insert(&cx, (block.label, name));
+                    },
+                    Option::None => (),
+                };
+                u = u + 1usize;
+            }
+            k = k + 1usize;
+        }
+    }
+
+    // The names of `block` the C reads, given which parameters of other blocks are live.
+    fn block_reads(self, &cx: Domain!['k], block: Block['k], live_params: ArenaSet[(Span['k], Span['k]), 'k]) -> ArenaSet[Span['k], 'k] {
+        let used: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+        match block.term {
+            Terminator::Ret(value, _pos) => {
+                let added = used.insert(&cx, value);
+            },
+            Terminator::Jnz(cond, _then, _other, _pos) => {
+                let added = used.insert(&cx, cond);
+            },
+            Terminator::Switch(scrutinee, _ty, _arms, _pos) => {
+                if !scrutinee.starts_with(&cx, Span::from_static(&cx, "&")) {
+                    let added = used.insert(&cx, scrutinee);
+                }
+            },
+            _ => (),
+        };
+        let edges = term_edges(&cx, block.term);
+        var e = 0usize;
+        while e < edges.len(&cx) {
+            let (edge, skip) = edges.at(&cx, e);
+            let target = self.blocks.at(&cx, edge.target);
+            match self.return_index.get(&cx, target.label) {
+                Option::Some(index) => {
+                    // The payload, when it is the value returned, is the scrutinee's, which the switch reads.
+                    if index >= skip {
+                        let added = used.insert(&cx, edge.args.at(&cx, index - skip));
+                    }
+                },
+                Option::None => {
+                    var a = 0usize;
+                    while a < edge.args.len(&cx) && skip + a < target.params.len(&cx) {
+                        if live_params.contains(&cx, (target.label, target.params.at(&cx, skip + a).name)) {
+                            let added = used.insert(&cx, edge.args.at(&cx, a));
+                        }
+                        a = a + 1usize;
+                    }
+                },
+            };
+            e = e + 1usize;
+        }
+        var i = block.instrs.len(&cx);
+        while i > 0usize {
+            i = i - 1usize;
+            let instr = block.instrs.at(&cx, i);
+            var any_used = false;
+            var l = 0usize;
+            while l < instr.lhs.len(&cx) {
+                if used.contains(&cx, instr.lhs.at(&cx, l)) {
+                    any_used = true;
+                }
+                l = l + 1usize;
+            }
+            if any_used || !is_pure(&cx, instr.op) {
+                add_reads(&cx, used, instr);
+            }
+        }
+        used
+    }
+
+    // The values that need a C variable: live parameters, and the results the C assigns.
+    fn c_variables(self, &cx: Domain!['k]) {
+        var b = 0usize;
+        while b < self.emitted.len(&cx) {
+            let block = self.emitted.at(&cx, b);
+            var p = 0usize;
+            while p < block.params.len(&cx) {
+                let key = (block.label, block.params.at(&cx, p).name);
+                if self.live.contains(&cx, key) {
+                    let added = self.variables.insert(&cx, key);
+                }
+                p = p + 1usize;
+            }
+            var i = 0usize;
+            while i < block.instrs.len(&cx) {
+                let instr = block.instrs.at(&cx, i);
+                if !instr.op.is(&cx, "copy") && !self.is_forwarded_load(&cx, instr) {
+                    var l = 0usize;
+                    while l < instr.lhs.len(&cx) {
+                        let key = (block.label, instr.lhs.at(&cx, l));
+                        if self.live.contains(&cx, key) || !is_pure(&cx, instr.op) && !is_unassigned(&cx, instr.op) {
+                            let added = self.variables.insert(&cx, key);
+                        }
+                        l = l + 1usize;
+                    }
+                }
+                i = i + 1usize;
+            }
+            b = b + 1usize;
+        }
+    }
+
+    // ------------------------------------------------------------------- returns --
+
+    // The position of the parameter a return join returns.
+    fn returned(self, &cx: Domain!['k], label: Span['k], seen: ArenaSet[Span['k], 'k]) -> Option[usize] {
+        let block = self.blocks.at(&cx, label);
+        if !block.instrs.is_empty(&cx) || !seen.insert(&cx, label) {
+            return Option::None;
+        }
+        match block.term {
+            Terminator::Ret(value, _pos) => param_index(&cx, block, value),
+            Terminator::Jmp(edge, _pos) => {
+                var a = 0usize;
+                while a < edge.args.len(&cx) {
+                    if param_index(&cx, block, edge.args.at(&cx, a)).is_none() {
+                        return Option::None;
+                    }
+                    a = a + 1usize;
+                }
+                match self.returned(&cx, edge.target, seen) {
+                    Option::Some(index) => param_index(&cx, block, edge.args.at(&cx, index)),
+                    Option::None => Option::None,
+                }
+            },
+            _ => Option::None,
+        }
+    }
+
+    // Whether `block`'s last instruction is a call whose result the block returns, directly or
+    // through return joins.
+    fn tail_call(self, &cx: Domain!['k], block: Block['k]) -> bool {
+        if block.instrs.is_empty(&cx) {
+            return false;
+        }
+        let call = block.instrs.at(&cx, block.instrs.len(&cx) - 1usize);
+        if !(call.op.is(&cx, "call") || call.op.is(&cx, "trait_call")) || call.lhs.len(&cx) != 1usize {
+            return false;
+        }
+        let returned = match block.term {
+            Terminator::Ret(value, _pos) => value,
+            Terminator::Jmp(edge, _pos) => match self.return_index.get(&cx, edge.target) {
+                Option::Some(index) => edge.args.at(&cx, index),
+                Option::None => return false,
+            },
+            _ => return false,
+        };
+        returned.eq(&cx, call.lhs.at(&cx, 0usize))
+    }
+
+    fn has_alloca(self, &cx: Domain!['k]) -> bool {
+        var b = 0usize;
+        while b < self.fun.blocks.len(&cx) {
+            let instrs = self.fun.blocks.at(&cx, b).instrs;
+            var i = 0usize;
+            while i < instrs.len(&cx) {
+                if instrs.at(&cx, i).op.is(&cx, "alloca") {
+                    return true;
+                }
+                i = i + 1usize;
+            }
+            b = b + 1usize;
+        }
+        false
+    }
+}
+
+forall 'k.
+fn name_place(&cx: Domain!['k], named: ArenaMap[Span['k], ArenaVec[(usize, usize, Span['k], Span['k]), 'k], 'k], use_: (usize, usize, Span['k], Span['k])) {
+    let (_b, _i, _op, path) = use_;
+    let key = root(&cx, path);
+    match named.get(&cx, key) {
+        Option::Some(uses) => uses.push(&cx, use_),
+        Option::None => {
+            let uses: ArenaVec[(usize, usize, Span['k], Span['k]), 'k] = ArenaVec::new(&cx);
+            uses.push(&cx, use_);
+            let unit = named.insert(&cx, key, uses);
+        },
+    };
+}
