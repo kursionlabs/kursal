@@ -4,19 +4,17 @@ place programs whose C must exit with the expected status.
     uv run python tools/test.py tests.test_places
 """
 
-import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
+from kursal.cc import cc_command
 from kursal.cgen import emit_c
 from kursal.check import check_program
 from kursal.kurs import parse_program
 from kursal.sexpr import KursError
 from tests.place_cases import CASES, TYPES
-
-CC = os.environ.get("CC", "cc")
 
 COMMON = """
 (type Cur (struct (pos u32)))
@@ -186,7 +184,7 @@ class PlaceProgramTests(unittest.TestCase):
                     program, checker = check(COMMON + text)
                     c_file, exe = Path(directory) / f"{name}.c", Path(directory) / name
                     c_file.write_text(emit_c(program, checker, "main"))
-                    built = subprocess.run([CC, "-w", str(c_file), "-o", str(exe)], capture_output=True, text=True)
+                    built = subprocess.run(cc_command([str(c_file)], str(exe)), capture_output=True, text=True)
                     self.assertEqual(built.returncode, 0, built.stderr)
                     self.assertEqual(subprocess.run([str(exe)]).returncode, status)
 

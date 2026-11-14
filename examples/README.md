@@ -24,7 +24,7 @@ program = lower(resolver, sigs)
 c = emit_c(program, check_program(program), sigs.name(resolver.packages[0].entry_decl))
 open("/tmp/wordfreq.c", "w").write(c)
 PY
-cc -O1 -fno-builtin /tmp/wordfreq.c ../lib/libc/fs.c ../lib/libc/thread.c -lpthread -o /tmp/wordfreq
+clang -O3 -w -fno-builtin /tmp/wordfreq.c ../lib/libc/fs.c ../lib/libc/thread.c -lpthread -o /tmp/wordfreq
 printf 'the cat and the hat\n' | /tmp/wordfreq
 ```
 

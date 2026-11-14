@@ -9,6 +9,7 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Optional
 
+from kursal.cc import FLAGS, c_compiler, cc_command
 from kursal.cgen import emit_c
 from kursal.check import check_program
 from kursal.lower import lower
@@ -177,12 +178,11 @@ def build(package: Path, out: Path) -> tuple[str, Optional[Path], str]:
     c_file = out / f"{package.name}.c"
     c_file.write_text(c)
     if entry is None:
-        cc = subprocess.run(["cc", "-w", "-c", str(c_file), "-o", str(out / f"{package.name}.o")],
+        cc = subprocess.run([c_compiler(), *FLAGS, "-c", str(c_file), "-o", str(out / f"{package.name}.o")],
                             capture_output=True, text=True)
         return package.name, None, cc.stderr[:500] if cc.returncode else ""
     executable = out / package.name
-    cc = subprocess.run(["cc", "-O1", "-w", "-fno-builtin", str(c_file), *map(str, C_HELPERS),
-                         *map(str, package.glob("*.c")), "-o", str(executable), "-lpthread"],
+    cc = subprocess.run(cc_command([str(c_file), *map(str, C_HELPERS), *map(str, package.glob("*.c"))], str(executable)),
                         capture_output=True, text=True)
     return package.name, executable, cc.stderr[:500] if cc.returncode else ""
 

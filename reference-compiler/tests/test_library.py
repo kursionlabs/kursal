@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from kursal.cc import FLAGS, c_compiler
 from kursal.cgen import emit_c
 from kursal.check import check_program
 from kursal.lower import lower
@@ -25,7 +26,7 @@ class LibraryTests(unittest.TestCase):
                     program = lower(resolver, signatures(resolver))
                     c_file = Path(base) / f"{name}.c"
                     c_file.write_text(emit_c(program, check_program(program)))
-                    built = subprocess.run(["cc", "-w", "-fsyntax-only", str(c_file)], capture_output=True, text=True)
+                    built = subprocess.run([c_compiler(), *FLAGS, "-fsyntax-only", str(c_file)], capture_output=True, text=True)
                     self.assertEqual(built.returncode, 0, built.stderr[:500])
 
 

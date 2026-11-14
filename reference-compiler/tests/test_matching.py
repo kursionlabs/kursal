@@ -1,12 +1,12 @@
 """One-way instance matching shares constructor rules and cannot leak binders."""
 
-import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 from kursal import core as C
+from kursal.cc import FLAGS, c_compiler
 from kursal.cgen import emit_c
 from kursal.check import check_program
 from kursal.infer import infer
@@ -168,7 +168,7 @@ class MatchingTests(unittest.TestCase):
                     (= %r (builtin::int_cast %n i32)) (ret %r)))""")
                 c = emit_c(program, check_program(program), "main")
                 binary = str(Path(directory) / "test")
-                built = subprocess.run([os.environ.get("CC", "cc"), "-x", "c", "-o", binary, "-"],
+                built = subprocess.run([c_compiler(), *FLAGS, "-x", "c", "-o", binary, "-"],
                                        input=c, text=True, capture_output=True)
                 self.assertEqual(built.returncode, 0, built.stderr)
                 self.assertEqual(subprocess.run([binary]).returncode, 7)

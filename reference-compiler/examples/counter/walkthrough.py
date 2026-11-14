@@ -15,6 +15,7 @@ PACKAGE = Path(__file__).resolve().parent
 sys.path.insert(0, str(PACKAGE.parents[1]))
 
 from kursal import core as C, syntax as S  # noqa: E402
+from kursal.cc import FLAGS, c_compiler  # noqa: E402
 from kursal.cgen import emit_c  # noqa: E402
 from kursal.check import check_program  # noqa: E402
 from kursal.infer import FnCall  # noqa: E402
@@ -163,7 +164,7 @@ def run() -> None:
     with tempfile.TemporaryDirectory(prefix="kursal-counter-") as temporary:
         for name, source in (("surface", c_source), ("kurs", restored_c)):
             binary = Path(temporary) / name
-            subprocess.run(["cc", "-x", "c", "-o", str(binary), "-"], input=source, text=True, check=True)
+            subprocess.run([c_compiler(), *FLAGS, "-x", "c", "-o", str(binary), "-"], input=source, text=True, check=True)
             status = subprocess.run([str(binary)], check=False).returncode
             assert status == 82, f"{name}: expected 82, got {status}"
     print("Core checking and KURS round-trip passed; both executables exited 82 (41 + 41).")

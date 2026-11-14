@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 
 from kursal.check import check_program
+from kursal.cc import cc_command
 from kursal.cgen import emit_c
 from kursal.lower import lower
 from kursal.resolve import LIB, resolve
@@ -475,7 +476,7 @@ def write(directory, files):
 
 
 def compile_and_run(c_file, out):
-    built = subprocess.run(["cc", "-w", "-fno-builtin", str(c_file), "-o", str(out)], capture_output=True, text=True)
+    built = subprocess.run(cc_command([str(c_file)], str(out)), capture_output=True, text=True)
     if built.returncode:
         return "cc failed: " + built.stderr[:300]
     return subprocess.run([str(out)], capture_output=True, timeout=20).returncode

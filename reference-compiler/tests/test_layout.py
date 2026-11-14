@@ -1,10 +1,10 @@
 """Recursive types must have finite storage and a finite family of C names."""
 
-import os
 import subprocess
 import unittest
 
 from kursal import core as C
+from kursal.cc import FLAGS, c_compiler
 from kursal.cgen import emit_c
 from kursal.check import check_program
 from kursal.kurs import parse_program
@@ -36,7 +36,7 @@ class LayoutTests(unittest.TestCase):
         program = parse_program(source)
         program.externs["probe"] = C.Extern("probe", ty)
         text = emit_c(program, check_program(program))
-        result = subprocess.run([os.environ.get("CC", "cc"), "-x", "c", "-fsyntax-only", "-"],
+        result = subprocess.run([c_compiler(), *FLAGS, "-x", "c", "-fsyntax-only", "-"],
                                 input=text, text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr + "\n" + text)
 

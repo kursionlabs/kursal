@@ -2,7 +2,8 @@
 
     uv run python tools/build.py PACKAGE OUTPUT [--times] [--kurs PATH]
 
-writes OUTPUT.c and compiles it, with the standard library's C helpers, into OUTPUT; with --kurs, also
+writes OUTPUT.c and compiles it, with the standard library's C helpers, into OUTPUT (by `kursal.cc`:
+`$KURSAL_CC`, else Clang, at -O3); with --kurs, also
 writes the lowered program, serialized as KURS, to PATH.
 """
 
@@ -16,6 +17,7 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from kursal.cc import cc_command  # noqa: E402
 from kursal.cgen import emit_c  # noqa: E402
 from kursal.check import check_program  # noqa: E402
 from kursal.kurs import write_program  # noqa: E402
@@ -50,8 +52,7 @@ def build(package: Path, output: Path, times: bool, kurs: Optional[Path] = None)
     stage("C")
     c_file = output.with_name(output.name + ".c")
     c_file.write_text(c_text)
-    command = ["cc", "-O2", "-w", "-fno-builtin", str(c_file), *map(str, C_HELPERS), "-lpthread", "-o", str(output)]
-    built = subprocess.run(command, capture_output=True, text=True)
+    built = subprocess.run(cc_command([str(c_file), *map(str, C_HELPERS)], str(output)), capture_output=True, text=True)
     stage("cc")
     if built.returncode != 0:
         raise SystemExit(built.stderr)

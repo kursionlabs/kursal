@@ -1,12 +1,12 @@
 """Opened-place contracts survive control flow without inventing witness identities."""
 
-import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 from kursal import core as C
+from kursal.cc import FLAGS, c_compiler
 from kursal.cgen import emit_c
 from kursal.check import check_program
 from kursal.kurs import parse_program
@@ -39,7 +39,7 @@ class OpenedContractTests(unittest.TestCase):
         c = emit_c(program, check_program(program), "main")
         with tempfile.TemporaryDirectory() as directory:
             binary = str(Path(directory) / "test")
-            built = subprocess.run([os.environ.get("CC", "cc"), "-x", "c", "-o", binary, "-"],
+            built = subprocess.run([c_compiler(), *FLAGS, "-x", "c", "-o", binary, "-"],
                                    input=c, text=True, capture_output=True)
             self.assertEqual(built.returncode, 0, built.stderr)
             self.assertEqual(subprocess.run([binary]).returncode, status)

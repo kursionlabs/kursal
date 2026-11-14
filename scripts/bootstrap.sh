@@ -8,6 +8,7 @@
 # With --check, bin/kursal builds compiler/ once more into bin/stage2/kursal, and the C of stages 1
 # and 2 must be identical.
 #
+# Every stage compiles its C with $KURSAL_CC, else clang, at -O3 (reference-compiler/kursal/cc.py).
 # Every run of a Kursal-built compiler is capped at 6 GB of address space and 10 minutes.
 set -eu
 
