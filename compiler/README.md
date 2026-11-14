@@ -11,7 +11,7 @@ reference in the tests.
 
 | Module | Translates | |
 |---|---|---|
-| `support::base` | | `fail`, and hashing the compiler's own keys; its storage is the standard library's (see below) |
+| `support::base` | | `fail`; its storage is the standard library's (see below) |
 | `support::system` | | arguments, files, directories, processes and the environment, through the standard library |
 | `syntax::ast`, `syntax::parser` | `syntax.py`, `parser.py` | the surface AST and the parser |
 | `syntax::dump` | | the AST as text |
@@ -96,8 +96,8 @@ branded `'k`:
 Each handle names a header in the arena, so a change made through one copy of a vec, map, set or
 `Ref` is seen through every copy, as with Python's lists, dicts and sets. Elements are `Copy`
 values, read and written whole, and no reference into storage is handed out, so growing a sequence
-never leaves one dangling. `support::base` has no storage of its own: it keeps `fail`, and the
-hashing helpers for the compiler's own key types.
+never leaves one dangling. `support::base` has no storage of its own: it keeps `fail`. Text is
+joined with `ArenaVec::join`, vecs with `concat`, sets with `union` and `insert_all`.
 
 Every type that holds storage carries the brand (`kurs::core::Type['k]`, `syntax::ast::Expr['k]`,
 `lower::lowering::FnLower['k]`), and every function that touches it is `forall 'k.` and takes
@@ -194,7 +194,7 @@ rather than copying them with `keys`, and compare text without splitting it.
 
 Map keys are hashed and compared through the standard library's `HashIn[K, Domain!['k]]`, which
 borrows the context by place: `HashIn[K, Domain!['k]]::hash_in(&cx, key, state)`, or
-`key_hash(&cx, key)` and `key_same(&cx, a, b)`. The standard library has the instances for the
+`std::hash::key_hash(&cx, key)` and `key_eq(&cx, a, b)`. The standard library has the instances for the
 integers, `bool`, tuples, spans and `ArenaVec`s of keys, and `kurs::core` adds `Type`, `Param`,
 `Premise` and `ModuleId`. `kurs::core::same` is structural type equality (Python's `==` on frozen
 dataclasses), `kurs::core::hash` its hash.

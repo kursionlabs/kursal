@@ -13,7 +13,8 @@
 //   NameRef::Prim(name)            a primitive type
 //   NameRef::Builtin(name)         a compiler-sealed name: Brand, Copy, builtin::fresh, ...
 
-use package::support::base::{combine, fail, key_hash, key_same};
+use package::support::base::fail;
+use std::hash::{combine, key_eq, key_hash};
 use std::collections::arena_vec::ArenaVec;
 use std::collections::arena_map::{ArenaMap, ArenaSet};
 use std::mem::Ref;
@@ -244,21 +245,6 @@ fn repr_tuple(&cx: Domain!['k], names: ArenaVec[Span['k], 'k]) -> Span['k] {
 forall 'k.
 fn repr_module(&cx: Domain!['k], m: ModuleId['k]) -> Span['k] {
     Buffer::new().push_static("ModuleId(package=").push_usize(m.package).push_static(", path=").push_bytes(&cx, repr_tuple(&cx, m.path)).push_static(")").save(&cx)
-}
-
-// `'::'.join(names)`.
-forall 'k.
-fn joined(&cx: Domain!['k], names: ArenaVec[Span['k], 'k]) -> Span['k] {
-    var out = Buffer::new();
-    var i = 0usize;
-    while i < names.len(&cx) {
-        if i > 0usize {
-            out = out.push_static("::");
-        }
-        out = out.push_bytes(&cx, names.at(&cx, i));
-        i = i + 1usize;
-    }
-    out.save(&cx)
 }
 
 // ---------------------------------------------------------- the manifest --
@@ -1049,7 +1035,7 @@ fn walk(&cx: Domain!['k], package: Package['k], here: Span['k], rel: ArenaVec[Sp
             }
             let home = ModuleId.{ package: package.id, path };
             if files.contains(&cx, home) {
-                fail(&cx, Buffer::new().push_static("two files define module ").push_bytes(&cx, joined(&cx, path)).push_static(" of ").push_bytes(&cx, package.name.copy(&cx)).save(&cx));
+                fail(&cx, Buffer::new().push_static("two files define module ").push_bytes(&cx, path.join(&cx, "::")).push_static(" of ").push_bytes(&cx, package.name.copy(&cx)).save(&cx));
             }
             files.insert(&cx, home, join(&cx, here, name));
         }
@@ -1407,7 +1393,7 @@ impl Resolver['k] {
                 Option::None => match self.glob(&cx, home, first) {
                     Result::Ok(found) => match found {
                         Option::Some(t) => t,
-                        Option::None => return problem(Buffer::new().push_static("unknown name ").push_bytes(&cx, joined(&cx, path)).save(&cx)),
+                        Option::None => return problem(Buffer::new().push_static("unknown name ").push_bytes(&cx, path.join(&cx, "::")).save(&cx)),
                     },
                     Result::Err(e) => return Result::Err.(e),
                 },
@@ -1416,12 +1402,12 @@ impl Resolver['k] {
         var k = 0usize;
         while k < rest.len(&cx) {
             target = match target {
-                Target::Decl(d) => return self.associated(&cx, d, joined(&cx, rest.skip(&cx, k))),
+                Target::Decl(d) => return self.associated(&cx, d, rest.skip(&cx, k).join(&cx, "::")),
                 Target::Module(m) => match self.member(&cx, home, m, rest.at(&cx, k)) {
                     Result::Ok(t) => t,
                     Result::Err(e) => return Result::Err.(e),
                 },
-                _ => return problem(Buffer::new().push_bytes(&cx, joined(&cx, path.slice(&cx, 0usize, k + 1usize))).push_static(" is not a module").save(&cx)),
+                _ => return problem(Buffer::new().push_bytes(&cx, path.slice(&cx, 0usize, k + 1usize).join(&cx, "::")).push_static(" is not a module").save(&cx)),
             };
             k = k + 1usize;
         }
@@ -1467,7 +1453,7 @@ impl Resolver['k] {
                         Result::Ok(t) => return Result::Ok.(Option::Some.(t)),
                         Result::Err(e) => (),
                     },
-                    _ => return Result::Err.(Problem.{ message: Buffer::new().push_bytes(&cx, joined(&cx, path)).push_static(" is not a module").save(&cx), pos: no_pos() }),
+                    _ => return Result::Err.(Problem.{ message: Buffer::new().push_bytes(&cx, path.join(&cx, "::")).push_static(" is not a module").save(&cx), pos: no_pos() }),
                 };
             }
             i = i + 1usize;
@@ -1519,7 +1505,7 @@ impl Resolver['k] {
                 Option::None => (),
             };
         }
-        let owner = if home.path.is_empty(&cx) { self.packages.at(&cx, home.package).name.copy(&cx) } else { joined(&cx, home.path) };
+        let owner = if home.path.is_empty(&cx) { self.packages.at(&cx, home.package).name.copy(&cx) } else { home.path.join(&cx, "::") };
         problem(Buffer::new().push_static("unknown or private member ").push_bytes(&cx, name).push_static(" of ").push_bytes(&cx, owner).save(&cx))
     }
 
@@ -1550,7 +1536,7 @@ impl Resolver['k] {
         var own: ArenaVec[Decl['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < found.len(&cx) {
-            if key_same(&cx, found.at(&cx, i).home, owner.home) {
+            if key_eq(&cx, found.at(&cx, i).home, owner.home) {
                 own.push(&cx, found.at(&cx, i));
             }
             i = i + 1usize;
@@ -1807,7 +1793,7 @@ impl Names['k] {
 
     fn not_a(self, &cx: Domain!['k], path: ArenaVec[Span['k], 'k], kind: Span['k], pos: Pos) -> ! {
         let what = if kind.is_empty() { Span::from_static(&cx, "declaration") } else { kind };
-        self.r.fail(&cx, Buffer::new().push_bytes(&cx, joined(&cx, path)).push_static(" is not a ").push_bytes(&cx, what).save(&cx), pos)
+        self.r.fail(&cx, Buffer::new().push_bytes(&cx, path.join(&cx, "::")).push_static(" is not a ").push_bytes(&cx, what).save(&cx), pos)
     }
 
     // ---- types
@@ -1840,7 +1826,7 @@ impl Names['k] {
                     let d = self.decl(&cx, path, if is_trait { "trait" } else { "" }, no_pos());
                     self.set(&cx, n.id, NameRef::Decl.(d));
                     if !is_trait && !d.kind.is(&cx, "struct") && !d.kind.is(&cx, "enum") && !d.kind.is(&cx, "tuple") {
-                        self.r.fail(&cx, Buffer::new().push_bytes(&cx, joined(&cx, path)).push_static(" is not a type").save(&cx), no_pos());
+                        self.r.fail(&cx, Buffer::new().push_bytes(&cx, path.join(&cx, "::")).push_static(" is not a type").save(&cx), no_pos());
                     }
                 }
                 self.types(&cx, n.args, types);
@@ -2081,7 +2067,7 @@ impl Names['k] {
         if names.len(&cx) == 1usize && values.contains(&cx, first) {
             self.set(&cx, p.id, NameRef::Local.(first));
         } else if first.is(&cx, "builtin") {
-            self.set(&cx, p.id, NameRef::Builtin.(joined(&cx, names.skip(&cx, 1usize))));
+            self.set(&cx, p.id, NameRef::Builtin.(names.skip(&cx, 1usize).join(&cx, "::")));
         } else if names.len(&cx) == 1usize && is_builtin_value(&cx, first) && !self.visible(&cx, first) {
             self.set(&cx, p.id, NameRef::Builtin.(first));
         } else if names.len(&cx) == 2usize && is_prim(&cx, first) {
@@ -2095,7 +2081,7 @@ impl Names['k] {
             self.set(&cx, p.id, NameRef::Assoc.(first, names.at(&cx, 1usize)));
         } else {
             let r = match self.r.need(&cx, self.home.copy(&cx), names, p.pos) {
-                Target::Module(m) => self.r.fail(&cx, Buffer::new().push_bytes(&cx, joined(&cx, names)).push_static(" is a module, not a value").save(&cx), p.pos),
+                Target::Module(m) => self.r.fail(&cx, Buffer::new().push_bytes(&cx, names.join(&cx, "::")).push_static(" is a module, not a value").save(&cx), p.pos),
                 Target::Decl(d) => NameRef::Decl.(d),
                 Target::Variant(d, v) => NameRef::Variant.(d, v),
                 Target::TraitMethod(d, m) => NameRef::TraitMethod.(d, m),
@@ -2107,7 +2093,7 @@ impl Names['k] {
     fn variant(self, &cx: Domain!['k], path: S::Path['k]) {
         match self.r.need(&cx, self.home.copy(&cx), path.names(&cx), path.pos) {
             Target::Variant(d, v) => self.set(&cx, path.id, NameRef::Variant.(d, v)),
-            _ => self.r.fail(&cx, Buffer::new().push_bytes(&cx, joined(&cx, path.names(&cx))).push_static(" is not an enum variant").save(&cx), path.pos),
+            _ => self.r.fail(&cx, Buffer::new().push_bytes(&cx, path.names(&cx).join(&cx, "::")).push_static(" is not an enum variant").save(&cx), path.pos),
         }
     }
 }
