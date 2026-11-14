@@ -387,6 +387,9 @@ The layout is sound because no program can observe or break it:
 
 - **The niche holds a valid value whenever it is read.** A `NonNull` value is made only by an unsafe
   cast from a pointer, whose obligation is that it is not null, or by `NonNull::new`, which checks.
+  The cast's C says so to the C compiler (`if (n == 0) __builtin_unreachable();`), which then folds
+  the niche tests of what is built from it, as it folded a constant tag before: without it, a
+  `Slice::get_ref` inlined into a byte loop kept its test for null, and `wordfreq` ran 15% slower.
   `variant_tag` and `switch` of a place need the place full, so its niche holds a `NonNull` it was
   given; a store under a known variant stores a whole `NonNull`, never a null, and a payload that is
   moved out keeps its bytes. The dataless variant's null is written only by `construct_variant`.

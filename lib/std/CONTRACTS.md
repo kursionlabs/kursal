@@ -256,7 +256,7 @@ a checked type; their obligation is the same kind of thing.
 | `core::array::Array::from_parts` | `base` addresses `len` initialized `T`s that nothing else reads or writes while the array exists; every later access is checked against `len` |
 | `alloc::collections::vec::before`, `swap_at`, `sift_down` | `p` addresses the vector's own initialized elements and every index is below its length |
 | `alloc::collections::vec::merge_pass` | `src` and `dst` each address `n` elements and do not overlap |
-| `core::ptr::NonNull::new_unchecked` | `p` is not null: it is `unsafe (p as NonNull[T])`, and a null one would read as the dataless variant of any enum in the niche layout that holds it (`Option[NonNull[T]]`, `Option[Ref[T,'k]]`, a `List` link; section 2.6) |
+| `core::ptr::NonNull::new_unchecked` | `p` is not null: it is `unsafe (p as NonNull[T])`, after which the C compiler is told so. A null one is undefined behavior; at best it reads as the dataless variant of any enum in the niche layout that holds it (`Option[NonNull[T]]`, `Option[Ref[T,'k]]`, a `List` link; section 2.6) |
 
 ### 2.5 Hands a raw pointer to caller-supplied code
 
@@ -299,6 +299,9 @@ in `core::ptr`. The ways to make one are:
 - `NonNull::new(p)`, which checks;
 - an unsafe cast `unsafe (p as NonNull[T])` from a pointer or another
   `NonNull`, whose obligation is that `p` is not null (`new_unchecked`).
+  The C written for the cast tells the C compiler that the result is not
+  null (`if (p == 0) __builtin_unreachable();`), so it can fold the niche
+  tests of the enums built from it; a null one is undefined behavior.
 
 `n as *T` needs no `unsafe`. Nothing else casts to or from a `NonNull`:
 not an integer, and not a struct, tuple or array that holds one, which

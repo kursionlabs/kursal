@@ -76,6 +76,8 @@ class NicheLayoutTests(unittest.TestCase):
         self.assertRegex(output, r"static uint32_t \w+\(uint8_t\* entry_o_1\)")
         self.assertIn("switch ((entry_o_1 == 0 ? 0 : 1)) {", output)
         self.assertIn("entry_z = 0;", output)
+        # The cast's obligation, told to the C compiler.
+        self.assertIn("entry_n = (uint8_t*)entry_a;\n  if (entry_n == 0) __builtin_unreachable();", output)
         self.assertNotRegex(output, r"struct K_Opt \{")
 
     def test_a_struct_with_a_non_null_field_inside_an_enum(self):

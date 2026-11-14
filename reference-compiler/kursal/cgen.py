@@ -735,6 +735,10 @@ class Backend:
         if isinstance(s, (Ptr, NonNull)) or isinstance(d, (Ptr, NonNull)):
             if isinstance(s, (Ptr, NonNull)) and isinstance(d, (Ptr, NonNull)):
                 self.line(f"{dst} = ({cd}){expr};")
+                if isinstance(d, NonNull) and not isinstance(s, NonNull):
+                    # The cast's obligation: the pointer is not null. Telling the C compiler lets it fold
+                    # the niche checks of an enum made from it.
+                    self.line(f"if ({dst} == 0) __builtin_unreachable();")
             elif (isinstance(s, Ptr) and isinstance(d, Prim) and d.name in INTEGERS or
                   isinstance(d, Ptr) and isinstance(s, Prim) and s.name in INTEGERS):
                 value = f"(uintptr_t){expr}"
