@@ -53,18 +53,18 @@ class AbstractShapeTests(unittest.TestCase):
             fn main() -> i32 { let { n } = unwrap(E::Item.(Token.{ n: 7i32 })); n }''', 7)
 
     def test_generic_existential_payload_passes_through(self):
-        self.run_source("""forall T. fn pass(x: exists 'a. (Brand['a], T)) -> T {
+        self.run_source("""forall T. fn pass(x: exists 'a. (core::cap::Brand['a], T)) -> T {
                 let exists 'a. (witness, value) = x;
                 value
             }
             fn main() -> i32 {
-                let exists 'a. witness = builtin::fresh();
+                let exists 'a. witness = core::cap::fresh();
                 pass(pack 'a. (witness, 7i32))
             }""", 7)
 
     def test_generic_pointer_load_and_store_do_not_unfold_pointee(self):
         self.run_source('''forall T. unsafe fn pass(x: T) -> T {
-                let p = builtin::alloca[T]();
+                let p = core::mem::alloca[T]();
                 unsafe *p = x;
                 *p
             }

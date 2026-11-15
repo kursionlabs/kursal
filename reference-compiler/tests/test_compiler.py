@@ -380,8 +380,8 @@ def callee_text(call: I.Callee) -> str:
             return "(tuple)"
         case I.BuiltinCall():
             return f"(builtin {write_atom(call.name)})"
-        case I.AllocaCall():
-            return f"(alloca {inferred_type(call.target)})"
+        case I.TypedBuiltinCall():
+            return f"({write_atom(call.name)} {inferred_type(call.target)})"
         case I.PointerCall():
             return f"(pointer {write_atom(call.name)})"
         case I.FStringWrite():
@@ -404,8 +404,6 @@ def inferred_line(tag: str, node: object, positioned: bool = True) -> str:
         parts.append(f"folded ({const_text(node.folded)})")
     if getattr(node, "call", None) is not None:
         parts.append(f"call {callee_text(node.call)}")
-    if hasattr(node, "target"):
-        parts.append(f"target {inferred_type(node.target)}")
     if hasattr(node, "field_ids"):
         parts.append("fields " + _form([f"({write_atom(n)} {i})" for n, i in node.field_ids.items()]))
     if hasattr(node, "spread_id"):
@@ -437,7 +435,7 @@ def inferred_line(tag: str, node: object, positioned: bool = True) -> str:
 WALKED = {
     S.Block: ("block", lambda n: (*n.stmts, n.tail)), S.Lit: ("lit", lambda n: ()),
     S.FStr: ("fstr", lambda n: n.parts), S.Path: ("path", lambda n: ()), S.Tuple: ("tuple", lambda n: n.elems),
-    S.Array: ("array", lambda n: n.elems), S.Sizeof: ("sizeof", lambda n: ()),
+    S.Array: ("array", lambda n: n.elems),
     S.StructLit: ("struct", lambda n: tuple(v for _, v in n.fields)), S.If: ("if", lambda n: (n.cond, n.then, n.other)),
     S.Closure: ("closure", lambda n: (n.body,)), S.Return: ("return", lambda n: (n.value,)),
     S.Pack: ("pack", lambda n: (n.value,)), S.Foreach: ("foreach", lambda n: (n.source, n.body)),
@@ -603,18 +601,24 @@ def place_case(directory: Path, index: int, case: str | dict[str, str]) -> Path:
         path.write_text(case)
         return path
     root.mkdir()
-    (root / "kur.toml").write_text(manifest("p"))
+    (root / "kur.toml").write_text(manifest("p", needs_core(case)))
     (root / "lib.kur").write_text(case)
     return root
 
 
 def manifest(name: str, deps: tuple[str, ...] = (), entry: str | None = None) -> str:
+    """`core` is the library's; any other dependency is a sibling directory."""
     text = f'[package]\nname="{name}"\nsource_root="."\n'
     if entry:
         text += f'kind="executable"\nentry="{entry}"\n'
     for dep in deps:
-        text += f'[dependencies.{dep}]\npath="../{dep}"\n'
+        text += f'[dependencies.{dep}]\npath="{LIB / "core" if dep == "core" else "../" + dep}"\n'
     return text
+
+
+def needs_core(source: str) -> tuple[str, ...]:
+    """The dependencies of a one-module case: `core`, where the builtins are, when it names it."""
+    return ("core",) if "core::" in source else ()
 
 
 def case_files(case: str | dict[str, str]) -> tuple[dict[str, str], str]:
@@ -623,7 +627,7 @@ def case_files(case: str | dict[str, str]) -> tuple[dict[str, str], str]:
         return case, "a"
     if "std::" in case:
         return {"case.kur": case}, "case.kur"
-    return {"kur.toml": manifest("p"), "lib.kur": case}, "."
+    return {"kur.toml": manifest("p", needs_core(case)), "lib.kur": case}, "."
 
 
 LOWER_CASES = tuple(case_files(case) for case, _ in LOWER_ERRORS)
@@ -800,9 +804,9 @@ SIGNATURES = (
     "forall T where Copy[T]. trait Dup { fn dup(x: T) -> (T, T); }\ntrait Show { fn show(&x: Self) -> u32; }\n"
     "instance Dup[u32] { fn dup(x: u32) -> (u32, u32) { (x, x) } }\n"
     "forall T where Exposed[T], Show[T]. instance Show[(T, T)] { fn show(&x: (T, T)) -> u32 { 0u32 } }\n"
-    "forall 'k. exposed struct Tag! { n: u32 }\nforall T, 'a. struct P { p: *T, w: Brand['a], e: exists 'b. Brand['b] }\n"
+    "forall 'k. exposed struct Tag! { n: u32 }\nforall T, 'a. struct P { p: *T, w: core::cap::Brand['a], e: exists 'b. core::cap::Brand['b] }\n"
     "forall T. impl P[T, 'static] { fn get(self, f: closure(u32) -> u32, g: closure[u8](&_: u32) -> u32) -> u32 { 0u32 } }\n"
-    "forall T where Copy[T]. fn pair(x: T, h: unsafe fn(&_: T) -> !, k: forall 'q. fn(Brand['q]) -> u32) -> (T, T) { (x, x) }\n"
+    "forall T where Copy[T]. fn pair(x: T, h: unsafe fn(&_: T) -> !, k: forall 'q. fn(core::cap::Brand['q]) -> u32) -> (T, T) { (x, x) }\n"
     "extern \"C\" fn puts(s: *u8) -> i32;\nenum E { A, B(u32), C(u8, u16) }\ntuple Pt(u32, i64);\n"
     "struct F { f: foreach F of (u32, u8) => *F }\nfn h(g: fn(closure(u32) -> u32) -> u32, k: closure(u8) -> u8) -> u32 { 0u32 }\n",
 )
@@ -815,11 +819,11 @@ SIGNATURE_ERRORS = (
     "struct S { a: builtin::Foo }\n",
     "forall T. struct S { a: T[u32] }\n",
     "struct S { a: u32[u8] }\n",
-    "struct S { a: Brand[u32] }\n",
+    "struct S { a: core::cap::Brand[u32] }\n",
     "struct S { a: Never[u32] }\n",
     "forall T. struct B { a: T }\nstruct S { b: B }\n",
-    "forall 'a. struct B { x: Brand['a] }\nstruct S { b: B[u32] }\n",
-    "struct S { a: Brand['k] }\n",
+    "forall 'a. struct B { x: core::cap::Brand['a] }\nstruct S { b: B[u32] }\n",
+    "struct S { a: core::cap::Brand['k] }\n",
     "struct S { f: fn(closure(u32) -> u32) -> u32 }\n",
     "forall T. struct B { a: *T }\nstruct S { b: B[_] }\n",
     "struct S { f: forall 'a. u32 }\n",
@@ -1408,7 +1412,7 @@ class CompilerTests(unittest.TestCase):
                 root = Path(directory) / f"case{index}"
                 root.mkdir()
                 std = f'[dependencies.std]\npath="{LIB / "std"}"\n' if "std::" in source else ""
-                (root / "kur.toml").write_text(manifest("p") + std)
+                (root / "kur.toml").write_text(manifest("p", needs_core(source)) + std)
                 (root / "lib.kur").write_text(source)
                 paths.append(root)
             for index, path in enumerate(paths):

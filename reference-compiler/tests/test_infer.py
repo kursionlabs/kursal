@@ -24,7 +24,7 @@ forall T. fn id(x: T) -> T { x }
 
 
 def run(source):
-    root = tree({"p/kur.toml": manifest("p"), "p/lib.kur": PRELUDE + source})
+    root = tree({"p/kur.toml": manifest("p", ("core",)), "p/lib.kur": PRELUDE + source})
     resolver = resolve(root / "p")
     sigs = signatures(resolver)
     infer(resolver, sigs)
@@ -134,15 +134,15 @@ instance Next[Wrap[T] -> I] {
         self.assertEqual(identity(body.stmts[3].value), [("b", b), ("a", a)])
 
     def test_packages(self):
-        r = run("forall 'k. struct Tag! { b: Brand['k] }\n"
-                "fn mint() -> exists 'r. Tag!['r] { let exists 'a. w = builtin::fresh(); pack 'a. Tag.{ b: w } }\n"
+        r = run("forall 'k. struct Tag! { b: core::cap::Brand['k] }\n"
+                "fn mint() -> exists 'r. Tag!['r] { let exists 'a. w = core::cap::fresh(); pack 'a. Tag.{ b: w } }\n"
                 "fn f() -> u32 { let exists 'x. t = mint(); let { b } = t; 0u32 }\n")
         let = fn(r, "f").body.stmts[0]
         self.assertEqual(let.pattern.ty, named("Tag", C.Skolem(let.opened_brands[0])))
         self.assertEqual(fn(r, "mint").body.tail.ty, C.Exists(("r",), named("Tag", C.Skolem("r"))))
 
     def test_function_values(self):
-        r = run("fn bump(&c: Cur) -> u32 { 0u32 }\nforall 'k. fn take(b: Brand['k]) -> u32 { 0u32 }\n"
+        r = run("fn bump(&c: Cur) -> u32 { 0u32 }\nforall 'k. fn take(b: core::cap::Brand['k]) -> u32 { 0u32 }\n"
                 "fn f() -> u32 { let g = bump; let h = take; 0u32 }\n")
         g, h = stmt_types(r, "f")
         self.assertEqual(g, C.Fn((named("Cur"),), U32, places=frozenset({0})))
@@ -154,8 +154,8 @@ instance Next[Wrap[T] -> I] {
     def test_call_metadata_orders_arguments_and_preserves_foreign_symbols(self):
         r = run("extern \"C\" fn foreign(x: u32) -> u32;\n"
                 "forall A, B. fn pick(a: A, b: B) -> A { a }\n"
-                "forall 'k. fn take(b: Brand['k]) -> u32 { 0u32 }\n"
-                "forall 'r. fn f(b: Brand['r]) -> u32 {\n"
+                "forall 'k. fn take(b: core::cap::Brand['k]) -> u32 { 0u32 }\n"
+                "forall 'r. fn f(b: core::cap::Brand['r]) -> u32 {\n"
                 "  let x = pick[u32, bool](1, true); let y = foreign(x);\n"
                 "  let g = take; g(b)\n}\n")
         body = fn(r, "f").body

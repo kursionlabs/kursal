@@ -74,9 +74,9 @@ class ConstructorArgumentTests(unittest.TestCase):
     def test_brand_arguments_remain_inferred_or_explicit(self):
         for args in ('', "['a]", "['a, u32]"):
             with self.subTest(args=args):
-                self.run_source('''forall 'k, T. exposed struct Tagged { witness: Brand['k], value: T }
+                self.run_source('''forall 'k, T. exposed struct Tagged { witness: core::cap::Brand['k], value: T }
                     fn main() -> i32 {
-                        let exists 'a. witness = builtin::fresh();
+                        let exists 'a. witness = core::cap::fresh();
                         let tagged = Tagged''' + args + '''.{ witness, value: 7u32 };
                         tagged.value as i32
                     }''', 7)

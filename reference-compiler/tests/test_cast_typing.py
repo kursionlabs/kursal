@@ -18,13 +18,13 @@ class CastTypingTests(unittest.TestCase):
 
     def test_cast_cannot_create_an_existential_package(self):
         with self.assertRaisesRegex(LowerError, 'existential'):
-            self.run_source("fn bad(x: u32) -> exists 'a. Brand['a] { "
-                            "unsafe (x as exists 'a. Brand['a]) } "
+            self.run_source("fn bad(x: u32) -> exists 'a. core::cap::Brand['a] { "
+                            "unsafe (x as exists 'a. core::cap::Brand['a]) } "
                             'fn main() -> i32 { 0i32 }', 0)
 
     def test_cast_cannot_erase_an_existential_package(self):
         with self.assertRaisesRegex(LowerError, 'existential'):
-            self.run_source("fn bad(x: exists 'a. Brand['a]) -> u32 { unsafe (x as u32) } "
+            self.run_source("fn bad(x: exists 'a. core::cap::Brand['a]) -> u32 { unsafe (x as u32) } "
                             'fn main() -> i32 { 0i32 }', 0)
 
     def test_safe_integer_casts_keep_modular_semantics(self):

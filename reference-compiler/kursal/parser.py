@@ -17,7 +17,7 @@ from .sexpr import KursError, Position
 
 KEYWORDS = frozenset(
     "use export module struct tuple enum fn extern impl trait instance const forall where as exposed unsafe "
-    "closure exists foreach of in for while if else match let var return pack sizeof true false self _".split())
+    "closure exists foreach of in for while if else match let var return pack true false self _".split())
 
 SCAN = re.compile(r"""
   (?P<ws>\s+|//[^\n]*|/\*(?:.|\n)*?\*/)
@@ -145,7 +145,7 @@ class Lexer:
 
 BLOCK_LIKE = frozenset(("{", "if", "match", "while", "for", "foreach"))
 EXPR_START = BLOCK_LIKE | frozenset((
-    "INT", "FLOAT", "BYTE", "STRING", "FSTRING_START", "true", "false", "NAME", "self", "(", "[", "sizeof",
+    "INT", "FLOAT", "BYTE", "STRING", "FSTRING_START", "true", "false", "NAME", "self", "(", "[",
     "-", "!", "*", "&", "unsafe", "|", "||", "return", "pack"))
 LEVELS = (("||",), ("&&",), ("==", "!=", "<=", ">=", "<", ">"), ("|",), ("^",), ("&",), ("<<", ">>"),
           ("+", "-"), ("*", "/", "%"))
@@ -887,14 +887,6 @@ class Parser:
                     elems.append(self.expr())
             self.expect("]")
             return S.Array(tuple(elems), fill, start)
-        if k == "sizeof":
-            self.next()
-            self.expect("[")
-            ty = self.type()
-            self.expect("]")
-            self.expect("(")
-            self.expect(")")
-            return S.Sizeof(ty, start)
         path = self.expr_path()
         if self.eat(".{"):
             fields, spread = self.braced(self.field_init)

@@ -164,14 +164,6 @@ class Array(Inferred):
 
 
 @dataclass
-class Sizeof(Inferred):
-    type: Type
-    pos: Optional[Position] = None
-    # Inference -> lowering: translation of the written type (ty is the usize result).
-    target: C.Type = field(init=False, repr=False, compare=False)
-
-
-@dataclass
 class StructLit(Inferred):
     path: Path
     fields: tuple[tuple[str, Optional[Expr]], ...]          # ((name, expr or None for shorthand), ...)
@@ -540,7 +532,7 @@ type Type = (
     | TExists | TForeach | TForall | TBrand | TIgnored
 )
 type Expr = (
-    Lit | FStr | Path | Tuple | Array | Sizeof | StructLit | Block | If | Match
+    Lit | FStr | Path | Tuple | Array | StructLit | Block | If | Match
     | Closure | Return | Pack | Foreach | Binop | Unary | Cast | UnsafeStore
     | Field | Index | Call | Try | While | For
 )
@@ -610,6 +602,7 @@ def parse(text: str, filename: str = "<input>") -> list[Item]:
 type DeclRef = tuple[Literal["decl"], Decl]
 type VariantRef = tuple[Literal["variant"], Decl, str]
 type TraitMethodRef = tuple[Literal["trait_method"], Decl, str]
+type BuiltinRef = tuple[Literal["builtin"], str]
 type NameRef = (
     DeclRef | VariantRef | TraitMethodRef
     | tuple[Literal["assoc"], str, str]

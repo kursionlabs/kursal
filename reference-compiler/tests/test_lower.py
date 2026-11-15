@@ -19,6 +19,8 @@ from kursal.check import CheckError
 
 
 MANIFEST = '[package]\nname="t"\nkind="executable"\nentry="package::main"\nsource_root="."\n'
+# The dependency of a test package that names `core::`, where the builtins are.
+CORE = f'[dependencies.core]\npath="{LIB / "core"}"\n'
 
 OPTION = "forall T. exposed enum Option { Some(T), None }\n"
 ITER = "use package::option::Option;\nforall Self -> Item.\ntrait Iterator { fn next(&it: Self) -> Option[Item]; }\n"
@@ -275,9 +277,9 @@ fn main() -> i32 {
 }
 """},
     "brands": {"lib.kur": """
-forall 'k. exposed struct Tag! { marker: Brand['k] }
+forall 'k. exposed struct Tag! { marker: core::cap::Brand['k] }
 fn mint() -> exists 'r. Tag!['r] {
-    let exists 'a. w: Brand['a] = builtin::fresh();
+    let exists 'a. w: core::cap::Brand['a] = core::cap::fresh();
     pack 'a. Tag.{ marker: w }
 }
 forall 'k. fn read(t: Tag!['k]) -> (Tag!['k], u32) { (t, 5) }
@@ -469,8 +471,10 @@ CHECKSUMS = {
 }
 
 
-def write(directory, files):
-    (directory / "kur.toml").write_text(MANIFEST)
+def write(directory, files, core=False):
+    """A test package of `files`; it depends on `core` when asked to or when a file names it."""
+    core = core or any("core::" in text for text in files.values())
+    (directory / "kur.toml").write_text(MANIFEST + (CORE if core else ""))
     for name, text in files.items():
         (directory / name).write_text(text)
 

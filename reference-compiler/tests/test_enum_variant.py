@@ -19,40 +19,40 @@ class EnumVariantTests(unittest.TestCase):
     run_source = test_closure_boundary.ClosureBoundaryTests.run_source
 
     def test_non_enum_operands_are_source_errors(self):
-        for ty in ('u32', '(u32, u32)', '*u32', "Brand['static]"):
+        for ty in ('u32', '(u32, u32)', '*u32', "core::cap::Brand['static]"):
             for lend in ('', '&'):
                 with self.subTest(ty=ty, lend=lend), self.assertRaisesRegex(InferError, 'enum'):
-                    self.run_source(f'fn bad(x: {ty}) -> () {{ let result = builtin::enum_variant({lend}x); () }} '
+                    self.run_source(f'fn bad(x: {ty}) -> () {{ let result = core::mem::enum_variant({lend}x); () }} '
                                     'fn main() -> i32 { 0i32 }', 0)
 
     def test_abstract_type_parameter_is_not_known_to_be_an_enum(self):
         with self.assertRaisesRegex(InferError, 'enum'):
-            self.run_source('forall T. fn bad(x: T) -> () { let result = builtin::enum_variant(&x); () } '
+            self.run_source('forall T. fn bad(x: T) -> () { let result = core::mem::enum_variant(&x); () } '
                             'fn main() -> i32 { 0i32 }', 0)
 
     def test_lent_operand_must_be_a_place(self):
         with self.assertRaisesRegex(InferError, 'place'):
             self.run_source('exposed enum E { A } fn main() -> i32 { '
-                            'let tag = builtin::enum_variant(&E::A); 0i32 }', 0)
+                            'let tag = core::mem::enum_variant(&E::A); 0i32 }', 0)
 
     def test_owned_copy_enum_returns_value_and_tag(self):
         self.run_source('''exposed enum E { A, B(u32) }
             fn main() -> i32 {
-                let (value, tag) = builtin::enum_variant(E::B.(6u32));
+                let (value, tag) = core::mem::enum_variant(E::B.(6u32));
                 match value { E::A => 0i32, E::B(n) => (n + tag) as i32 }
             }''', 7)
 
     def test_owned_linear_enum_returns_value_and_tag(self):
         self.run_source('''exposed enum E! { A, B(u32) }
             fn main() -> i32 {
-                let (value, tag) = builtin::enum_variant(E::B.(6u32));
+                let (value, tag) = core::mem::enum_variant(E::B.(6u32));
                 match value { E::A => 0i32, E::B(n) => (n + tag) as i32 }
             }''', 7)
 
     def test_returned_linear_enum_cannot_be_discarded(self):
         with self.assertRaisesRegex(LowerError, 'linear'):
             self.run_source('''exposed enum E! { A }
-                fn main() -> i32 { builtin::enum_variant(E::A); 7i32 }''', 7)
+                fn main() -> i32 { core::mem::enum_variant(E::A); 7i32 }''', 7)
 
     def test_opaque_enum_tag_observation_requires_exposure(self):
         with tempfile.TemporaryDirectory(prefix='kursal-enum-visibility-') as base:
@@ -62,7 +62,7 @@ class EnumVariantTests(unittest.TestCase):
                 'lib.kur': '''use package::hidden::{make, consume};
                     fn main() -> i32 {
                         let value = make();
-                        let tag = builtin::enum_variant(&value);
+                        let tag = core::mem::enum_variant(&value);
                         consume(value);
                         (tag + 6u32) as i32
                     }''',
@@ -76,8 +76,8 @@ class EnumVariantTests(unittest.TestCase):
         self.run_source('''exposed enum E! { A, B(u32) }
             fn main() -> i32 {
                 let value = E::B.(5u32);
-                let a = builtin::enum_variant(&value);
-                let b = builtin::enum_variant(&value);
+                let a = core::mem::enum_variant(&value);
+                let b = core::mem::enum_variant(&value);
                 match value { E::A => 0i32, E::B(n) => (n + a + b) as i32 }
             }''', 7)
 
@@ -87,14 +87,14 @@ class EnumVariantTests(unittest.TestCase):
                 fn main() -> i32 {
                     let value = E::A;
                     let moved = value;
-                    let tag = builtin::enum_variant(&value);
+                    let tag = core::mem::enum_variant(&value);
                     match moved { E::A => tag as i32 }
                 }''', 0)
 
     def test_deferred_closure_operand_inference(self):
         self.run_source('''exposed enum E! { A, B(u32) }
             fn main() -> i32 {
-                let f = |x| builtin::enum_variant(x);
+                let f = |x| core::mem::enum_variant(x);
                 let (value, tag) = f(E::B.(6u32));
                 match value { E::A => 0i32, E::B(n) => (n + tag) as i32 }
             }''', 7)
@@ -107,7 +107,7 @@ class EnumVariantTests(unittest.TestCase):
                 let value = E::B.(Token.{ n: 7u32 });
                 let tag = match &value { E::B(payload) => {
                     let moved = payload;
-                    let tag = builtin::enum_variant(&value);
+                    let tag = core::mem::enum_variant(&value);
                     payload = moved;
                     tag
                 } };

@@ -9,7 +9,8 @@ Each resolved node gets a `ref` attribute:
   ("param", name)             a type parameter in scope
   ("local", name)             a local value
   ("prim", name)              a primitive type
-  ("builtin", name)           a compiler-sealed name: Brand, Copy, builtin::fresh, ...
+  ("builtin", name)           a name the compiler gives meaning: `Copy`, `Exposed`, `Never`, and what
+                              `builtin::name` names in package core (`Brand`, `fresh`, ...)
 """
 
 from __future__ import annotations
@@ -26,11 +27,16 @@ from .sexpr import KursError, Position
 from .core import ModuleId
 
 PRIMS = {"i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize", "f32", "f64", "bool"}
-BUILTIN_TYPES = {"Brand", "Phantom", "Never", "NonNull"}
+# Always in scope, like the primitives: the type `Never` and the traits.
+NEVER = "Never"
+BUILTIN_TRAITS = {"Copy", "Exposed"}
+# What `builtin::name` names. Only package `core` writes such a path, and it exports each builtin from
+# the module it belongs to (`export builtin::NonNull;` in core::ptr); everyone else imports it from there.
+BUILTIN_TYPES = {"Brand", "NonNull"}
+BUILTIN_VALUES = {"fresh", "static_brand", "sizeof", "alloca", "enum_variant", "fence", "load_volatile", "store_volatile"}
 # The builtin types an impl may give methods, as it may a primitive: `impl NonNull[T]` in core::ptr.
 OWNED_BUILTINS = {"NonNull"}
-BUILTIN_TRAITS = {"Copy", "Exposed"}
-BUILTIN_VALUES = {"alloca", "fence", "load_volatile", "store_volatile"}  # unless a declaration is in scope
+CORE = "core"
 LIB = Path(os.environ.get("KURSAL_LIB") or Path(__file__).resolve().parents[2] / "lib")
 
 
@@ -74,7 +80,7 @@ class Scope:
 
 
 type NamedItem = S.Struct | S.EnumDecl | S.TupleDecl | S.Fn | S.Extern | S.TraitDecl | S.Const
-type Target = Decl | ModuleId | S.VariantRef | S.TraitMethodRef
+type Target = Decl | ModuleId | S.VariantRef | S.TraitMethodRef | S.BuiltinRef
 type LookupKey = (
     tuple[Literal["path"], ModuleId, S.NamePath]
     | tuple[Literal["import"], ModuleId, str]
@@ -254,6 +260,8 @@ class Resolver:
     def use(self, scope: Scope, prefix: S.NamePath, tree: S.UseTree, export: bool) -> None:
         names, star, children, alias = tree
         path = prefix + names
+        if path[0] == "builtin":
+            self.builtin_package(scope.module)
         if star:
             scope.globs.append(path)
         elif children:
@@ -284,17 +292,18 @@ class Resolver:
             owner: Optional[Decl | str]
             spelled = target.path[-1] if isinstance(target, S.TName) else "?"
             params = item.forall.params if item.forall else ()
-            if isinstance(target, S.TName) and len(target.path) == 1 and (
-                    target.path[0] in PRIMS or target.path[0] in OWNED_BUILTINS
-                    and target.path[0] not in scope.decls and target.path[0] not in scope.imports):
+            if isinstance(target, S.TName) and len(target.path) == 1 and target.path[0] in PRIMS:
                 owner = target.path[0]
             elif isinstance(target, S.TName) and len(target.path) == 1 and target.path[0] in params:
                 owner = None  # a blanket impl: its methods are found by method calls only
             else:
                 found_owner = self.lookup(scope.module, target.path, pos=item.pos)
-                if not isinstance(found_owner, Decl):
+                if isinstance(found_owner, tuple) and found_owner[0] == "builtin" and found_owner[1] in OWNED_BUILTINS:
+                    owner = found_owner[1]
+                elif isinstance(found_owner, Decl):
+                    owner = found_owner
+                else:
                     fail("an impl target must name a type declaration", item.pos)
-                owner = found_owner
             for member in item.items:
                 kind = "method" if isinstance(member, S.Fn) else "const"
                 decl = Decl(kind, scope.module, f"{spelled}::{member.name}", member, item)
@@ -344,6 +353,8 @@ class Resolver:
         first, rest = path[0], path[1:]
         scope = self.scopes[module]
         target: Optional[Target]
+        if first == "builtin":
+            return self.builtin(module, path)
         if first == "package":
             target = ModuleId(module.package)
         elif first in scope.decls:
@@ -357,10 +368,30 @@ class Resolver:
         for k, name in enumerate(rest):
             if isinstance(target, Decl):
                 return self.associated(target, "::".join(rest[k:]))
+            if isinstance(target, tuple) and target[0] == "builtin" and target[1] in OWNED_BUILTINS:
+                return self.attached_to(target[1], "::".join(rest[k:]))
             if not isinstance(target, ModuleId):
                 fail(f"{'::'.join(path[:k + 1])} is not a module")
             target = self.member(module, target, name)
         return target
+
+    def builtin(self, module: ModuleId, path: S.NamePath) -> S.BuiltinRef:
+        """`builtin::name`, which only package core writes."""
+        self.builtin_package(module)
+        if len(path) != 2 or path[1] not in BUILTIN_TYPES | BUILTIN_VALUES:
+            fail(f"unknown builtin {'::'.join(path)}")
+        return ("builtin", path[1])
+
+    def builtin_package(self, module: ModuleId) -> None:
+        if self.packages[module.package].name != CORE:
+            fail("only package core names builtins; import them from core")
+
+    def attached_to(self, owner: str, name: str) -> Decl:
+        """`Owner::name` of a primitive or builtin type: a method or const an impl of it declares."""
+        found = self.attached.get((owner, name))
+        if not found:
+            fail(f"unknown {owner}::{name}")
+        return found[0]
 
     def root_member(self, module: ModuleId, name: str) -> Optional[Decl | ModuleId]:
         package = self.packages[module.package]
@@ -523,12 +554,10 @@ class Names:
                     type_expr.ref = ("param", name)
                 elif name in PRIMS:
                     type_expr.ref = ("prim", name)
-                elif name in BUILTIN_TYPES and not self.declared(name):
+                elif name == NEVER:
                     type_expr.ref = ("builtin", name)
-                elif path[0] == "builtin":
-                    if len(path) != 2:
-                        fail("a builtin type path has exactly two components")
-                    type_expr.ref = ("builtin", path[1])
+                elif not trait and (builtin := self.builtin_type(path)) is not None:
+                    type_expr.ref = builtin
                 else:
                     type_expr.ref = self.decl(path, "trait" if trait else None)
                     if not trait and type_expr.ref[1].kind not in ("struct", "enum", "tuple"):
@@ -561,15 +590,14 @@ class Names:
             case S.TForall(params=params, body=body):
                 self.type(body, types | {p for p in params if not p.startswith("'")})
 
-    def visible(self, name: str) -> bool:
-        try:
-            self.r.lookup(self.module, (name,))
-            return True
-        except ResolveError:
-            return False
-
-    def declared(self, name: str) -> bool:
-        return name in self.r.scopes[self.module].decls or name in self.r.scopes[self.module].imports
+    def builtin_type(self, path: S.NamePath) -> Optional[S.BuiltinRef]:
+        """What `path` names when that is a builtin: a builtin type, else an error."""
+        target = self.r.lookup(self.module, path)
+        if not (isinstance(target, tuple) and target[0] == "builtin"):
+            return None
+        if target[1] not in BUILTIN_TYPES:
+            fail(f"{'::'.join(path)} is not a type")
+        return ("builtin", target[1])
 
     # ---- expressions
     def expr(self, expr: S.Expr, types: Set[str], values: Set[str]) -> None:
@@ -582,7 +610,7 @@ class Names:
             case S.Block():
                 self.block(expr, types, values)
             case S.StructLit(path=path, fields=fields, pos=pos):
-                path.ref = self.decl(path.names, "struct", pos) if path.names[0] != "builtin" else None
+                path.ref = self.decl(path.names, "struct", pos)
                 self.segment_args(path, types)
                 for _, v in fields:
                     if v is not None:
@@ -613,8 +641,6 @@ class Names:
                 self.expr(body, types | ({binder} if binder else set()), values | {name})
             case S.Cast(value=value, type=ty):
                 walk(value)
-                self.type(ty, types)
-            case S.Sizeof(type=ty):
                 self.type(ty, types)
             case S.While(cond=cond, body=body):
                 walk(cond)
@@ -667,11 +693,7 @@ class Names:
         self.segment_args(expr, types)
         if len(names) == 1 and names[0] in values:
             expr.ref = ("local", names[0])
-        elif names[0] == "builtin":
-            expr.ref = ("builtin", "::".join(names[1:]))
-        elif len(names) == 1 and names[0] in BUILTIN_VALUES and not self.visible(names[0]):
-            expr.ref = ("builtin", names[0])
-        elif len(names) == 2 and (names[0] in PRIMS or names[0] in OWNED_BUILTINS and not self.declared(names[0])):
+        elif len(names) == 2 and names[0] in PRIMS:
             found = self.r.attached.get((names[0], names[1]))
             if not found:
                 fail(f"unknown {names[0]}::{names[1]}", expr.pos)

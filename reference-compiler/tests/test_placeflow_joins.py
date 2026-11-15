@@ -14,7 +14,7 @@ from tests.test_resolve import manifest, tree
 
 
 def lowered(source):
-    root = tree({"p/kur.toml": manifest("p"), "p/lib.kur": source})
+    root = tree({"p/kur.toml": manifest("p", ("core",)), "p/lib.kur": source})
     resolver = resolve(root / "p")
     program = lower(resolver, signatures(resolver))
     check_program(program)
@@ -87,14 +87,14 @@ class JoinTests(unittest.TestCase):
         lowered("""
 fn branch(c: bool) -> u32 {
     if c {
-        let exists 'a. witness = builtin::fresh();
+        let exists 'a. witness = core::cap::fresh();
         1u32
     } else { 2u32 }
 }
 fn looping(c: bool) -> u32 {
     var again = c;
     while again {
-        let exists 'a. witness = builtin::fresh();
+        let exists 'a. witness = core::cap::fresh();
         again = false;
     }
     0u32
@@ -104,10 +104,10 @@ fn looping(c: bool) -> u32 {
     def test_live_linear_brand_payload_still_rejected(self):
         with self.assertRaises(KursError):
             lowered("""
-forall 'a. exposed struct Token! { witness: Brand['a] }
+forall 'a. exposed struct Token! { witness: core::cap::Brand['a] }
 fn branch(c: bool) -> u32 {
     if c {
-        let exists 'a. witness = builtin::fresh();
+        let exists 'a. witness = core::cap::fresh();
         let token = Token['a].{ witness: witness };
         1u32
     } else { 2u32 }

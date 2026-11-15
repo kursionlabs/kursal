@@ -16,8 +16,7 @@ class UnsafeAuthorizationTests(unittest.TestCase):
     def run_source(self, source, expected):
         with tempfile.TemporaryDirectory(prefix="kursal-unsafe-") as base:
             directory = Path(base)
-            write(directory, {"lib.kur": source,
-                              "atomic.kur": "exposed enum Ordering { Relaxed, Acquire, Release, AcqRel, SeqCst }"})
+            write(directory, {"lib.kur": source}, core=True)  # pointer methods take core::atomic::Ordering
             resolver = resolve(directory)
             sigs = signatures(resolver)
             program = lower(resolver, sigs)
@@ -52,8 +51,8 @@ class UnsafeAuthorizationTests(unittest.TestCase):
                 self.reject(f'fn bad(p: *u32) -> {result} {{ {body} }}')
 
     def test_volatile_builtins_require_authorization(self):
-        for body, result in (('builtin::load_volatile(p)', 'u32'),
-                             ('builtin::store_volatile(p, 7u32)', '()')):
+        for body, result in (('core::ptr::load_volatile(p)', 'u32'),
+                             ('core::ptr::store_volatile(p, 7u32)', '()')):
             with self.subTest(body=body):
                 self.reject(f'fn bad(p: *u32) -> {result} {{ {body} }}')
 
@@ -61,20 +60,20 @@ class UnsafeAuthorizationTests(unittest.TestCase):
         self.reject('fn read(&x: u32) -> u32 { x } fn bad(p: *u32) -> u32 { read(&*p) }')
 
     def test_machine_builtins_require_authorization(self):
-        self.reject('fn bad() -> *u32 { builtin::alloca[u32]() }')
-        self.reject("fn bad() -> Brand['static] { builtin::static_brand() }")
-        self.reject('fn bad(p: *u32) -> u32 { p.atomic_load(package::atomic::Ordering::Relaxed) }')
+        self.reject('fn bad() -> *u32 { core::mem::alloca[u32]() }')
+        self.reject("fn bad() -> core::cap::Brand['static] { core::cap::static_brand() }")
+        self.reject('fn bad(p: *u32) -> u32 { p.atomic_load(core::atomic::Ordering::Relaxed) }')
 
     def test_authorized_memory_and_raw_lends(self):
         for lend in ('read(unsafe &*p)', 'unsafe read(&*p)'):
             with self.subTest(lend=lend):
                 self.run_source('''fn read(&x: u32) -> u32 { x = x + 1u32; x }
                     fn main() -> i32 {
-                        let p = unsafe builtin::alloca[u32]();
+                        let p = unsafe core::mem::alloca[u32]();
                         unsafe *p = 5u32;
                         let a = ''' + lend + ''';
                         let store = unsafe p.store(a + 1u32);
-                        let b = unsafe builtin::load_volatile(p);
+                        let b = unsafe core::ptr::load_volatile(p);
                         let c = unsafe *p;
                         if b == c { b as i32 } else { 0i32 }
                     }''', 7)

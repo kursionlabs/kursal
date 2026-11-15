@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from kursal.core import ModuleId
-from kursal.resolve import Decl, ResolveError, resolve
+from kursal.resolve import LIB as LIBRARIES, Decl, ResolveError, resolve
 
 
 def tree(files):
@@ -23,7 +23,7 @@ def manifest(name, deps=(), entry=None):
     if entry:
         text += f'kind="executable"\nentry="{entry}"\n'
     for dep in deps:
-        text += f'[dependencies.{dep}]\npath="../{dep}"\n'
+        text += f'[dependencies.{dep}]\npath="{LIBRARIES / "core" if dep == "core" else "../" + dep}"\n'
     return text
 
 
@@ -45,12 +45,39 @@ def body_of(resolver, name):
     return resolver.scopes[ModuleId(0)].decls[name].node.body
 
 
+def kernel(core_source, source=""):
+    """A package named core, in `kernel/`, whose lib.kur is `core_source`, and `app`, which depends on it."""
+    return tree({"kernel/kur.toml": manifest("core"), "kernel/lib.kur": core_source,
+                 "app/kur.toml": manifest("app", ["kernel"]), "app/lib.kur": source}) / "app"
+
+
+class BuiltinTests(unittest.TestCase):
+    """Only package core names builtins (`builtin::name`); every other package imports them from it."""
+
+    def test_core_exports_builtins_under_their_names(self):
+        r = resolve(kernel("export builtin::{Brand, NonNull, fresh};\n",
+                           "use kernel::{Brand, NonNull};\n"
+                           "forall 'k. fn f(b: Brand['k], p: NonNull[u32]) -> u32 { let exists 'a. w = kernel::fresh(); 0u32 }\n"))
+        fn = r.scopes[ModuleId(0)].decls["f"].node
+        self.assertEqual([p.type.ref for p in fn.params], [("builtin", "Brand"), ("builtin", "NonNull")])
+
+    def test_only_core_names_builtins(self):
+        for source in ("fn bad(x: builtin::Brand['static]) -> () { () }\n", "fn bad() -> u32 { builtin::fresh(); 0u32 }\n",
+                       "use builtin::fresh;\nfn bad() -> u32 { fresh(); 0u32 }\n", "export builtin::Brand;\n"):
+            with self.subTest(source=source), self.assertRaisesRegex(ResolveError, "only package core names builtins"):
+                resolve(kernel("", source))
+
+    def test_unknown_builtins(self):
+        for type_name in ("builtin", "builtin::Brand::Extra['static]", "builtin::Phantom"):
+            with self.subTest(type_name=type_name), self.assertRaisesRegex(ResolveError, "unknown builtin"):
+                resolve(kernel(f"fn bad(x: {type_name}) -> () {{ () }}\n"))
+
+    def test_a_builtin_value_is_not_a_type(self):
+        with self.assertRaisesRegex(ResolveError, "fresh is not a type"):
+            resolve(kernel("export builtin::fresh;\n", "use kernel::fresh;\nfn bad(x: fresh) -> () { () }\n"))
+
+
 class GraphTests(unittest.TestCase):
-    def test_builtin_type_paths_have_exactly_two_components(self):
-        for type_name in ("builtin", "builtin::Brand::Extra['static]"):
-            with self.subTest(type_name=type_name), self.assertRaisesRegex(ResolveError, "exactly two components"):
-                resolve(app(f"fn bad(x: {type_name}) -> () {{ () }}"))
-        resolve(app("fn valid(x: builtin::Brand['static]) -> () { () }"))
 
     def test_manifest_values_are_validated_before_building_typed_packages(self):
         manifests = (
@@ -110,7 +137,8 @@ class NameTests(unittest.TestCase):
         self.assertEqual((kind, enum.name, variant), ("variant", "Shape", "Dot"))
 
     def test_type_parameters_and_brands(self):
-        r = resolve(app("forall T, 'k. fn f(x: T, b: Brand['k], n: u32) -> T { x }\n"))
+        r = resolve(tree({"app/kur.toml": manifest("app", ["core"]),
+                          "app/lib.kur": "forall T, 'k. fn f(x: T, b: core::cap::Brand['k], n: u32) -> T { x }\n"}) / "app")
         fn = r.scopes[ModuleId(0)].decls["f"].node
         self.assertEqual([p.type.ref for p in fn.params], [("param", "T"), ("builtin", "Brand"), ("prim", "u32")])
 

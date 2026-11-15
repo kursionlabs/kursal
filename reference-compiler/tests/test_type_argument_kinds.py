@@ -27,7 +27,7 @@ class TypeArgumentKindTests(unittest.TestCase):
                 self.run_source(source + ' fn main() -> i32 { 7i32 }', 7)
 
     def test_brand_constructor_requires_one_brand_argument(self):
-        for ty in ('Brand', 'Brand[u32]', "Brand['static, 'static]"):
+        for ty in ('core::cap::Brand', 'core::cap::Brand[u32]', "core::cap::Brand['static, 'static]"):
             with self.subTest(ty=ty), self.assertRaisesRegex(SigError, 'brand argument'):
                 self.run_source('fn bad(x: ' + ty + ') -> () { () } fn main() -> i32 { 7i32 }', 7)
 
@@ -38,9 +38,9 @@ class TypeArgumentKindTests(unittest.TestCase):
                                 'fn bad(x: Box[' + arg + ']) -> () { () } fn main() -> i32 { 7i32 }', 7)
 
     def test_valid_nominal_brand_and_type_arguments(self):
-        self.run_source('''forall 'a, T. exposed struct Tagged { witness: Brand['a], value: T }
+        self.run_source('''forall 'a, T. exposed struct Tagged { witness: core::cap::Brand['a], value: T }
             fn main() -> i32 {
-                let exists 'a. witness = builtin::fresh();
+                let exists 'a. witness = core::cap::fresh();
                 let value: Tagged['a, i32] = Tagged.{ witness, value: 7i32 };
                 value.value
             }''', 7)
@@ -48,10 +48,10 @@ class TypeArgumentKindTests(unittest.TestCase):
     def test_trait_brand_arguments_infer_with_brand_kind(self):
         for args in ("['a]", '', '[_]'):
             with self.subTest(args=args):
-                self.run_source('''forall 'a. trait Read { fn read(x: Brand['a]) -> i32; }
-            forall 'a. instance Read['a] { fn read(x: Brand['a]) -> i32 { 7i32 } }
+                self.run_source('''forall 'a. trait Read { fn read(x: core::cap::Brand['a]) -> i32; }
+            forall 'a. instance Read['a] { fn read(x: core::cap::Brand['a]) -> i32 { 7i32 } }
             fn main() -> i32 {
-                let exists 'a. witness = builtin::fresh();
+                let exists 'a. witness = core::cap::fresh();
                 Read''' + args + '''::read(witness)
             }''', 7)
 

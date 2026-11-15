@@ -101,7 +101,8 @@ exposed enum Callee {
     Variant(Span['k]),
     Tuple,
     Builtin(Span['k]),
-    Alloca(Type['k]),
+    // a builtin of one type argument, `alloca[T]()` or `sizeof[T]()`
+    TypedBuiltin(Span['k], Type['k]),
     // a pointer method, and its receiver
     Pointer(Span['k], Expr['k]),
     FStringWrite(S::FStr['k]),
@@ -125,8 +126,6 @@ exposed struct Results {
     folded: ArenaMap[u32, ConstValue['k], 'k],
     // paths and calls
     calls: ArenaMap[u32, Callee['k], 'k],
-    // sizeof
-    targets: ArenaMap[u32, Type['k], 'k],
     // struct literals: shorthand fields' binding ids, and the spread's
     field_ids: ArenaMap[u32, ArenaMap[Span['k], u32, 'k], 'k],
     spread_ids: ArenaMap[u32, u32, 'k],
@@ -154,7 +153,7 @@ exposed struct Results {
 forall 'k.
 fn new_results(&cx: Domain!['k]) -> Results['k] {
     Results.{
-        types: ArenaMap::new(&cx), binders: ArenaMap::new(&cx), folded: ArenaMap::new(&cx), calls: ArenaMap::new(&cx), targets: ArenaMap::new(&cx),
+        types: ArenaMap::new(&cx), binders: ArenaMap::new(&cx), folded: ArenaMap::new(&cx), calls: ArenaMap::new(&cx),
         field_ids: ArenaMap::new(&cx), spread_ids: ArenaMap::new(&cx), case_binders: ArenaMap::new(&cx), lent: ArenaMap::new(&cx),
         param_ids: ArenaMap::new(&cx), captures: ArenaMap::new(&cx), witnesses: ArenaMap::new(&cx), try_kinds: ArenaMap::new(&cx),
         opened: ArenaMap::new(&cx), options: ArenaMap::new(&cx), next_calls: ArenaMap::new(&cx), rest_ids: ArenaMap::new(&cx),
@@ -478,7 +477,7 @@ fn pointer_result(&cx: Domain!['k], name: Span['k]) -> u8 {
 // A builtin's number of value arguments, or none for an unknown builtin.
 forall 'k.
 fn builtin_arity(&cx: Domain!['k], name: Span['k]) -> Option[usize] {
-    if name.is(&cx, "fresh") || name.is(&cx, "static_brand") || name.is(&cx, "alloca") {
+    if name.is(&cx, "fresh") || name.is(&cx, "static_brand") || name.is(&cx, "sizeof") || name.is(&cx, "alloca") {
         Option::Some.(0usize)
     } else if name.is(&cx, "enum_variant") || name.is(&cx, "fence") || name.is(&cx, "load_volatile") {
         Option::Some.(1usize)
@@ -901,7 +900,7 @@ impl Body['k] {
                     Callee::Fn(f) => zonk_map(&cx, f.sub),
                     Callee::Value(sub) => zonk_map(&cx, sub),
                     Callee::Trait(t) => zonk_all(&cx, t.targs),
-                    Callee::Alloca(t) => { out.calls.insert(&cx, id, Callee::Alloca.(zonk(&cx, t))); },
+                    Callee::TypedBuiltin(name, t) => { out.calls.insert(&cx, id, Callee::TypedBuiltin.(name, zonk(&cx, t))); },
                     _ => (),
                 },
                 Option::None => (),
@@ -1678,10 +1677,6 @@ impl Body['k] {
                 Type::Tuple.(elems)
             },
             Expr::Array(a) => self.expr_array(&cx, a),
-            Expr::Sizeof(n) => {
-                self.results().targets.insert(&cx, n.id, self.core_type(&cx, n.value));
-                C::usize_type(&cx)
-            },
             Expr::StructLit(s) => self.expr_struct_lit(&cx, s),
             Expr::Block(b) => self.block(&cx, b),
             Expr::For(f) => self.expr_for(&cx, f),
@@ -2991,7 +2986,7 @@ impl Body['k] {
             }
             i = i + 1usize;
         }
-        let expected = if name.is(&cx, "alloca") { 1usize } else { 0usize };
+        let expected = if name.is(&cx, "alloca") || name.is(&cx, "sizeof") { 1usize } else { 0usize };
         if targs.len(&cx) != expected {
             self.fail(&cx, Buffer::new().push_bytes(&cx, name).push_static(" takes ").push_usize(expected).push_static(" type arguments").save(&cx), c.pos);
         }
@@ -3020,9 +3015,12 @@ impl Body['k] {
                 self.later(&cx, operand, Action::EnumOperand.(operand), arg_pos);
             }
             if lent.is_some() { C::u32_type(&cx) } else { Type::Tuple.(ArenaVec::two(&cx, operand, C::u32_type(&cx))) }
+        } else if name.is(&cx, "sizeof") {
+            self.results().calls.insert(&cx, c.id, Callee::TypedBuiltin.(name, self.core_type(&cx, targs.at(&cx, 0usize))));
+            C::usize_type(&cx)
         } else if name.is(&cx, "alloca") {
             let target = self.core_type(&cx, targs.at(&cx, 0usize));
-            self.results().calls.insert(&cx, c.id, Callee::Alloca.(target));
+            self.results().calls.insert(&cx, c.id, Callee::TypedBuiltin.(name, target));
             C::ptr(&cx, target)
         } else if name.is(&cx, "fence") {
             let unit = self.check(&cx, c.args.at(&cx, 0usize), Option::Some.(C::named(self.library(&cx, "Ordering"), ArenaVec::new(&cx))));

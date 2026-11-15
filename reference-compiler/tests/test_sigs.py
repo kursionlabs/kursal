@@ -9,7 +9,7 @@ from tests.test_resolve import manifest, tree
 
 
 def sigs_of(source):
-    root = tree({"p/kur.toml": manifest("p"), "p/lib.kur": source})
+    root = tree({"p/kur.toml": manifest("p", ("core",)), "p/lib.kur": source})
     return signatures(resolve(root / "p"))
 
 
@@ -28,7 +28,7 @@ class TypeDeclTests(unittest.TestCase):
             sigs_of(source)
 
     def test_struct_enum_tuple(self):
-        s = sigs_of("forall T, 'k where Copy[T]. struct Box! { v: T, b: Brand['k] }\n"
+        s = sigs_of("forall T, 'k where Copy[T]. struct Box! { v: T, b: core::cap::Brand['k] }\n"
                     "enum E { A, B(u32), C(u32, bool) }\nexposed tuple Pair(u32, u32);\n")
         box, enum, pair = s.types["p::Box"], s.types["p::E"], s.types["p::Pair"]
         self.assertTrue(box.linear)
@@ -84,7 +84,7 @@ class SignatureTests(unittest.TestCase):
 
     def test_brand_scope(self):
         with self.assertRaises(SigError):
-            sigs_of("fn f(b: Brand['k]) -> u32 { 0u32 }\n")
+            sigs_of("fn f(b: core::cap::Brand['k]) -> u32 { 0u32 }\n")
 
 
 class ConstTests(unittest.TestCase):

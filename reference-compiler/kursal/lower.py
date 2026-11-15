@@ -30,7 +30,7 @@ from .placeflow import OwnershipError, PlaceFlow
 from .promote import promote_locals
 from .literals import valid_literal
 from .check import overlap
-from .infer import (POINTER_OPS, AllocaCall, BuiltinCall, ClosureCall, FnCall, FStringWrite, Infer, PointerCall,
+from .infer import (POINTER_OPS, BuiltinCall, ClosureCall, FnCall, FStringWrite, Infer, PointerCall, TypedBuiltinCall,
                     TraitCall, TupleCall, ValueCall, VariantCall)
 from .sexpr import KursError, List, Position, Str
 from .sigs import ConstValue, Sig, Signatures
@@ -481,7 +481,6 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
             case S.Path(): return self.expr_path(expr)
             case S.Tuple(): return self.expr_tuple(expr)
             case S.Array(): return self.expr_tuple(expr)
-            case S.Sizeof(): return self.expr_sizeof(expr)
             case S.StructLit(): return self.expr_struct_lit(expr)
             case S.Block(): return self.expr_block(expr)
             case S.If(): return self.expr_if(expr)
@@ -529,9 +528,6 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
             return None
         ty = self.substitute_type(expr.ty)
         return self.emit("construct", ty, vals, ty=ty)
-
-    def expr_sizeof(self, expr: S.Sizeof) -> Optional[str]:
-        return self.emit("sizeof", C.USIZE, ty=self.substitute_type(expr.target))
 
     def expr_block(self, expr: S.Block) -> Optional[str]:
         def body() -> Optional[str]:
@@ -715,8 +711,8 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
                 vals = self.operands(list(expr.args))
                 ty = self.substitute_type(expr.ty)
                 return None if vals is None else self.emit("construct", ty, vals, ty=ty)
-            case AllocaCall():
-                return self.emit("alloca", self.substitute_type(expr.ty), ty=self.substitute_type(call.target), node=expr)
+            case TypedBuiltinCall():
+                return self.emit(call.name, self.substitute_type(expr.ty), ty=self.substitute_type(call.target), node=expr)
             case BuiltinCall():
                 return self.builtin(expr, call)
             case PointerCall():

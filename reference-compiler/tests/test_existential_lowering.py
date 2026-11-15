@@ -10,12 +10,12 @@ class ExistentialLoweringTests(unittest.TestCase):
 
     def test_repacked_branches_join(self):
         self.run_source('''
-        fn choose(flag: bool) -> exists 'r. (Brand['r], u32) {
+        fn choose(flag: bool) -> exists 'r. (core::cap::Brand['r], u32) {
             if flag {
-                let exists 'a. w = builtin::fresh();
+                let exists 'a. w = core::cap::fresh();
                 pack 'a. (w, 7u32)
             } else {
-                let exists 'a. w = builtin::fresh();
+                let exists 'a. w = core::cap::fresh();
                 pack 'a. (w, 9u32)
             }
         }
@@ -27,11 +27,11 @@ class ExistentialLoweringTests(unittest.TestCase):
 
     def test_shadowed_brand_does_not_retype_outer_value(self):
         self.run_source('''
-        forall 'a. fn same(x: Brand['a], y: Brand['a]) -> u32 { 7u32 }
+        forall 'a. fn same(x: core::cap::Brand['a], y: core::cap::Brand['a]) -> u32 { 7u32 }
         fn main() -> i32 {
-            let exists 'a. outer = builtin::fresh();
+            let exists 'a. outer = core::cap::fresh();
             let n = {
-                let exists 'a. inner = builtin::fresh();
+                let exists 'a. inner = core::cap::fresh();
                 same(outer, outer)
             };
             ((n + same(outer, outer)) as i32)
@@ -40,11 +40,11 @@ class ExistentialLoweringTests(unittest.TestCase):
     def test_shadowed_brands_cannot_unify(self):
         with self.assertRaisesRegex(InferError, 'type mismatch'):
             self.run_source('''
-            forall 'a. fn same(x: Brand['a], y: Brand['a]) -> u32 { 7u32 }
+            forall 'a. fn same(x: core::cap::Brand['a], y: core::cap::Brand['a]) -> u32 { 7u32 }
             fn main() -> i32 {
-                let exists 'a. outer = builtin::fresh();
+                let exists 'a. outer = core::cap::fresh();
                 let n = {
-                    let exists 'a. inner = builtin::fresh();
+                    let exists 'a. inner = core::cap::fresh();
                     same(outer, inner)
                 };
                 (n as i32)
@@ -53,7 +53,7 @@ class ExistentialLoweringTests(unittest.TestCase):
     def test_unpacked_value_cannot_escape_block(self):
         with self.assertRaisesRegex(InferError, 'brand.*escape'):
             self.run_source('''fn main() -> i32 {
-                let escaped = { let exists 'a. w = builtin::fresh(); w };
+                let escaped = { let exists 'a. w = core::cap::fresh(); w };
                 0i32
             }''', 0)
 
@@ -66,16 +66,16 @@ class ExistentialLoweringTests(unittest.TestCase):
 
     def test_repeated_name_in_same_scope_keeps_old_witness(self):
         self.run_source('''
-        forall 'a. fn same(x: Brand['a], y: Brand['a]) -> u32 { 7u32 }
+        forall 'a. fn same(x: core::cap::Brand['a], y: core::cap::Brand['a]) -> u32 { 7u32 }
         fn main() -> i32 {
-            let exists 'a. outer = builtin::fresh();
-            let exists 'a. inner = builtin::fresh();
+            let exists 'a. outer = core::cap::fresh();
+            let exists 'a. inner = core::cap::fresh();
             ((same(outer, outer) + same(inner, inner)) as i32)
         }''', 14)
 
     def test_loop_reseals_its_witness(self):
         self.run_source('''fn main() -> i32 {
-            var package = builtin::fresh();
+            var package = core::cap::fresh();
             var n = 0u32;
             while n < 3 {
                 let exists 'a. witness = package;
@@ -87,24 +87,24 @@ class ExistentialLoweringTests(unittest.TestCase):
 
     def test_generic_brand_survives_shadowing_inside_closure(self):
         self.run_source('''
-        forall 'a. fn same(x: Brand['a], y: Brand['a]) -> u32 { 7u32 }
-        forall 'a. fn touch(w: Brand['a]) -> u32 {
+        forall 'a. fn same(x: core::cap::Brand['a], y: core::cap::Brand['a]) -> u32 { 7u32 }
+        forall 'a. fn touch(w: core::cap::Brand['a]) -> u32 {
             let f = || {
-                let exists 'a. inner = builtin::fresh();
+                let exists 'a. inner = core::cap::fresh();
                 same(w, w)
             };
             f()
         }
         fn main() -> i32 {
-            let exists 'a. w = builtin::fresh();
+            let exists 'a. w = core::cap::fresh();
             (touch(w) as i32)
         }''', 7)
 
     def test_pack_after_shadowing_selects_inner_witness(self):
         self.run_source('''fn main() -> i32 {
-            let exists 'a. outer = builtin::fresh();
+            let exists 'a. outer = core::cap::fresh();
             let p = {
-                let exists 'a. inner = builtin::fresh();
+                let exists 'a. inner = core::cap::fresh();
                 pack 'a. inner
             };
             let exists 'b. reopened = p;
@@ -115,7 +115,7 @@ class ExistentialLoweringTests(unittest.TestCase):
     def test_opening_cannot_repeat_a_binder(self):
         with self.assertRaisesRegex(InferError, 'repeats a brand'):
             self.run_source('''
-            fn bad(p: exists 'x, 'y. (Brand['x], Brand['y])) -> u32 {
+            fn bad(p: exists 'x, 'y. (core::cap::Brand['x], core::cap::Brand['y])) -> u32 {
                 let exists 'a, 'a. (x, y) = p;
                 0u32
             }
@@ -128,7 +128,7 @@ class ExistentialLoweringTests(unittest.TestCase):
             fn main() -> i32 {
                 var slot = Option::None;
                 {
-                    let exists 'a. w = builtin::fresh();
+                    let exists 'a. w = core::cap::fresh();
                     slot = Option::Some.(w);
                 };
                 0i32
@@ -138,7 +138,7 @@ class ExistentialLoweringTests(unittest.TestCase):
         from kursal.lower import LowerError
         with self.assertRaisesRegex(LowerError, 'block-local brand'):
             self.run_source('''fn main() -> i32 {
-                let exists 'a. w = builtin::fresh();
+                let exists 'a. w = core::cap::fresh();
                 let f = || pack 'a. 7u32;
                 let p = f();
                 0i32

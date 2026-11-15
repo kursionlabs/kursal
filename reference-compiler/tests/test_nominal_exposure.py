@@ -116,7 +116,7 @@ class NominalExposureTests(unittest.TestCase):
     def test_opaque_tag_inspection(self):
         for operand in ('e', '&e'):
             with self.subTest(operand=operand):
-                self.reject('let e = make_e(); let tag = builtin::enum_variant(' + operand + '); 7i32')
+                self.reject('let e = make_e(); let tag = core::mem::enum_variant(' + operand + '); 7i32')
 
     def test_core_tag_inspection_requires_exposure(self):
         from kursal import core as C

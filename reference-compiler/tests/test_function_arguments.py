@@ -56,10 +56,10 @@ class FunctionArgumentTests(unittest.TestCase):
             fn main() -> i32 { B[i32]::get(Box.{ value: get(Box.{ value: 7i32 }) }) }''', 7)
 
     def test_brand_qualified_method_value_is_specialized(self):
-        self.run_source('''forall 'a. exposed struct Tagged { witness: Brand['a], value: i32 }
+        self.run_source('''forall 'a. exposed struct Tagged { witness: core::cap::Brand['a], value: i32 }
             forall 'a. impl Tagged['a] { fn get(self: Tagged['a]) -> i32 { self.value } }
             fn main() -> i32 {
-                let exists 'a. witness = builtin::fresh();
+                let exists 'a. witness = core::cap::fresh();
                 let f = Tagged['a]::get;
                 f(Tagged.{ witness, value: 7i32 })
             }''', 7)

@@ -14,7 +14,7 @@ from tests.test_lower import compile_and_run, write
 
 SOURCE = """
 forall 'k.
-struct Tagged { value: i32, brand: Brand['k] }
+struct Tagged { value: i32, brand: core::cap::Brand['k] }
 
 forall 'k.
 fn read(t: Tagged['k]) -> i32 {
@@ -28,8 +28,8 @@ fn both(s: Tagged['j], t: Tagged['k]) -> i32 {
 }
 
 fn main() -> i32 {
-    let exists 'a. x = builtin::fresh();
-    let exists 'b. y = builtin::fresh();
+    let exists 'a. x = core::cap::fresh();
+    let exists 'b. y = core::cap::fresh();
     let p = Tagged.{ value: 2i32, brand: x };
     let q = Tagged.{ value: 3i32, brand: y };
     read(p) + read(q) + both(p, q) + both(q, q) - 22i32

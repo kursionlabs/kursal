@@ -81,19 +81,19 @@ class ClosureBoundaryTests(unittest.TestCase):
         self.assertEqual(lifted[0].places, frozenset({1}))
 
     def test_enclosing_generic_brand_is_lifted(self):
-        self.run_source('''forall 'a. fn use_brand(w: Brand['a]) -> u32 {
+        self.run_source('''forall 'a. fn use_brand(w: core::cap::Brand['a]) -> u32 {
             let f = |n: u32| { let witness = w; n + 1u32 };
             f(4)
         }
         fn main() -> i32 {
-            let exists 'a. witness = builtin::fresh();
+            let exists 'a. witness = core::cap::fresh();
             (use_brand(witness) as i32)
         }''', 5)
 
     def test_block_local_brand_capture_is_rejected(self):
         with self.assertRaisesRegex(KursError, 'block-local brand'):
             self.run_source('''fn main() -> i32 {
-                let exists 'a. witness = builtin::fresh();
+                let exists 'a. witness = core::cap::fresh();
                 let f = |n: u32| { let w = witness; n };
                 (f(4) as i32)
             }''', 4)
@@ -102,8 +102,8 @@ class ClosureBoundaryTests(unittest.TestCase):
         from kursal.lower import LowerError
         with self.assertRaisesRegex(LowerError, 'block-local brand'):
             self.run_source('''fn main() -> i32 {
-                let exists 'a. witness = builtin::fresh();
-                let f = || sizeof[(u32, Brand['a])]();
+                let exists 'a. witness = core::cap::fresh();
+                let f = || core::mem::sizeof[(u32, core::cap::Brand['a])]();
                 (f() as i32)
             }''', 0)
 
@@ -150,21 +150,21 @@ class ClosureBoundaryTests(unittest.TestCase):
                     }''', 4)
 
     def test_type_only_generic_brand_in_closure_runs(self):
-        self.run_source('''forall 'a. fn measure(w: Brand['a]) -> usize {
-                let f = || sizeof[(u32, Brand['a])]();
+        self.run_source('''forall 'a. fn measure(w: core::cap::Brand['a]) -> usize {
+                let f = || core::mem::sizeof[(u32, core::cap::Brand['a])]();
                 f()
             }
             fn main() -> i32 {
-                let exists 'a. witness = builtin::fresh();
-                if measure(witness) == sizeof[(u32, Brand['a])]() { 7i32 } else { 1i32 }
+                let exists 'a. witness = core::cap::fresh();
+                if measure(witness) == core::mem::sizeof[(u32, core::cap::Brand['a])]() { 7i32 } else { 1i32 }
             }''', 7)
 
     def test_brand_opened_inside_closure_runs(self):
         self.run_source('''fn main() -> i32 {
                 let f = || {
-                    let exists 'a. witness = builtin::fresh();
-                    let size = sizeof[(u32, Brand['a])]();
-                    if size == sizeof[(u32, Brand['a])]() { 7i32 } else { 1i32 }
+                    let exists 'a. witness = core::cap::fresh();
+                    let size = core::mem::sizeof[(u32, core::cap::Brand['a])]();
+                    if size == core::mem::sizeof[(u32, core::cap::Brand['a])]() { 7i32 } else { 1i32 }
                 };
                 f()
             }''', 7)
@@ -173,9 +173,9 @@ class ClosureBoundaryTests(unittest.TestCase):
         from kursal.lower import LowerError
         with self.assertRaisesRegex(LowerError, 'block-local brand'):
             self.run_source('''fn main() -> i32 {
-                let exists 'a. witness = builtin::fresh();
+                let exists 'a. witness = core::cap::fresh();
                 let parts = foreach item of (1u32, 2u32) {
-                    let size = sizeof[(u32, Brand['a])]();
+                    let size = core::mem::sizeof[(u32, core::cap::Brand['a])]();
                     item
                 };
                 let (x, y) = parts;

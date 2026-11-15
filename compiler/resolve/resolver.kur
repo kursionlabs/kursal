@@ -11,7 +11,8 @@
 //   NameRef::Param(name)           a type parameter in scope
 //   NameRef::Local(name)           a local value
 //   NameRef::Prim(name)            a primitive type
-//   NameRef::Builtin(name)         a compiler-sealed name: Brand, Copy, builtin::fresh, ...
+//   NameRef::Builtin(name)         a name the compiler gives meaning: `Copy`, `Exposed`, `Never`, and
+//                                  what `builtin::name` names in package core (`Brand`, `fresh`, ...)
 
 use package::support::base::fail;
 use std::hash::{combine, key_eq, key_hash};
@@ -41,26 +42,29 @@ fn is_prim(&cx: Domain!['k], name: Span['k]) -> bool {
     among(&cx, name, "i8 i16 i32 i64 isize u8 u16 u32 u64 usize f32 f64 bool")
 }
 
+// Always in scope, like the primitives: the type `Never` and the traits.
+forall 'k.
+fn is_builtin_trait(&cx: Domain!['k], name: Span['k]) -> bool {
+    among(&cx, name, "Copy Exposed")
+}
+
+// What `builtin::name` names. Only package `core` writes such a path, and it exports each builtin
+// from the module it belongs to (`export builtin::NonNull;` in core::ptr); everyone else imports it
+// from there.
 forall 'k.
 fn is_builtin_type(&cx: Domain!['k], name: Span['k]) -> bool {
-    among(&cx, name, "Brand Phantom Never NonNull")
+    among(&cx, name, "Brand NonNull")
+}
+
+forall 'k.
+fn is_builtin_value(&cx: Domain!['k], name: Span['k]) -> bool {
+    among(&cx, name, "fresh static_brand sizeof alloca enum_variant fence load_volatile store_volatile")
 }
 
 // The builtin types an impl may give methods, as it may a primitive: `impl NonNull[T]` in core::ptr.
 forall 'k.
 fn is_owned_builtin(&cx: Domain!['k], name: Span['k]) -> bool {
     name.is(&cx, "NonNull")
-}
-
-forall 'k.
-fn is_builtin_trait(&cx: Domain!['k], name: Span['k]) -> bool {
-    among(&cx, name, "Copy Exposed")
-}
-
-// Builtin values, unless a declaration of the name is in scope.
-forall 'k.
-fn is_builtin_value(&cx: Domain!['k], name: Span['k]) -> bool {
-    among(&cx, name, "alloca fence load_volatile store_volatile")
 }
 
 // The standard library's directory: `$KURSAL_LIB`, else `lib` beside the directory that holds the
@@ -717,6 +721,7 @@ exposed enum Target {
     Module(ModuleId['k]),
     Variant(Decl['k], Span['k]),
     TraitMethod(Decl['k], Span['k]),
+    Builtin(Span['k]),
 }
 
 // What a resolved node names; see the top of this file.
@@ -1094,6 +1099,11 @@ fn lookup_key(&cx: Domain!['k], kind: Slice[u8, 'static], home: ModuleId['k], na
 }
 
 forall 'k.
+fn only_core(&cx: Domain!['k]) -> Span['k] {
+    Span::from_static(&cx, "only package core names builtins; import them from core")
+}
+
+forall 'k.
 fn problem(message: Span['k]) -> Result[Target['k], Problem['k]] {
     Result::Err.(Problem.{ message, pos: no_pos() })
 }
@@ -1214,6 +1224,9 @@ impl Resolver['k] {
     fn use_tree(self, &cx: Domain!['k], scope: Scope['k], prefix: ArenaVec[Span['k], 'k], tree: S::UseTree['k], exported: bool) {
         let path = prefix.clone(&cx);
         path.append(&cx, tree.path);
+        if path.at(&cx, 0usize).is(&cx, "builtin") && !self.in_core(&cx, scope.home) {
+            self.fail(&cx, only_core(&cx), no_pos());
+        }
         if tree.star {
             scope.globs.push(&cx, path);
         } else if !tree.children.is_empty(&cx) {
@@ -1269,14 +1282,18 @@ impl Resolver['k] {
             Option::None => ArenaVec::new(&cx),
         };
         let alone = target.path.at(&cx, 0usize);
-        let owner = if target.path.len(&cx) == 1usize && (is_prim(&cx, alone) || is_owned_builtin(&cx, alone)
-                && !scope.decls.contains(&cx, alone) && !scope.imports.contains(&cx, alone)) {
+        let owner = if target.path.len(&cx) == 1usize && is_prim(&cx, alone) {
             Owner::Prim.(target.path.at(&cx, 0usize))
         } else if target.path.len(&cx) == 1usize && params.contains(&cx, target.path.at(&cx, 0usize)) {
             // a blanket impl: its methods are found by method calls only
             Owner::Blanket
         } else {
             match self.need(&cx, scope.home, target.path, item.pos) {
+                Target::Builtin(name) => if is_owned_builtin(&cx, name) {
+                    Owner::Prim.(name)
+                } else {
+                    self.fail(&cx, Span::from_static(&cx, "an impl target must name a type declaration"), item.pos)
+                },
                 Target::Decl(d) => Owner::Decl.(d),
                 _ => self.fail(&cx, Span::from_static(&cx, "an impl target must name a type declaration"), item.pos),
             }
@@ -1387,6 +1404,9 @@ impl Resolver['k] {
             Option::Some(name) => !name.eq(&cx, first),
             Option::None => true,
         };
+        if first.is(&cx, "builtin") {
+            return self.builtin(&cx, home, path);
+        }
         var target = if first.is(&cx, "package") {
             Target::Module.(ModuleId::root(&cx, home.package))
         } else if scope.decls.contains(&cx, first) {
@@ -1412,6 +1432,11 @@ impl Resolver['k] {
         while k < rest.len(&cx) {
             target = match target {
                 Target::Decl(d) => return self.associated(&cx, d, rest.skip(&cx, k).join(&cx, "::")),
+                Target::Builtin(name) => if is_owned_builtin(&cx, name) {
+                    return self.attached_to(&cx, name, rest.skip(&cx, k).join(&cx, "::"));
+                } else {
+                    return problem(Buffer::new().push_bytes(&cx, path.slice(&cx, 0usize, k + 1usize).join(&cx, "::")).push_static(" is not a module").save(&cx));
+                },
                 Target::Module(m) => match self.member(&cx, home, m, rest.at(&cx, k)) {
                     Result::Ok(t) => t,
                     Result::Err(e) => return Result::Err.(e),
@@ -1421,6 +1446,31 @@ impl Resolver['k] {
             k = k + 1usize;
         }
         Result::Ok.(target)
+    }
+
+    // `builtin::name`, which only package core writes.
+    fn builtin(self, &cx: Domain!['k], home: ModuleId['k], path: ArenaVec[Span['k], 'k]) -> Result[Target['k], Problem['k]] {
+        if !self.in_core(&cx, home) {
+            return problem(only_core(&cx));
+        }
+        let name = if path.len(&cx) == 2usize { path.at(&cx, 1usize) } else { Span::from_static(&cx, "") };
+        if !is_builtin_type(&cx, name) && !is_builtin_value(&cx, name) {
+            return problem(Buffer::new().push_static("unknown builtin ").push_bytes(&cx, path.join(&cx, "::")).save(&cx));
+        }
+        Result::Ok.(Target::Builtin.(name))
+    }
+
+    fn in_core(self, &cx: Domain!['k], home: ModuleId['k]) -> bool {
+        self.packages.at(&cx, home.package).name.copy(&cx).is(&cx, "core")
+    }
+
+    // `Owner::name` of a primitive or builtin type: a method or const an impl of it declares.
+    fn attached_to(self, &cx: Domain!['k], owner: Span['k], name: Span['k]) -> Result[Target['k], Problem['k]] {
+        let found = self.attached.get_or(&cx, (Owner::Prim.(owner), name), ArenaVec::new(&cx));
+        if found.is_empty(&cx) {
+            return problem(Buffer::new().push_static("unknown ").push_bytes(&cx, owner).push_static("::").push_bytes(&cx, name).save(&cx));
+        }
+        Result::Ok.(Target::Decl.(found.at(&cx, 0usize)))
     }
 
     fn root_member(self, &cx: Domain!['k], home: ModuleId['k], name: Span['k]) -> Option[Target['k]] {
@@ -1824,18 +1874,19 @@ impl Names['k] {
                     self.set(&cx, n.id, NameRef::Param.(name));
                 } else if single && is_prim(&cx, name) {
                     self.set(&cx, n.id, NameRef::Prim.(name));
-                } else if single && is_builtin_type(&cx, name) && !self.declared(&cx, name) {
+                } else if single && name.is(&cx, "Never") {
                     self.set(&cx, n.id, NameRef::Builtin.(name));
-                } else if name.is(&cx, "builtin") {
-                    if path.len(&cx) != 2usize {
-                        self.r.fail(&cx, Span::from_static(&cx, "a builtin type path has exactly two components"), no_pos());
-                    }
-                    self.set(&cx, n.id, NameRef::Builtin.(path.at(&cx, 1usize)));
                 } else {
-                    let d = self.decl(&cx, path, if is_trait { "trait" } else { "" }, no_pos());
-                    self.set(&cx, n.id, NameRef::Decl.(d));
-                    if !is_trait && !d.kind.is(&cx, "struct") && !d.kind.is(&cx, "enum") && !d.kind.is(&cx, "tuple") {
-                        self.r.fail(&cx, Buffer::new().push_bytes(&cx, path.join(&cx, "::")).push_static(" is not a type").save(&cx), no_pos());
+                    let builtin = if is_trait { Option::None } else { self.builtin_type(&cx, path) };
+                    match builtin {
+                        Option::Some(b) => self.set(&cx, n.id, NameRef::Builtin.(b)),
+                        Option::None => {
+                            let d = self.decl(&cx, path, if is_trait { "trait" } else { "" }, no_pos());
+                            self.set(&cx, n.id, NameRef::Decl.(d));
+                            if !is_trait && !d.kind.is(&cx, "struct") && !d.kind.is(&cx, "enum") && !d.kind.is(&cx, "tuple") {
+                                self.r.fail(&cx, Buffer::new().push_bytes(&cx, path.join(&cx, "::")).push_static(" is not a type").save(&cx), no_pos());
+                            }
+                        },
                     }
                 }
                 self.types(&cx, n.args, types);
@@ -1886,13 +1937,17 @@ impl Names['k] {
         }
     }
 
-    fn visible(self, &cx: Domain!['k], name: Span['k]) -> bool {
-        self.r.lookup(&cx, self.home.copy(&cx), ArenaVec::one(&cx, name), no_pos()).is_ok()
-    }
-
-    fn declared(self, &cx: Domain!['k], name: Span['k]) -> bool {
-        let scope = self.r.scopes.at(&cx, self.home.copy(&cx));
-        scope.decls.contains(&cx, name) || scope.imports.contains(&cx, name)
+    // The builtin `path` names, if it names one; stops when that is not a type.
+    fn builtin_type(self, &cx: Domain!['k], path: ArenaVec[Span['k], 'k]) -> Option[Span['k]] {
+        match self.r.need(&cx, self.home.copy(&cx), path, no_pos()) {
+            Target::Builtin(name) => {
+                if !is_builtin_type(&cx, name) {
+                    self.r.fail(&cx, Buffer::new().push_bytes(&cx, path.join(&cx, "::")).push_static(" is not a type").save(&cx), no_pos());
+                }
+                Option::Some.(name)
+            },
+            _ => Option::None,
+        }
     }
 
     // ---- expressions
@@ -1903,9 +1958,7 @@ impl Names['k] {
             Expr::Block(b) => self.block(&cx, b, types, values),
             Expr::StructLit(s) => {
                 let names = s.path.names(&cx);
-                if !names.at(&cx, 0usize).is(&cx, "builtin") {
-                    self.set(&cx, s.path.id, NameRef::Decl.(self.decl(&cx, names, "struct", s.pos)));
-                }
+                self.set(&cx, s.path.id, NameRef::Decl.(self.decl(&cx, names, "struct", s.pos)));
                 self.segment_args(&cx, s.path, types);
                 var i = 0usize;
                 while i < s.fields.len(&cx) {
@@ -1992,7 +2045,6 @@ impl Names['k] {
                 self.expr(&cx, c.value.copy(&cx), types, values);
                 self.type(&cx, c.type, types, false);
             },
-            Expr::Sizeof(n) => self.type(&cx, n.value, types, false),
             Expr::While(w) => {
                 self.expr(&cx, w.cond.copy(&cx), types, values);
                 self.block(&cx, w.body, types, values);
@@ -2075,11 +2127,7 @@ impl Names['k] {
         let first = names.at(&cx, 0usize);
         if names.len(&cx) == 1usize && values.contains(&cx, first) {
             self.set(&cx, p.id, NameRef::Local.(first));
-        } else if first.is(&cx, "builtin") {
-            self.set(&cx, p.id, NameRef::Builtin.(names.skip(&cx, 1usize).join(&cx, "::")));
-        } else if names.len(&cx) == 1usize && is_builtin_value(&cx, first) && !self.visible(&cx, first) {
-            self.set(&cx, p.id, NameRef::Builtin.(first));
-        } else if names.len(&cx) == 2usize && (is_prim(&cx, first) || is_owned_builtin(&cx, first) && !self.declared(&cx, first)) {
+        } else if names.len(&cx) == 2usize && is_prim(&cx, first) {
             let found = self.r.attached.get_or(&cx, (Owner::Prim.(first), names.at(&cx, 1usize)), ArenaVec::new(&cx));
             if found.is_empty(&cx) {
                 self.r.fail(&cx, Buffer::new().push_static("unknown ").push_bytes(&cx, first).push_static("::").push_bytes(&cx, names.at(&cx, 1usize)).save(&cx), p.pos);
@@ -2094,6 +2142,7 @@ impl Names['k] {
                 Target::Decl(d) => NameRef::Decl.(d),
                 Target::Variant(d, v) => NameRef::Variant.(d, v),
                 Target::TraitMethod(d, m) => NameRef::TraitMethod.(d, m),
+                Target::Builtin(name) => NameRef::Builtin.(name),
             };
             self.set(&cx, p.id, r);
         }

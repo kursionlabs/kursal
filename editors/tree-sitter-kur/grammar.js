@@ -552,7 +552,6 @@ module.exports = grammar({
       $.boolean_literal,
       $.parenthesized_expression,
       $.array_expression,
-      $.sizeof_expression,
       $.path_expression,
       $.struct_expression,
       $.construct_expression,
@@ -571,8 +570,6 @@ module.exports = grammar({
       )),
       ']',
     ),
-
-    sizeof_expression: $ => seq('sizeof', '[', field('type', $._type), ']', '(', ')'),
 
     // `a`, `self`, `Option[u32]::Some`, `Map!['k]::new`: each segment may carry `!` and type arguments.
     path_expression: $ => prec.right(seq($.path_segment, repeat(seq('::', $.path_segment)))),

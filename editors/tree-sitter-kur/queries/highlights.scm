@@ -110,7 +110,6 @@
   "foreach"
   "of"
   "pack"
-  "sizeof"
   "as"
   "let"
 ] @keyword

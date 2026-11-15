@@ -93,7 +93,7 @@ fn main() -> i32 {
     0i32
 }''', 0)
         calls = [i for f in program.funs.values() for b in f.blocks for i in b.instrs
-                 if i.op == 'call' and i.args[0].endswith('::take')]
+                 if i.op == 'call' and i.args[0] == 't::take']
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].pos, (5, 5))
 

@@ -47,7 +47,7 @@ POINTER_OPS = {
     **{name: (("T", "O"), "T") for name in ("atomic_swap", "fetch_add", "fetch_sub", "fetch_and", "fetch_or", "fetch_xor")},
 }
 POINTER_METHODS = set(POINTER_OPS)
-BUILTIN_ARITY = {"fresh": 0, "static_brand": 0, "alloca": 0, "enum_variant": 1,
+BUILTIN_ARITY = {"fresh": 0, "static_brand": 0, "sizeof": 0, "alloca": 0, "enum_variant": 1,
                  "fence": 1, "load_volatile": 1, "store_volatile": 2}
 
 
@@ -135,7 +135,9 @@ class BuiltinCall:
 
 
 @dataclass
-class AllocaCall:
+class TypedBuiltinCall:
+    """A builtin of one type argument, `alloca[T]()` or `sizeof[T]()`."""
+    name: str
     target: C.Type
 
 
@@ -152,7 +154,7 @@ class FStringWrite:
 
 type Callee = (
     FnCall | TraitCall | ValueCall | ClosureCall | VariantCall | TupleCall
-    | BuiltinCall | AllocaCall | PointerCall | FStringWrite
+    | BuiltinCall | TypedBuiltinCall | PointerCall | FStringWrite
 )
 
 
@@ -272,7 +274,7 @@ class Infer:
                     call.sub = {k: zonk(v) for k, v in call.sub.items()}
                 case TraitCall():
                     call.targs = tuple(zonk(t) for t in call.targs)
-                case AllocaCall():
+                case TypedBuiltinCall():
                     call.target = zonk(call.target)
 
     # ---- the solver
@@ -583,7 +585,6 @@ class Infer:
             case S.Path(): return self.expr_path(expr)
             case S.Tuple(): return self.expr_tuple(expr)
             case S.Array(): return self.expr_array(expr)
-            case S.Sizeof(): return self.expr_sizeof(expr)
             case S.StructLit(): return self.expr_struct_lit(expr)
             case S.Block(): return self.expr_block(expr)
             case S.For(): return self.expr_for(expr)
@@ -792,10 +793,6 @@ class Infer:
             self.unify(elem, want.elem, expr.pos)
         self.later(result, fill, expr.pos)
         return result
-
-    def expr_sizeof(self, expr: S.Sizeof) -> C.Type:
-        expr.target = self.type(expr.type)
-        return C.USIZE
 
     def expr_struct_lit(self, expr: S.StructLit) -> C.Type:
         ref = expr.path.ref
@@ -1237,7 +1234,7 @@ class Infer:
         targs = expr.callee.segments[-1][2]
         if any(args for _, _, args in expr.callee.segments[:-1]):
             fail("builtin namespace does not take type arguments", expr.pos)
-        expected_types = 1 if name == "alloca" else 0
+        expected_types = 1 if name in ("alloca", "sizeof") else 0
         if len(targs) != expected_types:
             fail(f"{name} takes {expected_types} type arguments", expr.pos)
         expr.call = BuiltinCall(name)
@@ -1264,9 +1261,12 @@ class Infer:
                 if not isinstance(prune(operand), C.Never):
                     self.later(operand, known_enum, arg.pos)
                 return C.U32 if lent else C.Tuple((operand, C.U32))
+            case "sizeof":
+                expr.call = TypedBuiltinCall(name, self.type(targs[0]))
+                return C.USIZE
             case "alloca":
                 target = self.type(targs[0])
-                expr.call = AllocaCall(target)
+                expr.call = TypedBuiltinCall(name, target)
                 return C.Ptr(target)
             case "fence":
                 self.check(expr.args[0], C.Named(self.library("Ordering")))

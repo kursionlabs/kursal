@@ -28,7 +28,7 @@ class PrimitiveTypingTests(unittest.TestCase):
 
     def test_product_and_brand_equality_are_rejected(self):
         for declaration in ('fn bad(x: (u32, u32), y: (u32, u32)) -> bool { x == y }',
-                            "forall 'a. fn bad(x: Brand['a], y: Brand['a]) -> bool { x == y }"):
+                            "forall 'a. fn bad(x: core::cap::Brand['a], y: core::cap::Brand['a]) -> bool { x == y }"):
             with self.subTest(declaration=declaration), self.assertRaisesRegex(InferError, 'operator'):
                 self.run_source(declaration + ' fn main() -> i32 { 0i32 }', 0)
 
