@@ -311,6 +311,14 @@ Then, while writing the C (`backend::cgen`, `cgen.py`):
     integer, floating or pointer type; the call lends no local place; and the caller has no
     `alloca`, so no argument can point into the frame the tail call frees. `KUR_MUSTTAIL` is
     `__attribute__((musttail))` under Clang and nothing elsewhere.
+- **Aggregates by pointer.** A value parameter whose C representation is more than two 8-byte words
+  (`Backend::words`, an estimate from the type's structure) is a `T const*`: the caller passes the
+  address of where the value lies, or of a copy of it (see "Why passing aggregates by pointer is
+  sound"), and the callee reads it through the pointer, or copies it into its own variable first
+  where it writes that variable (a call of itself in tail position, a lend in place of a path in
+  it). A function whose address is taken keeps the plain convention for function values: they call
+  its by-value entry (`thunk`), which passes the addresses on. A call through a function value or
+  to a foreign function passes values as before.
 - **`const` and `restrict` place parameters.** A place parameter `&x: T` is a `T*`. When the whole
   program has been written, `qualifiers` makes it `T const*` when the function stores into no path
   under it and lends it only to `const` place parameters, and `T* restrict` when nothing reaches the
@@ -353,6 +361,30 @@ while the call runs (by induction on the calls, from the locals). Where the argu
 
 `const` needs no such argument: it only records that the function's C does not write through the
 pointer, which the checker's place rules let the backend see.
+
+### Why passing aggregates by pointer is sound
+
+A value parameter is a value: the callee must see what the caller passed, unchanged, for the whole
+call, and the caller must see its own values unchanged after it. The callee never writes through the
+pointer (`const`); where it would write the parameter, it copies the value into its own variable at
+entry and writes that. The caller passes the address of where the value lies only when nothing can
+write there while the callee runs:
+
+- a C variable of the caller (its own, or one a value reads in place) is written only by the
+  caller's own code, which is suspended, and lends in place of a path in it are made by the caller
+  alone;
+- a local place of the caller is written only by the caller or through a lend of it, so it is
+  passed when the same call lends no path overlapping it (the escape rule: no other address of it
+  exists); memory under a place parameter may be reached by other pointers, so a value lying there
+  is copied into a temporary first;
+- the pointee of the caller's own by-pointer parameter is, by the same argument one call up,
+  written by nobody while the caller runs, and so while its callee runs.
+
+A function value's C type keeps every value parameter by value, which a call through it, a foreign
+call and a `foreach` mapper's capture assume of their callee only through `request`'s decision; the
+by-value entry of a function whose address is taken copies each argument into its own parameter and
+passes the parameter's address, which nothing else can reach. The tail call `musttail` rule needs
+scalar parameters only, so a callee taking an aggregate is never one.
 
 ### Why reading values where they lie is sound
 

@@ -222,6 +222,34 @@ class SharingTests(unittest.TestCase):
         self.assertEqual(run(c), 3)
 
 
+class ByPointerTests(unittest.TestCase):
+    def test_aggregates_are_passed_by_pointer(self):
+        c = c_of("""
+(type Big (struct (a u64) (b u64) (c u64) (d u64)))
+(fun sum u64 (Big) (entry ((%p Big)) (= (%a %b %c %d) (destruct %p Big)) (= %x (add %a %b)) (= %y (add %c %d))
+  (= %r (add %x %y)) (ret %r)))
+(fun count u64 (Big u64) (entry ((%p Big) (%n u64)) (= %z (const u64 0)) (= %n2 (copy %n)) (= %done (eq %n2 %z))
+  (jnz %done (fin %p) (more %p %n)))
+  (fin ((%q Big)) (= %r (call sum %q)) (ret %r))
+  (more ((%q Big) (%n u64)) (= %one (const u64 1)) (= %m (sub %n %one)) (= %r (call count %q %m)) (ret %r)))
+(fun peek u64 (Big) (entry ((&b Big)) (= %v (load &b)) (= %r (call sum %v)) (ret %r)))
+(fun main i32 () (locals (&x Big))
+  (entry () (= %one (const u64 1)) (= %two (const u64 2)) (= %three (const u64 3)) (= %four (const u64 4))
+    (= %big (construct Big %one %two %three %four)) (= %b1 (copy %big)) (= %b2 (copy %big)) (= %b3 (copy %big))
+    (= %s (call sum %big)) (= %u (store &x %b1)) (= %t (call peek &x)) (= %f (fn sum)) (= %g (call %f %b2))
+    (= %k (const u64 3)) (= %h (call count %b3 %k))
+    (= %st (add %s %t)) (= %gh (add %g %h)) (= %all (add %st %gh)) (= %i (int_cast %all i32)) (ret %i)))""")
+        self.assertRegex(head(c, "sum"), r"^K_Big const\* entry_p\w*$")
+        # `count` calls itself in tail position, assigning its parameter: it reads a copy of it.
+        self.assertRegex(body(c, "count"), r"entry_p\w* = \*entry_p\w*_ref;")
+        self.assertIn("goto L_entry;", body(c, "count"))
+        # A value lying under a place parameter is copied for the callee.
+        self.assertRegex(body(c, "peek"), r"arg_\d+ = \(\*entry_b\w*\);")
+        # A function value calls the by-value entry.
+        self.assertRegex(c, r"static uint64_t \w*sum\w*_value\(K_Big entry_p\w*\) \{\n  return \w*sum\w*\(&entry_p\w*\);")
+        self.assertEqual(run(c), 40)
+
+
 SUM = """
 (fun sum u64 (u64 u64) (entry ((%n u64) (%acc u64)) (= %z (const u64 0)) (= %n2 (copy %n)) (= %done (eq %n2 %z)) (jnz %done (fin %acc) (more %n %acc)))
   (fin ((%a u64)) (ret %a))

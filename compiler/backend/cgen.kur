@@ -548,6 +548,12 @@ exposed struct Backend {
     index: Ref[usize, 'k],
     // what `adapter` found of each function it was asked of
     adapters: ArenaMap[Span['k], Option[(Adapter['k], Fun['k])], 'k],
+    // symbol -> for each of its parameters, whether it takes an aggregate by pointer (`request`)
+    by_ref: ArenaMap[Span['k], ArenaVec[bool, 'k], 'k],
+    // symbol of a function whose address is taken -> its by-value entry (`thunk`)
+    thunks: ArenaMap[Span['k], Span['k], 'k],
+    // the parameters of the function being written read through their pointer
+    deref: Ref[ArenaSet[Span['k], 'k], 'k],
 }
 
 forall 'k.
@@ -674,6 +680,9 @@ impl Backend['k] {
             label: Ref::new(&cx, Span::from_static(&cx, "")),
             index: Ref::new(&cx, 0usize),
             adapters: ArenaMap::new(&cx),
+            by_ref: ArenaMap::new(&cx),
+            thunks: ArenaMap::new(&cx),
+            deref: Ref::new(&cx, ArenaSet::new(&cx)),
         }
     }
 
@@ -1088,7 +1097,74 @@ impl Backend['k] {
         earlier.push(&cx, (args, symbol));
         self.symbol_index.insert(&cx, (key, args), symbol);
         self.queue.push(&cx, (key, fun, sub.clone(&cx), symbol));
+        let refs: ArenaVec[bool, 'k] = ArenaVec::new(&cx);
+        let entry = fun.blocks.at(&cx, 0usize);
+        var r = 0usize;
+        while r < entry.params.len(&cx) {
+            let binding = entry.params.at(&cx, r);
+            refs.push(&cx, !binding.name.starts_with(&cx, Span::from_static(&cx, "&")) && self.words(&cx, subst(&cx, binding.type, sub, self.counter)) > 2usize);
+            r = r + 1usize;
+        }
+        self.by_ref.insert(&cx, symbol, refs);
         symbol
+    }
+
+    // The size of `ty`'s C representation in 8-byte words, as estimated from its structure: a scalar
+    // is a word, an enum its tag and its largest payload (in the niche layout, its payload).
+    fn words(self, &cx: Domain!['k], ty: Type['k]) -> usize {
+        let t = erase(&cx, ty, self.types);
+        if self.types.zero_size(&cx, t) {
+            return 0usize;
+        }
+        match self.types.shape(&cx, t, Option::None) {
+            Type::Struct(fields) => {
+                var total = 0usize;
+                var f = 0usize;
+                while f < fields.len(&cx) {
+                    total = total + self.words(&cx, fields.at(&cx, f).type);
+                    f = f + 1usize;
+                }
+                total
+            },
+            Type::Tuple(elems) => {
+                var total = 0usize;
+                var e = 0usize;
+                while e < elems.len(&cx) {
+                    total = total + self.words(&cx, elems.at(&cx, e));
+                    e = e + 1usize;
+                }
+                total
+            },
+            Type::Array(elem, length) => (length as usize) * self.words(&cx, elem.copy(&cx)),
+            Type::Enum(variants) => match self.types.niche_variant(&cx, variants) {
+                Option::Some(k) => self.words(&cx, variants.at(&cx, k).type),
+                Option::None => {
+                    var most = 0usize;
+                    var v = 0usize;
+                    while v < variants.len(&cx) {
+                        let size = self.words(&cx, variants.at(&cx, v).type);
+                        if size > most {
+                            most = size;
+                        }
+                        v = v + 1usize;
+                    }
+                    1usize + most
+                },
+            },
+            _ => 1usize,
+        }
+    }
+
+    fn takes_by_ref(self, &cx: Domain!['k], symbol: Span['k]) -> bool {
+        let refs = self.by_ref.at(&cx, symbol);
+        var k = 0usize;
+        while k < refs.len(&cx) {
+            if refs.at(&cx, k) {
+                return true;
+            }
+            k = k + 1usize;
+        }
+        false
     }
 
     fn function_name(self, &cx: Domain!['k], path: ArenaVec[Span['k], 'k], identity: Span['k]) -> Span['k] {
@@ -1126,7 +1202,86 @@ impl Backend['k] {
         }
         let symbol = self.request(&cx, FunKey::Function.(name), fun, sub);
         let added = self.address_taken.insert(&cx, symbol);
-        symbol
+        if !self.takes_by_ref(&cx, symbol) {
+            return symbol;
+        }
+        // A function value calls with the plain convention: through an entry taking every value as is.
+        match self.thunks.get(&cx, symbol) {
+            Option::Some(thunk) => thunk,
+            Option::None => {
+                let thunk = allocate(&cx, Buffer::new().push_bytes(&cx, symbol).push_static("_value").save(&cx), self.taken);
+                self.thunks.insert(&cx, symbol, thunk);
+                thunk
+            },
+        }
+    }
+
+    // The head and body of `thunk`, the by-value entry of `symbol` that function values call: it takes
+    // each aggregate `symbol` takes by pointer as a value, and passes its address.
+    fn thunk(self, &cx: Domain!['k], symbol: Span['k], thunk: Span['k]) -> (Span['k], Span['k]) {
+        let (ret, noreturn, cparams) = self.heads.at(&cx, symbol);
+        let refs = self.by_ref.at(&cx, symbol);
+        let params: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let args: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        var k = 0usize;
+        while k < cparams.len(&cx) {
+            let cp = cparams.at(&cx, k);
+            if !cp.ctype.is(&cx, "void") {
+                params.push(&cx, Buffer::new().push_bytes(&cx, cp.ctype).push_static(if cp.place { "*" } else { "" }).push_static(" ").push_bytes(&cx, cp.cname).save(&cx));
+                args.push(&cx, Buffer::new().push_static(if refs.at(&cx, k) { "&" } else { "" }).push_bytes(&cx, cp.cname).save(&cx));
+            }
+            k = k + 1usize;
+        }
+        let call = Buffer::new().push_bytes(&cx, symbol).push_static("(").push_bytes(&cx, args.join(&cx, ", ")).push_static(");").save(&cx);
+        let body = if ret.is(&cx, "void") {
+            Buffer::new().push_static(" {\n  ").push_bytes(&cx, call).push_static("\n}\n").save(&cx)
+        } else {
+            Buffer::new().push_static(" {\n  return ").push_bytes(&cx, call).push_static("\n}\n").save(&cx)
+        };
+        let head = Buffer::new().push_static(if noreturn { "_Noreturn " } else { "" }).push_static("static ").push_bytes(&cx, ret).push_static(" ").push_bytes(&cx, thunk)
+            .push_static("(").push_bytes(&cx, or_void(&cx, params.join(&cx, ", "))).push_static(")").save(&cx);
+        (head, body)
+    }
+
+    // The value parameters the function being written assigns (`written_params` in cgen.py).
+    fn written_params(self, &cx: Domain!['k], fun: Fun['k]) -> ArenaSet[Span['k], 'k] {
+        let plan = self.the_plan(&cx);
+        let out: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+        var b = 0usize;
+        while b < plan.emitted.len(&cx) {
+            let block = plan.emitted.at(&cx, b);
+            if plan.tail_call(&cx, block) {
+                let call = block.instrs.at(&cx, block.instrs.len(&cx) - 1usize);
+                if call.op.is(&cx, "trait_call") || call.args.at(&cx, 0usize).eq(&cx, fun.name) {
+                    let params = fun.blocks.at(&cx, 0usize).params;
+                    var p = 0usize;
+                    while p < params.len(&cx) {
+                        out.insert(&cx, params.at(&cx, p).name);
+                        p = p + 1usize;
+                    }
+                    return out;
+                }
+            }
+            b = b + 1usize;
+        }
+        var i = 0usize;
+        while i < plan.in_place.positions(&cx) {
+            match plan.in_place.key_at(&cx, i) {
+                Option::Some(at) => {
+                    let paths = plan.in_place.at(&cx, at);
+                    var k = 0usize;
+                    while k < paths.len(&cx) {
+                        if paths.at(&cx, k).starts_with(&cx, Span::from_static(&cx, "%")) {
+                            out.insert(&cx, root(&cx, paths.at(&cx, k)));
+                        }
+                        k = k + 1usize;
+                    }
+                },
+                Option::None => (),
+            };
+            i = i + 1usize;
+        }
+        out
     }
 
     fn resolve_trait(self, &cx: Domain!['k], trait_name: Span['k], method: Span['k], tys: ArenaVec[Type['k], 'k]) -> (FunKey['k], Fun['k], ArenaMap[Span['k], Type['k], 'k]) {
@@ -1222,6 +1377,17 @@ impl Backend['k] {
         while !self.queue.is_empty(&cx) {
             let (key, fun, sub, symbol) = self.queue.remove(&cx, 0usize);
             self.emit_function(&cx, key, fun, sub, symbol);
+        }
+        var t = 0usize;
+        while t < self.thunks.positions(&cx) {
+            match self.thunks.key_at(&cx, t) {
+                Option::Some(symbol) => {
+                    let (head, body) = self.thunk(&cx, symbol, self.thunks.at(&cx, symbol));
+                    self.emitted.push(&cx, (Option::None, head, body));
+                },
+                Option::None => (),
+            };
+            t = t + 1usize;
         }
         let datas: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         let entries = self.datas.values(&cx);
@@ -1460,6 +1626,13 @@ impl Backend['k] {
         let place_c: ArenaMap[Span['k], Span['k], 'k] = ArenaMap::new(&cx);
         self.place_c.set(&cx, place_c);
         let cparams: ArenaVec[CParam['k], 'k] = ArenaVec::new(&cx);
+        // The parameters taken by pointer: read through it, or copied into the parameter's variable
+        // where the function writes that (a call of itself in tail position, or a lend in place).
+        let written = self.written_params(&cx, fun);
+        let deref: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+        self.deref.set(&cx, deref);
+        let prologue: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let refs = self.by_ref.at(&cx, symbol);
         var p = 0usize;
         while p < entry.params.len(&cx) {
             let binding = entry.params.at(&cx, p);
@@ -1469,10 +1642,17 @@ impl Backend['k] {
                 cparams.push(&cx, CParam.{ ctype, cname: Span::from_static(&cx, ""), place });
             } else {
                 let cname = self.cname(&cx, entry.label, binding.name);
+                var passed = cname;
                 if place {
                     place_c.insert(&cx, binding.name, Buffer::new().push_static("(*").push_bytes(&cx, cname).push_static(")").save(&cx));
+                } else if refs.at(&cx, p) && written.contains(&cx, binding.name) {
+                    passed = allocate(&cx, Buffer::new().push_bytes(&cx, cname).push_static("_ref").save(&cx), self.taken);
+                    decls.push(&cx, Buffer::new().push_bytes(&cx, ctype).push_static(" ").push_bytes(&cx, cname).push_static(";").save(&cx));
+                    prologue.push(&cx, Buffer::new().push_bytes(&cx, cname).push_static(" = *").push_bytes(&cx, passed).push_static(";").save(&cx));
+                } else if refs.at(&cx, p) {
+                    deref.insert(&cx, binding.name);
                 }
-                cparams.push(&cx, CParam.{ ctype, cname, place });
+                cparams.push(&cx, CParam.{ ctype, cname: passed, place });
             }
             p = p + 1usize;
         }
@@ -1535,6 +1715,11 @@ impl Backend['k] {
         self.blocks.set(&cx, blocks);
         // The lines of the body, after the declarations that emitting them may add to.
         var lines = Buffer::new();
+        var pr = 0usize;
+        while pr < prologue.len(&cx) {
+            line(&lines, Buffer::new().push_bytes(&cx, prologue.at(&cx, pr)));
+            pr = pr + 1usize;
+        }
         var e = 0usize;
         while e < plan.emitted.len(&cx) {
             let block = plan.emitted.at(&cx, e);
@@ -2020,6 +2205,8 @@ impl Backend['k] {
                     if restrict_params.contains(&cx, (symbol, k)) {
                         t = t.push_static(" restrict");
                     }
+                } else if self.by_ref.at(&cx, symbol).at(&cx, k) {
+                    t = t.push_static(" const*");
                 }
                 params.push(&cx, t.push_static(" ").push_bytes(&cx, cp.cname).save(&cx));
             }
@@ -2068,6 +2255,9 @@ impl Backend['k] {
     fn value_name(self, &cx: Domain!['k], name: Span['k]) -> Span['k] {
         let plan = self.the_plan(&cx);
         let key = (self.label.copy(&cx), name);
+        if !plan.resident.contains(&cx, key) && self.deref.copy(&cx).contains(&cx, name) && self.label.copy(&cx).eq(&cx, self.fun_entry_label(&cx)) {
+            return Buffer::new().push_static("(*").push_bytes(&cx, self.cname(&cx, self.label.copy(&cx), name)).push_static(")").save(&cx);
+        }
         if !plan.moved.contains(&cx, key) {
             return match self.aliases.copy(&cx).get(&cx, key) {
                 Option::Some(alias) => alias,
@@ -2654,13 +2844,13 @@ impl Backend['k] {
                 _ => fail_text(&cx, Span::from_static(&cx, "internal error: a call of a value that is not a function")),
             };
             self.lend(&cx, Option::None, instr.args.skip(&cx, 1usize));
-            self.emit_call(&cx, &lines, instr, self.value_name(&cx, callee), ret, ArenaMap::new(&cx), instr.args.skip(&cx, 1usize));
+            self.emit_call(&cx, &lines, instr, self.value_name(&cx, callee), ret, ArenaMap::new(&cx), instr.args.skip(&cx, 1usize), ArenaVec::new(&cx));
         } else if self.program.externs.contains(&cx, callee) {
             let ret = match self.program.externs.at(&cx, callee).ret {
                 Option::Some(r) => r,
                 Option::None => fail_text(&cx, Span::from_static(&cx, "internal error: an extern without a type")),
             };
-            self.emit_call(&cx, &lines, instr, callee, ret, ArenaMap::new(&cx), instr.args.skip(&cx, 1usize));
+            self.emit_call(&cx, &lines, instr, callee, ret, ArenaMap::new(&cx), instr.args.skip(&cx, 1usize), ArenaVec::new(&cx));
         } else {
             let fun = self.program.funs.at(&cx, callee);
             let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
@@ -2671,7 +2861,7 @@ impl Backend['k] {
             }
             let symbol = self.request(&cx, FunKey::Function.(callee), fun, sub);
             self.lend(&cx, Option::Some.(symbol), instr.args.skip(&cx, 1usize));
-            self.emit_call(&cx, &lines, instr, symbol, fun.ret, sub, instr.args.skip(&cx, 1usize));
+            self.emit_call(&cx, &lines, instr, symbol, fun.ret, sub, instr.args.skip(&cx, 1usize), self.by_ref.at(&cx, symbol));
         }
     }
 
@@ -2686,7 +2876,7 @@ impl Backend['k] {
         let (key, fun, sub) = self.resolve_trait(&cx, a.at(&cx, 0usize), a.at(&cx, 1usize), tys);
         let symbol = self.request(&cx, key, fun, sub);
         self.lend(&cx, Option::Some.(symbol), a.skip(&cx, 2usize));
-        self.emit_call(&cx, &lines, instr, symbol, fun.ret, sub, a.skip(&cx, 2usize));
+        self.emit_call(&cx, &lines, instr, symbol, fun.ret, sub, a.skip(&cx, 2usize), self.by_ref.at(&cx, symbol));
     }
 
     // A lend adapter's call (`Plan::residences`) as its own call, lending the callee the places
@@ -2796,20 +2986,49 @@ impl Backend['k] {
     }
 
     // The C arguments of a call: those that pass something.
-    fn operands(self, &cx: Domain!['k], args: ArenaVec[Span['k], 'k]) -> Span['k] {
+    fn operands(self, &cx: Domain!['k], &lines: Buffer!, args: ArenaVec[Span['k], 'k], refs: ArenaVec[bool, 'k]) -> Span['k] {
         let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < args.len(&cx) {
             if !self.erased_arg(&cx, args.at(&cx, i)) {
-                out.push(&cx, self.operand(&cx, args.at(&cx, i)));
+                if i < refs.len(&cx) && refs.at(&cx, i) {
+                    out.push(&cx, self.by_address(&cx, &lines, args.at(&cx, i), args));
+                } else {
+                    out.push(&cx, self.operand(&cx, args.at(&cx, i)));
+                }
             }
             i = i + 1usize;
         }
         out.join(&cx, ", ")
     }
 
-    fn emit_call(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k], callee: Span['k], ret: Type['k], sub: ArenaMap[Span['k], Type['k], 'k], args: ArenaVec[Span['k], 'k]) {
-        let call = Buffer::new().push_bytes(&cx, callee).push_static("(").push_bytes(&cx, self.operands(&cx, args)).push_static(")").save(&cx);
+    // The address of the value `arg` for a callee that reads it through a pointer (`by_address` in
+    // cgen.py).
+    fn by_address(self, &cx: Domain!['k], &lines: Buffer!, arg: Span['k], args: ArenaVec[Span['k], 'k]) -> Span['k] {
+        let expr = self.value_name(&cx, arg);
+        let path = self.the_plan(&cx).resident.get_or(&cx, (self.label.copy(&cx), arg), Span::from_static(&cx, ""));
+        var unsafe_spot = false;
+        if path.starts_with(&cx, Span::from_static(&cx, "&")) {
+            unsafe_spot = self.param_index(&cx, root(&cx, path)).is_some();
+            var g = 0usize;
+            while !unsafe_spot && g < args.len(&cx) {
+                unsafe_spot = is_place(&cx, args.at(&cx, g)) && overlap(&cx, args.at(&cx, g), path);
+                g = g + 1usize;
+            }
+        }
+        if !unsafe_spot {
+            return Buffer::new().push_static("&").push_bytes(&cx, expr).save(&cx);
+        }
+        let copy = allocate(&cx, Buffer::new().push_static("arg_").push_usize(self.scratch.copy(&cx)).save(&cx), self.taken);
+        self.scratch.set(&cx, self.scratch.copy(&cx) + 1usize);
+        self.temps.copy(&cx).push(&cx, Buffer::new().push_bytes(&cx, self.c(&cx, self.type_of(&cx, arg))).push_static(" ").push_bytes(&cx, copy).push_static(";").save(&cx));
+        line(&lines, Buffer::new().push_bytes(&cx, copy).push_static(" = ").push_bytes(&cx, expr).push_static(";"));
+        Buffer::new().push_static("&").push_bytes(&cx, copy).save(&cx)
+    }
+
+    fn emit_call(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k], callee: Span['k], ret: Type['k], sub: ArenaMap[Span['k], Type['k], 'k], args: ArenaVec[Span['k], 'k],
+        refs: ArenaVec[bool, 'k]) {
+        let call = Buffer::new().push_bytes(&cx, callee).push_static("(").push_bytes(&cx, self.operands(&cx, &lines, args, refs)).push_static(")").save(&cx);
         if self.erased(&cx, subst(&cx, ret, sub, self.counter)) || !self.is_live(&cx, instr.lhs.at(&cx, 0usize)) {
             line(&lines, Buffer::new().push_bytes(&cx, call).push_static(";"));
         } else {
@@ -2912,11 +3131,17 @@ impl Backend['k] {
         if mapper.params.len(&cx) != binders.len(&cx) + own.len(&cx) {
             fail_at(&cx, Span::from_static(&cx, "foreach mapper parameter partition disagrees"), instr.pos);
         }
+        // A captured value the mapper takes by pointer (an aggregate of more than two words, as
+        // `request` decides for its parameter of that type) is passed by its address.
         let caps: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         var c = 2usize;
         while c < instr.args.len(&cx) {
             if !self.value_erased(&cx, instr.args.at(&cx, c)) {
-                caps.push(&cx, self.value_name(&cx, instr.args.at(&cx, c)));
+                if self.words(&cx, self.type_of(&cx, instr.args.at(&cx, c))) > 2usize {
+                    caps.push(&cx, self.by_address(&cx, &lines, instr.args.at(&cx, c), ArenaVec::new(&cx)));
+                } else {
+                    caps.push(&cx, self.value_name(&cx, instr.args.at(&cx, c)));
+                }
             }
             c = c + 1usize;
         }
@@ -3316,7 +3541,7 @@ impl Backend['k] {
             return false;
         }
         self.lend(&cx, Option::Some.(symbol), args);
-        line(&lines, Buffer::new().push_static("KUR_MUSTTAIL return ").push_bytes(&cx, symbol).push_static("(").push_bytes(&cx, self.operands(&cx, args)).push_static(");"));
+        line(&lines, Buffer::new().push_static("KUR_MUSTTAIL return ").push_bytes(&cx, symbol).push_static("(").push_bytes(&cx, self.operands(&cx, &lines, args, ArenaVec::new(&cx))).push_static(");"));
         true
     }
 
@@ -3431,12 +3656,17 @@ impl Walk['k] {
             sub.insert(&cx, self.mapper.params.at(&cx, j).name, self.own.at(&cx, j - self.binders.len(&cx)));
             j = j + 1usize;
         }
+        let symbol = self.backend.request(&cx, FunKey::Function.(self.mapper_name), self.mapper, sub);
         let arguments: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         if self.pointer || !self.backend.erased(&cx, row.item) {
-            arguments.push(&cx, component);
+            if self.backend.by_ref.at(&cx, symbol).at(&cx, 0usize) {
+                arguments.push(&cx, Buffer::new().push_static("&").push_bytes(&cx, component).save(&cx));
+            } else {
+                arguments.push(&cx, component);
+            }
         }
         arguments.append(&cx, self.caps);
-        Buffer::new().push_bytes(&cx, self.backend.request(&cx, FunKey::Function.(self.mapper_name), self.mapper, sub)).push_static("(").push_bytes(&cx, arguments.join(&cx, ", ")).push_static(")").save(&cx)
+        Buffer::new().push_bytes(&cx, symbol).push_static("(").push_bytes(&cx, arguments.join(&cx, ", ")).push_static(")").save(&cx)
     }
 }
 

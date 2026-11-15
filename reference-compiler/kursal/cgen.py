@@ -16,7 +16,8 @@ payload with a niche, the other variant a null there (`niche_layout`, `tag`, `pa
 
 What a function's C leaves out (dead values, copies, forwarded places, return joins) and where it
 reads values where they lie (residences, lend adapters in place) is decided by plan.py, after local
-places that only hold what was moved out of another place are given its storage (`homes`). Beyond that
+places that only hold what was moved out of another place are given its storage (`homes`). A value
+parameter of more than two words is taken by pointer (`by_ref`, `by_address`, `thunk`). Beyond that
 the backend makes calls in tail position jumps (`tail_call`), and qualifies place parameters `const`
 and `restrict` where the whole program allows it (`qualifiers`)."""
 
@@ -160,6 +161,10 @@ class Backend:
         self.address_taken: set[str] = set()
         self.looping: set[str] = set()     # functions whose tail call to themselves moves a place parameter
         self.adapters: dict[str, Optional[tuple[Adapter, Fun]]] = {}  # lend adapters by name (`adapter`)
+        # symbol -> for each of its parameters, whether it takes an aggregate by pointer (`by_ref`)
+        self.by_ref: dict[str, tuple[bool, ...]] = {}
+        # symbol of a function whose address is taken -> its by-value entry (`thunk`)
+        self.thunks: dict[str, str] = {}
         self.datas: dict[str, tuple[str, Data]] = {}
         # One conservative pool for ordinary identifiers, including function
         # locals: later global declarations must not be shadowed by earlier locals.
@@ -346,7 +351,29 @@ class Backend:
                                                   *(type_key(t) for t in args))))
         self.symbols.setdefault(id(fun), []).append((args, symbol))
         self.queue.append((fun, dict(sub), symbol))
+        self.by_ref[symbol] = tuple(not name.startswith("&") and self.words(subst(ty, sub)) > 2
+                                    for name, ty in fun.blocks[0].params)
         return symbol
+
+    def words(self, ty: Type) -> int:
+        """The size of `ty`'s C representation in 8-byte words, as estimated from its structure: a
+        scalar is a word, an enum its tag and its largest payload (in the niche layout, its payload)."""
+        t = erase(ty, self.types)
+        if self.types.zero_size(t):
+            return 0
+        s = self.types.shape(t)
+        if isinstance(s, Struct):
+            return sum(self.words(f) for _, f in s.fields)
+        if isinstance(s, Tuple):
+            return sum(self.words(e) for e in s.elems)
+        if isinstance(s, Array):
+            return s.length * self.words(s.elem)
+        if isinstance(s, Enum):
+            k = self.types.niche_variant(s.variants)
+            if k is not None:
+                return self.words(s.variants[k][1])
+            return 1 + max((self.words(payload) for _, payload in s.variants), default=0)
+        return 1
 
     def function_name(self, path: tuple[str, ...], identity: str) -> str:
         salt = 0
@@ -367,7 +394,12 @@ class Backend:
                else self.substitute_type(t) for k, (p, t) in enumerate(zip(fun.params, instr.tys))}
         symbol = self.request(fun, sub)
         self.address_taken.add(symbol)
-        return symbol
+        if not any(self.by_ref[symbol]):
+            return symbol
+        # A function value calls with the plain convention: through an entry taking every value as is.
+        if symbol not in self.thunks:
+            self.thunks[symbol] = allocate(f"{symbol}_value", self.taken)
+        return self.thunks[symbol]
 
     def resolve_trait(self, trait_name: str, method: str, tys: tuple[Type, ...]) -> tuple[Fun, dict[str, Type]]:
         # Checking already discharged authority at the use site. Specialization
@@ -414,6 +446,8 @@ class Backend:
                     self.request(fun, {})
         while self.queue:
             self.emit_function(*self.queue.pop(0))
+        for symbol, thunk in self.thunks.items():
+            self.emitted.append((None, *self.thunk(symbol, thunk)))
         datas = [self.emit_data(d) for d in self.datas.values()]
         while self.pending:
             self.define(next(iter(self.pending)))
@@ -519,7 +553,12 @@ class Backend:
         self.params = [name for name, _ in entry.params]
         self.place_c: dict[str, str] = {}
         cparams = []
-        for name, ty in entry.params:
+        # The parameters taken by pointer: read through it, or copied into the parameter's variable
+        # where the function writes that (a call of itself in tail position, or a lend in place).
+        written = self.written_params(fun)
+        self.deref: set[str] = set()
+        prologue: list[str] = []
+        for k, (name, ty) in enumerate(entry.params):
             ctype = self.ctype(substitute_type(ty))
             if ctype == "void":
                 cparams.append((ctype, "", name.startswith("&")))
@@ -527,6 +566,13 @@ class Backend:
             cname = self.cname(entry.label, name)
             if name.startswith("&"):
                 self.place_c[name] = f"(*{cname})"
+            elif self.by_ref[symbol][k] and name in written:
+                pointer = allocate(f"{cname}_ref", self.taken)
+                decls.append(f"{ctype} {cname};")
+                prologue.append(f"{cname} = *{pointer};")
+                cname = pointer
+            elif self.by_ref[symbol][k]:
+                self.deref.add(name)
             cparams.append((ctype, cname, name.startswith("&")))
         ret_type = substitute_type(fun.ret)
         self.heads[symbol] = (self.ctype(ret_type), isinstance(ret_type, Never), cparams)
@@ -545,6 +591,7 @@ class Backend:
                 continue
             values.append((label, name, ty, self.cname(label, name)))
         self.blocks = {b.label: b for b in fun.blocks}
+        self.lines.extend(prologue)
         for block in self.plan.emitted:
             self.label = block.label
             self.line(f"{self.labels[block.label]}: ;")
@@ -715,6 +762,31 @@ class Backend:
                 self.adapters[name] = (Adapter(borrowed, True), fun)
         return self.adapters[name]
 
+    def written_params(self, fun: Fun) -> set[str]:
+        """The value parameters the function being written assigns: every one where it may call itself
+        in tail position (the call assigns the parameters and runs the entry block again), and those
+        holding a path a lend in place lends."""
+        plan = self.plan
+        for block in plan.emitted:
+            call = plan.tail_call(block)
+            if call is not None and (call.op == "trait_call" or call.args[0] == fun.name):
+                return {name for name, _ in fun.blocks[0].params}
+        return {root(path) for paths in plan.in_place.values() for path in paths if path.startswith("%")}
+
+    def thunk(self, symbol: str, thunk: str) -> tuple[str, str]:
+        """The head and body of `thunk`, the by-value entry of `symbol` that function values call: it
+        takes each aggregate `symbol` takes by pointer as a value, and passes its address."""
+        ret, noreturn, cparams = self.heads[symbol]
+        params, args = [], []
+        for k, (ctype, cname, place) in enumerate(cparams):
+            if ctype == "void":
+                continue
+            params.append(f"{ctype}{'*' if place else ''} {cname}")
+            args.append(f"&{cname}" if self.by_ref[symbol][k] else cname)
+        call = f"{symbol}({', '.join(args)});"
+        body = f" {{\n  {call}\n}}\n" if ret == "void" else f" {{\n  return {call}\n}}\n"
+        return f"{'_Noreturn ' if noreturn else ''}static {ret} {thunk}({', '.join(params) or 'void'})", body
+
     def head(self, symbol: str, const: set[tuple[str, int]], restrict: set[tuple[str, int]]) -> str:
         """A function's head, with its place parameters qualified as `qualifiers` allows."""
         ret, noreturn, cparams = self.heads[symbol]
@@ -724,6 +796,8 @@ class Backend:
                 continue
             if place:
                 ctype += (" const" if (symbol, k) in const else "") + "*" + (" restrict" if (symbol, k) in restrict else "")
+            elif self.by_ref[symbol][k]:
+                ctype += " const*"
             params.append(f"{ctype} {cname}")
         return f"{'_Noreturn ' if noreturn else ''}static {ret} {symbol}({', '.join(params) or 'void'})"
 
@@ -743,6 +817,8 @@ class Backend:
         key = (self.label, name)
         if key in self.plan.resident:
             return self.place(self.plan.resident[key])[0]
+        if self.label == self.fun.blocks[0].label and name in self.deref:
+            return f"(*{self.cname(self.label, name)})"
         if key in self.plan.shared:
             return self.cname(*self.plan.shared[key])
         if key in self.plan.arrived:
@@ -1060,14 +1136,14 @@ class Backend:
             sub = {p.name: substitute_type(t) for p, t in zip(fun.params, instr.tys)}
             symbol = self.request(fun, sub)
             self.lend(symbol, instr.args[1:])
-            self.emit_call(instr, symbol, fun.ret, sub, instr.args[1:])
+            self.emit_call(instr, symbol, fun.ret, sub, instr.args[1:], self.by_ref[symbol])
 
     def trait_call(self, instr: Instr) -> None:
         a = instr.args
         fun, sub = self.resolve_trait(a[0], a[1], tuple(self.substitute_type(t) for t in instr.tys))
         symbol = self.request(fun, sub)
         self.lend(symbol, a[2:])
-        self.emit_call(instr, symbol, fun.ret, sub, a[2:])
+        self.emit_call(instr, symbol, fun.ret, sub, a[2:], self.by_ref[symbol])
 
     def lend_in_place(self, instr: Instr, paths: tuple[str, ...]) -> None:
         """A lend adapter's call (`Plan.residences`) as its own call, lending the callee the places
@@ -1111,12 +1187,31 @@ class Backend:
                 self.written.add((self.symbol, self.params.index(root(target))))
             self.line(f"{dst}.{member} = {self.value_name(arg)};")
 
-    def operands(self, args: Sequence[str]) -> str:
-        """The C arguments of a call: those that pass something."""
-        return ", ".join(self.operand(a) for a in args if not self.erased_arg(a))
+    def operands(self, args: Sequence[str], refs: Sequence[bool] = ()) -> str:
+        """The C arguments of a call: those that pass something; an aggregate the callee takes by
+        pointer (`refs`) as the address of where it lies (`by_address`)."""
+        return ", ".join(self.by_address(a, args) if k < len(refs) and refs[k] else self.operand(a)
+                         for k, a in enumerate(args) if not self.erased_arg(a))
 
-    def emit_call(self, instr: Instr, callee: str, ret: Type, sub: Mapping[str, Type], args: tuple[str, ...]) -> None:
-        call = f"{callee}({self.operands(args)})"
+    def by_address(self, arg: str, args: Sequence[str]) -> str:
+        """The address of the value `arg` for a callee that reads it through a pointer: where it lies,
+        when nothing can write there while the callee runs, else a copy of it. A C variable is written by
+        its own function alone, which is suspended; a local place by its function or a lend of it, so
+        not one the same call lends; memory under a place parameter is copied."""
+        expr = self.value_name(arg)
+        path = self.plan.resident.get((self.label, arg), "")
+        if path.startswith("&") and (root(path) in self.params or
+                                     any(a.startswith("&") and not a.startswith("&*") and overlap(a, path) for a in args)):
+            copy = allocate(f"arg_{self.scratch}", self.taken)
+            self.scratch += 1
+            self.temps.append(f"{self.ctype(self.type_of(arg))} {copy};")
+            self.line(f"{copy} = {expr};")
+            return f"&{copy}"
+        return f"&{expr}"
+
+    def emit_call(self, instr: Instr, callee: str, ret: Type, sub: Mapping[str, Type], args: tuple[str, ...],
+                  refs: Sequence[bool] = ()) -> None:
+        call = f"{callee}({self.operands(args, refs)})"
         if self.erased(subst(ret, sub)) or not self.is_live(instr.lhs[0]):
             self.line(f"{call};")
         else:
@@ -1186,7 +1281,10 @@ class Backend:
         own = [self.substitute_type(x) for x in instr.tys]
         if len(mapper.params) != len(binders) + len(own):
             raise KursError("foreach mapper parameter partition disagrees", instr.pos)
-        caps = [self.value_name(c) for c in instr.args[2:] if not self.erased(self.type_of(c))]
+        # A captured value the mapper takes by pointer (an aggregate of more than two words, as `by_ref`
+        # decides for its parameter of that type) is passed by its address.
+        caps = [self.by_address(c, ()) if self.words(self.type_of(c)) > 2 else self.value_name(c)
+                for c in instr.args[2:] if not self.erased(self.type_of(c))]
         skeleton, rows = self.types.rows(t.source)
         pointer = isinstance(self.shape(t.source), Ptr) and not isinstance(t.source, Foreach)
         out_shape = self.shape(t)
@@ -1196,8 +1294,10 @@ class Backend:
             bound = self.types.bind(t, item, extra)
             sub = {p.name: bound[b] for p, b in zip(mapper.params, binders)}
             sub.update(zip((p.name for p in mapper.params[len(binders):]), own))
-            arguments = ([] if not pointer and self.erased(item) else [component]) + caps
-            return f"{self.request(mapper, sub)}({', '.join(arguments)})"
+            symbol = self.request(mapper, sub)
+            passed = f"&{component}" if self.by_ref[symbol][0] else component
+            arguments = ([] if not pointer and self.erased(item) else [passed]) + caps
+            return f"{symbol}({', '.join(arguments)})"
 
         def assign(target: str, result: Type, call: str) -> str:
             return f"{call};" if self.erased(result) else f"{target} = {call};"
