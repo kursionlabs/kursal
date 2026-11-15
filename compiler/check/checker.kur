@@ -154,17 +154,24 @@ fn overlap(&cx: Domain!['k], path: Span['k], other_path: Span['k]) -> bool {
     prefix(&cx, path, other_path) || prefix(&cx, other_path, path)
 }
 
-// Some path of `paths` is `path` or an ancestor of it.
+// Some path of `paths` is `path` or an ancestor of it: `paths.any(|z| prefix(z, path))`, answered
+// by looking up `path` and each of its ancestors rather than by scanning the set.
 forall 'k.
-fn any_prefix(&cx: Domain!['k], paths: ArenaVec[Span['k], 'k], path: Span['k]) -> bool {
-    var i = 0usize;
-    while i < paths.len(&cx) {
-        if prefix(&cx, paths.at(&cx, i), path) {
-            return true;
-        }
-        i = i + 1usize;
+fn ancestor_in(&cx: Domain!['k], paths: ArenaSet[Span['k], 'k], path: Span['k]) -> bool {
+    if paths.is_empty(&cx) {
+        return false;
     }
-    false
+    var found = false;
+    var dot = path.find_byte(&cx, b'.', 0usize);
+    while !found && dot.is_some() {
+        let at = match dot {
+            Option::Some(i) => i,
+            Option::None => path.len(),
+        };
+        found = paths.contains(&cx, path.slice(0usize, at));
+        dot = path.find_byte(&cx, b'.', at + 1usize);
+    }
+    found || paths.contains(&cx, path)
 }
 
 forall 'k.
@@ -337,12 +344,14 @@ impl Places['k] {
         Places.{ empty: self.empty.clone(&cx), known: self.known.clone(&cx), opened: self.opened.clone(&cx) }
     }
 
+    // Some empty path is `path` or an ancestor of it.
     fn covered(self, &cx: Domain!['k], path: Span['k]) -> bool {
-        self.empty.any(&cx, |&cx, z: Span['k]| prefix(&cx, z, path))
+        ancestor_in(&cx, self.empty, path)
     }
 
+    // No empty path is `path`, an ancestor or a descendant of it.
     fn full(self, &cx: Domain!['k], path: Span['k]) -> bool {
-        !self.empty.any(&cx, |&cx, z: Span['k]| overlap(&cx, z, path))
+        !self.covered(&cx, path) && !self.empty.any(&cx, |&cx, z: Span['k]| prefix(&cx, path, z))
     }
 
     fn forget(self, &cx: Domain!['k], path: Span['k], keep_own_view: bool) {
@@ -409,6 +418,29 @@ impl Places['k] {
     }
 }
 
+// What `storage_fact` found of a path: its stored type, whether that is Copy when it is known, and
+// whether the path is kept in `PathFacts.stored`.
+forall 'k.
+exposed struct Stored {
+    type: Type['k],
+    copy: Option[bool],
+    kept: bool,
+}
+
+// What the checker knows of the paths of the function it checks or plans, under its roots and
+// kinds maps, by their identities: made again when either changes.
+forall 'k.
+exposed struct PathFacts {
+    roots: usize,
+    kinds: usize,
+    // path -> its stored type, and whether that is Copy once asked, for a path no state decides
+    stored: ArenaMap[Span['k], (Type['k], Option[bool]), 'k],
+    // block label -> the paths it declares empty, as a set
+    empty_sets: ArenaMap[Span['k], ArenaSet[Span['k], 'k], 'k],
+    // block label -> the paths it declares empty that `Checker::empty_to_check` gives
+    linear_empty: ArenaMap[Span['k], ArenaVec[Span['k], 'k], 'k],
+}
+
 // (param types, result, unsafe, place indices) of a call's callee.
 forall 'k.
 exposed struct Signature {
@@ -444,6 +476,8 @@ exposed struct Checker {
     param_roots: Ref[ArenaSet[Span['k], 'k], 'k],
     // the free brands of each root's type, as `edge` asks for them
     root_brand_cache: Ref[ArenaMap[Span['k], ArenaSet[Span['k], 'k], 'k], 'k],
+    // what is known of paths under the current roots and kinds
+    facts: Ref[PathFacts['k], 'k],
     label: Ref[Span['k], 'k],
     env: Ref[ArenaMap[Span['k], Type['k], 'k], 'k],
     used: Ref[ArenaSet[Span['k], 'k], 'k],
@@ -536,6 +570,7 @@ impl Checker['k] {
             roots: Ref::new(&cx, ArenaMap::new(&cx)),
             param_roots: Ref::new(&cx, ArenaSet::new(&cx)),
             root_brand_cache: Ref::new(&cx, ArenaMap::new(&cx)),
+            facts: Ref::new(&cx, PathFacts.{ roots: 0usize, kinds: 0usize, stored: ArenaMap::new(&cx), empty_sets: ArenaMap::new(&cx), linear_empty: ArenaMap::new(&cx) }),
             label: Ref::new(&cx, Span::from_static(&cx, "")),
             env: Ref::new(&cx, ArenaMap::new(&cx)),
             used: Ref::new(&cx, ArenaSet::new(&cx)),
@@ -1009,6 +1044,19 @@ impl Checker['k] {
         }
     }
 
+    // The empty paths `block` declares, as a set, made once per function.
+    fn empty_set(self, &cx: Domain!['k], block: Block['k]) -> ArenaSet[Span['k], 'k] {
+        let cache = self.path_facts(&cx).empty_sets;
+        match cache.get(&cx, block.label) {
+            Option::Some(set) => set,
+            Option::None => {
+                let set = texts_set(&cx, block.empty);
+                cache.insert(&cx, block.label, set);
+                set
+            },
+        }
+    }
+
     fn copy_type(self, &cx: Domain!['k], ty: Type['k]) -> bool {
         let kinds = self.kinds.copy(&cx);
         let identity = kinds.address();
@@ -1081,8 +1129,107 @@ impl Checker['k] {
         self.place_view(&cx, path, stored)
     }
 
+    // The path facts of the current roots and kinds, made afresh when either map changes.
+    fn path_facts(self, &cx: Domain!['k]) -> PathFacts['k] {
+        let roots = self.roots.copy(&cx).address();
+        let kinds = self.kinds.copy(&cx).address();
+        let facts = self.facts.copy(&cx);
+        if facts.roots == roots && facts.kinds == kinds {
+            return facts;
+        }
+        let fresh = PathFacts.{ roots, kinds, stored: ArenaMap::new(&cx), empty_sets: ArenaMap::new(&cx), linear_empty: ArenaMap::new(&cx) };
+        self.facts.set(&cx, fresh);
+        fresh
+    }
+
     // The final slot's stored type, applying views only to its ancestors.
     fn place_storage(self, &cx: Domain!['k], path: Span['k]) -> Result[Type['k], Slice[u8, 'static]] {
+        let found = self.storage_fact(&cx, path)?;
+        Result::Ok.(found.type)
+    }
+
+    // `place_storage`, with what is known of the type. A path that no place state decides (no view
+    // is open, and no enum is on the way) is kept in `stored` once finding it drew no fresh name,
+    // and answered from there while no view is open.
+    fn storage_fact(self, &cx: Domain!['k], path: Span['k]) -> Result[Stored['k], Slice[u8, 'static]] {
+        let stateless = self.places.copy(&cx).opened.is_empty(&cx);
+        let stored = self.path_facts(&cx).stored;
+        if stateless {
+            match stored.get(&cx, path) {
+                Option::Some(fact) => {
+                    let (ty, copy) = fact;
+                    return Result::Ok.(Stored.{ type: ty, copy, kept: true });
+                },
+                Option::None => (),
+            };
+        }
+        let before = self.counter.next.copy(&cx);
+        let (ty, decided) = self.find_storage(&cx, path)?;
+        let kept = stateless && !decided && self.counter.next.copy(&cx) == before;
+        if kept {
+            stored.insert(&cx, path, (ty, Option::None));
+        }
+        Result::Ok.(Stored.{ type: ty, copy: Option::None, kept })
+    }
+
+    // Whether the stored type `found` of `path` is Copy, kept with it where it is kept.
+    fn storage_copy(self, &cx: Domain!['k], path: Span['k], found: Stored['k]) -> bool {
+        match found.copy {
+            Option::Some(answer) => answer,
+            Option::None => {
+                let answer = self.copy_type(&cx, found.type);
+                if found.kept {
+                    self.path_facts(&cx).stored.insert(&cx, path, (found.type, Option::Some.(answer)));
+                }
+                answer
+            },
+        }
+    }
+
+    // `discardable(path, place_storage(path))`, stopping at the first failure of either.
+    fn storage_discardable(self, &cx: Domain!['k], path: Span['k]) -> Result[bool, Slice[u8, 'static]] {
+        let (result, always) = self.empty_discardable(&cx, path);
+        result
+    }
+
+    // `storage_discardable`, and whether `path` holds no linear contents in every state of the
+    // function while no view is open: no state decides its stored type, and that type is Copy.
+    fn empty_discardable(self, &cx: Domain!['k], path: Span['k]) -> (Result[bool, Slice[u8, 'static]], bool) {
+        match self.storage_fact(&cx, path) {
+            Result::Ok(found) => {
+                let copy = self.storage_copy(&cx, path, found);
+                (self.discardable_with(&cx, path, found.type, copy), copy && found.kept)
+            },
+            Result::Err(message) => (Result::Err.(message), false),
+        }
+    }
+
+    // The paths `block` declares empty that an edge into it must show hold no linear contents, in
+    // order: all of them, or, once an edge has found them while no view was open, those of them
+    // `empty_discardable` does not answer for every state. The others answer `Ok(true)` with
+    // nothing found or drawn, so leaving them out changes nothing.
+    fn empty_to_check(self, &cx: Domain!['k], block: Block['k]) -> ArenaVec[Span['k], 'k] {
+        if self.places.copy(&cx).opened.is_empty(&cx) {
+            match self.path_facts(&cx).linear_empty.get(&cx, block.label) {
+                Option::Some(paths) => return paths,
+                Option::None => (),
+            };
+        }
+        block.empty
+    }
+
+    // Records what one edge into `block` found of the paths `empty_to_check` gave: `rest` are
+    // those not answered for every state. Kept only when the edge checked all of `block.empty`
+    // with no view open.
+    fn checked_empty(self, &cx: Domain!['k], block: Block['k], checked: ArenaVec[Span['k], 'k], rest: ArenaVec[Span['k], 'k]) {
+        if checked.address() == block.empty.address() && rest.address() != checked.address() && self.places.copy(&cx).opened.is_empty(&cx) {
+            self.path_facts(&cx).linear_empty.insert(&cx, block.label, rest);
+        }
+    }
+
+    // The stored type of `path`, and whether the place state decided it: a known variant chose an
+    // enum's component on the way.
+    fn find_storage(self, &cx: Domain!['k], path: Span['k]) -> Result[(Type['k], bool), Slice[u8, 'static]] {
         // The segments are read in place: `sofar` is the path up to the current one.
         var end = segment_end(&cx, path, 0usize);
         let roots = self.roots.copy(&cx);
@@ -1090,6 +1237,7 @@ impl Checker['k] {
             Option::Some(t) => t,
             Option::None => return Result::Err.("place_function"),
         };
+        var decided = false;
         while end < path.len() {
             let sofar = path.slice(0usize, end);
             let next = segment_end(&cx, path, end + 1usize);
@@ -1097,6 +1245,7 @@ impl Checker['k] {
             ty = self.place_view(&cx, sofar, ty)?;
             let component = match self.types.shape(&cx, ty, self.home.copy(&cx)) {
                 Type::Enum(variants) => {
+                    decided = true;
                     let known = match self.places.copy(&cx).known.get(&cx, sofar) {
                         Option::Some(v) => v.eq(&cx, seg),
                         Option::None => false,
@@ -1119,7 +1268,7 @@ impl Checker['k] {
             };
             end = next;
         }
-        Result::Ok.(ty)
+        Result::Ok.((ty, decided))
     }
 
     fn place_view(self, &cx: Domain!['k], path: Span['k], ty: Type['k]) -> Result[Type['k], Slice[u8, 'static]] {
@@ -1142,21 +1291,31 @@ impl Checker['k] {
     }
 
     fn discardable(self, &cx: Domain!['k], path: Span['k], ty: Type['k]) -> Result[bool, Slice[u8, 'static]] {
+        self.discardable_with(&cx, path, ty, self.copy_type(&cx, ty))
+    }
+
+    // `discardable`, given whether `ty` is Copy.
+    fn discardable_with(self, &cx: Domain!['k], path: Span['k], ty: Type['k], copy: bool) -> Result[bool, Slice[u8, 'static]] {
         let places = self.places.copy(&cx);
-        if self.copy_type(&cx, ty) || places.covered(&cx, path) {
+        if copy || places.covered(&cx, path) {
             return Result::Ok.(true);
         }
         if places.opened.contains(&cx, path) {
             let viewed = self.place_view(&cx, path, ty)?;
             return self.discardable_parts(&cx, path, viewed);
         }
-        self.discardable_parts(&cx, path, ty)
+        self.linear_parts_discardable(&cx, path, ty)
     }
 
     fn discardable_parts(self, &cx: Domain!['k], path: Span['k], ty: Type['k]) -> Result[bool, Slice[u8, 'static]] {
         if self.copy_type(&cx, ty) {
             return Result::Ok.(true);
         }
+        self.linear_parts_discardable(&cx, path, ty)
+    }
+
+    // `discardable_parts` of a type that is not Copy.
+    fn linear_parts_discardable(self, &cx: Domain!['k], path: Span['k], ty: Type['k]) -> Result[bool, Slice[u8, 'static]] {
         let places = self.places.copy(&cx);
         let decomposed = places.empty.any(&cx, |&cx, z: Span['k]| prefix(&cx, path, z) && !z.eq(&cx, path));
         let known = places.known.get(&cx, path);
@@ -1239,7 +1398,7 @@ impl Checker['k] {
         // What the store overwrites holds no linear contents: a Copy value, or a place whose linear
         // parts were moved out (dropping that empty linear place is its destruct in the value-only
         // translation).
-        if !self.no_linear(&cx, path, self.storage_type(&cx, path)) {
+        if !self.got(&cx, self.storage_discardable(&cx, path)) {
             self.fail(&cx, "storing_into_discard_linear");
         }
         var j = 0usize;
@@ -2323,9 +2482,10 @@ impl Checker['k] {
                 if !C::same(&cx, self.use_value(&cx, cond), C::bool_type(&cx)) {
                     self.fail(&cx, "jnz_bool_condition");
                 }
+                // An edge reads the place state and changes nothing in it, so both share it.
                 let used = self.used.copy(&cx).clone(&cx);
-                self.edge(&cx, then, used.clone(&cx), self.places.copy(&cx).copy(&cx), Option::None);
-                self.edge(&cx, other, used.clone(&cx), self.places.copy(&cx).copy(&cx), Option::None);
+                self.edge(&cx, then, used.clone(&cx), self.places.copy(&cx), Option::None);
+                self.edge(&cx, other, used.clone(&cx), self.places.copy(&cx), Option::None);
             },
             Terminator::Switch(scrutinee, ty, arms, _pos) => self.switch(&cx, scrutinee, ty, arms),
             Terminator::Unreachable(_pos) => {
@@ -2408,19 +2568,14 @@ impl Checker['k] {
         }
         let roots = self.roots.copy(&cx);
         let param_roots = self.param_roots.copy(&cx);
+        let target_empty = self.empty_set(&cx, target);
         var r = 0usize;
         while r < roots.positions(&cx) {
             let root = match roots.key_at(&cx, r) {
                 Option::Some(name) => name,
                 Option::None => Span::from_static(&cx, ""),
             };
-            var emptied = false;
-            var q = 0usize;
-            while !emptied && q < target.empty.len(&cx) {
-                emptied = prefix(&cx, target.empty.at(&cx, q), root);
-                q = q + 1usize;
-            }
-            if !param_roots.contains(&cx, root) && !emptied && !subset(&cx, self.root_brands(&cx, root), kept) {
+            if !param_roots.contains(&cx, root) && !ancestor_in(&cx, target_empty, root) && !subset(&cx, self.root_brands(&cx, root), kept) {
                 self.fail(&cx, "full_local_block_brand");
             }
             r = r + 1usize;
@@ -2453,8 +2608,8 @@ impl Checker['k] {
         if !opened_same(&cx, places.opened, wanted) {
             self.fail(&cx, "opened_view_contract");
         }
-        let target_empty = target.empty;
-        if places.empty.any(&cx, |&cx, z: Span['k]| !any_prefix(&cx, target_empty, z)) {
+        let target_empty = self.empty_set(&cx, target);
+        if places.empty.any(&cx, |&cx, z: Span['k]| !ancestor_in(&cx, target_empty, z)) {
             self.fail(&cx, "empty_assumes_full");
         }
         let fresh: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
@@ -2488,14 +2643,21 @@ impl Checker['k] {
             }
             r = r + 1usize;
         }
+        let checked = self.empty_to_check(&cx, target);
+        let whole = checked.address() == target.empty.address();
+        let rest: ArenaVec[Span['k], 'k] = if whole { ArenaVec::new(&cx) } else { checked };
         var e = 0usize;
-        while e < target.empty.len(&cx) {
-            let q = target.empty.at(&cx, e);
-            if !self.no_linear(&cx, q, self.storage_type(&cx, q)) {
+        while e < checked.len(&cx) {
+            let (result, always) = self.empty_discardable(&cx, checked.at(&cx, e));
+            if !self.got(&cx, result) {
                 self.fail(&cx, "holds_linear_contents_assumes");
+            }
+            if whole && !always {
+                rest.push(&cx, checked.at(&cx, e));
             }
             e = e + 1usize;
         }
+        self.checked_empty(&cx, target, checked, rest);
         var k = 0usize;
         while k < target.known.len(&cx) {
             let known = target.known.at(&cx, k);
@@ -2551,10 +2713,14 @@ impl Checker['k] {
         var i = 0usize;
         while i < arms.len(&cx) {
             let arm = arms.at(&cx, i);
-            let places = self.places.copy(&cx).copy(&cx);
+            // The edge changes nothing in the state it is given; an arm of a place switch knows
+            // one more variant, in a copy of the known variants.
+            var places = self.places.copy(&cx);
             var payload: Option[Type['k]] = Option::None;
             if place {
-                places.known.insert(&cx, arg, arm.variant);
+                let known = places.known.clone(&cx);
+                known.insert(&cx, arg, arm.variant);
+                places = Places.{ empty: places.empty, known, opened: places.opened };
             } else {
                 payload = member(&cx, variants, arm.variant);
             }

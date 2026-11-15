@@ -41,7 +41,7 @@ exposed struct Plan {
     // each local's free brands, and whether it is Copy once that is asked
     local_brands: ArenaVec[ArenaSet[Span['k], 'k], 'k],
     local_copy: ArenaVec[Option[bool], 'k],
-    // the locals whose types mention brands
+    // the locals whose types mention brands other than `global`
     branded: ArenaVec[usize, 'k],
     // the state each block other than the entry starts in, so far
     header: ArenaMap[Span['k], Places['k], 'k],
@@ -338,7 +338,8 @@ impl PlaceFlow['k] {
             let brands = free_brands(&cx, fun.locals.at(&cx, i).type);
             local_brands.push(&cx, brands);
             local_copy.push(&cx, Option::None);
-            if brands.len(&cx) > 0usize {
+            // A local whose brands are all global keeps them across every edge.
+            if !subset(&cx, brands, global) {
                 branded.push(&cx, i);
             }
             i = i + 1usize;
@@ -735,22 +736,27 @@ impl PlaceFlow['k] {
                         },
                         Option::None => (),
                     };
-                    let empty = fun.blocks.at(&cx, index.at(&cx, edge.target)).empty;
+                    let target = fun.blocks.at(&cx, index.at(&cx, edge.target));
+                    let empty = c.empty_to_check(&cx, target);
+                    let whole = empty.address() == target.empty.address();
+                    let rest: ArenaVec[Span['k], 'k] = if whole { ArenaVec::new(&cx) } else { empty };
                     var k = 0usize;
                     while k < empty.len(&cx) {
                         let path = empty.at(&cx, k);
-                        match c.place_storage(&cx, path) {
-                            Result::Ok(t) => match c.discardable(&cx, path, t) {
-                                Result::Ok(free) => if !free {
-                                    flow.ownership_error(&cx, path, "linear value '",
-                                        Buffer::new().push_static("' remains live on some paths to ").push_bytes(&cx, edge.target).save(&cx), term_pos(block.term), false);
-                                },
-                                Result::Err(_m) => (),
+                        let (result, always) = c.empty_discardable(&cx, path);
+                        match result {
+                            Result::Ok(free) => if !free {
+                                flow.ownership_error(&cx, path, "linear value '",
+                                    Buffer::new().push_static("' remains live on some paths to ").push_bytes(&cx, edge.target).save(&cx), term_pos(block.term), false);
                             },
                             Result::Err(_m) => (),
                         };
+                        if whole && !always {
+                            rest.push(&cx, path);
+                        }
                         k = k + 1usize;
                     }
+                    c.checked_empty(&cx, target, empty, rest);
                     c.places.set(&cx, saved);
                     e = e + 1usize;
                 }
@@ -823,11 +829,8 @@ impl PlaceFlow['k] {
                 while s < states.len(&cx) {
                     c.places.set(&cx, states.at(&cx, s));
                     if discardable {
-                        discardable = match c.place_storage(&cx, path) {
-                            Result::Ok(t) => match c.discardable(&cx, path, t) {
-                                Result::Ok(free) => free,
-                                Result::Err(_m) => false,
-                            },
+                        discardable = match c.storage_discardable(&cx, path) {
+                            Result::Ok(free) => free,
                             Result::Err(_m) => false,
                         };
                     }
@@ -873,15 +876,12 @@ impl PlaceFlow['k] {
             } else if op.is(&cx, "store") {
                 var known = true;
                 if diagnose {
-                    known = match c.place_storage(&cx, first) {
-                        Result::Ok(t) => match c.discardable(&cx, first, t) {
-                            Result::Ok(free) => {
-                                if !free {
-                                    self.ownership_error(&cx, first, "cannot overwrite live linear value '", Span::from_static(&cx, "'"), instr.pos, false);
-                                }
-                                true
-                            },
-                            Result::Err(_m) => false,
+                    known = match c.storage_discardable(&cx, first) {
+                        Result::Ok(free) => {
+                            if !free {
+                                self.ownership_error(&cx, first, "cannot overwrite live linear value '", Span::from_static(&cx, "'"), instr.pos, false);
+                            }
+                            true
                         },
                         Result::Err(_m) => false,
                     };
