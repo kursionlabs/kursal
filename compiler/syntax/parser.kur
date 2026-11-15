@@ -40,6 +40,8 @@ exposed struct Lexer {
     // The offset where each line starts.
     lines: ArenaVec[usize, 'k],
     out: ArenaVec[Tok['k], 'k],
+    // the line index, offset and column `loc` found last
+    last: Ref[(usize, usize, u32), 'k],
 }
 
 fn is_digit(b: u8) -> bool {
@@ -63,9 +65,21 @@ fn is_name_byte(b: u8) -> bool {
     is_name_start(b) || is_digit(b)
 }
 
+// `word` is one of `keywords`, compared in place.
 forall 'k.
 fn is_keyword(&cx: Domain!['k], word: Span['k]) -> bool {
-    keywords(&cx).contains(&cx, Buffer::new().push_static(" ").push_bytes(&cx, word).push_static(" ").save(&cx))
+    let all = keywords(&cx);
+    var found = false;
+    var start = 1usize;
+    while !found && start < all.len() {
+        let end = match all.find_byte(&cx, b' ', start) {
+            Option::Some(at) => at,
+            Option::None => all.len(),
+        };
+        found = end - start == word.len() && all.slice(start, end).eq(&cx, word);
+        start = end + 1usize;
+    }
+    found
 }
 
 forall 'k.
@@ -79,7 +93,7 @@ impl Lexer['k] {
             }
             i = i + 1usize;
         }
-        Lexer.{ source, file, i: Ref::new(&cx, 0usize), lines, out: ArenaVec::new(&cx) }
+        Lexer.{ source, file, i: Ref::new(&cx, 0usize), lines, out: ArenaVec::new(&cx), last: Ref::new(&cx, (0usize, 0usize, 1u32)) }
     }
 
     fn at(self, &cx: Domain!['k]) -> usize {
@@ -90,26 +104,36 @@ impl Lexer['k] {
         self.source.byte_or_zero(&cx, offset)
     }
 
-    // The line and column of `offset`; the column counts characters, not bytes.
+    // The line and column of `offset`; the column counts characters, not bytes. Counting goes on
+    // from the offset asked before when this one is later on the same line, as tokens come.
     fn loc(self, &cx: Domain!['k], offset: usize) -> (u32, u32) {
-        var lo = 0usize;
-        var hi = self.lines.len(&cx);
-        while lo + 1usize < hi {
-            let mid = (lo + hi) / 2usize;
-            if self.lines.at(&cx, mid) <= offset {
-                lo = mid;
-            } else {
-                hi = mid;
+        let (last_line, last_offset, last_col) = self.last.copy(&cx);
+        let same_line = last_offset <= offset
+            && (last_line + 1usize >= self.lines.len(&cx) || offset < self.lines.at(&cx, last_line + 1usize));
+        var lo = last_line;
+        var col = last_col;
+        var k = last_offset;
+        if !same_line {
+            lo = 0usize;
+            var hi = self.lines.len(&cx);
+            while lo + 1usize < hi {
+                let mid = (lo + hi) / 2usize;
+                if self.lines.at(&cx, mid) <= offset {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
             }
+            col = 1u32;
+            k = self.lines.at(&cx, lo);
         }
-        var col = 1u32;
-        var k = self.lines.at(&cx, lo);
         while k < offset {
             if (self.byte(&cx, k) & 192u8) != 128u8 {
                 col = col + 1u32;
             }
             k = k + 1usize;
         }
+        self.last.set(&cx, (lo, offset, col));
         ((lo + 1usize) as u32, col)
     }
 

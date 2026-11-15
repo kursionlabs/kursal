@@ -484,6 +484,8 @@ exposed struct Checker {
     param_roots: Ref[ArenaSet[Span['k], 'k], 'k],
     // the free brands of each root's type, as `edge` asks for them
     root_brand_cache: Ref[ArenaMap[Span['k], ArenaSet[Span['k], 'k], 'k], 'k],
+    // `branded_locals` of the function being checked, once asked
+    edge_roots: Ref[Option[(ArenaVec[Span['k], 'k], ArenaSet[Span['k], 'k])], 'k],
     // what is known of paths under the current roots and kinds
     facts: Ref[PathFacts['k], 'k],
     // The sets `empty_set` hands out, the n-th to a function's n-th block that asks, refilled for
@@ -582,6 +584,7 @@ impl Checker['k] {
             roots: Ref::new(&cx, ArenaMap::new(&cx)),
             param_roots: Ref::new(&cx, ArenaSet::new(&cx)),
             root_brand_cache: Ref::new(&cx, ArenaMap::new(&cx)),
+            edge_roots: Ref::new(&cx, Option::None),
             facts: Ref::new(&cx, PathFacts.{ roots: 0usize, kinds: 0usize, stored: ArenaMap::new(&cx), empty_sets: ArenaMap::new(&cx), linear_empty: ArenaMap::new(&cx) }),
             set_pool: ArenaVec::new(&cx),
             working: Places::new(ArenaSet::new(&cx), ArenaMap::new(&cx), ArenaMap::new(&cx)),
@@ -870,6 +873,7 @@ impl Checker['k] {
         }
         self.roots.set(&cx, roots);
         self.root_brand_cache.set(&cx, ArenaMap::new(&cx));
+        self.edge_roots.set(&cx, Option::None);
         if roots.len(&cx) != fun.locals.len(&cx) {
             self.fail(&cx, "duplicate_place_root");
         }
@@ -2584,35 +2588,48 @@ impl Checker['k] {
         self.accounted(&cx, self.used.copy(&cx));
         self.used.set(&cx, saved);
         self.entails(&cx, places, target, sub);
-        let kept = brand_params(&cx, self.params.copy(&cx));
-        kept.insert(&cx, static_brand(&cx));
-        let names = sub.keys(&cx);
-        var n = 0usize;
-        while n < names.len(&cx) {
-            let unit = match sub.at(&cx, names.at(&cx, n)) {
-                Type::Skolem(label) => {
-                    if label.eq(&cx, names.at(&cx, n)) {
-                        kept.insert(&cx, names.at(&cx, n));
-                    }
-                },
-                _ => (),
-            };
-            n = n + 1usize;
-        }
-        let roots = self.roots.copy(&cx);
-        let param_roots = self.param_roots.copy(&cx);
+        // The brands kept across the edge: the function's own, `static`, and the target's brands
+        // the edge passes themselves. Only a local whose brands are not all the function's own can
+        // name one that is not kept.
+        let (local_roots, global) = self.branded_locals(&cx);
         let target_empty = self.empty_set(&cx, target);
         var r = 0usize;
-        while r < roots.positions(&cx) {
-            let root = match roots.key_at(&cx, r) {
-                Option::Some(name) => name,
-                Option::None => Span::from_static(&cx, ""),
-            };
-            if !param_roots.contains(&cx, root) && !ancestor_in(&cx, target_empty, root) && !subset(&cx, self.root_brands(&cx, root), kept) {
-                self.fail(&cx, "full_local_block_brand");
+        while r < local_roots.len(&cx) {
+            let root = local_roots.at(&cx, r);
+            if !ancestor_in(&cx, target_empty, root) {
+                if !self.root_brands(&cx, root).all(&cx, |&cx, b: Span['k]| kept_brand(&cx, global, sub, b)) {
+                    self.fail(&cx, "full_local_block_brand");
+                }
             }
             r = r + 1usize;
         }
+    }
+
+    // The function's local roots (in the order of `roots`, but for its place parameters) whose
+    // free brands are not all among its brand parameters and `static`, and the set of those: made
+    // once per function.
+    fn branded_locals(self, &cx: Domain!['k]) -> (ArenaVec[Span['k], 'k], ArenaSet[Span['k], 'k]) {
+        match self.edge_roots.copy(&cx) {
+            Option::Some(known) => return known,
+            Option::None => (),
+        };
+        let global = brand_params(&cx, self.params.copy(&cx));
+        global.insert(&cx, static_brand(&cx));
+        let roots = self.roots.copy(&cx);
+        let param_roots = self.param_roots.copy(&cx);
+        let locals: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        var r = 0usize;
+        while r < roots.positions(&cx) {
+            match roots.key_at(&cx, r) {
+                Option::Some(root) => if !param_roots.contains(&cx, root) && !subset(&cx, self.root_brands(&cx, root), global) {
+                    locals.push(&cx, root);
+                },
+                Option::None => (),
+            };
+            r = r + 1usize;
+        }
+        self.edge_roots.set(&cx, Option::Some.((locals, global)));
+        (locals, global)
     }
 
     fn entails(self, &cx: Domain!['k], places: Places['k], target: Block['k], sub: ArenaMap[Span['k], Type['k], 'k]) {
@@ -2642,12 +2659,15 @@ impl Checker['k] {
             self.fail(&cx, "opened_view_contract");
         }
         let target_empty = self.empty_set(&cx, target);
-        if places.empty.any(&cx, |&cx, z: Span['k]| !ancestor_in(&cx, target_empty, z)) {
+        // Most often the edge leaves empty exactly what the target assumes: then each path covers
+        // itself, and no path is newly empty.
+        let exact = places.empty.len(&cx) == target_empty.len(&cx) && places.empty.all(&cx, |&cx, z: Span['k]| target_empty.contains(&cx, z));
+        if !exact && places.empty.any(&cx, |&cx, z: Span['k]| !ancestor_in(&cx, target_empty, z)) {
             self.fail(&cx, "empty_assumes_full");
         }
         let fresh: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         var f = 0usize;
-        while f < target.empty.len(&cx) {
+        while !exact && f < target.empty.len(&cx) {
             if !places.covered(&cx, target.empty.at(&cx, f)) {
                 fresh.push(&cx, target.empty.at(&cx, f));
             }
@@ -2760,6 +2780,22 @@ impl Checker['k] {
             self.edge(&cx, arm.edge, used.clone(&cx), places, payload);
             i = i + 1usize;
         }
+    }
+}
+
+// A brand kept across an edge whose target's brands are bound by `sub`: one of `global`, or a
+// target brand the edge passes itself.
+forall 'k.
+fn kept_brand(&cx: Domain!['k], global: ArenaSet[Span['k], 'k], sub: ArenaMap[Span['k], Type['k], 'k], b: Span['k]) -> bool {
+    if global.contains(&cx, b) {
+        return true;
+    }
+    match sub.get(&cx, b) {
+        Option::Some(t) => match t {
+            Type::Skolem(label) => label.eq(&cx, b),
+            _ => false,
+        },
+        Option::None => false,
     }
 }
 
