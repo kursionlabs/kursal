@@ -539,6 +539,8 @@ exposed struct Backend {
     place_c: Ref[ArenaMap[Span['k], Span['k], 'k], 'k],
     roots: Ref[ArenaMap[Span['k], Type['k], 'k], 'k],
     typed: Ref[ArenaMap[(Span['k], Span['k]), Type['k], 'k], 'k],
+    // (block label, SSA name) -> whether the value's type is zero-size, as `value_erased_in` finds it
+    erasure: Ref[ArenaMap[(Span['k], Span['k]), bool, 'k], 'k],
     blocks: Ref[ArenaMap[Span['k], Block['k], 'k], 'k],
     label: Ref[Span['k], 'k],
 }
@@ -662,6 +664,7 @@ impl Backend['k] {
             place_c: Ref::new(&cx, ArenaMap::new(&cx)),
             roots: Ref::new(&cx, ArenaMap::new(&cx)),
             typed: Ref::new(&cx, ArenaMap::new(&cx)),
+            erasure: Ref::new(&cx, ArenaMap::new(&cx)),
             blocks: Ref::new(&cx, ArenaMap::new(&cx)),
             label: Ref::new(&cx, Span::from_static(&cx, "")),
         }
@@ -1009,7 +1012,7 @@ impl Backend['k] {
             let (_expr, ty) = self.place(&cx, arg);
             return self.erased(&cx, ty);
         }
-        self.erased(&cx, self.type_of(&cx, arg))
+        self.value_erased(&cx, arg)
     }
 
     // ------------------------------------------------------------ specialization --
@@ -1357,7 +1360,8 @@ impl Backend['k] {
         self.symbol.set(&cx, symbol);
         let plan = Plan::new(&cx, fun);
         self.plan.set(&cx, Option::Some.(plan));
-        self.substituted.set(&cx, ArenaMap::new(&cx));
+        self.substituted.copy(&cx).clear(&cx);
+        self.erasure.copy(&cx).clear(&cx);
         let typed = self.recorded.at(&cx, key);
         self.locals.set(&cx, ArenaMap::new(&cx));
         self.aliases.set(&cx, ArenaMap::new(&cx));
@@ -1447,7 +1451,7 @@ impl Backend['k] {
                     q = q + 1usize;
                 }
             }
-            if !parameter && !self.erased(&cx, self.substitute_type(&cx, ty)) {
+            if !parameter && !self.value_erased_in(&cx, label, name) {
                 values.push(&cx, (label, name, ty, self.cname(&cx, label, name)));
             }
             v = v + 1usize;
@@ -1571,6 +1575,28 @@ impl Backend['k] {
         self.the_plan(&cx).is_live(&cx, self.label.copy(&cx), name)
     }
 
+    // Whether the value `name` of the current block has a zero-size type: `erased(type_of(name))`.
+    fn value_erased(self, &cx: Domain!['k], name: Span['k]) -> bool {
+        self.value_erased_in(&cx, self.label.copy(&cx), name)
+    }
+
+    // Whether the value `name` of block `label` has a zero-size type, kept for the function being
+    // emitted once finding it drew no fresh name.
+    fn value_erased_in(self, &cx: Domain!['k], label: Span['k], name: Span['k]) -> bool {
+        let known = self.erasure.copy(&cx);
+        match known.get(&cx, (label, name)) {
+            Option::Some(answer) => answer,
+            Option::None => {
+                let before = self.counter.next.copy(&cx);
+                let answer = self.erased(&cx, self.substitute_type(&cx, self.typed.copy(&cx).at(&cx, (label, name))));
+                if self.counter.next.copy(&cx) == before {
+                    known.insert(&cx, (label, name), answer);
+                }
+                answer
+            },
+        }
+    }
+
     fn type_of(self, &cx: Domain!['k], name: Span['k]) -> Type['k] {
         self.substitute_type(&cx, self.typed.copy(&cx).at(&cx, (self.label.copy(&cx), name)))
     }
@@ -1669,14 +1695,14 @@ impl Backend['k] {
             var l = 0usize;
             while !read && l < instr.lhs.len(&cx) {
                 let name = instr.lhs.at(&cx, l);
-                read = self.is_live(&cx, name) && !self.erased(&cx, self.type_of(&cx, name));
+                read = self.is_live(&cx, name) && !self.value_erased(&cx, name);
                 l = l + 1usize;
             }
             if !read {
                 return;
             }
         }
-        let dst = if instr.lhs.len(&cx) == 1usize && !self.erased(&cx, self.type_of(&cx, instr.lhs.at(&cx, 0usize))) {
+        let dst = if instr.lhs.len(&cx) == 1usize && !self.value_erased(&cx, instr.lhs.at(&cx, 0usize)) {
             Option::Some.(self.value_name(&cx, instr.lhs.at(&cx, 0usize)))
         } else {
             Option::None
@@ -1698,7 +1724,7 @@ impl Backend['k] {
         } else if op.is(&cx, "load") && plan.forwarded.contains(&cx, a.at(&cx, 0usize)) {
             let unit = self.aliases.copy(&cx).insert(&cx, (self.label.copy(&cx), instr.lhs.at(&cx, 0usize)), self.forwards.copy(&cx).at(&cx, a.at(&cx, 0usize)));
         } else if op.is(&cx, "store") && plan.forwarded.contains(&cx, a.at(&cx, 0usize)) {
-            if !self.erased(&cx, self.type_of(&cx, a.at(&cx, 1usize))) {
+            if !self.value_erased(&cx, a.at(&cx, 1usize)) {
                 let unit = self.forwards.copy(&cx).insert(&cx, a.at(&cx, 0usize), self.value_name(&cx, a.at(&cx, 1usize)));
             }
         } else if op.is(&cx, "construct") {
@@ -1882,7 +1908,7 @@ impl Backend['k] {
         while i < instr.lhs.len(&cx) && i < access.len(&cx) {
             let lhs = instr.lhs.at(&cx, i);
             let (member, t) = access.at(&cx, i);
-            if self.is_live(&cx, lhs) && !self.erased(&cx, self.type_of(&cx, lhs)) {
+            if self.is_live(&cx, lhs) && !self.value_erased(&cx, lhs) {
                 let name = self.value_name(&cx, lhs);
                 // A pointer to a zero-size component is the pointer to the whole: they may share an address.
                 if pointer && self.erased(&cx, t) {
@@ -2144,7 +2170,7 @@ impl Backend['k] {
             Option::None => fail_text(&cx, Span::from_static(&cx, "internal error: a foreach without its type")),
         };
         let (t, renamed) = subst_foreach(&cx, original, self.sub.copy(&cx), self.counter);
-        let source = if self.erased(&cx, self.type_of(&cx, instr.args.at(&cx, 0usize))) { Span::from_static(&cx, "") } else { self.value_name(&cx, instr.args.at(&cx, 0usize)) };
+        let source = if self.value_erased(&cx, instr.args.at(&cx, 0usize)) { Span::from_static(&cx, "") } else { self.value_name(&cx, instr.args.at(&cx, 0usize)) };
         let mapper_name = instr.args.at(&cx, 1usize);
         let mapper = self.program.funs.at(&cx, mapper_name);
         let binders: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
@@ -2179,7 +2205,7 @@ impl Backend['k] {
         let caps: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         var c = 2usize;
         while c < instr.args.len(&cx) {
-            if !self.erased(&cx, self.type_of(&cx, instr.args.at(&cx, c))) {
+            if !self.value_erased(&cx, instr.args.at(&cx, c)) {
                 caps.push(&cx, self.value_name(&cx, instr.args.at(&cx, c)));
             }
             c = c + 1usize;
@@ -2277,7 +2303,7 @@ impl Backend['k] {
 
     fn term(self, &cx: Domain!['k], &lines: Buffer!, term: Terminator['k]) {
         match term {
-            Terminator::Ret(value, _pos) => if self.erased(&cx, self.type_of(&cx, value)) {
+            Terminator::Ret(value, _pos) => if self.value_erased(&cx, value) {
                 line(&lines, Buffer::new().push_static("return;"));
             } else {
                 line(&lines, Buffer::new().push_static("return ").push_bytes(&cx, self.value_name(&cx, value)).push_static(";"));
@@ -2310,7 +2336,7 @@ impl Backend['k] {
         var a = 0usize;
         while a < edge.args.len(&cx) {
             let arg = edge.args.at(&cx, a);
-            if self.erased(&cx, self.type_of(&cx, arg)) {
+            if self.value_erased(&cx, arg) {
                 values.push(&cx, (Span::from_static(&cx, ""), Span::from_static(&cx, "")));
             } else {
                 let value = self.value_name(&cx, arg);

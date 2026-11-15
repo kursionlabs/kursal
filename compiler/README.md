@@ -150,6 +150,17 @@ the variants a match has covered (`FnLower::match_coverage`), and the walk of pa
 `&cx` (`insert_in`, `get_in`, `remove_in`). State that lives in a struct of handles shared with
 the rest of a phase stays in the arena, and so does everything that ends up in a result.
 
+Arena state that a walk refills again and again is kept and refilled in place rather than made
+anew: `ArenaMap::clear` and `assign` (and `ArenaSet`'s) keep the room a map has, so it takes new
+room only to hold more than it has held before. Place flow simulates each block in one scratch
+`Places` (`PlaceFlow.working`, loaded from the state the block starts in) and copies it only when
+the block changed it; its replay of the finished headers runs in the scratch too. The checker
+checks each block in one scratch state (`Checker.working`), hands out the sets of the empty paths
+blocks declare from a pool refilled for each function (`Checker::empty_set`), and keeps what it
+learns of a function's paths in `PathFacts`, cleared when the roots or kinds maps change: each
+path's stored type, when no place state decides it, with whether it is Copy, and for each block
+the declared empty paths an edge into it must still check.
+
 ### Text being built
 
 Text is built in the standard library's linear `Buffer!`, on the heap, threaded by value through
@@ -202,6 +213,17 @@ borrows the context by place: `HashIn[K, Domain!['k]]::hash_in(&cx, key, state)`
 integers, `bool`, tuples, spans and `ArenaVec`s of keys, and `kurs::core` adds `Type`, `Param`,
 `Premise` and `ModuleId`. `kurs::core::same` is structural type equality (Python's `==` on frozen
 dataclasses), `kurs::core::hash` its hash.
+
+Types are values, not interned: two equal types may be built apart, so a type-keyed map hashes and
+compares the structure. Both are kept cheap instead. A map entry keeps its key's hash bits, so a
+probe compares keys only where the bits agree, and growing or cloning a map hashes nothing again.
+`hash` takes from each name only its length and last 8 bytes (`name_hash`), and `same` stops at a
+part (a vec of types or members, a `Ref`) that both types share, which a type copied from another,
+or looked up with the type it was stored under, mostly does. Where a backend query is asked per
+value, it is kept by the value's (block label, name) (`Backend::value_erased_in`), which hashes two
+short names instead of a type. `types::ops::alpha_hash` is a hash that alpha-equivalent types
+share; `Backend::request` compares a specialization's arguments only with earlier ones whose hash
+is the same.
 
 A class whose methods mutate `self` becomes a struct of handles (refs, vecs, maps) whose methods
 take `self` by value and `&cx`: the copies share the same storage. Its constructor allocates them.
