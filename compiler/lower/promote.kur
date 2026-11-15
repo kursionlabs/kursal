@@ -2,8 +2,10 @@
 //
 // Place planning establishes which complete contents reach each edge. This pass threads those
 // contents explicitly; it does not relax core local formation. Projected products are decomposed
-// and rebuilt; lends use a generic value adapter. Sum refinements and opened root views require a
-// further representation extension.
+// and rebuilt; lends use a generic value adapter. A switch on an enum among the contents switches on
+// its value: each arm's block, entered by that arm alone, holds the variant's payload where its
+// header knows the variant, and the enum is rebuilt where a whole value is needed. Opened root views
+// require a further representation extension.
 
 use std::collections::arena_vec::ArenaVec;
 use std::collections::arena_map::{ArenaMap, ArenaSet};
@@ -39,13 +41,23 @@ exposed struct Promotion {
     // an exposed product path -> its components' paths and types
     shapes: ArenaMap[Span['k], ArenaVec[Binding['k], 'k], 'k],
     path_types: ArenaMap[Span['k], Type['k], 'k],
+    // enum paths among the contents, whose variants' payloads are exposed
+    sums: ArenaSet[Span['k], 'k],
+    // block -> enum path known to hold a variant -> the variant
+    refined: ArenaMap[Span['k], ArenaMap[Span['k], Span['k], 'k], 'k],
+    // an arm's block -> (enum path switched on, its variant)
+    arms: ArenaMap[Span['k], (Span['k], Span['k]), 'k],
+    // an arm's block -> (payload path, the parameter holding it)
+    payloads: ArenaMap[Span['k], (Span['k], Span['k]), 'k],
 }
 
 // One block being rewritten: the SSA value holding each leaf path, the loads replaced by those
-// values, the new instructions and the brands open so far.
+// values, the new instructions, the brands open so far, and the enum paths known to hold a variant
+// whose payload stands for them.
 forall 'k.
 exposed struct Rewrite {
     contents: ArenaMap[Span['k], Span['k], 'k],
+    known: ArenaMap[Span['k], Span['k], 'k],
     aliases: ArenaMap[Span['k], Span['k], 'k],
     instructions: ArenaVec[Instr['k], 'k],
     brands: ArenaVec[Span['k], 'k],
@@ -62,6 +74,25 @@ fn root_of(&cx: Domain!['k], path: Span['k]) -> Span['k] {
         Option::Some(at) => path.slice(0usize, at),
         Option::None => path,
     }
+}
+
+forall 'k.
+fn last_segment(&cx: Domain!['k], path: Span['k]) -> Span['k] {
+    match path.rfind_byte(&cx, b'.') {
+        Option::Some(at) => path.skip(at + 1usize),
+        Option::None => path,
+    }
+}
+
+forall 'k.
+fn child_of(&cx: Domain!['k], path: Span['k], label: Span['k]) -> Span['k] {
+    Buffer::new().push_bytes(&cx, path).push_static(".").push_bytes(&cx, label).save(&cx)
+}
+
+// Whether `path` lies under `parent`: `parent` and a `.` begin it.
+forall 'k.
+fn under(&cx: Domain!['k], path: Span['k], parent: Span['k]) -> bool {
+    path.len() > parent.len() && path.starts_with(&cx, parent) && path.byte_or_zero(&cx, parent.len()) == b'.'
 }
 
 forall 'k.
@@ -108,7 +139,26 @@ impl Promotion['k] {
         self.expose(&cx, parent);
         if !self.shapes.contains(&cx, parent) {
             let fields: ArenaVec[Binding['k], 'k] = ArenaVec::new(&cx);
-            match self.types.shape(&cx, self.path_types.at(&cx, parent), self.fun.home) {
+            let shape = self.types.shape(&cx, self.path_types.at(&cx, parent), self.fun.home);
+            match shape {
+                Type::Enum(variants) => {
+                    let label = last_segment(&cx, path);
+                    var k = 0usize;
+                    while k < variants.len(&cx) {
+                        if variants.at(&cx, k).name.eq(&cx, label) {
+                            self.sums.insert(&cx, parent);
+                            // A later variant of the same name wins, as Python's dict does.
+                            self.path_types.insert(&cx, path, variants.at(&cx, k).type);
+                        }
+                        k = k + 1usize;
+                    }
+                    if self.path_types.contains(&cx, path) {
+                        return;
+                    }
+                },
+                _ => (),
+            };
+            match shape {
                 Type::Tuple(elems) => {
                     var k = 0usize;
                     while k < elems.len(&cx) {
@@ -140,46 +190,96 @@ impl Promotion['k] {
         }
     }
 
-    // Checks every use of a branded root before anything changes; sums and opened roots need their
-    // own representation.
+    fn is_sum(self, &cx: Domain!['k], path: Span['k]) -> bool {
+        match self.types.shape(&cx, self.path_types.at(&cx, path), self.fun.home) {
+            Type::Enum(_variants) => true,
+            _ => false,
+        }
+    }
+
+    // A path the validation names in a block header: exposed, and recorded as refined when the header
+    // knows its variant.
+    fn header_path(self, &cx: Domain!['k], block: Block['k], path: Span['k]) {
+        if !self.restricted(&cx, path) {
+            return;
+        }
+        var k = 0usize;
+        while k < block.opened.len(&cx) {
+            if block.opened.at(&cx, k).path.eq(&cx, path) {
+                self.unsupported(&cx, path);
+            }
+            k = k + 1usize;
+        }
+        self.expose(&cx, path);
+        let refined = self.refined.at(&cx, block.label);
+        k = 0usize;
+        while k < block.known.len(&cx) {
+            if block.known.at(&cx, k).path.eq(&cx, path) {
+                let variant = block.known.at(&cx, k).variant;
+                var nested = false;
+                var q = 0usize;
+                while q < refined.positions(&cx) {
+                    match refined.key_at(&cx, q) {
+                        Option::Some(other) => if under(&cx, path, other) {
+                            nested = true;
+                        },
+                        Option::None => (),
+                    };
+                    q = q + 1usize;
+                }
+                if !self.is_sum(&cx, path) || nested {
+                    self.unsupported(&cx, path);
+                }
+                refined.insert(&cx, path, variant);
+                self.expose(&cx, child_of(&cx, path, variant));
+            }
+            k = k + 1usize;
+        }
+    }
+
+    // Checks every use of a branded root before anything changes; opened roots need their own
+    // representation.
     fn validate(self, &cx: Domain!['k]) {
+        let entries: ArenaMap[Span['k], usize, 'k] = ArenaMap::new(&cx);
+        var c = 0usize;
+        while c < self.fun.blocks.len(&cx) {
+            match self.fun.blocks.at(&cx, c).term {
+                Terminator::Jmp(e, _p) => {
+                    entries.insert(&cx, e.target, entries.get_or(&cx, e.target, 0usize) + 1usize);
+                },
+                Terminator::Jnz(_c, a, other, _p) => {
+                    entries.insert(&cx, a.target, entries.get_or(&cx, a.target, 0usize) + 1usize);
+                    entries.insert(&cx, other.target, entries.get_or(&cx, other.target, 0usize) + 1usize);
+                },
+                Terminator::Switch(_s, _t, arms, _p) => {
+                    var k = 0usize;
+                    while k < arms.len(&cx) {
+                        let target = arms.at(&cx, k).edge.target;
+                        entries.insert(&cx, target, entries.get_or(&cx, target, 0usize) + 1usize);
+                        k = k + 1usize;
+                    }
+                },
+                _ => (),
+            };
+            c = c + 1usize;
+        }
         var b = 0usize;
         while b < self.fun.blocks.len(&cx) {
             let block = self.fun.blocks.at(&cx, b);
+            self.refined.insert(&cx, block.label, ArenaMap::new(&cx));
             var i = 0usize;
             while i < block.empty.len(&cx) {
-                let path = block.empty.at(&cx, i);
-                if self.restricted(&cx, path) {
-                    var k = 0usize;
-                    while k < block.known.len(&cx) {
-                        if block.known.at(&cx, k).path.eq(&cx, path) {
-                            self.unsupported(&cx, path);
-                        }
-                        k = k + 1usize;
-                    }
-                    k = 0usize;
-                    while k < block.opened.len(&cx) {
-                        if block.opened.at(&cx, k).path.eq(&cx, path) {
-                            self.unsupported(&cx, path);
-                        }
-                        k = k + 1usize;
-                    }
-                    self.expose(&cx, path);
-                }
+                self.header_path(&cx, block, block.empty.at(&cx, i));
                 i = i + 1usize;
             }
             i = 0usize;
             while i < block.known.len(&cx) {
-                if self.restricted(&cx, block.known.at(&cx, i).path) {
-                    self.unsupported(&cx, block.known.at(&cx, i).path);
-                }
+                self.header_path(&cx, block, block.known.at(&cx, i).path);
                 i = i + 1usize;
             }
             i = 0usize;
             while i < block.opened.len(&cx) {
-                if self.restricted(&cx, block.opened.at(&cx, i).path) {
-                    self.unsupported(&cx, block.opened.at(&cx, i).path);
-                }
+                self.header_path(&cx, block, block.opened.at(&cx, i).path);
                 i = i + 1usize;
             }
             i = 0usize;
@@ -200,12 +300,46 @@ impl Promotion['k] {
                 i = i + 1usize;
             }
             match block.term {
-                Terminator::Switch(s, _t, _arms, _p) => if self.restricted(&cx, s) {
-                    self.unsupported(&cx, s);
+                Terminator::Switch(s, _t, arms, _p) => if self.restricted(&cx, s) {
+                    self.expose(&cx, s);
+                    if !self.is_sum(&cx, s) {
+                        self.unsupported(&cx, s);
+                    }
+                    var k = 0usize;
+                    while k < arms.len(&cx) {
+                        let target = arms.at(&cx, k).edge.target;
+                        if entries.get_or(&cx, target, 0usize) != 1usize || target.eq(&cx, block.label) {
+                            self.unsupported(&cx, s);
+                        }
+                        self.arms.insert(&cx, target, (s, arms.at(&cx, k).variant));
+                        k = k + 1usize;
+                    }
                 },
                 _ => (),
             };
             b = b + 1usize;
+        }
+    }
+
+    fn under_sum(self, &cx: Domain!['k], path: Span['k]) -> bool {
+        var k = 0usize;
+        while k < self.sums.positions(&cx) {
+            match self.sums.key_at(&cx, k) {
+                Option::Some(q) => if under(&cx, path, q) {
+                    return true;
+                },
+                Option::None => (),
+            };
+            k = k + 1usize;
+        }
+        false
+    }
+
+    // Puts `path` among the contents whole, building it from its parts or its variant's payload.
+    fn materialize(self, &cx: Domain!['k], w: Rewrite['k], path: Span['k]) {
+        if !w.contents.contains(&cx, path) {
+            let made = self.extract(&cx, w, path, false);
+            w.contents.insert(&cx, path, made);
         }
     }
 
@@ -250,6 +384,18 @@ impl Promotion['k] {
                 name
             },
             Option::None => {
+                if !w.contents.contains(&cx, path) && w.known.contains(&cx, path) {
+                    let variant = w.known.at(&cx, path);
+                    let inner = self.extract(&cx, w, child_of(&cx, path, variant), copy);
+                    let name = self.fresh(&cx);
+                    w.instructions.push(&cx, Instr.{ lhs: ArenaVec::one(&cx, name), op: Span::from_static(&cx, "construct_variant"),
+                        args: ArenaVec::one(&cx, inner), ty: Option::Some.(self.path_types.at(&cx, path)), tys: ArenaVec::new(&cx),
+                        lit: Option::Some.(variant), is_unsafe: false, binders: ArenaVec::new(&cx), pos: self.fun.pos });
+                    if !copy {
+                        w.known.remove(&cx, path);
+                    }
+                    return name;
+                }
                 let name = self.read(&cx, w, path);
                 if copy {
                     let copied = self.fresh(&cx);
@@ -487,6 +633,15 @@ impl Promotion['k] {
     }
 
     fn edge(self, &cx: Domain!['k], w: Rewrite['k], incoming: ArenaMap[Span['k], ArenaMap[Span['k], Span['k], 'k], 'k], e: Edge['k]) {
+        let needed = incoming.at(&cx, e.target);
+        var m = 0usize;
+        while m < needed.positions(&cx) {
+            match needed.key_at(&cx, m) {
+                Option::Some(p) => self.materialize(&cx, w, p),
+                Option::None => (),
+            };
+            m = m + 1usize;
+        }
         var k = 0usize;
         while k < e.args.len(&cx) {
             e.args.set(&cx, k, self.value(&cx, w, e.args.at(&cx, k)));
@@ -505,7 +660,15 @@ impl Promotion['k] {
 
     fn rewrite(self, &cx: Domain!['k], b: usize, incoming: ArenaMap[Span['k], ArenaMap[Span['k], Span['k], 'k], 'k]) {
         let block = self.fun.blocks.at(&cx, b);
-        let w = Rewrite.{ contents: incoming.at(&cx, block.label).clone(&cx), aliases: ArenaMap::new(&cx), instructions: ArenaVec::new(&cx), brands: block.brands.clone(&cx) };
+        let w = Rewrite.{ contents: incoming.at(&cx, block.label).clone(&cx), known: self.refined.at(&cx, block.label).clone(&cx), aliases: ArenaMap::new(&cx),
+            instructions: ArenaVec::new(&cx), brands: block.brands.clone(&cx) };
+        match self.payloads.get(&cx, block.label) {
+            Option::Some(found) => {
+                let (path, name) = found;
+                self.install(&cx, w, path, name);
+            },
+            Option::None => (),
+        };
         var i = 0usize;
         while i < block.instrs.len(&cx) {
             let ins = block.instrs.at(&cx, i);
@@ -519,6 +682,7 @@ impl Promotion['k] {
             }
             let first = if ins.args.is_empty(&cx) { Span::from_static(&cx, "") } else { ins.args.at(&cx, 0usize) };
             if ins.op.is(&cx, "store") && self.restricted(&cx, first) {
+                w.known.remove(&cx, first);
                 self.install(&cx, w, first, ins.args.at(&cx, 1usize));
                 w.instructions.push(&cx, instr(&cx, ins.lhs, "construct", ArenaVec::new(&cx), Option::Some.(C::unit(&cx)), ins.pos));
             } else if (ins.op.is(&cx, "load") || ins.op.is(&cx, "destruct")) && self.restricted(&cx, first) {
@@ -537,8 +701,6 @@ impl Promotion['k] {
             }
             i = i + 1usize;
         }
-        block.instrs.clear(&cx);
-        block.instrs.append(&cx, w.instructions);
         let term = match block.term {
             Terminator::Ret(v, p) => Terminator::Ret.(self.value(&cx, w, v), p),
             Terminator::Jmp(e, p) => {
@@ -552,7 +714,8 @@ impl Promotion['k] {
                 Terminator::Jnz.(cond, a, other, p)
             },
             Terminator::Switch(s, t, arms, p) => {
-                let scrutinee = self.value(&cx, w, s);
+                // The enum moves into the switch, and each arm's block holds its payload.
+                let scrutinee = if self.restricted(&cx, s) { self.extract(&cx, w, s, false) } else { self.value(&cx, w, s) };
                 var k = 0usize;
                 while k < arms.len(&cx) {
                     self.edge(&cx, w, incoming, arms.at(&cx, k).edge);
@@ -562,6 +725,8 @@ impl Promotion['k] {
             },
             Terminator::Unreachable(p) => Terminator::Unreachable.(p),
         };
+        block.instrs.clear(&cx);
+        block.instrs.append(&cx, w.instructions);
         let empty: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         i = 0usize;
         while i < block.empty.len(&cx) {
@@ -570,8 +735,16 @@ impl Promotion['k] {
             }
             i = i + 1usize;
         }
-        let { term: _t, empty: _e, ..rest } = block;
-        self.fun.blocks.set(&cx, b, Block.{ term, empty, ..rest });
+        let known: ArenaVec[C::Known['k], 'k] = ArenaVec::new(&cx);
+        i = 0usize;
+        while i < block.known.len(&cx) {
+            if !self.restricted(&cx, block.known.at(&cx, i).path) {
+                known.push(&cx, block.known.at(&cx, i));
+            }
+            i = i + 1usize;
+        }
+        let { term: _t, empty: _e, known: _k, ..rest } = block;
+        self.fun.blocks.set(&cx, b, Block.{ term, empty, known, ..rest });
     }
 
     fn any_restricted(self, &cx: Domain!['k], args: ArenaVec[Span['k], 'k]) -> bool {
@@ -642,24 +815,40 @@ fn promote_locals(&cx: Domain!['k], fun: Fun['k], types: Types['k], params: Aren
         i = i + 1usize;
     }
     let p = Promotion.{ fun, types, r, counter, params, premises, value_types, roots, kinds, taken, serial: Ref::new(&cx, 0u64),
-        helpers: ArenaVec::new(&cx), shapes: ArenaMap::new(&cx), path_types: roots.clone(&cx) };
+        helpers: ArenaVec::new(&cx), shapes: ArenaMap::new(&cx), path_types: roots.clone(&cx), sums: ArenaSet::new(&cx),
+        refined: ArenaMap::new(&cx), arms: ArenaMap::new(&cx), payloads: ArenaMap::new(&cx) };
     p.validate(&cx);
     // the leaf paths: those not decomposed further
     let leaves: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
     let paths = p.path_types.keys(&cx);
     i = 0usize;
     while i < paths.len(&cx) {
-        if !p.shapes.contains(&cx, paths.at(&cx, i)) {
+        if !p.shapes.contains(&cx, paths.at(&cx, i)) && !p.under_sum(&cx, paths.at(&cx, i)) {
             leaves.insert(&cx, paths.at(&cx, i), p.path_types.at(&cx, paths.at(&cx, i)));
         }
         i = i + 1usize;
     }
     // the SSA parameter that brings each leaf's contents into each block
     let incoming: ArenaMap[Span['k], ArenaMap[Span['k], Span['k], 'k], 'k] = ArenaMap::new(&cx);
-    let leaf_paths = leaves.keys(&cx);
     i = 0usize;
     while i < fun.blocks.len(&cx) {
         let block = fun.blocks.at(&cx, i);
+        // the leaves the block holds: an enum known to hold a variant by its payload
+        let held = leaves.clone(&cx);
+        let refined = p.refined.at(&cx, block.label);
+        var r = 0usize;
+        while r < refined.positions(&cx) {
+            match refined.key_at(&cx, r) {
+                Option::Some(q) => if held.contains(&cx, q) {
+                    held.remove(&cx, q);
+                    let payload = child_of(&cx, q, refined.at(&cx, q));
+                    held.insert(&cx, payload, p.path_types.at(&cx, payload));
+                },
+                Option::None => (),
+            };
+            r = r + 1usize;
+        }
+        let leaf_paths = held.keys(&cx);
         let contents: ArenaMap[Span['k], Span['k], 'k] = ArenaMap::new(&cx);
         if i > 0usize {
             var k = 0usize;
@@ -675,10 +864,37 @@ fn promote_locals(&cx: Domain!['k], fun: Fun['k], types: Types['k], params: Aren
                 if !emptied {
                     let v = p.fresh(&cx);
                     contents.insert(&cx, leaf, v);
-                    block.params.push(&cx, Binding.{ name: v, type: leaves.at(&cx, leaf) });
                 }
                 k = k + 1usize;
             }
+        }
+        match p.arms.get(&cx, block.label) {
+            Option::Some(arm) => {
+                let (q, variant) = arm;
+                let knows = match refined.get(&cx, q) {
+                    Option::Some(v) => v.eq(&cx, variant),
+                    Option::None => false,
+                };
+                if !knows {
+                    p.unsupported(&cx, q);
+                }
+                let payload = child_of(&cx, q, variant);
+                let name = match contents.remove(&cx, payload) {
+                    Option::Some(v) => v,
+                    Option::None => p.fresh(&cx),
+                };
+                p.payloads.insert(&cx, block.label, (payload, name));
+                block.params.insert(&cx, 0usize, Binding.{ name, type: p.path_types.at(&cx, payload) });
+            },
+            Option::None => (),
+        };
+        var t = 0usize;
+        while t < contents.positions(&cx) {
+            match contents.key_at(&cx, t) {
+                Option::Some(leaf) => block.params.push(&cx, Binding.{ name: contents.at(&cx, leaf), type: held.at(&cx, leaf) }),
+                Option::None => (),
+            };
+            t = t + 1usize;
         }
         incoming.insert(&cx, block.label, contents);
         i = i + 1usize;

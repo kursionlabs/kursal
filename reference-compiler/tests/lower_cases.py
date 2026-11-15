@@ -75,7 +75,7 @@ LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
      "iterator is not a place"),
     ("use std::bytes::buffer::Buffer;\nfn g() -> u32 { 1u32 }\nfn f() -> u32 { let b = f\"{&g()}\"; 0u32 }\n", "needs a local or a place"),
     # promotion of locally branded values
-    (OPTION + "fn f() -> u32 { let exists 'a. w = core::cap::fresh(); var o = Option::Some.(w); match &o { Option::Some(x) => 1u32, Option::None => 0u32 } }\n",
+    (OPTION + "fn f() -> u32 { let exists 'a. w = core::cap::fresh(); var o = Option::Some.(w); let t = core::mem::enum_variant(&o); match o { Option::Some(x) => t, Option::None => 0u32 } }\n",
      "frontend limitation"),
     ("forall 'k. fn two(&a: (core::cap::Brand['k], u32), &b: core::cap::Brand['k]) -> u32 { 0u32 }\n"
      "fn f() -> u32 { let exists 'a. w = core::cap::fresh(); var p = (w, 1u32); two(&p, &p.0) }\n", "overlap"),

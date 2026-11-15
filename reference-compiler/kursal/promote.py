@@ -3,7 +3,10 @@
 Place planning establishes which complete contents reach each edge. This pass
 threads those contents explicitly; it does not relax core local formation.
 Projected products are decomposed and rebuilt; lends use a generic value adapter.
-Sum refinements and opened root views require a further representation extension.
+A switch on an enum among the contents switches on its value: each arm's block, entered
+by that arm alone, holds the variant's payload where its header knows the variant, and
+the enum is rebuilt where a whole value is needed. Opened root views require a further
+representation extension.
 """
 from collections.abc import Sequence
 from itertools import count
@@ -41,14 +44,19 @@ def promote_locals(fun: C.Fun, types: Types, params: Sequence[C.Param],
     helpers: list[C.Fun] = []
     shapes: dict[str, tuple[tuple[str, C.Type], ...]] = {}
     path_types = dict(roots)
+    sums: set[str] = set()   # enum paths among the contents, whose variants' payloads are exposed
 
     def expose(path: str) -> None:
         if path in path_types:
             return
-        parent = path.rsplit('.', 1)[0]
+        parent, label = path.rsplit('.', 1)
         expose(parent)
         if parent not in shapes:
             shape = types.shape(path_types[parent], fun.module)
+            if isinstance(shape, C.Enum) and label in dict(shape.variants):
+                sums.add(parent)
+                path_types[path] = dict(shape.variants)[label]
+                return
             if isinstance(shape, C.Tuple):
                 fields = tuple((str(k), t) for k, t in enumerate(shape.elems))
             elif isinstance(shape, C.Struct):
@@ -61,14 +69,32 @@ def promote_locals(fun: C.Fun, types: Types, params: Sequence[C.Param],
         if path not in path_types:
             unsupported(path)
 
-    # Validate before mutation; sums/opened roots need their own representation.
+    def is_sum(path: str) -> bool:
+        return isinstance(types.shape(path_types[path], fun.module), C.Enum)
 
+    # Validate before mutation; opened roots need their own representation.
+
+    refined: dict[str, dict[str, str]] = {}    # block -> enum path known to hold a variant -> the variant
+    arms: dict[str, tuple[str, str]] = {}      # an arm's block -> (enum path switched on, its variant)
+    entries: dict[str, int] = {}
     for block in fun.blocks:
+        for edge in (block.term.edge,) if isinstance(block.term, C.Jmp) else \
+                (block.term.then, block.term.other) if isinstance(block.term, C.Jnz) else \
+                tuple(arm.edge for arm in block.term.arms) if isinstance(block.term, C.Switch) else ():
+            entries[edge.target] = entries.get(edge.target, 0) + 1
+    for block in fun.blocks:
+        refined[block.label] = {}
         for path in (*block.empty, *(p for p, _ in block.known), *(p for p, _ in block.opened)):
             if restricted(path):
-                if path in dict(block.known) or path in dict(block.opened):
+                if path in dict(block.opened):
                     unsupported(path)
                 expose(path)
+                if path in dict(block.known):
+                    variant = dict(block.known)[path]
+                    if not is_sum(path) or any(path.startswith(q + '.') for q in refined[block.label]):
+                        unsupported(path)
+                    refined[block.label][path] = variant
+                    expose(path + '.' + variant)
         for instr in block.instrs:
             for k, arg in enumerate(instr.args):
                 if restricted(arg):
@@ -77,20 +103,45 @@ def promote_locals(fun: C.Fun, types: Types, params: Sequence[C.Param],
                         unsupported(arg)
                     expose(arg)
         if isinstance(block.term, C.Switch) and restricted(block.term.scrutinee):
-            unsupported(block.term.scrutinee)
+            path = block.term.scrutinee
+            expose(path)
+            if not is_sum(path):
+                unsupported(path)
+            for arm in block.term.arms:
+                if entries.get(arm.edge.target) != 1 or arm.edge.target == block.label:
+                    unsupported(path)
+                arms[arm.edge.target] = (path, arm.variant)
 
-    leaves = {p: t for p, t in path_types.items() if p not in shapes}
+    def under_sum(path: str) -> bool:
+        return any(path.startswith(q + '.') for q in sums)
+
+    leaves = {p: t for p, t in path_types.items() if p not in shapes and not under_sum(p)}
     incoming: dict[str, dict[str, str]] = {}
+    payloads: dict[str, tuple[str, str]] = {}   # an arm's block -> (payload path, the parameter holding it)
     for block in fun.blocks:
-        contents = {} if block is fun.blocks[0] else {p: fresh() for p in leaves
+        held = dict(leaves)
+        for q, variant in refined[block.label].items():
+            if q in held:
+                del held[q]
+                held[q + '.' + variant] = path_types[q + '.' + variant]
+        contents = {} if block is fun.blocks[0] else {p: fresh() for p in held
                     if not any(p == z or p.startswith(z + '.') for z in block.empty)}
+        if block.label in arms:
+            q, variant = arms[block.label]
+            if refined[block.label].get(q) != variant:
+                unsupported(q)
+            payload = q + '.' + variant
+            name = contents.pop(payload) if payload in contents else fresh()
+            payloads[block.label] = (payload, name)
+            block.params = ((name, path_types[payload]),) + block.params
         incoming[block.label] = contents
-        block.params += tuple((v, leaves[p]) for p, v in contents.items())
+        block.params += tuple((v, held[p]) for p, v in contents.items())
 
     for block in fun.blocks:
         contents = dict(incoming[block.label])
         aliases: dict[str, str] = {}
-        instructions = []
+        instructions: list[C.Instr] = []
+        known = dict(refined[block.label])
 
         brands = list(block.brands)
 
@@ -103,6 +154,11 @@ def promote_locals(fun: C.Fun, types: Types, params: Sequence[C.Param],
             if path not in contents:
                 raise KursError(f"locally branded value {path} is unavailable", fun.pos)
             return contents[path]
+
+        def materialize(path: str) -> None:
+            """Puts `path` among the contents whole, building it from its parts or its variant's payload."""
+            if path not in contents:
+                contents[path] = extract(path)
 
         def install(path: str, operand: str) -> None:
             if path in shapes:
@@ -119,6 +175,14 @@ def promote_locals(fun: C.Fun, types: Types, params: Sequence[C.Param],
                 names = tuple(extract(child, copy) for child, _ in shapes[path])
                 name = fresh()
                 instructions.append(C.Instr((name,), 'construct', names, ty=path_types[path], pos=fun.pos))
+                return name
+            if path not in contents and path in known:
+                inner = extract(path + '.' + known[path], copy)
+                name = fresh()
+                instructions.append(C.Instr((name,), 'construct_variant', (inner,), ty=path_types[path],
+                                            lit=known[path], pos=fun.pos))
+                if not copy:
+                    del known[path]
                 return name
             name = read(path)
             if copy:
@@ -204,12 +268,15 @@ def promote_locals(fun: C.Fun, types: Types, params: Sequence[C.Param],
                 for (_, path), replacement in zip(borrowed, replacements):
                     install(path, replacement)
 
+        if block.label in payloads:
+            install(*payloads[block.label])
         for instr in block.instrs:
             instr.args = tuple(value(a) for a in instr.args)
             if instr.op == 'open':
                 brands.extend(instr.binders)
             if instr.op == 'store' and restricted(instr.args[0]):
                 path, operand = instr.args
+                known.pop(path, None)
                 install(path, operand)
                 instructions.append(C.Instr(instr.lhs, 'construct', ty=C.UNIT, pos=instr.pos))
             elif instr.op in {'load', 'destruct'} and restricted(instr.args[0]):
@@ -225,9 +292,10 @@ def promote_locals(fun: C.Fun, types: Types, params: Sequence[C.Param],
                 adapt_call(instr)
             else:
                 instructions.append(instr)
-        block.instrs = tuple(instructions)
 
         def edge(e: C.Edge) -> None:
+            for p in incoming[e.target]:
+                materialize(p)
             e.args = tuple(value(a) for a in e.args) + tuple(read(p) for p in incoming[e.target])
 
         match block.term:
@@ -240,9 +308,15 @@ def promote_locals(fun: C.Fun, types: Types, params: Sequence[C.Param],
                 edge(block.term.then)
                 edge(block.term.other)
             case C.Switch():
-                block.term.scrutinee = value(block.term.scrutinee)
+                if restricted(block.term.scrutinee):
+                    # The enum moves into the switch, and each arm's block holds its payload.
+                    block.term.scrutinee = extract(block.term.scrutinee)
+                else:
+                    block.term.scrutinee = value(block.term.scrutinee)
                 for arm in block.term.arms:
                     edge(arm.edge)
+        block.instrs = tuple(instructions)
         block.empty = tuple(p for p in block.empty if not restricted(p))
+        block.known = tuple((p, v) for p, v in block.known if not restricted(p))
     fun.locals = tuple((p, t) for p, t in fun.locals if p not in roots)
     return helpers

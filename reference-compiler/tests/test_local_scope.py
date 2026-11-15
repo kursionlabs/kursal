@@ -84,12 +84,26 @@ class LocalScopeTests(unittest.TestCase):
             self.run_source('''forall 'a. fn touch(&x: core::cap::Brand['a], &y: core::cap::Brand['a]) -> u32 { 7u32 }
                 fn main() -> i32 { let exists 'a. w = core::cap::fresh(); touch(&w, &w) as i32 }''', 7)
 
-    def test_locally_branded_sum_view_has_frontend_diagnostic(self):
+    def test_match_on_a_locally_branded_sum_in_place(self):
+        # The switch is on the enum's value; each arm holds the payload and rebuilds the enum.
+        self.run_source('''forall 'a. exposed enum E { A(core::cap::Brand['a], u32), B }
+            forall 'a. exposed struct M { e: E['a], n: u32 }
+            fn main() -> i32 {
+                let exists 'a. w = core::cap::fresh();
+                let value = M.{ e: E::A.(w, 5u32), n: 2u32 };
+                let k = match &value.e { E::A(_, k) => k, E::B => 0u32 };
+                let m = match &value.e { E::A(_, k) => k + value.n, E::B => 9u32 };
+                let { e, n } = value;
+                match e { E::A(_, x) => (k + m + x + n) as i32, E::B => 0i32 }
+            }''', 5 + 7 + 5 + 2)
+
+    def test_locally_branded_sum_tag_has_frontend_diagnostic(self):
         from kursal.lower import LowerError
         with self.assertRaisesRegex(LowerError, 'structural SSA lowering'):
             self.run_source('''forall 'a. exposed enum E { A(core::cap::Brand['a]) }
                 fn main() -> i32 {
                     let exists 'a. w = core::cap::fresh();
                     let value = E::A.(w);
-                    match &value { E::A(payload) => 7i32 }
-                }''', 7)
+                    let tag = core::mem::enum_variant(&value);
+                    match value { E::A(payload) => tag as i32 }
+                }''', 0)
