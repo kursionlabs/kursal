@@ -19,6 +19,10 @@
 // order; `positions` and `key_at` read them in place, without copying. The
 // slots are made at the first key and made again, twice as many, when half
 // are in use; nothing is freed until the arena is, so the old ones stay.
+//
+// Each entry keeps the low 32 bits of its key's hash. A probe compares
+// keys only where those bits agree, and making the slots again (`grow`,
+// `clone`) places each live key by them without hashing or comparing it.
 
 use package as alloc;
 
@@ -51,6 +55,14 @@ struct Entry {
     key: K,
     value: V,
     live: bool,
+    // the low bits of `key_hash` of `key`
+    hash: u32,
+}
+
+// The bits of a key's hash an entry keeps.
+forall K, C where HashIn[K, C].
+fn entry_hash(&cx: C, key: K) -> u32 {
+    key_hash(&cx, key) as u32
 }
 
 forall 'k, C, R where Access[C -> 'k, R].
@@ -184,16 +196,21 @@ impl ArenaMap[K, V, 'k] {
 
 forall K, V, 'k where Copy[K], Copy[V].
 impl ArenaMap[K, V, 'k] {
-    // The slot holding `key`, or the empty slot where it would go, and what
-    // that slot holds.
+    // The slot holding `key`, whose hash bits are `hash`, or the empty slot
+    // where it would go, and what that slot holds.
     forall C, R where Access[C -> 'k, R], HashIn[K, C].
-    fn slot(self, &cx: C, slots: Slice[usize, 'k], entries: ArenaVec[Entry[K, V], 'k], key: K) -> (usize, usize) {
+    fn slot(self, &cx: C, slots: Slice[usize, 'k], entries: ArenaVec[Entry[K, V], 'k], key: K, hash: u32) -> (usize, usize) {
         let mask = slots.len() - 1usize;
-        var i = (key_hash(&cx, key) as usize) & mask;
+        var i = (hash as usize) & mask;
         var entry = slot_at(&cx, slots, i);
-        while entry != 0usize && !HashIn[K, C]::eq_in(&cx, entries.at(&cx, entry - 1usize).key, key) {
-            i = (i + 1usize) & mask;
-            entry = slot_at(&cx, slots, i);
+        var found = false;
+        while !found && entry != 0usize {
+            let e = entries.at(&cx, entry - 1usize);
+            found = e.hash == hash && HashIn[K, C]::eq_in(&cx, e.key, key);
+            if !found {
+                i = (i + 1usize) & mask;
+                entry = slot_at(&cx, slots, i);
+            }
         }
         (i, entry)
     }
@@ -206,7 +223,7 @@ impl ArenaMap[K, V, 'k] {
             Option::Some(s) => s,
             Option::None => return Option::None,
         };
-        let (slot, entry) = self.slot(&cx, slots, h.entries, key);
+        let (slot, entry) = self.slot(&cx, slots, h.entries, key, entry_hash(&cx, key));
         if entry == 0usize || !h.entries.at(&cx, entry - 1usize).live {
             Option::None
         } else {
@@ -261,13 +278,14 @@ impl ArenaMap[K, V, 'k] {
                 fresh
             },
         };
-        let (slot, entry) = self.slot(&cx, slots, h.entries, key);
+        let hash = entry_hash(&cx, key);
+        let (slot, entry) = self.slot(&cx, slots, h.entries, key, hash);
         if entry != 0usize && h.entries.at(&cx, entry - 1usize).live {
-            let old = h.entries.replace(&cx, entry - 1usize, Entry.{ key, value, live: true });
+            let old = h.entries.replace(&cx, entry - 1usize, Entry.{ key, value, live: true, hash });
             return Option::Some.(old.value);
         }
         set_slot(&cx, slots, slot, h.entries.len(&cx) + 1usize);
-        h.entries.push(&cx, Entry.{ key, value, live: true });
+        h.entries.push(&cx, Entry.{ key, value, live: true, hash });
         self.state.set(&cx, MapState.{ slots: Option::Some.(slots), entries: h.entries, count: h.count + 1usize });
         if entry == 0usize && h.entries.len(&cx) * 2usize > slots.len() {
             self.grow(&cx, slots.len() * 2usize);
@@ -282,7 +300,7 @@ impl ArenaMap[K, V, 'k] {
             Option::Some(i) => {
                 let h = self.state.copy(&cx);
                 let e = h.entries.at(&cx, i);
-                h.entries.set(&cx, i, Entry.{ key: e.key, value: e.value, live: false });
+                h.entries.set(&cx, i, Entry.{ key: e.key, value: e.value, live: false, hash: e.hash });
                 self.state.set(&cx, MapState.{ slots: h.slots, entries: h.entries, count: h.count - 1usize });
                 Option::Some.(e.value)
             },
@@ -290,43 +308,57 @@ impl ArenaMap[K, V, 'k] {
         }
     }
 
-    // `slot_count` slots, every key placed again.
-    forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], HashIn[K, C].
+    // `slot_count` slots, every live key placed again by its hash bits.
+    forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q].
     fn grow(self, &cx: C, slot_count: usize) {
         let h = self.state.copy(&cx);
         let slots = slice_of_zeros(&cx, slot_count);
         self.state.set(&cx, MapState.{ slots: Option::Some.(slots), entries: h.entries, count: h.count });
         var k = 0usize;
         while k < h.entries.len(&cx) {
-            let (slot, entry) = self.slot(&cx, slots, h.entries, h.entries.at(&cx, k).key);
-            set_slot(&cx, slots, slot, k + 1usize);
+            let e = h.entries.at(&cx, k);
+            if e.live {
+                place(&cx, slots, e.hash, k + 1usize);
+            }
             k = k + 1usize;
         }
     }
 
     // The same live entries, in the same order, in a map of their own.
-    forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], HashIn[K, C].
+    forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q].
     fn clone(self, &cx: C) -> ArenaMap[K, V, 'k] {
         let h = self.state.copy(&cx);
-        let m: ArenaMap[K, V, 'k] = ArenaMap::new(&cx);
+        let entries: ArenaVec[Entry[K, V], 'k] = ArenaVec::new(&cx);
         if h.count == 0usize {
-            return m;
+            return ArenaMap.{ state: Ref::new(&cx, MapState.{ slots: Option::None, entries, count: 0usize }) };
         }
         var slot_count = 8usize;
         while h.count * 2usize > slot_count {
             slot_count = slot_count * 2usize;
         }
-        m.grow(&cx, slot_count);
+        let slots = slice_of_zeros(&cx, slot_count);
         var i = 0usize;
         while i < h.entries.len(&cx) {
             let e = h.entries.at(&cx, i);
             if e.live {
-                let old = m.insert(&cx, e.key, e.value);
+                place(&cx, slots, e.hash, entries.len(&cx) + 1usize);
+                entries.push(&cx, e);
             }
             i = i + 1usize;
         }
-        m
+        ArenaMap.{ state: Ref::new(&cx, MapState.{ slots: Option::Some.(slots), entries, count: h.count }) }
     }
+}
+
+// Puts `entry` in the first empty slot from where `hash` starts probing.
+forall 'k, C, R where Access[C -> 'k, R].
+fn place(&cx: C, slots: Slice[usize, 'k], hash: u32, entry: usize) {
+    let mask = slots.len() - 1usize;
+    var i = (hash as usize) & mask;
+    while slot_at(&cx, slots, i) != 0usize {
+        i = (i + 1usize) & mask;
+    }
+    set_slot(&cx, slots, i, entry);
 }
 
 // `count` zeros in one block of the arena.

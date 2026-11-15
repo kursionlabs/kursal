@@ -33,7 +33,7 @@ use package as alloc;
 
 use alloc::arena::{Allocate, Arena, Domain};
 use alloc::buffer::Buffer;
-use alloc::heap::out_of_range;
+use alloc::heap::{HeapAllocator, checked_mul, out_of_range};
 use core::cap::{Access, Exclusive};
 use core::cmp::Order;
 use core::hash::{HashIn, HashState};
@@ -41,6 +41,40 @@ use core::mem::{Ref, sizeof};
 use core::option::Option;
 use core::raw::{Span, elem_ptr};
 use core::slice::Slice;
+
+// One bottom-up merge pass of `ArenaVec::sort_by`: merges each pair of
+// adjacent sorted runs of `width` elements of `src` into `dst`. Ties take
+// from the left run, which keeps the sort stable. `unsafe`: `src` and `dst`
+// each hold `n` elements, in blocks that do not overlap.
+forall T, Env, C where Copy[T], Copy[Env].
+unsafe fn merge_runs(&cx: C, src: *T, dst: *T, n: usize, width: usize, cmp: closure[Env](&_: C, T, T) -> Order) {
+    var lo = 0usize;
+    while lo < n {
+        let mid = if width < n - lo { lo + width } else { n };
+        let hi = if width < n - mid { mid + width } else { n };
+        var l = lo;
+        var r = mid;
+        var k = lo;
+        while k < hi {
+            var take_right = l >= mid;
+            if !take_right && r < hi {
+                take_right = match cmp(&cx, unsafe *(unsafe elem_ptr(src, r)), unsafe *(unsafe elem_ptr(src, l))) {
+                    Order::Less => true,
+                    _ => false,
+                };
+            }
+            if take_right {
+                unsafe *(unsafe elem_ptr(dst, k)) = unsafe *(unsafe elem_ptr(src, r));
+                r = r + 1usize;
+            } else {
+                unsafe *(unsafe elem_ptr(dst, k)) = unsafe *(unsafe elem_ptr(src, l));
+                l = l + 1usize;
+            }
+            k = k + 1usize;
+        }
+        lo = hi;
+    }
+}
 
 forall T, 'k.
 struct Header {
@@ -471,11 +505,45 @@ impl ArenaVec[T, 'k] {
         cx = Access[C -> 'k, R]::close(tag, rest);
     }
 
-    // Sorts in place by `cmp`, keeping equal elements in their order (an
-    // insertion sort: stable, and quick on the short or nearly sorted runs
-    // arena data tends to hold).
+    // Sorts in place by `cmp`, keeping equal elements in their order. A
+    // short vec is sorted by insertion; a longer one is copied into a heap
+    // block of twice its length, merge sorted there bottom-up (O(n log n)
+    // comparisons) and copied back, and the block is freed.
     forall Env, C, R where Access[C -> 'k, R], Copy[Env].
     fn sort_by(self, &cx: C, cmp: closure[Env](&_: C, T, T) -> Order) {
+        let n = self.len(&cx);
+        if n <= 16usize {
+            self.insertion_sort(&cx, cmp);
+            return;
+        }
+        let (raw, extent) = HeapAllocator::alloc(checked_mul(checked_mul(n, sizeof[T]()), 2usize)).into_parts();
+        let first = unsafe (raw as *T);
+        let second = unsafe elem_ptr(first, n);
+        var i = 0usize;
+        while i < n {
+            unsafe *(unsafe elem_ptr(first, i)) = self.at(&cx, i);
+            i = i + 1usize;
+        }
+        var src = first;
+        var dst = second;
+        var width = 1usize;
+        while width < n {
+            unsafe merge_runs(&cx, src, dst, n, width, cmp);
+            let t = src;
+            src = dst;
+            dst = t;
+            width = width * 2usize;
+        }
+        i = 0usize;
+        while i < n {
+            self.set(&cx, i, unsafe *(unsafe elem_ptr(src, i)));
+            i = i + 1usize;
+        }
+        let u = HeapAllocator::drop(unsafe HeapAllocator::adopt_raw_sized(raw, extent));
+    }
+
+    forall Env, C, R where Access[C -> 'k, R], Copy[Env].
+    fn insertion_sort(self, &cx: C, cmp: closure[Env](&_: C, T, T) -> Order) {
         var i = 1usize;
         while i < self.len(&cx) {
             let value = self.at(&cx, i);
