@@ -573,7 +573,8 @@ class Backend:
         for block in fun.blocks:
             for instr in block.instrs:
                 a = instr.args
-                if instr.op == "store" and a[0] in seen.keys() | {n for n, _ in fun.locals}:
+                # A forwarded place has no storage to share.
+                if instr.op == "store" and a[0] not in plan.forwarded and a[0] in seen.keys() | {n for n, _ in fun.locals}:
                     path = plan.resident.get((block.label, a[1]))
                     known = seen.get(a[0], "")
                     if path is None or not path.startswith("&") or known not in ("", path):
@@ -586,6 +587,8 @@ class Backend:
                  not any(overlap(path, other) for o, other in found.items() if o != local) and
                  not self.erased(self.roots[local]) and
                  erase(self.roots[local], self.types) == erase(self.place(path)[1], self.types)}
+        if not found:
+            return found
         # A local whose contents C reads as a value stays a variable the C compiler can keep in registers:
         # each whole load of it is moved back to the path alone, directly or as the member at the path of
         # a construction stored in place, and nothing reads part of it but a lend.

@@ -246,6 +246,10 @@ class Plan:
                 incoming[edge.target] = incoming.get(edge.target, 0) + 1
         for block in self.emitted:
             label, term = block.label, block.term
+            # Nothing moves along an edge without arguments, nor a payload but a switch's.
+            if not (isinstance(term, Switch) and not term.scrutinee.startswith("&")) and \
+                    not any(edge.args for edge, _ in term_edges(term)):
+                continue
             reads: dict[str, int] = {}
             for name in [name for instr in block.instrs for name in instr_reads(instr)] + term_reads(term) + \
                     [name for edge, _ in term_edges(term) for name in edge.args]:
@@ -295,6 +299,9 @@ class Plan:
         between the lend and the store but the callee."""
         label, instrs = block.label, block.instrs
         n = len(instrs)
+        # Nothing lies anywhere, nor is stored in place, in a block with no load, destruct, construct or call.
+        if not any(instr.op in ("load", "destruct", "construct", "call") for instr in instrs):
+            return
         alias: dict[str, str] = {}
 
         def find(name: str) -> str:

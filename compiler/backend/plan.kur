@@ -135,6 +135,20 @@ fn param_index(&cx: Domain!['k], block: Block['k], name: Span['k]) -> Option[usi
     Option::None
 }
 
+// The maps `Plan::residences` works in, made once per function and cleared for each block, keeping
+// the room they have.
+forall 'k.
+exposed struct Scratch {
+    alias: ArenaMap[Span['k], Span['k], 'k],
+    stored: ArenaMap[Span['k], Span['k], 'k],
+    held: ArenaMap[Span['k], Type['k], 'k],
+    candidates: ArenaMap[Span['k], (Span['k], usize, Option[usize]), 'k],
+    lent: ArenaMap[usize, ArenaVec[(Span['k], Span['k]), 'k], 'k],
+    last: ArenaMap[Span['k], usize, 'k],
+    reads: ArenaMap[Span['k], usize, 'k],
+    valid: ArenaSet[Span['k], 'k],
+}
+
 forall 'k.
 exposed struct Plan {
     fun: Fun['k],
@@ -163,6 +177,9 @@ exposed struct Plan {
     // (block label, payload parameter) -> (block label, scrutinee, variant) whose payload the
     // parameter reads
     arrived: ArenaMap[(Span['k], Span['k]), (Span['k], Span['k], Span['k]), 'k],
+    // every key of `resident`, `shared` and `arrived`: the values the C reads elsewhere than in a
+    // variable of their own
+    moved: ArenaSet[(Span['k], Span['k]), 'k],
 }
 
 forall 'k.
@@ -181,7 +198,8 @@ impl Plan['k] {
         }
         let plan = Plan.{ fun, blocks, forwarded: ArenaSet::new(&cx), return_index: ArenaMap::new(&cx), emitted: ArenaVec::new(&cx),
             live: ArenaSet::new(&cx), variables: ArenaSet::new(&cx), resident: ArenaMap::new(&cx), in_place: ArenaMap::new(&cx),
-            unwritten: ArenaSet::new(&cx), fused: ArenaSet::new(&cx), shared: ArenaMap::new(&cx), arrived: ArenaMap::new(&cx) };
+            unwritten: ArenaSet::new(&cx), fused: ArenaSet::new(&cx), shared: ArenaMap::new(&cx), arrived: ArenaMap::new(&cx),
+            moved: ArenaSet::new(&cx) };
         plan.forwarded_places(&cx);
         var r = 1usize;
         while r < fun.blocks.len(&cx) {
@@ -202,9 +220,11 @@ impl Plan['k] {
             }
             e = e + 1usize;
         }
+        let scratch = Scratch.{ alias: ArenaMap::new(&cx), stored: ArenaMap::new(&cx), held: ArenaMap::new(&cx), candidates: ArenaMap::new(&cx),
+            lent: ArenaMap::new(&cx), last: ArenaMap::new(&cx), reads: ArenaMap::new(&cx), valid: ArenaSet::new(&cx) };
         var s = 0usize;
         while s < plan.emitted.len(&cx) {
-            plan.residences(&cx, plan.emitted.at(&cx, s), components, adapters, params, shapes);
+            plan.residences(&cx, plan.emitted.at(&cx, s), components, adapters, params, shapes, scratch);
             s = s + 1usize;
         }
         plan.liveness(&cx);
@@ -425,86 +445,107 @@ impl Plan['k] {
         var k = 0usize;
         while k < self.emitted.len(&cx) {
             let block = self.emitted.at(&cx, k);
-            let label = block.label;
-            let reads: ArenaMap[Span['k], usize, 'k] = ArenaMap::new(&cx);
-            let assigned: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
-            var i = 0usize;
-            while i < block.instrs.len(&cx) {
-                let instr = block.instrs.at(&cx, i);
-                var g = 0usize;
-                while g < instr.args.len(&cx) {
-                    match value_read(&cx, instr.args.at(&cx, g)) {
-                        Option::Some(v) => {
-                            reads.insert(&cx, v, reads.get_or(&cx, v, 0usize) + 1usize);
-                        },
-                        Option::None => (),
-                    };
-                    g = g + 1usize;
-                }
-                if !instr.op.is(&cx, "copy") && !self.is_forwarded_load(&cx, instr) && !self.fused.contains(&cx, (label, i))
-                    && !self.in_place.contains(&cx, (label, i)) {
-                    var l = 0usize;
-                    while l < instr.lhs.len(&cx) {
-                        assigned.insert(&cx, instr.lhs.at(&cx, l));
-                        l = l + 1usize;
-                    }
-                }
-                i = i + 1usize;
-            }
-            let ending = term_reads(&cx, block.term);
-            let edges = term_edges(&cx, block.term);
-            var e = 0usize;
-            while e < edges.len(&cx) {
-                let (edge, _skip) = edges.at(&cx, e);
-                ending.append(&cx, edge.args);
-                e = e + 1usize;
-            }
-            var t = 0usize;
-            while t < ending.len(&cx) {
-                reads.insert(&cx, ending.at(&cx, t), reads.get_or(&cx, ending.at(&cx, t), 0usize) + 1usize);
-                t = t + 1usize;
-            }
-            var f = 0usize;
-            while f < edges.len(&cx) {
-                let (edge, skip) = edges.at(&cx, f);
-                let target = self.blocks.at(&cx, edge.target);
-                if !self.return_index.contains(&cx, target.label) && !target.label.eq(&cx, label) {
-                    var a = 0usize;
-                    while a < edge.args.len(&cx) && skip + a < target.params.len(&cx) {
-                        let param = target.params.at(&cx, skip + a).name;
-                        let arg = edge.args.at(&cx, a);
-                        if assigned.contains(&cx, arg) && is_at(reads.get(&cx, arg), 1usize) && !self.resident.contains(&cx, (label, arg))
-                            && self.live.contains(&cx, (target.label, param)) {
-                            self.shared.insert(&cx, (label, arg), (target.label, param));
-                        }
-                        a = a + 1usize;
-                    }
-                }
-                f = f + 1usize;
-            }
-            match block.term {
-                Terminator::Switch(scrutinee, _ty, arms, _pos) => {
-                    let placed = match self.resident.get(&cx, (label, scrutinee)) {
-                        Option::Some(path) => path.starts_with(&cx, Span::from_static(&cx, "&")),
-                        Option::None => false,
-                    };
-                    if !scrutinee.starts_with(&cx, Span::from_static(&cx, "&")) && !placed {
-                        var r = 0usize;
-                        while r < arms.len(&cx) {
-                            let arm = arms.at(&cx, r);
-                            let target = self.blocks.at(&cx, arm.edge.target);
-                            if !self.return_index.contains(&cx, target.label) && !target.label.eq(&cx, label)
-                                && is_at(incoming.get(&cx, target.label), 1usize) && !target.params.is_empty(&cx) {
-                                self.arrived.insert(&cx, (target.label, target.params.at(&cx, 0usize).name), (label, scrutinee, arm.variant));
-                            }
-                            r = r + 1usize;
-                        }
-                    }
-                },
-                _ => (),
+            // Nothing moves along an edge without arguments, nor a payload but a switch's.
+            let edges_here = term_edges(&cx, block.term);
+            var moving = match block.term {
+                Terminator::Switch(scrutinee, _ty, _arms, _pos) => !scrutinee.starts_with(&cx, Span::from_static(&cx, "&")),
+                _ => false,
             };
+            var q = 0usize;
+            while !moving && q < edges_here.len(&cx) {
+                let (edge, _skip) = edges_here.at(&cx, q);
+                moving = !edge.args.is_empty(&cx);
+                q = q + 1usize;
+            }
+            if moving {
+                self.share_block(&cx, block, incoming);
+            }
             k = k + 1usize;
         }
+    }
+
+    // `share` in one block that passes something along an edge.
+    fn share_block(self, &cx: Domain!['k], block: Block['k], incoming: ArenaMap[Span['k], usize, 'k]) {
+        let label = block.label;
+        let reads: ArenaMap[Span['k], usize, 'k] = ArenaMap::new(&cx);
+        let assigned: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+        var i = 0usize;
+        while i < block.instrs.len(&cx) {
+            let instr = block.instrs.at(&cx, i);
+            var g = 0usize;
+            while g < instr.args.len(&cx) {
+                match value_read(&cx, instr.args.at(&cx, g)) {
+                    Option::Some(v) => {
+                        reads.insert(&cx, v, reads.get_or(&cx, v, 0usize) + 1usize);
+                    },
+                    Option::None => (),
+                };
+                g = g + 1usize;
+            }
+            if !instr.op.is(&cx, "copy") && !self.is_forwarded_load(&cx, instr) && !self.fused.contains(&cx, (label, i))
+                && !self.in_place.contains(&cx, (label, i)) {
+                var l = 0usize;
+                while l < instr.lhs.len(&cx) {
+                    assigned.insert(&cx, instr.lhs.at(&cx, l));
+                    l = l + 1usize;
+                }
+            }
+            i = i + 1usize;
+        }
+        let ending = term_reads(&cx, block.term);
+        let edges = term_edges(&cx, block.term);
+        var e = 0usize;
+        while e < edges.len(&cx) {
+            let (edge, _skip) = edges.at(&cx, e);
+            ending.append(&cx, edge.args);
+            e = e + 1usize;
+        }
+        var t = 0usize;
+        while t < ending.len(&cx) {
+            reads.insert(&cx, ending.at(&cx, t), reads.get_or(&cx, ending.at(&cx, t), 0usize) + 1usize);
+            t = t + 1usize;
+        }
+        var f = 0usize;
+        while f < edges.len(&cx) {
+            let (edge, skip) = edges.at(&cx, f);
+            let target = self.blocks.at(&cx, edge.target);
+            if !self.return_index.contains(&cx, target.label) && !target.label.eq(&cx, label) {
+                var a = 0usize;
+                while a < edge.args.len(&cx) && skip + a < target.params.len(&cx) {
+                    let param = target.params.at(&cx, skip + a).name;
+                    let arg = edge.args.at(&cx, a);
+                    if assigned.contains(&cx, arg) && is_at(reads.get(&cx, arg), 1usize) && !self.resident.contains(&cx, (label, arg))
+                        && self.live.contains(&cx, (target.label, param)) {
+                        self.shared.insert(&cx, (label, arg), (target.label, param));
+                        self.moved.insert(&cx, (label, arg));
+                    }
+                    a = a + 1usize;
+                }
+            }
+            f = f + 1usize;
+        }
+        match block.term {
+            Terminator::Switch(scrutinee, _ty, arms, _pos) => {
+                let placed = match self.resident.get(&cx, (label, scrutinee)) {
+                    Option::Some(path) => path.starts_with(&cx, Span::from_static(&cx, "&")),
+                    Option::None => false,
+                };
+                if !scrutinee.starts_with(&cx, Span::from_static(&cx, "&")) && !placed {
+                    var r = 0usize;
+                    while r < arms.len(&cx) {
+                        let arm = arms.at(&cx, r);
+                        let target = self.blocks.at(&cx, arm.edge.target);
+                        if !self.return_index.contains(&cx, target.label) && !target.label.eq(&cx, label)
+                            && is_at(incoming.get(&cx, target.label), 1usize) && !target.params.is_empty(&cx) {
+                            self.arrived.insert(&cx, (target.label, target.params.at(&cx, 0usize).name), (label, scrutinee, arm.variant));
+                            self.moved.insert(&cx, (target.label, target.params.at(&cx, 0usize).name));
+                        }
+                        r = r + 1usize;
+                    }
+                }
+            },
+            _ => (),
+        };
     }
 
     // ---------------------------------------------------------------- residences --
@@ -513,17 +554,35 @@ impl Plan['k] {
     // plan.py states the rules. A candidate is (path, the first index after the instruction that took
     // the class's first value out of the path, the adapter call it waits on).
     fn residences(self, &cx: Domain!['k], block: Block['k], components: ArenaMap[(Span['k], usize), ArenaVec[Span['k], 'k], 'k],
-        adapters: ArenaMap[Span['k], Adapter['k], 'k], params: ArenaSet[Span['k], 'k], shapes: ArenaMap[(Span['k], usize), Type['k], 'k]) {
+        adapters: ArenaMap[Span['k], Adapter['k], 'k], params: ArenaSet[Span['k], 'k], shapes: ArenaMap[(Span['k], usize), Type['k], 'k],
+        scratch: Scratch['k]) {
         let label = block.label;
         let instrs = block.instrs;
         let n = instrs.len(&cx);
-        let alias: ArenaMap[Span['k], Span['k], 'k] = ArenaMap::new(&cx);
-        let stored: ArenaMap[Span['k], Span['k], 'k] = ArenaMap::new(&cx);
+        // Nothing lies anywhere, nor is stored in place, in a block with no load, destruct, construct
+        // or call.
+        var busy = false;
+        var b = 0usize;
+        while !busy && b < n {
+            let op = instrs.at(&cx, b).op;
+            busy = op.is(&cx, "load") || op.is(&cx, "destruct") || op.is(&cx, "construct") || op.is(&cx, "call");
+            b = b + 1usize;
+        }
+        if !busy {
+            return;
+        }
+        let alias = scratch.alias;
+        alias.clear(&cx);
+        let stored = scratch.stored;
+        stored.clear(&cx);
         // path -> the type of the value there that a destruct took apart
-        let held: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
-        let candidates: ArenaMap[Span['k], (Span['k], usize, Option[usize]), 'k] = ArenaMap::new(&cx);
+        let held = scratch.held;
+        held.clear(&cx);
+        let candidates = scratch.candidates;
+        candidates.clear(&cx);
         // adapter call index -> (class, path) of each borrowed value, in the order handed back
-        let lent: ArenaMap[usize, ArenaVec[(Span['k], Span['k]), 'k], 'k] = ArenaMap::new(&cx);
+        let lent = scratch.lent;
+        lent.clear(&cx);
         var i = 0usize;
         while i < n {
             let instr = instrs.at(&cx, i);
@@ -592,8 +651,10 @@ impl Plan['k] {
             i = i + 1usize;
         }
 
-        let last: ArenaMap[Span['k], usize, 'k] = ArenaMap::new(&cx);
-        let reads: ArenaMap[Span['k], usize, 'k] = ArenaMap::new(&cx);
+        let last = scratch.last;
+        last.clear(&cx);
+        let reads = scratch.reads;
+        reads.clear(&cx);
         var j = 0usize;
         while j < n {
             let args = instrs.at(&cx, j).args;
@@ -625,7 +686,8 @@ impl Plan['k] {
             t = t + 1usize;
         }
 
-        let valid: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+        let valid = scratch.valid;
+        valid.clear(&cx);
         var v = 0usize;
         while v < candidates.positions(&cx) {
             match candidates.key_at(&cx, v) {
@@ -756,6 +818,7 @@ impl Plan['k] {
                     };
                     if ready && !path.eq(&cx, name) {
                         self.resident.insert(&cx, (label, name), path);
+                        self.moved.insert(&cx, (label, name));
                     }
                 }
                 h = h + 1usize;

@@ -1600,7 +1600,9 @@ impl Backend['k] {
             while i < block.instrs.len(&cx) {
                 let instr = block.instrs.at(&cx, i);
                 let a = instr.args;
-                if instr.op.is(&cx, "store") && (seen.contains(&cx, a.at(&cx, 0usize)) || local_names.contains(&cx, a.at(&cx, 0usize))) {
+                // A forwarded place has no storage to share.
+                if instr.op.is(&cx, "store") && !plan.forwarded.contains(&cx, a.at(&cx, 0usize))
+                    && (seen.contains(&cx, a.at(&cx, 0usize)) || local_names.contains(&cx, a.at(&cx, 0usize))) {
                     let local = a.at(&cx, 0usize);
                     let lying = plan.resident.get(&cx, (block.label, a.at(&cx, 1usize)));
                     let path = match lying {
@@ -1670,6 +1672,9 @@ impl Backend['k] {
                 Option::None => (),
             };
             f = f + 1usize;
+        }
+        if found.is_empty(&cx) {
+            return found;
         }
         // A local whose contents C reads as a value stays a variable: each whole load of it is moved
         // back to the path alone, and nothing reads part of it but a lend.
@@ -2063,6 +2068,12 @@ impl Backend['k] {
     fn value_name(self, &cx: Domain!['k], name: Span['k]) -> Span['k] {
         let plan = self.the_plan(&cx);
         let key = (self.label.copy(&cx), name);
+        if !plan.moved.contains(&cx, key) {
+            return match self.aliases.copy(&cx).get(&cx, key) {
+                Option::Some(alias) => alias,
+                Option::None => self.cname(&cx, self.label.copy(&cx), name),
+            };
+        }
         match plan.resident.get(&cx, key) {
             Option::Some(path) => {
                 let (expr, _ty) = self.place(&cx, path);
