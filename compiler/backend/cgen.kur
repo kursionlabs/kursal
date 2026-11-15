@@ -1102,11 +1102,19 @@ impl Backend['k] {
         var r = 0usize;
         while r < entry.params.len(&cx) {
             let binding = entry.params.at(&cx, r);
-            refs.push(&cx, !binding.name.starts_with(&cx, Span::from_static(&cx, "&")) && self.words(&cx, subst(&cx, binding.type, sub, self.counter)) > 2usize);
+            refs.push(&cx, !binding.name.starts_with(&cx, Span::from_static(&cx, "&")) && self.by_pointer(&cx, subst(&cx, binding.type, sub, self.counter)));
             r = r + 1usize;
         }
         self.by_ref.insert(&cx, symbol, refs);
         symbol
+    }
+
+    // A value of `ty` is passed by pointer: its C representation is more than four words. Up to four
+    // words the C compiler copies it in as many moves, while a pointer costs the callee a load per read
+    // and the inliner a higher estimate: `Interp::cons` of `examples/lisp`, taking two four-word values,
+    // is not inlined into the interpreter's loop when it takes them by pointer.
+    fn by_pointer(self, &cx: Domain!['k], ty: Type['k]) -> bool {
+        self.words(&cx, ty) > 4usize
     }
 
     // The size of `ty`'s C representation in 8-byte words, as estimated from its structure: a scalar
@@ -3131,13 +3139,13 @@ impl Backend['k] {
         if mapper.params.len(&cx) != binders.len(&cx) + own.len(&cx) {
             fail_at(&cx, Span::from_static(&cx, "foreach mapper parameter partition disagrees"), instr.pos);
         }
-        // A captured value the mapper takes by pointer (an aggregate of more than two words, as
+        // A captured value the mapper takes by pointer (an aggregate of more than four words, as
         // `request` decides for its parameter of that type) is passed by its address.
         let caps: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         var c = 2usize;
         while c < instr.args.len(&cx) {
             if !self.value_erased(&cx, instr.args.at(&cx, c)) {
-                if self.words(&cx, self.type_of(&cx, instr.args.at(&cx, c))) > 2usize {
+                if self.by_pointer(&cx, self.type_of(&cx, instr.args.at(&cx, c))) {
                     caps.push(&cx, self.by_address(&cx, &lines, instr.args.at(&cx, c), ArenaVec::new(&cx)));
                 } else {
                     caps.push(&cx, self.value_name(&cx, instr.args.at(&cx, c)));

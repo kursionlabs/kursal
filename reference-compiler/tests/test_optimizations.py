@@ -225,9 +225,9 @@ class SharingTests(unittest.TestCase):
 class ByPointerTests(unittest.TestCase):
     def test_aggregates_are_passed_by_pointer(self):
         c = c_of("""
-(type Big (struct (a u64) (b u64) (c u64) (d u64)))
-(fun sum u64 (Big) (entry ((%p Big)) (= (%a %b %c %d) (destruct %p Big)) (= %x (add %a %b)) (= %y (add %c %d))
-  (= %r (add %x %y)) (ret %r)))
+(type Big (struct (a u64) (b u64) (c u64) (d u64) (e u64)))
+(fun sum u64 (Big) (entry ((%p Big)) (= (%a %b %c %d %e) (destruct %p Big)) (= %x (add %a %b)) (= %y (add %c %d))
+  (= %w (add %x %y)) (= %r (add %w %e)) (ret %r)))
 (fun count u64 (Big u64) (entry ((%p Big) (%n u64)) (= %z (const u64 0)) (= %n2 (copy %n)) (= %done (eq %n2 %z))
   (jnz %done (fin %p) (more %p %n)))
   (fin ((%q Big)) (= %r (call sum %q)) (ret %r))
@@ -235,7 +235,7 @@ class ByPointerTests(unittest.TestCase):
 (fun peek u64 (Big) (entry ((&b Big)) (= %v (load &b)) (= %r (call sum %v)) (ret %r)))
 (fun main i32 () (locals (&x Big))
   (entry () (= %one (const u64 1)) (= %two (const u64 2)) (= %three (const u64 3)) (= %four (const u64 4))
-    (= %big (construct Big %one %two %three %four)) (= %b1 (copy %big)) (= %b2 (copy %big)) (= %b3 (copy %big))
+    (= %five (const u64 5)) (= %big (construct Big %one %two %three %four %five)) (= %b1 (copy %big)) (= %b2 (copy %big)) (= %b3 (copy %big))
     (= %s (call sum %big)) (= %u (store &x %b1)) (= %t (call peek &x)) (= %f (fn sum)) (= %g (call %f %b2))
     (= %k (const u64 3)) (= %h (call count %b3 %k))
     (= %st (add %s %t)) (= %gh (add %g %h)) (= %all (add %st %gh)) (= %i (int_cast %all i32)) (ret %i)))""")
@@ -247,7 +247,7 @@ class ByPointerTests(unittest.TestCase):
         self.assertRegex(body(c, "peek"), r"arg_\d+ = \(\*entry_b\w*\);")
         # A function value calls the by-value entry.
         self.assertRegex(c, r"static uint64_t \w*sum\w*_value\(K_Big entry_p\w*\) \{\n  return \w*sum\w*\(&entry_p\w*\);")
-        self.assertEqual(run(c), 40)
+        self.assertEqual(run(c), 60)
 
 
 SUM = """

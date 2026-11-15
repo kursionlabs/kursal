@@ -311,14 +311,18 @@ Then, while writing the C (`backend::cgen`, `cgen.py`):
     integer, floating or pointer type; the call lends no local place; and the caller has no
     `alloca`, so no argument can point into the frame the tail call frees. `KUR_MUSTTAIL` is
     `__attribute__((musttail))` under Clang and nothing elsewhere.
-- **Aggregates by pointer.** A value parameter whose C representation is more than two 8-byte words
-  (`Backend::words`, an estimate from the type's structure) is a `T const*`: the caller passes the
-  address of where the value lies, or of a copy of it (see "Why passing aggregates by pointer is
-  sound"), and the callee reads it through the pointer, or copies it into its own variable first
-  where it writes that variable (a call of itself in tail position, a lend in place of a path in
-  it). A function whose address is taken keeps the plain convention for function values: they call
-  its by-value entry (`thunk`), which passes the addresses on. A call through a function value or
-  to a foreign function passes values as before.
+- **Aggregates by pointer.** A value parameter whose C representation is more than four 8-byte words
+  (`Backend::by_pointer`, from `Backend::words`, an estimate from the type's structure) is a
+  `T const*`: the caller passes the address of where the value lies, or of a copy of it (see "Why
+  passing aggregates by pointer is sound"), and the callee reads it through the pointer, or copies it
+  into its own variable first where it writes that variable (a call of itself in tail position, a
+  lend in place of a path in it). A function whose address is taken keeps the plain convention for
+  function values: they call its by-value entry (`thunk`), which passes the addresses on. A call
+  through a function value or to a foreign function passes values as before. Up to four words the C
+  compiler copies a value in as many moves, and a pointer would cost the callee a load per read and
+  raise the inliner's estimate of it: `examples/lisp`'s `Interp::cons`, taking two four-word values,
+  is not inlined into the interpreter's loop when it takes them by pointer, and the interpreter runs
+  4% more instructions.
 - **`const` and `restrict` place parameters.** A place parameter `&x: T` is a `T*`. When the whole
   program has been written, `qualifiers` makes it `T const*` when the function stores into no path
   under it and lends it only to `const` place parameters, and `T* restrict` when nothing reaches the

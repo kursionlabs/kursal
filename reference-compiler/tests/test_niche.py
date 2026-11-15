@@ -98,8 +98,7 @@ class NicheLayoutTests(unittest.TestCase):
             (done ((%r i32)) (ret %r))
             (bad () (= %r (const i32 1)) (ret %r)))''', 7)
         self.assertIn("struct K_Run { uint64_t f_len; uint8_t* f_start; uint8_t* f_end; };", output)
-        # The three-word enum is taken by pointer, and its niche read through it.
-        self.assertIn("switch (((*entry_o_1).f_start == 0 ? 0 : 1)) {", output)
+        self.assertIn("switch ((entry_o_1.f_start == 0 ? 0 : 1)) {", output)
         self.assertIn("entry_z.f_start = 0;", output)
 
     def test_niches_in_tuples_and_arrays(self):

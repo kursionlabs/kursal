@@ -17,7 +17,7 @@ payload with a niche, the other variant a null there (`niche_layout`, `tag`, `pa
 What a function's C leaves out (dead values, copies, forwarded places, return joins) and where it
 reads values where they lie (residences, lend adapters in place) is decided by plan.py, after local
 places that only hold what was moved out of another place are given its storage (`homes`). A value
-parameter of more than two words is taken by pointer (`by_ref`, `by_address`, `thunk`). Beyond that
+parameter of more than four words is taken by pointer (`by_ref`, `by_address`, `thunk`). Beyond that
 the backend makes calls in tail position jumps (`tail_call`), and qualifies place parameters `const`
 and `restrict` where the whole program allows it (`qualifiers`)."""
 
@@ -351,9 +351,16 @@ class Backend:
                                                   *(type_key(t) for t in args))))
         self.symbols.setdefault(id(fun), []).append((args, symbol))
         self.queue.append((fun, dict(sub), symbol))
-        self.by_ref[symbol] = tuple(not name.startswith("&") and self.words(subst(ty, sub)) > 2
+        self.by_ref[symbol] = tuple(not name.startswith("&") and self.by_pointer(subst(ty, sub))
                                     for name, ty in fun.blocks[0].params)
         return symbol
+
+    def by_pointer(self, ty: Type) -> bool:
+        """A value of `ty` is passed by pointer: its C representation is more than four words. Up to four
+        words the C compiler copies it in as many moves, while a pointer costs the callee a load per read
+        and the inliner a higher estimate: `Interp::cons` of `examples/lisp`, taking two four-word values,
+        is not inlined into the interpreter's loop when it takes them by pointer."""
+        return self.words(ty) > 4
 
     def words(self, ty: Type) -> int:
         """The size of `ty`'s C representation in 8-byte words, as estimated from its structure: a
@@ -1281,9 +1288,9 @@ class Backend:
         own = [self.substitute_type(x) for x in instr.tys]
         if len(mapper.params) != len(binders) + len(own):
             raise KursError("foreach mapper parameter partition disagrees", instr.pos)
-        # A captured value the mapper takes by pointer (an aggregate of more than two words, as `by_ref`
+        # A captured value the mapper takes by pointer (an aggregate of more than four words, as `by_ref`
         # decides for its parameter of that type) is passed by its address.
-        caps = [self.by_address(c, ()) if self.words(self.type_of(c)) > 2 else self.value_name(c)
+        caps = [self.by_address(c, ()) if self.by_pointer(self.type_of(c)) else self.value_name(c)
                 for c in instr.args[2:] if not self.erased(self.type_of(c))]
         skeleton, rows = self.types.rows(t.source)
         pointer = isinstance(self.shape(t.source), Ptr) and not isinstance(t.source, Foreach)
