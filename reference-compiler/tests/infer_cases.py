@@ -202,7 +202,7 @@ INFER_ERRORS = (
     ('fn f() -> u32 { core::ptr::NonNull(); 0u32 }\n', 'unknown builtin NonNull'),
     ('fn f() -> u32 { core::atomic::fence(); 0u32 }\n', 'fence takes one ordering argument'),
     ('fn f() -> u32 { let b = core::cap::static_brand(1u32); 0u32 }\n', 'takes 0 value arguments'),
-    ('fn f() -> u32 { let p = core::mem[u32]::alloca[u32](); 0u32 }\n', 'builtin namespace does not take'),
+    ('fn f() -> u32 { let p = core::mem[u32]::alloca[u32](); 0u32 }\n', 'type arguments belong on alloca, not a namespace'),
     ('fn f() -> u32 { let p = core::mem::alloca(); 0u32 }\n', 'alloca takes 1 type arguments'),
     ('use std::alloc::buffer::Buffer;\nfn f() -> u32 { let b = f"x".write(); 0u32 }\n', 'write takes the writer'),
     ('exposed struct C { n: u32 }\nimpl C { fn get(self) -> u32 { 0u32 } }\nfn f(c: C) -> u32 { var d = c; &d.get() }\n', 'takes its receiver by value'),

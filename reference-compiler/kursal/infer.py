@@ -1233,7 +1233,7 @@ class Infer:
         assert isinstance(expr.callee, S.Path)
         targs = expr.callee.segments[-1][2]
         if any(args for _, _, args in expr.callee.segments[:-1]):
-            fail("builtin namespace does not take type arguments", expr.pos)
+            fail(f"type arguments belong on {name}, not a namespace", expr.pos)
         expected_types = 1 if name in ("alloca", "sizeof") else 0
         if len(targs) != expected_types:
             fail(f"{name} takes {expected_types} type arguments", expr.pos)
