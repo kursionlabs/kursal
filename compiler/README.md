@@ -292,9 +292,18 @@ What a function leaves out is decided first, from its KURS alone (`backend::plan
 - **Shared variables** (`Plan::share`). A value assigned in a block and read by one edge alone, as
   the argument of a live parameter of another block, is assigned to that parameter's variable, and
   the edge assigns nothing: an enum result of a call or of a construction is made in the join's
-  variable. The payload parameter of a block that only one arm of a switch on a value enters reads
+  variable, unless the block reads its payload in that variable (below). The payload parameter of a block that only one arm of a switch on a value enters reads
   the payload where the scrutinee lies, when that is a C variable (not a place, which the arm's block
   may write).
+
+- **Homed parameters** (`Plan::home_params`). A block parameter of a struct or tuple type that its
+  block takes apart, and whose component the block only stores into a place path its header declares
+  empty, gets that component written at the path by every edge into the block: where the argument is
+  made, when a construction or a call makes it into the parameter's variable, else at the edge after
+  its other assignments, unless an earlier write there would change it. The store writes nothing,
+  and the component lies at the path. A join
+  `let (next, hot) = match state { ... }; state = next;` so writes each arm's state straight into
+  `state`.
 
 Then, while writing the C (`backend::cgen`, `cgen.py`):
 
@@ -323,6 +332,15 @@ Then, while writing the C (`backend::cgen`, `cgen.py`):
   raise the inliner's estimate of it: `examples/lisp`'s `Interp::cons`, taking two four-word values,
   is not inlined into the interpreter's loop when it takes them by pointer, and the interpreter runs
   4% more instructions.
+- **Out-results.** A Kursal function whose result is a tuple with elements of more than four words
+  (`Backend::outs`, decided in `request` beside `by_ref`) takes, after its other parameters, a
+  pointer for each such element (`T* out_k`), writes the element there, and returns a tuple of the
+  other elements (`void` when none has bytes). A construction it returns and reads nowhere else
+  writes those elements through the pointers at once. A caller passes the place path a homed
+  component ends up at, its own out pointer for the same element when it returns the result as it
+  is, else the member of the result's variable; the rest of the C result goes to the other members.
+  A function value, and a `foreach` mapper, calls such a function through its by-value entry
+  (`thunk`), which returns the whole tuple.
 - **`const` and `restrict` place parameters.** A place parameter `&x: T` is a `T*`. When the whole
   program has been written, `qualifiers` makes it `T const*` when the function stores into no path
   under it and lends it only to `const` place parameters, and `T* restrict` when nothing reaches the
@@ -446,10 +464,52 @@ plan (`Plan::residences`) allows a residence only where that holds:
    and read only in that block. A value sharing it is assigned in a predecessor and read by nothing
    but the edge, which leaves the predecessor and enters the block, so its life and the parameter's
    do not overlap, and the predecessor is never the block itself. A payload parameter read from its
-   scrutinee's variable: only the switch's block assigns that variable (1), the arm's block is entered
-   from that switch alone and is not the switch's block, so the switch's block runs again only after
-   the arm's block has left; the moves of an edge out of the arm's block read the scrutinee's
-   variable, which `Move.base` accounts for.
+   scrutinee's variable: the switch's block assigns that variable (1), or, when the scrutinee lies in
+   a parameter's variable, the edges into the switch's block and the values shared into the
+   parameter; the arm's block is entered from that switch alone and is not the switch's block, so the
+   switch's block runs again only after the arm's block has left, and the arm's block (and a block
+   whose payload it passes on, read in the same variable) shares no value into the variable it reads
+   its payload in, which it may read after the value is made. The moves of an edge out of the arm's
+   block read the scrutinee's variable, which `Move.base` accounts for.
+
+### Why homed parameters and out-results are sound
+
+A homed component is written at its place path P earlier than the store that KURS has write it, and
+an out-result is written through a pointer by the callee instead of returned:
+
+1. **P is empty from the write to the store.** The block's header says P is empty where the block is
+   entered, so at the end of every edge into it (the place states of an edge are those of its
+   target), and nothing in the edge's block after the write, nor in the block before the store, names
+   a path overlapping P: no store fills it and no lend reaches it. An empty place holds no value: its
+   bytes belong to nothing the program may read, whatever pointer it reads through. A `Copy` value
+   loaded out of P leaves it full, so such a P is never empty in a header.
+2. **Nothing reads P's new contents but the store.** No value lying at a path overlapping P is read
+   after the write (the plan checks the rest of the block, its terminator and its edges), and the
+   component's value is read only by the store, which writes nothing: what is at P when the store
+   runs is that value.
+3. **No write under a later read.** An edge, or a construction making the argument, writes its homed
+   components one after another, in the order of the parameters and their components, so a component
+   is not homed when it lies at a path overlapping the path of one homed before it in that order: the
+   earlier write would change it (`(b, a)` stored back into `(&s.0, &s.1)` from `(&s.0, &s.1)` homes
+   one of the two). A component lying at a path that overlaps its own P without being P is not homed
+   either (C forbids the overlapping assignment); one lying at P itself is not written. At an edge the
+   homed components are written after every other assignment, so the moves read what they read
+   before, and a component is not homed when it lies in the variable of a parameter of the edge's
+   target (a block jumping to itself, or a payload read in the target's variable), which the moves
+   may have assigned by then.
+4. **Out pointers reach nothing else.** A callee writes an out pointer's pointee and never reads it.
+   The pointee is a homed path P, which the call lends to nobody (the plan refuses a call lending a
+   path overlapping P) and which no argument passed by pointer lies in (`by_address` copies one
+   that does); the caller's own out pointer, exclusive by the same argument one call up; or a member
+   of the variable of the call's result, which the call defines, so no argument lies in it: a value
+   of another block lies in it only as a payload read where its scrutinee lies, and a block reading
+   its payload in a parameter's variable shares no value into that parameter (9 above). The
+   callee writes it at a return, or at a construction that is returned and read nowhere else, after
+   which nothing in the callee reads anything there.
+5. **Calls through function values** keep the plain convention: they reach a function writing out
+   pointers through its by-value entry, whose pointees are its own locals. A `foreach` mapper does
+   the same. A self tail call keeps the out pointers it was given; `musttail` needs a scalar result,
+   which a reduced tuple is not.
 
 ### Zero-size types are erased
 

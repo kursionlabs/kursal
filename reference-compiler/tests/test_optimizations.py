@@ -271,6 +271,165 @@ PARITY = """
 UNOPTIMIZED = ["-O0", "-w", "-fno-builtin"]
 
 
+BIG = "(type Big (struct (a u64) (b u64) (c u64) (d u64) (e u64)))"
+
+
+def big(name: str, value: int) -> str:
+    """Instructions making `%name`, a `Big` with `value` in every field."""
+    copies = " ".join(f"(= %{name}_{k} (copy %{name}_v))" for k in range(5))
+    fields = " ".join(f"%{name}_{k}" for k in range(5))
+    return f"(= %{name}_v (const u64 {value})) {copies} (= %{name} (construct Big {fields}))"
+
+
+class OutResultTests(unittest.TestCase):
+    def test_big_elements_of_a_tuple_result_are_written_through_out_pointers(self):
+        c = c_of("""
+(type Big (struct (a u64) (b u64) (c u64) (d u64) (e u64)))
+(fun sum u64 (Big) (entry ((%p Big)) (= (%a %b %c %d %e) (destruct %p Big)) (= %x (add %a %b)) (= %y (add %c %d))
+  (= %w (add %x %y)) (= %r (add %w %e)) (ret %r)))
+(fun make (tuple Big u64) (u64) (entry ((%n u64)) (= %one (const u64 1)) (= %n0 (copy %n)) (= %m (add %n0 %one))
+  (= %n1 (copy %n)) (= %n2 (copy %n)) (= %n3 (copy %n)) (= %n4 (copy %n)) (= %big (construct Big %n1 %n2 %n3 %n4 %m))
+  (= %r (construct (tuple Big u64) %big %n)) (ret %r)))
+(fun pass (tuple Big u64) (u64) (entry ((%n u64)) (= %r (call make %n)) (ret %r)))
+(fun twice u64 (u64) (entry ((%n u64)) (= %f (fn make)) (= %t (call %f %n)) (= (%b %k) (destruct %t (tuple Big u64)))
+  (= %s (call sum %b)) (= %r (add %s %k)) (ret %r)))
+(fun main i32 () (locals (&x Big))
+  (entry () (= %z1 (const u64 2)) (= %z2 (const u64 2)) (= %z3 (const u64 2)) (= %z4 (const u64 2)) (= %z5 (const u64 2))
+    (= %b0 (construct Big %z1 %z2 %z3 %z4 %z5)) (= %u (store &x %b0)) (= %old (load &x))
+    (= %s0 (call sum %old)) (= %s1 (copy %s0)) (= %s2 (copy %s0)) (= %c (eq %s1 %s2)) (jnz %c (left) (right)))
+  (left () (empty &x) (= %k (const u64 3)) (= %r (call pass %k)) (jmp join %r))
+  (right () (empty &x) (= %k (const u64 4)) (= %k1 (copy %k)) (= %k2 (copy %k)) (= %k3 (copy %k)) (= %k4 (copy %k))
+    (= %k5 (copy %k)) (= %b (construct Big %k1 %k2 %k3 %k4 %k5)) (= %t (construct (tuple Big u64) %b %k)) (jmp join %t))
+  (join ((%p (tuple Big u64))) (empty &x) (= (%big %n) (destruct %p (tuple Big u64))) (= %u2 (store &x %big))
+    (= %v (load &x)) (= %s (call sum %v)) (= %seven (const u64 7)) (= %w (call twice %seven))
+    (= %a1 (add %s %n)) (= %a2 (add %a1 %w)) (= %i (int_cast %a2 i32)) (ret %i)))""")
+        # The callee writes the big element through its out pointer, at the construction it returns.
+        self.assertRegex(head(c, "make"), r"^uint64_t entry_n\w*, K_Big\* out_0\w*$")
+        self.assertRegex(body(c, "make"), r"\*out_0\w* = entry_big\w*;\n  return \(K_tuple_\d+\)\{ \.e0 = entry_r\w*\.e1 \};")
+        # A result returned as it is gets the caller's own out pointer.
+        self.assertRegex(body(c, "pass"), r"= _ZN4kurs4make\w*\(entry_n\w*, out_0\w*\);")
+        self.assertNotIn("*out_0", body(c, "pass"))
+        # Each arm writes the joined element straight into the emptied place, which the join stores no more.
+        self.assertRegex(body(c, "main"), r"= _ZN4kurs4pass\w*\(left_k\w*, &p_x\w*\);")
+        self.assertRegex(body(c, "main"), r"\n  p_x\w* = right_b\w*;\n  goto L_join;")
+        self.assertNotRegex(body(c, "main"), r"p_x\w* = join_")
+        # A function value calls the by-value entry, which returns the whole tuple.
+        self.assertRegex(c, r"static K_tuple \w*make\w*_value\(uint64_t entry_n\w*\) \{\n  K_Big out_0\w*;\n")
+        self.assertEqual(run(c), 62)
+
+    def test_an_out_pointer_never_points_where_an_argument_lies(self):
+        c = c_of(BIG + f"""
+(fun f (tuple Big Big) (Big) (entry ((%b Big)) {big("n", 50)} (= %t (construct (tuple Big Big) %n %b)) (ret %t)))
+(fun main i32 () (locals (&x Big))
+  (entry () {big("b0", 1)} (= %u (store &x %b0)) (= %c (const bool true)) (jnz %c (left) (right)))
+  (left () (= %v (load &x)) (= %r (call f %v)) (jmp join %r))
+  (right () (= %v (load &x)) {big("m", 7)} (= %t (construct (tuple Big Big) %m %v)) (jmp join %t))
+  (join ((%p (tuple Big Big))) (empty &x) (= (%a %b) (destruct %p (tuple Big Big))) (= %u2 (store &x %a))
+    (= (%ba %bb %bc %bd %be) (destruct %b Big)) (= %w (load &x)) (= (%wa %wb %wc %wd %we) (destruct %w Big))
+    (= %s (add %wa %ba)) (= %i (int_cast %s i32)) (ret %i)))""")
+        # `f` writes its first element into `x` while it reads its argument, which lay in `x`: it reads a copy.
+        self.assertRegex(body(c, "main"), r"(arg_\w+) = p_x\w*;\n  _ZN4kurs1f\w*\(&\1, &p_x\w*, &join_p\w*\.e1\);")
+        self.assertEqual(run(c), 51)
+
+    def test_no_value_is_made_in_the_variable_a_payload_is_read_in(self):
+        # The loop's state lies in its parameter's variable, and the arm reads its payload there: what the
+        # arm makes for the next round, by a construction or through out pointers, is made elsewhere.
+        def program(arm: str) -> str:
+            return BIG + f"""
+(type St (enum (A (tuple Big Big)) (C (tuple Big Big))))
+(fun step (tuple St Big) ((tuple Big Big)) (entry ((%p (tuple Big Big))) (= (%x %y) (destruct %p (tuple Big Big)))
+  {big("n1", 50)} {big("n2", 60)} (= %np (construct (tuple Big Big) %n1 %n2)) (= %s2 (construct_variant St C %np))
+  (= %t2 (construct (tuple St Big) %s2 %y)) (ret %t2)))
+(fun main i32 () (locals (&acc u64))
+  (entry () (= %z (const u64 0)) (= %u0 (store &acc %z)) {big("b1", 1)} {big("b2", 6)}
+    (= %pay (construct (tuple Big Big) %b1 %b2)) (= %s (construct_variant St A %pay)) {big("g0", 100)}
+    (= %t (construct (tuple St Big) %s %g0)) (jmp loop %t))
+  (loop ((%q (tuple St Big))) (= (%s %g) (destruct %q (tuple St Big))) (= (%ga %gb %gc %gd %ge) (destruct %g Big))
+    (= %old (load &acc)) (= %new (add %old %ga)) (= %u (store &acc %new)) (switch %s St (A arm) (C fin)))
+  (arm ((%pay (tuple Big Big))) {arm})
+  (fin ((%pay (tuple Big Big))) (= %v (load &acc)) (= %i (int_cast %v i32)) (ret %i)))"""
+        made = program(f"""(= (%x %y) (destruct %pay (tuple Big Big))) {big("n1", 50)} {big("n2", 60)}
+    (= %np (construct (tuple Big Big) %n1 %n2)) (= %s2 (construct_variant St C %np))
+    (= %t2 (construct (tuple St Big) %s2 %y)) (jmp loop %t2)""")
+        called = program("(= %r (call step %pay)) (jmp loop %r)")
+        for source in (made, called):
+            c = c_of(source)
+            self.assertRegex(body(c, "main"), r"loop_q\w*\.e0\.payload\.v_A")
+            self.assertNotRegex(body(c, "main"), r"loop_q\w*\.e0 = arm_|&loop_q\w*\.e0[,)]")
+            self.assertEqual(run(c), 106)
+
+    def test_a_foreach_mapper_writing_out_results_is_called_through_its_by_value_entry(self):
+        c = c_of(BIG + f"""
+(fun mk (forall (F) () (tuple Big F) (F u64) (entry ((%x F) (%k u64))
+  (= %k1 (copy %k)) (= %k2 (copy %k)) (= %k3 (copy %k)) (= %k4 (copy %k)) (= %k5 (copy %k))
+  (= %b (construct Big %k1 %k2 %k3 %k4 %k5)) (= %t (construct (tuple Big F) %b %x)) (ret %t))))
+(fun main i32 ()
+  (entry () (= %u (const u32 1)) (= %v (const u32 2)) (= %s (construct (tuple u32 u32) %u %v)) (= %k (const u64 3))
+    (= %m (foreach (foreach (F (tuple u32 u32)) (tuple Big F)) %s (mk) %k))
+    (= (%p %q) (destruct %m (foreach (F (tuple u32 u32)) (tuple Big F))))
+    (= (%pb %pk) (destruct %p (tuple Big u32))) (= (%a %b %c %d %e) (destruct %pb Big))
+    (= (%qb %qk) (destruct %q (tuple Big u32))) (= (%a2 %b2 %c2 %d2 %e2) (destruct %qb Big))
+    (= %x1 (add %a %e2)) (= %x2 (add %pk %qk)) (= %y (int_cast %x2 u64)) (= %x (add %x1 %y))
+    (= %i (int_cast %x i32)) (ret %i)))""")
+        self.assertRegex(head(c, "mk"), r"K_Big\* out_0\w*$")
+        self.assertRegex(body(c, "main"), r"entry_m\w*\.e0 = _ZN4kurs2mk\w*_value\(entry_s\w*\.e0, entry_k\w*\);")
+        self.assertEqual(run(c), 3 + 3 + 1 + 2)
+
+
+class HomedParameterTests(unittest.TestCase):
+    """A component written where it ends up never overwrites what a later write of the same edge or
+    construction reads."""
+
+    def test_a_swap_through_a_join_homes_one_component(self):
+        c = c_of("""
+(type T (struct (v u64)))
+(fun main i32 () (locals (&s (tuple T T)))
+  (entry () (= %x (const u64 1)) (= %y (const u64 2)) (= %tx (construct T %x)) (= %ty (construct T %y))
+    (= %t0 (construct (tuple T T) %tx %ty)) (= %u (store &s %t0))
+    (= (%a0 %b0) (destruct &s (tuple T T))) (= %t (construct (tuple T T) %a0 %b0)) (jmp join %t))
+  (join ((%p (tuple T T))) (empty &s.0 &s.1) (= (%a %b) (destruct %p (tuple T T))) (= %u1 (store &s.1 %a))
+    (= %u2 (store &s.0 %b)) (= %v (load &s)) (= (%c %d) (destruct %v (tuple T T))) (= (%cv) (destruct %c T))
+    (= (%dv) (destruct %d T)) (= %i (int_cast %cv i32)) (ret %i)))""")
+        # The edge writes `s.1` from `s.0`; `s.1`, which it overwrote, goes through the join's variable.
+        self.assertRegex(body(c, "main"), r"join_p\w*\.e1 = p_s\w*\.e1;\n  p_s\w*\.e1 = p_s\w*\.e0;\n  goto L_join;")
+        self.assertEqual(run(c), 2)
+
+    def test_a_swap_through_a_construction_homes_one_component(self):
+        c = c_of("""
+(type T (struct (v u64)))
+(fun main i32 () (locals (&s (tuple T T)))
+  (entry () (= %x (const u64 1)) (= %y (const u64 2)) (= %tx (construct T %x)) (= %ty (construct T %y))
+    (= %t0 (construct (tuple T T) %tx %ty)) (= %u (store &s %t0))
+    (= (%a0 %b0) (destruct &s (tuple T T))) (= %t (construct (tuple T T) %b0 %a0)) (jmp join %t))
+  (join ((%p (tuple T T))) (empty &s.0 &s.1) (= (%a %b) (destruct %p (tuple T T))) (= %u1 (store &s.0 %a))
+    (= %u2 (store &s.1 %b)) (= %v (load &s)) (= (%c %d) (destruct %v (tuple T T))) (= (%cv) (destruct %c T))
+    (= (%dv) (destruct %d T)) (= %i (int_cast %cv i32)) (ret %i)))""")
+        self.assertRegex(body(c, "main"), r"join_p\w*\.e1 = p_s\w*\.e0;\n  p_s\w*\.e0 = p_s\w*\.e1;\n  goto L_join;")
+        self.assertEqual(run(c), 2)
+
+    def test_a_component_lying_in_a_variable_the_edge_assigns_is_not_homed(self):
+        c = c_of("""
+(type T (struct (v u64)))
+(fun main i32 () (locals (&s (tuple T T)) (&acc u64))
+  (entry () (= %z (const u64 0)) (= %u0 (store &acc %z))
+    (= %e (const u64 5)) (= %f (const u64 6)) (= %te (construct T %e)) (= %tf (construct T %f))
+    (= %s0 (construct (tuple T T) %te %tf)) (= %u5 (store &s %s0)) (= (%g1 %g2) (destruct &s (tuple T T)))
+    (= %x (const u64 10)) (= %y (const u64 20)) (= %tx (construct T %x)) (= %ty (construct T %y))
+    (= %p0 (construct (tuple T T) %tx %ty))
+    (= %x1 (const u64 1)) (= %y1 (const u64 2)) (= %tx1 (construct T %x1)) (= %ty1 (construct T %y1))
+    (= %q0 (construct (tuple T T) %tx1 %ty1)) (= %n (const u64 2)) (jmp loop %p0 %q0 %n))
+  (loop ((%p (tuple T T)) (%q (tuple T T)) (%n u64)) (empty &s.0 &s.1)
+    (= (%a %b) (destruct %p (tuple T T))) (= %u1 (store &s.0 %a)) (= %u2 (store &s.1 %b))
+    (= (%c %d) (destruct &s (tuple T T))) (= (%cv) (destruct %c T)) (= (%dv) (destruct %d T))
+    (= %old (load &acc)) (= %new (add %old %cv)) (= %u3 (store &acc %new))
+    (= %one (const u64 1)) (= %n1 (sub %n %one)) (= %n2 (copy %n1)) (= %zero (const u64 0)) (= %go (ne %n1 %zero))
+    (= %h (const u64 100)) (= %k (const u64 200)) (= %th (construct T %h)) (= %tk (construct T %k))
+    (= %nq (construct (tuple T T) %th %tk)) (jnz %go (loop %q %nq %n2) (done)))
+  (done () (= %r (load &acc)) (= %i (int_cast %r i32)) (ret %i)))""")
+        # The round's `q` is the next round's `p`: the edge assigns `q` before it could write `p`'s components.
+        self.assertRegex(body(c, "main"), r"loop_p\w* = loop_q\w*;\n    loop_q\w* = loop_nq\w*;")
+        self.assertEqual(run(c), 10 + 1)
+
 class TailCallTests(unittest.TestCase):
     def test_a_call_of_itself_loops(self):
         c = c_of(SUM)

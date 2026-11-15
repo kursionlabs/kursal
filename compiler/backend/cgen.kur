@@ -554,6 +554,19 @@ exposed struct Backend {
     thunks: ArenaMap[Span['k], Span['k], 'k],
     // the parameters of the function being written read through their pointer
     deref: Ref[ArenaSet[Span['k], 'k], 'k],
+    // symbol -> the elements of its tuple result it writes through out pointers (`request`)
+    outs: ArenaMap[Span['k], ArenaVec[usize, 'k], 'k],
+    // symbol -> the C type and name of each out pointer's pointee, in element order
+    out_params: ArenaMap[Span['k], ArenaVec[(Span['k], Span['k]), 'k], 'k],
+    // symbol with out pointers -> its whole result type
+    results: ArenaMap[Span['k], Type['k], 'k],
+    // (block label, value, element) of each element of a returned value already in its out pointer's
+    // pointee
+    at_out: Ref[ArenaSet[(Span['k], Span['k], usize), 'k], 'k],
+    // the call being written is the one whose result its block returns (`emit_call`)
+    returning: Ref[bool, 'k],
+    // the place paths the call being written passes as out pointers (`by_address`)
+    out_paths: Ref[ArenaVec[Span['k], 'k], 'k],
 }
 
 forall 'k.
@@ -683,6 +696,12 @@ impl Backend['k] {
             by_ref: ArenaMap::new(&cx),
             thunks: ArenaMap::new(&cx),
             deref: Ref::new(&cx, ArenaSet::new(&cx)),
+            outs: ArenaMap::new(&cx),
+            out_params: ArenaMap::new(&cx),
+            results: ArenaMap::new(&cx),
+            at_out: Ref::new(&cx, ArenaSet::new(&cx)),
+            returning: Ref::new(&cx, false),
+            out_paths: Ref::new(&cx, ArenaVec::new(&cx)),
         }
     }
 
@@ -1106,7 +1125,45 @@ impl Backend['k] {
             r = r + 1usize;
         }
         self.by_ref.insert(&cx, symbol, refs);
+        let outs: ArenaVec[usize, 'k] = ArenaVec::new(&cx);
+        match self.shape(&cx, subst(&cx, fun.ret, sub, self.counter)) {
+            Type::Tuple(elems) => {
+                var k = 0usize;
+                while k < elems.len(&cx) {
+                    if self.by_pointer(&cx, elems.at(&cx, k)) {
+                        outs.push(&cx, k);
+                    }
+                    k = k + 1usize;
+                }
+            },
+            _ => (),
+        };
+        self.outs.insert(&cx, symbol, outs);
         symbol
+    }
+
+    // The C result of a function writing the elements `outs` of its tuple result `ret` through out
+    // pointers: a tuple of the other elements.
+    fn reduced(self, &cx: Domain!['k], ret: Type['k], outs: ArenaVec[usize, 'k]) -> Type['k] {
+        let rest: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
+        match self.shape(&cx, ret) {
+            Type::Tuple(elems) => {
+                var k = 0usize;
+                while k < elems.len(&cx) {
+                    if !outs.contains(&cx, k) {
+                        rest.push(&cx, elems.at(&cx, k));
+                    }
+                    k = k + 1usize;
+                }
+            },
+            _ => fail_text(&cx, Span::from_static(&cx, "internal error: out pointers of a result that is not a tuple")),
+        };
+        Type::Tuple.(rest)
+    }
+
+    // The C type and name of each out pointer of `symbol`, by element.
+    fn out_pointers(self, &cx: Domain!['k], symbol: Span['k]) -> ArenaVec[(Span['k], Span['k]), 'k] {
+        self.out_params.get_or(&cx, symbol, ArenaVec::new(&cx))
     }
 
     // A value of `ty` is passed by pointer: its C representation is more than four words. Up to four
@@ -1210,7 +1267,7 @@ impl Backend['k] {
         }
         let symbol = self.request(&cx, FunKey::Function.(name), fun, sub);
         let added = self.address_taken.insert(&cx, symbol);
-        if !self.takes_by_ref(&cx, symbol) {
+        if !self.takes_by_ref(&cx, symbol) && self.outs.at(&cx, symbol).is_empty(&cx) {
             return symbol;
         }
         // A function value calls with the plain convention: through an entry taking every value as is.
@@ -1240,6 +1297,10 @@ impl Backend['k] {
             }
             k = k + 1usize;
         }
+        let outs = self.out_pointers(&cx, symbol);
+        if !outs.is_empty(&cx) {
+            return self.whole_thunk(&cx, symbol, thunk, ret, params, args, outs);
+        }
         let call = Buffer::new().push_bytes(&cx, symbol).push_static("(").push_bytes(&cx, args.join(&cx, ", ")).push_static(");").save(&cx);
         let body = if ret.is(&cx, "void") {
             Buffer::new().push_static(" {\n  ").push_bytes(&cx, call).push_static("\n}\n").save(&cx)
@@ -1249,6 +1310,56 @@ impl Backend['k] {
         let head = Buffer::new().push_static(if noreturn { "_Noreturn " } else { "" }).push_static("static ").push_bytes(&cx, ret).push_static(" ").push_bytes(&cx, thunk)
             .push_static("(").push_bytes(&cx, or_void(&cx, params.join(&cx, ", "))).push_static(")").save(&cx);
         (head, body)
+    }
+
+    // `thunk` of a function writing elements of its result through the out pointers `outs`: it takes
+    // them into locals, and returns the whole result.
+    fn whole_thunk(self, &cx: Domain!['k], symbol: Span['k], thunk: Span['k], ret: Span['k], params: ArenaVec[Span['k], 'k], args: ArenaVec[Span['k], 'k],
+        outs: ArenaVec[(Span['k], Span['k]), 'k]) -> (Span['k], Span['k]) {
+        let whole = self.results.at(&cx, symbol);
+        let ks = self.outs.at(&cx, symbol);
+        let members = self.members(&cx, self.shape(&cx, whole));
+        var body = Buffer::new().push_static(" {\n");
+        var o = 0usize;
+        while o < outs.len(&cx) {
+            let (ctype, cname) = outs.at(&cx, o);
+            body = body.push_static("  ").push_bytes(&cx, ctype).push_static(" ").push_bytes(&cx, cname).push_static(";\n");
+            args.push(&cx, Buffer::new().push_static("&").push_bytes(&cx, cname).save(&cx));
+            o = o + 1usize;
+        }
+        let call = Buffer::new().push_bytes(&cx, symbol).push_static("(").push_bytes(&cx, args.join(&cx, ", ")).push_static(")").save(&cx);
+        let rest = self.members(&cx, self.shape(&cx, self.reduced(&cx, whole, ks)));
+        var r = 0usize;
+        let parts: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        var k = 0usize;
+        while k < members.len(&cx) {
+            let (member, t) = members.at(&cx, k);
+            let source = match ks.index_of(&cx, k) {
+                Option::Some(i) => {
+                    let (_ctype, cname) = outs.at(&cx, i);
+                    cname
+                },
+                Option::None => {
+                    let (m, _t) = rest.at(&cx, r);
+                    r = r + 1usize;
+                    Buffer::new().push_static("reduced.").push_bytes(&cx, m).save(&cx)
+                },
+            };
+            if !self.erased(&cx, t) {
+                parts.push(&cx, Buffer::new().push_static(".").push_bytes(&cx, member).push_static(" = ").push_bytes(&cx, source).save(&cx));
+            }
+            k = k + 1usize;
+        }
+        body = if ret.is(&cx, "void") {
+            body.push_static("  ").push_bytes(&cx, call).push_static(";\n")
+        } else {
+            body.push_static("  ").push_bytes(&cx, ret).push_static(" reduced = ").push_bytes(&cx, call).push_static(";\n")
+        };
+        let ct = self.c(&cx, whole);
+        body = body.push_static("  return (").push_bytes(&cx, ct).push_static("){ ").push_bytes(&cx, parts.join(&cx, ", ")).push_static(" };\n}\n");
+        let head = Buffer::new().push_static("static ").push_bytes(&cx, self.c(&cx, whole)).push_static(" ").push_bytes(&cx, thunk)
+            .push_static("(").push_bytes(&cx, or_void(&cx, params.join(&cx, ", "))).push_static(")").save(&cx);
+        (head, body.save(&cx))
     }
 
     // The value parameters the function being written assigns (`written_params` in cgen.py).
@@ -1665,7 +1776,26 @@ impl Backend['k] {
             p = p + 1usize;
         }
         let ret_type = self.substitute_type(&cx, fun.ret);
-        let unit = self.heads.insert(&cx, symbol, (self.c(&cx, ret_type), is_never(ret_type), cparams));
+        let outs = self.outs.at(&cx, symbol);
+        if outs.is_empty(&cx) {
+            let unit = self.heads.insert(&cx, symbol, (self.c(&cx, ret_type), is_never(ret_type), cparams));
+        } else {
+            let elems = match self.shape(&cx, ret_type) {
+                Type::Tuple(elems) => elems,
+                _ => fail_text(&cx, Span::from_static(&cx, "internal error: out pointers of a result that is not a tuple")),
+            };
+            let pointees: ArenaVec[(Span['k], Span['k]), 'k] = ArenaVec::new(&cx);
+            var k = 0usize;
+            while k < outs.len(&cx) {
+                let ctype = self.c(&cx, elems.at(&cx, outs.at(&cx, k)));
+                pointees.push(&cx, (ctype, allocate(&cx, Buffer::new().push_static("out_").push_usize(outs.at(&cx, k)).save(&cx), self.taken)));
+                k = k + 1usize;
+            }
+            self.out_params.insert(&cx, symbol, pointees);
+            self.results.insert(&cx, symbol, ret_type);
+            let unit = self.heads.insert(&cx, symbol, (self.c(&cx, self.reduced(&cx, ret_type, outs)), false, cparams));
+        }
+        self.at_out.set(&cx, ArenaSet::new(&cx));
         var l = 0usize;
         while l < fun.locals.len(&cx) {
             let binding = fun.locals.at(&cx, l);
@@ -1721,6 +1851,8 @@ impl Backend['k] {
             k = k + 1usize;
         }
         self.blocks.set(&cx, blocks);
+        self.returning.set(&cx, false);
+        self.out_paths.set(&cx, ArenaVec::new(&cx));
         // The lines of the body, after the declarations that emitting them may add to.
         var lines = Buffer::new();
         var pr = 0usize;
@@ -1744,7 +1876,9 @@ impl Backend['k] {
             self.index.set(&cx, count);
             if !tail || !self.tail_call(&cx, &lines, block.instrs.at(&cx, count)) {
                 if tail {
+                    self.returning.set(&cx, true);
                     self.instr(&cx, &lines, block.instrs.at(&cx, count));
+                    self.returning.set(&cx, false);
                 }
                 self.term(&cx, &lines, block.term);
             }
@@ -2220,6 +2354,13 @@ impl Backend['k] {
             }
             k = k + 1usize;
         }
+        let outs = self.out_pointers(&cx, symbol);
+        var o = 0usize;
+        while o < outs.len(&cx) {
+            let (ctype, cname) = outs.at(&cx, o);
+            params.push(&cx, Buffer::new().push_bytes(&cx, ctype).push_static("* ").push_bytes(&cx, cname).save(&cx));
+            o = o + 1usize;
+        }
         Buffer::new().push_static(if noreturn { "_Noreturn " } else { "" }).push_static("static ").push_bytes(&cx, ret).push_static(" ").push_bytes(&cx, symbol)
             .push_static("(").push_bytes(&cx, or_void(&cx, params.join(&cx, ", "))).push_static(")").save(&cx)
     }
@@ -2525,7 +2666,9 @@ impl Backend['k] {
                 let unit = self.forwards.copy(&cx).insert(&cx, a.at(&cx, 0usize), self.value_name(&cx, a.at(&cx, 1usize)));
             }
         } else if op.is(&cx, "construct") {
-            self.construct(&cx, &lines, d, self.type_operand(&cx, instr), a);
+            let ty = self.type_operand(&cx, instr);
+            let away = self.away(&cx, instr.lhs.at(&cx, 0usize));
+            self.construct(&cx, &lines, d, ty, a, away);
         } else if op.is(&cx, "destruct") {
             self.destruct(&cx, &lines, instr);
         } else if op.is(&cx, "construct_variant") {
@@ -2648,7 +2791,9 @@ impl Backend['k] {
         self.substitute_type(&cx, self.type_operand_raw(&cx, instr))
     }
 
-    fn construct(self, &cx: Domain!['k], &lines: Buffer!, dst: Span['k], ty: Type['k], args: ArenaVec[Span['k], 'k]) {
+    // Assigns each component to its member of `dst`, but the components `away` sends elsewhere: to a
+    // place path where a homed component ends up, or through an out pointer (`*out`), after the others.
+    fn construct(self, &cx: Domain!['k], &lines: Buffer!, dst: Span['k], ty: Type['k], args: ArenaVec[Span['k], 'k], away: ArenaVec[(usize, Span['k]), 'k]) {
         let s = self.shape(&cx, ty);
         match s {
             Type::Array(_elem, length) => {
@@ -2664,13 +2809,169 @@ impl Backend['k] {
                 var i = 0usize;
                 while i < rows.len(&cx) && i < args.len(&cx) {
                     let (m, t) = rows.at(&cx, i);
-                    if !self.erased(&cx, t) {
+                    if !self.erased(&cx, t) && home_of(&cx, away, i).is_none() {
                         line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(".").push_bytes(&cx, m).push_static(" = ").push_bytes(&cx, self.value_name(&cx, args.at(&cx, i))).push_static(";"));
                     }
                     i = i + 1usize;
                 }
+                var w = 0usize;
+                while w < away.len(&cx) {
+                    let (k, target) = away.at(&cx, w);
+                    if target.starts_with(&cx, Span::from_static(&cx, "*")) {
+                        line(&lines, Buffer::new().push_bytes(&cx, target).push_static(" = ").push_bytes(&cx, self.value_name(&cx, args.at(&cx, k))).push_static(";"));
+                    } else {
+                        let value = self.value_name(&cx, args.at(&cx, k));
+                        self.write_home(&cx, &lines, target, value, Span::from_static(&cx, ""));
+                    }
+                    w = w + 1usize;
+                }
             },
         };
+    }
+
+    // Where the components of the value `name` that a construction or a call makes go instead of its
+    // variable (`away` in cgen.py): the homed ones of a value shared into a homed parameter to their
+    // place paths; when the function writes elements of its result through out pointers, and the
+    // value is returned and read nothing else, those elements to `*out` (then marked as there).
+    fn away(self, &cx: Domain!['k], name: Span['k]) -> ArenaVec[(usize, Span['k]), 'k] {
+        let plan = self.the_plan(&cx);
+        let label = self.label.copy(&cx);
+        let key = (label, name);
+        if plan.made_home.contains(&cx, key) {
+            return plan.homed.at(&cx, plan.shared.at(&cx, key));
+        }
+        let away: ArenaVec[(usize, Span['k]), 'k] = ArenaVec::new(&cx);
+        let symbol = self.symbol.copy(&cx);
+        let outs = self.out_pointers(&cx, symbol);
+        if outs.is_empty(&cx) || !self.returned_alone(&cx, name) {
+            return away;
+        }
+        let ks = self.outs.at(&cx, symbol);
+        var k = 0usize;
+        while k < ks.len(&cx) {
+            let added = self.at_out.copy(&cx).insert(&cx, (label, name, ks.at(&cx, k)));
+            k = k + 1usize;
+        }
+        var o = 0usize;
+        while o < ks.len(&cx) && o < outs.len(&cx) {
+            let (_ctype, cname) = outs.at(&cx, o);
+            away.push(&cx, (ks.at(&cx, o), Buffer::new().push_static("*").push_bytes(&cx, cname).save(&cx)));
+            o = o + 1usize;
+        }
+        away
+    }
+
+    // The value `name` of the current block is what it returns, directly or through return joins, and
+    // the block reads it nowhere else.
+    fn returned_alone(self, &cx: Domain!['k], name: Span['k]) -> bool {
+        let plan = self.the_plan(&cx);
+        let block = self.blocks.copy(&cx).at(&cx, self.label.copy(&cx));
+        let returned = match block.term {
+            Terminator::Ret(value, _pos) => value,
+            Terminator::Jmp(edge, _pos) => match plan.return_index.get(&cx, edge.target) {
+                Option::Some(index) => edge.args.at(&cx, index),
+                Option::None => return false,
+            },
+            _ => return false,
+        };
+        if !returned.eq(&cx, name) {
+            return false;
+        }
+        var count = 0usize;
+        var i = 0usize;
+        while i < block.instrs.len(&cx) {
+            let args = block.instrs.at(&cx, i).args;
+            var g = 0usize;
+            while g < args.len(&cx) {
+                match value_read(&cx, args.at(&cx, g)) {
+                    Option::Some(v) => if v.eq(&cx, name) {
+                        count = count + 1usize;
+                    },
+                    Option::None => (),
+                };
+                g = g + 1usize;
+            }
+            i = i + 1usize;
+        }
+        let ending = term_reads(&cx, block.term);
+        let edges = term_edges(&cx, block.term);
+        var e = 0usize;
+        while e < edges.len(&cx) {
+            let (edge, _skip) = edges.at(&cx, e);
+            ending.append(&cx, edge.args);
+            e = e + 1usize;
+        }
+        var t = 0usize;
+        while t < ending.len(&cx) {
+            if ending.at(&cx, t).eq(&cx, name) {
+                count = count + 1usize;
+            }
+            t = t + 1usize;
+        }
+        count == 1usize
+    }
+
+    // Writes `value` at the place path `path` where a homed component ends up, unless it lies there.
+    fn write_home(self, &cx: Domain!['k], &lines: Buffer!, path: Span['k], value: Span['k], indent: Span['k]) {
+        let (target, _ty) = self.place(&cx, path);
+        if !target.eq(&cx, value) {
+            match self.param_index(&cx, root(&cx, path)) {
+                Option::Some(j) => {
+                    let added = self.written.insert(&cx, (self.symbol.copy(&cx), j));
+                },
+                Option::None => (),
+            };
+            line(&lines, Buffer::new().push_bytes(&cx, indent).push_bytes(&cx, target).push_static(" = ").push_bytes(&cx, value).push_static(";"));
+        }
+    }
+
+    // Returns the value `value` (of the SSA value `name`, or none: `""`): each element written
+    // through an out pointer is assigned to its pointee, unless it is there already, and the rest
+    // returned.
+    fn give_back(self, &cx: Domain!['k], &lines: Buffer!, name: Span['k], value: Span['k], indent: Span['k]) {
+        let symbol = self.symbol.copy(&cx);
+        let outs = self.out_pointers(&cx, symbol);
+        if outs.is_empty(&cx) {
+            line(&lines, Buffer::new().push_bytes(&cx, indent).push_static("return ").push_bytes(&cx, value).push_static(";"));
+            return;
+        }
+        let ks = self.outs.at(&cx, symbol);
+        let whole = self.results.at(&cx, symbol);
+        let members = self.members(&cx, self.shape(&cx, whole));
+        let label = self.label.copy(&cx);
+        var o = 0usize;
+        while o < ks.len(&cx) && o < outs.len(&cx) {
+            let k = ks.at(&cx, o);
+            let (_ctype, cname) = outs.at(&cx, o);
+            if !self.at_out.copy(&cx).contains(&cx, (label, name, k)) {
+                let (member, _t) = members.at(&cx, k);
+                line(&lines, Buffer::new().push_bytes(&cx, indent).push_static("*").push_bytes(&cx, cname).push_static(" = ").push_bytes(&cx, value).push_static(".").push_bytes(&cx, member).push_static(";"));
+            }
+            o = o + 1usize;
+        }
+        let reduced = self.reduced(&cx, whole, ks);
+        if self.erased(&cx, reduced) {
+            line(&lines, Buffer::new().push_bytes(&cx, indent).push_static("return;"));
+            return;
+        }
+        let rows = self.members(&cx, self.shape(&cx, reduced));
+        let parts: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        var r = 0usize;
+        var k = 0usize;
+        while k < members.len(&cx) {
+            if !ks.contains(&cx, k) {
+                let (m, t) = members.at(&cx, k);
+                if r < rows.len(&cx) {
+                    let (into, _rt) = rows.at(&cx, r);
+                    if !self.erased(&cx, t) {
+                        parts.push(&cx, Buffer::new().push_static(".").push_bytes(&cx, into).push_static(" = ").push_bytes(&cx, value).push_static(".").push_bytes(&cx, m).save(&cx));
+                    }
+                }
+                r = r + 1usize;
+            }
+            k = k + 1usize;
+        }
+        line(&lines, Buffer::new().push_bytes(&cx, indent).push_static("return (").push_bytes(&cx, self.c(&cx, reduced)).push_static("){ ").push_bytes(&cx, parts.join(&cx, ", ")).push_static(" };"));
     }
 
     fn destruct(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k]) {
@@ -2852,13 +3153,13 @@ impl Backend['k] {
                 _ => fail_text(&cx, Span::from_static(&cx, "internal error: a call of a value that is not a function")),
             };
             self.lend(&cx, Option::None, instr.args.skip(&cx, 1usize));
-            self.emit_call(&cx, &lines, instr, self.value_name(&cx, callee), ret, ArenaMap::new(&cx), instr.args.skip(&cx, 1usize), ArenaVec::new(&cx));
+            self.emit_call(&cx, &lines, instr, self.value_name(&cx, callee), ret, ArenaMap::new(&cx), instr.args.skip(&cx, 1usize), ArenaVec::new(&cx), ArenaVec::new(&cx));
         } else if self.program.externs.contains(&cx, callee) {
             let ret = match self.program.externs.at(&cx, callee).ret {
                 Option::Some(r) => r,
                 Option::None => fail_text(&cx, Span::from_static(&cx, "internal error: an extern without a type")),
             };
-            self.emit_call(&cx, &lines, instr, callee, ret, ArenaMap::new(&cx), instr.args.skip(&cx, 1usize), ArenaVec::new(&cx));
+            self.emit_call(&cx, &lines, instr, callee, ret, ArenaMap::new(&cx), instr.args.skip(&cx, 1usize), ArenaVec::new(&cx), ArenaVec::new(&cx));
         } else {
             let fun = self.program.funs.at(&cx, callee);
             let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
@@ -2869,7 +3170,7 @@ impl Backend['k] {
             }
             let symbol = self.request(&cx, FunKey::Function.(callee), fun, sub);
             self.lend(&cx, Option::Some.(symbol), instr.args.skip(&cx, 1usize));
-            self.emit_call(&cx, &lines, instr, symbol, fun.ret, sub, instr.args.skip(&cx, 1usize), self.by_ref.at(&cx, symbol));
+            self.emit_call(&cx, &lines, instr, symbol, fun.ret, sub, instr.args.skip(&cx, 1usize), self.by_ref.at(&cx, symbol), self.outs.at(&cx, symbol));
         }
     }
 
@@ -2884,7 +3185,7 @@ impl Backend['k] {
         let (key, fun, sub) = self.resolve_trait(&cx, a.at(&cx, 0usize), a.at(&cx, 1usize), tys);
         let symbol = self.request(&cx, key, fun, sub);
         self.lend(&cx, Option::Some.(symbol), a.skip(&cx, 2usize));
-        self.emit_call(&cx, &lines, instr, symbol, fun.ret, sub, a.skip(&cx, 2usize), self.by_ref.at(&cx, symbol));
+        self.emit_call(&cx, &lines, instr, symbol, fun.ret, sub, a.skip(&cx, 2usize), self.by_ref.at(&cx, symbol), self.outs.at(&cx, symbol));
     }
 
     // A lend adapter's call (`Plan::residences`) as its own call, lending the callee the places
@@ -3023,6 +3324,12 @@ impl Backend['k] {
                 unsafe_spot = is_place(&cx, args.at(&cx, g)) && overlap(&cx, args.at(&cx, g), path);
                 g = g + 1usize;
             }
+            let out_paths = self.out_paths.copy(&cx);
+            var q = 0usize;
+            while !unsafe_spot && q < out_paths.len(&cx) {
+                unsafe_spot = overlap(&cx, out_paths.at(&cx, q), path);
+                q = q + 1usize;
+            }
         }
         if !unsafe_spot {
             return Buffer::new().push_static("&").push_bytes(&cx, expr).save(&cx);
@@ -3035,12 +3342,128 @@ impl Backend['k] {
     }
 
     fn emit_call(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k], callee: Span['k], ret: Type['k], sub: ArenaMap[Span['k], Type['k], 'k], args: ArenaVec[Span['k], 'k],
-        refs: ArenaVec[bool, 'k]) {
-        let call = Buffer::new().push_bytes(&cx, callee).push_static("(").push_bytes(&cx, self.operands(&cx, &lines, args, refs)).push_static(")").save(&cx);
-        if self.erased(&cx, subst(&cx, ret, sub, self.counter)) || !self.is_live(&cx, instr.lhs.at(&cx, 0usize)) {
+        refs: ArenaVec[bool, 'k], outs: ArenaVec[usize, 'k]) {
+        let name = instr.lhs.at(&cx, 0usize);
+        let label = self.label.copy(&cx);
+        let result = subst(&cx, ret, sub, self.counter);
+        let live = !self.erased(&cx, result) && self.is_live(&cx, name);
+        let dst = if live { self.value_name(&cx, name) } else { Span::from_static(&cx, "") };
+        let homed = if live && self.the_plan(&cx).made_home.contains(&cx, (label, name)) { self.away(&cx, name) } else { ArenaVec::new(&cx) };
+        let members = if outs.is_empty(&cx) { ArenaVec::new(&cx) } else { self.members(&cx, self.shape(&cx, result)) };
+        let current = self.symbol.copy(&cx);
+        let own_ks = if self.returning.copy(&cx) { self.outs.at(&cx, current) } else { ArenaVec::new(&cx) };
+        let own = self.out_pointers(&cx, current);
+        let pointers: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let out_paths: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        var o = 0usize;
+        while o < outs.len(&cx) {
+            let k = outs.at(&cx, o);
+            let mine = match own_ks.index_of(&cx, k) {
+                Option::Some(i) => if i < own.len(&cx) { Option::Some.(own.at(&cx, i)) } else { Option::None },
+                Option::None => Option::None,
+            };
+            match home_of(&cx, homed, k) {
+                Option::Some(path) => {
+                    let (expr, _ty) = self.place(&cx, path);
+                    pointers.push(&cx, Buffer::new().push_static("&").push_bytes(&cx, expr).save(&cx));
+                    match self.param_index(&cx, root(&cx, path)) {
+                        Option::Some(j) => {
+                            let added = self.written.insert(&cx, (current, j));
+                        },
+                        Option::None => (),
+                    };
+                    out_paths.push(&cx, path);
+                },
+                Option::None => if self.passes_own(&cx, mine, result, k) {
+                    let (_ctype, cname) = match mine {
+                        Option::Some(pointee) => pointee,
+                        Option::None => fail_text(&cx, Span::from_static(&cx, "internal error: no out pointer")),
+                    };
+                    pointers.push(&cx, cname);
+                    let added = self.at_out.copy(&cx).insert(&cx, (label, name, k));
+                } else if live {
+                    let (member, _t) = members.at(&cx, k);
+                    pointers.push(&cx, Buffer::new().push_static("&").push_bytes(&cx, dst).push_static(".").push_bytes(&cx, member).save(&cx));
+                } else {
+                    let temp = allocate(&cx, Buffer::new().push_static("arg_").push_usize(self.scratch.copy(&cx)).save(&cx), self.taken);
+                    self.scratch.set(&cx, self.scratch.copy(&cx) + 1usize);
+                    self.temps.copy(&cx).push(&cx, Buffer::new().push_bytes(&cx, self.c(&cx, self.element(&cx, result, k))).push_static(" ").push_bytes(&cx, temp).push_static(";").save(&cx));
+                    pointers.push(&cx, Buffer::new().push_static("&").push_bytes(&cx, temp).save(&cx));
+                },
+            };
+            o = o + 1usize;
+        }
+        self.out_paths.set(&cx, out_paths);
+        let operands = self.operands(&cx, &lines, args, refs);
+        self.out_paths.set(&cx, ArenaVec::new(&cx));
+        let passed: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        if !operands.is_empty() {
+            passed.push(&cx, operands);
+        }
+        var p = 0usize;
+        while p < pointers.len(&cx) {
+            passed.push(&cx, pointers.at(&cx, p));
+            p = p + 1usize;
+        }
+        let call = Buffer::new().push_bytes(&cx, callee).push_static("(").push_bytes(&cx, passed.join(&cx, ", ")).push_static(")").save(&cx);
+        if !outs.is_empty(&cx) {
+            let reduced = self.reduced(&cx, result, outs);
+            if !live || self.erased(&cx, reduced) {
+                line(&lines, Buffer::new().push_bytes(&cx, call).push_static(";"));
+            } else {
+                let temp = allocate(&cx, Buffer::new().push_static("ret_").push_usize(self.scratch.copy(&cx)).save(&cx), self.taken);
+                self.scratch.set(&cx, self.scratch.copy(&cx) + 1usize);
+                self.temps.copy(&cx).push(&cx, Buffer::new().push_bytes(&cx, self.c(&cx, reduced)).push_static(" ").push_bytes(&cx, temp).push_static(";").save(&cx));
+                line(&lines, Buffer::new().push_bytes(&cx, temp).push_static(" = ").push_bytes(&cx, call).push_static(";"));
+                let rows = self.members(&cx, self.shape(&cx, reduced));
+                var r = 0usize;
+                var k = 0usize;
+                while k < members.len(&cx) {
+                    if !outs.contains(&cx, k) {
+                        let (m, t) = members.at(&cx, k);
+                        if r < rows.len(&cx) && !self.erased(&cx, t) {
+                            let (into, _rt) = rows.at(&cx, r);
+                            line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(".").push_bytes(&cx, m).push_static(" = ").push_bytes(&cx, temp).push_static(".").push_bytes(&cx, into).push_static(";"));
+                        }
+                        r = r + 1usize;
+                    }
+                    k = k + 1usize;
+                }
+            }
+        } else if !live {
             line(&lines, Buffer::new().push_bytes(&cx, call).push_static(";"));
         } else {
-            line(&lines, Buffer::new().push_bytes(&cx, self.value_name(&cx, instr.lhs.at(&cx, 0usize))).push_static(" = ").push_bytes(&cx, call).push_static(";"));
+            line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = ").push_bytes(&cx, call).push_static(";"));
+        }
+        // A homed component the callee does not write through a pointer goes to its place after the call.
+        var h = 0usize;
+        while h < homed.len(&cx) {
+            let (k, path) = homed.at(&cx, h);
+            if !outs.contains(&cx, k) {
+                let (member, _t) = self.members(&cx, self.shape(&cx, result)).at(&cx, k);
+                self.write_home(&cx, &lines, path, Buffer::new().push_bytes(&cx, dst).push_static(".").push_bytes(&cx, member).save(&cx), Span::from_static(&cx, ""));
+            }
+            h = h + 1usize;
+        }
+    }
+
+    // The caller's own out pointer `mine` for element `k` of a call's result `result` is passed on: its
+    // pointee has the element's C type.
+    fn passes_own(self, &cx: Domain!['k], mine: Option[(Span['k], Span['k])], result: Type['k], k: usize) -> bool {
+        match mine {
+            Option::Some(pointee) => {
+                let (ctype, _cname) = pointee;
+                ctype.eq(&cx, self.c(&cx, self.element(&cx, result, k)))
+            },
+            Option::None => false,
+        }
+    }
+
+    // The type of element `k` of the tuple `ty`'s shape.
+    fn element(self, &cx: Domain!['k], ty: Type['k], k: usize) -> Type['k] {
+        match self.shape(&cx, ty) {
+            Type::Tuple(elems) => elems.at(&cx, k),
+            _ => fail_text(&cx, Span::from_static(&cx, "internal error: an element of a type that is not a tuple")),
         }
     }
 
@@ -3153,11 +3576,19 @@ impl Backend['k] {
             }
             c = c + 1usize;
         }
+        let values: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        var v = 2usize;
+        while v < instr.args.len(&cx) {
+            if !self.value_erased(&cx, instr.args.at(&cx, v)) {
+                values.push(&cx, self.value_name(&cx, instr.args.at(&cx, v)));
+            }
+            v = v + 1usize;
+        }
         let found = self.types.rows(&cx, t.source.copy(&cx), Option::None, false);
         let rows = found.rows;
         let pointer = is_ptr(self.shape(&cx, t.source.copy(&cx))) && !is_foreach(t.source.copy(&cx));
         let out_shape = self.shape(&cx, Type::Foreach.(t));
-        let walk = Walk.{ backend: self, t, mapper, mapper_name, binders, own, caps, pointer };
+        let walk = Walk.{ backend: self, t, mapper, mapper_name, binders, own, caps, values, pointer };
         match found.skeleton {
             Option::Some(skeleton) => match skeleton {
                 Type::Enum(_variants) => {
@@ -3249,7 +3680,8 @@ impl Backend['k] {
             Terminator::Ret(value, _pos) => if self.value_erased(&cx, value) {
                 line(&lines, Buffer::new().push_static("return;"));
             } else {
-                line(&lines, Buffer::new().push_static("return ").push_bytes(&cx, self.value_name(&cx, value)).push_static(";"));
+                let returned = self.value_name(&cx, value);
+                self.give_back(&cx, &lines, value, returned, Span::from_static(&cx, ""));
             },
             Terminator::Jmp(edge, _pos) => self.edge(&cx, &lines, edge, Option::None, Span::from_static(&cx, ""), Span::from_static(&cx, "")),
             Terminator::Jnz(cond, then, other, _pos) => {
@@ -3272,6 +3704,12 @@ impl Backend['k] {
         let target = self.blocks.copy(&cx).at(&cx, edge.target);
         // (value, the C variable it reads)
         let values: ArenaVec[(Span['k], Span['k]), 'k] = ArenaVec::new(&cx);
+        // the SSA value of each, or `""` for the payload
+        let names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        if payload.is_some() {
+            names.push(&cx, Span::from_static(&cx, ""));
+        }
+        names.append(&cx, edge.args);
         match payload {
             Option::Some(p) => if plan.arrived.contains(&cx, (target.label, target.params.at(&cx, 0usize).name)) {
                 values.push(&cx, (Span::from_static(&cx, ""), source));
@@ -3296,23 +3734,55 @@ impl Backend['k] {
                 if value.is_empty() {
                     line(&lines, Buffer::new().push_bytes(&cx, indent).push_static("return;"));
                 } else {
-                    line(&lines, Buffer::new().push_bytes(&cx, indent).push_static("return ").push_bytes(&cx, value).push_static(";"));
+                    self.give_back(&cx, &lines, names.at(&cx, index), value, indent);
                 }
                 return;
             },
             Option::None => (),
         };
         let moves: ArenaVec[Move['k], 'k] = ArenaVec::new(&cx);
+        // (place path, value) of each homed component the edge writes, after every other assignment
+        let homes: ArenaVec[(Span['k], Span['k]), 'k] = ArenaVec::new(&cx);
+        let label = self.label.copy(&cx);
         var p = 0usize;
         while p < target.params.len(&cx) && p < values.len(&cx) {
             let binding = target.params.at(&cx, p);
             let (value, base) = values.at(&cx, p);
             if !value.is_empty() && plan.is_live(&cx, target.label, binding.name) {
-                moves.push(&cx, Move.{ dst: self.cname(&cx, target.label, binding.name), ty: binding.type, place: false, value, base });
+                match plan.homed.get(&cx, (target.label, binding.name)) {
+                    Option::Some(homed) => {
+                        // The components written where they end up (`Plan::home_params`): the others are
+                        // assigned one by one, and the homed ones after every other assignment, unless the
+                        // value's making wrote them.
+                        let made = plan.made_home.contains(&cx, (label, names.at(&cx, p)));
+                        let rows = self.members(&cx, self.shape(&cx, self.substitute_type(&cx, binding.type)));
+                        var k = 0usize;
+                        while k < rows.len(&cx) {
+                            let (member, mt) = rows.at(&cx, k);
+                            match home_of(&cx, homed, k) {
+                                Option::Some(path) => if !made {
+                                    homes.push(&cx, (path, Buffer::new().push_bytes(&cx, value).push_static(".").push_bytes(&cx, member).save(&cx)));
+                                },
+                                Option::None => if !self.erased(&cx, mt) {
+                                    moves.push(&cx, Move.{ dst: Buffer::new().push_bytes(&cx, self.cname(&cx, target.label, binding.name)).push_static(".").push_bytes(&cx, member).save(&cx),
+                                        ty: mt, place: false, value: Buffer::new().push_bytes(&cx, value).push_static(".").push_bytes(&cx, member).save(&cx), base });
+                                },
+                            };
+                            k = k + 1usize;
+                        }
+                    },
+                    Option::None => moves.push(&cx, Move.{ dst: self.cname(&cx, target.label, binding.name), ty: binding.type, place: false, value, base }),
+                };
             }
             p = p + 1usize;
         }
         self.assign(&cx, &lines, moves, indent);
+        var h = 0usize;
+        while h < homes.len(&cx) {
+            let (path, value) = homes.at(&cx, h);
+            self.write_home(&cx, &lines, path, value, indent);
+            h = h + 1usize;
+        }
         line(&lines, Buffer::new().push_bytes(&cx, indent).push_static("goto ").push_bytes(&cx, self.labels.copy(&cx).at(&cx, target.label)).push_static(";"));
     }
 
@@ -3332,7 +3802,7 @@ impl Backend['k] {
         while k < moves.len(&cx) {
             var later = k + 1usize;
             while later < moves.len(&cx) {
-                if moves.at(&cx, k).dst.eq(&cx, moves.at(&cx, later).base) {
+                if root(&cx, moves.at(&cx, k).dst).eq(&cx, moves.at(&cx, later).base) {
                     conflict = true;
                 }
                 later = later + 1usize;
@@ -3635,8 +4105,9 @@ fn last_member(&cx: Domain!['k], members: ArenaVec[Member['k], 'k], name: Span['
 }
 
 // One foreach instruction's mapping of its rows: the transform at the specialization, the mapper,
-// its traversal binders, its own type arguments, the captured values that pass something, and
-// whether the source is a pointer whose components are pointers.
+// its traversal binders, its own type arguments, the captured values that pass something (as the
+// mapper takes them, and as values), and whether the source is a pointer whose components are
+// pointers.
 forall 'k.
 exposed struct Walk {
     backend: Backend['k],
@@ -3646,6 +4117,7 @@ exposed struct Walk {
     binders: ArenaVec[Span['k], 'k],
     own: ArenaVec[Type['k], 'k],
     caps: ArenaVec[Span['k], 'k],
+    values: ArenaVec[Span['k], 'k],
     pointer: bool,
 }
 
@@ -3666,6 +4138,24 @@ impl Walk['k] {
         }
         let symbol = self.backend.request(&cx, FunKey::Function.(self.mapper_name), self.mapper, sub);
         let arguments: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        if !self.backend.outs.at(&cx, symbol).is_empty(&cx) {
+            // A mapper writing elements of its result through out pointers is called through its
+            // by-value entry, which returns the whole result.
+            let added = self.backend.address_taken.insert(&cx, symbol);
+            let thunk = match self.backend.thunks.get(&cx, symbol) {
+                Option::Some(known) => known,
+                Option::None => {
+                    let made = allocate(&cx, Buffer::new().push_bytes(&cx, symbol).push_static("_value").save(&cx), self.backend.taken);
+                    self.backend.thunks.insert(&cx, symbol, made);
+                    made
+                },
+            };
+            if self.pointer || !self.backend.erased(&cx, row.item) {
+                arguments.push(&cx, component);
+            }
+            arguments.append(&cx, self.values);
+            return Buffer::new().push_bytes(&cx, thunk).push_static("(").push_bytes(&cx, arguments.join(&cx, ", ")).push_static(")").save(&cx);
+        }
         if self.pointer || !self.backend.erased(&cx, row.item) {
             if self.backend.by_ref.at(&cx, symbol).at(&cx, 0usize) {
                 arguments.push(&cx, Buffer::new().push_static("&").push_bytes(&cx, component).save(&cx));
@@ -3681,6 +4171,20 @@ impl Walk['k] {
 forall 'k.
 fn emit_c(&cx: Domain!['k], program: Program['k], typed: ArenaMap[FunKey['k], ArenaMap[(Span['k], Span['k]), Type['k], 'k], 'k], entry: Option[Span['k]], counter: Fresh['k]) -> Buffer! {
     Backend::new(&cx, program, typed, counter).emit_program(&cx, entry)
+}
+
+// The place path or out pointer `away` sends component `k` to (`Backend::away`).
+forall 'k.
+fn home_of(&cx: Domain!['k], away: ArenaVec[(usize, Span['k]), 'k], k: usize) -> Option[Span['k]] {
+    var i = 0usize;
+    while i < away.len(&cx) {
+        let (at, target) = away.at(&cx, i);
+        if at == k {
+            return Option::Some.(target);
+        }
+        i = i + 1usize;
+    }
+    Option::None
 }
 
 // Records that instruction `at` (or the terminator, at the block's length) reads `name`.

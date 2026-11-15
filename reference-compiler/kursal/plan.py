@@ -140,6 +140,12 @@ class Plan:
         # (block, payload parameter) -> (block, scrutinee, variant) whose payload the parameter reads (`share`)
         self.arrived: dict[tuple[str, str], tuple[str, str, str]] = {}
         self.share()
+        # (block, parameter) -> {component index: the place path the component is written to} (`home_params`)
+        self.homed: dict[tuple[str, str], dict[int, str]] = {}
+        # (block, value) of each construction or call shared into a homed parameter: it writes the homed
+        # components itself, and the edge does not
+        self.made_home: set[tuple[str, str]] = set()
+        self.home_params(components or {})
         self.variables = self.c_variables()
 
     def is_live(self, label: str, name: str) -> bool:
@@ -233,23 +239,36 @@ class Plan:
 
         - A value an instruction of a block assigns, which one edge of the block reads and nothing else
           does, as the argument of a live parameter of another block, is assigned to the parameter's C
-          variable (`shared`), and the edge assigns nothing. Only the edges into the parameter's block
-          and that block itself touch the variable, and the edge enters the block after every read of
-          the value.
+          variable (`shared`), and the edge assigns nothing. Only the edges into the parameter's block,
+          the values shared into the parameter and that block itself touch the variable, and the edge
+          enters the block after every read of the value. A block whose payload is read in that variable
+          (below) makes nothing there, since it may read the payload after making the value.
         - The payload parameter of a block that one arm of a switch on a value enters, and no other
-          edge, reads the payload where the scrutinee lies (`arrived`), when that is a C variable: only
-          the switch's block assigns its variables, and it runs again only after the arm's block has
-          left. A scrutinee lying in a place is not read so, since the arm's block may write the place."""
+          edge, reads the payload where the scrutinee lies (`arrived`), when that is a C variable: the
+          switch's block assigns it, or the edges into that block and values shared into its parameter
+          when it lies in a parameter's variable, and the arm's block shares nothing there; the switch's
+          block runs again only after the arm's block has left. A scrutinee lying in a place is not read
+          so, since the arm's block may write the place."""
         incoming: dict[str, int] = {}
         for block in self.emitted:
             for edge, _ in term_edges(block.term):
                 incoming[edge.target] = incoming.get(edge.target, 0) + 1
         for block in self.emitted:
             label, term = block.label, block.term
-            # Nothing moves along an edge without arguments, nor a payload but a switch's.
-            if not (isinstance(term, Switch) and not term.scrutinee.startswith("&")) and \
-                    not any(edge.args for edge, _ in term_edges(term)):
+            if isinstance(term, Switch) and not term.scrutinee.startswith("&") and \
+                    not self.resident.get((label, term.scrutinee), "%").startswith("&"):
+                for arm in term.arms:
+                    target = self.blocks[arm.edge.target]
+                    if target.label not in self.return_index and target.label != label and \
+                            incoming.get(target.label) == 1 and target.params:
+                        self.arrived[target.label, target.params[0][0]] = (label, term.scrutinee, arm.variant)
+        for block in self.emitted:
+            label, term = block.label, block.term
+            if not any(edge.args for edge, _ in term_edges(term)):
                 continue
+            # The variable the block's payload is read in (`arrived`), which no value of the block is made in.
+            payload = block.params[0][0] if block.params else ""
+            arrival = self.variable(label, payload) if (label, payload) in self.arrived else None
             reads: dict[str, int] = {}
             for name in [name for instr in block.instrs for name in instr_reads(instr)] + term_reads(term) + \
                     [name for edge, _ in term_edges(term) for name in edge.args]:
@@ -263,15 +282,155 @@ class Plan:
                     continue
                 for (param, _), arg in zip(target.params[skip:], edge.args):
                     if arg in assigned and reads.get(arg) == 1 and (label, arg) not in self.resident and \
-                            (target.label, param) in self.live:
+                            (target.label, param) in self.live and arrival != (target.label, param):
                         self.shared[label, arg] = (target.label, param)
-            if isinstance(term, Switch) and not term.scrutinee.startswith("&") and \
-                    not self.resident.get((label, term.scrutinee), "%").startswith("&"):
-                for arm in term.arms:
-                    target = self.blocks[arm.edge.target]
-                    if target.label not in self.return_index and target.label != label and \
-                            incoming.get(target.label) == 1 and target.params:
-                        self.arrived[target.label, target.params[0][0]] = (label, term.scrutinee, arm.variant)
+
+    def variable(self, label: str, name: str) -> Optional[tuple[str, str]]:
+        """The block and value whose C variable the value `name` of block `label` lies in, through the
+        scrutinees payloads arrive from; `None` when it lies in a place."""
+        path = self.resident.get((label, name), name)
+        if path.startswith("&"):
+            return None
+        value = root(path)
+        if (label, value) in self.arrived:
+            source, scrutinee, _ = self.arrived[label, value]
+            return self.variable(source, scrutinee)
+        return label, value
+
+    # ------------------------------------------------------- homed parameters --
+
+    def home_params(self, components: dict[tuple[str, int], tuple[str, ...]]) -> None:
+        """Components of a block parameter written where they end up (`homed`).
+
+        A parameter `p` of a struct or tuple type that its block J reads once, by a destruct, whose
+        component `c` (with what copies or forwards it) J reads once, by a store into a place path P that
+        J's header declares empty (P or a path around it), with nothing in J naming a path overlapping P
+        before that store, is written at P by every edge into J instead: the store writes nothing, and `c`
+        lies at P. On each edge, the component is written where the argument is made (a construction or
+        a call whose result is shared into `p`), else at the edge, after its other assignments; from there
+        to the edge nothing names a path overlapping P, reads a value lying at such a path, or (for the
+        component written) has it lie at a path overlapping P but not P itself. P is empty from where it is
+        written to J's store, so its old contents are dead and nothing reads it before the store."""
+        preds: dict[str, list[tuple[Block, Edge, int]]] = {}
+        for block in self.emitted:
+            for edge, skip in term_edges(block.term):
+                preds.setdefault(edge.target, []).append((block, edge, skip))
+        for target in self.emitted[1:]:
+            label = target.label
+            if label not in preds or not target.params:
+                continue
+            alias: dict[str, str] = {}
+            stored: dict[str, str] = {}
+
+            def find(name: str) -> str:
+                while name in alias:
+                    name = alias[name]
+                return name
+
+            for instr in target.instrs:
+                op, a = instr.op, instr.args
+                if op in ("copy", "open", "pack") and a[0].startswith("%"):
+                    alias[instr.lhs[0]] = find(a[0])
+                elif op == "store" and a[0] in self.forwarded:
+                    stored[a[0]] = a[1]
+                elif op == "load" and a[0] in self.forwarded:
+                    alias[instr.lhs[0]] = find(stored[a[0]])
+            # class -> the indices of the instructions reading it (n: the terminator or an edge), but stores
+            # into forwarded places
+            n = len(target.instrs)
+            reads: dict[str, list[int]] = {}
+            for i, instr in enumerate(target.instrs):
+                if instr.op == "store" and instr.args[0] in self.forwarded:
+                    continue
+                for name in instr_reads(instr):
+                    reads.setdefault(find(name), []).append(i)
+            for name in term_reads(target.term) + [name for edge, _ in term_edges(target.term) for name in edge.args]:
+                reads.setdefault(find(name), []).append(n)
+            # the paths homed so far, in the order every edge and construction writes them
+            chosen: list[str] = []
+            for pi, (p, _) in enumerate(target.params):
+                at = reads.get(p, [])
+                if (label, p) not in self.live or len(at) != 1 or at[0] == n:
+                    continue
+                d = at[0]
+                destruct = target.instrs[d]
+                if destruct.op != "destruct" or destruct.args != (p,) or (label, d) not in components:
+                    continue
+                parts = components[label, d]
+                homes: dict[int, str] = {}
+                for k, c in enumerate(destruct.lhs):
+                    at = reads.get(find(c), [])
+                    if len(at) != 1 or at[0] == n:
+                        continue
+                    s = at[0]
+                    store = target.instrs[s]
+                    path = store.args[0]
+                    if store.op != "store" or find(store.args[1]) != find(c) or not is_place(path) or \
+                            root(path) in self.forwarded or s <= d or \
+                            not any(e == path or path.startswith(e + ".") for e in target.empty) or \
+                            any(is_place(arg) and overlap(arg, path) for instr in target.instrs[:s] for arg in instr.args):
+                        continue
+                    if all(self.written_on(block, edge, skip, pi, k, parts[k], path, chosen)
+                           for block, edge, skip in preds[label]):
+                        homes[k] = path
+                        chosen.append(path)
+                        self.unwritten.add((label, s))
+                        for name in [c] + [name for instr in target.instrs for name in instr.lhs]:
+                            if find(name) == find(c):
+                                self.resident[label, name] = path
+                if homes:
+                    self.homed[label, p] = homes
+                    for block, edge, skip in preds[label]:
+                        arg = edge.args[pi - skip]
+                        if self.made_at(block, arg, (label, p)) < len(block.instrs):
+                            self.made_home.add((block.label, arg))
+
+    def made_at(self, block: Block, arg: str, param: tuple[str, str]) -> int:
+        """Where a homed component of `arg`, passed to `param`, is written in `block`: at the construction
+        or call making it when it is shared into the parameter, else at the edge (the block's length)."""
+        if self.shared.get((block.label, arg)) == param:
+            for i, instr in enumerate(block.instrs):
+                if arg in instr.lhs:
+                    return i if instr.op in ("construct", "call", "trait_call") else len(block.instrs)
+        return len(block.instrs)
+
+    def written_on(self, block: Block, edge: Edge, skip: int, pi: int, k: int, part: str, path: str,
+                   chosen: list[str]) -> bool:
+        """Component `k` (labelled `part`) of the argument `edge` passes to parameter `pi` of its target
+        can be written at `path` in `block` (`home_params`), after the components homed at `chosen`."""
+        if pi < skip:
+            return False
+        label, instrs, n = block.label, block.instrs, len(block.instrs)
+        arg = edge.args[pi - skip]
+        at = self.made_at(block, arg, (edge.target, self.blocks[edge.target].params[pi][0]))
+        made_by = instrs[at] if at < n else None
+        # Nothing after the write names a path overlapping `path` (a call's own lends included).
+        start = at if made_by is not None and made_by.op != "construct" else at + 1
+        if any(is_place(a) and overlap(a, path) for instr in instrs[start:] for a in instr.args):
+            return False
+        term = block.term
+        if at < n and isinstance(term, Switch) and term.scrutinee.startswith("&") and overlap(term.scrutinee, path):
+            return False
+        # Nothing read after the write lies at a path overlapping `path`.
+        later = [name for instr in instrs[at + 1:] for name in instr_reads(instr)]
+        if at < n:
+            later += term_reads(term) + [name for e, _ in term_edges(term) for name in e.args]
+        if any(overlap(self.resident.get((label, name), "%"), path) for name in later):
+            return False
+        # What is written does not lie at a path overlapping `path` but `path` itself, nor at one a
+        # component written before it was written at.
+        if made_by is not None and made_by.op == "construct":
+            source = self.resident.get((label, made_by.args[k]), "%")
+        elif made_by is not None:
+            return True
+        else:
+            # Nor in a variable the edge assigns before it.
+            held = self.variable(label, arg)
+            if held is not None and held[0] == edge.target and any(held[1] == q for q, _ in self.blocks[edge.target].params):
+                return False
+            whole = self.resident.get((label, arg))
+            source = f"{whole}.{part}" if whole is not None else "%"
+        return (source == path or not overlap(source, path)) and not any(overlap(source, q) for q in chosen)
 
     # -------------------------------------------------------------- residences --
 

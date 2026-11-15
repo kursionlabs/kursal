@@ -165,6 +165,11 @@ class Backend:
         self.by_ref: dict[str, tuple[bool, ...]] = {}
         # symbol of a function whose address is taken -> its by-value entry (`thunk`)
         self.thunks: dict[str, str] = {}
+        # symbol -> the elements of its tuple result it writes through out pointers (`request`)
+        self.outs: dict[str, tuple[int, ...]] = {}
+        # symbol -> the C type and name of each out pointer's pointee, in element order
+        self.out_params: dict[str, list[tuple[str, str]]] = {}
+        self.results: dict[str, Type] = {}     # symbol with out pointers -> its whole result type
         self.datas: dict[str, tuple[str, Data]] = {}
         # One conservative pool for ordinary identifiers, including function
         # locals: later global declarations must not be shadowed by earlier locals.
@@ -353,7 +358,17 @@ class Backend:
         self.queue.append((fun, dict(sub), symbol))
         self.by_ref[symbol] = tuple(not name.startswith("&") and self.by_pointer(subst(ty, sub))
                                     for name, ty in fun.blocks[0].params)
+        result = self.shape(subst(fun.ret, sub))
+        self.outs[symbol] = tuple(k for k, e in enumerate(result.elems) if self.by_pointer(e)) \
+            if isinstance(result, Tuple) else ()
         return symbol
+
+    def reduced(self, ret: Type, outs: Sequence[int]) -> Type:
+        """The C result of a function writing the elements `outs` of its tuple result `ret` through out
+        pointers: a tuple of the other elements."""
+        result = self.shape(ret)
+        assert isinstance(result, Tuple)
+        return Tuple(tuple(e for k, e in enumerate(result.elems) if k not in outs))
 
     def by_pointer(self, ty: Type) -> bool:
         """A value of `ty` is passed by pointer: its C representation is more than four words. Up to four
@@ -401,7 +416,7 @@ class Backend:
                else self.substitute_type(t) for k, (p, t) in enumerate(zip(fun.params, instr.tys))}
         symbol = self.request(fun, sub)
         self.address_taken.add(symbol)
-        if not any(self.by_ref[symbol]):
+        if not any(self.by_ref[symbol]) and not self.outs[symbol]:
             return symbol
         # A function value calls with the plain convention: through an entry taking every value as is.
         if symbol not in self.thunks:
@@ -582,7 +597,18 @@ class Backend:
                 self.deref.add(name)
             cparams.append((ctype, cname, name.startswith("&")))
         ret_type = substitute_type(fun.ret)
-        self.heads[symbol] = (self.ctype(ret_type), isinstance(ret_type, Never), cparams)
+        self.ret_type = ret_type
+        outs = self.outs[symbol]
+        if outs:
+            result = self.shape(ret_type)
+            assert isinstance(result, Tuple)
+            self.out_params[symbol] = [(self.ctype(result.elems[k]), allocate(f"out_{k}", self.taken)) for k in outs]
+            self.results[symbol] = ret_type
+            self.heads[symbol] = (self.ctype(self.reduced(ret_type, outs)), False, cparams)
+        else:
+            self.heads[symbol] = (self.ctype(ret_type), isinstance(ret_type, Never), cparams)
+        # (block, value, element) of each element of a returned value already in its out pointer's pointee
+        self.at_out: set[tuple[str, str, int]] = set()
         for name, ty in fun.locals:
             if name in self.plan.forwarded or self.erased(substitute_type(ty)):
                 continue
@@ -598,6 +624,8 @@ class Backend:
                 continue
             values.append((label, name, ty, self.cname(label, name)))
         self.blocks = {b.label: b for b in fun.blocks}
+        self.returning = False
+        self.out_paths: list[str] = []
         self.lines.extend(prologue)
         for block in self.plan.emitted:
             self.label = block.label
@@ -608,7 +636,9 @@ class Backend:
                     self.instr(instr)
             if call is None or not self.tail_call(call):
                 if call is not None:
+                    self.returning = True
                     self.instr(call)
+                    self.returning = False
                 self.term(block.term)
         decls.extend(f"{self.ctype(substitute_type(ty))} {cname};" for label, name, ty, cname in values
                      if (label, name) in self.plan.variables)
@@ -790,9 +820,26 @@ class Backend:
                 continue
             params.append(f"{ctype}{'*' if place else ''} {cname}")
             args.append(f"&{cname}" if self.by_ref[symbol][k] else cname)
-        call = f"{symbol}({', '.join(args)});"
-        body = f" {{\n  {call}\n}}\n" if ret == "void" else f" {{\n  return {call}\n}}\n"
-        return f"{'_Noreturn ' if noreturn else ''}static {ret} {thunk}({', '.join(params) or 'void'})", body
+        outs = self.out_params.get(symbol, [])
+        if not outs:
+            call = f"{symbol}({', '.join(args)});"
+            body = f" {{\n  {call}\n}}\n" if ret == "void" else f" {{\n  return {call}\n}}\n"
+            return f"{'_Noreturn ' if noreturn else ''}static {ret} {thunk}({', '.join(params) or 'void'})", body
+        # It takes the result's elements written through out pointers into locals, and returns the whole.
+        whole, ks = self.results[symbol], self.outs[symbol]
+        members = self.members(self.shape(whole))
+        lines = [f"{ctype} {cname};" for ctype, cname in outs]
+        call = f"{symbol}({', '.join(args + ['&' + cname for _, cname in outs])})"
+        rest = iter(self.members(self.shape(self.reduced(whole, ks))))
+        parts = []
+        for k, (member, t) in enumerate(members):
+            source = f"{outs[ks.index(k)][1]}" if k in ks else f"reduced.{next(rest)[0]}"
+            if not self.erased(t):
+                parts.append(f".{member} = {source}")
+        lines.append(f"{call};" if ret == "void" else f"{ret} reduced = {call};")
+        lines.append(f"return ({self.ctype(whole)}){{ {', '.join(parts)} }};")
+        body = " {\n" + "".join(f"  {line}\n" for line in lines) + "}\n"
+        return f"static {self.ctype(whole)} {thunk}({', '.join(params) or 'void'})", body
 
     def head(self, symbol: str, const: set[tuple[str, int]], restrict: set[tuple[str, int]]) -> str:
         """A function's head, with its place parameters qualified as `qualifiers` allows."""
@@ -806,6 +853,7 @@ class Backend:
             elif self.by_ref[symbol][k]:
                 ctype += " const*"
             params.append(f"{ctype} {cname}")
+        params.extend(f"{ctype}* {cname}" for ctype, cname in self.out_params.get(symbol, ()))
         return f"{'_Noreturn ' if noreturn else ''}static {ret} {symbol}({', '.join(params) or 'void'})"
 
     def substitute_type(self, ty: Type) -> Type:
@@ -931,7 +979,7 @@ class Backend:
                 self.forwards[a[0]] = self.value_name(a[1])
         elif op == "construct":
             assert dst is not None
-            self.construct(dst, self.type_operand(instr), a)
+            self.construct(dst, self.type_operand(instr), a, self.away(instr.lhs[0]))
         elif op == "destruct":
             self.destruct(instr)
         elif op == "construct_variant":
@@ -1013,15 +1061,53 @@ class Backend:
         assert instr.ty is not None
         return self.substitute_type(instr.ty)
 
-    def construct(self, dst: str, ty: Type, args: Sequence[str]) -> None:
+    def construct(self, dst: str, ty: Type, args: Sequence[str], away: Optional[dict[int, str]] = None) -> None:
+        """Assigns each component to its member of `dst`, but the components `away` sends elsewhere: to a
+        place path where a homed component ends up, or through an out pointer (`*out`), after the others."""
         s = self.shape(ty)
         if isinstance(s, Array):
             for k in range(s.length):
                 self.line(f"{dst}.items[{k}] = {self.value_name(args[min(k, len(args) - 1)])};")
+            return
+        away = away or {}
+        for k, ((member, t), arg) in enumerate(zip(self.members(s), args)):
+            if not self.erased(t) and k not in away:
+                self.line(f"{dst}.{member} = {self.value_name(arg)};")
+        for k, target in away.items():
+            if target.startswith("*"):
+                self.line(f"{target} = {self.value_name(args[k])};")
+            else:
+                self.write_home(target, self.value_name(args[k]), "")
+
+    def away(self, name: str) -> dict[int, str]:
+        """Where the components of the value `name` that a construction or a call makes go instead of its
+        variable: the homed ones of a value shared into a homed parameter (`Plan.home_params`) to their
+        place paths; when the function writes elements of its result through out pointers, and the value
+        is returned and read nothing else, those elements to `*out` (then marked as there)."""
+        key = (self.label, name)
+        if key in self.plan.made_home:
+            return dict(self.plan.homed[self.plan.shared[key]])
+        outs = self.out_params.get(self.symbol)
+        if not outs or not self.returned_alone(name):
+            return {}
+        for k in self.outs[self.symbol]:
+            self.at_out.add((self.label, name, k))
+        return {k: f"*{cname}" for k, (_, cname) in zip(self.outs[self.symbol], outs)}
+
+    def returned_alone(self, name: str) -> bool:
+        """The value `name` of the current block is what it returns, directly or through return joins, and
+        the block reads it nowhere else."""
+        block = self.blocks[self.label]
+        term = block.term
+        if isinstance(term, Ret):
+            returned = term.value
+        elif isinstance(term, Jmp) and term.edge.target in self.plan.return_index:
+            returned = term.edge.args[self.plan.return_index[term.edge.target]]
         else:
-            for (member, t), arg in zip(self.members(s), args):
-                if not self.erased(t):
-                    self.line(f"{dst}.{member} = {self.value_name(arg)};")
+            return False
+        reads = [n for instr in block.instrs for n in instr_reads(instr)] + term_reads(term) + \
+            [n for edge, _ in term_edges(term) for n in edge.args]
+        return returned == name and reads.count(name) == 1
 
     def destruct(self, instr: Instr) -> None:
         arg = instr.args[0]
@@ -1143,14 +1229,14 @@ class Backend:
             sub = {p.name: substitute_type(t) for p, t in zip(fun.params, instr.tys)}
             symbol = self.request(fun, sub)
             self.lend(symbol, instr.args[1:])
-            self.emit_call(instr, symbol, fun.ret, sub, instr.args[1:], self.by_ref[symbol])
+            self.emit_call(instr, symbol, fun.ret, sub, instr.args[1:], self.by_ref[symbol], self.outs[symbol])
 
     def trait_call(self, instr: Instr) -> None:
         a = instr.args
         fun, sub = self.resolve_trait(a[0], a[1], tuple(self.substitute_type(t) for t in instr.tys))
         symbol = self.request(fun, sub)
         self.lend(symbol, a[2:])
-        self.emit_call(instr, symbol, fun.ret, sub, a[2:], self.by_ref[symbol])
+        self.emit_call(instr, symbol, fun.ret, sub, a[2:], self.by_ref[symbol], self.outs[symbol])
 
     def lend_in_place(self, instr: Instr, paths: tuple[str, ...]) -> None:
         """A lend adapter's call (`Plan.residences`) as its own call, lending the callee the places
@@ -1208,7 +1294,8 @@ class Backend:
         expr = self.value_name(arg)
         path = self.plan.resident.get((self.label, arg), "")
         if path.startswith("&") and (root(path) in self.params or
-                                     any(a.startswith("&") and not a.startswith("&*") and overlap(a, path) for a in args)):
+                                     any(a.startswith("&") and not a.startswith("&*") and overlap(a, path) for a in args) or
+                                     any(overlap(q, path) for q in self.out_paths)):
             copy = allocate(f"arg_{self.scratch}", self.taken)
             self.scratch += 1
             self.temps.append(f"{self.ctype(self.type_of(arg))} {copy};")
@@ -1217,12 +1304,60 @@ class Backend:
         return f"&{expr}"
 
     def emit_call(self, instr: Instr, callee: str, ret: Type, sub: Mapping[str, Type], args: tuple[str, ...],
-                  refs: Sequence[bool] = ()) -> None:
-        call = f"{callee}({self.operands(args, refs)})"
-        if self.erased(subst(ret, sub)) or not self.is_live(instr.lhs[0]):
+                  refs: Sequence[bool] = (), outs: Sequence[int] = ()) -> None:
+        """The call, its result assigned. A callee writing elements of its result through out pointers is
+        passed, for each: the place path a homed component ends up at, the caller's own out pointer for
+        that element when the caller returns the result alone (`returning`), else the member of the
+        result's variable (or a scratch local when the result is dead); the rest of the result is the C
+        result."""
+        name = instr.lhs[0]
+        result = subst(ret, sub)
+        live = not self.erased(result) and self.is_live(name)
+        dst = self.value_name(name) if live else ""
+        homed = self.away(name) if live and (self.label, name) in self.plan.made_home else {}
+        members = self.members(self.shape(result)) if outs else []
+        pointers = []
+        own = dict(zip(self.outs[self.symbol], self.out_params.get(self.symbol, ()))) if self.returning else {}
+        for k in outs:
+            if k in homed:
+                pointers.append(f"&{self.place(homed[k])[0]}")
+                if root(homed[k]) in self.params:
+                    self.written.add((self.symbol, self.params.index(root(homed[k]))))
+            elif k in own and own[k][0] == self.ctype(self.shape(result).elems[k]):
+                pointers.append(own[k][1])
+                self.at_out.add((self.label, name, k))
+            elif live:
+                pointers.append(f"&{dst}.{members[k][0]}")
+            else:
+                temp = allocate(f"arg_{self.scratch}", self.taken)
+                self.scratch += 1
+                self.temps.append(f"{self.ctype(self.shape(result).elems[k])} {temp};")
+                pointers.append(f"&{temp}")
+        self.out_paths = [homed[k] for k in outs if k in homed]
+        operands = self.operands(args, refs)
+        self.out_paths = []
+        call = f"{callee}({', '.join(x for x in [operands, *pointers] if x)})"
+        if outs:
+            reduced = self.reduced(result, outs)
+            rest = [(m, t) for k, (m, t) in enumerate(members) if k not in outs]
+            if not live or self.erased(reduced):
+                self.line(f"{call};")
+            else:
+                temp = allocate(f"ret_{self.scratch}", self.taken)
+                self.scratch += 1
+                self.temps.append(f"{self.ctype(reduced)} {temp};")
+                self.line(f"{temp} = {call};")
+                for (r, _), (m, t) in zip(self.members(self.shape(reduced)), rest):
+                    if not self.erased(t):
+                        self.line(f"{dst}.{m} = {temp}.{r};")
+        elif not live:
             self.line(f"{call};")
         else:
-            self.line(f"{self.value_name(instr.lhs[0])} = {call};")
+            self.line(f"{dst} = {call};")
+        # A homed component the callee does not write through a pointer goes to its place after the call.
+        for k, path in homed.items():
+            if k not in outs:
+                self.write_home(path, f"{dst}.{self.members(self.shape(result))[k][0]}", "")
 
     def lend(self, callee: Optional[str], args: Sequence[str]) -> None:
         """Records where each place lent to `callee` lies, for `qualifiers`; `None` for a call through a
@@ -1292,6 +1427,7 @@ class Backend:
         # decides for its parameter of that type) is passed by its address.
         caps = [self.by_address(c, ()) if self.by_pointer(self.type_of(c)) else self.value_name(c)
                 for c in instr.args[2:] if not self.erased(self.type_of(c))]
+        values = [self.value_name(c) for c in instr.args[2:] if not self.erased(self.type_of(c))]
         skeleton, rows = self.types.rows(t.source)
         pointer = isinstance(self.shape(t.source), Ptr) and not isinstance(t.source, Foreach)
         out_shape = self.shape(t)
@@ -1302,6 +1438,14 @@ class Backend:
             sub = {p.name: bound[b] for p, b in zip(mapper.params, binders)}
             sub.update(zip((p.name for p in mapper.params[len(binders):]), own))
             symbol = self.request(mapper, sub)
+            if self.outs[symbol]:
+                # A mapper writing elements of its result through out pointers is called through its by-value
+                # entry, which returns the whole result.
+                self.address_taken.add(symbol)
+                if symbol not in self.thunks:
+                    self.thunks[symbol] = allocate(f"{symbol}_value", self.taken)
+                arguments = ([] if not pointer and self.erased(item) else [component]) + values
+                return f"{self.thunks[symbol]}({', '.join(arguments)})"
             passed = f"&{component}" if self.by_ref[symbol][0] else component
             arguments = ([] if not pointer and self.erased(item) else [passed]) + caps
             return f"{symbol}({', '.join(arguments)})"
@@ -1350,7 +1494,10 @@ class Backend:
     def term(self, term: Terminator) -> None:
         match term:
             case Ret():
-                self.line("return;" if self.erased(self.type_of(term.value)) else f"return {self.value_name(term.value)};")
+                if self.erased(self.type_of(term.value)):
+                    self.line("return;")
+                else:
+                    self.give_back(term.value, self.value_name(term.value), "")
             case Jmp():
                 self.edge(term.edge)
             case Jnz():
@@ -1374,18 +1521,67 @@ class Backend:
         values = ([(payload, source)] if payload is not None else []) + \
             [("", "") if self.erased(self.type_of(a)) else (self.value_name(a), self.value_base(a)) for a in edge.args]
         if target.label in self.plan.return_index:
-            value = values[self.plan.return_index[target.label]][0]
-            self.line(f"{indent}return {value};" if value else f"{indent}return;")
+            index = self.plan.return_index[target.label]
+            value = values[index][0]
+            names = ([None] if payload is not None else []) + list(edge.args)
+            if value:
+                self.give_back(names[index], value, indent)
+            else:
+                self.line(f"{indent}return;")
             return
-        self.assign([(self.cname(target.label, n), t, False, value, base)
-                     for (n, t), (value, base) in zip(target.params, values) if value and self.plan.is_live(target.label, n)], indent)
+        moves, homes = [], []
+        for (n, t), (value, base), name in zip(target.params, values, ([None] if payload is not None else []) + list(edge.args)):
+            if not value or not self.plan.is_live(target.label, n):
+                continue
+            homed = self.plan.homed.get((target.label, n), {})
+            if not homed:
+                moves.append((self.cname(target.label, n), t, False, value, base))
+                continue
+            # The components written where they end up (`Plan.home_params`): the others are assigned one by
+            # one, and the homed ones after every other assignment, unless the value's making wrote them.
+            for k, (member, mt) in enumerate(self.members(self.shape(self.substitute_type(t)))):
+                if k not in homed and not self.erased(mt):
+                    moves.append((f"{self.cname(target.label, n)}.{member}", mt, False, f"{value}.{member}", base))
+                elif k in homed and (self.label, name) not in self.plan.made_home:
+                    homes.append((homed[k], f"{value}.{member}"))
+        self.assign(moves, indent)
+        for path, value in homes:
+            self.write_home(path, value, indent)
         self.line(f"{indent}goto {self.labels[target.label]};")
+
+    def write_home(self, path: str, value: str, indent: str) -> None:
+        """Writes `value` at the place path `path` where a homed component ends up, unless it lies there."""
+        target = self.place(path)[0]
+        if target != value:
+            if root(path) in self.params:
+                self.written.add((self.symbol, self.params.index(root(path))))
+            self.line(f"{indent}{target} = {value};")
+
+    def give_back(self, name: Optional[str], value: str, indent: str) -> None:
+        """Returns the value `value` (of the SSA value `name`, if known): each element written through an
+        out pointer is assigned to its pointee, unless it is there already, and the rest returned."""
+        outs = self.out_params.get(self.symbol)
+        if not outs:
+            self.line(f"{indent}return {value};")
+            return
+        ks = self.outs[self.symbol]
+        members = self.members(self.shape(self.ret_type))
+        for k, (_, cname) in zip(ks, outs):
+            if (self.label, name, k) not in self.at_out:
+                self.line(f"{indent}*{cname} = {value}.{members[k][0]};")
+        reduced = self.reduced(self.ret_type, ks)
+        if self.erased(reduced):
+            self.line(f"{indent}return;")
+            return
+        rest = [m for k, m in enumerate(members) if k not in ks]
+        parts = [f".{r} = {value}.{m}" for (r, _), (m, t) in zip(self.members(self.shape(reduced)), rest) if not self.erased(t)]
+        self.line(f"{indent}return ({self.ctype(reduced)}){{ {', '.join(parts)} }};")
 
     def assign(self, moves: Sequence[tuple[str, Type, bool, str, str]], indent: str) -> None:
         """Assigns each `(variable, type, whether a place's pointer, value, the variable it reads)` at once:
         one after another when no assignment overwrites what a later one reads, else through scratch locals."""
         moves = [move for move in moves if move[0] != move[3]]
-        if any(moves[k][0] == later[4] for k in range(len(moves)) for later in moves[k + 1:]):
+        if any(moves[k][0].split(".")[0] == later[4] for k in range(len(moves)) for later in moves[k + 1:]):
             temps: list[str] = []
             for _, t, place, value, _ in moves:
                 temp = allocate(f"edge_{self.scratch}", self.taken)

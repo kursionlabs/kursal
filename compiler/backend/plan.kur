@@ -8,7 +8,7 @@ use std::raw::Span;
 use std::alloc::arena::Domain;
 use std::bytes::buffer::Buffer;
 use package::kurs::core::{Block, Edge, Fun, Instr, Terminator, Type, atomic_kind, same};
-use package::check::checker::overlap;
+use package::check::checker::{overlap, prefix};
 use std::option::Option;
 
 // Instructions whose C writes only their results: left out when every result is dead.
@@ -180,6 +180,12 @@ exposed struct Plan {
     // every key of `resident`, `shared` and `arrived`: the values the C reads elsewhere than in a
     // variable of their own
     moved: ArenaSet[(Span['k], Span['k]), 'k],
+    // (block label, parameter) -> each (component index, the place path the component is written to),
+    // by index (`home_params`)
+    homed: ArenaMap[(Span['k], Span['k]), ArenaVec[(usize, Span['k]), 'k], 'k],
+    // (block label, value) of each construction or call shared into a homed parameter: it writes the
+    // homed components itself, and the edge does not
+    made_home: ArenaSet[(Span['k], Span['k]), 'k],
 }
 
 forall 'k.
@@ -199,7 +205,7 @@ impl Plan['k] {
         let plan = Plan.{ fun, blocks, forwarded: ArenaSet::new(&cx), return_index: ArenaMap::new(&cx), emitted: ArenaVec::new(&cx),
             live: ArenaSet::new(&cx), variables: ArenaSet::new(&cx), resident: ArenaMap::new(&cx), in_place: ArenaMap::new(&cx),
             unwritten: ArenaSet::new(&cx), fused: ArenaSet::new(&cx), shared: ArenaMap::new(&cx), arrived: ArenaMap::new(&cx),
-            moved: ArenaSet::new(&cx) };
+            moved: ArenaSet::new(&cx), homed: ArenaMap::new(&cx), made_home: ArenaSet::new(&cx) };
         plan.forwarded_places(&cx);
         var r = 1usize;
         while r < fun.blocks.len(&cx) {
@@ -229,6 +235,7 @@ impl Plan['k] {
         }
         plan.liveness(&cx);
         plan.share(&cx);
+        plan.home_params(&cx, components);
         plan.c_variables(&cx);
         plan
     }
@@ -442,15 +449,17 @@ impl Plan['k] {
             }
             b = b + 1usize;
         }
+        var a = 0usize;
+        while a < self.emitted.len(&cx) {
+            self.arrive(&cx, self.emitted.at(&cx, a), incoming);
+            a = a + 1usize;
+        }
         var k = 0usize;
         while k < self.emitted.len(&cx) {
             let block = self.emitted.at(&cx, k);
-            // Nothing moves along an edge without arguments, nor a payload but a switch's.
+            // Nothing moves along an edge without arguments.
             let edges_here = term_edges(&cx, block.term);
-            var moving = match block.term {
-                Terminator::Switch(scrutinee, _ty, _arms, _pos) => !scrutinee.starts_with(&cx, Span::from_static(&cx, "&")),
-                _ => false,
-            };
+            var moving = false;
             var q = 0usize;
             while !moving && q < edges_here.len(&cx) {
                 let (edge, _skip) = edges_here.at(&cx, q);
@@ -458,15 +467,50 @@ impl Plan['k] {
                 q = q + 1usize;
             }
             if moving {
-                self.share_block(&cx, block, incoming);
+                self.share_block(&cx, block);
             }
             k = k + 1usize;
         }
     }
 
-    // `share` in one block that passes something along an edge.
-    fn share_block(self, &cx: Domain!['k], block: Block['k], incoming: ArenaMap[Span['k], usize, 'k]) {
+    // The payloads that arrive where the scrutinee of a switch ending `block` lies (`arrived`).
+    fn arrive(self, &cx: Domain!['k], block: Block['k], incoming: ArenaMap[Span['k], usize, 'k]) {
         let label = block.label;
+        match block.term {
+            Terminator::Switch(scrutinee, _ty, arms, _pos) => {
+                let placed = match self.resident.get(&cx, (label, scrutinee)) {
+                    Option::Some(path) => path.starts_with(&cx, Span::from_static(&cx, "&")),
+                    Option::None => false,
+                };
+                if !scrutinee.starts_with(&cx, Span::from_static(&cx, "&")) && !placed {
+                    var r = 0usize;
+                    while r < arms.len(&cx) {
+                        let arm = arms.at(&cx, r);
+                        let target = self.blocks.at(&cx, arm.edge.target);
+                        if !self.return_index.contains(&cx, target.label) && !target.label.eq(&cx, label)
+                            && is_at(incoming.get(&cx, target.label), 1usize) && !target.params.is_empty(&cx) {
+                            self.arrived.insert(&cx, (target.label, target.params.at(&cx, 0usize).name), (label, scrutinee, arm.variant));
+                            self.moved.insert(&cx, (target.label, target.params.at(&cx, 0usize).name));
+                        }
+                        r = r + 1usize;
+                    }
+                }
+            },
+            _ => (),
+        };
+    }
+
+    // `share` in one block that passes something along an edge.
+    fn share_block(self, &cx: Domain!['k], block: Block['k]) {
+        let label = block.label;
+        // The variable the block's payload is read in (`arrived`), which no value of the block is made in.
+        let arrival = if block.params.is_empty(&cx) {
+            Option::None
+        } else if self.arrived.contains(&cx, (label, block.params.at(&cx, 0usize).name)) {
+            self.variable(&cx, label, block.params.at(&cx, 0usize).name)
+        } else {
+            Option::None
+        };
         let reads: ArenaMap[Span['k], usize, 'k] = ArenaMap::new(&cx);
         let assigned: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
         var i = 0usize;
@@ -514,8 +558,15 @@ impl Plan['k] {
                 while a < edge.args.len(&cx) && skip + a < target.params.len(&cx) {
                     let param = target.params.at(&cx, skip + a).name;
                     let arg = edge.args.at(&cx, a);
+                    let into = match arrival {
+                        Option::Some(held) => {
+                            let (at, name) = held;
+                            at.eq(&cx, target.label) && name.eq(&cx, param)
+                        },
+                        Option::None => false,
+                    };
                     if assigned.contains(&cx, arg) && is_at(reads.get(&cx, arg), 1usize) && !self.resident.contains(&cx, (label, arg))
-                        && self.live.contains(&cx, (target.label, param)) {
+                        && self.live.contains(&cx, (target.label, param)) && !into {
                         self.shared.insert(&cx, (label, arg), (target.label, param));
                         self.moved.insert(&cx, (label, arg));
                     }
@@ -524,28 +575,383 @@ impl Plan['k] {
             }
             f = f + 1usize;
         }
-        match block.term {
-            Terminator::Switch(scrutinee, _ty, arms, _pos) => {
-                let placed = match self.resident.get(&cx, (label, scrutinee)) {
-                    Option::Some(path) => path.starts_with(&cx, Span::from_static(&cx, "&")),
-                    Option::None => false,
+    }
+
+    // ---------------------------------------------------------- homed parameters --
+
+    // Components of a block parameter written where they end up (`homed`); `Plan.home_params` in
+    // plan.py states the rules.
+    fn home_params(self, &cx: Domain!['k], components: ArenaMap[(Span['k], usize), ArenaVec[Span['k], 'k], 'k]) {
+        // block label -> each (block, edge, skip) of an edge into it
+        let preds: ArenaMap[Span['k], ArenaVec[(Block['k], Edge['k], usize), 'k], 'k] = ArenaMap::new(&cx);
+        var b = 0usize;
+        while b < self.emitted.len(&cx) {
+            let block = self.emitted.at(&cx, b);
+            let edges = term_edges(&cx, block.term);
+            var e = 0usize;
+            while e < edges.len(&cx) {
+                let (edge, skip) = edges.at(&cx, e);
+                match preds.get(&cx, edge.target) {
+                    Option::Some(found) => found.push(&cx, (block, edge, skip)),
+                    Option::None => {
+                        let fresh: ArenaVec[(Block['k], Edge['k], usize), 'k] = ArenaVec::new(&cx);
+                        fresh.push(&cx, (block, edge, skip));
+                        let unit = preds.insert(&cx, edge.target, fresh);
+                    },
                 };
-                if !scrutinee.starts_with(&cx, Span::from_static(&cx, "&")) && !placed {
-                    var r = 0usize;
-                    while r < arms.len(&cx) {
-                        let arm = arms.at(&cx, r);
-                        let target = self.blocks.at(&cx, arm.edge.target);
-                        if !self.return_index.contains(&cx, target.label) && !target.label.eq(&cx, label)
-                            && is_at(incoming.get(&cx, target.label), 1usize) && !target.params.is_empty(&cx) {
-                            self.arrived.insert(&cx, (target.label, target.params.at(&cx, 0usize).name), (label, scrutinee, arm.variant));
-                            self.moved.insert(&cx, (target.label, target.params.at(&cx, 0usize).name));
+                e = e + 1usize;
+            }
+            b = b + 1usize;
+        }
+        let alias: ArenaMap[Span['k], Span['k], 'k] = ArenaMap::new(&cx);
+        let stored: ArenaMap[Span['k], Span['k], 'k] = ArenaMap::new(&cx);
+        // class -> (how many times the block reads it, where it reads it last: an instruction's index,
+        // or the block's length for the terminator or an edge), but stores into forwarded places
+        let reads: ArenaMap[Span['k], (usize, usize), 'k] = ArenaMap::new(&cx);
+        var t = 1usize;
+        while t < self.emitted.len(&cx) {
+            let target = self.emitted.at(&cx, t);
+            // Only a destruct of a parameter homes its components.
+            var destructs = false;
+            var d = 0usize;
+            while !destructs && d < target.instrs.len(&cx) {
+                destructs = target.instrs.at(&cx, d).op.is(&cx, "destruct");
+                d = d + 1usize;
+            }
+            if destructs && !target.params.is_empty(&cx) {
+                match preds.get(&cx, target.label) {
+                    Option::Some(into) => self.home_block(&cx, target, into, components, alias, stored, reads),
+                    Option::None => (),
+                };
+            }
+            t = t + 1usize;
+        }
+    }
+
+    // `home_params` in one block with edges into it.
+    fn home_block(self, &cx: Domain!['k], target: Block['k], preds: ArenaVec[(Block['k], Edge['k], usize), 'k],
+        components: ArenaMap[(Span['k], usize), ArenaVec[Span['k], 'k], 'k], alias: ArenaMap[Span['k], Span['k], 'k],
+        stored: ArenaMap[Span['k], Span['k], 'k], reads: ArenaMap[Span['k], (usize, usize), 'k]) {
+        let label = target.label;
+        let instrs = target.instrs;
+        let n = instrs.len(&cx);
+        alias.clear(&cx);
+        stored.clear(&cx);
+        reads.clear(&cx);
+        var i = 0usize;
+        while i < n {
+            let instr = instrs.at(&cx, i);
+            let op = instr.op;
+            let a = instr.args;
+            if (op.is(&cx, "copy") || op.is(&cx, "open") || op.is(&cx, "pack")) && a.at(&cx, 0usize).starts_with(&cx, Span::from_static(&cx, "%")) {
+                alias.insert(&cx, instr.lhs.at(&cx, 0usize), find(&cx, alias, a.at(&cx, 0usize)));
+            } else if op.is(&cx, "store") && self.forwarded.contains(&cx, a.at(&cx, 0usize)) {
+                stored.insert(&cx, a.at(&cx, 0usize), a.at(&cx, 1usize));
+            } else if op.is(&cx, "load") && self.forwarded.contains(&cx, a.at(&cx, 0usize)) {
+                alias.insert(&cx, instr.lhs.at(&cx, 0usize), find(&cx, alias, stored.at(&cx, a.at(&cx, 0usize))));
+            }
+            i = i + 1usize;
+        }
+        var j = 0usize;
+        while j < n {
+            let instr = instrs.at(&cx, j);
+            if !(instr.op.is(&cx, "store") && self.forwarded.contains(&cx, instr.args.at(&cx, 0usize))) {
+                var g = 0usize;
+                while g < instr.args.len(&cx) {
+                    match value_read(&cx, instr.args.at(&cx, g)) {
+                        Option::Some(v) => count_read(&cx, reads, find(&cx, alias, v), j),
+                        Option::None => (),
+                    };
+                    g = g + 1usize;
+                }
+            }
+            j = j + 1usize;
+        }
+        let ending = term_reads(&cx, target.term);
+        let edges = term_edges(&cx, target.term);
+        var e = 0usize;
+        while e < edges.len(&cx) {
+            let (edge, _skip) = edges.at(&cx, e);
+            ending.append(&cx, edge.args);
+            e = e + 1usize;
+        }
+        var t = 0usize;
+        while t < ending.len(&cx) {
+            count_read(&cx, reads, find(&cx, alias, ending.at(&cx, t)), n);
+            t = t + 1usize;
+        }
+        // the paths homed so far, in the order every edge and construction writes them
+        let chosen: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        var pi = 0usize;
+        while pi < target.params.len(&cx) {
+            let p = target.params.at(&cx, pi).name;
+            if self.live.contains(&cx, (label, p)) {
+                match read_once(reads.get(&cx, p), n) {
+                    Option::Some(d) => {
+                        let destruct = instrs.at(&cx, d);
+                        if destruct.op.is(&cx, "destruct") && destruct.args.len(&cx) == 1usize && destruct.args.at(&cx, 0usize).eq(&cx, p)
+                            && components.contains(&cx, (label, d)) {
+                            self.home_param(&cx, target, preds, pi, d, components.at(&cx, (label, d)), alias, reads, chosen);
                         }
-                        r = r + 1usize;
+                    },
+                    Option::None => (),
+                };
+            }
+            pi = pi + 1usize;
+        }
+    }
+
+    // `home_params` for parameter `pi` of `target`, which the destruct at `d` takes apart into
+    // components labelled `parts`, after the components homed at `chosen`.
+    fn home_param(self, &cx: Domain!['k], target: Block['k], preds: ArenaVec[(Block['k], Edge['k], usize), 'k], pi: usize, d: usize,
+        parts: ArenaVec[Span['k], 'k], alias: ArenaMap[Span['k], Span['k], 'k], reads: ArenaMap[Span['k], (usize, usize), 'k],
+        chosen: ArenaVec[Span['k], 'k]) {
+        let label = target.label;
+        let instrs = target.instrs;
+        let n = instrs.len(&cx);
+        let destruct = instrs.at(&cx, d);
+        let homes: ArenaVec[(usize, Span['k]), 'k] = ArenaVec::new(&cx);
+        var k = 0usize;
+        while k < destruct.lhs.len(&cx) && k < parts.len(&cx) {
+            let c = destruct.lhs.at(&cx, k);
+            let class = find(&cx, alias, c);
+            match read_once(reads.get(&cx, class), n) {
+                Option::Some(s) => if instrs.at(&cx, s).op.is(&cx, "store") && self.homes_at(&cx, target, s, d, class, alias) {
+                    let path = instrs.at(&cx, s).args.at(&cx, 0usize);
+                    var all = true;
+                    var q = 0usize;
+                    while all && q < preds.len(&cx) {
+                        let (block, edge, skip) = preds.at(&cx, q);
+                        all = self.written_on(&cx, block, edge, skip, pi, k, parts.at(&cx, k), path, chosen);
+                        q = q + 1usize;
+                    }
+                    if all {
+                        homes.push(&cx, (k, path));
+                        chosen.push(&cx, path);
+                        let added = self.unwritten.insert(&cx, (label, s));
+                        self.resident.insert(&cx, (label, c), path);
+                        let moved = self.moved.insert(&cx, (label, c));
+                        var m = 0usize;
+                        while m < n {
+                            let lhs = instrs.at(&cx, m).lhs;
+                            var h = 0usize;
+                            while h < lhs.len(&cx) {
+                                if find(&cx, alias, lhs.at(&cx, h)).eq(&cx, class) {
+                                    self.resident.insert(&cx, (label, lhs.at(&cx, h)), path);
+                                    let also = self.moved.insert(&cx, (label, lhs.at(&cx, h)));
+                                }
+                                h = h + 1usize;
+                            }
+                            m = m + 1usize;
+                        }
+                    }
+                },
+                Option::None => (),
+            };
+            k = k + 1usize;
+        }
+        if !homes.is_empty(&cx) {
+            let param = (label, target.params.at(&cx, pi).name);
+            self.homed.insert(&cx, param, homes);
+            var q = 0usize;
+            while q < preds.len(&cx) {
+                let (block, edge, skip) = preds.at(&cx, q);
+                let arg = edge.args.at(&cx, pi - skip);
+                if self.made_at(&cx, block, arg, param) < block.instrs.len(&cx) {
+                    let added = self.made_home.insert(&cx, (block.label, arg));
+                }
+                q = q + 1usize;
+            }
+        }
+    }
+
+    // The store at `s` in `target`, the one read of the class `class` of a component the destruct at
+    // `d` makes, stores it into a place path the block's header declares empty (or a path around
+    // it), which nothing in the block names before the store.
+    fn homes_at(self, &cx: Domain!['k], target: Block['k], s: usize, d: usize, class: Span['k], alias: ArenaMap[Span['k], Span['k], 'k]) -> bool {
+        let store = target.instrs.at(&cx, s);
+        let path = store.args.at(&cx, 0usize);
+        if !find(&cx, alias, store.args.at(&cx, 1usize)).eq(&cx, class) || !is_place(&cx, path)
+            || self.forwarded.contains(&cx, root(&cx, path)) || s <= d {
+            return false;
+        }
+        var empty = false;
+        var e = 0usize;
+        while !empty && e < target.empty.len(&cx) {
+            empty = prefix(&cx, target.empty.at(&cx, e), path);
+            e = e + 1usize;
+        }
+        if !empty {
+            return false;
+        }
+        var i = 0usize;
+        while i < s {
+            let args = target.instrs.at(&cx, i).args;
+            var g = 0usize;
+            while g < args.len(&cx) {
+                if is_place(&cx, args.at(&cx, g)) && overlap(&cx, args.at(&cx, g), path) {
+                    return false;
+                }
+                g = g + 1usize;
+            }
+            i = i + 1usize;
+        }
+        true
+    }
+
+    // Where a homed component of `arg`, passed to `param`, is written in `block`: at the
+    // construction or call making it when it is shared into the parameter, else at the edge (the
+    // block's length).
+    fn made_at(self, &cx: Domain!['k], block: Block['k], arg: Span['k], param: (Span['k], Span['k])) -> usize {
+        let n = block.instrs.len(&cx);
+        let (param_block, param_name) = param;
+        match self.shared.get(&cx, (block.label, arg)) {
+            Option::Some(found) => {
+                let (into, name) = found;
+                if into.eq(&cx, param_block) && name.eq(&cx, param_name) {
+                    var i = 0usize;
+                    while i < n {
+                        let instr = block.instrs.at(&cx, i);
+                        if instr.lhs.contains(&cx, arg) {
+                            return if instr.op.is(&cx, "construct") || is_call(&cx, instr.op) { i } else { n };
+                        }
+                        i = i + 1usize;
                     }
                 }
             },
-            _ => (),
+            Option::None => (),
         };
+        n
+    }
+
+    // Component `k` (labelled `part`) of the argument `edge` passes to parameter `pi` of its target
+    // can be written at `path` in `block` (`home_params`), after the components homed at `chosen`.
+    fn written_on(self, &cx: Domain!['k], block: Block['k], edge: Edge['k], skip: usize, pi: usize, k: usize, part: Span['k], path: Span['k],
+        chosen: ArenaVec[Span['k], 'k]) -> bool {
+        if pi < skip {
+            return false;
+        }
+        let label = block.label;
+        let instrs = block.instrs;
+        let n = instrs.len(&cx);
+        let arg = edge.args.at(&cx, pi - skip);
+        let at = self.made_at(&cx, block, arg, (edge.target, self.blocks.at(&cx, edge.target).params.at(&cx, pi).name));
+        let made = at < n;
+        let construct = made && instrs.at(&cx, at).op.is(&cx, "construct");
+        // Nothing after the write names a path overlapping `path` (a call's own lends included).
+        var i = if made && !construct { at } else { at + 1usize };
+        while i < n {
+            let args = instrs.at(&cx, i).args;
+            var g = 0usize;
+            while g < args.len(&cx) {
+                if is_place(&cx, args.at(&cx, g)) && overlap(&cx, args.at(&cx, g), path) {
+                    return false;
+                }
+                g = g + 1usize;
+            }
+            i = i + 1usize;
+        }
+        if made {
+            let switched = match block.term {
+                Terminator::Switch(scrutinee, _ty, _arms, _pos) => scrutinee.starts_with(&cx, Span::from_static(&cx, "&")) && overlap(&cx, scrutinee, path),
+                _ => false,
+            };
+            if switched {
+                return false;
+            }
+        }
+        // Nothing read after the write lies at a path overlapping `path`.
+        var r = at + 1usize;
+        while r < n {
+            let args = instrs.at(&cx, r).args;
+            var g = 0usize;
+            while g < args.len(&cx) {
+                match value_read(&cx, args.at(&cx, g)) {
+                    Option::Some(v) => if self.lies_over(&cx, label, v, path) {
+                        return false;
+                    },
+                    Option::None => (),
+                };
+                g = g + 1usize;
+            }
+            r = r + 1usize;
+        }
+        if made {
+            let ending = term_reads(&cx, block.term);
+            let edges = term_edges(&cx, block.term);
+            var e = 0usize;
+            while e < edges.len(&cx) {
+                let (other, _skip) = edges.at(&cx, e);
+                ending.append(&cx, other.args);
+                e = e + 1usize;
+            }
+            var t = 0usize;
+            while t < ending.len(&cx) {
+                if self.lies_over(&cx, label, ending.at(&cx, t), path) {
+                    return false;
+                }
+                t = t + 1usize;
+            }
+        }
+        // What is written does not lie at a path overlapping `path` but `path` itself, nor at one a
+        // component written before it was written at.
+        if made && !construct {
+            return true;
+        }
+        let source = if construct {
+            self.resident.get_or(&cx, (label, instrs.at(&cx, at).args.at(&cx, k)), Span::from_static(&cx, "%"))
+        } else {
+            // Nor in a variable the edge assigns before it.
+            match self.variable(&cx, label, arg) {
+                Option::Some(held) => {
+                    let (into, name) = held;
+                    if into.eq(&cx, edge.target) && param_index(&cx, self.blocks.at(&cx, edge.target), name).is_some() {
+                        return false;
+                    }
+                },
+                Option::None => (),
+            };
+            match self.resident.get(&cx, (label, arg)) {
+                Option::Some(whole) => Buffer::new().push_bytes(&cx, whole).push_static(".").push_bytes(&cx, part).save(&cx),
+                Option::None => Span::from_static(&cx, "%"),
+            }
+        };
+        if !source.eq(&cx, path) && overlap(&cx, source, path) {
+            return false;
+        }
+        var c = 0usize;
+        while c < chosen.len(&cx) {
+            if overlap(&cx, source, chosen.at(&cx, c)) {
+                return false;
+            }
+            c = c + 1usize;
+        }
+        true
+    }
+
+    // The block and value whose C variable the value `name` of block `label` lies in, through the
+    // scrutinees payloads arrive from; none when it lies in a place.
+    fn variable(self, &cx: Domain!['k], label: Span['k], name: Span['k]) -> Option[(Span['k], Span['k])] {
+        let path = self.resident.get_or(&cx, (label, name), name);
+        if path.starts_with(&cx, Span::from_static(&cx, "&")) {
+            return Option::None;
+        }
+        let value = root(&cx, path);
+        match self.arrived.get(&cx, (label, value)) {
+            Option::Some(found) => {
+                let (source, scrutinee, _variant) = found;
+                self.variable(&cx, source, scrutinee)
+            },
+            Option::None => Option::Some.((label, value)),
+        }
+    }
+
+    // The value `name` of block `label` lies at a path overlapping `path`.
+    fn lies_over(self, &cx: Domain!['k], label: Span['k], name: Span['k], path: Span['k]) -> bool {
+        match self.resident.get(&cx, (label, name)) {
+            Option::Some(at) => overlap(&cx, at, path),
+            Option::None => false,
+        }
     }
 
     // ---------------------------------------------------------------- residences --
@@ -976,6 +1382,24 @@ fn find(&cx: Domain!['k], alias: ArenaMap[Span['k], Span['k], 'k], name: Span['k
         };
     }
     at
+}
+
+// Counts a read of `name` at `at` (`home_params`).
+forall 'k.
+fn count_read(&cx: Domain!['k], reads: ArenaMap[Span['k], (usize, usize), 'k], name: Span['k], at: usize) {
+    let (count, _last) = reads.get_or(&cx, name, (0usize, 0usize));
+    reads.insert(&cx, name, (count + 1usize, at));
+}
+
+// Where a class is read, when it is read once and not by the terminator or an edge (at `n`).
+fn read_once(found: Option[(usize, usize)], n: usize) -> Option[usize] {
+    match found {
+        Option::Some(entry) => {
+            let (count, at) = entry;
+            if count == 1usize && at != n { Option::Some.(at) } else { Option::None }
+        },
+        Option::None => Option::None,
+    }
 }
 
 fn is_at(found: Option[usize], index: usize) -> bool {
