@@ -344,6 +344,14 @@ impl Places['k] {
         Places.{ empty: self.empty.clone(&cx), known: self.known.clone(&cx), opened: self.opened.clone(&cx) }
     }
 
+    // Makes this state hold what `from` holds, in the room it already has: a scratch state loaded
+    // again and again takes new room only to hold more than it has held before.
+    fn load(self, &cx: Domain!['k], from: Places['k]) {
+        self.empty.assign(&cx, from.empty);
+        self.known.assign(&cx, from.known);
+        self.opened.assign(&cx, from.opened);
+    }
+
     // Some empty path is `path` or an ancestor of it.
     fn covered(self, &cx: Domain!['k], path: Span['k]) -> bool {
         ancestor_in(&cx, self.empty, path)
@@ -478,6 +486,10 @@ exposed struct Checker {
     root_brand_cache: Ref[ArenaMap[Span['k], ArenaSet[Span['k], 'k], 'k], 'k],
     // what is known of paths under the current roots and kinds
     facts: Ref[PathFacts['k], 'k],
+    // The sets `empty_set` hands out, the n-th to a function's n-th block that asks, refilled for
+    // each function; and the state a block is checked in, refilled for each block.
+    set_pool: ArenaVec[ArenaSet[Span['k], 'k], 'k],
+    working: Places['k],
     label: Ref[Span['k], 'k],
     env: Ref[ArenaMap[Span['k], Type['k], 'k], 'k],
     used: Ref[ArenaSet[Span['k], 'k], 'k],
@@ -571,6 +583,8 @@ impl Checker['k] {
             param_roots: Ref::new(&cx, ArenaSet::new(&cx)),
             root_brand_cache: Ref::new(&cx, ArenaMap::new(&cx)),
             facts: Ref::new(&cx, PathFacts.{ roots: 0usize, kinds: 0usize, stored: ArenaMap::new(&cx), empty_sets: ArenaMap::new(&cx), linear_empty: ArenaMap::new(&cx) }),
+            set_pool: ArenaVec::new(&cx),
+            working: Places::new(ArenaSet::new(&cx), ArenaMap::new(&cx), ArenaMap::new(&cx)),
             label: Ref::new(&cx, Span::from_static(&cx, "")),
             env: Ref::new(&cx, ArenaMap::new(&cx)),
             used: Ref::new(&cx, ArenaSet::new(&cx)),
@@ -920,21 +934,27 @@ impl Checker['k] {
             if !block.opened.is_empty(&cx) {
                 self.fail(&cx, "entry_cannot_assume_opened_views");
             }
-            let empty: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+            let state = self.working;
+            state.empty.clear(&cx);
             var l = 0usize;
             while l < fun.locals.len(&cx) {
-                empty.insert(&cx, fun.locals.at(&cx, l).name);
+                state.empty.insert(&cx, fun.locals.at(&cx, l).name);
                 l = l + 1usize;
             }
-            self.places.set(&cx, Places::new(empty, ArenaMap::new(&cx), ArenaMap::new(&cx)));
+            state.known.clear(&cx);
+            state.opened.clear(&cx);
+            self.places.set(&cx, state);
         } else {
-            let known: ArenaMap[Span['k], Span['k], 'k] = ArenaMap::new(&cx);
+            let state = self.working;
+            state.known.clear(&cx);
             var k = 0usize;
             while k < block.known.len(&cx) {
-                known.insert(&cx, block.known.at(&cx, k).path, block.known.at(&cx, k).variant);
+                state.known.insert(&cx, block.known.at(&cx, k).path, block.known.at(&cx, k).variant);
                 k = k + 1usize;
             }
-            self.places.set(&cx, Places::new(texts_set(&cx, block.empty), known, ArenaMap::new(&cx)));
+            state.empty.assign(&cx, self.empty_set(&cx, block));
+            state.opened.clear(&cx);
+            self.places.set(&cx, state);
             let paths: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
             var o = 0usize;
             while o < block.opened.len(&cx) {
@@ -1050,7 +1070,17 @@ impl Checker['k] {
         match cache.get(&cx, block.label) {
             Option::Some(set) => set,
             Option::None => {
-                let set = texts_set(&cx, block.empty);
+                let n = cache.len(&cx);
+                let set = match self.set_pool.get(&cx, n) {
+                    Option::Some(pooled) => pooled,
+                    Option::None => {
+                        let made: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+                        self.set_pool.push(&cx, made);
+                        made
+                    },
+                };
+                set.clear(&cx);
+                set.insert_all(&cx, block.empty);
                 cache.insert(&cx, block.label, set);
                 set
             },
@@ -1129,7 +1159,7 @@ impl Checker['k] {
         self.place_view(&cx, path, stored)
     }
 
-    // The path facts of the current roots and kinds, made afresh when either map changes.
+    // The path facts of the current roots and kinds, cleared when either map changes.
     fn path_facts(self, &cx: Domain!['k]) -> PathFacts['k] {
         let roots = self.roots.copy(&cx).address();
         let kinds = self.kinds.copy(&cx).address();
@@ -1137,7 +1167,10 @@ impl Checker['k] {
         if facts.roots == roots && facts.kinds == kinds {
             return facts;
         }
-        let fresh = PathFacts.{ roots, kinds, stored: ArenaMap::new(&cx), empty_sets: ArenaMap::new(&cx), linear_empty: ArenaMap::new(&cx) };
+        facts.stored.clear(&cx);
+        facts.empty_sets.clear(&cx);
+        facts.linear_empty.clear(&cx);
+        let fresh = PathFacts.{ roots, kinds, stored: facts.stored, empty_sets: facts.empty_sets, linear_empty: facts.linear_empty };
         self.facts.set(&cx, fresh);
         fresh
     }

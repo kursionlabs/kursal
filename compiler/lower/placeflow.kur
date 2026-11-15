@@ -27,6 +27,7 @@ use package::resolve::resolver::Resolver;
 use package::syntax::ast::Pos;
 use package::types::ops::{Fresh, free_brands};
 use std::collections::vec::{OwnedVec, Popped};
+use package::support::base::fail;
 use std::option::{Option, Result};
 use std::slice::Slice;
 
@@ -53,6 +54,23 @@ exposed struct PlaceFlow {
     r: Resolver['k],
     // the first store into each place path, for diagnostics
     origins: Ref[ArenaMap[Span['k], Pos, 'k], 'k],
+    // The state a block is simulated in, loaded from the state it starts in, and the state of an
+    // edge that knows a switched place's variant: scratch, reused for every block and function.
+    working: Places['k],
+    arm: Places['k],
+}
+
+// A state with nothing in it.
+forall 'k.
+fn no_places(&cx: Domain!['k]) -> Places['k] {
+    Places::new(ArenaSet::new(&cx), ArenaMap::new(&cx), ArenaMap::new(&cx))
+}
+
+// How many keys each of a state's maps holds and has held: what any change to it changes, but
+// for a value replaced under a key it holds.
+forall 'k.
+fn extent(&cx: Domain!['k], p: Places['k]) -> (usize, usize, usize, usize, usize, usize) {
+    (p.empty.len(&cx), p.empty.positions(&cx), p.known.len(&cx), p.known.positions(&cx), p.opened.len(&cx), p.opened.positions(&cx))
 }
 
 forall 'k.
@@ -66,28 +84,30 @@ fn term_pos(t: Terminator['k]) -> Pos {
     }
 }
 
-// A block's outgoing edges, each with the variant it makes known of a switched place.
+// How many edges leave a block.
 forall 'k.
-fn edges(&cx: Domain!['k], block: Block['k]) -> ArenaVec[(Edge['k], Option[(Span['k], Span['k])]), 'k] {
-    let out: ArenaVec[(Edge['k], Option[(Span['k], Span['k])]), 'k] = ArenaVec::new(&cx);
+fn edge_count(&cx: Domain!['k], block: Block['k]) -> usize {
     match block.term {
-        Terminator::Jmp(e, _p) => out.push(&cx, (e, Option::None)),
-        Terminator::Jnz(_c, a, b, _p) => {
-            out.push(&cx, (a, Option::None));
-            out.push(&cx, (b, Option::None));
-        },
+        Terminator::Jmp(_e, _p) => 1usize,
+        Terminator::Jnz(_c, _a, _b, _p) => 2usize,
+        Terminator::Switch(_s, _t, arms, _p) => arms.len(&cx),
+        _ => 0usize,
+    }
+}
+
+// A block's outgoing edge `i`, with the variant it makes known of a switched place.
+forall 'k.
+fn edge_at(&cx: Domain!['k], block: Block['k], i: usize) -> (Edge['k], Option[(Span['k], Span['k])]) {
+    match block.term {
+        Terminator::Jmp(e, _p) => (e, Option::None),
+        Terminator::Jnz(_c, a, b, _p) => (if i == 0usize { a } else { b }, Option::None),
         Terminator::Switch(scrutinee, _t, arms, _p) => {
+            let arm = arms.at(&cx, i);
             let place = scrutinee.starts_with(&cx, Span::from_static(&cx, "&"));
-            var i = 0usize;
-            while i < arms.len(&cx) {
-                let arm = arms.at(&cx, i);
-                out.push(&cx, (arm.edge, if place { Option::Some.((scrutinee, arm.variant)) } else { Option::None }));
-                i = i + 1usize;
-            }
+            (arm.edge, if place { Option::Some.((scrutinee, arm.variant)) } else { Option::None })
         },
-        _ => (),
-    };
-    out
+        _ => fail(&cx, Span::from_static(&cx, "internal error: an edge of a block that has none")),
+    }
 }
 
 forall 'k.
@@ -272,7 +292,7 @@ fn subset(&cx: Domain!['k], a: ArenaSet[Span['k], 'k], b: ArenaSet[Span['k], 'k]
 forall 'k.
 impl PlaceFlow['k] {
     fn new(&cx: Domain!['k], program: Program['k], r: Resolver['k], counter: Fresh['k]) -> PlaceFlow['k] {
-        PlaceFlow.{ checker: Checker::new(&cx, program, counter), r, origins: Ref::new(&cx, ArenaMap::new(&cx)) }
+        PlaceFlow.{ checker: Checker::new(&cx, program, counter), r, origins: Ref::new(&cx, ArenaMap::new(&cx)), working: no_places(&cx), arm: no_places(&cx) }
     }
 
     fn places(self, &cx: Domain!['k]) -> Places['k] {
@@ -356,9 +376,13 @@ impl PlaceFlow['k] {
                     let (b, incoming) = next;
                     match self.arrive(&cx, plan, b, incoming) {
                         Option::Some(places) => {
-                            c.places.set(&cx, places);
-                            self.simulate(&cx, fun.blocks.at(&cx, b), false);
-                            self.leave(&cx, plan, &work, fun.blocks.at(&cx, b), places);
+                            // The block runs in the scratch state; it leaves in a state of its own
+                            // only when it changed what it started in.
+                            self.working.load(&cx, places);
+                            c.places.set(&cx, self.working);
+                            let changed = self.simulate(&cx, fun.blocks.at(&cx, b), false);
+                            let leaving = if changed { self.working.copy(&cx) } else { places };
+                            self.leave(&cx, plan, &work, fun.blocks.at(&cx, b), leaving);
                         },
                         Option::None => (),
                     };
@@ -407,16 +431,16 @@ impl PlaceFlow['k] {
     }
 
     // The state block `b` starts in when `incoming` reaches it, or none if its header already holds
-    // what `incoming` brings.
+    // what `incoming` brings. It is shared, like every state sent: the block runs in a copy.
     fn arrive(self, &cx: Domain!['k], plan: Plan['k], b: usize, incoming: Places['k]) -> Option[Places['k]] {
         if b == 0usize {
-            return Option::Some.(incoming.copy(&cx));
+            return Option::Some.(incoming);
         }
         let label = plan.fun.blocks.at(&cx, b).label;
         let state = match plan.header.get(&cx, label) {
             Option::None => {
                 plan.header.insert(&cx, label, incoming);
-                return Option::Some.(incoming.copy(&cx));
+                return Option::Some.(incoming);
             },
             Option::Some(state) => state,
         };
@@ -467,17 +491,17 @@ impl PlaceFlow['k] {
             return Option::None;
         }
         plan.header.insert(&cx, label, merged);
-        Option::Some.(merged.copy(&cx))
+        Option::Some.(merged)
     }
 
     // Sends the state `places` that `block` ends in along each of its edges. States are shared, and
     // never changed once sent: an edge that changes what it sends sends a copy.
     fn leave(self, &cx: Domain!['k], plan: Plan['k], &work: OwnedVec![(usize, Places['k])], block: Block['k], places: Places['k]) {
         let fun = plan.fun;
-        let out_edges = edges(&cx, block);
+        let edge_total = edge_count(&cx, block);
         var e = 0usize;
-        while e < out_edges.len(&cx) {
-            let (edge, arm_known) = out_edges.at(&cx, e);
+        while e < edge_total {
+            let (edge, arm_known) = edge_at(&cx, block, e);
             let t = plan.index.at(&cx, edge.target);
             let target = fun.blocks.at(&cx, t);
             // Existing edge entailment permits forgetting Copy contents. A dead local brand need not
@@ -691,11 +715,12 @@ impl PlaceFlow['k] {
             // the blocks reached: the entry, and those with a header
             let reached = if i == 0usize { Option::Some.(locals_empty(&cx, fun)) } else { header.get(&cx, block.label) };
             if reached.is_some() {
-                c.places.set(&cx, match reached {
-                    Option::Some(places) => if i == 0usize { places } else { places.copy(&cx) },
-                    Option::None => locals_empty(&cx, fun),
-                });
-                flow.simulate(&cx, block, true);
+                match reached {
+                    Option::Some(places) => self.working.load(&cx, places),
+                    Option::None => (),
+                };
+                c.places.set(&cx, self.working);
+                let changed = flow.simulate(&cx, block, true);
                 match block.term {
                     Terminator::Ret(_v, pos) => {
                         var k = 0usize;
@@ -722,17 +747,17 @@ impl PlaceFlow['k] {
                     },
                     _ => (),
                 };
-                let out_edges = edges(&cx, block);
+                let edge_total = edge_count(&cx, block);
                 var e = 0usize;
-                while e < out_edges.len(&cx) {
-                    let (edge, known) = out_edges.at(&cx, e);
+                while e < edge_total {
+                    let (edge, known) = edge_at(&cx, block, e);
                     let saved = flow.places(&cx);
                     match known {
                         Option::Some(pair) => {
                             let (path, variant) = pair;
-                            let places = saved.copy(&cx);
-                            places.known.insert(&cx, path, variant);
-                            c.places.set(&cx, places);
+                            self.arm.load(&cx, saved);
+                            self.arm.known.insert(&cx, path, variant);
+                            c.places.set(&cx, self.arm);
                         },
                         Option::None => (),
                     };
@@ -852,9 +877,12 @@ impl PlaceFlow['k] {
     // path's type to decide whether it moves linear contents; if that query fails, the place state is
     // left unchanged for this instruction. Unknown roots, unrefined enum projections and invalid
     // opened views are diagnosed by the core checker, which checks every instruction and requires
-    // each edge to satisfy its target's contract.
-    fn simulate(self, &cx: Domain!['k], block: Block['k], diagnose: bool) {
+    // each edge to satisfy its target's contract. Whether the state may have changed: a key added
+    // or removed, or a view opened.
+    fn simulate(self, &cx: Domain!['k], block: Block['k], diagnose: bool) -> bool {
         let c = self.checker;
+        let before = extent(&cx, c.places.copy(&cx));
+        var opened = false;
         var i = 0usize;
         while i < block.instrs.len(&cx) {
             let instr = block.instrs.at(&cx, i);
@@ -908,10 +936,15 @@ impl PlaceFlow['k] {
                 }
             } else if op.is(&cx, "open") && place {
                 places.opened.insert(&cx, first, instr.binders);
+                opened = true;
             } else if op.is(&cx, "pack") && place {
                 places.forget(&cx, first, false);
             }
             i = i + 1usize;
         }
+        let after = extent(&cx, c.places.copy(&cx));
+        let (a, b, k, l, o, p) = before;
+        let (a2, b2, k2, l2, o2, p2) = after;
+        opened || a != a2 || b != b2 || k != k2 || l != l2 || o != o2 || p != p2
     }
 }

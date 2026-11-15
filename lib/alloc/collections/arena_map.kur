@@ -350,6 +350,75 @@ impl ArenaMap[K, V, 'k] {
     }
 }
 
+forall K, V, 'k where Copy[K], Copy[V].
+impl ArenaMap[K, V, 'k] {
+    // Removes every key, keeping the room the map has for the keys
+    // inserted next. Slots far more than its entries need are let go, so
+    // that clearing costs in proportion to what the map held: a map that
+    // once held many keys does not empty all their slots every time.
+    forall C, R where Access[C -> 'k, R].
+    fn clear(self, &cx: C) {
+        let h = self.state.copy(&cx);
+        let slots = match h.slots {
+            Option::Some(s) => if s.len() > 16usize * h.entries.len(&cx) + 64usize {
+                Option::None
+            } else {
+                zero_slots(&cx, s);
+                h.slots
+            },
+            Option::None => Option::None,
+        };
+        h.entries.clear(&cx);
+        self.state.set(&cx, MapState.{ slots, entries: h.entries, count: 0usize });
+    }
+
+    // Makes the map hold `other`'s live entries, in their order, in the
+    // room it already has: its entries are refilled in place, and its slots
+    // are cleared and kept while they are enough. A map loaded again and
+    // again (a scratch state) takes new room only to hold more keys than
+    // it has held before.
+    forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q].
+    fn assign(self, &cx: C, other: ArenaMap[K, V, 'k]) {
+        if self.address() == other.address() {
+            return;
+        }
+        self.clear(&cx);
+        let from = other.state.copy(&cx);
+        if from.count == 0usize {
+            return;
+        }
+        let h = self.state.copy(&cx);
+        var slot_count = 8usize;
+        while from.count * 2usize > slot_count {
+            slot_count = slot_count * 2usize;
+        }
+        let slots = match h.slots {
+            Option::Some(s) => if s.len() >= slot_count { s } else { slice_of_zeros(&cx, slot_count) },
+            Option::None => slice_of_zeros(&cx, slot_count),
+        };
+        var i = 0usize;
+        while i < from.entries.len(&cx) {
+            let e = from.entries.at(&cx, i);
+            if e.live {
+                place(&cx, slots, e.hash, h.entries.len(&cx) + 1usize);
+                h.entries.push(&cx, e);
+            }
+            i = i + 1usize;
+        }
+        self.state.set(&cx, MapState.{ slots: Option::Some.(slots), entries: h.entries, count: from.count });
+    }
+}
+
+// Every slot emptied.
+forall 'k, C, R where Access[C -> 'k, R].
+fn zero_slots(&cx: C, slots: Slice[usize, 'k]) {
+    var i = 0usize;
+    while i < slots.len() {
+        set_slot(&cx, slots, i, 0usize);
+        i = i + 1usize;
+    }
+}
+
 // Puts `entry` in the first empty slot from where `hash` starts probing.
 forall 'k, C, R where Access[C -> 'k, R].
 fn place(&cx: C, slots: Slice[usize, 'k], hash: u32, entry: usize) {
@@ -471,5 +540,18 @@ impl ArenaSet[K, 'k] {
     forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], HashIn[K, C].
     fn clone(self, &cx: C) -> ArenaSet[K, 'k] {
         ArenaSet.{ map: self.map.clone(&cx) }
+    }
+
+    // Removes every key, keeping the room (`ArenaMap::clear`).
+    forall C, R where Access[C -> 'k, R].
+    fn clear(self, &cx: C) {
+        self.map.clear(&cx);
+    }
+
+    // Makes the set hold `other`'s keys, in their order, in the room it
+    // already has (`ArenaMap::assign`).
+    forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q].
+    fn assign(self, &cx: C, other: ArenaSet[K, 'k]) {
+        self.map.assign(&cx, other.map);
     }
 }
