@@ -277,7 +277,17 @@ What a function leaves out is decided first, from its KURS alone (`backend::plan
     the call's result. The backend knows an adapter by its shape alone (`Backend::adapter`) and
     writes its call as the call it makes, on the caller's storage, so the adapter itself is not
     written. In Aranea's kernel this left out 268 of its 272 adapters, and with them the copies
-    of a 520-byte table row in and out of each `Table::run_hot`.
+    of a 520-byte table row in and out of each `Table::run_hot`;
+  - a construction whose components each lie at their own member of one path when it is made, where
+    a destruct took apart a value of the construction's type, lies at that path and writes nothing
+    (lowering takes a branded value apart and builds it again around a lend; `Group::slot_index`
+    rebuilt and stored back a whole member per probe before).
+- **Shared variables** (`Plan::share`). A value assigned in a block and read by one edge alone, as
+  the argument of a live parameter of another block, is assigned to that parameter's variable, and
+  the edge assigns nothing: an enum result of a call or of a construction is made in the join's
+  variable. The payload parameter of a block that only one arm of a switch on a value enters reads
+  the payload where the scrutinee lies, when that is a C variable (not a place, which the arm's block
+  may write).
 
 Then, while writing the C (`backend::cgen`, `cgen.py`):
 
@@ -374,6 +384,19 @@ plan (`Plan::residences`) allows a residence only where that holds:
 6. **Edges.** An assignment of an edge or a self tail call from a value lying under a place
    parameter, or in another value's variable, reads that parameter's pointer or that variable:
    the parallel moves account for it like any other variable read (`Move.base`).
+7. **A construction where its parts lie.** Each component lies at its own member of the path when
+   the construction is made (nothing wrote it from where the component came out of it, whatever
+   reads the component later), every member has its component, and the path held a value of the
+   construction's type, so the object at the path is the constructed value; from there the
+   construction is a value lying at the path like any other (2–4).
+8. **Shared variables.** A block parameter's variable is assigned only on the edges into its block
+   and read only in that block. A value sharing it is assigned in a predecessor and read by nothing
+   but the edge, which leaves the predecessor and enters the block, so its life and the parameter's
+   do not overlap, and the predecessor is never the block itself. A payload parameter read from its
+   scrutinee's variable: only the switch's block assigns that variable (1), the arm's block is entered
+   from that switch alone and is not the switch's block, so the switch's block runs again only after
+   the arm's block has left; the moves of an edge out of the arm's block read the scrutinee's
+   variable, which `Move.base` accounts for.
 
 ### Zero-size types are erased
 

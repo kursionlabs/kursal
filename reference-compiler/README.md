@@ -98,8 +98,9 @@ What to look for in each output:
 - **Place contracts.** Each block states which places are empty on entry (`state { empty &result#2; ... }`).
   The checker checks every block against its own contract alone, and every jump against its target's.
 - **C.** The place parameter is a pointer, and the call passes the caller's storage:
-  `b10_v12 = ...bump...(&p_counter_1);`. Each block is a label; a jump with an argument assigns
-  `join15_r14` and jumps to `L_join15`. Contracts leave nothing behind at run time.
+  `join15_r14 = ...bump...(&p_counter_1);`. Each block is a label; a jump with an argument assigns
+  `join15_r14` and jumps to `L_join15`, and a value only that jump reads is assigned to it where it
+  is made, as the call's result is. Contracts leave nothing behind at run time.
 
 ## Packages
 

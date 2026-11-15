@@ -27,8 +27,6 @@ static int32_t _ZN4kurs7counter4main17h3c4d00f3096e51d3E(void) {
   uint32_t entry_v2;
   uint32_t entry_v7;
   _Bool entry_v9;
-  uint32_t b10_v12;
-  uint32_t b11_v13;
   uint32_t join15_r14;
   uint32_t join15_v21;
   int32_t join15_v22;
@@ -43,12 +41,10 @@ static int32_t _ZN4kurs7counter4main17h3c4d00f3096e51d3E(void) {
     goto L_b11;
   }
   L_b10: ;
-  b10_v12 = _ZN4kurs7counter4bump17hb7ec39266b253daeE(&p_counter_1);
-  join15_r14 = b10_v12;
+  join15_r14 = _ZN4kurs7counter4bump17hb7ec39266b253daeE(&p_counter_1);
   goto L_join15;
   L_b11: ;
-  b11_v13 = UINT64_C(0);
-  join15_r14 = b11_v13;
+  join15_r14 = UINT64_C(0);
   goto L_join15;
   L_join15: ;
   join15_v21 = (uint32_t)((uint64_t)(p_counter_1.f_value) + (uint64_t)(join15_r14));

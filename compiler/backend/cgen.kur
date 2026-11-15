@@ -1365,6 +1365,7 @@ impl Backend['k] {
         self.sub.set(&cx, sub);
         self.symbol.set(&cx, symbol);
         let components: ArenaMap[(Span['k], usize), ArenaVec[Span['k], 'k], 'k] = ArenaMap::new(&cx);
+        let shapes: ArenaMap[(Span['k], usize), Type['k], 'k] = ArenaMap::new(&cx);
         let adapters: ArenaMap[Span['k], Adapter['k], 'k] = ArenaMap::new(&cx);
         var cb = 0usize;
         while cb < fun.blocks.len(&cx) {
@@ -1373,9 +1374,11 @@ impl Backend['k] {
             while ci < block.instrs.len(&cx) {
                 let instr = block.instrs.at(&cx, ci);
                 if instr.op.is(&cx, "destruct") || instr.op.is(&cx, "construct") {
-                    match self.labels_of(&cx, self.type_operand(&cx, instr)) {
+                    let ty = self.type_operand(&cx, instr);
+                    match self.labels_of(&cx, ty) {
                         Option::Some(labels) => {
                             components.insert(&cx, (block.label, ci), labels);
+                            shapes.insert(&cx, (block.label, ci), erase(&cx, ty, self.types));
                         },
                         Option::None => (),
                     };
@@ -1401,7 +1404,7 @@ impl Backend['k] {
             }
             pp = pp + 1usize;
         }
-        let plan = Plan::new(&cx, fun, components, adapters, place_params);
+        let plan = Plan::new(&cx, fun, components, adapters, place_params, shapes);
         self.plan.set(&cx, Option::Some.(plan));
         self.substituted.copy(&cx).clear(&cx);
         self.erasure.copy(&cx).clear(&cx);
@@ -1723,10 +1726,31 @@ impl Backend['k] {
     // The C variable holding a value of the current block: its own, the one it reads, or the place it
     // lies in (`Plan`).
     fn value_name(self, &cx: Domain!['k], name: Span['k]) -> Span['k] {
-        match self.the_plan(&cx).resident.get(&cx, (self.label.copy(&cx), name)) {
+        let plan = self.the_plan(&cx);
+        let key = (self.label.copy(&cx), name);
+        match plan.resident.get(&cx, key) {
             Option::Some(path) => {
                 let (expr, _ty) = self.place(&cx, path);
                 return expr;
+            },
+            Option::None => (),
+        };
+        match plan.shared.get(&cx, key) {
+            Option::Some(found) => {
+                let (block, param) = found;
+                return self.cname(&cx, block, param);
+            },
+            Option::None => (),
+        };
+        match plan.arrived.get(&cx, key) {
+            Option::Some(found) => {
+                let (block, scrutinee, variant) = found;
+                let here = self.label.copy(&cx);
+                self.label.set(&cx, block);
+                let source = self.value_name(&cx, scrutinee);
+                let ty = self.type_of(&cx, scrutinee);
+                self.label.set(&cx, here);
+                return self.payload(&cx, source, ty, variant);
             },
             Option::None => (),
         };
@@ -1750,7 +1774,17 @@ impl Backend['k] {
                     self.place_c.copy(&cx).at(&cx, r)
                 }
             },
-            Option::None => self.value_name(&cx, name),
+            Option::None => match self.the_plan(&cx).arrived.get(&cx, (self.label.copy(&cx), name)) {
+                Option::Some(found) => {
+                    let (block, scrutinee, _variant) = found;
+                    let here = self.label.copy(&cx);
+                    self.label.set(&cx, block);
+                    let base = self.value_base(&cx, scrutinee);
+                    self.label.set(&cx, here);
+                    base
+                },
+                Option::None => self.value_name(&cx, name),
+            },
         }
     }
 
@@ -1801,7 +1835,7 @@ impl Backend['k] {
         let first = parts.at(&cx, 0usize);
         let in_value = first.starts_with(&cx, Span::from_static(&cx, "%")) || first.starts_with(&cx, Span::from_static(&cx, "&%"));
         let value = if first.starts_with(&cx, Span::from_static(&cx, "&")) { first.skip(1usize) } else { first };
-        var expr = if in_value { self.cname(&cx, self.label.copy(&cx), value) } else { self.place_c.copy(&cx).get_or(&cx, first, Span::from_static(&cx, "")) };
+        var expr = if in_value { self.value_name(&cx, value) } else { self.place_c.copy(&cx).get_or(&cx, first, Span::from_static(&cx, "")) };
         var ty = if in_value { self.type_of(&cx, value) } else { self.roots.copy(&cx).at(&cx, first) };
         var i = 1usize;
         while i < parts.len(&cx) {
@@ -1908,7 +1942,7 @@ impl Backend['k] {
             Option::None => (),
         };
         if plan.fused.contains(&cx, (label, index))
-            || (op.is(&cx, "load") || op.is(&cx, "open") || op.is(&cx, "pack")) && plan.resident.contains(&cx, (label, instr.lhs.at(&cx, 0usize))) {
+            || (op.is(&cx, "load") || op.is(&cx, "open") || op.is(&cx, "pack") || op.is(&cx, "construct")) && plan.resident.contains(&cx, (label, instr.lhs.at(&cx, 0usize))) {
             return;
         }
         if op.is(&cx, "destruct") && after_lend {
@@ -2660,7 +2694,11 @@ impl Backend['k] {
         // (value, the C variable it reads)
         let values: ArenaVec[(Span['k], Span['k]), 'k] = ArenaVec::new(&cx);
         match payload {
-            Option::Some(p) => values.push(&cx, (p, source)),
+            Option::Some(p) => if plan.arrived.contains(&cx, (target.label, target.params.at(&cx, 0usize).name)) {
+                values.push(&cx, (Span::from_static(&cx, ""), source));
+            } else {
+                values.push(&cx, (p, source));
+            },
             Option::None => (),
         };
         var a = 0usize;

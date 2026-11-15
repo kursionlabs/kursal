@@ -157,6 +157,42 @@ class ResidenceTests(unittest.TestCase):
         self.assertEqual(run(c), 11 + 12 + 13 + (13 + 12) + (12 + 12))
 
 
+class SharingTests(unittest.TestCase):
+    def test_a_value_one_edge_reads_is_made_in_the_parameter(self):
+        c = c_of("""
+(type Res (enum (Ok (tuple u32 u32)) (Err u32)))
+(fun make Res (bool) (entry ((%c bool)) (jnz %c (yes) (no)))
+  (yes () (= %a (const u32 3)) (= %b (const u32 4)) (= %t (construct (tuple u32 u32) %a %b))
+    (= %r (construct_variant Res Ok %t)) (jmp out %r))
+  (no () (= %e (const u32 9)) (= %r (construct_variant Res Err %e)) (jmp out %r))
+  (out ((%v Res)) (switch %v Res (Ok ok) (Err err)))
+  (ok ((%p (tuple u32 u32))) (= (%x %y) (destruct %p (tuple u32 u32))) (= %y2 (copy %y)) (= %s (add %x %y2))
+    (= %f (construct (tuple u32 u32) %s %y)) (= %g (construct_variant Res Ok %f)) (ret %g))
+  (err ((%q u32)) (= %g (construct_variant Res Err %q)) (ret %g)))
+(fun main i32 () (entry () (= %t (const bool true)) (= %r (call make %t)) (switch %r Res (Ok a) (Err b)))
+  (a ((%p (tuple u32 u32))) (= (%x %y) (destruct %p (tuple u32 u32))) (= %i (int_cast %x i32)) (ret %i))
+  (b ((%q u32)) (= %i (int_cast %q i32)) (ret %i)))""")
+        make = body(c, "make")
+        # Both arms build the enum in the join's variable; the switch's arms read the payload where it lies.
+        self.assertRegex(make, r"out_v\w*\.payload\.v_Ok = ")
+        self.assertRegex(make, r"out_v\w*\.payload\.v_Err = ")
+        self.assertNotRegex(make, r"(ok_p|err_q)\w* = ")
+        self.assertRegex(make, r"out_v\w*\.payload\.v_Ok\.e0\)")
+        self.assertEqual(run(c), 7)
+
+    def test_a_construction_of_parts_where_they_lie_is_not_written(self):
+        c = c_of(CUR + """
+(type Two (struct (a Cur) (b u32)))
+(fun peek u32 (Two) (entry ((&t Two)) (= %v (load &t)) (= (%a %b) (destruct %v Two)) (= (%p) (destruct %a Cur))
+  (= %a2 (construct Cur %p)) (= %b2 (copy %b)) (= %w (construct Two %a2 %b)) (= %u (store &t %w)) (ret %b2)))
+(fun main i32 () (locals (&x Two))
+  (entry () (= %one (const u32 1)) (= %c (construct Cur %one)) (= %two (const u32 2)) (= %t (construct Two %c %two))
+    (= %u (store &x %t)) (= %r (call peek &x)) (= %q (load &x.a.pos)) (= %s (add %r %q)) (= %i (int_cast %s i32)) (ret %i)))""")
+        self.assertNotRegex(body(c, "peek"), r"\(\*entry_t\w*\)[.\w]* = ")
+        self.assertRegex(head(c, "peek"), r"const\*")
+        self.assertEqual(run(c), 3)
+
+
 SUM = """
 (fun sum u64 (u64 u64) (entry ((%n u64) (%acc u64)) (= %z (const u64 0)) (= %n2 (copy %n)) (= %done (eq %n2 %z)) (jnz %done (fin %acc) (more %n %acc)))
   (fin ((%a u64)) (ret %a))

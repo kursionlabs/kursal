@@ -461,19 +461,22 @@ class Backend:
     def emit_function(self, fun: Fun, sub: Mapping[str, Type], symbol: str) -> None:
         self.fun, self.sub, self.symbol = fun, sub, symbol
         components: dict[tuple[str, int], tuple[str, ...]] = {}
+        shapes: dict[tuple[str, int], Type] = {}
         adapters: dict[str, Adapter] = {}
         for block in fun.blocks:
             for i, instr in enumerate(block.instrs):
                 if instr.op in ("destruct", "construct"):
-                    labels = self.labels_of(self.type_operand(instr))
+                    ty = self.type_operand(instr)
+                    labels = self.labels_of(ty)
                     if labels is not None:
                         components[block.label, i] = labels
+                        shapes[block.label, i] = erase(ty, self.types)
                 elif instr.op == "call" and instr.args[0] in self.program.funs:
                     adapter = self.adapter(instr.args[0])
                     if adapter is not None:
                         adapters[instr.args[0]] = adapter[0]
         self.plan = Plan(fun, components, adapters,
-                         frozenset(name for name, _ in fun.blocks[0].params if name.startswith("&")))
+                         frozenset(name for name, _ in fun.blocks[0].params if name.startswith("&")), shapes)
         typed = self.checker.typed[id(fun)]
         substitute_type = self.substitute_type
         self.locals: dict[tuple[str, str], str] = {}
@@ -600,6 +603,14 @@ class Backend:
         key = (self.label, name)
         if key in self.plan.resident:
             return self.place(self.plan.resident[key])[0]
+        if key in self.plan.shared:
+            return self.cname(*self.plan.shared[key])
+        if key in self.plan.arrived:
+            block, scrutinee, variant = self.plan.arrived[key]
+            here, self.label = self.label, block
+            source, ty = self.value_name(scrutinee), self.type_of(scrutinee)
+            self.label = here
+            return self.payload(source, ty, variant)
         return self.aliases[key] if key in self.aliases else self.cname(self.label, name)
 
     def value_base(self, name: str) -> str:
@@ -611,6 +622,12 @@ class Backend:
             if path.startswith("%"):
                 return self.cname(self.label, root(path))
             return self.cname(self.fun.blocks[0].label, root(path)) if root(path) in self.params else self.place_c[root(path)]
+        if key in self.plan.arrived:
+            block, scrutinee, _ = self.plan.arrived[key]
+            here, self.label = self.label, block
+            base = self.value_base(scrutinee)
+            self.label = here
+            return base
         return self.value_name(name)
 
     def is_live(self, name: str) -> bool:
@@ -630,7 +647,7 @@ class Backend:
         if parts[0].lstrip("&").startswith("%"):
             # A path in the C variable of a value of the current block (`Plan.residences`).
             value = parts[0].lstrip("&")
-            expr, ty = self.cname(self.label, value), self.type_of(value)
+            expr, ty = self.value_name(value), self.type_of(value)
         else:
             expr, ty = self.place_c.get(parts[0], ""), self.roots[parts[0]]
         for seg in parts[1:]:
@@ -667,7 +684,7 @@ class Backend:
         if here in plan.in_place:
             self.lend_in_place(instr, plan.in_place[here])
             return
-        if here in plan.fused or op in ("load", "open", "pack") and (self.label, instr.lhs[0]) in plan.resident:
+        if here in plan.fused or op in ("load", "open", "pack", "construct") and (self.label, instr.lhs[0]) in plan.resident:
             return
         if op == "destruct" and (self.label, self.index - 1) in plan.in_place:
             self.handed_back(instr, plan.in_place[self.label, self.index - 1])
@@ -1105,6 +1122,8 @@ class Backend:
         jump to a return join returns the value it passes there. A value of a zero-size type is `""`:
         nothing is assigned or returned."""
         target = self.blocks[edge.target]
+        if payload is not None and (target.label, target.params[0][0]) in self.plan.arrived:
+            payload = ""
         values = ([(payload, source)] if payload is not None else []) + \
             [("", "") if self.erased(self.type_of(a)) else (self.value_name(a), self.value_base(a)) for a in edge.args]
         if target.label in self.plan.return_index:

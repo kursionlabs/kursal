@@ -26,6 +26,8 @@ a parallel assignment through scratch variables. `plan` finds where less does th
   A lend adapter whose borrowed values lie in places lends those places to its callee itself; a store
   of a value back where it lies writes nothing, and a construction stored at once into a place writes
   only the components that are not already there.
+- Shared variables. A value read by one edge alone is assigned to the target parameter's variable, and
+  a payload parameter that one arm alone enters reads the payload where the scrutinee lies (`share`).
 
 The plan only reads the program; the KURS the checker accepted is what cgen.py translates."""
 
@@ -35,7 +37,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .check import overlap
-from .core import ATOMIC_OPS, Block, Edge, Fun, Instr, Jmp, Jnz, Ret, Switch, Terminator
+from .core import ATOMIC_OPS, Block, Edge, Fun, Instr, Jmp, Jnz, Ret, Switch, Terminator, Type
 
 # Instructions whose C writes only their results: left out when every result is dead.
 PURE = frozenset({"const", "copy", "construct", "construct_variant", "destruct", "variant_tag", "load",
@@ -108,9 +110,10 @@ def is_place(arg: str) -> bool:
 
 class Plan:
     def __init__(self, fun: Fun, components: Optional[dict[tuple[str, int], tuple[str, ...]]] = None,
-                 adapters: Optional[dict[str, Adapter]] = None, params: frozenset[str] = frozenset()) -> None:
+                 adapters: Optional[dict[str, Adapter]] = None, params: frozenset[str] = frozenset(),
+                 shapes: Optional[dict[tuple[str, int], Type]] = None) -> None:
         """`components`: for each (block, index) of a `destruct` or `construct` of a struct or tuple, the
-        labels of its components in a place path; `adapters`: the lend adapters the function calls;
+        labels of its components in a place path, and in `shapes` its type with brands erased; `adapters`: the lend adapters the function calls;
         `params`: the place parameters, whose memory a raw pointer may reach."""
         self.fun = fun
         self.blocks = {b.label: b for b in fun.blocks}
@@ -130,8 +133,13 @@ class Plan:
         self.unwritten: set[tuple[str, int]] = set()
         self.fused: set[tuple[str, int]] = set()
         for block in self.emitted:
-            self.residences(block, components or {}, adapters or {}, params)
+            self.residences(block, components or {}, adapters or {}, params, shapes or {})
         self.live = self.liveness()
+        # (block, value) -> (block, parameter) whose C variable the value is assigned to (`share`)
+        self.shared: dict[tuple[str, str], tuple[str, str]] = {}
+        # (block, payload parameter) -> (block, scrutinee, variant) whose payload the parameter reads (`share`)
+        self.arrived: dict[tuple[str, str], tuple[str, str, str]] = {}
+        self.share()
         self.variables = self.c_variables()
 
     def is_live(self, label: str, name: str) -> bool:
@@ -205,27 +213,72 @@ class Plan:
         """The values that need a C variable: live parameters, and the results the C assigns."""
         out: set[tuple[str, str]] = set()
         for block in self.emitted:
-            out.update((block.label, name) for name, _ in block.params if (block.label, name) in self.live)
+            out.update((block.label, name) for name, _ in block.params
+                       if (block.label, name) in self.live and (block.label, name) not in self.arrived)
             for i, instr in enumerate(block.instrs):
                 if instr.op == "copy" or self.is_forwarded_load(instr) or (block.label, i) in self.fused or \
                         (block.label, i) in self.in_place:
                     continue
                 for name in instr.lhs:
-                    if (block.label, name) in self.resident:
+                    if (block.label, name) in self.resident or (block.label, name) in self.shared:
                         continue
                     if (block.label, name) in self.live or instr.op not in PURE and instr.op not in UNASSIGNED:
                         out.add((block.label, name))
         return out
 
+    # ----------------------------------------------------------------- sharing --
+
+    def share(self) -> None:
+        """Values that move along one edge share the C variable they move into.
+
+        - A value an instruction of a block assigns, which one edge of the block reads and nothing else
+          does, as the argument of a live parameter of another block, is assigned to the parameter's C
+          variable (`shared`), and the edge assigns nothing. Only the edges into the parameter's block
+          and that block itself touch the variable, and the edge enters the block after every read of
+          the value.
+        - The payload parameter of a block that one arm of a switch on a value enters, and no other
+          edge, reads the payload where the scrutinee lies (`arrived`), when that is a C variable: only
+          the switch's block assigns its variables, and it runs again only after the arm's block has
+          left. A scrutinee lying in a place is not read so, since the arm's block may write the place."""
+        incoming: dict[str, int] = {}
+        for block in self.emitted:
+            for edge, _ in term_edges(block.term):
+                incoming[edge.target] = incoming.get(edge.target, 0) + 1
+        for block in self.emitted:
+            label, term = block.label, block.term
+            reads: dict[str, int] = {}
+            for name in [name for instr in block.instrs for name in instr_reads(instr)] + term_reads(term) + \
+                    [name for edge, _ in term_edges(term) for name in edge.args]:
+                reads[name] = reads.get(name, 0) + 1
+            assigned = {name for i, instr in enumerate(block.instrs) for name in instr.lhs
+                        if instr.op != "copy" and not self.is_forwarded_load(instr) and (label, i) not in self.fused
+                        and (label, i) not in self.in_place}
+            for edge, skip in term_edges(term):
+                target = self.blocks[edge.target]
+                if target.label in self.return_index or target.label == label:
+                    continue
+                for (param, _), arg in zip(target.params[skip:], edge.args):
+                    if arg in assigned and reads.get(arg) == 1 and (label, arg) not in self.resident and \
+                            (target.label, param) in self.live:
+                        self.shared[label, arg] = (target.label, param)
+            if isinstance(term, Switch) and not term.scrutinee.startswith("&") and \
+                    not self.resident.get((label, term.scrutinee), "%").startswith("&"):
+                for arm in term.arms:
+                    target = self.blocks[arm.edge.target]
+                    if target.label not in self.return_index and target.label != label and \
+                            incoming.get(target.label) == 1 and target.params:
+                        self.arrived[target.label, target.params[0][0]] = (label, term.scrutinee, arm.variant)
+
     # -------------------------------------------------------------- residences --
 
     def residences(self, block: Block, components: dict[tuple[str, int], tuple[str, ...]],
-                   adapters: dict[str, Adapter], params: frozenset[str]) -> None:
+                   adapters: dict[str, Adapter], params: frozenset[str], shapes: dict[tuple[str, int], Type]) -> None:
         """Which values of `block` are read where they lie, and what that saves.
 
         A value lies at a path: in a place P when it was loaded from P; in the C variable of a value `%v`
         (the path `%v`) when it is `v`; and at `Q.label` when it is a component taken apart from the place
-        Q or from a value lying at Q. Values that copy, open, pack or forward one lie where it does (one
+        Q or from a value lying at Q; and at Q when it is constructed of components each lying at its own
+        member of Q (and read so). Values that copy, open, pack or forward one lie where it does (one
         class), as does the value a lend adapter hands back when the call lends its callee the path the
         borrowed value lies at. A class is read where it lies when, from the instruction that took its
         first value out of the path to the class's last read in the block, nothing writes a path
@@ -250,6 +303,8 @@ class Plan:
             return name
 
         stored: dict[str, str] = {}
+        # path -> the type of the value there that a destruct took apart
+        held: dict[str, Type] = {}
         # class -> (path, index its first value came out of the path, adapter call it waits on or -1)
         candidates: dict[str, tuple[str, int, int]] = {}
         # adapter call index -> (class, path) of each borrowed value, in the order handed back
@@ -266,6 +321,7 @@ class Plan:
                 candidates[lhs[0]] = (a[0], i, -1)
             elif op == "destruct" and (label, i) in components and i - 1 not in lent:
                 base = (a[0], i, -1) if is_place(a[0]) else candidates.get(find(a[0]), (find(a[0]), i, -1))
+                held[base[0]] = shapes[label, i]
                 for name, part in zip(lhs, components[label, i]):
                     candidates[name] = (f"{base[0]}.{part}", base[1], base[2])
             elif op == "call" and a[0] in adapters:
@@ -291,8 +347,10 @@ class Plan:
         for name in term_reads(block.term) + [name for edge, _ in term_edges(block.term) for name in edge.args]:
             last[find(name)] = n
 
-        def kept(c: str, path: str, origin: int) -> bool:
-            end = last.get(c, origin)
+        def kept(c: str, path: str, origin: int, until: Optional[int] = None) -> bool:
+            """Nothing writes a path overlapping `path` after `origin` up to the class's last read, or
+            up to `until`."""
+            end = last.get(c, origin) if until is None else until
             under_param = root(path) in params
             for j in range(origin + 1, min(end, n - 1) + 1):
                 op, a = instrs[j].op, instrs[j].args
@@ -340,6 +398,29 @@ class Plan:
                     not any(overlap(p, q) for k, p in enumerate(paths) for q in paths[k + 1:]) and \
                     not any(overlap(p, q) for p in paths for q in others):
                 self.in_place[label, i] = tuple(paths)
+
+        def lies(c: str, path: str, at: int) -> bool:
+            """Class `c` lies at `path` when instruction `at` runs (it may be read elsewhere later)."""
+            if c not in candidates or candidates[c][0] != path:
+                return False
+            _, origin, waits = candidates[c]
+            return (waits == -1 or (label, waits) in self.in_place) and kept(c, path, origin, at)
+
+        # A construction whose components each lie at their own member of one path when it is made, a
+        # path where a destruct took apart a value of the construction's type, lies at that path.
+        for i, instr in enumerate(instrs):
+            if instr.op != "construct" or (label, i) not in components or not instr.args or \
+                    len(components[label, i]) != len(instr.args):
+                continue
+            parts, first = components[label, i], find(instr.args[0])
+            if first not in candidates or not candidates[first][0].endswith("." + parts[0]):
+                continue
+            whole = candidates[first][0][:-len(parts[0]) - 1]
+            if held.get(whole) == shapes[label, i] and \
+                    all(lies(find(arg), f"{whole}.{part}", i) for arg, part in zip(instr.args, parts)):
+                candidates[instr.lhs[0]] = (whole, i, -1)
+                if kept(instr.lhs[0], whole, i):
+                    valid.add(instr.lhs[0])
         for instr in instrs:
             for name in instr.lhs:
                 c = find(name)
@@ -351,7 +432,8 @@ class Plan:
             a = instr.args
             if instr.op == "store" and a[0] not in self.forwarded and self.resident.get((label, a[1])) == a[0]:
                 self.unwritten.add((label, i))
-            elif instr.op == "construct" and (label, i) in components and i + 1 < n:
+            elif instr.op == "construct" and (label, i) in components and i + 1 < n and \
+                    (label, instr.lhs[0]) not in self.resident:
                 store, made = instrs[i + 1], find(instr.lhs[0])
                 if store.op != "store" or store.args[1] != instr.lhs[0] or root(store.args[0]) in self.forwarded \
                         or reads.get(made) != 1 or last.get(made) != i + 1:
