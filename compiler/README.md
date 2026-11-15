@@ -262,6 +262,22 @@ What a function leaves out is decided first, from its KURS alone (`backend::plan
   next one is evaluated.
 - **Return joins.** A block with no instructions that returns one of its parameters, or passes its
   parameters on to another such block, is not written: an edge into it returns the value it passes.
+- **Residences.** A value is read where it lies (`Plan::residences`): a value loaded from a place in
+  the place; a component taken apart from a place, or from a value lying somewhere, in its member
+  there; any other value in its own C variable (the path `%v`, and `%v.f` for a component). Values
+  that copy, open, pack or forward one lie where it does. The C reads the place or member instead of
+  a copy of it, from where the value came out of it to its last read in its block, as long as nothing
+  writes there (see "Why reading values where they lie is sound"). Then:
+  - a store of a value into the place it lies in writes nothing, and a construction stored at once
+    into a place writes only the components that do not lie at their member of it already;
+  - a call of a **lend adapter** lends its callee the paths the borrowed values lie at, and the
+    values it hands back lie there. Lowering makes an adapter (`f#lend#contentsN`, `promote.py`)
+    where a value whose type holds a brand the function opened is lent: such a value cannot be a
+    local place, so the adapter stores it into a place of its own, lends that, and returns it with
+    the call's result. The backend knows an adapter by its shape alone (`Backend::adapter`) and
+    writes its call as the call it makes, on the caller's storage, so the adapter itself is not
+    written. In Aranea's kernel this left out 268 of its 272 adapters, and with them the copies
+    of a 520-byte table row in and out of each `Table::run_hot`.
 
 Then, while writing the C (`backend::cgen`, `cgen.py`):
 
@@ -320,6 +336,44 @@ while the call runs (by induction on the calls, from the locals). Where the argu
 
 `const` needs no such argument: it only records that the function's C does not write through the
 pointer, which the checker's place rules let the backend see.
+
+### Why reading values where they lie is sound
+
+A value read where it lies must find there, at each read, what it was when it came out of it. The
+plan (`Plan::residences`) allows a residence only where that holds:
+
+1. **Who writes a C variable.** The C variable of an SSA value is assigned once per execution of
+   its block, before any read, and a block parameter's on the edges into its block. The only other
+   write is a lend in place of a path in it, which the plan allows only when the value whose
+   variable it is is read no more after the call; a residence that a lend in place for another
+   value may overlap (whether or not that lend happens) ends there.
+2. **Who writes a place.** Under the escape rule a local place's C object has no address but the
+   ones its lends pass, so only a store or a lend of an overlapping path, in this function, writes
+   it. Memory under a place parameter may also be reached through a raw pointer when a caller lent
+   it from a raw target (`&*p`): for a residence there, every call, `foreach`, raw store and atomic
+   write before the last read ends it. A store of the value into the very place it lies in, as the
+   last read, writes nothing.
+3. **Calls read first.** A call's arguments are evaluated before its body runs, so the call that
+   reads a value last may write where it lay; any other write before the last read ends the
+   residence, and the value is copied out of the place where it came out, as before.
+4. **No overlapping assignment.** C requires the two sides of an assignment to be the same object
+   or not to overlap. A store into a path overlapping, but not equal to, where its value lies ends
+   the residence; a construction is stored in place only when every component that lies in the
+   target lies at its own member there, and then that member is not written.
+5. **A lend in place.** The callee is given the path the borrowed value lies at instead of the
+   adapter's place holding a copy of it: it sees the same value, and what it leaves there is what
+   the adapter would have handed back, which then lies there. The paths lent are disjoint from each
+   other and from every place the same call lends (checked), and recorded as lends for `const` and
+   `restrict` like any other (a C variable as a local place: its address goes to this call alone).
+   The adapter's place was its own, so nothing else could see the lent value change; on the
+   caller's storage, the plan makes sure nothing else does: a C variable is read no more after the
+   call (1), and a place has the value handed back stored into it again, in the same block, before
+   any other instruction names an overlapping path. A place a value of a `Copy` type was loaded
+   from still holds it, and may be read again in another block; it holds the value handed back
+   by then, as KURS says it does.
+6. **Edges.** An assignment of an edge or a self tail call from a value lying under a place
+   parameter, or in another value's variable, reads that parameter's pointer or that variable:
+   the parallel moves account for it like any other variable read (`Move.base`).
 
 ### Zero-size types are erased
 

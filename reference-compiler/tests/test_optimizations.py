@@ -109,6 +109,54 @@ class LeftOutTests(unittest.TestCase):
         self.assertEqual(run(c), 21)
 
 
+ADAPTED = CUR + """
+(type Rec (struct (cur Cur) (n u32)))
+(fun bump u32 (Cur) (entry ((&c Cur)) (= %p (load &c.pos)) (= %one (const u32 1)) (= %q (add %p %one))
+  (= %q2 (copy %q)) (= %u (store &c.pos %q2)) (ret %q)))
+(fun bump#lend (tuple Cur u32) (Cur) (locals (&slot0 Cur))
+  (entry ((%a0 Cur)) (= %unit0 (store &slot0 %a0)) (= %result (call bump &slot0)) (= %restored0 (load &slot0))
+    (= %out (construct (tuple Cur u32) %restored0 %result)) (ret %out)))
+(fun step u32 (Rec) (entry ((&r Rec)) (= %v (load &r)) (= (%c %n) (destruct %v Rec)) (= %o (call bump#lend %c))
+  (= (%c2 %k) (destruct %o (tuple Cur u32))) (= %w (construct Rec %c2 %n)) (= %u (store &r %w)) (ret %k)))
+(fun peek u32 (Rec) (entry ((&r Rec)) (= %v (load &r)) (= (%c %n) (destruct %v Rec)) (= %o (call bump#lend %c))
+  (= (%c2 %k) (destruct %o (tuple Cur u32))) (= %old (load &r.cur.pos)) (= %w (construct Rec %c2 %n)) (= %u (store &r %w))
+  (= %s (add %k %old)) (ret %s)))
+(fun twice u32 (Cur) (entry ((%c Cur)) (= %o (call bump#lend %c)) (= (%c2 %k) (destruct %o (tuple Cur u32)))
+  (= %o2 (call bump#lend %c2)) (= (%c3 %j) (destruct %o2 (tuple Cur u32))) (= %p (destruct %c3 Cur)) (= %s (add %j %p)) (ret %s)))
+(fun main i32 () (locals (&x Rec))
+  (entry () (= %z (const u32 10)) (= %c (construct Cur %z)) (= %c1 (copy %c)) (= %n (const u32 1)) (= %r (construct Rec %c1 %n))
+    (= %u (store &x %r)) (= %a (call step &x)) (= %b (call step &x)) (= %e (call peek &x)) (= %p (load &x.cur.pos))
+    (= %f (call twice %c)) (= %s (add %a %b)) (= %t (add %s %p)) (= %t2 (add %t %e)) (= %t3 (add %t2 %f))
+    (= %i (int_cast %t3 i32)) (ret %i)))"""
+
+
+class ResidenceTests(unittest.TestCase):
+    def test_values_are_read_where_they_were_loaded(self):
+        c = c_of(CUR + """
+(type Two (struct (a Cur) (b u32)))
+(fun sum u32 (Two) (entry ((&t Two)) (= %v (load &t)) (= (%a %b) (destruct %v Two)) (= %a2 (copy %a)) (= %p (destruct %a2 Cur))
+  (= %s (add %p %b)) (= %s2 (copy %s)) (= %w (construct Two %a %s2)) (= %u (store &t %w)) (ret %s)))
+(fun main i32 () (locals (&x Two))
+  (entry () (= %one (const u32 1)) (= %c (construct Cur %one)) (= %two (const u32 2)) (= %t (construct Two %c %two))
+    (= %u (store &x %t)) (= %r (call sum &x)) (= %q (load &x.b)) (= %s (add %r %q)) (= %i (int_cast %s i32)) (ret %i)))""")
+        sum_ = body(c, "sum")
+        # Nothing is copied out of the place; the store writes the one member that changed.
+        self.assertNotRegex(sum_, r"K_Two \w+;")
+        self.assertRegex(sum_, r"\(\*entry_t\w*\)\.f_b = ")
+        self.assertNotRegex(sum_, r"\(\*entry_t\w*\)\.f_a = ")
+        self.assertEqual(run(c), 6)
+
+    def test_a_lend_adapter_lends_the_place_its_value_lies_in(self):
+        c = c_of(ADAPTED)
+        self.assertRegex(body(c, "step"), r"bump\w*\(&\(\*entry_r\w*\)\.f_cur\);")
+        self.assertNotRegex(body(c, "step"), r"\(\*entry_r\w*\)(\.f_cur)? = ")
+        # A value in a C variable is lent there, twice in a row.
+        self.assertRegex(body(c, "twice"), r"bump\w*\(&entry_c\w*\);(.|\n)*bump\w*\(&entry_c\w*\);")
+        # `peek` reads the place between the lend and the store, so it lends a copy, through the adapter.
+        self.assertRegex(body(c, "peek"), r"bump_23lend\w*\(")
+        self.assertEqual(run(c), 11 + 12 + 13 + (13 + 12) + (12 + 12))
+
+
 SUM = """
 (fun sum u64 (u64 u64) (entry ((%n u64) (%acc u64)) (= %z (const u64 0)) (= %n2 (copy %n)) (= %done (eq %n2 %z)) (jnz %done (fin %acc) (more %n %acc)))
   (fin ((%a u64)) (ret %a))

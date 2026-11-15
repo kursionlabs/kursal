@@ -21,14 +21,21 @@ a parallel assignment through scratch variables. `plan` finds where less does th
   value it passes at that position.
 - Tail calls. A call, the last instruction of its block, whose result the block returns, directly or
   through return joins (`tail_call`). cgen.py decides whether its C can be a tail call.
+- Residences. A value loaded from a place, a component taken apart from one, and a value a lend
+  adapter hands back are read where they lie, in the place, while nothing writes it (`residences`).
+  A lend adapter whose borrowed values lie in places lends those places to its callee itself; a store
+  of a value back where it lies writes nothing, and a construction stored at once into a place writes
+  only the components that are not already there.
 
 The plan only reads the program; the KURS the checker accepted is what cgen.py translates."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Optional
 
-from .core import Block, Edge, Fun, Instr, Jmp, Jnz, Ret, Switch, Terminator
+from .check import overlap
+from .core import ATOMIC_OPS, Block, Edge, Fun, Instr, Jmp, Jnz, Ret, Switch, Terminator
 
 # Instructions whose C writes only their results: left out when every result is dead.
 PURE = frozenset({"const", "copy", "construct", "construct_variant", "destruct", "variant_tag", "load",
@@ -39,6 +46,19 @@ PURE = frozenset({"const", "copy", "construct", "construct_variant", "destruct",
 # Instructions whose dead result the C does not assign: unit results of stores, and call results.
 UNASSIGNED = frozenset({"store", "ptr_store", "ptr_store_volatile",
                         "ptr_atomic_store", "fence", "call", "trait_call"})
+# Instructions that may write memory through a raw pointer, or run code that may: a place parameter
+# lent from a raw target is reached so too.
+OPAQUE = frozenset({"call", "trait_call", "foreach", "ptr_store", "ptr_store_volatile",
+                    *(op for op in ATOMIC_OPS if op not in ("ptr_atomic_load", "fence"))})
+
+
+@dataclass(frozen=True)
+class Adapter:
+    """A lend adapter, which lowering makes for a lend of a value: it stores its parameters at
+    `borrowed` (in the order it hands them back) into places of its own, lends those to one call, and
+    returns them reloaded beside the call's result in a tuple, or never returns (`returns` false)."""
+    borrowed: tuple[int, ...]
+    returns: bool
 
 
 def value_read(arg: str) -> Optional[str]:
@@ -82,8 +102,16 @@ def root(path: str) -> str:
     return path.split(".")[0]
 
 
+def is_place(arg: str) -> bool:
+    return arg.startswith("&") and not arg.startswith("&*")
+
+
 class Plan:
-    def __init__(self, fun: Fun) -> None:
+    def __init__(self, fun: Fun, components: Optional[dict[tuple[str, int], tuple[str, ...]]] = None,
+                 adapters: Optional[dict[str, Adapter]] = None, params: frozenset[str] = frozenset()) -> None:
+        """`components`: for each (block, index) of a `destruct` or `construct` of a struct or tuple, the
+        labels of its components in a place path; `adapters`: the lend adapters the function calls;
+        `params`: the place parameters, whose memory a raw pointer may reach."""
         self.fun = fun
         self.blocks = {b.label: b for b in fun.blocks}
         self.forwarded = self.forwarded_places()
@@ -94,6 +122,15 @@ class Plan:
                 self.return_index[block.label] = index
         # The blocks the C has: every edge into a return join returns instead.
         self.emitted = [b for b in fun.blocks if b.label not in self.return_index]
+        # (block, value) -> the place path it is read from
+        self.resident: dict[tuple[str, str], str] = {}
+        # (block, index) of a lend adapter's call -> the paths it lends its callee, in the order handed back
+        self.in_place: dict[tuple[str, int], tuple[str, ...]] = {}
+        # (block, index) of each store that writes nothing, and of each construction its store writes in place
+        self.unwritten: set[tuple[str, int]] = set()
+        self.fused: set[tuple[str, int]] = set()
+        for block in self.emitted:
+            self.residences(block, components or {}, adapters or {}, params)
         self.live = self.liveness()
         self.variables = self.c_variables()
 
@@ -169,13 +206,161 @@ class Plan:
         out: set[tuple[str, str]] = set()
         for block in self.emitted:
             out.update((block.label, name) for name, _ in block.params if (block.label, name) in self.live)
-            for instr in block.instrs:
-                if instr.op == "copy" or self.is_forwarded_load(instr):
+            for i, instr in enumerate(block.instrs):
+                if instr.op == "copy" or self.is_forwarded_load(instr) or (block.label, i) in self.fused or \
+                        (block.label, i) in self.in_place:
                     continue
                 for name in instr.lhs:
+                    if (block.label, name) in self.resident:
+                        continue
                     if (block.label, name) in self.live or instr.op not in PURE and instr.op not in UNASSIGNED:
                         out.add((block.label, name))
         return out
+
+    # -------------------------------------------------------------- residences --
+
+    def residences(self, block: Block, components: dict[tuple[str, int], tuple[str, ...]],
+                   adapters: dict[str, Adapter], params: frozenset[str]) -> None:
+        """Which values of `block` are read where they lie, and what that saves.
+
+        A value lies at a path: in a place P when it was loaded from P; in the C variable of a value `%v`
+        (the path `%v`) when it is `v`; and at `Q.label` when it is a component taken apart from the place
+        Q or from a value lying at Q. Values that copy, open, pack or forward one lie where it does (one
+        class), as does the value a lend adapter hands back when the call lends its callee the path the
+        borrowed value lies at. A class is read where it lies when, from the instruction that took its
+        first value out of the path to the class's last read in the block, nothing writes a path
+        overlapping it: no store, no lend, no adapter that may lend such a path for another class, and,
+        under a place parameter, no call or raw write at all (memory lent from a raw target may be reached
+        through a pointer). A C variable is assigned once in a block, so only a lend in place writes it. A
+        call evaluates its arguments before it runs, so the call that reads the class last may write it.
+
+        A lend adapter's call lends its callee the paths its borrowed values lie at, instead of copying
+        them into places of its own, when each is read there and read last by the call, the paths overlap
+        neither each other nor another place the call lends, and the destruct taking its result apart
+        follows it; a value lying in a C variable is read no more after the call, and a place has the
+        value handed back stored into it again before anything else names it, so nothing sees the place
+        between the lend and the store but the callee."""
+        label, instrs = block.label, block.instrs
+        n = len(instrs)
+        alias: dict[str, str] = {}
+
+        def find(name: str) -> str:
+            while name in alias:
+                name = alias[name]
+            return name
+
+        stored: dict[str, str] = {}
+        # class -> (path, index its first value came out of the path, adapter call it waits on or -1)
+        candidates: dict[str, tuple[str, int, int]] = {}
+        # adapter call index -> (class, path) of each borrowed value, in the order handed back
+        lent: dict[int, list[tuple[str, str]]] = {}
+        for i, instr in enumerate(instrs):
+            op, a, lhs = instr.op, instr.args, instr.lhs
+            if op in ("copy", "open", "pack") and a[0].startswith("%"):
+                alias[lhs[0]] = find(a[0])
+            elif op == "store" and a[0] in self.forwarded:
+                stored[a[0]] = a[1]
+            elif op == "load" and a[0] in self.forwarded:
+                alias[lhs[0]] = find(stored[a[0]])
+            elif op == "load" and is_place(a[0]):
+                candidates[lhs[0]] = (a[0], i, -1)
+            elif op == "destruct" and (label, i) in components and i - 1 not in lent:
+                base = (a[0], i, -1) if is_place(a[0]) else candidates.get(find(a[0]), (find(a[0]), i, -1))
+                for name, part in zip(lhs, components[label, i]):
+                    candidates[name] = (f"{base[0]}.{part}", base[1], base[2])
+            elif op == "call" and a[0] in adapters:
+                adapter = adapters[a[0]]
+                actuals = [find(a[1 + m]) for m in adapter.borrowed]
+                if not all(x.startswith("%") for x in actuals):
+                    continue
+                if adapter.returns and (i + 1 >= n or instrs[i + 1].op != "destruct" or instrs[i + 1].args != (lhs[0],)):
+                    continue
+                for x in actuals:
+                    candidates.setdefault(x, (x, -1, -1))
+                lent[i] = [(x, candidates[x][0]) for x in actuals]
+                if adapter.returns:
+                    for name, x in zip(instrs[i + 1].lhs, actuals):
+                        candidates[name] = (candidates[x][0], i, i)
+
+        last: dict[str, int] = {}
+        reads: dict[str, int] = {}
+        for i, instr in enumerate(instrs):
+            for name in instr_reads(instr):
+                last[find(name)] = i
+                reads[find(name)] = reads.get(find(name), 0) + 1
+        for name in term_reads(block.term) + [name for edge, _ in term_edges(block.term) for name in edge.args]:
+            last[find(name)] = n
+
+        def kept(c: str, path: str, origin: int) -> bool:
+            end = last.get(c, origin)
+            under_param = root(path) in params
+            for j in range(origin + 1, min(end, n - 1) + 1):
+                op, a = instrs[j].op, instrs[j].args
+                if op == "store":
+                    if overlap(a[0], path) and not (j == end and a[0] == path and find(a[1]) == c):
+                        return False
+                elif op in ("call", "trait_call") and j == end:
+                    continue
+                elif under_param and op in OPAQUE:
+                    return False
+                elif op in ("call", "trait_call") and (
+                        any(is_place(arg) and overlap(arg, path) for arg in a) or
+                        any(x != c and overlap(q, path) for x, q in lent.get(j, ()))):
+                    return False
+            return True
+
+        def stored_back(j: int, k: int, path: str) -> bool:
+            """The value the adapter call at `j` hands back `k`th is stored into the place `path` again
+            before any other instruction names a path overlapping it."""
+            back = find(instrs[j + 1].lhs[k])
+            for s in range(j + 2, n):
+                instr = instrs[s]
+                if not any(is_place(arg) and overlap(arg, path) for arg in instr.args):
+                    continue
+                if instr.op != "store":
+                    return False
+                target, value = instr.args
+                if target == path:
+                    return find(value) == back
+                made = instrs[s - 1]
+                if made.op != "construct" or made.lhs[0] != value or (label, s - 1) not in components:
+                    return False
+                return any(f"{target}.{part}" == path and find(arg) == back
+                           for arg, part in zip(made.args, components[label, s - 1]))
+            return False
+
+        valid = {c for c, (path, origin, _) in candidates.items() if kept(c, path, origin)}
+        for i in sorted(lent):
+            paths = [q for _, q in lent[i]]
+            others = [arg for arg in instrs[i].args[1:] if is_place(arg)]
+            if all(x in valid and last.get(x) == i and
+                   (candidates[x][2] == -1 or (label, candidates[x][2]) in self.in_place) and
+                   (last.get(root(q), -1) <= i if q.startswith("%") else stored_back(i, k, q))
+                   for k, (x, q) in enumerate(lent[i])) and \
+                    not any(overlap(p, q) for k, p in enumerate(paths) for q in paths[k + 1:]) and \
+                    not any(overlap(p, q) for p in paths for q in others):
+                self.in_place[label, i] = tuple(paths)
+        for instr in instrs:
+            for name in instr.lhs:
+                c = find(name)
+                if c in valid and (candidates[c][2] == -1 or (label, candidates[c][2]) in self.in_place) and \
+                        candidates[c][0] != name:
+                    self.resident[label, name] = candidates[c][0]
+
+        for i, instr in enumerate(instrs):
+            a = instr.args
+            if instr.op == "store" and a[0] not in self.forwarded and self.resident.get((label, a[1])) == a[0]:
+                self.unwritten.add((label, i))
+            elif instr.op == "construct" and (label, i) in components and i + 1 < n:
+                store, made = instrs[i + 1], find(instr.lhs[0])
+                if store.op != "store" or store.args[1] != instr.lhs[0] or root(store.args[0]) in self.forwarded \
+                        or reads.get(made) != 1 or last.get(made) != i + 1:
+                    continue
+                target = store.args[0]
+                if all(not overlap(self.resident.get((label, arg), "%"), target) or
+                       self.resident[label, arg] == f"{target}.{part}" for arg, part in zip(a, components[label, i])):
+                    self.fused.add((label, i))
+
 
     # ----------------------------------------------------------------- returns --
 

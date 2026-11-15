@@ -3,8 +3,9 @@
 The reference compiler for Kursal (Python package `kursal`). It is a direct,
 spec-driven implementation of the language: source text is parsed, resolved,
 typed, lowered to KURS (the core language), checked, and translated to C. The
-translation leaves out what the C would not use and turns calls in tail position into
-jumps (`plan.py`, `cgen.py`); there are no passes over KURS.
+translation leaves out what the C would not use, reads values where they lie instead of
+copying them, and turns calls in tail position into jumps (`plan.py`, `cgen.py`); there
+are no passes over KURS.
 
 It needs only Python 3.12+. [uv](https://docs.astral.sh/uv/) manages the
 development tools (`pyproject.toml`, `uv.lock`); mypy checks `kursal/`.

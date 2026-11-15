@@ -14,8 +14,8 @@ program observes: a `char`.
 An enum is a tag and a union of its payloads, or, in the niche layout (`Types.niche_variant`), its one
 payload with a niche, the other variant a null there (`niche_layout`, `tag`, `payload`, `set_variant`).
 
-What a function's C leaves out (dead values, copies, forwarded places, return joins) is decided by
-plan.py. Beyond that the backend makes calls in tail position jumps (`tail_call`), and qualifies
+What a function's C leaves out (dead values, copies, forwarded places, return joins) and where it
+reads values where they lie (residences, lend adapters in place) is decided by plan.py. Beyond that the backend makes calls in tail position jumps (`tail_call`), and qualifies
 place parameters `const` and `restrict` where the whole program allows it (`qualifiers`)."""
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from .sexpr import Form, KursError, List, Str
 from .types import foreach_binders, ForeachRow, Types, equal, map_children, subst, subst_foreach
 from .termination import check_mono_termination
 from .mangle import encode, mangle, path_segments, type_key, unbranded
-from .plan import PURE, Plan, root
+from .plan import PURE, Adapter, Plan, root
 
 PRELUDE = """#include <stddef.h>
 #include <stdint.h>
@@ -140,6 +140,7 @@ class Backend:
         self.written: set[tuple[str, int]] = set()      # place parameters the function may write
         self.address_taken: set[str] = set()
         self.looping: set[str] = set()     # functions whose tail call to themselves moves a place parameter
+        self.adapters: dict[str, Optional[tuple[Adapter, Fun]]] = {}  # lend adapters by name (`adapter`)
         self.datas: dict[str, tuple[str, Data]] = {}
         # One conservative pool for ordinary identifiers, including function
         # locals: later global declarations must not be shadowed by earlier locals.
@@ -459,7 +460,20 @@ class Backend:
 
     def emit_function(self, fun: Fun, sub: Mapping[str, Type], symbol: str) -> None:
         self.fun, self.sub, self.symbol = fun, sub, symbol
-        self.plan = Plan(fun)
+        components: dict[tuple[str, int], tuple[str, ...]] = {}
+        adapters: dict[str, Adapter] = {}
+        for block in fun.blocks:
+            for i, instr in enumerate(block.instrs):
+                if instr.op in ("destruct", "construct"):
+                    labels = self.labels_of(self.type_operand(instr))
+                    if labels is not None:
+                        components[block.label, i] = labels
+                elif instr.op == "call" and instr.args[0] in self.program.funs:
+                    adapter = self.adapter(instr.args[0])
+                    if adapter is not None:
+                        adapters[instr.args[0]] = adapter[0]
+        self.plan = Plan(fun, components, adapters,
+                         frozenset(name for name, _ in fun.blocks[0].params if name.startswith("&")))
         typed = self.checker.typed[id(fun)]
         substitute_type = self.substitute_type
         self.locals: dict[tuple[str, str], str] = {}
@@ -505,7 +519,7 @@ class Backend:
             self.label = block.label
             self.line(f"{self.labels[block.label]}: ;")
             call = self.plan.tail_call(block)
-            for instr in block.instrs:
+            for self.index, instr in enumerate(block.instrs):
                 if instr is not call:
                     self.instr(instr)
             if call is None or not self.tail_call(call):
@@ -516,6 +530,47 @@ class Backend:
                      if (label, name) in self.plan.variables)
         self.emitted.append((symbol, "", " {\n" + "".join(f"  {d}\n" for d in decls + self.temps) +
                              "".join(f"  {line}\n" for line in self.lines) + "}\n"))
+
+    def labels_of(self, ty: Type) -> Optional[tuple[str, ...]]:
+        """The labels of a struct's or tuple's components in a place path; none for other types."""
+        s = self.shape(ty)
+        if isinstance(s, Struct):
+            return tuple(n for n, _ in s.fields)
+        if isinstance(s, Tuple):
+            return tuple(str(k) for k in range(len(s.elems)))
+        return None
+
+    def adapter(self, name: str) -> Optional[tuple[Adapter, Fun]]:
+        """The lend adapter `name` is, by its shape alone: one block that stores some of its value
+        parameters into its local places, one apiece, makes one call lending each place, and returns the
+        places reloaded and the call's result as a tuple, or never returns."""
+        if name not in self.adapters:
+            self.adapters[name] = None
+            fun = self.program.funs[name]
+            block = fun.blocks[0]
+            names = [n for n, _ in block.params]
+            k = len(fun.locals)
+            instrs = block.instrs
+            if len(fun.blocks) != 1 or k == 0 or len(instrs) < k + 1:
+                return None
+            slots = [n for n, _ in fun.locals]
+            stores = instrs[:k]
+            call = instrs[k]
+            if not all(s.op == "store" and s.args[0] == slot and s.args[1] in names and s.args[1].startswith("%")
+                       for s, slot in zip(stores, slots)) or call.op not in ("call", "trait_call") or len(call.lhs) != 1:
+                return None
+            if not all(sum(arg == slot for arg in call.args) == 1 for slot in slots):
+                return None
+            borrowed = tuple(names.index(s.args[1]) for s in stores)
+            rest, term = instrs[k + 1:], block.term
+            if isinstance(term, Unreachable) and not rest:
+                self.adapters[name] = (Adapter(borrowed, False), fun)
+            elif isinstance(term, Ret) and len(rest) == k + 1 and \
+                    all(r.op == "load" and r.args == (slot,) for r, slot in zip(rest, slots)) and \
+                    rest[k].op == "construct" and rest[k].args == (*(r.lhs[0] for r in rest[:k]), call.lhs[0]) and \
+                    term.value == rest[k].lhs[0]:
+                self.adapters[name] = (Adapter(borrowed, True), fun)
+        return self.adapters[name]
 
     def head(self, symbol: str, const: set[tuple[str, int]], restrict: set[tuple[str, int]]) -> str:
         """A function's head, with its place parameters qualified as `qualifiers` allows."""
@@ -540,9 +595,23 @@ class Backend:
         return self.locals[key]
 
     def value_name(self, name: str) -> str:
-        """The C variable holding a value of the current block: its own, or the one it reads (`Plan`)."""
+        """The C variable holding a value of the current block: its own, the one it reads, or the place it
+        lies in (`Plan`)."""
         key = (self.label, name)
+        if key in self.plan.resident:
+            return self.place(self.plan.resident[key])[0]
         return self.aliases[key] if key in self.aliases else self.cname(self.label, name)
+
+    def value_base(self, name: str) -> str:
+        """The C variable an assignment from `name` reads: for a value lying in a place under a place
+        parameter, the parameter's pointer, which a self tail call may assign."""
+        key = (self.label, name)
+        if key in self.plan.resident:
+            path = self.plan.resident[key]
+            if path.startswith("%"):
+                return self.cname(self.label, root(path))
+            return self.cname(self.fun.blocks[0].label, root(path)) if root(path) in self.params else self.place_c[root(path)]
+        return self.value_name(name)
 
     def is_live(self, name: str) -> bool:
         return self.plan.is_live(self.label, name)
@@ -558,7 +627,12 @@ class Backend:
     def place(self, path: str) -> tuple[str, Type]:
         """The C lvalue and type of a place path."""
         parts = path.split(".")
-        expr, ty = self.place_c.get(parts[0], ""), self.roots[parts[0]]
+        if parts[0].lstrip("&").startswith("%"):
+            # A path in the C variable of a value of the current block (`Plan.residences`).
+            value = parts[0].lstrip("&")
+            expr, ty = self.cname(self.label, value), self.type_of(value)
+        else:
+            expr, ty = self.place_c.get(parts[0], ""), self.roots[parts[0]]
         for seg in parts[1:]:
             ty = self.view(ty)
             s = self.shape(ty)
@@ -588,6 +662,20 @@ class Backend:
         # A pure instruction is written when the C reads one of its results: one that is live and not of a
         # zero-size type (so never `static_brand`, `fresh`, nor `pack` and `open` of a place).
         if op in PURE and not any(self.is_live(name) and not self.erased(self.type_of(name)) for name in instr.lhs):
+            return
+        here, plan = (self.label, self.index), self.plan
+        if here in plan.in_place:
+            self.lend_in_place(instr, plan.in_place[here])
+            return
+        if here in plan.fused or op in ("load", "open", "pack") and (self.label, instr.lhs[0]) in plan.resident:
+            return
+        if op == "destruct" and (self.label, self.index - 1) in plan.in_place:
+            self.handed_back(instr, plan.in_place[self.label, self.index - 1])
+            return
+        if here in plan.unwritten:
+            return
+        if op == "store" and (self.label, self.index - 1) in plan.fused:
+            self.store_in_place(a[0], self.blocks[self.label].instrs[self.index - 1])
             return
         dst = self.value_name(instr.lhs[0]) if len(instr.lhs) == 1 and not self.erased(self.type_of(instr.lhs[0])) else None
         substitute_type = self.substitute_type
@@ -631,10 +719,7 @@ class Backend:
         elif op == "call":
             self.call(instr)
         elif op == "trait_call":
-            fun, sub = self.resolve_trait(a[0], a[1], tuple(substitute_type(t) for t in instr.tys))
-            symbol = self.request(fun, sub)
-            self.lend(symbol, a[2:])
-            self.emit_call(instr, symbol, fun.ret, sub, a[2:])
+            self.trait_call(instr)
         elif op == "fn":
             self.line(f"{dst} = {self.function_address(instr)};")
         elif op == "alloca":
@@ -713,7 +798,7 @@ class Backend:
         else:
             access = self.members(s)
         for name, (member, t) in zip(instr.lhs, access):
-            if not self.is_live(name) or self.erased(self.type_of(name)):
+            if not self.is_live(name) or self.erased(self.type_of(name)) or (self.label, name) in self.plan.resident:
                 continue
             # A pointer to a zero-size component is the pointer to the whole: they may share an address.
             if pointer:
@@ -819,6 +904,55 @@ class Backend:
             symbol = self.request(fun, sub)
             self.lend(symbol, instr.args[1:])
             self.emit_call(instr, symbol, fun.ret, sub, instr.args[1:])
+
+    def trait_call(self, instr: Instr) -> None:
+        a = instr.args
+        fun, sub = self.resolve_trait(a[0], a[1], tuple(self.substitute_type(t) for t in instr.tys))
+        symbol = self.request(fun, sub)
+        self.lend(symbol, a[2:])
+        self.emit_call(instr, symbol, fun.ret, sub, a[2:])
+
+    def lend_in_place(self, instr: Instr, paths: tuple[str, ...]) -> None:
+        """A lend adapter's call (`Plan.residences`) as its own call, lending the callee the places
+        `paths` the borrowed values lie in instead of the adapter's places, its result assigned to the
+        result of the destruct that follows."""
+        entry = self.adapters[instr.args[0]]
+        assert entry is not None
+        adapter, fun = entry
+        block = fun.blocks[0]
+        inner = block.instrs[len(fun.locals)]
+        actual = {name: arg for (name, _), arg in zip(block.params, instr.args[1:])}
+        actual.update((slot, path if path.startswith("&") else "&" + path) for (slot, _), path in zip(fun.locals, paths))
+        sub = {p.name: t for p, t in zip(fun.params, instr.tys)}
+        after = self.blocks[self.label].instrs[self.index + 1]
+        call = Instr((after.lhs[-1],) if adapter.returns else instr.lhs, inner.op,
+                     tuple(actual.get(arg, arg) for arg in inner.args), tys=tuple(subst(t, sub) for t in inner.tys),
+                     unsafe=inner.unsafe, pos=inner.pos)
+        if call.op == "call":
+            self.call(call)
+        else:
+            self.trait_call(call)
+
+    def handed_back(self, instr: Instr, paths: tuple[str, ...]) -> None:
+        """The destruct after a lend in place: the call assigned the result, and each value handed back
+        lies in its place, or is copied out of it when it cannot be read there."""
+        for name, path in zip(instr.lhs, paths):
+            if self.is_live(name) and not self.erased(self.type_of(name)) and (self.label, name) not in self.plan.resident:
+                self.line(f"{self.value_name(name)} = {self.place(path)[0]};")
+
+    def store_in_place(self, target: str, construct: Instr) -> None:
+        """A store of the construction just before it (`Plan.fused`): each component written into its
+        member of the place, except the ones that lie there already."""
+        dst, _ = self.place(target)
+        ty = self.type_operand(construct)
+        labels = self.labels_of(ty)
+        assert labels is not None
+        for (member, t), arg, part in zip(self.members(self.shape(ty)), construct.args, labels):
+            if self.erased(t) or self.plan.resident.get((self.label, arg)) == f"{target}.{part}":
+                continue
+            if root(target) in self.params:
+                self.written.add((self.symbol, self.params.index(root(target))))
+            self.line(f"{dst}.{member} = {self.value_name(arg)};")
 
     def operands(self, args: Sequence[str]) -> str:
         """The C arguments of a call: those that pass something."""
@@ -972,7 +1106,7 @@ class Backend:
         nothing is assigned or returned."""
         target = self.blocks[edge.target]
         values = ([(payload, source)] if payload is not None else []) + \
-            [("", "") if self.erased(self.type_of(a)) else (self.value_name(a), self.value_name(a)) for a in edge.args]
+            [("", "") if self.erased(self.type_of(a)) else (self.value_name(a), self.value_base(a)) for a in edge.args]
         if target.label in self.plan.return_index:
             value = values[self.plan.return_index[target.label]][0]
             self.line(f"{indent}return {value};" if value else f"{indent}return;")
@@ -1003,8 +1137,9 @@ class Backend:
         arg = term.scrutinee
         if arg.startswith("&"):
             source, _ = self.place(arg)
+            base = source
         else:
-            source = self.value_name(arg)
+            source, base = self.value_name(arg), self.value_base(arg)
         ty = self.substitute_type(term.ty)
         variants = self.types.variants(erase(ty, self.types))
         names = [n for n, _ in variants]
@@ -1019,7 +1154,7 @@ class Backend:
             else:
                 payload = self.payload(source, ty, arm.variant)
             self.line("  {")
-            self.edge(arm.edge, payload, source, indent="    ")
+            self.edge(arm.edge, payload, base, indent="    ")
             self.line("  }")
         self.line("default: KUR_TRAP();")
         self.line("}")
@@ -1063,7 +1198,7 @@ class Backend:
                     base = self.value_name(arg[2:]) if arg.startswith("&*") else self.cname(entry.label, root(arg))
                     moves.append((self.cname(entry.label, name), ty, True, self.operand(arg), base))
                 elif not name.startswith("&") and self.plan.is_live(entry.label, name):
-                    moves.append((self.cname(entry.label, name), ty, False, self.value_name(arg), self.value_name(arg)))
+                    moves.append((self.cname(entry.label, name), ty, False, self.value_name(arg), self.value_base(arg)))
             self.assign(moves, "")
             self.line(f"goto {self.labels[entry.label]};")
             return True
