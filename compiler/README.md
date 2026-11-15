@@ -282,6 +282,13 @@ What a function leaves out is decided first, from its KURS alone (`backend::plan
     a destruct took apart a value of the construction's type, lies at that path and writes nothing
     (lowering takes a branded value apart and builds it again around a lend; `Group::slot_index`
     rebuilt and stored back a whole member per probe before).
+- **Homed locals** (`Backend::homes`, before the plan). A local place L whose every whole store
+  stores a value lying at one place path P of L's type, and that is never holding a value while P
+  is, shares P's storage: the function is planned and written with L's paths rewritten under P, so
+  `let { members, ..rest } = self; ...; self = Group.{ members, ..rest }` copies nothing out of
+  `self` or back. A local whose contents the C would read as a value (a load of it used otherwise
+  than to move it back to P, a load of a part of it, a switch on it) keeps its own variable, which
+  the C compiler can keep in registers.
 - **Shared variables** (`Plan::share`). A value assigned in a block and read by one edge alone, as
   the argument of a live parameter of another block, is assigned to that parameter's variable, and
   the edge assigns nothing: an enum result of a call or of a construction is made in the join's
@@ -389,7 +396,17 @@ plan (`Plan::residences`) allows a residence only where that holds:
    reads the component later), every member has its component, and the path held a value of the
    construction's type, so the object at the path is the constructed value; from there the
    construction is a value lying at the path like any other (2–4).
-8. **Shared variables.** A block parameter's variable is assigned only on the edges into its block
+8. **Homed locals.** L and P may share memory when at no point both hold a value: then a write to
+   one while it is empty touches only memory the other does not hold a value in, and nothing reads
+   an empty place. The backend follows the checker's own account of the places: each block's header
+   lists the paths empty where it starts (every local at the function's start), a load or place
+   destruct of a value that is not `Copy` empties its path, and a store fills its path; the paths
+   around a store are counted full, which can only refuse a homing. L counts as holding nothing
+   once nothing in its block, or in a block reachable from it, names it again (a `Copy` value
+   loaded out of L leaves it full but dead). A store into L of a value lying at P writes nothing.
+   The rewritten function is planned like any other, so every residence is checked against writes
+   to P that were writes to L.
+9. **Shared variables.** A block parameter's variable is assigned only on the edges into its block
    and read only in that block. A value sharing it is assigned in a predecessor and read by nothing
    but the edge, which leaves the predecessor and enters the block, so its life and the parameter's
    do not overlap, and the predecessor is never the block itself. A payload parameter read from its

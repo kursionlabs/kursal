@@ -15,24 +15,27 @@ An enum is a tag and a union of its payloads, or, in the niche layout (`Types.ni
 payload with a niche, the other variant a null there (`niche_layout`, `tag`, `payload`, `set_variant`).
 
 What a function's C leaves out (dead values, copies, forwarded places, return joins) and where it
-reads values where they lie (residences, lend adapters in place) is decided by plan.py. Beyond that the backend makes calls in tail position jumps (`tail_call`), and qualifies
-place parameters `const` and `restrict` where the whole program allows it (`qualifiers`)."""
+reads values where they lie (residences, lend adapters in place) is decided by plan.py, after local
+places that only hold what was moved out of another place are given its storage (`homes`). Beyond that
+the backend makes calls in tail position jumps (`tail_call`), and qualifies place parameters `const`
+and `restrict` where the whole program allows it (`qualifiers`)."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 import re
 from typing import Optional
 
-from .core import (ATOMIC_OPS, FLOATS, INTEGERS, UNIT, Array, Brand, Enum, Exists, Fn, Foreach, Ignored, Jmp, Jnz,
+from .core import (ATOMIC_OPS, FLOATS, INTEGERS, UNIT, Array, Block, Brand, Enum, Exists, Fn, Foreach, Ignored, Jmp, Jnz,
                    Named, Never, NonNull, Param, Prim, Ptr, Ret, Skolem, Struct, Switch, Tuple, Unreachable,
                    Type, Program, Fun, Data, Instr, Edge, Terminator)
-from .check import Checker
+from .check import Checker, overlap, prefix
 from .sexpr import Form, KursError, List, Str
 from .types import foreach_binders, ForeachRow, Types, equal, map_children, subst, subst_foreach
 from .termination import check_mono_termination
 from .mangle import encode, mangle, path_segments, type_key, unbranded
-from .plan import PURE, Adapter, Plan, root
+from .plan import PURE, Adapter, Plan, instr_reads, root, term_edges, term_reads
 
 PRELUDE = """#include <stddef.h>
 #include <stdint.h>
@@ -100,6 +103,22 @@ def readable(name: str) -> str:
                 pass
         parts.append(seg)
     return re.sub(r"[^A-Za-z0-9_]", "_", "_".join(parts)).strip("_") or "x"
+
+
+def homed(fun: Fun, homes: Mapping[str, str]) -> Fun:
+    """`fun` with each path under a local place of `homes` rewritten under the path it shares."""
+    def path(arg: str) -> str:
+        if arg.startswith("&") and not arg.startswith("&*") and root(arg) in homes:
+            return homes[root(arg)] + arg[len(root(arg)):]
+        return arg
+    blocks = []
+    for block in fun.blocks:
+        term = block.term
+        if isinstance(term, Switch):
+            term = replace(term, scrutinee=path(term.scrutinee))
+        blocks.append(replace(block, instrs=tuple(replace(i, args=tuple(path(a) for a in i.args)) for i in block.instrs),
+                              term=term))
+    return replace(fun, blocks=tuple(blocks), locals=tuple((n, t) for n, t in fun.locals if n not in homes))
 
 
 def erase(ty: Type, types: Types) -> Type:
@@ -475,10 +494,18 @@ class Backend:
                     adapter = self.adapter(instr.args[0])
                     if adapter is not None:
                         adapters[instr.args[0]] = adapter[0]
-        self.plan = Plan(fun, components, adapters,
-                         frozenset(name for name, _ in fun.blocks[0].params if name.startswith("&")), shapes)
+        params = frozenset(name for name, _ in fun.blocks[0].params if name.startswith("&"))
+        self.plan = Plan(fun, components, adapters, params, shapes)
         typed = self.checker.typed[id(fun)]
         substitute_type = self.substitute_type
+        self.place_c = {}
+        self.roots = {**{n: substitute_type(t) for n, t in fun.blocks[0].params if n.startswith("&")},
+                      **{n: substitute_type(t) for n, t in fun.locals}}
+        homes = self.homes(fun, typed)
+        if homes:
+            fun = homed(fun, homes)
+            self.fun = fun
+            self.plan = Plan(fun, components, adapters, params, shapes)
         self.locals: dict[tuple[str, str], str] = {}
         self.aliases: dict[tuple[str, str], str] = {}
         self.forwards: dict[str, str] = {}
@@ -533,6 +560,116 @@ class Backend:
                      if (label, name) in self.plan.variables)
         self.emitted.append((symbol, "", " {\n" + "".join(f"  {d}\n" for d in decls + self.temps) +
                              "".join(f"  {line}\n" for line in self.lines) + "}\n"))
+
+    def homes(self, fun: Fun, typed: Mapping[tuple[str, str], Type]) -> dict[str, str]:
+        """The local places that share the storage of a place path (`Plan` decides the rest on the
+        function with their paths rewritten to it): a local L whose every whole store stores a value
+        lying at one place path P, of L's type, that is never full where P is full. Each block's header
+        declares which places are empty at its entry; a load or a place destruct of a value that is not
+        `Copy` empties its path, and a store fills its path, and the paths around it, conservatively."""
+        plan = self.plan
+        kinds = {p.name: p.kind for p in self.instance_params.get(id(fun), fun.params)}
+        seen: dict[str, Optional[str]] = {}
+        for block in fun.blocks:
+            for instr in block.instrs:
+                a = instr.args
+                if instr.op == "store" and a[0] in seen.keys() | {n for n, _ in fun.locals}:
+                    path = plan.resident.get((block.label, a[1]))
+                    known = seen.get(a[0], "")
+                    if path is None or not path.startswith("&") or known not in ("", path):
+                        seen[a[0]] = None
+                    else:
+                        seen[a[0]] = path
+        found = {local: path for local, path in seen.items() if path is not None and local not in plan.forwarded
+                 and root(path) not in plan.forwarded and root(path) != local}
+        found = {local: path for local, path in found.items() if root(path) not in found and
+                 not any(overlap(path, other) for o, other in found.items() if o != local) and
+                 not self.erased(self.roots[local]) and
+                 erase(self.roots[local], self.types) == erase(self.place(path)[1], self.types)}
+        # A local whose contents C reads as a value stays a variable the C compiler can keep in registers:
+        # each whole load of it is moved back to the path alone, directly or as the member at the path of
+        # a construction stored in place, and nothing reads part of it but a lend.
+        for block in fun.blocks:
+            reads: dict[str, list[int]] = {}
+            for i, instr in enumerate(block.instrs):
+                for name in instr_reads(instr):
+                    reads.setdefault(name, []).append(i)
+            for name in term_reads(block.term) + [name for edge, _ in term_edges(block.term) for name in edge.args]:
+                reads.setdefault(name, []).append(len(block.instrs))
+            for i, instr in enumerate(block.instrs):
+                a = instr.args
+                for k, arg in enumerate(a):
+                    local = root(arg) if arg.startswith("&") and not arg.startswith("&*") else ""
+                    if local not in found or instr.op in ("call", "trait_call", "store") and arg != local or \
+                            instr.op == "store" and k == 0:
+                        continue
+                    back = instr.op == "load" and arg == local and len(reads.get(instr.lhs[0], ())) == 1
+                    if back:
+                        value, j = instr.lhs[0], reads[instr.lhs[0]][0]
+                        # A value waiting in a forwarded place is read where it is loaded again.
+                        while j < len(block.instrs) and block.instrs[j].op == "store" and \
+                                block.instrs[j].args[0] in plan.forwarded:
+                            again = next(m for m in range(j + 1, len(block.instrs)) if block.instrs[m].op == "load"
+                                         and block.instrs[m].args == (block.instrs[j].args[0],))
+                            value = block.instrs[again].lhs[0]
+                            j = reads[value][0] if len(reads.get(value, ())) == 1 else len(block.instrs) + 1
+                        user = block.instrs[j] if j < len(block.instrs) else None
+                        if user is None or not (user.op == "store" and user.args == (found[local], value) or
+                                                user.op == "construct" and (block.label, j) in plan.fused and
+                                                any(arg2 == value and f"{block.instrs[j + 1].args[0]}.{part}" == found[local]
+                                                    for arg2, part in zip(user.args, self.labels_of(self.type_operand(user)) or ()))):
+                            back = False
+                    if not back and instr.op not in ("call", "trait_call"):
+                        found.pop(local, None)
+            if isinstance(block.term, Switch) and block.term.scrutinee.startswith("&"):
+                found.pop(root(block.term.scrutinee), None)
+        blocks = {block.label: block for block in fun.blocks}
+        reach: dict[str, set[str]] = {}
+        for block in fun.blocks:
+            seen_blocks: set[str] = set()
+            todo = [edge.target for edge, _ in term_edges(block.term)]
+            while todo:
+                label = todo.pop()
+                if label not in seen_blocks:
+                    seen_blocks.add(label)
+                    todo.extend(edge.target for edge, _ in term_edges(blocks[label].term))
+            reach[block.label] = seen_blocks
+
+        def names(local: str, block: Block, start: int) -> bool:
+            """An instruction of `block` from `start` on, or its terminator, names a path under `local`."""
+            places = [arg for instr in block.instrs[start:] for arg in instr.args]
+            if isinstance(block.term, Switch):
+                places.append(block.term.scrutinee)
+            return any(arg.startswith("&") and not arg.startswith("&*") and root(arg) == local for arg in places)
+
+        out: dict[str, str] = {}
+        for local, path in found.items():
+            def apart(empty: set[str], block: Block, at: int) -> bool:
+                """`local` is empty or named no more from instruction `at` of `block` on, or `path` is empty."""
+                return any(prefix(e, local) for e in empty) or any(prefix(e, path) for e in empty) or \
+                    not names(local, block, at) and not any(names(local, blocks[b], 0) for b in reach[block.label])
+            fits = True
+            for block in fun.blocks:
+                # Every local place is empty where the function starts.
+                empty = set(block.empty) | ({n for n, _ in fun.locals} if block is fun.blocks[0] else set())
+                fits = fits and apart(empty, block, 0)
+                for i, instr in enumerate(block.instrs):
+                    if not fits:
+                        break
+                    a = instr.args
+                    if instr.op == "load" and a[0].startswith("&") and not a[0].startswith("&*"):
+                        if not self.types.is_copy(typed[block.label, instr.lhs[0]], kinds):
+                            empty.add(a[0])
+                    elif instr.op == "destruct" and a[0].startswith("&"):
+                        assert instr.ty is not None
+                        if not self.types.is_copy(instr.ty, kinds):
+                            empty.add(a[0])
+                    elif instr.op == "store":
+                        empty = {e for e in empty if not overlap(e, a[0])}
+                    fits = apart(empty, block, i + 1)
+            if fits:
+                out[local] = path
+        return out
 
     def labels_of(self, ty: Type) -> Optional[tuple[str, ...]]:
         """The labels of a struct's or tuple's components in a place path; none for other types."""

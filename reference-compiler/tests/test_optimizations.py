@@ -180,6 +180,35 @@ class SharingTests(unittest.TestCase):
         self.assertRegex(make, r"out_v\w*\.payload\.v_Ok\.e0\)")
         self.assertEqual(run(c), 7)
 
+    def test_a_local_holding_what_was_moved_out_of_a_place_shares_it(self):
+        moved = """
+(type Lin! (struct (pos u32)))
+(type Two! (struct (a Lin) (b u32)))
+(fun bump u32 (Lin) (entry ((&c Lin)) (= %p (load &c.pos)) (= %one (const u32 1)) (= %q (add %p %one))
+  (= %q2 (copy %q)) (= %u (store &c.pos %q2)) (ret %q)))
+(fun twice u32 (Two) (locals (&a Lin) (&b u32))
+  (entry ((&t Two)) (= %v (load &t)) (= (%x %y) (destruct %v Two)) (= %u1 (store &a %x)) (= %u2 (store &b %y))
+    (= %n (call bump &a)) (jmp next %n))
+  (next ((%m u32)) (empty &t) (= %x2 (load &a)) (= %y2 (load &b)) (= %w (construct Two %x2 %y2)) (= %u (store &t %w))
+    (ret %m)))
+(fun main i32 () (locals (&z Two))
+  (entry () (= %five (const u32 5)) (= %c (construct Lin %five)) (= %seven (const u32 7)) (= %t (construct Two %c %seven))
+    (= %u (store &z %t)) (= %r (call twice &z)) (= %q (load &z.a.pos)) (= %s (add %r %q))
+    (= %v (load &z)) (= (%x %y) (destruct %v Two)) (= (%p) (destruct %x Lin))
+    (= %i (int_cast %s i32)) (ret %i)))"""
+        c = c_of(moved)
+        twice = body(c, "twice")
+        # `a` and `b` live in `t`'s members, which `t` gave up: nothing is copied out or back.
+        self.assertNotIn("p_a", twice)
+        self.assertRegex(twice, r"bump\w*\(&\(\*entry_t\w*\)\.f_a\)")
+        self.assertNotRegex(twice, r"\(\*entry_t\w*\)[.\w]* = ")
+        self.assertEqual(run(c), 12)
+        # A local whose value the C reads keeps a variable of its own.
+        c = c_of(moved.replace("(next ((%m u32)) (empty &t) (= %x2 (load &a))",
+                               "(next ((%m u32)) (empty &t) (= %k (load &a.pos)) (= %x2 (load &a))"))
+        self.assertIn("p_a", body(c, "twice"))
+        self.assertEqual(run(c), 12)
+
     def test_a_construction_of_parts_where_they_lie_is_not_written(self):
         c = c_of(CUR + """
 (type Two (struct (a Cur) (b u32)))

@@ -18,9 +18,10 @@ use std::raw::Span;
 use std::alloc::arena::Domain;
 use std::bytes::buffer::Buffer;
 use package::check::checker::{FunKey, matching_instance};
-use package::kurs::core::{Arm, Block, Data, Edge, Fun, ForeachType, Instr, Member, Param, Program, Terminator, Type};
+use package::kurs::core::{Arm, Binding, Block, Data, Edge, Fun, ForeachType, Instr, Kind, Member, Param, Program, Terminator, Type, same};
 use package::kurs::core as C;
-use package::backend::plan::{Adapter, Plan, is_pure, root};
+use package::backend::plan::{Adapter, Plan, is_member, is_place, is_pure, root, term_edges, term_reads, value_read};
+use package::check::checker::{overlap, prefix};
 use package::backend::mangle::{decode_segment, encode, mangle, path_segments, type_key, unbranded};
 use package::kurs::sexpr::Form;
 use package::syntax::ast::{Pos, no_pos};
@@ -1364,6 +1365,8 @@ impl Backend['k] {
         self.fun.set(&cx, Option::Some.(fun));
         self.sub.set(&cx, sub);
         self.symbol.set(&cx, symbol);
+        self.substituted.copy(&cx).clear(&cx);
+        self.erasure.copy(&cx).clear(&cx);
         let components: ArenaMap[(Span['k], usize), ArenaVec[Span['k], 'k], 'k] = ArenaMap::new(&cx);
         let shapes: ArenaMap[(Span['k], usize), Type['k], 'k] = ArenaMap::new(&cx);
         let adapters: ArenaMap[Span['k], Adapter['k], 'k] = ArenaMap::new(&cx);
@@ -1404,11 +1407,32 @@ impl Backend['k] {
             }
             pp = pp + 1usize;
         }
-        let plan = Plan::new(&cx, fun, components, adapters, place_params, shapes);
+        var plan = Plan::new(&cx, fun, components, adapters, place_params, shapes);
         self.plan.set(&cx, Option::Some.(plan));
-        self.substituted.copy(&cx).clear(&cx);
-        self.erasure.copy(&cx).clear(&cx);
         let typed = self.recorded.at(&cx, key);
+        self.place_c.set(&cx, ArenaMap::new(&cx));
+        let first_roots: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+        var fr = 0usize;
+        while fr < fun.blocks.at(&cx, 0usize).params.len(&cx) {
+            let binding = fun.blocks.at(&cx, 0usize).params.at(&cx, fr);
+            if binding.name.starts_with(&cx, Span::from_static(&cx, "&")) {
+                first_roots.insert(&cx, binding.name, self.substitute_type(&cx, binding.type));
+            }
+            fr = fr + 1usize;
+        }
+        var fl = 0usize;
+        while fl < fun.locals.len(&cx) {
+            first_roots.insert(&cx, fun.locals.at(&cx, fl).name, self.substitute_type(&cx, fun.locals.at(&cx, fl).type));
+            fl = fl + 1usize;
+        }
+        self.roots.set(&cx, first_roots);
+        let homes = self.homes(&cx, key, fun, typed, plan);
+        let fun = if homes.is_empty(&cx) { fun } else { homed(&cx, fun, homes) };
+        if !homes.is_empty(&cx) {
+            self.fun.set(&cx, Option::Some.(fun));
+            plan = Plan::new(&cx, fun, components, adapters, place_params, shapes);
+            self.plan.set(&cx, Option::Some.(plan));
+        }
         self.locals.set(&cx, ArenaMap::new(&cx));
         self.aliases.set(&cx, ArenaMap::new(&cx));
         self.forwards.set(&cx, ArenaMap::new(&cx));
@@ -1549,6 +1573,317 @@ impl Backend['k] {
             d = d + 1usize;
         }
         self.emitted.push(&cx, (Option::Some.(symbol), Span::from_static(&cx, ""), body.push_buffer(lines).push_static("}\n").save(&cx)));
+    }
+
+    // The local places that share the storage of a place path; `Backend.homes` in cgen.py states the
+    // rules. `Plan` decides the rest on the function with their paths rewritten (`homed`).
+    fn homes(self, &cx: Domain!['k], key: FunKey['k], fun: Fun['k], typed: ArenaMap[(Span['k], Span['k]), Type['k], 'k], plan: Plan['k]) -> ArenaMap[Span['k], Span['k], 'k] {
+        let kinds: ArenaMap[Span['k], Kind, 'k] = ArenaMap::new(&cx);
+        let quantified = self.instance_params.get_or(&cx, key, fun.params);
+        var q = 0usize;
+        while q < quantified.len(&cx) {
+            kinds.insert(&cx, quantified.at(&cx, q).name, quantified.at(&cx, q).kind);
+            q = q + 1usize;
+        }
+        let local_names: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+        var n = 0usize;
+        while n < fun.locals.len(&cx) {
+            local_names.insert(&cx, fun.locals.at(&cx, n).name);
+            n = n + 1usize;
+        }
+        // local -> the one path every whole store into it stores a value lying at, or none
+        let seen: ArenaMap[Span['k], Option[Span['k]], 'k] = ArenaMap::new(&cx);
+        var b = 0usize;
+        while b < fun.blocks.len(&cx) {
+            let block = fun.blocks.at(&cx, b);
+            var i = 0usize;
+            while i < block.instrs.len(&cx) {
+                let instr = block.instrs.at(&cx, i);
+                let a = instr.args;
+                if instr.op.is(&cx, "store") && (seen.contains(&cx, a.at(&cx, 0usize)) || local_names.contains(&cx, a.at(&cx, 0usize))) {
+                    let local = a.at(&cx, 0usize);
+                    let lying = plan.resident.get(&cx, (block.label, a.at(&cx, 1usize)));
+                    let path = match lying {
+                        Option::Some(at) => at,
+                        Option::None => Span::from_static(&cx, ""),
+                    };
+                    let clash = match seen.get(&cx, local) {
+                        Option::Some(known) => match known {
+                            Option::Some(other) => !other.eq(&cx, path),
+                            Option::None => true,
+                        },
+                        Option::None => false,
+                    };
+                    let bad = lying.is_none() || !path.starts_with(&cx, Span::from_static(&cx, "&")) || clash;
+                    if bad {
+                        seen.insert(&cx, local, Option::None);
+                    } else {
+                        seen.insert(&cx, local, plan.resident.get(&cx, (block.label, a.at(&cx, 1usize))));
+                    }
+                }
+                i = i + 1usize;
+            }
+            b = b + 1usize;
+        }
+        let first: ArenaMap[Span['k], Span['k], 'k] = ArenaMap::new(&cx);
+        var s = 0usize;
+        while s < seen.positions(&cx) {
+            match seen.key_at(&cx, s) {
+                Option::Some(local) => match seen.at(&cx, local) {
+                    Option::Some(path) => if !plan.forwarded.contains(&cx, local) && !plan.forwarded.contains(&cx, root(&cx, path))
+                        && !root(&cx, path).eq(&cx, local) {
+                        first.insert(&cx, local, path);
+                    },
+                    Option::None => (),
+                },
+                Option::None => (),
+            };
+            s = s + 1usize;
+        }
+        let found: ArenaMap[Span['k], Span['k], 'k] = ArenaMap::new(&cx);
+        var f = 0usize;
+        while f < first.positions(&cx) {
+            match first.key_at(&cx, f) {
+                Option::Some(local) => {
+                    let path = first.at(&cx, local);
+                    var fits = !first.contains(&cx, root(&cx, path));
+                    var o = 0usize;
+                    while fits && o < first.positions(&cx) {
+                        match first.key_at(&cx, o) {
+                            Option::Some(other) => if !other.eq(&cx, local) && overlap(&cx, path, first.at(&cx, other)) {
+                                fits = false;
+                            },
+                            Option::None => (),
+                        };
+                        o = o + 1usize;
+                    }
+                    let root_type = self.roots.copy(&cx).at(&cx, local);
+                    fits = fits && !self.erased(&cx, root_type);
+                    if fits {
+                        let (_expr, there) = self.place(&cx, path);
+                        fits = same(&cx, erase(&cx, root_type, self.types), erase(&cx, there, self.types));
+                    }
+                    if fits {
+                        found.insert(&cx, local, path);
+                    }
+                },
+                Option::None => (),
+            };
+            f = f + 1usize;
+        }
+        // A local whose contents C reads as a value stays a variable: each whole load of it is moved
+        // back to the path alone, and nothing reads part of it but a lend.
+        var k = 0usize;
+        while k < fun.blocks.len(&cx) {
+            let block = fun.blocks.at(&cx, k);
+            let count = block.instrs.len(&cx);
+            let reads: ArenaMap[Span['k], ArenaVec[usize, 'k], 'k] = ArenaMap::new(&cx);
+            var i = 0usize;
+            while i < count {
+                let args = block.instrs.at(&cx, i).args;
+                var g = 0usize;
+                while g < args.len(&cx) {
+                    match value_read(&cx, args.at(&cx, g)) {
+                        Option::Some(v) => read_at(&cx, reads, v, i),
+                        Option::None => (),
+                    };
+                    g = g + 1usize;
+                }
+                i = i + 1usize;
+            }
+            let ending = term_reads(&cx, block.term);
+            let edges = term_edges(&cx, block.term);
+            var e = 0usize;
+            while e < edges.len(&cx) {
+                let (edge, _skip) = edges.at(&cx, e);
+                ending.append(&cx, edge.args);
+                e = e + 1usize;
+            }
+            var t = 0usize;
+            while t < ending.len(&cx) {
+                read_at(&cx, reads, ending.at(&cx, t), count);
+                t = t + 1usize;
+            }
+            var j = 0usize;
+            while j < count {
+                let instr = block.instrs.at(&cx, j);
+                let a = instr.args;
+                var g = 0usize;
+                while g < a.len(&cx) {
+                    let arg = a.at(&cx, g);
+                    let local = if is_place(&cx, arg) { root(&cx, arg) } else { Span::from_static(&cx, "") };
+                    let call = instr.op.is(&cx, "call") || instr.op.is(&cx, "trait_call");
+                    let skip = !found.contains(&cx, local) || (call || instr.op.is(&cx, "store")) && !arg.eq(&cx, local)
+                        || instr.op.is(&cx, "store") && g == 0usize;
+                    if !skip {
+                        var back = instr.op.is(&cx, "load") && arg.eq(&cx, local) && reads_once(&cx, reads, instr.lhs.at(&cx, 0usize));
+                        if back {
+                            var value = instr.lhs.at(&cx, 0usize);
+                            var at = reads.at(&cx, value).at(&cx, 0usize);
+                            // A value waiting in a forwarded place is read where it is loaded again.
+                            while at < count && block.instrs.at(&cx, at).op.is(&cx, "store") && plan.forwarded.contains(&cx, block.instrs.at(&cx, at).args.at(&cx, 0usize)) {
+                                let waiting = block.instrs.at(&cx, at).args.at(&cx, 0usize);
+                                var again = at + 1usize;
+                                while !(block.instrs.at(&cx, again).op.is(&cx, "load") && block.instrs.at(&cx, again).args.len(&cx) == 1usize
+                                    && block.instrs.at(&cx, again).args.at(&cx, 0usize).eq(&cx, waiting)) {
+                                    again = again + 1usize;
+                                }
+                                value = block.instrs.at(&cx, again).lhs.at(&cx, 0usize);
+                                at = if reads_once(&cx, reads, value) { reads.at(&cx, value).at(&cx, 0usize) } else { count + 1usize };
+                            }
+                            let home = found.at(&cx, local);
+                            back = if at < count {
+                                let user = block.instrs.at(&cx, at);
+                                if user.op.is(&cx, "store") {
+                                    user.args.len(&cx) == 2usize && user.args.at(&cx, 0usize).eq(&cx, home) && user.args.at(&cx, 1usize).eq(&cx, value)
+                                } else if user.op.is(&cx, "construct") && plan.fused.contains(&cx, (block.label, at)) {
+                                    let target = block.instrs.at(&cx, at + 1usize).args.at(&cx, 0usize);
+                                    let parts = match self.labels_of(&cx, self.type_operand(&cx, user)) {
+                                        Option::Some(found_parts) => found_parts,
+                                        Option::None => ArenaVec::new(&cx),
+                                    };
+                                    var hit = false;
+                                    var p = 0usize;
+                                    while !hit && p < user.args.len(&cx) && p < parts.len(&cx) {
+                                        hit = user.args.at(&cx, p).eq(&cx, value) && is_member(&cx, home, target, parts.at(&cx, p));
+                                        p = p + 1usize;
+                                    }
+                                    hit
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+                        }
+                        if !back && !call {
+                            found.remove(&cx, local);
+                        }
+                    }
+                    g = g + 1usize;
+                }
+                j = j + 1usize;
+            }
+            match block.term {
+                Terminator::Switch(scrutinee, _ty, _arms, _pos) => if scrutinee.starts_with(&cx, Span::from_static(&cx, "&")) {
+                    found.remove(&cx, root(&cx, scrutinee));
+                },
+                _ => (),
+            };
+            k = k + 1usize;
+        }
+        let blocks: ArenaMap[Span['k], Block['k], 'k] = ArenaMap::new(&cx);
+        var r = 0usize;
+        while r < fun.blocks.len(&cx) {
+            blocks.insert(&cx, fun.blocks.at(&cx, r).label, fun.blocks.at(&cx, r));
+            r = r + 1usize;
+        }
+        let out: ArenaMap[Span['k], Span['k], 'k] = ArenaMap::new(&cx);
+        if found.is_empty(&cx) {
+            return out;
+        }
+        // block -> the blocks reachable from its successors
+        let reach: ArenaMap[Span['k], ArenaSet[Span['k], 'k], 'k] = ArenaMap::new(&cx);
+        var u = 0usize;
+        while u < fun.blocks.len(&cx) {
+            let block = fun.blocks.at(&cx, u);
+            let reached: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+            let todo: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+            let edges = term_edges(&cx, block.term);
+            var e = 0usize;
+            while e < edges.len(&cx) {
+                let (edge, _skip) = edges.at(&cx, e);
+                todo.push(&cx, edge.target);
+                e = e + 1usize;
+            }
+            while !todo.is_empty(&cx) {
+                let label = todo.at(&cx, todo.len(&cx) - 1usize);
+                let popped = todo.pop(&cx);
+                if reached.insert(&cx, label) {
+                    let next = term_edges(&cx, blocks.at(&cx, label).term);
+                    var x = 0usize;
+                    while x < next.len(&cx) {
+                        let (edge, _skip) = next.at(&cx, x);
+                        todo.push(&cx, edge.target);
+                        x = x + 1usize;
+                    }
+                }
+            }
+            reach.insert(&cx, block.label, reached);
+            u = u + 1usize;
+        }
+        var h = 0usize;
+        while h < found.positions(&cx) {
+            match found.key_at(&cx, h) {
+                Option::Some(local) => {
+                    let path = found.at(&cx, local);
+                    var fits = true;
+                    var w = 0usize;
+                    while w < fun.blocks.len(&cx) {
+                        let block = fun.blocks.at(&cx, w);
+                        // Every local place is empty where the function starts.
+                        let empty: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+                        var z = 0usize;
+                        while z < block.empty.len(&cx) {
+                            empty.insert(&cx, block.empty.at(&cx, z));
+                            z = z + 1usize;
+                        }
+                        if w == 0usize {
+                            var y = 0usize;
+                            while y < fun.locals.len(&cx) {
+                                empty.insert(&cx, fun.locals.at(&cx, y).name);
+                                y = y + 1usize;
+                            }
+                        }
+                        fits = fits && apart(&cx, empty, local, path, block, 0usize, blocks, reach);
+                        var i = 0usize;
+                        while fits && i < block.instrs.len(&cx) {
+                            let instr = block.instrs.at(&cx, i);
+                            let a = instr.args;
+                            if instr.op.is(&cx, "load") && is_place(&cx, a.at(&cx, 0usize)) {
+                                if !self.types.is_copy(&cx, typed.at(&cx, (block.label, instr.lhs.at(&cx, 0usize))), kinds) {
+                                    empty.insert(&cx, a.at(&cx, 0usize));
+                                }
+                            } else if instr.op.is(&cx, "destruct") && a.at(&cx, 0usize).starts_with(&cx, Span::from_static(&cx, "&")) {
+                                let ty = match instr.ty {
+                                    Option::Some(t) => t,
+                                    Option::None => fail_text(&cx, Span::from_static(&cx, "internal error: a destruct without a type")),
+                                };
+                                if !self.types.is_copy(&cx, ty, kinds) {
+                                    empty.insert(&cx, a.at(&cx, 0usize));
+                                }
+                            } else if instr.op.is(&cx, "store") {
+                                let kept: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+                                var m = 0usize;
+                                while m < empty.positions(&cx) {
+                                    match empty.key_at(&cx, m) {
+                                        Option::Some(e) => if overlap(&cx, e, a.at(&cx, 0usize)) {
+                                            kept.push(&cx, e);
+                                        },
+                                        Option::None => (),
+                                    };
+                                    m = m + 1usize;
+                                }
+                                var x = 0usize;
+                                while x < kept.len(&cx) {
+                                    empty.remove(&cx, kept.at(&cx, x));
+                                    x = x + 1usize;
+                                }
+                            }
+                            fits = apart(&cx, empty, local, path, block, i + 1usize, blocks, reach);
+                            i = i + 1usize;
+                        }
+                        w = w + 1usize;
+                    }
+                    if fits {
+                        out.insert(&cx, local, path);
+                    }
+                },
+                Option::None => (),
+            };
+            h = h + 1usize;
+        }
+        out
     }
 
     // The labels of a struct's or tuple's components in a place path; none for other types.
@@ -3097,4 +3432,131 @@ impl Walk['k] {
 forall 'k.
 fn emit_c(&cx: Domain!['k], program: Program['k], typed: ArenaMap[FunKey['k], ArenaMap[(Span['k], Span['k]), Type['k], 'k], 'k], entry: Option[Span['k]], counter: Fresh['k]) -> Buffer! {
     Backend::new(&cx, program, typed, counter).emit_program(&cx, entry)
+}
+
+// Records that instruction `at` (or the terminator, at the block's length) reads `name`.
+forall 'k.
+fn read_at(&cx: Domain!['k], reads: ArenaMap[Span['k], ArenaVec[usize, 'k], 'k], name: Span['k], at: usize) {
+    match reads.get(&cx, name) {
+        Option::Some(found) => found.push(&cx, at),
+        Option::None => {
+            let fresh: ArenaVec[usize, 'k] = ArenaVec::new(&cx);
+            fresh.push(&cx, at);
+            reads.insert(&cx, name, fresh);
+        },
+    };
+}
+
+forall 'k.
+fn reads_once(&cx: Domain!['k], reads: ArenaMap[Span['k], ArenaVec[usize, 'k], 'k], name: Span['k]) -> bool {
+    match reads.get(&cx, name) {
+        Option::Some(found) => found.len(&cx) == 1usize,
+        Option::None => false,
+    }
+}
+
+// An instruction of `block` from `start` on, or its terminator, names a path under `local`.
+forall 'k.
+fn names(&cx: Domain!['k], local: Span['k], block: Block['k], start: usize) -> bool {
+    var i = start;
+    while i < block.instrs.len(&cx) {
+        let args = block.instrs.at(&cx, i).args;
+        var g = 0usize;
+        while g < args.len(&cx) {
+            if is_place(&cx, args.at(&cx, g)) && root(&cx, args.at(&cx, g)).eq(&cx, local) {
+                return true;
+            }
+            g = g + 1usize;
+        }
+        i = i + 1usize;
+    }
+    match block.term {
+        Terminator::Switch(scrutinee, _ty, _arms, _pos) => is_place(&cx, scrutinee) && root(&cx, scrutinee).eq(&cx, local),
+        _ => false,
+    }
+}
+
+// `local` is empty or named no more from instruction `at` of `block` on, or `path` is empty.
+forall 'k.
+fn apart(&cx: Domain!['k], empty: ArenaSet[Span['k], 'k], local: Span['k], path: Span['k], block: Block['k], at: usize,
+    blocks: ArenaMap[Span['k], Block['k], 'k], reach: ArenaMap[Span['k], ArenaSet[Span['k], 'k], 'k]) -> bool {
+    var m = 0usize;
+    while m < empty.positions(&cx) {
+        match empty.key_at(&cx, m) {
+            Option::Some(e) => if prefix(&cx, e, local) || prefix(&cx, e, path) {
+                return true;
+            },
+            Option::None => (),
+        };
+        m = m + 1usize;
+    }
+    if names(&cx, local, block, at) {
+        return false;
+    }
+    let reached = reach.at(&cx, block.label);
+    var r = 0usize;
+    while r < reached.positions(&cx) {
+        match reached.key_at(&cx, r) {
+            Option::Some(label) => if names(&cx, local, blocks.at(&cx, label), 0usize) {
+                return false;
+            },
+            Option::None => (),
+        };
+        r = r + 1usize;
+    }
+    true
+}
+
+// A path, rewritten under the path its local place shares (`homes`).
+forall 'k.
+fn rehome(&cx: Domain!['k], homes: ArenaMap[Span['k], Span['k], 'k], arg: Span['k]) -> Span['k] {
+    if !is_place(&cx, arg) {
+        return arg;
+    }
+    let local = root(&cx, arg);
+    match homes.get(&cx, local) {
+        Option::Some(path) => Buffer::new().push_bytes(&cx, path).push_bytes(&cx, arg.skip(local.len())).save(&cx),
+        Option::None => arg,
+    }
+}
+
+// `fun` with each path under a local place of `homes` rewritten under the path it shares.
+forall 'k.
+fn homed(&cx: Domain!['k], fun: Fun['k], homes: ArenaMap[Span['k], Span['k], 'k]) -> Fun['k] {
+    let blocks: ArenaVec[Block['k], 'k] = ArenaVec::new(&cx);
+    var b = 0usize;
+    while b < fun.blocks.len(&cx) {
+        let block = fun.blocks.at(&cx, b);
+        let instrs: ArenaVec[Instr['k], 'k] = ArenaVec::new(&cx);
+        var i = 0usize;
+        while i < block.instrs.len(&cx) {
+            let instr = block.instrs.at(&cx, i);
+            let args: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+            var g = 0usize;
+            while g < instr.args.len(&cx) {
+                args.push(&cx, rehome(&cx, homes, instr.args.at(&cx, g)));
+                g = g + 1usize;
+            }
+            let { args: _old, ..rest } = instr;
+            instrs.push(&cx, Instr.{ args, ..rest });
+            i = i + 1usize;
+        }
+        let term = match block.term {
+            Terminator::Switch(scrutinee, ty, arms, pos) => Terminator::Switch.(rehome(&cx, homes, scrutinee), ty, arms, pos),
+            _ => block.term,
+        };
+        let { instrs: _instrs, term: _term, ..rest } = block;
+        blocks.push(&cx, Block.{ instrs, term, ..rest });
+        b = b + 1usize;
+    }
+    let locals: ArenaVec[Binding['k], 'k] = ArenaVec::new(&cx);
+    var l = 0usize;
+    while l < fun.locals.len(&cx) {
+        if !homes.contains(&cx, fun.locals.at(&cx, l).name) {
+            locals.push(&cx, fun.locals.at(&cx, l));
+        }
+        l = l + 1usize;
+    }
+    let { blocks: _blocks, locals: _locals, ..rest } = fun;
+    Fun.{ blocks, locals, ..rest }
 }
