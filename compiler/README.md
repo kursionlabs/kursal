@@ -447,8 +447,12 @@ These are the places where Kursal differs from what one might expect.
 
 - **Names.** Keywords cannot be field, method or variable names: `use export module struct tuple
   enum fn extern impl trait instance const forall where as exposed unsafe closure exists foreach of in
-  for while if else match let var return pack sizeof true false self _`. Fields here are named
+  for while if else match let var return pack true false self _`. Fields here are named
   `is_unsafe`, `home`, `quantifier`, `trait_name` and the like instead.
+- **Builtins are imported.** Only the primitive types, `Never`, `Copy` and `Exposed` are always in
+  scope. What else the compiler provides, `core` exports from the module it belongs to, and code
+  imports it like any other name (see the reference compiler's README, "Builtins"):
+  `use std::ptr::NonNull;`, `use std::mem::sizeof;`, `use std::cap::Brand;`.
 - **Method lookup sees what the caller sees.** `x.name()` looks for `name` among the methods of
   `x`'s type, and otherwise among the single-parameter traits visible in the calling module
   (declared there, imported by name or glob, or re-exported to it), and the methods of blanket impls
@@ -483,10 +487,10 @@ These are the places where Kursal differs from what one might expect.
   takes it as its last argument (`ArenaVec[Span['k], 'k]`). A brand is minted by a constructor that
   returns `exists 'k. ...` and is opened by `let exists 'k. cx = Domain::new();`; a trait may take one
   as a parameter (`forall D, 'k. trait Discharge`, `instance Discharge[Checker['k], 'k]`).
-- **`NonNull[T]`** is a builtin type, like `*T` but never null: `NonNull::new(p)` checks and returns
-  an `Option`, `unsafe (p as NonNull[T])` asserts it, `n as *T` (or `n.as_ptr()`) is safe, and `==`
-  compares two. Its niche makes `Option[NonNull[T]]` and `Option[Ref[T, 'k]]` one word (see "Enum
-  layout").
+- **`NonNull[T]`** (`std::ptr::NonNull`) is a builtin type, like `*T` but never null:
+  `NonNull::new(p)` checks and returns an `Option`, `unsafe (p as NonNull[T])` asserts it, `n as *T`
+  (or `n.as_ptr()`) is safe, and `==` compares two. Its niche makes `Option[NonNull[T]]` and
+  `Option[Ref[T, 'k]]` one word (see "Enum layout").
 - **Zero-size types** (`()`, empty structs, brands, capabilities) take no bytes (`sizeof` is 0, see
   "Zero-size types are erased") and have no memory form: no `Ref`, vec or map stores one as a whole
   value. Use `bool` as a placeholder value (`ArenaSet` is an `ArenaMap[K, bool]`).

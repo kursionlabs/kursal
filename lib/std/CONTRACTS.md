@@ -21,7 +21,7 @@ Each function is classified by **signature alone**:
   type mentions a capability (`core::cap::Exclusive`/`Shared`/`SharedJoin`/
   `SharedResume`, or `core::mem::Region`/`RegionResume`);
 - **class B**: not class A, and a raw pointer type (`*T`, or the builtin
-  `NonNull[T]`) occurs anywhere in a parameter type or the return type;
+  `core::ptr::NonNull[T]`) occurs anywhere in a parameter type or the return type;
 - **class C**: neither.
 
 Classification is **never by name.** There is no function visibility: every
@@ -293,8 +293,8 @@ linear key is never lost.
 `NonNull[T]` is a builtin type of the language, not a library struct:
 a pointer like `*T` whose all-zero value is no value of the type. It is
 Copy, as wide as `*T`, and compares with `==`/`!=`; it is not ordered and
-has no fields. Its methods (`new`, `new_unchecked`, `as_ptr`) are declared
-in `core::ptr`. The ways to make one are:
+has no fields. `core::ptr` exports it (`export builtin::NonNull;`) and
+declares its methods (`new`, `new_unchecked`, `as_ptr`). The ways to make one are:
 
 - `NonNull::new(p)`, which checks;
 - an unsafe cast `unsafe (p as NonNull[T])` from a pointer or another

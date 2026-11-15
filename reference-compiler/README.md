@@ -24,6 +24,51 @@ development tools (`pyproject.toml`, `uv.lock`); mypy checks `kursal/`.
 `kurs.py` reads and writes serialized KURS (S-expressions, `sexpr.py`), and `readable.py`
 prints it in the readable notation.
 
+## Builtins
+
+The primitive types, `Never` (also written `!`) and the traits `Copy` and `Exposed` are always in
+scope. Everything else the compiler provides is a builtin, named `builtin::name`, and only package
+`core` writes such a path (anywhere else it is an error, `only package core names builtins`). `core`
+exports each builtin from the module it belongs to, as it would any other name (`export
+builtin::NonNull;`, the `export` form of `use`), and every other package imports it from there:
+`use core::ptr::NonNull;`, `use std::mem::sizeof;` through the standard library, or a path such as
+`core::cap::fresh()`.
+
+| Module | Builtin | |
+|---|---|---|
+| `core::cap` | `Brand['k]` | the witness type of brand `'k`: Copy and zero-size |
+| | `fresh()` | a new brand's witness, `exists 'k. Brand['k]` |
+| | `unsafe static_brand()` | the witness of `'static` |
+| `core::ptr` | `NonNull[T]` | a pointer that is never null; `core::ptr` gives it its methods |
+| | `unsafe load_volatile(p)`, `unsafe store_volatile(p, v)` | volatile access, as `p.load_volatile()` and `p.store_volatile(v)` |
+| `core::mem` | `sizeof[T]()` | the size of `T` in bytes, 0 for a zero-size type |
+| | `unsafe alloca[T]()` | room for a `T` in the calling function's frame |
+| | `enum_variant(&place)`, `enum_variant(value)` | the index of an enum value's variant, beside the value when it is taken by value |
+| `core::atomic` | `unsafe fence(ordering)` | a memory fence |
+
+`sizeof` is a function of one type argument, like `alloca`, not syntax. The operations of a raw
+pointer (`p.load()`, `p.store(v)`, `p.atomic_load(o)`, `p.compare_exchange(...)`, `p.fetch_add(...)`)
+are methods of `*T`, and need no import.
+
+## KURS names
+
+In KURS a bare atom is the IR's own vocabulary, a primitive type or a type parameter; a name with
+`::` is always the program's, fully qualified (`core::mem::Region`).
+
+- **Types**: `struct`, `enum`, `tuple`, `array`, `exists` and `foreach` (whose pattern `(ptr F)`
+  binds the pointee), and `(ptr T)`, `(non_null T)`, `(brand $k)`, `(fn (PTYPE*) RET)`.
+- **Premises**: `(Copy T)` and `(Exposed T)`.
+- **Builtin operations**: `int_cast`, `to_ptr` (a `non_null` as its `ptr`), `cast`, `sizeof`,
+  `alloca`, `fresh` and `static_brand`; through a raw pointer `ptr_load`, `ptr_store`,
+  `ptr_load_volatile` and `ptr_store_volatile`; and the atomics, each with its ordering: one
+  `ptr_atomic_KIND` per atomic method of `*T`, whatever the method's own spelling (`ptr_atomic_load`,
+  `ptr_atomic_store`, `ptr_atomic_swap`, `ptr_atomic_compare_exchange`, `ptr_atomic_fetch_add`,
+  `_sub`, `_and`, `_or`, `_xor`), and `fence`, which takes no pointer.
+- **Unsafety** is marked only by the `(unsafe (= ...))` wrapper of one instruction, or by an unsafe
+  function. The operations that need it are exactly `UNSAFE_OPS` (`core.py`; `kurs::core::is_unsafe_op`):
+  `cast`, `alloca`, `static_brand`, the `ptr_` loads and stores, the atomics and `fence`; a call needs
+  it when its callee is unsafe.
+
 ## A worked example: Counter
 
 [`examples/counter`](examples/counter/lib.kur) is a complete package with no library dependencies. It
