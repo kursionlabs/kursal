@@ -401,60 +401,100 @@ fn push8(&cx: Domain!['k], k: ArenaVec[u32, 'k], a: u32, b: u32, c: u32, d: u32,
     k.push(&cx, h);
 }
 
-// The SHA-256 digest of `data`, in lowercase hex.
+// Byte `i` of `data` padded as SHA-256 pads it to `total` bytes: a 1 bit, zeros, and the length in
+// bits, big-endian, in the last 8 bytes.
+forall 'k.
+fn padded_byte(&cx: Domain!['k], data: Span['k], total: usize, i: usize) -> u32 {
+    let n = data.len();
+    if i < n {
+        data.byte_or_zero(&cx, i) as u32
+    } else if i == n {
+        128u32
+    } else if i + 8usize >= total {
+        ((((n as u64) * 8u64) >> (((total - 1usize - i) * 8usize) as u64)) & 255u64) as u32
+    } else {
+        0u32
+    }
+}
+
+// The big-endian word at byte `i` of the padded message.
+forall 'k.
+fn padded_word(&cx: Domain!['k], data: Span['k], total: usize, i: usize) -> u32 {
+    (padded_byte(&cx, data, total, i) << 24u32) | (padded_byte(&cx, data, total, i + 1usize) << 16u32)
+        | (padded_byte(&cx, data, total, i + 2usize) << 8u32) | padded_byte(&cx, data, total, i + 3usize)
+}
+
+forall 'k.
+fn hex_word(&cx: Domain!['k], out: Buffer!, word: u32) -> Buffer! {
+    hex_byte(&cx, hex_byte(&cx, hex_byte(&cx, hex_byte(&cx, out, (word >> 24u32) as u8), ((word >> 16u32) & 255u32) as u8), ((word >> 8u32) & 255u32) as u8), (word & 255u32) as u8)
+}
+
+// The SHA-256 digest of `data`, in lowercase hex. The message is read in place, padded as it is
+// read, and each block's schedule is a window of its last 16 words, held in locals.
 forall 'k.
 fn sha256_hex(&cx: Domain!['k], data: Span['k]) -> Span['k] {
     let k = round_constants(&cx);
-    let h: ArenaVec[u32, 'k] = ArenaVec::new(&cx);
-    push8(&cx, h, 1779033703u32, 3144134277u32, 1013904242u32, 2773480762u32, 1359893119u32, 2600822924u32, 528734635u32, 1541459225u32);
-    let message: ArenaVec[u8, 'k] = ArenaVec::new(&cx);
-    var b = 0usize;
-    while b < data.len() {
-        message.push(&cx, data.byte_or_zero(&cx, b));
-        b = b + 1usize;
-    }
-    message.push(&cx, 128u8);
-    while message.len(&cx) % 64usize != 56usize {
-        message.push(&cx, 0u8);
-    }
-    let bits = (data.len() as u64) * 8u64;
-    var j = 0u64;
-    while j < 8u64 {
-        message.push(&cx, ((bits >> (56u64 - 8u64 * j)) & 255u64) as u8);
-        j = j + 1u64;
-    }
-    let w: ArenaVec[u32, 'k] = ArenaVec::new(&cx);
+    var h0 = 1779033703u32;
+    var h1 = 3144134277u32;
+    var h2 = 1013904242u32;
+    var h3 = 2773480762u32;
+    var h4 = 1359893119u32;
+    var h5 = 2600822924u32;
+    var h6 = 528734635u32;
+    var h7 = 1541459225u32;
+    let total = (data.len() + 9usize + 63usize) / 64usize * 64usize;
     var chunk = 0usize;
-    while chunk < message.len(&cx) {
-        w.clear(&cx);
-        var t = 0usize;
-        while t < 16usize {
-            let at = chunk + t * 4usize;
-            w.push(&cx, ((message.at(&cx, at) as u32) << 24u32) | ((message.at(&cx, at + 1usize) as u32) << 16u32)
-                | ((message.at(&cx, at + 2usize) as u32) << 8u32) | (message.at(&cx, at + 3usize) as u32));
-            t = t + 1usize;
-        }
-        while t < 64usize {
-            let x = w.at(&cx, t - 15usize);
-            let y = w.at(&cx, t - 2usize);
-            let s0 = rotr(x, 7u32) ^ rotr(x, 18u32) ^ (x >> 3u32);
-            let s1 = rotr(y, 17u32) ^ rotr(y, 19u32) ^ (y >> 10u32);
-            w.push(&cx, w.at(&cx, t - 16usize) + s0 + w.at(&cx, t - 7usize) + s1);
-            t = t + 1usize;
-        }
-        var a = h.at(&cx, 0usize);
-        var b = h.at(&cx, 1usize);
-        var c = h.at(&cx, 2usize);
-        var d = h.at(&cx, 3usize);
-        var e = h.at(&cx, 4usize);
-        var f = h.at(&cx, 5usize);
-        var g = h.at(&cx, 6usize);
-        var hh = h.at(&cx, 7usize);
+    while chunk < total {
+        var w0 = padded_word(&cx, data, total, chunk);
+        var w1 = padded_word(&cx, data, total, chunk + 4usize);
+        var w2 = padded_word(&cx, data, total, chunk + 8usize);
+        var w3 = padded_word(&cx, data, total, chunk + 12usize);
+        var w4 = padded_word(&cx, data, total, chunk + 16usize);
+        var w5 = padded_word(&cx, data, total, chunk + 20usize);
+        var w6 = padded_word(&cx, data, total, chunk + 24usize);
+        var w7 = padded_word(&cx, data, total, chunk + 28usize);
+        var w8 = padded_word(&cx, data, total, chunk + 32usize);
+        var w9 = padded_word(&cx, data, total, chunk + 36usize);
+        var w10 = padded_word(&cx, data, total, chunk + 40usize);
+        var w11 = padded_word(&cx, data, total, chunk + 44usize);
+        var w12 = padded_word(&cx, data, total, chunk + 48usize);
+        var w13 = padded_word(&cx, data, total, chunk + 52usize);
+        var w14 = padded_word(&cx, data, total, chunk + 56usize);
+        var w15 = padded_word(&cx, data, total, chunk + 60usize);
+        var a = h0;
+        var b = h1;
+        var c = h2;
+        var d = h3;
+        var e = h4;
+        var f = h5;
+        var g = h6;
+        var hh = h7;
         var r = 0usize;
         while r < 64usize {
+            // `w0` is the schedule's word `r`; the window moves on by one, taking word `r + 16`.
+            let current = w0;
+            let s0 = rotr(w1, 7u32) ^ rotr(w1, 18u32) ^ (w1 >> 3u32);
+            let s1 = rotr(w14, 17u32) ^ rotr(w14, 19u32) ^ (w14 >> 10u32);
+            let later = w0 + s0 + w9 + s1;
+            w0 = w1;
+            w1 = w2;
+            w2 = w3;
+            w3 = w4;
+            w4 = w5;
+            w5 = w6;
+            w6 = w7;
+            w7 = w8;
+            w8 = w9;
+            w9 = w10;
+            w10 = w11;
+            w11 = w12;
+            w12 = w13;
+            w13 = w14;
+            w14 = w15;
+            w15 = later;
             let big1 = rotr(e, 6u32) ^ rotr(e, 11u32) ^ rotr(e, 25u32);
             let choice = (e & f) ^ ((e ^ 4294967295u32) & g);
-            let t1 = hh + big1 + choice + k.at(&cx, r) + w.at(&cx, r);
+            let t1 = hh + big1 + choice + k.at(&cx, r) + current;
             let big0 = rotr(a, 2u32) ^ rotr(a, 13u32) ^ rotr(a, 22u32);
             let majority = (a & b) ^ (a & c) ^ (b & c);
             let t2 = big0 + majority;
@@ -468,22 +508,16 @@ fn sha256_hex(&cx: Domain!['k], data: Span['k]) -> Span['k] {
             a = t1 + t2;
             r = r + 1usize;
         }
-        h.set(&cx, 0usize, h.at(&cx, 0usize) + a);
-        h.set(&cx, 1usize, h.at(&cx, 1usize) + b);
-        h.set(&cx, 2usize, h.at(&cx, 2usize) + c);
-        h.set(&cx, 3usize, h.at(&cx, 3usize) + d);
-        h.set(&cx, 4usize, h.at(&cx, 4usize) + e);
-        h.set(&cx, 5usize, h.at(&cx, 5usize) + f);
-        h.set(&cx, 6usize, h.at(&cx, 6usize) + g);
-        h.set(&cx, 7usize, h.at(&cx, 7usize) + hh);
+        h0 = h0 + a;
+        h1 = h1 + b;
+        h2 = h2 + c;
+        h3 = h3 + d;
+        h4 = h4 + e;
+        h5 = h5 + f;
+        h6 = h6 + g;
+        h7 = h7 + hh;
         chunk = chunk + 64usize;
     }
-    var out = Buffer::new();
-    var i = 0usize;
-    while i < 8usize {
-        let word = h.at(&cx, i);
-        out = hex_byte(&cx, hex_byte(&cx, hex_byte(&cx, hex_byte(&cx, out, (word >> 24u32) as u8), ((word >> 16u32) & 255u32) as u8), ((word >> 8u32) & 255u32) as u8), (word & 255u32) as u8);
-        i = i + 1usize;
-    }
-    out.save(&cx)
+    let out = hex_word(&cx, hex_word(&cx, hex_word(&cx, hex_word(&cx, Buffer::new(), h0), h1), h2), h3);
+    hex_word(&cx, hex_word(&cx, hex_word(&cx, hex_word(&cx, out, h4), h5), h6), h7).save(&cx)
 }

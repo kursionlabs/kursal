@@ -2,7 +2,7 @@
 // exposure and logical shape.
 
 use package::support::base::fail;
-use std::hash::key_eq;
+use std::hash::{combine, key_eq};
 use std::cmp::Order;
 use std::collections::arena_vec::ArenaVec;
 use std::collections::arena_map::{ArenaMap, ArenaSet};
@@ -786,11 +786,63 @@ fn equal_in(&cx: Domain!['k], a: Type['k], b: Type['k], env: Alpha['k]) -> bool 
             Type::Tuple(ys) => equal_all(&cx, xs, ys, env),
             _ => false,
         },
-        Type::Ptr(_x) => equal_in(&cx, children(&cx, a).at(&cx, 0usize), children(&cx, b).at(&cx, 0usize), env),
-        Type::NonNull(_x) => equal_in(&cx, children(&cx, a).at(&cx, 0usize), children(&cx, b).at(&cx, 0usize), env),
-        Type::Brand(_x) => equal_in(&cx, children(&cx, a).at(&cx, 0usize), children(&cx, b).at(&cx, 0usize), env),
+        Type::Ptr(x) => match b {
+            Type::Ptr(y) => equal_in(&cx, x.copy(&cx), y.copy(&cx), env),
+            _ => false,
+        },
+        Type::NonNull(x) => match b {
+            Type::NonNull(y) => equal_in(&cx, x.copy(&cx), y.copy(&cx), env),
+            _ => false,
+        },
+        Type::Brand(x) => match b {
+            Type::Brand(y) => equal_in(&cx, x.copy(&cx), y.copy(&cx), env),
+            _ => false,
+        },
         _ => C::same(&cx, a, b),
     }
+}
+
+// A hash that `equal` types share: their structure, leaving out every name a binder may rename
+// (a brand, a type without arguments, a binder).
+forall 'k.
+fn alpha_hash(&cx: Domain!['k], t: Type['k]) -> u64 {
+    match t {
+        Type::Prim(x) => combine(1u64, x.hash(&cx)),
+        Type::Named(x, xs) => if xs.is_empty(&cx) { 3u64 } else { alpha_hashes(&cx, combine(3u64, x.hash(&cx)), xs) },
+        Type::Struct(ms) => alpha_members(&cx, 4u64, ms),
+        Type::Enum(ms) => alpha_members(&cx, 5u64, ms),
+        Type::Tuple(xs) => alpha_hashes(&cx, 6u64, xs),
+        Type::Array(x, n) => combine(combine(7u64, alpha_hash(&cx, x.copy(&cx))), n),
+        Type::Ptr(x) => combine(8u64, alpha_hash(&cx, x.copy(&cx))),
+        Type::Brand(x) => combine(10u64, alpha_hash(&cx, x.copy(&cx))),
+        Type::Exists(xs, x) => combine(combine(11u64, xs.len(&cx) as u64), alpha_hash(&cx, x.copy(&cx))),
+        Type::Foreach(f) => combine(combine(12u64, alpha_hash(&cx, f.source.copy(&cx))), alpha_hash(&cx, f.body.copy(&cx))),
+        Type::Fn(f) => combine(alpha_hashes(&cx, 13u64, f.params), alpha_hash(&cx, f.ret.copy(&cx))),
+        Type::NonNull(x) => combine(16u64, alpha_hash(&cx, x.copy(&cx))),
+        _ => type_tag(t) as u64,
+    }
+}
+
+forall 'k.
+fn alpha_hashes(&cx: Domain!['k], h: u64, ts: ArenaVec[Type['k], 'k]) -> u64 {
+    var h = h;
+    var i = 0usize;
+    while i < ts.len(&cx) {
+        h = combine(h, alpha_hash(&cx, ts.at(&cx, i)));
+        i = i + 1usize;
+    }
+    h
+}
+
+forall 'k.
+fn alpha_members(&cx: Domain!['k], h: u64, ms: ArenaVec[Member['k], 'k]) -> u64 {
+    var h = h;
+    var i = 0usize;
+    while i < ms.len(&cx) {
+        h = combine(combine(h, ms.at(&cx, i).name.hash(&cx)), alpha_hash(&cx, ms.at(&cx, i).type));
+        i = i + 1usize;
+    }
+    h
 }
 
 // The parameters have the same kinds, in order.
