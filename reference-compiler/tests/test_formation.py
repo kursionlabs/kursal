@@ -32,7 +32,7 @@ class FormationTests(unittest.TestCase):
 
     def test_copy_arguments_are_checked(self):
         self.rejects("(type Linear! (tuple)) (type Box (forall (T) ((Copy T)) (tuple T))) "
-                     "(type Bad (Box Linear))", "expected Copy")
+                     "(type Bad (Box Linear!))", "expected Copy")
         self.rejects("(type Box (forall (T) ((Copy T)) (tuple T))) "
                      "(type Bad (forall (U) () (Box U)))", "expected Copy")
         check_program(parse_program("(type Box (forall (T) ((Copy T)) (tuple T))) "
@@ -66,7 +66,7 @@ class FormationTests(unittest.TestCase):
         self.rejects("(type Bad (array u32 -1))", "negative array")
         self.rejects("(type Bad _)", "_ is only")
         self.rejects("(type Bad (fn (forall (T) () T (T))))", "function values quantify only brands")
-        p = C.Program(types={"Bad": C.TypeDecl("Bad", False, (), (), C.Fn((), C.UNIT, places=frozenset({0})))})
+        p = C.Program(types={"Bad": C.TypeDecl("Bad", (), (), C.Fn((), C.UNIT, places=frozenset({0})))})
         with self.assertRaisesRegex(KursError, "place index"):
             check_program(p)
 

@@ -154,6 +154,27 @@ class NameTests(unittest.TestCase):
         with self.assertRaises(ResolveError):
             resolve(app("fn f() -> u32 { nothing() }\n"))
 
+    def test_a_linear_type_is_named_with_its_bang(self):
+        lin = {"app/a.kur": "exposed struct L! { x: u32 }\nenum E! { A, B }\nimpl L! { fn new() -> L! { L!.{ x: 0 } } }\n"}
+        r = resolve(app("use package::a::{L!, E! as F!};\nfn f(l: L!) -> L! { let { x } = l; L!::new() }\n"
+                        "fn g(e: F!) -> u32 { match e { F!::A => 0, F!::B => 1 } }\n", lin))
+        self.assertEqual(r.scopes[ModuleId(0, ("a",))].decls["L!"].name, "L!")
+        cases = (
+            ("use package::a::L;\nfn f(l: L) -> u32 { 0 }\n", "unknown or private member L of a; the linear type is L!"),
+            ("use package::a::*;\nfn f(l: L) -> u32 { 0 }\n", "unknown name L; the linear type is L!"),
+            ("use package::a::L!;\nfn f() -> u32 { L::new().x }\n", "unknown name L::new; the linear type is L!"),
+            ("use package::a::E!;\nfn f(e: E!) -> u32 { match e { E::A => 0, _ => 1 } }\n",
+             "unknown name E::A; the linear type is E!"),
+            ("use lib::shapes::Point!;\nfn f(p: Point!) -> u32 { 0 }\n", "unknown or private member Point! of shapes; Point is not a linear type"),
+            ("use lib::shapes::Point;\nfn f(p: Point!) -> u32 { 0 }\n", "unknown name Point!; Point is not a linear type"),
+            ("fn f() -> u32 { nothing!() }\n", "unknown name nothing!$"),
+            ("use package::a::L! as M;\n", "the alias M of L! must end with !"),
+            ("use lib::shapes::Point as Q!;\n", "the alias Q! of Point must not end with !"),
+        )
+        for source, message in cases:
+            with self.subTest(source=source), self.assertRaisesRegex(ResolveError, message):
+                resolve(app(source, lin))
+
     def test_private_module_of_a_dependency(self):
         with self.assertRaises(ResolveError):
             resolve(app("fn f() -> u32 { lib::hidden::secret() }\n"))

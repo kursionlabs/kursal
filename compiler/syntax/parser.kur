@@ -8,8 +8,8 @@ use std::parse::parse_usize;
 use std::collections::arena_vec::ArenaVec;
 use std::mem::Ref;
 use std::raw::Span;
-use std::alloc::arena::Domain;
-use std::bytes::buffer::Buffer;
+use std::alloc::arena::Domain!;
+use std::bytes::buffer::Buffer!;
 use package::syntax::ast as S;
 use package::syntax::ast::{Expr, Pos, Statement, Type};
 use std::slice::Slice;
@@ -144,7 +144,7 @@ impl Lexer['k] {
 
     fn fail_at(self, &cx: Domain!['k], offset: usize) -> ! {
         let (line, col) = self.loc(&cx, offset);
-        fail(&cx, Buffer::new().push_bytes(&cx, self.file).push_static(":").push_u64(line as u64).push_static(":").push_u64(col as u64).push_static(": syntax error").save(&cx))
+        fail(&cx, Buffer!::new().push_bytes(&cx, self.file).push_static(":").push_u64(line as u64).push_static(":").push_u64(col as u64).push_static(": syntax error").save(&cx))
     }
 
     fn run(self, &cx: Domain!['k]) -> ArenaVec[Tok['k], 'k] {
@@ -273,6 +273,11 @@ impl Lexer['k] {
             while i < self.source.len() && is_name_byte(self.byte(&cx, i)) {
                 i = i + 1usize;
             }
+            // A `!` right after a name, unless it starts `!=`, ends the name: `Buffer!`. A keyword never
+            // takes it: `return!x` is `return !x`.
+            if self.byte(&cx, i) == b'!' && self.byte(&cx, i + 1usize) != b'=' && !is_keyword(&cx, self.source.slice(start, i)) {
+                i = i + 1usize;
+            }
             return (Span::from_static(&cx, "NAME"), i);
         }
         (Span::from_static(&cx, "OP"), self.operator(&cx, start))
@@ -398,7 +403,7 @@ impl Lexer['k] {
             return start + 3usize;
         }
         let pairs = Span::from_static(&cx, " .{ .( .. :: -> => == != <= >= << >> || && ");
-        if rest.len() >= 2usize && pairs.contains(&cx, Buffer::new().push_static(" ").push_bytes(&cx, rest.slice(0usize, 2usize)).push_static(" ").save(&cx)) {
+        if rest.len() >= 2usize && pairs.contains(&cx, Buffer!::new().push_static(" ").push_bytes(&cx, rest.slice(0usize, 2usize)).push_static(" ").save(&cx)) {
             return start + 2usize;
         }
         let singles = Span::from_static(&cx, "-+*/%&|^!<>=.,;:()[]{}?");
@@ -419,7 +424,7 @@ impl Lexer['k] {
         var i = self.at(&cx);
         var going = true;
         while going {
-            var chunk = Buffer::new();
+            var chunk = Buffer!::new();
             let begin = i;
             var scanning = true;
             while scanning {
@@ -436,7 +441,7 @@ impl Lexer['k] {
                     i = i + 2usize;
                 } else if ch == b'}' {
                     let (line, col) = self.loc(&cx, begin);
-                    fail(&cx, Buffer::new().push_u64(line as u64).push_static(":").push_u64(col as u64).push_static(": a lone '}' in an f-string").save(&cx));
+                    fail(&cx, Buffer!::new().push_u64(line as u64).push_static(":").push_u64(col as u64).push_static(": a lone '}' in an f-string").save(&cx));
                 } else if ch == b'{' || ch == b'"' {
                     scanning = false;
                 } else {
@@ -571,7 +576,7 @@ impl Parser['k] {
 
     fn fail(self, &cx: Domain!['k]) -> ! {
         let t = self.tok(&cx);
-        fail(&cx, Buffer::new().push_bytes(&cx, self.file).push_static(":").push_u64(t.line as u64).push_static(":").push_u64(t.col as u64).push_static(": syntax error").save(&cx))
+        fail(&cx, Buffer!::new().push_bytes(&cx, self.file).push_static(":").push_u64(t.line as u64).push_static(":").push_u64(t.col as u64).push_static(": syntax error").save(&cx))
     }
 
     fn id(self, &cx: Domain!['k]) -> u32 {
@@ -580,7 +585,17 @@ impl Parser['k] {
         id
     }
 
+    // A name that is not a type's: it never ends with `!`.
     fn name(self, &cx: Domain!['k]) -> Span['k] {
+        let t = self.tok(&cx);
+        if t.kind.is(&cx, "NAME") && t.text.ends_with(&cx, Span::from_static(&cx, "!")) {
+            fail(&cx, Buffer!::new().push_bytes(&cx, self.file).push_static(":").push_u64(t.line as u64).push_static(":").push_u64(t.col as u64).push_static(": only a linear type's name ends with !").save(&cx));
+        }
+        self.expect(&cx, "NAME").text
+    }
+
+    // A segment of a path, which may name a linear type.
+    fn segment(self, &cx: Domain!['k]) -> Span['k] {
         self.expect(&cx, "NAME").text
     }
 
@@ -609,10 +624,10 @@ impl Parser['k] {
     }
 
     fn forall_param(self, &cx: Domain!['k]) -> Span['k] {
-        if !self.at(&cx, "NAME") && !self.at(&cx, "BRAND") {
-            self.fail(&cx);
+        if self.at(&cx, "NAME") {
+            return self.name(&cx);
         }
-        self.next(&cx).text
+        self.expect(&cx, "BRAND").text
     }
 
     fn forall_clause(self, &cx: Domain!['k]) -> S::Forall['k] {
@@ -705,7 +720,7 @@ impl Parser['k] {
     }
 
     fn use_tree(self, &cx: Domain!['k]) -> S::UseTree['k] {
-        let path: ArenaVec[Span['k], 'k] = ArenaVec::one(&cx, self.name(&cx));
+        let path: ArenaVec[Span['k], 'k] = ArenaVec::one(&cx, self.segment(&cx));
         var star = false;
         let children: ArenaVec[S::UseTree['k], 'k] = ArenaVec::new(&cx);
         var going = true;
@@ -733,14 +748,14 @@ impl Parser['k] {
     }
 
     fn use_alias(self, &cx: Domain!['k], path: ArenaVec[Span['k], 'k], star: bool, children: ArenaVec[S::UseTree['k], 'k]) -> S::UseTree['k] {
-        let alias = if self.eat(&cx, "as") { Option::Some.(self.name(&cx)) } else { Option::None };
+        let alias = if self.eat(&cx, "as") { Option::Some.(self.segment(&cx)) } else { Option::None };
         S::UseTree.{ path, star, children, alias }
     }
 
     fn path(self, &cx: Domain!['k]) -> ArenaVec[Span['k], 'k] {
-        let names: ArenaVec[Span['k], 'k] = ArenaVec::one(&cx, self.name(&cx));
+        let names: ArenaVec[Span['k], 'k] = ArenaVec::one(&cx, self.segment(&cx));
         while self.eat(&cx, "::") {
-            names.push(&cx, self.name(&cx));
+            names.push(&cx, self.segment(&cx));
         }
         names
     }
@@ -762,8 +777,7 @@ impl Parser['k] {
             self.fail(&cx);
         }
         let unit = self.next(&cx);
-        let name = self.name(&cx);
-        let linear = self.eat(&cx, "!");
+        let name = self.segment(&cx);
         if kind.is(&cx, "struct") {
             let unit = self.expect(&cx, "{");
             let fields: ArenaVec[S::FieldDecl['k], 'k] = ArenaVec::new(&cx);
@@ -773,17 +787,17 @@ impl Parser['k] {
                 fields.push(&cx, S::FieldDecl.{ name: field_name, type: self.type(&cx) });
                 if !self.eat(&cx, ",") {
                     let unit = self.expect(&cx, "}");
-                    return S::Item::Struct.(S::StructDecl.{ id: self.id(&cx), name, linear, fields, exposure, quantifier, pos: start });
+                    return S::Item::Struct.(S::StructDecl.{ id: self.id(&cx), name, fields, exposure, quantifier, pos: start });
                 }
             }
             let unit = self.expect(&cx, "}");
-            return S::Item::Struct.(S::StructDecl.{ id: self.id(&cx), name, linear, fields, exposure, quantifier, pos: start });
+            return S::Item::Struct.(S::StructDecl.{ id: self.id(&cx), name, fields, exposure, quantifier, pos: start });
         }
         if kind.is(&cx, "tuple") {
             let unit = self.expect(&cx, "(");
             let elems = self.types_until_close(&cx);
             let unit = self.expect(&cx, ";");
-            return S::Item::Tuple.(S::TupleDecl.{ id: self.id(&cx), name, linear, elems, exposure, quantifier, pos: start });
+            return S::Item::Tuple.(S::TupleDecl.{ id: self.id(&cx), name, elems, exposure, quantifier, pos: start });
         }
         let unit = self.expect(&cx, "{");
         let variants: ArenaVec[S::Variant['k], 'k] = ArenaVec::new(&cx);
@@ -791,11 +805,11 @@ impl Parser['k] {
             variants.push(&cx, self.variant(&cx));
             if !self.eat(&cx, ",") {
                 let unit = self.expect(&cx, "}");
-                return S::Item::Enum.(S::EnumDecl.{ id: self.id(&cx), name, linear, variants, exposure, quantifier, pos: start });
+                return S::Item::Enum.(S::EnumDecl.{ id: self.id(&cx), name, variants, exposure, quantifier, pos: start });
             }
         }
         let unit = self.expect(&cx, "}");
-        S::Item::Enum.(S::EnumDecl.{ id: self.id(&cx), name, linear, variants, exposure, quantifier, pos: start })
+        S::Item::Enum.(S::EnumDecl.{ id: self.id(&cx), name, variants, exposure, quantifier, pos: start })
     }
 
     // `type ("," type)* ","? ")"`, possibly empty; the `(` was read.
@@ -1021,10 +1035,9 @@ impl Parser['k] {
         var going = true;
         while going && !self.at(&cx, ")") {
             if self.eat(&cx, "&") {
-                if !self.at(&cx, "NAME") && !self.at(&cx, "_") {
-                    self.fail(&cx);
+                if !self.eat(&cx, "_") {
+                    let unit = self.name(&cx);
                 }
-                let unit = self.next(&cx);
                 let unit = self.expect(&cx, ":");
                 out.push(&cx, S::Slot.{ lend: true, type: self.type(&cx) });
             } else {
@@ -1038,13 +1051,12 @@ impl Parser['k] {
 
     fn named_type(self, &cx: Domain!['k]) -> S::TName['k] {
         let path = self.path(&cx);
-        let linear = self.eat(&cx, "!");
         if self.eat(&cx, "[") {
             let args = self.type_args(&cx);
             let unit = self.expect(&cx, "]");
-            S::TName.{ id: self.id(&cx), path, linear, args: args.args, determined: args.determined }
+            S::TName.{ id: self.id(&cx), path, args: args.args, determined: args.determined }
         } else {
-            S::TName.{ id: self.id(&cx), path, linear, args: ArenaVec::new(&cx), determined: 0usize }
+            S::TName.{ id: self.id(&cx), path, args: ArenaVec::new(&cx), determined: 0usize }
         }
     }
 
@@ -1197,7 +1209,7 @@ impl Parser['k] {
         let k = self.k(&cx);
         let start = self.pos(&cx);
         if k.is(&cx, "NAME") {
-            return S::Pattern::Bind.(S::Node.{ id: self.id(&cx), value: self.next(&cx).text, pos: start });
+            return S::Pattern::Bind.(S::Node.{ id: self.id(&cx), value: self.name(&cx), pos: start });
         }
         if k.is(&cx, "_") {
             let unit = self.next(&cx);
@@ -1396,10 +1408,7 @@ impl Parser['k] {
             let names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
             var going = true;
             while going && !self.at(&cx, ")") {
-                if !self.at(&cx, "NAME") && !self.at(&cx, "_") {
-                    self.fail(&cx);
-                }
-                names.push(&cx, self.next(&cx).text);
+                names.push(&cx, if self.at(&cx, "_") { self.next(&cx).text } else { self.name(&cx) });
                 going = self.eat(&cx, ",");
             }
             let unit = self.expect(&cx, ")");
@@ -1648,7 +1657,6 @@ impl Parser['k] {
                 self.fail(&cx);
             }
             let name = self.next(&cx).text;
-            let linear = self.eat(&cx, "!");
             let args = if self.eat(&cx, "[") {
                 let parsed = self.type_args(&cx);
                 let unit = self.expect(&cx, "]");
@@ -1656,7 +1664,7 @@ impl Parser['k] {
             } else {
                 ArenaVec::new(&cx)
             };
-            segments.push(&cx, S::Segment.{ name, linear, args });
+            segments.push(&cx, S::Segment.{ name, args });
             going = self.eat(&cx, "::");
         }
         S::Path.{ id: self.id(&cx), segments, pos: start }
@@ -1675,7 +1683,7 @@ impl Parser['k] {
             let (digits, suffix) = split_int_suffix(&cx, word);
             let (value, ok) = int_value(&cx, digits);
             if !ok {
-                fail(&cx, Buffer::new().push_bytes(&cx, self.file).push_static(":").push_u64(tok.line as u64).push_static(":").push_u64(tok.col as u64).push_static(": integer literal out of range").save(&cx));
+                fail(&cx, Buffer!::new().push_bytes(&cx, self.file).push_static(":").push_u64(tok.line as u64).push_static(":").push_u64(tok.col as u64).push_static(": integer literal out of range").save(&cx));
             }
             return S::Lit.{ id, kind: S::LitKind::Int, int: value, negative: false, text: word, suffix, pos: p };
         }
@@ -1702,7 +1710,7 @@ impl Parser['k] {
 forall 'k.
 fn assignable(&cx: Domain!['k], e: Expr['k]) -> bool {
     match e {
-        Expr::Path(p) => p.segments.len(&cx) == 1usize && !p.segments.at(&cx, 0usize).linear && p.segments.at(&cx, 0usize).args.is_empty(&cx),
+        Expr::Path(p) => p.segments.len(&cx) == 1usize && p.segments.at(&cx, 0usize).args.is_empty(&cx),
         Expr::Field(f) => assignable(&cx, f.value.copy(&cx)),
         Expr::Index(i) => assignable(&cx, i.value.copy(&cx)),
         _ => false,
@@ -1728,7 +1736,7 @@ fn split_int_suffix(&cx: Domain!['k], word: Span['k]) -> (Span['k], Option[Span[
 
 forall 'k.
 fn without_underscores(&cx: Domain!['k], word: Span['k]) -> Span['k] {
-    var out = Buffer::new();
+    var out = Buffer!::new();
     var i = 0usize;
     while i < word.len() {
         if word.byte_or_zero(&cx, i) != b'_' {
@@ -1764,12 +1772,12 @@ fn int_value(&cx: Domain!['k], word: Span['k]) -> (u64, bool) {
 // The bytes `\n`, `\t`, `\r`, `\0`, `\\`, `\'`, `\"` and `\xHH` stand for.
 forall 'k.
 fn unescape(&cx: Domain!['k], raw: Span['k]) -> Span['k] {
-    var out = Buffer::new();
+    var out = Buffer!::new();
     var i = 0usize;
     while i < raw.len() {
         let b = raw.byte_or_zero(&cx, i);
         if b == b'\\' && raw.byte_or_zero(&cx, i + 1usize) == b'x' {
-            let (value, ok) = int_value(&cx, Buffer::new().push_static("0x").push_bytes(&cx, raw.slice(i + 2usize, i + 4usize)).save(&cx));
+            let (value, ok) = int_value(&cx, Buffer!::new().push_static("0x").push_bytes(&cx, raw.slice(i + 2usize, i + 4usize)).save(&cx));
             out = out.push_byte(value as u8);
             i = i + 4usize;
         } else if b == b'\\' {
@@ -1785,7 +1793,7 @@ fn unescape(&cx: Domain!['k], raw: Span['k]) -> Span['k] {
             } else if c == b'\\' || c == b'\'' || c == b'"' {
                 c
             } else {
-                fail(&cx, Buffer::new().push_static("unknown escape \\").push_bytes(&cx, raw.slice(i + 1usize, i + 2usize)).save(&cx))
+                fail(&cx, Buffer!::new().push_static("unknown escape \\").push_bytes(&cx, raw.slice(i + 1usize, i + 2usize)).save(&cx))
             };
             out = out.push_byte(byte);
             i = i + 2usize;

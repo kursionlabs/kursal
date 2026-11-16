@@ -59,7 +59,7 @@ class ClosureBoundaryTests(unittest.TestCase):
     def test_linear_environment_consumed_once(self):
         prefix = '''exposed struct Token! { n: u32 }
         fn main() -> i32 {
-            let token = Token.{ n: 7u32 };
+            let token = Token!.{ n: 7u32 };
             let once = |x: u32| { let { n } = token; n + x };
         '''
         self.run_source(prefix + '(once(2) as i32) }', 9)

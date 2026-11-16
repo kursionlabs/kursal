@@ -45,20 +45,20 @@ class EnumVariantTests(unittest.TestCase):
     def test_owned_linear_enum_returns_value_and_tag(self):
         self.run_source('''exposed enum E! { A, B(u32) }
             fn main() -> i32 {
-                let (value, tag) = core::mem::enum_variant(E::B.(6u32));
-                match value { E::A => 0i32, E::B(n) => (n + tag) as i32 }
+                let (value, tag) = core::mem::enum_variant(E!::B.(6u32));
+                match value { E!::A => 0i32, E!::B(n) => (n + tag) as i32 }
             }''', 7)
 
     def test_returned_linear_enum_cannot_be_discarded(self):
         with self.assertRaisesRegex(LowerError, 'linear'):
             self.run_source('''exposed enum E! { A }
-                fn main() -> i32 { core::mem::enum_variant(E::A); 7i32 }''', 7)
+                fn main() -> i32 { core::mem::enum_variant(E!::A); 7i32 }''', 7)
 
     def test_opaque_enum_tag_observation_requires_exposure(self):
         with tempfile.TemporaryDirectory(prefix='kursal-enum-visibility-') as base:
             directory = Path(base)
             write(directory, {
-                'hidden.kur': 'enum E! { A, B } fn make() -> E { E::B } fn consume(x: E) -> () { match x { E::A => (), E::B => () } }',
+                'hidden.kur': 'enum E! { A, B } fn make() -> E! { E!::B } fn consume(x: E!) -> () { match x { E!::A => (), E!::B => () } }',
                 'lib.kur': '''use package::hidden::{make, consume};
                     fn main() -> i32 {
                         let value = make();
@@ -75,41 +75,41 @@ class EnumVariantTests(unittest.TestCase):
     def test_lent_linear_enum_remains_available(self):
         self.run_source('''exposed enum E! { A, B(u32) }
             fn main() -> i32 {
-                let value = E::B.(5u32);
+                let value = E!::B.(5u32);
                 let a = core::mem::enum_variant(&value);
                 let b = core::mem::enum_variant(&value);
-                match value { E::A => 0i32, E::B(n) => (n + a + b) as i32 }
+                match value { E!::A => 0i32, E!::B(n) => (n + a + b) as i32 }
             }''', 7)
 
     def test_tag_of_moved_linear_place_is_rejected(self):
         with self.assertRaises(OwnershipError):
             self.run_source('''exposed enum E! { A }
                 fn main() -> i32 {
-                    let value = E::A;
+                    let value = E!::A;
                     let moved = value;
                     let tag = core::mem::enum_variant(&value);
-                    match moved { E::A => tag as i32 }
+                    match moved { E!::A => tag as i32 }
                 }''', 0)
 
     def test_deferred_closure_operand_inference(self):
         self.run_source('''exposed enum E! { A, B(u32) }
             fn main() -> i32 {
                 let f = |x| core::mem::enum_variant(x);
-                let (value, tag) = f(E::B.(6u32));
-                match value { E::A => 0i32, E::B(n) => (n + tag) as i32 }
+                let (value, tag) = f(E!::B.(6u32));
+                match value { E!::A => 0i32, E!::B(n) => (n + tag) as i32 }
             }''', 7)
 
     def test_tag_is_not_readable_while_payload_is_moved(self):
         with self.assertRaisesRegex(KursError, 'readable_tag'):
             self.run_source('''exposed struct Token! { n: u32 }
-            exposed enum E! { B(Token) }
+            exposed enum E! { B(Token!) }
             fn main() -> i32 {
-                let value = E::B.(Token.{ n: 7u32 });
-                let tag = match &value { E::B(payload) => {
+                let value = E!::B.(Token!.{ n: 7u32 });
+                let tag = match &value { E!::B(payload) => {
                     let moved = payload;
                     let tag = core::mem::enum_variant(&value);
                     payload = moved;
                     tag
                 } };
-                match value { E::B(token) => { let { n } = token; (n + tag) as i32 } }
+                match value { E!::B(token) => { let { n } = token; (n + tag) as i32 } }
             }''', 7)

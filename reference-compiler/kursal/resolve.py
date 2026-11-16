@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 import tomllib
-from collections.abc import Iterator, Sequence, Set
+from collections.abc import Callable, Iterator, Sequence, Set
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Literal, Never, cast, Optional
@@ -278,6 +278,8 @@ class Resolver:
                 self.use(scope, path, child, export)
         else:
             name = alias or path[-1]
+            if alias and alias.endswith("!") != path[-1].endswith("!"):
+                fail(f"the alias {alias} of {path[-1]} must {'' if path[-1].endswith('!') else 'not '}end with !")
             if export and path == (name,):  # `export name;` publishes an existing name
                 scope.exports.add(name)
                 return
@@ -358,7 +360,10 @@ class Resolver:
         self.cache[key] = value
         return value
 
-    def resolve_path(self, module: ModuleId, path: S.NamePath, importing: Optional[str] = None) -> Target:
+    def resolve_path(self, module: ModuleId, path: S.NamePath, importing: Optional[str] = None,
+                     hint: bool = True) -> Target:
+        """What `path` names from `module`; with `hint`, a first name that names nothing is reported with
+        what its other spelling names (`respelled`)."""
         first, rest = path[0], path[1:]
         scope = self.scopes[module]
         target: Optional[Target]
@@ -373,7 +378,8 @@ class Resolver:
         else:
             target = self.root_member(module, first) or self.glob(module, first)
             if target is None:
-                fail(f"unknown name {'::'.join(path)}")
+                respelled = self.respelled(first, lambda other: self.resolve_path(module, (other,), hint=False)) if hint else ""
+                fail(f"unknown name {'::'.join(path)}{respelled}")
         for k, name in enumerate(rest):
             if isinstance(target, Decl):
                 return self.associated(target, "::".join(rest[k:]))
@@ -423,14 +429,15 @@ class Resolver:
             if not isinstance(source, ModuleId):
                 fail(f"{'::'.join(path)} is not a module")
             try:
-                return self.member(module, source, name)
+                return self.member(module, source, name, hint=False)
             except ResolveError:
                 continue
         return None
 
-    def member(self, caller: ModuleId, module: ModuleId, name: str) -> Target:
+    def member(self, caller: ModuleId, module: ModuleId, name: str, hint: bool = True) -> Target:
         """`module::name`, seen from `caller`: its own declarations; within one
-        package also its children and imports; across packages only exports."""
+        package also its children and imports; across packages only exports. With `hint`, as
+        `resolve_path`."""
         scope = self.scopes.get(module)
         if scope and name in scope.decls:
             return scope.decls[name]
@@ -445,7 +452,20 @@ class Resolver:
                     return found
         elif scope and name in scope.exports:
             return self.solve(("export", module, name))
-        fail(f"unknown or private member {name} of {'::'.join(module.path) or self.packages[module.package].name}")
+        respelled = self.respelled(name, lambda other: self.member(caller, module, other, hint=False)) if hint else ""
+        fail(f"unknown or private member {name} of {'::'.join(module.path) or self.packages[module.package].name}"
+             f"{respelled}")
+
+    @staticmethod
+    def respelled(name: str, find: Callable[[str], Target]) -> str:
+        """For a name that names nothing: what its other spelling, with or without the `!` of a linear
+        type, names, when it names something."""
+        other = name.removesuffix("!") if name.endswith("!") else name + "!"
+        try:
+            find(other)
+        except ResolveError:
+            return ""
+        return f"; the linear type is {other}" if other.endswith("!") else f"; {other} is not a linear type"
 
     def associated(self, owner: Decl, name: str) -> Decl | S.VariantRef | S.TraitMethodRef:
         """`Owner::name`: an enum variant, or a method or const attached to `Owner`."""
@@ -693,7 +713,7 @@ class Names:
         return values
 
     def segment_args(self, path: S.Path, types: Set[str]) -> None:
-        for _, _, args in path.segments:
+        for _, args in path.segments:
             for a in args:
                 self.type(a, types)
 

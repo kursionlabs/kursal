@@ -29,7 +29,7 @@ SCAN = re.compile(r"""
  |(?P<FLOAT>[0-9][0-9_]*\.[0-9][0-9_]*(?:f32|f64)?|[0-9][0-9_]*(?:f32|f64))
  |(?P<INT>(?:0x[0-9a-fA-F_]+|0o[0-7_]+|0b[01_]+|[0-9][0-9_]*)(?:i8|i16|i32|i64|isize|u8|u16|u32|u64|usize)?)
  |(?P<TUPLE_INDEX>\.[0-9]+)
- |(?P<NAME>[^\W\d]\w*)
+ |(?P<NAME>[^\W\d]\w*(?:!(?!=))?)
  |(?P<OP>\.\.=|\.\{|\.\(|\.\.|::|->|=>|==|!=|<=|>=|<<|>>|\|\||&&|[-+*/%&|^!<>=.,;:()\[\]{}?])
 """, re.VERBOSE)
 
@@ -93,7 +93,9 @@ class Lexer:
                 out.append(self.tok(kind, word, start, self.i))
                 self.fstring(out)
                 continue
-            if kind == "NAME" and word in KEYWORDS:
+            if kind == "NAME" and word.removesuffix("!") in KEYWORDS:
+                if word.endswith("!"):             # a keyword never takes the `!`: `return!x` is `return !x`
+                    word, self.i = word[:-1], self.i - 1
                 kind = word
             elif kind == "OP":
                 kind = word
@@ -198,6 +200,14 @@ class Parser:
         return out
 
     def name(self) -> str:
+        """A name that is not a type's: it never ends with `!`."""
+        if self.k == "NAME" and self.t[self.i].text.endswith("!"):
+            t = self.t[self.i]
+            raise KursError(f"{self.filename}:{t.line}:{t.col}: only a linear type's name ends with !")
+        return self.expect("NAME").text
+
+    def segment(self) -> str:
+        """A segment of a path, which may name a linear type."""
         return self.expect("NAME").text
 
     # ---- items
@@ -223,9 +233,9 @@ class Parser:
         return tuple(brands)
 
     def forall_param(self) -> str:
-        if self.k not in ("NAME", "BRAND"):
-            self.fail()
-        return self.next().text
+        if self.k == "NAME":
+            return self.name()
+        return self.expect("BRAND").text
 
     def forall(self) -> S.Forall:
         self.expect("forall")
@@ -293,7 +303,7 @@ class Parser:
         self.fail()
 
     def use_tree(self) -> S.UseTree:
-        names, star = [self.name()], False
+        names, star = [self.segment()], False
         children: tuple[S.UseTree, ...] = ()
         alias: Optional[str] = None
         while self.eat("::"):
@@ -308,13 +318,13 @@ class Parser:
             else:
                 self.fail()
         if self.eat("as"):
-            alias = self.name()
+            alias = self.segment()
         return (tuple(names), star, children, alias)
 
     def path(self) -> S.NamePath:
-        names = [self.name()]
+        names = [self.segment()]
         while self.eat("::"):
-            names.append(self.name())
+            names.append(self.segment())
         return tuple(names)
 
     def aggregate(self) -> S.Struct | S.TupleDecl | S.EnumDecl:
@@ -329,19 +339,18 @@ class Parser:
         if kind not in ("struct", "tuple", "enum"):
             self.fail()
         self.next()
-        name = self.name()
-        linear = bool(self.eat("!"))
+        name = self.segment()
         if kind == "struct":
             self.expect("{")
             fields = self.list_until("}", self.field)
-            return S.Struct(name, linear, tuple(fields), exposed, None, start)
+            return S.Struct(name, tuple(fields), exposed, None, start)
         if kind == "tuple":
             self.expect("(")
             elems = self.list_until(")", self.type)
             self.expect(";")
-            return S.TupleDecl(name, linear, tuple(elems), exposed, None, start)
+            return S.TupleDecl(name, tuple(elems), exposed, None, start)
         self.expect("{")
-        return S.EnumDecl(name, linear, tuple(self.list_until("}", self.variant)), exposed, None, start)
+        return S.EnumDecl(name, tuple(self.list_until("}", self.variant)), exposed, None, start)
 
     def field(self) -> tuple[str, S.Type]:
         name = self.name()
@@ -513,21 +522,19 @@ class Parser:
 
     def fn_param(self) -> tuple[bool, S.Type]:
         if self.eat("&"):
-            if self.k not in ("NAME", "_"):
-                self.fail()
-            self.next()
+            if not self.eat("_"):
+                self.name()
             self.expect(":")
             return (True, self.type())
         return (False, self.ptype())
 
     def named_type(self) -> S.TName:
         path = self.path()
-        linear = bool(self.eat("!"))
         args = S.TypeArgs((), 0)
         if self.eat("["):
             args = self.type_args()
             self.expect("]")
-        return S.TName(path, linear, args.args, args.determined)
+        return S.TName(path, args.args, args.determined)
 
     def type_arg(self) -> S.Type:
         if self.k == "BRAND":
@@ -629,7 +636,7 @@ class Parser:
     def pattern(self) -> S.Pattern:
         k = self.k
         if k == "NAME":
-            return S.PBind(self.next().text)
+            return S.PBind(self.name())
         if k == "_":
             self.next()
             return S.PWild()
@@ -772,9 +779,9 @@ class Parser:
         return S.Case("variant", path, tuple(binders) if binders else None, pos=start)
 
     def binder(self) -> str:
-        if self.k not in ("NAME", "_"):
-            self.fail()
-        return self.next().text
+        if self.k == "_":
+            return self.next().text
+        return self.name()
 
     def lit_value(self) -> S.Lit:
         negative = bool(self.eat("-"))
@@ -911,11 +918,10 @@ class Parser:
                 self.fail()
             name = self.next().text
             args: tuple[S.Type, ...] = ()
-            linear = bool(self.eat("!"))
             if self.eat("["):
                 args = self.type_args().args
                 self.expect("]")
-            segments.append((name, linear, args))
+            segments.append((name, args))
             if not self.eat("::"):
                 return S.Path(tuple(segments), start)
 
@@ -945,7 +951,7 @@ class Parser:
 def assignable(e: S.Expr) -> bool:
     """The left side of `=`: a name, then fields and tuple elements (`x`, `self.n`, `(p.0).1`)."""
     if isinstance(e, S.Path):
-        return len(e.segments) == 1 and not e.segments[0][1] and not e.segments[0][2]
+        return len(e.segments) == 1 and not e.segments[0][1]
     return isinstance(e, (S.Field, S.Index)) and assignable(e.value)
 
 

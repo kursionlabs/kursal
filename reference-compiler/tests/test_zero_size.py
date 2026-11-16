@@ -104,10 +104,10 @@ class ZeroSizeTests(unittest.TestCase):
             directory = Path(base)
             (directory / "kur.toml").write_text(f'[package]\nname="p"\nsource_root="."\nkind="executable"\n'
                                                 f'entry="main"\n[dependencies.std]\npath="{LIB / "std"}"\n')
-            (directory / "lib.kur").write_text('''use std::alloc::arena::Domain;
+            (directory / "lib.kur").write_text('''use std::alloc::arena::Domain!;
 use std::mem::Ref;
 fn main() -> i32 {
-    let exists 'a. cx = Domain::new();
+    let exists 'a. cx = Domain!::new();
     let r = Ref::new(&cx, ());
     cx.destroy();
     0

@@ -22,16 +22,16 @@ class ValueFormationTests(unittest.TestCase):
         with self.assertRaisesRegex(SigError, 'Copy'):
             self.run_source('''exposed struct Token! {}
                 forall T where Copy[T]. exposed struct Box { value: T }
-                fn bad(x: Box[Token]) -> () { () }
+                fn bad(x: Box[Token!]) -> () { () }
                 fn main() -> i32 { 7i32 }''', 7)
 
     def test_inferred_copy_constraints(self):
-        for expression in ('consume(token)', 'let f = consume[Token]; f(token)', 'let b = Box.{ value: token }; ()'):
+        for expression in ('consume(token)', 'let f = consume[Token!]; f(token)', 'let b = Box.{ value: token }; ()'):
             with self.subTest(expression=expression), self.assertRaisesRegex(InferError, 'Copy'):
                 self.run_source('''exposed struct Token! {}
                     forall T where Copy[T]. fn consume(x: T) -> () { () }
                     forall T where Copy[T]. exposed struct Box { value: T }
-                    fn main() -> i32 { let token = Token.{}; ''' + expression + '; 7i32 }', 7)
+                    fn main() -> i32 { let token = Token!.{}; ''' + expression + '; 7i32 }', 7)
 
     def test_copy_constraints_wait_for_later_inference(self):
         self.run_source('''forall T where Copy[T]. fn twice(x: T) -> (T, T) { (x, x) }
@@ -52,7 +52,7 @@ class ValueFormationTests(unittest.TestCase):
                 x.value.value.n
             }''', 7)
         with self.assertRaisesRegex(SigError, 'Copy'):
-            self.run_source('''exposed struct First { value: Box[Later] }
+            self.run_source('''exposed struct First { value: Box[Later!] }
                 forall T where Copy[T]. exposed struct Box { value: T }
                 exposed struct Later! {}
                 fn main() -> i32 { 7i32 }''', 7)
@@ -61,10 +61,10 @@ class ValueFormationTests(unittest.TestCase):
         with self.assertRaisesRegex(InferError, 'Copy'):
             self.run_source('''exposed struct Token! {}
                 forall T where Copy[T]. trait Take { fn take(x: T) -> (); }
-                fn main() -> i32 { Take::take(Token.{}); 7i32 }''', 7)
+                fn main() -> i32 { Take::take(Token!.{}); 7i32 }''', 7)
 
     def test_copy_nominal_annotation_in_function_body(self):
         with self.assertRaisesRegex(SigError, 'Copy'):
             self.run_source('''exposed struct Token! {}
                 forall T where Copy[T]. exposed struct Box { value: T }
-                fn main() -> i32 { let x: Box[Token] = Box.{ value: Token.{} }; 7i32 }''', 7)
+                fn main() -> i32 { let x: Box[Token!] = Box.{ value: Token!.{} }; 7i32 }''', 7)

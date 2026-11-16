@@ -128,16 +128,16 @@ fn main() -> i32 {
 """},
     "aggregates": {"lib.kur": """
 exposed struct Token! { count: u32, id: u32, tag: u32 }
-fn bump(t: Token) -> Token {
+fn bump(t: Token!) -> Token! {
     let { count, ..rest } = t;
-    Token.{ count: count + 1, ..rest }
+    Token!.{ count: count + 1, ..rest }
 }
 fn swap(p: (u32, u32)) -> (u32, u32) { let (a, b) = p; (b, a) }
 forall T. fn first(p: (T, u32)) -> T { let (a, b) = p; a }
 exposed struct Pt { x: u32, y: u32 }
 exposed struct Line { a: Pt, b: Pt }
 fn main() -> i32 {
-    let t = bump(bump(Token.{ count: 1, id: 5, tag: 7 }));
+    let t = bump(bump(Token!.{ count: 1, id: 5, tag: 7 }));
     let { count, id, tag } = t;
     let (x, y) = swap((count, id));
     let pair = ((1u32, 2u32), (3u32, 4u32));
@@ -226,22 +226,22 @@ fn main() -> i32 {
     "linear_places": {"lib.kur": """
 exposed struct Box! { v: u32, n: u32 }
 exposed struct Pool! { free: u32, used: u32 }
-impl Pool {
+impl Pool! {
     fn take(&self) -> u32 {
         let { free, used } = self;
-        self = Pool.{ free: free - 1, used: used + 1 };
+        self = Pool!.{ free: free - 1, used: used + 1 };
         free
     }
     fn size(&self) -> u32 {
         let { free, used } = self;
-        self = Pool.{ free, used };
+        self = Pool!.{ free, used };
         free + used
     }
 }
-fn open(&b: Box) -> u32 { let { v, n } = b; b = Box.{ v: v + 1, n }; v + n }
+fn open(&b: Box!) -> u32 { let { v, n } = b; b = Box!.{ v: v + 1, n }; v + n }
 fn main() -> i32 {
-    var p = Pool.{ free: 10, used: 0 };
-    var b = Box.{ v: 4, n: 5 };
+    var p = Pool!.{ free: 10, used: 0 };
+    var b = Box!.{ v: 4, n: 5 };
     var i = 0u32;
     var sum = 0u32;
     while i < 4 {
@@ -280,7 +280,7 @@ fn main() -> i32 {
 forall 'k. exposed struct Tag! { marker: core::cap::Brand['k] }
 fn mint() -> exists 'r. Tag!['r] {
     let exists 'a. w: core::cap::Brand['a] = core::cap::fresh();
-    pack 'a. Tag.{ marker: w }
+    pack 'a. Tag!.{ marker: w }
 }
 forall 'k. fn read(t: Tag!['k]) -> (Tag!['k], u32) { (t, 5) }
 fn use_tag(p: exists 'r. Tag!['r]) -> u32 {
@@ -305,18 +305,18 @@ fn main() -> i32 {
 """},
     "lend_order": {"lib.kur": """
 exposed struct Tag! { id: u32 }
-exposed struct Ctx! { tag: Tag, count: u32, extra: u32 }
-fn bump(&t: Tag) -> u32 { let { id } = t; t = Tag.{ id: id + 1 }; id }
-fn run(&ctx: Ctx) -> u32 {
+exposed struct Ctx! { tag: Tag!, count: u32, extra: u32 }
+fn bump(&t: Tag!) -> u32 { let { id } = t; t = Tag!.{ id: id + 1 }; id }
+fn run(&ctx: Ctx!) -> u32 {
     let { tag, ..rest } = ctx;
     let count = bump(&tag);
-    ctx = Ctx.{ tag, count, ..rest };
+    ctx = Ctx!.{ tag, count, ..rest };
     let { tag, count, extra } = ctx;
-    ctx = Ctx.{ tag, count: count + 1, extra };
+    ctx = Ctx!.{ tag, count: count + 1, extra };
     count
 }
 fn main() -> i32 {
-    var c = Ctx.{ tag: Tag.{ id: 7 }, count: 0, extra: 9 };
+    var c = Ctx!.{ tag: Tag!.{ id: 7 }, count: 0, extra: 9 };
     let a = run(&c);
     let b = run(&c);
     let { tag, count, extra } = c;
@@ -342,7 +342,7 @@ fn main() -> i32 {
     let a = twice(|x| x * 2 + k, 3);
     var c = Cur.{ n: 7 };
     let b = with_cur(&c, |&cur| -> u32 { cur.n = cur.n + 1; cur.n * 2 });
-    let t = Tok.{ id: 4 };
+    let t = Tok!.{ id: 4 };
     let d = once(|x: u32| -> u32 { let { id } = t; id + x }, 3);
     let { n } = c;
     (((a + b + d + adder(1) + n) % 251) as i32)

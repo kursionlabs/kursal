@@ -23,43 +23,43 @@ class MatchLoweringTests(unittest.TestCase):
                 self.run_source('fn main() -> i32 { match 0u8 { ' + arms + ' } }', 1)
 
     def test_linear_payload_discard_is_upstream(self):
-        for arms in ('E::A => 0i32, E::B => 1i32',
-                     'E::A(_) => 0i32, E::B => 1i32',
-                     '_ => 0i32', 'E::A | E::B => 0i32'):
+        for arms in ('E!::A => 0i32, E!::B => 1i32',
+                     'E!::A(_) => 0i32, E!::B => 1i32',
+                     '_ => 0i32', 'E!::A | E!::B => 0i32'):
             with self.subTest(arms=arms), self.assertRaisesRegex(LowerError, 'linear'):
                 self.run_source('''exposed struct Token! { n: u32 }
-                    exposed enum E! { A(Token), B }
-                    fn main() -> i32 { match E::A.(Token.{ n: 7u32 }) { ''' + arms + ' } }', 0)
+                    exposed enum E! { A(Token!), B }
+                    fn main() -> i32 { match E!::A.(Token!.{ n: 7u32 }) { ''' + arms + ' } }', 0)
 
     def test_linear_pattern_discard_is_upstream(self):
         for pattern in ('_', '(x, _)', '{ n }'):
-            value = {'_': 'Token.{ n: 7u32 }', '(x, _)': '(1u32, Token.{ n: 7u32 })',
-                     '{ n }': 'Pair.{ n: 1u32, token: Token.{ n: 7u32 } }'}[pattern]
+            value = {'_': 'Token!.{ n: 7u32 }', '(x, _)': '(1u32, Token!.{ n: 7u32 })',
+                     '{ n }': 'Pair!.{ n: 1u32, token: Token!.{ n: 7u32 } }'}[pattern]
             with self.subTest(pattern=pattern), self.assertRaisesRegex(LowerError, 'linear'):
                 self.run_source('''exposed struct Token! { n: u32 }
-                    exposed struct Pair! { n: u32, token: Token }
+                    exposed struct Pair! { n: u32, token: Token! }
                     fn main() -> i32 { let ''' + pattern + ' = ' + value + '; 0i32 }', 0)
 
     def test_linear_payload_is_consumed_in_each_arm(self):
         self.run_source('''exposed struct Token! { n: u32 }
-            exposed enum E! { A(Token), B(Token) }
-            fn take(e: E) -> u32 {
+            exposed enum E! { A(Token!), B(Token!) }
+            fn take(e: E!) -> u32 {
                 match e {
-                    E::A(t) => { let { n } = t; n },
-                    E::B(t) => { let { n } = t; n + 1 }
+                    E!::A(t) => { let { n } = t; n },
+                    E!::B(t) => { let { n } = t; n + 1 }
                 }
             }
             fn main() -> i32 {
-                ((take(E::A.(Token.{ n: 7u32 })) + take(E::B.(Token.{ n: 9u32 }))) as i32)
+                ((take(E!::A.(Token!.{ n: 7u32 })) + take(E!::B.(Token!.{ n: 9u32 }))) as i32)
             }''', 17)
 
     def test_lent_wildcard_preserves_linear_payload(self):
         self.run_source('''exposed struct Token! { n: u32 }
-            exposed enum E! { A(Token), B }
+            exposed enum E! { A(Token!), B }
             fn main() -> i32 {
-                var e = E::A.(Token.{ n: 7u32 });
+                var e = E!::A.(Token!.{ n: 7u32 });
                 let n = match &e { _ => 3u32 };
-                let m = match e { E::A(t) => { let { n } = t; n }, E::B => 0u32 };
+                let m = match e { E!::A(t) => { let { n } = t; n }, E!::B => 0u32 };
                 ((n + m) as i32)
             }''', 10)
 
@@ -78,7 +78,7 @@ class MatchLoweringTests(unittest.TestCase):
     def test_grouped_copy_payloads_of_linear_enum_can_be_discarded(self):
         self.run_source('''exposed enum E! { A(u32), B(u32) }
             fn main() -> i32 {
-                match E::A.(4u32) { E::A | E::B => 7i32 }
+                match E!::A.(4u32) { E!::A | E!::B => 7i32 }
             }''', 7)
 
     def test_integer_ranges_execute(self):
@@ -103,32 +103,32 @@ class MatchLoweringTests(unittest.TestCase):
 
     def test_lent_payload_can_be_taken_and_restored(self):
         self.run_source('''exposed struct Token! { n: u32 }
-            exposed enum E! { A(Token), B }
+            exposed enum E! { A(Token!), B }
             fn main() -> i32 {
-                var e = E::A.(Token.{ n: 7u32 });
+                var e = E!::A.(Token!.{ n: 7u32 });
                 let old = match &e {
-                    E::A(t) => { let { n } = t; t = Token.{ n: n + 1 }; n },
-                    E::B => 0u32
+                    E!::A(t) => { let { n } = t; t = Token!.{ n: n + 1 }; n },
+                    E!::B => 0u32
                 };
-                let new = match e { E::A(t) => { let { n } = t; n }, E::B => 0u32 };
+                let new = match e { E!::A(t) => { let { n } = t; n }, E!::B => 0u32 };
                 ((old + new) as i32)
             }''', 15)
 
     def test_tuple_payload_can_discard_only_copy_component(self):
         self.run_source('''exposed struct Token! { n: u32 }
-            exposed enum E! { A(Token, u32), B }
+            exposed enum E! { A(Token!, u32), B }
             fn main() -> i32 {
-                match E::A.(Token.{ n: 7u32 }, 9u32) {
-                    E::A(t, _) => { let { n } = t; (n as i32) },
-                    E::B => 0i32
+                match E!::A.(Token!.{ n: 7u32 }, 9u32) {
+                    E!::A(t, _) => { let { n } = t; (n as i32) },
+                    E!::B => 0i32
                 }
             }''', 7)
 
     def test_struct_pattern_can_omit_copy_fields(self):
         self.run_source('''exposed struct Token! { n: u32 }
-            exposed struct Pair! { token: Token, count: u32 }
+            exposed struct Pair! { token: Token!, count: u32 }
             fn main() -> i32 {
-                let { token } = Pair.{ token: Token.{ n: 7u32 }, count: 9u32 };
+                let { token } = Pair!.{ token: Token!.{ n: 7u32 }, count: 9u32 };
                 let { n } = token;
                 (n as i32)
             }''', 7)

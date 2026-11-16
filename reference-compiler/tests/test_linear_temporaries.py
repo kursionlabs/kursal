@@ -6,8 +6,8 @@ from kursal.placeflow import OwnershipError
 from tests import test_closure_boundary
 
 PREFIX = '''exposed struct Token! { n: u32 }
-fn make(n: u32) -> Token { Token.{ n } }
-fn take(t: Token) -> u32 { let { n } = t; n }
+fn make(n: u32) -> Token! { Token!.{ n } }
+fn take(t: Token!) -> u32 { let { n } = t; n }
 '''
 
 
@@ -15,22 +15,22 @@ class LinearTemporaryTests(unittest.TestCase):
     run_source = test_closure_boundary.ClosureBoundaryTests.run_source
 
     def test_discarded_expression_results_are_upstream(self):
-        for expression in ('make(7u32)', 'Token.{ n: 7u32 }',
+        for expression in ('make(7u32)', 'Token!.{ n: 7u32 }',
                            '(make(7u32), 1u32)', 'if true { make(7u32) } else { make(9u32) }'):
             with self.subTest(expression=expression), self.assertRaisesRegex(LowerError, 'discard.*linear'):
                 self.run_source(PREFIX + 'fn main() -> i32 { ' + expression + '; 0i32 }', 0)
 
     def test_temporary_projection_cannot_drop_linear_sibling(self):
         with self.assertRaisesRegex(LowerError, 'projection.*linear'):
-            self.run_source(PREFIX + '''fn pair() -> (Token, u32) { (make(7u32), 3u32) }
+            self.run_source(PREFIX + '''fn pair() -> (Token!, u32) { (make(7u32), 3u32) }
                 fn main() -> i32 { (pair().1 as i32) }''', 3)
 
     def test_temporary_projection_may_drop_copy_sibling(self):
-        self.run_source(PREFIX + '''fn pair() -> (Token, u32) { (make(7u32), 3u32) }
+        self.run_source(PREFIX + '''fn pair() -> (Token!, u32) { (make(7u32), 3u32) }
             fn main() -> i32 { (take(pair().0) as i32) }''', 7)
 
     def test_abandoned_operand_reports_its_origin(self):
-        source = PREFIX + '''fn combine(t: Token, n: u32) -> u32 { take(t) + n }
+        source = PREFIX + '''fn combine(t: Token!, n: u32) -> u32 { take(t) + n }
 fn main() -> i32 {
     combine(
         make(7u32),
@@ -98,12 +98,12 @@ fn main() -> i32 {
         self.assertEqual(calls[0].pos, (5, 5))
 
     def test_operand_survives_branch_in_later_argument(self):
-        self.run_source(PREFIX + '''fn combine(t: Token, n: u32) -> u32 { take(t) + n }
+        self.run_source(PREFIX + '''fn combine(t: Token!, n: u32) -> u32 { take(t) + n }
             fn f(c: bool) -> u32 { combine(make(7u32), if c { 2u32 } else { 3u32 }) }
             fn main() -> i32 { ((f(true) + f(false)) as i32) }
             ''', 19)
 
     def test_nested_projection_checks_each_discarded_sibling(self):
         with self.assertRaisesRegex(LowerError, 'projection.*linear'):
-            self.run_source(PREFIX + '''fn pair() -> ((Token, u32), u32) { ((make(7u32), 3u32), 4u32) }
+            self.run_source(PREFIX + '''fn pair() -> ((Token!, u32), u32) { ((make(7u32), 3u32), 4u32) }
                 fn main() -> i32 { ((pair().0).1 as i32) }''', 3)

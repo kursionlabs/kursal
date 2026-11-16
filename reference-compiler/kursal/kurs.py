@@ -55,7 +55,7 @@ def parse_type(form: Form) -> Type:
             return Skolem(_brand(form))
         if form in PRIMS:
             return Prim(form)
-        return Named(form.rstrip("!") if len(form) > 1 else form)
+        return Named(form)
     if not form:
         _fail("empty type", form)
     head, rest = _text(form[0]), form[1:]
@@ -100,7 +100,7 @@ def parse_type(form: Form) -> Type:
             return Fn(ptypes, parse_type(header[3]), params, unsafe, places)
         ptypes, places = _ptypes(rest[0])
         return Fn(ptypes, parse_type(rest[1]), unsafe=unsafe, places=places)
-    return Named(head.rstrip("!"), tuple(parse_type(t) for t in rest))
+    return Named(head, tuple(parse_type(t) for t in rest))
 
 
 def _ptypes(form: Form) -> tuple[tuple[Type, ...], frozenset[int]]:
@@ -296,8 +296,7 @@ def parse_program(text: str) -> Program:
             while _is(body, "forall"):
                 more, more_premises = parse_forall(body[1], body[2])
                 params, premises, body = params + more, premises + more_premises, body[3]
-            name = raw.rstrip("!") if len(raw) > 1 else raw
-            program.types[name] = TypeDecl(name, raw.endswith("!"), params, premises, parse_type(body),
+            program.types[raw] = TypeDecl(raw, params, premises, parse_type(body),
                                            module, exposure)
         elif head == "fun":
             program.funs[str(rest[0])] = parse_fun(rest[1:], str(rest[0]), module, unsafe, form.pos)
@@ -576,8 +575,7 @@ def write_type_decl(decl: TypeDecl) -> str:
     body = write_type(decl.body)
     if decl.params or decl.premises:
         body = "(" + write_forall(decl.params, decl.premises) + " " + body + ")"
-    name = decl.name + "!" if decl.linear else decl.name
-    return _form(["type", *_in(decl.module, policy), write_atom(name), body])
+    return _form(["type", *_in(decl.module, policy), write_atom(decl.name), body])
 
 
 def write_extern(extern: Extern) -> str:

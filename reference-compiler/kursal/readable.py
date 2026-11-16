@@ -213,7 +213,7 @@ def emit_kurs(program: C.Program) -> str:
         quant = quantifier(decl.params, decl.premises)
         if quant:
             lines.append(quant.rstrip())
-        lines.append(f"type {decl.name}{'!' if decl.linear else ''} = {type_text(decl.body)};")
+        lines.append(f"type {decl.name} = {type_text(decl.body)};")
         sections.append("\n".join(lines))
     for external in program.externs.values():
         assert external.ret is not None

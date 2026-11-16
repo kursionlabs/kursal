@@ -122,14 +122,14 @@ class OpenedContractTests(unittest.TestCase):
                 parse_program(f"(fun f u32 () (entry () {contract} (= %n (const u32 0)) (ret %n)))")
 
     def test_partial_linear_payload_survives_a_branch_and_is_restored(self):
-        pkg = "(exists ($k) (tuple H (brand $k)))"
+        pkg = "(exists ($k) (tuple H! (brand $k)))"
         source = f"""(type H! (struct (n u32)))
           (fun f u32 ({pkg}) (entry ((&p {pkg}))
             (= %u (open &p ($o))) (= %h (load &p.0)) (= %c (const bool true))
             (jnz %c ((left $o) %h) ((right $o) %h)))
-            (left ($l) ((%h H)) (opened &p ($l)) (empty &p.0)
+            (left ($l) ((%h H!)) (opened &p ($l)) (empty &p.0)
               (= %u (store &p.0 %h)) (= %p (pack {pkg} $l &p)) (= %n (const u32 0)) (ret %n))
-            (right ($r) ((%h H)) (opened &p ($r)) (empty &p.0)
+            (right ($r) ((%h H!)) (opened &p ($r)) (empty &p.0)
               (= %u (store &p.0 %h)) (= %p (pack {pkg} $r &p)) (= %n (const u32 0)) (ret %n)))"""
         program = parse_program(source)
         check_program(program)
@@ -212,13 +212,13 @@ class OpenedContractTests(unittest.TestCase):
                      "place_already_open")
 
     def test_an_empty_successor_cannot_implicitly_close_an_open_payload(self):
-        pkg = "(exists ($k) (tuple H (brand $k)))"
+        pkg = "(exists ($k) (tuple H! (brand $k)))"
         source = f"""(type H! (struct (n u32)))
           (fun f u32 ({pkg}) (entry ((&p {pkg}))
             (= %u (open &p ($o))) (= %h (load &p.0)) (jmp next %h))
-            (next ((%h H)) (empty &p)
+            (next ((%h H!)) (empty &p)
               (= %fresh (fresh)) (= %w (open %fresh ($new)))
-              (= %body (construct (tuple H (brand $new)) %h %w))
+              (= %body (construct (tuple H! (brand $new)) %h %w))
               (= %pkg (pack {pkg} $new %body)) (= %u (store &p %pkg))
               (= %r (const u32 0)) (ret %r)))"""
         self.rejects(source, "opened_view_contract")
@@ -233,11 +233,11 @@ class OpenedContractTests(unittest.TestCase):
         check_program(parse_program(source))
 
     def test_loading_whole_payload_retains_the_view_until_explicit_close(self):
-        pkg = "(exists ($k) (tuple H (brand $k)))"
+        pkg = "(exists ($k) (tuple H! (brand $k)))"
         source = f"""(type H! (struct (n u32)))
           (fun f (tuple) ({pkg}) (entry ((&p {pkg}))
             (= %o (open &p ($a))) (= %body (load &p)) (jmp (next $a) %body))
-          (next ($b) ((%body (tuple H (brand $b))))
+          (next ($b) ((%body (tuple H! (brand $b))))
             (opened &p ($b)) (empty &p)
             (= %s (store &p %body)) (= %closed (pack {pkg} $b &p)) (ret %closed)))"""
         program = parse_program(source)
@@ -249,9 +249,9 @@ class OpenedContractTests(unittest.TestCase):
         check_program(program)
 
     def test_close_needs_the_whole_payload(self):
-        pkg = "(exists ($k) (tuple H (brand $k)))"
+        pkg = "(exists ($k) (tuple H! (brand $k)))"
         partial = f"""(type H! (struct (n u32)))
-          (fun f H ({pkg}) (entry ((&p {pkg}))
+          (fun f H! ({pkg}) (entry ((&p {pkg}))
             (= %o (open &p ($a))) (= %h (load &p.0))
             (= %closed (pack {pkg} $a &p)) (ret %h)))"""
         self.rejects(partial, "pack_place_full")

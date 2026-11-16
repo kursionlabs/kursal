@@ -23,12 +23,12 @@ LIBRARY = {  # name: (home library, path there, path through std)
     "Option": ("core", ("option", "Option"), ("option", "Option")),
     "Result": ("core", ("option", "Result"), ("option", "Result")),
     "Slice": ("core", ("slice", "Slice"), ("slice", "Slice")),
-    "Buffer": ("alloc", ("buffer", "Buffer"), ("bytes", "buffer", "Buffer")),
+    "Buffer!": ("alloc", ("buffer", "Buffer!"), ("bytes", "buffer", "Buffer!")),
     "Iterator": ("core", ("iter", "Iterator"), ("iter", "Iterator")),
     "Format": ("core", ("fmt", "Format"), ("text", "fmt", "Format")),
     "Writable": ("core", ("fmt", "Writable"), ("text", "fmt", "Writable")),
     "Slice::from_raw_parts": ("core", ("slice", "Slice", "from_raw_parts"), ("slice", "Slice", "from_raw_parts")),
-    "Buffer::new": ("alloc", ("buffer", "Buffer", "new"), ("bytes", "buffer", "Buffer", "new")),
+    "Buffer!::new": ("alloc", ("buffer", "Buffer!", "new"), ("bytes", "buffer", "Buffer!", "new")),
     "Ordering": ("core", ("atomic", "Ordering"), ("atomic", "Ordering")),
 }
 
@@ -126,6 +126,12 @@ class Signatures:
         for ty, kinds in self.copy_checks:
             self.require_copy(ty, kinds)
         self.copy_checks.clear()
+        types = Types(C.Program(types=self.types))
+        for scope in resolver.scopes.values():
+            for decl in scope.decls.values():
+                if decl.kind in ("struct", "enum", "tuple") and not decl.name.endswith("!"):
+                    with resolver.located(decl.module, decl.node.pos):
+                        self.unmarked(decl, types)
         for scope in resolver.scopes.values():
             for decl in scope.decls.values():
                 with resolver.located(decl.module, decl.node.pos):
@@ -308,7 +314,16 @@ class Signatures:
         exposure: Optional[C.Exposure] = ("owner", decl.module)
         if node.exposed is not None:
             exposure = None if node.exposed.scope is None else ("within", self.scope_module(decl, node.exposed.scope))
-        return C.TypeDecl(self.name(decl), node.linear, params, premises, body, decl.module, exposure)
+        return C.TypeDecl(self.name(decl), params, premises, body, decl.module, exposure)
+
+    def unmarked(self, decl: Decl, types: Types) -> None:
+        """A declaration whose name has no `!` is not linear for every instantiation: it is Copy when its
+        type arguments are."""
+        td = self.types[self.name(decl)]
+        args = tuple(C.Skolem(p.name) if p.kind == C.BRAND else C.Named(p.name) for p in td.params)
+        if not types.is_copy(C.Named(td.name, args), {p.name: C.COPY for p in td.params if p.kind != C.BRAND}):
+            whatever = " whatever its type arguments" if any(p.kind != C.BRAND for p in td.params) else ""
+            fail(f"{decl.kind} {decl.name} holds a linear type{whatever}; declare it {decl.name}!")
 
     def payload(self, types: Sequence[S.Type], scope: Scope) -> C.Type:
         if not types:
@@ -453,7 +468,7 @@ class Signatures:
         if isinstance(expr, S.Path):
             ref = expr.ref
             if ref and ref[0] == "decl" and ref[1].kind == "const":
-                if any(args for _, _, args in expr.segments):
+                if any(args for _, args in expr.segments):
                     fail("constant paths take no type arguments", expr.pos)
                 return self.const(ref[1])
             fail("a constant expression names only consts", expr.pos)

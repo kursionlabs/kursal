@@ -42,7 +42,7 @@ class AbstractShapeTests(unittest.TestCase):
                 if count == 1u32 { value } else { value }
             }
             fn main() -> i32 {
-                let { n } = pass(Token.{ n: 7i32 }, true);
+                let { n } = pass(Token!.{ n: 7i32 }, true);
                 n
             }''', 7)
 
@@ -50,7 +50,7 @@ class AbstractShapeTests(unittest.TestCase):
         self.run_source('''forall T. exposed enum E { Item(T) }
             forall T. fn unwrap(x: E[T]) -> T { match x { E::Item(value) => value } }
             exposed struct Token! { n: i32 }
-            fn main() -> i32 { let { n } = unwrap(E::Item.(Token.{ n: 7i32 })); n }''', 7)
+            fn main() -> i32 { let { n } = unwrap(E::Item.(Token!.{ n: 7i32 })); n }''', 7)
 
     def test_generic_existential_payload_passes_through(self):
         self.run_source("""forall T. fn pass(x: exists 'a. (core::cap::Brand['a], T)) -> T {
@@ -69,4 +69,4 @@ class AbstractShapeTests(unittest.TestCase):
                 *p
             }
             exposed struct Token! { n: i32 }
-            fn main() -> i32 { let { n } = unsafe pass(Token.{ n: 7i32 }); n }''', 7)
+            fn main() -> i32 { let { n } = unsafe pass(Token!.{ n: 7i32 }); n }''', 7)

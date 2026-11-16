@@ -27,10 +27,27 @@ class TypeDeclTests(unittest.TestCase):
         with self.assertRaisesRegex(SigError, "trait declarations cannot have their own trait premises"):
             sigs_of(source)
 
+    def test_a_declaration_linear_for_every_instantiation_carries_the_bang(self):
+        lin = "struct L! { x: u32 }\nforall T. enum Opt { None, Some(T) }\n"
+        s = sigs_of(lin + "struct H! { o: Opt[L!] }\nforall T. struct W { w: Opt[T] }\nforall 'k. struct Cap! {}\n"
+                    "fn f(w: W[L!]) -> W[L!] { w }\n")
+        self.assertTrue(s.types["p::Cap!"].linear)
+        self.assertFalse(s.types["p::W"].linear)
+        cases = (
+            ("struct S { l: L! }\n", "struct S holds a linear type; declare it S!"),
+            ("struct S { o: Opt[L!] }\n", "struct S holds a linear type; declare it S!"),
+            ("forall T. struct G { t: T, l: (u8, L!) }\n", "struct G holds a linear type whatever its type arguments; declare it G!"),
+            ("forall 'k. enum E { A, B(L!, core::cap::Brand['k]) }\n", "enum E holds a linear type; declare it E!"),
+            ("forall T. tuple P(T, Opt[L!]);\n", "tuple P holds a linear type whatever its type arguments; declare it P!"),
+        )
+        for source, message in cases:
+            with self.subTest(source=source), self.assertRaisesRegex(SigError, message):
+                sigs_of(lin + source)
+
     def test_struct_enum_tuple(self):
         s = sigs_of("forall T, 'k where Copy[T]. struct Box! { v: T, b: core::cap::Brand['k] }\n"
                     "enum E { A, B(u32), C(u32, bool) }\nexposed tuple Pair(u32, u32);\n")
-        box, enum, pair = s.types["p::Box"], s.types["p::E"], s.types["p::Pair"]
+        box, enum, pair = s.types["p::Box!"], s.types["p::E"], s.types["p::Pair"]
         self.assertTrue(box.linear)
         self.assertEqual(box.params, (C.Param("T", C.COPY), C.Param("k", C.BRAND)))
         self.assertEqual(box.body.fields[1][1], C.Brand(C.Skolem("k")))

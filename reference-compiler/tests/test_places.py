@@ -19,10 +19,10 @@ from tests.place_cases import CASES, TYPES
 COMMON = """
 (type Cur (struct (pos u32)))
 (type H! (struct (n u32)))
-(type Box! (struct (h H) (n u32)))
-(type E! (enum (A H) (B u32)))
-(type Holder! (struct (e E) (k u32)))
-(fun eat u32 (H) (entry ((%h H)) (= %n (destruct %h H)) (ret %n)))
+(type Box! (struct (h H!) (n u32)))
+(type E! (enum (A H!) (B u32)))
+(type Holder! (struct (e E!) (k u32)))
+(fun eat u32 (H!) (entry ((%h H!)) (= %n (destruct %h H!)) (ret %n)))
 (fun bump u32 (Cur u32) (entry ((&c Cur) (%by u32))
   (= %pos (load &c.pos)) (= %old (copy %pos)) (= %new (add %pos %by)) (= %u (store &c.pos %new)) (ret %old)))
 """
@@ -38,25 +38,25 @@ PROGRAMS = {
   (done () (= %pos (load &c.pos)) (= %r (int_cast %pos i32)) (ret %r)))"""),
     # A linear field moved out, carried across an edge, and stored back.
     "partial_product_edge": (47, """
-(fun take u32 (Box) (entry ((&b Box)) (= %h (load &b.h)) (jmp resume %h))
-  (resume ((%h H)) (empty &b.h) (= %u (store &b.h %h)) (= %n (load &b.n)) (ret %n)))
-(fun main i32 () (locals (&b Box))
-  (entry () (= %a (const u32 5)) (= %h (construct H %a)) (= %k (const u32 42)) (= %x (construct Box %h %k))
-    (= %u (store &b %x)) (= %n (call take &b)) (= %whole (load &b)) (= (%h2 %k2) (destruct %whole Box))
+(fun take u32 (Box!) (entry ((&b Box!)) (= %h (load &b.h)) (jmp resume %h))
+  (resume ((%h H!)) (empty &b.h) (= %u (store &b.h %h)) (= %n (load &b.n)) (ret %n)))
+(fun main i32 () (locals (&b Box!))
+  (entry () (= %a (const u32 5)) (= %h (construct H! %a)) (= %k (const u32 42)) (= %x (construct Box! %h %k))
+    (= %u (store &b %x)) (= %n (call take &b)) (= %whole (load &b)) (= (%h2 %k2) (destruct %whole Box!))
     (= %m (call eat %h2)) (= %s (add %n %m)) (= %r (int_cast %s i32)) (ret %r)))"""),
     # A switch on a place: the arm knows its variant, reads through it, and
     # one arm replaces the sum with the other variant.
     "place_switch": (9, """
-(fun step u32 (Holder) (entry ((&x Holder)) (switch &x.e E (A a) (B b)))
-  (a () (known &x.e A) (= %h (load &x.e.A)) (= %n (call eat %h)) (= %n2 (copy %n)) (= %v (construct_variant E B %n2))
+(fun step u32 (Holder!) (entry ((&x Holder!)) (switch &x.e E! (A a) (B b)))
+  (a () (known &x.e A) (= %h (load &x.e.A)) (= %n (call eat %h)) (= %n2 (copy %n)) (= %v (construct_variant E! B %n2))
      (= %u (store &x.e %v)) (ret %n))
   (b () (known &x.e B) (= %v (load &x.e.B)) (ret %v)))
-(fun main i32 () (locals (&x Holder))
-  (entry () (= %four (const u32 4)) (= %h (construct H %four)) (= %e (construct_variant E A %h)) (= %k (const u32 1))
-    (= %hold (construct Holder %e %k)) (= %u (store &x %hold)) (= %t (variant_tag &x.e E))
-    (= %first (call step &x)) (= %second (call step &x)) (= %t2 (variant_tag &x.e E))
-    (= %whole (load &x)) (= (%e2 %k2) (destruct %whole Holder)) (switch %e2 E (A fin_a %first %second %t %t2) (B fin_b %first %second %t %t2)))
-  (fin_a ((%h H) (%first u32) (%second u32) (%t u32) (%t2 u32)) (empty &x) (= %n (call eat %h)) (= %r (const i32 99)) (ret %r))
+(fun main i32 () (locals (&x Holder!))
+  (entry () (= %four (const u32 4)) (= %h (construct H! %four)) (= %e (construct_variant E! A %h)) (= %k (const u32 1))
+    (= %hold (construct Holder! %e %k)) (= %u (store &x %hold)) (= %t (variant_tag &x.e E!))
+    (= %first (call step &x)) (= %second (call step &x)) (= %t2 (variant_tag &x.e E!))
+    (= %whole (load &x)) (= (%e2 %k2) (destruct %whole Holder!)) (switch %e2 E! (A fin_a %first %second %t %t2) (B fin_b %first %second %t %t2)))
+  (fin_a ((%h H!) (%first u32) (%second u32) (%t u32) (%t2 u32)) (empty &x) (= %n (call eat %h)) (= %r (const i32 99)) (ret %r))
   (fin_b ((%n u32) (%first u32) (%second u32) (%t u32) (%t2 u32)) (empty &x)
     (= %s (add %first %second)) (= %s2 (add %s %t)) (= %s3 (add %s2 %t2)) (= %r (int_cast %s3 i32)) (ret %r)))"""),
     # Sibling fields lent to one call; a place destructured whole.
@@ -105,14 +105,14 @@ PROGRAMS = {
 
 # Further rejected programs, checked after the corpus's TYPES.
 REJECTED = {
-    "edge_to_entry": """(fun f u32 (Box) (entry ((&b Box)) (jmp entry)))""",
+    "edge_to_entry": """(fun f u32 (Box!) (entry ((&b Box!)) (jmp entry)))""",
     "pack_place_wrong_brand": """(fun f u32 (Pk) (entry ((&k Pk)) (= %u (open &k.pkg ($a)))
    (= %u2 (pack (exists ($h) (tuple u32 (brand $h))) $static &k.pkg)) (= %r (const u32 0)) (ret %r)))""",
     "store_wrong_type": """(fun f u32 (Cur) (entry ((&c Cur)) (= %x (const u64 1)) (= %u (store &c.pos %x)) (= %r (const u32 0)) (ret %r)))""",
-    "variant_tag_of_empty": """(fun f u32 (Holder) (entry ((&x Holder)) (= %e (load &x.e)) (= %t (variant_tag &x.e E))
+    "variant_tag_of_empty": """(fun f u32 (Holder!) (entry ((&x Holder!)) (= %e (load &x.e)) (= %t (variant_tag &x.e E!))
    (= %u (store &x.e %e)) (ret %t)))""",
-    "known_lost_after_store": """(fun f u32 (Holder) (entry ((&x Holder)) (switch &x.e E (A a) (B b)))
-  (a () (known &x.e A) (= %h (load &x.e.A)) (= %n (call eat %h)) (= %v (construct_variant E B %n)) (= %u (store &x.e %v))
+    "known_lost_after_store": """(fun f u32 (Holder!) (entry ((&x Holder!)) (switch &x.e E! (A a) (B b)))
+  (a () (known &x.e A) (= %h (load &x.e.A)) (= %n (call eat %h)) (= %v (construct_variant E! B %n)) (= %u (store &x.e %v))
      (= %w (load &x.e.B)) (ret %w))
   (b () (known &x.e B) (= %v (load &x.e.B)) (ret %v)))""",
     "raw_lend_wrong_type": """(fun f u32 ((ptr u32)) (entry ((%p (ptr u32))) (unsafe (= %r (call touch &*%p))) (ret %r)))""",
@@ -135,9 +135,9 @@ class PlaceCorpusTests(unittest.TestCase):
   (= %r (const u32 0)) (ret %r)))""")
 
     def test_variant_and_tuple_component_can_share_numeric_spelling(self):
-        check("""(type E (enum (0 u32) (1 u32)))
-(fun f u32 (E (tuple u32 u32))
-  (entry ((&e E) (&t (tuple u32 u32))) (switch &e E (0 a) (1 b)))
+        check("""(type E! (enum (0 u32) (1 u32)))
+(fun f u32 (E! (tuple u32 u32))
+  (entry ((&e E!) (&t (tuple u32 u32))) (switch &e E! (0 a) (1 b)))
   (a () (known &e 0) (= %n (load &e.0)) (= %m (load &t.0))
     (= %r (add %n %m)) (ret %r))
   (b () (known &e 1) (= %n (load &e.1)) (= %m (load &t.0))

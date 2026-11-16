@@ -84,8 +84,8 @@ class AggregateBoundaryTests(unittest.TestCase):
     def test_linear_array_elements_cannot_be_repeated(self):
         with self.assertRaisesRegex(CheckError, 'array_construct_element_copy'):
             check_program(parse_program('''(type L! (tuple i32))
-                (fun f (array L 2) () (entry () (= %n (const i32 7))
-                  (= %l (construct L %n)) (= %array (construct (array L 2) %l)) (ret %array)))'''))
+                (fun f (array L! 2) () (entry () (= %n (const i32 7))
+                  (= %l (construct L! %n)) (= %array (construct (array L! 2) %l)) (ret %array)))'''))
 
     def test_float_literals_reject_nonfinite_or_unrepresentable_values(self):
         for ty, literal in (('f32', '1e39'), ('f64', '1e309'), ('f64', 'nan'),

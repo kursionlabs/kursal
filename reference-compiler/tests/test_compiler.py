@@ -786,6 +786,20 @@ RESOLUTION_ERRORS: tuple[tuple[dict[str, str], str], ...] = (
     ({"p/kur.toml": '[package]\nname = ["p"]\nsource_root = "."\n', "p/lib.kur": ""}, "p"),
     ({"p/kur.toml": '[package]\nname = "p"\nsource_root = 1979-05-27\n', "p/lib.kur": ""}, "p"),
     ({"p/kur.toml": '[[package]]\nname = "p"\n', "p/lib.kur": ""}, "p"),
+    # A linear type's `!` is part of its name: a name without it, or with one it does not have, names
+    # nothing.
+    (app("struct L! { x: u32 }\nfn f(l: L) -> u32 { 0u32 }\n"), "app"),
+    (app("struct L! { x: u32 }\nfn f() -> L! { L.{ x: 0u32 } }\n"), "app"),
+    (app("enum E! { A, B }\nfn f() -> E! { E!::A }\nfn g(e: E!) -> u32 { match e { E::A => 0u32, E!::B => 1u32 } }\n"), "app"),
+    (app("struct L! { x: u32 }\nimpl L { fn get(self) -> u32 { 0u32 } }\n"), "app"),
+    (app("use package::a::L;\nfn f(l: L) -> u32 { 0u32 }\n", {"app/a.kur": "struct L! { x: u32 }\n"}), "app"),
+    (app("use lib::shapes::Point!;\nfn f(p: Point!) -> u32 { 0u32 }\n"), "app"),
+    (app("fn f(p: lib::shapes::Point!) -> u32 { 0u32 }\n"), "app"),
+    (app("struct P { x: u32 }\nfn f() -> P { P!.{ x: 0u32 } }\n"), "app"),
+    (app("fn f() -> u32 { lib::shapes::make!(1u32).x }\n"), "app"),
+    (app("use package::a::L! as M;\nfn f(l: M) -> u32 { 0u32 }\n", {"app/a.kur": "struct L! { x: u32 }\n"}), "app"),
+    (app("use lib::shapes::Point as Q!;\n"), "app"),
+    (app("struct P { x: u32 }\nstruct P! { x: u32 }\nfn f(p: P!) -> P { P.{ x: 0u32 } }\nfn g(p: Q) -> u32 { 0u32 }\n"), "app"),
 )
 
 
@@ -800,6 +814,11 @@ RESOLVED: tuple[tuple[dict[str, str], str], ...] = (
          "    match Shape::Empty { Shape::Dot(d) => d, _ => Point.{ x: T::size } }\n}\n",
          {"app/kur.toml": manifest("app", ("lib",)).replace('"', "'") + "kind = \"executable\"\nentry = \"package::run::main\"\n",
           "app/run.kur": "fn main() -> i32 { 0i32 }\n"}), "app"),
+    # Every reference to a linear type spells its `!`, and so does an alias of it.
+    (app("use package::a::{L!, E! as F!};\nfn f(l: L!) -> L! { let { x } = l; L!::make(x) }\n"
+         "fn g(e: F!) -> u32 { match e { F!::A => 0u32, F!::B(l) => l.get() } }\n",
+         {"app/a.kur": "exposed struct L! { x: u32 }\nenum E! { A, B(L!) }\n"
+                       "impl L! { fn make(x: u32) -> L! { L!.{ x } } fn get(self) -> u32 { self.x } }\n"}), "app"),
     # The whole of TOML, of which the manifest reads its strings and tables: a dependency's other keys
     # are not read.
     (app("", {"app/kur.toml": "[package]\nname = \"app\"\nsource_root = \".\"\n[dependencies.lib]\npath = '../lib'\n"
@@ -832,7 +851,11 @@ SIGNATURES = (
     "forall T. impl P[T, 'static] { fn get(self, f: closure(u32) -> u32, g: closure[u8](&_: u32) -> u32) -> u32 { 0u32 } }\n"
     "forall T where Copy[T]. fn pair(x: T, h: unsafe fn(&_: T) -> !, k: forall 'q. fn(core::cap::Brand['q]) -> u32) -> (T, T) { (x, x) }\n"
     "extern \"C\" fn puts(s: *u8) -> i32;\nenum E { A, B(u32), C(u8, u16) }\ntuple Pt(u32, i64);\n"
-    "struct F { f: foreach F of (u32, u8) => *F }\nfn h(g: fn(closure(u32) -> u32) -> u32, k: closure(u8) -> u8) -> u32 { 0u32 }\n",
+    "struct F! { f: foreach F of (u32, u8) => *F }\nfn h(g: fn(closure(u32) -> u32) -> u32, k: closure(u8) -> u8) -> u32 { 0u32 }\n",
+    # A generic declaration linear only through its arguments has no `!`; one with a `!` is linear even
+    # when every field is Copy.
+    "forall T. enum Opt { None, Some(T) }\nstruct L! { x: u32 }\nstruct H! { o: Opt[L!], p: *L! }\n"
+    "forall 'k. struct Cap! {}\nforall T. struct W { w: Opt[T] }\nfn f(o: Opt[L!], w: W[u32]) -> Opt[L!] { o }\n",
 )
 
 SIGNATURE_ERRORS = (
@@ -890,6 +913,12 @@ SIGNATURE_ERRORS = (
     "forall T where Copy[T]. trait Dup { fn dup(x: T) -> T; }\nstruct L! { x: u32 }\n"
     "instance Dup[L] { fn dup(x: L) -> L { x } }\n",
     "forall T where Nope[T]. fn f(x: T) {}\n",
+    # A declaration linear for every instantiation carries the `!`.
+    "struct L! { x: u32 }\nstruct S { l: L! }\n",
+    "struct L! { x: u32 }\nforall T. struct G { t: T, l: L! }\n",
+    "struct L! { x: u32 }\nforall 'k. enum E { A, B(L!, core::cap::Brand['k]) }\n",
+    "struct L! { x: u32 }\ntuple P(u32, (L!, u8));\n",
+    "forall T. enum Opt { None, Some(T) }\nstruct L! { x: u32 }\nstruct S { o: Opt[L!] }\n",
     "struct S { a: (u32, [u8; 1u8 - 2u8 > 0u8]) }\n",
 )
 
@@ -908,6 +937,15 @@ SYNTAX_ERRORS = (
     "fn f() { let s = \"\\q\"; }",
     "fn f() -> u32 { p.0.1 }",
     "fn f() -> u64 { 18446744073709551616 }",
+    # Only a type's name ends with `!`.
+    "fn f!() {}",
+    "fn f() { let x! = 1u32; }",
+    "forall T!. fn f(x: T!) {}",
+    "struct S { a!: u32 }",
+    "enum E { A! }",
+    "fn f(&x!: u32) {}",
+    "fn f() -> u32 { p.x! }",
+    "fn f() -> bool { a!b }",
 )
 
 KURS_ERRORS = (
@@ -1154,7 +1192,7 @@ TYPE_CASES = (
     "(copy ((type Node (T) (struct (v T) (next (ptr (Node T)))))) ((T copy)) (Node T))",
     "(copy ((type Node (T) (struct (v T) (next (ptr (Node T)))))) ((T any)) (Node T))",
     "(copy ((type L (T) (enum (Nil (tuple)) (Cons (tuple T (L T)))))) () (L u8))",
-    "(copy ((linear R () u8)) () (tuple R))",
+    "(copy ((type R! () u8)) () (tuple R!))",
     "(copy () () (foreach (F (tuple u8)) (ptr F)))",
     "(copy () () (foreach (F (tuple u8)) u16))",
     "(zero ((type E () (struct (a (tuple)) (b (array u8 0))))) E)",
@@ -1209,7 +1247,7 @@ TYPE_CASES = (
     "(formation (type W (T) u8) (type X () (W)))",
     "(formation (type K ($k) u8) (type X () (K u8)))",
     "(formation (type K (T) u8) (type X () (K $static)))",
-    "(formation (type C (+T) u8) (linear L () u8) (type X () (C L)))",
+    "(formation (type C (+T) u8) (type L! () u8) (type X () (C L!)))",
     "(formation (type C (+T) u8) (type X () (C (ptr u8))))",
     "(formation (type S ($static) u8))",
     "(formation (type D (T T) u8))",
@@ -1264,7 +1302,7 @@ def _premise(form: List) -> C.Premise:
 
 def _program(decls: list) -> C.Program:
     opaque: C.Exposure = ("owner", C.ModuleId(0, ("m",)))
-    types = {str(d[1]): C.TypeDecl(str(d[1]), d[0] == "linear", _params(d[2]), (), parse_type(d[3]),
+    types = {str(d[1]): C.TypeDecl(str(d[1]), _params(d[2]), (), parse_type(d[3]),
                                    exposure=opaque if d[0] == "opaque" else None) for d in decls}
     return C.Program(types=types)
 

@@ -163,13 +163,16 @@ type Exposure = tuple[Literal["owner", "within"], ModuleId]
 
 @dataclass
 class TypeDecl:
-    name: str
-    linear: bool
+    name: str              # a linear type's name ends with `!`
     params: tuple[Param, ...]
     premises: tuple[Premise, ...]
     body: Type
     module: Optional[ModuleId] = None
     exposure: Optional[Exposure] = None  # None: transparent; ("owner", m) or ("within", m)
+
+    @property
+    def linear(self) -> bool:
+        return self.name.endswith("!")
 
 
 # The atomic operations, each by its kind: one per atomic method of `*T` (`ptr_atomic_` and the kind,

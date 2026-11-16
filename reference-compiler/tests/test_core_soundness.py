@@ -26,7 +26,7 @@ REJECTED = {
     # A block's `known` contract names a variant of the enum at its path.
     "known_unknown_variant": ("known_contract_names_a_variant", """
         (type L! (struct (a u32)))
-        (type E (enum (A L) (B u32)))
+        (type E (enum (A L!) (B u32)))
         (fun f u32 ()
           (locals (&x E))
           (entry () (= %n (const u32 0)) (ret %n))
@@ -68,7 +68,7 @@ REJECTED = {
     # Unsafe operations do not conjure Never, packages, brand witnesses or values of abstract types.
     "cast_to_never": ("unsafe_cast_cannot_produce", """
         (type L! (struct (a u32)))
-        (fun (unsafe) h u32 (L u32) (entry ((%l L) (%x u32)) (= %n (cast %x !)) (unreachable)))"""),
+        (fun (unsafe) h u32 (L! u32) (entry ((%l L!) (%x u32)) (= %n (cast %x !)) (unreachable)))"""),
     "deref_to_never": ("unsafe_read_cannot_produce_never", """
         (fun (unsafe) h u32 ((ptr !)) (entry ((%p (ptr !)))
           (= %n (ptr_load %p)) (unreachable)))"""),

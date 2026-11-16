@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from kursal import syntax as S
+from kursal.parser import Lexer
 from kursal.sexpr import KursError
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -30,7 +31,7 @@ class ParameterTests(unittest.TestCase):
     def test_in_place_parameters(self):
         f = S.parse("fn f(&self, &x: T, y: u32) {}")[0]
         self.assertEqual([(p.name, p.lend) for p in f.params], [("self", True), ("x", True), ("y", False)])
-        self.assertFalse(f.params[1].type.linear)
+        self.assertEqual(f.params[1].type.path, ("T",))
 
     def test_self_comes_first_and_may_be_typed(self):
         for first in ("self", "&self", "self: Self", "&self: Cell"):
@@ -77,7 +78,7 @@ class ConstructionTests(unittest.TestCase):
 
     def test_generic_and_nested_literals(self):
         e = expr("Box[u32].{ v: 7 }")
-        self.assertEqual(e.path.segments[0][2][0].path, ("u32",))
+        self.assertEqual(e.path.segments[0][1][0].path, ("u32",))
         inner = expr("Pair.{ a: Point.{ x: 1 }.x }").fields[0][1]
         self.assertIsInstance(inner, S.Field)
         self.assertIsInstance(inner.value, S.StructLit)
@@ -247,6 +248,33 @@ class LexicalTests(unittest.TestCase):
             with self.assertRaises(KursError, msg=src):
                 expr(src)
 
+    def test_a_name_followed_by_bang_is_one_name(self):
+        def kinds(text):
+            return [(t.kind, t.text) for t in Lexer(text, "<t>").run()[:-1]]
+        self.assertEqual(kinds("Foo!"), [("NAME", "Foo!")])
+        self.assertEqual(kinds("Foo! x"), [("NAME", "Foo!"), ("NAME", "x")])
+        self.assertEqual(kinds("Foo!::new"), [("NAME", "Foo!"), ("::", "::"), ("NAME", "new")])
+        self.assertEqual(kinds("Foo ! x"), [("NAME", "Foo"), ("!", "!"), ("NAME", "x")])
+        self.assertEqual(kinds("a!=b"), [("NAME", "a"), ("!=", "!="), ("NAME", "b")])
+        self.assertEqual(kinds("a != b"), [("NAME", "a"), ("!=", "!="), ("NAME", "b")])
+        self.assertEqual(kinds("!x"), [("!", "!"), ("NAME", "x")])
+        self.assertEqual(kinds("!!x"), [("!", "!"), ("!", "!"), ("NAME", "x")])
+        self.assertEqual(kinds("return!x"), [("return", "return"), ("!", "!"), ("NAME", "x")])
+        self.assertEqual(kinds("-> !"), [("->", "->"), ("!", "!")])
+        self.assertEqual(kinds("a!!"), [("NAME", "a!"), ("!", "!")])
+        self.assertEqual(expr("a!=b").op, "!=")
+        self.assertEqual(expr("Foo![u32]::new()").callee.segments[0][0], "Foo!")
+        self.assertEqual(expr("Foo!.{ x }").path.names, ("Foo!",))
+        self.assertEqual(S.parse("struct Foo! { x: u32 }")[0].name, "Foo!")
+        self.assertEqual(S.parse("fn f() -> ! { g() }")[0].ret, S.TNever())
+
+    def test_only_a_type_name_ends_with_bang(self):
+        for src in ("fn f!() {}", "fn f() { let x! = 1u32; }", "forall T!. fn f() {}", "struct S { a!: u32 }",
+                    "enum E { A! }", "fn f(&x!: u32) {}", "fn f() -> u32 { p.x! }", "trait T! {}",
+                    "const C!: u32 = 0u32;", "fn f() { match x { E::A(y!) => () } }"):
+            with self.assertRaisesRegex(KursError, "only a linear type's name ends with !", msg=src):
+                S.parse(src)
+
     def test_f_strings(self):
         e = expr('f"a {x} b {y.z}!"')
         self.assertEqual([p if isinstance(p, str) else type(p).__name__ for p in e.parts],
@@ -258,7 +286,7 @@ class LexicalTests(unittest.TestCase):
         e = expr('f"{Point.{ x: 1 }.x} and {f"inner {y}"} {{braces}}\\n"')
         field, inner = e.parts[1], e.parts[3]
         self.assertIsInstance(field.value, S.StructLit)
-        self.assertEqual(inner.parts, ("inner ", S.Path((("y", False, ()),), inner.parts[1].pos), ""))
+        self.assertEqual(inner.parts, ("inner ", S.Path((("y", ()),), inner.parts[1].pos), ""))
         self.assertEqual(e.parts[4], " {braces}\n")
 
     def test_interpolations_take_a_lend_and_strings(self):
@@ -337,7 +365,7 @@ class ExpressionShapeTests(unittest.TestCase):
 
     def test_type_arguments_in_paths(self):
         e = expr("Result[TomlValue['k], TomlError]::Err(e)")
-        name, _, args = e.callee.segments[0]
+        name, args = e.callee.segments[0]
         self.assertEqual(name, "Result")
         self.assertEqual(args[0].args, (S.TBrand("'k"),))
         self.assertEqual(e.callee.names, ("Result", "Err"))
@@ -424,7 +452,7 @@ class ItemShapeTests(unittest.TestCase):
         self.assertEqual(f.forall.params, ("T", "'k"))
         self.assertEqual(len(f.forall.premises), 2)
         self.assertTrue(f.params[0].lend)
-        self.assertTrue(f.params[0].type.linear)
+        self.assertEqual(f.params[0].type.path, ("Exclusive!",))
 
     def test_determined_parameters(self):
         t = S.parse("forall Self -> Item. trait Iterator { fn next(&it: Self) -> Option[Item]; }")[0]

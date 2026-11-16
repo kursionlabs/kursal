@@ -1166,7 +1166,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         return self.emit("foreach", ty, (vals[0], name, *vals[1:]), ty=ty, tys=self.identity_args(), node=expr)
 
     def expr_fstring(self, expr: S.FStr) -> Optional[str]:
-        sig = self.lowering.library_sig("Buffer::new", self.module)
+        sig = self.lowering.library_sig("Buffer!::new", self.module)
         return self.fstring(expr, self.emit("call", self.substitute_type(expr.ty), (sig.name,), tys=()))
 
     def fstring(self, expr: S.FStr, writer: str) -> Optional[str]:

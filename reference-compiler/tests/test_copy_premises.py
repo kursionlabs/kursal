@@ -54,4 +54,4 @@ class CopyPremiseTests(unittest.TestCase):
                 forall T. impl Box[T] {
                     forall U where Copy[T], Copy[U]. fn drop(self: Box[T], unused: U) -> () { () }
                 }
-                fn main() -> i32 { Box::drop(Box.{ value: Token.{} }, ()); 7i32 }''', 7)
+                fn main() -> i32 { Box::drop(Box.{ value: Token!.{} }, ()); 7i32 }''', 7)

@@ -23,12 +23,12 @@ def lowered(source):
 
 ENUM_JOIN = """
 (type L! (tuple u32))
-(type E! (enum (A L) (B L)))
-(fun consume (tuple) (L)
-  (entry ((%l L)) (= %n (destruct %l L)) (= %u (construct (tuple))) (ret %u)))
-(fun walk (tuple) (E) (locals (&e E))
-  (entry ((%input E)) (= %u (store &e %input))
-    (switch &e E (A (left)) (B (right))))
+(type E! (enum (A L!) (B L!)))
+(fun consume (tuple) (L!)
+  (entry ((%l L!)) (= %n (destruct %l L!)) (= %u (construct (tuple))) (ret %u)))
+(fun walk (tuple) (E!) (locals (&e E!))
+  (entry ((%input E!)) (= %u (store &e %input))
+    (switch &e E! (A (left)) (B (right))))
   (left () (= %a (load &e.A)) (= %u (call consume %a)) (jmp join))
   (right () (= %b (load &e.B)) (= %u (call consume %b)) (jmp join))
   (join () (= %u (construct (tuple))) (ret %u)))
@@ -75,8 +75,8 @@ class JoinTests(unittest.TestCase):
     def test_place_destruct_updates_the_next_header(self):
         program = parse_program("""
 (type L! (tuple u32))
-(fun split u32 (L) (locals (&x L))
-  (entry ((%x L)) (= %u (store &x %x)) (= %n (destruct &x L)) (jmp next %n))
+(fun split u32 (L!) (locals (&x L!))
+  (entry ((%x L!)) (= %u (store &x %x)) (= %n (destruct &x L!)) (jmp next %n))
   (next ((%n u32)) (ret %n)))
 """)
         PlaceFlow(program).plan(program.funs["split"])
@@ -108,7 +108,7 @@ forall 'a. exposed struct Token! { witness: core::cap::Brand['a] }
 fn branch(c: bool) -> u32 {
     if c {
         let exists 'a. witness = core::cap::fresh();
-        let token = Token['a].{ witness: witness };
+        let token = Token!['a].{ witness: witness };
         1u32
     } else { 2u32 }
 }
@@ -139,9 +139,9 @@ fn main() -> u32 { var n = 1u32; let before = n; combine(before, bump(&n)) }
     def test_a_linear_read_and_a_lend_need_an_explicit_binding(self):
         prefix = """
 exposed struct Token! { n: u32 }
-fn bump(&t: Token) -> u32 { t.n = t.n + 1u32; t.n }
-fn consume(t: Token, n: u32) -> u32 { let { n: old } = t; old + n }
+fn bump(&t: Token!) -> u32 { t.n = t.n + 1u32; t.n }
+fn consume(t: Token!, n: u32) -> u32 { let { n: old } = t; old + n }
 """
         with self.assertRaisesRegex(KursError, 'plain read overlaps a lend'):
-            lowered(prefix + "fn use_token(t: Token) -> u32 { consume(t, bump(&t)) }")
-        lowered(prefix + "fn use_token(t: Token) -> u32 { var t = t; let n = bump(&t); consume(t, n) }")
+            lowered(prefix + "fn use_token(t: Token!) -> u32 { consume(t, bump(&t)) }")
+        lowered(prefix + "fn use_token(t: Token!) -> u32 { var t = t; let n = bump(&t); consume(t, n) }")

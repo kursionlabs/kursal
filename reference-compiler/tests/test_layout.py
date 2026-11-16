@@ -17,15 +17,15 @@ from tests.test_resolve import manifest, tree
 
 class LayoutTests(unittest.TestCase):
     def test_copy_query_does_not_accept_a_recursive_obligation(self):
-        alias = C.Program(types={"A": C.TypeDecl("A", False, (), (), C.Named("A"))})
+        alias = C.Program(types={"A": C.TypeDecl("A", (), (), C.Named("A"))})
         wrapped = C.Program(types={"A": C.TypeDecl(
-            "A", False, (), (), C.Struct((("self", C.Named("A")),)))})
+            "A", (), (), C.Struct((("self", C.Named("A")),)))})
         for program in (alias, wrapped):
             with self.subTest(body=program.types["A"].body):
                 self.assertFalse(Types(program).is_copy(C.Named("A")))
 
         pointer = C.Program(types={"A": C.TypeDecl(
-            "A", False, (), (), C.Struct((("next", C.Ptr(C.Named("A"))),)))})
+            "A", (), (), C.Struct((("next", C.Ptr(C.Named("A"))),)))})
         self.assertTrue(Types(pointer).is_copy(C.Named("A")))
 
     def rejects(self, source, message):

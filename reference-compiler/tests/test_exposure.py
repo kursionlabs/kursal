@@ -12,7 +12,7 @@ from tests.test_infer import run
 
 OWNER = C.ModuleId(0, ("owner",))
 CLIENT = C.ModuleId(0, ("client",))
-SECRET = C.Named("Secret")
+SECRET = C.Named("Secret!")
 T = C.Named("T")
 F = C.Named("F")
 
@@ -22,8 +22,8 @@ def exposed(ty):
 
 
 def declarations():
-    secret = C.TypeDecl("Secret", True, (), (), C.Struct((("n", C.U32),)), OWNER, ("owner", OWNER))
-    return C.Program(types={"Secret": secret})
+    secret = C.TypeDecl("Secret!", (), (), C.Struct((("n", C.U32),)), OWNER, ("owner", OWNER))
+    return C.Program(types={"Secret!": secret})
 
 
 def identity():
@@ -55,7 +55,7 @@ class ExposureTests(unittest.TestCase):
         self.assertTrue(types.exposure_available(SECRET, OWNER, {}, ()))
         self.assertFalse(types.exposure_available(SECRET, CLIENT, {}, ()))
         self.assertFalse(types.exposure_available(SECRET, None, {}, ()))
-        program.types["Secret"].exposure = ("within", OWNER)
+        program.types["Secret!"].exposure = ("within", OWNER)
         self.assertTrue(types.exposure_available(SECRET, OWNER.child("nested"), {}, ()))
         self.assertFalse(types.exposure_available(SECRET, CLIENT, {}, ()))
         # Exposing a product does not require exposing the contents of each field.
@@ -63,7 +63,7 @@ class ExposureTests(unittest.TestCase):
 
     def test_pointer_sum_and_hidden_outer_pointer_are_not_traversable(self):
         program = declarations()
-        program.types["Alias"] = C.TypeDecl("Alias", False, (), (), C.Ptr(C.U32))
+        program.types["Alias"] = C.TypeDecl("Alias", (), (), C.Ptr(C.U32))
         types = Types(program)
         self.assertFalse(types.exposure_available(C.Named("Alias"), CLIENT, {}, ()))
         self.assertFalse(types.exposure_available(C.Ptr(C.Enum((("A", C.U32),))), CLIENT, {}, ()))

@@ -47,7 +47,6 @@ class Inferred:
 @dataclass
 class TName(ResolvedName):
     path: NamePath            # name segments
-    linear: bool = False   # written `Name!`
     args: tuple[Type, ...] = ()
     determined: int = 0    # how many trailing args follow `->`
 
@@ -135,7 +134,7 @@ class FStr(Inferred):
 
 @dataclass
 class Path(ResolvedName, Inferred):
-    segments: tuple[tuple[str, bool, tuple[Type, ...]], ...]        # ((name, linear, type args), ...)
+    segments: tuple[tuple[str, tuple[Type, ...]], ...]        # ((name, type args), ...)
     pos: Optional[Position] = None
     # Inference -> lowering: binding ID for a local, or folded value for a constant.
     binder: int = field(init=False, repr=False, compare=False)
@@ -437,8 +436,7 @@ class Module(Declaration):
 
 @dataclass
 class Struct(Declaration):
-    name: str
-    linear: bool
+    name: str              # a linear type's name ends with `!`
     fields: tuple[tuple[str, Type], ...]          # ((name, type), ...)
     exposed: Optional[Exposed] = None # None (restricted) or Exposed
     forall: Optional[Forall] = None
@@ -447,8 +445,7 @@ class Struct(Declaration):
 
 @dataclass
 class TupleDecl(Declaration):
-    name: str
-    linear: bool
+    name: str              # a linear type's name ends with `!`
     elems: tuple[Type, ...]
     exposed: Optional[Exposed] = None
     forall: Optional[Forall] = None
@@ -457,8 +454,7 @@ class TupleDecl(Declaration):
 
 @dataclass
 class EnumDecl(Declaration):
-    name: str
-    linear: bool
+    name: str              # a linear type's name ends with `!`
     variants: tuple[tuple[str, tuple[Type, ...]], ...]        # ((name, payload types), ...)
     exposed: Optional[Exposed] = None
     forall: Optional[Forall] = None

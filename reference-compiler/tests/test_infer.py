@@ -135,11 +135,11 @@ instance Next[Wrap[T] -> I] {
 
     def test_packages(self):
         r = run("forall 'k. struct Tag! { b: core::cap::Brand['k] }\n"
-                "fn mint() -> exists 'r. Tag!['r] { let exists 'a. w = core::cap::fresh(); pack 'a. Tag.{ b: w } }\n"
+                "fn mint() -> exists 'r. Tag!['r] { let exists 'a. w = core::cap::fresh(); pack 'a. Tag!.{ b: w } }\n"
                 "fn f() -> u32 { let exists 'x. t = mint(); let { b } = t; 0u32 }\n")
         let = fn(r, "f").body.stmts[0]
-        self.assertEqual(let.pattern.ty, named("Tag", C.Skolem(let.opened_brands[0])))
-        self.assertEqual(fn(r, "mint").body.tail.ty, C.Exists(("r",), named("Tag", C.Skolem("r"))))
+        self.assertEqual(let.pattern.ty, named("Tag!", C.Skolem(let.opened_brands[0])))
+        self.assertEqual(fn(r, "mint").body.tail.ty, C.Exists(("r",), named("Tag!", C.Skolem("r"))))
 
     def test_function_values(self):
         r = run("fn bump(&c: Cur) -> u32 { 0u32 }\nforall 'k. fn take(b: core::cap::Brand['k]) -> u32 { 0u32 }\n"

@@ -150,7 +150,7 @@ class MatchingTests(unittest.TestCase):
             (fun run u32 () (entry () (= %n (const u32 0)) (ret %n))))""")
         checker = check_program(program)
         self.assertIsNotNone(checker.find_instance("Test", (C.Fn((), C.U32),)))
-        self.assertIsNone(checker.find_instance("Test", (C.Fn((), C.Named("Linear")),)))
+        self.assertIsNone(checker.find_instance("Test", (C.Fn((), C.Named("Linear!")),)))
 
     def test_closed_quantified_types_can_be_parameter_solutions(self):
         closed = C.Exists(("k",), brand("k"))

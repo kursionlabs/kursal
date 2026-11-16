@@ -660,13 +660,13 @@ class Infer:
         for part in expr.parts:
             if not isinstance(part, str):
                 self.expr(part.operand if isinstance(part, S.Unary) and part.op == "&" else part)
-        return C.Named(self.library("Buffer"))
+        return C.Named(self.library("Buffer!"))
 
     def expr_path(self, expr: S.Path) -> C.Type:
         ref = expr.ref
         match ref:
             case ("local", name):
-                if any(args for _, _, args in expr.segments):
+                if any(args for _, args in expr.segments):
                     fail("explicit type arguments on local values are not supported; specialize the named function before binding", expr.pos)
                 local = self.lookup(name)
                 if local is None:
@@ -676,7 +676,7 @@ class Infer:
                 expr.binder = local.id
                 return local.type
             case ("decl", Decl(kind="const") as decl):
-                if any(args for _, _, args in expr.segments):
+                if any(args for _, args in expr.segments):
                     fail("constant paths take no type arguments", expr.pos)
                 expr.folded = self.sigs.const(decl)
                 assert expr.folded[2] is not None
@@ -693,7 +693,7 @@ class Infer:
         Bare names bound by let retain unconstrained brand quantifiers; other
         parameters are instantiated at the occurrence.
         """
-        retain = expr.generic and not any(args for _, _, args in expr.segments)
+        retain = expr.generic and not any(args for _, args in expr.segments)
         kept = tuple(p for p in sig.params if p.kind == C.BRAND and retain and
                      not any(p.name in free_names(zonk(a)) for q in sig.premises for a in q.args))
         sub = instantiate([p for p in sig.params if p not in kept])
@@ -708,8 +708,8 @@ class Infer:
         """Type arguments written on a callee path: on its last segment, the function's own; on the type
         segment of `Type[A]::f`, its impl's."""
         segments, decl = path.segments, sig.decl
-        own = segments[-1][2]
-        for index, (_, _, args) in enumerate(segments[:-1]):
+        own = segments[-1][1]
+        for index, (_, args) in enumerate(segments[:-1]):
             if args and not (index == len(segments) - 2 and decl is not None and decl.kind == "method"):
                 fail("function type arguments cannot appear on a namespace", path.pos)
         impl_params = len(decl.impl.forall.params + decl.impl.forall.determined) \
@@ -723,7 +723,7 @@ class Infer:
             for p, a in zip(params, own):
                 if not isinstance(a, S.TIgnored) and a != S.TBrand("'_") and p.name in sub:
                     self.unify(sub[p.name], self.type(a), path.pos)
-        if len(segments) >= 2 and segments[-2][2] and decl is not None and decl.kind == "method":
+        if len(segments) >= 2 and segments[-2][1] and decl is not None and decl.kind == "method":
             assert decl.impl is not None
             target = self.sigs.type(decl.impl.type, self.sigs.forall(decl.impl.forall, Scope())[2])
             if not isinstance(target, C.Named):
@@ -731,18 +731,18 @@ class Infer:
             owner = self.r.lookup(self.module, path.names[:-1], path.pos)
             if not isinstance(owner, Decl) or self.sigs.name(owner) != target.name:
                 fail("method type arguments belong on the impl type, not a namespace", path.pos)
-            if len(segments[-2][2]) != len(target.args):
+            if len(segments[-2][1]) != len(target.args):
                 fail(f"the impl type qualifier takes {len(target.args)} type arguments", path.pos)
-            written = C.Named(target.name, tuple(self.type(a) for a in segments[-2][2]))
+            written = C.Named(target.name, tuple(self.type(a) for a in segments[-2][1]))
             self.unify(subst(target, sub), written, path.pos)
 
     def path_arguments(self, path: S.Path, declaration: Decl, *, member: bool = False) -> tuple[S.Type, ...]:
         """Arguments belong on the declaration name, before a variant/method if present."""
         owner = len(path.segments) - (2 if member else 1)
-        for index, (_, _, args) in enumerate(path.segments):
+        for index, (_, args) in enumerate(path.segments):
             if args and index != owner:
                 fail(f"type arguments belong on {declaration.name}, not a namespace or member", path.pos)
-        written = path.segments[owner][2] if owner >= 0 else ()
+        written = path.segments[owner][1] if owner >= 0 else ()
         if member and written and self.r.lookup(self.module, path.names[:-1], path.pos) is not declaration:
             fail(f"type arguments belong on {declaration.name}, not a namespace", path.pos)
         return written
@@ -1214,7 +1214,7 @@ class Infer:
     def assoc_call(self, expr: S.Call, param: str, name: str) -> C.Type:
         """`T::name(args)` for a type parameter `T`: the one bound of `T` with that method."""
         assert isinstance(expr.callee, S.Path)
-        if any(args for _, _, args in expr.callee.segments):
+        if any(args for _, args in expr.callee.segments):
             fail("an associated parameter call takes its type arguments from its trait premise", expr.pos)
         found = [p for p in self.assumptions if p.trait in self.sigs.traits
                  and any(m.name == name for m in self.sigs.traits[p.trait].methods)
@@ -1232,8 +1232,8 @@ class Infer:
                 fail("fence takes one ordering argument", expr.pos)
             fail(f"{name} takes {BUILTIN_ARITY[name]} value arguments", expr.pos)
         assert isinstance(expr.callee, S.Path)
-        targs = expr.callee.segments[-1][2]
-        if any(args for _, _, args in expr.callee.segments[:-1]):
+        targs = expr.callee.segments[-1][1]
+        if any(args for _, args in expr.callee.segments[:-1]):
             fail(f"type arguments belong on {name}, not a namespace", expr.pos)
         expected_types = 1 if name in ("alloca", "sizeof") else 0
         if len(targs) != expected_types:

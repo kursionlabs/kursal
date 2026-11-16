@@ -47,10 +47,10 @@ class LocalScopeTests(unittest.TestCase):
 
     def test_partial_linear_product_reconstructs_after_field_store(self):
         self.run_source('''exposed struct H! { value: u32 }
-            forall 'a. exposed struct Tagged! { witness: core::cap::Brand['a], h: H }
+            forall 'a. exposed struct Tagged! { witness: core::cap::Brand['a], h: H! }
             fn main() -> i32 {
                 let exists 'a. w = core::cap::fresh();
-                var tagged = Tagged.{ witness: w, h: H.{ value: 7u32 } };
+                var tagged = Tagged!.{ witness: w, h: H!.{ value: 7u32 } };
                 let moved = tagged.h;
                 if true { let snapshot = tagged.witness; } else { () };
                 tagged.h = moved;
