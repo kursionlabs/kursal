@@ -32,9 +32,12 @@ struct SpawnPayload {
     f: closure[Env]() -> Ret,
 }
 
+// `present` gives the box bytes even when `Ret` has none (`()`, a
+// capability), so it can be stored and loaded through a pointer.
 forall Ret.
 struct ResultBox {
     value: Ret,
+    present: bool,
 }
 
 forall Ret.
@@ -45,8 +48,13 @@ struct Thread! {
 // Runs on the new thread, instantiated once per `(Env, Ret)`. Takes
 // ownership of the heap payload `spawn` built, frees the box, calls the
 // closure exactly once, and boxes the result for `join` to unbox.
+//
+// `unsafe fn`: `raw` must be the `SpawnPayload[Env, Ret]` box `spawn`
+// built for this same `(Env, Ret)`, owned by nothing else. It is read,
+// freed and its closure called; any other pointer is read and freed
+// as one.
 forall Env, Ret.
-fn trampoline(raw: *u8) -> *u8 {
+unsafe fn trampoline(raw: *u8) -> *u8 {
     let typed_in = unsafe (raw as *SpawnPayload[Env, Ret]);
     let payload = unsafe *typed_in;
     let { f } = payload;
@@ -56,22 +64,32 @@ fn trampoline(raw: *u8) -> *u8 {
     let out = HeapAllocator::alloc(sizeof[ResultBox[Ret]]());
     let out_raw = out.into_raw();
     let typed_out = unsafe (out_raw as *ResultBox[Ret]);
-    unsafe *typed_out = ResultBox.{ value };
+    unsafe *typed_out = ResultBox.{ value, present: true };
     unsafe (typed_out as *u8)
 }
 
 // Spawns an OS thread running `f()`; `join` returns `f`'s result, typed
-// as `Ret`. The header explains why this is safe to call.
+// as `Ret`. The header explains why this is safe to call. When no thread
+// can be started, `f` comes back unrun with the error, so what it captured
+// is still the caller's.
 forall Env, Ret.
-fn spawn(f: closure[Env]() -> Ret) -> Result[Thread![Ret], ThreadError] {
+fn spawn(f: closure[Env]() -> Ret) -> Result[Thread![Ret], (closure[Env]() -> Ret, ThreadError)] {
     let payload = SpawnPayload.{ f };
     let boxed = HeapAllocator::alloc(sizeof[SpawnPayload[Env, Ret]]());
     let raw = boxed.into_raw();
     let typed = unsafe (raw as *SpawnPayload[Env, Ret]);
     unsafe *typed = payload;
+    // `raw_spawn`'s obligation: `raw` is the box just written, which only
+    // the new thread's `trampoline[Env, Ret]` reads, and only when the
+    // thread starts; this thread reads it again only when it does not.
     let spawned = unsafe raw_spawn(trampoline[Env, Ret], raw);
     match spawned {
-        Result::Err(error) => Result::Err.(ThreadError.{ code: error }),
+        Result::Err(error) => {
+            // No thread was started, so the box is still this call's.
+            let { f } = unsafe *typed;
+            let freed = HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(raw));
+            Result::Err.((f, ThreadError.{ code: error }))
+        },
         Result::Ok(raw_thread) => Result::Ok.(Thread.{ raw: raw_thread }),
     }
 }
@@ -91,7 +109,7 @@ impl Thread[Ret] {
             Result::Ok(result_ptr) => {
                 let typed = unsafe (result_ptr as *ResultBox[Ret]);
                 let boxed_result = unsafe *typed;
-                let { value } = boxed_result;
+                let { value, present } = boxed_result;
                 let reclaimed = unsafe HeapAllocator::adopt_raw(result_ptr);
                 let freed = HeapAllocator::drop(reclaimed);
                 Result::Ok.(value)

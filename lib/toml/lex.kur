@@ -7,7 +7,7 @@ use std::bytes::buffer::Buffer;
 use std::collections::list::List;
 use std::cap::Exclusive;
 use std::option::{Option, Result};
-use std::raw::{Span, raw_byte_at};
+use std::raw::Span;
 
 exposed enum TomlError {
     Syntax(usize),
@@ -408,18 +408,21 @@ unsafe fn toml_bare(&tag: Exclusive!['k], text: Span['k], start: usize) -> Resul
     span_result
 }
 
-// The owning input remains live throughout scanning; all token text is copied
-// into the supplied arena before the input is destroyed, including on error.
+// The input is read through `open`, under a brand of its own that the end
+// of the scan retires; all token text is copied into the supplied arena
+// before the input is destroyed, including on error.
 forall 'k.
 fn tokenize(&cx: Domain!['k], input: Buffer!) -> Result[List[TomlToken['k], 'k], TomlError] {
-    let p = unsafe &input.as_ptr();
-    let n = &input.len();
-    let text = unsafe Span::from_raw_parts(&cx.tag, p, n);
+    let exists 'b. (tag, bytes, restore) = input.open();
+    let (p, n, m) = bytes.into_parts();
+    // `p[0..n)` is the input's initialized prefix, readable while `tag`
+    // lives; `restore` takes `tag` back, so no use of `text` outlives it.
+    let text = unsafe Span::from_raw_parts(&tag, p, n);
     var i = 0usize;
     var status = Result[(), TomlError]::Ok.(());
     var running = true;
     while i < n && running {
-        match toml_codepoint(&cx.tag, text, i) {
+        match toml_codepoint(&tag, text, i) {
             Result::Err(error) => {
                 status = Result[(), TomlError]::Err.(error);
                 running = false;
@@ -433,7 +436,7 @@ fn tokenize(&cx: Domain!['k], input: Buffer!) -> Result[List[TomlToken['k], 'k],
     i = 0usize;
     var tokens = List::Empty;
     while i < n && running {
-        let byte = unsafe raw_byte_at(p, n, i);
+        let byte = text.byte_or_zero(&tag, i);
         let offset = i;
         if byte == b' ' || byte == b'\t' {
             i = i + 1usize;
@@ -442,7 +445,7 @@ fn tokenize(&cx: Domain!['k], input: Buffer!) -> Result[List[TomlToken['k], 'k],
                 i = i + 1usize;
                 var comment = true;
                 while i < n && comment && running {
-                    let c = unsafe raw_byte_at(p, n, i);
+                    let c = text.byte_or_zero(&tag, i);
                     if c == b'\n' || c == b'\r' {
                         comment = false;
                     } else {
@@ -456,7 +459,7 @@ fn tokenize(&cx: Domain!['k], input: Buffer!) -> Result[List[TomlToken['k], 'k],
                 }
             } else {
                 if byte == b'"' || byte == b'\'' {
-                    match unsafe toml_string(&cx.tag, text, i) {
+                    match unsafe toml_string(&tag, text, i) {
                         Result::Err(error) => {
                             status = Result[(), TomlError]::Err.(error);
                             running = false;
@@ -482,7 +485,7 @@ fn tokenize(&cx: Domain!['k], input: Buffer!) -> Result[List[TomlToken['k], 'k],
                             } else {
                                 if byte == b'\r' {
                                     let crlf = if i + 1usize < n {
-                                        unsafe raw_byte_at(p, n, i + 1usize) == b'\n'
+                                        text.byte_or_zero(&tag, i + 1usize) == b'\n'
                                     } else {
                                         false
                                     };
@@ -493,7 +496,7 @@ fn tokenize(&cx: Domain!['k], input: Buffer!) -> Result[List[TomlToken['k], 'k],
                                         Result::Err.(TomlError::Syntax.(i))
                                     }
                                 } else {
-                                    match unsafe toml_bare(&cx.tag, text, i) {
+                                    match unsafe toml_bare(&tag, text, i) {
                                         Result::Err(error) => Result::Err.(error),
                                         Result::Ok(decoded) => {
                                             let (buffer, next) = decoded;
@@ -519,7 +522,7 @@ fn tokenize(&cx: Domain!['k], input: Buffer!) -> Result[List[TomlToken['k], 'k],
             }
         }
     }
-    let unit = input.destroy();
+    restore.restore(tag).destroy();
     match status {
         Result::Err(error) => Result::Err.(error),
         Result::Ok(unit) => {

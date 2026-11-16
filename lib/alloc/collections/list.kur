@@ -32,8 +32,9 @@ exposed struct Cons {
 forall T, 'k.
 impl List[T, 'k] {
     // Prepends `head`. The cell is arena-allocated, so it needs no free
-    // of its own; the whole arena is freed as a unit.
-    forall C, R where Allocate[C -> 'k, R].
+    // of its own; the whole arena is freed as a unit. `T` is `Copy`, as
+    // everything in an arena is.
+    forall C, R where Copy[T], Allocate[C -> 'k, R].
     fn cons(self, &cx: C, head: T) -> List[T, 'k] {
         List::Cell.(Ref::new(&cx, Cons.{ head, tail: self }))
     }
@@ -77,13 +78,18 @@ impl List[T, 'k] {
 
     forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q].
     fn append(self, &cx: C, other: List[T, 'k]) -> List[T, 'k] {
-        match self {
-            List::Empty => other,
-            List::Cell(r) => {
-                let cell = r.copy(&cx);
-                cell.tail.append(&cx, other).cons(&cx, cell.head)
-            },
+        var out = ListBuilder::new();
+        var rest = self;
+        var going = true;
+        while going {
+            match &rest.pop(&cx) {
+                Option::Some(x) => &out.push(&cx, x),
+                Option::None => {
+                    going = false;
+                },
+            }
         }
+        out.finish(&cx, other)
     }
 
     // Reverses `self` onto the front of `acc`; a nonempty `acc` merges
@@ -311,60 +317,75 @@ impl List[T, 'k] {
     forall E, Env, C, R where Access[C -> 'k, R], Copy[Env].
     fn try_each(self, &cx: C, f: closure[Env](&_: C, T) -> Result[(), E]) -> Result[(), E] {
         var rest = self;
-        let next = &rest.pop(&cx);
-        match next {
-            Option::Some(x) => {
-                f(&cx, x)?;
-                rest.try_each(&cx, f)
-            },
-            Option::None => Result::Ok.(()),
+        while true {
+            match &rest.pop(&cx) {
+                Option::Some(x) => {
+                    f(&cx, x)?;
+                },
+                Option::None => {
+                    return Result::Ok.(());
+                },
+            }
         }
+        Result::Ok.(())
     }
 
     // `acc` through `f` with each element, stopping at the first error.
     forall A, E, Env, C, R where Access[C -> 'k, R], Copy[Env].
     fn try_fold(self, &cx: C, acc: A, f: closure[Env](&_: C, A, T) -> Result[A, E]) -> Result[A, E] {
         var rest = self;
-        let next = &rest.pop(&cx);
-        match next {
-            Option::Some(x) => {
-                let next = f(&cx, acc, x)?;
-                rest.try_fold(&cx, next, f)
-            },
-            Option::None => Result::Ok.(acc),
+        var acc = acc;
+        while !rest.is_empty() {
+            match &rest.pop(&cx) {
+                Option::Some(x) => {
+                    acc = f(&cx, acc, x)?;
+                },
+                Option::None => (),
+            }
         }
+        Result::Ok.(acc)
     }
 
     // Each element through `f`.
-    forall U, Env, C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], Copy[Env].
+    forall U, Env, C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], Copy[U], Copy[Env].
     fn map(self, &cx: C, f: closure[Env](&_: C, T) -> U) -> List[U, 'k] {
+        var out = ListBuilder::new();
         var rest = self;
-        let next = &rest.pop(&cx);
-        match next {
-            Option::Some(x) => {
-                let head = f(&cx, x);
-                rest.map(&cx, f).cons(&cx, head)
-            },
-            Option::None => List::Empty,
+        var going = true;
+        while going {
+            match &rest.pop(&cx) {
+                Option::Some(x) => {
+                    let u = f(&cx, x);
+                    &out.push(&cx, u);
+                },
+                Option::None => {
+                    going = false;
+                },
+            }
         }
+        out.finish(&cx, List::Empty)
     }
 
     // The values `f` returns, skipping the elements it returns none for.
-    forall U, Env, C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], Copy[Env].
+    forall U, Env, C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], Copy[U], Copy[Env].
     fn filter_map(self, &cx: C, f: closure[Env](&_: C, T) -> Option[U]) -> List[U, 'k] {
+        var out = ListBuilder::new();
         var rest = self;
-        let next = &rest.pop(&cx);
-        match next {
-            Option::Some(x) => {
-                let head = f(&cx, x);
-                let tail = rest.filter_map(&cx, f);
-                match head {
-                    Option::Some(u) => tail.cons(&cx, u),
-                    Option::None => tail,
-                }
-            },
-            Option::None => List::Empty,
+        var going = true;
+        while going {
+            match &rest.pop(&cx) {
+                Option::Some(x) => {
+                    match f(&cx, x) {
+                        Option::Some(u) => &out.push(&cx, u),
+                        Option::None => (),
+                    }
+                },
+                Option::None => {
+                    going = false;
+                },
+            }
         }
+        out.finish(&cx, List::Empty)
     }
 
     // The elements `f` holds for.
@@ -376,15 +397,61 @@ impl List[T, 'k] {
     // Each element through `f`, stopping at the first error.
     forall U, E, Env, C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], Copy[U], Copy[Env].
     fn try_map(self, &cx: C, f: closure[Env](&_: C, T) -> Result[U, E]) -> Result[List[U, 'k], E] {
+        var out = ListBuilder::new();
         var rest = self;
-        let next = &rest.pop(&cx);
-        match next {
-            Option::Some(x) => {
-                let head = f(&cx, x)?;
-                let tail = rest.try_map(&cx, f)?;
-                Result::Ok.(tail.cons(&cx, head))
+        while !rest.is_empty() {
+            match &rest.pop(&cx) {
+                Option::Some(x) => {
+                    let u = f(&cx, x)?;
+                    &out.push(&cx, u);
+                },
+                Option::None => (),
+            }
+        }
+        Result::Ok.(out.finish(&cx, List::Empty))
+    }
+}
+
+// A list built front to back in one pass: `push` links a new last cell
+// after the previous one, so the list comes out in push order with one
+// cell per element and no recursion. `finish` ends it with a given tail.
+forall T, 'k.
+exposed struct ListBuilder {
+    first: List[T, 'k],
+    last: Option[Ref[Cons[T, 'k], 'k]],
+}
+
+forall T, 'k where Copy[T].
+impl ListBuilder[T, 'k] {
+    fn new() -> ListBuilder[T, 'k] {
+        ListBuilder.{ first: List::Empty, last: Option::None }
+    }
+
+    forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q].
+    fn push(&self, &cx: C, value: T) {
+        let cell = Ref::new(&cx, Cons.{ head: value, tail: List::Empty });
+        match self.last {
+            Option::None => {
+                self.first = List::Cell.(cell);
             },
-            Option::None => Result::Ok.(List::Empty),
+            Option::Some(r) => {
+                let previous = r.copy(&cx);
+                r.set(&cx, Cons.{ head: previous.head, tail: List::Cell.(cell) });
+            },
+        }
+        self.last = Option::Some.(cell);
+    }
+
+    // The list pushed so far, followed by `tail`.
+    forall C, R where Access[C -> 'k, R].
+    fn finish(self, &cx: C, tail: List[T, 'k]) -> List[T, 'k] {
+        match self.last {
+            Option::None => tail,
+            Option::Some(r) => {
+                let previous = r.copy(&cx);
+                r.set(&cx, Cons.{ head: previous.head, tail });
+                self.first
+            },
         }
     }
 }

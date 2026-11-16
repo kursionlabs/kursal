@@ -17,10 +17,13 @@
 // Unlike `Owned!` or `Vec!`, an arena does not track what it contains: it
 // holds any number of values of different types with no way to walk them.
 // `destroy` therefore cannot route every contained value through a
-// consumer, and a linear value stored in an arena and never read back out
-// leaks. Arenas are meant for `Copy` node data forming self-referential
-// structures; their safety is aliasing safety through `Exclusive!`/`Ref`,
-// not per-node linearity.
+// consumer, so everything stored in an arena is `Copy`: `alloc`,
+// `alloc_slice` and `Ref::new` require it, and the arena collections
+// (`ArenaVec`, `ArenaMap`, `ArenaSet`, `List`) require it of their
+// elements. A linear value never enters an arena, so none is lost when the
+// arena goes. Arenas are meant for `Copy` node data forming
+// self-referential structures; their safety is aliasing safety through
+// `Exclusive!`/`Ref`.
 //
 // `Chunk` and `Arena!` are restricted, so no other module can construct or
 // destructure them. Forging an `Arena!` would pair a chunk chain with a
@@ -41,7 +44,7 @@ use alloc::buffer::Buffer;
 use core::raw::{Span, elem_ptr};
 use core::slice::{ReadBytes, Slice};
 use core::option::Option;
-use alloc::heap::checked_mul;
+use alloc::heap::{checked_add, checked_mul};
 
 struct Chunk {
     data: *u8,
@@ -110,10 +113,13 @@ fn type_align() -> usize {
     sizeof[AlignProbe[T]]() - sizeof[T]()
 }
 
-// `alignment` is a power of two (`type_align`'s C alignment), so the
-// padding up to the next multiple of it is a mask rather than a division.
-fn padding_for(used: usize, alignment: usize) -> usize {
-    (0usize - used) & (alignment - 1usize)
+// The padding that brings the address `at` up to the next multiple of
+// `alignment`. `alignment` is a power of two (`type_align`'s C alignment),
+// so this is a mask rather than a division. Callers pass the address, not
+// an offset into a chunk, so the result holds whatever alignment `malloc`
+// gave the chunk.
+fn padding_for(at: usize, alignment: usize) -> usize {
+    (0usize - at) & (alignment - 1usize)
 }
 
 // Check capacity by subtraction so wrapping usize addition cannot make an
@@ -141,8 +147,8 @@ unsafe fn byte_ptr_at(base: *u8, off: usize) -> *u8 {
 
 // Allocates the chunk header for an already-allocated data buffer. Kept
 // separate from `new_chunk` so that `Arena::new` can pass the root buffer's
-// `Uninit!` straight to `Allocation::adopt`, which records the allocator's
-// extent.
+// `Uninit!` straight to `Allocation::adopt_value`, which records the
+// allocator's extent.
 //
 // The header is a small, separate heap allocation (simpler than packing
 // it into the front of `data`, at the cost of one extra alloc/drop pair
@@ -192,15 +198,16 @@ unsafe fn new_chunk(min_cap: usize, next: *Chunk) -> *Chunk {
 // Requires: `cur` is the arena's live current chunk.
 unsafe fn bump_chunk(cur: *Chunk, need: usize, alignment: usize) -> (*Chunk, *u8) {
     let { data: d, used: u, cap: c, next: n } = unsafe *cur;
-    let padding = padding_for(u, alignment);
+    let padding = padding_for(unsafe (d as usize) + u, alignment);
     if has_room(u, c, padding, need) {
         let start = u + padding;
         unsafe *cur = Chunk.{ data: d, used: start + need, cap: c, next: n };
         (cur, unsafe byte_ptr_at(d, start))
     } else {
-        let fresh = unsafe new_chunk(need, cur);
+        // Room for the padding too, whatever alignment `malloc` gives.
+        let fresh = unsafe new_chunk(checked_add(need, alignment), cur);
         let { data: d2, used: u2, cap: c2, next: n2 } = unsafe *fresh;
-        let start = u2 + padding_for(u2, alignment);
+        let start = u2 + padding_for(unsafe (d2 as usize) + u2, alignment);
         unsafe *fresh = Chunk.{ data: d2, used: start + need, cap: c2, next: n2 };
         (fresh, unsafe byte_ptr_at(d2, start))
     }
@@ -238,8 +245,9 @@ impl Arena {
         let nullchunk = unsafe (z as *Chunk);
         let cap = 4096usize;
         // The root chunk's data buffer goes straight from the allocator into
-        // `Allocation::adopt`, which mints and seals a fresh brand.
-        let exists 'open1. (a, rg) = Allocation::adopt[u8](HeapAllocator::alloc(cap));
+        // `Allocation::adopt_value`, which mints and seals a fresh brand over
+        // it, with its first byte zeroed.
+        let exists 'open1. (a, rg) = Allocation::adopt_value[u8](HeapAllocator::alloc(cap), 0u8);
         let (tag, base_ref, bk) = rg.share();
         // `share` hands the brand out inside the `Ref`; `Arena!` keeps it as
         // a value in `marker`, because `alloc` brands pointers this module
@@ -263,8 +271,9 @@ impl Arena['k] {
     // and hands back a `Ref` under the arena's own, never-changing brand --
     // growing into a fresh chunk first if the current one doesn't have room
     // for both alignment padding and the value, but never rebranding either
-    // way.
-    forall T.
+    // way. `T` is `Copy`: the arena frees its chunks without reading them,
+    // so a linear value stored here would never reach its consumer.
+    forall T where Copy[T].
     fn alloc(&self, &tag: Exclusive!['k], val: T) -> Ref[T, 'k] {
         let { root: a, back: bk, current: cur, marker: m } = self;
         let (cur2, target) = unsafe bump_chunk(cur, sizeof[T](), type_align[T]());
@@ -308,7 +317,7 @@ impl Arena['k] {
     // The caller's witness is consumed by real work: `resume` demands this
     // exact `Exclusive!['k]` and rebuilds the root chunk's `Region![u8,'k]`,
     // `release` demands that complete region and returns the `Uninit!` whose
-    // base and extent `Allocation::adopt` read off the allocator, and `drop`
+    // base and extent `Allocation::adopt_value` read off the allocator, and `drop`
     // frees it. No `Ref` is constructed on the path. The remaining headers
     // and non-root buffers are freed by `free_chain_after_root_release`.
     fn destroy(self, tag: Exclusive!['k]) -> () {
@@ -425,8 +434,9 @@ instance ReadBytes[Domain!['k], Span['k]] {
 
 forall T, 'k.
 impl Ref[T, 'k] {
-    // `value`, put in the context's arena.
-    forall C, R where Allocate[C -> 'k, R].
+    // `value`, put in the context's arena. `T` is `Copy`, as for
+    // `Arena::alloc`.
+    forall C, R where Copy[T], Allocate[C -> 'k, R].
     fn new(&cx: C, value: T) -> Ref[T, 'k] {
         let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
         let r = &arena.alloc(&tag, value);

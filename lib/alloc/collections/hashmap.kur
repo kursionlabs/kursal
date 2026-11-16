@@ -17,13 +17,14 @@
 // pointer is always Copy. `hash_fn`/`eq_fn` take `*K` for the same reason
 // and dereference it at their concrete key type.
 //
-// Brand policy: `insert` and `remove` return a fresh `Exclusive!['2]`,
-// minted by `Allocation::adopt` and sealed by the operation's `exists '2.`
-// return. Read-only operations (`len`, the lookups) present the caller's
+// Brand policy: every operation that adds or frees an entry (`insert`,
+// `remove`, their `_in` and `_with` forms) returns a fresh
+// `Exclusive!['2]`, minted by `Allocation::adopt` and sealed by the
+// operation's `exists '2.` return. Read-only operations (`len`, the lookups) present the caller's
 // `Exclusive!['k]` and hand it back. `insert` may replace the bucket array
 // (`resize`), and a new block always gets a new brand, so a `Ref[V,'k]`
 // taken before an `insert` cannot be used after it, even though entries
-// themselves never move.
+// themselves never move; and `remove` frees the entry a `Ref` may name.
 
 use package as alloc;
 
@@ -320,7 +321,9 @@ impl HashMap[K, V] {
     fn new() -> exists '1. (Exclusive!['1], HashMap![K, V, '1]) {
         let initial_buckets = 8usize;
         let (u, base) = unsafe alloc_buckets[K, V](initial_buckets);
-        let exists 'open1. (a, rg) = Allocation::adopt[*Entry[K, V]](u);
+        // `adopt`'s obligation: `alloc_buckets` writes the null entry to every
+        // one of the (at least 8) slots, so the block holds initialized `*Entry`s.
+        let exists 'open1. (a, rg) = unsafe Allocation::adopt[*Entry[K, V]](u);
         let (tag, r, bk) = rg.share();
         pack 'open1. (tag, HashMap.{ alloc: a, back: bk, buckets: r, bucket_count: initial_buckets, len: 0usize })
     }
@@ -388,7 +391,9 @@ impl HashMap[K, V, 'k] {
         } else {
             (u0, bc)
         };
-        let exists 'open1. (a2, rg2) = Allocation::adopt[*Entry[K, V]](u1);
+        // `adopt`'s obligation: `alloc_buckets` writes the null entry to every
+        // one of the (at least 8) slots, so the block holds initialized `*Entry`s.
+        let exists 'open1. (a2, rg2) = unsafe Allocation::adopt[*Entry[K, V]](u1);
         let (tag2, r2, bk2) = rg2.share();
         pack 'open1. (tag2, HashMap.{ alloc: a2, back: bk2, buckets: r2, bucket_count: new_bc, len: new_len }, found)
     }
@@ -415,7 +420,9 @@ impl HashMap[K, V, 'k] {
         let (new_head, found, removed) = unsafe remove_chain[K, V](head, key_ptr, eq_fn);
         unsafe *s = new_head;
         let new_len = if removed { n - 1usize } else { n };
-        let exists 'open1. (a2, rg2) = Allocation::adopt[*Entry[K, V]](u0);
+        // `adopt`'s obligation: `alloc_buckets` writes the null entry to every
+        // one of the (at least 8) slots, so the block holds initialized `*Entry`s.
+        let exists 'open1. (a2, rg2) = unsafe Allocation::adopt[*Entry[K, V]](u0);
         let (tag2, r2, bk2) = rg2.share();
         pack 'open1. (tag2, HashMap.{ alloc: a2, back: bk2, buckets: r2, bucket_count: bc, len: new_len }, found)
     }
@@ -693,14 +700,18 @@ impl HashMap[K, V, 'k] {
         } else {
             (u0, bc)
         };
-        let exists 'open1. (a2, rg2) = Allocation::adopt[*Entry[K, V]](u1);
+        // `adopt`'s obligation: `alloc_buckets` writes the null entry to every
+        // one of the (at least 8) slots, so the block holds initialized `*Entry`s.
+        let exists 'open1. (a2, rg2) = unsafe Allocation::adopt[*Entry[K, V]](u1);
         let (tag2, r2, bk2) = rg2.share();
         pack 'open1. (tag2, HashMap.{ alloc: a2, back: bk2, buckets: r2, bucket_count: new_bc, len: new_len }, found)
     }
 
-    // `remove` for a domain key, handing back its value.
+    // `remove` for a domain key, handing back its value. The entry's
+    // storage is freed, so the map comes back freshly branded, as from
+    // `remove`, and no `Ref` from `get_in` survives the call.
     forall C where HashIn[K, C].
-    fn remove_in(&self, &tag: Exclusive!['k], &cap: C, key: K) -> Found[V] {
+    fn remove_in(self, tag: Exclusive!['k], &cap: C, key: K) -> exists '2. (Exclusive!['2], HashMap![K, V, '2], Found[V]) {
         let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n } = self;
         let (base, m) = r.into_parts();
         let h = hash_key_in[K, C](&cap, key);
@@ -709,8 +720,13 @@ impl HashMap[K, V, 'k] {
         let (new_head, found, removed) = unsafe take_chain_in[K, V, C](&cap, head, key);
         unsafe *s = new_head;
         let new_len = if removed { n - 1usize } else { n };
-        self = HashMap.{ alloc: a, back: bk, buckets: r, bucket_count: bc, len: new_len };
-        found
+        let rg = bk.resume(tag);
+        let u0 = a.release(rg);
+        // `adopt`'s obligation: `alloc_buckets` writes the null entry to every
+        // one of the (at least 8) slots, so the block holds initialized `*Entry`s.
+        let exists 'open1. (a2, rg2) = unsafe Allocation::adopt[*Entry[K, V]](u0);
+        let (tag2, r2, bk2) = rg2.share();
+        pack 'open1. (tag2, HashMap.{ alloc: a2, back: bk2, buckets: r2, bucket_count: bc, len: new_len }, found)
     }
 }
 
@@ -756,7 +772,9 @@ impl HashMap[K, V, 'k] {
         } else {
             (u0, bc)
         };
-        let exists 'open1. (a2, rg2) = Allocation::adopt[*Entry[K, V]](u1);
+        // `adopt`'s obligation: `alloc_buckets` writes the null entry to every
+        // one of the (at least 8) slots, so the block holds initialized `*Entry`s.
+        let exists 'open1. (a2, rg2) = unsafe Allocation::adopt[*Entry[K, V]](u1);
         let (tag2, r2, bk2) = rg2.share();
         pack 'open1. (tag2, HashMap.{ alloc: a2, back: bk2, buckets: r2, bucket_count: new_bc, len: new_len }, found)
     }
@@ -777,7 +795,9 @@ impl HashMap[K, V, 'k] {
         let new_len = if removed { n - 1usize } else { n };
         let rg = bk.resume(tag);
         let u0 = a.release(rg);
-        let exists 'open1. (a2, rg2) = Allocation::adopt[*Entry[K, V]](u0);
+        // `adopt`'s obligation: `alloc_buckets` writes the null entry to every
+        // one of the (at least 8) slots, so the block holds initialized `*Entry`s.
+        let exists 'open1. (a2, rg2) = unsafe Allocation::adopt[*Entry[K, V]](u0);
         let (tag2, r2, bk2) = rg2.share();
         pack 'open1. (tag2, HashMap.{ alloc: a2, back: bk2, buckets: r2, bucket_count: bc, len: new_len }, key, found)
     }
@@ -1117,8 +1137,8 @@ impl OwnedMap[K, V] {
     forall C where HashIn[K, C].
     fn remove_in(&self, &cap: C, key: K) -> Found[V] {
         let exists 'm. (tag, map) = self.inner;
-        let old = &map.remove_in(&tag, &cap, key);
-        self = OwnedMap.{ inner: pack 'm. (tag, map) };
+        let exists '2. (tag, map, old) = map.remove_in(tag, &cap, key);
+        self = OwnedMap.{ inner: pack '2. (tag, map) };
         old
     }
 

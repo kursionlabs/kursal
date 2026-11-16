@@ -69,7 +69,7 @@ capability for that brand would therefore make the authority copyable too.
 **No library function does this.** The only ways to obtain an
 `Exclusive!['k]` are to be handed one or to mint a fresh brand nobody else
 has. Every minting entry point (`core::cap::Exclusive::fresh`,
-`alloc::owned::Allocation::adopt`, `Vec::new`, `HashMap::new`,
+`alloc::owned::Allocation::adopt` and `adopt_value`, `Vec::new`, `HashMap::new`,
 `Arena::new`, `Vec::reserve_n`, ...) mints its brand internally and returns
 it **sealed** in an `exists`, so the brand is fresh per call and no caller
 can name it in advance. Forging a second capability for a live brand is not
@@ -204,6 +204,8 @@ double free.
 | `alloc::heap::HeapAllocator::adopt_raw` | `p` is a live `malloc`/`realloc` result with no other owner; it becomes a linear, freeable `Uninit!`. Records extent 0, since the size did not travel with the address |
 | `alloc::heap::HeapAllocator::adopt_raw_sized` | `adopt_raw`'s obligation, **plus** `extent` is the size most recently requested for that block. With `adopt_raw`, the only way into an `Uninit!` from a bare pointer |
 | `alloc::buffer::Buffer::from_owned_ptr` | `adopt_raw` one layer up: `p` is a live `malloc`/`realloc` result of at least `cap` bytes with no other owner, `len <= cap`, and `p[0..len)` is initialized. The result is linear and frees `p` at `destroy` |
+| `thread::thread::trampoline` | `raw` is the `SpawnPayload[Env, Ret]` box `thread::spawn` built for the same `Env` and `Ret`, owned by nothing else: it is read, freed, and its closure called once. Reached only through the pointer `spawn` hands `libc::thread::spawn` |
+| `libc::thread::spawn` | `entry(arg)` is a call whose obligations hold on the new thread (`entry` is typed `unsafe fn(*u8) -> *u8` for that reason); `arg`'s pointee stays valid while the new thread may use it, and accesses to it from the two threads are safe to interleave. On failure no thread ran and `entry` was not called |
 
 ### 2.2 Writes through an arbitrary pointer
 
@@ -214,14 +216,14 @@ double free.
 | `alloc::collections::hashmap::alloc_entry` | `key`, `val` and `next` are taken over by the new entry; none may be freed separately afterwards |
 | `alloc::collections::hashmap::insert_chain` | `head` is a well-formed chain; `key_ptr` is consumed into a new entry *or* freed (`is_new` says which) |
 | `alloc::collections::hashmap::rehash_bucket` | `new_base[0..new_bc)` is a live bucket array; every entry on `head` is relinked into it, and `head` must not be walked afterwards |
-| `alloc::arena::bump_chunk` | `cur` is the arena's live current chunk; the reserved bytes and the returned chunk belong to that arena |
+| `alloc::arena::bump_chunk` | `cur` is the arena's live current chunk; the reserved bytes and the returned chunk belong to that arena. The padding aligns the address itself, not the offset into the chunk |
 | `alloc::arena::new_chunk` | `next` is a chain head or the chain terminator; the returned header is owned by the chain |
 | `alloc::arena::new_header` | `next` is a chain head or the terminator, and `data` is a live buffer of at least `cap` bytes that the returned header takes over; passing a `data` still owned elsewhere makes two owners of one block |
 | `alloc::arena::copy_bytes` | `dest[0..count)` is writable, `src[0..count)` readable, and the two ranges do not overlap |
 | `alloc::buffer::Buffer::commit`, `BufferWriter::commit_external` | every byte being published (`p[len..len+n)`) has been written since the last reserve/grow. Publishing past `cap` aborts |
 | `alloc::arena::ArenaByteWriter::commit_external` | exactly `count` bytes at the pointer `writable_tail` returned have been initialized |
 | `alloc::collections::vec::Vec::reserve_n` | before any of `[old_len, old_len + extra)` is read through the returned `Slice`, or the returned `Vec!` is observed by anything that could read them, a valid `T` is written to every one of those slots |
-| `std::io::read_exact`, `std::io::File::read_exact` | `buf[0..size)` is writable; the kernel writes through `buf` |
+| `std::io::read_exact`, `std::io::File::read_exact` | `buf[0..size)` is writable; the kernel writes through `buf`. For the free `read_exact`, also `fd` is a descriptor the caller may read: stdin, or one a `File!` it holds owns |
 
 ### 2.3 Reads through an arbitrary pointer
 
@@ -238,9 +240,8 @@ double free.
 | `core::fmt::Writable::write_raw` (and its instances) | `ptr[0..len)` is readable for the whole call; the writer reads the bytes before returning and keeps no pointer to them |
 | `alloc::collections::hashmap::get_ref_chain` | `head` is a well-formed chain and `key_ptr` a readable key; `eq_fn` is called with raw pointers (section 2.5) |
 | `alloc::buffer::Buffer::push_n` | `src[0..count)` is readable and does not alias the buffer's own storage, which the growth on entry may reallocate |
-| `std::io::write_all`, `write_all_from` | `ptr[0..len)` is readable; for `write_all_from`, also `offset <= len` |
-| `std::io::File::write_all_raw`, `std::io::write_file_raw` | `ptr[0..len)` is readable throughout the write |
-| `std::io::open_read`, `std::io::read_file` | `path` is a NUL-terminated string |
+| `std::io::write_all` | `ptr[0..len)` is readable |
+| `std::io::File::write_all_raw` | `ptr[0..len)` is readable throughout the write |
 
 ### 2.4 Produces, offsets, or wraps a raw pointer
 
@@ -270,7 +271,7 @@ a checked type; their obligation is the same kind of thing.
 | `alloc::collections::hashmap::null_entry` | the null entry pointer must only be compared, never dereferenced |
 | `alloc::collections::hashmap::is_null_entry` | accepts any pointer; `false` means only non-null, not valid |
 | `core::mem::make_split_part` | `field` addresses initialized storage of `Field` that no other live capability covers, as for `Region::from_raw`: the returned `Region!` is fresh authority over it. It returns only the part's fresh brand, never a `Link!`; `Link!` is restricted to `core::mem` and built only by `Region::split`, so a part over unrelated storage cannot be merged into a parent |
-| `core::mem::Region::from_raw` | `ptr` points at storage for a `T` that nothing else can reach while `'r` lives, and `cap` is the only capability over `'r` (in practice fresh from `Exclusive::fresh`). `Allocation::adopt` discharges it with a fresh capability over a block its `Uninit!` owned outright |
+| `core::mem::Region::from_raw` | `ptr` points at an initialized `T`, aligned for `T`, in at least `sizeof[T]()` bytes, that nothing else can reach while `'r` lives, and `cap` is the only capability over `'r` (in practice fresh from `Exclusive::fresh`): the region's `replace` and `share` read and write the `T` unchecked. `Allocation::adopt` passes its own obligation on, with a fresh capability over a block its `Uninit!` owned outright |
 | `core::mem::lend`, `lend_in` | `p` points at a live `T` that nothing else reads or writes while `f` runs. `Ref::update`/`update_in` discharge it with the brand's `Exclusive!`; `Owned::update`/`update_in` with the `Owned!` they hold. `lend_in`'s `cx` carries no obligation |
 | `core::array::Array::from_parts` | `base` addresses `len` initialized `T`s that nothing else reads or writes while the array exists; every later access is checked against `len` |
 | `alloc::collections::vec::before`, `swap_at`, `sift_down` | `p` addresses the vector's own initialized elements and every index is below its length |
@@ -349,13 +350,17 @@ arena facades, formatting and string functions, `core::hash`'s arithmetic
 and traits, and the capability operations that consume or present
 authority rather than manufacturing it (`Exclusive::share`, `Shared::split`,
 `SharedJoin::join`, `SharedResume::resume`, `Ref::with`/`copy`/`update`,
-`Allocation::adopt`/`close`/`release`, `Region::share`/`split`/`merge`,
+`Allocation::adopt_value`/`close`/`release`, `Region::share`/`split`/`merge`,
 `RegionResume::resume`, `Owned::new`/`update`).
 
 Some class-C functions are still `unsafe fn` for an obligation that is not
-about a pointer in the signature, for example `std::io::File::adopt` (the
-descriptor has no other owner) and `std::io::read_file_sized` (the
-descriptor is live and open).
+about a pointer in the signature:
+
+| Function | Caller must guarantee |
+|---|---|
+| `alloc::owned::Allocation::adopt` | the block `u` owns holds an initialized `T`, aligned for `T`, in at least `sizeof[T]()` bytes: the `Region!` it returns reads and writes it as one (`Region::from_raw`'s obligation). A `malloc` result is aligned for every type, so in practice the obligation is the size and the contents. `adopt_value` is the checked form: it aborts on a block smaller than `sizeof[T]()` and writes the `T` itself. The library's own callers (`Vec!`, `HashMap!`, `Buffer::open`, `Owned::open`) state at each call why the block qualifies, or why a region over uninitialized slots never leaves the module and is never read as a `T` |
+| `std::io::File::adopt` | the descriptor is live and open, with no other owner |
+| `std::io::read_to_end_from` | `fd` is a descriptor the caller may read: stdin, or one a `File!` it holds owns. Reading advances the descriptor's offset, which is that owner's state |
 
 **Class C means "no brand-to-authority conversion and no raw pointer in the
 signature". It does not mean "verified correct".**
@@ -425,7 +430,7 @@ is an ordinary, recoverable condition:
   site (section 2.2), but it is an attestation, not evidence. A linear "filled"
   counter would prove that `n` writes happened, not that these `n` slots
   were the ones written. The remaining callers have the kernel write the
-  bytes through a raw pointer (`std::io::read_file`, `read_all_stdin`,
+  bytes through a raw pointer (`std::io::File::read_to_buffer`, `read_all_stdin`,
   `read_line`), where no per-slot operation exists to attach a witness to.
   Callers that only need a fully addressable scratch buffer use
   `Buffer::new_zeroed`, which makes the claim true and carries no
@@ -475,7 +480,7 @@ Types whose hidden representation protects authority or bounds:
 | `Drain!` | `alloc::collections::hashmap` | a map being taken apart; holds the map's capability so nothing else touches the entries meanwhile |
 | `ArenaVec[T,'k]`, `Header` | `alloc::collections::arena_vec` | a header naming segments of the sizes `locate` computes, with `len` within them; a forged one is read and written through |
 | `ArenaMap[K,V,'k]`, `ArenaSet[K,'k]`, `MapState`, `Entry` | `alloc::collections::arena_map` | slots that index live entries; a forged map probes out of range, which `out_of_range` stops |
-| `Arena!['k]`, `Chunk` | `alloc::arena` | one long-lived brand tied to a chunk chain this module built |
+| `Arena!['k]`, `Chunk` | `alloc::arena` | one long-lived brand tied to a chunk chain this module built. It holds only `Copy` values (`alloc`, `alloc_slice`, `Ref::new` and `List::cons` require `Copy`), so freeing its chunks unread loses nothing linear |
 | `ArenaByteWriter!`, `ArenaBytes` | `alloc::arena` | arena byte runs whose public length is exactly the initialized prefix |
 | `Buffer!`, `BufferRestore!['k]` | `alloc::buffer` | `Buffer!` owns a heap byte run that `destroy` frees with no capability; `BufferRestore!` plus the matching `Exclusive!` yields the owning `Buffer!` back |
 | `FixedWriter!` | `alloc::fmt` | a buffer that never grows past `cap`; its contents are always a prefix of what was written |

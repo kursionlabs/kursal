@@ -3,7 +3,7 @@
 // argument followed by a NUL, the program's name first, the way Linux
 // keeps `/proc/self/cmdline`.
 
-use std::alloc::heap::HeapAllocator;
+use std::alloc::heap::{HeapAllocator, checked_mul};
 use std::bytes::buffer::Buffer;
 use std::mem::{alloca, sizeof};
 use std::option::Result;
@@ -44,7 +44,8 @@ fn arguments() -> Result[Buffer!, i32] {
 // for it. `command` is handed back unchanged. A child that cannot run the
 // program exits with status 127. An error is a positive errno value:
 // EINVAL (22) for a command line that is empty or does not end in a NUL,
-// or whatever `fork` or `waitpid` reports.
+// or whatever `fork` or `waitpid` reports; a wait a signal interrupts is
+// retried.
 fn run(&command: Buffer!) -> Result[Exit, i32] {
     let base = unsafe &command.as_ptr();
     let len = &command.len();
@@ -60,7 +61,7 @@ fn run(&command: Buffer!) -> Result[Exit, i32] {
         }
         i = i + 1usize;
     }
-    let table = unsafe (HeapAllocator::alloc((count + 1usize) * sizeof[*u8]()).into_raw() as *(*u8));
+    let table = unsafe (HeapAllocator::alloc(checked_mul(count + 1usize, sizeof[*u8]())).into_raw() as *(*u8));
     var start = 0usize;
     var n = 0usize;
     i = 0usize;
@@ -85,8 +86,12 @@ fn run(&command: Buffer!) -> Result[Exit, i32] {
     }
     let status = unsafe alloca[i32]();
     unsafe *status = 0i32;
-    if unsafe waitpid(pid, status, 0i32) != pid {
-        return Result::Err.(unsafe kur_libc_fs_error());
+    // Waits again when a signal interrupts the wait (EINTR, 4).
+    while unsafe waitpid(pid, status, 0i32) != pid {
+        let error = unsafe kur_libc_fs_error();
+        if error != 4i32 {
+            return Result::Err.(error);
+        }
     }
     let s = unsafe *status;
     if (s & 127i32) == 0i32 {

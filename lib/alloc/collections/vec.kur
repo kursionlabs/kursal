@@ -19,10 +19,20 @@
 // The address `destroy` frees comes from `alloc`, never from a `Ref`, so
 // no pointer this module frees is one a caller chose.
 //
+// Adopting the block. `Allocation::adopt` asks for an initialized `T` in
+// at least `sizeof[T]()` bytes, because its region lets safe code read and
+// write the block as a `T`. The block holds `cap` slots, and `cap` starts
+// at 4 and only doubles, so the size holds; only the first `len` slots are
+// initialized, and an empty vec has none. That is sound here because the
+// region never leaves this module and is never read as a `T`: `share`'s
+// `Ref` is taken apart into the base address at once, elements are read
+// only below `len`, and the region is resumed only to be released.
+//
 // `Vec!` is not `exposed`: a foreign module cannot build or destructure
 // it. A forged `Vec!` could pair an arbitrary `buf` with an arbitrary
 // `len` or `cap`, which the element operations index through; it could
-// not supply an `Allocation!`, whose only producer is `Allocation::adopt`.
+// not supply an `Allocation!`, whose only producers are `Allocation::adopt`
+// and `adopt_value`.
 //
 // `Popped!` is the result of `pop`. It is `exposed` so that code outside
 // this module can `match` on it.
@@ -84,7 +94,8 @@ impl Vec[T] {
         let initial_cap = 4usize;
         let bytes = checked_mul(initial_cap, sizeof[T]());
         let u = HeapAllocator::alloc(bytes);
-        let exists 'open1. (a, rg) = Allocation::adopt[T](u);
+        // `adopt`'s obligation: see "Adopting the block" in the header.
+        let exists 'open1. (a, rg) = unsafe Allocation::adopt[T](u);
         let (tag, r, bk) = rg.share();
         let z = 0usize;
         pack 'open1. (tag, Vec.{ alloc: a, back: bk, buf: r, len: z, cap: initial_cap })
@@ -126,7 +137,8 @@ impl Vec[T, 'k] {
             let new_bytes = checked_mul(new_cap, sizeof[T]());
             HeapAllocator::grow(u, new_bytes)
         };
-        let exists 'open1. (a2, rg2) = Allocation::adopt[T](u);
+        // `adopt`'s obligation: see "Adopting the block" in the header.
+        let exists 'open1. (a2, rg2) = unsafe Allocation::adopt[T](u);
         let (tag, r2, bk2) = rg2.share();
         let (p, m) = r2.into_parts();
         let target = unsafe elem_ptr(p, n);
@@ -175,18 +187,16 @@ impl Vec[T, 'k] {
         view
     }
 
-    // Consumes the vec and hands back the two records that own its storage,
-    // plus the element count, for a caller that is done growing it and
-    // wants permanent ownership of the buffer (e.g. `alloc::str`'s
-    // `finish`). `Allocation!` and `RegionResume!` are linear and cannot be
-    // discarded, so they are handed on, the receipt already resumed into the
-    // `Region!`. `Region::share` recovers an `Exclusive!`/`Ref` pair from it,
-    // and `Allocation::release` turns the pair into an `Uninit!` without a
-    // `Ref` ever being involved.
-    fn into_region(self, tag: Exclusive!['k]) -> (Allocation![T, 'k], Region![T, 'k], usize) {
+    // Consumes the vec and hands back its block as raw storage, with the
+    // element count, for a caller that is done growing it and wants the
+    // buffer itself (`alloc::str`'s `finish`). The first `n` elements of
+    // the block are initialized; nothing else is promised. `resume` takes
+    // back the caller's `Exclusive!['k]`, so no `Ref` or `Slice` of the
+    // vec's brand can be used again, and `release` retires the domain.
+    fn into_uninit(self, tag: Exclusive!['k]) -> (Uninit!, usize) {
         let { alloc: a, back: bk, buf: r, len: n, cap: c } = self;
         let rg = bk.resume(tag);
-        (a, rg, n)
+        (a.release(rg), n)
     }
 
     // Grows the buffer if needed and raises `len` by `extra` in one step:
@@ -221,7 +231,8 @@ impl Vec[T, 'k] {
             let new_bytes = checked_mul(new_cap, sizeof[T]());
             HeapAllocator::grow(u, new_bytes)
         };
-        let exists 'open1. (a2, rg2) = Allocation::adopt[T](u);
+        // `adopt`'s obligation: see "Adopting the block" in the header.
+        let exists 'open1. (a2, rg2) = unsafe Allocation::adopt[T](u);
         let (tag, r2, bk2) = rg2.share();
         let (p, m) = r2.into_parts();
         // `unsafe`: the allocation was just grown to hold `needed` elements;
@@ -237,7 +248,8 @@ impl Vec[T, 'k] {
         let { alloc: a, back: bk, buf: r, len: n, cap: c } = self;
         let rg = bk.resume(tag);
         let u = a.release(rg);
-        let exists 'open1. (a2, rg2) = Allocation::adopt[T](u);
+        // `adopt`'s obligation: see "Adopting the block" in the header.
+        let exists 'open1. (a2, rg2) = unsafe Allocation::adopt[T](u);
         let (tag, r2, bk2) = rg2.share();
         let (p, m) = r2.into_parts();
         let zero = 0usize;

@@ -1,3 +1,7 @@
+/* 64-bit file offsets, inode numbers and times on 32-bit glibc too, before
+ * any header reads them. */
+#define _FILE_OFFSET_BITS 64
+#define _TIME_BITS 64
 #define _DEFAULT_SOURCE
 #define _XOPEN_SOURCE 700
 #include "fs.h"
@@ -9,6 +13,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 /* Length-delimited paths: no truncation at an embedded NUL, no PATH_MAX. */
 static char *path_copy(const uint8_t *bytes, uintptr_t len) {
@@ -96,6 +101,40 @@ int32_t kur_libc_fs_create(uint8_t *bytes, uintptr_t len) {
     int saved = errno;
     free(path);
     return fd < 0 ? -saved : fd;
+}
+
+/* read(2), retried while a signal interrupts it: the count, 0 at EOF, or a
+ * negative errno. */
+intptr_t kur_libc_fs_read(int32_t fd, uint8_t *buf, uintptr_t len) {
+    ssize_t n;
+    do n = read(fd, buf, len); while (n < 0 && errno == EINTR);
+    return n < 0 ? -(intptr_t)errno : (intptr_t)n;
+}
+
+/* write(2), retried while a signal interrupts it: the count or a negative
+ * errno. */
+intptr_t kur_libc_fs_write(int32_t fd, const uint8_t *buf, uintptr_t len) {
+    ssize_t n;
+    do n = write(fd, buf, len); while (n < 0 && errno == EINTR);
+    return n < 0 ? -(intptr_t)errno : (intptr_t)n;
+}
+
+/* close(2): 0 or errno. Not retried on EINTR: Linux has released the
+ * descriptor by then, and a retry could close one another thread opened. */
+int32_t kur_libc_fs_close(int32_t fd) {
+    return close(fd) == 0 ? 0 : errno;
+}
+
+/* The size of the regular file open on `fd`, or a negative errno: EISDIR
+ * for a directory, EINVAL for anything else that is not a regular file,
+ * EFBIG for a size an intptr_t cannot hold. */
+intptr_t kur_libc_fs_regular_size(int32_t fd) {
+    struct stat info;
+    if (fstat(fd, &info) != 0) return -(intptr_t)errno;
+    if (S_ISDIR(info.st_mode)) return -(intptr_t)EISDIR;
+    if (!S_ISREG(info.st_mode)) return -(intptr_t)EINVAL;
+    if (info.st_size < 0 || (uintmax_t)info.st_size > (uintmax_t)INTPTR_MAX) return -(intptr_t)EFBIG;
+    return (intptr_t)info.st_size;
 }
 
 /* Opaque entry borrowed until the next read or close on this DIR.

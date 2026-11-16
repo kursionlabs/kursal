@@ -155,12 +155,16 @@ RUNS = {
 # examples/bad/: each program, and the diagnostic that rejects it.
 REJECTED = {
     "branch_inconsistent.kur": "linear value 'h' remains live on some paths",
+    "close_by_number.kur": "unknown or private member close_fd of io",
     "double_use_handle.kur": "value 'h' has been moved",
     "implicit_package_open.kur": "pattern does not match \\(exists",
     "implicit_package_open_assignment.kur": "type mismatch: \\(exists",
     "implicit_package_open_plain_let.kur": "a struct pattern needs a struct, not \\(exists",
     "leaked_handle.kur": "linear value 'h' is not consumed before return",
+    "linear_in_arena.kur": "type argument must satisfy Copy",
     "mismatched_skolem.kur": "type mismatch",
+    "ref_after_remove_in.kur": "type mismatch: \\$b#open[0-9]+ and \\$a#open",
+    "safe_adopt.kur": "calling an unsafe function requires unsafe authorization",
     "unbound_result_brand.kur": "brand '1 is not in scope",
     "while_consume_without_replacement.kur": "linear value 'h' remains live on some paths to while",
 }

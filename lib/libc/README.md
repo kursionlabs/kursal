@@ -4,7 +4,12 @@
 this program's arguments and running other programs, and `thread.kur` a
 thin POSIX thread adapter. The C halves are `fs.c` and `thread.c`
 (`process.kur` calls libc directly and reports errno through `fs.c`); they
-target POSIX hosts, not freestanding kernels. Platform
+target POSIX hosts, not freestanding kernels. `std::io` reads, writes,
+opens, closes and sizes files through `fs.c` as well (`kur_libc_fs_read`,
+`_write`, `_open_read`, `_create`, `_close`, `_regular_size`), which retry
+a call a signal interrupts, open descriptors close-on-exec and return a
+negative errno, so every program links `fs.c`. `fs.c` asks for 64-bit file
+offsets and times (`_FILE_OFFSET_BITS`, `_TIME_BITS`) on 32-bit hosts. Platform
 structure layouts (`DIR`, `dirent`, `stat`, `pthread_t`) never cross the
 boundary.
 
@@ -88,8 +93,10 @@ when. Calling `spawn` is the unproven step, not any single operation inside
 it. The `thread` package builds a safe, closure-based `spawn` on top of
 this adapter.
 
-`entry: fn(*u8) -> *u8` is an ordinary function reference, passed across
-the `extern "C"` boundary as a C function pointer with no cast. `join` is
+`entry: unsafe fn(*u8) -> *u8` is a function reference, passed across
+the `extern "C"` boundary as a C function pointer with no cast. It is
+typed `unsafe` because an entry that reads its `*u8` has an obligation
+about it; `spawn`'s caller vouches that `entry(arg)` meets it. `join` is
 `unsafe` because it returns the raw `*u8` that `entry` produced, with no
 static knowledge of what it points to. `detach` is safe: it returns no
 pointer.

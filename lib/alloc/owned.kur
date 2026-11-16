@@ -3,14 +3,14 @@
 // block). The allocator-free half of the vocabulary -- `Ref`, `Region!`
 // and its receipts -- is `core::mem`, whose header describes both.
 //
-// `Allocation::adopt` is the only producer of an `Allocation!`, and it
-// reads the base and extent off the allocator's own `Uninit!`; `release`
-// and `close` demand the complete `Region!` back before giving the
-// storage up.
+// `Allocation::adopt` (unsafe) and `adopt_value` (checked) are the only
+// producers of an `Allocation!`, and they read the base and extent off the
+// allocator's own `Uninit!`; `release` and `close` demand the complete
+// `Region!` back before giving the storage up.
 
 use package as alloc;
 
-use alloc::heap::{Uninit, HeapAllocator, AllocError, Storage};
+use alloc::heap::{Uninit, HeapAllocator, AllocError, Storage, abort};
 use core::option::Result;
 use core::cap::{Brand, Exclusive};
 use core::mem::{Region, lend, lend_in, sizeof};
@@ -32,9 +32,9 @@ struct Owned! {
 // The right to free one heap block, under brand `'r`.
 //
 // Freeing goes through `release(self, reg: Region![T, 'r])`, which takes no
-// `Ref`: the base address comes from `self`, and the only producer of an
-// `Allocation!` is `Allocation::adopt`, which reads it straight off the
-// allocator's `Uninit!`. The record is restricted, and no exported function
+// `Ref`: the base address comes from `self`, and the only producers of an
+// `Allocation!` are `Allocation::adopt` and `adopt_value`, which read it
+// straight off the allocator's `Uninit!`. The record is restricted, and no exported function
 // turns a pointer, a `Ref` or a `Brand` into one, so freeing an interior
 // pointer projected from a `Ref` is not expressible.
 //
@@ -129,30 +129,60 @@ impl Owned[T] {
         let { ptr: p } = self;
         let raw = unsafe (p as *u8);
         let u = unsafe HeapAllocator::adopt_raw_sized(raw, sizeof[T]());
-        Allocation::adopt[T](u)
+        // `adopt`'s obligation: an `Owned![T]` holds an initialized `T` at
+        // the base of a `malloc` block of `sizeof[T]()` bytes.
+        unsafe Allocation::adopt[T](u)
     }
 }
 
 forall T.
 impl Allocation[T] {
-    // The only producer of an `Allocation![T,'r]`. Takes ownership of `u`
-    // and returns the record together with the `Region!` over the block.
+    // Takes ownership of `u` and returns an allocation record together with
+    // the `Region!` over the block.
     //
     // The brand `'1` is fresh per call and returned sealed, so no caller can
     // name it in advance or ask for a record over a brand that already
     // exists. The base and extent are read off `u`, never supplied by the
     // caller, and kept in the linear, restricted, unprojectable record; the
     // access side goes out separately as the `Region!`.
-    fn adopt(u: Uninit!) -> exists '1. (Allocation![T, '1], Region![T, '1]) {
+    //
+    // `unsafe fn`: the region lets safe code read and write the block as a
+    // `T` (`Region::replace`, `share` and the `Ref` it hands out), so the
+    // caller vouches that the block holds an initialized `T`, aligned for
+    // `T`, in at least `sizeof[T]()` bytes. `u`'s base is a `malloc`
+    // result, so alignment holds for every type the language has; the size
+    // and the contents are the caller's word. `adopt_value` checks the size
+    // and writes the `T` itself.
+    unsafe fn adopt(u: Uninit!) -> exists '1. (Allocation![T, '1], Region![T, '1]) {
         let exists '1. (k, cap) = Exclusive::fresh();
         let (raw, n) = u.into_parts();
         let p = unsafe (raw as *T);
         let a = Allocation.{ ptr: p, extent: n, marker: k };
         // `from_raw`'s obligation: `cap` is fresh, so no `Ref` of brand
-        // '1 exists yet, and `p` is the base of the block `u` owned
-        // outright.
+        // '1 exists yet; `p` is the base of the block `u` owned outright,
+        // and this function's caller vouches for what it holds.
         let rg = unsafe Region::from_raw(p, cap);
         pack '1. (a, rg)
+    }
+
+    // `adopt`, made safe: aborts unless `u`'s recorded extent is at least
+    // `sizeof[T]()` bytes, then writes `v` at the block's base, so the
+    // region is over an initialized `T`. An `Uninit!` from `adopt_raw`
+    // records extent 0 and so aborts here for any `T` with bytes.
+    fn adopt_value(u: Uninit!, v: T) -> exists '1. (Allocation![T, '1], Region![T, '1]) {
+        let (raw, n) = u.into_parts();
+        if n < sizeof[T]() {
+            unsafe abort();
+        }
+        let p = unsafe (raw as *T);
+        unsafe *p = v;
+        // `adopt_raw_sized`'s obligation: `raw` and `n` are what `u` held,
+        // so the block is a live `malloc` result of extent `n`, owned by
+        // nothing else now that `u` is consumed.
+        let u = unsafe HeapAllocator::adopt_raw_sized(raw, n);
+        // `adopt`'s obligation: the block is a `malloc` result (aligned),
+        // of at least `sizeof[T]()` bytes, and `v` was just written there.
+        unsafe Allocation::adopt[T](u)
     }
 }
 
@@ -204,13 +234,12 @@ impl Allocation[T, 'r] {
     // after `close` is rejected because `close` consumed it.
     //
     // Drops `self`'s extent, since `Owned![T]` records its size in its type.
-    // For a record from `Owned::open` that is exact. For one from
-    // `Allocation::adopt` over a block of another size, `close` narrows the
-    // claim to `sizeof[T]()`. That cannot break a free (`free` takes no size,
-    // and `Owned!`'s only terminal path is `into_value` -> `adopt_raw` ->
-    // `free`), and it permits no read that `adopt` did not already allow:
-    // `Allocation::adopt[T]` does not check that its `Uninit!` holds at least
-    // `sizeof[T]()` bytes.
+    // For a record from `Owned::open` that is exact. For one from `adopt` or
+    // `adopt_value` over a larger block, `close` narrows the claim to
+    // `sizeof[T]()`. That cannot break a free (`free` takes no size, and
+    // `Owned!`'s only terminal path is `into_value` -> `adopt_raw` ->
+    // `free`), and the block holds the initialized `T` that `adopt`'s
+    // obligation, or `adopt_value`'s write, put there.
     fn close(self, reg: Region![T, 'r]) -> Owned![T] {
         let { ptr: p, extent: n, marker: m } = self;
         let retired = reg.retire();

@@ -5,10 +5,13 @@ dependencies' names, so `libc`'s dependency on `std` does not make `std::`
 paths visible here. Link with `lib/libc/thread.c` and `-pthread`, as for
 `libc::thread`; this package has no C code of its own.
 
-`spawn(f: closure[Env]() -> Ret) -> Result[Thread![Ret], ThreadError]`
+`spawn(f: closure[Env]() -> Ret) -> Result[Thread![Ret], (closure[Env]() -> Ret, ThreadError)]`
 moves `f`, and whatever it captured, into a new OS thread, and
 `Thread![Ret]::join(self) -> Result[Ret, ThreadError]` blocks until it
-finishes and returns its `Ret` value. There is no `detach`: a spawned
+finishes and returns its `Ret` value. When no thread can be started,
+`spawn` hands `f` back unrun beside the error, so a linear value it
+captured is still the caller's. `Ret` may be a zero-size type such as
+`()`. There is no `detach`: a spawned
 thread's `Ret` must always reach a `join`, so a linear value it produces is
 never stranded in an abandoned thread with nobody left to destroy it.
 
@@ -30,6 +33,9 @@ the closure is the same ownership transfer a linear `Env` gets.
 
 Internally, `SpawnPayload[Env, Ret]` and `ResultBox[Ret]` box the closure
 and its result on the heap so they can cross `libc::thread`'s raw
-`fn(*u8) -> *u8` boundary. `trampoline[Env, Ret]`, instantiated once per
-`(Env, Ret)`, unboxes the payload, calls `f` exactly once, and boxes the
-result. None of this is part of the API.
+`unsafe fn(*u8) -> *u8` boundary (`ResultBox` carries a `bool` beside the
+value, so it has bytes even for a zero-size `Ret`). `trampoline[Env, Ret]`,
+instantiated once per `(Env, Ret)`, unboxes the payload, calls `f` exactly
+once, and boxes the result. It is an `unsafe fn`: its argument must be the
+payload box `spawn` built for the same `(Env, Ret)`. None of this is part
+of the API.
