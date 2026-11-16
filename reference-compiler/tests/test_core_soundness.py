@@ -26,9 +26,9 @@ REJECTED = {
     # A block's `known` contract names a variant of the enum at its path.
     "known_unknown_variant": ("known_contract_names_a_variant", """
         (type L! (struct (a u32)))
-        (type E (enum (A L!) (B u32)))
+        (type E! (enum (A L!) (B u32)))
         (fun f u32 ()
-          (locals (&x E))
+          (locals (&x E!))
           (entry () (= %n (const u32 0)) (ret %n))
           (done ((%r u32)) (known &x Nope) (ret %r)))"""),
     "known_not_an_enum": ("known_contract_names_a_variant", """

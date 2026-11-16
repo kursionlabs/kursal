@@ -1232,6 +1232,11 @@ impl Types['k] {
             Type::Array(elem, length) => length == 0u64 || self.is_copy(&cx, elem.copy(&cx), kinds),
             Type::Exists(_binders, body) => self.is_copy(&cx, body.copy(&cx), kinds),
             Type::Foreach(f) => {
+                // A source whose rows are fixed expands; otherwise every row is the body only when
+                // the body does not mention a binder.
+                if self.rows_fixed(&cx, f.source.copy(&cx), kinds) {
+                    return self.is_copy(&cx, self.expand(&cx, f, Option::None), kinds);
+                }
                 let body = f.body.copy(&cx);
                 let binders: ArenaSet[Span['k], 'k] = with_names(&cx, ArenaSet::new(&cx), foreach_binders(&cx, f));
                 !overlap(&cx, binders, free_names(&cx, body)) && self.is_copy(&cx, body, kinds)
@@ -1247,6 +1252,45 @@ impl Types['k] {
                 all
             },
         }
+    }
+
+    // Whether a foreach source's rows are the same whatever the type parameters in `kinds`, and any
+    // name no declaration gives, stand for: its outer shape, and a pointer's pointee's, is reached
+    // without meeting one. A parameter's shape is unknown, and even a Copy argument may have a
+    // linear component, in an array of length zero.
+    fn rows_fixed(self, &cx: Domain!['k], source: Type['k], kinds: ArenaMap[Span['k], Kind, 'k]) -> bool {
+        match self.fixed_shape(&cx, source, kinds) {
+            Option::None => false,
+            Option::Some(shape) => match shape {
+                Type::Ptr(inner) => self.fixed_shape(&cx, inner.copy(&cx), kinds).is_some(),
+                _ => true,
+            },
+        }
+    }
+
+    // The outer structural type of `ty`, or none when a parameter or undeclared name decides it.
+    fn fixed_shape(self, &cx: Domain!['k], ty: Type['k], kinds: ArenaMap[Span['k], Kind, 'k]) -> Option[Type['k]] {
+        var ty = ty;
+        while true {
+            match ty {
+                Type::Named(name, args) => {
+                    if (args.is_empty(&cx) && kinds.contains(&cx, name)) || !self.program.types.contains(&cx, name) {
+                        return Option::None;
+                    }
+                    ty = self.unfold(&cx, ty, Option::None);
+                },
+                Type::Foreach(f) => {
+                    if !self.rows_fixed(&cx, f.source.copy(&cx), kinds) {
+                        return Option::None;
+                    }
+                    ty = self.expand(&cx, f, Option::None);
+                },
+                _ => {
+                    return Option::Some.(ty);
+                },
+            }
+        }
+        Option::None
     }
 
     // The component types of a product (struct, tuple or array).

@@ -66,7 +66,9 @@ In KURS a bare atom is the IR's own vocabulary, a primitive type or a type param
 `::` is always the program's, fully qualified (`core::option::Option`). A linear type's name ends
 with `!`, as in the source, in its declaration and in every reference: `(type core::mem::Region!
 ...)`, `(core::mem::Region! $k)`, `(fun alloc::buffer::Buffer!::new ...)`; a type is linear exactly
-when its name ends with `!`. In C a symbol escapes the `!` as `_21`
+when its name ends with `!`. The checker holds a declaration to the source's rule: a type without the
+`!` is `Copy` when its type parameters are (`type formation: type S holds a linear type; declare it
+S!`). In C a symbol escapes the `!` as `_21`
 (`_ZN4kurs5alloc6buffer9Buffer_213new17h...E`, `mangle.path_segments`), and a type's readable C name
 leaves it out (`K_alloc_buffer_Buffer`).
 

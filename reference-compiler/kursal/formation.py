@@ -235,6 +235,16 @@ class Formation:
                 for t in edge.tys:
                     self.fits(t, C.BRAND, scope)
 
+    def unmarked(self, decl: C.TypeDecl) -> None:
+        """A type whose name has no `!` is not linear for every instantiation: it is Copy when its type
+        arguments are."""
+        if decl.linear:
+            return
+        args = tuple(C.Skolem(p.name) if p.kind == C.BRAND else C.Named(p.name) for p in decl.params)
+        if not self.types.is_copy(C.Named(decl.name, args), {p.name: C.COPY for p in decl.params if p.kind != C.BRAND}):
+            whatever = " whatever its type arguments" if any(p.kind != C.BRAND for p in decl.params) else ""
+            self.fail(f"type {decl.name} holds a linear type{whatever}; declare it {decl.name}!")
+
     def declarations(self) -> None:
         env: dict[str, C.Kind] = {"static": C.BRAND}
         for decl in self.program.types.values():
@@ -243,6 +253,8 @@ class Formation:
             for p in decl.premises:
                 self.premise(p, scope)
             self.fits(decl.body, C.ANY, scope)
+        for decl in self.program.types.values():
+            self.unmarked(decl)
         for trait in self.program.traits.values():
             self.module, self.premises = trait.module, ()
             scope = self.extend(env, self.trait_params(trait))

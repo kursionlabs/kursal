@@ -851,11 +851,15 @@ SIGNATURES = (
     "forall T. impl P[T, 'static] { fn get(self, f: closure(u32) -> u32, g: closure[u8](&_: u32) -> u32) -> u32 { 0u32 } }\n"
     "forall T where Copy[T]. fn pair(x: T, h: unsafe fn(&_: T) -> !, k: forall 'q. fn(core::cap::Brand['q]) -> u32) -> (T, T) { (x, x) }\n"
     "extern \"C\" fn puts(s: *u8) -> i32;\nenum E { A, B(u32), C(u8, u16) }\ntuple Pt(u32, i64);\n"
-    "struct F! { f: foreach F of (u32, u8) => *F }\nfn h(g: fn(closure(u32) -> u32) -> u32, k: closure(u8) -> u8) -> u32 { 0u32 }\n",
+    "struct F { f: foreach F of (u32, u8) => *F }\nfn h(g: fn(closure(u32) -> u32) -> u32, k: closure(u8) -> u8) -> u32 { 0u32 }\n",
     # A generic declaration linear only through its arguments has no `!`; one with a `!` is linear even
     # when every field is Copy.
     "forall T. enum Opt { None, Some(T) }\nstruct L! { x: u32 }\nstruct H! { o: Opt[L!], p: *L! }\n"
     "forall 'k. struct Cap! {}\nforall T. struct W { w: Opt[T] }\nfn f(o: Opt[L!], w: W[u32]) -> Opt[L!] { o }\n",
+    # A foreach over a source of fixed shape is Copy when its expansion is; over a parameter, only when
+    # its body does not mention the binder.
+    "struct L! { x: u32 }\nstruct P { p: foreach X of (u32, L!) => *X }\nforall T. struct Q { q: foreach X of (T, [L!; 0]) => X }\n"
+    "forall T where Exposed[T]. struct G! { g: foreach X of T => *X }\nforall T where Exposed[T]. struct K { k: foreach X of T => u8 }\n",
 )
 
 SIGNATURE_ERRORS = (
@@ -919,6 +923,8 @@ SIGNATURE_ERRORS = (
     "struct L! { x: u32 }\nforall 'k. enum E { A, B(L!, core::cap::Brand['k]) }\n",
     "struct L! { x: u32 }\ntuple P(u32, (L!, u8));\n",
     "forall T. enum Opt { None, Some(T) }\nstruct L! { x: u32 }\nstruct S { o: Opt[L!] }\n",
+    "struct L! { x: u32 }\nstruct F { f: foreach X of (u32, L!) => X }\n",
+    "forall T where Exposed[T]. struct G { g: foreach X of T => *X }\n",
     "struct S { a: (u32, [u8; 1u8 - 2u8 > 0u8]) }\n",
 )
 
@@ -1195,6 +1201,17 @@ TYPE_CASES = (
     "(copy ((type R! () u8)) () (tuple R!))",
     "(copy () () (foreach (F (tuple u8)) (ptr F)))",
     "(copy () () (foreach (F (tuple u8)) u16))",
+    "(copy ((type L! () u8)) () (foreach (F (tuple u8 L!)) F))",
+    "(copy ((type L! () u8)) () (foreach (F (tuple u8 L!)) (ptr F)))",
+    "(copy ((type L! () u8)) () (foreach (F (array L! 0)) F))",
+    "(copy ((type P (T) (struct (a T) (b u8)))) ((T any)) (foreach (F (P T)) (ptr F)))",
+    "(copy () ((T copy)) (foreach (F (tuple T u8)) F))",
+    "(copy () ((T copy)) (foreach (F T) (ptr F)))",
+    "(copy () ((T copy)) (foreach (F (ptr T)) (ptr F)))",
+    "(copy () ((T copy)) (foreach (F T) u8))",
+    "(copy ((type L! () u8)) () (foreach (G (foreach (F (tuple u8 L!)) (ptr F))) G))",
+    "(copy () ((T copy)) (foreach (G (foreach (F T) (ptr F))) G))",
+    "(copy () () (foreach (F G) (ptr F)))",
     "(zero ((type E () (struct (a (tuple)) (b (array u8 0))))) E)",
     "(zero () T)",
     "(zero () (exists ($a) (brand $a)))",
@@ -1249,6 +1266,15 @@ TYPE_CASES = (
     "(formation (type K (T) u8) (type X () (K $static)))",
     "(formation (type C (+T) u8) (type L! () u8) (type X () (C L!)))",
     "(formation (type C (+T) u8) (type X () (C (ptr u8))))",
+    "(formation (type L! () u8) (type S () (tuple u8 L!)))",
+    "(formation (type L! () u8) (type O (T) (enum (N (tuple)) (S T))) (type S () (O L!)))",
+    "(formation (type L! () u8) (type G (T) (tuple T L!)))",
+    "(formation (type L! () u8) (type G ($k) (tuple (brand $k) L!)))",
+    "(formation (type L! () u8) (type O (T) (enum (N (tuple)) (S T))) (type H! () (O L!)) (type C! ($k) u8) (type W (T) (O T)))",
+    "(formation (type L! () u8) (type F () (foreach (X (tuple u32 L!)) (ptr X))))",
+    "(formation (type L! () u8) (type F () (foreach (X (tuple u32 L!)) X)))",
+    "(formation (type G (T) (foreach (X T) (ptr X))))",
+    "(formation (type G! (T) (foreach (X T) (ptr X))))",
     "(formation (type S ($static) u8))",
     "(formation (type D (T T) u8))",
     "(kind () ((k brand)) $k)",

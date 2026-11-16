@@ -441,9 +441,38 @@ class Types:
                 return length == 0 or self.is_copy(elem, kinds)
             case Exists(body=body):
                 return self.is_copy(body, kinds)
-            case Foreach(binder=binder, body=body):
+            case Foreach(body=body):
+                # A source whose rows are fixed expands; otherwise every row is the body only when the
+                # body does not mention a binder.
+                if self.rows_fixed(ty.source, kinds):
+                    return self.is_copy(self.expand(ty), kinds)
                 return not (set(foreach_binders(ty)) & free_names(body)) and self.is_copy(body, kinds)
         return all(self.is_copy(c, kinds) for c in children(ty))
+
+    def rows_fixed(self, source: Type, kinds: Kinds) -> bool:
+        """Whether a foreach source's rows are the same whatever the type parameters in `kinds`, and
+        any name no declaration gives, stand for: its outer shape, and a pointer's pointee's, is
+        reached without meeting one. A parameter's shape is unknown, and even a Copy argument may have
+        a linear component, in an array of length zero."""
+        shape = self.fixed_shape(source, kinds)
+        if isinstance(shape, Ptr):
+            shape = self.fixed_shape(shape.inner, kinds)
+        return shape is not None
+
+    def fixed_shape(self, ty: Type, kinds: Kinds) -> Optional[Type]:
+        """The outer structural type of `ty`, or None when a parameter or undeclared name decides it."""
+        while True:
+            match ty:
+                case Named(name=name, args=args):
+                    if (not args and name in kinds) or name not in self.program.types:
+                        return None
+                    ty = self.unfold(ty)
+                case Foreach(source=source):
+                    if not self.rows_fixed(source, kinds):
+                        return None
+                    ty = self.expand(ty)
+                case _:
+                    return ty
 
     def fields(self, ty: Type, module: Optional[ModuleId] = None) -> tuple[Type, ...]:
         """The component types of a product (struct, tuple or array)."""

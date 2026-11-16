@@ -44,6 +44,21 @@ class TypeDeclTests(unittest.TestCase):
             with self.subTest(source=source), self.assertRaisesRegex(SigError, message):
                 sigs_of(lin + source)
 
+    def test_a_foreach_over_a_fixed_source_is_copy_when_its_expansion_is(self):
+        lin = "struct L! { x: u32 }\n"
+        s = sigs_of(lin + "struct F { f: foreach F of (u32, u8) => *F }\nstruct P { p: foreach X of (u32, L!) => *X }\n"
+                    "forall T. struct Q { q: foreach X of (T, [L!; 0]) => X }\n"
+                    "forall T where Exposed[T]. struct G! { g: foreach X of T => *X }\n")
+        self.assertFalse(s.types["p::F"].linear)
+        cases = (
+            ("struct F { f: foreach X of (u32, L!) => X }\n", "struct F holds a linear type; declare it F!"),
+            ("forall T where Exposed[T]. struct G { g: foreach X of T => *X }\n",
+             "struct G holds a linear type whatever its type arguments; declare it G!"),
+        )
+        for source, message in cases:
+            with self.subTest(source=source), self.assertRaisesRegex(SigError, message):
+                sigs_of(lin + source)
+
     def test_struct_enum_tuple(self):
         s = sigs_of("forall T, 'k where Copy[T]. struct Box! { v: T, b: core::cap::Brand['k] }\n"
                     "enum E { A, B(u32), C(u32, bool) }\nexposed tuple Pair(u32, u32);\n")

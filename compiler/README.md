@@ -722,8 +722,11 @@ These are the places where Kursal differs from what one might expect.
   must (`struct S holds a linear type; declare it S!`, or `... holds a linear type whatever its type
   arguments ...` for a generic one), one linear only through its type arguments has none
   (`Option[T]`; `Option[Buffer!]` shows its linearity through its argument), and one with the `!` is
-  linear even when every field is `Copy` (`Exclusive!['k]`). Type parameters never carry it: `forall
-  T` may stand for a linear type unless a premise says `Copy[T]`.
+  linear even when every field is `Copy` (`Exclusive!['k]`). A `foreach` whose source has a fixed
+  shape counts as its expansion (`foreach F of (u32, u8) => *F` is `Copy`); over a type parameter
+  it is `Copy` only when its body does not mention the binder, since even a `Copy` argument may hold
+  a linear type in an array of length zero. Type parameters never carry it: `forall T` may stand for
+  a linear type unless a premise says `Copy[T]`.
 - **Builtins are imported.** Only the primitive types, `Never`, `Copy` and `Exposed` are always in
   scope. What else the compiler provides, `core` exports from the module it belongs to, and code
   imports it like any other name (see the reference compiler's README, "Builtins"):

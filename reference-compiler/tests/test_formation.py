@@ -38,6 +38,23 @@ class FormationTests(unittest.TestCase):
         check_program(parse_program("(type Box (forall (T) ((Copy T)) (tuple T))) "
                                     "(type Good (forall (U) ((Copy U)) (Box U)))"))
 
+    def test_a_type_linear_for_every_instantiation_carries_the_bang(self):
+        lin = "(type L! (struct (x u32))) (type Opt (forall (T) () (enum (None (tuple)) (Some T)))) "
+        self.rejects(lin + "(type S (struct (l L!)))", "type S holds a linear type; declare it S!$")
+        self.rejects(lin + "(type S (Opt L!))", "type S holds a linear type; declare it S!$")
+        self.rejects(lin + "(type G (forall (T) () (tuple T (tuple u8 L!))))",
+                     "type G holds a linear type whatever its type arguments; declare it G!$")
+        self.rejects(lin + "(type E (forall ($k) () (enum (A (brand $k)) (B L!))))",
+                     "type E holds a linear type; declare it E!$")
+        self.rejects(lin + "(type F (foreach (X (tuple u32 L!)) X))", "type F holds a linear type; declare it F!$")
+        self.rejects(lin + "(type G (forall (T) () (foreach (X T) (ptr X))))",
+                     "type G holds a linear type whatever its type arguments; declare it G!$")
+        check_program(parse_program(
+            lin + "(type H! (struct (o (Opt L!)) (p (ptr L!)))) (type W (forall (T) () (Opt T))) "
+            "(type Cap! (forall ($k) () (tuple))) (type F (foreach (X (tuple u32 L!)) (ptr X))) "
+            "(type G! (forall (T) () (foreach (X T) (ptr X)))) "
+            "(type P (forall (T) () (foreach (X (tuple T (array L! 0))) X)))"))
+
     def test_trait_premises_have_valid_names_arity_and_kinds(self):
         self.rejects("(type Bad (forall (T) ((Missing T)) T))", "unknown trait Missing")
         self.rejects("(trait P (T)) (type Bad (forall (T) ((P T T)) T))", "wrong number")

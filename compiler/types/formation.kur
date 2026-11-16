@@ -9,7 +9,7 @@ use std::mem::Ref;
 use std::raw::Span;
 use std::alloc::arena::Domain!;
 use std::bytes::buffer::Buffer!;
-use package::kurs::core::{Block, Edge, Fun, Kind, ModuleId, Param, Premise, Program, Terminator, Trait, Type};
+use package::kurs::core::{Block, Edge, Fun, Kind, ModuleId, Param, Premise, Program, Terminator, Trait, Type, TypeDecl};
 use package::kurs::core as C;
 use package::resolve::resolver::Resolver;
 use package::syntax::ast::{Pos, no_pos};
@@ -588,6 +588,33 @@ impl Formation[D, 'k] {
         }
     }
 
+    // A type whose name has no `!` is not linear for every instantiation: it is Copy when its type
+    // arguments are.
+    fn unmarked(self, &cx: Domain!['k], decl: TypeDecl['k]) {
+        if decl.linear(&cx) {
+            return;
+        }
+        let args: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
+        let kinds: ArenaMap[Span['k], Kind, 'k] = ArenaMap::new(&cx);
+        var generic = false;
+        var i = 0usize;
+        while i < decl.params.len(&cx) {
+            let p = decl.params.at(&cx, i);
+            if is_brand(p.kind) {
+                args.push(&cx, Type::Skolem.(p.name));
+            } else {
+                args.push(&cx, C::named(p.name, ArenaVec::new(&cx)));
+                kinds.insert(&cx, p.name, Kind::Copy);
+                generic = true;
+            }
+            i = i + 1usize;
+        }
+        if !self.types.is_copy(&cx, C::named(decl.name, args), kinds) {
+            self.fail(&cx, Buffer!::new().push_static("type ").push_bytes(&cx, decl.name).push_static(" holds a linear type")
+                .push_static(if generic { " whatever its type arguments" } else { "" }).push_static("; declare it ").push_bytes(&cx, decl.name).push_static("!").save(&cx));
+        }
+    }
+
     fn declarations(self, &cx: Domain!['k]) {
         let env = with_kind(&cx, ArenaMap::new(&cx), Span::from_static(&cx, "static"), Kind::Brand);
         let decls = self.program.types.values(&cx);
@@ -604,6 +631,11 @@ impl Formation[D, 'k] {
             }
             self.fits(&cx, decl.body, Kind::Any, scope);
             i = i + 1usize;
+        }
+        var u = 0usize;
+        while u < decls.len(&cx) {
+            self.unmarked(&cx, decls.at(&cx, u));
+            u = u + 1usize;
         }
         let traits = self.program.traits.values(&cx);
         var t = 0usize;
