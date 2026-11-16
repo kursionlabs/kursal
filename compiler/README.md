@@ -674,7 +674,11 @@ and compare memory. A target, hosted or freestanding, must provide those four.
 
 ## Errors
 
-The compiler stops at the first error: `support::base::fail(&cx, message)` prints the message and exits
+Resolution reports every error it finds before it stops: `Resolver::report` keeps an error with
+its file and position, and `Resolver::stop`, after the last name is resolved, prints the first 20
+in source order (by module, then position), each on its own line, then `and N more errors`. An
+error reported twice is printed once. Every other phase stops at the first error:
+`support::base::fail(&cx, message)` prints the message and exits
 with status 1, leaving the open arenas to the operating system; `fail_static(literal)` needs no context. A message is exactly what the reference compiler prints for the same error: `KursError`'s
 `str()`, which is `line:col: message` when it carries a position and the message alone otherwise,
 and the file prefix the front end adds (`resolve.located`). Tests compare messages.
@@ -694,7 +698,12 @@ Where the reference wraps a phase in `with resolver.located(module, pos):`, call
 `r.locate(&cx, module, pos)` before it and `r.unlocate(&cx)` after, and report errors inside it with
 `r.fail(&cx, message, pos)` (a `pos` on line 0 is none): it adds the file, and the item's position when
 the error has none of its own. Lookups that the reference may catch (`ResolveError`) return a
-`Result[Target, Problem]` instead of stopping (`Resolver.lookup`); `Resolver.need` stops.
+`Result[Target, Problem]` instead of stopping (`Resolver.lookup`); `Resolver.need` stops. Where
+the reference reports an error and goes on (`with resolver.reporting(...)`, `resolver.report`),
+resolution calls `r.report(&cx, message, pos)`, located the same way, and goes on; `Names::run`
+ends with `r.stop(&cx)`. The checks of whole programs that the front end also runs
+(`check_type_expansion`, `check_instance_termination`, `check_coherence`) take the files of the
+declarations they check, and no files when they check KURS.
 
 The standard library is found as the reference finds it, in `$KURSAL_LIB`; without it, in `lib`
 beside the directory holding the compiler's binary (`PREFIX/bin/kursal` reads `PREFIX/lib`, so
@@ -719,7 +728,7 @@ These are the places where Kursal differs from what one might expect.
   its declaration lacks (`unknown name Point!; Point is not a linear type`), and only a type's name
   may end with `!` (`only a linear type's name ends with !`). A struct, enum or tuple declaration
   carries the `!` exactly when it is linear whatever its type arguments: one that holds a linear type
-  must (`struct S holds a linear type; declare it S!`, or `... holds a linear type whatever its type
+  must (`struct S holds a linear type in its field l; declare it S!`, or `... whatever its type
   arguments ...` for a generic one), one linear only through its type arguments has none
   (`Option[T]`; `Option[Buffer!]` shows its linearity through its argument), and one with the `!` is
   linear even when every field is `Copy` (`Exclusive!['k]`). A `foreach` whose source has a fixed
@@ -727,6 +736,14 @@ These are the places where Kursal differs from what one might expect.
   it is `Copy` only when its body does not mention the binder, since even a `Copy` argument may hold
   a linear type in an array of length zero. Type parameters never carry it: `forall T` may stand for
   a linear type unless a premise says `Copy[T]`.
+
+  Moving code to `!` names is not a find-and-replace. The same name can be linear in one module and
+  plain in another (`elf::Open` beside `fatfile::Open!`), and a type of one's own named `Copy!` is
+  not the `Copy[T]` premise. Let the compiler drive the change: resolution reports every name it
+  cannot resolve in one run, each at the name itself, and says which spelling exists
+  (`unknown name Open; the linear type is Open!`). When the name came through a `use` that still
+  imports the other spelling, the hint names that line too (`unknown name Open!; the linear type is
+  Open!, imported as Open at src/lib.kur:3:5`), so the fix goes in the `use`.
 - **Builtins are imported.** Only the primitive types, `Never`, `Copy` and `Exposed` are always in
   scope. What else the compiler provides, `core` exports from the module it belongs to, and code
   imports it like any other name (see the reference compiler's README, "Builtins"):
