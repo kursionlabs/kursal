@@ -225,9 +225,9 @@ class Backend:
                 cparams = [(self.ctype(p, False), k in places) for k, p in enumerate(params)]
                 plist = ", ".join(ct + ("*" if place else "") for ct, place in cparams if ct != "void") or "void"
                 self.defs.append(f"typedef {result} (*{name})({plist});")
-            case Enum(variants=variants) if self.types.niche_variant(variants) is not None:
+            case Enum(variants=variants) if (niche := self.types.niche_variant(variants)) is not None:
                 # The niche layout: the payload's C type, the other variant a null at the niche.
-                payload = erase(variants[self.types.niche_variant(variants)][1], self.types)
+                payload = erase(variants[niche][1], self.types)
                 self.names[ty] = self.ctype(payload, False)
                 self.represented[ty] = payload
             case Tuple() | Struct() | Array() | Enum():
@@ -274,6 +274,13 @@ class Backend:
 
     def shape(self, ty: Type) -> Type:
         return self.types.shape(erase(ty, self.types))
+
+    def element(self, ty: Type, k: int) -> Type:
+        """Element `k` of a tuple type."""
+        shape = self.shape(ty)
+        if not isinstance(shape, Tuple):
+            raise KursError(f"backend: {ty} is not a tuple")
+        return shape.elems[k]
 
     # ------------------------------------------------------- enum layouts --
 
@@ -475,9 +482,9 @@ class Backend:
             self.define(next(iter(self.pending)))
         const, restrict = self.qualifiers()
         protos, bodies = [], []
-        for symbol, head, body in self.emitted:
-            if symbol is not None:
-                head = self.head(symbol, const, restrict)
+        for owner, head, body in self.emitted:
+            if owner is not None:
+                head = self.head(owner, const, restrict)
             protos.append(head + ";")
             bodies.append(head + body)
         out = [PRELUDE, *self.forward, *self.defs, *externs, *datas, *protos, *bodies]
@@ -554,7 +561,7 @@ class Backend:
         self.plan = Plan(fun, components, adapters, params, shapes)
         typed = self.checker.typed[id(fun)]
         substitute_type = self.substitute_type
-        self.place_c = {}
+        self.place_c: dict[str, str] = {}
         self.roots = {**{n: substitute_type(t) for n, t in fun.blocks[0].params if n.startswith("&")},
                       **{n: substitute_type(t) for n, t in fun.locals}}
         homes = self.homes(fun, typed)
@@ -573,7 +580,7 @@ class Backend:
         self.temps: list[str] = []
         entry = fun.blocks[0]
         self.params = [name for name, _ in entry.params]
-        self.place_c: dict[str, str] = {}
+        self.place_c = {}
         cparams = []
         # The parameters taken by pointer: read through it, or copied into the parameter's variable
         # where the function writes that (a call of itself in tail position, or a lend in place).
@@ -1323,7 +1330,7 @@ class Backend:
                 pointers.append(f"&{self.place(homed[k])[0]}")
                 if root(homed[k]) in self.params:
                     self.written.add((self.symbol, self.params.index(root(homed[k]))))
-            elif k in own and own[k][0] == self.ctype(self.shape(result).elems[k]):
+            elif k in own and own[k][0] == self.ctype(self.element(result, k)):
                 pointers.append(own[k][1])
                 self.at_out.add((self.label, name, k))
             elif live:
@@ -1331,7 +1338,7 @@ class Backend:
             else:
                 temp = allocate(f"arg_{self.scratch}", self.taken)
                 self.scratch += 1
-                self.temps.append(f"{self.ctype(self.shape(result).elems[k])} {temp};")
+                self.temps.append(f"{self.ctype(self.element(result, k))} {temp};")
                 pointers.append(f"&{temp}")
         self.out_paths = [homed[k] for k in outs if k in homed]
         operands = self.operands(args, refs)

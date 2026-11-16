@@ -471,8 +471,9 @@ class Infer:
                 got = self.check(self.generic(value, want), want)
                 stmt.binder = self.bind(name, want or got, mutable=True).id
             case S.Const(name=name, type=ty, value=value):
-                stmt.folded = self.sigs.typed(name, value, self.type(ty), self.module)
-                stmt.binder = self.bind(name, stmt.folded[2]).id
+                want = self.type(ty)
+                stmt.folded = self.sigs.typed(name, value, want, self.module)
+                stmt.binder = self.bind(name, want).id
             case S.Assign(target=target, value=value):
                 self.check(value, self.place_type(target, assign=True))
             case S.ExprStmt(value=value):
@@ -1366,7 +1367,7 @@ class Infer:
                 other = self.r.scopes[source]
                 names += [*other.decls, *other.imports, *other.exports]
         found: set[Decl] = set()
-        for name in dict.fromkeys(names):
+        for name in dict.fromkeys(names, True):
             try:
                 target = self.r.lookup(module, (name,))
             except ResolveError:

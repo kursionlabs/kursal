@@ -137,7 +137,7 @@ class Checker:
     def check(self) -> None:
         for ext in self.program.externs.values():
             self.where = f"extern {ext.name}"
-            for t in ext.ptypes if ext.ptypes is not None else (ext.ret,):
+            for t in ext.ptypes if ext.ptypes is not None else (() if ext.ret is None else (ext.ret,)):
                 self.has_memory_form(t)
         for trait in self.program.traits.values():
             self.where = f"trait {trait.name}"
@@ -661,17 +661,17 @@ class Checker:
         return U32
 
     def op_int_cast(self, instr: Instr) -> Type:
-        got = self.use(instr.args[0])
-        if not (isinstance(got, Prim) and got.name in INTEGERS and isinstance(instr.ty, Prim) and instr.ty.name in INTEGERS):
+        got, ty = self.use(instr.args[0]), instr.ty
+        if not (isinstance(got, Prim) and got.name in INTEGERS and isinstance(ty, Prim) and ty.name in INTEGERS):
             self.fail("int_cast_converts_between")
-        return instr.ty
+        return ty
 
     def op_to_ptr(self, instr: Instr) -> Type:
         """`NonNull T` to `*T`: forgetting that a pointer is not null is safe."""
-        got = self.use(instr.args[0])
-        if not (isinstance(got, NonNull) and equal(Ptr(got.inner), instr.ty)):
+        got, ty = self.use(instr.args[0]), instr.ty
+        if not (isinstance(got, NonNull) and ty is not None and equal(Ptr(got.inner), ty)):
             self.fail("to_ptr_converts_non_null")
-        return instr.ty
+        return ty
 
     def op_cast(self, instr: Instr) -> Type:
         if instr.ty is None:

@@ -293,7 +293,7 @@ def promote_locals(fun: C.Fun, types: Types, params: Sequence[C.Param],
             else:
                 instructions.append(instr)
 
-        def edge(e: C.Edge) -> None:
+        def pass_on(e: C.Edge) -> None:
             for p in incoming[e.target]:
                 materialize(p)
             e.args = tuple(value(a) for a in e.args) + tuple(read(p) for p in incoming[e.target])
@@ -302,11 +302,11 @@ def promote_locals(fun: C.Fun, types: Types, params: Sequence[C.Param],
             case C.Ret():
                 block.term.value = value(block.term.value)
             case C.Jmp(edge=e):
-                edge(e)
+                pass_on(e)
             case C.Jnz():
                 block.term.cond = value(block.term.cond)
-                edge(block.term.then)
-                edge(block.term.other)
+                pass_on(block.term.then)
+                pass_on(block.term.other)
             case C.Switch():
                 if restricted(block.term.scrutinee):
                     # The enum moves into the switch, and each arm's block holds its payload.
@@ -314,7 +314,7 @@ def promote_locals(fun: C.Fun, types: Types, params: Sequence[C.Param],
                 else:
                     block.term.scrutinee = value(block.term.scrutinee)
                 for arm in block.term.arms:
-                    edge(arm.edge)
+                    pass_on(arm.edge)
         block.instrs = tuple(instructions)
         block.empty = tuple(p for p in block.empty if not restricted(p))
         block.known = tuple((p, v) for p, v in block.known if not restricted(p))

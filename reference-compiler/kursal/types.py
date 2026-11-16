@@ -100,8 +100,14 @@ def subst_foreach(ty: Foreach, sub: Substitution) -> tuple[Foreach, dict[str, Ty
     else:
         source, retained = subst(ty.source, sub), dict(sub)
     (binder,), inner = _rebind((ty.binder,), retained, brand=False)
-    names = tuple(inner.get(b, Named(b)).name for b in (ty.retained or ()))
+    names = tuple(_renamed(inner, b) for b in (ty.retained or ()))
     return Foreach(binder, ty.indirect, source, subst(ty.body, inner), names), inner
+
+
+def _renamed(sub: Substitution, binder: str) -> str:
+    """The name `sub` gives a type-variable binder: its renaming, else its own."""
+    renamed = sub.get(binder)
+    return renamed.name if isinstance(renamed, Named) else binder
 
 
 def _rebind(
