@@ -1697,7 +1697,8 @@ class Backend:
         the caller, at every call. The core language makes that so for places lent by path: a place is no
         value, so a local place's C object has no address but the ones lends pass, and the places one call
         lends are disjoint (an enum's payloads are lent only under a known variant, so never two of them).
-        It is not so for a raw target `&*p`, whose memory any copy of `p` reaches; for a function whose
+        It is not relied on for a raw target `&*p`, whose exclusivity while lent is the unsafe lender's
+        unchecked obligation (lib/std/CONTRACTS.md, 2.0d); and it is not so for a function whose
         address is taken, which a call through a function value may lend anything; and for a function whose
         tail call to itself moves a place parameter to another place (`tail_call`), which would reach two
         places through one pointer in one execution of the C function."""

@@ -48,8 +48,8 @@ PURE = frozenset({"const", "copy", "construct", "construct_variant", "destruct",
 # Instructions whose dead result the C does not assign: unit results of stores, and call results.
 UNASSIGNED = frozenset({"store", "ptr_store", "ptr_store_volatile",
                         "ptr_atomic_store", "fence", "call", "trait_call"})
-# Instructions that may write memory through a raw pointer, or run code that may: a place parameter
-# lent from a raw target is reached so too.
+# Instructions that may write memory through a raw pointer, or run code that may: memory under a place
+# parameter counts as reachable so too, since this backend does not rely on a raw target's exclusivity.
 OPAQUE = frozenset({"call", "trait_call", "foreach", "ptr_store", "ptr_store_volatile",
                     *(op for op in ATOMIC_OPS if op not in ("ptr_atomic_load", "fence"))})
 
@@ -446,8 +446,8 @@ class Plan:
         borrowed value lies at. A class is read where it lies when, from the instruction that took its
         first value out of the path to the class's last read in the block, nothing writes a path
         overlapping it: no store, no lend, no adapter that may lend such a path for another class, and,
-        under a place parameter, no call or raw write at all (memory lent from a raw target may be reached
-        through a pointer). A C variable is assigned once in a block, so only a lend in place writes it. A
+        under a place parameter, no call or raw write at all (the backend does not rely on the exclusivity
+        of memory lent from a raw target). A C variable is assigned once in a block, so only a lend in place writes it. A
         call evaluates its arguments before it runs, so the call that reads the class last may write it.
 
         A lend adapter's call lends its callee the paths its borrowed values lie at, instead of copying

@@ -33,7 +33,7 @@ not an available remedy for anything in this document.
 ### 0.2 Named types are not unfolded
 
 The walk descends through the structure of a *written* type term: a
-pointer's or phantom's inner type, tuple elements, an array's element type,
+pointer's or `NonNull`'s inner type, tuple elements, an array's element type,
 a named type's type **arguments**, an `exists` body, a `foreach` mapping
 body, and the parameter and return types of a function type. It **never
 opens a named type's declaration** to walk its fields. For `foreach`, the
@@ -108,7 +108,8 @@ allocation of at least the implied extent, and not be aliased by any live
 handed back must not outlive the structure it came from.
 
 A further obligation applies to every `extern "C"` declaration, class B or
-not; see section 2.0c.
+not; see section 2.0c. Another applies to every lend of a raw pointer's
+target, whatever the signature; see section 2.0d.
 
 ### 2.0 Class-B functions ruled safe
 
@@ -167,6 +168,24 @@ The library's own externs satisfy it: `malloc`/`realloc`/`free`, `abort`
 `close`/`lseek`, `clock`, and the `libc` adapters' C functions. An extern
 that can `longjmp`, throw, or resume from a handler into its caller is not
 made safe by this library's vocabulary or by an `unsafe` marker.
+
+### 2.0d Lending a raw pointer's target
+
+`f(unsafe &*p)` lends the memory behind a raw pointer `p: *T` to a place
+parameter, as `core::mem::lend` and `lend_in` do. The `unsafe` marker
+discharges this obligation, which nothing checks:
+
+> **`p` points at a live, initialized `T`, and from the call until it
+> returns nothing reaches that memory except through the lent place:** no
+> other copy of `p` or pointer derived from it, no `Ref`, `Slice` or
+> capability over it, no other thread.
+
+The callee treats the place as any other: it may move the value out and
+must leave a `T` there when it returns. A compiler may rely on the
+exclusivity as it relies on the escape rule for a local place, for example
+to mark the parameter `restrict` or to keep reading a value where it lies
+across a call (compiler/README.md, "Why `restrict` is sound where it is
+written"). A program that breaks it has undefined behavior.
 
 ### 2.1 Frees, or authorizes freeing, an arbitrary pointer
 
@@ -368,8 +387,8 @@ type (one holding a zero-size part beside bytes is ordinary). The size
 arithmetic is still defined at 0, for raw code and for `T`s that only
 compute with their size:
 
-- `alloc::heap::Storage::try_alloc`/`try_grow` (and `alloc`/`grow`) ask
-  `malloc`/`realloc` for one byte where the size is 0, so a block is never
+- `alloc::heap::Storage::try_alloc`/`try_grow` (and so
+  `HeapAllocator::alloc`/`grow`) ask `malloc`/`realloc` for one byte where the size is 0, so a block is never
   null and `realloc` never frees; the `Uninit!` records the requested 0;
 - `checked_mul(n, 0usize)` is 0 without dividing by 0;
 - `alloc::arena`'s `bump_chunk` reserves no bytes for a 0-byte request and

@@ -276,12 +276,10 @@ What a function leaves out is decided first, from its KURS alone (`backend::plan
     local place, so the adapter stores it into a place of its own, lends that, and returns it with
     the call's result. The backend knows an adapter by its shape alone (`Backend::adapter`) and
     writes its call as the call it makes, on the caller's storage, so the adapter itself is not
-    written. In Aranea's kernel this left out 268 of its 272 adapters, and with them the copies
-    of a 520-byte table row in and out of each `Table::run_hot`;
+    written, and neither are the copies of the borrowed values into its places and out again;
   - a construction whose components each lie at their own member of one path when it is made, where
     a destruct took apart a value of the construction's type, lies at that path and writes nothing
-    (lowering takes a branded value apart and builds it again around a lend; `Group::slot_index`
-    rebuilt and stored back a whole member per probe before).
+    (lowering takes a branded value apart and builds it again around a lend).
 - **Homed locals** (`Backend::homes`, before the plan). A local place L whose every whole store
   stores a value lying at one place path P of L's type, and that is never holding a value while P
   is, shares P's storage: the function is planned and written with L's paths rewritten under P, so
@@ -292,18 +290,16 @@ What a function leaves out is decided first, from its KURS alone (`backend::plan
 - **Shared variables** (`Plan::share`). A value assigned in a block and read by one edge alone, as
   the argument of a live parameter of another block, is assigned to that parameter's variable, and
   the edge assigns nothing: an enum result of a call or of a construction is made in the join's
-  variable, unless the block reads its payload in that variable (below). The payload parameter of a block that only one arm of a switch on a value enters reads
-  the payload where the scrutinee lies, when that is a C variable (not a place, which the arm's block
-  may write).
-
+  variable, unless the block reads its payload in that variable (below). The payload parameter of a
+  block that only one arm of a switch on a value enters reads the payload where the scrutinee lies,
+  when that is a C variable (not a place, which the arm's block may write).
 - **Homed parameters** (`Plan::home_params`). A block parameter of a struct or tuple type that its
   block takes apart, and whose component the block only stores into a place path its header declares
   empty, gets that component written at the path by every edge into the block: where the argument is
   made, when a construction or a call makes it into the parameter's variable, else at the edge after
   its other assignments, unless an earlier write there would change it. The store writes nothing,
-  and the component lies at the path. A join
-  `let (next, hot) = match state { ... }; state = next;` so writes each arm's state straight into
-  `state`.
+  and the component lies at the path. A join `let (next, hot) = match state { ... }; state = next;`
+  so writes each arm's state straight into `state`.
 
 Then, while writing the C (`backend::cgen`, `cgen.py`):
 
@@ -327,13 +323,12 @@ Then, while writing the C (`backend::cgen`, `cgen.py`):
   into its own variable first where it writes that variable (a call of itself in tail position, a
   lend in place of a path in it). A function whose address is taken keeps the plain convention for
   function values: they call its by-value entry (`thunk`), which passes the addresses on. A call
-  through a function value or to a foreign function passes values as before. Up to four words the C
-  compiler copies a value in as many moves, and a pointer would cost the callee a load per read and
-  raise the inliner's estimate of it: `examples/lisp`'s `Interp::cons`, taking two four-word values,
-  is not inlined into the interpreter's loop when it takes them by pointer, and the interpreter runs
-  4% more instructions.
+  through a function value or to a foreign function passes every value by value. Up to four words
+  the C compiler copies a value in as many moves, and a pointer would cost the callee a load per read
+  and raise the inliner's estimate of it: `examples/lisp`'s `Interp::cons`, taking two four-word
+  values, is not inlined into the interpreter's loop when it takes them by pointer.
 - **Out-results.** A Kursal function whose result is a tuple with elements of more than four words
-  (`Backend::outs`, decided in `request` beside `by_ref`) takes, after its other parameters, a
+  (`Backend::outs`, decided in `Backend::request` beside `by_ref`) takes, after its other parameters, a
   pointer for each such element (`T* out_k`), writes the element there, and returns a tuple of the
   other elements (`void` when none has bytes). A construction it returns and reads nowhere else
   writes those elements through the pointers at once. A caller passes the place path a homed
@@ -367,13 +362,15 @@ that so for places lent by path:
 
 So a place parameter lent, at every call, a path under a local place of the caller, or under a
 place parameter of the caller that is itself `restrict`, is reached only through the parameter
-while the call runs (by induction on the calls, from the locals). Where the argument does not hold,
-`restrict` is not written:
+while the call runs (by induction on the calls, from the locals). `restrict` is not written in
+these cases:
 
-- **Raw targets.** `f(&*p)` lends the memory behind a raw pointer, which any copy of `p` (another
-  argument, a field of something reachable, another thread) may reach. Its exclusivity is the
-  unsafe caller's obligation, which nothing checks, so the callee's parameter is not `restrict`, nor
-  is any parameter that place is lent on to.
+- **Raw targets.** `f(unsafe &*p)` lends the memory behind a raw pointer, which a copy of `p`
+  (another argument, a field of something reachable, another thread) could reach. That nothing does
+  while it is lent is the obligation of the unsafe lend (`lib/std/CONTRACTS.md`, section 2.0d),
+  which nothing checks. A backend may rely on it, as it relies on the escape rule for a local place;
+  this one does not: the callee's parameter is not `restrict`, nor is any parameter that place is
+  lent on to.
 - **Functions whose address is taken.** A call through a function value may lend anything, and a
   function pointer's type has no qualifiers: such a function's place parameters are neither
   `restrict` nor `const`, and a parameter lent through a function value is not `const`.
@@ -397,8 +394,8 @@ write there while the callee runs:
   alone;
 - a local place of the caller is written only by the caller or through a lend of it, so it is
   passed when the same call lends no path overlapping it (the escape rule: no other address of it
-  exists); memory under a place parameter may be reached by other pointers, so a value lying there
-  is copied into a temporary first;
+  exists); a value lying under a place parameter is copied into a temporary first, since this
+  backend does not rely on a raw target's exclusivity (see "Raw targets" above);
 - the pointee of the caller's own by-pointer parameter is, by the same argument one call up,
   written by nobody while the caller runs, and so while its callee runs.
 
@@ -420,13 +417,14 @@ plan (`Plan::residences`) allows a residence only where that holds:
    value may overlap (whether or not that lend happens) ends there.
 2. **Who writes a place.** Under the escape rule a local place's C object has no address but the
    ones its lends pass, so only a store or a lend of an overlapping path, in this function, writes
-   it. Memory under a place parameter may also be reached through a raw pointer when a caller lent
-   it from a raw target (`&*p`): for a residence there, every call, `foreach`, raw store and atomic
-   write before the last read ends it. A store of the value into the very place it lies in, as the
-   last read, writes nothing.
+   it. So is memory under a place parameter, unless a caller lent it from a raw target (`&*p`) and
+   broke that lend's obligation; this backend does not rely on the obligation (see "Raw targets"
+   above), so for a residence there, every call, `foreach`, raw store and atomic write before the
+   last read ends it. A store of the value into the very place it lies in, as the last read, writes
+   nothing.
 3. **Calls read first.** A call's arguments are evaluated before its body runs, so the call that
    reads a value last may write where it lay; any other write before the last read ends the
-   residence, and the value is copied out of the place where it came out, as before.
+   residence, and the value is copied out of the place where it came out.
 4. **No overlapping assignment.** C requires the two sides of an assignment to be the same object
    or not to overlap. A store into a path overlapping, but not equal to, where its value lies ends
    the residence; a construction is stored in place only when every component that lies in the
@@ -503,9 +501,9 @@ an out-result is written through a pointer by the callee instead of returned:
    that does); the caller's own out pointer, exclusive by the same argument one call up; or a member
    of the variable of the call's result, which the call defines, so no argument lies in it: a value
    of another block lies in it only as a payload read where its scrutinee lies, and a block reading
-   its payload in a parameter's variable shares no value into that parameter (9 above). The
-   callee writes it at a return, or at a construction that is returned and read nowhere else, after
-   which nothing in the callee reads anything there.
+   its payload in a parameter's variable shares no value into that parameter (item 9 of "Why
+   reading values where they lie is sound"). The callee writes it at a return, or at a construction
+   that is returned and read nowhere else, after which nothing in the callee reads anything there.
 5. **Calls through function values** keep the plain convention: they reach a function writing out
    pointers through its by-value entry, whose pointees are its own locals. A `foreach` mapper does
    the same. A self tail call keeps the out pointers it was given; `musttail` needs a scalar result,
@@ -598,11 +596,11 @@ beyond the surface spelling of the builtin type.
 The layout is sound because no program can observe or break it:
 
 - **The niche holds a valid value whenever it is read.** A `NonNull` value is made only by an unsafe
-  cast from a pointer, whose obligation is that it is not null, or by `NonNull::new`, which checks.
-  The cast's C says so to the C compiler (`if (n == 0) __builtin_unreachable();`), which then folds
-  the niche tests of what is built from it, as it folded a constant tag before: without it, a
-  `Slice::get_ref` inlined into a byte loop kept its test for null, and `wordfreq` ran 15% slower.
-  `variant_tag` and `switch` of a place need the place full, so its niche holds a `NonNull` it was
+  cast from a pointer (or another `NonNull`), whose obligation is that it is not null, or by
+  `NonNull::new`, which checks. The cast's C says so to the C compiler
+  (`if (n == 0) __builtin_unreachable();`), which then folds the niche tests of what is built from
+  it, as it folds a constant tag: without it, a `Slice::get_ref` inlined into a byte loop keeps its
+  test for null. `variant_tag` and `switch` of a place need the place full, so its niche holds a `NonNull` it was
   given; a store under a known variant stores a whole `NonNull`, never a null, and a payload that is
   moved out keeps its bytes. The dataless variant's null is written only by `construct_variant`.
 - **Nothing reads the bytes the dataless variant leaves unwritten.** Only the niche is read to tell
@@ -614,9 +612,9 @@ The layout is sound because no program can observe or break it:
   compiler's choice, and a cast between, say, `Option[NonNull[u8]]` and `*u8` would make it a
   contract. A cast of a type parameter is already rejected, so no specialization can bring an enum
   into one.
-- **Places, lends, `const` and `restrict`** are as before: a place under its known variant is the
-  enum's object (see "Why `restrict` is sound"); packing and opening a niche-layout enum copy its
-  value like any other.
+- **Places, lends, `const` and `restrict`** are as for a tagged enum: a place under its known
+  variant is the enum's object (see "Why `restrict` is sound where it is written"); packing and
+  opening a niche-layout enum copy its value like any other.
 
 ### The C compiler
 
@@ -625,6 +623,12 @@ The layout is sound because no program can observe or break it:
 generated code (unused labels, the standard library's own prototypes of C functions);
 `-fno-builtin` keeps the C compiler from giving a function the meaning of the C library function of
 the same name, which an extern or a Kursal function may declare with another type.
+
+The C is GNU C (`__typeof__`, `__builtin_*`, `__atomic_*`), as Clang and GCC accept it, and includes
+only `<stddef.h>` and `<stdint.h>`; `usize` and `isize` are 64-bit. It calls no C library function
+but those a program declares `extern`, yet the C compiler may: like any C compiler for a
+freestanding target, it emits calls to `memcpy`, `memmove`, `memset` and `memcmp` to copy, fill
+and compare memory. A target, hosted or freestanding, must provide those four.
 
 ## Errors
 
@@ -651,7 +655,9 @@ the error has none of its own. Lookups that the reference may catch (`ResolveErr
 `Result[Target, Problem]` instead of stopping (`Resolver.lookup`); `Resolver.need` stops.
 
 The standard library is found as the reference finds it, in `$KURSAL_LIB`; without it, in `lib`
-beside the directory holding the compiler's binary (`PREFIX/bin/kursal` reads `PREFIX/lib`).
+beside the directory holding the compiler's binary (`PREFIX/bin/kursal` reads `PREFIX/lib`, so
+the repository's `bin/kursal` reads its `lib`). `scripts/bootstrap.sh` sets `KURSAL_LIB` for every
+stage.
 
 ## The language, for a compiler author
 
@@ -684,11 +690,12 @@ These are the places where Kursal differs from what one might expect.
 - **Literals** carry their type when nothing else fixes it: `0u32`, `1usize`, `b'a'`. A bare `0`
   needs a type from context.
 - **`unsafe`** marks one operation: `unsafe f(x)` calls an unsafe or extern function, `unsafe *p`
-  reads through a pointer, `unsafe (x as *T)` casts. `unsafe (unsafe malloc(n) as *T)` is two
-  operations. A safe function may contain unsafe operations.
+  reads through a pointer, `unsafe (x as *T)` casts, `f(unsafe &*p)` lends a pointer's target.
+  `unsafe (unsafe malloc(n) as *T)` is two operations. A safe function may contain unsafe operations.
 - **Generic code over linear types.** A type parameter may stand for a linear type unless a premise
   says `Copy[T]`. Using a value twice, or dropping it on one path (`a && b` drops `b` when `a` is
-  false), needs `Copy[T]`. Every `support::base` collection requires it.
+  false), needs `Copy[T]`. The arena collections (`ArenaVec`, `ArenaMap`, `ArenaSet`, `List`) require
+  it of their elements.
 - **Places.** A linear value is lent by place: `fn f(&cx: Domain!['k])` is called `f(&cx)`, and the
   callee's changes to `cx` are the caller's. Fields of a lent struct can be lent in one call
   (`&cx.arena.alloc(&cx.tag, value)`), and a call may lend `cx` again in its arguments

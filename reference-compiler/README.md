@@ -4,7 +4,8 @@ The reference compiler for Kursal (Python package `kursal`). It is a direct,
 spec-driven implementation of the language: source text is parsed, resolved,
 typed, lowered to KURS (the core language), checked, and translated to C. The
 translation leaves out what the C would not use, reads values where they lie instead of
-copying them, and turns calls in tail position into jumps (`plan.py`, `cgen.py`); there
+copying them, passes large aggregates by pointer, and turns calls in tail position into jumps
+(`plan.py`, `cgen.py`; [`compiler/README.md`](../compiler/README.md), "The C backend"); there
 are no passes over KURS.
 
 It needs only Python 3.12+. [uv](https://docs.astral.sh/uv/) manages the
@@ -23,7 +24,8 @@ development tools (`pyproject.toml`, `uv.lock`); mypy checks `kursal/`.
 | C | `plan.py`, `cgen.py`, `mangle.py` | one C translation unit |
 
 `kurs.py` reads and writes serialized KURS (S-expressions, `sexpr.py`), and `readable.py`
-prints it in the readable notation.
+prints it in the readable notation. `literals.py` holds the rules for scalar literals that
+inference, lowering and the checker share, and `cc.py` the C compiler command.
 
 ## Builtins
 
@@ -57,7 +59,8 @@ In KURS a bare atom is the IR's own vocabulary, a primitive type or a type param
 `::` is always the program's, fully qualified (`core::mem::Region`).
 
 - **Types**: `struct`, `enum`, `tuple`, `array`, `exists` and `foreach` (whose pattern `(ptr F)`
-  binds the pointee), and `(ptr T)`, `(non_null T)`, `(brand $k)`, `(fn (PTYPE*) RET)`.
+  binds the pointee), and `(ptr T)`, `(non_null T)`, `(brand $k)`, `(fn (PTYPE*) RET)` (an
+  unsafe function's type `(fn (unsafe) (PTYPE*) RET)`).
 - **Premises**: `(Copy T)` and `(Exposed T)`.
 - **Builtin operations**: `int_cast`, `to_ptr` (a `non_null` as its `ptr`), `cast`, `sizeof`,
   `alloca`, `fresh` and `static_brand`; through a raw pointer `ptr_load`, `ptr_store`,
@@ -66,9 +69,9 @@ In KURS a bare atom is the IR's own vocabulary, a primitive type or a type param
   `ptr_atomic_store`, `ptr_atomic_swap`, `ptr_atomic_compare_exchange`, `ptr_atomic_fetch_add`,
   `_sub`, `_and`, `_or`, `_xor`), and `fence`, which takes no pointer.
 - **Unsafety** is marked only by the `(unsafe (= ...))` wrapper of one instruction, or by an unsafe
-  function. The operations that need it are exactly `UNSAFE_OPS` (`core.py`; `kurs::core::is_unsafe_op`):
+  function (the `(unsafe)` clause of its declaration, and of its type). The operations that need it are exactly `UNSAFE_OPS` (`core.py`; `kurs::core::is_unsafe_op`):
   `cast`, `alloca`, `static_brand`, the `ptr_` loads and stores, the atomics and `fence`; a call needs
-  it when its callee is unsafe.
+  it when its callee is unsafe or when it lends a raw pointer's target (`&*%p`).
 
 ## A worked example: Counter
 
@@ -157,6 +160,7 @@ uv run python tools/test.py -j 1 -v          # serial, full unittest output
 uv run mypy                                  # static types
 ```
 
-End-to-end tests build C with the command of `kursal/cc.py` (`$KURSAL_CC`, else
-`clang`, with `-O3 -w -fno-builtin`), the one `tools/build.py` and the self-hosted compiler use, and run it; each test program's exit code
-is a checksum of its behavior.
+End-to-end tests build C with the command of `kursal/cc.py` (`$KURSAL_CC`, else `clang`, with
+`-O3 -w -fno-builtin`), the one `tools/build.py` and the self-hosted compiler use, and run it; each
+test program's exit code is a checksum of its behavior. The C's requirements of its C compiler and
+target are in [`compiler/README.md`](../compiler/README.md), "The C compiler".
