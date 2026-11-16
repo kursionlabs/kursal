@@ -139,34 +139,41 @@ exposed struct Pair {
 
 // Pairs the two iterators' items until either runs out. Both sides are
 // pulled before either is inspected, so an item left over when the other
-// side ends is dropped: `Copy[ItemA]`, `Copy[ItemB]`.
+// side ends is dropped: `Copy[ItemA]`, `Copy[ItemB]`. Once one side has
+// run out, neither is pulled again (`done`).
 forall IA, IB.
 exposed struct Zip {
     a: IA,
     b: IB,
+    done: bool,
 }
 
 forall IA, IB.
 fn zip(a: IA, b: IB) -> Zip[IA, IB] {
-    Zip.{ a, b }
+    Zip.{ a, b, done: false }
 }
 
 forall IA, IB, ItemA, ItemB where Iterator[IA -> ItemA], Iterator[IB -> ItemB], Copy[ItemA], Copy[ItemB].
 instance Iterator[Zip[IA, IB] -> Pair[ItemA, ItemB]] {
     fn next(&z: Zip[IA, IB]) -> Option[Pair[ItemA, ItemB]] {
-        let { a, b } = z;
+        let { a, b, done } = z;
+        if done {
+            z = Zip.{ a, b, done };
+            return Option::None;
+        }
         var a = a;
         var b = b;
         let a_opt = &a.next();
         let b_opt = &b.next();
-        z = Zip.{ a, b };
-        match a_opt {
+        let pair = match a_opt {
             Option::Some(av) => match b_opt {
                 Option::Some(bv) => Option::Some.(Pair.{ a: av, b: bv }),
                 Option::None => Option::None,
             },
             Option::None => Option::None,
-        }
+        };
+        z = Zip.{ a, b, done: pair.is_none() };
+        pair
     }
 }
 
@@ -277,25 +284,31 @@ instance Iterator[TakeWhile[I, T, Env] -> T] {
     }
 }
 
-// The first iterator's items, then the second's.
+// The first iterator's items, then the second's. Once the first has run
+// out it is not pulled again (`a_done`).
 forall IA, IB.
 exposed struct Chain {
     a: IA,
     b: IB,
+    a_done: bool,
 }
 
 forall IA, IB, T where Iterator[IA -> T], Iterator[IB -> T].
 instance Iterator[Chain[IA, IB] -> T] {
     fn next(&c: Chain[IA, IB]) -> Option[T] {
-        let { a, b } = c;
+        let { a, b, a_done } = c;
         var a = a;
         var b = b;
-        let first = &a.next();
+        var a_done = a_done;
+        let first = if a_done { Option::None } else { &a.next() };
         let item = match first {
             Option::Some(v) => Option::Some.(v),
-            Option::None => &b.next(),
+            Option::None => {
+                a_done = true;
+                &b.next()
+            },
         };
-        c = Chain.{ a, b };
+        c = Chain.{ a, b, a_done };
         item
     }
 }
@@ -335,7 +348,7 @@ impl I {
 
     forall J.
     fn chain(self, other: J) -> Chain[I, J] {
-        Chain.{ a: self, b: other }
+        Chain.{ a: self, b: other, a_done: false }
     }
 }
 

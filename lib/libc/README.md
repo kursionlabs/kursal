@@ -37,7 +37,8 @@ returns a `std::io::File!` over a fresh, close-on-exec descriptor; its
 usual read and close operations apply. `create` makes the file, or empties
 an existing one, and returns a `File!` open for writing (mode 0644 less the
 umask for a new file). Opening errors are positive errno
-values; later `File!` operations report errors as `std::io` does.
+values; later `File!` operations report a `std::io::Error`, which carries
+the errno.
 
 `DirectoryStream!` is restricted and linear. `next` returns an owned entry
 name, `Ok(None)` at EOF, or a positive errno on failure. Names include `.`

@@ -788,6 +788,9 @@ class Checker:
     def op_static_brand(self, instr: Instr) -> Type:
         return Brand(Skolem(STATIC))
 
+    def op_trap(self, instr: Instr) -> Type:
+        return Never()
+
     def op_fresh(self, instr: Instr) -> Type:
         return Exists(("k",), Brand(Skolem("k")))
 
@@ -1070,6 +1073,7 @@ OPERATIONS: dict[str, Callable[[Checker, Instr], Type | list[Type]]] = {
     "data": Checker.op_data,
     "static_brand": Checker.op_static_brand,
     "fresh": Checker.op_fresh,
+    "trap": Checker.op_trap,
     "pack": Checker.op_pack,
     "open": Checker.op_open,
     "ptr_load": Checker.op_ptr_load,

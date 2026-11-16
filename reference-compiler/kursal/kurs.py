@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 from typing import NoReturn, TypeGuard, Optional
 from .sexpr import Atom, Form, KursError, List, Position, Str, read
-from .core import (ANY, ATOMIC_OPS, BRAND, COPY, PRIMS, Array, Arm, Block, Brand, Data,
+from .core import (ANY, ATOMIC_OPS, BRAND, COPY, LITERAL_BITS, PRIMS, Array, Arm, Block, Brand, Data,
                    Edge, Enum, Exists, Exposure, Extern, Fn, Foreach, Fun, Ignored, Instance,
                    Instr, Jmp, Jnz, Method, ModuleId, Named, Never, Param, Premise,
                    NonNull, Prim, Program, Ptr, Ret, Skolem, Struct, Switch, Trait, Tuple,
@@ -66,7 +66,7 @@ def parse_type(form: Form) -> Type:
     if head == "tuple":
         return Tuple(tuple(parse_type(f) for f in rest))
     if head == "array":
-        return Array(parse_type(rest[0]), int(_text(rest[1])))
+        return Array(parse_type(rest[0]), _int(rest[1]))
     if head == "ptr":
         return Ptr(parse_type(rest[0]))
     if head == "non_null":
@@ -250,7 +250,17 @@ def parse_fun(forms: Sequence[Form], name: str, module: Optional[ModuleId] = Non
 
 def _module(form: Form) -> ModuleId:
     form = _list(form)
-    return ModuleId(int(_text(form[1])), tuple(map(str, form[2:])))
+    return ModuleId(_int(form[1]), tuple(map(str, form[2:])))
+
+
+def _int(form: Form) -> int:
+    """A decimal atom no larger than `usize` holds, which literals take as 64-bit; a larger one fails
+    as `int()` fails on text that is not a number. A negative one is left to the checker."""
+    text = _text(form)
+    value = int(text)
+    if value >= 1 << LITERAL_BITS["usize"]:
+        raise ValueError(f"invalid literal for int() with base 10: {text!r}")
+    return value
 
 
 def _clause(

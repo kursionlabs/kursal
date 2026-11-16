@@ -11,7 +11,7 @@ use core::raw::Span;
 use core::raw::elem_ptr;
 use core::slice::{Slice, ReadBytes};
 use core::fmt::Writable;
-use core::option::Result;
+use core::option::{Option, Result};
 use core::cstr::{CStr, cstr_len};
 use alloc::arena::ArenaByteWriter;
 use core::cap::{Access, Exclusive};
@@ -28,27 +28,43 @@ extern "C" fn kur_libc_fs_create(path: *u8, len: usize) -> i32;
 extern "C" fn kur_libc_fs_close(fd: i32) -> i32;
 extern "C" fn kur_libc_fs_regular_size(fd: i32) -> isize;
 
-// The errno of an I/O error that the system did not report: a `write` that
-// made no progress.
-const EIO: i32 = 5i32;
+// An I/O error: the `errno` of the system call that failed, or EIO (5)
+// for a failure the system did not report itself (a `write` that made no
+// progress, a short read where an exact count was asked for). Every
+// fallible function here reports one.
+exposed struct Error {
+    errno: i32,
+}
+
+impl Error {
+    // The error a negative return of an `fs.c` call stands for.
+    fn of_return(n: isize) -> Error {
+        Error.{ errno: 0i32 - (n as i32) }
+    }
+
+    fn io() -> Error {
+        Error.{ errno: 5i32 }
+    }
+}
 
 // -------------------------------------------------------------- output --
 // `write_all` retries partial writes (`write(2)` may write fewer bytes
 // than requested, even to a regular file) until every byte is written. It
 // fails with the call's errno on a negative return, and with EIO on zero
 // progress (`write` returning 0, which POSIX permits and which would
-// otherwise loop forever). The print helpers ignore the result: a failed
-// write to the process's own stdout/stderr has no reasonable recovery.
+// otherwise loop forever). Every output function returns the result; a
+// caller that prints to its own stdout or stderr and has no recovery
+// discards it, while a program whose output is its product checks it.
 
-unsafe fn write_all(fd: i32, ptr: *u8, len: usize) -> Result[(), i32] {
+unsafe fn write_all(fd: i32, ptr: *u8, len: usize) -> Result[(), Error] {
     var offset = 0usize;
     while offset < len {
         let n = unsafe kur_libc_fs_write(fd, unsafe elem_ptr(ptr, offset), len - offset);
         if n < 0isize {
-            return Result::Err.(0i32 - (n as i32));
+            return Result::Err.(Error::of_return(n));
         }
         if n == 0isize {
-            return Result::Err.(EIO);
+            return Result::Err.(Error::io());
         }
         offset = offset + (n as usize);
     }
@@ -56,37 +72,37 @@ unsafe fn write_all(fd: i32, ptr: *u8, len: usize) -> Result[(), i32] {
 }
 
 // Writes a span's bytes, reading them under the domain's capability, which
-// `cx` lends, and returns how many there were.
+// `cx` lends.
 forall 'k, C, R where Access[C -> 'k, R].
-fn write_span(fd: i32, &cx: C, sp: Span['k]) -> usize {
+fn write_span(fd: i32, &cx: C, sp: Span['k]) -> Result[(), Error] {
     let (tag, rest) = Access[C -> 'k, R]::open(cx);
     let (p, n) = sp.into_parts();
-    let u = unsafe write_all(fd, p, n);
+    let result = unsafe write_all(fd, p, n);
     cx = Access[C -> 'k, R]::close(tag, rest);
-    n
+    result
 }
 
 // Prints any byte view, read through the capability that permits it
 // (`Exclusive!`, `Shared!`, `StaticRead`).
 forall C, S where ReadBytes[C, S], Copy[S].
-fn print_bytes(fd: i32, &cap: C, bytes: S) -> () {
+fn print_bytes(fd: i32, &cap: C, bytes: S) -> Result[(), Error] {
     let buffer = Buffer::new().push_bytes(&cap, bytes);
-    let unit = print_buffer(fd, buffer);
+    print_buffer(fd, buffer)
 }
 
-fn print(fd: i32, s: Slice[u8, 'static]) -> () {
+fn print(fd: i32, s: Slice[u8, 'static]) -> Result[(), Error] {
     let (p, n, m) = s.into_parts();
-    let u = unsafe write_all(fd, p, n);
-    ()
+    unsafe write_all(fd, p, n)
 }
 
 // Writes `buf`'s bytes, then frees it. Reads them through `as_ptr`/`len`;
 // printing needs no brand.
-fn print_buffer(fd: i32, buf: Buffer!) -> () {
+fn print_buffer(fd: i32, buf: Buffer!) -> Result[(), Error] {
     let p = unsafe &buf.as_ptr();
     let n = &buf.len();
-    let u = unsafe write_all(fd, p, n);
-    buf.destroy()
+    let result = unsafe write_all(fd, p, n);
+    buf.destroy();
+    result
 }
 
 // ---------------------------------------------------------------- files --
@@ -109,17 +125,22 @@ unsafe fn read_exact(fd: i32, buf: *u8, size: usize) -> usize {
 }
 
 // Reads `fd` to EOF, 4096 bytes at a time, appending to `b` and returning
-// it; a read error ends the input. Caller: `fd` is a descriptor the caller
-// may read, as for `read_exact`.
-unsafe fn read_to_end_from(fd: i32, b: Buffer!) -> Buffer! {
+// it. A read error frees what was read and is returned: it never looks like
+// the end of the input. Caller: `fd` is a descriptor the caller may read,
+// as for `read_exact`.
+unsafe fn read_to_end_from(fd: i32, b: Buffer!) -> Result[Buffer!, Error] {
     let chunk = 4096usize;
     var b = b;
     while true {
         let w = b.writer(chunk);
         let (dest, avail) = unsafe &w.writable_tail();
         let n = unsafe kur_libc_fs_read(fd, dest, chunk);
-        if n <= 0isize {
-            return w.finish();
+        if n == 0isize {
+            return Result::Ok.(w.finish());
+        }
+        if n < 0isize {
+            w.finish().destroy();
+            return Result::Err.(Error::of_return(n));
         }
         // `commit_external` obligation: `dest` is `w.writable_tail()`'s
         // pointer after `b.writer(chunk)`, and a successful read returning
@@ -127,31 +148,47 @@ unsafe fn read_to_end_from(fd: i32, b: Buffer!) -> Buffer! {
         // been ruled out, so the cast cannot turn an error into a length.
         b = unsafe w.commit_external(n as usize);
     }
-    b
+    Result::Ok.(b)
 }
 
-fn read_all_stdin() -> Buffer! {
+fn read_all_stdin() -> Result[Buffer!, Error] {
     // Standard input is the process's own, readable by any of its code.
     unsafe read_to_end_from(0i32, Buffer::new())
 }
 
 // One line of stdin, without its newline: reads through the next newline
 // or to the end of input, one byte at a time so nothing past the line is
-// consumed. A read error ends the line.
-fn read_line() -> Buffer! {
+// consumed. `None` at the end of input, when no byte is left to read; an
+// empty line is `Some` of an empty buffer, and a last line with no newline
+// is still a line.
+fn read_line() -> Result[Option[Buffer!], Error] {
     var b = Buffer::new();
+    var any = false;
     while true {
         let w = b.writer(1usize);
         let (dest, avail) = unsafe &w.writable_tail();
         let n = unsafe kur_libc_fs_read(0i32, dest, 1usize);
-        if n <= 0isize || unsafe *dest == b'\n' {
-            return w.finish();
+        if n < 0isize {
+            w.finish().destroy();
+            return Result::Err.(Error::of_return(n));
+        }
+        if n == 0isize {
+            let line = w.finish();
+            if any {
+                return Result::Ok.(Option::Some.(line));
+            }
+            line.destroy();
+            return Result::Ok.(Option::None);
+        }
+        if unsafe *dest == b'\n' {
+            return Result::Ok.(Option::Some.(w.finish()));
         }
         // `read` returned 1, so it wrote `dest[0]`, inside the one-byte
         // tail `writer(1)` reserved.
         b = unsafe w.commit_external(1usize);
+        any = true;
     }
-    b
+    Result::Ok.(Option::Some.(b))
 }
 
 // ----------------------------------------------------------- File! --
@@ -175,12 +212,12 @@ struct File! {
 impl File {
     // Opens `path` read-only. Safe: the descriptor it wraps is always
     // one this call opened. Fails with the errno of `open(2)`.
-    fn open_read(path: CStr) -> Result[File!, i32] {
+    fn open_read(path: CStr) -> Result[File!, Error] {
         let p = path.as_ptr();
         // `path` is a live NUL-terminated string, which `CStr` guarantees.
         let fd = unsafe kur_libc_fs_open_read(p, unsafe cstr_len(p));
         if fd < 0i32 {
-            Result::Err.(0i32 - fd)
+            Result::Err.(Error.{ errno: 0i32 - fd })
         } else {
             Result::Ok.(File.{ fd })
         }
@@ -188,11 +225,11 @@ impl File {
 
     // Creates `path`, or empties it, and opens it for writing; a new file
     // gets mode 0644 less the umask. Fails with the errno of `open(2)`.
-    fn create_truncate(path: CStr) -> Result[File!, i32] {
+    fn create_truncate(path: CStr) -> Result[File!, Error] {
         let p = path.as_ptr();
         let fd = unsafe kur_libc_fs_create(p, unsafe cstr_len(p));
         if fd < 0i32 {
-            Result::Err.(0i32 - fd)
+            Result::Err.(Error.{ errno: 0i32 - fd })
         } else {
             Result::Ok.(File.{ fd })
         }
@@ -209,11 +246,11 @@ impl File {
     // The terminal operation: the checker requires every `File!` to reach
     // `close`. The `File!` is consumed even when `close(2)` fails, which is
     // reported with its errno.
-    fn close(self) -> Result[(), i32] {
+    fn close(self) -> Result[(), Error] {
         let { fd } = self;
         let status = unsafe kur_libc_fs_close(fd);
         if status != 0i32 {
-            Result::Err.(status)
+            Result::Err.(Error.{ errno: status })
         } else {
             Result::Ok.(())
         }
@@ -222,12 +259,12 @@ impl File {
     // The byte size of a regular file, from `fstat(2)`. Anything else is an
     // error: EISDIR for a directory, EINVAL for a pipe, device or socket,
     // whose size says nothing about what a read will return.
-    fn file_size(&self) -> Result[usize, i32] {
+    fn file_size(&self) -> Result[usize, Error] {
         let { fd } = self;
         let size = unsafe kur_libc_fs_regular_size(fd);
         self = File.{ fd };
         if size < 0isize {
-            Result::Err.(0i32 - (size as i32))
+            Result::Err.(Error::of_return(size))
         } else {
             Result::Ok.(size as usize)
         }
@@ -246,10 +283,10 @@ impl File {
     // Reads into a checked arena writer. Only the bytes the kernel
     // reported as written are published; a short read is an error (EIO).
     forall 'k.
-    fn read_exact_into(&self, writer: ArenaByteWriter!['k], count: usize) -> (ArenaByteWriter!['k], Result[(), i32]) {
+    fn read_exact_into(&self, writer: ArenaByteWriter!['k], count: usize) -> (ArenaByteWriter!['k], Result[(), Error]) {
         let available = &writer.remaining();
         if count > available {
-            (writer, Result::Err.(EIO))
+            (writer, Result::Err.(Error::io()))
         } else {
             let (dest, available2) = unsafe &writer.writable_tail();
             let got = unsafe &self.read_exact(dest, count);
@@ -257,13 +294,13 @@ impl File {
             if committed && got == count {
                 (writer, Result::Ok.(()))
             } else {
-                (writer, Result::Err.(EIO))
+                (writer, Result::Err.(Error::io()))
             }
         }
     }
 
     forall 'k.
-    fn write_all(&self, tag: Exclusive!['k], bytes: Slice[u8, 'k]) -> (Exclusive!['k], Result[(), i32]) {
+    fn write_all(&self, tag: Exclusive!['k], bytes: Slice[u8, 'k]) -> (Exclusive!['k], Result[(), Error]) {
         let { fd } = self;
         let (ptr, len, marker) = bytes.into_parts();
         let result = unsafe write_all(fd, ptr, len);
@@ -274,7 +311,7 @@ impl File {
     // Writes all of a span's bytes, read under its domain's capability,
     // which `cx` lends.
     forall 'k, C, R where Access[C -> 'k, R].
-    fn write_span(&self, &cx: C, bytes: Span['k]) -> Result[(), i32] {
+    fn write_span(&self, &cx: C, bytes: Span['k]) -> Result[(), Error] {
         let (tag, rest) = Access[C -> 'k, R]::open(cx);
         let { fd } = self;
         let (ptr, len) = bytes.into_parts();
@@ -284,7 +321,7 @@ impl File {
         result
     }
 
-    fn write_static(&self, bytes: Slice[u8, 'static]) -> Result[(), i32] {
+    fn write_static(&self, bytes: Slice[u8, 'static]) -> Result[(), Error] {
         let { fd } = self;
         let (ptr, len, marker) = bytes.into_parts();
         let result = unsafe write_all(fd, ptr, len);
@@ -293,7 +330,7 @@ impl File {
     }
 
     // Writes all of `buf`, then frees it.
-    fn write_buffer(&self, buf: Buffer!) -> Result[(), i32] {
+    fn write_buffer(&self, buf: Buffer!) -> Result[(), Error] {
         let exists 'b. (tag, bytes, restore) = buf.open();
         let (tag, result) = &self.write_all(tag, bytes);
         restore.restore(tag).destroy();
@@ -302,7 +339,7 @@ impl File {
 
     // Writes `ptr[0..len)`, for producers that hold a raw pointer and
     // length. Caller: the entire range is readable.
-    unsafe fn write_all_raw(&self, ptr: *u8, len: usize) -> Result[(), i32] {
+    unsafe fn write_all_raw(&self, ptr: *u8, len: usize) -> Result[(), Error] {
         let { fd } = self;
         let result = unsafe write_all(fd, ptr, len);
         self = File.{ fd };
@@ -310,9 +347,10 @@ impl File {
     }
 
     // Reads from the descriptor's offset to EOF into a fresh `Buffer!`,
-    // for files whose size is not known ahead, such as pipes and `/proc`;
-    // a read error ends the input. Does not close `self`.
-    fn read_to_end(&self) -> Buffer! {
+    // for files whose size is not known ahead, such as pipes and `/proc`.
+    // A read error is returned, not taken for the end. Does not close
+    // `self`.
+    fn read_to_end(&self) -> Result[Buffer!, Error] {
         let { fd } = self;
         // `fd` is the descriptor this `File!` owns.
         let b = unsafe read_to_end_from(fd, Buffer::new());
@@ -325,7 +363,7 @@ impl File {
     // whatever the size said, so a file that grows or shrinks meanwhile is
     // read as it is. Fails as `file_size` does, so a directory is EISDIR.
     // Does not close `self`.
-    fn read_to_buffer(&self) -> Result[Buffer!, i32] {
+    fn read_to_buffer(&self) -> Result[Buffer!, Error] {
         match &self.file_size() {
             Result::Err(code) => Result::Err.(code),
             Result::Ok(size) => {
@@ -333,7 +371,7 @@ impl File {
                 // `fd` is the descriptor this `File!` owns.
                 let b = unsafe read_to_end_from(fd, Buffer::new_with_cap(size));
                 self = File.{ fd };
-                Result::Ok.(b)
+                b
             },
         }
     }
@@ -346,7 +384,8 @@ impl File {
 //
 // Output collects bytes and writes them once 4 KiB have gathered, on
 // `flush`, or on `finish`. Its error is sticky: once a write fails, the
-// rest is dropped, and `finish` reports the first failure.
+// rest is dropped, and `finish` reports the first failure (`error` holds
+// its errno, 0 until then).
 struct Output! {
     fd: i32,
     buf: Buffer!,
@@ -376,19 +415,19 @@ impl Output {
         let unit = buf.destroy();
         let error = match written {
             Result::Ok(nothing) => 0i32,
-            Result::Err(code) => code,
+            Result::Err(e) => e.errno,
         };
         Output.{ fd, buf: Buffer::new(), error }
     }
 
     // Writes what is left and reports the first failure, if any.
-    fn finish(self) -> Result[(), i32] {
+    fn finish(self) -> Result[(), Error] {
         let { fd, buf, error } = self.flush();
         let unit = buf.destroy();
         if error == 0i32 {
             Result::Ok.(())
         } else {
-            Result::Err.(error)
+            Result::Err.(Error.{ errno: error })
         }
     }
 

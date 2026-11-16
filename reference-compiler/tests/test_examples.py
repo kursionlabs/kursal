@@ -155,7 +155,7 @@ RUNS = {
 # examples/bad/: each program, and the diagnostic that rejects it.
 REJECTED = {
     "branch_inconsistent.kur": "linear value 'h' remains live on some paths",
-    "close_by_number.kur": "unknown or private member close_fd of io",
+    "close_by_number.kur": "calling an unsafe function requires unsafe authorization",
     "double_use_handle.kur": "value 'h' has been moved",
     "implicit_package_open.kur": "pattern does not match \\(exists",
     "implicit_package_open_assignment.kur": "type mismatch: \\(exists",

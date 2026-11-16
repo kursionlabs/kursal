@@ -198,8 +198,7 @@ double free.
 |---|---|
 | `alloc::collections::hashmap::free_one` | `p` is a live, uniquely owned `alloc_one` result; no `Ref`, `Slice` or other pointer to it is still live |
 | `alloc::collections::hashmap::destroy_chain` | `head` is a well-formed, uniquely owned entry chain; every entry, key box and value box along it is freed |
-| `alloc::collections::hashmap::remove_chain` | `head` is a well-formed chain and `key_ptr` a live key box; the matched entry *and* `key_ptr` are freed |
-| `alloc::collections::hashmap::resize` | `base` is a live bucket array of exactly `old_bc` slots; it is freed and replaced, so every outstanding `slot_ptr` into it dies |
+| `alloc::collections::hashmap::resize_hashed`, `resize_in` | `base` is a live bucket array of exactly `old_bc` slots; it is freed and replaced, so every outstanding `slot_ptr` into it dies |
 | `alloc::arena::free_chain_after_root_release` | `c` heads a chunk chain this arena built, **and** `Arena::destroy` has already retired the root chunk's data buffer through `Allocation::release`. Every header and every non-root data buffer is freed, so every arena pointer dies. Calling it without the prior `release` leaks the root buffer; calling it on a chain whose root was freed some other way double-frees it |
 | `alloc::heap::HeapAllocator::adopt_raw` | `p` is a live `malloc`/`realloc` result with no other owner; it becomes a linear, freeable `Uninit!`. Records extent 0, since the size did not travel with the address |
 | `alloc::heap::HeapAllocator::adopt_raw_sized` | `adopt_raw`'s obligation, **plus** `extent` is the size most recently requested for that block. With `adopt_raw`, the only way into an `Uninit!` from a bare pointer |
@@ -214,8 +213,9 @@ double free.
 | `core::raw::raw_set`, `raw_byte_set` | `base[0..len)` is a writable array; an out-of-range `i` is a silent no-op, so a wrong `len` loses writes rather than corrupting memory |
 | `alloc::collections::hashmap::alloc_one` | the returned `*T` is a fresh owning allocation that must reach `free_one` exactly once |
 | `alloc::collections::hashmap::alloc_entry` | `key`, `val` and `next` are taken over by the new entry; none may be freed separately afterwards |
-| `alloc::collections::hashmap::insert_chain` | `head` is a well-formed chain; `key_ptr` is consumed into a new entry *or* freed (`is_new` says which) |
-| `alloc::collections::hashmap::rehash_bucket` | `new_base[0..new_bc)` is a live bucket array; every entry on `head` is relinked into it, and `head` must not be walked afterwards |
+| `alloc::collections::hashmap::put_chain` | `head` is a well-formed chain; `key_ptr` is consumed into a new entry *or* freed (`is_new` says which) |
+| `alloc::collections::hashmap::link_after` | `last` is null or an entry of the chain `head` starts; `rest` replaces what followed it |
+| `alloc::collections::hashmap::rehash_bucket_hashed`, `rehash_bucket_in` | `new_base[0..new_bc)` is a live bucket array; every entry on `head` is relinked into it, and `head` must not be walked afterwards |
 | `alloc::arena::bump_chunk` | `cur` is the arena's live current chunk; the reserved bytes and the returned chunk belong to that arena. The padding aligns the address itself, not the offset into the chunk |
 | `alloc::arena::new_chunk` | `next` is a chain head or the chain terminator; the returned header is owned by the chain |
 | `alloc::arena::new_header` | `next` is a chain head or the terminator, and `data` is a live buffer of at least `cap` bytes that the returned header takes over; passing a `data` still owned elsewhere makes two owners of one block |
@@ -238,7 +238,6 @@ double free.
 | `std::process::Args::from_main` | `argc`/`argv` obey the C `main` contract: `argc >= 0`, `argc` readable entries, each a NUL-terminated string live for the rest of the process |
 | `core::hash::HashState::write_bytes` | `ptr[0..len)` is readable for the whole call |
 | `core::fmt::Writable::write_raw` (and its instances) | `ptr[0..len)` is readable for the whole call; the writer reads the bytes before returning and keeps no pointer to them |
-| `alloc::collections::hashmap::get_ref_chain` | `head` is a well-formed chain and `key_ptr` a readable key; `eq_fn` is called with raw pointers (section 2.5) |
 | `alloc::buffer::Buffer::push_n` | `src[0..count)` is readable and does not alias the buffer's own storage, which the growth on entry may reallocate |
 | `std::io::write_all` | `ptr[0..len)` is readable |
 | `std::io::File::write_all_raw` | `ptr[0..len)` is readable throughout the write |
@@ -297,7 +296,6 @@ callback's type, and the difference matters:
 
 | Function | Caller must guarantee |
 |---|---|
-| `alloc::collections::hashmap::HashMap::get_ref_with`, `insert_with`, `remove_with` | `hash_fn`/`eq_fn` only read through the `*K` they receive, do not retain or free it, and are consistent: equal keys hash equally |
 | `alloc::collections::hashmap::hash_key`, `keys_equal` | the pointers address live keys of type `K`; each key is moved out and put back |
 | `alloc::collections::hashmap::find_chain`, `find_chain_by`, `key_matches`, `put_chain`, `take_chain`, `rehash_bucket_hashed`, `resize_hashed` | the map's own chain and bucket invariants; reached from the safe `get`/`find`/`insert`/`remove` |
 | `alloc::collections::hashmap::find_chain_in`, `put_chain_in`, `take_chain_in`, `rehash_bucket_in`, `resize_in` | the same invariants, for keys read through a domain's capability; reached from the safe `get_in`/`insert_in`/`remove_in` |
@@ -422,6 +420,13 @@ is an ordinary, recoverable condition:
 - `core::slice::byte_or_zero` returns `0u8` out of range, matching
   `core::raw::raw_byte_at`.
 
+**`trap` where a miss is a bug.** The accessors whose result has no room
+for "none" (`Option::unwrap`, `Result::unwrap`, `Slice::at`, `Span::at`,
+`ArenaVec::at`, `ArenaMap::at`) stop the program with the builtin
+`core::process::trap` (through `alloc::heap::out_of_range` in `alloc`).
+It needs no operating system, so `core` can offer them; nothing after it
+runs, so it breaks no invariant and is safe to call.
+
 ### 3.2 Open in class C
 
 - **No initialization evidence.** `Buffer::commit`, the `commit_external`
@@ -440,9 +445,6 @@ is an ordinary, recoverable condition:
   `reserve_n` caller can still read the uninitialized region through the
   `Slice` it is handed. For `u8` that is an uninitialized byte; for a
   general `Copy` `T` it is a value synthesized from allocator residue.
-- **`Buffer::ensure` does not terminate for a zero-capacity buffer.**
-  `Buffer::new_with_cap(0usize).push_byte(..)` doubles a capacity of 0
-  forever. A hang, not a memory error; nothing wraps.
 
 ## 4. Type transparency
 
@@ -498,6 +500,11 @@ that restricting a type costs nothing: it only sees the code it is run on.
   else: building one needs both, and taking one apart gives back only what
   went in.
 - **`core::raw::Pos`.** A plain source position; no invariant to protect.
+- **`std::io::Error`.** An errno value. Any number is a valid one, so
+  building one grants nothing.
+- **`alloc::collections::list::ListBuilder`.** The first and last cells of
+  a list being built; it holds only `List` and `Ref` values, which any
+  holder of the domain could make.
 - **`core::option::Option`/`Result`, `alloc::collections::list::List`/
   `Cons`, `alloc::collections::vec::Popped!`, the `Found` enums.** These
   exist to be matched on, and there is no per-variant privacy, so an enum

@@ -17,8 +17,11 @@
 // key marks its entry dead and keeps the order of the rest; inserting it
 // again puts it at the end. `keys` and `values` list the live entries in
 // order; `positions` and `key_at` read them in place, without copying. The
-// slots are made at the first key and made again, twice as many, when half
-// are in use; nothing is freed until the arena is, so the old ones stay.
+// slots are made at the first key and made again (`grow`), twice as many,
+// when half are in use; nothing is freed until the arena is, so the old ones
+// stay. When `grow` finds more dead entries than live ones, it first drops
+// the dead ones, keeping the order of the rest, so a map whose keys come and
+// go stays the size of what it holds.
 //
 // Each entry keeps the low 32 bits of its key's hash. A probe compares
 // keys only where those bits agree, and making the slots again (`grow`,
@@ -28,7 +31,7 @@ use package as alloc;
 
 use alloc::arena::{Allocate, Domain};
 use alloc::collections::arena_vec::ArenaVec;
-use alloc::heap::out_of_range;
+use alloc::heap::{checked_add, checked_mul, out_of_range};
 use core::cap::Access;
 use core::hash::{HashIn, key_hash};
 use core::mem::Ref;
@@ -106,10 +109,11 @@ impl ArenaMap[K, V, 'k] {
         self.state.address()
     }
 
-    // The number of positions `key_at` reads: one per key ever inserted,
-    // in insertion order. Reading positions `0..positions()` visits the
-    // keys as `keys` lists them; removing a key meanwhile only empties its
-    // position.
+    // The number of positions `key_at` reads: one per key inserted since
+    // `grow` last dropped dead entries, in insertion order. Reading
+    // positions `0..positions()` visits the keys as `keys` lists them;
+    // removing a key meanwhile only empties its position, but inserting a
+    // new key may renumber them (`grow`).
     forall C, R where Access[C -> 'k, R].
     fn positions(self, &cx: C) -> usize {
         self.state.copy(&cx).entries.len(&cx)
@@ -287,8 +291,8 @@ impl ArenaMap[K, V, 'k] {
         set_slot(&cx, slots, slot, h.entries.len(&cx) + 1usize);
         h.entries.push(&cx, Entry.{ key, value, live: true, hash });
         self.state.set(&cx, MapState.{ slots: Option::Some.(slots), entries: h.entries, count: h.count + 1usize });
-        if entry == 0usize && h.entries.len(&cx) * 2usize > slots.len() {
-            self.grow(&cx, slots.len() * 2usize);
+        if h.entries.len(&cx) * 2usize > slots.len() {
+            self.grow(&cx, 0usize);
         }
         Option::None
     }
@@ -308,14 +312,43 @@ impl ArenaMap[K, V, 'k] {
         }
     }
 
-    // `slot_count` slots, every live key placed again by its hash bits.
+    // Makes the slots again, at least `slot_count` of them, every live key
+    // placed again by its hash bits. Their number is a power of two, at
+    // least 8 and more than twice the entries, whatever `slot_count` asks
+    // for, so the next insertion has room. When more entries are dead than
+    // live, the dead ones are dropped first, the live ones keeping their
+    // order; positions (`key_at`) then count the live entries only.
     forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q].
     fn grow(self, &cx: C, slot_count: usize) {
         let h = self.state.copy(&cx);
-        let slots = slice_of_zeros(&cx, slot_count);
+        let total = h.entries.len(&cx);
+        if total - h.count > h.count {
+            var kept = 0usize;
+            var k = 0usize;
+            while k < total {
+                let e = h.entries.at(&cx, k);
+                if e.live {
+                    h.entries.set(&cx, kept, e);
+                    kept = kept + 1usize;
+                }
+                k = k + 1usize;
+            }
+            h.entries.truncate(&cx, kept);
+        }
+        let entries = h.entries.len(&cx);
+        let wanted = if slot_count > checked_add(checked_mul(entries, 2usize), 2usize) {
+            slot_count
+        } else {
+            checked_add(checked_mul(entries, 2usize), 2usize)
+        };
+        var count = 8usize;
+        while count < wanted {
+            count = checked_mul(count, 2usize);
+        }
+        let slots = slice_of_zeros(&cx, count);
         self.state.set(&cx, MapState.{ slots: Option::Some.(slots), entries: h.entries, count: h.count });
         var k = 0usize;
-        while k < h.entries.len(&cx) {
+        while k < entries {
             let e = h.entries.at(&cx, k);
             if e.live {
                 place(&cx, slots, e.hash, k + 1usize);

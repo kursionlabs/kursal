@@ -828,6 +828,10 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
             return self.emit("fresh", rty)
         if name == "static_brand":
             return self.emit("static_brand", rty, node=expr)
+        if name == "trap":
+            self.emit("trap", C.Never(), node=expr)
+            self.terminate(C.Unreachable(self.pos))
+            return None
         if name == "enum_variant":
             arg = expr.args[0]
             if isinstance(arg, S.Unary) and arg.op == "&":

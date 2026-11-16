@@ -48,7 +48,7 @@ POINTER_OPS = {
 }
 POINTER_METHODS = set(POINTER_OPS)
 BUILTIN_ARITY = {"fresh": 0, "static_brand": 0, "sizeof": 0, "alloca": 0, "enum_variant": 1,
-                 "fence": 1, "load_volatile": 1, "store_volatile": 2}
+                 "fence": 1, "load_volatile": 1, "store_volatile": 2, "trap": 0}
 
 
 ARITH = {"+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>"}
@@ -1244,6 +1244,8 @@ class Infer:
                 return C.Exists(("x",), C.Brand(C.Skolem("x")))
             case "static_brand":
                 return C.Brand(C.Skolem("static"))
+            case "trap":
+                return C.Never()
             case "enum_variant":
                 arg = expr.args[0]
                 lent = isinstance(arg, S.Unary) and arg.op == "&"

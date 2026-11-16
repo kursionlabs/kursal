@@ -11,7 +11,7 @@ reference in the tests.
 
 | Module | Translates | |
 |---|---|---|
-| `support::base` | | `fail`; its storage is the standard library's (see below) |
+| `support::base` | | `fail`, and `emit`, which writes the output or fails; its storage is the standard library's (see below) |
 | `support::system` | | arguments, files, directories, processes and the environment, through the standard library |
 | `syntax::ast`, `syntax::parser` | `syntax.py`, `parser.py` | the surface AST and the parser |
 | `syntax::dump` | | the AST as text |
@@ -179,7 +179,8 @@ C of a function's body is written into `&lines: Buffer!`, which `backend::cgen::
 and which every method that emits an instruction or a terminator takes. A function's body is
 copied into the arena once, when it is finished (its declarations come first, and emitting the
 lines may add to them), and `emit_c` returns the whole C as a `Buffer!`, written to the file or
-printed with `std::io::print_buffer`.
+printed with `support::base::emit_buffer`, which stops the compiler with status 1 when the
+write fails.
 
 | Python | Kursal |
 |---|---|

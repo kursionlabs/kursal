@@ -54,6 +54,7 @@ builtin::NonNull;`, the `export` form of `use`), and every other package imports
 | | `unsafe alloca[T]()` | room for a `T` in the calling function's frame |
 | | `enum_variant(&place)`, `enum_variant(value)` | the index of an enum value's variant, beside the value when it is taken by value |
 | `core::atomic` | `unsafe fence(ordering)` | a memory fence |
+| `core::process` | `trap()` | stops the program at once (C's `__builtin_trap`); its type is `fn() -> !` |
 
 `sizeof` is a function of one type argument, like `alloca`, not syntax. The operations of a raw
 pointer (`p.load()`, `p.store(v)`, `p.atomic_load(o)`, `p.compare_exchange(...)`, `p.fetch_add(...)`)
@@ -69,7 +70,8 @@ In KURS a bare atom is the IR's own vocabulary, a primitive type or a type param
   unsafe function's type `(fn (unsafe) (PTYPE*) RET)`).
 - **Premises**: `(Copy T)` and `(Exposed T)`.
 - **Builtin operations**: `int_cast`, `to_ptr` (a `non_null` as its `ptr`), `cast`, `sizeof`,
-  `alloca`, `fresh` and `static_brand`; through a raw pointer `ptr_load`, `ptr_store`,
+  `alloca`, `fresh`, `static_brand` and `trap` (of type `!`, so the block ends with `unreachable`);
+  through a raw pointer `ptr_load`, `ptr_store`,
   `ptr_load_volatile` and `ptr_store_volatile`; and the atomics, each with its ordering: one
   `ptr_atomic_KIND` per atomic method of `*T`, whatever the method's own spelling (`ptr_atomic_load`,
   `ptr_atomic_store`, `ptr_atomic_swap`, `ptr_atomic_compare_exchange`, `ptr_atomic_fetch_add`,

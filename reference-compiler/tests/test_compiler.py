@@ -1570,6 +1570,13 @@ class CompilerTests(unittest.TestCase):
     def test_manifests_and_names_match_reference(self):
         self.check_resolution(RESOLVED, False)
 
+    def test_a_failed_output_write_fails_the_command(self):
+        with open("/dev/full", "w") as full:
+            result = subprocess.run([str(self.binary), "parse", str(ROOT / "examples/sayhi/lib.kur")], stdout=full,
+                                    stderr=subprocess.PIPE, text=True, timeout=TIME_LIMIT, preexec_fn=limit_memory,
+                                    env=dict(os.environ, KURSAL_LIB=str(LIB)))
+        self.assertEqual((result.returncode, result.stderr), (1, "cannot write the output\n"))
+
     def test_parser_matches_reference(self):
         paths = sorted(p for top in ("lib", "examples", "compiler", "reference-compiler/examples")
                        for p in (ROOT / top).rglob("*.kur"))

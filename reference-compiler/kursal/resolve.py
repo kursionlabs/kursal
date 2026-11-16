@@ -33,7 +33,8 @@ BUILTIN_TRAITS = {"Copy", "Exposed"}
 # What `builtin::name` names. Only package `core` writes such a path, and it exports each builtin from
 # the module it belongs to (`export builtin::NonNull;` in core::ptr); everyone else imports it from there.
 BUILTIN_TYPES = {"Brand", "NonNull"}
-BUILTIN_VALUES = {"fresh", "static_brand", "sizeof", "alloca", "enum_variant", "fence", "load_volatile", "store_volatile"}
+BUILTIN_VALUES = {"fresh", "static_brand", "sizeof", "alloca", "enum_variant", "fence", "load_volatile", "store_volatile",
+                  "trap"}
 # The builtin types an impl may give methods, as it may a primitive: `impl NonNull[T]` in core::ptr.
 OWNED_BUILTINS = {"NonNull"}
 CORE = "core"

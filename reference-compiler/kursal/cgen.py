@@ -1030,6 +1030,8 @@ class Backend:
             self.line(f"{dst} = UINT64_C(0);" if ct == "void" else f"{dst} = (uintptr_t)sizeof({ct});")
         elif op == "data":
             self.line(f"{dst} = &{self.data_symbol(a[0])};")
+        elif op == "trap":
+            self.line("KUR_TRAP();")
         elif op in ("pack", "open"):
             self.line(f"{dst} = {self.value_name(a[0])};")
         elif op == "ptr_load":
@@ -1529,7 +1531,9 @@ class Backend:
             case Switch():
                 self.switch(term)
             case Unreachable():
-                self.line("KUR_TRAP();")
+                instrs = self.blocks[self.label].instrs
+                if not instrs or instrs[-1].op != "trap":  # a `trap` has written its own
+                    self.line("KUR_TRAP();")
 
     def edge(self, edge: Edge, payload: Optional[str] = None, source: str = "", indent: str = "") -> None:
         """A jump assigns the target's live parameters (`source` is the C variable `payload` reads); a

@@ -13,6 +13,7 @@ from typing import Never, Optional
 from bisect import bisect_right
 
 from . import syntax as S
+from .core import LITERAL_BITS
 from .sexpr import KursError, Position
 
 KEYWORDS = frozenset(
@@ -846,7 +847,11 @@ class Parser:
                 self.next()
                 e, after_index = S.Try(e, start), False
             elif k == "TUPLE_INDEX" and not after_index:      # `p.0.1` is written `(p.0).1`
-                e, after_index = S.Index(e, int(self.next().text[1:]), start), True
+                index = int(self.t[self.i].text[1:])
+                if index >= 1 << LITERAL_BITS["usize"]:  # past `usize::MAX`, which literals take as 64-bit
+                    self.fail()
+                self.next()
+                e, after_index = S.Index(e, index, start), True
             else:
                 return e
 
