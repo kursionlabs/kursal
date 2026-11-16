@@ -233,8 +233,8 @@ take `self` by value and `&cx`: the copies share the same storage. Its construct
 
 `support::system` copies paths and command lines out of the arena into `Buffer!`s, calls the
 standard library and its `libc` package, and copies what comes back into the arena: arguments
-(`libc::process::arguments`), whole files (`libc::fs::open_read`, `std::io::File::read_to_buffer`),
-writing a file (`libc::fs::create`, `File::write_span`), directories, real paths and the
+(`libc::process::arguments`), whole files (`std::io::File::open_read`, `File::read_to_buffer`),
+writing a file (`File::create`, `File::write_buffer`), directories, real paths and the
 environment (`libc::fs`), and running `cc` (`libc::process::run`). Times come from
 `std::time::Instant`, and float literals are read with `std::float::parse_f64` and taken apart with
 `f64::to_bits` and `f64::to_f32`. The compiler has no `unsafe` operation and no `extern`
@@ -746,10 +746,13 @@ These are the places where Kursal differs from what one might expect.
   expression, without a `;`. `return` is allowed anywhere; a function whose type is `!` (such as
   `fail`) can stand in any expression position.
 - **`if` and `match` are expressions** and need an `else`/every case when their value is used.
-- **Closures** `|x| x + 1u32` have types `closure(u32) -> u32` as parameters; a closure may read Copy
-  locals of its function, but captures nothing linear, so one that touches storage takes the
-  context as a place parameter: `closure[Env](&_: Domain!['k], Type['k]) -> Type['k]`, written
-  `|&cx, child: Type['k]| zonk(&cx, child)` and called `transform(&cx, ty)`. Plain function values
+- **Closures** `|x| x + 1u32` have types `closure(u32) -> u32` as parameters. A closure captures
+  the locals of its function it mentions, a linear one by moving it in, which makes the closure
+  linear: it is then called once or handed on, as `thread::spawn` takes one that owns a `Buffer!`
+  (`examples/thread_sum`). A parameter that is called many times or may go uncalled requires
+  `Copy[Env]`, so what such a closure captures is `Copy`, and one that touches storage takes the
+  context as a place parameter instead: `closure[Env](&_: Domain!['k], Type['k]) -> Type['k]`,
+  written `|&cx, child: Type['k]| zonk(&cx, child)` and called `transform(&cx, ty)`. Plain function values
   have types `fn(u32) -> u32`, and a closure parameter does not take one: a comparator is passed
   as a closure that calls it, `items.sort_by(&cx, |&cx, a, b| a.cmp(&cx, b))`.
 - **Modules.** Each `.kur` file is a module named by its path; `use package::name` imports one, and

@@ -2,7 +2,7 @@
 
 Depends on `libc` and on `std` directly: a package sees only its own
 dependencies' names, so `libc`'s dependency on `std` does not make `std::`
-paths visible here. Link with `lib/libc/thread.c` and `-pthread`, as for
+paths visible here. Programs link `lib/libc/thread.c` with `-lpthread`, as for
 `libc::thread`; this package has no C code of its own.
 
 `spawn(f: closure[Env]() -> Ret) -> Result[Thread![Ret], (closure[Env]() -> Ret, std::io::Error)]`

@@ -1,11 +1,13 @@
 # Library contract inventory
 
-This document classifies the functions of the `core`, `alloc` and `std`
-packages by signature shape, and records the caller obligation of every
-function whose signature exposes a raw pointer. Items are named by module
-path within their home package (`core::raw::raw_get`,
-`alloc::buffer::Buffer::push_n`); `std` re-exports most of these modules
-under `std::` paths.
+This document classifies the functions of the `core`, `alloc`, `std`,
+`libc`, `thread` and `toml` packages by signature shape, and records the
+caller obligation of every function whose signature exposes a raw pointer.
+Items are named by module path within their home package
+(`core::raw::raw_get`, `alloc::buffer::Buffer::push_n`,
+`libc::thread::spawn`); `std` re-exports the `core` and `alloc` modules
+under `std::` paths. `toml` declares no raw pointer, no `unsafe fn` and no
+`extern "C"` function: all of it is class C.
 
 A signature classification is not a proof of its implementation.
 Restricted constructors, unsafe bodies, FFI contracts and target behavior
@@ -70,7 +72,7 @@ capability for that brand would therefore make the authority copyable too.
 `Exclusive!['k]` are to be handed one or to mint a fresh brand nobody else
 has. Every minting entry point (`core::cap::Exclusive::fresh`,
 `alloc::owned::Allocation::adopt` and `adopt_value`, `Vec::new`, `HashMap::new`,
-`Arena::new`, `Vec::reserve_n`, ...) mints its brand internally and returns
+`Arena::new`, `Buffer::open`, ...) mints its brand internally and returns
 it **sealed** in an `exists`, so the brand is fresh per call and no caller
 can name it in advance. Forging a second capability for a live brand is not
 caught but **unspellable**: no function accepts the brand that such a forgery
@@ -121,13 +123,11 @@ yes. A blanket "class B means `unsafe fn`" rule would get them wrong.
 |---|---|
 | `alloc::heap::Uninit::into_raw` | Consumes the linear `Uninit!` and returns its address. `Uninit!` is restricted to `alloc::heap`, so the address has no safe way back to an owner; it grants no dereference, ownership or reconstruction authority. |
 | `alloc::heap::Uninit::into_parts` | `into_raw`, plus the block's `usize` extent, which is plain data. |
-| `alloc::heap::null_u8` | Returns the null `*u8`, for comparing allocator results against. Dereferencing it is a separate unsafe operation, checked at that site. |
+| `core::ptr::null`, `core::ptr::is_null` | `null` returns the null `*T`, for comparing pointers against (the allocator's results, a hash chain's end, an `ArenaVec`'s missing segment); `is_null` compares with it. Dereferencing the pointer is a separate unsafe operation, checked at that site. |
 | `core::slice::Slice::into_parts` | Returns the `(ptr, len, marker)` a `Slice` was built from. Rebuilding a `Slice` needs the `unsafe fn from_raw_parts`, so it grants no new authority. |
 | `core::mem::Ref::into_parts` | Returns the `(ptr, marker)` a `Ref` was built from; rebuilding one needs the `unsafe fn Ref::from_raw`, so a stale pointer cannot be re-wrapped under a live brand in safe code. |
 | `core::raw::Span::into_parts` | Returns the `(ptr, len)` a `Span` was built from, never its brand: a span must not hand out a witness for its domain. Reading through the pointer needs `unsafe`, and rebuilding a span needs the `unsafe fn Span::from_raw_parts`. |
 | `core::cstr::CStr::as_ptr` | Returns the unchanged pointer of a `CStr`, which only unsafe adoption or the process-argument wrapper can construct. A raw pointer alone grants no safe dereference or ownership. |
-| `std::process::Args::as_raw` | Returns the unchanged argv table of an already-adopted `Args`; dereferencing it requires `unsafe`. |
-| `alloc::arena::ArenaBytes::into_parts` | Returns the exact pointer and initialized extent of a restricted arena byte run; grants no safe dereference or way to forge another checked view. |
 | `core::array::Array::into_parts` | Consumes the restricted, linear `Array!` and returns its storage. The only way back is the `unsafe fn from_parts` (section 2.4). |
 | `core::ptr::NonNull::new` | Checks its argument: a null pointer gives `None`, any other the unsafe cast `p as NonNull[T]`, whose one obligation (not null) the check has just discharged. |
 | `core::ptr::NonNull::as_ptr` | `self as *T`, which the language makes safe: forgetting that a pointer is not null grants nothing. Using the pointer still requires `unsafe`, and turning it back into a `NonNull` goes through `new` or the `unsafe fn new_unchecked`. |
@@ -163,11 +163,29 @@ free, unlock or restore.
 detect a violation, and an `unsafe` marker at the call site discharges the
 call's pointer obligations, not this one. The obligation is on the foreign
 code and can only be met by whoever chooses what to declare `extern "C"`.
-The library's own externs satisfy it: `malloc`/`realloc`/`free`, `abort`
-(declared `-> !`, the permitted terminating case), `read`/`write`/`open`/
-`close`/`lseek`, `clock`, and the `libc` adapters' C functions. An extern
-that can `longjmp`, throw, or resume from a handler into its caller is not
-made safe by this library's vocabulary or by an `unsafe` marker.
+The library's own externs satisfy it:
+
+- `alloc::heap`: `malloc`, `realloc`, `free`, and `abort` and `exit`
+  (declared `-> !`, the permitted terminating cases); `alloc::buffer`
+  declares `abort` again for `Buffer::commit`;
+- `std::io`: `fs.c`'s `kur_libc_fs_read`, `_write`, `_open_read`,
+  `_create`, `_close` and `_regular_size`, which retry a call a signal
+  interrupts and report a failure as a negative errno;
+- `std::time`: `clock_gettime`; `std::float`: `strtod`;
+- `libc::fs`: `fs.c`'s `kur_libc_fs_error`, `_release`, `_canonicalize`,
+  `_getenv`, `_open_directory`, `_next_entry`, `_entry_name`,
+  `_entry_is_directory` and `_close_directory`;
+- `libc::process`: `kur_libc_fs_error`, `fork`, `execvp`, `waitpid` and
+  `_exit` (`-> !`). The child of `fork` runs only `execvp` and `_exit`:
+  no library frame of the child resumes, and the parent's frames are not
+  re-entered;
+- `libc::thread`: `thread.c`'s `kur_libc_thread_error`, `_create` and
+  `_join`. A thread `_create` starts runs `entry` to its return; it is
+  never cancelled and never calls `pthread_exit`.
+
+An extern that can `longjmp`, throw, or resume from a handler into its
+caller is not made safe by this library's vocabulary or by an `unsafe`
+marker.
 
 ### 2.0d Lending a raw pointer's target
 
@@ -198,19 +216,18 @@ double free.
 |---|---|
 | `alloc::collections::hashmap::free_one` | `p` is a live, uniquely owned `alloc_one` result; no `Ref`, `Slice` or other pointer to it is still live |
 | `alloc::collections::hashmap::destroy_chain` | `head` is a well-formed, uniquely owned entry chain; every entry, key box and value box along it is freed |
-| `alloc::collections::hashmap::resize_hashed`, `resize_in` | `base` is a live bucket array of exactly `old_bc` slots; it is freed and replaced, so every outstanding `slot_ptr` into it dies |
+| `alloc::collections::hashmap::resize_hashed`, `resize_in` | `base` is a live bucket array of exactly `old_bc` slots; it is freed and replaced, so every pointer into it dies |
 | `alloc::arena::free_chain_after_root_release` | `c` heads a chunk chain this arena built, **and** `Arena::destroy` has already retired the root chunk's data buffer through `Allocation::release`. Every header and every non-root data buffer is freed, so every arena pointer dies. Calling it without the prior `release` leaks the root buffer; calling it on a chain whose root was freed some other way double-frees it |
 | `alloc::heap::HeapAllocator::adopt_raw` | `p` is a live `malloc`/`realloc` result with no other owner; it becomes a linear, freeable `Uninit!`. Records extent 0, since the size did not travel with the address |
 | `alloc::heap::HeapAllocator::adopt_raw_sized` | `adopt_raw`'s obligation, **plus** `extent` is the size most recently requested for that block. With `adopt_raw`, the only way into an `Uninit!` from a bare pointer |
-| `alloc::buffer::Buffer::from_owned_ptr` | `adopt_raw` one layer up: `p` is a live `malloc`/`realloc` result of at least `cap` bytes with no other owner, `len <= cap`, and `p[0..len)` is initialized. The result is linear and frees `p` at `destroy` |
 | `thread::thread::trampoline` | `raw` is the `SpawnPayload[Env, Ret]` box `thread::spawn` built for the same `Env` and `Ret`, owned by nothing else: it is read, freed, and its closure called once. Reached only through the pointer `spawn` hands `libc::thread::spawn` |
-| `libc::thread::spawn` | `entry(arg)` is a call whose obligations hold on the new thread (`entry` is typed `unsafe fn(*u8) -> *u8` for that reason); `arg`'s pointee stays valid while the new thread may use it, and accesses to it from the two threads are safe to interleave. On failure no thread ran and `entry` was not called |
+| `libc::thread::spawn` | `entry(arg)` is a call whose obligations hold on the new thread (`entry` is typed `unsafe fn(*u8) -> *u8` for that reason; section 2.5); `arg`'s pointee stays valid while the new thread may use it, and accesses to it from the two threads are safe to interleave. On failure no thread ran and `entry` was not called |
+| `libc::thread::Thread::join` | the `*u8` it returns is whatever `entry` returned, with no static knowledge of what it points to; the caller treats it as `entry`'s own contract says. The handle is consumed whether `pthread_join` succeeds or not |
 
 ### 2.2 Writes through an arbitrary pointer
 
 | Function | Caller must guarantee |
 |---|---|
-| `core::raw::raw_set`, `raw_byte_set` | `base[0..len)` is a writable array; an out-of-range `i` is a silent no-op, so a wrong `len` loses writes rather than corrupting memory |
 | `alloc::collections::hashmap::alloc_one` | the returned `*T` is a fresh owning allocation that must reach `free_one` exactly once |
 | `alloc::collections::hashmap::alloc_entry` | `key`, `val` and `next` are taken over by the new entry; none may be freed separately afterwards |
 | `alloc::collections::hashmap::put_chain` | `head` is a well-formed chain; `key_ptr` is consumed into a new entry *or* freed (`is_new` says which) |
@@ -221,8 +238,7 @@ double free.
 | `alloc::arena::new_header` | `next` is a chain head or the terminator, and `data` is a live buffer of at least `cap` bytes that the returned header takes over; passing a `data` still owned elsewhere makes two owners of one block |
 | `alloc::arena::copy_bytes` | `dest[0..count)` is writable, `src[0..count)` readable, and the two ranges do not overlap |
 | `alloc::buffer::Buffer::commit`, `BufferWriter::commit_external` | every byte being published (`p[len..len+n)`) has been written since the last reserve/grow. Publishing past `cap` aborts |
-| `alloc::arena::ArenaByteWriter::commit_external` | exactly `count` bytes at the pointer `writable_tail` returned have been initialized |
-| `alloc::collections::vec::Vec::reserve_n` | before any of `[old_len, old_len + extra)` is read through the returned `Slice`, or the returned `Vec!` is observed by anything that could read them, a valid `T` is written to every one of those slots |
+| `alloc::collections::arena_vec::merge_runs` | `src` and `dst` each address `n` elements and do not overlap; one bottom-up merge pass of `ArenaVec::sort_by` and `Vec::sort_by` |
 | `std::io::read_exact`, `std::io::File::read_exact` | `buf[0..size)` is writable; the kernel writes through `buf`. For the free `read_exact`, also `fd` is a descriptor the caller may read: stdin, or one a `File!` it holds owns |
 
 ### 2.3 Reads through an arbitrary pointer
@@ -233,8 +249,8 @@ double free.
 | `core::raw::raw_byte_at` | the same; out of range returns `0u8`, deliberately, for scanners that treat NUL as matching nothing |
 | `core::raw::raw_span_bytes_eq` | `a[0..len)` and `b[0..len)` are both readable; the byte loop behind the capability-checked span equality |
 | `core::raw::span_byte_at`, `core::slice::slice_byte_at` | the caller has just been handed a read capability for the view's brand; these read with no capability of their own and are the shared bodies of the `ReadBytes` instances |
-| `core::cstr::cstr_len`, `cstr_eq_lit` | the pointer addresses a NUL-terminated byte run; there is no length to bound the scan |
-| `core::cstr::CStr::from_raw` | `ptr` names a live NUL-terminated byte run for as long as the `CStr` is used |
+| `core::cstr::cstr_len` | the pointer addresses a NUL-terminated byte run; there is no length to bound the scan |
+| `core::cstr::CStr::from_raw` | `ptr` names a NUL-terminated byte run that stays readable and unchanged for the rest of the process, as `argv` entries do: a `CStr` is `Copy` and carries no brand, so nothing ends its use earlier |
 | `std::process::Args::from_main` | `argc`/`argv` obey the C `main` contract: `argc >= 0`, `argc` readable entries, each a NUL-terminated string live for the rest of the process |
 | `core::hash::HashState::write_bytes` | `ptr[0..len)` is readable for the whole call |
 | `core::fmt::Writable::write_raw` (and its instances) | `ptr[0..len)` is readable for the whole call; the writer reads the bytes before returning and keeps no pointer to them |
@@ -257,24 +273,18 @@ a checked type; their obligation is the same kind of thing.
 | `core::mem::Ref::from_raw` | `ptr` points at a live `T` inside the domain `marker` names, so presenting that domain's capability really authorizes the access |
 | `core::raw::Span::from_raw_parts` | `ptr[0..len)` is initialized and stays readable while the domain of the context `&cx` lends has its capability. Literal-backed spans use the safe `Span::from_static` |
 | `core::raw::Span::from_raw_parts_branded` | as `from_raw_parts`, for a module whose own object holds the domain's brand (an arena's `marker`); `marker` must be a witness that object really holds, since a span planted in another domain reads that domain's bytes |
-| `core::raw::Span::with_len` | the `len` bytes from the span's start are initialized and lie in the buffer the span points into |
-| `alloc::arena::ArenaByteWriter::writable_tail` | the destination is valid only while the writer owns the arena; external code must commit exactly the bytes it initialized |
 | `alloc::buffer::Buffer::as_ptr` | the pointer is invalidated by any later growth of the same buffer (which may reallocate) and by `destroy` |
 | `alloc::buffer::Buffer::tail_ptr` | the same; the bytes it addresses are uninitialized until written externally and committed |
 | `alloc::buffer::BufferWriter::writable_tail` | the same, within a `BufferWriter!` session: valid until the next `push`/`append`/grow, and `commit_external` must be called with the true count |
 | `alloc::arena::Arena::alloc_bytes` | the returned run is reserved but **uninitialized** and unaligned; it must not outlive the arena |
-| `core::raw::elem_ptr`, `core::slice::elem_ptr`, `alloc::collections::vec::elem_ptr`, `alloc::buffer::buffer_elem_ptr` | `base` is an array with more than `i` elements; no bound is passed or checked |
-| `alloc::arena::byte_ptr_at` | `base + off` lies within one live chunk's data buffer |
-| `alloc::collections::hashmap::slot_ptr` | `i` is below the bucket count `base` was allocated with |
+| `core::ptr::offset` | `count` elements of `T` past `base` stay inside the block `base` points into; no bound is passed or checked. The one address computation of the library: every module that steps through a block calls it |
+| `alloc::collections::arena_vec::place` | `i` is below the capacity of `h`'s segments, which are live arena blocks of the sizes `locate` computes |
 | `alloc::collections::hashmap::alloc_buckets` | the returned array is owned: exactly one `resize`/`destroy` must free it |
-| `alloc::collections::hashmap::null_entry` | the null entry pointer must only be compared, never dereferenced |
-| `alloc::collections::hashmap::is_null_entry` | accepts any pointer; `false` means only non-null, not valid |
 | `core::mem::make_split_part` | `field` addresses initialized storage of `Field` that no other live capability covers, as for `Region::from_raw`: the returned `Region!` is fresh authority over it. It returns only the part's fresh brand, never a `Link!`; `Link!` is restricted to `core::mem` and built only by `Region::split`, so a part over unrelated storage cannot be merged into a parent |
 | `core::mem::Region::from_raw` | `ptr` points at an initialized `T`, aligned for `T`, in at least `sizeof[T]()` bytes, that nothing else can reach while `'r` lives, and `cap` is the only capability over `'r` (in practice fresh from `Exclusive::fresh`): the region's `replace` and `share` read and write the `T` unchecked. `Allocation::adopt` passes its own obligation on, with a fresh capability over a block its `Uninit!` owned outright |
 | `core::mem::lend`, `lend_in` | `p` points at a live `T` that nothing else reads or writes while `f` runs. `Ref::update`/`update_in` discharge it with the brand's `Exclusive!`; `Owned::update`/`update_in` with the `Owned!` they hold. `lend_in`'s `cx` carries no obligation |
 | `core::array::Array::from_parts` | `base` addresses `len` initialized `T`s that nothing else reads or writes while the array exists; every later access is checked against `len` |
 | `alloc::collections::vec::before`, `swap_at`, `sift_down` | `p` addresses the vector's own initialized elements and every index is below its length |
-| `alloc::collections::vec::merge_pass` | `src` and `dst` each address `n` elements and do not overlap |
 | `core::ptr::NonNull::new_unchecked` | `p` is not null: it is `unsafe (p as NonNull[T])`, after which the C compiler is told so. A null one is undefined behavior; at best it reads as the dataless variant of any enum in the niche layout that holds it (`Option[NonNull[T]]`, `Option[Ref[T,'k]]`, a `List` link; section 2.6) |
 
 ### 2.5 Hands a raw pointer to caller-supplied code
@@ -300,11 +310,23 @@ callback's type, and the difference matters:
 | `alloc::collections::hashmap::find_chain`, `find_chain_by`, `key_matches`, `put_chain`, `take_chain`, `rehash_bucket_hashed`, `resize_hashed` | the map's own chain and bucket invariants; reached from the safe `get`/`find`/`insert`/`remove` |
 | `alloc::collections::hashmap::find_chain_in`, `put_chain_in`, `take_chain_in`, `rehash_bucket_in`, `resize_in` | the same invariants, for keys read through a domain's capability; reached from the safe `get_in`/`insert_in`/`remove_in` |
 | `core::mem::Ref::map` | `f` returns a pointer *into the same allocation* as its argument; the result is stamped with the original brand `'k` with no check that the new address belongs to it |
+| `libc::thread::spawn` | see section 2.1 |
+
+`libc::thread::spawn` is the one function whose callback type is itself
+`unsafe fn(*u8) -> *u8`, and the rule above still holds. The callback is
+not something `spawn` lets the caller make unsafe; it is an existing
+`unsafe fn` (in practice `thread::thread::trampoline`), whose own
+obligation is about the `*u8` it is handed. A safe function value cannot be
+bound to an `unsafe fn` parameter's type in reverse, and `spawn` is itself
+`unsafe fn`: its caller writes `unsafe libc::thread::spawn(entry, arg)` and
+thereby vouches that `entry(arg)` meets `entry`'s obligation on the new
+thread. `thread::thread::spawn` discharges it once, for the payload it
+builds, and is safe.
 
 `HashMap::get`/`insert`/`remove` are
 class C: they dispatch through the `Hash[K]`/`Eq[K]` traits instead of raw
-function pointers, and they hand back every key they do not keep, so a
-linear key is never lost.
+function pointers, and they hand back every key and value they do not keep,
+so a linear one is never lost.
 
 ### 2.6 `NonNull` and unsafe casts
 
@@ -422,15 +444,16 @@ is an ordinary, recoverable condition:
 
 **`trap` where a miss is a bug.** The accessors whose result has no room
 for "none" (`Option::unwrap`, `Result::unwrap`, `Slice::at`, `Span::at`,
-`ArenaVec::at`, `ArenaMap::at`) stop the program with the builtin
-`core::process::trap` (through `alloc::heap::out_of_range` in `alloc`).
+`Array::at`, `ArenaVec::at`, `ArenaMap::at`, `OwnedVec::at`,
+`OwnedMap::at`) stop the program with the builtin `core::process::trap`.
+Each has a `get` beside it that returns an `Option`.
 It needs no operating system, so `core` can offer them; nothing after it
 runs, so it breaks no invariant and is safe to call.
 
 ### 3.2 Open in class C
 
-- **No initialization evidence.** `Buffer::commit`, the `commit_external`
-  operations and `Vec::reserve_n` publish storage on the caller's word that
+- **No initialization evidence.** `Buffer::commit` and
+  `BufferWriter::commit_external` publish storage on the caller's word that
   it has been written. The obligation is declared and enforced at the call
   site (section 2.2), but it is an attestation, not evidence. A linear "filled"
   counter would prove that `n` writes happened, not that these `n` slots
@@ -440,11 +463,6 @@ runs, so it breaks no invariant and is safe to call.
   Callers that only need a fully addressable scratch buffer use
   `Buffer::new_zeroed`, which makes the claim true and carries no
   obligation.
-
-  `Vec::get_ref`'s bound narrows the consequence without closing it: a
-  `reserve_n` caller can still read the uninitialized region through the
-  `Slice` it is handed. For `u8` that is an uninitialized byte; for a
-  general `Copy` `T` it is a value synthesized from allocator residue.
 
 ## 4. Type transparency
 
@@ -481,15 +499,20 @@ Types whose hidden representation protects authority or bounds:
 | `HashMap![K,V,'k]`, `Entry[K,V]` | `alloc::collections::hashmap` | `buckets` matches `bucket_count`; entries are the chain nodes `free_one`/`destroy_chain` free |
 | `Drain!` | `alloc::collections::hashmap` | a map being taken apart; holds the map's capability so nothing else touches the entries meanwhile |
 | `ArenaVec[T,'k]`, `Header` | `alloc::collections::arena_vec` | a header naming segments of the sizes `locate` computes, with `len` within them; a forged one is read and written through |
-| `ArenaMap[K,V,'k]`, `ArenaSet[K,'k]`, `MapState`, `Entry` | `alloc::collections::arena_map` | slots that index live entries; a forged map probes out of range, which `out_of_range` stops |
+| `ArenaMap[K,V,'k]`, `ArenaSet[K,'k]`, `MapState`, `Entry` | `alloc::collections::arena_map` | slots that index live entries; a forged map probes out of range, which `trap` stops |
 | `Arena!['k]`, `Chunk` | `alloc::arena` | one long-lived brand tied to a chunk chain this module built. It holds only `Copy` values (`alloc`, `alloc_slice`, `Ref::new` and `List::cons` require `Copy`), so freeing its chunks unread loses nothing linear |
-| `ArenaByteWriter!`, `ArenaBytes` | `alloc::arena` | arena byte runs whose public length is exactly the initialized prefix |
 | `Buffer!`, `BufferRestore!['k]` | `alloc::buffer` | `Buffer!` owns a heap byte run that `destroy` frees with no capability; `BufferRestore!` plus the matching `Exclusive!` yields the owning `Buffer!` back |
 | `FixedWriter!` | `alloc::fmt` | a buffer that never grows past `cap`; its contents are always a prefix of what was written |
 | `HeapAllocator`, `Storage` | `alloc::heap` | zero-field receivers for the allocator's static methods; they own no memory |
-| `File!`, `Output!` | `std::io` | `File!` owns one open descriptor; forging one closes an arbitrary descriptor |
+| `AlignProbe[T]` | `core::mem` | never built; `alignof` takes only its size |
+| `Stamp['r]` | `core::cap` | exposed to `core` alone (`exposed (package)`): `core` modules read a domain's brand out of it, code outside `core` can hold one but not open it |
+| `File!`, `Output!` | `std::io` | `File!` owns one open descriptor; forging one closes an arbitrary descriptor. `Output!` writes to a descriptor it does not own (stdout, stderr), which a forged one could point anywhere |
 | `Args` | `std::process` | an argv table adopted under the C `main` contract |
-| `CpuInstant` | `std::time` | a `clock()` reading |
+| `Instant`, `Timespec` | `std::time` | a monotonic clock reading, and the C structure `clock_gettime` fills; nothing outside makes either |
+| `DirectoryStream!` | `libc::fs` | owns one open `DIR *`; forging one hands `readdir`/`closedir` an arbitrary pointer |
+| `Thread!` | `libc::thread` | owns one `pthread_t` handle that `join` frees; forging one joins and frees an arbitrary pointer |
+| `Thread![Ret]`, `SpawnPayload`, `ResultBox` | `thread::thread` | a spawned thread whose `join` reads back a `ResultBox[Ret]`; a forged one would read any thread's result as a `Ret`. The boxes never leave the module |
+| `TomlDefinition`, `TomlDefinitionKind`, `TomlAssignment` | `toml::document`, `toml::value` | the parser's own records of what a document has defined; nothing outside reads or makes them |
 
 A survey that finds no outside construction sites is evidence, not proof,
 that restricting a type costs nothing: it only sees the code it is run on.
@@ -499,15 +522,36 @@ that restricting a type costs nothing: it only sees the code it is run on.
 - **`alloc::arena::Domain!`.** An arena with its capability, and nothing
   else: building one needs both, and taking one apart gives back only what
   went in.
-- **`core::raw::Pos`.** A plain source position; no invariant to protect.
-- **`std::io::Error`.** An errno value. Any number is a valid one, so
-  building one grants nothing.
+- **`std::io::Error`.** An errno value, the one error type of `std::io`,
+  `libc` and `thread`. Any number is a valid one, so building one grants
+  nothing.
+- **Values that hold only what their builder already had:**
+  `alloc::collections::hashmap::OwnedMap!` and
+  `alloc::collections::vec::OwnedVec!` (a map or vector packed with its
+  capability), the iterators `core::slice::SliceIter!`,
+  `alloc::collections::list::ListIter!`, `alloc::collections::vec::VecIter!`
+  and `OwnedVecIter!` (a view or collection with the capability that reads
+  it), `core::fmt::ReadingWriter!` (a writer and a context),
+  `alloc::buffer::BufferWriter!` (a `Buffer!`), `core::cursor::Cursor` (a
+  `Slice` and a position; every read is checked whatever the position),
+  `core::slice::Readable` (a capability and a view), `core::borrow::
+  Borrowed!` and `NoCap`, `libc::fs::DirectoryEntry!` (an owned name and a
+  flag), and `core::fmt::CountingWriter`, `alloc::fmt::Full`,
+  `core::hash::HashState`. Taking one apart gives back only parts the
+  builder held.
+- **`core::iter`'s `Range`, `Pair`, `Map`, `Filter`, `Zip`, `Enumerate`,
+  `Take`, `Skip`, `TakeWhile` and `Chain`.** Plain adapter state over an
+  inner iterator.
+- **`toml::value::TomlValue`/`TomlField`, `toml::lex::TomlToken`/
+  `TomlTokenKind`/`TomlError`.** The parser's results, to be matched on;
+  their spans are read through the arena's capability like any other.
 - **`alloc::collections::list::ListBuilder`.** The first and last cells of
   a list being built; it holds only `List` and `Ref` values, which any
   holder of the domain could make.
-- **`core::option::Option`/`Result`, `alloc::collections::list::List`/
-  `Cons`, `alloc::collections::vec::Popped!`, the `Found` enums.** These
-  exist to be matched on, and there is no per-variant privacy, so an enum
+- **`core::option::Option`/`Result`, `core::cmp::Order`,
+  `core::atomic::Ordering`, `alloc::heap::AllocError`,
+  `alloc::collections::list::List`/`Cons`, `alloc::collections::vec::
+  Popped!`, `libc::process::Exit`.** These exist to be matched on, and there is no per-variant privacy, so an enum
   meant to be matched on cannot be restricted. The general rule: **a type
   can be restricted when its outside users rely on methods rather than
   destructuring.**

@@ -7,9 +7,11 @@
 // restore a region. The records that own heap storage -- `Owned!` and
 // `Allocation!`, with `Owned::new`/`into_value`, `Allocation::adopt`,
 // `adopt_value`, `release` and `close` -- live in `alloc::owned`, the allocator
-// layer, which reaches this module only through `unsafe
-// Region::from_raw` and `Region::retire`. The rest of this header
-// describes the whole vocabulary across both modules.
+// layer, which builds and ends regions through this module's public
+// operations: `unsafe Region::from_raw` to make one over a block it owns,
+// `Region::retire` to end one, and `lend`/`lend_in` to reach an `Owned!`'s
+// value in place. The rest of this header describes the whole vocabulary
+// across both modules.
 //
 // ---------------------------------------------------------------------
 // THE VOCABULARY
@@ -51,7 +53,7 @@
 //
 //     Owned::new(v)            -> Owned![T]
 //     owned.open()             -> (Allocation![T,'1], Region![T,'1])
-//     region.replace(v2)       -> (Region![T,'1], T)
+//     &region.replace(v2)      -> T        -- the region stays in place
 //     region.share()           -> (Exclusive!['1], Ref[T,'1], RegionResume![T,'1])
 //     back.resume(write)       -> Region![T,'1]
 //     alloc.close(region)      -> Owned![T]
@@ -97,18 +99,15 @@
 // ---------------------------------------------------------------------
 // WHY THE ACCESS OPERATIONS HAVE THE SHAPES THEY DO
 //
-// `Region::replace` and `Ref::with` are the only ways to look at or
-// change the contained `T`, and neither is a plain `read`/`write`
-// pair. That is forced, not stylistic: a `read` would have to
-// duplicate, and a `write` would have to silently discard, a value of
-// a still-abstract, generic `T`, and whether either is legal (`T:
-// Copy`? a real `drop`?) can only be judged at a concrete call site,
-// never inside one generic library function written once. Both
-// shapes below instead touch the value exactly once each way -- moved
-// out, moved back in -- which is sound for any `T` with no extra
-// machinery at all. A caller who knows their own `T` is `Copy` can
-// recover a read for free (`Ref::copy`, below, is literally
-// `with(tag, |v| (v, v))`).
+// For any `T`, the contained value is looked at or changed only by
+// operations that touch it exactly once each way -- moved out, moved back
+// in: `Region::replace`, and `Ref::with`, `update`, `update_in` and
+// `replace`. None is a plain `read`/`write` pair. That is forced, not
+// stylistic: a `read` would have to duplicate, and a `write` would have
+// to silently discard, a value of a still-abstract, generic `T`, and
+// whether either is legal can only be judged where `T` is known. The
+// plain forms exist where `T: Copy` says so: `Ref::copy` (what
+// `with(&cx, |v| (v, v))` returns), `Ref::set` and `Ref::read`.
 //
 // `Region::replace` needs NO witness: holding the region at all is
 // already proof that nothing else can be touching the block, because
@@ -548,8 +547,10 @@ impl Region[T, 'r] {
 }
 
 // A separate `impl` block because `split` alone needs `Exposed[*T]`:
-// `replace`/`share` never look past `T`'s opacity, and premises attach to
-// a whole `impl` block (there is no per-method `where`).
+// `replace`/`share` never look past `T`'s opacity. A method's own `where`
+// belongs to a `forall` that binds something, and `split` binds nothing of
+// its own, so the premise on the impl's parameter `T` goes on an impl block
+// of its own.
 forall T, 'r where Exposed[*T].
 impl Region[T, 'r] {
     // Decomposes one exclusive region into one independently branded
