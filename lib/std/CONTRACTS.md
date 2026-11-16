@@ -512,7 +512,7 @@ Types whose hidden representation protects authority or bounds:
 | `DirectoryStream!` | `libc::fs` | owns one open `DIR *`; forging one hands `readdir`/`closedir` an arbitrary pointer |
 | `Thread!` | `libc::thread` | owns one `pthread_t` handle that `join` frees; forging one joins and frees an arbitrary pointer |
 | `Thread![Ret]`, `SpawnPayload`, `ResultBox` | `thread::thread` | a spawned thread whose `join` reads back a `ResultBox[Ret]`; a forged one would read any thread's result as a `Ret`. The boxes never leave the module |
-| `TomlDefinition`, `TomlDefinitionKind`, `TomlAssignment` | `toml::document`, `toml::value` | the parser's own records of what a document has defined; nothing outside reads or makes them |
+| `Parser`, `FlagNode`, `KeyPath` | `toml::parser` | the parser's own state and its record of what a document has defined; nothing outside reads or makes them |
 
 A survey that finds no outside construction sites is evidence, not proof,
 that restricting a type costs nothing: it only sees the code it is run on.
@@ -542,9 +542,9 @@ that restricting a type costs nothing: it only sees the code it is run on.
 - **`core::iter`'s `Range`, `Pair`, `Map`, `Filter`, `Zip`, `Enumerate`,
   `Take`, `Skip`, `TakeWhile` and `Chain`.** Plain adapter state over an
   inner iterator.
-- **`toml::value::TomlValue`/`TomlField`, `toml::lex::TomlToken`/
-  `TomlTokenKind`/`TomlError`.** The parser's results, to be matched on;
-  their spans are read through the arena's capability like any other.
+- **`toml::value::TomlValue`/`TomlDatetime`/`DatetimeKind`/`TomlError`.**
+  The parser's results, to be matched on; their spans, vecs and maps are
+  read through the arena's capability like any other.
 - **`alloc::collections::list::ListBuilder`.** The first and last cells of
   a list being built; it holds only `List` and `Ref` values, which any
   holder of the domain could make.

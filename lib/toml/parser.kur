@@ -1,0 +1,1208 @@
+// toml::parser -- TOML 1.0 documents read into the caller's arena.
+//
+// `parse(&cx, src)` reads the whole of `src` and gives its root table, or
+// the first error with the byte it was found at. It reads a document one
+// statement at a time, as Python's `tomllib` does, and reports each error
+// where `tomllib` does: a definition that conflicts with an earlier one at
+// the end of the statement making it. Strings without escapes are spans of
+// `src`; everything else is allocated in `src`'s arena.
+//
+// What a key path may still become is kept apart from the values, in a tree
+// of flags that mirrors the tables:
+//
+// - explicit: a table a header (`[a]`, `[[a]]`) or a dotted key (`a.b = 1`
+//   defines `a`) has defined, which no other header may define again; a
+//   dotted key's tables count from the next header on, so the statements of
+//   one section may share them;
+// - frozen: an inline table or an array and everything under it, which
+//   nothing may extend.
+//
+// Each statement walks its key path through the tables once, by hash, so a
+// document is read in time linear in its size.
+
+use package::value::{DatetimeKind, TomlDatetime, TomlError, TomlValue};
+use std::alloc::arena::Allocate;
+use std::bytes::buffer::Buffer;
+use std::cap::Access;
+use std::collections::arena_map::ArenaMap;
+use std::collections::arena_vec::ArenaVec;
+use std::float::parse_f64;
+use std::mem::Ref;
+use std::option::{Option, Result};
+use std::raw::Span;
+use std::slice::{ReadBytes, Slice};
+use std::utf8::{decode, encode};
+
+// The flags of a key path (see above).
+const EXPLICIT: u32 = 1u32;
+const FROZEN: u32 = 2u32;
+
+forall 'k.
+struct FlagNode {
+    bits: Ref[u32, 'k],
+    nested: ArenaMap[Span['k], FlagNode['k], 'k],
+}
+
+// A key path: the first `count` parts of `key` after all of `header`, so
+// that a statement's paths share the header and the key it read.
+forall 'k.
+struct KeyPath {
+    header: ArenaVec[Span['k], 'k],
+    key: ArenaVec[Span['k], 'k],
+    count: usize,
+}
+
+forall 'k.
+struct Parser {
+    src: Span['k],
+    len: usize,
+    error: Ref[Option[TomlError], 'k],
+    // the header of the current section; empty before the first
+    header: Ref[ArenaVec[Span['k], 'k], 'k],
+    empty: ArenaVec[Span['k], 'k],
+    root: ArenaMap[Span['k], TomlValue['k], 'k],
+    flags: FlagNode['k],
+    // dotted keys' tables, explicit from the next header on
+    pending: ArenaVec[KeyPath['k], 'k],
+}
+
+fn is_bare(b: u8) -> bool {
+    (b >= b'A' && b <= b'Z') || (b >= b'a' && b <= b'z') || (b >= b'0' && b <= b'9') || b == b'_' || b == b'-'
+}
+
+fn is_digit(b: u8) -> bool {
+    b >= b'0' && b <= b'9'
+}
+
+fn is_hex(b: u8) -> bool {
+    is_digit(b) || (b >= b'a' && b <= b'f') || (b >= b'A' && b <= b'F')
+}
+
+fn hex_value(b: u8) -> u32 {
+    if is_digit(b) {
+        (b - b'0') as u32
+    } else if b >= b'a' && b <= b'f' {
+        (b - b'a') as u32 + 10u32
+    } else {
+        (b - b'A') as u32 + 10u32
+    }
+}
+
+// A control character, which no string or comment may hold but a tab, and
+// a multiline string a newline.
+fn is_control(b: u8) -> bool {
+    (b < 32u8 && b != b'\t') || b == 127u8
+}
+
+fn days_in_month(year: u32, month: u32) -> u32 {
+    if month == 2u32 {
+        let leap = (year % 4u32 == 0u32 && year % 100u32 != 0u32) || year % 400u32 == 0u32;
+        if leap { 29u32 } else { 28u32 }
+    } else if month == 4u32 || month == 6u32 || month == 9u32 || month == 11u32 {
+        30u32
+    } else {
+        31u32
+    }
+}
+
+forall 'k, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+fn new_flags(&cx: C) -> FlagNode['k] {
+    FlagNode.{ bits: Ref::new(&cx, 0u32), nested: ArenaMap::new(&cx) }
+}
+
+forall 'k.
+impl KeyPath['k] {
+    forall C, R where Access[C -> 'k, R].
+    fn len(self, &cx: C) -> usize {
+        self.header.len(&cx) + self.count
+    }
+
+    forall C, R where Access[C -> 'k, R].
+    fn part(self, &cx: C, i: usize) -> Span['k] {
+        let h = self.header.len(&cx);
+        if i < h { self.header.at(&cx, i) } else { self.key.at(&cx, i - h) }
+    }
+}
+
+// Whether `path` has the flag `bit`: explicit at the path itself, frozen at
+// the path or any table above it.
+forall 'k, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+fn has_flag(&cx: C, root: FlagNode['k], path: KeyPath['k], bit: u32) -> bool {
+    let n = path.len(&cx);
+    if n == 0usize {
+        return false;
+    }
+    var node = root;
+    var i = 0usize;
+    while i < n {
+        match node.nested.get(&cx, path.part(&cx, i)) {
+            Option::None => return false,
+            Option::Some(next) => {
+                node = next;
+            },
+        }
+        let bits = node.bits.copy(&cx);
+        if bit == FROZEN && (bits & FROZEN) != 0u32 {
+            return true;
+        }
+        i = i + 1usize;
+    }
+    (node.bits.copy(&cx) & bit) != 0u32
+}
+
+forall 'k, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+fn set_flag(&cx: C, root: FlagNode['k], path: KeyPath['k], bit: u32) {
+    let n = path.len(&cx);
+    var node = root;
+    var i = 0usize;
+    while i < n {
+        let part = path.part(&cx, i);
+        node = match node.nested.get(&cx, part) {
+            Option::Some(next) => next,
+            Option::None => {
+                let next = new_flags(&cx);
+                node.nested.insert(&cx, part, next);
+                next
+            },
+        };
+        i = i + 1usize;
+    }
+    node.bits.set(&cx, node.bits.copy(&cx) | bit);
+}
+
+// Forgets every flag at `path` and under it.
+forall 'k, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+fn unset_all(&cx: C, root: FlagNode['k], path: KeyPath['k]) {
+    let n = path.len(&cx);
+    var node = root;
+    var i = 0usize;
+    while i + 1usize < n {
+        match node.nested.get(&cx, path.part(&cx, i)) {
+            Option::None => return,
+            Option::Some(next) => {
+                node = next;
+            },
+        }
+        i = i + 1usize;
+    }
+    let removed = node.nested.remove(&cx, path.part(&cx, n - 1usize));
+}
+
+// The table `path` names under `table`, made where missing; through an array
+// (of tables) when `arrays`, its last element. `None` when a part is
+// another value.
+forall 'k, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+fn nest(&cx: C, table: ArenaMap[Span['k], TomlValue['k], 'k], path: KeyPath['k], arrays: bool) -> Option[ArenaMap[Span['k], TomlValue['k], 'k]] {
+    let n = path.len(&cx);
+    var t = table;
+    var i = 0usize;
+    while i < n {
+        let part = path.part(&cx, i);
+        var value = match t.get(&cx, part) {
+            Option::Some(v) => v,
+            Option::None => {
+                let made: ArenaMap[Span['k], TomlValue['k], 'k] = ArenaMap::new(&cx);
+                t.insert(&cx, part, TomlValue::Table.(made));
+                TomlValue::Table.(made)
+            },
+        };
+        if arrays {
+            match value {
+                TomlValue::Array(items) => {
+                    match items.last(&cx) {
+                        Option::Some(last) => {
+                            value = last;
+                        },
+                        Option::None => return Option::None,
+                    }
+                },
+                _ => (),
+            }
+        }
+        match value {
+            TomlValue::Table(inner) => {
+                t = inner;
+            },
+            _ => return Option::None,
+        }
+        i = i + 1usize;
+    }
+    Option::Some.(t)
+}
+
+forall 'k.
+impl Parser['k] {
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn byte(self, &cx: C, i: usize) -> u8 {
+        self.src.byte_or_zero(&cx, i)
+    }
+
+    // Records the first error; later ones are what it caused.
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn fail(self, &cx: C, at: usize, message: Slice[u8, 'static]) {
+        if self.error.copy(&cx).is_none() {
+            self.error.set(&cx, Option::Some.(TomlError.{ offset: at, message }));
+        }
+    }
+
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn failed(self, &cx: C) -> bool {
+        self.error.copy(&cx).is_some()
+    }
+
+    // The length of the newline at `i`, `\n` or `\r\n`; 0 for anything else.
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn newline(self, &cx: C, i: usize) -> usize {
+        let b = self.byte(&cx, i);
+        if b == b'\n' {
+            1usize
+        } else if b == b'\r' && self.byte(&cx, i + 1usize) == b'\n' {
+            2usize
+        } else {
+            0usize
+        }
+    }
+
+    // Spaces and tabs.
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn skip_space(self, &cx: C, pos: usize) -> usize {
+        var i = pos;
+        while i < self.len && (self.byte(&cx, i) == b' ' || self.byte(&cx, i) == b'\t') {
+            i = i + 1usize;
+        }
+        i
+    }
+
+    // Spaces, tabs and newlines.
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn skip_space_and_newlines(self, &cx: C, pos: usize) -> usize {
+        var i = pos;
+        var going = true;
+        while going && i < self.len {
+            let b = self.byte(&cx, i);
+            if b == b' ' || b == b'\t' {
+                i = i + 1usize;
+            } else {
+                let nl = self.newline(&cx, i);
+                if nl == 0usize {
+                    going = false;
+                } else {
+                    i = i + nl;
+                }
+            }
+        }
+        i
+    }
+
+    // A comment at `pos`, up to the newline that ends it, which is left.
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn skip_comment(self, &cx: C, pos: usize) -> usize {
+        if self.byte(&cx, pos) != b'#' {
+            return pos;
+        }
+        var i = pos + 1usize;
+        while i < self.len && self.byte(&cx, i) != b'\n' {
+            let b = self.byte(&cx, i);
+            if is_control(b) && !(b == b'\r' && self.byte(&cx, i + 1usize) == b'\n') {
+                self.fail(&cx, i, "invalid character in a comment");
+                return self.len;
+            }
+            i = i + 1usize;
+        }
+        if i > pos + 1usize && i < self.len && self.byte(&cx, i - 1usize) == b'\r' {
+            i - 1usize
+        } else {
+            i
+        }
+    }
+
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn skip_comments_and_array_space(self, &cx: C, pos: usize) -> usize {
+        var i = pos;
+        var going = true;
+        while going {
+            let before = i;
+            i = self.skip_space_and_newlines(&cx, i);
+            i = self.skip_comment(&cx, i);
+            going = i != before && !self.failed(&cx);
+        }
+        i
+    }
+
+    // ------------------------------------------------------------ strings --
+
+    // A literal string's text, from after its opening quote.
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn literal_string(self, &cx: C, pos: usize) -> (usize, Span['k]) {
+        let start = pos + 1usize;
+        let end = match self.src.find_byte(&cx, b'\'', start) {
+            Option::Some(e) => e,
+            Option::None => {
+                self.fail(&cx, self.len, "unterminated string");
+                return (self.len, self.src.take(0usize));
+            },
+        };
+        var i = start;
+        while i < end {
+            if is_control(self.byte(&cx, i)) {
+                self.fail(&cx, i, "invalid character in a string");
+                return (self.len, self.src.take(0usize));
+            }
+            i = i + 1usize;
+        }
+        (end + 1usize, self.src.slice(start, end))
+    }
+
+    // A basic string's text, from after its opening quote (or quotes), with
+    // its escapes replaced; a multiline one's `\r\n`s are `\n`s. Also whether
+    // the text had to be copied rather than viewed in `src`.
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn basic_string(self, &cx: C, pos: usize, multiline: bool) -> (usize, Span['k], bool) {
+        var out = Buffer::new();
+        var copied = false;
+        var start = pos;
+        var i = pos;
+        var result: Option[(usize, usize)] = Option::None;
+        while result.is_none() && !self.failed(&cx) {
+            if i >= self.len {
+                self.fail(&cx, i, "unterminated string");
+            } else {
+                let b = self.byte(&cx, i);
+                if b == b'"' {
+                    if !multiline {
+                        result = Option::Some.((i, i + 1usize));
+                    } else if self.byte(&cx, i + 1usize) == b'"' && self.byte(&cx, i + 2usize) == b'"' {
+                        result = Option::Some.((i, i + 3usize));
+                    } else {
+                        i = i + 1usize;
+                    }
+                } else if b == b'\\' {
+                    out = out.push_bytes(&cx, self.src.slice(start, i));
+                    copied = true;
+                    i = self.escape(&cx, i, multiline, &out);
+                    start = i;
+                } else if multiline && b == b'\r' && self.byte(&cx, i + 1usize) == b'\n' {
+                    out = out.push_bytes(&cx, self.src.slice(start, i)).push_byte(b'\n');
+                    copied = true;
+                    i = i + 2usize;
+                    start = i;
+                } else if is_control(b) && !(multiline && b == b'\n') {
+                    self.fail(&cx, i, "invalid character in a string");
+                } else {
+                    i = i + 1usize;
+                }
+            }
+        }
+        match result {
+            Option::None => {
+                out.destroy();
+                (self.len, self.src.take(0usize), false)
+            },
+            Option::Some(found) => {
+                let (end, next) = found;
+                if copied {
+                    (next, out.push_bytes(&cx, self.src.slice(start, end)).save(&cx), true)
+                } else {
+                    out.destroy();
+                    (next, self.src.slice(start, end), false)
+                }
+            },
+        }
+    }
+
+    // The escape at `pos` (its backslash) written to `out`; where the string
+    // goes on.
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn escape(self, &cx: C, pos: usize, multiline: bool, &out: Buffer!) -> usize {
+        let id = self.byte(&cx, pos + 1usize);
+        let after = pos + 2usize;
+        let crlf = id == b'\r' && self.byte(&cx, pos + 2usize) == b'\n';
+        if multiline && (id == b' ' || id == b'\t' || id == b'\n' || crlf) {
+            // A line-ending backslash: the whitespace and newlines after it go.
+            var i = if crlf { pos + 3usize } else { after };
+            if id == b' ' || id == b'\t' {
+                i = self.skip_space(&cx, i);
+                if i >= self.len {
+                    return i;
+                }
+                let nl = self.newline(&cx, i);
+                if nl == 0usize {
+                    self.fail(&cx, i, "invalid escape");
+                    return self.len;
+                }
+                i = i + nl;
+            }
+            return self.skip_space_and_newlines(&cx, i);
+        }
+        if id == b'u' || id == b'U' {
+            let count = if id == b'u' { 4usize } else { 8usize };
+            var code = 0u32;
+            var k = 0usize;
+            while k < count {
+                let d = self.byte(&cx, after + k);
+                if after + k >= self.len || !is_hex(d) {
+                    self.fail(&cx, after, "invalid hex value");
+                    return self.len;
+                }
+                code = code * 16u32 + hex_value(d);
+                k = k + 1usize;
+            }
+            if code > 1114111u32 || (code >= 55296u32 && code <= 57343u32) {
+                self.fail(&cx, after + count, "escape is not a Unicode scalar value");
+                return self.len;
+            }
+            out = encode(out, code);
+            return after + count;
+        }
+        let replacement = if id == b'b' {
+            8u8
+        } else if id == b't' {
+            9u8
+        } else if id == b'n' {
+            10u8
+        } else if id == b'f' {
+            12u8
+        } else if id == b'r' {
+            13u8
+        } else if id == b'"' || id == b'\\' {
+            id
+        } else {
+            self.fail(&cx, after, "invalid escape");
+            return self.len;
+        };
+        out = out.push_byte(replacement);
+        after
+    }
+
+    // A multiline string at `pos`, its first quote.
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn multiline_string(self, &cx: C, pos: usize, literal: bool) -> (usize, Span['k]) {
+        let delim = if literal { b'\'' } else { b'"' };
+        var i = pos + 3usize;
+        i = i + self.newline(&cx, i);
+        let (next, text, copied) = if literal {
+            self.multiline_literal(&cx, i)
+        } else {
+            self.basic_string(&cx, i, true)
+        };
+        if self.failed(&cx) {
+            return (self.len, text);
+        }
+        // Up to two quotes before the closing three belong to the text.
+        var extra = 0usize;
+        while extra < 2usize && self.byte(&cx, next + extra) == delim {
+            extra = extra + 1usize;
+        }
+        if extra == 0usize {
+            (next, text)
+        } else if copied {
+            var out = Buffer::new().push_bytes(&cx, text);
+            var k = 0usize;
+            while k < extra {
+                out = out.push_byte(delim);
+                k = k + 1usize;
+            }
+            (next + extra, out.save(&cx))
+        } else {
+            // The text is `src`'s, and the quotes follow it there.
+            let n = text.len();
+            let begin = next - 3usize - n;
+            (next + extra, self.src.slice(begin, begin + n + extra))
+        }
+    }
+
+    // A multiline literal string's text, from after its opening quotes and
+    // newline.
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn multiline_literal(self, &cx: C, pos: usize) -> (usize, Span['k], bool) {
+        let end = match self.src.find(&cx, Span::from_static(&cx, "'''"), pos) {
+            Option::Some(e) => e,
+            Option::None => {
+                self.fail(&cx, self.len, "unterminated string");
+                return (self.len, self.src.take(0usize), false);
+            },
+        };
+        var crlf = false;
+        var i = pos;
+        while i < end {
+            let b = self.byte(&cx, i);
+            if b == b'\r' && self.byte(&cx, i + 1usize) == b'\n' {
+                crlf = true;
+            } else if is_control(b) && b != b'\n' {
+                self.fail(&cx, i, "invalid character in a string");
+                return (self.len, self.src.take(0usize), false);
+            }
+            i = i + 1usize;
+        }
+        if !crlf {
+            return (end + 3usize, self.src.slice(pos, end), false);
+        }
+        var out = Buffer::new();
+        i = pos;
+        while i < end {
+            let b = self.byte(&cx, i);
+            if !(b == b'\r' && self.byte(&cx, i + 1usize) == b'\n') {
+                out = out.push_byte(b);
+            }
+            i = i + 1usize;
+        }
+        (end + 3usize, out.save(&cx), true)
+    }
+
+    // --------------------------------------------------------------- keys --
+
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn key_part(self, &cx: C, pos: usize) -> (usize, Span['k]) {
+        let b = self.byte(&cx, pos);
+        if pos < self.len && is_bare(b) {
+            var i = pos;
+            while i < self.len && is_bare(self.byte(&cx, i)) {
+                i = i + 1usize;
+            }
+            (i, self.src.slice(pos, i))
+        } else if b == b'\'' {
+            self.literal_string(&cx, pos)
+        } else if b == b'"' {
+            let (next, text, copied) = self.basic_string(&cx, pos + 1usize, false);
+            (next, text)
+        } else {
+            self.fail(&cx, pos, "invalid key");
+            (self.len, self.src.take(0usize))
+        }
+    }
+
+    // A dotted key, and the spaces after it.
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn key(self, &cx: C, pos: usize) -> (usize, ArenaVec[Span['k], 'k]) {
+        let (first_end, first) = self.key_part(&cx, pos);
+        let parts: ArenaVec[Span['k], 'k] = ArenaVec::one(&cx, first);
+        var i = self.skip_space(&cx, first_end);
+        while !self.failed(&cx) && self.byte(&cx, i) == b'.' && i < self.len {
+            i = self.skip_space(&cx, i + 1usize);
+            let (next, part) = self.key_part(&cx, i);
+            parts.push(&cx, part);
+            i = self.skip_space(&cx, next);
+        }
+        (i, parts)
+    }
+
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn key_value(self, &cx: C, pos: usize) -> (usize, ArenaVec[Span['k], 'k], TomlValue['k]) {
+        let (i, key) = self.key(&cx, pos);
+        if self.failed(&cx) {
+            return (self.len, key, TomlValue::Boolean.(false));
+        }
+        if self.byte(&cx, i) != b'=' || i >= self.len {
+            self.fail(&cx, i, "expected '=' after a key");
+            return (self.len, key, TomlValue::Boolean.(false));
+        }
+        let (next, value) = self.value(&cx, self.skip_space(&cx, i + 1usize));
+        (next, key, value)
+    }
+
+    // ------------------------------------------------------------- values --
+
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn starts_with(self, &cx: C, pos: usize, text: Slice[u8, 'static]) -> bool {
+        match self.src.sub(pos, text.len()) {
+            Option::Some(s) => s.is(&cx, text),
+            Option::None => false,
+        }
+    }
+
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn value(self, &cx: C, pos: usize) -> (usize, TomlValue['k]) {
+        let b = self.byte(&cx, pos);
+        if pos >= self.len {
+            self.fail(&cx, pos, "invalid value");
+            return (self.len, TomlValue::Boolean.(false));
+        }
+        if b == b'"' {
+            if self.starts_with(&cx, pos, "\"\"\"") {
+                let (next, text) = self.multiline_string(&cx, pos, false);
+                return (next, TomlValue::String.(text));
+            }
+            let (next, text, copied) = self.basic_string(&cx, pos + 1usize, false);
+            return (next, TomlValue::String.(text));
+        }
+        if b == b'\'' {
+            if self.starts_with(&cx, pos, "'''") {
+                let (next, text) = self.multiline_string(&cx, pos, true);
+                return (next, TomlValue::String.(text));
+            }
+            let (next, text) = self.literal_string(&cx, pos);
+            return (next, TomlValue::String.(text));
+        }
+        if b == b't' && self.starts_with(&cx, pos, "true") {
+            return (pos + 4usize, TomlValue::Boolean.(true));
+        }
+        if b == b'f' && self.starts_with(&cx, pos, "false") {
+            return (pos + 5usize, TomlValue::Boolean.(false));
+        }
+        if b == b'[' {
+            return self.array(&cx, pos);
+        }
+        if b == b'{' {
+            return self.inline_table(&cx, pos);
+        }
+        match self.datetime(&cx, pos) {
+            Option::Some(found) => {
+                let (next, kind) = found;
+                return (next, TomlValue::Datetime.(TomlDatetime.{ kind, text: self.src.slice(pos, next) }));
+            },
+            Option::None => (),
+        }
+        if self.failed(&cx) {
+            return (self.len, TomlValue::Boolean.(false));
+        }
+        let time_end = self.time(&cx, pos);
+        if time_end > pos {
+            return (time_end, TomlValue::Datetime.(TomlDatetime.{ kind: DatetimeKind::LocalTime, text: self.src.slice(pos, time_end) }));
+        }
+        match self.number(&cx, pos) {
+            Option::Some(found) => return found,
+            Option::None => (),
+        }
+        if self.failed(&cx) {
+            return (self.len, TomlValue::Boolean.(false));
+        }
+        let positive_infinity = f64::from_bits(9218868437227405312u64);
+        let nan = f64::from_bits(9221120237041090560u64);
+        let sign = 9223372036854775808u64;
+        if self.starts_with(&cx, pos, "inf") || self.starts_with(&cx, pos, "+inf") {
+            let width = if b == b'+' { 4usize } else { 3usize };
+            return (pos + width, TomlValue::Float.(positive_infinity));
+        }
+        if self.starts_with(&cx, pos, "-inf") {
+            return (pos + 4usize, TomlValue::Float.(f64::from_bits(positive_infinity.to_bits() | sign)));
+        }
+        if self.starts_with(&cx, pos, "nan") || self.starts_with(&cx, pos, "+nan") {
+            let width = if b == b'+' { 4usize } else { 3usize };
+            return (pos + width, TomlValue::Float.(nan));
+        }
+        if self.starts_with(&cx, pos, "-nan") {
+            return (pos + 4usize, TomlValue::Float.(f64::from_bits(nan.to_bits() | sign)));
+        }
+        self.fail(&cx, pos, "invalid value");
+        (self.len, TomlValue::Boolean.(false))
+    }
+
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn array(self, &cx: C, pos: usize) -> (usize, TomlValue['k]) {
+        let items: ArenaVec[TomlValue['k], 'k] = ArenaVec::new(&cx);
+        var i = self.skip_comments_and_array_space(&cx, pos + 1usize);
+        if self.byte(&cx, i) == b']' && i < self.len {
+            return (i + 1usize, TomlValue::Array.(items));
+        }
+        while !self.failed(&cx) {
+            let (next, item) = self.value(&cx, i);
+            items.push(&cx, item);
+            i = self.skip_comments_and_array_space(&cx, next);
+            if !self.failed(&cx) {
+                let c = self.byte(&cx, i);
+                if c == b']' && i < self.len {
+                    return (i + 1usize, TomlValue::Array.(items));
+                }
+                if c != b',' || i >= self.len {
+                    self.fail(&cx, i, "unclosed array");
+                } else {
+                    i = self.skip_comments_and_array_space(&cx, i + 1usize);
+                    if self.byte(&cx, i) == b']' && i < self.len {
+                        return (i + 1usize, TomlValue::Array.(items));
+                    }
+                }
+            }
+        }
+        (self.len, TomlValue::Array.(items))
+    }
+
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn inline_table(self, &cx: C, pos: usize) -> (usize, TomlValue['k]) {
+        let table: ArenaMap[Span['k], TomlValue['k], 'k] = ArenaMap::new(&cx);
+        let flags = new_flags(&cx);
+        var i = self.skip_space(&cx, pos + 1usize);
+        if self.byte(&cx, i) == b'}' && i < self.len {
+            return (i + 1usize, TomlValue::Table.(table));
+        }
+        while !self.failed(&cx) {
+            let (next, key, value) = self.key_value(&cx, i);
+            if self.failed(&cx) {
+                return (self.len, TomlValue::Table.(table));
+            }
+            i = next;
+            let n = key.len(&cx);
+            let whole = KeyPath.{ header: self.empty, key, count: n };
+            if has_flag(&cx, flags, whole, FROZEN) {
+                self.fail(&cx, i, "cannot extend an inline table or an array");
+                return (self.len, TomlValue::Table.(table));
+            }
+            let parent = KeyPath.{ header: self.empty, key, count: n - 1usize };
+            let target = match nest(&cx, table, parent, false) {
+                Option::Some(t) => t,
+                Option::None => {
+                    self.fail(&cx, i, "cannot overwrite a value");
+                    return (self.len, TomlValue::Table.(table));
+                },
+            };
+            let stem = key.at(&cx, n - 1usize);
+            if target.contains(&cx, stem) {
+                self.fail(&cx, i, "duplicate key in an inline table");
+                return (self.len, TomlValue::Table.(table));
+            }
+            target.insert(&cx, stem, value);
+            i = self.skip_space(&cx, i);
+            let c = self.byte(&cx, i);
+            if c == b'}' && i < self.len {
+                return (i + 1usize, TomlValue::Table.(table));
+            }
+            if c != b',' || i >= self.len {
+                self.fail(&cx, i, "unclosed inline table");
+                return (self.len, TomlValue::Table.(table));
+            }
+            match value {
+                TomlValue::Table(t) => set_flag(&cx, flags, whole, FROZEN),
+                TomlValue::Array(a) => set_flag(&cx, flags, whole, FROZEN),
+                _ => (),
+            }
+            i = self.skip_space(&cx, i + 1usize);
+        }
+        (self.len, TomlValue::Table.(table))
+    }
+
+    // The value of the `count` digits at `pos`, or `None` unless all are
+    // digits.
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn digits(self, &cx: C, pos: usize, count: usize) -> Option[u32] {
+        var value = 0u32;
+        var k = 0usize;
+        while k < count {
+            let d = self.byte(&cx, pos + k);
+            if pos + k >= self.len || !is_digit(d) {
+                return Option::None;
+            }
+            value = value * 10u32 + (d - b'0') as u32;
+            k = k + 1usize;
+        }
+        Option::Some.(value)
+    }
+
+    // Two digits at `pos` no more than `max`.
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn two_digits(self, &cx: C, pos: usize, max: u32) -> bool {
+        match self.digits(&cx, pos, 2usize) {
+            Option::Some(v) => v <= max,
+            Option::None => false,
+        }
+    }
+
+    // The end of a time `HH:MM:SS` or `HH:MM:SS.fraction` at `pos`; `pos`
+    // when there is none.
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn time(self, &cx: C, pos: usize) -> usize {
+        let fields = self.two_digits(&cx, pos, 23u32) && self.byte(&cx, pos + 2usize) == b':'
+            && self.two_digits(&cx, pos + 3usize, 59u32) && self.byte(&cx, pos + 5usize) == b':'
+            && self.two_digits(&cx, pos + 6usize, 59u32);
+        if !fields {
+            return pos;
+        }
+        var end = pos + 8usize;
+        if self.byte(&cx, end) == b'.' && is_digit(self.byte(&cx, end + 1usize)) && end + 1usize < self.len {
+            end = end + 1usize;
+            while end < self.len && is_digit(self.byte(&cx, end)) {
+                end = end + 1usize;
+            }
+        }
+        end
+    }
+
+    // A date, or a date and time with or without an offset, at `pos`: its
+    // end and form. A date that does not exist (`2023-02-29`) is an error.
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn datetime(self, &cx: C, pos: usize) -> Option[(usize, DatetimeKind)] {
+        let year = match self.digits(&cx, pos, 4usize) {
+            Option::Some(y) => y,
+            Option::None => return Option::None,
+        };
+        if self.byte(&cx, pos + 4usize) != b'-' || self.byte(&cx, pos + 7usize) != b'-' {
+            return Option::None;
+        }
+        let month = self.digits(&cx, pos + 5usize, 2usize).unwrap_or(0u32);
+        let day = self.digits(&cx, pos + 8usize, 2usize).unwrap_or(0u32);
+        if month < 1u32 || month > 12u32 || day < 1u32 || day > 31u32 {
+            return Option::None;
+        }
+        if year < 1u32 || day > days_in_month(year, month) {
+            self.fail(&cx, pos, "invalid date");
+            return Option::None;
+        }
+        let date_end = pos + 10usize;
+        let separator = self.byte(&cx, date_end);
+        if !(separator == b'T' || separator == b't' || separator == b' ') || date_end >= self.len {
+            return Option::Some.((date_end, DatetimeKind::LocalDate));
+        }
+        let time_end = self.time(&cx, date_end + 1usize);
+        if time_end == date_end + 1usize {
+            return Option::Some.((date_end, DatetimeKind::LocalDate));
+        }
+        let z = self.byte(&cx, time_end);
+        if (z == b'Z' || z == b'z') && time_end < self.len {
+            return Option::Some.((time_end + 1usize, DatetimeKind::OffsetDatetime));
+        }
+        let offset = (z == b'+' || z == b'-') && self.two_digits(&cx, time_end + 1usize, 23u32)
+            && self.byte(&cx, time_end + 3usize) == b':' && self.two_digits(&cx, time_end + 4usize, 59u32);
+        if offset {
+            Option::Some.((time_end + 6usize, DatetimeKind::OffsetDatetime))
+        } else {
+            Option::Some.((time_end, DatetimeKind::LocalDatetime))
+        }
+    }
+
+    // Digits of `base` at `pos`, each but the first after an optional `_`:
+    // their end.
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn digit_run(self, &cx: C, pos: usize, base: u32) -> usize {
+        if !self.is_digit_of(&cx, pos, base) {
+            return pos;
+        }
+        var end = pos + 1usize;
+        var going = true;
+        while going {
+            if self.is_digit_of(&cx, end, base) {
+                end = end + 1usize;
+            } else if self.byte(&cx, end) == b'_' && self.is_digit_of(&cx, end + 1usize, base) {
+                end = end + 2usize;
+            } else {
+                going = false;
+            }
+        }
+        end
+    }
+
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn is_digit_of(self, &cx: C, pos: usize, base: u32) -> bool {
+        if pos >= self.len {
+            return false;
+        }
+        let b = self.byte(&cx, pos);
+        if base == 16u32 {
+            is_hex(b)
+        } else {
+            is_digit(b) && ((b - b'0') as u32) < base
+        }
+    }
+
+    // An integer or a float at `pos`. An integer out of the range of `i64`
+    // is an error.
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn number(self, &cx: C, pos: usize) -> Option[(usize, TomlValue['k])] {
+        let b = self.byte(&cx, pos);
+        if b == b'0' {
+            let prefix = self.byte(&cx, pos + 1usize);
+            let base = if prefix == b'x' { 16u32 } else if prefix == b'o' { 8u32 } else if prefix == b'b' { 2u32 } else { 0u32 };
+            if base != 0u32 {
+                let end = self.digit_run(&cx, pos + 2usize, base);
+                if end > pos + 2usize {
+                    return Option::Some.((end, TomlValue::Integer.(self.integer(&cx, pos, pos + 2usize, end, base, false))));
+                }
+            }
+        }
+        let signed = b == b'+' || b == b'-';
+        let start = if signed { pos + 1usize } else { pos };
+        let first = self.byte(&cx, start);
+        let int_end = if first == b'0' && start < self.len {
+            start + 1usize
+        } else if first >= b'1' && first <= b'9' && start < self.len {
+            self.digit_run(&cx, start, 10u32)
+        } else {
+            return Option::None;
+        };
+        var end = int_end;
+        if self.byte(&cx, end) == b'.' {
+            let fraction = self.digit_run(&cx, end + 1usize, 10u32);
+            if fraction > end + 1usize {
+                end = fraction;
+            }
+        }
+        let e = self.byte(&cx, end);
+        if (e == b'e' || e == b'E') && end < self.len {
+            let sign = self.byte(&cx, end + 1usize);
+            let digits = if sign == b'+' || sign == b'-' { end + 2usize } else { end + 1usize };
+            let exponent = self.digit_run(&cx, digits, 10u32);
+            if exponent > digits {
+                end = exponent;
+            }
+        }
+        if end == int_end {
+            return Option::Some.((end, TomlValue::Integer.(self.integer(&cx, pos, start, end, 10u32, b == b'-'))));
+        }
+        // A float: its digits without underscores, as `strtod` reads them.
+        var text = Buffer::new();
+        var i = pos;
+        while i < end {
+            let d = self.byte(&cx, i);
+            if d != b'_' {
+                text = text.push_byte(d);
+            }
+            i = i + 1usize;
+        }
+        let exists 'b. (tag, bytes, restore) = text.open();
+        let parsed = parse_f64(&tag, bytes);
+        restore.restore(tag).destroy();
+        match parsed {
+            Option::Some(x) => Option::Some.((end, TomlValue::Float.(x))),
+            Option::None => {
+                self.fail(&cx, pos, "invalid float");
+                Option::None
+            },
+        }
+    }
+
+    // The integer whose digits of `base` are `[start, end)`, negated when
+    // `negative`; an error at `pos` past the range of `i64`.
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn integer(self, &cx: C, pos: usize, start: usize, end: usize, base: u32, negative: bool) -> i64 {
+        // 2^63: the magnitude of the most negative value.
+        let limit = 9223372036854775808u64;
+        var magnitude = 0u64;
+        var i = start;
+        while i < end {
+            let d = self.byte(&cx, i);
+            if d != b'_' {
+                let digit = hex_value(d) as u64;
+                if magnitude > (limit - digit) / (base as u64) {
+                    self.fail(&cx, pos, "integer out of range");
+                    return 0i64;
+                }
+                magnitude = magnitude * (base as u64) + digit;
+            }
+            i = i + 1usize;
+        }
+        if negative {
+            (0u64 - magnitude) as i64
+        } else if magnitude == limit {
+            self.fail(&cx, pos, "integer out of range");
+            0i64
+        } else {
+            magnitude as i64
+        }
+    }
+
+    // --------------------------------------------------------- statements --
+
+    // `key = value` in the current section.
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn assignment(self, &cx: C, pos: usize) -> usize {
+        let (i, key, value) = self.key_value(&cx, pos);
+        if self.failed(&cx) {
+            return self.len;
+        }
+        let header = self.header.copy(&cx);
+        let n = key.len(&cx);
+        var k = 1usize;
+        while k < n {
+            let table = KeyPath.{ header, key, count: k };
+            if has_flag(&cx, self.flags, table, EXPLICIT) {
+                self.fail(&cx, i, "cannot add to a table defined elsewhere");
+                return self.len;
+            }
+            self.pending.push(&cx, table);
+            k = k + 1usize;
+        }
+        let parent = KeyPath.{ header, key, count: n - 1usize };
+        if has_flag(&cx, self.flags, parent, FROZEN) {
+            self.fail(&cx, i, "cannot extend an inline table or an array");
+            return self.len;
+        }
+        let target = match nest(&cx, self.root, parent, true) {
+            Option::Some(t) => t,
+            Option::None => {
+                self.fail(&cx, i, "cannot overwrite a value");
+                return self.len;
+            },
+        };
+        let stem = key.at(&cx, n - 1usize);
+        if target.contains(&cx, stem) {
+            self.fail(&cx, i, "cannot overwrite a value");
+            return self.len;
+        }
+        let whole = KeyPath.{ header, key, count: n };
+        match value {
+            TomlValue::Table(t) => set_flag(&cx, self.flags, whole, FROZEN),
+            TomlValue::Array(a) => set_flag(&cx, self.flags, whole, FROZEN),
+            _ => (),
+        }
+        target.insert(&cx, stem, value);
+        i
+    }
+
+    // The dotted keys' tables of the section that ends become explicit.
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn finish_section(self, &cx: C) {
+        var k = 0usize;
+        while k < self.pending.len(&cx) {
+            set_flag(&cx, self.flags, self.pending.at(&cx, k), EXPLICIT);
+            k = k + 1usize;
+        }
+        self.pending.clear(&cx);
+    }
+
+    // `[key]` at `pos`.
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn table_header(self, &cx: C, pos: usize) -> usize {
+        let (i, key) = self.key(&cx, self.skip_space(&cx, pos + 1usize));
+        if self.failed(&cx) {
+            return self.len;
+        }
+        let path = KeyPath.{ header: self.empty, key, count: key.len(&cx) };
+        if has_flag(&cx, self.flags, path, EXPLICIT) || has_flag(&cx, self.flags, path, FROZEN) {
+            self.fail(&cx, i, "table defined twice");
+            return self.len;
+        }
+        set_flag(&cx, self.flags, path, EXPLICIT);
+        if nest(&cx, self.root, path, true).is_none() {
+            self.fail(&cx, i, "cannot overwrite a value");
+            return self.len;
+        }
+        if self.byte(&cx, i) != b']' || i >= self.len {
+            self.fail(&cx, i, "expected ']' after a table's key");
+            return self.len;
+        }
+        self.header.set(&cx, key);
+        i + 1usize
+    }
+
+    // `[[key]]` at `pos`.
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn array_header(self, &cx: C, pos: usize) -> usize {
+        let (i, key) = self.key(&cx, self.skip_space(&cx, pos + 2usize));
+        if self.failed(&cx) {
+            return self.len;
+        }
+        let n = key.len(&cx);
+        let path = KeyPath.{ header: self.empty, key, count: n };
+        if has_flag(&cx, self.flags, path, FROZEN) {
+            self.fail(&cx, i, "cannot extend an inline table or an array");
+            return self.len;
+        }
+        // The new element is a table of its own: what was defined in the
+        // previous one is forgotten, but not that the key is an array.
+        unset_all(&cx, self.flags, path);
+        set_flag(&cx, self.flags, path, EXPLICIT);
+        let parent = match nest(&cx, self.root, KeyPath.{ header: self.empty, key, count: n - 1usize }, true) {
+            Option::Some(t) => t,
+            Option::None => {
+                self.fail(&cx, i, "cannot overwrite a value");
+                return self.len;
+            },
+        };
+        let stem = key.at(&cx, n - 1usize);
+        let element: ArenaMap[Span['k], TomlValue['k], 'k] = ArenaMap::new(&cx);
+        match parent.get(&cx, stem) {
+            Option::Some(existing) => match existing {
+                TomlValue::Array(items) => items.push(&cx, TomlValue::Table.(element)),
+                _ => {
+                    self.fail(&cx, i, "cannot overwrite a value");
+                    return self.len;
+                },
+            },
+            Option::None => {
+                let items: ArenaVec[TomlValue['k], 'k] = ArenaVec::one(&cx, TomlValue::Table.(element));
+                parent.insert(&cx, stem, TomlValue::Array.(items));
+            },
+        }
+        if !self.starts_with(&cx, i, "]]") {
+            self.fail(&cx, i, "expected ']]' after an array of tables' key");
+            return self.len;
+        }
+        self.header.set(&cx, key);
+        i + 2usize
+    }
+
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    fn document(self, &cx: C) {
+        var pos = 0usize;
+        while !self.failed(&cx) {
+            pos = self.skip_space(&cx, pos);
+            if pos >= self.len {
+                return;
+            }
+            let c = self.byte(&cx, pos);
+            let nl = self.newline(&cx, pos);
+            if nl > 0usize {
+                pos = pos + nl;
+            } else {
+                if c == b'"' || c == b'\'' || is_bare(c) {
+                    pos = self.skip_space(&cx, self.assignment(&cx, pos));
+                } else if c == b'[' {
+                    self.finish_section(&cx);
+                    if self.byte(&cx, pos + 1usize) == b'[' && pos + 1usize < self.len {
+                        pos = self.array_header(&cx, pos);
+                    } else {
+                        pos = self.table_header(&cx, pos);
+                    }
+                    pos = self.skip_space(&cx, pos);
+                } else if c != b'#' {
+                    self.fail(&cx, pos, "invalid statement");
+                }
+                if !self.failed(&cx) {
+                    pos = self.skip_comment(&cx, pos);
+                }
+                if !self.failed(&cx) && pos < self.len {
+                    let end = self.newline(&cx, pos);
+                    if end == 0usize {
+                        self.fail(&cx, pos, "expected a newline or the end after a statement");
+                    }
+                    pos = pos + end;
+                }
+            }
+        }
+    }
+}
+
+// The first byte of `src` that does not start a UTF-8 scalar `decode`
+// reads, if any.
+forall 'k, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+fn invalid_utf8(&cx: C, src: Span['k]) -> Option[usize] {
+    var i = 0usize;
+    while i < src.len() {
+        if src.byte_or_zero(&cx, i) < 128u8 {
+            i = i + 1usize;
+        } else {
+            match decode(&cx, src, i) {
+                Option::Some(scalar) => {
+                    let (code, next) = scalar;
+                    i = next;
+                },
+                Option::None => return Option::Some.(i),
+            }
+        }
+    }
+    Option::None
+}
+
+// The root table of the TOML document `src`, in `src`'s arena, or the first
+// error.
+forall 'k, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+fn parse(&cx: C, src: Span['k]) -> Result[ArenaMap[Span['k], TomlValue['k], 'k], TomlError] {
+    match invalid_utf8(&cx, src) {
+        Option::Some(at) => return Result::Err.(TomlError.{ offset: at, message: "invalid UTF-8" }),
+        Option::None => (),
+    }
+    let empty: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+    let root: ArenaMap[Span['k], TomlValue['k], 'k] = ArenaMap::new(&cx);
+    let p = Parser.{
+        src,
+        len: src.len(),
+        error: Ref::new(&cx, Option::None),
+        header: Ref::new(&cx, empty),
+        empty,
+        root,
+        flags: new_flags(&cx),
+        pending: ArenaVec::new(&cx),
+    };
+    p.document(&cx);
+    match p.error.copy(&cx) {
+        Option::Some(error) => Result::Err.(error),
+        Option::None => Result::Ok.(root),
+    }
+}

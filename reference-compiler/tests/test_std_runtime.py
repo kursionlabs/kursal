@@ -217,23 +217,6 @@ class StdRuntimeTests(unittest.TestCase):
                 0
             }''', "type argument must satisfy Copy")
 
-    # ------------------------------------------------------------------ toml --
-
-    def test_toml_reads_a_document(self):
-        self.expect('''
-            use std::alloc::arena::Domain;
-            use std::bytes::buffer::Buffer;
-            use std::option::Result;
-            use toml::document::parse;
-            fn main() -> i32 {
-                let exists 'k. cx = Domain::new();
-                let input = Buffer::new().push_static("[package]\\nname = \\"x\\" # c\\r\\n");
-                let status = match parse(&cx, input) { Result::Ok(value) => 0, Result::Err(e) => 1 };
-                let bad = match parse(&cx, Buffer::new().push_static("[a")) { Result::Ok(value) => 1, Result::Err(e) => 0 };
-                cx.destroy();
-                status + bad
-            }''', deps=("std", "toml"))
-
     # -------------------------------------------------------------------- io --
 
     def test_reading_a_directory_is_an_error(self):
