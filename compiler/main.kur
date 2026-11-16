@@ -44,12 +44,13 @@ use package::resolve::dump as resolve_dump;
 use package::types::selftest::selftest_types;
 use package::sigs::dump as sigs_dump;
 use package::sigs::signatures::signatures;
-use package::support::system::{arguments, command_line, environment, read, run, write};
+use std::env::variable;
+use std::fs::{read_to_arena, write};
 use package::types::ops::{Fresh, carry_fresh};
 use std::bytes::buffer::Buffer;
 use std::io::print_buffer;
-use std::option::Option;
-use std::process::Args;
+use std::option::{Option, Result};
+use std::process::{Args, Command, Exit};
 use std::slice::Slice;
 use std::time::Instant;
 
@@ -122,7 +123,16 @@ fn main(args: Args) -> i32 {
 // done, and gives nothing; `check`, `c` and `build` give what the core needs.
 forall 'k.
 fn front_end(&cx: Domain!['k], process_args: Args) -> Option[Handoff['k]] {
-    let args = arguments(&cx, process_args);
+    // The arguments after the program's own name, viewed where C's `main` received them.
+    let args: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+    var a = 1usize;
+    while a < process_args.len() {
+        match process_args.bytes(a) {
+            Option::Some(arg) => args.push(&cx, Span::from_static(&cx, arg)),
+            Option::None => (),
+        }
+        a = a + 1usize;
+    }
     if args.is_empty(&cx) {
         fail(&cx, Span::from_static(&cx, "usage: kursal parse FILE... | kursal resolve PATH | kursal sigs PATH | kursal infer PATH | kursal kurs FILE | kursal check FILE | kursal c FILE [--entry NAME] | kursal readable FILE | kursal lower PATH | kursal build PATH [-o OUTPUT] [--times]"));
     }
@@ -132,10 +142,7 @@ fn front_end(&cx: Domain!['k], process_args: Args) -> Option[Handoff['k]] {
         var i = 1usize;
         while i < args.len(&cx) {
             let file = args.at(&cx, i);
-            let source = match read(&cx, file) {
-                Option::Some(s) => s,
-                Option::None => fail(&cx, Buffer::new().push_static("cannot read ").push_bytes(&cx, file).save(&cx)),
-            };
+            let source = read_file(&cx, file);
             emit_buffer(Buffer::new().push_static("== ").push_bytes(&cx, file).push_static("\n"));
             emit(&cx, syntax_dump::items(&cx, parse(&cx, source, file, ids)));
             i = i + 1usize;
@@ -199,9 +206,9 @@ fn front_end(&cx: Domain!['k], process_args: Args) -> Option[Handoff['k]] {
 
 forall 'k.
 fn read_file(&cx: Domain!['k], file: Span['k]) -> Span['k] {
-    match read(&cx, file) {
-        Option::Some(s) => s,
-        Option::None => fail(&cx, Buffer::new().push_static("cannot read ").push_bytes(&cx, file).save(&cx)),
+    match read_to_arena(&cx, file) {
+        Result::Ok(s) => s,
+        Result::Err(e) => fail(&cx, Buffer::new().push_static("cannot read ").push_bytes(&cx, file).save(&cx)),
     }
 }
 
@@ -273,30 +280,29 @@ fn back_end(cx: Domain!['k], handoff: Handoff['k], typed: ArenaMap[FunKey['k], A
         },
     };
     let c_file = Buffer::new().push_bytes(&cx, out).push_static(".c").save(&cx);
-    if !write(&cx, c_file, c) {
+    if write(&cx, c_file, c).is_err() {
         fail(&cx, Buffer::new().push_static("cannot write ").push_bytes(&cx, c_file).save(&cx));
     }
     let lib = lib_dir(&cx);
-    let command: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
     // The C compiler and flags of the reference's `kursal.cc`: `$KURSAL_CC`, else Clang, at -O3.
-    let compiler = match environment(&cx, Span::from_static(&cx, "KURSAL_CC")) {
-        Option::Some(name) => if name.len() > 0usize { name } else { Span::from_static(&cx, "clang") },
-        Option::None => Span::from_static(&cx, "clang"),
+    let compiler = match variable(&cx, Span::from_static(&cx, "KURSAL_CC")) {
+        Option::Some(name) => name.save(&cx),
+        Option::None => Span::from_static(&cx, ""),
     };
-    command.push(&cx, compiler);
-    command.push(&cx, Span::from_static(&cx, "-O3"));
-    command.push(&cx, Span::from_static(&cx, "-w"));
-    command.push(&cx, Span::from_static(&cx, "-fno-builtin"));
-    command.push(&cx, c_file);
-    command.push(&cx, Buffer::new().push_bytes(&cx, lib).push_static("/libc/fs.c").save(&cx));
-    command.push(&cx, Buffer::new().push_bytes(&cx, lib).push_static("/libc/thread.c").save(&cx));
-    command.push(&cx, Span::from_static(&cx, "-lpthread"));
-    command.push(&cx, Span::from_static(&cx, "-o"));
-    command.push(&cx, out);
-    // Only the command line outlives the arena while `cc` runs.
-    let line = command_line(&cx, command);
+    let compiler = if compiler.is_empty() { Span::from_static(&cx, "clang") } else { compiler };
+    // Only the command line, copied into the `Command!`, outlives the arena while `cc` runs.
+    let command = Command::new(&cx, compiler).arg(&cx, Span::from_static(&cx, "-O3")).arg(&cx, Span::from_static(&cx, "-w")).arg(&cx, Span::from_static(&cx, "-fno-builtin"))
+        .arg(&cx, c_file).arg(&cx, Buffer::new().push_bytes(&cx, lib).push_static("/libc/fs.c").save(&cx))
+        .arg(&cx, Buffer::new().push_bytes(&cx, lib).push_static("/libc/thread.c").save(&cx))
+        .arg(&cx, Span::from_static(&cx, "-lpthread")).arg(&cx, Span::from_static(&cx, "-o")).arg(&cx, out);
     cx.destroy();
-    let built = run(line);
+    let built = match command.run() {
+        Result::Ok(exit) => match exit {
+            Exit::Code(code) => code == 0i32,
+            Exit::Signal(number) => false,
+        },
+        Result::Err(e) => false,
+    };
     let finished = stage(handoff.times, "cc", started);
     if built { 0i32 } else { 1i32 }
 }

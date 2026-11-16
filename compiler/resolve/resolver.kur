@@ -26,11 +26,13 @@ use package::kurs::core::ModuleId;
 use package::syntax::parser::parse;
 use package::syntax::ast as S;
 use package::syntax::ast::{Expr, Pattern, Pos, Statement, Type, no_pos};
-use package::support::system::{environment, path_exists, list_directory, read, real_path};
+use std::env::variable;
+use std::fs::{canonicalize, path_exists, read_dir, read_to_arena};
 use std::hash::{HashIn, HashState};
 use std::option::{Option, Result};
 use std::slice::Slice;
-use std::utf8::{encode, width};
+use toml::parser::parse as parse_toml;
+use toml::value::{TomlValue, line_column};
 
 // Whether `name` is one of the space-separated `names`.
 forall 'k.
@@ -72,8 +74,8 @@ fn is_owned_builtin(&cx: Domain!['k], name: Span['k]) -> bool {
 // compiler's binary (an installation's `bin/kursal` and `lib/`).
 forall 'k.
 fn lib_dir(&cx: Domain!['k]) -> Span['k] {
-    let configured = match environment(&cx, Span::from_static(&cx, "KURSAL_LIB")) {
-        Option::Some(v) => v,
+    let configured = match variable(&cx, Span::from_static(&cx, "KURSAL_LIB")) {
+        Option::Some(v) => v.save(&cx),
         Option::None => Span::from_static(&cx, ""),
     };
     if !configured.is_empty() {
@@ -162,6 +164,15 @@ forall 'k.
 fn stem(&cx: Domain!['k], path: Span['k]) -> Span['k] {
     let name = base_name(&cx, path);
     name.slice(0usize, name.len() - suffix(&cx, name).len())
+}
+
+// The absolute path with no symbolic links that `path` names, if it exists.
+forall 'k.
+fn real_path(&cx: Domain!['k], path: Span['k]) -> Option[Span['k]] {
+    match canonicalize(&cx, path) {
+        Result::Ok(r) => Option::Some.(r.save(&cx)),
+        Result::Err(e) => Option::None,
+    }
 }
 
 // The absolute path with no symbolic links that `path` names, existing or not: `Path.resolve()`.
@@ -256,354 +267,6 @@ fn repr_tuple(&cx: Domain!['k], names: ArenaVec[Span['k], 'k]) -> Span['k] {
 forall 'k.
 fn repr_module(&cx: Domain!['k], m: ModuleId['k]) -> Span['k] {
     Buffer::new().push_static("ModuleId(package=").push_usize(m.package).push_static(", path=").push_bytes(&cx, repr_tuple(&cx, m.path)).push_static(")").save(&cx)
-}
-
-// ---------------------------------------------------------- the manifest --
-
-// A manifest value: a string, a table in key order, or any other TOML value.
-forall 'k.
-exposed enum Toml {
-    Str(Span['k]),
-    Table(ArenaMap[Span['k], Toml['k], 'k]),
-    Other,
-}
-
-// A reader for the TOML that manifests use: tables, dotted keys and headers, strings, inline
-// tables, and other values (numbers, booleans, arrays, dates) read only as far as their extent.
-forall 'k.
-exposed struct TomlReader {
-    src: Span['k],
-    i: Ref[usize, 'k],
-    file: Span['k],
-}
-
-forall 'k.
-fn read_toml(&cx: Domain!['k], source: Span['k], file: Span['k]) -> ArenaMap[Span['k], Toml['k], 'k] {
-    let r = TomlReader.{ src: source, i: Ref::new(&cx, 0usize), file };
-    r.document(&cx)
-}
-
-forall 'k.
-impl TomlReader['k] {
-    fn at(self, &cx: Domain!['k]) -> u8 {
-        self.src.byte_or_zero(&cx, self.i.copy(&cx))
-    }
-
-    fn done(self, &cx: Domain!['k]) -> bool {
-        self.i.copy(&cx) >= self.src.len()
-    }
-
-    fn advance(self, &cx: Domain!['k]) {
-        self.i.set(&cx, self.i.copy(&cx) + 1usize);
-    }
-
-    fn fail(self, &cx: Domain!['k]) -> ! {
-        var line = 1usize;
-        var k = 0usize;
-        while k < self.i.copy(&cx) && k < self.src.len() {
-            if self.src.byte_or_zero(&cx, k) == b'\n' {
-                line = line + 1usize;
-            }
-            k = k + 1usize;
-        }
-        fail(&cx, Buffer::new().push_bytes(&cx, self.file).push_static(":").push_usize(line).push_static(": invalid manifest").save(&cx))
-    }
-
-    fn expect(self, &cx: Domain!['k], b: u8) {
-        if self.done(&cx) || self.at(&cx) != b {
-            self.fail(&cx);
-        }
-        self.advance(&cx);
-    }
-
-    // Spaces and tabs.
-    fn blank(self, &cx: Domain!['k]) {
-        while !self.done(&cx) && (self.at(&cx) == b' ' || self.at(&cx) == b'\t') {
-            self.advance(&cx);
-        }
-    }
-
-    // Spaces, newlines and comments.
-    fn space(self, &cx: Domain!['k]) {
-        var going = true;
-        while going && !self.done(&cx) {
-            let b = self.at(&cx);
-            if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
-                self.advance(&cx);
-            } else if b == b'#' {
-                self.comment(&cx);
-            } else {
-                going = false;
-            }
-        }
-    }
-
-    fn comment(self, &cx: Domain!['k]) {
-        while !self.done(&cx) && self.at(&cx) != b'\n' {
-            self.advance(&cx);
-        }
-    }
-
-    // The rest of a line after a key-value pair or a header: blanks and a comment.
-    fn line_end(self, &cx: Domain!['k]) {
-        self.blank(&cx);
-        if !self.done(&cx) && self.at(&cx) == b'#' {
-            self.comment(&cx);
-        }
-        if !self.done(&cx) {
-            if self.at(&cx) == b'\r' {
-                self.advance(&cx);
-            }
-            self.expect(&cx, b'\n');
-        }
-    }
-
-    fn document(self, &cx: Domain!['k]) -> ArenaMap[Span['k], Toml['k], 'k] {
-        let root: ArenaMap[Span['k], Toml['k], 'k] = ArenaMap::new(&cx);
-        var current = root;
-        self.space(&cx);
-        while !self.done(&cx) {
-            if self.at(&cx) == b'[' {
-                self.advance(&cx);
-                if !self.done(&cx) && self.at(&cx) == b'[' {
-                    self.fail(&cx);
-                }
-                self.blank(&cx);
-                let keys = self.key(&cx);
-                self.blank(&cx);
-                self.expect(&cx, b']');
-                self.line_end(&cx);
-                current = self.descend(&cx, root, keys, keys.len(&cx));
-            } else {
-                let keys = self.key(&cx);
-                self.blank(&cx);
-                self.expect(&cx, b'=');
-                self.blank(&cx);
-                let value = self.value(&cx);
-                self.line_end(&cx);
-                self.define(&cx, current, keys, value);
-            }
-            self.space(&cx);
-        }
-        root
-    }
-
-    // The table `keys[..count]` names under `table`, made where missing.
-    fn descend(self, &cx: Domain!['k], table: ArenaMap[Span['k], Toml['k], 'k], keys: ArenaVec[Span['k], 'k], count: usize) -> ArenaMap[Span['k], Toml['k], 'k] {
-        var t = table;
-        var k = 0usize;
-        while k < count {
-            t = match t.get(&cx, keys.at(&cx, k)) {
-                Option::Some(v) => match v {
-                    Toml::Table(inner) => inner,
-                    _ => self.fail(&cx),
-                },
-                Option::None => {
-                    let inner: ArenaMap[Span['k], Toml['k], 'k] = ArenaMap::new(&cx);
-                    t.insert(&cx, keys.at(&cx, k), Toml::Table.(inner));
-                    inner
-                },
-            };
-            k = k + 1usize;
-        }
-        t
-    }
-
-    fn define(self, &cx: Domain!['k], table: ArenaMap[Span['k], Toml['k], 'k], keys: ArenaVec[Span['k], 'k], value: Toml['k]) {
-        let t = self.descend(&cx, table, keys, keys.len(&cx) - 1usize);
-        if t.contains(&cx, keys.at(&cx, keys.len(&cx) - 1usize)) {
-            self.fail(&cx);
-        }
-        t.insert(&cx, keys.at(&cx, keys.len(&cx) - 1usize), value);
-    }
-
-    // A dotted key.
-    fn key(self, &cx: Domain!['k]) -> ArenaVec[Span['k], 'k] {
-        let keys: ArenaVec[Span['k], 'k] = ArenaVec::one(&cx, self.simple_key(&cx));
-        self.blank(&cx);
-        while !self.done(&cx) && self.at(&cx) == b'.' {
-            self.advance(&cx);
-            self.blank(&cx);
-            keys.push(&cx, self.simple_key(&cx));
-            self.blank(&cx);
-        }
-        keys
-    }
-
-    fn simple_key(self, &cx: Domain!['k]) -> Span['k] {
-        if self.done(&cx) {
-            self.fail(&cx);
-        }
-        let b = self.at(&cx);
-        if b == b'"' || b == b'\'' {
-            self.string(&cx)
-        } else {
-            let start = self.i.copy(&cx);
-            while !self.done(&cx) && is_bare(self.at(&cx)) {
-                self.advance(&cx);
-            }
-            if self.i.copy(&cx) == start {
-                self.fail(&cx);
-            }
-            self.src.slice(start, self.i.copy(&cx))
-        }
-    }
-
-    fn value(self, &cx: Domain!['k]) -> Toml['k] {
-        if self.done(&cx) {
-            self.fail(&cx);
-        }
-        let b = self.at(&cx);
-        if b == b'"' || b == b'\'' {
-            Toml::Str.(self.string(&cx))
-        } else if b == b'{' {
-            self.advance(&cx);
-            let table: ArenaMap[Span['k], Toml['k], 'k] = ArenaMap::new(&cx);
-            self.blank(&cx);
-            if !self.done(&cx) && self.at(&cx) == b'}' {
-                self.advance(&cx);
-            } else {
-                var going = true;
-                while going {
-                    self.blank(&cx);
-                    let keys = self.key(&cx);
-                    self.blank(&cx);
-                    self.expect(&cx, b'=');
-                    self.blank(&cx);
-                    let value = self.value(&cx);
-                    self.define(&cx, table, keys, value);
-                    self.blank(&cx);
-                    if !self.done(&cx) && self.at(&cx) == b',' {
-                        self.advance(&cx);
-                    } else {
-                        self.expect(&cx, b'}');
-                        going = false;
-                    }
-                }
-            }
-            Toml::Table.(table)
-        } else if b == b'[' {
-            self.advance(&cx);
-            self.space(&cx);
-            while !self.done(&cx) && self.at(&cx) != b']' {
-                let unit = self.value(&cx);
-                self.space(&cx);
-                if !self.done(&cx) && self.at(&cx) == b',' {
-                    self.advance(&cx);
-                    self.space(&cx);
-                } else if self.done(&cx) || self.at(&cx) != b']' {
-                    self.fail(&cx);
-                }
-            }
-            self.expect(&cx, b']');
-            Toml::Other
-        } else {
-            let start = self.i.copy(&cx);
-            while !self.done(&cx) && is_scalar(self.at(&cx)) {
-                self.advance(&cx);
-            }
-            if self.i.copy(&cx) == start {
-                self.fail(&cx);
-            }
-            Toml::Other
-        }
-    }
-
-    // A basic or literal string, on one line or several.
-    fn string(self, &cx: Domain!['k]) -> Span['k] {
-        let quote = self.at(&cx);
-        let multi = self.src.slice(self.i.copy(&cx), self.i.copy(&cx) + 3usize).eq(&cx, Buffer::new().push_byte(quote).push_byte(quote).push_byte(quote).save(&cx));
-        var out = Buffer::new();
-        if multi {
-            self.i.set(&cx, self.i.copy(&cx) + 3usize);
-            if !self.done(&cx) && self.at(&cx) == b'\n' {
-                self.advance(&cx);
-            } else if self.src.slice(self.i.copy(&cx), self.i.copy(&cx) + 2usize).is(&cx, "\r\n") {
-                self.i.set(&cx, self.i.copy(&cx) + 2usize);
-            }
-        } else {
-            self.advance(&cx);
-        }
-        var going = true;
-        while going {
-            if self.done(&cx) {
-                self.fail(&cx);
-            }
-            let b = self.at(&cx);
-            if b == quote && (!multi || (self.src.byte_or_zero(&cx, self.i.copy(&cx) + 1usize) == quote && self.src.byte_or_zero(&cx, self.i.copy(&cx) + 2usize) == quote)) {
-                let width = if multi { 3usize } else { 1usize };
-                self.i.set(&cx, self.i.copy(&cx) + width);
-                going = false;
-            } else if b == b'\n' && !multi {
-                self.fail(&cx);
-            } else if b == b'\\' && quote == b'"' {
-                self.advance(&cx);
-                self.escape(&cx, &out, multi);
-            } else {
-                out = out.push_byte(b);
-                self.advance(&cx);
-            }
-        }
-        out.save(&cx)
-    }
-
-    fn escape(self, &cx: Domain!['k], &out: Buffer!, multi: bool) {
-        if self.done(&cx) {
-            self.fail(&cx);
-        }
-        let b = self.at(&cx);
-        self.advance(&cx);
-        if b == b'n' {
-            out = out.push_byte(b'\n');
-        } else if b == b't' {
-            out = out.push_byte(b'\t');
-        } else if b == b'r' {
-            out = out.push_byte(b'\r');
-        } else if b == b'b' {
-            out = out.push_byte(8u8);
-        } else if b == b'f' {
-            out = out.push_byte(12u8);
-        } else if b == b'"' || b == b'\\' {
-            out = out.push_byte(b);
-        } else if b == b'u' || b == b'U' {
-            let count = if b == b'u' { 4usize } else { 8usize };
-            var code = 0u32;
-            var k = 0usize;
-            while k < count {
-                let d = self.at(&cx);
-                let digit = if d >= b'0' && d <= b'9' {
-                    (d - b'0') as u32
-                } else if d >= b'a' && d <= b'f' {
-                    (d - b'a') as u32 + 10u32
-                } else if d >= b'A' && d <= b'F' {
-                    (d - b'A') as u32 + 10u32
-                } else {
-                    self.fail(&cx)
-                };
-                code = code * 16u32 + digit;
-                self.advance(&cx);
-                k = k + 1usize;
-            }
-            if width(code) == 0usize {
-                self.fail(&cx);
-            }
-            out = encode(out, code);
-        } else if multi && (b == b'\n' || b == b' ' || b == b'\t' || b == b'\r') {
-            // A line-ending backslash drops the whitespace after it.
-            self.i.set(&cx, self.i.copy(&cx) - 1usize);
-            self.space(&cx);
-        } else {
-            self.fail(&cx);
-        }
-    }
-}
-
-fn is_bare(b: u8) -> bool {
-    (b >= b'A' && b <= b'Z') || (b >= b'a' && b <= b'z') || (b >= b'0' && b <= b'9') || b == b'_' || b == b'-'
-}
-
-fn is_scalar(b: u8) -> bool {
-    !(b == b' ' || b == b'\t' || b == b'\r' || b == b'\n' || b == b',' || b == b']' || b == b'}' || b == b'#')
 }
 
 // ------------------------------------------------------------ the graph --
@@ -871,9 +534,9 @@ fn load(&cx: Domain!['k], path: Span['k], ids: Ref[u32, 'k]) -> ArenaVec[Package
 
 forall 'k.
 fn read_source(&cx: Domain!['k], path: Span['k]) -> Span['k] {
-    match read(&cx, path) {
-        Option::Some(s) => s,
-        Option::None => fail(&cx, Buffer::new().push_static("cannot read ").push_bytes(&cx, path).save(&cx)),
+    match read_to_arena(&cx, path) {
+        Result::Ok(s) => s,
+        Result::Err(e) => fail(&cx, Buffer::new().push_static("cannot read ").push_bytes(&cx, path).save(&cx)),
     }
 }
 
@@ -907,8 +570,8 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
     };
     if is_toml {
         by_dir.insert(&cx, root, package.id);
-        let config = table(&cx, Toml::Table.(read_toml(&cx, read_source(&cx, manifest), manifest)), manifest);
-        let info = table(&cx, config.get_or(&cx, Span::from_static(&cx, "package"), Toml::Table.(ArenaMap::new(&cx))), Span::from_static(&cx, "package"));
+        let config = manifest_table(&cx, manifest);
+        let info = table(&cx, config.get_or(&cx, Span::from_static(&cx, "package"), TomlValue::Table.(ArenaMap::new(&cx))), Span::from_static(&cx, "package"));
         let unknown: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
         let config_keys = config.keys(&cx);
         var i = 0usize;
@@ -954,7 +617,7 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
             package.entry.set(&cx, Option::Some.(path));
         }
         deps = ArenaMap::new(&cx);
-        let specs = table(&cx, config.get_or(&cx, Span::from_static(&cx, "dependencies"), Toml::Table.(ArenaMap::new(&cx))), Span::from_static(&cx, "dependencies"));
+        let specs = table(&cx, config.get_or(&cx, Span::from_static(&cx, "dependencies"), TomlValue::Table.(ArenaMap::new(&cx))), Span::from_static(&cx, "dependencies"));
         let aliases = specs.keys(&cx);
         var k = 0usize;
         while k < aliases.len(&cx) {
@@ -974,26 +637,38 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
     package.id
 }
 
+// The table of the manifest at `path`, read by the standard library's `toml`. A manifest that is not
+// TOML is an error on the line where reading it stopped.
 forall 'k.
-fn table(&cx: Domain!['k], value: Toml['k], at_pos: Span['k]) -> ArenaMap[Span['k], Toml['k], 'k] {
-    match value {
-        Toml::Table(t) => t,
-        _ => fail(&cx, Buffer::new().push_bytes(&cx, at_pos).push_static(": expected a table").save(&cx)),
+fn manifest_table(&cx: Domain!['k], path: Span['k]) -> ArenaMap[Span['k], TomlValue['k], 'k] {
+    let source = read_source(&cx, path);
+    match parse_toml(&cx, source) {
+        Result::Ok(t) => t,
+        Result::Err(e) => {
+            let (line, column) = line_column(&cx, source, e.offset);
+            fail(&cx, Buffer::new().push_bytes(&cx, path).push_static(":").push_usize(line).push_static(": invalid manifest").save(&cx))
+        },
     }
 }
 
 forall 'k.
-fn string(&cx: Domain!['k], t: ArenaMap[Span['k], Toml['k], 'k], key: Slice[u8, 'static], default: Option[Span['k]]) -> Span['k] {
+fn table(&cx: Domain!['k], value: TomlValue['k], at_pos: Span['k]) -> ArenaMap[Span['k], TomlValue['k], 'k] {
+    match value.as_table() {
+        Option::Some(t) => t,
+        Option::None => fail(&cx, Buffer::new().push_bytes(&cx, at_pos).push_static(": expected a table").save(&cx)),
+    }
+}
+
+// The string `t` holds at `key`, else `default`.
+forall 'k.
+fn string(&cx: Domain!['k], t: ArenaMap[Span['k], TomlValue['k], 'k], key: Slice[u8, 'static], default: Option[Span['k]]) -> Span['k] {
     let value = match t.get(&cx, Span::from_static(&cx, key)) {
-        Option::Some(v) => v,
-        Option::None => match default {
-            Option::Some(d) => Toml::Str.(d),
-            Option::None => Toml::Other,
-        },
+        Option::Some(v) => v.as_string(),
+        Option::None => default,
     };
     match value {
-        Toml::Str(s) => s,
-        _ => fail(&cx, Buffer::new().push_static("manifest ").push_bytes(&cx, repr(&cx, Span::from_static(&cx, key))).push_static(" must be a string").save(&cx)),
+        Option::Some(s) => s,
+        Option::None => fail(&cx, Buffer::new().push_static("manifest ").push_bytes(&cx, repr(&cx, Span::from_static(&cx, key))).push_static(" must be a string").save(&cx)),
     }
 }
 
@@ -1012,19 +687,37 @@ fn walk(&cx: Domain!['k], package: Package['k], here: Span['k], rel: ArenaVec[Sp
     if !rel.is_empty(&cx) && path_exists(&cx, join(&cx, here, Span::from_static(&cx, "kur.toml"))) {
         return;
     }
-    let entries = list_directory(&cx, here);
     let dirs: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
     let names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
-    var i = 0usize;
-    while i < entries.len(&cx) {
-        let (name, is_directory) = entries.at(&cx, i);
-        if is_directory {
-            dirs.push(&cx, name);
-        } else {
-            names.push(&cx, name);
-        }
-        i = i + 1usize;
+    match read_dir(&cx, here) {
+        Result::Ok(directory) => {
+            var directory = directory;
+            var going = true;
+            while going {
+                match &directory.next() {
+                    Result::Ok(next) => match next {
+                        Option::Some(entry) => {
+                            let { name, is_directory } = entry;
+                            if is_directory {
+                                dirs.push(&cx, name.save(&cx));
+                            } else {
+                                names.push(&cx, name.save(&cx));
+                            }
+                        },
+                        Option::None => {
+                            going = false;
+                        },
+                    },
+                    Result::Err(e) => {
+                        going = false;
+                    },
+                }
+            }
+            let closed = directory.close();
+        },
+        Result::Err(e) => (),
     }
+    var i = 0usize;
     dirs.sort_by(&cx, |&cx, a, b| a.cmp(&cx, b));
     names.sort_by(&cx, |&cx, a, b| a.cmp(&cx, b));
     i = 0usize;

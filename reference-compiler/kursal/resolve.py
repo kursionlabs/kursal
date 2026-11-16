@@ -126,8 +126,16 @@ def _string(table: dict[str, object], key: str, default: Optional[str] = None) -
 
 
 def _manifest(path: Path) -> dict[str, object]:
-    # tomllib returns dynamic values. Validate them as objects at this boundary.
-    return _table(cast(object, tomllib.loads(path.read_text())), str(path))
+    text = path.read_text()
+    try:
+        # tomllib returns dynamic values. Validate them as objects at this boundary.
+        document = cast(object, tomllib.loads(text))
+    except tomllib.TOMLDecodeError as error:
+        # Its message ends `(at line N, column M)`, or `(at end of document)`: the last line.
+        where = str(error).rsplit("(at line ", 1)
+        line = int(where[1].split(",")[0]) if len(where) == 2 else text.replace("\r\n", "\n").count("\n") + 1
+        fail(f"{path}:{line}: invalid manifest")
+    return _table(document, str(path))
 
 
 def load(path: str | Path) -> list[Package]:

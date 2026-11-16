@@ -285,7 +285,8 @@ class ZeroSizeTests(unittest.TestCase):
 
 
 class EntryTests(unittest.TestCase):
-    """The hosted entry is a safe, non-generic `fn() -> i32` or `fn(i32, *(*u8)) -> i32` without premises."""
+    """The hosted entry is a safe, non-generic `fn() -> i32`, or `fn(A) -> i32` with A a struct of a `*(*u8)` and a
+    `usize` (`std::process::Args`), without premises."""
 
     def emit(self, source):
         from kursal.cgen import emit_c
@@ -295,8 +296,9 @@ class EntryTests(unittest.TestCase):
     def test_the_two_entry_signatures(self):
         self.assertIn("int main(void)", self.emit("(fun main i32 () (entry () (= %r (const i32 0)) (ret %r)))"))
         self.assertIn("int main(int argc, char **argv)", self.emit(
-            """(fun main i32 (i32 (ptr (ptr u8)))
-                 (entry ((%n i32) (%v (ptr (ptr u8)))) (ret %n)))"""))
+            """(type Args (struct (argv (ptr (ptr u8))) (count usize)))
+               (fun main i32 (Args)
+                 (entry ((%a Args)) (= %r (const i32 0)) (ret %r)))"""))
 
     def test_other_entries_are_rejected(self):
         for source in (
@@ -304,6 +306,8 @@ class EntryTests(unittest.TestCase):
             "(fun (unsafe) main i32 () (entry () (= %r (const i32 0)) (ret %r)))",
             "(fun main (forall (T) () i32 () (entry () (= %r (const i32 0)) (ret %r))))",
             "(fun main i32 (i32) (entry ((%n i32)) (ret %n)))",
+            "(fun main i32 (i32 (ptr (ptr u8))) (entry ((%n i32) (%v (ptr (ptr u8)))) (ret %n)))",
+            "(type A (struct (count usize) (argv (ptr (ptr u8))))) (fun main i32 (A) (entry ((%a A)) (= %r (const i32 0)) (ret %r)))",
             "(trait P (T)) (instance P (u32)) (fun main (forall () ((P u32)) i32 () (entry () (= %r (const i32 0)) (ret %r))))",
         ):
             with self.subTest(source=source), self.assertRaisesRegex(KursError, "the entry main must be"):

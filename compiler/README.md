@@ -6,16 +6,15 @@ module, and must accept and reject the same programs, with the same messages, an
 output.
 
 The compiler has one directory per phase, in pipeline order below; `support` is the layer beneath
-them all. A phase's `dump` module prints what the phase computed, as text, for comparison with the
+them all, and the standard library (`std`, `toml`) beneath that. A phase's `dump` module prints what the phase computed, as text, for comparison with the
 reference in the tests.
 
 | Module | Translates | |
 |---|---|---|
 | `support::base` | | `fail`, and `emit`, which writes the output or fails; its storage is the standard library's (see below) |
-| `support::system` | | arguments, files, directories, processes and the environment, through the standard library |
 | `syntax::ast`, `syntax::parser` | `syntax.py`, `parser.py` | the surface AST and the parser |
 | `syntax::dump` | | the AST as text |
-| `resolve::resolver` | `resolve.py` | manifests, the package graph, and what every name names |
+| `resolve::resolver` | `resolve.py` | manifests (read by the standard library's `toml`), the package graph, and what every name names |
 | `resolve::dump` | | a resolved program as text |
 | `kurs::core`, `kurs::sexpr` | `core.py`, `sexpr.py` | the KURS core and S-expressions |
 | `kurs::serial` | `kurs.py` | serialized KURS: its reader and writer |
@@ -231,14 +230,28 @@ take `self` by value and `&cx`: the copies share the same storage. Its construct
 
 ### The operating system
 
-`support::system` copies paths and command lines out of the arena into `Buffer!`s, calls the
-standard library and its `libc` package, and copies what comes back into the arena: arguments
-(`libc::process::arguments`), whole files (`std::io::File::open_read`, `File::read_to_buffer`),
-writing a file (`File::create`, `File::write_buffer`), directories, real paths and the
-environment (`libc::fs`), and running `cc` (`libc::process::run`). Times come from
-`std::time::Instant`, and float literals are read with `std::float::parse_f64` and taken apart with
-`f64::to_bits` and `f64::to_f32`. The compiler has no `unsafe` operation and no `extern`
-declaration of its own.
+The compiler calls the standard library for everything it asks of the operating system, and hands
+it paths as spans of the arena, which it reads in place:
+
+- **Arguments.** `main` is `fn main(args: std::process::Args) -> i32`; the C `main` the backend
+  writes for it fills `Args` from `argv` and `argc` (see the reference compiler's README,
+  "Packages"). `front_end` views each argument as a span (`Span::from_static`), copying nothing.
+- **Files.** `std::fs::read_to_arena` reads a source, a manifest or a KURS file into the arena;
+  `std::fs::write` writes the C. `resolve::resolver` lists source directories with
+  `std::fs::read_dir`, asks `std::fs::path_exists` for a `kur.toml`, and resolves paths as
+  Python's `Path.resolve()` does with `std::fs::canonicalize`.
+- **Manifests** are read by the standard library's `toml` package (`toml::parser::parse`) into an
+  `ArenaMap` of `TomlValue`s. Its reading and its errors are `tomllib`'s, so a manifest that is not
+  TOML fails on the line the reference names, `FILE:LINE: invalid manifest`; the resolver then
+  checks the tables and strings it reads with the reference's messages.
+- **The environment.** `std::env::variable` reads `KURSAL_LIB` and `KURSAL_CC`.
+- **Running `cc`.** `back_end` builds a `std::process::Command!`, which copies each argument out
+  of the arena, destroys the arena, and runs it (`posix_spawnp`); `Exit::Code(0)` is success.
+
+The standard library's directory, without `KURSAL_LIB`, is found from `/proc/self/exe` (Linux),
+the one path the compiler names. Times come from `std::time::Instant`, and float literals are read
+with `std::float::parse_f64` and taken apart with `f64::to_bits` and `f64::to_f32`. The compiler
+has no `unsafe` operation and no `extern` declaration of its own.
 
 ## The C backend
 

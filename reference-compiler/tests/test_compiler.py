@@ -773,6 +773,19 @@ RESOLUTION_ERRORS: tuple[tuple[dict[str, str], str], ...] = (
     (app("use package::a;\n", {"app/a.kur": "fn f( {\n"}), "app"),
     (app("use package::b::c::X;\nfn f() -> u32 { X() }\n", {"app/b/lib.kur": "", "app/b/c.kur": "use package::b::c::X;\n"}), "app/kur.toml"),
     ({"p/kur.toml": manifest("p") + '[dependencies]\nx = { path = 3 }\n', "p/lib.kur": ""}, "p"),
+    # Manifests that are not TOML: the error names the line tomllib reports.
+    ({"p/kur.toml": manifest("p") + '[package]\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": 'package = { name = "p" }\n[package]\nsource_root = "."\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": 'package.name = "p"\n[package]\nsource_root = "."\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": manifest("p") + '[dependencies.x]\npath = "x"\npath = "y"\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": '[package]\nname = "p"\nsource_root = "."\nversion = 1.2.3\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": '[package]\r\nname = "p\r\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": manifest("p") + '[dependencies.x\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": manifest("p") + 'x = """open', "p/lib.kur": ""}, "p"),
+    # Values the manifest does not take.
+    ({"p/kur.toml": '[package]\nname = ["p"]\nsource_root = "."\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": '[package]\nname = "p"\nsource_root = 1979-05-27\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": '[[package]]\nname = "p"\n', "p/lib.kur": ""}, "p"),
 )
 
 
@@ -787,6 +800,11 @@ RESOLVED: tuple[tuple[dict[str, str], str], ...] = (
          "    match Shape::Empty { Shape::Dot(d) => d, _ => Point.{ x: T::size } }\n}\n",
          {"app/kur.toml": manifest("app", ("lib",)).replace('"', "'") + "kind = \"executable\"\nentry = \"package::run::main\"\n",
           "app/run.kur": "fn main() -> i32 { 0i32 }\n"}), "app"),
+    # The whole of TOML, of which the manifest reads its strings and tables: a dependency's other keys
+    # are not read.
+    (app("", {"app/kur.toml": "[package]\nname = \"app\"\nsource_root = \".\"\n[dependencies.lib]\npath = '../lib'\n"
+                              "version = 1\nratio = 0.5\nflags = [true, false]\nwhen = 1979-05-27T07:32:00Z\n"
+                              "[[dependencies.lib.authors]]\nname = \"a\"\n"}), "app"),
 )
 
 
