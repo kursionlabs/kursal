@@ -800,6 +800,28 @@ RESOLUTION_ERRORS: tuple[tuple[dict[str, str], str], ...] = (
     (app("use package::a::L! as M;\nfn f(l: M) -> u32 { 0u32 }\n", {"app/a.kur": "struct L! { x: u32 }\n"}), "app"),
     (app("use lib::shapes::Point as Q!;\n"), "app"),
     (app("struct P { x: u32 }\nstruct P! { x: u32 }\nfn f(p: P!) -> P { P.{ x: 0u32 } }\nfn g(p: Q) -> u32 { 0u32 }\n"), "app"),
+    # Every error is reported in its file, at the name: an impl's target in a module other than lib.kur,
+    # whose methods still reach the type its error names.
+    (app("use package::a;\n", {"app/a.kur": "struct L! { x: u32 }\nimpl L { fn get(self) -> u32 { 0u32 } }\n"
+                                            "fn f(l: L!) -> u32 { L!::get(l) }\n"}), "app"),
+    (app("struct P { x: u32 }\nimpl (u32, P) { fn f(self) -> u32 { 0u32 } }\nimpl P { fn g(self) -> u32 { 0u32 } }\n"
+         "impl P { fn g(self) -> u32 { 1u32 } }\n"), "app"),
+    (app("", {"app/kur.toml": manifest("app", ("lib",), "package::Nope"), "app/b.kur": "fn f() -> u32 { g() }\n"}), "app"),
+    (app("use package::b;\nuse builtin::fresh;\n", {"app/b.kur": "module b;\nuse lib::{shapes::Point as P!, shapes as Copy};\n"}), "app"),
+    # Resolution reports every error, in source order: the modules in order, each by position.
+    (app("use package::a;\nfn f(x: Nothing) -> u32 { nothing() }\nfn g() -> Other { 0u32 }\n",
+         {"app/a.kur": "struct L! { x: u32 }\nstruct S { l: L, m: Missing }\n"
+                       "forall T where Nope[T], Copy[T]. fn h(l: L) -> u32 { L::x + q + p::r }\n"
+                       "fn k(p: lib::shapes::Point) -> u32 { match p { lib::shapes::make(a) => 0u32 } }\n"}), "app"),
+    (app("use lib::shapes::{Point, make};\nfn f() -> u32 { Point.{ x, y: lib::shapes } + make.{ } + u32::nope() }\n"
+         "fn g(x: builtin, y: make) -> lib::shapes { () }\nfn h() -> u32 { lib::hidden::secret() }\n"), "app"),
+    (app("".join(f"fn f{i}() -> u32 {{ g{i}() }}\n" for i in range(21))), "app"),
+    (app("".join(f"fn f{i}() -> u32 {{ g{i}() + g{i}() }}\n" for i in range(12))), "app"),
+    # A `use` that imports the other spelling of a type: the hint names it.
+    (app("use package::a::X;\nfn f(x: X!) -> u32 { X!::V }\nfn g(x: X) -> u32 { 0u32 }\n", {"app/a.kur": "enum X! { V }\n"}), "app"),
+    (app("use package::a::{\n    Y,\n    P!,\n};\nfn f(p: P) -> P! { p }\n", {"app/a.kur": "struct P { x: u32 }\nfn Y() {}\n"}), "app"),
+    (app("use package::a::X as Z;\nfn f(x: Z!) -> u32 { 0u32 }\n", {"app/a.kur": "enum X! { V }\n"}), "app"),
+    (app("use lib::shapes::{Point as Q!, make as Copy};\nfn f(q: Q!) -> u32 { 0u32 }\n"), "app"),
 )
 
 
@@ -926,6 +948,16 @@ SIGNATURE_ERRORS = (
     "struct L! { x: u32 }\nstruct F { f: foreach X of (u32, L!) => X }\n",
     "forall T where Exposed[T]. struct G { g: foreach X of T => *X }\n",
     "struct S { a: (u32, [u8; 1u8 - 2u8 > 0u8]) }\n",
+    # Errors at the type that has them, and a declaration's at its name, naming what holds the linear type.
+    "struct L! { x: u32 }\nexposed struct S {\n    a: u32,\n    l: L!,\n}\n",
+    "struct L! { x: u32 }\nforall T. enum E { A, B(u32, L!) }\n",
+    "struct L! { x: u32 }\nexposed tuple P(u32, L!);\n",
+    "struct S {\n    a: u32,\n    b: u32[u8],\n}\n",
+    "forall T where Copy[T]. struct B { a: T }\nstruct L! { x: u32 }\nstruct S { b: B[L!] }\n",
+    "forall T where Copy[T]. struct B { a: T }\nstruct L! { x: u32 }\nfn f(b: B[L!]) {}\n",
+    "forall T. struct B { a: T }\nfn f(b: B[u32, u8]) {}\n",
+    "trait Show { fn show(x: Self) -> u32; }\nforall T where Show[T, T]. fn f(x: T) {}\n",
+    "forall T. struct R { r: R[(T, T)] }\n",
 )
 
 SYNTAX_ERRORS = (

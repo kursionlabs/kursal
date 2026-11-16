@@ -16,6 +16,18 @@ class KursError(Exception):
         self.message, self.pos = message, pos
 
 
+def located(error: KursError, file: object, pos: Optional[Position]) -> KursError:
+    """`error`, naming `file` and, when it has no position of its own, the position `pos` of the item it is
+    in."""
+    if str(error).startswith(str(file)):
+        return error
+    where = error.pos or pos
+    prefix = f"{file}:{where[0]}:{where[1]}" if where else str(file)
+    located_error = type(error)(f"{prefix}: {error.message}")
+    located_error.message, located_error.pos = error.message, where
+    return located_error
+
+
 class Atom(str):
     pos: Optional[Position] = None
 

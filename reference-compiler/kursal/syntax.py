@@ -49,6 +49,7 @@ class TName(ResolvedName):
     path: NamePath            # name segments
     args: tuple[Type, ...] = ()
     determined: int = 0    # how many trailing args follow `->`
+    pos: Optional[Position] = field(default=None, init=False, repr=False, compare=False)   # its first segment
 
 
 @dataclass
@@ -441,6 +442,7 @@ class Struct(Declaration):
     exposed: Optional[Exposed] = None # None (restricted) or Exposed
     forall: Optional[Forall] = None
     pos: Optional[Position] = None
+    name_pos: Optional[Position] = field(default=None, init=False, repr=False, compare=False)
 
 
 @dataclass
@@ -450,6 +452,7 @@ class TupleDecl(Declaration):
     exposed: Optional[Exposed] = None
     forall: Optional[Forall] = None
     pos: Optional[Position] = None
+    name_pos: Optional[Position] = field(default=None, init=False, repr=False, compare=False)
 
 
 @dataclass
@@ -459,6 +462,7 @@ class EnumDecl(Declaration):
     exposed: Optional[Exposed] = None
     forall: Optional[Forall] = None
     pos: Optional[Position] = None
+    name_pos: Optional[Position] = field(default=None, init=False, repr=False, compare=False)
 
 
 @dataclass
@@ -538,7 +542,7 @@ type Item = (
     Use | Module | Struct | TupleDecl | EnumDecl | Fn | Extern
     | Const | Impl | TraitDecl | InstanceDecl
 )
-type UseTree = tuple[NamePath, bool, tuple[UseTree, ...], Optional[str]]
+type UseTree = tuple[NamePath, bool, tuple[UseTree, ...], Optional[str], Position]   # (path, star, children, alias, where it starts)
 
 
 # ----------------------------------------------------------------- tokens --
@@ -579,6 +583,8 @@ class Exposed:
 class TypeArgs(ResolvedName):
     args: tuple[Type, ...]
     determined: int
+    # a premise's: where its trait's path starts
+    pos: Optional[Position] = field(default=None, init=False, repr=False, compare=False)
 
 
 # ----------------------------------------------------------------- parsing --

@@ -6,15 +6,17 @@ function representations break storage cycles; aggregate names break C alias
 cycles. No concrete specialization budget is needed.
 """
 
+from collections.abc import Mapping
 from typing import Optional
 
 from . import core as C
-from .sexpr import KursError
+from .sexpr import KursError, Position, located
 from .termination import Key, components
 from .types import children, equal, foreach_binders, free_brands, free_names, subst
 
 
-def check_type_expansion(program: C.Program) -> None:
+def check_type_expansion(program: C.Program, places: Optional[Mapping[str, tuple[str, Optional[Position]]]] = None) -> None:
+    """`places` names the file and position of a declaration, by its name, when it has them."""
     graph: dict[Key, set[Key]] = {(name,): set() for name in program.types}
     sites: list[tuple[str, C.Named, set[str], set[str]]] = []
 
@@ -46,9 +48,10 @@ def check_type_expansion(program: C.Program) -> None:
             names = free_names(arg)
             bare = isinstance(arg, C.Named) and not arg.args and arg.name in params
             if names & derived or names & params and not bare:
-                raise KursError(f"recursive type expansion {owner} -> {ty.name}: "
-                                "arguments must be unchanged parameters or independent of them; "
-                                "foreach components of parameter-dependent sources may grow")
+                error = KursError(f"recursive type expansion {owner} -> {ty.name}: "
+                                  "arguments must be unchanged parameters or independent of them; "
+                                  "foreach components of parameter-dependent sources may grow")
+                raise located(error, *places[owner]) if places and owner in places else error
 
     def unfold(ty: C.Named, bound: set[str]) -> Optional[C.Type]:
         if ty.name in bound or ty.name not in program.types:

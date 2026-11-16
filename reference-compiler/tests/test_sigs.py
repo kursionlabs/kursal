@@ -34,11 +34,11 @@ class TypeDeclTests(unittest.TestCase):
         self.assertTrue(s.types["p::Cap!"].linear)
         self.assertFalse(s.types["p::W"].linear)
         cases = (
-            ("struct S { l: L! }\n", "struct S holds a linear type; declare it S!"),
-            ("struct S { o: Opt[L!] }\n", "struct S holds a linear type; declare it S!"),
-            ("forall T. struct G { t: T, l: (u8, L!) }\n", "struct G holds a linear type whatever its type arguments; declare it G!"),
-            ("forall 'k. enum E { A, B(L!, core::cap::Brand['k]) }\n", "enum E holds a linear type; declare it E!"),
-            ("forall T. tuple P(T, Opt[L!]);\n", "tuple P holds a linear type whatever its type arguments; declare it P!"),
+            ("struct S { l: L! }\n", "3:8: struct S holds a linear type in its field l; declare it S!"),
+            ("struct S { o: Opt[L!] }\n", "3:8: struct S holds a linear type in its field o; declare it S!"),
+            ("forall T. struct G { t: T, l: (u8, L!) }\n", "3:18: struct G holds a linear type in its field l whatever its type arguments; declare it G!"),
+            ("forall 'k. enum E { A, B(L!, core::cap::Brand['k]) }\n", "3:17: enum E holds a linear type in its variant B; declare it E!"),
+            ("forall T. tuple P(T, Opt[L!]);\n", "3:17: tuple P holds a linear type in its element 1 whatever its type arguments; declare it P!"),
         )
         for source, message in cases:
             with self.subTest(source=source), self.assertRaisesRegex(SigError, message):
@@ -51,9 +51,9 @@ class TypeDeclTests(unittest.TestCase):
                     "forall T where Exposed[T]. struct G! { g: foreach X of T => *X }\n")
         self.assertFalse(s.types["p::F"].linear)
         cases = (
-            ("struct F { f: foreach X of (u32, L!) => X }\n", "struct F holds a linear type; declare it F!"),
+            ("struct F { f: foreach X of (u32, L!) => X }\n", "2:8: struct F holds a linear type in its field f; declare it F!"),
             ("forall T where Exposed[T]. struct G { g: foreach X of T => *X }\n",
-             "struct G holds a linear type whatever its type arguments; declare it G!"),
+             "2:35: struct G holds a linear type in its field g whatever its type arguments; declare it G!"),
         )
         for source, message in cases:
             with self.subTest(source=source), self.assertRaisesRegex(SigError, message):

@@ -9,11 +9,11 @@ rejected cycle need not actually grow (another edge might reset its arguments).
 Instance search instead requires structural descent on every recursive edge.
 """
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import Optional
 
 from .core import BRAND, Foreach, Fun, Instr, Named, Param, Premise, Program
-from .sexpr import KursError, Position
+from .sexpr import KursError, Position, located
 from .types import free_names, show
 from .formation import strict_subterm
 
@@ -53,13 +53,14 @@ def components(graph: dict[Key, set[Key]]) -> dict[Key, int]:
 
 
 def check_instance_termination(
-    instances: Iterable[tuple[Premise, tuple[Premise, ...], Optional[Position]]],
+    instances: Iterable[tuple[Premise, tuple[Premise, ...], Optional[Position]]], files: Sequence[str] = (),
 ) -> None:
     """Every premise edge within a trait SCC decreases its first argument.
 
     A finite proof tree follows: each recursive component strictly decreases
     a finite type term, and edges between components follow a finite DAG.
-    Headers are shared by surface inference and KURS, before either searches.
+    Headers are shared by surface inference and KURS, before either searches. `files` names the file of each
+    header, when it has one.
     """
     headers = list(instances)
     graph: dict[Key, set[Key]] = {}
@@ -69,13 +70,14 @@ def check_instance_termination(
             graph.setdefault((premise.trait,), set())
             graph[(head.trait,)].add((premise.trait,))
     scc = components(graph)
-    for head, premises, pos in headers:
+    for k, (head, premises, pos) in enumerate(headers):
         for premise in premises:
             if scc[(head.trait,)] == scc[(premise.trait,)]:
                 if not head.args or not premise.args or not strict_subterm(premise.args[0], head.args[0]):
-                    raise KursError(f"recursive instance premise {head.trait} -> {premise.trait}: "
-                                    "first argument must be a strict structural subterm of the head's "
-                                    "first argument", pos)
+                    error = KursError(f"recursive instance premise {head.trait} -> {premise.trait}: "
+                                      "first argument must be a strict structural subterm of the head's "
+                                      "first argument", pos)
+                    raise located(error, files[k], pos) if files else error
 
 
 def check_mono_termination(program: Program) -> None:

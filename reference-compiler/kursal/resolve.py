@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from typing import Literal, Never, cast, Optional
 from pathlib import Path
 from . import syntax as S
-from .sexpr import KursError, Position
+from .sexpr import KursError, Position, located
 from .core import ModuleId
 
 PRIMS = {"i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize", "f32", "f64", "bool"}
@@ -38,6 +38,8 @@ BUILTIN_VALUES = {"fresh", "static_brand", "sizeof", "alloca", "enum_variant", "
 # The builtin types an impl may give methods, as it may a primitive: `impl NonNull[T]` in core::ptr.
 OWNED_BUILTINS = {"NonNull"}
 CORE = "core"
+# Resolution reports at most this many errors, in source order, and how many more it found.
+ERROR_LIMIT = 20
 LIB = Path(os.environ.get("KURSAL_LIB") or Path(__file__).resolve().parents[2] / "lib")
 
 
@@ -67,6 +69,7 @@ class Package:
     entry: Optional[S.NamePath] = None    # an executable's entry path
     files: dict[ModuleId, Path] = field(default_factory=dict)  # ModuleId -> source path
     entry_decl: Optional[Decl] = None
+    manifest: Optional[Path] = None    # its kur.toml, or its one .kur file
 
 
 @dataclass
@@ -75,6 +78,7 @@ class Scope:
     module: ModuleId
     decls: dict[str, Decl] = field(default_factory=dict)     # name -> Decl
     imports: dict[str, S.NamePath] = field(default_factory=dict)   # alias -> path
+    import_pos: dict[str, Position] = field(default_factory=dict)  # alias -> where its `use` names it
     globs: list[S.NamePath] = field(default_factory=list)     # paths
     exports: set[str] = field(default_factory=set)
     items: list[S.Item] = field(default_factory=list)
@@ -93,17 +97,6 @@ def fail(message: str, pos: Optional[Position] = None) -> Never:
     raise ResolveError(message, pos)
 
 
-def located(error: KursError, file: Path, pos: Optional[Position]) -> KursError:
-    """`error`, naming `file` and, when it has no position of its own, the position of the item it is in."""
-    if str(error).startswith(str(file)):
-        return error
-    where = error.pos or pos
-    prefix = f"{file}:{where[0]}:{where[1]}" if where else str(file)
-    located_error = type(error)(f"{prefix}: {error.message}")
-    located_error.message, located_error.pos = error.message, where
-    return located_error
-
-
 # ------------------------------------------------------------ the graph --
 
 def _table(value: object, where: str) -> dict[str, object]:
@@ -118,10 +111,10 @@ def _table(value: object, where: str) -> dict[str, object]:
     return result
 
 
-def _string(table: dict[str, object], key: str, default: Optional[str] = None) -> str:
+def _string(table: dict[str, object], manifest: Path, key: str, default: Optional[str] = None) -> str:
     value = table.get(key, default)
     if not isinstance(value, str):
-        fail(f"manifest {key!r} must be a string")
+        fail(f"{manifest}: manifest {key!r} must be a string")
     return value
 
 
@@ -150,21 +143,21 @@ def load(path: str | Path) -> list[Package]:
         root = manifest.parent
         if root in by_dir and manifest.suffix == ".toml":
             return by_dir[root]
-        package = Package(len(packages), name or root.name, root, source_root or root, {}, entry)
+        package = Package(len(packages), name or root.name, root, source_root or root, {}, entry, manifest=manifest)
         packages.append(package)
         if manifest.suffix == ".toml":
             by_dir[root] = package.id
             config = _manifest(manifest)
-            info = _table(config.get("package", {}), "package")
+            info = _table(config.get("package", {}), f"{manifest}: package")
             unknown = set(config) - {"package", "dependencies"} | set(info) - {"name", "kind", "source_root", "entry"}
             if unknown:
                 fail(f"{manifest}: unknown manifest keys {sorted(unknown)}")
-            package.name = _string(info, "name")
-            package.source_root = (root / _string(info, "source_root", "src")).resolve()
-            if _string(info, "kind", "library") == "executable":
-                package.entry = tuple(p for p in _string(info, "entry").split("::") if p != "package")
-            deps = {alias: (root / _string(_table(spec, alias), "path")).resolve()
-                    for alias, spec in _table(config.get("dependencies", {}), "dependencies").items()}
+            package.name = _string(info, manifest, "name")
+            package.source_root = (root / _string(info, manifest, "source_root", "src")).resolve()
+            if _string(info, manifest, "kind", "library") == "executable":
+                package.entry = tuple(p for p in _string(info, manifest, "entry").split("::") if p != "package")
+            deps = {alias: (root / _string(_table(spec, f"{manifest}: {alias}"), manifest, "path")).resolve()
+                    for alias, spec in _table(config.get("dependencies", {}), f"{manifest}: dependencies").items()}
         for alias, target in (deps or {}).items():
             manifest_path = target if target.suffix == ".toml" else target / "kur.toml"
             package.deps[alias] = add(manifest_path)
@@ -235,9 +228,15 @@ class Resolver:
         self.cache: dict[LookupKey, Target] = {}
         self.active: set[LookupKey] = set()
         self.globbing: set[tuple[ModuleId, S.NamePath]] = set()
+        # The errors reported so far, each with where it sorts in source order: 0 for a manifest's and 1 more
+        # than its module's place among the modules for a source file's, then its position, then the order it
+        # was found in.
+        self.errors: dict[str, tuple[int, int, int, int]] = {}
+        self.order: dict[ModuleId, int] = {}
         for package in packages:
             self.children.setdefault(ModuleId(package.id), {})
             for module, file in package.files.items():
+                self.order[module] = len(self.order)
                 self.collect(module, S.parse(file.read_text(), str(file)))
                 for k in range(len(module.path)):
                     parent = ModuleId(module.package, module.path[:k])
@@ -253,13 +252,14 @@ class Resolver:
         for item in items:
             match item:
                 case S.Module():
-                    fail("package sources do not declare 'module'", item.pos)
+                    self.report(ResolveError("package sources do not declare 'module'", item.pos), module)
                 case S.Use():
                     self.use(scope, (), item.tree, item.export)
                 case S.InstanceDecl():
                     self.instances.append((module, item))
                 case S.Struct() | S.EnumDecl() | S.TupleDecl() | S.Fn() | S.Extern() | S.TraitDecl() | S.Const():
-                    self.declare(scope, Decl(kinds[type(item)], module, item.name, item))
+                    with self.reporting(module, item.pos):
+                        self.declare(scope, Decl(kinds[type(item)], module, item.name, item))
 
     def declare(self, scope: Scope, decl: Decl) -> None:
         if decl.name in scope.decls or decl.name in scope.imports:
@@ -267,29 +267,34 @@ class Resolver:
         scope.decls[decl.name] = decl
 
     def use(self, scope: Scope, prefix: S.NamePath, tree: S.UseTree, export: bool) -> None:
-        names, star, children, alias = tree
+        """The names a `use` tree imports; its errors are at where the tree starts."""
+        names, star, children, alias, start = tree
         path = prefix + names
-        if path[0] == "builtin":
-            self.builtin_package(scope.module)
-        if star:
-            scope.globs.append(path)
-        elif children:
-            for child in children:
-                self.use(scope, path, child, export)
-        else:
-            name = alias or path[-1]
-            if alias and alias.endswith("!") != path[-1].endswith("!"):
-                fail(f"the alias {alias} of {path[-1]} must {'' if path[-1].endswith('!') else 'not '}end with !")
-            if export and path == (name,):  # `export name;` publishes an existing name
-                scope.exports.add(name)
-                return
-            if name in ("package", "builtin") or name in BUILTIN_TRAITS:
-                fail(f"'{name}' is compiler-sealed")
-            if name in scope.imports or name in scope.decls:
-                fail(f"duplicate import {name} in {scope.module}")
-            scope.imports[name] = path
-            if export:
-                scope.exports.add(name)
+        with self.reporting(scope.module, start):
+            if path[0] == "builtin":
+                self.builtin_package(scope.module)
+            if star:
+                scope.globs.append(path)
+            elif children:
+                for child in children:
+                    self.use(scope, path, child, export)
+            else:
+                name = alias or path[-1]
+                if alias and alias.endswith("!") != path[-1].endswith("!"):
+                    # Still imported under the alias, so that its uses report nothing more.
+                    self.report(ResolveError(f"the alias {alias} of {path[-1]} must "
+                                             f"{'' if path[-1].endswith('!') else 'not '}end with !", start), scope.module)
+                if export and path == (name,):  # `export name;` publishes an existing name
+                    scope.exports.add(name)
+                    return
+                if name in ("package", "builtin") or name in BUILTIN_TRAITS:
+                    fail(f"'{name}' is compiler-sealed")
+                if name in scope.imports or name in scope.decls:
+                    fail(f"duplicate import {name} in {scope.module}")
+                scope.imports[name] = path
+                scope.import_pos[name] = start
+                if export:
+                    scope.exports.add(name)
 
     def attach(self, scope: Scope) -> None:
         """Methods and associated consts are declared by their impl's module
@@ -299,27 +304,41 @@ class Resolver:
                 continue
             target = item.type
             if not isinstance(target, S.TName):
-                fail("an impl target must be a named type", item.pos)
+                self.report(ResolveError("an impl target must be a named type", item.pos), scope.module)
+                continue
             owner: Optional[Decl | str]
-            spelled = target.path[-1] if isinstance(target, S.TName) else "?"
             params = item.forall.params if item.forall else ()
-            if isinstance(target, S.TName) and len(target.path) == 1 and target.path[0] in PRIMS:
+            if len(target.path) == 1 and target.path[0] in PRIMS:
                 owner = target.path[0]
-            elif isinstance(target, S.TName) and len(target.path) == 1 and target.path[0] in params:
+            elif len(target.path) == 1 and target.path[0] in params:
                 owner = None  # a blanket impl: its methods are found by method calls only
             else:
-                found_owner = self.lookup(scope.module, target.path, pos=item.pos)
-                if isinstance(found_owner, tuple) and found_owner[0] == "builtin" and found_owner[1] in OWNED_BUILTINS:
-                    owner = found_owner[1]
-                elif isinstance(found_owner, Decl):
-                    owner = found_owner
-                else:
-                    fail("an impl target must name a type declaration", item.pos)
+                owner = self.impl_owner(scope.module, target)
             for member in item.items:
                 kind = "method" if isinstance(member, S.Fn) else "const"
-                decl = Decl(kind, scope.module, f"{spelled}::{member.name}", member, item)
-                self.declare(scope, decl)
-                self.attached.setdefault((owner, member.name), []).append(decl)
+                decl = Decl(kind, scope.module, f"{target.path[-1]}::{member.name}", member, item)
+                with self.reporting(scope.module, member.pos):
+                    self.declare(scope, decl)
+                    self.attached.setdefault((owner, member.name), []).append(decl)
+
+    def impl_owner(self, module: ModuleId, target: S.TName) -> Optional[Decl | str]:
+        """What `impl target` gives methods. When `target` names nothing but its other spelling names a type,
+        the error is reported and the methods go to that type, so that their uses report nothing more."""
+        try:
+            found = self.lookup(module, target.path, target.pos)
+        except ResolveError as error:
+            self.report(error, module)
+            try:
+                found = self.lookup(module, (*target.path[:-1], respelling(target.path[-1])))
+            except ResolveError:
+                return None
+            return found if isinstance(found, Decl) else None
+        if isinstance(found, tuple) and found[0] == "builtin" and found[1] in OWNED_BUILTINS:
+            return found[1]
+        if isinstance(found, Decl):
+            return found
+        self.report(ResolveError("an impl target must name a type declaration", target.pos), module)
+        return None
 
     # ---- path lookup
     def file(self, module: ModuleId) -> Path:
@@ -332,6 +351,32 @@ class Resolver:
             yield
         except KursError as error:
             raise located(error, self.file(module), pos) from None
+
+    @contextmanager
+    def reporting(self, module: ModuleId, pos: Optional[Position]) -> Iterator[None]:
+        """A resolution error raised inside is reported, in `module`'s file and, when it has no position, at
+        `pos`, and the rest of the block is skipped."""
+        try:
+            yield
+        except ResolveError as error:
+            self.report(error, module, pos)
+
+    def report(self, error: ResolveError, module: ModuleId, pos: Optional[Position] = None,
+               file: Optional[Path] = None) -> None:
+        """Keeps `error` for `stop`, in `module`'s file (or `file`) and at `pos` when it has no position.
+        An error reported twice is kept once."""
+        found = located(error, file or self.file(module), pos)
+        line, col = found.pos or (0, 0)
+        self.errors.setdefault(str(found), (0 if file else self.order[module] + 1, line, col, len(self.errors)))
+
+    def stop(self) -> None:
+        """Raises the errors reported, in source order: the first ERROR_LIMIT, and how many more there are."""
+        if not self.errors:
+            return
+        found = sorted(self.errors, key=self.errors.__getitem__)
+        more = len(found) - ERROR_LIMIT
+        shown = found[:ERROR_LIMIT] + ([f"and {more} more error{'s' if more > 1 else ''}"] if more > 0 else [])
+        raise ResolveError("\n".join(shown))
 
     def lookup(self, module: ModuleId, path: S.NamePath, pos: Optional[Position] = None) -> Target:
         """What `path` names from `module`: a Decl or a ModuleId."""
@@ -374,12 +419,17 @@ class Resolver:
         elif first in scope.decls:
             target = scope.decls[first]
         elif first in scope.imports and first != importing:
-            target = self.solve(("import", module, first))
+            try:
+                target = self.solve(("import", module, first))
+            except ResolveError as error:
+                misspelled = self.misspelled_import(module, first) if hint else ""
+                if not misspelled:
+                    raise
+                raise ResolveError(error.message + misspelled, error.pos) from None
         else:
             target = self.root_member(module, first) or self.glob(module, first)
             if target is None:
-                respelled = self.respelled(first, lambda other: self.resolve_path(module, (other,), hint=False)) if hint else ""
-                fail(f"unknown name {'::'.join(path)}{respelled}")
+                fail(f"unknown name {'::'.join(path)}{self.unknown_hint(module, first, importing) if hint else ''}")
         for k, name in enumerate(rest):
             if isinstance(target, Decl):
                 return self.associated(target, "::".join(rest[k:]))
@@ -460,12 +510,33 @@ class Resolver:
     def respelled(name: str, find: Callable[[str], Target]) -> str:
         """For a name that names nothing: what its other spelling, with or without the `!` of a linear
         type, names, when it names something."""
-        other = name.removesuffix("!") if name.endswith("!") else name + "!"
+        other = respelling(name)
         try:
             find(other)
         except ResolveError:
             return ""
-        return f"; the linear type is {other}" if other.endswith("!") else f"; {other} is not a linear type"
+        return spelled_as(other)
+
+    def unknown_hint(self, module: ModuleId, name: str, importing: Optional[str]) -> str:
+        """For a first name that names nothing in `module`: what its other spelling names there, or, when
+        that is an import that names nothing, what the import names respelled (`misspelled_import`)."""
+        other = respelling(name)
+        if other in self.scopes[module].imports and other != importing:
+            misspelled = self.misspelled_import(module, other)
+            if misspelled:
+                return spelled_as(respelling(self.scopes[module].imports[other][-1])) + misspelled
+        return self.respelled(name, lambda other: self.resolve_path(module, (other,), hint=False))
+
+    def misspelled_import(self, module: ModuleId, alias: str) -> str:
+        """For an import that names nothing: where its `use` names it, when the import's last name respelled,
+        with or without the `!` of a linear type, names something."""
+        path = self.scopes[module].imports[alias]
+        try:
+            self.resolve_path(module, (*path[:-1], respelling(path[-1])), importing=alias, hint=False)
+        except ResolveError:
+            return ""
+        line, col = self.scopes[module].import_pos[alias]
+        return f", imported as {path[-1]} at {self.file(module)}:{line}:{col}"
 
     def associated(self, owner: Decl, name: str) -> Decl | S.VariantRef | S.TraitMethodRef:
         """`Owner::name`: an enum variant, or a method or const attached to `Owner`."""
@@ -489,6 +560,16 @@ class Resolver:
         return self.lookup(module, (root, *(std_path if root == "std" else path)))
 
 
+def respelling(name: str) -> str:
+    """`name` with the `!` of a linear type added or removed."""
+    return name.removesuffix("!") if name.endswith("!") else name + "!"
+
+
+def spelled_as(name: str) -> str:
+    """The end of the message for a name whose other spelling, `name`, names something."""
+    return f"; the linear type is {name}" if name.endswith("!") else f"; {name} is not a linear type"
+
+
 # ---------------------------------------------------------- references --
 
 class Names:
@@ -501,19 +582,30 @@ class Names:
         for module, scope in self.r.scopes.items():
             self.module = module
             for item in scope.items:
+                self.item_pos = item.pos
                 with self.r.located(module, item.pos):
                     self.item(item, frozenset())
+        self.r.stop()
         return self.r
+
+    @contextmanager
+    def reporting(self) -> Iterator[None]:
+        """A resolution error raised inside is reported, at the item's position when it has none of its own,
+        and the walk goes on after the block."""
+        with self.r.reporting(self.module, self.item_pos):
+            yield
 
     def params(self, forall: Optional[S.Forall]) -> frozenset[str]:
         return frozenset(p for p in (forall.params + forall.determined if forall else ()) if not p.startswith("'"))
 
     def premises(self, forall: Optional[S.Forall], types: Set[str]) -> None:
         for trait, args in (forall.premises if forall else ()):
-            trait_ref: S.DeclRef | tuple[Literal["builtin"], str] = ("builtin", trait[0]) if trait in (("Copy",), ("Exposed",)) else self.decl(trait, "trait")
+            with self.reporting():
+                trait_ref: S.DeclRef | tuple[Literal["builtin"], str] = (
+                    ("builtin", trait[0]) if trait in (("Copy",), ("Exposed",)) else self.decl(trait, "trait", args.pos))
+                args.ref = trait_ref
             for a in args.args:
                 self.type(a, types)
-            args.ref = trait_ref
 
     def item(self, item: S.Item, types: Set[str]) -> None:
         if isinstance(item, (S.Use, S.Module)):
@@ -585,12 +677,9 @@ class Names:
                     type_expr.ref = ("prim", name)
                 elif name == NEVER:
                     type_expr.ref = ("builtin", name)
-                elif not trait and (builtin := self.builtin_type(path)) is not None:
-                    type_expr.ref = builtin
                 else:
-                    type_expr.ref = self.decl(path, "trait" if trait else None)
-                    if not trait and type_expr.ref[1].kind not in ("struct", "enum", "tuple"):
-                        fail(f"{'::'.join(path)} is not a type")
+                    with self.reporting():
+                        type_expr.ref = self.named_type(path, trait, type_expr.pos)
                 for a in args:
                     self.type(a, types)
             case S.TPtr(inner=inner):
@@ -619,13 +708,23 @@ class Names:
             case S.TForall(params=params, body=body):
                 self.type(body, types | {p for p in params if not p.startswith("'")})
 
-    def builtin_type(self, path: S.NamePath) -> Optional[S.BuiltinRef]:
+    def named_type(self, path: S.NamePath, trait: bool, pos: Optional[Position]) -> S.DeclRef | S.BuiltinRef:
+        """What the type, or with `trait` the trait, written `path` at `pos` names."""
+        builtin = None if trait else self.builtin_type(path, pos)
+        if builtin is not None:
+            return builtin
+        ref = self.decl(path, "trait" if trait else None, pos)
+        if not trait and ref[1].kind not in ("struct", "enum", "tuple"):
+            fail(f"{'::'.join(path)} is not a type", pos)
+        return ref
+
+    def builtin_type(self, path: S.NamePath, pos: Optional[Position]) -> Optional[S.BuiltinRef]:
         """What `path` names when that is a builtin: a builtin type, else an error."""
-        target = self.r.lookup(self.module, path)
+        target = self.r.lookup(self.module, path, pos)
         if not (isinstance(target, tuple) and target[0] == "builtin"):
             return None
         if target[1] not in BUILTIN_TYPES:
-            fail(f"{'::'.join(path)} is not a type")
+            fail(f"{'::'.join(path)} is not a type", pos)
         return ("builtin", target[1])
 
     # ---- expressions
@@ -639,14 +738,16 @@ class Names:
             case S.Block():
                 self.block(expr, types, values)
             case S.StructLit(path=path, fields=fields, pos=pos):
-                path.ref = self.decl(path.names, "struct", pos)
+                with self.reporting():
+                    path.ref = self.decl(path.names, "struct", pos)
                 self.segment_args(path, types)
                 for _, v in fields:
                     if v is not None:
                         walk(v)
                 for name, v in fields:
                     if v is None and name not in values:
-                        fail(f"unknown local {name}", pos)
+                        with self.reporting():
+                            fail(f"unknown local {name}", pos)
             case S.Match(scrutinee=scrutinee, arms=arms):
                 walk(scrutinee)
                 for arm in arms:
@@ -654,7 +755,8 @@ class Names:
                     for case in arm.cases:
                         if case.kind == "variant":
                             assert case.path is not None
-                            self.variant(case.path)
+                            with self.reporting():
+                                self.variant(case.path)
                             self.segment_args(case.path, types)
                             bound |= {b for b in case.binders or () if b != "_"}
                     self.expr(arm.body, types, values | bound)
@@ -724,16 +826,18 @@ class Names:
             expr.ref = ("local", names[0])
         elif len(names) == 2 and names[0] in PRIMS:
             found = self.r.attached.get((names[0], names[1]))
-            if not found:
-                fail(f"unknown {names[0]}::{names[1]}", expr.pos)
-            expr.ref = ("decl", found[0])
+            with self.reporting():
+                if not found:
+                    fail(f"unknown {names[0]}::{names[1]}", expr.pos)
+                expr.ref = ("decl", found[0])
         elif len(names) == 2 and names[0] in types:
             expr.ref = ("assoc", names[0], names[1])  # a member of a type parameter, found by inference
         else:
-            target = self.r.lookup(self.module, names, expr.pos)
-            if isinstance(target, ModuleId):
-                fail(f"{'::'.join(names)} is a module, not a value", expr.pos)
-            expr.ref = target if isinstance(target, tuple) else ("decl", target)
+            with self.reporting():
+                target = self.r.lookup(self.module, names, expr.pos)
+                if isinstance(target, ModuleId):
+                    fail(f"{'::'.join(names)} is a module, not a value", expr.pos)
+                expr.ref = target if isinstance(target, tuple) else ("decl", target)
 
     def variant(self, path: S.Path) -> None:
         target = self.r.lookup(self.module, path.names, path.pos)
@@ -784,9 +888,12 @@ def resolve(path: str | Path) -> Resolver:
     resolver = Resolver(load(path))
     for package in resolver.packages:
         if package.entry:
-            target = resolver.lookup(ModuleId(package.id), package.entry)
-            if not isinstance(target, Decl) or target.kind != "fn" or target.module.package != package.id:
-                fail("an executable's entry must be a function of its own package")
-            package.entry_decl = target
+            try:
+                target = resolver.lookup(ModuleId(package.id), package.entry)
+                if not isinstance(target, Decl) or target.kind != "fn" or target.module.package != package.id:
+                    fail("an executable's entry must be a function of its own package")
+                package.entry_decl = target
+            except ResolveError as error:
+                resolver.report(error, ModuleId(package.id), file=package.manifest)
         break
     return Names(resolver).run()

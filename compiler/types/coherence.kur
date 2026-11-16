@@ -17,7 +17,7 @@ use std::bytes::buffer::Buffer!;
 use package::kurs::core::{Kind, Meta, MetaKind, Param, Premise, Type};
 use package::kurs::core as C;
 use package::syntax::ast::Pos;
-use package::types::ops::{Fresh, extractable_names, kurs_error, map_children, show, subst};
+use package::types::ops::{Fresh, extractable_names, file_of, kurs_error_in, map_children, show, subst};
 use package::types::unify::{instantiate, unify};
 use std::option::Option;
 
@@ -37,9 +37,10 @@ fn binders_as_wildcards(&cx: Domain!['k], ty: Type['k]) -> Type['k] {
     }
 }
 
-// Every quantified parameter is extractable without crossing a binder.
+// Every quantified parameter is extractable without crossing a binder. An error is in `file`, unless
+// it is empty.
 forall 'k.
-fn check_instance_range(&cx: Domain!['k], head: Premise['k], params: ArenaVec[Param['k], 'k], pos: Pos) {
+fn check_instance_range(&cx: Domain!['k], head: Premise['k], params: ArenaVec[Param['k], 'k], file: Span['k], pos: Pos) {
     let used: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
     var i = 0usize;
     while i < head.args.len(&cx) {
@@ -51,8 +52,8 @@ fn check_instance_range(&cx: Domain!['k], head: Premise['k], params: ArenaVec[Pa
         let param = params.at(&cx, j);
         if !used.contains(&cx, param.name) {
             let name = if C::same_kind(param.kind, Kind::Brand) { Buffer!::new().push_static("$").push_bytes(&cx, param.name).save(&cx) } else { param.name };
-            kurs_error(&cx, Buffer!::new().push_static("instance of ").push_bytes(&cx, head.trait_name).push_static(": parameter ").push_bytes(&cx, name)
-                .push_static(" needs a binder-free head occurrence").save(&cx), pos);
+            kurs_error_in(&cx, Buffer!::new().push_static("instance of ").push_bytes(&cx, head.trait_name).push_static(": parameter ").push_bytes(&cx, name)
+                .push_static(" needs a binder-free head occurrence").save(&cx), file, pos);
         }
         j = j + 1usize;
     }
@@ -83,13 +84,14 @@ fn wildcards(&cx: Domain!['k], args: ArenaVec[Type['k], 'k], sub: ArenaMap[Span[
     out
 }
 
+// `files` names the file of each header, when it has one.
 forall 'k.
-fn check_coherence(&cx: Domain!['k], headers: ArenaVec[(Premise['k], ArenaVec[Param['k], 'k], Pos), 'k], counter: Fresh['k]) {
+fn check_coherence(&cx: Domain!['k], headers: ArenaVec[(Premise['k], ArenaVec[Param['k], 'k], Pos), 'k], counter: Fresh['k], files: ArenaVec[Span['k], 'k]) {
     let seen: ArenaMap[Span['k], ArenaVec[(Premise['k], ArenaVec[Param['k], 'k]), 'k], 'k] = ArenaMap::new(&cx);
     var h = 0usize;
     while h < headers.len(&cx) {
         let (head, params, pos) = headers.at(&cx, h);
-        check_instance_range(&cx, head, params, pos);
+        check_instance_range(&cx, head, params, file_of(&cx, files, h), pos);
         let earlier_heads = seen.get_or(&cx, head.trait_name, ArenaVec::new(&cx));
         var e = 0usize;
         while e < earlier_heads.len(&cx) {
@@ -107,8 +109,8 @@ fn check_coherence(&cx: Domain!['k], headers: ArenaVec[(Premise['k], ArenaVec[Pa
                 i = i + 1usize;
             }
             if overlapping {
-                kurs_error(&cx, Buffer!::new().push_static("overlapping instances of ").push_bytes(&cx, head.trait_name).push_static(": (").push_bytes(&cx, show_args(&cx, head.args))
-                    .push_static(") and (").push_bytes(&cx, show_args(&cx, earlier.args)).push_static(")").save(&cx), pos);
+                kurs_error_in(&cx, Buffer!::new().push_static("overlapping instances of ").push_bytes(&cx, head.trait_name).push_static(": (").push_bytes(&cx, show_args(&cx, head.args))
+                    .push_static(") and (").push_bytes(&cx, show_args(&cx, earlier.args)).push_static(")").save(&cx), file_of(&cx, files, h), pos);
             }
             e = e + 1usize;
         }

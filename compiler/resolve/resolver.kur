@@ -28,6 +28,7 @@ use package::syntax::ast as S;
 use package::syntax::ast::{Expr, Pattern, Pos, Statement, Type, no_pos};
 use std::env::variable;
 use std::fs::{canonicalize, path_exists, read_dir, read_to_arena};
+use std::cmp::Order;
 use std::hash::{HashIn, HashState};
 use std::option::{Option, Result};
 use std::slice::Slice;
@@ -323,6 +324,17 @@ fn named_pos(n: Named['k]) -> Pos {
     }
 }
 
+// Where a declaration writes its name: a type declaration's name, else where it starts.
+forall 'k.
+fn name_pos(n: Named['k]) -> Pos {
+    match n {
+        Named::Struct(x) => x.name_pos,
+        Named::Enum(x) => x.name_pos,
+        Named::Tuple(x) => x.name_pos,
+        _ => named_pos(n),
+    }
+}
+
 forall 'k.
 fn item_pos(item: S::Item['k]) -> Pos {
     match item {
@@ -354,6 +366,8 @@ exposed struct Package {
     // module -> source path
     files: ArenaMap[ModuleId['k], Span['k], 'k],
     entry_decl: Ref[Option[Decl['k]], 'k],
+    // its kur.toml, or its one .kur file
+    manifest: Span['k],
 }
 
 // One module's namespace.
@@ -363,6 +377,8 @@ exposed struct Scope {
     decls: ArenaMap[Span['k], Decl['k], 'k],
     // alias -> path
     imports: ArenaMap[Span['k], ArenaVec[Span['k], 'k], 'k],
+    // alias -> where its `use` names it
+    import_pos: ArenaMap[Span['k], Pos, 'k],
     globs: ArenaVec[ArenaVec[Span['k], 'k], 'k],
     exports: ArenaSet[Span['k], 'k],
     items: ArenaVec[S::Item['k], 'k],
@@ -463,11 +479,45 @@ instance HashIn[Owner['k], Domain!['k]] {
     }
 }
 
-// A file and a position errors inside it are reported at when they have none of their own.
+// A file and a position errors inside it are reported at when they have none of their own, and
+// where its errors sort (`Reported.rank`).
 forall 'k.
 exposed struct Location {
     file: Span['k],
     pos: Pos,
+    rank: usize,
+}
+
+// A resolution error as printed, and where it sorts in source order: by its `rank`, 0 for a
+// manifest's and 1 more than its module's place among the modules for a source file's, then by its
+// position, then in the order it was found.
+forall 'k.
+exposed struct Reported {
+    text: Span['k],
+    rank: usize,
+    line: u32,
+    col: u32,
+    seq: usize,
+}
+
+// Resolution reports at most this many errors, in source order, and how many more it found.
+const ERROR_LIMIT: usize = 20;
+
+forall 'k.
+fn source_order(a: Reported['k], b: Reported['k]) -> Order {
+    if a.rank != b.rank {
+        if a.rank < b.rank { Order::Less } else { Order::Greater }
+    } else if a.line != b.line {
+        if a.line < b.line { Order::Less } else { Order::Greater }
+    } else if a.col != b.col {
+        if a.col < b.col { Order::Less } else { Order::Greater }
+    } else if a.seq < b.seq {
+        Order::Less
+    } else if a.seq > b.seq {
+        Order::Greater
+    } else {
+        Order::Equal
+    }
 }
 
 // An error as `KursError` prints it: `line:col: message`, or the message alone.
@@ -583,6 +633,7 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
         entry: Ref::new(&cx, entry),
         files: ArenaMap::new(&cx),
         entry_decl: Ref::new(&cx, Option::None),
+        manifest,
     };
     packages.push(&cx, package);
     var deps: ArenaMap[Span['k], Span['k], 'k] = match deps {
@@ -592,7 +643,7 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
     if is_toml {
         by_dir.insert(&cx, root, package.id);
         let config = manifest_table(&cx, manifest);
-        let info = table(&cx, config.get_or(&cx, Span::from_static(&cx, "package"), TomlValue::Table.(ArenaMap::new(&cx))), Span::from_static(&cx, "package"));
+        let info = table(&cx, config.get_or(&cx, Span::from_static(&cx, "package"), TomlValue::Table.(ArenaMap::new(&cx))), in_manifest(&cx, manifest, Span::from_static(&cx, "package")));
         let unknown: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
         let config_keys = config.keys(&cx);
         var i = 0usize;
@@ -623,10 +674,10 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
             }
             fail(&cx, out.push_static("]").save(&cx));
         }
-        package.name.set(&cx, string(&cx, info, "name", Option::None));
-        package.source_root.set(&cx, resolved(&cx, join(&cx, root, string(&cx, info, "source_root", Option::Some.(Span::from_static(&cx, "src"))))));
-        if string(&cx, info, "kind", Option::Some.(Span::from_static(&cx, "library"))).is(&cx, "executable") {
-            let parts = string(&cx, info, "entry", Option::None).split(&cx, Span::from_static(&cx, "::"));
+        package.name.set(&cx, string(&cx, info, manifest, "name", Option::None));
+        package.source_root.set(&cx, resolved(&cx, join(&cx, root, string(&cx, info, manifest, "source_root", Option::Some.(Span::from_static(&cx, "src"))))));
+        if string(&cx, info, manifest, "kind", Option::Some.(Span::from_static(&cx, "library"))).is(&cx, "executable") {
+            let parts = string(&cx, info, manifest, "entry", Option::None).split(&cx, Span::from_static(&cx, "::"));
             let path: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
             var k = 0usize;
             while k < parts.len(&cx) {
@@ -638,12 +689,12 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
             package.entry.set(&cx, Option::Some.(path));
         }
         deps = ArenaMap::new(&cx);
-        let specs = table(&cx, config.get_or(&cx, Span::from_static(&cx, "dependencies"), TomlValue::Table.(ArenaMap::new(&cx))), Span::from_static(&cx, "dependencies"));
+        let specs = table(&cx, config.get_or(&cx, Span::from_static(&cx, "dependencies"), TomlValue::Table.(ArenaMap::new(&cx))), in_manifest(&cx, manifest, Span::from_static(&cx, "dependencies")));
         let aliases = specs.keys(&cx);
         var k = 0usize;
         while k < aliases.len(&cx) {
             let alias = aliases.at(&cx, k);
-            deps.insert(&cx, alias, resolved(&cx, join(&cx, root, string(&cx, table(&cx, specs.at(&cx, alias), alias), "path", Option::None))));
+            deps.insert(&cx, alias, resolved(&cx, join(&cx, root, string(&cx, table(&cx, specs.at(&cx, alias), in_manifest(&cx, manifest, alias)), manifest, "path", Option::None))));
             k = k + 1usize;
         }
     }
@@ -680,16 +731,22 @@ fn table(&cx: Domain!['k], value: TomlValue['k], at_pos: Span['k]) -> ArenaMap[S
     }
 }
 
-// The string `t` holds at `key`, else `default`.
+// `MANIFEST: where`, for an error in the manifest.
 forall 'k.
-fn string(&cx: Domain!['k], t: ArenaMap[Span['k], TomlValue['k], 'k], key: Slice[u8, 'static], default: Option[Span['k]]) -> Span['k] {
+fn in_manifest(&cx: Domain!['k], manifest: Span['k], at_pos: Span['k]) -> Span['k] {
+    Buffer!::new().push_bytes(&cx, manifest).push_static(": ").push_bytes(&cx, at_pos).save(&cx)
+}
+
+// The string `t`, a table of `manifest`, holds at `key`, else `default`.
+forall 'k.
+fn string(&cx: Domain!['k], t: ArenaMap[Span['k], TomlValue['k], 'k], manifest: Span['k], key: Slice[u8, 'static], default: Option[Span['k]]) -> Span['k] {
     let value = match t.get(&cx, Span::from_static(&cx, key)) {
         Option::Some(v) => v.as_string(),
         Option::None => default,
     };
     match value {
         Option::Some(s) => s,
-        Option::None => fail(&cx, Buffer!::new().push_static("manifest ").push_bytes(&cx, repr(&cx, Span::from_static(&cx, key))).push_static(" must be a string").save(&cx)),
+        Option::None => fail(&cx, Buffer!::new().push_bytes(&cx, manifest).push_static(": manifest ").push_bytes(&cx, repr(&cx, Span::from_static(&cx, key))).push_static(" must be a string").save(&cx)),
     }
 }
 
@@ -830,6 +887,11 @@ exposed struct Resolver {
     // The files and positions errors are reported in, innermost last.
     locations: ArenaVec[Location['k], 'k],
     decl_ids: Ref[u32, 'k],
+    // the errors reported so far, and their texts
+    errors: ArenaVec[Reported['k], 'k],
+    reported: ArenaSet[Span['k], 'k],
+    // module -> its place among the modules
+    order: ArenaMap[ModuleId['k], usize, 'k],
 }
 
 forall 'k.
@@ -847,6 +909,9 @@ impl Resolver['k] {
             refs: ArenaMap::new(&cx),
             locations: ArenaVec::new(&cx),
             decl_ids: Ref::new(&cx, 0u32),
+            errors: ArenaVec::new(&cx),
+            reported: ArenaSet::new(&cx),
+            order: ArenaMap::new(&cx),
         };
         var p = 0usize;
         while p < packages.len(&cx) {
@@ -857,6 +922,7 @@ impl Resolver['k] {
             while i < modules.len(&cx) {
                 let home = modules.at(&cx, i);
                 let file = package.files.at(&cx, home);
+                r.order.insert(&cx, home, r.order.len(&cx));
                 r.collect(&cx, home, parse(&cx, read_source(&cx, file), file, ids));
                 var k = 0usize;
                 while k < home.path.len(&cx) {
@@ -898,39 +964,46 @@ impl Resolver['k] {
     }
 
     fn collect(self, &cx: Domain!['k], home: ModuleId['k], items: ArenaVec[S::Item['k], 'k]) {
-        let scope = Scope.{ home, decls: ArenaMap::new(&cx), imports: ArenaMap::new(&cx), globs: ArenaVec::new(&cx), exports: ArenaSet::new(&cx), items };
+        let scope = Scope.{ home, decls: ArenaMap::new(&cx), imports: ArenaMap::new(&cx), import_pos: ArenaMap::new(&cx), globs: ArenaVec::new(&cx), exports: ArenaSet::new(&cx), items };
         self.scopes.insert(&cx, home, scope);
         var i = 0usize;
         while i < items.len(&cx) {
+            self.locate(&cx, home, item_pos(items.at(&cx, i)));
             let unit = match items.at(&cx, i) {
-                S::Item::Module(m) => self.fail(&cx, Span::from_static(&cx, "package sources do not declare 'module'"), m.pos),
+                S::Item::Module(m) => self.report(&cx, Span::from_static(&cx, "package sources do not declare 'module'"), m.pos),
                 S::Item::Use(u) => self.use_tree(&cx, scope, ArenaVec::new(&cx), u.tree, u.is_export),
                 S::Item::Instance(n) => self.instances.push(&cx, (home, n)),
-                S::Item::Struct(x) => self.declare(&cx, scope, self.new_decl(&cx, "struct", home, x.name, Named::Struct.(x), Option::None)),
-                S::Item::Enum(x) => self.declare(&cx, scope, self.new_decl(&cx, "enum", home, x.name, Named::Enum.(x), Option::None)),
-                S::Item::Tuple(x) => self.declare(&cx, scope, self.new_decl(&cx, "tuple", home, x.name, Named::Tuple.(x), Option::None)),
-                S::Item::Fn(x) => self.declare(&cx, scope, self.new_decl(&cx, "fn", home, x.name, Named::Fn.(x), Option::None)),
-                S::Item::Extern(x) => self.declare(&cx, scope, self.new_decl(&cx, "extern", home, x.name, Named::Extern.(x), Option::None)),
-                S::Item::Trait(x) => self.declare(&cx, scope, self.new_decl(&cx, "trait", home, x.name, Named::Trait.(x), Option::None)),
-                S::Item::Const(x) => self.declare(&cx, scope, self.new_decl(&cx, "const", home, x.name, Named::Const.(x), Option::None)),
+                S::Item::Struct(x) => { let declared = self.declare(&cx, scope, self.new_decl(&cx, "struct", home, x.name, Named::Struct.(x), Option::None)); },
+                S::Item::Enum(x) => { let declared = self.declare(&cx, scope, self.new_decl(&cx, "enum", home, x.name, Named::Enum.(x), Option::None)); },
+                S::Item::Tuple(x) => { let declared = self.declare(&cx, scope, self.new_decl(&cx, "tuple", home, x.name, Named::Tuple.(x), Option::None)); },
+                S::Item::Fn(x) => { let declared = self.declare(&cx, scope, self.new_decl(&cx, "fn", home, x.name, Named::Fn.(x), Option::None)); },
+                S::Item::Extern(x) => { let declared = self.declare(&cx, scope, self.new_decl(&cx, "extern", home, x.name, Named::Extern.(x), Option::None)); },
+                S::Item::Trait(x) => { let declared = self.declare(&cx, scope, self.new_decl(&cx, "trait", home, x.name, Named::Trait.(x), Option::None)); },
+                S::Item::Const(x) => { let declared = self.declare(&cx, scope, self.new_decl(&cx, "const", home, x.name, Named::Const.(x), Option::None)); },
                 S::Item::Impl(x) => (),
             };
+            self.unlocate(&cx);
             i = i + 1usize;
         }
     }
 
-    fn declare(self, &cx: Domain!['k], scope: Scope['k], decl: Decl['k]) {
+    // Declares `decl` in `scope`, unless its name is taken, which is reported; whether it did.
+    fn declare(self, &cx: Domain!['k], scope: Scope['k], decl: Decl['k]) -> bool {
         if scope.decls.contains(&cx, decl.name) || scope.imports.contains(&cx, decl.name) {
-            self.fail(&cx, Buffer!::new().push_static("duplicate name ").push_bytes(&cx, decl.name).save(&cx), named_pos(decl.node));
+            self.report(&cx, Buffer!::new().push_static("duplicate name ").push_bytes(&cx, decl.name).save(&cx), named_pos(decl.node));
+            return false;
         }
         scope.decls.insert(&cx, decl.name, decl);
+        true
     }
 
+    // The names a `use` tree imports; its errors are at where the tree starts.
     fn use_tree(self, &cx: Domain!['k], scope: Scope['k], prefix: ArenaVec[Span['k], 'k], tree: S::UseTree['k], exported: bool) {
         let path = prefix.clone(&cx);
         path.append(&cx, tree.path);
         if path.at(&cx, 0usize).is(&cx, "builtin") && !self.in_core(&cx, scope.home) {
-            self.fail(&cx, only_core(&cx), no_pos());
+            self.report(&cx, only_core(&cx), tree.pos);
+            return;
         }
         if tree.star {
             scope.globs.push(&cx, path);
@@ -945,9 +1018,10 @@ impl Resolver['k] {
             let name = match tree.alias {
                 Option::Some(a) => {
                     let linear = last.ends_with(&cx, Span::from_static(&cx, "!"));
+                    // still imported under the alias, so that its uses report nothing more
                     if a.ends_with(&cx, Span::from_static(&cx, "!")) != linear {
-                        self.fail(&cx, Buffer!::new().push_static("the alias ").push_bytes(&cx, a).push_static(" of ").push_bytes(&cx, last)
-                            .push_static(if linear { " must end with !" } else { " must not end with !" }).save(&cx), no_pos());
+                        self.report(&cx, Buffer!::new().push_static("the alias ").push_bytes(&cx, a).push_static(" of ").push_bytes(&cx, last)
+                            .push_static(if linear { " must end with !" } else { " must not end with !" }).save(&cx), tree.pos);
                     }
                     a
                 },
@@ -959,12 +1033,15 @@ impl Resolver['k] {
                 return;
             }
             if name.is(&cx, "package") || name.is(&cx, "builtin") || is_builtin_trait(&cx, name) {
-                self.fail(&cx, Buffer!::new().push_static("'").push_bytes(&cx, name).push_static("' is compiler-sealed").save(&cx), no_pos());
+                self.report(&cx, Buffer!::new().push_static("'").push_bytes(&cx, name).push_static("' is compiler-sealed").save(&cx), tree.pos);
+                return;
             }
             if scope.imports.contains(&cx, name) || scope.decls.contains(&cx, name) {
-                self.fail(&cx, Buffer!::new().push_static("duplicate import ").push_bytes(&cx, name).push_static(" in ").push_bytes(&cx, repr_module(&cx, scope.home)).save(&cx), no_pos());
+                self.report(&cx, Buffer!::new().push_static("duplicate import ").push_bytes(&cx, name).push_static(" in ").push_bytes(&cx, repr_module(&cx, scope.home)).save(&cx), tree.pos);
+                return;
             }
             scope.imports.insert(&cx, name, path);
+            scope.import_pos.insert(&cx, name, tree.pos);
             if exported {
                 scope.exports.insert(&cx, name);
             }
@@ -977,7 +1054,11 @@ impl Resolver['k] {
         var i = 0usize;
         while i < scope.items.len(&cx) {
             let unit = match scope.items.at(&cx, i) {
-                S::Item::Impl(m) => self.attach_impl(&cx, scope, m),
+                S::Item::Impl(m) => {
+                    self.locate(&cx, scope.home, m.pos);
+                    self.attach_impl(&cx, scope, m);
+                    self.unlocate(&cx);
+                },
                 _ => (),
             };
             i = i + 1usize;
@@ -987,7 +1068,10 @@ impl Resolver['k] {
     fn attach_impl(self, &cx: Domain!['k], scope: Scope['k], item: S::Impl['k]) {
         let target = match item.type {
             Type::Name(n) => n,
-            _ => self.fail(&cx, Span::from_static(&cx, "an impl target must be a named type"), item.pos),
+            _ => {
+                self.report(&cx, Span::from_static(&cx, "an impl target must be a named type"), item.pos);
+                return;
+            },
         };
         let spelled = target.path.at(&cx, target.path.len(&cx) - 1usize);
         let params = match item.quantifier {
@@ -1001,15 +1085,7 @@ impl Resolver['k] {
             // a blanket impl: its methods are found by method calls only
             Owner::Blanket
         } else {
-            match self.need(&cx, scope.home, target.path, item.pos) {
-                Target::Builtin(name) => if is_owned_builtin(&cx, name) {
-                    Owner::Prim.(name)
-                } else {
-                    self.fail(&cx, Span::from_static(&cx, "an impl target must name a type declaration"), item.pos)
-                },
-                Target::Decl(d) => Owner::Decl.(d),
-                _ => self.fail(&cx, Span::from_static(&cx, "an impl target must name a type declaration"), item.pos),
-            }
+            self.impl_owner(&cx, scope.home, target)
         };
         var k = 0usize;
         while k < item.items.len(&cx) {
@@ -1021,13 +1097,48 @@ impl Resolver['k] {
                 S::Member::Fn(f) => f.name,
                 S::Member::Const(c) => c.name,
             };
-            self.declare(&cx, scope, decl);
-            let key = (owner, member);
-            match self.attached.get(&cx, key) {
-                Option::Some(found) => found.push(&cx, decl),
-                Option::None => { self.attached.insert(&cx, key, ArenaVec::one(&cx, decl)); },
+            if self.declare(&cx, scope, decl) {
+                let key = (owner, member);
+                match self.attached.get(&cx, key) {
+                    Option::Some(found) => found.push(&cx, decl),
+                    Option::None => { self.attached.insert(&cx, key, ArenaVec::one(&cx, decl)); },
+                }
             }
             k = k + 1usize;
+        }
+    }
+
+    // What `impl target` gives methods. When `target` names nothing but its other spelling names a
+    // type, the error is reported and the methods go to that type, so that their uses report nothing
+    // more.
+    fn impl_owner(self, &cx: Domain!['k], home: ModuleId['k], target: S::TName['k]) -> Owner['k] {
+        match self.lookup(&cx, home, target.path, target.pos) {
+            Result::Ok(found) => match found {
+                Target::Builtin(name) => if is_owned_builtin(&cx, name) {
+                    Owner::Prim.(name)
+                } else {
+                    self.report(&cx, Span::from_static(&cx, "an impl target must name a type declaration"), target.pos);
+                    Owner::Blanket
+                },
+                Target::Decl(d) => Owner::Decl.(d),
+                _ => {
+                    self.report(&cx, Span::from_static(&cx, "an impl target must name a type declaration"), target.pos);
+                    Owner::Blanket
+                },
+            },
+            Result::Err(e) => {
+                self.report(&cx, e.message, e.pos);
+                let n = target.path.len(&cx);
+                let other = target.path.slice(&cx, 0usize, n - 1usize);
+                other.push(&cx, other_spelling(&cx, target.path.at(&cx, n - 1usize)));
+                match self.lookup(&cx, home, other, no_pos()) {
+                    Result::Ok(found) => match found {
+                        Target::Decl(d) => Owner::Decl.(d),
+                        _ => Owner::Blanket,
+                    },
+                    Result::Err(_e) => Owner::Blanket,
+                }
+            },
         }
     }
 
@@ -1039,15 +1150,21 @@ impl Resolver['k] {
     // Errors from here until `unlocate` are inside `module`'s file and, when they have no
     // position, at `pos`.
     fn locate(self, &cx: Domain!['k], home: ModuleId['k], pos: Pos) {
-        self.locations.push(&cx, Location.{ file: self.file(&cx, home), pos });
+        self.locations.push(&cx, Location.{ file: self.file(&cx, home), pos, rank: self.order.get_or(&cx, home, 0usize) + 1usize });
+    }
+
+    // Errors from here until `unlocate` are in the manifest `file`.
+    fn locate_manifest(self, &cx: Domain!['k], file: Span['k]) {
+        self.locations.push(&cx, Location.{ file, pos: no_pos(), rank: 0usize });
     }
 
     fn unlocate(self, &cx: Domain!['k]) {
         let unit = self.locations.pop(&cx);
     }
 
-    // Stops with `message` at `pos` (none on line 0), naming the files it is located in.
-    fn fail(self, &cx: Domain!['k], message: Span['k], pos: Pos) -> ! {
+    // `message` at `pos` (none on line 0) as printed, naming the files it is located in, and where it
+    // is.
+    fn located_error(self, &cx: Domain!['k], message: Span['k], pos: Pos) -> (Span['k], Pos) {
         var full = error_text(&cx, message, pos);
         var at = pos;
         var i = self.locations.len(&cx);
@@ -1058,7 +1175,45 @@ impl Resolver['k] {
             full = f;
             at = p;
         }
+        (full, at)
+    }
+
+    // Stops with `message` at `pos` (none on line 0), naming the files it is located in.
+    fn fail(self, &cx: Domain!['k], message: Span['k], pos: Pos) -> ! {
+        let (full, at) = self.located_error(&cx, message, pos);
         fail(&cx, full)
+    }
+
+    // Keeps `message` at `pos` for `stop`, located as `fail` locates it. An error reported twice is
+    // kept once.
+    fn report(self, &cx: Domain!['k], message: Span['k], pos: Pos) {
+        let (full, at) = self.located_error(&cx, message, pos);
+        if !self.reported.contains(&cx, full) {
+            self.reported.insert(&cx, full);
+            let rank = if self.locations.is_empty(&cx) { 0usize } else { self.locations.at(&cx, self.locations.len(&cx) - 1usize).rank };
+            self.errors.push(&cx, Reported.{ text: full, rank, line: at.line, col: at.col, seq: self.errors.len(&cx) });
+        }
+    }
+
+    // Stops with the errors reported, in source order: the first `ERROR_LIMIT`, and how many more
+    // there are.
+    fn stop(self, &cx: Domain!['k]) {
+        let n = self.errors.len(&cx);
+        if n == 0usize {
+            return;
+        }
+        let sorted = self.errors.clone(&cx);
+        sorted.sort_by(&cx, |&cx, a, b| source_order(a, b));
+        var out = Buffer!::new();
+        var i = 0usize;
+        while i < n && i < ERROR_LIMIT {
+            out = out.push_static(if i > 0usize { "\n" } else { "" }).push_bytes(&cx, sorted.at(&cx, i).text);
+            i = i + 1usize;
+        }
+        if n > ERROR_LIMIT {
+            out = out.push_static("\nand ").push_usize(n - ERROR_LIMIT).push_static(if n - ERROR_LIMIT > 1usize { " more errors" } else { " more error" });
+        }
+        fail(&cx, out.save(&cx))
     }
 
     // ---- path lookup
@@ -1129,7 +1284,13 @@ impl Resolver['k] {
         } else if scope.imports.contains(&cx, first) && not_importing {
             match self.solve(&cx, lookup_key(&cx, "import", home, ArenaVec::one(&cx, first))) {
                 Result::Ok(t) => t,
-                Result::Err(e) => return Result::Err.(e),
+                Result::Err(e) => {
+                    let misspelled = if hint { self.misspelled_import(&cx, home, first) } else { Span::from_static(&cx, "") };
+                    if misspelled.is_empty() {
+                        return Result::Err.(e);
+                    }
+                    return Result::Err.(Problem.{ message: e.message.concat(&cx, misspelled), pos: e.pos });
+                },
             }
         } else {
             match self.root_member(&cx, home, first) {
@@ -1140,13 +1301,7 @@ impl Resolver['k] {
                         Option::None => {
                             var message = Buffer!::new().push_static("unknown name ").push_bytes(&cx, path.join(&cx, "::"));
                             if hint {
-                                let other = other_spelling(&cx, first);
-                                let unit = match self.resolve_path(&cx, home, ArenaVec::one(&cx, other), Option::None, false) {
-                                    Result::Ok(_t) => {
-                                        message = respelled(&cx, message, other);
-                                    },
-                                    Result::Err(_e) => (),
-                                };
+                                message = self.unknown_hint(&cx, message, home, first, importing);
                             }
                             return problem(message.save(&cx));
                         },
@@ -1173,6 +1328,47 @@ impl Resolver['k] {
             k = k + 1usize;
         }
         Result::Ok.(target)
+    }
+
+    // For a first name that names nothing in `home`, `out` followed by what its other spelling names
+    // there, or, when that is an import that names nothing, by what the import names respelled
+    // (`misspelled_import`).
+    fn unknown_hint(self, &cx: Domain!['k], out: Buffer!, home: ModuleId['k], name: Span['k], importing: Option[Span['k]]) -> Buffer! {
+        let other = other_spelling(&cx, name);
+        let scope = self.scopes.at(&cx, home);
+        let not_importing = match importing {
+            Option::Some(i) => !i.eq(&cx, other),
+            Option::None => true,
+        };
+        if scope.imports.contains(&cx, other) && not_importing {
+            let misspelled = self.misspelled_import(&cx, home, other);
+            if !misspelled.is_empty() {
+                let imported = scope.imports.at(&cx, other);
+                return respelled(&cx, out, other_spelling(&cx, imported.at(&cx, imported.len(&cx) - 1usize))).push_bytes(&cx, misspelled);
+            }
+        }
+        match self.resolve_path(&cx, home, ArenaVec::one(&cx, other), Option::None, false) {
+            Result::Ok(_t) => respelled(&cx, out, other),
+            Result::Err(_e) => out,
+        }
+    }
+
+    // For an import that names nothing: where its `use` names it, when the import's last name
+    // respelled, with or without the `!` of a linear type, names something; else nothing.
+    fn misspelled_import(self, &cx: Domain!['k], home: ModuleId['k], alias: Span['k]) -> Span['k] {
+        let scope = self.scopes.at(&cx, home);
+        let path = scope.imports.at(&cx, alias);
+        let n = path.len(&cx);
+        let other = path.slice(&cx, 0usize, n - 1usize);
+        other.push(&cx, other_spelling(&cx, path.at(&cx, n - 1usize)));
+        match self.resolve_path(&cx, home, other, Option::Some.(alias), false) {
+            Result::Ok(_t) => {
+                let at = scope.import_pos.at(&cx, alias);
+                Buffer!::new().push_static(", imported as ").push_bytes(&cx, path.at(&cx, n - 1usize)).push_static(" at ").push_bytes(&cx, self.file(&cx, home))
+                    .push_static(":").push_u64(at.line as u64).push_static(":").push_u64(at.col as u64).save(&cx)
+            },
+            Result::Err(_e) => Span::from_static(&cx, ""),
+        }
     }
 
     // `builtin::name`, which only package core writes.
@@ -1442,6 +1638,7 @@ impl Names['k] {
             }
             m = m + 1usize;
         }
+        self.r.stop(&cx);
         self.r
     }
 
@@ -1456,17 +1653,19 @@ impl Names['k] {
                 while i < f.premises.len(&cx) {
                     let premise = f.premises.at(&cx, i);
                     let trait_path = premise.trait_path;
-                    let trait_ref = if trait_path.len(&cx) == 1usize && is_builtin_trait(&cx, trait_path.at(&cx, 0usize)) {
-                        NameRef::Builtin.(trait_path.at(&cx, 0usize))
+                    if trait_path.len(&cx) == 1usize && is_builtin_trait(&cx, trait_path.at(&cx, 0usize)) {
+                        self.set(&cx, premise.args.id, NameRef::Builtin.(trait_path.at(&cx, 0usize)));
                     } else {
-                        NameRef::Decl.(self.decl(&cx, trait_path, "trait", no_pos()))
-                    };
+                        match self.decl(&cx, trait_path, "trait", premise.pos) {
+                            Option::Some(d) => self.set(&cx, premise.args.id, NameRef::Decl.(d)),
+                            Option::None => (),
+                        }
+                    }
                     var k = 0usize;
                     while k < premise.args.args.len(&cx) {
                         self.type(&cx, premise.args.args.at(&cx, k), types, false);
                         k = k + 1usize;
                     }
-                    self.set(&cx, premise.args.id, trait_ref);
                     i = i + 1usize;
                 }
             },
@@ -1573,23 +1772,39 @@ impl Names['k] {
         };
     }
 
-    // The declaration `path` names, of `kind` unless it is empty.
-    fn decl(self, &cx: Domain!['k], path: ArenaVec[Span['k], 'k], kind: Slice[u8, 'static], pos: Pos) -> Decl['k] {
-        let target = self.r.need(&cx, self.home.copy(&cx), path, pos);
-        let k = Span::from_static(&cx, kind);
-        match target {
-            Target::Decl(d) => if k.is_empty() || d.kind.eq(&cx, k) {
-                d
-            } else {
-                self.not_a(&cx, path, k, pos)
+    // What `path`, written at `pos`, names; or nothing, when it names nothing, which is reported.
+    fn seek(self, &cx: Domain!['k], path: ArenaVec[Span['k], 'k], pos: Pos) -> Option[Target['k]] {
+        match self.r.lookup(&cx, self.home.copy(&cx), path, pos) {
+            Result::Ok(t) => Option::Some.(t),
+            Result::Err(e) => {
+                self.r.report(&cx, e.message, e.pos);
+                Option::None
             },
-            _ => self.not_a(&cx, path, k, pos),
         }
     }
 
-    fn not_a(self, &cx: Domain!['k], path: ArenaVec[Span['k], 'k], kind: Span['k], pos: Pos) -> ! {
-        let what = if kind.is_empty() { Span::from_static(&cx, "declaration") } else { kind };
-        self.r.fail(&cx, Buffer!::new().push_bytes(&cx, path.join(&cx, "::")).push_static(" is not a ").push_bytes(&cx, what).save(&cx), pos)
+    // The declaration `path`, written at `pos`, names, of `kind` unless it is empty; or nothing, when
+    // it names none, which is reported.
+    fn decl(self, &cx: Domain!['k], path: ArenaVec[Span['k], 'k], kind: Slice[u8, 'static], pos: Pos) -> Option[Decl['k]] {
+        match self.seek(&cx, path, pos) {
+            Option::Some(target) => self.decl_of(&cx, path, target, kind, pos),
+            Option::None => Option::None,
+        }
+    }
+
+    // `target`, which `path` names, when it is a declaration of `kind` (any kind when it is empty);
+    // otherwise that is reported.
+    fn decl_of(self, &cx: Domain!['k], path: ArenaVec[Span['k], 'k], target: Target['k], kind: Slice[u8, 'static], pos: Pos) -> Option[Decl['k]] {
+        let k = Span::from_static(&cx, kind);
+        match target {
+            Target::Decl(d) => if k.is_empty() || d.kind.eq(&cx, k) {
+                return Option::Some.(d);
+            },
+            _ => (),
+        }
+        let what = if k.is_empty() { Span::from_static(&cx, "declaration") } else { k };
+        self.r.report(&cx, Buffer!::new().push_bytes(&cx, path.join(&cx, "::")).push_static(" is not a ").push_bytes(&cx, what).save(&cx), pos);
+        Option::None
     }
 
     // ---- types
@@ -1614,16 +1829,9 @@ impl Names['k] {
                 } else if single && name.is(&cx, "Never") {
                     self.set(&cx, n.id, NameRef::Builtin.(name));
                 } else {
-                    let builtin = if is_trait { Option::None } else { self.builtin_type(&cx, path) };
-                    match builtin {
-                        Option::Some(b) => self.set(&cx, n.id, NameRef::Builtin.(b)),
-                        Option::None => {
-                            let d = self.decl(&cx, path, if is_trait { "trait" } else { "" }, no_pos());
-                            self.set(&cx, n.id, NameRef::Decl.(d));
-                            if !is_trait && !d.kind.is(&cx, "struct") && !d.kind.is(&cx, "enum") && !d.kind.is(&cx, "tuple") {
-                                self.r.fail(&cx, Buffer!::new().push_bytes(&cx, path.join(&cx, "::")).push_static(" is not a type").save(&cx), no_pos());
-                            }
-                        },
+                    match self.seek(&cx, path, n.pos) {
+                        Option::Some(target) => self.named_type(&cx, n, target, is_trait),
+                        Option::None => (),
                     }
                 }
                 self.types(&cx, n.args, types);
@@ -1674,16 +1882,28 @@ impl Names['k] {
         }
     }
 
-    // The builtin `path` names, if it names one; stops when that is not a type.
-    fn builtin_type(self, &cx: Domain!['k], path: ArenaVec[Span['k], 'k]) -> Option[Span['k]] {
-        match self.r.need(&cx, self.home.copy(&cx), path, no_pos()) {
-            Target::Builtin(name) => {
-                if !is_builtin_type(&cx, name) {
-                    self.r.fail(&cx, Buffer!::new().push_bytes(&cx, path.join(&cx, "::")).push_static(" is not a type").save(&cx), no_pos());
+    // The type, or with `is_trait` the trait, `n` writes: `target`, what its path names, unless that is
+    // not one, which is reported.
+    fn named_type(self, &cx: Domain!['k], n: S::TName['k], target: Target['k], is_trait: bool) {
+        let not_a_type = Buffer!::new().push_bytes(&cx, n.path.join(&cx, "::")).push_static(" is not a type").save(&cx);
+        match target {
+            Target::Builtin(name) => if !is_trait {
+                if is_builtin_type(&cx, name) {
+                    self.set(&cx, n.id, NameRef::Builtin.(name));
+                } else {
+                    self.r.report(&cx, not_a_type, n.pos);
                 }
-                Option::Some.(name)
+                return;
             },
-            _ => Option::None,
+            _ => (),
+        }
+        match self.decl_of(&cx, n.path, target, if is_trait { "trait" } else { "" }, n.pos) {
+            Option::Some(d) => if is_trait || d.kind.is(&cx, "struct") || d.kind.is(&cx, "enum") || d.kind.is(&cx, "tuple") {
+                self.set(&cx, n.id, NameRef::Decl.(d));
+            } else {
+                self.r.report(&cx, not_a_type, n.pos);
+            },
+            Option::None => (),
         }
     }
 
@@ -1695,7 +1915,10 @@ impl Names['k] {
             Expr::Block(b) => self.block(&cx, b, types, values),
             Expr::StructLit(s) => {
                 let names = s.path.names(&cx);
-                self.set(&cx, s.path.id, NameRef::Decl.(self.decl(&cx, names, "struct", s.pos)));
+                match self.decl(&cx, names, "struct", s.pos) {
+                    Option::Some(d) => self.set(&cx, s.path.id, NameRef::Decl.(d)),
+                    Option::None => (),
+                }
                 self.segment_args(&cx, s.path, types);
                 var i = 0usize;
                 while i < s.fields.len(&cx) {
@@ -1709,7 +1932,7 @@ impl Names['k] {
                 while i < s.fields.len(&cx) {
                     let f = s.fields.at(&cx, i);
                     if f.value.is_none() && !values.contains(&cx, f.name) {
-                        self.r.fail(&cx, Buffer!::new().push_static("unknown local ").push_bytes(&cx, f.name).save(&cx), s.pos);
+                        self.r.report(&cx, Buffer!::new().push_static("unknown local ").push_bytes(&cx, f.name).save(&cx), s.pos);
                     }
                     i = i + 1usize;
                 }
@@ -1867,28 +2090,34 @@ impl Names['k] {
         } else if names.len(&cx) == 2usize && is_prim(&cx, first) {
             let found = self.r.attached.get_or(&cx, (Owner::Prim.(first), names.at(&cx, 1usize)), ArenaVec::new(&cx));
             if found.is_empty(&cx) {
-                self.r.fail(&cx, Buffer!::new().push_static("unknown ").push_bytes(&cx, first).push_static("::").push_bytes(&cx, names.at(&cx, 1usize)).save(&cx), p.pos);
+                self.r.report(&cx, Buffer!::new().push_static("unknown ").push_bytes(&cx, first).push_static("::").push_bytes(&cx, names.at(&cx, 1usize)).save(&cx), p.pos);
+            } else {
+                self.set(&cx, p.id, NameRef::Decl.(found.at(&cx, 0usize)));
             }
-            self.set(&cx, p.id, NameRef::Decl.(found.at(&cx, 0usize)));
         } else if names.len(&cx) == 2usize && types.contains(&cx, first) {
             // a member of a type parameter, found by inference
             self.set(&cx, p.id, NameRef::Assoc.(first, names.at(&cx, 1usize)));
         } else {
-            let r = match self.r.need(&cx, self.home.copy(&cx), names, p.pos) {
-                Target::Module(m) => self.r.fail(&cx, Buffer!::new().push_bytes(&cx, names.join(&cx, "::")).push_static(" is a module, not a value").save(&cx), p.pos),
-                Target::Decl(d) => NameRef::Decl.(d),
-                Target::Variant(d, v) => NameRef::Variant.(d, v),
-                Target::TraitMethod(d, m) => NameRef::TraitMethod.(d, m),
-                Target::Builtin(name) => NameRef::Builtin.(name),
-            };
-            self.set(&cx, p.id, r);
+            match self.seek(&cx, names, p.pos) {
+                Option::Some(target) => match target {
+                    Target::Module(m) => self.r.report(&cx, Buffer!::new().push_bytes(&cx, names.join(&cx, "::")).push_static(" is a module, not a value").save(&cx), p.pos),
+                    Target::Decl(d) => self.set(&cx, p.id, NameRef::Decl.(d)),
+                    Target::Variant(d, v) => self.set(&cx, p.id, NameRef::Variant.(d, v)),
+                    Target::TraitMethod(d, m) => self.set(&cx, p.id, NameRef::TraitMethod.(d, m)),
+                    Target::Builtin(name) => self.set(&cx, p.id, NameRef::Builtin.(name)),
+                },
+                Option::None => (),
+            }
         }
     }
 
     fn variant(self, &cx: Domain!['k], path: S::Path['k]) {
-        match self.r.need(&cx, self.home.copy(&cx), path.names(&cx), path.pos) {
-            Target::Variant(d, v) => self.set(&cx, path.id, NameRef::Variant.(d, v)),
-            _ => self.r.fail(&cx, Buffer!::new().push_bytes(&cx, path.names(&cx).join(&cx, "::")).push_static(" is not an enum variant").save(&cx), path.pos),
+        match self.seek(&cx, path.names(&cx), path.pos) {
+            Option::Some(target) => match target {
+                Target::Variant(d, v) => self.set(&cx, path.id, NameRef::Variant.(d, v)),
+                _ => self.r.report(&cx, Buffer!::new().push_bytes(&cx, path.names(&cx).join(&cx, "::")).push_static(" is not an enum variant").save(&cx), path.pos),
+            },
+            Option::None => (),
         }
     }
 }
@@ -1988,16 +2217,20 @@ fn resolve(&cx: Domain!['k], path: Span['k]) -> Resolver['k] {
         let unit = match package.entry.copy(&cx) {
             Option::Some(entry) => {
                 if !entry.is_empty(&cx) {
-                    let target = resolver.need(&cx, ModuleId::root(&cx, package.id), entry, no_pos());
-                    let unit = match target {
-                        Target::Decl(d) => {
-                            if !d.kind.is(&cx, "fn") || d.home.package != package.id {
-                                fail(&cx, Span::from_static(&cx, "an executable's entry must be a function of its own package"));
-                            }
-                            package.entry_decl.set(&cx, Option::Some.(d));
+                    resolver.locate_manifest(&cx, package.manifest);
+                    let not_entry = Span::from_static(&cx, "an executable's entry must be a function of its own package");
+                    match resolver.lookup(&cx, ModuleId::root(&cx, package.id), entry, no_pos()) {
+                        Result::Ok(target) => match target {
+                            Target::Decl(d) => if !d.kind.is(&cx, "fn") || d.home.package != package.id {
+                                resolver.report(&cx, not_entry, no_pos());
+                            } else {
+                                package.entry_decl.set(&cx, Option::Some.(d));
+                            },
+                            _ => resolver.report(&cx, not_entry, no_pos()),
                         },
-                        _ => fail(&cx, Span::from_static(&cx, "an executable's entry must be a function of its own package")),
-                    };
+                        Result::Err(e) => resolver.report(&cx, e.message, e.pos),
+                    }
+                    resolver.unlocate(&cx);
                 }
             },
             Option::None => (),

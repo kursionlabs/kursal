@@ -197,5 +197,44 @@ class NameTests(unittest.TestCase):
             resolve(app("use lib::shapes::make;\nfn f() -> u32 { make.{ x: 1u32 } }\n"))
 
 
+def error_of(path):
+    try:
+        resolve(path)
+    except ResolveError as error:
+        return str(error)
+    raise AssertionError("resolution succeeded")
+
+
+class DiagnosticTests(unittest.TestCase):
+    def test_an_impl_target_error_names_its_file(self):
+        # An `impl` of a linear type spelled without its `!`, in a module other than lib.kur: the error
+        # used to carry no file. Its methods still reach the type, so their uses report nothing more.
+        path = app("use package::a;\n", {"app/a.kur": "struct L! { x: u32 }\nimpl L { fn get(self) -> u32 { 0 } }\n"
+                                                      "fn f(l: L!) -> u32 { L!::get(l) }\n"})
+        self.assertEqual(error_of(path), f"{path / 'a.kur'}:2:6: unknown name L; the linear type is L!")
+
+    def test_errors_are_reported_together_in_source_order(self):
+        path = app("use package::a;\nfn f(x: Nothing) -> u32 { nothing() }\n",
+                   {"app/a.kur": "struct L! { x: u32 }\nstruct S { l: L, m: Missing }\n"})
+        self.assertEqual(error_of(path).splitlines(), [
+            f"{path / 'a.kur'}:2:15: unknown name L; the linear type is L!",
+            f"{path / 'a.kur'}:2:21: unknown name Missing",
+            f"{path / 'lib.kur'}:2:9: unknown name Nothing",
+            f"{path / 'lib.kur'}:2:27: unknown name nothing",
+        ])
+
+    def test_errors_past_the_limit_are_counted(self):
+        lines = error_of(app("".join(f"fn f{i}() -> u32 {{ g{i}() }}\n" for i in range(23)))).splitlines()
+        self.assertEqual((len(lines), lines[-1]), (21, "and 3 more errors"))
+
+    def test_a_hint_names_the_use_that_imports_the_other_spelling(self):
+        path = app("use package::a::X;\nfn f(x: X!) -> u32 { 0 }\nfn g(x: X) -> u32 { 0 }\n", {"app/a.kur": "enum X! { V }\n"})
+        self.assertEqual(error_of(path).splitlines(), [
+            f"{path / 'lib.kur'}:2:9: unknown name X!; the linear type is X!, imported as X at {path / 'lib.kur'}:1:5",
+            f"{path / 'lib.kur'}:3:9: unknown or private member X of a; the linear type is X!, imported as X at "
+            f"{path / 'lib.kur'}:1:5",
+        ])
+
+
 if __name__ == "__main__":
     unittest.main()

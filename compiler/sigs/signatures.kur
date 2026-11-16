@@ -27,7 +27,7 @@ use package::kurs::core::{Exposure, ExposureMode, Kind, Member, ModuleId, Param,
 use package::kurs::core as C;
 use package::types::layout::check_type_expansion;
 use package::types::literals::valid_literal;
-use package::resolve::resolver::{Decl, NameRef, Named, Package, Resolver, Target, named_pos, repr, repr_tuple};
+use package::resolve::resolver::{Decl, NameRef, Named, Package, Resolver, Target, name_pos, named_pos, repr, repr_tuple};
 use package::syntax::ast as S;
 use package::syntax::ast::{Expr, Pos, no_pos};
 use package::types::ops::{Fresh, Types};
@@ -494,7 +494,11 @@ exposed struct Signatures {
     // the ids of the consts being folded
     folding: ArenaSet[u32, 'k],
     implicit: Ref[u32, 'k],
-    copy_checks: ArenaVec[(Type['k], ArenaMap[Span['k], Kind, 'k]), 'k],
+    // Copy checks of type arguments in type declarations, made once every type is known: the type,
+    // the kinds in scope, the declaration and where the argument is written.
+    copy_checks: ArenaVec[(Type['k], ArenaMap[Span['k], Kind, 'k], Decl['k], Pos), 'k],
+    // the type declaration being translated
+    declaring: Ref[Option[Decl['k]], 'k],
     types_ready: Ref[bool, 'k],
     counter: Fresh['k],
 }
@@ -533,6 +537,7 @@ impl Signatures['k] {
             folding: ArenaSet::new(&cx),
             implicit: Ref::new(&cx, 0u32),
             copy_checks: ArenaVec::new(&cx),
+            declaring: Ref::new(&cx, Option::None),
             types_ready: Ref::new(&cx, false),
             counter,
         };
@@ -545,6 +550,7 @@ impl Signatures['k] {
                 let decl = decls.at(&cx, k);
                 if decl.kind.is(&cx, "struct") || decl.kind.is(&cx, "enum") || decl.kind.is(&cx, "tuple") {
                     resolver.locate(&cx, decl.home, named_pos(decl.node));
+                    s.declaring.set(&cx, Option::Some.(decl));
                     let type_decl = s.type_decl(&cx, decl);
                     s.types.insert(&cx, s.name(&cx, decl), type_decl);
                     resolver.unlocate(&cx);
@@ -553,12 +559,28 @@ impl Signatures['k] {
             }
             i = i + 1usize;
         }
-        check_type_expansion(&cx, s.program(&cx), counter);
+        let places: ArenaMap[Span['k], (Span['k], Pos), 'k] = ArenaMap::new(&cx);
+        i = 0usize;
+        while i < scopes.len(&cx) {
+            let decls = scopes.at(&cx, i).decls.values(&cx);
+            var k = 0usize;
+            while k < decls.len(&cx) {
+                let decl = decls.at(&cx, k);
+                if decl.kind.is(&cx, "struct") || decl.kind.is(&cx, "enum") || decl.kind.is(&cx, "tuple") {
+                    places.insert(&cx, s.name(&cx, decl), (resolver.file(&cx, decl.home), name_pos(decl.node)));
+                }
+                k = k + 1usize;
+            }
+            i = i + 1usize;
+        }
+        check_type_expansion(&cx, s.program(&cx), counter, places);
         s.types_ready.set(&cx, true);
         i = 0usize;
         while i < s.copy_checks.len(&cx) {
-            let (ty, kinds) = s.copy_checks.at(&cx, i);
-            let unit = s.got(&cx, s.require_copy(&cx, ty, kinds));
+            let (ty, kinds, declaring, pos) = s.copy_checks.at(&cx, i);
+            resolver.locate(&cx, declaring.home, named_pos(declaring.node));
+            let unit = s.got(&cx, s.require_copy(&cx, ty, kinds, pos));
+            resolver.unlocate(&cx);
             i = i + 1usize;
         }
         s.copy_checks.clear(&cx);
@@ -696,7 +718,7 @@ impl Signatures['k] {
         while i < f.premises.len(&cx) {
             let premise = f.premises.at(&cx, i);
             if !is_copy_trait(&cx, premise.trait_path) {
-                premises.push(&cx, self.premise(&cx, premise.args, inner));
+                premises.push(&cx, self.premise(&cx, premise.args, inner, premise.pos));
             }
             i = i + 1usize;
         }
@@ -741,7 +763,8 @@ impl Signatures['k] {
         Result::Ok.(names)
     }
 
-    fn premise(self, &cx: Domain!['k], args: S::TypeArgs['k], scope: Scope['k]) -> Premise['k] {
+    // The premise whose trait's path, written at `pos`, has the arguments `args`.
+    fn premise(self, &cx: Domain!['k], args: S::TypeArgs['k], scope: Scope['k], pos: Pos) -> Premise['k] {
         let r = match self.r.refs.get(&cx, args.id) {
             Option::Some(r) => r,
             Option::None => fail(&cx, Span::from_static(&cx, "internal error: an unresolved premise")),
@@ -758,18 +781,19 @@ impl Signatures['k] {
             NameRef::Decl(d) => d,
             _ => fail(&cx, Span::from_static(&cx, "internal error: a premise that names no trait")),
         };
-        let unit = self.got(&cx, self.check_arguments(&cx, decl, actual, scope));
+        let unit = self.got(&cx, self.check_arguments(&cx, decl, actual, scope, pos));
         Premise.{ trait_name: self.name(&cx, decl), args: actual }
     }
 
-    fn check_arguments(self, &cx: Domain!['k], decl: Decl['k], args: ArenaVec[Type['k], 'k], scope: Scope['k]) -> Result[bool, SigError['k]] {
+    // The type arguments `args` of `decl`, written at `pos`.
+    fn check_arguments(self, &cx: Domain!['k], decl: Decl['k], args: ArenaVec[Type['k], 'k], scope: Scope['k], pos: Pos) -> Result[bool, SigError['k]] {
         let header = named_quantifier(decl.node);
         let params = match header {
             Option::Some(f) => all_params(&cx, f),
             Option::None => if decl.kind.is(&cx, "trait") { ArenaVec::one(&cx, Span::from_static(&cx, "Self")) } else { ArenaVec::new(&cx) },
         };
         if args.len(&cx) != params.len(&cx) {
-            return sig_error(Buffer!::new().push_bytes(&cx, decl.name).push_static(" takes ").push_usize(params.len(&cx)).push_static(" type arguments, got ").push_usize(args.len(&cx)).save(&cx), no_pos());
+            return sig_error(Buffer!::new().push_bytes(&cx, decl.name).push_static(" takes ").push_usize(params.len(&cx)).push_static(" type arguments, got ").push_usize(args.len(&cx)).save(&cx), pos);
         }
         let copied = match self.copy_names(&cx, header) {
             Result::Ok(c) => c,
@@ -781,21 +805,24 @@ impl Signatures['k] {
             let arg = args.at(&cx, i);
             if param.starts_with(&cx, Span::from_static(&cx, "'")) != is_skolem(arg) {
                 return sig_error(Buffer!::new().push_static("argument for ").push_bytes(&cx, param).push_static(" of ").push_bytes(&cx, decl.name)
-                    .push_static(" has the wrong kind (brand versus type)").save(&cx), no_pos());
+                    .push_static(" has the wrong kind (brand versus type)").save(&cx), pos);
             }
             if copied.contains(&cx, param) {
-                let unit = self.require_copy(&cx, arg, scope.kinds)?;
+                let unit = self.require_copy(&cx, arg, scope.kinds, pos)?;
             }
             i = i + 1usize;
         }
         Result::Ok.(true)
     }
 
-    fn require_copy(self, &cx: Domain!['k], ty: Type['k], kinds: ArenaMap[Span['k], Kind, 'k]) -> Result[bool, SigError['k]] {
+    fn require_copy(self, &cx: Domain!['k], ty: Type['k], kinds: ArenaMap[Span['k], Kind, 'k], pos: Pos) -> Result[bool, SigError['k]] {
         if !self.types_ready.copy(&cx) {
-            self.copy_checks.push(&cx, (ty, kinds.clone(&cx)));
+            match self.declaring.copy(&cx) {
+                Option::Some(d) => self.copy_checks.push(&cx, (ty, kinds.clone(&cx), d, pos)),
+                Option::None => fail(&cx, Span::from_static(&cx, "internal error: a Copy check outside a type declaration")),
+            }
         } else if !Types::new(&cx, self.program(&cx), self.counter).is_copy(&cx, ty, kinds) {
-            return sig_error_static(&cx, "type argument must satisfy Copy");
+            return sig_error(Span::from_static(&cx, "type argument must satisfy Copy"), pos);
         }
         Result::Ok.(true)
     }
@@ -828,45 +855,45 @@ impl Signatures['k] {
                 let not_a_type = Buffer!::new().push_static("not a type name: ").push_bytes(&cx, repr_tuple(&cx, n.path)).save(&cx);
                 let r = match self.r.refs.get(&cx, n.id) {
                     Option::Some(r) => r,
-                    Option::None => return sig_error(not_a_type, no_pos()),
+                    Option::None => return sig_error(not_a_type, n.pos),
                 };
                 match r {
                     NameRef::Param(name) => if !args.is_empty(&cx) {
-                        sig_error(Buffer!::new().push_static("type parameter ").push_bytes(&cx, name).push_static(" takes no type arguments").save(&cx), no_pos())
+                        sig_error(Buffer!::new().push_static("type parameter ").push_bytes(&cx, name).push_static(" takes no type arguments").save(&cx), n.pos)
                     } else {
                         Result::Ok.(C::named(name, ArenaVec::new(&cx)))
                     },
                     NameRef::Prim(name) => if !args.is_empty(&cx) {
-                        sig_error(Buffer!::new().push_static("primitive ").push_bytes(&cx, name).push_static(" takes no type arguments").save(&cx), no_pos())
+                        sig_error(Buffer!::new().push_static("primitive ").push_bytes(&cx, name).push_static(" takes no type arguments").save(&cx), n.pos)
                     } else {
                         Result::Ok.(Type::Prim.(name))
                     },
                     NameRef::Builtin(name) => if name.is(&cx, "Brand") {
                         if args.len(&cx) != 1usize || !is_skolem(args.at(&cx, 0usize)) {
-                            sig_error_static(&cx, "Brand requires exactly one brand argument")
+                            sig_error(Span::from_static(&cx, "Brand requires exactly one brand argument"), n.pos)
                         } else {
                             Result::Ok.(Type::Brand.(Ref::new(&cx, args.at(&cx, 0usize))))
                         }
                     } else if name.is(&cx, "NonNull") {
                         if args.len(&cx) != 1usize || is_skolem(args.at(&cx, 0usize)) {
-                            sig_error_static(&cx, "NonNull requires exactly one type argument")
+                            sig_error(Span::from_static(&cx, "NonNull requires exactly one type argument"), n.pos)
                         } else {
                             Result::Ok.(C::non_null(&cx, args.at(&cx, 0usize)))
                         }
                     } else if name.is(&cx, "Never") {
                         if !args.is_empty(&cx) {
-                            sig_error_static(&cx, "Never takes no type arguments")
+                            sig_error(Span::from_static(&cx, "Never takes no type arguments"), n.pos)
                         } else {
                             Result::Ok.(Type::Never)
                         }
                     } else {
-                        sig_error(not_a_type, no_pos())
+                        sig_error(not_a_type, n.pos)
                     },
                     NameRef::Decl(decl) => {
-                        let unit = self.check_arguments(&cx, decl, args, scope)?;
+                        let unit = self.check_arguments(&cx, decl, args, scope, n.pos)?;
                         Result::Ok.(C::named(self.name(&cx, decl), args))
                     },
-                    _ => sig_error(not_a_type, no_pos()),
+                    _ => sig_error(not_a_type, n.pos),
                 }
             },
             S::Type::Brand(quoted) => {
@@ -1027,11 +1054,37 @@ impl Signatures['k] {
             }
             i = i + 1usize;
         }
-        if !types.is_copy(&cx, C::named(td.name, args), kinds) {
-            return sig_error(Buffer!::new().push_bytes(&cx, decl.kind).push_static(" ").push_bytes(&cx, decl.name).push_static(" holds a linear type")
-                .push_static(if generic { " whatever its type arguments" } else { "" }).push_static("; declare it ").push_bytes(&cx, decl.name).push_static("!").save(&cx), no_pos());
+        if types.is_copy(&cx, C::named(td.name, args), kinds) {
+            return Result::Ok.(true);
         }
-        Result::Ok.(true)
+        // the first field, variant or element that is linear when every type argument is Copy
+        var part = Span::from_static(&cx, "");
+        let (members, label) = match td.body {
+            Type::Struct(fields) => (fields, " in its field "),
+            Type::Enum(variants) => (variants, " in its variant "),
+            _ => (ArenaVec::new(&cx), ""),
+        };
+        i = 0usize;
+        while i < members.len(&cx) && part.is_empty() {
+            if !types.is_copy(&cx, members.at(&cx, i).type, kinds) {
+                part = Buffer!::new().push_static(label).push_bytes(&cx, members.at(&cx, i).name).save(&cx);
+            }
+            i = i + 1usize;
+        }
+        let unit = match td.body {
+            Type::Tuple(elems) => {
+                i = 0usize;
+                while i < elems.len(&cx) && part.is_empty() {
+                    if !types.is_copy(&cx, elems.at(&cx, i), kinds) {
+                        part = Buffer!::new().push_static(" in its element ").push_usize(i).save(&cx);
+                    }
+                    i = i + 1usize;
+                }
+            },
+            _ => (),
+        };
+        sig_error(Buffer!::new().push_bytes(&cx, decl.kind).push_static(" ").push_bytes(&cx, decl.name).push_static(" holds a linear type").push_bytes(&cx, part)
+            .push_static(if generic { " whatever its type arguments" } else { "" }).push_static("; declare it ").push_bytes(&cx, decl.name).push_static("!").save(&cx), name_pos(decl.node))
     }
 
     fn payload(self, &cx: Domain!['k], types: ArenaVec[S::Type['k], 'k], scope: Scope['k]) -> Result[Type['k], SigError['k]] {
@@ -1216,7 +1269,7 @@ impl Signatures['k] {
             Option::None => fail(&cx, Span::from_static(&cx, "internal error: an unresolved instance")),
         };
         let arguments = self.got(&cx, self.types_of(&cx, head.args, scope));
-        let unit = self.got(&cx, self.check_arguments(&cx, trait_decl, arguments, scope));
+        let unit = self.got(&cx, self.check_arguments(&cx, trait_decl, arguments, scope, head.pos));
         let methods: ArenaVec[Sig['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < item.methods.len(&cx) {

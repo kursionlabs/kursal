@@ -462,9 +462,9 @@ class ItemShapeTests(unittest.TestCase):
 
     def test_use_trees(self):
         u = S.parse("use package::shapes::{Point as P, make_point};")[0]
-        path, star, children, alias = u.tree
-        self.assertEqual(path, ("package", "shapes"))
-        self.assertEqual(children[0], (("Point",), False, (), "P"))
+        path, star, children, alias, start = u.tree
+        self.assertEqual((path, start), (("package", "shapes"), (1, 5)))
+        self.assertEqual(children[0], (("Point",), False, (), "P", (1, 23)))
         self.assertTrue(S.parse("use std::io::*;")[0].tree[1])
 
     def test_types(self):

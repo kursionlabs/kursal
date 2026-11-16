@@ -254,10 +254,12 @@ class Parser:
         return S.Forall(tuple(params), tuple(determined), tuple(premises))
 
     def premise(self) -> tuple[S.NamePath, S.TypeArgs]:
+        start = self.pos()
         path = self.path()
         self.expect("[")
         args = self.type_args()
         self.expect("]")
+        args.pos = start
         return (path, args)
 
     def item_body(self) -> S.Item:
@@ -303,6 +305,7 @@ class Parser:
         self.fail()
 
     def use_tree(self) -> S.UseTree:
+        start = self.pos()
         names, star = [self.segment()], False
         children: tuple[S.UseTree, ...] = ()
         alias: Optional[str] = None
@@ -319,7 +322,7 @@ class Parser:
                 self.fail()
         if self.eat("as"):
             alias = self.segment()
-        return (tuple(names), star, children, alias)
+        return (tuple(names), star, children, alias, start)
 
     def path(self) -> S.NamePath:
         names = [self.segment()]
@@ -339,18 +342,23 @@ class Parser:
         if kind not in ("struct", "tuple", "enum"):
             self.fail()
         self.next()
+        name_pos = self.pos()
         name = self.segment()
+        decl: S.Struct | S.TupleDecl | S.EnumDecl
         if kind == "struct":
             self.expect("{")
             fields = self.list_until("}", self.field)
-            return S.Struct(name, tuple(fields), exposed, None, start)
-        if kind == "tuple":
+            decl = S.Struct(name, tuple(fields), exposed, None, start)
+        elif kind == "tuple":
             self.expect("(")
             elems = self.list_until(")", self.type)
             self.expect(";")
-            return S.TupleDecl(name, tuple(elems), exposed, None, start)
-        self.expect("{")
-        return S.EnumDecl(name, tuple(self.list_until("}", self.variant)), exposed, None, start)
+            decl = S.TupleDecl(name, tuple(elems), exposed, None, start)
+        else:
+            self.expect("{")
+            decl = S.EnumDecl(name, tuple(self.list_until("}", self.variant)), exposed, None, start)
+        decl.name_pos = name_pos
+        return decl
 
     def field(self) -> tuple[str, S.Type]:
         name = self.name()
@@ -529,12 +537,15 @@ class Parser:
         return (False, self.ptype())
 
     def named_type(self) -> S.TName:
+        start = self.pos()
         path = self.path()
         args = S.TypeArgs((), 0)
         if self.eat("["):
             args = self.type_args()
             self.expect("]")
-        return S.TName(path, args.args, args.determined)
+        named = S.TName(path, args.args, args.determined)
+        named.pos = start
+        return named
 
     def type_arg(self) -> S.Type:
         if self.k == "BRAND":

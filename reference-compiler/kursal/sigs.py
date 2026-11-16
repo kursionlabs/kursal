@@ -42,6 +42,12 @@ class SigError(KursError):
     pass
 
 
+def name_pos(decl: Decl) -> Optional[Position]:
+    """Where a type declaration writes its name."""
+    assert isinstance(decl.node, (S.Struct, S.EnumDecl, S.TupleDecl))
+    return decl.node.name_pos
+
+
 def fail(message: str, pos: Optional[Position] = None) -> Never:
     raise SigError(message, pos)
 
@@ -114,17 +120,25 @@ class Signatures:
         self.consts: dict[Decl, ConstValue] = {}
         self.folding: set[Decl] = set()
         self.implicit = 0
-        self.copy_checks: list[tuple[C.Type, dict[str, C.Kind]]] = []
+        # Copy checks of type arguments in type declarations, made once every type is known: the type, the kinds
+        # in scope, the declaration and where the argument is written.
+        self.copy_checks: list[tuple[C.Type, dict[str, C.Kind], Decl, Optional[Position]]] = []
+        self.declaring: Optional[Decl] = None
         self.types_ready = False
         for scope in resolver.scopes.values():
             for decl in scope.decls.values():
                 if decl.kind in ("struct", "enum", "tuple"):
                     with resolver.located(decl.module, decl.node.pos):
+                        self.declaring = decl
                         self.types[self.name(decl)] = self.type_decl(decl)
-        check_type_expansion(C.Program(types=self.types))
+        check_type_expansion(C.Program(types=self.types),
+                             {self.name(decl): (str(resolver.file(decl.module)), name_pos(decl))
+                              for scope in resolver.scopes.values() for decl in scope.decls.values()
+                              if decl.kind in ("struct", "enum", "tuple")})
         self.types_ready = True
-        for ty, kinds in self.copy_checks:
-            self.require_copy(ty, kinds)
+        for ty, kinds, declaring, pos in self.copy_checks:
+            with resolver.located(declaring.module, declaring.node.pos):
+                self.require_copy(ty, kinds, pos)
         self.copy_checks.clear()
         types = Types(C.Program(types=self.types))
         for scope in resolver.scopes.values():
@@ -191,58 +205,60 @@ class Signatures:
         ref = args.ref
         assert ref is not None and ref[0] == "decl"
         actual = tuple(self.type(a, scope) for a in args.args)
-        self.check_arguments(ref[1], actual, scope)
+        self.check_arguments(ref[1], actual, scope, args.pos)
         return C.Premise(self.name(ref[1]), actual)
 
-    def check_arguments(self, decl: Decl, args: Sequence[C.Type], scope: Scope) -> None:
+    def check_arguments(self, decl: Decl, args: Sequence[C.Type], scope: Scope, pos: Optional[Position]) -> None:
+        """The type arguments `args` of `decl`, written at `pos`."""
         forall = decl.node.forall
         params = forall.params + forall.determined if forall else (("Self",) if decl.kind == "trait" else ())
         if len(args) != len(params):
-            fail(f"{decl.name} takes {len(params)} type arguments, got {len(args)}")
+            fail(f"{decl.name} takes {len(params)} type arguments, got {len(args)}", pos)
         copied = self.copy_names(forall)
         for param, arg in zip(params, args):
             if param.startswith("'") != isinstance(arg, C.Skolem):
-                fail(f"argument for {param} of {decl.name} has the wrong kind (brand versus type)")
+                fail(f"argument for {param} of {decl.name} has the wrong kind (brand versus type)", pos)
             if param in copied:
-                self.require_copy(arg, scope.kinds)
+                self.require_copy(arg, scope.kinds, pos)
 
-    def require_copy(self, ty: C.Type, kinds: dict[str, C.Kind]) -> None:
+    def require_copy(self, ty: C.Type, kinds: dict[str, C.Kind], pos: Optional[Position]) -> None:
         if not self.types_ready:
-            self.copy_checks.append((ty, dict(kinds)))
+            assert self.declaring is not None
+            self.copy_checks.append((ty, dict(kinds), self.declaring, pos))
         elif not Types(C.Program(types=self.types)).is_copy(ty, kinds):
-            fail("type argument must satisfy Copy")
+            fail("type argument must satisfy Copy", pos)
 
     # ---- types
     def type(self, type_expr: S.Type, scope: Scope) -> C.Type:
         match type_expr:
-            case S.TName(args=targs):
+            case S.TName(args=targs, pos=pos):
                 args = tuple(self.type(a, scope) for a in targs)
                 match type_expr.ref:
                     case ("param", name):
                         if args:
-                            fail(f"type parameter {name} takes no type arguments")
+                            fail(f"type parameter {name} takes no type arguments", pos)
                         return C.Named(name)
                     case ("prim", name):
                         if args:
-                            fail(f"primitive {name} takes no type arguments")
+                            fail(f"primitive {name} takes no type arguments", pos)
                         return C.Prim(name)
                     case ("builtin", "Brand"):
                         if len(args) != 1 or not isinstance(args[0], C.Skolem):
-                            fail("Brand requires exactly one brand argument")
+                            fail("Brand requires exactly one brand argument", pos)
                         return C.Brand(args[0])
                     case ("builtin", "NonNull"):
                         if len(args) != 1 or isinstance(args[0], C.Skolem):
-                            fail("NonNull requires exactly one type argument")
+                            fail("NonNull requires exactly one type argument", pos)
                         return C.NonNull(args[0])
                     case ("builtin", "Never"):
                         if args:
-                            fail("Never takes no type arguments")
+                            fail("Never takes no type arguments", pos)
                         return C.Never()
                     case ("decl", decl):
-                        self.check_arguments(decl, args, scope)
+                        self.check_arguments(decl, args, scope, pos)
                         return C.Named(self.name(decl), args)
                     case _:
-                        fail(f"not a type name: {type_expr.path}")
+                        fail(f"not a type name: {type_expr.path}", pos)
             case S.TBrand(label=label):
                 label = label[1:]
                 if label not in scope.brands and label != "static":
@@ -321,9 +337,23 @@ class Signatures:
         type arguments are."""
         td = self.types[self.name(decl)]
         args = tuple(C.Skolem(p.name) if p.kind == C.BRAND else C.Named(p.name) for p in td.params)
-        if not types.is_copy(C.Named(td.name, args), {p.name: C.COPY for p in td.params if p.kind != C.BRAND}):
-            whatever = " whatever its type arguments" if any(p.kind != C.BRAND for p in td.params) else ""
-            fail(f"{decl.kind} {decl.name} holds a linear type{whatever}; declare it {decl.name}!")
+        kinds = {p.name: C.COPY for p in td.params if p.kind != C.BRAND}
+        if types.is_copy(C.Named(td.name, args), kinds):
+            return
+        parts: Sequence[tuple[str, C.Type]]
+        match td.body:
+            case C.Struct(fields=fields):
+                parts = tuple((f"field {name}", ty) for name, ty in fields)
+            case C.Enum(variants=variants):
+                parts = tuple((f"variant {name}", ty) for name, ty in variants)
+            case C.Tuple(elems=elems):
+                parts = tuple((f"element {k}", ty) for k, ty in enumerate(elems))
+            case _:
+                parts = ()
+        # the first field, variant or element that is linear when every type argument is Copy
+        part = next((f" in its {part}" for part, ty in parts if not types.is_copy(ty, kinds)), "")
+        whatever = " whatever its type arguments" if kinds else ""
+        fail(f"{decl.kind} {decl.name} holds a linear type{part}{whatever}; declare it {decl.name}!", name_pos(decl))
 
     def payload(self, types: Sequence[S.Type], scope: Scope) -> C.Type:
         if not types:
@@ -401,7 +431,7 @@ class Signatures:
         assert ref is not None and ref[0] == "decl"
         trait = ref[1]
         arguments = tuple(self.type(a, scope) for a in head.args)
-        self.check_arguments(trait, arguments, scope)
+        self.check_arguments(trait, arguments, scope, head.pos)
         methods = tuple(self.signature(m, params, premises, scope, name=m.name) for m in item.methods)
         for m in methods:
             m.module = module

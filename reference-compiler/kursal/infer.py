@@ -199,10 +199,11 @@ class Frame:
 
 class Infer:
     def __init__(self, resolver: Resolver, sigs: Signatures) -> None:
-        check_instance_termination((C.Premise(inst.trait, inst.head), inst.premises, inst.pos)
-                                   for inst, _, _ in sigs.instances)
-        check_coherence((C.Premise(inst.trait, inst.head), inst.params, inst.pos)
-                        for inst, _, _ in sigs.instances)
+        files = [str(resolver.file(module)) for _, _, module in sigs.instances]
+        check_instance_termination([(C.Premise(inst.trait, inst.head), inst.premises, inst.pos)
+                                    for inst, _, _ in sigs.instances], files)
+        check_coherence([(C.Premise(inst.trait, inst.head), inst.params, inst.pos)
+                         for inst, _, _ in sigs.instances], files)
         self.r, self.sigs = resolver, sigs
         self.types = Types(C.Program(types=sigs.types, traits=sigs.traits))
         self.decl_of: dict[str, Decl] = {}
