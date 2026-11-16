@@ -5,8 +5,9 @@
  * them. The serialized form that `kurs.py` reads is S-expressions and is not covered.
  */
 
-// A name: `main`, `counter::bump`, `#tmp0`, `counter#1`, `b10`.
-const NAME = /[A-Za-z_#][A-Za-z0-9_#]*(::[A-Za-z_#][A-Za-z0-9_#]*)*/;
+// A name: `main`, `counter::bump`, `#tmp0`, `counter#1`, `b10`, and a linear type's, which ends with `!`:
+// `std::text::Buffer!`, `std::text::Buffer!::new`.
+const NAME = /[A-Za-z_#][A-Za-z0-9_#]*!?(::[A-Za-z_#][A-Za-z0-9_#]*!?)*/;
 
 module.exports = grammar({
   name: 'kurs',

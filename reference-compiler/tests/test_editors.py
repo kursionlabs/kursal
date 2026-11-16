@@ -40,10 +40,12 @@ ACCEPTED = (
     " let s = Map!['k]::new(); let t = [1u32, 2u32, ..]; let u = (1u32,); let v = -x.m(&y)? as u64 * 3; 0u32 }",
     "fn f(c: u8) -> bool { let s = f\"{{x}} = {x + 1u32} {f\"{y}\"}\\n\"; c == b'\\n' || c == b'\\x41' && c != b' ' }",
     "fn f() -> f64 { 1_000.5f64 + 0x_ff as f64 + 0b1010u8 as f64 + 2f32 as f64 }",
+    "use a::{B!, C! as D!}; fn f(x: B!) -> bool { let y = D!::new(); let z = B!.{ x }; a!=b && !c && a != b }",
 )
 
 # Forms of the surface syntax that Kursal does not have: a struct literal without `.`, a place written on
-# a parameter's type, an unnamed place slot, and a `forall` ended by `=>`.
+# a parameter's type, an unnamed place slot, a `forall` ended by `=>`, a `!` apart from its name, and a
+# `!` on a name that is not a type's.
 REJECTED = (
     "fn f() -> Point { Point { x: 1u32 } }",
     "fn f(x: &u32) {}",
@@ -51,6 +53,8 @@ REJECTED = (
     "forall T => fn f(x: T) {}",
     "fn f() { let (x) = g(); }",
     "fn f() -> u32 { match x { _ => 1u32, A => 2u32 } }",
+    "fn f() -> u32 { Foo !::new() }",
+    "fn f!() {}",
 )
 
 READABLE_PACKAGES = ("shapes", "option_result", "skolems", "mint_join", "generic_capabilities", "iter_combinators")

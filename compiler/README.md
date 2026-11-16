@@ -163,10 +163,10 @@ the declared empty paths an edge into it must still check.
 ### Text being built
 
 Text is built in the standard library's linear `Buffer!`, on the heap, threaded by value through
-the chain of pushes: `Buffer::new().push_static("(").push_bytes(&cx, t).push_u64(n)`. A span is
+the chain of pushes: `Buffer!::new().push_static("(").push_bytes(&cx, t).push_u64(n)`. A span is
 read under the domain's capability (`ReadBytes[Domain!['k], Span['k]]`), so `push_bytes(&cx, t)`
-takes it whole. Text that must outlive the builder ends in the arena through `Buffer::save`,
-`Buffer::new().push_static("a").push_bytes(&cx, t).save(&cx)`, which copies the finished bytes into
+takes it whole. Text that must outlive the builder ends in the arena through `Buffer!::save`,
+`Buffer!::new().push_static("a").push_bytes(&cx, t).save(&cx)`, which copies the finished bytes into
 one block of exactly their length and frees the buffer; a builder that is dropped on a path is
 destroyed there (`out.destroy()`), and the leak check under valgrind would see one that is not.
 
@@ -184,12 +184,12 @@ write fails.
 | Python | Kursal |
 |---|---|
 | `str` | `Span['k]` (a byte view; `Span::from_static(&cx, "literal")`, `t.is(&cx, "literal")`, `t.eq(&cx, u)`, `t.cmp(&cx, u)`, `t.len()`, `slice`, `skip`, `find`, `split`, `starts_with`, `byte_or_zero`) |
-| building a `str` | `Buffer::new().push_static("a").push_bytes(&cx, t).push_u64(n).save(&cx)`; in a loop, `var out = Buffer::new();` and `out = out.push_static(", ");` |
+| building a `str` | `Buffer!::new().push_static("a").push_bytes(&cx, t).push_u64(n).save(&cx)`; in a loop, `var out = Buffer!::new();` and `out = out.push_static(", ");` |
 | `list`, `tuple` of values | `ArenaVec[T, 'k]` (`push`, `at`, `get` → `Option`, `set`, `len`, `pop` → `Option`, `clone`, `slice`, `skip`, `append`, `insert`, `remove`, `sort_by`, `contains`, `each`, `any`, `fold`, ...; each takes `&cx`) |
 | `dict` | `ArenaMap[K, V, 'k]` (insertion-ordered like `dict`: `insert`, `get` → `Option`, `at`, `get_or`, `contains`, `remove`, `keys`, `values`, `each`, `any`) |
 | `set` | `ArenaSet[K, 'k]` (insertion-ordered: `insert`, `contains`, `remove`, `keys`, `each`, `any`, `all`) |
 | scopes pushed and popped by a walk | `List[T, 'k]` in a `Ref` (`cons`, `tail`, `first`, `find_map`, `reverse`, `each`) |
-| a worklist or visited set local to a walk | `OwnedVec![T]` (`push`, `pop` → `Popped`, `get`, `len`, `free`), `OwnedMap![K, V]` (`insert`, `get`; `insert_in(&cx, ...)` for keys in the arena; `free`) |
+| a worklist or visited set local to a walk | `OwnedVec![T]` (`push`, `pop` → `Popped!`, `get`, `len`, `free`), `OwnedMap![K, V]` (`insert`, `get`; `insert_in(&cx, ...)` for keys in the arena; `free`) |
 | a mutable attribute | a field holding a `Ref[T, 'k]` (`copy`, `set`), an `ArenaVec` or an `ArenaMap` |
 | a dataclass | an `exposed struct` branded `'k`; a `HashIn[X['k], Domain!['k]]` instance if it is a map key |
 | a union of classes | an `exposed enum` whose variants carry structs |
@@ -339,7 +339,7 @@ Then, while writing the C (`backend::cgen`, `cgen.py`):
   function values: they call its by-value entry (`thunk`), which passes the addresses on. A call
   through a function value or to a foreign function passes every value by value. Up to four words
   the C compiler copies a value in as many moves, and a pointer would cost the callee a load per read
-  and raise the inliner's estimate of it: `examples/lisp`'s `Interp::cons`, taking two four-word
+  and raise the inliner's estimate of it: `examples/lisp`'s `Interp!::cons`, taking two four-word
   values, is not inlined into the interpreter's loop when it takes them by pointer.
 - **Out-results.** A Kursal function whose result is a tuple with elements of more than four words
   (`Backend::outs`, decided in `Backend::request` beside `by_ref`) takes, after its other parameters, a
@@ -709,6 +709,21 @@ These are the places where Kursal differs from what one might expect.
   enum fn extern impl trait instance const forall where as exposed unsafe closure exists foreach of in
   for while if else match let var return pack true false self _`. Fields here are named
   `is_unsafe`, `home`, `quantifier`, `trait_name` and the like instead.
+- **A linear type's name ends with `!`.** `struct Buffer! { ... }` declares the name `Buffer!`, and
+  every reference spells it: `Buffer!`, `Buffer!::new()`, `Buffer!.{ ... }`, `Popped!::Value(x)`,
+  `use std::bytes::buffer::Buffer!;`, `impl Buffer!`, `Option[Buffer!]`; an alias of one ends with
+  `!` too (`use libc::thread::Thread! as RawThread!;`). The lexer reads a name followed at once by
+  `!` as one name, unless the `!` begins `!=`: `a!=b` is `a != b`, `!x` is a negation, a keyword never
+  takes the `!` (`return!x` is `return !x`), and `!` alone is still the type `Never`. A name without
+  its `!` names nothing (`unknown name Buffer; the linear type is Buffer!`), nor does one with a `!`
+  its declaration lacks (`unknown name Point!; Point is not a linear type`), and only a type's name
+  may end with `!` (`only a linear type's name ends with !`). A struct, enum or tuple declaration
+  carries the `!` exactly when it is linear whatever its type arguments: one that holds a linear type
+  must (`struct S holds a linear type; declare it S!`, or `... holds a linear type whatever its type
+  arguments ...` for a generic one), one linear only through its type arguments has none
+  (`Option[T]`; `Option[Buffer!]` shows its linearity through its argument), and one with the `!` is
+  linear even when every field is `Copy` (`Exclusive!['k]`). Type parameters never carry it: `forall
+  T` may stand for a linear type unless a premise says `Copy[T]`.
 - **Builtins are imported.** Only the primitive types, `Never`, `Copy` and `Exposed` are always in
   scope. What else the compiler provides, `core` exports from the module it belongs to, and code
   imports it like any other name (see the reference compiler's README, "Builtins"):
@@ -742,11 +757,11 @@ These are the places where Kursal differs from what one might expect.
   callee's changes to `cx` are the caller's. Fields of a lent struct can be lent in one call
   (`&cx.arena.alloc(&cx.tag, value)`), and a call may lend `cx` again in its arguments
   (`f(&cx, g(&cx, x))`). A function may move a place parameter out if it puts a value back before it
-  returns: `let { tag, arena } = cx; ...; cx = Domain.{ tag, arena };`. A
+  returns: `let { tag, arena } = cx; ...; cx = Domain!.{ tag, arena };`. A
   `match`, `&&` or `if` may lend it in every branch.
 - **Brands.** `forall 'k.` binds a brand like a type parameter, and a type that holds branded storage
   takes it as its last argument (`ArenaVec[Span['k], 'k]`). A brand is minted by a constructor that
-  returns `exists 'k. ...` and is opened by `let exists 'k. cx = Domain::new();`; a trait may take one
+  returns `exists 'k. ...` and is opened by `let exists 'k. cx = Domain!::new();`; a trait may take one
   as a parameter (`forall D, 'k. trait Discharge`, `instance Discharge[Checker['k], 'k]`).
 - **`NonNull[T]`** (`std::ptr::NonNull`) is a builtin type, like `*T` but never null:
   `NonNull::new(p)` checks and returns an `Option`, `unsafe (p as NonNull[T])` asserts it, `n as *T`

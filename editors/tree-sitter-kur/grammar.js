@@ -16,6 +16,12 @@ function commaSep(rule) {
   return optional(commaSep1(rule));
 }
 
+// The `!` that ends a linear type's name: part of the name, so nothing comes between them. After a name,
+// `!=` is the operator, which the lexer prefers as the longer token: `a!=b` is `a != b`.
+function linear() {
+  return optional(field('linear', token.immediate('!')));
+}
+
 // `'a, 'b`: one or more, with no trailing comma.
 function brandList($) {
   return seq(field('brand', $.brand), repeat(seq(',', field('brand', $.brand))));
@@ -93,12 +99,13 @@ module.exports = grammar({
 
     use_tree: $ => seq(
       field('path', $.identifier),
-      repeat(seq('::', field('path', $.identifier))),
+      linear(),
+      repeat(seq('::', field('path', $.identifier), linear())),
       optional(seq('::', choice(
         field('glob', '*'),
         seq('{', commaSep(field('child', $.use_tree)), '}'),
       ))),
-      optional(seq('as', field('alias', $.identifier))),
+      optional(seq('as', field('alias', $.identifier), linear())),
     ),
 
     module_declaration: $ => seq('module', field('path', $.path), ';'),
@@ -112,7 +119,7 @@ module.exports = grammar({
       optional($.exposure),
       'struct',
       field('name', $.identifier),
-      optional(field('linear', '!')),
+      linear(),
       '{',
       commaSep(field('field', $.field_declaration)),
       '}',
@@ -125,7 +132,7 @@ module.exports = grammar({
       optional($.exposure),
       'tuple',
       field('name', $.identifier),
-      optional(field('linear', '!')),
+      linear(),
       '(',
       commaSep(field('element', $._type)),
       ')',
@@ -137,7 +144,7 @@ module.exports = grammar({
       optional($.exposure),
       'enum',
       field('name', $.identifier),
-      optional(field('linear', '!')),
+      linear(),
       '{',
       commaSep(field('variant', $.variant_declaration)),
       '}',
@@ -237,7 +244,7 @@ module.exports = grammar({
 
     named_type: $ => seq(
       field('name', $.path),
-      optional(field('linear', '!')),
+      linear(),
       optional(field('arguments', $.type_arguments)),
     ),
 
@@ -571,12 +578,13 @@ module.exports = grammar({
       ']',
     ),
 
-    // `a`, `self`, `Option[u32]::Some`, `Map!['k]::new`: each segment may carry `!` and type arguments.
+    // `a`, `self`, `Option[u32]::Some`, `Map!['k]::new`: each segment may be a linear type's name and carry
+    // type arguments.
     path_expression: $ => prec.right(seq($.path_segment, repeat(seq('::', $.path_segment)))),
 
     path_segment: $ => prec.right(seq(
       field('name', choice($.identifier, $.self)),
-      optional(field('linear', '!')),
+      linear(),
       optional(field('arguments', $.type_arguments)),
     )),
 

@@ -175,6 +175,8 @@
 (tuple_declaration name: (identifier) @type.linear linear: "!" @type.linear)
 (enum_declaration name: (identifier) @type.linear linear: "!" @type.linear)
 (path_segment name: (identifier) @type.linear linear: "!" @type.linear)
+(use_tree path: (identifier) @type.linear . linear: "!" @type.linear)
+(use_tree alias: (identifier) @type.linear . linear: "!" @type.linear)
 
 ; ----------------------------------------------------------------- places --
 ; The `&` of a place parameter or slot and of a lend reads as one unit with its name.
