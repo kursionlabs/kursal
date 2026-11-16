@@ -8,22 +8,24 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <spawn.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
-/* Length-delimited paths: no truncation at an embedded NUL, no PATH_MAX. */
-static char *path_copy(const uint8_t *bytes, uintptr_t len) {
-    if (len == SIZE_MAX) { errno = EOVERFLOW; return NULL; }
-    if (memchr(bytes, 0, len)) { errno = EINVAL; return NULL; }
-    char *path = malloc(len + 1);
-    if (!path) { errno = ENOMEM; return NULL; }
-    memcpy(path, bytes, len);
-    path[len] = 0;
-    return path;
+extern char **environ;
+
+/* A path or name is `len` bytes followed by a NUL the caller wrote: 0 when
+ * none of the `len` is a NUL, else EINVAL, since C would read the path as
+ * ending there. */
+static int text_ok(const uint8_t *bytes, uintptr_t len) {
+    return memchr(bytes, 0, len) ? EINVAL : 0;
 }
 
 /* Read immediately after a failed operation, before allocation/cleanup. */
@@ -31,56 +33,76 @@ int32_t kur_libc_fs_error(void) { return errno; }
 
 void kur_libc_fs_release(uint8_t *bytes) { free(bytes); }
 
-uint8_t *kur_libc_fs_canonicalize(uint8_t *bytes, uintptr_t len) {
-    char *path = path_copy(bytes, len);
-    if (!path) return NULL;
-    char *resolved = realpath(path, NULL);
-    int saved = errno;
-    free(path);
-    errno = saved;
-    return (uint8_t *)resolved;
+uint8_t *kur_libc_fs_canonicalize(const uint8_t *path, uintptr_t len) {
+    int bad = text_ok(path, len);
+    if (bad) { errno = bad; return NULL; }
+    return (uint8_t *)realpath((const char *)path, NULL);
 }
 
 /* An environment variable's value as an independently owned string, or NULL
- * when it is unset. */
-uint8_t *kur_libc_fs_getenv(uint8_t *bytes, uintptr_t len) {
-    char *name = path_copy(bytes, len);
-    if (!name) return NULL;
-    const char *value = getenv(name);
-    free(name);
+ * when it is unset (or its name holds a NUL or an '='). */
+uint8_t *kur_libc_fs_getenv(const uint8_t *name, uintptr_t len) {
+    if (text_ok(name, len) || memchr(name, '=', len)) return NULL;
+    const char *value = getenv((const char *)name);
     return value ? (uint8_t *)strdup(value) : NULL;
 }
 
-uint8_t *kur_libc_fs_open_directory(uint8_t *bytes, uintptr_t len) {
-    char *path = path_copy(bytes, len);
-    if (!path) return NULL;
-    DIR *directory = opendir(path);
-    int saved = errno;
-    free(path);
-    errno = saved;
-    return (uint8_t *)directory;
+uint8_t *kur_libc_fs_open_directory(const uint8_t *path, uintptr_t len) {
+    int bad = text_ok(path, len);
+    if (bad) { errno = bad; return NULL; }
+    return (uint8_t *)opendir((const char *)path);
 }
 
 /* A fresh descriptor on success; negative errno on failure. */
-int32_t kur_libc_fs_open_read(uint8_t *bytes, uintptr_t len) {
-    char *path = path_copy(bytes, len);
-    if (!path) return -errno;
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    int saved = errno;
-    free(path);
-    return fd < 0 ? -saved : fd;
+int32_t kur_libc_fs_open_read(const uint8_t *path, uintptr_t len) {
+    int bad = text_ok(path, len);
+    if (bad) return -bad;
+    int fd = open((const char *)path, O_RDONLY | O_CLOEXEC);
+    return fd < 0 ? -errno : fd;
 }
 
 /* Creates the file or empties it, for writing: a fresh descriptor on
  * success, negative errno on failure. A new file gets mode 0644, less the
  * umask. */
-int32_t kur_libc_fs_create(uint8_t *bytes, uintptr_t len) {
-    char *path = path_copy(bytes, len);
-    if (!path) return -errno;
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    int saved = errno;
-    free(path);
-    return fd < 0 ? -saved : fd;
+int32_t kur_libc_fs_create(const uint8_t *path, uintptr_t len) {
+    int bad = text_ok(path, len);
+    if (bad) return -bad;
+    int fd = open((const char *)path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    return fd < 0 ? -errno : fd;
+}
+
+/* What `stat(2)` says of a path, following symbolic links: 1 for a regular
+ * file, 2 for a directory, 3 for anything else, with its size in `*size`;
+ * or a negative errno. */
+int32_t kur_libc_fs_stat(const uint8_t *path, uintptr_t len, uint64_t *size) {
+    int bad = text_ok(path, len);
+    if (bad) return -bad;
+    struct stat info;
+    if (stat((const char *)path, &info) != 0) return -errno;
+    *size = info.st_size < 0 ? 0 : (uint64_t)info.st_size;
+    return S_ISREG(info.st_mode) ? 1 : S_ISDIR(info.st_mode) ? 2 : 3;
+}
+
+/* `remove(3)`: unlinks a file, or removes an empty directory. 0 or errno. */
+int32_t kur_libc_fs_remove(const uint8_t *path, uintptr_t len) {
+    int bad = text_ok(path, len);
+    if (bad) return bad;
+    return remove((const char *)path) == 0 ? 0 : errno;
+}
+
+/* `rename(2)`: 0 or errno. */
+int32_t kur_libc_fs_rename(const uint8_t *from, uintptr_t from_len, const uint8_t *to, uintptr_t to_len) {
+    int bad = text_ok(from, from_len);
+    if (!bad) bad = text_ok(to, to_len);
+    if (bad) return bad;
+    return rename((const char *)from, (const char *)to) == 0 ? 0 : errno;
+}
+
+/* `mkdir(2)` with mode 0777, less the umask: 0 or errno. */
+int32_t kur_libc_fs_mkdir(const uint8_t *path, uintptr_t len) {
+    int bad = text_ok(path, len);
+    if (bad) return bad;
+    return mkdir((const char *)path, 0777) == 0 ? 0 : errno;
 }
 
 /* read(2), retried while a signal interrupts it: the count, 0 at EOF, or a
@@ -146,4 +168,47 @@ int32_t kur_libc_fs_entry_is_directory(uint8_t *handle, uint8_t *raw_entry) {
 /* The handle is consumed even if closedir reports an error. */
 int32_t kur_libc_fs_close_directory(uint8_t *handle) {
     return closedir((DIR *)handle) == 0 ? 0 : errno;
+}
+
+/* Runs the program `line` names, found on the PATH, with `count` arguments,
+ * the program's name first: `line` is each argument followed by a NUL,
+ * `len` bytes in all. The child gets this process's environment, and the
+ * call waits for it, again when a signal interrupts the wait. The exit
+ * status (0 to 255) when the child exits, 256 plus the signal's number when
+ * a signal ends it, or a negative errno: what `posix_spawnp` reports
+ * (ENOENT for a program not found, or the errno of the `exec` that failed)
+ * or `waitpid` does. */
+int64_t kur_libc_process_run(const uint8_t *line, uintptr_t len, uintptr_t count) {
+    if (count == 0 || count > SIZE_MAX / sizeof(char *) - 1) return -EINVAL;
+    char **argv = malloc((count + 1) * sizeof(char *));
+    if (!argv) return -ENOMEM;
+    uintptr_t start = 0, n = 0;
+    for (uintptr_t i = 0; i < len; i++) {
+        if (line[i] == 0) {
+            if (n < count) argv[n] = (char *)line + start;
+            n++;
+            start = i + 1;
+        }
+    }
+    /* An argument holding a NUL of its own would split in two. */
+    if (n != count || start != len) { free(argv); return -EINVAL; }
+    argv[count] = NULL;
+    pid_t pid;
+    int spawned = posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ);
+    free(argv);
+    if (spawned != 0) return -(int64_t)spawned;
+    int status;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) return -(int64_t)errno;
+    }
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return 256 + (int64_t)WTERMSIG(status);
+    return -(int64_t)ECHILD;
+}
+
+/* Sleeps for `nanos` nanoseconds, sleeping on for what is left when a
+ * signal interrupts it. */
+void kur_libc_time_sleep(uint64_t nanos) {
+    struct timespec left = { (time_t)(nanos / 1000000000u), (long)(nanos % 1000000000u) };
+    while (nanosleep(&left, &left) != 0 && errno == EINTR) {}
 }

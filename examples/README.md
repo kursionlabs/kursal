@@ -42,7 +42,7 @@ printf 'the cat and the hat\n' | /tmp/wordfreq
 | `election_tally` | a vote tally on `std::collections::hashmap` |
 | `ring` | a fixed-capacity ring buffer over `OwnedVec!` |
 | `dlist`, `graph` | a doubly linked list and a cyclic graph in one capability domain |
-| `host` | the host without `unsafe`: arguments, the environment, files, running programs, a monotonic clock, floats from text and their bits |
+| `host` | the host without `unsafe`: arguments (`fn main(args: Args)`), the environment, files and directories, running programs, a monotonic clock and a sleep, floats from text and their bits |
 | `arena_text` | text and tables in one arena, through a context of the program's own that lends the arena and its capability (`Access`, `Allocate`, `ReadBytes`): `ArenaVec` and its combinators, span search and comparison, keys compared through `HashIn`, text built in a `Buffer!` (with decimal numbers) and saved into the arena, text copied to another arena |
 | `arena_tables` | an `ArenaMap` and an `ArenaSet` in insertion order, with removal and growth, and scopes as a persistent `List`, in one `Domain!` |
 | `blockalloc` | a fixed-size block allocator under a scripted workload |

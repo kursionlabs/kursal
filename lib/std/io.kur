@@ -1,7 +1,8 @@
 // Process I/O over the POSIX `read`/`write`/`open`/`close`/`fstat` calls:
 // byte output to raw descriptors, whole-file and stdin reads into an owned
-// `Buffer!`, the owning descriptor type `File!`, and buffered `Output!`.
-// Readers that need branded spans copy the result into their own arena.
+// `Buffer!`, the owning descriptor type `File!`, and buffered `Output!`;
+// and `Error`, the error of every operating-system call of the library.
+// Paths are any byte view (`c_string`); `std::fs` works with them whole.
 
 use package as std;
 
@@ -24,6 +25,16 @@ extern "C" fn kur_libc_fs_open_read(path: *u8, len: usize) -> i32;
 extern "C" fn kur_libc_fs_create(path: *u8, len: usize) -> i32;
 extern "C" fn kur_libc_fs_close(fd: i32) -> i32;
 extern "C" fn kur_libc_fs_regular_size(fd: i32) -> isize;
+
+// A path, name or argument for C: the bytes of a view, read through the
+// capability that permits it, followed by a NUL, in a buffer the caller
+// frees once the call is made. The functions of `fs.c` that take one also
+// take its length, and fail with EINVAL when the bytes hold a NUL of their
+// own, which C would read as the end.
+forall C, S where ReadBytes[C, S], Copy[S].
+fn c_string(&cx: C, bytes: S) -> Buffer! {
+    Buffer::new().push_bytes(&cx, bytes).push_byte(0u8)
+}
 
 // An I/O error: the `errno` of the system call that failed, or EIO (5)
 // for a failure the system did not report itself (a `write` that made no
@@ -207,15 +218,17 @@ struct File! {
 }
 
 impl File {
-    // Opens the file at `path`, whose bytes are the path without a NUL,
+    // Opens the file at `path`, any byte view read through `cx`,
     // read-only. Safe: the descriptor it wraps is always one this call
     // opened. Fails with the errno of `open(2)`, or EINVAL for a path
-    // holding a NUL. `path` is handed back unchanged.
-    fn open_read(&path: Buffer!) -> Result[File!, Error] {
-        let p = unsafe &path.as_ptr();
-        let n = &path.len();
-        // `p[0..n)` are the bytes `path` holds.
-        let fd = unsafe kur_libc_fs_open_read(p, n);
+    // holding a NUL.
+    forall C, S where ReadBytes[C, S], Copy[S].
+    fn open_read(&cx: C, path: S) -> Result[File!, Error] {
+        var text = c_string(&cx, path);
+        let p = unsafe &text.as_ptr();
+        // `p` holds the path's `len` bytes and a NUL.
+        let fd = unsafe kur_libc_fs_open_read(p, ReadBytes[C, S]::len(&cx, path));
+        text.destroy();
         if fd < 0i32 {
             Result::Err.(Error.{ errno: 0i32 - fd })
         } else {
@@ -225,10 +238,12 @@ impl File {
 
     // Creates the file at `path`, or empties it, and opens it for writing;
     // a new file gets mode 0644 less the umask. Fails as `open_read` does.
-    fn create(&path: Buffer!) -> Result[File!, Error] {
-        let p = unsafe &path.as_ptr();
-        let n = &path.len();
-        let fd = unsafe kur_libc_fs_create(p, n);
+    forall C, S where ReadBytes[C, S], Copy[S].
+    fn create(&cx: C, path: S) -> Result[File!, Error] {
+        var text = c_string(&cx, path);
+        let p = unsafe &text.as_ptr();
+        let fd = unsafe kur_libc_fs_create(p, ReadBytes[C, S]::len(&cx, path));
+        text.destroy();
         if fd < 0i32 {
             Result::Err.(Error.{ errno: 0i32 - fd })
         } else {

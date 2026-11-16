@@ -334,6 +334,13 @@ class Backend:
         payload = [f"{dst}.payload.{self.variant(variant)} = {value};"] if value is not None else []
         return [*payload, f"{dst}.tag = {index};"]
 
+    def arguments_type(self, ty: Type) -> bool:
+        """Whether an entry function may take `ty`, which C's `main` fills from `argv` and `argc`
+        (`std::process::Args`): a struct of exactly a `*(*u8)` and a `usize`, in that order."""
+        shape = self.shape(ty)
+        return isinstance(shape, Struct) and len(shape.fields) == 2 and \
+            equal(shape.fields[0][1], Ptr(Ptr(Prim("u8")))) and equal(shape.fields[1][1], Prim("usize"))
+
     def erased(self, ty: Type) -> bool:
         """`ty` has no C representation: it is zero-size (Never included)."""
         return self.ctype(ty) == "void"
@@ -467,9 +474,9 @@ class Backend:
             fun = self.program.funs.get(entry)
             i32 = Prim("i32")
             if fun is None or fun.params or fun.premises or fun.unsafe or fun.places or not equal(fun.ret, i32) or \
-                    fun.ptypes not in ((), (i32, Ptr(Ptr(Prim("u8"))))):
-                raise KursError(f"backend: the entry {entry} must be a safe, non-generic "
-                                "`fn() -> i32` or `fn(i32, *(*u8)) -> i32` without premises")
+                    not (fun.ptypes == () or len(fun.ptypes) == 1 and self.arguments_type(fun.ptypes[0])):
+                raise KursError(f"backend: the entry {entry} must be a safe, non-generic `fn() -> i32`, or "
+                                "`fn(A) -> i32` with A a struct of a `*(*u8)` and a `usize`, without premises")
             main = self.request(fun, {})
         else:
             # The roots are the functions with nothing left to choose or discharge. One with premises gets code
@@ -496,8 +503,11 @@ class Backend:
             assert main is not None
             fun = self.program.funs[entry]
             if fun.ptypes:
-                out.append(f"int main(int argc, char **argv) {{ return (int){main}((int32_t)argc, "
-                           f"({self.ctype(fun.ptypes[1])})argv); }}")
+                shape = self.shape(fun.ptypes[0])
+                assert isinstance(shape, Struct)
+                (_, argv), (_, count) = shape.fields
+                out.append(f"int main(int argc, char **argv) {{ return (int){main}(({self.ctype(fun.ptypes[0])}){{ "
+                           f"({self.ctype(argv)})argv, ({self.ctype(count)})argc }}); }}")
             else:
                 out.append(f"int main(void) {{ return (int){main}(); }}")
         return "\n".join(out) + "\n"

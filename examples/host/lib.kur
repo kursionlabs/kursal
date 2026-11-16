@@ -1,53 +1,40 @@
-// The host, safely: this program's arguments, the environment, a file
-// written and read back, other programs run and waited for, a monotonic
-// clock, and floats read from text and taken apart into their bits. None
-// of it is `unsafe`.
+// The host, safely: this program's arguments, the environment, files and
+// directories, other programs run and waited for, a monotonic clock and a
+// sleep, and floats read from text and taken apart into their bits. None of
+// it is `unsafe`.
 //
 // Run with the arguments `one two`, it prints them and what each step
 // found, one line each.
 use std::bytes::buffer::Buffer;
+use std::env::variable;
 use std::float::parse_f64;
+use std::fs::{FileKind, metadata, mkdir, path_exists, read, read_dir, remove, rename, write};
 use std::io::{print, print_buffer};
 use std::option::{Option, Result};
-use std::slice::{Slice, StaticRead, byte_or_zero};
-use std::time::Instant;
-use std::io::File;
-use libc::fs::environment_variable;
-use libc::process::{Exit, arguments, run};
+use std::process::{Args, Command, Exit};
+use std::slice::{Slice, StaticRead};
+use std::time::{Duration, Instant, sleep};
 
 // The arguments after the program's own name, which depends on where it
 // was built.
-fn show_arguments() {
-    match arguments() {
-        Result::Ok(line) => {
-            let exists 'b. (tag, bytes, restore) = line.open();
-            var out = Buffer::new().push_static("arguments:");
-            var count = 0usize;
-            var i = 0usize;
-            while i < bytes.len() {
-                let b = byte_or_zero(&tag, bytes, i);
-                if b == 0u8 {
-                    count = count + 1usize;
-                } else if count > 0usize {
-                    if byte_or_zero(&tag, bytes, i - 1usize) == 0u8 {
-                        out = out.push_byte(b' ');
-                    }
-                    out = out.push_byte(b);
-                }
-                i = i + 1usize;
-            }
-            restore.restore(tag).destroy();
-            print_buffer(1i32, out.push_static(" (").push_usize(count).push_static(" with the name)\n"));
-        },
-        Result::Err(code) => {
-            print(1i32, "arguments: unreadable\n");
-        },
+fn show_arguments(args: Args) {
+    var out = Buffer::new().push_static("arguments:");
+    var i = 1usize;
+    while i < args.len() {
+        match args.bytes(i) {
+            Option::Some(arg) => {
+                out = out.push_byte(b' ').push_static(arg);
+            },
+            Option::None => (),
+        }
+        i = i + 1usize;
     }
+    print_buffer(1i32, out.push_static(" (").push_usize(args.len()).push_static(" with the name)\n"));
 }
 
 fn show_environment() {
-    var name = Buffer::new().push_static("EXAMPLE_HOST_GREETING");
-    match environment_variable(&name) {
+    var sr = StaticRead::new();
+    match variable(&sr, "EXAMPLE_HOST_GREETING") {
         Option::Some(value) => {
             print_buffer(1i32, Buffer::new().push_static("greeting: ").push_buffer(value).push_byte(b'\n'));
         },
@@ -55,50 +42,67 @@ fn show_environment() {
             print(1i32, "greeting: unset\n");
         },
     }
-    name.destroy();
 }
 
-// Writes a file in the working directory and reads it back.
-fn show_file() {
-    var path = Buffer::new().push_static("host.txt");
-    let written = match File::create(&path) {
-        Result::Ok(file) => {
-            var file = file;
-            let wrote = &file.write_static("written and read back\n");
-            let closed = file.close();
-            wrote.is_ok() && closed.is_ok()
+// Writes a file in a new directory, reads it back, renames it, lists the
+// directory, and removes both.
+fn show_files() {
+    var sr = StaticRead::new();
+    let made = mkdir(&sr, "host.d").is_ok();
+    let written = write(&sr, "host.d/a.txt", Buffer::new().push_static("written and read back\n")).is_ok();
+    match read(&sr, "host.d/a.txt") {
+        Result::Ok(contents) => {
+            print_buffer(1i32, Buffer::new().push_static("file: ").push_buffer(contents));
         },
-        Result::Err(code) => false,
-    };
-    if written {
-        match File::open_read(&path) {
-            Result::Ok(file) => {
-                var file = file;
-                match &file.read_to_buffer() {
-                    Result::Ok(contents) => {
-                        print_buffer(1i32, Buffer::new().push_static("file: ").push_buffer(contents));
+        Result::Err(e) => {
+            print(1i32, "file: unreadable\n");
+        },
+    }
+    let renamed = rename(&sr, "host.d/a.txt", "host.d/b.txt").is_ok();
+    var out = Buffer::new().push_static("directory:");
+    match read_dir(&sr, "host.d") {
+        Result::Ok(directory) => {
+            var directory = directory;
+            var going = true;
+            while going {
+                match &directory.next() {
+                    Result::Ok(next) => match next {
+                        Option::Some(entry) => {
+                            let { name, is_directory } = entry;
+                            out = out.push_byte(b' ').push_buffer(name);
+                        },
+                        Option::None => {
+                            going = false;
+                        },
                     },
-                    Result::Err(code) => {
-                        print(1i32, "file: unreadable\n");
+                    Result::Err(e) => {
+                        going = false;
                     },
                 }
-                let closed = file.close();
-            },
-            Result::Err(code) => {
-                print(1i32, "file: cannot open\n");
-            },
-        }
-    } else {
-        print(1i32, "file: cannot write\n");
+            }
+            let closed = directory.close();
+        },
+        Result::Err(e) => {
+            out = out.push_static(" unreadable");
+        },
     }
-    path.destroy();
+    let size = match metadata(&sr, "host.d/b.txt") {
+        Result::Ok(m) => match m.kind {
+            FileKind::File => m.size,
+            _ => 0u64,
+        },
+        Result::Err(e) => 0u64,
+    };
+    let removed = remove(&sr, "host.d/b.txt").is_ok() && remove(&sr, "host.d").is_ok();
+    let gone = !path_exists(&sr, "host.d");
+    print_buffer(1i32, out.push_static(", ").push_u64(size).push_static(" bytes, ")
+        .push_static(if made && written && renamed && removed && gone { "made and removed\n" } else { "failed\n" }));
 }
 
-// Runs `line` (each argument followed by a NUL) and prints how it ended.
-fn show_run(line: Buffer!) {
-    var line = line;
+// Runs `command` and prints how it ended.
+fn show_run(command: Command!) {
     var out = Buffer::new().push_static("run: ");
-    match run(&line) {
+    match command.run() {
         Result::Ok(exit) => match exit {
             Exit::Code(code) => {
                 out = out.push_static("exit ").push_usize((code as usize));
@@ -112,14 +116,15 @@ fn show_run(line: Buffer!) {
         },
     }
     print_buffer(1i32, out.push_byte(b'\n'));
-    line.destroy();
 }
 
 fn show_clock() {
     let start = Instant::now();
+    sleep(Duration::from_millis(2u64));
     let later = Instant::now();
-    if start.nanos_until(later) < 60000000000u64 && later.nanos_until(start) == 0u64 {
-        print(1i32, "clock: monotonic\n");
+    let slept = start.duration_until(later).as_nanos() >= 2000000u64;
+    if slept && start.nanos_until(later) < 60000000000u64 && later.nanos_until(start) == 0u64 {
+        print(1i32, "clock: monotonic, slept\n");
     } else {
         print(1i32, "clock: wrong\n");
     }
@@ -146,14 +151,16 @@ fn show_float(text: Slice[u8, 'static]) {
     print_buffer(1i32, out.push_byte(b'\n'));
 }
 
-fn main() -> i32 {
-    show_arguments();
+fn main(args: Args) -> i32 {
+    show_arguments(args);
     show_environment();
-    show_file();
-    show_run(Buffer::new().push_static("true").push_byte(0u8));
-    show_run(Buffer::new().push_static("sh").push_byte(0u8).push_static("-c").push_byte(0u8).push_static("exit 3").push_byte(0u8));
-    show_run(Buffer::new().push_static("kursal-example-no-such-program").push_byte(0u8));
-    show_run(Buffer::new().push_static("true"));
+    show_files();
+    var sr = StaticRead::new();
+    show_run(Command::new(&sr, "true"));
+    show_run(Command::new(&sr, "sh").arg(&sr, "-c").arg(&sr, "exit 3"));
+    show_run(Command::new(&sr, "sh").arg(&sr, "-c").arg(&sr, "kill -9 $$"));
+    show_run(Command::new(&sr, "kursal-example-no-such-program"));
+    show_run(Command::new(&sr, "true").arg(&sr, "a\x00b"));
     show_clock();
     show_float("1");
     show_float("-2.5e3");

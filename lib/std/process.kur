@@ -1,31 +1,33 @@
-// Process arguments: one unsafe adoption of the C main boundary, then
-// bounds-checked access to borrowed, process-lifetime C strings; and the
-// ways to end the process early: `exit`, through the C library, and
-// `trap`, core's builtin (`core::process::trap`), which stops it at once.
+// The process: its arguments, other programs run and waited for, and the
+// ways to end it early: `exit`, through the C library, and `trap`, core's
+// builtin (`core::process::trap`), which stops it at once.
 use package as std;
 
 export core::process::trap;
 
+use alloc::buffer::Buffer;
+use alloc::heap::exit as c_exit;
 use core::cap::static_brand;
 use core::cstr::{CStr, cstr_len};
-use core::slice::Slice;
-use core::option::Option;
+use core::option::{Option, Result};
 use core::raw::raw_get;
-use alloc::heap::exit as c_exit;
+use core::slice::{ReadBytes, Slice};
+use std::io::{Error, c_string};
 
+extern "C" fn kur_libc_process_run(line: *u8, len: usize, count: usize) -> i64;
+
+// The arguments the process was started with, the program's name first, as
+// C's `main` received them. A program's entry function may take one,
+// `fn main(args: Args) -> i32`: the C `main` the compiler writes for it
+// fills it from `argc` and `argv`, whose strings live as long as the
+// process. Nothing else makes one, so every `Args` holds `count` readable
+// entries, each a live NUL-terminated string.
 struct Args {
     argv: *(*u8),
     count: usize,
 }
 
 impl Args {
-    // Caller guarantees the C main contract: argc >= 0, argv points to
-    // argc readable entries, and each entry is a live NUL-terminated
-    // string for the remainder of the process.
-    unsafe fn from_main(argc: i32, argv: *(*u8)) -> Args {
-        Args.{ argv, count: (argc as usize) }
-    }
-
     fn len(self) -> usize {
         let { argv, count } = self;
         count
@@ -33,9 +35,11 @@ impl Args {
 
     fn get(self, index: usize) -> Option[CStr] {
         let { argv, count } = self;
+        // `argv` has `count` entries.
         let raw = unsafe raw_get(argv, count, index);
         match raw {
             Option::None => Option::None,
+            // A live NUL-terminated string for the rest of the process.
             Option::Some(ptr) => Option::Some.(unsafe CStr::from_raw(ptr)),
         }
     }
@@ -47,10 +51,66 @@ impl Args {
             Option::None => Option::None,
             Option::Some(arg) => {
                 let ptr = arg.as_ptr();
-                // `from_main`'s contract: a live NUL-terminated string.
                 Option::Some.(unsafe Slice::from_raw_parts(ptr, unsafe cstr_len(ptr), unsafe static_brand()))
             },
         }
+    }
+}
+
+// How a child process ended: `exit` with a status, or a signal.
+exposed enum Exit {
+    Code(i32),
+    Signal(i32),
+}
+
+// A program to run and its arguments, each any byte view, copied in as it
+// is added: a command line that outlives what it was built from.
+struct Command! {
+    // each argument followed by a NUL, the program first
+    line: Buffer!,
+    count: usize,
+}
+
+impl Command {
+    // A command running `program`, found on the `PATH` as `posix_spawnp`
+    // finds it, with no arguments yet.
+    forall C, S where ReadBytes[C, S], Copy[S].
+    fn new(&cx: C, program: S) -> Command! {
+        Command.{ line: c_string(&cx, program), count: 1usize }
+    }
+
+    forall C, S where ReadBytes[C, S], Copy[S].
+    fn arg(self, &cx: C, argument: S) -> Command! {
+        let { line, count } = self;
+        Command.{ line: line.push_bytes(&cx, argument).push_byte(0u8), count: count + 1usize }
+    }
+
+    // Runs the program with this process's environment and waits for it,
+    // again when a signal interrupts the wait. The error is what
+    // `posix_spawnp` reports, among them the errno of the `exec` that
+    // failed (ENOENT for a program not found), or what `waitpid` does;
+    // EINVAL when the program or an argument holds a NUL.
+    fn run(self) -> Result[Exit, Error] {
+        let { line, count } = self;
+        var line = line;
+        let p = unsafe &line.as_ptr();
+        let n = &line.len();
+        // `p` holds `count` NUL-terminated arguments in `n` bytes.
+        let result = unsafe kur_libc_process_run(p, n, count);
+        line.destroy();
+        if result < 0i64 {
+            Result::Err.(Error.{ errno: (0i64 - result) as i32 })
+        } else if result < 256i64 {
+            Result::Ok.(Exit::Code.(result as i32))
+        } else {
+            Result::Ok.(Exit::Signal.((result - 256i64) as i32))
+        }
+    }
+
+    // Frees a command that is not run.
+    fn destroy(self) {
+        let { line, count } = self;
+        line.destroy();
     }
 }
 

@@ -217,18 +217,192 @@ class StdRuntimeTests(unittest.TestCase):
                 0
             }''', "type argument must satisfy Copy")
 
+    # -------------------------------------------------------------------- fs --
+
+    def test_files_and_directories_by_span(self):
+        # Paths are spans of an arena, read in place; each step's failure has its own status.
+        self.expect('''
+            use std::alloc::arena::Domain;
+            use std::bytes::buffer::Buffer;
+            use std::io::Error;
+            use std::fs::{FileKind, canonicalize, metadata, mkdir, path_exists, read_dir, read_to_arena, remove, rename, write};
+            use std::option::{Option, Result};
+            use std::raw::Span;
+            fn main() -> i32 {
+                let exists 'k. cx = Domain::new();
+                var cx = cx;
+                let dir = Span::from_static(&cx, "d.dir/");
+                let dir = dir.take(5usize);
+                let a = Buffer::new().push_static("d.dir/a").save(&cx);
+                let b = Buffer::new().push_static("d.dir/b").save(&cx);
+                let none = Error.{ errno: 0i32 };
+                var status = 0i32;
+                if mkdir(&cx, dir).is_err() { status = 1; }
+                if mkdir(&cx, dir).err().unwrap_or(none).errno != 17i32 { status = 2; }
+                if write(&cx, a, Buffer::new().push_static("abc")).is_err() { status = 3; }
+                if rename(&cx, a, b).is_err() || path_exists(&cx, a) || !path_exists(&cx, b) { status = 4; }
+                match read_to_arena(&cx, b) {
+                    Result::Ok(text) => if !text.is(&cx, "abc") { status = 5; },
+                    Result::Err(e) => { status = 5; },
+                }
+                match metadata(&cx, b) {
+                    Result::Ok(m) => match m.kind { FileKind::File => if m.size != 3u64 { status = 6; }, _ => { status = 6; } },
+                    Result::Err(e) => { status = 6; },
+                }
+                match metadata(&cx, dir) {
+                    Result::Ok(m) => match m.kind { FileKind::Directory => (), _ => { status = 7; } },
+                    Result::Err(e) => { status = 7; },
+                }
+                match canonicalize(&cx, b) {
+                    Result::Ok(path) => {
+                        let full = path.save(&cx);
+                        if !full.starts_with(&cx, Span::from_static(&cx, "/")) || !full.ends_with(&cx, Span::from_static(&cx, "/d.dir/b")) { status = 8; }
+                    },
+                    Result::Err(e) => { status = 8; },
+                }
+                var names = 0usize;
+                match read_dir(&cx, dir) {
+                    Result::Ok(d) => {
+                        var d = d;
+                        var going = true;
+                        while going {
+                            match &d.next() {
+                                Result::Ok(next) => match next {
+                                    Option::Some(entry) => {
+                                        let { name, is_directory } = entry;
+                                        let n = name.save(&cx);
+                                        if !n.is(&cx, "b") || is_directory { status = 9; }
+                                        names = names + 1usize;
+                                    },
+                                    Option::None => { going = false; },
+                                },
+                                Result::Err(e) => { going = false; status = 9; },
+                            }
+                        }
+                        let closed = d.close();
+                    },
+                    Result::Err(e) => { status = 9; },
+                }
+                if names != 1usize { status = 10; }
+                if remove(&cx, dir).err().unwrap_or(none).errno != 39i32 { status = 11; }
+                if remove(&cx, b).is_err() || remove(&cx, dir).is_err() || path_exists(&cx, dir) { status = 12; }
+                if metadata(&cx, dir).err().unwrap_or(none).errno != 2i32 { status = 13; }
+                let nul = Buffer::new().push_static("a").push_byte(0u8).push_static("b").save(&cx);
+                if mkdir(&cx, nul).err().unwrap_or(none).errno != 22i32 { status = 14; }
+                cx.destroy();
+                status
+            }''')
+
+    # ------------------------------------------------------------------- env --
+
+    def test_environment_variables(self):
+        os.environ["KURSAL_TEST_VARIABLE"] = "set=yes"
+        try:
+            self.expect('''
+                use std::env::variable;
+                use std::io::print_buffer;
+                use std::option::Option;
+                use std::slice::StaticRead;
+                fn main() -> i32 {
+                    var sr = StaticRead::new();
+                    match variable(&sr, "KURSAL_TEST_VARIABLE") {
+                        Option::Some(value) => { print_buffer(1, value); },
+                        Option::None => (),
+                    }
+                    match variable(&sr, "KURSAL_TEST_UNSET_VARIABLE") {
+                        Option::Some(value) => { value.destroy(); 1 },
+                        Option::None => match variable(&sr, "KURSAL=TEST") {
+                            Option::Some(value) => { value.destroy(); 2 },
+                            Option::None => 0,
+                        },
+                    }
+                }''', stdout="set=yes")
+        finally:
+            del os.environ["KURSAL_TEST_VARIABLE"]
+
+    # --------------------------------------------------------------- process --
+
+    def test_args_are_the_entry_parameter(self):
+        self.expect('''
+            use std::bytes::buffer::Buffer;
+            use std::io::print_buffer;
+            use std::option::Option;
+            use std::process::Args;
+            fn main(args: Args) -> i32 {
+                var out = Buffer::new();
+                var i = 1usize;
+                while i < args.len() {
+                    match args.bytes(i) {
+                        Option::Some(arg) => { out = out.push_static(arg).push_static("|"); },
+                        Option::None => (),
+                    }
+                    i = i + 1usize;
+                }
+                print_buffer(1, out);
+                if args.bytes(args.len()).is_none() { args.len() as i32 } else { 99 }
+            }''', status=4, stdout="one|two words||", args=("one", "two words", ""))
+
+    def test_an_entry_taking_other_parameters_is_rejected(self):
+        with tempfile.TemporaryDirectory(prefix="kursal-std-") as base:
+            directory = Path(base)
+            package(directory, "fn main(argc: i32, argv: *(*u8)) -> i32 { 0 }\n", ("std",))
+            resolver, sigs, program = lowered(directory)
+            with self.assertRaisesRegex(KursError, "must be a safe, non-generic"):
+                emit_c(program, check_program(program), sigs.name(resolver.packages[0].entry_decl))
+
+    def test_run_reports_exit_signal_and_spawn_errors(self):
+        self.expect('''
+            use std::bytes::buffer::Buffer;
+            use std::fs::write;
+            use std::io::print_buffer;
+            use std::option::Result;
+            use std::process::{Command, Exit};
+            use std::slice::StaticRead;
+            fn outcome(command: Command!) -> Buffer! {
+                match command.run() {
+                    Result::Ok(exit) => match exit {
+                        Exit::Code(c) => Buffer::new().push_static("code ").push_usize(c as usize),
+                        Exit::Signal(s) => Buffer::new().push_static("signal ").push_usize(s as usize),
+                    },
+                    Result::Err(e) => Buffer::new().push_static("errno ").push_usize(e.errno as usize),
+                }
+            }
+            fn main() -> i32 {
+                var sr = StaticRead::new();
+                let made = write(&sr, "not-executable", Buffer::new().push_static("#!/bin/sh"));
+                print_buffer(1, outcome(Command::new(&sr, "sh").arg(&sr, "-c").arg(&sr, "exit 7")).push_static(","));
+                print_buffer(1, outcome(Command::new(&sr, "sh").arg(&sr, "-c").arg(&sr, "kill -15 $$")).push_static(","));
+                print_buffer(1, outcome(Command::new(&sr, "no-such-program-for-kursal")).push_static(","));
+                print_buffer(1, outcome(Command::new(&sr, "./not-executable")).push_static(","));
+                print_buffer(1, outcome(Command::new(&sr, "true").arg(&sr, "a\\x00b")));
+                Command::new(&sr, "never").arg(&sr, "run").destroy();
+                0
+            }''', stdout="code 7,signal 15,errno 2,errno 13,errno 22")
+
+    # ------------------------------------------------------------------ time --
+
+    def test_sleep_waits_for_its_duration(self):
+        self.expect('''
+            use std::time::{Duration, Instant, sleep};
+            fn main() -> i32 {
+                let start = Instant::now();
+                sleep(Duration::from_millis(20u64));
+                let slept = start.duration_until(Instant::now());
+                let d = Duration::from_secs(18446744073709551615u64);
+                if slept.as_millis() >= 20u64 && Duration::from_nanos(1500000000u64).as_secs() == 1u64
+                    && d.as_nanos() == 18446744073709551615u64 { 0 } else { 1 }
+            }''')
+
     # -------------------------------------------------------------------- io --
 
     def test_reading_a_directory_is_an_error(self):
         self.expect('''
-            use std::bytes::buffer::Buffer;
             use std::option::Result;
             use std::io::File;
+            use std::slice::StaticRead;
             fn main() -> i32 {
-                var path = Buffer::new().push_static(".");
-                let opened = File::open_read(&path);
-                path.destroy();
-                match opened {
+                var sr = StaticRead::new();
+                match File::open_read(&sr, ".") {
                     Result::Err(code) => 1,
                     Result::Ok(file) => {
                         var file = file;
@@ -244,14 +418,12 @@ class StdRuntimeTests(unittest.TestCase):
 
     def test_a_failed_write_is_an_error(self):
         self.expect('''
-            use std::bytes::buffer::Buffer;
             use std::option::Result;
             use std::io::File;
+            use std::slice::StaticRead;
             fn main() -> i32 {
-                var path = Buffer::new().push_static("/dev/full");
-                let created = File::create(&path);
-                path.destroy();
-                match created {
+                var sr = StaticRead::new();
+                match File::create(&sr, "/dev/full") {
                     Result::Err(code) => 1,
                     Result::Ok(file) => {
                         var file = file;

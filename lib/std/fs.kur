@@ -1,0 +1,252 @@
+// The file system by path: whole files read and written, what a path names,
+// directories listed, made and removed, and files renamed. A path is any
+// byte view, read through the capability that permits it (a `Span` under
+// its domain, a static literal under `StaticRead`, a `Buffer!`'s bytes
+// once opened), and copied with a NUL into a buffer freed when the call
+// returns (`std::io::c_string`); a path holding a NUL is EINVAL. Every
+// failure is a `std::io::Error` holding the errno. Nothing here prevents
+// another process from changing the file system between two calls.
+
+use package as std;
+
+use alloc::arena::Allocate;
+use alloc::buffer::Buffer;
+use core::cstr::cstr_len;
+use core::mem::alloca;
+use core::option::{Option, Result};
+use core::raw::{Span, raw_byte_at};
+use core::slice::ReadBytes;
+use std::io::{Error, File, c_string};
+
+extern "C" fn kur_libc_fs_error() -> i32;
+extern "C" fn kur_libc_fs_release(bytes: *u8) -> ();
+extern "C" fn kur_libc_fs_canonicalize(path: *u8, len: usize) -> *u8;
+extern "C" fn kur_libc_fs_stat(path: *u8, len: usize, size: *u64) -> i32;
+extern "C" fn kur_libc_fs_remove(path: *u8, len: usize) -> i32;
+extern "C" fn kur_libc_fs_rename(from: *u8, from_len: usize, to: *u8, to_len: usize) -> i32;
+extern "C" fn kur_libc_fs_mkdir(path: *u8, len: usize) -> i32;
+extern "C" fn kur_libc_fs_open_directory(path: *u8, len: usize) -> *u8;
+extern "C" fn kur_libc_fs_next_entry(handle: *u8) -> *u8;
+extern "C" fn kur_libc_fs_entry_name(entry: *u8) -> *u8;
+extern "C" fn kur_libc_fs_entry_is_directory(handle: *u8, entry: *u8) -> i32;
+extern "C" fn kur_libc_fs_close_directory(handle: *u8) -> i32;
+
+// The error of a `fs.c` call that returns 0 or an errno.
+fn status(code: i32) -> Result[(), Error] {
+    if code == 0i32 {
+        Result::Ok.(())
+    } else {
+        Result::Err.(Error.{ errno: code })
+    }
+}
+
+// The whole of the regular file at `path`, read to its end
+// (`File::read_to_buffer`): a directory is EISDIR.
+forall C, S where ReadBytes[C, S], Copy[S].
+fn read(&cx: C, path: S) -> Result[Buffer!, Error] {
+    match File::open_read(&cx, path) {
+        Result::Err(e) => Result::Err.(e),
+        Result::Ok(file) => {
+            var file = file;
+            let contents = &file.read_to_buffer();
+            let closed = file.close();
+            contents
+        },
+    }
+}
+
+// `read`'s bytes in the arena of `cx`, as a span of it.
+forall 'k, C, S, R where ReadBytes[C, S], Copy[S], Allocate[C -> 'k, R].
+fn read_to_arena(&cx: C, path: S) -> Result[Span['k], Error] {
+    match read(&cx, path) {
+        Result::Err(e) => Result::Err.(e),
+        Result::Ok(contents) => Result::Ok.(contents.save(&cx)),
+    }
+}
+
+// Writes `contents` to the file at `path`, created or emptied first, and
+// frees it. A failure to write, or to close, is the error.
+forall C, S where ReadBytes[C, S], Copy[S].
+fn write(&cx: C, path: S, contents: Buffer!) -> Result[(), Error] {
+    match File::create(&cx, path) {
+        Result::Err(e) => {
+            contents.destroy();
+            Result::Err.(e)
+        },
+        Result::Ok(file) => {
+            var file = file;
+            let written = &file.write_buffer(contents);
+            let closed = file.close();
+            match written {
+                Result::Err(e) => Result::Err.(e),
+                Result::Ok(nothing) => closed,
+            }
+        },
+    }
+}
+
+exposed enum FileKind {
+    File,
+    Directory,
+    // a device, a pipe, a socket
+    Other,
+}
+
+// What `stat(2)` says of a path: the kind of what it names, after
+// following symbolic links, and its size in bytes.
+exposed struct Metadata {
+    kind: FileKind,
+    size: u64,
+}
+
+forall C, S where ReadBytes[C, S], Copy[S].
+fn metadata(&cx: C, path: S) -> Result[Metadata, Error] {
+    var text = c_string(&cx, path);
+    let p = unsafe &text.as_ptr();
+    let size = unsafe alloca[u64]();
+    unsafe *size = 0u64;
+    // `p` holds the path and a NUL; `size` is a live `u64`.
+    let kind = unsafe kur_libc_fs_stat(p, ReadBytes[C, S]::len(&cx, path), size);
+    text.destroy();
+    if kind < 0i32 {
+        return Result::Err.(Error.{ errno: 0i32 - kind });
+    }
+    let k = if kind == 1i32 { FileKind::File } else if kind == 2i32 { FileKind::Directory } else { FileKind::Other };
+    Result::Ok.(Metadata.{ kind: k, size: unsafe *size })
+}
+
+// Whether `path` names anything, following symbolic links: `metadata`
+// succeeds.
+forall C, S where ReadBytes[C, S], Copy[S].
+fn path_exists(&cx: C, path: S) -> bool {
+    metadata(&cx, path).is_ok()
+}
+
+// The absolute path with no `.`, `..` or symbolic link that `path` names,
+// which must exist (`realpath(3)`).
+forall C, S where ReadBytes[C, S], Copy[S].
+fn canonicalize(&cx: C, path: S) -> Result[Buffer!, Error] {
+    var text = c_string(&cx, path);
+    let p = unsafe &text.as_ptr();
+    let result = unsafe kur_libc_fs_canonicalize(p, ReadBytes[C, S]::len(&cx, path));
+    let error = unsafe kur_libc_fs_error();
+    text.destroy();
+    if unsafe (result as usize) == 0usize {
+        Result::Err.(Error.{ errno: error })
+    } else {
+        // `result` is a NUL-terminated string `realpath` allocated; it is
+        // copied, then released to C's allocator.
+        let len = unsafe cstr_len(result);
+        let output = unsafe Buffer::new().push_n(result, len);
+        let unit = unsafe kur_libc_fs_release(result);
+        Result::Ok.(output)
+    }
+}
+
+// Removes a file, or an empty directory (`remove(3)`).
+forall C, S where ReadBytes[C, S], Copy[S].
+fn remove(&cx: C, path: S) -> Result[(), Error] {
+    var text = c_string(&cx, path);
+    let p = unsafe &text.as_ptr();
+    let code = unsafe kur_libc_fs_remove(p, ReadBytes[C, S]::len(&cx, path));
+    text.destroy();
+    status(code)
+}
+
+// Renames `from` to `to`, replacing what `to` named (`rename(2)`).
+forall C, S where ReadBytes[C, S], Copy[S].
+fn rename(&cx: C, from: S, to: S) -> Result[(), Error] {
+    var a = c_string(&cx, from);
+    var b = c_string(&cx, to);
+    let pa = unsafe &a.as_ptr();
+    let pb = unsafe &b.as_ptr();
+    let code = unsafe kur_libc_fs_rename(pa, ReadBytes[C, S]::len(&cx, from), pb, ReadBytes[C, S]::len(&cx, to));
+    a.destroy();
+    b.destroy();
+    status(code)
+}
+
+// Makes the directory `path`, with mode 0777 less the umask; its parent
+// must exist.
+forall C, S where ReadBytes[C, S], Copy[S].
+fn mkdir(&cx: C, path: S) -> Result[(), Error] {
+    var text = c_string(&cx, path);
+    let p = unsafe &text.as_ptr();
+    let code = unsafe kur_libc_fs_mkdir(p, ReadBytes[C, S]::len(&cx, path));
+    text.destroy();
+    status(code)
+}
+
+// ----------------------------------------------------------- directories --
+
+// An entry of a directory: its name, which owns its bytes, and whether it
+// is a directory. Classification follows symbolic links, uses the entry
+// type the system records where it has one, and counts a failed
+// observation as not a directory, as directory walks do; it is an
+// observation, not access authority.
+exposed struct DirEntry! {
+    name: Buffer!,
+    is_directory: bool,
+}
+
+// An open directory: owns one `DIR *`, which `close` releases. No raw
+// handle is extracted, and no safe code outside makes one.
+struct Directory! {
+    handle: *u8,
+}
+
+forall C, S where ReadBytes[C, S], Copy[S].
+fn read_dir(&cx: C, path: S) -> Result[Directory!, Error] {
+    var text = c_string(&cx, path);
+    let p = unsafe &text.as_ptr();
+    let handle = unsafe kur_libc_fs_open_directory(p, ReadBytes[C, S]::len(&cx, path));
+    let error = unsafe kur_libc_fs_error();
+    text.destroy();
+    if unsafe (handle as usize) == 0usize {
+        Result::Err.(Error.{ errno: error })
+    } else {
+        Result::Ok.(Directory.{ handle })
+    }
+}
+
+// Whether the NUL-terminated `name` is `.` or `..`. Caller: `name` is a
+// live NUL-terminated string.
+unsafe fn is_dot(name: *u8) -> bool {
+    let n = unsafe cstr_len(name);
+    n >= 1usize && n <= 2usize && unsafe raw_byte_at(name, n, 0usize) == b'.' && unsafe raw_byte_at(name, n, n - 1usize) == b'.'
+}
+
+impl Directory {
+    // The next entry other than `.` and `..`, `Ok(None)` at the end, in
+    // the order the system lists them.
+    fn next(&self) -> Result[Option[DirEntry!], Error] {
+        let { handle } = self;
+        while true {
+            let raw = unsafe kur_libc_fs_next_entry(handle);
+            if unsafe (raw as usize) == 0usize {
+                let errno = unsafe kur_libc_fs_error();
+                self = Directory.{ handle };
+                return if errno == 0i32 { Result::Ok.(Option::None) } else { Result::Err.(Error.{ errno }) };
+            }
+            // `raw` is the entry just read, valid until the next read or
+            // close of `handle`, and its name a NUL-terminated string
+            // within it.
+            let name = unsafe kur_libc_fs_entry_name(raw);
+            if !unsafe is_dot(name) {
+                let is_directory = unsafe kur_libc_fs_entry_is_directory(handle, raw) != 0i32;
+                let len = unsafe cstr_len(name);
+                let entry = unsafe Buffer::new().push_n(name, len);
+                self = Directory.{ handle };
+                return Result::Ok.(Option::Some.(DirEntry.{ name: entry, is_directory }));
+            }
+        }
+        self = Directory.{ handle };
+        Result::Ok.(Option::None)
+    }
+
+    // Releases the handle, whatever `closedir` reports.
+    fn close(self) -> Result[(), Error] {
+        let { handle } = self;
+        status(unsafe kur_libc_fs_close_directory(handle))
+    }
+}

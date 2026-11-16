@@ -1038,6 +1038,17 @@ impl Backend['k] {
         }
     }
 
+    // Whether an entry function may take `ty`, which C's `main` fills from `argv` and `argc`
+    // (`std::process::Args`): a struct of exactly a `*(*u8)` and a `usize`, in that order.
+    fn arguments_type(self, &cx: Domain!['k], ty: Type['k]) -> bool {
+        match self.shape(&cx, ty) {
+            Type::Struct(fields) => fields.len(&cx) == 2usize
+                && equal(&cx, fields.at(&cx, 0usize).type, C::ptr(&cx, C::ptr(&cx, C::prim(&cx, "u8"))))
+                && equal(&cx, fields.at(&cx, 1usize).type, C::prim(&cx, "usize")),
+            _ => false,
+        }
+    }
+
     // `ty` has no C representation: it is zero-size (Never included).
     fn erased(self, &cx: Domain!['k], ty: Type['k]) -> bool {
         self.c(&cx, ty).is(&cx, "void")
@@ -1468,19 +1479,17 @@ impl Backend['k] {
         match entry {
             Option::Some(name) => {
                 let i32 = C::prim(&cx, "i32");
-                let argv = C::ptr(&cx, C::ptr(&cx, C::prim(&cx, "u8")));
                 let ok = match self.program.funs.get(&cx, name) {
                     Option::Some(fun) => {
-                        let plain = fun.ptypes.is_empty(&cx) || fun.ptypes.len(&cx) == 2usize && C::same(&cx, fun.ptypes.at(&cx, 0usize), i32)
-                            && C::same(&cx, fun.ptypes.at(&cx, 1usize), argv);
+                        let plain = fun.ptypes.is_empty(&cx) || fun.ptypes.len(&cx) == 1usize && self.arguments_type(&cx, fun.ptypes.at(&cx, 0usize));
                         fun.params.is_empty(&cx) && fun.premises.is_empty(&cx) && !fun.is_unsafe && fun.places(&cx).is_empty(&cx)
                             && equal(&cx, fun.ret, i32) && plain
                     },
                     Option::None => false,
                 };
                 if !ok {
-                    fail_text(&cx, Buffer::new().push_static("backend: the entry ").push_bytes(&cx, name).push_static(" must be a safe, non-generic ")
-                        .push_static("`fn() -> i32` or `fn(i32, *(*u8)) -> i32` without premises").save(&cx));
+                    fail_text(&cx, Buffer::new().push_static("backend: the entry ").push_bytes(&cx, name).push_static(" must be a safe, non-generic `fn() -> i32`, or ")
+                        .push_static("`fn(A) -> i32` with A a struct of a `*(*u8)` and a `usize`, without premises").save(&cx));
                 }
                 main = Option::Some.(self.request(&cx, FunKey::Function.(name), self.program.funs.at(&cx, name), ArenaMap::new(&cx)));
             },
@@ -1561,8 +1570,14 @@ impl Backend['k] {
                     Option::None => Span::from_static(&cx, ""),
                 });
                 if !fun.ptypes.is_empty(&cx) {
-                    c.push_static("int main(int argc, char **argv) { return (int)").push_bytes(&cx, symbol).push_static("((int32_t)argc, ")
-                        .push_static("(").push_bytes(&cx, self.c(&cx, fun.ptypes.at(&cx, 1usize))).push_static(")argv); }\n")
+                    let args = fun.ptypes.at(&cx, 0usize);
+                    let fields = match self.shape(&cx, args) {
+                        Type::Struct(members) => members,
+                        _ => ArenaVec::new(&cx),
+                    };
+                    c.push_static("int main(int argc, char **argv) { return (int)").push_bytes(&cx, symbol).push_static("((")
+                        .push_bytes(&cx, self.c(&cx, args)).push_static("){ (").push_bytes(&cx, self.c(&cx, fields.at(&cx, 0usize).type))
+                        .push_static(")argv, (").push_bytes(&cx, self.c(&cx, fields.at(&cx, 1usize).type)).push_static(")argc }); }\n")
                 } else {
                     c.push_static("int main(void) { return (int)").push_bytes(&cx, symbol).push_static("(); }\n")
                 }

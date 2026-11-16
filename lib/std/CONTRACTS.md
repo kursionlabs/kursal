@@ -127,7 +127,7 @@ yes. A blanket "class B means `unsafe fn`" rule would get them wrong.
 | `core::slice::Slice::into_parts` | Returns the `(ptr, len, marker)` a `Slice` was built from. Rebuilding a `Slice` needs the `unsafe fn from_raw_parts`, so it grants no new authority. |
 | `core::mem::Ref::into_parts` | Returns the `(ptr, marker)` a `Ref` was built from; rebuilding one needs the `unsafe fn Ref::from_raw`, so a stale pointer cannot be re-wrapped under a live brand in safe code. |
 | `core::raw::Span::into_parts` | Returns the `(ptr, len)` a `Span` was built from, never its brand: a span must not hand out a witness for its domain. Reading through the pointer needs `unsafe`, and rebuilding a span needs the `unsafe fn Span::from_raw_parts`. |
-| `core::cstr::CStr::as_ptr` | Returns the unchanged pointer of a `CStr`, which only unsafe adoption or the process-argument wrapper can construct. A raw pointer alone grants no safe dereference or ownership. |
+| `core::cstr::CStr::as_ptr` | Returns the unchanged pointer of a `CStr`, which only unsafe adoption or `std::process::Args::get` can construct. A raw pointer alone grants no safe dereference or ownership. |
 | `core::array::Array::into_parts` | Consumes the restricted, linear `Array!` and returns its storage. The only way back is the `unsafe fn from_parts` (section 2.4). |
 | `core::ptr::NonNull::new` | Checks its argument: a null pointer gives `None`, any other the unsafe cast `p as NonNull[T]`, whose one obligation (not null) the check has just discharged. |
 | `core::ptr::NonNull::as_ptr` | `self as *T`, which the language makes safe: forgetting that a pointer is not null grants nothing. Using the pointer still requires `unsafe`, and turning it back into a `NonNull` goes through `new` or the `unsafe fn new_unchecked`. |
@@ -171,14 +171,15 @@ The library's own externs satisfy it:
 - `std::io`: `fs.c`'s `kur_libc_fs_read`, `_write`, `_open_read`,
   `_create`, `_close` and `_regular_size`, which retry a call a signal
   interrupts and report a failure as a negative errno;
-- `std::time`: `clock_gettime`; `std::float`: `strtod`;
-- `libc::fs`: `fs.c`'s `kur_libc_fs_error`, `_release`, `_canonicalize`,
-  `_getenv`, `_open_directory`, `_next_entry`, `_entry_name`,
-  `_entry_is_directory` and `_close_directory`;
-- `libc::process`: `kur_libc_fs_error`, `fork`, `execvp`, `waitpid` and
-  `_exit` (`-> !`). The child of `fork` runs only `execvp` and `_exit`:
-  no library frame of the child resumes, and the parent's frames are not
-  re-entered;
+- `std::fs`: `fs.c`'s `kur_libc_fs_error`, `_release`, `_canonicalize`,
+  `_stat`, `_remove`, `_rename`, `_mkdir`, `_open_directory`,
+  `_next_entry`, `_entry_name`, `_entry_is_directory` and
+  `_close_directory`; `std::env`: `_getenv` and `_release`;
+- `std::process`: `fs.c`'s `kur_libc_process_run`, which starts the child
+  with `posix_spawnp` (no library code runs in the child) and waits for
+  it, again when a signal interrupts the wait;
+- `std::time`: `clock_gettime`, and `fs.c`'s `kur_libc_time_sleep`, which
+  sleeps on after a signal; `std::float`: `strtod`;
 - `libc::thread`: `thread.c`'s `kur_libc_thread_error`, `_create` and
   `_join`. A thread `_create` starts runs `entry` to its return; it is
   never cancelled and never calls `pthread_exit`.
@@ -251,7 +252,7 @@ double free.
 | `core::raw::span_byte_at`, `core::slice::slice_byte_at` | the caller has just been handed a read capability for the view's brand; these read with no capability of their own and are the shared bodies of the `ReadBytes` instances |
 | `core::cstr::cstr_len` | the pointer addresses a NUL-terminated byte run; there is no length to bound the scan |
 | `core::cstr::CStr::from_raw` | `ptr` names a NUL-terminated byte run that stays readable and unchanged for the rest of the process, as `argv` entries do: a `CStr` is `Copy` and carries no brand, so nothing ends its use earlier |
-| `std::process::Args::from_main` | `argc`/`argv` obey the C `main` contract: `argc >= 0`, `argc` readable entries, each a NUL-terminated string live for the rest of the process |
+| `std::fs::is_dot` | `name` addresses a live NUL-terminated string (a directory entry's name, read before the next read or close of its directory) |
 | `core::hash::HashState::write_bytes` | `ptr[0..len)` is readable for the whole call |
 | `core::fmt::Writable::write_raw` (and its instances) | `ptr[0..len)` is readable for the whole call; the writer reads the bytes before returning and keeps no pointer to them |
 | `alloc::buffer::Buffer::push_n` | `src[0..count)` is readable and does not alias the buffer's own storage, which the growth on entry may reallocate |
@@ -493,7 +494,7 @@ Types whose hidden representation protects authority or bounds:
 | `Slice[T,'k]` | `core::slice` | pairs a pointer with an independent `len`; a forged `len` reads and writes past the allocation through the bounds-checked accessors |
 | `StaticRead` | `core::slice` | the read capability for `'static` byte slices; harmless to duplicate, since it grants no write, resume or deallocation |
 | `Span['k]` | `core::raw` | bytes in domain `'k`, readable in safe code only through that domain's capability; built only by `from_static` or the unsafe constructors |
-| `CStr` | `core::cstr` | a live NUL-terminated string, built only by unsafe adoption or `Args` |
+| `CStr` | `core::cstr` | a live NUL-terminated string, built only by unsafe adoption or `Args::get` |
 | `Array![T]` | `core::array` | storage with exactly `len` initialized elements |
 | `Vec![T,'k]` | `alloc::collections::vec` | a pointer with a `len`/`cap` the module maintains; a forged one is indexed and freed through |
 | `HashMap![K,V,'k]`, `Entry[K,V]` | `alloc::collections::hashmap` | `buckets` matches `bucket_count`; entries are the chain nodes `free_one`/`destroy_chain` free |
@@ -507,9 +508,10 @@ Types whose hidden representation protects authority or bounds:
 | `AlignProbe[T]` | `core::mem` | never built; `alignof` takes only its size |
 | `Stamp['r]` | `core::cap` | exposed to `core` alone (`exposed (package)`): `core` modules read a domain's brand out of it, code outside `core` can hold one but not open it |
 | `File!`, `Output!` | `std::io` | `File!` owns one open descriptor; forging one closes an arbitrary descriptor. `Output!` writes to a descriptor it does not own (stdout, stderr), which a forged one could point anywhere |
-| `Args` | `std::process` | an argv table adopted under the C `main` contract |
+| `Args` | `std::process` | `argv` and `argc` as C's `main` received them: made only by the C `main` the compiler writes for an entry function taking one (its `argv` has `count` readable entries, each a NUL-terminated string live for the rest of the process) |
+| `Command!` | `std::process` | a command line of `count` NUL-terminated arguments, which `fs.c` splits into the table `posix_spawnp` reads |
 | `Instant`, `Timespec` | `std::time` | a monotonic clock reading, and the C structure `clock_gettime` fills; nothing outside makes either |
-| `DirectoryStream!` | `libc::fs` | owns one open `DIR *`; forging one hands `readdir`/`closedir` an arbitrary pointer |
+| `Directory!` | `std::fs` | owns one open `DIR *`; forging one hands `readdir`/`closedir` an arbitrary pointer |
 | `Thread!` | `libc::thread` | owns one `pthread_t` handle that `join` frees; forging one joins and frees an arbitrary pointer |
 | `Thread![Ret]`, `SpawnPayload`, `ResultBox` | `thread::thread` | a spawned thread whose `join` reads back a `ResultBox[Ret]`; a forged one would read any thread's result as a `Ret`. The boxes never leave the module |
 | `Parser`, `FlagNode`, `KeyPath` | `toml::parser` | the parser's own state and its record of what a document has defined; nothing outside reads or makes them |
@@ -523,7 +525,7 @@ that restricting a type costs nothing: it only sees the code it is run on.
   else: building one needs both, and taking one apart gives back only what
   went in.
 - **`std::io::Error`.** An errno value, the one error type of `std::io`,
-  `libc` and `thread`. Any number is a valid one, so building one grants
+  `std::fs`, `std::process`, `libc` and `thread`. Any number is a valid one, so building one grants
   nothing.
 - **Values that hold only what their builder already had:**
   `alloc::collections::hashmap::OwnedMap!` and
@@ -535,8 +537,8 @@ that restricting a type costs nothing: it only sees the code it is run on.
   `alloc::buffer::BufferWriter!` (a `Buffer!`), `core::cursor::Cursor` (a
   `Slice` and a position; every read is checked whatever the position),
   `core::slice::Readable` (a capability and a view), `core::borrow::
-  Borrowed!` and `NoCap`, `libc::fs::DirectoryEntry!` (an owned name and a
-  flag), and `core::fmt::CountingWriter`, `alloc::fmt::Full`,
+  Borrowed!` and `NoCap`, `std::fs::DirEntry!` (an owned name and a
+  flag), `std::fs::Metadata`, `std::time::Duration`, and `core::fmt::CountingWriter`, `alloc::fmt::Full`,
   `core::hash::HashState`. Taking one apart gives back only parts the
   builder held.
 - **`core::iter`'s `Range`, `Pair`, `Map`, `Filter`, `Zip`, `Enumerate`,
@@ -551,7 +553,7 @@ that restricting a type costs nothing: it only sees the code it is run on.
 - **`core::option::Option`/`Result`, `core::cmp::Order`,
   `core::atomic::Ordering`, `alloc::heap::AllocError`,
   `alloc::collections::list::List`/`Cons`, `alloc::collections::vec::
-  Popped!`, `libc::process::Exit`.** These exist to be matched on, and there is no per-variant privacy, so an enum
+  Popped!`, `std::process::Exit`, `std::fs::FileKind`.** These exist to be matched on, and there is no per-variant privacy, so an enum
   meant to be matched on cannot be restricted. The general rule: **a type
   can be restricted when its outside users rely on methods rather than
   destructuring.**

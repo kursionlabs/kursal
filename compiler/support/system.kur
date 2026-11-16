@@ -1,78 +1,41 @@
-// The compiler's view of the operating system, on the standard library and its `libc` adapters:
-// arguments, files, directories, processes and the environment. Paths and command lines are
-// handed over as `Buffer!` copies, freed once the call returns, and what comes back is copied
-// into the context's arena.
+// The compiler's view of the operating system, on the standard library: arguments, files,
+// directories, processes and the environment. Paths are read as spans of the context's arena,
+// and what comes back is copied into it.
 
 use std::collections::arena_vec::ArenaVec;
 use std::raw::Span;
 use std::alloc::arena::Domain;
 use std::bytes::buffer::Buffer;
 use std::option::{Option, Result};
-use std::io::File;
-use libc::fs::{canonicalize, environment_variable, open_directory};
-use libc::process::{Exit, arguments as process_arguments, run as run_command};
-
-// The bytes of `t`.
-forall 'k.
-fn buffer(&cx: Domain!['k], t: Span['k]) -> Buffer! {
-    Buffer::new().push_bytes(&cx, t)
-}
-
+use std::env::variable;
+use std::fs::{canonicalize, path_exists as exists_at, read_dir, read_to_arena, write as write_file};
+use std::process::{Args, Command, Exit};
 
 // The arguments the program was started with, after its own name.
 forall 'k.
-fn arguments(&cx: Domain!['k]) -> ArenaVec[Span['k], 'k] {
+fn arguments(&cx: Domain!['k], args: Args) -> ArenaVec[Span['k], 'k] {
     let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
-    match process_arguments() {
-        Result::Ok(line) => {
-            // The program's name, then each argument, each followed by a NUL.
-            let all = line.save(&cx);
-            var start = 0usize;
-            var i = 0usize;
-            while i < all.len() {
-                if all.byte_or_zero(&cx, i) == 0u8 {
-                    out.push(&cx, all.slice(start, i));
-                    start = i + 1usize;
-                }
-                i = i + 1usize;
-            }
-        },
-        Result::Err(code) => (),
+    var i = 1usize;
+    while i < args.len() {
+        match args.bytes(i) {
+            Option::Some(arg) => out.push(&cx, Span::from_static(&cx, arg)),
+            Option::None => (),
+        }
+        i = i + 1usize;
     }
-    if out.is_empty(&cx) {
-        out
-    } else {
-        out.skip(&cx, 1usize)
-    }
+    out
 }
 
 // The contents of the file at `path`, if it can be read.
 forall 'k.
 fn read(&cx: Domain!['k], path: Span['k]) -> Option[Span['k]] {
-    var name = buffer(&cx, path);
-    let opened = File::open_read(&name);
-    name.destroy();
-    match opened {
-        Result::Ok(file) => {
-            var file = file;
-            let contents = &file.read_to_buffer();
-            let closed = file.close();
-            match contents {
-                Result::Ok(b) => Option::Some.(b.save(&cx)),
-                Result::Err(code) => Option::None,
-            }
-        },
-        Result::Err(code) => Option::None,
-    }
+    read_to_arena(&cx, path).ok()
 }
 
 // The absolute path with no symbolic links that `path` names, if it exists.
 forall 'k.
 fn real_path(&cx: Domain!['k], path: Span['k]) -> Option[Span['k]] {
-    var b = buffer(&cx, path);
-    let result = canonicalize(&b);
-    b.destroy();
-    match result {
+    match canonicalize(&cx, path) {
         Result::Ok(r) => Option::Some.(r.save(&cx)),
         Result::Err(code) => Option::None,
     }
@@ -81,15 +44,12 @@ fn real_path(&cx: Domain!['k], path: Span['k]) -> Option[Span['k]] {
 // Whether `path` names an existing file or directory.
 forall 'k.
 fn path_exists(&cx: Domain!['k], path: Span['k]) -> bool {
-    real_path(&cx, path).is_some()
+    exists_at(&cx, path)
 }
 
 forall 'k.
 fn environment(&cx: Domain!['k], name: Span['k]) -> Option[Span['k]] {
-    var b = buffer(&cx, name);
-    let result = environment_variable(&b);
-    b.destroy();
-    match result {
+    match variable(&cx, name) {
         Option::Some(r) => Option::Some.(r.save(&cx)),
         Option::None => Option::None,
     }
@@ -99,22 +59,16 @@ fn environment(&cx: Domain!['k], name: Span['k]) -> Option[Span['k]] {
 forall 'k.
 fn list_directory(&cx: Domain!['k], path: Span['k]) -> ArenaVec[(Span['k], bool), 'k] {
     let out: ArenaVec[(Span['k], bool), 'k] = ArenaVec::new(&cx);
-    var b = buffer(&cx, path);
-    let opened = open_directory(&b);
-    b.destroy();
-    match opened {
-        Result::Ok(stream) => {
-            var stream = stream;
+    match read_dir(&cx, path) {
+        Result::Ok(directory) => {
+            var directory = directory;
             var going = true;
             while going {
-                let unit = match &stream.next() {
+                match &directory.next() {
                     Result::Ok(next) => match next {
                         Option::Some(entry) => {
                             let { name, is_directory } = entry;
-                            let n = name.save(&cx);
-                            if !n.is(&cx, ".") && !n.is(&cx, "..") {
-                                out.push(&cx, (n, is_directory));
-                            }
+                            out.push(&cx, (name.save(&cx), is_directory));
                         },
                         Option::None => {
                             going = false;
@@ -123,9 +77,9 @@ fn list_directory(&cx: Domain!['k], path: Span['k]) -> ArenaVec[(Span['k], bool)
                     Result::Err(code) => {
                         going = false;
                     },
-                };
+                }
             }
-            let closed = stream.close();
+            let closed = directory.close();
         },
         Result::Err(code) => (),
     }
@@ -135,43 +89,25 @@ fn list_directory(&cx: Domain!['k], path: Span['k]) -> ArenaVec[(Span['k], bool)
 // Writes `contents` to the file at `path`, replacing it, and frees it; whether that succeeded.
 forall 'k.
 fn write(&cx: Domain!['k], path: Span['k], contents: Buffer!) -> bool {
-    var name = buffer(&cx, path);
-    let created = File::create(&name);
-    name.destroy();
-    match created {
-        Result::Ok(file) => {
-            var file = file;
-            let written = &file.write_buffer(contents);
-            let closed = file.close();
-            written.is_ok() && closed.is_ok()
-        },
-        Result::Err(code) => {
-            contents.destroy();
-            false
-        },
-    }
+    write_file(&cx, path, contents).is_ok()
 }
 
-// A command line for `run`: each of `argv` followed by a NUL, in a buffer of its own, so that it
-// outlives the arena.
+// A command for `run`: `argv[0]` run with the rest, copied out of the arena so that it outlives
+// it.
 forall 'k.
-fn command_line(&cx: Domain!['k], argv: ArenaVec[Span['k], 'k]) -> Buffer! {
-    var line = Buffer::new();
-    var i = 0usize;
+fn command_line(&cx: Domain!['k], argv: ArenaVec[Span['k], 'k]) -> Command! {
+    var command = Command::new(&cx, argv.at(&cx, 0usize));
+    var i = 1usize;
     while i < argv.len(&cx) {
-        line = line.push_bytes(&cx, argv.at(&cx, i)).push_byte(0u8);
+        command = command.arg(&cx, argv.at(&cx, i));
         i = i + 1usize;
     }
-    line
+    command
 }
 
-// Runs the program a command line names, found on the PATH, with its arguments, and waits for it;
-// whether it exited with status 0. The command line is freed.
-fn run(line: Buffer!) -> bool {
-    var line = line;
-    let result = run_command(&line);
-    line.destroy();
-    match result {
+// Runs a command and waits for it; whether it exited with status 0.
+fn run(command: Command!) -> bool {
+    match command.run() {
         Result::Ok(exit) => match exit {
             Exit::Code(code) => code == 0i32,
             Exit::Signal(number) => false,

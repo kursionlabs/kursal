@@ -128,6 +128,14 @@ source_root = "src"          # the default
 path = "../lib/std"
 ```
 
+An executable's entry is a safe, non-generic function `fn() -> i32`, or
+`fn(args: Args) -> i32` taking `std::process::Args`: the backend writes C's
+`main(int argc, char **argv)` for it, which fills `Args` from `argv` and `argc`
+and returns the entry's result as the exit status. The backend knows `Args` by
+its shape alone, a struct of exactly a `*(*u8)` and a `usize`, so no name is
+special; `Args` is restricted to `std::process`, so no safe code makes one
+otherwise, and its accessors may rely on what C's `main` received.
+
 Every `.kur` file under the source root is a module, named by its path
 (`a/lib.kur` and `a.kur` are both module `a`). A single `.kur` file can also be
 compiled on its own; it then depends on the standard library `std` when one is
