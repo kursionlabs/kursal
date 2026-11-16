@@ -17,7 +17,7 @@ development tools (`pyproject.toml`, `uv.lock`); mypy checks `kursal/`.
 |---|---|---|
 | Parse | `parser.py` | the surface AST of `syntax.py` |
 | Resolve | `resolve.py` | the package graph from `kur.toml`; every path bound to what it names |
-| Signatures | `sigs.py`, `formation.py`, `layout.py`, `coherence.py`, `termination.py` | declaration types in core terms; folded constants |
+| Signatures | `sigs.py`, `formation.py`, `layout.py`, `coherence.py`, `termination.py` | declaration types in core terms; folded constants, but for arithmetic on `usize` and `isize`, which the C compiler folds |
 | Inference | `infer.py`, `unify.py`, `types.py` | the type of every expression; call targets; closure captures |
 | Lowering | `lower.py`, `placeflow.py`, `promote.py` | a KURS program (`core.py`), with `&` places and block contracts |
 | Checking | `check.py` | acceptance by the core rules |
@@ -26,6 +26,12 @@ development tools (`pyproject.toml`, `uv.lock`); mypy checks `kursal/`.
 `kurs.py` reads and writes serialized KURS (S-expressions, `sexpr.py`), and `readable.py`
 prints it in the readable notation. `literals.py` holds the rules for scalar literals that
 inference, lowering and the checker share, and `cc.py` the C compiler command.
+
+`usize` and `isize` are pointer-sized (`uintptr_t` and `intptr_t` in C), and one C file serves 32-bit
+and 64-bit targets. Their literals range over 64 bits. Constant arithmetic on them is not evaluated
+here: `sigs.py` keeps it as an `OpConst`, lowering emits its instructions, and the C compiler folds
+them at the target's width. An array length, which a type must know, cannot use such arithmetic.
+[`compiler/README.md`](../compiler/README.md), "Pointer-sized integers", has the details.
 
 ## Builtins
 

@@ -28,9 +28,9 @@ from dataclasses import replace
 import re
 from typing import Optional
 
-from .core import (ATOMIC_OPS, FLOATS, INTEGERS, UNIT, Array, Block, Brand, Enum, Exists, Fn, Foreach, Ignored, Jmp, Jnz,
-                   Named, Never, NonNull, Param, Prim, Ptr, Ret, Skolem, Struct, Switch, Tuple, Unreachable,
-                   Type, Program, Fun, Data, Instr, Edge, Terminator)
+from .core import (ATOMIC_OPS, FLOATS, INTEGERS, POINTER_SIZED, UNIT, WIDTHS, Array, Block, Brand, Enum, Exists, Fn,
+                   Foreach, Ignored, Jmp, Jnz, Named, Never, NonNull, Param, Prim, Ptr, Ret, Skolem, Struct, Switch,
+                   Tuple, Unreachable, Type, Program, Fun, Data, Instr, Edge, Terminator)
 from .check import Checker, overlap, prefix
 from .sexpr import Form, KursError, List, Str
 from .types import foreach_binders, ForeachRow, Types, equal, map_children, subst, subst_foreach
@@ -57,11 +57,15 @@ static inline int8_t kur_dec_i8(uint64_t b) { b &= 0xFF; return b < 0x80 ? (int8
 static inline int16_t kur_dec_i16(uint64_t b) { b &= 0xFFFF; return b < 0x8000 ? (int16_t)b : (int16_t)((int64_t)b - 0x10000); }
 static inline int32_t kur_dec_i32(uint64_t b) { b &= 0xFFFFFFFF; return b < 0x80000000 ? (int32_t)b : (int32_t)((int64_t)b - 0x100000000); }
 static inline int64_t kur_dec_i64(uint64_t b) { return b <= (uint64_t)INT64_MAX ? (int64_t)b : -INT64_C(1) - (int64_t)(UINT64_MAX - b); }
+/* usize and isize are pointer-sized: uintptr_t and intptr_t, of KUR_PTR_BITS bits. */
+#define KUR_PTR_BITS (8 * sizeof(uintptr_t))
+static inline intptr_t kur_dec_isize(uintptr_t b) { return b <= (uintptr_t)INTPTR_MAX ? (intptr_t)b : -(intptr_t)1 - (intptr_t)(UINTPTR_MAX - b); }
 """
 
-C_PRIMS = {"bool": "_Bool", "f32": "float", "f64": "double", "usize": "uint64_t", "isize": "int64_t",
-           **{n: f"{'u' if n[0] == 'u' else ''}int{w}_t" for n, w in INTEGERS.items() if n[1:].isdigit()}}
-SIGNED = {n: (64 if n == "isize" else INTEGERS[n]) for n in INTEGERS if n[0] == "i"}
+C_PRIMS = {"bool": "_Bool", "f32": "float", "f64": "double", "usize": "uintptr_t", "isize": "intptr_t",
+           **{n: f"{'u' if n[0] == 'u' else ''}int{w}_t" for n, w in WIDTHS.items()}}
+# The signed integer types, each with the suffix of its `kur_dec_i` decoder.
+SIGNED = {n: n[1:] for n in INTEGERS if n[0] == "i"}
 C_ORDER = {o: f"__ATOMIC_{o.upper()}" for o in ("relaxed", "acquire", "release", "acq_rel", "seq_cst")}
 C_OPS = {"add": "+", "sub": "-", "mul": "*", "div": "/", "mod": "%", "bit_and": "&", "bit_or": "|",
          "bit_xor": "^", "eq": "==", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
@@ -71,7 +75,7 @@ C_KEYWORDS = set("auto break case char const continue default do double else enu
                  "inline int long register restrict return short signed sizeof static struct switch typedef "
                  "union unsigned void volatile while _Alignas _Alignof _Atomic _Bool _Complex _Generic "
                  "_Imaginary _Noreturn _Static_assert _Thread_local".split())
-RUNTIME_NAMES = {"KUR_TRAP", "KUR_MUSTTAIL", "KUR_FIELD", *(f"kur_dec_i{n}" for n in (8, 16, 32, 64)),
+RUNTIME_NAMES = {"KUR_TRAP", "KUR_MUSTTAIL", "KUR_FIELD", "KUR_PTR_BITS", *(f"kur_dec_i{n}" for n in SIGNED.values()),
                  "SIZE_MAX", "PTRDIFF_MIN", "PTRDIFF_MAX", "SIG_ATOMIC_MIN", "SIG_ATOMIC_MAX",
                  "WCHAR_MIN", "WCHAR_MAX", "WINT_MIN", "WINT_MAX", *C_ORDER.values()}
 for _stem in ("8", "16", "32", "64", "_LEAST8", "_LEAST16", "_LEAST32", "_LEAST64",
@@ -1023,7 +1027,7 @@ class Backend:
             self.line(f"{dst} = ({ct}*)__builtin_alloca(sizeof({ct}));")
         elif op == "sizeof":
             ct = self.ctype(self.type_operand(instr))
-            self.line(f"{dst} = UINT64_C(0);" if ct == "void" else f"{dst} = (uint64_t)sizeof({ct});")
+            self.line(f"{dst} = UINT64_C(0);" if ct == "void" else f"{dst} = (uintptr_t)sizeof({ct});")
         elif op == "data":
             self.line(f"{dst} = &{self.data_symbol(a[0])};")
         elif op in ("pack", "open"):
@@ -1143,9 +1147,10 @@ class Backend:
     def convert(self, expr: str, dst: Type) -> str:
         """Integer conversion by truncation or sign extension."""
         assert isinstance(dst, Prim)
+        wide = "uintptr_t" if dst.name in POINTER_SIZED else "uint64_t"
         if dst.name in SIGNED:
-            return f"kur_dec_i{SIGNED[dst.name]}((uint64_t)({expr}))"
-        return f"({C_PRIMS[dst.name]})((uint64_t)({expr}))"
+            return f"kur_dec_i{SIGNED[dst.name]}(({wide})({expr}))"
+        return f"({C_PRIMS[dst.name]})(({wide})({expr}))"
 
     def cast(self, dst: str, expr: str, src: Type, dst_ty: Type) -> None:
         s, d = self.shape(src), self.shape(dst_ty)
@@ -1168,8 +1173,9 @@ class Backend:
             if s.name == "bool" or d.name == "bool" or s.name in FLOATS and d.name in FLOATS:
                 self.line(f"{dst} = ({cd}){expr};")
             elif (s.name in FLOATS) != (d.name in FLOATS):
-                widths = {**INTEGERS, "f32": 32, "f64": 64}
-                if widths[s.name] != widths[d.name]:
+                # A pointer-sized integer's width is the target's: the assertion below checks it.
+                widths = {**WIDTHS, "f32": 32, "f64": 64}
+                if s.name in widths and d.name in widths and widths[s.name] != widths[d.name]:
                     raise KursError("backend integer/float reinterpretation requires equal widths")
                 self.reinterpret(dst, expr)
             else:
@@ -1194,31 +1200,38 @@ class Backend:
         if name not in INTEGERS or op in ("eq", "ne", "lt", "le", "gt", "ge"):
             self.line(f"{dst} = ({x} {C_OPS[op]} {y});")
             return
-        bits = 64 if name in ("usize", "isize") else INTEGERS[name]
         ct = C_PRIMS[name]
         signed = name in SIGNED
+        # The arithmetic is done unsigned, in `wide`, of `bits` bits: 64, or a pointer's width for
+        # `usize` and `isize`.
+        if name in POINTER_SIZED:
+            wide, wide_max, bits, mask = "uintptr_t", "UINTPTR_MAX", "KUR_PTR_BITS", "(KUR_PTR_BITS - 1)"
+            bits_of = f"(uintptr_t)({x})"
+        else:
+            width = WIDTHS[name]
+            wide, wide_max, bits, mask = "uint64_t", "UINT64_MAX", str(width), str(width - 1)
+            bits_of = f"(uint64_t)(uint{width}_t)({x})" if width < 64 or signed else f"(uint64_t)({x})"
         def wrap(expr: str) -> str:
-            return f"kur_dec_i{bits}({expr})" if signed else f"({ct})({expr})"
+            return f"kur_dec_i{SIGNED[name]}({expr})" if signed else f"({ct})({expr})"
         if op in ("div", "mod"):
             self.line(f"if ({y} == 0) KUR_TRAP();")
             if signed:
-                minus = wrap(f"(uint64_t)0 - (uint64_t)({x})") if op == "div" else "0"
+                minus = wrap(f"({wide})0 - ({wide})({x})") if op == "div" else "0"
                 self.line(f"{dst} = ({y} == -1) ? {minus} : ({ct})({x} {C_OPS[op]} {y});")
             else:
-                self.line(f"{dst} = ({ct})((uint64_t){x} {C_OPS[op]} (uint64_t){y});")
+                self.line(f"{dst} = ({ct})(({wide}){x} {C_OPS[op]} ({wide}){y});")
             return
         if op in ("shl", "shr"):
-            amount = f"((uint64_t)({y}) & {bits - 1})"
-            bits_of = f"(uint64_t)(uint{bits}_t)({x})" if bits < 64 or signed else f"(uint64_t)({x})"
+            amount = f"(({wide})({y}) & {mask})"
             if op == "shl":
                 self.line(f"{dst} = {wrap(f'{bits_of} << {amount}')};")
             elif not signed:
                 self.line(f"{dst} = {wrap(f'{bits_of} >> {amount}')};")
             else:
-                fill = f"({x} < 0 && {amount} ? (UINT64_MAX << ({bits} - {amount})) : 0)"
+                fill = f"({x} < 0 && {amount} ? ({wide_max} << ({bits} - {amount})) : 0)"
                 self.line(f"{dst} = {wrap(f'({bits_of} >> {amount}) | {fill}')};")
             return
-        self.line(f"{dst} = {wrap(f'(uint64_t)({x}) {C_OPS[op]} (uint64_t)({y})')};")
+        self.line(f"{dst} = {wrap(f'({wide})({x}) {C_OPS[op]} ({wide})({y})')};")
 
     def call(self, instr: Instr) -> None:
         callee, substitute_type = instr.args[0], self.substitute_type

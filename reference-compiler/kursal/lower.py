@@ -33,13 +33,10 @@ from .check import overlap
 from .infer import (POINTER_OPS, BuiltinCall, ClosureCall, FnCall, FStringWrite, Infer, PointerCall, TypedBuiltinCall,
                     TraitCall, TupleCall, ValueCall, VariantCall)
 from .sexpr import KursError, List, Position, Str
-from .sigs import ConstValue, Sig, Signatures
+from .sigs import OPERATORS, ConstValue, OpConst, Sig, Signatures
 from .resolve import Resolver
 from .types import equal, foreach_binders, foreach_item, Types, free_brands, subst
 
-BINOPS = {"+": "add", "-": "sub", "*": "mul", "/": "div", "%": "mod", "&": "bit_and", "|": "bit_or",
-          "^": "bit_xor", "<<": "shl", ">>": "shr", "==": "eq", "!=": "ne", "<": "lt", "<=": "le",
-          ">": "gt", ">=": "ge"}
 ORDERINGS = {"Relaxed": "relaxed", "Acquire": "acquire", "Release": "release", "AcqRel": "acq_rel",
              "SeqCst": "seq_cst"}
 
@@ -557,10 +554,31 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
     def const(self, value: ConstValue) -> str:
         if value[0] == "str":
             return self.string(value[1])
+        if value[0] == "op":
+            return self.operation(value)
         kind, v, ty = value
         assert ty is not None
         lit = ("true" if v else "false") if kind == "bool" else str(v)
         return self.emit("const", ty, ty=ty, lit=lit)
+
+    def operation(self, value: OpConst) -> str:
+        """A constant operation the C compiler folds, as the instructions that compute it."""
+        _, (op, operands), ty = value
+        if op in ("and", "or"):
+            c = self.const(operands[0])
+            right = lambda: self.const(operands[1])
+            constant = lambda: self.emit("const", C.BOOL, ty=C.BOOL, lit="false" if op == "and" else "true")
+            result = self.branch(c, right, constant, C.BOOL) if op == "and" else self.branch(c, constant, right, C.BOOL)
+            assert result is not None
+            return result
+        args = tuple(self.const(operand) for operand in operands)
+        if op == "neg":
+            return self.negate(args[0], ty)
+        if op == "not":
+            return self.complement(args[0], ty)
+        if op == "int_cast":
+            return self.emit("int_cast", ty, args, ty=ty)
+        return self.emit(op, ty, args)
 
     def expr_binop(self, expr: S.Binop) -> Optional[str]:
         if expr.op in ("&&", "||"):
@@ -573,7 +591,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
                 return self.branch(c, lambda: self.expr(expr.right), constant, C.BOOL)
             return self.branch(c, constant, lambda: self.expr(expr.right), C.BOOL)
         operands = self.operands([expr.left, expr.right])
-        return None if operands is None else self.emit(BINOPS[expr.op], self.substitute_type(expr.ty), operands)
+        return None if operands is None else self.emit(OPERATORS[expr.op],self.substitute_type(expr.ty), operands)
 
     def expr_unary(self, expr: S.Unary) -> Optional[str]:
         op = expr.op
@@ -594,18 +612,32 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         v = self.expr(expr.operand)
         if v is None:
             return None
+        return self.negate(v, ty) if op == "-" else self.complement(v, ty)
+
+    def negate(self, v: str, ty: C.Type) -> str:
         s = self.types.shape(ty)
         assert isinstance(s, C.Prim)
-        if op == "-":
-            if s.name in C.FLOATS:
-                minus = self.emit("const", ty, ty=ty, lit="-1.0")
-                return self.emit("mul", ty, (v, minus))
-            zero = self.emit("const", ty, ty=ty, lit="0")
-            return self.emit("sub", ty, (zero, v))
+        if s.name in C.FLOATS:
+            minus = self.emit("const", ty, ty=ty, lit="-1.0")
+            return self.emit("mul", ty, (v, minus))
+        zero = self.emit("const", ty, ty=ty, lit="0")
+        return self.emit("sub", ty, (zero, v))
+
+    def complement(self, v: str, ty: C.Type) -> str:
+        """`!v`: a bool's negation, or an integer's bits flipped."""
+        s = self.types.shape(ty)
+        assert isinstance(s, C.Prim)
         if s.name == "bool":
             f = self.emit("const", ty, ty=ty, lit="false")
             return self.emit("eq", ty, (v, f))
-        ones = self.emit("const", ty, ty=ty, lit="-1" if s.name.startswith("i") else str((1 << C.INTEGERS[s.name]) - 1))
+        if s.name.startswith("i"):
+            ones = self.emit("const", ty, ty=ty, lit="-1")
+        elif s.name in C.POINTER_SIZED:
+            # All ones at the target's width, `0 - 1`, which the C compiler folds.
+            zero, one = self.emit("const", ty, ty=ty, lit="0"), self.emit("const", ty, ty=ty, lit="1")
+            ones = self.emit("sub", ty, (zero, one))
+        else:
+            ones = self.emit("const", ty, ty=ty, lit=str((1 << C.WIDTHS[s.name]) - 1))
         return self.emit("bit_xor", ty, (v, ones))
 
     def expr_cast(self, expr: S.Cast) -> Optional[str]:
@@ -980,7 +1012,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         if isinstance(shape, C.Prim) and shape.name in C.INTEGERS:
             if not covers or covers[-1]:
                 fail("an integer match must end with a wildcard", expr.pos)
-            bits = C.INTEGERS[shape.name]
+            bits = C.LITERAL_BITS[shape.name]
             low, high = (-(1 << (bits - 1)), (1 << (bits - 1)) - 1) if shape.name.startswith("i") else (0, (1 << bits) - 1)
             spans: list[tuple[int, int]] = []
             for k, cover in enumerate(covers):

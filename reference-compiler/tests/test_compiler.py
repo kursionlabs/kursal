@@ -298,7 +298,11 @@ def sig_lines(sig: Sig, indent: str, out: list[str]) -> None:
 
 def const_text(value: ConstValue) -> str:
     kind, v, ty = value
-    if kind == "int":
+    if kind == "op":
+        assert isinstance(v, tuple)
+        op, operands = v
+        spelled = "(" + " ".join([op, *(f"({const_text(operand)})" for operand in operands)]) + ")"
+    elif kind == "int":
         spelled = str(v)
     elif kind == "bool":
         spelled = "true" if v else "false"
@@ -800,7 +804,9 @@ SIGNATURES = (
     "const Y: u64 = 1u64 >> 64u64;\nconst Z: i8 = -128 >> 1;\nconst AA: bool = 1 == 2u8;\nconst AB: u8 = b'a' ^ 255u8;\n"
     "const AC: i64 = -5 / 3 + -5 % 3 + 7 % -2 + -7 / -2;\nconst AD: bool = -1i8 >= -2i8 && 3u16 <= 3u16 && 1i32 != 2i32;\n"
     "const AE: u32 = 4294967295u32 as i64 as u32;\nconst AF: bool = true != (1u8 > 0u8);\n"
-    "struct Arr { a: [u8; U], b: [u8; 2 * U], c: [u8; 2u8] }\n",
+    "const AG: usize = !0usize >> 1;\nconst AH: u32 = (AG as u32) + 1;\nconst AI: bool = AG > 3 && !(U == 3);\n"
+    "const AJ: isize = -(AG as isize) / 2isize - 1;\nconst AK: bool = AI || true;\nconst AL: u8 = 300u32 as usize as u8;\n"
+    "struct Arr { a: [u8; U], b: [u8; 2u64 * 3], c: [u8; 2u8] }\n",
     "forall T where Copy[T]. trait Dup { fn dup(x: T) -> (T, T); }\ntrait Show { fn show(&x: Self) -> u32; }\n"
     "instance Dup[u32] { fn dup(x: u32) -> (u32, u32) { (x, x) } }\n"
     "forall T where Exposed[T], Show[T]. instance Show[(T, T)] { fn show(&x: (T, T)) -> u32 { 0u32 } }\n"
@@ -815,6 +821,8 @@ SIGNATURE_ERRORS = (
     "struct S { a: [u8; -1i32] }\n",
     "use std::slice::Slice;\nconst T: u32 = \"text\";\n",
     "const N: i64 = 0i64 - 2i64;\nstruct S { a: [u8; N] }\n",
+    "const U: usize = 3;\nstruct S { a: [u8; 2 * U] }\n",
+    "const U: usize = 1usize / 0usize;\n",
     "struct S { a: Phantom }\n",
     "struct S { a: builtin::Foo }\n",
     "forall T. struct S { a: T[u32] }\n",

@@ -29,22 +29,13 @@ use package::lower::placeflow::PlaceFlow;
 use package::lower::promote::promote_locals;
 use package::resolve::resolver::{NameRef, Named, Resolver};
 use package::kurs::sexpr::{Form, FormKind};
-use package::sigs::signatures::{ConstValue, Sig, Signatures, const_type, int_text};
+use package::sigs::signatures::{ConstValue, Sig, Signatures, binop_name, const_type, int_text};
 use package::syntax::ast as S;
 use package::syntax::ast::{Expr, Pattern, Pos, Statement, expr_id, expr_pos, no_pos};
 use package::types::ops::{Fresh, Types, equal, foreach_binders, foreach_item, free_brands, mentions_brand, subst};
 use std::collections::hashmap::{Found, OwnedMap};
 use std::option::Option;
 use std::slice::Slice;
-
-forall 'k.
-fn binop_name(&cx: Domain!['k], op: Span['k]) -> Slice[u8, 'static] {
-    if op.is(&cx, "+") { "add" } else if op.is(&cx, "-") { "sub" } else if op.is(&cx, "*") { "mul" } else if op.is(&cx, "/") { "div" }
-    else if op.is(&cx, "%") { "mod" } else if op.is(&cx, "&") { "bit_and" } else if op.is(&cx, "|") { "bit_or" }
-    else if op.is(&cx, "^") { "bit_xor" } else if op.is(&cx, "<<") { "shl" } else if op.is(&cx, ">>") { "shr" }
-    else if op.is(&cx, "==") { "eq" } else if op.is(&cx, "!=") { "ne" } else if op.is(&cx, "<") { "lt" } else if op.is(&cx, "<=") { "le" }
-    else if op.is(&cx, ">") { "gt" } else { "ge" }
-}
 
 // An `Ordering` variant's core spelling.
 forall 'k.
@@ -322,6 +313,8 @@ exposed enum ArmBody {
     Value(Expr['k]),
     Unit,
     Constant(Span['k]),
+    // a constant the C compiler folds
+    Folded(ConstValue['k]),
     // a match arm, its block, and the place a lent match switches on
     Case(S::Arm['k], BlockB['k], Option[Span['k]]),
 }
@@ -790,6 +783,7 @@ impl FnLower['k] {
             ArmBody::Value(e) => self.expr(&cx, e),
             ArmBody::Unit => Option::Some.(self.unit(&cx)),
             ArmBody::Constant(lit) => Option::Some.(self.constant(&cx, C::bool_type(&cx), lit)),
+            ArmBody::Folded(value) => Option::Some.(self.constant_value(&cx, value)),
             ArmBody::Case(arm, block, place) => {
                 let case = arm.cases.at(&cx, 0usize);
                 let variant = match case.kind {
@@ -1215,6 +1209,39 @@ impl FnLower['k] {
             },
             ConstValue::Bool(b) => self.constant(&cx, C::bool_type(&cx), Span::from_static(&cx, if b { "true" } else { "false" })),
             ConstValue::Float(digits, ty) => self.constant(&cx, ty, digits),
+            ConstValue::Op(name, operands, ty) => self.operation(&cx, name, operands, ty),
+        }
+    }
+
+    // A constant operation the C compiler folds, as the instructions that compute it.
+    fn operation(self, &cx: Domain!['k], name: Span['k], operands: ArenaVec[ConstValue['k], 'k], ty: Type['k]) -> Span['k] {
+        if name.is(&cx, "and") || name.is(&cx, "or") {
+            let c = self.constant_value(&cx, operands.at(&cx, 0usize));
+            let right = ArmBody::Folded.(operands.at(&cx, 1usize));
+            let result = if name.is(&cx, "and") {
+                self.branch(&cx, c, right, ArmBody::Constant.(Span::from_static(&cx, "false")), C::bool_type(&cx))
+            } else {
+                self.branch(&cx, c, ArmBody::Constant.(Span::from_static(&cx, "true")), right, C::bool_type(&cx))
+            };
+            return match result {
+                Option::Some(r) => r,
+                Option::None => self.fails(&cx, "internal error: a constant operation without a value", no_pos()),
+            };
+        }
+        let args: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        var i = 0usize;
+        while i < operands.len(&cx) {
+            args.push(&cx, self.constant_value(&cx, operands.at(&cx, i)));
+            i = i + 1usize;
+        }
+        if name.is(&cx, "neg") {
+            self.negate(&cx, args.at(&cx, 0usize), ty, no_pos())
+        } else if name.is(&cx, "not") {
+            self.complement(&cx, args.at(&cx, 0usize), ty, no_pos())
+        } else if name.is(&cx, "int_cast") {
+            self.emit(&cx, Op::new(&cx, "int_cast", ty, args).typed(ty))
+        } else {
+            self.emit(&cx, Op::named(&cx, name, ty, args))
         }
     }
 
@@ -1284,32 +1311,46 @@ impl FnLower['k] {
             Option::Some(v) => v,
             Option::None => return Option::None,
         };
-        let prim = match self.lowering.types.shape(&cx, ty, Option::None) {
+        Option::Some.(if op.is(&cx, "-") { self.negate(&cx, v, ty, u.pos) } else { self.complement(&cx, v, ty, u.pos) })
+    }
+
+    fn unary_prim(self, &cx: Domain!['k], ty: Type['k], pos: Pos) -> Span['k] {
+        match self.lowering.types.shape(&cx, ty, Option::None) {
             Type::Prim(name) => name,
-            _ => self.fails(&cx, "internal error: a unary operator on a non-primitive", u.pos),
-        };
-        if op.is(&cx, "-") {
-            if C::is_float(&cx, prim) {
-                let minus = self.constant(&cx, ty, Span::from_static(&cx, "-1.0"));
-                return Option::Some.(self.emit(&cx, Op::new(&cx, "mul", ty, ArenaVec::two(&cx, v, minus))));
-            }
-            let zero = self.constant(&cx, ty, Span::from_static(&cx, "0"));
-            return Option::Some.(self.emit(&cx, Op::new(&cx, "sub", ty, ArenaVec::two(&cx, zero, v))));
+            _ => self.fails(&cx, "internal error: a unary operator on a non-primitive", pos),
         }
+    }
+
+    fn negate(self, &cx: Domain!['k], v: Span['k], ty: Type['k], pos: Pos) -> Span['k] {
+        if C::is_float(&cx, self.unary_prim(&cx, ty, pos)) {
+            let minus = self.constant(&cx, ty, Span::from_static(&cx, "-1.0"));
+            return self.emit(&cx, Op::new(&cx, "mul", ty, ArenaVec::two(&cx, v, minus)));
+        }
+        let zero = self.constant(&cx, ty, Span::from_static(&cx, "0"));
+        self.emit(&cx, Op::new(&cx, "sub", ty, ArenaVec::two(&cx, zero, v)))
+    }
+
+    // `!v`: a bool's negation, or an integer's bits flipped.
+    fn complement(self, &cx: Domain!['k], v: Span['k], ty: Type['k], pos: Pos) -> Span['k] {
+        let prim = self.unary_prim(&cx, ty, pos);
         if prim.is(&cx, "bool") {
             let f = self.constant(&cx, ty, Span::from_static(&cx, "false"));
-            return Option::Some.(self.emit(&cx, Op::new(&cx, "eq", ty, ArenaVec::two(&cx, v, f))));
+            return self.emit(&cx, Op::new(&cx, "eq", ty, ArenaVec::two(&cx, v, f)));
         }
         let bits = C::integer_bits(&cx, prim);
-        let ones = if prim.starts_with(&cx, Span::from_static(&cx, "i")) {
-            Span::from_static(&cx, "-1")
+        let mask = if prim.starts_with(&cx, Span::from_static(&cx, "i")) {
+            self.constant(&cx, ty, Span::from_static(&cx, "-1"))
+        } else if C::is_pointer_sized(&cx, prim) {
+            // All ones at the target's width, `0 - 1`, which the C compiler folds.
+            let zero = self.constant(&cx, ty, Span::from_static(&cx, "0"));
+            let one = self.constant(&cx, ty, Span::from_static(&cx, "1"));
+            self.emit(&cx, Op::new(&cx, "sub", ty, ArenaVec::two(&cx, zero, one)))
         } else if bits == 64u32 {
-            Buffer::new().push_u64(18446744073709551615u64).save(&cx)
+            self.constant(&cx, ty, Buffer::new().push_u64(18446744073709551615u64).save(&cx))
         } else {
-            Buffer::new().push_u64((1u64 << (bits as u64)) - 1u64).save(&cx)
+            self.constant(&cx, ty, Buffer::new().push_u64((1u64 << (bits as u64)) - 1u64).save(&cx))
         };
-        let mask = self.constant(&cx, ty, ones);
-        Option::Some.(self.emit(&cx, Op::new(&cx, "bit_xor", ty, ArenaVec::two(&cx, v, mask))))
+        self.emit(&cx, Op::new(&cx, "bit_xor", ty, ArenaVec::two(&cx, v, mask)))
     }
 
     fn expr_cast(self, &cx: Domain!['k], c: S::Cast['k]) -> Option[Span['k]] {
@@ -2005,7 +2046,7 @@ impl FnLower['k] {
                 if covers.is_empty(&cx) || !covers.at(&cx, covers.len(&cx) - 1usize).is_empty(&cx) {
                     self.fails(&cx, "an integer match must end with a wildcard", m.pos);
                 }
-                let bits = C::integer_bits(&cx, name);
+                let bits = C::literal_bits(&cx, name);
                 let signed = name.starts_with(&cx, Span::from_static(&cx, "i"));
                 let top = if bits == 64u32 { 18446744073709551615u64 } else { (1u64 << (bits as u64)) - 1u64 };
                 let half = 1u64 << ((bits - 1u32) as u64);

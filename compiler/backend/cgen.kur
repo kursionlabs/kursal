@@ -51,6 +51,9 @@ fn prelude() -> Buffer! {
         .push_static("static inline int16_t kur_dec_i16(uint64_t b) { b &= 0xFFFF; return b < 0x8000 ? (int16_t)b : (int16_t)((int64_t)b - 0x10000); }\n")
         .push_static("static inline int32_t kur_dec_i32(uint64_t b) { b &= 0xFFFFFFFF; return b < 0x80000000 ? (int32_t)b : (int32_t)((int64_t)b - 0x100000000); }\n")
         .push_static("static inline int64_t kur_dec_i64(uint64_t b) { return b <= (uint64_t)INT64_MAX ? (int64_t)b : -INT64_C(1) - (int64_t)(UINT64_MAX - b); }\n")
+        .push_static("/* usize and isize are pointer-sized: uintptr_t and intptr_t, of KUR_PTR_BITS bits. */\n")
+        .push_static("#define KUR_PTR_BITS (8 * sizeof(uintptr_t))\n")
+        .push_static("static inline intptr_t kur_dec_isize(uintptr_t b) { return b <= (uintptr_t)INTPTR_MAX ? (intptr_t)b : -(intptr_t)1 - (intptr_t)(UINTPTR_MAX - b); }\n")
 }
 
 // Each of `items`, followed by a newline.
@@ -74,9 +77,9 @@ fn c_prim(&cx: Domain!['k], name: Span['k]) -> Span['k] {
     } else if name.is(&cx, "f64") {
         Span::from_static(&cx, "double")
     } else if name.is(&cx, "usize") {
-        Span::from_static(&cx, "uint64_t")
+        Span::from_static(&cx, "uintptr_t")
     } else if name.is(&cx, "isize") {
-        Span::from_static(&cx, "int64_t")
+        Span::from_static(&cx, "intptr_t")
     } else if name.byte_or_zero(&cx, 0usize) == b'u' {
         Buffer::new().push_static("uint").push_bytes(&cx, name.skip(1usize)).push_static("_t").save(&cx)
     } else {
@@ -89,10 +92,11 @@ fn line(&lines: Buffer!, l: Buffer!) {
     lines = lines.push_static("  ").push_buffer(l).push_static("\n");
 }
 
-// The width of a signed integer type, or 0 for any other.
+// The suffix of a signed integer type's `kur_dec_i` decoder (`8` to `64`, or `size`), or none for
+// any other type.
 forall 'k.
-fn signed_bits(&cx: Domain!['k], name: Span['k]) -> u32 {
-    if name.byte_or_zero(&cx, 0usize) == b'i' { C::integer_bits(&cx, name) } else { 0u32 }
+fn signed_suffix(&cx: Domain!['k], name: Span['k]) -> Option[Span['k]] {
+    if name.byte_or_zero(&cx, 0usize) == b'i' && C::is_integer(&cx, name) { Option::Some.(name.skip(1usize)) } else { Option::None }
 }
 
 forall 'k.
@@ -169,7 +173,7 @@ fn c_keywords(&cx: Domain!['k]) -> ArenaSet[Span['k], 'k] {
 forall 'k.
 fn runtime_names(&cx: Domain!['k]) -> ArenaSet[Span['k], 'k] {
     let out: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
-    add_words(&cx, out, "KUR_TRAP KUR_MUSTTAIL KUR_FIELD kur_dec_i8 kur_dec_i16 kur_dec_i32 kur_dec_i64");
+    add_words(&cx, out, "KUR_TRAP KUR_MUSTTAIL KUR_FIELD KUR_PTR_BITS kur_dec_i8 kur_dec_i16 kur_dec_i32 kur_dec_i64 kur_dec_isize");
     add_words(&cx, out, "SIZE_MAX PTRDIFF_MIN PTRDIFF_MAX SIG_ATOMIC_MIN SIG_ATOMIC_MAX WCHAR_MIN WCHAR_MAX WINT_MIN WINT_MAX");
     add_words(&cx, out, "__ATOMIC_RELAXED __ATOMIC_ACQUIRE __ATOMIC_RELEASE __ATOMIC_ACQ_REL __ATOMIC_SEQ_CST");
     let stems = Span::from_static(&cx, "8 16 32 64 _LEAST8 _LEAST16 _LEAST32 _LEAST64 _FAST8 _FAST16 _FAST32 _FAST64 PTR MAX").split(&cx, Span::from_static(&cx, " "));
@@ -460,6 +464,7 @@ fn is_scalar(&cx: Domain!['k], t: Span['k]) -> bool {
     t.ends_with(&cx, Span::from_static(&cx, "*")) || t.is(&cx, "_Bool") || t.is(&cx, "float") || t.is(&cx, "double")
         || t.is(&cx, "uint8_t") || t.is(&cx, "uint16_t") || t.is(&cx, "uint32_t") || t.is(&cx, "uint64_t")
         || t.is(&cx, "int8_t") || t.is(&cx, "int16_t") || t.is(&cx, "int32_t") || t.is(&cx, "int64_t")
+        || t.is(&cx, "uintptr_t") || t.is(&cx, "intptr_t")
 }
 
 // A C parameter of a function: its type, its name, and whether it is a place's pointer (`T*` then,
@@ -1638,7 +1643,7 @@ impl Backend['k] {
             let digits = if lit.contains(&cx, Span::from_static(&cx, ".")) || lit.contains(&cx, Span::from_static(&cx, "e")) || lit.contains(&cx, Span::from_static(&cx, "E")) { lit } else { lit.concat(&cx, Span::from_static(&cx, ".0")) };
             return if name.is(&cx, "f32") { digits.concat(&cx, Span::from_static(&cx, "f")) } else { digits };
         }
-        if signed_bits(&cx, name) != 0u32 {
+        if signed_suffix(&cx, name).is_some() {
             return if lit.is(&cx, "-9223372036854775808") { Span::from_static(&cx, "(-INT64_C(9223372036854775807) - 1)") } else { Buffer::new().push_static("INT64_C(").push_bytes(&cx, lit).push_static(")").save(&cx) };
         }
         Buffer::new().push_static("UINT64_C(").push_bytes(&cx, lit).push_static(")").save(&cx)
@@ -2722,7 +2727,7 @@ impl Backend['k] {
             if ct.is(&cx, "void") {
                 line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = UINT64_C(0);"));
             } else {
-                line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = (uint64_t)sizeof(").push_bytes(&cx, ct).push_static(");"));
+                line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = (uintptr_t)sizeof(").push_bytes(&cx, ct).push_static(");"));
             }
         } else if op.is(&cx, "data") {
             line(&lines, Buffer::new().push_bytes(&cx, d).push_static(" = &").push_bytes(&cx, self.data_symbol(&cx, a.at(&cx, 0usize))).push_static(";"));
@@ -3018,11 +3023,12 @@ impl Backend['k] {
             Type::Prim(n) => n,
             _ => fail_text(&cx, Span::from_static(&cx, "internal error: a conversion to a type that is not primitive")),
         };
-        let bits = signed_bits(&cx, name);
-        if bits != 0u32 {
-            return Buffer::new().push_static("kur_dec_i").push_u64(bits as u64).push_static("((uint64_t)(").push_bytes(&cx, expr).push_static("))").save(&cx);
-        }
-        Buffer::new().push_static("(").push_bytes(&cx, c_prim(&cx, name)).push_static(")((uint64_t)(").push_bytes(&cx, expr).push_static("))").save(&cx)
+        let wide = if C::is_pointer_sized(&cx, name) { "uintptr_t" } else { "uint64_t" };
+        match signed_suffix(&cx, name) {
+            Option::Some(suffix) => return Buffer::new().push_static("kur_dec_i").push_bytes(&cx, suffix).push_static("((").push_static(wide).push_static(")(").push_bytes(&cx, expr).push_static("))").save(&cx),
+            Option::None => (),
+        };
+        Buffer::new().push_static("(").push_bytes(&cx, c_prim(&cx, name)).push_static(")((").push_static(wide).push_static(")(").push_bytes(&cx, expr).push_static("))").save(&cx)
     }
 
     fn cast(self, &cx: Domain!['k], &lines: Buffer!, dst: Span['k], expr: Span['k], src: Type['k], dst_ty: Type['k]) {
@@ -3072,7 +3078,9 @@ impl Backend['k] {
         if sn.is(&cx, "bool") || dn.is(&cx, "bool") || C::is_float(&cx, sn) && C::is_float(&cx, dn) {
             line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = (").push_bytes(&cx, cd).push_static(")").push_bytes(&cx, expr).push_static(";"));
         } else if C::is_float(&cx, sn) != C::is_float(&cx, dn) {
-            if width(&cx, sn) != width(&cx, dn) {
+            // A pointer-sized integer's width is the target's: the assertion `reinterpret` writes
+            // checks it.
+            if width(&cx, sn) != 0u32 && width(&cx, dn) != 0u32 && width(&cx, sn) != width(&cx, dn) {
                 fail_text(&cx, Span::from_static(&cx, "backend integer/float reinterpretation requires equal widths"));
             }
             self.reinterpret(&cx, &lines, dst, expr);
@@ -3103,46 +3111,56 @@ impl Backend['k] {
             line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = (").push_bytes(&cx, x).push_static(" ").push_bytes(&cx, c_op(&cx, op)).push_static(" ").push_bytes(&cx, y).push_static(");"));
             return ();
         }
-        let bits = C::integer_bits(&cx, name);
         let ct = c_prim(&cx, name);
-        let signed = signed_bits(&cx, name) != 0u32;
+        let suffix = signed_suffix(&cx, name);
+        let signed = suffix.is_some();
+        // The arithmetic is done unsigned, in `wide`, of `bits` bits: 64, or a pointer's width for
+        // `usize` and `isize`.
+        let pointer_sized = C::is_pointer_sized(&cx, name);
+        let width = C::integer_bits(&cx, name);
+        let wide = if pointer_sized { Span::from_static(&cx, "uintptr_t") } else { Span::from_static(&cx, "uint64_t") };
+        let wide_max = if pointer_sized { Span::from_static(&cx, "UINTPTR_MAX") } else { Span::from_static(&cx, "UINT64_MAX") };
+        let bits = if pointer_sized { Span::from_static(&cx, "KUR_PTR_BITS") } else { Buffer::new().push_u64(width as u64).save(&cx) };
+        let mask = if pointer_sized { Span::from_static(&cx, "(KUR_PTR_BITS - 1)") } else { Buffer::new().push_u64((width - 1u32) as u64).save(&cx) };
+        let bits_of = if pointer_sized {
+            Buffer::new().push_static("(uintptr_t)(").push_bytes(&cx, x).push_static(")").save(&cx)
+        } else if width < 64u32 || signed {
+            Buffer::new().push_static("(uint64_t)(uint").push_u64(width as u64).push_static("_t)(").push_bytes(&cx, x).push_static(")").save(&cx)
+        } else {
+            Buffer::new().push_static("(uint64_t)(").push_bytes(&cx, x).push_static(")").save(&cx)
+        };
         if op.is(&cx, "div") || op.is(&cx, "mod") {
             line(&lines, Buffer::new().push_static("if (").push_bytes(&cx, y).push_static(" == 0) KUR_TRAP();"));
             if signed {
                 let minus = if op.is(&cx, "div") {
-                    wrap(&cx, Buffer::new().push_static("(uint64_t)0 - (uint64_t)(").push_bytes(&cx, x).push_static(")").save(&cx), bits, signed, ct)
+                    wrap(&cx, Buffer::new().push_static("(").push_bytes(&cx, wide).push_static(")0 - (").push_bytes(&cx, wide).push_static(")(").push_bytes(&cx, x).push_static(")").save(&cx), suffix, ct)
                 } else {
                     Span::from_static(&cx, "0")
                 };
                 line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = (").push_bytes(&cx, y).push_static(" == -1) ? ").push_bytes(&cx, minus).push_static(" : (").push_bytes(&cx, ct).push_static(")(")
                     .push_bytes(&cx, x).push_static(" ").push_bytes(&cx, c_op(&cx, op)).push_static(" ").push_bytes(&cx, y).push_static(");"));
             } else {
-                line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = (").push_bytes(&cx, ct).push_static(")((uint64_t)").push_bytes(&cx, x).push_static(" ").push_bytes(&cx, c_op(&cx, op))
-                    .push_static(" (uint64_t)").push_bytes(&cx, y).push_static(");"));
+                line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = (").push_bytes(&cx, ct).push_static(")((").push_bytes(&cx, wide).push_static(")").push_bytes(&cx, x).push_static(" ").push_bytes(&cx, c_op(&cx, op))
+                    .push_static(" (").push_bytes(&cx, wide).push_static(")").push_bytes(&cx, y).push_static(");"));
             }
             return ();
         }
         if op.is(&cx, "shl") || op.is(&cx, "shr") {
-            let amount = Buffer::new().push_static("((uint64_t)(").push_bytes(&cx, y).push_static(") & ").push_u64((bits - 1u32) as u64).push_static(")").save(&cx);
-            let bits_of = if bits < 64u32 || signed {
-                Buffer::new().push_static("(uint64_t)(uint").push_u64(bits as u64).push_static("_t)(").push_bytes(&cx, x).push_static(")").save(&cx)
-            } else {
-                Buffer::new().push_static("(uint64_t)(").push_bytes(&cx, x).push_static(")").save(&cx)
-            };
+            let amount = Buffer::new().push_static("((").push_bytes(&cx, wide).push_static(")(").push_bytes(&cx, y).push_static(") & ").push_bytes(&cx, mask).push_static(")").save(&cx);
             let shifted = if op.is(&cx, "shl") {
                 Buffer::new().push_bytes(&cx, bits_of).push_static(" << ").push_bytes(&cx, amount).save(&cx)
             } else if !signed {
                 Buffer::new().push_bytes(&cx, bits_of).push_static(" >> ").push_bytes(&cx, amount).save(&cx)
             } else {
-                let fill = Buffer::new().push_static("(").push_bytes(&cx, x).push_static(" < 0 && ").push_bytes(&cx, amount).push_static(" ? (UINT64_MAX << (").push_u64(bits as u64)
+                let fill = Buffer::new().push_static("(").push_bytes(&cx, x).push_static(" < 0 && ").push_bytes(&cx, amount).push_static(" ? (").push_bytes(&cx, wide_max).push_static(" << (").push_bytes(&cx, bits)
                     .push_static(" - ").push_bytes(&cx, amount).push_static(")) : 0)").save(&cx);
                 Buffer::new().push_static("(").push_bytes(&cx, bits_of).push_static(" >> ").push_bytes(&cx, amount).push_static(") | ").push_bytes(&cx, fill).save(&cx)
             };
-            line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = ").push_bytes(&cx, wrap(&cx, shifted, bits, signed, ct)).push_static(";"));
+            line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = ").push_bytes(&cx, wrap(&cx, shifted, suffix, ct)).push_static(";"));
             return ();
         }
-        let expr = Buffer::new().push_static("(uint64_t)(").push_bytes(&cx, x).push_static(") ").push_bytes(&cx, c_op(&cx, op)).push_static(" (uint64_t)(").push_bytes(&cx, y).push_static(")").save(&cx);
-        line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = ").push_bytes(&cx, wrap(&cx, expr, bits, signed, ct)).push_static(";"));
+        let expr = Buffer::new().push_static("(").push_bytes(&cx, wide).push_static(")(").push_bytes(&cx, x).push_static(") ").push_bytes(&cx, c_op(&cx, op)).push_static(" (").push_bytes(&cx, wide).push_static(")(").push_bytes(&cx, y).push_static(")").save(&cx);
+        line(&lines, Buffer::new().push_bytes(&cx, dst).push_static(" = ").push_bytes(&cx, wrap(&cx, expr, suffix, ct)).push_static(";"));
     }
 
     fn call(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k]) {
@@ -4080,11 +4098,10 @@ fn width(&cx: Domain!['k], name: Span['k]) -> u32 {
 }
 
 forall 'k.
-fn wrap(&cx: Domain!['k], expr: Span['k], bits: u32, signed: bool, ct: Span['k]) -> Span['k] {
-    if signed {
-        Buffer::new().push_static("kur_dec_i").push_u64(bits as u64).push_static("(").push_bytes(&cx, expr).push_static(")").save(&cx)
-    } else {
-        Buffer::new().push_static("(").push_bytes(&cx, ct).push_static(")(").push_bytes(&cx, expr).push_static(")").save(&cx)
+fn wrap(&cx: Domain!['k], expr: Span['k], suffix: Option[Span['k]], ct: Span['k]) -> Span['k] {
+    match suffix {
+        Option::Some(s) => Buffer::new().push_static("kur_dec_i").push_bytes(&cx, s).push_static("(").push_bytes(&cx, expr).push_static(")").save(&cx),
+        Option::None => Buffer::new().push_static("(").push_bytes(&cx, ct).push_static(")(").push_bytes(&cx, expr).push_static(")").save(&cx),
     }
 }
 

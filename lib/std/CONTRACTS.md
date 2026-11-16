@@ -373,6 +373,9 @@ signature". It does not mean "verified correct".**
 - Growth sizing goes through `alloc::heap::checked_add`/`checked_mul`, which
   abort instead of wrapping. Both guard before computing: the addition
   checks `a > usize::MAX - b`, never a post-hoc test on a wrapped value.
+  `usize` is pointer-sized, and `usize::MAX` (`!0usize`) is folded by the C
+  compiler at the target's width, so the guards hold on 32-bit and 64-bit
+  targets alike.
 - `alloc::buffer::Buffer::commit` aborts when the new length would pass
   the capacity. Without the check, `open` would hand out a `Slice` longer
   than the allocation, and the slice's own bounds check would admit

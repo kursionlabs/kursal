@@ -133,13 +133,17 @@ exposed struct InstanceSig {
 
 // A folded constant. An integer is its value in its type's width, in 64 bits, sign-extended for a
 // signed type; its type is an integer `Prim`. A float keeps its digits. A string's type is the one
-// wanted where it was folded, if any.
+// wanted where it was folded, if any. An operation the C compiler folds, at the target's width, is one
+// on `usize` or `isize`, or on the value of another such operation: its operator is a binary
+// operator's instruction (`binop_name`), `int_cast`, `neg`, `not`, `and` or `or`, and its type the
+// result's.
 forall 'k.
 exposed enum ConstValue {
     Int(u64, Type['k]),
     Bool(bool),
     Float(Span['k], Type['k]),
     Str(Span['k], Option[Type['k]]),
+    Op(Span['k], ArenaVec[ConstValue['k], 'k], Type['k]),
 }
 
 // `value[2]`: the constant's type.
@@ -150,6 +154,7 @@ fn const_type(&cx: Domain!['k], value: ConstValue['k]) -> Option[Type['k]] {
         ConstValue::Bool(_b) => Option::Some.(C::bool_type(&cx)),
         ConstValue::Float(_t, ty) => Option::Some.(ty),
         ConstValue::Str(_t, ty) => ty,
+        ConstValue::Op(_o, _a, ty) => Option::Some.(ty),
     }
 }
 
@@ -161,6 +166,40 @@ fn const_kind(&cx: Domain!['k], value: ConstValue['k]) -> Span['k] {
         ConstValue::Bool(_b) => Span::from_static(&cx, "bool"),
         ConstValue::Float(_t, _u) => Span::from_static(&cx, "float"),
         ConstValue::Str(_t, _u) => Span::from_static(&cx, "str"),
+        ConstValue::Op(_o, _a, _t) => Span::from_static(&cx, "op"),
+    }
+}
+
+forall 'k.
+fn op_value(&cx: Domain!['k], name: Slice[u8, 'static], operands: ArenaVec[ConstValue['k], 'k], ty: Type['k]) -> ConstValue['k] {
+    ConstValue::Op.(Span::from_static(&cx, name), operands, ty)
+}
+
+forall 'k.
+fn is_op(value: ConstValue['k]) -> bool {
+    match value {
+        ConstValue::Op(_o, _a, _t) => true,
+        _ => false,
+    }
+}
+
+// Whether `value` is a `bool` constant.
+forall 'k.
+fn is_boolean(&cx: Domain!['k], value: ConstValue['k]) -> bool {
+    match value {
+        ConstValue::Bool(_b) => true,
+        ConstValue::Op(_o, _a, ty) => C::same(&cx, ty, C::bool_type(&cx)),
+        _ => false,
+    }
+}
+
+// The type of an integer constant, or None for any other constant.
+forall 'k.
+fn integer_of(&cx: Domain!['k], value: ConstValue['k]) -> Option[Span['k]] {
+    match value {
+        ConstValue::Int(_v, ty) => integer_type(&cx, Option::Some.(ty)),
+        ConstValue::Op(_o, _a, ty) => integer_type(&cx, Option::Some.(ty)),
+        _ => Option::None,
     }
 }
 
@@ -419,6 +458,16 @@ fn all_params(&cx: Domain!['k], f: S::Forall['k]) -> ArenaVec[Span['k], 'k] {
     let out = f.params.clone(&cx);
     out.append(&cx, f.determined);
     out
+}
+
+// The KURS instruction of a binary operator.
+forall 'k.
+fn binop_name(&cx: Domain!['k], op: Span['k]) -> Slice[u8, 'static] {
+    if op.is(&cx, "+") { "add" } else if op.is(&cx, "-") { "sub" } else if op.is(&cx, "*") { "mul" } else if op.is(&cx, "/") { "div" }
+    else if op.is(&cx, "%") { "mod" } else if op.is(&cx, "&") { "bit_and" } else if op.is(&cx, "|") { "bit_or" }
+    else if op.is(&cx, "^") { "bit_xor" } else if op.is(&cx, "<<") { "shl" } else if op.is(&cx, ">>") { "shr" }
+    else if op.is(&cx, "==") { "eq" } else if op.is(&cx, "!=") { "ne" } else if op.is(&cx, "<") { "lt" } else if op.is(&cx, "<=") { "le" }
+    else if op.is(&cx, ">") { "gt" } else { "ge" }
 }
 
 forall 'k.
@@ -889,7 +938,8 @@ impl Signatures['k] {
 
     // An array length is folded as a usize, but a literal with another integer suffix keeps its
     // own type: the length is the value's 64 bits, so a negative length of a signed type is its
-    // two's complement.
+    // two's complement. A type's array length is the compiler's to know, and arithmetic on `usize` and
+    // `isize` is the C compiler's to fold.
     fn array_length(self, &cx: Domain!['k], expr: Expr['k]) -> Result[u64, SigError['k]] {
         match self.fold(&cx, expr, Option::Some.(C::usize_type(&cx)), Option::None, true)? {
             ConstValue::Int(value, ty) => if is_negative(&cx, value, ty) {
@@ -897,6 +947,7 @@ impl Signatures['k] {
             } else {
                 Result::Ok.(value)
             },
+            ConstValue::Op(_o, _a, _t) => sig_error_static(&cx, "an array length cannot use arithmetic on usize or isize"),
             _ => sig_error_static(&cx, "an array length is an integer constant"),
         }
     }
@@ -1179,7 +1230,9 @@ impl Signatures['k] {
     // Type a constant expression and, when `evaluate`, its value.
     //
     // Unevaluated short-circuit operands still validate operators and literals; only computed
-    // values (and their division-by-zero traps) are skipped.
+    // values (and their division-by-zero traps) are skipped. An operation on `usize` or `isize`, or on
+    // the value of one, is not evaluated: it is a `ConstValue::Op`, which the C compiler folds at the
+    // target's width.
     fn fold(self, &cx: Domain!['k], expr: Expr['k], want: Option[Type['k]], home: Option[ModuleId['k]], evaluate: bool) -> Result[ConstValue['k], SigError['k]] {
         match expr {
             Expr::Lit(lit) => match lit.kind {
@@ -1189,7 +1242,7 @@ impl Signatures['k] {
                         Option::None => want,
                     };
                     match integer_type(&cx, ty) {
-                        Option::Some(name) => self.wrapped_literal(&cx, lit.int, false, name, lit.pos),
+                        Option::Some(name) => self.literal(&cx, lit.int, false, name, lit.pos),
                         Option::None => sig_error(Span::from_static(&cx, "an integer constant needs a type"), lit.pos),
                     }
                 },
@@ -1255,14 +1308,20 @@ impl Signatures['k] {
             Expr::Cast(c) => {
                 let v = self.fold(&cx, c.value.copy(&cx), Option::None, home, evaluate)?;
                 let to = self.type(&cx, c.type, new_scope(&cx))?;
+                let (source, target) = match integer_of(&cx, v) {
+                    Option::Some(source) => match integer_type(&cx, Option::Some.(to)) {
+                        Option::Some(target) => (source, target),
+                        Option::None => return sig_error(Span::from_static(&cx, "a constant cast converts between integer types"), c.pos),
+                    },
+                    Option::None => return sig_error(Span::from_static(&cx, "a constant cast converts between integer types"), c.pos),
+                };
                 let unit = match v {
-                    ConstValue::Int(value, _ty) => match integer_type(&cx, Option::Some.(to)) {
-                        Option::Some(name) => return Result::Ok.(wrapped(&cx, value, name)),
-                        Option::None => (),
+                    ConstValue::Int(value, _ty) => if !C::is_pointer_sized(&cx, source) && !C::is_pointer_sized(&cx, target) {
+                        return Result::Ok.(wrapped(&cx, value, target));
                     },
                     _ => (),
                 };
-                sig_error(Span::from_static(&cx, "a constant cast converts between integer types"), c.pos)
+                Result::Ok.(op_value(&cx, "int_cast", ArenaVec::one(&cx, v), to))
             },
             Expr::Binop(b) => self.binop(&cx, b, want, home, evaluate),
             _ => sig_error(Span::from_static(&cx, "not a constant expression"), S::expr_pos(expr)),
@@ -1280,7 +1339,7 @@ impl Signatures['k] {
                             Option::None => want,
                         };
                         return match integer_type(&cx, ty) {
-                            Option::Some(name) => self.wrapped_literal(&cx, literal.int, true, name, expr.pos),
+                            Option::Some(name) => self.literal(&cx, literal.int, true, name, expr.pos),
                             Option::None => sig_error(Span::from_static(&cx, "an integer constant needs a type"), expr.pos),
                         };
                     },
@@ -1298,33 +1357,44 @@ impl Signatures['k] {
             ConstValue::Bool(b) => if expr.op.is(&cx, "!") {
                 return Result::Ok.(ConstValue::Bool.(!b));
             },
+            ConstValue::Op(_o, _a, ty) => if expr.op.is(&cx, "!") && C::same(&cx, ty, C::bool_type(&cx)) {
+                return Result::Ok.(op_value(&cx, "not", ArenaVec::one(&cx, v), ty));
+            },
             _ => (),
         };
-        match v {
-            ConstValue::Int(value, ty) => {
-                let name = match ty {
-                    Type::Prim(n) => n,
-                    _ => Span::from_static(&cx, ""),
-                };
-                Result::Ok.(wrapped(&cx, if expr.op.is(&cx, "-") { 0u64 - value } else { value ^ all_bits() }, name))
+        let name = match integer_of(&cx, v) {
+            Option::Some(name) => name,
+            Option::None => return sig_error(Span::from_static(&cx, "operator needs an integer"), expr.pos),
+        };
+        let unit = match v {
+            ConstValue::Int(value, _ty) => if !C::is_pointer_sized(&cx, name) {
+                return Result::Ok.(wrapped(&cx, if expr.op.is(&cx, "-") { 0u64 - value } else { value ^ all_bits() }, name));
             },
-            _ => sig_error(Span::from_static(&cx, "operator needs an integer"), expr.pos),
-        }
+            _ => (),
+        };
+        Result::Ok.(op_value(&cx, if expr.op.is(&cx, "-") { "neg" } else { "not" }, ArenaVec::one(&cx, v), Type::Prim.(name)))
     }
 
     fn binop(self, &cx: Domain!['k], expr: S::Binop['k], want: Option[Type['k]], home: Option[ModuleId['k]], evaluate: bool) -> Result[ConstValue['k], SigError['k]] {
         let op = expr.op;
         if op.is(&cx, "&&") || op.is(&cx, "||") {
-            let a = match self.fold(&cx, expr.left.copy(&cx), Option::Some.(C::bool_type(&cx)), home, evaluate)? {
-                ConstValue::Bool(x) => x,
-                _ => return sig_error(Span::from_static(&cx, "logical constant operands must be booleans"), expr.pos),
+            let a = self.fold(&cx, expr.left.copy(&cx), Option::Some.(C::bool_type(&cx)), home, evaluate)?;
+            if !is_boolean(&cx, a) {
+                return sig_error(Span::from_static(&cx, "logical constant operands must be booleans"), expr.pos);
+            }
+            // An operand the C compiler folds may be either value: the other is needed.
+            let needed = match a {
+                ConstValue::Bool(x) => x == op.is(&cx, "&&"),
+                _ => true,
             };
-            let needed = if op.is(&cx, "&&") { a } else { !a };
-            let b = match self.fold(&cx, expr.right.copy(&cx), Option::Some.(C::bool_type(&cx)), home, evaluate && needed)? {
-                ConstValue::Bool(x) => x,
-                _ => return sig_error(Span::from_static(&cx, "logical constant operands must be booleans"), expr.pos),
-            };
-            return Result::Ok.(ConstValue::Bool.(if op.is(&cx, "&&") { a && b } else { a || b }));
+            let b = self.fold(&cx, expr.right.copy(&cx), Option::Some.(C::bool_type(&cx)), home, evaluate && needed)?;
+            if !is_boolean(&cx, b) {
+                return sig_error(Span::from_static(&cx, "logical constant operands must be booleans"), expr.pos);
+            }
+            if is_op(a) {
+                return Result::Ok.(op_value(&cx, if op.is(&cx, "&&") { "and" } else { "or" }, ArenaVec::two(&cx, a, b), C::bool_type(&cx)));
+            }
+            return Result::Ok.(if needed { b } else { a });
         }
         let comparison = is_comparison(&cx, op);
         let hint = if comparison { Option::None } else { want };
@@ -1344,28 +1414,50 @@ impl Signatures['k] {
                 (a, b)
             },
         };
-        let unit = match a {
-            ConstValue::Bool(x) => if op.is(&cx, "==") || op.is(&cx, "!=") {
-                return match b {
-                    ConstValue::Bool(y) => Result::Ok.(ConstValue::Bool.((x == y) == op.is(&cx, "=="))),
-                    _ => sig_error(Span::from_static(&cx, "constant comparison operands must have the same type"), expr.pos),
-                };
+        if is_boolean(&cx, a) && (op.is(&cx, "==") || op.is(&cx, "!=")) {
+            if !is_boolean(&cx, b) {
+                return sig_error(Span::from_static(&cx, "constant comparison operands must have the same type"), expr.pos);
+            }
+            let unit = match a {
+                ConstValue::Bool(x) => match b {
+                    ConstValue::Bool(y) => return Result::Ok.(ConstValue::Bool.((x == y) == op.is(&cx, "=="))),
+                    _ => (),
+                },
+                _ => (),
+            };
+            return Result::Ok.(op_value(&cx, binop_name(&cx, op), ArenaVec::two(&cx, a, b), C::bool_type(&cx)));
+        }
+        let name = match integer_of(&cx, a) {
+            Option::Some(name) => name,
+            Option::None => return sig_error(Span::from_static(&cx, "constant operands must be integers of one type"), expr.pos),
+        };
+        let ty = Type::Prim.(name);
+        let same = match integer_of(&cx, b) {
+            Option::Some(other) => C::same(&cx, ty, Type::Prim.(other)),
+            Option::None => false,
+        };
+        if !same {
+            return sig_error(Span::from_static(&cx, "constant operands must be integers of one type"), expr.pos);
+        }
+        // A literal 0 is 0 at every width.
+        if evaluate && (op.is(&cx, "/") || op.is(&cx, "%")) {
+            let unit = match b {
+                ConstValue::Int(y, _t) => if y == 0u64 {
+                    return sig_error(Span::from_static(&cx, "constant division by zero"), expr.pos);
+                },
+                _ => (),
+            };
+        }
+        let known = match a {
+            ConstValue::Int(x, _t) => match b {
+                ConstValue::Int(y, _u) => if C::is_pointer_sized(&cx, name) { Option::None } else { Option::Some.((x, y)) },
+                _ => Option::None,
             },
-            _ => (),
+            _ => Option::None,
         };
-        let (x, ty) = match a {
-            ConstValue::Int(x, ty) => (x, ty),
-            _ => return sig_error(Span::from_static(&cx, "constant operands must be integers of one type"), expr.pos),
-        };
-        let y = match b {
-            ConstValue::Int(y, other) => if C::same(&cx, ty, other) { y } else {
-                return sig_error(Span::from_static(&cx, "constant operands must be integers of one type"), expr.pos);
-            },
-            _ => return sig_error(Span::from_static(&cx, "constant operands must be integers of one type"), expr.pos),
-        };
-        let name = match ty {
-            Type::Prim(n) => n,
-            _ => Span::from_static(&cx, ""),
+        let (x, y) = match known {
+            Option::Some(pair) => pair,
+            Option::None => return Result::Ok.(op_value(&cx, binop_name(&cx, op), ArenaVec::two(&cx, a, b), if comparison { C::bool_type(&cx) } else { ty })),
         };
         if !evaluate {
             return Result::Ok.(if comparison { ConstValue::Bool.(false) } else { wrapped(&cx, 0u64, name) });
@@ -1394,9 +1486,6 @@ impl Signatures['k] {
         }
         let bits = C::integer_bits(&cx, name) as u64;
         let value = if op.is(&cx, "/") || op.is(&cx, "%") {
-            if y == 0u64 {
-                return sig_error(Span::from_static(&cx, "constant division by zero"), expr.pos);
-            }
             // The quotient rounds toward zero, from the magnitudes; the most negative i64's
             // magnitude, 2^63, fits in a u64.
             let x_negative = signed && x >= sign_bit();
@@ -1437,7 +1526,7 @@ impl Signatures['k] {
 
     // A literal's value in the integer type `name`; it must fit (a negated one may reach the
     // minimum).
-    fn wrapped_literal(self, &cx: Domain!['k], magnitude: u64, negative: bool, name: Span['k], pos: Pos) -> Result[ConstValue['k], SigError['k]] {
+    fn literal(self, &cx: Domain!['k], magnitude: u64, negative: bool, name: Span['k], pos: Pos) -> Result[ConstValue['k], SigError['k]] {
         let spelled = if negative && magnitude != 0u64 {
             Buffer::new().push_static("-").push_u64(magnitude).save(&cx)
         } else {
@@ -1446,11 +1535,12 @@ impl Signatures['k] {
         if !valid_literal(&cx, Type::Prim.(name), spelled) {
             return sig_error(Buffer::new().push_bytes(&cx, spelled).push_static(" does not fit ").push_bytes(&cx, name).save(&cx), pos);
         }
-        Result::Ok.(wrapped(&cx, if negative { 0u64 - magnitude } else { magnitude }, name))
+        // A literal fits its type: negated, its 64 bits are already sign-extended.
+        Result::Ok.(ConstValue::Int.(if negative { 0u64 - magnitude } else { magnitude }, Type::Prim.(name)))
     }
 }
 
-// `value` in the integer type `name`'s width, sign-extended when it is signed.
+// `value` in the width of the fixed-width integer type `name`, sign-extended when it is signed.
 forall 'k.
 fn wrapped(&cx: Domain!['k], value: u64, name: Span['k]) -> ConstValue['k] {
     let bits = C::integer_bits(&cx, name) as u64;

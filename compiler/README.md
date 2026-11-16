@@ -616,6 +616,33 @@ The layout is sound because no program can observe or break it:
   variant is the enum's object (see "Why `restrict` is sound where it is written"); packing and
   opening a niche-layout enum copy its value like any other.
 
+### Pointer-sized integers
+
+`usize` and `isize` are pointer-sized: their C types are `uintptr_t` and `intptr_t`, and one C file
+is right on a 32-bit and on a 64-bit target. The compiler never assumes their width:
+
+- **Literals** of `usize` and `isize` range over 64 bits, the same on every target: `0xffff_ffff_ffff_ffffusize`
+  is accepted, and on a 32-bit target C converts it to the type, keeping its low 32 bits. Match
+  ranges are checked against the same range.
+- **Constant arithmetic on them is the C compiler's.** Folding (`sigs::signatures`, `sigs.py`) does
+  not evaluate an operation on `usize` or `isize`, nor one on the value of such an operation (a
+  cast to `u32` of a `usize` constant, a comparison of two): it keeps it as an operation
+  (`ConstValue::Op`; `OpConst`), and lowering emits its instructions wherever the constant is used,
+  for the C compiler to fold at the target's width. `usize::MAX` is `!0usize`, and `usize::BITS`
+  is computed from it. A division by a literal 0 is still an error, since 0 is 0 at every width.
+- **An array length** is part of a type, so the compiler must know it: it may not use arithmetic on
+  `usize` or `isize` (`an array length cannot use arithmetic on usize or isize`); a literal, a
+  constant that is one, or arithmetic in `u64` is accepted.
+- **Run-time arithmetic** is done unsigned in `uintptr_t` and decoded to `intptr_t` for `isize`
+  (`kur_dec_isize`); a shift amount is taken modulo `KUR_PTR_BITS`, the width C gives
+  `uintptr_t`. Conversions to and from the fixed-width types truncate or extend at the target's
+  width, and pointer casts go through `uintptr_t`.
+- **Foreign functions** that take or return `usize` or `isize` are declared with `uintptr_t` and
+  `intptr_t`, so their C side (`lib/libc/*.h`) uses those types too.
+
+The size estimate that passes aggregates by pointer (`words`) counts every scalar, `usize`
+included, as one word on every target.
+
 ### The C compiler
 
 `kursal build` compiles the C with `$KURSAL_CC`, else `clang`, with `-O3 -w -fno-builtin`, and so do
@@ -625,7 +652,8 @@ generated code (unused labels, the standard library's own prototypes of C functi
 the same name, which an extern or a Kursal function may declare with another type.
 
 The C is GNU C (`__typeof__`, `__builtin_*`, `__atomic_*`), as Clang and GCC accept it, and includes
-only `<stddef.h>` and `<stdint.h>`; `usize` and `isize` are 64-bit. It calls no C library function
+only `<stddef.h>` and `<stdint.h>`; `usize` and `isize` are pointer-sized (see "Pointer-sized
+integers"). It calls no C library function
 but those a program declares `extern`, yet the C compiler may: like any C compiler for a
 freestanding target, it emits calls to `memcpy`, `memmove`, `memset` and `memcmp` to copy, fill
 and compare memory. A target, hosted or freestanding, must provide those four.

@@ -3,7 +3,7 @@ import math
 import re
 import struct
 
-from .core import FLOATS, INTEGERS, Prim
+from .core import FLOATS, INTEGERS, LITERAL_BITS, Prim
 
 
 def valid_literal(ty: Prim, text: str) -> bool:
@@ -28,7 +28,7 @@ def valid_literal(ty: Prim, text: str) -> bool:
         value = int(text, 10)
     except ValueError:
         return False
-    bits = INTEGERS[ty.name]
+    bits = LITERAL_BITS[ty.name]
     if ty.name.startswith("i"):
         return -(1 << (bits - 1)) <= value < 1 << (bits - 1)
     return 0 <= value < 1 << bits

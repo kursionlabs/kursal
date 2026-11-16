@@ -12,8 +12,13 @@ from .sexpr import Form, Position
 
 type Kind = Literal["brand", "copy", "any"]
 
-INTEGERS = {"i8": 8, "i16": 16, "i32": 32, "i64": 64, "isize": 64,
-            "u8": 8, "u16": 16, "u32": 32, "u64": 64, "usize": 64}
+# The fixed-width integer types, with their widths in bits.
+WIDTHS = {"i8": 8, "i16": 16, "i32": 32, "i64": 64, "u8": 8, "u16": 16, "u32": 32, "u64": 64}
+# `usize` and `isize` are pointer-sized: their width is the target's, which only the C compiler knows.
+POINTER_SIZED = frozenset({"isize", "usize"})
+INTEGERS = frozenset(WIDTHS) | POINTER_SIZED
+# The range of an integer literal, in bits: its type's width, and 64 bits for `usize` and `isize`.
+LITERAL_BITS = {**WIDTHS, "isize": 64, "usize": 64}
 FLOATS = {"f32", "f64"}
 PRIMS = set(INTEGERS) | FLOATS | {"bool"}
 

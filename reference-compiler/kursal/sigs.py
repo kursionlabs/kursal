@@ -2,7 +2,8 @@
 
 Types become core types, with each nominal declaration named by its
 identity. Functions, methods, externs and trait methods get core
-signatures, with place modes. Consts are folded to values.
+signatures, with place modes. Consts are folded to values, except arithmetic
+on `usize` and `isize`, which the C compiler folds.
 """
 
 from __future__ import annotations
@@ -31,7 +32,10 @@ LIBRARY = {  # name: (home library, path there, path through std)
     "Ordering": ("core", ("atomic", "Ordering"), ("atomic", "Ordering")),
 }
 
-WIDTHS = C.INTEGERS
+# The KURS instruction of each binary operator.
+OPERATORS = {"+": "add", "-": "sub", "*": "mul", "/": "div", "%": "mod", "&": "bit_and", "|": "bit_or",
+             "^": "bit_xor", "<<": "shl", ">>": "shr", "==": "eq", "!=": "ne", "<": "lt", "<=": "le",
+             ">": "gt", ">=": "ge"}
 
 
 class SigError(KursError):
@@ -73,7 +77,11 @@ type IntConst = tuple[Literal["int"], int, C.Prim]
 type BoolConst = tuple[Literal["bool"], bool, C.Prim]
 type FloatConst = tuple[Literal["float"], str, Optional[C.Type]]
 type StringConst = tuple[Literal["str"], str, Optional[C.Type]]
-type ConstValue = IntConst | BoolConst | FloatConst | StringConst
+# An operation the C compiler folds, at the target's width: one on `usize` or `isize`, or on the value
+# of another such operation. Its operator is a binary operator's instruction (`OPERATORS`), `int_cast`,
+# `neg`, `not`, `and` or `or`; its type is the result's.
+type OpConst = tuple[Literal["op"], tuple[str, tuple[ConstValue, ...]], C.Prim]
+type ConstValue = IntConst | BoolConst | FloatConst | StringConst | OpConst
 
 
 @dataclass
@@ -274,6 +282,10 @@ class Signatures:
 
     def array_length(self, expr: S.Expr) -> int:
         value = self.fold(expr, C.USIZE)
+        # A type's array length is the compiler's to know, and arithmetic on `usize` and `isize` is the C
+        # compiler's to fold.
+        if value[0] == "op":
+            fail("an array length cannot use arithmetic on usize or isize")
         if value[0] != "int":
             fail("an array length is an integer constant")
         if value[1] < 0:
@@ -413,15 +425,17 @@ class Signatures:
         """Type a constant expression and optionally evaluate its value.
 
         Unevaluated short-circuit operands still validate operators and literals;
-        only computed values (and their division-by-zero traps) are skipped.
+        only computed values (and their division-by-zero traps) are skipped. An operation on `usize`
+        or `isize`, or on the value of one, is not evaluated: it is an `OpConst`, which the C compiler
+        folds at the target's width.
         """
         if isinstance(expr, S.Lit):
             if expr.kind == "int":
                 assert isinstance(expr.value, int)
                 ty = C.Prim(expr.suffix) if expr.suffix else want
-                if ty is None or not (isinstance(ty, C.Prim) and ty.name in WIDTHS):
+                if ty is None or not (isinstance(ty, C.Prim) and ty.name in C.INTEGERS):
                     fail("an integer constant needs a type", expr.pos)
-                return self.wrapped(expr.value, ty, expr.pos, exact=True)
+                return self.literal(expr.value, ty, expr.pos)
             if expr.kind == "bool":
                 assert isinstance(expr.value, bool)
                 return ("bool", expr.value, C.BOOL)
@@ -450,23 +464,31 @@ class Signatures:
                 literal = expr.operand
                 assert isinstance(literal.value, int)
                 ty = C.Prim(literal.suffix) if literal.suffix else want
-                if not isinstance(ty, C.Prim) or ty.name not in WIDTHS:
+                if not isinstance(ty, C.Prim) or ty.name not in C.INTEGERS:
                     fail("an integer constant needs a type", expr.pos)
-                return self.wrapped(-literal.value, ty, expr.pos, exact=True)
+                return self.literal(-literal.value, ty, expr.pos)
             v = self.fold(expr.operand, want, module, evaluate=evaluate)
             if expr.op == "-" and v[0] == "float":
                 return ("float", v[1][1:] if v[1].startswith("-") else "-" + v[1], v[2])
             if v[0] == "bool" and expr.op == "!":
                 return ("bool", not v[1], C.BOOL)
-            if v[0] != "int":
+            if v[0] == "op" and v[2] == C.BOOL and expr.op == "!":
+                return ("op", ("not", (v,)), C.BOOL)
+            ty = integer(v)
+            if ty is None:
                 fail("operator needs an integer", expr.pos)
-            return self.wrapped(-v[1] if expr.op == "-" else ~v[1], v[2], expr.pos)
+            if v[0] != "int" or ty.name in C.POINTER_SIZED:
+                return ("op", ("neg" if expr.op == "-" else "not", (v,)), ty)
+            return self.wrapped(-v[1] if expr.op == "-" else ~v[1], ty)
         if isinstance(expr, S.Cast):
             v = self.fold(expr.value, None, module, evaluate=evaluate)
             to = self.type(expr.type, Scope())
-            if v[0] != "int" or not (isinstance(to, C.Prim) and to.name in WIDTHS):
+            source = integer(v)
+            if source is None or not (isinstance(to, C.Prim) and to.name in C.INTEGERS):
                 fail("a constant cast converts between integer types", expr.pos)
-            return self.wrapped(v[1], to, expr.pos)
+            if v[0] != "int" or source.name in C.POINTER_SIZED or to.name in C.POINTER_SIZED:
+                return ("op", ("int_cast", (v,)), to)
+            return self.wrapped(v[1], to)
         if isinstance(expr, S.Binop):
             return self.binop(expr, want, module, evaluate=evaluate)
         fail("not a constant expression", expr.pos)
@@ -474,13 +496,16 @@ class Signatures:
     def binop(self, expr: S.Binop, want: Optional[C.Type], module: Optional[C.ModuleId], *, evaluate: bool = True) -> ConstValue:
         if expr.op in ("&&", "||"):
             a = self.fold(expr.left, C.BOOL, module, evaluate=evaluate)
-            if a[0] != "bool":
+            if not boolean(a):
                 fail("logical constant operands must be booleans", expr.pos)
-            needed = a[1] if expr.op == "&&" else not a[1]
+            # An operand the C compiler folds may be either value: the other is needed.
+            needed = a[0] == "op" or a[1] == (expr.op == "&&")
             b = self.fold(expr.right, C.BOOL, module, evaluate=evaluate and needed)
-            if b[0] != "bool":
+            if not boolean(b):
                 fail("logical constant operands must be booleans", expr.pos)
-            return ("bool", a[1] and b[1] if expr.op == "&&" else a[1] or b[1], C.BOOL)
+            if a[0] == "op":
+                return ("op", ("and" if expr.op == "&&" else "or", (a, b)), C.BOOL)
+            return b if needed else a
         comparison = expr.op in ("==", "!=", "<", "<=", ">", ">=")
         hint = None if comparison else want
         try:
@@ -489,22 +514,28 @@ class Signatures:
         except SigError:
             b = self.fold(expr.right, hint, module, evaluate=evaluate)
             a = self.fold(expr.left, b[2], module, evaluate=evaluate)
-        if a[0] == "bool" and expr.op in ("==", "!="):
-            if b[0] != "bool":
+        if boolean(a) and expr.op in ("==", "!="):
+            if not boolean(b):
                 fail("constant comparison operands must have the same type", expr.pos)
+            if a[0] == "op" or b[0] == "op":
+                return ("op", (OPERATORS[expr.op], (a, b)), C.BOOL)
             return ("bool", (a[1] == b[1]) == (expr.op == "=="), C.BOOL)
-        if a[0] != "int" or b[0] != "int" or a[2] != b[2]:
+        ty = integer(a)
+        if ty is None or integer(b) != ty:
             fail("constant operands must be integers of one type", expr.pos)
-        x, y, ty = a[1], b[1], a[2]
+        # A literal 0 is 0 at every width.
+        if evaluate and expr.op in ("/", "%") and b[0] == "int" and b[1] == 0:
+            fail("constant division by zero", expr.pos)
+        if a[0] != "int" or b[0] != "int" or ty.name in C.POINTER_SIZED:
+            return ("op", (OPERATORS[expr.op], (a, b)), C.BOOL if comparison else ty)
+        x, y = a[1], b[1]
         if not evaluate:
-            return ("bool", False, C.BOOL) if comparison else self.wrapped(0, ty, expr.pos)
+            return ("bool", False, C.BOOL) if comparison else self.wrapped(0, ty)
         if comparison:
             return ("bool", {"==": x == y, "!=": x != y, "<": x < y, "<=": x <= y, ">": x > y, ">=": x >= y}[expr.op],
                     C.BOOL)
-        bits = WIDTHS[ty.name]
+        bits = C.WIDTHS[ty.name]
         if expr.op in ("/", "%"):
-            if y == 0:
-                fail("constant division by zero", expr.pos)
             q = abs(x) // abs(y) * (1 if (x < 0) == (y < 0) else -1)
             value = q if expr.op == "/" else x - q * y
         elif expr.op in ("<<", ">>"):
@@ -512,18 +543,32 @@ class Signatures:
             value = x << shift if expr.op == "<<" else x >> shift
         else:
             value = {"+": x + y, "-": x - y, "*": x * y, "&": x & y, "|": x | y, "^": x ^ y}[expr.op]
-        return self.wrapped(value, ty, expr.pos)
+        return self.wrapped(value, ty)
 
-    def wrapped(self, value: int, ty: C.Prim, pos: Optional[Position], exact: bool = False) -> IntConst:
-        """`value` in `ty`'s width; a literal must already fit (a negated one may reach MIN)."""
-        bits = WIDTHS[ty.name]
-        signed = ty.name.startswith("i")
-        if exact and not valid_literal(ty, str(value)):
+    def literal(self, value: int, ty: C.Prim, pos: Optional[Position]) -> IntConst:
+        """A literal's value, which must fit `ty` (a negated one may reach MIN)."""
+        if not valid_literal(ty, str(value)):
             fail(f"{value} does not fit {ty.name}", pos)
+        return ("int", value, ty)
+
+    def wrapped(self, value: int, ty: C.Prim) -> IntConst:
+        """`value` in the width of `ty`, a fixed-width integer type."""
+        bits = C.WIDTHS[ty.name]
         value &= (1 << bits) - 1
-        if signed and value >= 1 << bits - 1:
+        if ty.name.startswith("i") and value >= 1 << bits - 1:
             value -= 1 << bits
         return ("int", value, ty)
+
+
+def boolean(value: ConstValue) -> bool:
+    """Whether `value` is a `bool` constant."""
+    return value[0] in ("bool", "op") and value[2] == C.BOOL
+
+
+def integer(value: ConstValue) -> Optional[C.Prim]:
+    """The type of an integer constant, or None for any other constant."""
+    ty = value[2]
+    return ty if value[0] in ("int", "op") and isinstance(ty, C.Prim) and ty.name in C.INTEGERS else None
 
 
 def signatures(resolver: Resolver) -> Signatures:
