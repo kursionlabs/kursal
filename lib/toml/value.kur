@@ -28,10 +28,10 @@ struct TomlAssignment {
     path: List[Span['k], 'k],
 }
 
-// All unsafe parsing helpers require live lexer tokens and their arena-backed,
-// valid UTF-8 text. A brand alone does not establish these obligations.
+// The parsing helpers read tokens and spans of the arena's domain, through
+// its capability.
 forall 'k.
-unsafe fn toml_bare_key(&tag: Exclusive!['k], text: Span['k]) -> bool {
+fn toml_bare_key(&tag: Exclusive!['k], text: Span['k]) -> bool {
     var i = 0usize;
     var valid = text.len() > 0usize;
     while i < text.len() && valid {
@@ -45,7 +45,7 @@ unsafe fn toml_bare_key(&tag: Exclusive!['k], text: Span['k]) -> bool {
 // Stops before the first non-dot token. Empty quoted keys are valid TOML;
 // multiline strings and non-ASCII bare keys are not.
 forall 'k.
-unsafe fn toml_key(
+fn toml_key(
     &cx: Domain!['k],
     tokens: List[TomlToken['k], 'k],
 ) -> Result[(List[Span['k], 'k], List[TomlToken['k], 'k]), TomlError] {
@@ -71,7 +71,7 @@ unsafe fn toml_key(
                         }
                     },
                     TomlTokenKind::Bare(text) => {
-                        if unsafe toml_bare_key(&cx.tag, text) {
+                        if toml_bare_key(&cx.tag, text) {
                             Result::Ok.(text)
                         } else {
                             Result[Span['k], TomlError]::Err.(TomlError::Syntax.(token.offset))
@@ -118,7 +118,7 @@ unsafe fn toml_key(
 }
 
 forall 'k.
-unsafe fn toml_path_prefix(&tag: Exclusive!['k], a: List[Span['k], 'k], b: List[Span['k], 'k]) -> bool {
+fn toml_path_prefix(&tag: Exclusive!['k], a: List[Span['k], 'k], b: List[Span['k], 'k]) -> bool {
     match a {
         List::Empty => true,
         List::Cell(ar) => {
@@ -128,7 +128,7 @@ unsafe fn toml_path_prefix(&tag: Exclusive!['k], a: List[Span['k], 'k], b: List[
                 List::Cell(br) => {
                     let bc = br.copy(&tag);
                     if ac.head.eq(&tag, bc.head) {
-                        unsafe toml_path_prefix(&tag, ac.tail, bc.tail)
+                        toml_path_prefix(&tag, ac.tail, bc.tail)
                     } else {
                         false
                     }
@@ -141,17 +141,17 @@ unsafe fn toml_path_prefix(&tag: Exclusive!['k], a: List[Span['k], 'k], b: List[
 // An assignment's value is complete, even if it is an inline table. No later
 // assignment may replace it, extend it, or replace one of its ancestors.
 forall 'k.
-unsafe fn toml_assignment_conflict(&tag: Exclusive!['k], assignments: List[TomlAssignment['k], 'k], path: List[Span['k], 'k]) -> bool {
+fn toml_assignment_conflict(&tag: Exclusive!['k], assignments: List[TomlAssignment['k], 'k], path: List[Span['k], 'k]) -> bool {
     match assignments {
         List::Empty => false,
         List::Cell(r) => {
             let cell = r.copy(&tag);
-            let forward = unsafe toml_path_prefix(&tag, cell.head.path, path);
-            let backward = unsafe toml_path_prefix(&tag, path, cell.head.path);
+            let forward = toml_path_prefix(&tag, cell.head.path, path);
+            let backward = toml_path_prefix(&tag, path, cell.head.path);
             if forward || backward {
                 true
             } else {
-                unsafe toml_assignment_conflict(&tag, cell.tail, path)
+                toml_assignment_conflict(&tag, cell.tail, path)
             }
         },
     }
@@ -163,7 +163,7 @@ unsafe fn toml_assignment_conflict(&tag: Exclusive!['k], assignments: List[TomlA
 // insertion can retain an existing table; document metadata checks whether
 // declaring that table is legal before requesting this mode.
 forall 'k.
-unsafe fn toml_insert(
+fn toml_insert(
     &cx: Domain!['k],
     fields: List[TomlField['k], 'k],
     path: List[Span['k], 'k],
@@ -179,7 +179,7 @@ unsafe fn toml_insert(
                     let child: Result[TomlValue['k], TomlError] = match part.tail {
                         List::Empty => Result::Ok.(value),
                         _ => {
-                            match unsafe toml_insert(&cx, List::Empty, part.tail, value, header) {
+                            match toml_insert(&cx, List::Empty, part.tail, value, header) {
                                 Result::Err(error) => Result::Err.(error),
                                 Result::Ok(nested) => Result::Ok.(TomlValue::Table.(nested)),
                             }
@@ -212,7 +212,7 @@ unsafe fn toml_insert(
                             _ => {
                                 match field.head.value {
                                     TomlValue::Table(nested) => {
-                                        match unsafe toml_insert(&cx, nested, part.tail, value, header) {
+                                        match toml_insert(&cx, nested, part.tail, value, header) {
                                             Result::Err(error) => Result::Err.(error),
                                             Result::Ok(updated) => Result::Ok.(TomlValue::Table.(updated)),
                                         }
@@ -229,7 +229,7 @@ unsafe fn toml_insert(
                             },
                         }
                     } else {
-                        match unsafe toml_insert(&cx, field.tail, path, value, header) {
+                        match toml_insert(&cx, field.tail, path, value, header) {
                             Result::Err(error) => Result::Err.(error),
                             Result::Ok(updated) => {
                                 let rebuilt = updated.cons(&cx, field.head);
@@ -244,14 +244,14 @@ unsafe fn toml_insert(
 }
 
 forall 'k.
-unsafe fn toml_value(&cx: Domain!['k], tokens: List[TomlToken['k], 'k]) -> Result[(TomlValue['k], List[TomlToken['k], 'k]), TomlError] {
+fn toml_value(&cx: Domain!['k], tokens: List[TomlToken['k], 'k]) -> Result[(TomlValue['k], List[TomlToken['k], 'k]), TomlError] {
     match tokens {
         List::Empty => Result::Err.(TomlError::Syntax.(0usize)),
         List::Cell(r) => {
             let cell = r.copy(&cx.tag);
             match cell.head.kind {
                 TomlTokenKind::Text(text) => Result::Ok.((TomlValue::String.(text), cell.tail)),
-                TomlTokenKind::OpenInline => { unsafe toml_inline(&cx, cell.tail) },
+                TomlTokenKind::OpenInline => { toml_inline(&cx, cell.tail) },
                 _ => Result::Err.(TomlError::Syntax.(cell.head.offset)),
             }
         },
@@ -259,7 +259,7 @@ unsafe fn toml_value(&cx: Domain!['k], tokens: List[TomlToken['k], 'k]) -> Resul
 }
 
 forall 'k.
-unsafe fn toml_inline(
+fn toml_inline(
     &cx: Domain!['k],
     tokens: List[TomlToken['k], 'k],
 ) -> Result[(TomlValue['k], List[TomlToken['k], 'k]), TomlError] {
@@ -281,7 +281,7 @@ unsafe fn toml_inline(
         if closing && first {
             return Result[(TomlValue['k], List[TomlToken['k], 'k]), TomlError]::Ok.((TomlValue::Table.(fields), head.tail));
         }
-        let (path, rest) = match unsafe toml_key(&cx, pending) {
+        let (path, rest) = match toml_key(&cx, pending) {
             Result::Err(error) => {
                 return Result[(TomlValue['k], List[TomlToken['k], 'k]), TomlError]::Err.(error);
             },
@@ -300,17 +300,17 @@ unsafe fn toml_inline(
         if !valid {
             return Result[(TomlValue['k], List[TomlToken['k], 'k]), TomlError]::Err.(TomlError::Syntax.(equals.head.offset));
         }
-        let (value, rest) = match unsafe toml_value(&cx, equals.tail) {
+        let (value, rest) = match toml_value(&cx, equals.tail) {
             Result::Err(error) => {
                 return Result[(TomlValue['k], List[TomlToken['k], 'k]), TomlError]::Err.(error);
             },
             Result::Ok(parsed) => parsed,
         };
-        let conflict = unsafe toml_assignment_conflict(&cx.tag, assignments, path);
+        let conflict = toml_assignment_conflict(&cx.tag, assignments, path);
         if conflict {
             return Result[(TomlValue['k], List[TomlToken['k], 'k]), TomlError]::Err.(TomlError::Syntax.(head.head.offset));
         }
-        let updated = match unsafe toml_insert(&cx, fields, path, value, false) {
+        let updated = match toml_insert(&cx, fields, path, value, false) {
             Result::Err(error) => {
                 return Result[(TomlValue['k], List[TomlToken['k], 'k]), TomlError]::Err.(error);
             },
@@ -338,29 +338,4 @@ unsafe fn toml_inline(
         };
     }
     Result::Err.(TomlError::Syntax.(0usize))
-}
-
-// Owning boundary for a single value, useful independently of document parsing.
-// Token descriptors are not accepted from callers of this safe function.
-forall 'k.
-fn parse_value(&cx: Domain!['k], input: Buffer!) -> Result[TomlValue['k], TomlError] {
-    let tokens = match tokenize(&cx, input) {
-        Result::Err(error) => {
-            return Result[TomlValue['k], TomlError]::Err.(error);
-        },
-        Result::Ok(parsed) => parsed,
-    };
-    let (value, rest) = match unsafe toml_value(&cx, tokens) {
-        Result::Err(error) => {
-            return Result[TomlValue['k], TomlError]::Err.(error);
-        },
-        Result::Ok(parsed) => parsed,
-    };
-    match rest {
-        List::Empty => Result::Ok.(value),
-        List::Cell(r) => {
-            let cell = r.copy(&cx.tag);
-            Result::Err.(TomlError::Syntax.(cell.head.offset))
-        },
-    }
 }

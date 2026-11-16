@@ -45,11 +45,3 @@ int32_t kur_libc_thread_join(uint8_t *handle, uint8_t **out_result) {
     if (out_result) *out_result = (uint8_t *)result;
     return 0;
 }
-
-/* The handle is consumed regardless of whether pthread_detach succeeds. */
-int32_t kur_libc_thread_detach(uint8_t *handle) {
-    pthread_t *h = (pthread_t *)handle;
-    int status = pthread_detach(*h);
-    free(h);
-    return status;
-}

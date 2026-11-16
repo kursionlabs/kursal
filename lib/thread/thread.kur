@@ -20,12 +20,9 @@
 
 use std::alloc::heap::HeapAllocator;
 use std::mem::sizeof;
+use std::io::Error;
 use std::option::Result;
 use libc::thread::{spawn as raw_spawn, Thread as RawThread};
-
-exposed struct ThreadError {
-    code: i32,
-}
 
 forall Env, Ret.
 struct SpawnPayload {
@@ -73,7 +70,7 @@ unsafe fn trampoline(raw: *u8) -> *u8 {
 // can be started, `f` comes back unrun with the error, so what it captured
 // is still the caller's.
 forall Env, Ret.
-fn spawn(f: closure[Env]() -> Ret) -> Result[Thread![Ret], (closure[Env]() -> Ret, ThreadError)] {
+fn spawn(f: closure[Env]() -> Ret) -> Result[Thread![Ret], (closure[Env]() -> Ret, Error)] {
     let payload = SpawnPayload.{ f };
     let boxed = HeapAllocator::alloc(sizeof[SpawnPayload[Env, Ret]]());
     let raw = boxed.into_raw();
@@ -88,7 +85,7 @@ fn spawn(f: closure[Env]() -> Ret) -> Result[Thread![Ret], (closure[Env]() -> Re
             // No thread was started, so the box is still this call's.
             let { f } = unsafe *typed;
             let freed = HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(raw));
-            Result::Err.((f, ThreadError.{ code: error }))
+            Result::Err.((f, error))
         },
         Result::Ok(raw_thread) => Result::Ok.(Thread.{ raw: raw_thread }),
     }
@@ -101,11 +98,11 @@ impl Thread[Ret] {
     // join`: no raw pointer escapes, and the pointer read back is the
     // `ResultBox[Ret]` `trampoline` built for this same `Ret`, which
     // nothing else writes through. The box is freed after unboxing.
-    fn join(self) -> Result[Ret, ThreadError] {
+    fn join(self) -> Result[Ret, Error] {
         let { raw } = self;
         let joined = unsafe raw.join();
         match joined {
-            Result::Err(error) => Result::Err.(ThreadError.{ code: error }),
+            Result::Err(error) => Result::Err.(error),
             Result::Ok(result_ptr) => {
                 let typed = unsafe (result_ptr as *ResultBox[Ret]);
                 let boxed_result = unsafe *typed;

@@ -5,9 +5,9 @@ dependencies' names, so `libc`'s dependency on `std` does not make `std::`
 paths visible here. Link with `lib/libc/thread.c` and `-pthread`, as for
 `libc::thread`; this package has no C code of its own.
 
-`spawn(f: closure[Env]() -> Ret) -> Result[Thread![Ret], (closure[Env]() -> Ret, ThreadError)]`
+`spawn(f: closure[Env]() -> Ret) -> Result[Thread![Ret], (closure[Env]() -> Ret, std::io::Error)]`
 moves `f`, and whatever it captured, into a new OS thread, and
-`Thread![Ret]::join(self) -> Result[Ret, ThreadError]` blocks until it
+`Thread![Ret]::join(self) -> Result[Ret, std::io::Error]` blocks until it
 finishes and returns its `Ret` value. When no thread can be started,
 `spawn` hands `f` back unrun beside the error, so a linear value it
 captured is still the caller's. `Ret` may be a zero-size type such as

@@ -7,6 +7,5 @@
 int32_t kur_libc_thread_error(void);
 uint8_t *kur_libc_thread_create(uint8_t *(*entry)(uint8_t *), uint8_t *arg);
 int32_t kur_libc_thread_join(uint8_t *handle, uint8_t **out_result);
-int32_t kur_libc_thread_detach(uint8_t *handle);
 
 #endif

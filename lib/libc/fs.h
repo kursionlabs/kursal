@@ -8,7 +8,6 @@ int32_t kur_libc_fs_error(void);
 void kur_libc_fs_release(uint8_t *bytes);
 uint8_t *kur_libc_fs_canonicalize(uint8_t *bytes, uintptr_t len);
 uint8_t *kur_libc_fs_getenv(uint8_t *bytes, uintptr_t len);
-int32_t kur_libc_fs_stat(uint8_t *bytes, uintptr_t len, uint8_t *output);
 int32_t kur_libc_fs_open_read(uint8_t *bytes, uintptr_t len);
 int32_t kur_libc_fs_create(uint8_t *bytes, uintptr_t len);
 intptr_t kur_libc_fs_read(int32_t fd, uint8_t *buf, uintptr_t len);

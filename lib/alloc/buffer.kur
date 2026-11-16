@@ -18,6 +18,7 @@ use alloc::heap::checked_add;
 use alloc::heap::checked_mul;
 use core::cap::{Brand, Exclusive};
 use core::mem::Ref;
+use core::ptr::offset;
 use alloc::owned::Allocation;
 use core::mem::Region;
 use core::mem::RegionResume;
@@ -30,9 +31,8 @@ use core::iter::Iterator;
 
 // Restricted: no other module can write the literal, which would otherwise
 // let it wrap any pointer (say, one read off a live `Slice`) and `destroy`
-// it -- an arbitrary `free` with no `unsafe`. The one way in from a raw
-// address is `from_owned_ptr` (an `unsafe fn`); the ways out are
-// `as_ptr`/`tail_ptr`.
+// it -- an arbitrary `free` with no `unsafe`. Nothing builds one from a
+// raw address; the ways out to one are `as_ptr`/`tail_ptr`.
 struct Buffer! {
     ptr: *u8,
     len: usize,
@@ -73,14 +73,6 @@ struct BufferRestore! {
 // channel, so an unsatisfiable request is a hard stop.
 extern "C" fn abort() -> !;
 
-// Address of the i-th byte of a flat buffer: cast to `usize`, add, cast
-// back.
-unsafe fn buffer_elem_ptr(base: *u8, i: usize) -> *u8 {
-    let addr = unsafe (base as usize);
-    let addr2 = addr + i;
-    unsafe (addr2 as *u8)
-}
-
 impl Buffer {
     // A new, empty buffer with room for `cap` bytes before the first grow.
     // `new` is this with a starting capacity of 64.
@@ -106,28 +98,11 @@ impl Buffer {
         let { ptr: p, len: len_, cap: c } = b;
         var i = 0usize;
         while i < n {
-            let d = unsafe buffer_elem_ptr(p, i);
+            let d = unsafe offset(p, i);
             unsafe *d = 0u8;
             i = i + 1usize;
         }
         Buffer.{ ptr: p, len: n, cap: c }
-    }
-
-    // Adopts an already-owned heap allocation as a `Buffer!` -- the
-    // counterpart to `as_ptr`/`destroy`, and the only way to build one from
-    // a raw address.
-    //
-    // Precondition: `p` is the base address of a live `malloc`/`realloc`
-    // allocation of at least `cap` bytes with no other owner (no `Uninit!`,
-    // no other `Buffer!`, no live `Ref`/`Slice` whose brand outlives this
-    // call), `len <= cap`, and `p[0..len)` is initialized. The resulting
-    // `Buffer!` frees `p` at `destroy`.
-    //
-    // `cap` may understate the real allocation (`alloc::str::finish` passes
-    // `cap = len`); `destroy` needs only `ptr`, and `ensure` grows from
-    // whatever `cap` says.
-    unsafe fn from_owned_ptr(p: *u8, len: usize, cap: usize) -> Buffer! {
-        Buffer.{ ptr: p, len, cap }
     }
 
     // Grows (doubling) until at least `extra` more bytes fit; a no-op
@@ -154,7 +129,7 @@ impl Buffer {
     fn push_byte(self, val: u8) -> Buffer! {
         let b2 = self.ensure(1usize);
         let { ptr: p, len: n, cap: c } = b2;
-        let dest = unsafe buffer_elem_ptr(p, n);
+        let dest = unsafe offset(p, n);
         unsafe *dest = val;
         Buffer.{ ptr: p, len: checked_add(n, 1usize), cap: c }
     }
@@ -165,9 +140,9 @@ impl Buffer {
         let { ptr: p, len: n, cap: c } = b2;
         var i = 0usize;
         while i < count {
-            let s = unsafe buffer_elem_ptr(src, i);
+            let s = unsafe offset(src, i);
             let v = unsafe *s;
-            let d = unsafe buffer_elem_ptr(p, n + i);
+            let d = unsafe offset(p, n + i);
             unsafe *d = v;
             i = i + 1usize;
         }
@@ -186,17 +161,17 @@ impl Buffer {
     // Appends any readable byte view's bytes, reading through the
     // capability that permits it. Never consumes or frees the view itself.
     forall C, S where ReadBytes[C, S], Copy[S].
-    fn push_bytes(self, &cap: C, bytes: S) -> Buffer! {
-        let n = ReadBytes[C, S]::len(&cap, bytes);
+    fn push_bytes(self, &cx: C, bytes: S) -> Buffer! {
+        let n = ReadBytes[C, S]::len(&cx, bytes);
         // One reservation covers every byte, so the loop stores directly.
         let { ptr: p, len: start, cap: c } = self.reserve(n);
         var len = start;
         var i = 0usize;
         while i < n {
-            let x = ReadBytes[C, S]::get(&cap, bytes, i);
+            let x = ReadBytes[C, S]::get(&cx, bytes, i);
             match x {
                 Option::Some(v) => {
-                    let dest = unsafe buffer_elem_ptr(p, len);
+                    let dest = unsafe offset(p, len);
                     unsafe *dest = v;
                     len = len + 1usize;
                 },
@@ -234,6 +209,18 @@ impl Buffer {
         let b = unsafe self.push_n(p, n);
         let u = other.destroy();
         b
+    }
+
+    // The first `len` bytes, or all of them when there are fewer; the
+    // room stays for what is pushed next.
+    fn truncate(self, len: usize) -> Buffer! {
+        let { ptr: p, len: n, cap: c } = self;
+        Buffer.{ ptr: p, len: if len < n { len } else { n }, cap: c }
+    }
+
+    // No bytes, with the room kept.
+    fn clear(self) -> Buffer! {
+        self.truncate(0usize)
     }
 
     // A new buffer holding the same bytes; `self` comes back unchanged.
@@ -280,7 +267,7 @@ impl Buffer {
     // survive the call so the caller can `commit` afterwards.
     unsafe fn tail_ptr(&self) -> *u8 {
         let { ptr: p, len: n, cap: c } = self;
-        let addr = unsafe buffer_elem_ptr(p, n);
+        let addr = unsafe offset(p, n);
         self = Buffer.{ ptr: p, len: n, cap: c };
         addr
     }
@@ -325,11 +312,9 @@ impl Buffer {
     // `Exclusive!`/`Ref` access pair plus the `RegionResume![u8,'1]` receipt
     // that `restore` needs.
     //
-    // Uses `adopt_raw`, not `adopt_raw_sized(p, c)`: `adopt_raw_sized`
-    // requires the extent to be the size most recently requested for the
-    // block, and `cap` need not be (`from_owned_ptr` allows it to be
-    // understated). So the allocation record holds extent `0usize` ("not
-    // recorded") and `BufferRestore!` carries `cap` itself. Nothing reads the
+    // Uses `adopt_raw`, not `adopt_raw_sized(p, c)`: the allocation record
+    // holds extent `0usize` ("not recorded") and `BufferRestore!` carries
+    // `cap` itself. Nothing reads the
     // record's extent: `restore` discards it via `into_raw`.
     fn open(self) -> exists '1. (Exclusive!['1], Slice[u8, '1], BufferRestore!['1]) {
         let { ptr: p, len: n, cap: c } = self;
@@ -387,9 +372,9 @@ impl BufferWriter {
 
     // Appends any readable byte view's bytes (`Buffer::push_bytes`).
     forall C, S where ReadBytes[C, S], Copy[S].
-    fn append_bytes(self, &cap: C, bytes: S) -> BufferWriter! {
+    fn append_bytes(self, &cx: C, bytes: S) -> BufferWriter! {
         let { buf: b } = self;
-        let b2 = b.push_bytes(&cap, bytes);
+        let b2 = b.push_bytes(&cx, bytes);
         BufferWriter.{ buf: b2 }
     }
 

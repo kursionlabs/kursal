@@ -1,47 +1,43 @@
 // Strings: a `"..."` literal is a `Slice[u8, 'static]`; there is no
 // separate string type. Literal bytes are read through `StaticRead`, the
 // permanent read capability for `'static`, and `bytes_eq` compares the
-// contents of any two readable views. `std::text::str` adds `concat` and a
-// builder (`push_literal`, `push_piece`, `finish`) for mixing literal and
-// computed pieces. `len` and the range-checked `sub` need no capability:
-// they only compute addresses and lengths.
+// contents of any two readable views. A `Buffer!` builds new text from
+// literal and computed pieces. `len` and the range-checked `sub` need no
+// capability: they only compute addresses and lengths.
 
 use std::slice::{Slice, StaticRead, byte_or_zero, bytes_eq, bytes_eq_within};
 use std::option::Option;
 use std::bytes::buffer::Buffer;
-use std::collections::vec::Vec;
-use std::text::str::{concat, push_literal, push_piece, finish};
-use std::text::fmt::u32_to_str;
 
 fn greeting_length() -> usize {
     "Hello, world!".len()
 }
 
 fn first_letter() -> u32 {
-    var sr = StaticRead::get();
+    var sr = StaticRead::new();
     (byte_or_zero(&sr, "Kur", 0) as u32)
 }
 
 fn same_content_different_literals_are_equal() -> bool {
-    var sr = StaticRead::get();
+    var sr = StaticRead::new();
     bytes_eq_within(&sr, "identical", "identical")
 }
 
 fn different_content_is_not_equal() -> bool {
-    var sr = StaticRead::get();
+    var sr = StaticRead::new();
     bytes_eq_within(&sr, "hello", "world")
 }
 
-// `concat` takes two `'static` operands and returns a new `Buffer!`;
-// open it to read its contents.
+// The pieces pushed one after another into a new `Buffer!`; open it to
+// read its contents.
 fn greet(name: Slice[u8, 'static]) -> Buffer! {
-    concat("Hello, ", name)
+    Buffer::new().push_static("Hello, ").push_static(name)
 }
 
 fn greet_matches_expected() -> bool {
     let greeting = greet("Kur");
     let exists 'open1. (tag, s, restore) = greeting.open();
-    var sr = StaticRead::get();
+    var sr = StaticRead::new();
     let ok = bytes_eq(&tag, s, &sr, "Hello, Kur");
     restore.restore(tag).destroy();
     ok
@@ -51,31 +47,28 @@ fn word_from_sentence() -> bool {
     // `sub(start, len)` is range-checked; "the quick fox"[4..9] is in range.
     match "the quick fox".sub(4, 5) {
         Option::Some(word) => {
-            var sr = StaticRead::get();
+            var sr = StaticRead::new();
             bytes_eq_within(&sr, word, "quick")
         },
         Option::None => false,
     }
 }
 
-// The message `format_strings` builds with one `f"..."`, built here by hand
-// with the builder that `f"..."` stands in for. The age is a separately
-// branded allocation, not a literal, which is what `push_piece` is for.
+// The message `format_strings` builds with one `f"..."`, built here by hand.
+// The age's digits come from a separately branded buffer, not a literal,
+// read through that buffer's own capability.
 fn birthday_greeting(age: u32) -> Buffer! {
-    let age_buf = u32_to_str(age);
+    let age_buf = Buffer::new().push_u64(age as u64);
     let exists 'open1. (atag, aslice, arestore) = age_buf.open();
-    let exists 'open2. (vtag, vacc) = Vec::new[u8]();
-    let exists 'open3. (vtag, vacc) = push_literal(vacc, vtag, "Happy birthday! You are ");
-    let exists 'open4. (vtag, vacc, atag) = push_piece(vacc, vtag, atag, aslice);
+    let text = Buffer::new().push_static("Happy birthday! You are ").push_bytes(&atag, aslice).push_static(" years old.");
     arestore.restore(atag).destroy();
-    let exists 'open5. (vtag, vacc) = push_literal(vacc, vtag, " years old.");
-    finish(vacc, vtag)
+    text
 }
 
 fn birthday_greeting_matches_expected() -> bool {
     let greeting = birthday_greeting(30);
     let exists 'open1. (tag, s, restore) = greeting.open();
-    var sr = StaticRead::get();
+    var sr = StaticRead::new();
     let ok = bytes_eq(&tag, s, &sr, "Happy birthday! You are 30 years old.");
     restore.restore(tag).destroy();
     ok

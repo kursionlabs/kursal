@@ -26,7 +26,6 @@ use package as core;
 
 use core::slice::{Slice, ReadBytes, Readable};
 use core::option::Option;
-use core::cap::Exclusive;
 use core::raw::Span;
 
 forall Self.
@@ -41,12 +40,12 @@ trait Writable {
 
 // Writes any readable byte view's bytes, reading through its capability.
 forall W, C, S where Writable[W], ReadBytes[C, S], Copy[S].
-fn write_bytes(out: W, &cap: C, bytes: S) -> W {
-    let n = ReadBytes[C, S]::len(&cap, bytes);
+fn write_bytes(out: W, &cx: C, bytes: S) -> W {
+    let n = ReadBytes[C, S]::len(&cx, bytes);
     var o = out;
     var i = 0usize;
     while i < n {
-        let b = ReadBytes[C, S]::get(&cap, bytes, i);
+        let b = ReadBytes[C, S]::get(&cx, bytes, i);
         let next = match b {
             Option::Some(x) => Writable[W]::write_byte(o, x),
             Option::None => o,
@@ -184,27 +183,27 @@ instance Format[Readable[C, S], W] {
     }
 }
 
-// A writer that also carries a read capability, so an f-string can
-// interpolate views of that capability's domain directly: every `{span}` is
-// read through the writer's own capability, one capability serving any
-// number of parts. `finish` hands both back.
+// A writer that also carries a context that reads a domain's bytes
+// (`ReadBytes`), so an f-string can interpolate spans of that domain directly:
+// every `{span}` is read through the writer's own context, one context
+// serving any number of parts. `finish` hands both back.
 //
-//     let (text, tag) = f"{name} = {value}".write(ReadingWriter::new(Buffer::new(), tag)).finish();
+//     let (text, cx) = f"{name} = {value}".write(ReadingWriter::new(Buffer::new(), cx)).finish();
 forall W, C.
 exposed struct ReadingWriter! {
     out: W,
-    cap: C,
+    cx: C,
 }
 
 forall W, C.
 impl ReadingWriter[W, C] {
-    fn new(out: W, cap: C) -> ReadingWriter![W, C] {
-        ReadingWriter.{ out, cap }
+    fn new(out: W, cx: C) -> ReadingWriter![W, C] {
+        ReadingWriter.{ out, cx }
     }
 
     fn finish(self) -> (W, C) {
-        let { out, cap } = self;
-        (out, cap)
+        let { out, cx } = self;
+        (out, cx)
     }
 }
 
@@ -224,16 +223,13 @@ instance Writable[ReadingWriter![W, C]] {
     }
 }
 
-// A span of the writer's capability domain.
-forall W, 'r where Writable[W].
-instance Format[Span['r], ReadingWriter![W, Exclusive!['r]]] {
-    fn format(value: Span['r], out: ReadingWriter![W, Exclusive!['r]]) -> (Span['r], ReadingWriter![W, Exclusive!['r]]) {
-        let { out: o, cap } = out;
-        // `unsafe`: `cap` is the capability for `value`'s domain, so its
-        // bytes are readable for the call.
-        let (ptr, len) = value.into_parts();
-        let o2 = unsafe Writable[W]::write_raw(o, ptr, len);
-        (value, ReadingWriter.{ out: o2, cap })
+// A span read through the writer's context.
+forall W, C, 'r where Writable[W], ReadBytes[C, Span['r]].
+instance Format[Span['r], ReadingWriter![W, C]] {
+    fn format(value: Span['r], out: ReadingWriter![W, C]) -> (Span['r], ReadingWriter![W, C]) {
+        let { out: o, cx } = out;
+        let o2 = write_bytes(o, &cx, value);
+        (value, ReadingWriter.{ out: o2, cx })
     }
 }
 

@@ -31,7 +31,8 @@ use package as alloc;
 
 use alloc::arena::{Allocate, Domain};
 use alloc::collections::arena_vec::ArenaVec;
-use alloc::heap::{checked_add, checked_mul, out_of_range};
+use alloc::heap::{checked_add, checked_mul};
+use core::process::trap;
 use core::cap::Access;
 use core::hash::{HashIn, key_hash};
 use core::mem::Ref;
@@ -72,7 +73,7 @@ forall 'k, C, R where Access[C -> 'k, R].
 fn slot_at(&cx: C, slots: Slice[usize, 'k], i: usize) -> usize {
     match slots.get_ref(&cx, i) {
         Option::Some(at) => at.copy(&cx),
-        Option::None => out_of_range(),
+        Option::None => trap(),
     }
 }
 
@@ -80,7 +81,7 @@ forall 'k, C, R where Access[C -> 'k, R].
 fn set_slot(&cx: C, slots: Slice[usize, 'k], i: usize, value: usize) {
     match slots.get_ref(&cx, i) {
         Option::Some(at) => at.set(&cx, value),
-        Option::None => out_of_range(),
+        Option::None => trap(),
     }
 }
 
@@ -250,12 +251,12 @@ impl ArenaMap[K, V, 'k] {
     }
 
     // The value of a key that must be in the map: without it, the process
-    // stops (`alloc::heap::out_of_range`).
+    // stops (`core::process::trap`).
     forall C, R where Access[C -> 'k, R], HashIn[K, C].
     fn at(self, &cx: C, key: K) -> V {
         match self.get(&cx, key) {
             Option::Some(v) => v,
-            Option::None => out_of_range(),
+            Option::None => trap(),
         }
     }
 
@@ -269,8 +270,10 @@ impl ArenaMap[K, V, 'k] {
     }
 
     // Maps `key` to `value`, handing back the value it replaces, if any. A
-    // new key goes at the end of the order, and so does a removed one
-    // coming back; a present one keeps its place.
+    // key already present is replaced, key and value, as
+    // `alloc::collections::hashmap` replaces one, and keeps its place in
+    // the order; a new key goes at the end, and so does a removed one
+    // coming back.
     forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], HashIn[K, C].
     fn insert(self, &cx: C, key: K, value: V) -> Option[V] {
         let h = self.state.copy(&cx);
@@ -295,6 +298,28 @@ impl ArenaMap[K, V, 'k] {
             self.grow(&cx, 0usize);
         }
         Option::None
+    }
+
+    // The value of `key`; when it is not in the map, `default` is inserted
+    // under it first.
+    forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], HashIn[K, C].
+    fn get_or_insert(self, &cx: C, key: K, default: V) -> V {
+        match self.get(&cx, key) {
+            Option::Some(v) => v,
+            Option::None => {
+                let none = self.insert(&cx, key, default);
+                default
+            },
+        }
+    }
+
+    // Maps `key` to `f` of its value, or of `default` when it is not in the
+    // map, and returns the new value.
+    forall Env, C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], HashIn[K, C], Copy[Env].
+    fn update(self, &cx: C, key: K, default: V, f: closure[Env](V) -> V) -> V {
+        let value = f(self.get_or(&cx, key, default));
+        let old = self.insert(&cx, key, value);
+        value
     }
 
     // Takes `key` out of the map, handing back its value, if it was there.
@@ -355,6 +380,23 @@ impl ArenaMap[K, V, 'k] {
             }
             k = k + 1usize;
         }
+    }
+
+    // Keeps the entries `f` holds for, in their order, and removes the rest.
+    forall Env, C, R where Access[C -> 'k, R], Copy[Env].
+    fn retain(self, &cx: C, f: closure[Env](&_: C, K, V) -> bool) {
+        let h = self.state.copy(&cx);
+        var count = h.count;
+        var i = 0usize;
+        while i < h.entries.len(&cx) {
+            let e = h.entries.at(&cx, i);
+            if e.live && !f(&cx, e.key, e.value) {
+                h.entries.set(&cx, i, Entry.{ key: e.key, value: e.value, live: false, hash: e.hash });
+                count = count - 1usize;
+            }
+            i = i + 1usize;
+        }
+        self.state.set(&cx, MapState.{ slots: h.slots, entries: h.entries, count });
     }
 
     // The same live entries, in the same order, in a map of their own.
@@ -562,6 +604,30 @@ impl ArenaSet[K, 'k] {
         let out = self.clone(&cx);
         out.insert_all(&cx, other.keys(&cx));
         out
+    }
+
+    // The keys of `self` that `other` holds too, in `self`'s order, in a
+    // new set.
+    forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], HashIn[K, C].
+    fn intersection(self, &cx: C, other: ArenaSet[K, 'k]) -> ArenaSet[K, 'k] {
+        let out = self.clone(&cx);
+        out.retain(&cx, |&c, k| other.contains(&c, k));
+        out
+    }
+
+    // The keys of `self` that `other` lacks, in `self`'s order, in a new
+    // set.
+    forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], HashIn[K, C].
+    fn difference(self, &cx: C, other: ArenaSet[K, 'k]) -> ArenaSet[K, 'k] {
+        let out = self.clone(&cx);
+        out.retain(&cx, |&c, k| !other.contains(&c, k));
+        out
+    }
+
+    // Keeps the keys `f` holds for, in their order (`ArenaMap::retain`).
+    forall Env, C, R where Access[C -> 'k, R], Copy[Env].
+    fn retain(self, &cx: C, f: closure[Env](&_: C, K) -> bool) {
+        self.map.retain(&cx, |&c, k, v| f(&c, k));
     }
 
     // Takes `key` out; whether it was there.

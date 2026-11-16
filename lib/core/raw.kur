@@ -14,29 +14,20 @@
 use package as core;
 
 use core::option::Option;
-use core::slice::{Slice, ReadBytes, bytes_cmp_within, find_bytes};
+use core::slice::{Slice, ReadBytes, bytes_cmp_within, bytes_eq_within, find_byte, find_bytes, hash_bytes};
 use core::cap::{Access, Brand, Exclusive, Shared, Stamp};
 use core::mem::sizeof;
+use core::ptr::offset;
 use core::ascii::is_space;
 use core::cmp::Order;
 use core::hash::{HashIn, HashState};
 use core::process::trap;
 
-// Address of the i-th `T` in a flat buffer starting at `base`. Pure
-// address math: nothing is read, and nothing checks that `i` is in range.
-forall T.
-unsafe fn elem_ptr(base: *T, i: usize) -> *T {
-    let addr = unsafe (base as usize);
-    let off = i * sizeof[T]();
-    let addr2 = addr + off;
-    unsafe (addr2 as *T)
-}
-
 // Bounds-checked read: `None` past `len`, `Some(value)` otherwise.
 forall T where Copy[T].
 unsafe fn raw_get(base: *T, len: usize, i: usize) -> Option[T] {
     if i < len {
-        Option::Some.(unsafe *(unsafe elem_ptr(base, i)))
+        Option::Some.(unsafe *(unsafe offset(base, i)))
     } else {
         Option::None
     }
@@ -47,45 +38,10 @@ unsafe fn raw_get(base: *T, len: usize, i: usize) -> Option[T] {
 // already treat `0u8` as matching nothing.
 unsafe fn raw_byte_at(base: *u8, len: usize, i: usize) -> u8 {
     if i < len {
-        unsafe *(unsafe elem_ptr(base, i))
+        unsafe *(unsafe offset(base, i))
     } else {
         0u8
     }
-}
-
-// Bounds-checked write: writes `val` at index `i` if `i < len`, and
-// silently does nothing otherwise. `T: Copy` for the mirror image of
-// `raw_get`'s reason: overwriting a slot by index never consumes the value
-// that was there, which would leak a linear one. The bounds check turns an
-// off-by-one into a no-op instead of memory corruption; it is not meant to
-// be inspected, so there is no result.
-forall T where Copy[T].
-unsafe fn raw_set(base: *T, len: usize, i: usize, val: T) -> () {
-    if i < len {
-        unsafe *(unsafe elem_ptr(base, i)) = val;
-    } else {
-        ()
-    }
-}
-
-// Bounds-checked byte write, as `raw_set` for `u8`.
-unsafe fn raw_byte_set(base: *u8, len: usize, i: usize, val: u8) -> () {
-    if i < len {
-        unsafe *(unsafe elem_ptr(base, i)) = val;
-    } else {
-        ()
-    }
-}
-
-// A source position. `file` is a raw NUL-terminated C string pointer,
-// typically straight into the process's `argv`: never copied, allocated or
-// freed here. `argv` strings live for the whole process, so a `Pos` may be
-// held for as long as needed. A plain `{*u8, u32, u32}` value with no
-// dependencies, so it lives in `core`.
-exposed struct Pos {
-    file: *u8,
-    line: u32,
-    col: u32,
 }
 
 // A byte range into some live text buffer, as `{ptr, len}`.
@@ -105,7 +61,7 @@ exposed struct Pos {
 //
 // The methods that read take the context by place, `&cx`. Generic code over
 // any readable byte view goes through `ReadBytes` instead (`core::slice`'s
-// `byte_at`, `find_bytes`, `bytes_eq_within`, ...); spans have its instances
+// `byte_or_zero`, `find_bytes`, `bytes_eq_within`, ...); spans have its instances
 // for `Exclusive!` and `Shared!`.
 forall 'k.
 struct Span {
@@ -203,14 +159,6 @@ impl Span['k] {
         unsafe (ptr as usize)
     }
 
-    // The same start, `len` bytes long, in the same domain. `unsafe`: the
-    // caller vouches that those bytes are initialized and lie in the buffer
-    // this span points into (joining two spans of one source text).
-    unsafe fn with_len(self, len: usize) -> Span['k] {
-        let { ptr, len: old, marker } = self;
-        Span.{ ptr, len, marker }
-    }
-
     // The first `count` bytes, or the whole span if it is shorter.
     fn take(self, count: usize) -> Span['k] {
         let { len, ..rest } = self;
@@ -225,7 +173,7 @@ impl Span['k] {
     fn skip(self, count: usize) -> Span['k] {
         let { ptr, len, ..rest } = self;
         let n = if count < len { count } else { len };
-        Span.{ ptr: unsafe elem_ptr(ptr, n), len: len - n, ..rest }
+        Span.{ ptr: unsafe offset(ptr, n), len: len - n, ..rest }
     }
 
     // Bytes `start` to `end`, each clamped to the span (an empty span when
@@ -273,7 +221,7 @@ impl Span['k] {
             if count > remaining {
                 Option::None
             } else {
-                Option::Some.(Span.{ ptr: unsafe elem_ptr(ptr, start), len: count, ..rest })
+                Option::Some.(Span.{ ptr: unsafe offset(ptr, start), len: count, ..rest })
             }
         }
     }
@@ -358,7 +306,7 @@ impl Span['k] {
     forall C, R where Access[C -> 'k, R].
     fn find(self, &cx: C, needle: Span['k], start: usize) -> Option[usize] {
         let (tag, rest) = Access[C -> 'k, R]::open(cx);
-        let found = find_bytes(&tag, self, start, needle);
+        let found = find_bytes(&tag, self, needle, start);
         cx = Access[C -> 'k, R]::close(tag, rest);
         found
     }
@@ -368,19 +316,12 @@ impl Span['k] {
         self.find(&cx, needle, 0usize).is_some()
     }
 
-    // The first index at or after `start` holding `byte`.
+    // The first index at or after `start` holding `byte`
+    // (`core::slice::find_byte`).
     forall C, R where Access[C -> 'k, R].
     fn find_byte(self, &cx: C, byte: u8, start: usize) -> Option[usize] {
         let (tag, rest) = Access[C -> 'k, R]::open(cx);
-        let { ptr, len, marker } = self;
-        var i = start;
-        var found = Option::None;
-        while found.is_none() && i < len {
-            if unsafe raw_byte_at(ptr, len, i) == byte {
-                found = Option::Some.(i);
-            }
-            i = i + 1usize;
-        }
+        let found = find_byte(&tag, self, byte, start);
         cx = Access[C -> 'k, R]::close(tag, rest);
         found
     }
@@ -427,20 +368,20 @@ unsafe fn span_byte_at(s: Span['k], index: usize) -> Option[u8] {
 
 forall 'r.
 instance ReadBytes[Exclusive!['r], Span['r]] {
-    fn get(&cap: Exclusive!['r], bytes: Span['r], index: usize) -> Option[u8] {
+    fn get(&cx: Exclusive!['r], bytes: Span['r], index: usize) -> Option[u8] {
         unsafe span_byte_at(bytes, index)
     }
-    fn len(&cap: Exclusive!['r], bytes: Span['r]) -> usize {
+    fn len(&cx: Exclusive!['r], bytes: Span['r]) -> usize {
         bytes.len()
     }
 }
 
 forall 'r, 'q.
 instance ReadBytes[Shared!['r, 'q], Span['r]] {
-    fn get(&cap: Shared!['r, 'q], bytes: Span['r], index: usize) -> Option[u8] {
+    fn get(&cx: Shared!['r, 'q], bytes: Span['r], index: usize) -> Option[u8] {
         unsafe span_byte_at(bytes, index)
     }
-    fn len(&cap: Shared!['r, 'q], bytes: Span['r]) -> usize {
+    fn len(&cx: Shared!['r, 'q], bytes: Span['r]) -> usize {
         bytes.len()
     }
 }
@@ -449,41 +390,13 @@ instance ReadBytes[Shared!['r, 'q], Span['r]] {
 // `core::slice` makes a byte slice one. Hashes as `Span::hash` does.
 forall C, 't where ReadBytes[C, Span['t]].
 instance HashIn[Span['t], C] {
-    fn hash_in(&cap: C, key: Span['t], state: HashState) -> HashState {
-        state.write_u64(hash_span_bytes(&cap, key))
+    fn hash_in(&cx: C, key: Span['t], state: HashState) -> HashState {
+        state.write_u64(hash_bytes(&cx, key, HashState::new()).finish())
     }
 
-    fn eq_in(&cap: C, a: Span['t], b: Span['t]) -> bool {
-        let n = ReadBytes[C, Span['t]]::len(&cap, a);
-        var same = n == ReadBytes[C, Span['t]]::len(&cap, b);
-        if same && a.address() == b.address() {
-            return true;
-        }
-        var i = n;
-        while same && i > 0usize {
-            i = i - 1usize;
-            same = byte_of(&cap, a, i) == byte_of(&cap, b, i);
-        }
-        same
+    // Spans of one buffer often share their bytes; equal addresses and
+    // lengths skip the byte walk.
+    fn eq_in(&cx: C, a: Span['t], b: Span['t]) -> bool {
+        (a.address() == b.address() && a.len() == b.len()) || bytes_eq_within(&cx, a, b)
     }
-}
-
-forall C, 't where ReadBytes[C, Span['t]].
-fn byte_of(&cap: C, s: Span['t], i: usize) -> u8 {
-    match ReadBytes[C, Span['t]]::get(&cap, s, i) {
-        Option::Some(b) => b,
-        Option::None => 0u8,
-    }
-}
-
-forall C, 't where ReadBytes[C, Span['t]].
-fn hash_span_bytes(&cap: C, s: Span['t]) -> u64 {
-    let n = ReadBytes[C, Span['t]]::len(&cap, s);
-    var state = HashState::new();
-    var i = 0usize;
-    while i < n {
-        state = state.write_u8(byte_of(&cap, s, i));
-        i = i + 1usize;
-    }
-    state.finish()
 }

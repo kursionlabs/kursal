@@ -51,26 +51,6 @@ uint8_t *kur_libc_fs_getenv(uint8_t *bytes, uintptr_t len) {
     return value ? (uint8_t *)strdup(value) : NULL;
 }
 
-/* Output is three uint64 values, copied rather than imposing a C struct ABI.
- * kind: 1 regular, 2 directory, 3 other. stat follows symbolic links. */
-int32_t kur_libc_fs_stat(uint8_t *bytes, uintptr_t len, uint8_t *output) {
-    char *path = path_copy(bytes, len);
-    if (!path) return errno;
-    struct stat info;
-    int status = stat(path, &info);
-    int saved = errno;
-    free(path);
-    if (status != 0) return saved;
-    if ((dev_t)(uint64_t)info.st_dev != info.st_dev ||
-        (ino_t)(uint64_t)info.st_ino != info.st_ino) return EOVERFLOW;
-    uint64_t values[3] = {
-        (uint64_t)info.st_dev, (uint64_t)info.st_ino,
-        S_ISREG(info.st_mode) ? 1 : S_ISDIR(info.st_mode) ? 2 : 3
-    };
-    memcpy(output, values, sizeof values);
-    return 0;
-}
-
 uint8_t *kur_libc_fs_open_directory(uint8_t *bytes, uintptr_t len) {
     char *path = path_copy(bytes, len);
     if (!path) return NULL;

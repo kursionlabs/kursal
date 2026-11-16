@@ -197,35 +197,6 @@ impl List[T, 'k] {
         same
     }
 
-    // This list's elements start `list`, compared pairwise with `eq`.
-    forall Env, C, R where Access[C -> 'k, R], Copy[Env].
-    fn is_prefix_with(self, &cx: C, list: List[T, 'k], eq: closure[Env](&_: C, T, T) -> bool) -> bool {
-        var a = self;
-        var b = list;
-        var same = true;
-        var going = true;
-        while same && going {
-            let x = &a.pop(&cx);
-            match x {
-                Option::Some(u) => {
-                    let next = &b.pop(&cx);
-                    match next {
-                        Option::Some(v) => {
-                            same = eq(&cx, u, v);
-                        },
-                        Option::None => {
-                            same = false;
-                        },
-                    }
-                },
-                Option::None => {
-                    going = false;
-                },
-            }
-        }
-        same
-    }
-
     // ------------------------------------------------------ combinators --
     // The computation goes to the list: each combinator lends its closure
     // the context, so the closure reads other data of the domain and
@@ -456,57 +427,43 @@ impl ListBuilder[T, 'k] {
     }
 }
 
-// `count` copies of `value`.
-forall T, 'k, C, R where Copy[T], Allocate[C -> 'k, R].
-fn repeat(&cx: C, value: T, count: usize) -> List[T, 'k] {
-    var list = List::Empty;
-    var left = count;
-    while left > 0usize {
-        list = list.cons(&cx, value);
-        left = left - 1usize;
-    }
-    list
-}
-
 // ------------------------------------------------------------ iteration --
-// A list's items, read under its capability, which the iterator holds while
-// it runs: `var it = xs.iter(tag); for x in &it { .. } let tag = it.finish();`.
-forall T, 'k.
+// A list's items, read under the capability a context lends (`Access`).
+// `iter` opens the context and the iterator holds what it opened while it
+// runs; `finish` closes it and hands the context back:
+// `var it = xs.iter(cx); for x in &it { .. } let cx = it.finish();`.
+forall T, 'k, C, R.
 exposed struct ListIter! {
     tag: Exclusive!['k],
+    held: R,
     rest: List[T, 'k],
 }
 
 forall T, 'k where Copy[T].
 impl List[T, 'k] {
-    fn iter(self, tag: Exclusive!['k]) -> ListIter![T, 'k] {
-        ListIter.{ tag, rest: self }
+    forall C, R where Access[C -> 'k, R].
+    fn iter(self, cx: C) -> ListIter![T, 'k, C, R] {
+        let (tag, held) = Access[C -> 'k, R]::open(cx);
+        ListIter.{ tag, held, rest: self }
     }
 }
 
-forall T, 'k where Copy[T].
-impl ListIter[T, 'k] {
-    // Ends the iteration, handing back the list's capability.
-    fn finish(self) -> Exclusive!['k] {
-        let { tag, rest: _rest } = self;
-        tag
+forall T, 'k, C, R where Access[C -> 'k, R].
+impl ListIter[T, 'k, C, R] {
+    // Ends the iteration, handing back the context.
+    fn finish(self) -> C {
+        let { tag, held, rest: _rest } = self;
+        Access[C -> 'k, R]::close(tag, held)
     }
 }
 
-forall T, 'k where Copy[T].
-instance Iterator[ListIter![T, 'k] -> T] {
-    fn next(&it: ListIter![T, 'k]) -> Option[T] {
-        let { tag, rest } = it;
-        match rest {
-            List::Cell(r) => {
-                let cell = r.copy(&tag);
-                it = ListIter.{ tag, rest: cell.tail };
-                Option::Some.(cell.head)
-            },
-            List::Empty => {
-                it = ListIter.{ tag, rest };
-                Option::None
-            },
-        }
+forall T, 'k, C, R where Copy[T].
+instance Iterator[ListIter![T, 'k, C, R] -> T] {
+    fn next(&it: ListIter![T, 'k, C, R]) -> Option[T] {
+        let { tag, held, rest } = it;
+        var rest = rest;
+        let item = &rest.pop(&tag);
+        it = ListIter.{ tag, held, rest };
+        item
     }
 }

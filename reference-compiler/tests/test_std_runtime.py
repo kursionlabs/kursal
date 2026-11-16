@@ -104,9 +104,8 @@ class StdRuntimeTests(unittest.TestCase):
                 let seven = &region.replace(8u32);
                 let eight = record.close(region).into_value();
                 let exists 'v. (tag, v) = Vec::new[u8]();
-                let b = std::text::str::finish(v, tag);
-                let n = &b.len();
-                b.destroy();
+                let n = &v.len(&tag);
+                v.free(tag);
                 if seven == 7u32 && eight == 8u32 && n == 0usize { 0 } else { 1 }
             }''')
 
@@ -114,19 +113,20 @@ class StdRuntimeTests(unittest.TestCase):
 
     def test_remove_in_rebrands_and_removes(self):
         self.expect('''
-            use std::collections::hashmap::{HashMap, OwnedMap, Found};
+            use std::collections::hashmap::{HashMap, OwnedMap};
+            use std::option::Option;
             fn drop_entry(key: u32, value: u32) {}
             fn main() -> i32 {
                 var cx = ();
                 let exists 'm. (tag, map) = HashMap::new[u32, u32]();
                 let exists 'a. (tag, map, old) = map.insert_in(tag, &cx, 1u32, 10u32);
                 let exists 'b. (tag, map, removed) = map.remove_in(tag, &cx, 1u32);
-                let again = match &map.get_in(&tag, &cx, 1u32) { Found::Item(r) => 1i32, Found::Missing => 0i32 };
-                let got = match removed { Found::Item(v) => v, Found::Missing => 0u32 };
+                let again = match &map.get_in(&tag, &cx, 1u32) { Option::Some(r) => 1i32, Option::None => 0i32 };
+                let got = match removed { Option::Some(v) => v, Option::None => 0u32 };
                 map.destroy(tag, drop_entry);
                 var owned = OwnedMap::new[u32, u32]();
                 let none = &owned.insert_in(&cx, 2u32, 20u32);
-                let twenty = match &owned.remove_in(&cx, 2u32) { Found::Item(v) => v, Found::Missing => 0u32 };
+                let twenty = match &owned.remove_in(&cx, 2u32) { Option::Some(v) => v, Option::None => 0u32 };
                 let left = &owned.len();
                 owned.destroy(drop_entry);
                 if again == 0i32 && got == 10u32 && twenty == 20u32 && left == 0usize { 0 } else { 1 }
@@ -175,7 +175,7 @@ class StdRuntimeTests(unittest.TestCase):
                 match thread::spawn(|| -> usize { let n = &owned.len(); owned.destroy(); n }) {
                     Result::Err(failed) => {
                         let (f, error) = failed;
-                        if f() == 3usize && error.code > 0i32 { 7 } else { 1 }
+                        if f() == 3usize && error.errno > 0i32 { 7 } else { 1 }
                     },
                     Result::Ok(t) => match t.join() {
                         Result::Ok(n) => 2,
@@ -240,10 +240,10 @@ class StdRuntimeTests(unittest.TestCase):
         self.expect('''
             use std::bytes::buffer::Buffer;
             use std::option::Result;
-            use libc::fs::open_read;
+            use std::io::File;
             fn main() -> i32 {
                 var path = Buffer::new().push_static(".");
-                let opened = open_read(&path);
+                let opened = File::open_read(&path);
                 path.destroy();
                 match opened {
                     Result::Err(code) => 1,
@@ -257,16 +257,16 @@ class StdRuntimeTests(unittest.TestCase):
                         status
                     },
                 }
-            }''', deps=("std", "libc"))
+            }''')
 
     def test_a_failed_write_is_an_error(self):
         self.expect('''
             use std::bytes::buffer::Buffer;
             use std::option::Result;
-            use libc::fs::create;
+            use std::io::File;
             fn main() -> i32 {
                 var path = Buffer::new().push_static("/dev/full");
-                let created = create(&path);
+                let created = File::create(&path);
                 path.destroy();
                 match created {
                     Result::Err(code) => 1,
@@ -280,7 +280,7 @@ class StdRuntimeTests(unittest.TestCase):
                         status
                     },
                 }
-            }''', deps=("std", "libc"))
+            }''')
 
     def test_print_reports_a_failed_write(self):
         with open("/dev/full", "w") as full:
@@ -405,8 +405,9 @@ class StdRuntimeTests(unittest.TestCase):
 
     def test_hash_chains_of_colliding_keys(self):
         self.expect('''
-            use std::collections::hashmap::{OwnedMap, Found};
+            use std::collections::hashmap::OwnedMap;
             use std::hash::{Hash, Eq, HashState};
+            use std::option::Option;
             exposed struct Key { n: u32 }
             instance Hash[Key] {
                 fn hash(self: Key, state: HashState) -> (Key, HashState) { (self, state) }
@@ -415,8 +416,8 @@ class StdRuntimeTests(unittest.TestCase):
                 fn eq(a: Key, b: Key) -> (Key, Key, bool) { (a, b, a.n == b.n) }
             }
             fn drop_entry(key: Key, value: u32) {}
-            fn one(f: Found[(Key, u32)]) -> i32 {
-                match f { Found::Item(kv) => 1i32, Found::Missing => 0i32 }
+            fn one(f: Option[(Key, u32)]) -> i32 {
+                match f { Option::Some(kv) => 1i32, Option::None => 0i32 }
             }
             fn main() -> i32 {
                 var map = OwnedMap::new[Key, u32]();
@@ -425,17 +426,21 @@ class StdRuntimeTests(unittest.TestCase):
                     let old = &map.insert(Key.{ n: i }, i);
                     i = i + 1u32;
                 }
-                let replaced = match &map.insert(Key.{ n: 1500u32 }, 7u32) { Found::Item(kv) => 1i32, Found::Missing => 0i32 };
-                let (k0, first) = &map.remove(Key.{ n: 0u32 });
-                let (k1, middle) = &map.remove(Key.{ n: 1000u32 });
-                let (k2, last) = &map.remove(Key.{ n: 2999u32 });
-                let (k3, again) = &map.remove(Key.{ n: 1000u32 });
-                let (k4, seven) = &map.get(Key.{ n: 1500u32 });
+                let replaced = match &map.insert(Key.{ n: 1500u32 }, 7u32) { Option::Some(kv) => kv.1 == 1500u32, Option::None => false };
+                var k0 = Key.{ n: 0u32 };
+                var k1 = Key.{ n: 1000u32 };
+                var k2 = Key.{ n: 2999u32 };
+                var k3 = Key.{ n: 1500u32 };
+                let first = &map.remove(&k0);
+                let middle = &map.remove(&k1);
+                let last = &map.remove(&k2);
+                let again = &map.remove(&k1);
                 let removed = one(first) + one(middle) + one(last) + one(again);
-                let kept = match seven { Found::Item(v) => v == 7u32, Found::Missing => false };
+                let kept = (&map.get(&k3)).unwrap_or(0u32) == 7u32 && &map.at(&k3) == 7u32;
+                let present = &map.contains(&k3) && !&map.contains(&k1);
                 let n = &map.len();
                 map.destroy(drop_entry);
-                if replaced == 1i32 && removed == 3i32 && kept && n == 2997usize { 0 } else { 1 }
+                if replaced && removed == 3i32 && kept && present && n == 2997usize { 0 } else { 1 }
             }''')
 
     def test_long_lists_and_scans_take_no_stack(self):
@@ -443,7 +448,7 @@ class StdRuntimeTests(unittest.TestCase):
             use std::alloc::arena::Domain;
             use std::collections::list::List;
             use std::bytes::buffer::Buffer;
-            use std::bytes::cursor::Cursor;
+            use std::cursor::Cursor;
             use std::option::Result;
             fn is_a(b: u8) -> bool { b == b'a' }
             forall 'k.
@@ -552,6 +557,258 @@ class StdRuntimeTests(unittest.TestCase):
                 result = self.run_program(self.ACCESSORS.replace("MISS", miss))
                 self.assertLess(result.returncode, 0)
 
+
+    # ------------------------------------------------------------ core API --
+
+    def test_core_helpers(self):
+        self.expect('''
+            use std::cmp::{Order, min, max};
+            use std::hash::{Hash, Eq, HashState};
+            use std::mem::{alignof, swap};
+            use std::option::{Option, Result};
+            use std::ptr::{null, is_null, offset};
+            use std::slice::{Slice, StaticRead};
+            use std::utf8::{encode, validate, width};
+            use std::bytes::buffer::Buffer;
+            use std::array::Array;
+            fn main() -> i32 {
+                var a = 1u32;
+                var b = 2u32;
+                swap(&a, &b);
+                let mem = a == 2u32 && b == 1u32 && alignof[u64]() == 8usize && alignof[u8]() == 1usize && alignof[()]() == 1usize;
+                let order = min(3u32, 5u32) == 3u32 && max(3u32, 5u32) == 5u32 && Order::Less.reverse().is_gt()
+                    && Order::Equal.reverse().is_eq() && !Order::Greater.is_eq();
+                let r: Result[u32, u32] = Result::Err.(4u32);
+                let k: Result[u32, u32] = Result::Ok.(6u32);
+                let none: Option[u32] = Option::None;
+                let results = r.unwrap_or(9u32) == 9u32 && r.unwrap_or_else(|e: u32| e + 1u32) == 5u32 && r.err().unwrap_or(0u32) == 4u32
+                    && r.ok().is_none() && k.ok().unwrap_or(0u32) == 6u32 && k.err().is_none()
+                    && none.unwrap_or_else(|| 8u32) == 8u32 && Option::Some.(2u32).unwrap_or_else(|| 8u32) == 2u32;
+                let p = null[u32]();
+                let pointers = is_null(p) && !is_null(unsafe offset(p, 1usize));
+                let (t, h1) = Hash[(u32, u64)]::hash((1u32, 2u64), HashState::new());
+                let (u, h2) = Hash[(u32, u64)]::hash((1u32, 2u64), HashState::new());
+                let (x, y, same) = Eq[(u32, u64), (u32, u64)]::eq((1u32, 2u64), (1u32, 2u64));
+                let (x2, y2, diff) = Eq[(u32, u32, u32), (u32, u32, u32)]::eq((1u32, 2u32, 3u32), (1u32, 2u32, 4u32));
+                let tuples = same && !diff && h1.finish() == h2.finish();
+                let good = Buffer::new().push_byte(104u8).push_byte(195u8).push_byte(169u8);
+                let bad = Buffer::new().push_byte(237u8).push_byte(160u8).push_byte(128u8);
+                let exists 'g. (gt, gs, gr) = good.open();
+                let exists 'b. (bt, bs, br) = bad.open();
+                var text = encode(encode(encode(Buffer::new(), 233u32), 128512u32), 55296u32);
+                let n = &text.len();
+                text.destroy();
+                let utf8 = validate(&gt, gs) && !validate(&bt, bs) && width(55296u32) == 0usize && width(128u32) == 2usize
+                    && width(1114112u32) == 0usize && n == 2usize + 4usize + 3usize;
+                gr.restore(gt).destroy();
+                br.restore(bt).destroy();
+                let empty: Slice[u8, 'static] = "";
+                let slices = empty.is_empty() && !"a".is_empty();
+                let store = Buffer::new_zeroed(12usize);
+                let base = unsafe (unsafe &store.as_ptr() as *u32);
+                var array = unsafe Array::from_parts(base, 3usize);
+                let old = &array.set(1usize, 7u32);
+                let missed = &array.set(3usize, 9u32);
+                let arrays = &array.at(1usize) == 7u32 && (&array.get(3usize)).is_none() && &array.len() == 3usize
+                    && missed.is_err() && old.is_ok();
+                let (pb, pn) = array.into_parts();
+                store.destroy();
+                if mem && order && results && pointers && tuples && utf8 && slices && arrays { 0 } else { 1 }
+            }''')
+
+    def test_iterators_and_writers_take_a_context(self):
+        self.expect('''
+            use std::alloc::arena::Domain;
+            use std::collections::list::List;
+            use std::text::fmt::ReadingWriter;
+            use std::bytes::buffer::Buffer;
+            use std::raw::Span;
+            use std::slice::Slice;
+            forall 'k.
+            fn run(cx: Domain!['k]) -> (Domain!['k], bool) {
+                var cx = cx;
+                var list: List[u32, 'k] = List::Empty;
+                list = list.cons(&cx, 3u32).cons(&cx, 2u32).cons(&cx, 1u32);
+                var it = list.iter(cx);
+                var sum = 0u32;
+                for x in &it {
+                    sum = sum * 10u32 + x;
+                }
+                var cx = it.finish();
+                let name = Span::from_static(&cx, "world");
+                let (text, cx) = f"hello {name}".write(ReadingWriter::new(Buffer::new(), cx)).finish();
+                let exists 'b. (tag, bytes, restore) = text.open();
+                var bit = bytes.iter(tag);
+                var count = 0usize;
+                for b in &bit {
+                    count = count + 1usize;
+                }
+                restore.restore(bit.finish()).destroy();
+                (cx, sum == 123u32 && count == 11usize)
+            }
+            fn main() -> i32 {
+                let exists 'k. cx = Domain::new();
+                let (cx, ok) = run(cx);
+                cx.destroy();
+                if ok { 0 } else { 1 }
+            }''')
+
+    def test_cursor_reads_through_any_reader(self):
+        self.expect('''
+            use std::cursor::Cursor;
+            use std::slice::StaticRead;
+            use std::ascii::is_alpha;
+            fn main() -> i32 {
+                let sr = StaticRead::new();
+                let cur = Cursor::new("abc1");
+                let (cur, word) = cur.take_matching(&sr, is_alpha);
+                if word.len() == 3usize && cur.peek(&sr).unwrap_or(0u8) == b'1' && cur.starts_with(&sr, "1") { 0 } else { 1 }
+            }''')
+
+    def test_split_and_merge_round_trip(self):
+        self.expect('''
+            use std::alloc::owned::Owned;
+            fn main() -> i32 {
+                let exists 'r. (alloc, region) = Owned::new((10u32, 20u32)).open();
+                let (restore, parts) = region.split();
+                var region = restore.merge(parts);
+                let pair = &region.replace((1u32, 2u32));
+                let back = alloc.close(region).into_value();
+                let fallible = match Owned::try_new(5u32) {
+                    std::option::Result::Ok(owned) => owned.into_value(),
+                    std::option::Result::Err(failed) => 0u32,
+                };
+                if pair.0 == 10u32 && pair.1 == 20u32 && back.0 == 1u32 && back.1 == 2u32 && fallible == 5u32 { 0 } else { 1 }
+            }''')
+
+    # ------------------------------------------------------ collections API --
+
+    def test_vectors_sort_stably_and_edit_in_place(self):
+        self.expect('''
+            use std::collections::vec::OwnedVec;
+            use std::cmp::Order;
+            fn by_first(a: (u32, u32), b: (u32, u32)) -> Order {
+                if a.0 < b.0 { Order::Less } else if a.0 > b.0 { Order::Greater } else { Order::Equal }
+            }
+            fn main() -> i32 {
+                var v = OwnedVec::new[(u32, u32)]();
+                var i = 0u32;
+                while i < 40u32 {
+                    v = v.push((i % 3u32, i));
+                    i = i + 1u32;
+                }
+                var none = ();
+                v = v.sort_by(&none, |&n, a: (u32, u32), b: (u32, u32)| by_first(a, b));
+                var stable = true;
+                var j = 1usize;
+                while j < 40usize {
+                    let a = &v.at(j - 1usize);
+                    let b = &v.at(j);
+                    stable = stable && (a.0 < b.0 || (a.0 == b.0 && a.1 < b.1));
+                    j = j + 1usize;
+                }
+                &v.set(0usize, (9u32, 9u32));
+                let set = &v.at(0usize).0 == 9u32 && &v.last().unwrap_or((0u32, 0u32)).1 == 38u32;
+                &v.truncate(2usize);
+                let truncated = &v.len() == 2usize && !&v.is_empty();
+                &v.clear();
+                let cleared = &v.is_empty();
+                v.free();
+                var w = OwnedVec::new[u32]().push(5u32).push(1u32).push(4u32).sort();
+                var u = OwnedVec::new[u32]().push(5u32).push(1u32).push(4u32).sort_unstable();
+                let sorted = &w.at(0usize) == 1u32 && &w.at(2usize) == 5u32 && &u.at(1usize) == 4u32;
+                w.free();
+                u.free();
+                if stable && set && truncated && cleared && sorted { 0 } else { 1 }
+            }''')
+
+    def test_vector_at_stops_on_a_miss(self):
+        result = self.run_program('''
+            use std::collections::vec::OwnedVec;
+            fn main() -> i32 {
+                var v = OwnedVec::new[u32]().push(1u32);
+                let x = &v.at(1usize);
+                v.free();
+                0
+            }''')
+        self.assertLess(result.returncode, 0)
+
+    def test_owned_maps_look_up_by_place(self):
+        self.expect('''
+            use std::collections::hashmap::{HashMap, OwnedMap};
+            use std::option::Option;
+            // `HashMap::find`, with a probe of the key type.
+            fn find(&named: OwnedMap![u32, u32], &probe: u32) -> bool {
+                let exists 'm. (tag, map) = named.inner;
+                let found = match &map.find(&tag, &probe) { Option::Some(r) => r.copy(&tag) == 11u32, Option::None => false };
+                named = OwnedMap.{ inner: pack 'm. (tag, map) };
+                found
+            }
+            fn main() -> i32 {
+                var m = OwnedMap::new[u32, u32]();
+                var one = 1u32;
+                var two = 2u32;
+                let none = &m.insert(1u32, 10u32);
+                let replaced = match &m.insert(1u32, 11u32) { Option::Some(kv) => kv.1 == 10u32, Option::None => false };
+                let looked = &m.contains(&one) && !&m.contains(&two) && &m.at(&one) == 11u32 && (&m.get(&two)).is_none();
+                let found = find(&m, &one) && !find(&m, &two);
+                let with = (&m.with(&one, |v: u32| (v + 1u32, v))).unwrap_or(0u32) == 11u32 && &m.at(&one) == 12u32;
+                let removed = match &m.remove(&one) { Option::Some(kv) => kv.1 == 12u32, Option::None => false };
+                let empty = &m.is_empty();
+                let none2 = &m.insert(3u32, 30u32);
+                &m.clear();
+                let cleared = &m.is_empty() && &m.len() == 0usize;
+                m.free();
+                if replaced && looked && found && with && removed && empty && cleared { 0 } else { 1 }
+            }''')
+
+    def test_arena_maps_update_retain_and_combine(self):
+        self.expect('''
+            use std::alloc::arena::Domain;
+            use std::collections::arena_map::{ArenaMap, ArenaSet};
+            forall 'k.
+            fn check(&cx: Domain!['k]) -> bool {
+                let m: ArenaMap[u32, u32, 'k] = ArenaMap::new(&cx);
+                let a = m.get_or_insert(&cx, 1u32, 10u32);
+                let b = m.get_or_insert(&cx, 1u32, 20u32);
+                let c = m.update(&cx, 1u32, 0u32, |v: u32| v + 5u32);
+                let d = m.update(&cx, 2u32, 7u32, |v: u32| v * 2u32);
+                let e = m.insert(&cx, 3u32, 30u32);
+                m.retain(&cx, |&c, k: u32, v: u32| k != 2u32);
+                let maps = a == 10u32 && b == 10u32 && c == 15u32 && d == 14u32 && !m.contains(&cx, 2u32)
+                    && m.len(&cx) == 2usize && m.at(&cx, 3u32) == 30u32 && m.key_at(&cx, 0usize).unwrap_or(0u32) == 1u32;
+                let x: ArenaSet[u32, 'k] = ArenaSet::new(&cx);
+                let y: ArenaSet[u32, 'k] = ArenaSet::new(&cx);
+                x.insert_all(&cx, m.keys(&cx));
+                let more = x.insert(&cx, 2u32);
+                let also = y.insert(&cx, 2u32);
+                let other = y.insert(&cx, 4u32);
+                let both = x.intersection(&cx, y);
+                let only = x.difference(&cx, y);
+                let sets = both.len(&cx) == 1usize && both.contains(&cx, 2u32) && only.len(&cx) == 2usize
+                    && only.key_at(&cx, 0usize).unwrap_or(0u32) == 1u32 && only.contains(&cx, 3u32);
+                maps && sets
+            }
+            fn main() -> i32 {
+                let exists 'k. cx = Domain::new();
+                let ok = check(&cx);
+                cx.destroy();
+                if ok { 0 } else { 1 }
+            }''')
+
+    def test_buffers_truncate_and_clear(self):
+        self.expect('''
+            use std::bytes::buffer::Buffer;
+            fn main() -> i32 {
+                let b = Buffer::new().push_static("hello").truncate(2usize).push_static("y");
+                let n = &b.len();
+                let b = b.truncate(10usize);
+                let m = &b.len();
+                let b = b.clear();
+                let z = &b.len();
+                b.destroy();
+                if n == 3usize && m == 3usize && z == 0usize { 0 } else { 1 }
+            }''')
 
 if __name__ == "__main__":
     unittest.main()

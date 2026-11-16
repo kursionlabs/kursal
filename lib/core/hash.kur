@@ -15,8 +15,8 @@
 // `'q2`. Both sides are handed back (`-> (A, B, bool)`). It is called by its
 // full name: `Eq[K, K]::eq(a, b)`.
 //
-// There are no blanket or derived instances; each key type writes its own
-// `Hash` and `Eq` instances.
+// There are no derived instances: the primitives and tuples of them have
+// instances here, and every other key type writes its own.
 
 use package as core;
 
@@ -75,21 +75,21 @@ trait Eq {
 // primitive and tuple ones are at the end of this module.
 forall K, C.
 trait HashIn {
-    fn hash_in(&cap: C, key: K, state: HashState) -> HashState;
-    fn eq_in(&cap: C, a: K, b: K) -> bool;
+    fn hash_in(&cx: C, key: K, state: HashState) -> HashState;
+    fn eq_in(&cx: C, a: K, b: K) -> bool;
 }
 
 // A key's hash under `HashIn`, from a fresh state and mixed, so that keys
 // differing in a few low bits spread over all of them.
 forall K, C where HashIn[K, C].
-fn key_hash(&cap: C, key: K) -> u64 {
-    mix(HashIn[K, C]::hash_in(&cap, key, HashState::new()).finish())
+fn key_hash(&cx: C, key: K) -> u64 {
+    mix(HashIn[K, C]::hash_in(&cx, key, HashState::new()).finish())
 }
 
 // Whether two keys are equal under `HashIn`.
 forall K, C where HashIn[K, C].
-fn key_eq(&cap: C, a: K, b: K) -> bool {
-    HashIn[K, C]::eq_in(&cap, a, b)
+fn key_eq(&cx: C, a: K, b: K) -> bool {
+    HashIn[K, C]::eq_in(&cx, a, b)
 }
 
 // The bits of `x` spread over the whole word (a 64-bit finalizer).
@@ -241,148 +241,194 @@ instance Eq[bool, bool] {
     }
 }
 
+// Tuples hash their parts in order through one state and compare part by
+// part, handing every part back, so linear parts work too.
+forall A, B where Hash[A], Hash[B].
+instance Hash[(A, B)] {
+    fn hash(self: (A, B), state: HashState) -> ((A, B), HashState) {
+        let (a, b) = self;
+        let (a, state) = Hash[A]::hash(a, state);
+        let (b, state) = Hash[B]::hash(b, state);
+        ((a, b), state)
+    }
+}
+
+forall A, B, D where Hash[A], Hash[B], Hash[D].
+instance Hash[(A, B, D)] {
+    fn hash(self: (A, B, D), state: HashState) -> ((A, B, D), HashState) {
+        let (a, b, d) = self;
+        let (a, state) = Hash[A]::hash(a, state);
+        let (b, state) = Hash[B]::hash(b, state);
+        let (d, state) = Hash[D]::hash(d, state);
+        ((a, b, d), state)
+    }
+}
+
+forall A1, B1, A2, B2 where Eq[A1, A2], Eq[B1, B2].
+instance Eq[(A1, B1), (A2, B2)] {
+    fn eq(x: (A1, B1), y: (A2, B2)) -> ((A1, B1), (A2, B2), bool) {
+        let (a1, b1) = x;
+        let (a2, b2) = y;
+        let (a1, a2, first) = Eq[A1, A2]::eq(a1, a2);
+        let (b1, b2, second) = Eq[B1, B2]::eq(b1, b2);
+        ((a1, b1), (a2, b2), first && second)
+    }
+}
+
+forall A1, B1, D1, A2, B2, D2 where Eq[A1, A2], Eq[B1, B2], Eq[D1, D2].
+instance Eq[(A1, B1, D1), (A2, B2, D2)] {
+    fn eq(x: (A1, B1, D1), y: (A2, B2, D2)) -> ((A1, B1, D1), (A2, B2, D2), bool) {
+        let (a1, b1, d1) = x;
+        let (a2, b2, d2) = y;
+        let (a1, a2, first) = Eq[A1, A2]::eq(a1, a2);
+        let (b1, b2, second) = Eq[B1, B2]::eq(b1, b2);
+        let (d1, d2, third) = Eq[D1, D2]::eq(d1, d2);
+        ((a1, b1, d1), (a2, b2, d2), first && second && third)
+    }
+}
+
 // The primitive and tuple keys of a domain-keyed map, under any capability:
-// their bytes are their own, so `cap` only passes through, and they hash as
+// their bytes are their own, so `cx` only passes through, and they hash as
 // `Hash` hashes them. A tuple key hashes and compares its parts in order,
 // each under the same capability (`(Span['k], u32)` read with an
 // `Exclusive!['k]`).
 forall C.
 instance HashIn[u8, C] {
-    fn hash_in(&cap: C, key: u8, state: HashState) -> HashState {
+    fn hash_in(&cx: C, key: u8, state: HashState) -> HashState {
         state.write_u64((key as u64))
     }
 
-    fn eq_in(&cap: C, a: u8, b: u8) -> bool {
+    fn eq_in(&cx: C, a: u8, b: u8) -> bool {
         a == b
     }
 }
 forall C.
 instance HashIn[u16, C] {
-    fn hash_in(&cap: C, key: u16, state: HashState) -> HashState {
+    fn hash_in(&cx: C, key: u16, state: HashState) -> HashState {
         state.write_u64((key as u64))
     }
 
-    fn eq_in(&cap: C, a: u16, b: u16) -> bool {
+    fn eq_in(&cx: C, a: u16, b: u16) -> bool {
         a == b
     }
 }
 forall C.
 instance HashIn[u32, C] {
-    fn hash_in(&cap: C, key: u32, state: HashState) -> HashState {
+    fn hash_in(&cx: C, key: u32, state: HashState) -> HashState {
         state.write_u64((key as u64))
     }
 
-    fn eq_in(&cap: C, a: u32, b: u32) -> bool {
+    fn eq_in(&cx: C, a: u32, b: u32) -> bool {
         a == b
     }
 }
 forall C.
 instance HashIn[u64, C] {
-    fn hash_in(&cap: C, key: u64, state: HashState) -> HashState {
+    fn hash_in(&cx: C, key: u64, state: HashState) -> HashState {
         state.write_u64(key)
     }
 
-    fn eq_in(&cap: C, a: u64, b: u64) -> bool {
+    fn eq_in(&cx: C, a: u64, b: u64) -> bool {
         a == b
     }
 }
 forall C.
 instance HashIn[usize, C] {
-    fn hash_in(&cap: C, key: usize, state: HashState) -> HashState {
+    fn hash_in(&cx: C, key: usize, state: HashState) -> HashState {
         state.write_u64((key as u64))
     }
 
-    fn eq_in(&cap: C, a: usize, b: usize) -> bool {
+    fn eq_in(&cx: C, a: usize, b: usize) -> bool {
         a == b
     }
 }
 forall C.
 instance HashIn[i8, C] {
-    fn hash_in(&cap: C, key: i8, state: HashState) -> HashState {
+    fn hash_in(&cx: C, key: i8, state: HashState) -> HashState {
         state.write_u64((key as u64))
     }
 
-    fn eq_in(&cap: C, a: i8, b: i8) -> bool {
+    fn eq_in(&cx: C, a: i8, b: i8) -> bool {
         a == b
     }
 }
 forall C.
 instance HashIn[i16, C] {
-    fn hash_in(&cap: C, key: i16, state: HashState) -> HashState {
+    fn hash_in(&cx: C, key: i16, state: HashState) -> HashState {
         state.write_u64((key as u64))
     }
 
-    fn eq_in(&cap: C, a: i16, b: i16) -> bool {
+    fn eq_in(&cx: C, a: i16, b: i16) -> bool {
         a == b
     }
 }
 forall C.
 instance HashIn[i32, C] {
-    fn hash_in(&cap: C, key: i32, state: HashState) -> HashState {
+    fn hash_in(&cx: C, key: i32, state: HashState) -> HashState {
         state.write_u64((key as u64))
     }
 
-    fn eq_in(&cap: C, a: i32, b: i32) -> bool {
+    fn eq_in(&cx: C, a: i32, b: i32) -> bool {
         a == b
     }
 }
 forall C.
 instance HashIn[i64, C] {
-    fn hash_in(&cap: C, key: i64, state: HashState) -> HashState {
+    fn hash_in(&cx: C, key: i64, state: HashState) -> HashState {
         state.write_u64((key as u64))
     }
 
-    fn eq_in(&cap: C, a: i64, b: i64) -> bool {
+    fn eq_in(&cx: C, a: i64, b: i64) -> bool {
         a == b
     }
 }
 forall C.
 instance HashIn[isize, C] {
-    fn hash_in(&cap: C, key: isize, state: HashState) -> HashState {
+    fn hash_in(&cx: C, key: isize, state: HashState) -> HashState {
         state.write_u64((key as u64))
     }
 
-    fn eq_in(&cap: C, a: isize, b: isize) -> bool {
+    fn eq_in(&cx: C, a: isize, b: isize) -> bool {
         a == b
     }
 }
 forall C.
 instance HashIn[bool, C] {
-    fn hash_in(&cap: C, key: bool, state: HashState) -> HashState {
+    fn hash_in(&cx: C, key: bool, state: HashState) -> HashState {
         state.write_u8(if key { 1u8 } else { 0u8 })
     }
 
-    fn eq_in(&cap: C, a: bool, b: bool) -> bool {
+    fn eq_in(&cx: C, a: bool, b: bool) -> bool {
         a == b
     }
 }
 forall A, B, C where HashIn[A, C], HashIn[B, C], Copy[A], Copy[B].
 instance HashIn[(A, B), C] {
-    fn hash_in(&cap: C, key: (A, B), state: HashState) -> HashState {
+    fn hash_in(&cx: C, key: (A, B), state: HashState) -> HashState {
         let (a, b) = key;
-        let state = HashIn[A, C]::hash_in(&cap, a, state);
-        HashIn[B, C]::hash_in(&cap, b, state)
+        let state = HashIn[A, C]::hash_in(&cx, a, state);
+        HashIn[B, C]::hash_in(&cx, b, state)
     }
 
-    fn eq_in(&cap: C, x: (A, B), y: (A, B)) -> bool {
+    fn eq_in(&cx: C, x: (A, B), y: (A, B)) -> bool {
         let (a, b) = x;
         let (c, d) = y;
-        HashIn[A, C]::eq_in(&cap, a, c) && HashIn[B, C]::eq_in(&cap, b, d)
+        HashIn[A, C]::eq_in(&cx, a, c) && HashIn[B, C]::eq_in(&cx, b, d)
     }
 }
 
 forall A, B, D, C where HashIn[A, C], HashIn[B, C], HashIn[D, C], Copy[A], Copy[B], Copy[D].
 instance HashIn[(A, B, D), C] {
-    fn hash_in(&cap: C, key: (A, B, D), state: HashState) -> HashState {
+    fn hash_in(&cx: C, key: (A, B, D), state: HashState) -> HashState {
         let (a, b, d) = key;
-        let state = HashIn[A, C]::hash_in(&cap, a, state);
-        let state = HashIn[B, C]::hash_in(&cap, b, state);
-        HashIn[D, C]::hash_in(&cap, d, state)
+        let state = HashIn[A, C]::hash_in(&cx, a, state);
+        let state = HashIn[B, C]::hash_in(&cx, b, state);
+        HashIn[D, C]::hash_in(&cx, d, state)
     }
 
-    fn eq_in(&cap: C, x: (A, B, D), y: (A, B, D)) -> bool {
+    fn eq_in(&cx: C, x: (A, B, D), y: (A, B, D)) -> bool {
         let (a, b, d) = x;
         let (e, f, g) = y;
-        HashIn[A, C]::eq_in(&cap, a, e) && HashIn[B, C]::eq_in(&cap, b, f) && HashIn[D, C]::eq_in(&cap, d, g)
+        HashIn[A, C]::eq_in(&cx, a, e) && HashIn[B, C]::eq_in(&cx, b, f) && HashIn[D, C]::eq_in(&cx, d, g)
     }
 }

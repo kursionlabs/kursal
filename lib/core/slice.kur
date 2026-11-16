@@ -30,6 +30,7 @@ use package as core;
 
 use core::cap::{Access, Brand, Exclusive};
 use core::mem::{Ref, sizeof};
+use core::ptr::offset;
 use core::cap::Shared;
 use core::hash::{Hash, Eq, HashIn, HashState};
 use core::option::Option;
@@ -54,17 +55,6 @@ struct Slice {
     ptr: *T,
     len: usize,
     marker: Brand['k],
-}
-
-// Address of the i-th element of a `T` buffer starting at `base`: cast to
-// usize, do plain integer math, cast back, since pointers have no
-// arithmetic of their own. Nothing checks that `i` is in range.
-forall T.
-unsafe fn elem_ptr(base: *T, i: usize) -> *T {
-    let addr = unsafe (base as usize);
-    let off = i * sizeof[T]();
-    let addr2 = addr + off;
-    unsafe (addr2 as *T)
 }
 
 forall T, 'k.
@@ -99,13 +89,13 @@ impl Slice[T, 'k] {
     //
     // `Option`, not an abort and not a sentinel: this is a fallible lookup,
     // the same shape as `core::raw::raw_get` (`Option[T]`) and the map
-    // lookups (`Found[Ref[V,'k]]`).
+    // lookups (`HashMap::get`, `Option[Ref[V,'k]]`).
     forall C, R where Access[C -> 'k, R].
     fn get_ref(self, &cx: C, i: usize) -> Option[Ref[T, 'k]] {
         let (tag, rest) = Access[C -> 'k, R]::open(cx);
         let { ptr: p, len: n, marker: m } = self;
         let out: Option[Ref[T, 'k]] = if i < n {
-            let ep = unsafe elem_ptr(p, i);
+            let ep = unsafe offset(p, i);
             // In bounds of this slice, whose extent is live under `m`.
             Option::Some.(unsafe Ref::from_raw(ep, m))
         } else {
@@ -115,9 +105,19 @@ impl Slice[T, 'k] {
         out
     }
 
-    // A copy of element `i`, read through the capability `cx` lends;
-    // stops the program (`core::process::trap`) when `i` is out of range.
-    // `get_ref` is the form for an index that may miss.
+    // A copy of element `i`, read through the capability `cx` lends, or
+    // `None` when `i` is out of range.
+    forall C, R where Copy[T], Access[C -> 'k, R].
+    fn get(self, &cx: C, i: usize) -> Option[T] {
+        match self.get_ref(&cx, i) {
+            Option::Some(r) => Option::Some.(r.copy(&cx)),
+            Option::None => Option::None,
+        }
+    }
+
+    // A copy of element `i`; stops the program (`core::process::trap`)
+    // when `i` is out of range. `get` is the form for an index that may
+    // miss.
     forall C, R where Copy[T], Access[C -> 'k, R].
     fn at(self, &cx: C, i: usize) -> T {
         match self.get_ref(&cx, i) {
@@ -129,6 +129,10 @@ impl Slice[T, 'k] {
     fn len(self) -> usize {
         let { ptr: p, len: n, marker: m } = self;
         n
+    }
+
+    fn is_empty(self) -> bool {
+        self.len() == 0usize
     }
 
     // A sub-view starting `start` elements in, `count` elements long, or
@@ -148,7 +152,7 @@ impl Slice[T, 'k] {
             if count > remaining {
                 Option::None
             } else {
-                let base = unsafe elem_ptr(p, start);
+                let base = unsafe offset(p, start);
                 Option::Some.(Slice.{ ptr: base, len: count, marker: m })
             }
         };
@@ -182,7 +186,7 @@ impl Slice[T, 'k] {
 struct StaticRead {}
 
 impl StaticRead {
-    fn get() -> StaticRead {
+    fn new() -> StaticRead {
         StaticRead.{}
     }
 }
@@ -190,10 +194,10 @@ impl StaticRead {
 forall C, S.
 trait ReadBytes {
     // `None` when `index` is out of range; zero is an ordinary byte.
-    fn get(&cap: C, bytes: S, index: usize) -> Option[u8];
-    // Needs `cap` only so a call can select the instance: generic code
+    fn get(&cx: C, bytes: S, index: usize) -> Option[u8];
+    // Needs `cx` only so a call can select the instance: generic code
     // holding just `S` has no other way to name the view's length.
-    fn len(&cap: C, bytes: S) -> usize;
+    fn len(&cx: C, bytes: S) -> usize;
 }
 
 // The shared body of the three instances below. `unsafe`: reads `s`'s
@@ -203,7 +207,7 @@ forall 'k.
 unsafe fn slice_byte_at(s: Slice[u8, 'k], index: usize) -> Option[u8] {
     let { ptr: p, len: n, marker: m } = s;
     if index < n {
-        let b = unsafe *(unsafe elem_ptr(p, index));
+        let b = unsafe *(unsafe offset(p, index));
         Option::Some.(b)
     } else {
         Option::None
@@ -212,29 +216,29 @@ unsafe fn slice_byte_at(s: Slice[u8, 'k], index: usize) -> Option[u8] {
 
 forall 'r.
 instance ReadBytes[Exclusive!['r], Slice[u8, 'r]] {
-    fn get(&cap: Exclusive!['r], bytes: Slice[u8, 'r], index: usize) -> Option[u8] {
+    fn get(&cx: Exclusive!['r], bytes: Slice[u8, 'r], index: usize) -> Option[u8] {
         unsafe slice_byte_at(bytes, index)
     }
-    fn len(&cap: Exclusive!['r], bytes: Slice[u8, 'r]) -> usize {
+    fn len(&cx: Exclusive!['r], bytes: Slice[u8, 'r]) -> usize {
         bytes.len()
     }
 }
 
 forall 'r, 'q.
 instance ReadBytes[Shared!['r, 'q], Slice[u8, 'r]] {
-    fn get(&cap: Shared!['r, 'q], bytes: Slice[u8, 'r], index: usize) -> Option[u8] {
+    fn get(&cx: Shared!['r, 'q], bytes: Slice[u8, 'r], index: usize) -> Option[u8] {
         unsafe slice_byte_at(bytes, index)
     }
-    fn len(&cap: Shared!['r, 'q], bytes: Slice[u8, 'r]) -> usize {
+    fn len(&cx: Shared!['r, 'q], bytes: Slice[u8, 'r]) -> usize {
         bytes.len()
     }
 }
 
 instance ReadBytes[StaticRead, Slice[u8, 'static]] {
-    fn get(&cap: StaticRead, bytes: Slice[u8, 'static], index: usize) -> Option[u8] {
+    fn get(&cx: StaticRead, bytes: Slice[u8, 'static], index: usize) -> Option[u8] {
         unsafe slice_byte_at(bytes, index)
     }
-    fn len(&cap: StaticRead, bytes: Slice[u8, 'static]) -> usize {
+    fn len(&cx: StaticRead, bytes: Slice[u8, 'static]) -> usize {
         bytes.len()
     }
 }
@@ -249,18 +253,12 @@ exposed struct Readable {
     bytes: S,
 }
 
-// The capability-generic byte read. Concrete callers infer `C` and `S`:
-// `byte_at(&tag, s, i)`.
-forall C, S where ReadBytes[C, S].
-fn byte_at(&cap: C, bytes: S, index: usize) -> Option[u8] {
-    ReadBytes[C, S]::get(&cap, bytes, index)
-}
-
-// `byte_at` with `0u8` for out of range: a sentinel for scanners whose
+// Byte `index` of a view read through its capability (`ReadBytes::get`),
+// with `0u8` for out of range: a sentinel for scanners whose
 // character-class tests already treat `0u8` as matching nothing.
 forall C, S where ReadBytes[C, S].
-fn byte_or_zero(&cap: C, bytes: S, index: usize) -> u8 {
-    let b = ReadBytes[C, S]::get(&cap, bytes, index);
+fn byte_or_zero(&cx: C, bytes: S, index: usize) -> u8 {
+    let b = ReadBytes[C, S]::get(&cx, bytes, index);
     let v = match b {
         Option::Some(x) => x,
         Option::None => 0u8,
@@ -329,8 +327,8 @@ fn bytes_cmp(&left_cap: C1, left: S1, &right_cap: C2, right: S2) -> Order {
 // `bytes_eq` for two views of one domain, read through its one capability
 // (which cannot be passed twice when it is linear).
 forall C, S where ReadBytes[C, S], Copy[S].
-fn bytes_eq_within(&cap: C, left: S, right: S) -> bool {
-    let order = bytes_cmp_within(&cap, left, right);
+fn bytes_eq_within(&cx: C, left: S, right: S) -> bool {
+    let order = bytes_cmp_within(&cx, left, right);
     let same = match order {
         Order::Equal => true,
         _ => false,
@@ -340,13 +338,13 @@ fn bytes_eq_within(&cap: C, left: S, right: S) -> bool {
 
 // `bytes_cmp` for two views of one domain, read through its one capability.
 forall C, S where ReadBytes[C, S], Copy[S].
-fn bytes_cmp_within(&cap: C, left: S, right: S) -> Order {
-    let n = ReadBytes[C, S]::len(&cap, left);
-    let m = ReadBytes[C, S]::len(&cap, right);
+fn bytes_cmp_within(&cx: C, left: S, right: S) -> Order {
+    let n = ReadBytes[C, S]::len(&cx, left);
+    let m = ReadBytes[C, S]::len(&cx, right);
     var i = 0usize;
     while i < n && i < m {
-        let x = byte_or_zero(&cap, left, i);
-        let y = byte_or_zero(&cap, right, i);
+        let x = byte_or_zero(&cx, left, i);
+        let y = byte_or_zero(&cx, right, i);
         if x != y {
             let order = if x < y {
                 Order::Less
@@ -367,15 +365,17 @@ fn bytes_cmp_within(&cap: C, left: S, right: S) -> Order {
     order
 }
 
-// The first index at or after `start` holding `needle`.
+// The first index at or after `start` holding `needle`. Every search
+// takes what it looks for before where it starts: `find_byte(&cx, bytes,
+// needle, start)`, as `Span::find` and `Span::find_byte` do.
 forall C, S where ReadBytes[C, S], Copy[S].
-fn find_byte(&cap: C, bytes: S, start: usize, needle: u8) -> Option[usize] {
-    let n = ReadBytes[C, S]::len(&cap, bytes);
+fn find_byte(&cx: C, bytes: S, needle: u8, start: usize) -> Option[usize] {
+    let n = ReadBytes[C, S]::len(&cx, bytes);
     var i = start;
     var found = Option::None;
     var searching = true;
     while searching && i < n {
-        let b = ReadBytes[C, S]::get(&cap, bytes, i);
+        let b = ReadBytes[C, S]::get(&cx, bytes, i);
         let hit = match b {
             Option::Some(x) => x == needle,
             Option::None => false,
@@ -393,14 +393,14 @@ fn find_byte(&cap: C, bytes: S, start: usize, needle: u8) -> Option[usize] {
 // `bytes`, both views read through the one capability. An empty `needle`
 // is found at `start` itself, when `start` is within `bytes`.
 forall C, S where ReadBytes[C, S], Copy[S].
-fn find_bytes(&cap: C, bytes: S, start: usize, needle: S) -> Option[usize] {
-    let n = ReadBytes[C, S]::len(&cap, bytes);
-    let m = ReadBytes[C, S]::len(&cap, needle);
+fn find_bytes(&cx: C, bytes: S, needle: S, start: usize) -> Option[usize] {
+    let n = ReadBytes[C, S]::len(&cx, bytes);
+    let m = ReadBytes[C, S]::len(&cx, needle);
     var i = start;
     var found = Option::None;
     while found.is_none() && i <= n && m <= n - i {
         var j = 0usize;
-        while j < m && byte_or_zero(&cap, bytes, i + j) == byte_or_zero(&cap, needle, j) {
+        while j < m && byte_or_zero(&cx, bytes, i + j) == byte_or_zero(&cx, needle, j) {
             j = j + 1usize;
         }
         if j == m {
@@ -413,12 +413,12 @@ fn find_bytes(&cap: C, bytes: S, start: usize, needle: S) -> Option[usize] {
 
 // Feeds a byte view's contents into `state`, byte by byte.
 forall C, S where ReadBytes[C, S], Copy[S].
-fn hash_bytes(&cap: C, bytes: S, state: HashState) -> HashState {
-    let n = ReadBytes[C, S]::len(&cap, bytes);
+fn hash_bytes(&cx: C, bytes: S, state: HashState) -> HashState {
+    let n = ReadBytes[C, S]::len(&cx, bytes);
     var s = state;
     var i = 0usize;
     while i < n {
-        let b = ReadBytes[C, S]::get(&cap, bytes, i);
+        let b = ReadBytes[C, S]::get(&cx, bytes, i);
         let next = match b {
             Option::Some(x) => s.write_u8(x),
             Option::None => s,
@@ -433,12 +433,12 @@ fn hash_bytes(&cap: C, bytes: S, state: HashState) -> HashState {
 // capability (`HashMap::get_in` and friends).
 forall C, 't where ReadBytes[C, Slice[u8, 't]].
 instance HashIn[Slice[u8, 't], C] {
-    fn hash_in(&cap: C, key: Slice[u8, 't], state: HashState) -> HashState {
-        hash_bytes(&cap, key, state)
+    fn hash_in(&cx: C, key: Slice[u8, 't], state: HashState) -> HashState {
+        hash_bytes(&cx, key, state)
     }
 
-    fn eq_in(&cap: C, a: Slice[u8, 't], b: Slice[u8, 't]) -> bool {
-        bytes_eq_within(&cap, a, b)
+    fn eq_in(&cx: C, a: Slice[u8, 't], b: Slice[u8, 't]) -> bool {
+        bytes_eq_within(&cx, a, b)
     }
 }
 
@@ -462,49 +462,43 @@ instance Hash[Readable[C, S]] {
 }
 
 // ------------------------------------------------------------ iteration --
-// A slice's elements in order, read under its domain's capability, which the
-// iterator holds while it runs: `var it = bytes.iter(tag); for b in &it { .. }
-// let tag = it.finish();`.
-forall T, 'k.
+// A slice's elements in order, read under the capability a context lends
+// (`Access`). `iter` opens the context and the iterator holds what it
+// opened while it runs; `finish` closes it and hands the context back:
+// `var it = bytes.iter(cx); for b in &it { .. } let cx = it.finish();`.
+forall T, 'k, C, R.
 exposed struct SliceIter! {
     tag: Exclusive!['k],
+    rest: R,
     slice: Slice[T, 'k],
     index: usize,
 }
 
 forall T, 'k where Copy[T].
 impl Slice[T, 'k] {
-    fn iter(self, tag: Exclusive!['k]) -> SliceIter![T, 'k] {
-        SliceIter.{ tag, slice: self, index: 0usize }
+    forall C, R where Access[C -> 'k, R].
+    fn iter(self, cx: C) -> SliceIter![T, 'k, C, R] {
+        let (tag, rest) = Access[C -> 'k, R]::open(cx);
+        SliceIter.{ tag, rest, slice: self, index: 0usize }
     }
 }
 
-forall T, 'k where Copy[T].
-impl SliceIter[T, 'k] {
-    // Ends the iteration, handing back the capability.
-    fn finish(self) -> Exclusive!['k] {
-        let { tag, slice: _slice, index: _index } = self;
-        tag
+forall T, 'k, C, R where Access[C -> 'k, R].
+impl SliceIter[T, 'k, C, R] {
+    // Ends the iteration, handing back the context.
+    fn finish(self) -> C {
+        let { tag, rest, slice: _slice, index: _index } = self;
+        Access[C -> 'k, R]::close(tag, rest)
     }
 }
 
-forall T, 'k where Copy[T].
-instance Iterator[SliceIter![T, 'k] -> T] {
-    fn next(&it: SliceIter![T, 'k]) -> Option[T] {
-        let { tag, slice, index } = it;
-        let slot = slice.get_ref(&tag, index);
-        let (tag, item) = match slot {
-            Option::Some(r) => {
-                let value = r.copy(&tag);
-                (tag, Option::Some.(value))
-            },
-            Option::None => (tag, Option::None),
-        };
-        let next_index = match item {
-            Option::Some(_v) => index + 1usize,
-            Option::None => index,
-        };
-        it = SliceIter.{ tag, slice, index: next_index };
+forall T, 'k, C, R where Copy[T].
+instance Iterator[SliceIter![T, 'k, C, R] -> T] {
+    fn next(&it: SliceIter![T, 'k, C, R]) -> Option[T] {
+        let { tag, rest, slice, index } = it;
+        let item = slice.get(&tag, index);
+        let next_index = if item.is_some() { index + 1usize } else { index };
+        it = SliceIter.{ tag, rest, slice, index: next_index };
         item
     }
 }

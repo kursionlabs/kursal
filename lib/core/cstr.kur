@@ -1,17 +1,14 @@
-// core::cstr -- helpers for a NUL-terminated C string pointer (an argv
-// entry, a path, ...): distinct from `core::raw::Span['k]`, which always
-// knows its own length up front and is never NUL-terminated by
-// convention.
+// core::cstr -- a NUL-terminated C string (an argv entry, a path, ...):
+// distinct from `core::raw::Span['k]`, which always knows its own length
+// up front and is never NUL-terminated by convention.
 //
-// Capability-free (no `Exclusive!`/`Brand` threading): both functions
-// below only read already-resolved bytes transiently and never construct
-// or consume a linear resource.
+// Capability-free (no `Exclusive!`/`Brand` threading): a `CStr` lives for
+// the rest of the process, so reading it needs no witness, and `cstr_len`
+// only reads bytes its caller vouches for.
 
 use package as core;
 
-use core::raw::elem_ptr;
-use core::raw::raw_byte_at;
-use core::slice::Slice;
+use core::ptr::offset;
 
 // A borrowed, process-lifetime NUL-terminated string. Construction is
 // restricted because even measuring an arbitrary pointer would be unsafe.
@@ -20,8 +17,8 @@ struct CStr {
 }
 
 impl CStr {
-    // `ptr` must address a live NUL-terminated byte run. In particular,
-    // `argv` entries satisfy this for the duration of the process.
+    // `ptr` must address a NUL-terminated byte run that stays readable and
+    // unchanged for the rest of the process, as `argv` entries do.
     unsafe fn from_raw(ptr: *u8) -> CStr {
         CStr.{ ptr }
     }
@@ -32,11 +29,6 @@ impl CStr {
         let { ptr } = self;
         ptr
     }
-
-    fn eq_lit(self, lit: Slice[u8, 'static]) -> bool {
-        let { ptr } = self;
-        unsafe cstr_eq_lit(ptr, lit)
-    }
 }
 
 // Length of a NUL-terminated C string. The scan is unbounded: no length
@@ -46,7 +38,7 @@ unsafe fn cstr_len(s: *u8) -> usize {
     var n = 0usize;
     var looping = true;
     while looping {
-        let b = unsafe *(unsafe elem_ptr(s, n));
+        let b = unsafe *(unsafe offset(s, n));
         if b == 0u8 {
             looping = false;
         } else {
@@ -54,28 +46,4 @@ unsafe fn cstr_len(s: *u8) -> usize {
         }
     }
     n
-}
-
-// Is NUL-terminated `raw` equal to the string literal `lit`? Measures
-// `raw` with `cstr_len` first, then compares byte by byte, reading the
-// literal's own pointer and length directly. `raw` must address a live
-// NUL-terminated byte run.
-unsafe fn cstr_eq_lit(raw: *u8, lit: Slice[u8, 'static]) -> bool {
-    let (lp, ln, lm) = lit.into_parts();
-    let raw_len = unsafe cstr_len(raw);
-    let result = if raw_len == ln {
-        var mismatches = 0usize;
-        var i = 0usize;
-        while i < raw_len {
-            let a = unsafe raw_byte_at(raw, raw_len, i);
-            let b = unsafe raw_byte_at(lp, ln, i);
-            let d = if a == b { 0usize } else { 1usize };
-            mismatches = mismatches + d;
-            i = i + 1usize;
-        }
-        mismatches == 0usize
-    } else {
-        false
-    };
-    result
 }

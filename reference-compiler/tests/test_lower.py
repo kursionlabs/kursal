@@ -31,7 +31,7 @@ fn main() -> i32 {
     var n = 5u32;
     let msg = f"{if n == 5 { 7u32 } else { 8u32 }}:{match n { 5 => 9u32, _ => 10u32 }}:{&n}:{n}";
     let exists 'opened. (tag, bytes, restore) = msg.open();
-    var sr = StaticRead::get();
+    var sr = StaticRead::new();
     let good = bytes_eq(&tag, bytes, &sr, "7:9:5:5");
     restore.restore(tag).destroy();
     if good && n == 5 { 0i32 } else { 1i32 }

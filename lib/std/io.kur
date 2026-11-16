@@ -6,14 +6,11 @@
 use package as std;
 
 use alloc::buffer::Buffer;
-use alloc::buffer::BufferWriter;
 use core::raw::Span;
-use core::raw::elem_ptr;
+use core::ptr::offset;
 use core::slice::{Slice, ReadBytes};
 use core::fmt::Writable;
 use core::option::{Option, Result};
-use core::cstr::{CStr, cstr_len};
-use alloc::arena::ArenaByteWriter;
 use core::cap::{Access, Exclusive};
 
 // `libc/fs.c`, which every program links, wraps the system calls: each
@@ -57,16 +54,16 @@ impl Error {
 // discards it, while a program whose output is its product checks it.
 
 unsafe fn write_all(fd: i32, ptr: *u8, len: usize) -> Result[(), Error] {
-    var offset = 0usize;
-    while offset < len {
-        let n = unsafe kur_libc_fs_write(fd, unsafe elem_ptr(ptr, offset), len - offset);
+    var done = 0usize;
+    while done < len {
+        let n = unsafe kur_libc_fs_write(fd, unsafe offset(ptr, done), len - done);
         if n < 0isize {
             return Result::Err.(Error::of_return(n));
         }
         if n == 0isize {
             return Result::Err.(Error::io());
         }
-        offset = offset + (n as usize);
+        done = done + (n as usize);
     }
     Result::Ok.(())
 }
@@ -85,8 +82,8 @@ fn write_span(fd: i32, &cx: C, sp: Span['k]) -> Result[(), Error] {
 // Prints any byte view, read through the capability that permits it
 // (`Exclusive!`, `Shared!`, `StaticRead`).
 forall C, S where ReadBytes[C, S], Copy[S].
-fn print_bytes(fd: i32, &cap: C, bytes: S) -> Result[(), Error] {
-    let buffer = Buffer::new().push_bytes(&cap, bytes);
+fn print_bytes(fd: i32, &cx: C, bytes: S) -> Result[(), Error] {
+    let buffer = Buffer::new().push_bytes(&cx, bytes);
     print_buffer(fd, buffer)
 }
 
@@ -113,15 +110,15 @@ fn print_buffer(fd: i32, buf: Buffer!) -> Result[(), Error] {
 // because the file shrank. Caller: `buf[0..size)` is writable, and `fd` is
 // a descriptor the caller may read (stdin, or one a `File!` it holds owns).
 unsafe fn read_exact(fd: i32, buf: *u8, size: usize) -> usize {
-    var offset = 0usize;
-    while offset < size {
-        let n = unsafe kur_libc_fs_read(fd, unsafe elem_ptr(buf, offset), size - offset);
+    var done = 0usize;
+    while done < size {
+        let n = unsafe kur_libc_fs_read(fd, unsafe offset(buf, done), size - done);
         if n <= 0isize {
-            return offset;
+            return done;
         }
-        offset = offset + (n as usize);
+        done = done + (n as usize);
     }
-    offset
+    done
 }
 
 // Reads `fd` to EOF, 4096 bytes at a time, appending to `b` and returning
@@ -197,9 +194,9 @@ fn read_line() -> Result[Option[Buffer!], Error] {
 // an arbitrary integer and later reads, writes or closes it: without that,
 // safe code could build `File { fd: 3 }` over a descriptor it never opened
 // and close whatever the process holds at that number. A `File!` comes
-// only from `open_read`/`create_truncate` (and `libc::fs`'s `open_read`/
-// `create`), which open a fresh descriptor, or from `unsafe adopt`. No
-// safe function here takes a bare descriptor to read or close.
+// only from `open_read` and `create`, which open a fresh descriptor, or
+// from `unsafe adopt`. No safe function here takes a bare descriptor to
+// read or close.
 //
 // Standard input, output and error stay bare `i32`s (0/1/2), never
 // `File!`: they are borrowed process handles this program did not open
@@ -210,12 +207,15 @@ struct File! {
 }
 
 impl File {
-    // Opens `path` read-only. Safe: the descriptor it wraps is always
-    // one this call opened. Fails with the errno of `open(2)`.
-    fn open_read(path: CStr) -> Result[File!, Error] {
-        let p = path.as_ptr();
-        // `path` is a live NUL-terminated string, which `CStr` guarantees.
-        let fd = unsafe kur_libc_fs_open_read(p, unsafe cstr_len(p));
+    // Opens the file at `path`, whose bytes are the path without a NUL,
+    // read-only. Safe: the descriptor it wraps is always one this call
+    // opened. Fails with the errno of `open(2)`, or EINVAL for a path
+    // holding a NUL. `path` is handed back unchanged.
+    fn open_read(&path: Buffer!) -> Result[File!, Error] {
+        let p = unsafe &path.as_ptr();
+        let n = &path.len();
+        // `p[0..n)` are the bytes `path` holds.
+        let fd = unsafe kur_libc_fs_open_read(p, n);
         if fd < 0i32 {
             Result::Err.(Error.{ errno: 0i32 - fd })
         } else {
@@ -223,11 +223,12 @@ impl File {
         }
     }
 
-    // Creates `path`, or empties it, and opens it for writing; a new file
-    // gets mode 0644 less the umask. Fails with the errno of `open(2)`.
-    fn create_truncate(path: CStr) -> Result[File!, Error] {
-        let p = path.as_ptr();
-        let fd = unsafe kur_libc_fs_create(p, unsafe cstr_len(p));
+    // Creates the file at `path`, or empties it, and opens it for writing;
+    // a new file gets mode 0644 less the umask. Fails as `open_read` does.
+    fn create(&path: Buffer!) -> Result[File!, Error] {
+        let p = unsafe &path.as_ptr();
+        let n = &path.len();
+        let fd = unsafe kur_libc_fs_create(p, n);
         if fd < 0i32 {
             Result::Err.(Error.{ errno: 0i32 - fd })
         } else {
@@ -278,25 +279,6 @@ impl File {
         let got = unsafe read_exact(fd, buf, size);
         self = File.{ fd };
         got
-    }
-
-    // Reads into a checked arena writer. Only the bytes the kernel
-    // reported as written are published; a short read is an error (EIO).
-    forall 'k.
-    fn read_exact_into(&self, writer: ArenaByteWriter!['k], count: usize) -> (ArenaByteWriter!['k], Result[(), Error]) {
-        let available = &writer.remaining();
-        if count > available {
-            (writer, Result::Err.(Error::io()))
-        } else {
-            let (dest, available2) = unsafe &writer.writable_tail();
-            let got = unsafe &self.read_exact(dest, count);
-            let committed = unsafe &writer.commit_external(got);
-            if committed && got == count {
-                (writer, Result::Ok.(()))
-            } else {
-                (writer, Result::Err.(Error::io()))
-            }
-        }
     }
 
     forall 'k.

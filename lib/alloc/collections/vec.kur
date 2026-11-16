@@ -11,7 +11,7 @@
 // `back.resume(tag)` to recover the region, `alloc.release(region)` to
 // retire the domain into raw `Uninit!` storage, an optional
 // `HeapAllocator::grow`, then `Allocation::adopt` and `Region::share` to
-// re-enter under a fresh brand. `push`, `pop` and `reserve_n` therefore
+// re-enter under a fresh brand. `push` and `pop` therefore
 // always return a new brand, invalidating every outstanding `Ref` or
 // `Slice` into the vec whether or not the storage moved: the policy is
 // "mutation invalidates", not "the address moved".
@@ -45,6 +45,7 @@ use alloc::heap::checked_add;
 use alloc::heap::checked_mul;
 use core::cap::Exclusive;
 use core::mem::{Ref, sizeof};
+use core::ptr::offset;
 use core::option::Option;
 use alloc::owned::Allocation;
 use core::mem::Region;
@@ -52,6 +53,8 @@ use core::mem::RegionResume;
 use core::slice::Slice;
 use core::cmp::{Ord, Order};
 use core::iter::Iterator;
+use core::process::trap;
+use alloc::collections::arena_vec::merge_runs;
 
 // `alloc` and `back` are restricted records held as fields: only
 // `Allocation::adopt` produces an `Allocation!` and only `Region::share`
@@ -71,17 +74,6 @@ forall T.
 exposed enum Popped! {
     Item(T),
     Empty,
-}
-
-// Address of the i-th element of a T-buffer starting at `base`. Pointers
-// have no arithmetic of their own: cast to usize, do plain integer math,
-// cast back.
-forall T.
-unsafe fn elem_ptr(base: *T, i: usize) -> *T {
-    let addr = unsafe (base as usize);
-    let off = i * sizeof[T]();
-    let addr2 = addr + off;
-    unsafe (addr2 as *T)
 }
 
 forall T.
@@ -105,7 +97,7 @@ impl Vec[T] {
 forall T, 'k.
 impl Vec[T, 'k] {
     // Appends `val`, doubling the capacity when the vec is full. The only
-    // operation here besides `reserve_n` where the storage can move. Always
+    // operation here where the storage can move. Always
     // returns under a fresh brand, invalidating every descriptor of the old
     // domain by type equality, growth or no growth.
     //
@@ -141,7 +133,7 @@ impl Vec[T, 'k] {
         let exists 'open1. (a2, rg2) = unsafe Allocation::adopt[T](u);
         let (tag, r2, bk2) = rg2.share();
         let (p, m) = r2.into_parts();
-        let target = unsafe elem_ptr(p, n);
+        let target = unsafe offset(p, n);
         unsafe *target = val;
         let n2 = n + 1usize;
         pack 'open1. (tag, Vec.{ alloc: a2, back: bk2, buf: r2, len: n2, cap: new_cap })
@@ -163,7 +155,7 @@ impl Vec[T, 'k] {
         let out: Option[Ref[T, 'k]] = if i < n {
             // In bounds of this vec's initialized elements, which live
             // under `m`.
-            Option::Some.(unsafe Ref::from_raw(unsafe elem_ptr(p, i), m))
+            Option::Some.(unsafe Ref::from_raw(unsafe offset(p, i), m))
         } else {
             Option::None
         };
@@ -187,61 +179,6 @@ impl Vec[T, 'k] {
         view
     }
 
-    // Consumes the vec and hands back its block as raw storage, with the
-    // element count, for a caller that is done growing it and wants the
-    // buffer itself (`alloc::str`'s `finish`). The first `n` elements of
-    // the block are initialized; nothing else is promised. `resume` takes
-    // back the caller's `Exclusive!['k]`, so no `Ref` or `Slice` of the
-    // vec's brand can be used again, and `release` retires the domain.
-    fn into_uninit(self, tag: Exclusive!['k]) -> (Uninit!, usize) {
-        let { alloc: a, back: bk, buf: r, len: n, cap: c } = self;
-        let rg = bk.resume(tag);
-        (a.release(rg), n)
-    }
-
-    // Grows the buffer if needed and raises `len` by `extra` in one step:
-    // one brand change, not one per element as with repeated `push`. Returns
-    // the vec under a fresh brand, a `Slice` spanning all `len` elements, and
-    // the old length, where the reserved slots start. The caller fills
-    // `[old_len, old_len + extra)` through the `Slice`'s `get_ref` and
-    // `Ref::with`, which keep the brand and so can run in a plain `while`
-    // loop (as `alloc::str`'s `push_literal`/`push_piece` do).
-    //
-    // `unsafe fn` because the reserved slots are uninitialized, yet
-    // `Slice::get_ref`'s bounds check (against `len`, not `cap`) admits them,
-    // so `Ref::copy` would read whatever is there: uninitialized bytes, or
-    // for a general `Copy` `T` a value synthesized from allocator residue.
-    //
-    // Caller obligation: before reading any of `[old_len, old_len + extra)`
-    // through the returned `Slice`, and before letting the returned `Vec!` be
-    // observed by anything that could, write a valid `T` to every one of
-    // those slots.
-    unsafe fn reserve_n(self, tag: Exclusive!['k], extra: usize) -> exists '2. (Exclusive!['2], Vec![T, '2], Slice[T, '2], usize) {
-        let { alloc: a, back: bk, buf: r, len: n, cap: c } = self;
-        let rg = bk.resume(tag);
-        let u = a.release(rg);
-        let needed = checked_add(n, extra);
-        var new_cap = c;
-        while new_cap < needed {
-            new_cap = checked_mul(new_cap, 2usize);
-        }
-        let u = if needed <= c {
-            u
-        } else {
-            let new_bytes = checked_mul(new_cap, sizeof[T]());
-            HeapAllocator::grow(u, new_bytes)
-        };
-        // `adopt`'s obligation: see "Adopting the block" in the header.
-        let exists 'open1. (a2, rg2) = unsafe Allocation::adopt[T](u);
-        let (tag, r2, bk2) = rg2.share();
-        let (p, m) = r2.into_parts();
-        // `unsafe`: the allocation was just grown to hold `needed` elements;
-        // the slots past the old length are uninitialized, which this
-        // function's caller obligation covers.
-        let view = unsafe Slice::from_raw_parts(p, needed, m);
-        pack 'open1. (tag, Vec.{ alloc: a2, back: bk2, buf: r2, len: needed, cap: new_cap }, view, n)
-    }
-
     // Removes and returns the last element, or `Popped::Empty` if the vec
     // is empty. Rebrands like `push`, but never resizes the allocation.
     fn pop(self, tag: Exclusive!['k]) -> exists '2. (Exclusive!['2], Vec![T, '2], Popped![T]) {
@@ -259,7 +196,7 @@ impl Vec[T, 'k] {
         } else {
             let one = 1usize;
             let n2 = n - one;
-            let ep = unsafe elem_ptr(p, n2);
+            let ep = unsafe offset(p, n2);
             let v = unsafe *ep;
             (n2, Popped::Item.(v))
         };
@@ -278,7 +215,7 @@ impl Vec[T, 'k] {
         let (p, m) = r.into_parts();
         var i = 0usize;
         while i < n {
-            let ep = unsafe elem_ptr(p, i);
+            let ep = unsafe offset(p, i);
             let v = unsafe *ep;
             let u = f(v);
             i = i + 1usize;
@@ -291,17 +228,21 @@ impl Vec[T, 'k] {
 }
 
 // ---------------------------------------------------------------------
-// Sorting, in place, by heapsort: O(n log n) comparisons and only moves
-// (no copies), so linear elements sort as well as `Copy` ones.
+// Sorting. `sort_by` and `sort` are stable: a bottom-up merge sort through
+// a scratch block (O(n log n) comparisons, O(n) extra space), for `Copy`
+// elements, as `ArenaVec::sort_by`. `sort_unstable_by` and
+// `sort_unstable` are a heapsort in place: O(n log n) comparisons and only
+// moves, so linear elements sort as well as `Copy` ones, but equal
+// elements may change order.
 
 // Whether the element at `i` orders before the one at `j`; both stay put.
 forall T, Env where Copy[Env].
 unsafe fn before(p: *T, i: usize, j: usize, cmp: closure[Env](T, T) -> (T, T, Order)) -> bool {
-    let a = unsafe *(unsafe elem_ptr(p, i));
-    let b = unsafe *(unsafe elem_ptr(p, j));
+    let a = unsafe *(unsafe offset(p, i));
+    let b = unsafe *(unsafe offset(p, j));
     let (a, b, order) = cmp(a, b);
-    unsafe *(unsafe elem_ptr(p, i)) = a;
-    unsafe *(unsafe elem_ptr(p, j)) = b;
+    unsafe *(unsafe offset(p, i)) = a;
+    unsafe *(unsafe offset(p, j)) = b;
     match order {
         Order::Less => true,
         _ => false,
@@ -310,10 +251,10 @@ unsafe fn before(p: *T, i: usize, j: usize, cmp: closure[Env](T, T) -> (T, T, Or
 
 forall T.
 unsafe fn swap_at(p: *T, i: usize, j: usize) -> () {
-    let a = unsafe *(unsafe elem_ptr(p, i));
-    let b = unsafe *(unsafe elem_ptr(p, j));
-    unsafe *(unsafe elem_ptr(p, i)) = b;
-    unsafe *(unsafe elem_ptr(p, j)) = a;
+    let a = unsafe *(unsafe offset(p, i));
+    let b = unsafe *(unsafe offset(p, j));
+    unsafe *(unsafe offset(p, i)) = b;
+    unsafe *(unsafe offset(p, j)) = a;
     ()
 }
 
@@ -348,9 +289,9 @@ unsafe fn sift_down(p: *T, root: usize, end: usize, cmp: closure[Env](T, T) -> (
 forall T, 'k.
 impl Vec[T, 'k] {
     // Sorts the elements so `cmp` never says a later one orders before an
-    // earlier one. Not stable.
+    // earlier one. Not stable; any `T`.
     forall Env where Copy[Env].
-    fn sort_by(&self, &tag: Exclusive!['k], cmp: closure[Env](T, T) -> (T, T, Order)) {
+    fn sort_unstable_by(&self, &tag: Exclusive!['k], cmp: closure[Env](T, T) -> (T, T, Order)) {
         let { alloc: a, back: bk, buf: r, len: n, cap: c } = self;
         let (p, m) = r.into_parts();
         // Indices below `n` are inside the elements this vector owns.
@@ -371,57 +312,18 @@ impl Vec[T, 'k] {
 
 forall T, 'k where Ord[T, T].
 impl Vec[T, 'k] {
-    // Sorts the elements in ascending `Ord` order. Not stable.
-    fn sort(&self, &tag: Exclusive!['k]) {
-        &self.sort_by(&tag, |a: T, b: T| Ord[T, T]::cmp(a, b))
+    // Sorts the elements in ascending `Ord` order. Not stable; any `T`.
+    fn sort_unstable(&self, &tag: Exclusive!['k]) {
+        &self.sort_unstable_by(&tag, |a: T, b: T| Ord[T, T]::cmp(a, b))
     }
-}
-
-// One bottom-up merge pass: merges each pair of adjacent sorted runs of
-// `width` elements of `src` into `dst`. Ties take from the left run, which
-// keeps the sort stable. Both hold `n` elements.
-forall T, C where Copy[T].
-unsafe fn merge_pass(domain: C, src: *T, dst: *T, n: usize, width: usize, cmp: fn(C, T, T) -> (C, Order)) -> C {
-    var domain = domain;
-    var lo = 0usize;
-    while lo < n {
-        let mid = if lo + width < n { lo + width } else { n };
-        let hi = if mid + width < n { mid + width } else { n };
-        var l = lo;
-        var r = mid;
-        var k = lo;
-        while k < hi {
-            var take_right = l >= mid;
-            if !take_right && r < hi {
-                let (d, order) = cmp(domain, unsafe *(unsafe elem_ptr(src, r)), unsafe *(unsafe elem_ptr(src, l)));
-                domain = d;
-                take_right = match order {
-                    Order::Less => true,
-                    _ => false,
-                };
-            }
-            if take_right {
-                unsafe *(unsafe elem_ptr(dst, k)) = unsafe *(unsafe elem_ptr(src, r));
-                r = r + 1usize;
-            } else {
-                unsafe *(unsafe elem_ptr(dst, k)) = unsafe *(unsafe elem_ptr(src, l));
-                l = l + 1usize;
-            }
-            k = k + 1usize;
-        }
-        lo = hi;
-    }
-    domain
 }
 
 forall T, 'k where Copy[T].
 impl Vec[T, 'k] {
-    // Sorts, stably, by `cmp`, a plain function handed `domain` for each
-    // comparison (see `OwnedVec::sort_with`). A bottom-up merge sort over
-    // the vector's own storage and one scratch buffer of the same size:
-    // O(n log n) comparisons, O(n) extra space.
-    forall C.
-    fn sort_with(&self, &tag: Exclusive!['k], &domain: C, cmp: fn(C, T, T) -> (C, Order)) {
+    // Sorts, stably, by `cmp`, which is lent the context `cx` for each
+    // comparison, so the order may read a domain the elements point into.
+    forall C, Env where Copy[Env].
+    fn sort_by(&self, &tag: Exclusive!['k], &cx: C, cmp: closure[Env](&_: C, T, T) -> Order) {
         let { alloc: a, back: bk, buf: r, len: n, cap: c } = self;
         let (p, m) = r.into_parts();
         let size = sizeof[T]();
@@ -432,12 +334,12 @@ impl Vec[T, 'k] {
         let (raw, extent) = HeapAllocator::alloc(checked_mul(n, size)).into_parts();
         let scratch = unsafe (raw as *T);
         // Indices below `n` are inside this vector's elements and inside
-        // the scratch buffer.
+        // the scratch block, and the two do not overlap.
         var src = p;
         var dst = scratch;
         var width = 1usize;
         while width < n {
-            domain = unsafe merge_pass(domain, src, dst, n, width, cmp);
+            unsafe merge_runs(&cx, src, dst, n, width, cmp);
             let t = src;
             src = dst;
             dst = t;
@@ -447,12 +349,24 @@ impl Vec[T, 'k] {
         if unsafe (src as usize) != unsafe (p as usize) {
             var i = 0usize;
             while i < n {
-                unsafe *(unsafe elem_ptr(p, i)) = unsafe *(unsafe elem_ptr(scratch, i));
+                unsafe *(unsafe offset(p, i)) = unsafe *(unsafe offset(scratch, i));
                 i = i + 1usize;
             }
         }
         let u = HeapAllocator::drop(unsafe HeapAllocator::adopt_raw_sized(raw, extent));
         self = Vec.{ alloc: a, back: bk, buf: r, len: n, cap: c };
+    }
+}
+
+forall T, 'k where Copy[T], Ord[T, T].
+impl Vec[T, 'k] {
+    // Sorts the elements in ascending `Ord` order, stably.
+    fn sort(&self, &tag: Exclusive!['k]) {
+        var none = ();
+        &self.sort_by(&tag, &none, |&none, a: T, b: T| {
+            let (x, y, order) = Ord[T, T]::cmp(a, b);
+            order
+        })
     }
 }
 
@@ -492,6 +406,10 @@ impl OwnedVec[T] {
         let n = &v.len(&tag);
         self = OwnedVec.{ inner: pack 'k. (tag, v) };
         n
+    }
+
+    fn is_empty(&self) -> bool {
+        &self.len() == 0usize
     }
 
     // Adds `val` at the end.
@@ -564,11 +482,11 @@ impl OwnedVec[T] {
     }
 
     // Sorts the elements so `cmp` never says a later one orders before an
-    // earlier one. Not stable.
+    // earlier one. Not stable; any `T`.
     forall Env where Copy[Env].
-    fn sort_by(self, cmp: closure[Env](T, T) -> (T, T, Order)) -> OwnedVec![T] {
+    fn sort_unstable_by(self, cmp: closure[Env](T, T) -> (T, T, Order)) -> OwnedVec![T] {
         let exists 'k. (tag, v) = self.inner;
-        &v.sort_by(&tag, cmp);
+        &v.sort_unstable_by(&tag, cmp);
         OwnedVec.{ inner: pack 'k. (tag, v) }
     }
 
@@ -581,7 +499,17 @@ impl OwnedVec[T] {
 
 forall T where Ord[T, T].
 impl OwnedVec[T] {
-    // Sorts the elements in ascending `Ord` order. Not stable.
+    // Sorts the elements in ascending `Ord` order. Not stable; any `T`.
+    fn sort_unstable(self) -> OwnedVec![T] {
+        let exists 'k. (tag, v) = self.inner;
+        &v.sort_unstable(&tag);
+        OwnedVec.{ inner: pack 'k. (tag, v) }
+    }
+}
+
+forall T where Copy[T], Ord[T, T].
+impl OwnedVec[T] {
+    // Sorts the elements in ascending `Ord` order, stably.
     fn sort(self) -> OwnedVec![T] {
         let exists 'k. (tag, v) = self.inner;
         &v.sort(&tag);
@@ -606,6 +534,52 @@ impl OwnedVec[T] {
         value
     }
 
+    // A copy of element `i`; stops the program (`core::process::trap`)
+    // when it is out of range. `get` is the form for an index that may miss.
+    fn at(&self, i: usize) -> T {
+        match &self.get(i) {
+            Option::Some(v) => v,
+            Option::None => trap(),
+        }
+    }
+
+    // A copy of the last element, or `None` when there is none.
+    fn last(&self) -> Option[T] {
+        let n = &self.len();
+        if n == 0usize { Option::None } else { &self.get(n - 1usize) }
+    }
+
+    // Puts `value` at `i`, dropping the element there; stops the program
+    // when `i` is out of range.
+    fn set(&self, i: usize, value: T) {
+        let exists 'k. (tag, v) = self.inner;
+        let slot = &v.get_ref(&tag, i);
+        let tag = match slot {
+            Option::Some(r) => {
+                r.set(&tag, value);
+                tag
+            },
+            Option::None => trap(),
+        };
+        self = OwnedVec.{ inner: pack 'k. (tag, v) };
+    }
+
+    // Keeps the first `len` elements, dropping the rest; nothing changes
+    // when there are no more than `len`.
+    fn truncate(&self, len: usize) {
+        while &self.len() > len {
+            let unit = match &self.pop() {
+                Popped::Item(v) => (),
+                Popped::Empty => (),
+            };
+        }
+    }
+
+    // Drops every element, keeping the room.
+    fn clear(&self) {
+        &self.truncate(0usize);
+    }
+
     // Frees a vector of `Copy` elements, which need no per-element callback.
     fn free(self) -> () {
         let exists 'k. (tag, v) = self.inner;
@@ -615,14 +589,12 @@ impl OwnedVec[T] {
 
 forall T where Copy[T].
 impl OwnedVec[T] {
-    // Sorts, stably, by `cmp`: a plain function that is handed `cap` for
-    // each comparison, so the order may read a domain the elements point
-    // into. `sort_by` cannot, since a closure cannot hold a linear
-    // capability. See `Vec::sort_with`.
-    forall C.
-    fn sort_with(self, &cap: C, cmp: fn(C, T, T) -> (C, Order)) -> OwnedVec![T] {
+    // Sorts, stably, by `cmp`, which is lent the context `cx` for each
+    // comparison (`Vec::sort_by`).
+    forall C, Env where Copy[Env].
+    fn sort_by(self, &cx: C, cmp: closure[Env](&_: C, T, T) -> Order) -> OwnedVec![T] {
         let exists 'k. (tag, v) = self.inner;
-        &v.sort_with(&tag, &cap, cmp);
+        &v.sort_by(&tag, &cx, cmp);
         OwnedVec.{ inner: pack 'k. (tag, v) }
     }
 }

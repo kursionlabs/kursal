@@ -16,7 +16,6 @@
 // needs no separate storage either.
 use std::io::{File, print, print_bytes, print_buffer};
 use std::process::Args;
-use std::cstr::CStr;
 use std::bytes::buffer::Buffer;
 use std::cap::Exclusive;
 use std::slice::{Slice, StaticRead, bytes_eq, bytes_eq_within, bytes_cmp_within, find_byte};
@@ -31,7 +30,7 @@ tuple Entry(Slice[u8, 't], Slice[u8, 't]);
 // The text before and after a line's first tab, if it has one.
 forall 't.
 fn split_at_tab(&tag: Exclusive!['t], line: Slice[u8, 't]) -> Option[Entry['t]] {
-    let at = find_byte(&tag, line, 0, b'\t')?;
+    let at = find_byte(&tag, line, b'\t', 0)?;
     let key = line.sub(0, at)?;
     let value = line.sub(at + 1, line.len() - at - 1)?;
     Option::Some.(Entry.(key, value))
@@ -64,19 +63,17 @@ fn entries(&tag: Exclusive!['t], text: Slice[u8, 't]) -> OwnedVec![Entry['t]] {
     found
 }
 
-// The comparison `sort_with` calls: it takes the capability and hands it back.
+// The order of two entries: by key, read under the capability.
 forall 't.
-fn key_order(tag: Exclusive!['t], a: Entry['t], b: Entry['t]) -> (Exclusive!['t], Order) {
-    var tag = tag;
-    let order = bytes_cmp_within(&tag, a.0, b.0);
-    (tag, order)
+fn key_order(&tag: Exclusive!['t], a: Entry['t], b: Entry['t]) -> Order {
+    bytes_cmp_within(&tag, a.0, b.0)
 }
 
 // The store's entries in key order, one per key: the sort is stable, so
 // the last entry of each run of equal keys is the one written last.
 forall 't.
 fn latest(&tag: Exclusive!['t], text: Slice[u8, 't]) -> OwnedVec![Entry['t]] {
-    var sorted = entries(&tag, text).sort_with(&tag, key_order);
+    var sorted = entries(&tag, text).sort_by(&tag, |&tag, a, b| key_order(&tag, a, b));
     var kept = OwnedVec::new[Entry['t]]();
     let n = &sorted.len();
     var i = 0usize;
@@ -100,7 +97,7 @@ fn latest(&tag: Exclusive!['t], text: Slice[u8, 't]) -> OwnedVec![Entry['t]] {
 forall 't.
 fn render(&tag: Exclusive!['t], entries: OwnedVec![Entry['t]], skip: Option[Slice[u8, 'static]]) -> Buffer! {
     var entries = entries;
-    var sr = StaticRead::get();
+    var sr = StaticRead::new();
     var out = Buffer::new();
     let n = &entries.len();
     var i = 0usize;
@@ -126,8 +123,11 @@ fn render(&tag: Exclusive!['t], entries: OwnedVec![Entry['t]], skip: Option[Slic
 }
 
 // The file's text, or nothing for a missing file.
-fn load(path: CStr) -> Buffer! {
-    match File::open_read(path) {
+fn load(path: Slice[u8, 'static]) -> Buffer! {
+    var name = Buffer::new().push_static(path);
+    let opened = File::open_read(&name);
+    name.destroy();
+    match opened {
         Result::Err(code) => Buffer::new(),
         Result::Ok(file) => {
             var file = file;
@@ -141,8 +141,11 @@ fn load(path: CStr) -> Buffer! {
     }
 }
 
-fn save(path: CStr, text: Buffer!) -> i32 {
-    match File::create_truncate(path) {
+fn save(path: Slice[u8, 'static], text: Buffer!) -> i32 {
+    var name = Buffer::new().push_static(path);
+    let created = File::create(&name);
+    name.destroy();
+    match created {
         Result::Err(code) => {
             text.destroy();
             3
@@ -160,10 +163,10 @@ fn save(path: CStr, text: Buffer!) -> i32 {
 
 // Rewrites the store from `text`, leaving out `skip`; exits 1 when `skip`
 // is given but was not stored.
-fn rewrite(path: CStr, text: Buffer!, skip: Option[Slice[u8, 'static]]) -> i32 {
+fn rewrite(path: Slice[u8, 'static], text: Buffer!, skip: Option[Slice[u8, 'static]]) -> i32 {
     let exists 't. (tag, bytes, text) = text.open();
     var tag = tag;
-    var sr = StaticRead::get();
+    var sr = StaticRead::new();
     var kept = latest(&tag, bytes);
     let n = &kept.len();
     var found = false;
@@ -188,7 +191,7 @@ fn rewrite(path: CStr, text: Buffer!, skip: Option[Slice[u8, 'static]]) -> i32 {
     if missing { 1 } else { saved }
 }
 
-fn list(path: CStr) -> i32 {
+fn list(path: Slice[u8, 'static]) -> i32 {
     let exists 't. (tag, bytes, text) = load(path).open();
     var tag = tag;
     let out = render(&tag, latest(&tag, bytes), Option::None);
@@ -198,10 +201,10 @@ fn list(path: CStr) -> i32 {
 }
 
 // Prints `key`'s value, or exits 1 when it is absent.
-fn get(path: CStr, key: Slice[u8, 'static]) -> i32 {
+fn get(path: Slice[u8, 'static], key: Slice[u8, 'static]) -> i32 {
     let exists 't. (tag, bytes, text) = load(path).open();
     var tag = tag;
-    var sr = StaticRead::get();
+    var sr = StaticRead::new();
     var all = entries(&tag, bytes);
     let n = &all.len();
     var value = Option::None;
@@ -234,7 +237,7 @@ fn arg(args: Args, i: usize) -> Slice[u8, 'static] {
 }
 
 fn is(a: Slice[u8, 'static], b: Slice[u8, 'static]) -> bool {
-    var sr = StaticRead::get();
+    var sr = StaticRead::new();
     bytes_eq_within(&sr, a, b)
 }
 
@@ -245,7 +248,7 @@ fn usage() -> i32 {
 
 fn main(argc: i32, argv: *(*u8)) -> i32 {
     let args = unsafe Args::from_main(argc, argv);
-    let path = match args.get(1) {
+    let path = match args.bytes(1) {
         Option::Some(p) => p,
         Option::None => {
             return usage();

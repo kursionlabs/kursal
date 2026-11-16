@@ -1,8 +1,11 @@
-// core::utf8 -- decoding UTF-8 one scalar at a time from a byte view, read
+// core::utf8 -- UTF-8: decoding one scalar at a time from a byte view, read
 // through whatever capability permits it (`Exclusive!`, `Shared!`,
-// `StaticRead`), as in `core::ascii`.
+// `StaticRead`, a context with a `ReadBytes` instance), as in
+// `core::ascii`; checking a whole view; and encoding a scalar into any
+// writer.
 use package as core;
 
+use core::fmt::Writable;
 use core::option::Option;
 use core::slice::{ReadBytes, byte_or_zero};
 
@@ -10,12 +13,12 @@ use core::slice::{ReadBytes, byte_or_zero};
 // overlong encoding, a surrogate, a truncated sequence, a scalar outside
 // Unicode, or a `start` past the end.
 forall C, S where ReadBytes[C, S], Copy[S].
-fn decode(&cap: C, bytes: S, start: usize) -> Option[(u32, usize)] {
-    let len = ReadBytes[C, S]::len(&cap, bytes);
+fn decode(&cx: C, bytes: S, start: usize) -> Option[(u32, usize)] {
+    let len = ReadBytes[C, S]::len(&cx, bytes);
     if start >= len {
         return Option::None;
     }
-    let first = byte_or_zero(&cap, bytes, start);
+    let first = byte_or_zero(&cx, bytes, start);
     let width = if first < 128u8 {
         1usize
     } else if first >= 194u8 && first <= 223u8 {
@@ -43,7 +46,7 @@ fn decode(&cap: C, bytes: S, start: usize) -> Option[(u32, usize)] {
     var i = 1usize;
     var valid = true;
     while i < width {
-        let byte = byte_or_zero(&cap, bytes, start + i);
+        let byte = byte_or_zero(&cx, bytes, start + i);
         valid = valid && byte >= 128u8 && byte <= 191u8;
         code = code * 64u32 + (byte as u32) % 64u32;
         i = i + 1usize;
@@ -62,4 +65,66 @@ fn decode(&cap: C, bytes: S, start: usize) -> Option[(u32, usize)] {
     } else {
         Option::None
     }
+}
+
+// Whether all of `bytes` is UTF-8 that `decode` reads, scalar after
+// scalar to the end.
+forall C, S where ReadBytes[C, S], Copy[S].
+fn validate(&cx: C, bytes: S) -> bool {
+    let len = ReadBytes[C, S]::len(&cx, bytes);
+    var i = 0usize;
+    while i < len {
+        match decode(&cx, bytes, i) {
+            Option::Some(scalar) => {
+                let (code, next) = scalar;
+                i = next;
+            },
+            Option::None => return false,
+        }
+    }
+    true
+}
+
+// How many bytes the UTF-8 form of `code` takes; 0 when `code` is not a
+// Unicode scalar (a surrogate, or past U+10FFFF).
+fn width(code: u32) -> usize {
+    if code < 128u32 {
+        1usize
+    } else if code < 2048u32 {
+        2usize
+    } else if code >= 55296u32 && code <= 57343u32 {
+        0usize
+    } else if code < 65536u32 {
+        3usize
+    } else if code <= 1114111u32 {
+        4usize
+    } else {
+        0usize
+    }
+}
+
+// Writes the UTF-8 form of `code` to `out`. A `code` that is not a scalar
+// (`width` 0) is written as U+FFFD, the replacement character.
+forall W where Writable[W].
+fn encode(out: W, code: u32) -> W {
+    let n = width(code);
+    let code = if n == 0usize { 65533u32 } else { code };
+    let n = if n == 0usize { 3usize } else { n };
+    if n == 1usize {
+        return Writable[W]::write_byte(out, code as u8);
+    }
+    let lead = if n == 2usize {
+        192u32 | (code >> 6u32)
+    } else if n == 3usize {
+        224u32 | (code >> 12u32)
+    } else {
+        240u32 | (code >> 18u32)
+    };
+    var w = Writable[W]::write_byte(out, lead as u8);
+    var shift = (n - 1usize) * 6usize;
+    while shift > 0usize {
+        shift = shift - 6usize;
+        w = Writable[W]::write_byte(w, (128u32 | ((code >> (shift as u32)) & 63u32)) as u8);
+    }
+    w
 }

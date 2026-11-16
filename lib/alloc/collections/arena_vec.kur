@@ -33,13 +33,15 @@ use package as alloc;
 
 use alloc::arena::{Allocate, Arena, Domain};
 use alloc::buffer::Buffer;
-use alloc::heap::{HeapAllocator, checked_mul, out_of_range};
+use alloc::heap::{HeapAllocator, checked_mul};
+use core::process::trap;
 use core::cap::{Access, Exclusive};
 use core::cmp::Order;
 use core::hash::{HashIn, HashState};
 use core::mem::{Ref, sizeof};
 use core::option::Option;
-use core::raw::{Span, elem_ptr};
+use core::raw::Span;
+use core::ptr::{null, offset};
 use core::slice::Slice;
 
 // One bottom-up merge pass of `ArenaVec::sort_by`: merges each pair of
@@ -58,16 +60,16 @@ unsafe fn merge_runs(&cx: C, src: *T, dst: *T, n: usize, width: usize, cmp: clos
         while k < hi {
             var take_right = l >= mid;
             if !take_right && r < hi {
-                take_right = match cmp(&cx, unsafe *(unsafe elem_ptr(src, r)), unsafe *(unsafe elem_ptr(src, l))) {
+                take_right = match cmp(&cx, unsafe *(unsafe offset(src, r)), unsafe *(unsafe offset(src, l))) {
                     Order::Less => true,
                     _ => false,
                 };
             }
             if take_right {
-                unsafe *(unsafe elem_ptr(dst, k)) = unsafe *(unsafe elem_ptr(src, r));
+                unsafe *(unsafe offset(dst, k)) = unsafe *(unsafe offset(src, r));
                 r = r + 1usize;
             } else {
-                unsafe *(unsafe elem_ptr(dst, k)) = unsafe *(unsafe elem_ptr(src, l));
+                unsafe *(unsafe offset(dst, k)) = unsafe *(unsafe offset(src, l));
                 l = l + 1usize;
             }
             k = k + 1usize;
@@ -140,25 +142,20 @@ fn locate(i: usize) -> (usize, usize) {
     (k, i - b * ((1usize << k) - 1usize))
 }
 
-forall T.
-fn null_of() -> *T {
-    unsafe (0usize as *T)
-}
-
 // Where element `i` of `h`'s storage lives. `unsafe`: `i` is below the
 // capacity of `h`'s segments.
 forall T, 'k.
 unsafe fn place(h: Header[T, 'k], i: usize) -> *T {
     if i < first_capacity[T]() {
-        return unsafe elem_ptr(h.first, i);
+        return unsafe offset(h.first, i);
     }
-    let (k, offset) = locate[T](i);
+    let (k, at) = locate[T](i);
     let base = if k == 0usize {
         h.first
     } else {
-        unsafe *(unsafe elem_ptr(h.table, k - 1usize))
+        unsafe *(unsafe offset(h.table, k - 1usize))
     };
-    unsafe elem_ptr(base, offset)
+    unsafe offset(base, at)
 }
 
 // The number of elements `h`'s segments hold.
@@ -183,14 +180,14 @@ fn add_segment(&tag: Exclusive!['k], &arena: Arena!['k], h: Header[T, 'k], fill:
         let (fresh, room, m) = grown.into_parts();
         var j = 0usize;
         while j < used {
-            unsafe *(unsafe elem_ptr(fresh, j)) = unsafe *(unsafe elem_ptr(h.table, j));
+            unsafe *(unsafe offset(fresh, j)) = unsafe *(unsafe offset(h.table, j));
             j = j + 1usize;
         }
         fresh
     } else {
         h.table
     };
-    unsafe *(unsafe elem_ptr(table, used)) = base;
+    unsafe *(unsafe offset(table, used)) = base;
     Header.{ len: h.len, segments: k + 1usize, first: h.first, table }
 }
 
@@ -203,7 +200,7 @@ impl ArenaVec[T, 'k] {
     forall C, R where Allocate[C -> 'k, R].
     fn new(&cx: C) -> ArenaVec[T, 'k] {
         let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
-        let header = &arena.alloc(&tag, Header.{ len: 0usize, segments: 0usize, first: null_of[T](), table: null_of[*T]() });
+        let header = &arena.alloc(&tag, Header.{ len: 0usize, segments: 0usize, first: null[T](), table: null[*T]() });
         cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
         ArenaVec.{ header }
     }
@@ -264,13 +261,13 @@ impl ArenaVec[T, 'k] {
     }
 
     // Element `i`, which must be there: past the end, the process stops
-    // (`alloc::heap::out_of_range`).
+    // (`core::process::trap`).
     forall C, R where Access[C -> 'k, R].
     fn at(self, &cx: C, i: usize) -> T {
         let (tag, rest) = Access[C -> 'k, R]::open(cx);
         let h = self.header.copy(&tag);
         if i >= h.len {
-            out_of_range();
+            trap();
         }
         let value = unsafe *(unsafe place(h, i));
         cx = Access[C -> 'k, R]::close(tag, rest);
@@ -302,7 +299,7 @@ impl ArenaVec[T, 'k] {
         let (tag, rest) = Access[C -> 'k, R]::open(cx);
         let h = self.header.copy(&tag);
         if i >= h.len {
-            out_of_range();
+            trap();
         }
         let at = unsafe place(h, i);
         let old = unsafe *at;
@@ -459,7 +456,7 @@ impl ArenaVec[T, 'k] {
         let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
         var d = Domain.{ tag, arena };
         if i > self.len(&d) {
-            out_of_range();
+            trap();
         }
         self.push(&d, value);
         var j = self.len(&d) - 1usize;
@@ -518,10 +515,10 @@ impl ArenaVec[T, 'k] {
         }
         let (raw, extent) = HeapAllocator::alloc(checked_mul(checked_mul(n, sizeof[T]()), 2usize)).into_parts();
         let first = unsafe (raw as *T);
-        let second = unsafe elem_ptr(first, n);
+        let second = unsafe offset(first, n);
         var i = 0usize;
         while i < n {
-            unsafe *(unsafe elem_ptr(first, i)) = self.at(&cx, i);
+            unsafe *(unsafe offset(first, i)) = self.at(&cx, i);
             i = i + 1usize;
         }
         var src = first;
@@ -536,7 +533,7 @@ impl ArenaVec[T, 'k] {
         }
         i = 0usize;
         while i < n {
-            self.set(&cx, i, unsafe *(unsafe elem_ptr(src, i)));
+            self.set(&cx, i, unsafe *(unsafe offset(src, i)));
             i = i + 1usize;
         }
         let u = HeapAllocator::drop(unsafe HeapAllocator::adopt_raw_sized(raw, extent));
@@ -747,7 +744,7 @@ impl ArenaVec[u8, 'k] {
         let (source, count) = bytes.into_parts();
         var i = 0usize;
         while i < n {
-            unsafe *(unsafe place(h, h.len + i)) = unsafe *(unsafe elem_ptr(source, i));
+            unsafe *(unsafe place(h, h.len + i)) = unsafe *(unsafe offset(source, i));
             i = i + 1usize;
         }
         self.header.set(&tag, Header.{ len: h.len + n, segments: h.segments, first: h.first, table: h.table });
@@ -783,7 +780,7 @@ impl ArenaVec[u8, 'k] {
             let (dest, size, marker) = block.into_parts();
             var i = 0usize;
             while i < h.len {
-                unsafe *(unsafe elem_ptr(dest, i)) = unsafe *(unsafe place(h, i));
+                unsafe *(unsafe offset(dest, i)) = unsafe *(unsafe place(h, i));
                 i = i + 1usize;
             }
             Span::from_slice(block)
