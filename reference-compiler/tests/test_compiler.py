@@ -1687,6 +1687,31 @@ class CompilerTests(unittest.TestCase):
     def test_manifests_and_names_match_reference(self):
         self.check_resolution(RESOLVED, False)
 
+    @unittest.skipIf(os.geteuid() == 0, "permissions do not bind root")
+    def test_a_manifest_that_cannot_be_looked_for_stops_resolution(self):
+        """A directory under the source root that can be listed but not searched: whether it holds a kur.toml,
+        which would make it another package, is unknown, and both resolvers stop with the same error. One
+        that cannot be listed is left out, as before."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            sub = root / "p/sub"
+            sub.mkdir(parents=True)
+            (root / "p/kur.toml").write_text(manifest("p"))
+            (root / "p/lib.kur").write_text("")
+            (sub / "kur.toml").write_text(manifest("sub"))
+            (sub / "lib.kur").write_text("")
+            try:
+                sub.chmod(0o444)
+                expected = reference_resolution(root / "p")
+                self.assertEqual(expected, f"error: cannot read {sub / 'kur.toml'} (error 13)")
+                self.assertEqual(self.compiler_resolution(root / "p"), expected)
+                sub.chmod(0o000)
+                expected = reference_resolution(root / "p")
+                self.assertFalse(expected.startswith("error:"), expected)
+                self.assertEqual(self.compiler_resolution(root / "p"), expected)
+            finally:
+                sub.chmod(0o755)
+
     def test_a_failed_output_write_fails_the_command(self):
         with open("/dev/full", "w") as full:
             result = subprocess.run([str(self.binary), "parse", str(ROOT / "examples/sayhi/lib.kur")], stdout=full,

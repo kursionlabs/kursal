@@ -572,7 +572,7 @@ fn load(&cx: Domain!['k], path: Span['k], ids: Ref[u32, 'k]) -> ArenaVec[Package
         }
         let std: ArenaMap[Span['k], Span['k], 'k] = ArenaMap::new(&cx);
         let lib = lib_dir(&cx);
-        if path_exists(&cx, join(&cx, join(&cx, lib, Span::from_static(&cx, "std")), Span::from_static(&cx, "kur.toml"))) {
+        if exists_or_fail(&cx, join(&cx, join(&cx, lib, Span::from_static(&cx, "std")), Span::from_static(&cx, "kur.toml"))) {
             std.insert(&cx, Span::from_static(&cx, "std"), join(&cx, lib, Span::from_static(&cx, "std")));
         }
         let entry = if main { Option::Some.(ArenaVec::one(&cx, Span::from_static(&cx, "main"))) } else { Option::None };
@@ -754,6 +754,17 @@ fn string(&cx: Domain!['k], t: ArenaMap[Span['k], TomlValue['k], 'k], manifest: 
     }
 }
 
+// Whether `path` names anything. An error other than its absence stops resolution: the file may be
+// there.
+forall 'k.
+fn exists_or_fail(&cx: Domain!['k], path: Span['k]) -> bool {
+    match path_exists(&cx, path) {
+        Result::Ok(found) => found,
+        Result::Err(e) => fail(&cx, Buffer!::new().push_static("cannot read ").push_bytes(&cx, path).push_static(" (error ")
+            .push_i64(e.errno as i64).push_static(")").save(&cx)),
+    }
+}
+
 // Each .kur file under the source root, by the module its path assigns.
 forall 'k.
 fn discover(&cx: Domain!['k], package: Package['k]) -> ArenaMap[ModuleId['k], Span['k], 'k] {
@@ -766,14 +777,16 @@ fn discover(&cx: Domain!['k], package: Package['k]) -> ArenaMap[ModuleId['k], Sp
 // a subdirectory with its own kur.toml is another package.
 forall 'k.
 fn walk(&cx: Domain!['k], package: Package['k], here: Span['k], rel: ArenaVec[Span['k], 'k], files: ArenaMap[ModuleId['k], Span['k], 'k]) {
-    if !rel.is_empty(&cx) && path_exists(&cx, join(&cx, here, Span::from_static(&cx, "kur.toml"))) {
-        return;
-    }
     let dirs: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
     let names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
     match read_dir(&cx, here) {
         Result::Ok(directory) => {
             var directory = directory;
+            // Asked only of a directory that could be listed, as the reference's `os.walk` asks.
+            if !rel.is_empty(&cx) && exists_or_fail(&cx, join(&cx, here, Span::from_static(&cx, "kur.toml"))) {
+                let closed = directory.close();
+                return;
+            }
             var going = true;
             while going {
                 match &directory.next() {

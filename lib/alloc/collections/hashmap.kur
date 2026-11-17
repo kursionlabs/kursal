@@ -38,7 +38,7 @@
 use package as alloc;
 
 use alloc::heap::Uninit!;
-use alloc::heap::HeapAllocator;
+use alloc::heap::{AllocError, HeapAllocator, Storage, abort};
 use alloc::heap::checked_mul;
 use core::cap::Exclusive!;
 use core::mem::{Ref, sizeof};
@@ -48,7 +48,7 @@ use core::mem::Region!;
 use core::mem::RegionResume!;
 use core::hash::{Hash, Eq, HashIn, HashState};
 use core::iter::{Iterator, Pair};
-use core::option::Option;
+use core::option::{Option, Result};
 use core::process::trap;
 
 // `Entry` stores only pointers, so it is Copy whatever `K` and `V` are; a
@@ -87,21 +87,34 @@ struct HashMap! {
 // pointer lets the caller pass it straight to `Allocation!::adopt` (the
 // only producer of an `Allocation!`) without re-stating a size; the
 // `into_parts`/`adopt_raw_sized` round trip keeps the extent the
-// allocator recorded.
+// allocator recorded. The allocation failure, when there is no block.
+forall K, V.
+unsafe fn try_alloc_buckets(n: usize) -> Result[(Uninit!, *(*Entry[K, V])), AllocError] {
+    let bytes = checked_mul(n, sizeof[*Entry[K, V]]());
+    match Storage::try_alloc(bytes) {
+        Result::Err(e) => Result::Err.(e),
+        Result::Ok(u) => {
+            let (raw, extent) = u.into_parts();
+            let base = unsafe (raw as *(*Entry[K, V]));
+            var i = 0usize;
+            while i < n {
+                let s = unsafe offset(base, i);
+                unsafe *s = null();
+                i = i + 1usize;
+            }
+            let u2 = unsafe HeapAllocator::adopt_raw_sized(raw, extent);
+            Result::Ok.((u2, base))
+        },
+    }
+}
+
+// `try_alloc_buckets`, aborting on failure.
 forall K, V.
 unsafe fn alloc_buckets(n: usize) -> (Uninit!, *(*Entry[K, V])) {
-    let bytes = checked_mul(n, sizeof[*Entry[K, V]]());
-    let u = HeapAllocator::alloc(bytes);
-    let (raw, extent) = u.into_parts();
-    let base = unsafe (raw as *(*Entry[K, V]));
-    var i = 0usize;
-    while i < n {
-        let s = unsafe offset(base, i);
-        unsafe *s = null();
-        i = i + 1usize;
+    match unsafe try_alloc_buckets[K, V](n) {
+        Result::Ok(buckets) => buckets,
+        Result::Err(e) => unsafe abort(),
     }
-    let u2 = unsafe HeapAllocator::adopt_raw_sized(raw, extent);
-    (u2, base)
 }
 
 // A single value in its own allocation; used for both keys and values
@@ -149,14 +162,31 @@ unsafe fn destroy_chain(head: *Entry[K, V], f: fn(K, V) -> ()) -> () {
 
 forall K, V.
 impl HashMap![K, V] {
-    fn new() -> exists '1. (Exclusive!['1], HashMap![K, V, '1]) {
+    // An empty map with 8 buckets, under a fresh brand, or the allocation
+    // failure. Growing it later (`insert`, which also allocates every entry)
+    // aborts on failure.
+    fn try_new() -> Result[exists '1. (Exclusive!['1], HashMap![K, V, '1]), AllocError] {
         let initial_buckets = 8usize;
-        let (u, base) = unsafe alloc_buckets[K, V](initial_buckets);
-        // `adopt`'s obligation: `alloc_buckets` writes the null entry to every
-        // one of the (at least 8) slots, so the block holds initialized `*Entry`s.
-        let exists 'open1. (a, rg) = unsafe Allocation!::adopt[*Entry[K, V]](u);
-        let (tag, r, bk) = rg.share();
-        pack 'open1. (tag, HashMap!.{ alloc: a, back: bk, buckets: r, bucket_count: initial_buckets, len: 0usize })
+        match unsafe try_alloc_buckets[K, V](initial_buckets) {
+            Result::Err(e) => Result::Err.(e),
+            Result::Ok(buckets) => {
+                let (u, base) = buckets;
+                // `adopt`'s obligation: `try_alloc_buckets` writes the null entry
+                // to every one of the (at least 8) slots, so the block holds
+                // initialized `*Entry`s.
+                let exists 'open1. (a, rg) = unsafe Allocation!::adopt[*Entry[K, V]](u);
+                let (tag, r, bk) = rg.share();
+                Result::Ok.(pack 'open1. (tag, HashMap!.{ alloc: a, back: bk, buckets: r, bucket_count: initial_buckets, len: 0usize }))
+            },
+        }
+    }
+
+    // `try_new`, aborting on failure.
+    fn new() -> exists '1. (Exclusive!['1], HashMap![K, V, '1]) {
+        match HashMap!::try_new[K, V]() {
+            Result::Ok(map) => map,
+            Result::Err(e) => unsafe abort(),
+        }
     }
 }
 
@@ -743,6 +773,14 @@ forall K, V.
 impl OwnedMap![K, V] {
     fn new() -> OwnedMap![K, V] {
         OwnedMap!.{ inner: HashMap!::new[K, V]() }
+    }
+
+    // `HashMap!::try_new`'s map, or its allocation failure.
+    fn try_new() -> Result[OwnedMap![K, V], AllocError] {
+        match HashMap!::try_new[K, V]() {
+            Result::Ok(inner) => Result::Ok.(OwnedMap!.{ inner }),
+            Result::Err(e) => Result::Err.(e),
+        }
     }
 
     fn len(&self) -> usize {

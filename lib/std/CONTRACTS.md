@@ -167,7 +167,7 @@ The library's own externs satisfy it:
 
 - `alloc::heap`: `malloc`, `realloc`, `free`, and `abort` and `exit`
   (declared `-> !`, the permitted terminating cases); `alloc::buffer`
-  declares `abort` again for `Buffer!::commit`;
+  declares `abort` again for `Buffer!::new_with_cap` and `commit`;
 - `std::io`: `fs.c`'s `kur_libc_fs_read`, `_write`, `_open_read`,
   `_create`, `_close` and `_regular_size`, which retry a call a signal
   interrupts and report a failure as a negative errno;
@@ -391,11 +391,19 @@ signature". It does not mean "verified correct".**
 **`abort` where a request is not representable.**
 
 - `alloc::heap::HeapAllocator::alloc`/`grow` abort when `malloc`/`realloc`
-  returns null. The constructors built on them have no error channel, and a
-  `Result` would cascade into every constructor in the library and every
-  caller of those. `grow` has a further reason: a failed `realloc` leaves
-  the old block live while its owning `Uninit!` has already been consumed,
-  so there is nothing to hand an error back in.
+  returns null, and so does everything built on them: the constructors
+  (`Buffer!::new`, `Vec!::new`, `HashMap!::new`, `Owned!::new`, the
+  arenas, ...) and every operation that grows a container (`push`,
+  `insert`, `Buffer!::reserve`, ...). These have no error channel: a
+  `Result` from every growing operation would cascade into every caller.
+  Recovery is offered where a program can plan for it, when a container is
+  made: `Storage::try_alloc`/`try_grow`, `Owned!::try_new`,
+  `Buffer!::try_new_with_cap`, `Vec!::try_new`, `OwnedVec!::try_new`,
+  `HashMap!::try_new` and `OwnedMap!::try_new` return the `AllocError`
+  instead (`try_grow` and `Owned!::try_new` with what they were given,
+  unconsumed). A container they make still aborts if it later fails to
+  grow. Each aborting constructor is its `try_` form, aborting on the
+  error.
 - Growth sizing goes through `alloc::heap::checked_add`/`checked_mul`, which
   abort instead of wrapping. Both guard before computing: the addition
   checks `a > usize::MAX - b`, never a post-hoc test on a wrapped value.

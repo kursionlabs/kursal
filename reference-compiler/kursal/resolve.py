@@ -131,6 +131,18 @@ def _manifest(path: Path) -> dict[str, object]:
     return _table(document, str(path))
 
 
+def _exists(path: Path) -> bool:
+    """Whether `path` names anything. An error other than its absence (ENOENT, ENOTDIR) stops resolution:
+    the file may be there."""
+    try:
+        path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as error:
+        fail(f"cannot read {path} (error {error.errno})")
+    return True
+
+
 def load(path: str | Path) -> list[Package]:
     """The package graph rooted at a package directory, its kur.toml, or one .kur file. A single file
     depends on the standard library `std` when one is installed (KURSAL_LIB)."""
@@ -169,7 +181,7 @@ def load(path: str | Path) -> list[Package]:
     if path.suffix == ".kur":
         items = S.parse(path.read_text(), str(path))
         main = any(isinstance(i, S.Fn) and i.name == "main" for i in items)
-        std = {"std": LIB / "std"} if (LIB / "std" / "kur.toml").exists() else {}
+        std = {"std": LIB / "std"} if _exists(LIB / "std" / "kur.toml") else {}
         add(path, path.stem, path.parent, std, ("main",) if main else None)
         packages[0].files[ModuleId(0)] = path
     else:
@@ -188,7 +200,7 @@ def discover(package: Package) -> dict[ModuleId, Path]:
     files = {}
     for directory, subdirs, names in os.walk(package.source_root):
         here = Path(directory)
-        if here != package.source_root and (here / "kur.toml").exists():
+        if here != package.source_root and _exists(here / "kur.toml"):
             subdirs.clear()
             continue
         subdirs.sort()

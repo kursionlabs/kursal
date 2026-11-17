@@ -109,6 +109,67 @@ class StdRuntimeTests(unittest.TestCase):
                 if seven == 7u32 && eight == 8u32 && n == 0usize { 0 } else { 1 }
             }''')
 
+    def test_fallible_constructors_report_exhaustion(self):
+        # Under a 256 MiB address-space limit, a 1 GiB buffer and a vec of four 128 MiB slots are refused;
+        # the constructors that fit build containers that work.
+        def limit() -> None:
+            resource.setrlimit(resource.RLIMIT_AS, (256 << 20, 256 << 20))
+        self.expect('''
+            use std::bytes::buffer::Buffer!;
+            use std::collections::hashmap::{HashMap!, OwnedMap!};
+            use std::collections::vec::{OwnedVec!, Vec!};
+            use std::io::print_buffer;
+            use std::option::Result;
+            fn forget(k: u32, v: u32) -> () { () }
+            fn main() -> i32 {
+                let big_buffer = match Buffer!::try_new_with_cap(1usize << 30usize) {
+                    Result::Ok(b) => { b.destroy(); "built" },
+                    Result::Err(e) => "refused",
+                };
+                let big_vec = match Vec!::try_new[[u64; 16777216]]() {
+                    Result::Ok(package) => {
+                        let exists 'v. (tag, v) = package;
+                        v.free(tag);
+                        "built"
+                    },
+                    Result::Err(e) => "refused",
+                };
+                let buffer = match Buffer!::try_new_with_cap(2usize) {
+                    Result::Ok(b) => { let b = b.push_static("abc"); let n = &b.len(); b.destroy(); n },
+                    Result::Err(e) => 0usize,
+                };
+                let vec = match Vec!::try_new[u64]() {
+                    Result::Ok(package) => {
+                        let exists 'v. (tag, v) = package;
+                        let exists 'w. (tag, v) = v.push(tag, 7u64);
+                        let n = &v.len(&tag);
+                        v.free(tag);
+                        n
+                    },
+                    Result::Err(e) => 0usize,
+                };
+                let map = match HashMap!::try_new[u32, u32]() {
+                    Result::Ok(package) => {
+                        let exists 'm. (tag, m) = package;
+                        let exists 'n. (tag, m, old) = m.insert(tag, 1u32, 2u32);
+                        let n = &m.len(&tag);
+                        m.free(tag);
+                        n
+                    },
+                    Result::Err(e) => 0usize,
+                };
+                let owned_vec = match OwnedVec!::try_new[u32]() {
+                    Result::Ok(v) => { let v = v.push(3u32).push(4u32); let n = &v.len(); v.free(); n },
+                    Result::Err(e) => 0usize,
+                };
+                let owned_map = match OwnedMap!::try_new[u32, u32]() {
+                    Result::Ok(m) => { var m = m; let old = &m.insert(1u32, 2u32); let n = &m.len(); m.destroy(forget); n },
+                    Result::Err(e) => 0usize,
+                };
+                print_buffer(1, f"{big_buffer} {big_vec} {buffer} {vec} {map} {owned_vec} {owned_map}");
+                0
+            }''', stdout="refused refused 3 1 1 2 1", preexec=limit)
+
     # -------------------------------------------------------- alloc::hashmap --
 
     def test_remove_in_rebrands_and_removes(self):
@@ -240,7 +301,7 @@ class StdRuntimeTests(unittest.TestCase):
                 if mkdir(&cx, dir).is_err() { status = 1; }
                 if mkdir(&cx, dir).err().unwrap_or(none).errno != 17i32 { status = 2; }
                 if write(&cx, a, Buffer!::new().push_static("abc")).is_err() { status = 3; }
-                if rename(&cx, a, b).is_err() || path_exists(&cx, a) || !path_exists(&cx, b) { status = 4; }
+                if rename(&cx, a, b).is_err() || path_exists(&cx, a).unwrap_or(true) || !path_exists(&cx, b).unwrap_or(false) { status = 4; }
                 match read_to_arena(&cx, b) {
                     Result::Ok(text) => if !text.is(&cx, "abc") { status = 5; },
                     Result::Err(e) => { status = 5; },
@@ -285,7 +346,7 @@ class StdRuntimeTests(unittest.TestCase):
                 }
                 if names != 1usize { status = 10; }
                 if remove(&cx, dir).err().unwrap_or(none).errno != 39i32 { status = 11; }
-                if remove(&cx, b).is_err() || remove(&cx, dir).is_err() || path_exists(&cx, dir) { status = 12; }
+                if remove(&cx, b).is_err() || remove(&cx, dir).is_err() || path_exists(&cx, dir).unwrap_or(true) { status = 12; }
                 if metadata(&cx, dir).err().unwrap_or(none).errno != 2i32 { status = 13; }
                 let nul = Buffer!::new().push_static("a").push_byte(0u8).push_static("b").save(&cx);
                 if mkdir(&cx, nul).err().unwrap_or(none).errno != 22i32 { status = 14; }
@@ -415,6 +476,67 @@ class StdRuntimeTests(unittest.TestCase):
                     },
                 }
             }''')
+
+    def test_path_exists_tells_absence_from_failure(self):
+        # A missing name and a path through a file are absent; a directory that cannot be searched says
+        # nothing, and is the error (EACCES), unless permissions do not bind this user.
+        with tempfile.TemporaryDirectory(prefix="kursal-exists-") as base:
+            locked = Path(base) / "locked"
+            locked.mkdir()
+            (Path(base) / "file").write_text("")
+            locked.chmod(0o000)
+            try:
+                self.expect(f'''
+                    use std::fs::path_exists;
+                    use std::option::Result;
+                    use std::slice::StaticRead;
+                    fn main() -> i32 {{
+                        var sr = StaticRead::new();
+                        let found = path_exists(&sr, "{base}/file");
+                        let missing = path_exists(&sr, "{base}/missing");
+                        let through_a_file = path_exists(&sr, "{base}/file/inner");
+                        if !found.unwrap_or(false) || missing.unwrap_or(true) || through_a_file.unwrap_or(true) {{
+                            return 1;
+                        }}
+                        match path_exists(&sr, "{base}/locked/inner") {{
+                            Result::Ok(found) => 0,
+                            Result::Err(e) => e.errno,
+                        }}
+                    }}''', status=0 if os.geteuid() == 0 else 13)
+            finally:
+                locked.chmod(0o755)
+
+    def test_read_exact_tells_the_end_from_a_failed_read(self):
+        # From stdin: the whole count, then a short count at the end, then 0; from a directory, EISDIR.
+        self.expect('''
+            use std::bytes::buffer::Buffer!;
+            use std::io::{File!, print_buffer, read_exact};
+            use std::option::Result;
+            use std::slice::StaticRead;
+            fn main() -> i32 {
+                var buffer = Buffer!::new_zeroed(4usize);
+                let p = unsafe &buffer.as_ptr();
+                // `p` addresses the 4 bytes `buffer` holds, which outlives every read.
+                let full = unsafe read_exact(0i32, p, 4usize);
+                let short = unsafe read_exact(0i32, p, 4usize);
+                let end = unsafe read_exact(0i32, p, 4usize);
+                var sr = StaticRead::new();
+                let failed = match File!::open_read(&sr, ".") {
+                    Result::Err(e) => 0i32,
+                    Result::Ok(file) => {
+                        var file = file;
+                        let read = unsafe &file.read_exact(p, 4usize);
+                        let closed = file.close();
+                        match read {
+                            Result::Ok(n) => 0i32,
+                            Result::Err(e) => e.errno,
+                        }
+                    },
+                };
+                buffer.destroy();
+                print_buffer(1, f"{full.unwrap_or(9usize)} {short.unwrap_or(9usize)} {end.unwrap_or(9usize)} {failed}");
+                0
+            }''', stdout="4 2 0 21", stdin="abcdef")
 
     def test_a_failed_write_is_an_error(self):
         self.expect('''

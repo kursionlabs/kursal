@@ -240,7 +240,9 @@ it paths as spans of the arena, which it reads in place:
 - **Files.** `std::fs::read_to_arena` reads a source, a manifest or a KURS file into the arena;
   `std::fs::write` writes the C. `resolve::resolver` lists source directories with
   `std::fs::read_dir`, asks `std::fs::path_exists` for a `kur.toml`, and resolves paths as
-  Python's `Path.resolve()` does with `std::fs::canonicalize`.
+  Python's `Path.resolve()` does with `std::fs::canonicalize`. A directory it cannot list, or a
+  `kur.toml` it cannot tell is there or not (any error but ENOENT and ENOTDIR), stops it with
+  `cannot read PATH (error ERRNO)`, as the reference's `os.walk` and `os.stat` errors do.
 - **Manifests** are read by the standard library's `toml` package (`toml::parser::parse`) into an
   `ArenaMap` of `TomlValue`s. Its reading and its errors are `tomllib`'s, so a manifest that is not
   TOML fails on the line the reference names, `FILE:LINE: invalid manifest`; the resolver then

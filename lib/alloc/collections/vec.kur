@@ -40,13 +40,13 @@
 use package as alloc;
 
 use alloc::heap::Uninit!;
-use alloc::heap::HeapAllocator;
+use alloc::heap::{AllocError, HeapAllocator, Storage, abort};
 use alloc::heap::checked_add;
 use alloc::heap::checked_mul;
 use core::cap::Exclusive!;
 use core::mem::{Ref, sizeof};
 use core::ptr::offset;
-use core::option::Option;
+use core::option::{Option, Result};
 use alloc::owned::Allocation!;
 use core::mem::Region!;
 use core::mem::RegionResume!;
@@ -78,19 +78,31 @@ exposed enum Popped! {
 
 forall T.
 impl Vec![T] {
-    // An empty vec with capacity 4, under a fresh brand. `Allocation!::adopt`
-    // mints and seals the brand and records the block's base and extent;
-    // `share` trades the region for the `Exclusive!`/`Ref` pair this
-    // signature promises, plus the receipt that is the only route back.
-    fn new() -> exists '1. (Exclusive!['1], Vec![T, '1]) {
+    // An empty vec with capacity 4, under a fresh brand, or the allocation
+    // failure. `Allocation!::adopt` mints and seals the brand and records
+    // the block's base and extent; `share` trades the region for the
+    // `Exclusive!`/`Ref` pair this signature promises, plus the receipt that
+    // is the only route back. Growing it later aborts as `push` does.
+    fn try_new() -> Result[exists '1. (Exclusive!['1], Vec![T, '1]), AllocError] {
         let initial_cap = 4usize;
         let bytes = checked_mul(initial_cap, sizeof[T]());
-        let u = HeapAllocator::alloc(bytes);
-        // `adopt`'s obligation: see "Adopting the block" in the header.
-        let exists 'open1. (a, rg) = unsafe Allocation!::adopt[T](u);
-        let (tag, r, bk) = rg.share();
-        let z = 0usize;
-        pack 'open1. (tag, Vec!.{ alloc: a, back: bk, buf: r, len: z, cap: initial_cap })
+        match Storage::try_alloc(bytes) {
+            Result::Err(e) => Result::Err.(e),
+            Result::Ok(u) => {
+                // `adopt`'s obligation: see "Adopting the block" in the header.
+                let exists 'open1. (a, rg) = unsafe Allocation!::adopt[T](u);
+                let (tag, r, bk) = rg.share();
+                Result::Ok.(pack 'open1. (tag, Vec!.{ alloc: a, back: bk, buf: r, len: 0usize, cap: initial_cap }))
+            },
+        }
+    }
+
+    // `try_new`, aborting on failure.
+    fn new() -> exists '1. (Exclusive!['1], Vec![T, '1]) {
+        match Vec!::try_new[T]() {
+            Result::Ok(v) => v,
+            Result::Err(e) => unsafe abort(),
+        }
     }
 }
 
@@ -399,6 +411,14 @@ forall T.
 impl OwnedVec![T] {
     fn new() -> OwnedVec![T] {
         OwnedVec!.{ inner: Vec!::new[T]() }
+    }
+
+    // `Vec!::try_new`'s vec, or its allocation failure.
+    fn try_new() -> Result[OwnedVec![T], AllocError] {
+        match Vec!::try_new[T]() {
+            Result::Ok(inner) => Result::Ok.(OwnedVec!.{ inner }),
+            Result::Err(e) => Result::Err.(e),
+        }
     }
 
     fn len(&self) -> usize {

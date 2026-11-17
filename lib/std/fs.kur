@@ -41,7 +41,10 @@ fn status(code: i32) -> Result[(), Error] {
 }
 
 // The whole of the regular file at `path`, read to its end
-// (`File!::read_to_buffer`): a directory is EISDIR.
+// (`File!::read_to_buffer`): a directory is EISDIR. The file is closed
+// whatever the read gave. A failure to read, or else to close, is the
+// error: a read error takes precedence, and a failed close discards what
+// was read.
 forall C, S where ReadBytes[C, S], Copy[S].
 fn read(&cx: C, path: S) -> Result[Buffer!, Error] {
     match File!::open_read(&cx, path) {
@@ -50,7 +53,16 @@ fn read(&cx: C, path: S) -> Result[Buffer!, Error] {
             var file = file;
             let contents = &file.read_to_buffer();
             let closed = file.close();
-            contents
+            match contents {
+                Result::Err(e) => Result::Err.(e),
+                Result::Ok(buffer) => match closed {
+                    Result::Ok(nothing) => Result::Ok.(buffer),
+                    Result::Err(e) => {
+                        buffer.destroy();
+                        Result::Err.(e)
+                    },
+                },
+            }
         },
     }
 }
@@ -65,7 +77,8 @@ fn read_to_arena(&cx: C, path: S) -> Result[Span['k], Error] {
 }
 
 // Writes `contents` to the file at `path`, created or emptied first, and
-// frees it. A failure to write, or to close, is the error.
+// frees it. The file is closed whatever the write gave. A failure to
+// write, or else to close, is the error: a write error takes precedence.
 forall C, S where ReadBytes[C, S], Copy[S].
 fn write(&cx: C, path: S, contents: Buffer!) -> Result[(), Error] {
     match File!::create(&cx, path) {
@@ -115,11 +128,20 @@ fn metadata(&cx: C, path: S) -> Result[Metadata, Error] {
     Result::Ok.(Metadata.{ kind: k, size: unsafe *size })
 }
 
-// Whether `path` names anything, following symbolic links: `metadata`
-// succeeds.
+// Whether `path` names anything, following symbolic links. It does not
+// when `metadata` fails with ENOENT, or with ENOTDIR for a path through
+// something other than a directory; any other failure (EACCES, ELOOP,
+// EIO, ...) says nothing about whether it does, and is the error.
 forall C, S where ReadBytes[C, S], Copy[S].
-fn path_exists(&cx: C, path: S) -> bool {
-    metadata(&cx, path).is_ok()
+fn path_exists(&cx: C, path: S) -> Result[bool, Error] {
+    match metadata(&cx, path) {
+        Result::Ok(found) => Result::Ok.(true),
+        Result::Err(e) => if e.errno == 2i32 || e.errno == 20i32 {
+            Result::Ok.(false)
+        } else {
+            Result::Err.(e)
+        },
+    }
 }
 
 // The absolute path with no `.`, `..` or symbolic link that `path` names,

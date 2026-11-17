@@ -38,8 +38,7 @@ fn c_string(&cx: C, bytes: S) -> Buffer! {
 
 // An I/O error: the `errno` of the system call that failed, or EIO (5)
 // for a failure the system did not report itself (a `write` that made no
-// progress, a short read where an exact count was asked for). Every
-// fallible function here reports one.
+// progress). Every fallible function here reports one.
 exposed struct Error {
     errno: i32,
 }
@@ -117,19 +116,24 @@ fn print_buffer(fd: i32, buf: Buffer!) -> Result[(), Error] {
 
 // Fills `buf[0..size)` from `fd`, retrying short reads (`read(2)` may
 // return fewer bytes than requested, even for a regular file). Returns the
-// total filled: `size` normally, less if a read returns 0 or fails, e.g.
-// because the file shrank. Caller: `buf[0..size)` is writable, and `fd` is
-// a descriptor the caller may read (stdin, or one a `File!` it holds owns).
-unsafe fn read_exact(fd: i32, buf: *u8, size: usize) -> usize {
+// total filled: `size`, or less when the input ends first (a read returns
+// 0, e.g. because the file shrank), so `buf[0..n)` holds the bytes read.
+// A failed read is the error, never a short count, even when some bytes
+// were filled before it. Caller: `buf[0..size)` is writable, and `fd` is a
+// descriptor the caller may read (stdin, or one a `File!` it holds owns).
+unsafe fn read_exact(fd: i32, buf: *u8, size: usize) -> Result[usize, Error] {
     var done = 0usize;
     while done < size {
         let n = unsafe kur_libc_fs_read(fd, unsafe offset(buf, done), size - done);
-        if n <= 0isize {
-            return done;
+        if n < 0isize {
+            return Result::Err.(Error::of_return(n));
+        }
+        if n == 0isize {
+            return Result::Ok.(done);
         }
         done = done + (n as usize);
     }
-    done
+    Result::Ok.(done)
 }
 
 // Reads `fd` to EOF, 4096 bytes at a time, appending to `b` and returning
@@ -287,9 +291,10 @@ impl File! {
     }
 
     // Fills `buf[0..size)` from the descriptor's offset, as the free
-    // `read_exact`, and returns how many bytes it filled. Caller:
-    // `buf[0..size)` is writable for the duration of the call.
-    unsafe fn read_exact(&self, buf: *u8, size: usize) -> usize {
+    // `read_exact`: how many bytes it filled, fewer only at the end of the
+    // file, or the error of a failed read. Caller: `buf[0..size)` is
+    // writable for the duration of the call.
+    unsafe fn read_exact(&self, buf: *u8, size: usize) -> Result[usize, Error] {
         let { fd } = self;
         let got = unsafe read_exact(fd, buf, size);
         self = File!.{ fd };

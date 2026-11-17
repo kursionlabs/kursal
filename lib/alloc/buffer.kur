@@ -13,7 +13,7 @@
 use package as alloc;
 
 use alloc::heap::Uninit!;
-use alloc::heap::HeapAllocator;
+use alloc::heap::{AllocError, HeapAllocator, Storage};
 use alloc::heap::checked_add;
 use alloc::heap::checked_mul;
 use core::cap::{Brand, Exclusive!};
@@ -26,7 +26,7 @@ use core::slice::Slice;
 use core::slice::{ReadBytes, Readable, hash_bytes, bytes_eq, bytes_cmp};
 use core::cmp::{Ord, Order};
 use core::hash::{Hash, Eq, HashState};
-use core::option::Option;
+use core::option::{Option, Result};
 use core::iter::Iterator;
 
 // Restricted: no other module can write the literal, which would otherwise
@@ -68,18 +68,29 @@ struct BufferRestore! {
     cap: usize,
 }
 
-// `commit` aborts when asked for a `len` past `cap`, matching
-// `alloc::heap`'s aborting API: a `Buffer!`-returning method has no error
-// channel, so an unsatisfiable request is a hard stop.
+// `new_with_cap` aborts when its allocation fails, and `commit` when asked
+// for a `len` past `cap`, matching `alloc::heap`'s aborting API: a
+// `Buffer!`-returning method has no error channel, so an unsatisfiable
+// request is a hard stop.
 extern "C" fn abort() -> !;
 
 impl Buffer! {
-    // A new, empty buffer with room for `cap` bytes before the first grow.
-    // `new` is this with a starting capacity of 64.
+    // A new, empty buffer with room for `cap` bytes before the first grow,
+    // or the allocation failure. Growing it later aborts as `ensure` does.
+    fn try_new_with_cap(cap: usize) -> Result[Buffer!, AllocError] {
+        match Storage::try_alloc(cap) {
+            Result::Ok(u) => Result::Ok.(Buffer!.{ ptr: u.into_raw(), len: 0usize, cap }),
+            Result::Err(e) => Result::Err.(e),
+        }
+    }
+
+    // `try_new_with_cap`, aborting on failure. `new` is this with a starting
+    // capacity of 64.
     fn new_with_cap(cap: usize) -> Buffer! {
-        let u = HeapAllocator::alloc(cap);
-        let raw = u.into_raw();
-        Buffer!.{ ptr: raw, len: 0usize, cap }
+        match Buffer!::try_new_with_cap(cap) {
+            Result::Ok(b) => b,
+            Result::Err(e) => unsafe abort(),
+        }
     }
 
     fn new() -> Buffer! {
