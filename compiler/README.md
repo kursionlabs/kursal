@@ -668,6 +668,11 @@ generated code (unused labels, the standard library's own prototypes of C functi
 `-fno-builtin` keeps the C compiler from giving a function the meaning of the C library function of
 the same name, which an extern or a Kursal function may declare with another type.
 
+What the C compiler writes goes to stderr as it writes it. When it fails, `kursal build` and
+`tools/build.py` add the same line and exit with status 1: `cannot run the C compiler CC (error
+ERRNO)` when it cannot be started (ERRNO 2 when there is no such program), `the C compiler CC exited
+with status N`, or `the C compiler CC was killed by signal N`.
+
 The C is GNU C (`__typeof__`, `__builtin_*`, `__atomic_*`), as Clang and GCC accept it, and includes
 only `<stddef.h>` and `<stdint.h>`; `usize` and `isize` are pointer-sized (see "Pointer-sized
 integers"). It calls no C library function

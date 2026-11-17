@@ -135,6 +135,9 @@ source_root = "src"          # the default
 path = "../lib/std"
 ```
 
+A `kind` other than those two is an error that names the manifest (`.../kur.toml: manifest 'kind' must
+be "library" or "executable"`).
+
 An executable's entry is a safe, non-generic function `fn() -> i32`, or
 `fn(args: Args) -> i32` taking `std::process::Args`: the backend writes C's
 `main(int argc, char **argv)` for it, which fills `Args` from `argv` and `argc`
