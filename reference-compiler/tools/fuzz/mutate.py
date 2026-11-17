@@ -65,7 +65,7 @@ class Mutator:
         for _ in range(self.r.randrange(1, 4)):
             lines = self.mutate(lines)
         text = "\n".join(lines) + "\n"
-        entry = "main" if re.search(r"^fn main\(\) -> i32", text, re.M) else None
+        entry = "main" if re.search(r"^fn main\(", text, re.M) else None
         return {"kur.toml": manifest(entry), "lib.kur": text}
 
     def corpus_package(self) -> dict[str, str]:

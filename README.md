@@ -9,16 +9,25 @@ and Clang, or another C compiler named by `$KURSAL_CC`. Build the compiler, then
 
 ```sh
 scripts/bootstrap.sh
-bin/kursal build examples/greet -o /tmp/greet
-echo ada | /tmp/greet
+bin/kursal build examples/hello -o /tmp/hello && /tmp/hello
 ```
 
 `scripts/bootstrap.sh` takes a few minutes: the reference compiler, in Python, builds the compiler,
-which then builds itself into `bin/kursal`. The program asks for a name and greets it:
+which then builds itself into `bin/kursal`. The program is
+[`examples/hello/lib.kur`](examples/hello/lib.kur):
+
+```kursal
+use std::io::print;
+
+fn main() {
+    print("Hello, world!\n");
+}
+```
+
+and it prints:
 
 ```text
-What's your name?
-Hello, Ada!
+Hello, world!
 ```
 
 [`examples/README.md`](examples/README.md) lists the example programs, starting with the ones to read

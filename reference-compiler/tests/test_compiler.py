@@ -585,6 +585,44 @@ def reference_build(path: Path) -> dict[str, Optional[str]]:
     return in_deep_thread(make)
 
 
+ENTRY_IMPORTS = "use std::io::{Error, print};\nuse std::option::{Option, Result};\nuse std::process::Args;\n"
+
+# An executable's entry functions: the six shapes it may have, then others it may not.
+ENTRIES = (
+    "fn main() { print(\"hello\"); }\n",
+    "fn main(args: Args) { print(\"hello\"); }\n",
+    "fn main() -> i32 { 3 }\n",
+    "fn main(args: Args) -> i32 { args.len() as i32 }\n",
+    "fn main() -> Result[(), Error] { print(\"hello\") }\n",
+    "fn main(args: Args) -> Result[(), Error] { Result::Err.(Error.{ errno: args.len() as i32 }) }\n",
+    "fn main() -> i64 { 0 }\n",
+    "fn main() -> u8 { 0 }\n",
+    "fn main() -> bool { true }\n",
+    "fn main() -> ! { std::process::exit(0) }\n",
+    "fn main() -> Result[(), u32] { Result::Ok.(()) }\n",
+    "fn main() -> Result[i32, Error] { Result::Ok.(0) }\n",
+    "fn main() -> Option[Error] { Option::None }\n",
+    "fn main(code: i32) -> i32 { code }\n",
+    "fn main(args: Args, more: Args) -> i32 { 0 }\n",
+    "unsafe fn main() -> i32 { 0 }\n",
+    "forall T. fn main() -> i32 { 0 }\n",
+    "fn main(&args: Args) -> i32 { 0 }\n",
+)
+
+
+def reference_entry(path: Path) -> str:
+    """The reference's C for the executable at `path`, as `kursal build` writes it, or its error."""
+    T._fresh = itertools.count()
+    I._ids = itertools.count()
+    try:
+        resolver = resolve(path)
+        sigs = signatures(resolver)
+        program = lower(resolver, sigs)
+        return emit_c(program, check_program(program), sigs.name(resolver.packages[0].entry_decl))
+    except KursError as error:
+        return f"error: {error}"
+
+
 def reference_lowering(path: Path) -> str:
     return reference_build(path)["lower"]
 
@@ -1611,6 +1649,23 @@ class CompilerTests(unittest.TestCase):
         for (path, want), got in zip(buildable, results):
             with self.subTest(path=str(path.relative_to(ROOT))):
                 self.assertEqual(got, want)
+
+    def test_entries_match_reference(self):
+        """Every entry shape, with and without `Args`, and entries of other shapes: `kursal build` writes the
+        reference's C, or fails with its error."""
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for index, source in enumerate(ENTRIES):
+                root = Path(directory) / f"entry{index}"
+                root.mkdir()
+                (root / "kur.toml").write_text(manifest("app", entry="main") + f'[dependencies.std]\npath="{LIB / "std"}"\n')
+                (root / "lib.kur").write_text(ENTRY_IMPORTS + source)
+                paths.append(root)
+            expected = [in_deep_thread(lambda: reference_entry(path)) for path in paths]
+            self.assertEqual(sum(want.startswith("error:") for want in expected), len(ENTRIES) - 6)
+            for path, want, got in zip(paths, expected, self.run_batches("build", paths)):
+                with self.subTest(source=(path / "lib.kur").read_text()):
+                    self.assertEqual(got, want)
 
     def test_lowering_cases_match_reference(self):
         """The packages the reference's own tests lower, and the cases of tests/lower_cases.py, which the

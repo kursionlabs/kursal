@@ -50,6 +50,11 @@ reports the errno of an `exec` that fails (ENOENT for a program not on the
 library in the child. A line whose arguments are not exactly `count` is
 EINVAL.
 
+`kur_libc_process_report_error` is called by no Kursal code: the C `main`
+the compiler writes for an entry returning `Result[(), std::io::Error]`
+calls it with an `Err`'s errno, and it writes `error: DESCRIPTION (error
+ERRNO)` to stderr, the description `strerror`'s.
+
 These calls describe observations, not authenticated ownership or a stable
 file-system snapshot. Code that uses them to enforce path containment must
 still compare canonical paths on component boundaries, check physical

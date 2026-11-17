@@ -33,11 +33,14 @@ and what each produces.
 
 ## Start here
 
-Small programs that do something visible, each showing what is particular to Kursal.
+Small programs that do something visible, each showing what is particular to Kursal. Read `hello`,
+then `greet`, then `linear`, which declares a linear type of its own and consumes it.
 
 | Example | What it shows |
 |---|---|
-| `greet` | reading a line from stdin into an owned `Buffer!`, and formatting a reply with `f"..."` |
+| `hello` | the smallest program: `fn main()` printing a line with `std::io::print` |
+| `greet` | reading a line from stdin into an owned `Buffer!`, and formatting a reply with `f"..."`; `main` returns `Result[(), std::io::Error]`, so `?` ends it on an I/O error |
+| `linear` (library), with `bad/leaked_handle.kur`, `bad/double_use_handle.kur`, `bad/branch_inconsistent.kur`, `bad/while_consume_without_replacement.kur` | a linear type, `struct Handle! { ... }`, the control flow that consumes it, and the programs that get it wrong |
 | `calc` | an integer calculator over stdin: parsing, and errors reported with their column |
 | `wc`, `wordfreq` | command-line tools: line, word and byte counts of files; word frequencies of stdin |
 | `graph` | a cyclic graph in one arena, read and written through one capability, with no `unsafe` |
@@ -80,7 +83,6 @@ and report through their exit status, 0 when every check holds.
 | `modules` | a package whose public facade exports a namespace from an internal module |
 | `core_only` | a program that needs only `core`: no allocator, no operating system |
 | `heap` (library) | C-heap interop: `malloc` checked for null, a raw pointer cast, and `free` |
-| `linear` (library), with `bad/leaked_handle.kur`, `bad/double_use_handle.kur`, `bad/branch_inconsistent.kur`, `bad/while_consume_without_replacement.kur` | linear types and the control flow that consumes them, and the programs that get it wrong |
 | `skolems`, `mint_in_arm`, `mint_join`, `mint_loop` (libraries), with `bad/mismatched_skolem.kur`, `bad/unbound_result_brand.kur` | brands: minting them and carrying them through branches, joins and loops |
 | `basic`, `arrays`, `tuples`, `shapes` (libraries) | structs, fixed-size arrays, tuples, enums |
 | `generics`, `generic_result`, `option_result` (libraries) | generic types and functions, `Result`, `Option` and `?` |

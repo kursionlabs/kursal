@@ -30,6 +30,16 @@ use package::types::ops::{Fresh, Row, Types, alpha_hashes, equal, foreach_binder
 use std::option::Option;
 use std::slice::Slice;
 
+// The C function, in `lib/libc/fs.c`, that C's `main` calls to report the error an entry returns.
+const REPORT_ERROR: Slice[u8, 'static] = "kur_libc_process_report_error";
+
+// How C's `main` makes an entry's result its exit status (`Backend::entry_result`).
+enum EntryResult {
+    Status,
+    Zero,
+    Report,
+}
+
 fn prelude() -> Buffer! {
     Buffer!::new()
         .push_static("#include <stddef.h>\n")
@@ -595,6 +605,7 @@ impl Backend['k] {
             r = r + 1usize;
         }
         taken.insert(&cx, Span::from_static(&cx, "main"));
+        taken.insert(&cx, Span::from_static(&cx, REPORT_ERROR));
         let externs = program.externs.values(&cx);
         var e = 0usize;
         while e < externs.len(&cx) {
@@ -1049,6 +1060,36 @@ impl Backend['k] {
         }
     }
 
+    // How C's `main` makes an entry function's result `ty` its exit status, or none if it cannot:
+    // `Status` returns it (`i32`), `Zero` returns 0 (`()`), and `Report` (`Result[(), std::io::Error]`)
+    // returns 0 for `Ok`, and 1 for `Err` once `REPORT_ERROR` has reported its errno on stderr. As
+    // `Args` is, the result is known by its shape alone: an enum of `Ok` of `()` and `Err` of a struct
+    // of exactly one `i32`.
+    fn entry_result(self, &cx: Domain!['k], ty: Type['k]) -> Option[EntryResult] {
+        if equal(&cx, ty, C::prim(&cx, "i32")) {
+            return Option::Some.(EntryResult::Status);
+        }
+        if equal(&cx, ty, C::unit(&cx)) {
+            return Option::Some.(EntryResult::Zero);
+        }
+        let variants = match self.shape(&cx, ty) {
+            Type::Enum(variants) => variants,
+            _ => return Option::None,
+        };
+        if variants.len(&cx) != 2usize || !variants.at(&cx, 0usize).name.is(&cx, "Ok") || !variants.at(&cx, 1usize).name.is(&cx, "Err")
+            || !equal(&cx, variants.at(&cx, 0usize).type, C::unit(&cx)) {
+            return Option::None;
+        }
+        match self.shape(&cx, variants.at(&cx, 1usize).type) {
+            Type::Struct(fields) => if fields.len(&cx) == 1usize && equal(&cx, fields.at(&cx, 0usize).type, C::prim(&cx, "i32")) {
+                Option::Some.(EntryResult::Report)
+            } else {
+                Option::None
+            },
+            _ => Option::None,
+        }
+    }
+
     // `ty` has no C representation: it is zero-size (Never included).
     fn erased(self, &cx: Domain!['k], ty: Type['k]) -> bool {
         self.c(&cx, ty).is(&cx, "void")
@@ -1451,7 +1492,7 @@ impl Backend['k] {
                 fail_at(&cx, Buffer!::new().push_static("backend: foreign symbol ").push_bytes(&cx, repr(&cx, ext.name)).push_static(" is not a C identifier").save(&cx), ext.pos);
             }
             if runtime.contains(&cx, ext.name) || ext.name.starts_with(&cx, Span::from_static(&cx, "__builtin_")) || ext.name.starts_with(&cx, Span::from_static(&cx, "__atomic_"))
-                || ext.name.is(&cx, "main") && entry.is_some() {
+                || (ext.name.is(&cx, "main") || ext.name.is(&cx, REPORT_ERROR)) && entry.is_some() {
                 fail_at(&cx, Buffer!::new().push_static("backend: foreign symbol ").push_bytes(&cx, repr(&cx, ext.name))
                     .push_static(" conflicts with the C runtime prelude or entry wrapper").save(&cx), ext.pos);
             }
@@ -1478,18 +1519,16 @@ impl Backend['k] {
         var main: Option[Span['k]] = Option::None;
         match entry {
             Option::Some(name) => {
-                let i32 = C::prim(&cx, "i32");
                 let ok = match self.program.funs.get(&cx, name) {
-                    Option::Some(fun) => {
-                        let plain = fun.ptypes.is_empty(&cx) || fun.ptypes.len(&cx) == 1usize && self.arguments_type(&cx, fun.ptypes.at(&cx, 0usize));
-                        fun.params.is_empty(&cx) && fun.premises.is_empty(&cx) && !fun.is_unsafe && fun.places(&cx).is_empty(&cx)
-                            && equal(&cx, fun.ret, i32) && plain
-                    },
+                    Option::Some(fun) => fun.params.is_empty(&cx) && fun.premises.is_empty(&cx) && !fun.is_unsafe && fun.places(&cx).is_empty(&cx)
+                        && self.entry_result(&cx, fun.ret).is_some()
+                        && (fun.ptypes.is_empty(&cx) || fun.ptypes.len(&cx) == 1usize && self.arguments_type(&cx, fun.ptypes.at(&cx, 0usize))),
                     Option::None => false,
                 };
                 if !ok {
-                    fail_text(&cx, Buffer!::new().push_static("backend: the entry ").push_bytes(&cx, name).push_static(" must be a safe, non-generic `fn() -> i32`, or ")
-                        .push_static("`fn(A) -> i32` with A a struct of a `*(*u8)` and a `usize`, without premises").save(&cx));
+                    fail_text(&cx, Buffer!::new().push_static("backend: the entry ").push_bytes(&cx, name).push_static(" must be `fn()`, `fn() -> i32` or ")
+                        .push_static("`fn() -> Result[(), std::io::Error]`, each with or without a parameter ")
+                        .push_static("`args: std::process::Args`, and safe, not generic and without premises").save(&cx));
                 }
                 main = Option::Some.(self.request(&cx, FunKey::Function.(name), self.program.funs.at(&cx, name), ArenaMap::new(&cx)));
             },
@@ -1569,20 +1608,53 @@ impl Backend['k] {
                     Option::Some(name) => name,
                     Option::None => Span::from_static(&cx, ""),
                 });
-                if !fun.ptypes.is_empty(&cx) {
-                    let args = fun.ptypes.at(&cx, 0usize);
-                    let fields = match self.shape(&cx, args) {
-                        Type::Struct(members) => members,
-                        _ => ArenaVec::new(&cx),
-                    };
-                    c.push_static("int main(int argc, char **argv) { return (int)").push_bytes(&cx, symbol).push_static("((")
-                        .push_bytes(&cx, self.c(&cx, args)).push_static("){ (").push_bytes(&cx, self.c(&cx, fields.at(&cx, 0usize).type))
-                        .push_static(")argv, (").push_bytes(&cx, self.c(&cx, fields.at(&cx, 1usize).type)).push_static(")argc }); }\n")
-                } else {
-                    c.push_static("int main(void) { return (int)").push_bytes(&cx, symbol).push_static("(); }\n")
-                }
+                c.push_bytes(&cx, self.entry_wrapper(&cx, fun, symbol)).push_static("\n")
             },
             Option::None => c,
+        }
+    }
+
+    // C's `main`: it calls the entry `fun`, whose C is `symbol`, with `Args` from `argv` and `argc` if
+    // `fun` takes them, and makes its result the exit status (`entry_result`).
+    fn entry_wrapper(self, &cx: Domain!['k], fun: Fun['k], symbol: Span['k]) -> Span['k] {
+        let (head, call) = if !fun.ptypes.is_empty(&cx) {
+            let args = fun.ptypes.at(&cx, 0usize);
+            let fields = match self.shape(&cx, args) {
+                Type::Struct(members) => members,
+                _ => fail_text(&cx, Span::from_static(&cx, "internal error: entry arguments that are not a struct")),
+            };
+            (Span::from_static(&cx, "int main(int argc, char **argv)"),
+                Buffer!::new().push_bytes(&cx, symbol).push_static("((").push_bytes(&cx, self.c(&cx, args)).push_static("){ (")
+                    .push_bytes(&cx, self.c(&cx, fields.at(&cx, 0usize).type)).push_static(")argv, (")
+                    .push_bytes(&cx, self.c(&cx, fields.at(&cx, 1usize).type)).push_static(")argc })").save(&cx))
+        } else {
+            (Span::from_static(&cx, "int main(void)"), Buffer!::new().push_bytes(&cx, symbol).push_static("()").save(&cx))
+        };
+        let kind = match self.entry_result(&cx, fun.ret) {
+            Option::Some(kind) => kind,
+            Option::None => fail_text(&cx, Span::from_static(&cx, "internal error: an entry whose result is no exit status")),
+        };
+        match kind {
+            EntryResult::Status => Buffer!::new().push_bytes(&cx, head).push_static(" { return (int)").push_bytes(&cx, call).push_static("; }").save(&cx),
+            EntryResult::Zero => Buffer!::new().push_bytes(&cx, head).push_static(" { ").push_bytes(&cx, call).push_static("; return 0; }").save(&cx),
+            EntryResult::Report => {
+                let error = match self.shape(&cx, fun.ret) {
+                    Type::Enum(variants) => self.shape(&cx, variants.at(&cx, 1usize).type),
+                    _ => fail_text(&cx, Span::from_static(&cx, "internal error: an entry result that is not an enum")),
+                };
+                let label = match error {
+                    Type::Struct(fields) => fields.at(&cx, 0usize).name,
+                    _ => fail_text(&cx, Span::from_static(&cx, "internal error: an entry error that is not a struct")),
+                };
+                let (member, _type) = self.member_of(&cx, error, label);
+                let status = self.fresh_name(&cx, Span::from_static(&cx, "status"));
+                Buffer!::new().push_static("void ").push_static(REPORT_ERROR).push_static("(int32_t);\n")
+                    .push_bytes(&cx, head).push_static(" { ").push_bytes(&cx, self.c(&cx, fun.ret)).push_static(" ").push_bytes(&cx, status)
+                    .push_static(" = ").push_bytes(&cx, call).push_static("; if (").push_bytes(&cx, self.tag(&cx, status, fun.ret))
+                    .push_static(" == 0) return 0; ").push_static(REPORT_ERROR).push_static("(")
+                    .push_bytes(&cx, self.payload(&cx, status, fun.ret, Span::from_static(&cx, "Err"))).push_static(".").push_bytes(&cx, member)
+                    .push_static("); return 1; }").save(&cx)
+            },
         }
     }
 

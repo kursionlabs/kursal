@@ -234,8 +234,10 @@ take `self` by value and `&cx`: the copies share the same storage. Its construct
 The compiler calls the standard library for everything it asks of the operating system, and hands
 it paths as spans of the arena, which it reads in place:
 
-- **Arguments.** `main` is `fn main(args: std::process::Args) -> i32`; the C `main` the backend
-  writes for it fills `Args` from `argv` and `argc` (see the reference compiler's README,
+- **Arguments.** `main` is `fn main(args: std::process::Args) -> i32`, one of the entry shapes the
+  backend accepts (`fn main()`, `fn main() -> i32` and `fn main() -> Result[(), std::io::Error]`,
+  each with or without `args`); the C `main` the backend writes for it fills `Args` from `argv` and
+  `argc` and returns the result as the exit status (see the reference compiler's README,
   "Packages"). `front_end` views each argument as a span (`Span::from_static`), copying nothing.
 - **Files.** `std::fs::read_to_arena` reads a source, a manifest or a KURS file into the arena;
   `std::fs::write` writes the C. `resolve::resolver` lists source directories with

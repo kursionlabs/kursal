@@ -206,6 +206,15 @@ int64_t kur_libc_process_run(const uint8_t *line, uintptr_t len, uintptr_t count
     return -(int64_t)ECHILD;
 }
 
+/* Reports the `std::io::Error` an executable's entry returned, its errno
+ * `code`, on stderr: `error: ` and the C library's description of the
+ * errno, then the errno itself, as `error: No such file or directory
+ * (error 2)`. The C `main` the compiler writes for an entry returning
+ * `Result[(), std::io::Error]` calls it before exiting with status 1. */
+void kur_libc_process_report_error(int32_t code) {
+    fprintf(stderr, "error: %s (error %d)\n", strerror(code), (int)code);
+}
+
 /* Sleeps for `nanos` nanoseconds, sleeping on for what is left when a
  * signal interrupts it. */
 void kur_libc_time_sleep(uint64_t nanos) {

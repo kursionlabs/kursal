@@ -122,12 +122,12 @@ fn main() -> i32 {
     let src = input.save(&cx);
     let status = match parse(&cx, src) {
         Result::Ok(root) => {
-            print_buffer(1i32, table(&cx, Buffer!::new(), root));
+            print_buffer(table(&cx, Buffer!::new(), root));
             0
         },
         Result::Err(e) => {
             let (line, column) = line_column(&cx, src, e.offset);
-            print_buffer(1i32, Buffer!::new().push_usize(e.offset).push_static(" ").push_usize(line).push_static(" ")
+            print_buffer(Buffer!::new().push_usize(e.offset).push_static(" ").push_usize(line).push_static(" ")
                 .push_usize(column).push_static(" ").push_static(e.message));
             1
         },

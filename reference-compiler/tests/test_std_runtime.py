@@ -166,7 +166,7 @@ class StdRuntimeTests(unittest.TestCase):
                     Result::Ok(m) => { var m = m; let old = &m.insert(1u32, 2u32); let n = &m.len(); m.destroy(forget); n },
                     Result::Err(e) => 0usize,
                 };
-                print_buffer(1, f"{big_buffer} {big_vec} {buffer} {vec} {map} {owned_vec} {owned_map}");
+                print_buffer(f"{big_buffer} {big_vec} {buffer} {vec} {map} {owned_vec} {owned_map}");
                 0
             }''', stdout="refused refused 3 1 1 2 1", preexec=limit)
 
@@ -367,7 +367,7 @@ class StdRuntimeTests(unittest.TestCase):
                 fn main() -> i32 {
                     var sr = StaticRead::new();
                     match variable(&sr, "KURSAL_TEST_VARIABLE") {
-                        Option::Some(value) => { print_buffer(1, value); },
+                        Option::Some(value) => { print_buffer(value); },
                         Option::None => (),
                     }
                     match variable(&sr, "KURSAL_TEST_UNSET_VARIABLE") {
@@ -399,17 +399,52 @@ class StdRuntimeTests(unittest.TestCase):
                     }
                     i = i + 1usize;
                 }
-                print_buffer(1, out);
+                print_buffer(out);
                 if args.bytes(args.len()).is_none() { args.len() as i32 } else { 99 }
             }''', status=4, stdout="one|two words||", args=("one", "two words", ""))
 
-    def test_an_entry_taking_other_parameters_is_rejected(self):
-        with tempfile.TemporaryDirectory(prefix="kursal-std-") as base:
-            directory = Path(base)
-            package(directory, "fn main(argc: i32, argv: *(*u8)) -> i32 { 0 }\n", ("std",))
-            resolver, sigs, program = lowered(directory)
-            with self.assertRaisesRegex(KursError, "must be a safe, non-generic"):
-                emit_c(program, check_program(program), sigs.name(resolver.packages[0].entry_decl))
+    def test_each_entry_shape_makes_its_exit_status(self):
+        """`fn main()`, `-> i32` and `-> Result[(), Error]`, each with and without `Args`: the exit status
+        and stderr of each, and the report of an `Err`."""
+        imports = '''
+            use std::io::{Error, File!, print};
+            use std::option::Result;
+            use std::process::Args;
+            use std::slice::StaticRead;
+        '''
+        missing = '''
+                var read = StaticRead::new();
+                let file = File!::open_read(&read, "missing")?;
+                file.close()'''
+        cases = (
+            ('fn main() { print("unit"); }', (), "unit", 0, ""),
+            ('fn main(args: Args) { if args.len() == 2usize { print("two"); } }', ("x",), "two", 0, ""),
+            ("fn main() -> i32 { 7 }", (), "", 7, ""),
+            ("fn main(args: Args) -> i32 { args.len() as i32 }", ("x", "y"), "", 3, ""),
+            ('fn main() -> Result[(), Error] { print("ok") }', (), "ok", 0, ""),
+            (f"fn main() -> Result[(), Error] {{{missing}\n}}", (), "", 1,
+             "error: No such file or directory (error 2)\n"),
+            ("fn main(args: Args) -> Result[(), Error] { Result::Err.(Error.{ errno: args.len() as i32 + 11 }) }",
+             ("x",), "", 1, "error: Permission denied (error 13)\n"),
+        )
+        for source, args, stdout, status, stderr in cases:
+            with self.subTest(source=source):
+                result = self.run_program(imports + source, args=args)
+                self.assertEqual((result.stdout, result.returncode, result.stderr), (stdout, status, stderr))
+
+    def test_an_entry_of_another_shape_is_rejected(self):
+        for source in ("fn main(argc: i32, argv: *(*u8)) -> i32 { 0 }\n", "fn main() -> u32 { 0 }\n",
+                       "use std::io::Error;\nuse std::option::Result;\nfn main() -> Result[u32, Error] { Result::Ok.(0) }\n"):
+            with self.subTest(source=source), tempfile.TemporaryDirectory(prefix="kursal-std-") as base:
+                directory = Path(base)
+                package(directory, source, ("std",))
+                resolver, sigs, program = lowered(directory)
+                with self.assertRaises(KursError) as raised:
+                    emit_c(program, check_program(program), sigs.name(resolver.packages[0].entry_decl))
+                self.assertEqual(str(raised.exception),
+                                 "backend: the entry t::main must be `fn()`, `fn() -> i32` or "
+                                 "`fn() -> Result[(), std::io::Error]`, each with or without a parameter "
+                                 "`args: std::process::Args`, and safe, not generic and without premises")
 
     def test_run_reports_exit_signal_and_spawn_errors(self):
         self.expect('''
@@ -431,11 +466,11 @@ class StdRuntimeTests(unittest.TestCase):
             fn main() -> i32 {
                 var sr = StaticRead::new();
                 let made = write(&sr, "not-executable", Buffer!::new().push_static("#!/bin/sh"));
-                print_buffer(1, outcome(Command!::new(&sr, "sh").arg(&sr, "-c").arg(&sr, "exit 7")).push_static(","));
-                print_buffer(1, outcome(Command!::new(&sr, "sh").arg(&sr, "-c").arg(&sr, "kill -15 $$")).push_static(","));
-                print_buffer(1, outcome(Command!::new(&sr, "no-such-program-for-kursal")).push_static(","));
-                print_buffer(1, outcome(Command!::new(&sr, "./not-executable")).push_static(","));
-                print_buffer(1, outcome(Command!::new(&sr, "true").arg(&sr, "a\\x00b")));
+                print_buffer(outcome(Command!::new(&sr, "sh").arg(&sr, "-c").arg(&sr, "exit 7")).push_static(","));
+                print_buffer(outcome(Command!::new(&sr, "sh").arg(&sr, "-c").arg(&sr, "kill -15 $$")).push_static(","));
+                print_buffer(outcome(Command!::new(&sr, "no-such-program-for-kursal")).push_static(","));
+                print_buffer(outcome(Command!::new(&sr, "./not-executable")).push_static(","));
+                print_buffer(outcome(Command!::new(&sr, "true").arg(&sr, "a\\x00b")));
                 Command!::new(&sr, "never").arg(&sr, "run").destroy();
                 0
             }''', stdout="code 7,signal 15,errno 2,errno 13,errno 22")
@@ -534,7 +569,7 @@ class StdRuntimeTests(unittest.TestCase):
                     },
                 };
                 buffer.destroy();
-                print_buffer(1, f"{full.unwrap_or(9usize)} {short.unwrap_or(9usize)} {end.unwrap_or(9usize)} {failed}");
+                print_buffer(f"{full.unwrap_or(9usize)} {short.unwrap_or(9usize)} {end.unwrap_or(9usize)} {failed}");
                 0
             }''', stdout="4 2 0 21", stdin="abcdef")
 
@@ -559,13 +594,33 @@ class StdRuntimeTests(unittest.TestCase):
                 }
             }''')
 
+    def test_print_and_eprint_write_to_stdout_and_stderr(self):
+        result = self.run_program('''
+            use std::bytes::buffer::Buffer!;
+            use std::io::{eprint, eprint_buffer, eprint_bytes, print, print_buffer, print_bytes, write, write_buffer, write_bytes};
+            use std::slice::StaticRead;
+            fn main() {
+                var read = StaticRead::new();
+                print("a");
+                print_bytes(&read, "b");
+                print_buffer(Buffer!::new().push_static("c"));
+                write(1i32, "d");
+                write_bytes(1i32, &read, "e");
+                write_buffer(1i32, Buffer!::new().push_static("f"));
+                eprint("A");
+                eprint_bytes(&read, "B");
+                eprint_buffer(Buffer!::new().push_static("C"));
+                write(2i32, "D");
+            }''')
+        self.assertEqual((result.stdout, result.stderr, result.returncode), ("abcdef", "ABCD", 0))
+
     def test_print_reports_a_failed_write(self):
         with open("/dev/full", "w") as full:
             result = self.run_program('''
                 use std::io::print;
                 use std::option::Result;
                 fn main() -> i32 {
-                    match print(1, "lost") {
+                    match print("lost") {
                         Result::Ok(nothing) => 1,
                         Result::Err(e) => e.errno,
                     }
@@ -589,7 +644,7 @@ class StdRuntimeTests(unittest.TestCase):
                             },
                             Option::Some(text) => {
                                 lines = lines + 1i32;
-                                print_buffer(1, Buffer!::new().push_byte(b'[').push_buffer(text).push_byte(b']'));
+                                print_buffer(Buffer!::new().push_byte(b'[').push_buffer(text).push_byte(b']'));
                             },
                         },
                     }

@@ -75,6 +75,8 @@ C_KEYWORDS = set("auto break case char const continue default do double else enu
                  "inline int long register restrict return short signed sizeof static struct switch typedef "
                  "union unsigned void volatile while _Alignas _Alignof _Atomic _Bool _Complex _Generic "
                  "_Imaginary _Noreturn _Static_assert _Thread_local".split())
+# The C function, in `lib/libc/fs.c`, that C's `main` calls to report the error an entry returns.
+REPORT_ERROR = "kur_libc_process_report_error"
 RUNTIME_NAMES = {"KUR_TRAP", "KUR_MUSTTAIL", "KUR_FIELD", "KUR_PTR_BITS", *(f"kur_dec_i{n}" for n in SIGNED.values()),
                  "SIZE_MAX", "PTRDIFF_MIN", "PTRDIFF_MAX", "SIG_ATOMIC_MIN", "SIG_ATOMIC_MAX",
                  "WCHAR_MIN", "WCHAR_MAX", "WINT_MIN", "WINT_MAX", *C_ORDER.values()}
@@ -177,7 +179,7 @@ class Backend:
         self.datas: dict[str, tuple[str, Data]] = {}
         # One conservative pool for ordinary identifiers, including function
         # locals: later global declarations must not be shadowed by earlier locals.
-        self.taken = C_KEYWORDS | RUNTIME_NAMES | {"main"} | {e.name for e in program.externs.values()}
+        self.taken = C_KEYWORDS | RUNTIME_NAMES | {"main", REPORT_ERROR} | {e.name for e in program.externs.values()}
         self.component_names: dict[tuple[str, str], str] = {}
         self.component_taken: set[str] = set()
         self.instance_params: dict[int, tuple[Param, ...]] = {}
@@ -341,6 +343,25 @@ class Backend:
         return isinstance(shape, Struct) and len(shape.fields) == 2 and \
             equal(shape.fields[0][1], Ptr(Ptr(Prim("u8")))) and equal(shape.fields[1][1], Prim("usize"))
 
+    def entry_result(self, ty: Type) -> Optional[str]:
+        """How C's `main` makes an entry function's result `ty` its exit status, or None if it cannot:
+        "status" returns it (`i32`), "zero" returns 0 (`()`), and "report" (`Result[(), std::io::Error]`)
+        returns 0 for `Ok`, and 1 for `Err` once `REPORT_ERROR` has reported its errno on stderr. As
+        `Args` is, the result is known by its shape alone: an enum of `Ok` of `()` and `Err` of a struct
+        of exactly one `i32`."""
+        if equal(ty, Prim("i32")):
+            return "status"
+        if equal(ty, UNIT):
+            return "zero"
+        shape = self.shape(ty)
+        if not isinstance(shape, Enum) or [name for name, _ in shape.variants] != ["Ok", "Err"]:
+            return None
+        error = self.shape(shape.variants[1][1])
+        if equal(shape.variants[0][1], UNIT) and isinstance(error, Struct) and len(error.fields) == 1 and \
+                equal(error.fields[0][1], Prim("i32")):
+            return "report"
+        return None
+
     def erased(self, ty: Type) -> bool:
         """`ty` has no C representation: it is zero-size (Never included)."""
         return self.ctype(ty) == "void"
@@ -459,7 +480,7 @@ class Backend:
         for ext in self.program.externs.values():
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", ext.name) or ext.name in C_KEYWORDS:
                 raise KursError(f"backend: foreign symbol {ext.name!r} is not a C identifier", ext.pos)
-            if ext.name in RUNTIME_NAMES or ext.name.startswith(("__builtin_", "__atomic_")) or ext.name == "main" and entry is not None:
+            if ext.name in RUNTIME_NAMES or ext.name.startswith(("__builtin_", "__atomic_")) or ext.name in ("main", REPORT_ERROR) and entry is not None:
                 raise KursError(f"backend: foreign symbol {ext.name!r} conflicts with the C runtime prelude or entry wrapper", ext.pos)
             assert ext.ret is not None
             if ext.ptypes is None:
@@ -472,11 +493,11 @@ class Backend:
         main: Optional[str] = None
         if entry is not None:
             fun = self.program.funs.get(entry)
-            i32 = Prim("i32")
-            if fun is None or fun.params or fun.premises or fun.unsafe or fun.places or not equal(fun.ret, i32) or \
+            if fun is None or fun.params or fun.premises or fun.unsafe or fun.places or self.entry_result(fun.ret) is None or \
                     not (fun.ptypes == () or len(fun.ptypes) == 1 and self.arguments_type(fun.ptypes[0])):
-                raise KursError(f"backend: the entry {entry} must be a safe, non-generic `fn() -> i32`, or "
-                                "`fn(A) -> i32` with A a struct of a `*(*u8)` and a `usize`, without premises")
+                raise KursError(f"backend: the entry {entry} must be `fn()`, `fn() -> i32` or "
+                                "`fn() -> Result[(), std::io::Error]`, each with or without a parameter "
+                                "`args: std::process::Args`, and safe, not generic and without premises")
             main = self.request(fun, {})
         else:
             # The roots are the functions with nothing left to choose or discharge. One with premises gets code
@@ -501,16 +522,34 @@ class Backend:
         out = [PRELUDE, *self.forward, *self.defs, *externs, *datas, *protos, *bodies]
         if entry is not None:
             assert main is not None
-            fun = self.program.funs[entry]
-            if fun.ptypes:
-                shape = self.shape(fun.ptypes[0])
-                assert isinstance(shape, Struct)
-                (_, argv), (_, count) = shape.fields
-                out.append(f"int main(int argc, char **argv) {{ return (int){main}(({self.ctype(fun.ptypes[0])}){{ "
-                           f"({self.ctype(argv)})argv, ({self.ctype(count)})argc }}); }}")
-            else:
-                out.append(f"int main(void) {{ return (int){main}(); }}")
+            out.append(self.entry_wrapper(self.program.funs[entry], main))
         return "\n".join(out) + "\n"
+
+    def entry_wrapper(self, fun: Fun, symbol: str) -> str:
+        """C's `main`: it calls the entry `fun`, whose C is `symbol`, with `Args` from `argv` and `argc` if
+        `fun` takes them, and makes its result the exit status (`entry_result`)."""
+        if fun.ptypes:
+            shape = self.shape(fun.ptypes[0])
+            assert isinstance(shape, Struct)
+            (_, argv), (_, count) = shape.fields
+            head = "int main(int argc, char **argv)"
+            call = f"{symbol}(({self.ctype(fun.ptypes[0])}){{ ({self.ctype(argv)})argv, ({self.ctype(count)})argc }})"
+        else:
+            head, call = "int main(void)", f"{symbol}()"
+        kind = self.entry_result(fun.ret)
+        if kind == "status":
+            return f"{head} {{ return (int){call}; }}"
+        if kind == "zero":
+            return f"{head} {{ {call}; return 0; }}"
+        result = self.shape(fun.ret)
+        assert isinstance(result, Enum)
+        error = self.shape(result.variants[1][1])
+        assert isinstance(error, Struct)
+        member, _ = self.member_of(error, error.fields[0][0])
+        status = self.fresh_name("status")
+        return (f"void {REPORT_ERROR}(int32_t);\n{head} {{ {self.ctype(fun.ret)} {status} = {call}; "
+                f"if ({self.tag(status, fun.ret)} == 0) return 0; "
+                f"{REPORT_ERROR}({self.payload(status, fun.ret, 'Err')}.{member}); return 1; }}")
 
     # -------------------------------------------------------------- data --
 

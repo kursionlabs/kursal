@@ -138,13 +138,32 @@ path = "../lib/std"
 A `kind` other than those two is an error that names the manifest (`.../kur.toml: manifest 'kind' must
 be "library" or "executable"`).
 
-An executable's entry is a safe, non-generic function `fn() -> i32`, or
-`fn(args: Args) -> i32` taking `std::process::Args`: the backend writes C's
-`main(int argc, char **argv)` for it, which fills `Args` from `argv` and `argc`
-and returns the entry's result as the exit status. The backend knows `Args` by
-its shape alone, a struct of exactly a `*(*u8)` and a `usize`, so no name is
-special; `Args` is restricted to `std::process`, so no safe code makes one
-otherwise, and its accessors may rely on what C's `main` received.
+An executable's entry is a safe, non-generic function without premises, of
+one of three shapes, each with or without a parameter `args: Args` of type
+`std::process::Args`:
+
+| Entry | Exit status |
+|---|---|
+| `fn main()` | 0 |
+| `fn main() -> i32` | the result |
+| `fn main() -> Result[(), std::io::Error]` | 0 for `Ok`; for `Err`, 1, once `error: DESCRIPTION (error ERRNO)` is written to stderr |
+
+Any other entry is an error:
+
+```text
+backend: the entry app::main must be `fn()`, `fn() -> i32` or `fn() -> Result[(), std::io::Error]`, each with or without a parameter `args: std::process::Args`, and safe, not generic and without premises
+```
+
+The backend writes C's `main` for the entry: `main(int argc, char **argv)`,
+which fills `Args` from `argv` and `argc`, for one taking them, else
+`main(void)`. For an `Err` it calls `kur_libc_process_report_error` in
+`lib/libc/fs.c`, which writes the errno with the C library's description of
+it (`strerror`), as `error: No such file or directory (error 2)`. The
+backend knows `Args` and the result by their shapes alone, so no name is
+special: `Args` is a struct of exactly a `*(*u8)` and a `usize`, and the
+result an enum of `Ok` of `()` and `Err` of a struct of exactly one `i32`.
+`Args` is restricted to `std::process`, so no safe code makes one otherwise,
+and its accessors may rely on what C's `main` received.
 
 Every `.kur` file under the source root is a module, named by its path
 (`a/lib.kur` and `a.kur` are both module `a`). A single `.kur` file can also be

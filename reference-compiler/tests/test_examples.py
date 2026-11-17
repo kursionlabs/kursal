@@ -157,7 +157,8 @@ RUNS: dict[str, tuple[tuple, ...]] = {
     "generic_capabilities": (((), "", "", 20),),
     "graph": (((), "", "from node 0, around the cycle 0 -> 1 -> 2 -> 0 and on to 3: 4 nodes\nfrom node 3: 1 node\n"
                        "from node 0, once 3 -> 4 is added: 5 nodes\n", 0),),
-    "greet": (((), "Ada\n", "What's your name?\nHello, Ada!\n", 0),),
+    "greet": (((), "Ada\n", "What's your name?\nHello, Ada!\n", 0, ""),),
+    "hello": (((), "", "Hello, world!\n", 0, ""),),
     "iter_basics": (((), "", "", 0),),
     "iter_combinators": (((), "", "", 0),),
     "mem_counter": (((), "", "", 0),),

@@ -44,7 +44,7 @@ in the mapping body is counted. Structural region split/merge over `*T` is
 therefore not a raw-pointer API merely because its shape is selected
 through indirection.
 
-So `std::io::print(fd: i32, s: Slice[u8, 'static])` is class C even though
+So `std::io::write(fd: i32, s: Slice[u8, 'static])` is class C even though
 its body reads through the slice's pointer, while
 `std::io::write_all(fd: i32, ptr: *u8, len: usize)` is class B: the same
 pointer, spelled bare. Unfolding would put nearly every function that takes
