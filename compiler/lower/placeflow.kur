@@ -20,7 +20,7 @@ use std::mem::Ref;
 use std::raw::Span;
 use std::alloc::arena::Domain!;
 use std::bytes::buffer::Buffer!;
-use package::check::checker::{Checker, Places, prefix};
+use package::check::checker::{Checker, Places, overlap, prefix};
 use package::kurs::core::{Block, Edge, Fun, Kind, Known, Opened, Param, Program, Terminator, Type};
 use package::kurs::core as C;
 use package::resolve::resolver::Resolver;
@@ -873,6 +873,53 @@ impl PlaceFlow['k] {
         c.places.set(&cx, saved);
     }
 
+    // A path through an enum's payload, such as a binder of `match &e`, is used only where the enum is
+    // known to hold that variant: not after a store into the enum or one of its ancestors.
+    fn variant_known(self, &cx: Domain!['k], path: Span['k], pos: Pos) {
+        match self.checker.place_storage(&cx, path) {
+            Result::Err(message) => if Span::from_static(&cx, message).is(&cx, "known") {
+                self.ownership_error(&cx, path, "'", Span::from_static(&cx, "' is used after its enum was assigned; match it again"), pos, false);
+            },
+            Result::Ok(_t) => (),
+        };
+    }
+
+    // The places one call lends are apart: none overlaps another, and beside whole locals a call lends
+    // at most two parts of places, which part at a field of a struct or tuple reached through structs
+    // and tuples only.
+    fn lent_apart(self, &cx: Domain!['k], paths: ArenaVec[Span['k], 'k], pos: Pos) {
+        var i = 0usize;
+        while i < paths.len(&cx) {
+            var j = i + 1usize;
+            while j < paths.len(&cx) {
+                if overlap(&cx, paths.at(&cx, i), paths.at(&cx, j)) {
+                    self.ownership_error(&cx, paths.at(&cx, j), "'", Span::from_static(&cx, "' overlaps another place the same call lends"), pos, false);
+                }
+                j = j + 1usize;
+            }
+            i = i + 1usize;
+        }
+        let nested: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        i = 0usize;
+        while i < paths.len(&cx) {
+            if paths.at(&cx, i).contains(&cx, Span::from_static(&cx, ".")) {
+                nested.push(&cx, paths.at(&cx, i));
+            }
+            i = i + 1usize;
+        }
+        if nested.len(&cx) > 2usize {
+            self.ownership_error(&cx, nested.at(&cx, 2usize), "a call lends at most two parts of places; '", Span::from_static(&cx, "' is a third"), pos, false);
+        }
+        if nested.len(&cx) == 2usize {
+            match self.checker.parts_at_product(&cx, nested) {
+                Result::Ok(apart) => if !apart {
+                    self.ownership_error(&cx, nested.at(&cx, 0usize), "'", Span::from_static(&cx, "' and another part of a place are lent by one call, but they do not part at a struct or tuple field reached through no enum"), pos, false);
+                },
+                Result::Err(_m) => (),
+            };
+        }
+    }
+
     // Tracks moves, stores, lends and package views without checking SSA values. A load needs its
     // path's type to decide whether it moves linear contents; if that query fails, the place state is
     // left unchanged for this instruction. Unknown roots, unrefined enum projections and invalid
@@ -894,6 +941,9 @@ impl PlaceFlow['k] {
                 if diagnose && !places.full(&cx, first) {
                     self.ownership_error(&cx, first, "value '", Span::from_static(&cx, "' has been moved or is only partially available"), instr.pos, false);
                 }
+                if diagnose {
+                    self.variant_known(&cx, first, instr.pos);
+                }
                 match c.place_type(&cx, first) {
                     Result::Ok(t) => if !c.copy_type(&cx, t) {
                         places.empty.insert(&cx, first);
@@ -904,6 +954,7 @@ impl PlaceFlow['k] {
             } else if op.is(&cx, "store") {
                 var known = true;
                 if diagnose {
+                    self.variant_known(&cx, first, instr.pos);
                     known = match c.storage_discardable(&cx, first) {
                         Result::Ok(free) => {
                             if !free {
@@ -919,19 +970,37 @@ impl PlaceFlow['k] {
                     places.forget(&cx, first, true);
                 }
             } else if op.is(&cx, "variant_tag") && place {
-                if diagnose && places.covered(&cx, first) {
-                    self.ownership_error(&cx, first, "enum value '", Span::from_static(&cx, "' has been moved; its tag is unavailable"), instr.pos, false);
+                if diagnose && !places.full(&cx, first) {
+                    self.ownership_error(&cx, first, "enum value '", Span::from_static(&cx, "' has been moved or is only partially available; its tag is unavailable"), instr.pos, false);
+                }
+                if diagnose {
+                    self.variant_known(&cx, first, instr.pos);
                 }
             } else if op.is(&cx, "call") || op.is(&cx, "trait_call") {
+                let lent: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
                 var k = 0usize;
                 while k < instr.args.len(&cx) {
                     let arg = instr.args.at(&cx, k);
                     if arg.starts_with(&cx, Span::from_static(&cx, "&")) && !arg.starts_with(&cx, Span::from_static(&cx, "&*")) {
-                        if diagnose && !places.full(&cx, arg) {
+                        lent.push(&cx, arg);
+                    }
+                    k = k + 1usize;
+                }
+                if diagnose {
+                    k = 0usize;
+                    while k < lent.len(&cx) {
+                        let arg = lent.at(&cx, k);
+                        if !places.full(&cx, arg) {
                             self.ownership_error(&cx, arg, "value '", Span::from_static(&cx, "' has been moved and cannot be lent"), instr.pos, false);
                         }
-                        places.forget(&cx, arg, true);
+                        self.variant_known(&cx, arg, instr.pos);
+                        k = k + 1usize;
                     }
+                    self.lent_apart(&cx, lent, instr.pos);
+                }
+                k = 0usize;
+                while k < lent.len(&cx) {
+                    places.forget(&cx, lent.at(&cx, k), true);
                     k = k + 1usize;
                 }
             } else if op.is(&cx, "open") && place {

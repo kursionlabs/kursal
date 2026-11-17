@@ -55,7 +55,7 @@ class CastTypingTests(unittest.TestCase):
         fn main() -> i32 { unsafe convert(true) }''', 7)
 
     def test_values_of_abstract_types_are_not_cast(self):
-        with self.assertRaisesRegex(KursError, 'unsafe_cast_cannot_produce'):
+        with self.assertRaisesRegex(KursError, 'an unsafe cast cannot produce or take apart'):
             self.run_source('''forall T, U. unsafe fn convert(x: T) -> U { x as U }
                 fn main() -> i32 { (unsafe convert[(u32, u32), (i32, i32)]((7u32, 9u32))).0 }
             ''', 7)

@@ -144,7 +144,7 @@ INFERENCES = (
     '\nforall T. exposed struct W { v: T }\nforall T. fn wrap(x: T) -> W[T] { W.{ v: x } }\nexposed struct S { a: u32, b: u32 }\nfn main() -> i32 {\n    let s = S.{ a: 7u32, b: 9u32 };\n    let parts = foreach f of s { wrap(f) };\n    let { a: x, b: y } = parts;\n    let { v: p } = x;\n    let { v: q } = y;\n    ((p * 10 + q) as i32)\n}\n',
     '\nfn main() -> i32 {\n    let a = 3u32;\n    let b = 7u32;\n    let outer = |x: u32| {\n        let a = 10u32;\n        let inner = |y: u32| b * 100 + a * 10 + x + y;\n        inner(2) + b\n    };\n    let mapped = foreach item of (1u32, 2u32) { (item, b, a, b) };\n    let (left, right) = mapped;\n    let (p, q, r, s) = left;\n    (((outer(a) + p + q + r + s) % 251u32) as i32)\n}\n',
     '\nextern "C" fn malloc(size: u64) -> *u8;\nextern "C" fn free(p: *u8) -> ();\nexposed struct Pair { a: u32, b: u32 }\nfn main() -> i32 {\n    let raw = unsafe malloc(8u64);\n    let p = unsafe (raw as *Pair);\n    unsafe *p = Pair.{ a: 20, b: 22 };\n    let v = unsafe *p;\n    let { a, b } = v;\n    let w = unsafe free(raw);\n    ((a + b) as i32)\n}\n',
-    '\nforall Self. trait Step { fn step(x: Self) -> u32; }\ninstance Step[u32] { fn step(&x: u32) -> u32 { x + 1 } }\nfn main() -> i32 { 0 }\n',
+    '\nforall Self. trait Step { fn step(&x: Self) -> u32; }\ninstance Step[u32] { fn step(&x: u32) -> u32 { x + 1 } }\nfn main() -> i32 { 0 }\n',
     'exposed enum E { A, B }\nfn main() -> i32 { match E::A { E::A => 1i32 } }',
     'exposed enum E { A, B }\nfn main() -> i32 { match E::A { E::A | E::A => 1i32, E::B => 3i32 } }',
     'fn main() -> i32 { match 0u8 { 0 => 1i32 } }',

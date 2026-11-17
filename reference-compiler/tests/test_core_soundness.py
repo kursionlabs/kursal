@@ -52,6 +52,9 @@ REJECTED = {
         (trait K (T) (keep T (T)))
         (instance K (u32) (method keep u32 (u32) (entry ((%x u32)) (ret %x)))
                           (method extra u32 (u32) (entry ((%x u32)) (ret %x))))"""),
+    "instance_method_place_mode": ("method_does_match_trait", """
+        (trait K (T) (keep u32 ((& T))))
+        (instance K (u32) (method keep u32 (u32) (entry ((%x u32)) (ret %x))))"""),
     "duplicate_trait_method": ("duplicate_trait_method", "(trait K (T) (keep T (T)) (keep T (T)))"),
 
     # Code with no module has no shape authority over a restricted declaration.

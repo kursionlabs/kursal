@@ -558,8 +558,8 @@ function is its own function pointer. A function that takes and returns only zer
 The language keeps its zero-size types out of memory, so erasing them never changes what a
 program reads or writes. `alloca`, the unsafe loads and stores (volatile or not), unsafe casts from
 or to one, extern parameters and extern values reject a zero-size type
-(`zero_size_type_has_no_memory_form`), and so does the backend where a specialization chooses one
-(`a zero-size type has no memory form`). So `Ref::new(&cx, ())`, `ArenaVec[(), 'k]` and a
+(`zero_size_type_has_no_memory_form`), as the front end does first, at the source (`a zero-size type
+has no memory form`), and so does the backend where a specialization chooses one. So `Ref::new(&cx, ())`, `ArenaVec[(), 'k]` and a
 `Vec![Marker]` do not build: they read and write their elements through pointers; an element that
 holds a zero-size part beside bytes (`ArenaVec[(Marker, u32), 'k]`) does. `sizeof` is the one
 operation that observes a zero-size type, and it is 0; the arithmetic the standard library does

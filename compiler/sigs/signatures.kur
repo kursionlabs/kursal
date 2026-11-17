@@ -30,7 +30,7 @@ use package::types::literals::valid_literal;
 use package::resolve::resolver::{Decl, NameRef, Named, Package, Resolver, Target, name_pos, named_pos, repr, repr_tuple};
 use package::syntax::ast as S;
 use package::syntax::ast::{Expr, Pos, no_pos};
-use package::types::ops::{Fresh, Types};
+use package::types::ops::{Fresh, Types, equal, subst};
 use std::option::{Option, Result};
 use std::slice::Slice;
 
@@ -631,6 +631,14 @@ impl Signatures['k] {
                 };
                 n = n + 1usize;
             }
+            i = i + 1usize;
+        }
+        i = 0usize;
+        while i < s.instances.len(&cx) {
+            let (inst, item, home) = s.instances.at(&cx, i);
+            resolver.locate(&cx, home, item.pos);
+            s.conforms(&cx, inst, item);
+            resolver.unlocate(&cx);
             i = i + 1usize;
         }
         s
@@ -1237,6 +1245,13 @@ impl Signatures['k] {
         var i = 0usize;
         while i < node.methods.len(&cx) {
             let m = node.methods.at(&cx, i);
+            var d = 0usize;
+            while d < methods.len(&cx) {
+                if methods.at(&cx, d).name.eq(&cx, m.name) {
+                    self.fail(&cx, Buffer!::new().push_static("method ").push_bytes(&cx, m.name).push_static(" is declared twice").save(&cx), m.pos);
+                }
+                d = d + 1usize;
+            }
             let sig = self.signature(&cx, Option::None, fn_header(m), ArenaVec::new(&cx), ArenaVec::new(&cx), Option::Some.(scope), Option::Some.(m.name));
             if !sig.params.is_empty(&cx) {
                 self.fail(&cx, Buffer!::new().push_static("trait method ").push_bytes(&cx, m.name).push_static(" cannot be generic itself").save(&cx), no_pos());
@@ -1281,6 +1296,67 @@ impl Signatures['k] {
         }
         let inst = InstanceSig.{ trait_name: self.name(&cx, trait_decl), params, premises, head: arguments, methods, home, pos: item.pos };
         (inst, item, home)
+    }
+
+    // An instance defines its trait's methods, once each, each with the trait's signature at the
+    // instance's arguments: parameter types, which parameters are places, result, and no `unsafe` the
+    // trait's method lacks.
+    fn conforms(self, &cx: Domain!['k], inst: InstanceSig['k], item: S::InstanceDecl['k]) {
+        let tr = match self.traits.get(&cx, inst.trait_name) {
+            Option::Some(t) => t,
+            Option::None => fail(&cx, Span::from_static(&cx, "internal error: an instance of an unknown trait")),
+        };
+        let head: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+        var h = 0usize;
+        while h < tr.params.len(&cx) && h < inst.head.len(&cx) {
+            head.insert(&cx, tr.params.at(&cx, h), inst.head.at(&cx, h));
+            h = h + 1usize;
+        }
+        let declared: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+        var d = 0usize;
+        while d < tr.methods.len(&cx) {
+            declared.insert(&cx, tr.methods.at(&cx, d).name);
+            d = d + 1usize;
+        }
+        // method name -> its index in the instance
+        let defined: ArenaMap[Span['k], usize, 'k] = ArenaMap::new(&cx);
+        var i = 0usize;
+        while i < item.methods.len(&cx) {
+            let node = item.methods.at(&cx, i);
+            if defined.contains(&cx, node.name) {
+                self.fail(&cx, Buffer!::new().push_static("method ").push_bytes(&cx, node.name).push_static(" is defined twice").save(&cx), node.pos);
+            }
+            if !declared.contains(&cx, node.name) {
+                self.fail(&cx, Buffer!::new().push_bytes(&cx, node.name).push_static(" is not a method of trait ").push_bytes(&cx, inst.trait_name).save(&cx), node.pos);
+            }
+            defined.insert(&cx, node.name, i);
+            i = i + 1usize;
+        }
+        var m = 0usize;
+        while m < tr.methods.len(&cx) {
+            let method = tr.methods.at(&cx, m);
+            let at = match defined.get(&cx, method.name) {
+                Option::Some(k) => k,
+                Option::None => self.fail(&cx, Buffer!::new().push_static("the instance lacks trait method ").push_bytes(&cx, method.name).save(&cx), no_pos()),
+            };
+            let sig = inst.methods.at(&cx, at);
+            let node = item.methods.at(&cx, at);
+            if sig.params.len(&cx) > inst.params.len(&cx) || sig.premises.len(&cx) > inst.premises.len(&cx) {
+                self.fail(&cx, Buffer!::new().push_static("instance method ").push_bytes(&cx, method.name).push_static(" cannot be generic itself").save(&cx), node.pos);
+            }
+            let wanted: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
+            var k = 0usize;
+            while k < method.ptypes.len(&cx) {
+                wanted.push(&cx, subst(&cx, method.ptypes.at(&cx, k), head, self.counter));
+                k = k + 1usize;
+            }
+            let want = C::fn_type(&cx, wanted, subst(&cx, method.ret, head, self.counter), ArenaVec::new(&cx), false, method.places);
+            let got = C::fn_type(&cx, sig.ptypes, sig.ret, ArenaVec::new(&cx), false, sig.places);
+            if !equal(&cx, got, want) || sig.is_unsafe && !method.is_unsafe {
+                self.fail(&cx, Buffer!::new().push_static("method ").push_bytes(&cx, method.name).push_static(" does not match its declaration in trait ").push_bytes(&cx, inst.trait_name).save(&cx), node.pos);
+            }
+            m = m + 1usize;
+        }
     }
 
     // ---- consts

@@ -32,7 +32,7 @@ use package::kurs::sexpr::{Form, FormKind};
 use package::sigs::signatures::{ConstValue, Sig, Signatures, binop_name, const_type, int_text};
 use package::syntax::ast as S;
 use package::syntax::ast::{Expr, Pattern, Pos, Statement, expr_id, expr_pos, no_pos};
-use package::types::ops::{Fresh, Types, equal, foreach_binders, foreach_item, free_brands, mentions_brand, subst};
+use package::types::ops::{Fresh, Types, children, equal, foreach_binders, foreach_item, free_brands, mentions_brand, subst};
 use std::collections::hashmap::OwnedMap!;
 use std::option::Option;
 use std::slice::Slice;
@@ -176,6 +176,15 @@ impl Lowering['k] {
             match sig.decl {
                 Option::Some(decl) => match decl.node {
                     Named::Extern(x) => if decl.kind.is(&cx, "extern") {
+                        self.r.locate(&cx, decl.home, x.pos);
+                        var p = 0usize;
+                        while p < sig.ptypes.len(&cx) {
+                            if self.types.zero_size(&cx, sig.ptypes.at(&cx, p)) {
+                                self.r.fail(&cx, Buffer!::new().push_static("extern ").push_bytes(&cx, x.name).push_static(" takes a zero-size type, which has no memory form").save(&cx), no_pos());
+                            }
+                            p = p + 1usize;
+                        }
+                        self.r.unlocate(&cx);
                         program.externs.insert(&cx, x.name, Extern.{ name: x.name, ret: Option::Some.(sig.ret), ptypes: Option::Some.(sig.ptypes), pos: no_pos() });
                     },
                     Named::Fn(node) => if node.body.is_some() {
@@ -574,10 +583,137 @@ impl FnLower['k] {
         if C::is_unsafe_op(&cx, o.name) && !(discharged || self.sig.is_unsafe) {
             self.fail(&cx, Buffer!::new().push_bytes(&cx, o.name).push_static(" requires unsafe authorization").save(&cx), pos);
         }
+        if C::is_unsafe_op(&cx, o.name) {
+            self.memory_operation(&cx, o, pos);
+        }
         self.current(&cx).instrs.push(&cx, Instr.{ lhs: ArenaVec::one(&cx, name), op: o.name, args: o.args, ty: o.ty, tys: o.tys, lit: o.lit,
             is_unsafe: discharged, binders: o.binders, pos });
         self.vty.insert(&cx, name, o.rty);
         name
+    }
+
+    // The core's rules for an unsafe operation on memory, which an `unsafe` marker does not lift: a
+    // zero-size type has no memory form to allocate, read, write or cast; a read through a pointer
+    // does not produce Never; a cast does not conjure what only a checked operation makes, nor
+    // reinterpret a layout the compiler chooses; an atomic operation works on an integer, a bool or a
+    // pointer.
+    fn memory_operation(self, &cx: Domain!['k], o: Op['k], pos: Pos) {
+        let target = if o.args.is_empty(&cx) { Option::None } else { self.vty.get(&cx, o.args.at(&cx, 0usize)) };
+        let pointee = match target {
+            Option::Some(t) => match t {
+                Type::Ptr(inner) => Option::Some.(inner.copy(&cx)),
+                _ => Option::None,
+            },
+            Option::None => Option::None,
+        };
+        let op = o.name;
+        if op.is(&cx, "alloca") {
+            match o.ty {
+                Option::Some(ty) => self.memory_form(&cx, ty, pos),
+                Option::None => (),
+            };
+        } else if op.is(&cx, "ptr_load") || op.is(&cx, "ptr_load_volatile") || op.is(&cx, "ptr_store") || op.is(&cx, "ptr_store_volatile") {
+            match pointee {
+                Option::Some(inner) => {
+                    let never = match inner {
+                        Type::Never => true,
+                        _ => false,
+                    };
+                    if op.starts_with(&cx, Span::from_static(&cx, "ptr_load")) && never {
+                        self.fail(&cx, Span::from_static(&cx, "an unsafe read cannot produce Never"), pos);
+                    }
+                    self.memory_form(&cx, inner, pos);
+                },
+                Option::None => (),
+            };
+        } else if op.is(&cx, "cast") {
+            match target {
+                Option::Some(from) => match o.ty {
+                    Option::Some(to) => self.cast_operation(&cx, from, to, pos),
+                    Option::None => (),
+                },
+                Option::None => (),
+            };
+        } else {
+            match C::atomic_kind(&cx, op) {
+                Option::Some(kind) => match pointee {
+                    Option::Some(inner) => self.atomic_operation(&cx, kind, inner, pos),
+                    Option::None => (),
+                },
+                Option::None => (),
+            };
+        }
+    }
+
+    fn cast_operation(self, &cx: Domain!['k], from: Type['k], to: Type['k], pos: Pos) {
+        if self.holds_uncastable(&cx, from) || self.holds_uncastable(&cx, to) {
+            self.fail(&cx, Span::from_static(&cx, "an unsafe cast cannot produce or take apart a package, a brand witness, a function value, a transform, a value of a type parameter or Never"), pos);
+        }
+        self.memory_form(&cx, from, pos);
+        self.memory_form(&cx, to, pos);
+        let types = self.lowering.types;
+        if is_non_null(from) || is_non_null(to) {
+            if !(is_pointer(from) && is_pointer(to)) {
+                self.fail(&cx, Span::from_static(&cx, "an unsafe cast converts a NonNull only to or from a pointer"), pos);
+            }
+        } else if types.chosen_layout(&cx, from) || types.chosen_layout(&cx, to) {
+            self.fail(&cx, Span::from_static(&cx, "an unsafe cast cannot reinterpret an enum or a NonNull, whose layout the compiler chooses"), pos);
+        }
+    }
+
+    fn atomic_operation(self, &cx: Domain!['k], kind: Span['k], inner: Type['k], pos: Pos) {
+        let integer = match inner {
+            Type::Prim(name) => C::is_integer(&cx, name),
+            _ => false,
+        };
+        if kind.starts_with(&cx, Span::from_static(&cx, "fetch_")) && !integer {
+            self.fail(&cx, Buffer!::new().push_static("atomic ").push_bytes(&cx, kind).push_static(" works on a pointer to an integer").save(&cx), pos);
+        }
+        let pointer = match inner {
+            Type::Ptr(_x) => true,
+            _ => false,
+        };
+        if !(integer || C::same(&cx, inner, C::bool_type(&cx)) || pointer) {
+            self.fail(&cx, Buffer!::new().push_static("atomic ").push_bytes(&cx, kind).push_static(" works on a pointer to an integer, a bool or a pointer").save(&cx), pos);
+        }
+    }
+
+    fn memory_form(self, &cx: Domain!['k], ty: Type['k], pos: Pos) {
+        if self.lowering.types.zero_size(&cx, ty) {
+            self.fail(&cx, Span::from_static(&cx, "a zero-size type has no memory form"), pos);
+        }
+    }
+
+    // Whether what no unsafe cast may conjure is in the value representation of `ty`: a package, a
+    // brand witness, a function value, a transform, a value of a type parameter, or Never. A
+    // pointer's target is not part of it.
+    fn holds_uncastable(self, &cx: Domain!['k], ty: Type['k]) -> bool {
+        let here = match ty {
+            Type::Exists(_binders, _body) => true,
+            Type::Brand(_brand) => true,
+            Type::Fn(_f) => true,
+            Type::Foreach(_f) => true,
+            Type::Never => true,
+            Type::Named(name, args) => args.is_empty(&cx) && self.kinds.contains(&cx, name),
+            _ => false,
+        };
+        if here {
+            return true;
+        }
+        match ty {
+            Type::Ptr(_inner) => false,
+            Type::NonNull(_inner) => false,
+            _ => {
+                let parts = children(&cx, ty);
+                var found = false;
+                var i = 0usize;
+                while !found && i < parts.len(&cx) {
+                    found = self.holds_uncastable(&cx, parts.at(&cx, i));
+                    i = i + 1usize;
+                }
+                found
+            },
+        }
     }
 
     fn unit(self, &cx: Domain!['k]) -> Span['k] {
@@ -1381,8 +1517,8 @@ impl FnLower['k] {
         if forgets {
             return Option::Some.(self.emit(&cx, Op::new(&cx, "to_ptr", dst, ArenaVec::one(&cx, v)).typed(dst)));
         }
-        // Casts do not inspect nominal layout or unfold abstract type parameters. Those
-        // representation obligations belong to the unsafe C boundary.
+        // `emit` holds a cast to the core's rules for it (`memory_operation`); a package is opened or
+        // packed.
         let package = match src {
             Type::Exists(_b, _t) => true,
             _ => match dst {
@@ -2677,4 +2813,22 @@ fn lower(&cx: Domain!['k], r: Resolver['k], sigs: Signatures['k], counter: Fresh
     let lowering = Lowering.{ r, sigs, results: inf.out, program, types: Types::new(&cx, program, counter), counter, datas: ArenaMap::new(&cx),
         closures: Ref::new(&cx, 0u64), value_types: ArenaMap::new(&cx) };
     lowering.run(&cx)
+}
+
+forall 'k.
+fn is_non_null(t: Type['k]) -> bool {
+    match t {
+        Type::NonNull(_inner) => true,
+        _ => false,
+    }
+}
+
+// A pointer, raw or `NonNull`.
+forall 'k.
+fn is_pointer(t: Type['k]) -> bool {
+    match t {
+        Type::Ptr(_inner) => true,
+        Type::NonNull(_inner) => true,
+        _ => false,
+    }
 }

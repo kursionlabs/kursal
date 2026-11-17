@@ -29,7 +29,7 @@ from . import syntax as S
 from .placeflow import OwnershipError, PlaceFlow
 from .promote import promote_locals
 from .literals import valid_literal
-from .check import overlap
+from .check import contains, overlap
 from .infer import (POINTER_OPS, BuiltinCall, ClosureCall, FnCall, FStringWrite, Infer, PointerCall, TypedBuiltinCall,
                     TraitCall, TupleCall, ValueCall, VariantCall)
 from .sexpr import KursError, List, Position, Str
@@ -100,6 +100,9 @@ class Lowering:
         program = self.program
         for decl, sig in self.sigs.sigs.items():
             if decl.kind == "extern":
+                with self.r.located(decl.module, decl.node.pos):
+                    if any(self.types.zero_size(t) for t in sig.ptypes):
+                        fail(f"extern {decl.node.name} takes a zero-size type, which has no memory form")
                 program.externs[decl.node.name] = C.Extern(decl.node.name, sig.ret, sig.ptypes)
             elif isinstance(decl.node, S.Fn) and decl.node.body is not None:
                 node = decl.node
@@ -239,9 +242,51 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         discharged = unsafe or self.discharge_all or node is not None and id(node) in self.unsafe_nodes
         if op in C.UNSAFE_OPS and not (discharged or self.sig.unsafe):
             fail(f"{op} requires unsafe authorization", pos)
+        if op in C.UNSAFE_OPS:
+            self.memory_operation(op, args, ty, pos)
         self.current.instrs.append(C.Instr((name,), op, tuple(args), unsafe=discharged, pos=pos, ty=ty, tys=tys, lit=lit, binders=binders))
         self.vty[name] = rty
         return name
+
+    def memory_operation(self, op: str, args: Sequence[str], ty: Optional[C.Type], pos: Optional[Position]) -> None:
+        """The core's rules for an unsafe operation on memory, which an `unsafe` marker does not lift: a
+        zero-size type has no memory form to allocate, read, write or cast; a read through a pointer does
+        not produce Never; a cast does not conjure what only a checked operation makes, nor reinterpret a
+        layout the compiler chooses; an atomic operation works on an integer, a bool or a pointer."""
+        def memory_form(t: C.Type) -> None:
+            if self.types.zero_size(t):
+                fail("a zero-size type has no memory form", pos)
+
+        target = self.vty.get(args[0]) if args else None
+        pointee = target.inner if isinstance(target, C.Ptr) else None
+        if op == "alloca" and ty is not None:
+            memory_form(ty)
+        elif op in ("ptr_load", "ptr_load_volatile", "ptr_store", "ptr_store_volatile") and pointee is not None:
+            if op.startswith("ptr_load") and isinstance(pointee, C.Never):
+                fail("an unsafe read cannot produce Never", pos)
+            memory_form(pointee)
+        elif op == "cast" and target is not None and ty is not None:
+            if any(contains(t, self.uncastable) for t in (target, ty)):
+                fail("an unsafe cast cannot produce or take apart a package, a brand witness, a function value, "
+                     "a transform, a value of a type parameter or Never", pos)
+            memory_form(target)
+            memory_form(ty)
+            if isinstance(target, C.NonNull) or isinstance(ty, C.NonNull):
+                if not (isinstance(target, (C.Ptr, C.NonNull)) and isinstance(ty, (C.Ptr, C.NonNull))):
+                    fail("an unsafe cast converts a NonNull only to or from a pointer", pos)
+            elif self.types.chosen_layout(target) or self.types.chosen_layout(ty):
+                fail("an unsafe cast cannot reinterpret an enum or a NonNull, whose layout the compiler chooses", pos)
+        elif op in C.ATOMIC_OPS and pointee is not None:
+            kind = C.ATOMIC_OPS[op]
+            integer = isinstance(pointee, C.Prim) and pointee.name in C.INTEGERS
+            if kind.startswith("fetch_") and not integer:
+                fail(f"atomic {kind} works on a pointer to an integer", pos)
+            if not (integer or pointee == C.BOOL or isinstance(pointee, C.Ptr)):
+                fail(f"atomic {kind} works on a pointer to an integer, a bool or a pointer", pos)
+
+    def uncastable(self, ty: C.Type) -> bool:
+        return isinstance(ty, (C.Exists, C.Brand, C.Fn, C.Foreach, C.Never)) or \
+            isinstance(ty, C.Named) and not ty.args and ty.name in self.kinds
 
     def unit(self) -> str:
         return self.emit("construct", C.UNIT, (), ty=C.UNIT)
@@ -650,8 +695,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         # Forgetting that a pointer is not null is safe.
         if isinstance(src, C.NonNull) and isinstance(dst, C.Ptr) and equal(src.inner, dst.inner):
             return self.emit("to_ptr", dst, (v,), ty=dst)
-        # Casts do not inspect nominal layout or unfold abstract type parameters.
-        # Those representation obligations belong to the unsafe C boundary.
+        # `emit` holds a cast to the core's rules for it (`memory_operation`); a package is opened or packed.
         if isinstance(src, C.Exists) or isinstance(dst, C.Exists):
             fail("a cast cannot consume or produce an outer existential package; use opening or packing", expr.pos)
         return self.emit("cast", dst, (v,), ty=dst, node=expr)

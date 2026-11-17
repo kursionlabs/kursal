@@ -643,7 +643,10 @@ class Gen:
             paths = self.t_places(env)
             if paths:
                 count = r.choice([2, 2, 3])
-                chosen = [r.choice(paths) for _ in range(count)]
+                if self.chance(0.7) and len(paths) >= count:
+                    chosen = r.sample(paths, count)   # apart, unless parts of one place
+                else:
+                    chosen = [r.choice(paths) for _ in range(count)]
                 name = self.fresh("r")
                 env.vars[name] = Var(name, "u32")
                 callee = "two_t" if count == 2 else "three_t"

@@ -13,7 +13,7 @@ the lowered program before passing it and the resulting checker to emit_c.
 from typing import Never, Optional
 
 from . import core as C
-from .check import Checker, CheckError, Places, prefix
+from .check import Checker, CheckError, Places, overlap, prefix
 from .types import free_brands
 from .sexpr import KursError, Position
 
@@ -193,31 +193,71 @@ class PlaceFlow(Checker):
                     path = i.args[0]
                     if diagnose and not self.places.full(path):
                         self.ownership_error(path, "value '{name}' has been moved or is only partially available", i.pos)
+                    if diagnose:
+                        self.variant_known(path, i.pos)
                     if not self.copy_type(self.path_type(path)):
                         self.places.empty.add(path)
                         self.places.forget(path)
                 elif i.op == "store":
                     path = i.args[0]
+                    if diagnose:
+                        self.variant_known(path, i.pos)
                     if diagnose and not self.no_linear(path, self.storage_type(path)):
                         self.ownership_error(path, "cannot overwrite live linear value '{name}'", i.pos)
                     self.places.empty = {z for z in self.places.empty if not prefix(path, z)}
                     self.places.forget(path)
                 elif i.op == "variant_tag" and i.args[0].startswith("&"):
                     path = i.args[0]
-                    if diagnose and self.places.covered(path):
-                        self.ownership_error(path, "enum value '{name}' has been moved; its tag is unavailable", i.pos)
+                    if diagnose and not self.places.full(path):
+                        self.ownership_error(path, "enum value '{name}' has been moved or is only partially "
+                                             "available; its tag is unavailable", i.pos)
+                    if diagnose:
+                        self.variant_known(path, i.pos)
                 elif i.op in ("call", "trait_call"):
-                    for arg in i.args:
-                        if arg.startswith("&") and not arg.startswith("&*"):
-                            if diagnose and not self.places.full(arg):
+                    lent = [arg for arg in i.args if arg.startswith("&") and not arg.startswith("&*")]
+                    if diagnose:
+                        for arg in lent:
+                            if not self.places.full(arg):
                                 self.ownership_error(arg, "value '{name}' has been moved and cannot be lent", i.pos)
-                            self.places.forget(arg)
+                            self.variant_known(arg, i.pos)
+                        self.lent_apart(lent, i.pos)
+                    for arg in lent:
+                        self.places.forget(arg)
                 elif i.op == "open" and i.args[0].startswith("&"):
                     self.places.opened[i.args[0]] = i.binders
                 elif i.op == "pack" and i.args[0].startswith("&"):
                     self.places.forget(i.args[0], keep_own_view=False)
             except CheckError:
                 pass  # Defer the failed load-path query to core checking.
+
+    def variant_known(self, path: str, pos: Optional[Position]) -> None:
+        """A path through an enum's payload, such as a binder of `match &e`, is used only where the enum is
+        known to hold that variant: not after a store into the enum or one of its ancestors."""
+        try:
+            self.storage_type(path)
+        except CheckError as error:
+            if str(error).endswith(": known"):
+                self.ownership_error(path, "'{name}' is used after its enum was assigned; match it again", pos)
+
+    def lent_apart(self, paths: list[str], pos: Optional[Position]) -> None:
+        """The places one call lends are apart: none overlaps another, and beside whole locals a call lends
+        at most two parts of places, which part at a field of a struct or tuple reached through structs
+        and tuples only."""
+        for k, path in enumerate(paths):
+            for other in paths[k + 1:]:
+                if overlap(path, other):
+                    self.ownership_error(other, "'{name}' overlaps another place the same call lends", pos)
+        nested = [path for path in paths if "." in path]
+        if len(nested) > 2:
+            self.ownership_error(nested[2], "a call lends at most two parts of places; '{name}' is a third", pos)
+        if len(nested) == 2:
+            try:
+                apart = self.product_branches(nested)
+            except CheckError:
+                return
+            if not apart:
+                self.ownership_error(nested[0], "'{name}' and another part of a place are lent by one call, but "
+                                     "they do not part at a struct or tuple field reached through no enum", pos)
 
     def edges(self, block: C.Block) -> list[tuple[C.Edge, Optional[tuple[str, str]]]]:
         t = block.term

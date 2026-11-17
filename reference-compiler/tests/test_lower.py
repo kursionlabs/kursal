@@ -15,7 +15,7 @@ from kursal.cgen import emit_c
 from kursal.lower import lower
 from kursal.resolve import LIB, resolve
 from kursal.sigs import signatures
-from kursal.check import CheckError
+from kursal.sexpr import KursError
 
 
 MANIFEST = '[package]\nname="t"\nkind="executable"\nentry="package::main"\nsource_root="."\n'
@@ -571,6 +571,8 @@ fn main() -> i32 {
             self.assertEqual(compile_and_run(c_file, directory / "main"), 10)
 
     def test_trait_implementation_preserves_place_parameters(self):
+        """An instance method lends where its trait's does, and nowhere else: the front end rejects one
+        that differs (as the checker would its core, test_core_soundness)."""
         for declared, implemented in (("&", ""), ("", "&")):
             with self.subTest(declared=declared, implemented=implemented):
                 with tempfile.TemporaryDirectory(prefix="kursal-trait-mode-") as base:
@@ -581,9 +583,8 @@ instance Step[u32] {{ fn step({implemented}x: u32) -> u32 {{ x + 1 }} }}
 fn main() -> i32 {{ 0 }}
 """})
                     resolver = resolve(directory)
-                    program = lower(resolver, signatures(resolver))
-                    with self.assertRaisesRegex(CheckError, "method_does_match_trait"):
-                        check_program(program)
+                    with self.assertRaisesRegex(KursError, "method step does not match its declaration"):
+                        signatures(resolver)
 
     def test_programs_exit_with_their_checksums(self):
         sys.setrecursionlimit(20000)

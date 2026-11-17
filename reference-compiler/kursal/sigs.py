@@ -17,7 +17,7 @@ from .resolve import Decl, Resolver
 from .sexpr import KursError, Position
 from .layout import check_type_expansion
 from .literals import valid_literal
-from .types import Types
+from .types import Types, equal, subst
 
 LIBRARY = {  # name: (home library, path there, path through std)
     "Option": ("core", ("option", "Option"), ("option", "Option")),
@@ -159,6 +159,9 @@ class Signatures:
                 if isinstance(item, S.InstanceDecl):
                     with resolver.located(scope.module, item.pos):
                         self.instances.append(self.instance(item, scope.module))
+        for inst, item, module in self.instances:
+            with resolver.located(module, item.pos):
+                self.conforms(inst, item)
 
     # ---- naming
     def name(self, decl: Decl) -> str:
@@ -414,8 +417,10 @@ class Signatures:
             fail("trait declarations cannot have their own trait premises", node.pos)
         if not node.forall:
             params, scope = (C.Param("Self", C.ANY),), scope.extend([C.Param("Self", C.ANY)])
-        methods = []
+        methods: list[C.Method] = []
         for m in node.methods:
+            if any(other.name == m.name for other in methods):
+                fail(f"method {m.name} is declared twice", m.pos)
             sig = self.signature(m, outer_scope=scope, name=m.name)
             if sig.params:
                 fail(f"trait method {m.name} cannot be generic itself")
@@ -438,6 +443,31 @@ class Signatures:
         inst = InstanceSig(self.name(trait), params, premises, arguments,
                           methods, module, item.pos)
         return inst, item, module
+
+    def conforms(self, inst: InstanceSig, item: S.InstanceDecl) -> None:
+        """An instance defines its trait's methods, once each, each with the trait's signature at the
+        instance's arguments: parameter types, which parameters are places, result, and no `unsafe` the
+        trait's method lacks."""
+        trait = self.traits[inst.trait]
+        head: dict[str, C.Type] = dict(zip(trait.params, inst.head))
+        declared = {m.name for m in trait.methods}
+        defined: dict[str, tuple[Sig, S.Fn]] = {}
+        for sig, node in zip(inst.methods, item.methods):
+            if node.name in defined:
+                fail(f"method {node.name} is defined twice", node.pos)
+            if node.name not in declared:
+                fail(f"{node.name} is not a method of trait {inst.trait}", node.pos)
+            defined[node.name] = (sig, node)
+        for method in trait.methods:
+            if method.name not in defined:
+                fail(f"the instance lacks trait method {method.name}")
+            sig, node = defined[method.name]
+            if sig.params[len(inst.params):] or sig.premises[len(inst.premises):]:
+                fail(f"instance method {method.name} cannot be generic itself", node.pos)
+            want = C.Fn(tuple(subst(t, head) for t in method.ptypes), subst(method.ret, head), places=method.places)
+            got = C.Fn(sig.ptypes, sig.ret, places=sig.places)
+            if not equal(got, want) or sig.unsafe and not method.unsafe:
+                fail(f"method {method.name} does not match its declaration in trait {inst.trait}", node.pos)
 
     # ---- consts
     def const(self, decl: Decl) -> ConstValue:

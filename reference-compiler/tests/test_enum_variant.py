@@ -100,7 +100,7 @@ class EnumVariantTests(unittest.TestCase):
             }''', 7)
 
     def test_tag_is_not_readable_while_payload_is_moved(self):
-        with self.assertRaisesRegex(KursError, 'readable_tag'):
+        with self.assertRaisesRegex(KursError, "enum value 'value' has been moved or is only partially available"):
             self.run_source('''exposed struct Token! { n: u32 }
             exposed enum E! { B(Token!) }
             fn main() -> i32 {
