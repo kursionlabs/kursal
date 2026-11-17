@@ -1,5 +1,6 @@
 """Packages and name resolution, on small package trees written per test."""
 
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -91,6 +92,17 @@ class GraphTests(unittest.TestCase):
             with self.subTest(source=source), self.assertRaises(ResolveError):
                 root = tree({"p/kur.toml": source, "p/lib.kur": ""})
                 resolve(root / "p")
+
+    def test_a_package_is_a_library_or_an_executable(self):
+        for kind in ("executabl", "Library", ""):
+            with self.subTest(kind=kind):
+                root = tree({"p/kur.toml": f'[package]\nname="p"\nsource_root="."\nkind="{kind}"\nentry="package::main"\n',
+                             "p/lib.kur": "fn main() -> i32 { 0i32 }\n"})
+                with self.assertRaisesRegex(ResolveError, "^" + re.escape(
+                        f"{(root / 'p/kur.toml').resolve()}: manifest 'kind' must be \"library\" or \"executable\"") + "$"):
+                    resolve(root / "p")
+        root = tree({"p/kur.toml": '[package]\nname="p"\nsource_root="."\n', "p/lib.kur": ""})
+        self.assertIsNone(resolve(root / "p").packages[0].entry)
 
     def test_modules_follow_paths(self):
         root = tree({"p/kur.toml": manifest("p"), "p/lib.kur": "", "p/a.kur": "", "p/b/lib.kur": "", "p/b/c.kur": ""})

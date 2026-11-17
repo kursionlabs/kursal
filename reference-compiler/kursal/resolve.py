@@ -154,7 +154,10 @@ def load(path: str | Path) -> list[Package]:
                 fail(f"{manifest}: unknown manifest keys {sorted(unknown)}")
             package.name = _string(info, manifest, "name")
             package.source_root = (root / _string(info, manifest, "source_root", "src")).resolve()
-            if _string(info, manifest, "kind", "library") == "executable":
+            kind = _string(info, manifest, "kind", "library")
+            if kind not in ("library", "executable"):
+                fail(f"{manifest}: manifest 'kind' must be \"library\" or \"executable\"")
+            if kind == "executable":
                 package.entry = tuple(p for p in _string(info, manifest, "entry").split("::") if p != "package")
             deps = {alias: (root / _string(_table(spec, f"{manifest}: {alias}"), manifest, "path")).resolve()
                     for alias, spec in _table(config.get("dependencies", {}), f"{manifest}: dependencies").items()}

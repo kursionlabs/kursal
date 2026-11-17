@@ -766,6 +766,9 @@ RESOLUTION_ERRORS: tuple[tuple[dict[str, str], str], ...] = (
     ({"p/kur.toml": 'package="p"\n', "p/lib.kur": ""}, "p"),
     ({"p/kur.toml": '# no name\n[package]\nsource_root="."\n', "p/lib.kur": ""}, "p"),
     ({"p/kur.toml": '[package]\nname="p"\nsource_root="."\nkind="executable"\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": '[package]\nname="p"\nsource_root="."\nkind="executabl"\nentry="package::main"\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": '[package]\nname="p"\nsource_root="."\nkind="Library"\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": '[package]\nname="p"\nsource_root="."\nkind=1\n', "p/lib.kur": ""}, "p"),
     ({"p/kur.toml": '[package]\nname = "p" # the name\n"source_root" = "."\n[package.x]\n', "p/lib.kur": ""}, "p"),
     ({"one.kur": "fn main() -> i32 { nothing() }\n"}, "one.kur"),
     ({"one.kur": "fn f() -> Nothing { 0i32 }\n"}, "one.kur"),
@@ -1690,6 +1693,34 @@ class CompilerTests(unittest.TestCase):
                                     stderr=subprocess.PIPE, text=True, timeout=TIME_LIMIT, preexec_fn=limit_memory,
                                     env=dict(os.environ, KURSAL_LIB=str(LIB)))
         self.assertEqual((result.returncode, result.stderr), (1, "cannot write the output\n"))
+
+    def test_a_failed_c_compiler_is_reported_as_the_reference_reports_it(self):
+        """`kursal build` and tools/build.py with a C compiler that cannot run, exits with a failure or is
+        killed: status 1, the C compiler's own output, then the same message."""
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            failing, killed, unrunnable = base / "failing-cc", base / "killed-cc", base / "unrunnable-cc"
+            failing.write_text("#!/bin/sh\necho 'cc: broken' >&2\nexit 3\n")
+            killed.write_text("#!/bin/sh\nkill -KILL $$\n")
+            unrunnable.write_text("not a program\n")
+            failing.chmod(0o755)
+            killed.chmod(0o755)
+            cases = ((base / "missing-cc", f"cannot run the C compiler {base / 'missing-cc'} (error 2)\n"),
+                     (unrunnable, f"cannot run the C compiler {unrunnable} (error 13)\n"),
+                     (failing, f"cc: broken\nthe C compiler {failing} exited with status 3\n"),
+                     (killed, f"the C compiler {killed} was killed by signal 9\n"))
+            package = ROOT / "examples/core_only"
+            for compiler, message in cases:
+                with self.subTest(compiler=compiler.name):
+                    env = dict(os.environ, KURSAL_LIB=str(LIB), KURSAL_CC=str(compiler))
+                    ours = subprocess.run([str(self.binary), "build", str(package), "-o", str(base / "ours")],
+                                          capture_output=True, text=True, timeout=TIME_LIMIT, preexec_fn=limit_memory,
+                                          env=env)
+                    reference = subprocess.run([sys.executable, str(ROOT / "reference-compiler/tools/build.py"),
+                                                str(package), str(base / "reference")],
+                                               capture_output=True, text=True, timeout=TIME_LIMIT, env=env)
+                    self.assertEqual((ours.returncode, ours.stdout, ours.stderr), (1, "", message))
+                    self.assertEqual((reference.returncode, reference.stdout, reference.stderr), (1, "", message))
 
     def test_parser_matches_reference(self):
         paths = sorted(p for top in ("lib", "examples", "compiler", "reference-compiler/examples")

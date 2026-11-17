@@ -12,7 +12,8 @@
 // [-o OUTPUT] [--times]` runs the whole pipeline: it lowers and checks the package and makes its C,
 // entered through the package's entry (every root function's C for a library); with OUTPUT, it
 // writes OUTPUT.c and compiles it with the standard library's C helpers into OUTPUT (with
-// $KURSAL_CC, else clang, at -O3), else it prints the C. With --times it prints the time each stage takes, as `tools/build.py --times` does.
+// $KURSAL_CC, else clang, at -O3; a C compiler that cannot run or fails is reported), else it
+// prints the C. With --times it prints the time each stage takes, as `tools/build.py --times` does.
 //
 // Each group of phases keeps what it builds in an arena of its own: the front end (the command
 // line, parsing, resolving, signatures, inference and lowering, or reading KURS), the core
@@ -265,7 +266,8 @@ fn build(&cx: Domain!['k], args: ArenaVec[Span['k], 'k]) -> Handoff['k] {
 
 // The back end, in the arena `cx`, which it destroys: the C of `handoff`'s program, printed or,
 // for `build` with OUTPUT, written to OUTPUT.c and compiled into OUTPUT with the standard
-// library's C helpers. The command's exit status.
+// library's C helpers. The command's exit status: 1 when the C compiler cannot be started, exits
+// with another status than 0 or is killed, which is reported on stderr.
 forall 'k.
 fn back_end(cx: Domain!['k], handoff: Handoff['k], typed: ArenaMap[FunKey['k], ArenaMap[(Span['k], Span['k]), Type['k], 'k], 'k]) -> i32 {
     var cx = cx;
@@ -290,19 +292,34 @@ fn back_end(cx: Domain!['k], handoff: Handoff['k], typed: ArenaMap[FunKey['k], A
         Option::None => Span::from_static(&cx, ""),
     };
     let compiler = if compiler.is_empty() { Span::from_static(&cx, "clang") } else { compiler };
-    // Only the command line, copied into the `Command!`, outlives the arena while `cc` runs.
+    // Only the command line, copied into the `Command!`, and the compiler's name, for a failure,
+    // outlive the arena while `cc` runs.
     let command = Command!::new(&cx, compiler).arg(&cx, Span::from_static(&cx, "-O3")).arg(&cx, Span::from_static(&cx, "-w")).arg(&cx, Span::from_static(&cx, "-fno-builtin"))
         .arg(&cx, c_file).arg(&cx, Buffer!::new().push_bytes(&cx, lib).push_static("/libc/fs.c").save(&cx))
         .arg(&cx, Buffer!::new().push_bytes(&cx, lib).push_static("/libc/thread.c").save(&cx))
         .arg(&cx, Span::from_static(&cx, "-lpthread")).arg(&cx, Span::from_static(&cx, "-o")).arg(&cx, out);
+    let cc = Buffer!::new().push_bytes(&cx, compiler);
     cx.destroy();
-    let built = match command.run() {
-        Result::Ok(exit) => match exit {
-            Exit::Code(code) => code == 0i32,
-            Exit::Signal(number) => false,
-        },
-        Result::Err(e) => false,
-    };
+    let ran = command.run();
     let finished = stage(handoff.times, "cc", started);
-    if built { 0i32 } else { 1i32 }
+    // As `tools/build.py` reports it: the C compiler's own diagnostics are already on stderr.
+    let failure = match ran {
+        Result::Ok(exit) => match exit {
+            Exit::Code(code) => if code == 0i32 {
+                cc.destroy();
+                Option::None
+            } else {
+                Option::Some.(Buffer!::new().push_static("the C compiler ").push_buffer(cc).push_static(" exited with status ").push_i64(code as i64))
+            },
+            Exit::Signal(number) => Option::Some.(Buffer!::new().push_static("the C compiler ").push_buffer(cc).push_static(" was killed by signal ").push_i64(number as i64)),
+        },
+        Result::Err(e) => Option::Some.(Buffer!::new().push_static("cannot run the C compiler ").push_buffer(cc).push_static(" (error ").push_i64(e.errno as i64).push_static(")")),
+    };
+    match failure {
+        Option::None => 0i32,
+        Option::Some(message) => {
+            let printed = print_buffer(2i32, message.push_static("\n"));
+            1i32
+        },
+    }
 }
