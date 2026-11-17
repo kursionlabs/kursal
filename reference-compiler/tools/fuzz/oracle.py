@@ -164,7 +164,9 @@ def compile_and_run(c_file: Path, work: Path, out: Outcome) -> None:
     fast_status, _, fast_err = run([str(fast)], timeout=10)
     checked_status, _, checked_err = run([str(checked)], timeout=30, env=env, limited=False)
     out.ran = True
-    if fast_status is None or checked_status is None:
+    if fast_status is None and checked_status is None:
+        pass  # neither build ends: the program loops, as one does when a mutation moves a loop's step out
+    elif fast_status is None or checked_status is None:
         out.bug, out.detail = RUN_FAILS, "timeout"
     elif "runtime error" in checked_err or "AddressSanitizer" in checked_err:
         line = next((x for x in checked_err.splitlines() if "runtime error" in x or "ERROR:" in x), checked_err)
