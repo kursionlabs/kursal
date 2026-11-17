@@ -1,0 +1,206 @@
+// Atomic operations, memory orderings, a fence and volatile access, each
+// used where it is the right tool, with the reason beside it.
+//
+// Two threads share one heap block of four `u32` words, through a raw
+// pointer each of them captures. A raw pointer grants nothing by itself:
+// every access through it is `unsafe`, and the contract that makes the
+// accesses sound is stated once, on `Words`, and each access says which
+// part of it it relies on.
+//
+// - COUNTER: both threads count their work into it with `fetch_add` at
+//   `Relaxed`. An atomic read-modify-write never loses an increment; no
+//   ordering is needed, because the count carries no other data and `main`
+//   reads it only after `join`, which orders all of a thread's writes
+//   before it.
+// - MESSAGE and READY: the producer writes MESSAGE with a plain store, then
+//   a `Release` fence, then sets READY with a `Relaxed` atomic store. The
+//   consumer spins on READY with an `Acquire` load and then reads MESSAGE
+//   with a plain load. The fence orders the plain store before the flag
+//   (a fence followed by a relaxed store acts as a release store), and the
+//   acquire load that sees the flag makes everything before the fence
+//   visible: the consumer can never read MESSAGE before it is written.
+// - FIRST: each thread, when its work is done, tries `compare_exchange`
+//   from 0 to its own number. Exactly one succeeds, whatever the timing:
+//   the claim of a one-time job. `AcqRel` on success and `Acquire` on
+//   failure order the claim with the rest of each thread's work.
+//
+// Volatile access is not for threads. `wipe_key` clears a secret before
+// its memory goes back to the allocator: a plain store to memory that is
+// freed right after it is dead, and the C compiler may remove it, leaving
+// the key in the heap for the block's next owner. A volatile store is
+// never removed or merged.
+
+use std::alloc::heap::HeapAllocator;
+use std::atomic::{Ordering, fence};
+use std::io::{print, print_buffer};
+use std::mem::sizeof;
+use std::option::Result;
+use std::process::exit;
+use std::ptr::offset;
+use thread::thread;
+
+const COUNTER: usize = 0;
+const MESSAGE: usize = 1;
+const READY: usize = 2;
+const FIRST: usize = 3;
+const WORDS: usize = 4;
+
+// How many times each thread counts.
+const ROUNDS: u32 = 1000;
+
+// The shared block. The contract of `words`, which every access below
+// relies on: it is the base of a live heap block of `WORDS` `u32`s, aligned
+// for `u32` (`malloc` aligns for every type), all zero before either
+// thread starts, and freed only after both are joined; COUNTER, READY and
+// FIRST are accessed only atomically while the threads run, and MESSAGE
+// only by the producer before its fence and by the consumer after its
+// acquire load sees READY.
+exposed struct Words {
+    words: *u32,
+}
+
+// What a thread reports: the message it read (0 for the producer), and
+// whether it won the claim.
+exposed struct Report {
+    message: u32,
+    first: bool,
+}
+
+// The word at `index`. Caller: `index < WORDS`, under the contract of
+// `Words`.
+unsafe fn word(shared: Words, index: usize) -> *u32 {
+    unsafe offset(shared.words, index)
+}
+
+// Counts `ROUNDS` units of work into COUNTER. Caller: as for `word`.
+unsafe fn count(shared: Words) {
+    let counter = unsafe word(shared, COUNTER);
+    var i = 0u32;
+    while i < ROUNDS {
+        // `counter` is the COUNTER word, accessed only atomically.
+        let before = unsafe counter.fetch_add(1u32, Ordering::Relaxed);
+        i = i + 1u32;
+    }
+}
+
+// Claims FIRST for thread `id` (not 0); whether this thread won. Caller:
+// as for `word`.
+unsafe fn claim(shared: Words, id: u32) -> bool {
+    let first = unsafe word(shared, FIRST);
+    // `first` is the FIRST word, accessed only atomically.
+    let (seen, won) = unsafe first.compare_exchange(0u32, id, Ordering::AcqRel, Ordering::Acquire);
+    won
+}
+
+// Counts, publishes the message, and claims. Caller: as for `word`, with
+// this the only thread that writes MESSAGE.
+unsafe fn produce(shared: Words) -> Report {
+    unsafe count(shared);
+    let message = unsafe word(shared, MESSAGE);
+    let ready = unsafe word(shared, READY);
+    // No other thread reads MESSAGE until READY is set, below.
+    unsafe *message = 42u32;
+    // Orders the store to MESSAGE before the store to READY.
+    unsafe fence(Ordering::Release);
+    // `ready` is the READY word, accessed only atomically.
+    let set = unsafe ready.atomic_store(1u32, Ordering::Relaxed);
+    Report.{ message: 0u32, first: unsafe claim(shared, 1u32) }
+}
+
+// Counts, waits for the message and reads it, and claims. Caller: as for
+// `word`, with a producer running that sets READY.
+unsafe fn consume(shared: Words) -> Report {
+    unsafe count(shared);
+    let message = unsafe word(shared, MESSAGE);
+    let ready = unsafe word(shared, READY);
+    // `ready` is the READY word, accessed only atomically; once this load
+    // sees 1, the producer's store to MESSAGE is visible.
+    while unsafe ready.atomic_load(Ordering::Acquire) == 0u32 {}
+    // READY is set, so the producer wrote MESSAGE and no longer touches it.
+    let received = unsafe *message;
+    Report.{ message: received, first: unsafe claim(shared, 2u32) }
+}
+
+// Uses a 16-byte key, then wipes it with volatile stores before freeing
+// its memory; the key's checksum and how many bytes read back as zero.
+fn wipe_key() -> (u32, usize) {
+    let n = 16usize;
+    let key = HeapAllocator::alloc(n).into_raw();
+    var sum = 0u32;
+    var i = 0usize;
+    while i < n {
+        // `key` is the base of the `n`-byte block just allocated, and
+        // `i < n`.
+        let b = unsafe offset(key, i);
+        unsafe *b = ((i * 37usize + 11usize) % 256usize) as u8;
+        sum = sum + (unsafe *b as u32);
+        i = i + 1usize;
+    }
+    var zeros = 0usize;
+    i = 0usize;
+    while i < n {
+        // As above; the block is still live.
+        let b = unsafe offset(key, i);
+        let wiped = unsafe b.store_volatile(0u8);
+        if unsafe b.load_volatile() == 0u8 {
+            zeros = zeros + 1usize;
+        }
+        i = i + 1usize;
+    }
+    // `key` came from `HeapAllocator::alloc` above and has no other owner.
+    HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(key));
+    (sum, zeros)
+}
+
+fn main() -> i32 {
+    let raw = HeapAllocator::alloc(WORDS * sizeof[u32]()).into_raw();
+    let shared = Words.{ words: unsafe (raw as *u32) };
+    var i = 0usize;
+    while i < WORDS {
+        // No thread has started: plain stores, which `spawn` orders before
+        // everything the threads do.
+        let w = unsafe word(shared, i);
+        unsafe *w = 0u32;
+        i = i + 1usize;
+    }
+
+    // `shared` meets the contract of `Words` until both threads are joined
+    // below; `produce` is the only writer of MESSAGE.
+    let producer = match thread::spawn(|| -> Report { unsafe produce(shared) }) {
+        Result::Err(failed) => {
+            print(2, "atomics: cannot start a thread\n");
+            exit(1)
+        },
+        Result::Ok(t) => t,
+    };
+    let consumer = match thread::spawn(|| -> Report { unsafe consume(shared) }) {
+        Result::Err(failed) => {
+            print(2, "atomics: cannot start a thread\n");
+            exit(1)
+        },
+        Result::Ok(t) => t,
+    };
+    let none = Report.{ message: 0u32, first: false };
+    let produced = match producer.join() {
+        Result::Ok(report) => report,
+        Result::Err(error) => none,
+    };
+    let consumed = match consumer.join() {
+        Result::Ok(report) => report,
+        Result::Err(error) => none,
+    };
+
+    // Both threads are joined: plain loads see all they wrote.
+    let total = unsafe *unsafe word(shared, COUNTER);
+    // Nothing reads the block any more, and it came from `alloc` above.
+    HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(raw));
+
+    let winners = (if produced.first { 1u32 } else { 0u32 }) + (if consumed.first { 1u32 } else { 0u32 });
+    let expected = 2u32 * ROUNDS;
+    print_buffer(1, f"counter: {total} of {expected} increments\n");
+    print_buffer(1, f"message: {consumed.message}, read after the flag\n");
+    print_buffer(1, f"claim: won by {winners} of 2 threads\n");
+    let (sum, zeros) = wipe_key();
+    print_buffer(1, f"key: checksum {sum}, {zeros} of 16 bytes wiped before free\n");
+    0
+}

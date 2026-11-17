@@ -66,9 +66,17 @@ HOST_OUT = (
     "float 4.9e-324: 1 f32 0\nfloat  1: none\nfloat 1x: none\nfloat : none\n"
 )
 
-# Each program's runs, in order and sharing one directory: (arguments, stdin, stdout, exit status).
-# `{file}` in the arguments is SAMPLE written beside the build; `{store}` is a path there, missing at first.
-RUNS = {
+CONSTS_OUT = ("6 rows, every 20 degrees:\n0 C = 32 F\n20 C = 68 F\n40 C = 104 F\n60 C = 140 F\n80 C = 176 F\n"
+              "100 C = 212 F\na u8 holds 0 to 255; an i32 has 32 bits\n")
+ATOMICS_OUT = ("counter: 2000 of 2000 increments\nmessage: 42, read after the flag\nclaim: won by 1 of 2 threads\n"
+               "key: checksum 1800, 16 of 16 bytes wiped before free\n")
+SHOP_OUT = ("a shelf for 10\ndeliver 8: 8 in stock\nsell 3: 5 in stock\ncannot sell 7: only 5 in stock\n"
+            "cannot deliver 6: room for 5\n")
+
+# Each program's runs, in order and sharing one directory: (arguments, stdin, stdout, exit status), and the
+# stderr expected after them, where it is checked. `{file}` in the arguments is SAMPLE written beside the
+# build; `{store}` is a path there, missing at first.
+RUNS: dict[str, tuple[tuple, ...]] = {
     "wordfreq": (((), "the cat and the hat\nThe cat sat.\n", "cat 2\nthe 2\nThe 1\nand 1\nhat 1\nsat 1\n", 0),),
     "calc": (((), "1 + 2 * 3\n(1 + 2) * 3\n-4 * -(2 - 5)\n10 / (5 - 5)\n2 +\n",
               "7\n9\n-12\ndivision by zero at column 4\nexpected a number or '(' at column 4\n", 2),),
@@ -105,6 +113,17 @@ RUNS = {
         ((), "", "", 0),
     ),
     "blockalloc": (((), "", BLOCKALLOC_OUT, 0),),
+    "config": (
+        ((), 'name = "demo"\n[server]\nhost = "example.org"\nport = 8080\ndebug = true\n',
+         "name: demo\nserver: example.org:8080\ndebug: on\n", 0, ""),
+        ((), "", "name: unnamed\nserver: localhost:80\ndebug: off\n", 0, ""),
+        ((), 'name = "x"\n[server]\nport = 80 80\n', "", 1,
+         "config: line 3, column 11: expected a newline or the end after a statement\n"),
+        ((), '[server]\nport = "high"\n', "", 1, "config: server.port must be an integer (found string)\n"),
+    ),
+    "shop": (((), "", SHOP_OUT, 0),),
+    "consts": (((), "", CONSTS_OUT, 0),),
+    "atomics": (((), "", ATOMICS_OUT, 0),),
     "iter_for_loops": (((), "", "0 2 4 6 8 \n1\t2\t3\t\n2\t4\t6\t\n3\t6\t9\t\n"
                                 "first square over 50: 64\nweighted total: 320\n", 0),),
     "iter_custom": (((), "", "0 1 1 2 3 5 8 13 21 34 55 89 \n"
@@ -136,7 +155,8 @@ RUNS = {
     "format_trait": (((), "", "point: (3, 4)\ncolor: rgb(255, 128, 0)\n", 0),),
     "functions": (((), "", "", 0),),
     "generic_capabilities": (((), "", "", 20),),
-    "graph": (((), "", "", 0),),
+    "graph": (((), "", "from node 0, around the cycle 0 -> 1 -> 2 -> 0 and on to 3: 4 nodes\nfrom node 3: 1 node\n"
+                       "from node 0, once 3 -> 4 is added: 5 nodes\n", 0),),
     "greet": (((), "Ada\n", "What's your name?\nHello, Ada!\n", 0),),
     "iter_basics": (((), "", "", 0),),
     "iter_combinators": (((), "", "", 0),),
@@ -147,7 +167,7 @@ RUNS = {
     "modules": (((), "", "", 0),),
     "non_null": (((), "", "", 0),),
     "sayhi": (((), "", "Hello, !\n", 0),),
-    "thread_sum": (((), "", "", 126),),
+    "thread_sum": (((), "", 'first thread, "hello": 532\nsecond thread, "world!!": 618\ntotal: 1150\n', 0),),
     "traits": (((), "", "", 0),),
     "tuple_decl": (((), "", "", 0),),
     "zero_size": (((), "", "", 0),),
@@ -158,14 +178,19 @@ REJECTED = {
     "branch_inconsistent.kur": "linear value 'h' remains live on some paths",
     "close_by_number.kur": "calling an unsafe function requires unsafe authorization",
     "double_use_handle.kur": "value 'h' has been moved",
+    "forged_file.kur": "the shape of std::io::File! is not exposed here",
     "implicit_package_open.kur": "pattern does not match \\(exists",
     "implicit_package_open_assignment.kur": "type mismatch: \\(exists",
     "implicit_package_open_plain_let.kur": "a struct pattern needs a struct, not \\(exists",
     "leaked_handle.kur": "linear value 'h' is not consumed before return",
     "linear_in_arena.kur": "type argument must satisfy Copy",
     "mismatched_skolem.kur": "type mismatch",
+    "non_exhaustive_match.kur": "a match must cover every enum variant",
+    "overlapping_instances.kur": "overlapping instances of overlapping_instances::Describe: \\(u32\\) and \\(T\\)",
+    "private_import.kur": "unknown or private member File! of fs",
     "ref_after_remove_in.kur": "type mismatch: \\$b#open[0-9]+ and \\$a#open",
     "safe_adopt.kur": "calling an unsafe function requires unsafe authorization",
+    "type_mismatch.kur": "type mismatch: bool and u32",
     "unbound_result_brand.kur": "brand '1 is not in scope",
     "while_consume_without_replacement.kur": "linear value 'h' remains live on some paths to while",
 }
@@ -208,13 +233,15 @@ class ExampleTests(unittest.TestCase):
             for name, executable, error in built:
                 with self.subTest(example=name):
                     self.assertEqual(error, "")
-                    for args, stdin, stdout, status in RUNS.get(name, ()):
+                    for args, stdin, stdout, status, *stderr in RUNS.get(name, ()):
                         args = [a.replace("{file}", str(sample)).replace("{store}", str(store)) for a in args]
                         assert executable is not None
                         result = subprocess.run([str(executable), *args], input=stdin, capture_output=True,
                                                 text=True, timeout=60, cwd=out)
                         self.assertEqual((result.stdout, result.returncode),
                                          (stdout.replace("{file}", str(sample)), status), args)
+                        if stderr:
+                            self.assertEqual(result.stderr, stderr[0], args)
 
     def test_bad_examples_are_rejected_for_their_reason(self):
         sys.setrecursionlimit(20000)

@@ -1,0 +1,112 @@
+// Reads a small TOML configuration from stdin with the `toml` package and
+// prints the settings it gives, filling in defaults:
+//
+//     name = "demo"
+//     [server]
+//     host = "example.org"
+//     port = 8080
+//     debug = true
+//
+// A document that is not TOML is reported with the line and column where
+// the parser stopped and its reason; a setting of the wrong type is
+// reported by name. Either way the program exits with status 1.
+//
+// The document is read into one arena (`Domain!`): every table and string
+// the parser gives back is a view into it, and destroying the arena frees
+// them all at once.
+
+use std::alloc::arena::Domain!;
+use std::bytes::buffer::Buffer!;
+use std::collections::arena_map::ArenaMap;
+use std::io::{print_buffer, read_all_stdin};
+use std::option::{Option, Result};
+use std::raw::Span;
+use std::slice::Slice;
+use toml::parse;
+use toml::value::{TomlValue, line_column};
+
+// The value at `key` of `table`, or `None` when it has none.
+forall 'k.
+fn setting(&cx: Domain!['k], table: ArenaMap[Span['k], TomlValue['k], 'k], key: Slice[u8, 'static]) -> Option[TomlValue['k]] {
+    table.get(&cx, Span::from_static(&cx, key))
+}
+
+// The message for a setting of the wrong type.
+forall 'k.
+fn wrong_type(value: TomlValue['k], key: Slice[u8, 'static], wanted: Slice[u8, 'static]) -> Buffer! {
+    f"config: {key} must be {wanted} (found {value.type_name()})\n"
+}
+
+// The settings in `root` as the lines to print, or why they cannot be used.
+forall 'k.
+fn settings(&cx: Domain!['k], root: ArenaMap[Span['k], TomlValue['k], 'k]) -> Result[Buffer!, Buffer!] {
+    let name = match setting(&cx, root, "name") {
+        Option::None => Span::from_static(&cx, "unnamed"),
+        Option::Some(value) => match value.as_string() {
+            Option::Some(s) => s,
+            Option::None => return Result::Err.(wrong_type(value, "name", "a string")),
+        },
+    };
+    let server = match setting(&cx, root, "server") {
+        Option::None => ArenaMap::new(&cx),
+        Option::Some(value) => match value.as_table() {
+            Option::Some(t) => t,
+            Option::None => return Result::Err.(wrong_type(value, "server", "a table")),
+        },
+    };
+    let host = match setting(&cx, server, "host") {
+        Option::None => Span::from_static(&cx, "localhost"),
+        Option::Some(value) => match value.as_string() {
+            Option::Some(s) => s,
+            Option::None => return Result::Err.(wrong_type(value, "server.host", "a string")),
+        },
+    };
+    let port = match setting(&cx, server, "port") {
+        Option::None => 80i64,
+        Option::Some(value) => match value.as_integer() {
+            Option::Some(n) => n,
+            Option::None => return Result::Err.(wrong_type(value, "server.port", "an integer")),
+        },
+    };
+    let debug = match setting(&cx, server, "debug") {
+        Option::None => false,
+        Option::Some(value) => match value.as_bool() {
+            Option::Some(b) => b,
+            Option::None => return Result::Err.(wrong_type(value, "server.debug", "a boolean")),
+        },
+    };
+    let mode = if debug { "on" } else { "off" };
+    Result::Ok.(Buffer!::new().push_static("name: ").push_bytes(&cx, name).push_static("\nserver: ").push_bytes(&cx, host)
+        .push_static(":").push_i64(port).push_static("\ndebug: ").push_static(mode).push_static("\n"))
+}
+
+fn main() -> i32 {
+    let text = match read_all_stdin() {
+        Result::Ok(text) => text,
+        Result::Err(e) => {
+            print_buffer(2, f"config: cannot read stdin (error {e.errno})\n");
+            return 1;
+        },
+    };
+    let exists 'k. cx = Domain!::new();
+    var cx = cx;
+    let source = text.save(&cx);
+    let report = match parse(&cx, source) {
+        Result::Err(e) => {
+            let (line, column) = line_column(&cx, source, e.offset);
+            Result::Err.(f"config: line {line}, column {column}: {e.message}\n")
+        },
+        Result::Ok(root) => settings(&cx, root),
+    };
+    cx.destroy();
+    match report {
+        Result::Ok(lines) => {
+            print_buffer(1, lines);
+            0
+        },
+        Result::Err(message) => {
+            print_buffer(2, message);
+            1
+        },
+    }
+}
