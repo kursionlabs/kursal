@@ -1510,7 +1510,8 @@ class CompilerTests(unittest.TestCase):
         for path in [*packages, *singles, COMPILER]:
             with self.subTest(path=str(path.relative_to(ROOT))):
                 expected = reference_resolution(path)
-                self.assertFalse(expected.startswith("error:"), expected)
+                # A rejected program may be rejected here: one in examples/bad/ reaches a private name.
+                self.assertEqual(expected.startswith("error:"), path.name == "private_import.kur", expected)
                 self.assertEqual(self.compiler_resolution(path), expected)
 
     def run_batches(self, command: str, paths: list[Path]) -> list[str]:
