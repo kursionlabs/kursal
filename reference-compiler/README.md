@@ -187,3 +187,33 @@ End-to-end tests build C with the command of `kursal/cc.py` (`$KURSAL_CC`, else 
 `-O3 -w -fno-builtin`), the one `tools/build.py` and the self-hosted compiler use, and run it; each
 test program's exit code is a checksum of its behavior. The C's requirements of its C compiler and
 target are in [`compiler/README.md`](../compiler/README.md), "The C compiler".
+
+## Fuzzing
+
+`tools/fuzz` generates and mutates programs and runs each through both compilers, looking for, in
+order: a program the front end accepts whose lowered KURS the checker rejects (the front end must
+reject it first, with a message about the source); a crash, trap or timeout of either compiler; the
+two compilers disagreeing on a verdict, a message, the KURS or the C; and C that does not compile,
+or that behaves differently at `-O3` and at `-O0` under `-fsanitize=undefined,address`.
+
+```bash
+uv run python -m tools.fuzz corpus --out CORPUS.json      # the packages the tests lower, to mutate
+uv run python -m tools.fuzz run --seed 1 --minutes 25 --count 100000 --out OUT \
+    --selfhost ../bin/kursal --execute --corpus CORPUS.json --minimize -j 8
+uv run python -m tools.fuzz show --seed 1000003           # the program one seed makes
+uv run python -m tools.fuzz one FILE.kur --prelude --selfhost ../bin/kursal   # one program's outcome
+uv run python -m tools.fuzz minimize OUT/findings/CLASS-HASH/seedN --out MIN  # delta debugging
+```
+
+`gen.py` writes well-typed programs over a prelude of linear and `Copy` structs and enums, a branded
+tag and its consumers and lenders, tracking which locals hold values, so that a linear value is
+consumed once on every path, a place parameter is full at every return, branches end alike, a loop
+body leaves the state it found and an early return consumes what is live; it also writes probes the
+front end must reject, such as one call lending overlapping places. `mutate.py` drops, duplicates,
+swaps and moves statements, inserts returns and traps, wraps statements in branches and loops, and
+turns lends into moves and back, in generated programs, examples and the corpus. `reduce.py`
+minimizes a finding by ddmin over statements, then words, keeping its bug class and normalized
+message. A campaign is deterministic for its seed and count, and runs a snapshot of this compiler
+and a copy of the self-hosted binary taken when it starts. Every compiler run has a timeout and a
+memory limit; run a campaign as one job in a memory-capped scope, like the repository's other heavy
+jobs.
