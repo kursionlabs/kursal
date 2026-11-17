@@ -13,7 +13,7 @@ from itertools import count
 
 from . import core as C
 from .sexpr import KursError
-from .check import overlap
+from .check import ancestor_in, overlap
 from .types import Types, free_brands, subst
 
 
@@ -124,8 +124,8 @@ def promote_locals(fun: C.Fun, types: Types, params: Sequence[C.Param],
             if q in held:
                 del held[q]
                 held[q + '.' + variant] = path_types[q + '.' + variant]
-        contents = {} if block is fun.blocks[0] else {p: fresh() for p in held
-                    if not any(p == z or p.startswith(z + '.') for z in block.empty)}
+        empty = set(block.empty)
+        contents = {} if block is fun.blocks[0] else {p: fresh() for p in held if not ancestor_in(empty, p)}
         if block.label in arms:
             q, variant = arms[block.label]
             if refined[block.label].get(q) != variant:

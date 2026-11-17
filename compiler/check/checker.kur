@@ -154,10 +154,16 @@ fn overlap(&cx: Domain!['k], path: Span['k], other_path: Span['k]) -> bool {
     prefix(&cx, path, other_path) || prefix(&cx, other_path, path)
 }
 
-// Some path of `paths` is `path` or an ancestor of it: `paths.any(|z| prefix(z, path))`, answered
-// by looking up `path` and each of its ancestors rather than by scanning the set.
+// The root `path` starts at: its first segment.
 forall 'k.
-fn ancestor_in(&cx: Domain!['k], paths: ArenaSet[Span['k], 'k], path: Span['k]) -> bool {
+fn root_of(&cx: Domain!['k], path: Span['k]) -> Span['k] {
+    path.slice(0usize, segment_end(&cx, path, 0usize))
+}
+
+// Some path of `paths` is a proper ancestor of `path`, answered by looking up each of its ancestors
+// rather than by scanning the set.
+forall 'k.
+fn strict_ancestor_in(&cx: Domain!['k], paths: ArenaSet[Span['k], 'k], path: Span['k]) -> bool {
     if paths.is_empty(&cx) {
         return false;
     }
@@ -171,7 +177,13 @@ fn ancestor_in(&cx: Domain!['k], paths: ArenaSet[Span['k], 'k], path: Span['k]) 
         found = paths.contains(&cx, path.slice(0usize, at));
         dot = path.find_byte(&cx, b'.', at + 1usize);
     }
-    found || paths.contains(&cx, path)
+    found
+}
+
+// Some path of `paths` is `path` or an ancestor of it: `paths.any(|z| prefix(z, path))`.
+forall 'k.
+fn ancestor_in(&cx: Domain!['k], paths: ArenaSet[Span['k], 'k], path: Span['k]) -> bool {
+    paths.contains(&cx, path) || strict_ancestor_in(&cx, paths, path)
 }
 
 forall 'k.
@@ -386,6 +398,39 @@ impl Places['k] {
                 Option::None => (),
             };
             j = j + 1usize;
+        }
+    }
+
+    // Empties each of `roots`, none of which has a view opened at or below it, and forgets what is
+    // known below them: `empty` and `forget` for each, in one pass over the state.
+    fn forget_roots(self, &cx: Domain!['k], roots: ArenaSet[Span['k], 'k]) {
+        var i = 0usize;
+        while i < self.empty.positions(&cx) {
+            match self.empty.key_at(&cx, i) {
+                Option::Some(p) => if roots.contains(&cx, root_of(&cx, p)) {
+                    self.empty.remove(&cx, p);
+                },
+                Option::None => (),
+            };
+            i = i + 1usize;
+        }
+        i = 0usize;
+        while i < roots.positions(&cx) {
+            match roots.key_at(&cx, i) {
+                Option::Some(root) => { self.empty.insert(&cx, root); },
+                Option::None => (),
+            };
+            i = i + 1usize;
+        }
+        i = 0usize;
+        while i < self.known.positions(&cx) {
+            match self.known.key_at(&cx, i) {
+                Option::Some(q) => if roots.contains(&cx, root_of(&cx, q)) {
+                    self.known.remove(&cx, q);
+                },
+                Option::None => (),
+            };
+            i = i + 1usize;
         }
     }
 

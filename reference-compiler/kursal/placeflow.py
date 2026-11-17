@@ -13,7 +13,7 @@ the lowered program before passing it and the resulting checker to emit_c.
 from typing import Never, Optional
 
 from . import core as C
-from .check import Checker, CheckError, Places, overlap, prefix
+from .check import Checker, CheckError, Places, overlap, prefix, root_of, strict_ancestor_in
 from .types import free_brands
 from .sexpr import KursError, Position
 
@@ -44,27 +44,33 @@ class PlaceFlow(Checker):
         blocks = {b.label: b for b in fun.blocks}
         header: dict[str, Places] = {}
         global_brands = {p.name for p in params if p.kind == C.BRAND} | {"static"}
+        # The locals whose types mention brands other than the global ones, with those brands; and
+        # whether each is Copy, once asked.
+        branded = [(root, brands, ty) for root, ty in fun.locals if not (brands := free_brands(ty)) <= global_brands]
+        copy: dict[str, bool] = {}
+
+        def copy_local(root: str, ty: C.Type) -> bool:
+            if root not in copy:
+                copy[root] = self.copy_type(ty)
+            return copy[root]
+
         self.places = Places()
-        work = [(entry, Places(empty={n for n, _ in fun.locals}))]
-        while work:
-            block, incoming = work.pop()
-            if block is not entry:
-                state = header.get(block.label)
-                if state is None:
-                    header[block.label] = state = incoming.copy()
-                else:
-                    merged = Places(state.empty | incoming.empty,
-                                    {p: v for p, v in state.known.items() if incoming.known.get(p) == v},
-                                    dict(state.opened))
-                    merged.keep_opened({p: b for p, b in state.opened.items() if incoming.opened.get(p) == b})
-                    self.abstract_variants(merged, state, incoming)
-                    if merged == state:
-                        continue
-                    header[block.label] = state = merged
-                places = state.copy()
-            else:
-                places = incoming
-            self.places = places
+        # The blocks in reverse postorder, and the blocks whose header changed since they were last
+        # simulated: the walk takes the first of those, so a block runs once every edge into it
+        # from earlier in that order has brought its state, and again only around a loop.
+        order = self.reverse_postorder(fun, blocks)
+        rank = {block.label: i for i, block in enumerate(order)}
+        dirty = [False] * len(order)
+        dirty[0] = True
+        header[entry.label] = Places(empty={n for n, _ in fun.locals})
+        at = 0
+        while at < len(order):
+            if not dirty[at]:
+                at += 1
+                continue
+            dirty[at] = False
+            block = order[at]
+            self.places = places = header[block.label].copy()
             self.simulate(block)
             for edge, arm_known in self.edges(block):
                 target = blocks[edge.target]
@@ -77,14 +83,15 @@ class PlaceFlow(Checker):
                                         if isinstance(t, C.Skolem) and t.label == b}
                 # Existing edge entailment permits forgetting Copy contents.
                 # A dead local brand need not survive in an unreadable slot.
-                for root, ty in fun.locals:
-                    if not free_brands(ty) <= kept and self.copy_type(ty):
-                        if not any(prefix(root, p) for p in out.opened):
-                            out.empty = {p for p in out.empty if not prefix(root, p)} | {root}
-                            out.forget(root)
+                forgotten = {root for root, brands, ty in branded if not brands <= kept and copy_local(root, ty)}
+                if forgotten:
+                    forgotten -= {root_of(p) for p in out.opened}
+                    out.forget_roots(forgotten)
                 opened = {p: tuple(rename.get(b, b) for b in brands) for p, brands in out.opened.items()}
                 out.keep_opened({p: brands for p, brands in opened.items() if set(brands) <= available})
-                work.append((target, out))
+                if self.arrive(header, target, out):
+                    dirty[rank[target.label]] = True
+                    at = min(at, rank[target.label])
         for block in fun.blocks:
             state = header.get(block.label)
             if state is not None and block is not entry:
@@ -93,7 +100,43 @@ class PlaceFlow(Checker):
                 block.opened = tuple(sorted(state.opened.items()))
 
         if diagnose:
-            self.diagnose_places(fun, set(header) | {entry.label})
+            self.diagnose_places(fun, set(header))
+
+    @staticmethod
+    def reverse_postorder(fun: C.Fun, blocks: dict[str, C.Block]) -> list[C.Block]:
+        """The blocks the entry reaches, in reverse postorder of a depth-first walk that takes each block's
+        edges in order."""
+        post: list[C.Block] = []
+        seen = {fun.blocks[0].label}
+        stack = [(fun.blocks[0], iter(PlaceFlow.edges(fun.blocks[0])))]
+        while stack:
+            block, edges = stack[-1]
+            for edge, _known in edges:
+                if edge.target not in seen:
+                    seen.add(edge.target)
+                    target = blocks[edge.target]
+                    stack.append((target, iter(PlaceFlow.edges(target))))
+                    break
+            else:
+                stack.pop()
+                post.append(block)
+        return post[::-1]
+
+    def arrive(self, header: dict[str, Places], block: C.Block, incoming: Places) -> bool:
+        """Merges `incoming` into `block`'s header; whether the header changed."""
+        state = header.get(block.label)
+        if state is None:
+            header[block.label] = incoming
+            return True
+        merged = Places(state.empty | incoming.empty,
+                        {p: v for p, v in state.known.items() if incoming.known.get(p) == v},
+                        dict(state.opened))
+        merged.keep_opened({p: b for p, b in state.opened.items() if incoming.opened.get(p) == b})
+        self.abstract_variants(merged, state, incoming)
+        if merged == state:
+            return False
+        header[block.label] = merged
+        return True
 
     def ownership_error(self, path: str, message: str, pos: Optional[Position], *, origin: bool = False) -> Never:
         root, dot, fields = path.removeprefix("&").partition(".")
@@ -173,8 +216,7 @@ class PlaceFlow(Checker):
                 if discardable:
                     merged.empty = {p for p in merged.empty if not prefix(path, p)} | {path}
                     merged.forget(path)
-            merged.empty = {p for p in merged.empty
-                            if not any(q != p and prefix(q, p) for q in merged.empty)}
+            merged.empty = {p for p in merged.empty if not strict_ancestor_in(merged.empty, p)}
         finally:
             self.places = saved
 
@@ -259,7 +301,8 @@ class PlaceFlow(Checker):
                 self.ownership_error(nested[0], "'{name}' and another part of a place are lent by one call, but "
                                      "they do not part at a struct or tuple field reached through no enum", pos)
 
-    def edges(self, block: C.Block) -> list[tuple[C.Edge, Optional[tuple[str, str]]]]:
+    @staticmethod
+    def edges(block: C.Block) -> list[tuple[C.Edge, Optional[tuple[str, str]]]]:
         t = block.term
         if isinstance(t, C.Jmp):
             return [(t.edge, None)]

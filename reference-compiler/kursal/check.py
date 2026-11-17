@@ -64,13 +64,33 @@ def canonical_tuple_index(segment: str, arity: int) -> Optional[int]:
 
 
 def prefix(parent: str, other_path: str) -> bool:
-    """`parent` is an ancestor of `other_path`, or the path itself."""
-    a, b = segments(parent), segments(other_path)
-    return b[:len(a)] == a
+    """`parent` is an ancestor of `other_path`, or the path itself: its segments begin `other_path`'s. A segment
+    holds no `.`, so this compares characters without splitting."""
+    return other_path.startswith(parent) and (len(other_path) == len(parent) or other_path[len(parent)] == ".")
+
+
+def root_of(path: str) -> str:
+    """The root a path starts at: its first segment."""
+    return path.partition(".")[0]
 
 
 def overlap(path: str, other_path: str) -> bool:
     return prefix(path, other_path) or prefix(other_path, path)
+
+
+def strict_ancestor_in(paths: Set[str], path: str) -> bool:
+    """Some path of `paths` is a proper ancestor of `path`: looked up by each ancestor, not by scanning `paths`."""
+    dot = path.find(".")
+    while dot >= 0:
+        if path[:dot] in paths:
+            return True
+        dot = path.find(".", dot + 1)
+    return False
+
+
+def ancestor_in(paths: Set[str], path: str) -> bool:
+    """Some path of `paths` is `path` or an ancestor of it: `any(prefix(z, path) for z in paths)`."""
+    return path in paths or strict_ancestor_in(paths, path)
 
 
 @dataclass
@@ -84,7 +104,7 @@ class Places:
         return Places(set(self.empty), dict(self.known), dict(self.opened))
 
     def covered(self, path: str) -> bool:
-        return any(prefix(z, path) for z in self.empty)
+        return ancestor_in(self.empty, path)
 
     def full(self, path: str) -> bool:
         return not any(overlap(z, path) for z in self.empty)
@@ -92,6 +112,12 @@ class Places:
     def forget(self, path: str, keep_own_view: bool = True) -> None:
         self.known = {q: v for q, v in self.known.items() if not prefix(path, q)}
         self.opened = {q: b for q, b in self.opened.items() if not prefix(path, q) or (keep_own_view and q == path)}
+
+    def forget_roots(self, roots: Set[str]) -> None:
+        """Empties each of `roots`, none of which has a view opened at or below it, and forgets what is known
+        below them: `empty` and `forget` for each, in one pass over the state."""
+        self.empty = {p for p in self.empty if root_of(p) not in roots} | roots
+        self.known = {q: v for q, v in self.known.items() if root_of(q) not in roots}
 
     def keep_opened(self, wanted: dict[str, tuple[str, ...]]) -> None:
         """Retain views only when all their opened ancestors are retained too."""

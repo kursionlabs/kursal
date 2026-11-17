@@ -20,14 +20,15 @@ use std::mem::Ref;
 use std::raw::Span;
 use std::alloc::arena::Domain!;
 use std::bytes::buffer::Buffer!;
-use package::check::checker::{Checker, Places, overlap, prefix};
+use package::check::checker::{Checker, Places, overlap, prefix, root_of, strict_ancestor_in};
 use package::kurs::core::{Block, Edge, Fun, Kind, Known, Opened, Param, Program, Terminator, Type};
 use package::kurs::core as C;
 use package::resolve::resolver::Resolver;
 use package::syntax::ast::Pos;
 use package::types::ops::{Fresh, free_brands};
-use std::collections::vec::{OwnedVec!, Popped!};
 use package::support::base::fail;
+use std::collections::hashmap::OwnedMap!;
+use std::collections::vec::{OwnedVec!, Popped!};
 use std::option::{Option, Result};
 use std::slice::Slice;
 
@@ -44,8 +45,12 @@ exposed struct Plan {
     local_copy: ArenaVec[Option[bool], 'k],
     // the locals whose types mention brands other than `global`
     branded: ArenaVec[usize, 'k],
-    // the state each block other than the entry starts in, so far
+    // the state each block starts in, so far
     header: ArenaMap[Span['k], Places['k], 'k],
+    // block index -> its place in the reverse postorder the walk follows, for a block the entry
+    // reaches; and, by that place, whether the block's header changed since it last ran
+    rank: ArenaVec[usize, 'k],
+    dirty: ArenaVec[bool, 'k],
 }
 
 forall 'k.
@@ -175,25 +180,6 @@ fn clear_below(&cx: Domain!['k], empty: ArenaSet[Span['k], 'k], path: Span['k]) 
     }
 }
 
-// Some other path of `empty` is an ancestor of `p`. A root has none.
-forall 'k.
-fn covered_by_other(&cx: Domain!['k], empty: ArenaSet[Span['k], 'k], p: Span['k]) -> bool {
-    if !p.contains(&cx, Span::from_static(&cx, ".")) {
-        return false;
-    }
-    var k = 0usize;
-    while k < empty.positions(&cx) {
-        match empty.key_at(&cx, k) {
-            Option::Some(q) => if !q.eq(&cx, p) && prefix(&cx, q, p) {
-                return true;
-            },
-            Option::None => (),
-        };
-        k = k + 1usize;
-    }
-    false
-}
-
 // Keeps only the outermost paths of `empty`. Removing a path that has an ancestor leaves the
 // outermost ancestor, so the paths left over answer the same.
 forall 'k.
@@ -201,7 +187,7 @@ fn outermost(&cx: Domain!['k], empty: ArenaSet[Span['k], 'k]) {
     var i = 0usize;
     while i < empty.positions(&cx) {
         match empty.key_at(&cx, i) {
-            Option::Some(p) => if covered_by_other(&cx, empty, p) {
+            Option::Some(p) => if strict_ancestor_in(&cx, empty, p) {
                 empty.remove(&cx, p);
             },
             Option::None => (),
@@ -216,7 +202,7 @@ fn is_outermost(&cx: Domain!['k], empty: ArenaSet[Span['k], 'k]) -> bool {
     var i = 0usize;
     while i < empty.positions(&cx) {
         match empty.key_at(&cx, i) {
-            Option::Some(p) => if covered_by_other(&cx, empty, p) {
+            Option::Some(p) => if strict_ancestor_in(&cx, empty, p) {
                 return false;
             },
             Option::None => (),
@@ -224,6 +210,48 @@ fn is_outermost(&cx: Domain!['k], empty: ArenaSet[Span['k], 'k]) -> bool {
         i = i + 1usize;
     }
     true
+}
+
+// The blocks the entry of `plan`'s function reaches, by index, in reverse postorder of a
+// depth-first walk that takes each block's edges in order.
+forall 'k.
+fn reverse_postorder(&cx: Domain!['k], plan: Plan['k]) -> ArenaVec[usize, 'k] {
+    let fun = plan.fun;
+    let post: ArenaVec[usize, 'k] = ArenaVec::new(&cx);
+    // The walk's path, each block on it with the edge it takes next, and the blocks it has seen:
+    // its own, freed when it ends.
+    var path = OwnedVec!::new[(usize, usize)]().push((0usize, 0usize));
+    var seen = OwnedMap!::new[usize, bool]();
+    let fresh = &seen.insert(0usize, true);
+    var going = true;
+    while going {
+        match &path.pop() {
+            Popped!::Item(top) => {
+                let (b, e) = top;
+                let block = fun.blocks.at(&cx, b);
+                if e < edge_count(&cx, block) {
+                    path = path.push((b, e + 1usize));
+                    let (edge, _known) = edge_at(&cx, block, e);
+                    let t = plan.index.at(&cx, edge.target);
+                    match &seen.insert(t, true) {
+                        Option::None => {
+                            path = path.push((t, 0usize));
+                        },
+                        Option::Some(old) => (),
+                    };
+                } else {
+                    post.push(&cx, b);
+                }
+            },
+            Popped!::Empty => {
+                going = false;
+            },
+        };
+    }
+    path.free();
+    seen.free();
+    post.reverse(&cx);
+    post
 }
 
 forall 'k.
@@ -365,34 +393,40 @@ impl PlaceFlow['k] {
             i = i + 1usize;
         }
         let header: ArenaMap[Span['k], Places['k], 'k] = ArenaMap::new(&cx);
-        let plan = Plan.{ fun, index, global, local_brands, local_copy, branded, header };
+        header.insert(&cx, entry.label, locals_empty(&cx, fun));
+        let rank = ArenaVec::filled(&cx, fun.blocks.len(&cx), 0usize);
+        let plan = Plan.{ fun, index, global, local_brands, local_copy, branded, header, rank, dirty: ArenaVec::new(&cx) };
         c.places.set(&cx, Places::new(ArenaSet::new(&cx), ArenaMap::new(&cx), ArenaMap::new(&cx)));
-        // The blocks to visit, with the state reaching each: the walk's own, freed when it ends.
-        var work = OwnedVec!::new[(usize, Places['k])]().push((0usize, locals_empty(&cx, fun)));
-        var going = true;
-        while going {
-            match &work.pop() {
-                Popped!::Item(next) => {
-                    let (b, incoming) = next;
-                    match self.arrive(&cx, plan, b, incoming) {
-                        Option::Some(places) => {
-                            // The block runs in the scratch state; it leaves in a state of its own
-                            // only when it changed what it started in.
-                            self.working.load(&cx, places);
-                            c.places.set(&cx, self.working);
-                            let changed = self.simulate(&cx, fun.blocks.at(&cx, b), false);
-                            let leaving = if changed { self.working.copy(&cx) } else { places };
-                            self.leave(&cx, plan, &work, fun.blocks.at(&cx, b), leaving);
-                        },
-                        Option::None => (),
-                    };
-                },
-                Popped!::Empty => {
-                    going = false;
-                },
-            };
+        // The walk takes the first block, in reverse postorder, whose header changed since it last
+        // ran: a block runs once every edge into it from earlier in that order has brought its
+        // state, and again only around a loop.
+        let order = reverse_postorder(&cx, plan);
+        i = 0usize;
+        while i < order.len(&cx) {
+            rank.set(&cx, order.at(&cx, i), i);
+            plan.dirty.push(&cx, i == 0usize);
+            i = i + 1usize;
         }
-        work.free();
+        var at = 0usize;
+        while at < order.len(&cx) {
+            if plan.dirty.at(&cx, at) {
+                plan.dirty.set(&cx, at, false);
+                let block = fun.blocks.at(&cx, order.at(&cx, at));
+                let places = header.at(&cx, block.label);
+                // The block runs in the scratch state; it leaves in a state of its own only when it
+                // changed what it started in.
+                self.working.load(&cx, places);
+                c.places.set(&cx, self.working);
+                let changed = self.simulate(&cx, block, false);
+                let leaving = if changed { self.working.copy(&cx) } else { places };
+                let earliest = self.leave(&cx, plan, block, leaving);
+                if earliest < at {
+                    at = earliest;
+                }
+            } else {
+                at = at + 1usize;
+            }
+        }
         i = 1usize;
         while i < fun.blocks.len(&cx) {
             let block = fun.blocks.at(&cx, i);
@@ -430,22 +464,19 @@ impl PlaceFlow['k] {
         self.diagnose_places(&cx, fun, header);
     }
 
-    // The state block `b` starts in when `incoming` reaches it, or none if its header already holds
-    // what `incoming` brings. It is shared, like every state sent: the block runs in a copy.
-    fn arrive(self, &cx: Domain!['k], plan: Plan['k], b: usize, incoming: Places['k]) -> Option[Places['k]] {
-        if b == 0usize {
-            return Option::Some.(incoming);
-        }
+    // Merges `incoming` into the header of block `b`; whether the header changed. The header is
+    // shared, like every state sent: the block runs in a copy.
+    fn arrive(self, &cx: Domain!['k], plan: Plan['k], b: usize, incoming: Places['k]) -> bool {
         let label = plan.fun.blocks.at(&cx, b).label;
         let state = match plan.header.get(&cx, label) {
             Option::None => {
                 plan.header.insert(&cx, label, incoming);
-                return Option::Some.(incoming);
+                return true;
             },
             Option::Some(state) => state,
         };
         if adds_nothing(&cx, state, incoming) {
-            return Option::None;
+            return false;
         }
         let empty = state.empty.clone(&cx);
         var k = 0usize;
@@ -488,16 +519,29 @@ impl PlaceFlow['k] {
         merged.keep_opened(&cx, agreed);
         self.abstract_variants(&cx, merged, state, incoming);
         if same_places(&cx, merged, state) {
-            return Option::None;
+            return false;
         }
         plan.header.insert(&cx, label, merged);
-        Option::Some.(merged)
+        true
+    }
+
+    // Brings `out` to block `t` along an edge: marks `t` to run again when its header changes. The
+    // earliest place in the walk's order this marked, or `earliest` if none is earlier.
+    fn send(self, &cx: Domain!['k], plan: Plan['k], t: usize, out: Places['k], earliest: usize) -> usize {
+        if !self.arrive(&cx, plan, t, out) {
+            return earliest;
+        }
+        let r = plan.rank.at(&cx, t);
+        plan.dirty.set(&cx, r, true);
+        if r < earliest { r } else { earliest }
     }
 
     // Sends the state `places` that `block` ends in along each of its edges. States are shared, and
-    // never changed once sent: an edge that changes what it sends sends a copy.
-    fn leave(self, &cx: Domain!['k], plan: Plan['k], &work: OwnedVec![(usize, Places['k])], block: Block['k], places: Places['k]) {
+    // never changed once sent: an edge that changes what it sends sends a copy. The earliest place
+    // in the walk's order of a block whose header this changed, or the order's length if none.
+    fn leave(self, &cx: Domain!['k], plan: Plan['k], block: Block['k], places: Places['k]) -> usize {
         let fun = plan.fun;
+        var earliest = plan.dirty.len(&cx);
         let edge_total = edge_count(&cx, block);
         var e = 0usize;
         while e < edge_total {
@@ -506,7 +550,7 @@ impl PlaceFlow['k] {
             let target = fun.blocks.at(&cx, t);
             // Existing edge entailment permits forgetting Copy contents. A dead local brand need not
             // survive in an unreadable slot.
-            let forgotten: ArenaVec[usize, 'k] = ArenaVec::new(&cx);
+            let forgotten: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
             if !plan.branded.is_empty(&cx) {
                 let kept = plan.global.clone(&cx);
                 var k = 0usize;
@@ -523,13 +567,13 @@ impl PlaceFlow['k] {
                 while k < plan.branded.len(&cx) {
                     let l = plan.branded.at(&cx, k);
                     if !subset(&cx, plan.local_brands.at(&cx, l), kept) && self.local_is_copy(&cx, plan, l) {
-                        forgotten.push(&cx, l);
+                        forgotten.insert(&cx, fun.locals.at(&cx, l).name);
                     }
                     k = k + 1usize;
                 }
             }
             if arm_known.is_none() && forgotten.is_empty(&cx) && places.opened.is_empty(&cx) {
-                work = work.push((t, places));
+                earliest = self.send(&cx, plan, t, places, earliest);
             } else {
                 let out = places.copy(&cx);
                 match arm_known {
@@ -539,34 +583,28 @@ impl PlaceFlow['k] {
                     },
                     Option::None => (),
                 };
-                var k = 0usize;
-                while k < forgotten.len(&cx) {
-                    let root = fun.locals.at(&cx, forgotten.at(&cx, k)).name;
-                    var viewed = false;
-                    var o = 0usize;
-                    while !viewed && o < out.opened.positions(&cx) {
-                        match out.opened.key_at(&cx, o) {
-                            Option::Some(p) => {
-                                viewed = prefix(&cx, root, p);
-                            },
-                            Option::None => (),
-                        };
-                        o = o + 1usize;
-                    }
-                    if !viewed {
-                        clear_below(&cx, out.empty, root);
-                        out.empty.insert(&cx, root);
-                        out.forget(&cx, root, true);
-                    }
-                    k = k + 1usize;
+                // A root with a view opened at or below it keeps its contents.
+                var o = 0usize;
+                while !forgotten.is_empty(&cx) && o < out.opened.positions(&cx) {
+                    match out.opened.key_at(&cx, o) {
+                        Option::Some(p) => {
+                            forgotten.remove(&cx, root_of(&cx, p));
+                        },
+                        Option::None => (),
+                    };
+                    o = o + 1usize;
+                }
+                if !forgotten.is_empty(&cx) {
+                    out.forget_roots(&cx, forgotten);
                 }
                 if !out.opened.is_empty(&cx) {
                     self.rename_views(&cx, out, target, edge);
                 }
-                work = work.push((t, out));
+                earliest = self.send(&cx, plan, t, out, earliest);
             }
             e = e + 1usize;
         }
+        earliest
     }
 
     // Renames `out`'s views into the brands of the block an edge enters, and keeps those whose

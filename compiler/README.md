@@ -141,7 +141,8 @@ is made once, whatever arena it runs in.
 
 What a walk needs only while it runs, and that never escapes into its result, lives in the
 standard library's linear collections, `OwnedVec!` and `OwnedMap!`, on the heap, and is freed when
-the walk ends: the worklist of place flow (`PlaceFlow::plan`), the numbering, stack and active set
+the walk ends: the depth-first path and visited set that order place flow's walk
+(`lower::placeflow::reverse_postorder`), the numbering, stack and active set
 of Tarjan's algorithm (`types::termination::components`), the open lists of the KURS reader
 (`kurs::sexpr::read`), the variables seen while collecting inference variables (`types::unify`),
 the variants a match has covered (`FnLower::match_coverage`), and the walk of package dependencies
