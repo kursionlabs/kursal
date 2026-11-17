@@ -2,6 +2,28 @@
 
 Kursal is a systems programming language that compiles to C.
 
+## Quickstart
+
+You need Linux, [uv](https://docs.astral.sh/uv/) (it provides Python 3.12 for the reference compiler),
+and Clang, or another C compiler named by `$KURSAL_CC`. Build the compiler, then a program with it:
+
+```sh
+scripts/bootstrap.sh
+bin/kursal build examples/greet -o /tmp/greet
+echo ada | /tmp/greet
+```
+
+`scripts/bootstrap.sh` takes a few minutes: the reference compiler, in Python, builds the compiler,
+which then builds itself into `bin/kursal`. The program asks for a name and greets it:
+
+```text
+What's your name?
+Hello, Ada!
+```
+
+[`examples/README.md`](examples/README.md) lists the example programs, starting with the ones to read
+first.
+
 ## Repository
 
 | Directory | Contents |
