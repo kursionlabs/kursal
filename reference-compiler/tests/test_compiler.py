@@ -15,6 +15,7 @@ message, every core program this compiler's own tests check; and from every lowe
 the same C and the same readable KURS."""
 
 import dataclasses
+import functools
 import hashlib
 import importlib
 import itertools
@@ -82,6 +83,22 @@ VALGRIND = ["valgrind", "--leak-check=full", "--show-leak-kinds=all", "--errors-
 
 def limit_valgrind_memory() -> None:
     resource.setrlimit(resource.RLIMIT_AS, (VALGRIND_MEMORY_LIMIT, VALGRIND_MEMORY_LIMIT))
+
+
+@functools.cache
+def valgrind_unusable() -> Optional[str]:
+    """Why valgrind cannot check a program here, or None when it can. It is not installed, or it cannot start
+    one: on Linux it needs the C library's symbols (glibc's debug symbols, on some systems a separate
+    package) and stops at startup without them."""
+    if shutil.which("valgrind") is None:
+        return "valgrind is not installed"
+    probe = subprocess.run(["valgrind", "--error-exitcode=99", shutil.which("true") or "/bin/true"],
+                           capture_output=True, text=True, timeout=300)
+    if probe.returncode != 0:
+        reason = next((line.lstrip("=0123456789 ") for line in probe.stderr.splitlines() if "Fatal error" in line),
+                      f"status {probe.returncode}")
+        return f"valgrind cannot start a program here ({reason}); install glibc's debug symbols"
+    return None
 
 
 def run_valgrind(binary: Path, *args: str, timeout: int) -> subprocess.CompletedProcess[str]:
@@ -1639,9 +1656,11 @@ class CompilerTests(unittest.TestCase):
         self.assertEqual(kc2_c, expected)
 
     @unittest.skipUnless(os.environ.get("KURSAL_SELFHOST") == "1", "set KURSAL_SELFHOST=1 to compile the compiler with itself")
-    @unittest.skipUnless(shutil.which("valgrind"), "valgrind is not installed")
     def test_self_build_frees_everything(self):
         """kc2 builds compiler/ under valgrind with no error and every byte freed, and writes the reference's C."""
+        unusable = valgrind_unusable()
+        if unusable is not None:
+            self.skipTest(unusable)
         expected = reference_builds()[built_paths().index(COMPILER)]["c"]
         kc2 = self_built_compiler(self.binary)
         with tempfile.TemporaryDirectory() as directory:
@@ -1656,10 +1675,12 @@ class CompilerTests(unittest.TestCase):
             self.assertIn("ERROR SUMMARY: 0 errors from 0 contexts", result.stderr)
             self.assertEqual(Path(f"{output}.c").read_text(), expected)
 
-    @unittest.skipUnless(shutil.which("valgrind"), "valgrind is not installed")
     def test_build_frees_everything(self):
         """The compiler builds a program under valgrind with no error and every byte freed, and the program
         it builds runs."""
+        unusable = valgrind_unusable()
+        if unusable is not None:
+            self.skipTest(unusable)
         package = ROOT / "examples/lisp"
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "lisp"
