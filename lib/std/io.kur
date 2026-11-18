@@ -1,3 +1,5 @@
+//! Input and output through descriptors, the standard streams and files.
+//!
 //! Process I/O over the POSIX `read`/`write`/`open`/`close`/`fstat` calls:
 //! byte output to raw descriptors (`write`), standard output (`print`) and
 //! standard error (`eprint`), whole-file and stdin reads into an owned
@@ -50,6 +52,7 @@ impl Error {
         Error.{ errno: 0i32 - (n as i32) }
     }
 
+    /// EIO, for a failure the system did not report itself.
     fn io() -> Error {
         Error.{ errno: 5i32 }
     }
@@ -64,6 +67,7 @@ impl Error {
 // caller that prints to its own stdout or stderr and has no recovery
 // discards it, while a program whose output is its product checks it.
 
+/// Writes `ptr[0..len)` to `fd`, retrying partial writes.
 unsafe fn write_all(fd: i32, ptr: *u8, len: usize) -> Result[(), Error] {
     var done = 0usize;
     while done < len {
@@ -90,6 +94,7 @@ fn write_span(fd: i32, &cx: C, sp: Span['k]) -> Result[(), Error] {
     result
 }
 
+/// Writes a static byte slice to `fd`.
 fn write(fd: i32, s: Slice[u8, 'static]) -> Result[(), Error] {
     let (p, n, m) = s.into_parts();
     unsafe write_all(fd, p, n)
@@ -116,29 +121,34 @@ fn write_buffer(fd: i32, buf: Buffer!) -> Result[(), Error] {
 // `print` writes to standard output (descriptor 1), `eprint` to standard
 // error (descriptor 2), as `write`, `write_bytes` and `write_buffer` do.
 
-/// Write a static byte slice to standard output. Returns an I/O error on failure.
+/// Writes a static byte slice to standard output. Returns an I/O error on failure.
 fn print(s: Slice[u8, 'static]) -> Result[(), Error] {
     write(1i32, s)
 }
 
+/// Writes any byte view to standard output.
 forall C, S where ReadBytes[C, S], Copy[S].
 fn print_bytes(&cx: C, bytes: S) -> Result[(), Error] {
     write_bytes(1i32, &cx, bytes)
 }
 
+/// Writes `buf`'s bytes to standard output, then frees it.
 fn print_buffer(buf: Buffer!) -> Result[(), Error] {
     write_buffer(1i32, buf)
 }
 
+/// Writes a static byte slice to standard error.
 fn eprint(s: Slice[u8, 'static]) -> Result[(), Error] {
     write(2i32, s)
 }
 
+/// Writes any byte view to standard error.
 forall C, S where ReadBytes[C, S], Copy[S].
 fn eprint_bytes(&cx: C, bytes: S) -> Result[(), Error] {
     write_bytes(2i32, &cx, bytes)
 }
 
+/// Writes `buf`'s bytes to standard error, then frees it.
 fn eprint_buffer(buf: Buffer!) -> Result[(), Error] {
     write_buffer(2i32, buf)
 }
@@ -194,6 +204,7 @@ unsafe fn read_to_end_from(fd: i32, b: Buffer!) -> Result[Buffer!, Error] {
     Result::Ok.(b)
 }
 
+/// All of standard input, read to its end.
 fn read_all_stdin() -> Result[Buffer!, Error] {
     // Standard input is the process's own, readable by any of its code.
     unsafe read_to_end_from(0i32, Buffer!::new())
@@ -295,6 +306,8 @@ impl File! {
         File!.{ fd }
     }
 
+    /// Closes the descriptor.
+    ///
     /// The terminal operation: the checker requires every `File!` to reach
     /// `close`. The `File!` is consumed even when `close(2)` fails, which is
     /// reported with its errno.
@@ -333,6 +346,7 @@ impl File! {
         got
     }
 
+    /// Writes all of `bytes`, read under `tag`, which comes back with the result.
     forall 'k.
     fn write_all(&self, tag: Exclusive!['k], bytes: Slice[u8, 'k]) -> (Exclusive!['k], Result[(), Error]) {
         let { fd } = self;
@@ -355,6 +369,7 @@ impl File! {
         result
     }
 
+    /// Writes all of a static byte slice.
     fn write_static(&self, bytes: Slice[u8, 'static]) -> Result[(), Error] {
         let { fd } = self;
         let (ptr, len, marker) = bytes.into_parts();
@@ -427,12 +442,12 @@ struct Output! {
     error: i32,
 }
 
-/// Construct a buffered writer for standard output.
+/// A buffered writer for standard output.
 fn stdout() -> Output! {
     Output!.{ fd: 1i32, buf: Buffer!::new(), error: 0i32 }
 }
 
-/// Construct a buffered writer for standard error.
+/// A buffered writer for standard error.
 fn stderr() -> Output! {
     Output!.{ fd: 2i32, buf: Buffer!::new(), error: 0i32 }
 }
@@ -468,6 +483,7 @@ impl Output! {
         }
     }
 
+    /// Writes what has gathered once it reaches 4 KiB.
     fn gathered(self) -> Output! {
         let { fd, buf, error } = self;
         let n = &buf.len();
@@ -476,6 +492,7 @@ impl Output! {
     }
 }
 
+/// Output as a writer: bytes gather and are written 4 KiB at a time.
 instance Writable[Output!] {
     fn write_byte(self: Output!, byte: u8) -> Output! {
         let { fd, buf, error } = self;

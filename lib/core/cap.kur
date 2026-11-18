@@ -21,11 +21,15 @@ use package as core;
 // 'static, whose obligation is that what it brands lives forever.
 export builtin::{Brand, fresh, static_brand};
 
+/// The sole read and write capability for domain `'r`.
 forall 'r.
 struct Exclusive! {
     marker: Brand['r],
 }
 
+/// A shared read capability for domain `'r`: one node `'q` of a tree of
+/// readers.
+///
 /// Every shared node carries two brands, and the distinction is the design:
 ///
 ///   'r   the DOMAIN brand, the same one its `Exclusive!['r]` carries. It
@@ -46,6 +50,9 @@ struct Shared! {
     lineage: Brand['q],
 }
 
+/// The receipt a `Shared!::split` keeps back, which `join` turns the two
+/// children back into their parent.
+///
 /// The join receipt names all FOUR brands: domain, parent, and both
 /// children. The obvious simplification, a receipt naming only its parent
 /// with `join` generic over the children, re-admits a nested-split attack:
@@ -61,6 +68,8 @@ struct SharedJoin! {
     right: Brand['b],
 }
 
+/// The receipt `Exclusive!::share` keeps back, which `resume` turns the
+/// root of the shared tree back into the `Exclusive!['r]`.
 forall 'r, 'q.
 struct SharedResume! {
     marker: Brand['r],
@@ -68,6 +77,8 @@ struct SharedResume! {
 }
 
 impl Exclusive! {
+    /// A capability for a new domain, with that domain's brand.
+    ///
     /// The only minting path. Freshness prevents an existing domain from
     /// acquiring a second Exclusive! token through a copied Brand.
     fn fresh() -> exists 'r. (Brand['r], Exclusive!['r]) {
@@ -81,6 +92,7 @@ impl Exclusive! {
 // region's `Ref`), while code outside `core` can hold one but never read
 // the brand out of it. A witness taken from the capability alone would let
 // anyone plant objects in a domain; inside `core` that is the point.
+/// A domain's brand, sealed so that only `core` can read it.
 forall 'r.
 exposed (package) struct Stamp {
     marker: Brand['r],
@@ -88,16 +100,21 @@ exposed (package) struct Stamp {
 
 forall 'r.
 impl Exclusive!['r] {
+    /// The domain's brand, sealed in a `Stamp` that only `core` can open.
     fn stamp(&self) -> Stamp['r] {
         Stamp.{ marker: self.marker }
     }
 
+    /// Trades the capability for the root of a tree of shared readers and the
+    /// receipt that turns that root back into it.
     fn share(self) -> exists 'q. (Shared!['r, 'q], SharedResume!['r, 'q]) {
         let { marker: brand } = self;
         let exists 'q. lineage: Brand['q] = fresh();
         pack 'q. (Shared!.{ marker: brand, lineage }, SharedResume!.{ marker: brand, lineage })
     }
 
+    /// Ends the capability.
+    ///
     /// A resource's finalizer can consume its exclusive token here after
     /// retiring the protected state. This does not deallocate anything.
     fn retire(self) -> () {
@@ -121,10 +138,13 @@ impl Exclusive!['r] {
 /// instance cannot make an `Exclusive!['k]` it does not hold.
 forall Self -> 'k, R.
 trait Access {
+    /// The capability taken out of `cx`, and the rest of the context.
     fn open(cx: Self) -> (Exclusive!['k], R);
+    /// The context again, from the capability and the rest `open` returned.
     fn close(tag: Exclusive!['k], rest: R) -> Self;
 }
 
+/// An `Exclusive!` lends itself, with nothing else held.
 forall 'k.
 instance Access[Exclusive!['k] -> 'k, ()] {
     fn open(cx: Exclusive!['k]) -> (Exclusive!['k], ()) {
@@ -138,6 +158,8 @@ instance Access[Exclusive!['k] -> 'k, ()] {
 
 forall 'r, 'q.
 impl Shared!['r, 'q] {
+    /// Two fresh shared readers in place of this one, and the receipt that
+    /// joins them back.
     fn split(self) -> exists 'a, 'b. (Shared!['r, 'a], Shared!['r, 'b], SharedJoin!['r, 'q, 'a, 'b]) {
         let { marker: brand, lineage: parent } = self;
         let exists 'a. left: Brand['a] = fresh();
@@ -148,6 +170,7 @@ impl Shared!['r, 'q] {
 
 forall 'r, 'q, 'a, 'b.
 impl SharedJoin!['r, 'q, 'a, 'b] {
+    /// The parent node again, from the two children its split produced.
     fn join(self, left_node: Shared!['r, 'a], right_node: Shared!['r, 'b]) -> Shared!['r, 'q] {
         let { marker: brand, parent, left, right } = self;
         let { marker: left_brand, lineage: left_lineage } = left_node;
@@ -158,6 +181,7 @@ impl SharedJoin!['r, 'q, 'a, 'b] {
 
 forall 'r, 'q.
 impl SharedResume!['r, 'q] {
+    /// The `Exclusive!['r]` again, from the root of the shared tree.
     fn resume(self, root: Shared!['r, 'q]) -> Exclusive!['r] {
         let { marker: brand, lineage: lineage } = self;
         let { marker: root_brand, lineage: root_lineage } = root;

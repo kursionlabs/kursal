@@ -41,6 +41,8 @@ use core::cmp::Order;
 use core::iter::Iterator;
 use core::process::trap;
 
+/// A checked view of `len` contiguous `T`s in domain `'k`.
+///
 /// As with `core::mem::Ref`, `Slice` stores `*T`, never `T` inline, so it
 /// is Copy whatever `T` is.
 ///
@@ -62,6 +64,8 @@ struct Slice {
 
 forall T, 'k.
 impl Slice[T, 'k] {
+    /// A view of the `len` elements at `ptr`, in the domain `marker` names.
+    ///
     /// The only way to build a `Slice` from outside this module. `unsafe`:
     /// the caller vouches that `ptr[0 .. len)` is live and readable and
     /// writable under `marker`'s brand. `get_ref`/`sub` are safe methods
@@ -74,6 +78,8 @@ impl Slice[T, 'k] {
         Slice.{ ptr, len, marker }
     }
 
+    /// The pointer, length and brand of this slice.
+    ///
     /// The safe inverse of `from_raw_parts`: the `(ptr, len, marker)` the
     /// slice was built from, for code that must read through it directly
     /// (e.g. `Buffer!::push_static`). Safe because it grants no authority:
@@ -129,11 +135,13 @@ impl Slice[T, 'k] {
         }
     }
 
+    /// The number of elements.
     fn len(self) -> usize {
         let { ptr: p, len: n, marker: m } = self;
         n
     }
 
+    /// Whether the slice has no elements.
     fn is_empty(self) -> bool {
         self.len() == 0usize
     }
@@ -189,20 +197,27 @@ impl Slice[T, 'k] {
 struct StaticRead {}
 
 impl StaticRead {
+    /// The capability to read `'static` bytes.
     fn new() -> StaticRead {
         StaticRead.{}
     }
 }
 
+/// Reading the bytes of a view `S` through the capability `C`.
 forall C, S.
 trait ReadBytes {
-    /// `None` when `index` is out of range; zero is an ordinary byte.
+    /// Byte `index` of `bytes`, or `None` when `index` is out of range;
+    /// zero is an ordinary byte.
     fn get(&cx: C, bytes: S, index: usize) -> Option[u8];
+    /// The number of bytes in `bytes`.
+    ///
     /// Needs `cx` only so a call can select the instance: generic code
     /// holding just `S` has no other way to name the view's length.
     fn len(&cx: C, bytes: S) -> usize;
 }
 
+/// Byte `index` of `s`, or `None` past its end, read with no capability.
+///
 /// The shared body of the three instances below. `unsafe`: reads `s`'s
 /// bytes with no capability of its own; every caller has just been handed
 /// one for `s`'s brand.
@@ -217,6 +232,7 @@ unsafe fn slice_byte_at(s: Slice[u8, 'k], index: usize) -> Option[u8] {
     }
 }
 
+/// A byte slice is read through its domain's `Exclusive!`.
 forall 'r.
 instance ReadBytes[Exclusive!['r], Slice[u8, 'r]] {
     fn get(&cx: Exclusive!['r], bytes: Slice[u8, 'r], index: usize) -> Option[u8] {
@@ -227,6 +243,7 @@ instance ReadBytes[Exclusive!['r], Slice[u8, 'r]] {
     }
 }
 
+/// A byte slice is read through any node of its domain's shared-read tree.
 forall 'r, 'q.
 instance ReadBytes[Shared!['r, 'q], Slice[u8, 'r]] {
     fn get(&cx: Shared!['r, 'q], bytes: Slice[u8, 'r], index: usize) -> Option[u8] {
@@ -237,6 +254,7 @@ instance ReadBytes[Shared!['r, 'q], Slice[u8, 'r]] {
     }
 }
 
+/// A `'static` byte slice is read through `StaticRead`.
 instance ReadBytes[StaticRead, Slice[u8, 'static]] {
     fn get(&cx: StaticRead, bytes: Slice[u8, 'static], index: usize) -> Option[u8] {
         unsafe slice_byte_at(bytes, index)
@@ -434,6 +452,8 @@ fn hash_bytes(&cx: C, bytes: S, state: HashState) -> HashState {
 
 // A byte view of a domain, as a map key read through that domain's
 // capability (`HashMap!::get_in` and friends).
+/// Byte slices hash and compare by their bytes, read through the capability
+/// `C`.
 forall C, 't where ReadBytes[C, Slice[u8, 't]].
 instance HashIn[Slice[u8, 't], C] {
     fn hash_in(&cx: C, key: Slice[u8, 't], state: HashState) -> HashState {
@@ -445,6 +465,7 @@ instance HashIn[Slice[u8, 't], C] {
     }
 }
 
+/// Readable views are equal when their bytes are (`bytes_eq`).
 forall C1, S1, C2, S2 where ReadBytes[C1, S1], ReadBytes[C2, S2], Copy[S1], Copy[S2].
 instance Eq[Readable[C1, S1], Readable[C2, S2]] {
     fn eq(a: Readable[C1, S1], b: Readable[C2, S2]) -> (Readable[C1, S1], Readable[C2, S2], bool) {
@@ -455,6 +476,7 @@ instance Eq[Readable[C1, S1], Readable[C2, S2]] {
     }
 }
 
+/// A readable view hashes its bytes (`hash_bytes`).
 forall C, S where ReadBytes[C, S], Copy[S].
 instance Hash[Readable[C, S]] {
     fn hash(self: Readable[C, S], state: HashState) -> (Readable[C, S], HashState) {
@@ -479,6 +501,8 @@ exposed struct SliceIter! {
 
 forall T, 'k where Copy[T].
 impl Slice[T, 'k] {
+    /// The elements in order, read under the capability `cx` lends, which
+    /// the iterator's `finish` hands back.
     forall C, R where Access[C -> 'k, R].
     fn iter(self, cx: C) -> SliceIter![T, 'k, C, R] {
         let (tag, rest) = Access[C -> 'k, R]::open(cx);

@@ -168,6 +168,9 @@ export builtin::{sizeof, alloca, enum_variant};
 // destructuring are confined to this module. `Owned!` and `Allocation!`
 // are `alloc::owned`'s, restricted there.
 
+/// A description of the place of a `T` in domain `'k`, read or written by
+/// presenting that domain's capability.
+///
 /// `Ref` only ever stores a pointer, never `T` inline, so it is Copy
 /// whatever `T` is: both `Ref[u32, 'k]` and `Ref[Owned!, 'k]` are Copy.
 ///
@@ -196,6 +199,8 @@ struct Ref {
 // capability. Memory types that own a domain hold its `Exclusive!` rather
 // than a bare brand, because only `Exclusive!::fresh` can create one.
 
+/// The right to access one block holding a `T`, under brand `'r`.
+///
 /// `Allocation!` (`alloc::owned`) is the right to free a block;
 /// `Region!` is the right to access it, under the same brand.
 forall T, 'r.
@@ -224,6 +229,8 @@ struct RegionResume! {
 // into one independently branded sub-region per FIELD, each with its own
 // fresh `Exclusive!` capability, and a receipt that reunites them.
 
+/// The tie between a part of a split region and the region it came from.
+///
 /// `Link!['f,'r]` names BOTH brands: the fresh child brand `'f` a part was
 /// minted under, and the parent brand `'r` it was split from. If `Link!`
 /// named only the parent, a caller could build a fake part (any
@@ -240,8 +247,8 @@ struct Link! {
     parent: Brand['r],
 }
 
-/// `Restore![T,'r]` -- the receipt `split` keeps back: the base pointer and
-/// the parent's own `Exclusive!['r]`, held while the parts are out. Like
+/// The receipt `Region!::split` keeps back: the base pointer and the
+/// parent's own `Exclusive!['r]`, held while the parts are out. Like
 /// `RegionResume!` it leads back to a `Region![T,'r]`, but it is a
 /// different type, for the reason `Allocation!`/`Region!` are two types:
 /// `share`'s receipt and `split`'s
@@ -279,6 +286,8 @@ unsafe fn lend_in(p: *T, &cx: C, f: closure(&_: T, &_: C) -> Ret) -> Ret {
     f(unsafe &*p, &cx)
 }
 
+/// A `u8` followed by a `T`, whose size gives the alignment of `T`.
+///
 /// For every layout the C backend gives a type, `sizeof[T]` is a multiple
 /// of its alignment, so in `{ u8, T }` the value starts at the alignment
 /// and the aggregate's size is `alignment + size`. `AlignProbe` is that
@@ -316,6 +325,8 @@ fn replace(&dst: T, val: T) -> T {
 
 forall T, 'k.
 impl Ref[T, 'k] {
+    /// A `Ref` to the `T` at `ptr`, in the domain `marker` names.
+    ///
     /// The one way to build a `Ref` outside this module. `unsafe`: the
     /// caller vouches that `ptr` points at a live `T` inside the domain
     /// `marker` names, so that presenting that domain's capability
@@ -326,6 +337,8 @@ impl Ref[T, 'k] {
         Ref.{ ptr: p, marker }
     }
 
+    /// The pointer and brand of this `Ref`.
+    ///
     /// The safe inverse of `from_raw`, like `Slice::into_parts`: the
     /// pointer and brand grant nothing by themselves, and turning them
     /// back into a `Ref` needs `from_raw` again.
@@ -344,6 +357,9 @@ impl Ref[T, 'k] {
         unsafe (raw as usize)
     }
 
+    /// Calls `f` on the value, moved out, and puts back the value `f` returns,
+    /// under the capability `cx` lends.
+    ///
     /// The only way to look at or change a shared value -- requires
     /// presenting the live `Exclusive!` of the matching brand, lent by a
     /// context that holds it (`core::cap::Access`); nothing about `self` or
@@ -423,6 +439,8 @@ impl Ref[T, 'k] {
 
 forall T, 'k where Copy[T].
 impl Ref[T, 'k] {
+    /// A copy of the value, read under the capability `cx` lends.
+    ///
     /// `with`'s most common case: read the current value without changing
     /// it. `T` comes from `r`'s own type, so a bare `r.copy(&tag)` needs no
     /// annotation. Needs `T: Copy` because the value is handed back as the
@@ -446,7 +464,8 @@ impl Ref[T, 'k] {
         let old = self.replace(&cx, val);
     }
 
-    /// A read through one node of the domain's shared-read tree. Any node
+    /// A copy of the value, read through one node of the domain's
+    /// shared-read tree. Any node
     /// will do: they all permit reading, and none permits writing.
     forall 'q.
     fn read(self, &cx: Shared!['k, 'q]) -> T {
@@ -470,6 +489,8 @@ impl Ref[T, 'k] {
 
 forall T, 'r.
 impl Region![T, 'r] {
+    /// A region over the `T` at `ptr`, under the capability `cap`.
+    ///
     /// The way into a region over memory this module did not allocate:
     /// `alloc::owned`'s `Allocation!::adopt`, or a program's own
     /// storage. The caller vouches that `ptr` points at an initialized `T`,
@@ -518,6 +539,9 @@ impl Region![T, 'r] {
         old
     }
 
+    /// Splits the region into its capability, a `Ref` to the value, and the
+    /// receipt that puts the two back together.
+    ///
     /// Trades the region -- one linear value that both describes the block
     /// and authorizes touching it -- for the two-axis split the module
     /// header describes: an `Exclusive!['r]` that authorizes and does not
@@ -554,6 +578,9 @@ impl Region![T, 'r] {
 // of its own.
 forall T, 'r where Exposed[*T].
 impl Region![T, 'r] {
+    /// Splits the region into one sub-region per field of `T`, each under a
+    /// fresh brand, and the receipt that merges them back.
+    ///
     /// Decomposes one exclusive region into one independently branded
     /// sub-region per FIELD of `T`, each usable (ordinarily via
     /// `Region!::share`) without any two sub-regions' `Exclusive!`s being
@@ -587,6 +614,7 @@ impl Region![T, 'r] {
     }
 }
 
+/// A region over `field` under a fresh brand, and that brand:
 /// `Region!::split`'s per-field step. A separate function, not inlined in
 /// `split`'s `foreach` body, because the `exists 'f. (...)` a `foreach`
 /// component produces must be a SEALED RETURN: `Exclusive!::fresh` mints and
@@ -616,6 +644,9 @@ unsafe fn make_split_part(field: *Field) -> exists 'f. (Region![Field, 'f], Bran
 
 forall T, 'r.
 impl RegionResume![T, 'r] {
+    /// The region again, from the capability `share` handed out with this
+    /// receipt.
+    ///
     /// `Region!::share`'s exact inverse, and the only producer of a
     /// `Region![T,'r]` for an 'r that `adopt` has already sealed.
     ///
@@ -652,6 +683,8 @@ impl RegionResume![T, 'r] {
 // against the exact type it authorizes, so `Exposed[*T]` alone does not
 // cover it.
 forall T, 'r where Exposed[foreach *F of * T => exists 'f. (Region![F, 'f], Link!['f, 'r])].impl Restore![T, 'r] {
+    /// The parent region again, from every part `split` produced.
+    ///
     /// `Region!::split`'s exact inverse. Consumes the WHOLE product -- every
     /// part, in whatever order the caller hands them back -- and `self`, the
     /// receipt `split` kept. Four properties carry the soundness:
