@@ -13,7 +13,8 @@
 // entered through the package's entry (every root function's C for a library); with OUTPUT, it
 // writes OUTPUT.c and compiles it with the standard library's C helpers into OUTPUT (with
 // $KURSAL_CC, else clang, at -O3; a C compiler that cannot run or fails is reported), else it
-// prints the C. With --times it prints the time each stage takes, as `tools/build.py --times` does.
+// prints the C. With --times it prints millisecond timings for each stage, including the copies
+// and arena releases between them.
 //
 // Each group of phases keeps what it builds in an arena of its own: the front end (the command
 // line, parsing, resolving, signatures, inference and lowering, or reading KURS), the core
@@ -36,7 +37,7 @@ use package::infer::inference::infer;
 use package::infer::dump as infer_dump;
 use package::kurs::core::{Program, Type};
 use package::kurs::serial::{parse_program, write_program};
-use package::lower::lowering::lower;
+use package::lower::lowering::{lower, lower_inferred};
 use package::syntax::parser::parse;
 use package::kurs::readable::emit_kurs;
 use package::kurs::transfer::{copy_option_text, copy_program};
@@ -100,10 +101,14 @@ fn main(args: Args) -> i32 {
     };
     let exists 'c. core = Domain!::new();
     var core = core;
+    let times = handoff.times;
+    var started = handoff.started;
     let checked = carry(&front, &core, handoff);
+    started = stage(times, "front copy", started);
     front.destroy();
+    started = stage(times, "front free", started);
     let checker = check_program(&core, checked.program, checked.counter);
-    let started = stage(checked.times, "check", checked.started);
+    started = stage(times, "check", started);
     let unit = match checked.goal {
         Goal::Check => {
             core.destroy();
@@ -115,9 +120,12 @@ fn main(args: Args) -> i32 {
     var back = back;
     let emitted = carry(&core, &back, Handoff.{ goal: checked.goal, program: checked.program, counter: checked.counter, entry: checked.entry,
         output: checked.output, times: checked.times, started });
+    started = stage(times, "back copy", started);
     let typed = copy_typed(&core, &back, checker.typed);
+    started = stage(times, "typed copy", started);
     core.destroy();
-    back_end(back, emitted, typed)
+    started = stage(times, "core free", started);
+    back_end(back, emitted, typed, started)
 }
 
 // The front end of every command, in the arena of `cx`: a command that only the front end does is
@@ -213,15 +221,17 @@ fn read_file(&cx: Domain!['k], file: Span['k]) -> Span['k] {
     }
 }
 
-// The time since `started` as `NAME: 1.5s` on stderr, when `times`; the time now.
+// The time since `started` as `NAME: 1500ms` on stderr, when `times`. Restart the clock
+// after printing so logging one stage is not charged to the next.
 fn stage(times: bool, name: Slice[u8, 'static], started: Instant) -> Instant {
     let now = Instant::now();
     if times {
         let ms = started.millis_until(now);
-        eprint_buffer(Buffer!::new().push_static(name).push_static(": ").push_usize((ms / 1000u64) as usize).push_static(".")
-            .push_usize((ms % 1000u64 / 100u64) as usize).push_static("s\n"));
+        eprint_buffer(Buffer!::new().push_static(name).push_static(": ").push_usize(ms as usize).push_static("ms\n"));
+        Instant::now()
+    } else {
+        now
     }
-    now
 }
 
 // The front end of `kursal build PATH [-o OUTPUT] [--times]`: the package resolved, its
@@ -253,9 +263,12 @@ fn build(&cx: Domain!['k], args: ArenaVec[Span['k], 'k]) -> Handoff['k] {
     var started = Instant::now();
     let counter = Fresh::new(&cx);
     let r = resolve(&cx, package);
+    started = stage(times, "resolve", started);
     let sigs = signatures(&cx, r, counter);
     started = stage(times, "signatures", started);
-    let program = lower(&cx, r, sigs, counter);
+    let inferred = infer(&cx, r, sigs, counter);
+    started = stage(times, "infer", started);
+    let program = lower_inferred(&cx, r, sigs, inferred.out, counter);
     started = stage(times, "lower", started);
     let entry = match r.packages.at(&cx, 0usize).entry_decl.copy(&cx) {
         Option::Some(decl) => Option::Some.(sigs.name(&cx, decl)),
@@ -269,15 +282,18 @@ fn build(&cx: Domain!['k], args: ArenaVec[Span['k], 'k]) -> Handoff['k] {
 // library's C helpers. The command's exit status: 1 when the C compiler cannot be started, exits
 // with another status than 0 or is killed, which is reported on stderr.
 forall 'k.
-fn back_end(cx: Domain!['k], handoff: Handoff['k], typed: ArenaMap[FunKey['k], ArenaMap[(Span['k], Span['k]), Type['k], 'k], 'k]) -> i32 {
+fn back_end(cx: Domain!['k], handoff: Handoff['k], typed: ArenaMap[FunKey['k], ArenaMap[(Span['k], Span['k]), Type['k], 'k], 'k], started: Instant) -> i32 {
     var cx = cx;
-    let c = emit_c(&cx, handoff.program, typed, handoff.entry, handoff.counter);
-    let started = stage(handoff.times, "C", handoff.started);
+    var started = started;
+    let c = emit_c(&cx, handoff.program, typed, handoff.entry, handoff.counter, handoff.times);
+    started = stage(handoff.times, "C", started);
     let out = match handoff.output {
         Option::Some(o) => o,
         Option::None => {
             emit_buffer(c);
+            started = stage(handoff.times, "write C", started);
             cx.destroy();
+            let finished = stage(handoff.times, "back free", started);
             return 0;
         },
     };
@@ -285,6 +301,7 @@ fn back_end(cx: Domain!['k], handoff: Handoff['k], typed: ArenaMap[FunKey['k], A
     if write(&cx, c_file, c).is_err() {
         fail(&cx, Buffer!::new().push_static("cannot write ").push_bytes(&cx, c_file).save(&cx));
     }
+    started = stage(handoff.times, "write C", started);
     let lib = lib_dir(&cx);
     // The C compiler and flags of the reference's `kursal.cc`: `$KURSAL_CC`, else Clang, at -O3.
     let compiler = match variable(&cx, Span::from_static(&cx, "KURSAL_CC")) {
@@ -299,7 +316,9 @@ fn back_end(cx: Domain!['k], handoff: Handoff['k], typed: ArenaMap[FunKey['k], A
         .arg(&cx, Buffer!::new().push_bytes(&cx, lib).push_static("/libc/thread.c").save(&cx))
         .arg(&cx, Span::from_static(&cx, "-lpthread")).arg(&cx, Span::from_static(&cx, "-o")).arg(&cx, out);
     let cc = Buffer!::new().push_bytes(&cx, compiler);
+    started = stage(handoff.times, "cc setup", started);
     cx.destroy();
+    started = stage(handoff.times, "back free", started);
     let ran = command.run();
     let finished = stage(handoff.times, "cc", started);
     // As `tools/build.py` reports it: the C compiler's own diagnostics are already on stderr.

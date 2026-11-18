@@ -29,6 +29,19 @@ use package::types::termination::check_mono_termination;
 use package::types::ops::{Fresh, Row, Types, alpha_hashes, equal, foreach_binders, kurs_error, map_children, subst, subst_foreach};
 use std::option::Option;
 use std::slice::Slice;
+use std::time::Instant;
+use std::io::eprint_buffer;
+
+fn c_stage(times: bool, name: Slice[u8, 'static], started: Instant) -> Instant {
+    let now = Instant::now();
+    if times {
+        let ms = started.millis_until(now);
+        eprint_buffer(Buffer!::new().push_static(name).push_static(": ").push_usize(ms as usize).push_static("ms\n"));
+        Instant::now()
+    } else {
+        now
+    }
+}
 
 // The C function, in `lib/libc/fs.c`, that C's `main` calls to report the error an entry returns.
 const REPORT_ERROR: Slice[u8, 'static] = "kur_libc_process_report_error";
@@ -1479,7 +1492,8 @@ impl Backend['k] {
 
     // ------------------------------------------------------------------- program --
 
-    fn emit_program(self, &cx: Domain!['k], entry: Option[Span['k]]) -> Buffer! {
+    fn emit_program(self, &cx: Domain!['k], entry: Option[Span['k]], times: bool) -> Buffer! {
+        var started = Instant::now();
         check_mono_termination(&cx, self.program);
         let keywords = c_keywords(&cx);
         let runtime = runtime_names(&cx);
@@ -1546,10 +1560,12 @@ impl Backend['k] {
                 }
             },
         };
+        started = c_stage(times, "C setup", started);
         while !self.queue.is_empty(&cx) {
             let (key, fun, sub, symbol) = self.queue.remove(&cx, 0usize);
             self.emit_function(&cx, key, fun, sub, symbol);
         }
+        started = c_stage(times, "C functions", started);
         var t = 0usize;
         while t < self.thunks.positions(&cx) {
             match self.thunks.key_at(&cx, t) {
@@ -1579,6 +1595,7 @@ impl Backend['k] {
             };
         }
         let (const_params, restrict_params) = self.qualifiers(&cx);
+        started = c_stage(times, "C definitions", started);
         var c = prelude().push_static("\n");
         c = text_lines(&cx, c, self.forward);
         c = text_lines(&cx, c, self.defs);
@@ -1602,7 +1619,7 @@ impl Backend['k] {
             c = c.push_bytes(&cx, heads.at(&cx, b)).push_bytes(&cx, body).push_static("\n");
             b = b + 1usize;
         }
-        match main {
+        let result = match main {
             Option::Some(symbol) => {
                 let fun = self.program.funs.at(&cx, match entry {
                     Option::Some(name) => name,
@@ -1611,7 +1628,9 @@ impl Backend['k] {
                 c.push_bytes(&cx, self.entry_wrapper(&cx, fun, symbol)).push_static("\n")
             },
             Option::None => c,
-        }
+        };
+        let finished = c_stage(times, "C assembly", started);
+        result
     }
 
     // C's `main`: it calls the entry `fun`, whose C is `symbol`, with `Args` from `argv` and `argc` if
@@ -4281,8 +4300,8 @@ impl Walk['k] {
 }
 
 forall 'k.
-fn emit_c(&cx: Domain!['k], program: Program['k], typed: ArenaMap[FunKey['k], ArenaMap[(Span['k], Span['k]), Type['k], 'k], 'k], entry: Option[Span['k]], counter: Fresh['k]) -> Buffer! {
-    Backend::new(&cx, program, typed, counter).emit_program(&cx, entry)
+fn emit_c(&cx: Domain!['k], program: Program['k], typed: ArenaMap[FunKey['k], ArenaMap[(Span['k], Span['k]), Type['k], 'k], 'k], entry: Option[Span['k]], counter: Fresh['k], times: bool) -> Buffer! {
+    Backend::new(&cx, program, typed, counter).emit_program(&cx, entry, times)
 }
 
 // The place path or out pointer `away` sends component `k` to (`Backend::away`).
