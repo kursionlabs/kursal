@@ -9,7 +9,7 @@ and Clang, or another C compiler named by `$KURSAL_CC`. Build the compiler, then
 
 ```sh
 scripts/bootstrap.sh
-bin/kursal build examples/hello -o /tmp/hello && /tmp/hello
+bin/kursal build examples/hello && ./a.out
 ```
 
 `scripts/bootstrap.sh` takes a few minutes: the reference compiler, in Python, builds the compiler,
@@ -29,6 +29,10 @@ and it prints:
 ```text
 Hello, world!
 ```
+
+`kursal build PATH` writes `a.out` and its generated C companion `a.out.c` in the current
+directory. Use `-o OUTPUT` to choose another location, or `--emit-c` to print the C. Run
+`bin/kursal --help` for the other commands.
 
 [`examples/README.md`](examples/README.md) lists the example programs, starting with the ones to read
 first.

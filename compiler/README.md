@@ -56,12 +56,18 @@ KURSAL_SELFHOST=1 uv run python tools/test.py tests.test_compiler   # also check
 ```
 
 `build --times` reports wall-clock milliseconds for resolution, signatures, inference, lowering,
-checking, C generation, and the copies and arena releases between those stages. With `-o`, it
-also reports writing C, preparing the C compiler command, and running the C compiler.
+checking, C generation, and the copies and arena releases between those stages. For executable
+builds it also reports writing C, preparing the C compiler command, and running the C compiler.
 `front copy` moves the lowered program into the checker arena; `back copy` moves it into the C
 arena; `typed copy` moves the checker's recorded types into that arena.
 Within C generation, `C setup`, `C functions`, `C definitions`, and `C assembly` show where the
 backend spends its time; `C` remains the total for that stage.
+
+`build` writes `a.out` and `a.out.c` unless `-o OUTPUT` names another destination.
+`build --emit-c` prints generated C, which also works for library packages. The compiler
+prints a source line and caret below a located error; `KURSAL_DIAGNOSTICS=short` retains the
+one-line form used by the reference comparison tests. `--help`, command `--help`, and `--version`
+are available without building a package.
 
 `tests/test_compiler.py` builds the compiler once per change to its sources (cached in
 `reference-compiler/.build/`) and compares its output with the reference compiler's. It also caches

@@ -19,7 +19,8 @@ printf 'the cat and the hat\n' | /tmp/wordfreq
 ```
 
 `bin/kursal build PACKAGE -o OUTPUT` writes `OUTPUT.c` and compiles it, with the standard library's C
-helpers, into `OUTPUT`. Without `-o` it prints the C; a library prints the C of every function.
+helpers, into `OUTPUT`. Without `-o` it writes `a.out` and `a.out.c` in the current directory.
+Use `--emit-c` to print the C, including for a library package.
 `bin/kursal build examples/bad/type_mismatch.kur` shows a rejected program's diagnostic.
 
 The reference compiler builds a program the same way, from `reference-compiler/`:

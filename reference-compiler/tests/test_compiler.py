@@ -110,7 +110,7 @@ def run_valgrind(binary: Path, *args: str, timeout: int) -> subprocess.Completed
 
 def run_kursal(binary: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run([str(binary), *args], capture_output=True, text=True, timeout=TIME_LIMIT,
-                          preexec_fn=limit_memory, env=dict(os.environ, KURSAL_LIB=str(LIB)))
+                          preexec_fn=limit_memory, env=dict(os.environ, KURSAL_LIB=str(LIB), KURSAL_DIAGNOSTICS="short"))
 
 
 def digest_of(paths: list[Path]) -> str:
@@ -1526,6 +1526,38 @@ class CompilerTests(unittest.TestCase):
     def run_compiler(self, *args: str) -> subprocess.CompletedProcess[str]:
         return run_kursal(self.binary, *args)
 
+    def test_public_cli(self):
+        for args, text in [(("--help",), "Commands:"), (("build", "--help"), "--emit-c"),
+                           (("--version",), "kursal 0.1.0")]:
+            with self.subTest(args=args):
+                result = self.run_compiler(*args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(text, result.stdout)
+                self.assertEqual(result.stderr, "")
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run([str(self.binary), "build", str(ROOT / "examples/hello")], cwd=directory,
+                                    capture_output=True, text=True, timeout=TIME_LIMIT,
+                                    preexec_fn=limit_memory, env=dict(os.environ, KURSAL_LIB=str(LIB)))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertTrue((Path(directory) / "a.out").is_file())
+            self.assertTrue((Path(directory) / "a.out.c").is_file())
+            running = subprocess.run([str(Path(directory) / "a.out")], capture_output=True, text=True)
+            self.assertEqual((running.returncode, running.stdout), (0, "Hello, world!\n"))
+
+        bad = subprocess.run([str(self.binary), "build", str(ROOT / "examples/bad/type_mismatch.kur")],
+                             capture_output=True, text=True, timeout=TIME_LIMIT,
+                             env=dict(os.environ, KURSAL_LIB=str(LIB)))
+        self.assertEqual(bad.returncode, 1)
+        self.assertIn("type_mismatch.kur:6:22: type mismatch", bad.stderr)
+        self.assertIn("let total: u32 = items > 0u32;", bad.stderr)
+        self.assertIn("^", bad.stderr)
+        short = self.run_compiler("build", str(ROOT / "examples/bad/type_mismatch.kur"), "--emit-c")
+        self.assertEqual(short.returncode, 1)
+        self.assertEqual(short.stderr.count("\n"), 1)
+        self.assertIn("type_mismatch.kur:6:22: type mismatch", short.stderr)
+
     def run_all(self, runs: list[tuple[str, ...]]) -> list[subprocess.CompletedProcess[str]]:
         """Each run's result, in order; the runs go in parallel."""
         with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
@@ -1558,9 +1590,10 @@ class CompilerTests(unittest.TestCase):
         results: list[str] = []
         # Started from this thread, so that `limit_memory` runs in no threaded child.
         for start in range(0, len(paths), workers):
-            running = [subprocess.Popen([str(self.binary), command, str(path)], stdout=subprocess.PIPE,
+            running = [subprocess.Popen([str(self.binary), command, str(path),
+                                         *(["--emit-c"] if command == "build" else [])], stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE, text=True, preexec_fn=limit_memory,
-                                        env=dict(os.environ, KURSAL_LIB=str(LIB)))
+                                        env=dict(os.environ, KURSAL_LIB=str(LIB), KURSAL_DIAGNOSTICS="short"))
                        for path in paths[start:start + workers]]
             for process in running:
                 stdout, stderr = process.communicate(timeout=TIME_LIMIT)
