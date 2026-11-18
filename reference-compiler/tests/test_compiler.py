@@ -12,7 +12,8 @@ the same C, and builds it under valgrind freeing every byte;
 its KURS reader and writer read every lowered program and write it back as this compiler's writer
 does, and reject malformed KURS with the same message; its checker accepts and rejects, with the same
 message, every core program this compiler's own tests check; and from every lowered program it writes
-the same C and the same readable KURS."""
+the same C and the same readable KURS. Its `doc` writes a Krayon site whose pages carry a package's
+documentation comments and signatures, and whose links all lead somewhere."""
 
 import dataclasses
 import functools
@@ -21,6 +22,7 @@ import importlib
 import itertools
 import json
 import os
+import re
 import resource
 import shutil
 import subprocess
@@ -673,6 +675,105 @@ def manifest(name: str, deps: tuple[str, ...] = (), entry: str | None = None) ->
     for dep in deps:
         text += f'[dependencies.{dep}]\npath="{LIB / "core" if dep == "core" else "../" + dep}"\n'
     return text
+
+
+# A package for `kursal doc`: overview and item comments, a struct with methods, a trait, an instance of
+# it, a constant, a function under a `forall` premise of several lines, and what the site leaves out: a
+# plain comment and an extern.
+DOC_PACKAGE = """\
+//! Gizmos for testing the documentation site.
+//! A second line of the overview.
+
+// An implementation note, not published.
+extern "C" fn abs(n: i32) -> i32;
+
+/// A point on a grid.
+exposed struct Point {
+    x: u32,
+    y: u32,
+}
+
+impl Point {
+    /// The point at the origin.
+    fn origin() -> Point {
+        Point.{ x: 0u32, y: 0u32 }
+    }
+
+    /// The sum of both coordinates.
+    fn sum(self) -> u32 {
+        self.x + self.y
+    }
+}
+
+/// Things with a size.
+forall Self.
+trait Measure {
+    fn size(self: Self) -> u32;
+}
+
+/// A point's size is the sum of its coordinates.
+instance Measure[Point] {
+    fn size(self: Point) -> u32 {
+        self.sum()
+    }
+}
+
+/// The largest coordinate.
+const LIMIT: u32 = 100u32;
+
+/// The first of two values.
+forall T, U
+    where Copy[T],
+          Copy[U].
+fn first(a: T, b: U) -> T {
+    a
+}
+"""
+
+
+def markdown_link_errors(src: Path) -> list[str]:
+    """The links of a generated site's Markdown that lead nowhere: a root-relative target names the
+    `index.md` under SRC, a fragment the `{#id}` of a heading on that page. Front matter's `parent`,
+    `parents` and sidebar `url`s count as links; code does not."""
+    anchors = {page: set(re.findall(r"\{#([\w:-]+)", page.read_text())) for page in src.rglob("*.md")}
+    errors = []
+    for page in anchors:
+        text = re.sub(r"```.*?```", "", page.read_text(), flags=re.S)
+        text = re.sub(r"`[^`\n]*`", "", text)
+        targets = re.findall(r"\]\(([^)\s]+)\)", text) + re.findall(r'^(?:url|parent) = "([^"]+)"', text, re.M)
+        for listed in re.findall(r"^parents = \[(.*)\]$", text, re.M):
+            targets += re.findall(r'"([^"]+)"', listed)
+        for target in targets:
+            path, _, fragment = target.partition("#")
+            dest = page if not path else src / path.strip("/") / "index.md"
+            if dest not in anchors or (fragment and fragment not in anchors[dest]):
+                errors.append(f"{page.relative_to(src)}: {target}")
+    return errors
+
+
+def html_link_errors(dist: Path) -> list[str]:
+    """The local `href`s and `src`s of a built site that name no file, or no `id` in it."""
+    dist = dist.resolve()
+    ids = {page: set(re.findall(r'\sid="([^"]+)"', page.read_text())) for page in dist.rglob("*.html")}
+    errors = []
+    for page in ids:
+        for target in re.findall(r'(?:href|src)="([^"]+)"', page.read_text()):
+            if re.match(r"[a-z]+:|//", target):
+                continue
+            path, _, fragment = target.partition("#")
+            path = path.partition("?")[0]
+            if not path:
+                dest = page
+            elif path.startswith("/"):
+                dest = dist / path.lstrip("/")
+            else:
+                dest = page.parent / path
+            if dest.is_dir():
+                dest = dest / "index.html"
+            dest = dest.resolve()
+            if not dest.is_file() or (fragment and fragment not in ids.get(dest, set())):
+                errors.append(f"{page.relative_to(dist)}: {target}")
+    return errors
 
 
 def needs_core(source: str) -> tuple[str, ...]:
@@ -1882,6 +1983,104 @@ class CompilerTests(unittest.TestCase):
                                                capture_output=True, text=True, timeout=TIME_LIMIT, env=env)
                     self.assertEqual((ours.returncode, ours.stdout, ours.stderr), (1, "", message))
                     self.assertEqual((reference.returncode, reference.stdout, reference.stderr), (1, "", message))
+
+    def test_doc_writes_comments_and_signatures(self):
+        """`kursal doc` on a small package: the `//!` overview, each declaration under a heading of its kind
+        with its `///` comment and its signature, an instance under what it is an instance of, a `forall`
+        premise of several lines kept whole, and no plain comment or extern."""
+        with tempfile.TemporaryDirectory() as directory:
+            package, site = Path(directory) / "gizmo", Path(directory) / "site"
+            package.mkdir()
+            (package / "kur.toml").write_text(manifest("gizmo"))
+            (package / "lib.kur").write_text(DOC_PACKAGE)
+            result = self.run_compiler("doc", str(package), "-o", str(site))
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+            page = (site / "src/gizmo/index.md").read_text()
+            self.assertEqual(markdown_link_errors(site / "src"), [])
+            self.assertTrue((site / "krayon.toml").is_file())
+            self.assertTrue((site / "src/_includes/module.html").is_file())
+            self.assertTrue((site / "src/assets/site.css").is_file())
+        front, _, body = page.partition("+++\n# gizmo\n\n")
+        self.assertIn('layout = "module.html"', front)
+        for name, section in (("Definition", "Types"), ("origin", "Types"), ("sum", "Types"), ("Measure", "Traits"),
+                              ("Measure[Point]", "Instances"), ("LIMIT", "Constants"), ("first", "Functions")):
+            self.assertIn(f'name = "{name}"\nsection = "{section}"', front)
+        self.assertTrue(body.startswith("Gizmos for testing the documentation site.\nA second line of the overview.\n\n"
+                                        "Source: `lib.kur`\n\n## Declarations\n\n"), body[:300])
+        expected = [
+            ("struct", "Point", "A point on a grid.", "exposed struct Point {\n    x: u32,\n    y: u32,\n}"),
+            ("method", "Point::origin", "The point at the origin.", "fn origin() -> Point { ... }"),
+            ("method", "Point::sum", "The sum of both coordinates.", "fn sum(self) -> u32 { ... }"),
+            ("trait", "Measure", "Things with a size.",
+             "forall Self.\ntrait Measure {\n    fn size(self: Self) -> u32;\n}"),
+            ("instance", "Measure[Point]", "A point's size is the sum of its coordinates.",
+             "instance Measure[Point] { ... }"),
+            ("const", "LIMIT", "The largest coordinate.", "const LIMIT: u32 = 100u32;"),
+            ("fn", "first", "The first of two values.",
+             "forall T, U\n    where Copy[T],\n          Copy[U].\nfn first(a: T, b: U) -> T { ... }"),
+        ]
+        headings = re.findall(r"^### `(\w+)` (.+) \{#item-\d+ \.item-heading \.doc-kind-\1\}$", body, re.M)
+        self.assertEqual(headings, [(kind, name) for kind, name, _, _ in expected])
+        for kind, name, prose, signature in expected:
+            with self.subTest(item=name):
+                self.assertRegex(body, re.escape(f"`{kind}` {name} {{#item-") + r"\d+"
+                                 + re.escape(f" .item-heading .doc-kind-{kind}}}\n\n{prose}\n\n```kursal\n{signature}\n```\n"))
+        for hidden in ("implementation note", "fn abs", "extern"):
+            self.assertNotIn(hidden, page)
+
+    def test_doc_site_of_the_standard_library(self):
+        """`kursal doc lib/std` documents std and its dependencies, every link in its Markdown leads to a page
+        and an anchor there, and no extern is listed."""
+        with tempfile.TemporaryDirectory() as directory:
+            site = Path(directory) / "site"
+            result = self.run_compiler("doc", str(LIB / "std"), "-o", str(site))
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+            pages = sorted(site.joinpath("src").rglob("*.md"))
+            self.assertGreater(len(pages), 30)
+            for package in ("std", "core", "alloc"):
+                self.assertTrue((site / "src" / package / "index.md").is_file(), package)
+            self.assertEqual(markdown_link_errors(site / "src"), [])
+            text = "".join(page.read_text() for page in pages)
+            self.assertNotIn("`extern`", text)
+            self.assertNotIn("kur_libc_", text)
+            self.assertIn("### `instance` Ord[u8, u8] {#item-", text)
+
+    def test_doc_site_builds_with_krayon(self):
+        """Krayon builds the standard library's site, and every local link and anchor of its HTML resolves."""
+        krayon = shutil.which("krayon")
+        if krayon is None:
+            self.skipTest("krayon is not on the PATH; build Krayon and put it on the PATH to check the site's HTML")
+        with tempfile.TemporaryDirectory() as directory:
+            site = Path(directory) / "site"
+            result = self.run_compiler("doc", str(LIB / "std"), "-o", str(site))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            built = subprocess.run([krayon, "build", str(site)], capture_output=True, text=True, timeout=TIME_LIMIT,
+                                   preexec_fn=limit_memory)
+            self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+            self.assertGreater(len(list((site / "dist").rglob("*.html"))), 30)
+            self.assertEqual(html_link_errors(site / "dist"), [])
+
+    def test_doc_refuses_an_existing_output_and_a_missing_theme(self):
+        """`kursal doc` writes no site over an existing path, and none when the theme beside the standard
+        library is missing; either way it says why and leaves the file system as it was."""
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            existing = base / "existing"
+            existing.mkdir()
+            (existing / "keep").write_text("mine\n")
+            result = self.run_compiler("doc", str(LIB / "std"), "-o", str(existing))
+            self.assertEqual((result.returncode, result.stderr),
+                             (1, "documentation output already exists; choose a new -o path\n"))
+            self.assertEqual(sorted(p.name for p in existing.iterdir()), ["keep"])
+            (base / "bare").mkdir()
+            (base / "bare/lib").symlink_to(LIB)
+            missing = subprocess.run([str(self.binary), "doc", str(LIB / "std"), "-o", str(base / "site")],
+                                     capture_output=True, text=True, timeout=TIME_LIMIT, preexec_fn=limit_memory,
+                                     env=dict(os.environ, KURSAL_LIB=str(base / "bare/lib")))
+            self.assertEqual((missing.returncode, missing.stderr),
+                             (1, f"documentation theme not found: {base / 'bare/docs/theme/_includes'} is missing; "
+                                 "kursal doc reads docs/theme beside the standard library directory\n"))
+            self.assertFalse((base / "site").exists())
 
     def test_parser_matches_reference(self):
         paths = sorted(p for top in ("lib", "examples", "compiler", "reference-compiler/examples")
