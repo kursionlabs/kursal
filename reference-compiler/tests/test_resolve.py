@@ -91,6 +91,8 @@ class GraphTests(unittest.TestCase):
             '[package]\nname="p"\nsource_root="."\nlink_flags=["-lm", 3]\n',
             '[package]\nname="p"\nsource_root="."\nlink_flags=[""]\n',
             '[package]\nname="p"\nsource_root="."\nlink_flags=["-l\\u0000x"]\n',
+            '[package]\nname="p"\nsource_root="."\nc_sources="native.c"\n',
+            '[package]\nname="p"\nsource_root="."\nc_sources=[""]\n',
         )
         for source in manifests:
             with self.subTest(source=source), self.assertRaises(ResolveError):
@@ -105,6 +107,15 @@ class GraphTests(unittest.TestCase):
                      "dep/lib.kur": ""})
         packages = resolve(root / "app").packages
         self.assertEqual([package.link_flags for package in packages], [["-lapp"], ["-lfirst", "-lsecond"]])
+
+    def test_c_sources_are_relative_to_the_declaring_package(self):
+        root = tree({"app/kur.toml": '[package]\nname="app"\nsource_root="."\n'
+                                      '[dependencies.dep]\npath="../dep"\n',
+                     "app/lib.kur": "", "dep/kur.toml": '[package]\nname="dep"\nsource_root="."\n'
+                                                          'c_sources=["native/bridge.c"]\n',
+                     "dep/lib.kur": "", "dep/native/bridge.c": ""})
+        packages = resolve(root / "app").packages
+        self.assertEqual(packages[1].c_sources, [(root / "dep/native/bridge.c").resolve()])
 
     def test_a_package_is_a_library_or_an_executable(self):
         for kind in ("executabl", "Library", ""):

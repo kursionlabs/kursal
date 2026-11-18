@@ -74,6 +74,7 @@ exposed struct Handoff {
     // `build`'s OUTPUT
     output: Option[Span['k]],
     link_flags: ArenaVec[Span['k], 'k],
+    c_sources: ArenaVec[Span['k], 'k],
     times: bool,
     // when the current stage started
     started: Instant,
@@ -84,7 +85,7 @@ forall 'a, 'b.
 fn carry(&from: Domain!['a], &to: Domain!['b], handoff: Handoff['a]) -> Handoff['b] {
     Handoff.{ goal: handoff.goal, program: copy_program(&from, &to, handoff.program), counter: carry_fresh(&from, &to, handoff.counter),
         entry: copy_option_text(&from, &to, handoff.entry), output: copy_option_text(&from, &to, handoff.output),
-        link_flags: copy_texts(&from, &to, handoff.link_flags), times: handoff.times,
+        link_flags: copy_texts(&from, &to, handoff.link_flags), c_sources: copy_texts(&from, &to, handoff.c_sources), times: handoff.times,
         started: handoff.started }
 }
 
@@ -118,7 +119,7 @@ fn main(args: Args) -> i32 {
     let exists 'b. back = Domain!::new();
     var back = back;
     let emitted = carry(&core, &back, Handoff.{ goal: checked.goal, program: checked.program, counter: checked.counter, entry: checked.entry,
-        output: checked.output, link_flags: checked.link_flags, times: checked.times, started });
+        output: checked.output, link_flags: checked.link_flags, c_sources: checked.c_sources, times: checked.times, started });
     started = stage(times, "back copy", started);
     let typed = copy_typed(&core, &back, checker.typed);
     started = stage(times, "typed copy", started);
@@ -210,7 +211,7 @@ fn front_end(&cx: Domain!['k], process_args: Args) -> Option[Handoff['k]] {
         Option::None
     } else if command.is(&cx, "check") && args.len(&cx) == 2usize {
         Option::Some.(Handoff.{ goal: Goal::Check, program: parse_program(&cx, read_file(&cx, args.at(&cx, 1usize))), counter: Fresh::new(&cx),
-            entry: Option::None, output: Option::None, link_flags: ArenaVec::new(&cx), times: false, started: Instant::now() })
+            entry: Option::None, output: Option::None, link_flags: ArenaVec::new(&cx), c_sources: ArenaVec::new(&cx), times: false, started: Instant::now() })
     } else if command.is(&cx, "c") {
         var file: Option[Span['k]] = Option::None;
         var entry: Option[Span['k]] = Option::None;
@@ -231,7 +232,7 @@ fn front_end(&cx: Domain!['k], process_args: Args) -> Option[Handoff['k]] {
             Option::None => fail(&cx, Span::from_static(&cx, "usage: kursal c FILE [--entry NAME]")),
         };
         Option::Some.(Handoff.{ goal: Goal::C, program: parse_program(&cx, read_file(&cx, path)), counter: Fresh::new(&cx),
-            entry, output: Option::None, link_flags: ArenaVec::new(&cx), times: false, started: Instant::now() })
+            entry, output: Option::None, link_flags: ArenaVec::new(&cx), c_sources: ArenaVec::new(&cx), times: false, started: Instant::now() })
     } else if command.is(&cx, "lower") && args.len(&cx) == 2usize {
         let counter = Fresh::new(&cx);
         let r = resolve(&cx, args.at(&cx, 1usize));
@@ -325,17 +326,25 @@ fn build(&cx: Domain!['k], args: ArenaVec[Span['k], 'k]) -> Handoff['k] {
         }
     };
     let link_flags: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+    let c_sources: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
     var p = 0usize;
     while p < r.packages.len(&cx) {
-        let flags = r.packages.at(&cx, p).link_flags;
+        let package = r.packages.at(&cx, p);
+        let flags = package.link_flags;
         var f = 0usize;
         while f < flags.len(&cx) {
             link_flags.push(&cx, flags.at(&cx, f));
             f = f + 1usize;
         }
+        let sources = package.c_sources;
+        f = 0usize;
+        while f < sources.len(&cx) {
+            c_sources.push(&cx, sources.at(&cx, f));
+            f = f + 1usize;
+        }
         p = p + 1usize;
     }
-    Handoff.{ goal: Goal::Build, program, counter, entry, output: destination, link_flags, times, started }
+    Handoff.{ goal: Goal::Build, program, counter, entry, output: destination, link_flags, c_sources, times, started }
 }
 
 // The back end, in the arena `cx`, which it destroys: the C of `handoff`'s program, printed or,
@@ -376,6 +385,11 @@ fn back_end(cx: Domain!['k], handoff: Handoff['k], typed: ArenaMap[FunKey['k], A
         .arg(&cx, c_file).arg(&cx, Buffer!::new().push_bytes(&cx, lib).push_static("/libc/fs.c").save(&cx))
         .arg(&cx, Buffer!::new().push_bytes(&cx, lib).push_static("/libc/thread.c").save(&cx));
     var f = 0usize;
+    while f < handoff.c_sources.len(&cx) {
+        command = command.arg(&cx, handoff.c_sources.at(&cx, f));
+        f = f + 1usize;
+    }
+    f = 0usize;
     while f < handoff.link_flags.len(&cx) {
         command = command.arg(&cx, handoff.link_flags.at(&cx, f));
         f = f + 1usize;

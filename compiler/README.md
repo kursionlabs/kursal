@@ -67,6 +67,7 @@ backend spends its time; `C` remains the total for that stage.
 `build --emit-c` prints generated C, which also works for library packages. The compiler
 passes each package's `[package] link_flags = ["-luv"]` entries as C compiler arguments
 after the generated C and helper sources; flags declared by dependencies are included.
+`[package] c_sources = ["native/uv.c"]` adds package-relative C sources to the same build.
 The compiler prints a source line and caret below a located error; `KURSAL_DIAGNOSTICS=short`
 retains the one-line form used by the reference comparison tests. `--help`, command `--help`,
 and `--version` are available without building a package.

@@ -2,6 +2,7 @@
 program in examples/bad/ is rejected for the reason it demonstrates."""
 
 import subprocess
+import shutil
 import sys
 import tempfile
 import unittest
@@ -216,14 +217,15 @@ def build(package: Path, out: Path) -> tuple[str, Optional[Path], str]:
         return package.name, None, cc.stderr[:500] if cc.returncode else ""
     executable = out / package.name
     link_flags = [flag for dependency in resolver.packages for flag in dependency.link_flags]
-    cc = subprocess.run(cc_command([str(c_file), *map(str, C_HELPERS), *map(str, package.glob("*.c"))], str(executable), *link_flags),
+    c_sources = [str(source) for dependency in resolver.packages for source in dependency.c_sources]
+    cc = subprocess.run(cc_command([str(c_file), *map(str, C_HELPERS), *c_sources, *map(str, package.glob("*.c"))], str(executable), *link_flags),
                         capture_output=True, text=True)
     return package.name, executable, cc.stderr[:500] if cc.returncode else ""
 
 
 class ExampleTests(unittest.TestCase):
     def test_every_example_builds_and_runs_as_recorded(self):
-        packages = sorted(p.parent for p in EXAMPLES.glob("*/kur.toml"))
+        packages = sorted(p.parent for p in EXAMPLES.glob("*/kur.toml") if p.parent.name != "libuv_echo")
         with tempfile.TemporaryDirectory(prefix="kursal-examples-") as base:
             out = Path(base)
             with ProcessPoolExecutor(max_workers=4) as pool:
@@ -244,6 +246,15 @@ class ExampleTests(unittest.TestCase):
                                          (stdout.replace("{file}", str(sample)), status), args)
                         if stderr:
                             self.assertEqual(result.stderr, stderr[0], args)
+
+    def test_libuv_echo_builds(self):
+        if shutil.which("pkg-config") is None or subprocess.run(["pkg-config", "--exists", "libuv"]).returncode != 0:
+            self.skipTest("libuv headers and library are not installed")
+        with tempfile.TemporaryDirectory(prefix="kursal-libuv-echo-") as base:
+            name, executable, error = build(EXAMPLES / "libuv_echo", Path(base))
+            self.assertEqual(name, "libuv_echo")
+            self.assertEqual(error, "")
+            self.assertIsNotNone(executable)
 
     def test_bad_examples_are_rejected_for_their_reason(self):
         sys.setrecursionlimit(20000)

@@ -131,6 +131,7 @@ kind = "executable"          # or "library" (the default)
 entry = "package::main"      # executables only
 source_root = "src"          # the default
 link_flags = ["-luv"]        # optional linker arguments, inherited by dependents
+c_sources = ["native/uv.c"] # optional C sources, relative to this package
 
 [dependencies.std]
 path = "../lib/std"
@@ -143,6 +144,11 @@ be "library" or "executable"`).
 to the C compiler after the generated C and helper sources. Flags from the executable and every dependency
 are included in package traversal order, so a library can declare its own `-l` requirement.
 The compiler passes arguments directly, without a shell.
+
+`c_sources` is an array of package-relative C source paths. Both build commands resolve each path
+against the declaring package's directory and compile the sources of all dependencies alongside
+the generated C, before passing `link_flags` to the linker. Native dependencies such as libuv
+remain optional: only packages that declare these sources and flags require them.
 
 An executable's entry is a safe, non-generic function without premises, of
 one of three shapes, each with or without a parameter `args: Args` of type

@@ -1558,8 +1558,8 @@ class CompilerTests(unittest.TestCase):
         self.assertEqual(short.stderr.count("\n"), 1)
         self.assertIn("type_mismatch.kur:6:22: type mismatch", short.stderr)
 
-    def test_dependency_link_flags_reach_the_c_compiler(self):
-        """A library's link requirement is used by both executable build commands."""
+    def test_dependency_native_sources_and_link_flags_reach_the_c_compiler(self):
+        """A library's C source and link requirement are used by both executable build commands."""
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             app, dep = base / "app", base / "dep"
@@ -1567,10 +1567,12 @@ class CompilerTests(unittest.TestCase):
             dep.mkdir()
             (app / "kur.toml").write_text('[package]\nname="app"\nsource_root="."\nkind="executable"\n'
                                           'entry="main"\n[dependencies.dep]\npath="../dep"\n')
-            (app / "lib.kur").write_text('extern "C" fn cos(x: f64) -> f64;\n'
-                                         'fn main() -> i32 { if unsafe cos(0.0f64) == 1.0f64 { 0i32 } else { 1i32 } }\n')
-            (dep / "kur.toml").write_text('[package]\nname="dep"\nsource_root="."\nlink_flags=["-lm"]\n')
+            (app / "lib.kur").write_text('extern "C" fn native_cos(x: f64) -> f64;\n'
+                                         'fn main() -> i32 { if unsafe native_cos(0.0f64) == 1.0f64 { 0i32 } else { 1i32 } }\n')
+            (dep / "kur.toml").write_text('[package]\nname="dep"\nsource_root="."\n'
+                                          'c_sources=["native.c"]\nlink_flags=["-lm"]\n')
             (dep / "lib.kur").write_text("")
+            (dep / "native.c").write_text('#include <math.h>\ndouble native_cos(double x) { return cos(x); }\n')
             ours = self.run_compiler("build", str(app), "-o", str(base / "ours"))
             self.assertEqual(ours.returncode, 0, ours.stderr)
             reference = subprocess.run([sys.executable, str(ROOT / "reference-compiler/tools/build.py"),

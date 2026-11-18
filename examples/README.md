@@ -4,8 +4,9 @@ Each directory is a package: a `kur.toml` manifest and its `.kur` sources. Packa
 `kind="executable"` are programs; the others are libraries that demonstrate a feature and only need to
 build. `bad/` holds single-file programs that the compiler must reject.
 
-`tests/test_examples.py` in the reference compiler builds every package, runs every program with the
-arguments and input it expects, and checks that every program in `bad/` is rejected for its reason.
+`tests/test_examples.py` in the reference compiler builds the packages, runs programs with the
+arguments and input they expect, and checks that every program in `bad/` is rejected for its reason.
+`libuv_echo` has a separate build check when libuv is installed and a loopback script for its socket behavior.
 
 ## Building and running one
 
@@ -63,6 +64,7 @@ Larger programs: complete applications, or a feature used where it is the right 
 | `atomics` | atomic operations, memory orderings, a fence and volatile access, each with its reason and the `unsafe` contract it relies on |
 | `blockalloc` | a fixed-size block allocator under a scripted workload |
 | `host` | the host without `unsafe`: arguments (`fn main(args: Args)`), the environment, files and directories, running programs, a monotonic clock and a sleep, floats from text and their bits |
+| [`libuv_echo`](libuv_echo/README.md) | a one-client TCP server: safe application code chooses to write each input buffer back, while a C shim owns libuv callbacks and buffers; building needs libuv headers and `-luv` |
 
 ## Reference examples
 

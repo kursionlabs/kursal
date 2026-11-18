@@ -363,6 +363,8 @@ exposed struct Package {
     deps: ArenaMap[Span['k], usize, 'k],
     // C compiler arguments, after source files; a build uses these from every package.
     link_flags: ArenaVec[Span['k], 'k],
+    // Absolute paths to C sources declared relative to this package.
+    c_sources: ArenaVec[Span['k], 'k],
     // an executable's entry path
     entry: Ref[Option[ArenaVec[Span['k], 'k]], 'k],
     // module -> source path
@@ -633,6 +635,7 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
         source_root: Ref::new(&cx, match source_root { Option::Some(s) => s, Option::None => root }),
         deps: ArenaMap::new(&cx),
         link_flags: ArenaVec::new(&cx),
+        c_sources: ArenaVec::new(&cx),
         entry: Ref::new(&cx, entry),
         files: ArenaMap::new(&cx),
         entry_decl: Ref::new(&cx, Option::None),
@@ -661,7 +664,7 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
         i = 0usize;
         while i < info_keys.len(&cx) {
             let key = info_keys.at(&cx, i);
-            if !among(&cx, key, "name kind source_root entry link_flags") {
+            if !among(&cx, key, "name kind source_root entry link_flags c_sources") {
                 unknown.insert(&cx, key);
             }
             i = i + 1usize;
@@ -679,26 +682,17 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
         }
         package.name.set(&cx, string(&cx, info, manifest, "name", Option::None));
         package.source_root.set(&cx, resolved(&cx, join(&cx, root, string(&cx, info, manifest, "source_root", Option::Some.(Span::from_static(&cx, "src"))))));
-        match info.get(&cx, Span::from_static(&cx, "link_flags")) {
-            Option::Some(value) => {
-                let flags = match value.as_array() {
-                    Option::Some(items) => items,
-                    Option::None => fail(&cx, Buffer!::new().push_bytes(&cx, manifest).push_static(": manifest 'link_flags' must be an array of nonempty strings without NUL").save(&cx)),
-                };
-                var f = 0usize;
-                while f < flags.len(&cx) {
-                    let flag = match flags.at(&cx, f).as_string() {
-                        Option::Some(s) => s,
-                        Option::None => fail(&cx, Buffer!::new().push_bytes(&cx, manifest).push_static(": manifest 'link_flags' must be an array of nonempty strings without NUL").save(&cx)),
-                    };
-                    if flag.is_empty() || !flag.find_byte(&cx, 0u8, 0usize).is_none() {
-                        fail(&cx, Buffer!::new().push_bytes(&cx, manifest).push_static(": manifest 'link_flags' must be an array of nonempty strings without NUL").save(&cx));
-                    }
-                    package.link_flags.push(&cx, flag);
-                    f = f + 1usize;
-                }
-            },
-            Option::None => (),
+        let flags = strings(&cx, info, manifest, "link_flags");
+        var f = 0usize;
+        while f < flags.len(&cx) {
+            package.link_flags.push(&cx, flags.at(&cx, f));
+            f = f + 1usize;
+        }
+        let sources = strings(&cx, info, manifest, "c_sources");
+        f = 0usize;
+        while f < sources.len(&cx) {
+            package.c_sources.push(&cx, resolved(&cx, join(&cx, root, sources.at(&cx, f))));
+            f = f + 1usize;
         }
         let kind = string(&cx, info, manifest, "kind", Option::Some.(Span::from_static(&cx, "library")));
         if !kind.is(&cx, "library") && !kind.is(&cx, "executable") {
@@ -776,6 +770,35 @@ fn string(&cx: Domain!['k], t: ArenaMap[Span['k], TomlValue['k], 'k], manifest: 
         Option::Some(s) => s,
         Option::None => fail(&cx, Buffer!::new().push_bytes(&cx, manifest).push_static(": manifest ").push_bytes(&cx, repr(&cx, Span::from_static(&cx, key))).push_static(" must be a string").save(&cx)),
     }
+}
+
+// An optional array of command arguments or source paths in a manifest.
+forall 'k.
+fn strings(&cx: Domain!['k], t: ArenaMap[Span['k], TomlValue['k], 'k], manifest: Span['k], key: Slice[u8, 'static]) -> ArenaVec[Span['k], 'k] {
+    let values = match t.get(&cx, Span::from_static(&cx, key)) {
+        Option::Some(value) => match value.as_array() {
+            Option::Some(items) => items,
+            Option::None => fail(&cx, Buffer!::new().push_bytes(&cx, manifest).push_static(": manifest ")
+                .push_bytes(&cx, repr(&cx, Span::from_static(&cx, key))).push_static(" must be an array of nonempty strings without NUL").save(&cx)),
+        },
+        Option::None => ArenaVec::new(&cx),
+    };
+    let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+    var i = 0usize;
+    while i < values.len(&cx) {
+        let value = match values.at(&cx, i).as_string() {
+            Option::Some(s) => s,
+            Option::None => fail(&cx, Buffer!::new().push_bytes(&cx, manifest).push_static(": manifest ")
+                .push_bytes(&cx, repr(&cx, Span::from_static(&cx, key))).push_static(" must be an array of nonempty strings without NUL").save(&cx)),
+        };
+        if value.is_empty() || !value.find_byte(&cx, 0u8, 0usize).is_none() {
+            fail(&cx, Buffer!::new().push_bytes(&cx, manifest).push_static(": manifest ")
+                .push_bytes(&cx, repr(&cx, Span::from_static(&cx, key))).push_static(" must be an array of nonempty strings without NUL").save(&cx));
+        }
+        out.push(&cx, value);
+        i = i + 1usize;
+    }
+    out
 }
 
 // Whether `path` names anything. An error other than its absence stops resolution: the file may be

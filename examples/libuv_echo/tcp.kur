@@ -1,0 +1,89 @@
+// EXPERIMENTAL one-client TCP transport. User code decides whether each
+// owned input buffer causes a write, another read, or a close.
+// C owns sockets and pending writes; this module owns the function payload.
+use std::alloc::heap::HeapAllocator;
+use std::bytes::buffer::Buffer!;
+use std::mem::sizeof;
+use std::option::Result;
+
+extern "C" fn kur_uv_tcp_new(port: u16,
+    handler: unsafe fn(*u8, *u8, *u8, usize) -> i32, context: *u8, out_error: *i32) -> *u8;
+extern "C" fn kur_uv_tcp_port(server: *u8) -> u16;
+extern "C" fn kur_uv_tcp_write_copy(client: *u8, bytes: *u8, len: usize) -> i32;
+extern "C" fn kur_uv_tcp_run_and_free(server: *u8) -> i32;
+extern "C" fn kur_uv_tcp_stop_and_free(server: *u8) -> ();
+
+exposed enum TcpAction! {
+    Write(Buffer!),
+    Continue,
+    Close,
+}
+
+struct HandlerPayload { handler: fn(Buffer!) -> TcpAction! }
+
+// The C read callback lends data and client only for this synchronous call.
+// Copy incoming bytes into a linear Buffer!, then copy the returned Buffer!
+// into C-owned write storage when requested. No raw pointer escapes.
+unsafe fn on_read(context: *u8, client: *u8, bytes: *u8, len: usize) -> i32 {
+    let typed = unsafe (context as *HandlerPayload);
+    let { handler } = unsafe *typed;
+    let input = unsafe Buffer!::new_with_cap(len).push_n(bytes, len);
+    match handler(input) {
+        TcpAction!::Write(response) => {
+            let p = unsafe &response.as_ptr();
+            let n = &response.len();
+            let status = unsafe kur_uv_tcp_write_copy(client, p, n);
+            response.destroy();
+            status
+        },
+        TcpAction!::Continue => 0i32,
+        TcpAction!::Close => 1i32,
+    }
+}
+
+struct TcpServer! { raw: *u8, payload: *u8 }
+
+impl TcpServer! {
+    // On allocation, bind or listen failure, C reports its libuv error code.
+    // No callback ran; this call frees its payload on that path.
+    fn bind_local(port: u16, handler: fn(Buffer!) -> TcpAction!) -> Result[TcpServer!, i32] {
+        let box = HeapAllocator::alloc(sizeof[HandlerPayload]());
+        let payload = box.into_raw();
+        let typed = unsafe (payload as *HandlerPayload);
+        unsafe *typed = HandlerPayload.{ handler };
+        let scratch = Buffer!::new_zeroed(sizeof[i32]());
+        let error_ptr = unsafe &scratch.as_ptr();
+        let raw = unsafe kur_uv_tcp_new(port, on_read, payload, unsafe (error_ptr as *i32));
+        let error = unsafe *(unsafe (error_ptr as *i32));
+        scratch.destroy();
+        if unsafe (raw as usize) == 0usize {
+            let freed = HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(payload));
+            Result::Err.(error)
+        } else {
+            Result::Ok.(TcpServer!.{ raw, payload })
+        }
+    }
+
+    fn port(&self) -> u16 {
+        let { raw, payload } = self;
+        let port = unsafe kur_uv_tcp_port(raw);
+        self = TcpServer!.{ raw, payload };
+        port
+    }
+
+    // Terminate a freshly bound server before entering the event loop.
+    fn stop(self) -> () {
+        let { raw, payload } = self;
+        let done = unsafe kur_uv_tcp_stop_and_free(raw);
+        let freed = HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(payload));
+    }
+
+    // Runs through one client's EOF and pending writes. C frees every uv
+    // handle in its close callback; only then does it free the loop.
+    fn run(self) -> Result[(), i32] {
+        let { raw, payload } = self;
+        let status = unsafe kur_uv_tcp_run_and_free(raw);
+        let freed = HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(payload));
+        if status == 0i32 { Result::Ok.(()) } else { Result::Err.(status) }
+    }
+}

@@ -55,8 +55,9 @@ def build(package: Path, output: Path, times: bool, kurs: Optional[Path] = None)
     compiler = c_compiler()
     # The C compiler's own diagnostics go to stderr as it writes them; a failure is reported after them.
     try:
+        c_sources = [str(source) for dependency in resolver.packages for source in dependency.c_sources]
         link_flags = [flag for dependency in resolver.packages for flag in dependency.link_flags]
-        built = subprocess.run(cc_command([str(c_file), *map(str, C_HELPERS)], str(output), *link_flags))
+        built = subprocess.run(cc_command([str(c_file), *map(str, C_HELPERS), *c_sources], str(output), *link_flags))
     except OSError as error:
         raise SystemExit(f"cannot run the C compiler {compiler} (error {error.errno})")
     stage("cc")
