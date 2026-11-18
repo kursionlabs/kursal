@@ -16,6 +16,7 @@ reference in the tests.
 | `syntax::dump` | | the AST as text |
 | `resolve::resolver` | `resolve.py` | manifests (read by the standard library's `toml`), the package graph, and what every name names |
 | `resolve::dump` | | a resolved program as text |
+| `doc::generator` | | documentation comments and resolved public modules to a Krayon site (`kursal doc`) |
 | `kurs::core`, `kurs::sexpr` | `core.py`, `sexpr.py` | the KURS core and S-expressions |
 | `kurs::serial` | `kurs.py` | serialized KURS: its reader and writer |
 | `kurs::readable` | `readable.py` | readable KURS |

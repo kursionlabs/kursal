@@ -37,6 +37,20 @@ directory. Use `-o OUTPUT` to choose another location, or `--emit-c` to print th
 [`examples/README.md`](examples/README.md) lists the example programs, starting with the ones to read
 first.
 
+## API documentation
+
+`kursal doc` generates a Krayon site from a package's public modules, `//!`
+module comments, `///` item comments, and declaration signatures. For the standard library and its
+dependencies:
+
+```sh
+bin/kursal doc lib/std -o docs/generated
+../krayon/bin/krayon build docs/generated
+```
+
+See [`docs/README.md`](docs/README.md) for serving the generated site. Krayon
+is built separately from its sibling repository.
+
 ## Repository
 
 | Directory | Contents |

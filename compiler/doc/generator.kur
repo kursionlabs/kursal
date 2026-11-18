@@ -1,0 +1,574 @@
+// Generate a Krayon input tree from the resolver's parsed modules. This lives in the compiler so
+// the published documentation follows the same package and module rules as a build.
+use package::resolve::resolver::{ModuleId, Owner, Named, Resolver, Target};
+use package::syntax::ast as S;
+use std::alloc::arena::Domain!;
+use std::bytes::buffer::Buffer!;
+use std::collections::arena_vec::ArenaVec;
+use std::fs::{mkdir, path_exists, read_to_arena, write};
+use std::option::{Option, Result};
+use std::raw::Span;
+
+forall 'k.
+fn lit(&cx: Domain!['k], value: std::slice::Slice[u8, 'static]) -> Span['k] {
+    Span::from_static(&cx, value)
+}
+
+forall 'k.
+fn path(&cx: Domain!['k], base: Span['k], name: Span['k]) -> Span['k] {
+    Buffer!::new().push_bytes(&cx, base).push_static("/").push_bytes(&cx, name).save(&cx)
+}
+
+forall 'k.
+fn url(&cx: Domain!['k], r: Resolver['k], home: ModuleId['k]) -> Span['k] {
+    var out = Buffer!::new().push_static("/").push_bytes(&cx, r.packages.at(&cx, home.package).name.copy(&cx)).push_static("/");
+    var i = 0usize;
+    while i < home.path.len(&cx) {
+        out = out.push_bytes(&cx, home.path.at(&cx, i)).push_static("/");
+        i = i + 1usize;
+    }
+    out.save(&cx)
+}
+
+forall 'k.
+fn require(&cx: Domain!['k], result: Result[(), std::io::Error], message: Span['k]) {
+    match result {
+        Result::Ok(_) => (),
+        Result::Err(_) => package::support::base::fail(&cx, message),
+    }
+}
+
+forall 'k.
+fn save(&cx: Domain!['k], file: Span['k], body: Buffer!) {
+    require(&cx, write(&cx, file, body), Buffer!::new().push_static("cannot write ").push_bytes(&cx, file).save(&cx));
+}
+
+forall 'k.
+fn directory(&cx: Domain!['k], file: Span['k]) {
+    let present = match path_exists(&cx, file) {
+        Result::Ok(found) => found,
+        Result::Err(_) => package::support::base::fail(&cx, Buffer!::new().push_static("cannot inspect ").push_bytes(&cx, file).save(&cx)),
+    };
+    if !present { require(&cx, mkdir(&cx, file), Buffer!::new().push_static("cannot create ").push_bytes(&cx, file).save(&cx)); }
+}
+
+// Offset of the first byte on a numbered source line. AST positions are one-based.
+forall 'k.
+fn line_start(&cx: Domain!['k], source: Span['k], line: u32) -> usize {
+    var at = 0usize;
+    var current = 1u32;
+    while current < line && at < source.len() {
+        at = match source.find_byte(&cx, b'\n', at) {
+            Option::Some(n) => n + 1usize,
+            Option::None => source.len(),
+        };
+        current = current + 1u32;
+    }
+    at
+}
+
+forall 'k.
+fn declaration_line(&cx: Domain!['k], source: Span['k], line: u32) -> u32 {
+    if line <= 1u32 { return line; }
+    let first = line_start(&cx, source, line - 1u32);
+    let previous = source.slice(first, line_start(&cx, source, line) - 1usize);
+    if previous.starts_with(&cx, lit(&cx, "forall ")) { line - 1u32 } else { line }
+}
+
+forall 'k.
+fn module_prose(&cx: Domain!['k], source: Span['k]) -> Buffer! {
+    var at = 0usize;
+    var out = Buffer!::new();
+    while at + 2usize < source.len() && source.byte_or_zero(&cx, at) == b'/' && source.byte_or_zero(&cx, at + 1usize) == b'/' && source.byte_or_zero(&cx, at + 2usize) == b'!' {
+        let end = match source.find_byte(&cx, b'\n', at) { Option::Some(n) => n, Option::None => source.len() };
+        var content = at + 3usize;
+        if content < end && source.byte_or_zero(&cx, content) == b' ' { content = content + 1usize; }
+        out = out.push_bytes(&cx, source.slice(content, end)).push_static("\n");
+        at = end + 1usize;
+    }
+    if at > 0usize { out.push_static("\n") } else { out }
+}
+
+// Consecutive /// lines immediately before a declaration are its prose. Ordinary implementation
+// comments are intentionally not published.
+forall 'k.
+fn prose(&cx: Domain!['k], source: Span['k], line: u32) -> Buffer! {
+    var start = line_start(&cx, source, line);
+    let lines: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+    var collecting = true;
+    while start > 0usize && collecting {
+        let end = start - 1usize;
+        var previous = end;
+        while previous > 0usize && source.byte_or_zero(&cx, previous - 1usize) != b'\n' {
+            previous = previous - 1usize;
+        }
+        var content = previous;
+        while content < end && (source.byte_or_zero(&cx, content) == b' ' || source.byte_or_zero(&cx, content) == b'\t') {
+            content = content + 1usize;
+        }
+        if content + 2usize >= end || source.byte_or_zero(&cx, content) != b'/' || source.byte_or_zero(&cx, content + 1usize) != b'/' || source.byte_or_zero(&cx, content + 2usize) != b'/' {
+            collecting = false;
+        } else {
+            content = content + 3usize;
+            if content < end && source.byte_or_zero(&cx, content) == b' ' { content = content + 1usize; }
+            lines.push(&cx, source.slice(content, end));
+            start = previous;
+        }
+    }
+    var out = Buffer!::new();
+    var i = lines.len(&cx);
+    while i > 0usize {
+        i = i - 1usize;
+        out = out.push_bytes(&cx, lines.at(&cx, i)).push_static("\n");
+    }
+    if !lines.is_empty(&cx) { out = out.push_static("\n"); }
+    out
+}
+
+// The source spelling of a declaration, stopping before a function body. Aggregate definitions
+// are kept whole only when their representation is exposed.
+forall 'k.
+fn signature(&cx: Domain!['k], source: Span['k], line: u32, aggregate: bool, is_exposed: bool) -> Span['k] {
+    var start = line_start(&cx, source, line);
+    while start < source.len() && (source.byte_or_zero(&cx, start) == b' ' || source.byte_or_zero(&cx, start) == b'\t') {
+        start = start + 1usize;
+    }
+    var at = start;
+    while at < source.len() {
+        let byte = source.byte_or_zero(&cx, at);
+        if byte == b';' { return source.slice(start, at + 1usize); }
+        if byte == b'{' {
+            if aggregate && is_exposed {
+                var depth = 1usize;
+                at = at + 1usize;
+                while at < source.len() && depth > 0usize {
+                    let next = source.byte_or_zero(&cx, at);
+                    if next == b'{' { depth = depth + 1usize; }
+                    if next == b'}' { depth = depth - 1usize; }
+                    at = at + 1usize;
+                }
+                return source.slice(start, at);
+            }
+            return source.slice(start, at + 1usize);
+        }
+        at = at + 1usize;
+    }
+    source.slice(start, at)
+}
+
+forall 'k.
+fn entry(&cx: Domain!['k], out: Buffer!, source: Span['k], name: Span['k], kind: Span['k], id: u32, pos: S::Pos, aggregate: bool, is_exposed: bool) -> Buffer! {
+    let first = declaration_line(&cx, source, pos.line);
+    var out = out.push_static("<h3 id=\"item-").push_usize(id as usize).push_static("\" class=\"item-heading\"><span class=\"kind kind-").push_bytes(&cx, kind)
+        .push_static("\">").push_bytes(&cx, kind).push_static("</span><span>").push_bytes(&cx, name).push_static("</span></h3>\n\n");
+    out = out.push_buffer(prose(&cx, source, first));
+    let sig = signature(&cx, source, first, aggregate, is_exposed);
+    out = out.push_static("```kursal\n").push_bytes(&cx, sig);
+    if aggregate && !is_exposed { out = out.push_static(" ... }"); }
+    if !aggregate && !sig.ends_with(&cx, Span::from_static(&cx, ";")) {
+        // A function or method signature ends before its body.
+        out = out.push_static(" ... }");
+    }
+    out.push_static("\n```\n\n")
+}
+
+forall 'k.
+fn other_methods(&cx: Domain!['k], r: Resolver['k], home: ModuleId['k], name: Span['k], out: Buffer!) -> Buffer! {
+    let scope = r.scopes.at(&cx, home);
+    let owner = match scope.decls.get(&cx, name) {
+        Option::Some(d) => d,
+        Option::None => return out,
+    };
+    let keys = r.attached.keys(&cx);
+    var out = out;
+    var k = 0usize;
+    while k < keys.len(&cx) {
+        let (target, member) = keys.at(&cx, k);
+        let matches = match target {
+            Owner::Decl(d) => d.id == owner.id,
+            _ => false,
+        };
+        if matches {
+            let methods = r.attached.at(&cx, (target, member));
+            var m = 0usize;
+            while m < methods.len(&cx) {
+                let decl = methods.at(&cx, m);
+                if decl.home.package == home.package && !decl.home.path.join(&cx, "::").eq(&cx, home.path.join(&cx, "::")) {
+                    let file = r.packages.at(&cx, decl.home.package).files.at(&cx, decl.home);
+                    let package = r.packages.at(&cx, decl.home.package);
+                    let relative = if file.starts_with(&cx, package.root) && file.len() > package.root.len() + 1usize {
+                        file.slice(package.root.len() + 1usize, file.len())
+                    } else { file };
+                    let method_source = match read_to_arena(&cx, file) {
+                        Result::Ok(bytes) => bytes,
+                        Result::Err(_) => package::support::base::fail(&cx, lit(&cx, "cannot read method source")),
+                    };
+                    out = match decl.node {
+                        Named::Fn(f) => entry(&cx, out, method_source, decl.name, lit(&cx, "method"), f.id, f.pos, false, false),
+                        Named::Const(c) => entry(&cx, out, method_source, decl.name, lit(&cx, "const"), c.id, c.pos, false, false),
+                        _ => out,
+                    };
+                    out = out.push_static("Defined in `").push_bytes(&cx, relative).push_static("`.\n\n");
+                }
+                m = m + 1usize;
+            }
+        }
+        k = k + 1usize;
+    }
+    out
+}
+
+forall 'k.
+fn item(&cx: Domain!['k], r: Resolver['k], home: ModuleId['k], out: Buffer!, source: Span['k], it: S::Item['k]) -> Buffer! {
+    match it {
+        S::Item::Struct(d) => other_methods(&cx, r, home, d.name, entry(&cx, out, source, d.name, lit(&cx, "struct"), d.id, d.pos, true, d.exposure.is_some())),
+        S::Item::Tuple(d) => other_methods(&cx, r, home, d.name, entry(&cx, out, source, d.name, lit(&cx, "tuple"), d.id, d.pos, false, false)),
+        S::Item::Enum(d) => other_methods(&cx, r, home, d.name, entry(&cx, out, source, d.name, lit(&cx, "enum"), d.id, d.pos, true, d.exposure.is_some())),
+        S::Item::Trait(d) => entry(&cx, out, source, d.name, lit(&cx, "trait"), d.id, d.pos, true, true),
+        S::Item::Fn(d) => entry(&cx, out, source, d.name, lit(&cx, "fn"), d.id, d.pos, false, false),
+        S::Item::Extern(d) => entry(&cx, out, source, d.name, lit(&cx, "extern"), d.id, d.pos, false, false),
+        S::Item::Const(d) => entry(&cx, out, source, d.name, lit(&cx, "const"), d.id, d.pos, false, false),
+        S::Item::Impl(d) => {
+            var out = out;
+            let owner = match d.type {
+                S::Type::Name(t) => t.path.join(&cx, "::"),
+                _ => lit(&cx, "impl"),
+            };
+            var i = 0usize;
+            while i < d.items.len(&cx) {
+                out = match d.items.at(&cx, i) {
+                    S::Member::Fn(m) => entry(&cx, out, source, Buffer!::new().push_bytes(&cx, owner).push_static("::").push_bytes(&cx, m.name).save(&cx), lit(&cx, "method"), m.id, m.pos, false, false),
+                    S::Member::Const(m) => entry(&cx, out, source, Buffer!::new().push_bytes(&cx, owner).push_static("::").push_bytes(&cx, m.name).save(&cx), lit(&cx, "const"), m.id, m.pos, false, false),
+                };
+                i = i + 1usize;
+            }
+            out
+        },
+        _ => out,
+    }
+}
+
+forall 'k.
+fn public_module(&cx: Domain!['k], r: Resolver['k], home: ModuleId['k]) -> bool {
+    var i = 0usize;
+    while i < home.path.len(&cx) {
+        let parent = ModuleId.{ package: home.package, path: home.path.slice(&cx, 0usize, i) };
+        match r.scopes.get(&cx, parent) {
+            Option::Some(scope) => if !scope.exports.contains(&cx, home.path.at(&cx, i)) { return false; },
+            Option::None => return false,
+        }
+        i = i + 1usize;
+    }
+    true
+}
+
+forall 'k.
+fn layout_name(&cx: Domain!['k], r: Resolver['k], home: ModuleId['k]) -> Span['k] {
+    Buffer!::new().push_static("module-").push_usize(r.order.at(&cx, home)).push_static(".html").save(&cx)
+}
+
+forall 'k.
+fn nav_item(&cx: Domain!['k], out: Buffer!, name: Span['k], id: u32) -> Buffer! {
+    out.push_static("<li><a href=\"#item-").push_usize(id as usize).push_static("\">").push_bytes(&cx, name).push_static("</a></li>\n")
+}
+
+forall 'k.
+fn type_nav(&cx: Domain!['k], r: Resolver['k], home: ModuleId['k], out: Buffer!, name: Span['k], id: u32) -> Buffer! {
+    var out = out.push_static("<li class=\"type-group\"><details><summary>").push_bytes(&cx, name).push_static("</summary><ul class=\"type-members\">\n");
+    out = nav_item(&cx, out, lit(&cx, "Definition"), id);
+    let scope = r.scopes.at(&cx, home);
+    let owner = match scope.decls.get(&cx, name) {
+        Option::Some(d) => d,
+        Option::None => return out.push_static("</ul></details></li>\n"),
+    };
+    let keys = r.attached.keys(&cx);
+    var k = 0usize;
+    while k < keys.len(&cx) {
+        let (target, member) = keys.at(&cx, k);
+        let matches = match target {
+            Owner::Decl(d) => d.id == owner.id,
+            _ => false,
+        };
+        if matches {
+            let methods = r.attached.at(&cx, (target, member));
+            var m = 0usize;
+            while m < methods.len(&cx) {
+                let decl = methods.at(&cx, m);
+                if decl.home.package == home.package {
+                    out = match decl.node {
+                        Named::Fn(f) => nav_item(&cx, out, member, f.id),
+                        Named::Const(c) => nav_item(&cx, out, member, c.id),
+                        _ => out,
+                    };
+                }
+                m = m + 1usize;
+            }
+        }
+        k = k + 1usize;
+    }
+    out.push_static("</ul></details></li>\n")
+}
+
+forall 'k.
+fn nav_section(&cx: Domain!['k], out: Buffer!, title: Span['k], kind: Span['k], entries: Buffer!, count: usize) -> Buffer! {
+    if count == 0usize {
+        entries.destroy();
+        out
+    } else {
+        out.push_static("<section class=\"nav-section nav-").push_bytes(&cx, kind).push_static("\"><h2>").push_bytes(&cx, title)
+            .push_static("</h2><ul class=\"nav-list\">\n").push_buffer(entries).push_static("</ul></section>\n")
+    }
+}
+
+// A module page shows only the modules exported directly by that module. Re-exported modules
+// point to the page for their defining package, as the API links in the body do.
+forall 'k.
+fn module_layout(&cx: Domain!['k], r: Resolver['k], home: ModuleId['k], root: Span['k]) {
+    let parent = if home.path.is_empty(&cx) { lit(&cx, "/") }
+        else { url(&cx, r, ModuleId.{ package: home.package, path: home.path.slice(&cx, 0usize, home.path.len(&cx) - 1usize) }) };
+    let short_name = if home.path.is_empty(&cx) { r.packages.at(&cx, home.package).name.copy(&cx) }
+        else { home.path.at(&cx, home.path.len(&cx) - 1usize) };
+    var out = Buffer!::new().push_static("+++\nlayout = \"page.html\"\n+++\n<div class=\"layout\">\n<aside class=\"sidebar\"><nav aria-label=\"Module contents\">\n")
+        .push_static("<a class=\"back-link\" href=\"").push_bytes(&cx, parent).push_static("\">← Parent</a>\n")
+        .push_static("<p class=\"nav-label\">In this module</p><strong class=\"nav-current\">").push_bytes(&cx, short_name).push_static("</strong>\n");
+    let scope = r.scopes.at(&cx, home);
+    let exports = scope.exports.keys(&cx);
+    var module_links = Buffer!::new();
+    var children = 0usize;
+    var i = 0usize;
+    while i < exports.len(&cx) {
+        let name = exports.at(&cx, i);
+        let target = r.lookup(&cx, home, ArenaVec::one(&cx, name), S::Pos.{ line: 0u32, col: 0u32 });
+        module_links = match target {
+            Result::Ok(found) => match found {
+                Target::Module(m) => {
+                    children = children + 1usize;
+                    module_links.push_static("<li><a href=\"").push_bytes(&cx, url(&cx, r, m)).push_static("\">").push_bytes(&cx, name).push_static("</a></li>\n")
+                },
+                _ => module_links,
+            },
+            Result::Err(_) => module_links,
+        };
+        i = i + 1usize;
+    }
+    out = nav_section(&cx, out, lit(&cx, "Modules"), lit(&cx, "modules"), module_links, children);
+
+    var type_links = Buffer!::new();
+    var trait_links = Buffer!::new();
+    var function_links = Buffer!::new();
+    var constant_links = Buffer!::new();
+    var extern_links = Buffer!::new();
+    var other_method_links = Buffer!::new();
+    var type_count = 0usize;
+    var trait_count = 0usize;
+    var function_count = 0usize;
+    var constant_count = 0usize;
+    var extern_count = 0usize;
+    var other_method_count = 0usize;
+    var j = 0usize;
+    while j < scope.items.len(&cx) {
+        match scope.items.at(&cx, j) {
+            S::Item::Struct(d) => { type_links = type_nav(&cx, r, home, type_links, d.name, d.id); type_count = type_count + 1usize; },
+            S::Item::Tuple(d) => { type_links = type_nav(&cx, r, home, type_links, d.name, d.id); type_count = type_count + 1usize; },
+            S::Item::Enum(d) => { type_links = type_nav(&cx, r, home, type_links, d.name, d.id); type_count = type_count + 1usize; },
+            S::Item::Trait(d) => { trait_links = nav_item(&cx, trait_links, d.name, d.id); trait_count = trait_count + 1usize; },
+            S::Item::Fn(d) => { function_links = nav_item(&cx, function_links, d.name, d.id); function_count = function_count + 1usize; },
+            S::Item::Const(d) => { constant_links = nav_item(&cx, constant_links, d.name, d.id); constant_count = constant_count + 1usize; },
+            S::Item::Extern(d) => { extern_links = nav_item(&cx, extern_links, d.name, d.id); extern_count = extern_count + 1usize; },
+            S::Item::Impl(d) => {
+                let owner = match d.type {
+                    S::Type::Name(t) => t.path.at(&cx, t.path.len(&cx) - 1usize),
+                    _ => lit(&cx, "impl"),
+                };
+                if !scope.decls.contains(&cx, owner) {
+                    var m = 0usize;
+                    while m < d.items.len(&cx) {
+                        other_method_links = match d.items.at(&cx, m) {
+                            S::Member::Fn(f) => nav_item(&cx, other_method_links, Buffer!::new().push_bytes(&cx, owner).push_static("::").push_bytes(&cx, f.name).save(&cx), f.id),
+                            S::Member::Const(c) => nav_item(&cx, other_method_links, Buffer!::new().push_bytes(&cx, owner).push_static("::").push_bytes(&cx, c.name).save(&cx), c.id),
+                        };
+                        other_method_count = other_method_count + 1usize;
+                        m = m + 1usize;
+                    }
+                }
+            },
+            _ => (),
+        }
+        j = j + 1usize;
+    }
+    out = nav_section(&cx, out, lit(&cx, "Types"), lit(&cx, "types"), type_links, type_count);
+    out = nav_section(&cx, out, lit(&cx, "Implementations"), lit(&cx, "implementations"), other_method_links, other_method_count);
+    out = nav_section(&cx, out, lit(&cx, "Traits"), lit(&cx, "traits"), trait_links, trait_count);
+    out = nav_section(&cx, out, lit(&cx, "Functions"), lit(&cx, "functions"), function_links, function_count);
+    out = nav_section(&cx, out, lit(&cx, "Constants"), lit(&cx, "constants"), constant_links, constant_count);
+    out = nav_section(&cx, out, lit(&cx, "Externs"), lit(&cx, "externs"), extern_links, extern_count);
+    out = out.push_static("</nav></aside>\n<main>{{ content | safe }}</main>\n</div>\n");
+    let includes = path(&cx, path(&cx, root, lit(&cx, "src")), lit(&cx, "_includes"));
+    save(&cx, path(&cx, includes, layout_name(&cx, r, home)), out);
+}
+
+forall 'k.
+fn page(&cx: Domain!['k], r: Resolver['k], home: ModuleId['k], root: Span['k]) {
+    let package = r.packages.at(&cx, home.package);
+    let module_name = if home.path.is_empty(&cx) { package.name.copy(&cx) }
+        else { Buffer!::new().push_bytes(&cx, package.name.copy(&cx)).push_static("::").push_bytes(&cx, home.path.join(&cx, "::")).save(&cx) };
+    let file = package.files.at(&cx, home);
+    let source = match read_to_arena(&cx, file) {
+        Result::Ok(bytes) => bytes,
+        Result::Err(_) => package::support::base::fail(&cx, Buffer!::new().push_static("cannot read ").push_bytes(&cx, file).save(&cx)),
+    };
+    var folder = path(&cx, path(&cx, root, lit(&cx, "src")), package.name.copy(&cx));
+    var i = 0usize;
+    while i < home.path.len(&cx) {
+        folder = path(&cx, folder, home.path.at(&cx, i));
+        directory(&cx, folder);
+        i = i + 1usize;
+    }
+    module_layout(&cx, r, home, root);
+    var out = Buffer!::new().push_static("+++\nlayout = \"").push_bytes(&cx, layout_name(&cx, r, home))
+        .push_static("\"\ntitle = \"").push_bytes(&cx, module_name).push_static("\"\n+++\n# ").push_bytes(&cx, module_name).push_static("\n\n");
+    out = out.push_buffer(module_prose(&cx, source));
+    let relative = if file.starts_with(&cx, package.root) && file.len() > package.root.len() + 1usize {
+        file.slice(package.root.len() + 1usize, file.len())
+    } else { file };
+    out = out.push_static("Source: `").push_bytes(&cx, relative).push_static("`\n\n");
+    let scope = r.scopes.at(&cx, home);
+    let exports = scope.exports.keys(&cx);
+    if !exports.is_empty(&cx) {
+        out = out.push_static("## Re-exports\n\n");
+        var e = 0usize;
+        while e < exports.len(&cx) {
+            let name = exports.at(&cx, e);
+            let target = r.lookup(&cx, home, ArenaVec::one(&cx, name), S::Pos.{ line: 0u32, col: 0u32 });
+            out = match target {
+                Result::Ok(found) => match found {
+                    Target::Module(m) => out.push_static("- [`").push_bytes(&cx, name).push_static("`](").push_bytes(&cx, url(&cx, r, m)).push_static(")\n"),
+                    Target::Decl(d) => out.push_static("- [`").push_bytes(&cx, name).push_static("`](").push_bytes(&cx, url(&cx, r, d.home)).push_static(")\n"),
+                    _ => out.push_static("- `").push_bytes(&cx, name).push_static("`\n"),
+                },
+                Result::Err(_) => out.push_static("- `").push_bytes(&cx, name).push_static("`\n"),
+            };
+            e = e + 1usize;
+        }
+        out = out.push_static("\n");
+    }
+    out = out.push_static("## Declarations\n\n");
+    var j = 0usize;
+    while j < scope.items.len(&cx) {
+        out = item(&cx, r, home, out, source, scope.items.at(&cx, j));
+        j = j + 1usize;
+    }
+    save(&cx, path(&cx, folder, lit(&cx, "index.md")), out);
+}
+
+forall 'k.
+fn generate(&cx: Domain!['k], r: Resolver['k], output: Span['k]) {
+    let present = match path_exists(&cx, output) {
+        Result::Ok(found) => found,
+        Result::Err(_) => package::support::base::fail(&cx, lit(&cx, "cannot inspect documentation output")),
+    };
+    if present { package::support::base::fail(&cx, lit(&cx, "documentation output already exists; choose a new -o path")); }
+    directory(&cx, output);
+    let source = path(&cx, output, lit(&cx, "src"));
+    directory(&cx, source);
+    let includes = path(&cx, source, lit(&cx, "_includes"));
+    directory(&cx, includes);
+    let assets = path(&cx, source, lit(&cx, "assets"));
+    directory(&cx, assets);
+    save(&cx, path(&cx, output, lit(&cx, "krayon.toml")), Buffer!::new().push_static("input = \"src\"\noutput = \"dist\"\nlayouts = \"_includes\"\nassets = \"assets\"\n"));
+    save(&cx, path(&cx, includes, lit(&cx, "page.html")), Buffer!::new()
+        .push_static("<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{{ page.title }} · Kursal Docs</title>\n<script>try{var theme=localStorage.getItem('kursal-doc-theme');if(theme==='light'||theme==='dark')document.documentElement.setAttribute('data-theme',theme)}catch(e){}</script>\n<link rel=\"stylesheet\" href=\"/assets/site.css\">\n<script defer src=\"/assets/theme.js\"></script>\n</head>\n<body>\n<header class=\"masthead\"><div class=\"masthead-inner\"><a class=\"brand\" href=\"/\"><span class=\"brand-mark\">K</span> Kursal <span class=\"brand-sub\">Docs</span></a><div class=\"header-actions\"><span class=\"header-kicker\">API Reference</span><button class=\"theme-toggle\" type=\"button\" data-next=\"dark\" aria-label=\"Switch to dark mode\" title=\"Switch to dark mode\"><svg class=\"theme-icon icon-moon\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M20.5 14.1A8.7 8.7 0 0 1 9.9 3.5 8.8 8.8 0 1 0 20.5 14.1Z\"/></svg><svg class=\"theme-icon icon-sun\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><circle cx=\"12\" cy=\"12\" r=\"4\"/><path d=\"M12 2v2m0 16v2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42M2 12h2m16 0h2M4.93 19.07l1.42-1.42m11.3-11.3 1.42-1.42\"/></svg></button></div></div></header>\n{{ content | safe }}\n</body>\n</html>\n"));
+    save(&cx, path(&cx, includes, lit(&cx, "index.html")), Buffer!::new()
+        .push_static("+++\nlayout = \"page.html\"\n+++\n<main class=\"landing\">{{ content | safe }}</main>\n"));
+    save(&cx, path(&cx, assets, lit(&cx, "theme.js")), Buffer!::new()
+        .push_static("(() => {\n  const root = document.documentElement;\n  const toggle = document.querySelector('.theme-toggle');\n  const system = window.matchMedia('(prefers-color-scheme: dark)');\n  const current = () => root.getAttribute('data-theme') || (system.matches ? 'dark' : 'light');\n  const label = () => { const next = current() === 'dark' ? 'light' : 'dark'; const text = 'Switch to ' + next + ' mode'; toggle.dataset.next = next; toggle.setAttribute('aria-label', text); toggle.title = text; };\n  toggle.addEventListener('click', () => { const next = current() === 'dark' ? 'light' : 'dark'; root.setAttribute('data-theme', next); try { localStorage.setItem('kursal-doc-theme', next); } catch (e) {} label(); });\n  if (system.addEventListener) system.addEventListener('change', label);\n  label();\n})();\n"));
+    let dark_colors = Buffer!::new()
+        .push_static("--bg:#15131a;--surface:#29232d;--ink:#fff9f7;--muted:#d4c4ce;--line:#695463;")
+        .push_static("--accent:#ff8a98;--accent-hover:#ffc0c8;--header:#3c202d;--header-border:#ff687d;")
+        .push_static("--brand-mark:#ff8794;--brand-ink:#32151d;--header-soft:#f3cbd3;--hover:#473340;")
+        .push_static("--code-bg:#111116;--code-ink:#f7f6fa;--inline-bg:#403441;")
+        .push_static("--landing-bg:#302633;--landing-border:#705367;--landing-hover:#433248;")
+        .push_static("--struct-ink:#10242d;--struct-bg:#62d9f7;--enum-ink:#251037;--enum-bg:#caa6ff;")
+        .push_static("--trait-ink:#332016;--trait-bg:#ffc17d;--fn-ink:#34161d;--fn-bg:#ff8794;")
+        .push_static("--method-ink:#1b2b13;--method-bg:#a6e67c;--const-ink:#342809;--const-bg:#ffe36c;")
+        .push_static("--extern-ink:#1e282e;--extern-bg:#c8d6df;")
+        .push_static("--nav-modules:#ff8794;--nav-types:#62d9f7;--nav-implementations:#a6e67c;--nav-traits:#ffc17d;")
+        .push_static("--nav-functions:#ff8794;--nav-constants:#ffe36c;--nav-externs:#c8d6df;color-scheme:dark;").save(&cx);
+    save(&cx, path(&cx, assets, lit(&cx, "site.css")), Buffer!::new()
+        .push_static(":root { color-scheme: light; --bg:#f7f6f7;--surface:#ffffff;--ink:#29262b;--muted:#625c64;--line:#ded8df;")
+        .push_static("--accent:#9b2f45;--accent-hover:#702238;--header:#3f222e;--header-border:#d54d67;")
+        .push_static("--brand-mark:#f17b8d;--brand-ink:#35141e;--header-soft:#f3d6df;--hover:#f5edf1;")
+        .push_static("--code-bg:#28232c;--code-ink:#faf7fb;--inline-bg:#f2eef2;")
+        .push_static("--landing-bg:#fcfafb;--landing-border:#e5dfe5;--landing-hover:#f4eef3;")
+        .push_static("--struct-ink:#0c4d62;--struct-bg:#bdefff;--enum-ink:#4d287a;--enum-bg:#ead4ff;")
+        .push_static("--trait-ink:#763708;--trait-bg:#ffe2bd;--fn-ink:#872237;--fn-bg:#ffccd2;")
+        .push_static("--method-ink:#2f5e20;--method-bg:#d9f6c6;--const-ink:#6c5200;--const-bg:#ffedaa;")
+        .push_static("--extern-ink:#40515b;--extern-bg:#e2ebf0;")
+        .push_static("--nav-modules:#9b2f45;--nav-types:#0c6a84;--nav-implementations:#3e7a2a;--nav-traits:#8f4b10;")
+        .push_static("--nav-functions:#9b2f45;--nav-constants:#866000;--nav-externs:#4b626e;")
+        .push_static("--code-font:ui-monospace,SFMono-Regular,Consolas,monospace; }\n")
+        .push_static("@media (prefers-color-scheme: dark) { :root:not([data-theme=\"light\"]) {").push_bytes(&cx, dark_colors).push_static("} }\n")
+        .push_static(":root[data-theme=\"dark\"] {").push_bytes(&cx, dark_colors).push_static("}\n")
+        .push_static("* { box-sizing: border-box; }\nhtml { scroll-behavior: smooth; }\n")
+        .push_static("body { margin: 0; color: var(--ink); background: var(--bg); font: 16px/1.65 system-ui, sans-serif; }\n")
+        .push_static("a { color: var(--accent); text-underline-offset: .18em; }\na:hover { color: var(--accent-hover); }\n")
+        .push_static(".masthead { background: var(--header); color: #fff1ee; border-bottom: 3px solid var(--header-border); }\n")
+        .push_static(".masthead-inner { max-width: 1240px; margin: auto; padding: .9rem 1.25rem; display: flex; justify-content: space-between; align-items: center; gap: 1rem; }\n")
+        .push_static(".brand { display: inline-flex; align-items: center; gap: .5rem; color: #fff1ee; font-size: 1.2rem; font-weight: 750; text-decoration: none; }\n")
+        .push_static(".brand-mark { display: inline-grid; place-items: center; width: 2rem; height: 2rem; border-radius: .55rem; background: var(--brand-mark); color: var(--brand-ink); font-weight: 850; }\n")
+        .push_static(".brand-sub { color: var(--header-soft); font-weight: 500; }\n.header-kicker { color: var(--header-soft); font-size: .85rem; letter-spacing: .04em; text-transform: uppercase; }\n")
+        .push_static(".header-actions { display: flex; align-items: center; gap: 1rem; }\n.theme-toggle { display: grid; place-items: center; width: 2.35rem; height: 2.35rem; border: 1px solid #a88c94; border-radius: .4rem; background: transparent; color: #f5ecef; cursor: pointer; }\n")
+        .push_static(".theme-toggle:hover { background: #ffffff18; }\n.theme-icon { display: none; width: 1.15rem; height: 1.15rem; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }\n")
+        .push_static(".theme-toggle[data-next=\"dark\"] .icon-moon, .theme-toggle[data-next=\"light\"] .icon-sun { display: block; }\n:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }\n.theme-toggle:focus-visible { outline-color: #fff1ee; }\n")
+        .push_static(".layout { display: grid; grid-template-columns: 230px minmax(0, 1fr); gap: 1.5rem; max-width: 1240px; margin: 0 auto; padding: 1.75rem 1.25rem 4rem; align-items: start; }\n")
+        .push_static(".sidebar { min-width: 0; position: sticky; top: 1rem; max-height: calc(100vh - 2rem); overflow: auto; overflow-wrap: anywhere; background: var(--surface); border: 1px solid var(--line); border-radius: .65rem; padding: 1rem; }\n")
+        .push_static(".back-link { display: inline-block; color: var(--muted); font-size: .82rem; text-decoration: none; margin-bottom: 1.2rem; }\n")
+        .push_static(".nav-label { margin: 0; color: var(--muted); font-size: .7rem; letter-spacing: .09em; text-transform: uppercase; font-weight: 700; }\n")
+        .push_static(".nav-current { display: block; font: 700 .9rem/1.4 var(--code-font); margin: .15rem 0 .7rem; }\n")
+        .push_static(".nav-section { border-top: 1px solid var(--line); padding-top: .75rem; margin-top: .8rem; }\n")
+        .push_static(".nav-modules { --nav-color: var(--nav-modules); }\n.nav-types { --nav-color: var(--nav-types); }\n.nav-implementations { --nav-color: var(--nav-implementations); }\n")
+        .push_static(".nav-traits { --nav-color: var(--nav-traits); }\n.nav-functions { --nav-color: var(--nav-functions); }\n.nav-constants { --nav-color: var(--nav-constants); }\n.nav-externs { --nav-color: var(--nav-externs); }\n")
+        .push_static(".nav-section h2 { color: var(--nav-color); font-size: .74rem; letter-spacing: .1em; text-transform: uppercase; margin: 0 0 .35rem; }\n.nav-section a { color: var(--nav-color); }\n")
+        .push_static(".nav-list, .type-members { list-style: none; margin: 0; padding: 0; }\n.nav-list li { margin: .08rem 0; }\n")
+        .push_static(".nav-list a { display: block; padding: .27rem .45rem; border-radius: .35rem; text-decoration: none; font: .84rem/1.5 var(--code-font); }\n")
+        .push_static(".nav-list a:hover { background: var(--hover); }\n")
+        .push_static(".type-group summary { cursor: pointer; padding: .27rem .45rem; border-radius: .35rem; color: var(--nav-color); font: 650 .84rem/1.5 var(--code-font); }\n")
+        .push_static(".type-group summary:hover { background: var(--hover); }\n.type-members { margin: .1rem 0 .3rem .65rem; padding-left: .5rem; border-left: 2px solid var(--line); }\n")
+        .push_static(".type-members a { color: var(--muted); font-size: .8rem; }\n")
+        .push_static("main { min-width: 0; max-width: 100%; overflow-wrap: anywhere; background: var(--surface); border: 1px solid var(--line); border-radius: .65rem; padding: 1.3rem 2rem 3rem; }\n")
+        .push_static("main.landing { max-width: 880px; margin: 2rem auto; }\nmain h1 { font-size: clamp(1.9rem, 4vw, 2.6rem); line-height: 1.18; letter-spacing: -.035em; margin: .35rem 0 1rem; }\n")
+        .push_static(".layout main h1 { font-family: var(--code-font); font-size: clamp(1.65rem, 3vw, 2.2rem); letter-spacing: -.045em; }\n")
+        .push_static("main h1::after { content: ''; display: block; width: 3.5rem; height: 4px; margin-top: .8rem; border-radius: 1rem; background: var(--header-border); }\n")
+        .push_static(".landing ul { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .75rem; list-style: none; padding: 0; margin-top: 1.5rem; }\n")
+        .push_static(".landing li a { display: block; padding: 1rem 1.2rem; border: 1px solid var(--landing-border); border-radius: .65rem; background: var(--landing-bg); font-size: 1.05rem; font-weight: 700; text-decoration: none; }\n")
+        .push_static(".landing li a:hover { background: var(--landing-hover); }\n")
+        .push_static("main h2 { font-size: 1.35rem; margin: 2rem 0 1rem; padding-top: 1.1rem; border-top: 1px solid var(--line); }\n")
+        .push_static(".item-heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: .65rem; margin: 1.6rem 0 .55rem; font-size: 1.12rem; line-height: 1.4; }\n")
+        .push_static(".item-heading > span:last-child { font-family: var(--code-font); font-size: 1.02rem; }\n")
+        .push_static(".kind { display: inline-block; border-radius: .3rem; padding: .12rem .5rem; font: 800 .69rem/1.5 system-ui, sans-serif; letter-spacing: .045em; text-transform: uppercase; white-space: nowrap; }\n")
+        .push_static(".kind-struct, .kind-tuple { color: var(--struct-ink); background: var(--struct-bg); }\n.kind-enum { color: var(--enum-ink); background: var(--enum-bg); }\n")
+        .push_static(".kind-trait { color: var(--trait-ink); background: var(--trait-bg); }\n.kind-fn { color: var(--fn-ink); background: var(--fn-bg); }\n")
+        .push_static(".kind-method { color: var(--method-ink); background: var(--method-bg); }\n.kind-const { color: var(--const-ink); background: var(--const-bg); }\n")
+        .push_static(".kind-extern { color: var(--extern-ink); background: var(--extern-bg); }\n")
+        .push_static("main pre { max-width: 100%; overflow-x: auto; padding: 1rem 1.2rem; border-radius: .6rem; background: var(--code-bg); color: var(--code-ink); line-height: 1.5; }\n")
+        .push_static("main code { font-family: var(--code-font); }\n")
+        .push_static("main :not(pre) > code { padding: .1rem .3rem; border-radius: .25rem; background: var(--inline-bg); font-size: .9em; }\n")
+        .push_static("@media (max-width: 760px) { .layout { display: block; padding: 1rem .8rem 3rem; } .sidebar { position: static; max-height: 12rem; margin-bottom: 1rem; } main { padding: 1rem 1.1rem 2rem; } .header-kicker { display: none; } }\n"));
+    var index = Buffer!::new().push_static("+++\nlayout = \"index.html\"\ntitle = \"Packages\"\n+++\n# Package documentation\n\nGenerated from Kursal source. Select a package:\n\n");
+    var p = 0usize;
+    while p < r.packages.len(&cx) {
+        let package = r.packages.at(&cx, p);
+        let name = package.name.copy(&cx);
+        directory(&cx, path(&cx, source, name));
+        index = index.push_static("- [").push_bytes(&cx, name).push_static("](/").push_bytes(&cx, name).push_static("/)\n");
+        let modules = package.files.keys(&cx);
+        var i = 0usize;
+        while i < modules.len(&cx) {
+            let home = modules.at(&cx, i);
+            if public_module(&cx, r, home) { page(&cx, r, home, output); }
+            i = i + 1usize;
+        }
+        p = p + 1usize;
+    }
+    save(&cx, path(&cx, source, lit(&cx, "index.md")), index);
+}
