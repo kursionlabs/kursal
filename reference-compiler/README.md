@@ -130,6 +130,7 @@ name = "app"
 kind = "executable"          # or "library" (the default)
 entry = "package::main"      # executables only
 source_root = "src"          # the default
+link_flags = ["-luv"]        # optional linker arguments, inherited by dependents
 
 [dependencies.std]
 path = "../lib/std"
@@ -137,6 +138,11 @@ path = "../lib/std"
 
 A `kind` other than those two is an error that names the manifest (`.../kur.toml: manifest 'kind' must
 be "library" or "executable"`).
+
+`link_flags` is an array of nonempty strings without NUL. Each element is passed as one argument
+to the C compiler after the generated C and helper sources. Flags from the executable and every dependency
+are included in package traversal order, so a library can declare its own `-l` requirement.
+The compiler passes arguments directly, without a shell.
 
 An executable's entry is a safe, non-generic function without premises, of
 one of three shapes, each with or without a parameter `args: Args` of type

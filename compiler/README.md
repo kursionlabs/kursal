@@ -65,9 +65,11 @@ backend spends its time; `C` remains the total for that stage.
 
 `build` writes `a.out` and `a.out.c` unless `-o OUTPUT` names another destination.
 `build --emit-c` prints generated C, which also works for library packages. The compiler
-prints a source line and caret below a located error; `KURSAL_DIAGNOSTICS=short` retains the
-one-line form used by the reference comparison tests. `--help`, command `--help`, and `--version`
-are available without building a package.
+passes each package's `[package] link_flags = ["-luv"]` entries as C compiler arguments
+after the generated C and helper sources; flags declared by dependencies are included.
+The compiler prints a source line and caret below a located error; `KURSAL_DIAGNOSTICS=short`
+retains the one-line form used by the reference comparison tests. `--help`, command `--help`,
+and `--version` are available without building a package.
 
 `tests/test_compiler.py` builds the compiler once per change to its sources (cached in
 `reference-compiler/.build/`) and compares its output with the reference compiler's. It also caches

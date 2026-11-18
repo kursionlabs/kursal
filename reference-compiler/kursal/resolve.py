@@ -70,6 +70,7 @@ class Package:
     files: dict[ModuleId, Path] = field(default_factory=dict)  # ModuleId -> source path
     entry_decl: Optional[Decl] = None
     manifest: Optional[Path] = None    # its kur.toml, or its one .kur file
+    link_flags: list[str] = field(default_factory=list)  # C compiler arguments after the source files
 
 
 @dataclass
@@ -161,11 +162,15 @@ def load(path: str | Path) -> list[Package]:
             by_dir[root] = package.id
             config = _manifest(manifest)
             info = _table(config.get("package", {}), f"{manifest}: package")
-            unknown = set(config) - {"package", "dependencies"} | set(info) - {"name", "kind", "source_root", "entry"}
+            unknown = set(config) - {"package", "dependencies"} | set(info) - {"name", "kind", "source_root", "entry", "link_flags"}
             if unknown:
                 fail(f"{manifest}: unknown manifest keys {sorted(unknown)}")
             package.name = _string(info, manifest, "name")
             package.source_root = (root / _string(info, manifest, "source_root", "src")).resolve()
+            flags = info.get("link_flags", [])
+            if not isinstance(flags, list) or any(not isinstance(flag, str) or not flag or "\x00" in flag for flag in flags):
+                fail(f"{manifest}: manifest 'link_flags' must be an array of nonempty strings without NUL")
+            package.link_flags = cast(list[str], flags)
             kind = _string(info, manifest, "kind", "library")
             if kind not in ("library", "executable"):
                 fail(f"{manifest}: manifest 'kind' must be \"library\" or \"executable\"")

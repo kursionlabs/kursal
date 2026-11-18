@@ -87,11 +87,24 @@ class GraphTests(unittest.TestCase):
             '[package]\nname="p"\nsyntax=12\n',
             'dependencies=[]\n[package]\nname="p"\nsource_root="."\n',
             manifest("p") + '[dependencies.x]\npath=3\n',
+            '[package]\nname="p"\nsource_root="."\nlink_flags="-lm"\n',
+            '[package]\nname="p"\nsource_root="."\nlink_flags=["-lm", 3]\n',
+            '[package]\nname="p"\nsource_root="."\nlink_flags=[""]\n',
+            '[package]\nname="p"\nsource_root="."\nlink_flags=["-l\\u0000x"]\n',
         )
         for source in manifests:
             with self.subTest(source=source), self.assertRaises(ResolveError):
                 root = tree({"p/kur.toml": source, "p/lib.kur": ""})
                 resolve(root / "p")
+
+    def test_link_flags_follow_dependency_packages_in_order(self):
+        root = tree({"app/kur.toml": '[package]\nname="app"\nsource_root="."\nlink_flags=["-lapp"]\n'
+                                      '[dependencies.dep]\npath="../dep"\n',
+                     "app/lib.kur": "", "dep/kur.toml": '[package]\nname="dep"\nsource_root="."\n'
+                                                          'link_flags=["-lfirst", "-lsecond"]\n',
+                     "dep/lib.kur": ""})
+        packages = resolve(root / "app").packages
+        self.assertEqual([package.link_flags for package in packages], [["-lapp"], ["-lfirst", "-lsecond"]])
 
     def test_a_package_is_a_library_or_an_executable(self):
         for kind in ("executabl", "Library", ""):

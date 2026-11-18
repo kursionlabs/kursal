@@ -215,7 +215,8 @@ def build(package: Path, out: Path) -> tuple[str, Optional[Path], str]:
                             capture_output=True, text=True)
         return package.name, None, cc.stderr[:500] if cc.returncode else ""
     executable = out / package.name
-    cc = subprocess.run(cc_command([str(c_file), *map(str, C_HELPERS), *map(str, package.glob("*.c"))], str(executable)),
+    link_flags = [flag for dependency in resolver.packages for flag in dependency.link_flags]
+    cc = subprocess.run(cc_command([str(c_file), *map(str, C_HELPERS), *map(str, package.glob("*.c"))], str(executable), *link_flags),
                         capture_output=True, text=True)
     return package.name, executable, cc.stderr[:500] if cc.returncode else ""
 

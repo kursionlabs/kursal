@@ -1558,6 +1558,30 @@ class CompilerTests(unittest.TestCase):
         self.assertEqual(short.stderr.count("\n"), 1)
         self.assertIn("type_mismatch.kur:6:22: type mismatch", short.stderr)
 
+    def test_dependency_link_flags_reach_the_c_compiler(self):
+        """A library's link requirement is used by both executable build commands."""
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            app, dep = base / "app", base / "dep"
+            app.mkdir()
+            dep.mkdir()
+            (app / "kur.toml").write_text('[package]\nname="app"\nsource_root="."\nkind="executable"\n'
+                                          'entry="main"\n[dependencies.dep]\npath="../dep"\n')
+            (app / "lib.kur").write_text('extern "C" fn cos(x: f64) -> f64;\n'
+                                         'fn main() -> i32 { if unsafe cos(0.0f64) == 1.0f64 { 0i32 } else { 1i32 } }\n')
+            (dep / "kur.toml").write_text('[package]\nname="dep"\nsource_root="."\nlink_flags=["-lm"]\n')
+            (dep / "lib.kur").write_text("")
+            ours = self.run_compiler("build", str(app), "-o", str(base / "ours"))
+            self.assertEqual(ours.returncode, 0, ours.stderr)
+            reference = subprocess.run([sys.executable, str(ROOT / "reference-compiler/tools/build.py"),
+                                        str(app), str(base / "reference")], capture_output=True, text=True,
+                                       timeout=TIME_LIMIT, env=dict(os.environ, KURSAL_LIB=str(LIB)))
+            self.assertEqual(reference.returncode, 0, reference.stderr)
+            for name in ("ours", "reference"):
+                with self.subTest(builder=name):
+                    ran = subprocess.run([str(base / name)], capture_output=True, text=True)
+                    self.assertEqual((ran.returncode, ran.stdout), (0, ""))
+
     def run_all(self, runs: list[tuple[str, ...]]) -> list[subprocess.CompletedProcess[str]]:
         """Each run's result, in order; the runs go in parallel."""
         with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
