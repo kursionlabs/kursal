@@ -523,6 +523,10 @@ exposed struct Backend {
     symbols: ArenaMap[(FunKey['k], u64), ArenaVec[(ArenaVec[Type['k], 'k], Span['k]), 'k], 'k],
     // the same, by structure: an earlier request with these very arguments
     symbol_index: ArenaMap[(FunKey['k], ArenaVec[Type['k], 'k]), Span['k], 'k],
+    // the part of a specialization's C identity that depends only on its function definition
+    signature_keys: ArenaMap[FunKey['k], Span['k], 'k],
+    // Whether a resolved type is passed indirectly in C, shared across function specializations.
+    by_pointer_cache: ArenaMap[Type['k], bool, 'k],
     queue: ArenaVec[(FunKey['k], Fun['k], ArenaMap[Span['k], Type['k], 'k], Span['k]), 'k],
     // Each function in order: its symbol, when its head waits for `qualifiers`, else its head; its body.
     emitted: ArenaVec[(Option[Span['k]], Span['k], Span['k]), 'k],
@@ -688,6 +692,8 @@ impl Backend['k] {
             defs: ArenaVec::new(&cx),
             symbols: ArenaMap::new(&cx),
             symbol_index: ArenaMap::new(&cx),
+            signature_keys: ArenaMap::new(&cx),
+            by_pointer_cache: ArenaMap::new(&cx),
             queue: ArenaVec::new(&cx),
             emitted: ArenaVec::new(&cx),
             heads: ArenaMap::new(&cx),
@@ -1175,8 +1181,16 @@ impl Backend['k] {
             s = s + 1usize;
         }
         let (path, function_id) = self.function_ids.at(&cx, key);
-        let signature = C::fn_type(&cx, fun.ptypes, fun.ret, params, fun.is_unsafe, fun.places(&cx));
-        let identity = ArenaVec::two(&cx, function_id, type_key(&cx, signature, ArenaVec::new(&cx)));
+        let signature_key = match self.signature_keys.get(&cx, key) {
+            Option::Some(found) => found,
+            Option::None => {
+                let signature = C::fn_type(&cx, fun.ptypes, fun.ret, params, fun.is_unsafe, fun.places(&cx));
+                let found = type_key(&cx, signature, ArenaVec::new(&cx));
+                self.signature_keys.insert(&cx, key, found);
+                found
+            },
+        };
+        let identity = ArenaVec::two(&cx, function_id, signature_key);
         var t = 0usize;
         while t < args.len(&cx) {
             identity.push(&cx, type_key(&cx, args.at(&cx, t), ArenaVec::new(&cx)));
@@ -1241,7 +1255,14 @@ impl Backend['k] {
     // and the inliner a higher estimate: `Interp!::cons` of `examples/lisp`, taking two four-word values,
     // is not inlined into the interpreter's loop when it takes them by pointer.
     fn by_pointer(self, &cx: Domain!['k], ty: Type['k]) -> bool {
-        self.words(&cx, ty) > 4usize
+        match self.by_pointer_cache.get(&cx, ty) {
+            Option::Some(found) => found,
+            Option::None => {
+                let found = self.words(&cx, ty) > 4usize;
+                self.by_pointer_cache.insert(&cx, ty, found);
+                found
+            },
+        }
     }
 
     // The size of `ty`'s C representation in 8-byte words, as estimated from its structure: a scalar
@@ -1561,8 +1582,10 @@ impl Backend['k] {
             },
         };
         started = c_stage(times, "C setup", started);
-        while !self.queue.is_empty(&cx) {
-            let (key, fun, sub, symbol) = self.queue.remove(&cx, 0usize);
+        var next = 0usize;
+        while next < self.queue.len(&cx) {
+            let (key, fun, sub, symbol) = self.queue.at(&cx, next);
+            next = next + 1usize;
             self.emit_function(&cx, key, fun, sub, symbol);
         }
         started = c_stage(times, "C functions", started);
@@ -1806,7 +1829,6 @@ impl Backend['k] {
         var plan = Plan::new(&cx, fun, components, adapters, place_params, shapes);
         self.plan.set(&cx, Option::Some.(plan));
         let typed = self.recorded.at(&cx, key);
-        self.place_c.set(&cx, ArenaMap::new(&cx));
         let first_roots: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
         var fr = 0usize;
         while fr < fun.blocks.at(&cx, 0usize).params.len(&cx) {
@@ -1823,38 +1845,39 @@ impl Backend['k] {
         }
         self.roots.set(&cx, first_roots);
         let homes = self.homes(&cx, key, fun, typed, plan);
-        let fun = if homes.is_empty(&cx) { fun } else { homed(&cx, fun, homes) };
-        if !homes.is_empty(&cx) {
+        let has_homes = !homes.is_empty(&cx);
+        let fun = if has_homes { homed(&cx, fun, homes) } else { fun };
+        if has_homes {
             self.fun.set(&cx, Option::Some.(fun));
             plan = Plan::new(&cx, fun, components, adapters, place_params, shapes);
             self.plan.set(&cx, Option::Some.(plan));
         }
-        self.locals.set(&cx, ArenaMap::new(&cx));
-        self.aliases.set(&cx, ArenaMap::new(&cx));
-        self.forwards.set(&cx, ArenaMap::new(&cx));
+        self.locals.copy(&cx).clear(&cx);
+        self.aliases.copy(&cx).clear(&cx);
+        self.forwards.copy(&cx).clear(&cx);
         self.scratch.set(&cx, 0usize);
         let label_taken = Pool::new(&cx, ArenaSet::new(&cx));
-        let labels: ArenaMap[Span['k], Span['k], 'k] = ArenaMap::new(&cx);
+        let labels = self.labels.copy(&cx);
+        labels.clear(&cx);
         var b = 0usize;
         while b < fun.blocks.len(&cx) {
             let label = fun.blocks.at(&cx, b).label;
             labels.insert(&cx, label, allocate(&cx, Buffer!::new().push_static("L_").push_bytes(&cx, self.readable(&cx, label)).save(&cx), label_taken));
             b = b + 1usize;
         }
-        self.labels.set(&cx, labels);
         let decls: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
-        let temps: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
-        self.temps.set(&cx, temps);
+        let temps = self.temps.copy(&cx);
+        temps.clear(&cx);
         let entry = fun.blocks.at(&cx, 0usize);
-        let params: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let params = self.params.copy(&cx);
+        params.clear(&cx);
         var n = 0usize;
         while n < entry.params.len(&cx) {
             params.push(&cx, entry.params.at(&cx, n).name);
             n = n + 1usize;
         }
-        self.params.set(&cx, params);
-        let place_c: ArenaMap[Span['k], Span['k], 'k] = ArenaMap::new(&cx);
-        self.place_c.set(&cx, place_c);
+        let place_c = self.place_c.copy(&cx);
+        place_c.clear(&cx);
         let cparams: ArenaVec[CParam['k], 'k] = ArenaVec::new(&cx);
         // The parameters taken by pointer: read through it, or copied into the parameter's variable
         // where the function writes that (a call of itself in tail position, or a lend in place).
@@ -1917,21 +1940,24 @@ impl Backend['k] {
             }
             l = l + 1usize;
         }
-        let roots: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
-        var r = 0usize;
-        while r < entry.params.len(&cx) {
-            let binding = entry.params.at(&cx, r);
-            if binding.name.starts_with(&cx, Span::from_static(&cx, "&")) {
-                roots.insert(&cx, binding.name, self.substitute_type(&cx, binding.type));
+        // Homing may add or change locals. Otherwise the map built for `homes` is still current.
+        if has_homes {
+            let roots: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+            var r = 0usize;
+            while r < entry.params.len(&cx) {
+                let binding = entry.params.at(&cx, r);
+                if binding.name.starts_with(&cx, Span::from_static(&cx, "&")) {
+                    roots.insert(&cx, binding.name, self.substitute_type(&cx, binding.type));
+                }
+                r = r + 1usize;
             }
-            r = r + 1usize;
+            var o = 0usize;
+            while o < fun.locals.len(&cx) {
+                roots.insert(&cx, fun.locals.at(&cx, o).name, self.substitute_type(&cx, fun.locals.at(&cx, o).type));
+                o = o + 1usize;
+            }
+            self.roots.set(&cx, roots);
         }
-        var o = 0usize;
-        while o < fun.locals.len(&cx) {
-            roots.insert(&cx, fun.locals.at(&cx, o).name, self.substitute_type(&cx, fun.locals.at(&cx, o).type));
-            o = o + 1usize;
-        }
-        self.roots.set(&cx, roots);
         self.typed.set(&cx, typed);
         // (block label, SSA name, type, C variable) of each value that is no entry parameter
         let values: ArenaVec[(Span['k], Span['k], Type['k], Span['k]), 'k] = ArenaVec::new(&cx);
@@ -1950,7 +1976,7 @@ impl Backend['k] {
                     q = q + 1usize;
                 }
             }
-            if !parameter && !self.value_erased_in(&cx, label, name) {
+            if !parameter && !self.record_erasure(&cx, label, name, ty) {
                 values.push(&cx, (label, name, ty, self.cname(&cx, label, name)));
             }
             v = v + 1usize;
@@ -2606,15 +2632,18 @@ impl Backend['k] {
         let known = self.erasure.copy(&cx);
         match known.get(&cx, (label, name)) {
             Option::Some(answer) => answer,
-            Option::None => {
-                let before = self.counter.next.copy(&cx);
-                let answer = self.erased(&cx, self.substitute_type(&cx, self.typed.copy(&cx).at(&cx, (label, name))));
-                if self.counter.next.copy(&cx) == before {
-                    known.insert(&cx, (label, name), answer);
-                }
-                answer
-            },
+            Option::None => self.record_erasure(&cx, label, name, self.typed.copy(&cx).at(&cx, (label, name))),
         }
+    }
+
+    // Record erasure using a type the caller already has, without another lookup in `typed`.
+    fn record_erasure(self, &cx: Domain!['k], label: Span['k], name: Span['k], ty: Type['k]) -> bool {
+        let before = self.counter.next.copy(&cx);
+        let answer = self.erased(&cx, self.substitute_type(&cx, ty));
+        if self.counter.next.copy(&cx) == before {
+            self.erasure.copy(&cx).insert(&cx, (label, name), answer);
+        }
+        answer
     }
 
     fn type_of(self, &cx: Domain!['k], name: Span['k]) -> Type['k] {
@@ -2752,7 +2781,8 @@ impl Backend['k] {
             self.store_in_place(&cx, &lines, a.at(&cx, 0usize), self.blocks.copy(&cx).at(&cx, label).instrs.at(&cx, index - 1usize));
             return;
         }
-        let dst = if instr.lhs.len(&cx) == 1usize && !self.value_erased(&cx, instr.lhs.at(&cx, 0usize)) {
+        // Store emission never uses its result, so it needs no C destination lookup.
+        let dst = if !op.is(&cx, "store") && instr.lhs.len(&cx) == 1usize && !self.value_erased(&cx, instr.lhs.at(&cx, 0usize)) {
             Option::Some.(self.value_name(&cx, instr.lhs.at(&cx, 0usize)))
         } else {
             Option::None
