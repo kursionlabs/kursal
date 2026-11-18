@@ -701,7 +701,8 @@ impl Point {
         Point.{ x: 0u32, y: 0u32 }
     }
 
-    /// The sum of both coordinates.
+    /// The sum of both coordinates, e.g. 3 for `(1, 2)`, i.e. `x + y`. It stays
+    /// below twice `LIMIT`.
     fn sum(self) -> u32 {
         self.x + self.y
     }
@@ -2131,6 +2132,7 @@ class CompilerTests(unittest.TestCase):
             point, measure = page_body(src / "gizmo/struct.Point.md"), page_body(src / "gizmo/trait.Measure.md")
             pages = [p.read_text() for p in src.rglob("*.md") if "src/src" not in p.as_posix()]
             source = (src / "src/gizmo/lib.kur.md").read_text()
+            summaries = {r["p"]: r["s"] for r in json.loads((src / "assets/search-index.json").read_text())}
         self.assertIn('layout = "doc.html"', front)
         for name, section, url in (("Point", "Types", "/gizmo/struct.Point.html"), ("Measure", "Traits", "/gizmo/trait.Measure.html"),
                                    ("first", "Functions", "#fn.first"), ("LIMIT", "Constants", "#const.LIMIT"),
@@ -2153,7 +2155,8 @@ class CompilerTests(unittest.TestCase):
             (body, "instance.Measure-5bPoint-5d", "instance", "A point's size is the sum of its coordinates.",
              "instance Measure[Point] { ... }"),
             (point, "method.origin", "method", "The point at the origin.", "fn origin() -> Point { ... }"),
-            (point, "method.sum", "method", "The sum of both coordinates.", "fn sum(self) -> u32 { ... }"),
+            (point, "method.sum", "method", "The sum of both coordinates, e.g. 3 for `(1, 2)`, i.e. `x + y`. It stays\nbelow twice `LIMIT`.",
+             "fn sum(self) -> u32 { ... }"),
             (point, "instance.Measure-5bPoint-5d", "instance", "A point's size is the sum of its coordinates.",
              "instance Measure[Point] { ... }"),
             (measure, "method.size", "method", "", "fn size(self: Self) -> u32;"),
@@ -2167,14 +2170,15 @@ class CompilerTests(unittest.TestCase):
                 entry = text[text.index(f'id="{anchor}"'):]
                 if prose:
                     self.assertIn(f"\n{prose}\n\n</section>", entry[:entry.index("</section>") + 10])
+        self.assertEqual(summaries["gizmo::Point::sum"], "The sum of both coordinates, e.g. 3 for (1, 2), i.e. x + y.")
         self.assertEqual(first_signature(point), "exposed struct Point {\n    x: u32,\n    y: u32,\n}")
         self.assertIn("\nA point on a grid.\n", point)
         self.assertIn('<span class="tok-keyword">forall</span> T, U', body)
         self.assertIn('<span class="tok-type">u32</span> = <span class="tok-number">100</span><span class="tok-type">u32</span>;', body)
         self.assertIn('<span class="tok-keyword">instance</span> <a class="sig-link sig-trait" href="trait.Measure.html">Measure</a>'
                       '[<a class="sig-link sig-struct" href="struct.Point.html">Point</a>] { ... }', body)
-        self.assertIn('<a class="src-link" href="src/gizmo/lib.kur.html#L42">source</a>', body.replace("../", ""))
-        self.assertIn('<span class="line" id="L42"><span class="tok-keyword">forall</span> T, U</span>', source)
+        self.assertIn('<a class="src-link" href="src/gizmo/lib.kur.html#L43">source</a>', body.replace("../", ""))
+        self.assertIn('<span class="line" id="L43"><span class="tok-keyword">forall</span> T, U</span>', source)
         for hidden in ("implementation note", "fn abs", "extern"):
             self.assertFalse(any(hidden in page for page in pages), hidden)
 

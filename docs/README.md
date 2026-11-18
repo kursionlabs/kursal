@@ -19,6 +19,9 @@ The generator uses the compiler's resolver to find the selected package and
 its dependencies, and documents all of them. Use `//!` at the start of a file
 for a module overview and `///` immediately before a declaration for its
 documentation; the first sentence of the first paragraph is its summary line.
+The sentence ends at a `.` outside backticks that ends the paragraph or comes
+before a space and anything but a lowercase letter; `e.g.`, `i.e.`, `cf.` and
+`vs.` do not end it.
 Ordinary `//` comments stay in source and are omitted from the site.
 
 ## Organization
