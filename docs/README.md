@@ -24,7 +24,9 @@ hidden child module is included with its reachable type. The generated
 `docs/generated/` tree is ignored by Git.
 
 Each module page groups its sidebar by modules, types, traits, functions,
-constants, and externs. A type expands to its definition and methods.
+constants, instances, and externs. A type expands to its definition and
+methods. An instance is listed under what it is an instance of, such as
+`Ord[u8, u8]`, with the documentation comment above it.
 The site follows the reader's light or dark system theme by default; the header
 toggle saves an explicit choice in the browser.
 
