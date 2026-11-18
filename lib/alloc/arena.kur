@@ -1,3 +1,4 @@
+//! Bump allocation for `Copy` values that share one lifetime and access brand.
 // alloc::arena -- a bump allocator over a chain of heap chunks (not one
 // contiguous buffer, unlike `Vec!`). `Arena!::new` mints one brand `'k` and
 // the arena keeps it for its whole life: `alloc` never rebrands, so a `Ref`
@@ -54,11 +55,11 @@ struct Chunk {
     next: *Chunk,
 }
 
-// `root`/`back` describe the root chunk's data buffer -- the block
-// `Arena!::new` allocates, over which `'k` was minted (see the module comment
-// for why only the root). `current` is the head of the chunk chain, and
-// `marker` is the same brand as a value, which `alloc` needs to brand the
-// pointers it computes.
+/// `root`/`back` describe the root chunk's data buffer -- the block
+/// `Arena!::new` allocates, over which `'k` was minted (see the module comment
+/// for why only the root). `current` is the head of the chunk chain, and
+/// `marker` is the same brand as a value, which `alloc` needs to brand the
+/// pointers it computes.
 forall 'k.
 struct Arena! {
     root: Allocation![u8, 'k],
@@ -67,17 +68,17 @@ struct Arena! {
     marker: Brand['k],
 }
 
-// The padding that brings the address `at` up to the next multiple of
-// `alignment`. `alignment` is a power of two (`core::mem::alignof`),
-// so this is a mask rather than a division. Callers pass the address, not
-// an offset into a chunk, so the result holds whatever alignment `malloc`
-// gave the chunk.
+/// The padding that brings the address `at` up to the next multiple of
+/// `alignment`. `alignment` is a power of two (`core::mem::alignof`),
+/// so this is a mask rather than a division. Callers pass the address, not
+/// an offset into a chunk, so the result holds whatever alignment `malloc`
+/// gave the chunk.
 fn padding_for(at: usize, alignment: usize) -> usize {
     (0usize - at) & (alignment - 1usize)
 }
 
-// Check capacity by subtraction so wrapping usize addition cannot make an
-// out-of-bounds allocation appear to fit.
+/// Check capacity by subtraction so wrapping usize addition cannot make an
+/// out-of-bounds allocation appear to fit.
 fn has_room(used: usize, cap: usize, padding: usize, need: usize) -> bool {
     if used > cap {
         false
@@ -91,14 +92,14 @@ fn has_room(used: usize, cap: usize, padding: usize, need: usize) -> bool {
     }
 }
 
-// Allocates the chunk header for an already-allocated data buffer. Kept
-// separate from `new_chunk` so that `Arena!::new` can pass the root buffer's
-// `Uninit!` straight to `Allocation!::adopt_value`, which records the
-// allocator's extent.
-//
-// The header is a small, separate heap allocation (simpler than packing
-// it into the front of `data`, at the cost of one extra alloc/drop pair
-// per chunk), and is arena-private in every chunk including the root.
+/// Allocates the chunk header for an already-allocated data buffer. Kept
+/// separate from `new_chunk` so that `Arena!::new` can pass the root buffer's
+/// `Uninit!` straight to `Allocation!::adopt_value`, which records the
+/// allocator's extent.
+///
+/// The header is a small, separate heap allocation (simpler than packing
+/// it into the front of `data`, at the cost of one extra alloc/drop pair
+/// per chunk), and is arena-private in every chunk including the root.
 unsafe fn new_header(data: *u8, cap: usize, next: *Chunk) -> *Chunk {
     let hdr_uninit = HeapAllocator::alloc(sizeof[Chunk]());
     let hdr_bytes = hdr_uninit.into_raw();
@@ -108,15 +109,15 @@ unsafe fn new_header(data: *u8, cap: usize, next: *Chunk) -> *Chunk {
     hdr
 }
 
-// A fresh chunk ahead of `next`, the current one, with room for at least
-// `min_cap` bytes: twice `next`'s capacity up to 1 MiB, so a small arena
-// stays small and a large one takes few chunks, or bigger if the single
-// allocation that triggered growth needs more than that on its own. Used
-// for chunks 2..n only (`Arena!::new` builds the root itself, because the
-// root's buffer is the tracked one); its data buffer never becomes an
-// `Allocation!` and is freed by `free_chain_after_root_release`.
-//
-// Requires: `next` is the arena's live current chunk.
+/// A fresh chunk ahead of `next`, the current one, with room for at least
+/// `min_cap` bytes: twice `next`'s capacity up to 1 MiB, so a small arena
+/// stays small and a large one takes few chunks, or bigger if the single
+/// allocation that triggered growth needs more than that on its own. Used
+/// for chunks 2..n only (`Arena!::new` builds the root itself, because the
+/// root's buffer is the tracked one); its data buffer never becomes an
+/// `Allocation!` and is freed by `free_chain_after_root_release`.
+///
+/// Requires: `next` is the arena's live current chunk.
 unsafe fn new_chunk(min_cap: usize, next: *Chunk) -> *Chunk {
     let { data: _, used: _, cap: next_cap, next: _ } = unsafe *next;
     let max_cap = 1048576usize;
@@ -136,12 +137,12 @@ unsafe fn new_chunk(min_cap: usize, next: *Chunk) -> *Chunk {
     unsafe new_header(data, cap, next)
 }
 
-// Reserves `need` bytes at `alignment` in `cur`, growing into a new chunk
-// when it lacks room, and returns the chunk the bytes are in and their
-// address. Everything in `Arena!::alloc` that does not depend on its `T`,
-// kept out of it so each instantiation stays a few statements.
-//
-// Requires: `cur` is the arena's live current chunk.
+/// Reserves `need` bytes at `alignment` in `cur`, growing into a new chunk
+/// when it lacks room, and returns the chunk the bytes are in and their
+/// address. Everything in `Arena!::alloc` that does not depend on its `T`,
+/// kept out of it so each instantiation stays a few statements.
+///
+/// Requires: `cur` is the arena's live current chunk.
 unsafe fn bump_chunk(cur: *Chunk, need: usize, alignment: usize) -> (*Chunk, *u8) {
     let { data: d, used: u, cap: c, next: n } = unsafe *cur;
     let padding = padding_for(unsafe (d as usize) + u, alignment);
@@ -159,15 +160,15 @@ unsafe fn bump_chunk(cur: *Chunk, need: usize, alignment: usize) -> (*Chunk, *u8
     }
 }
 
-// Frees every chunk's header, plus every non-root chunk's data buffer.
-//
-// Precondition: `Arena!::destroy` has already freed the root chunk's data
-// buffer through `Allocation!::release` + `HeapAllocator::drop`, so freeing
-// it here would be a double free. The walk skips exactly the root because
-// the root is the chain's tail: `new_chunk` prepends (it stores
-// `next: cur`), `Arena!::new` builds the root with a null `next`, and
-// nothing else writes a chunk's `next`, so `next == null` holds for the
-// root alone.
+/// Frees every chunk's header, plus every non-root chunk's data buffer.
+///
+/// Precondition: `Arena!::destroy` has already freed the root chunk's data
+/// buffer through `Allocation!::release` + `HeapAllocator::drop`, so freeing
+/// it here would be a double free. The walk skips exactly the root because
+/// the root is the chain's tail: `new_chunk` prepends (it stores
+/// `next: cur`), `Arena!::new` builds the root with a null `next`, and
+/// nothing else writes a chunk's `next`, so `next == null` holds for the
+/// root alone.
 unsafe fn free_chain_after_root_release(c: *Chunk) -> () {
     let z = 0usize;
     let nullc = unsafe (z as *Chunk);
@@ -206,19 +207,19 @@ impl Arena! {
 
 forall 'k.
 impl Arena!['k] {
-    // The arena's brand, for code that builds objects in its domain
-    // itself. Holding the arena is what entitles a caller to
-    // put new objects in its domain; the capability alone never does.
+    /// The arena's brand, for code that builds objects in its domain
+    /// itself. Holding the arena is what entitles a caller to
+    /// put new objects in its domain; the capability alone never does.
     fn marker(&self) -> Brand['k] {
         self.marker
     }
 
-    // Allocates naturally aligned room for one `T`, writes `val` into it,
-    // and hands back a `Ref` under the arena's own, never-changing brand --
-    // growing into a fresh chunk first if the current one doesn't have room
-    // for both alignment padding and the value, but never rebranding either
-    // way. `T` is `Copy`: the arena frees its chunks without reading them,
-    // so a linear value stored here would never reach its consumer.
+    /// Allocates naturally aligned room for one `T`, writes `val` into it,
+    /// and hands back a `Ref` under the arena's own, never-changing brand --
+    /// growing into a fresh chunk first if the current one doesn't have room
+    /// for both alignment padding and the value, but never rebranding either
+    /// way. `T` is `Copy`: the arena frees its chunks without reading them,
+    /// so a linear value stored here would never reach its consumer.
     forall T where Copy[T].
     fn alloc(&self, &tag: Exclusive!['k], val: T) -> Ref[T, 'k] {
         let { root: a, back: bk, current: cur, marker: m } = self;
@@ -236,10 +237,10 @@ impl Arena!['k] {
         r
     }
 
-    // Allocates room for `count` values of `T` in one naturally aligned
-    // block, writes `fill` into each, and hands back a view of them under
-    // the arena's brand, which, as with `alloc`, never changes. `T` is
-    // `Copy` because `fill` is written `count` times.
+    /// Allocates room for `count` values of `T` in one naturally aligned
+    /// block, writes `fill` into each, and hands back a view of them under
+    /// the arena's brand, which, as with `alloc`, never changes. `T` is
+    /// `Copy` because `fill` is written `count` times.
     forall T where Copy[T].
     fn alloc_slice(&self, &tag: Exclusive!['k], count: usize, fill: T) -> Slice[T, 'k] {
         let { root: a, back: bk, current: cur, marker: m } = self;
@@ -256,16 +257,16 @@ impl Arena!['k] {
         unsafe Slice::from_raw_parts(base, count, m)
     }
 
-    // Frees every chunk. See the module comment for why this cannot route
-    // every contained value through a consumer the way `Vec!`'s teardown
-    // does.
-    //
-    // The caller's witness is consumed by real work: `resume` demands this
-    // exact `Exclusive!['k]` and rebuilds the root chunk's `Region![u8,'k]`,
-    // `release` demands that complete region and returns the `Uninit!` whose
-    // base and extent `Allocation!::adopt_value` read off the allocator, and `drop`
-    // frees it. No `Ref` is constructed on the path. The remaining headers
-    // and non-root buffers are freed by `free_chain_after_root_release`.
+    /// Frees every chunk. See the module comment for why this cannot route
+    /// every contained value through a consumer the way `Vec!`'s teardown
+    /// does.
+    ///
+    /// The caller's witness is consumed by real work: `resume` demands this
+    /// exact `Exclusive!['k]` and rebuilds the root chunk's `Region![u8,'k]`,
+    /// `release` demands that complete region and returns the `Uninit!` whose
+    /// base and extent `Allocation!::adopt_value` read off the allocator, and `drop`
+    /// frees it. No `Ref` is constructed on the path. The remaining headers
+    /// and non-root buffers are freed by `free_chain_after_root_release`.
     fn destroy(self, tag: Exclusive!['k]) -> () {
         let { root: a, back: bk, current: cur, marker: m } = self;
         let rg = bk.resume(tag);
@@ -274,12 +275,12 @@ impl Arena!['k] {
         unsafe free_chain_after_root_release(cur)
     }
 
-    // Bump-allocates `n` raw, uninitialized bytes and returns a bare
-    // pointer, with no brand. For a caller with a finished, exact-length run
-    // of bytes to copy in once (e.g. built in a scratch `Buffer!`), so the
-    // result can be read many times without linear tracking. Unlike `alloc`,
-    // nothing is written; the caller copies the bytes in (see `copy_bytes`).
-    // No alignment padding is added.
+    /// Bump-allocates `n` raw, uninitialized bytes and returns a bare
+    /// pointer, with no brand. For a caller with a finished, exact-length run
+    /// of bytes to copy in once (e.g. built in a scratch `Buffer!`), so the
+    /// result can be read many times without linear tracking. Unlike `alloc`,
+    /// nothing is written; the caller copies the bytes in (see `copy_bytes`).
+    /// No alignment padding is added.
     unsafe fn alloc_bytes(&self, n: usize) -> *u8 {
         let { root: a, back: bk, current: cur, marker: m } = self;
         let { data: d, used: u, cap: c, next: nx } = unsafe *cur;
@@ -299,27 +300,27 @@ impl Arena!['k] {
 }
 
 // ------------------------------------------------------------- contexts --
-// A context that lends an arena with its capability: what code that
-// allocates in domain `'k` takes, as `&cx: C` with
-// `where Allocate[C -> 'k, R]`, the way code that only reads or writes it
-// takes `core::cap::Access`. `Domain!['k]` is the plain pair; a program may
-// keep both in a context of its own and lend them through these instances.
-//
-//     let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
-//     let r = &arena.alloc(&tag, value);
-//     cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
-//
-// `Arena!::alloc`, `alloc_slice` and `alloc_bytes` are the primitives the
-// context forms below call once a context is open.
+/// A context that lends an arena with its capability: what code that
+/// allocates in domain `'k` takes, as `&cx: C` with
+/// `where Allocate[C -> 'k, R]`, the way code that only reads or writes it
+/// takes `core::cap::Access`. `Domain!['k]` is the plain pair; a program may
+/// keep both in a context of its own and lend them through these instances.
+///
+///     let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
+///     let r = &arena.alloc(&tag, value);
+///     cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
+///
+/// `Arena!::alloc`, `alloc_slice` and `alloc_bytes` are the primitives the
+/// context forms below call once a context is open.
 forall Self -> 'k, R.
 trait Allocate {
     fn open(cx: Self) -> (Exclusive!['k], Arena!['k], R);
     fn close(tag: Exclusive!['k], arena: Arena!['k], rest: R) -> Self;
 }
 
-// An arena with the one capability for its domain: the context for code
-// that reads, writes and allocates there (`Access`, `Allocate`), and reads
-// spans of it (`ReadBytes`).
+/// An arena with the one capability for its domain: the context for code
+/// that reads, writes and allocates there (`Access`, `Allocate`), and reads
+/// spans of it (`ReadBytes`).
 forall 'k.
 exposed struct Domain! {
     tag: Exclusive!['k],
@@ -327,7 +328,7 @@ exposed struct Domain! {
 }
 
 impl Domain! {
-    // A fresh, empty arena under a brand of its own.
+    /// A fresh, empty arena under a brand of its own.
     fn new() -> exists 'k. Domain!['k] {
         let exists 'k. (tag, arena) = Arena!::new();
         pack 'k. Domain!.{ tag, arena }
@@ -336,7 +337,7 @@ impl Domain! {
 
 forall 'k.
 impl Domain!['k] {
-    // Frees everything in the arena; nothing of its domain can be read after.
+    /// Frees everything in the arena; nothing of its domain can be read after.
     fn destroy(self) {
         let { tag, arena } = self;
         arena.destroy(tag);
@@ -380,8 +381,8 @@ instance ReadBytes[Domain!['k], Span['k]] {
 
 forall T, 'k.
 impl Ref[T, 'k] {
-    // `value`, put in the context's arena. `T` is `Copy`, as for
-    // `Arena!::alloc`.
+    /// `value`, put in the context's arena. `T` is `Copy`, as for
+    /// `Arena!::alloc`.
     forall C, R where Copy[T], Allocate[C -> 'k, R].
     fn new(&cx: C, value: T) -> Ref[T, 'k] {
         let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
@@ -392,9 +393,9 @@ impl Ref[T, 'k] {
 }
 
 impl Buffer! {
-    // The buffer's bytes copied into the context's arena in one block of
-    // exactly their length, as a span that lives as long as the arena; the
-    // buffer is freed. `Buffer!::new().push_static("x").push_u64(n).save(&cx)`.
+    /// The buffer's bytes copied into the context's arena in one block of
+    /// exactly their length, as a span that lives as long as the arena; the
+    /// buffer is freed. `Buffer!::new().push_static("x").push_u64(n).save(&cx)`.
     forall 'k, C, R where Allocate[C -> 'k, R].
     fn save(self, &cx: C) -> Span['k] {
         let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
@@ -411,9 +412,9 @@ impl Buffer! {
 
 forall 'j.
 impl Span['j] {
-    // The span's bytes, read under the capability `from` lends, copied into
-    // the arena `to` lends: how text moves from one arena to another, so
-    // that the first can be destroyed while the copy lives on.
+    /// The span's bytes, read under the capability `from` lends, copied into
+    /// the arena `to` lends: how text moves from one arena to another, so
+    /// that the first can be destroyed while the copy lives on.
     forall 'k, C, R, D, Q where Access[C -> 'j, R], Allocate[D -> 'k, Q].
     fn copy_to(self, &from: C, &to: D) -> Span['k] {
         let (from_tag, from_rest) = Access[C -> 'j, R]::open(from);
@@ -427,7 +428,7 @@ impl Span['j] {
         copied
     }
 
-    // The bytes of `self` then `other`, in one new block of the arena.
+    /// The bytes of `self` then `other`, in one new block of the arena.
     forall C, R where Allocate[C -> 'j, R].
     fn concat(self, &cx: C, other: Span['j]) -> Span['j] {
         let (tag, arena, rest) = Allocate[C -> 'j, R]::open(cx);
@@ -439,9 +440,9 @@ impl Span['j] {
     }
 }
 
-// Copies `count` bytes from `src` to `dest`, byte by byte (the same loop as
-// `alloc::buffer::Buffer!::push_n`). `alloc_bytes` only reserves room, so its
-// callers copy with this.
+/// Copies `count` bytes from `src` to `dest`, byte by byte (the same loop as
+/// `alloc::buffer::Buffer!::push_n`). `alloc_bytes` only reserves room, so its
+/// callers copy with this.
 unsafe fn copy_bytes(dest: *u8, src: *u8, count: usize) -> () {
     var i = 0usize;
     while i < count {

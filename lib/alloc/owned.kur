@@ -1,3 +1,4 @@
+//! Heap ownership and the records used to open and close memory regions.
 // `alloc::owned` -- the records that own heap storage: `Owned![T]`
 // (one heap-allocated `T`) and `Allocation![T,'r]` (the right to free a
 // block). The allocator-free half of the vocabulary -- `Ref`, `Region!`
@@ -15,36 +16,36 @@ use core::option::Result;
 use core::cap::{Brand, Exclusive!};
 use core::mem::{Region!, lend, lend_in, sizeof};
 
-// Sole ownership of one heap-allocated `T`. Restricted, like everything in
-// `core::mem`: only this module may construct or destructure these records.
-//
-// Carries no brand: an `Owned!` is unshared, so there is nothing for a brand
-// to witness. One appears when `open` splits it and goes away when `close`
-// rejoins it. Carries no extent: the block's size is `sizeof[T]()`, which
-// `new`/`try_new` allocate and `open` recomputes, so the
-// `Owned!` -> `open` -> `close` -> `Owned!` round trip is lossless without
-// storing it. See `Allocation!::close` for the one narrowing direction.
+/// Sole ownership of one heap-allocated `T`. Restricted, like everything in
+/// `core::mem`: only this module may construct or destructure these records.
+///
+/// Carries no brand: an `Owned!` is unshared, so there is nothing for a brand
+/// to witness. One appears when `open` splits it and goes away when `close`
+/// rejoins it. Carries no extent: the block's size is `sizeof[T]()`, which
+/// `new`/`try_new` allocate and `open` recomputes, so the
+/// `Owned!` -> `open` -> `close` -> `Owned!` round trip is lossless without
+/// storing it. See `Allocation!::close` for the one narrowing direction.
 forall T.
 struct Owned! {
     ptr: *T,
 }
 
-// The right to free one heap block, under brand `'r`.
-//
-// Freeing goes through `release(self, reg: Region![T, 'r])`, which takes no
-// `Ref`: the base address comes from `self`, and the only producers of an
-// `Allocation!` are `Allocation!::adopt` and `adopt_value`, which read it
-// straight off the allocator's `Uninit!`. The record is restricted, and no exported function
-// turns a pointer, a `Ref` or a `Brand` into one, so freeing an interior
-// pointer projected from a `Ref` is not expressible.
-//
-// Carries the extent as well as the base so that `release` can hand back an
-// `Uninit!` with its size intact; without it every adopt/release round trip
-// would reset the size to zero.
-//
-// Kept separate from `Region!`: `close`/`release` demand the complete region
-// back, and merging the two would put the deallocation record and the
-// access-recovery token in one value.
+/// The right to free one heap block, under brand `'r`.
+///
+/// Freeing goes through `release(self, reg: Region![T, 'r])`, which takes no
+/// `Ref`: the base address comes from `self`, and the only producers of an
+/// `Allocation!` are `Allocation!::adopt` and `adopt_value`, which read it
+/// straight off the allocator's `Uninit!`. The record is restricted, and no exported function
+/// turns a pointer, a `Ref` or a `Brand` into one, so freeing an interior
+/// pointer projected from a `Ref` is not expressible.
+///
+/// Carries the extent as well as the base so that `release` can hand back an
+/// `Uninit!` with its size intact; without it every adopt/release round trip
+/// would reset the size to zero.
+///
+/// Kept separate from `Region!`: `close`/`release` demand the complete region
+/// back, and merging the two would put the deallocation record and the
+/// access-recovery token in one value.
 forall T, 'r.
 struct Allocation! {
     ptr: *T,
@@ -54,14 +55,14 @@ struct Allocation! {
 
 forall T.
 impl Owned![T] {
-    // Moves `value` into a new heap block. Aborts if allocation fails.
-    //
-    // Not built on `try_new`: after `abort()` in a derived version, the
-    // `Err` arm would still have to produce an `Owned![T]` while holding
-    // `try_new`'s returned `T`, which it can neither store (there is no
-    // allocation) nor drop (`T` may be linear). `HeapAllocator::grow` can be
-    // layered because its error arm hands back an `Uninit!`, the very thing
-    // it returns. So `new` calls `HeapAllocator::alloc` directly.
+    /// Moves `value` into a new heap block. Aborts if allocation fails.
+    ///
+    /// Not built on `try_new`: after `abort()` in a derived version, the
+    /// `Err` arm would still have to produce an `Owned![T]` while holding
+    /// `try_new`'s returned `T`, which it can neither store (there is no
+    /// allocation) nor drop (`T` may be linear). `HeapAllocator::grow` can be
+    /// layered because its error arm hands back an `Uninit!`, the very thing
+    /// it returns. So `new` calls `HeapAllocator::alloc` directly.
     fn new(value: T) -> Owned![T] {
         let u = HeapAllocator::alloc(sizeof[T]());
         let raw = u.into_raw();
@@ -70,9 +71,9 @@ impl Owned![T] {
         Owned!.{ ptr: p }
     }
 
-    // The fallible constructor. The error arm hands `value` back unmoved, so
-    // a linear `T` survives an allocation failure and the caller must decide
-    // what happens to it.
+    /// The fallible constructor. The error arm hands `value` back unmoved, so
+    /// a linear `T` survives an allocation failure and the caller must decide
+    /// what happens to it.
     fn try_new(value: T) -> Result[Owned![T], (AllocError, T)] {
         match Storage::try_alloc(sizeof[T]()) {
             Result::Ok(u) => {
@@ -84,9 +85,9 @@ impl Owned![T] {
         }
     }
 
-    // Calls `f` on the owned value where it lives: `f` gets it through `&`,
-    // and nothing is copied out or back. Holding `self` is the only access
-    // to the value, so nothing else reads or writes it while `f` runs.
+    /// Calls `f` on the owned value where it lives: `f` gets it through `&`,
+    /// and nothing is copied out or back. Holding `self` is the only access
+    /// to the value, so nothing else reads or writes it while `f` runs.
     forall Ret.
     fn update(&self, f: closure(&_: T) -> Ret) -> Ret {
         let { ptr: p } = self;
@@ -95,7 +96,7 @@ impl Owned![T] {
         ret
     }
 
-    // `update`, with a context `cx` lent to `f` beside the value.
+    /// `update`, with a context `cx` lent to `f` beside the value.
     forall C, Ret.
     fn update_in(&self, &cx: C, f: closure(&_: T, &_: C) -> Ret) -> Ret {
         let { ptr: p } = self;
@@ -104,9 +105,9 @@ impl Owned![T] {
         ret
     }
 
-    // Frees the allocation and returns the contained `T`. Freeing the
-    // storage does not consume what is in it: a linear `T` (a nested
-    // `Owned!`, say) must go back to the caller rather than be dropped.
+    /// Frees the allocation and returns the contained `T`. Freeing the
+    /// storage does not consume what is in it: a linear `T` (a nested
+    /// `Owned!`, say) must go back to the caller rather than be dropped.
     fn into_value(self) -> T {
         let { ptr: p } = self;
         let v = unsafe *p;
@@ -115,16 +116,16 @@ impl Owned![T] {
         v
     }
 
-    // Splits sole ownership into a freshly branded pair: the right to free
-    // (`Allocation!`) and the right to access (`Region!`).
-    // `Allocation!::close` is the exact inverse and the only way back to an
-    // `Owned![T]`.
-    //
-    // Goes through `Allocation!::adopt` so there is one place an allocation
-    // record is created. `adopt_raw_sized`'s precondition holds: `p` is the
-    // base of a single live block allocated by `new`/`try_new`; `self` was
-    // consumed above, so no other owner exists; and `sizeof[T]()` is exactly
-    // the size they requested.
+    /// Splits sole ownership into a freshly branded pair: the right to free
+    /// (`Allocation!`) and the right to access (`Region!`).
+    /// `Allocation!::close` is the exact inverse and the only way back to an
+    /// `Owned![T]`.
+    ///
+    /// Goes through `Allocation!::adopt` so there is one place an allocation
+    /// record is created. `adopt_raw_sized`'s precondition holds: `p` is the
+    /// base of a single live block allocated by `new`/`try_new`; `self` was
+    /// consumed above, so no other owner exists; and `sizeof[T]()` is exactly
+    /// the size they requested.
     fn open(self) -> exists '1. (Allocation![T, '1], Region![T, '1]) {
         let { ptr: p } = self;
         let raw = unsafe (p as *u8);
@@ -137,22 +138,22 @@ impl Owned![T] {
 
 forall T.
 impl Allocation![T] {
-    // Takes ownership of `u` and returns an allocation record together with
-    // the `Region!` over the block.
-    //
-    // The brand `'1` is fresh per call and returned sealed, so no caller can
-    // name it in advance or ask for a record over a brand that already
-    // exists. The base and extent are read off `u`, never supplied by the
-    // caller, and kept in the linear, restricted, unprojectable record; the
-    // access side goes out separately as the `Region!`.
-    //
-    // `unsafe fn`: the region lets safe code read and write the block as a
-    // `T` (`Region!::replace`, `share` and the `Ref` it hands out), so the
-    // caller vouches that the block holds an initialized `T`, aligned for
-    // `T`, in at least `sizeof[T]()` bytes. `u`'s base is a `malloc`
-    // result, so alignment holds for every type the language has; the size
-    // and the contents are the caller's word. `adopt_value` checks the size
-    // and writes the `T` itself.
+    /// Takes ownership of `u` and returns an allocation record together with
+    /// the `Region!` over the block.
+    ///
+    /// The brand `'1` is fresh per call and returned sealed, so no caller can
+    /// name it in advance or ask for a record over a brand that already
+    /// exists. The base and extent are read off `u`, never supplied by the
+    /// caller, and kept in the linear, restricted, unprojectable record; the
+    /// access side goes out separately as the `Region!`.
+    ///
+    /// `unsafe fn`: the region lets safe code read and write the block as a
+    /// `T` (`Region!::replace`, `share` and the `Ref` it hands out), so the
+    /// caller vouches that the block holds an initialized `T`, aligned for
+    /// `T`, in at least `sizeof[T]()` bytes. `u`'s base is a `malloc`
+    /// result, so alignment holds for every type the language has; the size
+    /// and the contents are the caller's word. `adopt_value` checks the size
+    /// and writes the `T` itself.
     unsafe fn adopt(u: Uninit!) -> exists '1. (Allocation![T, '1], Region![T, '1]) {
         let exists '1. (k, cap) = Exclusive!::fresh();
         let (raw, n) = u.into_parts();
@@ -165,10 +166,10 @@ impl Allocation![T] {
         pack '1. (a, rg)
     }
 
-    // `adopt`, made safe: aborts unless `u`'s recorded extent is at least
-    // `sizeof[T]()` bytes, then writes `v` at the block's base, so the
-    // region is over an initialized `T`. An `Uninit!` from `adopt_raw`
-    // records extent 0 and so aborts here for any `T` with bytes.
+    /// `adopt`, made safe: aborts unless `u`'s recorded extent is at least
+    /// `sizeof[T]()` bytes, then writes `v` at the block's base, so the
+    /// region is over an initialized `T`. An `Uninit!` from `adopt_raw`
+    /// records extent 0 and so aborts here for any `T` with bytes.
     fn adopt_value(u: Uninit!, v: T) -> exists '1. (Allocation![T, '1], Region![T, '1]) {
         let (raw, n) = u.into_parts();
         if n < sizeof[T]() {
@@ -188,15 +189,15 @@ impl Allocation![T] {
 
 forall T, 'r.
 impl Allocation![T, 'r] {
-    // The allocation's base address; the record stays with the caller.
-    //
-    // The pointer grants nothing by itself: every load, store or cast
-    // through it needs its own `unsafe`, and it cannot be turned back into
-    // an `Allocation!`. It is still `unsafe fn` because the caller keeps the
-    // record and so holds an address into memory it still owns, the same as
-    // `alloc::buffer::Buffer!::as_ptr`. (`Uninit!::into_raw`/`into_parts` are
-    // safe because they consume the owner.) Containers use it to compute
-    // element addresses while the record stays in their struct.
+    /// The allocation's base address; the record stays with the caller.
+    ///
+    /// The pointer grants nothing by itself: every load, store or cast
+    /// through it needs its own `unsafe`, and it cannot be turned back into
+    /// an `Allocation!`. It is still `unsafe fn` because the caller keeps the
+    /// record and so holds an address into memory it still owns, the same as
+    /// `alloc::buffer::Buffer!::as_ptr`. (`Uninit!::into_raw`/`into_parts` are
+    /// safe because they consume the owner.) Containers use it to compute
+    /// element addresses while the record stays in their struct.
     unsafe fn base(&self) -> *T {
         let { ptr: p, extent: n, marker: m } = self;
         let a = Allocation!.{ ptr: p, extent: n, marker: m };
@@ -204,17 +205,17 @@ impl Allocation![T, 'r] {
         p
     }
 
-    // Retires the brand and hands back raw, unbranded storage.
-    //
-    // Demands the complete `Region![T,'r]`, not merely a witness. A region
-    // is consumed by `share` and rebuilt only by `RegionResume!::resume`,
-    // which demands the exact `Exclusive!['r]` back, so presenting one
-    // proves every access capability of this brand has been returned. `self`
-    // and `reg` must name the same `'r`, which no caller can arrange for two
-    // unrelated allocations because `adopt` seals a fresh brand per call.
-    //
-    // The returned `Uninit!` carries the extent `adopt` recorded, so a caller
-    // can release, grow and re-adopt without restating the size.
+    /// Retires the brand and hands back raw, unbranded storage.
+    ///
+    /// Demands the complete `Region![T,'r]`, not merely a witness. A region
+    /// is consumed by `share` and rebuilt only by `RegionResume!::resume`,
+    /// which demands the exact `Exclusive!['r]` back, so presenting one
+    /// proves every access capability of this brand has been returned. `self`
+    /// and `reg` must name the same `'r`, which no caller can arrange for two
+    /// unrelated allocations because `adopt` seals a fresh brand per call.
+    ///
+    /// The returned `Uninit!` carries the extent `adopt` recorded, so a caller
+    /// can release, grow and re-adopt without restating the size.
     fn release(self, reg: Region![T, 'r]) -> Uninit! {
         let { ptr: p, extent: n, marker: m } = self;
         let retired = reg.retire();
@@ -222,24 +223,24 @@ impl Allocation![T, 'r] {
         unsafe HeapAllocator::adopt_raw_sized(raw, n)
     }
 
-    // `Owned!::open`'s exact inverse: retires the brand and hands back sole
-    // ownership of the block as an `Owned![T]`.
-    //
-    // Demands the complete `Region![T,'r]`. `close` checks nothing; the
-    // guarantee is what can exist at the call site. The region is linear and
-    // unique, the only way to get an access capability from it is `share`,
-    // which consumes it, and only `resume` -- given the exact `Exclusive!['r]`
-    // `share` handed out -- rebuilds it. So presenting the region proves every
-    // access capability of this brand has come back, and using the region
-    // after `close` is rejected because `close` consumed it.
-    //
-    // Drops `self`'s extent, since `Owned![T]` records its size in its type.
-    // For a record from `Owned!::open` that is exact. For one from `adopt` or
-    // `adopt_value` over a larger block, `close` narrows the claim to
-    // `sizeof[T]()`. That cannot break a free (`free` takes no size, and
-    // `Owned!`'s only terminal path is `into_value` -> `adopt_raw` ->
-    // `free`), and the block holds the initialized `T` that `adopt`'s
-    // obligation, or `adopt_value`'s write, put there.
+    /// `Owned!::open`'s exact inverse: retires the brand and hands back sole
+    /// ownership of the block as an `Owned![T]`.
+    ///
+    /// Demands the complete `Region![T,'r]`. `close` checks nothing; the
+    /// guarantee is what can exist at the call site. The region is linear and
+    /// unique, the only way to get an access capability from it is `share`,
+    /// which consumes it, and only `resume` -- given the exact `Exclusive!['r]`
+    /// `share` handed out -- rebuilds it. So presenting the region proves every
+    /// access capability of this brand has come back, and using the region
+    /// after `close` is rejected because `close` consumed it.
+    ///
+    /// Drops `self`'s extent, since `Owned![T]` records its size in its type.
+    /// For a record from `Owned!::open` that is exact. For one from `adopt` or
+    /// `adopt_value` over a larger block, `close` narrows the claim to
+    /// `sizeof[T]()`. That cannot break a free (`free` takes no size, and
+    /// `Owned!`'s only terminal path is `into_value` -> `adopt_raw` ->
+    /// `free`), and the block holds the initialized `T` that `adopt`'s
+    /// obligation, or `adopt_value`'s write, put there.
     fn close(self, reg: Region![T, 'r]) -> Owned![T] {
         let { ptr: p, extent: n, marker: m } = self;
         let retired = reg.retire();

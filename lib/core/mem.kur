@@ -164,24 +164,24 @@ use core::ptr::NonNull;
 // place, and `enum_variant(value)` returns the value beside it.
 export builtin::{sizeof, alloca, enum_variant};
 
-// Every owner and capability type here is `restricted`: construction and
-// destructuring are confined to this module. `Owned!` and `Allocation!`
-// are `alloc::owned`'s, restricted there.
-//
-// `Ref` only ever stores a pointer, never `T` inline, so it is Copy
-// whatever `T` is: both `Ref[u32, 'k]` and `Ref[Owned!, 'k]` are Copy.
-//
-// `Ref` is restricted because pairing an arbitrary pointer with an
-// arbitrary brand is itself authority once one capability covers a whole
-// domain (`Exclusive!['k]`, `StaticRead`). Without it, safe code could
-// re-brand any pointer it can read off a view (`Slice::into_parts`,
-// `Ref::into_parts`) -- e.g. wrap a stale slice's pointer as a `Ref` of a
-// live brand and read it through an unrelated `Exclusive!` of that brand,
-// or forge a `'static` view of heap memory. `from_raw` below is the only
-// way in from another module.
-//
-// The pointer is a `NonNull`: a `Ref` always describes a live `T`, so an
-// `Option[Ref[T, 'k]]` (or a list's link) is one word.
+/// Every owner and capability type here is `restricted`: construction and
+/// destructuring are confined to this module. `Owned!` and `Allocation!`
+/// are `alloc::owned`'s, restricted there.
+///
+/// `Ref` only ever stores a pointer, never `T` inline, so it is Copy
+/// whatever `T` is: both `Ref[u32, 'k]` and `Ref[Owned!, 'k]` are Copy.
+///
+/// `Ref` is restricted because pairing an arbitrary pointer with an
+/// arbitrary brand is itself authority once one capability covers a whole
+/// domain (`Exclusive!['k]`, `StaticRead`). Without it, safe code could
+/// re-brand any pointer it can read off a view (`Slice::into_parts`,
+/// `Ref::into_parts`) -- e.g. wrap a stale slice's pointer as a `Ref` of a
+/// live brand and read it through an unrelated `Exclusive!` of that brand,
+/// or forge a `'static` view of heap memory. `from_raw` below is the only
+/// way in from another module.
+///
+/// The pointer is a `NonNull`: a `Ref` always describes a live `T`, so an
+/// `Option[Ref[T, 'k]]` (or a list's link) is one word.
 forall T, 'k.
 struct Ref {
     ptr: NonNull[T],
@@ -196,107 +196,107 @@ struct Ref {
 // capability. Memory types that own a domain hold its `Exclusive!` rather
 // than a bare brand, because only `Exclusive!::fresh` can create one.
 
-// `Allocation!` (`alloc::owned`) is the right to free a block;
-// `Region!` is the right to access it, under the same brand.
+/// `Allocation!` (`alloc::owned`) is the right to free a block;
+/// `Region!` is the right to access it, under the same brand.
 forall T, 'r.
 struct Region! {
     ptr: *T,
     cap: Exclusive!['r],
 }
 
-// The receipt `Region!::share` keeps back, and the ONLY route from an
-// `Exclusive!['r]` back to a `Region![T,'r]`: the base pointer plus the
-// brand, and nothing else. No extent, because `resume` reconstructs a
-// `Region!`, and a `Region!` carries none (the extent lives in the
-// `Allocation!`, which `share` does not touch).
-//
-// Structurally `Allocation!` minus the extent, but a separate type:
-// `close`/`release` demanding a complete region is the invariant the
-// whole design rests on, and merging the deallocation record with the
-// access-recovery token would let one value stand in for both.
+/// The receipt `Region!::share` keeps back, and the ONLY route from an
+/// `Exclusive!['r]` back to a `Region![T,'r]`: the base pointer plus the
+/// brand, and nothing else. No extent, because `resume` reconstructs a
+/// `Region!`, and a `Region!` carries none (the extent lives in the
+/// `Allocation!`, which `share` does not touch).
+///
+/// Structurally `Allocation!` minus the extent, but a separate type:
+/// `close`/`release` demanding a complete region is the invariant the
+/// whole design rests on, and merging the deallocation record with the
+/// access-recovery token would let one value stand in for both.
 forall T, 'r.
 struct RegionResume! {
     ptr: *T,
     marker: Brand['r],
 }
 
-// `Region!::split`/`Restore!::merge` below decompose one exclusive region
-// into one independently branded sub-region per FIELD, each with its own
-// fresh `Exclusive!` capability, and a receipt that reunites them.
-//
-// `Link!['f,'r]` names BOTH brands: the fresh child brand `'f` a part was
-// minted under, and the parent brand `'r` it was split from. If `Link!`
-// named only the parent, a caller could build a fake part (any
-// `Region![F,'f2]` it already owns, paired with a `Link!['r]` naming the
-// real parent) and feed it to `merge` in place of a real one, smuggling
-// access to memory that was never part of the split. Naming the child
-// too means a `Link!` is only ever produced alongside the exact
-// `Region!` `split` made it for (`split` builds it from the fresh brand
-// `make_split_part` returns with that region), so a parent brand cannot
-// be paired with an arbitrary region.
+/// `Region!::split`/`Restore!::merge` below decompose one exclusive region
+/// into one independently branded sub-region per FIELD, each with its own
+/// fresh `Exclusive!` capability, and a receipt that reunites them.
+///
+/// `Link!['f,'r]` names BOTH brands: the fresh child brand `'f` a part was
+/// minted under, and the parent brand `'r` it was split from. If `Link!`
+/// named only the parent, a caller could build a fake part (any
+/// `Region![F,'f2]` it already owns, paired with a `Link!['r]` naming the
+/// real parent) and feed it to `merge` in place of a real one, smuggling
+/// access to memory that was never part of the split. Naming the child
+/// too means a `Link!` is only ever produced alongside the exact
+/// `Region!` `split` made it for (`split` builds it from the fresh brand
+/// `make_split_part` returns with that region), so a parent brand cannot
+/// be paired with an arbitrary region.
 forall 'f, 'r.
 struct Link! {
     child: Brand['f],
     parent: Brand['r],
 }
 
-// `Restore![T,'r]` -- the receipt `split` keeps back: the base pointer and
-// the parent's own `Exclusive!['r]`, held while the parts are out. Like
-// `RegionResume!` it leads back to a `Region![T,'r]`, but it is a
-// different type, for the reason `Allocation!`/`Region!` are two types:
-// `share`'s receipt and `split`'s
-// receipt account for two different events, and merging them would let
-// one value stand in for both. Restricted, and `merge` is the ONLY
-// producer of a `Region![T,'r]` from one, as `RegionResume!::resume` is
-// for its receipt.
-//
-// `merge` rebuilds the `Region![T,'r]` from `self`'s OWN stored pointer,
-// NEVER from a part: parts are permutable (nothing pins field 0's part to
-// field 0's storage once opened), so a `merge` that derived the parent's
-// base address from a part would read the wrong offset back the moment a
-// caller reordered the product. `Restore!` makes the correct base address
-// available without touching a part at all.
+/// `Restore![T,'r]` -- the receipt `split` keeps back: the base pointer and
+/// the parent's own `Exclusive!['r]`, held while the parts are out. Like
+/// `RegionResume!` it leads back to a `Region![T,'r]`, but it is a
+/// different type, for the reason `Allocation!`/`Region!` are two types:
+/// `share`'s receipt and `split`'s
+/// receipt account for two different events, and merging them would let
+/// one value stand in for both. Restricted, and `merge` is the ONLY
+/// producer of a `Region![T,'r]` from one, as `RegionResume!::resume` is
+/// for its receipt.
+///
+/// `merge` rebuilds the `Region![T,'r]` from `self`'s OWN stored pointer,
+/// NEVER from a part: parts are permutable (nothing pins field 0's part to
+/// field 0's storage once opened), so a `merge` that derived the parent's
+/// base address from a part would read the wrong offset back the moment a
+/// caller reordered the product. `Restore!` makes the correct base address
+/// available without touching a part at all.
 forall T, 'r.
 struct Restore! {
     ptr: *T,
     cap: Exclusive!['r],
 }
 
-// Lends `*p` to `f` in place: `f` gets the value through `&`, and the value
-// it leaves there is `*p` afterwards. `unsafe &*p` lends the target
-// itself, so the call passes `p`. `unsafe`: the caller vouches that `p`
-// points at a live `T` that nothing else reads or writes while `f` runs.
+/// Lends `*p` to `f` in place: `f` gets the value through `&`, and the value
+/// it leaves there is `*p` afterwards. `unsafe &*p` lends the target
+/// itself, so the call passes `p`. `unsafe`: the caller vouches that `p`
+/// points at a live `T` that nothing else reads or writes while `f` runs.
 forall T, Ret.
 unsafe fn lend(p: *T, f: closure(&_: T) -> Ret) -> Ret {
     f(unsafe &*p)
 }
 
-// `lend`, with a context `cx` lent to `f` beside `*p`: the other values the
-// closure works on, which it could not capture (a closure that may go
-// uncalled captures only `Copy` values). Bundle several into one struct.
+/// `lend`, with a context `cx` lent to `f` beside `*p`: the other values the
+/// closure works on, which it could not capture (a closure that may go
+/// uncalled captures only `Copy` values). Bundle several into one struct.
 forall T, C, Ret.
 unsafe fn lend_in(p: *T, &cx: C, f: closure(&_: T, &_: C) -> Ret) -> Ret {
     f(unsafe &*p, &cx)
 }
 
-// For every layout the C backend gives a type, `sizeof[T]` is a multiple
-// of its alignment, so in `{ u8, T }` the value starts at the alignment
-// and the aggregate's size is `alignment + size`. `AlignProbe` is that
-// aggregate, never built; `alignof` only takes its size.
+/// For every layout the C backend gives a type, `sizeof[T]` is a multiple
+/// of its alignment, so in `{ u8, T }` the value starts at the alignment
+/// and the aggregate's size is `alignment + size`. `AlignProbe` is that
+/// aggregate, never built; `alignof` only takes its size.
 forall T.
 struct AlignProbe {
     prefix: u8,
     value: T,
 }
 
-// The alignment of `T` in bytes, as C lays it out: a power of two, 1 for
-// a zero-size type.
+/// The alignment of `T` in bytes, as C lays it out: a power of two, 1 for
+/// a zero-size type.
 forall T.
 fn alignof() -> usize {
     sizeof[AlignProbe[T]]() - sizeof[T]()
 }
 
-// Exchanges the values of two places.
+/// Exchanges the values of two places.
 forall T.
 fn swap(&a: T, &b: T) {
     let x = a;
@@ -304,9 +304,9 @@ fn swap(&a: T, &b: T) {
     b = x;
 }
 
-// Puts `val` in `dst` and returns what was there: how a linear value in a
-// place is swapped out, where `dst = val;` would drop the previous one
-// (`let old = mem::replace(&self.slot, fresh);`).
+/// Puts `val` in `dst` and returns what was there: how a linear value in a
+/// place is swapped out, where `dst = val;` would drop the previous one
+/// (`let old = mem::replace(&self.slot, fresh);`).
 forall T.
 fn replace(&dst: T, val: T) -> T {
     let old = dst;
@@ -316,39 +316,39 @@ fn replace(&dst: T, val: T) -> T {
 
 forall T, 'k.
 impl Ref[T, 'k] {
-    // The one way to build a `Ref` outside this module. `unsafe`: the
-    // caller vouches that `ptr` points at a live `T` inside the domain
-    // `marker` names, so that presenting that domain's capability
-    // (`with`, `copy`, `read`) really authorizes the access. So `ptr` is
-    // never null.
+    /// The one way to build a `Ref` outside this module. `unsafe`: the
+    /// caller vouches that `ptr` points at a live `T` inside the domain
+    /// `marker` names, so that presenting that domain's capability
+    /// (`with`, `copy`, `read`) really authorizes the access. So `ptr` is
+    /// never null.
     unsafe fn from_raw(ptr: *T, marker: Brand['k]) -> Ref[T, 'k] {
         let p = unsafe NonNull::new_unchecked(ptr);
         Ref.{ ptr: p, marker }
     }
 
-    // The safe inverse of `from_raw`, like `Slice::into_parts`: the
-    // pointer and brand grant nothing by themselves, and turning them
-    // back into a `Ref` needs `from_raw` again.
+    /// The safe inverse of `from_raw`, like `Slice::into_parts`: the
+    /// pointer and brand grant nothing by themselves, and turning them
+    /// back into a `Ref` needs `from_raw` again.
     fn into_parts(self) -> (*T, Brand['k]) {
         let { ptr: p, marker: m } = self;
         (p.as_ptr(), m)
     }
 
-    // The address this `Ref` describes, for identity comparisons
-    // (`a.address() == b.address()`). Safe: it reads no memory, and turning
-    // an address back into a pointer needs an `unsafe` cast. Values of a
-    // zero-size `T` have no bytes and may share an address.
+    /// The address this `Ref` describes, for identity comparisons
+    /// (`a.address() == b.address()`). Safe: it reads no memory, and turning
+    /// an address back into a pointer needs an `unsafe` cast. Values of a
+    /// zero-size `T` have no bytes and may share an address.
     fn address(self) -> usize {
         let { ptr: p, marker: m } = self;
         let raw = p.as_ptr();
         unsafe (raw as usize)
     }
 
-    // The only way to look at or change a shared value -- requires
-    // presenting the live `Exclusive!` of the matching brand, lent by a
-    // context that holds it (`core::cap::Access`); nothing about `self` or
-    // the capability is inspected at runtime, the brand match is already
-    // enforced by the call's own type-check.
+    /// The only way to look at or change a shared value -- requires
+    /// presenting the live `Exclusive!` of the matching brand, lent by a
+    /// context that holds it (`core::cap::Access`); nothing about `self` or
+    /// the capability is inspected at runtime, the brand match is already
+    /// enforced by the call's own type-check.
     forall Ret, C, R where Access[C -> 'k, R].
     fn with(self, &cx: C, f: closure(T) -> (T, Ret)) -> Ret {
         let (tag, rest) = Access[C -> 'k, R]::open(cx);
@@ -361,9 +361,9 @@ impl Ref[T, 'k] {
         ret
     }
 
-    // Calls `f` on the value where it lives: `f` gets it through `&` and
-    // its changes land in place, with no copy of the value in or out. The
-    // same witness as `with`.
+    /// Calls `f` on the value where it lives: `f` gets it through `&` and
+    /// its changes land in place, with no copy of the value in or out. The
+    /// same witness as `with`.
     forall Ret, C, R where Access[C -> 'k, R].
     fn update(self, &cx: C, f: closure(&_: T) -> Ret) -> Ret {
         let (tag, rest) = Access[C -> 'k, R]::open(cx);
@@ -373,8 +373,8 @@ impl Ref[T, 'k] {
         ret
     }
 
-    // Puts `val` in the place and hands back the value that was there:
-    // `with`'s store, with no closure. The same witness as `with`.
+    /// Puts `val` in the place and hands back the value that was there:
+    /// `with`'s store, with no closure. The same witness as `with`.
     forall C, R where Access[C -> 'k, R].
     fn replace(self, &cx: C, val: T) -> T {
         let (tag, rest) = Access[C -> 'k, R]::open(cx);
@@ -386,8 +386,8 @@ impl Ref[T, 'k] {
         old
     }
 
-    // `update`, with a second place `other` lent to `f` beside the value
-    // (`lend_in`).
+    /// `update`, with a second place `other` lent to `f` beside the value
+    /// (`lend_in`).
     forall X, Ret, C, R where Access[C -> 'k, R].
     fn update_in(self, &cx: C, &other: X, f: closure(&_: T, &_: X) -> Ret) -> Ret {
         let (tag, rest) = Access[C -> 'k, R]::open(cx);
@@ -397,22 +397,22 @@ impl Ref[T, 'k] {
         ret
     }
 
-    // Projects this `Ref` onto a different pointer of the same brand, via
-    // a caller-supplied `fn`. Deliberately a plain, non-capturing function
-    // pointer, not a `closure`: `f` can only produce its `*E` from the
-    // `*T` it is handed (or from other code it calls), never by quietly
-    // closing over a pointer lying around at the call site. An inline
-    // `|p: *T| { ... }` literal in this position is checked to capture
-    // nothing. Deliberately general beyond field projection: nothing
-    // requires the new pointer to be derived from the original, which is
-    // what lets an arena stamp its one long-lived brand onto an unrelated
-    // allocation.
-    //
-    // The `unsafe` marker is on `map` itself, not on `f`'s type: an
-    // `unsafe fn` parameter would say "the callback may do unsafe things",
-    // a different statement from "calling `map` is unsafe". `map`
-    // discharges nothing; the caller must have checked that `f` returns a
-    // pointer to a live `E` in the same domain.
+    /// Projects this `Ref` onto a different pointer of the same brand, via
+    /// a caller-supplied `fn`. Deliberately a plain, non-capturing function
+    /// pointer, not a `closure`: `f` can only produce its `*E` from the
+    /// `*T` it is handed (or from other code it calls), never by quietly
+    /// closing over a pointer lying around at the call site. An inline
+    /// `|p: *T| { ... }` literal in this position is checked to capture
+    /// nothing. Deliberately general beyond field projection: nothing
+    /// requires the new pointer to be derived from the original, which is
+    /// what lets an arena stamp its one long-lived brand onto an unrelated
+    /// allocation.
+    ///
+    /// The `unsafe` marker is on `map` itself, not on `f`'s type: an
+    /// `unsafe fn` parameter would say "the callback may do unsafe things",
+    /// a different statement from "calling `map` is unsafe". `map`
+    /// discharges nothing; the caller must have checked that `f` returns a
+    /// pointer to a live `E` in the same domain.
     forall E.
     unsafe fn map(self, f: fn(*T) -> *E) -> Ref[E, 'k] {
         let { ptr: p, marker: m } = self;
@@ -423,10 +423,10 @@ impl Ref[T, 'k] {
 
 forall T, 'k where Copy[T].
 impl Ref[T, 'k] {
-    // `with`'s most common case: read the current value without changing
-    // it. `T` comes from `r`'s own type, so a bare `r.copy(&tag)` needs no
-    // annotation. Needs `T: Copy` because the value is handed back as the
-    // result while also staying in place, which duplicates it.
+    /// `with`'s most common case: read the current value without changing
+    /// it. `T` comes from `r`'s own type, so a bare `r.copy(&tag)` needs no
+    /// annotation. Needs `T: Copy` because the value is handed back as the
+    /// result while also staying in place, which duplicates it.
     forall C, R where Access[C -> 'k, R].
     fn copy(self, &cx: C) -> T {
         // The same read `with(&cx, |v| (v, v))` performs, without the
@@ -439,15 +439,15 @@ impl Ref[T, 'k] {
         v
     }
 
-    // Puts `val` in the place; the value there before is dropped, which
-    // `T: Copy` allows. `replace` hands it back.
+    /// Puts `val` in the place; the value there before is dropped, which
+    /// `T: Copy` allows. `replace` hands it back.
     forall C, R where Access[C -> 'k, R].
     fn set(self, &cx: C, val: T) {
         let old = self.replace(&cx, val);
     }
 
-    // A read through one node of the domain's shared-read tree. Any node
-    // will do: they all permit reading, and none permits writing.
+    /// A read through one node of the domain's shared-read tree. Any node
+    /// will do: they all permit reading, and none permits writing.
     forall 'q.
     fn read(self, &cx: Shared!['k, 'q]) -> T {
         let { ptr: nn, marker: m } = self;
@@ -470,23 +470,23 @@ impl Ref[T, 'k] {
 
 forall T, 'r.
 impl Region![T, 'r] {
-    // The way into a region over memory this module did not allocate:
-    // `alloc::owned`'s `Allocation!::adopt`, or a program's own
-    // storage. The caller vouches that `ptr` points at an initialized `T`,
-    // aligned for `T`, in at least `sizeof[T]()` bytes, that nothing else
-    // can reach while 'r lives (so `ptr` is not null), and that `cap` is
-    // the only capability over 'r -- in practice, fresh from
-    // `Exclusive!::fresh`, so no existing `Ref` of brand 'r describes other
-    // memory. The region's `replace` and `share` read and write the `T`
-    // with no further check.
+    /// The way into a region over memory this module did not allocate:
+    /// `alloc::owned`'s `Allocation!::adopt`, or a program's own
+    /// storage. The caller vouches that `ptr` points at an initialized `T`,
+    /// aligned for `T`, in at least `sizeof[T]()` bytes, that nothing else
+    /// can reach while 'r lives (so `ptr` is not null), and that `cap` is
+    /// the only capability over 'r -- in practice, fresh from
+    /// `Exclusive!::fresh`, so no existing `Ref` of brand 'r describes other
+    /// memory. The region's `replace` and `share` read and write the `T`
+    /// with no further check.
     unsafe fn from_raw(ptr: *T, cap: Exclusive!['r]) -> Region![T, 'r] {
         Region!.{ ptr, cap }
     }
 
-    // Ends the region and its domain: the capability is retired, so no
-    // `Ref` of brand 'r can be used again. The storage is untouched;
-    // whoever holds the matching `Allocation!` decides what happens to
-    // it, which is why `release` and `close` take the whole region.
+    /// Ends the region and its domain: the capability is retired, so no
+    /// `Ref` of brand 'r can be used again. The storage is untouched;
+    /// whoever holds the matching `Allocation!` decides what happens to
+    /// it, which is why `release` and `close` take the whole region.
     fn retire(self) -> () {
         let { ptr: p, cap } = self;
         cap.retire()
@@ -495,21 +495,21 @@ impl Region![T, 'r] {
 
 forall T, 'r.
 impl Region![T, 'r] {
-    // Reads the contained `T` out and writes a new one in, exactly once
-    // each way: the only access operation a region has that does not give
-    // the region up. There is no `Region!::with`, because `Ref::with`
-    // already has that shape, and getting to a `Ref` is what `share`
-    // (below) is for.
-    //
-    // No witness parameter: holding a `Region![T,'r]` is already proof
-    // that nothing else can touch this block, because a region is linear,
-    // unique, and consumed by every operation that could hand out a second
-    // capability over the same brand -- and `Allocation!::close`/`release`,
-    // which reclaim the storage, demand the region itself.
-    //
-    // Sound for any `T`, `Copy` or linear, for `Ref::with`'s reason: the
-    // previous value is moved out and returned to the caller, `val` is
-    // moved in, and neither is duplicated or discarded here.
+    /// Reads the contained `T` out and writes a new one in, exactly once
+    /// each way: the only access operation a region has that does not give
+    /// the region up. There is no `Region!::with`, because `Ref::with`
+    /// already has that shape, and getting to a `Ref` is what `share`
+    /// (below) is for.
+    ///
+    /// No witness parameter: holding a `Region![T,'r]` is already proof
+    /// that nothing else can touch this block, because a region is linear,
+    /// unique, and consumed by every operation that could hand out a second
+    /// capability over the same brand -- and `Allocation!::close`/`release`,
+    /// which reclaim the storage, demand the region itself.
+    ///
+    /// Sound for any `T`, `Copy` or linear, for `Ref::with`'s reason: the
+    /// previous value is moved out and returned to the caller, `val` is
+    /// moved in, and neither is duplicated or discarded here.
     fn replace(&self, val: T) -> T {
         let { ptr: p, ..rest } = self;
         let old = unsafe *p;
@@ -518,24 +518,24 @@ impl Region![T, 'r] {
         old
     }
 
-    // Trades the region -- one linear value that both describes the block
-    // and authorizes touching it -- for the two-axis split the module
-    // header describes: an `Exclusive!['r]` that authorizes and does not
-    // describe, a `Ref[T,'r]` that describes and does not authorize, and a
-    // `RegionResume![T,'r]` that is the receipt for putting them back
-    // together. No brand is minted: all three carry `self`'s 'r, so the
-    // `Ref` works with `Ref::with`/`Ref::copy` like any other
-    // `Exclusive!`/`Ref` pair, and the `Exclusive!` is the same type every
-    // container threads.
-    //
-    // `share` CONSUMES the region. `close`/`release` demand a
-    // `Region![T,'r]` that, once shared, only `RegionResume!::resume` can
-    // produce -- and `resume` demands this exact witness back. So storage
-    // cannot be reclaimed while the witness is out. The `Ref` left over
-    // after resuming is inert: it is `Copy`, it may outlive everything,
-    // and it authorizes nothing once the `Exclusive!['r]` is gone for good
-    // (brands are never recycled, and `Exclusive!::fresh` mints only fresh
-    // ones).
+    /// Trades the region -- one linear value that both describes the block
+    /// and authorizes touching it -- for the two-axis split the module
+    /// header describes: an `Exclusive!['r]` that authorizes and does not
+    /// describe, a `Ref[T,'r]` that describes and does not authorize, and a
+    /// `RegionResume![T,'r]` that is the receipt for putting them back
+    /// together. No brand is minted: all three carry `self`'s 'r, so the
+    /// `Ref` works with `Ref::with`/`Ref::copy` like any other
+    /// `Exclusive!`/`Ref` pair, and the `Exclusive!` is the same type every
+    /// container threads.
+    ///
+    /// `share` CONSUMES the region. `close`/`release` demand a
+    /// `Region![T,'r]` that, once shared, only `RegionResume!::resume` can
+    /// produce -- and `resume` demands this exact witness back. So storage
+    /// cannot be reclaimed while the witness is out. The `Ref` left over
+    /// after resuming is inert: it is `Copy`, it may outlive everything,
+    /// and it authorizes nothing once the `Exclusive!['r]` is gone for good
+    /// (brands are never recycled, and `Exclusive!::fresh` mints only fresh
+    /// ones).
     fn share(self) -> (Exclusive!['r], Ref[T, 'r], RegionResume![T, 'r]) {
         let { ptr: p, cap } = self;
         let stamp = &cap.stamp();
@@ -554,23 +554,24 @@ impl Region![T, 'r] {
 // of its own.
 forall T, 'r where Exposed[*T].
 impl Region![T, 'r] {
-    // Decomposes one exclusive region into one independently branded
-    // sub-region per FIELD of `T`, each usable (ordinarily via
-    // `Region!::share`) without any two sub-regions' `Exclusive!`s being
-    // interchangeable. `where Exposed[*T]` is the shape authority: `T` is
-    // abstract here, and `foreach *F of *T` needs to see `T`'s product
-    // shape to traverse it field by field.
-    //
-    // A part does NOT bundle an `Exclusive!` (`exists 'f. (Exclusive!['f],
-    // Region![F,'f], Link!['f,'r])`): a caller could `Region::share` the
-    // part's region to mint a SECOND live `Exclusive!['f]` beside the
-    // bundled one, and two live writers for one brand is a safe
-    // use-after-free and double free. A part's writer is obtained the
-    // ordinary way, by calling `share` on its `Region![F,'f]`.
-    //
-    // No new brand for 'r: the caller's `Region![T,'r]` already proves
-    // everything needed. The fresh brands minted here are the per-field
-    // ones, each strictly smaller in scope than 'r.
+    /// Decomposes one exclusive region into one independently branded
+    /// sub-region per FIELD of `T`, each usable (ordinarily via
+    /// `Region!::share`) without any two sub-regions' `Exclusive!`s being
+    /// interchangeable. `where Exposed[*T]` is the shape authority: `T` is
+    /// abstract here, and `foreach *F of *T` needs to see `T`'s product
+    /// shape to traverse it field by field.
+    ///
+/// A part does NOT bundle an `Exclusive!`
+/// (`exists 'f. (Exclusive!['f], Region![F,'f], Link!['f,'r])`):
+/// a caller could `Region::share` the
+    /// part's region to mint a SECOND live `Exclusive!['f]` beside the
+    /// bundled one, and two live writers for one brand is a safe
+    /// use-after-free and double free. A part's writer is obtained the
+    /// ordinary way, by calling `share` on its `Region![F,'f]`.
+    ///
+    /// No new brand for 'r: the caller's `Region![T,'r]` already proves
+    /// everything needed. The fresh brands minted here are the per-field
+    /// ones, each strictly smaller in scope than 'r.
     fn split(self) -> (Restore![T, 'r], foreach *F of * T => exists 'f. (Region![F, 'f], Link!['f, 'r])) {
         let { ptr: p, cap } = self;
         // The parts' parent brand is this region's own witness, read inside
@@ -586,26 +587,26 @@ impl Region![T, 'r] {
     }
 }
 
-// `Region!::split`'s per-field step. A separate function, not inlined in
-// `split`'s `foreach` body, because the `exists 'f. (...)` a `foreach`
-// component produces must be a SEALED RETURN: `Exclusive!::fresh` mints and
-// seals one brand per call.
-//
-// It mints the child brand and hands back only that, never a `Link!`. A
-// helper taking the PARENT brand as a parameter and returning a `Link!`
-// would forge authority: a `Brand['r]` is `Copy` and readable off any live
-// `Ref` naming 'r, so it proves nothing about holding 'r. `split` instead
-// reads the parent brand from the region's own `Exclusive!['r]` and builds
-// each `Link!` itself.
-//
-// `unsafe fn` because it takes a raw pointer that is trusted, unvalidated,
-// and immediately wrapped in a `Region!`. THE CALLER'S OBLIGATION (any
-// module can call this, not only `split`): `field` must address
-// initialized storage of `Field` that no other live capability covers, as
-// for `Region!::from_raw`. `split` meets it with field pointers computed by
-// `foreach` over a region it holds exclusively. The part returned carries
-// only its own fresh brand; since `Link!` is built by `split` alone, a part
-// over unrelated storage can never be merged into a parent.
+/// `Region!::split`'s per-field step. A separate function, not inlined in
+/// `split`'s `foreach` body, because the `exists 'f. (...)` a `foreach`
+/// component produces must be a SEALED RETURN: `Exclusive!::fresh` mints and
+/// seals one brand per call.
+///
+/// It mints the child brand and hands back only that, never a `Link!`. A
+/// helper taking the PARENT brand as a parameter and returning a `Link!`
+/// would forge authority: a `Brand['r]` is `Copy` and readable off any live
+/// `Ref` naming 'r, so it proves nothing about holding 'r. `split` instead
+/// reads the parent brand from the region's own `Exclusive!['r]` and builds
+/// each `Link!` itself.
+///
+/// `unsafe fn` because it takes a raw pointer that is trusted, unvalidated,
+/// and immediately wrapped in a `Region!`. THE CALLER'S OBLIGATION (any
+/// module can call this, not only `split`): `field` must address
+/// initialized storage of `Field` that no other live capability covers, as
+/// for `Region!::from_raw`. `split` meets it with field pointers computed by
+/// `foreach` over a region it holds exclusively. The part returned carries
+/// only its own fresh brand; since `Link!` is built by `split` alone, a part
+/// over unrelated storage can never be merged into a parent.
 forall Field.
 unsafe fn make_split_part(field: *Field) -> exists 'f. (Region![Field, 'f], Brand['f]) {
     let exists '1. (k, cap) = Exclusive!::fresh();
@@ -615,30 +616,30 @@ unsafe fn make_split_part(field: *Field) -> exists 'f. (Region![Field, 'f], Bran
 
 forall T, 'r.
 impl RegionResume![T, 'r] {
-    // `Region!::share`'s exact inverse, and the only producer of a
-    // `Region![T,'r]` for an 'r that `adopt` has already sealed.
-    //
-    // Demands the EXACT witness, not merely an `Exclusive!` of the same
-    // shape: 'r is fixed by `self`'s type, and the only `Exclusive!['r]`
-    // that ever exists for it is the one `share` returned beside this
-    // receipt. An `Exclusive!` from another region carries another brand
-    // and does not unify, and one cannot be forged from a copied `Brand`.
-    //
-    // Both weaker signatures would be unsound:
-    //
-    //   fn resume(self) -> Region![T,'r]
-    //       hands the region back with the witness still live: resume,
-    //       `close`, free, then read through a surviving `Ref`.
-    //   forall 'q. fn resume(self, w: Exclusive!['q]) -> Region![T,'r]
-    //       demands a witness, just not THIS one: discharge region A's
-    //       receipt with region B's witness, free A, read A.
-    //
-    // The pointer comes from `self`, never from a `Ref`. A `Ref[T,'r]` is
-    // `Copy` and freely projectable (`Ref::map`), so if `resume` took one,
-    // a caller could rebuild the region over an interior element and hand
-    // THAT to `close`. It takes the witness, which carries no pointer, and
-    // reads the base out of the receipt, which is linear, restricted and
-    // unprojectable.
+    /// `Region!::share`'s exact inverse, and the only producer of a
+    /// `Region![T,'r]` for an 'r that `adopt` has already sealed.
+    ///
+    /// Demands the EXACT witness, not merely an `Exclusive!` of the same
+    /// shape: 'r is fixed by `self`'s type, and the only `Exclusive!['r]`
+    /// that ever exists for it is the one `share` returned beside this
+    /// receipt. An `Exclusive!` from another region carries another brand
+    /// and does not unify, and one cannot be forged from a copied `Brand`.
+    ///
+    /// Both weaker signatures would be unsound:
+    ///
+    ///   fn resume(self) -> Region![T,'r]
+    ///       hands the region back with the witness still live: resume,
+    ///       `close`, free, then read through a surviving `Ref`.
+    ///   forall 'q. fn resume(self, w: Exclusive!['q]) -> Region![T,'r]
+    ///       demands a witness, just not THIS one: discharge region A's
+    ///       receipt with region B's witness, free A, read A.
+    ///
+    /// The pointer comes from `self`, never from a `Ref`. A `Ref[T,'r]` is
+    /// `Copy` and freely projectable (`Ref::map`), so if `resume` took one,
+    /// a caller could rebuild the region over an interior element and hand
+    /// THAT to `close`. It takes the witness, which carries no pointer, and
+    /// reads the base out of the receipt, which is linear, restricted and
+    /// unprojectable.
     fn resume(self, w: Exclusive!['r]) -> Region![T, 'r] {
         let { ptr: p, marker: m } = self;
         Region!.{ ptr: p, cap: w }
@@ -651,26 +652,26 @@ impl RegionResume![T, 'r] {
 // against the exact type it authorizes, so `Exposed[*T]` alone does not
 // cover it.
 forall T, 'r where Exposed[foreach *F of * T => exists 'f. (Region![F, 'f], Link!['f, 'r])].impl Restore![T, 'r] {
-    // `Region!::split`'s exact inverse. Consumes the WHOLE product -- every
-    // part, in whatever order the caller hands them back -- and `self`, the
-    // receipt `split` kept. Four properties carry the soundness:
-    //
-    //   1. `Link!` names both brands (see the struct).
-    //   2. `Restore!` is one-shot: it is consumed by value here, so a
-    //      second `merge` on the same receipt is unspellable.
-    //   3. No public operation consumes a single `Link!` in isolation: the
-    //      only way to discharge one is inside this `foreach`, which
-    //      discharges the whole product together with `self`, or not at
-    //      all (the `foreach` source is linear; a partially consumed
-    //      product cannot be dropped).
-    //   4. The returned `Region![T,'r]` is rebuilt from `self`'s own
-    //      pointer and capability, never from a part, since parts are
-    //      permutable (see `Restore!`).
-    //
-    // Each part is destructured only to CONSUME it: the child's
-    // capability is retired and its link discarded. Nothing about the
-    // child's pointer or brand flows into the rebuilt parent; that pointer
-    // addresses one field, not the whole block.
+    /// `Region!::split`'s exact inverse. Consumes the WHOLE product -- every
+    /// part, in whatever order the caller hands them back -- and `self`, the
+    /// receipt `split` kept. Four properties carry the soundness:
+    ///
+    ///   1. `Link!` names both brands (see the struct).
+    ///   2. `Restore!` is one-shot: it is consumed by value here, so a
+    ///      second `merge` on the same receipt is unspellable.
+    ///   3. No public operation consumes a single `Link!` in isolation: the
+    ///      only way to discharge one is inside this `foreach`, which
+    ///      discharges the whole product together with `self`, or not at
+    ///      all (the `foreach` source is linear; a partially consumed
+    ///      product cannot be dropped).
+    ///   4. The returned `Region![T,'r]` is rebuilt from `self`'s own
+    ///      pointer and capability, never from a part, since parts are
+    ///      permutable (see `Restore!`).
+    ///
+    /// Each part is destructured only to CONSUME it: the child's
+    /// capability is retired and its link discarded. Nothing about the
+    /// child's pointer or brand flows into the rebuilt parent; that pointer
+    /// addresses one field, not the whole block.
     fn merge(self, parts: foreach *F of * T => exists 'f. (Region![F, 'f], Link!['f, 'r])) -> Region![T, 'r] {
         let { ptr: p, ..rest } = self;
         let done = foreach part of parts {

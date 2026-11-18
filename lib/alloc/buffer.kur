@@ -1,3 +1,4 @@
+//! Growable byte buffers with explicit ownership and initialized length.
 // alloc::buffer -- `Buffer!`, the growable, heap-owned byte buffer. Always
 // `u8`. Linear, so a buffer that is built but never consumed is a compile
 // error rather than a leak.
@@ -29,37 +30,37 @@ use core::hash::{Hash, Eq, HashState};
 use core::option::{Option, Result};
 use core::iter::Iterator;
 
-// Restricted: no other module can write the literal, which would otherwise
-// let it wrap any pointer (say, one read off a live `Slice`) and `destroy`
-// it -- an arbitrary `free` with no `unsafe`. Nothing builds one from a
-// raw address; the ways out to one are `as_ptr`/`tail_ptr`.
+/// Restricted: no other module can write the literal, which would otherwise
+/// let it wrap any pointer (say, one read off a live `Slice`) and `destroy`
+/// it -- an arbitrary `free` with no `unsafe`. Nothing builds one from a
+/// raw address; the ways out to one are `as_ptr`/`tail_ptr`.
 struct Buffer! {
     ptr: *u8,
     len: usize,
     cap: usize,
 }
 
-// The way back from `Buffer!::open` to a growable `Buffer!`. Carries `cap`
-// as well as `len`, so a restored buffer keeps growing as before.
-//
-// Restricted: `restore` turns one of these plus a matching `Exclusive!['k]`
-// into an owning `Buffer!`, so forging one would yield a freeable buffer
-// over an arbitrary pointer.
-//
-// The address and the brand travel inside the two linear `core::mem`
-// records that `Allocation!::adopt` and `Region!::share` mint over the
-// buffer's storage:
-//
-//   * `store: Allocation![u8,'k]` -- the right to retire the block, and the
-//     only thing that remembers its base. Restricted, linear and
-//     unprojectable, so it cannot be offset.
-//   * `back: RegionResume![u8,'k]` -- the receipt for the `Exclusive!['k]`
-//     that `open` handed out. `resume` demands that exact witness back and
-//     returns the complete `Region![u8,'k]` that `Allocation!::release`
-//     requires.
-//
-// No separate `Brand['k]` field: everything `restore` builds is brandless,
-// so the brand is never needed as a value.
+/// The way back from `Buffer!::open` to a growable `Buffer!`. Carries `cap`
+/// as well as `len`, so a restored buffer keeps growing as before.
+///
+/// Restricted: `restore` turns one of these plus a matching `Exclusive!['k]`
+/// into an owning `Buffer!`, so forging one would yield a freeable buffer
+/// over an arbitrary pointer.
+///
+/// The address and the brand travel inside the two linear `core::mem`
+/// records that `Allocation!::adopt` and `Region!::share` mint over the
+/// buffer's storage:
+///
+///   * `store: Allocation![u8,'k]` -- the right to retire the block, and the
+///     only thing that remembers its base. Restricted, linear and
+///     unprojectable, so it cannot be offset.
+///   * `back: RegionResume![u8,'k]` -- the receipt for the `Exclusive!['k]`
+///     that `open` handed out. `resume` demands that exact witness back and
+///     returns the complete `Region![u8,'k]` that `Allocation!::release`
+///     requires.
+///
+/// No separate `Brand['k]` field: everything `restore` builds is brandless,
+/// so the brand is never needed as a value.
 forall 'k.
 struct BufferRestore! {
     store: Allocation![u8, 'k],
@@ -68,15 +69,15 @@ struct BufferRestore! {
     cap: usize,
 }
 
-// `new_with_cap` aborts when its allocation fails, and `commit` when asked
-// for a `len` past `cap`, matching `alloc::heap`'s aborting API: a
-// `Buffer!`-returning method has no error channel, so an unsatisfiable
-// request is a hard stop.
+/// `new_with_cap` aborts when its allocation fails, and `commit` when asked
+/// for a `len` past `cap`, matching `alloc::heap`'s aborting API: a
+/// `Buffer!`-returning method has no error channel, so an unsatisfiable
+/// request is a hard stop.
 extern "C" fn abort() -> !;
 
 impl Buffer! {
-    // A new, empty buffer with room for `cap` bytes before the first grow,
-    // or the allocation failure. Growing it later aborts as `ensure` does.
+    /// A new, empty buffer with room for `cap` bytes before the first grow,
+    /// or the allocation failure. Growing it later aborts as `ensure` does.
     fn try_new_with_cap(cap: usize) -> Result[Buffer!, AllocError] {
         match Storage::try_alloc(cap) {
             Result::Ok(u) => Result::Ok.(Buffer!.{ ptr: u.into_raw(), len: 0usize, cap }),
@@ -84,8 +85,8 @@ impl Buffer! {
         }
     }
 
-    // `try_new_with_cap`, aborting on failure. `new` is this with a starting
-    // capacity of 64.
+    /// `try_new_with_cap`, aborting on failure. `new` is this with a starting
+    /// capacity of 64.
     fn new_with_cap(cap: usize) -> Buffer! {
         match Buffer!::try_new_with_cap(cap) {
             Result::Ok(b) => b,
@@ -97,13 +98,13 @@ impl Buffer! {
         Buffer!::new_with_cap(64usize)
     }
 
-    // A buffer of exactly `n` zero bytes: `len == cap == n`, every byte
-    // initialized, so it is safe and carries no obligation.
-    //
-    // For a caller that wants a fixed-size buffer whose every index is
-    // addressable after `open` (so `get_ref` admits it), and then writes
-    // through the brand. Zeroing costs one pass over `n` bytes and means no
-    // uninitialized byte is ever inside `len`.
+    /// A buffer of exactly `n` zero bytes: `len == cap == n`, every byte
+    /// initialized, so it is safe and carries no obligation.
+    ///
+    /// For a caller that wants a fixed-size buffer whose every index is
+    /// addressable after `open` (so `get_ref` admits it), and then writes
+    /// through the brand. Zeroing costs one pass over `n` bytes and means no
+    /// uninitialized byte is ever inside `len`.
     fn new_zeroed(n: usize) -> Buffer! {
         let b = Buffer!::new_with_cap(n);
         let { ptr: p, len: len_, cap: c } = b;
@@ -116,8 +117,8 @@ impl Buffer! {
         Buffer!.{ ptr: p, len: n, cap: c }
     }
 
-    // Grows (doubling) until at least `extra` more bytes fit; a no-op
-    // otherwise. Aborts if the size overflows `usize`.
+    /// Grows (doubling) until at least `extra` more bytes fit; a no-op
+    /// otherwise. Aborts if the size overflows `usize`.
     fn ensure(self, extra: usize) -> Buffer! {
         let { ptr: p, len: n, cap: c } = self;
         let needed = checked_add(n, extra);
@@ -136,7 +137,7 @@ impl Buffer! {
         }
     }
 
-    // Appends one byte, growing first if needed.
+    /// Appends one byte, growing first if needed.
     fn push_byte(self, val: u8) -> Buffer! {
         let b2 = self.ensure(1usize);
         let { ptr: p, len: n, cap: c } = b2;
@@ -145,7 +146,7 @@ impl Buffer! {
         Buffer!.{ ptr: p, len: checked_add(n, 1usize), cap: c }
     }
 
-    // Copies `count` bytes from `src` in, growing first if needed.
+    /// Copies `count` bytes from `src` in, growing first if needed.
     unsafe fn push_n(self, src: *u8, count: usize) -> Buffer! {
         let b2 = self.ensure(count);
         let { ptr: p, len: n, cap: c } = b2;
@@ -160,17 +161,17 @@ impl Buffer! {
         Buffer!.{ ptr: p, len: checked_add(n, count), cap: c }
     }
 
-    // Appends a `'static` byte view's bytes. Safe without a capability
-    // argument because `'static` storage is permanent and immutable
-    // (`core::slice::StaticRead`); f-string lowering uses this for literal
-    // segments.
+    /// Appends a `'static` byte view's bytes. Safe without a capability
+    /// argument because `'static` storage is permanent and immutable
+    /// (`core::slice::StaticRead`); f-string lowering uses this for literal
+    /// segments.
     fn push_static(self, bytes: Slice[u8, 'static]) -> Buffer! {
         let (p, n, m) = bytes.into_parts();
         unsafe self.push_n(p, n)
     }
 
-    // Appends any readable byte view's bytes, reading through the
-    // capability that permits it. Never consumes or frees the view itself.
+    /// Appends any readable byte view's bytes, reading through the
+    /// capability that permits it. Never consumes or frees the view itself.
     forall C, S where ReadBytes[C, S], Copy[S].
     fn push_bytes(self, &cx: C, bytes: S) -> Buffer! {
         let n = ReadBytes[C, S]::len(&cx, bytes);
@@ -193,7 +194,7 @@ impl Buffer! {
         Buffer!.{ ptr: p, len, cap: c }
     }
 
-    // Appends the decimal rendering of `n`.
+    /// Appends the decimal rendering of `n`.
     fn push_u64(self, n: u64) -> Buffer! {
         let b = if n >= 10u64 { self.push_u64(n / 10u64) } else { self };
         b.push_byte(b'0' + ((n % 10u64) as u8))
@@ -203,7 +204,7 @@ impl Buffer! {
         self.push_u64(n as u64)
     }
 
-    // Appends the decimal rendering of `n`, after a `-` when it is negative.
+    /// Appends the decimal rendering of `n`, after a `-` when it is negative.
     fn push_i64(self, n: i64) -> Buffer! {
         if n < 0i64 {
             // Two's-complement negation in `u64`, so `i64::MIN` has a magnitude.
@@ -213,7 +214,7 @@ impl Buffer! {
         }
     }
 
-    // Appends `other`'s bytes, then destroys `other`.
+    /// Appends `other`'s bytes, then destroys `other`.
     fn push_buffer(self, other: Buffer!) -> Buffer! {
         let p = unsafe &other.as_ptr();
         let n = &other.len();
@@ -222,19 +223,19 @@ impl Buffer! {
         b
     }
 
-    // The first `len` bytes, or all of them when there are fewer; the
-    // room stays for what is pushed next.
+    /// The first `len` bytes, or all of them when there are fewer; the
+    /// room stays for what is pushed next.
     fn truncate(self, len: usize) -> Buffer! {
         let { ptr: p, len: n, cap: c } = self;
         Buffer!.{ ptr: p, len: if len < n { len } else { n }, cap: c }
     }
 
-    // No bytes, with the room kept.
+    /// No bytes, with the room kept.
     fn clear(self) -> Buffer! {
         self.truncate(0usize)
     }
 
-    // A new buffer holding the same bytes; `self` comes back unchanged.
+    /// A new buffer holding the same bytes; `self` comes back unchanged.
     fn clone(&self) -> Buffer! {
         let p = unsafe &self.as_ptr();
         let n = &self.len();
@@ -244,15 +245,15 @@ impl Buffer! {
         copy
     }
 
-    // `&self`: `self` is linear, so even a query hands the buffer back
-    // first, as `&b.len()` at the call site.
+    /// `&self`: `self` is linear, so even a query hands the buffer back
+    /// first, as `&b.len()` at the call site.
     fn len(&self) -> usize {
         let { ptr: p, len: n, cap: c } = self;
         self = Buffer!.{ ptr: p, len: n, cap: c };
         n
     }
 
-    // How many more bytes fit before the next grow: `cap - len`.
+    /// How many more bytes fit before the next grow: `cap - len`.
     fn remaining_capacity(&self) -> usize {
         let { ptr: p, len: n, cap: c } = self;
         self = Buffer!.{ ptr: p, len: n, cap: c };
@@ -265,17 +266,17 @@ impl Buffer! {
         p
     }
 
-    // Guarantees room for at least `extra` more bytes without writing
-    // anything, for a caller that writes through `tail_ptr` directly (e.g. a
-    // syscall filling the buffer in place).
+    /// Guarantees room for at least `extra` more bytes without writing
+    /// anything, for a caller that writes through `tail_ptr` directly (e.g. a
+    /// syscall filling the buffer in place).
     fn reserve(self, extra: usize) -> Buffer! {
         self.ensure(extra)
     }
 
-    // Address of the first unused byte, writable up to the room `reserve`
-    // most recently guaranteed. Pairs with `commit`. The pointer is valid
-    // only until the next grow. Takes `&self` because a linear buffer must
-    // survive the call so the caller can `commit` afterwards.
+    /// Address of the first unused byte, writable up to the room `reserve`
+    /// most recently guaranteed. Pairs with `commit`. The pointer is valid
+    /// only until the next grow. Takes `&self` because a linear buffer must
+    /// survive the call so the caller can `commit` afterwards.
     unsafe fn tail_ptr(&self) -> *u8 {
         let { ptr: p, len: n, cap: c } = self;
         let addr = unsafe offset(p, n);
@@ -283,20 +284,20 @@ impl Buffer! {
         addr
     }
 
-    // Advances `len` by `n` without writing anything. Pairs with
-    // `reserve`/`tail_ptr`.
-    //
-    // Capacity is checked: if the new length would exceed `cap`, this
-    // aborts. Without the check, `open` would hand out a `Slice` longer than
-    // the block, and `Slice::get_ref`'s bounds check (against the slice's
-    // length) would admit out-of-bounds indices.
-    //
-    // Initialization cannot be checked, so it is the caller's obligation:
-    // all `n` bytes at `p[len .. len+n)` have been written since the last
-    // `reserve`/grow, so the new `len` describes initialized storage.
-    //
-    // A caller that only wants a fixed-size, fully addressable buffer should
-    // use `Buffer!::new_zeroed`, which carries no obligation.
+    /// Advances `len` by `n` without writing anything. Pairs with
+    /// `reserve`/`tail_ptr`.
+    ///
+    /// Capacity is checked: if the new length would exceed `cap`, this
+    /// aborts. Without the check, `open` would hand out a `Slice` longer than
+    /// the block, and `Slice::get_ref`'s bounds check (against the slice's
+    /// length) would admit out-of-bounds indices.
+    ///
+    /// Initialization cannot be checked, so it is the caller's obligation:
+    /// all `n` bytes at `p[len .. len+n)` have been written since the last
+    /// `reserve`/grow, so the new `len` describes initialized storage.
+    ///
+    /// A caller that only wants a fixed-size, fully addressable buffer should
+    /// use `Buffer!::new_zeroed`, which carries no obligation.
     unsafe fn commit(self, n: usize) -> Buffer! {
         let { ptr: p, len: len_, cap: c } = self;
         let new_len = checked_add(len_, n);
@@ -305,28 +306,28 @@ impl Buffer! {
         Buffer!.{ ptr: p, len: new_len, cap: c }
     }
 
-    // Frees the buffer. Every `Buffer!` must reach this, or be handed on,
-    // before its function returns.
+    /// Frees the buffer. Every `Buffer!` must reach this, or be handed on,
+    /// before its function returns.
     fn destroy(self) -> () {
         let { ptr: p, len: n, cap: c } = self;
         HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(p))
     }
 
-    // Mints a fresh brand over this buffer's storage and returns a
-    // `Slice[u8,'1]` to read and write through, plus `BufferRestore!`, the
-    // only way back to a growable `Buffer!`. The address the way back uses
-    // is captured here from `self`, never from the `Slice` (which
-    // `Slice::sub` can offset).
-    //
-    // `Allocation!::adopt` keeps the base in a linear, restricted,
-    // unprojectable `Allocation![u8,'1]`; `Region!::share` hands out the
-    // `Exclusive!`/`Ref` access pair plus the `RegionResume![u8,'1]` receipt
-    // that `restore` needs.
-    //
-    // Uses `adopt_raw`, not `adopt_raw_sized(p, c)`: the allocation record
-    // holds extent `0usize` ("not recorded") and `BufferRestore!` carries
-    // `cap` itself. Nothing reads the
-    // record's extent: `restore` discards it via `into_raw`.
+    /// Mints a fresh brand over this buffer's storage and returns a
+    /// `Slice[u8,'1]` to read and write through, plus `BufferRestore!`, the
+    /// only way back to a growable `Buffer!`. The address the way back uses
+    /// is captured here from `self`, never from the `Slice` (which
+    /// `Slice::sub` can offset).
+    ///
+    /// `Allocation!::adopt` keeps the base in a linear, restricted,
+    /// unprojectable `Allocation![u8,'1]`; `Region!::share` hands out the
+    /// `Exclusive!`/`Ref` access pair plus the `RegionResume![u8,'1]` receipt
+    /// that `restore` needs.
+    ///
+    /// Uses `adopt_raw`, not `adopt_raw_sized(p, c)`: the allocation record
+    /// holds extent `0usize` ("not recorded") and `BufferRestore!` carries
+    /// `cap` itself. Nothing reads the
+    /// record's extent: `restore` discards it via `into_raw`.
     fn open(self) -> exists '1. (Exclusive!['1], Slice[u8, '1], BufferRestore!['1]) {
         let { ptr: p, len: n, cap: c } = self;
         // `adopt`'s obligation, at `u8`: the block is a `malloc` result of at
@@ -346,22 +347,22 @@ impl Buffer! {
     }
 }
 
-// An initialized-prefix writer: a session over a `Buffer!` with room
-// already reserved, so code that fills known bytes never needs
-// `tail_ptr`/`commit`. `push`/`append_*` are safe wrappers over the
-// `push_*` methods and `finish` hands the buffer back. The two `unsafe fn`s
-// at the bottom are the same escape hatch as `tail_ptr`/`commit`, for FFI.
-//
-// Exposed: its only field is a restricted `Buffer!`, so building one
-// requires already owning a real buffer -- no more authority than holding
-// that buffer grants.
+/// An initialized-prefix writer: a session over a `Buffer!` with room
+/// already reserved, so code that fills known bytes never needs
+/// `tail_ptr`/`commit`. `push`/`append_*` are safe wrappers over the
+/// `push_*` methods and `finish` hands the buffer back. The two `unsafe fn`s
+/// at the bottom are the same escape hatch as `tail_ptr`/`commit`, for FFI.
+///
+/// Exposed: its only field is a restricted `Buffer!`, so building one
+/// requires already owning a real buffer -- no more authority than holding
+/// that buffer grants.
 exposed struct BufferWriter! {
     buf: Buffer!,
 }
 
 impl Buffer! {
-    // Reserves `extra` more bytes up front (one grow), then wraps the buffer
-    // in a writer session.
+    /// Reserves `extra` more bytes up front (one grow), then wraps the buffer
+    /// in a writer session.
     fn writer(self, extra: usize) -> BufferWriter! {
         let reserved = self.reserve(extra);
         BufferWriter!.{ buf: reserved }
@@ -369,19 +370,19 @@ impl Buffer! {
 }
 
 impl BufferWriter! {
-    // Appends one byte -- safe, since `push_byte` already is.
+    /// Appends one byte -- safe, since `push_byte` already is.
     fn push(self, val: u8) -> BufferWriter! {
         let { buf: b } = self;
         BufferWriter!.{ buf: b.push_byte(val) }
     }
 
-    // Appends a `'static` byte view's bytes (`Buffer!::push_static`).
+    /// Appends a `'static` byte view's bytes (`Buffer!::push_static`).
     fn append_static(self, bytes: Slice[u8, 'static]) -> BufferWriter! {
         let { buf: b } = self;
         BufferWriter!.{ buf: b.push_static(bytes) }
     }
 
-    // Appends any readable byte view's bytes (`Buffer!::push_bytes`).
+    /// Appends any readable byte view's bytes (`Buffer!::push_bytes`).
     forall C, S where ReadBytes[C, S], Copy[S].
     fn append_bytes(self, &cx: C, bytes: S) -> BufferWriter! {
         let { buf: b } = self;
@@ -389,19 +390,19 @@ impl BufferWriter! {
         BufferWriter!.{ buf: b2 }
     }
 
-    // Returns the buffer at its current length -- the session's only way
-    // out on the safe path.
+    /// Returns the buffer at its current length -- the session's only way
+    /// out on the safe path.
     fn finish(self) -> Buffer! {
         let { buf: b } = self;
         b
     }
 
-    // FFI-only: the writable tail (the address `tail_ptr` returns) and how
-    // many bytes are available to fill -- for a caller about to pass the
-    // pointer to something like `read(2)`. `unsafe` for the same reason as
-    // `Buffer!::tail_ptr`: the pointer is valid only until the next
-    // `push`/`append`/grow, and nothing here proves what the external call
-    // wrote.
+    /// FFI-only: the writable tail (the address `tail_ptr` returns) and how
+    /// many bytes are available to fill -- for a caller about to pass the
+    /// pointer to something like `read(2)`. `unsafe` for the same reason as
+    /// `Buffer!::tail_ptr`: the pointer is valid only until the next
+    /// `push`/`append`/grow, and nothing here proves what the external call
+    /// wrote.
     unsafe fn writable_tail(&self) -> (*u8, usize) {
         let { buf: b } = self;
         let p = unsafe &b.tail_ptr();
@@ -410,10 +411,10 @@ impl BufferWriter! {
         (p, avail)
     }
 
-    // FFI-only: returns the buffer, attesting that exactly `count` more
-    // bytes (from the pointer `writable_tail` handed out) were written.
-    // Delegates to `Buffer!::commit`, so it aborts past `cap` and carries the
-    // same obligation.
+    /// FFI-only: returns the buffer, attesting that exactly `count` more
+    /// bytes (from the pointer `writable_tail` handed out) were written.
+    /// Delegates to `Buffer!::commit`, so it aborts past `cap` and carries the
+    /// same obligation.
     unsafe fn commit_external(self, count: usize) -> Buffer! {
         let { buf: b } = self;
         unsafe b.commit(count)
@@ -422,18 +423,18 @@ impl BufferWriter! {
 
 forall 'k.
 impl BufferRestore!['k] {
-    // The only way back to a growable `Buffer!`. Sound however the `Slice`
-    // from the same `open` was sub-sliced or used, since the address rebuilt
-    // here never came from it.
-    //
-    // `resume` demands the exact `Exclusive!['k]` that `open`'s `share`
-    // handed out and rebuilds the complete `Region![u8,'k]`; `release`
-    // demands that complete region -- proof that every access capability of
-    // this brand has come back -- and returns the `Uninit!` whose base
-    // `Allocation!::adopt` recorded. No `Ref` is constructed, and no address
-    // is read out of a field this module wrote. `'k` is sealed fresh per
-    // `open`, and `BufferRestore!` is restricted and linear, so the only
-    // `Exclusive!['k]` that exists for this brand is the one passed here.
+    /// The only way back to a growable `Buffer!`. Sound however the `Slice`
+    /// from the same `open` was sub-sliced or used, since the address rebuilt
+    /// here never came from it.
+    ///
+    /// `resume` demands the exact `Exclusive!['k]` that `open`'s `share`
+    /// handed out and rebuilds the complete `Region![u8,'k]`; `release`
+    /// demands that complete region -- proof that every access capability of
+    /// this brand has come back -- and returns the `Uninit!` whose base
+    /// `Allocation!::adopt` recorded. No `Ref` is constructed, and no address
+    /// is read out of a field this module wrote. `'k` is sealed fresh per
+    /// `open`, and `BufferRestore!` is restricted and linear, so the only
+    /// `Exclusive!['k]` that exists for this brand is the one passed here.
     fn restore(self, tag: Exclusive!['k]) -> Buffer! {
         let { store: a, back: bk, len: n, cap: c } = self;
         let rg = bk.resume(tag);
