@@ -1,16 +1,16 @@
 # Generated Kursal API documentation
 
 The compiler generates a Krayon site from a package's resolved modules and
-source declarations. From the repository root:
+source declarations. Krayon, a static site generator written in Kursal, is
+built separately and must be on your `PATH`. From the repository root:
 
 ```sh
 bin/kursal doc lib/std -o docs/generated
-../krayon/bin/krayon build docs/generated
+krayon build docs/generated
 python3 -m http.server 8000 --directory docs/generated/dist
 ```
 
-Open `http://localhost:8000/`. Build Krayon from the sibling repository first
-if `../krayon/bin/krayon` is missing. `SITE` must not exist before `kursal doc`
+Open `http://localhost:8000/`. `SITE` must not exist before `kursal doc`
 runs; the command does not overwrite an existing documentation tree. Remove
 `docs/generated/` before regenerating it.
 
