@@ -2322,6 +2322,45 @@ class CompilerTests(unittest.TestCase):
                         self.assertTrue((site / "dist/assets" / asset).is_file(), asset)
                     self.assertEqual(html_link_errors(site / "dist"), [])
 
+    def test_doc_search_ranking(self):
+        """The site's search (docs/theme/assets/search.js) ranks an exact name first, its `!` ignored and
+        the query's case before any other, then names the query starts, then the rest; within a tier
+        types and traits before other kinds, then shorter paths; a query with `::` matches paths."""
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is not on the PATH; install Node.js to check the search ranking")
+        records = [("module", "std::alloc::buffer"), ("struct", "std::alloc::buffer::Buffer!"),
+                   ("struct", "std::alloc::buffer::BufferWriter!"), ("method", "std::alloc::buffer::Buffer!::new"),
+                   ("fn", "std::io::write_buffer"), ("fn", "std::io::read_line"), ("fn", "std::io::read_exact"),
+                   ("method", "std::io::File!::read_exact"), ("module", "std::io"), ("module", "std::fs"),
+                   ("fn", "std::fs::read"), ("trait", "std::cmp::Ord"), ("instance", "std::cmp::Ord[u8, u8]"),
+                   ("method", "std::cmp::Ord::cmp"), ("enum", "std::cmp::Order"), ("module", "std::collections::vec"),
+                   ("struct", "std::collections::vec::Vec!"), ("struct", "std::collections::vec::VecIter!"),
+                   ("method", "std::collections::arena_vec::ArenaVec::len")]
+        index = [{"n": p.rsplit("::", 1)[-1], "k": k, "p": p, "u": "/", "s": ""} for k, p in records]
+        script = ("const { prepare, rank } = require(process.argv[1]);"
+                  "const index = prepare(JSON.parse(process.argv[2]));"
+                  "console.log(JSON.stringify(JSON.parse(process.argv[3]).map((q) => rank(index, q, 50).map((r) => r.p))));")
+        queries = ["Buffer", "buffer", "Buffer!", "read_line", "Ord", "io::read", "std::fs", "vec", "Vec"]
+        result = subprocess.run([node, "-e", script, str(ROOT / "docs/theme/assets/search.js"), json.dumps(index),
+                                 json.dumps(queries)], capture_output=True, text=True, timeout=TIME_LIMIT)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        ranked = dict(zip(queries, json.loads(result.stdout)))
+        buffer = ["std::alloc::buffer::Buffer!", "std::alloc::buffer", "std::alloc::buffer::BufferWriter!",
+                  "std::alloc::buffer::Buffer!::new", "std::io::write_buffer"]
+        self.assertEqual(ranked["Buffer"], buffer)
+        self.assertEqual(ranked["Buffer!"], buffer)
+        self.assertEqual(ranked["buffer"][:3], ["std::alloc::buffer", "std::alloc::buffer::Buffer!",
+                                                "std::alloc::buffer::BufferWriter!"])
+        self.assertEqual(ranked["read_line"], ["std::io::read_line"])
+        self.assertEqual(ranked["Ord"], ["std::cmp::Ord", "std::cmp::Order", "std::cmp::Ord[u8, u8]", "std::cmp::Ord::cmp"])
+        self.assertEqual(ranked["io::read"], ["std::io::read_line", "std::io::read_exact"])
+        self.assertEqual(ranked["std::fs"], ["std::fs", "std::fs::read"])
+        self.assertEqual(ranked["vec"][:3], ["std::collections::vec", "std::collections::vec::Vec!",
+                                             "std::collections::vec::VecIter!"])
+        self.assertEqual(ranked["Vec"][:3], ["std::collections::vec::Vec!", "std::collections::vec",
+                                             "std::collections::vec::VecIter!"])
+
     def test_doc_refuses_an_existing_output_and_a_missing_theme(self):
         """`kursal doc` writes no site over an existing path, and none when the theme beside the standard
         library is missing; either way it says why and leaves the file system as it was."""

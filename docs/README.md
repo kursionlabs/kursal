@@ -120,10 +120,15 @@ trait, primitive, function, constant, method and instance, with its name
 (`n`), kind (`k`), path (`p`), URL from the site's root (`u`) and summary line
 (`s`). The search box in the header (`assets/search.js`, no dependencies)
 loads it on first use from the root the page's `doc-root` meta tag names,
-which Krayon's `url` filter fills in with `base_path`. Results rank an exact
-name or path first, then names the query starts, then path segments it
-starts, then names and paths containing it, then paths and summaries
-containing every word. Press `/` to focus the box, the arrow keys to choose a
+which Krayon's `url` filter fills in with `base_path`. A query is matched
+against names, or against paths when it contains `::` (`io::read_line`,
+`std::fs`), and a linear type's `!` is ignored on both sides. Results rank an
+exact match first, then names or paths the query starts, each written in the
+query's case before any other case; then path segments it starts, then names
+and paths containing it, then paths and summaries containing every word.
+Within a tier, types and traits come before functions, methods, modules,
+constants and instances, then shorter paths first: `Buffer` lists `Buffer!`,
+then the module `buffer`. Press `/` to focus the box, the arrow keys to choose a
 result, Enter to open it and Escape to close the list.
 
 ## Theme

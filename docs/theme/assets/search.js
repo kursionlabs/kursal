@@ -1,10 +1,60 @@
 // Search over assets/search-index.json, which `kursal doc` writes: one record per item, with its name
 // (n), kind (k), path (p), URL from the site's root (u) and summary line (s). The index is loaded on
 // first use, from the root the page's `doc-root` meta tag names, so a site served from a
-// subdirectory works. Results rank an exact name or path first, then names the query starts, then
-// path segments it starts, then names and paths that contain it, then summaries that contain
-// every word of it.
+// subdirectory works.
+//
+// A query without `::` is matched against names, one with `::` against paths; a linear type's `!` is
+// ignored on both sides. Results rank, in tiers: an exact match, then a match the name or path starts
+// with, each written in the query's case before any other case; then a path segment the query
+// starts; then names and paths that contain it; then paths and summaries that contain every word of
+// it. Within a tier, types and traits come before the other kinds, then shorter paths first.
+//
+// `prepare` and `rank` are pure, and Node loads them as a module to test the ranking.
 (() => {
+  const types = new Set(['struct', 'enum', 'tuple', 'trait', 'primitive', 'builtin']);
+  const unmark = (text) => text.replace(/!/g, '');
+
+  const prepare = (records) => records.map((r) => {
+    const name = unmark(r.n);
+    const path = unmark(r.p);
+    return { ...r, key: { name, path, lowerName: name.toLowerCase(), lowerPath: path.toLowerCase(),
+      text: (r.p + ' ' + r.s).toLowerCase() } };
+  });
+
+  const tier = (key, query, lower, words) => {
+    const scoped = query.includes('::');
+    const exact = (name, path, q) => (scoped ? path === q || path.endsWith('::' + q) : name === q);
+    const starts = (name, path, q) => (scoped ? path.startsWith(q) || path.includes('::' + q) : name.startsWith(q));
+    if (exact(key.name, key.path, query)) return 0;
+    if (exact(key.lowerName, key.lowerPath, lower)) return 1;
+    if (starts(key.name, key.path, query)) return 2;
+    if (starts(key.lowerName, key.lowerPath, lower)) return 3;
+    if (key.lowerPath.includes('::' + lower)) return 4;
+    if (key.lowerName.includes(lower) || key.lowerPath.includes(lower)) return 5;
+    if (words.every((w) => key.text.includes(w))) return 6;
+    return -1;
+  };
+
+  const rank = (index, text, limit) => {
+    const query = unmark(text.trim());
+    if (!query) return [];
+    const lower = query.toLowerCase();
+    const words = text.trim().toLowerCase().split(/\s+/);
+    const found = [];
+    for (const r of index) {
+      const t = tier(r.key, query, lower, words);
+      if (t >= 0) found.push([t, types.has(r.k) ? 0 : 1, r]);
+    }
+    found.sort((a, b) => a[0] - b[0] || a[1] - b[1] || a[2].p.length - b[2].p.length
+      || (a[2].p < b[2].p ? -1 : a[2].p > b[2].p ? 1 : 0) || (a[2].k < b[2].k ? -1 : a[2].k > b[2].k ? 1 : 0));
+    return found.slice(0, limit).map((entry) => entry[2]);
+  };
+
+  if (typeof module === 'object' && module.exports) {
+    module.exports = { prepare, rank };
+    return;
+  }
+
   const input = document.getElementById('doc-search');
   const list = document.getElementById('doc-search-results');
   const status = document.getElementById('doc-search-status');
@@ -12,7 +62,6 @@
   const meta = document.querySelector('meta[name="doc-root"]');
   const root = meta && meta.content ? meta.content : '/';
   const base = root.replace(/\/$/, '');
-  const order = { module: 0, struct: 1, enum: 1, tuple: 1, trait: 1, primitive: 1, builtin: 1, fn: 2, method: 3, const: 4, instance: 5 };
   const limit = 50;
   let index = null;
   let loading = null;
@@ -23,37 +72,13 @@
     if (!loading) {
       loading = fetch(root + 'assets/search-index.json')
         .then((response) => response.json())
-        .then((records) => {
-          index = records.map((r) => ({ ...r, name: r.n.toLowerCase(), path: r.p.toLowerCase(), text: (r.p + ' ' + r.s).toLowerCase() }));
-        })
+        .then((records) => { index = prepare(records); })
         .catch(() => { index = []; status.textContent = 'The search index could not be loaded.'; });
     }
     return loading;
   };
 
-  const tier = (r, q, words) => {
-    if (r.name === q || r.path === q || r.path.endsWith('::' + q)) return 0;
-    if (r.name.startsWith(q)) return 1;
-    if (r.path.includes('::' + q)) return 2;
-    if (r.name.includes(q)) return 3;
-    if (r.path.includes(q)) return 4;
-    if (words.every((w) => r.text.includes(w))) return 5;
-    return -1;
-  };
-
-  const search = (query) => {
-    const q = query.trim().toLowerCase();
-    if (!q || !index) return [];
-    const words = q.split(/\s+/);
-    const found = [];
-    for (const r of index) {
-      const t = tier(r, q, words);
-      if (t >= 0) found.push([t, r]);
-    }
-    found.sort((a, b) => a[0] - b[0] || (order[a[1].k] ?? 9) - (order[b[1].k] ?? 9)
-      || a[1].n.length - b[1].n.length || (a[1].p < b[1].p ? -1 : a[1].p > b[1].p ? 1 : 0));
-    return found.slice(0, limit).map((pair) => pair[1]);
-  };
+  const search = (query) => (index ? rank(index, query, limit) : []);
 
   const select = (i) => {
     const items = list.querySelectorAll('[role="option"]');
