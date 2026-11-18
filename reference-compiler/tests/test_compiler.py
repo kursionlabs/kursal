@@ -2290,6 +2290,9 @@ class CompilerTests(unittest.TestCase):
             text = "".join(page.read_text() for page in pages if "src/src" not in page.as_posix())
             index = json.loads((src / "assets/search-index.json").read_text())
             cmp = (src / "core/cmp/index.md").read_text()
+            landing = (src / "index.md").read_text()
+        self.assertIn('<li><a class="package-link" href="core/"><code>core</code></a>'
+                      "<p>The core library: the language's own vocabulary types.</p></li>", landing)
         self.assertNotIn("`extern`", text)
         self.assertNotIn("kur_libc_", text)
         self.assertIn('<section class="item-entry" id="instance.Ord-5bu8-2cu8-5d">', cmp)
