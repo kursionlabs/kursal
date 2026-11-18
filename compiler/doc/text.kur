@@ -1,0 +1,375 @@
+// Text for the documentation site: escaping for HTML, TOML and JSON, the URL-safe spelling of
+// names, links between pages, summary lines, and Kursal highlighted with its names linked.
+use package::resolve::resolver::is_prim;
+use package::syntax::parser::{is_keyword, is_name_byte, is_name_start};
+use std::alloc::arena::Domain!;
+use std::bytes::buffer::Buffer!;
+use std::collections::arena_vec::ArenaVec;
+use std::option::Option;
+use std::raw::Span;
+use std::slice::Slice;
+
+forall 'k.
+fn lit(&cx: Domain!['k], value: Slice[u8, 'static]) -> Span['k] {
+    Span::from_static(&cx, value)
+}
+
+// `text` for HTML text or a quoted attribute value.
+forall 'k.
+fn html(&cx: Domain!['k], out: Buffer!, text: Span['k]) -> Buffer! {
+    var out = out;
+    var i = 0usize;
+    while i < text.len() {
+        let c = text.byte_or_zero(&cx, i);
+        out = if c == b'&' { out.push_static("&amp;") }
+            else if c == b'<' { out.push_static("&lt;") }
+            else if c == b'>' { out.push_static("&gt;") }
+            else if c == b'"' { out.push_static("&quot;") }
+            else { out.push_byte(c) };
+        i = i + 1usize;
+    }
+    out
+}
+
+// `text` as a TOML basic string, with its quotes.
+forall 'k.
+fn toml(&cx: Domain!['k], out: Buffer!, text: Span['k]) -> Buffer! {
+    var out = out.push_byte(b'"');
+    var i = 0usize;
+    while i < text.len() {
+        let c = text.byte_or_zero(&cx, i);
+        out = if c == b'"' || c == b'\\' { out.push_byte(b'\\').push_byte(c) } else { out.push_byte(c) };
+        i = i + 1usize;
+    }
+    out.push_byte(b'"')
+}
+
+fn hex_digit(n: u8) -> u8 {
+    if n < 10u8 { b'0' + n } else { b'a' + n - 10u8 }
+}
+
+// `text` as a JSON string, with its quotes.
+forall 'k.
+fn json(&cx: Domain!['k], out: Buffer!, text: Span['k]) -> Buffer! {
+    var out = out.push_byte(b'"');
+    var i = 0usize;
+    while i < text.len() {
+        let c = text.byte_or_zero(&cx, i);
+        out = if c == b'"' || c == b'\\' { out.push_byte(b'\\').push_byte(c) }
+            else if c < 32u8 { out.push_static("\\u00").push_byte(hex_digit(c / 16u8)).push_byte(hex_digit(c % 16u8)) }
+            else { out.push_byte(c) };
+        i = i + 1usize;
+    }
+    out.push_byte(b'"')
+}
+
+fn word_byte(c: u8) -> bool {
+    (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9') || c == b'_'
+}
+
+// A name or an instance's head as it appears in a page's file name or an anchor: ASCII letters,
+// digits and `_` are kept, a linear type's `!` is `~`, `::` is `.`, and every other byte is `-`
+// and two lowercase hex digits: `File!` is `File~`, `Ord[u8,u8]` is `Ord-5bu8-2cu8-5d`. Each of these
+// is a URL's unreserved character, so a link needs no percent-encoding, and no two texts share a
+// spelling.
+forall 'k.
+fn encode(&cx: Domain!['k], out: Buffer!, name: Span['k]) -> Buffer! {
+    var out = out;
+    var i = 0usize;
+    while i < name.len() {
+        let c = name.byte_or_zero(&cx, i);
+        if word_byte(c) {
+            out = out.push_byte(c);
+        } else if c == b'!' {
+            out = out.push_byte(b'~');
+        } else if c == b':' && name.byte_or_zero(&cx, i + 1usize) == b':' {
+            out = out.push_byte(b'.');
+            i = i + 1usize;
+        } else {
+            out = out.push_byte(b'-').push_byte(hex_digit(c / 16u8)).push_byte(hex_digit(c % 16u8));
+        }
+        i = i + 1usize;
+    }
+    out
+}
+
+// The link from the page at `from` to `to`, both URLs from the site's root (`/std/io/`,
+// `/std/io/struct.File~.html#method.read_line`), relative to the page, so that a site served from a
+// subdirectory needs no prefix in HTML that Krayon copies as written.
+forall 'k.
+fn relative(&cx: Domain!['k], from: Span['k], to: Span['k]) -> Span['k] {
+    let hash = match to.find_byte(&cx, b'#', 0usize) {
+        Option::Some(at) => at,
+        Option::None => to.len(),
+    };
+    let target = to.slice(0usize, hash);
+    let fragment = to.slice(hash, to.len());
+    if target.eq(&cx, from) && !fragment.is_empty() { return fragment; }
+    let directory = match from.rfind_byte(&cx, b'/') {
+        Option::Some(at) => from.slice(0usize, at + 1usize),
+        Option::None => from,
+    };
+    var common = 0usize;
+    var j = 0usize;
+    while j < directory.len() && j < target.len() && directory.byte_or_zero(&cx, j) == target.byte_or_zero(&cx, j) {
+        if directory.byte_or_zero(&cx, j) == b'/' { common = j + 1usize; }
+        j = j + 1usize;
+    }
+    var out = Buffer!::new();
+    var k = common;
+    while k < directory.len() {
+        if directory.byte_or_zero(&cx, k) == b'/' { out = out.push_static("../"); }
+        k = k + 1usize;
+    }
+    out = out.push_bytes(&cx, target.slice(common, target.len()));
+    if &out.len() == 0usize { out = out.push_static("./"); }
+    out.push_bytes(&cx, fragment).save(&cx)
+}
+
+// The summary line of a documentation comment: the first sentence of its first paragraph, which
+// ends at a `.` outside backticks before a space or the paragraph's end; the whole paragraph when
+// it has no such end.
+forall 'k.
+fn summary(&cx: Domain!['k], doc: Span['k]) -> Span['k] {
+    var at = 0usize;
+    var out = Buffer!::new();
+    var going = true;
+    while going && at < doc.len() {
+        let end = match doc.find_byte(&cx, b'\n', at) { Option::Some(n) => n, Option::None => doc.len() };
+        let line = doc.slice(at, end).trim(&cx);
+        if line.is_empty() {
+            if &out.len() > 0usize { going = false; }
+        } else {
+            if &out.len() > 0usize { out = out.push_byte(b' '); }
+            out = out.push_bytes(&cx, line);
+        }
+        at = end + 1usize;
+    }
+    let paragraph = out.save(&cx);
+    var code = false;
+    var i = 0usize;
+    while i < paragraph.len() {
+        let c = paragraph.byte_or_zero(&cx, i);
+        if c == b'`' { code = !code; }
+        if c == b'.' && !code && (i + 1usize == paragraph.len() || paragraph.byte_or_zero(&cx, i + 1usize) == b' ') {
+            return paragraph.slice(0usize, i + 1usize);
+        }
+        i = i + 1usize;
+    }
+    paragraph
+}
+
+// A summary as HTML: code between backticks, and the text of a Markdown link without its target.
+forall 'k.
+fn inline(&cx: Domain!['k], out: Buffer!, text: Span['k]) -> Buffer! {
+    var out = out;
+    var i = 0usize;
+    while i < text.len() {
+        let c = text.byte_or_zero(&cx, i);
+        let close = if c == b'`' { text.find_byte(&cx, b'`', i + 1usize) } else { Option::None };
+        match close {
+            Option::Some(end) => {
+                out = html(&cx, out.push_static("<code>"), text.slice(i + 1usize, end)).push_static("</code>");
+                i = end + 1usize;
+            },
+            Option::None => {
+                let label_end = if c == b'[' { text.find_byte(&cx, b']', i + 1usize) } else { Option::None };
+                let link_end = match label_end {
+                    Option::Some(end) => if text.byte_or_zero(&cx, end + 1usize) == b'(' { text.find_byte(&cx, b')', end + 2usize) } else { Option::None },
+                    Option::None => Option::None,
+                };
+                match link_end {
+                    Option::Some(end) => {
+                        let label = match label_end { Option::Some(n) => n, Option::None => i };
+                        out = inline(&cx, out, text.slice(i + 1usize, label));
+                        i = end + 1usize;
+                    },
+                    Option::None => {
+                        out = html(&cx, out, text.slice(i, i + 1usize));
+                        i = i + 1usize;
+                    },
+                }
+            },
+        }
+    }
+    out
+}
+
+// A summary as plain text, for the search index: without its backticks.
+forall 'k.
+fn plain(&cx: Domain!['k], text: Span['k]) -> Span['k] {
+    var out = Buffer!::new();
+    var i = 0usize;
+    while i < text.len() {
+        let c = text.byte_or_zero(&cx, i);
+        if c != b'`' { out = out.push_byte(c); }
+        i = i + 1usize;
+    }
+    out.save(&cx)
+}
+
+// A name to link in highlighted source: the bytes from `start` to `end`, the URL it links to, and
+// the kind of declaration it names (`struct`, `trait`, ...).
+forall 'k.
+exposed struct Link {
+    start: usize,
+    end: usize,
+    url: Span['k],
+    kind: Span['k],
+}
+
+// `text` in a span of the token class `class`, a span to each line, the newlines between them.
+forall 'k.
+fn token(&cx: Domain!['k], out: Buffer!, class: Slice[u8, 'static], text: Span['k]) -> Buffer! {
+    var out = out;
+    var start = 0usize;
+    while start <= text.len() {
+        let end = match text.find_byte(&cx, b'\n', start) { Option::Some(n) => n, Option::None => text.len() };
+        if end > start {
+            out = html(&cx, out.push_static("<span class=\"tok-").push_static(class).push_static("\">"), text.slice(start, end)).push_static("</span>");
+        }
+        if end < text.len() { out = out.push_byte(b'\n'); }
+        start = end + 1usize;
+    }
+    out
+}
+
+forall 'k.
+fn quoted_end(&cx: Domain!['k], text: Span['k], start: usize, quote: u8) -> usize {
+    var end = start;
+    var closed = false;
+    while end < text.len() && !closed {
+        let c = text.byte_or_zero(&cx, end);
+        if c == b'\\' { end = end + 2usize; }
+        else {
+            if c == quote { closed = true; }
+            end = end + 1usize;
+        }
+    }
+    if end > text.len() { text.len() } else { end }
+}
+
+fn digit(c: u8) -> bool { c >= b'0' && c <= b'9' }
+
+fn hex_byte(c: u8) -> bool { digit(c) || (c >= b'a' && c <= b'f') || (c >= b'A' && c <= b'F') || c == b'_' }
+
+// Kursal source as highlighted HTML, with the classes Krayon's highlighter gives (`tok-keyword`,
+// `tok-type`, `tok-string`, `tok-number`, `tok-comment`) and each of `links`, ordered by start, an
+// anchor. `base` is the offset of `text` in the source the links count in. After each newline,
+// up to `dedent` spaces are left out. The result has a newline between lines and no element
+// across one.
+forall 'k.
+fn highlight(&cx: Domain!['k], text: Span['k], base: usize, links: ArenaVec[Link['k], 'k], dedent: usize) -> Buffer! {
+    var out = Buffer!::new();
+    var li = 0usize;
+    var i = 0usize;
+    while i < text.len() {
+        let c = text.byte_or_zero(&cx, i);
+        let next = text.byte_or_zero(&cx, i + 1usize);
+        let after_word = i > 0usize && is_name_byte(text.byte_or_zero(&cx, i - 1usize));
+        if c == b'/' && next == b'/' {
+            let end = match text.find_byte(&cx, b'\n', i) { Option::Some(n) => n, Option::None => text.len() };
+            out = token(&cx, out, "comment", text.slice(i, end));
+            i = end;
+        } else if c == b'/' && next == b'*' {
+            let end = match text.find(&cx, lit(&cx, "*/"), i + 2usize) { Option::Some(n) => n + 2usize, Option::None => text.len() };
+            out = token(&cx, out, "comment", text.slice(i, end));
+            i = end;
+        } else if c == b'"' {
+            let end = quoted_end(&cx, text, i + 1usize, b'"');
+            out = token(&cx, out, "string", text.slice(i, end));
+            i = end;
+        } else if !after_word && c == b'f' && next == b'"' {
+            let end = quoted_end(&cx, text, i + 2usize, b'"');
+            out = token(&cx, out, "string", text.slice(i, end));
+            i = end;
+        } else if !after_word && c == b'b' && next == b'\'' {
+            let end = quoted_end(&cx, text, i + 2usize, b'\'');
+            out = token(&cx, out, "string", text.slice(i, end));
+            i = end;
+        } else if is_name_start(c) && !after_word {
+            while li < links.len(&cx) && links.at(&cx, li).start < base + i { li = li + 1usize; }
+            if li < links.len(&cx) && links.at(&cx, li).start == base + i {
+                let link = links.at(&cx, li);
+                out = out.push_static("<a class=\"sig-link sig-").push_bytes(&cx, link.kind).push_static("\" href=\"");
+                out = html(&cx, out, link.url).push_static("\">");
+                out = html(&cx, out, text.slice(i, link.end - base)).push_static("</a>");
+                i = link.end - base;
+            } else {
+                var end = i + 1usize;
+                while end < text.len() && is_name_byte(text.byte_or_zero(&cx, end)) { end = end + 1usize; }
+                let word = text.slice(i, end);
+                if is_keyword(&cx, word) {
+                    out = token(&cx, out, "keyword", word);
+                } else if is_prim(&cx, word) {
+                    out = token(&cx, out, "type", word);
+                } else {
+                    if text.byte_or_zero(&cx, end) == b'!' && text.byte_or_zero(&cx, end + 1usize) != b'=' { end = end + 1usize; }
+                    out = html(&cx, out, text.slice(i, end));
+                }
+                i = end;
+            }
+        } else if digit(c) && !after_word {
+            var end = i + 1usize;
+            if c == b'0' && (next == b'x' || next == b'b' || next == b'o') {
+                end = i + 2usize;
+                while end < text.len() && hex_byte(text.byte_or_zero(&cx, end)) { end = end + 1usize; }
+            } else {
+                while end < text.len() && (digit(text.byte_or_zero(&cx, end)) || text.byte_or_zero(&cx, end) == b'_') { end = end + 1usize; }
+                if text.byte_or_zero(&cx, end) == b'.' && digit(text.byte_or_zero(&cx, end + 1usize)) {
+                    end = end + 1usize;
+                    while end < text.len() && digit(text.byte_or_zero(&cx, end)) { end = end + 1usize; }
+                }
+            }
+            out = token(&cx, out, "number", text.slice(i, end));
+            var suffix = end;
+            while suffix < text.len() && is_name_byte(text.byte_or_zero(&cx, suffix)) { suffix = suffix + 1usize; }
+            if suffix > end && is_prim(&cx, text.slice(end, suffix)) {
+                out = token(&cx, out, "type", text.slice(end, suffix));
+                end = suffix;
+            }
+            i = end;
+        } else if c == b'\n' {
+            out = out.push_byte(b'\n');
+            i = i + 1usize;
+            var skipped = 0usize;
+            while skipped < dedent && text.byte_or_zero(&cx, i) == b' ' {
+                i = i + 1usize;
+                skipped = skipped + 1usize;
+            }
+        } else {
+            var end = i + 1usize;
+            while end < text.len() && !is_name_byte(text.byte_or_zero(&cx, end)) && text.byte_or_zero(&cx, end) != b'\n'
+                && text.byte_or_zero(&cx, end) != b'/' && text.byte_or_zero(&cx, end) != b'"' {
+                end = end + 1usize;
+            }
+            out = html(&cx, out, text.slice(i, end));
+            i = end;
+        }
+    }
+    out
+}
+
+// Highlighted lines, each in a `<span class="line">`, with the id `L<n>` when `first` is the
+// number of the first line rather than 0; a final newline adds no line. Every line starts with `<`,
+// so that Krayon's Markdown keeps it as HTML.
+forall 'k.
+fn lines(&cx: Domain!['k], body: Span['k], first: u32) -> Buffer! {
+    var out = Buffer!::new();
+    var start = 0usize;
+    var n = first;
+    let end_all = if body.ends_with(&cx, lit(&cx, "\n")) { body.len() - 1usize } else { body.len() };
+    while start <= end_all {
+        let end = match body.find_byte(&cx, b'\n', start) {
+            Option::Some(at) => if at < end_all { at } else { end_all },
+            Option::None => end_all,
+        };
+        if start > 0usize { out = out.push_byte(b'\n'); }
+        out = out.push_static("<span class=\"line\"");
+        if first > 0u32 { out = out.push_static(" id=\"L").push_usize(n as usize).push_static("\""); }
+        out = out.push_static(">").push_bytes(&cx, body.slice(start, end)).push_static("</span>");
+        start = end + 1usize;
+        n = n + 1u32;
+    }
+    out
+}

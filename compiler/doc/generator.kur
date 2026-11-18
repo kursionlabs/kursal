@@ -1,33 +1,29 @@
 // Generate a Krayon input tree from the resolver's parsed modules. This lives in the compiler so
 // the published documentation follows the same package and module rules as a build.
-use package::resolve::resolver::{ModuleId, Owner, Named, Resolver, Target, lib_dir, parent as parent_dir};
+//
+// Each module a package exposes, its own or one it re-exports, has a page at its path under the
+// package (`/std/io/`, `/std/cmp/` for `core::cmp`), with a table of its items by kind, then its
+// functions, constants and instances in full. Each type and trait has a page beside it
+// (`/std/io/struct.File~.html`) with its definition, its methods wherever they are defined, and
+// the instances whose head mentions it or, for a trait, every instance of it. Each source file
+// has a page (`/src/std/io.kur.html`), and `assets/search-index.json` lists every item for the
+// search box. `text::encode` spells names in file names and anchors.
+use package::doc::model::{Gen, Inst, Loc, Member, Mention, Source, build, decl_url, impl_owner, item_url, line_start, line_text, links, loc_of, mention_fn, mentions, module_title, module_url, page_kind, source};
+use package::doc::text::{encode, highlight, html, inline, json, lines, lit, plain, relative, summary, toml};
+use package::resolve::resolver::{ModuleId, NameRef, Resolver, Target, is_prim, lib_dir, parent as parent_dir};
 use package::syntax::ast as S;
 use std::alloc::arena::Domain!;
 use std::bytes::buffer::Buffer!;
 use std::collections::arena_vec::ArenaVec;
-use std::fs::{mkdir, path_exists, read, read_dir, read_to_arena, write};
+use std::fs::{mkdir, path_exists, read, read_dir, write};
+use std::hash::key_eq;
 use std::option::{Option, Result};
 use std::raw::Span;
-
-forall 'k.
-fn lit(&cx: Domain!['k], value: std::slice::Slice[u8, 'static]) -> Span['k] {
-    Span::from_static(&cx, value)
-}
+use std::slice::Slice;
 
 forall 'k.
 fn path(&cx: Domain!['k], base: Span['k], name: Span['k]) -> Span['k] {
     Buffer!::new().push_bytes(&cx, base).push_static("/").push_bytes(&cx, name).save(&cx)
-}
-
-forall 'k.
-fn url(&cx: Domain!['k], r: Resolver['k], home: ModuleId['k]) -> Span['k] {
-    var out = Buffer!::new().push_static("/").push_bytes(&cx, r.packages.at(&cx, home.package).name.copy(&cx)).push_static("/");
-    var i = 0usize;
-    while i < home.path.len(&cx) {
-        out = out.push_bytes(&cx, home.path.at(&cx, i)).push_static("/");
-        i = i + 1usize;
-    }
-    out.save(&cx)
 }
 
 forall 'k.
@@ -50,6 +46,23 @@ fn directory(&cx: Domain!['k], file: Span['k]) {
         Result::Err(_) => package::support::base::fail(&cx, Buffer!::new().push_static("cannot inspect ").push_bytes(&cx, file).save(&cx)),
     };
     if !present { require(&cx, mkdir(&cx, file), Buffer!::new().push_static("cannot create ").push_bytes(&cx, file).save(&cx)); }
+}
+
+// The file `relative` names under `root`, its directories made.
+forall 'k.
+fn file_in(&cx: Domain!['k], root: Span['k], relative: Span['k]) -> Span['k] {
+    var at = 0usize;
+    var going = true;
+    while going {
+        match relative.find_byte(&cx, b'/', at) {
+            Option::Some(n) => {
+                directory(&cx, path(&cx, root, relative.slice(0usize, n)));
+                at = n + 1usize;
+            },
+            Option::None => { going = false; },
+        }
+    }
+    path(&cx, root, relative)
 }
 
 // The directory `from` and everything under it, copied to `to`.
@@ -105,7 +118,7 @@ fn copy_tree(&cx: Domain!['k], from: Span['k], to: Span['k]) {
 // A directory of the site's theme: `docs/theme` beside the standard library directory, so a checkout's
 // compiler finds its own theme.
 forall 'k.
-fn theme(&cx: Domain!['k], part: std::slice::Slice[u8, 'static]) -> Span['k] {
+fn theme(&cx: Domain!['k], part: Slice[u8, 'static]) -> Span['k] {
     let found = path(&cx, path(&cx, path(&cx, parent_dir(&cx, lib_dir(&cx)), lit(&cx, "docs")), lit(&cx, "theme")), lit(&cx, part));
     let present = match path_exists(&cx, found) {
         Result::Ok(there) => there,
@@ -118,40 +131,16 @@ fn theme(&cx: Domain!['k], part: std::slice::Slice[u8, 'static]) -> Span['k] {
     found
 }
 
-// Offset of the first byte on a numbered source line. AST positions are one-based.
-forall 'k.
-fn line_start(&cx: Domain!['k], source: Span['k], line: u32) -> usize {
-    var at = 0usize;
-    var current = 1u32;
-    while current < line && at < source.len() {
-        at = match source.find_byte(&cx, b'\n', at) {
-            Option::Some(n) => n + 1usize,
-            Option::None => source.len(),
-        };
-        current = current + 1u32;
-    }
-    at
-}
-
-// A numbered source line without its newline and surrounding whitespace.
-forall 'k.
-fn line_text(&cx: Domain!['k], source: Span['k], line: u32) -> Span['k] {
-    let start = line_start(&cx, source, line);
-    let end = match source.find_byte(&cx, b'\n', start) {
-        Option::Some(n) => n,
-        Option::None => source.len(),
-    };
-    source.slice(start, end).trim(&cx)
-}
+// ------------------------------------------------------------- source text --
 
 // The line a declaration starts on: the `forall` line of a premise above it, which may run over
 // several lines (`forall C, S` then `where ...` lines, the last ending with `.`), else its own.
 forall 'k.
-fn declaration_line(&cx: Domain!['k], source: Span['k], line: u32) -> u32 {
-    if line <= 1u32 || !line_text(&cx, source, line - 1u32).ends_with(&cx, lit(&cx, ".")) { return line; }
+fn declaration_line(&cx: Domain!['k], src: Source['k], line: u32) -> u32 {
+    if line <= 1u32 || !line_text(&cx, src, line - 1u32).ends_with(&cx, lit(&cx, ".")) { return line; }
     var at = line - 1u32;
     while at >= 1u32 {
-        let text = line_text(&cx, source, at);
+        let text = line_text(&cx, src, at);
         if text.starts_with(&cx, lit(&cx, "forall ")) { return at; }
         if text.is_empty() || text.starts_with(&cx, lit(&cx, "//")) || text.ends_with(&cx, lit(&cx, "}"))
             || text.ends_with(&cx, lit(&cx, ";")) || text.ends_with(&cx, lit(&cx, "{")) {
@@ -162,8 +151,10 @@ fn declaration_line(&cx: Domain!['k], source: Span['k], line: u32) -> u32 {
     line
 }
 
+// The `//!` lines a file starts with: its module's overview.
 forall 'k.
-fn module_prose(&cx: Domain!['k], source: Span['k]) -> Buffer! {
+fn module_prose(&cx: Domain!['k], src: Source['k]) -> Span['k] {
+    let source = src.text;
     var at = 0usize;
     var out = Buffer!::new();
     while at + 2usize < source.len() && source.byte_or_zero(&cx, at) == b'/' && source.byte_or_zero(&cx, at + 1usize) == b'/' && source.byte_or_zero(&cx, at + 2usize) == b'!' {
@@ -173,15 +164,16 @@ fn module_prose(&cx: Domain!['k], source: Span['k]) -> Buffer! {
         out = out.push_bytes(&cx, source.slice(content, end)).push_static("\n");
         at = end + 1usize;
     }
-    if at > 0usize { out.push_static("\n") } else { out }
+    out.save(&cx)
 }
 
-// Consecutive /// lines immediately before a declaration are its prose. Ordinary implementation
-// comments are intentionally not published.
+// Consecutive /// lines immediately before a declaration are its documentation, each line ending in
+// a newline. Ordinary implementation comments are intentionally not published.
 forall 'k.
-fn prose(&cx: Domain!['k], source: Span['k], line: u32) -> Buffer! {
-    var start = line_start(&cx, source, line);
-    let lines: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+fn prose(&cx: Domain!['k], src: Source['k], line: u32) -> Span['k] {
+    let source = src.text;
+    var start = line_start(&cx, src, line);
+    let found: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
     var collecting = true;
     while start > 0usize && collecting {
         let end = start - 1usize;
@@ -198,353 +190,943 @@ fn prose(&cx: Domain!['k], source: Span['k], line: u32) -> Buffer! {
         } else {
             content = content + 3usize;
             if content < end && source.byte_or_zero(&cx, content) == b' ' { content = content + 1usize; }
-            lines.push(&cx, source.slice(content, end));
+            found.push(&cx, source.slice(content, end));
             start = previous;
         }
     }
     var out = Buffer!::new();
-    var i = lines.len(&cx);
+    var i = found.len(&cx);
     while i > 0usize {
         i = i - 1usize;
-        out = out.push_bytes(&cx, lines.at(&cx, i)).push_static("\n");
+        out = out.push_bytes(&cx, found.at(&cx, i)).push_static("\n");
     }
-    if !lines.is_empty(&cx) { out = out.push_static("\n"); }
-    out
+    out.save(&cx)
 }
 
-// The source spelling of a declaration, stopping before a function body. Aggregate definitions
-// are kept whole only when their representation is exposed.
+// The summary line of the declaration at `pos`.
 forall 'k.
-fn signature(&cx: Domain!['k], source: Span['k], line: u32, aggregate: bool, is_exposed: bool) -> Span['k] {
-    var start = line_start(&cx, source, line);
-    while start < source.len() && (source.byte_or_zero(&cx, start) == b' ' || source.byte_or_zero(&cx, start) == b'\t') {
+fn summary_of(&cx: Domain!['k], g: Gen['k], home: ModuleId['k], pos: S::Pos) -> Span['k] {
+    let src = source(&cx, g, home);
+    summary(&cx, prose(&cx, src, declaration_line(&cx, src, pos.line)))
+}
+
+// A declaration as its source spells it from `line`, stopping before a function body, with the types
+// and traits of `found` linked. Aggregate definitions are kept whole only when their representation
+// is exposed. Lines after the first lose the first line's indentation.
+forall 'k.
+fn signature(&cx: Domain!['k], g: Gen['k], view: usize, page: Span['k], src: Source['k], line: u32, aggregate: bool, is_exposed: bool, found: ArenaVec[Mention['k], 'k]) -> Buffer! {
+    let text = src.text;
+    let first = line_start(&cx, src, line);
+    var start = first;
+    while start < text.len() && (text.byte_or_zero(&cx, start) == b' ' || text.byte_or_zero(&cx, start) == b'\t') {
         start = start + 1usize;
     }
     var at = start;
-    while at < source.len() {
-        let byte = source.byte_or_zero(&cx, at);
-        if byte == b';' { return source.slice(start, at + 1usize); }
-        if byte == b'{' {
+    var end = text.len();
+    var tail = false;
+    var done = false;
+    while !done && at < text.len() {
+        let byte = text.byte_or_zero(&cx, at);
+        if byte == b';' {
+            end = at + 1usize;
+            done = true;
+        } else if byte == b'{' {
             if aggregate && is_exposed {
                 var depth = 1usize;
                 at = at + 1usize;
-                while at < source.len() && depth > 0usize {
-                    let next = source.byte_or_zero(&cx, at);
+                while at < text.len() && depth > 0usize {
+                    let next = text.byte_or_zero(&cx, at);
                     if next == b'{' { depth = depth + 1usize; }
                     if next == b'}' { depth = depth - 1usize; }
                     at = at + 1usize;
                 }
-                return source.slice(start, at);
+                end = at;
+            } else {
+                end = at + 1usize;
+                tail = true;
             }
-            return source.slice(start, at + 1usize);
+            done = true;
+        } else {
+            at = at + 1usize;
         }
-        at = at + 1usize;
     }
-    source.slice(start, at)
+    var body = highlight(&cx, text.slice(start, end), start, links(&cx, g, view, page, src, found, start, end), start - first);
+    if tail { body = body.push_static(" ... }"); }
+    Buffer!::new().push_static("<pre class=\"sig\"><code class=\"language-kursal\">").push_buffer(lines(&cx, body.save(&cx), 0u32)).push_static("</code></pre>\n")
 }
 
-// What an instance is of, as its source spells it: `Ord[u8, u8]` for `instance Ord[u8, u8] {`.
+// --------------------------------------------------------------- locations --
+
 forall 'k.
-fn instance_name(&cx: Domain!['k], source: Span['k], pos: S::Pos) -> Span['k] {
-    let text = line_text(&cx, source, pos.line);
-    let start = match text.find(&cx, lit(&cx, "instance "), 0usize) {
-        Option::Some(n) => n + 9usize,
-        Option::None => 0usize,
-    };
-    let end = match text.find_byte(&cx, b'{', start) {
-        Option::Some(n) => n,
-        Option::None => text.len(),
-    };
-    text.slice(start, end).trim(&cx)
+fn package_name(&cx: Domain!['k], g: Gen['k], package: usize) -> Span['k] {
+    g.r.packages.at(&cx, package).name.copy(&cx)
+}
+
+// The page of a module's source file, at a line: `/src/std/io.kur.html#L12`.
+forall 'k.
+fn source_url(&cx: Domain!['k], g: Gen['k], home: ModuleId['k], line: u32) -> Span['k] {
+    let src = source(&cx, g, home);
+    Buffer!::new().push_static("/src/").push_bytes(&cx, package_name(&cx, g, home.package)).push_static("/").push_bytes(&cx, src.file)
+        .push_static(".html#L").push_usize(line as usize).save(&cx)
 }
 
 forall 'k.
-fn entry(&cx: Domain!['k], out: Buffer!, source: Span['k], name: Span['k], kind: Span['k], id: u32, pos: S::Pos, aggregate: bool, is_exposed: bool) -> Buffer! {
-    let first = declaration_line(&cx, source, pos.line);
-    var out = out.push_static("### `").push_bytes(&cx, kind).push_static("` ").push_bytes(&cx, name).push_static(" {#item-").push_usize(id as usize)
-        .push_static(" .item-heading .doc-kind-").push_bytes(&cx, kind).push_static("}\n\n");
-    out = out.push_buffer(prose(&cx, source, first));
-    let sig = signature(&cx, source, first, aggregate, is_exposed);
-    out = out.push_static("```kursal\n").push_bytes(&cx, sig);
-    if aggregate && !is_exposed { out = out.push_static(" ... }"); }
-    if !aggregate && !sig.ends_with(&cx, Span::from_static(&cx, ";")) {
-        // A function or method signature ends before its body.
-        out = out.push_static(" ... }");
+fn source_link(&cx: Domain!['k], g: Gen['k], out: Buffer!, page: Span['k], home: ModuleId['k], line: u32) -> Buffer! {
+    out.push_static("<a class=\"src-link\" href=\"").push_bytes(&cx, relative(&cx, page, source_url(&cx, g, home, line))).push_static("\">source</a>")
+}
+
+// Whether a location is a module re-exported by another module than its parent.
+forall 'k.
+fn re_exported(&cx: Domain!['k], l: Loc['k]) -> bool {
+    l.package != l.actual.package || !l.path.eq(&cx, l.actual.path)
+}
+
+// A link to module `home` from `page`, by the title of its location for package `view`, or its
+// path as text when it has no page.
+forall 'k.
+fn module_link(&cx: Domain!['k], g: Gen['k], out: Buffer!, view: usize, page: Span['k], home: ModuleId['k]) -> Buffer! {
+    match loc_of(&cx, g, view, home) {
+        Option::Some(l) => out.push_static("<a href=\"").push_bytes(&cx, relative(&cx, page, l.url)).push_static("\"><code>")
+            .push_bytes(&cx, l.title).push_static("</code></a>"),
+        Option::None => {
+            let name = package_name(&cx, g, home.package);
+            let title = if home.path.is_empty(&cx) { name } else { Buffer!::new().push_bytes(&cx, name).push_static("::").push_bytes(&cx, home.path.join(&cx, "::")).save(&cx) };
+            out.push_static("<code>").push_bytes(&cx, title).push_static("</code>")
+        },
     }
-    out.push_static("\n```\n\n")
 }
 
+// The page of the location at `path` under `package` that holds `actual`, else the page its
+// package view links to.
 forall 'k.
-fn other_methods(&cx: Domain!['k], r: Resolver['k], home: ModuleId['k], name: Span['k], out: Buffer!) -> Buffer! {
-    let scope = r.scopes.at(&cx, home);
-    let owner = match scope.decls.get(&cx, name) {
-        Option::Some(d) => d,
-        Option::None => return out,
-    };
-    let keys = r.attached.keys(&cx);
-    var out = out;
-    var k = 0usize;
-    while k < keys.len(&cx) {
-        let (target, member) = keys.at(&cx, k);
-        let matches = match target {
-            Owner::Decl(d) => d.id == owner.id,
-            _ => false,
-        };
-        if matches {
-            let methods = r.attached.at(&cx, (target, member));
-            var m = 0usize;
-            while m < methods.len(&cx) {
-                let decl = methods.at(&cx, m);
-                if decl.home.package == home.package && !decl.home.path.join(&cx, "::").eq(&cx, home.path.join(&cx, "::")) {
-                    let file = r.packages.at(&cx, decl.home.package).files.at(&cx, decl.home);
-                    let package = r.packages.at(&cx, decl.home.package);
-                    let relative = if file.starts_with(&cx, package.root) && file.len() > package.root.len() + 1usize {
-                        file.slice(package.root.len() + 1usize, file.len())
-                    } else { file };
-                    let method_source = match read_to_arena(&cx, file) {
-                        Result::Ok(bytes) => bytes,
-                        Result::Err(_) => package::support::base::fail(&cx, lit(&cx, "cannot read method source")),
-                    };
-                    out = match decl.node {
-                        Named::Fn(f) => entry(&cx, out, method_source, decl.name, lit(&cx, "method"), f.id, f.pos, false, false),
-                        Named::Const(c) => entry(&cx, out, method_source, decl.name, lit(&cx, "const"), c.id, c.pos, false, false),
-                        _ => out,
-                    };
-                    out = out.push_static("Defined in `").push_bytes(&cx, relative).push_static("`.\n\n");
-                }
-                m = m + 1usize;
-            }
-        }
-        k = k + 1usize;
-    }
-    out
-}
-
-forall 'k.
-fn item(&cx: Domain!['k], r: Resolver['k], home: ModuleId['k], out: Buffer!, source: Span['k], it: S::Item['k]) -> Buffer! {
-    match it {
-        S::Item::Struct(d) => other_methods(&cx, r, home, d.name, entry(&cx, out, source, d.name, lit(&cx, "struct"), d.id, d.pos, true, d.exposure.is_some())),
-        S::Item::Tuple(d) => other_methods(&cx, r, home, d.name, entry(&cx, out, source, d.name, lit(&cx, "tuple"), d.id, d.pos, false, false)),
-        S::Item::Enum(d) => other_methods(&cx, r, home, d.name, entry(&cx, out, source, d.name, lit(&cx, "enum"), d.id, d.pos, true, d.exposure.is_some())),
-        S::Item::Trait(d) => entry(&cx, out, source, d.name, lit(&cx, "trait"), d.id, d.pos, true, true),
-        S::Item::Fn(d) => entry(&cx, out, source, d.name, lit(&cx, "fn"), d.id, d.pos, false, false),
-        S::Item::Const(d) => entry(&cx, out, source, d.name, lit(&cx, "const"), d.id, d.pos, false, false),
-        S::Item::Instance(d) => entry(&cx, out, source, instance_name(&cx, source, d.pos), lit(&cx, "instance"), d.id, d.pos, false, false),
-        S::Item::Impl(d) => {
-            var out = out;
-            let owner = match d.type {
-                S::Type::Name(t) => t.path.join(&cx, "::"),
-                _ => lit(&cx, "impl"),
-            };
+fn child_url(&cx: Domain!['k], g: Gen['k], l: Loc['k], name: Span['k], actual: ModuleId['k]) -> Option[Span['k]] {
+    let wanted = Buffer!::new().push_bytes(&cx, l.url).push_bytes(&cx, name).push_static("/").save(&cx);
+    match g.by_actual.get(&cx, actual) {
+        Option::Some(list) => {
             var i = 0usize;
-            while i < d.items.len(&cx) {
-                out = match d.items.at(&cx, i) {
-                    S::Member::Fn(m) => entry(&cx, out, source, Buffer!::new().push_bytes(&cx, owner).push_static("::").push_bytes(&cx, m.name).save(&cx), lit(&cx, "method"), m.id, m.pos, false, false),
-                    S::Member::Const(m) => entry(&cx, out, source, Buffer!::new().push_bytes(&cx, owner).push_static("::").push_bytes(&cx, m.name).save(&cx), lit(&cx, "const"), m.id, m.pos, false, false),
-                };
+            while i < list.len(&cx) {
+                if g.locs.at(&cx, list.at(&cx, i)).url.eq(&cx, wanted) { return Option::Some.(wanted); }
                 i = i + 1usize;
             }
-            out
         },
-        _ => out,
+        Option::None => (),
+    }
+    match loc_of(&cx, g, l.package, actual) {
+        Option::Some(found) => Option::Some.(found.url),
+        Option::None => Option::None,
     }
 }
 
+// ------------------------------------------------------------------- pieces --
+
+// A page's title: its kind, then its path with each module linked, and a link to its source.
 forall 'k.
-fn public_module(&cx: Domain!['k], r: Resolver['k], home: ModuleId['k]) -> bool {
+fn heading(&cx: Domain!['k], g: Gen['k], out: Buffer!, l: Loc['k], page: Span['k], kind: Span['k], label: Span['k], item: Option[Span['k]], source: Span['k]) -> Buffer! {
+    var out = out.push_static("<div class=\"item-header\">\n<p class=\"item-kind kind-").push_bytes(&cx, kind).push_static("\">").push_bytes(&cx, label).push_static("</p>\n<h1>");
+    let n = l.path.len(&cx);
     var i = 0usize;
-    while i < home.path.len(&cx) {
-        let parent = ModuleId.{ package: home.package, path: home.path.slice(&cx, 0usize, i) };
-        match r.scopes.get(&cx, parent) {
-            Option::Some(scope) => if !scope.exports.contains(&cx, home.path.at(&cx, i)) { return false; },
-            Option::None => return false,
+    while i <= n {
+        if i > 0usize { out = out.push_static("::<wbr>"); }
+        let name = if i == 0usize { package_name(&cx, g, l.package) } else { l.path.at(&cx, i - 1usize) };
+        if i < n || item.is_some() {
+            let url = module_url(&cx, g.r, l.package, l.path.slice(&cx, 0usize, i));
+            out = html(&cx, out.push_static("<a href=\"").push_bytes(&cx, relative(&cx, page, url)).push_static("\">"), name).push_static("</a>");
+        } else {
+            out = html(&cx, out.push_static("<span class=\"item-name\">"), name).push_static("</span>");
         }
         i = i + 1usize;
     }
-    true
+    match item {
+        Option::Some(name) => { out = html(&cx, out.push_static("::<wbr><span class=\"item-name\">"), name).push_static("</span>"); },
+        Option::None => (),
+    }
+    out = out.push_static("</h1>\n");
+    if !source.is_empty() {
+        out = out.push_static("<a class=\"src-link\" href=\"").push_bytes(&cx, relative(&cx, page, source)).push_static("\">source</a>\n");
+    }
+    out.push_static("</div>\n")
+}
+
+// One record of a sidebar list: `[[nav_items]]`.
+forall 'k.
+fn nav(&cx: Domain!['k], out: Buffer!, section: Span['k], name: Span['k], url: Span['k], kind: Span['k]) -> Buffer! {
+    var out = toml(&cx, out.push_static("[[nav_items]]\nsection = "), section);
+    out = toml(&cx, out.push_static("\nname = "), name);
+    out = toml(&cx, out.push_static("\nurl = "), url);
+    toml(&cx, out.push_static("\nkind = "), kind).push_static("\n")
+}
+
+// A row of an item table: the item's name, linked, and its summary line.
+forall 'k.
+fn row(&cx: Domain!['k], out: Buffer!, href: Span['k], kind: Span['k], name: Span['k], line: Span['k]) -> Buffer! {
+    var out = out.push_static("<tr><td><a class=\"item-link kind-").push_bytes(&cx, kind).push_static("\" href=\"");
+    out = html(&cx, out, href).push_static("\"><code>");
+    out = html(&cx, out, name).push_static("</code></a></td><td>");
+    inline(&cx, out, line).push_static("</td></tr>\n")
 }
 
 forall 'k.
-fn nav_record(&cx: Domain!['k], out: Buffer!, name: Span['k], section: std::slice::Slice[u8, 'static], id: u32) -> Buffer! {
-    out.push_static("[[nav_items]]\nname = \"").push_bytes(&cx, name)
-        .push_static("\"\nsection = \"").push_static(section)
-        .push_static("\"\nurl = \"#item-").push_usize(id as usize).push_static("\"\n")
+fn table(&cx: Domain!['k], out: Buffer!, id: Slice[u8, 'static], title: Slice[u8, 'static], rows: Buffer!) -> Buffer! {
+    if &rows.len() == 0usize {
+        rows.destroy();
+        return out;
+    }
+    out.push_static("<h2 id=\"").push_static(id).push_static("\">").push_static(title).push_static("</h2>\n<table class=\"item-table\">\n")
+        .push_buffer(rows).push_static("</table>\n\n")
 }
 
 forall 'k.
-fn nav_type_record(&cx: Domain!['k], out: Buffer!, owner: Span['k], name: Span['k], id: u32) -> Buffer! {
-    nav_record(&cx, out, name, "Types", id)
-        .push_static("owner = \"").push_bytes(&cx, owner).push_static("\"\n")
+fn section(&cx: Domain!['k], out: Buffer!, id: Slice[u8, 'static], title: Slice[u8, 'static], entries: Buffer!) -> Buffer! {
+    if &entries.len() == 0usize {
+        entries.destroy();
+        return out;
+    }
+    out.push_static("<h2 id=\"").push_static(id).push_static("\">").push_static(title).push_static("</h2>\n\n").push_buffer(entries)
+}
+
+// One declaration in full: a heading of its kind with its anchor and a link to its source, its
+// signature with the types and traits it names linked, a note, and its documentation.
+forall 'k.
+fn entry(&cx: Domain!['k], g: Gen['k], out: Buffer!, view: usize, page: Span['k], home: ModuleId['k], anchor: Span['k], kind: Span['k], name: Span['k],
+    pos: S::Pos, found: ArenaVec[Mention['k], 'k], aggregate: bool, is_exposed: bool, note: Span['k]) -> Buffer! {
+    let src = source(&cx, g, home);
+    let first = declaration_line(&cx, src, pos.line);
+    var out = out.push_static("<section class=\"item-entry\" id=\"").push_bytes(&cx, anchor).push_static("\">\n<h3 class=\"item-heading doc-kind-")
+        .push_bytes(&cx, kind).push_static("\"><code>").push_bytes(&cx, kind).push_static("</code> <a class=\"item-name\" href=\"#").push_bytes(&cx, anchor).push_static("\">");
+    out = html(&cx, out, name).push_static("</a>");
+    out = source_link(&cx, g, out, page, home, first).push_static("</h3>\n");
+    out = out.push_buffer(signature(&cx, g, view, page, src, first, aggregate, is_exposed, found));
+    if !note.is_empty() { out = out.push_static("<p class=\"item-note\">").push_bytes(&cx, note).push_static("</p>\n"); }
+    let doc = prose(&cx, src, first);
+    if !doc.is_empty() { out = out.push_static("\n").push_bytes(&cx, doc).push_static("\n"); }
+    out.push_static("</section>\n\n")
+}
+
+// The anchor of a member of an impl: `method.read_line`, `const.MAX`.
+forall 'k.
+fn member_anchor(&cx: Domain!['k], member: S::Member['k]) -> Span['k] {
+    match member {
+        S::Member::Fn(f) => encode(&cx, Buffer!::new().push_static("method."), f.name).save(&cx),
+        S::Member::Const(c) => encode(&cx, Buffer!::new().push_static("const."), c.name).save(&cx),
+    }
 }
 
 forall 'k.
-fn nav_type(&cx: Domain!['k], r: Resolver['k], home: ModuleId['k], out: Buffer!, name: Span['k], id: u32) -> Buffer! {
-    var out = nav_type_record(&cx, out, name, lit(&cx, "Definition"), id);
-    let scope = r.scopes.at(&cx, home);
-    let owner = match scope.decls.get(&cx, name) {
-        Option::Some(d) => d,
-        Option::None => return out,
-    };
-    let keys = r.attached.keys(&cx);
-    var k = 0usize;
-    while k < keys.len(&cx) {
-        let (target, member) = keys.at(&cx, k);
-        let matches = match target { Owner::Decl(d) => d.id == owner.id, _ => false };
-        if matches {
-            let methods = r.attached.at(&cx, (target, member));
-            var m = 0usize;
-            while m < methods.len(&cx) {
-                let decl = methods.at(&cx, m);
-                if decl.home.package == home.package {
-                    out = match decl.node {
-                        Named::Fn(f) => nav_type_record(&cx, out, name, member, f.id),
-                        Named::Const(c) => nav_type_record(&cx, out, name, member, c.id),
-                        _ => out,
-                    };
-                }
-                m = m + 1usize;
-            }
+fn member_name(member: S::Member['k]) -> Span['k] {
+    match member {
+        S::Member::Fn(f) => f.name,
+        S::Member::Const(c) => c.name,
+    }
+}
+
+forall 'k.
+fn member_pos(member: S::Member['k]) -> S::Pos {
+    match member {
+        S::Member::Fn(f) => f.pos,
+        S::Member::Const(c) => c.pos,
+    }
+}
+
+forall 'k.
+fn member_kind(&cx: Domain!['k], member: S::Member['k]) -> Span['k] {
+    match member {
+        S::Member::Fn(_) => lit(&cx, "method"),
+        S::Member::Const(_) => lit(&cx, "const"),
+    }
+}
+
+forall 'k.
+fn member_mentions(&cx: Domain!['k], g: Gen['k], member: S::Member['k]) -> ArenaVec[Mention['k], 'k] {
+    match member {
+        S::Member::Fn(f) => mentions(&cx, g, S::Item::Fn.(f)),
+        S::Member::Const(c) => mentions(&cx, g, S::Item::Const.(c)),
+    }
+}
+
+forall 'k.
+fn member_entry(&cx: Domain!['k], g: Gen['k], out: Buffer!, view: usize, page: Span['k], m: Member['k], note: Span['k]) -> Buffer! {
+    entry(&cx, g, out, view, page, m.home, member_anchor(&cx, m.member), member_kind(&cx, m.member), member_name(m.member),
+        member_pos(m.member), member_mentions(&cx, g, m.member), false, false, note)
+}
+
+// The anchors of instances shown on one page: each its own, unless two share it, when each also
+// gets its module's path.
+forall 'k.
+fn instance_anchors(&cx: Domain!['k], g: Gen['k], shown: ArenaVec[Inst['k], 'k]) -> ArenaVec[Span['k], 'k] {
+    let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+    var i = 0usize;
+    while i < shown.len(&cx) {
+        let it = shown.at(&cx, i);
+        var shared = false;
+        var j = 0usize;
+        while j < shown.len(&cx) {
+            if j != i && shown.at(&cx, j).anchor.eq(&cx, it.anchor) { shared = true; }
+            j = j + 1usize;
         }
-        k = k + 1usize;
+        if shared {
+            let place = Buffer!::new().push_bytes(&cx, package_name(&cx, g, it.home.package)).push_static("::").push_bytes(&cx, it.home.path.join(&cx, "::")).save(&cx);
+            out.push(&cx, encode(&cx, Buffer!::new().push_bytes(&cx, it.anchor).push_static("."), place).save(&cx));
+        } else {
+            out.push(&cx, it.anchor);
+        }
+        i = i + 1usize;
     }
     out
 }
 
 forall 'k.
-fn nav_records(&cx: Domain!['k], r: Resolver['k], home: ModuleId['k], source: Span['k]) -> Buffer! {
-    let scope = r.scopes.at(&cx, home);
-    var out = Buffer!::new();
-    var count = 0usize;
-    var j = 0usize;
-    while j < scope.items.len(&cx) {
-        match scope.items.at(&cx, j) {
-            S::Item::Struct(d) => { out = nav_type(&cx, r, home, out, d.name, d.id); count = count + 1usize; },
-            S::Item::Tuple(d) => { out = nav_type(&cx, r, home, out, d.name, d.id); count = count + 1usize; },
-            S::Item::Enum(d) => { out = nav_type(&cx, r, home, out, d.name, d.id); count = count + 1usize; },
-            S::Item::Trait(d) => { out = nav_record(&cx, out, d.name, "Traits", d.id); count = count + 1usize; },
-            S::Item::Fn(d) => { out = nav_record(&cx, out, d.name, "Functions", d.id); count = count + 1usize; },
-            S::Item::Const(d) => { out = nav_record(&cx, out, d.name, "Constants", d.id); count = count + 1usize; },
-            S::Item::Instance(d) => { out = nav_record(&cx, out, instance_name(&cx, source, d.pos), "Instances", d.id); count = count + 1usize; },
-            S::Item::Impl(d) => {
-                let owner = match d.type {
-                    S::Type::Name(t) => t.path.at(&cx, t.path.len(&cx) - 1usize),
-                    _ => lit(&cx, "impl"),
+fn instance_entries(&cx: Domain!['k], g: Gen['k], out: Buffer!, view: usize, page: Span['k], shown: ArenaVec[Inst['k], 'k], noted: bool) -> Buffer! {
+    let anchors = instance_anchors(&cx, g, shown);
+    var out = out;
+    var i = 0usize;
+    while i < shown.len(&cx) {
+        let it = shown.at(&cx, i);
+        let note = if noted { module_link(&cx, g, Buffer!::new().push_static("In "), view, page, it.home).push_static(".").save(&cx) } else { lit(&cx, "") };
+        out = entry(&cx, g, out, view, page, it.home, anchors.at(&cx, i), lit(&cx, "instance"), it.head, it.decl.pos,
+            mentions(&cx, g, S::Item::Instance.(it.decl)), false, false, note);
+        i = i + 1usize;
+    }
+    out
+}
+
+// The package's module tree for a sidebar, `current` marked: `[[tree]]` records.
+forall 'k.
+fn tree(&cx: Domain!['k], g: Gen['k], out: Buffer!, sorted: ArenaVec[Loc['k], 'k], current: Span['k]) -> Buffer! {
+    var out = out;
+    var i = 0usize;
+    while i < sorted.len(&cx) {
+        let l = sorted.at(&cx, i);
+        let name = if l.path.is_empty(&cx) { package_name(&cx, g, l.package) } else { l.path.at(&cx, l.path.len(&cx) - 1usize) };
+        out = toml(&cx, out.push_static("[[tree]]\nname = "), name);
+        out = toml(&cx, out.push_static("\nurl = "), l.url).push_static("\ndepth = ").push_usize(l.path.len(&cx));
+        if l.url.eq(&cx, current) { out = out.push_static("\ncurrent = true"); }
+        out = out.push_static("\n");
+        i = i + 1usize;
+    }
+    out
+}
+
+forall 'k.
+fn front(&cx: Domain!['k], layout: Slice[u8, 'static], title: Span['k], kind: Span['k], nav_title: Span['k], parent: Span['k], parent_title: Span['k], package: Span['k]) -> Buffer! {
+    var out = Buffer!::new().push_static("+++\nlayout = \"").push_static(layout).push_static("\"\ntitle = ");
+    out = toml(&cx, out, title);
+    out = toml(&cx, out.push_static("\nkind = "), kind);
+    out = toml(&cx, out.push_static("\nnav_title = "), nav_title);
+    out = toml(&cx, out.push_static("\nparent = "), parent);
+    out = toml(&cx, out.push_static("\nparent_title = "), parent_title);
+    toml(&cx, out.push_static("\npackage = "), package).push_static("\n")
+}
+
+// A page: its front matter, sidebar lists and module tree, then its body.
+forall 'k.
+fn page_text(&cx: Domain!['k], g: Gen['k], head: Buffer!, nav_records: Buffer!, sorted: ArenaVec[Loc['k], 'k], current: Span['k], body: Buffer!) -> Buffer! {
+    var out = head;
+    if &nav_records.len() == 0usize { out = out.push_static("nav_items = []\n"); }
+    out = tree(&cx, g, out.push_buffer(nav_records), sorted, current);
+    out.push_static("+++\n").push_buffer(body)
+}
+
+// The file of a page under the site's `src`: `std/io/index.md`, `std/io/struct.File~.md`.
+forall 'k.
+fn page_file(&cx: Domain!['k], g: Gen['k], site: Span['k], l: Loc['k], name: Span['k]) -> Span['k] {
+    var folder = path(&cx, site, package_name(&cx, g, l.package));
+    var i = 0usize;
+    while i < l.path.len(&cx) {
+        folder = path(&cx, folder, l.path.at(&cx, i));
+        directory(&cx, folder);
+        i = i + 1usize;
+    }
+    path(&cx, folder, name)
+}
+
+// --------------------------------------------------------------- the pages --
+
+// What a module's impls give methods to, beside its own types: the primitive and builtin types
+// (`u8`, `NonNull`) by name.
+forall 'k.
+fn primitives(&cx: Domain!['k], g: Gen['k], home: ModuleId['k]) -> ArenaVec[Span['k], 'k] {
+    let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+    let items = g.r.scopes.at(&cx, home).items;
+    var i = 0usize;
+    while i < items.len(&cx) {
+        match items.at(&cx, i) {
+            S::Item::Impl(block) => match impl_owner(&cx, g.r, block) {
+                Option::Some(owner) => match owner {
+                    NameRef::Prim(name) => if !out.contains(&cx, name) { out.push(&cx, name); },
+                    NameRef::Builtin(name) => if !out.contains(&cx, name) { out.push(&cx, name); },
+                    _ => (),
+                },
+                Option::None => (),
+            },
+            _ => (),
+        }
+        i = i + 1usize;
+    }
+    out
+}
+
+forall 'k.
+fn primitive_kind(&cx: Domain!['k], name: Span['k]) -> Span['k] {
+    if is_prim(&cx, name) { lit(&cx, "primitive") } else { lit(&cx, "builtin") }
+}
+
+// The members a module's impls give to the primitive or builtin type `name`.
+forall 'k.
+fn primitive_members(&cx: Domain!['k], g: Gen['k], home: ModuleId['k], name: Span['k]) -> ArenaVec[Member['k], 'k] {
+    let out: ArenaVec[Member['k], 'k] = ArenaVec::new(&cx);
+    let items = g.r.scopes.at(&cx, home).items;
+    var i = 0usize;
+    while i < items.len(&cx) {
+        match items.at(&cx, i) {
+            S::Item::Impl(block) => {
+                let mine = match impl_owner(&cx, g.r, block) {
+                    Option::Some(owner) => match owner {
+                        NameRef::Prim(n) => n.eq(&cx, name),
+                        NameRef::Builtin(n) => n.eq(&cx, name),
+                        _ => false,
+                    },
+                    Option::None => false,
                 };
-                if !scope.decls.contains(&cx, owner) {
+                if mine {
                     var m = 0usize;
-                    while m < d.items.len(&cx) {
-                        out = match d.items.at(&cx, m) {
-                            S::Member::Fn(f) => nav_record(&cx, out, Buffer!::new().push_bytes(&cx, owner).push_static("::").push_bytes(&cx, f.name).save(&cx), "Implementations", f.id),
-                            S::Member::Const(c) => nav_record(&cx, out, Buffer!::new().push_bytes(&cx, owner).push_static("::").push_bytes(&cx, c.name).save(&cx), "Implementations", c.id),
-                        };
-                        count = count + 1usize;
+                    while m < block.items.len(&cx) {
+                        out.push(&cx, Member.{ home, member: block.items.at(&cx, m) });
                         m = m + 1usize;
                     }
                 }
             },
             _ => (),
         }
-        j = j + 1usize;
+        i = i + 1usize;
     }
-    if count == 0usize { out = out.push_static("nav_items = []\n"); }
     out
 }
 
 forall 'k.
-fn page_parents(&cx: Domain!['k], r: Resolver['k], home: ModuleId['k], parent: Span['k]) -> Buffer! {
-    var out = Buffer!::new().push_static("parents = [\"").push_bytes(&cx, parent).push_static("\"");
-    var p = 0usize;
-    while p < r.packages.len(&cx) {
-        let package = r.packages.at(&cx, p);
-        let modules = package.files.keys(&cx);
-        var i = 0usize;
-        while i < modules.len(&cx) {
-            let source = modules.at(&cx, i);
-            if public_module(&cx, r, source) {
-                let scope = r.scopes.at(&cx, source);
-                let exports = scope.exports.keys(&cx);
-                var e = 0usize;
-                while e < exports.len(&cx) {
-                    let target = r.lookup(&cx, source, ArenaVec::one(&cx, exports.at(&cx, e)), S::Pos.{ line: 0u32, col: 0u32 });
-                    match target {
-                        Result::Ok(found) => match found {
-                            Target::Module(m) => if url(&cx, r, m).eq(&cx, url(&cx, r, home)) {
-                                let source_url = url(&cx, r, source);
-                                if !source_url.eq(&cx, parent) { out = out.push_static(", \"").push_bytes(&cx, source_url).push_static("\""); }
-                            },
-                            _ => (),
-                        },
-                        Result::Err(_) => (),
-                    }
-                    e = e + 1usize;
+fn kind_label(&cx: Domain!['k], kind: Span['k]) -> Span['k] {
+    if kind.is(&cx, "struct") { lit(&cx, "Struct") }
+    else if kind.is(&cx, "enum") { lit(&cx, "Enum") }
+    else if kind.is(&cx, "tuple") { lit(&cx, "Tuple") }
+    else if kind.is(&cx, "trait") { lit(&cx, "Trait") }
+    else if kind.is(&cx, "primitive") { lit(&cx, "Primitive type") }
+    else { lit(&cx, "Builtin type") }
+}
+
+// A note on a page of a re-exported module: where the module, or the item, is declared.
+forall 'k.
+fn re_export_note(&cx: Domain!['k], g: Gen['k], out: Buffer!, l: Loc['k], page: Span['k], target: Option[Span['k]], title: Span['k]) -> Buffer! {
+    if !re_exported(&cx, l) { return out; }
+    var out = out.push_static("<p class=\"re-export-note\">Re-exported from ");
+    out = match target {
+        Option::Some(url) => out.push_static("<a href=\"").push_bytes(&cx, relative(&cx, page, url)).push_static("\"><code>").push_bytes(&cx, title).push_static("</code></a>"),
+        Option::None => out.push_static("<code>").push_bytes(&cx, title).push_static("</code>"),
+    };
+    out.push_static(".</p>\n")
+}
+
+// The page of a type or trait declared in the module of `l`, or of a primitive or builtin type
+// its impls give methods to (`it` none).
+forall 'k.
+fn item_page(&cx: Domain!['k], g: Gen['k], site: Span['k], l: Loc['k], sorted: ArenaVec[Loc['k], 'k], siblings: Span['k], kind: Span['k], name: Span['k], it: Option[S::Item['k]]) {
+    let view = l.package;
+    let url = item_url(&cx, l, kind, name);
+    let src = source(&cx, g, l.actual);
+    let head = front(&cx, "doc.html", Buffer!::new().push_bytes(&cx, l.title).push_static("::").push_bytes(&cx, name).save(&cx),
+        kind_label(&cx, kind), name, l.url, l.title, package_name(&cx, g, view));
+    var head = toml(&cx, head.push_static("permalink = "), url).push_static("\n");
+    var navs = Buffer!::new();
+    var body = Buffer!::new();
+    let decl = match g.r.scopes.at(&cx, l.actual).decls.get(&cx, name) {
+        Option::Some(d) => if it.is_some() { Option::Some.(d) } else { Option::None },
+        Option::None => Option::None,
+    };
+    match it {
+        Option::Some(item) => {
+            let pos = match item {
+                S::Item::Struct(d) => d.pos,
+                S::Item::Enum(d) => d.pos,
+                S::Item::Tuple(d) => d.pos,
+                S::Item::Trait(d) => d.pos,
+                _ => S::Pos.{ line: 1u32, col: 1u32 },
+            };
+            let first = declaration_line(&cx, src, pos.line);
+            body = heading(&cx, g, body, l, url, kind, kind_label(&cx, kind), Option::Some.(name), source_url(&cx, g, l.actual, first));
+            let canonical = match decl {
+                Option::Some(d) => decl_url(&cx, g, l.actual.package, d),
+                Option::None => Option::None,
+            };
+            body = re_export_note(&cx, g, body, l, url, canonical,
+                Buffer!::new().push_bytes(&cx, module_title(&cx, g.r, l.actual.package, l.actual.path)).push_static("::").push_bytes(&cx, name).save(&cx));
+            let (aggregate, is_exposed) = match item {
+                S::Item::Struct(d) => (true, d.exposure.is_some()),
+                S::Item::Enum(d) => (true, d.exposure.is_some()),
+                S::Item::Trait(_) => (true, true),
+                _ => (false, false),
+            };
+            body = body.push_buffer(signature(&cx, g, view, url, src, first, aggregate, is_exposed, mentions(&cx, g, item)));
+            let doc = prose(&cx, src, first);
+            if !doc.is_empty() { body = body.push_static("\n").push_bytes(&cx, doc).push_static("\n"); }
+        },
+        Option::None => {
+            body = heading(&cx, g, body, l, url, kind, kind_label(&cx, kind), Option::Some.(name), lit(&cx, ""));
+            body = body.push_static("<p class=\"item-note\">The methods of <code>").push_bytes(&cx, name).push_static("</code> that ");
+            body = module_link(&cx, g, body, view, url, l.actual).push_static(" defines, and the instances that mention it.</p>\n\n");
+        },
+    }
+    // methods
+    var methods = Buffer!::new();
+    let members = match decl {
+        Option::Some(d) => match g.methods.get(&cx, d.id) {
+            Option::Some(found) => found,
+            Option::None => ArenaVec::new(&cx),
+        },
+        Option::None => if it.is_none() { primitive_members(&cx, g, l.actual, name) } else { ArenaVec::new(&cx) },
+    };
+    var m = 0usize;
+    while m < members.len(&cx) {
+        let member = members.at(&cx, m);
+        let note = if key_eq(&cx, member.home, l.actual) { lit(&cx, "") }
+            else { module_link(&cx, g, Buffer!::new().push_static("Defined in "), view, url, member.home).push_static(".").save(&cx) };
+        methods = member_entry(&cx, g, methods, view, url, member, note);
+        let anchor = member_anchor(&cx, member.member);
+        navs = nav(&cx, navs, lit(&cx, "Methods"), member_name(member.member), Buffer!::new().push_static("#").push_bytes(&cx, anchor).save(&cx), member_kind(&cx, member.member));
+        m = m + 1usize;
+    }
+    match it {
+        Option::Some(item) => match item {
+            S::Item::Trait(t) => {
+                var i = 0usize;
+                while i < t.methods.len(&cx) {
+                    let f = t.methods.at(&cx, i);
+                    let anchor = encode(&cx, Buffer!::new().push_static("method."), f.name).save(&cx);
+                    let found: ArenaVec[Mention['k], 'k] = ArenaVec::new(&cx);
+                    mention_fn(&cx, g, found, f);
+                    methods = entry(&cx, g, methods, view, url, l.actual, anchor, lit(&cx, "method"), f.name, f.pos, found, false, false, lit(&cx, ""));
+                    navs = nav(&cx, navs, lit(&cx, "Methods"), f.name, Buffer!::new().push_static("#").push_bytes(&cx, anchor).save(&cx), lit(&cx, "method"));
+                    i = i + 1usize;
                 }
-            }
-            i = i + 1usize;
+            },
+            _ => (),
+        },
+        Option::None => (),
+    }
+    body = section(&cx, body, "methods", "Methods", methods);
+    // instances
+    let is_trait = kind.is(&cx, "trait");
+    let shown = match decl {
+        Option::Some(d) => if is_trait {
+            g.instances.filter(&cx, |&cx, i| match i.trait_decl { Option::Some(t) => t.id == d.id, Option::None => false })
+        } else {
+            g.instances.filter(&cx, |&cx, i| i.types.contains(&cx, d.id))
+        },
+        Option::None => g.instances.filter(&cx, |&cx, i| i.prims.contains(&cx, name)),
+    };
+    let anchors = instance_anchors(&cx, g, shown);
+    var n = 0usize;
+    while n < shown.len(&cx) {
+        navs = nav(&cx, navs, if is_trait { lit(&cx, "Implementors") } else { lit(&cx, "Instances") }, shown.at(&cx, n).head,
+            Buffer!::new().push_static("#").push_bytes(&cx, anchors.at(&cx, n)).save(&cx), lit(&cx, "instance"));
+        n = n + 1usize;
+    }
+    let entries = instance_entries(&cx, g, Buffer!::new(), view, url, shown, true);
+    body = if is_trait { section(&cx, body, "implementors", "Implementors", entries) } else { section(&cx, body, "instances", "Instances", entries) };
+    navs = navs.push_bytes(&cx, siblings);
+    let file = page_file(&cx, g, site, l, encode(&cx, Buffer!::new().push_bytes(&cx, kind).push_static("."), name).push_static(".md").save(&cx));
+    save(&cx, file, page_text(&cx, g, head, navs, sorted, l.url, body));
+}
+
+// The page of the module at location `l`, and the pages of its types and traits.
+forall 'k.
+fn module_page(&cx: Domain!['k], g: Gen['k], site: Span['k], l: Loc['k], sorted: ArenaVec[Loc['k], 'k]) {
+    let view = l.package;
+    let page = l.url;
+    let home = l.actual;
+    let src = source(&cx, g, home);
+    let scope = g.r.scopes.at(&cx, home);
+    let n = l.path.len(&cx);
+    let parent = if n == 0usize { lit(&cx, "/") } else { module_url(&cx, g.r, view, l.path.slice(&cx, 0usize, n - 1usize)) };
+    let parent_title = if n == 0usize { lit(&cx, "All packages") } else { module_title(&cx, g.r, view, l.path.slice(&cx, 0usize, n - 1usize)) };
+    let short = if n == 0usize { package_name(&cx, g, view) } else { l.path.at(&cx, n - 1usize) };
+    let head = front(&cx, "doc.html", l.title, lit(&cx, "Module"), short, parent, parent_title, package_name(&cx, g, view));
+    var nav_modules = Buffer!::new();
+    var nav_types = Buffer!::new();
+    var nav_traits = Buffer!::new();
+    var nav_fns = Buffer!::new();
+    var nav_consts = Buffer!::new();
+    var nav_instances = Buffer!::new();
+    var nav_impls = Buffer!::new();
+    var nav_blanket = Buffer!::new();
+    var body = heading(&cx, g, Buffer!::new(), l, page, lit(&cx, "module"), lit(&cx, "Module"), Option::None, source_url(&cx, g, home, 1u32));
+    let canonical = match loc_of(&cx, g, home.package, home) {
+        Option::Some(c) => Option::Some.(c.url),
+        Option::None => Option::None,
+    };
+    body = re_export_note(&cx, g, body, l, page, canonical, module_title(&cx, g.r, home.package, home.path));
+    let overview = module_prose(&cx, src);
+    if !overview.is_empty() { body = body.push_static("\n").push_bytes(&cx, overview).push_static("\n"); }
+    // modules and re-exports
+    var modules = Buffer!::new();
+    var reexports = Buffer!::new();
+    let exports = scope.exports.keys(&cx);
+    var e = 0usize;
+    while e < exports.len(&cx) {
+        let name = exports.at(&cx, e);
+        match g.r.lookup(&cx, home, ArenaVec::one(&cx, name), S::Pos.{ line: 0u32, col: 0u32 }) {
+            Result::Ok(found) => match found {
+                Target::Module(m) => match child_url(&cx, g, l, name, m) {
+                    Option::Some(url) => {
+                        let line = summary(&cx, module_prose(&cx, source(&cx, g, m)));
+                        modules = row(&cx, modules, relative(&cx, page, url), lit(&cx, "module"), name, line);
+                        nav_modules = nav(&cx, nav_modules, lit(&cx, "Modules"), name, url, lit(&cx, "module"));
+                    },
+                    Option::None => (),
+                },
+                Target::Decl(d) => {
+                    let target = match loc_of(&cx, g, view, d.home) {
+                        Option::Some(dl) => {
+                            let kind = page_kind(&cx, d);
+                            let path = Buffer!::new().push_bytes(&cx, dl.title).push_static("::").push_bytes(&cx, d.name).save(&cx);
+                            let url = if !kind.is_empty() { Option::Some.(item_url(&cx, dl, kind, d.name)) }
+                                else if d.kind.is(&cx, "fn") || d.kind.is(&cx, "const") {
+                                    Option::Some.(encode(&cx, Buffer!::new().push_bytes(&cx, dl.url).push_static("#").push_bytes(&cx, d.kind).push_static("."), d.name).save(&cx))
+                                } else { Option::None };
+                            (url, path)
+                        },
+                        Option::None => (Option::None, d.name),
+                    };
+                    let (url, path) = target;
+                    let line = Buffer!::new().push_static("Re-export of `").push_bytes(&cx, path).push_static("`.").save(&cx);
+                    reexports = match url {
+                        Option::Some(u) => row(&cx, reexports, relative(&cx, page, u), d.kind, name, line),
+                        Option::None => html(&cx, reexports.push_static("<tr><td><code>"), name).push_static("</code></td><td>Re-export.</td></tr>\n"),
+                    };
+                },
+                _ => { reexports = html(&cx, reexports.push_static("<tr><td><code>"), name).push_static("</code></td><td>Re-export of a builtin.</td></tr>\n"); },
+            },
+            Result::Err(_) => (),
         }
+        e = e + 1usize;
+    }
+    body = table(&cx, body, "modules", "Modules", modules);
+    body = table(&cx, body, "re-exports", "Re-exports", reexports);
+    // the module's items
+    var types = Buffer!::new();
+    var traits = Buffer!::new();
+    var fns = Buffer!::new();
+    var consts = Buffer!::new();
+    var impls = Buffer!::new();
+    var fn_entries = Buffer!::new();
+    var const_entries = Buffer!::new();
+    var blanket = Buffer!::new();
+    var siblings = Buffer!::new();
+    let section_name = Buffer!::new().push_static("In ").push_bytes(&cx, l.title).save(&cx);
+    let pages: ArenaVec[(Span['k], Span['k], Option[S::Item['k]]), 'k] = ArenaVec::new(&cx);
+    var j = 0usize;
+    while j < scope.items.len(&cx) {
+        let it = scope.items.at(&cx, j);
+        let named = match it {
+            S::Item::Struct(d) => Option::Some.((lit(&cx, "struct"), d.name, d.pos)),
+            S::Item::Enum(d) => Option::Some.((lit(&cx, "enum"), d.name, d.pos)),
+            S::Item::Tuple(d) => Option::Some.((lit(&cx, "tuple"), d.name, d.pos)),
+            S::Item::Trait(d) => Option::Some.((lit(&cx, "trait"), d.name, d.pos)),
+            _ => Option::None,
+        };
+        match named {
+            Option::Some(found) => {
+                let (kind, name, pos) = found;
+                let url = item_url(&cx, l, kind, name);
+                let line = summary_of(&cx, g, home, pos);
+                if kind.is(&cx, "trait") {
+                    traits = row(&cx, traits, relative(&cx, page, url), kind, name, line);
+                    nav_traits = nav(&cx, nav_traits, lit(&cx, "Traits"), name, url, kind);
+                } else {
+                    types = row(&cx, types, relative(&cx, page, url), kind, name, line);
+                    nav_types = nav(&cx, nav_types, lit(&cx, "Types"), name, url, kind);
+                }
+                siblings = nav(&cx, siblings, section_name, name, url, kind);
+                pages.push(&cx, (kind, name, Option::Some.(it)));
+            },
+            Option::None => (),
+        }
+        match it {
+            S::Item::Fn(f) => {
+                let anchor = encode(&cx, Buffer!::new().push_static("fn."), f.name).save(&cx);
+                let target = Buffer!::new().push_static("#").push_bytes(&cx, anchor).save(&cx);
+                fns = row(&cx, fns, target, lit(&cx, "fn"), f.name, summary_of(&cx, g, home, f.pos));
+                nav_fns = nav(&cx, nav_fns, lit(&cx, "Functions"), f.name, target, lit(&cx, "fn"));
+                fn_entries = entry(&cx, g, fn_entries, view, page, home, anchor, lit(&cx, "fn"), f.name, f.pos, mentions(&cx, g, it), false, false, lit(&cx, ""));
+            },
+            S::Item::Const(c) => {
+                let anchor = encode(&cx, Buffer!::new().push_static("const."), c.name).save(&cx);
+                let target = Buffer!::new().push_static("#").push_bytes(&cx, anchor).save(&cx);
+                consts = row(&cx, consts, target, lit(&cx, "const"), c.name, summary_of(&cx, g, home, c.pos));
+                nav_consts = nav(&cx, nav_consts, lit(&cx, "Constants"), c.name, target, lit(&cx, "const"));
+                const_entries = entry(&cx, g, const_entries, view, page, home, anchor, lit(&cx, "const"), c.name, c.pos, mentions(&cx, g, it), false, false, lit(&cx, ""));
+            },
+            S::Item::Impl(block) => match impl_owner(&cx, g.r, block) {
+                Option::Some(owner) => match owner {
+                    NameRef::Decl(d) => if !key_eq(&cx, d.home, home) {
+                        var m = 0usize;
+                        while m < block.items.len(&cx) {
+                            let member = block.items.at(&cx, m);
+                            let name = Buffer!::new().push_bytes(&cx, d.name).push_static("::").push_bytes(&cx, member_name(member)).save(&cx);
+                            let line = summary_of(&cx, g, home, member_pos(member));
+                            impls = match decl_url(&cx, g, view, d) {
+                                Option::Some(u) => {
+                                    let target = Buffer!::new().push_bytes(&cx, u).push_static("#").push_bytes(&cx, member_anchor(&cx, member)).save(&cx);
+                                    nav_impls = nav(&cx, nav_impls, lit(&cx, "Implementations"), name, target, member_kind(&cx, member));
+                                    row(&cx, impls, relative(&cx, page, target), member_kind(&cx, member), name, line)
+                                },
+                                Option::None => html(&cx, impls.push_static("<tr><td><code>"), name).push_static("</code></td><td>").push_buffer(inline(&cx, Buffer!::new(), line)).push_static("</td></tr>\n"),
+                            };
+                            m = m + 1usize;
+                        }
+                    },
+                    NameRef::Param(_) => {
+                        let impl_src = source(&cx, g, home);
+                        let note = html(&cx, Buffer!::new().push_static("In <code>"), line_text(&cx, impl_src, declaration_line(&cx, impl_src, block.pos.line))).push_static("</code>").save(&cx);
+                        var m = 0usize;
+                        while m < block.items.len(&cx) {
+                            let member = Member.{ home, member: block.items.at(&cx, m) };
+                            blanket = member_entry(&cx, g, blanket, view, page, member, note);
+                            nav_blanket = nav(&cx, nav_blanket, lit(&cx, "Blanket methods"), member_name(member.member),
+                                Buffer!::new().push_static("#").push_bytes(&cx, member_anchor(&cx, member.member)).save(&cx), member_kind(&cx, member.member));
+                            m = m + 1usize;
+                        }
+                    },
+                    _ => (),
+                },
+                Option::None => (),
+            },
+            _ => (),
+        }
+        j = j + 1usize;
+    }
+    let prims = primitives(&cx, g, home);
+    var p = 0usize;
+    while p < prims.len(&cx) {
+        let name = prims.at(&cx, p);
+        let kind = primitive_kind(&cx, name);
+        let url = item_url(&cx, l, kind, name);
+        let line = Buffer!::new().push_static("Methods of the ").push_static(if kind.is(&cx, "primitive") { "primitive" } else { "builtin" }).push_static(" type `").push_bytes(&cx, name).push_static("`.").save(&cx);
+        types = row(&cx, types, relative(&cx, page, url), kind, name, line);
+        nav_types = nav(&cx, nav_types, lit(&cx, "Types"), name, url, kind);
+        siblings = nav(&cx, siblings, section_name, name, url, kind);
+        pages.push(&cx, (kind, name, Option::None));
         p = p + 1usize;
     }
-    out.push_static("]\n")
+    let own = g.instances.filter(&cx, |&cx, i| key_eq(&cx, i.home, home));
+    var instances = Buffer!::new();
+    let anchors = instance_anchors(&cx, g, own);
+    var q = 0usize;
+    while q < own.len(&cx) {
+        let it = own.at(&cx, q);
+        let target = Buffer!::new().push_static("#").push_bytes(&cx, anchors.at(&cx, q)).save(&cx);
+        instances = row(&cx, instances, target, lit(&cx, "instance"), it.head, summary_of(&cx, g, home, it.decl.pos));
+        nav_instances = nav(&cx, nav_instances, lit(&cx, "Instances"), it.head, target, lit(&cx, "instance"));
+        q = q + 1usize;
+    }
+    body = table(&cx, body, "types", "Types", types);
+    body = table(&cx, body, "traits", "Traits", traits);
+    body = table(&cx, body, "functions", "Functions", fns);
+    body = table(&cx, body, "constants", "Constants", consts);
+    body = table(&cx, body, "instances", "Instances", instances);
+    body = table(&cx, body, "implementations", "Methods of other modules' types", impls);
+    body = section(&cx, body, "function-declarations", "Function declarations", fn_entries);
+    body = section(&cx, body, "constant-declarations", "Constant declarations", const_entries);
+    body = section(&cx, body, "instance-declarations", "Instance declarations", instance_entries(&cx, g, Buffer!::new(), view, page, own, false));
+    body = section(&cx, body, "blanket-methods", "Blanket methods", blanket);
+    let navs = nav_modules.push_buffer(nav_types).push_buffer(nav_traits).push_buffer(nav_fns).push_buffer(nav_consts).push_buffer(nav_instances).push_buffer(nav_impls).push_buffer(nav_blanket);
+    save(&cx, page_file(&cx, g, site, l, lit(&cx, "index.md")), page_text(&cx, g, head, navs, sorted, page, body));
+    let around = siblings.save(&cx);
+    var k = 0usize;
+    while k < pages.len(&cx) {
+        let (kind, name, it) = pages.at(&cx, k);
+        item_page(&cx, g, site, l, sorted, around, kind, name, it);
+        k = k + 1usize;
+    }
+}
+
+// The page of a source file, each line with the anchor `L<n>`.
+forall 'k.
+fn source_page(&cx: Domain!['k], g: Gen['k], site: Span['k], home: ModuleId['k]) {
+    let src = source(&cx, g, home);
+    let name = package_name(&cx, g, home.package);
+    let title = Buffer!::new().push_bytes(&cx, name).push_static("/").push_bytes(&cx, src.file).save(&cx);
+    let url = Buffer!::new().push_static("/src/").push_bytes(&cx, title).push_static(".html").save(&cx);
+    var out = Buffer!::new().push_static("+++\nlayout = \"source.html\"\ntitle = ");
+    out = toml(&cx, out, title);
+    out = toml(&cx, out.push_static("\npermalink = "), url);
+    out = toml(&cx, out.push_static("\nparent = "), Buffer!::new().push_static("/").push_bytes(&cx, name).push_static("/").save(&cx));
+    out = toml(&cx, out.push_static("\nparent_title = "), name).push_static("\n+++\n");
+    out = html(&cx, out.push_static("<h1 class=\"source-title\">"), title).push_static("</h1>\n");
+    let body = highlight(&cx, src.text, 0usize, ArenaVec::new(&cx), 0usize).save(&cx);
+    out = out.push_static("<pre class=\"source\"><code class=\"language-kursal\">").push_buffer(lines(&cx, body, 1u32)).push_static("</code></pre>\n");
+    save(&cx, file_in(&cx, path(&cx, site, lit(&cx, "src")), Buffer!::new().push_bytes(&cx, title).push_static(".md").save(&cx)), out);
+}
+
+// ------------------------------------------------------------------ search --
+
+forall 'k.
+fn search_entry(&cx: Domain!['k], out: Buffer!, first: bool, name: Span['k], kind: Span['k], full: Span['k], url: Span['k], line: Span['k]) -> Buffer! {
+    var out = if first { out.push_static("\n{\"n\":") } else { out.push_static(",\n{\"n\":") };
+    out = json(&cx, out, name).push_static(",\"k\":");
+    out = json(&cx, out, kind).push_static(",\"p\":");
+    out = json(&cx, out, full).push_static(",\"u\":");
+    out = json(&cx, out, url).push_static(",\"s\":");
+    json(&cx, out, plain(&cx, line)).push_static("}")
 }
 
 forall 'k.
-fn page(&cx: Domain!['k], r: Resolver['k], home: ModuleId['k], root: Span['k]) {
-    let package = r.packages.at(&cx, home.package);
-    let module_name = if home.path.is_empty(&cx) { package.name.copy(&cx) }
-        else { Buffer!::new().push_bytes(&cx, package.name.copy(&cx)).push_static("::").push_bytes(&cx, home.path.join(&cx, "::")).save(&cx) };
-    let file = package.files.at(&cx, home);
-    let source = match read_to_arena(&cx, file) {
-        Result::Ok(bytes) => bytes,
-        Result::Err(_) => package::support::base::fail(&cx, Buffer!::new().push_static("cannot read ").push_bytes(&cx, file).save(&cx)),
-    };
-    var folder = path(&cx, path(&cx, root, lit(&cx, "src")), package.name.copy(&cx));
-    var i = 0usize;
-    while i < home.path.len(&cx) {
-        folder = path(&cx, folder, home.path.at(&cx, i));
-        directory(&cx, folder);
-        i = i + 1usize;
-    }
-    let parent = if home.path.is_empty(&cx) { lit(&cx, "/") }
-        else { url(&cx, r, ModuleId.{ package: home.package, path: home.path.slice(&cx, 0usize, home.path.len(&cx) - 1usize) }) };
-    let short_name = if home.path.is_empty(&cx) { package.name.copy(&cx) }
-        else { home.path.at(&cx, home.path.len(&cx) - 1usize) };
-    var out = Buffer!::new().push_static("+++\nlayout = \"module.html\"\ntitle = \"").push_bytes(&cx, module_name)
-        .push_static("\"\nnav_title = \"").push_bytes(&cx, short_name)
-        .push_static("\"\nparent = \"").push_bytes(&cx, parent).push_static("\"\n")
-        .push_buffer(page_parents(&cx, r, home, parent)).push_buffer(nav_records(&cx, r, home, source))
-        .push_static("+++\n# ").push_bytes(&cx, module_name).push_static("\n\n");
-    out = out.push_buffer(module_prose(&cx, source));
-    let relative = if file.starts_with(&cx, package.root) && file.len() > package.root.len() + 1usize {
-        file.slice(package.root.len() + 1usize, file.len())
-    } else { file };
-    out = out.push_static("Source: `").push_bytes(&cx, relative).push_static("`\n\n");
-    let scope = r.scopes.at(&cx, home);
-    let exports = scope.exports.keys(&cx);
-    if !exports.is_empty(&cx) {
-        out = out.push_static("## Re-exports\n\n");
-        var e = 0usize;
-        while e < exports.len(&cx) {
-            let name = exports.at(&cx, e);
-            let target = r.lookup(&cx, home, ArenaVec::one(&cx, name), S::Pos.{ line: 0u32, col: 0u32 });
-            out = match target {
-                Result::Ok(found) => match found {
-                    Target::Module(m) => out.push_static("- [`").push_bytes(&cx, name).push_static("`](").push_bytes(&cx, url(&cx, r, m)).push_static(")\n"),
-                    Target::Decl(d) => out.push_static("- [`").push_bytes(&cx, name).push_static("`](").push_bytes(&cx, url(&cx, r, d.home)).push_static(")\n"),
-                    _ => out.push_static("- `").push_bytes(&cx, name).push_static("`\n"),
-                },
-                Result::Err(_) => out.push_static("- `").push_bytes(&cx, name).push_static("`\n"),
-            };
-            e = e + 1usize;
-        }
-        out = out.push_static("\n");
-    }
-    out = out.push_static("## Declarations\n\n");
-    var j = 0usize;
-    while j < scope.items.len(&cx) {
-        out = item(&cx, r, home, out, source, scope.items.at(&cx, j));
-        j = j + 1usize;
-    }
-    save(&cx, path(&cx, folder, lit(&cx, "index.md")), out);
+fn joined(&cx: Domain!['k], a: Span['k], b: Span['k]) -> Span['k] {
+    Buffer!::new().push_bytes(&cx, a).push_static("::").push_bytes(&cx, b).save(&cx)
 }
+
+// Every documented item once, at the page the documented package (the first) links to: its name,
+// kind, path, URL and summary line.
+forall 'k.
+fn search_index(&cx: Domain!['k], g: Gen['k]) -> Buffer! {
+    var out = Buffer!::new().push_static("[");
+    var first = true;
+    let homes = g.by_actual.keys(&cx);
+    var h = 0usize;
+    while h < homes.len(&cx) {
+        let home = homes.at(&cx, h);
+        let l = match loc_of(&cx, g, 0usize, home) { Option::Some(found) => found, Option::None => g.locs.at(&cx, 0usize) };
+        let short = if l.path.is_empty(&cx) { package_name(&cx, g, l.package) } else { l.path.at(&cx, l.path.len(&cx) - 1usize) };
+        out = search_entry(&cx, out, first, short, lit(&cx, "module"), l.title, l.url, summary(&cx, module_prose(&cx, source(&cx, g, home))));
+        first = false;
+        let scope = g.r.scopes.at(&cx, home);
+        var j = 0usize;
+        while j < scope.items.len(&cx) {
+            let it = scope.items.at(&cx, j);
+            match it {
+                S::Item::Struct(d) => { out = search_type(&cx, g, out, l, home, lit(&cx, "struct"), d.name, d.pos, Option::None); },
+                S::Item::Enum(d) => { out = search_type(&cx, g, out, l, home, lit(&cx, "enum"), d.name, d.pos, Option::None); },
+                S::Item::Tuple(d) => { out = search_type(&cx, g, out, l, home, lit(&cx, "tuple"), d.name, d.pos, Option::None); },
+                S::Item::Trait(d) => { out = search_type(&cx, g, out, l, home, lit(&cx, "trait"), d.name, d.pos, Option::Some.(d)); },
+                S::Item::Fn(f) => {
+                    out = search_entry(&cx, out, false, f.name, lit(&cx, "fn"), joined(&cx, l.title, f.name),
+                        encode(&cx, Buffer!::new().push_bytes(&cx, l.url).push_static("#fn."), f.name).save(&cx), summary_of(&cx, g, home, f.pos));
+                },
+                S::Item::Const(c) => {
+                    out = search_entry(&cx, out, false, c.name, lit(&cx, "const"), joined(&cx, l.title, c.name),
+                        encode(&cx, Buffer!::new().push_bytes(&cx, l.url).push_static("#const."), c.name).save(&cx), summary_of(&cx, g, home, c.pos));
+                },
+                S::Item::Impl(block) => match impl_owner(&cx, g.r, block) {
+                    Option::Some(owner) => match owner {
+                        NameRef::Param(_) => {
+                            var m = 0usize;
+                            while m < block.items.len(&cx) {
+                                let member = block.items.at(&cx, m);
+                                out = search_entry(&cx, out, false, member_name(member), member_kind(&cx, member), joined(&cx, l.title, member_name(member)),
+                                    Buffer!::new().push_bytes(&cx, l.url).push_static("#").push_bytes(&cx, member_anchor(&cx, member)).save(&cx), summary_of(&cx, g, home, member_pos(member)));
+                                m = m + 1usize;
+                            }
+                        },
+                        _ => (),
+                    },
+                    Option::None => (),
+                },
+                _ => (),
+            }
+            j = j + 1usize;
+        }
+        let prims = primitives(&cx, g, home);
+        var p = 0usize;
+        while p < prims.len(&cx) {
+            let name = prims.at(&cx, p);
+            let kind = primitive_kind(&cx, name);
+            let url = item_url(&cx, l, kind, name);
+            out = search_entry(&cx, out, false, name, kind, joined(&cx, l.title, name), url, lit(&cx, ""));
+            let members = primitive_members(&cx, g, home, name);
+            var m = 0usize;
+            while m < members.len(&cx) {
+                let member = members.at(&cx, m).member;
+                out = search_entry(&cx, out, false, member_name(member), member_kind(&cx, member), joined(&cx, joined(&cx, l.title, name), member_name(member)),
+                    Buffer!::new().push_bytes(&cx, url).push_static("#").push_bytes(&cx, member_anchor(&cx, member)).save(&cx), summary_of(&cx, g, home, member_pos(member)));
+                m = m + 1usize;
+            }
+            p = p + 1usize;
+        }
+        let own = g.instances.filter(&cx, |&cx, i| key_eq(&cx, i.home, home));
+        let anchors = instance_anchors(&cx, g, own);
+        var q = 0usize;
+        while q < own.len(&cx) {
+            let it = own.at(&cx, q);
+            out = search_entry(&cx, out, false, it.head, lit(&cx, "instance"), joined(&cx, l.title, it.head),
+                Buffer!::new().push_bytes(&cx, l.url).push_static("#").push_bytes(&cx, anchors.at(&cx, q)).save(&cx), summary_of(&cx, g, home, it.decl.pos));
+            q = q + 1usize;
+        }
+        h = h + 1usize;
+    }
+    // instances in modules without a page are found on their trait's page
+    var n = 0usize;
+    while n < g.instances.len(&cx) {
+        let it = g.instances.at(&cx, n);
+        if !g.by_actual.contains(&cx, it.home) {
+            match it.trait_decl {
+                Option::Some(t) => match decl_url(&cx, g, 0usize, t) {
+                    Option::Some(url) => {
+                        let shown = g.instances.filter(&cx, |&cx, i| match i.trait_decl { Option::Some(o) => o.id == t.id, Option::None => false });
+                        let anchors = instance_anchors(&cx, g, shown);
+                        var at = 0usize;
+                        var k = 0usize;
+                        while k < shown.len(&cx) {
+                            if key_eq(&cx, shown.at(&cx, k).home, it.home) && shown.at(&cx, k).decl.id == it.decl.id { at = k; }
+                            k = k + 1usize;
+                        }
+                        out = search_entry(&cx, out, false, it.head, lit(&cx, "instance"), it.head,
+                            Buffer!::new().push_bytes(&cx, url).push_static("#").push_bytes(&cx, anchors.at(&cx, at)).save(&cx), summary_of(&cx, g, it.home, it.decl.pos));
+                    },
+                    Option::None => (),
+                },
+                Option::None => (),
+            }
+        }
+        n = n + 1usize;
+    }
+    out.push_static("\n]\n")
+}
+
+// A type or trait in the search index, with its methods.
+forall 'k.
+fn search_type(&cx: Domain!['k], g: Gen['k], out: Buffer!, l: Loc['k], home: ModuleId['k], kind: Span['k], name: Span['k], pos: S::Pos, trait_decl: Option[S::TraitDecl['k]]) -> Buffer! {
+    let url = item_url(&cx, l, kind, name);
+    let full = joined(&cx, l.title, name);
+    var out = search_entry(&cx, out, false, name, kind, full, url, summary_of(&cx, g, home, pos));
+    match g.r.scopes.at(&cx, home).decls.get(&cx, name) {
+        Option::Some(d) => match g.methods.get(&cx, d.id) {
+            Option::Some(members) => {
+                var m = 0usize;
+                while m < members.len(&cx) {
+                    let member = members.at(&cx, m);
+                    out = search_entry(&cx, out, false, member_name(member.member), member_kind(&cx, member.member), joined(&cx, full, member_name(member.member)),
+                        Buffer!::new().push_bytes(&cx, url).push_static("#").push_bytes(&cx, member_anchor(&cx, member.member)).save(&cx),
+                        summary_of(&cx, g, member.home, member_pos(member.member)));
+                    m = m + 1usize;
+                }
+            },
+            Option::None => (),
+        },
+        Option::None => (),
+    }
+    match trait_decl {
+        Option::Some(t) => {
+            var i = 0usize;
+            while i < t.methods.len(&cx) {
+                let f = t.methods.at(&cx, i);
+                out = search_entry(&cx, out, false, f.name, lit(&cx, "method"), joined(&cx, full, f.name),
+                    encode(&cx, Buffer!::new().push_bytes(&cx, url).push_static("#method."), f.name).save(&cx), summary_of(&cx, g, home, f.pos));
+                i = i + 1usize;
+            }
+        },
+        Option::None => (),
+    }
+    out
+}
+
+// ------------------------------------------------------------------- the site --
 
 forall 'k.
 fn generate(&cx: Domain!['k], r: Resolver['k], output: Span['k]) {
@@ -555,27 +1137,35 @@ fn generate(&cx: Domain!['k], r: Resolver['k], output: Span['k]) {
     if present { package::support::base::fail(&cx, lit(&cx, "documentation output already exists; choose a new -o path")); }
     let layouts = theme(&cx, "_includes");
     let assets = theme(&cx, "assets");
+    let g = build(&cx, r);
     directory(&cx, output);
-    let source = path(&cx, output, lit(&cx, "src"));
-    directory(&cx, source);
+    let site = path(&cx, output, lit(&cx, "src"));
+    directory(&cx, site);
     save(&cx, path(&cx, output, lit(&cx, "krayon.toml")), Buffer!::new().push_static("input = \"src\"\noutput = \"dist\"\nlayouts = \"_includes\"\nassets = \"assets\"\nbase_path = \"\"\n"));
-    copy_tree(&cx, layouts, path(&cx, source, lit(&cx, "_includes")));
-    copy_tree(&cx, assets, path(&cx, source, lit(&cx, "assets")));
+    copy_tree(&cx, layouts, path(&cx, site, lit(&cx, "_includes")));
+    copy_tree(&cx, assets, path(&cx, site, lit(&cx, "assets")));
     var index = Buffer!::new().push_static("+++\nlayout = \"index.html\"\ntitle = \"Packages\"\n+++\n# Package documentation\n\nGenerated from Kursal source. Select a package:\n\n");
     var p = 0usize;
     while p < r.packages.len(&cx) {
-        let package = r.packages.at(&cx, p);
-        let name = package.name.copy(&cx);
-        directory(&cx, path(&cx, source, name));
+        let name = package_name(&cx, g, p);
+        directory(&cx, path(&cx, site, name));
         index = index.push_static("- [").push_bytes(&cx, name).push_static("](/").push_bytes(&cx, name).push_static("/)\n");
-        let modules = package.files.keys(&cx);
+        let sorted = g.locs.filter(&cx, |&cx, l| l.package == p);
+        sorted.sort_by(&cx, |&cx, a, b| a.url.cmp(&cx, b.url));
         var i = 0usize;
-        while i < modules.len(&cx) {
-            let home = modules.at(&cx, i);
-            if public_module(&cx, r, home) { page(&cx, r, home, output); }
+        while i < sorted.len(&cx) {
+            module_page(&cx, g, site, sorted.at(&cx, i), sorted);
             i = i + 1usize;
         }
         p = p + 1usize;
     }
-    save(&cx, path(&cx, source, lit(&cx, "index.md")), index);
+    save(&cx, path(&cx, site, lit(&cx, "index.md")), index);
+    directory(&cx, path(&cx, site, lit(&cx, "src")));
+    let homes = r.scopes.keys(&cx);
+    var h = 0usize;
+    while h < homes.len(&cx) {
+        source_page(&cx, g, site, homes.at(&cx, h));
+        h = h + 1usize;
+    }
+    save(&cx, path(&cx, path(&cx, site, lit(&cx, "assets")), lit(&cx, "search-index.json")), search_index(&cx, g));
 }

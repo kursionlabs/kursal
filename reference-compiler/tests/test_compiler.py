@@ -18,6 +18,7 @@ documentation comments and signatures, and whose links all lead somewhere."""
 import dataclasses
 import functools
 import hashlib
+import html
 import importlib
 import itertools
 import json
@@ -31,6 +32,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 from collections.abc import Callable, Sequence
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
@@ -731,33 +733,139 @@ fn first(a: T, b: U) -> T {
 """
 
 
+# Packages for a site with a re-exported module: `gadget` declares a struct, an enum and a trait in
+# `gadget::shapes`, with a method in another module and the instances in `gadget::measures`; `gizmo`
+# re-exports `gadget::shapes` as `gizmo::shapes`, and its own `gizmo::tools` names `Circle`.
+DOC_PACKAGES = {
+    "gadget/kur.toml": manifest("gadget"),
+    "gadget/lib.kur": "//! Gadgets: shapes and how big they are.\nuse package::{measures, shapes};\nexport measures;\nexport shapes;\n",
+    "gadget/shapes.kur": """\
+//! Shapes and their areas.
+
+/// A circle. Its radius is whole.
+exposed struct Circle {
+    radius: u32,
+}
+
+/// A side of a square.
+exposed enum Side {
+    Top,
+    Bottom,
+}
+
+/// Things with an area.
+forall Self.
+trait Area {
+    /// The area, rounded down.
+    fn area(self: Self) -> u32;
+}
+""",
+    "gadget/measures.kur": """\
+//! How big shapes are.
+use package::shapes::{Area, Circle, Side};
+
+impl Circle {
+    /// A circle of radius one.
+    fn unit() -> Circle {
+        Circle.{ radius: 1u32 }
+    }
+}
+
+/// A circle's area, roughly.
+instance Area[Circle] {
+    fn area(self: Circle) -> u32 {
+        3u32 * self.radius * self.radius
+    }
+}
+
+/// A side has no area.
+instance Area[Side] {
+    fn area(self: Side) -> u32 {
+        0u32
+    }
+}
+
+/// The larger of two areas.
+forall T where Area[T], Copy[T].
+fn larger(a: T, b: T) -> u32 {
+    let x = a.area();
+    let y = b.area();
+    if x > y { x } else { y }
+}
+""",
+    "gizmo/kur.toml": manifest("gizmo", ("gadget",)),
+    "gizmo/lib.kur": "//! The gizmo facade.\nuse gadget::shapes;\nexport shapes;\nuse package::tools;\nexport tools;\n",
+    "gizmo/tools.kur": "//! Tools for circles.\nuse gadget::shapes::Circle;\n\n/// The radius of a circle.\nfn radius(c: Circle) -> u32 {\n    c.radius\n}\n",
+}
+
+
+# Declarations added before the others of DOC_PACKAGES' `gadget`, to `shapes.kur` and to `measures.kur`.
+EARLY_SHAPES = "/// Early.\nexposed struct Early {\n    n: u32,\n}\n\n/// Early too.\nfn early() -> u32 {\n    1u32\n}\n\n"
+EARLY_MEASURES = ("impl Circle {\n    fn zero() -> Circle {\n        Circle.{ radius: 0u32 }\n    }\n}\n\n"
+                  "instance Area[Early] {\n    fn area(self: Early) -> u32 {\n        self.n\n    }\n}\n\n")
+
+
+def write_files(base: Path, files: dict[str, str]) -> None:
+    for name, text in files.items():
+        (base / name).parent.mkdir(parents=True, exist_ok=True)
+        (base / name).write_text(text)
+
+
+def page_body(page: Path) -> str:
+    """A generated page without its front matter."""
+    return page.read_text().split("+++\n", 2)[2]
+
+
+def page_url(src: Path, page: Path) -> str:
+    """Where Krayon serves a generated page: its `permalink`, else its directory."""
+    found = re.search(r'^permalink = "([^"]+)"', page.read_text(), re.M)
+    if found:
+        return found.group(1)
+    relative = page.relative_to(src).as_posix()
+    return "/" + relative.removesuffix("index.md")
+
+
+def anchors_of(text: str) -> set[str]:
+    return set(re.findall(r"\{#([\w:-]+)", text)) | set(re.findall(r'\sid="([^"]+)"', text))
+
+
 def markdown_link_errors(src: Path) -> list[str]:
-    """The links of a generated site's Markdown that lead nowhere: a root-relative target names the
-    `index.md` under SRC, a fragment the `{#id}` of a heading on that page. Front matter's `parent`,
-    `parents` and sidebar `url`s count as links; code does not."""
-    anchors = {page: set(re.findall(r"\{#([\w:-]+)", page.read_text())) for page in src.rglob("*.md")}
+    """The links of a generated site's Markdown that lead nowhere: a target, root-relative or relative to
+    the page's URL, names a page under SRC, and a fragment an anchor there (a heading's `{#id}` or an
+    element's `id`). Markdown links, `href`s and front matter's `parent` and sidebar `url`s count;
+    links in fenced code do not, nor Markdown's link syntax in a line of HTML, which Krayon copies as
+    written."""
+    pages = {page: page.read_text() for page in src.rglob("*.md")}
+    by_url = {page_url(src, page): page for page in pages}
+    anchors = {page: anchors_of(text) for page, text in pages.items()}
     errors = []
-    for page in anchors:
-        text = re.sub(r"```.*?```", "", page.read_text(), flags=re.S)
-        text = re.sub(r"`[^`\n]*`", "", text)
-        targets = re.findall(r"\]\(([^)\s]+)\)", text) + re.findall(r'^(?:url|parent) = "([^"]+)"', text, re.M)
-        for listed in re.findall(r"^parents = \[(.*)\]$", text, re.M):
-            targets += re.findall(r'"([^"]+)"', listed)
+    for page, text in pages.items():
+        here = page_url(src, page)
+        text = re.sub(r"```.*?```", "", text, flags=re.S)
+        markdown = re.sub(r"^<.*$", "", text, flags=re.M)
+        targets = re.findall(r"\]\(([^)\s]+)\)", markdown) + re.findall(r'href="([^"]+)"', text)
+        targets += re.findall(r'^(?:url|parent) = "([^"]+)"', text, re.M)
         for target in targets:
-            path, _, fragment = target.partition("#")
-            dest = page if not path else src / path.strip("/") / "index.md"
-            if dest not in anchors or (fragment and fragment not in anchors[dest]):
+            if re.match(r"[a-z]+:", target):
+                continue
+            resolved = urllib.parse.urljoin("http://site" + here, html.unescape(target))
+            path, _, fragment = resolved.removeprefix("http://site").partition("#")
+            dest = by_url.get(path)
+            if dest is None or (fragment and fragment not in anchors[dest]):
                 errors.append(f"{page.relative_to(src)}: {target}")
     return errors
 
 
 def html_link_errors(dist: Path) -> list[str]:
-    """The local `href`s and `src`s of a built site that name no file, or no `id` in it."""
+    """The local `href`s and `src`s of a built site that name no file, or no `id` in it, and the ids a
+    page has twice."""
     dist = dist.resolve()
-    ids = {page: set(re.findall(r'\sid="([^"]+)"', page.read_text())) for page in dist.rglob("*.html")}
-    errors = []
-    for page in ids:
-        for target in re.findall(r'(?:href|src)="([^"]+)"', page.read_text()):
+    texts = {page: page.read_text() for page in dist.rglob("*.html")}
+    ids = {page: re.findall(r'\sid="([^"]+)"', text) for page, text in texts.items()}
+    errors = [f"{page.relative_to(dist)}: id {name} twice" for page, found in ids.items()
+              for name in sorted({n for n in found if found.count(n) > 1})]
+    for page, text in texts.items():
+        for target in re.findall(r'(?:href|src)="([^"]+)"', text):
             if re.match(r"[a-z]+:|//", target):
                 continue
             path, _, fragment = target.partition("#")
@@ -771,9 +879,26 @@ def html_link_errors(dist: Path) -> list[str]:
             if dest.is_dir():
                 dest = dest / "index.html"
             dest = dest.resolve()
-            if not dest.is_file() or (fragment and fragment not in ids.get(dest, set())):
+            if not dest.is_file() or (fragment and fragment not in ids.get(dest, [])):
                 errors.append(f"{page.relative_to(dist)}: {target}")
     return errors
+
+
+def plain_text(markup: str) -> str:
+    """HTML as text: without its tags, its entities decoded."""
+    return html.unescape(re.sub(r"<[^>]+>", "", markup))
+
+
+def first_signature(body: str) -> str:
+    """The text of the first signature in BODY."""
+    block = re.search(r'<pre class="sig"><code class="language-kursal">(.*?)</code></pre>', body, re.S)
+    assert block is not None
+    return plain_text(block.group(1))
+
+
+def signature_after(body: str, anchor: str) -> str:
+    """The text of the first signature after the element with id ANCHOR."""
+    return first_signature(body[body.index(f'id="{anchor}"'):])
 
 
 def needs_core(source: str) -> tuple[str, ...]:
@@ -1985,9 +2110,10 @@ class CompilerTests(unittest.TestCase):
                     self.assertEqual((reference.returncode, reference.stdout, reference.stderr), (1, "", message))
 
     def test_doc_writes_comments_and_signatures(self):
-        """`kursal doc` on a small package: the `//!` overview, each declaration under a heading of its kind
-        with its `///` comment and its signature, an instance under what it is an instance of, a `forall`
-        premise of several lines kept whole, and no plain comment or extern."""
+        """`kursal doc` on a small package: the `//!` overview, a table of each kind of item with its summary
+        line, functions, constants and instances in full on the module's page, a page for each type and
+        trait, each declaration with its signature highlighted and the types and traits it names linked, a
+        `forall` premise of several lines kept whole, and no plain comment or extern outside the source."""
         with tempfile.TemporaryDirectory() as directory:
             package, site = Path(directory) / "gizmo", Path(directory) / "site"
             package.mkdir()
@@ -1995,70 +2121,202 @@ class CompilerTests(unittest.TestCase):
             (package / "lib.kur").write_text(DOC_PACKAGE)
             result = self.run_compiler("doc", str(package), "-o", str(site))
             self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
-            page = (site / "src/gizmo/index.md").read_text()
-            self.assertEqual(markdown_link_errors(site / "src"), [])
+            src = site / "src"
+            self.assertEqual(markdown_link_errors(src), [])
             self.assertTrue((site / "krayon.toml").is_file())
-            self.assertTrue((site / "src/_includes/module.html").is_file())
-            self.assertTrue((site / "src/assets/site.css").is_file())
-        front, _, body = page.partition("+++\n# gizmo\n\n")
-        self.assertIn('layout = "module.html"', front)
-        for name, section in (("Definition", "Types"), ("origin", "Types"), ("sum", "Types"), ("Measure", "Traits"),
-                              ("Measure[Point]", "Instances"), ("LIMIT", "Constants"), ("first", "Functions")):
-            self.assertIn(f'name = "{name}"\nsection = "{section}"', front)
-        self.assertTrue(body.startswith("Gizmos for testing the documentation site.\nA second line of the overview.\n\n"
-                                        "Source: `lib.kur`\n\n## Declarations\n\n"), body[:300])
+            for theme in ("_includes/doc.html", "_includes/source.html", "assets/site.css", "assets/search.js"):
+                self.assertTrue((src / theme).is_file(), theme)
+            front, _, _ = (src / "gizmo/index.md").read_text().partition("+++\n<div")
+            body = page_body(src / "gizmo/index.md")
+            point, measure = page_body(src / "gizmo/struct.Point.md"), page_body(src / "gizmo/trait.Measure.md")
+            pages = [p.read_text() for p in src.rglob("*.md") if "src/src" not in p.as_posix()]
+            source = (src / "src/gizmo/lib.kur.md").read_text()
+        self.assertIn('layout = "doc.html"', front)
+        for name, section, url in (("Point", "Types", "/gizmo/struct.Point.html"), ("Measure", "Traits", "/gizmo/trait.Measure.html"),
+                                   ("first", "Functions", "#fn.first"), ("LIMIT", "Constants", "#const.LIMIT"),
+                                   ("Measure[Point]", "Instances", "#instance.Measure-5bPoint-5d")):
+            self.assertIn(f'section = "{section}"\nname = "{name}"\nurl = "{url}"', front)
+        self.assertIn('[[tree]]\nname = "gizmo"\nurl = "/gizmo/"\ndepth = 0\ncurrent = true\n', front)
+        self.assertIn("\nGizmos for testing the documentation site.\nA second line of the overview.\n", body)
+        rows = re.findall(r'<tr><td><a class="item-link kind-(\w+)" href="([^"]+)"><code>([^<]+)</code></a></td><td>([^<]*)</td></tr>', body)
+        self.assertEqual(rows, [
+            ("struct", "struct.Point.html", "Point", "A point on a grid."),
+            ("trait", "trait.Measure.html", "Measure", "Things with a size."),
+            ("fn", "#fn.first", "first", "The first of two values."),
+            ("const", "#const.LIMIT", "LIMIT", "The largest coordinate."),
+            ("instance", "#instance.Measure-5bPoint-5d", "Measure[Point]", "A point's size is the sum of its coordinates."),
+        ])
         expected = [
-            ("struct", "Point", "A point on a grid.", "exposed struct Point {\n    x: u32,\n    y: u32,\n}"),
-            ("method", "Point::origin", "The point at the origin.", "fn origin() -> Point { ... }"),
-            ("method", "Point::sum", "The sum of both coordinates.", "fn sum(self) -> u32 { ... }"),
-            ("trait", "Measure", "Things with a size.",
-             "forall Self.\ntrait Measure {\n    fn size(self: Self) -> u32;\n}"),
-            ("instance", "Measure[Point]", "A point's size is the sum of its coordinates.",
-             "instance Measure[Point] { ... }"),
-            ("const", "LIMIT", "The largest coordinate.", "const LIMIT: u32 = 100u32;"),
-            ("fn", "first", "The first of two values.",
+            (body, "fn.first", "fn", "The first of two values.",
              "forall T, U\n    where Copy[T],\n          Copy[U].\nfn first(a: T, b: U) -> T { ... }"),
+            (body, "const.LIMIT", "const", "The largest coordinate.", "const LIMIT: u32 = 100u32;"),
+            (body, "instance.Measure-5bPoint-5d", "instance", "A point's size is the sum of its coordinates.",
+             "instance Measure[Point] { ... }"),
+            (point, "method.origin", "method", "The point at the origin.", "fn origin() -> Point { ... }"),
+            (point, "method.sum", "method", "The sum of both coordinates.", "fn sum(self) -> u32 { ... }"),
+            (point, "instance.Measure-5bPoint-5d", "instance", "A point's size is the sum of its coordinates.",
+             "instance Measure[Point] { ... }"),
+            (measure, "method.size", "method", "", "fn size(self: Self) -> u32;"),
+            (measure, "instance.Measure-5bPoint-5d", "instance", "A point's size is the sum of its coordinates.",
+             "instance Measure[Point] { ... }"),
         ]
-        headings = re.findall(r"^### `(\w+)` (.+) \{#item-\d+ \.item-heading \.doc-kind-\1\}$", body, re.M)
-        self.assertEqual(headings, [(kind, name) for kind, name, _, _ in expected])
-        for kind, name, prose, signature in expected:
-            with self.subTest(item=name):
-                self.assertRegex(body, re.escape(f"`{kind}` {name} {{#item-") + r"\d+"
-                                 + re.escape(f" .item-heading .doc-kind-{kind}}}\n\n{prose}\n\n```kursal\n{signature}\n```\n"))
+        for text, anchor, kind, prose, signature in expected:
+            with self.subTest(anchor=anchor, kind=kind):
+                self.assertIn(f'<section class="item-entry" id="{anchor}">\n<h3 class="item-heading doc-kind-{kind}"><code>{kind}</code>', text)
+                self.assertEqual(signature_after(text, anchor), signature)
+                entry = text[text.index(f'id="{anchor}"'):]
+                if prose:
+                    self.assertIn(f"\n{prose}\n\n</section>", entry[:entry.index("</section>") + 10])
+        self.assertEqual(first_signature(point), "exposed struct Point {\n    x: u32,\n    y: u32,\n}")
+        self.assertIn("\nA point on a grid.\n", point)
+        self.assertIn('<span class="tok-keyword">forall</span> T, U', body)
+        self.assertIn('<span class="tok-type">u32</span> = <span class="tok-number">100</span><span class="tok-type">u32</span>;', body)
+        self.assertIn('<span class="tok-keyword">instance</span> <a class="sig-link sig-trait" href="trait.Measure.html">Measure</a>'
+                      '[<a class="sig-link sig-struct" href="struct.Point.html">Point</a>] { ... }', body)
+        self.assertIn('<a class="src-link" href="src/gizmo/lib.kur.html#L42">source</a>', body.replace("../", ""))
+        self.assertIn('<span class="line" id="L42"><span class="tok-keyword">forall</span> T, U</span>', source)
         for hidden in ("implementation note", "fn abs", "extern"):
-            self.assertNotIn(hidden, page)
+            self.assertFalse(any(hidden in page for page in pages), hidden)
+
+    def test_doc_re_exported_modules_instances_and_search(self):
+        """A module one package re-exports from another has its pages under both, with a note on the
+        re-exporting package's pointing to the other; a type's page lists its methods wherever they are
+        defined and the instances that mention it, a trait's page every instance of it; links from a
+        package's pages prefer its own paths; and the search index lists each item once, under the
+        documented package's path."""
+        with tempfile.TemporaryDirectory() as directory:
+            base, site = Path(directory), Path(directory) / "site"
+            write_files(base, DOC_PACKAGES)
+            result = self.run_compiler("doc", str(base / "gizmo"), "-o", str(site))
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+            src = site / "src"
+            self.assertEqual(markdown_link_errors(src), [])
+            facade = (src / "gizmo/shapes/index.md").read_text()
+            own = (src / "gadget/shapes/index.md").read_text()
+            circle = page_body(src / "gizmo/shapes/struct.Circle.md")
+            side = page_body(src / "gizmo/shapes/enum.Side.md")
+            area = page_body(src / "gizmo/shapes/trait.Area.md")
+            tools = page_body(src / "gizmo/tools/index.md")
+            measures = page_body(src / "gadget/measures/index.md")
+            index = json.loads((src / "assets/search-index.json").read_text())
+        self.assertIn('title = "gizmo::shapes"', facade)
+        self.assertIn('<p class="re-export-note">Re-exported from <a href="../../gadget/shapes/"><code>gadget::shapes</code></a>.</p>', facade)
+        self.assertNotIn("re-export-note", own)
+        self.assertIn('[[tree]]\nname = "shapes"\nurl = "/gizmo/shapes/"\ndepth = 1\ncurrent = true\n', facade)
+        self.assertIn('<td><a class="item-link kind-struct" href="struct.Circle.html"><code>Circle</code></a></td><td>A circle.</td>', facade)
+        self.assertIn('<p class="re-export-note">Re-exported from <a href="../../gadget/shapes/struct.Circle.html"><code>gadget::shapes::Circle</code></a>.</p>', circle)
+        self.assertEqual(signature_after(circle, "method.unit"), "fn unit() -> Circle { ... }")
+        self.assertIn('<p class="item-note">Defined in <a href="../../gadget/measures/"><code>gadget::measures</code></a>.</p>', circle)
+        self.assertEqual(signature_after(circle, "instance.Area-5bCircle-5d"), "instance Area[Circle] { ... }")
+        self.assertEqual(re.findall(r'id="(instance\.[^"]+)"', side), ["instance.Area-5bSide-5d"])
+        self.assertEqual(re.findall(r'id="(instance\.[^"]+)"', area), ["instance.Area-5bCircle-5d", "instance.Area-5bSide-5d"])
+        self.assertEqual(signature_after(area, "method.area"), "fn area(self: Self) -> u32;")
+        self.assertIn("\nThe area, rounded down.\n", area)
+        self.assertEqual(signature_after(tools, "fn.radius"), "fn radius(c: Circle) -> u32 { ... }")
+        link = re.search(r'<a class="sig-link sig-struct" href="([^"]+)">Circle</a>', tools)
+        self.assertIsNotNone(link)
+        self.assertEqual(urllib.parse.urljoin("http://site/gizmo/tools/", link.group(1)), "http://site/gizmo/shapes/struct.Circle.html")
+        link = re.search(r'<a class="sig-link sig-trait" href="([^"]+)">Area</a>\[<a class="sig-link sig-struct" href="([^"]+)">Circle</a>\]', measures)
+        self.assertIsNotNone(link)
+        self.assertEqual([urllib.parse.urljoin("http://site/gadget/measures/", url) for url in link.groups()],
+                         ["http://site/gadget/shapes/trait.Area.html", "http://site/gadget/shapes/struct.Circle.html"])
+        records = {(r["p"], r["k"]): (r["n"], r["u"], r["s"]) for r in index}
+        self.assertEqual(len(records), len(index))
+        for path, kind, name, url, line in (
+            ("gizmo", "module", "gizmo", "/gizmo/", "The gizmo facade."),
+            ("gizmo::shapes", "module", "shapes", "/gizmo/shapes/", "Shapes and their areas."),
+            ("gizmo::shapes::Circle", "struct", "Circle", "/gizmo/shapes/struct.Circle.html", "A circle."),
+            ("gizmo::shapes::Circle::unit", "method", "unit", "/gizmo/shapes/struct.Circle.html#method.unit", "A circle of radius one."),
+            ("gizmo::shapes::Side", "enum", "Side", "/gizmo/shapes/enum.Side.html", "A side of a square."),
+            ("gizmo::shapes::Area", "trait", "Area", "/gizmo/shapes/trait.Area.html", "Things with an area."),
+            ("gizmo::shapes::Area::area", "method", "area", "/gizmo/shapes/trait.Area.html#method.area", "The area, rounded down."),
+            ("gizmo::tools::radius", "fn", "radius", "/gizmo/tools/#fn.radius", "The radius of a circle."),
+            ("gadget::measures::larger", "fn", "larger", "/gadget/measures/#fn.larger", "The larger of two areas."),
+            ("gadget::measures::Area[Circle]", "instance", "Area[Circle]", "/gadget/measures/#instance.Area-5bCircle-5d", "A circle's area, roughly."),
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(records.get((path, kind)), (name, url, line))
+        self.assertFalse(any(p.startswith("gadget::shapes") for p, _ in records))
+
+    def test_doc_anchors_survive_an_earlier_declaration(self):
+        """Pages and anchors are named for what they document: declarations added before the others leave
+        every page and anchor of the site in place."""
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            write_files(base, DOC_PACKAGES)
+            sites = []
+            for run in ("first", "second"):
+                if run == "second":
+                    shapes, measures = base / "gadget/shapes.kur", base / "gadget/measures.kur"
+                    shapes.write_text(shapes.read_text().replace("/// A circle.", EARLY_SHAPES + "/// A circle.", 1))
+                    measures.write_text(measures.read_text().replace("{Area, Circle, Side}", "{Area, Circle, Early, Side}")
+                                        .replace("impl Circle {", EARLY_MEASURES + "impl Circle {", 1))
+                site = base / run
+                result = self.run_compiler("doc", str(base / "gadget"), "-o", str(site))
+                self.assertEqual((result.returncode, result.stderr), (0, ""))
+                src = site / "src"
+                self.assertEqual(markdown_link_errors(src), [])
+                sites.append({page_url(src, p): anchors_of(p.read_text()) for p in src.rglob("*.md")})
+        first, second = sites
+        self.assertGreater(len(first), 8)
+        for url, anchors in first.items():
+            with self.subTest(page=url):
+                self.assertIn(url, second)
+                self.assertLessEqual(anchors, second[url])
+                self.assertFalse(any(re.fullmatch(r"item-\d+", a) for a in anchors))
+        self.assertIn("/gadget/shapes/struct.Early.html", second)
+        self.assertLessEqual({"method.unit", "method.zero", "instance.Area-5bCircle-5d"}, second["/gadget/shapes/struct.Circle.html"])
+        self.assertIn("fn.early", second["/gadget/shapes/"])
+        self.assertIn("instance.Area-5bEarly-5d", second["/gadget/measures/"])
 
     def test_doc_site_of_the_standard_library(self):
-        """`kursal doc lib/std` documents std and its dependencies, every link in its Markdown leads to a page
-        and an anchor there, and no extern is listed."""
+        """`kursal doc lib/std` documents std and its dependencies, the modules std re-exports under std's
+        paths too, every link in its Markdown leads to a page and an anchor there, no extern is listed, and
+        the search index lists each item once."""
         with tempfile.TemporaryDirectory() as directory:
             site = Path(directory) / "site"
             result = self.run_compiler("doc", str(LIB / "std"), "-o", str(site))
             self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
-            pages = sorted(site.joinpath("src").rglob("*.md"))
-            self.assertGreater(len(pages), 30)
-            for package in ("std", "core", "alloc"):
-                self.assertTrue((site / "src" / package / "index.md").is_file(), package)
-            self.assertEqual(markdown_link_errors(site / "src"), [])
-            text = "".join(page.read_text() for page in pages)
-            self.assertNotIn("`extern`", text)
-            self.assertNotIn("kur_libc_", text)
-            self.assertIn("### `instance` Ord[u8, u8] {#item-", text)
+            src = site / "src"
+            pages = sorted(src.rglob("*.md"))
+            self.assertGreater(len(pages), 300)
+            for package in ("std", "core", "alloc", "std/cmp", "std/collections", "core/cmp"):
+                self.assertTrue((src / package / "index.md").is_file(), package)
+            self.assertEqual(markdown_link_errors(src), [])
+            text = "".join(page.read_text() for page in pages if "src/src" not in page.as_posix())
+            index = json.loads((src / "assets/search-index.json").read_text())
+            cmp = (src / "core/cmp/index.md").read_text()
+        self.assertNotIn("`extern`", text)
+        self.assertNotIn("kur_libc_", text)
+        self.assertIn('<section class="item-entry" id="instance.Ord-5bu8-2cu8-5d">', cmp)
+        self.assertEqual(len({(r["p"], r["k"]) for r in index}), len(index))
+        found = {r["p"]: r["u"] for r in index}
+        self.assertEqual(found["std::cmp::Ord"], "/std/cmp/trait.Ord.html")
+        self.assertEqual(found["std::io::read_line"], "/std/io/#fn.read_line")
+        self.assertEqual(found["std::collections::vec::Vec!"], "/std/collections/vec/struct.Vec~.html")
+        self.assertNotIn("core::cmp::Ord", found)
 
     def test_doc_site_builds_with_krayon(self):
-        """Krayon builds the standard library's site, and every local link and anchor of its HTML resolves."""
+        """Krayon builds the standard library's site and the re-exporting packages' site, every local link
+        and anchor of their HTML resolves, and no page has an id twice."""
         krayon = shutil.which("krayon")
         if krayon is None:
             self.skipTest("krayon is not on the PATH; build Krayon and put it on the PATH to check the site's HTML")
         with tempfile.TemporaryDirectory() as directory:
-            site = Path(directory) / "site"
-            result = self.run_compiler("doc", str(LIB / "std"), "-o", str(site))
-            self.assertEqual(result.returncode, 0, result.stderr)
-            built = subprocess.run([krayon, "build", str(site)], capture_output=True, text=True, timeout=TIME_LIMIT,
-                                   preexec_fn=limit_memory)
-            self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
-            self.assertGreater(len(list((site / "dist").rglob("*.html"))), 30)
-            self.assertEqual(html_link_errors(site / "dist"), [])
+            base = Path(directory)
+            write_files(base, DOC_PACKAGES)
+            for name, path, least in (("std", LIB / "std", 300), ("gizmo", base / "gizmo", 10)):
+                with self.subTest(site=name):
+                    site = base / f"site-{name}"
+                    result = self.run_compiler("doc", str(path), "-o", str(site))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    built = subprocess.run([krayon, "build", str(site)], capture_output=True, text=True, timeout=TIME_LIMIT,
+                                           preexec_fn=limit_memory)
+                    self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+                    self.assertGreater(len(list((site / "dist").rglob("*.html"))), least)
+                    for asset in ("search.js", "search-index.json"):
+                        self.assertTrue((site / "dist/assets" / asset).is_file(), asset)
+                    self.assertEqual(html_link_errors(site / "dist"), [])
 
     def test_doc_refuses_an_existing_output_and_a_missing_theme(self):
         """`kursal doc` writes no site over an existing path, and none when the theme beside the standard
