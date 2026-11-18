@@ -28,5 +28,12 @@ constants, and externs. A type expands to its definition and methods.
 The site follows the reader's light or dark system theme by default; the header
 toggle saves an explicit choice in the browser.
 
+The layouts, stylesheet and script live in [`theme/`](theme/): Krayon layouts
+in `theme/_includes/` and static files in `theme/assets/`. `kursal doc` looks
+for the theme beside the standard library it uses, in `docs/theme` next to
+`$KURSAL_LIB` (or next to the `lib/` it finds without it), and copies both
+directories into `SITE/src`, so a generated site builds on its own. It stops
+with an error, before writing anything, when the theme is missing.
+
 This is a source-derived API site. It does not yet provide full language-guide
 chapters or search.
