@@ -32,8 +32,9 @@ Each module page groups its sidebar by modules, types, traits, functions,
 constants, and instances. A type expands to its definition and methods. An
 instance is listed under what it is an instance of, such as `Ord[u8, u8]`,
 with the documentation comment above it.
-The site follows the reader's light or dark system theme by default; the header
-toggle saves an explicit choice in the browser.
+The site uses the Kursion palette and opens in dark mode; the header toggle switches
+to light mode and saves the choice in the browser. Headings, navigation and prose use
+Space Grotesk and code uses JetBrains Mono, loaded from Google Fonts with system fallbacks.
 
 The layouts, stylesheet and script live in [`theme/`](theme/): Krayon layouts
 in `theme/_includes/` and static files in `theme/assets/`. `kursal doc` looks
