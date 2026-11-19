@@ -259,6 +259,7 @@ class Resolver:
         self.cache: dict[LookupKey, Target] = {}
         self.active: set[LookupKey] = set()
         self.globbing: set[tuple[ModuleId, S.NamePath]] = set()
+        self.searching: set[tuple[ModuleId, str]] = set()
         # The errors reported so far, each with where it sorts in source order: 0 for a manifest's and 1 more
         # than its module's place among the modules for a source file's, then its position, then the order it
         # was found in.
@@ -500,9 +501,22 @@ class Resolver:
         return self.scopes[root].decls.get(name) if root in self.scopes else None
 
     def glob(self, module: ModuleId, name: str) -> Optional[Target]:
+        """`name` through the module's glob imports, in order. Globs that lead back to a search already
+        under way for `name` in `module` offer nothing more there."""
+        if (module, name) in self.searching:
+            return None
+        self.searching.add((module, name))
+        try:
+            return self.globbed(module, name)
+        finally:
+            self.searching.discard((module, name))
+
+    def globbed(self, module: ModuleId, name: str) -> Optional[Target]:
+        """A glob whose own path is being resolved offers nothing more: its path's first name is unknown in
+        the module itself."""
         for path in self.scopes[module].globs:
             if (module, path) in self.globbing:
-                continue                # the glob's own path is being resolved: it cannot name itself
+                continue
             self.globbing.add((module, path))
             try:
                 source = self.resolve_path(module, path)

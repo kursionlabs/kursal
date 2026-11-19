@@ -907,6 +907,8 @@ exposed struct Resolver {
     active: ArenaSet[(Span['k], ModuleId['k], ArenaVec[Span['k], 'k]), 'k],
     // the glob imports being resolved, by module and path
     expanding: ArenaSet[(ModuleId['k], ArenaVec[Span['k], 'k]), 'k],
+    // the names being looked up through a module's glob imports
+    searching: ArenaSet[(ModuleId['k], Span['k]), 'k],
     // node id -> what it names
     refs: ArenaMap[u32, NameRef['k], 'k],
     // The files and positions errors are reported in, innermost last.
@@ -931,6 +933,7 @@ impl Resolver['k] {
             cache: ArenaMap::new(&cx),
             active: ArenaSet::new(&cx),
             expanding: ArenaSet::new(&cx),
+            searching: ArenaSet::new(&cx),
             refs: ArenaMap::new(&cx),
             locations: ArenaVec::new(&cx),
             decl_ids: Ref::new(&cx, 0u32),
@@ -1439,9 +1442,21 @@ impl Resolver['k] {
         }
     }
 
-    // `name` through the module's glob imports, in order. A glob whose own path is being resolved
-    // offers nothing more: its path's first name is unknown in the module itself.
+    // `name` through the module's glob imports, in order. Globs that lead back to a search already
+    // under way for `name` in `home` offer nothing more there.
     fn glob(self, &cx: Domain!['k], home: ModuleId['k], name: Span['k]) -> Result[Option[Target['k]], Problem['k]] {
+        if self.searching.contains(&cx, (home, name)) {
+            return Result::Ok.(Option::None);
+        }
+        self.searching.insert(&cx, (home, name));
+        let found = self.globbed(&cx, home, name);
+        self.searching.remove(&cx, (home, name));
+        found
+    }
+
+    // A glob whose own path is being resolved offers nothing more: its path's first name is unknown
+    // in the module itself.
+    fn globbed(self, &cx: Domain!['k], home: ModuleId['k], name: Span['k]) -> Result[Option[Target['k]], Problem['k]] {
         let globs = self.scopes.at(&cx, home).globs;
         var i = 0usize;
         while i < globs.len(&cx) {

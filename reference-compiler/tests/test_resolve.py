@@ -190,6 +190,13 @@ class NameTests(unittest.TestCase):
         r = resolve(app("use lib::shapes::*;\nfn f(a: u32) -> Point { make(a) }\n"))
         self.assertIsInstance(body_of(r, "f").tail.callee.ref[1], Decl)
 
+    def test_modules_that_glob_each_other(self):
+        a = {"app/a.kur": "use package::*;\nfn y() -> u32 { x() }\n"}
+        r = resolve(app("use package::a::*;\nfn x() -> u32 { 0u32 }\nfn f() -> u32 { y() }\n", a))
+        self.assertEqual(body_of(r, "f").tail.callee.ref[1].name, "y")
+        with self.assertRaisesRegex(ResolveError, "2:17: unknown name X$"):
+            resolve(app("use package::a::*;\nfn f() -> u32 { X() }\n", {"app/a.kur": "use package::*;\n"}))
+
     def test_unknown_name(self):
         with self.assertRaises(ResolveError):
             resolve(app("fn f() -> u32 { nothing() }\n"))

@@ -1019,6 +1019,8 @@ RESOLUTION_ERRORS: tuple[tuple[dict[str, str], str], ...] = (
     (app("use lib::shapes::Point as Copy;\n"), "app"),
     (app("use lib::shapes as package;\n"), "app"),
     (app("use package::a::X;\nfn f() -> u32 { X.() }\n", {"app/a.kur": "use package::X;\n"}), "app"),
+    (app("use package::a::*;\nfn f() -> u32 { X() }\n", {"app/a.kur": "use package::*;\n"}), "app"),
+    (app("use package::a::*;\nfn f() -> u32 { X() }\n", {"app/a.kur": "use package::b::*;\n", "app/b.kur": "use package::a::*;\n"}), "app"),
     (app("fn f() -> u32 { lib::hidden::secret() }\n"), "app"),
     (app("fn f() -> u32 { lib::shapes }\n"), "app"),
     (app("fn f() -> u32 { lib::shapes::Point::nope() }\n"), "app"),
