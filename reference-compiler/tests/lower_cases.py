@@ -19,7 +19,7 @@ LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
     ("fn bump(&x: u32) -> u32 { x = x + 1u32; x }\nfn add(a: u32, b: u32) -> u32 { a + b }\n"
      "fn f() -> u32 { var n = 1u32; add(n, bump(&n)) }\n", "a plain read overlaps a lend"),
     ("struct P { a: u32, b: u32 }\nfn f(p: P) -> u32 { let { a, ..rest } = p; let q = rest; a }\n", "bundle"),
-    ("fn f() -> u32 { let exists 'a. w = core::cap::fresh(); let g = || pack 'a. 7u32; 0u32 }\n", "block-local brand"),
+    ("fn f() -> u32 { let exists 'a. w = core::cap::fresh(); let g = || pack 'a. 7u32; 0u32 }\n", "block-local brand 'a"),
     ("fn f() -> u32 { let exists 'a. w = core::cap::fresh(); let p = pack 'a. w; let c = unsafe (p as u32); 0u32 }\n",
      "existential package"),
     ("fn f(x: u32) -> u32 { let p = unsafe (x as exists 'a. core::cap::Brand['a]); 0u32 }\n", "existential package"),
@@ -74,9 +74,12 @@ LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
     ("use std::iter::{Iterator, range};\nfn f() -> u32 { var s = 0u32; for i in &range(0usize, 3usize) { s = s + 1u32; } s }\n",
      "iterator is not a place"),
     ("use std::bytes::buffer::Buffer!;\nfn g() -> u32 { 1u32 }\nfn f() -> u32 { let b = f\"{&g()}\"; 0u32 }\n", "needs a local or a place"),
+    # place flow names a closure's body by the function it is in
+    (TOKEN + "fn f() -> u32 {\n    let g = |x: u32| {\n        let t = Token!.{ n: x };\n        take(t) + take(t)\n    };\n    g(1u32)\n}\n",
+     "6:24: p::f: value 't' has been moved or is only partially available"),
     # promotion of locally branded values
     (OPTION + "fn f() -> u32 { let exists 'a. w = core::cap::fresh(); var o = Option::Some.(w); let t = core::mem::enum_variant(&o); match o { Option::Some(x) => t, Option::None => 0u32 } }\n",
-     "frontend limitation"),
+     "frontend limitation: locally branded value 'o' requires"),
     ("forall 'k. fn two(&a: (core::cap::Brand['k], u32), &b: core::cap::Brand['k]) -> u32 { 0u32 }\n"
      "fn f() -> u32 { let exists 'a. w = core::cap::fresh(); var p = (w, 1u32); two(&p, &p.0) }\n", "overlap"),
 )

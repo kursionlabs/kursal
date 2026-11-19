@@ -31,7 +31,7 @@ from . import syntax as S
 from .resolve import Decl, ResolveError, Resolver
 from .sigs import InstanceSig, Scope, Sig, Signatures
 from .sexpr import KursError, Position
-from .types import foreach_binders, Types, equal, free_brands, free_names, show, subst
+from .types import Surface, Types, brand_differences, equal, foreach_binders, free_brands, free_names, subst
 from .termination import check_instance_termination
 from .coherence import check_coherence
 from .unify import Meta, ground, instantiate, match_head, prune, unify, zonk
@@ -203,7 +203,7 @@ class Infer:
         check_instance_termination([(C.Premise(inst.trait, inst.head), inst.premises, inst.pos)
                                     for inst, _, _ in sigs.instances], files)
         check_coherence([(C.Premise(inst.trait, inst.head), inst.params, inst.pos)
-                         for inst, _, _ in sigs.instances], files)
+                         for inst, _, _ in sigs.instances], files, surface=True)
         self.r, self.sigs = resolver, sigs
         self.types = Types(C.Program(types=sigs.types, traits=sigs.traits))
         self.decl_of: dict[str, Decl] = {}
@@ -215,6 +215,7 @@ class Infer:
                        for name, decl in self.decl_of.items() if decl.kind == "trait"}
         self.instances: dict[str, list[InstanceSig]] = {}
         self.visible: dict[C.ModuleId, set[Decl]] = {}
+        self.origins: dict[str, Position] = {}    # an opened brand's label -> where its `let exists` is
         for inst, item, module in sigs.instances:
             self.instances.setdefault(inst.trait, []).append(inst)
 
@@ -261,7 +262,7 @@ class Infer:
         for ty, allowed, pos in self.brand_checks:
             escaped = free_brands(zonk(ty)) - allowed
             if escaped:
-                fail(f"brand {min(escaped)} escapes its lexical scope", pos)
+                fail(f"brand {self.shown(C.Skolem(min(escaped)))} escapes its lexical scope", pos)
         for e in self.recorded:
             e.ty = zonk(e.ty)
             if isinstance(e, S.For):
@@ -316,8 +317,26 @@ class Infer:
 
     def unify(self, a: C.Type, b: C.Type, pos: Optional[Position] = None) -> None:
         if not unify(a, b):
-            fail(f"type mismatch: {show(zonk(a))} and {show(zonk(b))}", pos)
+            fail(self.mismatch(zonk(a), zonk(b)), pos)
         self.solve()
+
+    def mismatch(self, a: C.Type, b: C.Type) -> str:
+        """Why `a` and `b` failed to unify. Unification is symmetric and its callers pass the two sides in
+        no fixed order, so the message names neither as the expected one. Types that differ only in brands
+        are a brand mismatch, which says where a `let exists` opened each brand that differs."""
+        surface = Surface((a, b), self.origins)
+        both = f"{surface.show(a)} and {surface.show(b)}"
+        brands = brand_differences(a, b)
+        if not brands:
+            return f"type mismatch: {both}"
+        opened = [label for label in brands if label in self.origins and label not in surface.qualified]
+        where = ", ".join(f"{surface.brand(label)}{' was opened' if k == 0 else ''} at "
+                          f"{self.origins[label][0]}:{self.origins[label][1]}" for k, label in enumerate(opened))
+        return f"brand mismatch: {both}" + (f"; {where}" if where else "")
+
+    def shown(self, ty: C.Type) -> str:
+        """`ty` as a message writes it."""
+        return Surface((ty,), self.origins).show(ty)
 
     def coerce(self, actual: C.Type, expected: Optional[C.Type], pos: Optional[Position]) -> None:
         if expected is not None and not isinstance(prune(actual), C.Never):
@@ -386,9 +405,10 @@ class Infer:
             sub = match_head(inst.params, inst.head[:input_count], inputs)
             if sub is not None and self.copy_ok(inst, sub):
                 found.append((inst, sub))
-        shown = f"{trait}[{', '.join(show(zonk(a)) for a in args)}]"
         if len(found) != 1:
-            fail(f"{'no' if not found else 'several'} instance of {shown}", pos)
+            written = [zonk(a) for a in args]
+            shown = ", ".join(map(Surface(written, self.origins).show, written))
+            fail(f"{'no' if not found else 'several'} instance of {trait}[{shown}]", pos)
         inst, sub = found[0]
         for param in inst.params:
             sub.setdefault(param.name, Meta("brand" if param.kind == C.BRAND else "type"))
@@ -492,11 +512,13 @@ class Infer:
     def let_exists(self, stmt: S.Let) -> bool:
         package = self.shape(self.expr(stmt.value), stmt.pos)
         if not isinstance(package, C.Exists) or len(package.binders) != len(stmt.brands):
-            fail(f"let exists opens {len(stmt.brands)} brands of {show(zonk(package))}", stmt.pos)
+            fail(f"let exists opens {len(stmt.brands)} brands of {self.shown(zonk(package))}", stmt.pos)
         names = tuple(b[1:] for b in stmt.brands)
         if len(set(names)) != len(names):
             fail("an existential opening repeats a brand name", stmt.pos)
         labels = stmt.opened_brands = tuple(f"{name}#open{next(_ids)}" for name in names)
+        if stmt.pos is not None:
+            self.origins.update((label, stmt.pos) for label in labels)
         self.scopes[-1].brands.update(zip(names, labels))
         self.scopes[-1].opened.update(labels)
         payload = subst(package.body, {b: C.Skolem(l) for b, l in zip(package.binders, labels)})
@@ -522,7 +544,7 @@ class Infer:
                         case S.PArray(), C.Array(elem=elem, length=length) if length == len(elems):
                             actual = (elem,) * length
                         case _:
-                            fail(f"pattern does not match {show(zonk(ty))}", pos)
+                            fail(f"pattern does not match {self.shown(zonk(ty))}", pos)
                     for t, a in zip(types, actual):
                         self.unify(t, a, pos)
                 self.later(ty, known, pos)
@@ -535,7 +557,7 @@ class Infer:
                     self.require_visible_shape(ty, pos)
                     s = self.shape(ty, pos)
                     if not isinstance(s, C.Struct):
-                        fail(f"a struct pattern needs a struct, not {show(zonk(ty))}", pos)
+                        fail(f"a struct pattern needs a struct, not {self.shown(zonk(ty))}", pos)
                     fields = dict(s.fields)
                     for name, t in field_types.items():
                         if name not in fields:
@@ -621,7 +643,7 @@ class Infer:
             else:
                 valid = numeric
             if not valid:
-                fail(f"operator {op} is not defined for {show(ty)}", pos)
+                fail(f"operator {op} is not defined for {self.shown(ty)}", pos)
 
         self.later(operand, known, pos)
 
@@ -1074,7 +1096,7 @@ class Infer:
             elif isinstance(expr, S.Index) and isinstance(s, C.Tuple) and expr.index < len(s.elems):
                 self.unify(result, s.elems[expr.index], expr.pos)
             else:
-                fail(f"{show(zonk(owner))} has no component {expr.name if isinstance(expr, S.Field) else expr.index}", expr.pos)
+                fail(f"{self.shown(zonk(owner))} has no component {expr.name if isinstance(expr, S.Field) else expr.index}", expr.pos)
         self.later(owner, component, expr.pos)
         return self.record(expr, result)
 
@@ -1146,7 +1168,7 @@ class Infer:
                 expr.call = ValueCall(sub)
                 ptypes, places, ret = [subst(t, sub) for t in s.params], s.places, subst(s.ret, sub)
             else:
-                fail(f"{show(zonk(callee))} is not callable", expr.pos)
+                fail(f"{self.shown(zonk(callee))} is not callable", expr.pos)
             self.bind_operands(expr, got, ptypes, places)
             self.unify(result, ret, expr.pos)
         self.later(callee, known, expr.pos)
@@ -1350,7 +1372,7 @@ class Infer:
             candidates.extend(("method", self.sigs.sigs[d]) for d in self.r.attached.get((None, name), [])
                               if d.kind == "method" and self.blanket_visible(d, visible))
         if len(candidates) != 1:
-            fail(f"{show(t)} has {'no' if not candidates else 'several'} method {name}", pos)
+            fail(f"{self.shown(t)} has {'no' if not candidates else 'several'} method {name}", pos)
         return candidates[0]
 
     def visible_traits(self, module: C.ModuleId) -> set[Decl]:

@@ -1193,6 +1193,7 @@ SIGNATURE_ERRORS = (
     "forall T where Copy[T]. struct B { a: T }\nstruct L! { x: u32 }\nfn f(b: B[L]) {}\n",
     "trait Show { fn show(x: Self) -> u32; }\nforall T where Show[T]. trait Bad { fn bad(x: T) -> u32; }\n",
     "trait Show { fn show(x: Self, f: closure(u32) -> u32) -> u32; }\n",
+    'extern "C" fn take(f: closure(u32) -> u32) -> u32;\n',
     "fn f(self) -> u32 { 0u32 }\n",
     "fn g() {}\nexposed(package::g) struct S { a: u32 }\n",
     "forall T. struct R { r: *R[(T, T)] }\n",

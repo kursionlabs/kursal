@@ -34,7 +34,7 @@ use package::sigs::signatures::{ConstValue, InstanceSig, Sig, Signatures, const_
 use package::syntax::ast as S;
 use package::syntax::ast::{Expr, Pattern, Pos, Statement, no_pos};
 use package::types::termination::check_instance_termination;
-use package::types::ops::{Fresh, Types, equal, foreach_binders, free_brands, free_names, show, subst};
+use package::types::ops::{Fresh, Surface, Types, brand_differences, equal, foreach_binders, free_brands, free_names, subst, surface};
 use package::types::unify::{instantiate, match_head, prune, unify, zonk};
 use std::collections::hashmap::OwnedMap!;
 use std::collections::vec::{OwnedVec!, Popped!};
@@ -519,6 +519,8 @@ exposed struct Infer {
     // `&` lends
     generic: ArenaSet[u32, 'k],
     lend_marked: ArenaSet[u32, 'k],
+    // an opened brand's label -> where its `let exists` is
+    origins: ArenaMap[Span['k], Pos, 'k],
 }
 
 forall 'k.
@@ -537,11 +539,12 @@ impl Infer['k] {
             i = i + 1usize;
         }
         check_instance_termination(&cx, headers, files);
-        check_coherence(&cx, ranges, counter, files);
+        check_coherence(&cx, ranges, counter, files, true);
         let program = Program.{ types: sigs.types, funs: ArenaMap::new(&cx), externs: ArenaMap::new(&cx), datas: ArenaMap::new(&cx), traits: sigs.traits, instances: ArenaMap::new(&cx) };
         let inf = Infer.{
             r, sigs, types: Types::new(&cx, program, counter), decl_of: ArenaMap::new(&cx), inputs: ArenaMap::new(&cx), instances: ArenaMap::new(&cx),
             visible: ArenaMap::new(&cx), ids: Ref::new(&cx, 0u32), counter, out: new_results(&cx), generic: ArenaSet::new(&cx), lend_marked: ArenaSet::new(&cx),
+            origins: ArenaMap::new(&cx),
         };
         let scopes = r.scopes.values(&cx);
         i = 0usize;
@@ -880,7 +883,7 @@ impl Body['k] {
                 k = k + 1usize;
             }
             let unit = match least {
-                Option::Some(b) => self.fail(&cx, Buffer!::new().push_static("brand ").push_bytes(&cx, b).push_static(" escapes its lexical scope").save(&cx), pos),
+                Option::Some(b) => self.fail(&cx, Buffer!::new().push_static("brand ").push_bytes(&cx, self.shown(&cx, Type::Skolem.(b))).push_static(" escapes its lexical scope").save(&cx), pos),
                 Option::None => (),
             };
             i = i + 1usize;
@@ -1068,9 +1071,44 @@ impl Body['k] {
 
     fn unify_at(self, &cx: Domain!['k], a: Type['k], b: Type['k], pos: Pos) {
         if !unify(&cx, a, b, false, self.inf.counter) {
-            self.fail(&cx, Buffer!::new().push_static("type mismatch: ").push_bytes(&cx, show(&cx, zonk(&cx, a))).push_static(" and ").push_bytes(&cx, show(&cx, zonk(&cx, b))).save(&cx), pos);
+            self.fail(&cx, self.mismatch(&cx, zonk(&cx, a), zonk(&cx, b)), pos);
         }
         self.solve(&cx);
+    }
+
+    // Why `a` and `b` failed to unify. Unification is symmetric and its callers pass the two sides
+    // in no fixed order, so the message names neither as the expected one. Types that differ only
+    // in brands are a brand mismatch, which says where a `let exists` opened each brand that
+    // differs.
+    fn mismatch(self, &cx: Domain!['k], a: Type['k], b: Type['k]) -> Span['k] {
+        let origins = self.inf.origins;
+        let spelling = surface(&cx, ArenaVec::two(&cx, a, b), origins);
+        let brands = match brand_differences(&cx, a, b) {
+            Option::Some(found) => found,
+            Option::None => ArenaVec::new(&cx),
+        };
+        var out = Buffer!::new().push_static(if brands.is_empty(&cx) { "type mismatch: " } else { "brand mismatch: " })
+            .push_bytes(&cx, spelling.show(&cx, a)).push_static(" and ").push_bytes(&cx, spelling.show(&cx, b));
+        var listed = 0usize;
+        var i = 0usize;
+        while i < brands.len(&cx) {
+            let label = brands.at(&cx, i);
+            let unit = match origins.get(&cx, label) {
+                Option::Some(at) => if !spelling.qualified.contains(&cx, label) {
+                    out = out.push_static(if listed == 0usize { "; " } else { ", " }).push_bytes(&cx, spelling.brand(&cx, label))
+                        .push_static(if listed == 0usize { " was opened at " } else { " at " }).push_u64(at.line as u64).push_static(":").push_u64(at.col as u64);
+                    listed = listed + 1usize;
+                },
+                Option::None => (),
+            };
+            i = i + 1usize;
+        }
+        out.save(&cx)
+    }
+
+    // `ty` as a message writes it.
+    fn shown(self, &cx: Domain!['k], ty: Type['k]) -> Span['k] {
+        surface(&cx, ArenaVec::one(&cx, ty), self.inf.origins).show(&cx, ty)
     }
 
     fn coerce(self, &cx: Domain!['k], actual: Type['k], expected: Option[Type['k]], pos: Pos) {
@@ -1198,12 +1236,19 @@ impl Body['k] {
         }
         if found.len(&cx) != 1usize {
             var shown = Buffer!::new().push_static(if found.is_empty(&cx) { "no" } else { "several" }).push_static(" instance of ").push_bytes(&cx, trait_name).push_static("[");
+            let concrete: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
             var k = 0usize;
             while k < args.len(&cx) {
+                concrete.push(&cx, zonk(&cx, args.at(&cx, k)));
+                k = k + 1usize;
+            }
+            let spelling = surface(&cx, concrete, self.inf.origins);
+            k = 0usize;
+            while k < concrete.len(&cx) {
                 if k > 0usize {
                     shown = shown.push_static(", ");
                 }
-                shown = shown.push_bytes(&cx, show(&cx, zonk(&cx, args.at(&cx, k))));
+                shown = shown.push_bytes(&cx, spelling.show(&cx, concrete.at(&cx, k)));
                 k = k + 1usize;
             }
             self.fail(&cx, shown.push_static("]").save(&cx), pos);
@@ -1466,7 +1511,7 @@ impl Body['k] {
         };
         let (binders, body) = match opened {
             Option::Some(pair) => pair,
-            Option::None => self.fail(&cx, Buffer!::new().push_static("let exists opens ").push_usize(l.brands.len(&cx)).push_static(" brands of ").push_bytes(&cx, show(&cx, zonk(&cx, package))).save(&cx), l.pos),
+            Option::None => self.fail(&cx, Buffer!::new().push_static("let exists opens ").push_usize(l.brands.len(&cx)).push_static(" brands of ").push_bytes(&cx, self.shown(&cx, zonk(&cx, package))).save(&cx), l.pos),
         };
         let names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         let distinct: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
@@ -1489,6 +1534,9 @@ impl Body['k] {
             labels.push(&cx, label);
             level.brands.insert(&cx, names.at(&cx, i), label);
             level.opened.insert(&cx, label);
+            if l.pos.line != 0u32 {
+                self.inf.origins.insert(&cx, label, l.pos);
+            }
             self.allowed.set(&cx, Option::None);
             sub.insert(&cx, binders.at(&cx, i), Type::Skolem.(label));
             i = i + 1usize;
@@ -1581,7 +1629,7 @@ impl Body['k] {
             }
         };
         if !fits {
-            self.fail(&cx, Buffer!::new().push_static("pattern does not match ").push_bytes(&cx, show(&cx, zonk(&cx, e.ty))).save(&cx), pos);
+            self.fail(&cx, Buffer!::new().push_static("pattern does not match ").push_bytes(&cx, self.shown(&cx, zonk(&cx, e.ty))).save(&cx), pos);
         }
         var i = 0usize;
         while i < actual.len(&cx) {
@@ -1594,7 +1642,7 @@ impl Body['k] {
         self.require_visible_shape(&cx, f.ty, pos);
         let fields = match self.shape(&cx, f.ty, pos) {
             Type::Struct(fields) => fields,
-            _ => self.fail(&cx, Buffer!::new().push_static("a struct pattern needs a struct, not ").push_bytes(&cx, show(&cx, zonk(&cx, f.ty))).save(&cx), pos),
+            _ => self.fail(&cx, Buffer!::new().push_static("a struct pattern needs a struct, not ").push_bytes(&cx, self.shown(&cx, zonk(&cx, f.ty))).save(&cx), pos),
         };
         let by_name: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
         var i = 0usize;
@@ -1742,7 +1790,7 @@ impl Body['k] {
             numeric
         };
         if !valid {
-            self.fail(&cx, Buffer!::new().push_static("operator ").push_bytes(&cx, op).push_static(" is not defined for ").push_bytes(&cx, show(&cx, ty)).save(&cx), pos);
+            self.fail(&cx, Buffer!::new().push_static("operator ").push_bytes(&cx, op).push_static(" is not defined for ").push_bytes(&cx, self.shown(&cx, ty)).save(&cx), pos);
         }
     }
 
@@ -2645,7 +2693,7 @@ impl Body['k] {
             Option::Some(name) => name,
             Option::None => Buffer!::new().push_usize(c.index).save(&cx),
         };
-        self.fail(&cx, Buffer!::new().push_bytes(&cx, show(&cx, zonk(&cx, c.owner))).push_static(" has no component ").push_bytes(&cx, what).save(&cx), pos)
+        self.fail(&cx, Buffer!::new().push_bytes(&cx, self.shown(&cx, zonk(&cx, c.owner))).push_static(" has no component ").push_bytes(&cx, what).save(&cx), pos)
     }
 
     fn is_place(self, &cx: Domain!['k], e: Expr['k]) -> bool {
@@ -2783,7 +2831,7 @@ impl Body['k] {
                     places.append(&cx, f.places);
                     subst(&cx, f.ret.copy(&cx), sub, self.inf.counter)
                 },
-                _ => self.fail(&cx, Buffer!::new().push_bytes(&cx, show(&cx, zonk(&cx, w.callee))).push_static(" is not callable").save(&cx), pos),
+                _ => self.fail(&cx, Buffer!::new().push_bytes(&cx, self.shown(&cx, zonk(&cx, w.callee))).push_static(" is not callable").save(&cx), pos),
             },
         };
         self.bind_operands(&cx, w.call, w.got, ptypes, places);
@@ -3189,7 +3237,7 @@ impl Body['k] {
             }
         }
         if candidates.len(&cx) != 1usize {
-            self.fail(&cx, Buffer!::new().push_bytes(&cx, show(&cx, t)).push_static(" has ").push_static(if candidates.is_empty(&cx) { "no" } else { "several" }).push_static(" method ").push_bytes(&cx, name).save(&cx), pos);
+            self.fail(&cx, Buffer!::new().push_bytes(&cx, self.shown(&cx, t)).push_static(" has ").push_static(if candidates.is_empty(&cx) { "no" } else { "several" }).push_static(" method ").push_bytes(&cx, name).save(&cx), pos);
         }
         candidates.at(&cx, 0usize)
     }

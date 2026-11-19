@@ -400,6 +400,8 @@ class Signatures:
                 places.add(k)
         implicit = tuple(scope.implicit)
         scope.implicit = None
+        if implicit and isinstance(node, S.Extern):
+            fail(f"a closure parameter of extern {node.name} needs [Env]", node.pos)
         ret = C.UNIT if node.ret is None else self.type(node.ret, scope)
         if name is None:
             assert isinstance(decl, Decl)

@@ -35,7 +35,7 @@ from .infer import (POINTER_OPS, BuiltinCall, ClosureCall, FnCall, FStringWrite,
 from .sexpr import KursError, List, Position, Str
 from .sigs import OPERATORS, ConstValue, OpConst, Sig, Signatures
 from .resolve import Resolver
-from .types import equal, foreach_binders, foreach_item, Types, free_brands, subst
+from .types import brand_name, equal, foreach_binders, foreach_item, Types, free_brands, subst
 
 ORDERINGS = {"Relaxed": "relaxed", "Acquire": "acquire", "Release": "release", "AcqRel": "acq_rel",
              "SeqCst": "seq_cst"}
@@ -503,7 +503,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         allowed = {p.name for p in self.sig.params if p.kind == C.BRAND} | {"static"} | set(local_brands)
         local = free_brands(ty) - allowed
         if local:
-            fail(f"a closure or foreach body cannot mention the block-local brand {min(local)}", self.pos)
+            fail(f"a closure or foreach body cannot mention the block-local brand {brand_name(min(local))}", self.pos)
 
     # ---- expressions
     def expr(self, expr: S.Expr) -> Optional[str]:

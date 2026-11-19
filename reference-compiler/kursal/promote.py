@@ -14,6 +14,7 @@ from itertools import count
 from . import core as C
 from .sexpr import KursError
 from .check import ancestor_in, overlap
+from .placeflow import place_name
 from .types import Types, free_brands, subst
 
 
@@ -38,7 +39,7 @@ def promote_locals(fun: C.Fun, types: Types, params: Sequence[C.Param],
         return path.split('.', 1)[0] in roots
 
     def unsupported(path: str) -> None:
-        raise KursError(f"frontend limitation: locally branded value {path} requires "
+        raise KursError(f"frontend limitation: locally branded value '{place_name(path)}' requires "
                         "structural SSA lowering; pass it by value to a generic function", fun.pos)
 
     helpers: list[C.Fun] = []
@@ -152,7 +153,7 @@ def promote_locals(fun: C.Fun, types: Types, params: Sequence[C.Param],
 
         def read(path: str) -> str:
             if path not in contents:
-                raise KursError(f"locally branded value {path} is unavailable", fun.pos)
+                raise KursError(f"locally branded value '{place_name(path)}' is unavailable", fun.pos)
             return contents[path]
 
         def materialize(path: str) -> None:

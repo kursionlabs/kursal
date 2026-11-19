@@ -32,6 +32,47 @@ use std::collections::vec::{OwnedVec!, Popped!};
 use std::option::{Option, Result};
 use std::slice::Slice;
 
+// A place's root and its fields, from the first `.`, without the `&` a local's name starts with.
+forall 'k.
+fn place_parts(&cx: Domain!['k], path: Span['k]) -> (Span['k], Span['k]) {
+    let stripped = if path.starts_with(&cx, Span::from_static(&cx, "&")) { path.skip(1usize) } else { path };
+    match stripped.find_byte(&cx, b'.', 0usize) {
+        Option::Some(at) => (stripped.take(at), stripped.skip(at)),
+        Option::None => (stripped, Span::from_static(&cx, "")),
+    }
+}
+
+// How a message names the place `path`: its variable and fields, or a temporary expression result.
+forall 'k.
+fn place_name(&cx: Domain!['k], path: Span['k]) -> Span['k] {
+    let (root, fields) = place_parts(&cx, path);
+    let name = if root.starts_with(&cx, Span::from_static(&cx, "#tmp")) {
+        Span::from_static(&cx, "temporary expression result")
+    } else {
+        match root.find_byte(&cx, b'#', 0usize) {
+            Option::Some(at) => root.take(at),
+            Option::None => root,
+        }
+    };
+    Buffer!::new().push_bytes(&cx, name).push_bytes(&cx, fields).save(&cx)
+}
+
+// How a message names the function `name`: a closure or foreach body lifted out of a function by
+// that function's name.
+forall 'k.
+fn function_name(&cx: Domain!['k], name: Span['k]) -> Span['k] {
+    var end = name.len();
+    let unit = match name.find(&cx, Span::from_static(&cx, "#closure"), 0usize) {
+        Option::Some(at) => { end = at; },
+        Option::None => (),
+    };
+    let unit = match name.find(&cx, Span::from_static(&cx, "#foreach"), 0usize) {
+        Option::Some(at) => if at < end { end = at; },
+        Option::None => (),
+    };
+    name.take(end)
+}
+
 // The state of planning one function.
 forall 'k.
 exposed struct Plan {
@@ -679,23 +720,10 @@ impl PlaceFlow['k] {
     // Stops with `message` about the place `path`: the message reads `before`, the variable's name,
     // then `after`.
     fn ownership_error(self, &cx: Domain!['k], path: Span['k], before: Slice[u8, 'static], after: Span['k], pos: Pos, origin: bool) -> ! {
-        let stripped = path.skip(1usize);
-        let (root, fields) = match stripped.find(&cx, Span::from_static(&cx, "."), 0usize) {
-            Option::Some(at) => (stripped.slice(0usize, at), stripped.skip(at)),
-            Option::None => (stripped, Span::from_static(&cx, "")),
-        };
-        let temporary = root.starts_with(&cx, Span::from_static(&cx, "#tmp"));
-        let name = if temporary {
-            Span::from_static(&cx, "temporary expression result")
-        } else {
-            match root.find(&cx, Span::from_static(&cx, "#"), 0usize) {
-                Option::Some(at) => root.slice(0usize, at),
-                Option::None => root,
-            }
-        };
+        let (root, _fields) = place_parts(&cx, path);
         let fun = self.fun(&cx);
         var at = pos;
-        if temporary || origin {
+        if root.starts_with(&cx, Span::from_static(&cx, "#tmp")) || origin {
             at = match self.origins.copy(&cx).get(&cx, Buffer!::new().push_static("&").push_bytes(&cx, root).save(&cx)) {
                 Option::Some(p) => p,
                 Option::None => Pos.{ line: 0u32, col: 0u32 },
@@ -707,7 +735,7 @@ impl PlaceFlow['k] {
                 at = pos;
             }
         }
-        self.r.fail(&cx, Buffer!::new().push_bytes(&cx, fun.name).push_static(": ").push_static(before).push_bytes(&cx, name).push_bytes(&cx, fields).push_bytes(&cx, after).save(&cx), at)
+        self.r.fail(&cx, Buffer!::new().push_bytes(&cx, function_name(&cx, fun.name)).push_static(": ").push_static(before).push_bytes(&cx, place_name(&cx, path)).push_bytes(&cx, after).save(&cx), at)
     }
 
     // Replays the finalized headers for source diagnostics, without checking SSA. Do not diagnose

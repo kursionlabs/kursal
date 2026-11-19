@@ -22,6 +22,18 @@ class OwnershipError(KursError):
     """A source ownership diagnostic, not a core assertion failure."""
 
 
+def place_name(path: str) -> str:
+    """How a message names the place `path`: its variable and fields, or a temporary expression result."""
+    root, dot, fields = path.removeprefix("&").partition(".")
+    return ("temporary expression result" if root.startswith("#tmp") else root.split("#", 1)[0]) + dot + fields
+
+
+def function_name(name: str) -> str:
+    """How a message names the function `name`: a closure or foreach body lifted out of a function by that
+    function's name."""
+    return name[:min((name.index(mark) for mark in ("#closure", "#foreach") if mark in name), default=len(name))]
+
+
 class PlaceFlow(Checker):
     """Computes each block's declared place state (`empty`, `known`, `opened`) by a
     forward dataflow over the finished graph, tracking the place effects of
@@ -139,12 +151,10 @@ class PlaceFlow(Checker):
         return True
 
     def ownership_error(self, path: str, message: str, pos: Optional[Position], *, origin: bool = False) -> Never:
-        root, dot, fields = path.removeprefix("&").partition(".")
-        temporary = root.startswith("#tmp")
-        name = ("temporary expression result" if temporary else root.split("#", 1)[0]) + dot + fields
-        if temporary or origin:
+        root = path.removeprefix("&").partition(".")[0]
+        if root.startswith("#tmp") or origin:
             pos = self.origins.get("&" + root) or self.fun.pos or pos
-        raise OwnershipError(f"{self.fun.name}: {message.format(name=name)}", pos)
+        raise OwnershipError(f"{function_name(self.fun.name)}: {message.format(name=place_name(path))}", pos)
 
     def diagnose_places(self, fun: C.Fun, reachable: set[str]) -> None:
         """Replay finalized headers for source diagnostics, without checking SSA.

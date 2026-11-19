@@ -1514,54 +1514,185 @@ fn sorted_kinds(&cx: Domain!['k], kinds: ArenaMap[Span['k], Kind, 'k]) -> ArenaV
 
 // ------------------------------------------------------------------- show --
 
+// `ty` as KURS writes it, a brand as `$label`: for messages about KURS, and for dumps.
 forall 'k.
-fn show_all(&cx: Domain!['k], out: Buffer!, ts: ArenaVec[Type['k], 'k]) -> Buffer! {
+fn show(&cx: Domain!['k], ty: Type['k]) -> Span['k] {
+    render(&cx, ty, Option::None)
+}
+
+// Types as a message about source writes them. A brand reads as written, `'k`; a name the compiler
+// made reads as the name it was made from (`'b` for the brand `b#open9` that `let exists 'b.` opened,
+// `Env` for a closure's environment `Env#1`), or `_` when it was made from none; a place parameter
+// of a function type reads `(& T)`.
+//
+// One `Surface` writes every type of one message. Where two different brands in it would read the
+// same, each that a `let exists` opened, at a position in `origins`, says where:
+// `'k (opened at 15:9)`.
+forall 'k.
+exposed struct Surface {
+    origins: ArenaMap[Span['k], Pos, 'k],
+    // the brands written with where they were opened
+    qualified: ArenaSet[Span['k], 'k],
+}
+
+forall 'k.
+fn surface(&cx: Domain!['k], types: ArenaVec[Type['k], 'k], origins: ArenaMap[Span['k], Pos, 'k]) -> Surface['k] {
+    let labels: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+    var i = 0usize;
+    while i < types.len(&cx) {
+        brand_labels(&cx, types.at(&cx, i), labels);
+        i = i + 1usize;
+    }
+    let all = labels.keys(&cx);
+    let spellings: ArenaMap[Span['k], usize, 'k] = ArenaMap::new(&cx);
+    i = 0usize;
+    while i < all.len(&cx) {
+        let name = made_from(&cx, all.at(&cx, i));
+        spellings.insert(&cx, name, spellings.get_or(&cx, name, 0usize) + 1usize);
+        i = i + 1usize;
+    }
+    let qualified: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+    i = 0usize;
+    while i < all.len(&cx) {
+        let label = all.at(&cx, i);
+        if spellings.at(&cx, made_from(&cx, label)) > 1usize && origins.contains(&cx, label) {
+            qualified.insert(&cx, label);
+        }
+        i = i + 1usize;
+    }
+    Surface.{ origins, qualified }
+}
+
+forall 'k.
+impl Surface['k] {
+    fn brand(self, &cx: Domain!['k], label: Span['k]) -> Span['k] {
+        let name = brand_name(&cx, label);
+        if self.qualified.contains(&cx, label) {
+            let at = self.origins.at(&cx, label);
+            Buffer!::new().push_bytes(&cx, name).push_static(" (opened at ").push_u64(at.line as u64).push_static(":").push_u64(at.col as u64)
+                .push_static(")").save(&cx)
+        } else {
+            name
+        }
+    }
+
+    fn show(self, &cx: Domain!['k], ty: Type['k]) -> Span['k] {
+        render(&cx, ty, Option::Some.(self))
+    }
+}
+
+// The brand `label` as written in source, as `Surface` writes it where no other brand reads the same.
+forall 'k.
+fn brand_name(&cx: Domain!['k], label: Span['k]) -> Span['k] {
+    Buffer!::new().push_static("'").push_bytes(&cx, made_from(&cx, label)).save(&cx)
+}
+
+// The name a compiler-made name `name#...` was made from; a source name is its own.
+forall 'k.
+fn made_from(&cx: Domain!['k], name: Span['k]) -> Span['k] {
+    match name.find_byte(&cx, b'#', 0usize) {
+        Option::Some(at) => name.take(at),
+        Option::None => name,
+    }
+}
+
+// A type variable as a message writes it; a nominal type's path is its own.
+forall 'k.
+fn variable(&cx: Domain!['k], name: Span['k]) -> Span['k] {
+    if name.contains(&cx, Span::from_static(&cx, "::")) || name.find_byte(&cx, b'#', 0usize).is_none() {
+        return name;
+    }
+    let base = made_from(&cx, name);
+    if base.is_empty() { Span::from_static(&cx, "_") } else { base }
+}
+
+forall 'k.
+fn brand_labels(&cx: Domain!['k], ty: Type['k], out: ArenaSet[Span['k], 'k]) {
+    let unit = match ty {
+        Type::Skolem(label) => { out.insert(&cx, label); },
+        Type::Exists(binders, _body) => {
+            var i = 0usize;
+            while i < binders.len(&cx) {
+                out.insert(&cx, binders.at(&cx, i));
+                i = i + 1usize;
+            }
+        },
+        _ => (),
+    };
+    let parts = children(&cx, ty);
+    var i = 0usize;
+    while i < parts.len(&cx) {
+        brand_labels(&cx, parts.at(&cx, i), out);
+        i = i + 1usize;
+    }
+}
+
+// A brand, written by `surface` or else as KURS writes it.
+forall 'k.
+fn render_brand(&cx: Domain!['k], label: Span['k], surface: Option[Surface['k]]) -> Span['k] {
+    match surface {
+        Option::Some(s) => s.brand(&cx, label),
+        Option::None => Buffer!::new().push_static("$").push_bytes(&cx, label).save(&cx),
+    }
+}
+
+// A type variable, written by `surface` or else as KURS writes it.
+forall 'k.
+fn render_variable(&cx: Domain!['k], name: Span['k], surface: Option[Surface['k]]) -> Span['k] {
+    match surface {
+        Option::Some(_s) => variable(&cx, name),
+        Option::None => name,
+    }
+}
+
+forall 'k.
+fn render_all(&cx: Domain!['k], out: Buffer!, ts: ArenaVec[Type['k], 'k], surface: Option[Surface['k]]) -> Buffer! {
     var out = out;
     var i = 0usize;
     while i < ts.len(&cx) {
         if i > 0usize {
             out = out.push_static(" ");
         }
-        out = out.push_bytes(&cx, show(&cx, ts.at(&cx, i)));
+        out = out.push_bytes(&cx, render(&cx, ts.at(&cx, i), surface));
         i = i + 1usize;
     }
     out
 }
 
 forall 'k.
-fn show_members(&cx: Domain!['k], out: Buffer!, ms: ArenaVec[Member['k], 'k]) -> Buffer! {
+fn render_members(&cx: Domain!['k], out: Buffer!, ms: ArenaVec[Member['k], 'k], surface: Option[Surface['k]]) -> Buffer! {
     var out = out;
     var i = 0usize;
     while i < ms.len(&cx) {
         if i > 0usize {
             out = out.push_static(" ");
         }
-        out = out.push_static("(").push_bytes(&cx, ms.at(&cx, i).name).push_static(" ").push_bytes(&cx, show(&cx, ms.at(&cx, i).type)).push_static(")");
+        out = out.push_static("(").push_bytes(&cx, ms.at(&cx, i).name).push_static(" ").push_bytes(&cx, render(&cx, ms.at(&cx, i).type, surface)).push_static(")");
         i = i + 1usize;
     }
     out
 }
 
 forall 'k.
-fn show(&cx: Domain!['k], ty: Type['k]) -> Span['k] {
+fn render(&cx: Domain!['k], ty: Type['k], surface: Option[Surface['k]]) -> Span['k] {
     match ty {
         Type::Prim(name) => name,
         Type::Never => Span::from_static(&cx, "!"),
         Type::Named(name, args) => {
             if args.is_empty(&cx) {
-                name
+                render_variable(&cx, name, surface)
             } else {
-                show_all(&cx, Buffer!::new().push_static("(").push_bytes(&cx, name).push_static(" "), args).push_static(")").save(&cx)
+                render_all(&cx, Buffer!::new().push_static("(").push_bytes(&cx, name).push_static(" "), args, surface).push_static(")").save(&cx)
             }
         },
-        Type::Skolem(label) => Buffer!::new().push_static("$").push_bytes(&cx, label).save(&cx),
-        Type::Brand(brand) => Buffer!::new().push_static("(brand ").push_bytes(&cx, show(&cx, brand.copy(&cx))).push_static(")").save(&cx),
-        Type::Ptr(inner) => Buffer!::new().push_static("(ptr ").push_bytes(&cx, show(&cx, inner.copy(&cx))).push_static(")").save(&cx),
-        Type::NonNull(inner) => Buffer!::new().push_static("(non_null ").push_bytes(&cx, show(&cx, inner.copy(&cx))).push_static(")").save(&cx),
-        Type::Tuple(elems) => replace_all(&cx, show_all(&cx, Buffer!::new().push_static("(tuple "), elems).push_static(")").save(&cx), Span::from_static(&cx, " )"), Span::from_static(&cx, ")")),
-        Type::Array(elem, length) => Buffer!::new().push_static("(array ").push_bytes(&cx, show(&cx, elem.copy(&cx))).push_static(" ").push_u64(length).push_static(")").save(&cx),
-        Type::Struct(fields) => show_members(&cx, Buffer!::new().push_static("(struct "), fields).push_static(")").save(&cx),
-        Type::Enum(variants) => show_members(&cx, Buffer!::new().push_static("(enum "), variants).push_static(")").save(&cx),
+        Type::Skolem(label) => render_brand(&cx, label, surface),
+        Type::Brand(brand) => Buffer!::new().push_static("(brand ").push_bytes(&cx, render(&cx, brand.copy(&cx), surface)).push_static(")").save(&cx),
+        Type::Ptr(inner) => Buffer!::new().push_static("(ptr ").push_bytes(&cx, render(&cx, inner.copy(&cx), surface)).push_static(")").save(&cx),
+        Type::NonNull(inner) => Buffer!::new().push_static("(non_null ").push_bytes(&cx, render(&cx, inner.copy(&cx), surface)).push_static(")").save(&cx),
+        Type::Tuple(elems) => replace_all(&cx, render_all(&cx, Buffer!::new().push_static("(tuple "), elems, surface).push_static(")").save(&cx), Span::from_static(&cx, " )"), Span::from_static(&cx, ")")),
+        Type::Array(elem, length) => Buffer!::new().push_static("(array ").push_bytes(&cx, render(&cx, elem.copy(&cx), surface)).push_static(" ").push_u64(length).push_static(")").save(&cx),
+        Type::Struct(fields) => render_members(&cx, Buffer!::new().push_static("(struct "), fields, surface).push_static(")").save(&cx),
+        Type::Enum(variants) => render_members(&cx, Buffer!::new().push_static("(enum "), variants, surface).push_static(")").save(&cx),
         Type::Exists(binders, body) => {
             var out = Buffer!::new().push_static("(exists (");
             var i = 0usize;
@@ -1569,19 +1700,19 @@ fn show(&cx: Domain!['k], ty: Type['k]) -> Span['k] {
                 if i > 0usize {
                     out = out.push_static(" ");
                 }
-                out = out.push_static("$").push_bytes(&cx, binders.at(&cx, i));
+                out = out.push_bytes(&cx, render_brand(&cx, binders.at(&cx, i), surface));
                 i = i + 1usize;
             }
-            out.push_static(") ").push_bytes(&cx, show(&cx, body.copy(&cx))).push_static(")").save(&cx)
+            out.push_static(") ").push_bytes(&cx, render(&cx, body.copy(&cx), surface)).push_static(")").save(&cx)
         },
         Type::Foreach(f) => {
             var out = Buffer!::new().push_static("(foreach (");
             if f.indirect {
-                out = out.push_static("(ptr ").push_bytes(&cx, f.binder).push_static(")");
+                out = out.push_static("(ptr ").push_bytes(&cx, render_variable(&cx, f.binder, surface)).push_static(")");
             } else {
-                out = out.push_bytes(&cx, f.binder);
+                out = out.push_bytes(&cx, render_variable(&cx, f.binder, surface));
             }
-            out = out.push_static(" ").push_bytes(&cx, show(&cx, f.source.copy(&cx))).push_static(") ").push_bytes(&cx, show(&cx, f.body.copy(&cx)));
+            out = out.push_static(" ").push_bytes(&cx, render(&cx, f.source.copy(&cx), surface)).push_static(") ").push_bytes(&cx, render(&cx, f.body.copy(&cx), surface));
             let inferred = match f.source.copy(&cx) {
                 Type::Foreach(source) => foreach_binders(&cx, source),
                 _ => ArenaVec::new(&cx),
@@ -1593,7 +1724,7 @@ fn show(&cx: Domain!['k], ty: Type['k]) -> Span['k] {
                     if i > 0usize {
                         out = out.push_static(" ");
                     }
-                    out = out.push_bytes(&cx, f.retained.at(&cx, i));
+                    out = out.push_bytes(&cx, render_variable(&cx, f.retained.at(&cx, i), surface));
                     i = i + 1usize;
                 }
                 out = out.push_static(")");
@@ -1605,8 +1736,142 @@ fn show(&cx: Domain!['k], ty: Type['k]) -> Span['k] {
             if f.is_unsafe {
                 out = out.push_static("(unsafe) ");
             }
-            show_all(&cx, out.push_static("("), f.params).push_static(") ").push_bytes(&cx, show(&cx, f.ret.copy(&cx))).push_static(")").save(&cx)
+            out = out.push_static("(");
+            var i = 0usize;
+            while i < f.params.len(&cx) {
+                if i > 0usize {
+                    out = out.push_static(" ");
+                }
+                let param = render(&cx, f.params.at(&cx, i), surface);
+                if surface.is_some() && f.places.contains(&cx, i) {
+                    out = out.push_static("(& ").push_bytes(&cx, param).push_static(")");
+                } else {
+                    out = out.push_bytes(&cx, param);
+                }
+                i = i + 1usize;
+            }
+            out.push_static(") ").push_bytes(&cx, render(&cx, f.ret.copy(&cx), surface)).push_static(")").save(&cx)
         },
         _ => Span::from_static(&cx, "_"),
+    }
+}
+
+// When `a` and `b` differ only in brands, as `equal` compares them: the brand labels where they
+// differ, in the order met, each pair's left one first. None when they differ in more than brands.
+forall 'k.
+fn brand_differences(&cx: Domain!['k], a: Type['k], b: Type['k]) -> Option[ArenaVec[Span['k], 'k]] {
+    let found: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+    if differ_in(&cx, a, b, alpha(), found) { Option::Some.(found) } else { Option::None }
+}
+
+forall 'k.
+fn note_brand(&cx: Domain!['k], found: ArenaVec[Span['k], 'k], label: Span['k]) {
+    if !found.contains(&cx, label) {
+        found.push(&cx, label);
+    }
+}
+
+forall 'k.
+fn differ_all(&cx: Domain!['k], xs: ArenaVec[Type['k], 'k], ys: ArenaVec[Type['k], 'k], env: Alpha['k], found: ArenaVec[Span['k], 'k]) -> bool {
+    var ok = xs.len(&cx) == ys.len(&cx);
+    var i = 0usize;
+    while ok && i < xs.len(&cx) {
+        ok = differ_in(&cx, xs.at(&cx, i), ys.at(&cx, i), env, found);
+        i = i + 1usize;
+    }
+    ok
+}
+
+forall 'k.
+fn differ_members(&cx: Domain!['k], xs: ArenaVec[Member['k], 'k], ys: ArenaVec[Member['k], 'k], env: Alpha['k], found: ArenaVec[Span['k], 'k]) -> bool {
+    var ok = xs.len(&cx) == ys.len(&cx);
+    var i = 0usize;
+    while ok && i < xs.len(&cx) {
+        ok = xs.at(&cx, i).name.eq(&cx, ys.at(&cx, i).name);
+        i = i + 1usize;
+    }
+    ok && differ_all(&cx, member_types(&cx, xs), member_types(&cx, ys), env, found)
+}
+
+// `equal_in`, except that two brands that differ are noted in `found` rather than unequal.
+forall 'k.
+fn differ_in(&cx: Domain!['k], a: Type['k], b: Type['k], env: Alpha['k], found: ArenaVec[Span['k], 'k]) -> bool {
+    if type_tag(a) != type_tag(b) {
+        return false;
+    }
+    match a {
+        Type::Skolem(x) => match b {
+            Type::Skolem(y) => {
+                if !same_name(&cx, env, x, y) {
+                    note_brand(&cx, found, x);
+                    note_brand(&cx, found, y);
+                }
+                true
+            },
+            _ => false,
+        },
+        Type::Named(x, xs) => match b {
+            Type::Named(y, ys) => {
+                if xs.is_empty(&cx) && ys.is_empty(&cx) && binds(&cx, env, x, y) {
+                    same_name(&cx, env, x, y)
+                } else {
+                    x.eq(&cx, y) && differ_all(&cx, xs, ys, env, found)
+                }
+            },
+            _ => false,
+        },
+        Type::Exists(xs, p) => match b {
+            Type::Exists(ys, q) => xs.len(&cx) == ys.len(&cx) && differ_in(&cx, p.copy(&cx), q.copy(&cx), bind(&cx, env, xs, ys), found),
+            _ => false,
+        },
+        Type::Foreach(x) => match b {
+            Type::Foreach(y) => {
+                let xb = foreach_binders(&cx, x);
+                let yb = foreach_binders(&cx, y);
+                x.indirect == y.indirect && differ_in(&cx, x.source.copy(&cx), y.source.copy(&cx), env, found) && xb.len(&cx) == yb.len(&cx)
+                    && differ_in(&cx, x.body.copy(&cx), y.body.copy(&cx), bind(&cx, env, xb, yb), found)
+            },
+            _ => false,
+        },
+        Type::Fn(x) => match b {
+            Type::Fn(y) => {
+                if x.is_unsafe != y.is_unsafe || !x.places.eq(&cx, y.places) || x.params.len(&cx) != y.params.len(&cx)
+                    || x.quantified.len(&cx) != y.quantified.len(&cx) || !same_kinds(&cx, x.quantified, y.quantified) {
+                    return false;
+                }
+                let inner = bind(&cx, env, param_names(&cx, x.quantified), param_names(&cx, y.quantified));
+                differ_all(&cx, x.params, y.params, inner, found) && differ_in(&cx, x.ret.copy(&cx), y.ret.copy(&cx), inner, found)
+            },
+            _ => false,
+        },
+        Type::Struct(xs) => match b {
+            Type::Struct(ys) => differ_members(&cx, xs, ys, env, found),
+            _ => false,
+        },
+        Type::Enum(xs) => match b {
+            Type::Enum(ys) => differ_members(&cx, xs, ys, env, found),
+            _ => false,
+        },
+        Type::Array(x, n) => match b {
+            Type::Array(y, m) => n == m && differ_in(&cx, x.copy(&cx), y.copy(&cx), env, found),
+            _ => false,
+        },
+        Type::Tuple(xs) => match b {
+            Type::Tuple(ys) => differ_all(&cx, xs, ys, env, found),
+            _ => false,
+        },
+        Type::Ptr(x) => match b {
+            Type::Ptr(y) => differ_in(&cx, x.copy(&cx), y.copy(&cx), env, found),
+            _ => false,
+        },
+        Type::NonNull(x) => match b {
+            Type::NonNull(y) => differ_in(&cx, x.copy(&cx), y.copy(&cx), env, found),
+            _ => false,
+        },
+        Type::Brand(x) => match b {
+            Type::Brand(y) => differ_in(&cx, x.copy(&cx), y.copy(&cx), env, found),
+            _ => false,
+        },
+        _ => C::same(&cx, a, b),
     }
 }

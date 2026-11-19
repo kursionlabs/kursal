@@ -9,7 +9,7 @@ from typing import Optional
 
 from .core import (COPY, Array, Brand, Enum, Exists, Fn, Foreach, Ignored, Named, Never, NonNull, Param, Prim, Ptr,
                    Kind, ModuleId, Premise, Program, Skolem, Struct, Tuple, Type, TypeDecl)
-from .sexpr import KursError
+from .sexpr import KursError, Position
 
 type Substitution = Mapping[str, Type]
 type Kinds = Mapping[str, Kind]
@@ -562,38 +562,156 @@ class Types:
 
 
 def show(ty: Type) -> str:
+    """`ty` as KURS writes it, a brand as `$label`: for messages about KURS, and for dumps."""
+    return _render(ty, None)
+
+
+class Surface:
+    """Types as a message about source writes them. A brand reads as written, `'k`; a name the compiler made
+    reads as the name it was made from (`'b` for the brand `b#open9` that `let exists 'b.` opened, `Env` for
+    a closure's environment `Env#1`), or `_` when it was made from none; a place parameter of a function
+    type reads `(& T)`.
+
+    One `Surface` writes every type of one message. Where two different brands in it would read the same,
+    each that a `let exists` opened, at a position in `origins`, says where: `'k (opened at 15:9)`."""
+
+    def __init__(self, types: Iterable[Type], origins: Mapping[str, Position]) -> None:
+        labels: set[str] = set()
+        for ty in types:
+            _brand_labels(ty, labels)
+        spellings: dict[str, int] = {}
+        for label in labels:
+            spellings[_made_from(label)] = spellings.get(_made_from(label), 0) + 1
+        self.origins = origins
+        self.qualified = {label for label in labels if spellings[_made_from(label)] > 1 and label in origins}
+
+    def brand(self, label: str) -> str:
+        name = brand_name(label)
+        if label in self.qualified:
+            line, col = self.origins[label]
+            return f"{name} (opened at {line}:{col})"
+        return name
+
+    def show(self, ty: Type) -> str:
+        return _render(ty, self)
+
+
+def brand_name(label: str) -> str:
+    """The brand `label` as written in source, as `Surface` writes it where no other brand reads the same."""
+    return "'" + _made_from(label)
+
+
+def _made_from(name: str) -> str:
+    """The name a compiler-made name `name#...` was made from; a source name is its own."""
+    return name.split("#", 1)[0]
+
+
+def _variable(name: str) -> str:
+    """A type variable as a message writes it; a nominal type's path is its own."""
+    if "::" in name or "#" not in name:
+        return name
+    return _made_from(name) or "_"
+
+
+def _brand_labels(ty: Type, out: set[str]) -> None:
+    if isinstance(ty, Skolem):
+        out.add(ty.label)
+    elif isinstance(ty, Exists):
+        out.update(ty.binders)
+    for child in children(ty):
+        _brand_labels(child, out)
+
+
+def _render(ty: Type, surface: Optional[Surface]) -> str:
+    def go(part: Type) -> str:
+        return _render(part, surface)
+
+    def brand(label: str) -> str:
+        return "$" + label if surface is None else surface.brand(label)
+
+    def variable(name: str) -> str:
+        return name if surface is None else _variable(name)
+
     match ty:
         case Prim(name=name):
             return name
         case Never():
             return "!"
         case Named(name=name, args=()):
-            return name
+            return variable(name)
         case Named(name=name, args=args):
-            return f"({name} {' '.join(map(show, args))})"
+            return f"({name} {' '.join(map(go, args))})"
         case Skolem(label=label):
-            return "$" + label
-        case Brand(brand=brand):
-            return f"(brand {show(brand)})"
+            return brand(label)
+        case Brand(brand=inner):
+            return f"(brand {go(inner)})"
         case Ptr(inner=inner):
-            return f"(ptr {show(inner)})"
+            return f"(ptr {go(inner)})"
         case NonNull(inner=inner):
-            return f"(non_null {show(inner)})"
+            return f"(non_null {go(inner)})"
         case Tuple(elems=elems):
-            return f"(tuple {' '.join(map(show, elems))})".replace(" )", ")")
+            return f"(tuple {' '.join(map(go, elems))})".replace(" )", ")")
         case Array(elem=elem, length=length):
-            return f"(array {show(elem)} {length})"
+            return f"(array {go(elem)} {length})"
         case Struct(fields=fields):
-            return "(struct " + " ".join(f"({n} {show(f)})" for n, f in fields) + ")"
+            return "(struct " + " ".join(f"({n} {go(f)})" for n, f in fields) + ")"
         case Enum(variants=variants):
-            return "(enum " + " ".join(f"({n} {show(f)})" for n, f in variants) + ")"
+            return "(enum " + " ".join(f"({n} {go(f)})" for n, f in variants) + ")"
         case Exists(binders=binders, body=body):
-            return f"(exists ({' '.join('$' + b for b in binders)}) {show(body)})"
+            return f"(exists ({' '.join(map(brand, binders))}) {go(body)})"
         case Foreach(binder=binder, indirect=indirect, source=source, body=body):
-            pattern = f"(ptr {binder})" if indirect else binder
+            pattern = f"(ptr {variable(binder)})" if indirect else variable(binder)
             inferred = (source.binder, *(source.retained or ())) if isinstance(source, Foreach) else ()
-            suffix = "" if ty.retained == inferred else " (retain " + " ".join(ty.retained or ()) + ")"
-            return f"(foreach ({pattern} {show(source)}) {show(body)}{suffix})"
+            suffix = "" if ty.retained == inferred else " (retain " + " ".join(map(variable, ty.retained or ())) + ")"
+            return f"(foreach ({pattern} {go(source)}) {go(body)}{suffix})"
         case Fn(params=params, ret=ret, unsafe=unsafe):
-            return f"(fn {'(unsafe) ' if unsafe else ''}({' '.join(map(show, params))}) {show(ret)})"
+            shown = (f"(& {go(p)})" if surface is not None and k in ty.places else go(p) for k, p in enumerate(params))
+            return f"(fn {'(unsafe) ' if unsafe else ''}({' '.join(shown)}) {go(ret)})"
     return "_"
+
+
+def brand_differences(a: Type, b: Type) -> Optional[list[str]]:
+    """When `a` and `b` differ only in brands, as `equal` compares them: the brand labels where they differ,
+    in the order met, each pair's left one first. None when they differ in more than brands."""
+    found: list[str] = []
+
+    def same_all(xs: Iterable[Type], ys: Iterable[Type], env: AlphaEnv) -> bool:
+        return all(same(x, y, env) for x, y in zip(xs, ys))
+
+    def same(x: Type, y: Type, env: AlphaEnv) -> bool:
+        left, right = env
+        if type(x) is not type(y):
+            return False
+        match x, y:
+            case Skolem(label=p), Skolem(label=q):
+                if left.get(p, p) != right.get(q, q):
+                    found.extend(label for label in (p, q) if label not in found)
+                return True
+            case Named(name=p, args=()), Named(name=q, args=()) if p in left or q in right:
+                return left.get(p, p) == right.get(q, q)
+            case Named(name=p, args=xs), Named(name=q, args=ys):
+                return p == q and len(xs) == len(ys) and same_all(xs, ys, env)
+            case Exists(binders=xs, body=p), Exists(binders=ys, body=q):
+                return len(xs) == len(ys) and same(p, q, _bind(env, xs, ys))
+            case Foreach(), Foreach():
+                return (x.indirect == y.indirect and same(x.source, y.source, env)
+                        and len(foreach_binders(x)) == len(foreach_binders(y))
+                        and same(x.body, y.body, _bind(env, foreach_binders(x), foreach_binders(y))))
+            case Fn(), Fn():
+                if (x.unsafe != y.unsafe or x.places != y.places or len(x.params) != len(y.params)
+                        or [p.kind for p in x.forall] != [p.kind for p in y.forall]):
+                    return False
+                inner = _bind(env, [p.name for p in x.forall], [p.name for p in y.forall])
+                return same_all(x.params, y.params, inner) and same(x.ret, y.ret, inner)
+            case (Struct(fields=fx), Struct(fields=fy)) | (Enum(variants=fx), Enum(variants=fy)):
+                return (len(fx) == len(fy) and all(n == m for (n, _), (m, _) in zip(fx, fy))
+                        and same_all((t for _, t in fx), (t for _, t in fy), env))
+            case Array(), Array():
+                return x.length == y.length and same(x.elem, y.elem, env)
+            case Tuple(elems=xs), Tuple(elems=ys):
+                return len(xs) == len(ys) and same_all(xs, ys, env)
+            case (Ptr() | NonNull() | Brand()), _:
+                return same(children(x)[0], children(y)[0], env)
+        return x == y
+
+    return found if same(a, b, ({}, {})) else None
