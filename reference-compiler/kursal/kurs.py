@@ -41,7 +41,7 @@ def _text(form: Form) -> Atom:
 
 def _brand(atom: Form) -> str:
     if isinstance(atom, List) or not atom.startswith("$") or len(atom) < 2:
-        _fail(f"expected a brand such as $k, got {atom}", atom)
+        _fail(f"expected a brand such as $k, got {write_form(atom)}", atom)
     return atom[1:]
 
 
@@ -149,7 +149,7 @@ def parse_term(form: Form) -> Terminator:
     if head == "switch":
         arms = tuple(Arm(_text(arm[0]), _edge(arm[1], arm[2:])) for arm in map(_list, form[3:]))
         return Switch(str(form[1]), parse_type(form[2]), arms, form.pos)
-    _fail(f"unknown terminator {head}", form)
+    _fail(f"unknown terminator {write_form(head)}", form)
 
 
 def _applied(form: Form) -> tuple[str, tuple[Type, ...]]:
@@ -254,12 +254,15 @@ def _module(form: Form) -> ModuleId:
 
 
 def _int(form: Form) -> int:
-    """A decimal atom no larger than `usize` holds, which literals take as 64-bit; a larger one fails
-    as `int()` fails on text that is not a number. A negative one is left to the checker."""
+    """A decimal atom no larger than `usize` holds, which literals take as 64-bit. A negative one is left
+    to the checker."""
     text = _text(form)
-    value = int(text)
-    if value >= 1 << LITERAL_BITS["usize"]:
-        raise ValueError(f"invalid literal for int() with base 10: {text!r}")
+    try:
+        value: Optional[int] = int(text)
+    except ValueError:
+        value = None
+    if value is None or value >= 1 << LITERAL_BITS["usize"]:
+        _fail(f"{write_form(text)} is not a usize", form)
     return value
 
 
@@ -330,7 +333,7 @@ def parse_program(text: str) -> Program:
         elif head == "data":
             program.datas[str(rest[0])] = Data(str(rest[0]), parse_type(rest[1]), rest[2], module)
         else:
-            _fail(f"unknown declaration {head}", form)
+            _fail(f"unknown declaration {write_form(head)}", form)
     return program
 
 

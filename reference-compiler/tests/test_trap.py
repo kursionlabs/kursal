@@ -76,7 +76,7 @@ class TrapTests(unittest.TestCase):
 
     def test_a_kurs_integer_past_usize_max_is_rejected(self):
         for value in ("18446744073709551616", "18446744073709551617"):
-            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "invalid literal for int"):
+            with self.subTest(value=value), self.assertRaisesRegex(KursError, f"1:11: {value} is not a usize$"):
                 parse_type(read(f"(array u8 {value})")[0])
 
 

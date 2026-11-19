@@ -479,9 +479,9 @@ class Backend:
         externs = []
         for ext in self.program.externs.values():
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", ext.name) or ext.name in C_KEYWORDS:
-                raise KursError(f"backend: foreign symbol {ext.name!r} is not a C identifier", ext.pos)
+                raise KursError(f"backend: foreign symbol {ext.name} is not a C identifier", ext.pos)
             if ext.name in RUNTIME_NAMES or ext.name.startswith(("__builtin_", "__atomic_")) or ext.name in ("main", REPORT_ERROR) and entry is not None:
-                raise KursError(f"backend: foreign symbol {ext.name!r} conflicts with the C runtime prelude or entry wrapper", ext.pos)
+                raise KursError(f"backend: foreign symbol {ext.name} conflicts with the C runtime prelude or entry wrapper", ext.pos)
             assert ext.ret is not None
             if ext.ptypes is None:
                 externs.append(f"extern {self.ctype(ext.ret)} {ext.name};")

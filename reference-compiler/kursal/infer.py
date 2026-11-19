@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from itertools import count
 from . import core as C
 from . import syntax as S
-from .resolve import Decl, ResolveError, Resolver
+from .resolve import Decl, ResolveError, Resolver, listed
 from .sigs import InstanceSig, Scope, Sig, Signatures
 from .sexpr import KursError, Position
 from .types import Surface, Types, brand_differences, brand_name, equal, foreach_binders, free_brands, free_names, made_from, subst
@@ -881,7 +881,8 @@ class Infer:
                     self.unify(bundle.types[name], fields[name], expr.pos)
             self.wait(lambda: bundle.filled, spread, expr.pos)
         elif given != set(fields):
-            fail(f"missing fields {sorted(set(fields) - given)}", expr.pos)
+            missing = sorted(set(fields) - given)
+            fail(f"missing field{'s' if len(missing) > 1 else ''} {listed(missing)}", expr.pos)
         return result
 
     def expr_block(self, expr: S.Block) -> C.Type:

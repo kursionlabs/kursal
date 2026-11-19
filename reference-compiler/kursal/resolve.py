@@ -99,6 +99,11 @@ def fail(message: str, pos: Optional[Position] = None) -> Never:
     raise ResolveError(message, pos)
 
 
+def listed(names: Sequence[str]) -> str:
+    """`names` as a message lists them: `a`, `a and b`, `a, b and c`."""
+    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+
+
 # ------------------------------------------------------------ the graph --
 
 def _table(value: object, where: str) -> dict[str, object]:
@@ -116,14 +121,14 @@ def _table(value: object, where: str) -> dict[str, object]:
 def _string(table: dict[str, object], manifest: Path, key: str, default: Optional[str] = None) -> str:
     value = table.get(key, default)
     if not isinstance(value, str):
-        fail(f"{manifest}: manifest {key!r} must be a string")
+        fail(f"{manifest}: manifest {key} must be a string")
     return value
 
 
 def _strings(table: dict[str, object], manifest: Path, key: str) -> list[str]:
     values = table.get(key, [])
     if not isinstance(values, list) or any(not isinstance(value, str) or not value or "\x00" in value for value in values):
-        fail(f"{manifest}: manifest {key!r} must be an array of nonempty strings without NUL")
+        fail(f"{manifest}: manifest {key} must be an array of nonempty strings without NUL")
     return cast(list[str], values)
 
 
@@ -172,14 +177,14 @@ def load(path: str | Path) -> list[Package]:
             info = _table(config.get("package", {}), f"{manifest}: package")
             unknown = set(config) - {"package", "dependencies"} | set(info) - {"name", "kind", "source_root", "entry", "link_flags", "c_sources"}
             if unknown:
-                fail(f"{manifest}: unknown manifest keys {sorted(unknown)}")
+                fail(f"{manifest}: unknown manifest key{'s' if len(unknown) > 1 else ''} {listed(sorted(unknown))}")
             package.name = _string(info, manifest, "name")
             package.source_root = (root / _string(info, manifest, "source_root", "src")).resolve()
             package.link_flags = _strings(info, manifest, "link_flags")
             package.c_sources = [(root / source).resolve() for source in _strings(info, manifest, "c_sources")]
             kind = _string(info, manifest, "kind", "library")
             if kind not in ("library", "executable"):
-                fail(f"{manifest}: manifest 'kind' must be \"library\" or \"executable\"")
+                fail(f"{manifest}: manifest kind must be \"library\" or \"executable\"")
             if kind == "executable":
                 package.entry = tuple(p for p in _string(info, manifest, "entry").split("::") if p != "package")
             deps = {alias: (root / _string(_table(spec, f"{manifest}: {alias}"), manifest, "path")).resolve()
@@ -278,7 +283,7 @@ class Resolver:
         for item in items:
             match item:
                 case S.Module():
-                    self.report(ResolveError("package sources do not declare 'module'", item.pos), module)
+                    self.report(ResolveError("package sources do not declare `module`", item.pos), module)
                 case S.Use():
                     self.use(scope, (), item.tree, item.export)
                 case S.InstanceDecl():
@@ -314,9 +319,9 @@ class Resolver:
                     scope.exports.add(name)
                     return
                 if name in ("package", "builtin") or name in BUILTIN_TRAITS:
-                    fail(f"'{name}' is compiler-sealed")
+                    fail(f"{name} is compiler-sealed")
                 if name in scope.imports or name in scope.decls:
-                    fail(f"duplicate import {name} in {scope.module}")
+                    fail(f"duplicate import {name}")
                 scope.imports[name] = path
                 scope.import_pos[name] = start
                 if export:
@@ -418,7 +423,7 @@ class Resolver:
         if key in self.cache:
             return self.cache[key]
         if key in self.active:
-            fail(f"import cycle at {key[2]}")
+            fail(f"import cycle at {'::'.join(key[2]) if key[0] == 'path' else key[2]}")
         self.active.add(key)
         try:
             if key[0] == "import":

@@ -88,12 +88,14 @@ class CNameTests(unittest.TestCase):
 
     def test_foreign_names_conflicting_with_c_are_diagnosed(self):
         from kursal.sexpr import KursError
-        for name in ('for', 'not-a-c-name', 'KUR_FIELD', 'kur_dec_i8', 'UINT8_MAX', 'main'):
+        for name, problem in (('for', 'is not a C identifier'), ('not-a-c-name', 'is not a C identifier'),
+                              ('KUR_FIELD', 'conflicts'), ('kur_dec_i8', 'conflicts'), ('UINT8_MAX', 'conflicts'),
+                              ('main', 'conflicts')):
             with self.subTest(name=name):
                 program = parse_program('(extern fun ' + name + ' i32 ()) '
                     '(fun entry i32 () (entry () (= %r (const i32 7)) (ret %r)))')
                 checker = check_program(program)
-                with self.assertRaisesRegex(KursError, 'backend: foreign symbol'):
+                with self.assertRaisesRegex(KursError, f'^1:1: backend: foreign symbol {name} {problem}'):
                     emit_c(program, checker, 'entry')
 
     def test_foreign_name_is_not_reused_for_data(self):

@@ -1043,6 +1043,9 @@ RESOLUTION_ERRORS: tuple[tuple[dict[str, str], str], ...] = (
     ({"p/kur.toml": '[package]\nname=12\nsource_root="."\n', "p/lib.kur": ""}, "p"),
     ({"p/kur.toml": '[package]\nname="p"\nsource_root=false\n', "p/lib.kur": ""}, "p"),
     ({"p/kur.toml": '[package]\nname="p"\nsyntax=12\nversion="1"\n[extra]\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": '[package]\nname="p"\nversion="1"\n[extra]\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": '[package]\nname="p"\nversion="1"\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": '[package]\nname="p"\nsource_root="."\nlink_flags=["-lm", ""]\n', "p/lib.kur": ""}, "p"),
     ({"p/kur.toml": 'dependencies=[]\n[package]\nname="p"\nsource_root="."\n', "p/lib.kur": ""}, "p"),
     ({"p/kur.toml": manifest("p") + '[dependencies.x]\npath=3\n', "p/lib.kur": ""}, "p"),
     ({"p/kur.toml": manifest("p") + '[dependencies]\nx="../x"\n', "p/lib.kur": ""}, "p"),
@@ -1305,6 +1308,10 @@ KURS_ERRORS = (
     ")",
     '(data d u8 "\\q")',
     '(data d u8 "abc',
+    "(fun f u32 () (entry () (= %x (const u32 1)) ((ret) %x)))",
+    "(type T (exists ((a \"b c\")) u32))",
+    "(type T (array u8 x))",
+    "(type T (array u8 18446744073709551616))",
 )
 
 

@@ -218,56 +218,21 @@ fn resolve_absolute(&cx: Domain!['k], path: Span['k]) -> Span['k] {
     }
 }
 
-// --------------------------------------------------------- Python's repr --
+// ------------------------------------------------------------- messages --
 
-// A string as Python's `repr` writes it.
+// `names` as a message lists them: `a`, `a and b`, `a, b and c`.
 forall 'k.
-fn repr(&cx: Domain!['k], t: Span['k]) -> Span['k] {
-    let quote = if t.contains(&cx, Span::from_static(&cx, "'")) && !t.contains(&cx, Span::from_static(&cx, "\"")) { b'"' } else { b'\'' };
-    var out = Buffer!::new().push_byte(quote);
-    var i = 0usize;
-    while i < t.len() {
-        let b = t.byte_or_zero(&cx, i);
-        if b == b'\\' || b == quote {
-            out = out.push_byte(b'\\').push_byte(b);
-        } else if b == b'\n' {
-            out = out.push_static("\\n");
-        } else if b == b'\t' {
-            out = out.push_static("\\t");
-        } else if b == b'\r' {
-            out = out.push_static("\\r");
-        } else if b < 32u8 || b == 127u8 {
-            let digits = Span::from_static(&cx, "0123456789abcdef");
-            out = out.push_static("\\x").push_byte(digits.byte_or_zero(&cx, (b / 16u8) as usize)).push_byte(digits.byte_or_zero(&cx, (b % 16u8) as usize));
-        } else {
-            out = out.push_byte(b);
-        }
-        i = i + 1usize;
-    }
-    out.push_byte(quote).save(&cx)
-}
-
-// A tuple of strings as Python's `repr` writes it: `()`, `('a',)`, `('a', 'b')`.
-forall 'k.
-fn repr_tuple(&cx: Domain!['k], names: ArenaVec[Span['k], 'k]) -> Span['k] {
-    var out = Buffer!::new().push_static("(");
+fn listed(&cx: Domain!['k], names: ArenaVec[Span['k], 'k]) -> Span['k] {
+    var out = Buffer!::new();
     var i = 0usize;
     while i < names.len(&cx) {
         if i > 0usize {
-            out = out.push_static(", ");
+            out = out.push_static(if i + 1usize == names.len(&cx) { " and " } else { ", " });
         }
-        out = out.push_bytes(&cx, repr(&cx, names.at(&cx, i)));
+        out = out.push_bytes(&cx, names.at(&cx, i));
         i = i + 1usize;
     }
-    if names.len(&cx) == 1usize {
-        out = out.push_static(",");
-    }
-    out.push_static(")").save(&cx)
-}
-
-forall 'k.
-fn repr_module(&cx: Domain!['k], m: ModuleId['k]) -> Span['k] {
-    Buffer!::new().push_static("ModuleId(package=").push_usize(m.package).push_static(", path=").push_bytes(&cx, repr_tuple(&cx, m.path)).push_static(")").save(&cx)
+    out.save(&cx)
 }
 
 // ------------------------------------------------------------ the graph --
@@ -673,13 +638,8 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
         if unknown.len(&cx) > 0usize {
             let names = unknown.keys(&cx);
             names.sort_by(&cx, |&cx, a, b| a.cmp(&cx, b));
-            var out = Buffer!::new().push_bytes(&cx, manifest).push_static(": unknown manifest keys [");
-            var k = 0usize;
-            while k < names.len(&cx) {
-                out = out.push_static(if k > 0usize { ", " } else { "" }).push_bytes(&cx, repr(&cx, names.at(&cx, k)));
-                k = k + 1usize;
-            }
-            fail(&cx, out.push_static("]").save(&cx));
+            fail(&cx, Buffer!::new().push_bytes(&cx, manifest).push_static(if names.len(&cx) > 1usize { ": unknown manifest keys " } else { ": unknown manifest key " })
+                .push_bytes(&cx, listed(&cx, names)).save(&cx));
         }
         package.name.set(&cx, string(&cx, info, manifest, "name", Option::None));
         package.source_root.set(&cx, resolved(&cx, join(&cx, root, string(&cx, info, manifest, "source_root", Option::Some.(Span::from_static(&cx, "src"))))));
@@ -697,7 +657,7 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
         }
         let kind = string(&cx, info, manifest, "kind", Option::Some.(Span::from_static(&cx, "library")));
         if !kind.is(&cx, "library") && !kind.is(&cx, "executable") {
-            fail(&cx, Buffer!::new().push_bytes(&cx, manifest).push_static(": manifest 'kind' must be \"library\" or \"executable\"").save(&cx));
+            fail(&cx, Buffer!::new().push_bytes(&cx, manifest).push_static(": manifest kind must be \"library\" or \"executable\"").save(&cx));
         }
         if kind.is(&cx, "executable") {
             let parts = string(&cx, info, manifest, "entry", Option::None).split(&cx, Span::from_static(&cx, "::"));
@@ -769,7 +729,7 @@ fn string(&cx: Domain!['k], t: ArenaMap[Span['k], TomlValue['k], 'k], manifest: 
     };
     match value {
         Option::Some(s) => s,
-        Option::None => fail(&cx, Buffer!::new().push_bytes(&cx, manifest).push_static(": manifest ").push_bytes(&cx, repr(&cx, Span::from_static(&cx, key))).push_static(" must be a string").save(&cx)),
+        Option::None => fail(&cx, Buffer!::new().push_bytes(&cx, manifest).push_static(": manifest ").push_static(key).push_static(" must be a string").save(&cx)),
     }
 }
 
@@ -780,7 +740,7 @@ fn strings(&cx: Domain!['k], t: ArenaMap[Span['k], TomlValue['k], 'k], manifest:
         Option::Some(value) => match value.as_array() {
             Option::Some(items) => items,
             Option::None => fail(&cx, Buffer!::new().push_bytes(&cx, manifest).push_static(": manifest ")
-                .push_bytes(&cx, repr(&cx, Span::from_static(&cx, key))).push_static(" must be an array of nonempty strings without NUL").save(&cx)),
+                .push_static(key).push_static(" must be an array of nonempty strings without NUL").save(&cx)),
         },
         Option::None => ArenaVec::new(&cx),
     };
@@ -790,11 +750,11 @@ fn strings(&cx: Domain!['k], t: ArenaMap[Span['k], TomlValue['k], 'k], manifest:
         let value = match values.at(&cx, i).as_string() {
             Option::Some(s) => s,
             Option::None => fail(&cx, Buffer!::new().push_bytes(&cx, manifest).push_static(": manifest ")
-                .push_bytes(&cx, repr(&cx, Span::from_static(&cx, key))).push_static(" must be an array of nonempty strings without NUL").save(&cx)),
+                .push_static(key).push_static(" must be an array of nonempty strings without NUL").save(&cx)),
         };
         if value.is_empty() || !value.find_byte(&cx, 0u8, 0usize).is_none() {
             fail(&cx, Buffer!::new().push_bytes(&cx, manifest).push_static(": manifest ")
-                .push_bytes(&cx, repr(&cx, Span::from_static(&cx, key))).push_static(" must be an array of nonempty strings without NUL").save(&cx));
+                .push_static(key).push_static(" must be an array of nonempty strings without NUL").save(&cx));
         }
         out.push(&cx, value);
         i = i + 1usize;
@@ -1035,7 +995,7 @@ impl Resolver['k] {
         while i < items.len(&cx) {
             self.locate(&cx, home, item_pos(items.at(&cx, i)));
             let unit = match items.at(&cx, i) {
-                S::Item::Module(m) => self.report(&cx, Span::from_static(&cx, "package sources do not declare 'module'"), m.pos),
+                S::Item::Module(m) => self.report(&cx, Span::from_static(&cx, "package sources do not declare `module`"), m.pos),
                 S::Item::Use(u) => self.use_tree(&cx, scope, ArenaVec::new(&cx), u.tree, u.is_export),
                 S::Item::Instance(n) => self.instances.push(&cx, (home, n)),
                 S::Item::Struct(x) => { let declared = self.declare(&cx, scope, self.new_decl(&cx, "struct", home, x.name, Named::Struct.(x), Option::None)); },
@@ -1098,11 +1058,11 @@ impl Resolver['k] {
                 return;
             }
             if name.is(&cx, "package") || name.is(&cx, "builtin") || is_builtin_trait(&cx, name) {
-                self.report(&cx, Buffer!::new().push_static("'").push_bytes(&cx, name).push_static("' is compiler-sealed").save(&cx), tree.pos);
+                self.report(&cx, Buffer!::new().push_bytes(&cx, name).push_static(" is compiler-sealed").save(&cx), tree.pos);
                 return;
             }
             if scope.imports.contains(&cx, name) || scope.decls.contains(&cx, name) {
-                self.report(&cx, Buffer!::new().push_static("duplicate import ").push_bytes(&cx, name).push_static(" in ").push_bytes(&cx, repr_module(&cx, scope.home)).save(&cx), tree.pos);
+                self.report(&cx, Buffer!::new().push_static("duplicate import ").push_bytes(&cx, name).save(&cx), tree.pos);
                 return;
             }
             scope.imports.insert(&cx, name, path);
@@ -1310,8 +1270,7 @@ impl Resolver['k] {
         };
         let (kind, home, names) = key;
         if self.active.contains(&cx, key) {
-            let at = if kind.is(&cx, "path") { repr_tuple(&cx, names) } else { names.at(&cx, 0usize) };
-            return problem(Buffer!::new().push_static("import cycle at ").push_bytes(&cx, at).save(&cx));
+            return problem(Buffer!::new().push_static("import cycle at ").push_bytes(&cx, names.join(&cx, "::")).save(&cx));
         }
         self.active.insert(&cx, key);
         let value = if kind.is(&cx, "import") {

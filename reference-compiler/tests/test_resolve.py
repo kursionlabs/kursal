@@ -81,23 +81,27 @@ class BuiltinTests(unittest.TestCase):
 class GraphTests(unittest.TestCase):
 
     def test_manifest_values_are_validated_before_building_typed_packages(self):
+        flags = "link_flags must be an array of nonempty strings without NUL"
         manifests = (
-            '[package]\nname=12\nsource_root="."\n',
-            '[package]\nname="p"\nsource_root=false\n',
-            '[package]\nname="p"\nsyntax=12\n',
-            'dependencies=[]\n[package]\nname="p"\nsource_root="."\n',
-            manifest("p") + '[dependencies.x]\npath=3\n',
-            '[package]\nname="p"\nsource_root="."\nlink_flags="-lm"\n',
-            '[package]\nname="p"\nsource_root="."\nlink_flags=["-lm", 3]\n',
-            '[package]\nname="p"\nsource_root="."\nlink_flags=[""]\n',
-            '[package]\nname="p"\nsource_root="."\nlink_flags=["-l\\u0000x"]\n',
-            '[package]\nname="p"\nsource_root="."\nc_sources="native.c"\n',
-            '[package]\nname="p"\nsource_root="."\nc_sources=[""]\n',
+            ('[package]\nname=12\nsource_root="."\n', "manifest name must be a string"),
+            ('[package]\nname="p"\nsource_root=false\n', "manifest source_root must be a string"),
+            ('[package]\nname="p"\nsyntax=12\n', "unknown manifest key syntax"),
+            ('[package]\nname="p"\nsyntax=12\n[extra]\n', "unknown manifest keys extra and syntax"),
+            ('[package]\nname="p"\nsyntax=12\nversion="1"\n[extra]\n', "unknown manifest keys extra, syntax and version"),
+            ('dependencies=[]\n[package]\nname="p"\nsource_root="."\n', "dependencies: expected a table"),
+            (manifest("p") + '[dependencies.x]\npath=3\n', "manifest path must be a string"),
+            ('[package]\nname="p"\nsource_root="."\nlink_flags="-lm"\n', f"manifest {flags}"),
+            ('[package]\nname="p"\nsource_root="."\nlink_flags=["-lm", 3]\n', f"manifest {flags}"),
+            ('[package]\nname="p"\nsource_root="."\nlink_flags=[""]\n', f"manifest {flags}"),
+            ('[package]\nname="p"\nsource_root="."\nlink_flags=["-l\\u0000x"]\n', f"manifest {flags}"),
+            ('[package]\nname="p"\nsource_root="."\nc_sources="native.c"\n', "manifest c_sources must be an array"),
+            ('[package]\nname="p"\nsource_root="."\nc_sources=[""]\n', "manifest c_sources must be an array"),
         )
-        for source in manifests:
-            with self.subTest(source=source), self.assertRaises(ResolveError):
+        for source, message in manifests:
+            with self.subTest(source=source):
                 root = tree({"p/kur.toml": source, "p/lib.kur": ""})
-                resolve(root / "p")
+                with self.assertRaisesRegex(ResolveError, "^" + re.escape(f"{(root / 'p/kur.toml').resolve()}: {message}")):
+                    resolve(root / "p")
 
     def test_link_flags_follow_dependency_packages_in_order(self):
         root = tree({"app/kur.toml": '[package]\nname="app"\nsource_root="."\nlink_flags=["-lapp"]\n'
@@ -123,7 +127,7 @@ class GraphTests(unittest.TestCase):
                 root = tree({"p/kur.toml": f'[package]\nname="p"\nsource_root="."\nkind="{kind}"\nentry="package::main"\n',
                              "p/lib.kur": "fn main() -> i32 { 0i32 }\n"})
                 with self.assertRaisesRegex(ResolveError, "^" + re.escape(
-                        f"{(root / 'p/kur.toml').resolve()}: manifest 'kind' must be \"library\" or \"executable\"") + "$"):
+                        f"{(root / 'p/kur.toml').resolve()}: manifest kind must be \"library\" or \"executable\"") + "$"):
                     resolve(root / "p")
         root = tree({"p/kur.toml": '[package]\nname="p"\nsource_root="."\n', "p/lib.kur": ""})
         self.assertIsNone(resolve(root / "p").packages[0].entry)
@@ -145,7 +149,7 @@ class GraphTests(unittest.TestCase):
             resolve(root / "a")
 
     def test_module_directive_rejected(self):
-        with self.assertRaises(ResolveError):
+        with self.assertRaisesRegex(ResolveError, "1:1: package sources do not declare `module`$"):
             resolve(tree({"p/kur.toml": manifest("p"), "p/lib.kur": "module x;\n"}) / "p")
 
     def test_entry(self):
@@ -216,15 +220,15 @@ class NameTests(unittest.TestCase):
             resolve(app("fn f() -> u32 { lib::hidden::secret() }\n"))
 
     def test_duplicate_alias(self):
-        with self.assertRaises(ResolveError):
+        with self.assertRaisesRegex(ResolveError, "2:5: duplicate import Point$"):
             resolve(app("use lib::shapes::Point;\nuse lib::shapes::Point;\n"))
 
     def test_sealed_alias(self):
-        with self.assertRaises(ResolveError):
+        with self.assertRaisesRegex(ResolveError, "1:5: Copy is compiler-sealed$"):
             resolve(app("use lib::shapes::Point as Copy;\n"))
 
     def test_alias_cycle(self):
-        with self.assertRaises(ResolveError):
+        with self.assertRaisesRegex(ResolveError, "2:17: import cycle at X$"):
             resolve(app("use package::a::X;\nfn f() -> u32 { X.() }\n",
                         {"app/a.kur": "use package::X;\n"}))
 
