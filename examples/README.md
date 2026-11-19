@@ -19,8 +19,9 @@ bin/kursal build examples/wordfreq -o /tmp/wordfreq
 printf 'the cat and the hat\n' | /tmp/wordfreq
 ```
 
-`bin/kursal build PACKAGE -o OUTPUT` writes `OUTPUT.c` and compiles it, with the standard library's C
-helpers, into `OUTPUT`. Without `-o` it writes `a.out` and `a.out.c` in the current directory.
+`bin/kursal build PACKAGE -o OUTPUT` writes the C into `OUTPUT.build`, a file per module, and
+compiles it, with the standard library's C helpers, into `OUTPUT`; with `--single-c` it writes one
+file, `OUTPUT.c`. Without `-o` it writes `a.out` and `a.out.build` in the current directory.
 Use `--emit-c` to print the C, including for a library package.
 `bin/kursal build examples/bad/type_mismatch.kur` shows a rejected program's diagnostic.
 

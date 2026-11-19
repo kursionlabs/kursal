@@ -30,9 +30,11 @@ and it prints:
 Hello, world!
 ```
 
-`kursal build PATH` writes `a.out` and its generated C companion `a.out.c` in the current
-directory. Use `-o OUTPUT` to choose another location, or `--emit-c` to print the C. Run
-`bin/kursal --help` for the other commands.
+`kursal build PATH` writes `a.out` in the current directory, and its generated C in `a.out.build`,
+a file per module, which Clang or GCC compiles in parallel and links with link-time optimization.
+Use `-o OUTPUT` to choose another location, `--single-c` to compile the C as one file, `a.out.c`,
+which builds slower and runs a little faster, or `--emit-c` to print the C. Run `bin/kursal --help`
+for the other commands.
 
 [`examples/README.md`](examples/README.md) lists the example programs, starting with the ones to read
 first.

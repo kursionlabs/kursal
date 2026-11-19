@@ -60,13 +60,24 @@ KURSAL_SELFHOST=1 uv run python tools/test.py tests.test_compiler   # also check
 
 `build --times` reports wall-clock milliseconds for resolution, signatures, inference, lowering,
 checking, C generation, and the copies and arena releases between those stages. For executable
-builds it also reports writing C, preparing the C compiler command, and running the C compiler.
+builds it also reports writing C, preparing the C compiler commands, compiling the files of a split
+build in parallel (`cc compile`), and the last C compiler run (`cc`: the link, or the whole build
+with `--single-c`).
 `front copy` moves the lowered program into the checker arena; `back copy` moves it into the C
 arena; `typed copy` moves the checker's recorded types into that arena.
 Within C generation, `C setup`, `C functions`, `C definitions`, and `C assembly` show where the
 backend spends its time; `C` remains the total for that stage.
 
-`build` writes `a.out` and `a.out.c` unless `-o OUTPUT` names another destination.
+`build` writes `a.out` unless `-o OUTPUT` names another destination. Its C goes to `a.out.build`
+as a file per module: a header every file includes (`kursal-decls.h`: types, externs, data
+declarations and every function's head), the data (`kursal-data.c`), C's `main` (`kursal-main.c`),
+the thunks (`kursal-thunks.c`), and each module's functions, in files of about 512 KB
+(`kursal.check.checker.c`, `kursal.check.checker.2.c`), a generic's instances with it. With Clang
+(`-flto=thin`) or GCC (`-flto=auto`) as `$KURSAL_CC`, the files are compiled in parallel,
+`$KURSAL_JOBS` at once or else one per processor, and linked with link-time optimization, which restores the inlining across files; a
+build removes the files an earlier one left that it does not write. With `--single-c`, or another C
+compiler, the C is one file, `a.out.c`, compiled whole: slower to build, a few percent faster to
+run.
 `build --emit-c` prints generated C, which also works for library packages. The compiler
 passes each package's `[package] link_flags = ["-luv"]` entries as C compiler arguments
 after the generated C and helper sources; flags declared by dependencies are included.

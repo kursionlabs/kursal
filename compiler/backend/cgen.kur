@@ -79,6 +79,75 @@ fn prelude() -> Buffer! {
         .push_static("static inline intptr_t kur_dec_isize(uintptr_t b) { return b <= (uintptr_t)INTPTR_MAX ? (intptr_t)b : -(intptr_t)1 - (intptr_t)(UINTPTR_MAX - b); }\n")
 }
 
+// The header every file of a split build includes: the program's types, externs, data declarations
+// and function heads.
+const HEADER: Slice[u8, 'static] = "kursal-decls.h";
+
+// About the most C one file of a split build holds, in bytes, unless one function is longer.
+const PIECE: usize = 524288usize;
+
+// The start of a split build's C file other than its header.
+fn included() -> Buffer! {
+    Buffer!::new().push_static("#include \"").push_static(HEADER).push_static("\"\n\n")
+}
+
+// The C of a program: one file, or the files of a split build, each its name and text (`emit_c`).
+forall 'k.
+exposed enum CText! {
+    One(Buffer!),
+    Split(ArenaVec[(Span['k], Span['k]), 'k]),
+}
+
+// The file of a split build a function goes to, without its `.c`: its module, the leading segments
+// of its qualified name without the function's own, at most three, joined by `.`
+// (`kursal::infer::inference::Infer::unify` goes to `kursal.infer.inference`). A segment that is
+// not a plain name ends the module before it; a linear type's `!` is left out. Such names never
+// hold a `-`, which the header and the files the backend adds have.
+forall 'k.
+fn module_file(&cx: Domain!['k], name: Span['k]) -> Span['k] {
+    let separator = Span::from_static(&cx, "::");
+    let segments: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+    var rest = name;
+    var more = true;
+    while more {
+        more = match rest.find(&cx, separator, 0usize) {
+            Option::Some(at) => {
+                segments.push(&cx, rest.take(at));
+                rest = rest.skip(at + 2usize);
+                true
+            },
+            Option::None => false,
+        };
+    }
+    var out = Buffer!::new();
+    var taken = 0usize;
+    var plain = true;
+    while plain && taken < segments.len(&cx) && taken < 3usize {
+        let segment = segments.at(&cx, taken);
+        var i = 0usize;
+        while plain && i < segment.len() {
+            let b = segment.at(&cx, i);
+            plain = is_word_byte(b) || b == b'!' && i + 1usize == segment.len();
+            i = i + 1usize;
+        }
+        if plain && !segment.is_empty() {
+            if taken > 0usize {
+                out = out.push_static(".");
+            }
+            let bare = if segment.ends_with(&cx, Span::from_static(&cx, "!")) { segment.take(segment.len() - 1usize) } else { segment };
+            out = out.push_bytes(&cx, bare);
+            taken = taken + 1usize;
+        } else {
+            plain = false;
+        }
+    }
+    if taken == 0usize {
+        out.destroy();
+        return Span::from_static(&cx, "kursal-root");
+    }
+    out.save(&cx)
+}
+
 // Each of `items`, followed by a newline.
 forall 'k.
 fn text_lines(&cx: Domain!['k], c: Buffer!, items: ArenaVec[Span['k], 'k]) -> Buffer! {
@@ -528,8 +597,12 @@ exposed struct Backend {
     // Whether a resolved type is passed indirectly in C, shared across function specializations.
     by_pointer_cache: ArenaMap[Type['k], bool, 'k],
     queue: ArenaVec[(FunKey['k], Fun['k], ArenaMap[Span['k], Type['k], 'k], Span['k]), 'k],
-    // Each function in order: its symbol, when its head waits for `qualifiers`, else its head; its body.
-    emitted: ArenaVec[(Option[Span['k]], Span['k], Span['k]), 'k],
+    // Each function in order: its symbol, when its head waits for `qualifiers`, else its head; its body;
+    // and the file of a split build it goes to (`module_file`), empty for a thunk.
+    emitted: ArenaVec[(Option[Span['k]], Span['k], Span['k], Span['k]), 'k],
+    // `static ` for one C file, where every function and data is the file's own; empty for a split
+    // build, whose files call one another's
+    linkage: Span['k],
     // symbol -> its C result, whether it never returns, and its parameters; a parameter of a zero-size
     // type has the C type `void` and no name, and is not written
     heads: ArenaMap[Span['k], (Span['k], bool, ArenaVec[CParam['k], 'k]), 'k],
@@ -613,7 +686,7 @@ fn fail_text(&cx: Domain!['k], message: Span['k]) -> ! {
 
 forall 'k.
 impl Backend['k] {
-    fn new(&cx: Domain!['k], program: Program['k], typed: ArenaMap[FunKey['k], ArenaMap[(Span['k], Span['k]), Type['k], 'k], 'k], counter: Fresh['k]) -> Backend['k] {
+    fn new(&cx: Domain!['k], program: Program['k], typed: ArenaMap[FunKey['k], ArenaMap[(Span['k], Span['k]), Type['k], 'k], 'k], counter: Fresh['k], split: bool) -> Backend['k] {
         let taken = c_keywords(&cx);
         let runtime = runtime_names(&cx).keys(&cx);
         var r = 0usize;
@@ -696,6 +769,7 @@ impl Backend['k] {
             by_pointer_cache: ArenaMap::new(&cx),
             queue: ArenaVec::new(&cx),
             emitted: ArenaVec::new(&cx),
+            linkage: Span::from_static(&cx, if split { "" } else { "static " }),
             heads: ArenaMap::new(&cx),
             lends: ArenaVec::new(&cx),
             written: ArenaSet::new(&cx),
@@ -1398,7 +1472,7 @@ impl Backend['k] {
         } else {
             Buffer!::new().push_static(" {\n  return ").push_bytes(&cx, call).push_static("\n}\n").save(&cx)
         };
-        let head = Buffer!::new().push_static(if noreturn { "_Noreturn " } else { "" }).push_static("static ").push_bytes(&cx, ret).push_static(" ").push_bytes(&cx, thunk)
+        let head = Buffer!::new().push_static(if noreturn { "_Noreturn " } else { "" }).push_bytes(&cx, self.linkage).push_bytes(&cx, ret).push_static(" ").push_bytes(&cx, thunk)
             .push_static("(").push_bytes(&cx, or_void(&cx, params.join(&cx, ", "))).push_static(")").save(&cx);
         (head, body)
     }
@@ -1448,7 +1522,7 @@ impl Backend['k] {
         };
         let ct = self.c(&cx, whole);
         body = body.push_static("  return (").push_bytes(&cx, ct).push_static("){ ").push_bytes(&cx, parts.join(&cx, ", ")).push_static(" };\n}\n");
-        let head = Buffer!::new().push_static("static ").push_bytes(&cx, self.c(&cx, whole)).push_static(" ").push_bytes(&cx, thunk)
+        let head = Buffer!::new().push_bytes(&cx, self.linkage).push_bytes(&cx, self.c(&cx, whole)).push_static(" ").push_bytes(&cx, thunk)
             .push_static("(").push_bytes(&cx, or_void(&cx, params.join(&cx, ", "))).push_static(")").save(&cx);
         (head, body.save(&cx))
     }
@@ -1513,7 +1587,7 @@ impl Backend['k] {
 
     // ------------------------------------------------------------------- program --
 
-    fn emit_program(self, &cx: Domain!['k], entry: Option[Span['k]], times: bool) -> Buffer! {
+    fn emit_program(self, &cx: Domain!['k], entry: Option[Span['k]], times: bool) -> CText!['k] {
         var started = Instant::now();
         check_mono_termination(&cx, self.program);
         let keywords = c_keywords(&cx);
@@ -1594,17 +1668,20 @@ impl Backend['k] {
             match self.thunks.key_at(&cx, t) {
                 Option::Some(symbol) => {
                     let (head, body) = self.thunk(&cx, symbol, self.thunks.at(&cx, symbol));
-                    self.emitted.push(&cx, (Option::None, head, body));
+                    self.emitted.push(&cx, (Option::None, head, body, Span::from_static(&cx, "")));
                 },
                 Option::None => (),
             };
             t = t + 1usize;
         }
+        let declared: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         let datas: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         let entries = self.datas.values(&cx);
         var d = 0usize;
         while d < entries.len(&cx) {
-            datas.push(&cx, self.emit_data(&cx, entries.at(&cx, d)));
+            let (declaration, definition) = self.emit_data(&cx, entries.at(&cx, d));
+            declared.push(&cx, declaration);
+            datas.push(&cx, definition);
             d = d + 1usize;
         }
         // The first pending type each time: positions before `first` hold only defined ones.
@@ -1619,38 +1696,102 @@ impl Backend['k] {
         }
         let (const_params, restrict_params) = self.qualifiers(&cx);
         started = c_stage(times, "C definitions", started);
-        var c = prelude().push_static("\n");
-        c = text_lines(&cx, c, self.forward);
-        c = text_lines(&cx, c, self.defs);
-        c = text_lines(&cx, c, externs);
-        c = text_lines(&cx, c, datas);
         let heads: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         var h = 0usize;
         while h < self.emitted.len(&cx) {
-            let (symbol, fixed, _body) = self.emitted.at(&cx, h);
-            let head = match symbol {
+            let (symbol, fixed, _body, _file) = self.emitted.at(&cx, h);
+            heads.push(&cx, match symbol {
                 Option::Some(s) => self.head(&cx, s, const_params, restrict_params),
                 Option::None => fixed,
-            };
-            heads.push(&cx, head);
-            c = c.push_bytes(&cx, head).push_static(";\n");
+            });
             h = h + 1usize;
         }
-        var b = 0usize;
-        while b < self.emitted.len(&cx) {
-            let (_symbol, _fixed, body) = self.emitted.at(&cx, b);
-            c = c.push_bytes(&cx, heads.at(&cx, b)).push_bytes(&cx, body).push_static("\n");
-            b = b + 1usize;
-        }
-        let result = match main {
+        let wrapper = match main {
             Option::Some(symbol) => {
                 let fun = self.program.funs.at(&cx, match entry {
                     Option::Some(name) => name,
                     Option::None => Span::from_static(&cx, ""),
                 });
-                c.push_bytes(&cx, self.entry_wrapper(&cx, fun, symbol)).push_static("\n")
+                Option::Some.(self.entry_wrapper(&cx, fun, symbol))
             },
-            Option::None => c,
+            Option::None => Option::None,
+        };
+        // Types, externs and data, then every head, then every body: one file, or a split build's
+        // header and the files that include it.
+        var c = text_lines(&cx, text_lines(&cx, text_lines(&cx, prelude().push_static("\n"), self.forward), self.defs), externs);
+        let result = if self.linkage.is_empty() {
+            c = text_lines(&cx, c, declared);
+            var p = 0usize;
+            while p < heads.len(&cx) {
+                c = c.push_bytes(&cx, heads.at(&cx, p)).push_static(";\n");
+                p = p + 1usize;
+            }
+            let files: ArenaVec[(Span['k], Span['k]), 'k] = ArenaVec::new(&cx);
+            files.push(&cx, (Span::from_static(&cx, HEADER), Buffer!::new().push_static("#pragma once\n").push_buffer(c).save(&cx)));
+            files.push(&cx, (Span::from_static(&cx, "kursal-data.c"), text_lines(&cx, included(), datas).save(&cx)));
+            // the file of each group of functions, in the order their first function comes
+            let order: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+            let groups: ArenaMap[Span['k], ArenaVec[usize, 'k], 'k] = ArenaMap::new(&cx);
+            var b = 0usize;
+            while b < self.emitted.len(&cx) {
+                let (_symbol, _fixed, _body, file) = self.emitted.at(&cx, b);
+                let name = if file.is_empty() { Span::from_static(&cx, "kursal-thunks") } else { file };
+                match groups.get(&cx, name) {
+                    Option::Some(members) => members.push(&cx, b),
+                    Option::None => {
+                        order.push(&cx, name);
+                        groups.insert(&cx, name, ArenaVec::one(&cx, b));
+                    },
+                };
+                b = b + 1usize;
+            }
+            // A group's functions in files of about `PIECE` bytes each, the first named for the
+            // group, the next for it and `.2`, `.3`...: the largest file bounds a parallel build.
+            var g = 0usize;
+            while g < order.len(&cx) {
+                let name = order.at(&cx, g);
+                let members = groups.at(&cx, name);
+                var text = included();
+                var piece = 1usize;
+                var m = 0usize;
+                while m < members.len(&cx) {
+                    let at = members.at(&cx, m);
+                    let (_symbol, _fixed, body, _file) = self.emitted.at(&cx, at);
+                    text = text.push_bytes(&cx, heads.at(&cx, at)).push_bytes(&cx, body).push_static("\n");
+                    m = m + 1usize;
+                    if &text.len() >= PIECE || m == members.len(&cx) {
+                        let file = Buffer!::new().push_bytes(&cx, name);
+                        let file = if piece > 1usize { file.push_static(".").push_usize(piece) } else { file };
+                        files.push(&cx, (file.push_static(".c").save(&cx), text.save(&cx)));
+                        text = included();
+                        piece = piece + 1usize;
+                    }
+                }
+                text.destroy();
+                g = g + 1usize;
+            }
+            match wrapper {
+                Option::Some(text) => files.push(&cx, (Span::from_static(&cx, "kursal-main.c"), included().push_bytes(&cx, text).push_static("\n").save(&cx))),
+                Option::None => (),
+            };
+            CText!::Split.(files)
+        } else {
+            c = text_lines(&cx, c, datas);
+            var p = 0usize;
+            while p < heads.len(&cx) {
+                c = c.push_bytes(&cx, heads.at(&cx, p)).push_static(";\n");
+                p = p + 1usize;
+            }
+            var b = 0usize;
+            while b < self.emitted.len(&cx) {
+                let (_symbol, _fixed, body, _file) = self.emitted.at(&cx, b);
+                c = c.push_bytes(&cx, heads.at(&cx, b)).push_bytes(&cx, body).push_static("\n");
+                b = b + 1usize;
+            }
+            CText!::One.(match wrapper {
+                Option::Some(text) => c.push_bytes(&cx, text).push_static("\n"),
+                Option::None => c,
+            })
         };
         let finished = c_stage(times, "C assembly", started);
         result
@@ -1711,14 +1852,17 @@ impl Backend['k] {
         symbol
     }
 
-    // A data's C object; one of a zero-size type is a `char`, for the address the program sees.
-    fn emit_data(self, &cx: Domain!['k], entry: (Span['k], Data['k])) -> Span['k] {
+    // A data's C object, declared and defined; one of a zero-size type is a `char`, for the address
+    // the program sees.
+    fn emit_data(self, &cx: Domain!['k], entry: (Span['k], Data['k])) -> (Span['k], Span['k]) {
         let (symbol, data) = entry;
-        if self.erased(&cx, data.ty) {
-            return Buffer!::new().push_static("static char ").push_bytes(&cx, symbol).push_static(";").save(&cx);
-        }
-        let ct = self.c(&cx, data.ty);
-        Buffer!::new().push_static("static ").push_bytes(&cx, ct).push_static(" ").push_bytes(&cx, symbol).push_static(" = ").push_bytes(&cx, self.initializer(&cx, data.ty, data.init)).push_static(";").save(&cx)
+        let ct = if self.erased(&cx, data.ty) { Span::from_static(&cx, "char") } else { self.c(&cx, data.ty) };
+        let declared = Buffer!::new().push_static("extern ").push_bytes(&cx, ct).push_static(" ").push_bytes(&cx, symbol).push_static(";").save(&cx);
+        let defined = Buffer!::new().push_bytes(&cx, self.linkage).push_bytes(&cx, ct).push_static(" ").push_bytes(&cx, symbol);
+        let defined = if self.erased(&cx, data.ty) { defined } else {
+            defined.push_static(" = ").push_bytes(&cx, self.initializer(&cx, data.ty, data.init))
+        };
+        (declared, defined.push_static(";").save(&cx))
     }
 
     fn initializer(self, &cx: Domain!['k], ty: Type['k], form: Form['k]) -> Span['k] {
@@ -2036,7 +2180,7 @@ impl Backend['k] {
             body = body.push_static("  ").push_bytes(&cx, decls.at(&cx, d)).push_static("\n");
             d = d + 1usize;
         }
-        self.emitted.push(&cx, (Option::Some.(symbol), Span::from_static(&cx, ""), body.push_buffer(lines).push_static("}\n").save(&cx)));
+        self.emitted.push(&cx, (Option::Some.(symbol), Span::from_static(&cx, ""), body.push_buffer(lines).push_static("}\n").save(&cx), module_file(&cx, fun.name)));
     }
 
     // The local places that share the storage of a place path; `Backend.homes` in cgen.py states the
@@ -2498,7 +2642,7 @@ impl Backend['k] {
             params.push(&cx, Buffer!::new().push_bytes(&cx, ctype).push_static("* ").push_bytes(&cx, cname).save(&cx));
             o = o + 1usize;
         }
-        Buffer!::new().push_static(if noreturn { "_Noreturn " } else { "" }).push_static("static ").push_bytes(&cx, ret).push_static(" ").push_bytes(&cx, symbol)
+        Buffer!::new().push_static(if noreturn { "_Noreturn " } else { "" }).push_bytes(&cx, self.linkage).push_bytes(&cx, ret).push_static(" ").push_bytes(&cx, symbol)
             .push_static("(").push_bytes(&cx, or_void(&cx, params.join(&cx, ", "))).push_static(")").save(&cx)
     }
 
@@ -4330,8 +4474,9 @@ impl Walk['k] {
 }
 
 forall 'k.
-fn emit_c(&cx: Domain!['k], program: Program['k], typed: ArenaMap[FunKey['k], ArenaMap[(Span['k], Span['k]), Type['k], 'k], 'k], entry: Option[Span['k]], counter: Fresh['k], times: bool) -> Buffer! {
-    Backend::new(&cx, program, typed, counter).emit_program(&cx, entry, times)
+fn emit_c(&cx: Domain!['k], program: Program['k], typed: ArenaMap[FunKey['k], ArenaMap[(Span['k], Span['k]), Type['k], 'k], 'k], entry: Option[Span['k]], counter: Fresh['k], times: bool,
+    split: bool) -> CText!['k] {
+    Backend::new(&cx, program, typed, counter, split).emit_program(&cx, entry, times)
 }
 
 // The place path or out pointer `away` sends component `k` to (`Backend::away`).

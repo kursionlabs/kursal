@@ -9,9 +9,12 @@
 // `kursal c FILE [--entry NAME]` also prints its C, entered from C's `main` through the function
 // NAME; `kursal readable FILE` prints it as readable KURS.
 // `kursal lower PATH` lowers the package at PATH to core and prints it as KURS. `kursal build PATH
-// [-o OUTPUT] [--emit-c] [--times]` runs the whole pipeline. It compiles an executable to OUTPUT
-// (default a.out), or prints generated C with --emit-c. With --times it prints timings for each
-// stage, including the copies and arena releases between them.
+// [-o OUTPUT] [--emit-c] [--single-c] [--times]` runs the whole pipeline. It compiles an executable
+// to OUTPUT (default a.out), or prints generated C with --emit-c. With --times it prints timings
+// for each stage, including the copies and arena releases between them. With Clang or GCC, the C is
+// split into a file per module in OUTPUT.build, compiled in parallel, `$KURSAL_JOBS` files at once
+// or else one per processor, and linked with link-time optimization; --single-c writes it as one
+// file, OUTPUT.c, compiled whole, which builds slower and runs a little faster.
 // `kursal doc PATH -o SITE` writes a Krayon documentation site from resolved source.
 //
 // Each group of phases keeps what it builds in an arena of its own: the front end (the command
@@ -24,11 +27,11 @@
 
 use package::support::base::{emit, emit_buffer, fail};
 use std::collections::arena_vec::ArenaVec;
-use std::collections::arena_map::ArenaMap;
+use std::collections::arena_map::{ArenaMap, ArenaSet};
 use std::mem::Ref;
 use std::raw::Span;
 use std::alloc::arena::Domain!;
-use package::backend::cgen::emit_c;
+use package::backend::cgen::{CText!, emit_c};
 use package::check::checker::{FunKey, check_program, copy_typed};
 use package::syntax::dump as syntax_dump;
 use package::infer::inference::infer;
@@ -46,14 +49,18 @@ use package::types::selftest::selftest_types;
 use package::sigs::dump as sigs_dump;
 use package::sigs::signatures::signatures;
 use std::env::variable;
-use std::fs::{read_to_arena, write};
+use std::fs::{mkdir, read_dir, read_to_arena, remove, write};
 use package::types::ops::{Fresh, carry_fresh};
 use std::bytes::buffer::Buffer!;
 use std::io::eprint_buffer;
 use std::option::{Option, Result};
-use std::process::{Args, Command!, Exit};
+use std::process::{Args, Child!, Command!, Exit, Polled!, available_parallelism};
+use std::collections::vec::{OwnedVec!, Popped!};
+use std::cmp::Order;
+use std::io::Error;
 use std::slice::Slice;
-use std::time::Instant;
+use std::time::{Duration, Instant, sleep};
+use std::parse::parse_usize;
 
 // What the core and the back end are asked to do.
 exposed enum Goal {
@@ -61,7 +68,7 @@ exposed enum Goal {
     Check,
     // `kursal c FILE [--entry NAME]`
     C,
-    // `kursal build PATH [-o OUTPUT] [--emit-c] [--times]`
+    // `kursal build PATH [-o OUTPUT] [--emit-c] [--single-c] [--times]`
     Build,
 }
 
@@ -77,6 +84,8 @@ exposed struct Handoff {
     output: Option[Span['k]],
     link_flags: ArenaVec[Span['k], 'k],
     c_sources: ArenaVec[Span['k], 'k],
+    // `build --single-c`
+    single_c: bool,
     times: bool,
     // when the current stage started
     started: Instant,
@@ -87,8 +96,8 @@ forall 'a, 'b.
 fn carry(&from: Domain!['a], &to: Domain!['b], handoff: Handoff['a]) -> Handoff['b] {
     Handoff.{ goal: handoff.goal, program: copy_program(&from, &to, handoff.program), counter: carry_fresh(&from, &to, handoff.counter),
         entry: copy_option_text(&from, &to, handoff.entry), output: copy_option_text(&from, &to, handoff.output),
-        link_flags: copy_texts(&from, &to, handoff.link_flags), c_sources: copy_texts(&from, &to, handoff.c_sources), times: handoff.times,
-        started: handoff.started }
+        link_flags: copy_texts(&from, &to, handoff.link_flags), c_sources: copy_texts(&from, &to, handoff.c_sources), single_c: handoff.single_c,
+        times: handoff.times, started: handoff.started }
 }
 
 fn main(args: Args) -> i32 {
@@ -121,7 +130,7 @@ fn main(args: Args) -> i32 {
     let exists 'b. back = Domain!::new();
     var back = back;
     let emitted = carry(&core, &back, Handoff.{ goal: checked.goal, program: checked.program, counter: checked.counter, entry: checked.entry,
-        output: checked.output, link_flags: checked.link_flags, c_sources: checked.c_sources, times: checked.times, started });
+        output: checked.output, link_flags: checked.link_flags, c_sources: checked.c_sources, single_c: checked.single_c, times: checked.times, started });
     started = stage(times, "back copy", started);
     let typed = copy_typed(&core, &back, checker.typed);
     started = stage(times, "typed copy", started);
@@ -150,7 +159,7 @@ fn front_end(&cx: Domain!['k], process_args: Args) -> Option[Handoff['k]] {
     }
     let command = args.at(&cx, 0usize);
     if command.is(&cx, "--help") || command.is(&cx, "-h") || command.is(&cx, "help") {
-        emit_buffer(Buffer!::new().push_static("Kursal compiler\n\nUsage: kursal COMMAND [ARGS]\n\nCommands:\n  build PATH [-o OUTPUT] [--emit-c] [--times]  Build an executable (a.out by default)\n  doc PATH -o SITE    Generate a Krayon documentation site\n  parse FILE...       Print syntax trees\n  resolve PATH        Print name resolution\n  sigs PATH           Print signatures\n  infer PATH          Print inferred types\n  lower PATH          Print lowered KURS\n  kurs FILE           Read and print KURS\n  check FILE          Check KURS\n  c FILE [--entry NAME]  Generate C from KURS\n  readable FILE       Print readable KURS\n\nUse kursal COMMAND --help for command details.\n"));
+        emit_buffer(Buffer!::new().push_static("Kursal compiler\n\nUsage: kursal COMMAND [ARGS]\n\nCommands:\n  build PATH [-o OUTPUT] [--emit-c] [--single-c] [--times]  Build an executable (a.out by default)\n  doc PATH -o SITE    Generate a Krayon documentation site\n  parse FILE...       Print syntax trees\n  resolve PATH        Print name resolution\n  sigs PATH           Print signatures\n  infer PATH          Print inferred types\n  lower PATH          Print lowered KURS\n  kurs FILE           Read and print KURS\n  check FILE          Check KURS\n  c FILE [--entry NAME]  Generate C from KURS\n  readable FILE       Print readable KURS\n\nUse kursal COMMAND --help for command details.\n"));
         return Option::None;
     }
     if command.is(&cx, "--version") || command.is(&cx, "-V") {
@@ -159,7 +168,7 @@ fn front_end(&cx: Domain!['k], process_args: Args) -> Option[Handoff['k]] {
     }
     if args.len(&cx) == 2usize && (args.at(&cx, 1usize).is(&cx, "--help") || args.at(&cx, 1usize).is(&cx, "-h")) {
         if command.is(&cx, "build") {
-            emit_buffer(Buffer!::new().push_static("Usage: kursal build PATH [-o OUTPUT] [--emit-c] [--times]\n\nBuild an executable at OUTPUT (default: a.out). --emit-c prints generated C instead.\nPATH is a package directory, kur.toml, or a .kur file. --times prints stage timings to stderr.\n"));
+            emit_buffer(Buffer!::new().push_static("Usage: kursal build PATH [-o OUTPUT] [--emit-c] [--single-c] [--times]\n\nBuild an executable at OUTPUT (default: a.out). --emit-c prints generated C instead.\nPATH is a package directory, kur.toml, or a .kur file. --times prints stage timings to stderr.\nWith Clang or GCC the C goes to OUTPUT.build, a file per module, compiled in parallel and\nlinked with link-time optimization; --single-c compiles it as one file, OUTPUT.c.\n"));
         } else if command.is(&cx, "doc") {
             emit_buffer(Buffer!::new().push_static("Usage: kursal doc PATH -o SITE\n\nGenerate a Krayon site for the public modules of PATH. SITE must not exist. Then run `krayon build SITE`.\n"));
         } else if command.is(&cx, "c") {
@@ -215,7 +224,7 @@ fn front_end(&cx: Domain!['k], process_args: Args) -> Option[Handoff['k]] {
         Option::None
     } else if command.is(&cx, "check") && args.len(&cx) == 2usize {
         Option::Some.(Handoff.{ goal: Goal::Check, program: parse_program(&cx, read_file(&cx, args.at(&cx, 1usize))), counter: Fresh::new(&cx),
-            entry: Option::None, output: Option::None, link_flags: ArenaVec::new(&cx), c_sources: ArenaVec::new(&cx), times: false, started: Instant::now() })
+            entry: Option::None, output: Option::None, link_flags: ArenaVec::new(&cx), c_sources: ArenaVec::new(&cx), single_c: true, times: false, started: Instant::now() })
     } else if command.is(&cx, "c") {
         var file: Option[Span['k]] = Option::None;
         var entry: Option[Span['k]] = Option::None;
@@ -236,7 +245,7 @@ fn front_end(&cx: Domain!['k], process_args: Args) -> Option[Handoff['k]] {
             Option::None => fail(&cx, Span::from_static(&cx, "usage: kursal c FILE [--entry NAME]")),
         };
         Option::Some.(Handoff.{ goal: Goal::C, program: parse_program(&cx, read_file(&cx, path)), counter: Fresh::new(&cx),
-            entry, output: Option::None, link_flags: ArenaVec::new(&cx), c_sources: ArenaVec::new(&cx), times: false, started: Instant::now() })
+            entry, output: Option::None, link_flags: ArenaVec::new(&cx), c_sources: ArenaVec::new(&cx), single_c: true, times: false, started: Instant::now() })
     } else if command.is(&cx, "lower") && args.len(&cx) == 2usize {
         let counter = Fresh::new(&cx);
         let r = resolve(&cx, args.at(&cx, 1usize));
@@ -279,7 +288,7 @@ fn stage(times: bool, name: Slice[u8, 'static], started: Instant) -> Instant {
     }
 }
 
-// The front end of `kursal build PATH [-o OUTPUT] [--emit-c] [--times]`: the package resolved, its
+// The front end of `kursal build PATH [-o OUTPUT] [--emit-c] [--single-c] [--times]`: the package resolved, its
 // signatures built, and its bodies inferred and lowered.
 forall 'k.
 fn build(&cx: Domain!['k], args: ArenaVec[Span['k], 'k]) -> Handoff['k] {
@@ -287,6 +296,7 @@ fn build(&cx: Domain!['k], args: ArenaVec[Span['k], 'k]) -> Handoff['k] {
     var output: Option[Span['k]] = Option::None;
     var times = false;
     var emit_c_only = false;
+    var single_c = false;
     var i = 0usize;
     while i < args.len(&cx) {
         if args.at(&cx, i).is(&cx, "--times") {
@@ -295,6 +305,9 @@ fn build(&cx: Domain!['k], args: ArenaVec[Span['k], 'k]) -> Handoff['k] {
         } else if args.at(&cx, i).is(&cx, "--emit-c") {
             emit_c_only = true;
             i = i + 1usize;
+        } else if args.at(&cx, i).is(&cx, "--single-c") {
+            single_c = true;
+            i = i + 1usize;
         } else if args.at(&cx, i).is(&cx, "-o") && i + 1usize < args.len(&cx) && output.is_none() {
             output = Option::Some.(args.at(&cx, i + 1usize));
             i = i + 2usize;
@@ -302,12 +315,12 @@ fn build(&cx: Domain!['k], args: ArenaVec[Span['k], 'k]) -> Handoff['k] {
             path = Option::Some.(args.at(&cx, i));
             i = i + 1usize;
         } else {
-            fail(&cx, Span::from_static(&cx, "usage: kursal build PATH [-o OUTPUT] [--emit-c] [--times]"));
+            fail(&cx, Span::from_static(&cx, "usage: kursal build PATH [-o OUTPUT] [--emit-c] [--single-c] [--times]"));
         }
     }
     let package = match path {
         Option::Some(p) => p,
-        Option::None => fail(&cx, Span::from_static(&cx, "usage: kursal build PATH [-o OUTPUT] [--emit-c] [--times]")),
+        Option::None => fail(&cx, Span::from_static(&cx, "usage: kursal build PATH [-o OUTPUT] [--emit-c] [--single-c] [--times]")),
     };
     if emit_c_only && !output.is_none() {
         fail(&cx, Span::from_static(&cx, "--emit-c and -o cannot be used together"));
@@ -354,45 +367,219 @@ fn build(&cx: Domain!['k], args: ArenaVec[Span['k], 'k]) -> Handoff['k] {
         }
         p = p + 1usize;
     }
-    Handoff.{ goal: Goal::Build, program, counter, entry, output: destination, link_flags, c_sources, times, started }
+    Handoff.{ goal: Goal::Build, program, counter, entry, output: destination, link_flags, c_sources, single_c: single_c || emit_c_only, times, started }
 }
 
-// The back end, in the arena `cx`, which it destroys: the C of `handoff`'s program, printed or,
-// for `build` with OUTPUT, written to OUTPUT.c and compiled into OUTPUT with the standard
-// library's C helpers. The command's exit status: 1 when the C compiler cannot be started, exits
+// The back end, in the arena `cx`, which it destroys: the C of `handoff`'s program, printed or, for
+// `build` with OUTPUT, compiled into OUTPUT with the standard library's C helpers: written to
+// OUTPUT.c and compiled whole for `--single-c` or a C compiler other than Clang and GCC, else
+// written to OUTPUT.build as a file per module, which are compiled in parallel and linked with
+// link-time optimization. The command's exit status: 1 when the C compiler cannot be started, exits
 // with another status than 0 or is killed, which is reported on stderr.
 forall 'k.
 fn back_end(cx: Domain!['k], handoff: Handoff['k], typed: ArenaMap[FunKey['k], ArenaMap[(Span['k], Span['k]), Type['k], 'k], 'k], started: Instant) -> i32 {
     var cx = cx;
     var started = started;
-    let c = emit_c(&cx, handoff.program, typed, handoff.entry, handoff.counter, handoff.times);
+    // The C compiler of the reference's `kursal.cc`: `$KURSAL_CC`, else Clang, at -O3.
+    let compiler = match variable(&cx, Span::from_static(&cx, "KURSAL_CC")) {
+        Option::Some(name) => name.save(&cx),
+        Option::None => Span::from_static(&cx, ""),
+    };
+    let compiler = if compiler.is_empty() { Span::from_static(&cx, "clang") } else { compiler };
+    let lto = if handoff.single_c { Option::None } else { link_time_optimization(&cx, compiler) };
+    let text = emit_c(&cx, handoff.program, typed, handoff.entry, handoff.counter, handoff.times, lto.is_some());
     started = stage(handoff.times, "C", started);
     let out = match handoff.output {
         Option::Some(o) => o,
         Option::None => {
-            emit_buffer(c);
+            match text {
+                CText!::One(c) => emit_buffer(c),
+                CText!::Split(files) => fail(&cx, Span::from_static(&cx, "internal error: split C to print")),
+            };
             started = stage(handoff.times, "write C", started);
             cx.destroy();
             let finished = stage(handoff.times, "back free", started);
             return 0;
         },
     };
-    let c_file = Buffer!::new().push_bytes(&cx, out).push_static(".c").save(&cx);
-    if write(&cx, c_file, c).is_err() {
-        fail(&cx, Buffer!::new().push_static("cannot write ").push_bytes(&cx, c_file).save(&cx));
-    }
-    started = stage(handoff.times, "write C", started);
     let lib = lib_dir(&cx);
-    // The C compiler and flags of the reference's `kursal.cc`: `$KURSAL_CC`, else Clang, at -O3.
-    let compiler = match variable(&cx, Span::from_static(&cx, "KURSAL_CC")) {
-        Option::Some(name) => name.save(&cx),
-        Option::None => Span::from_static(&cx, ""),
+    // `$KURSAL_JOBS` C compilers at once, else one per processor
+    let jobs = match variable(&cx, Span::from_static(&cx, "KURSAL_JOBS")) {
+        Option::Some(text) => match parse_usize(&cx, text.save(&cx)) {
+            Option::Some(n) => if n > 0usize { n } else { available_parallelism() },
+            Option::None => available_parallelism(),
+        },
+        Option::None => available_parallelism(),
     };
-    let compiler = if compiler.is_empty() { Span::from_static(&cx, "clang") } else { compiler };
-    // Only the command line, copied into the `Command!`, and the compiler's name, for a failure,
-    // outlive the arena while `cc` runs.
-    var command = Command!::new(&cx, compiler).arg(&cx, Span::from_static(&cx, "-O3")).arg(&cx, Span::from_static(&cx, "-w")).arg(&cx, Span::from_static(&cx, "-fno-builtin"))
-        .arg(&cx, c_file).arg(&cx, Buffer!::new().push_bytes(&cx, lib).push_static("/libc/fs.c").save(&cx))
+    // Only the command lines, copied into the `Command!`s, and the compiler's name, for a failure,
+    // outlive the arena while the C compiler runs.
+    let (compiles, link) = match text {
+        CText!::One(c) => {
+            let c_file = Buffer!::new().push_bytes(&cx, out).push_static(".c").save(&cx);
+            if write(&cx, c_file, c).is_err() {
+                fail(&cx, Buffer!::new().push_static("cannot write ").push_bytes(&cx, c_file).save(&cx));
+            }
+            (OwnedVec!::new[Command!](), linked(&cx, c_command(&cx, compiler, Option::None).arg(&cx, c_file), handoff, lib, out))
+        },
+        CText!::Split(files) => {
+            let dir = Buffer!::new().push_bytes(&cx, out).push_static(".build").save(&cx);
+            match mkdir(&cx, dir) {
+                Result::Ok(made) => (),
+                // an earlier build's directory, kept: only the files written below are compiled
+                Result::Err(e) => if e.errno != 17i32 {
+                    fail(&cx, Buffer!::new().push_static("cannot make the directory ").push_bytes(&cx, dir).save(&cx));
+                },
+            };
+            forget_stale(&cx, dir, files);
+            // the C files, smallest first, so the largest are taken first from the end
+            let sized: ArenaVec[(usize, Span['k]), 'k] = ArenaVec::new(&cx);
+            var f = 0usize;
+            while f < files.len(&cx) {
+                let (name, body) = files.at(&cx, f);
+                let path = Buffer!::new().push_bytes(&cx, dir).push_static("/").push_bytes(&cx, name).save(&cx);
+                if write(&cx, path, Buffer!::new().push_bytes(&cx, body)).is_err() {
+                    fail(&cx, Buffer!::new().push_static("cannot write ").push_bytes(&cx, path).save(&cx));
+                }
+                if name.ends_with(&cx, Span::from_static(&cx, ".c")) {
+                    sized.push(&cx, (body.len(), path));
+                }
+                f = f + 1usize;
+            }
+            sized.sort_by(&cx, |&cx, a, b| {
+                let (x, _p) = a;
+                let (y, _q) = b;
+                if x < y { Order::Less } else if x > y { Order::Greater } else { Order::Equal }
+            });
+            var compiles = OwnedVec!::new[Command!]();
+            var link = c_command(&cx, compiler, lto);
+            var c = 0usize;
+            while c < sized.len(&cx) {
+                let (_size, path) = sized.at(&cx, c);
+                let object = Buffer!::new().push_bytes(&cx, path.take(path.len() - 2usize)).push_static(".o").save(&cx);
+                compiles = compiles.push(c_command(&cx, compiler, lto).arg(&cx, Span::from_static(&cx, "-c")).arg(&cx, path).arg(&cx, Span::from_static(&cx, "-o")).arg(&cx, object));
+                link = link.arg(&cx, object);
+                c = c + 1usize;
+            }
+            (compiles, linked(&cx, link, handoff, lib, out))
+        },
+    };
+    var cc = Buffer!::new().push_bytes(&cx, compiler);
+    started = stage(handoff.times, "cc setup", started);
+    cx.destroy();
+    started = stage(handoff.times, "back free", started);
+    let compiled = run_all(compiles, jobs, &cc);
+    started = stage(handoff.times, "cc compile", started);
+    let failure = match compiled {
+        Option::Some(message) => {
+            link.destroy();
+            Option::Some.(message)
+        },
+        Option::None => failure(&cc, link.run()),
+    };
+    cc.destroy();
+    let finished = stage(handoff.times, "cc", started);
+    match failure {
+        Option::None => 0i32,
+        Option::Some(message) => {
+            let printed = eprint_buffer(message.push_static("\n"));
+            1i32
+        },
+    }
+}
+
+// Removes from `dir` the C, header and object files of an earlier build that `files` does not
+// write again, so the directory holds this build's files only.
+forall 'k.
+fn forget_stale(&cx: Domain!['k], dir: Span['k], files: ArenaVec[(Span['k], Span['k]), 'k]) {
+    let kept: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+    var f = 0usize;
+    while f < files.len(&cx) {
+        let (name, _text) = files.at(&cx, f);
+        kept.insert(&cx, name);
+        if name.ends_with(&cx, Span::from_static(&cx, ".c")) {
+            kept.insert(&cx, Buffer!::new().push_bytes(&cx, name.take(name.len() - 2usize)).push_static(".o").save(&cx));
+        }
+        f = f + 1usize;
+    }
+    let stale: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+    match read_dir(&cx, dir) {
+        Result::Ok(directory) => {
+            var directory = directory;
+            var going = true;
+            while going {
+                match &directory.next() {
+                    Result::Ok(next) => match next {
+                        Option::Some(entry) => {
+                            let { name, is_directory } = entry;
+                            let name = name.save(&cx);
+                            let generated = name.ends_with(&cx, Span::from_static(&cx, ".c")) || name.ends_with(&cx, Span::from_static(&cx, ".h"))
+                                || name.ends_with(&cx, Span::from_static(&cx, ".o"));
+                            if !is_directory && generated && !kept.contains(&cx, name) {
+                                stale.push(&cx, name);
+                            }
+                        },
+                        Option::None => {
+                            going = false;
+                        },
+                    },
+                    Result::Err(e) => {
+                        going = false;
+                    },
+                };
+            }
+            let closed = directory.close();
+        },
+        Result::Err(e) => (),
+    };
+    var s = 0usize;
+    while s < stale.len(&cx) {
+        let removed = remove(&cx, Buffer!::new().push_bytes(&cx, dir).push_static("/").push_bytes(&cx, stale.at(&cx, s)).save(&cx));
+        s = s + 1usize;
+    }
+}
+
+// The link-time optimization flag of the C compiler `compiler`, by its name: ThinLTO for Clang, GCC's
+// own for GCC; none for another, whose C is then compiled as one file.
+forall 'k.
+fn link_time_optimization(&cx: Domain!['k], compiler: Span['k]) -> Option[Slice[u8, 'static]] {
+    var start = 0usize;
+    var more = true;
+    while more {
+        more = match compiler.find_byte(&cx, b'/', start) {
+            Option::Some(slash) => {
+                start = slash + 1usize;
+                true
+            },
+            Option::None => false,
+        };
+    }
+    let name = compiler.skip(start);
+    if name.contains(&cx, Span::from_static(&cx, "clang")) {
+        Option::Some.("-flto=thin")
+    } else if name.contains(&cx, Span::from_static(&cx, "gcc")) {
+        Option::Some.("-flto=auto")
+    } else {
+        Option::None
+    }
+}
+
+// The C compiler `compiler` with the flags of every compile and link: those of the reference's
+// `kursal.cc`, and `lto`.
+forall 'k.
+fn c_command(&cx: Domain!['k], compiler: Span['k], lto: Option[Slice[u8, 'static]]) -> Command! {
+    let command = Command!::new(&cx, compiler).arg(&cx, Span::from_static(&cx, "-O3")).arg(&cx, Span::from_static(&cx, "-w"))
+        .arg(&cx, Span::from_static(&cx, "-fno-builtin"));
+    match lto {
+        Option::Some(flag) => command.arg(&cx, Span::from_static(&cx, flag)),
+        Option::None => command,
+    }
+}
+
+// `command` linking into `out`, with the standard library's C helpers, the packages' C sources and
+// link flags, and threads.
+forall 'k.
+fn linked(&cx: Domain!['k], command: Command!, handoff: Handoff['k], lib: Span['k], out: Span['k]) -> Command! {
+    var command = command.arg(&cx, Buffer!::new().push_bytes(&cx, lib).push_static("/libc/fs.c").save(&cx))
         .arg(&cx, Buffer!::new().push_bytes(&cx, lib).push_static("/libc/thread.c").save(&cx));
     var f = 0usize;
     while f < handoff.c_sources.len(&cx) {
@@ -404,31 +591,125 @@ fn back_end(cx: Domain!['k], handoff: Handoff['k], typed: ArenaMap[FunKey['k], A
         command = command.arg(&cx, handoff.link_flags.at(&cx, f));
         f = f + 1usize;
     }
-    command = command.arg(&cx, Span::from_static(&cx, "-lpthread")).arg(&cx, Span::from_static(&cx, "-o")).arg(&cx, out);
-    let cc = Buffer!::new().push_bytes(&cx, compiler);
-    started = stage(handoff.times, "cc setup", started);
-    cx.destroy();
-    started = stage(handoff.times, "back free", started);
-    let ran = command.run();
-    let finished = stage(handoff.times, "cc", started);
-    // As `tools/build.py` reports it: the C compiler's own diagnostics are already on stderr.
-    let failure = match ran {
-        Result::Ok(exit) => match exit {
-            Exit::Code(code) => if code == 0i32 {
-                cc.destroy();
-                Option::None
-            } else {
-                Option::Some.(Buffer!::new().push_static("the C compiler ").push_buffer(cc).push_static(" exited with status ").push_i64(code as i64))
-            },
-            Exit::Signal(number) => Option::Some.(Buffer!::new().push_static("the C compiler ").push_buffer(cc).push_static(" was killed by signal ").push_i64(number as i64)),
-        },
-        Result::Err(e) => Option::Some.(Buffer!::new().push_static("cannot run the C compiler ").push_buffer(cc).push_static(" (error ").push_i64(e.errno as i64).push_static(")")),
-    };
-    match failure {
-        Option::None => 0i32,
-        Option::Some(message) => {
-            let printed = eprint_buffer(message.push_static("\n"));
-            1i32
-        },
+    command.arg(&cx, Span::from_static(&cx, "-lpthread")).arg(&cx, Span::from_static(&cx, "-o")).arg(&cx, out)
+}
+
+// Runs `commands`, at most `jobs` at once, from the last; once one fails, starts no more and waits
+// for those running. The first failure, as `failure` words it for the C compiler `cc`.
+fn run_all(commands: OwnedVec![Command!], jobs: usize, &cc: Buffer!) -> Option[Buffer!] {
+    var pending = commands;
+    var running = OwnedVec!::new[Child!]();
+    var first = Buffer!::new();
+    var failed = false;
+    var going = true;
+    while going {
+        var starting = !failed;
+        while starting && &running.len() < jobs {
+            match &pending.pop() {
+                Popped!::Item(command) => {
+                    match failure(&cc, spawned(command, &running)) {
+                        Option::None => (),
+                        Option::Some(message) => {
+                            first.destroy();
+                            first = message;
+                            failed = true;
+                            starting = false;
+                        },
+                    };
+                },
+                Popped!::Empty => {
+                    starting = false;
+                },
+            };
+        }
+        // Each running child polled once; those still running kept.
+        var still = OwnedVec!::new[Child!]();
+        var polling = true;
+        while polling {
+            match &running.pop() {
+                Popped!::Item(child) => {
+                    match child.try_wait() {
+                        Result::Ok(polled) => match polled {
+                            Polled!::Running(child) => {
+                                still = still.push(child);
+                            },
+                            Polled!::Ended(exit) => {
+                                if !failed {
+                                    match failure(&cc, Result::Ok.(exit)) {
+                                        Option::None => (),
+                                        Option::Some(message) => {
+                                            first.destroy();
+                                            first = message;
+                                            failed = true;
+                                        },
+                                    };
+                                }
+                            },
+                        },
+                        Result::Err(e) => if !failed {
+                            first.destroy();
+                            first = Buffer!::new().push_static("cannot wait for the C compiler (error ").push_i64(e.errno as i64).push_static(")");
+                            failed = true;
+                        },
+                    };
+                },
+                Popped!::Empty => {
+                    polling = false;
+                },
+            };
+        }
+        running.destroy(forget_child);
+        running = still;
+        going = &running.len() > 0usize || !failed && &pending.len() > 0usize;
+        if going {
+            sleep(Duration::from_millis(2u64));
+        }
     }
+    running.destroy(forget_child);
+    pending.destroy(forget_command);
+    if failed {
+        Option::Some.(first)
+    } else {
+        first.destroy();
+        Option::None
+    }
+}
+
+// The outcome of `spawn`ing `command`: the child added to `running`, or the error.
+fn spawned(command: Command!, &running: OwnedVec![Child!]) -> Result[Exit, Error] {
+    match command.spawn() {
+        Result::Ok(child) => {
+            running = running.push(child);
+            Result::Ok.(Exit::Code.(0i32))
+        },
+        Result::Err(e) => Result::Err.(e),
+    }
+}
+
+// What went wrong running the C compiler `cc`, as `tools/build.py` reports it (its own diagnostics
+// are already on stderr), or `None` when it exited with status 0.
+fn failure(&cc: Buffer!, ran: Result[Exit, Error]) -> Option[Buffer!] {
+    let (lead, middle, number, end) = match ran {
+        Result::Ok(exit) => match exit {
+            Exit::Code(code) => {
+                if code == 0i32 {
+                    return Option::None;
+                }
+                ("the C compiler ", " exited with status ", code as i64, "")
+            },
+            Exit::Signal(signal) => ("the C compiler ", " was killed by signal ", signal as i64, ""),
+        },
+        Result::Err(e) => ("cannot run the C compiler ", " (error ", e.errno as i64, ")"),
+    };
+    let name = &cc.clone();
+    Option::Some.(Buffer!::new().push_static(lead).push_buffer(name).push_static(middle).push_i64(number).push_static(end))
+}
+
+// Frees an empty vector's slots: no child or command is left in one this file frees.
+fn forget_child(child: Child!) {
+    let ended = child.wait();
+}
+
+fn forget_command(command: Command!) {
+    command.destroy();
 }

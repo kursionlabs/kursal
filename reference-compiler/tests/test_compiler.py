@@ -114,7 +114,8 @@ def run_valgrind(binary: Path, *args: str, timeout: int) -> subprocess.Completed
 
 def run_kursal(binary: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run([str(binary), *args], capture_output=True, text=True, timeout=TIME_LIMIT,
-                          preexec_fn=limit_memory, env=dict(os.environ, KURSAL_LIB=str(LIB), KURSAL_DIAGNOSTICS="short"))
+                          preexec_fn=limit_memory, env=dict(os.environ, KURSAL_LIB=str(LIB), KURSAL_DIAGNOSTICS="short",
+                                                            KURSAL_JOBS="2"))
 
 
 def digest_of(paths: list[Path]) -> str:
@@ -141,7 +142,7 @@ def cached(stem: str, key: str, make: Callable[[], list]) -> list:
 
 
 def self_built_compiler(kc1: Path) -> Path:
-    """kc2, the compiler kc1 builds from compiler/, kept in .build/ beside kc1; its C is kc2.c."""
+    """kc2, the compiler kc1 builds from compiler/, kept in .build/ beside kc1; its C, split, is in kc2.build."""
     kc2 = kc1.with_name(kc1.name.replace("kursal-", "kursal-self-"))
     if not kc2.exists():
         started = time.monotonic()
@@ -1769,13 +1770,28 @@ class CompilerTests(unittest.TestCase):
                 self.assertEqual(result.stderr, "")
 
         with tempfile.TemporaryDirectory() as directory:
+            # a file an earlier build left, which this one does not write
+            (Path(directory) / "a.out.build").mkdir()
+            (Path(directory) / "a.out.build/stale.c").write_text("")
             result = subprocess.run([str(self.binary), "build", str(ROOT / "examples/hello")], cwd=directory,
                                     capture_output=True, text=True, timeout=TIME_LIMIT,
                                     preexec_fn=limit_memory, env=dict(os.environ, KURSAL_LIB=str(LIB)))
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "")
             self.assertTrue((Path(directory) / "a.out").is_file())
+            self.assertTrue((Path(directory) / "a.out.build/kursal-decls.h").is_file())
+            self.assertFalse((Path(directory) / "a.out.c").exists())
+            self.assertFalse((Path(directory) / "a.out.build/stale.c").exists())
+            running = subprocess.run([str(Path(directory) / "a.out")], capture_output=True, text=True)
+            self.assertEqual((running.returncode, running.stdout), (0, "Hello, world!\n"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run([str(self.binary), "build", str(ROOT / "examples/hello"), "--single-c"], cwd=directory,
+                                    capture_output=True, text=True, timeout=TIME_LIMIT,
+                                    preexec_fn=limit_memory, env=dict(os.environ, KURSAL_LIB=str(LIB)))
+            self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue((Path(directory) / "a.out.c").is_file())
+            self.assertFalse((Path(directory) / "a.out.build").exists())
             running = subprocess.run([str(Path(directory) / "a.out")], capture_output=True, text=True)
             self.assertEqual((running.returncode, running.stdout), (0, "Hello, world!\n"))
 
@@ -1989,8 +2005,9 @@ class CompilerTests(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get("KURSAL_SELFHOST") == "1", "set KURSAL_SELFHOST=1 to compile the compiler with itself")
     def test_self_compilation_reaches_a_fixpoint(self):
-        """The compiler the reference built (kc1) builds compiler/ (kc2), which builds it again (kc3): kc2's C
-        and kc3's are the same, and the reference's C for compiler/."""
+        """The compiler the reference built (kc1) builds compiler/ (kc2, split), which builds it again (kc3,
+        split, and once more as one file): kc2's split C and kc3's are the same, and kc3's one file is the
+        reference's C for compiler/."""
         expected = reference_builds()[built_paths().index(COMPILER)]["c"]
         kc2 = self_built_compiler(self.binary)
         with tempfile.TemporaryDirectory() as directory:
@@ -1999,9 +2016,12 @@ class CompilerTests(unittest.TestCase):
             result = run_kursal(kc2, "build", str(COMPILER), "-o", str(kc3), "--times")
             self.assertEqual(result.returncode, 0, result.stderr)
             print(f"\nkc3 built in {time.monotonic() - started:.1f}s:\n{result.stderr}", file=sys.stderr)
-            kc2_c, kc3_c = (Path(f"{stage}.c").read_text() for stage in (kc2, kc3))
-        self.assertEqual(kc2_c, kc3_c)
-        self.assertEqual(kc2_c, expected)
+            single = run_kursal(kc2, "build", str(COMPILER), "-o", str(Path(directory) / "single"), "--single-c")
+            self.assertEqual(single.returncode, 0, single.stderr)
+            kc2_split, kc3_split = ({p.name: p.read_text() for p in Path(f"{stage}.build").glob("*.[ch]")} for stage in (kc2, kc3))
+            single_c = (Path(directory) / "single.c").read_text()
+        self.assertEqual(kc2_split, kc3_split)
+        self.assertEqual(single_c, expected)
 
     @unittest.skipUnless(os.environ.get("KURSAL_SELFHOST") == "1", "set KURSAL_SELFHOST=1 to compile the compiler with itself")
     def test_self_build_frees_everything(self):
@@ -2014,7 +2034,7 @@ class CompilerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "kc3"
             started = time.monotonic()
-            result = run_valgrind(kc2, "build", str(COMPILER), "-o", str(output), timeout=6 * 3600)
+            result = run_valgrind(kc2, "build", str(COMPILER), "-o", str(output), "--single-c", timeout=6 * 3600)
             print(f"\nkc3 built under valgrind in {time.monotonic() - started:.1f}s:\n"
                   + "\n".join(line for line in result.stderr.splitlines() if "in use at exit" in line or "ERROR SUMMARY" in line),
                   file=sys.stderr)
