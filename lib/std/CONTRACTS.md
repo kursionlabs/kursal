@@ -169,17 +169,22 @@ The library's own externs satisfy it:
   (declared `-> !`, the permitted terminating cases); `alloc::buffer`
   declares `abort` again for `Buffer!::new_with_cap` and `commit`;
 - `std::io`: `fs.c`'s `kur_libc_fs_read`, `_write`, `_open_read`,
-  `_create`, `_close` and `_regular_size`, which retry a call a signal
-  interrupts and report a failure as a negative errno;
+  `_create`, `_close`, `_regular_size` and `_size_hint`, which retry a call
+  a signal interrupts and report a failure as a negative errno, and
+  `kur_libc_stdin_claim` and `_release`, which set and clear the flag that
+  makes one `Input!` at a time the reader of standard input;
 - `std::fs`: `fs.c`'s `kur_libc_fs_error`, `_release`, `_canonicalize`,
   `_stat`, `_remove`, `_rename`, `_mkdir`, `_open_directory`,
   `_next_entry`, `_entry_name`, `_entry_is_directory` and
   `_close_directory`; `std::env`: `_getenv` and `_release`;
-- `std::process`: `fs.c`'s `kur_libc_process_run`, which starts the child
-  with `posix_spawnp` (no library code runs in the child) and waits for
-  it, again when a signal interrupts the wait;
-- `std::time`: `clock_gettime`, and `fs.c`'s `kur_libc_time_sleep`, which
-  sleeps on after a signal; `std::float`: `strtod`;
+- `std::process`: `fs.c`'s `kur_libc_process_spawn`, which starts the
+  child with `posix_spawnp` (no library code runs in the child),
+  `_wait`, which waits for it, again when a signal interrupts the wait,
+  and `_cpus`, which counts the processors of the affinity mask;
+- `std::time`: `fs.c`'s `kur_libc_time_monotonic`, which reads the host's
+  `CLOCK_MONOTONIC` (and aborts where it has none), and
+  `kur_libc_time_sleep`, which sleeps on after a signal; `std::float`:
+  `strtod`;
 - `libc::thread`: `thread.c`'s `kur_libc_thread_error`, `_create` and
   `_join`. A thread `_create` starts runs `entry` to its return; it is
   never cancelled and never calls `pthread_exit`.
@@ -470,7 +475,7 @@ runs, so it breaks no invariant and is safe to call.
   site (section 2.2), but it is an attestation, not evidence. A linear "filled"
   counter would prove that `n` writes happened, not that these `n` slots
   were the ones written. The remaining callers have the kernel write the
-  bytes through a raw pointer (`std::io::File!::read_to_buffer`, `read_all_stdin`,
+  bytes through a raw pointer (`std::io::File!::read_to_buffer`, `Input!`, `read_all_stdin`,
   `read_line`), where no per-slot operation exists to attach a witness to.
   Callers that only need a fully addressable scratch buffer use
   `Buffer!::new_zeroed`, which makes the claim true and carries no
@@ -519,10 +524,10 @@ Types whose hidden representation protects authority or bounds:
 | `HeapAllocator`, `Storage` | `alloc::heap` | zero-field receivers for the allocator's static methods; they own no memory |
 | `AlignProbe[T]` | `core::mem` | never built; `alignof` takes only its size |
 | `Stamp['r]` | `core::cap` | exposed to `core` alone (`exposed (package)`): `core` modules read a domain's brand out of it, code outside `core` can hold one but not open it |
-| `File!`, `Output!` | `std::io` | `File!` owns one open descriptor; forging one closes an arbitrary descriptor. `Output!` writes to a descriptor it does not own (stdout, stderr), which a forged one could point anywhere. No `File!` owns a standard stream's number: the C `main` of an executable (`kursal build`) opens `/dev/null` on each of descriptors 0, 1 and 2 the process started without, before the program runs |
+| `File!`, `Output!`, `Input!` | `std::io` | `File!` owns one open descriptor; forging one closes an arbitrary descriptor. `Output!` writes to a descriptor it does not own (stdout, stderr), which a forged one could point anywhere. `Input!` is made only by `stdin`, once it holds standard input, so that one reader at a time reads ahead from it; a forged one would skip what another has read ahead, and its `finish` would give standard input back from under the one that holds it. No `File!` owns a standard stream's number: the C `main` of an executable (`kursal build`) opens `/dev/null` on each of descriptors 0, 1 and 2 the process started without, before the program runs |
 | `Args` | `std::process` | `argv` and `argc` as C's `main` received them: made only by the C `main` the compiler writes for an entry function taking one (its `argv` has `count` readable entries, each a NUL-terminated string live for the rest of the process) |
 | `Command!` | `std::process` | a command line of `count` NUL-terminated arguments, which `fs.c` splits into the table `posix_spawnp` reads |
-| `Instant`, `Timespec` | `std::time` | a monotonic clock reading, and the C structure `clock_gettime` fills; nothing outside makes either |
+| `Instant` | `std::time` | a monotonic clock reading; nothing outside makes one |
 | `Directory!` | `std::fs` | owns one open `DIR *`; forging one hands `readdir`/`closedir` an arbitrary pointer |
 | `Thread!` | `libc::thread` | owns one `pthread_t` handle that `join` frees; forging one joins and frees an arbitrary pointer |
 | `Thread![Ret]`, `SpawnPayload`, `ResultBox` | `thread::thread` | a spawned thread whose `join` reads back a `ResultBox[Ret]`; a forged one would read any thread's result as a `Ret`. The boxes never leave the module |

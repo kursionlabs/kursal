@@ -2,14 +2,18 @@
  * any header reads them. */
 #define _FILE_OFFSET_BITS 64
 #define _TIME_BITS 64
+/* `sched_getaffinity` and `CPU_COUNT`, where the C library has them. */
+#define _GNU_SOURCE
 #define _DEFAULT_SOURCE
 #define _XOPEN_SOURCE 700
 #include "fs.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <signal.h>
 #include <spawn.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -128,16 +132,46 @@ int32_t kur_libc_fs_close(int32_t fd) {
     return close(fd) == 0 ? 0 : errno;
 }
 
+/* The size of the regular file open on `fd`; `other` for anything else
+ * that is not a directory; or a negative errno: EISDIR for a directory,
+ * EFBIG for a size an intptr_t cannot hold. */
+static intptr_t regular_size_or(int32_t fd, intptr_t other) {
+    struct stat info;
+    if (fstat(fd, &info) != 0) return -(intptr_t)errno;
+    if (S_ISDIR(info.st_mode)) return -(intptr_t)EISDIR;
+    if (!S_ISREG(info.st_mode)) return other;
+    if (info.st_size < 0 || (uintmax_t)info.st_size > (uintmax_t)INTPTR_MAX) return -(intptr_t)EFBIG;
+    return (intptr_t)info.st_size;
+}
+
 /* The size of the regular file open on `fd`, or a negative errno: EISDIR
  * for a directory, EINVAL for anything else that is not a regular file,
  * EFBIG for a size an intptr_t cannot hold. */
 intptr_t kur_libc_fs_regular_size(int32_t fd) {
-    struct stat info;
-    if (fstat(fd, &info) != 0) return -(intptr_t)errno;
-    if (S_ISDIR(info.st_mode)) return -(intptr_t)EISDIR;
-    if (!S_ISREG(info.st_mode)) return -(intptr_t)EINVAL;
-    if (info.st_size < 0 || (uintmax_t)info.st_size > (uintmax_t)INTPTR_MAX) return -(intptr_t)EFBIG;
-    return (intptr_t)info.st_size;
+    return regular_size_or(fd, -(intptr_t)EINVAL);
+}
+
+/* How many bytes reading `fd` to its end is likely to give: a regular
+ * file's size, 0 for a pipe, device or socket, whose size says nothing
+ * about it; or a negative errno: EISDIR for a directory, EFBIG for a size
+ * an intptr_t cannot hold. */
+intptr_t kur_libc_fs_size_hint(int32_t fd) {
+    return regular_size_or(fd, 0);
+}
+
+/* Whether a `std::io::Input!` holds standard input: the one reader of it
+ * at a time, so that no bytes it has read ahead are skipped by another. */
+static atomic_flag stdin_claimed = ATOMIC_FLAG_INIT;
+
+/* Claims standard input for one reader: 0, or EBUSY while another holds
+ * it. */
+int32_t kur_libc_stdin_claim(void) {
+    return atomic_flag_test_and_set(&stdin_claimed) ? EBUSY : 0;
+}
+
+/* Gives standard input back, for the next `kur_libc_stdin_claim`. */
+void kur_libc_stdin_release(void) {
+    atomic_flag_clear(&stdin_claimed);
 }
 
 /* Opaque entry borrowed until the next read or close on this DIR.
@@ -226,8 +260,17 @@ int64_t kur_libc_process_wait(int64_t pid, uint8_t block) {
     return -(int64_t)ECHILD;
 }
 
-/* The number of processors online, at least 1. */
+/* The number of processors this process may run on, at least 1: those of
+ * its CPU affinity mask (`sched_getaffinity`) where the C library reports
+ * it, else those online. */
 uintptr_t kur_libc_process_cpus(void) {
+#ifdef CPU_COUNT
+    cpu_set_t allowed;
+    if (sched_getaffinity(0, sizeof allowed, &allowed) == 0) {
+        int n = CPU_COUNT(&allowed);
+        if (n > 0) return (uintptr_t)n;
+    }
+#endif
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return n < 1 ? 1 : (uintptr_t)n;
 }
@@ -258,6 +301,16 @@ void kur_libc_process_start(void) {
  * `Result[(), std::io::Error]` calls it before exiting with status 1. */
 void kur_libc_process_report_error(int32_t code) {
     fprintf(stderr, "error: %s (error %d)\n", strerror(code), (int)code);
+}
+
+/* A reading of the monotonic clock (CLOCK_MONOTONIC) in nanoseconds: it
+ * never goes back, and its start is arbitrary. POSIX hosts have this
+ * clock, so `clock_gettime` does not fail on it; on one where it does, the
+ * process aborts rather than report a time that could go back. */
+uint64_t kur_libc_time_monotonic(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) abort();
+    return (uint64_t)now.tv_sec * 1000000000u + (uint64_t)now.tv_nsec;
 }
 
 /* Sleeps for `nanos` nanoseconds, sleeping on for what is left when a

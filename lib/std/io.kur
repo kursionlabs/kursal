@@ -3,7 +3,8 @@
 //! Process I/O over the POSIX `read`/`write`/`open`/`close`/`fstat` calls:
 //! byte output to standard output (`print`) and standard error (`eprint`),
 //! whole-file and stdin reads into an owned `Buffer!`, the owning
-//! descriptor type `File!`, and buffered `Output!`;
+//! descriptor type `File!`, buffered `Output!`, and `Input!`, the buffered
+//! reader of standard input;
 //! and `Error`, the error of every operating-system call of the library.
 //! Paths are any byte view (`c_string`); `std::fs` works with them whole.
 
@@ -28,6 +29,9 @@ extern "C" fn kur_libc_fs_open_read(path: *u8, len: usize) -> i32;
 extern "C" fn kur_libc_fs_create(path: *u8, len: usize) -> i32;
 extern "C" fn kur_libc_fs_close(fd: i32) -> i32;
 extern "C" fn kur_libc_fs_regular_size(fd: i32) -> isize;
+extern "C" fn kur_libc_fs_size_hint(fd: i32) -> isize;
+extern "C" fn kur_libc_stdin_claim() -> i32;
+extern "C" fn kur_libc_stdin_release() -> ();
 
 /// A path, name or argument for C: the bytes of a view, read through the
 /// capability that permits it, followed by a NUL, in a buffer the caller
@@ -198,17 +202,19 @@ unsafe fn read_exact(fd: i32, buf: *u8, size: usize) -> Result[usize, Error] {
     Result::Ok.(done)
 }
 
-/// Reads `fd` to EOF, 4096 bytes at a time, appending to `b` and returning
-/// it. A read error frees what was read and is returned: it never looks like
-/// the end of the input. Caller: `fd` is a descriptor the caller may read,
-/// as for `read_exact`.
+/// Reads `fd` to EOF, appending to `b` and returning it. Each read fills
+/// the room `b` has, and a full `b` grows first, by at least 4096 bytes and
+/// at least doubling, so a `b` made with room for all the input and one
+/// byte more reads it without growing. A read error frees what was read and
+/// is returned: it never looks like the end of the input. Caller: `fd` is a
+/// descriptor the caller may read, as for `read_exact`.
 unsafe fn read_to_end_from(fd: i32, b: Buffer!) -> Result[Buffer!, Error] {
-    let chunk = 4096usize;
     var b = b;
     while true {
-        let w = b.writer(chunk);
+        let room = &b.remaining_capacity();
+        let w = b.writer(if room == 0usize { 4096usize } else { room });
         let (dest, avail) = unsafe &w.writable_tail();
-        let n = unsafe kur_libc_fs_read(fd, dest, chunk);
+        let n = unsafe kur_libc_fs_read(fd, dest, avail);
         if n == 0isize {
             return Result::Ok.(w.finish());
         }
@@ -216,27 +222,167 @@ unsafe fn read_to_end_from(fd: i32, b: Buffer!) -> Result[Buffer!, Error] {
             w.finish().destroy();
             return Result::Err.(Error::of_return(n));
         }
-        // `commit_external` obligation: `dest` is `w.writable_tail()`'s
-        // pointer after `b.writer(chunk)`, and a successful read returning
-        // `n` wrote exactly `dest[0..n)`, with `n <= chunk`. `n <= 0` has
-        // been ruled out, so the cast cannot turn an error into a length.
+        // `commit_external` obligation: `dest` and `avail` are
+        // `w.writable_tail()`'s, and a successful read returning `n` wrote
+        // exactly `dest[0..n)`, with `n <= avail`. `n <= 0` has been ruled
+        // out, so the cast cannot turn an error into a length.
         b = unsafe w.commit_external(n as usize);
     }
     Result::Ok.(b)
 }
 
-/// All of standard input, read to its end.
+// ------------------------------------------------------- standard input --
+// Standard input is read through an `Input!`, which reads ahead into a
+// buffer and returns lines from it, or through `read_all_stdin` and
+// `read_line`. Bytes an `Input!` has read ahead are its own: another reader
+// of standard input would skip them. So one reader at a time holds
+// standard input, by a flag `fs.c` keeps (`kur_libc_stdin_claim`): `stdin`
+// fails with EBUSY while an `Input!` holds it, and so do `read_all_stdin`
+// and `read_line`, which hold it for the length of the call. `finish`
+// gives it back, with the bytes read ahead and not yet returned. Code that
+// reads standard input without these (a C library, a child process
+// `std::process` starts) does not see the bytes an `Input!` has read ahead.
+
+/// The buffered reader of standard input: lines (`read_line`) and the rest
+/// (`read_to_end`), read 64 KiB at a time. The one reader of standard input
+/// while it lives (see `stdin`). Call `finish` to give it back.
+struct Input! {
+    // what standard input gave and has not been returned yet: `buf[start..)`
+    buf: Buffer!,
+    start: usize,
+}
+
+/// Standard input, held by the `Input!` returned until its `finish`, or
+/// EBUSY while another `Input!` holds it.
+fn stdin() -> Result[Input!, Error] {
+    let claimed = unsafe kur_libc_stdin_claim();
+    if claimed != 0i32 {
+        Result::Err.(Error.{ errno: claimed })
+    } else {
+        Result::Ok.(Input!.{ buf: Buffer!::new_with_cap(65536usize), start: 0usize })
+    }
+}
+
+impl Input! {
+    /// The next line, without its newline, as the free `read_line` reads
+    /// it: `None` at the end of input, when no byte is left to read; an
+    /// empty line is `Some` of an empty buffer, and a last line with no
+    /// newline is still a line. A read error is returned, and the bytes of
+    /// the line read before it are lost with it.
+    fn read_line(&self) -> Result[Option[Buffer!], Error] {
+        let { buf, start } = self;
+        var buf = buf;
+        var start = start;
+        var line = Buffer!::new();
+        while true {
+            let n = &buf.len();
+            let p = unsafe &buf.as_ptr();
+            // `p[0..n)` are the bytes `buf` holds, unchanged until `buf`
+            // is pushed to or freed.
+            var end = start;
+            while end < n && unsafe *(unsafe offset(p, end)) != b'\n' {
+                end = end + 1usize;
+            }
+            line = unsafe line.push_n(unsafe offset(p, start), end - start);
+            if end < n {
+                self = Input!.{ buf, start: end + 1usize };
+                return Result::Ok.(Option::Some.(line));
+            }
+            // Every byte read ahead is in `line`: read more into the room.
+            start = 0usize;
+            let w = buf.clear().writer(1usize);
+            let (dest, avail) = unsafe &w.writable_tail();
+            let got = unsafe kur_libc_fs_read(0i32, dest, avail);
+            if got < 0isize {
+                self = Input!.{ buf: w.finish(), start };
+                line.destroy();
+                return Result::Err.(Error::of_return(got));
+            }
+            if got == 0isize {
+                self = Input!.{ buf: w.finish(), start };
+                if &line.len() > 0usize {
+                    return Result::Ok.(Option::Some.(line));
+                }
+                line.destroy();
+                return Result::Ok.(Option::None);
+            }
+            // A successful read returning `got` wrote exactly `dest[0..got)`,
+            // inside the room `writable_tail` gave.
+            buf = unsafe w.commit_external(got as usize);
+        }
+        self = Input!.{ buf, start };
+        Result::Ok.(Option::Some.(line))
+    }
+
+    /// The rest of standard input, read to its end, the bytes read ahead
+    /// first. A read error is returned, and what was read is lost with it.
+    fn read_to_end(&self) -> Result[Buffer!, Error] {
+        let { buf, start } = self;
+        let rest = rest_of(buf, start);
+        // Standard input is the process's own, and this `Input!` holds it.
+        let all = unsafe read_to_end_from(0i32, rest);
+        self = Input!.{ buf: Buffer!::new_with_cap(65536usize), start: 0usize };
+        all
+    }
+
+    /// Gives standard input back, for the next `stdin`, `read_line` or
+    /// `read_all_stdin`: the bytes read ahead and not returned yet, which
+    /// the next reader of standard input does not see.
+    fn finish(self) -> Buffer! {
+        let { buf, start } = self;
+        unsafe kur_libc_stdin_release();
+        rest_of(buf, start)
+    }
+}
+
+/// `buf[start..)` in a buffer of its own; `buf` is freed.
+fn rest_of(buf: Buffer!, start: usize) -> Buffer! {
+    let n = &buf.len();
+    let p = unsafe &buf.as_ptr();
+    // `p[start..n)` are bytes `buf` holds, and `buf` is freed after the copy.
+    let rest = unsafe Buffer!::new_with_cap(n - start).push_n(unsafe offset(p, start), n - start);
+    buf.destroy();
+    rest
+}
+
+/// All of standard input, read to its end: what `Input!::read_to_end`
+/// reads from a new `Input!`. Fails with EBUSY while an `Input!` holds
+/// standard input.
 fn read_all_stdin() -> Result[Buffer!, Error] {
-    // Standard input is the process's own, readable by any of its code.
-    unsafe read_to_end_from(0i32, Buffer!::new())
+    match stdin() {
+        Result::Err(e) => Result::Err.(e),
+        Result::Ok(input) => {
+            var input = input;
+            let all = &input.read_to_end();
+            input.finish().destroy();
+            all
+        },
+    }
 }
 
 /// One line of stdin, without its newline: reads through the next newline
-/// or to the end of input, one byte at a time so nothing past the line is
-/// consumed. `None` at the end of input, when no byte is left to read; an
-/// empty line is `Some` of an empty buffer, and a last line with no newline
-/// is still a line.
+/// or to the end of input. `None` at the end of input, when no byte is left
+/// to read; an empty line is `Some` of an empty buffer, and a last line
+/// with no newline is still a line.
+///
+/// It reads one byte at a time, a system call for each, so that nothing
+/// past the line is consumed: what follows is left for whatever reads
+/// standard input next, such as a program `std::process` starts. To read
+/// many lines, read them through an `Input!` (`stdin`), which reads ahead.
+/// Fails with EBUSY while an `Input!` holds standard input, since the line
+/// would skip the bytes it has read ahead.
 fn read_line() -> Result[Option[Buffer!], Error] {
+    let claimed = unsafe kur_libc_stdin_claim();
+    if claimed != 0i32 {
+        return Result::Err.(Error.{ errno: claimed });
+    }
+    let line = read_line_unbuffered();
+    unsafe kur_libc_stdin_release();
+    line
+}
+
+/// `read_line`, holding standard input.
+fn read_line_unbuffered() -> Result[Option[Buffer!], Error] {
     var b = Buffer!::new();
     var any = false;
     while true {
@@ -279,7 +425,7 @@ fn read_line() -> Result[Option[Buffer!], Error] {
 // Standard input, output and error stay bare `i32`s (0/1/2), never
 // `File!`: they are borrowed process handles this program did not open
 // and must not close. Only this module names them, in `print`, `eprint`,
-// `read_line`, `read_all_stdin` and `Output!`. A `File!` never gets one of
+// `Input!`, `read_line` and `Output!`. A `File!` never gets one of
 // their numbers: the C `main` the compiler writes for an executable opens
 // /dev/null on each of the three the process started without, before the
 // program runs.
@@ -420,9 +566,9 @@ impl File! {
     }
 
     /// Reads from the descriptor's offset to EOF into a fresh `Buffer!`,
-    /// for files whose size is not known ahead, such as pipes and `/proc`.
-    /// A read error is returned, not taken for the end. Does not close
-    /// `self`.
+    /// which grows as it fills (`read_to_buffer` sizes it up front for a
+    /// regular file). A read error is returned, not taken for the end. Does
+    /// not close `self`.
     fn read_to_end(&self) -> Result[Buffer!, Error] {
         let { fd } = self;
         // `fd` is the descriptor this `File!` owns.
@@ -431,22 +577,24 @@ impl File! {
         b
     }
 
-    /// Reads a regular file from the descriptor's offset to EOF into a
-    /// fresh `Buffer!`, sized up front by `file_size`. Reading goes on to EOF
+    /// Reads from the descriptor's offset to EOF into a fresh `Buffer!`, as
+    /// `read_to_end` does, but sized up front for a regular file: by its
+    /// size, so it is read without growing the buffer. Reading goes on to EOF
     /// whatever the size said, so a file that grows or shrinks meanwhile is
-    /// read as it is. Fails as `file_size` does, so a directory is EISDIR.
-    /// Does not close `self`.
+    /// read as it is; a pipe, a device or a socket, whose size says nothing,
+    /// is read until it ends. A directory is EISDIR. Does not close `self`.
     fn read_to_buffer(&self) -> Result[Buffer!, Error] {
-        match &self.file_size() {
-            Result::Err(code) => Result::Err.(code),
-            Result::Ok(size) => {
-                let { fd } = self;
-                // `fd` is the descriptor this `File!` owns.
-                let b = unsafe read_to_end_from(fd, Buffer!::new_with_cap(size));
-                self = File!.{ fd };
-                b
-            },
-        }
+        let { fd } = self;
+        let hint = unsafe kur_libc_fs_size_hint(fd);
+        // `fd` is the descriptor this `File!` owns. The room past the size
+        // is for the read that finds the end, or a pipe's first reads.
+        let b = if hint < 0isize {
+            Result::Err.(Error::of_return(hint))
+        } else {
+            unsafe read_to_end_from(fd, Buffer!::new_with_cap((hint as usize) + 4096usize))
+        };
+        self = File!.{ fd };
+        b
     }
 }
 

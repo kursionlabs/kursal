@@ -2,8 +2,9 @@
 
 `fs.c` is the C half of the standard library's operating-system layer:
 `std::io` (descriptors), `std::fs` (paths, files and directories),
-`std::env` (the environment), `std::process` (running programs) and
-`std::time::sleep` call it. `thread.kur` is a thin POSIX thread adapter
+`std::env` (the environment), `std::process` (running programs and
+counting processors) and `std::time` (the monotonic clock and `sleep`)
+call it. `thread.kur` is a thin POSIX thread adapter
 over `thread.c`. Both target POSIX hosts, not freestanding kernels.
 
 Every C function retries a call a signal interrupts, opens descriptors
@@ -50,6 +51,17 @@ EACCES for a file that is not executable), and runs no code of this library
 in the child. A line whose arguments are not exactly `count` is EINVAL.
 `kur_libc_process_wait` waits for the child: the exit status, 256 plus the
 signal's number, or a negative errno.
+
+`kur_libc_fs_size_hint` is what `File!::read_to_buffer` sizes its buffer
+by: a regular file's size, 0 for a pipe, device or socket, which are read
+until they end, EISDIR for a directory. `kur_libc_stdin_claim` and
+`kur_libc_stdin_release` set and clear one process-wide flag, so that one
+reader of standard input at a time (a `std::io::Input!`, or `read_line` or
+`read_all_stdin` for the length of the call) holds it, and none skips the
+bytes another has read ahead. `kur_libc_process_cpus` counts the processors
+of the process's affinity mask (`sched_getaffinity`, where the C library
+has it), else those online. `kur_libc_time_monotonic` reads
+`CLOCK_MONOTONIC`, so that no clock's number is written in Kursal code.
 
 `kur_libc_process_report_error` is called by no Kursal code: the C `main`
 the compiler writes for an entry returning `Result[(), std::io::Error]`

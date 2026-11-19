@@ -6,6 +6,7 @@ import resource
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import IO, Callable, Optional
@@ -571,6 +572,38 @@ class StdRuntimeTests(unittest.TestCase):
                     && d.as_nanos() == 18446744073709551615u64 { 0 } else { 1 }
             }''')
 
+    def test_instant_reads_the_monotonic_clock_through_the_c_library(self):
+        # `Instant::now` reads CLOCK_MONOTONIC through fs.c, which names the host's clock, so no clock
+        # number (Linux's 1, FreeBSD's 4, macOS's 6) is written in Kursal: the time between two readings
+        # around a sleep is the sleep's at least, and no more than the whole run's.
+        started = time.monotonic_ns()
+        result = self.run_program('''
+            use std::time::{Duration, Instant, sleep};
+            use std::io::print_buffer;
+            fn main() -> i32 {
+                let start = Instant::now();
+                sleep(Duration::from_millis(30u64));
+                let elapsed = start.nanos_until(Instant::now());
+                let printed = print_buffer(f"{elapsed}");
+                0
+            }''')
+        whole = time.monotonic_ns() - started
+        self.assertEqual(result.returncode, 0, result.stderr[:500])
+        self.assertTrue(30_000_000 <= int(result.stdout) <= whole, (result.stdout, whole))
+        self.assertFalse("clock_gettime" in (LIB / "std/time.kur").read_text(), "std::time names a clock itself")
+
+    def test_available_parallelism_counts_the_processors_of_the_affinity_mask(self):
+        # Allowed to run on one processor (`taskset -c 0`), the process can run one thread at a time.
+        def one_processor() -> None:
+            os.sched_setaffinity(0, {min(os.sched_getaffinity(0))})
+        self.expect('''
+            use std::process::available_parallelism;
+            fn main() -> i32 {
+                available_parallelism() as i32
+            }''', status=1, preexec=one_processor)
+
+    # -------------------------------------------------------------------- io --
+
     def test_reading_a_directory_is_an_error(self):
         self.expect('''
             use std::option::Result;
@@ -591,6 +624,42 @@ class StdRuntimeTests(unittest.TestCase):
                     },
                 }
             }''')
+
+    def test_files_that_are_not_regular_are_read_to_their_end(self):
+        # A pipe (/dev/stdin fed by one) and a device (/dev/null) have no size to read by: `fs::read` and
+        # `File!::read_to_buffer` read them until they end. A regular file is read whole, a directory is
+        # EISDIR.
+        text = "line\n" * 20000
+        self.expect('''
+            use std::bytes::buffer::Buffer!;
+            use std::fs::{read, write};
+            use std::io::{Error, File!, print_buffer};
+            use std::option::Result;
+            use std::slice::StaticRead;
+            fn length(r: Result[Buffer!, Error]) -> i32 {
+                match r {
+                    Result::Ok(b) => { let n = &b.len(); b.destroy(); n as i32 },
+                    Result::Err(e) => 0i32 - e.errno,
+                }
+            }
+            fn main() -> i32 {
+                var sr = StaticRead::new();
+                let none = length(read(&sr, "/dev/null"));
+                let directory = length(read(&sr, "."));
+                let written = write(&sr, "file.txt", Buffer!::new().push_static("12345")).is_ok();
+                let regular = length(read(&sr, "file.txt"));
+                let piped = match File!::open_read(&sr, "/dev/stdin") {
+                    Result::Ok(file) => {
+                        var file = file;
+                        let n = length(&file.read_to_buffer());
+                        let closed = file.close();
+                        n
+                    },
+                    Result::Err(e) => 0i32 - e.errno,
+                };
+                let printed = print_buffer(f"{none} {directory} {regular} {piped}");
+                if written { 0 } else { 1 }
+            }''', stdout=f"0 -21 5 {len(text)}", stdin=text)
 
     def test_path_exists_tells_absence_from_failure(self):
         # A missing name and a path through a file are absent; a directory that cannot be searched says
@@ -811,6 +880,87 @@ class StdRuntimeTests(unittest.TestCase):
                 }
                 lines
             }''', status=3, stdout="[a][][b]", stdin="a\n\nb")
+
+    def test_input_reads_lines_ahead_and_loses_no_byte(self):
+        # An `Input!` returns lines as `read_line` does; while it holds standard input, the other readers
+        # of it fail with EBUSY (16) rather than skip what it read ahead; `read_to_end` returns the rest,
+        # and `finish` hands back what was read ahead and not returned, and standard input with it.
+        self.expect('''
+            use std::bytes::buffer::Buffer!;
+            use std::io::{Error, Input!, print_buffer, read_all_stdin, read_line, stdin};
+            use std::process::trap;
+            use std::option::{Option, Result};
+            fn shown(&out: Buffer!, line: Result[Option[Buffer!], Error]) {
+                out = match line {
+                    Result::Ok(found) => match found {
+                        Option::Some(text) => out.push_byte(b'[').push_buffer(text).push_byte(b']'),
+                        Option::None => out.push_static("end"),
+                    },
+                    Result::Err(e) => out.push_static("error ").push_i64(e.errno as i64),
+                };
+            }
+            fn errno(r: Result[Input!, Error]) -> i32 {
+                match r {
+                    Result::Ok(input) => { input.finish().destroy(); 0i32 },
+                    Result::Err(e) => e.errno,
+                }
+            }
+            fn main() -> i32 {
+                var out = Buffer!::new();
+                var input = match stdin() { Result::Ok(i) => i, Result::Err(e) => trap(), };
+                shown(&out, &input.read_line());
+                shown(&out, &input.read_line());
+                shown(&out, read_line());
+                let again = errno(stdin());
+                let all_busy = match read_all_stdin() {
+                    Result::Ok(text) => { text.destroy(); false },
+                    Result::Err(e) => e.errno == 16i32,
+                };
+                shown(&out, &input.read_line());
+                let ahead = input.finish();
+                out = out.push_static(" ahead ").push_buffer(ahead);
+                var second = match stdin() { Result::Ok(i) => i, Result::Err(e) => trap(), };
+                shown(&out, &second.read_line());
+                second.finish().destroy();
+                var third = match stdin() { Result::Ok(i) => i, Result::Err(e) => trap(), };
+                let none = match &third.read_to_end() { Result::Ok(text) => { let n = &text.len(); text.destroy(); n }, Result::Err(e) => 9usize };
+                shown(&out, &third.read_line());
+                third.finish().destroy();
+                let printed = print_buffer(out);
+                if again == 16i32 && all_busy && none == 0usize { 0 } else { 4 }
+            }''', stdout="[a][]error 16[b] ahead c\nlastendend", stdin="a\n\nb\nc\nlast")
+
+    def test_input_reads_many_lines_in_few_reads(self):
+        # 20000 lines, 200 KB, take a few reads of 64 KiB, not one per byte; a line longer than the buffer
+        # comes whole.
+        lines = [f"line {i}" for i in range(20000)] + ["x" * 100000, "end"]
+        self.expect('''
+            use std::io::{Input!, stdin};
+            use std::option::{Option, Result};
+            extern "C" fn probe_reads() -> u64;
+            fn main() -> i32 {
+                var input = match stdin() { Result::Ok(i) => i, Result::Err(e) => return 1, };
+                var lines = 0u64;
+                var longest = 0usize;
+                var reading = true;
+                while reading {
+                    match &input.read_line() {
+                        Result::Ok(found) => match found {
+                            Option::Some(text) => {
+                                let n = &text.len();
+                                if n > longest { longest = n; }
+                                text.destroy();
+                                lines = lines + 1u64;
+                            },
+                            Option::None => { reading = false; },
+                        },
+                        Result::Err(e) => { reading = false; },
+                    }
+                }
+                input.finish().destroy();
+                let reads = unsafe probe_reads();
+                if lines != 20002u64 || longest != 100000usize { 2 } else if reads > 64u64 { 3 } else { 0 }
+            }''', stdin="\n".join(lines), counted=True)
 
     def test_a_read_error_is_not_the_end_of_the_input(self):
         directory = os.open(".", os.O_RDONLY)
