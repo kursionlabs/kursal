@@ -176,6 +176,10 @@ INFERENCES = (
     "forall 'a. trait Read { fn read(x: core::cap::Brand['a]) -> i32; }\n            forall 'a. instance Read['a] { fn read(x: core::cap::Brand['a]) -> i32 { 7i32 } }\n            fn main() -> i32 {\n                let exists 'a. witness = core::cap::fresh();\n                Read['a]::read(witness)\n            }",
     "forall 'a. trait Read { fn read(x: core::cap::Brand['a]) -> i32; }\n            forall 'a. instance Read['a] { fn read(x: core::cap::Brand['a]) -> i32 { 7i32 } }\n            fn main() -> i32 {\n                let exists 'a. witness = core::cap::fresh();\n                Read[_]::read(witness)\n            }",
     'forall T where Copy[T]. fn twice(x: T) -> (T, T) { (x, x) }\n            fn main() -> i32 { let f = |x| twice(x); let (a, b) = f(3i32); a + b + 1i32 }',
+    # The items of a transformed source mention the binders of its transform.
+    '\nforall T. exposed struct W { v: T }\nforall T. fn wrap(x: T) -> W[T] { W.{ v: x } }\nexposed struct S { a: u32, b: u32 }\n'
+    'fn main() -> i32 {\n    let s = S.{ a: 7u32, b: 9u32 };\n    let t = foreach a: A of s { wrap(a) };\n'
+    '    let u = foreach b of t { let c = b; c };\n    let v = foreach b: B of u { let d = b; d };\n    0i32\n}\n',
 )
 
 INFER_ERRORS = (
@@ -333,4 +337,11 @@ INFER_ERRORS = (
     (methods("use package::m::Show;\nfn f(x: package::n::Show) -> u32 { Show::show(x) }\n", m=SHOW,
              n="exposed struct Show { v: u32 }\n"),
      "no instance of a::m::Show[a::n::Show]"),
+    # The type of a `foreach` item reaches a local bound outside the body.
+    ("exposed struct S { a: u32, b: u32 }\nforall T. fn id(x: T) -> T { x }\nfn main() -> i32 {\n"
+     "    let s = S.{ a: 7u32, b: 9u32 };\n    let h = id;\n    let parts = foreach f: F of s { h(f) };\n    0i32\n}\n",
+     "6:17: the type of foreach item f escapes its lexical scope"),
+    ("exposed struct S { a: u32, b: u32 }\nfn main() -> i32 {\n    let s = S.{ a: 7u32, b: 9u32 };\n"
+     "    var keep = s.a;\n    let g = |x| x;\n    let parts = foreach f of s { g(f) };\n    0i32\n}\n",
+     "6:17: the type of foreach item f escapes its lexical scope"),
 )

@@ -635,7 +635,8 @@ impl Infer['k] {
         let level = new_level(&cx);
         let b = Body.{
             inf: self, home, sig, kinds, assumptions, waiting: ArenaVec::new(&cx), defaults: ArenaVec::new(&cx), recorded: ArenaVec::new(&cx),
-            literals: ArenaVec::new(&cx), brand_checks: ArenaVec::new(&cx), solving: Ref::new(&cx, false), returns: ArenaVec::one(&cx, sig.ret),
+            literals: ArenaVec::new(&cx), brand_checks: ArenaVec::new(&cx), foreaches: ArenaMap::new(&cx), open_binders: Ref::new(&cx, List::Empty),
+            binder_checks: ArenaVec::new(&cx), solving: Ref::new(&cx, false), returns: ArenaVec::one(&cx, sig.ret),
             scopes: Ref::new(&cx, List::Empty.cons(&cx, level)), frames: ArenaVec::one(&cx, new_frame(&cx)), allowed: Ref::new(&cx, Option::None),
         };
         let ids: ArenaVec[u32, 'k] = ArenaVec::new(&cx);
@@ -820,6 +821,12 @@ exposed struct Body {
     recorded: ArenaVec[u32, 'k],
     literals: ArenaVec[Meta['k], 'k],
     brand_checks: ArenaVec[(Type['k], ArenaSet[Span['k], 'k], Pos), 'k],
+    // the binder of each `foreach`, with its item's name and where it is
+    foreaches: ArenaMap[Span['k], (Span['k], Pos), 'k],
+    // the binders whose `foreach` bodies are open
+    open_binders: Ref[List[Span['k], 'k], 'k],
+    // each local's type, with the binders open where it was bound
+    binder_checks: ArenaVec[(Type['k], List[Span['k], 'k]), 'k],
     solving: Ref[bool, 'k],
     returns: ArenaVec[Type['k], 'k],
     // the scopes open, innermost first
@@ -884,6 +891,31 @@ impl Body['k] {
             }
             let unit = match least {
                 Option::Some(b) => self.fail(&cx, Buffer!::new().push_static("brand ").push_bytes(&cx, self.shown(&cx, Type::Skolem.(b))).push_static(" escapes its lexical scope").save(&cx), pos),
+                Option::None => (),
+            };
+            i = i + 1usize;
+        }
+        i = 0usize;
+        while i < self.binder_checks.len(&cx) && !self.foreaches.is_empty(&cx) {
+            let (ty, open_binders) = self.binder_checks.at(&cx, i);
+            let names = free_names(&cx, zonk(&cx, ty)).keys(&cx);
+            var least: Option[Span['k]] = Option::None;
+            var k = 0usize;
+            while k < names.len(&cx) {
+                let b = names.at(&cx, k);
+                if self.foreaches.contains(&cx, b) && !open_binders.any(&cx, |&cx, open: Span['k]| open.eq(&cx, b)) {
+                    least = match least {
+                        Option::Some(l) => if b.cmp(&cx, l).is_lt() { Option::Some.(b) } else { Option::Some.(l) },
+                        Option::None => Option::Some.(b),
+                    };
+                }
+                k = k + 1usize;
+            }
+            let unit = match least {
+                Option::Some(b) => {
+                    let (item, pos) = self.foreaches.at(&cx, b);
+                    self.fail(&cx, Buffer!::new().push_static("the type of foreach item ").push_bytes(&cx, item).push_static(" escapes its lexical scope").save(&cx), pos)
+                },
                 Option::None => (),
             };
             i = i + 1usize;
@@ -1336,6 +1368,7 @@ impl Body['k] {
 
     fn bind(self, &cx: Domain!['k], name: Span['k], ty: Type['k], mutable: bool, rest: Option[Bundle['k]]) -> Local['k] {
         self.check_brand_scope(&cx, ty, no_pos());
+        self.binder_checks.push(&cx, (ty, self.open_binders.copy(&cx)));
         let local = Local.{ type: ty, mutable, rest, depth: self.frames.len(&cx) - 1usize, id: self.inf.next_id(&cx) };
         self.level(&cx).names.insert(&cx, name, local);
         local
@@ -2484,13 +2517,20 @@ impl Body['k] {
             Option::Some(b) => b,
             Option::None => Buffer!::new().push_static("#F").push_u64(self.inf.next_id(&cx) as u64).save(&cx),
         };
+        // a binder that shadows a type parameter is formation's
+        if !self.sig.params.any(&cx, |&cx, p: Param['k]| p.name.eq(&cx, binder)) {
+            self.foreaches.insert(&cx, binder, (f.name, f.pos));
+        }
         self.kinds.insert(&cx, binder, Kind::Any);
+        let outer = self.open_binders.copy(&cx);
+        var open_binders = outer.cons(&cx, binder);
         let (indirect, item) = match source {
             Type::Foreach(s) => {
                 let names = foreach_binders(&cx, s);
                 var i = 0usize;
                 while i < names.len(&cx) {
                     self.kinds.insert(&cx, names.at(&cx, i), Kind::Any);
+                    open_binders = open_binders.cons(&cx, names.at(&cx, i));
                     i = i + 1usize;
                 }
                 (false, s.body.copy(&cx))
@@ -2504,6 +2544,7 @@ impl Body['k] {
                 (indirect, if indirect { C::ptr(&cx, named) } else { named })
             },
         };
+        self.open_binders.set(&cx, open_binders);
         let frame = new_frame(&cx);
         self.frames.push(&cx, frame);
         self.enter(&cx);
@@ -2511,6 +2552,7 @@ impl Body['k] {
         let body = zonk(&cx, self.expr(&cx, Expr::Block.(f.body)));
         self.leave(&cx);
         let unit = self.frames.pop(&cx);
+        self.open_binders.set(&cx, outer);
         self.results().captures.insert(&cx, f.id, self.captures(&cx, frame));
         C::foreach_type(&cx, binder, indirect, source, body)
     }

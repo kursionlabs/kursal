@@ -238,6 +238,11 @@ class Infer:
         self.recorded: list[S.Expr | S.Pattern | S.Case] = []
         self.literals: list[Meta] = []
         self.brand_checks: list[tuple[C.Type, set[str], Optional[Position]]] = []
+        # The binder of each `foreach`, with its item's name and where it is; the binders whose bodies are
+        # open; and each local's type, with the binders open where it was bound.
+        self.foreaches: dict[str, tuple[str, Optional[Position]]] = {}
+        self.open_binders: tuple[str, ...] = ()
+        self.binder_checks: list[tuple[C.Type, tuple[str, ...]]] = []
         self.solving = False
         self.returns = [sig.ret]
         level, node.param_ids = Level(), []
@@ -263,6 +268,11 @@ class Infer:
             escaped = free_brands(zonk(ty)) - allowed
             if escaped:
                 fail(f"brand {self.shown(C.Skolem(min(escaped)))} escapes its lexical scope", pos)
+        for ty, open_binders in self.binder_checks:
+            escaped = {b for b in free_names(zonk(ty)) if b in self.foreaches and b not in open_binders}
+            if escaped:
+                item, pos = self.foreaches[min(escaped)]
+                fail(f"the type of foreach item {item} escapes its lexical scope", pos)
         for e in self.recorded:
             e.ty = zonk(e.ty)
             if isinstance(e, S.For):
@@ -444,6 +454,7 @@ class Infer:
 
     def bind(self, name: str, ty: C.Type, mutable: bool = False, rest: Optional[Bundle] = None) -> Local:
         self.check_brand_scope(ty, None)
+        self.binder_checks.append((ty, self.open_binders))
         local = self.scopes[-1].names[name] = Local(ty, mutable, rest, len(self.frames) - 1)
         return local
 
@@ -980,13 +991,18 @@ class Infer:
             source = self.shape(source, expr.pos)
         self.require("Exposed", (source,), expr.pos)
         binder = expr.binder or f"#F{next(_ids)}"
+        if all(p.name != binder for p in self.sig.params):  # a binder that shadows a type parameter is formation's
+            self.foreaches[binder] = (expr.name, expr.pos)
         self.kinds[binder] = C.ANY
+        outer = self.open_binders
         if isinstance(source, C.Foreach):     # a transformed source: its items are its body
             indirect, item = False, source.body
             self.kinds.update({b: C.ANY for b in foreach_binders(source)})
+            self.open_binders = (*outer, binder, *foreach_binders(source))
         else:
             indirect = isinstance(self.shape(source, expr.pos), C.Ptr)
             item = C.Ptr(C.Named(binder)) if indirect else C.Named(binder)
+            self.open_binders = (*outer, binder)
         frame = Frame()
         self.frames.append(frame)
         self.scopes.append(Level())
@@ -994,6 +1010,7 @@ class Infer:
         body = zonk(self.expr(expr.body))
         self.scopes.pop()
         self.frames.pop()
+        self.open_binders = outer
         expr.captures = tuple(Capture(name, local.id) for name, local in frame.locals)
         return C.Foreach(binder, indirect, source, body)
 
