@@ -211,8 +211,8 @@ INFER_ERRORS = (
     ('fn f(p: u32) -> u32 { core::ptr::load_volatile(p) }\n', 'needs a pointer'),
     ('exposed struct P { x: u32 }\nimpl P { fn make() -> P { P.{ x: 1u32 } } }\nfn f(p: P) -> P { p.make() }\n', 'make takes no receiver'),
     ("fn f() -> u32 { let x: core::cap::Brand['q] = core::cap::static_brand(); 0u32 }\n", "brand 'q is not in scope"),
-    ('forall T. trait Show { fn show(x: T) -> u32; }\nforall T where Show[(T, T)]. instance Show[T] { fn show(x: T) -> u32 { 0u32 } }\n', 'recursive instance premise'),
-    ('trait Show { fn show(x: Self) -> u32; }\ninstance Show[u32] { fn show(x: u32) -> u32 { 0u32 } }\ninstance Show[u32] { fn show(x: u32) -> u32 { 1u32 } }\n', 'overlapping instances'),
+    ('forall T. trait Show { fn show(x: T) -> u32; }\nforall T where Show[(T, T)]. instance Show[T] { fn show(x: T) -> u32 { 0u32 } }\n', 'recursive instance premise Show -> Show:'),
+    ('trait Show { fn show(x: Self) -> u32; }\ninstance Show[u32] { fn show(x: u32) -> u32 { 0u32 } }\ninstance Show[u32] { fn show(x: u32) -> u32 { 1u32 } }\n', 'overlapping instances of Show: (u32) and (u32)'),
     ('trait Show { fn show(x: Self) -> u32; }\nfn f() -> u32 { let s = Show; 0u32 }\n', 'is not a value'),
     ("fn f() -> u32 { let g = |x| { let exists 'a. y = x; 0u32 }; 0u32 }\n", 'the type here is not known yet'),
     ('exposed struct P { x: u32 }\nfn f() -> u32 { let p = P.{ x: 1u32, y: 2u32 }; 0u32 }\n', 'is unknown or given twice'),
@@ -328,5 +328,9 @@ INFER_ERRORS = (
     ("fn g(v: (u32, *u8)) -> [u32; 3] { v }\n",
      "1:33: type mismatch: (u32, *u8) and [u32; 3]"),
     ("forall Self. trait P { fn p(x: Self) -> u32; }\nforall 'k. instance P[u32] { fn p(x: u32) -> u32 { x } }\n",
-     "2:12: instance of p::P: parameter 'k needs a binder-free head occurrence"),
+     "2:12: instance of P: parameter 'k needs a binder-free head occurrence"),
+    # A trait's name reads as a type's does: in full where a type in the message reads the same.
+    (methods("use package::m::Show;\nfn f(x: package::n::Show) -> u32 { Show::show(x) }\n", m=SHOW,
+             n="exposed struct Show { v: u32 }\n"),
+     "no instance of a::m::Show[a::n::Show]"),
 )

@@ -201,7 +201,7 @@ class Infer:
     def __init__(self, resolver: Resolver, sigs: Signatures) -> None:
         files = [str(resolver.file(module)) for _, _, module in sigs.instances]
         check_instance_termination([(C.Premise(inst.trait, inst.head), inst.premises, inst.pos)
-                                    for inst, _, _ in sigs.instances], files)
+                                    for inst, _, _ in sigs.instances], files, surface=True)
         check_coherence([(C.Premise(inst.trait, inst.head), inst.params, inst.pos)
                          for inst, _, _ in sigs.instances], files, surface=True)
         self.r, self.sigs = resolver, sigs
@@ -407,8 +407,9 @@ class Infer:
                 found.append((inst, sub))
         if len(found) != 1:
             written = [zonk(a) for a in args]
-            shown = ", ".join(map(Surface(written, self.origins).show, written))
-            fail(f"{'no' if not found else 'several'} instance of {trait}[{shown}]", pos)
+            surface = Surface(written, self.origins, (trait,))
+            shown = ", ".join(map(surface.show, written))
+            fail(f"{'no' if not found else 'several'} instance of {surface.name(trait)}[{shown}]", pos)
         inst, sub = found[0]
         for param in inst.params:
             sub.setdefault(param.name, Meta("brand" if param.kind == C.BRAND else "type"))

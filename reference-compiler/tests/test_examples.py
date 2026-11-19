@@ -188,7 +188,7 @@ REJECTED = {
     "linear_in_arena.kur": "type argument must satisfy Copy",
     "mismatched_skolem.kur": "15:41: brand mismatch: Ref\\[u32, '2\\] and Ref\\[u32, 'k\\]; '2 was opened at 16:5$",
     "non_exhaustive_match.kur": "a match must cover every enum variant",
-    "overlapping_instances.kur": "overlapping instances of overlapping_instances::Describe: \\(u32\\) and \\(T\\)",
+    "overlapping_instances.kur": "overlapping instances of Describe: \\(u32\\) and \\(T\\)",
     "private_import.kur": "unknown or private member File! of fs",
     "ref_after_remove_in.kur": "17:28: brand mismatch: 'b and 'a; 'b was opened at 15:5, 'a at 13:5$",
     "safe_adopt.kur": "calling an unsafe function requires unsafe authorization",

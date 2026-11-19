@@ -51,7 +51,7 @@ REJECTED = (
      "'e.B' is used after its enum was assigned"),
     # An instance's methods are its trait's, each with the trait's signature at the instance's arguments.
     (STEP + "instance Step[u32] { fn step(&x: u32) -> u32 { x + 1u32 } }\n",
-     "method step does not match its declaration in trait p::Step"),
+     "method step does not match its declaration in trait Step"),
     (LEND_STEP + "instance Step[u32] { fn step(x: u32, &y: u32) -> u32 { x + y } }\n",
      "method step does not match its declaration"),
     (STEP + "instance Step[u32] { fn step(x: u64) -> u32 { 1u32 } }\n", "method step does not match"),
@@ -59,7 +59,7 @@ REJECTED = (
     (STEP + "instance Step[u32] { unsafe fn step(x: u32) -> u32 { x } }\n", "method step does not match"),
     (STEP + "instance Step[u32] { }\n", "the instance lacks trait method step"),
     (STEP + "instance Step[u32] { fn step(x: u32) -> u32 { x } fn other(x: u32) -> u32 { x } }\n",
-     "other is not a method of trait p::Step"),
+     "other is not a method of trait Step"),
     (STEP + "instance Step[u32] { fn step(x: u32) -> u32 { x } fn step(x: u32) -> u32 { x } }\n",
      "method step is defined twice"),
     ("forall Self. trait K { fn k(x: Self) -> u32; fn k(x: Self) -> u32; }\n", "method k is declared twice"),

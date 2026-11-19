@@ -17,7 +17,7 @@ from .resolve import Decl, Resolver
 from .sexpr import KursError, Position
 from .layout import check_type_expansion
 from .literals import valid_literal
-from .types import Types, equal, subst
+from .types import Surface, Types, equal, subst
 
 LIBRARY = {  # name: (home library, path there, path through std)
     "Option": ("core", ("option", "Option"), ("option", "Option")),
@@ -453,12 +453,13 @@ class Signatures:
         trait = self.traits[inst.trait]
         head: dict[str, C.Type] = dict(zip(trait.params, inst.head))
         declared = {m.name for m in trait.methods}
+        written = Surface((), {}, (inst.trait,)).name(inst.trait)
         defined: dict[str, tuple[Sig, S.Fn]] = {}
         for sig, node in zip(inst.methods, item.methods):
             if node.name in defined:
                 fail(f"method {node.name} is defined twice", node.pos)
             if node.name not in declared:
-                fail(f"{node.name} is not a method of trait {inst.trait}", node.pos)
+                fail(f"{node.name} is not a method of trait {written}", node.pos)
             defined[node.name] = (sig, node)
         for method in trait.methods:
             if method.name not in defined:
@@ -469,7 +470,7 @@ class Signatures:
             want = C.Fn(tuple(subst(t, head) for t in method.ptypes), subst(method.ret, head), places=method.places)
             got = C.Fn(sig.ptypes, sig.ret, places=sig.places)
             if not equal(got, want) or sig.unsafe and not method.unsafe:
-                fail(f"method {method.name} does not match its declaration in trait {inst.trait}", node.pos)
+                fail(f"method {method.name} does not match its declaration in trait {written}", node.pos)
 
     # ---- consts
     def const(self, decl: Decl) -> ConstValue:

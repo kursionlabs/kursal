@@ -92,5 +92,5 @@ instance P[u32] {}
 """
         root = tree({"p/kur.toml": manifest("p"), "p/lib.kur": source})
         resolver = resolve(root / "p")
-        with self.assertRaisesRegex(KursError, "overlapping instances of p::P"):
+        with self.assertRaisesRegex(KursError, "overlapping instances of P: "):
             infer(resolver, signatures(resolver))

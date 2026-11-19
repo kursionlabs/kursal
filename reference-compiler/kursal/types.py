@@ -572,14 +572,14 @@ class Surface:
     made from (`'b` for the brand `b#open9` that `let exists 'b.` opened, `Env` for a closure's environment
     `Env#1`), or `_` when it was made from none.
 
-    One `Surface` writes every type of one message. A nominal type reads as its last path segment unless
-    another name in the message reads the same, when it reads as its full path. Where two different brands
-    would read the same, each that a `let exists` opened, at a position in `origins`, says where:
-    `'k (opened at 15:9)`."""
+    One `Surface` writes every type of one message, and the `nominal` names it writes outside them, such as
+    a trait's. A nominal name reads as its last path segment unless another name in the message reads the
+    same, when it reads as its full path. Where two different brands would read the same, each that a
+    `let exists` opened, at a position in `origins`, says where: `'k (opened at 15:9)`."""
 
-    def __init__(self, types: Iterable[Type], origins: Mapping[str, Position]) -> None:
+    def __init__(self, types: Iterable[Type], origins: Mapping[str, Position], nominal: Iterable[str] = ()) -> None:
         labels: set[str] = set()
-        names: set[str] = set()
+        names = set(nominal)
         for ty in types:
             _brand_labels(ty, labels)
             _type_names(ty, names)

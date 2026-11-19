@@ -35,7 +35,8 @@ def check_instance_range(head: Premise, params: tuple[Param, ...], pos: Optional
     for param in params:
         if param.name not in used:
             name = param.name if param.kind != BRAND else f"'{param.name}" if surface else f"${param.name}"
-            raise KursError(f"instance of {head.trait}: parameter {name} needs a binder-free head occurrence", pos)
+            trait = Surface((), {}, (head.trait,)).name(head.trait) if surface else head.trait
+            raise KursError(f"instance of {trait}: parameter {name} needs a binder-free head occurrence", pos)
 
 
 def check_coherence(headers: Iterable[tuple[Premise, tuple[Param, ...], Optional[Position]]],
@@ -61,7 +62,8 @@ def coherent(head: Premise, params: tuple[Param, ...], pos: Optional[Position],
         xs: tuple[Type, ...] = tuple(binders_as_wildcards(subst(t, left)) for t in head.args)
         ys = tuple(binders_as_wildcards(subst(t, right)) for t in earlier.args)
         if len(xs) == len(ys) and all(unify(x, y, closed=True) for x, y in zip(xs, ys)):
-            spell = Surface((*head.args, *earlier.args), {}).show if surface else show
+            spelling = Surface((*head.args, *earlier.args), {}, (head.trait,))
+            spell, trait = (spelling.show, spelling.name(head.trait)) if surface else (show, head.trait)
             current = ", ".join(map(spell, head.args))
             previous = ", ".join(map(spell, earlier.args))
-            raise KursError(f"overlapping instances of {head.trait}: ({current}) and ({previous})", pos)
+            raise KursError(f"overlapping instances of {trait}: ({current}) and ({previous})", pos)

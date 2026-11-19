@@ -100,7 +100,7 @@ instance Next[Wrap[T] -> I] {
         r = run(wrapper + "fn f(c: Wrap[Cur]) -> Opt[u32] { var d = c; &d.step() }")
         call = fn(r, "f").body.tail.operand.call
         self.assertEqual(call.targs, (C.Named("p::Wrap", (named("Cur"),)), U32))
-        with self.assertRaisesRegex(InferError, "no instance of p::Next"):
+        with self.assertRaisesRegex(InferError, "no instance of Next\\[Other, _\\]"):
             run(wrapper + "exposed struct Other {}\n"
                 "fn f(c: Wrap[Other]) -> Opt[u32] { var d = c; &d.step() }")
 

@@ -14,7 +14,7 @@ from typing import Optional
 
 from .core import BRAND, Foreach, Fun, Instr, Named, Param, Premise, Program
 from .sexpr import KursError, Position, located
-from .types import free_names, show
+from .types import Surface, free_names, show
 from .formation import strict_subterm
 
 type Key = tuple[str, ...]  # (function,) or (trait, method)
@@ -54,13 +54,15 @@ def components(graph: dict[Key, set[Key]]) -> dict[Key, int]:
 
 def check_instance_termination(
     instances: Iterable[tuple[Premise, tuple[Premise, ...], Optional[Position]]], files: Sequence[str] = (),
+    surface: bool = False,
 ) -> None:
     """Every premise edge within a trait SCC decreases its first argument.
 
     A finite proof tree follows: each recursive component strictly decreases
     a finite type term, and edges between components follow a finite DAG.
     Headers are shared by surface inference and KURS, before either searches. `files` names the file of each
-    header, when it has one.
+    header, when it has one. With `surface` set, a message writes trait names as a message about source does
+    (`types.Surface`).
     """
     headers = list(instances)
     graph: dict[Key, set[Key]] = {}
@@ -74,7 +76,8 @@ def check_instance_termination(
         for premise in premises:
             if scc[(head.trait,)] == scc[(premise.trait,)]:
                 if not head.args or not premise.args or not strict_subterm(premise.args[0], head.args[0]):
-                    error = KursError(f"recursive instance premise {head.trait} -> {premise.trait}: "
+                    spell = Surface((), {}, (head.trait, premise.trait)).name if surface else str
+                    error = KursError(f"recursive instance premise {spell(head.trait)} -> {spell(premise.trait)}: "
                                       "first argument must be a strict structural subterm of the head's "
                                       "first argument", pos)
                     raise located(error, files[k], pos) if files else error
