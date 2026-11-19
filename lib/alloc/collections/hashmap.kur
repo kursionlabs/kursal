@@ -236,34 +236,36 @@ impl HashMap![K, V, 'k] {
 // these operations are safe, and every key a call does not keep is handed
 // back rather than dropped -- a linear key is never lost.
 
-/// The hash of the key at `p`, which is moved out and put back.
+// A key the map only looks up is lent by place all the way down, so a
+// lookup allocates nothing; a stored key is reached through its entry's
+// pointer.
+
+/// The hash of the key `k`, which is lent.
 forall K where Hash[K].
-unsafe fn hash_key(p: *K) -> u64 {
-    let k = unsafe *p;
-    let (k, state) = k.hash(HashState::new());
-    unsafe *p = k;
+fn hash_key(&k: K) -> u64 {
+    let (back, state) = k.hash(HashState::new());
+    k = back;
     state.finish()
 }
 
-/// Whether the keys at `a` and `b` are equal; both are put back.
+/// Whether the stored key at `a` equals `b`; both are put back.
 forall K where Eq[K, K].
-unsafe fn keys_equal(a: *K, b: *K) -> bool {
+unsafe fn keys_equal(a: *K, &b: K) -> bool {
     let x = unsafe *a;
-    let y = unsafe *b;
-    let (x, y, same) = Eq[K, K]::eq(x, y);
+    let (x, y, same) = Eq[K, K]::eq(x, b);
     unsafe *a = x;
-    unsafe *b = y;
+    b = y;
     same
 }
 
 forall K, V where Eq[K, K].
-unsafe fn find_chain(head: *Entry[K, V], key_ptr: *K) -> Option[*V] {
+unsafe fn find_chain(head: *Entry[K, V], &key: K) -> Option[*V] {
     var cur = head;
     var found: Option[*V] = Option::None;
     while unsafe (cur as usize) != 0usize {
         let e = unsafe *cur;
         let { key: k, val: vp, next: nx } = e;
-        cur = if unsafe keys_equal[K](k, key_ptr) {
+        cur = if unsafe keys_equal[K](k, &key) {
             found = Option::Some.(vp);
             null()
         } else {
@@ -282,7 +284,8 @@ unsafe fn put_chain(head: *Entry[K, V], key_ptr: *K, val: V) -> (*Entry[K, V], O
     var cur = head;
     while !is_null(cur) {
         let { key: k, val: vp, next: nx } = unsafe *cur;
-        if unsafe keys_equal[K](k, key_ptr) {
+        // `key_ptr` is the new key's own block, which nothing else reaches.
+        if unsafe keys_equal[K](k, unsafe &*key_ptr) {
             let stored = unsafe *k;
             unsafe free_one[K](k);
             unsafe *cur = Entry.{ key: key_ptr, val: vp, next: nx };
@@ -297,15 +300,15 @@ unsafe fn put_chain(head: *Entry[K, V], key_ptr: *K, val: V) -> (*Entry[K, V], O
     (unsafe link_after[K, V](head, last, added), Option::None, true)
 }
 
-/// Unlinks the entry whose key equals the one at `key_ptr`, handing back
-/// its stored key and value. The probe at `key_ptr` is left in place.
+/// Unlinks the entry whose key equals `key`, handing back its stored key
+/// and value. `key` is lent, and comes back.
 forall K, V where Eq[K, K].
-unsafe fn take_chain(head: *Entry[K, V], key_ptr: *K) -> (*Entry[K, V], Option[(K, V)], bool) {
+unsafe fn take_chain(head: *Entry[K, V], &key: K) -> (*Entry[K, V], Option[(K, V)], bool) {
     var last = null();
     var cur = head;
     while !is_null(cur) {
         let { key: k, val: vp, next: nx } = unsafe *cur;
-        if unsafe keys_equal[K](k, key_ptr) {
+        if unsafe keys_equal[K](k, &key) {
             let stored = unsafe *k;
             let old = unsafe *vp;
             unsafe free_one[K](k);
@@ -325,7 +328,8 @@ unsafe fn rehash_bucket_hashed(head: *Entry[K, V], new_base: *(*Entry[K, V]), ne
     while unsafe (cur as usize) != 0usize {
         let e = unsafe *cur;
         let { key: k, val: vp, next: nx } = e;
-        let idx = (unsafe hash_key[K](k) as usize) % new_bc;
+        // `k` is this entry's key block, which only the entry reaches.
+        let idx = (hash_key[K](unsafe &*k) as usize) % new_bc;
         let slot = unsafe offset(new_base, idx);
         let old_head = unsafe *slot;
         unsafe *cur = Entry.{ key: k, val: vp, next: old_head };
@@ -547,12 +551,9 @@ impl HashMap![K, V, 'k] {
     fn get(&self, &tag: Exclusive!['k], &key: K) -> Option[Ref[V, 'k]] {
         let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n } = self;
         let (base, m) = r.into_parts();
-        let probe = unsafe alloc_one[K](key);
-        let idx = (unsafe hash_key[K](probe) as usize) % bc;
+        let idx = (hash_key[K](&key) as usize) % bc;
         let head = unsafe *(unsafe offset(base, idx));
-        let found_vp = unsafe find_chain[K, V](head, probe);
-        key = unsafe *probe;
-        let u = unsafe free_one[K](probe);
+        let found_vp = unsafe find_chain[K, V](head, &key);
         let found: Option[Ref[V, 'k]] = match found_vp {
             Option::Some(vp) => Option::Some.(unsafe Ref::from_raw(vp, m)),
             Option::None => Option::None,
@@ -567,8 +568,9 @@ impl HashMap![K, V, 'k] {
     fn insert(self, tag: Exclusive!['k], key: K, val: V) -> exists '2. (Exclusive!['2], HashMap![K, V, '2], Option[(K, V)]) {
         let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n } = self;
         let (base, m) = r.into_parts();
+        var key = key;
+        let idx = (hash_key[K](&key) as usize) % bc;
         let key_ptr = unsafe alloc_one[K](key);
-        let idx = (unsafe hash_key[K](key_ptr) as usize) % bc;
         let s = unsafe offset(base, idx);
         let head = unsafe *s;
         let (new_head, found, is_new) = unsafe put_chain[K, V](head, key_ptr, val);
@@ -594,14 +596,11 @@ impl HashMap![K, V, 'k] {
     fn remove(self, tag: Exclusive!['k], &key: K) -> exists '2. (Exclusive!['2], HashMap![K, V, '2], Option[(K, V)]) {
         let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n } = self;
         let (base, m) = r.into_parts();
-        let probe = unsafe alloc_one[K](key);
-        let idx = (unsafe hash_key[K](probe) as usize) % bc;
+        let idx = (hash_key[K](&key) as usize) % bc;
         let s = unsafe offset(base, idx);
         let head = unsafe *s;
-        let (new_head, found, removed) = unsafe take_chain[K, V](head, probe);
+        let (new_head, found, removed) = unsafe take_chain[K, V](head, &key);
         unsafe *s = new_head;
-        key = unsafe *probe;
-        let u = unsafe free_one[K](probe);
         let new_len = if removed { n - 1usize } else { n };
         let rg = bk.resume(tag);
         let u0 = a.release(rg);
@@ -613,25 +612,24 @@ impl HashMap![K, V, 'k] {
     }
 }
 
-/// Whether the stored key at `k` equals the probe at `q`; both are put back.
+/// Whether the stored key at `k` equals the probe `q`; both are put back.
 forall K, Q where Eq[K, Q].
-unsafe fn key_matches(k: *K, q: *Q) -> bool {
+unsafe fn key_matches(k: *K, &q: Q) -> bool {
     let x = unsafe *k;
-    let y = unsafe *q;
-    let (x, y, same) = Eq[K, Q]::eq(x, y);
+    let (x, y, same) = Eq[K, Q]::eq(x, q);
     unsafe *k = x;
-    unsafe *q = y;
+    q = y;
     same
 }
 
 forall K, V, Q where Eq[K, Q].
-unsafe fn find_chain_by(head: *Entry[K, V], probe: *Q) -> Option[*V] {
+unsafe fn find_chain_by(head: *Entry[K, V], &probe: Q) -> Option[*V] {
     var cur = head;
     var found: Option[*V] = Option::None;
     while unsafe (cur as usize) != 0usize {
         let e = unsafe *cur;
         let { key: k, val: vp, next: nx } = e;
-        cur = if unsafe key_matches[K, Q](k, probe) {
+        cur = if unsafe key_matches[K, Q](k, &probe) {
             found = Option::Some.(vp);
             null()
         } else {
@@ -651,12 +649,9 @@ impl HashMap![K, V, 'k] {
     fn find(&self, &tag: Exclusive!['k], &probe: Q) -> Option[Ref[V, 'k]] {
         let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n } = self;
         let (base, m) = r.into_parts();
-        let slot = unsafe alloc_one[Q](probe);
-        let idx = (unsafe hash_key[Q](slot) as usize) % bc;
+        let idx = (hash_key[Q](&probe) as usize) % bc;
         let head = unsafe *(unsafe offset(base, idx));
-        let found_vp = unsafe find_chain_by[K, V, Q](head, slot);
-        probe = unsafe *slot;
-        let u = unsafe free_one[Q](slot);
+        let found_vp = unsafe find_chain_by[K, V, Q](head, &probe);
         let found: Option[Ref[V, 'k]] = match found_vp {
             Option::Some(vp) => Option::Some.(unsafe Ref::from_raw(vp, m)),
             Option::None => Option::None,

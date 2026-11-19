@@ -20,6 +20,25 @@ from kursal.sigs import signatures
 
 MANIFEST = '[package]\nname="t"\nkind="executable"\nentry="package::main"\nsource_root="."\n'
 C_HELPERS = [LIB / "libc/fs.c", LIB / "libc/thread.c"]
+# Counters a program built with `counted=True` reads through its own externs: the calls of `malloc` and
+# `realloc` and the bytes they were asked for, and the calls of `read`, made by the program's own C and
+# the library's (the linker sends them through these wrappers), not by the C library internally.
+COUNTERS = """
+#include <stddef.h>
+#include <stdint.h>
+#include <sys/types.h>
+void *__real_malloc(size_t size);
+void *__real_realloc(void *block, size_t size);
+ssize_t __real_read(int fd, void *buf, size_t count);
+static uint64_t allocations, allocated, reads;
+void *__wrap_malloc(size_t size) { allocations++; allocated += size; return __real_malloc(size); }
+void *__wrap_realloc(void *block, size_t size) { allocations++; allocated += size; return __real_realloc(block, size); }
+ssize_t __wrap_read(int fd, void *buf, size_t count) { reads++; return __real_read(fd, buf, count); }
+uint64_t probe_allocations(void) { return allocations; }
+uint64_t probe_allocated(void) { return allocated; }
+uint64_t probe_reads(void) { return reads; }
+"""
+COUNTED_LINK = ("-Wl,--wrap=malloc,--wrap=realloc,--wrap=read",)
 
 
 def package(directory: Path, source: str, deps: tuple[str, ...]) -> None:
@@ -39,9 +58,10 @@ def lowered(directory: Path):
 class StdRuntimeTests(unittest.TestCase):
     def run_program(self, source: str, deps: tuple[str, ...] = ("std",), stdin: str = "",
                     args: tuple[str, ...] = (), preexec: Optional[Callable[[], None]] = None,
-                    stdout: Optional[IO[str]] = None, stdin_fd: Optional[int] = None,
+                    stdout: Optional[IO[str]] = None, stdin_fd: Optional[int] = None, counted: bool = False,
                     ) -> subprocess.CompletedProcess[str]:
-        """Builds `source` as a package with `deps` and runs it; the completed process."""
+        """Builds `source` as a package with `deps` and runs it; the completed process. With `counted`, the
+        program is linked with COUNTERS."""
         with tempfile.TemporaryDirectory(prefix="kursal-std-") as base:
             directory = Path(base)
             package(directory, source, deps)
@@ -49,8 +69,11 @@ class StdRuntimeTests(unittest.TestCase):
             c_file = directory / "main.c"
             c_file.write_text(emit_c(program, check_program(program), sigs.name(resolver.packages[0].entry_decl), hosted=True))
             executable = directory / "main"
-            built = subprocess.run(cc_command([str(c_file), *map(str, C_HELPERS)], str(executable)),
-                                   capture_output=True, text=True)
+            sources, link = [str(c_file), *map(str, C_HELPERS)], ()
+            if counted:
+                (directory / "counters.c").write_text(COUNTERS)
+                sources, link = [*sources, str(directory / "counters.c")], COUNTED_LINK
+            built = subprocess.run(cc_command(sources, str(executable), *link), capture_output=True, text=True)
             self.assertEqual(built.returncode, 0, built.stderr[:500])
             source_in: dict[str, object] = {"input": stdin} if stdin_fd is None else {"stdin": stdin_fd}
             return subprocess.run([str(executable), *args], **source_in,  # type: ignore[call-overload]
@@ -548,8 +571,6 @@ class StdRuntimeTests(unittest.TestCase):
                     && d.as_nanos() == 18446744073709551615u64 { 0 } else { 1 }
             }''')
 
-    # -------------------------------------------------------------------- io --
-
     def test_reading_a_directory_is_an_error(self):
         self.expect('''
             use std::option::Result;
@@ -873,6 +894,36 @@ class StdRuntimeTests(unittest.TestCase):
                 cx.destroy();
                 bad
             }''')
+
+    def test_arena_map_churn_takes_no_more_of_the_arena(self):
+        # A map of at most 8 keys, removed and inserted again a million times after a warm-up of a thousand:
+        # the arena (whose chunks come from `malloc`) takes no more memory, where a new slot array at each
+        # `grow` took some 35 MB.
+        self.expect('''
+            use std::alloc::arena::Domain!;
+            use std::collections::arena_map::ArenaMap;
+            extern "C" fn probe_allocated() -> u64;
+            forall 'k.
+            fn churn(&cx: Domain!['k], map: ArenaMap[u32, u32, 'k], from: u32, to: u32) {
+                var i = from;
+                while i < to {
+                    map.insert(&cx, i % 8u32, i);
+                    map.remove(&cx, (i + 3u32) % 8u32);
+                    i = i + 1u32;
+                }
+            }
+            fn main() -> i32 {
+                let exists 'k. cx = Domain!::new();
+                var cx = cx;
+                let map: ArenaMap[u32, u32, 'k] = ArenaMap::new(&cx);
+                churn(&cx, map, 0u32, 1000u32);
+                let before = unsafe probe_allocated();
+                churn(&cx, map, 1000u32, 1001000u32);
+                let taken = unsafe probe_allocated() - before;
+                let live = map.len(&cx);
+                cx.destroy();
+                if live > 8usize { 1 } else if taken != 0u64 { 2 } else { 0 }
+            }''', counted=True)
 
     def test_hash_chains_of_colliding_keys(self):
         self.expect('''
@@ -1271,6 +1322,38 @@ class StdRuntimeTests(unittest.TestCase):
                 m.free();
                 if replaced && looked && found && with && removed && empty && cleared { 0 } else { 1 }
             }''')
+
+    def test_map_lookups_allocate_nothing(self):
+        # A key that is only looked up is lent, not copied into a block of its own: 10000 lookups through
+        # each of `get`, `contains`, `find` and a `remove` of a missing key make no allocation.
+        self.expect('''
+            use std::collections::hashmap::{HashMap!, OwnedMap!};
+            use std::option::Option;
+            extern "C" fn probe_allocations() -> u64;
+            fn find(&named: OwnedMap![u64, u64], &probe: u64) -> bool {
+                let exists 'm. (tag, map) = named.inner;
+                let found = (&map.find(&tag, &probe)).is_some();
+                named = OwnedMap!.{ inner: pack 'm. (tag, map) };
+                found
+            }
+            fn main() -> i32 {
+                var m = OwnedMap!::new[u64, u64]();
+                let none = &m.insert(1u64, 10u64);
+                let before = unsafe probe_allocations();
+                var hits = 0u64;
+                var i = 0u64;
+                while i < 10000u64 {
+                    var key = i % 2u64;
+                    match &m.get(&key) { Option::Some(v) => { hits = hits + v; }, Option::None => () }
+                    if &m.contains(&key) && find(&m, &key) { hits = hits + 1u64; }
+                    var missing = 2u64;
+                    let gone = &m.remove(&missing);
+                    i = i + 1u64;
+                }
+                let made = unsafe probe_allocations() - before;
+                m.free();
+                if hits != 55000u64 { 1 } else if made != 0u64 { 2 } else { 0 }
+            }''', counted=True)
 
     def test_arena_maps_update_retain_and_combine(self):
         self.expect('''

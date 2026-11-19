@@ -22,8 +22,9 @@
 // the entries, dead ones included, pass half the slots: a power of two
 // more than twice the entries; nothing is freed until the arena is, so the
 // old ones stay. When `grow` finds more dead entries than live ones, it first drops
-// the dead ones, keeping the order of the rest, so a map whose keys come and
-// go stays the size of what it holds.
+// the dead ones, keeping the order of the rest, and places the live ones in
+// the slots it has when they are enough. So a map whose keys come and go
+// stays the size of what it holds, and takes no more of the arena.
 //
 // Each entry keeps the low 32 bits of its key's hash. A probe compares
 // keys only where those bits agree, and making the slots again (`grow`,
@@ -347,7 +348,9 @@ impl ArenaMap[K, V, 'k] {
     /// Makes the slots again, at least `slot_count` of them, every live key
     /// placed again by its hash bits. Their number is a power of two, at
     /// least 8 and more than twice the entries, whatever `slot_count` asks
-    /// for, so the next insertion has room. When more entries are dead than
+    /// for, so the next insertion has room; the slots the map has are
+    /// emptied and used again when there are that many, and the arena gives
+    /// new ones otherwise. When more entries are dead than
     /// live, the dead ones are dropped first, the live ones keeping their
     /// order; positions (`key_at`) then count the live entries only.
     forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q].
@@ -377,7 +380,18 @@ impl ArenaMap[K, V, 'k] {
         while count < wanted {
             count = checked_mul(count, 2usize);
         }
-        let slots = slice_of_zeros(&cx, count);
+        // The slots the map has are emptied and kept when they are enough,
+        // as after dropping dead entries; the arena gives new ones only for
+        // more keys than the map has held.
+        let slots = match h.slots {
+            Option::Some(s) => if s.len() >= count {
+                zero_slots(&cx, s);
+                s
+            } else {
+                slice_of_zeros(&cx, count)
+            },
+            Option::None => slice_of_zeros(&cx, count),
+        };
         self.state.set(&cx, MapState.{ slots: Option::Some.(slots), entries: h.entries, count: h.count });
         var k = 0usize;
         while k < entries {
