@@ -3,11 +3,15 @@
 // Types become core types, with each nominal declaration named by its identity. Functions, methods,
 // externs and trait methods get core signatures, with place modes. Consts are folded to values.
 //
-// Folding a binary operation tries its operands in one order and, when that fails, in the other, so
-// an error met while folding must be one the caller can recover from. The steps folding may reach
-// (`type`, `check_arguments`, `require_copy`, `copy_names`, `array_length`, `const_decl`, `fold`,
-// `binop`, `wrapped_literal`) therefore return a `Result` whose error is a `SigError`; the others
-// stop at the first error, through `got`, as raising `SigError` does.
+// Each step returns a `Result` whose error is a `SigError`. Folding a binary operation tries its
+// operands in one order and, when that fails, in the other, so an error met while folding is one
+// the caller recovers from.
+//
+// Errors are reported together, in source order, a step at a time: the type declarations, the Copy
+// checks of their type arguments, which declarations are linear, the other declarations, and
+// whether each instance conforms to its trait. A step runs only when every step before it
+// succeeded, and a declaration reports at most its first error. An error in a constant stops at
+// once: it would recur wherever the constant is used.
 //
 // An integer constant is held in 64 bits: its value in its type's width, sign-extended for a signed
 // type, so every value of every integer type has one representation. Folding computes modulo 2^64
@@ -80,16 +84,18 @@ fn library_item(&cx: Domain!['k], name: Span['k]) -> LibraryItem['k] {
 
 // ----------------------------------------------------------------- errors --
 
-// An error of this stage, before its file is known; a `pos` on line 0 is no position.
+// An error of this stage, before its file is known; a `pos` on line 0 is no position. `in_const` is
+// set for one met folding a constant.
 forall 'k.
 exposed struct SigError {
     message: Span['k],
     pos: Pos,
+    in_const: bool,
 }
 
 forall T, 'k.
 fn sig_error(message: Span['k], pos: Pos) -> Result[T, SigError['k]] {
-    Result::Err.(SigError.{ message, pos })
+    Result::Err.(SigError.{ message, pos, in_const: false })
 }
 
 forall T, 'k.
@@ -551,14 +557,17 @@ impl Signatures['k] {
                 if decl.kind.is(&cx, "struct") || decl.kind.is(&cx, "enum") || decl.kind.is(&cx, "tuple") {
                     resolver.locate(&cx, decl.home, named_pos(decl.node));
                     s.declaring.set(&cx, Option::Some.(decl));
-                    let type_decl = s.type_decl(&cx, decl);
-                    s.types.insert(&cx, s.name(&cx, decl), type_decl);
+                    let unit = match s.reported(&cx, s.type_decl(&cx, decl)) {
+                        Option::Some(type_decl) => { s.types.insert(&cx, s.name(&cx, decl), type_decl); },
+                        Option::None => (),
+                    };
                     resolver.unlocate(&cx);
                 }
                 k = k + 1usize;
             }
             i = i + 1usize;
         }
+        resolver.stop(&cx);
         let places: ArenaMap[Span['k], (Span['k], Pos), 'k] = ArenaMap::new(&cx);
         i = 0usize;
         while i < scopes.len(&cx) {
@@ -579,10 +588,11 @@ impl Signatures['k] {
         while i < s.copy_checks.len(&cx) {
             let (ty, kinds, declaring, pos) = s.copy_checks.at(&cx, i);
             resolver.locate(&cx, declaring.home, named_pos(declaring.node));
-            let unit = s.got(&cx, s.require_copy(&cx, ty, kinds, pos));
+            let unit = s.reported(&cx, s.require_copy(&cx, ty, kinds, pos));
             resolver.unlocate(&cx);
             i = i + 1usize;
         }
+        resolver.stop(&cx);
         s.copy_checks.clear(&cx);
         let types = Types::new(&cx, s.program(&cx), counter);
         i = 0usize;
@@ -593,13 +603,14 @@ impl Signatures['k] {
                 let decl = decls.at(&cx, k);
                 if (decl.kind.is(&cx, "struct") || decl.kind.is(&cx, "enum") || decl.kind.is(&cx, "tuple")) && !decl.name.ends_with(&cx, Span::from_static(&cx, "!")) {
                     resolver.locate(&cx, decl.home, named_pos(decl.node));
-                    let unit = s.got(&cx, s.unmarked(&cx, decl, types));
+                    let unit = s.reported(&cx, s.unmarked(&cx, decl, types));
                     resolver.unlocate(&cx);
                 }
                 k = k + 1usize;
             }
             i = i + 1usize;
         }
+        resolver.stop(&cx);
         i = 0usize;
         while i < scopes.len(&cx) {
             let scope = scopes.at(&cx, i);
@@ -609,12 +620,17 @@ impl Signatures['k] {
                 let decl = decls.at(&cx, k);
                 resolver.locate(&cx, decl.home, named_pos(decl.node));
                 if decl.kind.is(&cx, "trait") {
-                    let t = s.trait_decl(&cx, decl);
-                    s.traits.insert(&cx, s.name(&cx, decl), t);
+                    let unit = match s.reported(&cx, s.trait_decl(&cx, decl)) {
+                        Option::Some(t) => { s.traits.insert(&cx, s.name(&cx, decl), t); },
+                        Option::None => (),
+                    };
                 } else if decl.kind.is(&cx, "fn") || decl.kind.is(&cx, "method") || decl.kind.is(&cx, "extern") {
-                    s.sigs.insert(&cx, decl.id, s.decl_signature(&cx, decl));
+                    let unit = match s.reported(&cx, s.decl_signature(&cx, decl)) {
+                        Option::Some(sig) => { s.sigs.insert(&cx, decl.id, sig); },
+                        Option::None => (),
+                    };
                 } else if decl.kind.is(&cx, "const") {
-                    let unit = s.got(&cx, s.const_decl(&cx, decl));
+                    let unit = s.reported(&cx, s.const_decl(&cx, decl));
                 }
                 resolver.unlocate(&cx);
                 k = k + 1usize;
@@ -624,7 +640,10 @@ impl Signatures['k] {
                 let unit = match scope.items.at(&cx, n) {
                     S::Item::Instance(item) => {
                         resolver.locate(&cx, scope.home, item.pos);
-                        s.instances.push(&cx, s.instance_decl(&cx, item, scope.home));
+                        let unit = match s.reported(&cx, s.instance_decl(&cx, item, scope.home)) {
+                            Option::Some(inst) => { s.instances.push(&cx, inst); },
+                            Option::None => (),
+                        };
                         resolver.unlocate(&cx);
                     },
                     _ => (),
@@ -637,10 +656,11 @@ impl Signatures['k] {
         while i < s.instances.len(&cx) {
             let (inst, item, home) = s.instances.at(&cx, i);
             resolver.locate(&cx, home, item.pos);
-            s.conforms(&cx, inst, item);
+            let unit = s.reported(&cx, s.conforms(&cx, inst, item));
             resolver.unlocate(&cx);
             i = i + 1usize;
         }
+        resolver.stop(&cx);
         s
     }
 
@@ -650,17 +670,28 @@ impl Signatures['k] {
     }
 
     // ---- errors
-    // Stops with `message` at `pos`, in the declaration being translated.
-    fn fail(self, &cx: Domain!['k], message: Span['k], pos: Pos) -> ! {
-        self.r.fail(&cx, message, pos)
-    }
-
     // The value of a step that may fail, stopping if it did.
     forall T.
     fn got(self, &cx: Domain!['k], result: Result[T, SigError['k]]) -> T {
         match result {
             Result::Ok(value) => value,
-            Result::Err(e) => self.fail(&cx, e.message, e.pos),
+            Result::Err(e) => self.r.fail(&cx, e.message, e.pos),
+        }
+    }
+
+    // The value of a step that may fail; if it did, its error is reported, and one in a constant
+    // stops with the errors reported.
+    forall T.
+    fn reported(self, &cx: Domain!['k], result: Result[T, SigError['k]]) -> Option[T] {
+        match result {
+            Result::Ok(value) => Option::Some.(value),
+            Result::Err(e) => {
+                self.r.report(&cx, e.message, e.pos);
+                if e.in_const {
+                    self.r.stop(&cx);
+                }
+                Option::None
+            },
         }
     }
 
@@ -692,12 +723,13 @@ impl Signatures['k] {
 
     // ---- headers
     // Core Params and premises of a `forall` header, and the scope it opens.
-    fn quantifier(self, &cx: Domain!['k], header: Option[S::Forall['k]], scope: Scope['k]) -> (ArenaVec[Param['k], 'k], ArenaVec[Premise['k], 'k], Scope['k]) {
+    fn quantifier(self, &cx: Domain!['k], header: Option[S::Forall['k]], scope: Scope['k])
+        -> Result[(ArenaVec[Param['k], 'k], ArenaVec[Premise['k], 'k], Scope['k]), SigError['k]] {
         let f = match header {
             Option::Some(f) => f,
-            Option::None => return (ArenaVec::new(&cx), ArenaVec::new(&cx), scope),
+            Option::None => return Result::Ok.((ArenaVec::new(&cx), ArenaVec::new(&cx), scope)),
         };
-        let copy = self.got(&cx, self.copy_names(&cx, header));
+        let copy = self.copy_names(&cx, header)?;
         let names = all_params(&cx, f);
         let params: ArenaVec[Param['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
@@ -716,7 +748,7 @@ impl Signatures['k] {
         while i < copied.len(&cx) {
             let name = copied.at(&cx, i);
             if !inner.kinds.contains(&cx, name) {
-                self.fail(&cx, Buffer!::new().push_static("Copy requires an in-scope type parameter, not ").push_bytes(&cx, name).save(&cx), no_pos());
+                return sig_error(Buffer!::new().push_static("Copy requires an in-scope type parameter, not ").push_bytes(&cx, name).save(&cx), no_pos());
             }
             inner.kinds.insert(&cx, name, Kind::Copy);
             i = i + 1usize;
@@ -726,11 +758,11 @@ impl Signatures['k] {
         while i < f.premises.len(&cx) {
             let premise = f.premises.at(&cx, i);
             if !is_copy_trait(&cx, premise.trait_path) {
-                premises.push(&cx, self.premise(&cx, premise.args, inner, premise.pos));
+                premises.push(&cx, self.premise(&cx, premise.args, inner, premise.pos)?);
             }
             i = i + 1usize;
         }
-        (params, premises, inner)
+        Result::Ok.((params, premises, inner))
     }
 
     fn copy_names(self, &cx: Domain!['k], header: Option[S::Forall['k]]) -> Result[ArenaSet[Span['k], 'k], SigError['k]] {
@@ -772,7 +804,7 @@ impl Signatures['k] {
     }
 
     // The premise whose trait's path, written at `pos`, has the arguments `args`.
-    fn premise(self, &cx: Domain!['k], args: S::TypeArgs['k], scope: Scope['k], pos: Pos) -> Premise['k] {
+    fn premise(self, &cx: Domain!['k], args: S::TypeArgs['k], scope: Scope['k], pos: Pos) -> Result[Premise['k], SigError['k]] {
         let r = match self.r.refs.get(&cx, args.id) {
             Option::Some(r) => r,
             Option::None => fail(&cx, Span::from_static(&cx, "internal error: an unresolved premise")),
@@ -781,16 +813,16 @@ impl Signatures['k] {
             NameRef::Builtin(name) => name.is(&cx, "Exposed"),
             _ => false,
         };
-        let actual = self.got(&cx, self.types_of(&cx, args.args, scope));
+        let actual = self.types_of(&cx, args.args, scope)?;
         if is_exposed {
-            return Premise.{ trait_name: Span::from_static(&cx, "Exposed"), args: actual };
+            return Result::Ok.(Premise.{ trait_name: Span::from_static(&cx, "Exposed"), args: actual });
         }
         let decl = match r {
             NameRef::Decl(d) => d,
             _ => fail(&cx, Span::from_static(&cx, "internal error: a premise that names no trait")),
         };
-        let unit = self.got(&cx, self.check_arguments(&cx, decl, actual, scope, pos));
-        Premise.{ trait_name: self.name(&cx, decl), args: actual }
+        let unit = self.check_arguments(&cx, decl, actual, scope, pos)?;
+        Result::Ok.(Premise.{ trait_name: self.name(&cx, decl), args: actual })
     }
 
     // The type arguments `args` of `decl`, written at `pos`.
@@ -1004,26 +1036,26 @@ impl Signatures['k] {
     }
 
     // ---- declarations
-    fn type_decl(self, &cx: Domain!['k], decl: Decl['k]) -> TypeDecl['k] {
-        let (params, premises, scope) = self.quantifier(&cx, named_quantifier(decl.node), new_scope(&cx));
+    fn type_decl(self, &cx: Domain!['k], decl: Decl['k]) -> Result[TypeDecl['k], SigError['k]] {
+        let (params, premises, scope) = self.quantifier(&cx, named_quantifier(decl.node), new_scope(&cx))?;
         let (body, written) = match decl.node {
             Named::Struct(node) => {
                 let fields: ArenaVec[Member['k], 'k] = ArenaVec::new(&cx);
                 var i = 0usize;
                 while i < node.fields.len(&cx) {
                     let field = node.fields.at(&cx, i);
-                    fields.push(&cx, Member.{ name: field.name, type: self.got(&cx, self.type(&cx, field.type, scope)) });
+                    fields.push(&cx, Member.{ name: field.name, type: self.type(&cx, field.type, scope)? });
                     i = i + 1usize;
                 }
                 (Type::Struct.(fields), node.exposure)
             },
-            Named::Tuple(node) => (Type::Tuple.(self.got(&cx, self.types_of(&cx, node.elems, scope))), node.exposure),
+            Named::Tuple(node) => (Type::Tuple.(self.types_of(&cx, node.elems, scope)?), node.exposure),
             Named::Enum(node) => {
                 let variants: ArenaVec[Member['k], 'k] = ArenaVec::new(&cx);
                 var i = 0usize;
                 while i < node.variants.len(&cx) {
                     let variant = node.variants.at(&cx, i);
-                    variants.push(&cx, Member.{ name: variant.name, type: self.got(&cx, self.payload(&cx, variant.payload, scope)) });
+                    variants.push(&cx, Member.{ name: variant.name, type: self.payload(&cx, variant.payload, scope)? });
                     i = i + 1usize;
                 }
                 (Type::Enum.(variants), node.exposure)
@@ -1034,13 +1066,13 @@ impl Signatures['k] {
         let unit = match written {
             Option::Some(e) => {
                 exposure = match e.scope {
-                    Option::Some(path) => Option::Some.(Exposure.{ mode: ExposureMode::Within, home: self.scope_module(&cx, decl, path) }),
+                    Option::Some(path) => Option::Some.(Exposure.{ mode: ExposureMode::Within, home: self.scope_module(&cx, decl, path)? }),
                     Option::None => Option::None,
                 };
             },
             Option::None => (),
         };
-        TypeDecl.{ name: self.name(&cx, decl), params, premises, body, home: Option::Some.(decl.home), exposure }
+        Result::Ok.(TypeDecl.{ name: self.name(&cx, decl), params, premises, body, home: Option::Some.(decl.home), exposure })
     }
 
     // A declaration whose name has no `!` is not linear for every instantiation: it is Copy when its
@@ -1105,22 +1137,22 @@ impl Signatures['k] {
         Result::Ok.(Type::Tuple.(self.types_of(&cx, types, scope)?))
     }
 
-    fn scope_module(self, &cx: Domain!['k], decl: Decl['k], path: ArenaVec[Span['k], 'k]) -> ModuleId['k] {
+    fn scope_module(self, &cx: Domain!['k], decl: Decl['k], path: ArenaVec[Span['k], 'k]) -> Result[ModuleId['k], SigError['k]] {
         let target = match self.r.need(&cx, decl.home, path, no_pos()) {
             Target::Module(m) => Option::Some.(m),
             _ => Option::None,
         };
         match target {
             Option::Some(m) => if decl.home.within(&cx, m) {
-                return m;
+                return Result::Ok.(m);
             },
             Option::None => (),
         };
-        self.fail(&cx, Buffer!::new().push_static("an exposure scope is an enclosing module of ").push_bytes(&cx, decl.name).save(&cx), no_pos())
+        sig_error(Buffer!::new().push_static("an exposure scope is an enclosing module of ").push_bytes(&cx, decl.name).save(&cx), no_pos())
     }
 
     // The signature of a function, method or extern declaration.
-    fn decl_signature(self, &cx: Domain!['k], decl: Decl['k]) -> Sig['k] {
+    fn decl_signature(self, &cx: Domain!['k], decl: Decl['k]) -> Result[Sig['k], SigError['k]] {
         let node = match decl.node {
             Named::Fn(f) => fn_header(f),
             Named::Extern(x) => Header.{ params: x.params, ret: x.ret, quantifier: x.quantifier, is_unsafe: true, pos: x.pos },
@@ -1130,7 +1162,7 @@ impl Signatures['k] {
     }
 
     fn signature(self, &cx: Domain!['k], decl: Option[Decl['k]], node: Header['k], outer: ArenaVec[Param['k], 'k], outer_premises: ArenaVec[Premise['k], 'k],
-                 outer_scope: Option[Scope['k]], name: Option[Span['k]]) -> Sig['k] {
+                 outer_scope: Option[Scope['k]], name: Option[Span['k]]) -> Result[Sig['k], SigError['k]] {
         var scope = match outer_scope {
             Option::Some(s) => s,
             Option::None => new_scope(&cx),
@@ -1147,16 +1179,16 @@ impl Signatures['k] {
         };
         let unit = match method_impl {
             Option::Some(impl_block) => {
-                let (impl_params, impl_premises, inner) = self.quantifier(&cx, impl_block.quantifier, scope);
+                let (impl_params, impl_premises, inner) = self.quantifier(&cx, impl_block.quantifier, scope)?;
                 outer = outer.concat(&cx, impl_params);
                 outer_premises = outer_premises.concat(&cx, impl_premises);
                 scope = inner;
             },
             Option::None => (),
         };
-        let (params, premises, inner) = self.quantifier(&cx, node.quantifier, scope);
+        let (params, premises, inner) = self.quantifier(&cx, node.quantifier, scope)?;
         let scope = inner;
-        let copied = self.got(&cx, self.copy_names(&cx, node.quantifier));
+        let copied = self.copy_names(&cx, node.quantifier)?;
         let adjusted: ArenaVec[Param['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < outer.len(&cx) {
@@ -1193,11 +1225,11 @@ impl Signatures['k] {
                         Option::None => Option::None,
                     };
                     match self_type {
-                        Option::Some(t) => ptypes.push(&cx, self.got(&cx, self.type(&cx, t, scope))),
-                        Option::None => self.fail(&cx, Buffer!::new().push_static("parameter ").push_bytes(&cx, p.name).push_static(" needs a type").save(&cx), node.pos),
+                        Option::Some(t) => ptypes.push(&cx, self.type(&cx, t, scope)?),
+                        Option::None => return sig_error(Buffer!::new().push_static("parameter ").push_bytes(&cx, p.name).push_static(" needs a type").save(&cx), node.pos),
                     }
                 },
-                Option::Some(t) => ptypes.push(&cx, self.got(&cx, self.type(&cx, t, scope))),
+                Option::Some(t) => ptypes.push(&cx, self.type(&cx, t, scope)?),
             };
             pnames.push(&cx, p.name);
             if p.lend {
@@ -1208,13 +1240,13 @@ impl Signatures['k] {
         scope.implicit.set(&cx, Option::None);
         let unit = match decl {
             Option::Some(d) => if d.kind.is(&cx, "extern") && !implicit.is_empty(&cx) {
-                self.fail(&cx, Buffer!::new().push_static("a closure parameter of extern ").push_bytes(&cx, d.name).push_static(" needs [Env]").save(&cx), node.pos);
+                return sig_error(Buffer!::new().push_static("a closure parameter of extern ").push_bytes(&cx, d.name).push_static(" needs [Env]").save(&cx), node.pos);
             },
             Option::None => (),
         };
         let ret = match node.ret {
             Option::None => C::unit(&cx),
-            Option::Some(t) => self.got(&cx, self.type(&cx, t, scope)),
+            Option::Some(t) => self.type(&cx, t, scope)?,
         };
         let core_name = match name {
             Option::Some(n) => n,
@@ -1228,18 +1260,18 @@ impl Signatures['k] {
             Option::Some(d) => Option::Some.(d.home),
             Option::None => Option::None,
         };
-        Sig.{ name: core_name, decl, params: all, premises: outer_premises.concat(&cx, premises), pnames, ptypes, places, ret,
-              is_unsafe: node.is_unsafe, home }
+        Result::Ok.(Sig.{ name: core_name, decl, params: all, premises: outer_premises.concat(&cx, premises), pnames, ptypes, places, ret,
+                          is_unsafe: node.is_unsafe, home })
     }
 
-    fn trait_decl(self, &cx: Domain!['k], decl: Decl['k]) -> C::Trait['k] {
+    fn trait_decl(self, &cx: Domain!['k], decl: Decl['k]) -> Result[C::Trait['k], SigError['k]] {
         let node = match decl.node {
             Named::Trait(t) => t,
             _ => fail(&cx, Span::from_static(&cx, "internal error: a trait declaration that declares no trait")),
         };
-        let (declared, premises, declared_scope) = self.quantifier(&cx, node.quantifier, new_scope(&cx));
+        let (declared, premises, declared_scope) = self.quantifier(&cx, node.quantifier, new_scope(&cx))?;
         if !premises.is_empty(&cx) {
-            self.fail(&cx, Span::from_static(&cx, "trait declarations cannot have their own trait premises"), node.pos);
+            return sig_error(Span::from_static(&cx, "trait declarations cannot have their own trait premises"), node.pos);
         }
         let self_param = Param.{ name: Span::from_static(&cx, "Self"), kind: Kind::Any };
         let (params, scope) = if node.quantifier.is_none() {
@@ -1254,13 +1286,13 @@ impl Signatures['k] {
             var d = 0usize;
             while d < methods.len(&cx) {
                 if methods.at(&cx, d).name.eq(&cx, m.name) {
-                    self.fail(&cx, Buffer!::new().push_static("method ").push_bytes(&cx, m.name).push_static(" is declared twice").save(&cx), m.pos);
+                    return sig_error(Buffer!::new().push_static("method ").push_bytes(&cx, m.name).push_static(" is declared twice").save(&cx), m.pos);
                 }
                 d = d + 1usize;
             }
-            let sig = self.signature(&cx, Option::None, fn_header(m), ArenaVec::new(&cx), ArenaVec::new(&cx), Option::Some.(scope), Option::Some.(m.name));
+            let sig = self.signature(&cx, Option::None, fn_header(m), ArenaVec::new(&cx), ArenaVec::new(&cx), Option::Some.(scope), Option::Some.(m.name))?;
             if !sig.params.is_empty(&cx) {
-                self.fail(&cx, Buffer!::new().push_static("trait method ").push_bytes(&cx, m.name).push_static(" cannot be generic itself").save(&cx), no_pos());
+                return sig_error(Buffer!::new().push_static("trait method ").push_bytes(&cx, m.name).push_static(" cannot be generic itself").save(&cx), no_pos());
             }
             methods.push(&cx, C::Method.{ name: m.name, ret: sig.ret, ptypes: sig.ptypes, is_unsafe: sig.is_unsafe, places: sig.places });
             i = i + 1usize;
@@ -1273,11 +1305,12 @@ impl Signatures['k] {
             kinds.push(&cx, params.at(&cx, i).kind);
             i = i + 1usize;
         }
-        C::Trait.{ name: self.name(&cx, decl), params: names, methods, home: Option::Some.(decl.home), param_kinds: kinds }
+        Result::Ok.(C::Trait.{ name: self.name(&cx, decl), params: names, methods, home: Option::Some.(decl.home), param_kinds: kinds })
     }
 
-    fn instance_decl(self, &cx: Domain!['k], item: S::InstanceDecl['k], home: ModuleId['k]) -> (InstanceSig['k], S::InstanceDecl['k], ModuleId['k]) {
-        let (params, premises, scope) = self.quantifier(&cx, item.quantifier, new_scope(&cx));
+    fn instance_decl(self, &cx: Domain!['k], item: S::InstanceDecl['k], home: ModuleId['k])
+        -> Result[(InstanceSig['k], S::InstanceDecl['k], ModuleId['k]), SigError['k]] {
+        let (params, premises, scope) = self.quantifier(&cx, item.quantifier, new_scope(&cx))?;
         let head = match item.type {
             S::Type::Name(n) => n,
             _ => fail(&cx, Span::from_static(&cx, "internal error: an instance of something other than a trait")),
@@ -1289,25 +1322,25 @@ impl Signatures['k] {
             },
             Option::None => fail(&cx, Span::from_static(&cx, "internal error: an unresolved instance")),
         };
-        let arguments = self.got(&cx, self.types_of(&cx, head.args, scope));
-        let unit = self.got(&cx, self.check_arguments(&cx, trait_decl, arguments, scope, head.pos));
+        let arguments = self.types_of(&cx, head.args, scope)?;
+        let unit = self.check_arguments(&cx, trait_decl, arguments, scope, head.pos)?;
         let methods: ArenaVec[Sig['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < item.methods.len(&cx) {
             let m = item.methods.at(&cx, i);
-            let sig = self.signature(&cx, Option::None, fn_header(m), params, premises, Option::Some.(scope), Option::Some.(m.name));
+            let sig = self.signature(&cx, Option::None, fn_header(m), params, premises, Option::Some.(scope), Option::Some.(m.name))?;
             methods.push(&cx, Sig.{ name: sig.name, decl: sig.decl, params: sig.params, premises: sig.premises, pnames: sig.pnames,
                                ptypes: sig.ptypes, places: sig.places, ret: sig.ret, is_unsafe: sig.is_unsafe, home: Option::Some.(home) });
             i = i + 1usize;
         }
         let inst = InstanceSig.{ trait_name: self.name(&cx, trait_decl), params, premises, head: arguments, methods, home, pos: item.pos };
-        (inst, item, home)
+        Result::Ok.((inst, item, home))
     }
 
     // An instance defines its trait's methods, once each, each with the trait's signature at the
     // instance's arguments: parameter types, which parameters are places, result, and no `unsafe` the
     // trait's method lacks.
-    fn conforms(self, &cx: Domain!['k], inst: InstanceSig['k], item: S::InstanceDecl['k]) {
+    fn conforms(self, &cx: Domain!['k], inst: InstanceSig['k], item: S::InstanceDecl['k]) -> Result[bool, SigError['k]] {
         let tr = match self.traits.get(&cx, inst.trait_name) {
             Option::Some(t) => t,
             Option::None => fail(&cx, Span::from_static(&cx, "internal error: an instance of an unknown trait")),
@@ -1331,10 +1364,10 @@ impl Signatures['k] {
         while i < item.methods.len(&cx) {
             let node = item.methods.at(&cx, i);
             if defined.contains(&cx, node.name) {
-                self.fail(&cx, Buffer!::new().push_static("method ").push_bytes(&cx, node.name).push_static(" is defined twice").save(&cx), node.pos);
+                return sig_error(Buffer!::new().push_static("method ").push_bytes(&cx, node.name).push_static(" is defined twice").save(&cx), node.pos);
             }
             if !declared.contains(&cx, node.name) {
-                self.fail(&cx, Buffer!::new().push_bytes(&cx, node.name).push_static(" is not a method of trait ").push_bytes(&cx, written).save(&cx), node.pos);
+                return sig_error(Buffer!::new().push_bytes(&cx, node.name).push_static(" is not a method of trait ").push_bytes(&cx, written).save(&cx), node.pos);
             }
             defined.insert(&cx, node.name, i);
             i = i + 1usize;
@@ -1344,12 +1377,12 @@ impl Signatures['k] {
             let method = tr.methods.at(&cx, m);
             let at = match defined.get(&cx, method.name) {
                 Option::Some(k) => k,
-                Option::None => self.fail(&cx, Buffer!::new().push_static("the instance lacks trait method ").push_bytes(&cx, method.name).save(&cx), no_pos()),
+                Option::None => return sig_error(Buffer!::new().push_static("the instance lacks trait method ").push_bytes(&cx, method.name).save(&cx), no_pos()),
             };
             let sig = inst.methods.at(&cx, at);
             let node = item.methods.at(&cx, at);
             if sig.params.len(&cx) > inst.params.len(&cx) || sig.premises.len(&cx) > inst.premises.len(&cx) {
-                self.fail(&cx, Buffer!::new().push_static("instance method ").push_bytes(&cx, method.name).push_static(" cannot be generic itself").save(&cx), node.pos);
+                return sig_error(Buffer!::new().push_static("instance method ").push_bytes(&cx, method.name).push_static(" cannot be generic itself").save(&cx), node.pos);
             }
             let wanted: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
             var k = 0usize;
@@ -1360,10 +1393,11 @@ impl Signatures['k] {
             let want = C::fn_type(&cx, wanted, subst(&cx, method.ret, head, self.counter), ArenaVec::new(&cx), false, method.places);
             let got = C::fn_type(&cx, sig.ptypes, sig.ret, ArenaVec::new(&cx), false, sig.places);
             if !equal(&cx, got, want) || sig.is_unsafe && !method.is_unsafe {
-                self.fail(&cx, Buffer!::new().push_static("method ").push_bytes(&cx, method.name).push_static(" does not match its declaration in trait ").push_bytes(&cx, written).save(&cx), node.pos);
+                return sig_error(Buffer!::new().push_static("method ").push_bytes(&cx, method.name).push_static(" does not match its declaration in trait ").push_bytes(&cx, written).save(&cx), node.pos);
             }
             m = m + 1usize;
         }
+        Result::Ok.(true)
     }
 
     // ---- consts
@@ -1378,7 +1412,10 @@ impl Signatures['k] {
         self.folding.insert(&cx, decl.id);
         let result = self.const_value(&cx, decl);
         self.folding.remove(&cx, decl.id);
-        result
+        match result {
+            Result::Ok(value) => Result::Ok.(value),
+            Result::Err(e) => Result::Err.(SigError.{ message: e.message, pos: e.pos, in_const: true }),
+        }
     }
 
     fn const_value(self, &cx: Domain!['k], decl: Decl['k]) -> Result[ConstValue['k], SigError['k]] {

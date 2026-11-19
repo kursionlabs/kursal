@@ -4,17 +4,23 @@ Types become core types, with each nominal declaration named by its
 identity. Functions, methods, externs and trait methods get core
 signatures, with place modes. Consts are folded to values, except arithmetic
 on `usize` and `isize`, which the C compiler folds.
+
+Errors are reported together, in source order, a step at a time: the type declarations, the Copy checks of
+their type arguments, which declarations are linear, the other declarations, and whether each instance
+conforms to its trait. A step runs only when every step before it succeeded, and a declaration reports at
+most its first error. An error in a constant stops at once: it would recur wherever the constant is used.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Literal, Never, Optional
 from . import core as C
 from . import syntax as S
 from .resolve import Decl, Resolver
-from .sexpr import KursError, Position
+from .sexpr import KursError, Position, located
 from .layout import check_type_expansion
 from .literals import valid_literal
 from .types import Surface, Types, equal, subst
@@ -40,6 +46,10 @@ OPERATORS = {"+": "add", "-": "sub", "*": "mul", "/": "div", "%": "mod", "&": "b
 
 class SigError(KursError):
     pass
+
+
+class ConstError(SigError):
+    """An error met folding a constant."""
 
 
 def name_pos(decl: Decl) -> Optional[Position]:
@@ -128,27 +138,30 @@ class Signatures:
         for scope in resolver.scopes.values():
             for decl in scope.decls.values():
                 if decl.kind in ("struct", "enum", "tuple"):
-                    with resolver.located(decl.module, decl.node.pos):
+                    with self.reporting(decl.module, decl.node.pos):
                         self.declaring = decl
                         self.types[self.name(decl)] = self.type_decl(decl)
+        resolver.stop(SigError)
         check_type_expansion(C.Program(types=self.types),
                              {self.name(decl): (str(resolver.file(decl.module)), name_pos(decl))
                               for scope in resolver.scopes.values() for decl in scope.decls.values()
                               if decl.kind in ("struct", "enum", "tuple")})
         self.types_ready = True
         for ty, kinds, declaring, pos in self.copy_checks:
-            with resolver.located(declaring.module, declaring.node.pos):
+            with self.reporting(declaring.module, declaring.node.pos):
                 self.require_copy(ty, kinds, pos)
+        resolver.stop(SigError)
         self.copy_checks.clear()
         types = Types(C.Program(types=self.types))
         for scope in resolver.scopes.values():
             for decl in scope.decls.values():
                 if decl.kind in ("struct", "enum", "tuple") and not decl.name.endswith("!"):
-                    with resolver.located(decl.module, decl.node.pos):
+                    with self.reporting(decl.module, decl.node.pos):
                         self.unmarked(decl, types)
+        resolver.stop(SigError)
         for scope in resolver.scopes.values():
             for decl in scope.decls.values():
-                with resolver.located(decl.module, decl.node.pos):
+                with self.reporting(decl.module, decl.node.pos):
                     if decl.kind == "trait":
                         self.traits[self.name(decl)] = self.trait(decl)
                     elif decl.kind in ("fn", "method", "extern"):
@@ -157,11 +170,27 @@ class Signatures:
                         self.const(decl)
             for item in scope.items:
                 if isinstance(item, S.InstanceDecl):
-                    with resolver.located(scope.module, item.pos):
+                    with self.reporting(scope.module, item.pos):
                         self.instances.append(self.instance(item, scope.module))
+        resolver.stop(SigError)
         for inst, item, module in self.instances:
-            with resolver.located(module, item.pos):
+            with self.reporting(module, item.pos):
                 self.conforms(inst, item)
+        resolver.stop(SigError)
+
+    @contextmanager
+    def reporting(self, module: C.ModuleId, pos: Optional[Position]) -> Iterator[None]:
+        """A signature error raised inside is reported, in `module`'s file and, when it has no position, at
+        `pos`, and the rest of the block is skipped; one in a constant stops with the errors reported. Other
+        errors stop, named as in that file and at `pos`."""
+        try:
+            yield
+        except SigError as error:
+            self.r.report(error, module, pos)
+            if isinstance(error, ConstError):
+                self.r.stop(SigError)
+        except KursError as error:
+            raise located(error, self.r.file(module), pos) from None
 
     # ---- naming
     def name(self, decl: Decl) -> str:
@@ -485,6 +514,8 @@ class Signatures:
             value = self.typed(decl.name, node.value, self.type(node.type, Scope()), decl.module)
             self.consts[decl] = value
             return value
+        except SigError as error:
+            raise error if isinstance(error, ConstError) else ConstError(error.message, error.pos) from None
         finally:
             self.folding.discard(decl)
 

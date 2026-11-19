@@ -141,6 +141,31 @@ class ConstTests(unittest.TestCase):
             with self.subTest(source=source), self.assertRaises(SigError):
                 sigs_of(source)
 
+    def test_errors_are_reported_together_in_source_order(self):
+        cases = (
+            ("fn f(x: u32[u8]) -> u32 { 0u32 }\nstruct S { a: u32 }\n"
+             "fn g(y: core::cap::Brand[u32]) -> u32 { 0u32 }\nforall T. fn h(x: T[u32]) -> u32 { 0u32 }\n",
+             ["1:9: primitive u32 takes no type arguments", "3:9: Brand requires exactly one brand argument",
+              "4:19: type parameter T takes no type arguments"]),
+            ("trait Show { fn show(x: Self) -> u32; }\n"
+             "instance Show[u32] { fn show(x: u32) -> u32 { x } fn extra(x: u32) -> u32 { x } }\n"
+             "instance Show[u8] { fn show(x: u8) -> u8 { x } }\n",
+             ["2:51: extra is not a method of trait Show", "3:21: method show does not match its declaration in trait Show"]),
+            # The functions are not looked at while a type declaration is wrong.
+            ("fn f(x: u32[u8]) -> u32 { 0u32 }\nstruct V { d: Never[u32] }\nstruct U { c: u32[u8] }\n",
+             ["2:15: Never takes no type arguments", "3:15: primitive u32 takes no type arguments"]),
+            # An error in a constant would recur wherever the constant is used: it stops at once.
+            ("struct U { c: u32[u8] }\nconst A: u32 = true;\nstruct S { a: [u8; A] }\nstruct T { b: [u8; A] }\n",
+             ["1:15: primitive u32 takes no type arguments", "3:1: const A is not a"]),
+        )
+        for source, messages in cases:
+            with self.subTest(source=source), self.assertRaises(SigError) as caught:
+                sigs_of(source)
+            lines = str(caught.exception).split("\n")
+            self.assertEqual(len(lines), len(messages), lines)
+            for line, message in zip(lines, messages):
+                self.assertIn(f"lib.kur:{message}", line)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -742,9 +742,12 @@ the error has none of its own. Lookups that the reference may catch (`ResolveErr
 `Result[Target, Problem]` instead of stopping (`Resolver.lookup`); `Resolver.need` stops. Where
 the reference reports an error and goes on (`with resolver.reporting(...)`, `resolver.report`),
 resolution calls `r.report(&cx, message, pos)`, located the same way, and goes on; `Names::run`
-ends with `r.stop(&cx)`. The checks of whole programs that the front end also runs
-(`check_type_expansion`, `check_instance_termination`, `check_coherence`) take the files of the
-declarations they check, and no files when they check KURS.
+ends with `r.stop(&cx)`. Signatures do the same where the reference reports a `SigError`
+(`with self.reporting(...)`): each step returns a `Result` whose error is a `SigError`,
+`Signatures::reported` reports it, and `r.stop(&cx)` ends each group of steps. The checks of
+whole programs that the front end also runs (`check_type_expansion`, `check_instance_termination`,
+`check_coherence`) take the files of the declarations they check, and no files when they check
+KURS.
 
 The standard library is found as the reference finds it, in `$KURSAL_LIB`; without it, in `lib`
 beside the directory holding the compiler's binary (`PREFIX/bin/kursal` reads `PREFIX/lib`, so

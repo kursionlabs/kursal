@@ -38,7 +38,7 @@ BUILTIN_VALUES = {"fresh", "static_brand", "sizeof", "alloca", "enum_variant", "
 # The builtin types an impl may give methods, as it may a primitive: `impl NonNull[T]` in core::ptr.
 OWNED_BUILTINS = {"NonNull"}
 CORE = "core"
-# Resolution reports at most this many errors, in source order, and how many more it found.
+# Resolution, and then signatures, report at most this many errors, in source order, and how many more they found.
 ERROR_LIMIT = 20
 LIB = Path(os.environ.get("KURSAL_LIB") or Path(__file__).resolve().parents[2] / "lib")
 
@@ -387,7 +387,7 @@ class Resolver:
         except ResolveError as error:
             self.report(error, module, pos)
 
-    def report(self, error: ResolveError, module: ModuleId, pos: Optional[Position] = None,
+    def report(self, error: KursError, module: ModuleId, pos: Optional[Position] = None,
                file: Optional[Path] = None) -> None:
         """Keeps `error` for `stop`, in `module`'s file (or `file`) and at `pos` when it has no position.
         An error reported twice is kept once."""
@@ -395,14 +395,15 @@ class Resolver:
         line, col = found.pos or (0, 0)
         self.errors.setdefault(str(found), (0 if file else self.order[module] + 1, line, col, len(self.errors)))
 
-    def stop(self) -> None:
-        """Raises the errors reported, in source order: the first ERROR_LIMIT, and how many more there are."""
+    def stop(self, kind: type[KursError]) -> None:
+        """Raises the errors reported, in source order, as a `kind`: the first ERROR_LIMIT, and how many more
+        there are."""
         if not self.errors:
             return
         found = sorted(self.errors, key=self.errors.__getitem__)
         more = len(found) - ERROR_LIMIT
         shown = found[:ERROR_LIMIT] + ([f"and {more} more error{'s' if more > 1 else ''}"] if more > 0 else [])
-        raise ResolveError("\n".join(shown))
+        raise kind("\n".join(shown))
 
     def lookup(self, module: ModuleId, path: S.NamePath, pos: Optional[Position] = None) -> Target:
         """What `path` names from `module`: a Decl or a ModuleId."""
@@ -611,7 +612,7 @@ class Names:
                 self.item_pos = item.pos
                 with self.r.located(module, item.pos):
                     self.item(item, frozenset())
-        self.r.stop()
+        self.r.stop(ResolveError)
         return self.r
 
     @contextmanager

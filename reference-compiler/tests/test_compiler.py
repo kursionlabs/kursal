@@ -1171,6 +1171,14 @@ SIGNATURES = (
 )
 
 SIGNATURE_ERRORS = (
+    # several errors, reported together in source order
+    "fn f(x: u32[u8]) -> u32 { 0u32 }\nstruct S { a: u32 }\n"
+    "fn g(y: core::cap::Brand[u32]) -> u32 { 0u32 }\nforall T. fn h(x: T[u32]) -> u32 { 0u32 }\n",
+    "trait Show { fn show(x: Self) -> u32; }\n"
+    "instance Show[u32] { fn show(x: u32) -> u32 { x } fn extra(x: u32) -> u32 { x } }\n"
+    "instance Show[u8] { fn show(x: u8) -> u8 { x } }\n",
+    "fn f(x: u32[u8]) -> u32 { 0u32 }\nstruct V { d: Never[u32] }\nstruct U { c: u32[u8] }\n",
+    "struct U { c: u32[u8] }\nconst A: u32 = true;\nstruct S { a: [u8; A] }\nstruct T { b: [u8; A] }\n",
     "struct S { a: [u8; -1i32] }\n",
     "use std::slice::Slice;\nconst T: u32 = \"text\";\n",
     "const N: i64 = 0i64 - 2i64;\nstruct S { a: [u8; N] }\n",
