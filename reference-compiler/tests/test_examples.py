@@ -190,11 +190,14 @@ REJECTED = {
     "non_exhaustive_match.kur": "a match must cover every enum variant",
     "overlapping_instances.kur": "overlapping instances of Describe: \\(u32\\) and \\(T\\)",
     "private_import.kur": "unknown or private member File! of fs",
+    "push_after_finish.kur": "15:6: .*value 'builder' has been moved and cannot be lent$",
     "ref_after_remove_in.kur": "17:28: brand mismatch: 'b and 'a; 'b was opened at 15:5, 'a at 13:5$",
+    "release_linear.kur": "14:25: type argument must satisfy Copy$",
     "safe_adopt.kur": "calling an unsafe function requires unsafe authorization",
     "type_mismatch.kur": "type mismatch: bool and u32",
     "unbound_result_brand.kur": "brand '1 is not in scope",
     "while_consume_without_replacement.kur": "linear value 'h' remains live on some paths to while",
+    "write_by_number.kur": "13:19: calling an unsafe function requires unsafe authorization$",
 }
 
 

@@ -273,7 +273,7 @@ class StdRuntimeTests(unittest.TestCase):
             use std::bytes::buffer::Buffer!;
             fn main() -> i32 {
                 let exists 'k. cx = Domain!::new();
-                let list = List::Empty.cons(&cx, Buffer!::new());
+                let list = List::empty().cons(&cx, Buffer!::new());
                 cx.destroy();
                 0
             }''', "type argument must satisfy Copy")
@@ -655,23 +655,26 @@ class StdRuntimeTests(unittest.TestCase):
 
     def test_print_and_eprint_write_to_stdout_and_stderr(self):
         result = self.run_program('''
+            use std::alloc::arena::Domain!;
             use std::bytes::buffer::Buffer!;
-            use std::io::{eprint, eprint_buffer, eprint_bytes, print, print_buffer, print_bytes, write, write_buffer, write_bytes};
+            use std::io::{eprint, eprint_buffer, eprint_bytes, eprint_span, print, print_buffer, print_bytes, print_span};
+            use std::raw::Span;
             use std::slice::StaticRead;
             fn main() {
                 var read = StaticRead::new();
+                let exists 'k. cx = Domain!::new();
+                var cx = cx;
                 print("a");
                 print_bytes(&read, "b");
                 print_buffer(Buffer!::new().push_static("c"));
-                write(1i32, "d");
-                write_bytes(1i32, &read, "e");
-                write_buffer(1i32, Buffer!::new().push_static("f"));
+                print_span(&cx, Span::from_static(&cx, "d"));
                 eprint("A");
                 eprint_bytes(&read, "B");
                 eprint_buffer(Buffer!::new().push_static("C"));
-                write(2i32, "D");
+                eprint_span(&cx, Span::from_static(&cx, "D"));
+                cx.destroy();
             }''')
-        self.assertEqual((result.stdout, result.stderr, result.returncode), ("abcdef", "ABCD", 0))
+        self.assertEqual((result.stdout, result.stderr, result.returncode), ("abcd", "ABCD", 0))
 
     def test_print_reports_a_failed_write(self):
         with open("/dev/full", "w") as full:
@@ -844,7 +847,7 @@ class StdRuntimeTests(unittest.TestCase):
             fn is_a(b: u8) -> bool { b == b'a' }
             forall 'k.
             fn lists(&cx: Domain!['k]) -> bool {
-                var list: List[u32, 'k] = List::Empty;
+                var list: List[u32, 'k] = List::empty();
                 var i = 0u32;
                 while i < 1000000u32 {
                     list = list.cons(&cx, i);
@@ -1018,7 +1021,7 @@ class StdRuntimeTests(unittest.TestCase):
             forall 'k.
             fn run(cx: Domain!['k]) -> (Domain!['k], bool) {
                 var cx = cx;
-                var list: List[u32, 'k] = List::Empty;
+                var list: List[u32, 'k] = List::empty();
                 list = list.cons(&cx, 3u32).cons(&cx, 2u32).cons(&cx, 1u32);
                 var it = list.iter(cx);
                 var sum = 0u32;
@@ -1186,6 +1189,44 @@ class StdRuntimeTests(unittest.TestCase):
                 cx.destroy();
                 if ok { 0 } else { 1 }
             }''')
+
+    def test_lists_are_built_front_to_back(self):
+        self.expect('''
+            use std::alloc::arena::Domain!;
+            use std::collections::list::List;
+            use std::option::Result;
+            forall 'k.
+            fn check(&cx: Domain!['k]) -> bool {
+                let list: List[u32, 'k] = List::empty().cons(&cx, 3u32).cons(&cx, 2u32).cons(&cx, 1u32);
+                let doubled = list.map(&cx, |&c, x: u32| x * 2u32);
+                let joined = list.append(&cx, doubled);
+                let halted: Result[List[u32, 'k], u32] = list.try_map(&cx, |&c, x: u32| if x == 2u32 { Result::Err.(x) } else { Result::Ok.(x) });
+                let failed = match halted { Result::Ok(l) => 0u32, Result::Err(e) => e };
+                joined.len(&cx) == 6usize && joined.nth(&cx, 3usize).unwrap_or(0u32) == 2u32
+                    && joined.last(&cx).unwrap_or(0u32) == 6u32 && list.len(&cx) == 3usize && failed == 2u32
+            }
+            fn main() -> i32 {
+                let exists 'k. cx = Domain!::new();
+                let ok = check(&cx);
+                cx.destroy();
+                if ok { 0 } else { 1 }
+            }''')
+
+    def test_list_cells_are_out_of_reach(self):
+        # A cell's `Ref` would let code rewrite a list others hold, and make it cyclic.
+        self.reject('''
+            use std::alloc::arena::Domain!;
+            use std::collections::list::List;
+            fn main() -> i32 {
+                let exists 'k. cx = Domain!::new();
+                let list: List[u32, 'k] = List::empty().cons(&cx, 1u32);
+                let cells = match list {
+                    List::Cell(r) => 1,
+                    List::Empty => 0,
+                };
+                cx.destroy();
+                cells
+            }''', "the shape of alloc::collections::list::List is not exposed here")
 
     def test_buffers_truncate_and_clear(self):
         self.expect('''

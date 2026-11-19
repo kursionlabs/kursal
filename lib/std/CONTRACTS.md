@@ -44,8 +44,8 @@ in the mapping body is counted. Structural region split/merge over `*T` is
 therefore not a raw-pointer API merely because its shape is selected
 through indirection.
 
-So `std::io::write(fd: i32, s: Slice[u8, 'static])` is class C even though
-its body reads through the slice's pointer, while
+So `std::io::print(s: Slice[u8, 'static])` is class C even though its body
+reads through the slice's pointer, while
 `std::io::write_all(fd: i32, ptr: *u8, len: usize)` is class B: the same
 pointer, spelled bare. Unfolding would put nearly every function that takes
 or returns a `Slice`, `Span`, `Ref`, `Buffer!`, `Vec!`, `Arena!`, `HashMap!`
@@ -256,7 +256,7 @@ double free.
 | `core::hash::HashState::write_bytes` | `ptr[0..len)` is readable for the whole call |
 | `core::fmt::Writable::write_raw` (and its instances) | `ptr[0..len)` is readable for the whole call; the writer reads the bytes before returning and keeps no pointer to them |
 | `alloc::buffer::Buffer!::push_n` | `src[0..count)` is readable and does not alias the buffer's own storage, which the growth on entry may reallocate |
-| `std::io::write_all` | `ptr[0..len)` is readable |
+| `std::io::write_all` | `ptr[0..len)` is readable, and `fd` is a descriptor the caller may write: standard output or error, or one a `File!` it holds owns |
 | `std::io::File!::write_all_raw` | `ptr[0..len)` is readable throughout the write |
 
 ### 2.4 Produces, offsets, or wraps a raw pointer
@@ -371,7 +371,8 @@ arena facades, formatting and string functions, `core::hash`'s arithmetic
 and traits, and the capability operations that consume or present
 authority rather than manufacturing it (`Exclusive!::share`, `Shared!::split`,
 `SharedJoin!::join`, `SharedResume!::resume`, `Ref::with`/`copy`/`update`,
-`Allocation!::adopt_value`/`close`/`release`, `Region!::share`/`split`/`merge`,
+`Allocation!::adopt_value`/`close`, `Allocation!::release` (for a `Copy`
+`T` only: it gives up the `T` in the block), `Region!::share`/`split`/`merge`,
 `RegionResume!::resume`, `Owned!::new`/`update`).
 
 Some class-C functions are still `unsafe fn` for an obligation that is not
@@ -380,7 +381,9 @@ about a pointer in the signature:
 | Function | Caller must guarantee |
 |---|---|
 | `alloc::owned::Allocation!::adopt` | the block `u` owns holds an initialized `T`, aligned for `T`, in at least `sizeof[T]()` bytes: the `Region!` it returns reads and writes it as one (`Region!::from_raw`'s obligation). A `malloc` result is aligned for every type, so in practice the obligation is the size and the contents. `adopt_value` is the checked form: it aborts on a block smaller than `sizeof[T]()` and writes the `T` itself. The library's own callers (`Vec!`, `HashMap!`, `Buffer!::open`, `Owned!::open`) state at each call why the block qualifies, or why a region over uninitialized slots never leaves the module and is never read as a `T` |
+| `alloc::owned::Allocation!::release_storage` | every `T` the block holds is accounted for: moved out, never written, or still tracked by the caller, which keeps the returned storage and its contents. The block is given up without reading it, so a linear `T` left in it unaccounted would be dropped. `release` is the safe form, for a `Copy` `T`; the library's one caller is `Vec!` (`push`/`pop` re-adopt the same storage at once and keep tracking the elements below `len`; `destroy` moves every element out first) |
 | `std::io::File!::adopt` | the descriptor is live and open, with no other owner |
+| `std::io::write_static_to`, `write_span_to`, `write_buffer_to` | `fd` is a descriptor the caller may write: standard output or error, or one a `File!` it holds owns. A number taken from anywhere else may name a descriptor a `File!` owns, or one closed and since reused, and the write would go around its owner. The safe output functions name standard output and error themselves (`print*`, `eprint*`, `Output!`), or write through a `File!` |
 | `std::io::read_to_end_from` | `fd` is a descriptor the caller may read: stdin, or one a `File!` it holds owns. Reading advances the descriptor's offset, which is that owner's state |
 
 **Class C means "no brand-to-authority conversion and no raw pointer in the
@@ -509,13 +512,14 @@ Types whose hidden representation protects authority or bounds:
 | `Drain!` | `alloc::collections::hashmap` | a map being taken apart; holds the map's capability so nothing else touches the entries meanwhile |
 | `ArenaVec[T,'k]`, `Header` | `alloc::collections::arena_vec` | a header naming segments of the sizes `locate` computes, with `len` within them; a forged one is read and written through |
 | `ArenaMap[K,V,'k]`, `ArenaSet[K,'k]`, `MapState`, `Entry` | `alloc::collections::arena_map` | slots that index live entries; a forged map probes out of range, which `trap` stops |
+| `List[T,'k]`, `Cons[T,'k]`, `ListBuilder![T,'k]` | `alloc::collections::list` | a list is persistent: no code outside the module reaches a cell's `Ref`, so none can rewrite a cell a list holds (and make it cyclic). `ListBuilder!` writes only the cells of the list it is building, and is linear so that `finish` leaves no copy to link more cells onto the list it hands out |
 | `Arena!['k]`, `Chunk` | `alloc::arena` | one long-lived brand tied to a chunk chain this module built. It holds only `Copy` values (`alloc`, `alloc_slice`, `Ref::new` and `List::cons` require `Copy`), so freeing its chunks unread loses nothing linear |
 | `Buffer!`, `BufferRestore!['k]` | `alloc::buffer` | `Buffer!` owns a heap byte run that `destroy` frees with no capability; `BufferRestore!` plus the matching `Exclusive!` yields the owning `Buffer!` back |
 | `FixedWriter!` | `alloc::fmt` | a buffer that never grows past `cap`; its contents are always a prefix of what was written |
 | `HeapAllocator`, `Storage` | `alloc::heap` | zero-field receivers for the allocator's static methods; they own no memory |
 | `AlignProbe[T]` | `core::mem` | never built; `alignof` takes only its size |
 | `Stamp['r]` | `core::cap` | exposed to `core` alone (`exposed (package)`): `core` modules read a domain's brand out of it, code outside `core` can hold one but not open it |
-| `File!`, `Output!` | `std::io` | `File!` owns one open descriptor; forging one closes an arbitrary descriptor. `Output!` writes to a descriptor it does not own (stdout, stderr), which a forged one could point anywhere |
+| `File!`, `Output!` | `std::io` | `File!` owns one open descriptor; forging one closes an arbitrary descriptor. `Output!` writes to a descriptor it does not own (stdout, stderr), which a forged one could point anywhere. |
 | `Args` | `std::process` | `argv` and `argc` as C's `main` received them: made only by the C `main` the compiler writes for an entry function taking one (its `argv` has `count` readable entries, each a NUL-terminated string live for the rest of the process) |
 | `Command!` | `std::process` | a command line of `count` NUL-terminated arguments, which `fs.c` splits into the table `posix_spawnp` reads |
 | `Instant`, `Timespec` | `std::time` | a monotonic clock reading, and the C structure `clock_gettime` fills; nothing outside makes either |
@@ -555,13 +559,9 @@ that restricting a type costs nothing: it only sees the code it is run on.
 - **`toml::value::TomlValue`/`TomlDatetime`/`DatetimeKind`/`TomlError`.**
   The parser's results, to be matched on; their spans, vecs and maps are
   read through the arena's capability like any other.
-- **`alloc::collections::list::ListBuilder`.** The first and last cells of
-  a list being built; it holds only `List` and `Ref` values, which any
-  holder of the domain could make.
 - **`core::option::Option`/`Result`, `core::cmp::Order`,
   `core::atomic::Ordering`, `alloc::heap::AllocError`,
-  `alloc::collections::list::List`/`Cons`, `alloc::collections::vec::
-  Popped!`, `std::process::Exit`, `std::fs::FileKind`.** These exist to be matched on, and there is no per-variant privacy, so an enum
+  `alloc::collections::vec::Popped!`, `std::process::Exit`, `std::fs::FileKind`.** These exist to be matched on, and there is no per-variant privacy, so an enum
   meant to be matched on cannot be restricted. The general rule: **a type
   can be restricted when its outside users rely on methods rather than
   destructuring.**

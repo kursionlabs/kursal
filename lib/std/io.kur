@@ -1,9 +1,9 @@
-//! Input and output through descriptors, the standard streams and files.
+//! Input and output through the standard streams and files.
 //!
 //! Process I/O over the POSIX `read`/`write`/`open`/`close`/`fstat` calls:
-//! byte output to raw descriptors (`write`), standard output (`print`) and
-//! standard error (`eprint`), whole-file and stdin reads into an owned
-//! `Buffer!`, the owning descriptor type `File!`, and buffered `Output!`;
+//! byte output to standard output (`print`) and standard error (`eprint`),
+//! whole-file and stdin reads into an owned `Buffer!`, the owning
+//! descriptor type `File!`, and buffered `Output!`;
 //! and `Error`, the error of every operating-system call of the library.
 //! Paths are any byte view (`c_string`); `std::fs` works with them whole.
 
@@ -59,6 +59,12 @@ impl Error {
 }
 
 // -------------------------------------------------------------- output --
+// Output goes to standard output (`print`), standard error (`eprint`), a
+// `File!` (its `write_*` methods) or a buffered `Output!` over one of the
+// two streams. No safe function takes a descriptor number: a number could
+// name a descriptor a `File!` owns, or one closed and reused, and writing
+// to it would go around the `File!` that owns it.
+//
 // `write_all` retries partial writes (`write(2)` may write fewer bytes
 // than requested, even to a regular file) until every byte is written. It
 // fails with the call's errno on a negative return, and with EIO on zero
@@ -67,7 +73,9 @@ impl Error {
 // caller that prints to its own stdout or stderr and has no recovery
 // discards it, while a program whose output is its product checks it.
 
-/// Writes `ptr[0..len)` to `fd`, retrying partial writes.
+/// Writes `ptr[0..len)` to `fd`, retrying partial writes. Caller:
+/// `ptr[0..len)` is readable, and `fd` is a descriptor the caller may write:
+/// standard output or error, or one a `File!` it holds owns.
 unsafe fn write_all(fd: i32, ptr: *u8, len: usize) -> Result[(), Error] {
     var done = 0usize;
     while done < len {
@@ -83,10 +91,18 @@ unsafe fn write_all(fd: i32, ptr: *u8, len: usize) -> Result[(), Error] {
     Result::Ok.(())
 }
 
-/// Writes a span's bytes, reading them under the domain's capability, which
-/// `cx` lends.
+/// Writes a static byte slice to `fd`. Caller: `fd` is a descriptor the
+/// caller may write, as for `write_all`.
+unsafe fn write_static_to(fd: i32, s: Slice[u8, 'static]) -> Result[(), Error] {
+    let (p, n, m) = s.into_parts();
+    unsafe write_all(fd, p, n)
+}
+
+/// Writes a span's bytes to `fd`, reading them under the domain's
+/// capability, which `cx` lends. Caller: `fd` is a descriptor the caller
+/// may write, as for `write_all`.
 forall 'k, C, R where Access[C -> 'k, R].
-fn write_span(fd: i32, &cx: C, sp: Span['k]) -> Result[(), Error] {
+unsafe fn write_span_to(fd: i32, &cx: C, sp: Span['k]) -> Result[(), Error] {
     let (tag, rest) = Access[C -> 'k, R]::open(cx);
     let (p, n) = sp.into_parts();
     let result = unsafe write_all(fd, p, n);
@@ -94,23 +110,10 @@ fn write_span(fd: i32, &cx: C, sp: Span['k]) -> Result[(), Error] {
     result
 }
 
-/// Writes a static byte slice to `fd`.
-fn write(fd: i32, s: Slice[u8, 'static]) -> Result[(), Error] {
-    let (p, n, m) = s.into_parts();
-    unsafe write_all(fd, p, n)
-}
-
-/// Writes any byte view, read through the capability that permits it
-/// (`Exclusive!`, `Shared!`, `StaticRead`).
-forall C, S where ReadBytes[C, S], Copy[S].
-fn write_bytes(fd: i32, &cx: C, bytes: S) -> Result[(), Error] {
-    let buffer = Buffer!::new().push_bytes(&cx, bytes);
-    write_buffer(fd, buffer)
-}
-
-/// Writes `buf`'s bytes, then frees it. Reads them through `as_ptr`/`len`;
-/// writing needs no brand.
-fn write_buffer(fd: i32, buf: Buffer!) -> Result[(), Error] {
+/// Writes `buf`'s bytes to `fd`, then frees it. Reads them through
+/// `as_ptr`/`len`; writing needs no brand. Caller: `fd` is a descriptor the
+/// caller may write, as for `write_all`.
+unsafe fn write_buffer_to(fd: i32, buf: Buffer!) -> Result[(), Error] {
     let p = unsafe &buf.as_ptr();
     let n = &buf.len();
     let result = unsafe write_all(fd, p, n);
@@ -119,38 +122,53 @@ fn write_buffer(fd: i32, buf: Buffer!) -> Result[(), Error] {
 }
 
 // `print` writes to standard output (descriptor 1), `eprint` to standard
-// error (descriptor 2), as `write`, `write_bytes` and `write_buffer` do.
+// error (descriptor 2): the process's own streams, which any of its code
+// may write.
 
 /// Writes a static byte slice to standard output. Returns an I/O error on failure.
 fn print(s: Slice[u8, 'static]) -> Result[(), Error] {
-    write(1i32, s)
+    unsafe write_static_to(1i32, s)
 }
 
-/// Writes any byte view to standard output.
+/// Writes any byte view to standard output, read through the capability
+/// that permits it (`Exclusive!`, `Shared!`, `StaticRead`).
 forall C, S where ReadBytes[C, S], Copy[S].
 fn print_bytes(&cx: C, bytes: S) -> Result[(), Error] {
-    write_bytes(1i32, &cx, bytes)
+    unsafe write_buffer_to(1i32, Buffer!::new().push_bytes(&cx, bytes))
+}
+
+/// Writes a span's bytes to standard output where they lie, reading them
+/// under the domain's capability, which `cx` lends.
+forall 'k, C, R where Access[C -> 'k, R].
+fn print_span(&cx: C, sp: Span['k]) -> Result[(), Error] {
+    unsafe write_span_to(1i32, &cx, sp)
 }
 
 /// Writes `buf`'s bytes to standard output, then frees it.
 fn print_buffer(buf: Buffer!) -> Result[(), Error] {
-    write_buffer(1i32, buf)
+    unsafe write_buffer_to(1i32, buf)
 }
 
 /// Writes a static byte slice to standard error.
 fn eprint(s: Slice[u8, 'static]) -> Result[(), Error] {
-    write(2i32, s)
+    unsafe write_static_to(2i32, s)
 }
 
 /// Writes any byte view to standard error.
 forall C, S where ReadBytes[C, S], Copy[S].
 fn eprint_bytes(&cx: C, bytes: S) -> Result[(), Error] {
-    write_bytes(2i32, &cx, bytes)
+    unsafe write_buffer_to(2i32, Buffer!::new().push_bytes(&cx, bytes))
+}
+
+/// Writes a span's bytes to standard error where they lie.
+forall 'k, C, R where Access[C -> 'k, R].
+fn eprint_span(&cx: C, sp: Span['k]) -> Result[(), Error] {
+    unsafe write_span_to(2i32, &cx, sp)
 }
 
 /// Writes `buf`'s bytes to standard error, then frees it.
 fn eprint_buffer(buf: Buffer!) -> Result[(), Error] {
-    write_buffer(2i32, buf)
+    unsafe write_buffer_to(2i32, buf)
 }
 
 // ---------------------------------------------------------------- files --
@@ -257,8 +275,8 @@ fn read_line() -> Result[Option[Buffer!], Error] {
 //
 // Standard input, output and error stay bare `i32`s (0/1/2), never
 // `File!`: they are borrowed process handles this program did not open
-// and must not close. The output functions above take a bare `fd` for the
-// same reason.
+// and must not close. Only this module names them, in `print`, `eprint`,
+// `read_line`, `read_all_stdin` and `Output!`.
 /// Owns one open file descriptor. Call `close` to consume it.
 struct File! {
     fd: i32,
@@ -462,7 +480,9 @@ impl Output! {
             return Output!.{ fd, buf: Buffer!::new(), error };
         }
         let p = unsafe &buf.as_ptr();
-        // `p` addresses the `n` bytes `buf` holds, and `buf` outlives the write.
+        // `p` addresses the `n` bytes `buf` holds, and `buf` outlives the
+        // write; `fd` is standard output or error, the only descriptors
+        // `stdout` and `stderr` make an `Output!` over.
         let written = unsafe write_all(fd, p, n);
         let unit = buf.destroy();
         let error = match written {

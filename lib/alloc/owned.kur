@@ -6,8 +6,10 @@
 //
 // `Allocation!::adopt` (unsafe) and `adopt_value` (checked) are the only
 // producers of an `Allocation!`, and they read the base and extent off the
-// allocator's own `Uninit!`; `release` and `close` demand the complete
-// `Region!` back before giving the storage up.
+// allocator's own `Uninit!`; `release`, `release_storage` and `close` demand
+// the complete `Region!` back before giving the storage up. `close` keeps
+// the `T`; `release` gives it up and so takes a `Copy` one only, and
+// `release_storage` (unsafe) leaves it to the caller.
 
 use package as alloc;
 
@@ -32,7 +34,8 @@ struct Owned! {
 
 /// The right to free one heap block, under brand `'r`.
 ///
-/// Freeing goes through `release(self, reg: Region![T, 'r])`, which takes no
+/// Freeing goes through `release(self, reg: Region![T, 'r])` (or
+/// `release_storage`, or `close` and `Owned!::into_value`), which takes no
 /// `Ref`: the base address comes from `self`, and the only producers of an
 /// `Allocation!` are `Allocation!::adopt` and `adopt_value`, which read it
 /// straight off the allocator's `Uninit!`. The record is restricted, and no exported function
@@ -211,7 +214,15 @@ impl Allocation![T, 'r] {
         p
     }
 
-    /// Retires the brand and hands back raw, unbranded storage.
+    /// Retires the brand and hands back raw, unbranded storage without
+    /// reading the `T` in the block. `release` is the safe form, for a `Copy`
+    /// `T`; for any other, giving the block up unread would drop a linear
+    /// value.
+    ///
+    /// `unsafe fn`: the caller vouches that every `T` the block holds is
+    /// accounted for: moved out, never written, or still tracked by the
+    /// caller, which keeps the returned storage and what is in it (`Vec!`
+    /// releases to grow and adopts the block again over the same elements).
     ///
     /// Demands the complete `Region![T,'r]`, not merely a witness. A region
     /// is consumed by `share` and rebuilt only by `RegionResume!::resume`,
@@ -222,7 +233,7 @@ impl Allocation![T, 'r] {
     ///
     /// The returned `Uninit!` carries the extent `adopt` recorded, so a caller
     /// can release, grow and re-adopt without restating the size.
-    fn release(self, reg: Region![T, 'r]) -> Uninit! {
+    unsafe fn release_storage(self, reg: Region![T, 'r]) -> Uninit! {
         let { ptr: p, extent: n, marker: m } = self;
         let retired = reg.retire();
         let raw = unsafe (p as *u8);
@@ -251,5 +262,20 @@ impl Allocation![T, 'r] {
         let { ptr: p, extent: n, marker: m } = self;
         let retired = reg.retire();
         Owned!.{ ptr: p }
+    }
+}
+
+forall T, 'r where Copy[T].
+impl Allocation![T, 'r] {
+    /// Retires the brand and hands back raw, unbranded storage; the `T` in
+    /// the block is given up, which a `Copy` value may be. A linear `T` comes
+    /// back through `close` and `Owned!::into_value` instead, or, for storage
+    /// whose contents the caller tracks itself, the unsafe `release_storage`.
+    /// Demands the complete region, as `release_storage` does, and the
+    /// `Uninit!` carries the extent `adopt` recorded.
+    fn release(self, reg: Region![T, 'r]) -> Uninit! {
+        // `release_storage`'s obligation: a `Copy` value needs no consumer,
+        // so the `T` in the block may be given up.
+        unsafe self.release_storage(reg)
     }
 }

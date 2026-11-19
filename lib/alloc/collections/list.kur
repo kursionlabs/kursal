@@ -4,7 +4,12 @@
 //
 // A list is persistent: `cons` shares the tail it is given, so extending a
 // list never changes it, and a scope that adds bindings for a while and
-// then goes back to the list it started from needs nothing undone.
+// then goes back to the list it started from needs nothing undone. Nothing
+// outside this module changes a cell once a list holds it: `List` and
+// `Cons` are restricted, so no code elsewhere reaches a cell's `Ref`, and the
+// one function here that writes a cell after making it, `ListBuilder!::push`,
+// writes only cells of the list being built, which no one else holds until
+// `finish` hands it out and consumes the builder.
 //
 // Every method that reads cells takes the context that lends the domain's
 // capability by place (`&cx`, `core::cap::Access`), and one that makes
@@ -19,22 +24,29 @@ use core::option::{Option, Result};
 use core::iter::Iterator;
 
 /// A persistent singly linked list in an arena: a cell holding the first
-/// element and the rest, or the empty list.
+/// element and the rest, or the empty list. Restricted: a list is made by
+/// `empty`, `cons` and the functions that build one, and read through its
+/// methods.
 forall T, 'k.
-exposed enum List {
+enum List {
     Cell(Ref[Cons[T, 'k], 'k]),
     Empty,
 }
 
 /// One cell of a `List`: an element and the list after it.
 forall T, 'k.
-exposed struct Cons {
+struct Cons {
     head: T,
     tail: List[T, 'k],
 }
 
 forall T, 'k.
 impl List[T, 'k] {
+    /// The list with no elements.
+    fn empty() -> List[T, 'k] {
+        List::Empty
+    }
+
     /// Prepends `head`. The cell is arena-allocated, so it needs no free
     /// of its own; the whole arena is freed as a unit. `T` is `Copy`, as
     /// everything in an arena is.
@@ -85,7 +97,7 @@ impl List[T, 'k] {
     /// The elements of `self`, copied into new cells, followed by `other`.
     forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q].
     fn append(self, &cx: C, other: List[T, 'k]) -> List[T, 'k] {
-        var out = ListBuilder::new();
+        var out = ListBuilder!::new();
         var rest = self;
         var going = true;
         while going {
@@ -330,7 +342,7 @@ impl List[T, 'k] {
     /// Each element through `f`.
     forall U, Env, C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], Copy[U], Copy[Env].
     fn map(self, &cx: C, f: closure[Env](&_: C, T) -> U) -> List[U, 'k] {
-        var out = ListBuilder::new();
+        var out = ListBuilder!::new();
         var rest = self;
         var going = true;
         while going {
@@ -350,7 +362,7 @@ impl List[T, 'k] {
     /// The values `f` returns, skipping the elements it returns none for.
     forall U, Env, C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], Copy[U], Copy[Env].
     fn filter_map(self, &cx: C, f: closure[Env](&_: C, T) -> Option[U]) -> List[U, 'k] {
-        var out = ListBuilder::new();
+        var out = ListBuilder!::new();
         var rest = self;
         var going = true;
         while going {
@@ -378,13 +390,16 @@ impl List[T, 'k] {
     /// Each element through `f`, stopping at the first error.
     forall U, E, Env, C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q], Copy[U], Copy[Env].
     fn try_map(self, &cx: C, f: closure[Env](&_: C, T) -> Result[U, E]) -> Result[List[U, 'k], E] {
-        var out = ListBuilder::new();
+        var out = ListBuilder!::new();
         var rest = self;
         while !rest.is_empty() {
             match &rest.pop(&cx) {
-                Option::Some(x) => {
-                    let u = f(&cx, x)?;
-                    &out.push(&cx, u);
+                Option::Some(x) => match f(&cx, x) {
+                    Result::Ok(u) => &out.push(&cx, u),
+                    Result::Err(e) => {
+                        let unfinished = out.finish(&cx, List::Empty);
+                        return Result::Err.(e);
+                    },
                 },
                 Option::None => (),
             }
@@ -396,44 +411,48 @@ impl List[T, 'k] {
 /// A list built front to back in one pass: `push` links a new last cell
 /// after the previous one, so the list comes out in push order with one
 /// cell per element and no recursion. `finish` ends it with a given tail.
+///
+/// Linear and restricted: `finish` consumes the builder, so no copy of it
+/// is left to link cells onto a list that has been handed out.
 forall T, 'k.
-exposed struct ListBuilder {
+struct ListBuilder! {
     first: List[T, 'k],
     last: Option[Ref[Cons[T, 'k], 'k]],
 }
 
 forall T, 'k where Copy[T].
-impl ListBuilder[T, 'k] {
+impl ListBuilder![T, 'k] {
     /// A builder with no elements yet.
-    fn new() -> ListBuilder[T, 'k] {
-        ListBuilder.{ first: List::Empty, last: Option::None }
+    fn new() -> ListBuilder![T, 'k] {
+        ListBuilder!.{ first: List::Empty, last: Option::None }
     }
 
     /// Adds `value` at the end, in a new cell linked after the last one.
     forall C, R, Q where Access[C -> 'k, R], Allocate[C -> 'k, Q].
     fn push(&self, &cx: C, value: T) {
+        let { first, last } = self;
         let cell = Ref::new(&cx, Cons.{ head: value, tail: List::Empty });
-        match self.last {
-            Option::None => {
-                self.first = List::Cell.(cell);
-            },
+        let first = match last {
+            Option::None => List::Cell.(cell),
             Option::Some(r) => {
                 let previous = r.copy(&cx);
                 r.set(&cx, Cons.{ head: previous.head, tail: List::Cell.(cell) });
+                first
             },
-        }
-        self.last = Option::Some.(cell);
+        };
+        self = ListBuilder!.{ first, last: Option::Some.(cell) };
     }
 
     /// The list pushed so far, followed by `tail`.
     forall C, R where Access[C -> 'k, R].
     fn finish(self, &cx: C, tail: List[T, 'k]) -> List[T, 'k] {
-        match self.last {
+        let { first, last } = self;
+        match last {
             Option::None => tail,
             Option::Some(r) => {
                 let previous = r.copy(&cx);
                 r.set(&cx, Cons.{ head: previous.head, tail });
-                self.first
+                first
             },
         }
     }
