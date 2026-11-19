@@ -639,7 +639,7 @@ class Infer:
             case S.UnsafeStore():
                 return self.apply(((expr.pointer, "*t"), (expr.value, "t")), "()", expr.pos)
             case S.Lit(): return self.expr_lit(expr)
-            case S.FStr(): return self.expr_fstring(expr)
+            case S.FStr(): return self.expr_fstring(expr, C.Named(self.library("Buffer!")))
             case S.Path(): return self.expr_path(expr)
             case S.Tuple(): return self.expr_tuple(expr)
             case S.Array(): return self.expr_array(expr)
@@ -713,10 +713,13 @@ class Infer:
                 return C.BOOL
         return C.Named(self.library("Slice"), (C.Prim("u8"), C.Skolem("static")))
 
-    def expr_fstring(self, expr: S.FStr) -> C.Type:
+    def expr_fstring(self, expr: S.FStr, writer: C.Type) -> C.Type:
+        """Each `{x}` of the f-string needs `Format[X, W]`, for `W` the `writer` it is written into."""
+        fmt = self.library("Format")
         for part in expr.parts:
             if not isinstance(part, str):
-                self.expr(part.operand if isinstance(part, S.Unary) and part.op == "&" else part)
+                value = self.expr(part.operand if isinstance(part, S.Unary) and part.op == "&" else part)
+                self.require(fmt, [value, writer], part.pos)
         return C.Named(self.library("Buffer!"))
 
     def expr_path(self, expr: S.Path) -> C.Type:
@@ -1358,11 +1361,13 @@ class Infer:
         assert isinstance(expr.callee, S.Field)
         receiver, name = expr.callee.value, expr.callee.name
         if isinstance(receiver, S.FStr) and name == "write":
-            self.expr(receiver)
+            writer = Meta()
+            self.record(receiver, self.expr_fstring(receiver, writer))
             expr.call = FStringWrite(receiver)
             if len(expr.args) != 1:
                 fail("write takes the writer", expr.pos)
             out = self.expr(expr.args[0])
+            self.unify(writer, out, expr.pos)
             self.require(self.library("Writable"), [out], expr.pos)
             return out
         if lent_receiver and not self.is_place(receiver):

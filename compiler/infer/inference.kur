@@ -1802,7 +1802,7 @@ impl Body['k] {
             },
             Expr::UnsafeStore(s) => self.apply(&cx, ArenaVec::two(&cx, (s.pointer.copy(&cx), Pat::PtrT), (s.value.copy(&cx), Pat::T)), Pat::Unit, s.pos),
             Expr::Lit(l) => self.expr_lit(&cx, l),
-            Expr::FStr(f) => self.expr_fstring(&cx, f),
+            Expr::FStr(f) => self.expr_fstring(&cx, f, C::named(self.library(&cx, "Buffer!"), ArenaVec::new(&cx))),
             Expr::Path(p) => self.expr_path(&cx, p),
             Expr::Tuple(n) => {
                 let elems: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
@@ -1941,7 +1941,9 @@ impl Body['k] {
         }
     }
 
-    fn expr_fstring(self, &cx: Domain!['k], f: S::FStr['k]) -> Type['k] {
+    /// Each `{x}` of the f-string needs `Format[X, W]`, for `W` the `writer` it is written into.
+    fn expr_fstring(self, &cx: Domain!['k], f: S::FStr['k], writer: Type['k]) -> Type['k] {
+        let fmt = self.library(&cx, "Format");
         var i = 0usize;
         while i < f.parts.len(&cx) {
             let unit = match f.parts.at(&cx, i) {
@@ -1950,7 +1952,8 @@ impl Body['k] {
                         Expr::Unary(u) => if u.op.is(&cx, "&") { u.operand.copy(&cx) } else { part },
                         _ => part,
                     };
-                    let unit = self.expr(&cx, operand);
+                    let value = self.expr(&cx, operand);
+                    self.require(&cx, fmt, ArenaVec::two(&cx, value, writer), S::expr_pos(part));
                 },
                 S::Piece::Text(_t) => (),
             };
@@ -3205,12 +3208,14 @@ impl Body['k] {
         let name = callee.name;
         let unit = match receiver {
             Expr::FStr(f) => if name.is(&cx, "write") {
-                let unit = self.expr(&cx, receiver);
+                let writer = new_meta(&cx);
+                let unit = self.record(&cx, f.id, f.pos, self.expr_fstring(&cx, f, writer));
                 self.results().calls.insert(&cx, c.id, Callee::FStringWrite.(f));
                 if c.args.len(&cx) != 1usize {
                     self.fails(&cx, "write takes the writer", c.pos);
                 }
                 let out = self.expr(&cx, c.args.at(&cx, 0usize));
+                self.unify_at(&cx, writer, out, c.pos);
                 self.require(&cx, self.library(&cx, "Writable"), ArenaVec::one(&cx, out), c.pos);
                 return out;
             },
