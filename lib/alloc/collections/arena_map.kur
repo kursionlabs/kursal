@@ -390,20 +390,32 @@ impl ArenaMap[K, V, 'k] {
     }
 
     /// Keeps the entries `f` holds for, in their order, and removes the rest.
+    ///
+    /// `f` is lent the context, so it can change the map through a copy of
+    /// its handle. The entries are visited by position as they stand after
+    /// each call, and an entry `f` rejects is removed only if it is still
+    /// live there; the count is the map's own at each removal, so it stays
+    /// the number of live keys whatever `f` did. An insertion that makes the
+    /// map drop its dead entries (`grow`) moves the live ones, so a call
+    /// after it sees the entries from their new positions on.
     forall Env, C, R where Access[C -> 'k, R], Copy[Env].
     fn retain(self, &cx: C, f: closure[Env](&_: C, K, V) -> bool) {
-        let h = self.state.copy(&cx);
-        var count = h.count;
+        // The entries vec is the map's for its whole life: `grow`, `clear`
+        // and `assign` change it in place.
+        let entries = self.state.copy(&cx).entries;
         var i = 0usize;
-        while i < h.entries.len(&cx) {
-            let e = h.entries.at(&cx, i);
-            if e.live && !f(&cx, e.key, e.value) {
-                h.entries.set(&cx, i, Entry.{ key: e.key, value: e.value, live: false, hash: e.hash });
-                count = count - 1usize;
+        while i < entries.len(&cx) {
+            let e = entries.at(&cx, i);
+            if e.live && !f(&cx, e.key, e.value) && i < entries.len(&cx) {
+                let now = entries.at(&cx, i);
+                if now.live {
+                    entries.set(&cx, i, Entry.{ key: now.key, value: now.value, live: false, hash: now.hash });
+                    let h = self.state.copy(&cx);
+                    self.state.set(&cx, MapState.{ slots: h.slots, entries: h.entries, count: h.count - 1usize });
+                }
             }
             i = i + 1usize;
         }
-        self.state.set(&cx, MapState.{ slots: h.slots, entries: h.entries, count });
     }
 
     /// The same live entries, in the same order, in a map of their own.

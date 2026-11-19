@@ -214,7 +214,8 @@ instance Iterator[Enumerate[I] -> Pair[usize, T]] {
     }
 }
 
-/// At most `left` more items; the inner iterator is not pulled past them.
+/// At most `left` more items; the inner iterator is not pulled past them,
+/// nor again once it has run out (`left` drops to 0).
 forall I.
 exposed struct Take {
     inner: I,
@@ -231,30 +232,39 @@ instance Iterator[Take[I] -> T] {
             return Option::None;
         }
         let item = &inner.next();
-        t = Take.{ inner, left: left - 1usize };
+        let (item, left) = match item {
+            Option::Some(v) => (Option::Some.(v), left - 1usize),
+            Option::None => (Option::None, 0usize),
+        };
+        t = Take.{ inner, left };
         item
     }
 }
 
 /// The items after the first `left`. `Copy[T]`: the skipped ones are dropped.
+/// Once the inner iterator has run out, while skipping or after, it is not
+/// pulled again (`done`).
 forall I.
 exposed struct Skip {
     inner: I,
     left: usize,
+    done: bool,
 }
 
 forall I, T where Iterator[I -> T], Copy[T].
 instance Iterator[Skip[I] -> T] {
     fn next(&s: Skip[I]) -> Option[T] {
-        let { inner, left } = s;
+        let { inner, left, done } = s;
         var inner = inner;
         var left = left;
-        while left > 0usize {
+        var done = done;
+        while left > 0usize && !done {
             let skipped = &inner.next();
+            done = skipped.is_none();
             left = left - 1usize;
         }
-        let item = &inner.next();
-        s = Skip.{ inner, left: 0usize };
+        let item = if done { Option::None } else { &inner.next() };
+        s = Skip.{ inner, left: 0usize, done: done || item.is_none() };
         item
     }
 }
@@ -378,7 +388,7 @@ forall I, T where Iterator[I -> T], Copy[T].
 impl I {
     /// The items after the first `count`.
     fn skip(self, count: usize) -> Skip[I] {
-        Skip.{ inner: self, left: count }
+        Skip.{ inner: self, left: count, done: false }
     }
 
     /// The items up to the first one `pred` rejects.

@@ -20,6 +20,12 @@
 //
 // Each statement walks its key path through the tables once, by hash, so a
 // document is read in time linear in its size.
+//
+// Arrays and inline tables nest at most `MAX_DEPTH` deep, a value at the
+// top of a statement being at depth 0: the parser reads them by recursion,
+// and a document nested deeper fails with "nesting too deep" at the `[` or
+// `{` that goes past the limit rather than overflow the stack (a thread's
+// is smaller than the process's).
 
 use package::value::{DatetimeKind, TomlDatetime, TomlError, TomlValue};
 use std::alloc::arena::Allocate;
@@ -37,6 +43,9 @@ use std::utf8::{decode, encode};
 // The flags of a key path (see above).
 const EXPLICIT: u32 = 1u32;
 const FROZEN: u32 = 2u32;
+
+// How deep arrays and inline tables may nest (see above).
+const MAX_DEPTH: usize = 128usize;
 
 forall 'k.
 struct FlagNode {
@@ -588,7 +597,7 @@ impl Parser['k] {
     }
 
     forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
-    fn key_value(self, &cx: C, pos: usize) -> (usize, ArenaVec[Span['k], 'k], TomlValue['k]) {
+    fn key_value(self, &cx: C, pos: usize, depth: usize) -> (usize, ArenaVec[Span['k], 'k], TomlValue['k]) {
         let (i, key) = self.key(&cx, pos);
         if self.failed(&cx) {
             return (self.len, key, TomlValue::Boolean.(false));
@@ -597,7 +606,7 @@ impl Parser['k] {
             self.fail(&cx, i, "expected '=' after a key");
             return (self.len, key, TomlValue::Boolean.(false));
         }
-        let (next, value) = self.value(&cx, self.skip_space(&cx, i + 1usize));
+        let (next, value) = self.value(&cx, self.skip_space(&cx, i + 1usize), depth);
         (next, key, value)
     }
 
@@ -611,8 +620,9 @@ impl Parser['k] {
         }
     }
 
+    /// The value at `pos`, nested `depth` arrays and inline tables deep.
     forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
-    fn value(self, &cx: C, pos: usize) -> (usize, TomlValue['k]) {
+    fn value(self, &cx: C, pos: usize, depth: usize) -> (usize, TomlValue['k]) {
         let b = self.byte(&cx, pos);
         if pos >= self.len {
             self.fail(&cx, pos, "invalid value");
@@ -640,11 +650,15 @@ impl Parser['k] {
         if b == b'f' && self.starts_with(&cx, pos, "false") {
             return (pos + 5usize, TomlValue::Boolean.(false));
         }
+        if (b == b'[' || b == b'{') && depth >= MAX_DEPTH {
+            self.fail(&cx, pos, "nesting too deep");
+            return (self.len, TomlValue::Boolean.(false));
+        }
         if b == b'[' {
-            return self.array(&cx, pos);
+            return self.array(&cx, pos, depth + 1usize);
         }
         if b == b'{' {
-            return self.inline_table(&cx, pos);
+            return self.inline_table(&cx, pos, depth + 1usize);
         }
         match self.datetime(&cx, pos) {
             Option::Some(found) => {
@@ -689,14 +703,14 @@ impl Parser['k] {
     }
 
     forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
-    fn array(self, &cx: C, pos: usize) -> (usize, TomlValue['k]) {
+    fn array(self, &cx: C, pos: usize, depth: usize) -> (usize, TomlValue['k]) {
         let items: ArenaVec[TomlValue['k], 'k] = ArenaVec::new(&cx);
         var i = self.skip_comments_and_array_space(&cx, pos + 1usize);
         if self.byte(&cx, i) == b']' && i < self.len {
             return (i + 1usize, TomlValue::Array.(items));
         }
         while !self.failed(&cx) {
-            let (next, item) = self.value(&cx, i);
+            let (next, item) = self.value(&cx, i, depth);
             items.push(&cx, item);
             i = self.skip_comments_and_array_space(&cx, next);
             if !self.failed(&cx) {
@@ -718,7 +732,7 @@ impl Parser['k] {
     }
 
     forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
-    fn inline_table(self, &cx: C, pos: usize) -> (usize, TomlValue['k]) {
+    fn inline_table(self, &cx: C, pos: usize, depth: usize) -> (usize, TomlValue['k]) {
         let table: ArenaMap[Span['k], TomlValue['k], 'k] = ArenaMap::new(&cx);
         let flags = new_flags(&cx);
         var i = self.skip_space(&cx, pos + 1usize);
@@ -726,7 +740,7 @@ impl Parser['k] {
             return (i + 1usize, TomlValue::Table.(table));
         }
         while !self.failed(&cx) {
-            let (next, key, value) = self.key_value(&cx, i);
+            let (next, key, value) = self.key_value(&cx, i, depth);
             if self.failed(&cx) {
                 return (self.len, TomlValue::Table.(table));
             }
@@ -993,7 +1007,7 @@ impl Parser['k] {
     /// `key = value` in the current section.
     forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
     fn assignment(self, &cx: C, pos: usize) -> usize {
-        let (i, key, value) = self.key_value(&cx, pos);
+        let (i, key, value) = self.key_value(&cx, pos, 0usize);
         if self.failed(&cx) {
             return self.len;
         }
@@ -1182,7 +1196,8 @@ fn invalid_utf8(&cx: C, src: Span['k]) -> Option[usize] {
 }
 
 /// The root table of the TOML document `src`, in `src`'s arena, or the first
-/// error.
+/// error. Arrays and inline tables nested more than 128 deep are an error
+/// ("nesting too deep"), which TOML itself does not make one.
 forall 'k, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
 fn parse(&cx: C, src: Span['k]) -> Result[ArenaMap[Span['k], TomlValue['k], 'k], TomlError] {
     match invalid_utf8(&cx, src) {

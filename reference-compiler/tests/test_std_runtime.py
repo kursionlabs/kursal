@@ -995,6 +995,45 @@ class StdRuntimeTests(unittest.TestCase):
                 if sum == 0u32 + 1u32 + 2u32 + 10u32 + 11u32 + 12u32 && pairs == 3u32 { 0 } else { 1 }
             }''')
 
+    def test_take_and_skip_stop_pulling_a_finished_iterator(self):
+        self.expect('''
+            use std::iter::Iterator;
+            use std::option::Option;
+            // Ends after three items, then would start again: an iterator pulled after it ended.
+            exposed struct Flaky { n: u32 }
+            instance Iterator[Flaky -> u32] {
+                fn next(&it: Flaky) -> Option[u32] {
+                    let n = it.n;
+                    it = Flaky.{ n: n + 1u32 };
+                    if n == 3u32 { Option::None } else { Option::Some.(n) }
+                }
+            }
+            fn main() -> i32 {
+                var taken = Flaky.{ n: 0u32 }.take(10usize);
+                var skipped_past = Flaky.{ n: 0u32 }.skip(5usize);
+                var skipped = Flaky.{ n: 0u32 }.skip(1usize);
+                var took = 0u32;
+                var past = 0u32;
+                var sum = 0u32;
+                var count = 0u32;
+                while count < 8u32 {
+                    match &taken.next() {
+                        Option::Some(x) => { took = took + 1u32; },
+                        Option::None => (),
+                    }
+                    match &skipped_past.next() {
+                        Option::Some(x) => { past = past + 1u32; },
+                        Option::None => (),
+                    }
+                    match &skipped.next() {
+                        Option::Some(x) => { sum = sum + x; },
+                        Option::None => (),
+                    }
+                    count = count + 1u32;
+                }
+                if took == 3u32 && past == 0u32 && sum == 1u32 + 2u32 { 0 } else { 1 }
+            }''')
+
     # ------------------------------------------------------- core accessors --
 
     ACCESSORS = '''
@@ -1265,6 +1304,74 @@ class StdRuntimeTests(unittest.TestCase):
                 let ok = check(&cx);
                 cx.destroy();
                 if ok { 0 } else { 1 }
+            }''')
+
+    def test_arena_map_retain_counts_what_its_callback_changes(self):
+        # The callback holds a copy of the map's handle and removes key 2 while key 1 is visited, then
+        # rejects key 1: no key is left, and the count says so.
+        self.expect('''
+            use std::alloc::arena::Domain!;
+            use std::collections::arena_map::ArenaMap;
+            forall 'k.
+            fn check(&cx: Domain!['k]) -> bool {
+                let map: ArenaMap[u32, u32, 'k] = ArenaMap::new(&cx);
+                map.insert(&cx, 1u32, 10u32);
+                map.insert(&cx, 2u32, 20u32);
+                map.retain(&cx, |&c, k: u32, v: u32| {
+                    if k == 1u32 {
+                        let gone = map.remove(&c, 2u32);
+                    }
+                    false
+                });
+                let emptied = map.len(&cx) == 0usize && map.keys(&cx).len(&cx) == 0usize;
+                map.insert(&cx, 3u32, 30u32);
+                let gone = map.remove(&cx, 3u32);
+                emptied && map.len(&cx) == 0usize
+            }
+            fn main() -> i32 {
+                let exists 'k. cx = Domain!::new();
+                let ok = check(&cx);
+                cx.destroy();
+                if ok { 0 } else { 1 }
+            }''')
+
+    def test_arena_vec_push_span_of_its_own_bytes(self):
+        # `span` views the vec's first segment; pushing that view back after a `truncate` copies from
+        # bytes the push itself overwrites.
+        self.expect('''
+            use std::alloc::arena::Domain!;
+            use std::collections::arena_vec::ArenaVec;
+            forall 'k.
+            fn check(&cx: Domain!['k]) -> bool {
+                let v: ArenaVec[u8, 'k] = ArenaVec::new(&cx);
+                v.push_static(&cx, "abcd");
+                let s = v.span(&cx);
+                v.truncate(&cx, 1usize);
+                v.push_span(&cx, s);
+                let grown = v.span(&cx).is(&cx, "aabcd");
+                let t = v.span(&cx);
+                v.truncate(&cx, 0usize);
+                v.push_span(&cx, t.slice(1usize, 4usize));
+                grown && v.span(&cx).is(&cx, "abc")
+            }
+            fn main() -> i32 {
+                let exists 'k. cx = Domain!::new();
+                let ok = check(&cx);
+                cx.destroy();
+                if ok { 0 } else { 1 }
+            }''')
+
+    def test_arena_vec_locates_indices_past_four_billion_segments(self):
+        # Segment k of a vec of u64 holds 4 << k elements, after 4 * (2^k - 1) of them.
+        self.expect('''
+            use std::collections::arena_vec::locate;
+            fn at(i: usize, segment: usize, offset: usize) -> bool {
+                let (k, o) = locate[u64](i);
+                k == segment && o == offset && o < 4usize << k
+            }
+            fn main() -> i32 {
+                if at(1000usize, 7usize, 492usize) && at(17179869184usize, 32usize, 4usize)
+                    && at(34359738368usize, 33usize, 4usize) { 0 } else { 1 }
             }''')
 
     def test_lists_are_built_front_to_back(self):

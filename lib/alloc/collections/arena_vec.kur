@@ -123,6 +123,13 @@ fn locate(i: usize) -> (usize, usize) {
     }
     var q = i / b + 1usize;
     var k = 0usize;
+    // `q >> 32`, written as two shifts so that it is 0, not undefined, where
+    // `usize` has 32 bits.
+    let high = (q >> 16usize) >> 16usize;
+    if high != 0usize {
+        k = 32usize;
+        q = high;
+    }
     if q >= 65536usize {
         k = k + 16usize;
         q = q >> 16usize;
@@ -739,7 +746,10 @@ instance HashIn[ArenaVec[T, 'k], Domain!['k]] {
 
 forall 'k.
 impl ArenaVec[u8, 'k] {
-    /// Pushes the bytes of `bytes`, a span of the same domain.
+    /// Pushes the bytes of `bytes`, a span of the same domain. The span may
+    /// view this vec's own bytes (`span`), even ones past its length after a
+    /// `truncate`, which the push then overwrites: each byte is read before
+    /// it is overwritten, as `memmove` does.
     forall C, R where Allocate[C -> 'k, R].
     fn push_span(self, &cx: C, bytes: Span['k]) {
         let n = bytes.len();
@@ -753,10 +763,24 @@ impl ArenaVec[u8, 'k] {
         }
         // `bytes` is read under the domain's capability, which `tag` is.
         let (source, count) = bytes.into_parts();
-        var i = 0usize;
-        while i < n {
-            unsafe *(unsafe place(h, h.len + i)) = unsafe *(unsafe offset(source, i));
-            i = i + 1usize;
+        // A span over this vec lies in segment 0 (`span` copies a longer run
+        // out), where the destination's bytes follow one another too. A
+        // source that starts below the destination is copied from its end,
+        // so no byte is overwritten before it is read; any other, from its
+        // start.
+        let destination = unsafe place(h, h.len);
+        if unsafe (source as usize) < unsafe (destination as usize) {
+            var i = n;
+            while i > 0usize {
+                i = i - 1usize;
+                unsafe *(unsafe place(h, h.len + i)) = unsafe *(unsafe offset(source, i));
+            }
+        } else {
+            var i = 0usize;
+            while i < n {
+                unsafe *(unsafe place(h, h.len + i)) = unsafe *(unsafe offset(source, i));
+                i = i + 1usize;
+            }
         }
         self.header.set(&tag, Header.{ len: h.len + n, segments: h.segments, first: h.first, table: h.table });
         cx = Allocate[C -> 'k, R]::close(tag, arena, rest);

@@ -351,6 +351,22 @@ class TomlTests(unittest.TestCase):
         self.assertTrue(all(math.isnan(struct.unpack("<d", struct.pack("<Q", b))[0]) for b in bits))
         self.assertEqual([b >> 63 for b in bits], [1, 0])
 
+    def test_nesting_deeper_than_128_is_an_error(self):
+        # 128 arrays or inline tables deep read as tomllib reads them; the 129th `[` or `{` is an error
+        # where it stands, and so is nesting 100000 deep, which recursing into would overflow the stack.
+        for open_, close, inner in (("[", "]", ""), ("{b=", "}", "1")):
+            with self.subTest(open=open_):
+                deep = "a = " + open_ * 128 + inner + close * 128 + "\n"
+                result = self.decode(deep)
+                self.assertEqual(result.returncode, 0, result.stdout[:200])
+                self.assertEqual(pairs(result.stdout.decode()), tagged(tomllib.loads(deep)))
+                result = self.decode("a = " + open_ * 129 + inner + close * 129 + "\n")
+                self.assertEqual(result.returncode, 1, result.stdout[:200])
+                offset = 4 + 128 * len(open_)
+                self.assertEqual(result.stdout.decode().split(" ", 3), [str(offset), "1", str(offset + 1), "nesting too deep"])
+                result = self.decode("a = " + open_ * 100000 + inner + close * 100000 + "\n")
+                self.assertEqual((result.returncode, result.stdout.decode().split(" ")[0]), (1, str(offset)))
+
     def test_a_large_document_reads_in_linear_time(self):
         # Many tables, each defined by a header and many dotted keys: quadratic definition checks would
         # take minutes.
