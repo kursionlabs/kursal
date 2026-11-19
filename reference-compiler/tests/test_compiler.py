@@ -165,7 +165,10 @@ def build_compiler() -> Path:
     if not binary.exists():
         CACHE.mkdir(exist_ok=True)
         for old in CACHE.glob("kursal-*"):
-            old.unlink()
+            if old.is_dir():
+                shutil.rmtree(old)
+            else:
+                old.unlink()
         built = subprocess.run([sys.executable, str(ROOT / "reference-compiler/tools/build.py"), str(COMPILER), str(binary)],
                                capture_output=True, text=True)
         if built.returncode != 0:
