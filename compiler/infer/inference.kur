@@ -34,7 +34,7 @@ use package::sigs::signatures::{ConstValue, InstanceSig, Sig, Signatures, const_
 use package::syntax::ast as S;
 use package::syntax::ast::{Expr, Pattern, Pos, Statement, no_pos};
 use package::types::termination::check_instance_termination;
-use package::types::ops::{Fresh, Surface, Types, brand_differences, brand_name, equal, foreach_binders, free_brands, free_names, subst, surface};
+use package::types::ops::{Fresh, Surface, Types, brand_differences, brand_name, equal, foreach_binders, free_brands, free_names, made_from, subst, surface};
 use package::types::unify::{ground, instantiate, match_head, prune, unify, zonk};
 use std::collections::hashmap::OwnedMap!;
 use std::collections::vec::{OwnedVec!, Popped!};
@@ -1476,11 +1476,23 @@ impl Body['k] {
             }
             i = i + 1usize;
         }
-        let sub = self.brand_sub(&cx);
-        let names = sub.keys(&cx);
+        let brands = self.brand_sub(&cx);
+        let names = brands.keys(&cx);
         i = 0usize;
         while i < names.len(&cx) {
             scope.brands.insert(&cx, names.at(&cx, i));
+            i = i + 1usize;
+        }
+        // a foreach binder as written names the binder of its own `foreach`
+        let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+        self.open_binders.copy(&cx).each(&cx, |&cx, b: Span['k]| {
+            if !made_from(&cx, b).is_empty() {
+                sub.insert(&cx, made_from(&cx, b), C::named(b, ArenaVec::new(&cx)));
+            }
+        });
+        i = 0usize;
+        while i < names.len(&cx) {
+            sub.insert(&cx, names.at(&cx, i), brands.at(&cx, names.at(&cx, i)));
             i = i + 1usize;
         }
         subst(&cx, self.inf.sigs.got(&cx, self.inf.sigs.type(&cx, type_expr, scope)), sub, self.inf.counter)
@@ -2544,24 +2556,31 @@ impl Body['k] {
             source = self.shape(&cx, source, f.pos);
         }
         self.require(&cx, Span::from_static(&cx, "Exposed"), ArenaVec::one(&cx, source), f.pos);
-        let binder = match f.binder {
+        // Each `foreach` binds a binder of its own, named after the one written, as `F#F12` for `F`.
+        let written = match f.binder {
             Option::Some(b) => b,
-            Option::None => Buffer!::new().push_static("#F").push_u64(self.inf.next_id(&cx) as u64).save(&cx),
+            Option::None => Span::from_static(&cx, ""),
         };
-        // a binder that shadows a type parameter is formation's
-        if !self.sig.params.any(&cx, |&cx, p: Param['k]| p.name.eq(&cx, binder)) {
-            self.foreaches.insert(&cx, binder, (f.name, f.pos));
+        let sources = match source {
+            Type::Foreach(s) => foreach_binders(&cx, s),
+            _ => ArenaVec::new(&cx),
+        };
+        if !written.is_empty() && (self.sig.params.any(&cx, |&cx, p: Param['k]| p.name.eq(&cx, written))
+            || self.open_binders.copy(&cx).any(&cx, |&cx, b: Span['k]| made_from(&cx, b).eq(&cx, written))
+            || sources.any(&cx, |&cx, b: Span['k]| made_from(&cx, b).eq(&cx, written))) {
+            self.fail(&cx, Buffer!::new().push_static("foreach binder ").push_bytes(&cx, written).push_static(" shadows another type named ").push_bytes(&cx, written).save(&cx), f.pos);
         }
+        let binder = Buffer!::new().push_bytes(&cx, written).push_static("#F").push_u64(self.inf.next_id(&cx) as u64).save(&cx);
+        self.foreaches.insert(&cx, binder, (f.name, f.pos));
         self.kinds.insert(&cx, binder, Kind::Any);
         let outer = self.open_binders.copy(&cx);
         var open_binders = outer.cons(&cx, binder);
         let (indirect, item) = match source {
             Type::Foreach(s) => {
-                let names = foreach_binders(&cx, s);
                 var i = 0usize;
-                while i < names.len(&cx) {
-                    self.kinds.insert(&cx, names.at(&cx, i), Kind::Any);
-                    open_binders = open_binders.cons(&cx, names.at(&cx, i));
+                while i < sources.len(&cx) {
+                    self.kinds.insert(&cx, sources.at(&cx, i), Kind::Any);
+                    open_binders = open_binders.cons(&cx, sources.at(&cx, i));
                     i = i + 1usize;
                 }
                 (false, s.body.copy(&cx))

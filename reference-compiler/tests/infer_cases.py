@@ -180,6 +180,10 @@ INFERENCES = (
     '\nforall T. exposed struct W { v: T }\nforall T. fn wrap(x: T) -> W[T] { W.{ v: x } }\nexposed struct S { a: u32, b: u32 }\n'
     'fn main() -> i32 {\n    let s = S.{ a: 7u32, b: 9u32 };\n    let t = foreach a: A of s { wrap(a) };\n'
     '    let u = foreach b of t { let c = b; c };\n    let v = foreach b: B of u { let d = b; d };\n    0i32\n}\n',
+    # Sibling `foreach`es may write the same binder, and a type written in a body names its own.
+    'exposed struct S { a: u32, b: u32 }\nfn main() -> i32 {\n    let s = S.{ a: 7u32, b: 9u32 };\n'
+    '    let t = foreach a: A of s { let c: A = a; c };\n    let u = foreach b: A of s { let d: A = b; d };\n'
+    '    let { a: x, b: y } = u;\n    (x + y) as i32\n}\n',
 )
 
 INFER_ERRORS = (
@@ -357,4 +361,20 @@ INFER_ERRORS = (
      "5:5: cannot infer the type argument T of m"),
     ("forall 'a. fn f(x: u32) -> u32 { x }\nfn main() -> i32 {\n    let g = f;\n    g(1u32) as i32\n}\n",
      "4:5: cannot infer the type argument 'a of g"),
+    # The type of one `foreach` item reaches the body of a sibling that writes the same binder.
+    ("exposed struct S { a: u32, b: u32 }\nexposed struct P { c: u8, d: u8 }\nforall T. fn same(x: T, y: T) -> (T, T) { (x, y) }\n"
+     "fn main() -> i32 {\n    let s = S.{ a: 7u32, b: 9u32 };\n    let p = P.{ c: 1u8, d: 2u8 };\n"
+     "    let first = foreach f: F of s { (f, core::option::Option::None) };\n"
+     "    let second = foreach g: F of p {\n        let { a: x, b: y } = first;\n        let (k, o) = x;\n"
+     "        (same(o, core::option::Option::Some(g)), y)\n    };\n    0i32\n}\n",
+     "8:18: the type of foreach item g escapes its lexical scope"),
+    # A binder never shadows a type parameter, an enclosing binder or a binder of its source.
+    ("exposed struct S { a: u32, b: u32 }\nforall F. fn f(x: F, s: S) -> F {\n    let t = foreach f: F of s { f };\n    x\n}\n",
+     "3:13: foreach binder F shadows another type named F"),
+    ("exposed struct S { a: u32, b: u32 }\nfn main() -> i32 {\n    let s = S.{ a: 7u32, b: 9u32 };\n"
+     "    let t = foreach f: F of s {\n        let u = foreach g: F of s { g };\n        f\n    };\n    0i32\n}\n",
+     "5:17: foreach binder F shadows another type named F"),
+    ("exposed struct S { a: u32, b: u32 }\nfn main() -> i32 {\n    let s = S.{ a: 7u32, b: 9u32 };\n"
+     "    let t = foreach a: A of s { a };\n    let u = foreach b: A of t { b };\n    0i32\n}\n",
+     "5:13: foreach binder A shadows another type named A"),
 )

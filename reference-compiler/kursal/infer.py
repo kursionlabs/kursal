@@ -31,7 +31,7 @@ from . import syntax as S
 from .resolve import Decl, ResolveError, Resolver
 from .sigs import InstanceSig, Scope, Sig, Signatures
 from .sexpr import KursError, Position
-from .types import Surface, Types, brand_differences, brand_name, equal, foreach_binders, free_brands, free_names, subst
+from .types import Surface, Types, brand_differences, brand_name, equal, foreach_binders, free_brands, free_names, made_from, subst
 from .termination import check_instance_termination
 from .coherence import check_coherence
 from .unify import Meta, ground, instantiate, match_head, prune, unify, zonk
@@ -485,7 +485,9 @@ class Infer:
     def type(self, type_expr: S.Type) -> C.Type:
         scope = Scope({p.name: p.kind for p in self.sig.params if p.kind != C.BRAND},
                       {p.name for p in self.sig.params if p.kind == C.BRAND} | set(self.brand_sub()))
-        return subst(self.sigs.type(type_expr, scope), self.brand_sub())
+        # a foreach binder as written names the binder of its own `foreach`
+        binders = {made_from(b): C.Named(b) for b in self.open_binders if made_from(b)}
+        return subst(self.sigs.type(type_expr, scope), {**binders, **self.brand_sub()})
 
     # ---- statements
     def block(self, block: S.Block) -> C.Type:
@@ -1005,15 +1007,20 @@ class Infer:
         if isinstance(source, Meta):
             source = self.shape(source, expr.pos)
         self.require("Exposed", (source,), expr.pos)
-        binder = expr.binder or f"#F{next(_ids)}"
-        if all(p.name != binder for p in self.sig.params):  # a binder that shadows a type parameter is formation's
-            self.foreaches[binder] = (expr.name, expr.pos)
+        # Each `foreach` binds a binder of its own, named after the one written, as `F#F12` for `F`.
+        written = expr.binder or ""
+        sources = foreach_binders(source) if isinstance(source, C.Foreach) else ()
+        if written and (any(p.name == written for p in self.sig.params) or
+                        any(made_from(b) == written for b in (*self.open_binders, *sources))):
+            fail(f"foreach binder {written} shadows another type named {written}", expr.pos)
+        binder = f"{written}#F{next(_ids)}"
+        self.foreaches[binder] = (expr.name, expr.pos)
         self.kinds[binder] = C.ANY
         outer = self.open_binders
         if isinstance(source, C.Foreach):     # a transformed source: its items are its body
             indirect, item = False, source.body
-            self.kinds.update({b: C.ANY for b in foreach_binders(source)})
-            self.open_binders = (*outer, binder, *foreach_binders(source))
+            self.kinds.update({b: C.ANY for b in sources})
+            self.open_binders = (*outer, binder, *sources)
         else:
             indirect = isinstance(self.shape(source, expr.pos), C.Ptr)
             item = C.Ptr(C.Named(binder)) if indirect else C.Named(binder)

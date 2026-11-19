@@ -585,9 +585,9 @@ class Surface:
             _type_names(ty, names)
         spellings: dict[str, int] = {}
         for label in labels:
-            spellings[_made_from(label)] = spellings.get(_made_from(label), 0) + 1
+            spellings[made_from(label)] = spellings.get(made_from(label), 0) + 1
         self.origins = origins
-        self.qualified = {label for label in labels if spellings[_made_from(label)] > 1 and label in origins}
+        self.qualified = {label for label in labels if spellings[made_from(label)] > 1 and label in origins}
         readings: dict[str, int] = {}
         for name in names:
             readings[_short(name)] = readings.get(_short(name), 0) + 1
@@ -612,10 +612,10 @@ class Surface:
 
 def brand_name(label: str) -> str:
     """The brand `label` as written in source, as `Surface` writes it where no other brand reads the same."""
-    return "'" + _made_from(label)
+    return "'" + made_from(label)
 
 
-def _made_from(name: str) -> str:
+def made_from(name: str) -> str:
     """The name a compiler-made name `name#...` was made from; a source name is its own."""
     return name.split("#", 1)[0]
 
@@ -624,7 +624,7 @@ def _variable(name: str) -> str:
     """A type variable as a message writes it; a nominal type's path is its own."""
     if "::" in name or "#" not in name:
         return name
-    return _made_from(name) or "_"
+    return made_from(name) or "_"
 
 
 def _short(name: str) -> str:
