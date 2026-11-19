@@ -426,7 +426,8 @@ signature". It does not mean "verified correct".**
 **Zero sizes.** A zero-size type (`()`, a brand, a capability, an empty
 struct, `[T; 0]`) has size 0 and no memory form: `sizeof[T]()` is `0`, and
 the compiler rejects every load or store of one through a pointer, also
-where a specialization chooses it. So `Arena!::alloc`, `alloc_slice`,
+where a specialization chooses it, at the call in the program that chose
+the type. So `Arena!::alloc`, `alloc_slice`,
 `Ref::new`, `Ref::copy` and the vectors do not build at a zero-size element
 type (one holding a zero-size part beside bytes is ordinary). The size
 arithmetic is still defined at 0, for raw code and for `T`s that only

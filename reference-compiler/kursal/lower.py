@@ -83,7 +83,8 @@ class Lowering:
 
     def __init__(self, resolver: Resolver, sigs: Signatures) -> None:
         self.r, self.sigs = resolver, sigs
-        self.program = LoweredProgram(types=sigs.types, traits=sigs.traits)
+        self.program = LoweredProgram(types=sigs.types, traits=sigs.traits,
+                                      files={m: str(f) for p in resolver.packages for m, f in p.files.items()})
         self.types = Types(self.program)
         self.datas: dict[bytes, str] = {}
         self.closures = count()

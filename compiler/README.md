@@ -597,7 +597,11 @@ or to one, extern parameters and extern values reject a zero-size type
 (`zero_size_type_has_no_memory_form`), as the front end does first, at the source (`a zero-size type
 has no memory form`), and so does the backend where a specialization chooses one. So `Ref::new(&cx, ())`, `ArenaVec[(), 'k]` and a
 `Vec![Marker]` do not build: they read and write their elements through pointers; an element that
-holds a zero-size part beside bytes (`ArenaVec[(Marker, u32), 'k]`) does. `sizeof` is the one
+holds a zero-size part beside bytes (`ArenaVec[(Marker, u32), 'k]`) does. The backend reports such
+an operation at the call that chose the type, in its file (`Program.files`): it follows back the
+requests that made the specialization while each was made with a zero-size type argument, and names
+the operation beside it (`zero_size_error`), as `lib.kur:7:9: a zero-size type has no memory form,
+and this call reaches a read or write of one through a pointer at .../alloc/collections/vec.kur:166:9`. `sizeof` is the one
 operation that observes a zero-size type, and it is 0; the arithmetic the standard library does
 with sizes is defined at 0 (`checked_mul` does not divide by it, `bump_chunk` reserves no bytes and
 returns the current address, `HeapAllocator::alloc(0)` asks `malloc` for one byte so that it is

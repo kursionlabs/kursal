@@ -332,3 +332,5 @@ class Program:
     datas: dict[str, Data] = field(default_factory=dict)
     traits: dict[str, Trait] = field(default_factory=dict)
     instances: dict[str, list[Instance]] = field(default_factory=dict)  # trait -> [Instance]
+    # Each module's source file, which the back end's messages name; none for a program read as KURS.
+    files: dict[ModuleId, str] = field(default_factory=dict)

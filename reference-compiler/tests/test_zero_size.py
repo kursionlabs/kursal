@@ -99,26 +99,41 @@ class ZeroSizeTests(unittest.TestCase):
               (= %r (call (same i32) %n)) (ret %r)))''', 3)
         self.assertRegex(output, r"static void \w+\(void\) \{\n  L_entry: ;\n  return;\n\}")
 
-    def test_arena_allocation_of_a_zero_size_value_is_rejected(self):
-        with tempfile.TemporaryDirectory(prefix="kursal-zero-size-") as base:
-            directory = Path(base)
-            (directory / "kur.toml").write_text(f'[package]\nname="p"\nsource_root="."\nkind="executable"\n'
-                                                f'entry="main"\n[dependencies.std]\npath="{LIB / "std"}"\n')
-            (directory / "lib.kur").write_text('''use std::alloc::arena::Domain!;
+    def test_a_zero_size_instantiation_is_reported_at_the_call_that_chose_it(self):
+        # The library's containers read and write their elements through pointers, so they do not build
+        # at a zero-size element type. The error names the program's own file and the call that chose the
+        # type, then the memory operation in the library it reaches.
+        cases = {
+            "Ref::new(&cx, ())": "arena.kur",
+            "OwnedVec!::new[()]().push(()).free()": "collections/vec.kur",
+            "{ var m = OwnedMap!::new[u32, ()](); let old = &m.insert(1u32, ()); m.free() }": "collections/hashmap.kur",
+            "Owned!::new(()).into_value()": "owned.kur",
+        }
+        for expression, library in cases.items():
+            with self.subTest(expression=expression), tempfile.TemporaryDirectory(prefix="kursal-zero-size-") as base:
+                directory = Path(base)
+                (directory / "kur.toml").write_text(f'[package]\nname="p"\nsource_root="."\nkind="executable"\n'
+                                                    f'entry="main"\n[dependencies.std]\npath="{LIB / "std"}"\n')
+                (directory / "lib.kur").write_text('''use std::alloc::arena::Domain!;
+use std::alloc::owned::Owned!;
+use std::collections::{hashmap::OwnedMap!, vec::OwnedVec!};
 use std::mem::Ref;
 fn main() -> i32 {
     let exists 'a. cx = Domain!::new();
-    let r = Ref::new(&cx, ());
+    let r = ''' + expression + ''';
     cx.destroy();
     0
 }
 ''')
-            resolver = resolve(directory)
-            sigs = signatures(resolver)
-            program = lower(resolver, sigs)
-            checked = check_program(program)
-            with self.assertRaisesRegex(KursError, "zero-size type has no memory form"):
-                emit_c(program, checked, sigs.name(resolver.packages[0].entry_decl))
+                resolver = resolve(directory)
+                sigs = signatures(resolver)
+                program = lower(resolver, sigs)
+                checked = check_program(program)
+                here = re.escape(str(directory / "lib.kur"))
+                there = re.escape(str(LIB / "alloc" / library))
+                with self.assertRaisesRegex(KursError, f"^{here}:7:\\d+: a zero-size type has no memory form, and this call "
+                                            f"reaches a read or write of one through a pointer at {there}:\\d+:\\d+$"):
+                    emit_c(program, checked, sigs.name(resolver.packages[0].entry_decl))
 
 
 if __name__ == "__main__":
