@@ -966,7 +966,8 @@ class Infer:
             self.unify(value, subst(want.body, {b: C.Skolem(l) for b, l in zip(want.binders, labels)}), expr.pos)
 
         def default() -> None:                    # otherwise it is the payload's type with the brands abstracted
-            binders = tuple(f"p{k}" for k in range(len(labels)))
+            # Binders no source spells: a brand of the payload, even one solved later, is never captured.
+            binders = tuple(f"p{k}#" for k in range(len(labels)))
             self.unify(result, C.Exists(binders, subst(zonk(value), {l: C.Skolem(b) for l, b in zip(labels, binders)})))
         self.later(result, known, expr.pos)
         self.defaults.append((result, default))

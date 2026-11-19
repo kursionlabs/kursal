@@ -22,6 +22,15 @@ exposed enum E! { A(Token!), B(u32) }
 fn eat(e: E!) -> u32 { match e { E!::A(t) => take(t), E!::B(n) => n } }
 """
 
+BRANDS = """\
+forall T. exposed enum Opt { Some(T), None }
+forall 'k. fn same(x: core::cap::Brand['k], y: core::cap::Brand['k]) -> u32 { 1u32 }
+forall 'a. fn second(pk: exists 'b. (core::cap::Brand['b], core::cap::Brand['a])) -> core::cap::Brand['a] {
+    let exists 'c. (x, y) = pk;
+    y
+}
+"""
+
 STEP = "forall Self. trait Step { fn step(x: Self) -> u32; }\n"
 LEND_STEP = "forall Self. trait Step { fn step(&x: Self, y: u32) -> u32; }\n"
 
@@ -95,6 +104,22 @@ REJECTED = (
      "atomic load works on a pointer to an integer, a bool or a pointer"),
     ("fn g(p: *bool) -> bool { unsafe p.fetch_add(true, core::atomic::Ordering::SeqCst) }\n",
      "atomic fetch_add works on a pointer to an integer"),
+    # A pack's own binders name no brand the payload can mention: the first opening makes the package's
+    # type, and `slot`'s type, learned after it, names the caller's 'p0, not the packed 'q.
+    (BRANDS + "forall 'p0, 'q. fn f(a: core::cap::Brand['p0], b: core::cap::Brand['q]) -> u32 {\n"
+     "    var slot = Opt::None; let pk = pack 'q. (b, slot); let exists 'r. (x, s) = pk;\n"
+     "    slot = Opt::Some.(a); let exists 't. (x2, s2) = pk;\n"
+     "    match s2 { Opt::Some(y) => same(x2, y), Opt::None => 0u32 } }\n",
+     r"brand mismatch: \(brand 'p0\) and \(brand 't\)"),
+    # Unifying two packages solves no outside variable to a brand they bind: `second`'s 'a is neither
+    # package's brand, whatever the binders are called.
+    (BRANDS + "forall 'p0, 'z. fn f(w: core::cap::Brand['p0], wz: core::cap::Brand['z]) -> u32 {\n"
+     "    let pk = pack 'z. (wz, wz); let exists 'r. (u, v) = pk; let y = second(pk); same(y, w) }\n",
+     r"type mismatch: \(exists \('p0\) \(tuple \(brand 'p0\) \(brand 'p0\)\)\) and \(exists \('b\)"),
+    (BRANDS + "forall 'b, 'z. fn f(wb: core::cap::Brand['b], wz: core::cap::Brand['z]) -> u32 {\n"
+     "    let pk: exists 'b. (core::cap::Brand['b], core::cap::Brand['b]) = pack 'z. (wz, wz);\n"
+     "    let y = second(pk); same(y, wb) }\n",
+     "type mismatch"),
 )
 
 ACCEPTED = (
@@ -118,6 +143,18 @@ ACCEPTED = (
     "fn g(p: *bool) -> bool { unsafe p.atomic_load(core::atomic::Ordering::SeqCst) }\n",
     "fn g(p: **u8) -> *u8 { unsafe p.atomic_swap(unsafe *p, core::atomic::Ordering::SeqCst) }\n",
     "fn g(p: *u32) -> u32 { unsafe p.fetch_add(1u32, core::atomic::Ordering::SeqCst) }\n",
+    # A brand the payload mentions but the pack does not hide stays itself, even spelled 'p0.
+    BRANDS + "forall 'p0, 'q. fn f(a: core::cap::Brand['p0], b: core::cap::Brand['q]) -> u32 {\n"
+    "    let pk = pack 'q. (a, b); let exists 'r. (x, y) = pk; same(x, a) + same(y, y) }\n",
+    BRANDS + "forall 'p0, 'q. fn f(a: core::cap::Brand['p0], b: core::cap::Brand['q]) -> u32 {\n"
+    "    var slot = Opt::None; let pk = pack 'q. (b, slot); let exists 'r. (x, s) = pk;\n"
+    "    slot = Opt::Some.(a); let exists 't. (x2, s2) = pk;\n"
+    "    match s2 { Opt::Some(y) => same(y, a), Opt::None => 0u32 } }\n",
+    BRANDS + "forall 'p0, 'z. fn f(w: core::cap::Brand['p0], wz: core::cap::Brand['z]) -> u32 {\n"
+    "    let pk = pack 'z. (wz, w); let exists 'r. (u, v) = pk; let y = second(pk); same(y, w) }\n",
+    BRANDS + "forall 'p0. fn f(w: core::cap::Brand['p0]) -> u32 {\n"
+    "    let pk: exists 'p0. (core::cap::Brand['p0], core::cap::Brand['p0]) = pack 'p0. (w, w);\n"
+    "    let exists 'p0. (x, y) = pk; same(x, y) }\n",
 )
 
 

@@ -75,16 +75,18 @@ def metas(ty: C.Type) -> set[Meta]:
 
 
 def quantified(left: tuple[C.Param, ...], right: tuple[C.Param, ...],
-               xs: tuple[C.Type, ...], ys: tuple[C.Type, ...], closed: bool) -> bool:
-    """Instance variables live outside binders; body inference variables may live inside."""
+               xs: tuple[C.Type, ...], ys: tuple[C.Type, ...], closed: bool, scoped: bool = False) -> bool:
+    """The binders `left` of `xs` and `right` of `ys` are equated. Only a transform's body, `scoped`, has
+    inference variables of its own, which an open unification may solve to name its binders; any other
+    variable lives outside the binders, and a solution naming one fails."""
     if tuple(p.kind for p in left) != tuple(p.kind for p in right) or len(xs) != len(ys):
         return False
-    if not closed:
+    if scoped and not closed:
         rename = {q.name: C.Skolem(p.name) if p.kind == C.BRAND else C.Named(p.name)
                   for p, q in zip(left, right)}
         return all(unify(zonk(x), subst(zonk(y), rename)) for x, y in zip(xs, ys))
     if not left:
-        return all(unify(x, y, closed=True) for x, y in zip(xs, ys))
+        return all(unify(x, y, closed=closed) for x, y in zip(xs, ys))
     variables = {m for t in (*xs, *ys) for m in metas(t)}
     occupied = {n for t in (*xs, *ys) for n in free_names(zonk(t))}
     labels = []
@@ -96,9 +98,12 @@ def quantified(left: tuple[C.Param, ...], right: tuple[C.Param, ...],
     rigid = tuple(C.Skolem(n) if p.kind == C.BRAND else C.Named(n) for p, n in zip(left, labels))
     a = dict(zip((p.name for p in left), rigid))
     b = dict(zip((p.name for p in right), rigid))
-    if not all(unify(subst(zonk(x), a), subst(zonk(y), b), closed=True) for x, y in zip(xs, ys)):
-        return False
-    return not any(free_names(zonk(m)) & set(labels) for m in variables)
+    if (all(unify(subst(zonk(x), a), subst(zonk(y), b), closed=closed) for x, y in zip(xs, ys))
+            and not any(free_names(zonk(m)) & set(labels) for m in variables)):
+        return True
+    for m in variables:              # a failure leaves no solution naming a rigid label
+        m.ref = None
+    return False
 
 
 def unify(a: C.Type, b: C.Type, *, closed: bool = False) -> bool:
@@ -143,7 +148,8 @@ def unify(a: C.Type, b: C.Type, *, closed: bool = False) -> bool:
         case C.Foreach(), C.Foreach():
             return (a.indirect == b.indirect and compare(a.source, b.source) and
                     quantified(tuple(C.Param(n) for n in foreach_binders(a)),
-                               tuple(C.Param(n) for n in foreach_binders(b)), (a.body,), (b.body,), closed))
+                               tuple(C.Param(n) for n in foreach_binders(b)), (a.body,), (b.body,), closed,
+                               scoped=True))
         case C.Fn(), C.Fn():
             if len(a.params) != len(b.params) or a.places != b.places or a.unsafe != b.unsafe:
                 return False

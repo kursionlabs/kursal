@@ -176,13 +176,15 @@ fn concat(&cx: Domain!['k], xs: ArenaVec[Type['k], 'k], ys: ArenaVec[Type['k], '
     out
 }
 
-// Instance variables live outside binders; body inference variables may live inside.
+// The binders `left` of `xs` and `right` of `ys` are equated. Only a transform's body, `scoped`, has
+// inference variables of its own, which an open unification may solve to name its binders; any other
+// variable lives outside the binders, and a solution naming one fails.
 forall 'k.
-fn quantified(&cx: Domain!['k], left: ArenaVec[Param['k], 'k], right: ArenaVec[Param['k], 'k], xs: ArenaVec[Type['k], 'k], ys: ArenaVec[Type['k], 'k], closed: bool, counter: Fresh['k]) -> bool {
+fn quantified(&cx: Domain!['k], left: ArenaVec[Param['k], 'k], right: ArenaVec[Param['k], 'k], xs: ArenaVec[Type['k], 'k], ys: ArenaVec[Type['k], 'k], closed: bool, scoped: bool, counter: Fresh['k]) -> bool {
     if kinds_differ(&cx, left, right) || xs.len(&cx) != ys.len(&cx) {
         return false;
     }
-    if !closed {
+    if scoped && !closed {
         let rename: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
         var i = 0usize;
         while i < left.len(&cx) && i < right.len(&cx) {
@@ -203,7 +205,7 @@ fn quantified(&cx: Domain!['k], left: ArenaVec[Param['k], 'k], right: ArenaVec[P
         var all = true;
         var j = 0usize;
         while all && j < xs.len(&cx) {
-            all = unify(&cx, xs.at(&cx, j), ys.at(&cx, j), true, counter);
+            all = unify(&cx, xs.at(&cx, j), ys.at(&cx, j), closed, counter);
             j = j + 1usize;
         }
         return all;
@@ -247,20 +249,26 @@ fn quantified(&cx: Domain!['k], left: ArenaVec[Param['k], 'k], right: ArenaVec[P
     var all = true;
     var j = 0usize;
     while all && j < xs.len(&cx) {
-        all = unify(&cx, subst(&cx, zonk(&cx, xs.at(&cx, j)), a, counter), subst(&cx, zonk(&cx, ys.at(&cx, j)), b, counter), true, counter);
+        all = unify(&cx, subst(&cx, zonk(&cx, xs.at(&cx, j)), a, counter), subst(&cx, zonk(&cx, ys.at(&cx, j)), b, counter), closed, counter);
         j = j + 1usize;
-    }
-    if !all {
-        return false;
     }
     let label_set = T::with_names(&cx, ArenaSet::new(&cx), labels);
     var escaped = false;
     var v = 0usize;
-    while !escaped && v < variables.len(&cx) {
+    while all && !escaped && v < variables.len(&cx) {
         escaped = T::overlap(&cx, free_names(&cx, zonk(&cx, Type::Meta.(variables.at(&cx, v)))), label_set);
         v = v + 1usize;
     }
-    !escaped
+    if all && !escaped {
+        return true;
+    }
+    // a failure leaves no solution naming a rigid label
+    var u = 0usize;
+    while u < variables.len(&cx) {
+        variables.at(&cx, u).unsolve(&cx);
+        u = u + 1usize;
+    }
+    false
 }
 
 // A rigid stand-in for a quantified parameter: a brand label or a type variable.
@@ -347,12 +355,12 @@ fn unify(&cx: Domain!['k], a: Type['k], b: Type['k], closed: bool, counter: Fres
             _ => false,
         },
         Type::Exists(xs, p) => match b {
-            Type::Exists(ys, q) => quantified(&cx, params_named(&cx, xs, Kind::Brand), params_named(&cx, ys, Kind::Brand), ArenaVec::one(&cx, p.copy(&cx)), ArenaVec::one(&cx, q.copy(&cx)), closed, counter),
+            Type::Exists(ys, q) => quantified(&cx, params_named(&cx, xs, Kind::Brand), params_named(&cx, ys, Kind::Brand), ArenaVec::one(&cx, p.copy(&cx)), ArenaVec::one(&cx, q.copy(&cx)), closed, false, counter),
             _ => false,
         },
         Type::Foreach(x) => match b {
             Type::Foreach(y) => x.indirect == y.indirect && unify(&cx, x.source.copy(&cx), y.source.copy(&cx), closed, counter)
-                && quantified(&cx, params_named(&cx, foreach_binders(&cx, x), Kind::Any), params_named(&cx, foreach_binders(&cx, y), Kind::Any), ArenaVec::one(&cx, x.body.copy(&cx)), ArenaVec::one(&cx, y.body.copy(&cx)), closed, counter),
+                && quantified(&cx, params_named(&cx, foreach_binders(&cx, x), Kind::Any), params_named(&cx, foreach_binders(&cx, y), Kind::Any), ArenaVec::one(&cx, x.body.copy(&cx)), ArenaVec::one(&cx, y.body.copy(&cx)), closed, true, counter),
             _ => false,
         },
         Type::Fn(x) => match b {
@@ -360,7 +368,7 @@ fn unify(&cx: Domain!['k], a: Type['k], b: Type['k], closed: bool, counter: Fres
                 if x.params.len(&cx) != y.params.len(&cx) || !x.places.eq(&cx, y.places) || x.is_unsafe != y.is_unsafe {
                     return false;
                 }
-                quantified(&cx, x.quantified, y.quantified, with_ret(&cx, x), with_ret(&cx, y), closed, counter)
+                quantified(&cx, x.quantified, y.quantified, with_ret(&cx, x), with_ret(&cx, y), closed, false, counter)
             },
             _ => false,
         },

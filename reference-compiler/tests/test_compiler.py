@@ -1473,7 +1473,12 @@ TYPE_CASES = (
     "(fn (forall ($q) () u8 ((brand $q)))))",
     "(unify-closed ((k brand)) (tuple (exists ($x) (tuple $x $rigid#0)) (exists ($x) (tuple $x $?k))) "
     "(tuple (exists ($y) (tuple $y $rigid#0)) (exists ($y) (tuple $y $y))))",
+    "(unify ((k brand)) (exists ($x) (tuple $x $?k $x)) (exists ($y) (tuple $y $z $y)))",
+    "(unify () (exists ($x) (tuple $x $x)) (exists ($y) (tuple $y $x)))",
+    "(unify ((k brand) (a type)) (tuple ?a (exists ($x) (tuple $x $?k u8))) (tuple u16 (exists ($y) (tuple $y $y u16))))",
+    "(unify ((a type)) (fn (forall ($p) () ?a ((brand $p)))) (fn (forall ($q) () (brand $q) ((brand $q)))))",
     "(unify ((a type)) (foreach (F (tuple ?a)) (ptr F)) (foreach (G (tuple u8)) (ptr G)))",
+    "(unify ((a type)) (foreach (F (tuple u8)) ?a) (foreach (G (tuple u8)) (ptr G)))",
     "(unify () (fn (u8) u8) (fn (unsafe) (u8) u8))",
     "(match-head (T $k) ((Pair T (brand $k))) ((Pair u8 (brand $z))) true)",
     "(match-head (T) ((Box (exists ($a) (P $a T)))) ((Box (exists ($a) (P $a u8)))) true)",

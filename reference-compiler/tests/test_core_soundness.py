@@ -157,6 +157,15 @@ REJECTED = {
         (fun f u32 (Pk) (entry ((&k Pk)) (= %o (open &k.pkg ($o))) (= %r (call g &k))
           (= %c (pack (exists ($h) (tuple u32 (brand $h))) $o &k.pkg)) (ret %r)))"""),
 
+    # A package's binder is its own brand, never a free brand it shares a name with: packing 'q as $p0
+    # does not also hide the function's 'p0.
+    "pack_binder_is_not_a_free_brand": ("packing", """
+        (fun f (forall ($p0 $q) () u32 ((brand $p0) (brand $q))
+          (entry ((%a (brand $p0)) (%b (brand $q)))
+            (= %v (construct (tuple (brand $q) (brand $p0)) %b %a))
+            (= %k (pack (exists ($p0) (tuple (brand $p0) (brand $p0))) ($q) %v))
+            (= %r (const u32 0)) (ret %r))))"""),
+
     # A zero-size type is erased: it has no memory form for unsafe memory operations, casts or externs.
     "alloca_empty_array": ("zero_size_type_has_no_memory_form", """
         (fun (unsafe) h u32 () (entry () (= %p (alloca (array u32 0))) (= %r (const u32 0)) (ret %r)))"""),
@@ -217,6 +226,15 @@ class CoreSoundnessTests(unittest.TestCase):
                  (out () (empty &s.a) (empty &s.c.0)
                    (= %x (const u32 0)) (= %u (store &s.a %x)) (= %y (const u32 0)) (= %v (store &s.c.0 %y))
                    (= %r (const u32 1)) (ret %r)))""",
+            # A package beside a free brand of the same spelling, as a pack's own binders are written:
+            # opening it gives the hidden brand a new name and leaves the function's $p0 itself.
+            """(fun f (forall ($p0 $q) () u32 ((brand $p0) (brand $q))
+                 (entry ((%a (brand $p0)) (%b (brand $q)))
+                   (= %v (construct (tuple (brand $q) (brand $p0)) %b %a))
+                   (= %k (pack (exists ($p0#) (tuple (brand $p0#) (brand $p0))) ($q) %v))
+                   (= %o (open %k ($t)))
+                   (= (%x %y) (destruct %o (tuple (brand $t) (brand $p0))))
+                   (= %r (const u32 0)) (ret %r))))""",
             # Pointer projection at the pointer's own type.
             """(type S (struct (a u32)))
                (fun h u32 ((ptr S)) (entry ((%p (ptr S)))
