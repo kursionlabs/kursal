@@ -2,7 +2,7 @@
 
 A program is a package: its files by relative path. `run_case` writes it into a directory of its own,
 runs the reference pipeline (tools/fuzz/run_ref.py) in a process under a timeout and a memory limit,
-then, when a self-hosted compiler is given, `kursal lower` and `kursal build` on the same directory,
+then, when a self-hosted compiler is given, `kursal lower` and `kursal build --emit-c` on the same directory,
 then optionally compiles the C under sanitizers and runs it. Every run of a compiler is bounded, so a
 hang or a runaway allocation becomes a finding."""
 
@@ -199,7 +199,7 @@ def run_case(files: dict[str, str], work: Path, selfhost: Optional[Path] = None,
         out.bug, out.detail = KURS_ROUNDTRIP, ref["error"] or ""
         return out
     if selfhost is not None:
-        env = dict(os.environ, KURSAL_LIB=str(LIB))
+        env = dict(os.environ, KURSAL_LIB=str(LIB), KURSAL_DIAGNOSTICS="short")
         status, kurs, err = run([str(selfhost), "lower", str(package)], env=env)
         crashed = self_status_bug(status, err)
         if crashed:
@@ -211,8 +211,7 @@ def run_case(files: dict[str, str], work: Path, selfhost: Optional[Path] = None,
             out.bug, out.detail = DIFF_LOWER, first_difference(want, got)
             return out
         if out.accepted:
-            binary = work / "self"
-            status, _, err = run([str(selfhost), "build", str(package), "-o", str(binary)], env=env, timeout=120)
+            status, c_text, err = run([str(selfhost), "build", str(package), "--emit-c"], env=env, timeout=120)
             crashed = self_status_bug(status, err)
             if crashed:
                 out.bug, out.detail = CRASH_SELF, "build: " + crashed
@@ -222,11 +221,9 @@ def run_case(files: dict[str, str], work: Path, selfhost: Optional[Path] = None,
                     out.bug, out.detail = DIFF_BUILD, f"reference rejects at {ref['stage']}: {ref['error']}"
                     return out
             elif status != 0:
-                if not err.strip().startswith("error: cc") and "cc" not in err[:40]:
-                    out.bug, out.detail = DIFF_BUILD, f"self-hosted build fails: {err.strip()[:2000]}"
-                    return out
+                out.bug, out.detail = DIFF_BUILD, f"self-hosted build fails: {err.strip()[:2000]}"
+                return out
             else:
-                c_text = (work / "self.c").read_text(errors="replace")
                 if c_text != ref["c"]:
                     out.bug, out.detail = DIFF_BUILD, "C differs: " + first_difference(ref["c"], c_text)
                     return out
