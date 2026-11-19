@@ -38,7 +38,7 @@ class ExistentialLoweringTests(unittest.TestCase):
         }''', 14)
 
     def test_shadowed_brands_cannot_unify(self):
-        with self.assertRaisesRegex(InferError, r"brand mismatch: \(brand 'a \(opened at 6:21\)\) and \(brand 'a \(opened at 4:17\)\)"):
+        with self.assertRaisesRegex(InferError, r"brand mismatch: Brand\['a \(opened at 6:21\)\] and Brand\['a \(opened at 4:17\)\]"):
             self.run_source('''
             forall 'a. fn same(x: core::cap::Brand['a], y: core::cap::Brand['a]) -> u32 { 7u32 }
             fn main() -> i32 {

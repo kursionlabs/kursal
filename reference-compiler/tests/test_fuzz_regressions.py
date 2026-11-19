@@ -110,12 +110,12 @@ REJECTED = (
      "    var slot = Opt::None; let pk = pack 'q. (b, slot); let exists 'r. (x, s) = pk;\n"
      "    slot = Opt::Some.(a); let exists 't. (x2, s2) = pk;\n"
      "    match s2 { Opt::Some(y) => same(x2, y), Opt::None => 0u32 } }\n",
-     r"brand mismatch: \(brand 'p0\) and \(brand 't\)"),
+     "brand mismatch: Brand['p0] and Brand['t]"),
     # Unifying two packages solves no outside variable to a brand they bind: `second`'s 'a is neither
     # package's brand, whatever the binders are called.
     (BRANDS + "forall 'p0, 'z. fn f(w: core::cap::Brand['p0], wz: core::cap::Brand['z]) -> u32 {\n"
      "    let pk = pack 'z. (wz, wz); let exists 'r. (u, v) = pk; let y = second(pk); same(y, w) }\n",
-     r"type mismatch: \(exists \('p0\) \(tuple \(brand 'p0\) \(brand 'p0\)\)\) and \(exists \('b\)"),
+     r"type mismatch: exists 'p0\. \(Brand['p0], Brand['p0]\) and exists 'b\."),
     (BRANDS + "forall 'b, 'z. fn f(wb: core::cap::Brand['b], wz: core::cap::Brand['z]) -> u32 {\n"
      "    let pk: exists 'b. (core::cap::Brand['b], core::cap::Brand['b]) = pack 'z. (wz, wz);\n"
      "    let y = second(pk); same(y, wb) }\n",

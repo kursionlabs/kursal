@@ -301,27 +301,32 @@ INFER_ERRORS = (
     # differ read the same each with where it was opened, and no name the compiler made.
     ("forall 'k. fn same(x: core::cap::Brand['k], y: core::cap::Brand['k]) -> u32 { 0u32 }\n"
      "fn f() -> u32 {\n    let exists 'a. x = core::cap::fresh();\n    let exists 'b. y = core::cap::fresh();\n    same(x, y)\n}\n",
-     "5:5: brand mismatch: (brand 'b) and (brand 'a); 'b was opened at 4:5, 'a at 3:5"),
+     "5:5: brand mismatch: Brand['b] and Brand['a]; 'b was opened at 4:5, 'a at 3:5"),
     ("forall 'k. fn same(x: core::cap::Brand['k], y: core::cap::Brand['k]) -> u32 { 0u32 }\n"
      "fn f() -> u32 {\n    let exists 'k. x = core::cap::fresh();\n    let exists 'k. y = core::cap::fresh();\n    same(x, y)\n}\n",
-     "5:5: brand mismatch: (brand 'k (opened at 4:5)) and (brand 'k (opened at 3:5))"),
+     "5:5: brand mismatch: Brand['k (opened at 4:5)] and Brand['k (opened at 3:5)]"),
     ("forall 'k, 'q. fn other(x: core::cap::Brand['k], y: core::cap::Brand['q]) -> core::cap::Brand['k] {\n    y\n}\n",
-     "1:99: brand mismatch: (brand 'q) and (brand 'k)"),
+     "1:99: brand mismatch: Brand['q] and Brand['k]"),
     ("forall 'k. fn keep(x: core::cap::Brand['k]) -> core::cap::Brand['k] {\n    let exists 'k. y = core::cap::fresh();\n    y\n}\n",
-     "1:69: brand mismatch: (brand 'k (opened at 2:5)) and (brand 'k)"),
+     "1:69: brand mismatch: Brand['k (opened at 2:5)] and Brand['k]"),
     ("forall T, 'k. exposed struct Ref { ptr: *T, marker: core::cap::Brand['k] }\n"
      "fn f(p: *u32) -> u32 {\n    let exists 'a. a = core::cap::fresh();\n    let exists 'b. b = core::cap::fresh();\n"
      "    let r = Ref.{ ptr: p, marker: a };\n    let s: Ref[u32, 'b] = r;\n    0u32\n}\n",
-     "6:27: brand mismatch: (p::Ref u32 'a) and (p::Ref u32 'b); 'a was opened at 3:5, 'b at 4:5"),
+     "6:27: brand mismatch: Ref[u32, 'a] and Ref[u32, 'b]; 'a was opened at 3:5, 'b at 4:5"),
     ("fn f() -> u32 {\n    let x = {\n        let exists 'a. w = core::cap::fresh();\n        w\n    };\n    0u32\n}\n",
      "2:13: brand 'a escapes its lexical scope"),
     ("forall T. fn apply(x: T, f: closure(T) -> u32) -> u32 {\n    let n: u32 = f;\n    n\n}\n",
-     "2:18: type mismatch: (struct (env Env) (code (fn (Env T) u32))) and u32"),
+     "2:18: type mismatch: struct { env: Env, code: fn(Env, T) -> u32 } and u32"),
     ("fn f() -> u32 {\n    let items = foreach item of (1u32, 2u32) { (item, 1u32) };\n    items + 1u32\n}\n",
-     "3:5: type mismatch: u32 and (foreach (_ (tuple u32 u32)) (tuple _ u32))"),
+     "3:5: type mismatch: u32 and foreach _ of (u32, u32) => (_, u32)"),
     ("exposed struct Token! { n: u32 }\nfn peek(&t: Token!) -> u32 { t.n }\n"
      "fn f() -> u32 {\n    let g: fn(Token!) -> u32 = peek;\n    0u32\n}\n",
-     "4:32: type mismatch: (fn ((& p::Token!)) u32) and (fn (p::Token!) u32)"),
+     "4:32: type mismatch: fn(&_: Token!) -> u32 and fn(Token!) -> u32"),
+    # A nominal type reads as its last path segment, or as its full path where another reads the same.
+    ("exposed struct Error { n: u32 }\nfn f(e: std::io::Error) -> Error { e }\n",
+     "2:34: type mismatch: std::io::Error and "),
+    ("fn g(v: (u32, *u8)) -> [u32; 3] { v }\n",
+     "1:33: type mismatch: (u32, *u8) and [u32; 3]"),
     ("forall Self. trait P { fn p(x: Self) -> u32; }\nforall 'k. instance P[u32] { fn p(x: u32) -> u32 { x } }\n",
      "2:12: instance of p::P: parameter 'k needs a binder-free head occurrence"),
 )

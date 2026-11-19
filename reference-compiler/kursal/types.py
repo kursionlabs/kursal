@@ -7,8 +7,8 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Set
 from itertools import count
 from typing import Optional
 
-from .core import (COPY, Array, Brand, Enum, Exists, Fn, Foreach, Ignored, Named, Never, NonNull, Param, Prim, Ptr,
-                   Kind, ModuleId, Premise, Program, Skolem, Struct, Tuple, Type, TypeDecl)
+from .core import (BRAND, COPY, Array, Brand, Enum, Exists, Fn, Foreach, Ignored, Named, Never, NonNull, Param, Prim,
+                   Ptr, Kind, ModuleId, Premise, Program, Skolem, Struct, Tuple, Type, TypeDecl)
 from .sexpr import KursError, Position
 
 type Substitution = Mapping[str, Type]
@@ -563,27 +563,41 @@ class Types:
 
 def show(ty: Type) -> str:
     """`ty` as KURS writes it, a brand as `$label`: for messages about KURS, and for dumps."""
-    return _render(ty, None)
+    return _render(ty)
 
 
 class Surface:
-    """Types as a message about source writes them. A brand reads as written, `'k`; a name the compiler made
-    reads as the name it was made from (`'b` for the brand `b#open9` that `let exists 'b.` opened, `Env` for
-    a closure's environment `Env#1`), or `_` when it was made from none; a place parameter of a function
-    type reads `(& T)`.
+    """Types as source writes them: `Vec![T]`, `Brand['k]`, `(A, B)`, `*T`, `[T; 4]`, `exists 'k. T`,
+    `fn(A, &_: B) -> R`. A brand reads as written, `'k`; a name the compiler made reads as the name it was
+    made from (`'b` for the brand `b#open9` that `let exists 'b.` opened, `Env` for a closure's environment
+    `Env#1`), or `_` when it was made from none.
 
-    One `Surface` writes every type of one message. Where two different brands in it would read the same,
-    each that a `let exists` opened, at a position in `origins`, says where: `'k (opened at 15:9)`."""
+    One `Surface` writes every type of one message. A nominal type reads as its last path segment unless
+    another name in the message reads the same, when it reads as its full path. Where two different brands
+    would read the same, each that a `let exists` opened, at a position in `origins`, says where:
+    `'k (opened at 15:9)`."""
 
     def __init__(self, types: Iterable[Type], origins: Mapping[str, Position]) -> None:
         labels: set[str] = set()
+        names: set[str] = set()
         for ty in types:
             _brand_labels(ty, labels)
+            _type_names(ty, names)
         spellings: dict[str, int] = {}
         for label in labels:
             spellings[_made_from(label)] = spellings.get(_made_from(label), 0) + 1
         self.origins = origins
         self.qualified = {label for label in labels if spellings[_made_from(label)] > 1 and label in origins}
+        readings: dict[str, int] = {}
+        for name in names:
+            readings[_short(name)] = readings.get(_short(name), 0) + 1
+        self.paths = {name for name in names if readings[_short(name)] > 1}
+
+    def name(self, name: str) -> str:
+        """A nominal type's name or a type variable, as this message writes it."""
+        if "::" not in name:
+            return _variable(name)
+        return name if name in self.paths else _short(name)
 
     def brand(self, label: str) -> str:
         name = brand_name(label)
@@ -593,7 +607,7 @@ class Surface:
         return name
 
     def show(self, ty: Type) -> str:
-        return _render(ty, self)
+        return _source(ty, self)
 
 
 def brand_name(label: str) -> str:
@@ -613,6 +627,23 @@ def _variable(name: str) -> str:
     return _made_from(name) or "_"
 
 
+def _short(name: str) -> str:
+    """A nominal type's last path segment; a type variable as a message writes it."""
+    return name.rsplit("::", 1)[-1] if "::" in name else _variable(name)
+
+
+def _type_names(ty: Type, out: set[str]) -> None:
+    match ty:
+        case Named(name=name):
+            out.add(name)
+        case Foreach(binder=binder):
+            out.add(binder)
+        case Fn(forall=forall):
+            out.update(p.name for p in forall if p.kind != BRAND)
+    for child in children(ty):
+        _type_names(child, out)
+
+
 def _brand_labels(ty: Type, out: set[str]) -> None:
     if isinstance(ty, Skolem):
         out.add(ty.label)
@@ -622,15 +653,12 @@ def _brand_labels(ty: Type, out: set[str]) -> None:
         _brand_labels(child, out)
 
 
-def _render(ty: Type, surface: Optional[Surface]) -> str:
+def _source(ty: Type, surface: Surface) -> str:
     def go(part: Type) -> str:
-        return _render(part, surface)
+        return _source(part, surface)
 
-    def brand(label: str) -> str:
-        return "$" + label if surface is None else surface.brand(label)
-
-    def variable(name: str) -> str:
-        return name if surface is None else _variable(name)
+    def all_of(parts: Iterable[Type]) -> str:
+        return ", ".join(map(go, parts))
 
     match ty:
         case Prim(name=name):
@@ -638,7 +666,53 @@ def _render(ty: Type, surface: Optional[Surface]) -> str:
         case Never():
             return "!"
         case Named(name=name, args=()):
-            return variable(name)
+            return surface.name(name)
+        case Named(name=name, args=args):
+            return f"{surface.name(name)}[{all_of(args)}]"
+        case Skolem(label=label):
+            return surface.brand(label)
+        case Brand(brand=inner):
+            return f"Brand[{go(inner)}]"
+        case Ptr(inner=inner):
+            return f"*{go(inner)}"
+        case NonNull(inner=inner):
+            return f"NonNull[{go(inner)}]"
+        case Tuple(elems=(elem,)):
+            return f"({go(elem)},)"
+        case Tuple(elems=elems):
+            return f"({all_of(elems)})"
+        case Array(elem=elem, length=length):
+            return f"[{go(elem)}; {length}]"
+        case Struct(fields=fields):
+            return "struct { " + ", ".join(f"{n}: {go(f)}" for n, f in fields) + " }"
+        case Enum(variants=variants):
+            return "enum { " + ", ".join(f"{n}({go(f)})" for n, f in variants) + " }"
+        case Exists(binders=binders, body=body):
+            return f"exists {', '.join(map(surface.brand, binders))}. {go(body)}"
+        case Foreach(binder=binder, indirect=indirect, source=source, body=body):
+            return f"foreach {'*' if indirect else ''}{surface.name(binder)} of {go(source)} => {go(body)}"
+        case Fn(params=params, ret=ret, forall=forall, unsafe=unsafe):
+            shown = ", ".join(f"&_: {go(p)}" if k in ty.places else go(p) for k, p in enumerate(params))
+            quantified = ", ".join(surface.brand(p.name) if p.kind == BRAND else surface.name(p.name) for p in forall)
+            return (f"{f'forall {quantified}. ' if forall else ''}{'unsafe ' if unsafe else ''}"
+                    f"fn({shown}) -> {go(ret)}")
+    return "_"
+
+
+def _render(ty: Type) -> str:
+    """`ty` as KURS writes it."""
+    go = _render
+
+    def brand(label: str) -> str:
+        return "$" + label
+
+    match ty:
+        case Prim(name=name):
+            return name
+        case Never():
+            return "!"
+        case Named(name=name, args=()):
+            return name
         case Named(name=name, args=args):
             return f"({name} {' '.join(map(go, args))})"
         case Skolem(label=label):
@@ -660,13 +734,12 @@ def _render(ty: Type, surface: Optional[Surface]) -> str:
         case Exists(binders=binders, body=body):
             return f"(exists ({' '.join(map(brand, binders))}) {go(body)})"
         case Foreach(binder=binder, indirect=indirect, source=source, body=body):
-            pattern = f"(ptr {variable(binder)})" if indirect else variable(binder)
+            pattern = f"(ptr {binder})" if indirect else binder
             inferred = (source.binder, *(source.retained or ())) if isinstance(source, Foreach) else ()
-            suffix = "" if ty.retained == inferred else " (retain " + " ".join(map(variable, ty.retained or ())) + ")"
+            suffix = "" if ty.retained == inferred else " (retain " + " ".join(ty.retained or ()) + ")"
             return f"(foreach ({pattern} {go(source)}) {go(body)}{suffix})"
         case Fn(params=params, ret=ret, unsafe=unsafe):
-            shown = (f"(& {go(p)})" if surface is not None and k in ty.places else go(p) for k, p in enumerate(params))
-            return f"(fn {'(unsafe) ' if unsafe else ''}({' '.join(shown)}) {go(ret)})"
+            return f"(fn {'(unsafe) ' if unsafe else ''}({' '.join(map(go, params))}) {go(ret)})"
     return "_"
 
 
