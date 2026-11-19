@@ -290,7 +290,7 @@ class Signatures:
                         self.check_arguments(decl, args, scope, pos)
                         return C.Named(self.name(decl), args)
                     case _:
-                        fail(f"not a type name: {type_expr.path}", pos)
+                        fail(f"not a type name: {'::'.join(type_expr.path)}", pos)
             case S.TBrand(label=label):
                 label = label[1:]
                 if label not in scope.brands and label != "static":
@@ -522,8 +522,11 @@ class Signatures:
     def typed(self, name: str, expr: S.Expr, want: C.Type, module: C.ModuleId) -> ConstValue:
         """The value of `const name: want = expr`, which must have type `want`."""
         value = self.fold(expr, want, module)
-        if value[2] != want:
-            fail(f"const {name} is not a {want}")
+        got = value[2]
+        if got != want:
+            assert got is not None
+            surface = Surface((got, want), {})
+            fail(f"const {name} has type {surface.show(got)}, but its declared type is {surface.show(want)}", expr.pos)
         return value
 
     def string_type(self, module: C.ModuleId) -> C.Type:

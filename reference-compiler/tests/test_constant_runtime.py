@@ -66,11 +66,12 @@ class ConstantRuntimeTests(unittest.TestCase):
             }'''), 7)
 
     def test_string_constant_of_another_type_is_rejected(self):
-        for source in ('const T: u32 = "text"; fn main() -> i32 { 0i32 }',
-                       'fn main() -> i32 { const T: u32 = "text"; 0i32 }',
-                       'fn main() -> i32 { const T: u32 = 5u8; 0i32 }'):
-            with self.subTest(source=source), self.assertRaisesRegex(SigError, 'const T is not a'):
+        for source, got in (('const T: u32 = "text"; fn main() -> i32 { 0i32 }', "Slice[u8, 'static]"),
+                            ('fn main() -> i32 { const T: u32 = "text"; 0i32 }', "Slice[u8, 'static]"),
+                            ('fn main() -> i32 { const T: u32 = 5u8; 0i32 }', "u8")):
+            with self.subTest(source=source), self.assertRaises(SigError) as caught:
                 run_with_std(source)
+            self.assertIn(f"const T has type {got}, but its declared type is u32", str(caught.exception))
 
     def test_bool_integer_comparison_is_rejected(self):
         for expression in ('true == 1u8', 'false != 0u8', '1u8 == true'):

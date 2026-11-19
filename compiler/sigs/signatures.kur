@@ -31,7 +31,7 @@ use package::kurs::core::{Exposure, ExposureMode, Kind, Member, ModuleId, Param,
 use package::kurs::core as C;
 use package::types::layout::check_type_expansion;
 use package::types::literals::valid_literal;
-use package::resolve::resolver::{Decl, NameRef, Named, Package, Resolver, Target, name_pos, named_pos, repr, repr_tuple};
+use package::resolve::resolver::{Decl, NameRef, Named, Package, Resolver, Target, name_pos, named_pos};
 use package::syntax::ast as S;
 use package::syntax::ast::{Expr, Pos, no_pos};
 use package::types::ops::{Fresh, Types, equal, subst, surface};
@@ -209,17 +209,6 @@ fn integer_of(&cx: Domain!['k], value: ConstValue['k]) -> Option[Span['k]] {
     }
 }
 
-forall 'k.
-fn same_type(&cx: Domain!['k], a: Option[Type['k]], b: Option[Type['k]]) -> bool {
-    match a {
-        Option::Some(x) => match b {
-            Option::Some(y) => C::same(&cx, x, y),
-            Option::None => false,
-        },
-        Option::None => b.is_none(),
-    }
-}
-
 // An integer type's name, if `ty` is one.
 forall 'k.
 fn integer_type(&cx: Domain!['k], ty: Option[Type['k]]) -> Option[Span['k]] {
@@ -272,113 +261,6 @@ fn int_text(&cx: Domain!['k], value: u64, name: Span['k]) -> Span['k] {
         Buffer!::new().push_static("-").push_u64(0u64 - value).save(&cx)
     } else {
         Buffer!::new().push_u64(value).save(&cx)
-    }
-}
-
-// --------------------------------------------------------- Python's repr --
-
-// A tuple's repr from its elements' reprs: `()`, `(a,)`, `(a, b)`.
-forall 'k.
-fn repr_parts(&cx: Domain!['k], parts: ArenaVec[Span['k], 'k]) -> Span['k] {
-    var out = Buffer!::new().push_static("(");
-    var i = 0usize;
-    while i < parts.len(&cx) {
-        if i > 0usize {
-            out = out.push_static(", ");
-        }
-        out = out.push_bytes(&cx, parts.at(&cx, i));
-        i = i + 1usize;
-    }
-    if parts.len(&cx) == 1usize {
-        out = out.push_static(",");
-    }
-    out.push_static(")").save(&cx)
-}
-
-forall 'k.
-fn repr_types(&cx: Domain!['k], types: ArenaVec[Type['k], 'k]) -> Span['k] {
-    let parts: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
-    var i = 0usize;
-    while i < types.len(&cx) {
-        parts.push(&cx, type_repr(&cx, types.at(&cx, i)));
-        i = i + 1usize;
-    }
-    repr_parts(&cx, parts)
-}
-
-forall 'k.
-fn repr_members(&cx: Domain!['k], members: ArenaVec[Member['k], 'k]) -> Span['k] {
-    let parts: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
-    var i = 0usize;
-    while i < members.len(&cx) {
-        parts.push(&cx, repr_parts(&cx, ArenaVec::two(&cx, repr(&cx, members.at(&cx, i).name), type_repr(&cx, members.at(&cx, i).type))));
-        i = i + 1usize;
-    }
-    repr_parts(&cx, parts)
-}
-
-forall 'k.
-fn repr_bool(&cx: Domain!['k], b: bool) -> Span['k] {
-    Span::from_static(&cx, if b { "True" } else { "False" })
-}
-
-forall 'k.
-fn kind_repr(&cx: Domain!['k], k: Kind) -> Span['k] {
-    match k {
-        Kind::Brand => Span::from_static(&cx, "'brand'"),
-        Kind::Copy => Span::from_static(&cx, "'copy'"),
-        Kind::Any => Span::from_static(&cx, "'any'"),
-    }
-}
-
-// A core type as Python's dataclass `repr` writes it.
-forall 'k.
-fn type_repr(&cx: Domain!['k], ty: Type['k]) -> Span['k] {
-    match ty {
-        Type::Prim(name) => Buffer!::new().push_static("Prim(name=").push_bytes(&cx, repr(&cx, name)).push_static(")").save(&cx),
-        Type::Never => Span::from_static(&cx, "Never()"),
-        Type::Named(name, args) => Buffer!::new().push_static("Named(name=").push_bytes(&cx, repr(&cx, name)).push_static(", args=").push_bytes(&cx, repr_types(&cx, args)).push_static(")").save(&cx),
-        Type::Struct(fields) => Buffer!::new().push_static("Struct(fields=").push_bytes(&cx, repr_members(&cx, fields)).push_static(")").save(&cx),
-        Type::Enum(variants) => Buffer!::new().push_static("Enum(variants=").push_bytes(&cx, repr_members(&cx, variants)).push_static(")").save(&cx),
-        Type::Tuple(elems) => Buffer!::new().push_static("Tuple(elems=").push_bytes(&cx, repr_types(&cx, elems)).push_static(")").save(&cx),
-        Type::Array(elem, length) => Buffer!::new().push_static("Array(elem=").push_bytes(&cx, type_repr(&cx, elem.copy(&cx))).push_static(", length=").push_u64(length).push_static(")").save(&cx),
-        Type::Ptr(inner) => Buffer!::new().push_static("Ptr(inner=").push_bytes(&cx, type_repr(&cx, inner.copy(&cx))).push_static(")").save(&cx),
-        Type::NonNull(inner) => Buffer!::new().push_static("NonNull(inner=").push_bytes(&cx, type_repr(&cx, inner.copy(&cx))).push_static(")").save(&cx),
-        Type::Skolem(label) => Buffer!::new().push_static("Skolem(label=").push_bytes(&cx, repr(&cx, label)).push_static(")").save(&cx),
-        Type::Brand(brand) => Buffer!::new().push_static("Brand(brand=").push_bytes(&cx, type_repr(&cx, brand.copy(&cx))).push_static(")").save(&cx),
-        Type::Exists(binders, body) => Buffer!::new().push_static("Exists(binders=").push_bytes(&cx, repr_tuple(&cx, binders)).push_static(", body=").push_bytes(&cx, type_repr(&cx, body.copy(&cx))).push_static(")").save(&cx),
-        Type::Foreach(f) => Buffer!::new().push_static("Foreach(binder=").push_bytes(&cx, repr(&cx, f.binder)).push_static(", indirect=").push_bytes(&cx, repr_bool(&cx, f.indirect))
-            .push_static(", source=").push_bytes(&cx, type_repr(&cx, f.source.copy(&cx))).push_static(", body=").push_bytes(&cx, type_repr(&cx, f.body.copy(&cx)))
-            .push_static(", retained=").push_bytes(&cx, repr_tuple(&cx, f.retained)).push_static(")").save(&cx),
-        Type::Fn(f) => {
-            let quantified: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
-            var i = 0usize;
-            while i < f.quantified.len(&cx) {
-                let p = f.quantified.at(&cx, i);
-                quantified.push(&cx, Buffer!::new().push_static("Param(name=").push_bytes(&cx, repr(&cx, p.name)).push_static(", kind=").push_bytes(&cx, kind_repr(&cx, p.kind)).push_static(")").save(&cx));
-                i = i + 1usize;
-            }
-            var out = Buffer!::new().push_static("Fn(params=").push_bytes(&cx, repr_types(&cx, f.params)).push_static(", ret=").push_bytes(&cx, type_repr(&cx, f.ret.copy(&cx)))
-                .push_static(", forall=").push_bytes(&cx, repr_parts(&cx, quantified)).push_static(", unsafe=").push_bytes(&cx, repr_bool(&cx, f.is_unsafe))
-                .push_static(", places=");
-            if f.places.is_empty(&cx) {
-                out = out.push_static("frozenset()");
-            } else {
-                out = out.push_static("frozenset({");
-                var k = 0usize;
-                while k < f.places.len(&cx) {
-                    if k > 0usize {
-                        out = out.push_static(", ");
-                    }
-                    out = out.push_usize(f.places.at(&cx, k));
-                    k = k + 1usize;
-                }
-                out = out.push_static("})");
-            }
-            out.push_static(")").save(&cx)
-        },
-        Type::Ignored => Span::from_static(&cx, "Ignored()"),
-        Type::Meta(_m) => Span::from_static(&cx, "Meta()"),
     }
 }
 
@@ -892,7 +774,7 @@ impl Signatures['k] {
         match type_expr {
             S::Type::Name(n) => {
                 let args = self.types_of(&cx, n.args, scope)?;
-                let not_a_type = Buffer!::new().push_static("not a type name: ").push_bytes(&cx, repr_tuple(&cx, n.path)).save(&cx);
+                let not_a_type = Buffer!::new().push_static("not a type name: ").push_bytes(&cx, n.path.join(&cx, "::")).save(&cx);
                 let r = match self.r.refs.get(&cx, n.id) {
                     Option::Some(r) => r,
                     Option::None => return sig_error(not_a_type, n.pos),
@@ -1431,8 +1313,14 @@ impl Signatures['k] {
     // The value of `const name: want = expr`, which must have type `want`.
     fn typed(self, &cx: Domain!['k], name: Span['k], expr: Expr['k], want: Type['k], home: ModuleId['k]) -> Result[ConstValue['k], SigError['k]] {
         let value = self.fold(&cx, expr, Option::Some.(want), Option::Some.(home), true)?;
-        if !same_type(&cx, const_type(&cx, value), Option::Some.(want)) {
-            return sig_error(Buffer!::new().push_static("const ").push_bytes(&cx, name).push_static(" is not a ").push_bytes(&cx, type_repr(&cx, want)).save(&cx), no_pos());
+        let got = match const_type(&cx, value) {
+            Option::Some(t) => t,
+            Option::None => fail(&cx, Span::from_static(&cx, "internal error: an untyped constant")),
+        };
+        if !C::same(&cx, got, want) {
+            let spelling = surface(&cx, ArenaVec::two(&cx, got, want), ArenaVec::new(&cx), ArenaMap::new(&cx));
+            return sig_error(Buffer!::new().push_static("const ").push_bytes(&cx, name).push_static(" has type ").push_bytes(&cx, spelling.show(&cx, got))
+                .push_static(", but its declared type is ").push_bytes(&cx, spelling.show(&cx, want)).save(&cx), S::expr_pos(expr));
         }
         Result::Ok.(value)
     }

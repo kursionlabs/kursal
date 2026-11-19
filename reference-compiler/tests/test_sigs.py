@@ -141,6 +141,18 @@ class ConstTests(unittest.TestCase):
             with self.subTest(source=source), self.assertRaises(SigError):
                 sigs_of(source)
 
+    def test_a_value_of_another_type_names_both_types(self):
+        cases = (
+            ("const A: u32 = true;\n", "1:16: const A has type bool, but its declared type is u32"),
+            ("const A: u32 = 5u8;\n", "1:16: const A has type u8, but its declared type is u32"),
+            ('use std::slice::Slice;\nconst A: (u32, *u8) = "x";\n',
+             "2:23: const A has type Slice[u8, 'static], but its declared type is (u32, *u8)"),
+        )
+        for source, message in cases:
+            with self.subTest(source=source), self.assertRaises(SigError) as caught:
+                sigs_of(source)
+            self.assertIn(f"lib.kur:{message}", str(caught.exception))
+
     def test_errors_are_reported_together_in_source_order(self):
         cases = (
             ("fn f(x: u32[u8]) -> u32 { 0u32 }\nstruct S { a: u32 }\n"
@@ -156,7 +168,7 @@ class ConstTests(unittest.TestCase):
              ["2:15: Never takes no type arguments", "3:15: primitive u32 takes no type arguments"]),
             # An error in a constant would recur wherever the constant is used: it stops at once.
             ("struct U { c: u32[u8] }\nconst A: u32 = true;\nstruct S { a: [u8; A] }\nstruct T { b: [u8; A] }\n",
-             ["1:15: primitive u32 takes no type arguments", "3:1: const A is not a"]),
+             ["1:15: primitive u32 takes no type arguments", "2:16: const A has type bool, but its declared type is u32"]),
         )
         for source, messages in cases:
             with self.subTest(source=source), self.assertRaises(SigError) as caught:

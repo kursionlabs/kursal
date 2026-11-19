@@ -233,7 +233,7 @@ INFER_ERRORS = (
     ("exposed struct Callable { env: u32, code: forall 'a. fn(u32) -> u32 }\nforall 'a. fn code(env: u32) -> u32 { env }\n                    fn main() -> i32 {\n                        let code_value = code;\n                        let f = Callable.{ env: 4u32, code: code_value };\n                        (f() as i32)\n                    }", 'a closure code'),
     ('exposed struct Callable { code: fn(u32) -> u32 }\n                    fn code(env: u32) -> u32 { env }\n                    fn main() -> i32 {\n                        let f = Callable.{ code: code };\n                        (f() as i32)\n                    }', 'a closure must'),
     ('exposed struct Callable { env: bool, code: fn(u32) -> u32 }\n                    fn code(env: u32) -> u32 { env }\n                    fn main() -> i32 {\n                        let f = Callable.{ env: true, code: code };\n                        (f() as i32)\n                    }', 'type mismatch: bool'),
-    ('fn main() -> i32 { const T: u32 = 5u8; 0i32 }', 'const T is'),
+    ('fn main() -> i32 { const T: u32 = 5u8; 0i32 }', '1:35: const T has type u8, but its declared type is u32'),
     ('forall T, U. exposed struct S { first: T, second: U }\n    forall T, U. exposed tuple Pair(T, U);\n    forall T, U. exposed enum E { Item(T, U), Empty }\n    exposed struct Plain { n: u32 }\n    exposed tuple Single(u32);\n    exposed enum Flag { On }\nfn main() -> i32 { let x = E[u32, u32]::Empty[bool]; 7i32 }', 'type arguments belong'),
     ('forall T, U. exposed struct S { first: T, second: U }\n    forall T, U. exposed tuple Pair(T, U);\n    forall T, U. exposed enum E { Item(T, U), Empty }\n    exposed struct Plain { n: u32 }\n    exposed tuple Single(u32);\n    exposed enum Flag { On }\nfn main() -> i32 { let x = S[u32, u32, bool].{ first: 3u32, second: 4u32 }; 7i32 }', 'accepts at most'),
     ('forall T, U. exposed struct S { first: T, second: U }\n    forall T, U. exposed tuple Pair(T, U);\n    forall T, U. exposed enum E { Item(T, U), Empty }\n    exposed struct Plain { n: u32 }\n    exposed tuple Single(u32);\n    exposed enum Flag { On }\nfn main() -> i32 { let x = Pair[u32, u32, bool].(3u32, 4u32); 7i32 }', 'accepts at most'),
@@ -344,4 +344,5 @@ INFER_ERRORS = (
     ("exposed struct S { a: u32, b: u32 }\nfn main() -> i32 {\n    let s = S.{ a: 7u32, b: 9u32 };\n"
      "    var keep = s.a;\n    let g = |x| x;\n    let parts = foreach f of s { g(f) };\n    0i32\n}\n",
      "6:17: the type of foreach item f escapes its lexical scope"),
+    ("fn main() -> i32 {\n    const K: u32 = 1u8;\n    0i32\n}\n", "2:20: const K has type u8, but its declared type is u32"),
 )
