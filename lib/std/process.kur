@@ -1,5 +1,5 @@
-//! The process: its arguments, other programs run and waited for, and the
-//! ways to end it early. Those are `exit`, through the C library, and `trap`,
+//! The process: its arguments, the processors it can run on, other programs
+//! run and waited for, and the ways to end it early. Those are `exit`, through the C library, and `trap`,
 //! core's builtin (`core::process::trap`), which stops it at once.
 use package as std;
 
@@ -14,7 +14,9 @@ use core::raw::raw_get;
 use core::slice::{ReadBytes, Slice};
 use std::io::{Error, c_string};
 
-extern "C" fn kur_libc_process_run(line: *u8, len: usize, count: usize) -> i64;
+extern "C" fn kur_libc_process_spawn(line: *u8, len: usize, count: usize) -> i64;
+extern "C" fn kur_libc_process_wait(pid: i64, block: u8) -> i64;
+extern "C" fn kur_libc_process_cpus() -> usize;
 
 /// The arguments the process was started with, the program's name first, as
 /// C's `main` received them. A program's entry function may take one,
@@ -88,25 +90,32 @@ impl Command! {
         Command!.{ line: line.push_bytes(&cx, argument).push_byte(0u8), count: count + 1usize }
     }
 
-    /// Runs the program with this process's environment and waits for it,
-    /// again when a signal interrupts the wait. The error is what
-    /// `posix_spawnp` reports, among them the errno of the `exec` that
-    /// failed (ENOENT for a program not found), or what `waitpid` does;
-    /// EINVAL when the program or an argument holds a NUL.
+    /// Runs the program with this process's environment and waits for it:
+    /// `spawn`, then `Child!::wait`, with their errors.
     fn run(self) -> Result[Exit, Error] {
+        match self.spawn() {
+            Result::Ok(child) => child.wait(),
+            Result::Err(e) => Result::Err.(e),
+        }
+    }
+
+    /// Starts the program with this process's environment and hands back
+    /// the running child, which must be waited for. The error is what
+    /// `posix_spawnp` reports, among them the errno of the `exec` that
+    /// failed (ENOENT for a program not found); EINVAL when the program or an
+    /// argument holds a NUL.
+    fn spawn(self) -> Result[Child!, Error] {
         let { line, count } = self;
         var line = line;
         let p = unsafe &line.as_ptr();
         let n = &line.len();
         // `p` holds `count` NUL-terminated arguments in `n` bytes.
-        let result = unsafe kur_libc_process_run(p, n, count);
+        let pid = unsafe kur_libc_process_spawn(p, n, count);
         line.destroy();
-        if result < 0i64 {
-            Result::Err.(Error.{ errno: (0i64 - result) as i32 })
-        } else if result < 256i64 {
-            Result::Ok.(Exit::Code.(result as i32))
+        if pid < 0i64 {
+            Result::Err.(Error.{ errno: (0i64 - pid) as i32 })
         } else {
-            Result::Ok.(Exit::Signal.((result - 256i64) as i32))
+            Result::Ok.(Child!.{ pid })
         }
     }
 
@@ -115,6 +124,59 @@ impl Command! {
         let { line, count } = self;
         line.destroy();
     }
+}
+
+/// A program `Command!::spawn` started, running until it is waited for.
+/// Waiting reaps it, so a child is waited for once; one left unwaited would
+/// stay a zombie until this process ends.
+struct Child! {
+    pid: i64,
+}
+
+/// What `Child!::try_wait` found: the child still running, or how it ended.
+exposed enum Polled! {
+    Running(Child!),
+    Ended(Exit),
+}
+
+impl Child! {
+    /// Waits for the child to end, again when a signal interrupts the wait.
+    /// The error is what `waitpid` reports.
+    fn wait(self) -> Result[Exit, Error] {
+        let { pid } = self;
+        exit_of(unsafe kur_libc_process_wait(pid, 1u8))
+    }
+
+    /// Whether the child has ended, without waiting: the child back while
+    /// it runs, else how it ended. The error is what `waitpid` reports.
+    fn try_wait(self) -> Result[Polled!, Error] {
+        let { pid } = self;
+        let result = unsafe kur_libc_process_wait(pid, 0u8);
+        if result == 512i64 {
+            return Result::Ok.(Polled!::Running.(Child!.{ pid }));
+        }
+        match exit_of(result) {
+            Result::Ok(exit) => Result::Ok.(Polled!::Ended.(exit)),
+            Result::Err(e) => Result::Err.(e),
+        }
+    }
+}
+
+// How a child ended, from what `kur_libc_process_wait` returns for one that has.
+fn exit_of(result: i64) -> Result[Exit, Error] {
+    if result < 0i64 {
+        Result::Err.(Error.{ errno: (0i64 - result) as i32 })
+    } else if result < 256i64 {
+        Result::Ok.(Exit::Code.(result as i32))
+    } else {
+        Result::Ok.(Exit::Signal.((result - 256i64) as i32))
+    }
+}
+
+/// The number of processors online, at least 1: how many programs can run
+/// at once without waiting for one another.
+fn available_parallelism() -> usize {
+    unsafe kur_libc_process_cpus()
 }
 
 /// Ends the process with `status` after C's `exit` runs its handlers and

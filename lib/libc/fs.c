@@ -170,15 +170,13 @@ int32_t kur_libc_fs_close_directory(uint8_t *handle) {
     return closedir((DIR *)handle) == 0 ? 0 : errno;
 }
 
-/* Runs the program `line` names, found on the PATH, with `count` arguments,
- * the program's name first: `line` is each argument followed by a NUL,
- * `len` bytes in all. The child gets this process's environment, and the
- * call waits for it, again when a signal interrupts the wait. The exit
- * status (0 to 255) when the child exits, 256 plus the signal's number when
- * a signal ends it, or a negative errno: what `posix_spawnp` reports
- * (ENOENT for a program not found, or the errno of the `exec` that failed)
- * or `waitpid` does. */
-int64_t kur_libc_process_run(const uint8_t *line, uintptr_t len, uintptr_t count) {
+/* Starts the program `line` names, found on the PATH, with `count`
+ * arguments, the program's name first: `line` is each argument followed by
+ * a NUL, `len` bytes in all. The child gets this process's environment.
+ * Its process id, or a negative errno: what `posix_spawnp` reports (ENOENT
+ * for a program not found, or the errno of the `exec` that failed), EINVAL
+ * when an argument holds a NUL of its own. */
+int64_t kur_libc_process_spawn(const uint8_t *line, uintptr_t len, uintptr_t count) {
     if (count == 0 || count > SIZE_MAX / sizeof(char *) - 1) return -EINVAL;
     char **argv = malloc((count + 1) * sizeof(char *));
     if (!argv) return -ENOMEM;
@@ -197,13 +195,29 @@ int64_t kur_libc_process_run(const uint8_t *line, uintptr_t len, uintptr_t count
     int spawned = posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ);
     free(argv);
     if (spawned != 0) return -(int64_t)spawned;
+    return pid;
+}
+
+/* Waits for the child `pid`, again when a signal interrupts the wait; with
+ * `block` 0, only looks. The exit status (0 to 255) when the child exits,
+ * 256 plus the signal's number when a signal ends it, 512 when it still
+ * runs and `block` is 0, or the negative errno `waitpid` reports. */
+int64_t kur_libc_process_wait(int64_t pid, uint8_t block) {
     int status;
-    while (waitpid(pid, &status, 0) < 0) {
+    pid_t got;
+    while ((got = waitpid((pid_t)pid, &status, block ? 0 : WNOHANG)) < 0) {
         if (errno != EINTR) return -(int64_t)errno;
     }
+    if (got == 0) return 512;
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) return 256 + (int64_t)WTERMSIG(status);
     return -(int64_t)ECHILD;
+}
+
+/* The number of processors online, at least 1. */
+uintptr_t kur_libc_process_cpus(void) {
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n < 1 ? 1 : (uintptr_t)n;
 }
 
 /* Reports the `std::io::Error` an executable's entry returned, its errno

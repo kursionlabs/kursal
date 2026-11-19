@@ -475,6 +475,65 @@ class StdRuntimeTests(unittest.TestCase):
                 0
             }''', stdout="code 7,signal 15,errno 2,errno 13,errno 22")
 
+    def test_spawned_children_are_polled_and_waited_for(self):
+        self.expect('''
+            use std::io::print_buffer;
+            use std::bytes::buffer::Buffer!;
+            use std::option::Result;
+            use std::process::{Child!, Command!, Exit, Polled!, available_parallelism, trap};
+            use std::slice::StaticRead;
+            fn started(command: Command!) -> Child! {
+                match command.spawn() {
+                    Result::Ok(child) => child,
+                    Result::Err(e) => trap(),
+                }
+            }
+            fn code(exit: Exit) -> usize {
+                match exit {
+                    Exit::Code(c) => c as usize,
+                    Exit::Signal(s) => 1000usize + s as usize,
+                }
+            }
+            fn main() -> i32 {
+                var sr = StaticRead::new();
+                let slow = started(Command!::new(&sr, "sh").arg(&sr, "-c").arg(&sr, "sleep 0.2; exit 3"));
+                let quick = started(Command!::new(&sr, "sh").arg(&sr, "-c").arg(&sr, "exit 4"));
+                var polls = 0usize;
+                var state = Polled!::Running.(slow);
+                var polling = true;
+                while polling {
+                    state = match state {
+                        Polled!::Running(child) => match child.try_wait() {
+                            Result::Ok(p) => {
+                                polls = polls + 1usize;
+                                p
+                            },
+                            Result::Err(e) => trap(),
+                        },
+                        Polled!::Ended(exit) => {
+                            polling = false;
+                            Polled!::Ended.(exit)
+                        },
+                    };
+                }
+                let slow_code = match state {
+                    Polled!::Running(child) => trap(),
+                    Polled!::Ended(exit) => code(exit),
+                };
+                let quick_code = match quick.wait() {
+                    Result::Ok(exit) => code(exit),
+                    Result::Err(e) => trap(),
+                };
+                let missing = match Command!::new(&sr, "no-such-program-for-kursal").spawn() {
+                    Result::Ok(child) => { let ended = child.wait(); 0usize },
+                    Result::Err(e) => e.errno as usize,
+                };
+                print_buffer(Buffer!::new().push_usize(slow_code).push_static(",").push_usize(quick_code).push_static(",")
+                    .push_usize(missing).push_static(if polls > 1usize { ",polled" } else { ",ended at once" })
+                    .push_static(if available_parallelism() > 0usize { ",cpus" } else { ",none" }));
+                0
+            }''', stdout="3,4,2,polled,cpus")
+
     # ------------------------------------------------------------------ time --
 
     def test_sleep_waits_for_its_duration(self):
