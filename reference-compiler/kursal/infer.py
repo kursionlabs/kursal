@@ -246,6 +246,8 @@ class Infer:
         # Each instantiation of a generic declaration: its parameters, their metavariables, the name it is
         # used by, and where.
         self.instantiations: list[tuple[tuple[C.Param, ...], dict[str, C.Type], str, Optional[Position]]] = []
+        # Each type no source writes that the body must determine: the type, what it is, and where.
+        self.unwritten: list[tuple[C.Type, str, Optional[Position]]] = []
         self.solving = False
         self.returns = [sig.ret]
         level, node.param_ids = Level(), []
@@ -276,6 +278,9 @@ class Infer:
             if escaped:
                 item, pos = self.foreaches[min(escaped)]
                 fail(f"the type of foreach item {item} escapes its lexical scope", pos)
+        for ty, what, pos in self.unwritten:
+            if not ground(ty):
+                fail(f"cannot infer the {what}", pos)
         for params, sub, owner, pos in self.instantiations:
             for p in params:
                 if not ground(sub[p.name]):
@@ -833,6 +838,8 @@ class Infer:
 
     def expr_array(self, expr: S.Array) -> C.Type:
         elem = Meta()
+        if not expr.elems:
+            self.unwritten.append((elem, "element type of the empty array", expr.pos))
         for x in expr.elems:
             self.check(x, elem)
         if not expr.fill:
@@ -963,7 +970,10 @@ class Infer:
 
     def expr_closure(self, expr: S.Closure) -> C.Type:
         params = [self.type(t) if t is not None else Meta() for _, _, t in expr.params]
+        self.unwritten += [(ty, f"type of closure parameter {name}", expr.pos) for (_, name, t), ty in zip(expr.params, params) if t is None]
         ret = self.type(expr.ret) if expr.ret is not None else Meta()
+        if expr.ret is None:
+            self.unwritten.append((ret, "return type of the closure", expr.pos))
         places = frozenset(k + 1 for k, (lend, _, _) in enumerate(expr.params) if lend)
         frame = Frame()
         self.frames.append(frame)

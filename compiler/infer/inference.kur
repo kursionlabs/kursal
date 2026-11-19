@@ -642,7 +642,7 @@ impl Infer['k] {
         let b = Body.{
             inf: self, home, sig, kinds, assumptions, waiting: ArenaVec::new(&cx), defaults: ArenaVec::new(&cx), recorded: ArenaVec::new(&cx),
             literals: ArenaVec::new(&cx), brand_checks: ArenaVec::new(&cx), foreaches: ArenaMap::new(&cx), open_binders: Ref::new(&cx, List::Empty),
-            binder_checks: ArenaVec::new(&cx), instantiations: ArenaVec::new(&cx), solving: Ref::new(&cx, false), returns: ArenaVec::one(&cx, sig.ret),
+            binder_checks: ArenaVec::new(&cx), instantiations: ArenaVec::new(&cx), unwritten: ArenaVec::new(&cx), solving: Ref::new(&cx, false), returns: ArenaVec::one(&cx, sig.ret),
             scopes: Ref::new(&cx, List::Empty.cons(&cx, level)), frames: ArenaVec::one(&cx, new_frame(&cx)), allowed: Ref::new(&cx, Option::None),
         };
         let ids: ArenaVec[u32, 'k] = ArenaVec::new(&cx);
@@ -836,6 +836,8 @@ exposed struct Body {
     // each instantiation of a generic declaration: its parameters, their metavariables, the name it
     // is used by, and where
     instantiations: ArenaVec[(ArenaVec[Param['k], 'k], ArenaMap[Span['k], Type['k], 'k], Span['k], Pos), 'k],
+    // each type no source writes that the body must determine: the type, what it is, and where
+    unwritten: ArenaVec[(Type['k], Span['k], Pos), 'k],
     solving: Ref[bool, 'k],
     returns: ArenaVec[Type['k], 'k],
     // the scopes open, innermost first
@@ -927,6 +929,14 @@ impl Body['k] {
                 },
                 Option::None => (),
             };
+            i = i + 1usize;
+        }
+        i = 0usize;
+        while i < self.unwritten.len(&cx) {
+            let (ty, what, pos) = self.unwritten.at(&cx, i);
+            if !ground(&cx, ty) {
+                self.fail(&cx, Buffer!::new().push_static("cannot infer the ").push_bytes(&cx, what).save(&cx), pos);
+            }
             i = i + 1usize;
         }
         i = 0usize;
@@ -2223,6 +2233,9 @@ impl Body['k] {
 
     fn expr_array(self, &cx: Domain!['k], a: S::ArrayLit['k]) -> Type['k] {
         let elem = new_meta(&cx);
+        if a.elems.is_empty(&cx) {
+            self.unwritten.push(&cx, (elem, Span::from_static(&cx, "element type of the empty array"), a.pos));
+        }
         var i = 0usize;
         while i < a.elems.len(&cx) {
             let unit = self.check(&cx, a.elems.at(&cx, i), Option::Some.(elem));
@@ -2446,7 +2459,11 @@ impl Body['k] {
         while i < c.params.len(&cx) {
             params.push(&cx, match c.params.at(&cx, i).type {
                 Option::Some(t) => self.core_type(&cx, t),
-                Option::None => new_meta(&cx),
+                Option::None => {
+                    let meta = new_meta(&cx);
+                    self.unwritten.push(&cx, (meta, Buffer!::new().push_static("type of closure parameter ").push_bytes(&cx, c.params.at(&cx, i).name).save(&cx), c.pos));
+                    meta
+                },
             });
             if c.params.at(&cx, i).lend {
                 places.push(&cx, i + 1usize);
@@ -2455,7 +2472,11 @@ impl Body['k] {
         }
         let ret = match c.ret {
             Option::Some(t) => self.core_type(&cx, t),
-            Option::None => new_meta(&cx),
+            Option::None => {
+                let meta = new_meta(&cx);
+                self.unwritten.push(&cx, (meta, Span::from_static(&cx, "return type of the closure"), c.pos));
+                meta
+            },
         };
         let frame = new_frame(&cx);
         self.frames.push(&cx, frame);

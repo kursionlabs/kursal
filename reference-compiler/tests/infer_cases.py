@@ -364,6 +364,14 @@ INFER_ERRORS = (
     # Missing fields, listed in alphabetical order.
     ("exposed struct P { b: u32, a: u32 }\nfn f() -> P { P.{ } }\n", "2:15: missing fields a and b"),
     ("exposed struct P { c: u32, b: u32, d: u32, a: u32 }\nfn f() -> P { P.{ b: 1u32 } }\n", "2:15: missing fields a, c and d"),
+    # A type no source writes, which nothing in the body determines.
+    ("fn main() -> i32 {\n    let f = |x| 0i32;\n    0i32\n}\n", "2:13: cannot infer the type of closure parameter x"),
+    ("forall T. fn id(x: T) -> T { x }\nfn main() -> i32 {\n    let f = |a: u32, &b| id(b);\n    0i32\n}\n",
+     "3:13: cannot infer the type of closure parameter b"),
+    ("fn main() -> i32 {\n    let f = || std::process::exit(1i32);\n    0i32\n}\n", "2:13: cannot infer the return type of the closure"),
+    ("fn main() -> i32 {\n    let a = ([], 1u32);\n    0i32\n}\n", "2:14: cannot infer the element type of the empty array"),
+    ("forall T. exposed struct B { v: T }\nfn main() -> i32 {\n    let b = B.{ v: [] };\n    0i32\n}\n",
+     "3:20: cannot infer the element type of the empty array"),
     # The type of one `foreach` item reaches the body of a sibling that writes the same binder.
     ("exposed struct S { a: u32, b: u32 }\nexposed struct P { c: u8, d: u8 }\nforall T. fn same(x: T, y: T) -> (T, T) { (x, y) }\n"
      "fn main() -> i32 {\n    let s = S.{ a: 7u32, b: 9u32 };\n    let p = P.{ c: 1u8, d: 2u8 };\n"
