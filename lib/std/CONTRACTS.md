@@ -519,7 +519,7 @@ Types whose hidden representation protects authority or bounds:
 | `HeapAllocator`, `Storage` | `alloc::heap` | zero-field receivers for the allocator's static methods; they own no memory |
 | `AlignProbe[T]` | `core::mem` | never built; `alignof` takes only its size |
 | `Stamp['r]` | `core::cap` | exposed to `core` alone (`exposed (package)`): `core` modules read a domain's brand out of it, code outside `core` can hold one but not open it |
-| `File!`, `Output!` | `std::io` | `File!` owns one open descriptor; forging one closes an arbitrary descriptor. `Output!` writes to a descriptor it does not own (stdout, stderr), which a forged one could point anywhere. |
+| `File!`, `Output!` | `std::io` | `File!` owns one open descriptor; forging one closes an arbitrary descriptor. `Output!` writes to a descriptor it does not own (stdout, stderr), which a forged one could point anywhere. No `File!` owns a standard stream's number: the C `main` of an executable (`kursal build`) opens `/dev/null` on each of descriptors 0, 1 and 2 the process started without, before the program runs |
 | `Args` | `std::process` | `argv` and `argc` as C's `main` received them: made only by the C `main` the compiler writes for an entry function taking one (its `argv` has `count` readable entries, each a NUL-terminated string live for the rest of the process) |
 | `Command!` | `std::process` | a command line of `count` NUL-terminated arguments, which `fs.c` splits into the table `posix_spawnp` reads |
 | `Instant`, `Timespec` | `std::time` | a monotonic clock reading, and the C structure `clock_gettime` fills; nothing outside makes either |

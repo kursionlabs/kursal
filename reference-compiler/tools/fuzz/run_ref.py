@@ -52,7 +52,7 @@ def pipeline(package: Path) -> dict[str, Optional[str]]:
         result["stage"] = "check-kurs"
         check_program(parse_program(kurs))
         result["stage"] = "c"
-        result["c"] = emit_c(program, facts, result["entry"])
+        result["c"] = emit_c(program, facts, result["entry"], hosted=True)
         result["stage"] = "ok"
     except KursError as error:
         result["error"] = str(error)

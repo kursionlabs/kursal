@@ -41,19 +41,31 @@ type hint where available and otherwise follows symbolic links; a failed
 fallback observation counts as not a directory. Build with
 `KUR_LIBC_FS_NO_D_TYPE` to exercise the portable `fstatat` fallback.
 
-`kur_libc_process_run` takes a command line of `count` NUL-terminated
-arguments, the program first, builds the table `posix_spawnp` reads, starts
-the child with this process's environment, and waits for it: the exit
-status, 256 plus the signal's number, or a negative errno. `posix_spawnp`
-reports the errno of an `exec` that fails (ENOENT for a program not on the
-`PATH`, EACCES for a file that is not executable), and runs no code of this
-library in the child. A line whose arguments are not exactly `count` is
-EINVAL.
+`kur_libc_process_spawn` takes a command line of `count` NUL-terminated
+arguments, the program first, builds the table `posix_spawnp` reads, and
+starts the child with this process's environment and SIGPIPE's default
+action: its process id, or a negative errno. `posix_spawnp` reports the
+errno of an `exec` that fails (ENOENT for a program not on the `PATH`,
+EACCES for a file that is not executable), and runs no code of this library
+in the child. A line whose arguments are not exactly `count` is EINVAL.
+`kur_libc_process_wait` waits for the child: the exit status, 256 plus the
+signal's number, or a negative errno.
 
 `kur_libc_process_report_error` is called by no Kursal code: the C `main`
 the compiler writes for an entry returning `Result[(), std::io::Error]`
 calls it with an `Err`'s errno, and it writes `error: DESCRIPTION (error
 ERRNO)` to stderr, the description `strerror`'s.
+
+`kur_libc_process_start` is called by no Kursal code either: the C `main`
+`kursal build` writes calls it before anything else. It opens `/dev/null`
+on each of the descriptors 0, 1 and 2 the process started without (and
+aborts if it cannot), so a `File!` never gets a standard stream's number
+and `print`, `eprint` and `read_line` never reach a file the program owns.
+It ignores SIGPIPE, so a write to a closed pipe fails with EPIPE, which the
+output functions return, instead of ending the process. The children
+`kur_libc_process_spawn` starts get the default action back
+(`posix_spawnattr_setsigdefault`), since an ignored signal stays ignored
+across `exec`.
 
 These calls describe observations, not authenticated ownership or a stable
 file-system snapshot. Code that uses them to enforce path containment must

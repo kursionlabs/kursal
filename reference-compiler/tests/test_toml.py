@@ -299,7 +299,7 @@ class TomlTests(unittest.TestCase):
         sigs = signatures(resolver)
         program = lower(resolver, sigs)
         c_file = directory / "main.c"
-        c_file.write_text(emit_c(program, check_program(program), sigs.name(resolver.packages[0].entry_decl)))
+        c_file.write_text(emit_c(program, check_program(program), sigs.name(resolver.packages[0].entry_decl), hosted=True))
         executable = directory / "decoder"
         built = subprocess.run(cc_command([str(c_file), *map(str, C_HELPERS)], str(executable)), capture_output=True, text=True)
         assert built.returncode == 0, built.stderr[:500]

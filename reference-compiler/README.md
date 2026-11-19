@@ -177,6 +177,16 @@ result an enum of `Ok` of `()` and `Err` of a struct of exactly one `i32`.
 `Args` is restricted to `std::process`, so no safe code makes one otherwise,
 and its accessors may rely on what C's `main` received.
 
+The `main` of an executable `tools/build.py` (and `kursal build`) makes, which
+links `lib/libc/fs.c`, first calls `kur_libc_process_start` there: it opens
+`/dev/null` on each of the descriptors 0, 1 and 2 the process started
+without, so no file the program opens takes a standard stream's number, and
+ignores SIGPIPE, so a write to a closed pipe returns EPIPE to the program
+rather than ending it. The C of a KURS file with an entry (`python3 -m kursal
+--emit-c --entry NAME`, `kursal c --entry NAME`) is for targets that bring
+their own start-up code and C library, or none, and its `main` calls only the
+entry.
+
 Every `.kur` file under the source root is a module, named by its path
 (`a/lib.kur` and `a.kur` are both module `a`). A single `.kur` file can also be
 compiled on its own; it then depends on the standard library `std` when one is

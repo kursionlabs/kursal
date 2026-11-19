@@ -209,7 +209,7 @@ def build(package: Path, out: Path) -> tuple[str, Optional[Path], str]:
         sigs = signatures(resolver)
         program = lower(resolver, sigs)
         entry = resolver.packages[0].entry_decl
-        c = emit_c(program, check_program(program), sigs.name(entry) if entry is not None else None)
+        c = emit_c(program, check_program(program), sigs.name(entry) if entry is not None else None, hosted=True)
     except KursError as e:
         return package.name, None, f"{type(e).__name__}: {e}"
     c_file = out / f"{package.name}.c"

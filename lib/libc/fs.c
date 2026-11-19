@@ -8,6 +8,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <spawn.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -172,10 +173,12 @@ int32_t kur_libc_fs_close_directory(uint8_t *handle) {
 
 /* Starts the program `line` names, found on the PATH, with `count`
  * arguments, the program's name first: `line` is each argument followed by
- * a NUL, `len` bytes in all. The child gets this process's environment.
- * Its process id, or a negative errno: what `posix_spawnp` reports (ENOENT
- * for a program not found, or the errno of the `exec` that failed), EINVAL
- * when an argument holds a NUL of its own. */
+ * a NUL, `len` bytes in all. The child gets this process's environment, and
+ * SIGPIPE's default action back: an executable's C `main` ignores SIGPIPE
+ * (`kur_libc_process_start`), and an ignored signal stays ignored across
+ * `exec`. Its process id, or a negative errno: what `posix_spawnp` reports
+ * (ENOENT for a program not found, or the errno of the `exec` that failed),
+ * EINVAL when an argument holds a NUL of its own. */
 int64_t kur_libc_process_spawn(const uint8_t *line, uintptr_t len, uintptr_t count) {
     if (count == 0 || count > SIZE_MAX / sizeof(char *) - 1) return -EINVAL;
     char **argv = malloc((count + 1) * sizeof(char *));
@@ -191,8 +194,17 @@ int64_t kur_libc_process_spawn(const uint8_t *line, uintptr_t len, uintptr_t cou
     /* An argument holding a NUL of its own would split in two. */
     if (n != count || start != len) { free(argv); return -EINVAL; }
     argv[count] = NULL;
+    posix_spawnattr_t attributes;
+    int spawned = posix_spawnattr_init(&attributes);
+    if (spawned != 0) { free(argv); return -(int64_t)spawned; }
+    sigset_t defaults;
+    sigemptyset(&defaults);
+    sigaddset(&defaults, SIGPIPE);
+    spawned = posix_spawnattr_setsigdefault(&attributes, &defaults);
+    if (spawned == 0) spawned = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETSIGDEF);
     pid_t pid;
-    int spawned = posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ);
+    if (spawned == 0) spawned = posix_spawnp(&pid, argv[0], NULL, &attributes, argv, environ);
+    posix_spawnattr_destroy(&attributes);
     free(argv);
     if (spawned != 0) return -(int64_t)spawned;
     return pid;
@@ -218,6 +230,25 @@ int64_t kur_libc_process_wait(int64_t pid, uint8_t block) {
 uintptr_t kur_libc_process_cpus(void) {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return n < 1 ? 1 : (uintptr_t)n;
+}
+
+/* Readies the process for an executable's Kursal code; the C `main` the
+ * compiler writes for `kursal build` calls it before anything else. Each of
+ * the standard descriptors 0, 1 and 2 the process started without is opened
+ * on /dev/null, so no file the program opens later takes its number and
+ * receives what `print`, `eprint` or `read_line` mean for the standard
+ * streams; the process aborts when one cannot be opened. SIGPIPE is ignored,
+ * so a write to a closed pipe fails with EPIPE, which the output functions
+ * return, instead of ending the process (`kur_libc_process_spawn` gives
+ * children the default back). */
+void kur_libc_process_start(void) {
+    for (int fd = 0; fd < 3; fd++) {
+        if (fcntl(fd, F_GETFD) == -1 && errno == EBADF) {
+            /* The lowest free number: `fd`, since 0 to fd - 1 are open. */
+            if (open("/dev/null", O_RDWR) != fd) abort();
+        }
+    }
+    signal(SIGPIPE, SIG_IGN);
 }
 
 /* Reports the `std::io::Error` an executable's entry returned, its errno

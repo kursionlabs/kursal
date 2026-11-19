@@ -77,6 +77,9 @@ C_KEYWORDS = set("auto break case char const continue default do double else enu
                  "_Imaginary _Noreturn _Static_assert _Thread_local".split())
 # The C function, in `lib/libc/fs.c`, that C's `main` calls to report the error an entry returns.
 REPORT_ERROR = "kur_libc_process_report_error"
+# The C function, in `lib/libc/fs.c`, that a hosted C `main` calls first: it opens /dev/null on each
+# standard descriptor the process started without, and ignores SIGPIPE.
+START = "kur_libc_process_start"
 RUNTIME_NAMES = {"KUR_TRAP", "KUR_MUSTTAIL", "KUR_FIELD", "KUR_PTR_BITS", *(f"kur_dec_i{n}" for n in SIGNED.values()),
                  "SIZE_MAX", "PTRDIFF_MIN", "PTRDIFF_MAX", "SIG_ATOMIC_MIN", "SIG_ATOMIC_MAX",
                  "WCHAR_MIN", "WCHAR_MAX", "WINT_MIN", "WINT_MAX", *C_ORDER.values()}
@@ -179,7 +182,7 @@ class Backend:
         self.datas: dict[str, tuple[str, Data]] = {}
         # One conservative pool for ordinary identifiers, including function
         # locals: later global declarations must not be shadowed by earlier locals.
-        self.taken = C_KEYWORDS | RUNTIME_NAMES | {"main", REPORT_ERROR} | {e.name for e in program.externs.values()}
+        self.taken = C_KEYWORDS | RUNTIME_NAMES | {"main", REPORT_ERROR, START} | {e.name for e in program.externs.values()}
         self.component_names: dict[tuple[str, str], str] = {}
         self.component_taken: set[str] = set()
         self.instance_params: dict[int, tuple[Param, ...]] = {}
@@ -474,13 +477,14 @@ class Backend:
 
     # ------------------------------------------------------------ program --
 
-    def emit_program(self, entry: Optional[str] = None) -> str:
+    def emit_program(self, entry: Optional[str] = None, hosted: bool = False) -> str:
         check_mono_termination(self.program)
         externs = []
         for ext in self.program.externs.values():
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", ext.name) or ext.name in C_KEYWORDS:
                 raise KursError(f"backend: foreign symbol {ext.name} is not a C identifier", ext.pos)
-            if ext.name in RUNTIME_NAMES or ext.name.startswith(("__builtin_", "__atomic_")) or ext.name in ("main", REPORT_ERROR) and entry is not None:
+            if ext.name in RUNTIME_NAMES or ext.name.startswith(("__builtin_", "__atomic_")) or \
+                    ext.name in ("main", REPORT_ERROR) and entry is not None or ext.name == START and entry is not None and hosted:
                 raise KursError(f"backend: foreign symbol {ext.name} conflicts with the C runtime prelude or entry wrapper", ext.pos)
             assert ext.ret is not None
             if ext.ptypes is None:
@@ -522,12 +526,14 @@ class Backend:
         out = [PRELUDE, *self.forward, *self.defs, *externs, *datas, *protos, *bodies]
         if entry is not None:
             assert main is not None
-            out.append(self.entry_wrapper(self.program.funs[entry], main))
+            out.append(self.entry_wrapper(self.program.funs[entry], main, hosted))
         return "\n".join(out) + "\n"
 
-    def entry_wrapper(self, fun: Fun, symbol: str) -> str:
+    def entry_wrapper(self, fun: Fun, symbol: str, hosted: bool) -> str:
         """C's `main`: it calls the entry `fun`, whose C is `symbol`, with `Args` from `argv` and `argc` if
-        `fun` takes them, and makes its result the exit status (`entry_result`)."""
+        `fun` takes them, and makes its result the exit status (`entry_result`). A `hosted` one, for an
+        executable `kursal build` links with `lib/libc/fs.c`, calls `START` first; any other (`kursal c`,
+        whose C a freestanding target may enter from start-up code of its own) does not."""
         if fun.ptypes:
             shape = self.shape(fun.ptypes[0])
             assert isinstance(shape, Struct)
@@ -536,18 +542,19 @@ class Backend:
             call = f"{symbol}(({self.ctype(fun.ptypes[0])}){{ ({self.ctype(argv)})argv, ({self.ctype(count)})argc }})"
         else:
             head, call = "int main(void)", f"{symbol}()"
+        declare, start = (f"void {START}(void);\n", f"{START}(); ") if hosted else ("", "")
         kind = self.entry_result(fun.ret)
         if kind == "status":
-            return f"{head} {{ return (int){call}; }}"
+            return f"{declare}{head} {{ {start}return (int){call}; }}"
         if kind == "zero":
-            return f"{head} {{ {call}; return 0; }}"
+            return f"{declare}{head} {{ {start}{call}; return 0; }}"
         result = self.shape(fun.ret)
         assert isinstance(result, Enum)
         error = self.shape(result.variants[1][1])
         assert isinstance(error, Struct)
         member, _ = self.member_of(error, error.fields[0][0])
         status = self.fresh_name("status")
-        return (f"void {REPORT_ERROR}(int32_t);\n{head} {{ {self.ctype(fun.ret)} {status} = {call}; "
+        return (f"{declare}void {REPORT_ERROR}(int32_t);\n{head} {{ {start}{self.ctype(fun.ret)} {status} = {call}; "
                 f"if ({self.tag(status, fun.ret)} == 0) return 0; "
                 f"{REPORT_ERROR}({self.payload(status, fun.ret, 'Err')}.{member}); return 1; }}")
 
@@ -1786,5 +1793,7 @@ class Backend:
         return const, restrict
 
 
-def emit_c(program: Program, checker: Checker, entry: Optional[str] = None) -> str:
-    return Backend(program, checker).emit_program(entry)
+def emit_c(program: Program, checker: Checker, entry: Optional[str] = None, hosted: bool = False) -> str:
+    """The C of `program`; with an `entry`, also C's `main`, which calls it (`Backend.entry_wrapper`),
+    `hosted` for an executable `kursal build` links with the standard library's C."""
+    return Backend(program, checker).emit_program(entry, hosted)

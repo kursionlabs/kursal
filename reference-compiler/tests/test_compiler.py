@@ -586,7 +586,7 @@ def reference_build(path: Path) -> dict[str, Optional[str]]:
         entry_decl = resolver.packages[0].entry_decl
         try:
             c: Optional[str] = emit_c(program, check_program(program),
-                                      sigs.name(entry_decl) if entry_decl is not None else None)
+                                      sigs.name(entry_decl) if entry_decl is not None else None, hosted=True)
         except KursError:
             c = None
         return {"lower": text, "c": c}
@@ -626,7 +626,7 @@ def reference_entry(path: Path) -> str:
         resolver = resolve(path)
         sigs = signatures(resolver)
         program = lower(resolver, sigs)
-        return emit_c(program, check_program(program), sigs.name(resolver.packages[0].entry_decl))
+        return emit_c(program, check_program(program), sigs.name(resolver.packages[0].entry_decl), hosted=True)
     except KursError as error:
         return f"error: {error}"
 

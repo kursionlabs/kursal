@@ -47,7 +47,7 @@ class StdRuntimeTests(unittest.TestCase):
             package(directory, source, deps)
             resolver, sigs, program = lowered(directory)
             c_file = directory / "main.c"
-            c_file.write_text(emit_c(program, check_program(program), sigs.name(resolver.packages[0].entry_decl)))
+            c_file.write_text(emit_c(program, check_program(program), sigs.name(resolver.packages[0].entry_decl), hosted=True))
             executable = directory / "main"
             built = subprocess.run(cc_command([str(c_file), *map(str, C_HELPERS)], str(executable)),
                                    capture_output=True, text=True)
@@ -688,6 +688,83 @@ class StdRuntimeTests(unittest.TestCase):
                     }
                 }''', stdout=full)
         self.assertEqual(result.returncode, 28)
+
+    def test_print_reports_a_closed_pipe(self):
+        # The pipe's reader is gone before the program starts: each write fails with EPIPE (32), which
+        # `print` returns, rather than SIGPIPE ending the process. A child started meanwhile gets SIGPIPE's
+        # default action back, so a shell that sends itself one ends by it (status 3 if it does not).
+        reader, writer = os.pipe()
+        os.close(reader)
+        with os.fdopen(writer, "w") as pipe:
+            result = self.run_program('''
+                use std::io::print;
+                use std::option::Result;
+                use std::process::{Command!, Exit};
+                use std::slice::StaticRead;
+                fn main() -> i32 {
+                    var sr = StaticRead::new();
+                    let child = match Command!::new(&sr, "sh").arg(&sr, "-c").arg(&sr, "kill -s PIPE $$; exit 3").run() {
+                        Result::Ok(exit) => match exit {
+                            Exit::Signal(s) => s,
+                            Exit::Code(c) => 100 + c,
+                        },
+                        Result::Err(e) => 200,
+                    };
+                    if child != 13 {
+                        return child;
+                    }
+                    var i = 0u32;
+                    while i < 3u32 {
+                        match print("lost") {
+                            Result::Ok(nothing) => (),
+                            Result::Err(e) => return e.errno,
+                        }
+                        i = i + 1u32;
+                    }
+                    1
+                }''', stdout=pipe)
+        self.assertEqual(result.returncode, 32)
+
+    def test_standard_streams_the_process_started_without_stay_out_of_reach(self):
+        # Started with descriptors 0, 1 and 2 closed, the program still has them, on /dev/null, so the file
+        # it creates takes another number: `print`, `eprint` and `read_line` work and reach /dev/null, and
+        # the file holds only what was written to it.
+        def close_standard_streams() -> None:
+            for fd in (0, 1, 2):
+                os.close(fd)
+        self.expect('''
+            use std::io::{File!, eprint, print, read_line};
+            use std::option::{Option, Result};
+            use std::slice::StaticRead;
+            fn main() -> i32 {
+                var sr = StaticRead::new();
+                let file = match File!::create(&sr, "owned.txt") {
+                    Result::Ok(f) => f,
+                    Result::Err(e) => return 1,
+                };
+                var file = file;
+                let written = &file.write_static("the file's own\\n");
+                let printed = print("stdout\\n").is_ok() && eprint("stderr\\n").is_ok();
+                let line = match read_line() {
+                    Result::Ok(found) => match found {
+                        Option::Some(text) => { text.destroy(); 4 },
+                        Option::None => 0,
+                    },
+                    Result::Err(e) => 5,
+                };
+                let closed = file.close().is_ok();
+                let reader = match File!::open_read(&sr, "owned.txt") {
+                    Result::Ok(f) => f,
+                    Result::Err(e) => return 6,
+                };
+                var reader = reader;
+                let length = match &reader.read_to_end() {
+                    Result::Ok(text) => { let n = &text.len(); text.destroy(); n },
+                    Result::Err(e) => 0usize,
+                };
+                let shut = reader.close();
+                if !written.is_ok() || !closed { 2 } else if !printed { 3 } else if line != 0 { line } else if length != 15usize { 7 } else { 0 }
+            }''', preexec=close_standard_streams)
 
     def test_read_line_tells_an_empty_line_from_the_end(self):
         self.expect('''

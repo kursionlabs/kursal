@@ -45,6 +45,9 @@ fn c_stage(times: bool, name: Slice[u8, 'static], started: Instant) -> Instant {
 
 // The C function, in `lib/libc/fs.c`, that C's `main` calls to report the error an entry returns.
 const REPORT_ERROR: Slice[u8, 'static] = "kur_libc_process_report_error";
+// The C function, in `lib/libc/fs.c`, that a hosted C `main` calls first: it opens /dev/null on each
+// standard descriptor the process started without, and ignores SIGPIPE.
+const START: Slice[u8, 'static] = "kur_libc_process_start";
 
 // How C's `main` makes an entry's result its exit status (`Backend::entry_result`).
 enum EntryResult {
@@ -669,6 +672,7 @@ impl Backend['k] {
         }
         taken.insert(&cx, Span::from_static(&cx, "main"));
         taken.insert(&cx, Span::from_static(&cx, REPORT_ERROR));
+        taken.insert(&cx, Span::from_static(&cx, START));
         let externs = program.externs.values(&cx);
         var e = 0usize;
         while e < externs.len(&cx) {
@@ -1560,7 +1564,7 @@ impl Backend['k] {
 
     // ------------------------------------------------------------------- program --
 
-    fn emit_program(self, &cx: Domain!['k], entry: Option[Span['k]], times: bool) -> CText!['k] {
+    fn emit_program(self, &cx: Domain!['k], entry: Option[Span['k]], hosted: bool, times: bool) -> CText!['k] {
         var started = Instant::now();
         check_mono_termination(&cx, self.program);
         let keywords = c_keywords(&cx);
@@ -1574,7 +1578,8 @@ impl Backend['k] {
                 fail_at(&cx, Buffer!::new().push_static("backend: foreign symbol ").push_bytes(&cx, ext.name).push_static(" is not a C identifier").save(&cx), ext.pos);
             }
             if runtime.contains(&cx, ext.name) || ext.name.starts_with(&cx, Span::from_static(&cx, "__builtin_")) || ext.name.starts_with(&cx, Span::from_static(&cx, "__atomic_"))
-                || (ext.name.is(&cx, "main") || ext.name.is(&cx, REPORT_ERROR)) && entry.is_some() {
+                || (ext.name.is(&cx, "main") || ext.name.is(&cx, REPORT_ERROR)) && entry.is_some()
+                || ext.name.is(&cx, START) && entry.is_some() && hosted {
                 fail_at(&cx, Buffer!::new().push_static("backend: foreign symbol ").push_bytes(&cx, ext.name)
                     .push_static(" conflicts with the C runtime prelude or entry wrapper").save(&cx), ext.pos);
             }
@@ -1685,7 +1690,7 @@ impl Backend['k] {
                     Option::Some(name) => name,
                     Option::None => Span::from_static(&cx, ""),
                 });
-                Option::Some.(self.entry_wrapper(&cx, fun, symbol))
+                Option::Some.(self.entry_wrapper(&cx, fun, symbol, hosted))
             },
             Option::None => Option::None,
         };
@@ -1771,8 +1776,10 @@ impl Backend['k] {
     }
 
     // C's `main`: it calls the entry `fun`, whose C is `symbol`, with `Args` from `argv` and `argc` if
-    // `fun` takes them, and makes its result the exit status (`entry_result`).
-    fn entry_wrapper(self, &cx: Domain!['k], fun: Fun['k], symbol: Span['k]) -> Span['k] {
+    // `fun` takes them, and makes its result the exit status (`entry_result`). A `hosted` one, for an
+    // executable `kursal build` links with `lib/libc/fs.c`, calls `START` first; any other (`kursal c`,
+    // whose C a freestanding target may enter from start-up code of its own) does not.
+    fn entry_wrapper(self, &cx: Domain!['k], fun: Fun['k], symbol: Span['k], hosted: bool) -> Span['k] {
         let (head, call) = if !fun.ptypes.is_empty(&cx) {
             let args = fun.ptypes.at(&cx, 0usize);
             let fields = match self.shape(&cx, args) {
@@ -1786,13 +1793,21 @@ impl Backend['k] {
         } else {
             (Span::from_static(&cx, "int main(void)"), Buffer!::new().push_bytes(&cx, symbol).push_static("()").save(&cx))
         };
+        let (declare, start) = if hosted {
+            (Buffer!::new().push_static("void ").push_static(START).push_static("(void);\n").save(&cx),
+                Buffer!::new().push_static(START).push_static("(); ").save(&cx))
+        } else {
+            (Span::from_static(&cx, ""), Span::from_static(&cx, ""))
+        };
         let kind = match self.entry_result(&cx, fun.ret) {
             Option::Some(kind) => kind,
             Option::None => fail_text(&cx, Span::from_static(&cx, "internal error: an entry whose result is no exit status")),
         };
         match kind {
-            EntryResult::Status => Buffer!::new().push_bytes(&cx, head).push_static(" { return (int)").push_bytes(&cx, call).push_static("; }").save(&cx),
-            EntryResult::Zero => Buffer!::new().push_bytes(&cx, head).push_static(" { ").push_bytes(&cx, call).push_static("; return 0; }").save(&cx),
+            EntryResult::Status => Buffer!::new().push_bytes(&cx, declare).push_bytes(&cx, head).push_static(" { ").push_bytes(&cx, start)
+                .push_static("return (int)").push_bytes(&cx, call).push_static("; }").save(&cx),
+            EntryResult::Zero => Buffer!::new().push_bytes(&cx, declare).push_bytes(&cx, head).push_static(" { ").push_bytes(&cx, start)
+                .push_bytes(&cx, call).push_static("; return 0; }").save(&cx),
             EntryResult::Report => {
                 let error = match self.shape(&cx, fun.ret) {
                     Type::Enum(variants) => self.shape(&cx, variants.at(&cx, 1usize).type),
@@ -1804,8 +1819,8 @@ impl Backend['k] {
                 };
                 let (member, _type) = self.member_of(&cx, error, label);
                 let status = self.fresh_name(&cx, Span::from_static(&cx, "status"));
-                Buffer!::new().push_static("void ").push_static(REPORT_ERROR).push_static("(int32_t);\n")
-                    .push_bytes(&cx, head).push_static(" { ").push_bytes(&cx, self.c(&cx, fun.ret)).push_static(" ").push_bytes(&cx, status)
+                Buffer!::new().push_bytes(&cx, declare).push_static("void ").push_static(REPORT_ERROR).push_static("(int32_t);\n")
+                    .push_bytes(&cx, head).push_static(" { ").push_bytes(&cx, start).push_bytes(&cx, self.c(&cx, fun.ret)).push_static(" ").push_bytes(&cx, status)
                     .push_static(" = ").push_bytes(&cx, call).push_static("; if (").push_bytes(&cx, self.tag(&cx, status, fun.ret))
                     .push_static(" == 0) return 0; ").push_static(REPORT_ERROR).push_static("(")
                     .push_bytes(&cx, self.payload(&cx, status, fun.ret, Span::from_static(&cx, "Err"))).push_static(".").push_bytes(&cx, member)
@@ -4448,8 +4463,8 @@ impl Walk['k] {
 
 forall 'k.
 fn emit_c(&cx: Domain!['k], program: Program['k], typed: ArenaMap[FunKey['k], ArenaMap[(Span['k], Span['k]), Type['k], 'k], 'k], entry: Option[Span['k]], counter: Fresh['k], times: bool,
-    split: bool) -> CText!['k] {
-    Backend::new(&cx, program, typed, counter, split).emit_program(&cx, entry, times)
+    split: bool, hosted: bool) -> CText!['k] {
+    Backend::new(&cx, program, typed, counter, split).emit_program(&cx, entry, hosted, times)
 }
 
 // The place path or out pointer `away` sends component `k` to (`Backend::away`).
