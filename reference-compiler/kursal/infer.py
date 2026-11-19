@@ -31,7 +31,7 @@ from . import syntax as S
 from .resolve import Decl, ResolveError, Resolver
 from .sigs import InstanceSig, Scope, Sig, Signatures
 from .sexpr import KursError, Position
-from .types import Surface, Types, brand_differences, equal, foreach_binders, free_brands, free_names, subst
+from .types import Surface, Types, brand_differences, brand_name, equal, foreach_binders, free_brands, free_names, subst
 from .termination import check_instance_termination
 from .coherence import check_coherence
 from .unify import Meta, ground, instantiate, match_head, prune, unify, zonk
@@ -243,6 +243,9 @@ class Infer:
         self.foreaches: dict[str, tuple[str, Optional[Position]]] = {}
         self.open_binders: tuple[str, ...] = ()
         self.binder_checks: list[tuple[C.Type, tuple[str, ...]]] = []
+        # Each instantiation of a generic declaration: its parameters, their metavariables, the name it is
+        # used by, and where.
+        self.instantiations: list[tuple[tuple[C.Param, ...], dict[str, C.Type], str, Optional[Position]]] = []
         self.solving = False
         self.returns = [sig.ret]
         level, node.param_ids = Level(), []
@@ -273,6 +276,11 @@ class Infer:
             if escaped:
                 item, pos = self.foreaches[min(escaped)]
                 fail(f"the type of foreach item {item} escapes its lexical scope", pos)
+        for params, sub, owner, pos in self.instantiations:
+            for p in params:
+                if not ground(sub[p.name]):
+                    argument = brand_name(p.name) if p.kind == C.BRAND else Surface((), {}).name(p.name)
+                    fail(f"cannot infer the type argument {argument} of {owner}", pos)
         for e in self.recorded:
             e.ty = zonk(e.ty)
             if isinstance(e, S.For):
@@ -427,6 +435,13 @@ class Infer:
             self.unify(subst(h, sub), a, pos)
         for premise in inst.premises:
             self.require(premise.trait, [subst(a, sub) for a in premise.args], pos)
+
+    def instantiate(self, params: Sequence[C.Param], owner: str, pos: Optional[Position]) -> dict[str, C.Type]:
+        """A fresh metavariable for each of `params`, the parameters of `owner` used at `pos`; each must be
+        solved by the end of the body."""
+        sub = instantiate(params)
+        self.instantiations.append((tuple(params), sub, owner, pos))
+        return sub
 
     def copy_ok(self, inst: InstanceSig, sub: Mapping[str, C.Type]) -> bool:
         return all(p.name not in sub or self.types.is_copy(sub[p.name], self.kinds)
@@ -731,7 +746,7 @@ class Infer:
         retain = expr.generic and not any(args for _, args in expr.segments)
         kept = tuple(p for p in sig.params if p.kind == C.BRAND and retain and
                      not any(p.name in free_names(zonk(a)) for q in sig.premises for a in q.args))
-        sub = instantiate([p for p in sig.params if p not in kept])
+        sub = self.instantiate([p for p in sig.params if p not in kept], expr.names[-1], expr.pos)
         self.explicit_args(expr, sig, sub)
         expr.call = FnCall(sig, sub)
         self.require_signature(sig, sub, expr.pos)
@@ -788,7 +803,7 @@ class Infer:
         self.require_visible_shape(C.Named(td.name), expr.pos)
         if len(written) > len(td.params):
             fail(f"{td.name} accepts at most {len(td.params)} type arguments, got {len(written)}", expr.pos)
-        sub = instantiate(td.params)
+        sub = self.instantiate(td.params, Surface((), {}, (td.name,)).name(td.name), expr.pos)
         for p, a in zip(td.params, written):
             self.unify(sub[p.name], self.type(a), expr.pos)
         self.require_parameter_kinds(td.params, sub, expr.pos)
@@ -1138,7 +1153,7 @@ class Infer:
                     return self.record(callee, ty)
                 case ("decl", Decl(kind="fn" | "method" | "extern") as decl):
                     sig = self.sigs.sigs[decl]
-                    sub = instantiate(sig.params)
+                    sub = self.instantiate(sig.params, callee.names[-1], expr.pos)
                     self.explicit_args(callee, sig, sub)
                     expr.call = FnCall(sig, sub)
                     return self.call_sig(expr, expr.call, self.operands(expr.args))
@@ -1183,7 +1198,7 @@ class Infer:
                 expr.call = ClosureCall()
                 ptypes, places, ret = list(code.params[1:]), {k - 1 for k in code.places}, code.ret
             elif isinstance(s, C.Fn):
-                sub = instantiate(s.forall)
+                sub = self.instantiate(s.forall, expr.callee.names[-1] if isinstance(expr.callee, S.Path) else "the callee", expr.pos)
                 expr.call = ValueCall(sub)
                 ptypes, places, ret = [subst(t, sub) for t in s.params], s.places, subst(s.ret, sub)
             else:
@@ -1361,7 +1376,7 @@ class Infer:
                     fail(f"{name} takes no receiver", expr.pos)
                 if (0 in sig.places) != receiver.lend:
                     fail(f"{name} takes its receiver {'by &' if 0 in sig.places else 'by value'}", expr.pos)
-                sub = instantiate(sig.params)
+                sub = self.instantiate(sig.params, name, expr.pos)
                 self.unify(subst(sig.ptypes[0], sub), receiver_ty, expr.pos)
                 expr.call = FnCall(sig, sub, receiver)
                 return self.call_sig(expr, expr.call, got)

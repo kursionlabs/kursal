@@ -62,7 +62,7 @@ VISIBILITY_ERRORS = (
 INFERENCES = (
     'use std::iter::{Iterator, range};\nuse std::option::{Option, Result};\nuse std::atomic::Ordering;\nuse std::bytes::buffer::Buffer!;\nfn total(n: u32) -> u32 { var sum = 0u32; var it = range(0usize, 4usize); for i in &it { sum = sum + (i as u32); } sum }\nfn first(o: Option[u32]) -> Option[u32] { let v = o?; Option::Some.(v + 1) }\nfn both(r: Result[u32, bool]) -> Result[(u32, u32), bool] { let v = r?; Result::Ok.((v, v)) }\nfn text(n: u32) -> Buffer! { f"n = {n}" }\nfn written(n: u32) -> Buffer! { f"n = {n}".write(Buffer!::new()) }\nfn atomics(p: *u32) -> u32 { std::atomic::fence(Ordering::SeqCst); let old = unsafe p.fetch_add(1u32, Ordering::Relaxed); let (v, ok) = unsafe p.compare_exchange(old, 2u32, Ordering::SeqCst, Ordering::Relaxed); unsafe p.store(v); std::ptr::store_volatile(p, 3u32); std::ptr::load_volatile(p) }\nfn tag(o: Option[u32]) -> u32 { var x = o; let t = std::mem::enum_variant(&x); let (y, u) = std::mem::enum_variant(x); t + u }\nfn mint() -> exists \'r. std::cap::Brand[\'r] { let exists \'a. w = std::cap::fresh(); pack \'a. w }\nfn use_mint() -> u32 { let exists \'b. w = mint(); let s = std::cap::static_brand(); let q = pack \'b. w; 0u32 }\n',
     'exposed struct P { x: u32, y: u32, z: u8 }\nforall T. exposed struct Box { value: T }\nforall T. impl Box[T] { forall U. fn map(self, u: U) -> (T, U) { (self.value, u) } }\ntrait Size { fn size(x: Self) -> usize; }\ninstance Size[u32] { fn size(x: u32) -> usize { 4usize } }\nforall T where Size[T]. fn size_of(x: T) -> usize { T::size(x) }\nforall T. fn id(x: T) -> T { x }\nfn f(p: P, q: *u32) -> u32 {\n  const K: u32 = 3u32 * 2u32;\n  let { x, ..rest } = p; let r = P.{ x: x + K, ..rest };\n  let a: [u32; 4] = [x, ..]; let [a0, a1, a2, a3] = a;\n  let n = core::mem::sizeof[P]() + size_of(a0); let c = (n as u32) + (r.z as u32);\n  let slot = core::mem::alloca[u32](); unsafe *slot = c; let back = unsafe *slot;\n  let bias = 2u32; let g = |y: u32| y + bias + back; let h = id; let i = id[u32](g(1u32));\n  let b = Box[u32]::map[bool](Box.{ value: i }, true);\n  let items = foreach item of (1u32, 2u32) { (item, bias) };\n  let m = match a0 { 0 => 1u32, 1..=3 => 2u32, _ => 3u32 };\n  var v = p; v.x = m; v.y = b.0; v.x + h(v.y)\n}\n',
-    "forall T. exposed enum Opt { Some(T), None }\nfn f(n: u32) -> u32 { let o = Opt::None; var k = n; while k > 0u32 { k = k - 1u32; if k == 3u32 { return k; } } var q = Opt::Some.(k); let w = match &q { Opt::Some(v) => v, Opt::None => 0u32 }; let pk = pack 'static. q; w }\n",
+    "forall T. exposed enum Opt { Some(T), None }\nfn f(n: u32) -> u32 { let o: Opt[u32] = Opt::None; var k = n; while k > 0u32 { k = k - 1u32; if k == 3u32 { return k; } } var q = Opt::Some.(k); let w = match &q { Opt::Some(v) => v, Opt::None => 0u32 }; let pk = pack 'static. q; w }\n",
     *VISIBILITY,
     "forall T. fn pass(x: exists 'a. (core::cap::Brand['a], T)) -> T {\n                let exists 'a. (witness, value) = x;\n                value\n            }\n            fn main() -> i32 {\n                let exists 'a. witness = core::cap::fresh();\n                pass(pack 'a. (witness, 7i32))\n            }",
     'exposed struct Token! { n: i32 }\n            forall T. fn pass(x: T, flag: bool) -> T {\n                let pair = (x, if flag { 1u32 } else { 2u32 });\n                let (value, count) = pair;\n                if count == 1u32 { value } else { value }\n            }\n            fn main() -> i32 {\n                let { n } = pass(Token!.{ n: 7i32 }, true);\n                n\n            }',
@@ -345,4 +345,16 @@ INFER_ERRORS = (
      "    var keep = s.a;\n    let g = |x| x;\n    let parts = foreach f of s { g(f) };\n    0i32\n}\n",
      "6:17: the type of foreach item f escapes its lexical scope"),
     ("fn main() -> i32 {\n    const K: u32 = 1u8;\n    0i32\n}\n", "2:20: const K has type u8, but its declared type is u32"),
+    # A type argument nothing in the body determines.
+    ("forall T. fn id(x: T) -> T { x }\nfn main() -> i32 {\n    let h = id;\n    0i32\n}\n",
+     "3:13: cannot infer the type argument T of id"),
+    ("forall T. enum Opt { Some(T), None }\nfn main() -> i32 {\n    let x = Opt::None;\n    0i32\n}\n",
+     "3:13: cannot infer the type argument T of Opt"),
+    ("forall T. fn mk() -> u32 { 0u32 }\nfn main() -> i32 {\n    mk() as i32\n}\n",
+     "3:5: cannot infer the type argument T of mk"),
+    ("exposed struct B { x: u32 }\nimpl B { forall T. fn m(self) -> u32 { self.x } }\n"
+     "fn main() -> i32 {\n    let b = B.{ x: 1u32 };\n    b.m() as i32\n}\n",
+     "5:5: cannot infer the type argument T of m"),
+    ("forall 'a. fn f(x: u32) -> u32 { x }\nfn main() -> i32 {\n    let g = f;\n    g(1u32) as i32\n}\n",
+     "4:5: cannot infer the type argument 'a of g"),
 )

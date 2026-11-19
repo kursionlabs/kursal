@@ -34,8 +34,8 @@ use package::sigs::signatures::{ConstValue, InstanceSig, Sig, Signatures, const_
 use package::syntax::ast as S;
 use package::syntax::ast::{Expr, Pattern, Pos, Statement, no_pos};
 use package::types::termination::check_instance_termination;
-use package::types::ops::{Fresh, Surface, Types, brand_differences, equal, foreach_binders, free_brands, free_names, subst, surface};
-use package::types::unify::{instantiate, match_head, prune, unify, zonk};
+use package::types::ops::{Fresh, Surface, Types, brand_differences, brand_name, equal, foreach_binders, free_brands, free_names, subst, surface};
+use package::types::unify::{ground, instantiate, match_head, prune, unify, zonk};
 use std::collections::hashmap::OwnedMap!;
 use std::collections::vec::{OwnedVec!, Popped!};
 use std::option::{Option, Result};
@@ -348,6 +348,12 @@ fn is_never(&cx: Domain!['k], t: Type['k]) -> bool {
     }
 }
 
+// The last segment of a path.
+forall 'k.
+fn last_name(&cx: Domain!['k], p: S::Path['k]) -> Span['k] {
+    p.segments.at(&cx, p.segments.len(&cx) - 1usize).name
+}
+
 forall 'k.
 fn is_unsolved(&cx: Domain!['k], t: Type['k]) -> bool {
     match prune(&cx, t) {
@@ -636,7 +642,7 @@ impl Infer['k] {
         let b = Body.{
             inf: self, home, sig, kinds, assumptions, waiting: ArenaVec::new(&cx), defaults: ArenaVec::new(&cx), recorded: ArenaVec::new(&cx),
             literals: ArenaVec::new(&cx), brand_checks: ArenaVec::new(&cx), foreaches: ArenaMap::new(&cx), open_binders: Ref::new(&cx, List::Empty),
-            binder_checks: ArenaVec::new(&cx), solving: Ref::new(&cx, false), returns: ArenaVec::one(&cx, sig.ret),
+            binder_checks: ArenaVec::new(&cx), instantiations: ArenaVec::new(&cx), solving: Ref::new(&cx, false), returns: ArenaVec::one(&cx, sig.ret),
             scopes: Ref::new(&cx, List::Empty.cons(&cx, level)), frames: ArenaVec::one(&cx, new_frame(&cx)), allowed: Ref::new(&cx, Option::None),
         };
         let ids: ArenaVec[u32, 'k] = ArenaVec::new(&cx);
@@ -827,6 +833,9 @@ exposed struct Body {
     open_binders: Ref[List[Span['k], 'k], 'k],
     // each local's type, with the binders open where it was bound
     binder_checks: ArenaVec[(Type['k], List[Span['k], 'k]), 'k],
+    // each instantiation of a generic declaration: its parameters, their metavariables, the name it
+    // is used by, and where
+    instantiations: ArenaVec[(ArenaVec[Param['k], 'k], ArenaMap[Span['k], Type['k], 'k], Span['k], Pos), 'k],
     solving: Ref[bool, 'k],
     returns: ArenaVec[Type['k], 'k],
     // the scopes open, innermost first
@@ -918,6 +927,20 @@ impl Body['k] {
                 },
                 Option::None => (),
             };
+            i = i + 1usize;
+        }
+        i = 0usize;
+        while i < self.instantiations.len(&cx) {
+            let (params, sub, owner, pos) = self.instantiations.at(&cx, i);
+            var k = 0usize;
+            while k < params.len(&cx) {
+                let p = params.at(&cx, k);
+                if !ground(&cx, sub.at(&cx, p.name)) {
+                    let argument = if is_brand(p.kind) { brand_name(&cx, p.name) } else { surface(&cx, ArenaVec::new(&cx), ArenaVec::new(&cx), ArenaMap::new(&cx)).name(&cx, p.name) };
+                    self.fail(&cx, Buffer!::new().push_static("cannot infer the type argument ").push_bytes(&cx, argument).push_static(" of ").push_bytes(&cx, owner).save(&cx), pos);
+                }
+                k = k + 1usize;
+            }
             i = i + 1usize;
         }
         let out = self.results();
@@ -1099,6 +1122,14 @@ impl Body['k] {
             },
             Action::Pointer(p) => self.pointer_known(&cx, p, pos),
         }
+    }
+
+    // A fresh metavariable for each of `params`, the parameters of `owner` used at `pos`; each must be
+    // solved by the end of the body.
+    fn instantiate_at(self, &cx: Domain!['k], params: ArenaVec[Param['k], 'k], owner: Span['k], pos: Pos) -> ArenaMap[Span['k], Type['k], 'k] {
+        let sub = instantiate(&cx, params);
+        self.instantiations.push(&cx, (params, sub, owner, pos));
+        sub
     }
 
     fn unify_at(self, &cx: Domain!['k], a: Type['k], b: Type['k], pos: Pos) {
@@ -1976,7 +2007,7 @@ impl Body['k] {
             }
             i = i + 1usize;
         }
-        let sub = instantiate(&cx, fresh);
+        let sub = self.instantiate_at(&cx, fresh, last_name(&cx, p), p.pos);
         self.explicit_args(&cx, p, sig, sub);
         self.results().calls.insert(&cx, p.id, Callee::Fn.(FnCall.{ sig, sub, receiver: Option::None }));
         self.require_signature(&cx, sig, sub, p.pos);
@@ -2117,7 +2148,7 @@ impl Body['k] {
         if written.len(&cx) > td.params.len(&cx) {
             self.fail(&cx, Buffer!::new().push_bytes(&cx, td.name).push_static(" accepts at most ").push_usize(td.params.len(&cx)).push_static(" type arguments, got ").push_usize(written.len(&cx)).save(&cx), pos);
         }
-        let sub = instantiate(&cx, td.params);
+        let sub = self.instantiate_at(&cx, td.params, surface(&cx, ArenaVec::new(&cx), ArenaVec::one(&cx, td.name), ArenaMap::new(&cx)).name(&cx, td.name), pos);
         var i = 0usize;
         while i < written.len(&cx) {
             self.unify_at(&cx, sub.at(&cx, td.params.at(&cx, i).name), self.core_type(&cx, written.at(&cx, i)), pos);
@@ -2782,7 +2813,7 @@ impl Body['k] {
             },
             NameRef::Decl(decl) => if decl.kind.is(&cx, "fn") || decl.kind.is(&cx, "method") || decl.kind.is(&cx, "extern") {
                 let sig = self.inf.sigs.sigs.at(&cx, decl.id);
-                let sub = instantiate(&cx, sig.params);
+                let sub = self.instantiate_at(&cx, sig.params, last_name(&cx, path), c.pos);
                 self.explicit_args(&cx, path, sig, sub);
                 let call = FnCall.{ sig, sub, receiver: Option::None };
                 self.results().calls.insert(&cx, c.id, Callee::Fn.(call));
@@ -2869,7 +2900,11 @@ impl Body['k] {
             },
             Option::None => match s {
                 Type::Fn(f) => {
-                    let sub = instantiate(&cx, f.quantified);
+                    let owner = match w.call.callee.copy(&cx) {
+                        Expr::Path(callee) => last_name(&cx, callee),
+                        _ => Span::from_static(&cx, "the callee"),
+                    };
+                    let sub = self.instantiate_at(&cx, f.quantified, owner, pos);
                     self.results().calls.insert(&cx, w.call.id, Callee::Value.(sub));
                     ptypes.append(&cx, self.subst_all(&cx, f.params, sub));
                     places.append(&cx, f.places);
@@ -3190,7 +3225,7 @@ impl Body['k] {
                     self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(" takes no receiver").save(&cx), c.pos);
                 }
                 self.receiver_mode(&cx, name, sig.places, receiver, c.pos);
-                let sub = instantiate(&cx, sig.params);
+                let sub = self.instantiate_at(&cx, sig.params, name, c.pos);
                 self.unify_at(&cx, subst(&cx, sig.ptypes.at(&cx, 0usize), sub, self.inf.counter), receiver_ty, c.pos);
                 let call = FnCall.{ sig, sub, receiver: Option::Some.(receiver) };
                 self.results().calls.insert(&cx, c.id, Callee::Fn.(call));
