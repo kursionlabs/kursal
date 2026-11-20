@@ -48,6 +48,13 @@ def contains(types: Types, ty: Type, pred: Callable[[Type], bool]) -> bool:
     return isinstance(ty, Named) and ty.name in types.program.types and contains(types, types.shape(ty), pred)
 
 
+def checked_only(ty: Type) -> bool:
+    """What only checked code makes, and foreign code never hands the program: a package, a brand witness,
+    a safe function value, a transform, or Never. An `unsafe fn` value may come from C: calling it needs
+    `unsafe`."""
+    return isinstance(ty, (Exists, Brand, Foreach, Never)) or isinstance(ty, Fn) and not ty.unsafe
+
+
 class CheckError(KursError):
     pass
 
@@ -173,6 +180,8 @@ class Checker:
             self.where = f"extern {ext.name}"
             for t in ext.ptypes if ext.ptypes is not None else (() if ext.ret is None else (ext.ret,)):
                 self.has_memory_form(t)
+            if ext.ret is not None and not isinstance(ext.ret, Never):
+                self.foreign_result(ext.ret)
         for trait in self.program.traits.values():
             self.where = f"trait {trait.name}"
             if trait.name in SEALED:
@@ -809,6 +818,16 @@ class Checker:
             self.fail("retained_brand_with_premise")
         sub = self.instantiate(fun.params, fun.premises, instr.tys, name)
         return Fn(tuple(subst(t, sub) for t in fun.ptypes), subst(fun.ret, sub), retained, fun.unsafe, fun.places)
+
+    def foreign_result(self, ty: Type) -> None:
+        """What foreign code hands the program, an extern function's result or an extern value, is
+        reinterpreted from C's bytes as an unsafe cast's result is: it holds nothing only checked code
+        makes (`checked_only`; a result of `!` itself says the function does not return), and no enum or
+        `NonNull`, whose layout the compiler chooses."""
+        if contains(self.types, ty, checked_only):
+            self.fail("extern_result_cannot_produce")
+        if self.types.chosen_layout(ty):
+            self.fail("extern_result_layout_chosen")
 
     def has_memory_form(self, ty: Type) -> None:
         """A zero-size type is erased: it has no C object and no C value, and `sizeof` of one is 0. A load or

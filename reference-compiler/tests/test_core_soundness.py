@@ -223,6 +223,20 @@ REJECTED = {
     "extern_unit_parameter": ("zero_size_type_has_no_memory_form", "(extern fun f u32 ((tuple)))"),
     "extern_unit_value": ("zero_size_type_has_no_memory_form", "(extern value v (tuple (array u8 0)))"),
 
+    # What foreign code hands back is reinterpreted from C's bytes, as a cast's result is: it holds
+    # nothing only checked code makes, and no layout the compiler chooses.
+    "extern_result_brand": ("extern_result_cannot_produce", """
+        (type W (struct (n u64) (b (brand $static))))
+        (extern fun forge W ())"""),
+    "extern_result_safe_function": ("extern_result_cannot_produce", "(extern fun make (fn () u32) ())"),
+    "extern_result_package": ("extern_result_cannot_produce", "(extern fun make (tuple u64 (exists ($k) (brand $k))) ())"),
+    "extern_result_holding_never": ("extern_result_cannot_produce", "(extern fun make (tuple u64 !) ())"),
+    "extern_value_brand": ("extern_result_cannot_produce", "(extern value v (tuple u64 (brand $static)))"),
+    "extern_result_enum": ("extern_result_layout_chosen", """
+        (type E (enum (A u32) (B u64)))
+        (extern fun make (tuple u64 E) ())"""),
+    "extern_result_non_null": ("extern_result_layout_chosen", "(extern fun make (non_null u8) ())"),
+
     # Compiler-reserved traits are sealed, and a Copy premise names a parameter.
     "user_exposed_trait": ("trait_name_is_reserved", "(trait Exposed (T)) (instance Exposed (u32))"),
     "copy_premise_on_a_type": ("Copy requires a type parameter name",
@@ -281,6 +295,11 @@ class CoreSoundnessTests(unittest.TestCase):
             # A pointer read out of memory is a value; what it points at is not.
             """(type S (struct (n !)))
                (fun (unsafe) h (ptr S) ((ptr (ptr S))) (entry ((%p (ptr (ptr S)))) (= %q (ptr_load %p)) (ret %q)))""",
+            # A foreign function that does not return, one that hands back an `unsafe fn` value (calling
+            # it needs `unsafe`), and parameters, which the result rule does not reach.
+            """(extern fun stop ! ())
+               (extern fun callback (tuple (fn (unsafe) ((ptr u8)) (ptr u8)) u64) ())
+               (extern fun take u32 ((fn () u32) (non_null u8)))""",
             # A cast of a type holding itself in an array of length 0, which holds no value.
             """(type R (struct (a (array R 0)) (b u32)))
                (fun (unsafe) h (tuple u64 R) ((tuple u64 R)) (entry ((%t (tuple u64 R)))

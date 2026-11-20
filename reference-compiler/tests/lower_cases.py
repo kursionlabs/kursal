@@ -31,6 +31,13 @@ LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
      "an unsafe cast cannot produce or take apart"),
     ("forall 'k.\nstruct P { x: u64, b: core::cap::Brand['k] }\nforall 'k.\nfn f(x: u64) -> P['k] { unsafe (x as P['k]) }\n",
      "an unsafe cast cannot produce or take apart"),
+    # What an extern hands back holds nothing only checked code makes, and no layout the compiler chooses.
+    ('extern "C" fn get_cb() -> fn() -> u32;\n', "extern get_cb cannot return a package, a brand witness, a safe function"),
+    ('struct W { n: u64, f: fn() -> u32 }\nextern "C" fn make() -> W;\n', "extern make cannot return a package"),
+    ('extern "C" fn make() -> (u64, !);\n', "extern make cannot return a package"),
+    ('forall T. exposed enum Opt { Some(T), None }\nextern "C" fn make() -> Opt[u32];\n',
+     "extern make cannot return an enum or a NonNull, whose layout the compiler chooses"),
+    ('extern "C" fn make() -> std::ptr::NonNull[u8];\n', "extern make cannot return an enum or a NonNull"),
     # No memory holds a value that holds Never, however deep.
     ("struct S { n: ! }\nfn f(p: *S) -> u32 { let s = unsafe *p; 0u32 }\n",
      "an unsafe read cannot produce a value that holds Never"),

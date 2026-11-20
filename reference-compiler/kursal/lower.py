@@ -29,7 +29,7 @@ from . import syntax as S
 from .placeflow import OwnershipError, PlaceFlow
 from .promote import promote_locals
 from .literals import valid_literal
-from .check import contains, overlap
+from .check import checked_only, contains, overlap
 from .infer import (POINTER_OPS, BuiltinCall, ClosureCall, FnCall, FStringWrite, Infer, PointerCall, TypedBuiltinCall,
                     TraitCall, TupleCall, ValueCall, VariantCall)
 from .sexpr import KursError, List, Position, Str
@@ -103,6 +103,12 @@ class Lowering:
                 with self.r.located(decl.module, decl.node.pos):
                     if any(self.types.zero_size(t) for t in sig.ptypes):
                         fail(f"extern {decl.node.name} takes a zero-size type, which has no memory form")
+                    if not isinstance(sig.ret, C.Never) and contains(self.types, sig.ret, checked_only):
+                        fail(f"extern {decl.node.name} cannot return a package, a brand witness, a safe function "
+                             "value, a transform or Never, which only checked code makes")
+                    if self.types.chosen_layout(sig.ret):
+                        fail(f"extern {decl.node.name} cannot return an enum or a NonNull, whose layout the "
+                             "compiler chooses")
                 program.externs[decl.node.name] = C.Extern(decl.node.name, sig.ret, sig.ptypes)
             elif isinstance(decl.node, S.Fn) and decl.node.body is not None:
                 node = decl.node

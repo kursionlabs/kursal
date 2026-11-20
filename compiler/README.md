@@ -875,7 +875,11 @@ These are the places where Kursal differs from what one might expect.
   fields included; behind a pointer, reading one is a separate unsafe operation. No read through a
   pointer produces a value that holds `Never`, named types' fields included
   (`unsafe_read_cannot_produce_never`); a generic read at a `T` instantiated with one is the caller's
-  obligation (`lib/std/CONTRACTS.md`, section 2.3).
+  obligation (`lib/std/CONTRACTS.md`, section 2.3). What an extern function returns, like an unsafe
+  cast's result, holds no package, brand witness, safe function value, transform or `Never` (a result
+  of `!` itself is a function that does not return), and no enum or `NonNull`, whose layout C cannot
+  know (`extern_result_cannot_produce`, `extern_result_layout_chosen`); an `unsafe fn` value may come
+  back (`lib/std/CONTRACTS.md`, section 2.0c).
 - **Generic code over linear types.** A type parameter may stand for a linear type unless a premise
   says `Copy[T]`. Using a value twice, or dropping it on one path (`a && b` drops `b` when `a` is
   false), needs `Copy[T]`. The arena collections (`ArenaVec`, `ArenaMap`, `ArenaSet`, `List`) require

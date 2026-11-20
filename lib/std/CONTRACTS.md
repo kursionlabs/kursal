@@ -206,6 +206,21 @@ An extern that can `longjmp`, throw, or resume from a handler into its
 caller is not made safe by this library's vocabulary or by an `unsafe`
 marker.
 
+**What an extern hands back is checked like a cast's result.** C's bytes
+become the result of an `extern "C"` function, or the value of a KURS
+`extern value`, with no Kursal code making them, as an unsafe cast's bytes
+become its result. So the checker rejects such a result or value that holds,
+anywhere in its value (named types' fields included, not behind a pointer),
+what only checked code makes: a package, a brand witness, a safe function
+value, a transform, or `Never` (`extern_result_cannot_produce`; a result of
+`!` itself declares a function that does not return, as `abort` and `exit`
+are declared). It also rejects one that holds an enum or a `NonNull`
+(`extern_result_layout_chosen`): their layout is the compiler's choice, which
+C cannot know, and a `NonNull` from C may be null. An `unsafe fn` value may
+come back, since calling it needs `unsafe`. Parameters are not restricted
+this way: what Kursal hands C was made by checked code. The library's own
+externs return integers, floats, raw pointers, `()` and `!`.
+
 ### 2.0d Lending a raw pointer's target
 
 `f(unsafe &*p)` lends the memory behind a raw pointer `p: *T` to a place

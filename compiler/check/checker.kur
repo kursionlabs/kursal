@@ -216,6 +216,21 @@ fn contains(&cx: Domain!['k], types: Types['k], ty: Type['k], holds: closure[Env
     }
 }
 
+// What only checked code makes, and foreign code never hands the program: a package, a brand
+// witness, a safe function value, a transform, or Never. An `unsafe fn` value may come from C:
+// calling it needs `unsafe`.
+forall 'k.
+fn checked_only(t: Type['k]) -> bool {
+    match t {
+        Type::Exists(_binders, _body) => true,
+        Type::Brand(_brand) => true,
+        Type::Foreach(_f) => true,
+        Type::Never => true,
+        Type::Fn(f) => !f.is_unsafe,
+        _ => false,
+    }
+}
+
 forall 'k.
 fn is_never(t: Type['k]) -> bool {
     match t {
@@ -746,6 +761,12 @@ impl Checker['k] {
                     Option::Some(ty) => self.has_memory_form(&cx, ty),
                     Option::None => (),
                 },
+            };
+            let unit = match ext.ret {
+                Option::Some(ty) => if !is_never(ty) {
+                    self.foreign_result(&cx, ty);
+                },
+                Option::None => (),
             };
             e = e + 1usize;
         }
@@ -2251,6 +2272,19 @@ impl Checker['k] {
         }
         let sub = self.instantiate(&cx, fun.params, fun.premises, instr.tys);
         C::fn_type(&cx, subst_all(&cx, fun.ptypes, sub, self.counter), subst(&cx, fun.ret, sub, self.counter), retained, fun.is_unsafe, fun.places(&cx))
+    }
+
+    // What foreign code hands the program, an extern function's result or an extern value, is
+    // reinterpreted from C's bytes as an unsafe cast's result is: it holds nothing only checked code
+    // makes (`checked_only`; a result of `!` itself says the function does not return), and no enum
+    // or `NonNull`, whose layout the compiler chooses.
+    fn foreign_result(self, &cx: Domain!['k], ty: Type['k]) {
+        if contains(&cx, self.types, ty, |&cx, t: Type['k]| checked_only(t)) {
+            self.fail(&cx, "extern_result_cannot_produce");
+        }
+        if self.types.chosen_layout(&cx, ty) {
+            self.fail(&cx, "extern_result_layout_chosen");
+        }
     }
 
     // A zero-size type is erased: it has no C object and no C value, and `sizeof` of one is 0. A load
