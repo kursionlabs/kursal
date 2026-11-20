@@ -24,6 +24,9 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <sys/random.h>
+#endif
 
 extern char **environ;
 
@@ -492,6 +495,12 @@ uintptr_t kur_libc_process_cpus(void) {
     return n < 1 ? 1 : (uintptr_t)n;
 }
 
+/* The process's hash seed, which `kur_libc_process_start` draws from the
+ * operating system before any Kursal code runs and nothing changes after,
+ * so threads read it without a lock. */
+static uint64_t hash_seed[2];
+static int hash_seed_drawn;
+
 /* Readies the process for an executable's Kursal code; the C `main` the
  * compiler writes for `kursal build` calls it before anything else. Each of
  * the standard descriptors 0, 1 and 2 the process started without is opened
@@ -500,7 +509,9 @@ uintptr_t kur_libc_process_cpus(void) {
  * streams; the process aborts when one cannot be opened. SIGPIPE is ignored,
  * so a write to a closed pipe fails with EPIPE, which the output functions
  * return, instead of ending the process (`kur_libc_process_spawn` gives
- * children the default back). */
+ * children the default back). The hash seed's 16 bytes are drawn with
+ * `getentropy`; the process aborts when the operating system has none to
+ * give. */
 void kur_libc_process_start(void) {
     for (int fd = 0; fd < 3; fd++) {
         if (fcntl(fd, F_GETFD) == -1 && errno == EBADF) {
@@ -509,6 +520,20 @@ void kur_libc_process_start(void) {
         }
     }
     signal(SIGPIPE, SIG_IGN);
+    if (getentropy(hash_seed, sizeof hash_seed) != 0) abort();
+    hash_seed_drawn = 1;
+}
+
+/* Word `word` (0 or 1) of the process's hash seed, `std::process::hash_seed`.
+ * The process aborts, saying why, when `kur_libc_process_start` has not
+ * drawn the seed: a program whose C `main` is not the one `kursal build`
+ * writes calls it first. */
+uint64_t kur_libc_process_hash_seed(uint32_t word) {
+    if (!hash_seed_drawn) {
+        fputs("error: the hash seed is read before kur_libc_process_start drew it\n", stderr);
+        abort();
+    }
+    return hash_seed[word & 1u];
 }
 
 /* Reports the `std::io::Error` an executable's entry returned, its errno

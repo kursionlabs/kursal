@@ -184,8 +184,9 @@ The library's own externs satisfy it:
   starts the child with `posix_spawnp` (no library code runs in the
   child), `_wait`, which waits for it, again when a signal interrupts the
   wait, `_kill` and `_signal` (`kill(2)`), `_poll`, which waits for one of
-  two pipes to be readable, again after a signal, and `_cpus`, which counts
-  the processors of the affinity mask;
+  two pipes to be readable, again after a signal, `_cpus`, which counts
+  the processors of the affinity mask, and `_hash_seed`, which reads the
+  seed start-up drew (and aborts if it drew none);
 - `std::time`: `fs.c`'s `kur_libc_time_monotonic`, which reads the host's
   `CLOCK_MONOTONIC` (and aborts where it has none), and
   `kur_libc_time_sleep`, which sleeps on after a signal; `std::float`:
@@ -263,7 +264,6 @@ double free.
 | `core::cstr::cstr_len` | the pointer addresses a NUL-terminated byte run; there is no length to bound the scan |
 | `core::cstr::CStr::from_raw` | `ptr` names a NUL-terminated byte run that stays readable and unchanged for the rest of the process, as `argv` entries do: a `CStr` is `Copy` and carries no brand, so nothing ends its use earlier |
 | `std::fs::is_dot` | `name` addresses a live NUL-terminated string (a directory entry's name, read before the next read or close of its directory) |
-| `core::hash::HashState::write_bytes` | `ptr[0..len)` is readable for the whole call |
 | `core::fmt::Writable::write_raw` (and its instances) | `ptr[0..len)` is readable for the whole call; the writer reads the bytes before returning and keeps no pointer to them |
 | `alloc::buffer::Buffer!::push_n` | `src[0..count)` is readable and does not alias the buffer's own storage, which the growth on entry may reallocate |
 | `std::io::write_all` | `ptr[0..len)` is readable, and `fd` is a descriptor the caller may write: standard output or error, or one a `File!` it holds owns |
@@ -591,9 +591,8 @@ that restricting a type costs nothing: it only sees the code it is run on.
   `Slice` and a position; every read is checked whatever the position),
   `core::slice::Readable` (a capability and a view), `core::borrow::
   Borrowed!` and `NoCap`, `std::fs::DirEntry!` (an owned name and a
-  flag), `std::fs::Metadata`, `std::time::Duration`, and `core::fmt::CountingWriter`, `alloc::fmt::Full`,
-  `core::hash::HashState`. Taking one apart gives back only parts the
-  builder held.
+  flag), `std::fs::Metadata`, `std::time::Duration`, `core::fmt::CountingWriter` and `alloc::fmt::Full`.
+  Taking one apart gives back only parts the builder held.
 - **`core::iter`'s `Range`, `Pair`, `Map`, `Filter`, `Zip`, `Enumerate`,
   `Take`, `Skip`, `TakeWhile` and `Chain`.** Plain adapter state over an
   inner iterator.

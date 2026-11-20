@@ -38,6 +38,7 @@ int32_t kur_libc_process_signal(int64_t pid, int32_t signal);
 int32_t kur_libc_process_poll(int32_t a, int32_t b);
 uintptr_t kur_libc_process_cpus(void);
 void kur_libc_process_start(void);
+uint64_t kur_libc_process_hash_seed(uint32_t word);
 void kur_libc_process_report_error(int32_t code);
 uint64_t kur_libc_time_monotonic(void);
 void kur_libc_time_sleep(uint64_t nanos);

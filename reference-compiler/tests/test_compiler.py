@@ -2000,7 +2000,7 @@ class CompilerTests(unittest.TestCase):
         nothing: `kursal build` writes the reference's C."""
         sources = (
             "fn main() -> i32 { var v = OwnedVec!::new[()](); v = v.push(()); v.free(); 0 }\n",
-            "fn main() -> i32 { var m = OwnedMap!::new[u32, ()](); let old = &m.insert(1u32, ()); m.free(); 0 }\n",
+            "fn main() -> i32 { var m = OwnedMap!::new[u32, ()](std::process::hash_seed()); let old = &m.insert(1u32, ()); m.free(); 0 }\n",
             "fn main() -> i32 { let o = Owned!::new(()); o.into_value(); 0 }\n",
             "forall T. fn boxed(x: T) -> T { Owned!::new(x).into_value() }\nfn main() -> i32 { boxed(()); 0 }\n",
         )

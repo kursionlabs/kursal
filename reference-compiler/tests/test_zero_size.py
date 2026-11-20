@@ -135,7 +135,7 @@ class ZeroSizeTests(unittest.TestCase):
                 key.destroy()
             }
             fn main() -> i32 {
-                var set = OwnedMap!::new[Buffer!, ()]();
+                var set = OwnedMap!::new[Buffer!, ()](std::process::hash_seed());
                 var i = 0u64;
                 var again = 0u32;
                 while i < 200 {
@@ -151,7 +151,7 @@ class ZeroSizeTests(unittest.TestCase):
                 &set.each_in(&visited, |&key, &unit, &count| { count = count + 1usize; });
                 let size = &set.len();
                 set.destroy(drop_key);
-                var numbers = OwnedMap!::new[u32, ()]();
+                var numbers = OwnedMap!::new[u32, ()](std::process::hash_seed());
                 var n = 0u32;
                 while n < 1000 {
                     let old = &numbers.insert(n * 3, ());
@@ -236,7 +236,7 @@ class ZeroSizeTests(unittest.TestCase):
                 let exists 'y. (tag, vec, out) = vec.pop(tag);
                 let left = &vec.len(&tag);
                 vec.free(tag);
-                let exists 'h. (tag, map) = HashMap!::new[u32, ()]();
+                let exists 'h. (tag, map) = HashMap!::new[u32, ()](std::process::hash_seed());
                 let exists 'i. (tag, map, old) = map.insert(tag, 1u32, ());
                 var one = 1u32;
                 let present = &map.contains(&tag, &one);
@@ -256,7 +256,7 @@ class ZeroSizeTests(unittest.TestCase):
             use std::mem::Ref;
             use std::option::Option;
             fn main() -> i32 {
-                let exists 'a. cx = Domain!::new();
+                let exists 'a. cx = Domain!::new(std::process::hash_seed());
                 let unit = Ref::new(&cx, ());
                 let copied = unit.copy(&cx);
                 let units: ArenaVec[(), 'a] = ArenaVec::new(&cx);
@@ -316,7 +316,7 @@ class ZeroSizeTests(unittest.TestCase):
                 let { brand: read, unit: u1 } = unsafe *p;
                 let boxed = Owned!::new(Witness.{ brand: read, unit: () });
                 let { brand: unboxed, unit: u2 } = boxed.into_value();
-                let exists 'a. cx = Domain!::new();
+                let exists 'a. cx = Domain!::new(std::process::hash_seed());
                 let held = Ref::new(&cx, Witness.{ brand: unboxed, unit: () });
                 let { brand: again, unit: u3 } = held.copy(&cx);
                 cx.destroy();

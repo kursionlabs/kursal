@@ -475,22 +475,43 @@ fn rfind_byte(&cx: C, bytes: S, needle: u8) -> Option[usize] {
     found
 }
 
-/// Feeds a byte view's contents into `state`, byte by byte.
+/// Writes a byte view into `state` (`core::hash`'s encoding of a byte
+/// string): its length, then its bytes eight to a word, little-endian, the
+/// last word padded with zeros.
 forall C, S where ReadBytes[C, S], Copy[S].
 fn hash_bytes(&cx: C, bytes: S, state: HashState) -> HashState {
     let n = ReadBytes[C, S]::len(&cx, bytes);
-    var s = state;
+    var s = state.write_u64(n as u64);
     var i = 0usize;
-    while i < n {
-        let b = ReadBytes[C, S]::get(&cx, bytes, i);
-        let next = match b {
-            Option::Some(x) => s.write_u8(x),
-            Option::None => s,
-        };
-        s = next;
-        i = i + 1usize;
+    while n - i >= 8usize {
+        s = s.write_u64(word8(&cx, bytes, i));
+        i = i + 8usize;
+    }
+    if i < n {
+        var word = 0u64;
+        var k = 0usize;
+        while i + k < n {
+            word = word | (byte_word(&cx, bytes, i + k) << ((k * 8usize) as u64));
+            k = k + 1usize;
+        }
+        s = s.write_u64(word);
     }
     s
+}
+
+/// Byte `i` of a byte view as a word (`byte_or_zero`).
+forall C, S where ReadBytes[C, S], Copy[S].
+fn byte_word(&cx: C, bytes: S, i: usize) -> u64 {
+    byte_or_zero(&cx, bytes, i) as u64
+}
+
+/// Bytes `i..i + 8` of a byte view as a little-endian word.
+forall C, S where ReadBytes[C, S], Copy[S].
+fn word8(&cx: C, bytes: S, i: usize) -> u64 {
+    byte_word(&cx, bytes, i) | (byte_word(&cx, bytes, i + 1usize) << 8u64)
+        | (byte_word(&cx, bytes, i + 2usize) << 16u64) | (byte_word(&cx, bytes, i + 3usize) << 24u64)
+        | (byte_word(&cx, bytes, i + 4usize) << 32u64) | (byte_word(&cx, bytes, i + 5usize) << 40u64)
+        | (byte_word(&cx, bytes, i + 6usize) << 48u64) | (byte_word(&cx, bytes, i + 7usize) << 56u64)
 }
 
 // ------------------------------------------------------------ byte views --
@@ -577,13 +598,6 @@ impl Slice[u8, 'k] {
     forall C where ReadBytes[C, Slice[u8, 'k]].
     fn rfind_byte(self, &cx: C, byte: u8) -> Option[usize] {
         rfind_byte(&cx, self, byte)
-    }
-
-    /// The bytes' hash: the state `HashIn` makes of them from a fresh
-    /// `HashState`, finished, the same as `Span::hash` of the same bytes.
-    forall C where ReadBytes[C, Slice[u8, 'k]].
-    fn hash(self, &cx: C) -> u64 {
-        hash_bytes(&cx, self, HashState::new()).finish()
     }
 }
 

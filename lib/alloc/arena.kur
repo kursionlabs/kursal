@@ -46,6 +46,7 @@ use core::raw::Span;
 use core::ptr::offset;
 use core::slice::{ReadBytes, Slice};
 use core::option::Option;
+use core::hash::Seed;
 use alloc::heap::{checked_add, checked_mul};
 
 struct Chunk {
@@ -62,13 +63,15 @@ struct Chunk {
 /// `Arena!::new` allocates, over which `'k` was minted (see the module comment
 /// for why only the root). `current` is the head of the chunk chain, and
 /// `marker` is the same brand as a value, which `alloc` needs to brand the
-/// pointers it computes.
+/// pointers it computes. `seed` is what the arena's maps hash their keys
+/// under (`ArenaMap`, `core::hash`).
 forall 'k.
 struct Arena! {
     root: Allocation![u8, 'k],
     back: RegionResume![u8, 'k],
     current: *Chunk,
     marker: Brand['k],
+    seed: Seed,
 }
 
 /// The padding that brings the address `at` up to the next multiple of
@@ -194,8 +197,8 @@ unsafe fn free_chain_after_root_release(c: *Chunk) -> () {
 
 impl Arena! {
     /// A new arena with one 4 KiB chunk, under a fresh brand, with its
-    /// capability.
-    fn new() -> exists '1. (Exclusive!['1], Arena!['1]) {
+    /// capability; the maps made in it hash their keys under `seed`.
+    fn new(seed: Seed) -> exists '1. (Exclusive!['1], Arena!['1]) {
         let z = 0usize;
         let nullchunk = unsafe (z as *Chunk);
         let cap = 4096usize;
@@ -209,7 +212,7 @@ impl Arena! {
         // computes itself.
         let (d, am) = base_ref.into_parts();
         let c = unsafe new_header(d, cap, nullchunk);
-        pack 'open1. (tag, Arena!.{ root: a, back: bk, current: c, marker: am })
+        pack 'open1. (tag, Arena!.{ root: a, back: bk, current: c, marker: am, seed })
     }
 }
 
@@ -222,6 +225,11 @@ impl Arena!['k] {
         self.marker
     }
 
+    /// The seed the arena's maps hash their keys under.
+    fn seed(&self) -> Seed {
+        self.seed
+    }
+
     /// Puts `val` in the arena and hands back a `Ref` to it.
     ///
     /// Allocates naturally aligned room for one `T`, writes `val` into it,
@@ -232,7 +240,7 @@ impl Arena!['k] {
     /// so a linear value stored here would never reach its consumer.
     forall T where Copy[T].
     fn alloc(&self, &tag: Exclusive!['k], val: T) -> Ref[T, 'k] {
-        let { root: a, back: bk, current: cur, marker: m } = self;
+        let { root: a, back: bk, current: cur, marker: m, seed } = self;
         let (cur2, target) = unsafe bump_chunk(cur, sizeof[T](), alignof[T]());
         let target_t = unsafe (target as *T);
         unsafe *target_t = val;
@@ -243,7 +251,7 @@ impl Arena!['k] {
         // than moving the root, so the result keeps the same brand `'k`
         // whether or not growth happened, and this signature needs no
         // `exists` (unlike `Vec!::push`, which may relocate its one block).
-        self = Arena!.{ root: a, back: bk, current: cur2, marker: m };
+        self = Arena!.{ root: a, back: bk, current: cur2, marker: m, seed };
         r
     }
 
@@ -256,7 +264,7 @@ impl Arena!['k] {
     /// `Copy` because `fill` is written `count` times.
     forall T where Copy[T].
     fn alloc_slice(&self, &tag: Exclusive!['k], count: usize, fill: T) -> Slice[T, 'k] {
-        let { root: a, back: bk, current: cur, marker: m } = self;
+        let { root: a, back: bk, current: cur, marker: m, seed } = self;
         let (cur2, target) = unsafe bump_chunk(cur, checked_mul(count, sizeof[T]()), alignof[T]());
         let base = unsafe (target as *T);
         var i = 0usize;
@@ -264,7 +272,7 @@ impl Arena!['k] {
             unsafe *(unsafe offset(base, i)) = fill;
             i = i + 1usize;
         }
-        self = Arena!.{ root: a, back: bk, current: cur2, marker: m };
+        self = Arena!.{ root: a, back: bk, current: cur2, marker: m, seed };
         // `count` values were just carved out of this arena's own chunk and
         // initialized; the arena's chunks are the domain `m` names.
         unsafe Slice::from_raw_parts(base, count, m)
@@ -281,7 +289,7 @@ impl Arena!['k] {
     /// frees it. No `Ref` is constructed on the path. The remaining headers
     /// and non-root buffers are freed by `free_chain_after_root_release`.
     fn destroy(self, tag: Exclusive!['k]) -> () {
-        let { root: a, back: bk, current: cur, marker: m } = self;
+        let { root: a, back: bk, current: cur, marker: m, seed } = self;
         let rg = bk.resume(tag);
         let u = a.release(rg);
         let u2 = HeapAllocator::drop(u);
@@ -295,7 +303,7 @@ impl Arena!['k] {
     /// nothing is written; the caller copies the bytes in (see `copy_bytes`).
     /// No alignment padding is added.
     unsafe fn alloc_bytes(&self, n: usize) -> *u8 {
-        let { root: a, back: bk, current: cur, marker: m } = self;
+        let { root: a, back: bk, current: cur, marker: m, seed } = self;
         let { data: d, used: u, cap: c, next: nx } = unsafe *cur;
         let fits = has_room(u, c, 0usize, n);
         let cur2 = if fits {
@@ -307,7 +315,7 @@ impl Arena!['k] {
         let target = unsafe offset(d2, u2);
         let u3 = u2 + n;
         unsafe *cur2 = Chunk.{ data: d2, used: u3, cap: c2, next: n2 };
-        self = Arena!.{ root: a, back: bk, current: cur2, marker: m };
+        self = Arena!.{ root: a, back: bk, current: cur2, marker: m, seed };
         target
     }
 }
@@ -333,6 +341,16 @@ trait Allocate {
     fn close(tag: Exclusive!['k], arena: Arena!['k], rest: R) -> Self;
 }
 
+/// The seed the arena a context lends hashes its maps' keys under
+/// (`Arena!::seed`).
+forall 'k, C, R where Allocate[C -> 'k, R].
+fn seed(&cx: C) -> Seed {
+    let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
+    let s = &arena.seed();
+    cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
+    s
+}
+
 /// An arena with the one capability for its domain: the context for code
 /// that reads, writes and allocates there (`Access`, `Allocate`), and reads
 /// spans of it (`ReadBytes`).
@@ -343,9 +361,10 @@ exposed struct Domain! {
 }
 
 impl Domain! {
-    /// A fresh, empty arena under a brand of its own.
-    fn new() -> exists 'k. Domain!['k] {
-        let exists 'k. (tag, arena) = Arena!::new();
+    /// A fresh, empty arena under a brand of its own, whose maps hash their
+    /// keys under `seed`.
+    fn new(seed: Seed) -> exists 'k. Domain!['k] {
+        let exists 'k. (tag, arena) = Arena!::new(seed);
         pack 'k. Domain!.{ tag, arena }
     }
 }

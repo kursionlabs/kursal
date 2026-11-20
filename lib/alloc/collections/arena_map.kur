@@ -12,6 +12,10 @@
 // the same context `C` that lends the domain's capability (`Access`) and,
 // to insert, the arena (`Allocate`): a key that points into the domain
 // (a span, a vec, a program's own tree) is read under that context.
+// Every map of an arena hashes under the arena's seed (`Arena!::seed`,
+// `core::hash`), which the map reads when it is made. The seed decides only
+// where keys sit in the slots: what the map lists, and in what order, is
+// the same under any seed.
 //
 // The entries are kept in insertion order in one `ArenaVec`, and the hash
 // slots, open-addressed with linear probing, hold their indices. Removing a
@@ -32,12 +36,12 @@
 
 use package as alloc;
 
-use alloc::arena::{Allocate, Domain!};
+use alloc::arena::{Allocate, Domain!, seed};
 use alloc::collections::arena_vec::ArenaVec;
 use alloc::heap::{checked_add, checked_mul};
 use core::process::trap;
 use core::cap::Access;
-use core::hash::{HashIn, key_hash};
+use core::hash::{HashIn, Seed, key_hash};
 use core::mem::Ref;
 use core::option::Option;
 use core::slice::Slice;
@@ -57,6 +61,9 @@ struct MapState {
     // Every key inserted, in insertion order; a removed one stays, dead.
     entries: ArenaVec[Entry[K, V], 'k],
     count: usize,
+    // The arena's seed (`Arena!::seed`), which every map of the arena
+    // shares, so an entry's `hash` holds in any of them (`assign`).
+    seed: Seed,
 }
 
 forall K, V.
@@ -64,14 +71,14 @@ struct Entry {
     key: K,
     value: V,
     live: bool,
-    // the low bits of `key_hash` of `key`
+    // the low bits of `key_hash` of `key` under the map's seed
     hash: u32,
 }
 
-/// The bits of a key's hash an entry keeps.
+/// The bits of a key's hash under `seed` an entry keeps.
 forall K, C where HashIn[K, C].
-fn entry_hash(&cx: C, key: K) -> u32 {
-    key_hash(&cx, key) as u32
+fn entry_hash(&cx: C, key: K, seed: Seed) -> u32 {
+    key_hash(&cx, key, seed) as u32
 }
 
 forall 'k, C, R where Access[C -> 'k, R].
@@ -95,7 +102,7 @@ impl ArenaMap[K, V, 'k] {
     /// An empty map in the context's arena.
     forall C, R where Allocate[C -> 'k, R].
     fn new(&cx: C) -> ArenaMap[K, V, 'k] {
-        let state = MapState.{ slots: Option::None, entries: ArenaVec::new(&cx), count: 0usize };
+        let state = MapState.{ slots: Option::None, entries: ArenaVec::new(&cx), count: 0usize, seed: seed(&cx) };
         ArenaMap.{ state: Ref::new(&cx, state) }
     }
 
@@ -235,7 +242,7 @@ impl ArenaMap[K, V, 'k] {
             Option::Some(s) => s,
             Option::None => return Option::None,
         };
-        let (slot, entry) = self.slot(&cx, slots, h.entries, key, entry_hash(&cx, key));
+        let (slot, entry) = self.slot(&cx, slots, h.entries, key, entry_hash(&cx, key, h.seed));
         if entry == 0usize || !h.entries.at(&cx, entry - 1usize).live {
             Option::None
         } else {
@@ -289,11 +296,11 @@ impl ArenaMap[K, V, 'k] {
             Option::Some(s) => s,
             Option::None => {
                 let fresh = slice_of_zeros(&cx, 8usize);
-                self.state.set(&cx, MapState.{ slots: Option::Some.(fresh), entries: h.entries, count: h.count });
+                self.state.set(&cx, MapState.{ slots: Option::Some.(fresh), entries: h.entries, count: h.count, seed: h.seed });
                 fresh
             },
         };
-        let hash = entry_hash(&cx, key);
+        let hash = entry_hash(&cx, key, h.seed);
         let (slot, entry) = self.slot(&cx, slots, h.entries, key, hash);
         if entry != 0usize && h.entries.at(&cx, entry - 1usize).live {
             let old = h.entries.replace(&cx, entry - 1usize, Entry.{ key, value, live: true, hash });
@@ -301,7 +308,7 @@ impl ArenaMap[K, V, 'k] {
         }
         set_slot(&cx, slots, slot, h.entries.len(&cx) + 1usize);
         h.entries.push(&cx, Entry.{ key, value, live: true, hash });
-        self.state.set(&cx, MapState.{ slots: Option::Some.(slots), entries: h.entries, count: h.count + 1usize });
+        self.state.set(&cx, MapState.{ slots: Option::Some.(slots), entries: h.entries, count: h.count + 1usize, seed: h.seed });
         if h.entries.len(&cx) * 2usize > slots.len() {
             self.grow(&cx, 0usize);
         }
@@ -339,7 +346,7 @@ impl ArenaMap[K, V, 'k] {
                 let h = self.state.copy(&cx);
                 let e = h.entries.at(&cx, i);
                 h.entries.set(&cx, i, Entry.{ key: e.key, value: e.value, live: false, hash: e.hash });
-                self.state.set(&cx, MapState.{ slots: h.slots, entries: h.entries, count: h.count - 1usize });
+                self.state.set(&cx, MapState.{ slots: h.slots, entries: h.entries, count: h.count - 1usize, seed: h.seed });
                 Option::Some.(e.value)
             },
             Option::None => Option::None,
@@ -393,7 +400,7 @@ impl ArenaMap[K, V, 'k] {
             },
             Option::None => slice_of_zeros(&cx, count),
         };
-        self.state.set(&cx, MapState.{ slots: Option::Some.(slots), entries: h.entries, count: h.count });
+        self.state.set(&cx, MapState.{ slots: Option::Some.(slots), entries: h.entries, count: h.count, seed: h.seed });
         var k = 0usize;
         while k < entries {
             let e = h.entries.at(&cx, k);
@@ -426,7 +433,7 @@ impl ArenaMap[K, V, 'k] {
                 if now.live {
                     entries.set(&cx, i, Entry.{ key: now.key, value: now.value, live: false, hash: now.hash });
                     let h = self.state.copy(&cx);
-                    self.state.set(&cx, MapState.{ slots: h.slots, entries: h.entries, count: h.count - 1usize });
+                    self.state.set(&cx, MapState.{ slots: h.slots, entries: h.entries, count: h.count - 1usize, seed: h.seed });
                 }
             }
             i = i + 1usize;
@@ -439,7 +446,7 @@ impl ArenaMap[K, V, 'k] {
         let h = self.state.copy(&cx);
         let entries: ArenaVec[Entry[K, V], 'k] = ArenaVec::new(&cx);
         if h.count == 0usize {
-            return ArenaMap.{ state: Ref::new(&cx, MapState.{ slots: Option::None, entries, count: 0usize }) };
+            return ArenaMap.{ state: Ref::new(&cx, MapState.{ slots: Option::None, entries, count: 0usize, seed: h.seed }) };
         }
         var slot_count = 8usize;
         while h.count * 2usize > slot_count {
@@ -455,7 +462,7 @@ impl ArenaMap[K, V, 'k] {
             }
             i = i + 1usize;
         }
-        ArenaMap.{ state: Ref::new(&cx, MapState.{ slots: Option::Some.(slots), entries, count: h.count }) }
+        ArenaMap.{ state: Ref::new(&cx, MapState.{ slots: Option::Some.(slots), entries, count: h.count, seed: h.seed }) }
     }
 }
 
@@ -478,7 +485,7 @@ impl ArenaMap[K, V, 'k] {
             Option::None => Option::None,
         };
         h.entries.clear(&cx);
-        self.state.set(&cx, MapState.{ slots, entries: h.entries, count: 0usize });
+        self.state.set(&cx, MapState.{ slots, entries: h.entries, count: 0usize, seed: h.seed });
     }
 
     /// Makes the map hold `other`'s live entries, in their order, in the
@@ -514,7 +521,7 @@ impl ArenaMap[K, V, 'k] {
             }
             i = i + 1usize;
         }
-        self.state.set(&cx, MapState.{ slots: Option::Some.(slots), entries: h.entries, count: from.count });
+        self.state.set(&cx, MapState.{ slots: Option::Some.(slots), entries: h.entries, count: from.count, seed: h.seed });
     }
 }
 

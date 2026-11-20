@@ -1,14 +1,36 @@
-//! Hashing and equality traits.
+//! Hashing and equality traits, and the keyed hash behind them.
 // core::hash -- hashing and equality traits for keyed collections such as
 // `alloc::collections::hashmap::HashMap!` (`Hash`, `Eq`) and
 // `alloc::collections::arena_map::ArenaMap` (`HashIn`).
+//
+// The hash is SipHash-1-3 under a 128-bit `Seed`. A key's hash is
+// SipHash-1-3, under the seed, of the key's encoding: the 64-bit words its
+// `Hash` or `HashIn` instance writes (`HashState::write_u64`), each as its 8
+// little-endian bytes. Every instance here writes an encoding that tells the
+// values of its type apart and none of which is a prefix of another's (an
+// integer or `bool` is one word; a byte string is its length, then its bytes
+// eight to a word, the last word padded with zeros; a tuple is its parts in
+// order), so two keys hash alike only where SipHash makes them: whoever does
+// not know the seed cannot choose many keys that collide, and a map fed
+// chosen keys (HashDoS) stays as fast as one fed any others. An instance of
+// a type of its own keeps this by writing its parts the same way, with a
+// word that tells its variants apart first.
+//
+// The seed is chosen by whoever makes a map, and every map takes one:
+// `HashMap!::new(seed)`, `OwnedMap!::new(seed)`, and for an arena's maps the
+// arena's (`alloc::arena::Arena!::new(seed)`). A hosted program passes the
+// process's, `std::process::hash_seed()`, which start-up draws from the
+// operating system, so it differs from one run to the next. A freestanding
+// program draws one from an entropy source of its own (`Seed::new`), or
+// picks a fixed one where no key comes from outside. A map's hash order, its
+// `each` and `drain`, follows the seed; `ArenaMap` keeps insertion order
+// whatever the seed.
 //
 // `Hash::hash` threads both the value and a running `HashState` through:
 // it takes `self` by value and hands it back (`-> (Self, HashState)`), so a
 // linear key can be hashed without being consumed. A composite key feeds
 // each of its fields through the same state in turn
-// (`state = field.hash(state)`) rather than combining per-field hashes by
-// hand.
+// (`state = field.hash(state)`).
 //
 // `Eq` is `Eq[A, B]`: the two sides may be different types. This lets
 // values that differ only in brand be compared, as
@@ -21,52 +43,97 @@
 
 use package as core;
 
-use core::raw::raw_byte_at;
+/// The 128-bit key of the hash: which of SipHash's functions every map made
+/// with it computes. Keys hash alike only under one seed, so a map hashes
+/// all its keys under the one it was made with.
+struct Seed {
+    k0: u64,
+    k1: u64,
+}
 
-/// A djb2-style multiply-add running hash. `u64` arithmetic wraps modulo
-/// 2^64. Hash quality affects only performance, never correctness. Every
-/// field is `u64`, so `HashState` is `Copy` and threads through repeated
-/// `write_*` calls by value.
-exposed struct HashState {
-    acc: u64,
+impl Seed {
+    /// The seed of the two words `k0` and `k1`: random ones, from an entropy
+    /// source, for maps that may be fed keys from outside.
+    fn new(k0: u64, k1: u64) -> Seed {
+        Seed.{ k0, k1 }
+    }
+}
+
+/// SipHash-1-3's running state: its four words, and how many words have
+/// been written. Every field is `u64`, so `HashState` is `Copy` and threads
+/// through repeated `write_u64` calls by value.
+struct HashState {
+    v0: u64,
+    v1: u64,
+    v2: u64,
+    v3: u64,
+    words: u64,
+}
+
+/// `x` rotated left by `r` bits, `0 < r < 64`.
+fn rotl(x: u64, r: u64) -> u64 {
+    (x << r) | (x >> (64u64 - r))
 }
 
 impl HashState {
-    /// A fresh state, before anything is mixed in.
-    fn new() -> HashState {
-        HashState.{ acc: 5381u64 }
-    }
-    /// The state with byte `b` mixed in.
-    fn write_u8(self, b: u8) -> HashState {
-        HashState.{ acc: (self.acc * 33u64) + (b as u64) }
-    }
-    /// The state with `v` mixed in.
-    fn write_u64(self, v: u64) -> HashState {
-        HashState.{ acc: (self.acc * 1000003u64) + v }
-    }
-    /// Mixes in every byte of `ptr[0..len)` in order. A plain loop, since
-    /// this is the hot path of every keyed collection. `unsafe`:
-    /// `ptr[0..len)` must be readable for the whole call.
-    unsafe fn write_bytes(self, ptr: *u8, len: usize) -> HashState {
-        var s = self;
-        var i = 0usize;
-        while i < len {
-            s = s.write_u8(unsafe raw_byte_at(ptr, len, i));
-            i = i + 1usize;
+    /// A fresh state under `seed`, before anything is written.
+    fn new(seed: Seed) -> HashState {
+        let { k0, k1 } = seed;
+        HashState.{
+            v0: k0 ^ 0x736f_6d65_7073_6575u64,
+            v1: k1 ^ 0x646f_7261_6e64_6f6du64,
+            v2: k0 ^ 0x6c79_6765_6e65_7261u64,
+            v3: k1 ^ 0x7465_6462_7974_6573u64,
+            words: 0u64,
         }
-        s
     }
-    /// The hash of everything mixed in so far.
+
+    /// One SipRound. `u64` arithmetic wraps modulo 2^64.
+    fn round(self) -> HashState {
+        let { v0, v1, v2, v3, words } = self;
+        let v0 = v0 + v1;
+        let v1 = rotl(v1, 13u64) ^ v0;
+        let v0 = rotl(v0, 32u64);
+        let v2 = v2 + v3;
+        let v3 = rotl(v3, 16u64) ^ v2;
+        let v0 = v0 + v3;
+        let v3 = rotl(v3, 21u64) ^ v0;
+        let v2 = v2 + v1;
+        let v1 = rotl(v1, 17u64) ^ v2;
+        let v2 = rotl(v2, 32u64);
+        HashState.{ v0, v1, v2, v3, words }
+    }
+
+    /// The state with the word `m` compressed in: one SipRound.
+    fn compress(self, m: u64) -> HashState {
+        let { v0, v1, v2, v3, words } = self;
+        let { v0, v1, v2, v3, words } = HashState.{ v0, v1, v2, v3: v3 ^ m, words }.round();
+        HashState.{ v0: v0 ^ m, v1, v2, v3, words }
+    }
+
+    /// The state with the word `v` written: the next 8 bytes of the
+    /// encoding.
+    fn write_u64(self, v: u64) -> HashState {
+        let { v0, v1, v2, v3, words } = self.compress(v);
+        HashState.{ v0, v1, v2, v3, words: words + 1u64 }
+    }
+
+    /// The hash of everything written: SipHash-1-3's last block, which
+    /// holds the encoding's length in bytes (8 per word) modulo 256 in its
+    /// top byte, then its three finishing rounds.
     fn finish(self) -> u64 {
-        self.acc
+        let { v0, v1, v2, v3, words } = self.compress(self.words << 59u64);
+        let s = HashState.{ v0, v1, v2: v2 ^ 0xffu64, v3, words }.round().round().round();
+        let { v0, v1, v2, v3, words } = s;
+        v0 ^ v1 ^ v2 ^ v3
     }
 }
 
-/// Hashing: a value feeds itself into a running `HashState` and is handed
-/// back, so a linear key is not consumed.
+/// Hashing: a value writes its encoding into a running `HashState` and is
+/// handed back, so a linear key is not consumed.
 forall Self.
 trait Hash {
-    /// The state with `self` mixed in, and `self` handed back.
+    /// The state with `self` written, and `self` handed back.
     fn hash(self: Self, state: HashState) -> (Self, HashState);
 }
 
@@ -86,17 +153,16 @@ trait Eq {
 /// primitive and tuple ones are at the end of this module.
 forall K, C.
 trait HashIn {
-    /// The state with `key` mixed in, its bytes read through `cx`.
+    /// The state with `key` written, its bytes read through `cx`.
     fn hash_in(&cx: C, key: K, state: HashState) -> HashState;
     /// Whether `a` equals `b`, their bytes read through `cx`.
     fn eq_in(&cx: C, a: K, b: K) -> bool;
 }
 
-/// A key's hash under `HashIn`, from a fresh state and mixed, so that keys
-/// differing in a few low bits spread over all of them.
+/// A key's hash under `HashIn` and `seed`.
 forall K, C where HashIn[K, C].
-fn key_hash(&cx: C, key: K) -> u64 {
-    mix(HashIn[K, C]::hash_in(&cx, key, HashState::new()).finish())
+fn key_hash(&cx: C, key: K, seed: Seed) -> u64 {
+    HashIn[K, C]::hash_in(&cx, key, HashState::new(seed)).finish()
 }
 
 /// Whether two keys are equal under `HashIn`.
@@ -105,22 +171,9 @@ fn key_eq(&cx: C, a: K, b: K) -> bool {
     HashIn[K, C]::eq_in(&cx, a, b)
 }
 
-/// The bits of `x` spread over the whole word (a 64-bit finalizer).
-fn mix(x: u64) -> u64 {
-    let x = (x ^ (x >> 33u64)) * 18397679294719823053u64;
-    let x = (x ^ (x >> 33u64)) * 14181476777654086739u64;
-    x ^ (x >> 33u64)
-}
-
-/// One hash of a hash `h` so far and the hash `x` of the next part: how a
-/// key hashed by its parts, in order, builds its own.
-fn combine(h: u64, x: u64) -> u64 {
-    mix(h * 31u64 + x)
-}
-
-// The primitive instances. Every integer hashes as its 64-bit value (a
-// signed one by its two's-complement bits), so equal values hash equally
-// whatever their width.
+// The primitive instances. Every integer writes its 64-bit value (a signed
+// one by its two's-complement bits), so equal values hash equally whatever
+// their width; `bool` writes 0 or 1.
 instance Hash[u8] {
     fn hash(self: u8, state: HashState) -> (u8, HashState) {
         (self, state.write_u64((self as u64)))
@@ -243,8 +296,7 @@ instance Eq[isize, isize] {
 
 instance Hash[bool] {
     fn hash(self: bool, state: HashState) -> (bool, HashState) {
-        let byte = if self { 1u8 } else { 0u8 };
-        (self, state.write_u8(byte))
+        (self, state.write_u64(if self { 1u64 } else { 0u64 }))
     }
 }
 
@@ -408,7 +460,7 @@ instance HashIn[isize, C] {
 forall C.
 instance HashIn[bool, C] {
     fn hash_in(&cx: C, key: bool, state: HashState) -> HashState {
-        state.write_u8(if key { 1u8 } else { 0u8 })
+        state.write_u64(if key { 1u64 } else { 0u64 })
     }
 
     fn eq_in(&cx: C, a: bool, b: bool) -> bool {

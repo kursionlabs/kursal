@@ -2,13 +2,14 @@
 // exposure and logical shape.
 
 use package::support::base::fail;
-use std::hash::{combine, key_eq};
+use std::hash::{HashState, key_eq};
 use std::cmp::Order;
 use std::collections::arena_vec::ArenaVec;
 use std::collections::arena_map::{ArenaMap, ArenaSet};
 use std::mem::Ref;
 use std::raw::Span;
-use std::arena::Domain!;
+use std::slice::hash_bytes;
+use std::arena::{Domain!, seed};
 use std::buffer::Buffer!;
 use package::kurs::core::{Exposure, ExposureMode, FnType, ForeachType, Kind, Member, ModuleId, Param, Premise, Program, Type, TypeDecl};
 use package::kurs::core as C;
@@ -820,47 +821,52 @@ fn equal_in(&cx: Domain!['k], a: Type['k], b: Type['k], env: Alpha['k]) -> bool 
     }
 }
 
-// A hash that `equal` types share: their structure, leaving out every name a binder may rename
-// (a brand, a type without arguments, a binder).
+// A hash that `equal` types share, under the arena's seed: their structure, leaving out every name
+// a binder may rename (a brand, a type without arguments, a binder).
 forall 'k.
-fn alpha_hash(&cx: Domain!['k], t: Type['k]) -> u64 {
+fn alpha_hashes(&cx: Domain!['k], ts: ArenaVec[Type['k], 'k]) -> u64 {
+    alpha_types(&cx, HashState::new(seed(&cx)), ts).finish()
+}
+
+forall 'k.
+fn alpha_hash(&cx: Domain!['k], t: Type['k], state: HashState) -> HashState {
     match t {
-        Type::Prim(x) => combine(1u64, x.hash(&cx)),
-        Type::Named(x, xs) => if xs.is_empty(&cx) { 3u64 } else { alpha_hashes(&cx, combine(3u64, x.hash(&cx)), xs) },
-        Type::Struct(ms) => alpha_members(&cx, 4u64, ms),
-        Type::Enum(ms) => alpha_members(&cx, 5u64, ms),
-        Type::Tuple(xs) => alpha_hashes(&cx, 6u64, xs),
-        Type::Array(x, n) => combine(combine(7u64, alpha_hash(&cx, x.copy(&cx))), n),
-        Type::Ptr(x) => combine(8u64, alpha_hash(&cx, x.copy(&cx))),
-        Type::Brand(x) => combine(10u64, alpha_hash(&cx, x.copy(&cx))),
-        Type::Exists(xs, x) => combine(combine(11u64, xs.len(&cx) as u64), alpha_hash(&cx, x.copy(&cx))),
-        Type::Foreach(f) => combine(combine(12u64, alpha_hash(&cx, f.source.copy(&cx))), alpha_hash(&cx, f.body.copy(&cx))),
-        Type::Fn(f) => combine(alpha_hashes(&cx, 13u64, f.params), alpha_hash(&cx, f.ret.copy(&cx))),
-        Type::NonNull(x) => combine(16u64, alpha_hash(&cx, x.copy(&cx))),
-        _ => type_tag(t) as u64,
+        Type::Prim(x) => hash_bytes(&cx, x, state.write_u64(1u64)),
+        Type::Named(x, xs) => if xs.is_empty(&cx) { state.write_u64(3u64) } else { alpha_types(&cx, hash_bytes(&cx, x, state.write_u64(3u64)), xs) },
+        Type::Struct(ms) => alpha_members(&cx, state.write_u64(4u64), ms),
+        Type::Enum(ms) => alpha_members(&cx, state.write_u64(5u64), ms),
+        Type::Tuple(xs) => alpha_types(&cx, state.write_u64(6u64), xs),
+        Type::Array(x, n) => alpha_hash(&cx, x.copy(&cx), state.write_u64(7u64)).write_u64(n),
+        Type::Ptr(x) => alpha_hash(&cx, x.copy(&cx), state.write_u64(8u64)),
+        Type::Brand(x) => alpha_hash(&cx, x.copy(&cx), state.write_u64(10u64)),
+        Type::Exists(xs, x) => alpha_hash(&cx, x.copy(&cx), state.write_u64(11u64).write_u64(xs.len(&cx) as u64)),
+        Type::Foreach(f) => alpha_hash(&cx, f.body.copy(&cx), alpha_hash(&cx, f.source.copy(&cx), state.write_u64(12u64))),
+        Type::Fn(f) => alpha_hash(&cx, f.ret.copy(&cx), alpha_types(&cx, state.write_u64(13u64), f.params)),
+        Type::NonNull(x) => alpha_hash(&cx, x.copy(&cx), state.write_u64(16u64)),
+        _ => state.write_u64(type_tag(t) as u64),
     }
 }
 
 forall 'k.
-fn alpha_hashes(&cx: Domain!['k], h: u64, ts: ArenaVec[Type['k], 'k]) -> u64 {
-    var h = h;
+fn alpha_types(&cx: Domain!['k], state: HashState, ts: ArenaVec[Type['k], 'k]) -> HashState {
+    var state = state.write_u64(ts.len(&cx) as u64);
     var i = 0usize;
     while i < ts.len(&cx) {
-        h = combine(h, alpha_hash(&cx, ts.at(&cx, i)));
+        state = alpha_hash(&cx, ts.at(&cx, i), state);
         i = i + 1usize;
     }
-    h
+    state
 }
 
 forall 'k.
-fn alpha_members(&cx: Domain!['k], h: u64, ms: ArenaVec[Member['k], 'k]) -> u64 {
-    var h = h;
+fn alpha_members(&cx: Domain!['k], state: HashState, ms: ArenaVec[Member['k], 'k]) -> HashState {
+    var state = state.write_u64(ms.len(&cx) as u64);
     var i = 0usize;
     while i < ms.len(&cx) {
-        h = combine(combine(h, ms.at(&cx, i).name.hash(&cx)), alpha_hash(&cx, ms.at(&cx, i).type));
+        state = alpha_hash(&cx, ms.at(&cx, i).type, hash_bytes(&cx, ms.at(&cx, i).name, state));
         i = i + 1usize;
     }
-    h
+    state
 }
 
 // The parameters have the same kinds, in order.

@@ -113,7 +113,7 @@ fn table(&cx: Domain!['k], out: Buffer!, t: ArenaMap[Span['k], TomlValue['k], 'k
 }
 
 fn main() -> i32 {
-    let exists 'k. cx = Domain!::new();
+    let exists 'k. cx = Domain!::new(std::process::hash_seed());
     var cx = cx;
     let input = match read_all_stdin() {
         Result::Ok(b) => b,

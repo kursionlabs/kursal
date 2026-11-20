@@ -4,7 +4,6 @@
 // declarations and renames binders, lives in `types`. An inference variable (`Meta`) is a type
 // too, compared by identity; checked programs contain none.
 
-use std::hash::{combine, key_hash};
 use std::collections::arena_vec::ArenaVec;
 use std::collections::arena_map::ArenaMap;
 use std::mem::Ref;
@@ -12,7 +11,7 @@ use std::raw::Span;
 use std::arena::Domain!;
 use package::kurs::sexpr::Form;
 use std::hash::{HashIn, HashState};
-use std::slice::Slice;
+use std::slice::{Slice, hash_bytes};
 use package::syntax::ast::Pos;
 use std::option::Option;
 
@@ -428,69 +427,72 @@ fn same(&cx: Domain!['k], a: Type['k], b: Type['k]) -> bool {
     }
 }
 
+// A type's hash writes its structure into the state, in the encoding of `std::hash`: each variant's
+// tag first, a vec its length first.
 forall 'k.
-fn hash_types(&cx: Domain!['k], h: u64, ts: ArenaVec[Type['k], 'k]) -> u64 {
-    var h = h;
+fn hash_types(&cx: Domain!['k], state: HashState, ts: ArenaVec[Type['k], 'k]) -> HashState {
+    var state = state.write_u64(ts.len(&cx) as u64);
     var i = 0usize;
     while i < ts.len(&cx) {
-        h = combine(h, hash(&cx, ts.at(&cx, i)));
+        state = hash(&cx, ts.at(&cx, i), state);
         i = i + 1usize;
     }
-    h
+    state
 }
 
 // A name's part of a type's hash: its length and at most its last 8 bytes, where names that differ
-// mostly do (`a::b::Vec!`, `a::b::Map`), so hashing a type costs little for each name it holds.
+// mostly do (`a::b::Vec!`, `a::b::Map`), so hashing a type costs little for each name it holds. Names
+// alike in both collide whatever the seed; the names are the program's own, so only the program being
+// built can slow its build down that way.
 forall 'k.
-fn name_hash(&cx: Domain!['k], name: Span['k]) -> u64 {
+fn name_hash(&cx: Domain!['k], name: Span['k], state: HashState) -> HashState {
     let n = name.len();
-    var h = n as u64;
+    var word = 0u64;
     var i = if n > 8usize { n - 8usize } else { 0usize };
     while i < n {
-        h = h * 257u64 + (name.byte_or_zero(&cx, i) as u64);
+        word = (word << 8u64) | (name.byte_or_zero(&cx, i) as u64);
         i = i + 1usize;
     }
-    h
+    state.write_u64(n as u64).write_u64(word)
 }
 
 forall 'k.
-fn hash_members(&cx: Domain!['k], h: u64, ms: ArenaVec[Member['k], 'k]) -> u64 {
-    var h = h;
+fn hash_members(&cx: Domain!['k], state: HashState, ms: ArenaVec[Member['k], 'k]) -> HashState {
+    var state = state.write_u64(ms.len(&cx) as u64);
     var i = 0usize;
     while i < ms.len(&cx) {
-        h = combine(combine(h, name_hash(&cx, ms.at(&cx, i).name)), hash(&cx, ms.at(&cx, i).type));
+        state = hash(&cx, ms.at(&cx, i).type, name_hash(&cx, ms.at(&cx, i).name, state));
         i = i + 1usize;
     }
-    h
+    state
 }
 
 forall 'k.
-fn hash(&cx: Domain!['k], t: Type['k]) -> u64 {
+fn hash(&cx: Domain!['k], t: Type['k], state: HashState) -> HashState {
     match t {
-        Type::Prim(x) => combine(1u64, name_hash(&cx, x)),
-        Type::Never => 2u64,
-        Type::Named(x, xs) => hash_types(&cx, combine(3u64, name_hash(&cx, x)), xs),
-        Type::Struct(xs) => hash_members(&cx, 4u64, xs),
-        Type::Enum(xs) => hash_members(&cx, 5u64, xs),
-        Type::Tuple(xs) => hash_types(&cx, 6u64, xs),
-        Type::Array(x, n) => combine(combine(7u64, hash(&cx, x.copy(&cx))), n),
-        Type::Ptr(x) => combine(8u64, hash(&cx, x.copy(&cx))),
-        Type::Skolem(x) => combine(9u64, name_hash(&cx, x)),
-        Type::Brand(x) => combine(10u64, hash(&cx, x.copy(&cx))),
-        Type::Exists(xs, x) => combine(combine(11u64, key_hash(&cx, xs)), hash(&cx, x.copy(&cx))),
-        Type::Foreach(x) => combine(combine(12u64, name_hash(&cx, x.binder)), combine(hash(&cx, x.source.copy(&cx)), hash(&cx, x.body.copy(&cx)))),
-        Type::Fn(x) => combine(hash_types(&cx, 13u64, x.params), hash(&cx, x.ret.copy(&cx))),
-        Type::Ignored => 14u64,
-        Type::Meta(x) => combine(15u64, x.id() as u64),
-        Type::NonNull(x) => combine(16u64, hash(&cx, x.copy(&cx))),
+        Type::Prim(x) => name_hash(&cx, x, state.write_u64(1u64)),
+        Type::Never => state.write_u64(2u64),
+        Type::Named(x, xs) => hash_types(&cx, name_hash(&cx, x, state.write_u64(3u64)), xs),
+        Type::Struct(xs) => hash_members(&cx, state.write_u64(4u64), xs),
+        Type::Enum(xs) => hash_members(&cx, state.write_u64(5u64), xs),
+        Type::Tuple(xs) => hash_types(&cx, state.write_u64(6u64), xs),
+        Type::Array(x, n) => hash(&cx, x.copy(&cx), state.write_u64(7u64)).write_u64(n),
+        Type::Ptr(x) => hash(&cx, x.copy(&cx), state.write_u64(8u64)),
+        Type::Skolem(x) => name_hash(&cx, x, state.write_u64(9u64)),
+        Type::Brand(x) => hash(&cx, x.copy(&cx), state.write_u64(10u64)),
+        Type::Exists(xs, x) => hash(&cx, x.copy(&cx), HashIn[ArenaVec[Span['k], 'k], Domain!['k]]::hash_in(&cx, xs, state.write_u64(11u64))),
+        Type::Foreach(x) => hash(&cx, x.body.copy(&cx), hash(&cx, x.source.copy(&cx), name_hash(&cx, x.binder, state.write_u64(12u64)))),
+        Type::Fn(x) => hash(&cx, x.ret.copy(&cx), hash_types(&cx, state.write_u64(13u64), x.params)),
+        Type::Ignored => state.write_u64(14u64),
+        Type::Meta(x) => state.write_u64(15u64).write_u64(x.id() as u64),
+        Type::NonNull(x) => hash(&cx, x.copy(&cx), state.write_u64(16u64)),
     }
 }
 
 forall 'k.
 instance HashIn[Type['k], Domain!['k]] {
     fn hash_in(&cx: Domain!['k], key: Type['k], state: HashState) -> HashState {
-        let h = hash(&cx, key);
-        state.write_u64(h)
+        hash(&cx, key, state)
     }
 
     fn eq_in(&cx: Domain!['k], a: Type['k], b: Type['k]) -> bool {
@@ -502,8 +504,7 @@ instance HashIn[Type['k], Domain!['k]] {
 forall 'k.
 instance HashIn[Param['k], Domain!['k]] {
     fn hash_in(&cx: Domain!['k], key: Param['k], state: HashState) -> HashState {
-        let h = combine(key.name.hash(&cx), kind_index(key.kind) as u64);
-        state.write_u64(h)
+        hash_bytes(&cx, key.name, state).write_u64(kind_index(key.kind) as u64)
     }
 
     fn eq_in(&cx: Domain!['k], a: Param['k], b: Param['k]) -> bool {
@@ -515,8 +516,7 @@ instance HashIn[Param['k], Domain!['k]] {
 forall 'k.
 instance HashIn[Premise['k], Domain!['k]] {
     fn hash_in(&cx: Domain!['k], key: Premise['k], state: HashState) -> HashState {
-        let h = hash_types(&cx, key.trait_name.hash(&cx), key.args);
-        state.write_u64(h)
+        hash_types(&cx, hash_bytes(&cx, key.trait_name, state), key.args)
     }
 
     fn eq_in(&cx: Domain!['k], a: Premise['k], b: Premise['k]) -> bool {
@@ -554,8 +554,7 @@ impl ModuleId['k] {
 forall 'k.
 instance HashIn[ModuleId['k], Domain!['k]] {
     fn hash_in(&cx: Domain!['k], key: ModuleId['k], state: HashState) -> HashState {
-        let h = combine(key.package as u64, key_hash(&cx, key.path));
-        state.write_u64(h)
+        HashIn[ArenaVec[Span['k], 'k], Domain!['k]]::hash_in(&cx, key.path, state.write_u64(key.package as u64))
     }
 
     fn eq_in(&cx: Domain!['k], a: ModuleId['k], b: ModuleId['k]) -> bool {

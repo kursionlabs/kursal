@@ -97,6 +97,13 @@ output functions return, instead of ending the process. The children
 `kur_libc_process_spawn` starts get the default action back
 (`posix_spawnattr_setsigdefault`), since an ignored signal stays ignored
 across `exec`.
+It draws the process's hash seed, 16 bytes from `getentropy`, and aborts
+when the operating system has none to give; `kur_libc_process_hash_seed`
+reads it, a word at a time, for `std::process::hash_seed`, and aborts,
+saying why, when the seed was never drawn. Nothing changes the seed after
+start-up, so threads read it without a lock. A program whose C `main` is
+not the one `kursal build` writes (`kursal c --entry`, linked with this
+file) calls `kur_libc_process_start` before any Kursal code.
 
 These calls describe observations, not authenticated ownership or a stable
 file-system snapshot. Code that uses them to enforce path containment must

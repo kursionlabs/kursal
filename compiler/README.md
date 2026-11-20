@@ -178,8 +178,20 @@ of Tarjan's algorithm (`types::termination::components`), the open lists of the 
 (`kurs::sexpr::read`), the variables seen while collecting inference variables (`types::unify`),
 the variants a match has covered (`FnLower::match_coverage`), and the walk of package dependencies
 (`Infer::depends_on`). A scratch map with `Copy` keys that point into the arena hashes them under
-`&cx` (`insert_in`, `get_in`, `remove_in`). State that lives in a struct of handles shared with
+`&cx` (`insert_in`, `get_in`, `remove_in`), and under the arena's seed (`OwnedMap!::new(seed(&cx))`,
+`std::arena::seed`). State that lives in a struct of handles shared with
 the rest of a phase stays in the arena, and so does everything that ends up in a result.
+
+### The hash seed
+
+`main` makes each arena with the process's hash seed, `std::process::hash_seed()`, which start-up
+draws from the operating system, so every map's hash differs from one run to the next (see
+`std::hash`). The compiler's output does not depend on it: an `ArenaMap` or `ArenaSet` lists its
+keys in insertion order whatever their hashes, the scratch `OwnedMap!`s are only looked up and
+freed, never listed, and nothing else reads a hash but a map. `scripts/bootstrap.sh --check`, whose
+two builds of the compiler draw two seeds and must make the same C, and the comparisons with the
+reference compiler check this. A map listed in hash order (`OwnedMap!::each` or `drain`) would make
+the output change from run to run; sort what such a map lists, or keep the map in the arena.
 
 Arena state that a walk refills again and again is kept and refilled in place rather than made
 anew: `ArenaMap::clear` and `assign` (and `ArenaSet`'s) keep the room a map has, so it takes new
@@ -241,7 +253,7 @@ rather than copying them with `keys`, and compare text without splitting it.
 
 Map keys are hashed and compared through the standard library's `HashIn[K, Domain!['k]]`, which
 borrows the context by place: `HashIn[K, Domain!['k]]::hash_in(&cx, key, state)`, or
-`std::hash::key_hash(&cx, key)` and `key_eq(&cx, a, b)`. The standard library has the instances for the
+`std::hash::key_hash(&cx, key, seed)` and `key_eq(&cx, a, b)`. The standard library has the instances for the
 integers, `bool`, tuples, spans and `ArenaVec`s of keys, and `kurs::core` adds `Type`, `Param`,
 `Premise` and `ModuleId`. `kurs::core::same` is structural type equality (Python's `==` on frozen
 dataclasses), `kurs::core::hash` its hash.
@@ -249,12 +261,14 @@ dataclasses), `kurs::core::hash` its hash.
 Types are values, not interned: two equal types may be built apart, so a type-keyed map hashes and
 compares the structure. Both are kept cheap instead. A map entry keeps its key's hash bits, so a
 probe compares keys only where the bits agree, and growing or cloning a map hashes nothing again.
-`hash` takes from each name only its length and last 8 bytes (`name_hash`), and `same` stops at a
+`hash` takes from each name only its length and last 8 bytes (`name_hash`): names alike in those
+collide under every seed, but a program's names are its own, so only it can slow its build down that
+way. `same` stops at a
 part (a vec of types or members, a `Ref`) that both types share, which a type copied from another,
 or looked up with the type it was stored under, mostly does. Where a backend query is asked per
 value, it is kept by the value's (block label, name) (`Backend::value_erased_in`), which hashes two
-short names instead of a type. `types::ops::alpha_hash` is a hash that alpha-equivalent types
-share; `Backend::request` compares a specialization's arguments only with earlier ones whose hash
+short names instead of a type. `types::ops::alpha_hashes` is a hash, under the arena's seed, that
+alpha-equivalent types share; `Backend::request` compares a specialization's arguments only with earlier ones whose hash
 is the same.
 
 A class whose methods mutate `self` becomes a struct of handles (refs, vecs, maps) whose methods
@@ -868,7 +882,7 @@ These are the places where Kursal differs from what one might expect.
   `match`, `&&` or `if` may lend it in every branch.
 - **Brands.** `forall 'k.` binds a brand like a type parameter, and a type that holds branded storage
   takes it as its last argument (`ArenaVec[Span['k], 'k]`). A brand is minted by a constructor that
-  returns `exists 'k. ...` and is opened by `let exists 'k. cx = Domain!::new();`; a trait may take one
+  returns `exists 'k. ...` and is opened by `let exists 'k. cx = Domain!::new(hash_seed());`; a trait may take one
   as a parameter (`forall D, 'k. trait Discharge`, `instance Discharge[Checker['k], 'k]`).
 - **`NonNull[T]`** (`std::ptr::NonNull`) is a builtin type, like `*T` but never null:
   `NonNull::new(p)` checks and returns an `Option`, `unsafe (p as NonNull[T])` asserts it, `n as *T`
