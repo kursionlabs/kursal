@@ -216,6 +216,33 @@ fn contains(&cx: Domain!['k], types: Types['k], ty: Type['k], holds: closure[Env
     }
 }
 
+// A cast with a raw pointer on one side has a pointer or an integer on the other: C converts a
+// pointer only to and from those (through `uintptr_t`), and the backend writes no other cast of one.
+// Named types are unfolded, as the backend sees them.
+forall 'k.
+fn pointer_cast_fits(&cx: Domain!['k], types: Types['k], got: Type['k], want: Type['k]) -> bool {
+    let from = types.shape(&cx, got, Option::None);
+    let to = types.shape(&cx, want, Option::None);
+    !(is_raw_pointer(from) || is_raw_pointer(to)) || pointer_or_integer(&cx, from) && pointer_or_integer(&cx, to)
+}
+
+forall 'k.
+fn is_raw_pointer(t: Type['k]) -> bool {
+    match t {
+        Type::Ptr(_inner) => true,
+        _ => false,
+    }
+}
+
+forall 'k.
+fn pointer_or_integer(&cx: Domain!['k], t: Type['k]) -> bool {
+    match t {
+        Type::Ptr(_inner) => true,
+        Type::Prim(name) => C::is_integer(&cx, name),
+        _ => false,
+    }
+}
+
 // What only checked code makes, and foreign code never hands the program: a package, a brand
 // witness, a safe function value, a transform, or Never. An `unsafe fn` value may come from C:
 // calling it needs `unsafe`.
@@ -2115,8 +2142,9 @@ impl Checker['k] {
     // An unsafe cast reinterprets only representations the program fixes: a `NonNull` is cast only
     // from or to a pointer (whose obligation is that it is not null), and nothing that holds an enum
     // or a `NonNull` within it is cast, since the compiler chooses an enum's layout (a tag, or the
-    // niche of a `NonNull`: `Types::niche_variant`). A type parameter cannot be cast at all. Nor is a
-    // number cast to a number: that is a conversion by value, `int_cast` or `float_cast`.
+    // niche of a `NonNull`: `Types::niche_variant`). A raw pointer is cast only to or from a pointer or
+    // an integer (`pointer_cast_fits`). A type parameter cannot be cast at all. Nor is a number cast to
+    // a number: that is a conversion by value, `int_cast` or `float_cast`.
     fn castable(self, &cx: Domain!['k], got: Type['k], want: Type['k]) {
         if is_non_null(got) || is_non_null(want) {
             if !(is_pointer_like(got) && is_pointer_like(want)) {
@@ -2126,6 +2154,9 @@ impl Checker['k] {
         }
         if self.types.chosen_layout(&cx, got) || self.types.chosen_layout(&cx, want) {
             self.fail(&cx, "unsafe_cast_layout_chosen");
+        }
+        if !pointer_cast_fits(&cx, self.types, got, want) {
+            self.fail(&cx, "pointer_cast_pointer_or_integer");
         }
         if is_number_type(&cx, got) && is_number_type(&cx, want) {
             self.fail(&cx, "unsafe_cast_between_numbers");

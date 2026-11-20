@@ -77,11 +77,18 @@ class CastTests(unittest.TestCase):
         self.assertIn('entry_out = (float)entry_x;', output)
         self.assertNotIn('__builtin_memcpy', output)
 
-    def test_pointer_float_conversion_has_no_invented_integer_intermediate(self):
-        with self.assertRaisesRegex(KursError, "raw pointers only with pointers or integers"):
-            generate(self.cast(C.Ptr(C.U32), C.Prim("f64")))
-        output = generate(self.cast(C.Ptr(C.U32), C.Ptr(C.Prim("u8"))))
+    def test_a_pointer_is_cast_only_to_or_from_a_pointer_or_an_integer(self):
+        # C converts a pointer only to and from those; the checker rejects what the backend cannot write.
+        pointer = C.Ptr(C.U32)
+        for source, target in ((pointer, C.Prim("f64")), (C.Prim("f32"), pointer), (pointer, C.BOOL),
+                               (C.BOOL, pointer), (pointer, C.Tuple((pointer,))), (C.Tuple((pointer,)), pointer),
+                               (pointer, C.Array(C.U32, 2))):
+            with self.subTest(source=source, target=target), \
+                    self.assertRaisesRegex(KursError, "pointer_cast_pointer_or_integer"):
+                check_program(self.cast(source, target))
+        output = generate(self.cast(pointer, C.Ptr(C.Prim("u8"))))
         self.assertIn('entry_out = (uint8_t*)entry_x;', output)
+        self.assertIn('entry_out = (uint64_t)((uint64_t)((uintptr_t)entry_x));', generate(self.cast(pointer, C.Prim("u64"))))
 
 
 class AtomicTests(unittest.TestCase):

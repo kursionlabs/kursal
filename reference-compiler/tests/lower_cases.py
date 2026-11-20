@@ -31,6 +31,11 @@ LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
      "an unsafe cast cannot produce or take apart"),
     ("forall 'k.\nstruct P { x: u64, b: core::cap::Brand['k] }\nforall 'k.\nfn f(x: u64) -> P['k] { unsafe (x as P['k]) }\n",
      "an unsafe cast cannot produce or take apart"),
+    # A raw pointer is cast only to or from a pointer or an integer, as C converts one.
+    ("fn f(p: *u8) -> bool { unsafe (p as bool) }\n", "an unsafe cast converts a pointer only to or from a pointer or an integer"),
+    ("fn f(p: *u8) -> f64 { unsafe (p as f64) }\n", "an unsafe cast converts a pointer only to or from a pointer or an integer"),
+    ("exposed struct W { p: *u8 }\nfn f(p: *u8) -> W { unsafe (p as W) }\n", "an unsafe cast converts a pointer only"),
+    ("exposed struct W { p: *u8 }\nfn f(w: W) -> *u8 { unsafe (w as *u8) }\n", "an unsafe cast converts a pointer only"),
     # What an extern hands back holds nothing only checked code makes, and no layout the compiler chooses.
     ('extern "C" fn get_cb() -> fn() -> u32;\n', "extern get_cb cannot return a package, a brand witness, a safe function"),
     ('struct W { n: u64, f: fn() -> u32 }\nextern "C" fn make() -> W;\n', "extern make cannot return a package"),

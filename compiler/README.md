@@ -872,10 +872,11 @@ These are the places where Kursal differs from what one might expect.
   conversions"); a float's bits are `x.to_bits()` and `f64::from_bits(b)`. An unsafe cast neither
   makes nor takes apart a value that holds a package, a brand witness, a function value, a
   transform, a value of a type parameter or `Never` (`unsafe_cast_cannot_produce`), named types'
-  fields included; behind a pointer, reading one is a separate unsafe operation. No read through a
-  pointer produces a value that holds `Never`, named types' fields included
-  (`unsafe_read_cannot_produce_never`); a generic read at a `T` instantiated with one is the caller's
-  obligation (`lib/std/CONTRACTS.md`, section 2.3). What an extern function returns, like an unsafe
+  fields included; behind a pointer, reading one is a separate unsafe operation. A raw pointer is cast
+  only to or from a pointer, a `NonNull` or an integer (`pointer_cast_pointer_or_integer`), named types
+  unfolded, as C converts one. No read through a pointer produces a value that holds `Never`, named
+  types' fields included (`unsafe_read_cannot_produce_never`); a generic read at a `T` instantiated
+  with one is the caller's obligation (`lib/std/CONTRACTS.md`, section 2.3). What an extern function returns, like an unsafe
   cast's result, holds no package, brand witness, safe function value, transform or `Never` (a result
   of `!` itself is a function that does not return), and no enum or `NonNull`, whose layout C cannot
   know (`extern_result_cannot_produce`, `extern_result_layout_chosen`); an `unsafe fn` value may come

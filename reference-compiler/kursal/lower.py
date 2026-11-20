@@ -29,7 +29,7 @@ from . import syntax as S
 from .placeflow import OwnershipError, PlaceFlow
 from .promote import promote_locals
 from .literals import valid_literal
-from .check import checked_only, contains, overlap
+from .check import checked_only, contains, overlap, pointer_cast_fits
 from .infer import (POINTER_OPS, BuiltinCall, ClosureCall, FnCall, FStringWrite, Infer, PointerCall, TypedBuiltinCall,
                     TraitCall, TupleCall, ValueCall, VariantCall)
 from .sexpr import KursError, List, Position, Str
@@ -258,8 +258,8 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         """The core's rules for an unsafe operation on memory, which an `unsafe` marker does not lift: a read
         through a pointer does not produce a value that holds Never; a cast does not conjure what only a
         checked operation makes, nor reinterpret a layout the compiler chooses, nor take or produce a
-        zero-size type, which has no representation to reinterpret; an atomic operation works on an integer,
-        a bool or a pointer. A load or store of a zero-size type reads and writes nothing, and `alloca` of
+        zero-size type, which has no representation to reinterpret, nor convert a pointer but to or from a
+        pointer or an integer; an atomic operation works on an integer, a bool or a pointer. A load or store of a zero-size type reads and writes nothing, and `alloca` of
         one is not null."""
         target = self.vty.get(args[0]) if args else None
         pointee = target.inner if isinstance(target, C.Ptr) else None
@@ -277,6 +277,8 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
                     fail("an unsafe cast converts a NonNull only to or from a pointer", pos)
             elif self.types.chosen_layout(target) or self.types.chosen_layout(ty):
                 fail("an unsafe cast cannot reinterpret an enum or a NonNull, whose layout the compiler chooses", pos)
+            elif not pointer_cast_fits(self.types, target, ty):
+                fail("an unsafe cast converts a pointer only to or from a pointer or an integer", pos)
         elif op in C.ATOMIC_OPS and pointee is not None:
             kind = C.ATOMIC_OPS[op]
             integer = isinstance(pointee, C.Prim) and pointee.name in C.INTEGERS

@@ -20,7 +20,7 @@ use std::mem::Ref;
 use std::raw::Span;
 use std::arena::{Domain!, seed};
 use std::buffer::Buffer!;
-use package::check::checker::{checked_only, contains, is_never, overlap};
+use package::check::checker::{checked_only, contains, is_never, overlap, pointer_cast_fits};
 use package::kurs::core::{Block, Data, Edge, Extern, Fun, Instance, Instr, Kind, ModuleId, Param, Program, Terminator, Type};
 use package::kurs::core as C;
 use package::infer::inference::{Callee, Capture, Results, infer, pointer_params};
@@ -601,9 +601,10 @@ impl FnLower['k] {
     // The core's rules for an unsafe operation on memory, which an `unsafe` marker does not lift: a
     // read through a pointer does not produce a value that holds Never; a cast does not conjure what
     // only a checked operation makes, nor reinterpret a layout the compiler chooses, nor take or
-    // produce a zero-size type, which has no representation to reinterpret; an atomic operation works
-    // on an integer, a bool or a pointer. A load or store of a zero-size type reads and writes
-    // nothing, and `alloca` of one is not null.
+    // produce a zero-size type, which has no representation to reinterpret, nor convert a pointer but
+    // to or from a pointer or an integer; an atomic operation works on an integer, a bool or a
+    // pointer. A load or store of a zero-size type reads and writes nothing, and `alloca` of one is
+    // not null.
     fn memory_operation(self, &cx: Domain!['k], o: Op['k], pos: Pos) {
         let target = if o.args.is_empty(&cx) { Option::None } else { self.vty.get(&cx, o.args.at(&cx, 0usize)) };
         let pointee = match target {
@@ -655,6 +656,8 @@ impl FnLower['k] {
             }
         } else if types.chosen_layout(&cx, from) || types.chosen_layout(&cx, to) {
             self.fail(&cx, Span::from_static(&cx, "an unsafe cast cannot reinterpret an enum or a NonNull, whose layout the compiler chooses"), pos);
+        } else if !pointer_cast_fits(&cx, types, from, to) {
+            self.fail(&cx, Span::from_static(&cx, "an unsafe cast converts a pointer only to or from a pointer or an integer"), pos);
         }
     }
 

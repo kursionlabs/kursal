@@ -1233,20 +1233,18 @@ class Backend:
     def cast(self, dst: str, expr: str, src: Type, dst_ty: Type) -> None:
         s, d = self.shape(src), self.shape(dst_ty)
         cd = self.ctype(dst_ty)
-        if isinstance(s, (Ptr, NonNull)) or isinstance(d, (Ptr, NonNull)):
-            if isinstance(s, (Ptr, NonNull)) and isinstance(d, (Ptr, NonNull)):
-                self.line(f"{dst} = ({cd}){expr};")
-                if isinstance(d, NonNull) and not isinstance(s, NonNull):
-                    # The cast's obligation: the pointer is not null. Telling the C compiler lets it fold
-                    # the niche checks of an enum made from it.
-                    self.line(f"if ({dst} == 0) __builtin_unreachable();")
-            elif (isinstance(s, Ptr) and isinstance(d, Prim) and d.name in INTEGERS or
-                  isinstance(d, Ptr) and isinstance(s, Prim) and s.name in INTEGERS):
-                value = f"(uintptr_t){expr}"
-                converted = self.convert(value, d) if isinstance(d, Prim) else f"({cd}){value}"
-                self.line(f"{dst} = {converted};")
-            else:
-                raise KursError("backend cast supports raw pointers only with pointers or integers")
+        if isinstance(s, (Ptr, NonNull)) and isinstance(d, (Ptr, NonNull)):
+            self.line(f"{dst} = ({cd}){expr};")
+            if isinstance(d, NonNull) and not isinstance(s, NonNull):
+                # The cast's obligation: the pointer is not null. Telling the C compiler lets it fold
+                # the niche checks of an enum made from it.
+                self.line(f"if ({dst} == 0) __builtin_unreachable();")
+        elif isinstance(s, Ptr) or isinstance(d, Ptr):
+            # The other side is an integer: the checker casts a pointer to or from nothing else
+            # (`pointer_cast_fits`), and a `NonNull` only to or from a pointer.
+            value = f"(uintptr_t){expr}"
+            converted = self.convert(value, d) if isinstance(d, Prim) else f"({cd}){value}"
+            self.line(f"{dst} = {converted};")
         elif isinstance(s, Prim) and isinstance(d, Prim):
             # One is a bool: the checker leaves a number to a number to `int_cast` and `float_cast`.
             self.line(f"{dst} = ({cd}){expr};")

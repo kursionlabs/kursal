@@ -394,7 +394,10 @@ declares its methods (`new`, `new_unchecked`, `as_ptr`). The ways to make one ar
 
 `n as *T` needs no `unsafe`. Nothing else casts to or from a `NonNull`:
 not an integer, and not a struct, tuple or array that holds one, which
-would make the same claim without saying so.
+would make the same claim without saying so. A raw pointer is cast only to
+or from a pointer, a `NonNull` or an integer, which C converts through
+`uintptr_t` (`pointer_cast_pointer_or_integer`): not a `bool` or a float,
+and not a struct, tuple or array, even one that holds only a pointer.
 
 The niche of a `NonNull` lets the compiler represent an enum of a
 dataless variant and a variant whose payload holds a `NonNull` as that

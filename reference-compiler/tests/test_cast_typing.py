@@ -95,10 +95,9 @@ class CastTypingTests(unittest.TestCase):
             if unsafe (q as usize) == 0usize { 7i32 } else { 0i32 }
         }''', 7)
 
-    def test_target_restrictions_are_backend_errors(self):
-        with self.assertRaisesRegex(KursError, 'raw pointers only with pointers or integers') as error:
+    def test_a_pointer_is_cast_only_to_or_from_a_pointer_or_an_integer(self):
+        with self.assertRaisesRegex(LowerError, 'converts a pointer only to or from a pointer or an integer'):
             self.run_source('fn main() -> i32 { let x = unsafe ((unsafe (0usize as *u32)) as f32); 0i32 }', 0)
-        self.assertNotIsInstance(error.exception, LowerError)
 
     def test_diverging_operand_needs_no_cast(self):
         self.run_source('''fn main() -> i32 {

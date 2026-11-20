@@ -104,6 +104,17 @@ REJECTED = {
     "cast_from_abstract": ("unsafe_cast_cannot_produce", """
         (fun (unsafe) h (forall (T) () u32 (T) (entry ((%x T)) (= %n (cast %x u32)) (ret %n))))"""),
 
+    # A raw pointer is cast only to or from a pointer or an integer, named types unfolded: a struct
+    # holding a pointer is not one.
+    "cast_pointer_to_struct_of_pointer": ("pointer_cast_pointer_or_integer", """
+        (type W (struct (p (ptr u8))))
+        (fun (unsafe) h W ((ptr u8)) (entry ((%p (ptr u8))) (= %w (cast %p W)) (ret %w)))"""),
+    "cast_struct_of_pointer_to_pointer": ("pointer_cast_pointer_or_integer", """
+        (type W (struct (p (ptr u8))))
+        (fun (unsafe) h (ptr u8) (W) (entry ((%w W)) (= %p (cast %w (ptr u8))) (ret %p)))"""),
+    "cast_pointer_to_float": ("pointer_cast_pointer_or_integer", """
+        (fun (unsafe) h f64 ((ptr u8)) (entry ((%p (ptr u8))) (= %f (cast %p f64)) (ret %f)))"""),
+
     # Re-entering a nominal type's premises must descend. A brand an existential binds is a different
     # variable from the function's brand, however each is spelled: here the reentry into A changes its
     # brand argument while shrinking the other, so it does not descend under either spelling.

@@ -55,6 +55,15 @@ def checked_only(ty: Type) -> bool:
     return isinstance(ty, (Exists, Brand, Foreach, Never)) or isinstance(ty, Fn) and not ty.unsafe
 
 
+def pointer_cast_fits(types: Types, got: Type, want: Type) -> bool:
+    """A cast with a raw pointer on one side has a pointer or an integer on the other: C converts a
+    pointer only to and from those (through `uintptr_t`), and the backend writes no other cast of one.
+    Named types are unfolded, as the backend sees them."""
+    shapes = (types.shape(got), types.shape(want))
+    return not any(isinstance(s, Ptr) for s in shapes) or \
+        all(isinstance(s, Ptr) or isinstance(s, Prim) and s.name in INTEGERS for s in shapes)
+
+
 class CheckError(KursError):
     pass
 
@@ -742,8 +751,9 @@ class Checker:
         """An unsafe cast reinterprets only representations the program fixes: a `NonNull` is cast
         only from or to a pointer (whose obligation is that it is not null), and nothing that holds an
         enum or a `NonNull` within it is cast, since the compiler chooses an enum's layout (a tag, or
-        the niche of a `NonNull`: `Types.niche_variant`). A type parameter cannot be cast at all. Nor is a
-        number cast to a number: that is a conversion by value, `int_cast` or `float_cast`."""
+        the niche of a `NonNull`: `Types.niche_variant`). A raw pointer is cast only to or from a pointer
+        or an integer (`pointer_cast_fits`). A type parameter cannot be cast at all. Nor is a number cast
+        to a number: that is a conversion by value, `int_cast` or `float_cast`."""
         pointers = (Ptr, NonNull)
         if isinstance(got, NonNull) or isinstance(want, NonNull):
             if not (isinstance(got, pointers) and isinstance(want, pointers)):
@@ -751,6 +761,8 @@ class Checker:
             return
         if self.types.chosen_layout(got) or self.types.chosen_layout(want):
             self.fail("unsafe_cast_layout_chosen")
+        if not pointer_cast_fits(self.types, got, want):
+            self.fail("pointer_cast_pointer_or_integer")
         numbers = INTEGERS | FLOATS
         if isinstance(got, Prim) and got.name in numbers and isinstance(want, Prim) and want.name in numbers:
             self.fail("unsafe_cast_between_numbers")
