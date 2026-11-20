@@ -865,6 +865,9 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
                 p = self.expr(target.operand)
                 if p is not None and not (explicit or self.authorized(call)):
                     fail("lending a raw pointer target requires unsafe authorization", arg.pos)
+                pointer = self.vty.get(p) if p is not None else None
+                if isinstance(pointer, C.Ptr) and contains(self.types, pointer.inner, lambda t: isinstance(t, C.Never)):
+                    fail("an unsafe lend of a pointer's target cannot lend a value that holds Never", arg.pos)
                 return None if p is None else "&*" + p
             path = self.place_path(target)
             if path is not None:

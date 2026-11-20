@@ -303,7 +303,8 @@ A read through a pointer never produces `Never`. No memory holds a value of `!`,
 holds one in its value (a struct, tuple or array of length above 0 with a component that does, an enum
 with a payload that does, named types' fields included; not what a pointer in it points at), so such a
 read has undefined behavior. The checker rejects a read whose pointee is such a type
-(`unsafe_read_cannot_produce_never`). It checks a generic read, `unsafe *p` with `p: *T`, at `T`
+(`unsafe_read_cannot_produce_never`), and so a lend of such a pointer's target
+(`f(unsafe &*p)`, section 2.0d), from which the callee could read one. It checks a generic read, `unsafe *p` with `p: *T`, at `T`
 itself, so it cannot see a `T` instantiated with such a type (`rd[!](p)` for
 `forall T. unsafe fn rd(p: *T) -> T { unsafe *p }`): there the obligation is the caller's, as it is
 for every other type the memory must hold.

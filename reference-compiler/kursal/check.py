@@ -594,6 +594,8 @@ class Checker:
                 ty = self.use(arg[2:])
                 if not isinstance(ty, Ptr) or not equal(ty.inner, want):
                     self.fail("raw_target_lend_wrong")
+                if contains(self.types, want, lambda t: isinstance(t, Never)):
+                    self.fail("unsafe_read_cannot_produce_never")
             elif arg.startswith("&"):
                 if not equal(self.path_type(arg), want):
                     self.fail("lent_place_type_expected")

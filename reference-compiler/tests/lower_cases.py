@@ -47,6 +47,8 @@ LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
     ("struct S { n: ! }\nfn f(p: *S) -> u32 { let s = unsafe *p; 0u32 }\n",
      "an unsafe read cannot produce a value that holds Never"),
     ("fn f(p: *(u32, !)) -> u32 { let s = unsafe *p; 0u32 }\n", "an unsafe read cannot produce a value that holds Never"),
+    ("struct S { n: ! }\nfn get(&s: S) -> u32 { 0u32 }\nfn f(p: *S) -> u32 { get(unsafe &*p) }\n",
+     "an unsafe lend of a pointer's target cannot lend a value that holds Never"),
     (TOKEN + "fn f() -> u32 { (Token!.{ n: 1u32 }, Token!.{ n: 2u32 }).0.n }\n", "linear sibling"),
     ("unsafe fn danger() -> u32 { 0u32 }\nfn f() -> u32 { danger() }\n", "calling an unsafe function"),
     ("fn take(&x: u32) -> u32 { x }\nfn f(p: *u32) -> u32 { take(&*p) }\n", "lending a raw pointer target"),

@@ -81,6 +81,10 @@ REJECTED = {
         (type S (struct (n !)))
         (fun (unsafe) h u32 (L! (ptr S)) (entry ((%l L!) (%p (ptr S)))
           (= %s (ptr_load %p)) (= %n (destruct %s S)) (unreachable)))"""),
+    "lend_target_holding_never": ("unsafe_read_cannot_produce_never", """
+        (type S (struct (n !)))
+        (fun get u32 (S) (entry ((&s S)) (= %v (load &s)) (= %n (destruct %v S)) (unreachable)))
+        (fun h u32 ((ptr S)) (entry ((%p (ptr S))) (unsafe (= %r (call get &*%p))) (ret %r)))"""),
     "deref_to_tuple_holding_never": ("unsafe_read_cannot_produce_never", """
         (type L! (struct (a u32)))
         (fun (unsafe) h u32 (L! (ptr (tuple !))) (entry ((%l L!) (%p (ptr (tuple !))))

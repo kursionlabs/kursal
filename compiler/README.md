@@ -880,8 +880,8 @@ These are the places where Kursal differs from what one might expect.
   transform, a value of a type parameter or `Never` (`unsafe_cast_cannot_produce`), named types'
   fields included; behind a pointer, reading one is a separate unsafe operation. A raw pointer is cast
   only to or from a pointer, a `NonNull` or an integer (`pointer_cast_pointer_or_integer`), named types
-  unfolded, as C converts one. No read through a pointer produces a value that holds `Never`, named
-  types' fields included (`unsafe_read_cannot_produce_never`); a generic read at a `T` instantiated
+  unfolded, as C converts one. No read through a pointer, nor lend of its target, produces a value
+  that holds `Never`, named types' fields included (`unsafe_read_cannot_produce_never`); a generic read at a `T` instantiated
   with one is the caller's obligation (`lib/std/CONTRACTS.md`, section 2.3). What an extern function returns, like an unsafe
   cast's result, holds no package, brand witness, safe function value, transform or `Never` (a result
   of `!` itself is a function that does not return), and no enum or `NonNull`, whose layout C cannot
