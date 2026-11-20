@@ -320,6 +320,16 @@ class CoreSoundnessTests(unittest.TestCase):
             """(extern fun stop ! ())
                (extern fun callback (tuple (fn (unsafe) ((ptr u8)) (ptr u8)) u64) ())
                (extern fun take u32 ((fn () u32) (non_null u8)))""",
+            # The walk of a value follows its by-value layout: not what a function value takes and
+            # returns, and not a named type's arguments but through its fields, so a type that holds
+            # itself behind a function or a pointer wrapper ends it.
+            """(type A (struct (callback (fn (unsafe) (A) A)) (n u64)))
+               (type Ref (forall (T) () (struct (ptr (ptr T)))))
+               (type Node (forall (T) () (struct (value T) (next (Ref (Node T))))))
+               (extern fun make A ())
+               (fun (unsafe) read A ((ptr A)) (entry ((%p (ptr A))) (= %a (ptr_load %p)) (ret %a)))
+               (fun (unsafe) cast (Node u64) ((tuple u64 (ptr u8))) (entry ((%t (tuple u64 (ptr u8))))
+                 (= %n (cast %t (Node u64))) (ret %n)))""",
             # A cast of a type holding itself in an array of length 0, which holds no value.
             """(type R (struct (a (array R 0)) (b u32)))
                (fun (unsafe) h (tuple u64 R) ((tuple u64 R)) (entry ((%t (tuple u64 R)))

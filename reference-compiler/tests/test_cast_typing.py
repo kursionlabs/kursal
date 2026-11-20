@@ -61,6 +61,14 @@ class CastTypingTests(unittest.TestCase):
         self.run_source('''struct R { a: [R; 0], b: u32 }
             fn same(x: (u64, R)) -> (u64, R) { unsafe (x as (u64, R)) }
             fn main() -> i32 { 7i32 }''', 7)
+        # Nor do they look into a named type's arguments but through its fields, nor into what a function
+        # value takes (a read walks for Never): here they would meet the type again without end.
+        self.run_source('''forall T. struct Link { p: *T }
+            forall T. struct Node { value: T, next: Link[Node[T]] }
+            struct F { f: unsafe fn(F) -> u64, n: u64 }
+            fn same(x: Node[u64]) -> Node[u64] { unsafe (x as Node[u64]) }
+            fn read(p: *F) -> F { unsafe *p }
+            fn main() -> i32 { 7i32 }''', 7)
 
     def test_authorization_does_not_extend_to_nested_casts(self):
         with self.assertRaisesRegex(LowerError, 'unsafe'):

@@ -36,16 +36,18 @@ SEALED = {"Copy", "Exposed"}      # compiler-reserved trait names: no user trait
 
 
 def contains(types: Types, ty: Type, pred: Callable[[Type], bool]) -> bool:
-    """`pred` holds somewhere in the value representation of `ty`, or in the arguments of a named type in
-    it. A named type is unfolded too, since its fields are its value; a pointer's target is not part of it,
-    nor is the element of an array of length 0, which holds no value (and may be the type itself)."""
+    """`pred` holds somewhere in the value representation of `ty`. A named type is unfolded, since its
+    fields are its value; its arguments are part of it only through them. A pointer's target is not part
+    of it, nor what a function value takes and returns, nor the element of an array of length 0, which
+    holds no value. So the walk follows the by-value layout, which is finite (`check_type_expansion`)."""
     if pred(ty):
         return True
-    if isinstance(ty, (Ptr, NonNull)) or isinstance(ty, Array) and ty.length == 0:
-        return False
-    if any(contains(types, t, pred) for t in children(ty)):
-        return True
-    return isinstance(ty, Named) and ty.name in types.program.types and contains(types, types.shape(ty), pred)
+    match ty:
+        case Ptr() | NonNull() | Fn() | Array(length=0):
+            return False
+        case Named():
+            return ty.name in types.program.types and contains(types, types.shape(ty), pred)
+    return any(contains(types, t, pred) for t in children(ty))
 
 
 def checked_only(ty: Type) -> bool:

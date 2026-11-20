@@ -34,7 +34,7 @@ class LayoutTests(unittest.TestCase):
 
     def compiles(self, source, ty):
         program = parse_program(source)
-        program.externs["probe"] = C.Extern("probe", ty)
+        program.externs["probe"] = C.Extern("probe", C.U32, (ty,))
         text = emit_c(program, check_program(program))
         result = subprocess.run([c_compiler(), *FLAGS, "-x", "c", "-fsyntax-only", "-"],
                                 input=text, text=True, capture_output=True)
