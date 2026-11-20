@@ -1304,6 +1304,9 @@ SYNTAX_ERRORS = (
 KURS_ERRORS = (
     "garbage",
     "(fun main i32 () garbage)",
+    # A function has an entry block, and a generic one's are inside its forall.
+    "(fun g u32 ())",
+    "(fun g (forall (T) () T (T))\n  (entry ((%x T)) (ret %x)))",
     "(type T (struct u32))",
     "(type T (forall (A) ((Copy (tuple u32))) A))",
     "(type T (forall (A) ((Copy B)) A))",

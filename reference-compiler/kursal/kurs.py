@@ -236,6 +236,8 @@ def parse_fun(forms: Sequence[Form], name: str, module: Optional[ModuleId] = Non
     premises: tuple[Premise, ...] = ()
     header = forms[0]
     if _is(header, "forall"):
+        if len(forms) > 1:
+            _fail("a generic function's blocks are inside its forall", forms[1])
         params, premises = parse_forall(header[1], header[2])
         forms = header[3:]
     body = forms[2:]
@@ -244,6 +246,8 @@ def parse_fun(forms: Sequence[Form], name: str, module: Optional[ModuleId] = Non
     if _is(local_form, "locals"):
         locals_ = tuple((str(p[0]), parse_type(p[1])) for p in map(_list, local_form[1:]))
         body = body[1:]
+    if not body:
+        raise KursError("a function needs an entry block", pos)
     return Fun(name, params, premises, parse_type(forms[0]), tuple(parse_type(t) for t in _list(forms[1])),
                tuple(parse_block(b) for b in body), locals_, unsafe, module, pos)
 
