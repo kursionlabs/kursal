@@ -31,7 +31,7 @@ from . import syntax as S
 from .resolve import Decl, ResolveError, Resolver, listed
 from .sigs import InstanceSig, Scope, Sig, Signatures
 from .sexpr import KursError, Position
-from .types import Surface, Types, brand_differences, brand_name, equal, foreach_binders, free_brands, free_names, made_from, subst
+from .types import Surface, Types, brand_differences, brand_name, equal, foreach_binders, free_brands, free_names, fresh, made_from, subst
 from .termination import check_instance_termination
 from .coherence import check_coherence
 from .unify import Meta, ground, instantiate, match_head, prune, unify, zonk
@@ -760,9 +760,12 @@ class Infer:
         self.explicit_args(expr, sig, sub)
         expr.call = FnCall(sig, sub)
         self.require_signature(sig, sub, expr.pos)
-        ptypes = tuple(subst(t, sub) for t in sig.ptypes)
-        ret = subst(sig.ret, sub)
-        return C.Fn(ptypes, ret, kept, sig.unsafe, sig.places)
+        # A kept brand gets a name no source spells: a type argument solved later never captures it.
+        labels = {p.name: fresh(p.name) for p in kept}
+        whole = {**sub, **{name: C.Skolem(label) for name, label in labels.items()}}
+        ptypes = tuple(subst(t, whole) for t in sig.ptypes)
+        ret = subst(sig.ret, whole)
+        return C.Fn(ptypes, ret, tuple(C.Param(labels[p.name], C.BRAND) for p in kept), sig.unsafe, sig.places)
 
     def explicit_args(self, path: S.Path, sig: Sig, sub: dict[str, C.Type]) -> None:
         """Type arguments written on a callee path: on its last segment, the function's own; on the type

@@ -807,7 +807,8 @@ class Checker:
         if any(retained_brands & free_brands(arg) for premise in fun.premises for arg in premise.args):
             self.fail("retained_brand_with_premise")
         sub = self.instantiate(fun.params, fun.premises, instr.tys, name)
-        return Fn(tuple(subst(t, sub) for t in fun.ptypes), subst(fun.ret, sub), retained, fun.unsafe, fun.places)
+        # Substituting through the value's own binder renames a retained brand that a type argument would capture.
+        return subst(Fn(fun.ptypes, fun.ret, retained, fun.unsafe, fun.places), sub)
 
     def has_memory_form(self, ty: Type) -> None:
         """A zero-size type is erased: it has no C object and no C value, and `sizeof` of one is 0. A load or

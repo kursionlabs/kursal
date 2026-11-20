@@ -886,7 +886,10 @@ These are the places where Kursal differs from what one might expect.
 - **Brands.** `forall 'k.` binds a brand like a type parameter, and a type that holds branded storage
   takes it as its last argument (`ArenaVec[Span['k], 'k]`). A brand is minted by a constructor that
   returns `exists 'k. ...` and is opened by `let exists 'k. cx = Domain!::new(hash_seed());`; a trait may take one
-  as a parameter (`forall D, 'k. trait Discharge`, `instance Discharge[Checker['k], 'k]`).
+  as a parameter (`forall D, 'k. trait Discharge`, `instance Discharge[Checker['k], 'k]`). A
+  function named bare as a value (`let f = g;`) keeps its brands without a premise quantified, each a
+  brand of its own that no type argument can name, even one written with the same name: a message
+  writes it numbered where another reads the same (`forall 'b1. fn(Brand['b1], Tok['b]) -> Tok['b]`).
 - **`NonNull[T]`** (`std::ptr::NonNull`) is a builtin type, like `*T` but never null:
   `NonNull::new(p)` checks and returns an `Option`, `unsafe (p as NonNull[T])` asserts it, `n as *T`
   (or `n.as_ptr()`) is safe, and `==` compares two. Its niche makes `Option[NonNull[T]]` and

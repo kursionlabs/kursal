@@ -585,7 +585,9 @@ class Surface:
     One `Surface` writes every type of one message, and the `nominal` names it writes outside them, such as
     a trait's. A nominal name reads as its last path segment unless another name in the message reads the
     same, when it reads as its full path. Where two different brands would read the same, each that a
-    `let exists` opened, at a position in `origins`, says where: `'k (opened at 15:9)`."""
+    `let exists` opened, at a position in `origins`, says where: `'k (opened at 15:9)`, and any other the
+    compiler made reads as its stem numbered apart from every other reading, as `'b1` for the brand `b#4`
+    that a function value keeps beside the brand `'b`."""
 
     def __init__(self, types: Iterable[Type], origins: Mapping[str, Position], nominal: Iterable[str] = ()) -> None:
         labels: set[str] = set()
@@ -598,6 +600,16 @@ class Surface:
             spellings[made_from(label)] = spellings.get(made_from(label), 0) + 1
         self.origins = origins
         self.qualified = {label for label in labels if spellings[made_from(label)] > 1 and label in origins}
+        # Any other brand the compiler made that reads as another does reads as its stem numbered anew.
+        taken = set(spellings)
+        self.renamed: dict[str, str] = {}
+        for label in sorted(label for label in labels
+                            if spellings[made_from(label)] > 1 and label not in origins and "#" in label):
+            n = 1
+            while f"{made_from(label)}{n}" in taken:
+                n += 1
+            self.renamed[label] = f"{made_from(label)}{n}"
+            taken.add(self.renamed[label])
         readings: dict[str, int] = {}
         for name in names:
             readings[_short(name)] = readings.get(_short(name), 0) + 1
@@ -614,6 +626,8 @@ class Surface:
         if label in self.qualified:
             line, col = self.origins[label]
             return f"{name} (opened at {line}:{col})"
+        if label in self.renamed:
+            return "'" + self.renamed[label]
         return name
 
     def show(self, ty: Type) -> str:

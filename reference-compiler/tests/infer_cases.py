@@ -16,6 +16,8 @@ def manifest(name: str, deps: tuple[str, ...] = ()) -> str:
 
 SHOW = "trait Show { fn show(x: Self) -> u32; }\ninstance Show[u32] { fn show(x: u32) -> u32 { x } }\n"
 OTHER = "trait Other { fn show(x: Self) -> u32; }\ninstance Other[u32] { fn show(x: u32) -> u32 { 0u32 } }\n"
+KEPT_BRAND = ("forall 'k. struct Tok { w: core::cap::Brand['k] }\n"
+              "forall 'b, T. fn g(w: core::cap::Brand['b], t: T) -> T { t }\n")
 NEXT = ("trait Next { fn step(x: Self) -> u32; }\ninstance Next[u32] { fn step(x: u32) -> u32 { x } }\n"
         "forall I where Next[I]. impl I { fn twice(self) -> u32 { 0u32 } }\n")
 
@@ -184,6 +186,9 @@ INFERENCES = (
     'exposed struct S { a: u32, b: u32 }\nfn main() -> i32 {\n    let s = S.{ a: 7u32, b: 9u32 };\n'
     '    let t = foreach a: A of s { let c: A = a; c };\n    let u = foreach b: A of s { let d: A = b; d };\n'
     '    let { a: x, b: y } = u;\n    (x + y) as i32\n}\n',
+    # A function value keeps its brand quantified beside the caller's brand of the same name.
+    KEPT_BRAND + "forall 'b. fn h(w: core::cap::Brand['b]) -> forall 'c. fn(core::cap::Brand['c], u32) -> u32 {\n"
+    "    let f = g;\n    let n = f(w, 1u32);\n    f\n}\n",
 )
 
 INFER_ERRORS = (
@@ -327,6 +332,14 @@ INFER_ERRORS = (
      "6:27: brand mismatch: Ref[u32, 'a] and Ref[u32, 'b]; 'a was opened at 3:5, 'b at 4:5"),
     ("fn f() -> u32 {\n    let x = {\n        let exists 'a. w = core::cap::fresh();\n        w\n    };\n    0u32\n}\n",
      "2:13: brand 'a escapes its lexical scope"),
+    # A brand a function value keeps is its own, under a name no source spells, which the message writes
+    # numbered beside a brand that reads the same ('b1): g's T is h's Tok['b], not one over the kept brand.
+    (KEPT_BRAND + "forall 'b. fn h(w: core::cap::Brand['b], t: Tok['b]) -> "
+     "forall 'b. fn(core::cap::Brand['b], Tok['b]) -> Tok['b] {\n    let f = g;\n    let u: Tok['b] = f(w, t);\n    f\n}\n",
+     "3:113: brand mismatch: forall 'b1. fn(Brand['b1], Tok['b]) -> Tok['b] and forall 'b. fn(Brand['b], Tok['b]) -> Tok['b]"),
+    (KEPT_BRAND + "forall 'q. fn h(w: core::cap::Brand['q], t: Tok['q]) -> "
+     "forall 'b. fn(core::cap::Brand['b], Tok['b]) -> Tok['b] {\n    let f = g;\n    let u: Tok['q] = f(w, t);\n    f\n}\n",
+     "3:113: brand mismatch: forall 'b1. fn(Brand['b1], Tok['q]) -> Tok['q] and forall 'b. fn(Brand['b], Tok['b]) -> Tok['b]"),
     ("forall T. fn apply(x: T, f: closure(T) -> u32) -> u32 {\n    let n: u32 = f;\n    n\n}\n",
      "2:18: type mismatch: struct { env: Env, code: fn(Env, T) -> u32 } and u32"),
     ("fn f() -> u32 {\n    let items = foreach item of (1u32, 2u32) { (item, 1u32) };\n    items + 1u32\n}\n",

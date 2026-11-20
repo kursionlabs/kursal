@@ -204,6 +204,21 @@ REJECTED = {
             (= %k (pack (exists ($p0) (tuple (brand $p0) (brand $p0))) ($q) %v))
             (= %r (const u32 0)) (ret %r))))"""),
 
+    # A brand a function value keeps is its own, never the caller's brand of the same name that a type
+    # argument names: g's T is h's Brand['b], not the kept 'b, so h cannot return Tok['c] for any 'c.
+    "kept_brand_captures_type_argument": ("returning_function", """
+        (type Tok! (forall ($k) () (struct (w (brand $k)))))
+        (fun g (forall ($b T) () T ((brand $b) T)
+          (entry ((%w (brand $b)) (%x T)) (ret %x))))
+        (fun h (forall ($b) () (fn (forall ($b) () (Tok! $b) ((brand $b) (Tok! $b)))) ()
+          (entry () (= %f (fn (g _ (Tok! $b)))) (ret %f))))"""),
+    "kept_brand_captures_type_argument_renamed": ("returning_function", """
+        (type Tok! (forall ($k) () (struct (w (brand $k)))))
+        (fun g (forall ($b T) () T ((brand $b) T)
+          (entry ((%w (brand $b)) (%x T)) (ret %x))))
+        (fun h (forall ($q) () (fn (forall ($b) () (Tok! $b) ((brand $b) (Tok! $b)))) ()
+          (entry () (= %f (fn (g _ (Tok! $q)))) (ret %f))))"""),
+
     # A zero-size type is erased: an unsafe cast has no representation of one to reinterpret, and C has
     # no zero-size parameter or object for an extern. Its loads and stores are accepted (test_zero_size).
     "cast_to_unit": ("zero_size_type_has_no_memory_form", """
@@ -262,6 +277,14 @@ class CoreSoundnessTests(unittest.TestCase):
                    (= %o (open %k ($t)))
                    (= (%x %y) (destruct %o (tuple (brand $t) (brand $p0))))
                    (= %r (const u32 0)) (ret %r))))""",
+            # A function value keeps a brand that a type argument's brand shares a name with: the kept one
+            # is renamed, so the value is quantified over a brand of its own beside the caller's.
+            """(fun g (forall ($b T) () T ((brand $b) T)
+                 (entry ((%w (brand $b)) (%x T)) (ret %x))))
+               (fun h (forall ($b) ()
+                   (fn (forall ($c) () (ptr (brand $b)) ((brand $c) (ptr (brand $b))))) ((brand $b) (ptr (brand $b)))
+                 (entry ((%w (brand $b)) (%p (ptr (brand $b)))) (= %f (fn (g _ (ptr (brand $b)))))
+                   (= %g (fn (g _ (ptr (brand $b))))) (= %v (call (%g $b) %w %p)) (ret %f))))""",
             # Pointer projection at the pointer's own type.
             """(type S (struct (a u32)))
                (fun h u32 ((ptr S)) (entry ((%p (ptr S)))
