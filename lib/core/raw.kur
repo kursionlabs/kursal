@@ -16,11 +16,11 @@
 use package as core;
 
 use core::option::Option;
-use core::slice::{Slice, ReadBytes, bytes_cmp_within, bytes_eq_within, find_byte, find_bytes, hash_bytes};
+use core::slice::{Slice, ReadBytes, StaticRead, byte_or_zero, bytes_cmp_within, bytes_eq, bytes_eq_within, find_byte, find_bytes, hash_bytes, rfind_byte};
 use core::cap::{Access, Brand, Exclusive!, Shared!, Stamp};
 use core::mem::sizeof;
 use core::ptr::offset;
-use core::ascii::is_space;
+use core::ascii::{space_prefix, space_suffix};
 use core::cmp::Order;
 use core::hash::{HashIn, HashState};
 use core::process::trap;
@@ -51,11 +51,13 @@ unsafe fn raw_byte_at(base: *u8, len: usize, i: usize) -> u8 {
 /// A byte range into some live text buffer, as `{ptr, len}`.
 ///
 /// Branded and restricted: a span names bytes in domain 'k, and only this
-/// module can build one or see its pointer. Reading the bytes needs the
-/// domain's capability, lent by any context that holds it
-/// (`core::cap::Access`: the `Exclusive!['k]` itself, an arena's
-/// `alloc::arena::Domain!`, a program's own context), so a span cannot be
-/// read once its arena's `Exclusive!['k]` is gone. `marker: Brand['k]` costs
+/// module can build one or see its pointer. Reading the bytes needs a
+/// capability that may read the domain (`core::slice::ReadBytes`): the
+/// `Exclusive!['k]` itself, a node of its shared-read tree, or a context that
+/// lends one (an arena's `alloc::arena::Domain!`, a program's own context),
+/// so a span cannot be read once its arena's `Exclusive!['k]` is gone.
+/// Planting one in a domain needs the `Exclusive!` itself, lent by a context
+/// (`core::cap::Access`). `marker: Brand['k]` costs
 /// nothing at runtime (`Brand` is Copy and zero-size) and does not make
 /// `Span` linear. Literals enter a domain through `Span::from_static`;
 /// spans over memory the caller just filled use `unsafe Span::from_raw_parts`.
@@ -64,31 +66,15 @@ unsafe fn raw_byte_at(base: *u8, len: usize, i: usize) -> u8 {
 /// a brand instead, for a module whose own object holds it (an arena), and
 /// is `unsafe` for that reason: a brand is `Copy` and proves nothing.
 ///
-/// The methods that read take the context by place, `&cx`. Generic code over
-/// any readable byte view goes through `ReadBytes` instead (`core::slice`'s
-/// `byte_or_zero`, `find_bytes`, `bytes_eq_within`, ...); spans have its instances
-/// for `Exclusive!` and `Shared!`.
+/// The methods that read take the capability by place, `&cx`. Generic code
+/// over any readable byte view goes through `ReadBytes` too (`core::slice`'s
+/// `byte_or_zero`, `find_bytes`, `bytes_eq_within`, ...); spans have its
+/// instances for `Exclusive!` and `Shared!`.
 forall 'k.
 struct Span {
     ptr: *u8,
     len: usize,
     marker: Brand['k],
-}
-
-/// Byte-for-byte equality of two raw buffers. Takes no capability: a caller
-/// may hold bytes that are alive by construction with no witness in scope.
-/// `unsafe`: `len` must bound both `a` and `b`; `raw_byte_at`'s bounds
-/// check only guards against `len`, so a wrong `len` reads out of bounds.
-/// Compares the first `i` bytes, last byte first: names of one length
-/// usually differ at the end (`t_17` and `t_18`, `a::b::x` and `a::b::y`).
-unsafe fn raw_span_bytes_eq(a: *u8, b: *u8, len: usize, i: usize) -> bool {
-    var j = i;
-    var same = true;
-    while same && j > 0usize {
-        j = j - 1usize;
-        same = unsafe raw_byte_at(a, len, j) == unsafe raw_byte_at(b, len, j);
-    }
-    same
 }
 
 forall 'k.
@@ -195,28 +181,27 @@ impl Span['k] {
         self.skip(start).take(end - start)
     }
 
+    // The methods below read the bytes, through any capability that may read
+    // them (`ReadBytes`): the domain's `Exclusive!`, a node of its shared-read
+    // tree, or a context that lends one (`alloc::arena::Domain!`). They read
+    // through the trait, never the span's pointer, so an instance can only
+    // hand back wrong bytes, not read memory it has no capability for.
+    // `Slice[u8, 'k]` has the same methods, in `core::slice`.
+
     /// Without the ASCII whitespace at its start (`core::ascii::is_space`).
-    forall C, R where Access[C -> 'k, R].
+    forall C where ReadBytes[C, Span['k]].
     fn trim_start(self, &cx: C) -> Span['k] {
-        var start = 0usize;
-        while start < self.len() && is_space(self.byte_or_zero(&cx, start)) {
-            start = start + 1usize;
-        }
-        self.skip(start)
+        self.skip(space_prefix(&cx, self))
     }
 
     /// Without the ASCII whitespace at its end.
-    forall C, R where Access[C -> 'k, R].
+    forall C where ReadBytes[C, Span['k]].
     fn trim_end(self, &cx: C) -> Span['k] {
-        var end = self.len();
-        while end > 0usize && is_space(self.byte_or_zero(&cx, end - 1usize)) {
-            end = end - 1usize;
-        }
-        self.take(end)
+        self.take(self.len() - space_suffix(&cx, self))
     }
 
     /// Without the ASCII whitespace at either end.
-    forall C, R where Access[C -> 'k, R].
+    forall C where ReadBytes[C, Span['k]].
     fn trim(self, &cx: C) -> Span['k] {
         self.trim_start(&cx).trim_end(&cx)
     }
@@ -238,17 +223,14 @@ impl Span['k] {
     }
 
     /// Byte `i`, or `None` past the end.
-    forall C, R where Access[C -> 'k, R].
+    forall C where ReadBytes[C, Span['k]].
     fn get(self, &cx: C, i: usize) -> Option[u8] {
-        let (tag, rest) = Access[C -> 'k, R]::open(cx);
-        let b = unsafe span_byte_at(self, i);
-        cx = Access[C -> 'k, R]::close(tag, rest);
-        b
+        ReadBytes[C, Span['k]]::get(&cx, self, i)
     }
 
     /// Byte `i`; stops the program (`core::process::trap`) past the end.
     /// `get` is the form for an index that may miss.
-    forall C, R where Access[C -> 'k, R].
+    forall C where ReadBytes[C, Span['k]].
     fn at(self, &cx: C, i: usize) -> u8 {
         match self.get(&cx, i) {
             Option::Some(b) => b,
@@ -259,112 +241,75 @@ impl Span['k] {
     /// Byte `i`, or `0u8` past the end: a sentinel for scanners whose
     /// character-class tests already treat `0u8` as matching nothing
     /// (`core::slice::byte_or_zero`).
-    forall C, R where Access[C -> 'k, R].
+    forall C where ReadBytes[C, Span['k]].
     fn byte_or_zero(self, &cx: C, i: usize) -> u8 {
-        let (tag, rest) = Access[C -> 'k, R]::open(cx);
-        let { ptr, len, marker } = self;
-        let b = unsafe raw_byte_at(ptr, len, i);
-        cx = Access[C -> 'k, R]::close(tag, rest);
-        b
+        byte_or_zero(&cx, self, i)
     }
 
     /// Byte equality with another span of the domain.
-    forall C, R where Access[C -> 'k, R].
+    forall C where ReadBytes[C, Span['k]].
     fn eq(self, &cx: C, other: Span['k]) -> bool {
-        let (tag, rest) = Access[C -> 'k, R]::open(cx);
-        let { ptr: ap, len: an, marker: am } = self;
-        let { ptr: bp, len: bn, marker: bm } = other;
         // Spans of one buffer often share their bytes; skip the byte walk.
-        let aliased = unsafe (ap as usize) == unsafe (bp as usize);
-        let same = an == bn && (aliased || unsafe raw_span_bytes_eq(ap, bp, an, an));
-        cx = Access[C -> 'k, R]::close(tag, rest);
-        same
+        (self.address() == other.address() && self.len() == other.len()) || bytes_eq_within(&cx, self, other)
     }
 
     /// Byte equality with a literal.
-    forall C, R where Access[C -> 'k, R].
+    forall C where ReadBytes[C, Span['k]].
     fn is(self, &cx: C, literal: Slice[u8, 'static]) -> bool {
-        let (tag, rest) = Access[C -> 'k, R]::open(cx);
-        let { ptr: ap, len: an, marker: am } = self;
-        let (lp, ln, lm) = literal.into_parts();
-        let same = an == ln && unsafe raw_span_bytes_eq(ap, lp, an, an);
-        cx = Access[C -> 'k, R]::close(tag, rest);
-        same
+        var sr = StaticRead::new();
+        bytes_eq(&cx, self, &sr, literal)
     }
 
     /// Byte order, as unsigned values, a shorter prefix first
     /// (`core::slice::bytes_cmp`).
-    forall C, R where Access[C -> 'k, R].
+    forall C where ReadBytes[C, Span['k]].
     fn cmp(self, &cx: C, other: Span['k]) -> Order {
-        let (tag, rest) = Access[C -> 'k, R]::open(cx);
-        let order = bytes_cmp_within(&tag, self, other);
-        cx = Access[C -> 'k, R]::close(tag, rest);
-        order
+        bytes_cmp_within(&cx, self, other)
     }
 
     /// Whether the span's bytes start with `prefix`'s.
-    forall C, R where Access[C -> 'k, R].
+    forall C where ReadBytes[C, Span['k]].
     fn starts_with(self, &cx: C, prefix: Span['k]) -> bool {
         prefix.len() <= self.len() && self.take(prefix.len()).eq(&cx, prefix)
     }
 
     /// Whether the span's bytes end with `suffix`'s.
-    forall C, R where Access[C -> 'k, R].
+    forall C where ReadBytes[C, Span['k]].
     fn ends_with(self, &cx: C, suffix: Span['k]) -> bool {
         suffix.len() <= self.len() && self.skip(self.len() - suffix.len()).eq(&cx, suffix)
     }
 
     /// The first index at or after `start` where `needle`'s bytes appear
     /// (`core::slice::find_bytes`).
-    forall C, R where Access[C -> 'k, R].
+    forall C where ReadBytes[C, Span['k]].
     fn find(self, &cx: C, needle: Span['k], start: usize) -> Option[usize] {
-        let (tag, rest) = Access[C -> 'k, R]::open(cx);
-        let found = find_bytes(&tag, self, needle, start);
-        cx = Access[C -> 'k, R]::close(tag, rest);
-        found
+        find_bytes(&cx, self, needle, start)
     }
 
     /// Whether `needle`'s bytes appear in the span.
-    forall C, R where Access[C -> 'k, R].
+    forall C where ReadBytes[C, Span['k]].
     fn contains(self, &cx: C, needle: Span['k]) -> bool {
         self.find(&cx, needle, 0usize).is_some()
     }
 
     /// The first index at or after `start` holding `byte`
     /// (`core::slice::find_byte`).
-    forall C, R where Access[C -> 'k, R].
+    forall C where ReadBytes[C, Span['k]].
     fn find_byte(self, &cx: C, byte: u8, start: usize) -> Option[usize] {
-        let (tag, rest) = Access[C -> 'k, R]::open(cx);
-        let found = find_byte(&tag, self, byte, start);
-        cx = Access[C -> 'k, R]::close(tag, rest);
-        found
+        find_byte(&cx, self, byte, start)
     }
 
-    /// The last index holding `byte`.
-    forall C, R where Access[C -> 'k, R].
+    /// The last index holding `byte` (`core::slice::rfind_byte`).
+    forall C where ReadBytes[C, Span['k]].
     fn rfind_byte(self, &cx: C, byte: u8) -> Option[usize] {
-        let (tag, rest) = Access[C -> 'k, R]::open(cx);
-        let { ptr, len, marker } = self;
-        var i = len;
-        var found = Option::None;
-        while found.is_none() && i > 0usize {
-            i = i - 1usize;
-            if unsafe raw_byte_at(ptr, len, i) == byte {
-                found = Option::Some.(i);
-            }
-        }
-        cx = Access[C -> 'k, R]::close(tag, rest);
-        found
+        rfind_byte(&cx, self, byte)
     }
 
-    /// The bytes' djb2 hash: the value `HashIn` feeds a fresh `HashState`.
-    forall C, R where Access[C -> 'k, R].
+    /// The bytes' hash: the state `HashIn` makes of them from a fresh
+    /// `HashState`, finished, as `Slice[u8, 'k]::hash` makes of the same bytes.
+    forall C where ReadBytes[C, Span['k]].
     fn hash(self, &cx: C) -> u64 {
-        let (tag, rest) = Access[C -> 'k, R]::open(cx);
-        let { ptr, len, marker } = self;
-        let state = unsafe HashState::new().write_bytes(ptr, len);
-        cx = Access[C -> 'k, R]::close(tag, rest);
-        state.finish()
+        hash_bytes(&cx, self, HashState::new()).finish()
     }
 }
 
@@ -405,12 +350,13 @@ instance ReadBytes[Shared!['r, 'q], Span['r]] {
 }
 
 // A span as a map key read through its domain's capability, as
-// `core::slice` makes a byte slice one. Hashes as `Span::hash` does.
+// `core::slice` makes a byte slice one, and hashed as one: the same bytes
+// hash the same in either.
 /// Spans hash and compare by their bytes, read through the capability `C`.
 forall C, 't where ReadBytes[C, Span['t]].
 instance HashIn[Span['t], C] {
     fn hash_in(&cx: C, key: Span['t], state: HashState) -> HashState {
-        state.write_u64(hash_bytes(&cx, key, HashState::new()).finish())
+        hash_bytes(&cx, key, state)
     }
 
     // Spans of one buffer often share their bytes; equal addresses and

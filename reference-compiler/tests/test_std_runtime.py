@@ -1392,6 +1392,84 @@ class StdRuntimeTests(unittest.TestCase):
                 if pair.0 == 10u32 && pair.1 == 20u32 && back.0 == 1u32 && back.1 == 2u32 && fallible == 5u32 { 0 } else { 1 }
             }''')
 
+    def test_readers_of_a_shared_tree_use_slices_and_spans(self):
+        # A `Shared!` node, not the `Exclusive!`, reads a slice's element through `get_ref` and a span's and
+        # a byte slice's bytes through their read methods; the writer comes back once the tree is joined.
+        self.expect('''
+            use std::bytes::buffer::Buffer!;
+            use std::raw::Span;
+            fn main() -> i32 {
+                let exists 'b. (tag, bytes, restore) = Buffer!::new().push_static("  key=value \\n").open();
+                let exists 'q. (root, back) = tag.share();
+                let exists 'l, 'r. (left, right, join) = root.split();
+                let second = match bytes.get_ref(2usize) {
+                    std::option::Option::Some(at) => at.read(&left),
+                    std::option::Option::None => 0u8,
+                };
+                let text = Span::from_slice(bytes).trim(&left);
+                let key = text.take(text.find_byte(&right, b'=', 0usize).unwrap_or(0usize));
+                let spans = key.is(&left, "key") && text.ends_with(&right, Span::from_slice(bytes).slice(6usize, 11usize))
+                    && text.get(&left, 0usize).unwrap_or(0u8) == b'k' && text.rfind_byte(&right, b'e').unwrap_or(0usize) == 8usize
+                    && text.cmp(&left, key).is_gt() && !text.eq(&right, key) && text.contains(&left, key);
+                let slices = bytes.trim(&right).is(&left, "key=value") && bytes.trim_start(&left).len() == 11usize
+                    && bytes.trim_end(&right).len() == 11usize && bytes.skip(2usize).starts_with(&left, bytes.slice(2usize, 5usize))
+                    && bytes.find(&right, bytes.slice(6usize, 8usize), 0usize).unwrap_or(0usize) == 6usize
+                    && bytes.rfind_byte(&left, b' ').unwrap_or(0usize) == 11usize && bytes.byte_or_zero(&right, 99usize) == 0u8;
+                let tag = back.resume(join.join(left, right));
+                let written = match bytes.get_ref(0usize) {
+                    std::option::Option::Some(at) => { at.set(&tag, b'#'); at.copy(&tag) },
+                    std::option::Option::None => 0u8,
+                };
+                restore.restore(tag).destroy();
+                if second == b'k' && spans && slices && written == b'#' { 0 } else { 1 }
+            }''')
+
+    def test_readers_of_a_shared_tree_cannot_write(self):
+        self.reject('''
+            use std::bytes::buffer::Buffer!;
+            fn main() -> i32 {
+                let exists 'b. (tag, bytes, restore) = Buffer!::new().push_static("ab").open();
+                let exists 'q. (root, back) = tag.share();
+                match bytes.get_ref(0usize) {
+                    std::option::Option::Some(at) => at.set(&root, b'#'),
+                    std::option::Option::None => (),
+                }
+                restore.restore(back.resume(root)).destroy();
+                0
+            }''', "no instance of Access")
+
+    def test_byte_slices_and_spans_of_the_same_bytes_hash_alike(self):
+        self.expect('''
+            use std::bytes::buffer::Buffer!;
+            use std::raw::Span;
+            use std::hash::{HashIn, HashState, key_hash};
+            use std::cap::Exclusive!;
+            use std::slice::{Slice, StaticRead};
+            fn main() -> i32 {
+                let exists 'b. (tag, bytes, restore) = Buffer!::new().push_static("name").open();
+                let span = Span::from_slice(bytes);
+                let sr = StaticRead::new();
+                let literal: Slice[u8, 'static] = "name";
+                let same = span.hash(&tag) == bytes.hash(&tag) && bytes.hash(&tag) == literal.hash(&sr)
+                    && key_hash(&tag, span) == key_hash(&tag, bytes) && key_hash(&tag, bytes) == key_hash(&sr, literal)
+                    && HashIn[Span['b], Exclusive!['b]]::hash_in(&tag, span, HashState::new()).finish() == span.hash(&tag);
+                restore.restore(tag).destroy();
+                if same { 0 } else { 1 }
+            }''')
+
+    def test_c_strings_read_their_bytes_safely(self):
+        self.expect('''
+            use std::process::Args;
+            use std::slice::StaticRead;
+            use std::option::Option;
+            fn main(args: Args) -> i32 {
+                let sr = StaticRead::new();
+                match args.get(1usize) {
+                    Option::Some(arg) => if arg.len() == 5usize && arg.bytes().is(&sr, "hello") && args.bytes(1usize).unwrap().is(&sr, "hello") { 0 } else { 1 },
+                    Option::None => 2,
+                }
+            }''', args=("hello",))
+
     # ------------------------------------------------------ collections API --
 
     def test_vectors_sort_stably_and_edit_in_place(self):

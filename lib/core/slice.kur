@@ -40,6 +40,7 @@ use core::option::Option;
 use core::cmp::Order;
 use core::iter::Iterator;
 use core::process::trap;
+use core::ascii::{space_prefix, space_suffix};
 
 /// A checked view of `len` contiguous `T`s in domain `'k`.
 ///
@@ -92,33 +93,33 @@ impl Slice[T, 'k] {
     }
 
     /// A `Ref` of the same brand to element `i`, or `None` when `i` is out
-    /// of range; reads and writes then go through `Ref::with`. Mirrors
-    /// `Vec!::get_ref`. The bounds check is what makes this sound: the brand
-    /// only proves the allocation is live, not that `i` is inside it.
+    /// of range. Reads and writes then go through the `Ref`, under the
+    /// capability its brand asks for: `Ref::with` and `copy` under the
+    /// `Exclusive!` a context lends, `Ref::read` under a `Shared!` node.
+    /// Mirrors `Vec!::get_ref`. Pure address projection with the same brand,
+    /// like `sub`, so it needs no capability. The bounds check is what makes
+    /// this sound: the brand only proves the allocation is live, not that
+    /// `i` is inside it.
     ///
     /// `Option`, not an abort and not a sentinel: this is a fallible lookup,
     /// the same shape as `core::raw::raw_get` (`Option[T]`) and the map
     /// lookups (`HashMap!::get`, `Option[Ref[V,'k]]`).
-    forall C, R where Access[C -> 'k, R].
-    fn get_ref(self, &cx: C, i: usize) -> Option[Ref[T, 'k]] {
-        let (tag, rest) = Access[C -> 'k, R]::open(cx);
+    fn get_ref(self, i: usize) -> Option[Ref[T, 'k]] {
         let { ptr: p, len: n, marker: m } = self;
-        let out: Option[Ref[T, 'k]] = if i < n {
+        if i < n {
             let ep = unsafe offset(p, i);
             // In bounds of this slice, whose extent is live under `m`.
             Option::Some.(unsafe Ref::from_raw(ep, m))
         } else {
             Option::None
-        };
-        cx = Access[C -> 'k, R]::close(tag, rest);
-        out
+        }
     }
 
     /// A copy of element `i`, read through the capability `cx` lends, or
     /// `None` when `i` is out of range.
     forall C, R where Copy[T], Access[C -> 'k, R].
     fn get(self, &cx: C, i: usize) -> Option[T] {
-        match self.get_ref(&cx, i) {
+        match self.get_ref(i) {
             Option::Some(r) => Option::Some.(r.copy(&cx)),
             Option::None => Option::None,
         }
@@ -129,7 +130,7 @@ impl Slice[T, 'k] {
     /// miss.
     forall C, R where Copy[T], Access[C -> 'k, R].
     fn at(self, &cx: C, i: usize) -> T {
-        match self.get_ref(&cx, i) {
+        match self.get_ref(i) {
             Option::Some(r) => r.copy(&cx),
             Option::None => trap(),
         }
@@ -168,6 +169,28 @@ impl Slice[T, 'k] {
             }
         };
         out
+    }
+
+    /// The first `count` elements, or the whole slice if it is shorter.
+    fn take(self, count: usize) -> Slice[T, 'k] {
+        let { ptr: p, len: n, marker: m } = self;
+        Slice.{ ptr: p, len: if count < n { count } else { n }, marker: m }
+    }
+
+    /// Everything after the first `count` elements, or an empty slice at the
+    /// end.
+    fn skip(self, count: usize) -> Slice[T, 'k] {
+        let { ptr: p, len: n, marker: m } = self;
+        let c = if count < n { count } else { n };
+        Slice.{ ptr: unsafe offset(p, c), len: n - c, marker: m }
+    }
+
+    /// Elements `start` to `end`, each clamped to the slice (an empty slice
+    /// when `start` is past `end`).
+    fn slice(self, start: usize, end: usize) -> Slice[T, 'k] {
+        let end = if end > self.len() { self.len() } else { end };
+        let start = if start > end { end } else { start };
+        self.skip(start).take(end - start)
     }
 }
 
@@ -290,14 +313,16 @@ fn byte_or_zero(&cx: C, bytes: S, index: usize) -> u8 {
 /// Content equality of two byte views, of equal or different brands and
 /// capabilities. Two views of one exclusively owned domain cannot both
 /// take its single `Exclusive!`; split shared access first (`Exclusive!::share`,
-/// `Shared!::split`).
+/// `Shared!::split`). Compares the last byte first: names of one length
+/// usually differ at the end (`t_17` and `t_18`, `a::b::x` and `a::b::y`).
 forall C1, S1, C2, S2 where ReadBytes[C1, S1], ReadBytes[C2, S2], Copy[S1], Copy[S2].
 fn bytes_eq(&left_cap: C1, left: S1, &right_cap: C2, right: S2) -> bool {
     let n = ReadBytes[C1, S1]::len(&left_cap, left);
     let m = ReadBytes[C2, S2]::len(&right_cap, right);
     var same = n == m;
-    var i = 0usize;
-    while same && i < n {
+    var i = n;
+    while same && i > 0usize {
+        i = i - 1usize;
         let a = ReadBytes[C1, S1]::get(&left_cap, left, i);
         let b = ReadBytes[C2, S2]::get(&right_cap, right, i);
         let equal = match a {
@@ -310,7 +335,6 @@ fn bytes_eq(&left_cap: C1, left: S1, &right_cap: C2, right: S2) -> bool {
             Option::None => false,
         };
         same = equal;
-        i = i + 1usize;
     }
     same
 }
@@ -346,14 +370,17 @@ fn bytes_cmp(&left_cap: C1, left: S1, &right_cap: C2, right: S2) -> Order {
 }
 
 /// `bytes_eq` for two views of one domain, read through its one capability
-/// (which cannot be passed twice when it is linear).
+/// (which cannot be passed twice when it is linear); the last byte first,
+/// as `bytes_eq` compares.
 forall C, S where ReadBytes[C, S], Copy[S].
 fn bytes_eq_within(&cx: C, left: S, right: S) -> bool {
-    let order = bytes_cmp_within(&cx, left, right);
-    let same = match order {
-        Order::Equal => true,
-        _ => false,
-    };
+    let n = ReadBytes[C, S]::len(&cx, left);
+    var same = n == ReadBytes[C, S]::len(&cx, right);
+    var i = n;
+    while same && i > 0usize {
+        i = i - 1usize;
+        same = byte_or_zero(&cx, left, i) == byte_or_zero(&cx, right, i);
+    }
     same
 }
 
@@ -432,6 +459,20 @@ fn find_bytes(&cx: C, bytes: S, needle: S, start: usize) -> Option[usize] {
     found
 }
 
+/// The last index holding `needle`.
+forall C, S where ReadBytes[C, S], Copy[S].
+fn rfind_byte(&cx: C, bytes: S, needle: u8) -> Option[usize] {
+    var i = ReadBytes[C, S]::len(&cx, bytes);
+    var found = Option::None;
+    while found.is_none() && i > 0usize {
+        i = i - 1usize;
+        if byte_or_zero(&cx, bytes, i) == needle {
+            found = Option::Some.(i);
+        }
+    }
+    found
+}
+
 /// Feeds a byte view's contents into `state`, byte by byte.
 forall C, S where ReadBytes[C, S], Copy[S].
 fn hash_bytes(&cx: C, bytes: S, state: HashState) -> HashState {
@@ -448,6 +489,100 @@ fn hash_bytes(&cx: C, bytes: S, state: HashState) -> HashState {
         i = i + 1usize;
     }
     s
+}
+
+// ------------------------------------------------------------ byte views --
+// A byte slice reads as a `core::raw::Span` does, with the same methods,
+// each through any capability that may read it (`ReadBytes`).
+
+forall 'k.
+impl Slice[u8, 'k] {
+    /// Without the ASCII whitespace at its start (`core::ascii::is_space`).
+    forall C where ReadBytes[C, Slice[u8, 'k]].
+    fn trim_start(self, &cx: C) -> Slice[u8, 'k] {
+        self.skip(space_prefix(&cx, self))
+    }
+
+    /// Without the ASCII whitespace at its end.
+    forall C where ReadBytes[C, Slice[u8, 'k]].
+    fn trim_end(self, &cx: C) -> Slice[u8, 'k] {
+        self.take(self.len() - space_suffix(&cx, self))
+    }
+
+    /// Without the ASCII whitespace at either end.
+    forall C where ReadBytes[C, Slice[u8, 'k]].
+    fn trim(self, &cx: C) -> Slice[u8, 'k] {
+        self.trim_start(&cx).trim_end(&cx)
+    }
+
+    /// Byte `i`, or `0u8` past the end (`byte_or_zero`).
+    forall C where ReadBytes[C, Slice[u8, 'k]].
+    fn byte_or_zero(self, &cx: C, i: usize) -> u8 {
+        byte_or_zero(&cx, self, i)
+    }
+
+    /// Byte equality with another slice of the domain.
+    forall C where ReadBytes[C, Slice[u8, 'k]].
+    fn eq(self, &cx: C, other: Slice[u8, 'k]) -> bool {
+        bytes_eq_within(&cx, self, other)
+    }
+
+    /// Byte equality with a literal.
+    forall C where ReadBytes[C, Slice[u8, 'k]].
+    fn is(self, &cx: C, literal: Slice[u8, 'static]) -> bool {
+        var sr = StaticRead::new();
+        bytes_eq(&cx, self, &sr, literal)
+    }
+
+    /// Byte order, as unsigned values, a shorter prefix first (`bytes_cmp`).
+    forall C where ReadBytes[C, Slice[u8, 'k]].
+    fn cmp(self, &cx: C, other: Slice[u8, 'k]) -> Order {
+        bytes_cmp_within(&cx, self, other)
+    }
+
+    /// Whether the slice's bytes start with `prefix`'s.
+    forall C where ReadBytes[C, Slice[u8, 'k]].
+    fn starts_with(self, &cx: C, prefix: Slice[u8, 'k]) -> bool {
+        prefix.len() <= self.len() && self.take(prefix.len()).eq(&cx, prefix)
+    }
+
+    /// Whether the slice's bytes end with `suffix`'s.
+    forall C where ReadBytes[C, Slice[u8, 'k]].
+    fn ends_with(self, &cx: C, suffix: Slice[u8, 'k]) -> bool {
+        suffix.len() <= self.len() && self.skip(self.len() - suffix.len()).eq(&cx, suffix)
+    }
+
+    /// The first index at or after `start` where `needle`'s bytes appear
+    /// (`find_bytes`).
+    forall C where ReadBytes[C, Slice[u8, 'k]].
+    fn find(self, &cx: C, needle: Slice[u8, 'k], start: usize) -> Option[usize] {
+        find_bytes(&cx, self, needle, start)
+    }
+
+    /// Whether `needle`'s bytes appear in the slice.
+    forall C where ReadBytes[C, Slice[u8, 'k]].
+    fn contains(self, &cx: C, needle: Slice[u8, 'k]) -> bool {
+        self.find(&cx, needle, 0usize).is_some()
+    }
+
+    /// The first index at or after `start` holding `byte` (`find_byte`).
+    forall C where ReadBytes[C, Slice[u8, 'k]].
+    fn find_byte(self, &cx: C, byte: u8, start: usize) -> Option[usize] {
+        find_byte(&cx, self, byte, start)
+    }
+
+    /// The last index holding `byte` (`rfind_byte`).
+    forall C where ReadBytes[C, Slice[u8, 'k]].
+    fn rfind_byte(self, &cx: C, byte: u8) -> Option[usize] {
+        rfind_byte(&cx, self, byte)
+    }
+
+    /// The bytes' hash: the state `HashIn` makes of them from a fresh
+    /// `HashState`, finished, the same as `Span::hash` of the same bytes.
+    forall C where ReadBytes[C, Slice[u8, 'k]].
+    fn hash(self, &cx: C) -> u64 {
+        hash_bytes(&cx, self, HashState::new()).finish()
+    }
 }
 
 // A byte view of a domain, as a map key read through that domain's

@@ -253,7 +253,7 @@ double free.
 |---|---|
 | `core::raw::raw_get` | `base[0..len)` is a readable array; an out-of-range `i` returns `None` |
 | `core::raw::raw_byte_at` | the same; out of range returns `0u8`, deliberately, for scanners that treat NUL as matching nothing |
-| `core::raw::raw_span_bytes_eq` | `a[0..len)` and `b[0..len)` are both readable; the byte loop behind the capability-checked span equality |
+
 | `core::raw::span_byte_at`, `core::slice::slice_byte_at` | the caller has just been handed a read capability for the view's brand; these read with no capability of their own and are the shared bodies of the `ReadBytes` instances |
 | `core::cstr::cstr_len` | the pointer addresses a NUL-terminated byte run; there is no length to bound the scan |
 | `core::cstr::CStr::from_raw` | `ptr` names a NUL-terminated byte run that stays readable and unchanged for the rest of the process, as `argv` entries do: a `CStr` is `Copy` and carries no brand, so nothing ends its use earlier |
@@ -274,7 +274,7 @@ a checked type; their obligation is the same kind of thing.
 
 | Function | Caller must guarantee |
 |---|---|
-| `alloc::owned::Allocation!::base` | the returned `*T` addresses memory the caller **still owns**, since the `Allocation!` stays with it (`Buffer!::as_ptr`'s situation, not `into_raw`'s). It is invalidated by the `release`/`grow` that retires or moves the block, and it cannot be turned back into an `Allocation!` |
+
 | `core::slice::Slice::from_raw_parts` | `ptr[0..len)` is live, initialized and accessible under `marker`'s brand |
 | `core::mem::Ref::from_raw` | `ptr` points at a live `T` inside the domain `marker` names, so presenting that domain's capability really authorizes the access |
 | `core::raw::Span::from_raw_parts` | `ptr[0..len)` is initialized and stays readable while the domain of the context `&cx` lends has its capability. Literal-backed spans use the safe `Span::from_static` |
@@ -302,20 +302,19 @@ supplies is what must behave.
 They are `unsafe fn` **on the function**, never `unsafe fn` on the
 callback's type, and the difference matters:
 
-- `unsafe fn map(self, f: fn(*T) -> *E) -> Ref[E,'k]` says "calling `map`
-  is unsafe": the caller writes `unsafe r.map(f)` and thereby asserts the
-  property `map` cannot check.
-- `fn map(self, f: unsafe fn(*T) -> *E) -> Ref[E,'k]` would say "the
-  callback may do unsafe things": a safe `map` that accepts an unsafe
-  callback, callable with no marker anywhere. That is a different and, here,
-  wrong statement.
+- `unsafe fn visit(self, f: fn(*T) -> *E)` says "calling `visit` is
+  unsafe": the caller writes `unsafe visit(f)` and thereby asserts the
+  property `visit` cannot check.
+- `fn visit(self, f: unsafe fn(*T) -> *E)` would say "the callback may do
+  unsafe things": a safe `visit` that accepts an unsafe callback, callable
+  with no marker anywhere. That is a different and, here, wrong statement.
 
 | Function | Caller must guarantee |
 |---|---|
 | `alloc::collections::hashmap::hash_key`, `keys_equal` | the pointers address live keys of type `K`; each key is moved out and put back |
 | `alloc::collections::hashmap::find_chain`, `find_chain_by`, `key_matches`, `put_chain`, `take_chain`, `rehash_bucket_hashed`, `resize_hashed` | the map's own chain and bucket invariants; reached from the safe `get`/`find`/`insert`/`remove` |
 | `alloc::collections::hashmap::find_chain_in`, `put_chain_in`, `take_chain_in`, `rehash_bucket_in`, `resize_in` | the same invariants, for keys read through a domain's capability; reached from the safe `get_in`/`insert_in`/`remove_in` |
-| `core::mem::Ref::map` | `f` returns a pointer *into the same allocation* as its argument; the result is stamped with the original brand `'k` with no check that the new address belongs to it |
+
 | `libc::thread::spawn` | see section 2.1 |
 
 `libc::thread::spawn` is the one function whose callback type is itself
@@ -450,7 +449,10 @@ address.
 is an ordinary, recoverable condition:
 
 - `core::slice::Slice::get_ref` returns `Option[Ref[T,'k]]`, checked
-  against the slice's `len`;
+  against the slice's `len`. It takes no capability: it computes an
+  address and reads nothing, like `sub`, and every read or write through
+  the `Ref` presents the brand's capability (`Ref::read` a `Shared!` node,
+  `copy`/`with`/`set` the `Exclusive!`);
 - `core::slice::Slice::sub` returns `Option[Slice[T,'k]]`, checked by
   subtraction (`start > len`, then `count > len - start`) so a `count` near
   `usize::MAX` cannot wrap into range;
@@ -510,8 +512,8 @@ Types whose hidden representation protects authority or bounds:
 | `SharedResume!['r,'q]` | `core::cap` | the inverse of `share`; demands the exact root node back |
 | `Slice[T,'k]` | `core::slice` | pairs a pointer with an independent `len`; a forged `len` reads and writes past the allocation through the bounds-checked accessors |
 | `StaticRead` | `core::slice` | the read capability for `'static` byte slices; harmless to duplicate, since it grants no write, resume or deallocation |
-| `Span['k]` | `core::raw` | bytes in domain `'k`, readable in safe code only through that domain's capability; built only by `from_static` or the unsafe constructors |
-| `CStr` | `core::cstr` | a live NUL-terminated string, built only by unsafe adoption or `Args::get` |
+| `Span['k]` | `core::raw` | bytes in domain `'k`, readable in safe code only through a capability that may read the domain (`ReadBytes`: its `Exclusive!`, a node of its shared-read tree, a context lending one); built only by `from_static` or the unsafe constructors |
+| `CStr` | `core::cstr` | a live NUL-terminated string, built only by unsafe adoption or `Args::get`; so `len` and `bytes`, which read it as a `'static` view, are safe |
 | `Array![T]` | `core::array` | storage with exactly `len` initialized elements |
 | `Vec![T,'k]` | `alloc::collections::vec` | a pointer with a `len`/`cap` the module maintains; a forged one is indexed and freed through |
 | `HashMap![K,V,'k]`, `Entry[K,V]` | `alloc::collections::hashmap` | `buckets` matches `bucket_count`; entries are the chain nodes `free_one`/`destroy_chain` free |
