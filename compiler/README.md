@@ -719,8 +719,9 @@ v3 = v2 >= -0x1p63 && v2 < 0x1p63 ? (int64_t)v2 : v2 > 0 ? INT64_MAX : v2 < 0 ? 
 ```
 
 For an unsigned `T` the range is `x > -1 && x < 0x1pN`, and for `usize` and `isize` the bounds are
-`(double)INTPTR_MIN` and its negation (doubled for `usize`), at the target's width. Clang and GCC
-compile it to two comparisons around the conversion instruction (`cvttsd2si` on x86-64).
+`(double)INTPTR_MIN` and its negation (doubled for `usize`), at the target's width. On x86-64,
+Clang at -O2 compiles the in-range path to two comparisons and the conversion instruction
+(`cvttsd2si`), the saturating cases to a branch beside it.
 
 `cast`, the unsafe reinterpretation, never takes a number to a number (`unsafe_cast_between_numbers`);
 the front end never asks it to, since `as` between numbers is `int_cast` or `float_cast`. A float's

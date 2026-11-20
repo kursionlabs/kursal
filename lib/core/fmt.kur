@@ -22,9 +22,25 @@
 // calls -- literal segments through `Writable::write_static`, `{expr}`
 // segments through `Format::format` -- so instances are written once,
 // generically over the writer, and work with every writer.
+//
+// Floats. An `f64` or `f32` is written as the decimal with the fewest
+// significant digits that reads back as the same float (`core::dtoa`), and
+// of those the nearest: `0.1` for 0.1, `0.30000000000000004` for 0.1 + 0.2,
+// `0.1` again for `0.1f32`. The digits are laid out as ECMAScript's
+// `Number::toString` lays them out, with `e` before a bare exponent:
+//
+// - an integer below 10^21 in full, with no point: `2`, `100`,
+//   `100000000000000000000`;
+// - a number from 10^-6 below 10^21 with a point: `2.5`, `0.000001`;
+// - anything else with an exponent: `1e21`, `1.5e300`, `1e-7`, `5e-324`;
+// - `-` before a negative number and -0.0 (`-0`); `inf`, `-inf` and `NaN`.
+//
+// Every one of them reads back through `std::float::parse_f64` (C's
+// `strtod`) as the float written, a NaN as some NaN.
 
 use package as core;
 
+use core::dtoa::{Decimal, shortest};
 use core::slice::{Slice, ReadBytes, Readable};
 use core::option::Option;
 use core::raw::Span;
@@ -86,6 +102,111 @@ fn write_i64(out: W, n: i64) -> W {
     } else {
         write_u64(out, (n as u64))
     }
+}
+
+/// Writes `x` as the shortest decimal that reads back as it (see
+/// "Floats" in the module notes): `2.5`, `0.1`, `100`, `1e21`, `5e-324`,
+/// `-0`, `inf`, `-inf`, `NaN`.
+forall W where Writable[W].
+fn write_f64(out: W, x: f64) -> W {
+    if x.is_nan() {
+        return Writable[W]::write_static(out, "NaN");
+    }
+    let bits = x.to_bits();
+    let o = if x.is_sign_negative() { Writable[W]::write_byte(out, b'-') } else { out };
+    let biased = (bits >> 52u64) & 2047u64;
+    let fraction = bits & 4503599627370495u64;
+    if biased == 2047u64 {
+        return Writable[W]::write_static(o, "inf");
+    }
+    if biased == 0u64 && fraction == 0u64 {
+        return Writable[W]::write_byte(o, b'0');
+    }
+    let decimal = if biased == 0u64 {
+        shortest(fraction, -1074i32, false)
+    } else {
+        // The implicit leading bit; the gap below is the smaller at the bottom of a binade.
+        shortest(fraction | 4503599627370496u64, (biased as i32) - 1075i32, fraction == 0u64 && biased > 1u64)
+    };
+    write_decimal(o, decimal)
+}
+
+/// Writes `x` as the shortest decimal that reads back as it as an `f32`,
+/// as `write_f64` does for an `f64`: `0.1f32` is `0.1`.
+forall W where Writable[W].
+fn write_f32(out: W, x: f32) -> W {
+    if x.is_nan() {
+        return Writable[W]::write_static(out, "NaN");
+    }
+    let bits = x.to_bits();
+    let o = if x.is_sign_negative() { Writable[W]::write_byte(out, b'-') } else { out };
+    let biased = (bits >> 23u32) & 255u32;
+    let fraction = (bits & 8388607u32) as u64;
+    if biased == 255u32 {
+        return Writable[W]::write_static(o, "inf");
+    }
+    if biased == 0u32 && fraction == 0u64 {
+        return Writable[W]::write_byte(o, b'0');
+    }
+    let decimal = if biased == 0u32 {
+        shortest(fraction, -149i32, false)
+    } else {
+        shortest(fraction | 8388608u64, (biased as i32) - 150i32, fraction == 0u64 && biased > 1u32)
+    };
+    write_decimal(o, decimal)
+}
+
+/// A positive decimal laid out as ECMAScript's `Number::toString` does: an
+/// integer of at most 21 digits in full, a number from 10^-6 on positionally,
+/// anything else as `d.ddde±x`.
+forall W where Writable[W].
+fn write_decimal(out: W, decimal: Decimal) -> W {
+    let { digits, count, point } = decimal;
+    let n = count as i32;
+    if n <= point && point <= 21i32 {
+        let o = write_digits(out, digits, count, 0u32, count);
+        write_zeros(o, (point - n) as u32)
+    } else if 0i32 < point && point <= 21i32 {
+        let o = write_digits(out, digits, count, 0u32, point as u32);
+        write_digits(Writable[W]::write_byte(o, b'.'), digits, count, point as u32, count)
+    } else if -6i32 < point && point <= 0i32 {
+        let o = write_zeros(Writable[W]::write_static(out, "0."), (0i32 - point) as u32);
+        write_digits(o, digits, count, 0u32, count)
+    } else {
+        let o = write_digits(out, digits, count, 0u32, 1u32);
+        let o = if count > 1u32 { write_digits(Writable[W]::write_byte(o, b'.'), digits, count, 1u32, count) } else { o };
+        write_i64(Writable[W]::write_byte(o, b'e'), ((point - 1i32) as i64))
+    }
+}
+
+/// Writes the digits `from` to `to` of the `count` decimal digits of `digits`, most significant first.
+forall W where Writable[W].
+fn write_digits(out: W, digits: u64, count: u32, from: u32, to: u32) -> W {
+    var o = out;
+    var i = from;
+    while i < to {
+        var unit = 1u64;
+        var j = i + 1u32;
+        while j < count {
+            unit = unit * 10u64;
+            j = j + 1u32;
+        }
+        o = Writable[W]::write_byte(o, (((digits / unit) % 10u64) as u8) + b'0');
+        i = i + 1u32;
+    }
+    o
+}
+
+/// Writes `n` zeros.
+forall W where Writable[W].
+fn write_zeros(out: W, n: u32) -> W {
+    var o = out;
+    var i = 0u32;
+    while i < n {
+        o = Writable[W]::write_byte(o, b'0');
+        i = i + 1u32;
+    }
+    o
 }
 
 /// Formatting of a `T` into any writer `W`, handing the value back.
@@ -162,6 +283,20 @@ forall W where Writable[W].
 instance Format[isize, W] {
     fn format(value: isize, out: W) -> (isize, W) {
         (value, write_i64(out, (value as i64)))
+    }
+}
+
+forall W where Writable[W].
+instance Format[f64, W] {
+    fn format(value: f64, out: W) -> (f64, W) {
+        (value, write_f64(out, value))
+    }
+}
+
+forall W where Writable[W].
+instance Format[f32, W] {
+    fn format(value: f32, out: W) -> (f32, W) {
+        (value, write_f32(out, value))
     }
 }
 

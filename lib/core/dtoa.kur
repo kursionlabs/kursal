@@ -1,0 +1,294 @@
+//! The shortest decimal that reads back as a given float.
+// core::dtoa -- a float's shortest round-trip digits, for `core::fmt`.
+//
+// `shortest` finds, for a positive finite float v, the decimal with the
+// fewest significant digits that a correctly rounding reader (C's `strtod`,
+// `std::float::parse_f64`) reads back as v, and of those the one nearest v.
+// It is Steele and White's free-format algorithm as Burger and Dybvig give it
+// ("Printing Floating-Point Numbers Quickly and Accurately", 1996), in exact
+// integer arithmetic:
+//
+// - v = f * 2^e, and the decimals that read back as v are those strictly
+//   inside the interval halfway to v's neighbours, its ends included when f
+//   is even (round-half-even reads an end as the even neighbour, v). Below a
+//   power of two whose predecessor is in the binade under it the lower half
+//   gap is half the upper.
+// - r / s = v, m+ / s and m- / s are the half gaps above and below, all four
+//   integers, scaled by a power of ten so that 10^(k-1) <= v < 10^k with the
+//   upper end of the interval below 10^k.
+// - Each step multiplies r, m+ and m- by 10 and takes the next digit,
+//   floor(r / s), leaving the remainder in r. It stops at the first digit
+//   whose prefix is inside the interval rounded down (r <= m-) or up
+//   (r + m+ >= s); when both are, at the one nearer v, the even one on a tie.
+//
+// The numbers reach about 1100 bits (s at 2^1076 for a subnormal f64, r and
+// m+ scaled to it by up to 10^324), kept as 32-bit limbs in a `core::array::Array!` over
+// storage in `shortest`'s frame. No allocator and no C library: `core` stays
+// freestanding.
+use package as core;
+
+use core::array::Array!;
+use core::mem::alloca;
+use core::option::Result;
+use core::process::trap;
+
+/// The limbs of each number: 1280 bits, above the most any of them takes.
+const LIMBS: usize = 40usize;
+
+/// 2^32 - 1, the bits of one limb.
+const MASK: u64 = 4294967295u64;
+
+/// A positive decimal: `digits` (`count` of them, the first not 0) with the
+/// decimal point after the first `point` of them, so it is
+/// 0.d1d2..dn * 10^point; `point` may be negative or past `count`.
+exposed struct Decimal {
+    digits: u64,
+    count: u32,
+    point: i32,
+}
+
+/// The shortest decimal that reads back as `mantissa * 2^exponent`, and of
+/// those the nearest (`mantissa` is not 0). `lower_closer` says the float
+/// below is nearer than the float above: `mantissa` is the smallest of a
+/// binade above the lowest. The result has at most 17 digits for an `f64`.
+fn shortest(mantissa: u64, exponent: i32, lower_closer: bool) -> Decimal {
+    let zero: [u32; LIMBS] = [0u32, ..];
+    let r_storage = unsafe alloca[[u32; LIMBS]]();
+    let s_storage = unsafe alloca[[u32; LIMBS]]();
+    let plus_storage = unsafe alloca[[u32; LIMBS]]();
+    let minus_storage = unsafe alloca[[u32; LIMBS]]();
+    let t_storage = unsafe alloca[[u32; LIMBS]]();
+    unsafe *r_storage = zero;
+    unsafe *s_storage = zero;
+    unsafe *plus_storage = zero;
+    unsafe *minus_storage = zero;
+    unsafe *t_storage = zero;
+    // Each storage is this frame's, initialized, and has one array over it.
+    var r = unsafe Array!::from_parts(unsafe (r_storage as *u32), LIMBS);
+    var s = unsafe Array!::from_parts(unsafe (s_storage as *u32), LIMBS);
+    var plus = unsafe Array!::from_parts(unsafe (plus_storage as *u32), LIMBS);
+    var minus = unsafe Array!::from_parts(unsafe (minus_storage as *u32), LIMBS);
+    var t = unsafe Array!::from_parts(unsafe (t_storage as *u32), LIMBS);
+
+    // r / s = v, plus / s and minus / s the half gaps: with a = max(e, 0) and b = max(-e, 0),
+    // r = f * 2^(a+1+c), s = 2^(b+1+c), plus = 2^(a+c), minus = 2^a, where c is 1 when the
+    // lower gap is the smaller.
+    let c = if lower_closer { 1u32 } else { 0u32 };
+    let a = if exponent > 0i32 { exponent as u32 } else { 0u32 };
+    let b = if exponent < 0i32 { (0i32 - exponent) as u32 } else { 0u32 };
+    set(&r, mantissa);
+    shift(&r, a + 1u32 + c);
+    set(&s, 1u64);
+    shift(&s, b + 1u32 + c);
+    set(&plus, 1u64);
+    shift(&plus, a + c);
+    set(&minus, 1u64);
+    shift(&minus, a);
+
+    // k0 = ceil(log10 2^L) for L = floor(log2 v), which is floor(L * log10 2) + 1 unless L is 0,
+    // and is k or k - 1: floor(L * log10 2) is (L * 78913) >> 18 for |L| below 1650.
+    let top = exponent + 63i32 - (leading_zeros(mantissa) as i32);
+    let scaled = (top as i64) * 78913i64;
+    let estimate = if top == 0i32 {
+        0i32
+    } else if scaled >= 0i64 {
+        (scaled / 262144i64) as i32 + 1i32
+    } else {
+        // Toward negative infinity.
+        (0i64 - ((0i64 - scaled + 262143i64) / 262144i64)) as i32 + 1i32
+    };
+    if estimate >= 0i32 {
+        mul_pow10(&s, estimate as u32);
+    } else {
+        let n = (0i32 - estimate) as u32;
+        mul_pow10(&r, n);
+        mul_pow10(&plus, n);
+        mul_pow10(&minus, n);
+    }
+    // The upper end belongs to the interval when f is even.
+    let even = (mantissa & 1u64) == 0u64;
+    copy(&t, &r);
+    add(&t, &plus);
+    let high = compare(&t, &s);
+    let point = if high > 0i32 || even && high == 0i32 {
+        mul_small(&s, 10u32);
+        estimate + 1i32
+    } else {
+        estimate
+    };
+
+    var digits = 0u64;
+    var count = 0u32;
+    var done = false;
+    while !done {
+        mul_small(&r, 10u32);
+        mul_small(&plus, 10u32);
+        mul_small(&minus, 10u32);
+        var digit = 0u64;
+        while compare(&r, &s) >= 0i32 {
+            sub(&r, &s);
+            digit = digit + 1u64;
+        }
+        let low_cmp = compare(&r, &minus);
+        let low = low_cmp < 0i32 || even && low_cmp == 0i32;
+        copy(&t, &r);
+        add(&t, &plus);
+        let high_cmp = compare(&t, &s);
+        let high = high_cmp > 0i32 || even && high_cmp == 0i32;
+        if low || high {
+            done = true;
+            if high && !low {
+                digit = digit + 1u64;
+            } else if high && low {
+                // Both are inside: the nearer, 2r against s; on a tie the even digit.
+                copy(&t, &r);
+                add(&t, &r);
+                let half = compare(&t, &s);
+                if half > 0i32 || half == 0i32 && (digit & 1u64) == 1u64 {
+                    digit = digit + 1u64;
+                }
+            }
+        }
+        digits = digits * 10u64 + digit;
+        count = count + 1u32;
+    }
+
+    release(r);
+    release(s);
+    release(plus);
+    release(minus);
+    release(t);
+    Decimal.{ digits, count, point }
+}
+
+/// Ends an array over `shortest`'s storage.
+fn release(a: Array![u32]) {
+    let (_base, _len) = a.into_parts();
+}
+
+/// Sets limb `i` of `a`; every index used is below `LIMBS`.
+fn put(&a: Array![u32], i: usize, limb: u32) {
+    match &a.set(i, limb) {
+        Result::Ok(_old) => (),
+        Result::Err(_limb) => trap(),
+    }
+}
+
+/// The number of zero bits above the highest set bit of `x`, 64 for 0.
+fn leading_zeros(x: u64) -> u32 {
+    var n = 0u32;
+    var rest = x;
+    while n < 64u32 && (rest & 9223372036854775808u64) == 0u64 {
+        rest = rest << 1u64;
+        n = n + 1u32;
+    }
+    n
+}
+
+/// Sets the number `a` to `value`.
+fn set(&a: Array![u32], value: u64) {
+    put(&a, 0usize, (value & MASK) as u32);
+    put(&a, 1usize, (value >> 32u64) as u32);
+    var i = 2usize;
+    while i < LIMBS {
+        put(&a, i, 0u32);
+        i = i + 1usize;
+    }
+}
+
+/// Sets the number `a` to the number `b`.
+fn copy(&a: Array![u32], &b: Array![u32]) {
+    var i = 0usize;
+    while i < LIMBS {
+        put(&a, i, (&b.at(i)));
+        i = i + 1usize;
+    }
+}
+
+/// Multiplies the number `a` by 2^n.
+fn shift(&a: Array![u32], n: u32) {
+    let limbs = (n / 32u32) as usize;
+    let bits = (n % 32u32) as u64;
+    if limbs >= LIMBS {
+        trap();
+    }
+    var i = LIMBS;
+    while i > 0usize {
+        i = i - 1usize;
+        let high = if i >= limbs { (&a.at(i - limbs)) as u64 } else { 0u64 };
+        let low = if i >= limbs + 1usize { (&a.at(i - limbs - 1usize)) as u64 } else { 0u64 };
+        // The 32 bits of high:low that the shift brings to limb `i`.
+        put(&a, i, (((((high << 32u64) | low) << bits) >> 32u64) & MASK) as u32);
+    }
+}
+
+/// Multiplies the number `a` by `m`; a product past `LIMBS` limbs stops the program.
+fn mul_small(&a: Array![u32], m: u32) {
+    var carry = 0u64;
+    var i = 0usize;
+    while i < LIMBS {
+        let x = ((&a.at(i)) as u64) * (m as u64) + carry;
+        put(&a, i, (x & MASK) as u32);
+        carry = x >> 32u64;
+        i = i + 1usize;
+    }
+    if carry != 0u64 {
+        trap();
+    }
+}
+
+/// Multiplies the number `a` by 10^n.
+fn mul_pow10(&a: Array![u32], n: u32) {
+    var rest = n;
+    while rest >= 9u32 {
+        mul_small(&a, 1000000000u32);
+        rest = rest - 9u32;
+    }
+    var p = 1u32;
+    while rest > 0u32 {
+        p = p * 10u32;
+        rest = rest - 1u32;
+    }
+    mul_small(&a, p);
+}
+
+/// Adds the number `b` to `a`; a sum past `LIMBS` limbs stops the program.
+fn add(&a: Array![u32], &b: Array![u32]) {
+    var carry = 0u64;
+    var i = 0usize;
+    while i < LIMBS {
+        let x = ((&a.at(i)) as u64) + ((&b.at(i)) as u64) + carry;
+        put(&a, i, (x & MASK) as u32);
+        carry = x >> 32u64;
+        i = i + 1usize;
+    }
+    if carry != 0u64 {
+        trap();
+    }
+}
+
+/// Subtracts the number `b`, which is not above it, from `a`.
+fn sub(&a: Array![u32], &b: Array![u32]) {
+    var borrow = 0u64;
+    var i = 0usize;
+    while i < LIMBS {
+        let x = ((&a.at(i)) as u64) - ((&b.at(i)) as u64) - borrow;
+        put(&a, i, (x & MASK) as u32);
+        borrow = (x >> 32u64) & 1u64;
+        i = i + 1usize;
+    }
+}
+
+/// -1, 0 or 1 as the number `a` is below, equal to or above `b`.
+fn compare(&a: Array![u32], &b: Array![u32]) -> i32 {
+    var i = LIMBS;
+    while i > 0usize {
+        i = i - 1usize;
+        let x = (&a.at(i));
+        let y = (&b.at(i));
+        if x != y {
+            return if x < y { -1i32 } else { 1i32 };
+        }
+    }
+    0i32
+}

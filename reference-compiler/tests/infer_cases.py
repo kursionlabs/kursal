@@ -213,7 +213,7 @@ INFER_ERRORS = (
     ('fn f() -> u32 { let p = core::mem[u32]::alloca[u32](); 0u32 }\n', 'type arguments belong on alloca, not a namespace'),
     ('fn f() -> u32 { let p = core::mem::alloca(); 0u32 }\n', 'alloca takes 1 type arguments'),
     ('use std::buffer::Buffer;\nfn f() -> u32 { let b = f"x".write(); 0u32 }\n', 'write takes the writer'),
-    ('use std::buffer::Buffer!;\nfn f(x: f64) -> Buffer! { f"x = {x}" }\n', '2:34: no instance of Format[f64, Buffer!]'),
+    ('use std::buffer::Buffer!;\nfn f(x: *u8) -> Buffer! { f"x = {x}" }\n', '2:34: no instance of Format[*u8, Buffer!]'),
     ("use std::buffer::Buffer!;\nuse std::raw::Span;\nfn f(s: Span['static]) -> Buffer! { f\"{&s}\".write(Buffer!::new()) }\n",
      "3:40: no instance of Format[Span['static], Buffer!]"),
     ('use std::buffer::Buffer!;\nforall T. fn f(x: T) -> Buffer! { f"{x}" }\n', 'no instance of Format[T, Buffer!]'),
