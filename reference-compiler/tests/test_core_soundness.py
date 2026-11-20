@@ -253,6 +253,44 @@ REJECTED = {
         (trait K (T))
         (instance K (forall (Foo) () ((ptr Foo))))"""),
 
+    # A mapper is checked against a foreach's binders as new variables, never as the caller's type
+    # parameters of the same name: m's X is the binder F, a u64, not the caller's F, so the row
+    # (F, F) would turn a u64 into an F, and the premise K[F] would hold of a u64.
+    "foreach_binder_is_not_a_caller_parameter": ("mapper_does_map", """
+        (fun m (forall (X Y) () (tuple X Y) (X Y)
+          (entry ((%x X) (%y Y)) (= %t (construct (tuple X Y) %x %y)) (ret %t))))
+        (fun f (forall (F) ((Copy F)) u64 (F)
+          (entry ((%c F))
+            (= %z (const u64 0)) (= %s (construct (tuple u64) %z))
+            (= %r (foreach (foreach (F (tuple u64)) (tuple F F)) %s (m F) %c))
+            (= %row (destruct %r (foreach (F (tuple u64)) (tuple F F))))
+            (= (%a %b) (destruct %row (tuple u64 u64))) (ret %b))))"""),
+    "foreach_binder_is_not_a_caller_parameter_renamed": ("mapper_does_map", """
+        (fun m (forall (X Y) () (tuple X Y) (X Y)
+          (entry ((%x X) (%y Y)) (= %t (construct (tuple X Y) %x %y)) (ret %t))))
+        (fun f (forall (F) ((Copy F)) u64 (F)
+          (entry ((%c F))
+            (= %z (const u64 0)) (= %s (construct (tuple u64) %z))
+            (= %r (foreach (foreach (G (tuple u64)) (tuple G G)) %s (m F) %c))
+            (= %row (destruct %r (foreach (G (tuple u64)) (tuple G G))))
+            (= (%a %b) (destruct %row (tuple u64 u64))) (ret %b))))"""),
+    "foreach_binder_takes_no_caller_premise": ("unsatisfied_premise", """
+        (trait K (T) (k u32 (T)))
+        (fun m (forall (X) ((K X)) u32 (X)
+          (entry ((%x X)) (= %r (trait_call K k (X) %x)) (ret %r))))
+        (fun f (forall (F) ((K F)) (foreach (F (tuple u64)) u32) ()
+          (entry ()
+            (= %z (const u64 0)) (= %s (construct (tuple u64) %z))
+            (= %r (foreach (foreach (F (tuple u64)) u32) %s m)) (ret %r))))"""),
+    "foreach_binder_takes_no_caller_premise_renamed": ("unsatisfied_premise", """
+        (trait K (T) (k u32 (T)))
+        (fun m (forall (X) ((K X)) u32 (X)
+          (entry ((%x X)) (= %r (trait_call K k (X) %x)) (ret %r))))
+        (fun f (forall (F) ((K F)) (foreach (G (tuple u64)) u32) ()
+          (entry ()
+            (= %z (const u64 0)) (= %s (construct (tuple u64) %z))
+            (= %r (foreach (foreach (G (tuple u64)) u32) %s m)) (ret %r))))"""),
+
     # A zero-size type is erased: an unsafe cast has no representation of one to reinterpret, and C has
     # no zero-size parameter or object for an extern. Its loads and stores are accepted (test_zero_size).
     "cast_to_unit": ("zero_size_type_has_no_memory_form", """
@@ -319,6 +357,15 @@ class CoreSoundnessTests(unittest.TestCase):
                    (fn (forall ($c) () (ptr (brand $b)) ((brand $c) (ptr (brand $b))))) ((brand $b) (ptr (brand $b)))
                  (entry ((%w (brand $b)) (%p (ptr (brand $b)))) (= %f (fn (g _ (ptr (brand $b)))))
                    (= %g (fn (g _ (ptr (brand $b))))) (= %v (call (%g $b) %w %p)) (ret %f))))""",
+            # A foreach body names the caller's type parameter beside its own binder.
+            """(fun m (forall (X Y) () (tuple X Y) (X Y)
+                 (entry ((%x X) (%y Y)) (= %t (construct (tuple X Y) %x %y)) (ret %t))))
+               (fun f (forall (F) ((Copy F)) F (F)
+                 (entry ((%c F))
+                   (= %z (const u64 0)) (= %s (construct (tuple u64) %z))
+                   (= %r (foreach (foreach (G (tuple u64)) (tuple G F)) %s (m F) %c))
+                   (= %row (destruct %r (foreach (G (tuple u64)) (tuple G F))))
+                   (= (%a %b) (destruct %row (tuple u64 F))) (ret %b))))""",
             # Pointer projection at the pointer's own type.
             """(type S (struct (a u32)))
                (fun h u32 ((ptr S)) (entry ((%p (ptr S)))
