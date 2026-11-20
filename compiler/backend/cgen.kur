@@ -2969,6 +2969,10 @@ impl Backend['k] {
         } else if op.is(&cx, "int_cast") {
             let value = self.value_name(&cx, a.at(&cx, 0usize));
             line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, self.convert(&cx, value, self.type_operand(&cx, instr))).push_static(";"));
+        } else if op.is(&cx, "float_cast") {
+            let value = self.value_name(&cx, a.at(&cx, 0usize));
+            let converted = self.float_convert(&cx, value, self.type_of(&cx, a.at(&cx, 0usize)), self.type_operand(&cx, instr));
+            line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, converted).push_static(";"));
         } else if op.is(&cx, "cast") {
             let value = self.value_name(&cx, a.at(&cx, 0usize));
             let src = self.type_of(&cx, a.at(&cx, 0usize));
@@ -3292,6 +3296,49 @@ impl Backend['k] {
         Buffer!::new().push_static("(").push_bytes(&cx, c_prim(&cx, name)).push_static(")((").push_static(wide).push_static(")(").push_bytes(&cx, expr).push_static("))").save(&cx)
     }
 
+    // Conversion by value with a float on one side. To a float, C's conversion: the nearest value,
+    // ties to even, and past the largest to an infinity. To an integer, toward zero, saturating at the
+    // integer's bounds, NaN to 0: C's conversion is undefined outside the range, so it is used only in
+    // it. The bounds are powers of two, exact in either float type.
+    fn float_convert(self, &cx: Domain!['k], expr: Span['k], src: Type['k], dst: Type['k]) -> Span['k] {
+        let (sn, dn) = match self.shape(&cx, src) {
+            Type::Prim(x) => match self.shape(&cx, dst) {
+                Type::Prim(y) => (x, y),
+                _ => fail_text(&cx, Span::from_static(&cx, "internal error: a float conversion to a type that is not primitive")),
+            },
+            _ => fail_text(&cx, Span::from_static(&cx, "internal error: a float conversion from a type that is not primitive")),
+        };
+        let ct = c_prim(&cx, dn);
+        if C::is_float(&cx, dn) {
+            return Buffer!::new().push_static("(").push_bytes(&cx, ct).push_static(")").push_bytes(&cx, expr).save(&cx);
+        }
+        let signed = signed_suffix(&cx, dn).is_some();
+        let (low, high, limits) = if C::is_pointer_sized(&cx, dn) {
+            // -2^(N-1), for the target's pointer width N.
+            let low = Buffer!::new().push_static("(").push_bytes(&cx, c_prim(&cx, sn)).push_static(")INTPTR_MIN").save(&cx);
+            let high = Buffer!::new().push_static(if signed { "-" } else { "-2 * " }).push_bytes(&cx, low).save(&cx);
+            (low, high, Span::from_static(&cx, if signed { "INTPTR" } else { "UINTPTR" }))
+        } else {
+            let suffix = if sn.is(&cx, "f32") { "f" } else { "" };
+            let bits = C::integer_bits(&cx, dn);
+            let low = Buffer!::new().push_static("-0x1p").push_u64(((bits - 1u32) as u64)).push_static(suffix).save(&cx);
+            let top = if signed { bits - 1u32 } else { bits };
+            let high = Buffer!::new().push_static("0x1p").push_u64((top as u64)).push_static(suffix).save(&cx);
+            // `int8_t` to `INT8`, `uint64_t` to `UINT64`.
+            let limits = Buffer!::new().push_static(if signed { "INT" } else { "UINT" }).push_u64((bits as u64)).save(&cx);
+            (low, high, limits)
+        };
+        var out = Buffer!::new().push_bytes(&cx, expr);
+        out = if signed { out.push_static(" >= ").push_bytes(&cx, low) } else { out.push_static(" > -1") };
+        out = out.push_static(" && ").push_bytes(&cx, expr).push_static(" < ").push_bytes(&cx, high)
+            .push_static(" ? (").push_bytes(&cx, ct).push_static(")").push_bytes(&cx, expr)
+            .push_static(" : ").push_bytes(&cx, expr).push_static(" > 0 ? ").push_bytes(&cx, limits).push_static("_MAX : ");
+        if signed {
+            out = out.push_bytes(&cx, expr).push_static(" < 0 ? ").push_bytes(&cx, limits).push_static("_MIN : ");
+        }
+        out.push_static("0").save(&cx)
+    }
+
     fn cast(self, &cx: Domain!['k], &lines: Buffer!, dst: Span['k], expr: Span['k], src: Type['k], dst_ty: Type['k]) {
         let s = self.shape(&cx, src);
         let d = self.shape(&cx, dst_ty);
@@ -3321,32 +3368,20 @@ impl Backend['k] {
             }
             return ();
         }
-        let (sn, dn) = match s {
-            Type::Prim(x) => match d {
-                Type::Prim(y) => (x, y),
-                _ => {
-                    // Layout belongs to C. Never silently truncate a source or leave a destination
-                    // tail uninitialized; exact size is a target obligation.
-                    self.reinterpret(&cx, &lines, dst, expr);
-                    return ();
-                },
+        let prims = match s {
+            Type::Prim(_x) => match d {
+                Type::Prim(_y) => true,
+                _ => false,
             },
-            _ => {
-                self.reinterpret(&cx, &lines, dst, expr);
-                return ();
-            },
+            _ => false,
         };
-        if sn.is(&cx, "bool") || dn.is(&cx, "bool") || C::is_float(&cx, sn) && C::is_float(&cx, dn) {
+        if prims {
+            // One is a bool: the checker leaves a number to a number to `int_cast` and `float_cast`.
             line(&lines, Buffer!::new().push_bytes(&cx, dst).push_static(" = (").push_bytes(&cx, cd).push_static(")").push_bytes(&cx, expr).push_static(";"));
-        } else if C::is_float(&cx, sn) != C::is_float(&cx, dn) {
-            // A pointer-sized integer's width is the target's: the assertion `reinterpret` writes
-            // checks it.
-            if width(&cx, sn) != 0u32 && width(&cx, dn) != 0u32 && width(&cx, sn) != width(&cx, dn) {
-                fail_text(&cx, Span::from_static(&cx, "backend integer/float reinterpretation requires equal widths"));
-            }
-            self.reinterpret(&cx, &lines, dst, expr);
         } else {
-            line(&lines, Buffer!::new().push_bytes(&cx, dst).push_static(" = ").push_bytes(&cx, self.convert(&cx, expr, d)).push_static(";"));
+            // Layout belongs to C. Never silently truncate a source or leave a destination tail
+            // uninitialized; exact size is a target obligation.
+            self.reinterpret(&cx, &lines, dst, expr);
         }
     }
 
@@ -4357,11 +4392,6 @@ impl Backend['k] {
         }
         (const_params, restrict_params)
     }
-}
-
-forall 'k.
-fn width(&cx: Domain!['k], name: Span['k]) -> u32 {
-    if name.is(&cx, "f32") { 32u32 } else if name.is(&cx, "f64") { 64u32 } else { C::integer_bits(&cx, name) }
 }
 
 forall 'k.

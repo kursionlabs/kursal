@@ -366,6 +366,14 @@ unsafe cast takes or makes a value whose representation holds an enum or a
 `Option[NonNull[T]]` as a `*T` is rejected, not defined. Code that needs
 the pointer matches the `Option`.
 
+`as` between two number types is not a cast of this kind: it converts the
+value (a float to an integer saturates, NaN to 0), is defined for every
+value, and needs no `unsafe`. No unsafe cast takes a number to a number
+(`unsafe_cast_between_numbers`). A float's bits are `f64::to_bits` and
+`f64::from_bits` (and `f32`'s), class C: every bit pattern is a float and
+every float a bit pattern. Inside, they cast a struct holding the float
+alone to the integer of its width, or back.
+
 ### 2.7 What class B does not claim
 
 Class B is an inventory of trusted obligations, not a deprecation list.

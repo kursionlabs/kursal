@@ -615,8 +615,8 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
             return self.negate(args[0], ty)
         if op == "not":
             return self.complement(args[0], ty)
-        if op == "int_cast":
-            return self.emit("int_cast", ty, args, ty=ty)
+        if op in ("int_cast", "float_cast"):
+            return self.emit(op, ty, args, ty=ty)
         return self.emit(op, ty, args)
 
     def expr_binop(self, expr: S.Binop) -> Optional[str]:
@@ -684,8 +684,11 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         if v is None:
             return None
         src, dst = self.vty[v], self.substitute_type(expr.ty)
-        if isinstance(src, C.Prim) and isinstance(dst, C.Prim) and src.name in C.INTEGERS and dst.name in C.INTEGERS:
-            return self.emit("int_cast", dst, (v,), ty=dst)
+        # A number to a number is a conversion by value, which needs no `unsafe`.
+        numbers = C.INTEGERS | C.FLOATS
+        if isinstance(src, C.Prim) and isinstance(dst, C.Prim) and src.name in numbers and dst.name in numbers:
+            op = "int_cast" if src.name in C.INTEGERS and dst.name in C.INTEGERS else "float_cast"
+            return self.emit(op, dst, (v,), ty=dst)
         # Forgetting that a pointer is not null is safe.
         if isinstance(src, C.NonNull) and isinstance(dst, C.Ptr) and equal(src.inner, dst.inner):
             return self.emit("to_ptr", dst, (v,), ty=dst)

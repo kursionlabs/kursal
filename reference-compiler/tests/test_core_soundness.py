@@ -235,7 +235,7 @@ class CoreSoundnessTests(unittest.TestCase):
 
 # One instruction of each unsafe operation, in a safe function with `%p: (ptr u32)` and `%x, %y: u32`.
 UNSAFE_INSTRUCTIONS = {
-    "cast": "(= %v (cast %x i32))",
+    "cast": "(= %v (cast %p (ptr i32)))",
     "alloca": "(= %v (alloca u32))",
     "static_brand": "(= %v (static_brand))",
     "ptr_load": "(= %v (ptr_load %p))",
@@ -278,7 +278,7 @@ class UnsafeOperationTests(unittest.TestCase):
                 check_program(parse_program(self.program(instr).replace("(fun f", "(fun (unsafe) f", 1)))
 
     def test_safe_operations_need_no_marker(self):
-        for instr in ("(= %v (int_cast %x u64))", "(= %v (sizeof u32))", "(= %v (fresh))"):
+        for instr in ("(= %v (int_cast %x u64))", "(= %v (float_cast %x f64))", "(= %v (sizeof u32))", "(= %v (fresh))"):
             with self.subTest(instr=instr):
                 check_program(parse_program(self.program(instr)))
 

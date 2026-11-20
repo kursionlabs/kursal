@@ -692,6 +692,17 @@ class Checker:
             self.fail("int_cast_converts_between")
         return ty
 
+    def op_float_cast(self, instr: Instr) -> Type:
+        """A conversion by value between two number types, at least one of them a float: an integer to
+        the nearest float; a float toward zero to an integer, saturating at its bounds, NaN to 0; a float
+        to the nearest float of the other width."""
+        got, ty = self.use(instr.args[0]), instr.ty
+        numbers = INTEGERS | FLOATS
+        if not (isinstance(got, Prim) and got.name in numbers and isinstance(ty, Prim) and ty.name in numbers and
+                FLOATS & {got.name, ty.name}):
+            self.fail("float_cast_converts_between")
+        return ty
+
     def op_to_ptr(self, instr: Instr) -> Type:
         """`NonNull T` to `*T`: forgetting that a pointer is not null is safe."""
         got, ty = self.use(instr.args[0]), instr.ty
@@ -714,7 +725,8 @@ class Checker:
         """An unsafe cast reinterprets only representations the program fixes: a `NonNull` is cast
         only from or to a pointer (whose obligation is that it is not null), and nothing that holds an
         enum or a `NonNull` within it is cast, since the compiler chooses an enum's layout (a tag, or
-        the niche of a `NonNull`: `Types.niche_variant`). A type parameter cannot be cast at all."""
+        the niche of a `NonNull`: `Types.niche_variant`). A type parameter cannot be cast at all. Nor is a
+        number cast to a number: that is a conversion by value, `int_cast` or `float_cast`."""
         pointers = (Ptr, NonNull)
         if isinstance(got, NonNull) or isinstance(want, NonNull):
             if not (isinstance(got, pointers) and isinstance(want, pointers)):
@@ -722,6 +734,9 @@ class Checker:
             return
         if self.types.chosen_layout(got) or self.types.chosen_layout(want):
             self.fail("unsafe_cast_layout_chosen")
+        numbers = INTEGERS | FLOATS
+        if isinstance(got, Prim) and got.name in numbers and isinstance(want, Prim) and want.name in numbers:
+            self.fail("unsafe_cast_between_numbers")
 
     def uncastable(self, ty: Type) -> bool:
         """What no unsafe cast may conjure in a value: a package, a brand witness, a function value, a
@@ -1088,6 +1103,7 @@ OPERATIONS: dict[str, Callable[[Checker, Instr], Type | list[Type]]] = {
     "construct_variant": Checker.op_construct_variant,
     "variant_tag": Checker.op_variant_tag,
     "int_cast": Checker.op_int_cast,
+    "float_cast": Checker.op_float_cast,
     "to_ptr": Checker.op_to_ptr,
     "cast": Checker.op_cast,
     "call": Checker.op_call,

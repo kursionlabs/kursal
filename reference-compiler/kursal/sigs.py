@@ -93,8 +93,9 @@ type IntConst = tuple[Literal["int"], int, C.Prim]
 type BoolConst = tuple[Literal["bool"], bool, C.Prim]
 type FloatConst = tuple[Literal["float"], str, Optional[C.Type]]
 type StringConst = tuple[Literal["str"], str, Optional[C.Type]]
-# An operation the C compiler folds, at the target's width: one on `usize` or `isize`, or on the value
-# of another such operation. Its operator is a binary operator's instruction (`OPERATORS`), `int_cast`,
+# An operation the C compiler folds: one on `usize` or `isize`, at the target's width; one on floats, or
+# a conversion with a float on either side, in IEEE arithmetic; or one on the value of another such
+# operation. Its operator is a binary operator's instruction (`OPERATORS`), `int_cast`, `float_cast`,
 # `neg`, `not`, `and` or `or`; its type is the result's.
 type OpConst = tuple[Literal["op"], tuple[str, tuple[ConstValue, ...]], C.Prim]
 type ConstValue = IntConst | BoolConst | FloatConst | StringConst | OpConst
@@ -539,7 +540,8 @@ class Signatures:
         Unevaluated short-circuit operands still validate operators and literals;
         only computed values (and their division-by-zero traps) are skipped. An operation on `usize`
         or `isize`, or on the value of one, is not evaluated: it is an `OpConst`, which the C compiler
-        folds at the target's width.
+        folds at the target's width. Nor is arithmetic on floats, or a conversion to or from one: the
+        C compiler folds it too.
         """
         if isinstance(expr, S.Lit):
             if expr.kind == "int":
@@ -582,6 +584,8 @@ class Signatures:
             v = self.fold(expr.operand, want, module, evaluate=evaluate)
             if expr.op == "-" and v[0] == "float":
                 return ("float", v[1][1:] if v[1].startswith("-") else "-" + v[1], v[2])
+            if expr.op == "-" and v[0] == "op" and floating(v) is not None:
+                return ("op", ("neg", (v,)), v[2])
             if v[0] == "bool" and expr.op == "!":
                 return ("bool", not v[1], C.BOOL)
             if v[0] == "op" and v[2] == C.BOOL and expr.op == "!":
@@ -595,9 +599,11 @@ class Signatures:
         if isinstance(expr, S.Cast):
             v = self.fold(expr.value, None, module, evaluate=evaluate)
             to = self.type(expr.type, Scope())
-            source = integer(v)
-            if source is None or not (isinstance(to, C.Prim) and to.name in C.INTEGERS):
-                fail("a constant cast converts between integer types", expr.pos)
+            source = integer(v) or floating(v)
+            if source is None or not (isinstance(to, C.Prim) and to.name in C.INTEGERS | C.FLOATS):
+                fail("a constant cast converts between number types", expr.pos)
+            if source.name in C.FLOATS or to.name in C.FLOATS:
+                return ("op", ("float_cast", (v,)), to)
             if v[0] != "int" or source.name in C.POINTER_SIZED or to.name in C.POINTER_SIZED:
                 return ("op", ("int_cast", (v,)), to)
             return self.wrapped(v[1], to)
@@ -632,6 +638,10 @@ class Signatures:
             if a[0] == "op" or b[0] == "op":
                 return ("op", (OPERATORS[expr.op], (a, b)), C.BOOL)
             return ("bool", (a[1] == b[1]) == (expr.op == "=="), C.BOOL)
+        number = floating(a)
+        if number is not None and floating(b) == number and (comparison or expr.op in ("+", "-", "*", "/")):
+            # The C compiler folds arithmetic on floats.
+            return ("op", (OPERATORS[expr.op], (a, b)), C.BOOL if comparison else number)
         ty = integer(a)
         if ty is None or integer(b) != ty:
             fail("constant operands must be integers of one type", expr.pos)
@@ -675,6 +685,12 @@ class Signatures:
 def boolean(value: ConstValue) -> bool:
     """Whether `value` is a `bool` constant."""
     return value[0] in ("bool", "op") and value[2] == C.BOOL
+
+
+def floating(value: ConstValue) -> Optional[C.Prim]:
+    """The type of a float constant, or None for any other constant."""
+    ty = value[2]
+    return ty if value[0] in ("float", "op") and isinstance(ty, C.Prim) and ty.name in C.FLOATS else None
 
 
 def integer(value: ConstValue) -> Optional[C.Prim]:

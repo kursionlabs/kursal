@@ -41,7 +41,7 @@ from .core import ATOMIC_OPS, Block, Edge, Fun, Instr, Jmp, Jnz, Ret, Switch, Te
 
 # Instructions whose C writes only their results: left out when every result is dead.
 PURE = frozenset({"const", "copy", "construct", "construct_variant", "destruct", "variant_tag", "load",
-                  "int_cast", "to_ptr", "pack", "open", "static_brand",
+                  "int_cast", "float_cast", "to_ptr", "pack", "open", "static_brand",
                   "fresh",
                   "add", "sub", "mul", "bit_and", "bit_or", "bit_xor", "shl", "shr",
                   "eq", "ne", "lt", "le", "gt", "ge"})

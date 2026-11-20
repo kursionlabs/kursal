@@ -301,7 +301,7 @@ What a function leaves out is decided first, from its KURS alone (`backend::plan
 
 - **Dead values.** A value is live when the C reads it: a kept instruction, a terminator, or an edge
   into a live block parameter (a fixpoint over the blocks). A pure instruction (constants, copies,
-  loads, arithmetic other than division, construction and destruction, tags, casts between integers,
+  loads, arithmetic other than division, construction and destruction, tags, casts between numbers,
   `pack` and `open`) whose results are all dead is not written. A store's unit result and a call's
   result that nothing reads are not assigned, and a dead block parameter is assigned by no edge.
 - **Copies.** `copy` gets no variable: it reads its source's. Within one execution of a block every C
@@ -699,6 +699,39 @@ is right on a 32-bit and on a 64-bit target. The compiler never assumes their wi
 The size estimate that passes aggregates by pointer (`words`) counts every scalar, `usize`
 included, as one word on every target.
 
+### Number conversions
+
+`x as T` between two number types converts the value, and is safe: it is defined for every value.
+
+| From | To | Instruction | Result |
+|---|---|---|---|
+| integer | integer | `int_cast` | the value modulo 2^N for an N-bit `T`: truncated, or sign- or zero-extended |
+| integer | float | `float_cast` | the nearest float, ties to even (`u64::MAX as f32` is 2^64) |
+| float | integer | `float_cast` | toward zero (`-2.9 as i32` is -2); below `T::MIN` it is `T::MIN`, above `T::MAX` it is `T::MAX`, NaN is 0 |
+| float | float | `float_cast` | `f32` to `f64` exactly; `f64` to `f32` the nearest, ties to even, past `f32::MAX` an infinity |
+
+C converts a float to an integer only when the integral part fits (anything else is undefined), so
+the C for a float to an integer tests the range first, against powers of two that both float types
+hold exactly, and converts only inside it:
+
+```c
+v3 = v2 >= -0x1p63 && v2 < 0x1p63 ? (int64_t)v2 : v2 > 0 ? INT64_MAX : v2 < 0 ? INT64_MIN : 0;
+```
+
+For an unsigned `T` the range is `x > -1 && x < 0x1pN`, and for `usize` and `isize` the bounds are
+`(double)INTPTR_MIN` and its negation (doubled for `usize`), at the target's width. Clang and GCC
+compile it to two comparisons around the conversion instruction (`cvttsd2si` on x86-64).
+
+`cast`, the unsafe reinterpretation, never takes a number to a number (`unsafe_cast_between_numbers`);
+the front end never asks it to, since `as` between numbers is `int_cast` or `float_cast`. A float's
+IEEE bits are `core::num`'s `f64::to_bits` and `f64::from_bits` (and `f32`'s), safe functions that
+reinterpret a struct holding the float alone.
+
+A constant conversion with a float on either side, and constant arithmetic or comparison on floats
+(`const INFINITY: f64 = 1.0 / 0.0;`), is not evaluated by the compiler: like an operation on `usize`
+(see "Pointer-sized integers") it is kept as an operation (`OpConst`, `ConstValue::Op`), and the C
+compiler folds it.
+
 ### The C compiler
 
 `kursal build` compiles the C with `$KURSAL_CC`, else `clang`, with `-O3 -w -fno-builtin`, and so do
@@ -819,6 +852,8 @@ These are the places where Kursal differs from what one might expect.
 - **`unsafe`** marks one operation: `unsafe f(x)` calls an unsafe or extern function, `unsafe *p`
   reads through a pointer, `unsafe (x as *T)` casts, `f(unsafe &*p)` lends a pointer's target.
   `unsafe (unsafe malloc(n) as *T)` is two operations. A safe function may contain unsafe operations.
+  `as` between two number types is a conversion by value and needs no `unsafe` (see "Number
+  conversions"); a float's bits are `x.to_bits()` and `f64::from_bits(b)`.
 - **Generic code over linear types.** A type parameter may stand for a linear type unless a premise
   says `Copy[T]`. Using a value twice, or dropping it on one path (`a && b` drops `b` when `a` is
   false), needs `Copy[T]`. The arena collections (`ArenaVec`, `ArenaMap`, `ArenaSet`, `List`) require

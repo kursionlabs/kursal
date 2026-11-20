@@ -10,7 +10,7 @@ class CastTypingTests(unittest.TestCase):
     run_source = test_closure_boundary.ClosureBoundaryTests.run_source
 
     def test_noninteger_casts_require_authorization(self):
-        for source, target in (('bool', 'u32'), ('u32', 'f32'), ('u32', '*u32'),
+        for source, target in (('bool', 'u32'), ('f32', 'bool'), ('u32', '*u32'),
                                ('*u32', 'usize'), ('(u32,)', 'u32')):
             with self.subTest(source=source, target=target), self.assertRaisesRegex(LowerError, 'unsafe'):
                 self.run_source(f'fn bad(x: {source}) -> {target} {{ x as {target} }} '
@@ -33,18 +33,31 @@ class CastTypingTests(unittest.TestCase):
             if (x as u32) == 4294967295u32 && (255u32 as i8) == -1i8 { 7i32 } else { 0i32 }
         }''', 7)
 
+    def test_number_casts_convert_by_value_without_authorization(self):
+        self.run_source('''fn main() -> i32 {
+            let half = 2.5f64;
+            let nan = 0.0f64 / 0.0f64;
+            let big = 1.0f64 / 0.0f64;
+            let small = (half as i64) == 2i64 && ((-half) as i64) == -2i64 && (7i64 as f64) == 7.0
+                && ((-1.5f32) as u8) == 0u8 && (300.0f32 as u8) == 255u8;
+            let saturated = (nan as i32) == 0i32 && (big as i64) == 9223372036854775807i64
+                && ((-big) as i64) == -9223372036854775808i64 && (big as usize) == !0usize
+                && ((-big) as isize) < 0isize && (3.9f32 as usize) == 3usize;
+            let widths = (16777217u32 as f32) == 16777216.0f32 && ((0.1f64 as f32) as f64) != 0.1f64
+                && (18446744073709551615u64 as f64) == 18446744073709551616.0f64;
+            if small && saturated && widths { 7i32 } else { 0i32 }
+        }''', 7)
+
     def test_authorized_scalar_and_aggregate_casts(self):
         self.run_source('''fn main() -> i32 {
-            let bits = unsafe (1.0f32 as u32);
-            let value = unsafe (bits as f32);
             let pair = (7u32, 9u32);
             let rebuilt = unsafe (pair as (i32, i32));
-            if value == 1.0 && unsafe (true as u32) == 1u32 { rebuilt.0 } else { 0i32 }
+            if unsafe (true as u32) == 1u32 { rebuilt.0 } else { 0i32 }
         }''', 7)
 
     def test_authorization_does_not_extend_to_nested_casts(self):
         with self.assertRaisesRegex(LowerError, 'unsafe'):
-            self.run_source('fn bad(x: bool) -> f32 { unsafe ((x as u32) as f32) } '
+            self.run_source('fn bad(x: bool) -> bool { unsafe ((x as u32) as bool) } '
                             'fn main() -> i32 { 0i32 }', 0)
 
     def test_unsafe_function_and_lifted_closure_authorize_casts(self):
@@ -76,13 +89,9 @@ class CastTypingTests(unittest.TestCase):
         }''', 7)
 
     def test_target_restrictions_are_backend_errors(self):
-        for source, message in (
-            ('unsafe (1u32 as f64)', 'reinterpretation requires equal widths'),
-            ('unsafe ((unsafe (0usize as *u32)) as f32)', 'raw pointers only with pointers or integers'),
-        ):
-            with self.subTest(source=source), self.assertRaisesRegex(KursError, message) as error:
-                self.run_source('fn main() -> i32 { let x = ' + source + '; 0i32 }', 0)
-            self.assertNotIsInstance(error.exception, LowerError)
+        with self.assertRaisesRegex(KursError, 'raw pointers only with pointers or integers') as error:
+            self.run_source('fn main() -> i32 { let x = unsafe ((unsafe (0usize as *u32)) as f32); 0i32 }', 0)
+        self.assertNotIsInstance(error.exception, LowerError)
 
     def test_diverging_operand_needs_no_cast(self):
         self.run_source('''fn main() -> i32 {

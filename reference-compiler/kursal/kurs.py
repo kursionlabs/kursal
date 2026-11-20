@@ -176,7 +176,7 @@ def parse_instr(form: Form) -> Instr:
         return Instr(lhs, op, pos=pos, ty=parse_type(rest[0]), lit=str(rest[1]))
     if op in ("construct",):
         return Instr(lhs, op, pos=pos, ty=parse_type(rest[0]), args=tuple(map(str, rest[1:])))
-    if op in ("destruct", "variant_tag", "cast", "int_cast", "to_ptr"):
+    if op in ("destruct", "variant_tag", "cast", "int_cast", "float_cast", "to_ptr"):
         return Instr(lhs, op, pos=pos, args=(str(rest[0]),), ty=parse_type(rest[1]))
     if op == "construct_variant":
         return Instr(lhs, op, pos=pos, ty=parse_type(rest[0]), lit=str(rest[1]), args=(str(rest[2]),))
@@ -494,7 +494,7 @@ def write_instr(instr: Instr) -> str:
         operation = [op, _type_operand(instr), _literal(instr)]
     elif op == "construct":
         operation = [op, _type_operand(instr), *args]
-    elif op in ("destruct", "variant_tag", "cast", "int_cast", "to_ptr"):
+    elif op in ("destruct", "variant_tag", "cast", "int_cast", "float_cast", "to_ptr"):
         operation = [op, args[0], _type_operand(instr)]
     elif op == "construct_variant":
         operation = [op, _type_operand(instr), _literal(instr), args[0]]

@@ -37,16 +37,34 @@ class CastTests(unittest.TestCase):
     def cast(self, source, target):
         return operation("cast", (("%x", source),), target, ("%x",), ty=target)
 
-    def test_cross_integer_float_cast_requires_equal_widths(self):
-        for source, target in ((C.U32, C.Prim("f64")), (C.Prim("f32"), C.Prim("u64"))):
-            with self.subTest(source=source, target=target):
-                program = self.cast(source, target)
-                checker = check_program(program)
-                with self.assertRaisesRegex(KursError, "reinterpretation requires equal widths"):
-                    emit_c(program, checker)
-        output = generate(self.cast(C.U32, C.Prim("f32")))
+    def test_a_number_is_not_reinterpreted_as_a_number(self):
+        for source, target in ((C.U32, C.Prim("f32")), (C.Prim("f64"), C.Prim("u64")), (C.U32, C.Prim("i32")),
+                               (C.Prim("f32"), C.Prim("f64"))):
+            with self.subTest(source=source, target=target), \
+                    self.assertRaisesRegex(KursError, "unsafe_cast_between_numbers"):
+                check_program(self.cast(source, target))
+        # A float's bits are reinterpreted through a struct that holds it alone.
+        output = generate(self.cast(C.Tuple((C.Prim("f32"),)), C.U32))
         self.assertIn('_Static_assert(sizeof(entry_out) == sizeof(entry_x)', output)
         self.assertIn('__builtin_memcpy(&entry_out, &entry_x, sizeof(entry_out));', output)
+
+    def float_cast(self, source, target):
+        return operation("float_cast", (("%x", source),), target, ("%x",), ty=target)
+
+    def test_float_cast_converts_by_value_and_saturates(self):
+        self.assertIn("entry_out = (double)entry_x;", generate(self.float_cast(C.U32, C.Prim("f64"))))
+        self.assertIn("entry_out = (float)entry_x;", generate(self.float_cast(C.Prim("f64"), C.Prim("f32"))))
+        self.assertIn("entry_out = entry_x >= -0x1p63 && entry_x < 0x1p63 ? (int64_t)entry_x : "
+                      "entry_x > 0 ? INT64_MAX : entry_x < 0 ? INT64_MIN : 0;",
+                      generate(self.float_cast(C.Prim("f64"), C.Prim("i64"))))
+        self.assertIn("entry_out = entry_x > -1 && entry_x < 0x1p8f ? (uint8_t)entry_x : entry_x > 0 ? UINT8_MAX : 0;",
+                      generate(self.float_cast(C.Prim("f32"), C.Prim("u8"))))
+        self.assertIn("entry_out = entry_x > -1 && entry_x < -2 * (double)INTPTR_MIN ? (uintptr_t)entry_x : "
+                      "entry_x > 0 ? UINTPTR_MAX : 0;", generate(self.float_cast(C.Prim("f64"), C.USIZE)))
+        for source, target in ((C.U32, C.Prim("u64")), (C.BOOL, C.Prim("f64")), (C.Prim("f64"), C.BOOL)):
+            with self.subTest(source=source, target=target), \
+                    self.assertRaisesRegex(KursError, "float_cast_converts_between"):
+                check_program(self.float_cast(source, target))
 
     def test_aggregate_copy_has_size_assertion_and_no_partial_copy(self):
         output = generate(self.cast(C.Tuple((C.U32,)), C.Tuple((C.U32, C.U32))))

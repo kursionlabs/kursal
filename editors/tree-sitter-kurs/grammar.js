@@ -43,7 +43,7 @@ module.exports = grammar({
       'load', 'store', 'alloca', 'call', 'trait_call', 'pack',
       'add', 'sub', 'mul', 'div', 'mod', 'eq', 'ne', 'lt', 'le', 'gt', 'ge',
       'bit_and', 'bit_or', 'bit_xor', 'shl', 'shr',
-      'int_cast', 'to_ptr', 'cast', 'sizeof', 'fresh', 'static_brand', 'fence',
+      'int_cast', 'float_cast', 'to_ptr', 'cast', 'sizeof', 'fresh', 'static_brand', 'fence',
       'ptr_load', 'ptr_store', 'ptr_load_volatile', 'ptr_store_volatile', /ptr_atomic_[a-z_]+/,
     ),
 

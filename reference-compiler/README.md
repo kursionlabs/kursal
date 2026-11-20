@@ -76,7 +76,10 @@ leaves it out (`K_alloc_buffer_Buffer`).
   binds the pointee), and `(ptr T)`, `(non_null T)`, `(brand $k)`, `(fn (PTYPE*) RET)` (an
   unsafe function's type `(fn (unsafe) (PTYPE*) RET)`).
 - **Premises**: `(Copy T)` and `(Exposed T)`.
-- **Builtin operations**: `int_cast`, `to_ptr` (a `non_null` as its `ptr`), `cast`, `sizeof`,
+- **Builtin operations**: `int_cast` (between integers, modular), `float_cast` (by value, with a
+  float on one side or both: an integer to the nearest float; a float toward zero to an integer,
+  saturating, NaN to 0; a float to the nearest of the other width), `to_ptr` (a `non_null` as its
+  `ptr`), `cast` (a reinterpretation, never from a number to a number), `sizeof`,
   `alloca`, `fresh`, `static_brand` and `trap` (of type `!`, so the block ends with `unreachable`);
   through a raw pointer `ptr_load`, `ptr_store`,
   `ptr_load_volatile` and `ptr_store_volatile`; and the atomics, each with its ordering: one

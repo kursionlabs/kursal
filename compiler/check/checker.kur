@@ -237,6 +237,19 @@ fn is_integer_type(&cx: Domain!['k], t: Type['k]) -> bool {
     }
 }
 
+forall 'k.
+fn is_float_type(&cx: Domain!['k], t: Type['k]) -> bool {
+    match t {
+        Type::Prim(name) => C::is_float(&cx, name),
+        _ => false,
+    }
+}
+
+forall 'k.
+fn is_number_type(&cx: Domain!['k], t: Type['k]) -> bool {
+    is_integer_type(&cx, t) || is_float_type(&cx, t)
+}
+
 // The type of the last member named `name`, as `dict(members).get(name)` finds it.
 forall 'k.
 fn member(&cx: Domain!['k], members: ArenaVec[Member['k], 'k], name: Span['k]) -> Option[Type['k]] {
@@ -1802,6 +1815,8 @@ impl Checker['k] {
             ArenaVec::one(&cx, self.op_variant_tag(&cx, instr))
         } else if op.is(&cx, "int_cast") {
             ArenaVec::one(&cx, self.op_int_cast(&cx, instr))
+        } else if op.is(&cx, "float_cast") {
+            ArenaVec::one(&cx, self.op_float_cast(&cx, instr))
         } else if op.is(&cx, "to_ptr") {
             ArenaVec::one(&cx, self.op_to_ptr(&cx, instr))
         } else if op.is(&cx, "cast") {
@@ -2003,6 +2018,22 @@ impl Checker['k] {
         self.type_operand(&cx, instr)
     }
 
+    // A conversion by value between two number types, at least one of them a float: an integer to
+    // the nearest float; a float toward zero to an integer, saturating at its bounds, NaN to 0; a
+    // float to the nearest float of the other width.
+    fn op_float_cast(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
+        let got = self.use_value(&cx, instr.args.at(&cx, 0usize));
+        let ok = match instr.ty {
+            Option::Some(t) => is_number_type(&cx, got) && is_number_type(&cx, t)
+                && (is_float_type(&cx, got) || is_float_type(&cx, t)),
+            Option::None => false,
+        };
+        if !ok {
+            self.fail(&cx, "float_cast_converts_between");
+        }
+        self.type_operand(&cx, instr)
+    }
+
     fn op_cast(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
         let ty = self.type_operand(&cx, instr);
         let got = self.use_value(&cx, instr.args.at(&cx, 0usize));
@@ -2035,7 +2066,8 @@ impl Checker['k] {
     // An unsafe cast reinterprets only representations the program fixes: a `NonNull` is cast only
     // from or to a pointer (whose obligation is that it is not null), and nothing that holds an enum
     // or a `NonNull` within it is cast, since the compiler chooses an enum's layout (a tag, or the
-    // niche of a `NonNull`: `Types::niche_variant`). A type parameter cannot be cast at all.
+    // niche of a `NonNull`: `Types::niche_variant`). A type parameter cannot be cast at all. Nor is a
+    // number cast to a number: that is a conversion by value, `int_cast` or `float_cast`.
     fn castable(self, &cx: Domain!['k], got: Type['k], want: Type['k]) {
         if is_non_null(got) || is_non_null(want) {
             if !(is_pointer_like(got) && is_pointer_like(want)) {
@@ -2045,6 +2077,9 @@ impl Checker['k] {
         }
         if self.types.chosen_layout(&cx, got) || self.types.chosen_layout(&cx, want) {
             self.fail(&cx, "unsafe_cast_layout_chosen");
+        }
+        if is_number_type(&cx, got) && is_number_type(&cx, want) {
+            self.fail(&cx, "unsafe_cast_between_numbers");
         }
     }
 

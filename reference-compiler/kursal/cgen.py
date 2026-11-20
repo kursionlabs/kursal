@@ -1063,6 +1063,8 @@ class Backend:
             self.line(f"{dst} = {self.value_name(a[0])};")
         elif op == "int_cast":
             self.line(f"{dst} = {self.convert(self.value_name(a[0]), self.type_operand(instr))};")
+        elif op == "float_cast":
+            self.line(f"{dst} = {self.float_convert(self.value_name(a[0]), self.type_of(a[0]), self.type_operand(instr))};")
         elif op == "cast":
             assert dst is not None
             self.cast(dst, self.value_name(a[0]), self.type_of(a[0]), self.type_operand(instr))
@@ -1205,6 +1207,29 @@ class Backend:
             return f"kur_dec_i{SIGNED[dst.name]}(({wide})({expr}))"
         return f"({C_PRIMS[dst.name]})(({wide})({expr}))"
 
+    def float_convert(self, expr: str, src: Type, dst: Type) -> str:
+        """Conversion by value with a float on one side. To a float, C's conversion: the nearest value,
+        ties to even, and past the largest to an infinity. To an integer, toward zero, saturating at the
+        integer's bounds, NaN to 0: C's conversion is undefined outside the range, so it is used only in
+        it. The bounds are powers of two, exact in either float type."""
+        s, d = self.shape(src), self.shape(dst)
+        assert isinstance(s, Prim) and isinstance(d, Prim)
+        if d.name in FLOATS:
+            return f"({C_PRIMS[d.name]}){expr}"
+        if d.name in POINTER_SIZED:
+            # -2^(N-1), for the target's pointer width N.
+            low = f"({C_PRIMS[s.name]})INTPTR_MIN"
+            high = f"-{low}" if d.name in SIGNED else f"-2 * {low}"
+            limits = "INTPTR" if d.name in SIGNED else "UINTPTR"
+        else:
+            suffix, bits = "f" if s.name == "f32" else "", WIDTHS[d.name]
+            high = f"0x1p{bits - 1}{suffix}" if d.name in SIGNED else f"0x1p{bits}{suffix}"
+            low, limits = f"-0x1p{bits - 1}{suffix}", C_PRIMS[d.name][:-2].upper()
+        if d.name not in SIGNED:
+            return f"{expr} > -1 && {expr} < {high} ? ({C_PRIMS[d.name]}){expr} : {expr} > 0 ? {limits}_MAX : 0"
+        return (f"{expr} >= {low} && {expr} < {high} ? ({C_PRIMS[d.name]}){expr} : "
+                f"{expr} > 0 ? {limits}_MAX : {expr} < 0 ? {limits}_MIN : 0")
+
     def cast(self, dst: str, expr: str, src: Type, dst_ty: Type) -> None:
         s, d = self.shape(src), self.shape(dst_ty)
         cd = self.ctype(dst_ty)
@@ -1223,16 +1248,8 @@ class Backend:
             else:
                 raise KursError("backend cast supports raw pointers only with pointers or integers")
         elif isinstance(s, Prim) and isinstance(d, Prim):
-            if s.name == "bool" or d.name == "bool" or s.name in FLOATS and d.name in FLOATS:
-                self.line(f"{dst} = ({cd}){expr};")
-            elif (s.name in FLOATS) != (d.name in FLOATS):
-                # A pointer-sized integer's width is the target's: the assertion below checks it.
-                widths = {**WIDTHS, "f32": 32, "f64": 64}
-                if s.name in widths and d.name in widths and widths[s.name] != widths[d.name]:
-                    raise KursError("backend integer/float reinterpretation requires equal widths")
-                self.reinterpret(dst, expr)
-            else:
-                self.line(f"{dst} = {self.convert(expr, d)};")
+            # One is a bool: the checker leaves a number to a number to `int_cast` and `float_cast`.
+            self.line(f"{dst} = ({cd}){expr};")
         else:
             # Layout belongs to C. Never silently truncate a source or leave a
             # destination tail uninitialized; exact size is a target obligation.

@@ -1,14 +1,28 @@
-//! Integer limits and numeric helpers.
+//! Number limits, float classification and rounding, and float bits.
 // The limits of each integer type, read as `u32::MAX`, `i8::MIN` and
 // `u64::BITS`. `isize` and `usize` are pointer-sized, 32 or 64 bits wide:
 // their limits and widths are computed from `!0usize`, constant arithmetic
 // that the C compiler folds at the target's width.
 //
-// The floating-point types convert to and from their IEEE 754 bits
-// (`x.to_bits()`, `f64::from_bits(b)`) and to each other: `f64::to_f32`
-// rounds to the nearest `f32`, ties to even, past the largest to an
-// infinity; `f32::to_f64` is exact. Every bit pattern is some float, and
-// every float some bit pattern, so none of them needs `unsafe`.
+// `as` converts between number types by value, and needs no `unsafe`:
+// between integers it truncates or extends (modular); an integer becomes the
+// nearest float, ties to even; a float becomes an integer toward zero,
+// saturating at the integer's bounds, NaN becoming 0 (`2.5 as i64` is 2,
+// `1e300 as i32` is `i32::MAX`); and a float becomes the nearest float of the
+// other width, ties to even, past the largest an infinity. `f64::to_f32` and
+// `f32::to_f64` are those last conversions by name.
+//
+// The IEEE 754 bits of a float are a separate, named conversion:
+// `x.to_bits()` and `f64::from_bits(b)`. Every bit pattern is some float, and
+// every float some bit pattern, so neither needs `unsafe`.
+//
+// Rounding to an integral value (`trunc`, `floor`, `ceil`, `round`) is done
+// here, without C's math library: a float of magnitude at least 2^52 (2^23
+// for `f32`) is already integral, and anything smaller converts exactly to
+// an integer and back.
+use package as core;
+
+use core::option::Option;
 
 impl i8 {
     /// The smallest `i8`.
@@ -101,43 +115,230 @@ impl usize {
     const BITS: u32 = 32 + 32 * (((usize::MAX >> 31usize >> 1usize) & 1usize) as u32);
 }
 
+// The representation of an `f64` alone: a cast from it to a `u64`, or back,
+// reinterprets its 64 bits (`f64::to_bits`, `f64::from_bits`).
+struct F64Repr {
+    value: f64,
+}
+
+// The representation of an `f32` alone, as `F64Repr` is of an `f64`.
+struct F32Repr {
+    value: f32,
+}
+
 impl f64 {
     /// The width of `f64` in bits.
     const BITS: u32 = 64;
+    /// Not a number: C's `0.0 / 0.0`. Which NaN, its sign and payload, is
+    /// not specified; test for one with `is_nan`, since a NaN equals nothing.
+    const NAN: f64 = 0.0 / 0.0;
+    /// Positive infinity.
+    const INFINITY: f64 = 1.0 / 0.0;
+    /// Negative infinity.
+    const NEG_INFINITY: f64 = -1.0 / 0.0;
+    /// The largest finite `f64`, (2 - 2^-52) * 2^1023.
+    const MAX: f64 = 179769313486231570000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000.0;
+    /// The smallest finite `f64`, `-f64::MAX`.
+    const MIN: f64 = -f64::MAX;
+    /// The smallest positive normal `f64`, 2^-1022.
+    const MIN_POSITIVE: f64 = 0.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000022250738585072014;
+    /// The difference between 1.0 and the next larger `f64`, 2^-52.
+    const EPSILON: f64 = 0.0000000000000002220446049250313;
 
     /// The IEEE 754 bits of `self`, as a `u64`.
     fn to_bits(self) -> u64 {
-        // A cast between a float and an integer of its width keeps the bits.
-        unsafe (self as u64)
+        // `F64Repr` holds nothing but the `f64`, and any 64 bits are a `u64`.
+        unsafe (F64Repr.{ value: self } as u64)
     }
 
     /// The `f64` whose IEEE 754 bits are `bits`.
     fn from_bits(bits: u64) -> f64 {
-        unsafe (bits as f64)
+        // Any 64 bits are an `f64`, a NaN among them.
+        let repr = unsafe (bits as F64Repr);
+        repr.value
     }
 
     /// `self` rounded to the nearest `f32`, ties to even, and past the largest to an infinity.
     fn to_f32(self) -> f32 {
-        unsafe (self as f32)
+        self as f32
+    }
+
+    /// Whether `self` is a NaN.
+    fn is_nan(self) -> bool {
+        self != self
+    }
+
+    /// Whether `self` is positive or negative infinity.
+    fn is_infinite(self) -> bool {
+        self == f64::INFINITY || self == f64::NEG_INFINITY
+    }
+
+    /// Whether `self` is neither infinite nor a NaN.
+    fn is_finite(self) -> bool {
+        // Some exponent bit is clear.
+        (self.to_bits() & 9218868437227405312u64) != 9218868437227405312u64
+    }
+
+    /// Whether the sign bit of `self` is set: for a negative number, for
+    /// -0.0, and for a NaN with the bit set.
+    fn is_sign_negative(self) -> bool {
+        (self.to_bits() >> 63u64) == 1u64
+    }
+
+    /// `self` without its sign bit.
+    fn abs(self) -> f64 {
+        f64::from_bits(self.to_bits() & 9223372036854775807u64)
+    }
+
+    /// The magnitude of `self` with the sign of `sign`.
+    fn copysign(self, sign: f64) -> f64 {
+        f64::from_bits((self.to_bits() & 9223372036854775807u64) | (sign.to_bits() & 9223372036854775808u64))
+    }
+
+    /// `self` rounded toward zero to an integral value, keeping its sign
+    /// (`-0.5f64.trunc()` is -0.0). An infinity and a NaN stay as they are.
+    fn trunc(self) -> f64 {
+        // From 2^52 on every `f64` is integral; below it, an `i64` holds the integral part exactly.
+        if !(self.abs() < 4503599627370496.0) {
+            return self;
+        }
+        ((self as i64) as f64).copysign(self)
+    }
+
+    /// The largest integral value not above `self`.
+    fn floor(self) -> f64 {
+        let t = self.trunc();
+        if t > self { t - 1.0 } else { t }
+    }
+
+    /// The smallest integral value not below `self`.
+    fn ceil(self) -> f64 {
+        let t = self.trunc();
+        if t < self { t + 1.0 } else { t }
+    }
+
+    /// The nearest integral value, halfway cases away from zero, as C's `round`.
+    fn round(self) -> f64 {
+        let t = self.trunc();
+        // Exact: `t` is `self` without its fraction.
+        if (self - t).abs() >= 0.5 { t + 1.0f64.copysign(self) } else { t }
+    }
+
+    /// `self` toward zero as an `i64`, or nothing when that is out of
+    /// `i64`'s range or `self` is a NaN, where `as` saturates or gives 0.
+    fn to_i64_checked(self) -> Option[i64] {
+        // -2^63 is an `i64`; 2^63 is not.
+        if self >= -9223372036854775808.0 && self < 9223372036854775808.0 {
+            Option::Some.(self as i64)
+        } else {
+            Option::None
+        }
     }
 }
 
 impl f32 {
     /// The width of `f32` in bits.
     const BITS: u32 = 32;
+    /// Not a number: C's `0.0f / 0.0f`. Which NaN is not specified, as for `f64::NAN`.
+    const NAN: f32 = 0.0 / 0.0;
+    /// Positive infinity.
+    const INFINITY: f32 = 1.0 / 0.0;
+    /// Negative infinity.
+    const NEG_INFINITY: f32 = -1.0 / 0.0;
+    /// The largest finite `f32`, (2 - 2^-23) * 2^127.
+    const MAX: f32 = 340282350000000000000000000000000000000.0;
+    /// The smallest finite `f32`, `-f32::MAX`.
+    const MIN: f32 = -f32::MAX;
+    /// The smallest positive normal `f32`, 2^-126.
+    const MIN_POSITIVE: f32 = 0.000000000000000000000000000000000000011754944;
+    /// The difference between 1.0 and the next larger `f32`, 2^-23.
+    const EPSILON: f32 = 0.00000011920929;
 
     /// The IEEE 754 bits of `self`, as a `u32`.
     fn to_bits(self) -> u32 {
-        unsafe (self as u32)
+        // `F32Repr` holds nothing but the `f32`, and any 32 bits are a `u32`.
+        unsafe (F32Repr.{ value: self } as u32)
     }
 
     /// The `f32` whose IEEE 754 bits are `bits`.
     fn from_bits(bits: u32) -> f32 {
-        unsafe (bits as f32)
+        // Any 32 bits are an `f32`, a NaN among them.
+        let repr = unsafe (bits as F32Repr);
+        repr.value
     }
 
     /// `self` as an `f64`, exactly.
     fn to_f64(self) -> f64 {
-        unsafe (self as f64)
+        self as f64
+    }
+
+    /// Whether `self` is a NaN.
+    fn is_nan(self) -> bool {
+        self != self
+    }
+
+    /// Whether `self` is positive or negative infinity.
+    fn is_infinite(self) -> bool {
+        self == f32::INFINITY || self == f32::NEG_INFINITY
+    }
+
+    /// Whether `self` is neither infinite nor a NaN.
+    fn is_finite(self) -> bool {
+        // Some exponent bit is clear.
+        (self.to_bits() & 2139095040u32) != 2139095040u32
+    }
+
+    /// Whether the sign bit of `self` is set, as `f64::is_sign_negative`.
+    fn is_sign_negative(self) -> bool {
+        (self.to_bits() >> 31u32) == 1u32
+    }
+
+    /// `self` without its sign bit.
+    fn abs(self) -> f32 {
+        f32::from_bits(self.to_bits() & 2147483647u32)
+    }
+
+    /// The magnitude of `self` with the sign of `sign`.
+    fn copysign(self, sign: f32) -> f32 {
+        f32::from_bits((self.to_bits() & 2147483647u32) | (sign.to_bits() & 2147483648u32))
+    }
+
+    /// `self` rounded toward zero to an integral value, as `f64::trunc`.
+    fn trunc(self) -> f32 {
+        // From 2^23 on every `f32` is integral; below it, an `i32` holds the integral part exactly.
+        if !(self.abs() < 8388608.0) {
+            return self;
+        }
+        ((self as i32) as f32).copysign(self)
+    }
+
+    /// The largest integral value not above `self`.
+    fn floor(self) -> f32 {
+        let t = self.trunc();
+        if t > self { t - 1.0 } else { t }
+    }
+
+    /// The smallest integral value not below `self`.
+    fn ceil(self) -> f32 {
+        let t = self.trunc();
+        if t < self { t + 1.0 } else { t }
+    }
+
+    /// The nearest integral value, halfway cases away from zero.
+    fn round(self) -> f32 {
+        let t = self.trunc();
+        // Exact: `t` is `self` without its fraction.
+        if (self - t).abs() >= 0.5 { t + 1.0f32.copysign(self) } else { t }
+    }
+
+    /// `self` toward zero as an `i64`, or nothing when that is out of
+    /// `i64`'s range or `self` is a NaN.
+    fn to_i64_checked(self) -> Option[i64] {
+        // -2^63 is an `i64`; 2^63 is not.
+        if self >= -9223372036854775808.0 && self < 9223372036854775808.0 {
+            Option::Some.(self as i64)
+        } else {
+            Option::None
+        }
     }
 }

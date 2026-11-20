@@ -112,7 +112,7 @@ def instruction_text(instr: C.Instr, depth: int, omit_unit: bool = False) -> str
             operands = [ty, *args]
         elif op == "construct_variant":
             operands = [ty, literal, *args]
-        elif op in ("int_cast", "cast", "to_ptr"):
+        elif op in ("int_cast", "float_cast", "cast", "to_ptr"):
             operands = [*args, ty]
         elif op in ("alloca", "sizeof"):
             operands = [ty]

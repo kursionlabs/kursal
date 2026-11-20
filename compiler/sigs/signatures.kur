@@ -139,9 +139,10 @@ exposed struct InstanceSig {
 
 // A folded constant. An integer is its value in its type's width, in 64 bits, sign-extended for a
 // signed type; its type is an integer `Prim`. A float keeps its digits. A string's type is the one
-// wanted where it was folded, if any. An operation the C compiler folds, at the target's width, is one
-// on `usize` or `isize`, or on the value of another such operation: its operator is a binary
-// operator's instruction (`binop_name`), `int_cast`, `neg`, `not`, `and` or `or`, and its type the
+// wanted where it was folded, if any. An operation the C compiler folds is one on `usize` or `isize`,
+// at the target's width; one on floats, or a conversion with a float on either side, in IEEE
+// arithmetic; or one on the value of another such operation: its operator is a binary operator's
+// instruction (`binop_name`), `int_cast`, `float_cast`, `neg`, `not`, `and` or `or`, and its type the
 // result's.
 forall 'k.
 exposed enum ConstValue {
@@ -205,6 +206,20 @@ fn integer_of(&cx: Domain!['k], value: ConstValue['k]) -> Option[Span['k]] {
     match value {
         ConstValue::Int(_v, ty) => integer_type(&cx, Option::Some.(ty)),
         ConstValue::Op(_o, _a, ty) => integer_type(&cx, Option::Some.(ty)),
+        _ => Option::None,
+    }
+}
+
+// The type of a float constant, or none for any other constant.
+forall 'k.
+fn floating_of(&cx: Domain!['k], value: ConstValue['k]) -> Option[Span['k]] {
+    let ty = match value {
+        ConstValue::Float(_t, ty) => ty,
+        ConstValue::Op(_o, _a, ty) => ty,
+        _ => return Option::None,
+    };
+    match ty {
+        Type::Prim(name) => if C::is_float(&cx, name) { Option::Some.(name) } else { Option::None },
         _ => Option::None,
     }
 }
@@ -1411,13 +1426,24 @@ impl Signatures['k] {
             Expr::Cast(c) => {
                 let v = self.fold(&cx, c.value.copy(&cx), Option::None, home, evaluate)?;
                 let to = self.type(&cx, c.type, new_scope(&cx))?;
-                let (source, target) = match integer_of(&cx, v) {
-                    Option::Some(source) => match integer_type(&cx, Option::Some.(to)) {
-                        Option::Some(target) => (source, target),
-                        Option::None => return sig_error(Span::from_static(&cx, "a constant cast converts between integer types"), c.pos),
+                let source = match integer_of(&cx, v) {
+                    Option::Some(name) => name,
+                    Option::None => match floating_of(&cx, v) {
+                        Option::Some(name) => name,
+                        Option::None => return sig_error(Span::from_static(&cx, "a constant cast converts between number types"), c.pos),
                     },
-                    Option::None => return sig_error(Span::from_static(&cx, "a constant cast converts between integer types"), c.pos),
                 };
+                let target = match to {
+                    Type::Prim(name) => if C::is_integer(&cx, name) || C::is_float(&cx, name) {
+                        name
+                    } else {
+                        return sig_error(Span::from_static(&cx, "a constant cast converts between number types"), c.pos);
+                    },
+                    _ => return sig_error(Span::from_static(&cx, "a constant cast converts between number types"), c.pos),
+                };
+                if C::is_float(&cx, source) || C::is_float(&cx, target) {
+                    return Result::Ok.(op_value(&cx, "float_cast", ArenaVec::one(&cx, v), to));
+                }
                 let unit = match v {
                     ConstValue::Int(value, _ty) => if !C::is_pointer_sized(&cx, source) && !C::is_pointer_sized(&cx, target) {
                         return Result::Ok.(wrapped(&cx, value, target));
@@ -1460,7 +1486,9 @@ impl Signatures['k] {
             ConstValue::Bool(b) => if expr.op.is(&cx, "!") {
                 return Result::Ok.(ConstValue::Bool.(!b));
             },
-            ConstValue::Op(_o, _a, ty) => if expr.op.is(&cx, "!") && C::same(&cx, ty, C::bool_type(&cx)) {
+            ConstValue::Op(_o, _a, ty) => if expr.op.is(&cx, "-") && floating_of(&cx, v).is_some() {
+                return Result::Ok.(op_value(&cx, "neg", ArenaVec::one(&cx, v), ty));
+            } else if expr.op.is(&cx, "!") && C::same(&cx, ty, C::bool_type(&cx)) {
                 return Result::Ok.(op_value(&cx, "not", ArenaVec::one(&cx, v), ty));
             },
             _ => (),
@@ -1529,6 +1557,20 @@ impl Signatures['k] {
                 _ => (),
             };
             return Result::Ok.(op_value(&cx, binop_name(&cx, op), ArenaVec::two(&cx, a, b), C::bool_type(&cx)));
+        }
+        match floating_of(&cx, a) {
+            Option::Some(number) => {
+                let same = match floating_of(&cx, b) {
+                    Option::Some(other) => number.eq(&cx, other),
+                    Option::None => false,
+                };
+                if same && (comparison || op.is(&cx, "+") || op.is(&cx, "-") || op.is(&cx, "*") || op.is(&cx, "/")) {
+                    // The C compiler folds arithmetic on floats.
+                    let ty = if comparison { C::bool_type(&cx) } else { Type::Prim.(number) };
+                    return Result::Ok.(op_value(&cx, binop_name(&cx, op), ArenaVec::two(&cx, a, b), ty));
+                }
+            },
+            Option::None => (),
         }
         let name = match integer_of(&cx, a) {
             Option::Some(name) => name,

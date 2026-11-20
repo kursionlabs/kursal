@@ -123,3 +123,26 @@ class ConstantRuntimeTests(unittest.TestCase):
                 let a = -1i32; let b = 255u32; let c = -1i8;
                 if (a as u8) == A && (b as i8) == B && (c as u64) == C { 7i32 } else { 1i32 }
             }''', 7)
+
+    def test_float_constants_are_folded_by_the_c_compiler(self):
+        self.run_source('''const INF: f64 = 1.0 / 0.0;
+            const NAN: f64 = -INF + INF;
+            const HALF: f32 = (1.0 / 2.0) * 1.0;
+            const N: i32 = (-2.5f64) as i32;
+            const BIG: u8 = INF as u8;
+            const SEVEN: f64 = (7i64 as f64) + 0.0;
+            const NARROW: f32 = 0.1f64 as f32;
+            const ORDERED: bool = HALF < 1.0f32 && !(NAN == NAN);
+            fn inf() -> f64 { 1.0 / 0.0 }
+            fn main() -> i32 {
+                let ok = INF == inf() && NAN != NAN && HALF == 0.5 && N == -2i32 && BIG == 255u8
+                    && SEVEN == 7.0 && NARROW == (0.1f64 as f32) && ORDERED;
+                if ok { 7i32 } else { 1i32 }
+            }''', 7)
+
+    def test_float_constant_operators_are_arithmetic_and_comparison(self):
+        for expression, message in (('1.0f64 % 2.0f64', 'one type'), ('1.0f64 + 1u8', 'one type'),
+                                    ('true as f64', 'converts between number types'),
+                                    ('1.0f64 as bool', 'converts between number types')):
+            with self.subTest(expression=expression), self.assertRaisesRegex(SigError, message):
+                self.run_source('const X: f64 = ' + expression + '; fn main() -> i32 { 0i32 }', 0)
