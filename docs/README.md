@@ -75,8 +75,9 @@ which `std` exports as `std::cmp`, has its pages under both: `/core/cmp/` and
 from `core::cmp`, with a link there. A reader of `std` stays in `std`, and a
 reader of `core` alone still has its pages. Both are generated from the same
 source in one run, so there is nothing to keep in step by hand. Links on a
-package's pages lead to the shortest path that package exposes (`std::collections`
-rather than `std::alloc::collections`), else to the declaring package's own.
+package's pages lead to the path that package exposes (`std::cmp::Ord` rather
+than `core::cmp::Ord`), the shortest when it has several, else to the declaring
+package's own.
 The search index lists each item once, at the path the documented package
 (the one `kursal doc` was given) links to.
 

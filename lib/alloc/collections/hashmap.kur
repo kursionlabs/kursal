@@ -19,6 +19,11 @@
 //   - `insert` of a key already present replaces the entry, key and
 //     value, and hands back the ones it replaced: `Some((key, value))`
 //     here, `Some(value)` where keys are `Copy` (`insert_in`, `ArenaMap`).
+//   - `each` and `each_in` visit every entry in place and keep the map;
+//     `drain` and `destroy` take it apart. A map whose keys own their
+//     bytes (`Buffer!`) is looked up by a view of them with `find` and
+//     `OwnedMap!`'s `find_with`/`find_update`, so no key is built to look
+//     one up.
 //
 // Keys and values each live in their own one-value allocation: `Entry`
 // holds `*K`/`*V`, never `K`/`V` inline. A generic type parameter is not
@@ -26,7 +31,7 @@
 // `Entry` and compared more than once in this generic code, whereas a raw
 // pointer is always Copy.
 //
-// Brand policy: `insert` and `remove`, and their `_in` forms, always
+// Brand policy: `insert`, `remove` and `clear`, and the `_in` forms, always
 // return a fresh `Exclusive!['2]`, minted by `Allocation!::adopt` and sealed
 // by the operation's `exists '2.` return, whether or not an entry was
 // added, replaced or freed. Read-only operations (`len`, `is_empty`, the
@@ -661,6 +666,79 @@ impl HashMap![K, V, 'k] {
     }
 }
 
+// ---------------------------------------------------------------------
+// Visiting: every entry, lent where it lives, the map kept.
+
+forall K, V, 'k.
+impl HashMap![K, V, 'k] {
+    /// Calls `f` on each key and its value where they live, in no
+    /// particular order: `f` gets both through `&`, and nothing is copied
+    /// out or back. The map stays as it is, apart from what `f` does to the
+    /// values. A key `f` changes stays in the bucket of its old hash, so a
+    /// lookup may then miss it; nothing worse comes of it.
+    forall Env where Copy[Env].
+    fn each(&self, &tag: Exclusive!['k], f: closure[Env](&_: K, &_: V) -> ()) {
+        let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n } = self;
+        let (base, m) = r.into_parts();
+        var i = 0usize;
+        while i < bc {
+            var cur = unsafe *(unsafe offset(base, i));
+            while !is_null(cur) {
+                let { key: kp, val: vp, next: nx } = unsafe *cur;
+                // The entry's key and value blocks, which only the entry
+                // reaches, and nothing else runs while `f` does.
+                f(unsafe &*kp, unsafe &*vp);
+                cur = nx;
+            }
+            i = i + 1usize;
+        }
+        self = HashMap!.{ alloc: a, back: bk, buckets: r, bucket_count: bc, len: n };
+    }
+
+    /// `each`, with a context `cx` lent to `f` beside each key and value:
+    /// the linear values `f` works on, which it cannot capture (an output
+    /// to write the entries to, say).
+    forall C, Env where Copy[Env].
+    fn each_in(&self, &tag: Exclusive!['k], &cx: C, f: closure[Env](&_: K, &_: V, &_: C) -> ()) {
+        let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n } = self;
+        let (base, m) = r.into_parts();
+        var i = 0usize;
+        while i < bc {
+            var cur = unsafe *(unsafe offset(base, i));
+            while !is_null(cur) {
+                let { key: kp, val: vp, next: nx } = unsafe *cur;
+                // As in `each`; `cx` is the caller's own place.
+                f(unsafe &*kp, unsafe &*vp, &cx);
+                cur = nx;
+            }
+            i = i + 1usize;
+        }
+        self = HashMap!.{ alloc: a, back: bk, buckets: r, bucket_count: bc, len: n };
+    }
+
+    /// Removes every entry, handing each to `f`, and keeps the bucket array,
+    /// so the map holds as many again without growing. The entries' storage
+    /// is freed, so the map comes back freshly branded, as from `remove`.
+    fn clear(self, tag: Exclusive!['k], f: fn(K, V) -> ()) -> exists '2. (Exclusive!['2], HashMap![K, V, '2]) {
+        let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n } = self;
+        let (base, m) = r.into_parts();
+        var i = 0usize;
+        while i < bc {
+            let s = unsafe offset(base, i);
+            unsafe destroy_chain[K, V](unsafe *s, f);
+            unsafe *s = null();
+            i = i + 1usize;
+        }
+        let rg = bk.resume(tag);
+        let u0 = a.release(rg);
+        // `adopt`'s obligation: every one of the (at least 8) slots holds the
+        // null entry, an initialized `*Entry`.
+        let exists 'open1. (a2, rg2) = unsafe Allocation!::adopt[*Entry[K, V]](u0);
+        let (tag2, r2, bk2) = rg2.share();
+        pack 'open1. (tag2, HashMap!.{ alloc: a2, back: bk2, buckets: r2, bucket_count: bc, len: 0usize })
+    }
+}
+
 forall K, V where Copy[K], Copy[V].
 fn forget_entry(key: K, value: V) -> () {
     ()
@@ -814,6 +892,32 @@ impl OwnedMap![K, V] {
         let exists 'm. (tag, map) = self.inner;
         map.destroy(tag, f)
     }
+
+    /// Calls `f` on each key and its value where they live, in no
+    /// particular order, keeping the map (`HashMap!::each`).
+    forall Env where Copy[Env].
+    fn each(&self, f: closure[Env](&_: K, &_: V) -> ()) {
+        let exists 'm. (tag, map) = self.inner;
+        &map.each(&tag, f);
+        self = OwnedMap!.{ inner: pack 'm. (tag, map) };
+    }
+
+    /// `each`, with a context `cx` lent to `f` beside each key and value
+    /// (`HashMap!::each_in`).
+    forall C, Env where Copy[Env].
+    fn each_in(&self, &cx: C, f: closure[Env](&_: K, &_: V, &_: C) -> ()) {
+        let exists 'm. (tag, map) = self.inner;
+        &map.each_in(&tag, &cx, f);
+        self = OwnedMap!.{ inner: pack 'm. (tag, map) };
+    }
+
+    /// Removes every entry, handing each to `f`, and keeps the room the map
+    /// has (`HashMap!::clear`).
+    fn clear_with(&self, f: fn(K, V) -> ()) {
+        let exists 'm. (tag, map) = self.inner;
+        let exists '2. (tag, map) = map.clear(tag, f);
+        self = OwnedMap!.{ inner: pack '2. (tag, map) };
+    }
 }
 
 forall K, V where Hash[K], Eq[K, K].
@@ -895,6 +999,66 @@ impl OwnedMap![K, V] {
         };
         self = OwnedMap!.{ inner: pack 'm. (tag, map) };
         result
+    }
+}
+
+forall K, V.
+impl OwnedMap![K, V] {
+    /// Calls `f` on the value of the key `probe` stands for, in place:
+    /// `with`, looked up by a probe of another type that hashes like the
+    /// keys and compares equal to the one it stands for (`HashMap!::find`),
+    /// such as a `core::slice::Readable` view for a `Buffer!` key, so that
+    /// no owned key is built for the lookup. The probe comes back.
+    forall Q, Ret, Env where Hash[Q], Eq[K, Q], Copy[Env].
+    fn find_with(&self, &probe: Q, f: closure[Env](V) -> (V, Ret)) -> Option[Ret] {
+        let exists 'm. (tag, map) = self.inner;
+        let slot = &map.find(&tag, &probe);
+        let (tag, result) = match slot {
+            Option::Some(r) => {
+                let ret = r.with(&tag, f);
+                (tag, Option::Some.(ret))
+            },
+            Option::None => (tag, Option::None),
+        };
+        self = OwnedMap!.{ inner: pack 'm. (tag, map) };
+        result
+    }
+
+    /// Calls `f` on the value of the key `probe` stands for, where it
+    /// lives: `update`, looked up by a probe as `find_with` is.
+    forall Q, Ret, Env where Hash[Q], Eq[K, Q], Copy[Env].
+    fn find_update(&self, &probe: Q, f: closure[Env](&_: V) -> Ret) -> Option[Ret] {
+        let exists 'm. (tag, map) = self.inner;
+        let slot = &map.find(&tag, &probe);
+        let (tag, result) = match slot {
+            Option::Some(r) => {
+                let ret = r.update(&tag, f);
+                (tag, Option::Some.(ret))
+            },
+            Option::None => (tag, Option::None),
+        };
+        self = OwnedMap!.{ inner: pack 'm. (tag, map) };
+        result
+    }
+}
+
+forall K, V where Copy[V].
+impl OwnedMap![K, V] {
+    /// A copy of the value of the key `probe` stands for, or `None`: `get`,
+    /// looked up by a probe as `find_with` is.
+    forall Q where Hash[Q], Eq[K, Q].
+    fn find(&self, &probe: Q) -> Option[V] {
+        let exists 'm. (tag, map) = self.inner;
+        let slot = &map.find(&tag, &probe);
+        let (tag, value) = match slot {
+            Option::Some(r) => {
+                let value = r.copy(&tag);
+                (tag, Option::Some.(value))
+            },
+            Option::None => (tag, Option::None),
+        };
+        self = OwnedMap!.{ inner: pack 'm. (tag, map) };
+        value
     }
 }
 
@@ -993,11 +1157,9 @@ impl OwnedMap![K, V] {
         value
     }
 
-    /// Removes every entry.
+    /// Removes every entry, keeping the room the map has.
     fn clear(&self) {
-        let exists 'm. (tag, map) = self.inner;
-        map.free(tag);
-        self = OwnedMap!.{ inner: HashMap!::new[K, V]() };
+        &self.clear_with(forget_entry[K, V]);
     }
 
     /// Frees a map of `Copy` keys and values, which need no per-entry callback.

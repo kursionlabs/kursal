@@ -73,7 +73,7 @@ LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
      "fn f() -> u32 { pair(make(), { return 0u32; 2u32 }) }\n", "temporary expression result"),
     ("use std::iter::{Iterator, range};\nfn f() -> u32 { var s = 0u32; for i in &range(0usize, 3usize) { s = s + 1u32; } s }\n",
      "iterator is not a place"),
-    ("use std::bytes::buffer::Buffer!;\nfn g() -> u32 { 1u32 }\nfn f() -> u32 { let b = f\"{&g()}\"; 0u32 }\n", "needs a local or a place"),
+    ("use std::buffer::Buffer!;\nfn g() -> u32 { 1u32 }\nfn f() -> u32 { let b = f\"{&g()}\"; 0u32 }\n", "needs a local or a place"),
     # place flow names a closure's body by the function it is in
     (TOKEN + "fn f() -> u32 {\n    let g = |x: u32| {\n        let t = Token!.{ n: x };\n        take(t) + take(t)\n    };\n    g(1u32)\n}\n",
      "6:24: p::f: value 't' has been moved or is only partially available"),

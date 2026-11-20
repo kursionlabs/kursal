@@ -1,7 +1,12 @@
 //! Time: `Instant`, a reading of a monotonic clock; `Duration`, a span of
-//! time; and `sleep`. `Duration`'s arithmetic saturates at the largest
-//! `Duration`.
+//! time; and `sleep`. `Duration`'s arithmetic, and an `Instant` moved by
+//! one, saturate: at the largest `Duration` or `Instant` going up, at zero
+//! going down. Both compare with `Ord`, so a deadline is an `Instant`:
+//! `Instant::now() >= start.add(timeout)`, or `start.elapsed() >= timeout`.
 use package as std;
+
+use core::cmp::{Ord, Order};
+use core::hash::Eq;
 
 extern "C" fn kur_libc_time_monotonic() -> u64;
 extern "C" fn kur_libc_time_sleep(nanoseconds: u64) -> ();
@@ -17,7 +22,6 @@ impl Duration {
         Duration.{ nanoseconds }
     }
 
-    // The arithmetic below saturates at the largest `Duration`.
     /// A duration of `milliseconds` milliseconds.
     fn from_millis(milliseconds: u64) -> Duration {
         Duration.{ nanoseconds: saturating_mul(milliseconds, 1000000u64) }
@@ -42,10 +46,57 @@ impl Duration {
     fn as_secs(self) -> u64 {
         self.nanoseconds / 1000000000u64
     }
+
+    /// Whether the duration is no time at all.
+    fn is_zero(self) -> bool {
+        self.nanoseconds == 0u64
+    }
+
+    /// The two durations together.
+    fn add(self, other: Duration) -> Duration {
+        Duration.{ nanoseconds: saturating_add(self.nanoseconds, other.nanoseconds) }
+    }
+
+    /// What is left of this duration after `other`; zero if `other` is
+    /// longer.
+    fn sub(self, other: Duration) -> Duration {
+        Duration.{ nanoseconds: saturating_sub(self.nanoseconds, other.nanoseconds) }
+    }
+
+    /// The duration `times` times over.
+    fn mul(self, times: u64) -> Duration {
+        Duration.{ nanoseconds: saturating_mul(self.nanoseconds, times) }
+    }
+}
+
+fn saturating_add(a: u64, b: u64) -> u64 {
+    if a > 18446744073709551615u64 - b { 18446744073709551615u64 } else { a + b }
+}
+
+fn saturating_sub(a: u64, b: u64) -> u64 {
+    if b > a { 0u64 } else { a - b }
 }
 
 fn saturating_mul(a: u64, b: u64) -> u64 {
     if a != 0u64 && b > 18446744073709551615u64 / a { 18446744073709551615u64 } else { a * b }
+}
+
+/// Durations are equal when they are as long.
+instance Eq[Duration, Duration] {
+    fn eq(a: Duration, b: Duration) -> (Duration, Duration, bool) {
+        (a, b, a.nanoseconds == b.nanoseconds)
+    }
+}
+
+/// The shorter duration orders first.
+instance Ord[Duration, Duration] {
+    fn cmp(a: Duration, b: Duration) -> (Duration, Duration, Order) {
+        (a, b, order(a.nanoseconds, b.nanoseconds))
+    }
+}
+
+fn order(a: u64, b: u64) -> Order {
+    if a < b { Order::Less } else if a > b { Order::Greater } else { Order::Equal }
 }
 
 /// Suspends the calling thread for at least `duration`, sleeping on for what
@@ -67,21 +118,32 @@ impl Instant {
         Instant.{ nanoseconds: unsafe kur_libc_time_monotonic() }
     }
 
-    /// The nanoseconds from `self` to `later`; zero if `later` is earlier.
-    fn nanos_until(self, later: Instant) -> u64 {
-        let { nanoseconds: start } = self;
-        let { nanoseconds: end } = later;
-        if end < start { 0u64 } else { end - start }
+    /// The time from `earlier` to this reading; zero if `earlier` is later.
+    fn since(self, earlier: Instant) -> Duration {
+        Duration.{ nanoseconds: saturating_sub(self.nanoseconds, earlier.nanoseconds) }
     }
 
-    /// The whole milliseconds from `self` to `later`; zero if `later` is
-    /// earlier.
-    fn millis_until(self, later: Instant) -> u64 {
-        self.nanos_until(later) / 1000000u64
+    /// The time from this reading to now: `Instant::now().since(self)`.
+    fn elapsed(self) -> Duration {
+        Instant::now().since(self)
     }
 
-    /// The time from `self` to `later`; zero if `later` is earlier.
-    fn duration_until(self, later: Instant) -> Duration {
-        Duration.{ nanoseconds: self.nanos_until(later) }
+    /// The reading `duration` after this one.
+    fn add(self, duration: Duration) -> Instant {
+        Instant.{ nanoseconds: saturating_add(self.nanoseconds, duration.nanoseconds) }
+    }
+}
+
+/// Readings are equal when they are of the same moment.
+instance Eq[Instant, Instant] {
+    fn eq(a: Instant, b: Instant) -> (Instant, Instant, bool) {
+        (a, b, a.nanoseconds == b.nanoseconds)
+    }
+}
+
+/// The earlier reading orders first.
+instance Ord[Instant, Instant] {
+    fn cmp(a: Instant, b: Instant) -> (Instant, Instant, Order) {
+        (a, b, order(a.nanoseconds, b.nanoseconds))
     }
 }

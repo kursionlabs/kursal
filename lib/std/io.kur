@@ -14,7 +14,7 @@ use alloc::buffer::Buffer!;
 use core::raw::Span;
 use core::ptr::offset;
 use core::slice::{Slice, ReadBytes};
-use core::fmt::Writable;
+use core::fmt::{Format, Writable, write_i64};
 use core::option::{Option, Result};
 use core::cap::{Access, Exclusive!};
 
@@ -32,6 +32,8 @@ extern "C" fn kur_libc_fs_regular_size(fd: i32) -> isize;
 extern "C" fn kur_libc_fs_size_hint(fd: i32) -> isize;
 extern "C" fn kur_libc_stdin_claim() -> i32;
 extern "C" fn kur_libc_stdin_release() -> ();
+extern "C" fn kur_libc_error_kind(code: i32) -> i32;
+extern "C" fn kur_libc_error_message(code: i32, out: *u8, cap: usize) -> usize;
 
 /// A path, name or argument for C: the bytes of a view, read through the
 /// capability that permits it, followed by a NUL, in a buffer the caller
@@ -45,9 +47,50 @@ fn c_string(&cx: C, bytes: S) -> Buffer! {
 
 /// An I/O error: the `errno` of the system call that failed, or EIO (5)
 /// for a failure the system did not report itself (a `write` that made no
-/// progress). Every fallible function here reports one.
+/// progress). Every fallible function here reports one. It describes itself
+/// (`message`), says what kind of failure it is (`kind`), and formats as
+/// its description and its number, `No such file or directory (error 2)`,
+/// so `f"cannot read {path}: {e}\n"` reports it.
 exposed struct Error {
     errno: i32,
+}
+
+/// What kind of failure an `Error` is, for code that handles some kinds:
+/// the errnos a portable program tells apart, whatever their numbers on
+/// the host. `Other` is every other errno; `errno` still tells them apart.
+exposed enum ErrorKind {
+    // ENOENT: no such file or directory.
+    NotFound,
+    // EACCES or EPERM.
+    PermissionDenied,
+    // EEXIST.
+    AlreadyExists,
+    // EISDIR: a directory where a file was wanted.
+    IsADirectory,
+    // ENOTDIR: a file where a directory was wanted, in a path.
+    NotADirectory,
+    // ENOTEMPTY: removing a directory that holds something.
+    DirectoryNotEmpty,
+    // EINVAL: an argument the call does not take, such as a path holding a NUL.
+    InvalidInput,
+    // EPIPE: writing to a pipe nothing reads any more.
+    BrokenPipe,
+    // EINTR: a signal interrupted the call.
+    Interrupted,
+    // EAGAIN or EWOULDBLOCK: the call would have had to wait.
+    WouldBlock,
+    // ETIMEDOUT.
+    TimedOut,
+    // EBUSY: in use, such as standard input held by an `Input!`.
+    Busy,
+    // ENOSPC: no space left on the device.
+    StorageFull,
+    // ENOMEM.
+    OutOfMemory,
+    // ENOSYS or ENOTSUP: the host does not do it.
+    Unsupported,
+    // Any other errno.
+    Other,
 }
 
 impl Error {
@@ -59,6 +102,73 @@ impl Error {
     /// EIO, for a failure the system did not report itself.
     fn io() -> Error {
         Error.{ errno: 5i32 }
+    }
+
+    /// The kind of failure, from the errno: `libc/fs.c` sorts the host's
+    /// numbers into the kinds.
+    fn kind(self) -> ErrorKind {
+        let k = unsafe kur_libc_error_kind(self.errno);
+        if k == 1i32 {
+            ErrorKind::NotFound
+        } else if k == 2i32 {
+            ErrorKind::PermissionDenied
+        } else if k == 3i32 {
+            ErrorKind::AlreadyExists
+        } else if k == 4i32 {
+            ErrorKind::IsADirectory
+        } else if k == 5i32 {
+            ErrorKind::NotADirectory
+        } else if k == 6i32 {
+            ErrorKind::DirectoryNotEmpty
+        } else if k == 7i32 {
+            ErrorKind::InvalidInput
+        } else if k == 8i32 {
+            ErrorKind::BrokenPipe
+        } else if k == 9i32 {
+            ErrorKind::Interrupted
+        } else if k == 10i32 {
+            ErrorKind::WouldBlock
+        } else if k == 11i32 {
+            ErrorKind::TimedOut
+        } else if k == 12i32 {
+            ErrorKind::Busy
+        } else if k == 13i32 {
+            ErrorKind::StorageFull
+        } else if k == 14i32 {
+            ErrorKind::OutOfMemory
+        } else if k == 15i32 {
+            ErrorKind::Unsupported
+        } else {
+            ErrorKind::Other
+        }
+    }
+
+    /// The C library's description of the errno, as `strerror` gives it
+    /// (`No such file or directory`), read thread-safely (`strerror_r`).
+    fn message(self) -> Buffer! {
+        var text = Buffer!::new_with_cap(128usize);
+        let room = &text.remaining_capacity();
+        let dest = unsafe &text.tail_ptr();
+        // `dest[0..room)` is the room `text` has; the call writes at most
+        // `room` bytes there and says how many.
+        let n = unsafe kur_libc_error_message(self.errno, dest, room);
+        unsafe text.commit(n)
+    }
+}
+
+/// An error formats as its description and its errno:
+/// `No such file or directory (error 2)`.
+forall W where Writable[W].
+instance Format[Error, W] {
+    fn format(value: Error, out: W) -> (Error, W) {
+        let text = value.message();
+        let p = unsafe &text.as_ptr();
+        let n = &text.len();
+        // `p` addresses the `n` bytes `text` holds until it is freed below.
+        let out = unsafe Writable[W]::write_raw(out, p, n);
+        text.destroy();
+        let out = write_i64(Writable[W]::write_static(out, " (error "), value.errno as i64);
+        (value, Writable[W]::write_static(out, ")"))
     }
 }
 
@@ -180,26 +290,27 @@ fn eprint_buffer(buf: Buffer!) -> Result[(), Error] {
 
 // ---------------------------------------------------------------- files --
 
-/// Fills `buf[0..size)` from `fd`, retrying short reads (`read(2)` may
-/// return fewer bytes than requested, even for a regular file). Returns the
-/// total filled: `size`, or less when the input ends first (a read returns
-/// 0, e.g. because the file shrank), so `buf[0..n)` holds the bytes read.
-/// A failed read is the error, never a short count, even when some bytes
-/// were filled before it. Caller: `buf[0..size)` is writable, and `fd` is a
-/// descriptor the caller may read (stdin, or one a `File!` it holds owns).
-unsafe fn read_exact(fd: i32, buf: *u8, size: usize) -> Result[usize, Error] {
-    var done = 0usize;
-    while done < size {
-        let n = unsafe kur_libc_fs_read(fd, unsafe offset(buf, done), size - done);
-        if n < 0isize {
-            return Result::Err.(Error::of_return(n));
-        }
-        if n == 0isize {
-            return Result::Ok.(done);
-        }
-        done = done + (n as usize);
+/// Reads at most `max` bytes from `fd`, with one `read(2)`, appending them
+/// to `buf`: how many, which is 0 at the end of the input (and for a `max`
+/// of 0, which reads nothing). Fewer than `max` is no sign of the end: a
+/// pipe gives what it has. The error of a failed read, with `buf` as it
+/// was. Caller: `fd` is a descriptor the caller may read: stdin, or one a
+/// `File!` it holds owns.
+unsafe fn read_into(fd: i32, &buf: Buffer!, max: usize) -> Result[usize, Error] {
+    if max == 0usize {
+        return Result::Ok.(0usize);
     }
-    Result::Ok.(done)
+    buf = buf.reserve(max);
+    let dest = unsafe &buf.tail_ptr();
+    let n = unsafe kur_libc_fs_read(fd, dest, max);
+    if n < 0isize {
+        return Result::Err.(Error::of_return(n));
+    }
+    // A successful read returning `n` wrote exactly `dest[0..n)`, with
+    // `n <= max`, inside the room `reserve` made. `n < 0` has been ruled
+    // out, so the cast cannot turn an error into a length.
+    buf = unsafe buf.commit(n as usize);
+    Result::Ok.(n as usize)
 }
 
 /// Reads `fd` to EOF, appending to `b` and returning it. Each read fills
@@ -207,26 +318,20 @@ unsafe fn read_exact(fd: i32, buf: *u8, size: usize) -> Result[usize, Error] {
 /// at least doubling, so a `b` made with room for all the input and one
 /// byte more reads it without growing. A read error frees what was read and
 /// is returned: it never looks like the end of the input. Caller: `fd` is a
-/// descriptor the caller may read, as for `read_exact`.
+/// descriptor the caller may read, as for `read_into`.
 unsafe fn read_to_end_from(fd: i32, b: Buffer!) -> Result[Buffer!, Error] {
     var b = b;
     while true {
         let room = &b.remaining_capacity();
-        let w = b.writer(if room == 0usize { 4096usize } else { room });
-        let (dest, avail) = unsafe &w.writable_tail();
-        let n = unsafe kur_libc_fs_read(fd, dest, avail);
-        if n == 0isize {
-            return Result::Ok.(w.finish());
+        match unsafe read_into(fd, &b, if room == 0usize { 4096usize } else { room }) {
+            Result::Ok(n) => if n == 0usize {
+                return Result::Ok.(b);
+            },
+            Result::Err(e) => {
+                b.destroy();
+                return Result::Err.(e);
+            },
         }
-        if n < 0isize {
-            w.finish().destroy();
-            return Result::Err.(Error::of_return(n));
-        }
-        // `commit_external` obligation: `dest` and `avail` are
-        // `w.writable_tail()`'s, and a successful read returning `n` wrote
-        // exactly `dest[0..n)`, with `n <= avail`. `n <= 0` has been ruled
-        // out, so the cast cannot turn an error into a length.
-        b = unsafe w.commit_external(n as usize);
     }
     Result::Ok.(b)
 }
@@ -290,25 +395,24 @@ impl Input! {
             }
             // Every byte read ahead is in `line`: read more into the room.
             start = 0usize;
-            let w = buf.clear().writer(1usize);
-            let (dest, avail) = unsafe &w.writable_tail();
-            let got = unsafe kur_libc_fs_read(0i32, dest, avail);
-            if got < 0isize {
-                self = Input!.{ buf: w.finish(), start };
-                line.destroy();
-                return Result::Err.(Error::of_return(got));
+            buf = buf.clear();
+            let room = &buf.remaining_capacity();
+            // Standard input is the process's own, and this `Input!` holds it.
+            match unsafe read_into(0i32, &buf, room) {
+                Result::Err(e) => {
+                    self = Input!.{ buf, start };
+                    line.destroy();
+                    return Result::Err.(e);
+                },
+                Result::Ok(got) => if got == 0usize {
+                    self = Input!.{ buf, start };
+                    if &line.len() > 0usize {
+                        return Result::Ok.(Option::Some.(line));
+                    }
+                    line.destroy();
+                    return Result::Ok.(Option::None);
+                },
             }
-            if got == 0isize {
-                self = Input!.{ buf: w.finish(), start };
-                if &line.len() > 0usize {
-                    return Result::Ok.(Option::Some.(line));
-                }
-                line.destroy();
-                return Result::Ok.(Option::None);
-            }
-            // A successful read returning `got` wrote exactly `dest[0..got)`,
-            // inside the room `writable_tail` gave.
-            buf = unsafe w.commit_external(got as usize);
         }
         self = Input!.{ buf, start };
         Result::Ok.(Option::Some.(line))
@@ -386,27 +490,26 @@ fn read_line_unbuffered() -> Result[Option[Buffer!], Error] {
     var b = Buffer!::new();
     var any = false;
     while true {
-        let w = b.writer(1usize);
-        let (dest, avail) = unsafe &w.writable_tail();
+        b = b.reserve(1usize);
+        let dest = unsafe &b.tail_ptr();
         let n = unsafe kur_libc_fs_read(0i32, dest, 1usize);
         if n < 0isize {
-            w.finish().destroy();
+            b.destroy();
             return Result::Err.(Error::of_return(n));
         }
         if n == 0isize {
-            let line = w.finish();
             if any {
-                return Result::Ok.(Option::Some.(line));
+                return Result::Ok.(Option::Some.(b));
             }
-            line.destroy();
+            b.destroy();
             return Result::Ok.(Option::None);
         }
         if unsafe *dest == b'\n' {
-            return Result::Ok.(Option::Some.(w.finish()));
+            return Result::Ok.(Option::Some.(b));
         }
-        // `read` returned 1, so it wrote `dest[0]`, inside the one-byte
-        // tail `writer(1)` reserved.
-        b = unsafe w.commit_external(1usize);
+        // `read` returned 1, so it wrote `dest[0]`, inside the byte
+        // `reserve` made room for.
+        b = unsafe b.commit(1usize);
         any = true;
     }
     Result::Ok.(Option::Some.(b))
@@ -505,15 +608,45 @@ impl File! {
         }
     }
 
-    /// Fills `buf[0..size)` from the descriptor's offset, as the free
-    /// `read_exact`: how many bytes it filled, fewer only at the end of the
-    /// file, or the error of a failed read. Caller: `buf[0..size)` is
-    /// writable for the duration of the call.
-    unsafe fn read_exact(&self, buf: *u8, size: usize) -> Result[usize, Error] {
+    /// Reads at most `max` bytes from the descriptor's offset, with one
+    /// `read(2)`, appending them to `buf`: how many, which is 0 at the end of
+    /// the file. Fewer than `max` is no sign of the end (a pipe gives what it
+    /// has); read in chunks until it returns 0. A failed read is the error,
+    /// with `buf` as it was.
+    fn read(&self, &buf: Buffer!, max: usize) -> Result[usize, Error] {
         let { fd } = self;
-        let got = unsafe read_exact(fd, buf, size);
+        // `fd` is the descriptor this `File!` owns.
+        let got = unsafe read_into(fd, &buf, max);
         self = File!.{ fd };
         got
+    }
+
+    /// Reads `size` bytes from the descriptor's offset, appending them to
+    /// `buf`, again after each short read: how many, which is fewer only at
+    /// the end of the file. A failed read is the error, even when some bytes
+    /// were appended before it; they stay in `buf`.
+    fn read_exact(&self, &buf: Buffer!, size: usize) -> Result[usize, Error] {
+        var done = 0usize;
+        while done < size {
+            match &self.read(&buf, size - done) {
+                Result::Ok(n) => if n == 0usize {
+                    return Result::Ok.(done);
+                } else {
+                    done = done + n;
+                },
+                Result::Err(e) => return Result::Err.(e),
+            }
+        }
+        Result::Ok.(done)
+    }
+
+    /// The descriptor's number, for a C interface or another process (a
+    /// `std::process::Stdio!::File` hands a child a copy). No safe function
+    /// takes a number to read, write or close, so it grants nothing.
+    fn descriptor(&self) -> i32 {
+        let { fd } = self;
+        self = File!.{ fd };
+        fd
     }
 
     /// Writes all of `bytes`, read under `tag`, which comes back with the result.

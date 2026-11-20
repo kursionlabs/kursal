@@ -8,13 +8,18 @@ export core::process::trap;
 use alloc::buffer::Buffer!;
 use alloc::heap::exit as c_exit;
 use core::cstr::CStr;
+use core::mem::alloca;
+use core::ptr::null;
 use core::option::{Option, Result};
 use core::raw::raw_get;
 use core::slice::{ReadBytes, Slice};
-use std::io::{Error, c_string};
+use std::io::{Error, File!, c_string};
 
-extern "C" fn kur_libc_process_spawn(line: *u8, len: usize, count: usize) -> i64;
+extern "C" fn kur_libc_process_spawn(line: *u8, len: usize, count: usize, env: *u8, env_len: usize, env_ops: usize, env_clear: u8, dir: *u8, dir_len: usize, streams: *i32) -> i64;
 extern "C" fn kur_libc_process_wait(pid: i64, block: u8) -> i64;
+extern "C" fn kur_libc_process_kill(pid: i64) -> i32;
+extern "C" fn kur_libc_process_signal(pid: i64, signal: i32) -> i32;
+extern "C" fn kur_libc_process_poll(a: i32, b: i32) -> i32;
 extern "C" fn kur_libc_process_cpus() -> usize;
 
 /// The arguments the process was started with, the program's name first, as
@@ -63,12 +68,80 @@ exposed enum Exit {
     Signal(i32),
 }
 
-/// A program to run and its arguments, each any byte view, copied in as it
-/// is added: a command line that outlives what it was built from.
+impl Exit {
+    /// Whether the child exited with status 0.
+    fn success(self) -> bool {
+        match self {
+            Exit::Code(c) => c == 0i32,
+            Exit::Signal(s) => false,
+        }
+    }
+}
+
+/// Where a child's standard input, output or error comes from or goes:
+/// this process's own stream (`Inherit`, what a `Command!` starts with),
+/// `/dev/null` (`Null`), a new pipe whose other end the `Child!` holds
+/// (`Pipe`), or a file this process opened (`File`), which `spawn` closes
+/// once the child has its own copy.
+exposed enum Stdio! {
+    Inherit,
+    Null,
+    Pipe,
+    File(File!),
+}
+
+impl Stdio! {
+    // What `kur_libc_process_spawn` reads for the stream: the descriptor to
+    // copy, or a negative code for the other ways (fs.c's KUR_STREAM_*).
+    fn code(&self) -> i32 {
+        let (stdio, code) = match self {
+            Stdio!::Inherit => (Stdio!::Inherit, 0i32 - 1i32),
+            Stdio!::Null => (Stdio!::Null, 0i32 - 2i32),
+            Stdio!::Pipe => (Stdio!::Pipe, 0i32 - 3i32),
+            Stdio!::File(f) => {
+                var f = f;
+                let fd = &f.descriptor();
+                (Stdio!::File.(f), fd)
+            },
+        };
+        self = stdio;
+        code
+    }
+
+    // Closes the file of a `File`, which the child has a copy of by now;
+    // nothing for the others.
+    fn close(self) {
+        match self {
+            Stdio!::File(f) => {
+                let closed = f.close();
+            },
+            Stdio!::Inherit => (),
+            Stdio!::Null => (),
+            Stdio!::Pipe => (),
+        }
+    }
+}
+
+/// A program to run, its arguments, and how it runs: its standard streams
+/// (`stdin`, `stdout`, `stderr`), its environment (`env`, `env_remove`,
+/// `env_clear`) and its working directory (`current_dir`). Each argument,
+/// name and path is any byte view, copied in as it is added: a command
+/// that outlives what it was built from. It starts with this process's
+/// streams, environment and working directory.
 struct Command! {
     // each argument followed by a NUL, the program first
     line: Buffer!,
     count: usize,
+    // the environment's changes, in order: `s` NAME NUL VALUE NUL sets a
+    // variable, `r` NAME NUL removes one
+    env: Buffer!,
+    env_ops: usize,
+    env_clear: bool,
+    // the working directory and its NUL, or nothing to keep this process's
+    dir: Option[Buffer!],
+    stdin: Stdio!,
+    stdout: Stdio!,
+    stderr: Stdio!,
 }
 
 impl Command! {
@@ -76,18 +149,85 @@ impl Command! {
     /// finds it, with no arguments yet.
     forall C, S where ReadBytes[C, S], Copy[S].
     fn new(&cx: C, program: S) -> Command! {
-        Command!.{ line: c_string(&cx, program), count: 1usize }
+        Command!.{
+            line: c_string(&cx, program), count: 1usize, env: Buffer!::new(), env_ops: 0usize, env_clear: false,
+            dir: Option::None, stdin: Stdio!::Inherit, stdout: Stdio!::Inherit, stderr: Stdio!::Inherit,
+        }
     }
 
     /// The command with `argument` added after its other arguments.
     forall C, S where ReadBytes[C, S], Copy[S].
     fn arg(self, &cx: C, argument: S) -> Command! {
-        let { line, count } = self;
-        Command!.{ line: line.push_bytes(&cx, argument).push_byte(0u8), count: count + 1usize }
+        let { line, count, ..rest } = self;
+        Command!.{ line: line.push_bytes(&cx, argument).push_byte(0u8), count: count + 1usize, ..rest }
     }
 
-    /// Runs the program with this process's environment and waits for it:
-    /// `spawn`, then `Child!::wait`, with their errors.
+    /// The command with the environment variable `name` set to `value` for
+    /// the child, after the changes made before. A name that is empty or
+    /// holds an `=`, or a name or value holding a NUL, makes `spawn` fail
+    /// with EINVAL.
+    forall C, S where ReadBytes[C, S], Copy[S].
+    fn env(self, &cx: C, name: S, value: S) -> Command! {
+        let { env, env_ops, ..rest } = self;
+        let env = env.push_byte(b's').push_bytes(&cx, name).push_byte(0u8).push_bytes(&cx, value).push_byte(0u8);
+        Command!.{ env, env_ops: env_ops + 1usize, ..rest }
+    }
+
+    /// The command with the environment variable `name` unset for the
+    /// child, after the changes made before.
+    forall C, S where ReadBytes[C, S], Copy[S].
+    fn env_remove(self, &cx: C, name: S) -> Command! {
+        let { env, env_ops, ..rest } = self;
+        Command!.{ env: env.push_byte(b'r').push_bytes(&cx, name).push_byte(0u8), env_ops: env_ops + 1usize, ..rest }
+    }
+
+    /// The command with an empty environment for the child, and none of the
+    /// changes made before: only the variables `env` sets after this.
+    fn env_clear(self) -> Command! {
+        let { env, env_ops, env_clear, ..rest } = self;
+        Command!.{ env: env.clear(), env_ops: 0usize, env_clear: true, ..rest }
+    }
+
+    /// The command with `path` as the child's working directory. A program
+    /// named by a relative path with a `/` in it is then found from there.
+    /// Where the C library cannot change a child's directory (fs.c built
+    /// with `KUR_LIBC_NO_ADDCHDIR`), `spawn` fails with ENOSYS.
+    forall C, S where ReadBytes[C, S], Copy[S].
+    fn current_dir(self, &cx: C, path: S) -> Command! {
+        let { dir, ..rest } = self;
+        match dir {
+            Option::Some(old) => old.destroy(),
+            Option::None => (),
+        }
+        Command!.{ dir: Option::Some.(c_string(&cx, path)), ..rest }
+    }
+
+    /// The command with `stdio` as the child's standard input. A `Pipe`'s
+    /// other end is `Child!::take_stdin`'s, for this process to write.
+    fn stdin(self, stdio: Stdio!) -> Command! {
+        let { stdin, ..rest } = self;
+        stdin.close();
+        Command!.{ stdin: stdio, ..rest }
+    }
+
+    /// The command with `stdio` as the child's standard output. A `Pipe`'s
+    /// other end is `Child!::take_stdout`'s, for this process to read.
+    fn stdout(self, stdio: Stdio!) -> Command! {
+        let { stdout, ..rest } = self;
+        stdout.close();
+        Command!.{ stdout: stdio, ..rest }
+    }
+
+    /// The command with `stdio` as the child's standard error. A `Pipe`'s
+    /// other end is `Child!::take_stderr`'s, for this process to read.
+    fn stderr(self, stdio: Stdio!) -> Command! {
+        let { stderr, ..rest } = self;
+        stderr.close();
+        Command!.{ stderr: stdio, ..rest }
+    }
+
+    /// Runs the program and waits for it: `spawn`, then `Child!::wait`,
+    /// with their errors.
     fn run(self) -> Result[Exit, Error] {
         match self.spawn() {
             Result::Ok(child) => child.wait(),
@@ -95,38 +235,103 @@ impl Command! {
         }
     }
 
-    /// Starts the program with this process's environment and hands back
-    /// the running child, which must be waited for. The error is what
-    /// `posix_spawnp` reports, among them the errno of the `exec` that
-    /// failed (ENOENT for a program not found); EINVAL when the program or an
-    /// argument holds a NUL.
-    fn spawn(self) -> Result[Child!, Error] {
-        let { line, count } = self;
-        var line = line;
-        let p = unsafe &line.as_ptr();
-        let n = &line.len();
-        // `p` holds `count` NUL-terminated arguments in `n` bytes.
-        let pid = unsafe kur_libc_process_spawn(p, n, count);
-        line.destroy();
-        if pid < 0i64 {
-            Result::Err.(Error.{ errno: (0i64 - pid) as i32 })
-        } else {
-            Result::Ok.(Child!.{ pid })
+    /// Runs the program to its end, capturing what it writes to its
+    /// standard output and error: how it ended, and the two outputs.
+    /// `Child!::wait_with_output` of the child `spawn` starts with both
+    /// streams piped; its standard input is as set (this process's own,
+    /// unless `stdin` says otherwise).
+    fn output(self) -> Result[Captured!, Error] {
+        match self.stdout(Stdio!::Pipe).stderr(Stdio!::Pipe).spawn() {
+            Result::Ok(child) => child.wait_with_output(),
+            Result::Err(e) => Result::Err.(e),
         }
     }
 
-    /// Frees a command that is not run.
-    fn destroy(self) {
-        let { line, count } = self;
+    /// Starts the program and hands back the running child, which must be
+    /// waited for. The error is what `posix_spawnp` reports, among them the
+    /// errno of the `exec` that failed (ENOENT for a program not found);
+    /// EINVAL when the program, an argument or an environment change holds
+    /// a NUL or a name is not one; and the errno of a pipe or of opening
+    /// `/dev/null`. The files given as streams are closed either way.
+    fn spawn(self) -> Result[Child!, Error] {
+        let { line, count, env, env_ops, env_clear, dir, stdin, stdout, stderr } = self;
+        var line = line;
+        var env = env;
+        var stdin = stdin;
+        var stdout = stdout;
+        var stderr = stderr;
+        let streams = unsafe alloca[(i32, i32, i32)]();
+        unsafe *streams = (&stdin.code(), &stdout.code(), &stderr.code());
+        let p = unsafe &line.as_ptr();
+        let n = &line.len();
+        let e = unsafe &env.as_ptr();
+        let en = &env.len();
+        let (dir, d, dn) = match dir {
+            Option::Some(path) => {
+                var path = path;
+                let d = unsafe &path.as_ptr();
+                let dn = &path.len() - 1usize;
+                (Option::Some.(path), d, dn)
+            },
+            Option::None => (Option::None, null[u8](), 0usize),
+        };
+        // `p` holds `count` NUL-terminated arguments in `n` bytes, `e` the
+        // `env_ops` changes in `en`, and `d`, when not null, a path of `dn`
+        // bytes and its NUL; `streams` is three `i32`s fs.c reads and
+        // writes. The descriptors in it are the `File!`s `stdin`, `stdout`
+        // and `stderr` hold, open until they are closed below.
+        let pid = unsafe kur_libc_process_spawn(p, n, count, e, en, env_ops, if env_clear { 1u8 } else { 0u8 }, d, dn, unsafe (streams as *i32));
+        let (child_in, child_out, child_err) = unsafe *streams;
         line.destroy();
+        env.destroy();
+        match dir {
+            Option::Some(path) => path.destroy(),
+            Option::None => (),
+        }
+        stdin.close();
+        stdout.close();
+        stderr.close();
+        if pid < 0i64 {
+            Result::Err.(Error.{ errno: (0i64 - pid) as i32 })
+        } else {
+            // fs.c hands back the parent's end of each pipe it made, a
+            // descriptor of its own, and -1 for the other streams.
+            Result::Ok.(Child!.{ pid, stdin: unsafe pipe_end(child_in), stdout: unsafe pipe_end(child_out), stderr: unsafe pipe_end(child_err) })
+        }
+    }
+
+    /// Frees a command that is not run, closing the files given as its
+    /// streams.
+    fn destroy(self) {
+        let { line, count, env, env_ops, env_clear, dir, stdin, stdout, stderr } = self;
+        line.destroy();
+        env.destroy();
+        match dir {
+            Option::Some(path) => path.destroy(),
+            Option::None => (),
+        }
+        stdin.close();
+        stdout.close();
+        stderr.close();
     }
 }
 
-/// A program `Command!::spawn` started, running until it is waited for.
-/// Waiting reaps it, so a child is waited for once; one left unwaited would
-/// stay a zombie until this process ends.
+/// This process's end of a pipe `spawn` made, as a `File!`, or nothing
+/// for -1. Caller: `fd` is -1 or a descriptor nothing else owns.
+unsafe fn pipe_end(fd: i32) -> Option[File!] {
+    if fd < 0i32 { Option::None } else { Option::Some.(unsafe File!::adopt(fd)) }
+}
+
+/// A program `Command!::spawn` started, running until it is waited for,
+/// with this process's end of each of its streams that is a pipe. Waiting
+/// reaps it, so a child is waited for once; one left unwaited would stay a
+/// zombie until this process ends. Until then its process id is its own, so
+/// `kill` and `signal` reach this child and no other.
 struct Child! {
     pid: i64,
+    stdin: Option[File!],
+    stdout: Option[File!],
+    stderr: Option[File!],
 }
 
 /// What `Child!::try_wait` found: the child still running, or how it ended.
@@ -135,27 +340,217 @@ exposed enum Polled! {
     Ended(Exit),
 }
 
+/// What `Command!::output` and `Child!::wait_with_output` capture: how the
+/// child ended, and what it wrote to its standard output and error.
+exposed struct Captured! {
+    exit: Exit,
+    stdout: Buffer!,
+    stderr: Buffer!,
+}
+
 impl Child! {
+    /// The child's process id.
+    fn id(&self) -> i64 {
+        let { pid, stdin, stdout, stderr } = self;
+        self = Child!.{ pid, stdin, stdout, stderr };
+        pid
+    }
+
+    /// The write end of the child's standard input, when it is a pipe and
+    /// was not taken before. Closing it is the end of the child's input.
+    fn take_stdin(&self) -> Option[File!] {
+        let { pid, stdin, stdout, stderr } = self;
+        self = Child!.{ pid, stdin: Option::None, stdout, stderr };
+        stdin
+    }
+
+    /// The read end of the child's standard output, when it is a pipe and
+    /// was not taken before.
+    fn take_stdout(&self) -> Option[File!] {
+        let { pid, stdin, stdout, stderr } = self;
+        self = Child!.{ pid, stdin, stdout: Option::None, stderr };
+        stdout
+    }
+
+    /// The read end of the child's standard error, when it is a pipe and
+    /// was not taken before.
+    fn take_stderr(&self) -> Option[File!] {
+        let { pid, stdin, stdout, stderr } = self;
+        self = Child!.{ pid, stdin, stdout, stderr: Option::None };
+        stderr
+    }
+
+    /// Ends the child: sends it SIGKILL, which it cannot catch. It still
+    /// has to be waited for (`wait`), which reports `Exit::Signal` with
+    /// SIGKILL's number unless it ended first. The error is what `kill(2)`
+    /// reports.
+    fn kill(&self) -> Result[(), Error] {
+        let pid = &self.id();
+        status_of(unsafe kur_libc_process_kill(pid))
+    }
+
+    /// Sends the child the signal numbered `signal` (`kill(2)`), such as 15,
+    /// SIGTERM, which asks it to end. The error is what `kill(2)` reports:
+    /// EINVAL for a number that is no signal.
+    fn signal(&self, signal: i32) -> Result[(), Error] {
+        let pid = &self.id();
+        status_of(unsafe kur_libc_process_signal(pid, signal))
+    }
+
     /// Waits for the child to end, again when a signal interrupts the wait.
+    /// The ends of its pipes this child still holds are closed first, its
+    /// standard input's among them, so a child reading it sees its end.
     /// The error is what `waitpid` reports.
     fn wait(self) -> Result[Exit, Error] {
-        let { pid } = self;
+        let { pid, stdin, stdout, stderr } = self;
+        close_end(stdin);
+        close_end(stdout);
+        close_end(stderr);
         exit_of(unsafe kur_libc_process_wait(pid, 1u8))
     }
 
     /// Whether the child has ended, without waiting: the child back while
-    /// it runs, else how it ended. The error is what `waitpid` reports.
+    /// it runs, else how it ended, with the ends of its pipes it held
+    /// closed. The error is what `waitpid` reports.
     fn try_wait(self) -> Result[Polled!, Error] {
-        let { pid } = self;
+        let { pid, stdin, stdout, stderr } = self;
         let result = unsafe kur_libc_process_wait(pid, 0u8);
         if result == 512i64 {
-            return Result::Ok.(Polled!::Running.(Child!.{ pid }));
+            return Result::Ok.(Polled!::Running.(Child!.{ pid, stdin, stdout, stderr }));
         }
+        close_end(stdin);
+        close_end(stdout);
+        close_end(stderr);
         match exit_of(result) {
             Result::Ok(exit) => Result::Ok.(Polled!::Ended.(exit)),
             Result::Err(e) => Result::Err.(e),
         }
     }
+
+    /// Reads the child's standard output and error to their ends, then
+    /// waits for it: how it ended and what it wrote. Both are read as they
+    /// come (`poll`), so a child that fills one pipe while this process
+    /// waits on the other does not stall it. A stream that is not a pipe,
+    /// or whose end was taken, gives an empty buffer. Standard input's end,
+    /// when this child holds it, is closed first. A read error is returned
+    /// after the child has been waited for.
+    fn wait_with_output(self) -> Result[Captured!, Error] {
+        let { pid, stdin, stdout, stderr } = self;
+        close_end(stdin);
+        var out = Buffer!::new();
+        var err = Buffer!::new();
+        let read = read_both(stdout, stderr, &out, &err);
+        let exit = exit_of(unsafe kur_libc_process_wait(pid, 1u8));
+        match read {
+            Result::Err(e) => {
+                out.destroy();
+                err.destroy();
+                Result::Err.(e)
+            },
+            Result::Ok(nothing) => match exit {
+                Result::Ok(exit) => Result::Ok.(Captured!.{ exit, stdout: out, stderr: err }),
+                Result::Err(e) => {
+                    out.destroy();
+                    err.destroy();
+                    Result::Err.(e)
+                },
+            },
+        }
+    }
+}
+
+/// Reads `a` into `into_a` and `b` into `into_b` until both end, a read
+/// from whichever can be read without waiting at a time; both are closed.
+/// The first read error is returned once both are closed.
+fn read_both(a: Option[File!], b: Option[File!], &into_a: Buffer!, &into_b: Buffer!) -> Result[(), Error] {
+    var a = a;
+    var b = b;
+    var failed: Option[Error] = Option::None;
+    var reading = true;
+    while reading {
+        let fa = descriptor_of(&a);
+        let fb = descriptor_of(&b);
+        let ready = if fa < 0i32 && fb < 0i32 {
+            reading = false;
+            0i32
+        } else {
+            unsafe kur_libc_process_poll(fa, fb)
+        };
+        if ready < 0i32 {
+            failed = Option::Some.(Error.{ errno: 0i32 - ready });
+            close_end(a);
+            close_end(b);
+            a = Option::None;
+            b = Option::None;
+        } else {
+            if ready % 2i32 == 1i32 {
+                a = read_some(a, &into_a, &failed);
+            }
+            if ready / 2i32 % 2i32 == 1i32 {
+                b = read_some(b, &into_b, &failed);
+            }
+        }
+    }
+    // Both are `None` by now.
+    close_end(a);
+    close_end(b);
+    match failed {
+        Option::Some(e) => Result::Err.(e),
+        Option::None => Result::Ok.(()),
+    }
+}
+
+/// One read from `end` into `into`: `end` back while it has more, else
+/// closed, at its end or at an error, which goes to `failed` unless one is
+/// there already.
+fn read_some(end: Option[File!], &into: Buffer!, &failed: Option[Error]) -> Option[File!] {
+    match end {
+        Option::None => Option::None,
+        Option::Some(f) => {
+            var f = f;
+            match &f.read(&into, 65536usize) {
+                Result::Ok(n) => if n > 0usize {
+                    return Option::Some.(f);
+                },
+                Result::Err(e) => if failed.is_none() {
+                    failed = Option::Some.(e);
+                },
+            }
+            let closed = f.close();
+            Option::None
+        },
+    }
+}
+
+/// The descriptor of `end`, or -1 for none, which `poll` passes over.
+fn descriptor_of(&end: Option[File!]) -> i32 {
+    match end {
+        Option::Some(f) => {
+            var f = f;
+            let fd = &f.descriptor();
+            end = Option::Some.(f);
+            fd
+        },
+        Option::None => {
+            end = Option::None;
+            0i32 - 1i32
+        },
+    }
+}
+
+/// Closes a pipe's end, when there is one.
+fn close_end(end: Option[File!]) {
+    match end {
+        Option::Some(f) => {
+            let closed = f.close();
+        },
+        Option::None => (),
+    }
+}
+
+// The error of a call that returns 0 or an errno.
+fn status_of(code: i32) -> Result[(), Error] {
+    if code == 0i32 { Result::Ok.(()) } else { Result::Err.(Error.{ errno: code }) }
 }
 
 // How a child ended, from what `kur_libc_process_wait` returns for one that has.

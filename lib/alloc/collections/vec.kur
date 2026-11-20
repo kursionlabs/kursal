@@ -42,9 +42,6 @@
 // `len` or `cap`, which the element operations index through; it could
 // not supply an `Allocation!`, whose only producers are `Allocation!::adopt`
 // and `adopt_value`.
-//
-// `Popped!` is the result of `pop`. It is `exposed` so that code outside
-// this module can `match` on it.
 
 use package as alloc;
 
@@ -61,6 +58,7 @@ use core::mem::Region!;
 use core::mem::RegionResume!;
 use core::slice::Slice;
 use core::cmp::{Ord, Order};
+use core::hash::Eq;
 use core::iter::Iterator;
 use core::process::trap;
 use alloc::collections::arena_vec::merge_runs;
@@ -81,13 +79,6 @@ struct Vec! {
     cap: usize,
 }
 
-/// What `Vec!::pop` hands back: the last element, or nothing when the vec
-/// was empty.
-forall T.
-exposed enum Popped! {
-    Item(T),
-    Empty,
-}
 
 forall T.
 impl Vec![T] {
@@ -209,9 +200,9 @@ impl Vec![T, 'k] {
         view
     }
 
-    /// Removes and returns the last element, or `Popped!::Empty` if the vec
-    /// is empty. Rebrands like `push`, but never resizes the allocation.
-    fn pop(self, tag: Exclusive!['k]) -> exists '2. (Exclusive!['2], Vec![T, '2], Popped![T]) {
+    /// Removes and returns the last element, or `None` if the vec is empty.
+    /// Rebrands like `push`, but never resizes the allocation.
+    fn pop(self, tag: Exclusive!['k]) -> exists '2. (Exclusive!['2], Vec![T, '2], Option[T]) {
         let { alloc: a, back: bk, buf: r, len: n, cap: c } = self;
         let rg = bk.resume(tag);
         // `release_storage`'s obligation: see "Releasing the block" in the
@@ -223,17 +214,87 @@ impl Vec![T, 'k] {
         let (p, m) = r2.into_parts();
         let zero = 0usize;
         let is_empty = n == zero;
-        let result: (usize, Popped![T]) = if is_empty {
-            (n, Popped!::Empty)
+        let result: (usize, Option[T]) = if is_empty {
+            (n, Option::None)
         } else {
             let one = 1usize;
             let n2 = n - one;
             let ep = unsafe offset(p, n2);
             let v = unsafe *ep;
-            (n2, Popped!::Item.(v))
+            (n2, Option::Some.(v))
         };
         let (new_len, popped) = result;
         pack 'open1. (tag, Vec!.{ alloc: a2, back: bk2, buf: r2, len: new_len, cap: c }, popped)
+    }
+
+    /// Puts `val` at index `i`, moving the elements from `i` on one place
+    /// up: `push` when `i` is the length. Stops the program
+    /// (`core::process::trap`) when `i` is past the length. Rebrands as
+    /// `push` does.
+    fn insert(self, tag: Exclusive!['k], i: usize, val: T) -> exists '2. (Exclusive!['2], Vec![T, '2]) {
+        if i > &self.len(&tag) {
+            trap();
+        }
+        let exists '2. (tag, v) = self.push(tag, val);
+        let { alloc: a, back: bk, buf: r, len: n, cap: c } = v;
+        let (p, m) = r.into_parts();
+        // Indices below `n` are this vector's initialized elements.
+        var j = n - 1usize;
+        while j > i {
+            unsafe swap_at[T](p, j - 1usize, j);
+            j = j - 1usize;
+        }
+        pack '2. (tag, Vec!.{ alloc: a, back: bk, buf: r, len: n, cap: c })
+    }
+
+    /// Takes the element at index `i` out, moving the ones after it one
+    /// place down, or `None` when `i` is out of range. Rebrands as `pop`
+    /// does.
+    fn remove(self, tag: Exclusive!['k], i: usize) -> exists '2. (Exclusive!['2], Vec![T, '2], Option[T]) {
+        let { alloc: a, back: bk, buf: r, len: n, cap: c } = self;
+        let (p, m) = r.into_parts();
+        // Indices below `n` are this vector's initialized elements.
+        var j = i;
+        while j + 1usize < n {
+            unsafe swap_at[T](p, j, j + 1usize);
+            j = j + 1usize;
+        }
+        let v = Vec!.{ alloc: a, back: bk, buf: r, len: n, cap: c };
+        if i < n {
+            v.pop(tag)
+        } else {
+            pack 'k. (tag, v, Option::None)
+        }
+    }
+
+    /// Exchanges the elements at `i` and `j`; stops the program
+    /// (`core::process::trap`) when either is out of range. Moves only, so
+    /// any `T`, and no rebranding: a `Ref` to an index names what is there
+    /// now.
+    fn swap(&self, &tag: Exclusive!['k], i: usize, j: usize) {
+        let { alloc: a, back: bk, buf: r, len: n, cap: c } = self;
+        let (p, m) = r.into_parts();
+        if i >= n || j >= n {
+            trap();
+        }
+        // Both indices are below `n`, inside this vector's elements.
+        unsafe swap_at[T](p, i, j);
+        self = Vec!.{ alloc: a, back: bk, buf: r, len: n, cap: c };
+    }
+
+    /// Reverses the order of the elements, by moves, as `swap` does.
+    fn reverse(&self, &tag: Exclusive!['k]) {
+        let { alloc: a, back: bk, buf: r, len: n, cap: c } = self;
+        let (p, m) = r.into_parts();
+        var i = 0usize;
+        var j = n;
+        // `i < j - 1` keeps both indices below `n`, inside the elements.
+        while i + 1usize < j {
+            j = j - 1usize;
+            unsafe swap_at[T](p, i, j);
+            i = i + 1usize;
+        }
+        self = Vec!.{ alloc: a, back: bk, buf: r, len: n, cap: c };
     }
 
     /// Consumes the vec: calls `f` once per element (so a linear `T` can be
@@ -411,6 +472,26 @@ fn forget_copy(value: T) -> () {
 
 forall T, 'k where Copy[T].
 impl Vec![T, 'k] {
+    /// A copy of element `i`, or `None` when it is out of range.
+    fn get(&self, &tag: Exclusive!['k], i: usize) -> Option[T] {
+        match &self.get_ref(&tag, i) {
+            Option::Some(r) => Option::Some.(r.copy(&tag)),
+            Option::None => Option::None,
+        }
+    }
+
+    /// A copy of element `i`; stops the program (`core::process::trap`)
+    /// when it is out of range. `get` is the form for an index that may miss.
+    fn at(&self, &tag: Exclusive!['k], i: usize) -> T {
+        match &self.get(&tag, i) {
+            Option::Some(v) => v,
+            Option::None => trap(),
+        }
+    }
+}
+
+forall T, 'k where Copy[T].
+impl Vec![T, 'k] {
     /// Frees a vector of `Copy` elements, which need no per-element callback.
     fn free(self, tag: Exclusive!['k]) -> () {
         self.destroy(tag, forget_copy[T])
@@ -465,12 +546,46 @@ impl OwnedVec![T] {
         OwnedVec!.{ inner: pack '2. (tag, v) }
     }
 
-    /// Removes the last element and hands it back, or `Popped!::Empty`.
-    fn pop(&self) -> Popped![T] {
+    /// Removes the last element and hands it back, or `None` when there is
+    /// none.
+    fn pop(&self) -> Option[T] {
         let exists 'k. (tag, v) = self.inner;
         let exists '2. (tag, v, popped) = v.pop(tag);
         self = OwnedVec!.{ inner: pack '2. (tag, v) };
         popped
+    }
+
+    /// Puts `val` at index `i`, moving the elements from `i` on one place
+    /// up; stops the program when `i` is past the length
+    /// (`Vec!::insert`).
+    fn insert(&self, i: usize, val: T) {
+        let exists 'k. (tag, v) = self.inner;
+        let exists '2. (tag, v) = v.insert(tag, i, val);
+        self = OwnedVec!.{ inner: pack '2. (tag, v) };
+    }
+
+    /// Takes the element at index `i` out, moving the ones after it one
+    /// place down, or `None` when `i` is out of range (`Vec!::remove`).
+    fn remove(&self, i: usize) -> Option[T] {
+        let exists 'k. (tag, v) = self.inner;
+        let exists '2. (tag, v, removed) = v.remove(tag, i);
+        self = OwnedVec!.{ inner: pack '2. (tag, v) };
+        removed
+    }
+
+    /// Exchanges the elements at `i` and `j`; stops the program when either
+    /// is out of range (`Vec!::swap`).
+    fn swap(&self, i: usize, j: usize) {
+        let exists 'k. (tag, v) = self.inner;
+        &v.swap(&tag, i, j);
+        self = OwnedVec!.{ inner: pack 'k. (tag, v) };
+    }
+
+    /// Reverses the order of the elements (`Vec!::reverse`).
+    fn reverse(&self) {
+        let exists 'k. (tag, v) = self.inner;
+        &v.reverse(&tag);
+        self = OwnedVec!.{ inner: pack 'k. (tag, v) };
     }
 
     /// Calls `f` on element `i` in place: `f` takes the element and hands it
@@ -589,6 +704,11 @@ impl OwnedVec![T] {
         }
     }
 
+    /// A copy of the first element, or `None` when there is none.
+    fn first(&self) -> Option[T] {
+        &self.get(0usize)
+    }
+
     /// A copy of the last element, or `None` when there is none.
     fn last(&self) -> Option[T] {
         let n = &self.len();
@@ -615,8 +735,8 @@ impl OwnedVec![T] {
     fn truncate(&self, len: usize) {
         while &self.len() > len {
             let unit = match &self.pop() {
-                Popped!::Item(v) => (),
-                Popped!::Empty => (),
+                Option::Some(v) => (),
+                Option::None => (),
             };
         }
     }
@@ -630,6 +750,21 @@ impl OwnedVec![T] {
     fn free(self) -> () {
         let exists 'k. (tag, v) = self.inner;
         v.free(tag)
+    }
+}
+
+forall T where Copy[T], Eq[T, T].
+impl OwnedVec![T] {
+    /// Whether some element equals `value` (`Eq`).
+    fn contains(&self, value: T) -> bool {
+        var i = 0usize;
+        var found = false;
+        while !found && i < &self.len() {
+            let (a, b, same) = Eq[T, T]::eq(&self.at(i), value);
+            found = same;
+            i = i + 1usize;
+        }
+        found
     }
 }
 

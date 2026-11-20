@@ -2005,7 +2005,7 @@ class CompilerTests(unittest.TestCase):
             "fn main() -> i32 { let o = Owned!::new(()); o.into_value(); 0 }\n",
             "forall T. fn boxed(x: T) -> T { Owned!::new(x).into_value() }\nfn main() -> i32 { boxed(()); 0 }\n",
         )
-        imports = "use std::alloc::owned::Owned!;\nuse std::collections::{hashmap::OwnedMap!, vec::OwnedVec!};\n"
+        imports = "use std::owned::Owned!;\nuse std::collections::{hashmap::OwnedMap!, vec::OwnedVec!};\n"
         with tempfile.TemporaryDirectory() as directory:
             paths = []
             for index, source in enumerate(sources):
@@ -2356,7 +2356,7 @@ class CompilerTests(unittest.TestCase):
             self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
             src = site / "src"
             pages = sorted(src.rglob("*.md"))
-            self.assertGreater(len(pages), 300)
+            self.assertGreater(len(pages), 250)
             for package in ("std", "core", "alloc", "std/cmp", "std/collections", "core/cmp"):
                 self.assertTrue((src / package / "index.md").is_file(), package)
             self.assertEqual(markdown_link_errors(src), [])
@@ -2385,7 +2385,7 @@ class CompilerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             write_files(base, DOC_PACKAGES)
-            for name, path, least in (("std", LIB / "std", 300), ("gizmo", base / "gizmo", 10)):
+            for name, path, least in (("std", LIB / "std", 250), ("gizmo", base / "gizmo", 10)):
                 with self.subTest(site=name):
                     site = base / f"site-{name}"
                     result = self.run_compiler("doc", str(path), "-o", str(site))
@@ -2405,8 +2405,8 @@ class CompilerTests(unittest.TestCase):
         node = shutil.which("node")
         if node is None:
             self.skipTest("node is not on the PATH; install Node.js to check the search ranking")
-        records = [("module", "std::alloc::buffer"), ("struct", "std::alloc::buffer::Buffer!"),
-                   ("struct", "std::alloc::buffer::BufferWriter!"), ("method", "std::alloc::buffer::Buffer!::new"),
+        records = [("module", "std::buffer"), ("struct", "std::buffer::Buffer!"),
+                   ("struct", "std::buffer::BufferRestore!"), ("method", "std::buffer::Buffer!::new"),
                    ("fn", "std::io::write_buffer"), ("fn", "std::io::read_line"), ("fn", "std::io::read_exact"),
                    ("method", "std::io::File!::read_exact"), ("module", "std::io"), ("module", "std::fs"),
                    ("fn", "std::fs::read"), ("trait", "std::cmp::Ord"), ("instance", "std::cmp::Ord[u8, u8]"),
@@ -2422,12 +2422,12 @@ class CompilerTests(unittest.TestCase):
                                  json.dumps(queries)], capture_output=True, text=True, timeout=TIME_LIMIT)
         self.assertEqual(result.returncode, 0, result.stderr)
         ranked = dict(zip(queries, json.loads(result.stdout)))
-        buffer = ["std::alloc::buffer::Buffer!", "std::alloc::buffer", "std::alloc::buffer::BufferWriter!",
-                  "std::alloc::buffer::Buffer!::new", "std::io::write_buffer"]
+        buffer = ["std::buffer::Buffer!", "std::buffer", "std::buffer::BufferRestore!",
+                  "std::buffer::Buffer!::new", "std::io::write_buffer"]
         self.assertEqual(ranked["Buffer"], buffer)
         self.assertEqual(ranked["Buffer!"], buffer)
-        self.assertEqual(ranked["buffer"][:3], ["std::alloc::buffer", "std::alloc::buffer::Buffer!",
-                                                "std::alloc::buffer::BufferWriter!"])
+        self.assertEqual(ranked["buffer"][:3], ["std::buffer", "std::buffer::Buffer!",
+                                                "std::buffer::BufferRestore!"])
         self.assertEqual(ranked["read_line"], ["std::io::read_line"])
         self.assertEqual(ranked["Ord"], ["std::cmp::Ord", "std::cmp::Order", "std::cmp::Ord[u8, u8]", "std::cmp::Ord::cmp"])
         self.assertEqual(ranked["io::read"], ["std::io::read_line", "std::io::read_exact"])

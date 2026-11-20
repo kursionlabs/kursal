@@ -27,8 +27,8 @@ C_HELPERS = [LIB / "libc/fs.c", LIB / "libc/thread.c"]
 # Reads a document on stdin. Valid: prints its root table as toml-test's tagged JSON (a float as its bits,
 # a date or time as its text) and exits 0. Invalid: prints `OFFSET LINE COLUMN MESSAGE` and exits 1.
 DECODER = r'''
-use std::alloc::arena::Domain!;
-use std::bytes::buffer::Buffer!;
+use std::arena::Domain!;
+use std::buffer::Buffer!;
 use std::collections::arena_map::ArenaMap;
 use std::io::{print_buffer, read_all_stdin};
 use std::option::{Option, Result};

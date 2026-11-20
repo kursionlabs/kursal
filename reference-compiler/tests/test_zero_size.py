@@ -114,8 +114,8 @@ class ZeroSizeTests(unittest.TestCase):
                 directory = Path(base)
                 (directory / "kur.toml").write_text(f'[package]\nname="p"\nsource_root="."\nkind="executable"\n'
                                                     f'entry="main"\n[dependencies.std]\npath="{LIB / "std"}"\n')
-                (directory / "lib.kur").write_text('''use std::alloc::arena::Domain!;
-use std::alloc::owned::Owned!;
+                (directory / "lib.kur").write_text('''use std::arena::Domain!;
+use std::owned::Owned!;
 use std::collections::{hashmap::OwnedMap!, vec::OwnedVec!};
 use std::mem::Ref;
 fn main() -> i32 {

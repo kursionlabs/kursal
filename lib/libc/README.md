@@ -44,13 +44,32 @@ fallback observation counts as not a directory. Build with
 
 `kur_libc_process_spawn` takes a command line of `count` NUL-terminated
 arguments, the program first, builds the table `posix_spawnp` reads, and
-starts the child with this process's environment and SIGPIPE's default
-action: its process id, or a negative errno. `posix_spawnp` reports the
-errno of an `exec` that fails (ENOENT for a program not on the `PATH`,
-EACCES for a file that is not executable), and runs no code of this library
-in the child. A line whose arguments are not exactly `count` is EINVAL.
+starts the child with SIGPIPE's default action: its process id, or a
+negative errno. `posix_spawnp` reports the errno of an `exec` that fails
+(ENOENT for a program not on the `PATH`, EACCES for a file that is not
+executable), and runs no code of this library in the child. A line whose
+arguments are not exactly `count` is EINVAL. The child's environment is
+this process's, or none, changed by the `std::process::Command!`'s
+`env`/`env_remove` operations in order, in a table built for the call; its
+working directory changes with `posix_spawn_file_actions_addchdir_np`
+(glibc 2.29, musl 1.1.24, macOS 10.15, FreeBSD 13.1 and later). Build with
+`KUR_LIBC_NO_ADDCHDIR` for a C library without it: a command given a
+working directory then fails with ENOSYS rather than run elsewhere. Each
+standard stream is inherited, `/dev/null`, a descriptor the child gets a
+copy of, or a new pipe: pipes are made close-on-exec (`pipe2`), the
+child's end reaches it by `dup2`, and this process's end is handed back.
 `kur_libc_process_wait` waits for the child: the exit status, 256 plus the
-signal's number, or a negative errno.
+signal's number, or a negative errno. `kur_libc_process_kill` and `_signal`
+send it SIGKILL or a signal by number, and `kur_libc_process_poll` waits
+until one of two pipes can be read, so that `Child!::wait_with_output`
+reads standard output and error as they come and a child that fills one
+pipe never waits on this process reading the other.
+
+`kur_libc_error_message` writes the C library's description of an errno
+into a buffer through `strerror_r`, thread-safely (the GNU form under
+glibc, the POSIX one elsewhere), and `kur_libc_error_kind` sorts an errno
+into the kinds of `std::io::ErrorKind`, so that no host's errno numbers
+are written in Kursal code.
 
 `kur_libc_fs_size_hint` is what `File!::read_to_buffer` sizes its buffer
 by: a regular file's size, 0 for a pipe, device or socket, which are read

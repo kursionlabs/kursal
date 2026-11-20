@@ -170,17 +170,22 @@ The library's own externs satisfy it:
   declares `abort` again for `Buffer!::new_with_cap` and `commit`;
 - `std::io`: `fs.c`'s `kur_libc_fs_read`, `_write`, `_open_read`,
   `_create`, `_close`, `_regular_size` and `_size_hint`, which retry a call
-  a signal interrupts and report a failure as a negative errno, and
+  a signal interrupts and report a failure as a negative errno,
   `kur_libc_stdin_claim` and `_release`, which set and clear the flag that
-  makes one `Input!` at a time the reader of standard input;
+  makes one `Input!` at a time the reader of standard input, and
+  `kur_libc_error_message` (`strerror_r`) and `kur_libc_error_kind`, which
+  describe an errno;
 - `std::fs`: `fs.c`'s `kur_libc_fs_error`, `_release`, `_canonicalize`,
   `_stat`, `_remove`, `_rename`, `_mkdir`, `_open_directory`,
   `_next_entry`, `_entry_name`, `_entry_is_directory` and
   `_close_directory`; `std::env`: `_getenv` and `_release`;
-- `std::process`: `fs.c`'s `kur_libc_process_spawn`, which starts the
-  child with `posix_spawnp` (no library code runs in the child),
-  `_wait`, which waits for it, again when a signal interrupts the wait,
-  and `_cpus`, which counts the processors of the affinity mask;
+- `std::process`: `fs.c`'s `kur_libc_process_spawn`, which makes the
+  pipes, the environment and the file actions a command asks for and
+  starts the child with `posix_spawnp` (no library code runs in the
+  child), `_wait`, which waits for it, again when a signal interrupts the
+  wait, `_kill` and `_signal` (`kill(2)`), `_poll`, which waits for one of
+  two pipes to be readable, again after a signal, and `_cpus`, which counts
+  the processors of the affinity mask;
 - `std::time`: `fs.c`'s `kur_libc_time_monotonic`, which reads the host's
   `CLOCK_MONOTONIC` (and aborts where it has none), and
   `kur_libc_time_sleep`, which sleeps on after a signal; `std::float`:
@@ -243,9 +248,9 @@ double free.
 | `alloc::arena::new_chunk` | `next` is a chain head or the chain terminator; the returned header is owned by the chain |
 | `alloc::arena::new_header` | `next` is a chain head or the terminator, and `data` is a live buffer of at least `cap` bytes that the returned header takes over; passing a `data` still owned elsewhere makes two owners of one block |
 | `alloc::arena::copy_bytes` | `dest[0..count)` is writable, `src[0..count)` readable, and the two ranges do not overlap |
-| `alloc::buffer::Buffer!::commit`, `BufferWriter!::commit_external` | every byte being published (`p[len..len+n)`) has been written since the last reserve/grow. Publishing past `cap` aborts |
+| `alloc::buffer::Buffer!::commit` | every byte being published (`p[len..len+n)`) has been written since the last reserve/grow. Publishing past `cap` aborts |
 | `alloc::collections::arena_vec::merge_runs` | `src` and `dst` each address `n` elements and do not overlap; one bottom-up merge pass of `ArenaVec::sort_by` and `Vec!::sort_by` |
-| `std::io::read_exact`, `std::io::File!::read_exact` | `buf[0..size)` is writable; the kernel writes through `buf`. For the free `read_exact`, also `fd` is a descriptor the caller may read: stdin, or one a `File!` it holds owns |
+
 
 ### 2.3 Reads through an arbitrary pointer
 
@@ -281,7 +286,7 @@ a checked type; their obligation is the same kind of thing.
 | `core::raw::Span::from_raw_parts_branded` | as `from_raw_parts`, for a module whose own object holds the domain's brand (an arena's `marker`); `marker` must be a witness that object really holds, since a span planted in another domain reads that domain's bytes |
 | `alloc::buffer::Buffer!::as_ptr` | the pointer is invalidated by any later growth of the same buffer (which may reallocate) and by `destroy` |
 | `alloc::buffer::Buffer!::tail_ptr` | the same; the bytes it addresses are uninitialized until written externally and committed |
-| `alloc::buffer::BufferWriter!::writable_tail` | the same, within a `BufferWriter!` session: valid until the next `push`/`append`/grow, and `commit_external` must be called with the true count |
+
 | `alloc::arena::Arena!::alloc_bytes` | the returned run is reserved but **uninitialized** and unaligned; it must not outlive the arena |
 | `core::ptr::offset` | `count` elements of `T` past `base` stay inside the block `base` points into; no bound is passed or checked. The one address computation of the library: every module that steps through a block calls it |
 | `alloc::collections::arena_vec::place` | `i` is below the capacity of `h`'s segments, which are live arena blocks of the sizes `locate` computes |
@@ -388,7 +393,8 @@ about a pointer in the signature:
 | `alloc::owned::Allocation!::release_storage` | every `T` the block holds is accounted for: moved out, never written, or still tracked by the caller, which keeps the returned storage and its contents. The block is given up without reading it, so a linear `T` left in it unaccounted would be dropped. `release` is the safe form, for a `Copy` `T`; the library's one caller is `Vec!` (`push`/`pop` re-adopt the same storage at once and keep tracking the elements below `len`; `destroy` moves every element out first) |
 | `std::io::File!::adopt` | the descriptor is live and open, with no other owner |
 | `std::io::write_static_to`, `write_span_to`, `write_buffer_to` | `fd` is a descriptor the caller may write: standard output or error, or one a `File!` it holds owns. A number taken from anywhere else may name a descriptor a `File!` owns, or one closed and since reused, and the write would go around its owner. The safe output functions name standard output and error themselves (`print*`, `eprint*`, `Output!`), or write through a `File!` |
-| `std::io::read_to_end_from` | `fd` is a descriptor the caller may read: stdin, or one a `File!` it holds owns. Reading advances the descriptor's offset, which is that owner's state |
+| `std::io::read_into`, `read_to_end_from` | `fd` is a descriptor the caller may read: stdin, or one a `File!` it holds owns. Reading advances the descriptor's offset, which is that owner's state. The safe reads (`File!::read`, `read_exact`, `read_to_end`, `Input!`) name their own descriptor |
+| `std::process::pipe_end` | `fd` is -1 or a descriptor nothing else owns, which the `File!` made of it closes: the parent's end of a pipe `kur_libc_process_spawn` made for the child |
 
 **Class C means "no brand-to-authority conversion and no raw pointer in the
 signature". It does not mean "verified correct".**
@@ -472,14 +478,14 @@ runs, so it breaks no invariant and is safe to call.
 
 ### 3.2 Open in class C
 
-- **No initialization evidence.** `Buffer!::commit` and
-  `BufferWriter!::commit_external` publish storage on the caller's word that
-  it has been written. The obligation is declared and enforced at the call
+- **No initialization evidence.** `Buffer!::commit` publishes storage on
+  the caller's word that it has been written. The obligation is declared and enforced at the call
   site (section 2.2), but it is an attestation, not evidence. A linear "filled"
   counter would prove that `n` writes happened, not that these `n` slots
   were the ones written. The remaining callers have the kernel write the
-  bytes through a raw pointer (`std::io::File!::read_to_buffer`, `Input!`, `read_all_stdin`,
-  `read_line`), where no per-slot operation exists to attach a witness to.
+  bytes through a raw pointer (`std::io::read_into`, behind `File!::read`
+  and every read to the end, `read_line`, and `Error::message`, which the C
+  library fills), where no per-slot operation exists to attach a witness to.
   Callers that only need a fully addressable scratch buffer use
   `Buffer!::new_zeroed`, which makes the claim true and carries no
   obligation.
@@ -527,9 +533,10 @@ Types whose hidden representation protects authority or bounds:
 | `HeapAllocator`, `Storage` | `alloc::heap` | zero-field receivers for the allocator's static methods; they own no memory |
 | `AlignProbe[T]` | `core::mem` | never built; `alignof` takes only its size |
 | `Stamp['r]` | `core::cap` | exposed to `core` alone (`exposed (package)`): `core` modules read a domain's brand out of it, code outside `core` can hold one but not open it |
-| `File!`, `Output!`, `Input!` | `std::io` | `File!` owns one open descriptor; forging one closes an arbitrary descriptor. `Output!` writes to a descriptor it does not own (stdout, stderr), which a forged one could point anywhere. `Input!` is made only by `stdin`, once it holds standard input, so that one reader at a time reads ahead from it; a forged one would skip what another has read ahead, and its `finish` would give standard input back from under the one that holds it. No `File!` owns a standard stream's number: the C `main` of an executable (`kursal build`) opens `/dev/null` on each of descriptors 0, 1 and 2 the process started without, before the program runs |
+| `File!`, `Output!`, `Input!` | `std::io` | `File!` owns one open descriptor; forging one closes an arbitrary descriptor. `descriptor` hands out its number, which no safe function takes. `Output!` writes to a descriptor it does not own (stdout, stderr), which a forged one could point anywhere. `Input!` is made only by `stdin`, once it holds standard input, so that one reader at a time reads ahead from it; a forged one would skip what another has read ahead, and its `finish` would give standard input back from under the one that holds it. No `File!` owns a standard stream's number: the C `main` of an executable (`kursal build`) opens `/dev/null` on each of descriptors 0, 1 and 2 the process started without, before the program runs |
 | `Args` | `std::process` | `argv` and `argc` as C's `main` received them: made only by the C `main` the compiler writes for an entry function taking one (its `argv` has `count` readable entries, each a NUL-terminated string live for the rest of the process) |
-| `Command!` | `std::process` | a command line of `count` NUL-terminated arguments, which `fs.c` splits into the table `posix_spawnp` reads |
+| `Command!` | `std::process` | a command line of `count` NUL-terminated arguments, which `fs.c` splits into the table `posix_spawnp` reads, and `env_ops` environment changes in the form `fs.c` parses; a forged one would hand `fs.c` a mismatched count. Its streams are `Stdio!` values, whose `File` is a `File!` the command closes after `spawn` |
+| `Child!` | `std::process` | a child this process started and has not waited for, so its process id names it and no other: `wait`, `kill` and `signal` reach it. A forged one would `waitpid` or signal an arbitrary process, and reap a child another component owns. Its pipe ends are `File!`s |
 | `Instant` | `std::time` | a monotonic clock reading; nothing outside makes one |
 | `Directory!` | `std::fs` | owns one open `DIR *`; forging one hands `readdir`/`closedir` an arbitrary pointer |
 | `Thread!` | `libc::thread` | owns one `pthread_t` handle that `join` frees; forging one joins and frees an arbitrary pointer |
@@ -554,7 +561,7 @@ that restricting a type costs nothing: it only sees the code it is run on.
   `alloc::collections::list::ListIter!`, `alloc::collections::vec::VecIter!`
   and `OwnedVecIter!` (a view or collection with the capability that reads
   it), `core::fmt::ReadingWriter!` (a writer and a context),
-  `alloc::buffer::BufferWriter!` (a `Buffer!`), `core::cursor::Cursor` (a
+  `std::process::Captured!` (an `Exit` and two `Buffer!`s), `core::cursor::Cursor` (a
   `Slice` and a position; every read is checked whatever the position),
   `core::slice::Readable` (a capability and a view), `core::borrow::
   Borrowed!` and `NoCap`, `std::fs::DirEntry!` (an owned name and a
@@ -569,7 +576,8 @@ that restricting a type costs nothing: it only sees the code it is run on.
   read through the arena's capability like any other.
 - **`core::option::Option`/`Result`, `core::cmp::Order`,
   `core::atomic::Ordering`, `alloc::heap::AllocError`,
-  `alloc::collections::vec::Popped!`, `std::process::Exit`, `std::fs::FileKind`.** These exist to be matched on, and there is no per-variant privacy, so an enum
+  `std::process::Exit`, `Polled!` (a `Child!` or an `Exit`) and `Stdio!`
+  (a `File!` or nothing), `std::io::ErrorKind`, `std::fs::FileKind`.** These exist to be matched on, and there is no per-variant privacy, so an enum
   meant to be matched on cannot be restricted. The general rule: **a type
   can be restricted when its outside users rely on methods rather than
   destructuring.**

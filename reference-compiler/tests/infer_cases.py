@@ -60,7 +60,7 @@ VISIBILITY_ERRORS = (
 )
 
 INFERENCES = (
-    'use std::iter::{Iterator, range};\nuse std::option::{Option, Result};\nuse std::atomic::Ordering;\nuse std::bytes::buffer::Buffer!;\nfn total(n: u32) -> u32 { var sum = 0u32; var it = range(0usize, 4usize); for i in &it { sum = sum + (i as u32); } sum }\nfn first(o: Option[u32]) -> Option[u32] { let v = o?; Option::Some.(v + 1) }\nfn both(r: Result[u32, bool]) -> Result[(u32, u32), bool] { let v = r?; Result::Ok.((v, v)) }\nfn text(n: u32) -> Buffer! { f"n = {n}" }\nfn written(n: u32) -> Buffer! { f"n = {n}".write(Buffer!::new()) }\nfn atomics(p: *u32) -> u32 { std::atomic::fence(Ordering::SeqCst); let old = unsafe p.fetch_add(1u32, Ordering::Relaxed); let (v, ok) = unsafe p.compare_exchange(old, 2u32, Ordering::SeqCst, Ordering::Relaxed); unsafe p.store(v); std::ptr::store_volatile(p, 3u32); std::ptr::load_volatile(p) }\nfn tag(o: Option[u32]) -> u32 { var x = o; let t = std::mem::enum_variant(&x); let (y, u) = std::mem::enum_variant(x); t + u }\nfn mint() -> exists \'r. std::cap::Brand[\'r] { let exists \'a. w = std::cap::fresh(); pack \'a. w }\nfn use_mint() -> u32 { let exists \'b. w = mint(); let s = std::cap::static_brand(); let q = pack \'b. w; 0u32 }\n',
+    'use std::iter::{Iterator, range};\nuse std::option::{Option, Result};\nuse std::atomic::Ordering;\nuse std::buffer::Buffer!;\nfn total(n: u32) -> u32 { var sum = 0u32; var it = range(0usize, 4usize); for i in &it { sum = sum + (i as u32); } sum }\nfn first(o: Option[u32]) -> Option[u32] { let v = o?; Option::Some.(v + 1) }\nfn both(r: Result[u32, bool]) -> Result[(u32, u32), bool] { let v = r?; Result::Ok.((v, v)) }\nfn text(n: u32) -> Buffer! { f"n = {n}" }\nfn written(n: u32) -> Buffer! { f"n = {n}".write(Buffer!::new()) }\nfn atomics(p: *u32) -> u32 { std::atomic::fence(Ordering::SeqCst); let old = unsafe p.fetch_add(1u32, Ordering::Relaxed); let (v, ok) = unsafe p.compare_exchange(old, 2u32, Ordering::SeqCst, Ordering::Relaxed); unsafe p.store(v); std::ptr::store_volatile(p, 3u32); std::ptr::load_volatile(p) }\nfn tag(o: Option[u32]) -> u32 { var x = o; let t = std::mem::enum_variant(&x); let (y, u) = std::mem::enum_variant(x); t + u }\nfn mint() -> exists \'r. std::cap::Brand[\'r] { let exists \'a. w = std::cap::fresh(); pack \'a. w }\nfn use_mint() -> u32 { let exists \'b. w = mint(); let s = std::cap::static_brand(); let q = pack \'b. w; 0u32 }\n',
     'exposed struct P { x: u32, y: u32, z: u8 }\nforall T. exposed struct Box { value: T }\nforall T. impl Box[T] { forall U. fn map(self, u: U) -> (T, U) { (self.value, u) } }\ntrait Size { fn size(x: Self) -> usize; }\ninstance Size[u32] { fn size(x: u32) -> usize { 4usize } }\nforall T where Size[T]. fn size_of(x: T) -> usize { T::size(x) }\nforall T. fn id(x: T) -> T { x }\nfn f(p: P, q: *u32) -> u32 {\n  const K: u32 = 3u32 * 2u32;\n  let { x, ..rest } = p; let r = P.{ x: x + K, ..rest };\n  let a: [u32; 4] = [x, ..]; let [a0, a1, a2, a3] = a;\n  let n = core::mem::sizeof[P]() + size_of(a0); let c = (n as u32) + (r.z as u32);\n  let slot = core::mem::alloca[u32](); unsafe *slot = c; let back = unsafe *slot;\n  let bias = 2u32; let g = |y: u32| y + bias + back; let h = id; let i = id[u32](g(1u32));\n  let b = Box[u32]::map[bool](Box.{ value: i }, true);\n  let items = foreach item of (1u32, 2u32) { (item, bias) };\n  let m = match a0 { 0 => 1u32, 1..=3 => 2u32, _ => 3u32 };\n  var v = p; v.x = m; v.y = b.0; v.x + h(v.y)\n}\n',
     "forall T. exposed enum Opt { Some(T), None }\nfn f(n: u32) -> u32 { let o: Opt[u32] = Opt::None; var k = n; while k > 0u32 { k = k - 1u32; if k == 3u32 { return k; } } var q = Opt::Some.(k); let w = match &q { Opt::Some(v) => v, Opt::None => 0u32 }; let pk = pack 'static. q; w }\n",
     *VISIBILITY,
@@ -188,7 +188,7 @@ INFERENCES = (
 
 INFER_ERRORS = (
     ('fn f() -> u32 { let g = |x| x.0; 0u32 }\n', 'a type here is not known yet'),
-    ('use std::option::Option;\nfn f(o: std::alloc::buffer::Buffer!) -> u32 { let { len } = o; 0u32 }\n', 'is not exposed here'),
+    ('use std::option::Option;\nfn f(o: std::buffer::Buffer!) -> u32 { let { len } = o; 0u32 }\n', 'is not exposed here'),
     ('exposed struct P { x: u32 }\nfn f(p: P) -> u32 { let { y } = p; y }\n', 'no field y'),
     ('exposed struct P { x: u32, y: u32 }\nfn f(p: P) -> u32 { let { x, ..rest } = p; let r = rest; x }\n', 'is a ..rest bundle'),
     ('exposed struct P { x: u32 }\nfn f() -> u32 { let q = P; 0u32 }\n', 'is not a value'),
@@ -212,11 +212,11 @@ INFER_ERRORS = (
     ('fn f() -> u32 { let b = core::cap::static_brand(1u32); 0u32 }\n', 'takes 0 value arguments'),
     ('fn f() -> u32 { let p = core::mem[u32]::alloca[u32](); 0u32 }\n', 'type arguments belong on alloca, not a namespace'),
     ('fn f() -> u32 { let p = core::mem::alloca(); 0u32 }\n', 'alloca takes 1 type arguments'),
-    ('use std::alloc::buffer::Buffer;\nfn f() -> u32 { let b = f"x".write(); 0u32 }\n', 'write takes the writer'),
-    ('use std::bytes::buffer::Buffer!;\nfn f(x: f64) -> Buffer! { f"x = {x}" }\n', '2:34: no instance of Format[f64, Buffer!]'),
-    ("use std::bytes::buffer::Buffer!;\nuse std::raw::Span;\nfn f(s: Span['static]) -> Buffer! { f\"{&s}\".write(Buffer!::new()) }\n",
+    ('use std::buffer::Buffer;\nfn f() -> u32 { let b = f"x".write(); 0u32 }\n', 'write takes the writer'),
+    ('use std::buffer::Buffer!;\nfn f(x: f64) -> Buffer! { f"x = {x}" }\n', '2:34: no instance of Format[f64, Buffer!]'),
+    ("use std::buffer::Buffer!;\nuse std::raw::Span;\nfn f(s: Span['static]) -> Buffer! { f\"{&s}\".write(Buffer!::new()) }\n",
      "3:40: no instance of Format[Span['static], Buffer!]"),
-    ('use std::bytes::buffer::Buffer!;\nforall T. fn f(x: T) -> Buffer! { f"{x}" }\n', 'no instance of Format[T, Buffer!]'),
+    ('use std::buffer::Buffer!;\nforall T. fn f(x: T) -> Buffer! { f"{x}" }\n', 'no instance of Format[T, Buffer!]'),
     ('exposed struct C { n: u32 }\nimpl C { fn get(self) -> u32 { 0u32 } }\nfn f(c: C) -> u32 { var d = c; &d.get() }\n', 'takes its receiver by value'),
     ('trait A { fn go(x: Self) -> u32; }\ntrait B { fn go(x: Self) -> u32; }\nfn f(x: u8) -> u32 { x.go() }\n', 'has several method go'),
     ('fn f(p: *u32) -> u32 { unsafe p.store() }\n', 'store takes 1 arguments'),

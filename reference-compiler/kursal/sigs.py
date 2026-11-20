@@ -29,12 +29,12 @@ LIBRARY = {  # name: (home library, path there, path through std)
     "Option": ("core", ("option", "Option"), ("option", "Option")),
     "Result": ("core", ("option", "Result"), ("option", "Result")),
     "Slice": ("core", ("slice", "Slice"), ("slice", "Slice")),
-    "Buffer!": ("alloc", ("buffer", "Buffer!"), ("bytes", "buffer", "Buffer!")),
+    "Buffer!": ("alloc", ("buffer", "Buffer!"), ("buffer", "Buffer!")),
     "Iterator": ("core", ("iter", "Iterator"), ("iter", "Iterator")),
-    "Format": ("core", ("fmt", "Format"), ("text", "fmt", "Format")),
-    "Writable": ("core", ("fmt", "Writable"), ("text", "fmt", "Writable")),
+    "Format": ("core", ("fmt", "Format"), ("fmt", "Format")),
+    "Writable": ("core", ("fmt", "Writable"), ("fmt", "Writable")),
     "Slice::from_raw_parts": ("core", ("slice", "Slice", "from_raw_parts"), ("slice", "Slice", "from_raw_parts")),
-    "Buffer!::new": ("alloc", ("buffer", "Buffer!", "new"), ("bytes", "buffer", "Buffer!", "new")),
+    "Buffer!::new": ("alloc", ("buffer", "Buffer!", "new"), ("buffer", "Buffer!", "new")),
     "Ordering": ("core", ("atomic", "Ordering"), ("atomic", "Ordering")),
 }
 

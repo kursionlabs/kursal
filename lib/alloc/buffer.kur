@@ -79,7 +79,7 @@ extern "C" fn abort() -> !;
 
 impl Buffer! {
     /// A new, empty buffer with room for `cap` bytes before the first grow,
-    /// or the allocation failure. Growing it later aborts as `ensure` does.
+    /// or the allocation failure. Growing it later aborts as `reserve` does.
     fn try_new_with_cap(cap: usize) -> Result[Buffer!, AllocError] {
         match Storage::try_alloc(cap) {
             Result::Ok(u) => Result::Ok.(Buffer!.{ ptr: u.into_raw(), len: 0usize, cap }),
@@ -124,8 +124,10 @@ impl Buffer! {
     }
 
     /// Grows (doubling) until at least `extra` more bytes fit; a no-op
-    /// otherwise. Aborts if the size overflows `usize`.
-    fn ensure(self, extra: usize) -> Buffer! {
+    /// otherwise. Aborts if the size overflows `usize`. Room reserved this
+    /// way is what `tail_ptr` hands out, for a caller that writes into it
+    /// directly (a system call filling the buffer in place) and `commit`s.
+    fn reserve(self, extra: usize) -> Buffer! {
         let { ptr: p, len: n, cap: c } = self;
         let needed = checked_add(n, extra);
         let has_room = needed <= c;
@@ -145,7 +147,7 @@ impl Buffer! {
 
     /// Appends one byte, growing first if needed.
     fn push_byte(self, val: u8) -> Buffer! {
-        let b2 = self.ensure(1usize);
+        let b2 = self.reserve(1usize);
         let { ptr: p, len: n, cap: c } = b2;
         let dest = unsafe offset(p, n);
         unsafe *dest = val;
@@ -154,7 +156,7 @@ impl Buffer! {
 
     /// Copies `count` bytes from `src` in, growing first if needed.
     unsafe fn push_n(self, src: *u8, count: usize) -> Buffer! {
-        let b2 = self.ensure(count);
+        let b2 = self.reserve(count);
         let { ptr: p, len: n, cap: c } = b2;
         var i = 0usize;
         while i < count {
@@ -276,13 +278,6 @@ impl Buffer! {
         p
     }
 
-    /// Guarantees room for at least `extra` more bytes without writing
-    /// anything, for a caller that writes through `tail_ptr` directly (e.g. a
-    /// syscall filling the buffer in place).
-    fn reserve(self, extra: usize) -> Buffer! {
-        self.ensure(extra)
-    }
-
     /// Address of the first unused byte, writable up to the room `reserve`
     /// most recently guaranteed. Pairs with `commit`. The pointer is valid
     /// only until the next grow. Takes `&self` because a linear buffer must
@@ -357,80 +352,6 @@ impl Buffer! {
         let slice = unsafe Slice::from_raw_parts(p2, n, m);
         let restore = BufferRestore!.{ store: a, back: back, len: n, cap: c };
         pack 'open1. (tag, slice, restore)
-    }
-}
-
-/// An initialized-prefix writer: a session over a `Buffer!` with room
-/// already reserved, so code that fills known bytes never needs
-/// `tail_ptr`/`commit`. `push`/`append_*` are safe wrappers over the
-/// `push_*` methods and `finish` hands the buffer back. The two `unsafe fn`s
-/// at the bottom are the same escape hatch as `tail_ptr`/`commit`, for FFI.
-///
-/// Exposed: its only field is a restricted `Buffer!`, so building one
-/// requires already owning a real buffer -- no more authority than holding
-/// that buffer grants.
-exposed struct BufferWriter! {
-    buf: Buffer!,
-}
-
-impl Buffer! {
-    /// Reserves `extra` more bytes up front (one grow), then wraps the buffer
-    /// in a writer session.
-    fn writer(self, extra: usize) -> BufferWriter! {
-        let reserved = self.reserve(extra);
-        BufferWriter!.{ buf: reserved }
-    }
-}
-
-impl BufferWriter! {
-    /// Appends one byte -- safe, since `push_byte` already is.
-    fn push(self, val: u8) -> BufferWriter! {
-        let { buf: b } = self;
-        BufferWriter!.{ buf: b.push_byte(val) }
-    }
-
-    /// Appends a `'static` byte view's bytes (`Buffer!::push_static`).
-    fn append_static(self, bytes: Slice[u8, 'static]) -> BufferWriter! {
-        let { buf: b } = self;
-        BufferWriter!.{ buf: b.push_static(bytes) }
-    }
-
-    /// Appends any readable byte view's bytes (`Buffer!::push_bytes`).
-    forall C, S where ReadBytes[C, S], Copy[S].
-    fn append_bytes(self, &cx: C, bytes: S) -> BufferWriter! {
-        let { buf: b } = self;
-        let b2 = b.push_bytes(&cx, bytes);
-        BufferWriter!.{ buf: b2 }
-    }
-
-    /// Returns the buffer at its current length -- the session's only way
-    /// out on the safe path.
-    fn finish(self) -> Buffer! {
-        let { buf: b } = self;
-        b
-    }
-
-    /// FFI-only: the writable tail (the address `tail_ptr` returns) and how
-    /// many bytes are available to fill -- for a caller about to pass the
-    /// pointer to something like `read(2)`. `unsafe` for the same reason as
-    /// `Buffer!::tail_ptr`: the pointer is valid only until the next
-    /// `push`/`append`/grow, and nothing here proves what the external call
-    /// wrote.
-    unsafe fn writable_tail(&self) -> (*u8, usize) {
-        let { buf: b } = self;
-        let p = unsafe &b.tail_ptr();
-        let avail = &b.remaining_capacity();
-        self = BufferWriter!.{ buf: b };
-        (p, avail)
-    }
-
-    /// FFI-only: returns the buffer, attesting that exactly `count` more
-    /// bytes (from the pointer `writable_tail` handed out) were written.
-    /// Delegates to `Buffer!::commit`, so it aborts past `cap` and carries the
-    /// same obligation.
-    unsafe fn commit_external(self, count: usize) -> Buffer! {
-        let { buf: b } = self;
-        unsafe b.commit(count)
     }
 }
 

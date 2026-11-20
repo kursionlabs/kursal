@@ -101,7 +101,7 @@ limited to 6 GB of address space and a timeout. When valgrind is installed, the 
 ## Storage
 
 The compiler keeps what it builds in arenas of the standard library. Each group of phases has one
-`std::alloc::arena::Domain!['k]`: an arena with the one capability for its domain.
+`std::arena::Domain!['k]`: an arena with the one capability for its domain.
 
 ```kursal
 forall 'k.
@@ -221,7 +221,7 @@ write fails.
 | `dict` | `ArenaMap[K, V, 'k]` (insertion-ordered like `dict`: `insert`, `get` → `Option`, `at`, `get_or`, `contains`, `remove`, `keys`, `values`, `each`, `any`) |
 | `set` | `ArenaSet[K, 'k]` (insertion-ordered: `insert`, `contains`, `remove`, `keys`, `each`, `any`, `all`) |
 | scopes pushed and popped by a walk | `List[T, 'k]` in a `Ref` (`cons`, `tail`, `first`, `find_map`, `reverse`, `each`) |
-| a worklist or visited set local to a walk | `OwnedVec![T]` (`push`, `pop` → `Popped!`, `get`, `len`, `free`), `OwnedMap![K, V]` (`insert`, `get`; `insert_in(&cx, ...)` for keys in the arena; `free`) |
+| a worklist or visited set local to a walk | `OwnedVec![T]` (`push`, `pop` → `Option`, `get`, `len`, `free`), `OwnedMap![K, V]` (`insert`, `get`; `insert_in(&cx, ...)` for keys in the arena; `free`) |
 | a mutable attribute | a field holding a `Ref[T, 'k]` (`copy`, `set`), an `ArenaVec` or an `ArenaMap` |
 | a dataclass | an `exposed struct` branded `'k`; a `HashIn[X['k], Domain!['k]]` instance if it is a map key |
 | a union of classes | an `exposed enum` whose variants carry structs |
@@ -767,8 +767,8 @@ These are the places where Kursal differs from what one might expect.
   for while if else match let var return pack true false self _`. Fields here are named
   `is_unsafe`, `home`, `quantifier`, `trait_name` and the like instead.
 - **A linear type's name ends with `!`.** `struct Buffer! { ... }` declares the name `Buffer!`, and
-  every reference spells it: `Buffer!`, `Buffer!::new()`, `Buffer!.{ ... }`, `Popped!::Value(x)`,
-  `use std::bytes::buffer::Buffer!;`, `impl Buffer!`, `Option[Buffer!]`; an alias of one ends with
+  every reference spells it: `Buffer!`, `Buffer!::new()`, `Buffer!.{ ... }`, `Polled!::Running(x)`,
+  `use std::buffer::Buffer!;`, `impl Buffer!`, `Option[Buffer!]`; an alias of one ends with
   `!` too (`use libc::thread::Thread! as RawThread!;`). The lexer reads a name followed at once by
   `!` as one name, unless the `!` begins `!=`: `a!=b` is `a != b`, `!x` is a negation, a keyword never
   takes the `!` (`return!x` is `return !x`), and `!` alone is still the type `Never`. A name without

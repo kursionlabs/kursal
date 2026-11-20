@@ -30,7 +30,7 @@ use std::collections::arena_vec::ArenaVec;
 use std::collections::arena_map::{ArenaMap, ArenaSet};
 use std::mem::Ref;
 use std::raw::Span;
-use std::alloc::arena::Domain!;
+use std::arena::Domain!;
 use package::backend::cgen::{CText!, emit_c};
 use package::check::checker::{FunKey, check_program, copy_typed};
 use package::syntax::dump as syntax_dump;
@@ -51,13 +51,13 @@ use package::sigs::signatures::signatures;
 use std::env::variable;
 use std::fs::{mkdir, read_dir, read_to_arena, remove, write};
 use package::types::ops::{Fresh, carry_fresh};
-use std::bytes::buffer::Buffer!;
+use std::buffer::Buffer!;
 use std::io::eprint_buffer;
 use std::option::{Option, Result};
 use std::process::{Args, Child!, Command!, Exit, Polled!, available_parallelism};
-use std::collections::vec::{OwnedVec!, Popped!};
+use std::collections::vec::OwnedVec!;
 use std::cmp::Order;
-use std::io::Error;
+use std::io::{Error, ErrorKind};
 use std::slice::Slice;
 use std::time::{Duration, Instant, sleep};
 use std::parse::parse_usize;
@@ -280,7 +280,7 @@ fn read_file(&cx: Domain!['k], file: Span['k]) -> Span['k] {
 fn stage(times: bool, name: Slice[u8, 'static], started: Instant) -> Instant {
     let now = Instant::now();
     if times {
-        let ms = started.millis_until(now);
+        let ms = now.since(started).as_millis();
         eprint_buffer(Buffer!::new().push_static(name).push_static(": ").push_usize(ms as usize).push_static("ms\n"));
         Instant::now()
     } else {
@@ -431,8 +431,11 @@ fn back_end(cx: Domain!['k], handoff: Handoff['k], typed: ArenaMap[FunKey['k], A
             match mkdir(&cx, dir) {
                 Result::Ok(made) => (),
                 // an earlier build's directory, kept: only the files written below are compiled
-                Result::Err(e) => if e.errno != 17i32 {
-                    fail(&cx, Buffer!::new().push_static("cannot make the directory ").push_bytes(&cx, dir).save(&cx));
+                Result::Err(e) => match e.kind() {
+                    ErrorKind::AlreadyExists => (),
+                    _ => {
+                        fail(&cx, Buffer!::new().push_static("cannot make the directory ").push_bytes(&cx, dir).save(&cx));
+                    },
                 },
             };
             forget_stale(&cx, dir, files);
@@ -611,7 +614,7 @@ fn run_all(commands: OwnedVec![Command!], jobs: usize, &cc: Buffer!) -> Option[B
         var starting = !failed;
         while starting && &running.len() < jobs {
             match &pending.pop() {
-                Popped!::Item(command) => {
+                Option::Some(command) => {
                     match failure(&cc, spawned(command, &running)) {
                         Option::None => (),
                         Option::Some(message) => {
@@ -622,7 +625,7 @@ fn run_all(commands: OwnedVec![Command!], jobs: usize, &cc: Buffer!) -> Option[B
                         },
                     };
                 },
-                Popped!::Empty => {
+                Option::None => {
                     starting = false;
                 },
             };
@@ -632,7 +635,7 @@ fn run_all(commands: OwnedVec![Command!], jobs: usize, &cc: Buffer!) -> Option[B
         var polling = true;
         while polling {
             match &running.pop() {
-                Popped!::Item(child) => {
+                Option::Some(child) => {
                     match child.try_wait() {
                         Result::Ok(polled) => match polled {
                             Polled!::Running(child) => {
@@ -658,7 +661,7 @@ fn run_all(commands: OwnedVec![Command!], jobs: usize, &cc: Buffer!) -> Option[B
                         },
                     };
                 },
-                Popped!::Empty => {
+                Option::None => {
                     polling = false;
                 },
             };
