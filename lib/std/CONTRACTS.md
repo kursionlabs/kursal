@@ -284,6 +284,15 @@ read that conjures a witness some other way breaks the obligation, as a read of 
 memory that does not hold one does. An unsafe cast never produces a witness: the checker rejects a
 cast whose result holds one in its value.
 
+A read through a pointer never produces `Never`. No memory holds a value of `!`, nor of a type that
+holds one in its value (a struct, tuple or array of length above 0 with a component that does, an enum
+with a payload that does, named types' fields included; not what a pointer in it points at), so such a
+read has undefined behavior. The checker rejects a read whose pointee is such a type
+(`unsafe_read_cannot_produce_never`). It checks a generic read, `unsafe *p` with `p: *T`, at `T`
+itself, so it cannot see a `T` instantiated with such a type (`rd[!](p)` for
+`forall T. unsafe fn rd(p: *T) -> T { unsafe *p }`): there the obligation is the caller's, as it is
+for every other type the memory must hold.
+
 ### 2.4 Produces, offsets, or wraps a raw pointer
 
 Individually mild (several are only integer arithmetic), but together they

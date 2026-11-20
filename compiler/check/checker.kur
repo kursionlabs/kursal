@@ -185,6 +185,37 @@ fn ancestor_in(&cx: Domain!['k], paths: ArenaSet[Span['k], 'k], path: Span['k]) 
     paths.contains(&cx, path) || strict_ancestor_in(&cx, paths, path)
 }
 
+// `holds` is true somewhere in the value representation of `ty`, or in the arguments of a named type
+// in it. A named type is unfolded too, since its fields are its value; a pointer's target is not part
+// of it, nor is the element of an array of length 0, which holds no value (and may be the type itself).
+forall Env, 'k where Copy[Env].
+fn contains(&cx: Domain!['k], types: Types['k], ty: Type['k], holds: closure[Env](&_: Domain!['k], Type['k]) -> bool) -> bool {
+    if holds(&cx, ty) {
+        return true;
+    }
+    match ty {
+        Type::Ptr(_inner) => false,
+        Type::NonNull(_inner) => false,
+        Type::Array(elem, length) => length != 0u64 && contains(&cx, types, elem.copy(&cx), holds),
+        _ => {
+            let parts = children(&cx, ty);
+            var found = false;
+            var i = 0usize;
+            while !found && i < parts.len(&cx) {
+                found = contains(&cx, types, parts.at(&cx, i), holds);
+                i = i + 1usize;
+            }
+            if found {
+                return true;
+            }
+            match ty {
+                Type::Named(name, _args) => types.program.types.contains(&cx, name) && contains(&cx, types, types.shape(&cx, ty, Option::None), holds),
+                _ => false,
+            }
+        },
+    }
+}
+
 forall 'k.
 fn is_never(t: Type['k]) -> bool {
     match t {
@@ -2033,7 +2064,8 @@ impl Checker['k] {
     fn op_cast(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
         let ty = self.type_operand(&cx, instr);
         let got = self.use_value(&cx, instr.args.at(&cx, 0usize));
-        if self.contains(&cx, got) || self.contains(&cx, ty) {
+        if contains(&cx, self.types, got, |&cx, t: Type['k]| self.uncastable(&cx, t))
+            || contains(&cx, self.types, ty, |&cx, t: Type['k]| self.uncastable(&cx, t)) {
             self.fail(&cx, "unsafe_cast_cannot_produce");
         }
         self.has_memory_form(&cx, got);
@@ -2076,37 +2108,6 @@ impl Checker['k] {
         }
         if is_number_type(&cx, got) && is_number_type(&cx, want) {
             self.fail(&cx, "unsafe_cast_between_numbers");
-        }
-    }
-
-    // `uncastable` holds somewhere in the value representation of `ty`, or in the arguments of a
-    // named type in it. A named type is unfolded too, since its fields are its value; a pointer's
-    // target is not part of it, nor is the element of an array of length 0, which holds no value (and
-    // may be the type itself).
-    fn contains(self, &cx: Domain!['k], ty: Type['k]) -> bool {
-        if self.uncastable(&cx, ty) {
-            return true;
-        }
-        match ty {
-            Type::Ptr(_inner) => false,
-            Type::NonNull(_inner) => false,
-            Type::Array(elem, length) => length != 0u64 && self.contains(&cx, elem.copy(&cx)),
-            _ => {
-                let parts = children(&cx, ty);
-                var found = false;
-                var i = 0usize;
-                while !found && i < parts.len(&cx) {
-                    found = self.contains(&cx, parts.at(&cx, i));
-                    i = i + 1usize;
-                }
-                if found {
-                    return true;
-                }
-                match ty {
-                    Type::Named(name, _args) => self.types.program.types.contains(&cx, name) && self.contains(&cx, self.types.shape(&cx, ty, Option::None)),
-                    _ => false,
-                }
-            },
         }
     }
 
@@ -2398,7 +2399,7 @@ impl Checker['k] {
             Type::Ptr(inner) => inner.copy(&cx),
             _ => self.fail(&cx, "ptr_load_non_pointer"),
         };
-        if is_never(inner) {
+        if contains(&cx, self.types, inner, |&cx, t: Type['k]| is_never(t)) {
             self.fail(&cx, "unsafe_read_cannot_produce_never");
         }
         inner

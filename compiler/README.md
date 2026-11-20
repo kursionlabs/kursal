@@ -872,7 +872,10 @@ These are the places where Kursal differs from what one might expect.
   conversions"); a float's bits are `x.to_bits()` and `f64::from_bits(b)`. An unsafe cast neither
   makes nor takes apart a value that holds a package, a brand witness, a function value, a
   transform, a value of a type parameter or `Never` (`unsafe_cast_cannot_produce`), named types'
-  fields included; behind a pointer, reading one is a separate unsafe operation.
+  fields included; behind a pointer, reading one is a separate unsafe operation. No read through a
+  pointer produces a value that holds `Never`, named types' fields included
+  (`unsafe_read_cannot_produce_never`); a generic read at a `T` instantiated with one is the caller's
+  obligation (`lib/std/CONTRACTS.md`, section 2.3).
 - **Generic code over linear types.** A type parameter may stand for a linear type unless a premise
   says `Copy[T]`. Using a value twice, or dropping it on one path (`a && b` drops `b` when `a` is
   false), needs `Copy[T]`. The arena collections (`ArenaVec`, `ArenaMap`, `ArenaSet`, `List`) require

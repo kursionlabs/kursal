@@ -75,6 +75,16 @@ REJECTED = {
     "deref_to_never": ("unsafe_read_cannot_produce_never", """
         (fun (unsafe) h u32 ((ptr !)) (entry ((%p (ptr !)))
           (= %n (ptr_load %p)) (unreachable)))"""),
+    # Nor a value that holds Never: a named type's fields are its value.
+    "deref_to_struct_holding_never": ("unsafe_read_cannot_produce_never", """
+        (type L! (struct (a u32)))
+        (type S (struct (n !)))
+        (fun (unsafe) h u32 (L! (ptr S)) (entry ((%l L!) (%p (ptr S)))
+          (= %s (ptr_load %p)) (= %n (destruct %s S)) (unreachable)))"""),
+    "deref_to_tuple_holding_never": ("unsafe_read_cannot_produce_never", """
+        (type L! (struct (a u32)))
+        (fun (unsafe) h u32 (L! (ptr (tuple !))) (entry ((%l L!) (%p (ptr (tuple !))))
+          (= %s (ptr_load_volatile %p)) (= %n (destruct %s (tuple !))) (unreachable)))"""),
     "cast_to_static_brand": ("unsafe_cast_cannot_produce", """
         (fun (unsafe) h (brand $static) (u32)
           (entry ((%x u32)) (= %b (cast %x (brand $static))) (ret %b)))"""),
@@ -262,6 +272,15 @@ class CoreSoundnessTests(unittest.TestCase):
                    (= %o (open %k ($t)))
                    (= (%x %y) (destruct %o (tuple (brand $t) (brand $p0))))
                    (= %r (const u32 0)) (ret %r))))""",
+            # A generic read is checked at its type parameter, not at what instantiates it: that a read
+            # through a pointer never produces Never, here at `rd[!]`, is the unsafe read's obligation
+            # (lib/std/CONTRACTS.md, section 2.3), which nothing checks.
+            """(type L! (struct (a u32)))
+               (fun (unsafe) rd (forall (T) () T ((ptr T)) (entry ((%p (ptr T))) (= %v (ptr_load %p)) (ret %v))))
+               (fun (unsafe) h u32 (L! (ptr !)) (entry ((%l L!) (%p (ptr !))) (= %n (call (rd !) %p)) (unreachable)))""",
+            # A pointer read out of memory is a value; what it points at is not.
+            """(type S (struct (n !)))
+               (fun (unsafe) h (ptr S) ((ptr (ptr S))) (entry ((%p (ptr (ptr S)))) (= %q (ptr_load %p)) (ret %q)))""",
             # A cast of a type holding itself in an array of length 0, which holds no value.
             """(type R (struct (a (array R 0)) (b u32)))
                (fun (unsafe) h (tuple u64 R) ((tuple u64 R)) (entry ((%t (tuple u64 R)))

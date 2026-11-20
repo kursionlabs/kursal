@@ -20,7 +20,7 @@ use std::mem::Ref;
 use std::raw::Span;
 use std::arena::{Domain!, seed};
 use std::buffer::Buffer!;
-use package::check::checker::overlap;
+use package::check::checker::{contains, is_never, overlap};
 use package::kurs::core::{Block, Data, Edge, Extern, Fun, Instance, Instr, Kind, ModuleId, Param, Program, Terminator, Type};
 use package::kurs::core as C;
 use package::infer::inference::{Callee, Capture, Results, infer, pointer_params};
@@ -593,11 +593,11 @@ impl FnLower['k] {
     }
 
     // The core's rules for an unsafe operation on memory, which an `unsafe` marker does not lift: a
-    // read through a pointer does not produce Never; a cast does not conjure what only a checked
-    // operation makes, nor reinterpret a layout the compiler chooses, nor take or produce a zero-size
-    // type, which has no representation to reinterpret; an atomic operation works on an integer, a bool
-    // or a pointer. A load or store of a zero-size type reads and writes nothing, and `alloca` of one is
-    // not null.
+    // read through a pointer does not produce a value that holds Never; a cast does not conjure what
+    // only a checked operation makes, nor reinterpret a layout the compiler chooses, nor take or
+    // produce a zero-size type, which has no representation to reinterpret; an atomic operation works
+    // on an integer, a bool or a pointer. A load or store of a zero-size type reads and writes
+    // nothing, and `alloca` of one is not null.
     fn memory_operation(self, &cx: Domain!['k], o: Op['k], pos: Pos) {
         let target = if o.args.is_empty(&cx) { Option::None } else { self.vty.get(&cx, o.args.at(&cx, 0usize)) };
         let pointee = match target {
@@ -610,9 +610,8 @@ impl FnLower['k] {
         let op = o.name;
         if op.is(&cx, "ptr_load") || op.is(&cx, "ptr_load_volatile") {
             match pointee {
-                Option::Some(inner) => match inner {
-                    Type::Never => self.fail(&cx, Span::from_static(&cx, "an unsafe read cannot produce Never"), pos),
-                    _ => (),
+                Option::Some(inner) => if contains(&cx, self.lowering.types, inner, |&cx, t: Type['k]| is_never(t)) {
+                    self.fail(&cx, Span::from_static(&cx, "an unsafe read cannot produce a value that holds Never"), pos);
                 },
                 Option::None => (),
             };
@@ -636,13 +635,14 @@ impl FnLower['k] {
     }
 
     fn cast_operation(self, &cx: Domain!['k], from: Type['k], to: Type['k], pos: Pos) {
-        if self.holds_uncastable(&cx, from) || self.holds_uncastable(&cx, to) {
+        let types = self.lowering.types;
+        if contains(&cx, types, from, |&cx, t: Type['k]| self.uncastable(&cx, t))
+            || contains(&cx, types, to, |&cx, t: Type['k]| self.uncastable(&cx, t)) {
             self.fail(&cx, Span::from_static(&cx, "an unsafe cast cannot produce or take apart a package, a brand witness, a function value, a transform, a value of a type parameter or Never"), pos);
         }
-        if self.lowering.types.zero_size(&cx, from) || self.lowering.types.zero_size(&cx, to) {
+        if types.zero_size(&cx, from) || types.zero_size(&cx, to) {
             self.fail(&cx, Span::from_static(&cx, "a zero-size type has no memory form"), pos);
         }
-        let types = self.lowering.types;
         if is_non_null(from) || is_non_null(to) {
             if !(is_pointer(from) && is_pointer(to)) {
                 self.fail(&cx, Span::from_static(&cx, "an unsafe cast converts a NonNull only to or from a pointer"), pos);
@@ -669,13 +669,10 @@ impl FnLower['k] {
         }
     }
 
-    // Whether what no unsafe cast may conjure is in the value representation of `ty`, or in the
-    // arguments of a named type in it: a package, a brand witness, a function value, a transform, a
-    // value of a type parameter, or Never. A named type is unfolded too, since its fields are its
-    // value; a pointer's target is not part of it, nor is the element of an array of length 0, which
-    // holds no value (and may be the type itself).
-    fn holds_uncastable(self, &cx: Domain!['k], ty: Type['k]) -> bool {
-        let here = match ty {
+    // What no unsafe cast may conjure in a value: a package, a brand witness, a function value, a
+    // transform, a value of a type parameter, or Never.
+    fn uncastable(self, &cx: Domain!['k], ty: Type['k]) -> bool {
+        match ty {
             Type::Exists(_binders, _body) => true,
             Type::Brand(_brand) => true,
             Type::Fn(_f) => true,
@@ -683,31 +680,6 @@ impl FnLower['k] {
             Type::Never => true,
             Type::Named(name, args) => args.is_empty(&cx) && self.kinds.contains(&cx, name),
             _ => false,
-        };
-        if here {
-            return true;
-        }
-        match ty {
-            Type::Ptr(_inner) => false,
-            Type::NonNull(_inner) => false,
-            Type::Array(elem, length) => length != 0u64 && self.holds_uncastable(&cx, elem.copy(&cx)),
-            _ => {
-                let parts = children(&cx, ty);
-                var found = false;
-                var i = 0usize;
-                while !found && i < parts.len(&cx) {
-                    found = self.holds_uncastable(&cx, parts.at(&cx, i));
-                    i = i + 1usize;
-                }
-                if found {
-                    return true;
-                }
-                let types = self.lowering.types;
-                match ty {
-                    Type::Named(name, _args) => types.program.types.contains(&cx, name) && self.holds_uncastable(&cx, types.shape(&cx, ty, Option::None)),
-                    _ => false,
-                }
-            },
         }
     }
 

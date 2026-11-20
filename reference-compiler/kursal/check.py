@@ -895,7 +895,7 @@ class Checker:
         t = self.use(instr.args[0])
         if not isinstance(t, Ptr):
             self.fail("ptr_load_non_pointer")
-        if isinstance(t.inner, Never):
+        if contains(self.types, t.inner, lambda ty: isinstance(ty, Never)):
             self.fail("unsafe_read_cannot_produce_never")
         return t.inner
 

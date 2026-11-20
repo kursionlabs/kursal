@@ -250,15 +250,16 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
 
     def memory_operation(self, op: str, args: Sequence[str], ty: Optional[C.Type], pos: Optional[Position]) -> None:
         """The core's rules for an unsafe operation on memory, which an `unsafe` marker does not lift: a read
-        through a pointer does not produce Never; a cast does not conjure what only a checked operation
-        makes, nor reinterpret a layout the compiler chooses, nor take or produce a zero-size type, which has
-        no representation to reinterpret; an atomic operation works on an integer, a bool or a pointer. A
-        load or store of a zero-size type reads and writes nothing, and `alloca` of one is not null."""
+        through a pointer does not produce a value that holds Never; a cast does not conjure what only a
+        checked operation makes, nor reinterpret a layout the compiler chooses, nor take or produce a
+        zero-size type, which has no representation to reinterpret; an atomic operation works on an integer,
+        a bool or a pointer. A load or store of a zero-size type reads and writes nothing, and `alloca` of
+        one is not null."""
         target = self.vty.get(args[0]) if args else None
         pointee = target.inner if isinstance(target, C.Ptr) else None
         if op in ("ptr_load", "ptr_load_volatile"):
-            if isinstance(pointee, C.Never):
-                fail("an unsafe read cannot produce Never", pos)
+            if pointee is not None and contains(self.types, pointee, lambda t: isinstance(t, C.Never)):
+                fail("an unsafe read cannot produce a value that holds Never", pos)
         elif op == "cast" and target is not None and ty is not None:
             if any(contains(self.types, t, self.uncastable) for t in (target, ty)):
                 fail("an unsafe cast cannot produce or take apart a package, a brand witness, a function value, "
