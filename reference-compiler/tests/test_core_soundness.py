@@ -262,6 +262,10 @@ class CoreSoundnessTests(unittest.TestCase):
                    (= %o (open %k ($t)))
                    (= (%x %y) (destruct %o (tuple (brand $t) (brand $p0))))
                    (= %r (const u32 0)) (ret %r))))""",
+            # A cast of a type holding itself in an array of length 0, which holds no value.
+            """(type R (struct (a (array R 0)) (b u32)))
+               (fun (unsafe) h (tuple u64 R) ((tuple u64 R)) (entry ((%t (tuple u64 R)))
+                 (= %s (cast %t (tuple u64 R))) (ret %s)))""",
             # Pointer projection at the pointer's own type.
             """(type S (struct (a u32)))
                (fun h u32 ((ptr S)) (entry ((%p (ptr S)))

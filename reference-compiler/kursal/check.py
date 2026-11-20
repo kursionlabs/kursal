@@ -37,10 +37,11 @@ SEALED = {"Copy", "Exposed"}      # compiler-reserved trait names: no user trait
 
 def contains(types: Types, ty: Type, pred: Callable[[Type], bool]) -> bool:
     """`pred` holds somewhere in the value representation of `ty`, or in the arguments of a named type in
-    it. A named type is unfolded too, since its fields are its value; a pointer's target is not part of it."""
+    it. A named type is unfolded too, since its fields are its value; a pointer's target is not part of it,
+    nor is the element of an array of length 0, which holds no value (and may be the type itself)."""
     if pred(ty):
         return True
-    if isinstance(ty, (Ptr, NonNull)):
+    if isinstance(ty, (Ptr, NonNull)) or isinstance(ty, Array) and ty.length == 0:
         return False
     if any(contains(types, t, pred) for t in children(ty)):
         return True

@@ -55,6 +55,13 @@ class CastTypingTests(unittest.TestCase):
             if unsafe (true as u32) == 1u32 { rebuilt.0 } else { 0i32 }
         }''', 7)
 
+    def test_a_type_holding_itself_in_an_empty_array_is_cast(self):
+        # An array of length 0 holds no value: the walks for what a cast may not take or make, and for a
+        # layout the compiler chooses, stop there instead of unfolding the type again.
+        self.run_source('''struct R { a: [R; 0], b: u32 }
+            fn same(x: (u64, R)) -> (u64, R) { unsafe (x as (u64, R)) }
+            fn main() -> i32 { 7i32 }''', 7)
+
     def test_authorization_does_not_extend_to_nested_casts(self):
         with self.assertRaisesRegex(LowerError, 'unsafe'):
             self.run_source('fn bad(x: bool) -> bool { unsafe ((x as u32) as bool) } '

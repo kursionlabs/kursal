@@ -333,12 +333,12 @@ class Types:
 
     def chosen_layout(self, ty: Type) -> bool:
         """The compiler chooses how `ty`'s value is laid out: an enum or a `NonNull` is in its value
-        representation (named types unfolded; not through a pointer or a function; a type parameter is a
-        leaf)."""
+        representation (named types unfolded; not through a pointer, a function or an array of length 0,
+        which holds no value; a type parameter is a leaf)."""
         match ty:
             case Enum() | NonNull():
                 return True
-            case Ptr() | Fn() | Brand():
+            case Ptr() | Fn() | Brand() | Array(length=0):
                 return False
             case Named(args=()) if ty.name not in self.program.types:
                 return False
