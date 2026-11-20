@@ -83,8 +83,7 @@ class Lowering:
 
     def __init__(self, resolver: Resolver, sigs: Signatures) -> None:
         self.r, self.sigs = resolver, sigs
-        self.program = LoweredProgram(types=sigs.types, traits=sigs.traits,
-                                      files={m: str(f) for p in resolver.packages for m, f in p.files.items()})
+        self.program = LoweredProgram(types=sigs.types, traits=sigs.traits)
         self.types = Types(self.program)
         self.datas: dict[bytes, str] = {}
         self.closures = count()
@@ -250,28 +249,22 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         return name
 
     def memory_operation(self, op: str, args: Sequence[str], ty: Optional[C.Type], pos: Optional[Position]) -> None:
-        """The core's rules for an unsafe operation on memory, which an `unsafe` marker does not lift: a
-        zero-size type has no memory form to allocate, read, write or cast; a read through a pointer does
-        not produce Never; a cast does not conjure what only a checked operation makes, nor reinterpret a
-        layout the compiler chooses; an atomic operation works on an integer, a bool or a pointer."""
-        def memory_form(t: C.Type) -> None:
-            if self.types.zero_size(t):
-                fail("a zero-size type has no memory form", pos)
-
+        """The core's rules for an unsafe operation on memory, which an `unsafe` marker does not lift: a read
+        through a pointer does not produce Never; a cast does not conjure what only a checked operation
+        makes, nor reinterpret a layout the compiler chooses, nor take or produce a zero-size type, which has
+        no representation to reinterpret; an atomic operation works on an integer, a bool or a pointer. A
+        load or store of a zero-size type reads and writes nothing, and `alloca` of one is not null."""
         target = self.vty.get(args[0]) if args else None
         pointee = target.inner if isinstance(target, C.Ptr) else None
-        if op == "alloca" and ty is not None:
-            memory_form(ty)
-        elif op in ("ptr_load", "ptr_load_volatile", "ptr_store", "ptr_store_volatile") and pointee is not None:
-            if op.startswith("ptr_load") and isinstance(pointee, C.Never):
+        if op in ("ptr_load", "ptr_load_volatile"):
+            if isinstance(pointee, C.Never):
                 fail("an unsafe read cannot produce Never", pos)
-            memory_form(pointee)
         elif op == "cast" and target is not None and ty is not None:
             if any(contains(t, self.uncastable) for t in (target, ty)):
                 fail("an unsafe cast cannot produce or take apart a package, a brand witness, a function value, "
                      "a transform, a value of a type parameter or Never", pos)
-            memory_form(target)
-            memory_form(ty)
+            if self.types.zero_size(target) or self.types.zero_size(ty):
+                fail("a zero-size type has no memory form", pos)
             if isinstance(target, C.NonNull) or isinstance(ty, C.NonNull):
                 if not (isinstance(target, (C.Ptr, C.NonNull)) and isinstance(ty, (C.Ptr, C.NonNull))):
                     fail("an unsafe cast converts a NonNull only to or from a pointer", pos)

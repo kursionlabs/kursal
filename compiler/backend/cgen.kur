@@ -19,7 +19,7 @@ use std::raw::Span;
 use std::arena::Domain!;
 use std::buffer::Buffer!;
 use package::check::checker::{FunKey, matching_instance};
-use package::kurs::core::{Arm, Binding, Block, Data, Edge, Fun, ForeachType, Instr, Kind, Member, ModuleId, Param, Program, Terminator, Type, same};
+use package::kurs::core::{Arm, Binding, Block, Data, Edge, Fun, ForeachType, Instr, Kind, Member, Param, Program, Terminator, Type, same};
 use package::kurs::core as C;
 use package::backend::plan::{Adapter, Plan, is_member, is_place, is_pure, root, term_edges, term_reads, value_read};
 use package::check::checker::{overlap, prefix};
@@ -27,7 +27,7 @@ use package::backend::mangle::{decode_segment, encode, mangle, path_segments, ty
 use package::kurs::sexpr::Form;
 use package::syntax::ast::{Pos, no_pos};
 use package::types::termination::check_mono_termination;
-use package::types::ops::{Fresh, Row, Types, alpha_hashes, equal, foreach_binders, kurs_error, kurs_error_in, map_children, subst, subst_foreach};
+use package::types::ops::{Fresh, Row, Types, alpha_hashes, equal, foreach_binders, kurs_error, map_children, subst, subst_foreach};
 use std::option::Option;
 use std::slice::Slice;
 use std::time::Instant;
@@ -570,11 +570,6 @@ exposed struct Backend {
     // Whether a resolved type is passed indirectly in C, shared across function specializations.
     by_pointer_cache: ArenaMap[Type['k], bool, 'k],
     queue: ArenaVec[(FunKey['k], Fun['k], ArenaMap[Span['k], Type['k], 'k], Span['k]), 'k],
-    // symbol -> the request that made it: the function asking (its symbol and module), where it asked,
-    // and the specialization's type arguments (`zero_size_error`); none for a root
-    origins: ArenaMap[Span['k], (Span['k], Option[ModuleId['k]], Pos, ArenaVec[Type['k], 'k]), 'k],
-    // where in the function being emitted the instruction being emitted is
-    at: Ref[Pos, 'k],
     // Each function in order: its symbol, when its head waits for `qualifiers`, else its head; its body;
     // and the file of a split build it goes to (`module_file`), empty for a thunk.
     emitted: ArenaVec[(Option[Span['k]], Span['k], Span['k], Span['k]), 'k],
@@ -747,8 +742,6 @@ impl Backend['k] {
             signature_keys: ArenaMap::new(&cx),
             by_pointer_cache: ArenaMap::new(&cx),
             queue: ArenaVec::new(&cx),
-            origins: ArenaMap::new(&cx),
-            at: Ref::new(&cx, no_pos()),
             emitted: ArenaVec::new(&cx),
             linkage: Span::from_static(&cx, if split { "" } else { "static " }),
             heads: ArenaMap::new(&cx),
@@ -1255,21 +1248,6 @@ impl Backend['k] {
         earlier.push(&cx, (args, symbol));
         self.symbol_index.insert(&cx, (key, args), symbol);
         self.queue.push(&cx, (key, fun, sub.clone(&cx), symbol));
-        match self.fun.copy(&cx) {
-            Option::Some(asking) => {
-                let typed: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
-                var q = 0usize;
-                while q < params.len(&cx) {
-                    match params.at(&cx, q).kind {
-                        Kind::Brand => (),
-                        _ => typed.push(&cx, args.at(&cx, q)),
-                    };
-                    q = q + 1usize;
-                }
-                let none = self.origins.insert(&cx, symbol, (self.symbol.copy(&cx), asking.home, self.at.copy(&cx), typed));
-            },
-            Option::None => (),
-        };
         let refs: ArenaVec[bool, 'k] = ArenaVec::new(&cx);
         let entry = fun.blocks.at(&cx, 0usize);
         var r = 0usize;
@@ -2890,7 +2868,6 @@ impl Backend['k] {
     // ------------------------------------------------------------- instructions --
 
     fn instr(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k]) {
-        self.at.set(&cx, instr.pos);
         let op = instr.op;
         let a = instr.args;
         // A pure instruction is written when the C reads one of its results: one that is live and not
@@ -2993,8 +2970,6 @@ impl Backend['k] {
             let value = self.value_name(&cx, a.at(&cx, 0usize));
             line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, self.convert(&cx, value, self.type_operand(&cx, instr))).push_static(";"));
         } else if op.is(&cx, "cast") {
-            self.has_memory_form(&cx, self.type_of(&cx, a.at(&cx, 0usize)), instr);
-            self.has_memory_form(&cx, self.type_operand(&cx, instr), instr);
             let value = self.value_name(&cx, a.at(&cx, 0usize));
             let src = self.type_of(&cx, a.at(&cx, 0usize));
             self.cast(&cx, &lines, d, value, src, self.type_operand(&cx, instr));
@@ -3007,9 +2982,14 @@ impl Backend['k] {
         } else if op.is(&cx, "fn") {
             line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, self.function_address(&cx, instr)).push_static(";"));
         } else if op.is(&cx, "alloca") {
-            self.has_memory_form(&cx, self.type_operand(&cx, instr), instr);
             let ct = self.c(&cx, self.type_operand(&cx, instr));
-            line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = (").push_bytes(&cx, ct).push_static("*)__builtin_alloca(sizeof(").push_bytes(&cx, ct).push_static("));"));
+            // A zero-size type has no bytes to reserve: its pointer is any one that is not null, aligned
+            // as `alignof` says (to 1).
+            if ct.is(&cx, "void") {
+                line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = (void*)(uintptr_t)1;"));
+            } else {
+                line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = (").push_bytes(&cx, ct).push_static("*)__builtin_alloca(sizeof(").push_bytes(&cx, ct).push_static("));"));
+            }
         } else if op.is(&cx, "sizeof") {
             let ct = self.c(&cx, self.type_operand(&cx, instr));
             if ct.is(&cx, "void") {
@@ -3023,18 +3003,16 @@ impl Backend['k] {
             line(&lines, Buffer!::new().push_static("KUR_TRAP();"));
         } else if op.is(&cx, "pack") || op.is(&cx, "open") {
             line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, self.value_name(&cx, a.at(&cx, 0usize))).push_static(";"));
+        } else if (op.is(&cx, "ptr_load") || op.is(&cx, "ptr_load_volatile") || op.is(&cx, "ptr_store") || op.is(&cx, "ptr_store_volatile"))
+                && self.erased(&cx, self.pointee(&cx, self.type_of(&cx, a.at(&cx, 0usize)))) {
+            // a zero-size value is read and written nowhere
         } else if op.is(&cx, "ptr_load") {
-            let inner = self.pointee(&cx, self.type_of(&cx, a.at(&cx, 0usize)));
-            self.has_memory_form(&cx, inner, instr);
             line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = *").push_bytes(&cx, self.value_name(&cx, a.at(&cx, 0usize))).push_static(";"));
         } else if op.is(&cx, "ptr_load_volatile") {
-            let inner = self.pointee(&cx, self.type_of(&cx, a.at(&cx, 0usize)));
-            self.has_memory_form(&cx, inner, instr);
-            let ct = self.c(&cx, inner);
+            let ct = self.c(&cx, self.pointee(&cx, self.type_of(&cx, a.at(&cx, 0usize))));
             line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = *(").push_bytes(&cx, ct).push_static(" volatile*)").push_bytes(&cx, self.value_name(&cx, a.at(&cx, 0usize))).push_static(";"));
         } else if op.is(&cx, "ptr_store") || op.is(&cx, "ptr_store_volatile") {
             let inner = self.pointee(&cx, self.type_of(&cx, a.at(&cx, 0usize)));
-            self.has_memory_form(&cx, inner, instr);
             let qual = if op.ends_with(&cx, Span::from_static(&cx, "volatile")) { Buffer!::new().push_static("(").push_bytes(&cx, self.c(&cx, inner)).push_static(" volatile*)").save(&cx) } else { Span::from_static(&cx, "") };
             let target = self.value_name(&cx, a.at(&cx, 0usize));
             line(&lines, Buffer!::new().push_static("*").push_bytes(&cx, qual).push_bytes(&cx, target).push_static(" = ").push_bytes(&cx, self.value_name(&cx, a.at(&cx, 1usize))).push_static(";"));
@@ -3065,85 +3043,6 @@ impl Backend['k] {
         match pointer {
             Type::Ptr(inner) => inner.copy(&cx),
             _ => fail_text(&cx, Span::from_static(&cx, "internal error: a pointer operation on a value that is not a pointer")),
-        }
-    }
-
-    // The checker's zero-size rule, for types a specialization chose.
-    fn has_memory_form(self, &cx: Domain!['k], ty: Type['k], instr: Instr['k]) {
-        if self.types.zero_size(&cx, ty) {
-            self.zero_size_error(&cx, instr.pos);
-        }
-    }
-
-    // A zero-size type a specialization chose reaches a memory operation at `pos` of the function being
-    // emitted: the error is at the call that chose it, in its file. The requests that made the
-    // specialization are followed back while each was made with a zero-size type argument, to the call
-    // that made the first of them, and the operation is named beside it.
-    fn zero_size_error(self, &cx: Domain!['k], pos: Pos) -> ! {
-        let inner = match self.fun.copy(&cx) {
-            Option::Some(f) => f.home,
-            Option::None => Option::None,
-        };
-        let failing = self.symbol.copy(&cx);
-        var symbol = failing;
-        var home = inner;
-        var at = pos;
-        var walking = true;
-        while walking {
-            match self.origins.get(&cx, symbol) {
-                Option::Some(origin) => {
-                    let (caller, caller_home, call_at, args) = origin;
-                    var chosen = false;
-                    var a = 0usize;
-                    while !chosen && a < args.len(&cx) {
-                        chosen = self.types.zero_size(&cx, args.at(&cx, a));
-                        a = a + 1usize;
-                    }
-                    if chosen {
-                        symbol = caller;
-                        home = caller_home;
-                        at = call_at;
-                    } else {
-                        walking = false;
-                    }
-                },
-                Option::None => {
-                    walking = false;
-                },
-            };
-        }
-        var message = Buffer!::new().push_static("a zero-size type has no memory form");
-        if !symbol.eq(&cx, failing) {
-            message = message.push_static(", and this call reaches a read or write of one through a pointer at ")
-                .push_bytes(&cx, self.where_in(&cx, inner, pos));
-        }
-        let text = message.save(&cx);
-        match self.file_of(&cx, home) {
-            Option::Some(file) => kurs_error_in(&cx, text, file, at),
-            Option::None => kurs_error(&cx, text, at),
-        }
-    }
-
-    // The source file of `home`, when the program knows it.
-    fn file_of(self, &cx: Domain!['k], home: Option[ModuleId['k]]) -> Option[Span['k]] {
-        match home {
-            Option::Some(m) => self.program.files.get(&cx, m),
-            Option::None => Option::None,
-        }
-    }
-
-    // `pos` in the module `home`, with its file when the program knows it.
-    fn where_in(self, &cx: Domain!['k], home: Option[ModuleId['k]], pos: Pos) -> Span['k] {
-        let place = if pos.line == 0u32 {
-            Span::from_static(&cx, "")
-        } else {
-            Buffer!::new().push_u64(pos.line as u64).push_static(":").push_u64(pos.col as u64).save(&cx)
-        };
-        match self.file_of(&cx, home) {
-            Option::Some(file) => if place.is_empty() { file } else {
-                Buffer!::new().push_bytes(&cx, file).push_static(":").push_bytes(&cx, place).save(&cx)
-            },
-            Option::None => place,
         }
     }
 
@@ -4304,7 +4203,6 @@ impl Backend['k] {
     // A call whose result its block returns (`Plan::tail_call`), as a jump when the C allows one: see
     // `tail_call` in cgen.py. Returns whether it wrote the call; otherwise the block is written as usual.
     fn tail_call(self, &cx: Domain!['k], &lines: Buffer!, call: Instr['k]) -> bool {
-        self.at.set(&cx, call.pos);
         let a = call.args;
         let (key, fun, sub, args) = if call.op.is(&cx, "call") {
             let name = a.at(&cx, 0usize);

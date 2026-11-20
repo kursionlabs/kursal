@@ -29,7 +29,9 @@
 // holds `*K`/`*V`, never `K`/`V` inline. A generic type parameter is not
 // provably Copy, so an inline `key: K` could not be read out of a shared
 // `Entry` and compared more than once in this generic code, whereas a raw
-// pointer is always Copy.
+// pointer is always Copy. A zero-size key or value (the `()` of a set,
+// `OwnedMap![K, ()]`) takes no allocation: its pointer is a non-null address
+// that addresses no block, through which it is read and written as nothing.
 //
 // Brand policy: `insert`, `remove` and `clear`, and the `_in` forms, always
 // return a fresh `Exclusive!['2]`, minted by `Allocation!::adopt` and sealed
@@ -47,7 +49,7 @@ use alloc::heap::Uninit!;
 use alloc::heap::{AllocError, HeapAllocator, Storage, abort};
 use alloc::heap::checked_mul;
 use core::cap::Exclusive!;
-use core::mem::{Ref, sizeof};
+use core::mem::{Ref, alignof, sizeof};
 use core::ptr::{null, is_null, offset};
 use alloc::owned::Allocation!;
 use core::mem::Region!;
@@ -128,20 +130,28 @@ unsafe fn alloc_buckets(n: usize) -> (Uninit!, *(*Entry[K, V])) {
 }
 
 /// A single value in its own allocation; used for both keys and values
-/// (see the header for why neither lives inline in `Entry`).
+/// (see the header for why neither lives inline in `Entry`). A zero-size
+/// value has no allocation: its pointer is its alignment, not null and
+/// addressing nothing, as `free_one` expects.
 forall T.
 unsafe fn alloc_one(v: T) -> *T {
-    let u = HeapAllocator::alloc(sizeof[T]());
-    let raw = u.into_raw();
-    let p = unsafe (raw as *T);
+    let p = if sizeof[T]() == 0usize {
+        unsafe (alignof[T]() as *T)
+    } else {
+        let raw = HeapAllocator::alloc(sizeof[T]()).into_raw();
+        unsafe (raw as *T)
+    };
     unsafe *p = v;
     p
 }
 
+/// Frees what `alloc_one` allocated for `p`: nothing for a zero-size value.
 forall T.
 unsafe fn free_one(p: *T) -> () {
-    let raw = unsafe (p as *u8);
-    HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(raw))
+    if sizeof[T]() != 0usize {
+        let raw = unsafe (p as *u8);
+        HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(raw));
+    }
 }
 
 forall K, V.

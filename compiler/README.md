@@ -591,27 +591,29 @@ There is no `KurUnit` and no adapter for foreign functions returning `()`: a for
 function is its own function pointer. A function that takes and returns only zero-size values is
 `static void f(void)`, and a call of it still runs it.
 
-The language keeps its zero-size types out of memory, so erasing them never changes what a
-program reads or writes. `alloca`, the unsafe loads and stores (volatile or not), unsafe casts from
-or to one, extern parameters and extern values reject a zero-size type
+Erasing them never changes what a program reads or writes: a zero-size value has no bytes to read
+or write. So a load or store of one through a pointer (`ptr_load`, `ptr_store`, volatile or not)
+writes no C, and `alloca` of one gives `(void*)(uintptr_t)1`, a pointer that is not null and is
+aligned as `alignof` says (1), with nothing behind it. Generic code therefore builds at a zero-size
+type argument wherever it type-checks: `Ref::new(&cx, ())`, `ArenaVec[(), 'k]`, `OwnedVec![()]`,
+`OwnedMap![K, ()]` and `Owned!::new(())` read and write their elements through pointers, and those
+reads and writes are of nothing. Three operations still reject a zero-size type
 (`zero_size_type_has_no_memory_form`), as the front end does first, at the source (`a zero-size type
-has no memory form`), and so does the backend where a specialization chooses one. So `Ref::new(&cx, ())`, `ArenaVec[(), 'k]` and a
-`Vec![Marker]` do not build: they read and write their elements through pointers; an element that
-holds a zero-size part beside bytes (`ArenaVec[(Marker, u32), 'k]`) does. The backend reports such
-an operation at the call that chose the type, in its file (`Program.files`): it follows back the
-requests that made the specialization while each was made with a zero-size type argument, and names
-the operation beside it (`zero_size_error`), as `lib.kur:7:9: a zero-size type has no memory form,
-and this call reaches a read or write of one through a pointer at .../alloc/collections/vec.kur:166:9`. `sizeof` is the one
-operation that observes a zero-size type, and it is 0; the arithmetic the standard library does
-with sizes is defined at 0 (`checked_mul` does not divide by it, `bump_chunk` reserves no bytes and
-returns the current address, `HeapAllocator::alloc(0)` asks `malloc` for one byte so that it is
-never null).
+has no memory form`): an unsafe cast from or to one, which reinterprets a representation it does not
+have; and an extern parameter or extern value of one, which C has no form for. None of them can
+take a type parameter (a cast cannot take or produce a value of one, and an extern is not generic),
+so no specialization meets them, and the backend has no zero-size rule of its own. An atomic
+operation works on an integer, a bool or a pointer, never a zero-size type. `sizeof` of a zero-size
+type is 0, and the arithmetic the standard library does with sizes is defined at 0 (`checked_mul`
+does not divide by it, `bump_chunk` reserves no bytes and returns the current address,
+`HeapAllocator::alloc(0)` asks `malloc` for one byte so that it is never null, a `Vec!` of zero-size
+elements has capacity `usize::MAX` and never grows, and `HashMap!` allocates no box for a zero-size
+key or value; `lib/std/CONTRACTS.md`, "Zero sizes").
 
 Two zero-size objects may share an address, with each other and with what holds them. Nothing relies on distinct addresses for zero-size data: the identities the
 compiler and the standard library compare (`Ref::address`, `ArenaVec::address` and
 `ArenaMap::address`, which `Meta::id`, `fun_key` and the checker's copy cache use, and `Span`'s
-equal-address shortcut) are addresses of headers and states that have bytes, and a `Ref` to a
-zero-size value cannot be read, so it cannot be built by `Ref::new`.
+equal-address shortcut) are addresses of headers and states that have bytes.
 
 ### Enum layout: tags and niches
 
@@ -836,8 +838,8 @@ These are the places where Kursal differs from what one might expect.
   (or `n.as_ptr()`) is safe, and `==` compares two. Its niche makes `Option[NonNull[T]]` and
   `Option[Ref[T, 'k]]` one word (see "Enum layout").
 - **Zero-size types** (`()`, empty structs, brands, capabilities) take no bytes (`sizeof` is 0, see
-  "Zero-size types are erased") and have no memory form: no `Ref`, vec or map stores one as a whole
-  value. Use `bool` as a placeholder value (`ArenaSet` is an `ArenaMap[K, bool]`).
+  "Zero-size types are erased"); a `Ref`, vec or map of one stores nothing, so `OwnedMap![K, ()]` is
+  a set.
 - **Expressions as statements.** `f(x);` discards a Copy result. A block's value is its last
   expression, without a `;`. `return` is allowed anywhere; a function whose type is `!` (such as
   `fail`) can stand in any expression position.

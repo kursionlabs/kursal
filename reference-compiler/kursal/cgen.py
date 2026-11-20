@@ -7,9 +7,9 @@ Representation erasure is separate from code-specialization identity.
 A zero-size type (`Types.zero_size`: unit, brand witnesses, Never, products of zero-size components,
 arrays of length 0 or of zero-size elements) has no C representation: its C type is `void` (`erased`),
 and no struct member, parameter, local, argument or assignment has it. A function returning one
-returns `void`; constructing, destructuring, copying, loading or storing one writes nothing; a pointer
-to one is a `void*`. The one C object a zero-size type gets is a `data` of it, whose address the
-program observes: a `char`.
+returns `void`; constructing, destructuring, copying, loading or storing one, in a place or through a
+pointer, writes nothing; a pointer to one is a `void*`, and `alloca` of one is `(void*)1`. The one C
+object a zero-size type gets is a `data` of it, whose address the program observes: a `char`.
 
 An enum is a tag and a union of its payloads, or, in the niche layout (`Types.niche_variant`), its one
 payload with a niche, the other variant a null there (`niche_layout`, `tag`, `payload`, `set_variant`).
@@ -26,13 +26,13 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 import re
-from typing import NoReturn, Optional
+from typing import Optional
 
-from .core import (ATOMIC_OPS, BRAND, FLOATS, INTEGERS, POINTER_SIZED, UNIT, WIDTHS, Array, Block, Brand, Enum, Exists, Fn,
+from .core import (ATOMIC_OPS, FLOATS, INTEGERS, POINTER_SIZED, UNIT, WIDTHS, Array, Block, Brand, Enum, Exists, Fn,
                    Foreach, Ignored, Jmp, Jnz, Named, Never, NonNull, Param, Prim, Ptr, Ret, Skolem, Struct, Switch,
-                   Tuple, Unreachable, Type, Program, Fun, Data, Instr, Edge, Terminator, ModuleId)
+                   Tuple, Unreachable, Type, Program, Fun, Data, Instr, Edge, Terminator)
 from .check import Checker, overlap, prefix
-from .sexpr import Form, KursError, List, Position, Str, located
+from .sexpr import Form, KursError, List, Str
 from .types import foreach_binders, ForeachRow, Types, equal, map_children, subst, subst_foreach
 from .termination import check_mono_termination
 from .mangle import encode, mangle, path_segments, type_key, unbranded
@@ -157,11 +157,6 @@ class Backend:
         self.defs: list[str] = []
         self.symbols: dict[int, list[tuple[tuple[Type, ...], str]]] = {}  # function -> its specializations' unbranded arguments and C symbols
         self.queue: list[tuple[Fun, Mapping[str, Type], str]] = []
-        # symbol -> the request that made it: the function asking (its symbol and module), where it asked,
-        # and the specialization's type arguments (`zero_size_error`); none for a root
-        self.origins: dict[str, tuple[str, Optional[ModuleId], Optional[Position], tuple[Type, ...]]] = {}
-        self.asking: Optional[tuple[str, Optional[ModuleId]]] = None     # the function being emitted: symbol, module
-        self.at: Optional[Position] = None      # where in it the instruction being emitted is
         # Each function in order: its symbol, when its head waits for `qualifiers`, else its head; its body.
         self.emitted: list[tuple[Optional[str], str, str]] = []
         # symbol -> its C result, whether it never returns, and its parameters: (C type, C name, whether a
@@ -403,9 +398,6 @@ class Backend:
                                                   *(type_key(t) for t in args))))
         self.symbols.setdefault(id(fun), []).append((args, symbol))
         self.queue.append((fun, dict(sub), symbol))
-        if self.asking is not None:
-            typed = tuple(a for p, a in zip(params, args) if p.kind != BRAND)
-            self.origins[symbol] = (*self.asking, self.at, typed)
         self.by_ref[symbol] = tuple(not name.startswith("&") and self.by_pointer(subst(ty, sub))
                                     for name, ty in fun.blocks[0].params)
         result = self.shape(subst(fun.ret, sub))
@@ -610,7 +602,6 @@ class Backend:
 
     def emit_function(self, fun: Fun, sub: Mapping[str, Type], symbol: str) -> None:
         self.fun, self.sub, self.symbol = fun, sub, symbol
-        self.asking = (symbol, fun.module)
         components: dict[tuple[str, int], tuple[str, ...]] = {}
         shapes: dict[tuple[str, int], Type] = {}
         adapters: dict[str, Adapter] = {}
@@ -1023,7 +1014,6 @@ class Backend:
 
     def instr(self, instr: Instr) -> None:
         op, a = instr.op, instr.args
-        self.at = instr.pos
         # A pure instruction is written when the C reads one of its results: one that is live and not of a
         # zero-size type (so never `static_brand`, `fresh`, nor `pack` and `open` of a place).
         if op in PURE and not any(self.is_live(name) and not self.erased(self.type_of(name)) for name in instr.lhs):
@@ -1074,8 +1064,6 @@ class Backend:
         elif op == "int_cast":
             self.line(f"{dst} = {self.convert(self.value_name(a[0]), self.type_operand(instr))};")
         elif op == "cast":
-            self.has_memory_form(self.type_of(a[0]), instr)
-            self.has_memory_form(self.type_operand(instr), instr)
             assert dst is not None
             self.cast(dst, self.value_name(a[0]), self.type_of(a[0]), self.type_operand(instr))
         elif op in C_OPS or op in ("shl", "shr"):
@@ -1088,9 +1076,11 @@ class Backend:
         elif op == "fn":
             self.line(f"{dst} = {self.function_address(instr)};")
         elif op == "alloca":
-            self.has_memory_form(self.type_operand(instr), instr)
             ct = self.ctype(self.type_operand(instr))
-            self.line(f"{dst} = ({ct}*)__builtin_alloca(sizeof({ct}));")
+            # A zero-size type has no bytes to reserve: its pointer is any one that is not null, aligned as
+            # `alignof` says (to 1).
+            self.line(f"{dst} = (void*)(uintptr_t)1;" if ct == "void" else
+                      f"{dst} = ({ct}*)__builtin_alloca(sizeof({ct}));")
         elif op == "sizeof":
             ct = self.ctype(self.type_operand(instr))
             self.line(f"{dst} = UINT64_C(0);" if ct == "void" else f"{dst} = (uintptr_t)sizeof({ct});")
@@ -1100,21 +1090,15 @@ class Backend:
             self.line("KUR_TRAP();")
         elif op in ("pack", "open"):
             self.line(f"{dst} = {self.value_name(a[0])};")
+        elif op in ("ptr_load", "ptr_load_volatile", "ptr_store", "ptr_store_volatile") and \
+                self.erased(self.pointee(a[0])):
+            pass    # a zero-size value is read and written nowhere
         elif op == "ptr_load":
-            pointer = self.type_of(a[0])
-            assert isinstance(pointer, Ptr)
-            self.has_memory_form(pointer.inner, instr)
             self.line(f"{dst} = *{self.value_name(a[0])};")
         elif op == "ptr_load_volatile":
-            pointer = self.type_of(a[0])
-            assert isinstance(pointer, Ptr)
-            self.has_memory_form(pointer.inner, instr)
-            self.line(f"{dst} = *({self.ctype(pointer.inner)} volatile*){self.value_name(a[0])};")
+            self.line(f"{dst} = *({self.ctype(self.pointee(a[0]))} volatile*){self.value_name(a[0])};")
         elif op in ("ptr_store", "ptr_store_volatile"):
-            pointer = self.type_of(a[0])
-            assert isinstance(pointer, Ptr)
-            self.has_memory_form(pointer.inner, instr)
-            qual = f"({self.ctype(pointer.inner)} volatile*)" if op.endswith("volatile") else ""
+            qual = f"({self.ctype(self.pointee(a[0]))} volatile*)" if op.endswith("volatile") else ""
             self.line(f"*{qual}{self.value_name(a[0])} = {self.value_name(a[1])};")
         elif op in ATOMIC_OPS:
             self.atomic(instr, dst)
@@ -1131,41 +1115,11 @@ class Backend:
         else:
             raise KursError(f"no C recipe for {op}")
 
-    def has_memory_form(self, ty: Type, instr: Instr) -> None:
-        """The checker's zero-size rule, for types a specialization chose."""
-        if self.types.zero_size(ty):
-            self.zero_size_error(instr.pos)
-
-    def zero_size_error(self, pos: Optional[Position]) -> NoReturn:
-        """A zero-size type a specialization chose reaches a memory operation at `pos` of the function being
-        emitted: the error is at the call that chose it, in its file. The requests that made the
-        specialization are followed back while each was made with a zero-size type argument, to the call
-        that made the first of them, and the operation is named beside it."""
-        inner = self.fun.module
-        symbol, home, at = self.symbol, inner, pos
-        while symbol in self.origins:
-            caller, caller_home, call_at, args = self.origins[symbol]
-            if not any(self.types.zero_size(a) for a in args):
-                break
-            symbol, home, at = caller, caller_home, call_at
-        message = "a zero-size type has no memory form"
-        if symbol != self.symbol:
-            message += f", and this call reaches a read or write of one through a pointer at {self.where(inner, pos)}"
-        file = self.file_of(home)
-        error = KursError(message, at)
-        raise located(error, file, at) if file is not None else error
-
-    def file_of(self, home: Optional[ModuleId]) -> Optional[str]:
-        """The source file of `home`, when the program knows it."""
-        return self.program.files.get(home) if home is not None else None
-
-    def where(self, home: Optional[ModuleId], pos: Optional[Position]) -> str:
-        """`pos` in the module `home`, with its file when the program knows it."""
-        file = self.file_of(home)
-        place = f"{pos[0]}:{pos[1]}" if pos else ""
-        if file is None:
-            return place
-        return f"{file}:{place}" if place else file
+    def pointee(self, pointer: str) -> Type:
+        """The type the pointer value `pointer` points at."""
+        ty = self.type_of(pointer)
+        assert isinstance(ty, Ptr)
+        return ty.inner
 
     def type_operand(self, instr: Instr) -> Type:
         assert instr.ty is not None
@@ -1757,7 +1711,6 @@ class Backend:
 
         Returns whether it wrote the call; otherwise the block is written as usual."""
         a = call.args
-        self.at = call.pos
         if call.op == "call":
             if a[0].startswith("%") or a[0] in self.program.externs:
                 return False

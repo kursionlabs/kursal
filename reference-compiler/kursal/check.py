@@ -788,16 +788,17 @@ class Checker:
         return Fn(tuple(subst(t, sub) for t in fun.ptypes), subst(fun.ret, sub), retained, fun.unsafe, fun.places)
 
     def has_memory_form(self, ty: Type) -> None:
-        """A zero-size type is erased: it has no memory form, no C object and no C value. So `alloca`, the
-        unsafe memory operations (a load or store through a pointer, volatile or not), unsafe casts, and
-        extern parameters and values reject zero-size types; `sizeof` of one is 0."""
+        """A zero-size type is erased: it has no C object and no C value, and `sizeof` of one is 0. A load or
+        store of one through a pointer reads and writes nothing, and `alloca` of one gives a pointer that is
+        not null, so those accept it; an unsafe cast reinterprets a representation, which a zero-size type
+        does not have, and C has no zero-size parameter or object, so casts and extern parameters and values
+        reject zero-size types."""
         if self.types.zero_size(ty):
             self.fail("zero_size_type_has_no_memory_form")
 
     def op_alloca(self, instr: Instr) -> Type:
         if instr.ty is None:
             self.fail("instruction_requires_type")
-        self.has_memory_form(instr.ty)
         return Ptr(instr.ty)
 
     def op_sizeof(self, instr: Instr) -> Type:
@@ -873,7 +874,6 @@ class Checker:
             self.fail("ptr_load_non_pointer")
         if isinstance(t.inner, Never):
             self.fail("unsafe_read_cannot_produce_never")
-        self.has_memory_form(t.inner)
         return t.inner
 
     op_ptr_load_volatile = op_ptr_load
@@ -882,7 +882,6 @@ class Checker:
         p, v = self.use(instr.args[0]), self.use(instr.args[1])
         if not isinstance(p, Ptr) or not fits(v, p.inner):
             self.fail("store_through_pointer_another")
-        self.has_memory_form(p.inner)
         return UNIT
 
     op_ptr_store_volatile = op_ptr_store

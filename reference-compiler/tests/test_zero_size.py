@@ -1,24 +1,18 @@
 """Zero-size types are erased: no C member, parameter, local, argument or stored value has one; `sizeof`
-of one is 0; the unsafe memory operations, casts and externs reject them, also where a specialization
-chooses one. `examples/zero_size` runs the same through the surface language and the standard
-library."""
+of one is 0; a load or store of one through a pointer writes no C, and `alloca` of one is a pointer that
+is not null; unsafe casts and externs reject them. So the standard library's containers work at a
+zero-size element type, which the runtime tests here run. `examples/zero_size` runs the same through
+the surface language, for both compilers."""
 import re
-import tempfile
 import unittest
-from pathlib import Path
 
-from kursal.cgen import emit_c
-from kursal.check import check_program
-from kursal.kurs import parse_program
-from kursal.lower import lower
-from kursal.resolve import LIB, resolve
-from kursal.sexpr import KursError
-from kursal.sigs import signatures
-from tests import test_c_names
+from tests import test_c_names, test_std_runtime
 
 
 class ZeroSizeTests(unittest.TestCase):
     run_core = test_c_names.CNameTests.run_core
+    run_program = test_std_runtime.StdRuntimeTests.run_program
+    expect = test_std_runtime.StdRuntimeTests.expect
 
     def test_zero_size_components_have_no_members(self):
         output = self.run_core('''(type Marker (struct))
@@ -99,41 +93,236 @@ class ZeroSizeTests(unittest.TestCase):
               (= %r (call (same i32) %n)) (ret %r)))''', 3)
         self.assertRegex(output, r"static void \w+\(void\) \{\n  L_entry: ;\n  return;\n\}")
 
-    def test_a_zero_size_instantiation_is_reported_at_the_call_that_chose_it(self):
-        # The library's containers read and write their elements through pointers, so they do not build
-        # at a zero-size element type. The error names the program's own file and the call that chose the
-        # type, then the memory operation in the library it reaches.
-        cases = {
-            "Ref::new(&cx, ())": "arena.kur",
-            "OwnedVec!::new[()]().push(()).free()": "collections/vec.kur",
-            "{ var m = OwnedMap!::new[u32, ()](); let old = &m.insert(1u32, ()); m.free() }": "collections/hashmap.kur",
-            "Owned!::new(()).into_value()": "owned.kur",
-        }
-        for expression, library in cases.items():
-            with self.subTest(expression=expression), tempfile.TemporaryDirectory(prefix="kursal-zero-size-") as base:
-                directory = Path(base)
-                (directory / "kur.toml").write_text(f'[package]\nname="p"\nsource_root="."\nkind="executable"\n'
-                                                    f'entry="main"\n[dependencies.std]\npath="{LIB / "std"}"\n')
-                (directory / "lib.kur").write_text('''use std::arena::Domain!;
-use std::owned::Owned!;
-use std::collections::{hashmap::OwnedMap!, vec::OwnedVec!};
-use std::mem::Ref;
-fn main() -> i32 {
-    let exists 'a. cx = Domain!::new();
-    let r = ''' + expression + ''';
-    cx.destroy();
-    0
-}
-''')
-                resolver = resolve(directory)
-                sigs = signatures(resolver)
-                program = lower(resolver, sigs)
-                checked = check_program(program)
-                here = re.escape(str(directory / "lib.kur"))
-                there = re.escape(str(LIB / "alloc" / library))
-                with self.assertRaisesRegex(KursError, f"^{here}:7:\\d+: a zero-size type has no memory form, and this call "
-                                            f"reaches a read or write of one through a pointer at {there}:\\d+:\\d+$"):
-                    emit_c(program, checked, sigs.name(resolver.packages[0].entry_decl))
+    def test_loads_and_stores_of_a_zero_size_type_write_nothing(self):
+        # `alloca` of one is not null; a load or store through it, volatile or not, and one a specialization
+        # chooses, is no C at all.
+        output = self.run_core('''(type Marker (struct))
+            (fun (unsafe) read (forall (T) () T ((ptr T)) (entry ((%p (ptr T))) (= %v (ptr_load %p)) (ret %v))))
+            (fun main i32 () (entry ()
+              (unsafe (= %p (alloca Marker))) (unsafe (= %q (alloca (array u64 0))))
+              (= %p1 (copy %p)) (= %p2 (copy %p)) (= %p3 (copy %p)) (= %p4 (copy %p))
+              (= %m (construct Marker)) (unsafe (= %u (ptr_store %p1 %m))) (unsafe (= %m2 (ptr_load_volatile %p2)))
+              (unsafe (= %v (ptr_store_volatile %p3 %m2))) (unsafe (= %e (ptr_load %q)))
+              (unsafe (= %m3 (call (read Marker) %p4)))
+              (unsafe (= %a (cast %p usize))) (= %z (const usize 0)) (= %b (ne %a %z)) (jnz %b (yes) (no)))
+            (yes () (= %r (const i32 5)) (ret %r))
+            (no () (= %r (const i32 0)) (ret %r)))''', 5)
+        self.assertIn("= (void*)(uintptr_t)1;", output)
+        self.assertNotIn("alloca", output)
+        self.assertNotIn("volatile", output)
+        self.assertRegex(output, r"static void \w+\(void\* \w+\) \{\n  L_entry: ;\n  return;\n\}")
+
+    def test_an_owned_hash_set(self):
+        # `OwnedMap![K, ()]` is a set: of owned buffers, looked up by a view, and of numbers.
+        self.expect('''
+            use std::buffer::Buffer!;
+            use std::collections::hashmap::OwnedMap!;
+            use std::option::Option;
+            fn word(n: u64) -> Buffer! {
+                Buffer!::new().push_static("w").push_u64(n)
+            }
+            fn forget(old: Option[(Buffer!, ())]) -> u32 {
+                match old {
+                    Option::Some(pair) => {
+                        let (key, unit) = pair;
+                        key.destroy();
+                        1
+                    },
+                    Option::None => 0,
+                }
+            }
+            fn drop_key(key: Buffer!, unit: ()) {
+                key.destroy()
+            }
+            fn main() -> i32 {
+                var set = OwnedMap!::new[Buffer!, ()]();
+                var i = 0u64;
+                var again = 0u32;
+                while i < 200 {
+                    again = again + forget(&set.insert(word(i % 100), ()));
+                    i = i + 1;
+                }
+                var probe = word(42);
+                let found = &set.find(&probe);
+                let removed = forget(&set.remove(&probe));
+                let still = &set.contains(&probe);
+                probe.destroy();
+                var visited = 0usize;
+                &set.each_in(&visited, |&key, &unit, &count| { count = count + 1usize; });
+                let size = &set.len();
+                set.destroy(drop_key);
+                var numbers = OwnedMap!::new[u32, ()]();
+                var n = 0u32;
+                while n < 1000 {
+                    let old = &numbers.insert(n * 3, ());
+                    n = n + 1;
+                }
+                var key = 300u32;
+                let hit = &numbers.get(&key);
+                let taken = &numbers.remove(&key);
+                key = 301u32;
+                let miss = &numbers.contains(&key);
+                let count = &numbers.len();
+                numbers.free();
+                if again != 100 || !found.is_some() || removed != 1 || still || visited != 99usize || size != 99usize {
+                    1
+                } else if !hit.is_some() || !taken.is_some() || miss || count != 999usize {
+                    2
+                } else {
+                    0
+                }
+            }''')
+
+    def test_a_vector_of_units_counts_without_allocating(self):
+        # One block of no bytes, which a vector of zero-size elements never grows; its elements are pushed,
+        # moved and popped as nothing.
+        self.expect('''
+            use std::collections::vec::OwnedVec!;
+            use std::option::Option;
+            extern "C" fn probe_allocations() -> u64;
+            fn main() -> i32 {
+                let before = unsafe probe_allocations();
+                var v = OwnedVec!::new[()]();
+                var i = 0u32;
+                while i < 100000 {
+                    v = v.push(());
+                    i = i + 1;
+                }
+                let allocations = unsafe probe_allocations() - before;
+                let pushed = &v.len();
+                &v.insert(5usize, ());
+                &v.swap(0usize, 99usize);
+                &v.reverse();
+                let removed = &v.remove(3usize);
+                let last = &v.get(99999usize);
+                let past = &v.get(100000usize);
+                var popped = 0u32;
+                var going = true;
+                while going {
+                    match &v.pop() {
+                        Option::Some(unit) => { popped = popped + 1; },
+                        Option::None => { going = false; },
+                    }
+                }
+                let empty = &v.is_empty();
+                v.free();
+                if allocations != 1u64 || pushed != 100000usize { 1 }
+                else if !removed.is_some() || !last.is_some() || past.is_some() { 2 }
+                else if popped != 100000 || !empty { 3 }
+                else { 0 }
+            }''', counted=True)
+
+    def test_an_owned_unit(self):
+        self.expect('''
+            use std::owned::Owned!;
+            fn main() -> i32 {
+                var o = Owned!::new(());
+                let three = &o.update(|&unit| 3u32);
+                let exists 'r. (record, region) = o.open();
+                let back = record.close(region);
+                let unit = back.into_value();
+                if three == 3u32 { 0 } else { 1 }
+            }''')
+
+    def test_the_branded_vector_and_map(self):
+        self.expect('''
+            use std::collections::hashmap::HashMap!;
+            use std::collections::vec::Vec!;
+            fn main() -> i32 {
+                let exists 'v. (tag, vec) = Vec!::new[()]();
+                let exists 'w. (tag, vec) = vec.push(tag, ());
+                let exists 'x. (tag, vec) = vec.push(tag, ());
+                let view = &vec.as_slice(&tag);
+                let exists 'y. (tag, vec, out) = vec.pop(tag);
+                let left = &vec.len(&tag);
+                vec.free(tag);
+                let exists 'h. (tag, map) = HashMap!::new[u32, ()]();
+                let exists 'i. (tag, map, old) = map.insert(tag, 1u32, ());
+                var one = 1u32;
+                let present = &map.contains(&tag, &one);
+                let exists 'j. (tag, map, taken) = map.remove(tag, &one);
+                let size = &map.len(&tag);
+                map.free(tag);
+                if view.len() != 2usize || !out.is_some() || left != 1usize { 1 }
+                else if !present || old.is_some() || !taken.is_some() || size != 0usize { 2 }
+                else { 0 }
+            }''')
+
+    def test_the_arena_at_a_zero_size_type(self):
+        self.expect('''
+            use std::arena::Domain!;
+            use std::collections::arena_map::ArenaMap;
+            use std::collections::arena_vec::ArenaVec;
+            use std::mem::Ref;
+            use std::option::Option;
+            fn main() -> i32 {
+                let exists 'a. cx = Domain!::new();
+                let unit = Ref::new(&cx, ());
+                let copied = unit.copy(&cx);
+                let units: ArenaVec[(), 'a] = ArenaVec::new(&cx);
+                var i = 0u32;
+                while i < 1000 {
+                    units.push(&cx, ());
+                    i = i + 1;
+                }
+                let last = units.at(&cx, 999usize);
+                let popped = units.pop(&cx);
+                let left = units.len(&cx);
+                let set: ArenaMap[u32, (), 'a] = ArenaMap::new(&cx);
+                var k = 0u32;
+                while k < 100 {
+                    let old = set.insert(&cx, k, ());
+                    k = k + 1;
+                }
+                let has = set.contains(&cx, 50u32) && !set.contains(&cx, 500u32);
+                let removed = set.remove(&cx, 50u32);
+                let size = set.len(&cx);
+                let { tag, arena } = cx;
+                let many = &arena.alloc_slice(&tag, 1000000usize, ());
+                let found = match many.get_ref(999999usize) {
+                    Option::Some(r) => { let u = r.copy(&tag); true },
+                    Option::None => false,
+                };
+                let cx = Domain!.{ tag, arena };
+                cx.destroy();
+                if !popped.is_some() || left != 999usize { 1 }
+                else if !has || !removed.is_some() || size != 99usize { 2 }
+                else if many.len() != 1000000usize || !found { 3 }
+                else { 0 }
+            }''')
+
+    def test_a_brand_witness_through_a_pointer(self):
+        # A zero-size struct that holds a brand witness, stored and read back through a raw pointer, an
+        # `Owned!` and the arena: the brand it carries is the one put in.
+        self.expect('''
+            use std::arena::Domain!;
+            use std::cap::{Brand, Exclusive!};
+            use std::mem::{Ref, alloca};
+            use std::owned::Owned!;
+            forall 'k.
+            exposed struct Witness {
+                brand: Brand['k],
+                unit: (),
+            }
+            forall 'k.
+            fn same(a: Brand['k], b: Brand['k]) -> bool {
+                true
+            }
+            fn main() -> i32 {
+                let exists 'b. (brand, cap) = Exclusive!::fresh();
+                let p = unsafe alloca[Witness['b]]();
+                let address = unsafe (p as usize);
+                unsafe *p = Witness.{ brand, unit: () };
+                let { brand: read, unit: u1 } = unsafe *p;
+                let boxed = Owned!::new(Witness.{ brand: read, unit: () });
+                let { brand: unboxed, unit: u2 } = boxed.into_value();
+                let exists 'a. cx = Domain!::new();
+                let held = Ref::new(&cx, Witness.{ brand: unboxed, unit: () });
+                let { brand: again, unit: u3 } = held.copy(&cx);
+                cx.destroy();
+                cap.retire();
+                if address != 0usize && same(again, brand) { 0 } else { 1 }
+            }''')
 
 
 if __name__ == "__main__":

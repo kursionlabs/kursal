@@ -593,10 +593,11 @@ impl FnLower['k] {
     }
 
     // The core's rules for an unsafe operation on memory, which an `unsafe` marker does not lift: a
-    // zero-size type has no memory form to allocate, read, write or cast; a read through a pointer
-    // does not produce Never; a cast does not conjure what only a checked operation makes, nor
-    // reinterpret a layout the compiler chooses; an atomic operation works on an integer, a bool or a
-    // pointer.
+    // read through a pointer does not produce Never; a cast does not conjure what only a checked
+    // operation makes, nor reinterpret a layout the compiler chooses, nor take or produce a zero-size
+    // type, which has no representation to reinterpret; an atomic operation works on an integer, a bool
+    // or a pointer. A load or store of a zero-size type reads and writes nothing, and `alloca` of one is
+    // not null.
     fn memory_operation(self, &cx: Domain!['k], o: Op['k], pos: Pos) {
         let target = if o.args.is_empty(&cx) { Option::None } else { self.vty.get(&cx, o.args.at(&cx, 0usize)) };
         let pointee = match target {
@@ -607,22 +608,11 @@ impl FnLower['k] {
             Option::None => Option::None,
         };
         let op = o.name;
-        if op.is(&cx, "alloca") {
-            match o.ty {
-                Option::Some(ty) => self.memory_form(&cx, ty, pos),
-                Option::None => (),
-            };
-        } else if op.is(&cx, "ptr_load") || op.is(&cx, "ptr_load_volatile") || op.is(&cx, "ptr_store") || op.is(&cx, "ptr_store_volatile") {
+        if op.is(&cx, "ptr_load") || op.is(&cx, "ptr_load_volatile") {
             match pointee {
-                Option::Some(inner) => {
-                    let never = match inner {
-                        Type::Never => true,
-                        _ => false,
-                    };
-                    if op.starts_with(&cx, Span::from_static(&cx, "ptr_load")) && never {
-                        self.fail(&cx, Span::from_static(&cx, "an unsafe read cannot produce Never"), pos);
-                    }
-                    self.memory_form(&cx, inner, pos);
+                Option::Some(inner) => match inner {
+                    Type::Never => self.fail(&cx, Span::from_static(&cx, "an unsafe read cannot produce Never"), pos),
+                    _ => (),
                 },
                 Option::None => (),
             };
@@ -649,8 +639,9 @@ impl FnLower['k] {
         if self.holds_uncastable(&cx, from) || self.holds_uncastable(&cx, to) {
             self.fail(&cx, Span::from_static(&cx, "an unsafe cast cannot produce or take apart a package, a brand witness, a function value, a transform, a value of a type parameter or Never"), pos);
         }
-        self.memory_form(&cx, from, pos);
-        self.memory_form(&cx, to, pos);
+        if self.lowering.types.zero_size(&cx, from) || self.lowering.types.zero_size(&cx, to) {
+            self.fail(&cx, Span::from_static(&cx, "a zero-size type has no memory form"), pos);
+        }
         let types = self.lowering.types;
         if is_non_null(from) || is_non_null(to) {
             if !(is_pointer(from) && is_pointer(to)) {
@@ -675,12 +666,6 @@ impl FnLower['k] {
         };
         if !(integer || C::same(&cx, inner, C::bool_type(&cx)) || pointer) {
             self.fail(&cx, Buffer!::new().push_static("atomic ").push_bytes(&cx, kind).push_static(" works on a pointer to an integer, a bool or a pointer").save(&cx), pos);
-        }
-    }
-
-    fn memory_form(self, &cx: Domain!['k], ty: Type['k], pos: Pos) {
-        if self.lowering.types.zero_size(&cx, ty) {
-            self.fail(&cx, Span::from_static(&cx, "a zero-size type has no memory form"), pos);
         }
     }
 
@@ -2815,21 +2800,7 @@ fn lower(&cx: Domain!['k], r: Resolver['k], sigs: Signatures['k], counter: Fresh
 // measure inference and lowering independently without doing either work twice.
 forall 'k.
 fn lower_inferred(&cx: Domain!['k], r: Resolver['k], sigs: Signatures['k], results: Results['k], counter: Fresh['k]) -> Program['k] {
-    let files: ArenaMap[ModuleId['k], Span['k], 'k] = ArenaMap::new(&cx);
-    var p = 0usize;
-    while p < r.packages.len(&cx) {
-        let modules = r.packages.at(&cx, p).files;
-        var m = 0usize;
-        while m < modules.positions(&cx) {
-            match modules.key_at(&cx, m) {
-                Option::Some(home) => { let none = files.insert(&cx, home, modules.at(&cx, home)); },
-                Option::None => (),
-            };
-            m = m + 1usize;
-        }
-        p = p + 1usize;
-    }
-    let program = Program.{ types: sigs.types, funs: ArenaMap::new(&cx), externs: ArenaMap::new(&cx), datas: ArenaMap::new(&cx), traits: sigs.traits, instances: ArenaMap::new(&cx), files };
+    let program = Program.{ types: sigs.types, funs: ArenaMap::new(&cx), externs: ArenaMap::new(&cx), datas: ArenaMap::new(&cx), traits: sigs.traits, instances: ArenaMap::new(&cx) };
     let lowering = Lowering.{ r, sigs, results, program, types: Types::new(&cx, program, counter), counter, datas: ArenaMap::new(&cx),
         closures: Ref::new(&cx, 0u64), value_types: ArenaMap::new(&cx) };
     lowering.run(&cx)

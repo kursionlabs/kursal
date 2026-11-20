@@ -166,19 +166,8 @@ REJECTED = {
             (= %k (pack (exists ($p0) (tuple (brand $p0) (brand $p0))) ($q) %v))
             (= %r (const u32 0)) (ret %r))))"""),
 
-    # A zero-size type is erased: it has no memory form for unsafe memory operations, casts or externs.
-    "alloca_empty_array": ("zero_size_type_has_no_memory_form", """
-        (fun (unsafe) h u32 () (entry () (= %p (alloca (array u32 0))) (= %r (const u32 0)) (ret %r)))"""),
-    "deref_unit": ("zero_size_type_has_no_memory_form", """
-        (fun (unsafe) h u32 ((ptr (tuple))) (entry ((%p (ptr (tuple))))
-          (= %v (ptr_load %p)) (= %r (const u32 0)) (ret %r)))"""),
-    "load_volatile_unit": ("zero_size_type_has_no_memory_form", """
-        (fun (unsafe) h u32 ((ptr (tuple))) (entry ((%p (ptr (tuple))))
-          (= %v (ptr_load_volatile %p)) (= %r (const u32 0)) (ret %r)))"""),
-    "store_empty_array": ("zero_size_type_has_no_memory_form", """
-        (fun (unsafe) h u32 ((ptr (array u32 0)) (array u32 0))
-          (entry ((%p (ptr (array u32 0))) (%v (array u32 0)))
-            (= %u (ptr_store %p %v)) (= %r (const u32 0)) (ret %r)))"""),
+    # A zero-size type is erased: an unsafe cast has no representation of one to reinterpret, and C has
+    # no zero-size parameter or object for an extern. Its loads and stores are accepted (test_zero_size).
     "cast_to_unit": ("zero_size_type_has_no_memory_form", """
         (fun (unsafe) h (tuple) (u8) (entry ((%x u8)) (= %u (cast %x (tuple))) (ret %u)))"""),
     "cast_from_unit": ("zero_size_type_has_no_memory_form", """
@@ -292,17 +281,6 @@ class UnsafeOperationTests(unittest.TestCase):
         for instr in ("(= %v (int_cast %x u64))", "(= %v (sizeof u32))", "(= %v (fresh))"):
             with self.subTest(instr=instr):
                 check_program(parse_program(self.program(instr)))
-
-
-class ZeroSizeTests(unittest.TestCase):
-    def test_a_specialization_cannot_choose_a_zero_size_type(self):
-        from kursal.cgen import emit_c
-        program = parse_program("""(fun (unsafe) read (forall (T) () T ((ptr T))
-              (entry ((%p (ptr T))) (= %v (ptr_load %p)) (ret %v))))
-            (fun main i32 () (entry () (= %z (const usize 8)) (unsafe (= %p (cast %z (ptr (tuple)))))
-              (unsafe (= %v (call (read (tuple)) %p))) (= %r (const i32 0)) (ret %r)))""")
-        with self.assertRaisesRegex(KursError, "zero-size type has no memory form"):
-            emit_c(program, check_program(program), "main")
 
 
 class EntryTests(unittest.TestCase):

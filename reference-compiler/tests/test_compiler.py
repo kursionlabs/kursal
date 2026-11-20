@@ -1996,9 +1996,8 @@ class CompilerTests(unittest.TestCase):
                     self.assertEqual(got, want)
 
     def test_zero_size_instantiations_match_reference(self):
-        """A container of a zero-size element type, which reads and writes its elements through pointers:
-        `kursal build` fails as the reference does, at the call in the program's own file that chose the
-        type, naming the memory operation in the library it reaches."""
+        """A container of a zero-size element type, which reads and writes its elements through pointers, as
+        nothing: `kursal build` writes the reference's C."""
         sources = (
             "fn main() -> i32 { var v = OwnedVec!::new[()](); v = v.push(()); v.free(); 0 }\n",
             "fn main() -> i32 { var m = OwnedMap!::new[u32, ()](); let old = &m.insert(1u32, ()); m.free(); 0 }\n",
@@ -2015,9 +2014,8 @@ class CompilerTests(unittest.TestCase):
                 (root / "lib.kur").write_text(imports + source)
                 paths.append(root)
             expected = [in_deep_thread(lambda: reference_entry(path)) for path in paths]
-            for path, want in zip(paths, expected):
-                self.assertTrue(want.startswith(f"error: {path / 'lib.kur'}:"), want)
-                self.assertIn("a zero-size type has no memory form, and this call reaches", want)
+            for want in expected:
+                self.assertFalse(want.startswith("error:"), want)
             for path, want, got in zip(paths, expected, self.run_batches("build", paths)):
                 with self.subTest(source=(path / "lib.kur").read_text()):
                     self.assertEqual(got, want)

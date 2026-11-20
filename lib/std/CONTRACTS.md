@@ -280,7 +280,7 @@ a checked type; their obligation is the same kind of thing.
 | Function | Caller must guarantee |
 |---|---|
 
-| `core::slice::Slice::from_raw_parts` | `ptr[0..len)` is live, initialized and accessible under `marker`'s brand |
+| `core::slice::Slice::from_raw_parts` | `ptr[0..len)` is live, initialized and accessible under `marker`'s brand, and `ptr` is not null, even when `len` is 0 or `T` is zero-size: `get_ref` makes a `Ref` of it, which is never null |
 | `core::mem::Ref::from_raw` | `ptr` points at a live `T` inside the domain `marker` names, so presenting that domain's capability really authorizes the access |
 | `core::raw::Span::from_raw_parts` | `ptr[0..len)` is initialized and stays readable while the domain of the context `&cx` lends has its capability. Literal-backed spans use the safe `Span::from_static` |
 | `core::raw::Span::from_raw_parts_branded` | as `from_raw_parts`, for a module whose own object holds the domain's brand (an arena's `marker`); `marker` must be a witness that object really holds, since a span planted in another domain reads that domain's bytes |
@@ -292,7 +292,7 @@ a checked type; their obligation is the same kind of thing.
 | `alloc::collections::arena_vec::place` | `i` is below the capacity of `h`'s segments, which are live arena blocks of the sizes `locate` computes |
 | `alloc::collections::hashmap::alloc_buckets` | the returned array is owned: exactly one `resize`/`destroy` must free it |
 | `core::mem::make_split_part` | `field` addresses initialized storage of `Field` that no other live capability covers, as for `Region!::from_raw`: the returned `Region!` is fresh authority over it. It returns only the part's fresh brand, never a `Link!`; `Link!` is restricted to `core::mem` and built only by `Region!::split`, so a part over unrelated storage cannot be merged into a parent |
-| `core::mem::Region!::from_raw` | `ptr` points at an initialized `T`, aligned for `T`, in at least `sizeof[T]()` bytes, that nothing else can reach while `'r` lives, and `cap` is the only capability over `'r` (in practice fresh from `Exclusive!::fresh`): the region's `replace` and `share` read and write the `T` unchecked. `Allocation!::adopt` passes its own obligation on, with a fresh capability over a block its `Uninit!` owned outright |
+| `core::mem::Region!::from_raw` | `ptr` is not null, also for a zero-size `T`, and points at an initialized `T`, aligned for `T`, in at least `sizeof[T]()` bytes, that nothing else can reach while `'r` lives, and `cap` is the only capability over `'r` (in practice fresh from `Exclusive!::fresh`): the region's `replace` and `share` read and write the `T` unchecked. `Allocation!::adopt` passes its own obligation on, with a fresh capability over a block its `Uninit!` owned outright |
 | `core::mem::lend`, `lend_in` | `p` points at a live `T` that nothing else reads or writes while `f` runs. `Ref::update`/`update_in` discharge it with the brand's `Exclusive!`; `Owned!::update`/`update_in` with the `Owned!` they hold. `lend_in`'s `cx` carries no obligation |
 | `core::array::Array!::from_parts` | `base` addresses `len` initialized `T`s that nothing else reads or writes while the array exists; every later access is checked against `len` |
 | `alloc::collections::vec::before`, `swap_at`, `sift_down` | `p` addresses the vector's own initialized elements and every index is below its length |
@@ -429,27 +429,37 @@ signature". It does not mean "verified correct".**
   out-of-bounds indices.
 
 **Zero sizes.** A zero-size type (`()`, a brand, a capability, an empty
-struct, `[T; 0]`) has size 0 and no memory form: `sizeof[T]()` is `0`, and
-the compiler rejects every load or store of one through a pointer, also
-where a specialization chooses it, at the call in the program that chose
-the type. So `Arena!::alloc`, `alloc_slice`,
-`Ref::new`, `Ref::copy` and the vectors do not build at a zero-size element
-type (one holding a zero-size part beside bytes is ordinary). The size
-arithmetic is still defined at 0, for raw code and for `T`s that only
-compute with their size:
+struct, `[T; 0]`) has size 0: `sizeof[T]()` is `0`, `alignof[T]()` is 1, and
+a load or store of one through a pointer reads and writes nothing (an unsafe
+cast from or to one, and an extern parameter or value of one, are still
+rejected; compiler/README.md, "Zero-size types are erased"). So every
+container and allocation function builds at a zero-size element type:
+`OwnedVec![()]`, `OwnedMap![K, ()]` (a set of owned keys), `Owned![()]`,
+`Vec!`, `HashMap!`, `Arena!::alloc` and `alloc_slice`, `Ref::new`,
+`ArenaVec` and `ArenaMap`. The size arithmetic is defined at 0, and no
+pointer a zero-size value is reached through is null, so none lands in a
+`NonNull` or a `Ref`:
 
 - `alloc::heap::Storage::try_alloc`/`try_grow` (and so
-  `HeapAllocator::alloc`/`grow`) ask `malloc`/`realloc` for one byte where the size is 0, so a block is never
-  null and `realloc` never frees; the `Uninit!` records the requested 0;
+  `HeapAllocator::alloc`/`grow`) ask `malloc`/`realloc` for one byte where
+  the size is 0, so a block is never null and `realloc` never frees; the
+  `Uninit!` records the requested 0. `Owned!::new` of a zero-size value and
+  a `Vec!` of zero-size elements hold such a block;
 - `checked_mul(n, 0usize)` is 0 without dividing by 0;
+- a `Vec!` of a zero-size `T` starts with capacity `usize::MAX`, so `push`
+  never grows its block of no bytes, and only a length past `usize::MAX`
+  aborts (`checked_mul`);
+- `HashMap!` allocates no box for a zero-size key or value: `alloc_one`
+  gives the address `alignof[T]()` (1), which addresses no block and is not
+  null, and `free_one` frees nothing for it;
 - `alloc::arena`'s `bump_chunk` reserves no bytes for a 0-byte request and
   returns the current address, so zero-size requests may share an address
-  with each other and with the next allocation.
+  with each other and with the next allocation;
+- `alloca` of a zero-size type gives the address 1.
 
 Identities taken from addresses (`Ref::address`, `ArenaVec::address`,
 `ArenaMap::address`) are of headers that have bytes; two `Ref`s to
-zero-size values, which only `Ref::from_raw` can make, may share an
-address.
+zero-size values may share an address.
 
 **`Option` where a request is merely out of range.** An index past the end
 is an ordinary, recoverable condition:
