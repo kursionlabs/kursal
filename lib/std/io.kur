@@ -17,27 +17,15 @@ use core::slice::{Slice, ReadBytes};
 use core::fmt::{Format, Writable, write_i64};
 use core::option::{Option, Result};
 use core::cap::{Access, Exclusive!};
-
-// `libc/fs.c`, which every program links, wraps the system calls: each
-// retries a call a signal interrupted (EINTR), opens descriptors
-// close-on-exec, and reports a failure as a negative errno, so no variadic
-// C function is called through a fixed prototype and no `errno` is read
-// from here.
-extern "C" fn kur_libc_fs_read(fd: i32, buf: *u8, count: usize) -> isize;
-extern "C" fn kur_libc_fs_write(fd: i32, buf: *u8, count: usize) -> isize;
-extern "C" fn kur_libc_fs_open_read(path: *u8, len: usize) -> i32;
-extern "C" fn kur_libc_fs_create(path: *u8, len: usize) -> i32;
-extern "C" fn kur_libc_fs_close(fd: i32) -> i32;
-extern "C" fn kur_libc_fs_regular_size(fd: i32) -> isize;
-extern "C" fn kur_libc_fs_size_hint(fd: i32) -> isize;
-extern "C" fn kur_libc_stdin_claim() -> i32;
-extern "C" fn kur_libc_stdin_release() -> ();
-extern "C" fn kur_libc_error_kind(code: i32) -> i32;
-extern "C" fn kur_libc_error_message(code: i32, out: *u8, cap: usize) -> usize;
+// The system calls: a read or write a signal interrupts is made again,
+// descriptors are opened close-on-exec, and a failure is an errno.
+use libc::io::{kur_libc_fs_read, kur_libc_fs_write, kur_libc_fs_open_read, kur_libc_fs_create, kur_libc_fs_close,
+    kur_libc_fs_regular_size, kur_libc_fs_size_hint, kur_libc_stdin_claim, kur_libc_stdin_release, kur_libc_error_kind,
+    kur_libc_error_message};
 
 /// A path, name or argument for C: the bytes of a view, read through the
 /// capability that permits it, followed by a NUL, in a buffer the caller
-/// frees once the call is made. The functions of `fs.c` that take one also
+/// frees once the call is made. The C functions (`libc`) that take one also
 /// take its length, and fail with EINVAL when the bytes hold a NUL of their
 /// own, which C would read as the end.
 forall C, S where ReadBytes[C, S], Copy[S].
@@ -94,7 +82,7 @@ exposed enum ErrorKind {
 }
 
 impl Error {
-    /// The error a negative return of an `fs.c` call stands for.
+    /// The error a negative return of a C function (`libc`) stands for.
     fn of_return(n: isize) -> Error {
         Error.{ errno: 0i32 - (n as i32) }
     }
@@ -104,7 +92,7 @@ impl Error {
         Error.{ errno: 5i32 }
     }
 
-    /// The kind of failure, from the errno: `libc/fs.c` sorts the host's
+    /// The kind of failure, from the errno: the C runtime sorts the host's
     /// numbers into the kinds.
     fn kind(self) -> ErrorKind {
         let k = unsafe kur_libc_error_kind(self.errno);
@@ -341,7 +329,7 @@ unsafe fn read_to_end_from(fd: i32, b: Buffer!) -> Result[Buffer!, Error] {
 // buffer and returns lines from it, or through `read_all_stdin` and
 // `read_line`. Bytes an `Input!` has read ahead are its own: another reader
 // of standard input would skip them. So one reader at a time holds
-// standard input, by a flag `fs.c` keeps (`kur_libc_stdin_claim`): `stdin`
+// standard input, by a flag io.c keeps (`kur_libc_stdin_claim`): `stdin`
 // fails with EBUSY while an `Input!` holds it, and so do `read_all_stdin`
 // and `read_line`, which hold it for the length of the call. `finish`
 // gives it back, with the bytes read ahead and not yet returned. Code that

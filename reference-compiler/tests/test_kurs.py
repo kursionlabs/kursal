@@ -17,7 +17,7 @@ from kursal.sexpr import KursError
 from kursal.sigs import signatures
 
 ROOT = Path(__file__).resolve().parents[2]
-LIBRARY = ("core", "alloc", "std", "libc", "thread", "toml")
+LIBRARY = ("core", "alloc", "libc", "std", "toml")
 
 # Every form of the serialization, written the way `write_program` writes it.
 CANONICAL = r'''(type (in (module 0 a) abstract) Secret (struct (k u32)))

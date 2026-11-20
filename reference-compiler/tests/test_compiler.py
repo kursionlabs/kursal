@@ -2355,7 +2355,7 @@ class CompilerTests(unittest.TestCase):
             src = site / "src"
             pages = sorted(src.rglob("*.md"))
             self.assertGreater(len(pages), 250)
-            for package in ("std", "core", "alloc", "std/cmp", "std/collections", "core/cmp"):
+            for package in ("std", "core", "alloc", "libc", "std/cmp", "std/collections", "std/thread", "core/cmp", "libc/thread"):
                 self.assertTrue((src / package / "index.md").is_file(), package)
             self.assertEqual(markdown_link_errors(src), [])
             text = "".join(page.read_text() for page in pages if "src/src" not in page.as_posix())

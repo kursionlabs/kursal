@@ -708,7 +708,7 @@ is right on a 32-bit and on a 64-bit target. The compiler never assumes their wi
   `uintptr_t`. Conversions to and from the fixed-width types truncate or extend at the target's
   width, and pointer casts go through `uintptr_t`.
 - **Foreign functions** that take or return `usize` or `isize` are declared with `uintptr_t` and
-  `intptr_t`, so their C side (`lib/libc/*.h`) uses those types too.
+  `intptr_t`, so their C side (`lib/libc/libc.h`) uses those types too.
 
 The size estimate that passes aggregates by pointer (`words`) counts every scalar, `usize`
 included, as one word on every target.
@@ -897,7 +897,7 @@ These are the places where Kursal differs from what one might expect.
 - **`if` and `match` are expressions** and need an `else`/every case when their value is used.
 - **Closures** `|x| x + 1u32` have types `closure(u32) -> u32` as parameters. A closure captures
   the locals of its function it mentions, a linear one by moving it in, which makes the closure
-  linear: it is then called once or handed on, as `thread::spawn` takes one that owns a `Buffer!`
+  linear: it is then called once or handed on, as `std::thread::spawn` takes one that owns a `Buffer!`
   (`examples/thread_sum`). A parameter that is called many times or may go uncalled requires
   `Copy[Env]`, so what such a closure captures is `Copy`, and one that touches storage takes the
   context as a place parameter instead: `closure[Env](&_: Domain!['k], Type['k]) -> Type['k]`,

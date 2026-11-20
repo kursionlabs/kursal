@@ -59,7 +59,7 @@ See [`docs/README.md`](docs/README.md) for serving the generated site.
 |---|---|
 | [`reference-compiler/`](reference-compiler/) | the reference compiler, in Python: source to KURS (the core language) to C |
 | [`compiler/`](compiler/) | the compiler, in Kursal, which builds itself and must agree with the reference compiler |
-| [`lib/`](lib/) | the standard library packages: `core`, `alloc`, `std`, `libc`, `thread`, `toml` |
+| [`lib/`](lib/) | the standard library packages: `core`, `alloc`, `libc` (the C runtime and its bindings), `std` (over `core`, `alloc` and `libc`), `toml` |
 | [`examples/`](examples/) | example programs and libraries, and programs the compiler must reject |
 | [`editors/`](editors/) | Tree-sitter grammars and highlight queries for `.kur` and readable `.kurs` |
 | [`scripts/`](scripts/) | `bootstrap.sh`, which builds `compiler/` into `bin/kursal` |

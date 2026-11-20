@@ -13,7 +13,7 @@ from kursal.lower import lower
 from kursal.resolve import LIB, resolve
 from kursal.sigs import signatures
 
-PACKAGES = ("core", "alloc", "std", "libc", "thread", "toml")
+PACKAGES = ("core", "alloc", "libc", "std", "toml")
 
 
 class LibraryTests(unittest.TestCase):

@@ -245,17 +245,17 @@ class StdRuntimeTests(unittest.TestCase):
 
     def test_trampoline_is_unsafe(self):
         self.reject('''
-            use thread::thread::trampoline;
+            use std::thread::trampoline;
             use std::heap::HeapAllocator;
             fn main() -> i32 {
                 let raw = HeapAllocator::alloc(8usize).into_raw();
                 let result = trampoline[(), u32](raw);
                 0
-            }''', "calling an unsafe function requires unsafe authorization", deps=("std", "thread"))
+            }''', "calling an unsafe function requires unsafe authorization")
 
     def test_spawn_returns_a_zero_size_result(self):
         self.expect('''
-            use thread::thread;
+            use std::thread;
             use std::option::Result;
             fn main() -> i32 {
                 match thread::spawn(|| -> () { () }) {
@@ -269,14 +269,14 @@ class StdRuntimeTests(unittest.TestCase):
                         Result::Err(error) => 2,
                     },
                 }
-            }''', deps=("std", "thread"))
+            }''')
 
     @unittest.skipIf(os.geteuid() == 0, "the process limit does not bind root")
     def test_failed_spawn_hands_the_closure_back(self):
         def no_more_processes() -> None:
             resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))
         self.expect('''
-            use thread::thread;
+            use std::thread;
             use std::buffer::Buffer!;
             use std::option::Result;
             fn main() -> i32 {
@@ -291,7 +291,7 @@ class StdRuntimeTests(unittest.TestCase):
                         Result::Err(error) => 3,
                     },
                 }
-            }''', status=7, deps=("std", "thread"), preexec=no_more_processes)
+            }''', status=7, preexec=no_more_processes)
 
     # ----------------------------------------------------------------- arena --
 

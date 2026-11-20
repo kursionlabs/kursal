@@ -14,15 +14,9 @@ use core::ptr::null;
 use core::option::{Option, Result};
 use core::raw::raw_get;
 use core::slice::{ReadBytes, Slice};
+use libc::process::{kur_libc_process_spawn, kur_libc_process_wait, kur_libc_process_kill, kur_libc_process_signal,
+    kur_libc_process_poll, kur_libc_process_cpus, kur_libc_process_hash_seed};
 use std::io::{Error, File!, c_string};
-
-extern "C" fn kur_libc_process_spawn(line: *u8, len: usize, count: usize, env: *u8, env_len: usize, env_ops: usize, env_clear: u8, dir: *u8, dir_len: usize, streams: *i32) -> i64;
-extern "C" fn kur_libc_process_wait(pid: i64, block: u8) -> i64;
-extern "C" fn kur_libc_process_kill(pid: i64) -> i32;
-extern "C" fn kur_libc_process_signal(pid: i64, signal: i32) -> i32;
-extern "C" fn kur_libc_process_poll(a: i32, b: i32) -> i32;
-extern "C" fn kur_libc_process_cpus() -> usize;
-extern "C" fn kur_libc_process_hash_seed(word: u32) -> u64;
 
 /// The arguments the process was started with, the program's name first, as
 /// C's `main` received them. A program's entry function may take one,
@@ -94,7 +88,7 @@ exposed enum Stdio! {
 
 impl Stdio! {
     // What `kur_libc_process_spawn` reads for the stream: the descriptor to
-    // copy, or a negative code for the other ways (fs.c's KUR_STREAM_*).
+    // copy, or a negative code for the other ways (process.c's KUR_STREAM_*).
     fn code(&self) -> i32 {
         let (stdio, code) = match self {
             Stdio!::Inherit => (Stdio!::Inherit, 0i32 - 1i32),
@@ -192,8 +186,8 @@ impl Command! {
 
     /// The command with `path` as the child's working directory. A program
     /// named by a relative path with a `/` in it is then found from there.
-    /// Where the C library cannot change a child's directory (fs.c built
-    /// with `KUR_LIBC_NO_ADDCHDIR`), `spawn` fails with ENOSYS.
+    /// Where the C library cannot change a child's directory (the runtime
+    /// built with `KUR_LIBC_NO_ADDCHDIR`), `spawn` fails with ENOSYS.
     forall C, S where ReadBytes[C, S], Copy[S].
     fn current_dir(self, &cx: C, path: S) -> Command! {
         let { dir, ..rest } = self;
@@ -279,7 +273,7 @@ impl Command! {
         };
         // `p` holds `count` NUL-terminated arguments in `n` bytes, `e` the
         // `env_ops` changes in `en`, and `d`, when not null, a path of `dn`
-        // bytes and its NUL; `streams` is three `i32`s fs.c reads and
+        // bytes and its NUL; `streams` is three `i32`s process.c reads and
         // writes. The descriptors in it are the `File!`s `stdin`, `stdout`
         // and `stderr` hold, open until they are closed below.
         let pid = unsafe kur_libc_process_spawn(p, n, count, e, en, env_ops, if env_clear { 1u8 } else { 0u8 }, d, dn, unsafe (streams as *i32));
@@ -296,7 +290,7 @@ impl Command! {
         if pid < 0i64 {
             Result::Err.(Error.{ errno: (0i64 - pid) as i32 })
         } else {
-            // fs.c hands back the parent's end of each pipe it made, a
+            // process.c hands back the parent's end of each pipe it made, a
             // descriptor of its own, and -1 for the other streams.
             Result::Ok.(Child!.{ pid, stdin: unsafe pipe_end(child_in), stdout: unsafe pipe_end(child_out), stderr: unsafe pipe_end(child_err) })
         }

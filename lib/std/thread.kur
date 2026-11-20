@@ -1,29 +1,35 @@
-//! Thread ownership, spawning, and joining.
-// Closure-based thread spawning, built on `libc::thread`'s raw pthread
-// wrapper. The closure moves its captured environment into the new
-// thread instead of handing over a bare `*u8`. There is no `detach`:
-// every spawned thread's `Ret` must reach a `join`, so a linear value it
-// produces can never be stranded with nobody left to destroy it.
-//
-// `spawn` is safe to call. Holding a value does not by itself grant
-// permission to act on it, so moving an environment into another thread
-// is inert by itself:
-// - a linear `Env` transfers exclusive ownership; the checker rejects any
-//   further use of what was captured;
-// - a Copy `Env` with no raw pointer in it is plain data, with nothing to
-//   race on;
-// - a Copy `Env` that is or contains a raw pointer grants no access by
-//   existing: every dereference of it, in either thread, needs its own
-//   `unsafe`.
-// Shared mutable state should cross as `std::cap::Exclusive!`/`Shared!`
-// rather than a bare pointer; both are linear, so moving or splitting one
-// into the closure is the same ownership transfer as any linear `Env`.
+//! Threads: `spawn` runs a closure on a new OS thread, and `Thread!::join`
+//! waits for it and returns what it returned.
+//!
+//! The closure moves what it captured into the new thread. There is no
+//! `detach`: every spawned thread's result must reach a `join`, so a linear
+//! value it produces can never be stranded with nobody left to destroy it.
+//!
+//! `spawn` is safe to call. Holding a value does not by itself grant
+//! permission to act on it, so moving an environment into another thread is
+//! inert by itself: a linear environment transfers exclusive ownership, and
+//! the checker rejects any further use of what was captured; one that is
+//! `Copy` with no raw pointer in it is plain data, with nothing to race on;
+//! and one that is or holds a raw pointer grants no access by existing,
+//! since every dereference of it, in either thread, needs its own `unsafe`.
+//!
+//! Shared mutable state should cross as `std::cap::Exclusive!` or `Shared!`
+//! rather than a bare pointer: both are linear, so moving or splitting one
+//! into the closure is the same ownership transfer as any linear value. A
+//! closure cannot mention a brand its block opened (`let exists 't. ...`),
+//! so a capability over one is sent by a function generic over the brand,
+//! where it is a parameter, which calls `spawn`:
+//! `forall 't. fn work(tag: Exclusive!['t], bytes: Slice[u8, 't])`.
+// Built on `libc::thread`'s raw pthread wrapper. `SpawnPayload[Env, Ret]`
+// and `ResultBox[Ret]` box the closure and its result on the heap so they
+// can cross that layer's raw `unsafe fn(*u8) -> *u8` boundary.
+use package as std;
 
-use std::heap::HeapAllocator;
-use std::mem::sizeof;
-use std::io::Error;
-use std::option::Result;
+use alloc::heap::HeapAllocator;
+use core::mem::sizeof;
+use core::option::Result;
 use libc::thread::{spawn as raw_spawn, Thread! as RawThread!};
+use std::io::Error;
 
 forall Env, Ret.
 struct SpawnPayload {
@@ -38,6 +44,8 @@ struct ResultBox {
     present: bool,
 }
 
+/// A thread `spawn` started, whose closure returns a `Ret`; `join` waits for
+/// it.
 forall Ret.
 struct Thread! {
     raw: RawThread!,
@@ -67,9 +75,10 @@ unsafe fn trampoline(raw: *u8) -> *u8 {
 }
 
 /// Spawns an OS thread running `f()`; `join` returns `f`'s result, typed
-/// as `Ret`. The header explains why this is safe to call. When no thread
-/// can be started, `f` comes back unrun with the error, so what it captured
-/// is still the caller's.
+/// as `Ret`, which may be a zero-size type such as `()`. The module's
+/// overview explains why this is safe to call. When no thread can be
+/// started, `f` comes back unrun with the error, so what it captured is
+/// still the caller's.
 forall Env, Ret.
 fn spawn(f: closure[Env]() -> Ret) -> Result[Thread![Ret], (closure[Env]() -> Ret, Error)] {
     let payload = SpawnPayload.{ f };
@@ -82,11 +91,11 @@ fn spawn(f: closure[Env]() -> Ret) -> Result[Thread![Ret], (closure[Env]() -> Re
     // thread starts; this thread reads it again only when it does not.
     let spawned = unsafe raw_spawn(trampoline[Env, Ret], raw);
     match spawned {
-        Result::Err(error) => {
+        Result::Err(errno) => {
             // No thread was started, so the box is still this call's.
             let { f } = unsafe *typed;
             let freed = HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(raw));
-            Result::Err.((f, error))
+            Result::Err.((f, Error.{ errno }))
         },
         Result::Ok(raw_thread) => Result::Ok.(Thread!.{ raw: raw_thread }),
     }
@@ -103,7 +112,7 @@ impl Thread![Ret] {
         let { raw } = self;
         let joined = unsafe raw.join();
         match joined {
-            Result::Err(error) => Result::Err.(error),
+            Result::Err(errno) => Result::Err.(Error.{ errno }),
             Result::Ok(result_ptr) => {
                 let typed = unsafe (result_ptr as *ResultBox[Ret]);
                 let boxed_result = unsafe *typed;
@@ -114,5 +123,4 @@ impl Thread![Ret] {
             },
         }
     }
-    // No `detach`: see the header.
 }

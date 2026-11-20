@@ -1,12 +1,12 @@
 # Library contract inventory
 
 This document classifies the functions of the `core`, `alloc`, `std`,
-`libc`, `thread` and `toml` packages by signature shape, and records the
+`libc` and `toml` packages by signature shape, and records the
 caller obligation of every function whose signature exposes a raw pointer.
 Items are named by module path within their home package
 (`core::raw::raw_get`, `alloc::buffer::Buffer!::push_n`,
 `libc::thread::spawn`); `std` re-exports the `core` and `alloc` modules
-under `std::` paths. `toml` declares no raw pointer, no `unsafe fn` and no
+under `std::` paths, but not `libc`'s. `toml` declares no raw pointer, no `unsafe fn` and no
 `extern "C"` function: all of it is class C.
 
 A signature classification is not a proof of its implementation.
@@ -163,37 +163,44 @@ free, unlock or restore.
 detect a violation, and an `unsafe` marker at the call site discharges the
 call's pointer obligations, not this one. The obligation is on the foreign
 code and can only be met by whoever chooses what to declare `extern "C"`.
-The library's own externs satisfy it:
+The library's own externs satisfy it. They are declared in `alloc` (the
+allocator's) and in `libc` (the C runtime's), each once; `std` declares
+none and calls `libc`'s:
 
 - `alloc::heap`: `malloc`, `realloc`, `free`, and `abort` and `exit`
   (declared `-> !`, the permitted terminating cases); `alloc::buffer`
-  declares `abort` again for `Buffer!::new_with_cap` and `commit`;
-- `std::io`: `fs.c`'s `kur_libc_fs_read`, `_write`, `_open_read`,
+  declares `abort` again for `Buffer!::new_with_cap` and `commit` (both
+  below `libc`, so that a freestanding program needs only these);
+- `libc::io` (`io.c`): `kur_libc_fs_read`, `_write`, `_open_read`,
   `_create`, `_close`, `_regular_size` and `_size_hint`, which retry a call
-  a signal interrupts and report a failure as a negative errno,
-  `kur_libc_stdin_claim` and `_release`, which set and clear the flag that
-  makes one `Input!` at a time the reader of standard input, and
-  `kur_libc_error_message` (`strerror_r`) and `kur_libc_error_kind`, which
-  describe an errno;
-- `std::fs`: `fs.c`'s `kur_libc_fs_error`, `_release`, `_canonicalize`,
+  a signal interrupts (but `close`) and report a failure as a negative
+  errno, `kur_libc_stdin_claim` and `_release`, which set and clear the
+  flag that makes one `std::io::Input!` at a time the reader of standard
+  input, and `kur_libc_error_message` (`strerror_r`) and
+  `kur_libc_error_kind`, which describe an errno;
+- `libc::fs` (`fs.c`): `kur_libc_fs_error`, `_release`, `_canonicalize`,
   `_stat`, `_remove`, `_rename`, `_mkdir`, `_open_directory`,
   `_next_entry`, `_entry_name`, `_entry_is_directory` and
-  `_close_directory`; `std::env`: `_getenv` and `_release`;
-- `std::process`: `fs.c`'s `kur_libc_process_spawn`, which makes the
+  `_close_directory`; `libc::env` (`env.c`): `kur_libc_env_get`;
+- `libc::process` (`process.c`): `kur_libc_process_spawn`, which makes the
   pipes, the environment and the file actions a command asks for and
   starts the child with `posix_spawnp` (no library code runs in the
   child), `_wait`, which waits for it, again when a signal interrupts the
   wait, `_kill` and `_signal` (`kill(2)`), `_poll`, which waits for one of
-  two pipes to be readable, again after a signal, `_cpus`, which counts
-  the processors of the affinity mask, and `_hash_seed`, which reads the
-  seed start-up drew (and aborts if it drew none);
-- `std::time`: `fs.c`'s `kur_libc_time_monotonic`, which reads the host's
-  `CLOCK_MONOTONIC` (and aborts where it has none), and
-  `kur_libc_time_sleep`, which sleeps on after a signal; `std::float`:
-  `strtod`;
-- `libc::thread`: `thread.c`'s `kur_libc_thread_error`, `_create` and
+  two pipes to be readable, again after a signal, and `_cpus`, which counts
+  the processors of the affinity mask; and `start.c`'s `_hash_seed`, which
+  reads the seed start-up drew (and aborts if it drew none);
+- `libc::time` (`time.c`): `kur_libc_time_monotonic`, which reads the
+  host's `CLOCK_MONOTONIC` (and aborts where it has none), and
+  `kur_libc_time_sleep`, which sleeps on after a signal; `libc::float`:
+  the C library's `strtod`;
+- `libc::thread` (`thread.c`): `kur_libc_thread_error`, `_create` and
   `_join`. A thread `_create` starts runs `entry` to its return; it is
   never cancelled and never calls `pthread_exit`.
+
+`start.c`'s `kur_libc_process_start` and `_report_error` are called by the
+C `main` the compiler writes, not declared in Kursal; they return normally
+or abort.
 
 An extern that can `longjmp`, throw, or resume from a handler into its
 caller is not made safe by this library's vocabulary or by an `unsafe`
@@ -232,8 +239,8 @@ double free.
 | `alloc::arena::free_chain_after_root_release` | `c` heads a chunk chain this arena built, **and** `Arena!::destroy` has already retired the root chunk's data buffer through `Allocation!::release`. Every header and every non-root data buffer is freed, so every arena pointer dies. Calling it without the prior `release` leaks the root buffer; calling it on a chain whose root was freed some other way double-frees it |
 | `alloc::heap::HeapAllocator::adopt_raw` | `p` is a live `malloc`/`realloc` result with no other owner; it becomes a linear, freeable `Uninit!`. Records extent 0, since the size did not travel with the address |
 | `alloc::heap::HeapAllocator::adopt_raw_sized` | `adopt_raw`'s obligation, **plus** `extent` is the size most recently requested for that block. With `adopt_raw`, the only way into an `Uninit!` from a bare pointer |
-| `thread::thread::trampoline` | `raw` is the `SpawnPayload[Env, Ret]` box `thread::spawn` built for the same `Env` and `Ret`, owned by nothing else: it is read, freed, and its closure called once. Reached only through the pointer `spawn` hands `libc::thread::spawn` |
-| `libc::thread::spawn` | `entry(arg)` is a call whose obligations hold on the new thread (`entry` is typed `unsafe fn(*u8) -> *u8` for that reason; section 2.5); `arg`'s pointee stays valid while the new thread may use it, and accesses to it from the two threads are safe to interleave. On failure no thread ran and `entry` was not called |
+| `std::thread::trampoline` | `raw` is the `SpawnPayload[Env, Ret]` box `std::thread::spawn` built for the same `Env` and `Ret`, owned by nothing else: it is read, freed, and its closure called once. Reached only through the pointer `spawn` hands `libc::thread::spawn` |
+| `libc::thread::spawn` | `entry(arg)` is a call whose obligations hold on the new thread (`entry` is typed `unsafe fn(*u8) -> *u8` for that reason; section 2.5); `arg`'s pointee stays valid while the new thread may use it, and accesses to it from the two threads are safe to interleave. On failure (the errno) no thread ran and `entry` was not called |
 | `libc::thread::Thread!::join` | the `*u8` it returns is whatever `entry` returned, with no static knowledge of what it points to; the caller treats it as `entry`'s own contract says. The handle is consumed whether `pthread_join` succeeds or not |
 
 ### 2.2 Writes through an arbitrary pointer
@@ -333,12 +340,12 @@ callback's type, and the difference matters:
 `libc::thread::spawn` is the one function whose callback type is itself
 `unsafe fn(*u8) -> *u8`, and the rule above still holds. The callback is
 not something `spawn` lets the caller make unsafe; it is an existing
-`unsafe fn` (in practice `thread::thread::trampoline`), whose own
+`unsafe fn` (in practice `std::thread::trampoline`), whose own
 obligation is about the `*u8` it is handed. A safe function value cannot be
 bound to an `unsafe fn` parameter's type in reverse, and `spawn` is itself
 `unsafe fn`: its caller writes `unsafe libc::thread::spawn(entry, arg)` and
 thereby vouches that `entry(arg)` meets `entry`'s obligation on the new
-thread. `thread::thread::spawn` discharges it once, for the payload it
+thread. `std::thread::spawn` discharges it once, for the payload it
 builds, and is safe.
 
 `HashMap!::get`/`insert`/`remove` are
@@ -561,12 +568,12 @@ Types whose hidden representation protects authority or bounds:
 | `Stamp['r]` | `core::cap` | exposed to `core` alone (`exposed (package)`): `core` modules read a domain's brand out of it, code outside `core` can hold one but not open it |
 | `File!`, `Output!`, `Input!` | `std::io` | `File!` owns one open descriptor; forging one closes an arbitrary descriptor. `descriptor` hands out its number, which no safe function takes. `Output!` writes to a descriptor it does not own (stdout, stderr), which a forged one could point anywhere. `Input!` is made only by `stdin`, once it holds standard input, so that one reader at a time reads ahead from it; a forged one would skip what another has read ahead, and its `finish` would give standard input back from under the one that holds it. No `File!` owns a standard stream's number: the C `main` of an executable (`kursal build`) opens `/dev/null` on each of descriptors 0, 1 and 2 the process started without, before the program runs |
 | `Args` | `std::process` | `argv` and `argc` as C's `main` received them: made only by the C `main` the compiler writes for an entry function taking one (its `argv` has `count` readable entries, each a NUL-terminated string live for the rest of the process) |
-| `Command!` | `std::process` | a command line of `count` NUL-terminated arguments, which `fs.c` splits into the table `posix_spawnp` reads, and `env_ops` environment changes in the form `fs.c` parses; a forged one would hand `fs.c` a mismatched count. Its streams are `Stdio!` values, whose `File` is a `File!` the command closes after `spawn` |
+| `Command!` | `std::process` | a command line of `count` NUL-terminated arguments, which `process.c` splits into the table `posix_spawnp` reads, and `env_ops` environment changes in the form `process.c` parses; a forged one would hand `process.c` a mismatched count. Its streams are `Stdio!` values, whose `File` is a `File!` the command closes after `spawn` |
 | `Child!` | `std::process` | a child this process started and has not waited for, so its process id names it and no other: `wait`, `kill` and `signal` reach it. A forged one would `waitpid` or signal an arbitrary process, and reap a child another component owns. Its pipe ends are `File!`s |
 | `Instant` | `std::time` | a monotonic clock reading; nothing outside makes one |
 | `Directory!` | `std::fs` | owns one open `DIR *`; forging one hands `readdir`/`closedir` an arbitrary pointer |
 | `Thread!` | `libc::thread` | owns one `pthread_t` handle that `join` frees; forging one joins and frees an arbitrary pointer |
-| `Thread![Ret]`, `SpawnPayload`, `ResultBox` | `thread::thread` | a spawned thread whose `join` reads back a `ResultBox[Ret]`; a forged one would read any thread's result as a `Ret`. The boxes never leave the module |
+| `Thread![Ret]`, `SpawnPayload`, `ResultBox` | `std::thread` | a spawned thread whose `join` reads back a `ResultBox[Ret]`; a forged one would read any thread's result as a `Ret`. The boxes never leave the module |
 | `Parser`, `FlagNode`, `KeyPath` | `toml::parser` | the parser's own state and its record of what a document has defined; nothing outside reads or makes them |
 
 A survey that finds no outside construction sites is evidence, not proof,
@@ -578,7 +585,8 @@ that restricting a type costs nothing: it only sees the code it is run on.
   else: building one needs both, and taking one apart gives back only what
   went in.
 - **`std::io::Error`.** An errno value, the one error type of `std::io`,
-  `std::fs`, `std::process`, `libc` and `thread`. Any number is a valid one, so building one grants
+  `std::fs`, `std::process` and `std::thread` (`libc` reports the errno
+  itself, an `i32`). Any number is a valid one, so building one grants
   nothing.
 - **Values that hold only what their builder already had:**
   `alloc::collections::hashmap::OwnedMap!` and

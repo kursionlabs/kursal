@@ -57,8 +57,10 @@ Ordinary `//` comments stay in source and are omitted from the site.
   module. Both end with the package's module tree, the current module marked.
 
 `extern` declarations are left out of the pages (they remain on the source
-pages). They bind the C functions a module is built on, such as the
-`kur_libc_*` helpers, and are the module's own plumbing rather than its
+pages). They bind the C functions a module is built on, such as the C
+runtime's, which the `libc` package declares (so `bin/kursal doc lib/std`
+documents `libc` as a dependency of `std`, and its module pages hold their
+overviews and `libc::thread`'s raw `Thread!`), and are plumbing rather than
 interface. Kursal has no item-level privacy, so every other declaration of a
 public module is listed. A visibility rule would be applied where the
 generator walks a module's items (`module_page` and `search_index` in
