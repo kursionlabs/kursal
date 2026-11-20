@@ -100,6 +100,11 @@ class TForeach:
     source: Type
     body: Type
 
+    def binders(self) -> tuple[str, ...]:
+        """The names its body binds: its own binder, then those of a `foreach` source, as the core
+        transform retains them."""
+        return (self.binder, *(self.source.binders() if isinstance(self.source, TForeach) else ()))
+
 
 @dataclass
 class TForall:

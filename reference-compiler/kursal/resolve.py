@@ -748,9 +748,9 @@ class Names:
                     self.type(env, types)
             case S.TExists(body=body):
                 self.type(body, types)
-            case S.TForeach(binder=binder, source=source, body=body):
+            case S.TForeach(source=source, body=body):
                 self.type(source, types)
-                self.type(body, types | {binder})
+                self.type(body, types | set(type_expr.binders()))
             case S.TForall(params=params, body=body):
                 self.type(body, types | {p for p in params if not p.startswith("'")})
 

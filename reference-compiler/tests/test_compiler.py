@@ -1178,6 +1178,9 @@ SIGNATURES = (
     "forall T where Exposed[T]. struct G! { g: foreach X of T => *X }\nforall T where Exposed[T]. struct K { k: foreach X of T => u8 }\n",
     # A foreach over a pointer to a recursive type has the pointee's fields: here *L and u32, finite.
     "struct L { next: *L, v: u32 }\nstruct M { f: foreach *F of *L => F }\n",
+    # A foreach over a transformed source binds the source's binders in its body too, as its core
+    # transform retains them.
+    "struct N { f: foreach F of (foreach G of (u32, u8) => *G) => (F, G) }\n",
 )
 
 SIGNATURE_ERRORS = (

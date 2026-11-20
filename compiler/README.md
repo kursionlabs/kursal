@@ -909,6 +909,9 @@ These are the places where Kursal differs from what one might expect.
   before any name, even behind a pointer, is rejected too (`struct T { f: foreach *F of *T => *F
   }`: `recursive foreach needs a named type between`). Errors name the declaration whose walk found
   them.
+- **A `foreach` type's body** binds its own binder and, over a transformed source, that source's
+  binders, each the component's: in `foreach F of (foreach G of (u32, u8) => *G) => (F, G)`, `G` is
+  `u32` in the first row and `u8` in the second, even where a type parameter `G` is in scope.
 - **Expressions as statements.** `f(x);` discards a Copy result. A block's value is its last
   expression, without a `;`. `return` is allowed anywhere; a function whose type is `!` (such as
   `fail`) can stand in any expression position.
