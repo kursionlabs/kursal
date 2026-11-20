@@ -94,6 +94,34 @@ REJECTED = {
     "cast_from_abstract": ("unsafe_cast_cannot_produce", """
         (fun (unsafe) h (forall (T) () u32 (T) (entry ((%x T)) (= %n (cast %x u32)) (ret %n))))"""),
 
+    # Re-entering a nominal type's premises must descend. A brand an existential binds is a different
+    # variable from the function's brand, however each is spelled: here the reentry into A changes its
+    # brand argument while shrinking the other, so it does not descend under either spelling.
+    "descent_through_shadowing_binder": ("non-descending nominal premise formation for A", """
+        (trait P (T))
+        (trait Q (T))
+        (type A (forall ($a T) ((P T)) (tuple)))
+        (type B (forall ()
+          ((Q (exists ($a) (tuple (A $a u32) (brand $a)))))
+          (tuple)))
+        (instance P (u32))
+        (instance Q ((exists ($c) (tuple (A $c u32) (brand $c)))))
+        (instance P ((tuple u32 B)))
+        (fun f (forall ($a) () u32 ((A $a (tuple u32 B)))
+          (entry ((%x (A $a (tuple u32 B)))) (= %r (const u32 1)) (ret %r))))"""),
+    "descent_through_renamed_binder": ("non-descending nominal premise formation for A", """
+        (trait P (T))
+        (trait Q (T))
+        (type A (forall ($a T) ((P T)) (tuple)))
+        (type B (forall ()
+          ((Q (exists ($b) (tuple (A $b u32) (brand $b)))))
+          (tuple)))
+        (instance P (u32))
+        (instance Q ((exists ($c) (tuple (A $c u32) (brand $c)))))
+        (instance P ((tuple u32 B)))
+        (fun f (forall ($a) () u32 ((A $a (tuple u32 B)))
+          (entry ((%x (A $a (tuple u32 B)))) (= %r (const u32 1)) (ret %r))))"""),
+
     # Atomic read-modify-write takes integers; other atomics take integers, bools or pointers.
     "atomic_fetch_on_struct": ("atomic_pointee_type", """
         (type S (struct (a u32)))

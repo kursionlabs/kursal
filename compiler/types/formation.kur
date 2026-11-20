@@ -13,7 +13,7 @@ use package::kurs::core::{Block, Edge, Fun, Kind, ModuleId, Param, Premise, Prog
 use package::kurs::core as C;
 use package::resolve::resolver::Resolver;
 use package::syntax::ast::{Pos, no_pos};
-use package::types::ops::{Fresh, Types, children, equal, foreach_binders, free_brands, kind_name, kurs_error, subst};
+use package::types::ops::{Fresh, Types, children, equal, foreach_binders, free_brands, free_names, kind_name, kurs_error, subst};
 use std::option::Option;
 use std::slice::Slice;
 
@@ -118,8 +118,11 @@ exposed struct Formation {
     discharge: Ref[Option[D], 'k],
     premises: Ref[ArenaVec[Premise['k], 'k], 'k],
     home: Ref[Option[ModuleId['k]], 'k],
-    // nominal types whose premises are being formed, with their arguments
-    active: ArenaVec[(Span['k], ArenaVec[Type['k], 'k]), 'k],
+    // nominal types whose premises are being formed, with their arguments and the number of binders
+    // `opened` held when each began: a binder opened since is a different variable from any name its
+    // arguments mention, however it is spelled
+    active: ArenaVec[(Span['k], ArenaVec[Type['k], 'k], usize), 'k],
+    opened: ArenaVec[Span['k], 'k],
     // the resolver that locates errors, when a declaration's file is known
     reporter: Ref[Option[Resolver['k]], 'k],
 }
@@ -165,6 +168,7 @@ impl Formation[D, 'k] {
             premises: Ref::new(&cx, ArenaVec::new(&cx)),
             home: Ref::new(&cx, Option::None),
             active: ArenaVec::new(&cx),
+            opened: ArenaVec::new(&cx),
             reporter: Ref::new(&cx, Option::None),
         }
     }
@@ -297,7 +301,10 @@ impl Formation[D, 'k] {
                     }
                     i = i + 1usize;
                 }
+                let mark = self.opened.len(&cx);
+                self.opened.append(&cx, binders);
                 self.fits(&cx, body.copy(&cx), Kind::Any, inner);
+                self.opened.truncate(&cx, mark);
             },
             Type::Foreach(f) => {
                 self.fits(&cx, f.source.copy(&cx), Kind::Any, env);
@@ -308,7 +315,11 @@ impl Formation[D, 'k] {
                 if !available.slice(&cx, 0usize, f.retained.len(&cx)).eq(&cx, f.retained) {
                     self.fail_static(&cx, "foreach retained binders must be a source prefix");
                 }
-                self.fits(&cx, f.body.copy(&cx), Kind::Any, self.extend(&cx, env, params_of(&cx, foreach_binders(&cx, f), Kind::Any)));
+                let names = foreach_binders(&cx, f);
+                let mark = self.opened.len(&cx);
+                self.opened.append(&cx, names);
+                self.fits(&cx, f.body.copy(&cx), Kind::Any, self.extend(&cx, env, params_of(&cx, names, Kind::Any)));
+                self.opened.truncate(&cx, mark);
             },
             Type::Fn(f) => {
                 var i = 0usize;
@@ -326,12 +337,19 @@ impl Formation[D, 'k] {
                     j = j + 1usize;
                 }
                 let inner = self.extend(&cx, env, f.quantified);
+                let mark = self.opened.len(&cx);
+                var q = 0usize;
+                while q < f.quantified.len(&cx) {
+                    self.opened.push(&cx, f.quantified.at(&cx, q).name);
+                    q = q + 1usize;
+                }
                 var k = 0usize;
                 while k < f.params.len(&cx) {
                     self.fits(&cx, f.params.at(&cx, k), Kind::Any, inner);
                     k = k + 1usize;
                 }
                 self.fits(&cx, f.ret.copy(&cx), Kind::Any, inner);
+                self.opened.truncate(&cx, mark);
             },
             Type::Prim(name) => {
                 if !C::is_prim(&cx, name) {
@@ -400,13 +418,13 @@ impl Formation[D, 'k] {
         }
         var i = 0usize;
         while i < self.active.len(&cx) {
-            let (n, previous) = self.active.at(&cx, i);
-            if n.eq(&cx, name) && !nominal_descent(&cx, args, previous) {
+            let (n, previous, depth) = self.active.at(&cx, i);
+            if n.eq(&cx, name) && (self.mentions_opened_since(&cx, args, depth) || !nominal_descent(&cx, args, previous)) {
                 self.fail(&cx, Buffer!::new().push_static("non-descending nominal premise formation for ").push_bytes(&cx, name).save(&cx));
             }
             i = i + 1usize;
         }
-        self.active.push(&cx, (name, args));
+        self.active.push(&cx, (name, args, self.opened.len(&cx)));
         let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
         var j = 0usize;
         while j < decl.params.len(&cx) && j < args.len(&cx) {
@@ -430,6 +448,23 @@ impl Formation[D, 'k] {
             k = k + 1usize;
         }
         let unit = self.active.pop(&cx);
+    }
+
+    // Whether `args` mention a binder opened after the first `depth` of `opened`.
+    fn mentions_opened_since(self, &cx: Domain!['k], args: ArenaVec[Type['k], 'k], depth: usize) -> bool {
+        var a = 0usize;
+        while a < args.len(&cx) {
+            let names = free_names(&cx, args.at(&cx, a));
+            var i = depth;
+            while i < self.opened.len(&cx) {
+                if names.contains(&cx, self.opened.at(&cx, i)) {
+                    return true;
+                }
+                i = i + 1usize;
+            }
+            a = a + 1usize;
+        }
+        false
     }
 
     fn function(self, &cx: Domain!['k], fun: Fun['k], outer: ArenaVec[Param['k], 'k], premises: ArenaVec[Premise['k], 'k]) {

@@ -9,7 +9,7 @@ from collections.abc import Callable
 
 from . import core as C
 from .sexpr import KursError, Position
-from .types import Kinds, Types, children, foreach_binders, subst, free_brands, equal
+from .types import Kinds, Types, children, foreach_binders, subst, free_brands, free_names, equal
 
 
 def formation_children(ty: C.Type) -> tuple[C.Type, ...]:
@@ -55,7 +55,11 @@ class Formation:
         self.discharge: Optional[Callable[[C.Premise, Kinds, tuple[C.Premise, ...], Optional[C.ModuleId]], bool]] = None
         self.premises: tuple[C.Premise, ...] = ()
         self.module: Optional[C.ModuleId] = None
-        self.active: list[tuple[str, tuple[C.Type, ...]]] = []
+        # The nominal applications whose premises are being formed, each with the number of binders
+        # `opened` held when it began: a binder opened since is a different variable from any name its
+        # arguments mention, however it is spelled.
+        self.active: list[tuple[str, tuple[C.Type, ...], int]] = []
+        self.opened: list[str] = []
 
     def fail(self, message: str) -> None:
         raise KursError(f"type formation: {message}", self.pos)
@@ -121,10 +125,11 @@ class Formation:
                         return C.ANY
                     self.arguments(decl.params, args, env)
                     if self.discharge is not None and decl.premises:
-                        if any(n == name and not nominal_descent(args, previous)
-                               for n, previous in self.active):
+                        mentioned = set().union(*(free_names(a) for a in args))
+                        if any(n == name and (mentioned & set(self.opened[depth:]) or not nominal_descent(args, previous))
+                               for n, previous, depth in self.active):
                             self.fail(f"non-descending nominal premise formation for {name}")
-                        self.active.append((name, args))
+                        self.active.append((name, args, len(self.opened)))
                         try:
                             sub = dict(zip((p.name for p in decl.params), args))
                             for p in decl.premises:
@@ -144,21 +149,25 @@ class Formation:
                     self.fail("nested existential binders must be flattened")
                 if any(not brand_occurs(body, binder) for binder in binders):
                     self.fail("existential brand binder is unused")
-                self.fits(body, C.ANY, inner)
+                self.within(binders, lambda: self.fits(body, C.ANY, inner))
             case C.Foreach(binder=binder, source=source, body=body):
                 self.fits(source, C.ANY, env)
                 available = foreach_binders(source) if isinstance(source, C.Foreach) else ()
                 if tuple(available[:len(ty.retained or ())]) != ty.retained:
                     self.fail("foreach retained binders must be a source prefix")
-                self.fits(body, C.ANY, self.extend(env, tuple(C.Param(b) for b in foreach_binders(ty))))
+                names = foreach_binders(ty)
+                self.within(names, lambda: self.fits(body, C.ANY, self.extend(env, tuple(C.Param(b) for b in names))))
             case C.Fn(params=params, ret=ret, forall=forall, places=places):
                 if any(p.kind != C.BRAND for p in forall):
                     self.fail("function values quantify only brands")
                 if not places <= set(range(len(params))):
                     self.fail("function place index out of range")
                 inner = self.extend(env, forall)
-                for t in (*params, ret):
-                    self.fits(t, C.ANY, inner)
+
+                def signature() -> None:
+                    for t in (*params, ret):
+                        self.fits(t, C.ANY, inner)
+                self.within(tuple(p.name for p in forall), signature)
             case C.Prim(name=name):
                 if name not in C.PRIMS:
                     self.fail(f"unknown primitive {name}")
@@ -174,6 +183,14 @@ class Formation:
             case _:
                 self.fail("unknown type node")
         return C.ANY
+
+    def within(self, binders: tuple[str, ...], check: Callable[[], object]) -> None:
+        """Run `check` with `binders` opened."""
+        self.opened.extend(binders)
+        try:
+            check()
+        finally:
+            del self.opened[len(self.opened) - len(binders):]
 
     def function(self, fun: C.Fun, outer: tuple[C.Param, ...] = (),
                  premises: tuple[C.Premise, ...] = ()) -> None:
