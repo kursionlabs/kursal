@@ -96,6 +96,33 @@ class RetainedScopeTests(unittest.TestCase):
         self.assertTrue(equal(result, expected))
         self.assertEqual(subst(original, {"G": C.U32}), original)
 
+    def test_a_source_binder_not_retained_is_the_enclosing_variable(self):
+        # The body's F is free: this transform retains none of its source's binders, so the source's
+        # binder F binds nothing there and substituting F reaches it.
+        source = C.Foreach("F", False, C.Tuple((C.U32,)), C.Named("F"))
+        mapped = C.Foreach("G", False, source, C.Tuple((C.Named("G"), C.Named("F"))), ())
+        self.assertEqual(free_names(mapped), {"F"})
+        result = subst(mapped, {"F": C.Prim("u8")})
+        self.assertEqual(result.body, C.Tuple((C.Named("G"), C.Prim("u8"))))
+        self.assertEqual(result.source, source)
+        self.assertEqual(foreach_item(mapped), C.Named("G"))
+        # A replacement naming a binder a body retains renames it in its source and in that body alike.
+        retained = C.Foreach("G", False, source, C.Tuple((C.Named("G"), C.Named("F"), C.Named("T"))))
+        renamed = subst(retained, {"T": C.Named("F")})
+        self.assertEqual(free_names(renamed), {"F"})
+        self.assertTrue(equal(renamed, C.Foreach("G", False, C.Foreach("H", False, C.Tuple((C.U32,)), C.Named("H")),
+                                                 C.Tuple((C.Named("G"), C.Named("H"), C.Named("F"))))))
+        # A source binder an enclosing body retains is renamed when that body's replacement would
+        # capture it, even where the source's own body binds nothing it reaches.
+        innermost = C.Foreach("H", False, C.Tuple((C.U32,)), C.Named("H"))
+        partial = C.Foreach("G", False, C.Foreach("F", False, innermost, C.Named("F"), ("H",)),
+                            C.Tuple((C.Named("H"), C.Named("F"))), ("F",))
+        # Its item names H, which it does not retain: the mapper takes an abstract item instead.
+        self.assertEqual(foreach_item(partial), C.Named("G"))
+        moved = subst(partial, {"H": C.Named("F")})
+        self.assertTrue(equal(moved, C.Foreach("G", False, C.Foreach("K", False, innermost, C.Named("K"), ("H",)),
+                                               C.Tuple((C.Named("F"), C.Named("K"))), ("K",))))
+
     def test_specialization_does_not_add_source_binders(self):
         inner = C.Foreach("G", False, C.Tuple((C.U32,)), C.Named("G"))
         generic = C.Foreach("F", False, C.Named("T"), C.Named("F"))

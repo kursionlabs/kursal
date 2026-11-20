@@ -259,15 +259,15 @@ fn subst(&cx: Domain!['k], ty: Type['k], sub: ArenaMap[Span['k], Type['k], 'k], 
         },
         Type::Skolem(label) => sub.get_or(&cx, label, ty),
         Type::Exists(binders, body) => {
-            let (names, inner) = rebind(&cx, binders, sub, true, counter);
+            let (names, inner) = rebind(&cx, binders, sub, true, ArenaSet::new(&cx), counter);
             Type::Exists.(names, Ref::new(&cx, subst(&cx, body.copy(&cx), inner, counter)))
         },
         Type::Foreach(f) => {
-            let (result, inner) = subst_foreach(&cx, f, sub, counter);
+            let (result, renames) = subst_foreach(&cx, f, sub, ArenaSet::new(&cx), counter);
             Type::Foreach.(result)
         },
         Type::Fn(f) => {
-            let (names, inner) = rebind(&cx, param_names(&cx, f.quantified), sub, true, counter);
+            let (names, inner) = rebind(&cx, param_names(&cx, f.quantified), sub, true, ArenaSet::new(&cx), counter);
             let params: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
             var i = 0usize;
             while i < f.params.len(&cx) {
@@ -295,54 +295,105 @@ fn foreach_binders(&cx: Domain!['k], ty: ForeachType['k]) -> ArenaVec[Span['k], 
     out
 }
 
-// Abstract mapper input, using only the retained binders of this transform.
+// Abstract mapper input. A transformed source's body is the item only when this transform retains
+// every binder it names; otherwise the item is abstract, as over any other source.
 forall 'k.
 fn foreach_item(&cx: Domain!['k], ty: ForeachType['k]) -> Type['k] {
-    if !ty.retained.is_empty(&cx) {
-        let unit = match ty.source.copy(&cx) {
-            Type::Foreach(source) => {
+    let unit = match ty.source.copy(&cx) {
+        Type::Foreach(source) => {
+            if ty.retained.eq(&cx, foreach_binders(&cx, source)) {
                 return source.body.copy(&cx);
-            },
-            _ => (),
-        };
-    }
+            }
+        },
+        _ => (),
+    };
     let binder = C::named(ty.binder, ArenaVec::new(&cx));
     if ty.indirect { C::ptr(&cx, binder) } else { binder }
 }
 
-// Transport retained binder renamings into each enclosing transform body.
+// `ty` under `sub`, and the renamings of its binders (its own and those it retains).
+//
+// Each body is substituted with `sub` less the names it binds, so a source binder it does not retain
+// is the enclosing variable of that name there. A binder is renamed where a replacement in any body
+// that binds it would capture it: a source's binder also avoids what an enclosing body that retains
+// it substitutes (`avoid`).
 forall 'k.
-fn subst_foreach(&cx: Domain!['k], ty: ForeachType['k], sub: ArenaMap[Span['k], Type['k], 'k], counter: Fresh['k]) -> (ForeachType['k], ArenaMap[Span['k], Type['k], 'k]) {
-    let (source, retained) = match ty.source.copy(&cx) {
-        Type::Foreach(inner) => {
-            let (s, r) = subst_foreach(&cx, inner, sub, counter);
-            (Type::Foreach.(s), r)
-        },
-        _ => (subst(&cx, ty.source.copy(&cx), sub, counter), sub.clone(&cx)),
-    };
-    let (binders, inner) = rebind(&cx, ArenaVec::one(&cx, ty.binder), retained, false, counter);
-    let names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+fn subst_foreach(&cx: Domain!['k], ty: ForeachType['k], sub: ArenaMap[Span['k], Type['k], 'k], avoid: ArenaSet[Span['k], 'k], counter: Fresh['k]) -> (ForeachType['k], ArenaMap[Span['k], Type['k], 'k]) {
+    let own: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+    let keys = sub.keys(&cx);
     var i = 0usize;
-    while i < ty.retained.len(&cx) {
-        let b = ty.retained.at(&cx, i);
-        let name = match inner.get(&cx, b) {
+    while i < keys.len(&cx) {
+        let key = keys.at(&cx, i);
+        if !key.eq(&cx, ty.binder) && !ty.retained.contains(&cx, key) {
+            own.insert(&cx, key, sub.at(&cx, key));
+        }
+        i = i + 1usize;
+    }
+    let (source, renames) = match ty.source.copy(&cx) {
+        Type::Foreach(inner) => {
+            let reached = avoid.clone(&cx);
+            let values = own.values(&cx);
+            var v = 0usize;
+            while v < values.len(&cx) {
+                reached.insert_all(&cx, free_names(&cx, values.at(&cx, v)).keys(&cx));
+                v = v + 1usize;
+            }
+            let kept: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+            var r = 0usize;
+            while r < ty.retained.len(&cx) {
+                if reached.contains(&cx, ty.retained.at(&cx, r)) {
+                    kept.insert(&cx, ty.retained.at(&cx, r));
+                }
+                r = r + 1usize;
+            }
+            let (s, n) = subst_foreach(&cx, inner, sub, kept, counter);
+            (Type::Foreach.(s), n)
+        },
+        _ => (subst(&cx, ty.source.copy(&cx), sub, counter), ArenaMap::new(&cx)),
+    };
+    let carried: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+    var c = 0usize;
+    while c < ty.retained.len(&cx) {
+        let b = ty.retained.at(&cx, c);
+        let unit = match renames.get(&cx, b) {
+            Option::Some(t) => { carried.insert(&cx, b, t); },
+            Option::None => (),
+        };
+        c = c + 1usize;
+    }
+    let body_sub = own.clone(&cx);
+    let carried_keys = carried.keys(&cx);
+    var k = 0usize;
+    while k < carried_keys.len(&cx) {
+        body_sub.insert(&cx, carried_keys.at(&cx, k), carried.at(&cx, carried_keys.at(&cx, k)));
+        k = k + 1usize;
+    }
+    let (binders, inner) = rebind(&cx, ArenaVec::one(&cx, ty.binder), body_sub, false, avoid, counter);
+    let names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+    var j = 0usize;
+    while j < ty.retained.len(&cx) {
+        let b = ty.retained.at(&cx, j);
+        let name = match carried.get(&cx, b) {
             Option::Some(t) => match t {
                 Type::Named(n, _args) => n,
-                Type::Prim(n) => n,
                 _ => fail(&cx, Span::from_static(&cx, "internal error: a retained foreach binder renamed to a non-name")),
             },
             Option::None => b,
         };
         names.push(&cx, name);
-        i = i + 1usize;
+        j = j + 1usize;
     }
-    let result = ForeachType.{ binder: binders.at(&cx, 0usize), indirect: ty.indirect, source: Ref::new(&cx, source), body: Ref::new(&cx, subst(&cx, ty.body.copy(&cx), inner, counter)), retained: names };
-    (result, inner)
+    let binder = binders.at(&cx, 0usize);
+    if !binder.eq(&cx, ty.binder) {
+        carried.insert(&cx, ty.binder, C::named(binder, ArenaVec::new(&cx)));
+    }
+    let result = ForeachType.{ binder, indirect: ty.indirect, source: Ref::new(&cx, source), body: Ref::new(&cx, subst(&cx, ty.body.copy(&cx), inner, counter)), retained: names };
+    (result, carried)
 }
 
-// Drop `binders` from `sub`, renaming any a replacement would capture.
+// Drop `binders` from `sub`, renaming any a replacement would capture, or that is in `avoid`.
 forall 'k.
-fn rebind(&cx: Domain!['k], binders: ArenaVec[Span['k], 'k], sub: ArenaMap[Span['k], Type['k], 'k], brand: bool, counter: Fresh['k]) -> (ArenaVec[Span['k], 'k], ArenaMap[Span['k], Type['k], 'k]) {
+fn rebind(&cx: Domain!['k], binders: ArenaVec[Span['k], 'k], sub: ArenaMap[Span['k], Type['k], 'k], brand: bool, avoid: ArenaSet[Span['k], 'k], counter: Fresh['k]) -> (ArenaVec[Span['k], 'k], ArenaMap[Span['k], Type['k], 'k]) {
     let inner: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
     let keys = sub.keys(&cx);
     var i = 0usize;
@@ -352,7 +403,7 @@ fn rebind(&cx: Domain!['k], binders: ArenaVec[Span['k], 'k], sub: ArenaMap[Span[
         }
         i = i + 1usize;
     }
-    let captured: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+    let captured = avoid.clone(&cx);
     let values = inner.values(&cx);
     var j = 0usize;
     while j < values.len(&cx) {

@@ -291,6 +291,29 @@ REJECTED = {
             (= %z (const u64 0)) (= %s (construct (tuple u64) %z))
             (= %r (foreach (foreach (G (tuple u64)) u32) %s m)) (ret %r))))"""),
 
+    # A source binder a transform does not retain binds nothing in its body: the body's F is f's type
+    # parameter, which a call substitutes, so f[*u8] takes a row (u32, *u8), not transmute's (u32, F).
+    "unretained_source_binder_is_substituted": ("argument_expected", """
+        (fun f (forall (F) () F ((foreach (G (foreach (F (tuple u32)) F)) (tuple G F) (retain)))
+          (entry ((%v (foreach (G (foreach (F (tuple u32)) F)) (tuple G F) (retain))))
+            (= %row (destruct %v (foreach (G (foreach (F (tuple u32)) F)) (tuple G F) (retain))))
+            (= (%n %x) (destruct %row (tuple u32 F))) (ret %x))))
+        (fun transmute (forall (F) () (ptr u8) (F)
+          (entry ((%x F))
+            (= %n (const u32 0)) (= %row (construct (tuple u32 F) %n %x))
+            (= %v (construct (foreach (G (foreach (F (tuple u32)) F)) (tuple G F) (retain)) %row))
+            (= %p (call (f (ptr u8)) %v)) (ret %p))))"""),
+    "unretained_source_binder_is_substituted_renamed": ("argument_expected", """
+        (fun f (forall (F) () F ((foreach (G (foreach (H (tuple u32)) H)) (tuple G F) (retain)))
+          (entry ((%v (foreach (G (foreach (H (tuple u32)) H)) (tuple G F) (retain))))
+            (= %row (destruct %v (foreach (G (foreach (H (tuple u32)) H)) (tuple G F) (retain))))
+            (= (%n %x) (destruct %row (tuple u32 F))) (ret %x))))
+        (fun transmute (forall (F) () (ptr u8) (F)
+          (entry ((%x F))
+            (= %n (const u32 0)) (= %row (construct (tuple u32 F) %n %x))
+            (= %v (construct (foreach (G (foreach (H (tuple u32)) H)) (tuple G F) (retain)) %row))
+            (= %p (call (f (ptr u8)) %v)) (ret %p))))"""),
+
     # A zero-size type is erased: an unsafe cast has no representation of one to reinterpret, and C has
     # no zero-size parameter or object for an extern. Its loads and stores are accepted (test_zero_size).
     "cast_to_unit": ("zero_size_type_has_no_memory_form", """

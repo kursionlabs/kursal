@@ -1471,6 +1471,8 @@ TYPE_CASES = (
     "(subst (foreach (F (foreach (G (tuple T T)) (tuple G U))) (tuple F G U)) ((T u8) (U G)))",
     "(subst (foreach (F (foreach (G (tuple T T)) (tuple G U))) (tuple F G U)) ((T u8) (U F)))",
     "(subst (foreach (F (tuple T)) (tuple F T)) ((T (tuple F)) (F u8)))",
+    "(subst (foreach (G (foreach (F (tuple u32)) F)) (tuple G F) (retain)) ((F u8)))",
+    "(subst (foreach (G (foreach (F (foreach (H (tuple u32)) H)) F (retain H))) (tuple H F) (retain F)) ((H F)))",
     # free names
     "(free (foreach (F (tuple T $k)) (tuple F G)))",
     "(free (fn (forall ($a) () $a ($b T))))",
