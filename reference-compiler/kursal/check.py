@@ -35,9 +35,16 @@ NOWHERE = ModuleId(-1, ("<no module>",))
 SEALED = {"Copy", "Exposed"}      # compiler-reserved trait names: no user trait or instance
 
 
-def contains(ty: Type, pred: Callable[[Type], bool]) -> bool:
-    """`pred` holds somewhere in the value representation of `ty`: a pointer's target is not part of it."""
-    return pred(ty) or not isinstance(ty, (Ptr, NonNull)) and any(contains(t, pred) for t in children(ty))
+def contains(types: Types, ty: Type, pred: Callable[[Type], bool]) -> bool:
+    """`pred` holds somewhere in the value representation of `ty`, or in the arguments of a named type in
+    it. A named type is unfolded too, since its fields are its value; a pointer's target is not part of it."""
+    if pred(ty):
+        return True
+    if isinstance(ty, (Ptr, NonNull)):
+        return False
+    if any(contains(types, t, pred) for t in children(ty)):
+        return True
+    return isinstance(ty, Named) and ty.name in types.program.types and contains(types, types.shape(ty), pred)
 
 
 class CheckError(KursError):
@@ -714,7 +721,7 @@ class Checker:
         if instr.ty is None:
             self.fail("instruction_requires_type")
         got = self.use(instr.args[0])
-        if any(contains(t, self.uncastable) for t in (got, instr.ty)):
+        if any(contains(self.types, t, self.uncastable) for t in (got, instr.ty)):
             self.fail("unsafe_cast_cannot_produce")
         self.has_memory_form(got)
         self.has_memory_form(instr.ty)

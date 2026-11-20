@@ -869,7 +869,10 @@ These are the places where Kursal differs from what one might expect.
   reads through a pointer, `unsafe (x as *T)` casts, `f(unsafe &*p)` lends a pointer's target.
   `unsafe (unsafe malloc(n) as *T)` is two operations. A safe function may contain unsafe operations.
   `as` between two number types is a conversion by value and needs no `unsafe` (see "Number
-  conversions"); a float's bits are `x.to_bits()` and `f64::from_bits(b)`.
+  conversions"); a float's bits are `x.to_bits()` and `f64::from_bits(b)`. An unsafe cast neither
+  makes nor takes apart a value that holds a package, a brand witness, a function value, a
+  transform, a value of a type parameter or `Never` (`unsafe_cast_cannot_produce`), named types'
+  fields included; behind a pointer, reading one is a separate unsafe operation.
 - **Generic code over linear types.** A type parameter may stand for a linear type unless a premise
   says `Copy[T]`. Using a value twice, or dropping it on one path (`a && b` drops `b` when `a` is
   false), needs `Copy[T]`. The arena collections (`ArenaVec`, `ArenaMap`, `ArenaSet`, `List`) require

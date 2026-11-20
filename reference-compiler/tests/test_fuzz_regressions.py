@@ -94,6 +94,7 @@ REJECTED = (
     ("fn g(x: u64) -> core::cap::Brand['static] { unsafe (x as core::cap::Brand['static]) }\n",
      "an unsafe cast cannot produce or take apart"),
     ("fn g(f: fn(u32) -> u32) -> u64 { unsafe (f as u64) }\n", "an unsafe cast cannot produce or take apart"),
+    ("struct S { f: fn() -> () }\nfn g(x: usize) -> S { unsafe (x as S) }\n", "an unsafe cast cannot produce or take apart"),
     ("forall T. exposed enum Opt { Some(T), None }\nfn g(x: u64) -> Opt[u32] { unsafe (x as Opt[u32]) }\n",
      "an unsafe cast cannot reinterpret an enum or a NonNull"),
     ("fn g(x: u64) -> core::ptr::NonNull[u8] { unsafe (x as core::ptr::NonNull[u8]) }\n",

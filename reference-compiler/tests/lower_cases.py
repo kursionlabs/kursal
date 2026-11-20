@@ -23,6 +23,14 @@ LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
     ("fn f() -> u32 { let exists 'a. w = core::cap::fresh(); let p = pack 'a. w; let c = unsafe (p as u32); 0u32 }\n",
      "existential package"),
     ("fn f(x: u32) -> u32 { let p = unsafe (x as exists 'a. core::cap::Brand['a]); 0u32 }\n", "existential package"),
+    # A named type's fields are part of its value: a cast neither makes nor takes apart one that holds a
+    # function value or a brand witness, however deep.
+    ("struct S { f: fn() -> () }\nfn f(x: u64) -> S { unsafe (x as S) }\n", "an unsafe cast cannot produce or take apart"),
+    ("struct S { f: fn() -> () }\nfn f(s: S) -> u64 { unsafe (s as u64) }\n", "an unsafe cast cannot produce or take apart"),
+    ("struct I { f: fn() -> () }\nstruct O { a: u32, i: I }\nfn f(x: u64) -> O { unsafe (x as O) }\n",
+     "an unsafe cast cannot produce or take apart"),
+    ("forall 'k.\nstruct P { x: u64, b: core::cap::Brand['k] }\nforall 'k.\nfn f(x: u64) -> P['k] { unsafe (x as P['k]) }\n",
+     "an unsafe cast cannot produce or take apart"),
     (TOKEN + "fn f() -> u32 { (Token!.{ n: 1u32 }, Token!.{ n: 2u32 }).0.n }\n", "linear sibling"),
     ("unsafe fn danger() -> u32 { 0u32 }\nfn f() -> u32 { danger() }\n", "calling an unsafe function"),
     ("fn take(&x: u32) -> u32 { x }\nfn f(p: *u32) -> u32 { take(&*p) }\n", "lending a raw pointer target"),

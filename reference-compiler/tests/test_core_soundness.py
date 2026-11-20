@@ -81,6 +81,16 @@ REJECTED = {
     "cast_to_nested_package": ("unsafe_cast_cannot_produce", """
         (fun (unsafe) h (tuple (exists ($k) (brand $k))) ((tuple u32))
           (entry ((%x (tuple u32))) (= %n (cast %x (tuple (exists ($k) (brand $k))))) (ret %n)))"""),
+    "cast_to_named_function": ("unsafe_cast_cannot_produce", """
+        (type S (struct (f (fn () u32))))
+        (fun (unsafe) h S (u64) (entry ((%x u64)) (= %s (cast %x S)) (ret %s)))"""),
+    "cast_to_nested_named_brand": ("unsafe_cast_cannot_produce", """
+        (type W (struct (b (brand $static))))
+        (type O (struct (n u64) (w W)))
+        (fun (unsafe) h O (u64) (entry ((%x u64)) (= %o (cast %x O)) (ret %o)))"""),
+    "cast_from_named_function": ("unsafe_cast_cannot_produce", """
+        (type S (struct (f (fn () u32))))
+        (fun (unsafe) h u64 (S) (entry ((%s S)) (= %x (cast %s u64)) (ret %x)))"""),
     "cast_from_abstract": ("unsafe_cast_cannot_produce", """
         (fun (unsafe) h (forall (T) () u32 (T) (entry ((%x T)) (= %n (cast %x u32)) (ret %n))))"""),
 

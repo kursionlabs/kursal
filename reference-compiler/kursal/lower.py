@@ -260,7 +260,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
             if isinstance(pointee, C.Never):
                 fail("an unsafe read cannot produce Never", pos)
         elif op == "cast" and target is not None and ty is not None:
-            if any(contains(t, self.uncastable) for t in (target, ty)):
+            if any(contains(self.types, t, self.uncastable) for t in (target, ty)):
                 fail("an unsafe cast cannot produce or take apart a package, a brand witness, a function value, "
                      "a transform, a value of a type parameter or Never", pos)
             if self.types.zero_size(target) or self.types.zero_size(ty):
