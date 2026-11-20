@@ -24,7 +24,7 @@ use package::types::literals::valid_literal;
 use package::kurs::sexpr::Form;
 use package::syntax::ast::{Pos, no_pos};
 use package::types::termination::check_instance_termination;
-use package::types::ops::{Fresh, Types, children, equal, fits, foreach_binders, foreach_item, free_brands, kurs_error, subst};
+use package::types::ops::{Fresh, Types, children, equal, fits, foreach_binders, foreach_item, free_brands, fresh, kurs_error, subst};
 use package::types::unify::match_head;
 use std::hash::{HashIn, HashState};
 use std::option::{Option, Result};
@@ -2302,7 +2302,10 @@ impl Checker['k] {
             q = q + 1usize;
         }
         let sub = self.instantiate(&cx, fun.params, fun.premises, instr.tys);
-        C::fn_type(&cx, subst_all(&cx, fun.ptypes, sub, self.counter), subst(&cx, fun.ret, sub, self.counter), retained, fun.is_unsafe, fun.places(&cx))
+        // Substituting through the value's own binder renames a retained brand that a type argument would
+        // capture.
+        let value = C::fn_type(&cx, fun.ptypes, fun.ret, retained, fun.is_unsafe, fun.places(&cx));
+        subst(&cx, value, sub, self.counter)
     }
 
     // What foreign code hands the program, an extern function's result or an extern value, is
@@ -2581,24 +2584,32 @@ impl Checker['k] {
         if mapper.params.len(&cx) != binders.len(&cx) + instr.tys.len(&cx) || !mapper.places(&cx).is_empty(&cx) {
             self.fail(&cx, "mapper_takes_traversal_binders");
         }
+        // The mapper is checked for an arbitrary component, not only today's rows: each binder is a new
+        // variable, under a name no type of the caller's, premise or declaration has.
+        let saved_kinds = self.kinds.copy(&cx);
+        let rigid: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+        let kinds = saved_kinds.clone(&cx);
+        var b = 0usize;
+        while b < binders.len(&cx) {
+            let binder = binders.at(&cx, b);
+            var name = fresh(&cx, binder, self.counter);
+            while saved_kinds.contains(&cx, name) || self.program.types.contains(&cx, name) || binders.contains(&cx, name) {
+                name = fresh(&cx, binder, self.counter);
+            }
+            rigid.insert(&cx, binder, C::named(name, ArenaVec::new(&cx)));
+            kinds.insert(&cx, name, Kind::Any);
+            b = b + 1usize;
+        }
         let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
         var i = 0usize;
         while i < mapper.params.len(&cx) && i < binders.len(&cx) {
-            sub.insert(&cx, mapper.params.at(&cx, i).name, C::named(binders.at(&cx, i), ArenaVec::new(&cx)));
+            sub.insert(&cx, mapper.params.at(&cx, i).name, rigid.at(&cx, binders.at(&cx, i)));
             i = i + 1usize;
         }
         var j = binders.len(&cx);
         while j < mapper.params.len(&cx) {
             sub.insert(&cx, mapper.params.at(&cx, j).name, instr.tys.at(&cx, j - binders.len(&cx)));
             j = j + 1usize;
-        }
-        // The mapper is checked for an arbitrary component, not only today's rows.
-        let saved_kinds = self.kinds.copy(&cx);
-        let kinds = saved_kinds.clone(&cx);
-        var b = 0usize;
-        while b < binders.len(&cx) {
-            kinds.insert(&cx, binders.at(&cx, b), Kind::Any);
-            b = b + 1usize;
         }
         self.kinds.set(&cx, kinds);
         let chosen: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
@@ -2609,9 +2620,10 @@ impl Checker['k] {
         }
         let unit = self.instantiate(&cx, mapper.params, mapper.premises, chosen);
         self.kinds.set(&cx, saved_kinds);
-        let item = foreach_item(&cx, f);
+        let item = subst(&cx, foreach_item(&cx, f), rigid, self.counter);
         let ptypes = subst_all(&cx, mapper.ptypes, sub, self.counter);
-        if ptypes.is_empty(&cx) || !equal(&cx, ptypes.at(&cx, 0usize), item) || !equal(&cx, subst(&cx, mapper.ret, sub, self.counter), f.body.copy(&cx)) {
+        if ptypes.is_empty(&cx) || !equal(&cx, ptypes.at(&cx, 0usize), item)
+            || !equal(&cx, subst(&cx, mapper.ret, sub, self.counter), subst(&cx, f.body.copy(&cx), rigid, self.counter)) {
             self.fail(&cx, "mapper_does_map");
         }
         var k = 2usize;

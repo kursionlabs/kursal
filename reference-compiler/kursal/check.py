@@ -10,7 +10,7 @@ from .core import (ATOMIC_OPS, UNSAFE_OPS, BOOL, BRAND, COPY, FLOATS, INTEGERS, 
                    Foreach, Ignored, Jmp, Jnz, Named, Never, NonNull, Prim, Ptr, Ret, Skolem, Struct, Switch, Tuple,
                    Unreachable, Type, Kind, Program, Fun, Instance, Param, Premise, Block, Instr, Terminator, Edge, ModuleId)
 from .sexpr import Form, KursError, List, Position, Str
-from .types import Kinds, children, foreach_binders, foreach_item, Types, equal, fits, free_brands, subst
+from .types import Kinds, children, foreach_binders, foreach_item, Types, equal, fits, free_brands, fresh, subst
 from .termination import check_instance_termination
 from .formation import Formation
 from .layout import check_type_expansion
@@ -833,7 +833,8 @@ class Checker:
         if any(retained_brands & free_brands(arg) for premise in fun.premises for arg in premise.args):
             self.fail("retained_brand_with_premise")
         sub = self.instantiate(fun.params, fun.premises, instr.tys, name)
-        return Fn(tuple(subst(t, sub) for t in fun.ptypes), subst(fun.ret, sub), retained, fun.unsafe, fun.places)
+        # Substituting through the value's own binder renames a retained brand that a type argument would capture.
+        return subst(Fn(fun.ptypes, fun.ret, retained, fun.unsafe, fun.places), sub)
 
     def foreign_result(self, ty: Type) -> None:
         """What foreign code hands the program, an extern function's result or an extern value, is
@@ -996,20 +997,29 @@ class Checker:
         binders = foreach_binders(t)
         if len(mapper.params) != len(binders) + len(instr.tys) or mapper.places:
             self.fail("mapper_takes_traversal_binders")
-        abstract = {p.name: Named(b) for p, b in zip(mapper.params, binders)}
+        # The mapper is checked for an arbitrary component, not only today's rows: each binder is a new
+        # variable, under a name no type of the caller's, premise or declaration has.
+        occupied = {*self.kinds, *self.program.types, *binders}
+        names: dict[str, str] = {}
+        for binder in binders:
+            name = fresh(binder)
+            while name in occupied:
+                name = fresh(binder)
+            names[binder] = name
+        rigid = {binder: Named(name) for binder, name in names.items()}
+        abstract = {p.name: rigid[b] for p, b in zip(mapper.params, binders)}
         own = dict(zip((p.name for p in mapper.params[len(binders):]), instr.tys))
         sub = {**abstract, **own}
-        # The mapper is checked for an arbitrary component, not only today's rows.
         saved_kinds = self.kinds
-        self.kinds = {**self.kinds, **{binder: "any" for binder in binders}}
+        self.kinds = {**self.kinds, **{name: "any" for name in names.values()}}
         try:
             self.instantiate(mapper.params, mapper.premises,
                              tuple(sub[param.name] for param in mapper.params), mapper.name)
         finally:
             self.kinds = saved_kinds
-        item = foreach_item(t)
+        item = subst(foreach_item(t), rigid)
         ptypes = [subst(p, sub) for p in mapper.ptypes]
-        if not ptypes or not equal(ptypes[0], item) or not equal(subst(mapper.ret, sub), t.body):
+        if not ptypes or not equal(ptypes[0], item) or not equal(subst(mapper.ret, sub), subst(t.body, rigid)):
             self.fail("mapper_does_map")
         for cap, want in zip(instr.args[2:], ptypes[1:]):
             got = self.use(cap)

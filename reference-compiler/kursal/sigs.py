@@ -326,7 +326,7 @@ class Signatures:
                 return C.Exists(labels, self.type(body, scope.extend(C.Param(b, C.BRAND) for b in labels)))
             case S.TForeach(binder=binder, indirect=indirect, source=source, body=body):
                 return C.Foreach(binder, indirect, self.type(source, scope),
-                                 self.type(body, scope.extend([C.Param(binder, C.ANY)])))
+                                 self.type(body, scope.extend(C.Param(b, C.ANY) for b in type_expr.binders())))
             case S.TForall(params=tparams, body=body):
                 quantified = tuple(C.Param(p[1:], C.BRAND) for p in tparams)
                 inner_type = self.type(body, scope.extend(quantified))

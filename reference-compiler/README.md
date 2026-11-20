@@ -63,7 +63,9 @@ are methods of `*T`, and need no import.
 ## KURS names
 
 In KURS a bare atom is the IR's own vocabulary, a primitive type or a type parameter; a name with
-`::` is always the program's, fully qualified (`core::option::Option`). A linear type's name ends
+`::` is always the program's, fully qualified (`core::option::Option`). No parameter, binder or brand
+has a declared type's name (`type formation: Foo is a declared type, not a parameter name`), which
+would read as the declaration wherever a type is unfolded; the front end's are never so named. A linear type's name ends
 with `!`, as in the source, in its declaration and in every reference: `(type core::mem::Region!
 ...)`, `(core::mem::Region! $k)`, `(fun alloc::buffer::Buffer!::new ...)`; a type is linear exactly
 when its name ends with `!`. The checker holds a declaration to the source's rule: a type without the

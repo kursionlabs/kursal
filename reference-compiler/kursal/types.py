@@ -86,22 +86,36 @@ def foreach_binders(ty: Foreach) -> tuple[str, ...]:
 
 
 def foreach_item(ty: Foreach) -> Type:
-    """Abstract mapper input, using only the retained binders of this transform."""
-    if ty.retained and isinstance(ty.source, Foreach):
+    """Abstract mapper input. A transformed source's body is the item only when this transform retains
+    every binder it names; otherwise the item is abstract, as over any other source."""
+    if isinstance(ty.source, Foreach) and ty.retained == foreach_binders(ty.source):
         return ty.source.body
     return Ptr(Named(ty.binder)) if ty.indirect else Named(ty.binder)
 
 
-def subst_foreach(ty: Foreach, sub: Substitution) -> tuple[Foreach, dict[str, Type]]:
-    """Transport retained binder renamings into each enclosing transform body."""
+def subst_foreach(ty: Foreach, sub: Substitution,
+                  avoid: Set[str] = frozenset()) -> tuple[Foreach, dict[str, Type]]:
+    """`ty` under `sub`, and the renamings of its binders (its own and those it retains).
+
+    Each body is substituted with `sub` less the names it binds, so a source binder it does not retain
+    is the enclosing variable of that name there. A binder is renamed where a replacement in any body
+    that binds it would capture it: a source's binder also avoids what an enclosing body that retains
+    it substitutes (`avoid`)."""
+    retained = ty.retained or ()
+    own = {k: v for k, v in sub.items() if k != ty.binder and k not in retained}
     source: Type
+    renames: dict[str, Type]
     if isinstance(ty.source, Foreach):
-        source, retained = subst_foreach(ty.source, sub)
+        reached = set().union(avoid, *(free_names(v) for v in own.values()))
+        source, renames = subst_foreach(ty.source, sub, reached & set(retained))
     else:
-        source, retained = subst(ty.source, sub), dict(sub)
-    (binder,), inner = _rebind((ty.binder,), retained, brand=False)
-    names = tuple(_renamed(inner, b) for b in (ty.retained or ()))
-    return Foreach(binder, ty.indirect, source, subst(ty.body, inner), names), inner
+        source, renames = subst(ty.source, sub), {}
+    carried = {b: renames[b] for b in retained if b in renames}
+    (binder,), inner = _rebind((ty.binder,), {**own, **carried}, brand=False, avoid=avoid)
+    names = tuple(_renamed(carried, b) for b in retained)
+    if binder != ty.binder:
+        carried[ty.binder] = Named(binder)
+    return Foreach(binder, ty.indirect, source, subst(ty.body, inner), names), carried
 
 
 def _renamed(sub: Substitution, binder: str) -> str:
@@ -111,11 +125,11 @@ def _renamed(sub: Substitution, binder: str) -> str:
 
 
 def _rebind(
-    binders: tuple[str, ...], sub: Substitution, brand: bool = True
+    binders: tuple[str, ...], sub: Substitution, brand: bool = True, avoid: Set[str] = frozenset()
 ) -> tuple[tuple[str, ...], dict[str, Type]]:
-    """Drop `binders` from `sub`, renaming any a replacement would capture."""
+    """Drop `binders` from `sub`, renaming any a replacement would capture, or that is in `avoid`."""
     inner = {k: v for k, v in sub.items() if k not in binders}
-    captured = set().union(*(free_names(v) for v in inner.values())) if inner else set()
+    captured = set().union(avoid, *(free_names(v) for v in inner.values()))
     out = []
     for b in binders:
         if b in captured:
@@ -585,7 +599,9 @@ class Surface:
     One `Surface` writes every type of one message, and the `nominal` names it writes outside them, such as
     a trait's. A nominal name reads as its last path segment unless another name in the message reads the
     same, when it reads as its full path. Where two different brands would read the same, each that a
-    `let exists` opened, at a position in `origins`, says where: `'k (opened at 15:9)`."""
+    `let exists` opened, at a position in `origins`, says where: `'k (opened at 15:9)`, and any other the
+    compiler made reads as its stem numbered apart from every other reading, as `'b1` for the brand `b#4`
+    that a function value keeps beside the brand `'b`."""
 
     def __init__(self, types: Iterable[Type], origins: Mapping[str, Position], nominal: Iterable[str] = ()) -> None:
         labels: set[str] = set()
@@ -598,6 +614,16 @@ class Surface:
             spellings[made_from(label)] = spellings.get(made_from(label), 0) + 1
         self.origins = origins
         self.qualified = {label for label in labels if spellings[made_from(label)] > 1 and label in origins}
+        # Any other brand the compiler made that reads as another does reads as its stem numbered anew.
+        taken = set(spellings)
+        self.renamed: dict[str, str] = {}
+        for label in sorted(label for label in labels
+                            if spellings[made_from(label)] > 1 and label not in origins and "#" in label):
+            n = 1
+            while f"{made_from(label)}{n}" in taken:
+                n += 1
+            self.renamed[label] = f"{made_from(label)}{n}"
+            taken.add(self.renamed[label])
         readings: dict[str, int] = {}
         for name in names:
             readings[_short(name)] = readings.get(_short(name), 0) + 1
@@ -614,6 +640,8 @@ class Surface:
         if label in self.qualified:
             line, col = self.origins[label]
             return f"{name} (opened at {line}:{col})"
+        if label in self.renamed:
+            return "'" + self.renamed[label]
         return name
 
     def show(self, ty: Type) -> str:

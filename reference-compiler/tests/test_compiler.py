@@ -1178,6 +1178,9 @@ SIGNATURES = (
     "forall T where Exposed[T]. struct G! { g: foreach X of T => *X }\nforall T where Exposed[T]. struct K { k: foreach X of T => u8 }\n",
     # A foreach over a pointer to a recursive type has the pointee's fields: here *L and u32, finite.
     "struct L { next: *L, v: u32 }\nstruct M { f: foreach *F of *L => F }\n",
+    # A foreach over a transformed source binds the source's binders in its body too, as its core
+    # transform retains them.
+    "struct N { f: foreach F of (foreach G of (u32, u8) => *G) => (F, G) }\n",
 )
 
 SIGNATURE_ERRORS = (
@@ -1301,6 +1304,9 @@ SYNTAX_ERRORS = (
 KURS_ERRORS = (
     "garbage",
     "(fun main i32 () garbage)",
+    # A function has an entry block, and a generic one's are inside its forall.
+    "(fun g u32 ())",
+    "(fun g (forall (T) () T (T))\n  (entry ((%x T)) (ret %x)))",
     "(type T (struct u32))",
     "(type T (forall (A) ((Copy (tuple u32))) A))",
     "(type T (forall (A) ((Copy B)) A))",
@@ -1468,6 +1474,8 @@ TYPE_CASES = (
     "(subst (foreach (F (foreach (G (tuple T T)) (tuple G U))) (tuple F G U)) ((T u8) (U G)))",
     "(subst (foreach (F (foreach (G (tuple T T)) (tuple G U))) (tuple F G U)) ((T u8) (U F)))",
     "(subst (foreach (F (tuple T)) (tuple F T)) ((T (tuple F)) (F u8)))",
+    "(subst (foreach (G (foreach (F (tuple u32)) F)) (tuple G F) (retain)) ((F u8)))",
+    "(subst (foreach (G (foreach (F (foreach (H (tuple u32)) H)) F (retain H))) (tuple H F) (retain F)) ((H F)))",
     # free names
     "(free (foreach (F (tuple T $k)) (tuple F G)))",
     "(free (fn (forall ($a) () $a ($b T))))",

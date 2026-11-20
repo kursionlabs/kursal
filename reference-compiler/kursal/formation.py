@@ -69,6 +69,11 @@ class Formation:
             self.fail("duplicate parameter")
         if any(p.name == "static" for p in params):
             self.fail("static is not a parameter name")
+        # A parameter is a variable everywhere, but a name a declaration also has would read as that
+        # declaration wherever a type is unfolded.
+        for p in params:
+            if p.name in self.program.types:
+                self.fail(f"{p.name} is a declared type, not a parameter name")
         if any(p.kind not in {C.BRAND, C.COPY, C.ANY} for p in params):
             self.fail("unknown kind")
         return {**env, **{p.name: p.kind for p in params}}

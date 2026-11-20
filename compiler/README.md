@@ -900,7 +900,10 @@ These are the places where Kursal differs from what one might expect.
 - **Brands.** `forall 'k.` binds a brand like a type parameter, and a type that holds branded storage
   takes it as its last argument (`ArenaVec[Span['k], 'k]`). A brand is minted by a constructor that
   returns `exists 'k. ...` and is opened by `let exists 'k. cx = Domain!::new(hash_seed());`; a trait may take one
-  as a parameter (`forall D, 'k. trait Discharge`, `instance Discharge[Checker['k], 'k]`).
+  as a parameter (`forall D, 'k. trait Discharge`, `instance Discharge[Checker['k], 'k]`). A
+  function named bare as a value (`let f = g;`) keeps its brands without a premise quantified, each a
+  brand of its own that no type argument can name, even one written with the same name: a message
+  writes it numbered where another reads the same (`forall 'b1. fn(Brand['b1], Tok['b]) -> Tok['b]`).
 - **`NonNull[T]`** (`std::ptr::NonNull`) is a builtin type, like `*T` but never null:
   `NonNull::new(p)` checks and returns an `Option`, `unsafe (p as NonNull[T])` asserts it, `n as *T`
   (or `n.as_ptr()`) is safe, and `==` compares two. Its niche makes `Option[NonNull[T]]` and
@@ -920,6 +923,9 @@ These are the places where Kursal differs from what one might expect.
   before any name, even behind a pointer, is rejected too (`struct T { f: foreach *F of *T => *F
   }`: `recursive foreach needs a named type between`). Errors name the declaration whose walk found
   them.
+- **A `foreach` type's body** binds its own binder and, over a transformed source, that source's
+  binders, each the component's: in `foreach F of (foreach G of (u32, u8) => *G) => (F, G)`, `G` is
+  `u32` in the first row and `u8` in the second, even where a type parameter `G` is in scope.
 - **Expressions as statements.** `f(x);` discards a Copy result. A block's value is its last
   expression, without a `;`. `return` is allowed anywhere; a function whose type is `!` (such as
   `fail`) can stand in any expression position.

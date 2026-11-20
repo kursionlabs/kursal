@@ -229,6 +229,116 @@ REJECTED = {
             (= %k (pack (exists ($p0) (tuple (brand $p0) (brand $p0))) ($q) %v))
             (= %r (const u32 0)) (ret %r))))"""),
 
+    # A brand a function value keeps is its own, never the caller's brand of the same name that a type
+    # argument names: g's T is h's Brand['b], not the kept 'b, so h cannot return Tok['c] for any 'c.
+    "kept_brand_captures_type_argument": ("returning_function", """
+        (type Tok! (forall ($k) () (struct (w (brand $k)))))
+        (fun g (forall ($b T) () T ((brand $b) T)
+          (entry ((%w (brand $b)) (%x T)) (ret %x))))
+        (fun h (forall ($b) () (fn (forall ($b) () (Tok! $b) ((brand $b) (Tok! $b)))) ()
+          (entry () (= %f (fn (g _ (Tok! $b)))) (ret %f))))"""),
+    "kept_brand_captures_type_argument_renamed": ("returning_function", """
+        (type Tok! (forall ($k) () (struct (w (brand $k)))))
+        (fun g (forall ($b T) () T ((brand $b) T)
+          (entry ((%w (brand $b)) (%x T)) (ret %x))))
+        (fun h (forall ($q) () (fn (forall ($b) () (Tok! $b) ((brand $b) (Tok! $b)))) ()
+          (entry () (= %f (fn (g _ (Tok! $q)))) (ret %f))))"""),
+
+    # A parameter never has a declared type's name: it would read as the declaration wherever a type is
+    # unfolded, so a field of type Foo would be returned as whatever f's Foo stands for, and dup's Box
+    # would copy a linear argument as the plain struct Box.
+    "parameter_named_as_type": ("Foo is a declared type, not a parameter name", """
+        (type Foo (struct (a u64)))
+        (type Bar (struct (f Foo)))
+        (fun f (forall (Foo) () Foo (Bar)
+          (entry ((%b Bar)) (= %x (destruct %b Bar)) (ret %x))))"""),
+    "parameter_named_as_copy_type": ("Box is a declared type, not a parameter name", """
+        (type Box (struct (k u32)))
+        (fun dup (forall (Box) () (tuple Box Box) (Box)
+          (entry ((%b Box))
+            (= %k (destruct %b Box)) (= %k2 (copy %k))
+            (= %b1 (construct Box %k)) (= %b2 (construct Box %k2))
+            (= %r (construct (tuple Box Box) %b1 %b2)) (ret %r))))"""),
+    "foreach_binder_named_as_type": ("Foo is a declared type, not a parameter name", """
+        (type Foo (struct (a u64)))
+        (type T! (forall (S) () (struct (f (foreach (Foo S) Foo)))))"""),
+    "existential_binder_named_as_type": ("Foo is a declared type, not a parameter name", """
+        (type Foo (struct (a u64)))
+        (type T (struct (f (exists ($Foo) (brand $Foo)))))"""),
+    "block_brand_named_as_type": ("Foo is a declared type, not a parameter name", """
+        (type Foo (struct (a u64)))
+        (fun f u32 ()
+          (entry () (= %f (fresh)) (= %w (open %f ($a))) (jmp (next $a) %w))
+          (next ($Foo) ((%x (brand $Foo))) (= %r (const u32 0)) (ret %r)))"""),
+    "trait_parameter_named_as_type": ("Foo is a declared type, not a parameter name", """
+        (type Foo (struct (a u64)))
+        (trait K (Foo) (keep Foo (Foo)))"""),
+    "instance_parameter_named_as_type": ("Foo is a declared type, not a parameter name", """
+        (type Foo (struct (a u64)))
+        (trait K (T))
+        (instance K (forall (Foo) () ((ptr Foo))))"""),
+
+    # A mapper is checked against a foreach's binders as new variables, never as the caller's type
+    # parameters of the same name: m's X is the binder F, a u64, not the caller's F, so the row
+    # (F, F) would turn a u64 into an F, and the premise K[F] would hold of a u64.
+    "foreach_binder_is_not_a_caller_parameter": ("mapper_does_map", """
+        (fun m (forall (X Y) () (tuple X Y) (X Y)
+          (entry ((%x X) (%y Y)) (= %t (construct (tuple X Y) %x %y)) (ret %t))))
+        (fun f (forall (F) ((Copy F)) u64 (F)
+          (entry ((%c F))
+            (= %z (const u64 0)) (= %s (construct (tuple u64) %z))
+            (= %r (foreach (foreach (F (tuple u64)) (tuple F F)) %s (m F) %c))
+            (= %row (destruct %r (foreach (F (tuple u64)) (tuple F F))))
+            (= (%a %b) (destruct %row (tuple u64 u64))) (ret %b))))"""),
+    "foreach_binder_is_not_a_caller_parameter_renamed": ("mapper_does_map", """
+        (fun m (forall (X Y) () (tuple X Y) (X Y)
+          (entry ((%x X) (%y Y)) (= %t (construct (tuple X Y) %x %y)) (ret %t))))
+        (fun f (forall (F) ((Copy F)) u64 (F)
+          (entry ((%c F))
+            (= %z (const u64 0)) (= %s (construct (tuple u64) %z))
+            (= %r (foreach (foreach (G (tuple u64)) (tuple G G)) %s (m F) %c))
+            (= %row (destruct %r (foreach (G (tuple u64)) (tuple G G))))
+            (= (%a %b) (destruct %row (tuple u64 u64))) (ret %b))))"""),
+    "foreach_binder_takes_no_caller_premise": ("unsatisfied_premise", """
+        (trait K (T) (k u32 (T)))
+        (fun m (forall (X) ((K X)) u32 (X)
+          (entry ((%x X)) (= %r (trait_call K k (X) %x)) (ret %r))))
+        (fun f (forall (F) ((K F)) (foreach (F (tuple u64)) u32) ()
+          (entry ()
+            (= %z (const u64 0)) (= %s (construct (tuple u64) %z))
+            (= %r (foreach (foreach (F (tuple u64)) u32) %s m)) (ret %r))))"""),
+    "foreach_binder_takes_no_caller_premise_renamed": ("unsatisfied_premise", """
+        (trait K (T) (k u32 (T)))
+        (fun m (forall (X) ((K X)) u32 (X)
+          (entry ((%x X)) (= %r (trait_call K k (X) %x)) (ret %r))))
+        (fun f (forall (F) ((K F)) (foreach (G (tuple u64)) u32) ()
+          (entry ()
+            (= %z (const u64 0)) (= %s (construct (tuple u64) %z))
+            (= %r (foreach (foreach (G (tuple u64)) u32) %s m)) (ret %r))))"""),
+
+    # A source binder a transform does not retain binds nothing in its body: the body's F is f's type
+    # parameter, which a call substitutes, so f[*u8] takes a row (u32, *u8), not transmute's (u32, F).
+    "unretained_source_binder_is_substituted": ("argument_expected", """
+        (fun f (forall (F) () F ((foreach (G (foreach (F (tuple u32)) F)) (tuple G F) (retain)))
+          (entry ((%v (foreach (G (foreach (F (tuple u32)) F)) (tuple G F) (retain))))
+            (= %row (destruct %v (foreach (G (foreach (F (tuple u32)) F)) (tuple G F) (retain))))
+            (= (%n %x) (destruct %row (tuple u32 F))) (ret %x))))
+        (fun transmute (forall (F) () (ptr u8) (F)
+          (entry ((%x F))
+            (= %n (const u32 0)) (= %row (construct (tuple u32 F) %n %x))
+            (= %v (construct (foreach (G (foreach (F (tuple u32)) F)) (tuple G F) (retain)) %row))
+            (= %p (call (f (ptr u8)) %v)) (ret %p))))"""),
+    "unretained_source_binder_is_substituted_renamed": ("argument_expected", """
+        (fun f (forall (F) () F ((foreach (G (foreach (H (tuple u32)) H)) (tuple G F) (retain)))
+          (entry ((%v (foreach (G (foreach (H (tuple u32)) H)) (tuple G F) (retain))))
+            (= %row (destruct %v (foreach (G (foreach (H (tuple u32)) H)) (tuple G F) (retain))))
+            (= (%n %x) (destruct %row (tuple u32 F))) (ret %x))))
+        (fun transmute (forall (F) () (ptr u8) (F)
+          (entry ((%x F))
+            (= %n (const u32 0)) (= %row (construct (tuple u32 F) %n %x))
+            (= %v (construct (foreach (G (foreach (H (tuple u32)) H)) (tuple G F) (retain)) %row))
+            (= %p (call (f (ptr u8)) %v)) (ret %p))))"""),
+
     # A zero-size type is erased: an unsafe cast has no representation of one to reinterpret, and C has
     # no zero-size parameter or object for an extern. Its loads and stores are accepted (test_zero_size).
     "cast_to_unit": ("zero_size_type_has_no_memory_form", """
@@ -334,6 +444,23 @@ class CoreSoundnessTests(unittest.TestCase):
             """(type R (struct (a (array R 0)) (b u32)))
                (fun (unsafe) h (tuple u64 R) ((tuple u64 R)) (entry ((%t (tuple u64 R)))
                  (= %s (cast %t (tuple u64 R))) (ret %s)))""",
+            # A function value keeps a brand that a type argument's brand shares a name with: the kept one
+            # is renamed, so the value is quantified over a brand of its own beside the caller's.
+            """(fun g (forall ($b T) () T ((brand $b) T)
+                 (entry ((%w (brand $b)) (%x T)) (ret %x))))
+               (fun h (forall ($b) ()
+                   (fn (forall ($c) () (ptr (brand $b)) ((brand $c) (ptr (brand $b))))) ((brand $b) (ptr (brand $b)))
+                 (entry ((%w (brand $b)) (%p (ptr (brand $b)))) (= %f (fn (g _ (ptr (brand $b)))))
+                   (= %g (fn (g _ (ptr (brand $b))))) (= %v (call (%g $b) %w %p)) (ret %f))))""",
+            # A foreach body names the caller's type parameter beside its own binder.
+            """(fun m (forall (X Y) () (tuple X Y) (X Y)
+                 (entry ((%x X) (%y Y)) (= %t (construct (tuple X Y) %x %y)) (ret %t))))
+               (fun f (forall (F) ((Copy F)) F (F)
+                 (entry ((%c F))
+                   (= %z (const u64 0)) (= %s (construct (tuple u64) %z))
+                   (= %r (foreach (foreach (G (tuple u64)) (tuple G F)) %s (m F) %c))
+                   (= %row (destruct %r (foreach (G (tuple u64)) (tuple G F))))
+                   (= (%a %b) (destruct %row (tuple u64 F))) (ret %b))))""",
             # Pointer projection at the pointer's own type.
             """(type S (struct (a u32)))
                (fun h u32 ((ptr S)) (entry ((%p (ptr S)))
