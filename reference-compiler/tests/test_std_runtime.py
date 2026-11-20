@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from typing import IO, Callable, Optional
 
-from kursal.cc import cc_command
+from kursal.cc import FLAGS, c_compiler, cc_command
 from kursal.cgen import emit_c
 from kursal.check import check_program
 from kursal.lower import lower
@@ -40,6 +40,31 @@ uint64_t probe_allocated(void) { return allocated; }
 uint64_t probe_reads(void) { return reads; }
 """
 COUNTED_LINK = ("-Wl,--wrap=malloc,--wrap=realloc,--wrap=read",)
+
+
+def siphash13(seed: tuple[int, int], words: list[int]) -> int:
+    """SipHash-1-3 under the key `seed` of the 64-bit `words`, each as its 8 little-endian bytes."""
+    mask = (1 << 64) - 1
+
+    def rotl(x: int, r: int) -> int:
+        return ((x << r) | (x >> (64 - r))) & mask
+
+    def sip_round(v: list[int]) -> None:
+        v[0] = (v[0] + v[1]) & mask; v[1] = rotl(v[1], 13) ^ v[0]; v[0] = rotl(v[0], 32)
+        v[2] = (v[2] + v[3]) & mask; v[3] = rotl(v[3], 16) ^ v[2]
+        v[0] = (v[0] + v[3]) & mask; v[3] = rotl(v[3], 21) ^ v[0]
+        v[2] = (v[2] + v[1]) & mask; v[1] = rotl(v[1], 17) ^ v[2]; v[2] = rotl(v[2], 32)
+
+    k0, k1 = seed
+    v = [k0 ^ 0x736f6d6570736575, k1 ^ 0x646f72616e646f6d, k0 ^ 0x6c7967656e657261, k1 ^ 0x7465646279746573]
+    for m in [*words, ((8 * len(words)) % 256) << 56]:
+        v[3] ^= m
+        sip_round(v)
+        v[0] ^= m
+    v[2] ^= 0xff
+    for _ in range(3):
+        sip_round(v)
+    return v[0] ^ v[1] ^ v[2] ^ v[3]
 
 
 def package(directory: Path, source: str, deps: tuple[str, ...]) -> None:
@@ -1647,6 +1672,159 @@ class StdRuntimeTests(unittest.TestCase):
                 restore.restore(tag).destroy();
                 if same { 0 } else { 1 }
             }''')
+
+    def test_the_hash_is_siphash_1_3_of_the_encoding(self):
+        """A key's hash is SipHash-1-3, under the seed, of the words its instance writes, little-endian: an
+        integer one word, a byte string its length and then its bytes, the last word padded with zeros."""
+        seed = (0x0706050403020100, 0x0f0e0d0c0b0a0908)
+        # The reference vectors' key, and their first SipHash-1-3 output, of the empty message.
+        self.assertEqual(siphash13(seed, []), 0xabac0158050fc4dc)
+        cases = (("42u64", [42]), ("(1u32, true)", [1, 1]), ('"aBaBaB"', [6, int.from_bytes(b"aBaBaB", "little")]),
+                 ('"0123456789abcdef!"', [17, *(int.from_bytes(w, "little") for w in (b"01234567", b"89abcdef", b"!"))]),
+                 ('""', [0]))
+        lines = "".join(f"                let h{i} = key_hash(&sr, {key}, seed);\n                out = f\"{{h{i}}}\\n\".write(out);\n"
+                        for i, (key, _) in enumerate(cases))
+        self.expect('''
+            use std::hash::{Seed, key_hash};
+            use std::slice::StaticRead;
+            use std::io::{Error, stdout};
+            use std::fmt::Writable;
+            use std::option::Result;
+            fn main() -> Result[(), Error] {
+                let sr = StaticRead::new();
+                let seed = Seed::new(''' + f"{seed[0]}u64, {seed[1]}u64" + ''');
+                var out = stdout();
+''' + lines + '''                out.finish()
+            }''', stdout="".join(f"{siphash13(seed, words)}\n" for _, words in cases))
+
+    def test_keys_that_collide_under_a_multiply_add_hash_do_not_collide(self):
+        """`aB` and `b!` make the same `acc * 33 + b`, and so do any two keys that swap one for the other: 4096
+        keys of 12 such pairs once shared one hash. Under each seed they spread over the buckets as random keys
+        do, so no bucket of 4096 holds more than a handful, and the three keys of the review are apart."""
+        result = self.run_program('''
+            use std::buffer::Buffer!;
+            use std::hash::{Seed, key_hash};
+            use std::slice::StaticRead;
+            use std::collections::vec::OwnedVec!;
+            use std::io::{Error, stdout};
+            use std::fmt::Writable;
+            use std::option::Result;
+            fn most_in_one_bucket(seed: Seed) -> u32 {
+                var counts = OwnedVec!::new[u32]();
+                var b = 0usize;
+                while b < 4096usize {
+                    counts = counts.push(0u32);
+                    b = b + 1usize;
+                }
+                var most = 0u32;
+                var i = 0usize;
+                while i < 4096usize {
+                    var key = Buffer!::new();
+                    var bit = 0usize;
+                    while bit < 12usize {
+                        key = if (i >> bit) % 2usize == 0usize { key.push_static("aB") } else { key.push_static("b!") };
+                        bit = bit + 1usize;
+                    }
+                    let exists 'k. (tag, bytes, restore) = key.open();
+                    let bucket = (key_hash(&tag, bytes, seed) % 4096u64) as usize;
+                    restore.restore(tag).destroy();
+                    let before = &counts.at(bucket);
+                    let n = before + 1u32;
+                    &counts.set(bucket, n);
+                    if n > most {
+                        most = n;
+                    }
+                    i = i + 1usize;
+                }
+                counts.free();
+                most
+            }
+            fn apart(seed: Seed) -> bool {
+                let sr = StaticRead::new();
+                let a = key_hash(&sr, "aBaBaB", seed);
+                let b = key_hash(&sr, "b!b!b!", seed);
+                let c = key_hash(&sr, "aBb!aB", seed);
+                a != b && b != c && a != c
+            }
+            fn main() -> Result[(), Error] {
+                var out = stdout();
+                let s0 = Seed::new(0u64, 0u64);
+                let s1 = Seed::new(1u64, 2u64);
+                let s2 = Seed::new(18446744073709551615u64, 12345u64);
+                let s3 = std::process::hash_seed();
+                out = f"{most_in_one_bucket(s0)} {most_in_one_bucket(s1)} {most_in_one_bucket(s2)} {most_in_one_bucket(s3)}\\n".write(out);
+                let all_apart = if apart(s0) && apart(s1) && apart(s2) && apart(s3) { 1u32 } else { 0u32 };
+                out = f"{all_apart}\\n".write(out);
+                out.finish()
+            }''')
+        self.assertEqual(result.returncode, 0, result.stderr[:500])
+        loads, apart = result.stdout.splitlines()
+        self.assertEqual(apart, "1")
+        for load in loads.split():
+            self.assertLessEqual(int(load), 16, loads)
+
+    def test_a_hosted_program_draws_its_seed_at_start(self):
+        """`std::process::hash_seed` is the same throughout a process, and another process draws another: a
+        string hashed twice in one run hashes alike, and differently in the next run."""
+        source = '''
+            use std::hash::key_hash;
+            use std::process::hash_seed;
+            use std::slice::StaticRead;
+            use std::io::{Error, stdout};
+            use std::fmt::Writable;
+            use std::option::Result;
+            fn main() -> Result[(), Error] {
+                let sr = StaticRead::new();
+                let first = key_hash(&sr, "a fixed string", hash_seed());
+                let second = key_hash(&sr, "a fixed string", hash_seed());
+                var out = stdout();
+                out = f"{first} {second}\\n".write(out);
+                out.finish()
+            }'''
+        runs = []
+        for _ in range(2):
+            result = self.run_program(source)
+            self.assertEqual(result.returncode, 0, result.stderr[:500])
+            first, second = result.stdout.split()
+            self.assertEqual(first, second)
+            runs.append(first)
+        self.assertNotEqual(runs[0], runs[1])
+
+    def test_a_freestanding_map_needs_no_new_c_symbol(self):
+        """C made for a freestanding target (`kursal c --entry`, not hosted) of a program with a `HashMap!`
+        and an arena's `ArenaMap`, seeded by the program, calls only what `alloc` declares: no seed, no
+        randomness, nothing of `lib/libc`."""
+        source = '''
+            use alloc::arena::Domain!;
+            use alloc::collections::arena_map::ArenaMap;
+            use alloc::collections::hashmap::OwnedMap!;
+            use core::hash::Seed;
+            use core::option::Option;
+            fn main() -> i32 {
+                let seed = Seed::new(1u64, 2u64);
+                var m = OwnedMap!::new[u64, u64](seed);
+                let old = &m.insert(7u64, 8u64);
+                var k = 7u64;
+                let seven = &m.at(&k);
+                m.free();
+                let exists 'k. cx = Domain!::new(seed);
+                let a: ArenaMap[u32, u32, 'k] = ArenaMap::new(&cx);
+                let none = a.insert(&cx, 1u32, 2u32);
+                let two = a.at(&cx, 1u32);
+                cx.destroy();
+                (seven + (two as u64)) as i32
+            }'''
+        with tempfile.TemporaryDirectory(prefix="kursal-std-") as base:
+            directory = Path(base)
+            package(directory, source, ("core", "alloc"))
+            resolver, sigs, program = lowered(directory)
+            c_file, o_file = directory / "main.c", directory / "main.o"
+            c_file.write_text(emit_c(program, check_program(program), sigs.name(resolver.packages[0].entry_decl)))
+            built = subprocess.run([c_compiler(), *FLAGS, "-c", str(c_file), "-o", str(o_file)], capture_output=True, text=True)
+            self.assertEqual(built.returncode, 0, built.stderr[:500])
+            symbols = subprocess.run(["nm", "-u", str(o_file)], capture_output=True, text=True, check=True).stdout.split()
+        undefined = {name for name in symbols if name != "U"}
+        self.assertLessEqual(undefined, {"malloc", "realloc", "free", "abort", "exit", "memcpy", "memmove", "memset", "memcmp"})
 
     def test_c_strings_read_their_bytes_safely(self):
         self.expect('''
