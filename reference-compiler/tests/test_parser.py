@@ -248,6 +248,16 @@ class LexicalTests(unittest.TestCase):
             with self.assertRaises(KursError, msg=src):
                 expr(src)
 
+    def test_floats_take_an_exponent(self):
+        for src, text, suffix in (("1e5", "1e5", None), ("2.5E-3", "2.5E-3", None), ("1_0e+1_0f32", "10e+10", "f32"),
+                                  ("7.0e300f64", "7.0e300", "f64")):
+            lit = expr(src)
+            self.assertEqual((lit.kind, lit.value, lit.suffix), ("float", text, suffix), src)
+        self.assertEqual(expr("0x1e5").kind, "int")
+        for src in ("1e", "1e+", "2.5e"):
+            with self.assertRaises(KursError, msg=src):
+                expr(src)
+
     def test_a_name_followed_by_bang_is_one_name(self):
         def kinds(text):
             return [(t.kind, t.text) for t in Lexer(text, "<t>").run()[:-1]]

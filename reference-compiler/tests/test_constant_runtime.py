@@ -140,6 +140,15 @@ class ConstantRuntimeTests(unittest.TestCase):
                 if ok { 7i32 } else { 1i32 }
             }''', 7)
 
+    def test_float_literals_with_an_exponent(self):
+        self.run_source('''const BIG: f64 = 1.5e300;
+            const SMALL: f32 = 2.5E-3f32;
+            fn main() -> i32 {
+                let ok = BIG == 1.5e300 && BIG > 1.0e299 && SMALL == (0.0025f64 as f32) && 1e3 == 1000.0f64
+                    && 1.0e-7 < 1e-6f64;
+                if ok { 7i32 } else { 1i32 }
+            }''', 7)
+
     def test_float_constant_operators_are_arithmetic_and_comparison(self):
         for expression, message in (('1.0f64 % 2.0f64', 'one type'), ('1.0f64 + 1u8', 'one type'),
                                     ('true as f64', 'converts between number types'),

@@ -269,6 +269,14 @@ double free.
 | `std::io::write_all` | `ptr[0..len)` is readable, and `fd` is a descriptor the caller may write: standard output or error, or one a `File!` it holds owns |
 | `std::io::File!::write_all_raw` | `ptr[0..len)` is readable throughout the write |
 
+Every read through a raw pointer (`unsafe *p`, and the functions above) owes the same thing for
+brands: a value of a type that holds a brand witness (`Brand['r]`, `Exclusive!`, `Shared!`, a
+receipt, anything holding or capturing one), zero-size or not, may be read only from memory that a
+value of that type was moved into and not since moved out of. The checker does not track this; a
+read that conjures a witness some other way breaks the obligation, as a read of any type from
+memory that does not hold one does. An unsafe cast never produces a witness: the checker rejects a
+cast whose result holds one in its value.
+
 ### 2.4 Produces, offsets, or wraps a raw pointer
 
 Individually mild (several are only integer arithmetic), but together they

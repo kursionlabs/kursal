@@ -849,7 +849,8 @@ These are the places where Kursal differs from what one might expect.
   with `.(`: `Option::Some.(x)`. A spread `..rest` names a bundle made by a pattern
   (`let { x, ..rest } = p; Point.{ x: 2u32, ..rest }`), not an arbitrary value.
 - **Literals** carry their type when nothing else fixes it: `0u32`, `1usize`, `b'a'`. A bare `0`
-  needs a type from context.
+  needs a type from context. A float literal has a point (`2.5`), an exponent (`1e-7`, `1.5E+300`)
+  or a float suffix (`7f64`); a point needs digits on both sides.
 - **`unsafe`** marks one operation: `unsafe f(x)` calls an unsafe or extern function, `unsafe *p`
   reads through a pointer, `unsafe (x as *T)` casts, `f(unsafe &*p)` lends a pointer's target.
   `unsafe (unsafe malloc(n) as *T)` is two operations. A safe function may contain unsafe operations.

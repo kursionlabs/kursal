@@ -621,7 +621,8 @@ module.exports = grammar({
     )),
 
     float_literal: _ => token(choice(
-      seq(/[0-9][0-9_]*/, '.', /[0-9][0-9_]*/, optional(choice('f32', 'f64'))),
+      seq(/[0-9][0-9_]*/, '.', /[0-9][0-9_]*/, optional(/[eE][+-]?[0-9][0-9_]*/), optional(choice('f32', 'f64'))),
+      seq(/[0-9][0-9_]*/, /[eE][+-]?[0-9][0-9_]*/, optional(choice('f32', 'f64'))),
       seq(/[0-9][0-9_]*/, choice('f32', 'f64')),
     )),
 
