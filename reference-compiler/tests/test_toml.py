@@ -14,7 +14,7 @@ from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any, ClassVar, Optional, cast
 
-from kursal.cc import cc_command
+from kursal.cc import RUNTIME, cc_command
 from kursal.cgen import emit_c
 from kursal.check import check_program
 from kursal.lower import lower
@@ -22,7 +22,6 @@ from kursal.resolve import LIB, resolve
 from kursal.sigs import signatures
 
 MANIFEST = '[package]\nname="t"\nkind="executable"\nentry="package::main"\nsource_root="."\n'
-C_HELPERS = [LIB / "libc/fs.c", LIB / "libc/thread.c"]
 
 # Reads a document on stdin. Valid: prints its root table as toml-test's tagged JSON (a float as its bits,
 # a date or time as its text) and exits 0. Invalid: prints `OFFSET LINE COLUMN MESSAGE` and exits 1.
@@ -301,7 +300,7 @@ class TomlTests(unittest.TestCase):
         c_file = directory / "main.c"
         c_file.write_text(emit_c(program, check_program(program), sigs.name(resolver.packages[0].entry_decl), hosted=True))
         executable = directory / "decoder"
-        built = subprocess.run(cc_command([str(c_file), *map(str, C_HELPERS)], str(executable)), capture_output=True, text=True)
+        built = subprocess.run(cc_command([str(c_file), *map(str, RUNTIME)], str(executable)), capture_output=True, text=True)
         assert built.returncode == 0, built.stderr[:500]
         cls.decoder = executable
 

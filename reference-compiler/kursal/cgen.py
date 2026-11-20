@@ -75,9 +75,9 @@ C_KEYWORDS = set("auto break case char const continue default do double else enu
                  "inline int long register restrict return short signed sizeof static struct switch typedef "
                  "union unsigned void volatile while _Alignas _Alignof _Atomic _Bool _Complex _Generic "
                  "_Imaginary _Noreturn _Static_assert _Thread_local".split())
-# The C function, in `lib/libc/fs.c`, that C's `main` calls to report the error an entry returns.
+# The C function, in `lib/libc/start.c`, that C's `main` calls to report the error an entry returns.
 REPORT_ERROR = "kur_libc_process_report_error"
-# The C function, in `lib/libc/fs.c`, that a hosted C `main` calls first: it opens /dev/null on each
+# The C function, in `lib/libc/start.c`, that a hosted C `main` calls first: it opens /dev/null on each
 # standard descriptor the process started without, and ignores SIGPIPE.
 START = "kur_libc_process_start"
 RUNTIME_NAMES = {"KUR_TRAP", "KUR_MUSTTAIL", "KUR_FIELD", "KUR_PTR_BITS", *(f"kur_dec_i{n}" for n in SIGNED.values()),
@@ -532,7 +532,7 @@ class Backend:
     def entry_wrapper(self, fun: Fun, symbol: str, hosted: bool) -> str:
         """C's `main`: it calls the entry `fun`, whose C is `symbol`, with `Args` from `argv` and `argc` if
         `fun` takes them, and makes its result the exit status (`entry_result`). A `hosted` one, for an
-        executable `kursal build` links with `lib/libc/fs.c`, calls `START` first; any other (`kursal c`,
+        executable `kursal build` links with `lib/libc/start.c`, calls `START` first; any other (`kursal c`,
         whose C a freestanding target may enter from start-up code of its own) does not."""
         if fun.ptypes:
             shape = self.shape(fun.ptypes[0])

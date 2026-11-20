@@ -10,16 +10,15 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Optional
 
-from kursal.cc import FLAGS, c_compiler, cc_command
+from kursal.cc import FLAGS, RUNTIME, c_compiler, cc_command
 from kursal.cgen import emit_c
 from kursal.check import check_program
 from kursal.lower import lower
-from kursal.resolve import LIB, resolve
+from kursal.resolve import resolve
 from kursal.sexpr import KursError
 from kursal.sigs import signatures
 
 EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
-C_HELPERS = [LIB / "libc/fs.c", LIB / "libc/thread.c"]
 
 SAMPLE = "one two\nthree four five\n"
 JSON_IN = '{"name": "Ada", "tags": ["x", 1, -2.5e3, true, null], "nested": {"empty": [], "o": {}}}'
@@ -222,7 +221,7 @@ def build(package: Path, out: Path) -> tuple[str, Optional[Path], str]:
     executable = out / package.name
     link_flags = [flag for dependency in resolver.packages for flag in dependency.link_flags]
     c_sources = [str(source) for dependency in resolver.packages for source in dependency.c_sources]
-    cc = subprocess.run(cc_command([str(c_file), *map(str, C_HELPERS), *c_sources, *map(str, package.glob("*.c"))], str(executable), *link_flags),
+    cc = subprocess.run(cc_command([str(c_file), *map(str, RUNTIME), *c_sources, *map(str, package.glob("*.c"))], str(executable), *link_flags),
                         capture_output=True, text=True)
     return package.name, executable, cc.stderr[:500] if cc.returncode else ""
 

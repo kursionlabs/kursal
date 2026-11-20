@@ -2,7 +2,7 @@
 
     uv run python tools/build.py PACKAGE OUTPUT [--times] [--kurs PATH]
 
-writes OUTPUT.c and compiles it, with the standard library's C helpers, into OUTPUT (by `kursal.cc`:
+writes OUTPUT.c and compiles it, with the C runtime (`lib/libc`), into OUTPUT (by `kursal.cc`:
 `$KURSAL_CC`, else Clang, at -O3), reporting a C compiler that cannot run or fails; with --kurs, also
 writes the lowered program, serialized as KURS, to PATH.
 """
@@ -17,16 +17,14 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from kursal.cc import c_compiler, cc_command  # noqa: E402
+from kursal.cc import RUNTIME, c_compiler, cc_command  # noqa: E402
 from kursal.cgen import emit_c  # noqa: E402
 from kursal.check import check_program  # noqa: E402
 from kursal.kurs import write_program  # noqa: E402
 from kursal.lower import lower  # noqa: E402
-from kursal.resolve import LIB, resolve  # noqa: E402
+from kursal.resolve import resolve  # noqa: E402
 from kursal.sexpr import KursError  # noqa: E402
 from kursal.sigs import signatures  # noqa: E402
-
-C_HELPERS = [LIB / "libc/fs.c", LIB / "libc/thread.c"]
 
 
 def build(package: Path, output: Path, times: bool, kurs: Optional[Path] = None) -> None:
@@ -57,7 +55,7 @@ def build(package: Path, output: Path, times: bool, kurs: Optional[Path] = None)
     try:
         c_sources = [str(source) for dependency in resolver.packages for source in dependency.c_sources]
         link_flags = [flag for dependency in resolver.packages for flag in dependency.link_flags]
-        built = subprocess.run(cc_command([str(c_file), *map(str, C_HELPERS), *c_sources], str(output), *link_flags))
+        built = subprocess.run(cc_command([str(c_file), *map(str, RUNTIME), *c_sources], str(output), *link_flags))
     except OSError as error:
         raise SystemExit(f"cannot run the C compiler {compiler} (error {error.errno})")
     stage("cc")

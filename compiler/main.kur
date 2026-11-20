@@ -371,7 +371,7 @@ fn build(&cx: Domain!['k], args: ArenaVec[Span['k], 'k]) -> Handoff['k] {
 }
 
 // The back end, in the arena `cx`, which it destroys: the C of `handoff`'s program, printed or, for
-// `build` with OUTPUT, compiled into OUTPUT with the standard library's C helpers: written to
+// `build` with OUTPUT, compiled into OUTPUT with the C runtime (`lib/libc`): written to
 // OUTPUT.c and compiled whole for `--single-c` or a C compiler other than Clang and GCC, else
 // written to OUTPUT.build as a file per module, which are compiled in parallel and linked with
 // link-time optimization. The command's exit status: 1 when the C compiler cannot be started, exits
@@ -387,7 +387,8 @@ fn back_end(cx: Domain!['k], handoff: Handoff['k], typed: ArenaMap[FunKey['k], A
     };
     let compiler = if compiler.is_empty() { Span::from_static(&cx, "clang") } else { compiler };
     let lto = if handoff.single_c { Option::None } else { link_time_optimization(&cx, compiler) };
-    // `kursal build` links the C with `lib/libc/fs.c`, whose start-up its C `main` calls first.
+    // `kursal build` links the C with the C runtime, whose start-up (`lib/libc/start.c`) its C `main`
+    // calls first.
     let hosted = match handoff.goal {
         Goal::Build => true,
         _ => false,
@@ -583,12 +584,20 @@ fn c_command(&cx: Domain!['k], compiler: Span['k], lto: Option[Slice[u8, 'static
     }
 }
 
-// `command` linking into `out`, with the standard library's C helpers, the packages' C sources and
-// link flags, and threads.
+// The C file `name` of the runtime in the standard library `lib`.
+forall 'k.
+fn runtime(&cx: Domain!['k], lib: Span['k], name: Slice[u8, 'static]) -> Span['k] {
+    Buffer!::new().push_bytes(&cx, lib).push_static("/libc/").push_static(name).save(&cx)
+}
+
+// `command` linking into `out`, with the C runtime every hosted executable links (`lib/libc`'s C
+// files, the reference's `kursal.cc.RUNTIME`), the packages' C sources and link flags, and threads.
 forall 'k.
 fn linked(&cx: Domain!['k], command: Command!, handoff: Handoff['k], lib: Span['k], out: Span['k]) -> Command! {
-    var command = command.arg(&cx, Buffer!::new().push_bytes(&cx, lib).push_static("/libc/fs.c").save(&cx))
-        .arg(&cx, Buffer!::new().push_bytes(&cx, lib).push_static("/libc/thread.c").save(&cx));
+    var command = command.arg(&cx, runtime(&cx, lib, "io.c")).arg(&cx, runtime(&cx, lib, "fs.c"))
+        .arg(&cx, runtime(&cx, lib, "env.c")).arg(&cx, runtime(&cx, lib, "process.c"))
+        .arg(&cx, runtime(&cx, lib, "start.c")).arg(&cx, runtime(&cx, lib, "time.c"))
+        .arg(&cx, runtime(&cx, lib, "thread.c"));
     var f = 0usize;
     while f < handoff.c_sources.len(&cx) {
         command = command.arg(&cx, handoff.c_sources.at(&cx, f));

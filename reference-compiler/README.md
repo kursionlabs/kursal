@@ -172,7 +172,7 @@ backend: the entry app::main must be `fn()`, `fn() -> i32` or `fn() -> Result[()
 The backend writes C's `main` for the entry: `main(int argc, char **argv)`,
 which fills `Args` from `argv` and `argc`, for one taking them, else
 `main(void)`. For an `Err` it calls `kur_libc_process_report_error` in
-`lib/libc/fs.c`, which writes the errno with the C library's description of
+`lib/libc/start.c`, which writes the errno with the C library's description of
 it (`strerror`), as `error: No such file or directory (error 2)`. The
 backend knows `Args` and the result by their shapes alone, so no name is
 special: `Args` is a struct of exactly a `*(*u8)` and a `usize`, and the
@@ -181,7 +181,7 @@ result an enum of `Ok` of `()` and `Err` of a struct of exactly one `i32`.
 and its accessors may rely on what C's `main` received.
 
 The `main` of an executable `tools/build.py` (and `kursal build`) makes, which
-links `lib/libc/fs.c`, first calls `kur_libc_process_start` there: it opens
+links `lib/libc/start.c`, first calls `kur_libc_process_start` there: it opens
 `/dev/null` on each of the descriptors 0, 1 and 2 the process started
 without, so no file the program opens takes a standard stream's number, and
 ignores SIGPIPE, so a write to a closed pipe returns EPIPE to the program

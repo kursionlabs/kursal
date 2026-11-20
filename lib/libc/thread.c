@@ -1,6 +1,5 @@
-#define _DEFAULT_SOURCE
-#include "thread.h"
-#include <errno.h>
+/* Threads, for `libc::thread`: start one, join it. */
+#include "common.h"
 #include <pthread.h>
 #include <stdlib.h>
 

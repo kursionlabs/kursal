@@ -3,11 +3,17 @@
 `-O3` optimizes; `-w` silences warnings about generated code (unused labels and variables, the
 standard library's own prototypes of C functions); `-fno-builtin` keeps the C compiler from giving
 a function the meaning of the C library function of the same name, which an `extern` or a Kursal
-function may declare with another type. `compiler/main.kur` runs the same command."""
+function may declare with another type. `compiler/main.kur` runs the same command.
+
+`RUNTIME` is the C runtime every hosted executable links, `lib/libc`'s C files, whose functions the
+`libc` package declares and the C `main` of `kursal build` calls; it needs the threads library."""
 
 import os
 
+from .resolve import LIB
+
 FLAGS = ("-O3", "-w", "-fno-builtin")
+RUNTIME = tuple(LIB / "libc" / f"{name}.c" for name in ("io", "fs", "env", "process", "start", "time", "thread"))
 
 
 def c_compiler() -> str:

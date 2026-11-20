@@ -1,4 +1,4 @@
-"""The standard library at run time: small programs that use it, built with its C helpers and run, each
+"""The standard library at run time: small programs that use it, built with the C runtime and run, each
 checking its own results; and programs that misuse it, rejected."""
 
 import os
@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from typing import IO, Callable, Optional
 
-from kursal.cc import FLAGS, c_compiler, cc_command
+from kursal.cc import FLAGS, RUNTIME, c_compiler, cc_command
 from kursal.cgen import emit_c
 from kursal.check import check_program
 from kursal.lower import lower
@@ -20,7 +20,6 @@ from kursal.sexpr import KursError
 from kursal.sigs import signatures
 
 MANIFEST = '[package]\nname="t"\nkind="executable"\nentry="package::main"\nsource_root="."\n'
-C_HELPERS = [LIB / "libc/fs.c", LIB / "libc/thread.c"]
 # Counters a program built with `counted=True` reads through its own externs: the calls of `malloc` and
 # `realloc` and the bytes they were asked for, and the calls of `read`, made by the program's own C and
 # the library's (the linker sends them through these wrappers), not by the C library internally.
@@ -95,7 +94,7 @@ class StdRuntimeTests(unittest.TestCase):
             c_file = directory / "main.c"
             c_file.write_text(emit_c(program, check_program(program), sigs.name(resolver.packages[0].entry_decl), hosted=True))
             executable = directory / "main"
-            sources, link = [str(c_file), *map(str, C_HELPERS)], ()
+            sources, link = [str(c_file), *map(str, RUNTIME)], ()
             if counted:
                 (directory / "counters.c").write_text(COUNTERS)
                 sources, link = [*sources, str(directory / "counters.c")], COUNTED_LINK
@@ -786,7 +785,7 @@ class StdRuntimeTests(unittest.TestCase):
             }''')
 
     def test_instant_reads_the_monotonic_clock_through_the_c_library(self):
-        # `Instant::now` reads CLOCK_MONOTONIC through fs.c, which names the host's clock, so no clock
+        # `Instant::now` reads CLOCK_MONOTONIC through time.c, which names the host's clock, so no clock
         # number (Linux's 1, FreeBSD's 4, macOS's 6) is written in Kursal: the time between two readings
         # around a sleep is the sleep's at least, and no more than the whole run's.
         started = time.monotonic_ns()

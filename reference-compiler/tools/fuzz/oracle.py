@@ -24,7 +24,6 @@ HERE = Path(__file__).resolve().parent
 REFERENCE = HERE.parents[1]
 ROOT = REFERENCE.parent
 LIB = ROOT / "lib"
-C_HELPERS = [LIB / "libc/fs.c", LIB / "libc/thread.c"]
 
 # Bug classes, in priority order.
 CHECK_REJECTS = "check-rejects"        # the front end accepts; the checker rejects what it made
@@ -147,15 +146,15 @@ def self_status_bug(status: Optional[int], err: str) -> Optional[str]:
 
 def compile_and_run(c_file: Path, work: Path, out: Outcome) -> None:
     """Compile the C at -O3 and at -O0 under sanitizers, run both, and compare their statuses."""
-    from kursal.cc import FLAGS, c_compiler
+    from kursal.cc import FLAGS, RUNTIME, c_compiler
     cc = c_compiler()
     fast, checked = work / "fast", work / "checked"
-    status, _, err = run([cc, *FLAGS, str(c_file), *map(str, C_HELPERS), "-lpthread", "-o", str(fast)], timeout=120)
+    status, _, err = run([cc, *FLAGS, str(c_file), *map(str, RUNTIME), "-lpthread", "-o", str(fast)], timeout=120)
     if status != 0:
         out.bug, out.detail = CC_FAILS, err[-3000:]
         return
     sanitize = ["-O0", "-g", "-w", "-fno-builtin", "-fsanitize=undefined,address", "-fno-sanitize-recover=all"]
-    status, _, err = run([cc, *sanitize, str(c_file), *map(str, C_HELPERS), "-lpthread", "-o", str(checked)],
+    status, _, err = run([cc, *sanitize, str(c_file), *map(str, RUNTIME), "-lpthread", "-o", str(checked)],
                          timeout=120)
     if status != 0:
         out.bug, out.detail = CC_FAILS, "sanitized: " + err[-3000:]
