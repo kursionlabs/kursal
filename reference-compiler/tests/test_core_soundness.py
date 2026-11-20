@@ -277,6 +277,11 @@ class CoreSoundnessTests(unittest.TestCase):
             """(type (in (module 0 a) abstract) Secret (struct (k u32)))
                (fun (in (module 0 a)) h u32 (Secret) (entry ((%s Secret)) (= %k (destruct %s Secret)) (ret %k)))
                (data (in (module 0 a)) made Secret (7))""",
+            # An unsafe cast may make and take apart a restricted type outside its module: the type's
+            # invariants are the cast's obligation (lib/std/CONTRACTS.md, section 4).
+            """(type (in (module 0 a) abstract) Secret (struct (k u32)))
+               (fun (in (module 0 b) unsafe) make Secret (u32) (entry ((%x u32)) (= %s (cast %x Secret)) (ret %s)))
+               (fun (in (module 0 b) unsafe) open u32 (Secret) (entry ((%s Secret)) (= %x (cast %s u32)) (ret %x)))""",
             # Sizes are public: of a hidden type, of a type holding one, of a type parameter.
             """(type (in (module 0 a) abstract) Secret (struct (k u32)))
                (fun (in (module 0 b)) h usize () (entry () (= %n (sizeof Secret)) (ret %n)))

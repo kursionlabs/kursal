@@ -559,6 +559,21 @@ may construct or destructure it, at the surface and in the core IR alike.
 surface-only field privacy would not protect hand-written core IR or
 another frontend.
 
+An unsafe cast is not construction, and the checker does not restrict it by
+exposure: `unsafe (x as T)` may make a value of a restricted `T` anywhere,
+and `unsafe (t as X)` may take one apart into its representation. The cast's
+obligation then includes every invariant of `T` that its module's own
+constructors would establish (the rows of section 4.1): `unsafe (fd as
+File!)` must name a descriptor nothing else owns, a `CStr` made from a
+pointer must address a NUL-terminated string readable for the rest of the
+process, an `Uninit!` must own the block it names. This is the obligation
+the module's own unsafe constructors state (`File!::adopt`,
+`CStr::from_raw`, `HeapAllocator::adopt_raw_sized`). A type that holds a
+brand witness (a capability, a `Span`, a `Slice`, a `Ref`) is never made
+this way: the checker rejects a cast whose result holds one (section 2.3). The
+restriction protects what safe code can reach; an unsafe cast that breaks
+the type's invariant has undefined behavior.
+
 ### 4.1 Restricted
 
 Types whose hidden representation protects authority or bounds:
