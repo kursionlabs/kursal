@@ -84,6 +84,47 @@ class LayoutTests(unittest.TestCase):
         self.compiles("(type A (foreach (F (tuple u32)) (ptr A)))", C.Named("A"))
         self.compiles("(type A (foreach (A (tuple u32)) A))", C.Named("A"))
 
+    def test_foreach_components_that_hold_the_foreach_by_value_are_infinite(self):
+        # `*F` over `*T` binds F to each field type of T, so the field is the foreach again.
+        self.rejects("(type T (struct (f (foreach ((ptr F) (ptr T)) F))))", "^type T: infinite by-value layout$")
+        # A foreach source that maps T's fields brings the field back the same way.
+        self.rejects("(type T (struct (f (foreach (F (foreach ((ptr G) (ptr T)) G)) F))))",
+                     "^type T: infinite by-value layout$")
+        # A retained binder of the source is the field too.
+        self.rejects("(type T (struct (f (foreach (X (foreach ((ptr G) (ptr T)) u32)) G))))",
+                     "^type T: infinite by-value layout$")
+        # Over a parameter the components are unknown; the use that chooses the argument is walked.
+        self.rejects("""(type S! (forall (P) () (struct (f (foreach ((ptr F) (ptr P)) F)))))
+          (type W! (struct (s (S! W!))))""", "^type S!: infinite by-value layout$")
+        # An enum source gives its payloads, and a pointer pattern over a tuple of pointers the pointees.
+        self.rejects("""(type E (enum (A (ptr T)) (B (ptr u32))))
+          (type T (struct (f (foreach ((ptr F) E) F))))""", "^type T: infinite by-value layout$")
+        self.rejects("(type T (struct (f (foreach ((ptr F) (tuple (ptr T) (ptr u32))) F))))",
+                     "^type T: infinite by-value layout$")
+
+    def test_foreach_components_behind_pointers_or_empty_arrays_are_finite(self):
+        self.compiles("""(type L (struct (next (ptr L)) (v u32)))
+          (type M (struct (f (foreach ((ptr F) (ptr L)) F))))""", C.Named("M"))
+        self.compiles("(type T (struct (f (foreach (F (tuple (ptr T) u32)) F))))", C.Named("T"))
+        self.compiles("""(type B (forall (X) () (struct (b (ptr X)))))
+          (type T (struct (f (foreach ((ptr F) (ptr T)) (B (ptr T))))))""", C.Named("T"))
+
+    def test_a_foreach_reached_again_behind_a_pointer_needs_a_name_between(self):
+        # Finite in memory, but C names a type by its expanded structure, which never ends: the
+        # field is a struct of a pointer to the field (or of an empty array of it).
+        for body in ("(foreach ((ptr F) (ptr T)) (ptr F))", "(foreach (F (ptr T)) F)",
+                     "(ptr (foreach ((ptr F) (ptr T)) (ptr F)))", "(foreach ((ptr F) (ptr T)) (fn (F) u32))",
+                     "(array (foreach ((ptr F) (ptr T)) F) 0)",
+                     "(foreach ((ptr F) (ptr T)) (B F))"):
+            with self.subTest(body=body):
+                self.rejects(f"(type B (forall (X) () (struct (b (ptr X))))) (type T (struct (f {body})))",
+                             "^type T: recursive foreach needs a named type between$")
+
+    def test_copy_query_of_a_foreach_holding_itself_ends(self):
+        program = C.Program(types={"T": C.TypeDecl("T", (), (), C.Struct((
+            ("f", C.Foreach("F", True, C.Ptr(C.Named("T")), C.Named("F"))),)))})
+        self.assertFalse(Types(program).is_copy(C.Named("T")))
+
     def test_erased_arguments_and_empty_arrays_do_not_store_their_types(self):
         self.compiles("(type Phantom (forall (T) () u32)) (type A (Phantom A))", C.Named("A"))
         self.compiles("(type A (array A 0)) (type B (struct (a A) (n u32)))", C.Named("B"))
@@ -107,7 +148,8 @@ class LayoutTests(unittest.TestCase):
 
     def test_surface_declarations_are_checked_before_inference(self):
         for source, error in (
-            ("exposed struct Bad { inner: Bad }", "infinite by-value"),
+            ("exposed struct Bad { inner: Bad }", "lib.kur:1:16: type p::Bad: infinite by-value layout$"),
+            ("struct T { f: foreach *F of *T => F }", "lib.kur:1:8: type p::T: infinite by-value layout$"),
             ("forall T. exposed struct Bad { next: *Bad[(T, T)] }", "recursive type expansion"),
         ):
             with self.subTest(source=source):

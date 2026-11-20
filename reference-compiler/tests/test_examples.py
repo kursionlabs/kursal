@@ -180,6 +180,7 @@ REJECTED = {
     "branch_inconsistent.kur": "linear value 'h' remains live on some paths",
     "close_by_number.kur": "calling an unsafe function requires unsafe authorization",
     "double_use_handle.kur": "value 'h' has been moved",
+    "foreach_holds_itself.kur": "7:8: type foreach_holds_itself::Tree: infinite by-value layout$",
     "forged_file.kur": "the shape of std::io::File! is not exposed here",
     "implicit_package_open.kur": "pattern does not match exists '1\\. \\(Tag!\\['1\\], u32\\)",
     "implicit_package_open_assignment.kur": "type mismatch: exists '1\\. Tag!\\['1\\] and Tag!\\['a\\]",

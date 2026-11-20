@@ -262,6 +262,7 @@ class Types:
     def __init__(self, program: Program) -> None:
         self.program = program
         self._copy: dict[tuple[Type, tuple[tuple[str, Kind], ...]], bool] = {}
+        self._expanding: list[Foreach] = []  # the foreach types whose Copy query is active
 
     def decl(self, name: str) -> TypeDecl:
         decl = self.program.types.get(name)
@@ -445,7 +446,16 @@ class Types:
                 # A source whose rows are fixed expands; otherwise every row is the body only when the
                 # body does not mention a binder.
                 if self.rows_fixed(ty.source, kinds):
-                    return self.is_copy(self.expand(ty), kinds)
+                    # Like a nominal query, an active one cannot justify itself: a foreach whose
+                    # expansion holds it again by value has no finite layout, which
+                    # `check_type_expansion` rejects.
+                    if any(equal(ty, prior) for prior in self._expanding):
+                        return False
+                    self._expanding.append(ty)
+                    try:
+                        return self.is_copy(self.expand(ty), kinds)
+                    finally:
+                        self._expanding.pop()
                 return not (set(foreach_binders(ty)) & free_names(body)) and self.is_copy(body, kinds)
         return all(self.is_copy(c, kinds) for c in children(ty))
 

@@ -917,6 +917,8 @@ exposed struct Types {
     copy_cache: ArenaMap[(Type['k], ArenaVec[(Span['k], u32), 'k]), bool, 'k],
     // a nominal type -> its unfolding, when making it renamed no binder
     unfolded: ArenaMap[Type['k], Type['k], 'k],
+    // the foreach types whose Copy query is active
+    expanding: ArenaVec[Type['k], 'k],
     counter: Fresh['k],
 }
 
@@ -930,7 +932,7 @@ fn name_order(&cx: Domain!['k], a: (Span['k], u32), b: (Span['k], u32)) -> Order
 forall 'k.
 impl Types['k] {
     fn new(&cx: Domain!['k], program: Program['k], counter: Fresh['k]) -> Types['k] {
-        Types.{ program, copy_cache: ArenaMap::new(&cx), unfolded: ArenaMap::new(&cx), counter }
+        Types.{ program, copy_cache: ArenaMap::new(&cx), unfolded: ArenaMap::new(&cx), expanding: ArenaVec::new(&cx), counter }
     }
 
     fn decl(self, &cx: Domain!['k], name: Span['k]) -> TypeDecl['k] {
@@ -1259,7 +1261,20 @@ impl Types['k] {
                 // A source whose rows are fixed expands; otherwise every row is the body only when
                 // the body does not mention a binder.
                 if self.rows_fixed(&cx, f.source.copy(&cx), kinds) {
-                    return self.is_copy(&cx, self.expand(&cx, f, Option::None), kinds);
+                    // Like a nominal query, an active one cannot justify itself: a foreach whose
+                    // expansion holds it again by value has no finite layout, which
+                    // `check_type_expansion` rejects.
+                    var i = 0usize;
+                    while i < self.expanding.len(&cx) {
+                        if equal(&cx, ty, self.expanding.at(&cx, i)) {
+                            return false;
+                        }
+                        i = i + 1usize;
+                    }
+                    self.expanding.push(&cx, ty);
+                    let answer = self.is_copy(&cx, self.expand(&cx, f, Option::None), kinds);
+                    let unit = self.expanding.pop(&cx);
+                    return answer;
                 }
                 let body = f.body.copy(&cx);
                 let binders: ArenaSet[Span['k], 'k] = with_names(&cx, ArenaSet::new(&cx), foreach_binders(&cx, f));

@@ -891,6 +891,18 @@ These are the places where Kursal differs from what one might expect.
 - **Zero-size types** (`()`, empty structs, brands, capabilities) take no bytes (`sizeof` is 0, see
   "Zero-size types are erased"); a `Ref`, vec or map of one stores nothing, so `OwnedMap![K, ()]` is
   a set.
+- **Types are finite** (`check_type_expansion`, `types::layout`, run before anything else asks a
+  question of a declared type). A type that holds itself by value is rejected (`type T: infinite
+  by-value layout`); a pointer, a function or an empty array between breaks the cycle. A `foreach`
+  whose source's components are known counts as its expansion, and is itself active while its
+  expansion is walked: `*F of *T` binds F to each field type of T, so `struct T { f: foreach *F of
+  *T => F }` holds itself, while `foreach *F of *L => F` over `struct L { next: *L, v: u32 }` is
+  `(*L, u32)` as a struct, finite. Over a type parameter the components are unknown, and the use
+  that chooses the argument is walked instead (`struct W { s: S[W] }`). C names a type by its
+  expanded structure, a declared name staying a name, so a `foreach` that reaches itself again
+  before any name, even behind a pointer, is rejected too (`struct T { f: foreach *F of *T => *F
+  }`: `recursive foreach needs a named type between`). Errors name the declaration whose walk found
+  them.
 - **Expressions as statements.** `f(x);` discards a Copy result. A block's value is its last
   expression, without a `;`. `return` is allowed anywhere; a function whose type is `!` (such as
   `fail`) can stand in any expression position.

@@ -1176,6 +1176,8 @@ SIGNATURES = (
     # its body does not mention the binder.
     "struct L! { x: u32 }\nstruct P { p: foreach X of (u32, L!) => *X }\nforall T. struct Q { q: foreach X of (T, [L!; 0]) => X }\n"
     "forall T where Exposed[T]. struct G! { g: foreach X of T => *X }\nforall T where Exposed[T]. struct K { k: foreach X of T => u8 }\n",
+    # A foreach over a pointer to a recursive type has the pointee's fields: here *L and u32, finite.
+    "struct L { next: *L, v: u32 }\nstruct M { f: foreach *F of *L => F }\n",
 )
 
 SIGNATURE_ERRORS = (
@@ -1261,6 +1263,13 @@ SIGNATURE_ERRORS = (
     "forall T. struct B { a: T }\nfn f(b: B[u32, u8]) {}\n",
     "trait Show { fn show(x: Self) -> u32; }\nforall T where Show[T, T]. fn f(x: T) {}\n",
     "forall T. struct R { r: R[(T, T)] }\n",
+    # A foreach whose components hold it again by value, directly, through a type argument, or through
+    # a foreach source: no finite layout.
+    "struct T { f: foreach *F of *T => F }\n",
+    "forall P. struct S! { f: foreach *F of *P => F }\nstruct W! { s: S![W!] }\n",
+    "struct T { f: foreach F of (foreach *G of *T => G) => F }\n",
+    # Behind a pointer the layout is finite, but C names the field by its expansion, which never ends.
+    "struct T { f: foreach *F of *T => *F }\n",
 )
 
 SYNTAX_ERRORS = (
@@ -1553,6 +1562,8 @@ TYPE_CASES = (
     "(copy () ((T copy)) (foreach (F T) (ptr F)))",
     "(copy () ((T copy)) (foreach (F (ptr T)) (ptr F)))",
     "(copy () ((T copy)) (foreach (F T) u8))",
+    # a foreach holding itself again by value: an active query cannot justify itself
+    "(copy ((type T () (struct (f (foreach ((ptr F) (ptr T)) F))))) () T)",
     "(copy ((type L! () u8)) () (foreach (G (foreach (F (tuple u8 L!)) (ptr F))) G))",
     "(copy () ((T copy)) (foreach (G (foreach (F T) (ptr F))) G))",
     "(copy () () (foreach (F G) (ptr F)))",
@@ -1592,6 +1603,13 @@ TYPE_CASES = (
     "(layout (type S () (foreach (F S) F)))",
     "(layout (type A () (struct (b (ptr B)))) (type B () (enum (x A) (y (array B 0)))))",
     "(layout (type A ($k) (struct (b (brand $k)) (n (ptr (A $k))))))",
+    # a foreach whose components are known is walked as its expansion
+    "(layout (type T () (struct (f (foreach ((ptr F) (ptr T)) F)))))",
+    "(layout (type T () (struct (f (foreach (F (foreach ((ptr G) (ptr T)) G)) F)))))",
+    "(layout (type S (P) (struct (f (foreach ((ptr F) (ptr P)) F)))) (type W () (struct (s (S W)))))",
+    "(layout (type L () (struct (next (ptr L)) (v u32))) (type M () (struct (f (foreach ((ptr F) (ptr L)) F)))))",
+    "(layout (type T () (struct (a (array (foreach ((ptr F) (ptr T)) F) 0)) (n u32))))",
+    "(layout (type T () (struct (f (foreach ((ptr F) (ptr T)) (ptr F))))))",
     # formation
     "(formation (type P (T $k) (struct (a T) (b (brand $k)))))",
     "(formation (type E () (exists ($a) u8)))",
