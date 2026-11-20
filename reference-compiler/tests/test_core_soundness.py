@@ -219,6 +219,40 @@ REJECTED = {
         (fun h (forall ($q) () (fn (forall ($b) () (Tok! $b) ((brand $b) (Tok! $b)))) ()
           (entry () (= %f (fn (g _ (Tok! $q)))) (ret %f))))"""),
 
+    # A parameter never has a declared type's name: it would read as the declaration wherever a type is
+    # unfolded, so a field of type Foo would be returned as whatever f's Foo stands for, and dup's Box
+    # would copy a linear argument as the plain struct Box.
+    "parameter_named_as_type": ("Foo is a declared type, not a parameter name", """
+        (type Foo (struct (a u64)))
+        (type Bar (struct (f Foo)))
+        (fun f (forall (Foo) () Foo (Bar)
+          (entry ((%b Bar)) (= %x (destruct %b Bar)) (ret %x))))"""),
+    "parameter_named_as_copy_type": ("Box is a declared type, not a parameter name", """
+        (type Box (struct (k u32)))
+        (fun dup (forall (Box) () (tuple Box Box) (Box)
+          (entry ((%b Box))
+            (= %k (destruct %b Box)) (= %k2 (copy %k))
+            (= %b1 (construct Box %k)) (= %b2 (construct Box %k2))
+            (= %r (construct (tuple Box Box) %b1 %b2)) (ret %r))))"""),
+    "foreach_binder_named_as_type": ("Foo is a declared type, not a parameter name", """
+        (type Foo (struct (a u64)))
+        (type T! (forall (S) () (struct (f (foreach (Foo S) Foo)))))"""),
+    "existential_binder_named_as_type": ("Foo is a declared type, not a parameter name", """
+        (type Foo (struct (a u64)))
+        (type T (struct (f (exists ($Foo) (brand $Foo)))))"""),
+    "block_brand_named_as_type": ("Foo is a declared type, not a parameter name", """
+        (type Foo (struct (a u64)))
+        (fun f u32 ()
+          (entry () (= %f (fresh)) (= %w (open %f ($a))) (jmp (next $a) %w))
+          (next ($Foo) ((%x (brand $Foo))) (= %r (const u32 0)) (ret %r)))"""),
+    "trait_parameter_named_as_type": ("Foo is a declared type, not a parameter name", """
+        (type Foo (struct (a u64)))
+        (trait K (Foo) (keep Foo (Foo)))"""),
+    "instance_parameter_named_as_type": ("Foo is a declared type, not a parameter name", """
+        (type Foo (struct (a u64)))
+        (trait K (T))
+        (instance K (forall (Foo) () ((ptr Foo))))"""),
+
     # A zero-size type is erased: an unsafe cast has no representation of one to reinterpret, and C has
     # no zero-size parameter or object for an extern. Its loads and stores are accepted (test_zero_size).
     "cast_to_unit": ("zero_size_type_has_no_memory_form", """

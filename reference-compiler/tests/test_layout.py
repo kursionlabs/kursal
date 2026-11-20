@@ -82,7 +82,7 @@ class LayoutTests(unittest.TestCase):
         self.rejects("(type A (foreach (F (ptr A)) u32))", "recursive foreach source")
         self.rejects("(type A (foreach (F (tuple u32)) (tuple A F)))", "infinite by-value layout")
         self.compiles("(type A (foreach (F (tuple u32)) (ptr A)))", C.Named("A"))
-        self.compiles("(type A (foreach (A (tuple u32)) A))", C.Named("A"))
+        self.rejects("(type A (foreach (A (tuple u32)) A))", "A is a declared type, not a parameter name")
 
     def test_foreach_components_that_hold_the_foreach_by_value_are_infinite(self):
         # `*F` over `*T` binds F to each field type of T, so the field is the foreach again.
