@@ -385,7 +385,9 @@ Then, while writing the C (`backend::cgen`, `cgen.py`):
   `T const*`: the caller passes the address of where the value lies, or of a copy of it (see "Why
   passing aggregates by pointer is sound"), and the callee reads it through the pointer, or copies it
   into its own variable first where it writes that variable (a call of itself in tail position, a
-  lend in place of a path in it). A function whose address is taken keeps the plain convention for
+  lend in place of a path in it, or of a value read there: a payload read where the switch's
+  scrutinee lies, through a component or a copy of the parameter, `Plan::variable`). A function whose
+  address is taken keeps the plain convention for
   function values: they call its by-value entry (`thunk`), which passes the addresses on. A call
   through a function value or to a foreign function passes every value by value. Up to four words
   the C compiler copies a value in as many moves, and a pointer would cost the callee a load per read
@@ -531,8 +533,12 @@ plan (`Plan::residences`) allows a residence only where that holds:
    parameter; the arm's block is entered from that switch alone and is not the switch's block, so the
    switch's block runs again only after the arm's block has left, and the arm's block (and a block
    whose payload it passes on, read in the same variable) shares no value into the variable it reads
-   its payload in, which it may read after the value is made. The moves of an edge out of the arm's
-   block read the scrutinee's variable, which `Move.base` accounts for.
+   its payload in, which it may read after the value is made. That variable is found through what
+   reads another value's variable (`Plan::variable`): a residence in a value, a copy, a load of a
+   forwarded place, and a payload read where its scrutinee lies; a switch on a copy of a parameter
+   reads the payload in the parameter's variable. The moves of an edge out of the arm's block read
+   the scrutinee's variable, which `Move.base` accounts for. A lend in place of such a payload writes
+   the scrutinee's variable, so a parameter taken by pointer that it lies in is copied first.
 
 ### Why homed parameters and out-results are sound
 

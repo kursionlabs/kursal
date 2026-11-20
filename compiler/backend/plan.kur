@@ -156,6 +156,8 @@ exposed struct Plan {
     blocks: ArenaMap[Span['k], Block['k], 'k],
     // the local places a store and a load alone name
     forwarded: ArenaSet[Span['k], 'k],
+    // (block label, value) -> the value whose C variable a copy, or a load of a forwarded place, reads
+    copied: ArenaMap[(Span['k], Span['k]), Span['k], 'k],
     // a return join -> the position of the parameter it returns
     return_index: ArenaMap[Span['k], usize, 'k],
     // the blocks the C has: every edge into a return join returns instead
@@ -205,11 +207,12 @@ impl Plan['k] {
             let unit = blocks.insert(&cx, fun.blocks.at(&cx, b).label, fun.blocks.at(&cx, b));
             b = b + 1usize;
         }
-        let plan = Plan.{ fun, blocks, forwarded: ArenaSet::new(&cx), return_index: ArenaMap::new(&cx), emitted: ArenaVec::new(&cx),
+        let plan = Plan.{ fun, blocks, forwarded: ArenaSet::new(&cx), copied: ArenaMap::new(&cx), return_index: ArenaMap::new(&cx), emitted: ArenaVec::new(&cx),
             live: ArenaSet::new(&cx), read_scratch: ArenaSet::new(&cx), variables: ArenaSet::new(&cx), resident: ArenaMap::new(&cx), in_place: ArenaMap::new(&cx),
             unwritten: ArenaSet::new(&cx), fused: ArenaSet::new(&cx), shared: ArenaMap::new(&cx), arrived: ArenaMap::new(&cx),
             moved: ArenaSet::new(&cx), homed: ArenaMap::new(&cx), made_home: ArenaSet::new(&cx) };
         plan.forwarded_places(&cx);
+        plan.copy_sources(&cx);
         var r = 1usize;
         while r < fun.blocks.len(&cx) {
             let label = fun.blocks.at(&cx, r).label;
@@ -300,6 +303,41 @@ impl Plan['k] {
 
     fn is_forwarded_load(self, &cx: Domain!['k], instr: Instr['k]) -> bool {
         instr.op.is(&cx, "load") && self.forwarded.contains(&cx, instr.args.at(&cx, 0usize))
+    }
+
+    // The value whose C variable each copy, and each load of a forwarded place, reads: its source's,
+    // or the stored value's, followed through copies and forwarded loads.
+    fn copy_sources(self, &cx: Domain!['k]) {
+        let stored: ArenaMap[Span['k], Span['k], 'k] = ArenaMap::new(&cx);
+        var b = 0usize;
+        while b < self.fun.blocks.len(&cx) {
+            let block = self.fun.blocks.at(&cx, b);
+            stored.clear(&cx);
+            var i = 0usize;
+            while i < block.instrs.len(&cx) {
+                let instr = block.instrs.at(&cx, i);
+                let first = if instr.args.is_empty(&cx) { Span::from_static(&cx, "") } else { instr.args.at(&cx, 0usize) };
+                let source = if instr.op.is(&cx, "copy") && first.starts_with(&cx, Span::from_static(&cx, "%")) {
+                    Option::Some.(first)
+                } else if instr.op.is(&cx, "store") && self.forwarded.contains(&cx, first) {
+                    let unit = stored.insert(&cx, first, instr.args.at(&cx, 1usize));
+                    Option::None
+                } else if self.is_forwarded_load(&cx, instr) {
+                    Option::Some.(stored.at(&cx, first))
+                } else {
+                    Option::None
+                };
+                match source {
+                    Option::Some(from) => {
+                        let found = self.copied.get_or(&cx, (block.label, from), from);
+                        let unit = self.copied.insert(&cx, (block.label, instr.lhs.at(&cx, 0usize)), found);
+                    },
+                    Option::None => (),
+                };
+                i = i + 1usize;
+            }
+            b = b + 1usize;
+        }
     }
 
     // ------------------------------------------------------------------ liveness --
@@ -934,9 +972,10 @@ impl Plan['k] {
     }
 
     // The block and value whose C variable the value `name` of block `label` lies in, through the
-    // scrutinees payloads arrive from; none when it lies in a place.
+    // copies and forwarded loads that read another value's variable and the scrutinees payloads
+    // arrive from; none when it lies in a place.
     fn variable(self, &cx: Domain!['k], label: Span['k], name: Span['k]) -> Option[(Span['k], Span['k])] {
-        let path = self.resident.get_or(&cx, (label, name), name);
+        let path = self.resident.get_or(&cx, (label, name), self.copied.get_or(&cx, (label, name), name));
         if path.starts_with(&cx, Span::from_static(&cx, "&")) {
             return Option::None;
         }

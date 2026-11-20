@@ -249,6 +249,40 @@ class ByPointerTests(unittest.TestCase):
         self.assertRegex(c, r"static uint64_t \w*sum\w*_value\(K_Big entry_p\w*\) \{\n  return \w*sum\w*\(&entry_p\w*\);")
         self.assertEqual(run(c), 60)
 
+    def test_a_payload_lent_in_place_is_lent_from_a_copy_of_a_parameter_taken_by_pointer(self):
+        # The arm reads its payload where the scrutinee lies: in the parameter taken by pointer, or in a
+        # component of it. A lend of the payload in place writes there, so the function copies the
+        # parameter into its own variable first, and the caller's value, read again by `g`, is unchanged.
+        def program(param: str, scrutinee: str, made: str) -> str:
+            return f"""
+(type T5 (tuple u64 u64 u64 u64 u64))
+(type Big (enum (A T5) (B u32)))
+(fun bump u32 (T5) (entry ((&t T5)) (= %n (const u64 99)) (= %u (store &t.0 %n)) (= %r (const u32 0)) (ret %r)))
+(fun adapt (tuple T5 u32) (T5) (locals (&s T5))
+  (entry ((%v T5)) (= %u (store &s %v)) (= %r (call bump &s)) (= %w (load &s)) (= %o (construct (tuple T5 u32) %w %r)) (ret %o)))
+(fun f u64 ({param})
+  (entry ((%q {param})) {scrutinee} (switch %p Big (A a) (B b)))
+  (a ((%pl T5)) (= %x (call adapt %pl)) (= (%w %r) (destruct %x (tuple T5 u32)))
+     (= (%a0 %a1 %a2 %a3 %a4) (destruct %w T5)) (ret %a0))
+  (b ((%k u32)) (= %z (const u64 0)) (ret %z)))
+(fun g u64 ({param})
+  (entry ((%q {param})) {scrutinee} (switch %p Big (A a) (B b)))
+  (a ((%pl T5)) (= (%a0 %a1 %a2 %a3 %a4) (destruct %pl T5)) (ret %a0))
+  (b ((%k u32)) (= %z (const u64 0)) (ret %z)))
+(fun main i32 ()
+  (entry ()
+    (= %1 (const u64 1)) (= %2 (const u64 2)) (= %3 (const u64 3)) (= %4 (const u64 4)) (= %5 (const u64 5))
+    (= %t (construct T5 %1 %2 %3 %4 %5)) (= %bg (construct_variant Big A %t)) {made} (= %q2 (copy %q))
+    (= %x (call f %q)) (= %y (call g %q2)) (= %s (add %x %y)) (= %r (int_cast %s i32)) (ret %r)))"""
+        whole = program("Big", "(= %p (copy %q))", "(= %q (copy %bg))")
+        component = program("(tuple u64 Big)", "(= (%n %p) (destruct %q (tuple u64 Big)))",
+                            "(= %z (const u64 0)) (= %q (construct (tuple u64 Big) %z %bg))")
+        for source in (whole, component):
+            c = c_of(source)
+            self.assertRegex(body(c, "f"), r"entry_q\w* = \*entry_q\w*_ref;")
+            self.assertEqual(run(c), 100)
+            self.assertEqual(run(c, [c_compiler(), *UNOPTIMIZED]), 100)
+
 
 SUM = """
 (fun sum u64 (u64 u64) (entry ((%n u64) (%acc u64)) (= %z (const u64 0)) (= %n2 (copy %n)) (= %done (eq %n2 %z)) (jnz %done (fin %acc) (more %n %acc)))
@@ -357,6 +391,26 @@ class OutResultTests(unittest.TestCase):
             self.assertRegex(body(c, "main"), r"loop_q\w*\.e0\.payload\.v_A")
             self.assertNotRegex(body(c, "main"), r"loop_q\w*\.e0 = arm_|&loop_q\w*\.e0[,)]")
             self.assertEqual(run(c), 106)
+
+    def test_no_value_is_made_in_the_variable_a_payload_is_read_in_through_a_copy(self):
+        # The switch is on a copy of the loop's parameter, which reads the parameter's variable: the
+        # arm reads its payload there, so the state it makes for the next round is made elsewhere, and
+        # the payload's first component is read before it is overwritten.
+        c = c_of(BIG + f"""
+(type St (enum (A (tuple Big Big)) (C (tuple Big Big))))
+(fun main i32 () (locals (&acc u64))
+  (entry () (= %z (const u64 0)) (= %u0 (store &acc %z)) {big("b1", 1)} {big("b2", 6)}
+    (= %pay (construct (tuple Big Big) %b1 %b2)) (= %s (construct_variant St A %pay)) (jmp loop %s))
+  (loop ((%st St)) (= %c (copy %st)) (switch %c St (A arm) (C fin)))
+  (arm ((%pay (tuple Big Big))) (= (%x %y) (destruct %pay (tuple Big Big))) {big("n1", 50)}
+    (= %np (construct (tuple Big Big) %n1 %y)) (= %s2 (construct_variant St C %np))
+    (= (%xa %xb %xc %xd %xe) (destruct %x Big)) (= %old (load &acc)) (= %new (add %old %xa)) (= %u (store &acc %new))
+    (jmp loop %s2))
+  (fin ((%pay (tuple Big Big))) (= (%x %y) (destruct %pay (tuple Big Big))) (= (%ya %yb %yc %yd %ye) (destruct %y Big))
+    (= %v (load &acc)) (= %w (add %v %ya)) (= %i (int_cast %w i32)) (ret %i)))""")
+        self.assertNotRegex(body(c, "main"), r"loop_st\w*\.payload\.v_C = ")
+        self.assertEqual(run(c), 7)
+        self.assertEqual(run(c, [c_compiler(), *UNOPTIMIZED]), 7)
 
     def test_a_foreach_mapper_writing_out_results_is_called_through_its_by_value_entry(self):
         c = c_of(BIG + f"""

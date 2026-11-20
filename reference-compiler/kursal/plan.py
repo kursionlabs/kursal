@@ -118,6 +118,8 @@ class Plan:
         self.fun = fun
         self.blocks = {b.label: b for b in fun.blocks}
         self.forwarded = self.forwarded_places()
+        # (block, value) -> the value whose C variable a copy, or a load of a forwarded place, reads
+        self.copied = self.copy_sources()
         self.return_index: dict[str, int] = {}
         for block in fun.blocks[1:]:
             index = self.returned(block.label, set())
@@ -177,6 +179,25 @@ class Plan:
 
     def is_forwarded_load(self, instr: Instr) -> bool:
         return instr.op == "load" and instr.args[0] in self.forwarded
+
+    def copy_sources(self) -> dict[tuple[str, str], str]:
+        """The value whose C variable each copy, and each load of a forwarded place, reads: its
+        source's, or the stored value's, followed through copies and forwarded loads."""
+        out: dict[tuple[str, str], str] = {}
+        for block in self.fun.blocks:
+            stored: dict[str, str] = {}
+            for instr in block.instrs:
+                if instr.op == "copy" and instr.args[0].startswith("%"):
+                    source = instr.args[0]
+                elif instr.op == "store" and instr.args[0] in self.forwarded:
+                    stored[instr.args[0]] = instr.args[1]
+                    continue
+                elif self.is_forwarded_load(instr):
+                    source = stored[instr.args[0]]
+                else:
+                    continue
+                out[block.label, instr.lhs[0]] = out.get((block.label, source), source)
+        return out
 
     # --------------------------------------------------------------- liveness --
 
@@ -287,8 +308,9 @@ class Plan:
 
     def variable(self, label: str, name: str) -> Optional[tuple[str, str]]:
         """The block and value whose C variable the value `name` of block `label` lies in, through the
-        scrutinees payloads arrive from; `None` when it lies in a place."""
-        path = self.resident.get((label, name), name)
+        copies and forwarded loads that read another value's variable and the scrutinees payloads arrive
+        from; `None` when it lies in a place."""
+        path = self.resident.get((label, name), self.copied.get((label, name), name))
         if path.startswith("&"):
             return None
         value = root(path)

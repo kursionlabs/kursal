@@ -869,13 +869,17 @@ class Backend:
     def written_params(self, fun: Fun) -> set[str]:
         """The value parameters the function being written assigns: every one where it may call itself
         in tail position (the call assigns the parameters and runs the entry block again), and those
-        holding a path a lend in place lends."""
+        whose variable holds a path a lend in place lends: the value lent may lie there itself, or be a
+        payload read where its scrutinee lies (`Plan.variable`), in any block."""
         plan = self.plan
+        entry = fun.blocks[0].label
         for block in plan.emitted:
             call = plan.tail_call(block)
             if call is not None and (call.op == "trait_call" or call.args[0] == fun.name):
                 return {name for name, _ in fun.blocks[0].params}
-        return {root(path) for paths in plan.in_place.values() for path in paths if path.startswith("%")}
+        homes = {plan.variable(label, root(path)) for (label, _), paths in plan.in_place.items() for path in paths
+                 if path.startswith("%")}
+        return {name for home in homes if home is not None for label, name in (home,) if label == entry}
 
     def thunk(self, symbol: str, thunk: str) -> tuple[str, str]:
         """The head and body of `thunk`, the by-value entry of `symbol` that function values call: it
