@@ -403,7 +403,8 @@ class Types:
         return True
 
     def sum_behind_pointer(self, source: Type, module: Optional[ModuleId], kinds: Kinds) -> bool:
-        """A pointer to a visible sum: its type expands, but no traversal reaches its payloads yet."""
+        """A pointer to a visible sum: traversing it reads the variant through the pointer, an unsafe
+        read, so it needs unsafe authorization instead of `Exposed`, which never holds for one."""
         shape = self.visible_shape(source, module, kinds)
         return isinstance(shape, Ptr) and isinstance(self.visible_shape(shape.inner, module, kinds), Enum)
 

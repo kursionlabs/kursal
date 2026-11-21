@@ -878,7 +878,8 @@ These are the places where Kursal differs from what one might expect.
   needs a type from context. A float literal has a point (`2.5`), an exponent (`1e-7`, `1.5E+300`)
   or a float suffix (`7f64`); a point needs digits on both sides.
 - **`unsafe`** marks one operation: `unsafe f(x)` calls an unsafe or extern function, `unsafe *p`
-  reads through a pointer, `unsafe (x as *T)` casts, `f(unsafe &*p)` lends a pointer's target.
+  reads through a pointer, `unsafe (x as *T)` casts, `f(unsafe &*p)` lends a pointer's target,
+  `unsafe (foreach x of p { .. })` traverses a sum through a pointer (it reads the variant there).
   `unsafe (unsafe malloc(n) as *T)` is two operations. A safe function may contain unsafe operations.
   `as` between two number types is a conversion by value and needs no `unsafe` (see "Number
   conversions"); a float's bits are `x.to_bits()` and `f64::from_bits(b)`. An unsafe cast neither
@@ -936,9 +937,12 @@ These are the places where Kursal differs from what one might expect.
   holds that variant); a pointer to a leaf is the one component. `*F` binds F to each component's
   pointee, so its source must give pointers whatever the type arguments are: an explicit pointer,
   a `foreach` whose body is a pointer, or a visible product of pointers (`foreach *F of T => F` is
-  rejected, as `T` may be `bool`: `foreach *F needs a source whose components are pointers`). No
-  `foreach` expression traverses a sum through a pointer yet: the type is defined, the traversal is
-  rejected (`a foreach cannot traverse a sum through a pointer yet`).
+  rejected, as `T` may be `bool`: `foreach *F needs a source whose components are pointers`).
+  Through a pointer to a product a `foreach` only computes addresses, but through one to a sum it
+  reads the variant there, so it is `unsafe`: the pointer addresses an initialized value whose
+  variant stays the same while a payload pointer is used. It calls the mapper on the held
+  variant's payload only, and needs the sum's shape visible where it is written: `Exposed[*T]`
+  never holds for a pointer to a sum, so a generic traversal never reads through its pointer.
 - **A `foreach` type's body** binds its own binder and, over a transformed source, that source's
   binders, each the component's: in `foreach F of (foreach G of (u32, u8) => *G) => (F, G)`, `G` is
   `u32` in the first row and `u8` in the second, even where a type parameter `G` is in scope.

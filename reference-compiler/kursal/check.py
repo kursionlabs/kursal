@@ -988,8 +988,8 @@ class Checker:
         if not equal(got, t.source):
             self.fail("foreach_source")
         if self.types.sum_behind_pointer(t.source, self.module, self.kinds):
-            self.fail("foreach_cannot_traverse_sum_behind_pointer")
-        if not self.holds("Exposed", (t.source,)):
+            self.authorize(instr, True)
+        elif not self.holds("Exposed", (t.source,)):
             self.fail("foreach_source_not_exposed")
         mapper = self.program.funs.get(instr.args[1])
         if mapper is None:

@@ -152,6 +152,7 @@ RUNS: dict[str, tuple[tuple, ...]] = {
                                 "Candidate 3 disqualified, had 2 votes\n"
                                 "Candidate 3 confirmed removed -- 0 candidates found (expected 0): 0\n"
                                 "Total distinct candidates on file: 33\n", 0),),
+    "foreach_sum_pointers": (((), "", "", 0),),
     "format_strings": (((), "", "", 0),),
     "format_trait": (((), "", "point: (3, 4)\ncolor: rgb(255, 128, 0)\n", 0),),
     "functions": (((), "", "", 0),),
@@ -183,7 +184,7 @@ REJECTED = {
     "double_use_handle.kur": "value 'h' has been moved",
     "foreach_holds_itself.kur": "7:8: type foreach_holds_itself::Tree: infinite by-value layout$",
     "foreach_pointer_over_parameter.kur": "10:5: type formation: foreach \\*F needs a source whose components are pointers$",
-    "foreach_through_pointer_to_sum.kur": "9:17: a foreach cannot traverse a sum through a pointer yet$",
+    "foreach_through_pointer_to_sum.kur": "10:17: a foreach through a pointer to a sum reads its variant there and requires unsafe authorization$",
     "forged_file.kur": "the shape of std::io::File! is not exposed here",
     "implicit_package_open.kur": "pattern does not match exists '1\\. \\(Tag!\\['1\\], u32\\)",
     "implicit_package_open_assignment.kur": "type mismatch: exists '1\\. Tag!\\['1\\] and Tag!\\['a\\]",

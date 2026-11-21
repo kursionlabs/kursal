@@ -167,8 +167,9 @@ REJECTED = {
         (fun g usize () (entry () (= %n (sizeof (foreach ((ptr F) Opt) F))) (ret %n)))"""),
     "pointer_pattern_in_declaration": ("foreach \\*F needs a source whose components are pointers in type Holder!", """
         (type Holder! (forall (T) () (struct (f (foreach ((ptr F) T) F)))))"""),
-    # A sum behind a pointer expands to pointers to its payloads; nothing traverses one yet.
-    "foreach_through_pointer_to_sum": ("foreach_cannot_traverse_sum_behind_pointer", """
+    # A sum behind a pointer expands to pointers to its payloads; traversing one reads its variant
+    # through the pointer, an unsafe read.
+    "foreach_through_pointer_to_sum": ("unsafe_authorization", """
         (type Opt (enum (none (tuple)) (some u8)))
         (fun mapper (forall (F) () u32 ((ptr F)) (entry ((%x (ptr F))) (= %z (const u32 0)) (ret %z))))
         (fun walk (foreach ((ptr F) (ptr Opt)) u32) ((ptr Opt))
@@ -410,6 +411,13 @@ class CoreSoundnessTests(unittest.TestCase):
                  (= %d (sizeof (foreach ((ptr F) (tuple (ptr u8) (ptr u16))) F)))
                  (ret %a)))
                (fun g (forall (T) () usize () (entry () (= %n (sizeof (foreach ((ptr F) (ptr T)) F))) (ret %n))))""",
+            # An unsafe traversal of a sum through a pointer.
+            """(type Opt (enum (none (tuple)) (some u8)))
+               (fun mapper (forall (F) () u32 ((ptr F)) (entry ((%x (ptr F))) (= %z (const u32 0)) (ret %z))))
+               (fun walk (foreach ((ptr F) (ptr Opt)) u32) ((ptr Opt))
+                 (entry ((%p (ptr Opt)))
+                   (unsafe (= %out (foreach (foreach ((ptr F) (ptr Opt)) u32) %p mapper)))
+                   (ret %out)))""",
             # A block brand that is new to the function.
             """(fun f u32 ()
                  (entry () (= %f (fresh)) (= %w (open %f ($a))) (jmp (next $a) %w))

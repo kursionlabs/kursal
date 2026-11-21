@@ -1,0 +1,86 @@
+// A foreach through a pointer to a sum gives a pointer to the payload of the
+// variant the value holds, in a sum with the same labels: through a
+// `*Option[u32]` it is `Some` holding a `*u32` or `None` holding a `*()`.
+// Finding the variant reads the value through the pointer, so the traversal
+// is `unsafe`: the pointer must address an initialized value, whose variant
+// stays the same while the payload pointer is used. A payload of a niche
+// layout, `Option[NonNull[u8]]`'s, is the whole value, at the same address.
+use std::io::print;
+use std::mem::alloca;
+use std::option::Option;
+use std::ptr::NonNull;
+use std::slice::Slice;
+
+fn check(ok: bool, what: Slice[u8, 'static]) {
+    if !ok {
+        print(what);
+        print(": wrong\n");
+    }
+}
+
+enum Shape {
+    Dot,
+    Line(u32),
+    Box(u32, u64),
+}
+
+fn held(p: *Option[u32]) -> u32 {
+    let parts = unsafe (foreach f of p { f });
+    match parts {
+        Some(q) => unsafe *q,
+        None(_) => 0,
+    }
+}
+
+// Writing through the payload pointer keeps the variant.
+fn bump(p: *Option[u32]) {
+    let parts = unsafe (foreach f of p { f });
+    match parts {
+        Some(q) => { unsafe *q = unsafe *q + 1; },
+        None(_) => (),
+    }
+}
+
+fn measure(p: *Shape) -> u64 {
+    let parts = unsafe (foreach f of p { f });
+    match parts {
+        Dot(_) => 1,
+        Line(q) => unsafe *q as u64,
+        Box(q) => {
+            let (w, h) = unsafe *q;
+            (w as u64) * h
+        },
+    }
+}
+
+fn at_whole(p: *Option[NonNull[u8]]) -> bool {
+    let parts = unsafe (foreach f of p { f });
+    match parts {
+        Some(q) => unsafe (q as usize) == unsafe (p as usize),
+        None(_) => false,
+    }
+}
+
+fn main() -> i32 {
+    let o = unsafe alloca[Option[u32]]();
+    unsafe *o = Option::Some(41);
+    bump(o);
+    check(held(o) == 42, "a tagged payload");
+    unsafe *o = Option::None;
+    check(held(o) == 0, "no payload");
+
+    let s = unsafe alloca[Shape]();
+    unsafe *s = Shape::Box(3, 5);
+    check(measure(s) == 15, "a tuple payload");
+    unsafe *s = Shape::Line(7);
+    check(measure(s) == 7, "a word payload");
+    unsafe *s = Shape::Dot;
+    check(measure(s) == 1, "a dataless variant");
+
+    let n = unsafe alloca[Option[NonNull[u8]]]();
+    unsafe *n = NonNull::new(unsafe (s as *u8));
+    check(at_whole(n), "a niche payload");
+    unsafe *n = Option::None;
+    check(!at_whole(n), "the niche");
+    0
+}

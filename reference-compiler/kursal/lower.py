@@ -1213,8 +1213,12 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         if vals is None:
             return None
         assert isinstance(ty, C.Foreach)
+        reads = self.types.sum_behind_pointer(ty.source, self.module, self.kinds)
+        if reads and not self.authorized(expr):
+            fail("a foreach through a pointer to a sum reads its variant there and requires unsafe authorization", expr.pos)
         name = MapperLower(self, expr, ty).lower()
-        return self.emit("foreach", ty, (vals[0], name, *vals[1:]), ty=ty, tys=self.identity_args(), node=expr)
+        return self.emit("foreach", ty, (vals[0], name, *vals[1:]), node=expr, unsafe=reads,
+                         ty=ty, tys=self.identity_args())
 
     def expr_fstring(self, expr: S.FStr) -> Optional[str]:
         sig = self.lowering.library_sig("Buffer!::new", self.module)

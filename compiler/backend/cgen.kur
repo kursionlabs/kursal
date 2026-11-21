@@ -3914,11 +3914,31 @@ impl Backend['k] {
                     };
                     let source_type = self.type_of(&cx, instr.args.at(&cx, 0usize));
                     let result_type = Type::Foreach.(t);
-                    line(&lines, Buffer!::new().push_static("switch (").push_bytes(&cx, self.tag(&cx, source, source_type)).push_static(") {"));
+                    // Through a pointer the variant is read there, and each payload is passed by its
+                    // address: the pointer to the whole for a zero-size payload or the niche layout's.
+                    let sum_type = if pointer {
+                        self.pointee(&cx, self.shape(&cx, source_type))
+                    } else {
+                        source_type
+                    };
+                    let held = if pointer {
+                        self.tag(&cx, Buffer!::new().push_static("(*").push_bytes(&cx, source).push_static(")").save(&cx), sum_type)
+                    } else {
+                        self.tag(&cx, source, source_type)
+                    };
+                    let niche = self.niche_layout(&cx, sum_type).is_some();
+                    line(&lines, Buffer!::new().push_static("switch (").push_bytes(&cx, held).push_static(") {"));
                     var k = 0usize;
                     while k < rows.len(&cx) && k < results.len(&cx) {
                         let row = rows.at(&cx, k);
-                        let applied = walk.apply(&cx, row, self.payload(&cx, source, source_type, row.label));
+                        let component = if !pointer {
+                            self.payload(&cx, source, source_type, row.label)
+                        } else if niche || self.erased(&cx, self.pointee(&cx, row.item)) {
+                            Buffer!::new().push_static("(void*)").push_bytes(&cx, source).save(&cx)
+                        } else {
+                            Buffer!::new().push_static("KUR_FIELD(").push_bytes(&cx, source).push_static(", payload.").push_bytes(&cx, self.variant(&cx, row.label)).push_static(")").save(&cx)
+                        };
+                        let applied = walk.apply(&cx, row, component);
                         let body = if self.erased(&cx, results.at(&cx, k).type) {
                             Buffer!::new().push_bytes(&cx, applied).push_static("; ").push_bytes(&cx, self.set_variant(&cx, dst, result_type, row.label, Option::None).join(&cx, " ")).save(&cx)
                         } else {

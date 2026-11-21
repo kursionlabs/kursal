@@ -328,6 +328,7 @@ a checked type; their obligation is the same kind of thing.
 | `alloc::buffer::Buffer!::tail_ptr` | the same; the bytes it addresses are uninitialized until written externally and committed |
 
 | `alloc::arena::Arena!::alloc_bytes` | the returned run is reserved but **uninitialized** and unaligned; it must not outlive the arena |
+| `unsafe (foreach x of p { .. })`, `p` a pointer to a sum | the language operation, not a function: `p` addresses an initialized value of the sum, read there to find its variant, and that variant stays the same while the payload pointer the mapper is given is used (a write through it keeps the variant; a write of the whole value through `p` does not) |
 | `core::mem::alloca` | the returned `*T` is used only until the calling function returns, when its storage is freed; and a linear value written there is moved out (or otherwise accounted for) before then. The checker tracks values and places, not raw storage: a linear `T` left in an `alloca` slot at return is dropped unseen |
 | `core::ptr::offset` | `count` elements of `T` past `base` stay inside the block `base` points into; no bound is passed or checked. The one address computation of the library: every module that steps through a block calls it |
 | `alloc::collections::arena_vec::place` | `i` is below the capacity of `h`'s segments, which are live arena blocks of the sizes `locate` computes |

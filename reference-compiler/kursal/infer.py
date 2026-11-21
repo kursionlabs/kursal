@@ -415,8 +415,6 @@ class Infer:
             concrete = tuple(zonk(arg) for arg in args)
             if len(concrete) != 1 or not self.types.exposure_available(
                     concrete[0], self.module, self.kinds, self.assumptions):
-                if len(concrete) == 1 and self.types.sum_behind_pointer(concrete[0], self.module, self.kinds):
-                    fail("a foreach cannot traverse a sum through a pointer yet", pos)
                 fail("Exposed requires an exact premise or an authorized traversable shape", pos)
             return
         inputs = [zonk(a) for a in args[:input_count]]
@@ -1034,7 +1032,10 @@ class Infer:
         source = zonk(self.expr(expr.source))
         if isinstance(source, Meta):
             source = self.shape(source, expr.pos)
-        self.require("Exposed", (source,), expr.pos)
+        # Through a pointer to a sum the traversal reads the variant, an unsafe read that lowering
+        # authorizes; anything else it traverses needs only the shape.
+        if not self.types.sum_behind_pointer(source, self.module, self.kinds):
+            self.require("Exposed", (source,), expr.pos)
         # Each `foreach` binds a binder of its own, named after the one written, as `F#F12` for `F`.
         written = expr.binder or ""
         sources = foreach_binders(source) if isinstance(source, C.Foreach) else ()
