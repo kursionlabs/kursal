@@ -2218,23 +2218,20 @@ class CompilerTests(unittest.TestCase):
         trait, each declaration with its signature highlighted and the types and traits it names linked, a
         `forall` premise of several lines kept whole, and no plain comment or extern outside the source."""
         with tempfile.TemporaryDirectory() as directory:
-            package, site = Path(directory) / "gizmo", Path(directory) / "site"
+            package, src = Path(directory) / "gizmo", Path(directory) / "site"
             package.mkdir()
             (package / "kur.toml").write_text(manifest("gizmo"))
             (package / "lib.kur").write_text(DOC_PACKAGE)
-            result = self.run_compiler("doc", str(package), "-o", str(site))
+            result = self.run_compiler("doc", str(package), "-o", str(src))
             self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
-            src = site / "src"
             self.assertEqual(markdown_link_errors(src), [])
-            self.assertTrue((site / "krayon.toml").is_file())
-            for theme in ("_includes/doc.html", "_includes/source.html", "assets/site.css", "assets/search.js"):
-                self.assertTrue((src / theme).is_file(), theme)
+            self.assertEqual(sorted(p.name for p in src.iterdir()), ["gizmo", "index.md", "search-index.json", "src"])
             front, _, _ = (src / "gizmo/index.md").read_text().partition("+++\n<div")
             body = page_body(src / "gizmo/index.md")
             point, measure = page_body(src / "gizmo/struct.Point.md"), page_body(src / "gizmo/trait.Measure.md")
-            pages = [p.read_text() for p in src.rglob("*.md") if "src/src" not in p.as_posix()]
+            pages = [p.read_text() for p in src.rglob("*.md") if p.relative_to(src).parts[0] != "src"]
             source = (src / "src/gizmo/lib.kur.md").read_text()
-            summaries = {r["p"]: r["s"] for r in json.loads((src / "assets/search-index.json").read_text())}
+            summaries = {r["p"]: r["s"] for r in json.loads((src / "search-index.json").read_text())}
         self.assertIn('layout = "doc.html"', front)
         for name, section, url in (("Point", "Types", "/gizmo/struct.Point.html"), ("Measure", "Traits", "/gizmo/trait.Measure.html"),
                                    ("first", "Functions", "#fn.first"), ("LIMIT", "Constants", "#const.LIMIT"),
@@ -2291,11 +2288,10 @@ class CompilerTests(unittest.TestCase):
         package's pages prefer its own paths; and the search index lists each item once, under the
         documented package's path."""
         with tempfile.TemporaryDirectory() as directory:
-            base, site = Path(directory), Path(directory) / "site"
+            base, src = Path(directory), Path(directory) / "site"
             write_files(base, DOC_PACKAGES)
-            result = self.run_compiler("doc", str(base / "gizmo"), "-o", str(site))
+            result = self.run_compiler("doc", str(base / "gizmo"), "-o", str(src))
             self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
-            src = site / "src"
             self.assertEqual(markdown_link_errors(src), [])
             facade = (src / "gizmo/shapes/index.md").read_text()
             own = (src / "gadget/shapes/index.md").read_text()
@@ -2304,7 +2300,7 @@ class CompilerTests(unittest.TestCase):
             area = page_body(src / "gizmo/shapes/trait.Area.md")
             tools = page_body(src / "gizmo/tools/index.md")
             measures = page_body(src / "gadget/measures/index.md")
-            index = json.loads((src / "assets/search-index.json").read_text())
+            index = json.loads((src / "search-index.json").read_text())
         self.assertIn('title = "gizmo::shapes"', facade)
         self.assertIn('<p class="re-export-note">Re-exported from <a href="../../gadget/shapes/"><code>gadget::shapes</code></a>.</p>', facade)
         self.assertNotIn("re-export-note", own)
@@ -2357,10 +2353,9 @@ class CompilerTests(unittest.TestCase):
                     shapes.write_text(shapes.read_text().replace("/// A circle.", EARLY_SHAPES + "/// A circle.", 1))
                     measures.write_text(measures.read_text().replace("{Area, Circle, Side}", "{Area, Circle, Early, Side}")
                                         .replace("impl Circle {", EARLY_MEASURES + "impl Circle {", 1))
-                site = base / run
-                result = self.run_compiler("doc", str(base / "gadget"), "-o", str(site))
+                src = base / run
+                result = self.run_compiler("doc", str(base / "gadget"), "-o", str(src))
                 self.assertEqual((result.returncode, result.stderr), (0, ""))
-                src = site / "src"
                 self.assertEqual(markdown_link_errors(src), [])
                 sites.append({page_url(src, p): anchors_of(p.read_text()) for p in src.rglob("*.md")})
         first, second = sites
@@ -2380,17 +2375,16 @@ class CompilerTests(unittest.TestCase):
         paths too, every link in its Markdown leads to a page and an anchor there, no extern is listed, and
         the search index lists each item once."""
         with tempfile.TemporaryDirectory() as directory:
-            site = Path(directory) / "site"
-            result = self.run_compiler("doc", str(LIB / "std"), "-o", str(site))
+            src = Path(directory) / "site"
+            result = self.run_compiler("doc", str(LIB / "std"), "-o", str(src))
             self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
-            src = site / "src"
             pages = sorted(src.rglob("*.md"))
             self.assertGreater(len(pages), 250)
             for package in ("std", "core", "alloc", "libc", "std/cmp", "std/collections", "std/thread", "core/cmp", "libc/thread"):
                 self.assertTrue((src / package / "index.md").is_file(), package)
             self.assertEqual(markdown_link_errors(src), [])
-            text = "".join(page.read_text() for page in pages if "src/src" not in page.as_posix())
-            index = json.loads((src / "assets/search-index.json").read_text())
+            text = "".join(page.read_text() for page in pages if page.relative_to(src).parts[0] != "src")
+            index = json.loads((src / "search-index.json").read_text())
             cmp = (src / "core/cmp/index.md").read_text()
             landing = (src / "index.md").read_text()
         self.assertIn('<li><a class="package-link" href="core/"><code>core</code></a>'
@@ -2406,8 +2400,10 @@ class CompilerTests(unittest.TestCase):
         self.assertNotIn("core::cmp::Ord", found)
 
     def test_doc_site_builds_with_krayon(self):
-        """Krayon builds the standard library's site and the re-exporting packages' site, every local link
-        and anchor of their HTML resolves, and no page has an id twice."""
+        """Krayon builds the standard library's site and the re-exporting packages' site, the pages
+        `kursal doc` writes with docs/site's configuration and theme copied over them: every local link
+        and anchor of their HTML resolves, no page has an id twice, and the pages link the theme's
+        assets by their fingerprinted names."""
         krayon = shutil.which("krayon")
         if krayon is None:
             self.skipTest("krayon is not on the PATH; build Krayon and put it on the PATH to check the site's HTML")
@@ -2417,18 +2413,21 @@ class CompilerTests(unittest.TestCase):
             for name, path, least in (("std", LIB / "std", 250), ("gizmo", base / "gizmo", 10)):
                 with self.subTest(site=name):
                     site = base / f"site-{name}"
-                    result = self.run_compiler("doc", str(path), "-o", str(site))
+                    result = self.run_compiler("doc", str(path), "-o", str(site / "src"))
                     self.assertEqual(result.returncode, 0, result.stderr)
+                    shutil.copytree(ROOT / "docs/site", site, dirs_exist_ok=True)
                     built = subprocess.run([krayon, "build", str(site)], capture_output=True, text=True, timeout=TIME_LIMIT,
                                            preexec_fn=limit_memory)
                     self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
-                    self.assertGreater(len(list((site / "dist").rglob("*.html"))), least)
-                    for asset in ("search.js", "search-index.json"):
-                        self.assertTrue((site / "dist/assets" / asset).is_file(), asset)
-                    self.assertEqual(html_link_errors(site / "dist"), [])
+                    dist = site / "dist"
+                    self.assertGreater(len(list(dist.rglob("*.html"))), least)
+                    self.assertIsInstance(json.loads((dist / "search-index.json").read_text()), list)
+                    self.assertRegex((dist / "index.html").read_text(),
+                                     r'<script defer src="/assets/search\.[0-9a-f]{64}\.js"></script>')
+                    self.assertEqual(html_link_errors(dist), [])
 
     def test_doc_search_ranking(self):
-        """The site's search (docs/theme/assets/search.js) ranks an exact name first, its `!` ignored and
+        """The site's search (docs/site/src/assets/search.js) ranks an exact name first, its `!` ignored and
         the query's case before any other, then names the query starts, then the rest; within a tier
         types and traits before other kinds, then shorter paths; a query with `::` matches paths."""
         node = shutil.which("node")
@@ -2447,7 +2446,7 @@ class CompilerTests(unittest.TestCase):
                   "const index = prepare(JSON.parse(process.argv[2]));"
                   "console.log(JSON.stringify(JSON.parse(process.argv[3]).map((q) => rank(index, q, 50).map((r) => r.p))));")
         queries = ["Buffer", "buffer", "Buffer!", "read_line", "Ord", "io::read", "std::fs", "vec", "Vec"]
-        result = subprocess.run([node, "-e", script, str(ROOT / "docs/theme/assets/search.js"), json.dumps(index),
+        result = subprocess.run([node, "-e", script, str(ROOT / "docs/site/src/assets/search.js"), json.dumps(index),
                                  json.dumps(queries)], capture_output=True, text=True, timeout=TIME_LIMIT)
         self.assertEqual(result.returncode, 0, result.stderr)
         ranked = dict(zip(queries, json.loads(result.stdout)))
@@ -2466,9 +2465,9 @@ class CompilerTests(unittest.TestCase):
         self.assertEqual(ranked["Vec"][:3], ["std::collections::vec::Vec!", "std::collections::vec",
                                              "std::collections::vec::VecIter!"])
 
-    def test_doc_refuses_an_existing_output_and_a_missing_theme(self):
-        """`kursal doc` writes no site over an existing path, and none when the theme beside the standard
-        library is missing; either way it says why and leaves the file system as it was."""
+    def test_doc_refuses_an_existing_output_and_needs_no_theme(self):
+        """`kursal doc` writes no pages over an existing path, says why and leaves it as it was; and it
+        reads nothing beside the standard library, so one with no repository around it documents too."""
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             existing = base / "existing"
@@ -2480,13 +2479,11 @@ class CompilerTests(unittest.TestCase):
             self.assertEqual(sorted(p.name for p in existing.iterdir()), ["keep"])
             (base / "bare").mkdir()
             (base / "bare/lib").symlink_to(LIB)
-            missing = subprocess.run([str(self.binary), "doc", str(LIB / "std"), "-o", str(base / "site")],
-                                     capture_output=True, text=True, timeout=TIME_LIMIT, preexec_fn=limit_memory,
-                                     env=dict(os.environ, KURSAL_LIB=str(base / "bare/lib")))
-            self.assertEqual((missing.returncode, missing.stderr),
-                             (1, f"documentation theme not found: {base / 'bare/docs/theme/_includes'} is missing; "
-                                 "kursal doc reads docs/theme beside the standard library directory\n"))
-            self.assertFalse((base / "site").exists())
+            bare = subprocess.run([str(self.binary), "doc", str(LIB / "std"), "-o", str(base / "site")],
+                                  capture_output=True, text=True, timeout=TIME_LIMIT, preexec_fn=limit_memory,
+                                  env=dict(os.environ, KURSAL_LIB=str(base / "bare/lib")))
+            self.assertEqual((bare.returncode, bare.stderr), (0, ""))
+            self.assertTrue((base / "site/std/index.md").is_file())
 
     def test_parser_matches_reference(self):
         paths = sorted(p for top in ("lib", "examples", "compiler", "reference-compiler/examples")

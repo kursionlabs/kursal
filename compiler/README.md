@@ -18,7 +18,7 @@ reference in the tests.
 | `resolve::dump` | | a resolved program as text |
 | `doc::model` | | what the documentation site shows and where: each package's modules, its own and re-exported, every type's methods, every instance, each item's URL |
 | `doc::text` | | escaping, the URL spelling of names, relative links, summary lines, and Kursal highlighted with its names linked |
-| `doc::generator` | | the Krayon site (`kursal doc`): module, type, trait and source pages, and the search index; see `docs/README.md` |
+| `doc::generator` | | the Krayon site's content (`kursal doc`): module, type, trait and source pages, and the search index; see `docs/README.md` |
 | `kurs::core`, `kurs::sexpr` | `core.py`, `sexpr.py` | the KURS core and S-expressions |
 | `kurs::serial` | `kurs.py` | serialized KURS: its reader and writer |
 | `kurs::readable` | `readable.py` | readable KURS |

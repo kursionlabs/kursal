@@ -41,13 +41,14 @@ first.
 
 ## API documentation
 
-`kursal doc` generates a Krayon site from a package's public modules, `//!`
-module comments, `///` item comments, and declaration signatures. Krayon, a static site generator
-written in Kursal, is built separately and must be on your `PATH`. For the standard library and its
-dependencies:
+`kursal doc` generates the pages of a Krayon site from a package's public modules, `//!`
+module comments, `///` item comments, and declaration signatures; the site's configuration and
+theme are in [`docs/site/`](docs/site/). Krayon, a static site generator written in Kursal, is
+built separately and must be on your `PATH`. For the standard library and its dependencies:
 
 ```sh
-bin/kursal doc lib/std -o docs/generated
+bin/kursal doc lib/std -o docs/generated/src
+cp -R docs/site/. docs/generated
 krayon build docs/generated
 ```
 

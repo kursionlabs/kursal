@@ -1,4 +1,4 @@
-// Search over assets/search-index.json, which `kursal doc` writes: one record per item, with its name
+// Search over search-index.json, which `kursal doc` writes: one record per item, with its name
 // (n), kind (k), path (p), URL from the site's root (u) and summary line (s). The index is loaded on
 // first use, from the root the page's `doc-root` meta tag names, so a site served from a
 // subdirectory works.
@@ -70,7 +70,7 @@
 
   const load = () => {
     if (!loading) {
-      loading = fetch(root + 'assets/search-index.json')
+      loading = fetch(root + 'search-index.json')
         .then((response) => response.json())
         .then((records) => { index = prepare(records); })
         .catch(() => { index = []; status.textContent = 'The search index could not be loaded.'; });

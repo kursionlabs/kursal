@@ -1,21 +1,24 @@
-// Generate a Krayon input tree from the resolver's parsed modules. This lives in the compiler so
-// the published documentation follows the same package and module rules as a build.
+// Generate the content of a Krayon site from the resolver's parsed modules. This lives in the
+// compiler so the published documentation follows the same package and module rules as a build.
+// It writes pages and data only: the site that builds them (its `krayon.toml`, and the layouts
+// `doc.html`, `source.html` and `index.html` the pages name, with their assets) is not the
+// compiler's, and `docs/site` is the one this repository publishes.
 //
 // Each module a package exposes, its own or one it re-exports, has a page at its path under the
 // package (`/std/io/`, `/std/cmp/` for `core::cmp`), with a table of its items by kind, then its
 // functions, constants and instances in full. Each type and trait has a page beside it
 // (`/std/io/struct.File~.html`) with its definition, its methods wherever they are defined, and
 // the instances whose head mentions it or, for a trait, every instance of it. Each source file
-// has a page (`/src/std/io.kur.html`), and `assets/search-index.json` lists every item for the
-// search box. `text::encode` spells names in file names and anchors.
+// has a page (`/src/std/io.kur.html`), and `/search-index.json` lists every item for the search
+// box. `text::encode` spells names in file names and anchors.
 use package::doc::model::{Gen, Inst, Loc, Member, Mention, Source, build, decl_url, impl_owner, item_url, line_start, line_text, links, loc_of, mention_fn, mentions, module_title, module_url, page_kind, source};
 use package::doc::text::{encode, highlight, html, inline, json, lines, lit, plain, relative, summary, toml};
-use package::resolve::resolver::{ModuleId, NameRef, Resolver, Target, is_prim, lib_dir, parent as parent_dir};
+use package::resolve::resolver::{ModuleId, NameRef, Resolver, Target, is_prim};
 use package::syntax::ast as S;
 use std::arena::Domain!;
 use std::buffer::Buffer!;
 use std::collections::arena_vec::ArenaVec;
-use std::fs::{mkdir, path_exists, read, read_dir, write};
+use std::fs::{mkdir, path_exists, write};
 use std::hash::key_eq;
 use std::option::{Option, Result};
 use std::raw::Span;
@@ -48,6 +51,23 @@ fn directory(&cx: Domain!['k], file: Span['k]) {
     if !present { require(&cx, mkdir(&cx, file), Buffer!::new().push_static("cannot create ").push_bytes(&cx, file).save(&cx)); }
 }
 
+// The directory `dir`, and each directory above it that is missing.
+forall 'k.
+fn directories(&cx: Domain!['k], dir: Span['k]) {
+    var at = 1usize;
+    var going = true;
+    while going {
+        match dir.find_byte(&cx, b'/', at) {
+            Option::Some(n) => {
+                directory(&cx, dir.slice(0usize, n));
+                at = n + 1usize;
+            },
+            Option::None => { going = false; },
+        }
+    }
+    directory(&cx, dir);
+}
+
 // The file `relative` names under `root`, its directories made.
 forall 'k.
 fn file_in(&cx: Domain!['k], root: Span['k], relative: Span['k]) -> Span['k] {
@@ -63,72 +83,6 @@ fn file_in(&cx: Domain!['k], root: Span['k], relative: Span['k]) -> Span['k] {
         }
     }
     path(&cx, root, relative)
-}
-
-// The directory `from` and everything under it, copied to `to`.
-forall 'k.
-fn copy_tree(&cx: Domain!['k], from: Span['k], to: Span['k]) {
-    directory(&cx, to);
-    let dirs: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
-    let files: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
-    let listed = match read_dir(&cx, from) {
-        Result::Ok(listing) => {
-            var listing = listing;
-            var complete = true;
-            var going = true;
-            while going {
-                match &listing.next() {
-                    Result::Ok(next) => match next {
-                        Option::Some(entry) => {
-                            let { name, is_directory } = entry;
-                            if is_directory { dirs.push(&cx, name.save(&cx)); } else { files.push(&cx, name.save(&cx)); }
-                        },
-                        Option::None => { going = false; },
-                    },
-                    Result::Err(_) => {
-                        complete = false;
-                        going = false;
-                    },
-                }
-            }
-            match listing.close() {
-                Result::Ok(_) => complete,
-                Result::Err(_) => false,
-            }
-        },
-        Result::Err(_) => false,
-    };
-    if !listed { package::support::base::fail(&cx, Buffer!::new().push_static("cannot list ").push_bytes(&cx, from).save(&cx)); }
-    var i = 0usize;
-    while i < files.len(&cx) {
-        let source = path(&cx, from, files.at(&cx, i));
-        match read(&cx, source) {
-            Result::Ok(bytes) => save(&cx, path(&cx, to, files.at(&cx, i)), bytes),
-            Result::Err(_) => package::support::base::fail(&cx, Buffer!::new().push_static("cannot read ").push_bytes(&cx, source).save(&cx)),
-        }
-        i = i + 1usize;
-    }
-    i = 0usize;
-    while i < dirs.len(&cx) {
-        copy_tree(&cx, path(&cx, from, dirs.at(&cx, i)), path(&cx, to, dirs.at(&cx, i)));
-        i = i + 1usize;
-    }
-}
-
-// A directory of the site's theme: `docs/theme` beside the standard library directory, so a checkout's
-// compiler finds its own theme.
-forall 'k.
-fn theme(&cx: Domain!['k], part: Slice[u8, 'static]) -> Span['k] {
-    let found = path(&cx, path(&cx, path(&cx, parent_dir(&cx, lib_dir(&cx)), lit(&cx, "docs")), lit(&cx, "theme")), lit(&cx, part));
-    let present = match path_exists(&cx, found) {
-        Result::Ok(there) => there,
-        Result::Err(_) => false,
-    };
-    if !present {
-        package::support::base::fail(&cx, Buffer!::new().push_static("documentation theme not found: ").push_bytes(&cx, found)
-            .push_static(" is missing; kursal doc reads docs/theme beside the standard library directory").save(&cx));
-    }
-    found
 }
 
 // ------------------------------------------------------------- source text --
@@ -526,7 +480,7 @@ fn page_text(&cx: Domain!['k], g: Gen['k], head: Buffer!, nav_records: Buffer!, 
     out.push_static("+++\n").push_buffer(body)
 }
 
-// The file of a page under the site's `src`: `std/io/index.md`, `std/io/struct.File~.md`.
+// The file of a page under the output directory: `std/io/index.md`, `std/io/struct.File~.md`.
 forall 'k.
 fn page_file(&cx: Domain!['k], g: Gen['k], site: Span['k], l: Loc['k], name: Span['k]) -> Span['k] {
     var folder = path(&cx, site, package_name(&cx, g, l.package));
@@ -983,7 +937,8 @@ fn joined(&cx: Domain!['k], a: Span['k], b: Span['k]) -> Span['k] {
 }
 
 // Every documented item once, at the page the documented package (the first) links to: its name,
-// kind, path, URL and summary line.
+// kind, path, URL and summary line. Krayon renders the file as a JSON template and checks that the
+// result is JSON; `text::json` escapes every `{` in a string, so no name or summary opens a tag.
 forall 'k.
 fn search_index(&cx: Domain!['k], g: Gen['k]) -> Buffer! {
     var out = Buffer!::new().push_static("[");
@@ -1144,21 +1099,14 @@ fn package_entry(&cx: Domain!['k], g: Gen['k], out: Buffer!, package: usize, nam
 }
 
 forall 'k.
-fn generate(&cx: Domain!['k], r: Resolver['k], output: Span['k]) {
-    let present = match path_exists(&cx, output) {
+fn generate(&cx: Domain!['k], r: Resolver['k], site: Span['k]) {
+    let present = match path_exists(&cx, site) {
         Result::Ok(found) => found,
         Result::Err(_) => package::support::base::fail(&cx, lit(&cx, "cannot inspect documentation output")),
     };
     if present { package::support::base::fail(&cx, lit(&cx, "documentation output already exists; choose a new -o path")); }
-    let layouts = theme(&cx, "_includes");
-    let assets = theme(&cx, "assets");
     let g = build(&cx, r);
-    directory(&cx, output);
-    let site = path(&cx, output, lit(&cx, "src"));
-    directory(&cx, site);
-    save(&cx, path(&cx, output, lit(&cx, "krayon.toml")), Buffer!::new().push_static("input = \"src\"\noutput = \"dist\"\nlayouts = \"_includes\"\nassets = \"assets\"\nbase_path = \"\"\n"));
-    copy_tree(&cx, layouts, path(&cx, site, lit(&cx, "_includes")));
-    copy_tree(&cx, assets, path(&cx, site, lit(&cx, "assets")));
+    directories(&cx, site);
     var index = Buffer!::new().push_static("+++\nlayout = \"index.html\"\ntitle = \"Packages\"\n+++\n# Package documentation\n\nGenerated from Kursal source.\n\n<ul class=\"package-list\">\n");
     var p = 0usize;
     while p < r.packages.len(&cx) {
@@ -1182,5 +1130,5 @@ fn generate(&cx: Domain!['k], r: Resolver['k], output: Span['k]) {
         source_page(&cx, g, site, homes.at(&cx, h));
         h = h + 1usize;
     }
-    save(&cx, path(&cx, path(&cx, site, lit(&cx, "assets")), lit(&cx, "search-index.json")), search_index(&cx, g));
+    save(&cx, path(&cx, site, lit(&cx, "search-index.json")), search_index(&cx, g));
 }

@@ -1,19 +1,29 @@
 # Generated Kursal API documentation
 
-The compiler generates a Krayon site from a package's resolved modules and
-source declarations. Krayon, a static site generator written in Kursal, is
-built separately and must be on your `PATH`. From the repository root:
+The compiler generates the content of a Krayon site, its pages and search index,
+from a package's resolved modules and source declarations. The site itself, its
+`krayon.toml` and theme, is [`site/`](site/), outside the compiler. Krayon, a
+static site generator written in Kursal, is built separately and must be on your
+`PATH`. From the repository root:
 
 ```sh
-bin/kursal doc lib/std -o docs/generated
+bin/kursal doc lib/std -o docs/generated/src
+cp -R docs/site/. docs/generated
 krayon build docs/generated
 python3 -m http.server 8000 --directory docs/generated/dist
 ```
 
-Open `http://localhost:8000/`. `SITE` must not exist before `kursal doc`
-runs; the command does not overwrite an existing documentation tree. Remove
-`docs/generated/` before regenerating it. The generated `docs/generated/` tree
-is ignored by Git.
+Open `http://localhost:8000/`. `kursal doc PATH -o DIR` writes the pages into
+`DIR`, the site's input directory, creating the directories above it; `DIR` must
+not exist, as the command does not overwrite an existing documentation tree.
+Copying `site/` over the generated tree adds `krayon.toml` beside it and the
+layouts and assets into it. Remove `docs/generated/` before regenerating it. The
+generated `docs/generated/` tree is ignored by Git.
+
+`krayon build` (or `krayon check`, which validates without writing `dist`) fails
+on a local link or fragment that leads nowhere and on an ID a page has twice, and
+checks that the search index is valid JSON, so a build that succeeds has no
+broken cross-reference.
 
 The generator uses the compiler's resolver to find the selected package and
 its dependencies, and documents all of them. Use `//!` at the start of a file
@@ -118,10 +128,10 @@ works when served from a subdirectory.
 
 ## Search
 
-`kursal doc` writes `assets/search-index.json`: one record per module, type,
+`kursal doc` writes `search-index.json`: one record per module, type,
 trait, primitive, function, constant, method and instance, with its name
 (`n`), kind (`k`), path (`p`), URL from the site's root (`u`) and summary line
-(`s`). The search box in the header (`assets/search.js`, no dependencies)
+(`s`). The search box in the header (`site/src/assets/search.js`, no dependencies)
 loads it on first use from the root the page's `doc-root` meta tag names,
 which Krayon's `url` filter fills in with `base_path`. A query is matched
 against names, or against paths when it contains `::` (`io::read_line`,
@@ -141,14 +151,21 @@ to light mode and saves the choice in the browser. Headings, navigation and pros
 Space Grotesk and code uses JetBrains Mono, loaded from Google Fonts with system fallbacks.
 Text keeps a contrast of at least 4.5:1 against its background in both modes.
 
-The layouts, stylesheet and scripts live in [`theme/`](theme/): Krayon layouts
-in `theme/_includes/` (`doc.html` for module, type and trait pages,
-`source.html` for source files, `index.html` for the package list, all inside
-`page.html`) and static files in `theme/assets/`. `kursal doc` looks for the
-theme beside the standard library it uses, in `docs/theme` next to
-`$KURSAL_LIB` (or next to the `lib/` it finds without it), and copies both
-directories into `SITE/src`, so a generated site builds on its own. It stops
-with an error, before writing anything, when the theme is missing.
+The site lives in [`site/`](site/), a Krayon site without content: `site/krayon.toml`
+and, under `site/src/`, the layouts in `_includes/` and the stylesheet, scripts and logo in
+`assets/`. The compiler does not read it. The generated pages are its content, and they
+name the layouts they need: `doc.html` for module, type and trait pages, `source.html` for
+source files and `index.html` for the package list. `site/src/_includes/` holds the three,
+each inside `page.html`. A different site can render the same pages with its own layouts of those
+names; the front matter fields they use are `title`, `kind`, `nav_title`, `parent`,
+`parent_title`, `package`, the `nav_items` records (`section`, `name`, `url`, `kind`) and the
+`tree` records (`name`, `url`, `depth`, `current`).
+
+The site sets `fingerprint_assets`, and the layouts link the stylesheet, scripts and logo
+through Krayon's `asset_url` filter, so each build names them by the hash of their content
+and a browser never keeps a stale copy. The search index is a page, not an asset, so it keeps
+its name. To serve the site from a subdirectory, set `base_path` in `docs/generated/krayon.toml`
+before building.
 
 This is a source-derived API site. It does not yet provide full language-guide
 chapters.
