@@ -865,6 +865,12 @@ These are the places where Kursal differs from what one might expect.
   an `ArenaVec` and `at`.
 - **No nested patterns.** A match case binds names: `Option::Some(x) =>`, never
   `Result::Ok(Option::Some(x))`. Match the outer value, then the inner one. The `_` arm comes last.
+- **A case may name a variant by its label alone**: `Some(x) =>`, `None =>`, looked up in the sum
+  the scrutinee has once its type is known (`the type here is not known yet; annotate it` before
+  then). `Option::Some(x)` stays valid, and one match may mix both. A bare label is never a binding:
+  a case binds only inside its parentheses, so a misspelled one is an error (`Option[u8] has no
+  variant Nothing`), not a catch-all. A sum with no declared name, such as a `foreach` over an
+  `Option`, is matched by its labels the same way.
 - **Struct literals** are `Point.{ x: 1u32, y }`; tuple structs and variants with a payload are built
   with `.(`: `Option::Some.(x)`. A spread `..rest` names a bundle made by a pattern
   (`let { x, ..rest } = p; Point.{ x: 2u32, ..rest }`), not an arbitrary value.

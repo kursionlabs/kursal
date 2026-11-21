@@ -801,8 +801,13 @@ class Names:
                     for case in arm.cases:
                         if case.kind == "variant":
                             assert case.path is not None
-                            with self.reporting():
-                                self.variant(case.path)
+                            # A bare label names a variant of the scrutinee's sum, which inference knows.
+                            if len(case.path.segments) == 1:
+                                if case.path.segments[0][1]:
+                                    fail("a variant label takes no type arguments", case.path.pos)
+                            else:
+                                with self.reporting():
+                                    self.variant(case.path)
                             self.segment_args(case.path, types)
                             bound |= {b for b in case.binders or () if b != "_"}
                     self.expr(arm.body, types, values | bound)

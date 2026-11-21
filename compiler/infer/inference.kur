@@ -131,6 +131,8 @@ exposed struct Results {
     spread_ids: ArenaMap[u32, u32, 'k],
     // variant cases: payload binding ids, none for each `_`
     case_binders: ArenaMap[u32, ArenaVec[Option[u32], 'k], 'k],
+    // variant cases: the variant, written bare or as a path
+    case_labels: ArenaMap[u32, Span['k], 'k],
     // matches: whether the scrutinee lends a place
     lent: ArenaMap[u32, bool, 'k],
     // functions and closures
@@ -154,7 +156,7 @@ forall 'k.
 fn new_results(&cx: Domain!['k]) -> Results['k] {
     Results.{
         types: ArenaMap::new(&cx), binders: ArenaMap::new(&cx), folded: ArenaMap::new(&cx), calls: ArenaMap::new(&cx),
-        field_ids: ArenaMap::new(&cx), spread_ids: ArenaMap::new(&cx), case_binders: ArenaMap::new(&cx), lent: ArenaMap::new(&cx),
+        field_ids: ArenaMap::new(&cx), spread_ids: ArenaMap::new(&cx), case_binders: ArenaMap::new(&cx), case_labels: ArenaMap::new(&cx), lent: ArenaMap::new(&cx),
         param_ids: ArenaMap::new(&cx), captures: ArenaMap::new(&cx), witnesses: ArenaMap::new(&cx), try_kinds: ArenaMap::new(&cx),
         opened: ArenaMap::new(&cx), options: ArenaMap::new(&cx), next_calls: ArenaMap::new(&cx), rest_ids: ArenaMap::new(&cx),
     }
@@ -2203,6 +2205,23 @@ impl Body['k] {
         (td, sub, C::named(td.name, args))
     }
 
+    // The payload of the variant `name` of the sum `ty` is, once `ty` is known.
+    fn label_payload(self, &cx: Domain!['k], ty: Type['k], name: Span['k], pos: Pos) -> Type['k] {
+        let unit = match self.shape(&cx, ty, pos) {
+            Type::Enum(variants) => {
+                var i = 0usize;
+                while i < variants.len(&cx) {
+                    if variants.at(&cx, i).name.eq(&cx, name) {
+                        return variants.at(&cx, i).type;
+                    }
+                    i = i + 1usize;
+                }
+            },
+            _ => (),
+        };
+        self.fail(&cx, Buffer!::new().push_bytes(&cx, self.shown(&cx, ty)).push_static(" has no variant ").push_bytes(&cx, name).save(&cx), pos)
+    }
+
     fn payload_of(self, &cx: Domain!['k], td: TypeDecl['k], name: Span['k], sub: ArenaMap[Span['k], Type['k], 'k]) -> Type['k] {
         let variants = match td.body {
             Type::Enum(variants) => variants,
@@ -2417,17 +2436,23 @@ impl Body['k] {
             Option::Some(p) => p,
             Option::None => self.fails(&cx, "internal error: a variant case without a path", pos),
         };
-        let (enum_decl, name) = match self.inf.r.refs.get(&cx, path.id) {
+        let (name, payload) = match self.inf.r.refs.get(&cx, path.id) {
             Option::Some(r) => match r {
-                NameRef::Variant(d, name) => (d, name),
+                NameRef::Variant(enum_decl, name) => {
+                    let (td, sub, scrutinee) = self.construct(&cx, path.pos, enum_decl, self.path_arguments(&cx, path, enum_decl, true));
+                    self.unify_at(&cx, scrutinee, ty, pos);
+                    (name, self.payload_of(&cx, td, name, sub))
+                },
                 _ => self.fails(&cx, "internal error: a variant case that names no variant", pos),
             },
-            Option::None => self.fails(&cx, "internal error: an unresolved variant case", pos),
+            // a bare label: a variant of the scrutinee's sum
+            Option::None => {
+                let name = path.segments.at(&cx, 0usize).name;
+                (name, self.label_payload(&cx, ty, name, c.pos))
+            },
         };
-        let (td, sub, scrutinee) = self.construct(&cx, path.pos, enum_decl, self.path_arguments(&cx, path, enum_decl, true));
-        self.unify_at(&cx, scrutinee, ty, pos);
-        let payload = self.payload_of(&cx, td, name, sub);
         self.results().types.insert(&cx, c.id, payload);
+        self.results().case_labels.insert(&cx, c.id, name);
         self.recorded.push(&cx, c.id);
         let ids: ArenaVec[Option[u32], 'k] = ArenaVec::new(&cx);
         self.results().case_binders.insert(&cx, c.id, ids);

@@ -465,7 +465,7 @@ module.exports = grammar({
 
     _case: $ => choice($.variant_case, $.value_case),
 
-    // `Enum::Variant`, or `Enum::Variant(a, _)` binding the payload.
+    // `Variant` or `Enum::Variant`, or either with `(a, _)` binding the payload.
     variant_case: $ => seq(
       field('variant', $.path_expression),
       optional(seq('(', commaSep(field('binding', choice($.identifier, $.wildcard_pattern))), ')')),

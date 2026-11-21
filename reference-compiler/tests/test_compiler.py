@@ -1030,7 +1030,7 @@ RESOLUTION_ERRORS: tuple[tuple[dict[str, str], str], ...] = (
     (app("use lib::shapes::make;\nfn f(x: make) -> u32 { 0u32 }\n"), "app"),
     (app("use lib::shapes::make;\nfn f() -> u32 { make.{ x: 1u32 } }\n"), "app"),
     (app("use lib::shapes::Point;\nfn f() -> Point { Point.{ x } }\n"), "app"),
-    (app("use lib::shapes::Point;\nfn f(p: Point) -> u32 { match p { Point(x) => 0u32 } }\n"), "app"),
+    (app("use lib::shapes;\nuse lib::shapes::Point;\nfn f(p: Point) -> u32 { match p { shapes::Point(x) => 0u32 } }\n"), "app"),
     (app("fn f(x: builtin) -> () { () }\n"), "app"),
     (app("fn f() -> u32 { u32::nope() }\n"), "app"),
     (app("forall T where lib::shapes::make[T]. fn f(x: T) -> u32 { 0u32 }\n"), "app"),

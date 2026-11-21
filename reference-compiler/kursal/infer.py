@@ -956,12 +956,21 @@ class Infer:
             return
         assert case.path is not None
         ref = case.path.ref
-        assert ref is not None and ref[0] == "variant"
-        _, enum_decl, name = ref
-        enum, sub, scrutinee = self.construct(case.path, enum_decl, self.path_arguments(case.path, enum_decl, member=True))
-        self.unify(scrutinee, ty, pos)
-        assert isinstance(enum.body, C.Enum)
-        case.ty = payload = subst(dict(enum.body.variants)[name], sub)
+        if ref is None:                         # a bare label: a variant of the scrutinee's sum
+            name = case.path.names[0]
+            shape = self.shape(ty, pos)
+            variants = dict(shape.variants) if isinstance(shape, C.Enum) else {}
+            if name not in variants:
+                fail(f"{self.shown(ty)} has no variant {name}", case.pos or pos)
+            payload = variants[name]
+        else:
+            assert ref[0] == "variant"
+            _, enum_decl, name = ref
+            enum, sub, scrutinee = self.construct(case.path, enum_decl, self.path_arguments(case.path, enum_decl, member=True))
+            self.unify(scrutinee, ty, pos)
+            assert isinstance(enum.body, C.Enum)
+            payload = subst(dict(enum.body.variants)[name], sub)
+        case.ty, case.label = payload, name
         self.recorded.append(case)
         case.binder_ids, binders = [], case.binders
         if binders is None:

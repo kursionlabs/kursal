@@ -1132,8 +1132,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
             cover: Cover = []
             for case in arm.cases:
                 if case.kind == "variant":
-                    assert case.path is not None and case.path.ref is not None and case.path.ref[0] == "variant"
-                    cover.append(case.path.ref[2])
+                    cover.append(case.label)
                 elif case.kind == "value":
                     assert case.low is not None and case.high is not None
                     assert isinstance(case.low.value, int) and isinstance(case.high.value, int)
@@ -1160,8 +1159,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         whole = len(case.binders) == 1
         types = (ty,) if whole else self.types.fields(ty)
         if lent:
-            assert case.path is not None and case.path.ref is not None and case.path.ref[0] == "variant"
-            path = f"{payload}.{case.path.ref[2]}"
+            path = f"{payload}.{case.label}"
             sources = [path] if whole else [f"{path}.{k}" for k in range(len(types))]
         else:
             sources = [payload] if whole else [v for v, _ in self.destruct(payload, ty)]

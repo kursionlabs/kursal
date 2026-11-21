@@ -205,6 +205,8 @@ class Case(Inferred):
     pos: Optional[Position] = None
     # Inference -> lowering, variant cases only: payload binding IDs; None for each `_`.
     binder_ids: list[Optional[int]] = field(init=False, repr=False, compare=False)
+    # Inference -> lowering, variant cases only: the variant, written bare or as a path.
+    label: str = field(init=False, repr=False, compare=False)
 
 
 @dataclass
