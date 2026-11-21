@@ -935,9 +935,11 @@ These are the places where Kursal differs from what one might expect.
   component is a pointer to it: to a field, an element, or, for a sum, each variant's payload
   (`foreach F of *Option[u8] => F` is the sum of `*()` and `*u8`, a pointer valid while the value
   holds that variant); a pointer to a leaf is the one component. `*F` binds F to each component's
-  pointee, so its source must give pointers whatever the type arguments are: an explicit pointer,
-  a `foreach` whose body is a pointer, or a visible product of pointers (`foreach *F of T => F` is
-  rejected, as `T` may be `bool`: `foreach *F needs a source whose components are pointers`).
+  pointee, so its source must give pointers whatever the type arguments are, and show them as
+  written: an explicit pointer, a `foreach` whose body is a pointer, or a tuple, struct, enum or
+  array whose components are written as pointers. `foreach *F of T => F` is rejected, as `T` may be
+  `bool`, and so is a name, even one whose shape is a visible product of pointers: `foreach *F
+  needs a source written with pointer components`.
   Through a pointer to a product a `foreach` only computes addresses, but through one to a sum it
   reads the variant there, so it is `unsafe`: the pointer addresses an initialized value whose
   variant stays the same while a payload pointer is used. It calls the mapper on the held

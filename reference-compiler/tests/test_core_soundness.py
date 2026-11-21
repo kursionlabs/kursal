@@ -154,18 +154,21 @@ REJECTED = {
           (= %v (ptr_atomic_fetch_add seq_cst %p %s)) (= %r (const u32 0)) (ret %r)))"""),
 
     # A foreach type has an expansion at every instantiation: `*F` matches only pointer components, so its
-    # source must give pointers whatever its type arguments are.
-    "pointer_pattern_over_leaf": ("foreach \\*F needs a source whose components are pointers", """
+    # source must show them as written, whatever its type arguments are, and not through a name.
+    "pointer_pattern_over_leaf": ("foreach \\*F needs a source written with pointer components", """
         (fun main i32 ()
           (entry () (= %n (sizeof (foreach ((ptr F) bool) bool))) (= %z (const i32 0)) (ret %z)))"""),
-    "pointer_pattern_over_parameter": ("foreach \\*F needs a source whose components are pointers", """
+    "pointer_pattern_over_parameter": ("foreach \\*F needs a source written with pointer components", """
         (fun g (forall (T) () usize () (entry () (= %n (sizeof (foreach ((ptr F) T) F))) (ret %n))))"""),
-    "pointer_pattern_over_mixed_tuple": ("foreach \\*F needs a source whose components are pointers", """
+    "pointer_pattern_over_mixed_tuple": ("foreach \\*F needs a source written with pointer components", """
         (fun g (forall (T) () usize () (entry () (= %n (sizeof (foreach ((ptr F) (tuple (ptr u8) T)) F))) (ret %n))))"""),
-    "pointer_pattern_over_sum": ("foreach \\*F needs a source whose components are pointers", """
+    "pointer_pattern_over_sum": ("foreach \\*F needs a source written with pointer components", """
         (type Opt (enum (none (tuple)) (some (ptr u8))))
         (fun g usize () (entry () (= %n (sizeof (foreach ((ptr F) Opt) F))) (ret %n)))"""),
-    "pointer_pattern_in_declaration": ("foreach \\*F needs a source whose components are pointers in type Holder!", """
+    "pointer_pattern_through_a_name": ("foreach \\*F needs a source written with pointer components", """
+        (type P (struct (a (ptr u8)) (b (ptr u16))))
+        (fun g usize () (entry () (= %n (sizeof (foreach ((ptr F) P) F))) (ret %n)))"""),
+    "pointer_pattern_in_declaration": ("foreach \\*F needs a source written with pointer components in type Holder!", """
         (type Holder! (forall (T) () (struct (f (foreach ((ptr F) T) F)))))"""),
     # A sum behind a pointer expands to pointers to its payloads; traversing one reads its variant
     # through the pointer, an unsafe read.

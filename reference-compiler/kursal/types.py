@@ -560,22 +560,27 @@ class Types:
             return {**retained, ty.binder: item.inner}
         return {**retained, ty.binder: item}
 
-    def pattern_available(self, ty: Foreach, module: Optional[ModuleId], kinds: Kinds) -> bool:
-        """Prove *F matches without assuming the shape of abstract components.
+    def pattern_available(self, ty: Foreach) -> bool:
+        """Prove *F matches every component from the source as written: an explicit pointer, a foreach
+        whose body is a pointer, or a tuple, struct, enum or array whose components are written as
+        pointers. A name is not looked through, even where its shape is visible.
 
-        Source exposure is a separate obligation. An explicit pointer gives
-        pointer components even when its authorized pointee shape is abstract.
+        Source exposure is a separate obligation.
         """
         if not ty.indirect:
             return True
-        if isinstance(ty.source, Foreach):
-            return isinstance(ty.source.body, Ptr)
-        if isinstance(ty.source, Ptr):
-            return True
-        if self.visible_shape(ty.source, module, kinds) is None:
-            return False
-        _, rows = self.rows(ty.source, module, schema=True)
-        return all(isinstance(item, Ptr) for _, item, _ in rows)
+        match ty.source:
+            case Foreach(body=body):
+                return isinstance(body, Ptr)
+            case Ptr():
+                return True
+            case Tuple(elems=elems):
+                return all(isinstance(t, Ptr) for t in elems)
+            case Struct(fields=members) | Enum(variants=members):
+                return all(isinstance(t, Ptr) for _, t in members)
+            case Array(elem=elem):
+                return isinstance(elem, Ptr)
+        return False
 
     def expand(self, ty: Foreach, module: Optional[ModuleId] = None) -> Type:
         """The structural type a foreach transform denotes."""

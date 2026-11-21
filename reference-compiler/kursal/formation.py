@@ -161,9 +161,9 @@ class Formation:
             case C.Foreach(binder=binder, source=source, body=body):
                 self.fits(source, C.ANY, env)
                 # The type has an expansion only if every component is a pointer for `*F` to match, and
-                # it must have one at every instantiation, so the components cannot be left to an argument.
-                if ty.indirect and not self.types.pattern_available(ty, self.module, env):
-                    self.fail(f"foreach *{binder} needs a source whose components are pointers")
+                # it must have one at every instantiation: the source shows its pointers as written.
+                if ty.indirect and not self.types.pattern_available(ty):
+                    self.fail(f"foreach *{binder} needs a source written with pointer components")
                 available = foreach_binders(source) if isinstance(source, C.Foreach) else ()
                 if tuple(available[:len(ty.retained or ())]) != ty.retained:
                     self.fail("foreach retained binders must be a source prefix")

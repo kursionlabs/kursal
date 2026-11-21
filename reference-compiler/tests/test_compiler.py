@@ -1601,10 +1601,12 @@ TYPE_CASES = (
     "(exposure () () (ptr (struct (a u8))))",
     "(exposure () ((T any)) T)",
     "(exposure () () (foreach (F (tuple u8 u16)) (ptr F)))",
-    "(pattern () () (foreach ((ptr F) (tuple (ptr u8) (ptr u16))) F))",
-    "(pattern () () (foreach ((ptr F) (tuple (ptr u8) u16)) F))",
-    "(pattern ((opaque H () (tuple (ptr u8)))) () (foreach ((ptr F) H) F))",
-    "(pattern () () (foreach ((ptr F) (foreach (G (tuple u8)) (ptr G))) F))",
+    "(pattern () (foreach ((ptr F) (tuple (ptr u8) (ptr u16))) F))",
+    "(pattern () (foreach ((ptr F) (tuple (ptr u8) u16)) F))",
+    "(pattern ((opaque H () (tuple (ptr u8)))) (foreach ((ptr F) H) F))",
+    "(pattern ((type H () (tuple (ptr u8)))) (foreach ((ptr F) H) F))",
+    "(pattern () (foreach ((ptr F) (array (ptr u8) 2)) F))",
+    "(pattern () (foreach ((ptr F) (foreach (G (tuple u8)) (ptr G))) F))",
     # layout
     "(layout (type L (T) (enum (Nil (tuple)) (Cons (ptr (L T))))))",
     "(layout (type L () (struct (next L))))",
@@ -1795,9 +1797,9 @@ def type_case(case: str) -> str:
         shape = types.visible_shape(ty, None, kinds)
         return f"{'hidden' if shape is None else T.show(shape)} {str(types.concrete_exposure(ty, None, kinds)).lower()}"
     if op == "pattern":
-        ty = parse_type(form[3])
+        ty = parse_type(form[2])
         assert isinstance(ty, C.Foreach)
-        return str(T.Types(_program(form[1])).pattern_available(ty, None, _kinds(form[2]))).lower()
+        return str(T.Types(_program(form[1])).pattern_available(ty)).lower()
     raise ValueError(f"unknown case {op}")
 
 

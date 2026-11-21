@@ -1523,34 +1523,32 @@ impl Types['k] {
         out
     }
 
-    // Prove *F matches without assuming the shape of abstract components.
+    // Prove *F matches every component from the source as written: an explicit pointer, a foreach
+    // whose body is a pointer, or a tuple, struct, enum or array whose components are written as
+    // pointers. A name is not looked through, even where its shape is visible.
     //
-    // Source exposure is a separate obligation. An explicit pointer gives pointer components even
-    // when its authorized pointee shape is abstract.
-    fn pattern_available(self, &cx: Domain!['k], ty: ForeachType['k], home: Option[ModuleId['k]], kinds: ArenaMap[Span['k], Kind, 'k]) -> bool {
+    // Source exposure is a separate obligation.
+    fn pattern_available(self, &cx: Domain!['k], ty: ForeachType['k]) -> bool {
         if !ty.indirect {
             return true;
         }
-        let unit = match ty.source.copy(&cx) {
-            Type::Foreach(source) => {
-                return is_ptr(source.body.copy(&cx));
+        match ty.source.copy(&cx) {
+            Type::Foreach(source) => is_ptr(source.body.copy(&cx)),
+            Type::Ptr(_inner) => true,
+            Type::Tuple(elems) => {
+                var all = true;
+                var i = 0usize;
+                while all && i < elems.len(&cx) {
+                    all = is_ptr(elems.at(&cx, i));
+                    i = i + 1usize;
+                }
+                all
             },
-            Type::Ptr(_inner) => {
-                return true;
-            },
-            _ => (),
-        };
-        if self.visible_shape(&cx, ty.source.copy(&cx), home, kinds).is_none() {
-            return false;
+            Type::Struct(members) => all_ptr_members(&cx, members),
+            Type::Enum(members) => all_ptr_members(&cx, members),
+            Type::Array(elem, _length) => is_ptr(elem.copy(&cx)),
+            _ => false,
         }
-        let rows = self.rows(&cx, ty.source.copy(&cx), home, true).rows;
-        var all = true;
-        var i = 0usize;
-        while all && i < rows.len(&cx) {
-            all = is_ptr(rows.at(&cx, i).item);
-            i = i + 1usize;
-        }
-        all
     }
 
     // The structural type a foreach transform denotes.
@@ -1578,6 +1576,17 @@ impl Types['k] {
 forall 'k.
 fn wrap(&cx: Domain!['k], t: Type['k], pointer: bool) -> Type['k] {
     if pointer { C::ptr(&cx, t) } else { t }
+}
+
+forall 'k.
+fn all_ptr_members(&cx: Domain!['k], members: ArenaVec[Member['k], 'k]) -> bool {
+    var all = true;
+    var i = 0usize;
+    while all && i < members.len(&cx) {
+        all = is_ptr(members.at(&cx, i).type);
+        i = i + 1usize;
+    }
+    all
 }
 
 forall 'k.

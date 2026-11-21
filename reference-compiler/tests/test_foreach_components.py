@@ -48,9 +48,9 @@ class ComponentTests(unittest.TestCase):
         for source in (C.Named("T"), C.Tuple((C.U32,)), C.Array(C.U32, 0)):
             with self.subTest(source=source):
                 mapped = C.Foreach("F", True, source, C.Named("F"))
-                self.assertFalse(self.types.pattern_available(mapped, None, {"T": C.ANY}))
+                self.assertFalse(self.types.pattern_available(mapped))
         mapped = C.Foreach("F", True, C.Ptr(C.Named("T")), C.Named("F"))
-        self.assertTrue(self.types.pattern_available(mapped, None, {"T": C.ANY}))
+        self.assertTrue(self.types.pattern_available(mapped))
 
     def test_formation_rejects_pointer_pattern_without_pointer_components(self):
         f = C.Named("F")
@@ -62,7 +62,7 @@ class ComponentTests(unittest.TestCase):
                        (C.Block("entry", (("%x", source),),
                                 (C.Instr(("%out",), "foreach", ("%x", "identity"), ty=mapped),),
                                 C.Ret("%out")),))
-        with self.assertRaisesRegex(KursError, r"foreach \*F needs a source whose components are pointers"):
+        with self.assertRaisesRegex(KursError, r"foreach \*F needs a source written with pointer components"):
             check_program(C.Program(funs={"identity": mapper, "walk": caller}))
 
     def test_nested_leaf_c_passes_the_singleton_member(self):
