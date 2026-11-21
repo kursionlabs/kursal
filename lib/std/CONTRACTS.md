@@ -272,6 +272,7 @@ double free.
 | `alloc::arena::new_header` | `next` is a chain head or the terminator, and `data` is a live buffer of at least `cap` bytes that the returned header takes over; passing a `data` still owned elsewhere makes two owners of one block |
 | `alloc::arena::copy_bytes` | `dest[0..count)` is writable, `src[0..count)` readable, and the two ranges do not overlap |
 | `alloc::buffer::Buffer!::commit` | every byte being published (`p[len..len+n)`) has been written since the last reserve/grow. Publishing past `cap` aborts |
+| `alloc::buffer::Buffer!::from_initialized_allocation` | the consumed `Uninit!` records its capacity and the first `len` bytes are initialized. A `len` past the recorded capacity aborts |
 | `alloc::collections::arena_vec::merge_runs` | `src` and `dst` each address `n` elements and do not overlap; one bottom-up merge pass of `ArenaVec::sort_by` and `Vec!::sort_by` |
 
 
