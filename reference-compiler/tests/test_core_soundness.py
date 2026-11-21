@@ -153,6 +153,27 @@ REJECTED = {
         (fun (unsafe) h u32 ((ptr S) S) (entry ((%p (ptr S)) (%s S))
           (= %v (ptr_atomic_fetch_add seq_cst %p %s)) (= %r (const u32 0)) (ret %r)))"""),
 
+    # A foreach type has an expansion at every instantiation: `*F` matches only pointer components, so its
+    # source must give pointers whatever its type arguments are.
+    "pointer_pattern_over_leaf": ("foreach \\*F needs a source whose components are pointers", """
+        (fun main i32 ()
+          (entry () (= %n (sizeof (foreach ((ptr F) bool) bool))) (= %z (const i32 0)) (ret %z)))"""),
+    "pointer_pattern_over_parameter": ("foreach \\*F needs a source whose components are pointers", """
+        (fun g (forall (T) () usize () (entry () (= %n (sizeof (foreach ((ptr F) T) F))) (ret %n))))"""),
+    "pointer_pattern_over_mixed_tuple": ("foreach \\*F needs a source whose components are pointers", """
+        (fun g (forall (T) () usize () (entry () (= %n (sizeof (foreach ((ptr F) (tuple (ptr u8) T)) F))) (ret %n))))"""),
+    "pointer_pattern_over_sum": ("foreach \\*F needs a source whose components are pointers", """
+        (type Opt (enum (none (tuple)) (some (ptr u8))))
+        (fun g usize () (entry () (= %n (sizeof (foreach ((ptr F) Opt) F))) (ret %n)))"""),
+    "pointer_pattern_in_declaration": ("foreach \\*F needs a source whose components are pointers in type Holder!", """
+        (type Holder! (forall (T) () (struct (f (foreach ((ptr F) T) F)))))"""),
+    # A sum behind a pointer expands to pointers to its payloads; nothing traverses one yet.
+    "foreach_through_pointer_to_sum": ("foreach_cannot_traverse_sum_behind_pointer", """
+        (type Opt (enum (none (tuple)) (some u8)))
+        (fun mapper (forall (F) () u32 ((ptr F)) (entry ((%x (ptr F))) (= %z (const u32 0)) (ret %z))))
+        (fun walk (foreach ((ptr F) (ptr Opt)) u32) ((ptr Opt))
+          (entry ((%p (ptr Opt))) (= %out (foreach (foreach ((ptr F) (ptr Opt)) u32) %p mapper)) (ret %out)))"""),
+
     # A function value carries no premises: they are discharged where the value is made.
     "function_type_premise": ("a function type has no premises", """
         (trait Q (T))
@@ -379,6 +400,16 @@ class CoreSoundnessTests(unittest.TestCase):
 
     def test_the_sound_forms_are_accepted(self):
         for source in (
+            # A pointer gives pointer components whatever its pointee is: a leaf, a type parameter, or a
+            # sum, whose components are pointers to its payloads.
+            """(type Opt (enum (none (tuple)) (some u8)))
+               (fun f usize () (entry ()
+                 (= %a (sizeof (foreach ((ptr F) (ptr bool)) F)))
+                 (= %b (sizeof (foreach ((ptr F) (ptr Opt)) F)))
+                 (= %c (sizeof (foreach (F (ptr Opt)) F)))
+                 (= %d (sizeof (foreach ((ptr F) (tuple (ptr u8) (ptr u16))) F)))
+                 (ret %a)))
+               (fun g (forall (T) () usize () (entry () (= %n (sizeof (foreach ((ptr F) (ptr T)) F))) (ret %n))))""",
             # A block brand that is new to the function.
             """(fun f u32 ()
                  (entry () (= %f (fresh)) (= %w (open %f ($a))) (jmp (next $a) %w))

@@ -415,6 +415,8 @@ class Infer:
             concrete = tuple(zonk(arg) for arg in args)
             if len(concrete) != 1 or not self.types.exposure_available(
                     concrete[0], self.module, self.kinds, self.assumptions):
+                if len(concrete) == 1 and self.types.sum_behind_pointer(concrete[0], self.module, self.kinds):
+                    fail("a foreach cannot traverse a sum through a pointer yet", pos)
                 fail("Exposed requires an exact premise or an authorized traversable shape", pos)
             return
         inputs = [zonk(a) for a in args[:input_count]]

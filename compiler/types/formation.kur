@@ -125,6 +125,8 @@ exposed struct Formation {
     opened: ArenaVec[Span['k], 'k],
     // the resolver that locates errors, when a declaration's file is known
     reporter: Ref[Option[Resolver['k]], 'k],
+    // the type declaration being formed: it has no position of its own, so its name says where
+    declaration: Ref[Option[Span['k]], 'k],
 }
 
 forall 'k.
@@ -170,11 +172,15 @@ impl Formation[D, 'k] {
             active: ArenaVec::new(&cx),
             opened: ArenaVec::new(&cx),
             reporter: Ref::new(&cx, Option::None),
+            declaration: Ref::new(&cx, Option::None),
         }
     }
 
     fn fail(self, &cx: Domain!['k], message: Span['k]) -> ! {
-        let full = Buffer!::new().push_static("type formation: ").push_bytes(&cx, message).save(&cx);
+        let full = match self.declaration.copy(&cx) {
+            Option::Some(name) => Buffer!::new().push_static("type formation: ").push_bytes(&cx, message).push_static(" in type ").push_bytes(&cx, name).save(&cx),
+            Option::None => Buffer!::new().push_static("type formation: ").push_bytes(&cx, message).save(&cx),
+        };
         match self.reporter.copy(&cx) {
             Option::Some(r) => r.fail(&cx, full, self.pos.copy(&cx)),
             Option::None => kurs_error(&cx, full, self.pos.copy(&cx)),
@@ -318,6 +324,12 @@ impl Formation[D, 'k] {
             },
             Type::Foreach(f) => {
                 self.fits(&cx, f.source.copy(&cx), Kind::Any, env);
+                // The type has an expansion only if every component is a pointer for `*F` to match,
+                // and it must have one at every instantiation, so the components cannot be left to
+                // an argument.
+                if f.indirect && !self.types.pattern_available(&cx, f, self.home.copy(&cx), env) {
+                    self.fail(&cx, Buffer!::new().push_static("foreach *").push_bytes(&cx, f.binder).push_static(" needs a source whose components are pointers").save(&cx));
+                }
                 let available = match f.source.copy(&cx) {
                     Type::Foreach(source) => foreach_binders(&cx, source),
                     _ => ArenaVec::new(&cx),
@@ -668,6 +680,7 @@ impl Formation[D, 'k] {
             let decl = decls.at(&cx, i);
             self.home.set(&cx, decl.home);
             self.premises.set(&cx, decl.premises);
+            self.declaration.set(&cx, Option::Some.(decl.name));
             let scope = self.extend(&cx, env, decl.params);
             var p = 0usize;
             while p < decl.premises.len(&cx) {
@@ -677,6 +690,7 @@ impl Formation[D, 'k] {
             self.fits(&cx, decl.body, Kind::Any, scope);
             i = i + 1usize;
         }
+        self.declaration.set(&cx, Option::None);
         var u = 0usize;
         while u < decls.len(&cx) {
             self.unmarked(&cx, decls.at(&cx, u));

@@ -25,6 +25,13 @@ class ComponentTests(unittest.TestCase):
         mapped = C.Foreach("F", True, C.Ptr(C.Tuple((C.Ptr(C.U32),))), C.Named("F"))
         self.assertEqual(self.types.expand(mapped), C.Tuple((C.Ptr(C.U32),)))
 
+    def test_sum_behind_pointer_gives_pointers_to_payloads(self):
+        opt = C.Enum((("none", C.Tuple(())), ("some", C.Prim("u8"))))
+        self.assertEqual(self.types.expand(C.Foreach("F", True, C.Ptr(opt), C.Named("F"))),
+                         C.Enum((("none", C.Tuple(())), ("some", C.Prim("u8")))))
+        self.assertEqual(self.types.expand(C.Foreach("F", False, C.Ptr(opt), C.Named("F"))),
+                         C.Enum((("none", C.Ptr(C.Tuple(()))), ("some", C.Ptr(C.Prim("u8"))))))
+
     def test_nested_indirect_source_retains_stripped_type(self):
         inner = C.Foreach("G", True, C.Ptr(C.U32), C.Ptr(C.Named("G")))
         outer = C.Foreach("F", True, inner, C.Tuple((C.Named("G"), C.Named("F"))))
@@ -45,7 +52,7 @@ class ComponentTests(unittest.TestCase):
         mapped = C.Foreach("F", True, C.Ptr(C.Named("T")), C.Named("F"))
         self.assertTrue(self.types.pattern_available(mapped, None, {"T": C.ANY}))
 
-    def test_checker_rejects_pointer_pattern_before_expansion(self):
+    def test_formation_rejects_pointer_pattern_without_pointer_components(self):
         f = C.Named("F")
         source = C.Tuple((C.U32,))
         mapped = C.Foreach("F", True, source, C.Ptr(f))
@@ -55,7 +62,7 @@ class ComponentTests(unittest.TestCase):
                        (C.Block("entry", (("%x", source),),
                                 (C.Instr(("%out",), "foreach", ("%x", "identity"), ty=mapped),),
                                 C.Ret("%out")),))
-        with self.assertRaisesRegex(KursError, "foreach_pointer_pattern"):
+        with self.assertRaisesRegex(KursError, r"foreach \*F needs a source whose components are pointers"):
             check_program(C.Program(funs={"identity": mapper, "walk": caller}))
 
     def test_nested_leaf_c_passes_the_singleton_member(self):

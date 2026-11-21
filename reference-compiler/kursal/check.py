@@ -987,10 +987,10 @@ class Checker:
         got = self.use(instr.args[0])
         if not equal(got, t.source):
             self.fail("foreach_source")
+        if self.types.sum_behind_pointer(t.source, self.module, self.kinds):
+            self.fail("foreach_cannot_traverse_sum_behind_pointer")
         if not self.holds("Exposed", (t.source,)):
             self.fail("foreach_source_not_exposed")
-        if not self.types.pattern_available(t, self.module, self.kinds):
-            self.fail("foreach_pointer_pattern_requires_pointer_components")
         mapper = self.program.funs.get(instr.args[1])
         if mapper is None:
             self.fail("unknown_mapper")

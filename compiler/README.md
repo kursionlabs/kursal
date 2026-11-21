@@ -923,6 +923,16 @@ These are the places where Kursal differs from what one might expect.
   before any name, even behind a pointer, is rejected too (`struct T { f: foreach *F of *T => *F
   }`: `recursive foreach needs a named type between`). Errors name the declaration whose walk found
   them.
+- **A `foreach` type has an expansion at every instantiation.** A source that is no product (nor,
+  by value, a sum) is one component: `foreach F of u32 => *F` is `(*u32,)`. Behind a pointer each
+  component is a pointer to it: to a field, an element, or, for a sum, each variant's payload
+  (`foreach F of *Option[u8] => F` is the sum of `*()` and `*u8`, a pointer valid while the value
+  holds that variant); a pointer to a leaf is the one component. `*F` binds F to each component's
+  pointee, so its source must give pointers whatever the type arguments are: an explicit pointer,
+  a `foreach` whose body is a pointer, or a visible product of pointers (`foreach *F of T => F` is
+  rejected, as `T` may be `bool`: `foreach *F needs a source whose components are pointers`). No
+  `foreach` expression traverses a sum through a pointer yet: the type is defined, the traversal is
+  rejected (`a foreach cannot traverse a sum through a pointer yet`).
 - **A `foreach` type's body** binds its own binder and, over a transformed source, that source's
   binders, each the component's: in `foreach F of (foreach G of (u32, u8) => *G) => (F, G)`, `G` is
   `u32` in the first row and `u8` in the second, even where a type parameter `G` is in scope.

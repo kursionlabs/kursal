@@ -181,6 +181,8 @@ REJECTED = {
     "close_by_number.kur": "calling an unsafe function requires unsafe authorization",
     "double_use_handle.kur": "value 'h' has been moved",
     "foreach_holds_itself.kur": "7:8: type foreach_holds_itself::Tree: infinite by-value layout$",
+    "foreach_pointer_over_parameter.kur": "10:5: type formation: foreach \\*F needs a source whose components are pointers$",
+    "foreach_through_pointer_to_sum.kur": "9:17: a foreach cannot traverse a sum through a pointer yet$",
     "forged_file.kur": "the shape of std::io::File! is not exposed here",
     "implicit_package_open.kur": "pattern does not match exists '1\\. \\(Tag!\\['1\\], u32\\)",
     "implicit_package_open_assignment.kur": "type mismatch: exists '1\\. Tag!\\['1\\] and Tag!\\['a\\]",

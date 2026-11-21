@@ -1425,7 +1425,7 @@ def checked_case(text: str) -> Optional[dict[str, Optional[str]]]:
     except KursError as error:
         # An array length is unsigned in the Kursal compiler's core, so it rejects a negative one as it
         # reads the program, with the reader's message.
-        if str(error) == "type formation: negative array length":
+        if str(error).startswith("type formation: negative array length"):
             return None
         return {"kurs": text, "check": str(error), "c": None, "readable": None}
     except Exception:  # noqa: BLE001

@@ -60,9 +60,12 @@ class Formation:
         # arguments mention, however it is spelled.
         self.active: list[tuple[str, tuple[C.Type, ...], int]] = []
         self.opened: list[str] = []
+        self.declaration: Optional[str] = None
 
     def fail(self, message: str) -> None:
-        raise KursError(f"type formation: {message}", self.pos)
+        # A type declaration has no position of its own: its name says where.
+        where = f" in type {self.declaration}" if self.declaration is not None else ""
+        raise KursError(f"type formation: {message}{where}", self.pos)
 
     def extend(self, env: Kinds, params: tuple[C.Param, ...]) -> dict[str, C.Kind]:
         if len({p.name for p in params}) != len(params):
@@ -157,6 +160,10 @@ class Formation:
                 self.within(binders, lambda: self.fits(body, C.ANY, inner))
             case C.Foreach(binder=binder, source=source, body=body):
                 self.fits(source, C.ANY, env)
+                # The type has an expansion only if every component is a pointer for `*F` to match, and
+                # it must have one at every instantiation, so the components cannot be left to an argument.
+                if ty.indirect and not self.types.pattern_available(ty, self.module, env):
+                    self.fail(f"foreach *{binder} needs a source whose components are pointers")
                 available = foreach_binders(source) if isinstance(source, C.Foreach) else ()
                 if tuple(available[:len(ty.retained or ())]) != ty.retained:
                     self.fail("foreach retained binders must be a source prefix")
@@ -270,11 +277,12 @@ class Formation:
     def declarations(self) -> None:
         env: dict[str, C.Kind] = {"static": C.BRAND}
         for decl in self.program.types.values():
-            self.module, self.premises = decl.module, decl.premises
+            self.module, self.premises, self.declaration = decl.module, decl.premises, decl.name
             scope = self.extend(env, decl.params)
             for p in decl.premises:
                 self.premise(p, scope)
             self.fits(decl.body, C.ANY, scope)
+        self.declaration = None
         for decl in self.program.types.values():
             self.unmarked(decl)
         for trait in self.program.traits.values():

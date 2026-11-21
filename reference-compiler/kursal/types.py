@@ -402,6 +402,11 @@ class Types:
             return inner is not None and not isinstance(inner, Enum)
         return True
 
+    def sum_behind_pointer(self, source: Type, module: Optional[ModuleId], kinds: Kinds) -> bool:
+        """A pointer to a visible sum: its type expands, but no traversal reaches its payloads yet."""
+        shape = self.visible_shape(source, module, kinds)
+        return isinstance(shape, Ptr) and isinstance(self.visible_shape(shape.inner, module, kinds), Enum)
+
     def visible_shape(self, ty: Type, module: Optional[ModuleId], kinds: Kinds) -> Optional[Type]:
         """Reveal only the outer shape, without treating abstract types as leaves."""
         while True:
@@ -531,9 +536,9 @@ class Types:
         s = self.shape(source, module)
         wrap: Callable[[Type], Type] = lambda c: c
         if isinstance(s, Ptr):
+            # Behind a pointer each component is a pointer to it; a sum's are pointers to its payloads,
+            # one per variant, valid while its variant is the one the value holds.
             s, wrap = self.shape(s.inner, module), Ptr
-            if isinstance(s, Enum):
-                raise KursError("a pointer source cannot be a sum")
         match s:
             case Struct(fields=fields):
                 return s, [(n, wrap(f), {}) for n, f in fields]
@@ -542,7 +547,7 @@ class Types:
             case Array(elem=elem, length=length):
                 return s, [(str(i), wrap(elem), {}) for i in range(1 if schema else length)]
             case Enum(variants=variants):
-                return s, [(n, f, {}) for n, f in variants]
+                return s, [(n, wrap(f), {}) for n, f in variants]
         return None, [("0", source, {})]
 
     def bind(self, ty: Foreach, item: Type, extra: Substitution) -> dict[str, Type]:

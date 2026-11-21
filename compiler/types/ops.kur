@@ -1232,6 +1232,24 @@ impl Types['k] {
     }
 
     // Reveal only the outer shape, without treating abstract types as leaves.
+    // A pointer to a visible sum: its type expands, but no traversal reaches its payloads yet.
+    fn sum_behind_pointer(self, &cx: Domain!['k], source: Type['k], home: Option[ModuleId['k]], kinds: ArenaMap[Span['k], Kind, 'k]) -> bool {
+        let pointee = match self.visible_shape(&cx, source, home, kinds) {
+            Option::Some(shape) => match shape {
+                Type::Ptr(inner) => self.visible_shape(&cx, inner.copy(&cx), home, kinds),
+                _ => Option::None,
+            },
+            Option::None => Option::None,
+        };
+        match pointee {
+            Option::Some(shape) => match shape {
+                Type::Enum(_v) => true,
+                _ => false,
+            },
+            Option::None => false,
+        }
+    }
+
     fn visible_shape(self, &cx: Domain!['k], ty: Type['k], home: Option[ModuleId['k]], kinds: ArenaMap[Span['k], Kind, 'k]) -> Option[Type['k]] {
         var ty = ty;
         while true {
@@ -1431,13 +1449,11 @@ impl Types['k] {
         var s = self.shape(&cx, source, home);
         var pointer = false;
         let unit = match s {
+            // Behind a pointer each component is a pointer to it; a sum's are pointers to its
+            // payloads, one per variant, valid while its variant is the one the value holds.
             Type::Ptr(inner) => {
                 s = self.shape(&cx, inner.copy(&cx), home);
                 pointer = true;
-                match s {
-                    Type::Enum(_v) => kurs_error(&cx, Span::from_static(&cx, "a pointer source cannot be a sum"), no_pos()),
-                    _ => (),
-                }
             },
             _ => (),
         };
@@ -1471,7 +1487,7 @@ impl Types['k] {
             Type::Enum(variants) => {
                 var i = 0usize;
                 while i < variants.len(&cx) {
-                    rows.push(&cx, Row.{ label: variants.at(&cx, i).name, item: variants.at(&cx, i).type, extra: ArenaMap::new(&cx) });
+                    rows.push(&cx, Row.{ label: variants.at(&cx, i).name, item: wrap(&cx, variants.at(&cx, i).type, pointer), extra: ArenaMap::new(&cx) });
                     i = i + 1usize;
                 }
                 Rows.{ skeleton: Option::Some.(s), rows }
