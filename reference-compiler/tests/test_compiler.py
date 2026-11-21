@@ -127,15 +127,17 @@ def digest_of(paths: list[Path]) -> str:
 
 
 def cached(stem: str, key: str, make: Callable[[], list]) -> list:
-    """`make()`, a JSON value, kept in .build/ as STEM-KEY.json until KEY changes."""
+    """`make()`, a JSON value, kept in .build/ as STEM-KEY.json until KEY changes. Test modules running at
+    once may each make the same value: each writes its own temporary file and moves it into place."""
     path = CACHE / f"{stem}-{key}.json"
     if path.exists():
         return json.loads(path.read_text())
     value = make()
     CACHE.mkdir(exist_ok=True)
     for old in CACHE.glob(f"{stem}-*.json"):
-        old.unlink()
-    temporary = path.with_suffix(".tmp")
+        if old != path:
+            old.unlink(missing_ok=True)
+    temporary = path.with_suffix(f".{os.getpid()}.tmp")
     temporary.write_text(json.dumps(value))
     temporary.replace(path)
     return value
@@ -1444,7 +1446,8 @@ def checked_case(text: str) -> Optional[dict[str, Optional[str]]]:
 def core_cases() -> list[dict[str, Optional[str]]]:
     """Every distinct core program the other test modules check, with `checked_case`'s verdict."""
     modules = sorted(path.stem for path in TESTS.glob("test_*.py") if "check_program" in path.read_text()
-                     and path.stem not in ("test_compiler", "test_examples", "test_library", "test_kurs"))
+                     and path.stem not in ("test_compiler", "test_examples", "test_library", "test_kurs",
+                                           "test_place_translation"))
 
     def make() -> list:
         with ProcessPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
