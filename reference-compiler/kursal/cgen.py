@@ -23,7 +23,7 @@ and `restrict` where the whole program allows it (`qualifiers`)."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 import re
 from typing import Optional
@@ -90,14 +90,25 @@ for _stem in ("8", "16", "32", "64", "_LEAST8", "_LEAST16", "_LEAST32", "_LEAST6
         RUNTIME_NAMES.update(f"{_unsigned}INT{_stem}_{suffix}" for suffix in ("MIN", "MAX", "C", "WIDTH"))
 
 
-def allocate(base: str, taken: set[str]) -> str:
+class Names(set[str]):
+    """C identifiers in use, with the last suffix `allocate` gave each base: a name is never released, so
+    every earlier one is still taken and the next search starts there."""
+
+    def __init__(self, names: Iterable[str] = ()) -> None:
+        super().__init__(names)
+        self.suffix: dict[str, int] = {}
+
+
+def allocate(base: str, taken: Names) -> str:
     """Allocate a C identifier; the readable spelling is only a hint."""
     if base[0].isdigit():
         base = "k_" + base
-    name, index = base, 0
+    index = taken.suffix.get(base, 0)
+    name = f"{base}_{index}" if index else base
     while name in taken:
         index += 1
         name = f"{base}_{index}"
+    taken.suffix[base] = index
     taken.add(name)
     return name
 
@@ -182,9 +193,9 @@ class Backend:
         self.datas: dict[str, tuple[str, Data]] = {}
         # One conservative pool for ordinary identifiers, including function
         # locals: later global declarations must not be shadowed by earlier locals.
-        self.taken = C_KEYWORDS | RUNTIME_NAMES | {"main", REPORT_ERROR, START} | {e.name for e in program.externs.values()}
+        self.taken = Names(C_KEYWORDS | RUNTIME_NAMES | {"main", REPORT_ERROR, START} | {e.name for e in program.externs.values()})
         self.component_names: dict[tuple[str, str], str] = {}
-        self.component_taken: set[str] = set()
+        self.component_taken = Names()
         self.instance_params: dict[int, tuple[Param, ...]] = {}
         self.function_ids = {id(f): (path_segments(f.name), encode(("function", f.name)))
                              for f in program.funs.values()}
@@ -634,7 +645,7 @@ class Backend:
         self.forwards: dict[str, str] = {}
         self.lines: list[str] = []
         self.scratch = 0
-        label_taken: set[str] = set()
+        label_taken = Names()
         self.labels = {b.label: allocate(f"L_{readable(b.label)}", label_taken) for b in fun.blocks}
         decls: list[str] = []
         self.temps: list[str] = []

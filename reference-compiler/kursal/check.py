@@ -1089,9 +1089,9 @@ class Checker:
         self.entails(places, target, sub)
         kept = {p.name for p in self.params if p.kind == BRAND} | {STATIC} | {
             b for b, t in sub.items() if t.label == b}
+        empty = set(target.empty)
         for root, ty in self.roots.items():
-            if root not in self.param_roots and not any(prefix(q, root) for q in target.empty) \
-                    and not free_brands(ty) <= kept:
+            if root not in self.param_roots and not ancestor_in(empty, root) and not free_brands(ty) <= kept:
                 self.fail("full_local_block_brand")
 
     def entails(self, places: Places, target: Block, sub: Mapping[str, Skolem]) -> None:
@@ -1101,8 +1101,9 @@ class Checker:
                       for path, brands in target.opened}
             if places.opened != wanted:
                 self.fail("opened_view_contract")
+            empty = set(target.empty)
             for z in places.empty:
-                if not any(prefix(q, z) for q in target.empty):
+                if not ancestor_in(empty, z):
                     self.fail("empty_assumes_full")
             fresh = [q for q in target.empty if not places.covered(q)]
             for root in {segments(q)[0] for q in fresh}:
