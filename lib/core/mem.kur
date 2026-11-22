@@ -225,9 +225,10 @@ struct RegionResume! {
     marker: Brand['r],
 }
 
-// `Region!::split`/`Restore!::merge` below decompose one exclusive region
-// into one independently branded sub-region per FIELD, each with its own
-// fresh `Exclusive!` capability, and a receipt that reunites them.
+// `Region!::split`, `Splitting!::parts` and `Restore!::merge` below
+// decompose one exclusive region into one independently branded
+// sub-region per FIELD, each with its own fresh `Exclusive!` capability,
+// and a receipt that reunites them.
 
 /// The tie between a part of a split region and the region it came from.
 ///
@@ -267,6 +268,22 @@ forall T, 'r.
 struct Restore! {
     ptr: *T,
     cap: Exclusive!['r],
+}
+
+/// What `Region!::split` hands on to make the parts: the base pointer and
+/// the parent brand, read from the region's own `Exclusive!['r]`, and
+/// nothing else. The capability itself stays in the `Restore!`.
+///
+/// Linear and restricted: `Splitting!::parts` is the only operation that
+/// consumes one, so the parts of one split are made once, and no other
+/// module can build one around a pointer or a brand of its choosing. A
+/// `Brand['r]` is `Copy` and readable off any `Ref` naming 'r, so pairing
+/// it with a pointer is authority only here, where `split` took both from
+/// a region it held.
+forall T, 'r.
+struct Splitting! {
+    ptr: *T,
+    parent: Brand['r],
 }
 
 /// Lends `*p` to `f` in place: `f` gets the value through `&`, and the value
@@ -548,22 +565,49 @@ impl Region![T, 'r] {
     }
 }
 
-// A separate `impl` block because `split` alone needs `Exposed[*T]`:
+// A separate `impl` block because splitting alone needs premises on `T`:
 // `replace`/`share` never look past `T`'s opacity. A method's own `where`
 // belongs to a `forall` that binds something, and `split` binds nothing of
-// its own, so the premise on the impl's parameter `T` goes on an impl block
-// of its own.
-forall T, 'r where Exposed[*T].
+// its own, so the premises on the impl's parameter `T` go on an impl block
+// of its own. `Exposed[*T]` is the shape authority: `T` is abstract here,
+// and `foreach *F of *T` needs to see `T`'s product shape to traverse it
+// field by field. `Sized[T]` says `T` has a finite layout of non-zero size:
+// a traversal of `*T` for a generic `T` takes it as the evidence that `T`
+// has the layout whose field offsets it computes.
+forall T, 'r where Exposed[*T], Sized[T].
 impl Region![T, 'r] {
-    /// Splits the region into one sub-region per field of `T`, each under a
-    /// fresh brand, and the receipt that merges them back.
+    /// Splits the region into the receipt that merges it back and the
+    /// `Splitting!` that makes its parts.
     ///
-    /// Decomposes one exclusive region into one independently branded
+    /// Two steps, not one, because the parts are a value of a `foreach`
+    /// type, which is never a field of a tuple: they are the whole result
+    /// of `Splitting!::parts`. `split` gives up the region's capability to
+    /// the receipt and keeps, in the `Splitting!`, only the pointer and the
+    /// parent brand read from that capability, so nothing but `parts` can
+    /// make parts, and only once.
+    ///
+    /// No new brand for 'r: the caller's `Region![T,'r]` already proves
+    /// everything needed. The fresh brands `parts` mints are the per-field
+    /// ones, each strictly smaller in scope than 'r.
+    fn split(self) -> (Restore![T, 'r], Splitting![T, 'r]) {
+        let { ptr: p, cap } = self;
+        // The parts' parent brand is this region's own witness, read inside
+        // `core` and never handed out.
+        let stamp = &cap.stamp();
+        let { marker: parent } = stamp;
+        (Restore!.{ ptr: p, cap }, Splitting!.{ ptr: p, parent })
+    }
+}
+
+forall T, 'r where Exposed[*T], Sized[T].
+impl Splitting![T, 'r] {
+    /// One sub-region per field of `T`, each under a fresh brand and tied to
+    /// the parent by a `Link!`.
+    ///
+    /// Decomposes the split region into one independently branded
     /// sub-region per FIELD of `T`, each usable (ordinarily via
     /// `Region!::share`) without any two sub-regions' `Exclusive!`s being
-    /// interchangeable. `where Exposed[*T]` is the shape authority: `T` is
-    /// abstract here, and `foreach *F of *T` needs to see `T`'s product
-    /// shape to traverse it field by field.
+    /// interchangeable.
     ///
     /// A part does NOT bundle an `Exclusive!`
     /// (`exists 'f. (Exclusive!['f], Region![F,'f], Link!['f,'r])`):
@@ -572,46 +616,36 @@ impl Region![T, 'r] {
     /// bundled one, and two live writers for one brand is a safe
     /// use-after-free and double free. A part's writer is obtained the
     /// ordinary way, by calling `share` on its `Region![F,'f]`.
-    ///
-    /// No new brand for 'r: the caller's `Region![T,'r]` already proves
-    /// everything needed. The fresh brands minted here are the per-field
-    /// ones, each strictly smaller in scope than 'r.
-    fn split(self) -> (Restore![T, 'r], foreach *F of * T => exists 'f. (Region![F, 'f], Link!['f, 'r])) {
-        let { ptr: p, cap } = self;
-        // The parts' parent brand is this region's own witness, read inside
-        // `core` and never handed out.
-        let stamp = &cap.stamp();
-        let { marker: parent } = stamp;
-        let back = Restore!.{ ptr: p, cap };
-        let parts = foreach f: F of p {
+    fn parts(self) -> foreach *F of * T => exists 'f. (Region![F, 'f], Link!['f, 'r]) {
+        let { ptr: p, parent } = self;
+        foreach f: F of p {
             let exists 'f. (child, k) = unsafe make_split_part[F](f);
             pack 'f. (child, Link!.{ child: k, parent })
-        };
-        (back, parts)
+        }
     }
 }
 
 /// A region over `field` under a fresh brand, and that brand:
-/// `Region!::split`'s per-field step. A separate function, not inlined in
-/// `split`'s `foreach` body, because the `exists 'f. (...)` a `foreach`
+/// `Splitting!::parts`'s per-field step. A separate function, not inlined in
+/// `parts`'s `foreach` body, because the `exists 'f. (...)` a `foreach`
 /// component produces must be a SEALED RETURN: `Exclusive!::fresh` mints and
 /// seals one brand per call.
 ///
 /// It mints the child brand and hands back only that, never a `Link!`. A
 /// helper taking the PARENT brand as a parameter and returning a `Link!`
 /// would forge authority: a `Brand['r]` is `Copy` and readable off any live
-/// `Ref` naming 'r, so it proves nothing about holding 'r. `split` instead
-/// reads the parent brand from the region's own `Exclusive!['r]` and builds
-/// each `Link!` itself.
+/// `Ref` naming 'r, so it proves nothing about holding 'r. `parts` instead
+/// takes the parent brand `split` read from the region's own
+/// `Exclusive!['r]` and builds each `Link!` itself.
 ///
 /// `unsafe fn` because it takes a raw pointer that is trusted, unvalidated,
 /// and immediately wrapped in a `Region!`. THE CALLER'S OBLIGATION (any
-/// module can call this, not only `split`): `field` must address
+/// module can call this, not only `parts`): `field` must address
 /// initialized storage of `Field` that no other live capability covers, as
-/// for `Region!::from_raw`. `split` meets it with field pointers computed by
-/// `foreach` over a region it holds exclusively. The part returned carries
-/// only its own fresh brand; since `Link!` is built by `split` alone, a part
-/// over unrelated storage can never be merged into a parent.
+/// for `Region!::from_raw`. `parts` meets it with field pointers computed by
+/// `foreach` over a region `split` gave up exclusively. The part returned
+/// carries only its own fresh brand; since `Link!` is built by `parts`
+/// alone, a part over unrelated storage can never be merged into a parent.
 forall Field.
 unsafe fn make_split_part(field: *Field) -> exists 'f. (Region![Field, 'f], Brand['f]) {
     let exists '1. (k, cap) = Exclusive!::fresh();
@@ -654,12 +688,12 @@ impl RegionResume![T, 'r] {
     }
 }
 
-// `where Exposed[*T]`: `merge`'s `foreach` maps `parts`, a value of a
-// `foreach` type over `*T`, and a map needs the shape of that source, as
-// `split`'s traversal of the pointer does.
-forall T, 'r where Exposed[*T].
+// `where Exposed[*T], Sized[T]`: `merge`'s `foreach` maps `parts`, a value
+// of a `foreach` type over `*T`, and a map needs the shape of that source,
+// as the traversal of the pointer in `parts` does.
+forall T, 'r where Exposed[*T], Sized[T].
 impl Restore![T, 'r] {
-    /// The parent region again, from every part `split` produced.
+    /// The parent region again, from every part `Splitting!::parts` made.
     ///
     /// `Region!::split`'s exact inverse. Consumes the WHOLE product -- every
     /// part, in whatever order the caller hands them back -- and `self`, the
@@ -669,10 +703,10 @@ impl Restore![T, 'r] {
     ///   2. `Restore!` is one-shot: it is consumed by value here, so a
     ///      second `merge` on the same receipt is unspellable.
     ///   3. No public operation consumes a single `Link!` in isolation: the
-    ///      only way to discharge one is inside this `foreach`, which
-    ///      discharges the whole product together with `self`, or not at
-    ///      all (the `foreach` source is linear; a partially consumed
-    ///      product cannot be dropped).
+    ///      only way to discharge one is inside this `foreach`, which maps
+    ///      the whole product together with `self`, or not at all (a map
+    ///      consumes each component of its operand exactly once, and a
+    ///      product holding linear parts cannot be dropped).
     ///   4. The returned `Region![T,'r]` is rebuilt from `self`'s own
     ///      pointer and capability, never from a part, since parts are
     ///      permutable (see `Restore!`).
@@ -680,7 +714,8 @@ impl Restore![T, 'r] {
     /// Each part is destructured only to CONSUME it: the child's
     /// capability is retired and its link discarded. Nothing about the
     /// child's pointer or brand flows into the rebuilt parent; that pointer
-    /// addresses one field, not the whole block.
+    /// addresses one field, not the whole block. What the map makes,
+    /// `foreach *F of *T => ()`, is `Copy`, as its body mentions no `F`.
     fn merge(self, parts: foreach *F of * T => exists 'f. (Region![F, 'f], Link!['f, 'r])) -> Region![T, 'r] {
         let { ptr: p, ..rest } = self;
         let done = foreach part of parts {

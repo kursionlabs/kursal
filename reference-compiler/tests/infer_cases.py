@@ -421,4 +421,7 @@ INFER_ERRORS = (
      "forall U where Sized[U]. fn bad(x: (U, u8)) -> (U, u8) { need(x) }\n", "Sized requires an exact premise"),
     ("forall T where Sized[T]. fn need(x: T) -> T { x }\nfn bad(x: ((), [u64; 0])) -> ((), [u64; 0]) { need(x) }\n",
      "Sized requires an exact premise"),
+    # A region over a zero-size value has no fields to split into.
+    ("use std::owned::Owned!;\nfn main() -> i32 {\n    let exists 'r. (alloc, region) = Owned!::new(((), ())).open();\n"
+     "    let (restore, splitting) = region.split();\n    0i32\n}\n", "Sized requires an exact premise"),
 )

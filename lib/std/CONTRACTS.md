@@ -334,7 +334,7 @@ a checked type; their obligation is the same kind of thing.
 | `core::ptr::offset` | `count` elements of `T` past `base` stay inside the block `base` points into; no bound is passed or checked. The one address computation of the library: every module that steps through a block calls it |
 | `alloc::collections::arena_vec::place` | `i` is below the capacity of `h`'s segments, which are live arena blocks of the sizes `locate` computes |
 | `alloc::collections::hashmap::alloc_buckets` | the returned array is owned: exactly one `resize`/`destroy` must free it |
-| `core::mem::make_split_part` | `field` addresses initialized storage of `Field` that no other live capability covers, as for `Region!::from_raw`: the returned `Region!` is fresh authority over it. It returns only the part's fresh brand, never a `Link!`; `Link!` is restricted to `core::mem` and built only by `Region!::split`, so a part over unrelated storage cannot be merged into a parent |
+| `core::mem::make_split_part` | `field` addresses initialized storage of `Field` that no other live capability covers, as for `Region!::from_raw`: the returned `Region!` is fresh authority over it. It returns only the part's fresh brand, never a `Link!`; `Link!` is restricted to `core::mem` and built only by `Splitting!::parts`, so a part over unrelated storage cannot be merged into a parent |
 | `core::mem::Region!::from_raw` | `ptr` is not null, also for a zero-size `T`, and points at an initialized `T`, aligned for `T`, in at least `sizeof[T]()` bytes, that nothing else can reach while `'r` lives, and `cap` is the only capability over `'r` (in practice fresh from `Exclusive!::fresh`): the region's `replace` and `share` read and write the `T` unchecked. `Allocation!::adopt` passes its own obligation on, with a fresh capability over a block its `Uninit!` owned outright |
 | `core::mem::lend`, `lend_in` | `p` points at a live `T` that nothing else reads or writes while `f` runs. `Ref::update`/`update_in` discharge it with the brand's `Exclusive!`; `Owned!::update`/`update_in` with the `Owned!` they hold. `lend_in`'s `cx` carries no obligation |
 | `core::array::Array!::from_parts` | `base` addresses `len` initialized `T`s that nothing else reads or writes while the array exists; every later access is checked against `len` |
@@ -435,8 +435,9 @@ and traits, and the capability operations that consume or present
 authority rather than manufacturing it (`Exclusive!::share`, `Shared!::split`,
 `SharedJoin!::join`, `SharedResume!::resume`, `Ref::with`/`copy`/`update`,
 `Allocation!::adopt_value`/`close`, `Allocation!::release` (for a `Copy`
-`T` only: it gives up the `T` in the block), `Region!::share`/`split`/`merge`,
-`RegionResume!::resume`, `Owned!::new`/`update`).
+`T` only: it gives up the `T` in the block), `Region!::share`/`split`,
+`Splitting!::parts`, `Restore!::merge`, `RegionResume!::resume`,
+`Owned!::new`/`update`).
 
 Some class-C functions are still `unsafe fn` for an obligation that is not
 about a pointer in the signature:
@@ -589,7 +590,8 @@ Types whose hidden representation protects authority or bounds:
 | `Region![T,'r]` | `core::mem` | the right to access that block, and what `close`/`release` demand back |
 | `RegionResume![T,'r]` | `core::mem` | the receipt `share` keeps when it trades a `Region!` for an `Exclusive!` and a `Ref`; the only route back to the `Region!` |
 | `Link!['f,'r]` | `core::mem` | names both a split part's fresh brand and the parent brand it was split from, so a forged part cannot be merged into an unrelated region |
-| `Restore![T,'r]` | `core::mem` | `split`'s receipt; rebuilds `Region![T,'r]` from its own stored pointer, never from a part |
+| `Restore![T,'r]` | `core::mem` | `split`'s receipt; holds the parent's `Exclusive!` while the parts are out, and rebuilds `Region![T,'r]` from its own stored pointer, never from a part |
+| `Splitting![T,'r]` | `core::mem` | what `split` hands on to make the parts: the base pointer and the parent brand read from the region's own `Exclusive!`, consumed once by `parts` |
 | `Ref[T,'k]` | `core::mem` | pairs a pointer with a brand; only the `unsafe fn from_raw` rebuilds one from raw parts |
 | `Exclusive!['r]` | `core::cap` | *the* exclusive witness for a brand; only fresh-brand minting creates one |
 | `Shared!['r,'q]` | `core::cap` | one node of a read tree over `'r`, identified by its lineage `'q` |
