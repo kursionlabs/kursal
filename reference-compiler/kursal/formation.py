@@ -99,7 +99,7 @@ class Formation:
 
     def premise(self, premise: C.Premise, env: Kinds) -> None:
         params: tuple[C.Param, ...]
-        if premise.trait == "Exposed":
+        if premise.trait in ("Exposed", "Sized"):
             params = (C.Param("T"),)
         else:
             trait = self.program.traits.get(premise.trait)
@@ -280,6 +280,8 @@ class Formation:
             self.module, self.premises, self.declaration = decl.module, decl.premises, decl.name
             scope = self.extend(env, decl.params)
             for p in decl.premises:
+                if p.trait == "Sized":
+                    self.fail("Sized is not a premise of a type declaration")
                 self.premise(p, scope)
             self.fits(decl.body, C.ANY, scope)
         self.declaration = None

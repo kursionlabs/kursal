@@ -848,10 +848,16 @@ These are the places where Kursal differs from what one might expect.
   (`unknown name Open; the linear type is Open!`). When the name came through a `use` that still
   imports the other spelling, the hint names that line too (`unknown name Open!; the linear type is
   Open!, imported as Open at src/lib.kur:3:5`), so the fix goes in the `use`.
-- **Builtins are imported.** Only the primitive types, `Never`, `Copy` and `Exposed` are always in
-  scope. What else the compiler provides, `core` exports from the module it belongs to, and code
-  imports it like any other name (see the reference compiler's README, "Builtins"):
+- **Builtins are imported.** Only the primitive types, `Never`, `Copy`, `Exposed` and `Sized` are
+  always in scope. What else the compiler provides, `core` exports from the module it belongs to, and
+  code imports it like any other name (see the reference compiler's README, "Builtins"):
   `use std::ptr::NonNull;`, `use std::mem::sizeof;`, `use std::cap::Brand;`.
+- **`Sized[T]`** says that `T` has a finite by-value layout of non-zero size. It is a premise of a
+  function or an instance (so of each of its methods), never of a type declaration, and no program
+  declares an instance of it. It holds of a type that mentions no type parameter when that type is
+  not zero-size, the same on every target (`Sized[(u8, ())]` holds, `Sized[()]` does not), and of a
+  type parameter or anything mentioning one only by the caller's own premise for exactly that type
+  (`Sized requires an exact premise ...`). It implies neither `Copy` nor `Exposed`.
 - **Method lookup sees what the caller sees.** `x.name()` looks for `name` among the methods of
   `x`'s type, and otherwise among the single-parameter traits visible in the calling module
   (declared there, imported by name or glob, or re-exported to it), and the methods of blanket impls

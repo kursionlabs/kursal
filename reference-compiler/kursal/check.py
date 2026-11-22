@@ -32,7 +32,7 @@ STATIC = "static"
 # The module of a declaration that names none: inside no exposure scope, so it has no shape authority over
 # restricted declarations.
 NOWHERE = ModuleId(-1, ("<no module>",))
-SEALED = {"Copy", "Exposed"}      # compiler-reserved trait names: no user trait or instance
+SEALED = {"Copy", "Exposed", "Sized"}     # compiler-reserved trait names: no user trait or instance
 
 
 def contains(types: Types, ty: Type, pred: Callable[[Type], bool]) -> bool:
@@ -510,6 +510,8 @@ class Checker:
         head matches and whose own premises hold."""
         if trait == "Exposed":
             return len(args) == 1 and self.types.exposure_available(args[0], self.module, self.kinds, self.premises)
+        if trait == "Sized":
+            return len(args) == 1 and self.types.sized_available(args[0], self.premises)
         for p in self.premises:
             if p.trait == trait and len(p.args) == len(args) and all(equal(a, b) for a, b in zip(p.args, args)):
                 return True

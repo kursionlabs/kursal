@@ -35,8 +35,8 @@ them at the target's width. An array length, which a type must know, cannot use 
 
 ## Builtins
 
-The primitive types, `Never` (also written `!`) and the traits `Copy` and `Exposed` are always in
-scope. Everything else the compiler provides is a builtin, named `builtin::name`, and only package
+The primitive types, `Never` (also written `!`) and the traits `Copy`, `Exposed` and `Sized` are
+always in scope. Everything else the compiler provides is a builtin, named `builtin::name`, and only package
 `core` writes such a path (anywhere else it is an error, `only package core names builtins`). `core`
 exports each builtin from the module it belongs to, as it would any other name (`export
 builtin::NonNull;`, the `export` form of `use`), and every other package imports it from there:
@@ -77,7 +77,8 @@ leaves it out (`K_alloc_buffer_Buffer`).
 - **Types**: `struct`, `enum`, `tuple`, `array`, `exists` and `foreach` (whose pattern `(ptr F)`
   binds the pointee), and `(ptr T)`, `(non_null T)`, `(brand $k)`, `(fn (PTYPE*) RET)` (an
   unsafe function's type `(fn (unsafe) (PTYPE*) RET)`).
-- **Premises**: `(Copy T)` and `(Exposed T)`.
+- **Premises**: `(Copy T)`, `(Exposed T)` and `(Sized T)` (a finite by-value layout of non-zero size;
+  not a premise of a type declaration).
 - **Builtin operations**: `int_cast` (between integers, modular), `float_cast` (by value, with a
   float on one side or both: an integer to the nearest float; a float toward zero to an integer,
   saturating, NaN to 0; a float to the nearest of the other width), `to_ptr` (a `non_null` as its

@@ -390,6 +390,17 @@ class Types:
             return True
         return self.concrete_exposure(source, module, kinds)
 
+    def sized_available(self, ty: Type, premises: Iterable[Premise]) -> bool:
+        """`Sized[ty]`: `ty` has a finite by-value layout of non-zero size. An exact assumption gives it;
+        otherwise `ty` must mention no type parameter, and then its shape decides it, the same on every
+        target. Every declaration's by-value layout is finite (`check_type_expansion`), so a type that
+        mentions no parameter has one."""
+        if any(p.trait == "Sized" and len(p.args) == 1 and equal(p.args[0], ty) for p in premises):
+            return True
+        if any(name not in self.program.types for name in free_names(ty) - free_brands(ty)):
+            return False
+        return not self.zero_size(ty)
+
     def concrete_exposure(self, source: Type, module: Optional[ModuleId], kinds: Kinds) -> bool:
         shape = self.visible_shape(source, module, kinds)
         if shape is None:

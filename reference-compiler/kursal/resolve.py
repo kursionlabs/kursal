@@ -9,7 +9,7 @@ Each resolved node gets a `ref` attribute:
   ("param", name)             a type parameter in scope
   ("local", name)             a local value
   ("prim", name)              a primitive type
-  ("builtin", name)           a name the compiler gives meaning: `Copy`, `Exposed`, `Never`, and what
+  ("builtin", name)           a name the compiler gives meaning: `Copy`, `Exposed`, `Sized`, `Never`, and what
                               `builtin::name` names in package core (`Brand`, `fresh`, ...)
 """
 
@@ -29,7 +29,7 @@ from .core import ModuleId
 PRIMS = {"i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize", "f32", "f64", "bool"}
 # Always in scope, like the primitives: the type `Never` and the traits.
 NEVER = "Never"
-BUILTIN_TRAITS = {"Copy", "Exposed"}
+BUILTIN_TRAITS = {"Copy", "Exposed", "Sized"}
 # What `builtin::name` names. Only package `core` writes such a path, and it exports each builtin from
 # the module it belongs to (`export builtin::NonNull;` in core::ptr); everyone else imports it from there.
 BUILTIN_TYPES = {"Brand", "NonNull"}
@@ -648,7 +648,7 @@ class Names:
         for trait, args in (forall.premises if forall else ()):
             with self.reporting():
                 trait_ref: S.DeclRef | tuple[Literal["builtin"], str] = (
-                    ("builtin", trait[0]) if trait in (("Copy",), ("Exposed",)) else self.decl(trait, "trait", args.pos))
+                    ("builtin", trait[0]) if len(trait) == 1 and trait[0] in BUILTIN_TRAITS else self.decl(trait, "trait", args.pos))
                 args.ref = trait_ref
             for a in args.args:
                 self.type(a, types)

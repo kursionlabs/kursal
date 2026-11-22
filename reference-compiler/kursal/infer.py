@@ -417,6 +417,11 @@ class Infer:
                     concrete[0], self.module, self.kinds, self.assumptions):
                 fail("Exposed requires an exact premise or an authorized traversable shape", pos)
             return
+        if trait == "Sized":
+            concrete = tuple(zonk(arg) for arg in args)
+            if len(concrete) != 1 or not self.types.sized_available(concrete[0], self.assumptions):
+                fail("Sized requires an exact premise or a type without parameters whose size is not zero", pos)
+            return
         inputs = [zonk(a) for a in args[:input_count]]
         for p in self.assumptions:
             if p.trait == trait and len(p.args) == len(args) and all(equal(zonk(a), b) for a, b in zip(p.args[:input_count], inputs)):

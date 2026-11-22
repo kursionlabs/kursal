@@ -233,8 +233,9 @@ class Signatures:
         return names
 
     def premise(self, trait: S.NamePath, args: S.TypeArgs, scope: Scope) -> C.Premise:
-        if args.ref == ("builtin", "Exposed"):
-            return C.Premise("Exposed", tuple(self.type(a, scope) for a in args.args))
+        for builtin in ("Exposed", "Sized"):
+            if args.ref == ("builtin", builtin):
+                return C.Premise(builtin, tuple(self.type(a, scope) for a in args.args))
         ref = args.ref
         assert ref is not None and ref[0] == "decl"
         actual = tuple(self.type(a, scope) for a in args.args)
@@ -352,6 +353,8 @@ class Signatures:
         node = decl.node
         assert isinstance(node, (S.Struct, S.TupleDecl, S.EnumDecl))
         params, premises, scope = self.forall(node.forall, Scope())
+        if any(p.trait == "Sized" for p in premises):
+            fail("Sized is a premise of functions and instances, not of a type declaration", node.pos)
         body: C.Type
         match node:
             case S.Struct(fields=fields):

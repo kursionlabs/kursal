@@ -389,6 +389,24 @@ REJECTED = {
 
     # Compiler-reserved traits are sealed, and a Copy premise names a parameter.
     "user_exposed_trait": ("trait_name_is_reserved", "(trait Exposed (T)) (instance Exposed (u32))"),
+    "user_sized_trait": ("trait_name_is_reserved", "(trait Sized (T)) (instance Sized (u32))"),
+
+    # `Sized[T]`: a finite layout of non-zero size. It holds of a type parameter only by the caller's own
+    # premise, never of a zero-size type, and it is no premise of a type declaration.
+    "sized_parameter_without_premise": ("unsatisfied_premise", """
+        (fun need (forall (T) ((Sized T)) u32 () (entry () (= %r (const u32 0)) (ret %r))))
+        (fun f (forall (U) () u32 () (entry () (= %r (call (need U))) (ret %r))))"""),
+    "sized_holding_a_parameter": ("unsatisfied_premise", """
+        (fun need (forall (T) ((Sized T)) u32 () (entry () (= %r (const u32 0)) (ret %r))))
+        (fun f (forall (U) ((Sized U)) u32 () (entry () (= %r (call (need (tuple U u32)))) (ret %r))))"""),
+    "sized_zero_size": ("unsatisfied_premise", """
+        (fun need (forall (T) ((Sized T)) u32 () (entry () (= %r (const u32 0)) (ret %r))))
+        (fun f u32 () (entry () (= %r (call (need (tuple (tuple) (array u64 0))))) (ret %r)))"""),
+    "sized_brand_witness": ("unsatisfied_premise", """
+        (fun need (forall (T) ((Sized T)) u32 () (entry () (= %r (const u32 0)) (ret %r))))
+        (fun f u32 () (entry () (= %r (call (need (brand $static)))) (ret %r)))"""),
+    "sized_premise_on_a_type": ("Sized is not a premise of a type declaration",
+                                "(type W (forall (T) ((Sized T)) (struct (t T))))"),
     "copy_premise_on_a_type": ("Copy requires a type parameter name",
                                "(fun h (forall (T) ((Copy u32)) u32 () (entry () (= %r (const u32 0)) (ret %r))))"),
     "copy_premise_on_an_unknown_name": ("Copy requires a type parameter name",
@@ -503,6 +521,12 @@ class CoreSoundnessTests(unittest.TestCase):
                    (= %r (foreach (foreach (G (tuple u64)) (tuple G F)) %s (m F) %c))
                    (= %row (destruct %r (foreach (G (tuple u64)) (tuple G F))))
                    (= (%a %b) (destruct %row (tuple u64 F))) (ret %b))))""",
+            # `Sized` of a concrete type of non-zero size, a zero-size field included, and of a type
+            # parameter under the caller's own premise.
+            """(type P (struct (a (tuple)) (b u8)))
+               (fun need (forall (T) ((Sized T)) u32 () (entry () (= %r (const u32 0)) (ret %r))))
+               (fun f u32 () (entry () (= %a (call (need P))) (= %b (call (need (ptr (tuple))))) (ret %a)))
+               (fun g (forall (U) ((Sized U)) u32 () (entry () (= %r (call (need U))) (ret %r))))""",
             # Pointer projection at the pointer's own type.
             """(type S (struct (a u32)))
                (fun h u32 ((ptr S)) (entry ((%p (ptr S)))

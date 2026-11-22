@@ -1214,6 +1214,8 @@ SIGNATURE_ERRORS = (
     "forall T where Copy[T]. trait Dup { fn dup(x: T) -> T; }\nstruct L! { x: u32 }\n"
     "instance Dup[L] { fn dup(x: L) -> L { x } }\n",
     "forall T where Nope[T]. fn f(x: T) {}\n",
+    # `Sized` is a premise of functions and instances only.
+    "forall T where Sized[T]. struct S { t: T }\n",
     # A declaration linear for every instantiation carries the `!`.
     "struct L! { x: u32 }\nstruct S { l: L! }\n",
     "struct L! { x: u32 }\nforall T. struct G { t: T, l: L! }\n",

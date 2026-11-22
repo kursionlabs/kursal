@@ -192,6 +192,10 @@ INFERENCES = (
     # A function value keeps its brand quantified beside the caller's brand of the same name.
     KEPT_BRAND + "forall 'b. fn h(w: core::cap::Brand['b]) -> forall 'c. fn(core::cap::Brand['c], u32) -> u32 {\n"
     "    let f = g;\n    let n = f(w, 1u32);\n    f\n}\n",
+    # `Sized` of a concrete type of non-zero size, and of a parameter under the caller's own premise.
+    "forall T where Sized[T]. fn need(x: T) -> T { x }\nstruct P { a: (), b: u8 }\n"
+    "fn concrete(p: P, q: *()) -> *() { let r = need(p); need(q) }\n"
+    "forall U where Sized[U]. fn forward(x: U) -> U { need[U](x) }\n",
 )
 
 INFER_ERRORS = (
@@ -408,4 +412,12 @@ INFER_ERRORS = (
     ("exposed struct S { a: u32, b: u32 }\nfn main() -> i32 {\n    let s = S.{ a: 7u32, b: 9u32 };\n"
      "    let t = foreach a: A of s { a };\n    let u = foreach b: A of t { b };\n    0i32\n}\n",
      "5:13: foreach binder A shadows another type named A"),
+    # `Sized` holds of a parameter only by the caller's own premise for exactly it, and never of a
+    # zero-size type.
+    ("forall T where Sized[T]. fn need(x: T) -> T { x }\nforall U. fn bad(x: U) -> U { need[U](x) }\n",
+     "Sized requires an exact premise"),
+    ("forall T where Sized[T]. fn need(x: T) -> T { x }\n"
+     "forall U where Sized[U]. fn bad(x: (U, u8)) -> (U, u8) { need(x) }\n", "Sized requires an exact premise"),
+    ("forall T where Sized[T]. fn need(x: T) -> T { x }\nfn bad(x: ((), [u64; 0])) -> ((), [u64; 0]) { need(x) }\n",
+     "Sized requires an exact premise"),
 )
