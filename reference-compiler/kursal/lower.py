@@ -35,7 +35,7 @@ from .infer import (POINTER_OPS, BuiltinCall, ClosureCall, FnCall, FStringWrite,
 from .sexpr import KursError, List, Position, Str
 from .sigs import OPERATORS, ConstValue, OpConst, Sig, Signatures
 from .resolve import Resolver
-from .types import brand_name, equal, foreach_binders, foreach_item, Types, free_brands, subst
+from .types import brand_name, equal, foreach_binders, foreach_item, mapped_component, mapped_operand, Types, free_brands, subst
 
 ORDERINGS = {"Relaxed": "relaxed", "Acquire": "acquire", "Release": "release", "AcqRel": "acq_rel",
              "SeqCst": "seq_cst"}
@@ -1213,10 +1213,14 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         if vals is None:
             return None
         assert isinstance(ty, C.Foreach)
-        reads = self.types.sum_behind_pointer(ty.source, self.module, self.kinds)
+        # A mapped value (the map form) holds its components: only a traversal of the pointer itself
+        # reads a sum's variant through it.
+        mapped = mapped_operand(ty, self.vty[vals[0]])
+        reads = mapped is None and self.types.sum_behind_pointer(ty.source, self.module, self.kinds)
         if reads and not self.authorized(expr):
             fail("a foreach through a pointer to a sum reads its variant there and requires unsafe authorization", expr.pos)
-        name = MapperLower(self, expr, ty).lower()
+        item = foreach_item(ty) if mapped is None else mapped_component(mapped, C.Named(ty.binder))
+        name = MapperLower(self, expr, ty, item).lower()
         return self.emit("foreach", ty, (vals[0], name, *vals[1:]), node=expr, unsafe=reads,
                          ty=ty, tys=self.identity_args())
 
@@ -1386,13 +1390,14 @@ class ClosureLower(Lifted[S.Closure]):
 
 
 class MapperLower(Lifted[S.Foreach]):
-    """The function a `foreach` applies to each component: the component, then the (Copy) captures."""
+    """The function a `foreach` applies to each component, `item`: the component, then the (Copy)
+    captures."""
 
-    def __init__[P: S.Fn | S.Closure | S.Foreach](self, parent: FnLower[P], expr: S.Foreach, ty: C.Foreach) -> None:
+    def __init__[P: S.Fn | S.Closure | S.Foreach](self, parent: FnLower[P], expr: S.Foreach, ty: C.Foreach,
+                                                  item: C.Type) -> None:
         lowering = parent.lowering
         name = f"{parent.name}#foreach{next(lowering.closures)}"
         binders = foreach_binders(ty)
-        item = foreach_item(ty)
         captured = [parent.bindings[c.binder_id].ty for c in expr.captures]
         sig = Sig(name, None, tuple(C.Param(b, C.ANY) for b in binders) + parent.sig.params, parent.sig.premises,
                   (expr.name, *(c.name for c in expr.captures)), (item, *captured), frozenset(), ty.body, False, parent.sig.module)

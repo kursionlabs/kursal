@@ -24,7 +24,7 @@ use package::types::literals::valid_literal;
 use package::kurs::sexpr::Form;
 use package::syntax::ast::{Pos, no_pos};
 use package::types::termination::check_instance_termination;
-use package::types::ops::{Fresh, Types, children, equal, fits, foreach_binders, foreach_item, free_brands, fresh, kurs_error, subst};
+use package::types::ops::{Fresh, Types, children, equal, fits, foreach_binders, foreach_item, free_brands, fresh, kurs_error, mapped_component, mapped_operand, subst};
 use package::types::unify::match_head;
 use std::hash::{HashIn, HashState};
 use std::option::{Option, Result};
@@ -2570,11 +2570,24 @@ impl Checker['k] {
             _ => self.fail(&cx, "foreach_builds_foreach_type"),
         };
         let got = self.use_value(&cx, instr.args.at(&cx, 0usize));
-        if !equal(&cx, got, f.source.copy(&cx)) {
+        // The operand is the source, or (the map form) a value of a foreach type over the same source with
+        // the same pattern, whose components are the mapper's inputs.
+        let mapped = mapped_operand(&cx, f, got);
+        let fits_source = match mapped {
+            Option::None => equal(&cx, got, f.source.copy(&cx)),
+            Option::Some(o) => match o.source.copy(&cx) {
+                Type::Foreach(_s) => false,
+                _ => o.indirect == f.indirect && equal(&cx, o.source.copy(&cx), f.source.copy(&cx)),
+            },
+        };
+        if !fits_source {
             self.fail(&cx, "foreach_source");
         }
         if self.types.sum_behind_pointer(&cx, f.source.copy(&cx), self.home.copy(&cx), self.kinds.copy(&cx)) {
-            self.authorize(&cx, instr, true);
+            // A traversal of the pointer reads the variant there; a mapped value holds its own.
+            if mapped.is_none() {
+                self.authorize(&cx, instr, true);
+            }
         } else if !self.holds(&cx, Span::from_static(&cx, "Exposed"), ArenaVec::one(&cx, f.source.copy(&cx))) {
             self.fail(&cx, "foreach_source_not_exposed");
         }
@@ -2622,7 +2635,10 @@ impl Checker['k] {
         }
         let unit = self.instantiate(&cx, mapper.params, mapper.premises, chosen);
         self.kinds.set(&cx, saved_kinds);
-        let item = subst(&cx, foreach_item(&cx, f), rigid, self.counter);
+        let item = match mapped {
+            Option::None => subst(&cx, foreach_item(&cx, f), rigid, self.counter),
+            Option::Some(o) => mapped_component(&cx, o, rigid.at(&cx, f.binder), self.counter),
+        };
         let ptypes = subst_all(&cx, mapper.ptypes, sub, self.counter);
         if ptypes.is_empty(&cx) || !equal(&cx, ptypes.at(&cx, 0usize), item)
             || !equal(&cx, subst(&cx, mapper.ret, sub, self.counter), subst(&cx, f.body.copy(&cx), rigid, self.counter)) {

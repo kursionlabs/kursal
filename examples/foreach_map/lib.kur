@@ -1,0 +1,94 @@
+// A foreach over a value of a foreach type maps it: the mapper takes each
+// component of the value, and the result is a foreach type over the same
+// source, with the same binder and pattern. Each component is passed to the
+// mapper exactly once, so a linear one is consumed exactly once, and of a sum
+// only the variant the value holds is mapped. Mapping reads nothing through a
+// pointer, so it needs no `unsafe` even where the source is a pointer to a sum:
+// the value already holds its variant.
+use std::io::print;
+use std::mem::alloca;
+use std::option::Option;
+use std::slice::Slice;
+
+fn check(ok: bool, what: Slice[u8, 'static]) {
+    if !ok {
+        print(what);
+        print(": wrong\n");
+    }
+}
+
+exposed struct Pair {
+    a: u32,
+    b: u32,
+}
+
+exposed struct Token! {
+    n: u32,
+}
+
+// Each field is paired with a weight, then each pair is mapped to the weight
+// and the field swapped: `foreach F of Pair => (F, u32)`, then `foreach F of
+// Pair => (u32, F)`. The mapper is checked for any `F`, so it hands the field
+// on rather than dropping it, as `F` may be linear.
+fn weighted(p: Pair) -> u32 {
+    let tagged = foreach f of p { (f, 3u32) };
+    let swapped = foreach t of tagged {
+        let (field, weight) = t;
+        (weight + 1, field)
+    };
+    let { a, b } = swapped;
+    let (wa, fa) = a;
+    let (wb, fb) = b;
+    wa * fa + wb * fb
+}
+
+// Linear components: each token is wrapped, then each wrapped token is
+// unwrapped and consumed once.
+fn spend(x: Token!, y: Token!) -> u32 {
+    let wrapped = foreach t of (x, y) { (t, 1u8) };
+    let unwrapped = foreach w of wrapped {
+        let (t, n) = w;
+        t
+    };
+    let (u, v) = unwrapped;
+    let { n: m } = u;
+    let { n } = v;
+    m + n
+}
+
+// The payload pointer of the held variant, mapped to the value there. The
+// traversal of the pointer reads the variant; the map of its result does not.
+fn held(p: *Option[u32]) -> u32 {
+    let parts = unsafe (foreach f of p { f });
+    let values = foreach q of parts { unsafe *q };
+    match values {
+        Some(v) => v,
+        None(_) => 0,
+    }
+}
+
+// An array's elements are mapped one by one.
+fn doubled(xs: [u32; 3]) -> u32 {
+    let pairs = foreach x of xs { (x, 2u32) };
+    let twice = foreach p of pairs {
+        let (x, k) = p;
+        (k, x)
+    };
+    let [a, b, c] = twice;
+    let (ka, xa) = a;
+    let (kb, xb) = b;
+    let (kc, xc) = c;
+    ka * xa + kb * xb + kc * xc
+}
+
+fn main() -> i32 {
+    check(weighted(Pair.{ a: 1, b: 2 }) == 12, "a struct mapped twice");
+    check(spend(Token!.{ n: 4 }, Token!.{ n: 5 }) == 9, "linear components");
+    let o = unsafe alloca[Option[u32]]();
+    unsafe *o = Option::Some(41);
+    check(held(o) == 41, "the held variant");
+    unsafe *o = Option::None;
+    check(held(o) == 0, "no payload");
+    check(doubled([7, 8, 9]) == 48, "an array mapped");
+    0
+}

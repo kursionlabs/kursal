@@ -34,7 +34,7 @@ use package::sigs::signatures::{ConstValue, InstanceSig, Sig, Signatures, const_
 use package::syntax::ast as S;
 use package::syntax::ast::{Expr, Pattern, Pos, Statement, no_pos};
 use package::types::termination::check_instance_termination;
-use package::types::ops::{Fresh, Surface, Types, brand_differences, brand_name, equal, foreach_binders, free_brands, free_names, fresh, made_from, subst, surface};
+use package::types::ops::{Fresh, Surface, Types, brand_differences, brand_name, equal, foreach_binders, free_brands, free_names, fresh, made_from, mapped_component, subst, surface};
 use package::types::unify::{ground, instantiate, match_head, prune, unify, zonk};
 use std::collections::hashmap::OwnedMap!;
 use std::collections::vec::OwnedVec!;
@@ -2609,12 +2609,26 @@ impl Body['k] {
     }
 
     fn expr_foreach(self, &cx: Domain!['k], f: S::Foreach['k]) -> Type['k] {
-        var source = zonk(&cx, self.expr(&cx, f.source.copy(&cx)));
-        if is_unsolved(&cx, source) {
-            source = self.shape(&cx, source, f.pos);
+        var operand = zonk(&cx, self.expr(&cx, f.source.copy(&cx)));
+        if is_unsolved(&cx, operand) {
+            operand = self.shape(&cx, operand, f.pos);
         }
-        // Through a pointer to a sum the traversal reads the variant, an unsafe read that lowering
-        // authorizes; anything else it traverses needs only the shape.
+        // A value of a foreach type is mapped (the map form): the result has its source, binder and
+        // pattern, and each item is a component of the value. Anything else is the source itself.
+        let mapped = match operand {
+            Type::Foreach(o) => match o.source.copy(&cx) {
+                Type::Foreach(_s) => Option::None,
+                _ => Option::Some.(o),
+            },
+            _ => Option::None,
+        };
+        let source = match mapped {
+            Option::Some(o) => o.source.copy(&cx),
+            Option::None => operand,
+        };
+        // Through a pointer to a sum the traversal of the pointer reads the variant, an unsafe read that
+        // lowering authorizes; a mapped value holds its variant, and reads nothing. Anything else it
+        // traverses needs only the shape.
         if !self.inf.types.sum_behind_pointer(&cx, source, Option::Some.(self.home), self.kinds) {
             self.require(&cx, Span::from_static(&cx, "Exposed"), ArenaVec::one(&cx, source), f.pos);
         }
@@ -2637,23 +2651,26 @@ impl Body['k] {
         self.kinds.insert(&cx, binder, Kind::Any);
         let outer = self.open_binders.copy(&cx);
         var open_binders = outer.cons(&cx, binder);
-        let (indirect, item) = match source {
-            Type::Foreach(s) => {
-                var i = 0usize;
-                while i < sources.len(&cx) {
-                    self.kinds.insert(&cx, sources.at(&cx, i), Kind::Any);
-                    open_binders = open_binders.cons(&cx, sources.at(&cx, i));
-                    i = i + 1usize;
-                }
-                (false, s.body.copy(&cx))
-            },
-            _ => {
-                let indirect = match self.shape(&cx, source, f.pos) {
-                    Type::Ptr(_p) => true,
-                    _ => false,
-                };
-                let named = C::named(binder, ArenaVec::new(&cx));
-                (indirect, if indirect { C::ptr(&cx, named) } else { named })
+        let (indirect, item) = match mapped {
+            Option::Some(o) => (o.indirect, mapped_component(&cx, o, C::named(binder, ArenaVec::new(&cx)), self.inf.counter)),
+            Option::None => match source {
+                Type::Foreach(s) => {
+                    var i = 0usize;
+                    while i < sources.len(&cx) {
+                        self.kinds.insert(&cx, sources.at(&cx, i), Kind::Any);
+                        open_binders = open_binders.cons(&cx, sources.at(&cx, i));
+                        i = i + 1usize;
+                    }
+                    (false, s.body.copy(&cx))
+                },
+                _ => {
+                    let indirect = match self.shape(&cx, source, f.pos) {
+                        Type::Ptr(_p) => true,
+                        _ => false,
+                    };
+                    let named = C::named(binder, ArenaVec::new(&cx));
+                    (indirect, if indirect { C::ptr(&cx, named) } else { named })
+                },
             },
         };
         self.open_binders.set(&cx, open_binders);

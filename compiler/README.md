@@ -951,6 +951,14 @@ These are the places where Kursal differs from what one might expect.
   variant stays the same while a payload pointer is used. It calls the mapper on the held
   variant's payload only, and needs the sum's shape visible where it is written: `Exposed[*T]`
   never holds for a pointer to a sum, so a generic traversal never reads through its pointer.
+- **A `foreach` over a value of a `foreach` type maps it.** With `v: foreach F of S => B`, `foreach
+  x of v { .. }` gives the body each component of `v`, of type `B` at the component's row, and makes
+  `foreach F of S => R`, `R` the body's type: the same source and pattern, so it needs `Exposed[S]`
+  as a traversal of `S` does. Each component is given to the body exactly once, so a linear one is
+  consumed once, and of a sum only the variant `v` holds. A map reads nothing through a pointer: the
+  value holds its variant, so mapping what `unsafe (foreach f of p { .. })` made of a pointer to a
+  sum needs no `unsafe`. The body is checked for any `F`, so it hands on a part of type `F` rather
+  than dropping it (`examples/foreach_map`).
 - **A `foreach` type's body** binds its own binder and, over a transformed source, that source's
   binders, each the component's: in `foreach F of (foreach G of (u32, u8) => *G) => (F, G)`, `G` is
   `u32` in the first row and `u8` in the second, even where a type parameter `G` is in scope.

@@ -31,7 +31,8 @@ from . import syntax as S
 from .resolve import Decl, ResolveError, Resolver, listed
 from .sigs import InstanceSig, Scope, Sig, Signatures
 from .sexpr import KursError, Position
-from .types import Surface, Types, brand_differences, brand_name, equal, foreach_binders, free_brands, free_names, fresh, made_from, subst
+from .types import (Surface, Types, brand_differences, brand_name, equal, foreach_binders, free_brands, free_names, fresh, made_from,
+                    mapped_component, subst)
 from .termination import check_instance_termination
 from .coherence import check_coherence
 from .unify import Meta, ground, instantiate, match_head, prune, unify, zonk
@@ -1034,11 +1035,16 @@ class Infer:
         return result
 
     def expr_foreach(self, expr: S.Foreach) -> C.Type:
-        source = zonk(self.expr(expr.source))
-        if isinstance(source, Meta):
-            source = self.shape(source, expr.pos)
-        # Through a pointer to a sum the traversal reads the variant, an unsafe read that lowering
-        # authorizes; anything else it traverses needs only the shape.
+        operand = zonk(self.expr(expr.source))
+        if isinstance(operand, Meta):
+            operand = self.shape(operand, expr.pos)
+        # A value of a foreach type is mapped (the map form): the result has its source, binder and
+        # pattern, and each item is a component of the value. Anything else is the source itself.
+        mapped = isinstance(operand, C.Foreach) and not isinstance(operand.source, C.Foreach)
+        source = operand.source if mapped and isinstance(operand, C.Foreach) else operand
+        # Through a pointer to a sum the traversal of the pointer reads the variant, an unsafe read that
+        # lowering authorizes; a mapped value holds its variant, and reads nothing. Anything else it
+        # traverses needs only the shape.
         if not self.types.sum_behind_pointer(source, self.module, self.kinds):
             self.require("Exposed", (source,), expr.pos)
         # Each `foreach` binds a binder of its own, named after the one written, as `F#F12` for `F`.
@@ -1051,7 +1057,11 @@ class Infer:
         self.foreaches[binder] = (expr.name, expr.pos)
         self.kinds[binder] = C.ANY
         outer = self.open_binders
-        if isinstance(source, C.Foreach):     # a transformed source: its items are its body
+        item: C.Type
+        if mapped and isinstance(operand, C.Foreach):
+            indirect, item = operand.indirect, mapped_component(operand, C.Named(binder))
+            self.open_binders = (*outer, binder)
+        elif isinstance(source, C.Foreach):     # a transformed source: its items are its body
             indirect, item = False, source.body
             self.kinds.update({b: C.ANY for b in sources})
             self.open_binders = (*outer, binder, *sources)

@@ -33,7 +33,7 @@ from .core import (ATOMIC_OPS, FLOATS, INTEGERS, POINTER_SIZED, UNIT, WIDTHS, Ar
                    Tuple, Unreachable, Type, Program, Fun, Data, Instr, Edge, Terminator)
 from .check import Checker, overlap, prefix
 from .sexpr import Form, KursError, List, Str
-from .types import foreach_binders, ForeachRow, Types, equal, map_children, subst, subst_foreach
+from .types import foreach_binders, ForeachRow, Types, equal, map_children, mapped_component, mapped_operand, subst, subst_foreach
 from .termination import check_mono_termination
 from .mangle import encode, mangle, path_segments, type_key, unbranded
 from .plan import PURE, Adapter, Plan, instr_reads, root, term_edges, term_reads
@@ -1510,13 +1510,15 @@ class Backend:
             self.line(f"{dst} = __atomic_{kind}({args[0]}, {args[1]}, {C_ORDER[instr.lit]});")
 
     def foreach(self, instr: Instr, dst: Optional[str]) -> None:
-        """Each component of the result is the mapper applied to the source's component: a component
-        of a zero-size type is passed as nothing, and a result component of one is not assigned (the call
-        is still made)."""
+        """Each component of the result is the mapper applied to the source's component, or in the map
+        form to the operand's component at the same row: a component of a zero-size type is passed as
+        nothing, and a result component of one is not assigned (the call is still made)."""
         original = instr.ty
         assert isinstance(original, Foreach)
         t, renamed = subst_foreach(original, self.sub)
-        source = "" if self.erased(self.type_of(instr.args[0])) else self.value_name(instr.args[0])
+        operand = self.type_of(instr.args[0])
+        mapped = mapped_operand(t, operand)
+        source = "" if self.erased(operand) else self.value_name(instr.args[0])
         mapper = self.program.funs[instr.args[1]]
         binders = []
         for name in foreach_binders(original):
@@ -1532,12 +1534,13 @@ class Backend:
                 for c in instr.args[2:] if not self.erased(self.type_of(c))]
         values = [self.value_name(c) for c in instr.args[2:] if not self.erased(self.type_of(c))]
         skeleton, rows = self.types.rows(t.source)
-        pointer = isinstance(self.shape(t.source), Ptr) and not isinstance(t.source, Foreach)
+        pointer = mapped is None and isinstance(self.shape(t.source), Ptr) and not isinstance(t.source, Foreach)
         out_shape = self.shape(t)
 
         def apply(row: ForeachRow, component: str) -> str:
             _, item, extra = row
             bound = self.types.bind(t, item, extra)
+            given = item if mapped is None else mapped_component(mapped, bound[t.binder])
             sub = {p.name: bound[b] for p, b in zip(mapper.params, binders)}
             sub.update(zip((p.name for p in mapper.params[len(binders):]), own))
             symbol = self.request(mapper, sub)
@@ -1547,10 +1550,10 @@ class Backend:
                 self.address_taken.add(symbol)
                 if symbol not in self.thunks:
                     self.thunks[symbol] = allocate(f"{symbol}_value", self.taken)
-                arguments = ([] if not pointer and self.erased(item) else [component]) + values
+                arguments = ([] if not pointer and self.erased(given) else [component]) + values
                 return f"{self.thunks[symbol]}({', '.join(arguments)})"
             passed = f"&{component}" if self.by_ref[symbol][0] else component
-            arguments = ([] if not pointer and self.erased(item) else [passed]) + caps
+            arguments = ([] if not pointer and self.erased(given) else [passed]) + caps
             return f"{symbol}({', '.join(arguments)})"
 
         def assign(target: str, result: Type, call: str) -> str:
@@ -1591,15 +1594,15 @@ class Backend:
         out = [(f"items[{k}]", out_shape.elem) for k in range(len(rows))] if isinstance(out_shape, Array) \
             else self.members(out_shape)
         if skeleton is None:
-            component = f"{source}.e0" if isinstance(t.source, Foreach) else source
+            component = f"{source}.e0" if mapped is not None or isinstance(t.source, Foreach) else source
             self.line(assign(f"{dst}.{out[0][0]}", out[0][1], apply(rows[0], component)))
             return
         if isinstance(skeleton, Array):
             src_access = [f"items[{k}]" for k in range(len(rows))]
         else:
             src_access = [m for m, _ in self.members(skeleton)]
-        if isinstance(t.source, Foreach):
-            inner_shape = self.shape(t.source)
+        if mapped is not None or isinstance(t.source, Foreach):
+            inner_shape = self.shape(operand)
             src_access = ([f"items[{k}]" for k in range(len(rows))] if isinstance(inner_shape, Array)
                           else [m for m, _ in self.members(inner_shape)])
         for row, s_member, (d_member, result) in zip(rows, src_access, out):

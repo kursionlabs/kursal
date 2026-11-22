@@ -6,7 +6,7 @@ from kursal import core as C
 from kursal.check import check_program
 from kursal.cgen import emit_c
 from kursal.formation import Formation
-from kursal.kurs import parse_type
+from kursal.kurs import parse_program, parse_type
 from kursal.sexpr import read
 from kursal.sexpr import KursError
 from kursal.types import Types, equal, foreach_binders, foreach_item, free_names, show, subst
@@ -78,6 +78,56 @@ class ComponentTests(unittest.TestCase):
         program = C.Program(funs={"identity": mapper, "walk": caller})
         output = emit_c(program, check_program(program))
         self.assertRegex(output, r"\.e0 = [A-Za-z_][A-Za-z_0-9]*\([A-Za-z_][A-Za-z_0-9]*\.e0\);")
+
+
+MAPPERS = """
+    (type L! (struct (n u32)))
+    (type Opt (enum (none (tuple)) (some u8)))
+    (fun wrap (forall (F) () (tuple F u8) (F)
+      (entry ((%x F)) (= %z (const u8 0)) (= %t (construct (tuple F u8) %x %z)) (ret %t))))
+    (fun unwrap (forall (F) () F ((tuple F u8))
+      (entry ((%t (tuple F u8))) (= (%x %z) (destruct %t (tuple F u8))) (ret %x))))
+    (fun keep (forall (F) () (tuple (ptr F)) ((ptr F))
+      (entry ((%p (ptr F))) (= %t (construct (tuple (ptr F)) %p)) (ret %t))))
+    (fun pair (forall (F G) () (tuple F u8) (F)
+      (entry ((%x F)) (= %z (const u8 0)) (= %t (construct (tuple F u8) %x %z)) (ret %t))))
+"""
+
+
+class MapFormTests(unittest.TestCase):
+    """A traversal of a value of a foreach type over the same source and pattern maps its components."""
+
+    def test_a_map_takes_each_component_of_the_value(self):
+        check_program(parse_program(MAPPERS + """
+            (fun f (foreach (G (tuple L! u32)) G) ((tuple L! u32))
+              (entry ((%s (tuple L! u32)))
+                (= %w (foreach (foreach (F (tuple L! u32)) (tuple F u8)) %s wrap))
+                (= %u (foreach (foreach (G (tuple L! u32)) G) %w unwrap))
+                (ret %u)))"""))
+
+    def test_a_map_of_a_pointer_to_a_sum_reads_nothing(self):
+        # The value holds its variant: no unsafe marker, unlike the traversal of the pointer itself.
+        check_program(parse_program(MAPPERS + """
+            (fun f (foreach ((ptr F) (ptr Opt)) (tuple (ptr F))) ((foreach ((ptr F) (ptr Opt)) (ptr F)))
+              (entry ((%v (foreach ((ptr F) (ptr Opt)) (ptr F))))
+                (= %out (foreach (foreach ((ptr F) (ptr Opt)) (tuple (ptr F))) %v keep))
+                (ret %out)))"""))
+
+    def test_a_map_keeps_the_source_and_pattern(self):
+        for name, (error, operand, written, mapper) in {
+            "another source": ("foreach_source", "(foreach (F (tuple u32 u8)) (tuple F u8))",
+                               "(foreach (F (tuple u32 u16)) F)", "unwrap"),
+            "another pattern": ("foreach_source", "(foreach (F (ptr (tuple u32))) (tuple F u8))",
+                                "(foreach ((ptr F) (ptr (tuple u32))) F)", "unwrap"),
+            "the row item for the component": ("mapper_does_map", "(foreach (F (tuple u32 u8)) (tuple F u8))",
+                                               "(foreach (F (tuple u32 u8)) (tuple F u8))", "wrap"),
+            "a second binder": ("wrong number of type arguments", "(foreach (F (tuple u32 u8)) F)",
+                                "(foreach (F (tuple u32 u8)) (tuple F u8))", "pair"),
+        }.items():
+            with self.subTest(case=name), self.assertRaisesRegex(KursError, error):
+                check_program(parse_program(MAPPERS + f"""
+                    (fun f {written} ({operand})
+                      (entry ((%v {operand})) (= %out (foreach {written} %v {mapper})) (ret %out)))"""))
 
 
 class RetainedScopeTests(unittest.TestCase):

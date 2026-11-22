@@ -10,7 +10,7 @@ from .core import (ATOMIC_OPS, UNSAFE_OPS, BOOL, BRAND, COPY, FLOATS, INTEGERS, 
                    Foreach, Ignored, Jmp, Jnz, Named, Never, NonNull, Prim, Ptr, Ret, Skolem, Struct, Switch, Tuple,
                    Unreachable, Type, Kind, Program, Fun, Instance, Param, Premise, Block, Instr, Terminator, Edge, ModuleId)
 from .sexpr import Form, KursError, List, Position, Str
-from .types import Kinds, children, foreach_binders, foreach_item, Types, equal, fits, free_brands, fresh, subst
+from .types import Kinds, children, foreach_binders, foreach_item, mapped_component, mapped_operand, Types, equal, fits, free_brands, fresh, subst
 from .termination import check_instance_termination
 from .formation import Formation
 from .layout import check_type_expansion
@@ -987,10 +987,16 @@ class Checker:
         if not isinstance(t, Foreach):
             self.fail("foreach_builds_foreach_type")
         got = self.use(instr.args[0])
-        if not equal(got, t.source):
+        # The operand is the source, or (the map form) a value of a foreach type over the same source with
+        # the same pattern, whose components are the mapper's inputs.
+        mapped = mapped_operand(t, got)
+        if mapped is None and not equal(got, t.source) or mapped is not None and (
+                mapped.indirect != t.indirect or not equal(mapped.source, t.source) or isinstance(mapped.source, Foreach)):
             self.fail("foreach_source")
         if self.types.sum_behind_pointer(t.source, self.module, self.kinds):
-            self.authorize(instr, True)
+            # A traversal of the pointer reads the variant there; a mapped value holds its own.
+            if mapped is None:
+                self.authorize(instr, True)
         elif not self.holds("Exposed", (t.source,)):
             self.fail("foreach_source_not_exposed")
         mapper = self.program.funs.get(instr.args[1])
@@ -1019,7 +1025,7 @@ class Checker:
                              tuple(sub[param.name] for param in mapper.params), mapper.name)
         finally:
             self.kinds = saved_kinds
-        item = subst(foreach_item(t), rigid)
+        item = subst(foreach_item(t), rigid) if mapped is None else mapped_component(mapped, rigid[t.binder])
         ptypes = [subst(p, sub) for p in mapper.ptypes]
         if not ptypes or not equal(ptypes[0], item) or not equal(subst(mapper.ret, sub), subst(t.body, rigid)):
             self.fail("mapper_does_map")

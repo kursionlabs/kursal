@@ -152,6 +152,7 @@ RUNS: dict[str, tuple[tuple, ...]] = {
                                 "Candidate 3 disqualified, had 2 votes\n"
                                 "Candidate 3 confirmed removed -- 0 candidates found (expected 0): 0\n"
                                 "Total distinct candidates on file: 33\n", 0),),
+    "foreach_map": (((), "", "", 0),),
     "foreach_sum_pointers": (((), "", "", 0),),
     "format_strings": (((), "", "", 0),),
     "format_trait": (((), "", "point: (3, 4)\ncolor: rgb(255, 128, 0)\n", 0),),

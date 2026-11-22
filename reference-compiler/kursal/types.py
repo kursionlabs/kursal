@@ -93,6 +93,19 @@ def foreach_item(ty: Foreach) -> Type:
     return Ptr(Named(ty.binder)) if ty.indirect else Named(ty.binder)
 
 
+def mapped_operand(ty: Foreach, operand: Type) -> Optional[Foreach]:
+    """The operand of a traversal that builds `ty`, when it is mapped (the map form): a value of a
+    foreach type, whose components are the mapper's inputs. None where the operand is the source."""
+    if not isinstance(operand, Foreach) or equal(operand, ty.source):
+        return None
+    return operand
+
+
+def mapped_component(operand: Foreach, binding: Type) -> Type:
+    """The type of a mapped operand's component whose row binds the binder to `binding`."""
+    return subst(operand.body, {operand.binder: binding})
+
+
 def subst_foreach(ty: Foreach, sub: Substitution,
                   avoid: Set[str] = frozenset()) -> tuple[Foreach, dict[str, Type]]:
     """`ty` under `sub`, and the renamings of its binders (its own and those it retains).

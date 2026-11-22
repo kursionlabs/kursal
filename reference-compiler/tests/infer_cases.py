@@ -192,6 +192,10 @@ INFERENCES = (
     # A function value keeps its brand quantified beside the caller's brand of the same name.
     KEPT_BRAND + "forall 'b. fn h(w: core::cap::Brand['b]) -> forall 'c. fn(core::cap::Brand['c], u32) -> u32 {\n"
     "    let f = g;\n    let n = f(w, 1u32);\n    f\n}\n",
+    # A map's binder may be named as the binder of the value it maps, which binds nothing in its body.
+    "exposed struct S { a: u32, b: u32 }\nfn main() -> i32 {\n    let s = S.{ a: 7u32, b: 9u32 };\n"
+    "    let t = foreach a: A of s { (a, 1u8) };\n    let u = foreach b: A of t { let (c, n) = b; let d: A = c; d };\n"
+    "    let { a: x, b: y } = u;\n    (x + y) as i32\n}\n",
     # `Sized` of a concrete type of non-zero size, and of a parameter under the caller's own premise.
     "forall T where Sized[T]. fn need(x: T) -> T { x }\nstruct P { a: (), b: u8 }\n"
     "fn concrete(p: P, q: *()) -> *() { let r = need(p); need(q) }\n"
@@ -403,15 +407,12 @@ INFER_ERRORS = (
      "    let second = foreach g: F of p {\n        let { a: x, b: y } = first;\n        let (k, o) = x;\n"
      "        (same(o, core::option::Option::Some(g)), y)\n    };\n    0i32\n}\n",
      "8:18: the type of foreach item g escapes its lexical scope"),
-    # A binder never shadows a type parameter, an enclosing binder or a binder of its source.
+    # A binder never shadows a type parameter or an enclosing binder.
     ("exposed struct S { a: u32, b: u32 }\nforall F. fn f(x: F, s: S) -> F {\n    let t = foreach f: F of s { f };\n    x\n}\n",
      "3:13: foreach binder F shadows another type named F"),
     ("exposed struct S { a: u32, b: u32 }\nfn main() -> i32 {\n    let s = S.{ a: 7u32, b: 9u32 };\n"
      "    let t = foreach f: F of s {\n        let u = foreach g: F of s { g };\n        f\n    };\n    0i32\n}\n",
      "5:17: foreach binder F shadows another type named F"),
-    ("exposed struct S { a: u32, b: u32 }\nfn main() -> i32 {\n    let s = S.{ a: 7u32, b: 9u32 };\n"
-     "    let t = foreach a: A of s { a };\n    let u = foreach b: A of t { b };\n    0i32\n}\n",
-     "5:13: foreach binder A shadows another type named A"),
     # `Sized` holds of a parameter only by the caller's own premise for exactly it, and never of a
     # zero-size type.
     ("forall T where Sized[T]. fn need(x: T) -> T { x }\nforall U. fn bad(x: U) -> U { need[U](x) }\n",
