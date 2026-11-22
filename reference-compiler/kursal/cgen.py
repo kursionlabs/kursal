@@ -33,7 +33,7 @@ from .core import (ATOMIC_OPS, FLOATS, INTEGERS, POINTER_SIZED, UNIT, WIDTHS, Ar
                    Tuple, Unreachable, Type, Program, Fun, Data, Instr, Edge, Terminator)
 from .check import Checker, overlap, prefix
 from .sexpr import Form, KursError, List, Str
-from .types import foreach_binders, ForeachRow, Types, equal, map_children, mapped_component, mapped_operand, subst, subst_foreach
+from .types import ForeachRow, Types, equal, map_children, mapped_component, mapped_operand, subst
 from .termination import check_mono_termination
 from .mangle import encode, mangle, path_segments, type_key, unbranded
 from .plan import PURE, Adapter, Plan, instr_reads, root, term_edges, term_reads
@@ -1513,20 +1513,14 @@ class Backend:
         """Each component of the result is the mapper applied to the source's component, or in the map
         form to the operand's component at the same row: a component of a zero-size type is passed as
         nothing, and a result component of one is not assigned (the call is still made)."""
-        original = instr.ty
-        assert isinstance(original, Foreach)
-        t, renamed = subst_foreach(original, self.sub)
+        t = self.substitute_type(instr.ty) if instr.ty is not None else None
+        assert isinstance(t, Foreach)
         operand = self.type_of(instr.args[0])
-        mapped = mapped_operand(t, operand)
+        mapped = mapped_operand(operand)
         source = "" if self.erased(operand) else self.value_name(instr.args[0])
         mapper = self.program.funs[instr.args[1]]
-        binders = []
-        for name in foreach_binders(original):
-            binder = renamed.get(name, Named(name))
-            assert isinstance(binder, Named) and not binder.args
-            binders.append(binder.name)
         own = [self.substitute_type(x) for x in instr.tys]
-        if len(mapper.params) != len(binders) + len(own):
+        if len(mapper.params) != 1 + len(own):
             raise KursError("foreach mapper parameter partition disagrees", instr.pos)
         # A captured value the mapper takes by pointer (an aggregate of more than four words, as `by_ref`
         # decides for its parameter of that type) is passed by its address.
@@ -1534,15 +1528,14 @@ class Backend:
                 for c in instr.args[2:] if not self.erased(self.type_of(c))]
         values = [self.value_name(c) for c in instr.args[2:] if not self.erased(self.type_of(c))]
         skeleton, rows = self.types.rows(t.source)
-        pointer = mapped is None and isinstance(self.shape(t.source), Ptr) and not isinstance(t.source, Foreach)
+        pointer = mapped is None and isinstance(self.shape(t.source), Ptr)
         out_shape = self.shape(t)
 
         def apply(row: ForeachRow, component: str) -> str:
-            _, item, extra = row
-            bound = self.types.bind(t, item, extra)
-            given = item if mapped is None else mapped_component(mapped, bound[t.binder])
-            sub = {p.name: bound[b] for p, b in zip(mapper.params, binders)}
-            sub.update(zip((p.name for p in mapper.params[len(binders):]), own))
+            _, item = row
+            bound = self.types.binding(t, item)
+            given = item if mapped is None else mapped_component(mapped, bound)
+            sub = {mapper.params[0].name: bound, **dict(zip((p.name for p in mapper.params[1:]), own))}
             symbol = self.request(mapper, sub)
             if self.outs[symbol]:
                 # A mapper writing elements of its result through out pointers is called through its by-value
@@ -1561,11 +1554,10 @@ class Backend:
 
         if isinstance(skeleton, Enum):
             assert isinstance(out_shape, Enum) and dst is not None
-            source_type = self.type_of(instr.args[0])
             if pointer:
                 # Through a pointer the variant is read there, and each payload is passed by its
                 # address: the pointer to the whole for a zero-size payload or the niche layout's.
-                sum_type = self.shape(source_type)
+                sum_type = self.shape(operand)
                 assert isinstance(sum_type, Ptr)
                 held = self.tag(f"(*{source})", sum_type.inner)
                 niche = self.niche_layout(sum_type.inner) is not None
@@ -1576,10 +1568,10 @@ class Backend:
                         return f"(void*){source}"
                     return f"KUR_FIELD({source}, payload.{self.variant(row[0])})"
             else:
-                held = self.tag(source, source_type)
+                held = self.tag(source, operand)
 
                 def payload_at(row: ForeachRow) -> str:
-                    return self.payload(source, source_type, row[0])
+                    return self.payload(source, operand, row[0])
             self.line(f"switch ({held}) {{")
             for k, (row, (_, result)) in enumerate(zip(rows, out_shape.variants)):
                 call = apply(row, payload_at(row))
@@ -1594,17 +1586,14 @@ class Backend:
         out = [(f"items[{k}]", out_shape.elem) for k in range(len(rows))] if isinstance(out_shape, Array) \
             else self.members(out_shape)
         if skeleton is None:
-            component = f"{source}.e0" if mapped is not None or isinstance(t.source, Foreach) else source
+            # A mapped operand of a leaf source is a one-component tuple.
+            component = f"{source}.e0" if mapped is not None else source
             self.line(assign(f"{dst}.{out[0][0]}", out[0][1], apply(rows[0], component)))
             return
-        if isinstance(skeleton, Array):
-            src_access = [f"items[{k}]" for k in range(len(rows))]
-        else:
-            src_access = [m for m, _ in self.members(skeleton)]
-        if mapped is not None or isinstance(t.source, Foreach):
-            inner_shape = self.shape(operand)
-            src_access = ([f"items[{k}]" for k in range(len(rows))] if isinstance(inner_shape, Array)
-                          else [m for m, _ in self.members(inner_shape)])
+        # A mapped operand is a value of its expansion, with its own members; a source's are the skeleton's.
+        accessed = self.shape(operand) if mapped is not None else skeleton
+        src_access = ([f"items[{k}]" for k in range(len(rows))] if isinstance(accessed, Array)
+                      else [m for m, _ in self.members(accessed)])
         for row, s_member, (d_member, result) in zip(rows, src_access, out):
             # A pointer to a zero-size component is the pointer to the whole, as `destruct` makes it.
             if pointer:

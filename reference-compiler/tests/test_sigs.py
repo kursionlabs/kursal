@@ -44,20 +44,20 @@ class TypeDeclTests(unittest.TestCase):
             with self.subTest(source=source), self.assertRaisesRegex(SigError, message):
                 sigs_of(lin + source)
 
-    def test_a_foreach_over_a_fixed_source_is_copy_when_its_expansion_is(self):
-        lin = "struct L! { x: u32 }\n"
-        s = sigs_of(lin + "struct F { f: foreach F of (u32, u8) => *F }\nstruct P { p: foreach X of (u32, L!) => *X }\n"
-                    "forall T. struct Q { q: foreach X of (T, [L!; 0]) => X }\n"
-                    "forall T where Exposed[T]. struct G! { g: foreach X of T => *X }\n")
-        self.assertFalse(s.types["p::F"].linear)
-        cases = (
-            ("struct F { f: foreach X of (u32, L!) => X }\n", "2:8: struct F holds a linear type in its field f; declare it F!"),
-            ("forall T where Exposed[T]. struct G { g: foreach X of T => *X }\n",
-             "2:35: struct G holds a linear type in its field g whatever its type arguments; declare it G!"),
-        )
-        for source, message in cases:
-            with self.subTest(source=source), self.assertRaisesRegex(SigError, message):
-                sigs_of(lin + source)
+    def test_a_foreach_type_is_no_component(self):
+        # A foreach type is the type of a whole value, parameter or result (TY-FLAT).
+        for source, what in (
+            ("struct F { f: foreach F of (u32, u8) => *F }\n", "a component"),
+            ("tuple P(foreach X of (u32,) => X, u8);\n", "a component"),
+            ("enum E { A(foreach X of (u32,) => X) }\n", "a component"),
+            ("fn f(p: *foreach X of (u32,) => X) {}\n", "a pointee"),
+            ("forall T. struct B { b: *T }\nfn f(b: B[foreach X of (u32,) => X]) {}\n", "a type argument"),
+            ("fn f(x: foreach X of (foreach Y of (u32,) => Y) => X) {}\n", "a foreach source"),
+            ("fn f(x: foreach X of (u32,) => foreach Y of (X,) => Y) {}\n", "a foreach body"),
+            ("forall T where Exposed[foreach X of T => X]. fn f(x: T) {}\n", "a type argument"),
+        ):
+            with self.subTest(source=source), self.assertRaisesRegex(SigError, f"{what} is a foreach type"):
+                sigs_of(source)
 
     def test_struct_enum_tuple(self):
         s = sigs_of("forall T, 'k where Copy[T]. struct Box! { v: T, b: core::cap::Brand['k] }\n"

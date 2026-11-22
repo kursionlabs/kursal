@@ -341,28 +341,30 @@ REJECTED = {
             (= %z (const u64 0)) (= %s (construct (tuple u64) %z))
             (= %r (foreach (foreach (G (tuple u64)) u32) %s m)) (ret %r))))"""),
 
-    # A source binder a transform does not retain binds nothing in its body: the body's F is f's type
-    # parameter, which a call substitutes, so f[*u8] takes a row (u32, *u8), not transmute's (u32, F).
-    "unretained_source_binder_is_substituted": ("argument_expected", """
-        (fun f (forall (F) () F ((foreach (G (foreach (F (tuple u32)) F)) (tuple G F) (retain)))
-          (entry ((%v (foreach (G (foreach (F (tuple u32)) F)) (tuple G F) (retain))))
-            (= %row (destruct %v (foreach (G (foreach (F (tuple u32)) F)) (tuple G F) (retain))))
-            (= (%n %x) (destruct %row (tuple u32 F))) (ret %x))))
-        (fun transmute (forall (F) () (ptr u8) (F)
-          (entry ((%x F))
-            (= %n (const u32 0)) (= %row (construct (tuple u32 F) %n %x))
-            (= %v (construct (foreach (G (foreach (F (tuple u32)) F)) (tuple G F) (retain)) %row))
-            (= %p (call (f (ptr u8)) %v)) (ret %p))))"""),
-    "unretained_source_binder_is_substituted_renamed": ("argument_expected", """
-        (fun f (forall (F) () F ((foreach (G (foreach (H (tuple u32)) H)) (tuple G F) (retain)))
-          (entry ((%v (foreach (G (foreach (H (tuple u32)) H)) (tuple G F) (retain))))
-            (= %row (destruct %v (foreach (G (foreach (H (tuple u32)) H)) (tuple G F) (retain))))
-            (= (%n %x) (destruct %row (tuple u32 F))) (ret %x))))
-        (fun transmute (forall (F) () (ptr u8) (F)
-          (entry ((%x F))
-            (= %n (const u32 0)) (= %row (construct (tuple u32 F) %n %x))
-            (= %v (construct (foreach (G (foreach (H (tuple u32)) H)) (tuple G F) (retain)) %row))
-            (= %p (call (f (ptr u8)) %v)) (ret %p))))"""),
+    # A foreach type is flat (TY-FLAT): a whole value's type, a function's parameter or result, or a
+    # declaration's body, never anywhere else, a declaration whose body is one included.
+    "foreach_source_is_a_foreach": ("a foreach source expands to a foreach type", """
+        (fun f usize () (entry () (= %n (sizeof (foreach (G (foreach (F (tuple u32)) F)) G))) (ret %n)))"""),
+    "foreach_body_is_a_foreach": ("a foreach body expands to a foreach type", """
+        (fun f usize () (entry () (= %n (sizeof (foreach (G (tuple u32)) (foreach (F (tuple G)) F)))) (ret %n)))"""),
+    "foreach_component": ("a component expands to a foreach type", """
+        (fun f usize () (entry () (= %n (sizeof (tuple (foreach (F (tuple u32)) F) u8))) (ret %n)))"""),
+    "foreach_field_through_a_declaration": ("a component expands to a foreach type in type P", """
+        (type W (foreach (F (tuple u32)) F))
+        (type P (struct (w W)))"""),
+    "foreach_pointee": ("a pointee expands to a foreach type", """
+        (fun f usize () (entry () (= %n (sizeof (ptr (foreach (F (tuple u32)) F)))) (ret %n)))"""),
+    "foreach_package_body": ("a package body expands to a foreach type", """
+        (fun f usize () (entry () (= %n (sizeof (exists ($k) (foreach (F (tuple (brand $k))) F)))) (ret %n)))"""),
+    "foreach_type_argument": ("a type argument expands to a foreach type", """
+        (type W (foreach (F (tuple u32)) F))
+        (fun id (forall (T) () T (T) (entry ((%x T)) (ret %x))))
+        (fun f W (W) (entry ((%w W)) (= %v (call (id W) %w)) (ret %v)))"""),
+    "foreach_premise_argument": ("a type argument expands to a foreach type", """
+        (fun f (forall (T) ((Exposed (foreach (F T) F))) u32 () (entry () (= %r (const u32 0)) (ret %r))))"""),
+    "foreach_stack_slot": ("a pointee expands to a foreach type", """
+        (fun (unsafe) f u32 () (entry ()
+          (= %p (alloca (foreach (F (tuple u32)) F))) (= %r (const u32 0)) (ret %r)))"""),
 
     # A zero-size type is erased: an unsafe cast has no representation of one to reinterpret, and C has
     # no zero-size parameter or object for an extern. Its loads and stores are accepted (test_zero_size).
@@ -521,6 +523,11 @@ class CoreSoundnessTests(unittest.TestCase):
                    (= %r (foreach (foreach (G (tuple u64)) (tuple G F)) %s (m F) %c))
                    (= %row (destruct %r (foreach (G (tuple u64)) (tuple G F))))
                    (= (%a %b) (destruct %row (tuple u64 F))) (ret %b))))""",
+            # A foreach type as a declaration's body, a function's parameter and result, and a parameter
+            # of a function type.
+            """(type W (foreach (F (tuple u32 u8)) (tuple F)))
+               (fun keep W (W (fn ((foreach (F (tuple u8)) F)) W))
+                 (entry ((%w W) (%g (fn ((foreach (F (tuple u8)) F)) W))) (ret %w)))""",
             # `Sized` of a concrete type of non-zero size, a zero-size field included, and of a type
             # parameter under the caller's own premise.
             """(type P (struct (a (tuple)) (b u8)))

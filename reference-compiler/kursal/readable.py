@@ -66,9 +66,7 @@ def type_text(ty: C.Type, depth: int = 0) -> str:
         case C.Exists(binders=binders, body=body):
             return "exists " + ", ".join(map(brand, binders)) + ". " + type_text(body, depth)
         case C.Foreach(binder=binder, indirect=indirect, source=source, body=body):
-            inferred = (source.binder, *(source.retained or ())) if isinstance(source, C.Foreach) else ()
-            retained = "" if ty.retained == inferred else " retain (" + ", ".join(ty.retained or ()) + ")"
-            return f"foreach {'*' if indirect else ''}{binder}{retained} of {type_text(source, depth)} => {type_text(body, depth)}"
+            return f"foreach {'*' if indirect else ''}{binder} of {type_text(source, depth)} => {type_text(body, depth)}"
         case C.Fn(params=params, ret=ret, forall=forall, unsafe=unsafe, places=places):
             modes = ", ".join(("&" if index in places else "") + type_text(param, depth) for index, param in enumerate(params))
             return quantifier(forall, ()) + ("unsafe " if unsafe else "") + f"fn({modes}) -> {type_text(ret, depth)}"

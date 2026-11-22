@@ -15,7 +15,7 @@ from typing import NoReturn, Optional
 from . import core as C
 from .sexpr import KursError, Position, located
 from .termination import Key, components
-from .types import children, equal, foreach_binders, free_brands, free_names, subst
+from .types import children, equal, free_brands, free_names, subst
 
 
 def check_type_expansion(program: C.Program, places: Optional[Mapping[str, tuple[str, Optional[Position]]]] = None) -> None:
@@ -37,9 +37,8 @@ def check_type_expansion(program: C.Program, places: Optional[Mapping[str, tuple
                     collect(owner, arg, bound, params, derived)
             case C.Foreach(binder=binder, source=source, body=body):
                 collect(owner, source, bound, params, derived)
-                binders = set(foreach_binders(ty))
-                tainted = binders if free_names(source) & (params | derived) else set()
-                collect(owner, body, bound | binders, params - binders, (derived - binders) | tainted)
+                tainted = {binder} if free_names(source) & (params | derived) else set()
+                collect(owner, body, bound | {binder}, params - {binder}, (derived - {binder}) | tainted)
             case _:
                 for child in children(ty):
                     collect(owner, child, bound, params, derived)
@@ -94,18 +93,7 @@ def check_type_expansion(program: C.Program, places: Optional[Mapping[str, tuple
         found = unfold(ty, bound) if isinstance(ty, C.Named) else expand(ty, bound)
         return None if found is None else outer(found, bound)
 
-    def rows(source: C.Type, bound: set[str]) -> Optional[tuple[Optional[C.Type], list[tuple[str, C.Type, dict[str, C.Type]]]]]:
-        if isinstance(source, C.Foreach):
-            inner = rows(source.source, bound)
-            if inner is None:
-                return None
-            mapped = []
-            for label, item, extra in inner[1]:
-                sub = bind(source, item, extra)
-                if sub is None:
-                    return None
-                mapped.append((label, subst(source.body, sub), sub))
-            return inner[0], mapped
+    def rows(source: C.Type, bound: set[str]) -> Optional[tuple[Optional[C.Type], list[tuple[str, C.Type]]]]:
         s = outer(source, bound)
         if s is None:
             return None
@@ -116,20 +104,19 @@ def check_type_expansion(program: C.Program, places: Optional[Mapping[str, tuple
                 return None
         match s:
             case C.Struct(fields=fields):
-                return s, [(n, wrap(f), {}) for n, f in fields]
+                return s, [(n, wrap(f)) for n, f in fields]
             case C.Tuple(elems=elems):
-                return s, [(str(i), wrap(e), {}) for i, e in enumerate(elems)]
+                return s, [(str(i), wrap(e)) for i, e in enumerate(elems)]
             case C.Array(elem=elem):
-                return s, [("0", wrap(elem), {})]
+                return s, [("0", wrap(elem))]
             case C.Enum(variants=variants):
-                return s, [(n, f, {}) for n, f in variants]
-        return None, [("0", source, {})]
+                return s, [(n, f) for n, f in variants]
+        return None, [("0", source)]
 
-    def bind(ty: C.Foreach, item: C.Type, extra: dict[str, C.Type]) -> Optional[dict[str, C.Type]]:
-        retained = {name: extra[name] for name in (ty.retained or ()) if name in extra}
+    def binding(ty: C.Foreach, item: C.Type) -> Optional[C.Type]:
         if not ty.indirect:
-            return {**retained, ty.binder: item}
-        return {**retained, ty.binder: item.inner} if isinstance(item, C.Ptr) else None
+            return item
+        return item.inner if isinstance(item, C.Ptr) else None
 
     def expand(ty: C.Foreach, bound: set[str]) -> Optional[C.Type]:
         found = rows(ty.source, bound)
@@ -137,11 +124,11 @@ def check_type_expansion(program: C.Program, places: Optional[Mapping[str, tuple
             return None
         skeleton, items = found
         mapped = []
-        for label, item, extra in items:
-            sub = bind(ty, item, extra)
-            if sub is None:
+        for label, item in items:
+            bind = binding(ty, item)
+            if bind is None:
                 return None
-            mapped.append((label, subst(ty.body, sub)))
+            mapped.append((label, subst(ty.body, {ty.binder: bind})))
         match skeleton:
             case C.Struct():
                 return C.Struct(tuple(mapped))
@@ -168,10 +155,10 @@ def check_type_expansion(program: C.Program, places: Optional[Mapping[str, tuple
             expanded = expand(ty, bound)
             if expanded is None:
                 # Opaque here; every use walks the expansion at its type arguments.
-                walk(owner, ty.body, active, bound | set(foreach_binders(ty)), aliases)
+                walk(owner, ty.body, active, bound | {ty.binder}, aliases)
                 return
-            # A component may hold this foreach again by value, unfolding no name on the way
-            # (`struct T { f: foreach *F of *T => F }`): it is active like a name.
+            # A component may hold this foreach again by value, unfolding no name on the way: it is
+            # active like a name.
             current = key(ty)
             if any(equal(current, prior) for prior in active):
                 fail(owner, f"type {owner}: infinite by-value layout")
@@ -191,12 +178,12 @@ def check_type_expansion(program: C.Program, places: Optional[Mapping[str, tuple
     def represent(owner: str, ty: C.Type, active: tuple[C.Type, ...], bound: set[str]) -> None:
         """The C representation key (`cgen.erase`) keeps names and expands every foreach, behind
         pointers and functions too: a foreach whose expansion reaches it again before a name has none
-        (`struct T { f: foreach *F of *T => *F }`)."""
+        (`struct T { f: fn(foreach *F of *T => *F) -> u32 }`)."""
         if isinstance(ty, C.Foreach):
             shape(owner, ty.source, (), bound)
             expanded = expand(ty, bound)
             if expanded is None:
-                represent(owner, ty.body, active, bound | set(foreach_binders(ty)))
+                represent(owner, ty.body, active, bound | {ty.binder})
                 return
             current = key(ty)
             if any(equal(current, prior) for prior in active):

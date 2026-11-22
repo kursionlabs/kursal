@@ -1134,20 +1134,14 @@ SIGNATURES = (
     "forall T. impl P[T, 'static] { fn get(self, f: closure(u32) -> u32, g: closure[u8](&_: u32) -> u32) -> u32 { 0u32 } }\n"
     "forall T where Copy[T]. fn pair(x: T, h: unsafe fn(&_: T) -> !, k: forall 'q. fn(core::cap::Brand['q]) -> u32) -> (T, T) { (x, x) }\n"
     "extern \"C\" fn puts(s: *u8) -> i32;\nenum E { A, B(u32), C(u8, u16) }\ntuple Pt(u32, i64);\n"
-    "struct F { f: foreach F of (u32, u8) => *F }\nfn h(g: fn(closure(u32) -> u32) -> u32, k: closure(u8) -> u8) -> u32 { 0u32 }\n",
+    "fn h(g: fn(closure(u32) -> u32) -> u32, k: closure(u8) -> u8) -> u32 { 0u32 }\n",
     # A generic declaration linear only through its arguments has no `!`; one with a `!` is linear even
     # when every field is Copy.
     "forall T. enum Opt { None, Some(T) }\nstruct L! { x: u32 }\nstruct H! { o: Opt[L!], p: *L! }\n"
     "forall 'k. struct Cap! {}\nforall T. struct W { w: Opt[T] }\nfn f(o: Opt[L!], w: W[u32]) -> Opt[L!] { o }\n",
-    # A foreach over a source of fixed shape is Copy when its expansion is; over a parameter, only when
-    # its body does not mention the binder.
-    "struct L! { x: u32 }\nstruct P { p: foreach X of (u32, L!) => *X }\nforall T. struct Q { q: foreach X of (T, [L!; 0]) => X }\n"
-    "forall T where Exposed[T]. struct G! { g: foreach X of T => *X }\nforall T where Exposed[T]. struct K { k: foreach X of T => u8 }\n",
-    # A foreach over a pointer to a recursive type has the pointee's fields: here *L and u32, finite.
-    "struct L { next: *L, v: u32 }\nstruct M { f: foreach *F of *L => F }\n",
-    # A foreach over a transformed source binds the source's binders in its body too, as its core
-    # transform retains them.
-    "struct N { f: foreach F of (foreach G of (u32, u8) => *G) => (F, G) }\n",
+    # A foreach type is a whole parameter's or result's type, in a function type's too.
+    "struct L { next: *L, v: u32 }\nfn m(f: foreach *F of *L => F) -> foreach *F of *L => F { f }\n"
+    "forall T where Exposed[T]. fn g(x: foreach X of T => *X, k: fn(foreach X of (u32, u8) => X) -> u32) -> u32 { 0u32 }\n",
 )
 
 SIGNATURE_ERRORS = (
@@ -1222,8 +1216,6 @@ SIGNATURE_ERRORS = (
     "struct L! { x: u32 }\nforall 'k. enum E { A, B(L!, core::cap::Brand['k]) }\n",
     "struct L! { x: u32 }\ntuple P(u32, (L!, u8));\n",
     "forall T. enum Opt { None, Some(T) }\nstruct L! { x: u32 }\nstruct S { o: Opt[L!] }\n",
-    "struct L! { x: u32 }\nstruct F { f: foreach X of (u32, L!) => X }\n",
-    "forall T where Exposed[T]. struct G { g: foreach X of T => *X }\n",
     "struct S { a: (u32, [u8; 1u8 - 2u8 > 0u8]) }\n",
     # Errors at the type that has them, and a declaration's at its name, naming what holds the linear type.
     "struct L! { x: u32 }\nexposed struct S {\n    a: u32,\n    l: L!,\n}\n",
@@ -1235,13 +1227,16 @@ SIGNATURE_ERRORS = (
     "forall T. struct B { a: T }\nfn f(b: B[u32, u8]) {}\n",
     "trait Show { fn show(x: Self) -> u32; }\nforall T where Show[T, T]. fn f(x: T) {}\n",
     "forall T. struct R { r: R[(T, T)] }\n",
-    # A foreach whose components hold it again by value, directly, through a type argument, or through
-    # a foreach source: no finite layout.
+    # A foreach type is flat: no component, pointee, type argument, or foreach source or body.
     "struct T { f: foreach *F of *T => F }\n",
-    "forall P. struct S! { f: foreach *F of *P => F }\nstruct W! { s: S![W!] }\n",
-    "struct T { f: foreach F of (foreach *G of *T => G) => F }\n",
-    # Behind a pointer the layout is finite, but C names the field by its expansion, which never ends.
-    "struct T { f: foreach *F of *T => *F }\n",
+    "tuple P(u32, foreach X of (u32,) => X);\n",
+    "enum E { A(foreach X of (u32,) => X), B }\n",
+    "fn f(p: *foreach X of (u32,) => X) {}\n",
+    "forall T. struct B { b: *T }\nfn f(b: B[foreach X of (u32,) => X]) {}\n",
+    "forall T where Exposed[foreach X of T => X]. fn f(x: T) {}\n",
+    "fn f(x: foreach X of (foreach Y of (u32,) => Y) => X) {}\n",
+    "fn f(x: foreach X of (u32,) => foreach Y of (X,) => Y) {}\n",
+    "fn f(x: exists 'k. foreach X of (core::cap::Brand['k],) => X) {}\n",
 )
 
 SYNTAX_ERRORS = (
@@ -1474,21 +1469,17 @@ TYPE_CASES = (
     # show
     "(show (tuple))",
     "(show (tuple (struct) (enum (A u32)) (exists ($a $b) (brand $a)) (array u8 3)))",
-    "(show (foreach (F (foreach (G (tuple u8 u16)) (ptr G))) (tuple F G)))",
-    "(show (foreach (F (foreach (G (tuple u8)) G)) F (retain)))",
-    "(show (foreach ((ptr F) (ptr (tuple u8))) F (retain X Y)))",
+    "(show (foreach (F (tuple u8 u16)) (tuple F (ptr F))))",
+    "(show (foreach ((ptr F) (ptr (tuple u8))) F))",
     "(show (fn (unsafe) (forall ($a) () ! ((Pair u32 $a) _))))",
-    # subst: capture avoidance, numbering, foreach retained binders
+    # subst: capture avoidance, numbering, a foreach binder
     "(subst (exists ($a) (tuple $a $b)) ((b $a)))",
     "(subst (fn (forall ($a) () $b ($a))) ((b $a)))",
     "(subst (tuple (exists ($a) (tuple $a $b)) (exists ($a#7) (tuple $a#7 $b))) ((b (tuple $a $a#7))))",
     "(subst (exists ($a) $a) ((a $z)))",
     "(subst (T T) ((T u8)))",
-    "(subst (foreach (F (foreach (G (tuple T T)) (tuple G U))) (tuple F G U)) ((T u8) (U G)))",
-    "(subst (foreach (F (foreach (G (tuple T T)) (tuple G U))) (tuple F G U)) ((T u8) (U F)))",
+    "(subst (foreach (F (tuple T T)) (tuple F U)) ((T u8) (U F)))",
     "(subst (foreach (F (tuple T)) (tuple F T)) ((T (tuple F)) (F u8)))",
-    "(subst (foreach (G (foreach (F (tuple u32)) F)) (tuple G F) (retain)) ((F u8)))",
-    "(subst (foreach (G (foreach (F (foreach (H (tuple u32)) H)) F (retain H))) (tuple H F) (retain F)) ((H F)))",
     # free names
     "(free (foreach (F (tuple T $k)) (tuple F G)))",
     "(free (fn (forall ($a) () $a ($b T))))",
@@ -1585,15 +1576,12 @@ TYPE_CASES = (
     "(copy () ((T copy)) (foreach (F T) u8))",
     # a foreach holding itself again by value: an active query cannot justify itself
     "(copy ((type T () (struct (f (foreach ((ptr F) (ptr T)) F))))) () T)",
-    "(copy ((type L! () u8)) () (foreach (G (foreach (F (tuple u8 L!)) (ptr F))) G))",
-    "(copy () ((T copy)) (foreach (G (foreach (F T) (ptr F))) G))",
     "(copy () () (foreach (F G) (ptr F)))",
     "(zero ((type E () (struct (a (tuple)) (b (array u8 0))))) E)",
     "(zero () T)",
     "(zero () (exists ($a) (brand $a)))",
     "(expand ((type P (T) (struct (a T) (b u8)))) (foreach (F (P u16)) (ptr F)))",
     "(expand () (foreach ((ptr F) (ptr (tuple u8 u16))) (array F 2)))",
-    "(expand () (foreach (G (foreach (F (struct (x u8) (y u16))) (tuple F F))) (tuple G F)))",
     "(expand () (foreach (F (array u32 0)) (ptr F)))",
     "(expand () (foreach ((ptr F) (ptr (enum (A u8)))) F))",
     "(expand () (foreach ((ptr F) (tuple u8)) F))",
@@ -1616,31 +1604,35 @@ TYPE_CASES = (
     "(pattern ((opaque H () (tuple (ptr u8)))) (foreach ((ptr F) H) F))",
     "(pattern ((type H () (tuple (ptr u8)))) (foreach ((ptr F) H) F))",
     "(pattern () (foreach ((ptr F) (array (ptr u8) 2)) F))",
-    "(pattern () (foreach ((ptr F) (foreach (G (tuple u8)) (ptr G))) F))",
     # layout
     "(layout (type L (T) (enum (Nil (tuple)) (Cons (ptr (L T))))))",
     "(layout (type L () (struct (next L))))",
     "(layout (type A () (ptr A)))",
     "(layout (type G (T) (enum (Leaf T) (Node (ptr (G (tuple T T)))))))",
-    "(layout (type H (T) (enum (Leaf T) (Node (foreach (F T) (ptr (H F)))))))",
+    "(layout (type H (T) (foreach (F T) (ptr (H F)))))",
     "(layout (type S () (foreach (F S) F)))",
     "(layout (type A () (struct (b (ptr B)))) (type B () (enum (x A) (y (array B 0)))))",
     "(layout (type A ($k) (struct (b (brand $k)) (n (ptr (A $k))))))",
     # a foreach whose components are known is walked as its expansion
-    "(layout (type T () (struct (f (foreach ((ptr F) (ptr T)) F)))))",
-    "(layout (type T () (struct (f (foreach (F (foreach ((ptr G) (ptr T)) G)) F)))))",
-    "(layout (type S (P) (struct (f (foreach ((ptr F) (ptr P)) F)))) (type W () (struct (s (S W)))))",
-    "(layout (type L () (struct (next (ptr L)) (v u32))) (type M () (struct (f (foreach ((ptr F) (ptr L)) F)))))",
-    "(layout (type T () (struct (a (array (foreach ((ptr F) (ptr T)) F) 0)) (n u32))))",
-    "(layout (type T () (struct (f (foreach ((ptr F) (ptr T)) (ptr F))))))",
+    "(layout (type T () (foreach ((ptr F) (ptr T)) F)))",
+    "(layout (type S (P) (foreach ((ptr F) (ptr P)) (tuple F))) (type W () (S W)))",
+    "(layout (type L () (struct (next (ptr L)) (v u32))) (type M () (foreach ((ptr F) (ptr L)) F)))",
+    "(layout (type E () (enum (A (ptr T)) (B (ptr u32)))) (type T () (foreach ((ptr F) E) F)))",
+    "(layout (type T () (struct (f (fn ((foreach ((ptr F) (ptr T)) (ptr F))) u32)))))",
     # formation
     "(formation (type P (T $k) (struct (a T) (b (brand $k)))))",
     "(formation (type E () (exists ($a) u8)))",
     "(formation (type E () (exists ($a) (exists ($b) (tuple $a $b)))))",
     "(formation (type E () (exists () u8)))",
     "(formation (type B () (brand $z)))",
-    "(formation (type R () (foreach (G (foreach (F (tuple u8)) F)) G (retain X))))",
-    "(formation (type R () (foreach (G (foreach (F (tuple u8)) F)) (tuple G F))))",
+    "(formation (type R () (foreach (G (foreach (F (tuple u8)) F)) G)))",
+    "(formation (type R () (foreach (G (tuple u8)) (foreach (F (tuple G)) F))))",
+    "(formation (type W () (foreach (F (tuple u8)) F)) (type P () (struct (w W))))",
+    "(formation (type W () (foreach (F (tuple u8)) F)) (type V () W) (type P () (tuple u8 V)))",
+    "(formation (type W () (foreach (F (tuple u8)) F)) (type O (T) (enum (S T))) (type P () (O W)))",
+    "(formation (type W () (foreach (F (tuple u8)) F)) (type P () (ptr W)))",
+    "(formation (type W () (foreach (F (tuple u8)) F)) (type P () (exists ($k) W)))",
+    "(formation (type W () (foreach (F (tuple u8)) F)) (type P () (fn (W) W)))",
     "(formation (type F () (fn (forall (T) () u8 ()))))",
     "(formation (type D () (struct (a u8) (a u16))))",
     "(formation (type I () (tuple _)))",

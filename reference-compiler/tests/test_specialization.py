@@ -6,7 +6,6 @@ from kursal import core as C
 from kursal.cgen import Backend, emit_c
 from kursal.check import check_program
 from kursal.sexpr import KursError
-from kursal.types import subst
 
 
 def constant(name, value):
@@ -65,7 +64,9 @@ class SpecializationTests(unittest.TestCase):
         self.assertEqual(first, backend.request(fun, {"a": C.Skolem("y"), "b": C.Skolem("y")}))
         self.assertEqual(len(backend.queue), 1)
 
-    def test_substituted_foreach_source_keeps_mapper_parameter_partition(self):
+    def test_a_generic_traversal_is_never_specialized_at_a_foreach_source(self):
+        # A type parameter never stands for a foreach type (TY-FLAT), so specialization never makes a
+        # traversal whose source is one.
         f, s = C.Named("F"), C.Named("S")
         mapped = C.Foreach("F", False, s, f)
         mapper = C.Fun("mapper", (C.Param("F"), C.Param("S")), (), f, (f,),
@@ -75,16 +76,13 @@ class SpecializationTests(unittest.TestCase):
                               (C.Instr(("%y",), "foreach", ("%x", "mapper"), ty=mapped, tys=(s,)),),
                               C.Ret("%y")),))
         source = C.Foreach("G", False, C.U32, C.Named("G"))
-        result = subst(mapped, {"S": source})
-        caller = C.Fun("caller", (), (), result, (source,),
+        caller = C.Fun("caller", (), (), source, (source,),
                        (C.Block("entry", (("%x", source),),
                                 (C.Instr(("%y",), "call", ("walk", "%x"), tys=(source,)),),
-                                C.Ret("%y")),))
+                                C.Ret("%x")),))
         program = C.Program(funs={"mapper": mapper, "walk": walk, "caller": caller})
-        backend = Backend(program, check_program(program))
-        backend.emit_program()
-        keys = [args for args, _symbol in backend.symbols[id(mapper)]]
-        self.assertEqual(keys, [(C.U32, source)])
+        with self.assertRaisesRegex(KursError, "a type argument expands to a foreach type"):
+            check_program(program)
 
 
 class FunctionAddressTests(unittest.TestCase):

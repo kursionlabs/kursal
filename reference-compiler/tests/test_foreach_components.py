@@ -1,4 +1,4 @@
-"""Component typing, retained scope, and emitted operands must describe one map."""
+"""Component typing, the binder's scope, and emitted operands must describe one map."""
 
 import unittest
 
@@ -9,7 +9,7 @@ from kursal.formation import Formation
 from kursal.kurs import parse_program, parse_type
 from kursal.sexpr import read
 from kursal.sexpr import KursError
-from kursal.types import Types, equal, foreach_binders, foreach_item, free_names, show, subst
+from kursal.types import Types, equal, free_names, show, subst
 from kursal.unify import unify
 
 
@@ -32,17 +32,10 @@ class ComponentTests(unittest.TestCase):
         self.assertEqual(self.types.expand(C.Foreach("F", False, C.Ptr(opt), C.Named("F"))),
                          C.Enum((("none", C.Ptr(C.Tuple(()))), ("some", C.Ptr(C.Prim("u8"))))))
 
-    def test_nested_indirect_source_retains_stripped_type(self):
-        inner = C.Foreach("G", True, C.Ptr(C.U32), C.Ptr(C.Named("G")))
-        outer = C.Foreach("F", True, inner, C.Tuple((C.Named("G"), C.Named("F"))))
-        self.assertEqual(foreach_item(outer), C.Ptr(C.Named("G")))
-        self.assertEqual(self.types.expand(outer), C.Tuple((C.Tuple((C.U32, C.U32)),)))
-
     def test_empty_array_has_schema_but_no_runtime_components(self):
-        inner = C.Foreach("G", True, C.Ptr(C.Array(C.U32, 0)), C.Ptr(C.Named("G")))
-        outer = C.Foreach("F", False, inner, C.Tuple((C.Named("F"), C.Named("G"))))
-        self.assertEqual(self.types.rows(outer.source)[1], [])
-        self.assertEqual(self.types.expand(outer), C.Array(C.Tuple((C.Ptr(C.U32), C.U32)), 0))
+        mapped = C.Foreach("F", True, C.Ptr(C.Array(C.U32, 0)), C.Tuple((C.Named("F"),)))
+        self.assertEqual(self.types.rows(mapped.source)[1], [])
+        self.assertEqual(self.types.expand(mapped), C.Array(C.Tuple((C.U32,)), 0))
 
     def test_pointer_pattern_needs_more_than_an_unknown_exposed_shape(self):
         for source in (C.Named("T"), C.Tuple((C.U32,)), C.Array(C.U32, 0)):
@@ -65,14 +58,15 @@ class ComponentTests(unittest.TestCase):
         with self.assertRaisesRegex(KursError, r"foreach \*F needs a source written with pointer components"):
             check_program(C.Program(funs={"identity": mapper, "walk": caller}))
 
-    def test_nested_leaf_c_passes_the_singleton_member(self):
-        source = C.Foreach("G", False, C.U32, C.Named("G"))
-        mapped = C.Foreach("F", False, source, C.Named("G"))
-        g = C.Named("G")
-        mapper = C.Fun("identity", (C.Param("F"), C.Param("G")), (), g, (g,),
-                       (C.Block("entry", (("%x", g),), (), C.Ret("%x")),))
-        caller = C.Fun("walk", (), (), mapped, (source,),
-                       (C.Block("entry", (("%x", source),),
+
+    def test_a_map_of_a_leaf_c_passes_the_singleton_member(self):
+        operand = C.Foreach("G", False, C.U32, C.Named("G"))
+        mapped = C.Foreach("F", False, C.U32, C.Named("F"))
+        f = C.Named("F")
+        mapper = C.Fun("identity", (C.Param("F"),), (), f, (f,),
+                       (C.Block("entry", (("%x", f),), (), C.Ret("%x")),))
+        caller = C.Fun("walk", (), (), mapped, (operand,),
+                       (C.Block("entry", (("%x", operand),),
                                 (C.Instr(("%out",), "foreach", ("%x", "identity"), ty=mapped),),
                                 C.Ret("%out")),))
         program = C.Program(funs={"identity": mapper, "walk": caller})
@@ -130,66 +124,31 @@ class MapFormTests(unittest.TestCase):
                       (entry ((%v {operand})) (= %out (foreach {written} %v {mapper})) (ret %out)))"""))
 
 
-class RetainedScopeTests(unittest.TestCase):
-    def nested(self, inner, outer, free=C.U32):
-        source = C.Foreach(inner, False, C.Tuple((C.U32,)), C.Named(inner))
-        return C.Foreach(outer, False, source, C.Tuple((C.Named(inner), C.Named(outer), free)))
 
-    def test_retained_names_are_bound_and_alpha_equivalent(self):
-        left, right = self.nested("G", "F"), self.nested("Y", "X")
+class BinderScopeTests(unittest.TestCase):
+    """A foreach type binds one name, its binder, in its body."""
+
+    def test_the_binder_is_bound_and_alpha_equivalent(self):
+        left = C.Foreach("F", False, C.Tuple((C.U32,)), C.Tuple((C.Named("F"), C.U32)))
+        right = C.Foreach("G", False, C.Tuple((C.U32,)), C.Tuple((C.Named("G"), C.U32)))
         self.assertEqual(free_names(left), set())
         Formation(C.Program()).kind(left, {})
         self.assertTrue(equal(left, right))
         self.assertTrue(unify(left, right, closed=True))
-        wrong = C.Foreach("X", False, right.source, C.Tuple((C.Named("X"), C.Named("X"), C.U32)))
+        wrong = C.Foreach("G", False, right.source, C.Tuple((C.U32, C.Named("G"))))
         self.assertFalse(equal(left, wrong))
         self.assertFalse(unify(left, wrong, closed=True))
 
-    def test_substitution_transports_retained_renaming_without_capture(self):
-        original = self.nested("G", "F", C.Named("T"))
-        result = subst(original, {"T": C.Named("G"), "G": C.U32})
-        expected = self.nested("Y", "X", C.Named("G"))
-        self.assertEqual(free_names(result), {"G"})
-        self.assertTrue(equal(result, expected))
-        self.assertEqual(subst(original, {"G": C.U32}), original)
+    def test_substitution_renames_a_binder_it_would_capture(self):
+        original = C.Foreach("F", False, C.Tuple((C.Named("T"),)), C.Tuple((C.Named("F"), C.Named("T"))))
+        result = subst(original, {"T": C.Named("F")})
+        self.assertEqual(free_names(result), {"F"})
+        self.assertTrue(equal(result, C.Foreach("G", False, C.Tuple((C.Named("F"),)),
+                                                C.Tuple((C.Named("G"), C.Named("F"))))))
+        self.assertEqual(subst(original, {"F": C.U32}), original)
 
-    def test_a_source_binder_not_retained_is_the_enclosing_variable(self):
-        # The body's F is free: this transform retains none of its source's binders, so the source's
-        # binder F binds nothing there and substituting F reaches it.
-        source = C.Foreach("F", False, C.Tuple((C.U32,)), C.Named("F"))
-        mapped = C.Foreach("G", False, source, C.Tuple((C.Named("G"), C.Named("F"))), ())
-        self.assertEqual(free_names(mapped), {"F"})
-        result = subst(mapped, {"F": C.Prim("u8")})
-        self.assertEqual(result.body, C.Tuple((C.Named("G"), C.Prim("u8"))))
-        self.assertEqual(result.source, source)
-        self.assertEqual(foreach_item(mapped), C.Named("G"))
-        # A replacement naming a binder a body retains renames it in its source and in that body alike.
-        retained = C.Foreach("G", False, source, C.Tuple((C.Named("G"), C.Named("F"), C.Named("T"))))
-        renamed = subst(retained, {"T": C.Named("F")})
-        self.assertEqual(free_names(renamed), {"F"})
-        self.assertTrue(equal(renamed, C.Foreach("G", False, C.Foreach("H", False, C.Tuple((C.U32,)), C.Named("H")),
-                                                 C.Tuple((C.Named("G"), C.Named("H"), C.Named("F"))))))
-        # A source binder an enclosing body retains is renamed when that body's replacement would
-        # capture it, even where the source's own body binds nothing it reaches.
-        innermost = C.Foreach("H", False, C.Tuple((C.U32,)), C.Named("H"))
-        partial = C.Foreach("G", False, C.Foreach("F", False, innermost, C.Named("F"), ("H",)),
-                            C.Tuple((C.Named("H"), C.Named("F"))), ("F",))
-        # Its item names H, which it does not retain: the mapper takes an abstract item instead.
-        self.assertEqual(foreach_item(partial), C.Named("G"))
-        moved = subst(partial, {"H": C.Named("F")})
-        self.assertTrue(equal(moved, C.Foreach("G", False, C.Foreach("K", False, innermost, C.Named("K"), ("H",)),
-                                               C.Tuple((C.Named("F"), C.Named("K"))), ("K",))))
-
-    def test_specialization_does_not_add_source_binders(self):
-        inner = C.Foreach("G", False, C.Tuple((C.U32,)), C.Named("G"))
-        generic = C.Foreach("F", False, C.Named("T"), C.Named("F"))
-        specialized = subst(generic, {"T": inner})
-        nested = C.Foreach("F", False, inner, C.Named("F"))
-        self.assertEqual(foreach_binders(specialized), ("F",))
-        self.assertEqual(foreach_item(specialized), C.Named("F"))
-        self.assertEqual(Types(C.Program()).expand(specialized), C.Tuple((C.U32,)))
-        self.assertEqual(foreach_binders(nested), ("F", "G"))
-        self.assertFalse(equal(specialized, nested))
-        self.assertEqual(parse_type(read(show(specialized))[0]), specialized)
-        with self.assertRaisesRegex(KursError, "source prefix"):
-            Formation(C.Program()).kind(C.Foreach("F", False, C.U32, C.Named("F"), ("G",)), {})
+    def test_kurs_writes_and_reads_the_one_binder(self):
+        mapped = C.Foreach("F", True, C.Ptr(C.Tuple((C.U32,))), C.Named("F"))
+        self.assertEqual(parse_type(read(show(mapped))[0]), mapped)
+        with self.assertRaisesRegex(KursError, "foreach requires source and body"):
+            parse_type(read("(foreach (F (tuple u8)) F (retain))")[0])

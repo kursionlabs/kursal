@@ -928,22 +928,20 @@ These are the places where Kursal differs from what one might expect.
   question of a declared type). A type that holds itself by value is rejected (`type T: infinite
   by-value layout`); a pointer, a function or an empty array between breaks the cycle. A `foreach`
   whose source's components are known counts as its expansion, and is itself active while its
-  expansion is walked: `*F of *T` binds F to each field type of T, so `struct T { f: foreach *F of
-  *T => F }` holds itself, while `foreach *F of *L => F` over `struct L { next: *L, v: u32 }` is
-  `(*L, u32)` as a struct, finite. Over a type parameter the components are unknown, and the use
-  that chooses the argument is walked instead (`struct W { s: S[W] }`). C names a type by its
-  expanded structure, a declared name staying a name, so a `foreach` that reaches itself again
-  before any name, even behind a pointer, is rejected too (`struct T { f: foreach *F of *T => *F
-  }`: `recursive foreach needs a named type between`). Errors name the declaration whose walk found
-  them.
+  expansion is walked: `foreach *F of *L => F` over `struct L { next: *L, v: u32 }` is `(*L, u32)`
+  as a struct, finite. Over a type parameter the components are unknown, and the use that chooses
+  the argument is walked instead. C names a type by its expanded structure, a declared name staying
+  a name, so a `foreach` that reaches itself again before any name, even behind a function, is
+  rejected too (`struct T { f: fn(foreach *F of *T => *F) -> u32 }`: `recursive foreach needs a
+  named type between`). Errors name the declaration whose walk found them.
 - **A `foreach` type has an expansion at every instantiation.** A source that is no product (nor,
   by value, a sum) is one component: `foreach F of u32 => *F` is `(*u32,)`. Behind a pointer each
   component is a pointer to it: to a field, an element, or, for a sum, each variant's payload
   (`foreach F of *Option[u8] => F` is the sum of `*()` and `*u8`, a pointer valid while the value
   holds that variant); a pointer to a leaf is the one component. `*F` binds F to each component's
   pointee, so its source must give pointers whatever the type arguments are, and show them as
-  written: an explicit pointer, a `foreach` whose body is a pointer, or a tuple, struct, enum or
-  array whose components are written as pointers. `foreach *F of T => F` is rejected, as `T` may be
+  written: an explicit pointer, or a tuple, struct, enum or array whose components are written as
+  pointers. `foreach *F of T => F` is rejected, as `T` may be
   `bool`, and so is a name, even one whose shape is a visible product of pointers: `foreach *F
   needs a source written with pointer components`.
   Through a pointer to a product a `foreach` only computes addresses, but through one to a sum it
@@ -959,9 +957,16 @@ These are the places where Kursal differs from what one might expect.
   value holds its variant, so mapping what `unsafe (foreach f of p { .. })` made of a pointer to a
   sum needs no `unsafe`. The body is checked for any `F`, so it hands on a part of type `F` rather
   than dropping it (`examples/foreach_map`).
-- **A `foreach` type's body** binds its own binder and, over a transformed source, that source's
-  binders, each the component's: in `foreach F of (foreach G of (u32, u8) => *G) => (F, G)`, `G` is
-  `u32` in the first row and `u8` in the second, even where a type parameter `G` is in scope.
+- **A `foreach` type is flat.** It binds one name, its binder, in its body, and it is the type of a
+  whole value, a function's parameter or result (a function type's too), never a field or element,
+  a pointee, a package body, a `foreach`'s source or body, or a type argument, a premise's
+  included: `struct T { f: foreach .. }`, `*foreach ..`, `Vec[foreach ..]` and `Exposed[foreach
+  ..]` are rejected (`a component is a foreach type, which is only the type of a whole value,
+  parameter or result`). So a `foreach` is always one layer over a structural shape, and a type
+  parameter never stands for one. The KURS checker applies the same rule through declarations: a
+  declaration whose body is a `foreach` is one wherever it is named (`a component expands to a
+  foreach type`). To keep what a `foreach` made, make it a function's whole result, as
+  `Splitting!::parts` does.
 - **Expressions as statements.** `f(x);` discards a Copy result. A block's value is its last
   expression, without a `;`. `return` is allowed anywhere; a function whose type is `!` (such as
   `fail`) can stand in any expression position.

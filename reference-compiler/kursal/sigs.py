@@ -235,10 +235,10 @@ class Signatures:
     def premise(self, trait: S.NamePath, args: S.TypeArgs, scope: Scope) -> C.Premise:
         for builtin in ("Exposed", "Sized"):
             if args.ref == ("builtin", builtin):
-                return C.Premise(builtin, tuple(self.type(a, scope) for a in args.args))
+                return C.Premise(builtin, tuple(self.component(a, scope, "a type argument") for a in args.args))
         ref = args.ref
         assert ref is not None and ref[0] == "decl"
-        actual = tuple(self.type(a, scope) for a in args.args)
+        actual = tuple(self.component(a, scope, "a type argument") for a in args.args)
         self.check_arguments(ref[1], actual, scope, args.pos)
         return C.Premise(self.name(ref[1]), actual)
 
@@ -266,7 +266,7 @@ class Signatures:
     def type(self, type_expr: S.Type, scope: Scope) -> C.Type:
         match type_expr:
             case S.TName(args=targs, pos=pos):
-                args = tuple(self.type(a, scope) for a in targs)
+                args = tuple(self.component(a, scope, "a type argument") for a in targs)
                 match type_expr.ref:
                     case ("param", name):
                         if args:
@@ -299,13 +299,13 @@ class Signatures:
                     fail(f"brand '{label} is not in scope")
                 return C.Skolem(label)
             case S.TPtr(inner=inner):
-                return C.Ptr(self.type(inner, scope))
+                return C.Ptr(self.component(inner, scope, "a pointee"))
             case S.TNever():
                 return C.Never()
             case S.TTuple(elems=elems):
-                return C.Tuple(tuple(self.type(e, scope) for e in elems))
+                return C.Tuple(tuple(self.component(e, scope, "a component") for e in elems))
             case S.TArray(elem=elem, length=length):
-                return C.Array(self.type(elem, scope), self.array_length(length))
+                return C.Array(self.component(elem, scope, "a component"), self.array_length(length))
             case S.TFn(params=params, ret=ret, unsafe=unsafe):
                 return C.Fn(tuple(self.type(p, scope) for _, p in params), self.type(ret, scope),
                             unsafe=unsafe, places=frozenset(i for i, (lend, _) in enumerate(params) if lend))
@@ -324,10 +324,10 @@ class Signatures:
                 return C.Struct((("env", environment), ("code", code)))
             case S.TExists(brands=brands, body=body):
                 labels = tuple(b[1:] for b in brands)
-                return C.Exists(labels, self.type(body, scope.extend(C.Param(b, C.BRAND) for b in labels)))
+                return C.Exists(labels, self.component(body, scope.extend(C.Param(b, C.BRAND) for b in labels), "a package body"))
             case S.TForeach(binder=binder, indirect=indirect, source=source, body=body):
-                return C.Foreach(binder, indirect, self.type(source, scope),
-                                 self.type(body, scope.extend(C.Param(b, C.ANY) for b in type_expr.binders())))
+                return C.Foreach(binder, indirect, self.component(source, scope, "a foreach source"),
+                                 self.component(body, scope.extend((C.Param(binder, C.ANY),)), "a foreach body"))
             case S.TForall(params=tparams, body=body):
                 quantified = tuple(C.Param(p[1:], C.BRAND) for p in tparams)
                 inner_type = self.type(body, scope.extend(quantified))
@@ -335,6 +335,14 @@ class Signatures:
                     fail("forall in a type quantifies brands of a function type")
                 return C.Fn(inner_type.params, inner_type.ret, quantified, inner_type.unsafe, inner_type.places)
         fail(f"no core type for {type(type_expr).__name__}")
+
+    def component(self, type_expr: S.Type, scope: Scope, what: str) -> C.Type:
+        """A type written where a foreach type may not be (TY-FLAT): `what` names the place. A foreach
+        type is a whole value's type, or a function's parameter or result."""
+        ty = self.type(type_expr, scope)
+        if isinstance(ty, C.Foreach):
+            fail(f"{what} is a foreach type, which is only the type of a whole value, parameter or result")
+        return ty
 
     def array_length(self, expr: S.Expr) -> int:
         value = self.fold(expr, C.USIZE)
@@ -358,9 +366,9 @@ class Signatures:
         body: C.Type
         match node:
             case S.Struct(fields=fields):
-                body = C.Struct(tuple((n, self.type(t, scope)) for n, t in fields))
+                body = C.Struct(tuple((n, self.component(t, scope, "a component")) for n, t in fields))
             case S.TupleDecl(elems=elems):
-                body = C.Tuple(tuple(self.type(t, scope) for t in elems))
+                body = C.Tuple(tuple(self.component(t, scope, "a component") for t in elems))
             case S.EnumDecl():
                 body = C.Enum(tuple((n, self.payload(p, scope)) for n, p in node.variants))
         exposure: Optional[C.Exposure] = ("owner", decl.module)
@@ -395,8 +403,8 @@ class Signatures:
         if not types:
             return C.UNIT
         if len(types) == 1:
-            return self.type(types[0], scope)
-        return C.Tuple(tuple(self.type(t, scope) for t in types))
+            return self.component(types[0], scope, "a component")
+        return C.Tuple(tuple(self.component(t, scope, "a component") for t in types))
 
     def scope_module(self, decl: Decl, path: S.NamePath) -> C.ModuleId:
         target = self.r.lookup(decl.module, path)
@@ -470,7 +478,7 @@ class Signatures:
         ref = head.ref
         assert ref is not None and ref[0] == "decl"
         trait = ref[1]
-        arguments = tuple(self.type(a, scope) for a in head.args)
+        arguments = tuple(self.component(a, scope, "a type argument") for a in head.args)
         self.check_arguments(trait, arguments, scope, head.pos)
         methods = tuple(self.signature(m, params, premises, scope, name=m.name) for m in item.methods)
         for m in methods:

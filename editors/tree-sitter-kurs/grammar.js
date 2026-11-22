@@ -33,7 +33,7 @@ module.exports = grammar({
 
     keyword: _ => choice(
       'type', 'struct', 'enum', 'fn', 'unsafe', 'extern', 'val', 'data', 'trait', 'instance',
-      'forall', 'where', 'exists', 'foreach', 'retain', 'of', 'using', 'as',
+      'forall', 'where', 'exists', 'foreach', 'of', 'using', 'as',
       'locals', 'entry', 'block', 'state', 'empty', 'known', 'open',
       'return', 'jump', 'branch', 'switch', 'unreachable',
     ),

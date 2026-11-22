@@ -17,7 +17,7 @@ use package::kurs::core::{ForeachType, Kind, Member, Program, Type};
 use package::kurs::core as C;
 use package::syntax::ast::{Pos, no_pos};
 use package::types::termination::components;
-use package::types::ops::{Fresh, Row, Rows, children, equal, foreach_binders, free_brands, free_names, kurs_error_in, member_types, overlap, subst, with_names, wrap};
+use package::types::ops::{Fresh, Row, Rows, children, equal, free_brands, free_names, kurs_error_in, member_types, overlap, subst, with_names, wrap};
 use std::option::Option;
 
 // A nominal application found while collecting: its owner declaration, the application, and the
@@ -93,7 +93,7 @@ impl Expansion['k] {
             },
             Type::Foreach(f) => {
                 self.collect(&cx, owner, f.source.copy(&cx), bound, params, derived);
-                let binders = with_names(&cx, ArenaSet::new(&cx), foreach_binders(&cx, f));
+                let binders = with_names(&cx, ArenaSet::new(&cx), ArenaVec::one(&cx, f.binder));
                 let tainted = if overlap(&cx, free_names(&cx, f.source.copy(&cx)), params.union(&cx, derived)) { binders } else { ArenaSet::new(&cx) };
                 self.collect(&cx, owner, f.body.copy(&cx), bound.union(&cx, binders), without(&cx, params, binders), without(&cx, derived, binders).union(&cx, tainted));
             },
@@ -181,27 +181,6 @@ impl Expansion['k] {
     }
 
     fn rows(self, &cx: Domain!['k], source: Type['k], bound: ArenaSet[Span['k], 'k]) -> Option[Rows['k]] {
-        let unit = match source {
-            Type::Foreach(f) => {
-                let inner = match self.rows(&cx, f.source.copy(&cx), bound) {
-                    Option::Some(inner) => inner,
-                    Option::None => return Option::None,
-                };
-                let mapped: ArenaVec[Row['k], 'k] = ArenaVec::new(&cx);
-                var i = 0usize;
-                while i < inner.rows.len(&cx) {
-                    let row = inner.rows.at(&cx, i);
-                    let sub = match self.bind(&cx, f, row.item, row.extra) {
-                        Option::Some(sub) => sub,
-                        Option::None => return Option::None,
-                    };
-                    mapped.push(&cx, Row.{ label: row.label, item: subst(&cx, f.body.copy(&cx), sub, self.counter), extra: sub });
-                    i = i + 1usize;
-                }
-                return Option::Some.(Rows.{ skeleton: inner.skeleton, rows: mapped });
-            },
-            _ => (),
-        };
         var shape = match self.outer(&cx, source, bound) {
             Option::Some(shape) => shape,
             Option::None => return Option::None,
@@ -226,7 +205,7 @@ impl Expansion['k] {
             Type::Struct(fields) => {
                 var i = 0usize;
                 while i < fields.len(&cx) {
-                    rows.push(&cx, Row.{ label: fields.at(&cx, i).name, item: wrap(&cx, fields.at(&cx, i).type, pointer), extra: ArenaMap::new(&cx) });
+                    rows.push(&cx, Row.{ label: fields.at(&cx, i).name, item: wrap(&cx, fields.at(&cx, i).type, pointer) });
                     i = i + 1usize;
                 }
                 Option::Some.(Rows.{ skeleton: Option::Some.(shape), rows })
@@ -234,50 +213,36 @@ impl Expansion['k] {
             Type::Tuple(elems) => {
                 var i = 0usize;
                 while i < elems.len(&cx) {
-                    rows.push(&cx, Row.{ label: Buffer!::new().push_usize(i).save(&cx), item: wrap(&cx, elems.at(&cx, i), pointer), extra: ArenaMap::new(&cx) });
+                    rows.push(&cx, Row.{ label: Buffer!::new().push_usize(i).save(&cx), item: wrap(&cx, elems.at(&cx, i), pointer) });
                     i = i + 1usize;
                 }
                 Option::Some.(Rows.{ skeleton: Option::Some.(shape), rows })
             },
             Type::Array(elem, _length) => {
-                rows.push(&cx, Row.{ label: Span::from_static(&cx, "0"), item: wrap(&cx, elem.copy(&cx), pointer), extra: ArenaMap::new(&cx) });
+                rows.push(&cx, Row.{ label: Span::from_static(&cx, "0"), item: wrap(&cx, elem.copy(&cx), pointer) });
                 Option::Some.(Rows.{ skeleton: Option::Some.(shape), rows })
             },
             Type::Enum(variants) => {
                 var i = 0usize;
                 while i < variants.len(&cx) {
-                    rows.push(&cx, Row.{ label: variants.at(&cx, i).name, item: variants.at(&cx, i).type, extra: ArenaMap::new(&cx) });
+                    rows.push(&cx, Row.{ label: variants.at(&cx, i).name, item: variants.at(&cx, i).type });
                     i = i + 1usize;
                 }
                 Option::Some.(Rows.{ skeleton: Option::Some.(shape), rows })
             },
             _ => {
-                rows.push(&cx, Row.{ label: Span::from_static(&cx, "0"), item: source, extra: ArenaMap::new(&cx) });
+                rows.push(&cx, Row.{ label: Span::from_static(&cx, "0"), item: source });
                 Option::Some.(Rows.{ skeleton: Option::None, rows })
             },
         }
     }
 
-    fn bind(self, &cx: Domain!['k], ty: ForeachType['k], item: Type['k], extra: ArenaMap[Span['k], Type['k], 'k]) -> Option[ArenaMap[Span['k], Type['k], 'k]] {
-        let out: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
-        var i = 0usize;
-        while i < ty.retained.len(&cx) {
-            let name = ty.retained.at(&cx, i);
-            let unit = match extra.get(&cx, name) {
-                Option::Some(t) => { out.insert(&cx, name, t); },
-                Option::None => (),
-            };
-            i = i + 1usize;
-        }
+    fn binding(self, &cx: Domain!['k], ty: ForeachType['k], item: Type['k]) -> Option[Type['k]] {
         if !ty.indirect {
-            out.insert(&cx, ty.binder, item);
-            return Option::Some.(out);
+            return Option::Some.(item);
         }
         match item {
-            Type::Ptr(inner) => {
-                out.insert(&cx, ty.binder, inner.copy(&cx));
-                Option::Some.(out)
-            },
+            Type::Ptr(inner) => Option::Some.(inner.copy(&cx)),
             _ => Option::None,
         }
     }
@@ -291,10 +256,12 @@ impl Expansion['k] {
         var i = 0usize;
         while i < found.rows.len(&cx) {
             let row = found.rows.at(&cx, i);
-            let sub = match self.bind(&cx, ty, row.item, row.extra) {
-                Option::Some(sub) => sub,
+            let bind = match self.binding(&cx, ty, row.item) {
+                Option::Some(bind) => bind,
                 Option::None => return Option::None,
             };
+            let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+            sub.insert(&cx, ty.binder, bind);
             mapped.push(&cx, Member.{ name: row.label, type: subst(&cx, ty.body.copy(&cx), sub, self.counter) });
             i = i + 1usize;
         }
@@ -357,7 +324,7 @@ impl Expansion['k] {
                 match self.expand(&cx, f, bound) {
                     Option::Some(expanded) => {
                         // A component may hold this foreach again by value, unfolding no name on
-                        // the way (`struct T { f: foreach *F of *T => F }`): it is active like a name.
+                        // the way: it is active like a name.
                         let current = self.key(&cx, ty);
                         if any_equal(&cx, current, active) {
                             self.fail(&cx, owner, Buffer!::new().push_static("type ").push_bytes(&cx, owner).push_static(": infinite by-value layout").save(&cx));
@@ -365,7 +332,7 @@ impl Expansion['k] {
                         self.walk(&cx, owner, expanded, with_type(&cx, active, current), bound, aliases);
                     },
                     // Opaque here; every use walks the expansion at its type arguments.
-                    Option::None => self.walk(&cx, owner, f.body.copy(&cx), active, with_names(&cx, bound, foreach_binders(&cx, f)), aliases),
+                    Option::None => self.walk(&cx, owner, f.body.copy(&cx), active, with_names(&cx, bound, ArenaVec::one(&cx, f.binder)), aliases),
                 }
             },
             Type::Brand(_b) => (),
@@ -391,7 +358,7 @@ impl Expansion['k] {
 
     // The C representation key (`backend::cgen::erase`) keeps names and expands every foreach,
     // behind pointers and functions too: a foreach whose expansion reaches it again before a name
-    // has none (`struct T { f: foreach *F of *T => *F }`).
+    // has none (`struct T { f: fn(foreach *F of *T => *F) -> u32 }`).
     fn represent(self, &cx: Domain!['k], owner: Span['k], ty: Type['k], active: ArenaVec[Type['k], 'k], bound: ArenaSet[Span['k], 'k]) {
         match ty {
             Type::Foreach(f) => {
@@ -404,7 +371,7 @@ impl Expansion['k] {
                         }
                         self.represent(&cx, owner, expanded, with_type(&cx, active, current), bound);
                     },
-                    Option::None => self.represent(&cx, owner, f.body.copy(&cx), active, with_names(&cx, bound, foreach_binders(&cx, f))),
+                    Option::None => self.represent(&cx, owner, f.body.copy(&cx), active, with_names(&cx, bound, ArenaVec::one(&cx, f.binder))),
                 }
             },
             _ => {

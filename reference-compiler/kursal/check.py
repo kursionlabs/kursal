@@ -10,7 +10,7 @@ from .core import (ATOMIC_OPS, UNSAFE_OPS, BOOL, BRAND, COPY, FLOATS, INTEGERS, 
                    Foreach, Ignored, Jmp, Jnz, Named, Never, NonNull, Prim, Ptr, Ret, Skolem, Struct, Switch, Tuple,
                    Unreachable, Type, Kind, Program, Fun, Instance, Param, Premise, Block, Instr, Terminator, Edge, ModuleId)
 from .sexpr import Form, KursError, List, Position, Str
-from .types import Kinds, children, foreach_binders, foreach_item, mapped_component, mapped_operand, Types, equal, fits, free_brands, fresh, subst
+from .types import Kinds, children, foreach_item, mapped_component, mapped_operand, Types, equal, fits, free_brands, fresh, subst
 from .termination import check_instance_termination
 from .formation import Formation
 from .layout import check_type_expansion
@@ -989,9 +989,9 @@ class Checker:
         got = self.use(instr.args[0])
         # The operand is the source, or (the map form) a value of a foreach type over the same source with
         # the same pattern, whose components are the mapper's inputs.
-        mapped = mapped_operand(t, got)
+        mapped = mapped_operand(got)
         if mapped is None and not equal(got, t.source) or mapped is not None and (
-                mapped.indirect != t.indirect or not equal(mapped.source, t.source) or isinstance(mapped.source, Foreach)):
+                mapped.indirect != t.indirect or not equal(mapped.source, t.source)):
             self.fail("foreach_source")
         if self.types.sum_behind_pointer(t.source, self.module, self.kinds):
             # A traversal of the pointer reads the variant there; a mapped value holds its own.
@@ -1002,32 +1002,26 @@ class Checker:
         mapper = self.program.funs.get(instr.args[1])
         if mapper is None:
             self.fail("unknown_mapper")
-        binders = foreach_binders(t)
-        if len(mapper.params) != len(binders) + len(instr.tys) or mapper.places:
+        if len(mapper.params) != 1 + len(instr.tys) or mapper.places:
             self.fail("mapper_takes_traversal_binders")
-        # The mapper is checked for an arbitrary component, not only today's rows: each binder is a new
+        # The mapper is checked for an arbitrary component, not only today's rows: the binder is a new
         # variable, under a name no type of the caller's, premise or declaration has.
-        occupied = {*self.kinds, *self.program.types, *binders}
-        names: dict[str, str] = {}
-        for binder in binders:
-            name = fresh(binder)
-            while name in occupied:
-                name = fresh(binder)
-            names[binder] = name
-        rigid = {binder: Named(name) for binder, name in names.items()}
-        abstract = {p.name: rigid[b] for p, b in zip(mapper.params, binders)}
-        own = dict(zip((p.name for p in mapper.params[len(binders):]), instr.tys))
-        sub = {**abstract, **own}
+        occupied = {*self.kinds, *self.program.types, t.binder}
+        name = fresh(t.binder)
+        while name in occupied:
+            name = fresh(t.binder)
+        rigid = Named(name)
+        sub = {mapper.params[0].name: rigid, **dict(zip((p.name for p in mapper.params[1:]), instr.tys))}
         saved_kinds = self.kinds
-        self.kinds = {**self.kinds, **{name: "any" for name in names.values()}}
+        self.kinds = {**self.kinds, name: "any"}
         try:
             self.instantiate(mapper.params, mapper.premises,
                              tuple(sub[param.name] for param in mapper.params), mapper.name)
         finally:
             self.kinds = saved_kinds
-        item = subst(foreach_item(t), rigid) if mapped is None else mapped_component(mapped, rigid[t.binder])
+        item = subst(foreach_item(t), {t.binder: rigid}) if mapped is None else mapped_component(mapped, rigid)
         ptypes = [subst(p, sub) for p in mapper.ptypes]
-        if not ptypes or not equal(ptypes[0], item) or not equal(subst(mapper.ret, sub), subst(t.body, rigid)):
+        if not ptypes or not equal(ptypes[0], item) or not equal(subst(mapper.ret, sub), subst(t.body, {t.binder: rigid})):
             self.fail("mapper_does_map")
         for cap, want in zip(instr.args[2:], ptypes[1:]):
             got = self.use(cap)

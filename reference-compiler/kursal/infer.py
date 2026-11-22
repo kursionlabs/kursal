@@ -31,7 +31,7 @@ from . import syntax as S
 from .resolve import Decl, ResolveError, Resolver, listed
 from .sigs import InstanceSig, Scope, Sig, Signatures
 from .sexpr import KursError, Position
-from .types import (Surface, Types, brand_differences, brand_name, equal, foreach_binders, free_brands, free_names, fresh, made_from,
+from .types import (Surface, Types, brand_differences, brand_name, equal, free_brands, free_names, fresh, made_from,
                     mapped_component, subst)
 from .termination import check_instance_termination
 from .coherence import check_coherence
@@ -500,6 +500,13 @@ class Infer:
         binders = {made_from(b): C.Named(b) for b in self.open_binders if made_from(b)}
         return subst(self.sigs.type(type_expr, scope), {**binders, **self.brand_sub()})
 
+    def argument(self, type_expr: S.Type, pos: Optional[Position]) -> C.Type:
+        """A type argument written at `pos`, which is never a foreach type (TY-FLAT)."""
+        ty = self.type(type_expr)
+        if isinstance(ty, C.Foreach):
+            fail("a type argument is a foreach type, which is only the type of a whole value, parameter or result", pos)
+        return ty
+
     # ---- statements
     def block(self, block: S.Block) -> C.Type:
         self.scopes.append(Level())
@@ -791,7 +798,7 @@ class Infer:
                 fail(f"{segments[-1][0]} takes {len(mine)} type arguments", path.pos)
             for p, a in zip(params, own):
                 if not isinstance(a, S.TIgnored) and a != S.TBrand("'_") and p.name in sub:
-                    self.unify(sub[p.name], self.type(a), path.pos)
+                    self.unify(sub[p.name], self.argument(a, path.pos), path.pos)
         if len(segments) >= 2 and segments[-2][1] and decl is not None and decl.kind == "method":
             assert decl.impl is not None
             target = self.sigs.type(decl.impl.type, self.sigs.forall(decl.impl.forall, Scope())[2])
@@ -802,7 +809,7 @@ class Infer:
                 fail("method type arguments belong on the impl type, not a namespace", path.pos)
             if len(segments[-2][1]) != len(target.args):
                 fail(f"the impl type qualifier takes {len(target.args)} type arguments", path.pos)
-            written = C.Named(target.name, tuple(self.type(a) for a in segments[-2][1]))
+            written = C.Named(target.name, tuple(self.argument(a, path.pos) for a in segments[-2][1]))
             self.unify(subst(target, sub), written, path.pos)
 
     def path_arguments(self, path: S.Path, declaration: Decl, *, member: bool = False) -> tuple[S.Type, ...]:
@@ -824,7 +831,7 @@ class Infer:
             fail(f"{td.name} accepts at most {len(td.params)} type arguments, got {len(written)}", expr.pos)
         sub = self.instantiate(td.params, Surface((), {}, (td.name,)).name(td.name), expr.pos)
         for p, a in zip(td.params, written):
-            self.unify(sub[p.name], self.type(a), expr.pos)
+            self.unify(sub[p.name], self.argument(a, expr.pos), expr.pos)
         self.require_parameter_kinds(td.params, sub, expr.pos)
         return td, sub, C.Named(td.name, tuple(sub[p.name] for p in td.params))
 
@@ -1040,8 +1047,7 @@ class Infer:
             operand = self.shape(operand, expr.pos)
         # A value of a foreach type is mapped (the map form): the result has its source, binder and
         # pattern, and each item is a component of the value. Anything else is the source itself.
-        mapped = isinstance(operand, C.Foreach) and not isinstance(operand.source, C.Foreach)
-        source = operand.source if mapped and isinstance(operand, C.Foreach) else operand
+        source = operand.source if isinstance(operand, C.Foreach) else operand
         # Through a pointer to a sum the traversal of the pointer reads the variant, an unsafe read that
         # lowering authorizes; a mapped value holds its variant, and reads nothing. Anything else it
         # traverses needs only the shape.
@@ -1049,26 +1055,20 @@ class Infer:
             self.require("Exposed", (source,), expr.pos)
         # Each `foreach` binds a binder of its own, named after the one written, as `F#F12` for `F`.
         written = expr.binder or ""
-        sources = foreach_binders(source) if isinstance(source, C.Foreach) else ()
         if written and (any(p.name == written for p in self.sig.params) or
-                        any(made_from(b) == written for b in (*self.open_binders, *sources))):
+                        any(made_from(b) == written for b in self.open_binders)):
             fail(f"foreach binder {written} shadows another type named {written}", expr.pos)
         binder = f"{written}#F{next(_ids)}"
         self.foreaches[binder] = (expr.name, expr.pos)
         self.kinds[binder] = C.ANY
         outer = self.open_binders
         item: C.Type
-        if mapped and isinstance(operand, C.Foreach):
+        if isinstance(operand, C.Foreach):
             indirect, item = operand.indirect, mapped_component(operand, C.Named(binder))
-            self.open_binders = (*outer, binder)
-        elif isinstance(source, C.Foreach):     # a transformed source: its items are its body
-            indirect, item = False, source.body
-            self.kinds.update({b: C.ANY for b in sources})
-            self.open_binders = (*outer, binder, *sources)
         else:
             indirect = isinstance(self.shape(source, expr.pos), C.Ptr)
             item = C.Ptr(C.Named(binder)) if indirect else C.Named(binder)
-            self.open_binders = (*outer, binder)
+        self.open_binders = (*outer, binder)
         frame = Frame()
         self.frames.append(frame)
         self.scopes.append(Level())
@@ -1304,7 +1304,7 @@ class Infer:
         targs = [Meta("brand" if kind == C.BRAND else "type") for kind in trait.param_kinds]
         for t, a in zip(targs, written):
             if not isinstance(a, S.TIgnored):
-                self.unify(t, self.type(a), expr.pos)
+                self.unify(t, self.argument(a, expr.pos), expr.pos)
         return self.trait_method(expr, trait, method, targs, self.operands(expr.args), receiver=None)
 
     def trait_method(self, expr: S.Call, trait: C.Trait, method: str, targs: Sequence[C.Type],
@@ -1373,10 +1373,10 @@ class Infer:
                     self.later(operand, known_enum, arg.pos)
                 return C.U32 if lent else C.Tuple((operand, C.U32))
             case "sizeof":
-                expr.call = TypedBuiltinCall(name, self.type(targs[0]))
+                expr.call = TypedBuiltinCall(name, self.argument(targs[0], expr.pos))
                 return C.USIZE
             case "alloca":
-                target = self.type(targs[0])
+                target = self.argument(targs[0], expr.pos)
                 expr.call = TypedBuiltinCall(name, target)
                 return C.Ptr(target)
             case "fence":

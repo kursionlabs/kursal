@@ -117,13 +117,6 @@ class Foreach(Type):
     indirect: bool  # the `(ptr F)` pattern
     source: Type
     body: Type
-    retained: tuple[str, ...] | None = None
-
-    def __post_init__(self) -> None:
-        if self.retained is None:
-            source = self.source
-            names = (source.binder, *(source.retained or ())) if isinstance(source, Foreach) else ()
-            object.__setattr__(self, "retained", names)
 
 
 @dataclass(frozen=True)

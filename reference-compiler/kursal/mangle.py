@@ -12,7 +12,7 @@ import hashlib
 import re
 
 from . import core as C
-from .types import foreach_binders, map_children
+from .types import map_children
 
 
 def encode(parts: tuple[str, ...]) -> str:
@@ -65,8 +65,7 @@ def type_key(ty: C.Type, scope: tuple[str, ...] = ()) -> str:
         case C.Exists(binders=names, body=t):
             parts = ("exists", str(len(names)), type_key(t, scope + names))
         case C.Foreach():
-            parts = ("foreach", str(ty.indirect), str(len(foreach_binders(ty))), key(ty.source),
-                     type_key(ty.body, scope + foreach_binders(ty)))
+            parts = ("foreach", str(ty.indirect), key(ty.source), type_key(ty.body, (*scope, ty.binder)))
         case C.Fn():
             inner = scope + tuple(p.name for p in ty.forall)
             parts = ("fn", str(ty.unsafe), encode(tuple(map(str, sorted(ty.places)))),

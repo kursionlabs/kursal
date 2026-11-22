@@ -27,7 +27,7 @@ use package::backend::mangle::{decode_segment, encode, mangle, path_segments, ty
 use package::kurs::sexpr::Form;
 use package::syntax::ast::{Pos, no_pos};
 use package::types::termination::check_mono_termination;
-use package::types::ops::{Fresh, Row, Types, alpha_hashes, equal, foreach_binders, kurs_error, map_children, mapped_component, mapped_operand, subst, subst_foreach};
+use package::types::ops::{Fresh, Row, Types, alpha_hashes, equal, kurs_error, map_children, mapped_component, mapped_operand, subst};
 use std::option::Option;
 use std::slice::Slice;
 use std::time::Instant;
@@ -443,14 +443,6 @@ fn is_pointer_like(t: Type['k]) -> bool {
     match t {
         Type::Ptr(_inner) => true,
         Type::NonNull(_inner) => true,
-        _ => false,
-    }
-}
-
-forall 'k.
-fn is_foreach(t: Type['k]) -> bool {
-    match t {
-        Type::Foreach(_f) => true,
         _ => false,
     }
 }
@@ -3838,46 +3830,25 @@ impl Backend['k] {
     }
 
     fn foreach_instr(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k], dst: Span['k]) {
-        let original = match instr.ty {
-            Option::Some(ty) => match ty {
+        let t = match instr.ty {
+            Option::Some(ty) => match self.substitute_type(&cx, ty) {
                 Type::Foreach(f) => f,
                 _ => fail_text(&cx, Span::from_static(&cx, "internal error: a foreach of a type that is not a transform")),
             },
             Option::None => fail_text(&cx, Span::from_static(&cx, "internal error: a foreach without its type")),
         };
-        let (t, renamed) = subst_foreach(&cx, original, self.sub.copy(&cx), ArenaSet::new(&cx), self.counter);
         let operand = self.type_of(&cx, instr.args.at(&cx, 0usize));
-        let mapped = mapped_operand(&cx, t, operand);
+        let mapped = mapped_operand(operand);
         let source = if self.value_erased(&cx, instr.args.at(&cx, 0usize)) { Span::from_static(&cx, "") } else { self.value_name(&cx, instr.args.at(&cx, 0usize)) };
         let mapper_name = instr.args.at(&cx, 1usize);
         let mapper = self.program.funs.at(&cx, mapper_name);
-        let binders: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
-        let names = foreach_binders(&cx, original);
-        var b = 0usize;
-        while b < names.len(&cx) {
-            let name = names.at(&cx, b);
-            let binder = match renamed.get(&cx, name) {
-                Option::Some(found) => match found {
-                    Type::Named(n, args) => {
-                        if !args.is_empty(&cx) {
-                            fail_text(&cx, Span::from_static(&cx, "internal error: a foreach binder renamed to an application"));
-                        }
-                        n
-                    },
-                    _ => fail_text(&cx, Span::from_static(&cx, "internal error: a foreach binder renamed to a type that is not a name")),
-                },
-                Option::None => name,
-            };
-            binders.push(&cx, binder);
-            b = b + 1usize;
-        }
         let own: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         var o = 0usize;
         while o < instr.tys.len(&cx) {
             own.push(&cx, self.substitute_type(&cx, instr.tys.at(&cx, o)));
             o = o + 1usize;
         }
-        if mapper.params.len(&cx) != binders.len(&cx) + own.len(&cx) {
+        if mapper.params.len(&cx) != 1usize + own.len(&cx) {
             fail_at(&cx, Span::from_static(&cx, "foreach mapper parameter partition disagrees"), instr.pos);
         }
         // A captured value the mapper takes by pointer (an aggregate of more than four words, as
@@ -3904,9 +3875,9 @@ impl Backend['k] {
         }
         let found = self.types.rows(&cx, t.source.copy(&cx), Option::None, false);
         let rows = found.rows;
-        let pointer = mapped.is_none() && is_ptr(self.shape(&cx, t.source.copy(&cx))) && !is_foreach(t.source.copy(&cx));
+        let pointer = mapped.is_none() && is_ptr(self.shape(&cx, t.source.copy(&cx)));
         let out_shape = self.shape(&cx, Type::Foreach.(t));
-        let walk = Walk.{ backend: self, t, mapped, mapper, mapper_name, binders, own, caps, values, pointer };
+        let walk = Walk.{ backend: self, t, mapped, mapper, mapper_name, own, caps, values, pointer };
         match found.skeleton {
             Option::Some(skeleton) => match skeleton {
                 Type::Enum(_variants) => {
@@ -3966,24 +3937,21 @@ impl Backend['k] {
         let skeleton = match found.skeleton {
             Option::Some(s) => s,
             Option::None => {
-                let component = if mapped.is_some() || is_foreach(t.source.copy(&cx)) { Buffer!::new().push_bytes(&cx, source).push_static(".e0").save(&cx) } else { source };
+                // A mapped operand of a leaf source is a one-component tuple.
+                let component = if mapped.is_some() { Buffer!::new().push_bytes(&cx, source).push_static(".e0").save(&cx) } else { source };
                 let (member, result) = out.at(&cx, 0usize);
                 let applied = walk.apply(&cx, rows.at(&cx, 0usize), component);
                 line(&lines, Buffer!::new().push_bytes(&cx, self.assign_result(&cx, Buffer!::new().push_bytes(&cx, dst).push_static(".").push_bytes(&cx, member).save(&cx), result, applied)));
                 return ();
             },
         };
-        var source_access = match skeleton {
+        // A mapped operand is a value of its expansion, with its own members; a source's are the
+        // skeleton's.
+        let accessed = if mapped.is_some() { self.shape(&cx, operand) } else { skeleton };
+        let source_access = match accessed {
             Type::Array(_elem, _length) => items_access(&cx, rows.len(&cx)),
-            _ => member_names(&cx, self.members(&cx, skeleton)),
+            _ => member_names(&cx, self.members(&cx, accessed)),
         };
-        if mapped.is_some() || is_foreach(t.source.copy(&cx)) {
-            let inner_shape = self.shape(&cx, operand);
-            source_access = match inner_shape {
-                Type::Array(_elem, _length) => items_access(&cx, rows.len(&cx)),
-                _ => member_names(&cx, self.members(&cx, inner_shape)),
-            };
-        }
         var k = 0usize;
         while k < rows.len(&cx) && k < source_access.len(&cx) && k < out.len(&cx) {
             let row = rows.at(&cx, k);
@@ -4443,9 +4411,9 @@ fn last_member(&cx: Domain!['k], members: ArenaVec[Member['k], 'k], name: Span['
 }
 
 // One foreach instruction's mapping of its rows: the transform at the specialization, the operand's
-// type when it is mapped (the map form), the mapper, its traversal binders, its own type arguments,
-// the captured values that pass something (as the mapper takes them, and as values), and whether
-// the source is a pointer whose components are pointers.
+// type when it is mapped (the map form), the mapper, its own type arguments, the captured values
+// that pass something (as the mapper takes them, and as values), and whether the source is a
+// pointer whose components are pointers.
 forall 'k.
 exposed struct Walk {
     backend: Backend['k],
@@ -4453,7 +4421,6 @@ exposed struct Walk {
     mapped: Option[ForeachType['k]],
     mapper: Fun['k],
     mapper_name: Span['k],
-    binders: ArenaVec[Span['k], 'k],
     own: ArenaVec[Type['k], 'k],
     caps: ArenaVec[Span['k], 'k],
     values: ArenaVec[Span['k], 'k],
@@ -4463,21 +4430,17 @@ exposed struct Walk {
 forall 'k.
 impl Walk['k] {
     fn apply(self, &cx: Domain!['k], row: Row['k], component: Span['k]) -> Span['k] {
-        let bound = self.backend.types.bind(&cx, self.t, row.item, row.extra);
+        let bound = self.backend.types.binding(&cx, self.t, row.item);
         // What the mapper is given: the source's component, or the mapped operand's at this row.
         let given = match self.mapped {
-            Option::Some(o) => mapped_component(&cx, o, bound.at(&cx, self.t.binder), self.backend.counter),
+            Option::Some(o) => mapped_component(&cx, o, bound, self.backend.counter),
             Option::None => row.item,
         };
         let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
-        var i = 0usize;
-        while i < self.mapper.params.len(&cx) && i < self.binders.len(&cx) {
-            sub.insert(&cx, self.mapper.params.at(&cx, i).name, bound.at(&cx, self.binders.at(&cx, i)));
-            i = i + 1usize;
-        }
-        var j = self.binders.len(&cx);
-        while j < self.mapper.params.len(&cx) && j - self.binders.len(&cx) < self.own.len(&cx) {
-            sub.insert(&cx, self.mapper.params.at(&cx, j).name, self.own.at(&cx, j - self.binders.len(&cx)));
+        sub.insert(&cx, self.mapper.params.at(&cx, 0usize).name, bound);
+        var j = 1usize;
+        while j < self.mapper.params.len(&cx) && j - 1usize < self.own.len(&cx) {
+            sub.insert(&cx, self.mapper.params.at(&cx, j).name, self.own.at(&cx, j - 1usize));
             j = j + 1usize;
         }
         let symbol = self.backend.request(&cx, FunKey::Function.(self.mapper_name), self.mapper, sub);

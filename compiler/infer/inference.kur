@@ -34,7 +34,7 @@ use package::sigs::signatures::{ConstValue, InstanceSig, Sig, Signatures, const_
 use package::syntax::ast as S;
 use package::syntax::ast::{Expr, Pattern, Pos, Statement, no_pos};
 use package::types::termination::check_instance_termination;
-use package::types::ops::{Fresh, Surface, Types, brand_differences, brand_name, equal, foreach_binders, free_brands, free_names, fresh, made_from, mapped_component, subst, surface};
+use package::types::ops::{Fresh, Surface, Types, brand_differences, brand_name, equal, free_brands, free_names, fresh, made_from, mapped_component, subst, surface};
 use package::types::unify::{ground, instantiate, match_head, prune, unify, zonk};
 use std::collections::hashmap::OwnedMap!;
 use std::collections::vec::OwnedVec!;
@@ -1516,6 +1516,15 @@ impl Body['k] {
         subst(&cx, self.inf.sigs.got(&cx, self.inf.sigs.type(&cx, type_expr, scope)), sub, self.inf.counter)
     }
 
+    // A type argument written at `pos`, which is never a foreach type (TY-FLAT).
+    fn argument(self, &cx: Domain!['k], type_expr: S::Type['k], pos: Pos) -> Type['k] {
+        let ty = self.core_type(&cx, type_expr);
+        match ty {
+            Type::Foreach(_f) => self.fails(&cx, "a type argument is a foreach type, which is only the type of a whole value, parameter or result", pos),
+            _ => ty,
+        }
+    }
+
     fn opt_type(self, &cx: Domain!['k], t: Option[S::Type['k]]) -> Option[Type['k]] {
         match t {
             Option::Some(x) => Option::Some.(self.core_type(&cx, x)),
@@ -2112,7 +2121,7 @@ impl Body['k] {
                     _ => false,
                 };
                 if !skipped && sub.contains(&cx, params.at(&cx, i).name) {
-                    self.unify_at(&cx, sub.at(&cx, params.at(&cx, i).name), self.core_type(&cx, a), path.pos);
+                    self.unify_at(&cx, sub.at(&cx, params.at(&cx, i).name), self.argument(&cx, a, path.pos), path.pos);
                 }
                 i = i + 1usize;
             }
@@ -2141,7 +2150,7 @@ impl Body['k] {
                     let given: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
                     var i = 0usize;
                     while i < written.len(&cx) {
-                        given.push(&cx, self.core_type(&cx, written.at(&cx, i)));
+                        given.push(&cx, self.argument(&cx, written.at(&cx, i), path.pos));
                         i = i + 1usize;
                     }
                     self.unify_at(&cx, subst(&cx, target, sub, self.inf.counter), C::named(name, given), path.pos);
@@ -2195,7 +2204,7 @@ impl Body['k] {
         let sub = self.instantiate_at(&cx, td.params, surface(&cx, ArenaVec::new(&cx), ArenaVec::one(&cx, td.name), ArenaMap::new(&cx)).name(&cx, td.name), pos);
         var i = 0usize;
         while i < written.len(&cx) {
-            self.unify_at(&cx, sub.at(&cx, td.params.at(&cx, i).name), self.core_type(&cx, written.at(&cx, i)), pos);
+            self.unify_at(&cx, sub.at(&cx, td.params.at(&cx, i).name), self.argument(&cx, written.at(&cx, i), pos), pos);
             i = i + 1usize;
         }
         self.require_parameter_kinds(&cx, td.params, sub, pos);
@@ -2616,10 +2625,7 @@ impl Body['k] {
         // A value of a foreach type is mapped (the map form): the result has its source, binder and
         // pattern, and each item is a component of the value. Anything else is the source itself.
         let mapped = match operand {
-            Type::Foreach(o) => match o.source.copy(&cx) {
-                Type::Foreach(_s) => Option::None,
-                _ => Option::Some.(o),
-            },
+            Type::Foreach(o) => Option::Some.(o),
             _ => Option::None,
         };
         let source = match mapped {
@@ -2637,43 +2643,26 @@ impl Body['k] {
             Option::Some(b) => b,
             Option::None => Span::from_static(&cx, ""),
         };
-        let sources = match source {
-            Type::Foreach(s) => foreach_binders(&cx, s),
-            _ => ArenaVec::new(&cx),
-        };
         if !written.is_empty() && (self.sig.params.any(&cx, |&cx, p: Param['k]| p.name.eq(&cx, written))
-            || self.open_binders.copy(&cx).any(&cx, |&cx, b: Span['k]| made_from(&cx, b).eq(&cx, written))
-            || sources.any(&cx, |&cx, b: Span['k]| made_from(&cx, b).eq(&cx, written))) {
+            || self.open_binders.copy(&cx).any(&cx, |&cx, b: Span['k]| made_from(&cx, b).eq(&cx, written))) {
             self.fail(&cx, Buffer!::new().push_static("foreach binder ").push_bytes(&cx, written).push_static(" shadows another type named ").push_bytes(&cx, written).save(&cx), f.pos);
         }
         let binder = Buffer!::new().push_bytes(&cx, written).push_static("#F").push_u64(self.inf.next_id(&cx) as u64).save(&cx);
         self.foreaches.insert(&cx, binder, (f.name, f.pos));
         self.kinds.insert(&cx, binder, Kind::Any);
         let outer = self.open_binders.copy(&cx);
-        var open_binders = outer.cons(&cx, binder);
         let (indirect, item) = match mapped {
             Option::Some(o) => (o.indirect, mapped_component(&cx, o, C::named(binder, ArenaVec::new(&cx)), self.inf.counter)),
-            Option::None => match source {
-                Type::Foreach(s) => {
-                    var i = 0usize;
-                    while i < sources.len(&cx) {
-                        self.kinds.insert(&cx, sources.at(&cx, i), Kind::Any);
-                        open_binders = open_binders.cons(&cx, sources.at(&cx, i));
-                        i = i + 1usize;
-                    }
-                    (false, s.body.copy(&cx))
-                },
-                _ => {
-                    let indirect = match self.shape(&cx, source, f.pos) {
-                        Type::Ptr(_p) => true,
-                        _ => false,
-                    };
-                    let named = C::named(binder, ArenaVec::new(&cx));
-                    (indirect, if indirect { C::ptr(&cx, named) } else { named })
-                },
+            Option::None => {
+                let indirect = match self.shape(&cx, source, f.pos) {
+                    Type::Ptr(_p) => true,
+                    _ => false,
+                };
+                let named = C::named(binder, ArenaVec::new(&cx));
+                (indirect, if indirect { C::ptr(&cx, named) } else { named })
             },
         };
-        self.open_binders.set(&cx, open_binders);
+        self.open_binders.set(&cx, outer.cons(&cx, binder));
         let frame = new_frame(&cx);
         self.frames.push(&cx, frame);
         self.enter(&cx);
@@ -3118,7 +3107,7 @@ impl Body['k] {
         while i < written.len(&cx) {
             let unit = match written.at(&cx, i) {
                 S::Type::Ignored => (),
-                _ => self.unify_at(&cx, targs.at(&cx, i), self.core_type(&cx, written.at(&cx, i)), c.pos),
+                _ => self.unify_at(&cx, targs.at(&cx, i), self.argument(&cx, written.at(&cx, i), c.pos), c.pos),
             };
             i = i + 1usize;
         }
@@ -3245,10 +3234,10 @@ impl Body['k] {
             }
             if lent.is_some() { C::u32_type(&cx) } else { Type::Tuple.(ArenaVec::two(&cx, operand, C::u32_type(&cx))) }
         } else if name.is(&cx, "sizeof") {
-            self.results().calls.insert(&cx, c.id, Callee::TypedBuiltin.(name, self.core_type(&cx, targs.at(&cx, 0usize))));
+            self.results().calls.insert(&cx, c.id, Callee::TypedBuiltin.(name, self.argument(&cx, targs.at(&cx, 0usize), c.pos)));
             C::usize_type(&cx)
         } else if name.is(&cx, "alloca") {
-            let target = self.core_type(&cx, targs.at(&cx, 0usize));
+            let target = self.argument(&cx, targs.at(&cx, 0usize), c.pos);
             self.results().calls.insert(&cx, c.id, Callee::TypedBuiltin.(name, target));
             C::ptr(&cx, target)
         } else if name.is(&cx, "fence") {

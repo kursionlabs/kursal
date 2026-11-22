@@ -24,7 +24,7 @@ use package::types::literals::valid_literal;
 use package::kurs::sexpr::Form;
 use package::syntax::ast::{Pos, no_pos};
 use package::types::termination::check_instance_termination;
-use package::types::ops::{Fresh, Types, children, equal, fits, foreach_binders, foreach_item, free_brands, fresh, kurs_error, mapped_component, mapped_operand, subst};
+use package::types::ops::{Fresh, Types, children, equal, fits, foreach_item, free_brands, fresh, kurs_error, mapped_component, mapped_operand, subst};
 use package::types::unify::match_head;
 use std::hash::{HashIn, HashState};
 use std::option::{Option, Result};
@@ -2572,13 +2572,10 @@ impl Checker['k] {
         let got = self.use_value(&cx, instr.args.at(&cx, 0usize));
         // The operand is the source, or (the map form) a value of a foreach type over the same source with
         // the same pattern, whose components are the mapper's inputs.
-        let mapped = mapped_operand(&cx, f, got);
+        let mapped = mapped_operand(got);
         let fits_source = match mapped {
             Option::None => equal(&cx, got, f.source.copy(&cx)),
-            Option::Some(o) => match o.source.copy(&cx) {
-                Type::Foreach(_s) => false,
-                _ => o.indirect == f.indirect && equal(&cx, o.source.copy(&cx), f.source.copy(&cx)),
-            },
+            Option::Some(o) => o.indirect == f.indirect && equal(&cx, o.source.copy(&cx), f.source.copy(&cx)),
         };
         if !fits_source {
             self.fail(&cx, "foreach_source");
@@ -2595,35 +2592,24 @@ impl Checker['k] {
             Option::Some(m) => m,
             Option::None => self.fail(&cx, "unknown_mapper"),
         };
-        let binders = foreach_binders(&cx, f);
-        if mapper.params.len(&cx) != binders.len(&cx) + instr.tys.len(&cx) || !mapper.places(&cx).is_empty(&cx) {
+        if mapper.params.len(&cx) != 1usize + instr.tys.len(&cx) || !mapper.places(&cx).is_empty(&cx) {
             self.fail(&cx, "mapper_takes_traversal_binders");
         }
-        // The mapper is checked for an arbitrary component, not only today's rows: each binder is a new
+        // The mapper is checked for an arbitrary component, not only today's rows: the binder is a new
         // variable, under a name no type of the caller's, premise or declaration has.
         let saved_kinds = self.kinds.copy(&cx);
-        let rigid: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+        var name = fresh(&cx, f.binder, self.counter);
+        while saved_kinds.contains(&cx, name) || self.program.types.contains(&cx, name) || name.eq(&cx, f.binder) {
+            name = fresh(&cx, f.binder, self.counter);
+        }
+        let rigid = C::named(name, ArenaVec::new(&cx));
         let kinds = saved_kinds.clone(&cx);
-        var b = 0usize;
-        while b < binders.len(&cx) {
-            let binder = binders.at(&cx, b);
-            var name = fresh(&cx, binder, self.counter);
-            while saved_kinds.contains(&cx, name) || self.program.types.contains(&cx, name) || binders.contains(&cx, name) {
-                name = fresh(&cx, binder, self.counter);
-            }
-            rigid.insert(&cx, binder, C::named(name, ArenaVec::new(&cx)));
-            kinds.insert(&cx, name, Kind::Any);
-            b = b + 1usize;
-        }
+        kinds.insert(&cx, name, Kind::Any);
         let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
-        var i = 0usize;
-        while i < mapper.params.len(&cx) && i < binders.len(&cx) {
-            sub.insert(&cx, mapper.params.at(&cx, i).name, rigid.at(&cx, binders.at(&cx, i)));
-            i = i + 1usize;
-        }
-        var j = binders.len(&cx);
+        sub.insert(&cx, mapper.params.at(&cx, 0usize).name, rigid);
+        var j = 1usize;
         while j < mapper.params.len(&cx) {
-            sub.insert(&cx, mapper.params.at(&cx, j).name, instr.tys.at(&cx, j - binders.len(&cx)));
+            sub.insert(&cx, mapper.params.at(&cx, j).name, instr.tys.at(&cx, j - 1usize));
             j = j + 1usize;
         }
         self.kinds.set(&cx, kinds);
@@ -2635,13 +2621,15 @@ impl Checker['k] {
         }
         let unit = self.instantiate(&cx, mapper.params, mapper.premises, chosen);
         self.kinds.set(&cx, saved_kinds);
+        let binding: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+        binding.insert(&cx, f.binder, rigid);
         let item = match mapped {
-            Option::None => subst(&cx, foreach_item(&cx, f), rigid, self.counter),
-            Option::Some(o) => mapped_component(&cx, o, rigid.at(&cx, f.binder), self.counter),
+            Option::None => subst(&cx, foreach_item(&cx, f), binding, self.counter),
+            Option::Some(o) => mapped_component(&cx, o, rigid, self.counter),
         };
         let ptypes = subst_all(&cx, mapper.ptypes, sub, self.counter);
         if ptypes.is_empty(&cx) || !equal(&cx, ptypes.at(&cx, 0usize), item)
-            || !equal(&cx, subst(&cx, mapper.ret, sub, self.counter), subst(&cx, f.body.copy(&cx), rigid, self.counter)) {
+            || !equal(&cx, subst(&cx, mapper.ret, sub, self.counter), subst(&cx, f.body.copy(&cx), binding, self.counter)) {
             self.fail(&cx, "mapper_does_map");
         }
         var k = 2usize;

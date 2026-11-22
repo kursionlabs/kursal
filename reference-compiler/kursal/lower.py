@@ -35,7 +35,7 @@ from .infer import (POINTER_OPS, BuiltinCall, ClosureCall, FnCall, FStringWrite,
 from .sexpr import KursError, List, Position, Str
 from .sigs import OPERATORS, ConstValue, OpConst, Sig, Signatures
 from .resolve import Resolver
-from .types import brand_name, equal, foreach_binders, foreach_item, mapped_component, mapped_operand, Types, free_brands, subst
+from .types import brand_name, equal, foreach_item, mapped_component, mapped_operand, Types, free_brands, subst
 
 ORDERINGS = {"Relaxed": "relaxed", "Acquire": "acquire", "Release": "release", "AcqRel": "acq_rel",
              "SeqCst": "seq_cst"}
@@ -1215,7 +1215,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         assert isinstance(ty, C.Foreach)
         # A mapped value (the map form) holds its components: only a traversal of the pointer itself
         # reads a sum's variant through it.
-        mapped = mapped_operand(ty, self.vty[vals[0]])
+        mapped = mapped_operand(self.vty[vals[0]])
         reads = mapped is None and self.types.sum_behind_pointer(ty.source, self.module, self.kinds)
         if reads and not self.authorized(expr):
             fail("a foreach through a pointer to a sum reads its variant there and requires unsafe authorization", expr.pos)
@@ -1397,9 +1397,8 @@ class MapperLower(Lifted[S.Foreach]):
                                                   item: C.Type) -> None:
         lowering = parent.lowering
         name = f"{parent.name}#foreach{next(lowering.closures)}"
-        binders = foreach_binders(ty)
         captured = [parent.bindings[c.binder_id].ty for c in expr.captures]
-        sig = Sig(name, None, tuple(C.Param(b, C.ANY) for b in binders) + parent.sig.params, parent.sig.premises,
+        sig = Sig(name, None, (C.Param(ty.binder, C.ANY), *parent.sig.params), parent.sig.premises,
                   (expr.name, *(c.name for c in expr.captures)), (item, *captured), frozenset(), ty.body, False, parent.sig.module)
         super().__init__(lowering, sig, expr, name)
         self.discharge_all = parent.discharge_all or parent.sig.unsafe

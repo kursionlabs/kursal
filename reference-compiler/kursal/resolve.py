@@ -750,7 +750,7 @@ class Names:
                 self.type(body, types)
             case S.TForeach(source=source, body=body):
                 self.type(source, types)
-                self.type(body, types | set(type_expr.binders()))
+                self.type(body, types | {type_expr.binder})
             case S.TForall(params=params, body=body):
                 self.type(body, types | {p for p in params if not p.startswith("'")})
 

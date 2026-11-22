@@ -710,7 +710,7 @@ impl Signatures['k] {
             NameRef::Builtin(name) => if name.is(&cx, "Exposed") || name.is(&cx, "Sized") { Option::Some.(name) } else { Option::None },
             _ => Option::None,
         };
-        let actual = self.types_of(&cx, args.args, scope)?;
+        let actual = self.components(&cx, args.args, scope, "a type argument")?;
         match builtin {
             Option::Some(name) => { return Result::Ok.(Premise.{ trait_name: name, args: actual }); },
             Option::None => (),
@@ -766,14 +766,25 @@ impl Signatures['k] {
     }
 
     // ---- types
-    fn types_of(self, &cx: Domain!['k], exprs: ArenaVec[S::Type['k], 'k], scope: Scope['k]) -> Result[ArenaVec[Type['k], 'k], SigError['k]] {
+    // Types written where a foreach type may not be (TY-FLAT): `what` names the place.
+    fn components(self, &cx: Domain!['k], exprs: ArenaVec[S::Type['k], 'k], scope: Scope['k], what: Slice[u8, 'static]) -> Result[ArenaVec[Type['k], 'k], SigError['k]] {
         let out: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < exprs.len(&cx) {
-            out.push(&cx, self.type(&cx, exprs.at(&cx, i), scope)?);
+            out.push(&cx, self.component(&cx, exprs.at(&cx, i), scope, what)?);
             i = i + 1usize;
         }
         Result::Ok.(out)
+    }
+
+    // A type written where a foreach type may not be (TY-FLAT): `what` names the place. A foreach type
+    // is a whole value's type, or a function's parameter or result.
+    fn component(self, &cx: Domain!['k], type_expr: S::Type['k], scope: Scope['k], what: Slice[u8, 'static]) -> Result[Type['k], SigError['k]] {
+        let ty = self.type(&cx, type_expr, scope)?;
+        match ty {
+            Type::Foreach(_f) => sig_error(Buffer!::new().push_static(what).push_static(" is a foreach type, which is only the type of a whole value, parameter or result").save(&cx), no_pos()),
+            _ => Result::Ok.(ty),
+        }
     }
 
     fn slot_types(self, &cx: Domain!['k], slots: ArenaVec[S::Slot['k], 'k], scope: Scope['k]) -> Result[ArenaVec[Type['k], 'k], SigError['k]] {
@@ -789,7 +800,7 @@ impl Signatures['k] {
     fn type(self, &cx: Domain!['k], type_expr: S::Type['k], scope: Scope['k]) -> Result[Type['k], SigError['k]] {
         match type_expr {
             S::Type::Name(n) => {
-                let args = self.types_of(&cx, n.args, scope)?;
+                let args = self.components(&cx, n.args, scope, "a type argument")?;
                 let not_a_type = Buffer!::new().push_static("not a type name: ").push_bytes(&cx, n.path.join(&cx, "::")).save(&cx);
                 let r = match self.r.refs.get(&cx, n.id) {
                     Option::Some(r) => r,
@@ -841,11 +852,11 @@ impl Signatures['k] {
                 }
                 Result::Ok.(Type::Skolem.(label))
             },
-            S::Type::Ptr(inner) => Result::Ok.(C::ptr(&cx, self.type(&cx, inner.copy(&cx), scope)?)),
+            S::Type::Ptr(inner) => Result::Ok.(C::ptr(&cx, self.component(&cx, inner.copy(&cx), scope, "a pointee")?)),
             S::Type::Never => Result::Ok.(Type::Never),
-            S::Type::Tuple(elems) => Result::Ok.(Type::Tuple.(self.types_of(&cx, elems, scope)?)),
+            S::Type::Tuple(elems) => Result::Ok.(Type::Tuple.(self.components(&cx, elems, scope, "a component")?)),
             S::Type::Array(elem, length) => {
-                let elem_type = self.type(&cx, elem.copy(&cx), scope)?;
+                let elem_type = self.component(&cx, elem.copy(&cx), scope, "a component")?;
                 let count = self.array_length(&cx, length.copy(&cx))?;
                 Result::Ok.(Type::Array.(Ref::new(&cx, elem_type), count))
             },
@@ -883,19 +894,13 @@ impl Signatures['k] {
                     binders.push(&cx, Param.{ name: label, kind: Kind::Brand });
                     i = i + 1usize;
                 }
-                let inner = self.type(&cx, body.copy(&cx), scope.extend(&cx, binders))?;
+                let inner = self.component(&cx, body.copy(&cx), scope.extend(&cx, binders), "a package body")?;
                 Result::Ok.(Type::Exists.(labels, Ref::new(&cx, inner)))
             },
             S::Type::Foreach(f) => {
-                let source = self.type(&cx, f.source.copy(&cx), scope)?;
-                let names = f.binders(&cx);
-                let bound: ArenaVec[Param['k], 'k] = ArenaVec::new(&cx);
-                var i = 0usize;
-                while i < names.len(&cx) {
-                    bound.push(&cx, Param.{ name: names.at(&cx, i), kind: Kind::Any });
-                    i = i + 1usize;
-                }
-                let body = self.type(&cx, f.body.copy(&cx), scope.extend(&cx, bound))?;
+                let source = self.component(&cx, f.source.copy(&cx), scope, "a foreach source")?;
+                let bound = ArenaVec::one(&cx, Param.{ name: f.binder, kind: Kind::Any });
+                let body = self.component(&cx, f.body.copy(&cx), scope.extend(&cx, bound), "a foreach body")?;
                 Result::Ok.(C::foreach_type(&cx, f.binder, f.indirect, source, body))
             },
             S::Type::Forall(tparams, body) => {
@@ -956,12 +961,12 @@ impl Signatures['k] {
                 var i = 0usize;
                 while i < node.fields.len(&cx) {
                     let field = node.fields.at(&cx, i);
-                    fields.push(&cx, Member.{ name: field.name, type: self.type(&cx, field.type, scope)? });
+                    fields.push(&cx, Member.{ name: field.name, type: self.component(&cx, field.type, scope, "a component")? });
                     i = i + 1usize;
                 }
                 (Type::Struct.(fields), node.exposure)
             },
-            Named::Tuple(node) => (Type::Tuple.(self.types_of(&cx, node.elems, scope)?), node.exposure),
+            Named::Tuple(node) => (Type::Tuple.(self.components(&cx, node.elems, scope, "a component")?), node.exposure),
             Named::Enum(node) => {
                 let variants: ArenaVec[Member['k], 'k] = ArenaVec::new(&cx);
                 var i = 0usize;
@@ -1044,9 +1049,9 @@ impl Signatures['k] {
             return Result::Ok.(C::unit(&cx));
         }
         if types.len(&cx) == 1usize {
-            return self.type(&cx, types.at(&cx, 0usize), scope);
+            return self.component(&cx, types.at(&cx, 0usize), scope, "a component");
         }
-        Result::Ok.(Type::Tuple.(self.types_of(&cx, types, scope)?))
+        Result::Ok.(Type::Tuple.(self.components(&cx, types, scope, "a component")?))
     }
 
     fn scope_module(self, &cx: Domain!['k], decl: Decl['k], path: ArenaVec[Span['k], 'k]) -> Result[ModuleId['k], SigError['k]] {
@@ -1234,7 +1239,7 @@ impl Signatures['k] {
             },
             Option::None => fail(&cx, Span::from_static(&cx, "internal error: an unresolved instance")),
         };
-        let arguments = self.types_of(&cx, head.args, scope)?;
+        let arguments = self.components(&cx, head.args, scope, "a type argument")?;
         let unit = self.check_arguments(&cx, trait_decl, arguments, scope, head.pos)?;
         let methods: ArenaVec[Sig['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;

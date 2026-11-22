@@ -14,7 +14,7 @@ from .sexpr import KursError, Position
 type Substitution = Mapping[str, Type]
 type Kinds = Mapping[str, Kind]
 type AlphaEnv = tuple[dict[str, object], dict[str, object]]
-type ForeachRow = tuple[str, Type, dict[str, Type]]
+type ForeachRow = tuple[str, Type]
 type Skeleton = Struct | Enum | Tuple | Array
 
 _fresh = count()
@@ -50,7 +50,7 @@ def map_children(ty: Type, transform: Callable[[Type], Type]) -> Type:
         case Exists(binders=binders, body=body):
             return Exists(binders, transform(body))
         case Foreach(binder=binder, indirect=indirect, source=source, body=body):
-            return Foreach(binder, indirect, transform(source), transform(body), ty.retained)
+            return Foreach(binder, indirect, transform(source), transform(body))
         case Fn(params=params, ret=ret, forall=forall):
             return Fn(tuple(transform(p) for p in params), transform(ret), forall, ty.unsafe, ty.places)
     return ty
@@ -71,8 +71,10 @@ def subst(ty: Type, sub: Substitution) -> Type:
         case Exists(binders=binders, body=body):
             binders, inner = _rebind(binders, sub)
             return Exists(binders, subst(body, inner))
-        case Foreach():
-            return subst_foreach(ty, sub)[0]
+        case Foreach(binder=binder, indirect=indirect, source=source, body=body):
+            source = subst(source, sub)
+            (binder,), inner = _rebind((binder,), sub, brand=False)
+            return Foreach(binder, indirect, source, subst(body, inner))
         case Fn(params=params, ret=ret, forall=forall):
             names, inner = _rebind(tuple(p.name for p in forall), sub)
             return Fn(tuple(subst(p, inner) for p in params), subst(ret, inner),
@@ -80,25 +82,15 @@ def subst(ty: Type, sub: Substitution) -> Type:
     return map_children(ty, lambda child: subst(child, sub))
 
 
-def foreach_binders(ty: Foreach) -> tuple[str, ...]:
-    """The binder prefix fixed when the transform was formed."""
-    return (ty.binder, *(ty.retained or ()))
-
-
 def foreach_item(ty: Foreach) -> Type:
-    """Abstract mapper input. A transformed source's body is the item only when this transform retains
-    every binder it names; otherwise the item is abstract, as over any other source."""
-    if isinstance(ty.source, Foreach) and ty.retained == foreach_binders(ty.source):
-        return ty.source.body
+    """The mapper's input where the operand is the source: the binder, or a pointer to it."""
     return Ptr(Named(ty.binder)) if ty.indirect else Named(ty.binder)
 
 
-def mapped_operand(ty: Foreach, operand: Type) -> Optional[Foreach]:
-    """The operand of a traversal that builds `ty`, when it is mapped (the map form): a value of a
-    foreach type, whose components are the mapper's inputs. None where the operand is the source."""
-    if not isinstance(operand, Foreach) or equal(operand, ty.source):
-        return None
-    return operand
+def mapped_operand(operand: Type) -> Optional[Foreach]:
+    """The operand of a traversal, when it is mapped (the map form): a value of a foreach type, whose
+    components are the mapper's inputs. None where the operand is the source, which is never a foreach."""
+    return operand if isinstance(operand, Foreach) else None
 
 
 def mapped_component(operand: Foreach, binding: Type) -> Type:
@@ -106,43 +98,12 @@ def mapped_component(operand: Foreach, binding: Type) -> Type:
     return subst(operand.body, {operand.binder: binding})
 
 
-def subst_foreach(ty: Foreach, sub: Substitution,
-                  avoid: Set[str] = frozenset()) -> tuple[Foreach, dict[str, Type]]:
-    """`ty` under `sub`, and the renamings of its binders (its own and those it retains).
-
-    Each body is substituted with `sub` less the names it binds, so a source binder it does not retain
-    is the enclosing variable of that name there. A binder is renamed where a replacement in any body
-    that binds it would capture it: a source's binder also avoids what an enclosing body that retains
-    it substitutes (`avoid`)."""
-    retained = ty.retained or ()
-    own = {k: v for k, v in sub.items() if k != ty.binder and k not in retained}
-    source: Type
-    renames: dict[str, Type]
-    if isinstance(ty.source, Foreach):
-        reached = set().union(avoid, *(free_names(v) for v in own.values()))
-        source, renames = subst_foreach(ty.source, sub, reached & set(retained))
-    else:
-        source, renames = subst(ty.source, sub), {}
-    carried = {b: renames[b] for b in retained if b in renames}
-    (binder,), inner = _rebind((ty.binder,), {**own, **carried}, brand=False, avoid=avoid)
-    names = tuple(_renamed(carried, b) for b in retained)
-    if binder != ty.binder:
-        carried[ty.binder] = Named(binder)
-    return Foreach(binder, ty.indirect, source, subst(ty.body, inner), names), carried
-
-
-def _renamed(sub: Substitution, binder: str) -> str:
-    """The name `sub` gives a type-variable binder: its renaming, else its own."""
-    renamed = sub.get(binder)
-    return renamed.name if isinstance(renamed, Named) else binder
-
-
 def _rebind(
-    binders: tuple[str, ...], sub: Substitution, brand: bool = True, avoid: Set[str] = frozenset()
+    binders: tuple[str, ...], sub: Substitution, brand: bool = True
 ) -> tuple[tuple[str, ...], dict[str, Type]]:
-    """Drop `binders` from `sub`, renaming any a replacement would capture, or that is in `avoid`."""
+    """Drop `binders` from `sub`, renaming any a replacement would capture."""
     inner = {k: v for k, v in sub.items() if k not in binders}
-    captured = set().union(avoid, *(free_names(v) for v in inner.values()))
+    captured = set().union(*(free_names(v) for v in inner.values()))
     out = []
     for b in binders:
         if b in captured:
@@ -166,7 +127,7 @@ def free_names(ty: Type, bound: Set[str] = frozenset()) -> set[str]:
         case Exists(binders=binders, body=body):
             return free_names(body, bound | set(binders))
         case Foreach(binder=binder, source=source, body=body):
-            return free_names(source, bound) | free_names(body, bound | set(foreach_binders(ty)))
+            return free_names(source, bound) | free_names(body, bound | {binder})
         case Fn(params=params, ret=ret, forall=forall):
             inner = bound | {p.name for p in forall}
             return set().union(free_names(ret, inner), *(free_names(p, inner) for p in params))
@@ -247,8 +208,7 @@ def equal(a: Type, b: Type, env: Optional[AlphaEnv] = None) -> bool:
             return len(xs) == len(ys) and equal(p, q, _bind(env, xs, ys))
         case Foreach(), Foreach():
             return (a.indirect == b.indirect and equal(a.source, b.source, env)
-                    and len(foreach_binders(a)) == len(foreach_binders(b))
-                    and equal(a.body, b.body, _bind(env, foreach_binders(a), foreach_binders(b))))
+                    and equal(a.body, b.body, _bind(env, (a.binder,), (b.binder,))))
         case Fn(), Fn():
             if (a.unsafe != b.unsafe or a.places != b.places or len(a.params) != len(b.params)
                     or len(a.forall) != len(b.forall)
@@ -500,7 +460,7 @@ class Types:
                         return self.is_copy(self.expand(ty), kinds)
                     finally:
                         self._expanding.pop()
-                return not (set(foreach_binders(ty)) & free_names(body)) and self.is_copy(body, kinds)
+                return ty.binder not in free_names(body) and self.is_copy(body, kinds)
         return all(self.is_copy(c, kinds) for c in children(ty))
 
     def rows_fixed(self, source: Type, kinds: Kinds) -> bool:
@@ -547,17 +507,9 @@ class Types:
 
     def rows(self, source: Type, module: Optional[ModuleId] = None, *,
              schema: bool = False) -> tuple[Optional[Skeleton], list[ForeachRow]]:
-        """One-level traversal of a foreach source: its outer skeleton (a
-        structural type, or None for a leaf) and one (label, item type,
-        retained bindings) row per component, in order. With `schema`, an array
-        contributes one element type even when its runtime length is zero."""
-        if isinstance(source, Foreach):
-            skeleton, inner = self.rows(source.source, module, schema=schema)
-            mapped = []
-            for label, item, extra in inner:
-                bound = self.bind(source, item, extra)
-                mapped.append((label, subst(source.body, bound), bound))
-            return skeleton, mapped
+        """One-level traversal of a foreach source: its outer skeleton (a structural type, or None for a
+        leaf) and one (label, item type) row per component, in order. With `schema`, an array contributes
+        one element type even when its runtime length is zero."""
         s = self.shape(source, module)
         wrap: Callable[[Type], Type] = lambda c: c
         if isinstance(s, Ptr):
@@ -566,36 +518,34 @@ class Types:
             s, wrap = self.shape(s.inner, module), Ptr
         match s:
             case Struct(fields=fields):
-                return s, [(n, wrap(f), {}) for n, f in fields]
+                return s, [(n, wrap(f)) for n, f in fields]
             case Tuple(elems=elems):
-                return s, [(str(i), wrap(e), {}) for i, e in enumerate(elems)]
+                return s, [(str(i), wrap(e)) for i, e in enumerate(elems)]
             case Array(elem=elem, length=length):
-                return s, [(str(i), wrap(elem), {}) for i in range(1 if schema else length)]
+                return s, [(str(i), wrap(elem)) for i in range(1 if schema else length)]
             case Enum(variants=variants):
-                return s, [(n, wrap(f), {}) for n, f in variants]
-        return None, [("0", source, {})]
+                return s, [(n, wrap(f)) for n, f in variants]
+        return None, [("0", source)]
 
-    def bind(self, ty: Foreach, item: Type, extra: Substitution) -> dict[str, Type]:
-        """The substitution under which `ty`'s body maps one row."""
-        retained = {name: extra[name] for name in (ty.retained or ()) if name in extra}
-        if ty.indirect:
-            if not isinstance(item, Ptr):
-                raise KursError("a pointer pattern needs pointer components")
-            return {**retained, ty.binder: item.inner}
-        return {**retained, ty.binder: item}
+    def binding(self, ty: Foreach, item: Type) -> Type:
+        """What `ty`'s binder stands for at the row whose item is `item`: the item, or the pointee of a
+        pointer item for the `*F` pattern."""
+        if not ty.indirect:
+            return item
+        if not isinstance(item, Ptr):
+            raise KursError("a pointer pattern needs pointer components")
+        return item.inner
 
     def pattern_available(self, ty: Foreach) -> bool:
-        """Prove *F matches every component from the source as written: an explicit pointer, a foreach
-        whose body is a pointer, or a tuple, struct, enum or array whose components are written as
-        pointers. A name is not looked through, even where its shape is visible.
+        """Prove *F matches every component from the source as written: an explicit pointer, or a tuple,
+        struct, enum or array whose components are written as pointers. A name is not looked through,
+        even where its shape is visible.
 
         Source exposure is a separate obligation.
         """
         if not ty.indirect:
             return True
         match ty.source:
-            case Foreach(body=body):
-                return isinstance(body, Ptr)
             case Ptr():
                 return True
             case Tuple(elems=elems):
@@ -609,7 +559,7 @@ class Types:
     def expand(self, ty: Foreach, module: Optional[ModuleId] = None) -> Type:
         """The structural type a foreach transform denotes."""
         skeleton, rows = self.rows(ty.source, module, schema=True)
-        mapped = [(label, subst(ty.body, self.bind(ty, item, extra))) for label, item, extra in rows]
+        mapped = [(label, subst(ty.body, {ty.binder: self.binding(ty, item)})) for label, item in rows]
         match skeleton:
             case Struct():
                 return Struct(tuple(mapped))
@@ -618,6 +568,24 @@ class Types:
             case Array(length=length):
                 return Array(mapped[0][1], length)
         return Tuple(tuple(m for _, m in mapped))
+
+    def expands_to_foreach(self, ty: Type) -> bool:
+        """`ty`'s head, unfolding declarations, is a foreach type (TY-FLAT). A declaration whose body's
+        head is one of its parameters takes the head of that argument; a cycle of heads is no foreach,
+        and a type parameter never is one. Components are not looked at."""
+        seen: list[Type] = []
+        while isinstance(ty, Named) and ty.name in self.program.types and not any(equal(ty, s) for s in seen):
+            seen.append(ty)
+            decl = self.program.types[ty.name]
+            sub = {p.name: a for p, a in zip(decl.params, ty.args)}
+            body = decl.body
+            if isinstance(body, Named) and not body.args and body.name in sub:
+                ty = sub[body.name]
+            elif isinstance(body, Named):
+                ty = Named(body.name, tuple(subst(a, sub) for a in body.args))
+            else:
+                ty = body
+        return isinstance(ty, Foreach)
 
 
 def show(ty: Type) -> str:
@@ -808,9 +776,7 @@ def _render(ty: Type) -> str:
             return f"(exists ({' '.join(map(brand, binders))}) {go(body)})"
         case Foreach(binder=binder, indirect=indirect, source=source, body=body):
             pattern = f"(ptr {binder})" if indirect else binder
-            inferred = (source.binder, *(source.retained or ())) if isinstance(source, Foreach) else ()
-            suffix = "" if ty.retained == inferred else " (retain " + " ".join(ty.retained or ()) + ")"
-            return f"(foreach ({pattern} {go(source)}) {go(body)}{suffix})"
+            return f"(foreach ({pattern} {go(source)}) {go(body)})"
         case Fn(params=params, ret=ret, unsafe=unsafe):
             return f"(fn {'(unsafe) ' if unsafe else ''}({' '.join(map(go, params))}) {go(ret)})"
     return "_"
@@ -841,8 +807,7 @@ def brand_differences(a: Type, b: Type) -> Optional[list[str]]:
                 return len(xs) == len(ys) and same(p, q, _bind(env, xs, ys))
             case Foreach(), Foreach():
                 return (x.indirect == y.indirect and same(x.source, y.source, env)
-                        and len(foreach_binders(x)) == len(foreach_binders(y))
-                        and same(x.body, y.body, _bind(env, foreach_binders(x), foreach_binders(y))))
+                        and same(x.body, y.body, _bind(env, (x.binder,), (y.binder,))))
             case Fn(), Fn():
                 if (x.unsafe != y.unsafe or x.places != y.places or len(x.params) != len(y.params)
                         or [p.kind for p in x.forall] != [p.kind for p in y.forall]):

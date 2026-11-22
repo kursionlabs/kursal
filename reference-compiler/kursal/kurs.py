@@ -79,15 +79,9 @@ def parse_type(form: Form) -> Type:
         pattern, source = _list(rest[0])
         indirect = _is(pattern, "ptr", 2)
         binder = str(_list(pattern)[1] if indirect else pattern)
-        retained = None
-        if len(rest) == 3:
-            annotation = _list(rest[2])
-            if not annotation or annotation[0] != "retain":
-                _fail("expected foreach retained-binder annotation", rest[2])
-            retained = tuple(map(str, annotation[1:]))
-        elif len(rest) != 2:
+        if len(rest) != 2:
             _fail("foreach requires source and body", form)
-        return Foreach(binder, indirect, parse_type(source), parse_type(rest[1]), retained)
+        return Foreach(binder, indirect, parse_type(source), parse_type(rest[1]))
     if head == "fn":
         unsafe = _is(rest[0], "unsafe", 1)
         rest = rest[1:] if unsafe else rest
@@ -416,13 +410,9 @@ def write_type(ty: Type) -> str:
             return _form(["brand", write_atom("$" + label)])
         case Exists(binders=binders, body=body):
             return _form(["exists", _brands(binders), write_type(body)])
-        case Foreach(binder=binder, indirect=indirect, source=source, body=body, retained=retained):
+        case Foreach(binder=binder, indirect=indirect, source=source, body=body):
             pattern = _form(["ptr", write_atom(binder)]) if indirect else write_atom(binder)
-            parts = ["foreach", _form([pattern, write_type(source)]), write_type(body)]
-            inferred = (source.binder, *(source.retained or ())) if isinstance(source, Foreach) else ()
-            if retained != inferred:
-                parts.append(_form(["retain", *map(write_atom, retained or ())]))
-            return _form(parts)
+            return _form(["foreach", _form([pattern, write_type(source)]), write_type(body)])
         case Fn(params=params, ret=ret, forall=forall, unsafe=unsafe, places=places):
             parts = ["fn", *(["(unsafe)"] if unsafe else [])]
             if forall:

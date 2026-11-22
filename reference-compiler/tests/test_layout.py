@@ -74,50 +74,40 @@ class LayoutTests(unittest.TestCase):
 
     def test_foreach_cannot_hide_growth_in_a_fresh_binder(self):
         self.rejects("""(type A (forall (T) ()
-          (struct (p (ptr (foreach (F (tuple (tuple T T))) (A F)))))))""",
+          (foreach (F (tuple (tuple T T))) (ptr (A F)))))""",
                      "foreach components.*may grow")
 
     def test_foreach_sources_and_bodies_must_terminate(self):
         self.rejects("(type A (foreach (F A) u32))", "recursive foreach source")
         self.rejects("(type A (foreach (F (ptr A)) u32))", "recursive foreach source")
         self.rejects("(type A (foreach (F (tuple u32)) (tuple A F)))", "infinite by-value layout")
-        self.compiles("(type A (foreach (F (tuple u32)) (ptr A)))", C.Named("A"))
+        self.rejects("(type A (foreach (F (tuple u32)) (ptr A)))", "a pointee expands to a foreach type in type A")
         self.rejects("(type A (foreach (A (tuple u32)) A))", "A is a declared type, not a parameter name")
 
     def test_foreach_components_that_hold_the_foreach_by_value_are_infinite(self):
-        # `*F` over `*T` binds F to each field type of T, so the field is the foreach again.
-        self.rejects("(type T (struct (f (foreach ((ptr F) (ptr T)) F))))", "^type T: infinite by-value layout$")
-        # A foreach source that maps T's fields brings the field back the same way.
-        self.rejects("(type T (struct (f (foreach (F (foreach ((ptr G) (ptr T)) G)) F))))",
-                     "^type T: infinite by-value layout$")
-        # A retained binder of the source is the field too.
-        self.rejects("(type T (struct (f (foreach (X (foreach ((ptr G) (ptr T)) u32)) G))))",
-                     "^type T: infinite by-value layout$")
+        # `*F` over `*T` binds F to each field type of T, so a declaration whose body is that foreach needs
+        # its own shape first.
+        self.rejects("(type T (foreach ((ptr F) (ptr T)) F))", "^recursive foreach source shape through T$")
         # Over a parameter the components are unknown; the use that chooses the argument is walked.
-        self.rejects("""(type S! (forall (P) () (struct (f (foreach ((ptr F) (ptr P)) F)))))
-          (type W! (struct (s (S! W!))))""", "^type S!: infinite by-value layout$")
+        self.rejects("""(type S! (forall (P) () (foreach ((ptr F) (ptr P)) (tuple F))))
+          (type W! (S! W!))""", "^recursive foreach source shape through W!$")
         # An enum source gives its payloads, and a pointer pattern over a tuple of pointers the pointees.
         self.rejects("""(type E (enum (A (ptr T)) (B (ptr u32))))
-          (type T (struct (f (foreach ((ptr F) E) F))))""", "^type T: infinite by-value layout$")
-        self.rejects("(type T (struct (f (foreach ((ptr F) (tuple (ptr T) (ptr u32))) F))))",
+          (type T (foreach ((ptr F) E) F))""", "^type T: infinite by-value layout$")
+        self.rejects("(type T (foreach ((ptr F) (tuple (ptr T) (ptr u32))) F))",
                      "^type T: infinite by-value layout$")
 
-    def test_foreach_components_behind_pointers_or_empty_arrays_are_finite(self):
+    def test_foreach_components_behind_pointers_are_finite(self):
         self.compiles("""(type L (struct (next (ptr L)) (v u32)))
-          (type M (struct (f (foreach ((ptr F) (ptr L)) F))))""", C.Named("M"))
-        self.compiles("(type T (struct (f (foreach (F (tuple (ptr T) u32)) F))))", C.Named("T"))
-        self.compiles("""(type B (forall (X) () (struct (b (ptr X)))))
-          (type T (struct (f (foreach ((ptr F) (ptr T)) (B (ptr T))))))""", C.Named("T"))
+          (type M (foreach ((ptr F) (ptr L)) F))""", C.Named("M"))
 
     def test_a_foreach_reached_again_behind_a_pointer_needs_a_name_between(self):
-        # Finite in memory, but C names a type by its expanded structure, which never ends: the
-        # field is a struct of a pointer to the field (or of an empty array of it).
-        for body in ("(foreach ((ptr F) (ptr T)) (ptr F))", "(foreach (F (ptr T)) F)",
-                     "(ptr (foreach ((ptr F) (ptr T)) (ptr F)))", "(foreach ((ptr F) (ptr T)) (fn (F) u32))",
-                     "(array (foreach ((ptr F) (ptr T)) F) 0)",
-                     "(foreach ((ptr F) (ptr T)) (B F))"):
-            with self.subTest(body=body):
-                self.rejects(f"(type B (forall (X) () (struct (b (ptr X))))) (type T (struct (f {body})))",
+        # Finite in memory, but C names a type by its expanded structure, which never ends: a function's
+        # parameter is a foreach whose expansion is a pointer to the function again.
+        for param in ("(foreach ((ptr F) (ptr T)) (ptr F))", "(foreach (F (ptr T)) F)",
+                      "(foreach ((ptr F) (ptr T)) (fn (F) u32))", "(foreach ((ptr F) (ptr T)) (B F))"):
+            with self.subTest(param=param):
+                self.rejects(f"(type B (forall (X) () (struct (b (ptr X))))) (type T (struct (f (fn ({param}) u32))))",
                              "^type T: recursive foreach needs a named type between$")
 
     def test_copy_query_of_a_foreach_holding_itself_ends(self):
@@ -149,7 +139,7 @@ class LayoutTests(unittest.TestCase):
     def test_surface_declarations_are_checked_before_inference(self):
         for source, error in (
             ("exposed struct Bad { inner: Bad }", "lib.kur:1:16: type p::Bad: infinite by-value layout$"),
-            ("struct T { f: foreach *F of *T => F }", "lib.kur:1:8: type p::T: infinite by-value layout$"),
+            ("struct T { f: foreach *F of *T => F }", "lib.kur:1:1: a component is a foreach type"),
             ("forall T. exposed struct Bad { next: *Bad[(T, T)] }", "recursive type expansion"),
         ):
             with self.subTest(source=source):

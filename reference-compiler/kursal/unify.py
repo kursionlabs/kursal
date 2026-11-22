@@ -5,7 +5,7 @@ from itertools import count
 from typing import Literal, Optional
 from . import core as C
 from .sexpr import Position
-from .types import children as type_children, extractable_names, foreach_binders, free_names, fresh, map_children, subst
+from .types import children as type_children, extractable_names, free_names, fresh, map_children, subst
 
 type MetaKind = Literal["type", "int", "float", "brand"]
 INTS = C.INTEGERS
@@ -147,9 +147,7 @@ def unify(a: C.Type, b: C.Type, *, closed: bool = False) -> bool:
                               tuple(C.Param(y, C.BRAND) for y in ys), (p,), (q,), closed)
         case C.Foreach(), C.Foreach():
             return (a.indirect == b.indirect and compare(a.source, b.source) and
-                    quantified(tuple(C.Param(n) for n in foreach_binders(a)),
-                               tuple(C.Param(n) for n in foreach_binders(b)), (a.body,), (b.body,), closed,
-                               scoped=True))
+                    quantified((C.Param(a.binder),), (C.Param(b.binder),), (a.body,), (b.body,), closed, scoped=True))
         case C.Fn(), C.Fn():
             if len(a.params) != len(b.params) or a.places != b.places or a.unsafe != b.unsafe:
                 return False

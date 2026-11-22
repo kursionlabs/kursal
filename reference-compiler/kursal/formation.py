@@ -9,7 +9,7 @@ from collections.abc import Callable
 
 from . import core as C
 from .sexpr import KursError, Position
-from .types import Kinds, Types, children, foreach_binders, subst, free_brands, free_names, equal
+from .types import Kinds, Types, children, subst, free_brands, free_names, equal
 
 
 def formation_children(ty: C.Type) -> tuple[C.Type, ...]:
@@ -96,6 +96,15 @@ class Formation:
             if retain and param.kind == C.BRAND and isinstance(arg, C.Ignored):
                 continue
             self.fits(arg, param.kind, env)
+            if param.kind != C.BRAND:
+                self.flat(arg, "a type argument")
+
+    def flat(self, ty: C.Type, what: str) -> None:
+        """TY-FLAT: a type that expands to a foreach is a whole value's type, a function's parameter or
+        result, or a declaration's body, never a component, a pointee, a package body, a foreach source
+        or body, or a type argument (premises' included)."""
+        if self.types.expands_to_foreach(ty):
+            self.fail(f"{what} expands to a foreach type")
 
     def premise(self, premise: C.Premise, env: Kinds) -> None:
         params: tuple[C.Param, ...]
@@ -158,17 +167,16 @@ class Formation:
                 if any(not brand_occurs(body, binder) for binder in binders):
                     self.fail("existential brand binder is unused")
                 self.within(binders, lambda: self.fits(body, C.ANY, inner))
+                self.flat(body, "a package body")
             case C.Foreach(binder=binder, source=source, body=body):
                 self.fits(source, C.ANY, env)
+                self.flat(source, "a foreach source")
                 # The type has an expansion only if every component is a pointer for `*F` to match, and
                 # it must have one at every instantiation: the source shows its pointers as written.
                 if ty.indirect and not self.types.pattern_available(ty):
                     self.fail(f"foreach *{binder} needs a source written with pointer components")
-                available = foreach_binders(source) if isinstance(source, C.Foreach) else ()
-                if tuple(available[:len(ty.retained or ())]) != ty.retained:
-                    self.fail("foreach retained binders must be a source prefix")
-                names = foreach_binders(ty)
-                self.within(names, lambda: self.fits(body, C.ANY, self.extend(env, tuple(C.Param(b) for b in names))))
+                self.within((binder,), lambda: self.fits(body, C.ANY, self.extend(env, (C.Param(binder),))))
+                self.flat(body, "a foreach body")
             case C.Fn(params=params, ret=ret, forall=forall, places=places):
                 if any(p.kind != C.BRAND for p in forall):
                     self.fail("function values quantify only brands")
@@ -192,6 +200,7 @@ class Formation:
             case C.Ptr() | C.NonNull() | C.Tuple() | C.Array() | C.Struct() | C.Enum() | C.Never():
                 for t in children(ty):
                     self.fits(t, C.ANY, env)
+                    self.flat(t, "a pointee" if isinstance(ty, (C.Ptr, C.NonNull)) else "a component")
             case _:
                 self.fail("unknown type node")
         return C.ANY
@@ -232,15 +241,17 @@ class Formation:
                 self.pos = i.pos
                 if i.ty is not None:
                     self.fits(i.ty, C.ANY, scope)
+                    if i.op == "alloca":
+                        self.flat(i.ty, "a pointee")
                 if i.op in {"call", "fn"} and i.args[0] in self.program.funs:
                     self.arguments(self.program.funs[i.args[0]].params, i.tys, scope, i.op == "fn")
                 elif i.op in {"call", "fn"} and i.args[0] in self.program.externs:
                     self.arguments((), i.tys, scope)
                 elif i.op == "foreach" and i.args[1] in self.program.funs:
-                    count = len(foreach_binders(i.ty)) if isinstance(i.ty, C.Foreach) else 0
+                    count = 1 if isinstance(i.ty, C.Foreach) else 0
                     mapper = self.program.funs[i.args[1]]
                     if any(p.kind == C.BRAND for p in mapper.params[:count]):
-                        self.fail("foreach binders require value parameters")
+                        self.fail("the foreach binder requires a value parameter")
                     self.arguments(mapper.params[count:], i.tys, scope)
                 elif i.op == "trait_call":
                     self.premise(C.Premise(i.args[0], i.tys), scope)
