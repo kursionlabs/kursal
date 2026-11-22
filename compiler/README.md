@@ -877,6 +877,8 @@ These are the places where Kursal differs from what one might expect.
   a case binds only inside its parentheses, so a misspelled one is an error (`Option[u8] has no
   variant Nothing`), not a catch-all. A sum with no declared name, such as a `foreach` over an
   `Option`, is matched by its labels the same way.
+- **An enum has at least one variant.** `enum E {}` is rejected (`enum E has no variant; an enum
+  has at least one`), in KURS too: a sum of no variant would be a type with no value.
 - **Struct literals** are `Point.{ x: 1u32, y }`; tuple structs and variants with a payload are built
   with `.(`: `Option::Some.(x)`. A spread `..rest` names a bundle made by a pattern
   (`let { x, ..rest } = p; Point.{ x: 2u32, ..rest }`), not an arbitrary value.

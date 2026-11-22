@@ -370,6 +370,8 @@ class Signatures:
             case S.TupleDecl(elems=elems):
                 body = C.Tuple(tuple(self.component(t, scope, "a component") for t in elems))
             case S.EnumDecl():
+                if not node.variants:
+                    fail(f"enum {node.name} has no variant; an enum has at least one", node.pos)
                 body = C.Enum(tuple((n, self.payload(p, scope)) for n, p in node.variants))
         exposure: Optional[C.Exposure] = ("owner", decl.module)
         if node.exposed is not None:

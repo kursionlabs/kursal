@@ -193,6 +193,8 @@ class Formation:
                     self.fail(f"unknown primitive {name}")
             case C.Array(length=length) if length < 0:
                 self.fail("negative array length")
+            case C.Enum(variants=()):
+                self.fail("an enum has at least one variant")
             case C.Struct(fields=fields) | C.Enum(variants=fields) if len({n for n, _ in fields}) != len(fields):
                 self.fail("duplicate component name")
             case C.Ignored():

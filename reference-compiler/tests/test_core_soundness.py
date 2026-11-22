@@ -366,6 +366,11 @@ REJECTED = {
         (fun (unsafe) f u32 () (entry ()
           (= %p (alloca (foreach (F (tuple u32)) F))) (= %r (const u32 0)) (ret %r)))"""),
 
+    # An enum has at least one variant: a sum of none would be a type with no value.
+    "empty_enum_declaration": ("an enum has at least one variant", "(type E (enum))"),
+    "empty_enum_written": ("an enum has at least one variant", """
+        (fun f usize () (entry () (= %n (sizeof (tuple (enum)))) (ret %n)))"""),
+
     # A zero-size type is erased: an unsafe cast has no representation of one to reinterpret, and C has
     # no zero-size parameter or object for an extern. Its loads and stores are accepted (test_zero_size).
     "cast_to_unit": ("zero_size_type_has_no_memory_form", """
