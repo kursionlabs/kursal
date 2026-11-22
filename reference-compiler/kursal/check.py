@@ -851,7 +851,8 @@ class Checker:
     def has_memory_form(self, ty: Type) -> None:
         """A zero-size type is erased: it has no C object and no C value, and `sizeof` of one is 0. A load or
         store of one through a pointer reads and writes nothing, and `alloca` of one gives a pointer that is
-        not null, so those accept it; an unsafe cast reinterprets a representation, which a zero-size type
+        not null, so those accept it (a store of a linear one, which would vanish, is `op_ptr_store`'s to
+        reject); an unsafe cast reinterprets a representation, which a zero-size type
         does not have, and C has no zero-size parameter or object, so casts and extern parameters and values
         reject zero-size types."""
         if self.types.zero_size(ty):
@@ -943,6 +944,9 @@ class Checker:
         p, v = self.use(instr.args[0]), self.use(instr.args[1])
         if not isinstance(p, Ptr) or not fits(v, p.inner):
             self.fail("store_through_pointer_another")
+        # A store of a zero-size type writes nothing, so a linear value stored so would vanish.
+        if self.types.zero_size(p.inner) and not self.copy_type(p.inner):
+            self.fail("zero_size_linear_store")
         return UNIT
 
     op_ptr_store_volatile = op_ptr_store

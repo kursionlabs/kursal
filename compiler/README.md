@@ -622,7 +622,11 @@ reads and writes are of nothing. Three operations still reject a zero-size type
 has no memory form`): an unsafe cast from or to one, which reinterprets a representation it does not
 have; and an extern parameter or extern value of one, which C has no form for. None of them can
 take a type parameter (a cast cannot take or produce a value of one, and an extern is not generic),
-so no specialization meets them, and the backend has no zero-size rule of its own. An atomic
+so no specialization meets them, and the backend has no zero-size rule of its own. A store of a
+zero-size linear type through a pointer (`unsafe *p = cap` for a capability, volatile or not) is
+rejected (`zero_size_linear_store`): it writes nothing, so the value would vanish; a `Copy` one, as
+`()`, is stored. A generic store at a type parameter is checked at the parameter, which is not
+zero-size. An atomic
 operation works on an integer, a bool or a pointer, never a zero-size type. `sizeof` of a zero-size
 type is 0, and the arithmetic the standard library does with sizes is defined at 0 (`checked_mul`
 does not divide by it, `bump_chunk` reserves no bytes and returns the current address,

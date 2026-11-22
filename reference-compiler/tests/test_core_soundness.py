@@ -371,8 +371,19 @@ REJECTED = {
     "empty_enum_written": ("an enum has at least one variant", """
         (fun f usize () (entry () (= %n (sizeof (tuple (enum)))) (ret %n)))"""),
 
+    # A store of a zero-size type writes nothing: a linear one, such as a capability, would vanish.
+    "zero_size_linear_store": ("zero_size_linear_store", """
+        (type Cap! (struct))
+        (fun (unsafe) f (tuple) ((ptr Cap!) Cap!) (entry ((%p (ptr Cap!)) (%c Cap!))
+          (= %u (ptr_store %p %c)) (ret %u)))"""),
+    "zero_size_linear_volatile_store": ("zero_size_linear_store", """
+        (type Cap! (struct))
+        (fun (unsafe) f (tuple) ((ptr (tuple Cap! (tuple))) (tuple Cap! (tuple)))
+          (entry ((%p (ptr (tuple Cap! (tuple)))) (%c (tuple Cap! (tuple))))
+            (= %u (ptr_store_volatile %p %c)) (ret %u)))"""),
+
     # A zero-size type is erased: an unsafe cast has no representation of one to reinterpret, and C has
-    # no zero-size parameter or object for an extern. Its loads and stores are accepted (test_zero_size).
+    # no zero-size parameter or object for an extern. Its loads and Copy stores are accepted (test_zero_size).
     "cast_to_unit": ("zero_size_type_has_no_memory_form", """
         (fun (unsafe) h (tuple) (u8) (entry ((%x u8)) (= %u (cast %x (tuple))) (ret %u)))"""),
     "cast_from_unit": ("zero_size_type_has_no_memory_form", """

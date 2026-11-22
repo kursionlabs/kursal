@@ -486,8 +486,9 @@ signature". It does not mean "verified correct".**
 **Zero sizes.** A zero-size type (`()`, a brand, a capability, an empty
 struct, `[T; 0]`) has size 0: `sizeof[T]()` is `0`, `alignof[T]()` is 1, and
 a load or store of one through a pointer reads and writes nothing (an unsafe
-cast from or to one, and an extern parameter or value of one, are still
-rejected; compiler/README.md, "Zero-size types are erased"). So every
+cast from or to one, an extern parameter or value of one, and a store of a
+linear one, which would vanish, are rejected; compiler/README.md, "Zero-size
+types are erased"). So every
 container and allocation function builds at a zero-size element type:
 `OwnedVec![()]`, `OwnedMap![K, ()]` (a set of owned keys), `Owned![()]`,
 `Vec!`, `HashMap!`, `Arena!::alloc` and `alloc_slice`, `Ref::new`,
