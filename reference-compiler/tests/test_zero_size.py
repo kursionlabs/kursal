@@ -70,7 +70,7 @@ class ZeroSizeTests(unittest.TestCase):
               (= %b (ne %q %z)) (jnz %b (yes) (no)))
             (yes () (= %r (const i32 1)) (ret %r))
             (no () (= %r (const i32 0)) (ret %r)))''', 1)
-        self.assertRegex(output, r"static char d0_empty;")
+        self.assertRegex(output, r"static const char d0_empty;")
 
     def test_enum_payloads_of_zero_size_types_are_tags(self):
         self.run_core('''(type Marker (struct))

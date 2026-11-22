@@ -275,6 +275,10 @@ double free.
 | `alloc::buffer::Buffer!::from_initialized_allocation` | the consumed `Uninit!` records its capacity and the first `len` bytes are initialized. A `len` past the recorded capacity aborts |
 | `alloc::collections::arena_vec::merge_runs` | `src` and `dst` each address `n` elements and do not overlap; one bottom-up merge pass of `ArenaVec::sort_by` and `Vec!::sort_by` |
 
+Every write through a raw pointer also has this obligation: it never addresses the static
+image, the bytes of a string constant (a `Slice[u8, 'static]` the compiler made). The C
+backend emits them `static const`, so a write there is undefined and may fault.
+
 
 ### 2.3 Reads through an arbitrary pointer
 

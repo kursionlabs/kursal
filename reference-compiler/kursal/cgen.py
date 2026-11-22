@@ -577,11 +577,12 @@ class Backend:
         return self.datas[name][0]
 
     def emit_data(self, entry: tuple[str, Data]) -> str:
-        """A data's C object; one of a zero-size type is a `char`, for the address the program sees."""
+        """A data's C object, read-only as the static image is; one of a zero-size type is a `char`, for the
+        address the program sees."""
         symbol, data = entry
         if self.erased(data.ty):
-            return f"static char {symbol};"
-        return f"static {self.ctype(data.ty)} {symbol} = {self.initializer(data.ty, data.init)};"
+            return f"static const char {symbol};"
+        return f"static const {self.ctype(data.ty)} {symbol} = {self.initializer(data.ty, data.init)};"
 
     def initializer(self, ty: Type, form: Form) -> str:
         s = self.shape(ty)
@@ -1102,7 +1103,8 @@ class Backend:
             ct = self.ctype(self.type_operand(instr))
             self.line(f"{dst} = UINT64_C(0);" if ct == "void" else f"{dst} = (uintptr_t)sizeof({ct});")
         elif op == "data":
-            self.line(f"{dst} = &{self.data_symbol(a[0])};")
+            # The program's pointer is not `const`: no write reaches the static image (CONTRACTS.md).
+            self.line(f"{dst} = ({self.ctype(self.program.datas[a[0]].ty)}*)&{self.data_symbol(a[0])};")
         elif op == "trap":
             self.line("KUR_TRAP();")
         elif op in ("pack", "open"):
