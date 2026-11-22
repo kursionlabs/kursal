@@ -16,6 +16,7 @@ the same C and the same readable KURS. Its `doc` writes a Krayon site whose page
 documentation comments and signatures, and whose links all lead somewhere."""
 
 import dataclasses
+import fcntl
 import functools
 import hashlib
 import html
@@ -128,18 +129,21 @@ def digest_of(paths: list[Path]) -> str:
 
 def cached(stem: str, key: str, make: Callable[[], list]) -> list:
     """`make()`, a JSON value, kept in .build/ as STEM-KEY.json until KEY changes. Test modules running at
-    once may each make the same value: each writes its own temporary file and moves it into place."""
+    once make it once: the first takes STEM.lock while it makes the value, and the others wait to read it."""
     path = CACHE / f"{stem}-{key}.json"
     if path.exists():
         return json.loads(path.read_text())
-    value = make()
     CACHE.mkdir(exist_ok=True)
-    for old in CACHE.glob(f"{stem}-*.json"):
-        if old != path:
-            old.unlink(missing_ok=True)
-    temporary = path.with_suffix(f".{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(value))
-    temporary.replace(path)
+    with open(CACHE / f"{stem}.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if path.exists():
+            return json.loads(path.read_text())
+        value = make()
+        for old in CACHE.glob(f"{stem}-*.json"):
+            old.unlink()
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(value))
+        temporary.replace(path)
     return value
 
 
@@ -925,40 +929,6 @@ def case_files(case: str | dict[str, str]) -> tuple[dict[str, str], str]:
 LOWER_CASES = tuple(case_files(case) for case, _ in LOWER_ERRORS)
 
 
-def recorded_lowerings(module_name: str) -> list[tuple[dict[str, str], str]]:
-    """The packages a test module lowers, outside the repository: its tests run with `lower` watched. Each
-    is the files of the directory holding the packages lowered, by relative path, and the path lowered."""
-    sys.setrecursionlimit(20000)
-    real_lower = lower_module.lower
-    found: list[tuple[dict[str, str], str]] = []
-
-    def watched(resolver, *args, **kwargs):
-        try:
-            roots = [p.root for p in resolver.packages if not p.root.is_relative_to(LIB)]
-            first = resolver.packages[0]
-            single = not (first.root / "kur.toml").exists()
-            target = next(iter(first.files.values())) if single else first.root
-            base = Path(os.path.commonpath(roots))
-            files = [f for f in base.rglob("*") if f.is_file() and f.suffix in (".kur", ".toml")]
-            if not base.is_relative_to(ROOT) and len(files) <= 20:
-                found.append(({str(f.relative_to(base)): f.read_text() for f in files}, str(target.relative_to(base))))
-        except Exception:  # noqa: BLE001 - a package that cannot be recorded is left out
-            pass
-        return real_lower(resolver, *args, **kwargs)
-
-    module = importlib.import_module(module_name)
-    patched = [m for name, m in list(sys.modules.items())
-               if (name.startswith("tests.") or name == module_name) and getattr(m, "lower", None) is real_lower]
-    for m in patched:
-        m.lower = watched
-    try:
-        unittest.TestLoader().loadTestsFromModule(module).run(unittest.TestResult())
-    finally:
-        for m in patched:
-            m.lower = real_lower
-    return found
-
-
 def materialize(directory: Path, files: dict[str, str]) -> None:
     for rel, text in files.items():
         (directory / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -977,21 +947,16 @@ def reference_case_lowering(case: tuple[dict[str, str], str]) -> str:
 def lowering_cases() -> list[dict]:
     """Every distinct package the reference's own tests lower outside the repository, and the cases of
     tests/lower_cases.py, each with the reference's lowering: {files, target, lower}."""
-    modules = sorted(path.stem for path in TESTS.glob("test_*.py")
-                     if path.stem not in ("test_compiler", "test_examples", "test_library", "test_kurs", "test_parallel_runner"))
-
     def make() -> list:
+        cases: dict[str, tuple[dict[str, str], str]] = {}
+        for files, target in [*recordings()[1], *LOWER_CASES]:
+            cases.setdefault(json.dumps([files, target], sort_keys=True), (files, target))
+        unique = list(cases.values())
         with ProcessPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
-            found = pool.map(recorded_lowerings, [f"tests.{module}" for module in modules])
-            cases: dict[str, tuple[dict[str, str], str]] = {}
-            for files, target in [case for group in found for case in group] + list(LOWER_CASES):
-                cases.setdefault(json.dumps([files, target], sort_keys=True), (files, target))
-            unique = list(cases.values())
             return [{"files": files, "target": target, "lower": text}
                     for (files, target), text in zip(unique, pool.map(reference_case_lowering, unique, chunksize=4))]
 
-    sources = [*TESTS.glob("*.py"), *(ROOT / "reference-compiler/kursal").glob("*.py"), *(ROOT / "lib").rglob("*.kur")]
-    return cached("lowerings", digest_of(sources), make)
+    return cached("lowerings", digest_of(RECORDED_SOURCES), make)
 
 
 SHAPES = {
@@ -1380,15 +1345,25 @@ def lowered_programs() -> list[dict[str, Optional[str]]]:
     return cached("lowered", digest_of(sources), make)
 
 
-def recorded_programs(module_name: str) -> list[str]:
-    """The core programs a test module checks, as KURS: its tests run with `check_program` and
-    `parse_program` watched. A program checked as it was read is its own text, so positions stay as the
-    test wrote them; any other is written out."""
+# The modules recording leaves out: this one, which builds the cases from the others, the ones that check
+# the repository's own packages (which the lowering cases leave out), and the parallel runner's.
+UNRECORDED = ("test_compiler", "test_examples", "test_library", "test_kurs", "test_parallel_runner",
+              "test_place_translation")
+
+
+def recorded(module_name: str) -> tuple[list[str], list[tuple[dict[str, str], str]]]:
+    """What a test module's tests check and lower, from one run of them with `parse_program`,
+    `check_program` and `lower` watched: the core programs it checks, as KURS (a program checked as it was
+    read is its own text, so positions stay as the test wrote them; any other is written out), and the
+    packages it lowers outside the repository, each as the files of the directory holding the packages
+    lowered, by relative path, and the path lowered."""
     sys.setrecursionlimit(20000)
     module = importlib.import_module(module_name)
     texts: dict[int, str] = {}
-    found: list[str] = []
+    programs: list[str] = []
+    packages: list[tuple[dict[str, str], str]] = []
     real_parse, real_check = module.__dict__.get("parse_program"), module.__dict__.get("check_program")
+    real_lower = lower_module.lower
 
     def parse(text, *args, **kwargs):
         program = real_parse(text, *args, **kwargs)
@@ -1399,18 +1374,57 @@ def recorded_programs(module_name: str) -> list[str]:
         try:
             written = write_program(program)
             original = texts.get(id(program))
-            found.append(original if original is not None and write_program(parse_program(original)) == written
-                         else written)
+            programs.append(original if original is not None and write_program(parse_program(original)) == written
+                            else written)
         except Exception:  # noqa: BLE001 - a program the writer cannot write is not recorded
             pass
         return real_check(program, *args, **kwargs)
+
+    def watched(resolver, *args, **kwargs):
+        try:
+            roots = [p.root for p in resolver.packages if not p.root.is_relative_to(LIB)]
+            first = resolver.packages[0]
+            single = not (first.root / "kur.toml").exists()
+            target = next(iter(first.files.values())) if single else first.root
+            base = Path(os.path.commonpath(roots))
+            files = [f for f in base.rglob("*") if f.is_file() and f.suffix in (".kur", ".toml")]
+            if not base.is_relative_to(ROOT) and len(files) <= 20:
+                packages.append(({str(f.relative_to(base)): f.read_text() for f in files}, str(target.relative_to(base))))
+        except Exception:  # noqa: BLE001 - a package that cannot be recorded is left out
+            pass
+        return real_lower(resolver, *args, **kwargs)
 
     if real_parse is not None:
         module.parse_program = parse
     if real_check is not None:
         module.check_program = check
-    unittest.TestLoader().loadTestsFromModule(module).run(unittest.TestResult())
-    return found
+    patched = [m for name, m in list(sys.modules.items())
+               if (name.startswith("tests.") or name == module_name) and getattr(m, "lower", None) is real_lower]
+    for m in patched:
+        m.lower = watched
+    try:
+        unittest.TestLoader().loadTestsFromModule(module).run(unittest.TestResult())
+    finally:
+        for m in patched:
+            m.lower = real_lower
+    return programs, packages
+
+
+RECORDED_SOURCES = [*TESTS.glob("*.py"), *(ROOT / "reference-compiler/kursal").glob("*.py"), *(ROOT / "lib").rglob("*.kur")]
+
+
+def recordings() -> list:
+    """`recorded` for every test module but the `UNRECORDED`, computed once per change to the sources: the
+    distinct core programs, then every package lowered."""
+    modules = sorted(path.stem for path in TESTS.glob("test_*.py") if path.stem not in UNRECORDED)
+
+    def make() -> list:
+        with ProcessPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
+            found = list(pool.map(recorded, [f"tests.{module}" for module in modules]))
+        return [list(dict.fromkeys(text for programs, _ in found for text in programs)),
+                [package for _, packages in found for package in packages]]
+
+    return cached("recorded", digest_of(RECORDED_SOURCES), make)
 
 
 def checked_case(text: str) -> Optional[dict[str, Optional[str]]]:
@@ -1445,18 +1459,12 @@ def checked_case(text: str) -> Optional[dict[str, Optional[str]]]:
 
 def core_cases() -> list[dict[str, Optional[str]]]:
     """Every distinct core program the other test modules check, with `checked_case`'s verdict."""
-    modules = sorted(path.stem for path in TESTS.glob("test_*.py") if "check_program" in path.read_text()
-                     and path.stem not in ("test_compiler", "test_examples", "test_library", "test_kurs",
-                                           "test_place_translation"))
-
     def make() -> list:
+        texts = recordings()[0]
         with ProcessPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
-            found = pool.map(recorded_programs, [f"tests.{module}" for module in modules])
-            texts = list(dict.fromkeys(text for group in found for text in group))
             return [case for case in pool.map(checked_case, texts, chunksize=16) if case is not None]
 
-    sources = [*TESTS.glob("*.py"), *(ROOT / "reference-compiler/kursal").glob("*.py")]
-    return cached("core", digest_of(sources), make)
+    return cached("core", digest_of(RECORDED_SOURCES), make)
 
 
 # Cases for `kursal selftest-types`; compiler/types/selftest.kur describes their forms.
