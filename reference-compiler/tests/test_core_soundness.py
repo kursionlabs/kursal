@@ -489,6 +489,9 @@ REJECTED = {
         (fun (unsafe) f (forall (T) () u32 ((ptr T)) (entry ((%p (ptr T))) (= %r (call (get T) &*%p)) (ret %r))))"""),
     # Foreign code calls an `unsafe fn` of the signature with values: it lends no place, so no function
     # type in an extern's signature takes a place parameter, nested or behind a pointer.
+    "extern_zero_size_linear_result": ("extern_zero_size_linear_result", """
+        (type Cap! (struct))
+        (extern fun make Cap! ())"""),
     "extern_callback_takes_place": ("extern_place_parameter", "(extern fun take u32 ((fn (unsafe) ((& u32)) u32)))"),
     "extern_nested_callback_takes_place": ("extern_place_parameter", """
         (type Callback (struct (run (fn (unsafe) (u8 (& u64)) u8))))

@@ -158,7 +158,8 @@ class Lowering:
     def foreign_signature(self, name: str, sig: Sig) -> None:
         """The core's rules for an extern's signature (`Checker.foreign_signature`), at the source: it takes no
         type or brand parameter and no place parameter, which foreign code cannot lend back, a parameter has
-        a memory form, the result holds nothing only checked code makes and no layout the compiler chooses,
+        a memory form, the result holds nothing only checked code makes and no layout the compiler chooses
+        and is zero-size only if it is Copy,
         and every function type in it is an `unsafe fn` type, whose parameters and result foreign code makes
         or takes as it does an extern's."""
         if sig.params:
@@ -172,6 +173,8 @@ class Lowering:
                  "value, a transform or Never, which only checked code makes")
         if self.types.chosen_layout(sig.ret):
             fail(f"extern {name} cannot return an enum or a NonNull, whose layout the compiler chooses")
+        if not isinstance(sig.ret, C.Never) and self.types.zero_size(sig.ret) and not self.types.is_copy(sig.ret):
+            fail(f"extern {name} returns a zero-size linear type, which foreign code would make from nothing")
         inner = f"extern {name} has an unsafe fn type in its signature that"
         functions = [fn for part in (*sig.ptypes, sig.ret) for fn in function_types(self.types, part)]
         if any(not fn.unsafe for fn in functions):

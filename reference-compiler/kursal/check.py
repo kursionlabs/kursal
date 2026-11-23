@@ -852,7 +852,8 @@ class Checker:
 
     def foreign_signature(self, ptypes: Sequence[Type], ret: Type) -> None:
         """DECL-EXTERN-FN and DECL-EXTERN-RESULT. A parameter has a memory form, and the result holds nothing
-        only checked code makes (`foreign_result`). A function type anywhere in the signature is an `unsafe
+        only checked code makes (`foreign_result`) and is zero-size only if it is Copy: a zero-size linear
+        result would be a resource foreign code made from nothing. A function type anywhere in the signature is an `unsafe
         fn` type: no safe function value comes from foreign code or goes to it. Foreign code calls such a
         value with arguments it makes, and takes its result, or hands the value back, so the program calls
         it: each parameter of one has a memory form and holds nothing only checked code makes, and so does
@@ -863,6 +864,8 @@ class Checker:
             self.has_memory_form(t)
         if not isinstance(ret, Never):
             self.foreign_result(ret)
+            if self.types.zero_size(ret) and not self.copy_type(ret):
+                self.fail("extern_zero_size_linear_result")
         functions = [fn for part in (*ptypes, ret) for fn in function_types(self.types, part)]
         if any(not fn.unsafe for fn in functions):
             self.fail("extern_safe_function_type")

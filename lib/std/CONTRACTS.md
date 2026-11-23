@@ -216,7 +216,9 @@ value, a transform, or `Never` (`extern_result_cannot_produce`; a result of
 `!` itself declares a function that does not return, as `abort` and `exit`
 are declared). It also rejects one that holds an enum or a `NonNull`
 (`extern_result_layout_chosen`): their layout is the compiler's choice, which
-C cannot know, and a `NonNull` from C may be null. An `unsafe fn` value may
+C cannot know, and a `NonNull` from C may be null. A zero-size result must be
+`Copy` (`extern_zero_size_linear_result`): C returns no bytes for it, so a
+zero-size linear one would be a resource made from nothing. An `unsafe fn` value may
 come back, since calling it needs `unsafe`. Parameters are not restricted
 this way: what Kursal hands C was made by checked code. A function type in an
 extern's signature, anywhere, is an `unsafe fn` type: C neither makes nor

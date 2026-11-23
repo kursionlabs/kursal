@@ -47,6 +47,8 @@ LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
     # whose parameters and result foreign code makes or takes as it does an extern's.
     ('forall T. extern "C" fn f(x: *T) -> u32;\n', "extern f takes no type or brand parameters"),
     ('extern "C" fn f(&x: u32) -> u32;\n', "extern f takes a place parameter; foreign code takes values"),
+    ('struct Cap! {}\nextern "C" fn make() -> Cap!;\n',
+     "extern make returns a zero-size linear type, which foreign code would make from nothing"),
     ('extern "C" fn f(n: u64, &x: u32) -> u32;\nfn g() -> u32 { var x = 1u32; unsafe f(2u64, &x) }\n',
      "extern f takes a place parameter; foreign code takes values"),
     ('extern "C" fn f(x: fn() -> u32) -> u32;\n', "extern f has a safe function type in its signature"),

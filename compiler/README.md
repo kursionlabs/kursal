@@ -922,7 +922,9 @@ These are the places where Kursal differs from what one might expect.
   with one is the caller's obligation (`lib/std/CONTRACTS.md`, section 2.3). What an extern function returns, like an unsafe
   cast's result, holds no package, brand witness, safe function value, transform or `Never` (a result
   of `!` itself is a function that does not return), and no enum or `NonNull`, whose layout C cannot
-  know (`extern_result_cannot_produce`, `extern_result_layout_chosen`); an `unsafe fn` value may come
+  know (`extern_result_cannot_produce`, `extern_result_layout_chosen`), and is zero-size only if it is
+  `Copy`, since a zero-size linear result would be a resource made from nothing
+  (`extern_zero_size_linear_result`; `extern f returns a zero-size linear type`); an `unsafe fn` value may come
   back (`lib/std/CONTRACTS.md`, section 2.0c). The walk is the by-value one: named types unfolded,
   not through a pointer, a function value or an array of length 0. An extern takes no type or brand
   parameter (`extern f takes no type or brand parameters`) and no zero-size one, and a function type
