@@ -681,14 +681,7 @@ impl FnLower['k] {
                 if load && contains(&cx, self.lowering.types, inner, |&cx, t: Type['k]| is_never(t)) {
                     self.fail(&cx, Span::from_static(&cx, "an unsafe read cannot produce a value that holds Never"), pos);
                 }
-                if !self.lowering.types.sized_available(&cx, inner, self.sig.premises) {
-                    if self.lowering.types.closed(&cx, inner) {
-                        self.fail(&cx, Span::from_static(&cx, "a raw read, write or alloca at a zero-size type"), pos);
-                    }
-                    let written = surface(&cx, ArenaVec::one(&cx, inner), ArenaVec::new(&cx), ArenaMap::new(&cx)).show(&cx, inner);
-                    self.fail(&cx, Buffer!::new().push_static("a raw read, write or alloca at ").push_bytes(&cx, written)
-                        .push_static(" needs Sized[").push_bytes(&cx, written).push_static("]").save(&cx), pos);
-                }
+                self.raw_access(&cx, inner, pos);
                 return;
             },
             Option::None => (),
@@ -709,6 +702,19 @@ impl FnLower['k] {
                 },
                 Option::None => (),
             };
+        }
+    }
+
+    // A raw read, write, `alloca` or lend of a raw pointer's target is at a `Sized` type, never a
+    // zero-size one (`Checker::raw_access`).
+    fn raw_access(self, &cx: Domain!['k], ty: Type['k], pos: Pos) {
+        if !self.lowering.types.sized_available(&cx, ty, self.sig.premises) {
+            if self.lowering.types.closed(&cx, ty) {
+                self.fail(&cx, Span::from_static(&cx, "a raw read, write or alloca at a zero-size type"), pos);
+            }
+            let written = surface(&cx, ArenaVec::one(&cx, ty), ArenaVec::new(&cx), ArenaMap::new(&cx)).show(&cx, ty);
+            self.fail(&cx, Buffer!::new().push_static("a raw read, write or alloca at ").push_bytes(&cx, written)
+                .push_static(" needs Sized[").push_bytes(&cx, written).push_static("]").save(&cx), pos);
         }
     }
 
@@ -1903,8 +1909,11 @@ impl FnLower['k] {
                                 }
                                 let unit = match self.vty.get(&cx, p) {
                                     Option::Some(t) => match t {
-                                        Type::Ptr(inner) => if contains(&cx, self.lowering.types, inner.copy(&cx), |&cx, t: Type['k]| is_never(t)) {
-                                            self.fails(&cx, "an unsafe lend of a pointer's target cannot lend a value that holds Never", expr_pos(arg));
+                                        Type::Ptr(inner) => {
+                                            if contains(&cx, self.lowering.types, inner.copy(&cx), |&cx, t: Type['k]| is_never(t)) {
+                                                self.fails(&cx, "an unsafe lend of a pointer's target cannot lend a value that holds Never", expr_pos(arg));
+                                            }
+                                            self.raw_access(&cx, inner.copy(&cx), expr_pos(arg));
                                         },
                                         _ => (),
                                     },

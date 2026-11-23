@@ -63,7 +63,7 @@ class AbstractShapeTests(unittest.TestCase):
             }""", 7)
 
     def test_generic_pointer_load_and_store_do_not_unfold_pointee(self):
-        self.run_source('''forall T. unsafe fn pass(x: T) -> T {
+        self.run_source('''forall T where Sized[T]. unsafe fn pass(x: T) -> T {
                 let p = core::mem::alloca[T]();
                 unsafe *p = x;
                 *p

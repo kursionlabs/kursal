@@ -501,16 +501,17 @@ signature". It does not mean "verified correct".**
 
 **Zero sizes.** A zero-size type (`()`, a brand, a capability, an empty
 struct, `[T; 0]`) has size 0: `sizeof[T]()` is `0` and `alignof[T]()` is 1.
-Memory never holds one on its own: a raw load, store or `alloca` at one is
-rejected, `Copy` or not (compiler/README.md, "Zero-size types are erased"),
+Memory never holds one on its own: a raw load, store or `alloca` at one, or
+a lend of a raw pointer's target of one (`f(unsafe &*p)`), is rejected, `Copy` or not (compiler/README.md, "Zero-size types are erased"),
 as are an unsafe cast from or to one and an extern parameter of one. So
 every function that reads or writes an element through a pointer takes
 `Sized` of it, `Sized[T]` for a type parameter (`where Sized[T]`): the
 containers and allocation functions, `Owned!`, `Vec!`, `OwnedVec!`,
 `HashMap!` and `OwnedMap!` (`Sized[K]` and `Sized[V]`), `Arena!::alloc`
 and `alloc_slice`, `Ref::new`, `ArenaVec`, `ArenaMap` and `ArenaSet`, and
-the raw accessors in `core` (`Ref::with`, `replace`, `copy`, `set` and
-`read`, `Region!::replace`, `Array!::set` and `get`, `raw_get`). An element
+the raw accessors in `core` (`Ref::with`, `update`, `update_in`, `replace`,
+`copy`, `set` and `read`, `Region!::replace`, `Array!::set` and `get`,
+`raw_get`, `lend` and `lend_in`). An element
 type holds bytes: `OwnedVec![()]`, `Owned![()]` and a map to `()` as a set
 are not formed, while a value with zero-size parts beside bytes, as
 `(Marker, u32)`, is. A caller discharges `Sized` where it calls: by the

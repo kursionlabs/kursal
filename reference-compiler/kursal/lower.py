@@ -296,11 +296,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         if accessed is not None:
             if op in ("ptr_load", "ptr_load_volatile") and contains(self.types, accessed, lambda t: isinstance(t, C.Never)):
                 fail("an unsafe read cannot produce a value that holds Never", pos)
-            if not self.types.sized_available(accessed, self.sig.premises):
-                if self.types.closed(accessed):
-                    fail("a raw read, write or alloca at a zero-size type", pos)
-                written = Surface((accessed,), {}).show(accessed)
-                fail(f"a raw read, write or alloca at {written} needs Sized[{written}]", pos)
+            self.raw_access(accessed, pos)
         elif op == "cast" and target is not None and ty is not None:
             if any(contains(self.types, t, self.uncastable) for t in (target, ty)):
                 fail("an unsafe cast cannot produce or take apart a package, a brand witness, a function value, "
@@ -321,6 +317,15 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
                 fail(f"atomic {kind} works on a pointer to an integer", pos)
             if not (integer or pointee == C.BOOL or isinstance(pointee, C.Ptr)):
                 fail(f"atomic {kind} works on a pointer to an integer, a bool or a pointer", pos)
+
+    def raw_access(self, ty: C.Type, pos: Optional[Position]) -> None:
+        """A raw read, write, `alloca` or lend of a raw pointer's target is at a `Sized` type, never a
+        zero-size one (`Checker.raw_access`)."""
+        if not self.types.sized_available(ty, self.sig.premises):
+            if self.types.closed(ty):
+                fail("a raw read, write or alloca at a zero-size type", pos)
+            written = Surface((ty,), {}).show(ty)
+            fail(f"a raw read, write or alloca at {written} needs Sized[{written}]", pos)
 
     def uncastable(self, ty: C.Type) -> bool:
         return isinstance(ty, (C.Exists, C.Brand, C.Fn, C.Foreach, C.Never)) or \
@@ -903,6 +908,8 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
                 pointer = self.vty.get(p) if p is not None else None
                 if isinstance(pointer, C.Ptr) and contains(self.types, pointer.inner, lambda t: isinstance(t, C.Never)):
                     fail("an unsafe lend of a pointer's target cannot lend a value that holds Never", arg.pos)
+                if isinstance(pointer, C.Ptr):
+                    self.raw_access(pointer.inner, arg.pos)
                 return None if p is None else "&*" + p
             path = self.place_path(target)
             if path is not None:

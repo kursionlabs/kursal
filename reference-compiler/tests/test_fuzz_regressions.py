@@ -86,9 +86,12 @@ REJECTED = (
      "'e.A' and another part of a place are lent by one call, but they do not part at a struct or tuple field"),
     # An `unsafe` marker does not lift the core's rules for memory: a cast takes and produces no zero-size
     # type, conjures no package, brand, function, transform, type parameter or Never and reinterprets no
-    # layout the compiler chooses, an extern takes no zero-size type, and an atomic operation works on an
-    # integer, a bool or a pointer.
+    # layout the compiler chooses, an extern takes no zero-size type, a raw read, write or alloca is never
+    # at one, and an atomic operation works on an integer, a bool or a pointer.
     ("fn g(x: ()) -> u32 { unsafe (x as u32) }\n", "a zero-size type has no memory form"),
+    ("fn g() -> u32 { let p = unsafe core::mem::alloca[()](); 0u32 }\n", "a raw read, write or alloca at a zero-size type"),
+    ("fn g(p: *()) -> u32 { let x = unsafe *p; 0u32 }\n", "a raw read, write or alloca at a zero-size type"),
+    ("fn g(p: *[u8; 0]) -> u32 { unsafe *p = []; 0u32 }\n", "a raw read, write or alloca at a zero-size type"),
     ('extern "C" fn ext(x: ()) -> u32;\n', "extern ext takes a zero-size type, which has no memory form"),
     ("forall T, U. unsafe fn convert(x: T) -> U { x as U }\n", "an unsafe cast cannot produce or take apart"),
     ("fn g(x: u64) -> core::cap::Brand['static] { unsafe (x as core::cap::Brand['static]) }\n",
@@ -137,10 +140,6 @@ ACCEPTED = (
     "fn three(&a: u32, &b: u32, &c: u32) -> u32 { 0u32 }\n"
     "fn f() -> u32 { var x = (1u32, 2u32); var y = 3u32; three(&x.0, &y, &x.1) }\n",
     'extern "C" fn ext(x: (u32, ())) -> u32;\n',
-    # A zero-size type is allocated, read and written through a pointer as nothing.
-    "fn g() -> u32 { let p = unsafe core::mem::alloca[()](); 0u32 }\n",
-    "fn g(p: *()) -> u32 { let x = unsafe *p; 0u32 }\n",
-    "fn g(p: *[u8; 0]) -> u32 { unsafe *p = []; 0u32 }\n",
     "fn g(x: u64) -> (u32, u32) { unsafe (x as (u32, u32)) }\n",
     "fn g(p: core::ptr::NonNull[u8]) -> *u8 { unsafe (p as *u8) }\n",
     "fn g(p: *bool) -> bool { unsafe p.atomic_load(core::atomic::Ordering::SeqCst) }\n",

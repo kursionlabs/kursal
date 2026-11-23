@@ -620,6 +620,7 @@ class Checker:
                     self.fail("raw_target_lend_wrong")
                 if contains(self.types, want, lambda t: isinstance(t, Never)):
                     self.fail("unsafe_read_cannot_produce_never")
+                self.raw_access(want)
             elif arg.startswith("&"):
                 if not equal(self.path_type(arg), want):
                     self.fail("lent_place_type_expected")
@@ -989,8 +990,9 @@ class Checker:
     op_ptr_store_volatile = op_ptr_store
 
     def raw_access(self, ty: Type) -> None:
-        """MEM-SIZED-ACCESS: a raw load, store or `alloca` is at a type of non-zero size, never a zero-size
-        one, which has no memory to read, write or reserve: it needs `Sized` of the type
+        """MEM-SIZED-ACCESS: a raw load, store, `alloca` or lend of a raw pointer's target (`&*p`, a read
+        and a write) is at a type of non-zero size, never a zero-size one, which has no memory to read,
+        write or reserve: it needs `Sized` of the type
         (`Types.sized_available`), which the shape decides for a type without parameters, and which
         otherwise holds by an exact premise or a part with bytes whatever the parameters are. Nothing is
         checked again at an instantiation; a caller discharges `Sized`."""

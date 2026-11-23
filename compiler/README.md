@@ -613,7 +613,8 @@ function is its own function pointer. A function that takes and returns only zer
 
 Erasing them never changes what a program reads or writes: a zero-size value has no bytes to read
 or write, and memory never holds one on its own. A raw load or store (`ptr_load`, `ptr_store`,
-volatile or not) or an `alloca` is formed only at a type with `Sized` (MEM-SIZED-ACCESS): at a type
+volatile or not), an `alloca`, or a lend of a raw pointer's target (`f(unsafe &*p)`, which reads and
+writes it) is formed only at a type with `Sized` (MEM-SIZED-ACCESS): at a type
 without parameters, one that is not zero-size, so `unsafe *p` at `()`, a `Brand['k]` or a capability
 is rejected, `Copy` or not (`raw_access_at_zero_size`, and at the source `a raw read, write or
 alloca at a zero-size type`); at a type that mentions a parameter, one with an exact `Sized`
