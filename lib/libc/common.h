@@ -10,9 +10,14 @@
 #define _TIME_BITS 64
 /* `sched_getaffinity`, `CPU_COUNT`, `pipe2` and the GNU `strerror_r`, where
  * the C library has them. */
+#ifdef __APPLE__
+/* `_XOPEN_SOURCE` would hide macOS's own extensions (`_SC_NPROCESSORS_ONLN`). */
+#define _DARWIN_C_SOURCE
+#else
 #define _GNU_SOURCE
 #define _DEFAULT_SOURCE
 #define _XOPEN_SOURCE 700
+#endif
 
 #include "libc.h"
 #include <errno.h>

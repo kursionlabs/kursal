@@ -10,7 +10,8 @@
 #
 # Every stage compiles its C with $KURSAL_CC, else clang, at -O3 (reference-compiler/kursal/cc.py);
 # stages 1 and 2 split it into a file per module and link with link-time optimization.
-# Every run of a Kursal-built compiler is capped at 6 GB of address space and 10 minutes.
+# Every run of a Kursal-built compiler is capped at 6 GB of address space and 10 minutes, where
+# the system can (not macOS's `ulimit -v`, nor its missing `timeout`).
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -24,8 +25,13 @@ esac
 
 export KURSAL_LIB="$root/lib"
 
+# macOS has neither `timeout` (unless coreutils' gtimeout is installed) nor a working `ulimit -v`.
+if command -v timeout >/dev/null 2>&1; then limit_time="timeout 600"
+elif command -v gtimeout >/dev/null 2>&1; then limit_time="gtimeout 600"
+else limit_time=""; fi
+
 kursal() {
-    (ulimit -v 6000000; timeout 600 "$@")
+    (ulimit -v 6000000 2>/dev/null || true; exec $limit_time "$@")
 }
 
 mkdir -p "$bin/stage0"

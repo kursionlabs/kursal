@@ -161,7 +161,11 @@ int64_t kur_libc_process_spawn(const uint8_t *line, uintptr_t len, uintptr_t cou
         }
     }
 #ifndef KUR_LIBC_NO_ADDCHDIR
+#ifdef __APPLE__
+    if (dir && !failed) failed = posix_spawn_file_actions_addchdir(&actions, (const char *)dir);
+#else
     if (dir && !failed) failed = posix_spawn_file_actions_addchdir_np(&actions, (const char *)dir);
+#endif
 #endif
     posix_spawnattr_t attributes;
     int attributes_made = 0;
