@@ -106,7 +106,7 @@ through their exit status.
 | `at_sugar` | `&` in-out parameters |
 | `tuple_decl` | `tuple Name(T, ...);` declarations |
 | `non_null` | `NonNull[T]`, the pointer that is never null, and the enums whose layout it fills: `Option[NonNull[T]]`, `Option[Ref[T, 'k]]`, a `List` link and a user's own enum are one word |
-| `zero_size` | zero-size types (`()`, brands, capabilities, markers, empty arrays): no bytes in `sizeof`, in the structs that hold them, or in calls, matches, pointers and the arena; a vector of units and a set as a map to `()` |
+| `zero_size` | zero-size types (`()`, brands, capabilities, markers, empty arrays): no bytes in `sizeof`, in the structs that hold them, or in calls and matches; no raw read, write or `alloca` at one, so a container holds one only beside bytes |
 
 ## Rejected programs (`bad/`)
 

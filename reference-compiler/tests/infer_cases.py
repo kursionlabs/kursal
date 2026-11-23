@@ -192,10 +192,13 @@ INFERENCES = (
     "exposed struct S { a: u32, b: u32 }\nfn main() -> i32 {\n    let s = S.{ a: 7u32, b: 9u32 };\n"
     "    let t = foreach a: A of s { (a, 1u8) };\n    let u = foreach b: A of t { let (c, n) = b; let d: A = c; d };\n"
     "    let { a: x, b: y } = u;\n    (x + y) as i32\n}\n",
-    # `Sized` of a concrete type of non-zero size, and of a parameter under the caller's own premise.
+    # `Sized` of a concrete type of non-zero size, of a parameter and of a tuple of parameters under the
+    # caller's own premise for exactly it, and of a type with a part of bytes whatever the parameter is.
     "forall T where Sized[T]. fn need(x: T) -> T { x }\nstruct P { a: (), b: u8 }\n"
     "fn concrete(p: P, q: *()) -> *() { let r = need(p); need(q) }\n"
-    "forall U where Sized[U]. fn forward(x: U) -> U { need[U](x) }\n",
+    "forall U where Sized[U]. fn forward(x: U) -> U { need[U](x) }\n"
+    "forall U, V where Sized[(U, V)]. fn pair(x: (U, V)) -> (U, V) { need(x) }\n"
+    "forall U. fn leaf(x: (U, u8)) -> (U, u8) { need(x) }\n",
 )
 
 INFER_ERRORS = (
@@ -407,15 +410,16 @@ INFER_ERRORS = (
     ("exposed struct S { a: u32, b: u32 }\nfn main() -> i32 {\n    let s = S.{ a: 7u32, b: 9u32 };\n"
      "    let t = foreach f: F of s {\n        let u = foreach g: F of s { g };\n        f\n    };\n    0i32\n}\n",
      "5:17: foreach binder F shadows another type named F"),
-    # `Sized` holds of a parameter only by the caller's own premise for exactly it, and never of a
+    # `Sized` holds of a type with parameters only by the caller's own premise for exactly it or a part of
+    # bytes whatever the parameters are, so not of a tuple of `Sized` parameters, and never of a
     # zero-size type.
     ("forall T where Sized[T]. fn need(x: T) -> T { x }\nforall U. fn bad(x: U) -> U { need[U](x) }\n",
      "Sized requires an exact premise"),
     ("forall T where Sized[T]. fn need(x: T) -> T { x }\n"
-     "forall U where Sized[U]. fn bad(x: (U, u8)) -> (U, u8) { need(x) }\n", "Sized requires an exact premise"),
+     "forall U, V where Sized[U], Sized[V]. fn bad(x: (U, V)) -> (U, V) { need(x) }\n", "Sized requires an exact premise"),
     ("forall T where Sized[T]. fn need(x: T) -> T { x }\nfn bad(x: ((), [u64; 0])) -> ((), [u64; 0]) { need(x) }\n",
      "Sized requires an exact premise"),
-    # A region over a zero-size value has no fields to split into.
+    # A zero-size value has no heap block, so no region to split.
     ("use std::owned::Owned!;\nfn main() -> i32 {\n    let exists 'r. (alloc, region) = Owned!::new(((), ())).open();\n"
      "    let (restore, splitting) = region.split();\n    0i32\n}\n", "Sized requires an exact premise"),
 )

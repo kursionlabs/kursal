@@ -35,7 +35,7 @@ from .infer import (POINTER_OPS, BuiltinCall, ClosureCall, FnCall, FStringWrite,
 from .sexpr import KursError, List, Position, Str
 from .sigs import OPERATORS, ConstValue, OpConst, Sig, Signatures
 from .resolve import Resolver
-from .types import brand_name, equal, foreach_item, mapped_component, mapped_operand, Types, free_brands, subst
+from .types import brand_name, equal, foreach_item, mapped_component, mapped_operand, Surface, Types, free_brands, subst
 
 ORDERINGS = {"Relaxed": "relaxed", "Acquire": "acquire", "Release": "release", "AcqRel": "acq_rel",
              "SeqCst": "seq_cst"}
@@ -186,8 +186,8 @@ class Lowering:
                          "transform or Never, which only checked code makes")
                 if self.types.chosen_layout(t):
                     fail(f"{inner} takes or returns an enum or a NonNull, whose layout the compiler chooses")
-            if self.types.zero_size(fn.ret) and not self.types.erasable(fn.ret):
-                fail(f"{inner} returns a zero-size type with no erased value")
+            if self.types.zero_size(fn.ret) and not self.types.is_copy(fn.ret):
+                fail(f"{inner} returns a zero-size linear type, which C's void would make vanish")
 
     def located(self, fun: C.Fun) -> AbstractContextManager[None]:
         return self.r.located(fun.module, fun.pos) if fun.module is not None else nullcontext()
@@ -286,17 +286,21 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         through a pointer does not produce a value that holds Never; a cast does not conjure what only a
         checked operation makes, nor reinterpret a layout the compiler chooses, nor take or produce a
         zero-size type, which has no representation to reinterpret, nor convert a pointer but to or from a
-        pointer or an integer; an atomic operation works on an integer, a bool or a pointer. A load or store
-        of a zero-size type reads and writes nothing, so it needs a type with an erased value, which holds
-        no brand witness, package or linear value; `alloca` of one is not null."""
+        pointer or an integer; an atomic operation works on an integer, a bool or a pointer. A load, store or
+        `alloca` is never at a zero-size type, which has no memory to touch: it needs `Sized` of the type,
+        so `Sized[T]` at a type parameter `T`, as nothing is checked at an instantiation."""
         target = self.vty.get(args[0]) if args else None
         pointee = target.inner if isinstance(target, C.Ptr) else None
-        if op in ("ptr_load", "ptr_load_volatile", "ptr_store", "ptr_store_volatile") and pointee is not None:
-            if op in ("ptr_load", "ptr_load_volatile") and contains(self.types, pointee, lambda t: isinstance(t, C.Never)):
+        raw = op in ("ptr_load", "ptr_load_volatile", "ptr_store", "ptr_store_volatile")
+        accessed = ty if op == "alloca" else pointee if raw else None
+        if accessed is not None:
+            if op in ("ptr_load", "ptr_load_volatile") and contains(self.types, accessed, lambda t: isinstance(t, C.Never)):
                 fail("an unsafe read cannot produce a value that holds Never", pos)
-            if self.types.zero_size(pointee) and not self.types.erasable(pointee):
-                fail("a zero-size type that holds a brand witness, a package or a linear value is not read or "
-                     "written through a pointer", pos)
+            if not self.types.sized_available(accessed, self.sig.premises):
+                if self.types.closed(accessed):
+                    fail("a raw read, write or alloca at a zero-size type", pos)
+                written = Surface((accessed,), {}).show(accessed)
+                fail(f"a raw read, write or alloca at {written} needs Sized[{written}]", pos)
         elif op == "cast" and target is not None and ty is not None:
             if any(contains(self.types, t, self.uncastable) for t in (target, ty)):
                 fail("an unsafe cast cannot produce or take apart a package, a brand witness, a function value, "

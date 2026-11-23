@@ -312,11 +312,10 @@ receipt, anything holding or capturing one), zero-size or not, may be read only 
 value of that type was moved into and not since moved out of. The checker does not track this; a
 read that conjures a witness some other way breaks the obligation, as a read of any type from
 memory that does not hold one does. An unsafe cast never produces a witness: the checker rejects a
-cast whose result holds one in its value. At a zero-size type the checker rejects the read itself, and
-the write: a load or store of one reads and writes nothing, so it is formed only at a type with an
-erased value, which holds no brand witness, package or linear value (compiler/README.md, "Zero-size
-types are erased"). Generic code is checked at its type parameter, which is not zero-size there; a
-read or write it makes at a zero-size instantiation owes the same, and this obligation covers it.
+cast whose result holds one in its value. A zero-size type is never read or written through a
+pointer at all: a raw load, store or `alloca` needs `Sized` of its type, checked where it is written
+(compiler/README.md, "Zero-size types are erased"), so no read conjures a zero-size witness and no
+write makes one vanish.
 
 A read through a pointer never produces `Never`. No memory holds a value of `!`, nor of a type that
 holds one in its value (a struct, tuple or array of length above 0 with a component that does, an enum
@@ -501,39 +500,34 @@ signature". It does not mean "verified correct".**
   out-of-bounds indices.
 
 **Zero sizes.** A zero-size type (`()`, a brand, a capability, an empty
-struct, `[T; 0]`) has size 0: `sizeof[T]()` is `0`, `alignof[T]()` is 1, and
-a load or store of one through a pointer reads and writes nothing (an unsafe
-cast from or to one, an extern parameter of one, and a load or store
-of one with no erased value, which holds a brand witness, a package or a
-linear value, are rejected; compiler/README.md, "Zero-size types are
-erased"). So every
-container and allocation function builds at a zero-size element type:
-`OwnedVec![()]`, `OwnedMap![K, ()]` (a set of owned keys), `Owned![()]`,
-`Vec!`, `HashMap!`, `Arena!::alloc` and `alloc_slice`, `Ref::new`,
-`ArenaVec` and `ArenaMap`. The size arithmetic is defined at 0, and no
-pointer a zero-size value is reached through is null, so none lands in a
-`NonNull` or a `Ref`:
+struct, `[T; 0]`) has size 0: `sizeof[T]()` is `0` and `alignof[T]()` is 1.
+Memory never holds one on its own: a raw load, store or `alloca` at one is
+rejected, `Copy` or not (compiler/README.md, "Zero-size types are erased"),
+as are an unsafe cast from or to one and an extern parameter of one. So
+every function that reads or writes an element through a pointer takes
+`Sized` of it, `Sized[T]` for a type parameter (`where Sized[T]`): the
+containers and allocation functions, `Owned!`, `Vec!`, `OwnedVec!`,
+`HashMap!` and `OwnedMap!` (`Sized[K]` and `Sized[V]`), `Arena!::alloc`
+and `alloc_slice`, `Ref::new`, `ArenaVec`, `ArenaMap` and `ArenaSet`, and
+the raw accessors in `core` (`Ref::with`, `replace`, `copy`, `set` and
+`read`, `Region!::replace`, `Array!::set` and `get`, `raw_get`). An element
+type holds bytes: `OwnedVec![()]`, `Owned![()]` and a map to `()` as a set
+are not formed, while a value with zero-size parts beside bytes, as
+`(Marker, u32)`, is. A caller discharges `Sized` where it calls: by the
+type's shape, or by a premise of its own. The size arithmetic is still
+defined at 0 for what asks for no bytes, as an empty buffer:
 
 - `alloc::heap::Storage::try_alloc`/`try_grow` (and so
   `HeapAllocator::alloc`/`grow`) ask `malloc`/`realloc` for one byte where
   the size is 0, so a block is never null and `realloc` never frees; the
-  `Uninit!` records the requested 0. `Owned!::new` of a zero-size value and
-  a `Vec!` of zero-size elements hold such a block;
+  `Uninit!` records the requested 0;
 - `checked_mul(n, 0usize)` is 0 without dividing by 0;
-- a `Vec!` of a zero-size `T` starts with capacity `usize::MAX`, so `push`
-  never grows its block of no bytes, and only a length past `usize::MAX`
-  aborts (`checked_mul`);
-- `HashMap!` allocates no box for a zero-size key or value: `alloc_one`
-  gives the address `alignof[T]()` (1), which addresses no block and is not
-  null, and `free_one` frees nothing for it;
 - `alloc::arena`'s `bump_chunk` reserves no bytes for a 0-byte request and
-  returns the current address, so zero-size requests may share an address
-  with each other and with the next allocation;
-- `alloca` of a zero-size type gives the address 1.
+  returns the current address, so such requests may share an address with
+  each other and with the next allocation.
 
 Identities taken from addresses (`Ref::address`, `ArenaVec::address`,
-`ArenaMap::address`) are of headers that have bytes; two `Ref`s to
-zero-size values may share an address.
+`ArenaMap::address`) are of headers that have bytes.
 
 **`Option` where a request is merely out of range.** An index past the end
 is an ordinary, recoverable condition:

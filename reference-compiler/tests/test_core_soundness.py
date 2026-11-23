@@ -385,34 +385,57 @@ REJECTED = {
     "empty_enum_written": ("an enum has at least one variant", """
         (fun f usize () (entry () (= %n (sizeof (tuple (enum)))) (ret %n)))"""),
 
-    # A load or store of a zero-size type reads and writes nothing (MEM-ZERO-SIZE): it is formed only at a
-    # type with an erased value. A load would conjure a brand witness, a package or a linear value, and a
-    # store would make one vanish, a capability's included; a Brand is Copy, and still has none.
-    "zero_size_linear_store": ("zero_size_access_not_erasable", """
+    # A raw load, store or alloca is never at a zero-size type (MEM-ZERO-SIZE), Copy or not: unit, an empty
+    # array, a brand witness, a package of one, a capability and a struct of such. At a type that mentions
+    # a parameter it needs Sized of the type: an exact premise, or a part with bytes whatever the
+    # parameters are.
+    "zero_size_unit_load": ("raw_access_at_zero_size", """
+        (fun (unsafe) f (tuple) ((ptr (tuple))) (entry ((%p (ptr (tuple)))) (= %u (ptr_load %p)) (ret %u)))"""),
+    "zero_size_empty_array_store": ("raw_access_at_zero_size", """
+        (fun (unsafe) f (tuple) ((ptr (array u64 0)) (array u64 0))
+          (entry ((%p (ptr (array u64 0))) (%a (array u64 0))) (= %u (ptr_store %p %a)) (ret %u)))"""),
+    "zero_size_alloca": ("raw_access_at_zero_size", """
+        (type Marker (struct))
+        (fun (unsafe) f (tuple) () (entry () (= %p (alloca Marker)) (= %u (construct (tuple))) (ret %u)))"""),
+    "zero_size_linear_store": ("raw_access_at_zero_size", """
         (type Cap! (struct))
         (fun (unsafe) f (tuple) ((ptr Cap!) Cap!) (entry ((%p (ptr Cap!)) (%c Cap!))
           (= %u (ptr_store %p %c)) (ret %u)))"""),
-    "zero_size_linear_volatile_store": ("zero_size_access_not_erasable", """
+    "zero_size_linear_volatile_store": ("raw_access_at_zero_size", """
         (type Cap! (struct))
         (fun (unsafe) f (tuple) ((ptr (tuple Cap! (tuple))) (tuple Cap! (tuple)))
           (entry ((%p (ptr (tuple Cap! (tuple)))) (%c (tuple Cap! (tuple))))
             (= %u (ptr_store_volatile %p %c)) (ret %u)))"""),
-    "zero_size_linear_load": ("zero_size_access_not_erasable", """
+    "zero_size_linear_load": ("raw_access_at_zero_size", """
         (type Cap! (struct))
         (fun (unsafe) f Cap! ((ptr Cap!)) (entry ((%p (ptr Cap!))) (= %c (ptr_load %p)) (ret %c)))"""),
-    "zero_size_witness_load": ("zero_size_access_not_erasable", """
+    "zero_size_witness_load": ("raw_access_at_zero_size", """
         (type W (forall ($k) () (struct (b (brand $k)) (u (tuple)))))
         (fun (unsafe) f (forall ($k) () (W $k) ((ptr (W $k))) (entry ((%p (ptr (W $k)))) (= %w (ptr_load_volatile %p)) (ret %w))))"""),
-    "zero_size_witness_store": ("zero_size_access_not_erasable", """
+    "zero_size_witness_store": ("raw_access_at_zero_size", """
         (fun (unsafe) f (forall ($k) () (tuple) ((ptr (brand $k)) (brand $k))
           (entry ((%p (ptr (brand $k))) (%b (brand $k))) (= %u (ptr_store %p %b)) (ret %u))))"""),
-    "zero_size_package_load": ("zero_size_access_not_erasable", """
+    "zero_size_package_load": ("raw_access_at_zero_size", """
         (fun (unsafe) f (exists ($a) (brand $a)) ((ptr (exists ($a) (brand $a))))
           (entry ((%p (ptr (exists ($a) (brand $a))))) (= %w (ptr_load %p)) (ret %w)))"""),
+    "parameter_load_without_sized": ("raw_access_needs_sized", """
+        (fun (unsafe) f (forall (T) ((Copy T)) T ((ptr T)) (entry ((%p (ptr T))) (= %v (ptr_load %p)) (ret %v))))"""),
+    "parameter_alloca_without_sized": ("raw_access_needs_sized", """
+        (fun (unsafe) f (forall (T) () (ptr T) () (entry () (= %p (alloca T)) (ret %p))))"""),
+    "parameter_tuple_from_sized_parts": ("raw_access_needs_sized", """
+        (fun (unsafe) f (forall (T U) ((Sized T) (Sized U)) (tuple) ((ptr (tuple T U)) (tuple T U))
+          (entry ((%p (ptr (tuple T U))) (%v (tuple T U))) (= %u (ptr_store %p %v)) (ret %u))))"""),
+    "parameter_empty_array_with_sized": ("raw_access_needs_sized", """
+        (fun (unsafe) f (forall (T) ((Sized T)) (tuple) () (entry () (= %p (alloca (array T 0))) (= %u (construct (tuple))) (ret %u))))"""),
+    # The premise is discharged where the generic function is called, by shape or by the caller's own.
+    "parameter_load_at_a_brand_holding_struct": ("unsatisfied_premise", """
+        (type W (forall ($k) () (struct (b (brand $k)) (u (tuple)))))
+        (fun (unsafe) get (forall (T) ((Copy T) (Sized T)) T ((ptr T)) (entry ((%p (ptr T))) (= %v (ptr_load %p)) (ret %v))))
+        (fun (unsafe) f (W $static) ((ptr (W $static)))
+          (entry ((%p (ptr (W $static)))) (= %w (call (get (W $static)) %p)) (ret %w)))"""),
 
     # A zero-size type is erased: an unsafe cast has no representation of one to reinterpret, and C has
-    # no zero-size parameter or object for an extern. Its loads and stores at an erasable type are accepted
-    # (test_zero_size).
+    # no zero-size parameter or object for an extern.
     "cast_to_unit": ("zero_size_type_has_no_memory_form", """
         (fun (unsafe) h (tuple) (u8) (entry ((%x u8)) (= %u (cast %x (tuple))) (ret %u)))"""),
     "cast_from_unit": ("zero_size_type_has_no_memory_form", """
@@ -436,7 +459,7 @@ REJECTED = {
     # A function type in an extern's signature is an `unsafe fn` type, anywhere: behind a pointer and in
     # a named type's fields too. Foreign code makes the arguments of one and takes its result, or hands
     # it back, so its parameters and result are checked both as an extern's parameters and as its result,
-    # to any depth, and its result is zero-size only with an erased value.
+    # to any depth, and its result is zero-size only if it is Copy, as C's void is.
     "extern_safe_function_parameter": ("extern_safe_function_type", "(extern fun take u32 ((fn () u32)))"),
     "extern_safe_function_behind_pointer": ("extern_safe_function_type", """
         (type Callback (struct (run (fn () bool))))
@@ -467,14 +490,15 @@ REJECTED = {
     "user_exposed_trait": ("trait_name_is_reserved", "(trait Exposed (T)) (instance Exposed (u32))"),
     "user_sized_trait": ("trait_name_is_reserved", "(trait Sized (T)) (instance Sized (u32))"),
 
-    # `Sized[T]`: a finite layout of non-zero size. It holds of a type parameter only by the caller's own
-    # premise, never of a zero-size type, and it is no premise of a type declaration.
+    # `Sized[T]`: a finite layout of non-zero size. It holds of a type that mentions a parameter by the
+    # caller's own premise for exactly it, or by a part with bytes whatever the parameters are; never of
+    # a zero-size type, and it is no premise of a type declaration.
     "sized_parameter_without_premise": ("unsatisfied_premise", """
         (fun need (forall (T) ((Sized T)) u32 () (entry () (= %r (const u32 0)) (ret %r))))
         (fun f (forall (U) () u32 () (entry () (= %r (call (need U))) (ret %r))))"""),
-    "sized_holding_a_parameter": ("unsatisfied_premise", """
+    "sized_holding_only_parameters": ("unsatisfied_premise", """
         (fun need (forall (T) ((Sized T)) u32 () (entry () (= %r (const u32 0)) (ret %r))))
-        (fun f (forall (U) ((Sized U)) u32 () (entry () (= %r (call (need (tuple U u32)))) (ret %r))))"""),
+        (fun f (forall (U V) ((Sized U) (Sized V)) u32 () (entry () (= %r (call (need (tuple U V)))) (ret %r))))"""),
     "sized_zero_size": ("unsatisfied_premise", """
         (fun need (forall (T) ((Sized T)) u32 () (entry () (= %r (const u32 0)) (ret %r))))
         (fun f u32 () (entry () (= %r (call (need (tuple (tuple) (array u64 0))))) (ret %r)))"""),
@@ -546,11 +570,12 @@ class CoreSoundnessTests(unittest.TestCase):
                    (= (%x %y) (destruct %o (tuple (brand $t) (brand $p0))))
                    (= %r (const u32 0)) (ret %r))))""",
             # A generic read is checked at its type parameter, not at what instantiates it: that a read
-            # through a pointer never produces Never, here at `rd[!]`, is the unsafe read's obligation
-            # (lib/std/CONTRACTS.md, section 2.3), which nothing checks.
+            # through a pointer never produces Never, here at `rd[(u32, !)]`, which is `Sized`, is the
+            # unsafe read's obligation (lib/std/CONTRACTS.md, section 2.3), which nothing checks.
             """(type L! (struct (a u32)))
-               (fun (unsafe) rd (forall (T) () T ((ptr T)) (entry ((%p (ptr T))) (= %v (ptr_load %p)) (ret %v))))
-               (fun (unsafe) h u32 (L! (ptr !)) (entry ((%l L!) (%p (ptr !))) (= %n (call (rd !) %p)) (unreachable)))""",
+               (fun (unsafe) rd (forall (T) ((Sized T)) T ((ptr T)) (entry ((%p (ptr T))) (= %v (ptr_load %p)) (ret %v))))
+               (fun (unsafe) h u32 (L! (ptr (tuple u32 !))) (entry ((%l L!) (%p (ptr (tuple u32 !))))
+                 (= %n (call (rd (tuple u32 !)) %p)) (= (%a %b) (destruct %n (tuple u32 !))) (= %c (copy %b)) (unreachable)))""",
             # A pointer read out of memory is a value; what it points at is not.
             """(type S (struct (n !)))
                (fun (unsafe) h (ptr S) ((ptr (ptr S))) (entry ((%p (ptr (ptr S)))) (= %q (ptr_load %p)) (ret %q)))""",
@@ -589,12 +614,28 @@ class CoreSoundnessTests(unittest.TestCase):
             """(type W (foreach (F (tuple u32 u8)) (tuple F)))
                (fun keep W (W (fn ((foreach (F (tuple u8)) F)) W))
                  (entry ((%w W) (%g (fn ((foreach (F (tuple u8)) F)) W))) (ret %w)))""",
-            # `Sized` of a concrete type of non-zero size, a zero-size field included, and of a type
-            # parameter under the caller's own premise.
+            # `Sized` of a concrete type of non-zero size, a zero-size field included, of a type
+            # parameter and a tuple of them under the caller's own premise for exactly it, and of a struct
+            # with a field of bytes whatever its parameter is.
             """(type P (struct (a (tuple)) (b u8)))
+               (type Q (forall (T) () (struct (a u32) (b T))))
                (fun need (forall (T) ((Sized T)) u32 () (entry () (= %r (const u32 0)) (ret %r))))
                (fun f u32 () (entry () (= %a (call (need P))) (= %b (call (need (ptr (tuple))))) (ret %a)))
-               (fun g (forall (U) ((Sized U)) u32 () (entry () (= %r (call (need U))) (ret %r))))""",
+               (fun g (forall (U) ((Sized U)) u32 () (entry () (= %r (call (need U))) (ret %r))))
+               (fun h (forall (U V) ((Sized (tuple U V))) u32 () (entry () (= %r (call (need (tuple U V)))) (ret %r))))
+               (fun q (forall (U) () u32 () (entry () (= %r (call (need (Q U)))) (ret %r))))""",
+            # A raw load, store and alloca at a type parameter under `Sized`, at a tuple of parameters under
+            # `Sized` of exactly it, and at an open struct with a field of bytes, called at `u32`.
+            """(type Q (forall (T) () (struct (a u32) (b T))))
+               (fun (unsafe) get (forall (T) ((Copy T) (Sized T)) T ((ptr T))
+                 (entry ((%p (ptr T))) (= %v (ptr_load %p)) (ret %v))))
+               (fun (unsafe) put (forall (T) ((Sized T)) (tuple) ((ptr T) T)
+                 (entry ((%p (ptr T)) (%v T)) (= %u (ptr_store_volatile %p %v)) (ret %u))))
+               (fun (unsafe) pair (forall (T U) ((Copy T) (Copy U) (Sized (tuple T U))) (ptr (tuple T U)) ()
+                 (entry () (= %p (alloca (tuple T U))) (ret %p))))
+               (fun (unsafe) open (forall (T) ((Copy T)) (Q T) ((ptr (Q T)))
+                 (entry ((%p (ptr (Q T)))) (= %v (ptr_load %p)) (ret %v))))
+               (fun (unsafe) f u32 ((ptr u32)) (entry ((%p (ptr u32))) (= %v (call (get u32) %p)) (ret %v)))""",
             # Pointer projection at the pointer's own type.
             """(type S (struct (a u32)))
                (fun h u32 ((ptr S)) (entry ((%p (ptr S)))

@@ -273,23 +273,24 @@ class Types:
             raise KursError(f"unknown type {name}")
         return decl
 
-    def zero_size(self, ty: Type) -> bool:
+    def zero_size(self, ty: Type, parameters: bool = False) -> bool:
         """`ty` has no bytes of its own: unit-like products, empty arrays, brand witnesses, Never. A type
-        parameter is answered when it is instantiated."""
+        parameter is answered when it is instantiated, or with `parameters` is taken to be zero-size, as
+        it may be: `ty` then has bytes only through a part that has them whatever the parameters are."""
         match ty:
             case Brand() | Never():
                 return True
             case Named(args=()) if ty.name not in self.program.types:
-                return False
+                return parameters
         match self.shape(ty):
             case Tuple(elems=elems):
-                return all(self.zero_size(t) for t in elems)
+                return all(self.zero_size(t, parameters) for t in elems)
             case Struct(fields=fields):
-                return all(self.zero_size(t) for _, t in fields)
+                return all(self.zero_size(t, parameters) for _, t in fields)
             case Array(elem=elem, length=length):
-                return length == 0 or self.zero_size(elem)
+                return length == 0 or self.zero_size(elem, parameters)
             case Exists(body=body):
-                return self.zero_size(body)
+                return self.zero_size(body, parameters)
         return False
 
     def closed(self, ty: Type) -> bool:
@@ -350,22 +351,6 @@ class Types:
                 offset = _round_up(offset, part_align) + size
                 align = max(align, part_align)
         return _fitted(_round_up(offset, align), align)
-
-    def erasable(self, ty: Type) -> bool:
-        """`ty` has an erased value (MEM-ZERO-SIZE), which a load of a zero-size type yields and a store
-        writes nothing of: unit, a tuple, struct or array of erasable parts, an empty array, or a named
-        type whose body is one, unfolded whether exposed or not. A brand witness, a package and a linear
-        type have none, so an erasable type is Copy."""
-        match ty:
-            case Named(name=name) if name in self.program.types:
-                return not self.decl(name).linear and self.erasable(self.unfold(ty))
-            case Tuple(elems=elems):
-                return all(self.erasable(t) for t in elems)
-            case Struct(fields=fields):
-                return all(self.erasable(t) for _, t in fields)
-            case Array(elem=elem, length=length):
-                return length == 0 or self.erasable(elem)
-        return False
 
     def niche(self, ty: Type) -> Optional[tuple[str, ...]]:
         """Where a value of `ty` has bytes that hold no value of it: the path (field names, tuple indices,
@@ -455,15 +440,15 @@ class Types:
         return self.concrete_exposure(source, module, kinds)
 
     def sized_available(self, ty: Type, premises: Iterable[Premise]) -> bool:
-        """`Sized[ty]`: `ty` has a finite by-value layout of non-zero size. An exact assumption gives it;
-        otherwise `ty` must mention no type parameter, and then its shape decides it, the same on every
-        target. Every declaration's by-value layout is finite (`check_type_expansion`), so a type that
-        mentions no parameter has one."""
+        """`Sized[ty]` (TY-SIZED): `ty` has a finite by-value layout of non-zero size, at every instantiation.
+        An exact assumption gives it; otherwise its shape decides it, with each type parameter standing for
+        the zero-size `()`: a part of it held by value, a primitive, a pointer, a sum or a function value,
+        has bytes whatever the parameters are. So `Sized[T]` and `Sized[U]` do not give `Sized[(T, U)]`,
+        and the same holds on every target. A raw load, store or `alloca` at `ty` needs it. Every
+        declaration's by-value layout is finite (`check_type_expansion`)."""
         if any(p.trait == "Sized" and len(p.args) == 1 and equal(p.args[0], ty) for p in premises):
             return True
-        if any(name not in self.program.types for name in free_names(ty) - free_brands(ty)):
-            return False
-        return not self.zero_size(ty)
+        return not self.zero_size(ty, parameters=True)
 
     def concrete_exposure(self, source: Type, module: Optional[ModuleId], kinds: Kinds) -> bool:
         shape = self.visible_shape(source, module, kinds)

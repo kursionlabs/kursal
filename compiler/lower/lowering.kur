@@ -32,7 +32,7 @@ use package::kurs::sexpr::{Form, FormKind};
 use package::sigs::signatures::{ConstValue, Sig, Signatures, binop_name, const_type, int_text};
 use package::syntax::ast as S;
 use package::syntax::ast::{Expr, Pattern, Pos, Statement, expr_id, expr_pos, no_pos};
-use package::types::ops::{Fresh, Types, brand_name, children, equal, foreach_item, free_brands, mapped_component, mapped_operand, mentions_brand, subst};
+use package::types::ops::{Fresh, Types, brand_name, children, equal, foreach_item, free_brands, mapped_component, mapped_operand, mentions_brand, subst, surface};
 use std::collections::hashmap::OwnedMap!;
 use std::option::Option;
 use std::slice::Slice;
@@ -220,8 +220,8 @@ impl Lowering['k] {
                 k = k + 1usize;
             }
             let result = fun.ret.copy(&cx);
-            if self.types.zero_size(&cx, result) && !self.types.erasable(&cx, result) {
-                self.foreign_fail(&cx, name, " has an unsafe fn type in its signature that returns a zero-size type with no erased value");
+            if self.types.zero_size(&cx, result) && !self.types.is_copy(&cx, result, ArenaMap::new(&cx)) {
+                self.foreign_fail(&cx, name, " has an unsafe fn type in its signature that returns a zero-size linear type, which C's void would make vanish");
             }
             f = f + 1usize;
         }
@@ -655,9 +655,9 @@ impl FnLower['k] {
     // only a checked operation makes, nor reinterpret a layout the compiler chooses, nor take or
     // produce a zero-size type, which has no representation to reinterpret, nor convert a pointer but
     // to or from a pointer or an integer; an atomic operation works on an integer, a bool or a
-    // pointer. A load or store of a zero-size type reads and writes nothing, so it needs a type with an
-    // erased value, which holds no brand witness, package or linear value; `alloca` of one is not
-    // null.
+    // pointer. A load, store or `alloca` is never at a zero-size type, which has no memory to touch:
+    // it needs `Sized` of the type, so `Sized[T]` at a type parameter `T`, as nothing is checked at an
+    // instantiation.
     fn memory_operation(self, &cx: Domain!['k], o: Op['k], pos: Pos) {
         let target = if o.args.is_empty(&cx) { Option::None } else { self.vty.get(&cx, o.args.at(&cx, 0usize)) };
         let pointee = match target {
@@ -669,19 +669,31 @@ impl FnLower['k] {
         };
         let op = o.name;
         let load = op.is(&cx, "ptr_load") || op.is(&cx, "ptr_load_volatile");
-        if load || op.is(&cx, "ptr_store") || op.is(&cx, "ptr_store_volatile") {
-            match pointee {
-                Option::Some(inner) => {
-                    if load && contains(&cx, self.lowering.types, inner, |&cx, t: Type['k]| is_never(t)) {
-                        self.fail(&cx, Span::from_static(&cx, "an unsafe read cannot produce a value that holds Never"), pos);
+        let accessed = if op.is(&cx, "alloca") {
+            o.ty
+        } else if load || op.is(&cx, "ptr_store") || op.is(&cx, "ptr_store_volatile") {
+            pointee
+        } else {
+            Option::None
+        };
+        match accessed {
+            Option::Some(inner) => {
+                if load && contains(&cx, self.lowering.types, inner, |&cx, t: Type['k]| is_never(t)) {
+                    self.fail(&cx, Span::from_static(&cx, "an unsafe read cannot produce a value that holds Never"), pos);
+                }
+                if !self.lowering.types.sized_available(&cx, inner, self.sig.premises) {
+                    if self.lowering.types.closed(&cx, inner) {
+                        self.fail(&cx, Span::from_static(&cx, "a raw read, write or alloca at a zero-size type"), pos);
                     }
-                    if self.lowering.types.zero_size(&cx, inner) && !self.lowering.types.erasable(&cx, inner) {
-                        self.fail(&cx, Span::from_static(&cx, "a zero-size type that holds a brand witness, a package or a linear value is not read or written through a pointer"), pos);
-                    }
-                },
-                Option::None => (),
-            };
-        } else if op.is(&cx, "cast") {
+                    let written = surface(&cx, ArenaVec::one(&cx, inner), ArenaVec::new(&cx), ArenaMap::new(&cx)).show(&cx, inner);
+                    self.fail(&cx, Buffer!::new().push_static("a raw read, write or alloca at ").push_bytes(&cx, written)
+                        .push_static(" needs Sized[").push_bytes(&cx, written).push_static("]").save(&cx), pos);
+                }
+                return;
+            },
+            Option::None => (),
+        };
+        if op.is(&cx, "cast") {
             match target {
                 Option::Some(from) => match o.ty {
                     Option::Some(to) => self.cast_operation(&cx, from, to, pos),

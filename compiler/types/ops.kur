@@ -952,6 +952,12 @@ impl Types['k] {
     // `ty` has no bytes of its own: unit-like products, empty arrays, brand witnesses, Never. A
     // type parameter is answered when it is instantiated.
     fn zero_size(self, &cx: Domain!['k], ty: Type['k]) -> bool {
+        self.zero_size_at(&cx, ty, false)
+    }
+
+    // `zero_size`, a type parameter taken to be zero-size when `parameters` says so, as it may be:
+    // `ty` then has bytes only through a part that has them whatever the parameters are.
+    fn zero_size_at(self, &cx: Domain!['k], ty: Type['k], parameters: bool) -> bool {
         let unit = match ty {
             Type::Brand(_b) => {
                 return true;
@@ -961,7 +967,7 @@ impl Types['k] {
             },
             Type::Named(name, args) => {
                 if args.is_empty(&cx) && !self.program.types.contains(&cx, name) {
-                    return false;
+                    return parameters;
                 }
             },
             _ => (),
@@ -971,7 +977,7 @@ impl Types['k] {
                 var all = true;
                 var i = 0usize;
                 while all && i < elems.len(&cx) {
-                    all = self.zero_size(&cx, elems.at(&cx, i));
+                    all = self.zero_size_at(&cx, elems.at(&cx, i), parameters);
                     i = i + 1usize;
                 }
                 all
@@ -980,48 +986,13 @@ impl Types['k] {
                 var all = true;
                 var i = 0usize;
                 while all && i < fields.len(&cx) {
-                    all = self.zero_size(&cx, fields.at(&cx, i).type);
+                    all = self.zero_size_at(&cx, fields.at(&cx, i).type, parameters);
                     i = i + 1usize;
                 }
                 all
             },
-            Type::Array(elem, length) => length == 0u64 || self.zero_size(&cx, elem.copy(&cx)),
-            Type::Exists(_binders, body) => self.zero_size(&cx, body.copy(&cx)),
-            _ => false,
-        }
-    }
-
-    // `ty` has an erased value (MEM-ZERO-SIZE), which a load of a zero-size type yields and a store
-    // writes nothing of: unit, a tuple, struct or array of erasable parts, an empty array, or a named
-    // type whose body is one, unfolded whether exposed or not. A brand witness, a package and a linear
-    // type have none, so an erasable type is Copy.
-    fn erasable(self, &cx: Domain!['k], ty: Type['k]) -> bool {
-        match ty {
-            Type::Named(name, _args) => match self.program.types.get(&cx, name) {
-                Option::Some(decl) => !decl.linear(&cx) && self.erasable(&cx, self.unfold(&cx, ty, Option::None)),
-                Option::None => false,
-            },
-            Type::Tuple(elems) => {
-                var i = 0usize;
-                while i < elems.len(&cx) {
-                    if !self.erasable(&cx, elems.at(&cx, i)) {
-                        return false;
-                    }
-                    i = i + 1usize;
-                }
-                true
-            },
-            Type::Struct(fields) => {
-                var i = 0usize;
-                while i < fields.len(&cx) {
-                    if !self.erasable(&cx, fields.at(&cx, i).type) {
-                        return false;
-                    }
-                    i = i + 1usize;
-                }
-                true
-            },
-            Type::Array(elem, length) => length == 0u64 || self.erasable(&cx, elem.copy(&cx)),
+            Type::Array(elem, length) => length == 0u64 || self.zero_size_at(&cx, elem.copy(&cx), parameters),
+            Type::Exists(_binders, body) => self.zero_size_at(&cx, body.copy(&cx), parameters),
             _ => false,
         }
     }
@@ -1314,10 +1285,12 @@ impl Types['k] {
         self.concrete_exposure(&cx, source, home, kinds)
     }
 
-    // `Sized[ty]`: `ty` has a finite by-value layout of non-zero size. An exact assumption gives it;
-    // otherwise `ty` must mention no type parameter, and then its shape decides it, the same on every
-    // target. Every declaration's by-value layout is finite (`check_type_expansion`), so a type that
-    // mentions no parameter has one.
+    // `Sized[ty]` (TY-SIZED): `ty` has a finite by-value layout of non-zero size, at every
+    // instantiation. An exact assumption gives it; otherwise its shape decides it, with each type
+    // parameter standing for a zero-size type: a part of it held by value, a primitive, a pointer, a
+    // sum or a function value, has bytes whatever the parameters are. So `Sized[T]` and `Sized[U]` do
+    // not give `Sized[(T, U)]`, and the same holds on every target. A raw load, store or `alloca` at
+    // `ty` needs it. Every declaration's by-value layout is finite (`check_type_expansion`).
     fn sized_available(self, &cx: Domain!['k], ty: Type['k], premises: ArenaVec[Premise['k], 'k]) -> bool {
         var i = 0usize;
         while i < premises.len(&cx) {
@@ -1327,17 +1300,7 @@ impl Types['k] {
             }
             i = i + 1usize;
         }
-        let brands = free_brands(&cx, ty);
-        let names = free_names(&cx, ty).keys(&cx);
-        var n = 0usize;
-        while n < names.len(&cx) {
-            let name = names.at(&cx, n);
-            if !brands.contains(&cx, name) && !self.program.types.contains(&cx, name) {
-                return false;
-            }
-            n = n + 1usize;
-        }
-        !self.zero_size(&cx, ty)
+        !self.zero_size_at(&cx, ty, true)
     }
 
     fn concrete_exposure(self, &cx: Domain!['k], source: Type['k], home: Option[ModuleId['k]], kinds: ArenaMap[Span['k], Kind, 'k]) -> bool {

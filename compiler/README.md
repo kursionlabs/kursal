@@ -612,33 +612,26 @@ function is its own function pointer. A function that takes and returns only zer
 `static void f(void)`, and a call of it still runs it.
 
 Erasing them never changes what a program reads or writes: a zero-size value has no bytes to read
-or write. So a load or store of one through a pointer (`ptr_load`, `ptr_store`, volatile or not)
-writes no C, and `alloca` of one gives `(void*)(uintptr_t)1`, a pointer that is not null and is
-aligned as `alignof` says (1), with nothing behind it. Generic code therefore builds at a zero-size
-type argument wherever it type-checks: `Ref::new(&cx, ())`, `ArenaVec[(), 'k]`, `OwnedVec![()]`,
-`OwnedMap![K, ()]` and `Owned!::new(())` read and write their elements through pointers, and those
-reads and writes are of nothing. Three operations still reject a zero-size type
+or write, and memory never holds one on its own. A raw load or store (`ptr_load`, `ptr_store`,
+volatile or not) or an `alloca` is formed only at a type with `Sized` (MEM-SIZED-ACCESS): at a type
+without parameters, one that is not zero-size, so `unsafe *p` at `()`, a `Brand['k]` or a capability
+is rejected, `Copy` or not (`raw_access_at_zero_size`, and at the source `a raw read, write or
+alloca at a zero-size type`); at a type that mentions a parameter, one with an exact `Sized`
+premise or a part with bytes whatever the parameters are, so a generic function's `unsafe *p` at
+`T` needs `where Sized[T]` (`raw_access_needs_sized`, and at the source `a raw read, write or alloca
+at T needs Sized[T]`). Nothing is checked again at an instantiation: a caller discharges `Sized`
+where it calls, so no specialization reads, writes or reserves a zero-size type, and the backend
+writes every load, store and `alloca` it meets. The containers and allocation functions take
+`Sized` of their elements (`lib/std/CONTRACTS.md`, "Zero sizes"): `OwnedVec![()]`, `Owned!::new(())`
+and a map to `()` are not formed. Two more operations reject a zero-size type
 (`zero_size_type_has_no_memory_form`), as the front end does first, at the source (`a zero-size type
 has no memory form`): an unsafe cast from or to one, which reinterprets a representation it does not
-have; and an extern parameter of one, which C has no form for. None of them can
-take a type parameter (a cast cannot take or produce a value of one, and an extern is not generic),
-so no specialization meets them, and the backend has no zero-size rule of its own. A load or store
-at a zero-size type, volatile or not, is formed only where the type has an *erased value*: unit, a
-tuple, struct or array of such parts, an empty array, or a named type whose body is one, unfolded
-whether exposed or not (`Types.erasable`). A brand witness, a package and a linear type have none,
-even a `Brand`, which is `Copy`: a load would conjure one and a store would make one vanish, so
-`unsafe *p = cap` for a capability and `unsafe *p` at a `Brand['k]` are rejected
-(`zero_size_access_not_erasable`, and at the source `a zero-size type that holds a brand witness, a
-package or a linear value is not read or written through a pointer`). An erasable type is `Copy`, as a
-store needs. A generic load or store at a type parameter is checked at the parameter, which is not
-zero-size; at a zero-size instantiation the read is the unsafe operation's obligation
-(`lib/std/CONTRACTS.md`). An atomic
-operation works on an integer, a bool or a pointer, never a zero-size type. `sizeof` of a zero-size
-type is 0, and the arithmetic the standard library does with sizes is defined at 0 (`checked_mul`
-does not divide by it, `bump_chunk` reserves no bytes and returns the current address,
-`HeapAllocator::alloc(0)` asks `malloc` for one byte so that it is never null, a `Vec!` of zero-size
-elements has capacity `usize::MAX` and never grows, and `HashMap!` allocates no box for a zero-size
-key or value; `lib/std/CONTRACTS.md`, "Zero sizes").
+have; and an extern parameter of one, which C has no form for. Neither can take a type parameter (a
+cast cannot take or produce a value of one, and an extern is not generic). An atomic operation works
+on an integer, a bool or a pointer, never a zero-size type. `sizeof` of a zero-size type is 0, and
+the arithmetic the standard library does with sizes is defined at 0 for what asks for no bytes
+(`checked_mul` does not divide by it, `bump_chunk` reserves no bytes and returns the current address,
+`HeapAllocator::alloc(0)` asks `malloc` for one byte so that it is never null).
 
 Two zero-size objects may share an address, with each other and with what holds them. Nothing relies on distinct addresses for zero-size data: the identities the
 compiler and the standard library compare (`Ref::address`, `ArenaVec::address` and
@@ -879,9 +872,13 @@ These are the places where Kursal differs from what one might expect.
 - **`Sized[T]`** says that `T` has a finite by-value layout of non-zero size. It is a premise of a
   function or an instance (so of each of its methods), never of a type declaration, and no program
   declares an instance of it. It holds of a type that mentions no type parameter when that type is
-  not zero-size, the same on every target (`Sized[(u8, ())]` holds, `Sized[()]` does not), and of a
-  type parameter or anything mentioning one only by the caller's own premise for exactly that type
-  (`Sized requires an exact premise ...`). It implies neither `Copy` nor `Exposed`.
+  not zero-size, the same on every target (`Sized[(u8, ())]` holds, `Sized[()]` does not). Of a type
+  that mentions one it holds by the caller's own premise for exactly that type, or by a part held by
+  value that has bytes whatever the parameters are, a primitive, a pointer, a sum or a function
+  value: `Sized[(T, u32)]` holds with no premise, while `Sized[(T, U)]` needs exactly that premise,
+  `Sized[T]` and `Sized[U]` not giving it (`Sized requires an exact premise or a part whose size is
+  not zero whatever the type parameters are`). It implies neither `Copy` nor `Exposed`. A raw load,
+  store or `alloca` needs it of its type ("Zero-size types are erased").
 - **Method lookup sees what the caller sees.** `x.name()` looks for `name` among the methods of
   `x`'s type, and otherwise among the single-parameter traits visible in the calling module
   (declared there, imported by name or glob, or re-exported to it), and the methods of blanket impls
@@ -931,8 +928,8 @@ These are the places where Kursal differs from what one might expect.
   (`extern_safe_function_type`; `extern f has a safe function type in its signature`): foreign code
   neither makes nor calls a safe function value. Foreign code makes the arguments of such a value, and
   takes its result or hands the value back, so each of its parameters and its result is held to both
-  rules, an extern parameter's and its result's, to any depth; its result may be zero-size only with an
-  erased value, as `()` is C's `void`. Foreign code takes and passes values and lends nothing back, so
+  rules, an extern parameter's and its result's, to any depth; its result may be zero-size only if it
+  is `Copy`, as `()` is C's `void`, where a linear value would vanish. Foreign code takes and passes values and lends nothing back, so
   an extern takes no place parameter (`extern f takes a place parameter; foreign code takes values`)
   and no function type in its signature takes one (`extern_place_parameter`), where KURS can write one.
 - **Generic code over linear types.** A type parameter may stand for a linear type unless a premise

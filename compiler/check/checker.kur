@@ -2274,9 +2274,9 @@ impl Checker['k] {
     // an `unsafe fn` type: no safe function value comes from foreign code or goes to it. Foreign code
     // calls such a value with arguments it makes, and takes its result, or hands the value back, so
     // the program calls it: each parameter of one has a memory form and holds nothing only checked code
-    // makes, and so does its result, which may be zero-size only with an erased value (`void`), and none
-    // of its parameters is a place, which foreign code cannot lend. The walk reaches the function types
-    // nested in those too.
+    // makes, and so does its result, which may be zero-size only if it is Copy (C's `void`, where a
+    // linear value would vanish), and none of its parameters is a place, which foreign code cannot
+    // lend. The walk reaches the function types nested in those too.
     fn foreign_signature(self, &cx: Domain!['k], ptypes: ArenaVec[Type['k], 'k], ret: Type['k]) {
         var i = 0usize;
         while i < ptypes.len(&cx) {
@@ -2310,7 +2310,7 @@ impl Checker['k] {
             }
             let result = fun.ret.copy(&cx);
             self.foreign_result(&cx, result);
-            if self.types.zero_size(&cx, result) && !self.types.erasable(&cx, result) {
+            if self.types.zero_size(&cx, result) && !self.copy_type(&cx, result) {
                 self.fail(&cx, "zero_size_type_has_no_memory_form");
             }
             f = f + 1usize;
@@ -2331,11 +2331,10 @@ impl Checker['k] {
         }
     }
 
-    // A zero-size type is erased: it has no C object and no C value, and `sizeof` of one is 0. A load
-    // or store of one through a pointer reads and writes nothing, and `alloca` of one gives a pointer that
-    // is not null, so those accept it (one with no erased value is `zero_size_access`'s to reject); an
+    // A zero-size type is erased: it has no C object and no C value, and `sizeof` of one is 0. An
     // unsafe cast reinterprets a representation, which a zero-size type does not have, and C has no
-    // zero-size parameter, so casts and extern parameters reject zero-size types.
+    // zero-size parameter, so casts and extern parameters reject zero-size types (as a raw load, store
+    // or `alloca` does, `raw_access`).
     fn has_memory_form(self, &cx: Domain!['k], ty: Type['k]) {
         if self.types.zero_size(&cx, ty) {
             self.fail(&cx, "zero_size_type_has_no_memory_form");
@@ -2343,7 +2342,9 @@ impl Checker['k] {
     }
 
     fn op_alloca(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
-        C::ptr(&cx, self.type_operand(&cx, instr))
+        let ty = self.type_operand(&cx, instr);
+        self.raw_access(&cx, ty);
+        C::ptr(&cx, ty)
     }
 
     fn op_sizeof(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
@@ -2480,7 +2481,7 @@ impl Checker['k] {
         if contains(&cx, self.types, inner, |&cx, t: Type['k]| is_never(t)) {
             self.fail(&cx, "unsafe_read_cannot_produce_never");
         }
-        self.zero_size_access(&cx, inner);
+        self.raw_access(&cx, inner);
         inner
     }
 
@@ -2495,17 +2496,21 @@ impl Checker['k] {
         if !fits(&cx, v, inner) {
             self.fail(&cx, "store_through_pointer_another");
         }
-        self.zero_size_access(&cx, inner);
+        self.raw_access(&cx, inner);
         C::unit(&cx)
     }
 
-    // MEM-ZERO-SIZE: a load or store at a zero-size type reads and writes nothing, so it is formed
-    // only where the type has an erased value (`Types::erasable`): a load would conjure a brand
-    // witness, a package or a linear value, and a store would make one vanish. An erasable type is
-    // Copy, as a store needs. A type parameter is not zero-size here.
-    fn zero_size_access(self, &cx: Domain!['k], ty: Type['k]) {
-        if self.types.zero_size(&cx, ty) && !self.types.erasable(&cx, ty) {
-            self.fail(&cx, "zero_size_access_not_erasable");
+    // MEM-SIZED-ACCESS: a raw load, store or `alloca` is at a type of non-zero size, never a
+    // zero-size one, which has no memory to read, write or reserve: it needs `Sized` of the type
+    // (`Types::sized_available`), which the shape decides for a type without parameters, and which
+    // otherwise holds by an exact premise or a part with bytes whatever the parameters are. Nothing is
+    // checked again at an instantiation; a caller discharges `Sized`.
+    fn raw_access(self, &cx: Domain!['k], ty: Type['k]) {
+        if !self.types.sized_available(&cx, ty, self.premises.copy(&cx)) {
+            if self.types.closed(&cx, ty) {
+                self.fail(&cx, "raw_access_at_zero_size");
+            }
+            self.fail(&cx, "raw_access_needs_sized");
         }
     }
 

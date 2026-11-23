@@ -7,9 +7,9 @@ Representation erasure is separate from code-specialization identity.
 A zero-size type (`Types.zero_size`: unit, brand witnesses, Never, products of zero-size components,
 arrays of length 0 or of zero-size elements) has no C representation: its C type is `void` (`erased`),
 and no struct member, parameter, local, argument or assignment has it. A function returning one
-returns `void`; constructing, destructuring, copying, loading or storing one, in a place or through a
-pointer, writes nothing; a pointer to one is a `void*`, and `alloca` of one is `(void*)1`. The one C
-object a zero-size type gets is a `data` of it, whose address the program observes: a `char`.
+returns `void`; constructing, destructuring, copying, loading or storing one in a place writes nothing;
+a pointer to one is a `void*`, and no raw load, store or `alloca` is at one (`Checker.raw_access`). The
+one C object a zero-size type gets is a `data` of it, whose address the program observes: a `char`.
 
 An enum is a tag and a union of its payloads, or, in the niche layout (`Types.niche_variant`), its one
 payload with a niche, the other variant a null there (`niche_layout`, `tag`, `payload`, `set_variant`).
@@ -1099,10 +1099,7 @@ class Backend:
             self.line(f"{dst} = {self.function_address(instr)};")
         elif op == "alloca":
             ct = self.ctype(self.type_operand(instr))
-            # A zero-size type has no bytes to reserve: its pointer is any one that is not null, aligned as
-            # `alignof` says (to 1).
-            self.line(f"{dst} = (void*)(uintptr_t)1;" if ct == "void" else
-                      f"{dst} = ({ct}*)__builtin_alloca(sizeof({ct}));")
+            self.line(f"{dst} = ({ct}*)__builtin_alloca(sizeof({ct}));")
         elif op == "sizeof":
             ct = self.ctype(self.type_operand(instr))
             self.line(f"{dst} = UINT64_C(0);" if ct == "void" else f"{dst} = (uintptr_t)sizeof({ct});")
@@ -1113,9 +1110,6 @@ class Backend:
             self.line("KUR_TRAP();")
         elif op in ("pack", "open"):
             self.line(f"{dst} = {self.value_name(a[0])};")
-        elif op in ("ptr_load", "ptr_load_volatile", "ptr_store", "ptr_store_volatile") and \
-                self.erased(self.pointee(a[0])):
-            pass    # a zero-size value is read and written nowhere
         elif op == "ptr_load":
             self.line(f"{dst} = *{self.value_name(a[0])};")
         elif op == "ptr_load_volatile":

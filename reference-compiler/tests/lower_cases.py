@@ -63,16 +63,29 @@ LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
     ("fn f(p: *(u32, !)) -> u32 { let s = unsafe *p; 0u32 }\n", "an unsafe read cannot produce a value that holds Never"),
     ("struct S { n: ! }\nfn get(&s: S) -> u32 { 0u32 }\nfn f(p: *S) -> u32 { get(unsafe &*p) }\n",
      "an unsafe lend of a pointer's target cannot lend a value that holds Never"),
-    # A load or store of a zero-size type reads and writes nothing: only one with an erased value, so no
-    # brand witness, package or linear value is conjured or made to vanish, volatile or not.
-    ("exposed struct Cap! {}\nfn f(p: *Cap!) -> Cap! { unsafe *p }\n",
-     "a zero-size type that holds a brand witness, a package or a linear value is not read or written"),
+    # A raw read, write or alloca is never at a zero-size type, Copy or not, volatile or not; at a type
+    # with parameters it needs Sized of the type, by an exact premise or a part with bytes whatever the
+    # parameters are, discharged where the function is called.
+    ("fn f(p: *()) -> () { unsafe *p }\n", "a raw read, write or alloca at a zero-size type"),
+    ("exposed struct Cap! {}\nfn f(p: *Cap!) -> Cap! { unsafe *p }\n", "a raw read, write or alloca at a zero-size type"),
     ("exposed struct Cap! {}\nfn f(p: *(Cap!, ()), c: Cap!) { unsafe *p = (c, ()); }\n",
-     "a zero-size type that holds a brand witness, a package or a linear value is not read or written"),
+     "a raw read, write or alloca at a zero-size type"),
     ("forall 'k.\nexposed struct W { b: core::cap::Brand['k], u: () }\nforall 'k.\nfn f(p: *W['k]) -> W['k] { unsafe *p }\n",
-     "a zero-size type that holds a brand witness, a package or a linear value is not read or written"),
+     "a raw read, write or alloca at a zero-size type"),
     ("forall 'k.\nfn f(p: *core::cap::Brand['k], b: core::cap::Brand['k]) { unsafe p.store_volatile(b); }\n",
-     "a zero-size type that holds a brand witness, a package or a linear value is not read or written"),
+     "a raw read, write or alloca at a zero-size type"),
+    ("fn f() -> *[u64; 0] { unsafe core::mem::alloca[[u64; 0]]() }\n", "a raw read, write or alloca at a zero-size type"),
+    ("forall T where Copy[T].\nfn get(p: *T) -> T { unsafe *p }\n", "a raw read, write or alloca at T needs Sized[T]"),
+    ("forall T.\nfn make() -> *T { unsafe core::mem::alloca[T]() }\n", "a raw read, write or alloca at T needs Sized[T]"),
+    ("forall T, U where Copy[T], Copy[U], Sized[T], Sized[U].\nfn get(p: *(T, U)) -> (T, U) { unsafe *p }\n",
+     "a raw read, write or alloca at (T, U) needs Sized[(T, U)]"),
+    ("forall 'k.\nexposed struct W { b: core::cap::Brand['k], u: () }\n"
+     "forall T where Copy[T], Sized[T].\nfn get(p: *T) -> T { unsafe *p }\n"
+     "fn f(p: *W['static]) -> W['static] { get(p) }\n", "Sized requires an exact premise"),
+    ("use std::owned::Owned!;\nfn main() -> i32 { let o = Owned!::new(()); 0 }\n", "Sized requires an exact premise"),
+    ("use std::arena::Domain!;\nuse std::mem::Ref;\nfn main() -> i32 {\n"
+     "    let exists 'a. cx = Domain!::new(std::process::hash_seed());\n    let r = Ref::new(&cx, ());\n"
+     "    cx.destroy();\n    0\n}\n", "Sized requires an exact premise"),
     # Every formed type is smaller than the address space, 2^64 bytes.
     ("fn f() -> usize { core::mem::sizeof[[[u8; 9223372036854775808]; 2]]() }\n",
      "is too large: its size is not below 2^64 bytes"),

@@ -417,7 +417,8 @@ class Infer:
         if trait == "Sized":
             concrete = tuple(zonk(arg) for arg in args)
             if len(concrete) != 1 or not self.types.sized_available(concrete[0], self.assumptions):
-                fail("Sized requires an exact premise or a type without parameters whose size is not zero", pos)
+                fail("Sized requires an exact premise or a part whose size is not zero whatever the type parameters "
+                     "are", pos)
             return
         inputs = [zonk(a) for a in args[:input_count]]
         for p in self.assumptions:

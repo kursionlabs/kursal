@@ -23,8 +23,8 @@
 // Adopting the block. `Allocation!::adopt` asks for an initialized `T` in
 // at least `sizeof[T]()` bytes, because its region lets safe code read and
 // write the block as a `T`. The block holds `cap` slots, and `cap` starts
-// at 4 and only doubles, so the size holds; a zero-size `T` takes no bytes,
-// so its `cap` starts at `usize::MAX` and the block of none never grows.
+// at 4 and only doubles, so the size holds. `T` is `Sized`: a raw read or
+// write is never at a zero-size type.
 // Only the first `len` slots are initialized, and an empty vec has none. That is sound here because the
 // region never leaves this module and is never read as a `T`: `share`'s
 // `Ref` is taken apart into the base address at once, elements are read
@@ -81,16 +81,16 @@ struct Vec! {
 }
 
 
-forall T.
+forall T where Sized[T].
 impl Vec![T] {
-    /// An empty vec with capacity 4 (`usize::MAX` for a zero-size `T`), under
+    /// An empty vec with capacity 4, under
     /// a fresh brand, or the allocation failure. `Allocation!::adopt` mints
     /// and seals the brand and records the block's base and extent; `share`
     /// trades the region for the `Exclusive!`/`Ref` pair this signature
     /// promises, plus the receipt that is the only route back. Growing it
     /// later aborts as `push` does.
     fn try_new() -> Result[exists '1. (Exclusive!['1], Vec![T, '1]), AllocError] {
-        let initial_cap = if sizeof[T]() == 0usize { usize::MAX } else { 4usize };
+        let initial_cap = 4usize;
         let bytes = checked_mul(initial_cap, sizeof[T]());
         match Storage::try_alloc(bytes) {
             Result::Err(e) => Result::Err.(e),
@@ -112,7 +112,7 @@ impl Vec![T] {
     }
 }
 
-forall T, 'k.
+forall T, 'k where Sized[T].
 impl Vec![T, 'k] {
     /// Appends `val`, doubling the capacity when the vec is full. The only
     /// operation here where the storage can move. Always
@@ -332,7 +332,7 @@ impl Vec![T, 'k] {
 // elements may change order.
 
 /// Whether the element at `i` orders before the one at `j`; both stay put.
-forall T, Env where Copy[Env].
+forall T, Env where Copy[Env], Sized[T].
 unsafe fn before(p: *T, i: usize, j: usize, cmp: closure[Env](T, T) -> (T, T, Order)) -> bool {
     let a = unsafe *(unsafe offset(p, i));
     let b = unsafe *(unsafe offset(p, j));
@@ -345,7 +345,7 @@ unsafe fn before(p: *T, i: usize, j: usize, cmp: closure[Env](T, T) -> (T, T, Or
     }
 }
 
-forall T.
+forall T where Sized[T].
 unsafe fn swap_at(p: *T, i: usize, j: usize) -> () {
     let a = unsafe *(unsafe offset(p, i));
     let b = unsafe *(unsafe offset(p, j));
@@ -355,7 +355,7 @@ unsafe fn swap_at(p: *T, i: usize, j: usize) -> () {
 }
 
 /// Restores the max-heap below `root` within the first `end` elements.
-forall T, Env where Copy[Env].
+forall T, Env where Copy[Env], Sized[T].
 unsafe fn sift_down(p: *T, root: usize, end: usize, cmp: closure[Env](T, T) -> (T, T, Order)) -> () {
     var at = root;
     var going = true;
@@ -382,7 +382,7 @@ unsafe fn sift_down(p: *T, root: usize, end: usize, cmp: closure[Env](T, T) -> (
     }
 }
 
-forall T, 'k.
+forall T, 'k where Sized[T].
 impl Vec![T, 'k] {
     /// Sorts the elements so `cmp` never says a later one orders before an
     /// earlier one. Not stable; any `T`.
@@ -406,7 +406,7 @@ impl Vec![T, 'k] {
     }
 }
 
-forall T, 'k where Ord[T, T].
+forall T, 'k where Ord[T, T], Sized[T].
 impl Vec![T, 'k] {
     /// Sorts the elements in ascending `Ord` order. Not stable; any `T`.
     fn sort_unstable(&self, &tag: Exclusive!['k]) {
@@ -414,7 +414,7 @@ impl Vec![T, 'k] {
     }
 }
 
-forall T, 'k where Copy[T].
+forall T, 'k where Copy[T], Sized[T].
 impl Vec![T, 'k] {
     /// Sorts, stably, by `cmp`, which is lent the context `cx` for each
     /// comparison, so the order may read a domain the elements point into.
@@ -423,7 +423,7 @@ impl Vec![T, 'k] {
         let { alloc: a, back: bk, buf: r, len: n, cap: c } = self;
         let (p, m) = r.into_parts();
         let size = sizeof[T]();
-        if n < 2usize || size == 0usize {
+        if n < 2usize {
             self = Vec!.{ alloc: a, back: bk, buf: r, len: n, cap: c };
             return;
         }
@@ -454,7 +454,7 @@ impl Vec![T, 'k] {
     }
 }
 
-forall T, 'k where Copy[T], Ord[T, T].
+forall T, 'k where Copy[T], Ord[T, T], Sized[T].
 impl Vec![T, 'k] {
     /// Sorts the elements in ascending `Ord` order, stably.
     fn sort(&self, &tag: Exclusive!['k]) {
@@ -471,7 +471,7 @@ fn forget_copy(value: T) -> () {
     ()
 }
 
-forall T, 'k where Copy[T].
+forall T, 'k where Copy[T], Sized[T].
 impl Vec![T, 'k] {
     /// A copy of element `i`, or `None` when it is out of range.
     fn get(&self, &tag: Exclusive!['k], i: usize) -> Option[T] {
@@ -491,7 +491,7 @@ impl Vec![T, 'k] {
     }
 }
 
-forall T, 'k where Copy[T].
+forall T, 'k where Copy[T], Sized[T].
 impl Vec![T, 'k] {
     /// Frees a vector of `Copy` elements, which need no per-element callback.
     fn free(self, tag: Exclusive!['k]) -> () {
@@ -511,7 +511,7 @@ exposed struct OwnedVec! {
     inner: exists 'k. (Exclusive!['k], Vec![T, 'k]),
 }
 
-forall T.
+forall T where Sized[T].
 impl OwnedVec![T] {
     /// An empty vector, aborting when allocation fails.
     fn new() -> OwnedVec![T] {
@@ -659,7 +659,7 @@ impl OwnedVec![T] {
     }
 }
 
-forall T where Ord[T, T].
+forall T where Ord[T, T], Sized[T].
 impl OwnedVec![T] {
     /// Sorts the elements in ascending `Ord` order. Not stable; any `T`.
     fn sort_unstable(self) -> OwnedVec![T] {
@@ -669,7 +669,7 @@ impl OwnedVec![T] {
     }
 }
 
-forall T where Copy[T], Ord[T, T].
+forall T where Copy[T], Ord[T, T], Sized[T].
 impl OwnedVec![T] {
     /// Sorts the elements in ascending `Ord` order, stably.
     fn sort(self) -> OwnedVec![T] {
@@ -679,7 +679,7 @@ impl OwnedVec![T] {
     }
 }
 
-forall T where Copy[T].
+forall T where Copy[T], Sized[T].
 impl OwnedVec![T] {
     /// A copy of element `i`, or `None` when it is out of range.
     fn get(&self, i: usize) -> Option[T] {
@@ -754,7 +754,7 @@ impl OwnedVec![T] {
     }
 }
 
-forall T where Copy[T], Eq[T, T].
+forall T where Copy[T], Eq[T, T], Sized[T].
 impl OwnedVec![T] {
     /// Whether some element equals `value` (`Eq`).
     fn contains(&self, value: T) -> bool {
@@ -769,7 +769,7 @@ impl OwnedVec![T] {
     }
 }
 
-forall T where Copy[T].
+forall T where Copy[T], Sized[T].
 impl OwnedVec![T] {
     /// Sorts, stably, by `cmp`, which is lent the context `cx` for each
     /// comparison (`Vec!::sort_by`).
@@ -791,7 +791,7 @@ exposed struct VecIter! {
     index: usize,
 }
 
-forall T, 'k where Copy[T].
+forall T, 'k where Copy[T], Sized[T].
 impl Vec![T, 'k] {
     /// An iterator over the elements, holding the vec and its capability
     /// until `VecIter!::finish` hands them back.
@@ -800,7 +800,7 @@ impl Vec![T, 'k] {
     }
 }
 
-forall T, 'k where Copy[T].
+forall T, 'k where Copy[T], Sized[T].
 impl VecIter![T, 'k] {
     /// Ends the iteration, handing back the capability and the vec.
     fn finish(self) -> (Exclusive!['k], Vec![T, 'k]) {
@@ -809,7 +809,7 @@ impl VecIter![T, 'k] {
     }
 }
 
-forall T, 'k where Copy[T].
+forall T, 'k where Copy[T], Sized[T].
 instance Iterator[VecIter![T, 'k] -> T] {
     fn next(&it: VecIter![T, 'k]) -> Option[T] {
         let { vec, tag, index } = it;
@@ -837,7 +837,7 @@ exposed struct OwnedVecIter! {
     index: usize,
 }
 
-forall T where Copy[T].
+forall T where Copy[T], Sized[T].
 impl OwnedVec![T] {
     /// An iterator over the elements, holding the vector until
     /// `OwnedVecIter!::finish` hands it back.
@@ -846,7 +846,7 @@ impl OwnedVec![T] {
     }
 }
 
-forall T where Copy[T].
+forall T where Copy[T], Sized[T].
 impl OwnedVecIter![T] {
     /// Ends the iteration, handing back the vector.
     fn finish(self) -> OwnedVec![T] {
@@ -855,7 +855,7 @@ impl OwnedVecIter![T] {
     }
 }
 
-forall T where Copy[T].
+forall T where Copy[T], Sized[T].
 instance Iterator[OwnedVecIter![T] -> T] {
     fn next(&it: OwnedVecIter![T]) -> Option[T] {
         let { vec, index } = it;
@@ -871,7 +871,7 @@ instance Iterator[OwnedVecIter![T] -> T] {
 }
 
 // Every iterator's remaining items, in order, in a new vector.
-forall I, T where Iterator[I -> T].
+forall I, T where Iterator[I -> T], Sized[T].
 impl I {
     /// The iterator's remaining items, in order, in a new vector.
     fn collect_vec(self) -> (I, OwnedVec![T]) {

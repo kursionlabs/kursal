@@ -855,8 +855,8 @@ class Checker:
         fn` type: no safe function value comes from foreign code or goes to it. Foreign code calls such a
         value with arguments it makes, and takes its result, or hands the value back, so the program calls
         it: each parameter of one has a memory form and holds nothing only checked code makes, and so does
-        its result, which may be zero-size only with an erased value (`void`), and none of its parameters
-        is a place, which foreign code cannot lend. The walk reaches the function types nested in those
+        its result, which may be zero-size only if it is Copy (C's `void`, where a linear value would
+        vanish), and none of its parameters is a place, which foreign code cannot lend. The walk reaches the function types nested in those
         too."""
         for t in ptypes:
             self.has_memory_form(t)
@@ -872,7 +872,7 @@ class Checker:
                 self.has_memory_form(t)
                 self.foreign_result(t)
             self.foreign_result(fn.ret)
-            if self.types.zero_size(fn.ret) and not self.types.erasable(fn.ret):
+            if self.types.zero_size(fn.ret) and not self.copy_type(fn.ret):
                 self.fail("zero_size_type_has_no_memory_form")
 
     def foreign_result(self, ty: Type) -> None:
@@ -888,17 +888,17 @@ class Checker:
             self.fail("extern_result_layout_chosen")
 
     def has_memory_form(self, ty: Type) -> None:
-        """A zero-size type is erased: it has no C object and no C value, and `sizeof` of one is 0. A load or
-        store of one through a pointer reads and writes nothing, and `alloca` of one gives a pointer that is
-        not null, so those accept it (one with no erased value is `zero_size_access`'s to reject); an
-        unsafe cast reinterprets a representation, which a zero-size type does not have, and C has no
-        zero-size parameter, so casts and extern parameters reject zero-size types."""
+        """A zero-size type is erased: it has no C object and no C value, and `sizeof` of one is 0. An unsafe
+        cast reinterprets a representation, which a zero-size type does not have, and C has no zero-size
+        parameter, so casts and extern parameters reject zero-size types (as a raw load, store or `alloca`
+        does, `raw_access`)."""
         if self.types.zero_size(ty):
             self.fail("zero_size_type_has_no_memory_form")
 
     def op_alloca(self, instr: Instr) -> Type:
         if instr.ty is None:
             self.fail("instruction_requires_type")
+        self.raw_access(instr.ty)
         return Ptr(instr.ty)
 
     def op_sizeof(self, instr: Instr) -> Type:
@@ -974,7 +974,7 @@ class Checker:
             self.fail("ptr_load_non_pointer")
         if contains(self.types, t.inner, lambda ty: isinstance(ty, Never)):
             self.fail("unsafe_read_cannot_produce_never")
-        self.zero_size_access(t.inner)
+        self.raw_access(t.inner)
         return t.inner
 
     op_ptr_load_volatile = op_ptr_load
@@ -983,18 +983,19 @@ class Checker:
         p, v = self.use(instr.args[0]), self.use(instr.args[1])
         if not isinstance(p, Ptr) or not fits(v, p.inner):
             self.fail("store_through_pointer_another")
-        self.zero_size_access(p.inner)
+        self.raw_access(p.inner)
         return UNIT
 
     op_ptr_store_volatile = op_ptr_store
 
-    def zero_size_access(self, ty: Type) -> None:
-        """MEM-ZERO-SIZE: a load or store at a zero-size type reads and writes nothing, so it is formed only
-        where the type has an erased value (`Types.erasable`): a load would conjure a brand witness, a
-        package or a linear value, and a store would make one vanish. An erasable type is Copy, as a store
-        needs. A type parameter is not zero-size here."""
-        if self.types.zero_size(ty) and not self.types.erasable(ty):
-            self.fail("zero_size_access_not_erasable")
+    def raw_access(self, ty: Type) -> None:
+        """MEM-SIZED-ACCESS: a raw load, store or `alloca` is at a type of non-zero size, never a zero-size
+        one, which has no memory to read, write or reserve: it needs `Sized` of the type
+        (`Types.sized_available`), which the shape decides for a type without parameters, and which
+        otherwise holds by an exact premise or a part with bytes whatever the parameters are. Nothing is
+        checked again at an instantiation; a caller discharges `Sized`."""
+        if not self.types.sized_available(ty, self.premises):
+            self.fail("raw_access_at_zero_size" if self.types.closed(ty) else "raw_access_needs_sized")
 
     def atomic(self, instr: Instr) -> Type:
         kind = ATOMIC_OPS[instr.op]

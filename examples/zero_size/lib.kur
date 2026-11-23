@@ -2,20 +2,15 @@
 // and tuples of nothing else, enums aside (a tag is a byte or more), and arrays
 // of length 0 or of zero-size elements. They have no bytes: `sizeof` of one
 // is 0, a struct holding one is no bigger for it, and passing, returning,
-// storing, matching and keeping them in the arena costs nothing. Reading or
-// writing one through a pointer reads and writes nothing, so every container
-// holds them: a vector of units counts, and a map to `()` is a set. Only one
-// with an erased value is read or written so, which holds no brand witness,
-// package or capability: a read would conjure one and a write lose it. A check
-// that fails prints its name.
+// storing in a place and matching them costs nothing. Memory holds none on
+// its own: a raw read, write or `alloca` is never at one, so no container or
+// arena holds one as an element, but one holds a value with zero-size parts
+// beside bytes. A check that fails prints its name.
 use std::arena::Domain!;
 use std::cap::Exclusive!;
 use std::collections::arena_vec::ArenaVec;
-use std::collections::hashmap::OwnedMap!;
-use std::collections::vec::OwnedVec!;
 use std::io::print;
-use std::mem::{Ref, alloca};
-use std::owned::Owned!;
+use std::mem::Ref;
 use std::slice::Slice;
 use std::mem::sizeof;
 use std::process::hash_seed;
@@ -92,12 +87,6 @@ fn bump(&m: Marker, &n: u64) {
     n = n + 1;
 }
 
-// A value moved into its own heap block and back out.
-forall T.
-fn boxed(x: T) -> T {
-    Owned!::new(x).into_value()
-}
-
 forall 'k.
 fn take(t: Tagged!['k]) -> u64 {
     let { tag, unit, nothing, value, marker } = t;
@@ -145,39 +134,7 @@ fn main() -> i32 {
     let (_m, seven) = held.copy(&cx);
     let (_n, last) = pairs.at(&cx, 99usize);
     check(seven == 7 && last == 99 && pairs.len(&cx) == 100usize, "arena values with zero-size parts");
-    let markers: ArenaVec[Marker, 'a] = ArenaVec::filled(&cx, 1000usize, mark());
-    let unit = Ref::new(&cx, ());
-    let again = unit.copy(&cx);
-    check(markers.len(&cx) == 1000usize, "arena values of zero-size types");
     cx.destroy();
 
-    var units = OwnedVec!::new[()]();
-    var k = 0u32;
-    while k < 1000 {
-        units = units.push(boxed(()));
-        k = k + 1;
-    }
-    let popped = &units.pop();
-    let counted = &units.len();
-    units.free();
-    check(popped.is_some() && counted == 999usize, "a vector of units");
-
-    var set = OwnedMap!::new[u32, ()](hash_seed());
-    var s = 0u32;
-    while s < 100 {
-        let old = &set.insert(s % 10, ());
-        s = s + 1;
-    }
-    var key = 7u32;
-    let present = &set.contains(&key);
-    let removed = &set.remove(&key);
-    let size = &set.len();
-    set.free();
-    check(present && removed.is_some() && size == 9usize, "a set");
-
-    let slot = unsafe alloca[(Marker, [u64; 0])]();
-    unsafe *slot = (mark(), []);
-    let (read, nothing) = unsafe *slot;
-    check(unsafe (slot as usize) != 0usize, "a pointer to a zero-size value");
     0
 }

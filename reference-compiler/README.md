@@ -51,14 +51,15 @@ builtin::NonNull;`, the `export` form of `use`), and every other package imports
 | `core::ptr` | `NonNull[T]` | a pointer that is never null; `core::ptr` gives it its methods |
 | | `unsafe load_volatile(p)`, `unsafe store_volatile(p, v)` | volatile access, as `p.load_volatile()` and `p.store_volatile(v)` |
 | `core::mem` | `sizeof[T]()` | the size of `T` in bytes, 0 for a zero-size type |
-| | `unsafe alloca[T]()` | room for a `T` in the calling function's frame |
+| | `unsafe alloca[T]()` | room for a `T` in the calling function's frame; `T` is `Sized` |
 | | `enum_variant(&place)`, `enum_variant(value)` | the index of an enum value's variant, beside the value when it is taken by value |
 | `core::atomic` | `unsafe fence(ordering)` | a memory fence |
 | `core::process` | `trap()` | stops the program at once (C's `__builtin_trap`); its type is `fn() -> !` |
 
 `sizeof` is a function of one type argument, like `alloca`, not syntax. The operations of a raw
 pointer (`p.load()`, `p.store(v)`, `p.atomic_load(o)`, `p.compare_exchange(...)`, `p.fetch_add(...)`)
-are methods of `*T`, and need no import.
+are methods of `*T`, and need no import. A raw load, store or `alloca` needs `Sized` of its type, so
+never at a zero-size type, and `Sized[T]` at a type parameter `T`.
 
 ## KURS names
 
@@ -77,8 +78,8 @@ leaves it out (`K_alloc_buffer_Buffer`).
 - **Types**: `struct`, `enum`, `tuple`, `array`, `exists` and `foreach` (whose pattern `(ptr F)`
   binds the pointee), and `(ptr T)`, `(non_null T)`, `(brand $k)`, `(fn (PTYPE*) RET)` (an
   unsafe function's type `(fn (unsafe) (PTYPE*) RET)`).
-- **Premises**: `(Copy T)`, `(Exposed T)` and `(Sized T)` (a finite by-value layout of non-zero size;
-  not a premise of a type declaration).
+- **Premises**: `(Copy T)`, `(Exposed T)` and `(Sized T)` (a finite by-value layout of non-zero size,
+  which `ptr_load`, `ptr_store` and `alloca` need of their type; not a premise of a type declaration).
 - **Builtin operations**: `int_cast` (between integers, modular), `float_cast` (by value, with a
   float on one side or both: an integer to the nearest float; a float toward zero to an integer,
   saturating, NaN to 0; a float to the nearest of the other width), `to_ptr` (a `non_null` as its

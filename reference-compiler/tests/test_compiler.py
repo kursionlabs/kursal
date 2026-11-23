@@ -2039,26 +2039,33 @@ class CompilerTests(unittest.TestCase):
                     self.assertEqual(got, want)
 
     def test_zero_size_instantiations_match_reference(self):
-        """A container of a zero-size element type, which reads and writes its elements through pointers, as
-        nothing: `kursal build` writes the reference's C."""
+        """A container of an element type with zero-size parts beside bytes, and the containers at a zero-size
+        element type, which `Sized` rejects: `kursal build` writes the reference's C, or its error."""
         sources = (
+            "fn main() -> i32 { var v = OwnedVec!::new[((), u8)](); v = v.push(((), 1u8)); v.free(); 0 }\n",
+            "fn main() -> i32 { var m = OwnedMap!::new[u32, ((), u8)](std::process::hash_seed()); let old = &m.insert(1u32, ((), 2u8)); m.free(); 0 }\n",
+            "fn main() -> i32 { let o = Owned!::new(((), 3u8)); o.into_value(); 0 }\n",
+            "forall T where Sized[T]. fn boxed(x: T) -> T { Owned!::new(x).into_value() }\nfn main() -> i32 { boxed(((), 4u8)); 0 }\n",
+        )
+        rejected = (
             "fn main() -> i32 { var v = OwnedVec!::new[()](); v = v.push(()); v.free(); 0 }\n",
             "fn main() -> i32 { var m = OwnedMap!::new[u32, ()](std::process::hash_seed()); let old = &m.insert(1u32, ()); m.free(); 0 }\n",
-            "fn main() -> i32 { let o = Owned!::new(()); o.into_value(); 0 }\n",
             "forall T. fn boxed(x: T) -> T { Owned!::new(x).into_value() }\nfn main() -> i32 { boxed(()); 0 }\n",
         )
         imports = "use std::owned::Owned!;\nuse std::collections::{hashmap::OwnedMap!, vec::OwnedVec!};\n"
         with tempfile.TemporaryDirectory() as directory:
             paths = []
-            for index, source in enumerate(sources):
+            for index, source in enumerate((*sources, *rejected)):
                 root = Path(directory) / f"zero{index}"
                 root.mkdir()
                 (root / "kur.toml").write_text(manifest("app", entry="main") + f'[dependencies.std]\npath="{LIB / "std"}"\n')
                 (root / "lib.kur").write_text(imports + source)
                 paths.append(root)
             expected = [in_deep_thread(lambda: reference_entry(path)) for path in paths]
-            for want in expected:
+            for want in expected[:len(sources)]:
                 self.assertFalse(want.startswith("error:"), want)
+            for want in expected[len(sources):]:
+                self.assertIn("Sized requires an exact premise", want)
             for path, want, got in zip(paths, expected, self.run_batches("build", paths)):
                 with self.subTest(source=(path / "lib.kur").read_text()):
                     self.assertEqual(got, want)
