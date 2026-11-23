@@ -277,7 +277,9 @@ double free.
 
 Every write through a raw pointer also has this obligation: it never addresses the static
 image, the bytes of a string constant (a `Slice[u8, 'static]` the compiler made). The C
-backend emits them `static const`, so a write there is undefined and may fault.
+backend emits them `static const`, so a write there is undefined and may fault. A load
+through a pointer into it leaves it as it is: every data item's type is `Copy`, which both
+checkers require of a KURS `data` declaration (`data_type_not_copy`).
 
 
 ### 2.3 Reads through an arbitrary pointer

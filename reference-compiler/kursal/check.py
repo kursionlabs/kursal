@@ -207,6 +207,10 @@ class Checker:
         for data in self.program.datas.values():
             self.where = data.name
             self.module = data.module or NOWHERE
+            # A data item's static object is never written, and a load through a pointer to it must
+            # leave it as it is: a move out of a linear value would change it (DECL-DATA).
+            if not self.types.is_copy(data.ty):
+                self.fail("data_type_not_copy")
             self.check_data(data.ty, data.init)
 
     def check_instance(self, inst: Instance) -> None:

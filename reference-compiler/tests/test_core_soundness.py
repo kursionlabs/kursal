@@ -373,6 +373,15 @@ REJECTED = {
 
     # An enum has at least one variant: a sum of none would be a type with no value.
     "empty_enum_declaration": ("an enum has at least one variant", "(type E (enum))"),
+    # A data item is Copy: its static object is never written, so a load through a pointer to it may not
+    # move a linear value out (DECL-DATA), a forced-linear type's whose fields are all Copy included.
+    "data_linear": ("data_type_not_copy", """
+        (type L! (struct (n u32)))
+        (data d L! (7))"""),
+    "data_holding_linear": ("data_type_not_copy", """
+        (type L! (struct (n u32)))
+        (data d (tuple u8 (array L! 2)) (1 ((2) (3))))"""),
+
     "empty_enum_written": ("an enum has at least one variant", """
         (fun f usize () (entry () (= %n (sizeof (tuple (enum)))) (ret %n)))"""),
 
