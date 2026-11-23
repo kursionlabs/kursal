@@ -1305,6 +1305,9 @@ KURS_ERRORS = (
     "(type T (exists ((a \"b c\")) u32))",
     "(type T (array u8 x))",
     "(type T (array u8 18446744073709551616))",
+    # There is no extern value.
+    "(extern value errno i32)",
+    "(extern fun f u32)",
 )
 
 

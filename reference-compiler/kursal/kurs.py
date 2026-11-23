@@ -297,9 +297,10 @@ def parse_program(text: str) -> Program:
         elif head == "fun":
             program.funs[str(rest[0])] = parse_fun(rest[1:], str(rest[0]), module, unsafe, form.pos)
         elif head == "extern":
-            kind, name = form[1], str(form[2])
-            program.externs[name] = (Extern(name, parse_type(form[3]), tuple(parse_type(t) for t in _list(form[4])), form.pos)
-                                     if kind == "fun" else Extern(name, parse_type(form[3]), None, form.pos))
+            if len(form) != 5 or form[1] != "fun":
+                _fail("an extern is (extern fun NAME RET (PTYPE*))", form)
+            name = str(form[2])
+            program.externs[name] = Extern(name, parse_type(form[3]), tuple(parse_type(t) for t in _list(form[4])), form.pos)
         elif head == "trait":
             trait_methods: list[Method] = []
             for method in map(_list, rest[2:]):
@@ -563,10 +564,6 @@ def write_type_decl(decl: TypeDecl) -> str:
 
 
 def write_extern(extern: Extern) -> str:
-    if extern.ret is None:
-        _cannot(f"the extern {extern.name} without a type")
-    if extern.ptypes is None:
-        return _form(["extern", "value", write_atom(extern.name), write_type(extern.ret)])
     return _form(["extern", "fun", write_atom(extern.name), write_type(extern.ret),
                   _form([write_type(t) for t in extern.ptypes])])
 

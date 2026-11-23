@@ -496,10 +496,6 @@ class Backend:
             if ext.name in RUNTIME_NAMES or ext.name.startswith(("__builtin_", "__atomic_")) or \
                     ext.name in ("main", REPORT_ERROR) and entry is not None or ext.name == START and entry is not None and hosted:
                 raise KursError(f"backend: foreign symbol {ext.name} conflicts with the C runtime prelude or entry wrapper", ext.pos)
-            assert ext.ret is not None
-            if ext.ptypes is None:
-                externs.append(f"extern {self.ctype(ext.ret)} {ext.name};")
-                continue
             ret = self.ctype(ext.ret)
             noreturn = "_Noreturn " if isinstance(ext.ret, Never) else ""
             params = ", ".join(self.ctype(p) for p in ext.ptypes) or "void"
@@ -1335,7 +1331,6 @@ class Backend:
             self.emit_call(instr, self.value_name(callee), fn.ret, {}, instr.args[1:])
         elif callee in self.program.externs:
             ext = self.program.externs[callee]
-            assert ext.ret is not None
             self.emit_call(instr, callee, ext.ret, {}, instr.args[1:])
         else:
             fun = self.program.funs[callee]

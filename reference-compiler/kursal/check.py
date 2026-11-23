@@ -189,9 +189,9 @@ class Checker:
     def check(self) -> None:
         for ext in self.program.externs.values():
             self.where = f"extern {ext.name}"
-            for t in ext.ptypes if ext.ptypes is not None else (() if ext.ret is None else (ext.ret,)):
+            for t in ext.ptypes:
                 self.has_memory_form(t)
-            if ext.ret is not None and not isinstance(ext.ret, Never):
+            if not isinstance(ext.ret, Never):
                 self.foreign_result(ext.ret)
         for trait in self.program.traits.values():
             self.where = f"trait {trait.name}"
@@ -580,8 +580,6 @@ class Checker:
             return list(ty.params), ty.ret, ty.unsafe, ty.places
         if callee in self.program.externs:
             ext = self.program.externs[callee]
-            if ext.ptypes is None or ext.ret is None:
-                self.fail("extern_value_not_callable")
             return list(ext.ptypes), ext.ret, True, frozenset()
         fun = self.program.funs.get(callee)
         if fun is None:
@@ -825,8 +823,6 @@ class Checker:
         name = instr.args[0]
         if name in self.program.externs:
             ext = self.program.externs[name]
-            if ext.ptypes is None or ext.ret is None:
-                self.fail("extern_value_not_callable")
             return Fn(ext.ptypes, ext.ret, unsafe=True)
         fun = self.program.funs.get(name)
         if fun is None:
@@ -835,7 +831,7 @@ class Checker:
         return subst(Fn(fun.ptypes, fun.ret, fun.unsafe, fun.places), sub)
 
     def foreign_result(self, ty: Type) -> None:
-        """What foreign code hands the program, an extern function's result or an extern value, is
+        """What foreign code hands the program, an extern function's result, is
         reinterpreted from C's bytes as an unsafe cast's result is: it holds nothing only checked code
         makes (`checked_only`; a result of `!` itself says the function does not return), and no enum or
         `NonNull`, whose layout the compiler chooses."""
@@ -848,9 +844,8 @@ class Checker:
         """A zero-size type is erased: it has no C object and no C value, and `sizeof` of one is 0. A load or
         store of one through a pointer reads and writes nothing, and `alloca` of one gives a pointer that is
         not null, so those accept it (one with no erased value is `zero_size_access`'s to reject); an
-        unsafe cast reinterprets a representation, which a zero-size type
-        does not have, and C has no zero-size parameter or object, so casts and extern parameters and values
-        reject zero-size types."""
+        unsafe cast reinterprets a representation, which a zero-size type does not have, and C has no
+        zero-size parameter, so casts and extern parameters reject zero-size types."""
         if self.types.zero_size(ty):
             self.fail("zero_size_type_has_no_memory_form")
 

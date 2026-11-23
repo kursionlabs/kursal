@@ -213,7 +213,7 @@ def promote_locals(fun: C.Fun, types: Types, params: Sequence[C.Param],
                     assert isinstance(cty, C.Fn)
                     ptypes = cty.params
                 elif callee in types.program.externs:
-                    ptypes = types.program.externs[callee].ptypes or ()
+                    ptypes = types.program.externs[callee].ptypes
                 else:
                     target = types.program.funs[callee]
                     sub = dict(zip((p.name for p in target.params), instr.tys))

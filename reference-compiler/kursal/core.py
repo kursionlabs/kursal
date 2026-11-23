@@ -269,8 +269,8 @@ class Fun:
 @dataclass
 class Extern:
     name: str
-    ret: Optional[Type] = None
-    ptypes: Optional[tuple[Type, ...]] = None   # None for an extern value
+    ret: Type
+    ptypes: tuple[Type, ...]
     pos: Optional[Position] = None
 
 

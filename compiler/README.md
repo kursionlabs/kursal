@@ -620,7 +620,7 @@ type argument wherever it type-checks: `Ref::new(&cx, ())`, `ArenaVec[(), 'k]`, 
 reads and writes are of nothing. Three operations still reject a zero-size type
 (`zero_size_type_has_no_memory_form`), as the front end does first, at the source (`a zero-size type
 has no memory form`): an unsafe cast from or to one, which reinterprets a representation it does not
-have; and an extern parameter or extern value of one, which C has no form for. None of them can
+have; and an extern parameter of one, which C has no form for. None of them can
 take a type parameter (a cast cannot take or produce a value of one, and an extern is not generic),
 so no specialization meets them, and the backend has no zero-size rule of its own. A load or store
 at a zero-size type, volatile or not, is formed only where the type has an *erased value*: unit, a

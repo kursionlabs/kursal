@@ -207,9 +207,9 @@ caller is not made safe by this library's vocabulary or by an `unsafe`
 marker.
 
 **What an extern hands back is checked like a cast's result.** C's bytes
-become the result of an `extern "C"` function, or the value of a KURS
-`extern value`, with no Kursal code making them, as an unsafe cast's bytes
-become its result. So the checker rejects such a result or value that holds,
+become the result of an `extern "C"` function, with no Kursal code making
+them, as an unsafe cast's bytes become its result. So the checker rejects such
+a result that holds,
 anywhere in its value (named types' fields included, not behind a pointer),
 what only checked code makes: a package, a brand witness, a safe function
 value, a transform, or `Never` (`extern_result_cannot_produce`; a result of
@@ -495,7 +495,7 @@ signature". It does not mean "verified correct".**
 **Zero sizes.** A zero-size type (`()`, a brand, a capability, an empty
 struct, `[T; 0]`) has size 0: `sizeof[T]()` is `0`, `alignof[T]()` is 1, and
 a load or store of one through a pointer reads and writes nothing (an unsafe
-cast from or to one, an extern parameter or value of one, and a load or store
+cast from or to one, an extern parameter of one, and a load or store
 of one with no erased value, which holds a brand witness, a package or a
 linear value, are rejected; compiler/README.md, "Zero-size types are
 erased"). So every

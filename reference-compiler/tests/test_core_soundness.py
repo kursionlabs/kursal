@@ -418,7 +418,8 @@ REJECTED = {
     "cast_from_unit": ("zero_size_type_has_no_memory_form", """
         (fun (unsafe) h u8 ((tuple)) (entry ((%u (tuple))) (= %x (cast %u u8)) (ret %x)))"""),
     "extern_unit_parameter": ("zero_size_type_has_no_memory_form", "(extern fun f u32 ((tuple)))"),
-    "extern_unit_value": ("zero_size_type_has_no_memory_form", "(extern value v (tuple (array u8 0)))"),
+    # There is no extern value: a foreign datum is reached through a function that returns a pointer to it.
+    "extern_value": ("an extern is \\(extern fun NAME RET \\(PTYPE\\*\\)\\)", "(extern value v (tuple u64 u8))"),
 
     # What foreign code hands back is reinterpreted from C's bytes, as a cast's result is: it holds
     # nothing only checked code makes, and no layout the compiler chooses.
@@ -428,7 +429,6 @@ REJECTED = {
     "extern_result_safe_function": ("extern_result_cannot_produce", "(extern fun make (fn () u32) ())"),
     "extern_result_package": ("extern_result_cannot_produce", "(extern fun make (tuple u64 (exists ($k) (brand $k))) ())"),
     "extern_result_holding_never": ("extern_result_cannot_produce", "(extern fun make (tuple u64 !) ())"),
-    "extern_value_brand": ("extern_result_cannot_produce", "(extern value v (tuple u64 (brand $static)))"),
     "extern_result_enum": ("extern_result_layout_chosen", """
         (type E (enum (A u32) (B u64)))
         (extern fun make (tuple u64 E) ())"""),

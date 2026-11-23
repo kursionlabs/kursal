@@ -322,11 +322,8 @@ class Formation:
         self.module, self.premises = None, ()
         for ext in self.program.externs.values():
             self.pos = ext.pos
-            if ext.ret is None:
-                self.fail("extern requires a type")
-            else:
-                for t in (*(ext.ptypes or ()), ext.ret):
-                    self.fits(t, C.ANY, env)
+            for t in (*ext.ptypes, ext.ret):
+                self.fits(t, C.ANY, env)
         for data in self.program.datas.values():
             self.module = data.module
             self.pos = None

@@ -561,8 +561,7 @@ def devalue(program: Program) -> Program:
                        methods=tuple(Function(checker, f, inst.params).translate() for f in inst.methods))
 
     def extern(ext: Extern) -> Extern:
-        return replace(ext, ret=None if ext.ret is None else devalue_type(ext.ret),
-                       ptypes=None if ext.ptypes is None else tuple(devalue_type(t) for t in ext.ptypes))
+        return replace(ext, ret=devalue_type(ext.ret), ptypes=tuple(devalue_type(t) for t in ext.ptypes))
 
     def decl(d: TypeDecl) -> TypeDecl:
         return replace(d, premises=tuple(map(devalue_premise, d.premises)), body=devalue_type(d.body))

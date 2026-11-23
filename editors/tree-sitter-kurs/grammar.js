@@ -32,7 +32,7 @@ module.exports = grammar({
     bracket_group: $ => seq('[', repeat($._item), ']'),
 
     keyword: _ => choice(
-      'type', 'struct', 'enum', 'fn', 'unsafe', 'extern', 'val', 'data', 'trait', 'instance',
+      'type', 'struct', 'enum', 'fn', 'unsafe', 'extern', 'data', 'trait', 'instance',
       'forall', 'where', 'exists', 'foreach', 'of', 'using', 'as',
       'locals', 'entry', 'block', 'state', 'empty', 'known', 'open',
       'return', 'jump', 'branch', 'switch', 'unreachable',

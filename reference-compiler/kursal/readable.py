@@ -212,13 +212,8 @@ def emit_kurs(program: C.Program) -> str:
         lines.append(f"type {decl.name} = {type_text(decl.body)};")
         sections.append("\n".join(lines))
     for external in program.externs.values():
-        assert external.ret is not None
-        ty = type_text(external.ret)
-        if external.ptypes is None:
-            sections.append(f"extern val {external.name}: {ty};")
-        else:
-            extern_params = ", ".join(type_text(param) for param in external.ptypes)
-            sections.append(f"extern fn {external.name}({extern_params}) -> {ty};")
+        extern_params = ", ".join(type_text(param) for param in external.ptypes)
+        sections.append(f"extern fn {external.name}({extern_params}) -> {type_text(external.ret)};")
     for data in program.datas.values():
         sections.append("\n".join([*metadata(data.module), f"data {data.name}: {type_text(data.ty)} = {initializer_text(data.init)};"]))
     for trait in program.traits.values():

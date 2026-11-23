@@ -773,25 +773,14 @@ impl Checker['k] {
         while e < externs.len(&cx) {
             let ext = externs.at(&cx, e);
             self.location.set(&cx, Buffer!::new().push_static("extern ").push_bytes(&cx, ext.name).save(&cx));
-            let unit = match ext.ptypes {
-                Option::Some(ptypes) => {
-                    var i = 0usize;
-                    while i < ptypes.len(&cx) {
-                        self.has_memory_form(&cx, ptypes.at(&cx, i));
-                        i = i + 1usize;
-                    }
-                },
-                Option::None => match ext.ret {
-                    Option::Some(ty) => self.has_memory_form(&cx, ty),
-                    Option::None => (),
-                },
-            };
-            let unit = match ext.ret {
-                Option::Some(ty) => if !is_never(ty) {
-                    self.foreign_result(&cx, ty);
-                },
-                Option::None => (),
-            };
+            var i = 0usize;
+            while i < ext.ptypes.len(&cx) {
+                self.has_memory_form(&cx, ext.ptypes.at(&cx, i));
+                i = i + 1usize;
+            }
+            if !is_never(ext.ret) {
+                self.foreign_result(&cx, ext.ret);
+            }
             e = e + 1usize;
         }
         let traits = self.program.traits.values(&cx);
@@ -1795,17 +1784,7 @@ impl Checker['k] {
             return Signature.{ ptypes: f.params, ret: f.ret.copy(&cx), is_unsafe: f.is_unsafe, places: f.places };
         }
         match self.program.externs.get(&cx, callee) {
-            Option::Some(ext) => {
-                let ptypes = match ext.ptypes {
-                    Option::Some(p) => p,
-                    Option::None => self.fail(&cx, "extern_value_not_callable"),
-                };
-                let ret = match ext.ret {
-                    Option::Some(r) => r,
-                    Option::None => self.fail(&cx, "extern_value_not_callable"),
-                };
-                return Signature.{ ptypes, ret, is_unsafe: true, places: ArenaVec::new(&cx) };
-            },
+            Option::Some(ext) => return Signature.{ ptypes: ext.ptypes, ret: ext.ret, is_unsafe: true, places: ArenaVec::new(&cx) },
             Option::None => (),
         };
         let fun = match self.program.funs.get(&cx, callee) {
@@ -2255,17 +2234,7 @@ impl Checker['k] {
     fn op_fn(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
         let name = instr.args.at(&cx, 0usize);
         match self.program.externs.get(&cx, name) {
-            Option::Some(ext) => {
-                let ptypes = match ext.ptypes {
-                    Option::Some(p) => p,
-                    Option::None => self.fail(&cx, "extern_value_not_callable"),
-                };
-                let ret = match ext.ret {
-                    Option::Some(r) => r,
-                    Option::None => self.fail(&cx, "extern_value_not_callable"),
-                };
-                return C::fn_type(&cx, ptypes, ret, true, ArenaVec::new(&cx));
-            },
+            Option::Some(ext) => return C::fn_type(&cx, ext.ptypes, ext.ret, true, ArenaVec::new(&cx)),
             Option::None => (),
         };
         let fun = match self.program.funs.get(&cx, name) {
@@ -2276,7 +2245,7 @@ impl Checker['k] {
         subst(&cx, C::fn_type(&cx, fun.ptypes, fun.ret, fun.is_unsafe, fun.places(&cx)), sub, self.counter)
     }
 
-    // What foreign code hands the program, an extern function's result or an extern value, is
+    // What foreign code hands the program, an extern function's result, is
     // reinterpreted from C's bytes as an unsafe cast's result is: it holds nothing only checked code
     // makes (`checked_only`; a result of `!` itself says the function does not return), and no enum
     // or `NonNull`, whose layout the compiler chooses.
@@ -2292,9 +2261,8 @@ impl Checker['k] {
     // A zero-size type is erased: it has no C object and no C value, and `sizeof` of one is 0. A load
     // or store of one through a pointer reads and writes nothing, and `alloca` of one gives a pointer that
     // is not null, so those accept it (one with no erased value is `zero_size_access`'s to reject); an
-    // unsafe cast reinterprets a representation, which a zero-size
-    // type does not have, and C has no zero-size parameter or object, so casts and extern parameters and
-    // values reject zero-size types.
+    // unsafe cast reinterprets a representation, which a zero-size type does not have, and C has no
+    // zero-size parameter, so casts and extern parameters reject zero-size types.
     fn has_memory_form(self, &cx: Domain!['k], ty: Type['k]) {
         if self.types.zero_size(&cx, ty) {
             self.fail(&cx, "zero_size_type_has_no_memory_form");
