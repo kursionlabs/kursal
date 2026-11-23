@@ -17,6 +17,9 @@ type AlphaEnv = tuple[dict[str, object], dict[str, object]]
 type ForeachRow = tuple[str, Type]
 type Skeleton = Struct | Enum | Tuple | Array
 
+# A pointer source points to a product, an array or a leaf; a pointer to a sum is opaque.
+POINTER_TO_SUM = "a foreach source cannot be a pointer to a sum"
+
 _fresh = count()
 
 
@@ -374,11 +377,12 @@ class Types:
             return inner is not None and not isinstance(inner, Enum)
         return True
 
-    def sum_behind_pointer(self, source: Type, module: Optional[ModuleId], kinds: Kinds) -> bool:
-        """A pointer to a visible sum: traversing it reads the variant through the pointer, an unsafe
-        read, so it needs unsafe authorization instead of `Exposed`, which never holds for one."""
-        shape = self.visible_shape(source, module, kinds)
-        return isinstance(shape, Ptr) and isinstance(self.visible_shape(shape.inner, module, kinds), Enum)
+    def points_to_sum(self, source: Type, kinds: Kinds) -> bool:
+        """A foreach source that is a pointer to a sum, named types unfolded whether exposed or not: no
+        traversal has one, as a pointer source points to a product, an array or a leaf. A parameter
+        decides nothing here; an instantiation at a sum has no rows."""
+        shape = self.fixed_shape(source, kinds)
+        return isinstance(shape, Ptr) and isinstance(self.fixed_shape(shape.inner, kinds), Enum)
 
     def visible_shape(self, ty: Type, module: Optional[ModuleId], kinds: Kinds) -> Optional[Type]:
         """Reveal only the outer shape, without treating abstract types as leaves."""
@@ -501,9 +505,10 @@ class Types:
         s = self.shape(source, module)
         wrap: Callable[[Type], Type] = lambda c: c
         if isinstance(s, Ptr):
-            # Behind a pointer each component is a pointer to it; a sum's are pointers to its payloads,
-            # one per variant, valid while its variant is the one the value holds.
+            # Behind a pointer each component is a pointer to it; a sum has none.
             s, wrap = self.shape(s.inner, module), Ptr
+            if isinstance(s, Enum):
+                raise KursError(POINTER_TO_SUM)
         match s:
             case Struct(fields=fields):
                 return s, [(n, wrap(f)) for n, f in fields]

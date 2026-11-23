@@ -989,11 +989,7 @@ class Checker:
         if mapped is None and not equal(got, t.source) or mapped is not None and (
                 mapped.indirect != t.indirect or not equal(mapped.source, t.source)):
             self.fail("foreach_source")
-        if self.types.sum_behind_pointer(t.source, self.module, self.kinds):
-            # A traversal of the pointer reads the variant there; a mapped value holds its own.
-            if mapped is None:
-                self.authorize(instr, True)
-        elif not self.holds("Exposed", (t.source,)):
+        if not self.holds("Exposed", (t.source,)):
             self.fail("foreach_source_not_exposed")
         mapper = self.program.funs.get(instr.args[1])
         if mapper is None:

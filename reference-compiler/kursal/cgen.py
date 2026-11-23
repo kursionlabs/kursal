@@ -1553,28 +1553,11 @@ class Backend:
             return f"{call};" if self.erased(result) else f"{target} = {call};"
 
         if isinstance(skeleton, Enum):
-            assert isinstance(out_shape, Enum) and dst is not None
-            if pointer:
-                # Through a pointer the variant is read there, and each payload is passed by its
-                # address: the pointer to the whole for a zero-size payload or the niche layout's.
-                sum_type = self.shape(operand)
-                assert isinstance(sum_type, Ptr)
-                held = self.tag(f"(*{source})", sum_type.inner)
-                niche = self.niche_layout(sum_type.inner) is not None
-
-                def payload_at(row: ForeachRow) -> str:
-                    assert isinstance(row[1], Ptr)
-                    if niche or self.erased(row[1].inner):
-                        return f"(void*){source}"
-                    return f"KUR_FIELD({source}, payload.{self.variant(row[0])})"
-            else:
-                held = self.tag(source, operand)
-
-                def payload_at(row: ForeachRow) -> str:
-                    return self.payload(source, operand, row[0])
-            self.line(f"switch ({held}) {{")
+            # A sum is traversed by value only: a pointer source points to a product or an array.
+            assert isinstance(out_shape, Enum) and dst is not None and not pointer
+            self.line(f"switch ({self.tag(source, operand)}) {{")
             for k, (row, (_, result)) in enumerate(zip(rows, out_shape.variants)):
-                call = apply(row, payload_at(row))
+                call = apply(row, self.payload(source, operand, row[0]))
                 if self.erased(result):
                     self.line(f"case {k}: {call}; {' '.join(self.set_variant(dst, t, row[0], None))} break;")
                 elif self.niche_layout(t) is not None:

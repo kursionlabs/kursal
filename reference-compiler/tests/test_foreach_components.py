@@ -25,12 +25,15 @@ class ComponentTests(unittest.TestCase):
         mapped = C.Foreach("F", True, C.Ptr(C.Tuple((C.Ptr(C.U32),))), C.Named("F"))
         self.assertEqual(self.types.expand(mapped), C.Tuple((C.Ptr(C.U32),)))
 
-    def test_sum_behind_pointer_gives_pointers_to_payloads(self):
+    def test_a_sum_has_rows_by_value_only(self):
         opt = C.Enum((("none", C.Tuple(())), ("some", C.Prim("u8"))))
-        self.assertEqual(self.types.expand(C.Foreach("F", True, C.Ptr(opt), C.Named("F"))),
-                         C.Enum((("none", C.Tuple(())), ("some", C.Prim("u8")))))
-        self.assertEqual(self.types.expand(C.Foreach("F", False, C.Ptr(opt), C.Named("F"))),
+        self.assertEqual(self.types.expand(C.Foreach("F", False, opt, C.Ptr(C.Named("F")))),
                          C.Enum((("none", C.Ptr(C.Tuple(()))), ("some", C.Ptr(C.Prim("u8"))))))
+        # A pointer to a sum is no source, with either pattern, and an instantiation that makes one has
+        # no expansion.
+        for indirect in (True, False):
+            with self.subTest(indirect=indirect), self.assertRaisesRegex(KursError, "cannot be a pointer to a sum"):
+                self.types.expand(C.Foreach("F", indirect, C.Ptr(opt), C.Named("F")))
 
     def test_empty_array_has_schema_but_no_runtime_components(self):
         mapped = C.Foreach("F", True, C.Ptr(C.Array(C.U32, 0)), C.Tuple((C.Named("F"),)))
@@ -99,13 +102,20 @@ class MapFormTests(unittest.TestCase):
                 (= %u (foreach (foreach (G (tuple L! u32)) G) %w unwrap))
                 (ret %u)))"""))
 
-    def test_a_map_of_a_pointer_to_a_sum_reads_nothing(self):
-        # The value holds its variant: no unsafe marker, unlike the traversal of the pointer itself.
+    def test_a_map_of_a_sum_takes_the_held_payload(self):
         check_program(parse_program(MAPPERS + """
-            (fun f (foreach ((ptr F) (ptr Opt)) (tuple (ptr F))) ((foreach ((ptr F) (ptr Opt)) (ptr F)))
-              (entry ((%v (foreach ((ptr F) (ptr Opt)) (ptr F))))
-                (= %out (foreach (foreach ((ptr F) (ptr Opt)) (tuple (ptr F))) %v keep))
+            (fun f (foreach (F Opt) F) ((foreach (F Opt) (tuple F u8)))
+              (entry ((%v (foreach (F Opt) (tuple F u8))))
+                (= %out (foreach (foreach (F Opt) F) %v unwrap))
                 (ret %out)))"""))
+
+    def test_no_map_has_a_pointer_to_a_sum_as_its_source(self):
+        with self.assertRaisesRegex(KursError, "a foreach source cannot be a pointer to a sum"):
+            check_program(parse_program(MAPPERS + """
+                (fun f (foreach ((ptr F) (ptr Opt)) (tuple (ptr F))) ((foreach ((ptr F) (ptr Opt)) (ptr F)))
+                  (entry ((%v (foreach ((ptr F) (ptr Opt)) (ptr F))))
+                    (= %out (foreach (foreach ((ptr F) (ptr Opt)) (tuple (ptr F))) %v keep))
+                    (ret %out)))"""))
 
     def test_a_map_keeps_the_source_and_pattern(self):
         for name, (error, operand, written, mapper) in {

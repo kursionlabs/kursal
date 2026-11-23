@@ -890,8 +890,7 @@ These are the places where Kursal differs from what one might expect.
   needs a type from context. A float literal has a point (`2.5`), an exponent (`1e-7`, `1.5E+300`)
   or a float suffix (`7f64`); a point needs digits on both sides.
 - **`unsafe`** marks one operation: `unsafe f(x)` calls an unsafe or extern function, `unsafe *p`
-  reads through a pointer, `unsafe (x as *T)` casts, `f(unsafe &*p)` lends a pointer's target,
-  `unsafe (foreach x of p { .. })` traverses a sum through a pointer (it reads the variant there).
+  reads through a pointer, `unsafe (x as *T)` casts, `f(unsafe &*p)` lends a pointer's target.
   `unsafe (unsafe malloc(n) as *T)` is two operations. A safe function may contain unsafe operations.
   `as` between two number types is a conversion by value and needs no `unsafe` (see "Number
   conversions"); a float's bits are `x.to_bits()` and `f64::from_bits(b)`. An unsafe cast neither
@@ -942,28 +941,26 @@ These are the places where Kursal differs from what one might expect.
   a name, so a `foreach` that reaches itself again before any name, even behind a function, is
   rejected too (`struct T { f: fn(foreach *F of *T => *F) -> u32 }`: `recursive foreach needs a
   named type between`). Errors name the declaration whose walk found them.
-- **A `foreach` type has an expansion at every instantiation.** A source that is no product (nor,
-  by value, a sum) is one component: `foreach F of u32 => *F` is `(*u32,)`. Behind a pointer each
-  component is a pointer to it: to a field, an element, or, for a sum, each variant's payload
-  (`foreach F of *Option[u8] => F` is the sum of `*()` and `*u8`, a pointer valid while the value
-  holds that variant); a pointer to a leaf is the one component. `*F` binds F to each component's
+- **A `foreach` type has an expansion at every instantiation.** A source that is no product (nor a
+  sum) is one component: `foreach F of u32 => *F` is `(*u32,)`. Behind a pointer each component is
+  a pointer to it, to a field or an element; a pointer to a leaf is the one component. A pointer to
+  a sum is opaque, copied, passed and read whole (`unsafe *p`, then a `match`), and is no source:
+  its components would be those of the variant held there, which only a read finds.
+  `foreach F of *Option[u8] => F` is rejected, by value or with `*F`, through a name too, and so is
+  a traversal of such a pointer (`a foreach source cannot be a pointer to a sum`); an instantiation
+  that makes one, `foreach *F of *T => F` at an enum `T`, has no expansion either, and
+  `Exposed[*T]`, which a generic traversal needs, never holds for it. `*F` binds F to each component's
   pointee, so its source must give pointers whatever the type arguments are, and show them as
   written: an explicit pointer, or a tuple, struct, enum or array whose components are written as
   pointers. `foreach *F of T => F` is rejected, as `T` may be
   `bool`, and so is a name, even one whose shape is a visible product of pointers: `foreach *F
-  needs a source written with pointer components`.
-  Through a pointer to a product a `foreach` only computes addresses, but through one to a sum it
-  reads the variant there, so it is `unsafe`: the pointer addresses an initialized value whose
-  variant stays the same while a payload pointer is used. It calls the mapper on the held
-  variant's payload only, and needs the sum's shape visible where it is written: `Exposed[*T]`
-  never holds for a pointer to a sum, so a generic traversal never reads through its pointer.
+  needs a source written with pointer components`. Through a pointer a `foreach` only computes
+  addresses, and reads nothing.
 - **A `foreach` over a value of a `foreach` type maps it.** With `v: foreach F of S => B`, `foreach
   x of v { .. }` gives the body each component of `v`, of type `B` at the component's row, and makes
   `foreach F of S => R`, `R` the body's type: the same source and pattern, so it needs `Exposed[S]`
   as a traversal of `S` does. Each component is given to the body exactly once, so a linear one is
-  consumed once, and of a sum only the variant `v` holds. A map reads nothing through a pointer: the
-  value holds its variant, so mapping what `unsafe (foreach f of p { .. })` made of a pointer to a
-  sum needs no `unsafe`. The body is checked for any `F`, so it hands on a part of type `F` rather
+  consumed once, and of a sum only the variant `v` holds. The body is checked for any `F`, so it hands on a part of type `F` rather
   than dropping it (`examples/foreach_map`).
 - **A `foreach` type is flat.** It binds one name, its binder, in its body, and it is the type of a
   whole value, a function's parameter or result (a function type's too), never a field or element,

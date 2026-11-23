@@ -31,7 +31,7 @@ from . import syntax as S
 from .resolve import Decl, ResolveError, Resolver, listed
 from .sigs import InstanceSig, Scope, Sig, Signatures
 from .sexpr import KursError, Position
-from .types import (Surface, Types, brand_differences, brand_name, equal, free_brands, free_names, made_from,
+from .types import (POINTER_TO_SUM, Surface, Types, brand_differences, brand_name, equal, free_brands, free_names, made_from,
                     mapped_component, subst)
 from .termination import check_instance_termination
 from .coherence import check_coherence
@@ -1029,11 +1029,9 @@ class Infer:
         # A value of a foreach type is mapped (the map form): the result has its source, binder and
         # pattern, and each item is a component of the value. Anything else is the source itself.
         source = operand.source if isinstance(operand, C.Foreach) else operand
-        # Through a pointer to a sum the traversal of the pointer reads the variant, an unsafe read that
-        # lowering authorizes; a mapped value holds its variant, and reads nothing. Anything else it
-        # traverses needs only the shape.
-        if not self.types.sum_behind_pointer(source, self.module, self.kinds):
-            self.require("Exposed", (source,), expr.pos)
+        if self.types.points_to_sum(source, self.kinds):
+            fail(POINTER_TO_SUM, expr.pos)
+        self.require("Exposed", (source,), expr.pos)
         # Each `foreach` binds a binder of its own, named after the one written, as `F#F12` for `F`.
         written = expr.binder or ""
         if written and (any(p.name == written for p in self.sig.params) or

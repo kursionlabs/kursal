@@ -9,7 +9,7 @@ from collections.abc import Callable
 
 from . import core as C
 from .sexpr import KursError, Position
-from .types import Kinds, Types, children, subst, free_brands, free_names, equal
+from .types import POINTER_TO_SUM, Kinds, Types, children, subst, free_brands, free_names, equal
 
 
 def formation_children(ty: C.Type) -> tuple[C.Type, ...]:
@@ -164,6 +164,8 @@ class Formation:
             case C.Foreach(binder=binder, source=source, body=body):
                 self.fits(source, C.ANY, env)
                 self.flat(source, "a foreach source")
+                if self.types.points_to_sum(source, env):
+                    self.fail(POINTER_TO_SUM)
                 # The type has an expansion only if every component is a pointer for `*F` to match, and
                 # it must have one at every instantiation: the source shows its pointers as written.
                 if ty.indirect and not self.types.pattern_available(ty):

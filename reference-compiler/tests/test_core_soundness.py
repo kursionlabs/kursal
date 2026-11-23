@@ -170,13 +170,21 @@ REJECTED = {
         (fun g usize () (entry () (= %n (sizeof (foreach ((ptr F) P) F))) (ret %n)))"""),
     "pointer_pattern_in_declaration": ("foreach \\*F needs a source written with pointer components in type Holder!", """
         (type Holder! (forall (T) () (struct (f (foreach ((ptr F) T) F)))))"""),
-    # A sum behind a pointer expands to pointers to its payloads; traversing one reads its variant
-    # through the pointer, an unsafe read.
-    "foreach_through_pointer_to_sum": ("unsafe_authorization", """
+    # A pointer source points to a product, an array or a leaf: a pointer to a sum is opaque, and no
+    # foreach type or traversal has one as its source, through a name or with either pattern.
+    "foreach_type_over_pointer_to_sum": ("type formation: a foreach source cannot be a pointer to a sum", """
+        (type Opt (enum (none (tuple)) (some u8)))
+        (fun g usize () (entry () (= %n (sizeof (foreach ((ptr F) (ptr Opt)) F))) (ret %n)))"""),
+    "foreach_value_pattern_over_pointer_to_sum": ("type formation: a foreach source cannot be a pointer to a sum", """
+        (type Opt (enum (none (tuple)) (some u8)))
+        (type O (struct (o Opt)))
+        (type W (enum (only O)))
+        (fun g usize () (entry () (= %n (sizeof (foreach (F (ptr W)) F))) (ret %n)))"""),
+    "foreach_through_pointer_to_sum": ("type formation: a foreach source cannot be a pointer to a sum", """
         (type Opt (enum (none (tuple)) (some u8)))
         (fun mapper (forall (F) () u32 ((ptr F)) (entry ((%x (ptr F))) (= %z (const u32 0)) (ret %z))))
         (fun walk (foreach ((ptr F) (ptr Opt)) u32) ((ptr Opt))
-          (entry ((%p (ptr Opt))) (= %out (foreach (foreach ((ptr F) (ptr Opt)) u32) %p mapper)) (ret %out)))"""),
+          (entry ((%p (ptr Opt))) (unsafe (= %out (foreach (foreach ((ptr F) (ptr Opt)) u32) %p mapper))) (ret %out)))"""),
 
     # A function type quantifies nothing: a function's brands and premises are settled where its value is
     # made.
@@ -437,23 +445,16 @@ class CoreSoundnessTests(unittest.TestCase):
 
     def test_the_sound_forms_are_accepted(self):
         for source in (
-            # A pointer gives pointer components whatever its pointee is: a leaf, a type parameter, or a
-            # sum, whose components are pointers to its payloads.
+            # A pointer gives pointer components whatever its pointee is but a sum: a leaf, a product
+            # holding a sum, or a type parameter. A pointer to a sum is a value still, and a component.
             """(type Opt (enum (none (tuple)) (some u8)))
-               (fun f usize () (entry ()
+               (fun f usize ((ptr Opt)) (entry ((%p (ptr Opt)))
                  (= %a (sizeof (foreach ((ptr F) (ptr bool)) F)))
-                 (= %b (sizeof (foreach ((ptr F) (ptr Opt)) F)))
-                 (= %c (sizeof (foreach (F (ptr Opt)) F)))
+                 (= %b (sizeof (foreach ((ptr F) (ptr (tuple u8 Opt))) F)))
+                 (= %c (sizeof (foreach (F (tuple (ptr Opt) u8)) F)))
                  (= %d (sizeof (foreach ((ptr F) (tuple (ptr u8) (ptr u16))) F)))
                  (ret %a)))
                (fun g (forall (T) () usize () (entry () (= %n (sizeof (foreach ((ptr F) (ptr T)) F))) (ret %n))))""",
-            # An unsafe traversal of a sum through a pointer.
-            """(type Opt (enum (none (tuple)) (some u8)))
-               (fun mapper (forall (F) () u32 ((ptr F)) (entry ((%x (ptr F))) (= %z (const u32 0)) (ret %z))))
-               (fun walk (foreach ((ptr F) (ptr Opt)) u32) ((ptr Opt))
-                 (entry ((%p (ptr Opt)))
-                   (unsafe (= %out (foreach (foreach ((ptr F) (ptr Opt)) u32) %p mapper)))
-                   (ret %out)))""",
             # A block brand that is new to the function.
             """(fun f u32 ()
                  (entry () (= %f (fresh)) (= %w (open %f ($a))) (jmp (next $a) %w))

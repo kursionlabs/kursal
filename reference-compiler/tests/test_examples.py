@@ -153,7 +153,6 @@ RUNS: dict[str, tuple[tuple, ...]] = {
                                 "Candidate 3 confirmed removed -- 0 candidates found (expected 0): 0\n"
                                 "Total distinct candidates on file: 33\n", 0),),
     "foreach_map": (((), "", "", 0),),
-    "foreach_sum_pointers": (((), "", "", 0),),
     "format_strings": (((), "", "", 0),),
     "format_trait": (((), "", "point: (3, 4)\ncolor: rgb(255, 128, 0)\n", 0),),
     "functions": (((), "", "", 0),),
@@ -185,7 +184,7 @@ REJECTED = {
     "double_use_handle.kur": "value 'h' has been moved",
     "foreach_as_field.kur": "8:1: a component is a foreach type, which is only the type of a whole value, parameter or result$",
     "foreach_pointer_over_parameter.kur": "8:1: type formation: foreach \\*F needs a source written with pointer components$",
-    "foreach_through_pointer_to_sum.kur": "10:17: a foreach through a pointer to a sum reads its variant there and requires unsafe authorization$",
+    "foreach_through_pointer_to_sum.kur": "9:17: a foreach source cannot be a pointer to a sum$",
     "function_value_at_two_brands.kur": "22:36: brand mismatch: Tag!\\['b\\] and Tag!\\['a\\]; 'b was opened at 20:5, 'a at 19:5$",
     "forged_file.kur":"the shape of std::io::File! is not exposed here",
     "implicit_package_open.kur": "pattern does not match exists '1\\. \\(Tag!\\['1\\], u32\\)",

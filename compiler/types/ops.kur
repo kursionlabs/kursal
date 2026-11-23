@@ -8,6 +8,7 @@ use std::collections::arena_vec::ArenaVec;
 use std::collections::arena_map::{ArenaMap, ArenaSet};
 use std::mem::Ref;
 use std::raw::Span;
+use std::slice::Slice;
 use std::slice::hash_bytes;
 use std::arena::{Domain!, seed};
 use std::buffer::Buffer!;
@@ -16,6 +17,9 @@ use package::kurs::core as C;
 use package::kurs::sexpr::located;
 use package::syntax::ast::{Pos, no_pos};
 use std::option::Option;
+
+// A pointer source points to a product, an array or a leaf; a pointer to a sum is opaque.
+const POINTER_TO_SUM: Slice[u8, 'static] = "a foreach source cannot be a pointer to a sum";
 
 // Stops the compiler with a KursError's text: `line:col: message` when `pos` is a position, the
 // message alone when it is none (line 0).
@@ -1142,26 +1146,26 @@ impl Types['k] {
         }
     }
 
-    // Reveal only the outer shape, without treating abstract types as leaves.
-    // A pointer to a visible sum: traversing it reads the variant through the pointer, an unsafe
-    // read, so it needs unsafe authorization instead of `Exposed`, which never holds for one.
-    fn sum_behind_pointer(self, &cx: Domain!['k], source: Type['k], home: Option[ModuleId['k]], kinds: ArenaMap[Span['k], Kind, 'k]) -> bool {
-        let pointee = match self.visible_shape(&cx, source, home, kinds) {
+    // A foreach source that is a pointer to a sum, named types unfolded whether exposed or not: no
+    // traversal has one, as a pointer source points to a product, an array or a leaf. A parameter
+    // decides nothing here; an instantiation at a sum has no rows.
+    fn points_to_sum(self, &cx: Domain!['k], source: Type['k], kinds: ArenaMap[Span['k], Kind, 'k]) -> bool {
+        match self.fixed_shape(&cx, source, kinds) {
             Option::Some(shape) => match shape {
-                Type::Ptr(inner) => self.visible_shape(&cx, inner.copy(&cx), home, kinds),
-                _ => Option::None,
-            },
-            Option::None => Option::None,
-        };
-        match pointee {
-            Option::Some(shape) => match shape {
-                Type::Enum(_v) => true,
+                Type::Ptr(inner) => match self.fixed_shape(&cx, inner.copy(&cx), kinds) {
+                    Option::Some(pointee) => match pointee {
+                        Type::Enum(_v) => true,
+                        _ => false,
+                    },
+                    Option::None => false,
+                },
                 _ => false,
             },
             Option::None => false,
         }
     }
 
+    // Reveal only the outer shape, without treating abstract types as leaves.
     fn visible_shape(self, &cx: Domain!['k], ty: Type['k], home: Option[ModuleId['k]], kinds: ArenaMap[Span['k], Kind, 'k]) -> Option[Type['k]] {
         var ty = ty;
         while true {
@@ -1344,11 +1348,14 @@ impl Types['k] {
         var s = self.shape(&cx, source, home);
         var pointer = false;
         let unit = match s {
-            // Behind a pointer each component is a pointer to it; a sum's are pointers to its
-            // payloads, one per variant, valid while its variant is the one the value holds.
+            // Behind a pointer each component is a pointer to it; a sum has none.
             Type::Ptr(inner) => {
                 s = self.shape(&cx, inner.copy(&cx), home);
                 pointer = true;
+                match s {
+                    Type::Enum(_v) => kurs_error(&cx, Span::from_static(&cx, POINTER_TO_SUM), no_pos()),
+                    _ => (),
+                };
             },
             _ => (),
         };

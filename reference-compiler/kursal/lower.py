@@ -1213,16 +1213,11 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         if vals is None:
             return None
         assert isinstance(ty, C.Foreach)
-        # A mapped value (the map form) holds its components: only a traversal of the pointer itself
-        # reads a sum's variant through it.
+        # A mapped value (the map form) holds its components.
         mapped = mapped_operand(self.vty[vals[0]])
-        reads = mapped is None and self.types.sum_behind_pointer(ty.source, self.module, self.kinds)
-        if reads and not self.authorized(expr):
-            fail("a foreach through a pointer to a sum reads its variant there and requires unsafe authorization", expr.pos)
         item = foreach_item(ty) if mapped is None else mapped_component(mapped, C.Named(ty.binder))
         name = MapperLower(self, expr, ty, item).lower()
-        return self.emit("foreach", ty, (vals[0], name, *vals[1:]), node=expr, unsafe=reads,
-                         ty=ty, tys=self.identity_args())
+        return self.emit("foreach", ty, (vals[0], name, *vals[1:]), node=expr, ty=ty, tys=self.identity_args())
 
     def expr_fstring(self, expr: S.FStr) -> Optional[str]:
         sig = self.lowering.library_sig("Buffer!::new", self.module)
