@@ -603,8 +603,9 @@ impl FnLower['k] {
     // only a checked operation makes, nor reinterpret a layout the compiler chooses, nor take or
     // produce a zero-size type, which has no representation to reinterpret, nor convert a pointer but
     // to or from a pointer or an integer; an atomic operation works on an integer, a bool or a
-    // pointer. A load or store of a zero-size type reads and writes nothing, and `alloca` of one is
-    // not null.
+    // pointer. A load or store of a zero-size type reads and writes nothing, so it needs a type with an
+    // erased value, which holds no brand witness, package or linear value; `alloca` of one is not
+    // null.
     fn memory_operation(self, &cx: Domain!['k], o: Op['k], pos: Pos) {
         let target = if o.args.is_empty(&cx) { Option::None } else { self.vty.get(&cx, o.args.at(&cx, 0usize)) };
         let pointee = match target {
@@ -615,10 +616,16 @@ impl FnLower['k] {
             Option::None => Option::None,
         };
         let op = o.name;
-        if op.is(&cx, "ptr_load") || op.is(&cx, "ptr_load_volatile") {
+        let load = op.is(&cx, "ptr_load") || op.is(&cx, "ptr_load_volatile");
+        if load || op.is(&cx, "ptr_store") || op.is(&cx, "ptr_store_volatile") {
             match pointee {
-                Option::Some(inner) => if contains(&cx, self.lowering.types, inner, |&cx, t: Type['k]| is_never(t)) {
-                    self.fail(&cx, Span::from_static(&cx, "an unsafe read cannot produce a value that holds Never"), pos);
+                Option::Some(inner) => {
+                    if load && contains(&cx, self.lowering.types, inner, |&cx, t: Type['k]| is_never(t)) {
+                        self.fail(&cx, Span::from_static(&cx, "an unsafe read cannot produce a value that holds Never"), pos);
+                    }
+                    if self.lowering.types.zero_size(&cx, inner) && !self.lowering.types.erasable(&cx, inner) {
+                        self.fail(&cx, Span::from_static(&cx, "a zero-size type that holds a brand witness, a package or a linear value is not read or written through a pointer"), pos);
+                    }
                 },
                 Option::None => (),
             };

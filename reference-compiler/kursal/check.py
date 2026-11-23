@@ -843,8 +843,8 @@ class Checker:
     def has_memory_form(self, ty: Type) -> None:
         """A zero-size type is erased: it has no C object and no C value, and `sizeof` of one is 0. A load or
         store of one through a pointer reads and writes nothing, and `alloca` of one gives a pointer that is
-        not null, so those accept it (a store of a linear one, which would vanish, is `op_ptr_store`'s to
-        reject); an unsafe cast reinterprets a representation, which a zero-size type
+        not null, so those accept it (one with no erased value is `zero_size_access`'s to reject); an
+        unsafe cast reinterprets a representation, which a zero-size type
         does not have, and C has no zero-size parameter or object, so casts and extern parameters and values
         reject zero-size types."""
         if self.types.zero_size(ty):
@@ -928,6 +928,7 @@ class Checker:
             self.fail("ptr_load_non_pointer")
         if contains(self.types, t.inner, lambda ty: isinstance(ty, Never)):
             self.fail("unsafe_read_cannot_produce_never")
+        self.zero_size_access(t.inner)
         return t.inner
 
     op_ptr_load_volatile = op_ptr_load
@@ -936,12 +937,18 @@ class Checker:
         p, v = self.use(instr.args[0]), self.use(instr.args[1])
         if not isinstance(p, Ptr) or not fits(v, p.inner):
             self.fail("store_through_pointer_another")
-        # A store of a zero-size type writes nothing, so a linear value stored so would vanish.
-        if self.types.zero_size(p.inner) and not self.copy_type(p.inner):
-            self.fail("zero_size_linear_store")
+        self.zero_size_access(p.inner)
         return UNIT
 
     op_ptr_store_volatile = op_ptr_store
+
+    def zero_size_access(self, ty: Type) -> None:
+        """MEM-ZERO-SIZE: a load or store at a zero-size type reads and writes nothing, so it is formed only
+        where the type has an erased value (`Types.erasable`): a load would conjure a brand witness, a
+        package or a linear value, and a store would make one vanish. An erasable type is Copy, as a store
+        needs. A type parameter is not zero-size here."""
+        if self.types.zero_size(ty) and not self.types.erasable(ty):
+            self.fail("zero_size_access_not_erasable")
 
     def atomic(self, instr: Instr) -> Type:
         kind = ATOMIC_OPS[instr.op]

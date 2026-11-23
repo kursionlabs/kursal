@@ -259,13 +259,17 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         through a pointer does not produce a value that holds Never; a cast does not conjure what only a
         checked operation makes, nor reinterpret a layout the compiler chooses, nor take or produce a
         zero-size type, which has no representation to reinterpret, nor convert a pointer but to or from a
-        pointer or an integer; an atomic operation works on an integer, a bool or a pointer. A load or store of a zero-size type reads and writes nothing, and `alloca` of
-        one is not null."""
+        pointer or an integer; an atomic operation works on an integer, a bool or a pointer. A load or store
+        of a zero-size type reads and writes nothing, so it needs a type with an erased value, which holds
+        no brand witness, package or linear value; `alloca` of one is not null."""
         target = self.vty.get(args[0]) if args else None
         pointee = target.inner if isinstance(target, C.Ptr) else None
-        if op in ("ptr_load", "ptr_load_volatile"):
-            if pointee is not None and contains(self.types, pointee, lambda t: isinstance(t, C.Never)):
+        if op in ("ptr_load", "ptr_load_volatile", "ptr_store", "ptr_store_volatile") and pointee is not None:
+            if op in ("ptr_load", "ptr_load_volatile") and contains(self.types, pointee, lambda t: isinstance(t, C.Never)):
                 fail("an unsafe read cannot produce a value that holds Never", pos)
+            if self.types.zero_size(pointee) and not self.types.erasable(pointee):
+                fail("a zero-size type that holds a brand witness, a package or a linear value is not read or "
+                     "written through a pointer", pos)
         elif op == "cast" and target is not None and ty is not None:
             if any(contains(self.types, t, self.uncastable) for t in (target, ty)):
                 fail("an unsafe cast cannot produce or take apart a package, a brand witness, a function value, "

@@ -302,7 +302,11 @@ receipt, anything holding or capturing one), zero-size or not, may be read only 
 value of that type was moved into and not since moved out of. The checker does not track this; a
 read that conjures a witness some other way breaks the obligation, as a read of any type from
 memory that does not hold one does. An unsafe cast never produces a witness: the checker rejects a
-cast whose result holds one in its value.
+cast whose result holds one in its value. At a zero-size type the checker rejects the read itself, and
+the write: a load or store of one reads and writes nothing, so it is formed only at a type with an
+erased value, which holds no brand witness, package or linear value (compiler/README.md, "Zero-size
+types are erased"). Generic code is checked at its type parameter, which is not zero-size there; a
+read or write it makes at a zero-size instantiation owes the same, and this obligation covers it.
 
 A read through a pointer never produces `Never`. No memory holds a value of `!`, nor of a type that
 holds one in its value (a struct, tuple or array of length above 0 with a component that does, an enum
@@ -489,9 +493,10 @@ signature". It does not mean "verified correct".**
 **Zero sizes.** A zero-size type (`()`, a brand, a capability, an empty
 struct, `[T; 0]`) has size 0: `sizeof[T]()` is `0`, `alignof[T]()` is 1, and
 a load or store of one through a pointer reads and writes nothing (an unsafe
-cast from or to one, an extern parameter or value of one, and a store of a
-linear one, which would vanish, are rejected; compiler/README.md, "Zero-size
-types are erased"). So every
+cast from or to one, an extern parameter or value of one, and a load or store
+of one with no erased value, which holds a brand witness, a package or a
+linear value, are rejected; compiler/README.md, "Zero-size types are
+erased"). So every
 container and allocation function builds at a zero-size element type:
 `OwnedVec![()]`, `OwnedMap![K, ()]` (a set of owned keys), `Owned![()]`,
 `Vec!`, `HashMap!`, `Arena!::alloc` and `alloc_slice`, `Ref::new`,

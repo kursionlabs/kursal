@@ -291,39 +291,23 @@ class ZeroSizeTests(unittest.TestCase):
                 else { 0 }
             }''')
 
-    def test_a_brand_witness_through_a_pointer(self):
-        # A zero-size struct that holds a brand witness, stored and read back through a raw pointer, an
-        # `Owned!` and the arena: the brand it carries is the one put in.
+    def test_an_erased_value_through_a_pointer(self):
+        # A zero-size value with an erased value, stored and read back through a raw pointer: unit, an
+        # empty array of a linear type, and a named wrapper of those. One that holds a brand witness, a
+        # package or a capability is not (tests/lower_cases.py).
         self.expect('''
-            use std::arena::Domain!;
-            use std::cap::{Brand, Exclusive!};
-            use std::mem::{Ref, alloca};
-            use std::owned::Owned!;
-            forall 'k.
-            exposed struct Witness {
-                brand: Brand['k],
+            use std::mem::alloca;
+            exposed struct Cap! {}
+            exposed struct Empty {
                 unit: (),
-            }
-            forall 'k.
-            fn same(a: Brand['k], b: Brand['k]) -> bool {
-                true
+                none: [Cap!; 0],
             }
             fn main() -> i32 {
-                let exists 'b. (brand, cap) = Exclusive!::fresh();
-                let p = unsafe alloca[Witness['b]]();
-                let address = unsafe (p as usize);
-                unsafe *p = Witness.{ brand, unit: () };
-                let { brand: read, unit: u1 } = unsafe *p;
-                let boxed = Owned!::new(Witness.{ brand: read, unit: () });
-                let { brand: unboxed, unit: u2 } = boxed.into_value();
-                let exists 'a. cx = Domain!::new(std::process::hash_seed());
-                let held = Ref::new(&cx, Witness.{ brand: unboxed, unit: () });
-                let { brand: again, unit: u3 } = held.copy(&cx);
-                cx.destroy();
-                cap.retire();
-                if address != 0usize && same(again, brand) { 0 } else { 1 }
+                let p = unsafe alloca[Empty]();
+                unsafe *p = Empty.{ unit: (), none: [] };
+                let { unit, none } = unsafe *p;
+                if unsafe (p as usize) != 0usize { 0 } else { 1 }
             }''')
-
 
 if __name__ == "__main__":
     unittest.main()

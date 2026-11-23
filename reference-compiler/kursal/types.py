@@ -267,6 +267,22 @@ class Types:
                 return self.zero_size(body)
         return False
 
+    def erasable(self, ty: Type) -> bool:
+        """`ty` has an erased value (MEM-ZERO-SIZE), which a load of a zero-size type yields and a store
+        writes nothing of: unit, a tuple, struct or array of erasable parts, an empty array, or a named
+        type whose body is one, unfolded whether exposed or not. A brand witness, a package and a linear
+        type have none, so an erasable type is Copy."""
+        match ty:
+            case Named(name=name) if name in self.program.types:
+                return not self.decl(name).linear and self.erasable(self.unfold(ty))
+            case Tuple(elems=elems):
+                return all(self.erasable(t) for t in elems)
+            case Struct(fields=fields):
+                return all(self.erasable(t) for _, t in fields)
+            case Array(elem=elem, length=length):
+                return length == 0 or self.erasable(elem)
+        return False
+
     def niche(self, ty: Type) -> Optional[tuple[str, ...]]:
         """Where a value of `ty` has bytes that hold no value of it: the path (field names, tuple indices,
         `0` for an array's first element) to its first `NonNull` in layout order, whose all-zero value is

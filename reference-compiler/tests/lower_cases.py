@@ -49,6 +49,16 @@ LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
     ("fn f(p: *(u32, !)) -> u32 { let s = unsafe *p; 0u32 }\n", "an unsafe read cannot produce a value that holds Never"),
     ("struct S { n: ! }\nfn get(&s: S) -> u32 { 0u32 }\nfn f(p: *S) -> u32 { get(unsafe &*p) }\n",
      "an unsafe lend of a pointer's target cannot lend a value that holds Never"),
+    # A load or store of a zero-size type reads and writes nothing: only one with an erased value, so no
+    # brand witness, package or linear value is conjured or made to vanish, volatile or not.
+    ("exposed struct Cap! {}\nfn f(p: *Cap!) -> Cap! { unsafe *p }\n",
+     "a zero-size type that holds a brand witness, a package or a linear value is not read or written"),
+    ("exposed struct Cap! {}\nfn f(p: *(Cap!, ()), c: Cap!) { unsafe *p = (c, ()); }\n",
+     "a zero-size type that holds a brand witness, a package or a linear value is not read or written"),
+    ("forall 'k.\nexposed struct W { b: core::cap::Brand['k], u: () }\nforall 'k.\nfn f(p: *W['k]) -> W['k] { unsafe *p }\n",
+     "a zero-size type that holds a brand witness, a package or a linear value is not read or written"),
+    ("forall 'k.\nfn f(p: *core::cap::Brand['k], b: core::cap::Brand['k]) { unsafe p.store_volatile(b); }\n",
+     "a zero-size type that holds a brand witness, a package or a linear value is not read or written"),
     (TOKEN + "fn f() -> u32 { (Token!.{ n: 1u32 }, Token!.{ n: 2u32 }).0.n }\n", "linear sibling"),
     ("unsafe fn danger() -> u32 { 0u32 }\nfn f() -> u32 { danger() }\n", "calling an unsafe function"),
     ("fn take(&x: u32) -> u32 { x }\nfn f(p: *u32) -> u32 { take(&*p) }\n", "lending a raw pointer target"),

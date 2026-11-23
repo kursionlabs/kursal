@@ -2286,7 +2286,8 @@ impl Checker['k] {
 
     // A zero-size type is erased: it has no C object and no C value, and `sizeof` of one is 0. A load
     // or store of one through a pointer reads and writes nothing, and `alloca` of one gives a pointer that
-    // is not null, so those accept it; an unsafe cast reinterprets a representation, which a zero-size
+    // is not null, so those accept it (one with no erased value is `zero_size_access`'s to reject); an
+    // unsafe cast reinterprets a representation, which a zero-size
     // type does not have, and C has no zero-size parameter or object, so casts and extern parameters and
     // values reject zero-size types.
     fn has_memory_form(self, &cx: Domain!['k], ty: Type['k]) {
@@ -2433,6 +2434,7 @@ impl Checker['k] {
         if contains(&cx, self.types, inner, |&cx, t: Type['k]| is_never(t)) {
             self.fail(&cx, "unsafe_read_cannot_produce_never");
         }
+        self.zero_size_access(&cx, inner);
         inner
     }
 
@@ -2447,11 +2449,18 @@ impl Checker['k] {
         if !fits(&cx, v, inner) {
             self.fail(&cx, "store_through_pointer_another");
         }
-        // A store of a zero-size type writes nothing, so a linear value stored so would vanish.
-        if self.types.zero_size(&cx, inner) && !self.copy_type(&cx, inner) {
-            self.fail(&cx, "zero_size_linear_store");
-        }
+        self.zero_size_access(&cx, inner);
         C::unit(&cx)
+    }
+
+    // MEM-ZERO-SIZE: a load or store at a zero-size type reads and writes nothing, so it is formed
+    // only where the type has an erased value (`Types::erasable`): a load would conjure a brand
+    // witness, a package or a linear value, and a store would make one vanish. An erasable type is
+    // Copy, as a store needs. A type parameter is not zero-size here.
+    fn zero_size_access(self, &cx: Domain!['k], ty: Type['k]) {
+        if self.types.zero_size(&cx, ty) && !self.types.erasable(&cx, ty) {
+            self.fail(&cx, "zero_size_access_not_erasable");
+        }
     }
 
     fn atomic(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
