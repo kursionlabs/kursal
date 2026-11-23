@@ -43,6 +43,17 @@ LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
     ('forall T. exposed enum Opt { Some(T), None }\nextern "C" fn make() -> Opt[u32];\n',
      "extern make cannot return an enum or a NonNull, whose layout the compiler chooses"),
     ('extern "C" fn make() -> std::ptr::NonNull[u8];\n', "extern make cannot return an enum or a NonNull"),
+    # An extern's signature is closed, and every function type in it is an `unsafe fn` type, anywhere,
+    # whose parameters and result foreign code makes or takes as it does an extern's.
+    ('forall T. extern "C" fn f(x: *T) -> u32;\n', "extern f takes no type or brand parameters"),
+    ('extern "C" fn f(x: fn() -> u32) -> u32;\n', "extern f has a safe function type in its signature"),
+    ('struct Cb { run: fn() -> u32 }\nextern "C" fn f(x: *Cb) -> u32;\n', "extern f has a safe function type in its signature"),
+    ('extern "C" fn f(x: unsafe fn(u8, ()) -> u8) -> u32;\n',
+     "extern f has an unsafe fn type in its signature that takes a zero-size type"),
+    ("forall 'k.\nstruct W { b: core::cap::Brand['k], n: u64 }\nextern \"C\" fn f(x: unsafe fn(W['static]) -> u8) -> u32;\n",
+     "extern f has an unsafe fn type in its signature that takes or returns a package, a brand witness"),
+    ('enum E { A(u8), B(u16) }\nextern "C" fn f() -> unsafe fn() -> unsafe fn(E) -> u8;\n',
+     "extern f has an unsafe fn type in its signature that takes or returns an enum or a NonNull"),
     # No memory holds a value that holds Never, however deep.
     ("struct S { n: ! }\nfn f(p: *S) -> u32 { let s = unsafe *p; 0u32 }\n",
      "an unsafe read cannot produce a value that holds Never"),

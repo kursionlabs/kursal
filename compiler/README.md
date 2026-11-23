@@ -924,7 +924,15 @@ These are the places where Kursal differs from what one might expect.
   cast's result, holds no package, brand witness, safe function value, transform or `Never` (a result
   of `!` itself is a function that does not return), and no enum or `NonNull`, whose layout C cannot
   know (`extern_result_cannot_produce`, `extern_result_layout_chosen`); an `unsafe fn` value may come
-  back (`lib/std/CONTRACTS.md`, section 2.0c).
+  back (`lib/std/CONTRACTS.md`, section 2.0c). The walk is the by-value one: named types unfolded,
+  not through a pointer, a function value or an array of length 0. An extern takes no type or brand
+  parameter (`extern f takes no type or brand parameters`) and no zero-size one, and a function type
+  anywhere in its signature, behind a pointer or in a named type's fields too, is an `unsafe fn` type
+  (`extern_safe_function_type`; `extern f has a safe function type in its signature`): foreign code
+  neither makes nor calls a safe function value. Foreign code makes the arguments of such a value, and
+  takes its result or hands the value back, so each of its parameters and its result is held to both
+  rules, an extern parameter's and its result's, to any depth; its result may be zero-size only with an
+  erased value, as `()` is C's `void`.
 - **Generic code over linear types.** A type parameter may stand for a linear type unless a premise
   says `Copy[T]`. Using a value twice, or dropping it on one path (`a && b` drops `b` when `a` is
   false), needs `Copy[T]`. The arena collections (`ArenaVec`, `ArenaMap`, `ArenaSet`, `List`) require

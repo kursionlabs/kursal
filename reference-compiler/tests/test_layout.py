@@ -34,6 +34,7 @@ class LayoutTests(unittest.TestCase):
             check_program(parse_program(source))
 
     def compiles(self, source, ty):
+        # A foreign parameter of the type makes C name it; a function type in it is an `unsafe fn`.
         program = parse_program(source)
         program.externs["probe"] = C.Extern("probe", C.U32, (ty,))
         text = emit_c(program, check_program(program))
@@ -57,7 +58,7 @@ class LayoutTests(unittest.TestCase):
 """, C.Named("Node", (C.U32,)))
 
     def test_function_fields_break_storage_cycles(self):
-        self.compiles("(type A (struct (callback (fn (A) A))))", C.Named("A"))
+        self.compiles("(type A (struct (callback (fn (unsafe) (A) A))))", C.Named("A"))
 
     def test_generic_pointer_recursion_permits_permutations_and_fixed_resets(self):
         self.compiles("""(type Pair (forall (T U) ()
@@ -126,7 +127,7 @@ class LayoutTests(unittest.TestCase):
                 self.rejects(f"(type A {body})", "infinite by-value layout|aggregate boundary")
 
     def test_function_alias_can_recur_through_a_named_aggregate(self):
-        self.compiles("(type Callback (fn () Node)) (type Node (struct (run Callback)))",
+        self.compiles("(type Callback (fn (unsafe) () Node)) (type Node (struct (run Callback)))",
                       C.Named("Callback"))
 
     def test_repeated_names_can_be_finite_nested_applications(self):

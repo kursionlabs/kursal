@@ -433,6 +433,29 @@ REJECTED = {
         (type E (enum (A u32) (B u64)))
         (extern fun make (tuple u64 E) ())"""),
     "extern_result_non_null": ("extern_result_layout_chosen", "(extern fun make (non_null u8) ())"),
+    # A function type in an extern's signature is an `unsafe fn` type, anywhere: behind a pointer and in
+    # a named type's fields too. Foreign code makes the arguments of one and takes its result, or hands
+    # it back, so its parameters and result are checked both as an extern's parameters and as its result,
+    # to any depth, and its result is zero-size only with an erased value.
+    "extern_safe_function_parameter": ("extern_safe_function_type", "(extern fun take u32 ((fn () u32)))"),
+    "extern_safe_function_behind_pointer": ("extern_safe_function_type", """
+        (type Callback (struct (run (fn () bool))))
+        (extern fun take u32 ((ptr Callback)))"""),
+    "extern_safe_function_inside_unsafe": ("extern_safe_function_type",
+                                           "(extern fun take u32 ((fn (unsafe) ((fn () u32)) u32)))"),
+    "extern_callback_takes_witness": ("extern_result_cannot_produce",
+                                      "(extern fun take u32 ((fn (unsafe) ((tuple u8 (brand $static))) u32)))"),
+    "extern_callback_takes_enum": ("extern_result_layout_chosen", """
+        (type E (enum (A u32) (B u64)))
+        (extern fun take u32 ((fn (unsafe) (E) u32)))"""),
+    "extern_callback_takes_unit": ("zero_size_type_has_no_memory_form",
+                                   "(extern fun take u32 ((fn (unsafe) ((tuple)) u32)))"),
+    "extern_callback_returns_package": ("extern_result_cannot_produce",
+                                        "(extern fun take u32 ((fn (unsafe) () (exists ($k) (brand $k)))))"),
+    "extern_callback_returns_witness": ("extern_result_cannot_produce",
+                                        "(extern fun take u32 ((fn (unsafe) () (brand $static))))"),
+    "extern_nested_callback": ("extern_result_layout_chosen", """
+        (extern fun make (fn (unsafe) ((fn (unsafe) ((non_null u8)) u32)) u32) ())"""),
 
     # Compiler-reserved traits are sealed, and a Copy premise names a parameter.
     "user_exposed_trait": ("trait_name_is_reserved", "(trait Exposed (T)) (instance Exposed (u32))"),
@@ -526,10 +549,12 @@ class CoreSoundnessTests(unittest.TestCase):
             """(type S (struct (n !)))
                (fun (unsafe) h (ptr S) ((ptr (ptr S))) (entry ((%p (ptr (ptr S)))) (= %q (ptr_load %p)) (ret %q)))""",
             # A foreign function that does not return, one that hands back an `unsafe fn` value (calling
-            # it needs `unsafe`), and parameters, which the result rule does not reach.
+            # it needs `unsafe`), parameters, which the result rule does not reach, and a callback whose
+            # result is unit, C's `void`.
             """(extern fun stop ! ())
                (extern fun callback (tuple (fn (unsafe) ((ptr u8)) (ptr u8)) u64) ())
-               (extern fun take u32 ((fn () u32) (non_null u8)))""",
+               (extern fun take u32 ((ptr (brand $static)) (non_null u8)))
+               (extern fun on u32 ((fn (unsafe) ((ptr u8) u64) (tuple))))""",
             # The walk of a value follows its by-value layout: not what a function value takes and
             # returns, and not a named type's arguments but through its fields, so a type that holds
             # itself behind a function or a pointer wrapper ends it.

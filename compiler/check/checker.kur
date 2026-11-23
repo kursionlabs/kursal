@@ -15,7 +15,7 @@ use std::raw::Span;
 use std::arena::Domain!;
 use std::buffer::Buffer!;
 use package::kurs::transfer::copy_type;
-use package::kurs::core::{Arm, Block, Edge, Fun, Instance, Instr, Kind, Member, Method, ModuleId, Opened, Param, Premise, Program, Terminator, Type};
+use package::kurs::core::{Arm, Block, Edge, FnType, Fun, Instance, Instr, Kind, Member, Method, ModuleId, Opened, Param, Premise, Program, Terminator, Type};
 use package::kurs::core as C;
 use package::types::coherence::check_coherence;
 use package::types::formation::{Discharge, Formation};
@@ -252,6 +252,37 @@ fn checked_only(t: Type['k]) -> bool {
         Type::Never => true,
         Type::Fn(f) => !f.is_unsafe,
         _ => false,
+    }
+}
+
+// Every function type in `ty`, anywhere: behind a pointer, in a function type's parameters and
+// result, and in the fields of named types, each named type unfolded once, whether exposed or not. In
+// order, the outer before the inner.
+forall 'k.
+fn function_types(&cx: Domain!['k], types: Types['k], ty: Type['k]) -> ArenaVec[FnType['k], 'k] {
+    let found: ArenaVec[FnType['k], 'k] = ArenaVec::new(&cx);
+    function_types_in(&cx, types, ty, ArenaVec::new(&cx), found);
+    found
+}
+
+forall 'k.
+fn function_types_in(&cx: Domain!['k], types: Types['k], part: Type['k], seen: ArenaVec[Type['k], 'k], found: ArenaVec[FnType['k], 'k]) {
+    match part {
+        Type::Fn(f) => found.push(&cx, f),
+        Type::Named(name, _args) => if types.program.types.contains(&cx, name) {
+            if !seen.any(&cx, |&cx, s: Type['k]| equal(&cx, s, part)) {
+                seen.push(&cx, part);
+                function_types_in(&cx, types, types.unfold(&cx, part, Option::None), seen, found);
+            }
+            return ();
+        },
+        _ => (),
+    };
+    let parts = children(&cx, part);
+    var i = 0usize;
+    while i < parts.len(&cx) {
+        function_types_in(&cx, types, parts.at(&cx, i), seen, found);
+        i = i + 1usize;
     }
 }
 
@@ -773,14 +804,7 @@ impl Checker['k] {
         while e < externs.len(&cx) {
             let ext = externs.at(&cx, e);
             self.location.set(&cx, Buffer!::new().push_static("extern ").push_bytes(&cx, ext.name).save(&cx));
-            var i = 0usize;
-            while i < ext.ptypes.len(&cx) {
-                self.has_memory_form(&cx, ext.ptypes.at(&cx, i));
-                i = i + 1usize;
-            }
-            if !is_never(ext.ret) {
-                self.foreign_result(&cx, ext.ret);
-            }
+            self.foreign_signature(&cx, ext.ptypes, ext.ret);
             e = e + 1usize;
         }
         let traits = self.program.traits.values(&cx);
@@ -2245,7 +2269,52 @@ impl Checker['k] {
         subst(&cx, C::fn_type(&cx, fun.ptypes, fun.ret, fun.is_unsafe, fun.places(&cx)), sub, self.counter)
     }
 
-    // What foreign code hands the program, an extern function's result, is
+    // DECL-EXTERN-FN and DECL-EXTERN-RESULT. A parameter has a memory form, and the result holds
+    // nothing only checked code makes (`foreign_result`). A function type anywhere in the signature is
+    // an `unsafe fn` type: no safe function value comes from foreign code or goes to it. Foreign code
+    // calls such a value with arguments it makes, and takes its result, or hands the value back, so
+    // the program calls it: each parameter of one has a memory form and holds nothing only checked code
+    // makes, and so does its result, which may be zero-size only with an erased value (`void`). The walk
+    // reaches the function types nested in those too.
+    fn foreign_signature(self, &cx: Domain!['k], ptypes: ArenaVec[Type['k], 'k], ret: Type['k]) {
+        var i = 0usize;
+        while i < ptypes.len(&cx) {
+            self.has_memory_form(&cx, ptypes.at(&cx, i));
+            i = i + 1usize;
+        }
+        if !is_never(ret) {
+            self.foreign_result(&cx, ret);
+        }
+        let functions: ArenaVec[FnType['k], 'k] = ArenaVec::new(&cx);
+        var p = 0usize;
+        while p <= ptypes.len(&cx) {
+            let part = if p < ptypes.len(&cx) { ptypes.at(&cx, p) } else { ret };
+            functions.append(&cx, function_types(&cx, self.types, part));
+            p = p + 1usize;
+        }
+        if functions.any(&cx, |&cx, f: FnType['k]| !f.is_unsafe) {
+            self.fail(&cx, "extern_safe_function_type");
+        }
+        var f = 0usize;
+        while f < functions.len(&cx) {
+            let fun = functions.at(&cx, f);
+            var k = 0usize;
+            while k < fun.params.len(&cx) {
+                self.has_memory_form(&cx, fun.params.at(&cx, k));
+                self.foreign_result(&cx, fun.params.at(&cx, k));
+                k = k + 1usize;
+            }
+            let result = fun.ret.copy(&cx);
+            self.foreign_result(&cx, result);
+            if self.types.zero_size(&cx, result) && !self.types.erasable(&cx, result) {
+                self.fail(&cx, "zero_size_type_has_no_memory_form");
+            }
+            f = f + 1usize;
+        }
+    }
+
+    // What foreign code hands the program, an extern function's result or a value it passes to an
+    // `unsafe fn` of the signature, is
     // reinterpreted from C's bytes as an unsafe cast's result is: it holds nothing only checked code
     // makes (`checked_only`; a result of `!` itself says the function does not return), and no enum
     // or `NonNull`, whose layout the compiler chooses.

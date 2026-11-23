@@ -218,8 +218,13 @@ are declared). It also rejects one that holds an enum or a `NonNull`
 (`extern_result_layout_chosen`): their layout is the compiler's choice, which
 C cannot know, and a `NonNull` from C may be null. An `unsafe fn` value may
 come back, since calling it needs `unsafe`. Parameters are not restricted
-this way: what Kursal hands C was made by checked code. The library's own
-externs return integers, floats, raw pointers, `()` and `!`.
+this way: what Kursal hands C was made by checked code. A function type in an
+extern's signature, anywhere, is an `unsafe fn` type: C neither makes nor
+calls a safe function value. The parameters and result of such a type are
+held to both rules, since C makes the arguments of a callback it is given and
+takes what one it hands back returns. The library's own externs return
+integers, floats, raw pointers, `()` and `!`, and take one callback,
+`unsafe fn(*u8) -> *u8`.
 
 ### 2.0d Lending a raw pointer's target
 

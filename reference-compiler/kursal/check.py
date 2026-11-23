@@ -57,6 +57,28 @@ def checked_only(ty: Type) -> bool:
     return isinstance(ty, (Exists, Brand, Foreach, Never)) or isinstance(ty, Fn) and not ty.unsafe
 
 
+def function_types(types: Types, ty: Type) -> list[Fn]:
+    """Every function type in `ty`, anywhere: behind a pointer, in a function type's parameters and result,
+    and in the fields of named types, each named type unfolded once, whether exposed or not. In order, the
+    outer before the inner."""
+    found: list[Fn] = []
+    seen: list[Type] = []
+
+    def walk(part: Type) -> None:
+        if isinstance(part, Fn):
+            found.append(part)
+        if isinstance(part, Named) and part.name in types.program.types:
+            if not any(equal(part, s) for s in seen):
+                seen.append(part)
+                walk(types.unfold(part))
+            return
+        for child in children(part):
+            walk(child)
+
+    walk(ty)
+    return found
+
+
 def pointer_cast_fits(types: Types, got: Type, want: Type) -> bool:
     """A cast with a raw pointer on one side has a pointer or an integer on the other: C converts a
     pointer only to and from those (through `uintptr_t`), and the backend writes no other cast of one.
@@ -189,10 +211,7 @@ class Checker:
     def check(self) -> None:
         for ext in self.program.externs.values():
             self.where = f"extern {ext.name}"
-            for t in ext.ptypes:
-                self.has_memory_form(t)
-            if not isinstance(ext.ret, Never):
-                self.foreign_result(ext.ret)
+            self.foreign_signature(ext.ptypes, ext.ret)
         for trait in self.program.traits.values():
             self.where = f"trait {trait.name}"
             if trait.name in SEALED:
@@ -830,11 +849,36 @@ class Checker:
         sub = self.instantiate(fun.params, fun.premises, instr.tys, name)
         return subst(Fn(fun.ptypes, fun.ret, fun.unsafe, fun.places), sub)
 
+    def foreign_signature(self, ptypes: Sequence[Type], ret: Type) -> None:
+        """DECL-EXTERN-FN and DECL-EXTERN-RESULT. A parameter has a memory form, and the result holds nothing
+        only checked code makes (`foreign_result`). A function type anywhere in the signature is an `unsafe
+        fn` type: no safe function value comes from foreign code or goes to it. Foreign code calls such a
+        value with arguments it makes, and takes its result, or hands the value back, so the program calls
+        it: each parameter of one has a memory form and holds nothing only checked code makes, and so does
+        its result, which may be zero-size only with an erased value (`void`). The walk reaches the
+        function types nested in those too."""
+        for t in ptypes:
+            self.has_memory_form(t)
+        if not isinstance(ret, Never):
+            self.foreign_result(ret)
+        functions = [fn for part in (*ptypes, ret) for fn in function_types(self.types, part)]
+        if any(not fn.unsafe for fn in functions):
+            self.fail("extern_safe_function_type")
+        for fn in functions:
+            for t in fn.params:
+                self.has_memory_form(t)
+                self.foreign_result(t)
+            self.foreign_result(fn.ret)
+            if self.types.zero_size(fn.ret) and not self.types.erasable(fn.ret):
+                self.fail("zero_size_type_has_no_memory_form")
+
     def foreign_result(self, ty: Type) -> None:
-        """What foreign code hands the program, an extern function's result, is
-        reinterpreted from C's bytes as an unsafe cast's result is: it holds nothing only checked code
-        makes (`checked_only`; a result of `!` itself says the function does not return), and no enum or
-        `NonNull`, whose layout the compiler chooses."""
+        """What foreign code hands the program, an extern function's result or a value it passes to an
+        `unsafe fn` of the signature, is reinterpreted from C's bytes as an unsafe cast's result is: it
+        holds nothing only checked code makes (`checked_only`; an extern's result of `!` itself says the
+        function does not return), and no enum or `NonNull`, whose layout the compiler chooses. The walk
+        is TY-REACH's (`contains`): named types unfolded, not through a pointer, a function value or an
+        array of length 0."""
         if contains(self.types, ty, checked_only):
             self.fail("extern_result_cannot_produce")
         if self.types.chosen_layout(ty):
