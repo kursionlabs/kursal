@@ -479,6 +479,14 @@ REJECTED = {
                                         "(extern fun take u32 ((fn (unsafe) () (brand $static))))"),
     "extern_nested_callback": ("extern_result_layout_chosen", """
         (extern fun make (fn (unsafe) ((fn (unsafe) ((non_null u8)) u32)) u32) ())"""),
+    # `sizeof` of a foreach type whose pointer source mentions a parameter needs `Exposed` of the source,
+    # as a traversal does, so no instantiation makes it a pointer to a sum; a closed one is formed only
+    # where the pointee is no sum (foreach_type_over_pointer_to_sum).
+    "sizeof_foreach_pointer_source_not_exposed": ("foreach_source_not_exposed", """
+        (fun g (forall (T) () usize () (entry () (= %n (sizeof (foreach ((ptr F) (ptr T)) (tuple F)))) (ret %n))))"""),
+    "raw_target_lend_without_sized": ("raw_access_needs_sized", """
+        (fun get (forall (T) () u32 (T) (entry ((&x T)) (= %r (const u32 0)) (ret %r))))
+        (fun (unsafe) f (forall (T) () u32 ((ptr T)) (entry ((%p (ptr T))) (= %r (call (get T) &*%p)) (ret %r))))"""),
     # Foreign code calls an `unsafe fn` of the signature with values: it lends no place, so no function
     # type in an extern's signature takes a place parameter, nested or behind a pointer.
     "extern_callback_takes_place": ("extern_place_parameter", "(extern fun take u32 ((fn (unsafe) ((& u32)) u32)))"),
@@ -523,7 +531,8 @@ class CoreSoundnessTests(unittest.TestCase):
     def test_the_sound_forms_are_accepted(self):
         for source in (
             # A pointer gives pointer components whatever its pointee is but a sum: a leaf, a product
-            # holding a sum, or a type parameter. A pointer to a sum is a value still, and a component.
+            # holding a sum, or a type parameter, whose `sizeof` needs `Exposed` of the source. A pointer
+            # to a sum is a value still, and a component.
             """(type Opt (enum (none (tuple)) (some u8)))
                (fun f usize ((ptr Opt)) (entry ((%p (ptr Opt)))
                  (= %a (sizeof (foreach ((ptr F) (ptr bool)) F)))
@@ -531,7 +540,8 @@ class CoreSoundnessTests(unittest.TestCase):
                  (= %c (sizeof (foreach (F (tuple (ptr Opt) u8)) F)))
                  (= %d (sizeof (foreach ((ptr F) (tuple (ptr u8) (ptr u16))) F)))
                  (ret %a)))
-               (fun g (forall (T) () usize () (entry () (= %n (sizeof (foreach ((ptr F) (ptr T)) F))) (ret %n))))""",
+               (fun g (forall (T) ((Exposed (ptr T))) usize ()
+                 (entry () (= %n (sizeof (foreach ((ptr F) (ptr T)) F))) (ret %n))))""",
             # A block brand that is new to the function.
             """(fun f u32 ()
                  (entry () (= %f (fresh)) (= %w (open %f ($a))) (jmp (next $a) %w))

@@ -276,12 +276,15 @@ class Types:
     def zero_size(self, ty: Type, parameters: bool = False) -> bool:
         """`ty` has no bytes of its own: unit-like products, empty arrays, brand witnesses, Never. A type
         parameter is answered when it is instantiated, or with `parameters` is taken to be zero-size, as
-        it may be: `ty` then has bytes only through a part that has them whatever the parameters are."""
+        it may be, and so is a foreach type that mentions one: `ty` then has bytes only through a part
+        that has them whatever the parameters are."""
         match ty:
             case Brand() | Never():
                 return True
             case Named(args=()) if ty.name not in self.program.types:
                 return parameters
+            case Foreach() if parameters and not self.closed(ty):
+                return True
         match self.shape(ty):
             case Tuple(elems=elems):
                 return all(self.zero_size(t, parameters) for t in elems)
@@ -292,6 +295,24 @@ class Types:
             case Exists(body=body):
                 return self.zero_size(body, parameters)
         return False
+
+    def pointer_sources(self, ty: Type) -> list[Type]:
+        """The pointer sources that mention a type parameter of the foreach types in `ty`, declarations that
+        mention one unfolded, each once (TY-FOREACH-EXPOSED-PTR): `sizeof` of `ty` needs `Exposed` of each,
+        as a traversal does, so none points to a sum at an instantiation."""
+        sources: list[Type] = []
+        seen: list[Type] = []
+
+        def visit(t: Type) -> None:
+            for part in walk(t):
+                if isinstance(part, Foreach) and isinstance(part.source, Ptr) and not self.closed(part.source):
+                    sources.append(part.source)
+                elif isinstance(part, Named) and part.name in self.program.types and not self.closed(part) \
+                        and not any(equal(part, s) for s in seen):
+                    seen.append(part)
+                    visit(self.unfold(part))
+        visit(ty)
+        return sources
 
     def closed(self, ty: Type) -> bool:
         """`ty` mentions no type parameter or binder: every name it has is a declaration's. Brands do not
@@ -590,10 +611,12 @@ class Types:
         s = self.shape(source, module)
         wrap: Callable[[Type], Type] = lambda c: c
         if isinstance(s, Ptr):
-            # Behind a pointer each component is a pointer to it; a sum has none.
+            # Behind a pointer each component is a pointer to it; a sum has none, so no rows
+            # (TY-FOREACH-ROWS-PTR). Formation rejects a written one, and a traversal or `sizeof` with a
+            # parameter in the pointee needs `Exposed` of the source, which no sum has.
             s, wrap = self.shape(s.inner, module), Ptr
             if isinstance(s, Enum):
-                raise KursError(POINTER_TO_SUM)
+                return Tuple(()), []
         match s:
             case Struct(fields=fields):
                 return s, [(n, wrap(f)) for n, f in fields]

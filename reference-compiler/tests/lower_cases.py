@@ -83,6 +83,14 @@ LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
      "forall T where Copy[T], Sized[T].\nfn get(p: *T) -> T { unsafe *p }\n"
      "fn f(p: *W['static]) -> W['static] { get(p) }\n", "Sized requires an exact premise"),
     ("use std::owned::Owned!;\nfn main() -> i32 { let o = Owned!::new(()); 0 }\n", "Sized requires an exact premise"),
+    ("forall T.\nfn take(&x: T) -> u32 { 0u32 }\nforall T.\nfn f(p: *T) -> u32 { take(unsafe &*p) }\n",
+     "a raw read, write or alloca at T needs Sized[T]"),
+    ("fn take(&x: ()) -> u32 { 0u32 }\nfn f(p: *()) -> u32 { take(unsafe &*p) }\n",
+     "a raw read, write or alloca at a zero-size type"),
+    # The source writes no `sizeof` of a foreach type, which is no type argument (the core's `sizeof`
+    # of one over a pointer to a parameter needs `Exposed` of the source, test_core_soundness).
+    ("forall T.\nfn f() -> usize { core::mem::sizeof[foreach *F of *T => (F,)]() }\n",
+     "a type argument is a foreach type"),
     ("use std::arena::Domain!;\nuse std::mem::Ref;\nfn main() -> i32 {\n"
      "    let exists 'a. cx = Domain!::new(std::process::hash_seed());\n    let r = Ref::new(&cx, ());\n"
      "    cx.destroy();\n    0\n}\n", "Sized requires an exact premise"),

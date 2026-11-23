@@ -876,10 +876,11 @@ These are the places where Kursal differs from what one might expect.
   not zero-size, the same on every target (`Sized[(u8, ())]` holds, `Sized[()]` does not). Of a type
   that mentions one it holds by the caller's own premise for exactly that type, or by a part held by
   value that has bytes whatever the parameters are, a primitive, a pointer, a sum or a function
-  value: `Sized[(T, u32)]` holds with no premise, while `Sized[(T, U)]` needs exactly that premise,
-  `Sized[T]` and `Sized[U]` not giving it (`Sized requires an exact premise or a part whose size is
-  not zero whatever the type parameters are`). It implies neither `Copy` nor `Exposed`. A raw load,
-  store or `alloca` needs it of its type ("Zero-size types are erased").
+  value, but not a foreach type: `Sized[(T, u32)]` holds with no premise, while `Sized[(T, U)]`
+  needs exactly that premise, `Sized[T]` and `Sized[U]` not giving it (`Sized requires an exact
+  premise or a part whose size is not zero whatever the type parameters are`). It implies neither
+  `Copy` nor `Exposed`. A raw load, store, `alloca` or lend of a raw pointer's target needs it of
+  its type ("Zero-size types are erased").
 - **Method lookup sees what the caller sees.** `x.name()` looks for `name` among the methods of
   `x`'s type, and otherwise among the single-parameter traits visible in the calling module
   (declared there, imported by name or glob, or re-exported to it), and the methods of blanket impls
@@ -975,9 +976,13 @@ These are the places where Kursal differs from what one might expect.
   a sum is opaque, copied, passed and read whole (`unsafe *p`, then a `match`), and is no source:
   its components would be those of the variant held there, which only a read finds.
   `foreach F of *Option[u8] => F` is rejected, by value or with `*F`, through a name too, and so is
-  a traversal of such a pointer (`a foreach source cannot be a pointer to a sum`); an instantiation
-  that makes one, `foreach *F of *T => F` at an enum `T`, has no expansion either, and
-  `Exposed[*T]`, which a generic traversal needs, never holds for it. `*F` binds F to each component's
+  a traversal of such a pointer (`a foreach source cannot be a pointer to a sum`). Nothing is checked
+  again at an instantiation: `Exposed[*T]`, which a generic traversal needs, and which the core's
+  `sizeof` of a foreach type needs of each pointer source that mentions a parameter
+  (`foreach_source_not_exposed`; the source writes no `sizeof` of a foreach type, which is no type
+  argument), never holds for an enum `T`, so no generic code forms `foreach *F of *T => F` there,
+  and a pointer to a sum gives no rows, an empty expansion, where a type that is never formed is
+  laid out anyway (TY-FOREACH-ROWS-PTR). `*F` binds F to each component's
   pointee, so its source must give pointers whatever the type arguments are, and show them as
   written: an explicit pointer, or a tuple, struct, enum or array whose components are written as
   pointers. `foreach *F of T => F` is rejected, as `T` may be

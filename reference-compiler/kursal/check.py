@@ -903,8 +903,12 @@ class Checker:
         return Ptr(instr.ty)
 
     def op_sizeof(self, instr: Instr) -> Type:
+        """INS-SIZEOF: a foreach type's pointer source that mentions a parameter is `Exposed`, as a traversal
+        needs, so the type has its rows at every instantiation (`Types.pointer_sources`)."""
         if instr.ty is None:
             self.fail("instruction_requires_type")
+        if any(not self.holds("Exposed", (source,)) for source in self.types.pointer_sources(instr.ty)):
+            self.fail("foreach_source_not_exposed")
         return USIZE
 
     def op_data(self, instr: Instr) -> Type:

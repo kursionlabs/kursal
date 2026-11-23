@@ -955,8 +955,9 @@ impl Types['k] {
         self.zero_size_at(&cx, ty, false)
     }
 
-    // `zero_size`, a type parameter taken to be zero-size when `parameters` says so, as it may be:
-    // `ty` then has bytes only through a part that has them whatever the parameters are.
+    // `zero_size`, a type parameter taken to be zero-size when `parameters` says so, as it may be, and
+    // so a foreach type that mentions one: `ty` then has bytes only through a part that has them
+    // whatever the parameters are.
     fn zero_size_at(self, &cx: Domain!['k], ty: Type['k], parameters: bool) -> bool {
         let unit = match ty {
             Type::Brand(_b) => {
@@ -968,6 +969,11 @@ impl Types['k] {
             Type::Named(name, args) => {
                 if args.is_empty(&cx) && !self.program.types.contains(&cx, name) {
                     return parameters;
+                }
+            },
+            Type::Foreach(_f) => {
+                if parameters && !self.closed(&cx, ty) {
+                    return true;
                 }
             },
             _ => (),
@@ -999,6 +1005,45 @@ impl Types['k] {
 
     // `ty` mentions no type parameter or binder: every name it has is a declaration's. Brands do not
     // change a layout.
+    // The pointer sources that mention a type parameter of the foreach types in `ty`, declarations
+    // that mention one unfolded, each once (TY-FOREACH-EXPOSED-PTR): `sizeof` of `ty` needs `Exposed`
+    // of each, as a traversal does, so none points to a sum at an instantiation.
+    fn pointer_sources(self, &cx: Domain!['k], ty: Type['k]) -> ArenaVec[Type['k], 'k] {
+        let out: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
+        self.pointer_sources_in(&cx, ty, out, ArenaVec::new(&cx));
+        out
+    }
+
+    fn pointer_sources_in(self, &cx: Domain!['k], ty: Type['k], out: ArenaVec[Type['k], 'k], seen: ArenaVec[Type['k], 'k]) {
+        let parts = walk(&cx, ty);
+        var i = 0usize;
+        while i < parts.len(&cx) {
+            let part = parts.at(&cx, i);
+            match part {
+                Type::Foreach(f) => {
+                    let source = f.source.copy(&cx);
+                    match source {
+                        Type::Ptr(_inner) => {
+                            if !self.closed(&cx, source) {
+                                out.push(&cx, source);
+                            }
+                        },
+                        _ => (),
+                    };
+                },
+                Type::Named(name, _args) => {
+                    if self.program.types.contains(&cx, name) && !self.closed(&cx, part)
+                        && !seen.any(&cx, |&cx, s: Type['k]| equal(&cx, s, part)) {
+                        seen.push(&cx, part);
+                        self.pointer_sources_in(&cx, self.unfold(&cx, part, Option::None), out, seen);
+                    }
+                },
+                _ => (),
+            };
+            i = i + 1usize;
+        }
+    }
+
     fn closed(self, &cx: Domain!['k], ty: Type['k]) -> bool {
         let brands = free_brands(&cx, ty);
         let names = free_names(&cx, ty).keys(&cx);
@@ -1527,12 +1572,16 @@ impl Types['k] {
         var s = self.shape(&cx, source, home);
         var pointer = false;
         let unit = match s {
-            // Behind a pointer each component is a pointer to it; a sum has none.
+            // Behind a pointer each component is a pointer to it; a sum has none, so no rows
+            // (TY-FOREACH-ROWS-PTR). Formation rejects a written one, and a traversal or `sizeof` with a
+            // parameter in the pointee needs `Exposed` of the source, which no sum has.
             Type::Ptr(inner) => {
                 s = self.shape(&cx, inner.copy(&cx), home);
                 pointer = true;
                 match s {
-                    Type::Enum(_v) => kurs_error(&cx, Span::from_static(&cx, POINTER_TO_SUM), no_pos()),
+                    Type::Enum(_v) => {
+                        return Rows.{ skeleton: Option::Some.(Type::Tuple.(ArenaVec::new(&cx))), rows: ArenaVec::new(&cx) };
+                    },
                     _ => (),
                 };
             },
