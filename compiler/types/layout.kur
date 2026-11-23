@@ -80,7 +80,7 @@ forall 'k.
 impl Expansion['k] {
     fn collect(self, &cx: Domain!['k], owner: Span['k], ty: Type['k], bound: ArenaSet[Span['k], 'k], params: ArenaSet[Span['k], 'k], derived: ArenaSet[Span['k], 'k]) {
         match ty {
-            Type::Named(name, args) => {
+            Named(name, args) => {
                 if !bound.contains(&cx, name) && self.program.types.contains(&cx, name) {
                     self.graph.at(&cx, ArenaVec::one(&cx, owner)).insert(&cx, ArenaVec::one(&cx, name));
                     self.sites.push(&cx, ExpansionSite.{ owner, name, args, params, derived });
@@ -91,7 +91,7 @@ impl Expansion['k] {
                     i = i + 1usize;
                 }
             },
-            Type::Foreach(f) => {
+            Foreach(f) => {
                 self.collect(&cx, owner, f.source.copy(&cx), bound, params, derived);
                 let binders = with_names(&cx, ArenaSet::new(&cx), ArenaVec::one(&cx, f.binder));
                 let tainted = if overlap(&cx, free_names(&cx, f.source.copy(&cx)), params.union(&cx, derived)) { binders } else { ArenaSet::new(&cx) };
@@ -145,18 +145,18 @@ impl Expansion['k] {
     // Demand just the outer shape needed by foreach rows (one pointer layer).
     fn shape(self, &cx: Domain!['k], owner: Span['k], ty: Type['k], active: ArenaVec[Type['k], 'k], bound: ArenaSet[Span['k], 'k], pointer: bool) {
         match ty {
-            Type::Named(name, args) => match self.unfold(&cx, name, args, bound) {
-                Option::Some(found) => {
+            Named(name, args) => match self.unfold(&cx, name, args, bound) {
+                Some(found) => {
                     let current = self.key(&cx, ty);
                     if any_equal(&cx, current, active) {
                         self.fail(&cx, owner, Buffer!::new().push_static("recursive foreach source shape through ").push_bytes(&cx, name).save(&cx));
                     }
                     self.shape(&cx, owner, found, with_type(&cx, active, current), bound, pointer);
                 },
-                Option::None => (),
+                None => (),
             },
-            Type::Foreach(f) => self.shape(&cx, owner, f.source.copy(&cx), active, bound, true),
-            Type::Ptr(inner) => {
+            Foreach(f) => self.shape(&cx, owner, f.source.copy(&cx), active, bound, true),
+            Ptr(inner) => {
                 if pointer {
                     self.shape(&cx, owner, inner.copy(&cx), active, bound, false);
                 }
@@ -170,31 +170,31 @@ impl Expansion['k] {
     // or the pattern does not fit them (formation reports that).
     fn outer(self, &cx: Domain!['k], ty: Type['k], bound: ArenaSet[Span['k], 'k]) -> Option[Type['k]] {
         let found = match ty {
-            Type::Named(name, args) => self.unfold(&cx, name, args, bound),
-            Type::Foreach(f) => self.expand(&cx, f, bound),
+            Named(name, args) => self.unfold(&cx, name, args, bound),
+            Foreach(f) => self.expand(&cx, f, bound),
             _ => return Option::Some.(ty),
         };
         match found {
-            Option::Some(next) => self.outer(&cx, next, bound),
-            Option::None => Option::None,
+            Some(next) => self.outer(&cx, next, bound),
+            None => Option::None,
         }
     }
 
     fn rows(self, &cx: Domain!['k], source: Type['k], bound: ArenaSet[Span['k], 'k]) -> Option[Rows['k]] {
         var shape = match self.outer(&cx, source, bound) {
-            Option::Some(shape) => shape,
-            Option::None => return Option::None,
+            Some(shape) => shape,
+            None => return Option::None,
         };
         var pointer = false;
         let unit = match shape {
-            Type::Ptr(inner) => {
+            Ptr(inner) => {
                 shape = match self.outer(&cx, inner.copy(&cx), bound) {
-                    Option::Some(pointee) => pointee,
-                    Option::None => return Option::None,
+                    Some(pointee) => pointee,
+                    None => return Option::None,
                 };
                 pointer = true;
                 match shape {
-                    Type::Enum(_v) => return Option::None,
+                    Enum(_v) => return Option::None,
                     _ => (),
                 }
             },
@@ -202,7 +202,7 @@ impl Expansion['k] {
         };
         let rows: ArenaVec[Row['k], 'k] = ArenaVec::new(&cx);
         match shape {
-            Type::Struct(fields) => {
+            Struct(fields) => {
                 var i = 0usize;
                 while i < fields.len(&cx) {
                     rows.push(&cx, Row.{ label: fields.at(&cx, i).name, item: wrap(&cx, fields.at(&cx, i).type, pointer) });
@@ -210,7 +210,7 @@ impl Expansion['k] {
                 }
                 Option::Some.(Rows.{ skeleton: Option::Some.(shape), rows })
             },
-            Type::Tuple(elems) => {
+            Tuple(elems) => {
                 var i = 0usize;
                 while i < elems.len(&cx) {
                     rows.push(&cx, Row.{ label: Buffer!::new().push_usize(i).save(&cx), item: wrap(&cx, elems.at(&cx, i), pointer) });
@@ -218,11 +218,11 @@ impl Expansion['k] {
                 }
                 Option::Some.(Rows.{ skeleton: Option::Some.(shape), rows })
             },
-            Type::Array(elem, _length) => {
+            Array(elem, _length) => {
                 rows.push(&cx, Row.{ label: Span::from_static(&cx, "0"), item: wrap(&cx, elem.copy(&cx), pointer) });
                 Option::Some.(Rows.{ skeleton: Option::Some.(shape), rows })
             },
-            Type::Enum(variants) => {
+            Enum(variants) => {
                 var i = 0usize;
                 while i < variants.len(&cx) {
                     rows.push(&cx, Row.{ label: variants.at(&cx, i).name, item: variants.at(&cx, i).type });
@@ -242,23 +242,23 @@ impl Expansion['k] {
             return Option::Some.(item);
         }
         match item {
-            Type::Ptr(inner) => Option::Some.(inner.copy(&cx)),
+            Ptr(inner) => Option::Some.(inner.copy(&cx)),
             _ => Option::None,
         }
     }
 
     fn expand(self, &cx: Domain!['k], ty: ForeachType['k], bound: ArenaSet[Span['k], 'k]) -> Option[Type['k]] {
         let found = match self.rows(&cx, ty.source.copy(&cx), bound) {
-            Option::Some(found) => found,
-            Option::None => return Option::None,
+            Some(found) => found,
+            None => return Option::None,
         };
         let mapped: ArenaVec[Member['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < found.rows.len(&cx) {
             let row = found.rows.at(&cx, i);
             let bind = match self.binding(&cx, ty, row.item) {
-                Option::Some(bind) => bind,
-                Option::None => return Option::None,
+                Some(bind) => bind,
+                None => return Option::None,
             };
             let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
             sub.insert(&cx, ty.binder, bind);
@@ -266,13 +266,13 @@ impl Expansion['k] {
             i = i + 1usize;
         }
         Option::Some.(match found.skeleton {
-            Option::Some(skeleton) => match skeleton {
-                Type::Struct(_f) => Type::Struct.(mapped),
-                Type::Enum(_v) => Type::Enum.(mapped),
-                Type::Array(_e, length) => Type::Array.(Ref::new(&cx, mapped.at(&cx, 0usize).type), length),
+            Some(skeleton) => match skeleton {
+                Struct(_f) => Type::Struct.(mapped),
+                Enum(_v) => Type::Enum.(mapped),
+                Array(_e, length) => Type::Array.(Ref::new(&cx, mapped.at(&cx, 0usize).type), length),
                 _ => Type::Tuple.(member_types(&cx, mapped)),
             },
-            Option::None => Type::Tuple.(member_types(&cx, mapped)),
+            None => Type::Tuple.(member_types(&cx, mapped)),
         })
     }
 
@@ -282,12 +282,12 @@ impl Expansion['k] {
         var i = 0usize;
         while i < bound.positions(&cx) {
             let unit = match bound.key_at(&cx, i) {
-                Option::Some(name) => {
+                Some(name) => {
                     if self.program.types.contains(&cx, name) {
                         return false;
                     }
                 },
-                Option::None => (),
+                None => (),
             };
             i = i + 1usize;
         }
@@ -296,8 +296,8 @@ impl Expansion['k] {
 
     fn walk(self, &cx: Domain!['k], owner: Span['k], ty: Type['k], active: ArenaVec[Type['k], 'k], bound: ArenaSet[Span['k], 'k], aliases: bool) {
         match ty {
-            Type::Named(name, args) => match self.unfold(&cx, name, args, bound) {
-                Option::Some(found) => {
+            Named(name, args) => match self.unfold(&cx, name, args, bound) {
+                Some(found) => {
                     let current = self.key(&cx, ty);
                     if any_equal(&cx, current, active) {
                         let reason = if aliases { Span::from_static(&cx, "recursive alias needs an aggregate boundary") } else { Span::from_static(&cx, "infinite by-value layout") };
@@ -312,9 +312,9 @@ impl Expansion['k] {
                         }
                     }
                 },
-                Option::None => (),
+                None => (),
             },
-            Type::Foreach(f) => {
+            Foreach(f) => {
                 self.shape(&cx, owner, f.source.copy(&cx), ArenaVec::new(&cx), bound, true);
                 if aliases {
                     // Every foreach result has an aggregate representation.
@@ -322,7 +322,7 @@ impl Expansion['k] {
                 }
                 self.walk(&cx, owner, f.source.copy(&cx), active, bound, aliases);
                 match self.expand(&cx, f, bound) {
-                    Option::Some(expanded) => {
+                    Some(expanded) => {
                         // A component may hold this foreach again by value, unfolding no name on
                         // the way: it is active like a name.
                         let current = self.key(&cx, ty);
@@ -332,17 +332,17 @@ impl Expansion['k] {
                         self.walk(&cx, owner, expanded, with_type(&cx, active, current), bound, aliases);
                     },
                     // Opaque here; every use walks the expansion at its type arguments.
-                    Option::None => self.walk(&cx, owner, f.body.copy(&cx), active, with_names(&cx, bound, ArenaVec::one(&cx, f.binder)), aliases),
+                    None => self.walk(&cx, owner, f.body.copy(&cx), active, with_names(&cx, bound, ArenaVec::one(&cx, f.binder)), aliases),
                 }
             },
-            Type::Brand(_b) => (),
-            Type::Ptr(_i) => if !aliases { () } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
-            Type::NonNull(_i) => if !aliases { () } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
-            Type::Fn(_f) => if !aliases { () } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
-            Type::Tuple(_e) => if aliases { () } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
-            Type::Struct(_f) => if aliases { () } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
-            Type::Enum(_v) => if aliases { () } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
-            Type::Array(_e, length) => if aliases || length == 0u64 { () } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
+            Brand(_b) => (),
+            Ptr(_i) => if !aliases { () } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
+            NonNull(_i) => if !aliases { () } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
+            Fn(_f) => if !aliases { () } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
+            Tuple(_e) => if aliases { () } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
+            Struct(_f) => if aliases { () } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
+            Enum(_v) => if aliases { () } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
+            Array(_e, length) => if aliases || length == 0u64 { () } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
             _ => self.walk_children(&cx, owner, ty, active, bound, aliases),
         }
     }
@@ -361,17 +361,17 @@ impl Expansion['k] {
     // has none (`struct T { f: fn(foreach *F of *T => *F) -> u32 }`).
     fn represent(self, &cx: Domain!['k], owner: Span['k], ty: Type['k], active: ArenaVec[Type['k], 'k], bound: ArenaSet[Span['k], 'k]) {
         match ty {
-            Type::Foreach(f) => {
+            Foreach(f) => {
                 self.shape(&cx, owner, f.source.copy(&cx), ArenaVec::new(&cx), bound, true);
                 match self.expand(&cx, f, bound) {
-                    Option::Some(expanded) => {
+                    Some(expanded) => {
                         let current = self.key(&cx, ty);
                         if any_equal(&cx, current, active) {
                             self.fail(&cx, owner, Buffer!::new().push_static("type ").push_bytes(&cx, owner).push_static(": recursive foreach needs a named type between").save(&cx));
                         }
                         self.represent(&cx, owner, expanded, with_type(&cx, active, current), bound);
                     },
-                    Option::None => self.represent(&cx, owner, f.body.copy(&cx), active, with_names(&cx, bound, ArenaVec::one(&cx, f.binder))),
+                    None => self.represent(&cx, owner, f.body.copy(&cx), active, with_names(&cx, bound, ArenaVec::one(&cx, f.binder))),
                 }
             },
             _ => {
@@ -422,7 +422,7 @@ fn check_type_expansion(&cx: Domain!['k], program: Program['k], counter: Fresh['
                 let arg = site.args.at(&cx, a);
                 let names = free_names(&cx, arg);
                 let bare = match arg {
-                    Type::Named(name, args) => args.is_empty(&cx) && site.params.contains(&cx, name),
+                    Named(name, args) => args.is_empty(&cx) && site.params.contains(&cx, name),
                     _ => false,
                 };
                 if overlap(&cx, names, site.derived) || (overlap(&cx, names, site.params) && !bare) {

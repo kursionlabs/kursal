@@ -21,8 +21,8 @@ use std::slice::Slice;
 forall 'k.
 fn formation_children(&cx: Domain!['k], ty: Type['k]) -> ArenaVec[Type['k], 'k] {
     match ty {
-        Type::Exists(_binders, _body) => ArenaVec::new(&cx),
-        Type::Foreach(f) => ArenaVec::one(&cx, f.source.copy(&cx)),
+        Exists(_binders, _body) => ArenaVec::new(&cx),
+        Foreach(f) => ArenaVec::one(&cx, f.source.copy(&cx)),
         _ => children(&cx, ty),
     }
 }
@@ -61,10 +61,10 @@ fn nominal_descent(&cx: Domain!['k], args: ArenaVec[Type['k], 'k], previous: Are
 forall 'k.
 fn brand_occurs(&cx: Domain!['k], ty: Type['k], label: Span['k]) -> bool {
     let unit = match ty {
-        Type::Skolem(found) => {
+        Skolem(found) => {
             return found.eq(&cx, label);
         },
-        Type::Exists(binders, _body) => {
+        Exists(binders, _body) => {
             if binders.contains(&cx, label) {
                 return false;
             }
@@ -164,12 +164,12 @@ impl Formation[D, 'k] {
 
     fn fail(self, &cx: Domain!['k], message: Span['k]) -> ! {
         let full = match self.declaration.copy(&cx) {
-            Option::Some(name) => Buffer!::new().push_static("type formation: ").push_bytes(&cx, message).push_static(" in type ").push_bytes(&cx, name).save(&cx),
-            Option::None => Buffer!::new().push_static("type formation: ").push_bytes(&cx, message).save(&cx),
+            Some(name) => Buffer!::new().push_static("type formation: ").push_bytes(&cx, message).push_static(" in type ").push_bytes(&cx, name).save(&cx),
+            None => Buffer!::new().push_static("type formation: ").push_bytes(&cx, message).save(&cx),
         };
         match self.reporter.copy(&cx) {
-            Option::Some(r) => r.fail(&cx, full, self.pos.copy(&cx)),
-            Option::None => kurs_error(&cx, full, self.pos.copy(&cx)),
+            Some(r) => r.fail(&cx, full, self.pos.copy(&cx)),
+            None => kurs_error(&cx, full, self.pos.copy(&cx)),
         }
     }
 
@@ -241,8 +241,8 @@ impl Formation[D, 'k] {
             ArenaVec::one(&cx, Param.{ name: Span::from_static(&cx, "T"), kind: Kind::Any })
         } else {
             match self.program.traits.get(&cx, premise.trait_name) {
-                Option::Some(t) => self.trait_params(&cx, t),
-                Option::None => self.fail(&cx, Buffer!::new().push_static("unknown trait ").push_bytes(&cx, premise.trait_name).save(&cx)),
+                Some(t) => self.trait_params(&cx, t),
+                None => self.fail(&cx, Buffer!::new().push_static("unknown trait ").push_bytes(&cx, premise.trait_name).save(&cx)),
             }
         };
         self.arguments(&cx, params, premise.args, env);
@@ -275,25 +275,25 @@ impl Formation[D, 'k] {
     // Validate structure and distinguish brands from values; fits refines Copy.
     fn kind(self, &cx: Domain!['k], ty: Type['k], env: ArenaMap[Span['k], Kind, 'k]) -> Kind {
         match ty {
-            Type::Skolem(label) => {
+            Skolem(label) => {
                 let in_scope = match env.get(&cx, label) {
-                    Option::Some(k) => is_brand(k),
-                    Option::None => false,
+                    Some(k) => is_brand(k),
+                    None => false,
                 };
                 if !in_scope {
                     self.fail(&cx, Buffer!::new().push_static("brand ").push_bytes(&cx, label).push_static(" is not in scope").save(&cx));
                 }
                 return Kind::Brand;
             },
-            Type::Named(name, args) => self.named(&cx, name, args, env),
-            Type::Brand(brand) => self.fits(&cx, brand.copy(&cx), Kind::Brand, env),
-            Type::Exists(binders, body) => {
+            Named(name, args) => self.named(&cx, name, args, env),
+            Brand(brand) => self.fits(&cx, brand.copy(&cx), Kind::Brand, env),
+            Exists(binders, body) => {
                 if binders.is_empty(&cx) {
                     self.fail_static(&cx, "existential requires at least one brand binder");
                 }
                 let inner = self.extend(&cx, env, params_of(&cx, binders, Kind::Brand));
                 let unit = match body.copy(&cx) {
-                    Type::Exists(_b, _t) => self.fail_static(&cx, "nested existential binders must be flattened"),
+                    Exists(_b, _t) => self.fail_static(&cx, "nested existential binders must be flattened"),
                     _ => (),
                 };
                 var i = 0usize;
@@ -309,7 +309,7 @@ impl Formation[D, 'k] {
                 self.opened.truncate(&cx, mark);
                 self.flat(&cx, body.copy(&cx), "a package body");
             },
-            Type::Foreach(f) => {
+            Foreach(f) => {
                 self.fits(&cx, f.source.copy(&cx), Kind::Any, env);
                 self.flat(&cx, f.source.copy(&cx), "a foreach source");
                 if self.types.points_to_sum(&cx, f.source.copy(&cx), env) {
@@ -327,7 +327,7 @@ impl Formation[D, 'k] {
                 self.opened.truncate(&cx, mark);
                 self.flat(&cx, f.body.copy(&cx), "a foreach body");
             },
-            Type::Fn(f) => {
+            Fn(f) => {
                 var j = 0usize;
                 while j < f.places.len(&cx) {
                     if f.places.at(&cx, j) >= f.params.len(&cx) {
@@ -342,24 +342,24 @@ impl Formation[D, 'k] {
                 }
                 self.fits(&cx, f.ret.copy(&cx), Kind::Any, env);
             },
-            Type::Prim(name) => {
+            Prim(name) => {
                 if !C::is_prim(&cx, name) {
                     self.fail(&cx, Buffer!::new().push_static("unknown primitive ").push_bytes(&cx, name).save(&cx));
                 }
             },
             // A length is never negative: it is unsigned.
-            Type::Struct(fields) => self.components(&cx, ty, fields, env),
-            Type::Enum(variants) => {
+            Struct(fields) => self.components(&cx, ty, fields, env),
+            Enum(variants) => {
                 if variants.is_empty(&cx) {
                     self.fail_static(&cx, "an enum has at least one variant");
                 }
                 self.components(&cx, ty, variants, env);
             },
-            Type::Ptr(_inner) => self.children_fit(&cx, ty, env, "a pointee"),
-            Type::NonNull(_inner) => self.children_fit(&cx, ty, env, "a pointee"),
-            Type::Tuple(_elems) => self.children_fit(&cx, ty, env, "a component"),
-            Type::Array(_elem, _length) => self.children_fit(&cx, ty, env, "a component"),
-            Type::Never => self.children_fit(&cx, ty, env, "a component"),
+            Ptr(_inner) => self.children_fit(&cx, ty, env, "a pointee"),
+            NonNull(_inner) => self.children_fit(&cx, ty, env, "a pointee"),
+            Tuple(_elems) => self.children_fit(&cx, ty, env, "a component"),
+            Array(_elem, _length) => self.children_fit(&cx, ty, env, "a component"),
+            Never => self.children_fit(&cx, ty, env, "a component"),
             _ => self.fail_static(&cx, "unknown type node"),
         }
         if self.sizes.copy(&cx) {
@@ -412,22 +412,22 @@ impl Formation[D, 'k] {
 
     fn named(self, &cx: Domain!['k], name: Span['k], args: ArenaVec[Type['k], 'k], env: ArenaMap[Span['k], Kind, 'k]) {
         let unit = match env.get(&cx, name) {
-            Option::Some(k) => {
+            Some(k) => {
                 if !args.is_empty(&cx) || is_brand(k) {
                     self.fail(&cx, Buffer!::new().push_static("invalid type parameter ").push_bytes(&cx, name).save(&cx));
                 }
                 return ();
             },
-            Option::None => (),
+            None => (),
         };
         let decl = match self.program.types.get(&cx, name) {
-            Option::Some(d) => d,
-            Option::None => self.fail(&cx, Buffer!::new().push_static("unknown type ").push_bytes(&cx, name).save(&cx)),
+            Some(d) => d,
+            None => self.fail(&cx, Buffer!::new().push_static("unknown type ").push_bytes(&cx, name).save(&cx)),
         };
         self.arguments(&cx, decl.params, args, env);
         let discharger = match self.discharge.copy(&cx) {
-            Option::Some(d) => d,
-            Option::None => {
+            Some(d) => d,
+            None => {
                 return ();
             },
         };
@@ -537,8 +537,8 @@ impl Formation[D, 'k] {
         var i = 0usize;
         while i < block.brands.len(&cx) {
             let rebinds = match env.get(&cx, block.brands.at(&cx, i)) {
-                Option::Some(k) => is_brand(k),
-                Option::None => false,
+                Some(k) => is_brand(k),
+                None => false,
             };
             if rebinds {
                 self.fail_static(&cx, "a block brand parameter cannot rebind a function brand");
@@ -566,13 +566,13 @@ impl Formation[D, 'k] {
             let instr = block.instrs.at(&cx, n);
             self.pos.set(&cx, instr.pos);
             let unit = match instr.ty {
-                Option::Some(t) => {
+                Some(t) => {
                     self.fits(&cx, t, Kind::Any, scope);
                     if instr.op.is(&cx, "alloca") {
                         self.flat(&cx, t, "a pointee");
                     }
                 },
-                Option::None => (),
+                None => (),
             };
             let call = instr.op.is(&cx, "call") || instr.op.is(&cx, "fn");
             if call && self.program.funs.contains(&cx, instr.args.at(&cx, 0usize)) {
@@ -581,11 +581,11 @@ impl Formation[D, 'k] {
                 self.arguments(&cx, ArenaVec::new(&cx), instr.tys, scope);
             } else if instr.op.is(&cx, "foreach") && self.program.funs.contains(&cx, instr.args.at(&cx, 1usize)) {
                 let count = match instr.ty {
-                    Option::Some(t) => match t {
-                        Type::Foreach(_f) => 1usize,
+                    Some(t) => match t {
+                        Foreach(_f) => 1usize,
                         _ => 0usize,
                     },
-                    Option::None => 0usize,
+                    None => 0usize,
                 };
                 let mapper = self.program.funs.at(&cx, instr.args.at(&cx, 1usize));
                 let leading = mapper.params.slice(&cx, 0usize, count);
@@ -613,7 +613,7 @@ impl Formation[D, 'k] {
         }
         let edges: ArenaVec[Edge['k], 'k] = ArenaVec::new(&cx);
         let unit = match block.term {
-            Terminator::Switch(_scrutinee, ty, arms, pos) => {
+            Switch(_scrutinee, ty, arms, pos) => {
                 self.pos.set(&cx, pos);
                 self.fits(&cx, ty, Kind::Any, scope);
                 var a = 0usize;
@@ -622,17 +622,17 @@ impl Formation[D, 'k] {
                     a = a + 1usize;
                 }
             },
-            Terminator::Jnz(_cond, then, other, pos) => {
+            Jnz(_cond, then, other, pos) => {
                 self.pos.set(&cx, pos);
                 edges.push(&cx, then);
                 edges.push(&cx, other);
             },
-            Terminator::Jmp(edge, pos) => {
+            Jmp(edge, pos) => {
                 self.pos.set(&cx, pos);
                 edges.push(&cx, edge);
             },
-            Terminator::Ret(_value, pos) => self.pos.set(&cx, pos),
-            Terminator::Unreachable(pos) => self.pos.set(&cx, pos),
+            Ret(_value, pos) => self.pos.set(&cx, pos),
+            Unreachable(pos) => self.pos.set(&cx, pos),
         };
         var e = 0usize;
         while e < edges.len(&cx) {
