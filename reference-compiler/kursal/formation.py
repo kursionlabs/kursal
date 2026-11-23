@@ -9,7 +9,7 @@ from collections.abc import Callable
 
 from . import core as C
 from .sexpr import KursError, Position
-from .types import POINTER_TO_SUM, Kinds, Types, children, subst, free_brands, free_names, equal
+from .types import POINTER_TO_SUM, Kinds, Types, children, equal, free_brands, free_names, show, subst, walk
 
 
 def formation_children(ty: C.Type) -> tuple[C.Type, ...]:
@@ -57,6 +57,7 @@ class Formation:
         self.active: list[tuple[str, tuple[C.Type, ...], int]] = []
         self.opened: list[str] = []
         self.declaration: Optional[str] = None
+        self.sizes = True   # off while the declarations are being formed (`declarations`)
 
     def fail(self, message: str) -> None:
         # A type declaration has no position of its own: its name says where.
@@ -192,7 +193,16 @@ class Formation:
                     self.flat(t, "a pointee" if isinstance(ty, (C.Ptr, C.NonNull)) else "a component")
             case _:
                 self.fail("unknown type node")
+        if self.sizes:
+            self.sized(ty)
         return C.ANY
+
+    def sized(self, ty: C.Type) -> None:
+        """TY-SIZE-LIMIT: a closed type's size is below 2^64, the target's address space. A type that
+        mentions a parameter is checked at each instantiation: where it is written closed, and in the
+        backend's specializations."""
+        if self.types.closed(ty) and self.types.layout(ty) is None:
+            self.fail(f"{show(ty)} is too large: its size is not below 2^64 bytes")
 
     def within(self, binders: tuple[str, ...], check: Callable[[], object]) -> None:
         """Run `check` with `binders` opened."""
@@ -276,6 +286,8 @@ class Formation:
 
     def declarations(self) -> None:
         env: dict[str, C.Kind] = {"static": C.BRAND}
+        # A size unfolds other declarations, so the closed parts of each are sized once all are formed.
+        self.sizes = False
         for decl in self.program.types.values():
             self.module, self.premises, self.declaration = decl.module, decl.premises, decl.name
             scope = self.extend(env, decl.params)
@@ -284,6 +296,12 @@ class Formation:
                     self.fail("Sized is not a premise of a type declaration")
                 self.premise(p, scope)
             self.fits(decl.body, C.ANY, scope)
+        self.sizes = True
+        for decl in self.program.types.values():
+            self.declaration = decl.name
+            for part in (decl.body, *(arg for p in decl.premises for arg in p.args)):
+                for t in walk(part):
+                    self.sized(t)
         self.declaration = None
         for decl in self.program.types.values():
             self.unmarked(decl)

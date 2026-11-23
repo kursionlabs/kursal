@@ -27,7 +27,7 @@ use package::backend::mangle::{decode_segment, encode, mangle, path_segments, si
 use package::kurs::sexpr::Form;
 use package::syntax::ast::{Pos, no_pos};
 use package::types::termination::check_mono_termination;
-use package::types::ops::{Fresh, Row, Types, alpha_hashes, equal, kurs_error, map_children, mapped_component, mapped_operand, subst};
+use package::types::ops::{Fresh, Row, Types, alpha_hashes, equal, kurs_error, map_children, mapped_component, mapped_operand, show, subst, walk};
 use std::option::Option;
 use std::slice::Slice;
 use std::time::Instant;
@@ -2636,9 +2636,28 @@ impl Backend['k] {
             Option::None => (),
         }
         let before = self.counter.next.copy(&cx);
-        let out = subst(&cx, ty, self.sub.copy(&cx), self.counter);
+        let sub = self.sub.copy(&cx);
+        let out = subst(&cx, ty, sub, self.counter);
         if self.counter.next.copy(&cx) == before {
             done.insert(&cx, ty, out);
+        }
+        // A type that mentions a parameter is checked again here, at each instantiation, for its size
+        // (TY-SIZE-LIMIT), as formation checks a closed one.
+        if !sub.is_empty(&cx) {
+            let parts = walk(&cx, out);
+            var i = 0usize;
+            while i < parts.len(&cx) {
+                let part = parts.at(&cx, i);
+                if self.types.closed(&cx, part) && self.types.layout(&cx, part).is_none() {
+                    let owner = match self.fun.copy(&cx) {
+                        Option::Some(fun) => fun.name,
+                        Option::None => Span::from_static(&cx, ""),
+                    };
+                    fail_text(&cx, Buffer!::new().push_static("backend: ").push_bytes(&cx, show(&cx, part))
+                        .push_static(" is too large: its size is not below 2^64 bytes, in a specialization of ").push_bytes(&cx, owner).save(&cx));
+                }
+                i = i + 1usize;
+            }
         }
         out
     }

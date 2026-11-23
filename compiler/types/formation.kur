@@ -13,7 +13,7 @@ use package::kurs::core::{Block, Edge, Fun, Kind, ModuleId, Param, Premise, Prog
 use package::kurs::core as C;
 use package::resolve::resolver::Resolver;
 use package::syntax::ast::{Pos, no_pos};
-use package::types::ops::{POINTER_TO_SUM, Fresh, Types, children, equal, free_brands, free_names, kind_name, kurs_error, subst};
+use package::types::ops::{POINTER_TO_SUM, Fresh, Types, children, equal, free_brands, free_names, kind_name, kurs_error, show, subst, walk, walk_into};
 use std::option::Option;
 use std::slice::Slice;
 
@@ -117,6 +117,8 @@ exposed struct Formation {
     reporter: Ref[Option[Resolver['k]], 'k],
     // the type declaration being formed: it has no position of its own, so its name says where
     declaration: Ref[Option[Span['k]], 'k],
+    // off while the declarations are being formed (`declarations`)
+    sizes: Ref[bool, 'k],
 }
 
 forall 'k.
@@ -156,6 +158,7 @@ impl Formation[D, 'k] {
             opened: ArenaVec::new(&cx),
             reporter: Ref::new(&cx, Option::None),
             declaration: Ref::new(&cx, Option::None),
+            sizes: Ref::new(&cx, true),
         }
     }
 
@@ -359,7 +362,19 @@ impl Formation[D, 'k] {
             Type::Never => self.children_fit(&cx, ty, env, "a component"),
             _ => self.fail_static(&cx, "unknown type node"),
         }
+        if self.sizes.copy(&cx) {
+            self.sized(&cx, ty);
+        }
         Kind::Any
+    }
+
+    // TY-SIZE-LIMIT: a closed type's size is below 2^64, the target's address space. A type that
+    // mentions a parameter is checked at each instantiation: where it is written closed, and in the
+    // backend's specializations.
+    fn sized(self, &cx: Domain!['k], ty: Type['k]) {
+        if self.types.closed(&cx, ty) && self.types.layout(&cx, ty).is_none() {
+            self.fail(&cx, Buffer!::new().push_bytes(&cx, show(&cx, ty)).push_static(" is too large: its size is not below 2^64 bytes").save(&cx));
+        }
     }
 
     fn components(self, &cx: Domain!['k], ty: Type['k], members: ArenaVec[C::Member['k], 'k], env: ArenaMap[Span['k], Kind, 'k]) {
@@ -661,6 +676,8 @@ impl Formation[D, 'k] {
     fn declarations(self, &cx: Domain!['k]) {
         let env = with_kind(&cx, ArenaMap::new(&cx), Span::from_static(&cx, "static"), Kind::Brand);
         let decls = self.program.types.values(&cx);
+        // A size unfolds other declarations, so the closed parts of each are sized once all are formed.
+        self.sizes.set(&cx, false);
         var i = 0usize;
         while i < decls.len(&cx) {
             let decl = decls.at(&cx, i);
@@ -678,6 +695,29 @@ impl Formation[D, 'k] {
             }
             self.fits(&cx, decl.body, Kind::Any, scope);
             i = i + 1usize;
+        }
+        self.sizes.set(&cx, true);
+        var d = 0usize;
+        while d < decls.len(&cx) {
+            let decl = decls.at(&cx, d);
+            self.declaration.set(&cx, Option::Some.(decl.name));
+            let parts = walk(&cx, decl.body);
+            var p = 0usize;
+            while p < decl.premises.len(&cx) {
+                let args = decl.premises.at(&cx, p).args;
+                var a = 0usize;
+                while a < args.len(&cx) {
+                    walk_into(&cx, args.at(&cx, a), parts);
+                    a = a + 1usize;
+                }
+                p = p + 1usize;
+            }
+            var w = 0usize;
+            while w < parts.len(&cx) {
+                self.sized(&cx, parts.at(&cx, w));
+                w = w + 1usize;
+            }
+            d = d + 1usize;
         }
         self.declaration.set(&cx, Option::None);
         var u = 0usize;

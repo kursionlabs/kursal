@@ -59,6 +59,10 @@ LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
      "a zero-size type that holds a brand witness, a package or a linear value is not read or written"),
     ("forall 'k.\nfn f(p: *core::cap::Brand['k], b: core::cap::Brand['k]) { unsafe p.store_volatile(b); }\n",
      "a zero-size type that holds a brand witness, a package or a linear value is not read or written"),
+    # Every formed type is smaller than the address space, 2^64 bytes.
+    ("fn f() -> usize { core::mem::sizeof[[[u8; 9223372036854775808]; 2]]() }\n",
+     "is too large: its size is not below 2^64 bytes"),
+    ("fn f(p: *[[u8; 9223372036854775808]; 2]) -> u32 { 0u32 }\n", "is too large: its size is not below 2^64 bytes"),
     (TOKEN + "fn f() -> u32 { (Token!.{ n: 1u32 }, Token!.{ n: 2u32 }).0.n }\n", "linear sibling"),
     ("unsafe fn danger() -> u32 { 0u32 }\nfn f() -> u32 { danger() }\n", "calling an unsafe function"),
     ("fn take(&x: u32) -> u32 { x }\nfn f(p: *u32) -> u32 { take(&*p) }\n", "lending a raw pointer target"),

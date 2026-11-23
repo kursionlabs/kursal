@@ -18,6 +18,71 @@ use package::kurs::sexpr::located;
 use package::syntax::ast::{Pos, no_pos};
 use std::option::Option;
 
+// The target's pointer width in bytes, which the layout assumes: of a pointer, a function value,
+// `usize` and `isize` (TY-SIZE-LIMIT). Every formed type's size is below 2^64.
+const WORD: u64 = 8u64;
+
+// The size of a primitive, which is its alignment too.
+forall 'k.
+fn prim_size(&cx: Domain!['k], name: Span['k]) -> u64 {
+    if C::is_pointer_sized(&cx, name) {
+        WORD
+    } else if name.is(&cx, "bool") {
+        1u64
+    } else if name.is(&cx, "f32") {
+        4u64
+    } else if name.is(&cx, "f64") {
+        8u64
+    } else {
+        (C::integer_bits(&cx, name) / 8u32) as u64
+    }
+}
+
+// `offset` rounded up to a multiple of `align`, or none at 2^64 or more.
+fn round_up(offset: u64, align: u64) -> Option[u64] {
+    if offset > u64::MAX - (align - 1u64) {
+        Option::None
+    } else {
+        Option::Some.((offset + align - 1u64) / align * align)
+    }
+}
+
+// A C struct of the parts that are not zero-size, in order; none when a part has none, or the size is
+// 2^64 or more.
+forall 'k.
+fn product(&cx: Domain!['k], parts: ArenaVec[Option[(u64, u64)], 'k]) -> Option[(u64, u64)] {
+    var offset = 0u64;
+    var align = 1u64;
+    var i = 0usize;
+    while i < parts.len(&cx) {
+        match parts.at(&cx, i) {
+            Option::Some(part) => {
+                let (size, a) = part;
+                if size > 0u64 {
+                    match round_up(offset, a) {
+                        Option::Some(at) => {
+                            if at > u64::MAX - size {
+                                return Option::None;
+                            }
+                            offset = at + size;
+                        },
+                        Option::None => return Option::None,
+                    }
+                    if a > align {
+                        align = a;
+                    }
+                }
+            },
+            Option::None => return Option::None,
+        }
+        i = i + 1usize;
+    }
+    match round_up(offset, align) {
+        Option::Some(size) => Option::Some.((size, align)),
+        Option::None => Option::None,
+    }
+}
+
 // A pointer source points to a product, an array or a leaf; a pointer to a sum is opaque.
 const POINTER_TO_SUM: Slice[u8, 'static] = "a foreach source cannot be a pointer to a sum";
 
@@ -859,6 +924,8 @@ exposed struct Types {
     unfolded: ArenaMap[Type['k], Type['k], 'k],
     // the foreach types whose Copy query is active
     expanding: ArenaVec[Type['k], 'k],
+    // a closed type -> its size and alignment, none at 2^64 bytes or more
+    layouts: ArenaMap[Type['k], Option[(u64, u64)], 'k],
     counter: Fresh['k],
 }
 
@@ -872,7 +939,7 @@ fn name_order(&cx: Domain!['k], a: (Span['k], u32), b: (Span['k], u32)) -> Order
 forall 'k.
 impl Types['k] {
     fn new(&cx: Domain!['k], program: Program['k], counter: Fresh['k]) -> Types['k] {
-        Types.{ program, copy_cache: ArenaMap::new(&cx), unfolded: ArenaMap::new(&cx), expanding: ArenaVec::new(&cx), counter }
+        Types.{ program, copy_cache: ArenaMap::new(&cx), unfolded: ArenaMap::new(&cx), expanding: ArenaVec::new(&cx), layouts: ArenaMap::new(&cx), counter }
     }
 
     fn decl(self, &cx: Domain!['k], name: Span['k]) -> TypeDecl['k] {
@@ -956,6 +1023,120 @@ impl Types['k] {
             },
             Type::Array(elem, length) => length == 0u64 || self.erasable(&cx, elem.copy(&cx)),
             _ => false,
+        }
+    }
+
+    // `ty` mentions no type parameter or binder: every name it has is a declaration's. Brands do not
+    // change a layout.
+    fn closed(self, &cx: Domain!['k], ty: Type['k]) -> bool {
+        let brands = free_brands(&cx, ty);
+        let names = free_names(&cx, ty).keys(&cx);
+        var n = 0usize;
+        while n < names.len(&cx) {
+            let name = names.at(&cx, n);
+            if !brands.contains(&cx, name) && !self.program.types.contains(&cx, name) {
+                return false;
+            }
+            n = n + 1usize;
+        }
+        true
+    }
+
+    // The size and alignment of a closed type's value as the backend lays it out at the target's
+    // pointer width: a primitive its width, a pointer or a function value a word, a zero-size part
+    // erased, a product a C struct of the rest, and an enum a `uint32_t` tag and a union of its
+    // payloads, or its payload in the niche layout. None when the size is 2^64 or more: no formed type
+    // has one (TY-SIZE-LIMIT).
+    fn layout(self, &cx: Domain!['k], ty: Type['k]) -> Option[(u64, u64)] {
+        match self.layouts.get(&cx, ty) {
+            Option::Some(known) => return known,
+            Option::None => (),
+        }
+        let found = self.lay_out(&cx, ty);
+        self.layouts.insert(&cx, ty, found);
+        found
+    }
+
+    fn lay_out(self, &cx: Domain!['k], ty: Type['k]) -> Option[(u64, u64)] {
+        match ty {
+            Type::Prim(name) => {
+                let size = prim_size(&cx, name);
+                Option::Some.((size, size))
+            },
+            Type::Ptr(_inner) => Option::Some.((WORD, WORD)),
+            Type::NonNull(_inner) => Option::Some.((WORD, WORD)),
+            Type::Fn(_f) => Option::Some.((WORD, WORD)),
+            Type::Named(_name, _args) => self.layout(&cx, self.shape(&cx, ty, Option::None)),
+            Type::Foreach(_f) => self.layout(&cx, self.shape(&cx, ty, Option::None)),
+            Type::Exists(_binders, body) => self.layout(&cx, body.copy(&cx)),
+            Type::Array(elem, length) => {
+                if length == 0u64 {
+                    return Option::Some.((0u64, 1u64));
+                }
+                match self.layout(&cx, elem.copy(&cx)) {
+                    Option::Some(part) => {
+                        let (size, align) = part;
+                        if size != 0u64 && length > u64::MAX / size {
+                            Option::None
+                        } else {
+                            Option::Some.((size * length, align))
+                        }
+                    },
+                    Option::None => Option::None,
+                }
+            },
+            Type::Tuple(elems) => {
+                let parts: ArenaVec[Option[(u64, u64)], 'k] = ArenaVec::new(&cx);
+                var i = 0usize;
+                while i < elems.len(&cx) {
+                    parts.push(&cx, self.layout(&cx, elems.at(&cx, i)));
+                    i = i + 1usize;
+                }
+                product(&cx, parts)
+            },
+            Type::Struct(fields) => {
+                let parts: ArenaVec[Option[(u64, u64)], 'k] = ArenaVec::new(&cx);
+                var i = 0usize;
+                while i < fields.len(&cx) {
+                    parts.push(&cx, self.layout(&cx, fields.at(&cx, i).type));
+                    i = i + 1usize;
+                }
+                product(&cx, parts)
+            },
+            Type::Enum(variants) => {
+                match self.niche_variant(&cx, variants) {
+                    Option::Some(held) => return self.layout(&cx, variants.at(&cx, held).type),
+                    Option::None => (),
+                }
+                // A union of the payloads that are not zero-size: as big as the biggest, rounded up to
+                // the strictest alignment.
+                var size = 0u64;
+                var align = 1u64;
+                var i = 0usize;
+                while i < variants.len(&cx) {
+                    match self.layout(&cx, variants.at(&cx, i).type) {
+                        Option::Some(part) => {
+                            let (s, a) = part;
+                            if s > 0u64 {
+                                if s > size {
+                                    size = s;
+                                }
+                                if a > align {
+                                    align = a;
+                                }
+                            }
+                        },
+                        Option::None => return Option::None,
+                    }
+                    i = i + 1usize;
+                }
+                match round_up(size, align) {
+                    Option::Some(union) => product(&cx, ArenaVec::two(&cx, Option::Some.((4u64, 4u64)), Option::Some.((union, align)))),
+                    Option::None => Option::None,
+                }
+            },
+            // a brand witness or Never
+            _ => Option::Some.((0u64, 1u64)),
         }
     }
 

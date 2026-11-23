@@ -7,7 +7,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Set
 from itertools import count
 from typing import Optional
 
-from .core import (COPY, Array, Brand, Enum, Exists, Fn, Foreach, Named, Never, NonNull, Prim,
+from .core import (COPY, WIDTHS, Array, Brand, Enum, Exists, Fn, Foreach, Named, Never, NonNull, Prim,
                    Ptr, Kind, ModuleId, Premise, Program, Skolem, Struct, Tuple, Type, TypeDecl)
 from .sexpr import KursError, Position
 
@@ -17,6 +17,13 @@ type AlphaEnv = tuple[dict[str, object], dict[str, object]]
 type ForeachRow = tuple[str, Type]
 type Skeleton = Struct | Enum | Tuple | Array
 
+# The target's pointer width in bytes, which the layout assumes: of a pointer, a function value, `usize` and
+# `isize` (TY-SIZE-LIMIT). Every formed type's size is below 2^64.
+WORD = 8
+SIZE_LIMIT = 1 << (8 * WORD)
+PRIM_SIZES = {**{name: bits // 8 for name, bits in WIDTHS.items()}, "usize": WORD, "isize": WORD,
+              "f32": 4, "f64": 8, "bool": 1}
+
 # A pointer source points to a product, an array or a leaf; a pointer to a sum is opaque.
 POINTER_TO_SUM = "a foreach source cannot be a pointer to a sum"
 
@@ -25,6 +32,23 @@ _fresh = count()
 
 def fresh(label: str) -> str:
     return f"{label.split('#')[0]}#{next(_fresh)}"
+
+
+def _round_up(offset: int, align: int) -> int:
+    return (offset + align - 1) // align * align
+
+
+def _fitted(size: int, align: int) -> Optional[tuple[int, int]]:
+    return (size, align) if size < SIZE_LIMIT else None
+
+
+def _union(parts: list[tuple[int, int]]) -> tuple[int, int]:
+    """A C union of parts that are not zero-size: as big as the biggest, rounded up to the strictest
+    alignment; (0, 1), erased, for none."""
+    if not parts:
+        return 0, 1
+    align = max(a for _, a in parts)
+    return _round_up(max(s for s, _ in parts), align), align
 
 
 def map_children(ty: Type, transform: Callable[[Type], Type]) -> Type:
@@ -241,6 +265,7 @@ class Types:
         self.program = program
         self._copy: dict[tuple[Type, tuple[tuple[str, Kind], ...]], bool] = {}
         self._expanding: list[Foreach] = []  # the foreach types whose Copy query is active
+        self._layout: dict[Type, Optional[tuple[int, int]]] = {}
 
     def decl(self, name: str) -> TypeDecl:
         decl = self.program.types.get(name)
@@ -266,6 +291,65 @@ class Types:
             case Exists(body=body):
                 return self.zero_size(body)
         return False
+
+    def closed(self, ty: Type) -> bool:
+        """`ty` mentions no type parameter or binder: every name it has is a declaration's. Brands do not
+        change a layout."""
+        return all(name in self.program.types for name in free_names(ty) - free_brands(ty))
+
+    def layout(self, ty: Type) -> Optional[tuple[int, int]]:
+        """The size and alignment of a closed type's value as the backend lays it out at the target's
+        pointer width: a primitive its width, a pointer or a function value a word, a zero-size part
+        erased, a product a C struct of the rest, and an enum a `uint32_t` tag and a union of its payloads,
+        or its payload in the niche layout. None when the size is 2^64 or more: no formed type has one
+        (TY-SIZE-LIMIT)."""
+        if ty not in self._layout:
+            self._layout[ty] = self._lay_out(ty)
+        return self._layout[ty]
+
+    def _lay_out(self, ty: Type) -> Optional[tuple[int, int]]:
+        match ty:
+            case Prim(name=name):
+                return PRIM_SIZES[name], PRIM_SIZES[name]
+            case Ptr() | NonNull() | Fn():
+                return WORD, WORD
+            case Named() | Foreach():
+                return self.layout(self.shape(ty))
+            case Exists(body=body):
+                return self.layout(body)
+            case Array(elem=elem, length=length):
+                if length == 0:
+                    return 0, 1
+                part = self.layout(elem)
+                return None if part is None else _fitted(part[0] * length, part[1])
+            case Tuple(elems=elems):
+                return self._product([self.layout(t) for t in elems])
+            case Struct(fields=fields):
+                return self._product([self.layout(t) for _, t in fields])
+            case Enum(variants=variants):
+                held = self.niche_variant(variants)
+                if held is not None:
+                    return self.layout(variants[held][1])
+                payloads = [self.layout(t) for _, t in variants]
+                if any(p is None for p in payloads):
+                    return None
+                material = [p for p in payloads if p is not None and p[0] > 0]
+                union = _union(material)
+                return self._product([(4, 4), union])
+        return 0, 1   # a brand witness or Never
+
+    @staticmethod
+    def _product(parts: list[Optional[tuple[int, int]]]) -> Optional[tuple[int, int]]:
+        """A C struct of the parts that are not zero-size, in order."""
+        offset, align = 0, 1
+        for part in parts:
+            if part is None:
+                return None
+            size, part_align = part
+            if size > 0:
+                offset = _round_up(offset, part_align) + size
+                align = max(align, part_align)
+        return _fitted(_round_up(offset, align), align)
 
     def erasable(self, ty: Type) -> bool:
         """`ty` has an erased value (MEM-ZERO-SIZE), which a load of a zero-size type yields and a store

@@ -201,6 +201,7 @@ REJECTED = {
     "ref_after_remove_in.kur": "17:28: brand mismatch: 'b and 'a; 'b was opened at 15:5, 'a at 13:5$",
     "release_linear.kur": "14:25: type argument must satisfy Copy$",
     "safe_adopt.kur": "calling an unsafe function requires unsafe authorization",
+    "too_large_type.kur": "is too large: its size is not below 2\\^64 bytes in type too_large_type::Huge$",
     "type_mismatch.kur": "type mismatch: bool and u32",
     "unbound_result_brand.kur": "brand '1 is not in scope",
     "while_consume_without_replacement.kur": "linear value 'h' remains live on some paths to while",

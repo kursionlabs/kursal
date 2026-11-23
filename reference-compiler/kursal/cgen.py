@@ -33,7 +33,7 @@ from .core import (ATOMIC_OPS, FLOATS, INTEGERS, POINTER_SIZED, UNIT, WIDTHS, Ar
                    Tuple, Unreachable, Type, Program, Fun, Data, Instr, Edge, Terminator)
 from .check import Checker, overlap, prefix
 from .sexpr import Form, KursError, List, Str
-from .types import ForeachRow, Types, equal, map_children, mapped_component, mapped_operand, subst
+from .types import ForeachRow, Types, equal, map_children, mapped_component, mapped_operand, show, subst, walk
 from .termination import check_mono_termination
 from .mangle import encode, mangle, path_segments, signature_key, type_key, unbranded
 from .plan import PURE, Adapter, Plan, instr_reads, root, term_edges, term_reads
@@ -163,6 +163,7 @@ class Backend:
         self.types = Types(program)
         self.names: dict[Type, str] = {}        # representation key -> C type name
         self.represented: dict[Type, Type] = {}   # an enum in the niche layout -> its payload's key
+        self.sized: set[Type] = set()   # the instantiated types whose size is checked
         self.pending: dict[Type, Tuple | Struct | Array | Enum] = {}      # named but not yet defined aggregates
         self.forward: list[str] = []
         self.defs: list[str] = []
@@ -938,7 +939,16 @@ class Backend:
         return f"{'_Noreturn ' if noreturn else ''}static {ret} {symbol}({', '.join(params) or 'void'})"
 
     def substitute_type(self, ty: Type) -> Type:
-        return subst(ty, self.sub)
+        """`ty` at the specialization's type arguments. A type that mentions a parameter is checked again
+        here, at each instantiation, for its size (TY-SIZE-LIMIT), as formation checks a closed one."""
+        out = subst(ty, self.sub)
+        if self.sub and out not in self.sized:
+            self.sized.add(out)
+            for part in walk(out):
+                if self.types.closed(part) and self.types.layout(part) is None:
+                    raise KursError(f"backend: {show(part)} is too large: its size is not below 2^64 bytes, "
+                                    f"in a specialization of {self.fun.name}")
+        return out
 
     def cname(self, label: str, name: str) -> str:
         key = (label, name)

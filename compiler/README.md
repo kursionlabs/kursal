@@ -729,6 +729,20 @@ is right on a 32-bit and on a 64-bit target. The compiler never assumes their wi
 The size estimate that passes aggregates by pointer (`words`) counts every scalar, `usize`
 included, as one word on every target.
 
+**The size limit is the one place a width is assumed.** A type is formed only if its size is
+below 2^64 bytes, the address space of a 64-bit target (TY-SIZE-LIMIT), so `sizeof` of any formed
+type is a `usize`. The size is the one the backend's C has (`Types.layout`, `Types::layout`): a
+primitive its width, a pointer, a function value, `usize` and `isize` 8 bytes, zero-size parts
+erased, a product a C struct of the rest with C's padding, an array its element's size times its
+length, and an enum a `uint32_t` tag beside a union of its payloads, or its payload in the niche
+layout. Formation checks every closed type where it is written, declarations' closed parts once all
+declarations are formed (`type formation: (array (array u8 9223372036854775808) 2) is too large:
+its size is not below 2^64 bytes`), and the backend checks every type of a specialization again at
+its type arguments (`backend: ... is too large: its size is not below 2^64 bytes, in a
+specialization of g`), as a type that mentions a parameter may be small at one instantiation and
+too large at another. A 32-bit target would need the limit at 2^32; the compiler checks the 64-bit
+one only.
+
 ### Number conversions
 
 `x as T` between two number types converts the value, and is safe: it is defined for every value.

@@ -7,7 +7,8 @@ from kursal import core as C
 from kursal.cc import FLAGS, c_compiler
 from kursal.cgen import emit_c
 from kursal.check import check_program
-from kursal.kurs import parse_program
+from kursal.kurs import parse_program, parse_type
+from kursal.sexpr import read
 from kursal.sexpr import KursError
 from kursal.resolve import resolve
 from kursal.sigs import signatures
@@ -146,3 +147,51 @@ class LayoutTests(unittest.TestCase):
                 root = tree({"p/kur.toml": manifest("p"), "p/lib.kur": source})
                 with self.assertRaisesRegex(KursError, error):
                     signatures(resolve(root / "p"))
+
+
+class SizeLimitTests(unittest.TestCase):
+    """TY-SIZE-LIMIT: every formed type is smaller than the 64-bit address space, 2^64 bytes, as the
+    backend lays it out: zero-size parts erased, C's padding, a `uint32_t` tag beside a union."""
+
+    def test_the_size_of_a_layout(self):
+        types = Types(parse_program("""
+            (type Opt (enum (none (tuple)) (some (non_null u8))))
+            (type E (enum (a u8) (b (tuple u16 u8)) (c (tuple))))"""))
+        for written, layout in (("u8", (1, 1)), ("(tuple u8 u64 u8)", (24, 8)), ("(tuple (brand $static) u16)", (2, 2)),
+                                ("(array (tuple u32 u8) 3)", (24, 4)), ("Opt", (8, 8)), ("E", (8, 4)),
+                                ("(enum (a (tuple)))", (4, 4)), ("(array u64 0)", (0, 1))):
+            with self.subTest(type=written):
+                self.assertEqual(types.layout(parse_type(read(written)[0])), layout)
+
+    def test_a_type_of_2_to_the_64_bytes_or_more_is_not_formed(self):
+        for name, written in {
+            "a nested array": "(array (array u8 9223372036854775808) 2)",
+            "padding": "(tuple u8 (array u64 2305843009213693951))",
+            "a tag": "(enum (a (array u8 18446744073709551615)) (b u8))",
+            "a pointee": "(ptr (array (array u8 9223372036854775808) 2))",
+        }.items():
+            with self.subTest(case=name), self.assertRaisesRegex(
+                    KursError, "type formation: .* is too large: its size is not below 2\\^64 bytes$"):
+                check_program(parse_program(f"(fun f usize () (entry () (= %n (sizeof {written})) (ret %n)))"))
+        with self.assertRaisesRegex(KursError, "too large: its size is not below 2\\^64 bytes in type Big$"):
+            check_program(parse_program(
+                "(type Big (struct (a (array u8 9223372036854775808)) (b (array u8 9223372036854775808))))"))
+
+    def test_a_type_just_below_the_limit_is_formed(self):
+        check_program(parse_program("""
+            (type Half (struct (a (array u8 9223372036854775808))))
+            (fun f usize () (entry ()
+              (= %a (sizeof (array (array u8 9223372036854775808) 1)))
+              (= %b (sizeof (tuple (array u64 2305843009213693951))))
+              (= %c (sizeof (ptr (array Half 1))))
+              (ret %a)))"""))
+
+    def test_a_specialization_is_sized_at_its_type_arguments(self):
+        program = parse_program("""
+            (fun g (forall (T) () usize () (entry () (= %n (sizeof (tuple T T))) (ret %n))))
+            (fun main i32 () (entry ()
+              (= %n (call (g (array u8 9223372036854775808)))) (= %r (const i32 0)) (ret %r)))""")
+        checked = check_program(program)
+        with self.assertRaisesRegex(KursError, "backend: .* is too large: its size is not below 2\\^64 bytes, "
+                                               "in a specialization of g$"):
+            emit_c(program, checked, "main")
