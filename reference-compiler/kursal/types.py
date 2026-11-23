@@ -105,6 +105,25 @@ def subst(ty: Type, sub: Substitution) -> Type:
     return map_children(ty, lambda child: subst(child, sub))
 
 
+def apart(ty: Type, scope: Set[str]) -> Type:
+    """`ty` with each package binder that would shadow a brand of `scope` or of an enclosing package
+    (TY-EXISTS-FORM.scope) renamed `b#n`, a spelling no written brand has: a type the compiler writes
+    may come from a declaration whose binders are spelled as a brand where it is written."""
+    match ty:
+        case Exists(binders=binders, body=body):
+            taken = set(scope) | set(binders)
+            spelled = []
+            for b in binders:
+                n = 0
+                while b in scope and f"{b.split('#')[0]}#{n}" in taken:
+                    n += 1
+                spelled.append(f"{b.split('#')[0]}#{n}" if b in scope else b)
+                taken.add(spelled[-1])
+            renamed: Substitution = {b: Skolem(new) for b, new in zip(binders, spelled) if b != new}
+            return Exists(tuple(spelled), apart(subst(body, renamed), taken))
+    return map_children(ty, lambda child: apart(child, scope))
+
+
 def foreach_item(ty: Foreach) -> Type:
     """The mapper's input where the operand is the source: the binder, or a pointer to it."""
     return Ptr(Named(ty.binder)) if ty.indirect else Named(ty.binder)

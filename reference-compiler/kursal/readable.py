@@ -8,7 +8,6 @@ from typing import Optional
 
 from . import core as C
 from .sexpr import Form, List, Str
-from .types import subst
 
 
 def brand(name: str) -> str:
@@ -85,9 +84,7 @@ def instruction_text(instr: C.Instr, depth: int, omit_unit: bool = False) -> str
         binding = "" if omit_unit and args[0].startswith("&") else lhs + " = "
         return prefix + "exists " + ", ".join(map(brand, instr.binders)) + ". " + binding + "open " + args[0] + ";"
     if op == "pack":
-        assert isinstance(instr.ty, C.Exists)
-        payload = subst(instr.ty.body, dict(zip(instr.ty.binders, instr.tys)))
-        rhs = "pack " + ", ".join(type_text(witness) for witness in instr.tys) + ". " + args[0] + " as " + type_text(payload, depth)
+        rhs = "pack " + ", ".join(type_text(witness) for witness in instr.tys) + ". " + args[0] + " as " + ty
     elif op in ("call", "fn"):
         rhs = op + " " + args[0] + arguments(instr.tys, depth)
         if op == "call":

@@ -74,7 +74,9 @@ has. Every minting entry point (`core::cap::Exclusive!::fresh`,
 `alloc::owned::Allocation!::adopt` and `adopt_value`, `Vec!::new`, `HashMap!::new`,
 `Arena!::new`, `Buffer!::open`, ...) mints its brand internally and returns
 it **sealed** in an `exists`, so the brand is fresh per call and no caller
-can name it in advance. Forging a second capability for a live brand is not
+can name it in advance. Opening the package (`let exists 'k. ...`) names
+it with a brand that is not already in scope, so the fresh brand never
+reads as one the caller held. Forging a second capability for a live brand is not
 caught but **unspellable**: no function accepts the brand that such a forgery
 would need to pass.
 

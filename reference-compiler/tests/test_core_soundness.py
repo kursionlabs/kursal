@@ -253,14 +253,31 @@ REJECTED = {
         (fun f u32 (Pk) (entry ((&k Pk)) (= %o (open &k.pkg ($o))) (= %r (call g &k))
           (= %c (pack (exists ($h) (tuple u32 (brand $h))) $o &k.pkg)) (ret %r)))"""),
 
-    # A package's binder is its own brand, never a free brand it shares a name with: packing 'q as $p0
-    # does not also hide the function's 'p0.
+    # A package's binder is its own brand, never a free brand: packing 'q as $r hides 'q only, so the
+    # function's 'p0 is not the binder's.
     "pack_binder_is_not_a_free_brand": ("packing", """
         (fun f (forall ($p0 $q) () u32 ((brand $p0) (brand $q))
           (entry ((%a (brand $p0)) (%b (brand $q)))
             (= %v (construct (tuple (brand $q) (brand $p0)) %b %a))
-            (= %k (pack (exists ($p0) (tuple (brand $p0) (brand $p0))) ($q) %v))
+            (= %k (pack (exists ($r) (tuple (brand $r) (brand $r))) ($q) %v))
             (= %r (const u32 0)) (ret %r))))"""),
+
+    # A package's binders are distinct and shadow no brand in scope where the type is written: not
+    # 'static, a brand parameter, a brand a block opened, or an enclosing package's binder.
+    "exists_binder_shadows_function_brand": ("an existential brand binder shadows a brand in scope", """
+        (fun f (forall ($k) () u32 ((brand $k))
+          (entry ((%a (brand $k)))
+            (= %p (pack (exists ($k) (brand $k)) ($k) %a))
+            (= %r (const u32 0)) (ret %r))))"""),
+    "exists_binder_shadows_opened_brand": ("an existential brand binder shadows a brand in scope", """
+        (fun f u32 ()
+          (entry () (= %f (fresh)) (= %w (open %f ($a)))
+            (= %p (pack (exists ($a) (brand $a)) ($a) %w))
+            (= %r (const u32 0)) (ret %r)))"""),
+    "exists_binder_shadows_enclosing_binder": ("an existential brand binder shadows a brand in scope",
+        "(type E (exists ($k) (tuple (brand $k) (exists ($k) (brand $k)))))"),
+    "exists_binder_repeats": ("duplicate parameter", "(type E (exists ($k $k) (brand $k)))"),
+    "exists_binder_static": ("static is not a parameter name", "(type E (exists ($static) (brand $static)))"),
 
     # `fn` names every brand of its function, each in scope where the value is made.
     "function_value_unnamed_brand": ("_ is not a type", """

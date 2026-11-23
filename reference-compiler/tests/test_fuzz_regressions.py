@@ -118,9 +118,11 @@ REJECTED = (
     (BRANDS + "forall 'p0, 'z. fn f(w: core::cap::Brand['p0], wz: core::cap::Brand['z]) -> u32 {\n"
      "    let pk = pack 'z. (wz, wz); let exists 'r. (u, v) = pk; let y = second(pk); same(y, w) }\n",
      r"type mismatch: exists 'p0\. \(Brand['p0], Brand['p0]\) and exists 'b\."),
-    (BRANDS + "forall 'b, 'z. fn f(wb: core::cap::Brand['b], wz: core::cap::Brand['z]) -> u32 {\n"
-     "    let pk: exists 'b. (core::cap::Brand['b], core::cap::Brand['b]) = pack 'z. (wz, wz);\n"
-     "    let y = second(pk); same(y, wb) }\n",
+    # The same where the package's binder is spelled as the function's brand: `twin`'s 'b is not `f`'s.
+    (BRANDS + "forall 'z. fn twin(wz: core::cap::Brand['z]) -> exists 'b. (core::cap::Brand['b], core::cap::Brand['b]) {\n"
+     "    pack 'z. (wz, wz) }\n"
+     "forall 'b, 'z. fn f(wb: core::cap::Brand['b], wz: core::cap::Brand['z]) -> u32 {\n"
+     "    let pk = twin(wz); let y = second(pk); same(y, wb) }\n",
      "type mismatch"),
 )
 
@@ -155,8 +157,14 @@ ACCEPTED = (
     BRANDS + "forall 'p0, 'z. fn f(w: core::cap::Brand['p0], wz: core::cap::Brand['z]) -> u32 {\n"
     "    let pk = pack 'z. (wz, w); let exists 'r. (u, v) = pk; let y = second(pk); same(y, w) }\n",
     BRANDS + "forall 'p0. fn f(w: core::cap::Brand['p0]) -> u32 {\n"
-    "    let pk: exists 'p0. (core::cap::Brand['p0], core::cap::Brand['p0]) = pack 'p0. (w, w);\n"
-    "    let exists 'p0. (x, y) = pk; same(x, y) }\n",
+    "    let pk: exists 'q. (core::cap::Brand['q], core::cap::Brand['q]) = pack 'p0. (w, w);\n"
+    "    let exists 'r. (x, y) = pk; same(x, y) }\n",
+    # A package whose binder is spelled as the function's brand, from a signature written elsewhere.
+    BRANDS + "forall 'z. fn twin(wz: core::cap::Brand['z]) -> exists 'b. (core::cap::Brand['b], core::cap::Brand['b]) {\n"
+    "    pack 'z. (wz, wz) }\n"
+    "forall T. fn id(x: T) -> T { x }\n"
+    "forall 'b, 'z. fn f(wb: core::cap::Brand['b], wz: core::cap::Brand['z]) -> u32 {\n"
+    "    let pk = id(twin(wz)); let exists 'r. (x, y) = pk; same(x, y) }\n",
 )
 
 

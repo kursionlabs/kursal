@@ -176,7 +176,6 @@ class Level:
     """A lexical scope: the names bound in it, and the brands a `let exists` opened in it."""
     names: dict[str, Local] = field(default_factory=dict)
     brands: dict[str, str] = field(default_factory=dict)  # source spelling -> unique witness
-    opened: set[str] = field(default_factory=set)  # includes witnesses whose spelling was shadowed
 
 
 @dataclass(frozen=True)
@@ -487,7 +486,7 @@ class Infer:
     def check_brand_scope(self, ty: C.Type, pos: Optional[Position]) -> None:
         # Check after solving: an outer metavariable may acquire a local brand later.
         allowed = {p.name for p in self.sig.params if p.kind == C.BRAND} | {"static"}
-        allowed.update(label for level in self.scopes for label in level.opened)
+        allowed.update(label for level in self.scopes for label in level.brands.values())
         self.brand_checks.append((ty, allowed, pos))
 
     def type(self, type_expr: S.Type) -> C.Type:
@@ -555,11 +554,14 @@ class Infer:
         names = tuple(b[1:] for b in stmt.brands)
         if len(set(names)) != len(names):
             fail("an existential opening repeats a brand name", stmt.pos)
+        in_scope = {p.name for p in self.sig.params if p.kind == C.BRAND} | {"static"} | set(self.brand_sub())
+        for name in names:
+            if name in in_scope:
+                fail(f"let exists '{name} reuses a brand already in scope", stmt.pos)
         labels = stmt.opened_brands = tuple(f"{name}#open{next(_ids)}" for name in names)
         if stmt.pos is not None:
             self.origins.update((label, stmt.pos) for label in labels)
         self.scopes[-1].brands.update(zip(names, labels))
-        self.scopes[-1].opened.update(labels)
         payload = subst(package.body, {b: C.Skolem(l) for b, l in zip(package.binders, labels)})
         if stmt.type is not None:
             self.unify(payload, self.type(stmt.type), stmt.pos)

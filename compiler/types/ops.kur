@@ -330,6 +330,43 @@ fn subst(&cx: Domain!['k], ty: Type['k], sub: ArenaMap[Span['k], Type['k], 'k], 
     }
 }
 
+// `ty` with each package binder that would shadow a brand of `scope` or of an enclosing package
+// (TY-EXISTS-FORM.scope) renamed `b#n`, a spelling no written brand has: a type the compiler writes
+// may come from a declaration whose binders are spelled as a brand where it is written.
+forall 'k.
+fn apart(&cx: Domain!['k], ty: Type['k], scope: ArenaSet[Span['k], 'k], counter: Fresh['k]) -> Type['k] {
+    match ty {
+        Exists(binders, body) => {
+            let taken = with_names(&cx, scope, binders);
+            let spelled: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+            let renamed: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+            var i = 0usize;
+            while i < binders.len(&cx) {
+                let b = binders.at(&cx, i);
+                var name = b;
+                if scope.contains(&cx, b) {
+                    let stem = match b.find(&cx, Span::from_static(&cx, "#"), 0usize) {
+                        Some(at) => b.slice(0usize, at),
+                        None => b,
+                    };
+                    var n = 0u64;
+                    name = Buffer!::new().push_bytes(&cx, stem).push_static("#").push_u64(n).save(&cx);
+                    while taken.contains(&cx, name) {
+                        n = n + 1u64;
+                        name = Buffer!::new().push_bytes(&cx, stem).push_static("#").push_u64(n).save(&cx);
+                    }
+                    renamed.insert(&cx, b, Type::Skolem.(name));
+                }
+                spelled.push(&cx, name);
+                taken.insert(&cx, name);
+                i = i + 1usize;
+            }
+            Type::Exists.(spelled, Ref::new(&cx, apart(&cx, subst(&cx, body.copy(&cx), renamed, counter), taken, counter)))
+        },
+        _ => map_children(&cx, ty, |&cx, child: Type['k]| apart(&cx, child, scope, counter)),
+    }
+}
+
 // The mapper's input where the operand is the source: the binder, or a pointer to it.
 forall 'k.
 fn foreach_item(&cx: Domain!['k], ty: ForeachType['k]) -> Type['k] {

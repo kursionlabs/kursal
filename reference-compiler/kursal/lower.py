@@ -35,7 +35,7 @@ from .infer import (POINTER_OPS, BuiltinCall, ClosureCall, FnCall, FStringWrite,
 from .sexpr import KursError, List, Position, Str
 from .sigs import OPERATORS, ConstValue, OpConst, Sig, Signatures
 from .resolve import Resolver
-from .types import brand_name, equal, foreach_item, mapped_component, mapped_operand, Surface, Types, free_brands, subst
+from .types import apart, brand_name, equal, foreach_item, mapped_component, mapped_operand, Surface, Types, free_brands, subst
 
 ORDERINGS = {"Relaxed": "relaxed", "Acquire": "acquire", "Release": "release", "AcqRel": "acq_rel",
              "SeqCst": "seq_cst"}
@@ -76,6 +76,22 @@ class BlockB:
         self.label, self.params, self.brands = label, list(params), tuple(brands)
         self.instrs: list[C.Instr] = []
         self.term: Optional[C.Terminator] = None
+
+
+def set_apart(fun: C.Fun, outer: tuple[C.Param, ...]) -> None:
+    """Rename each package binder of a type `fun` writes that would shadow a brand of `fun` (`apart`)."""
+    scope = ({"static"} | {p.name for p in outer + fun.params if p.kind == C.BRAND}
+             | {b for block in fun.blocks for b in block.brands}
+             | {b for block in fun.blocks for i in block.instrs for b in i.binders})
+    fun.ptypes, fun.ret = tuple(apart(t, scope) for t in fun.ptypes), apart(fun.ret, scope)
+    fun.locals = tuple((name, apart(t, scope)) for name, t in fun.locals)
+    for block in fun.blocks:
+        block.params = tuple((name, apart(t, scope)) for name, t in block.params)
+        for i in block.instrs:
+            i.ty = None if i.ty is None else apart(i.ty, scope)
+            i.tys = tuple(apart(t, scope) for t in i.tys)
+        if isinstance(block.term, C.Switch):
+            block.term.ty = apart(block.term.ty, scope)
 
 
 class Lowering:
@@ -135,7 +151,9 @@ class Lowering:
                                              self.value_types.pop(id(fun), {}))
                     for helper in helpers:
                         program.funs[helper.name] = helper
+                        set_apart(helper, ())
                         flow.formation.function(helper)
+                    set_apart(fun, instance.params if instance else ())
                     flow.formation.function(fun, instance.params if instance else (),
                                             instance.premises if instance else ())
                 except KursError as error:

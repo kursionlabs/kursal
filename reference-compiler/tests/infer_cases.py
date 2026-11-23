@@ -97,8 +97,8 @@ INFERENCES = (
     'exposed enum E! { A }\n                fn main() -> i32 { core::mem::enum_variant(E!::A); 7i32 }',
     'exposed enum E! { A }\n                fn main() -> i32 {\n                    let value = E!::A;\n                    let moved = value;\n                    let tag = core::mem::enum_variant(&value);\n                    match moved { E!::A => tag as i32 }\n                }',
     "fn main() -> i32 {\n            var package = core::cap::fresh();\n            var n = 0u32;\n            while n < 3 {\n                let exists 'a. witness = package;\n                package = pack 'a. witness;\n                n = n + 1;\n            }\n            (n as i32)\n        }",
-    "fn main() -> i32 {\n            let exists 'a. outer = core::cap::fresh();\n            let p = {\n                let exists 'a. inner = core::cap::fresh();\n                pack 'a. inner\n            };\n            let exists 'b. reopened = p;\n            let p = pack 'a. outer;\n            7i32\n        }",
-    "\n        forall 'a. fn same(x: core::cap::Brand['a], y: core::cap::Brand['a]) -> u32 { 7u32 }\n        fn main() -> i32 {\n            let exists 'a. outer = core::cap::fresh();\n            let exists 'a. inner = core::cap::fresh();\n            ((same(outer, outer) + same(inner, inner)) as i32)\n        }",
+    "fn main() -> i32 {\n            let exists 'a. outer = core::cap::fresh();\n            let p = {\n                let exists 'c. inner = core::cap::fresh();\n                pack 'c. inner\n            };\n            let exists 'b. reopened = p;\n            let p = pack 'a. outer;\n            7i32\n        }",
+    "\n        forall 'a. fn same(x: core::cap::Brand['a], y: core::cap::Brand['a]) -> u32 { 7u32 }\n        fn main() -> i32 {\n            let exists 'a. outer = core::cap::fresh();\n            let exists 'b. inner = core::cap::fresh();\n            ((same(outer, outer) + same(inner, inner)) as i32)\n        }",
     '\nforall T. exposed enum Opt { Some(T), None }\nforall T, E. exposed enum Res { Ok(T), Err(E) }\nexposed struct Cur { pos: u32 }\nimpl Cur {\n    fn bump(&self, by: u32) -> u32 { by }\n    fn get(self) -> u32 { 0u32 }\n}\nforall Self -> Item. trait Next { fn step(&it: Self) -> Opt[Item]; }\ninstance Next[Cur -> u32] { fn step(&it: Cur) -> Opt[u32] { Opt::None } }\nforall T. fn id(x: T) -> T { x }\nforall T where Exposed[T]. fn need(x: T) -> T { x }\nforall T where Exposed[T]. fn forward(x: T) -> T { need[T](x) }',
     'fn main() -> i32 {\n            let bias = 2u32;\n            let mapped = foreach item of (3u32, 4u32) { (item, bias) };\n            let (a, b) = mapped;\n            let (x, y) = a;\n            let (z, w) = b;\n            (x + y + z + w) as i32\n        }',
     'fn main() -> i32 {\n            let mapped = foreach item of (3u32, 4u32) { (item, 1u32) };\n            let (a, b) = mapped;\n            let (x, y) = a;\n            let (z, w) = b;\n            (x + y + z + w) as i32\n        }',
@@ -238,6 +238,11 @@ INFER_ERRORS = (
     ('fn f(p: u32) -> u32 { core::ptr::load_volatile(p) }\n', 'needs a pointer'),
     ('exposed struct P { x: u32 }\nimpl P { fn make() -> P { P.{ x: 1u32 } } }\nfn f(p: P) -> P { p.make() }\n', 'make takes no receiver'),
     ("fn f() -> u32 { let x: core::cap::Brand['q] = core::cap::static_brand(); 0u32 }\n", "brand 'q is not in scope"),
+    # An exists type written in a body binds no brand in scope there: a parameter's or an opening's.
+    ("forall 'k. fn f(w: core::cap::Brand['k]) -> u32 {\n    let p: exists 'k. core::cap::Brand['k] = pack 'k. w;\n    0u32\n}\n",
+     "exists binder 'k shadows a brand in scope"),
+    ("fn f() -> u32 {\n    let exists 'a. w = core::cap::fresh();\n    let p: exists 'a. core::cap::Brand['a] = pack 'a. w;\n    0u32\n}\n",
+     "exists binder 'a shadows a brand in scope"),
     ('forall T. trait Show { fn show(x: T) -> u32; }\nforall T where Show[(T, T)]. instance Show[T] { fn show(x: T) -> u32 { 0u32 } }\n', 'recursive instance premise Show -> Show:'),
     ('trait Show { fn show(x: Self) -> u32; }\ninstance Show[u32] { fn show(x: u32) -> u32 { 0u32 } }\ninstance Show[u32] { fn show(x: u32) -> u32 { 1u32 } }\n', 'overlapping instances of Show: (u32) and (u32)'),
     ('trait Show { fn show(x: Self) -> u32; }\nfn f() -> u32 { let s = Show; 0u32 }\n', 'is not a value'),
@@ -328,13 +333,18 @@ INFER_ERRORS = (
     ("forall 'k. fn same(x: core::cap::Brand['k], y: core::cap::Brand['k]) -> u32 { 0u32 }\n"
      "fn f() -> u32 {\n    let exists 'a. x = core::cap::fresh();\n    let exists 'b. y = core::cap::fresh();\n    same(x, y)\n}\n",
      "5:5: brand mismatch: Brand['b] and Brand['a]; 'b was opened at 4:5, 'a at 3:5"),
+    # An opening names a brand no brand in scope has: not a parameter's, not 'static, not an earlier opening's.
     ("forall 'k. fn same(x: core::cap::Brand['k], y: core::cap::Brand['k]) -> u32 { 0u32 }\n"
      "fn f() -> u32 {\n    let exists 'k. x = core::cap::fresh();\n    let exists 'k. y = core::cap::fresh();\n    same(x, y)\n}\n",
-     "5:5: brand mismatch: Brand['k (opened at 4:5)] and Brand['k (opened at 3:5)]"),
+     "4:5: let exists 'k reuses a brand already in scope"),
     ("forall 'k, 'q. fn other(x: core::cap::Brand['k], y: core::cap::Brand['q]) -> core::cap::Brand['k] {\n    y\n}\n",
      "1:99: brand mismatch: Brand['q] and Brand['k]"),
     ("forall 'k. fn keep(x: core::cap::Brand['k]) -> core::cap::Brand['k] {\n    let exists 'k. y = core::cap::fresh();\n    y\n}\n",
-     "1:69: brand mismatch: Brand['k (opened at 2:5)] and Brand['k]"),
+     "2:5: let exists 'k reuses a brand already in scope"),
+    ("fn f() -> u32 {\n    let exists 'static. y = core::cap::fresh();\n    0u32\n}\n",
+     "2:5: let exists 'static reuses a brand already in scope"),
+    ("fn f() -> u32 {\n    let exists 'k. x = core::cap::fresh();\n    let y = {\n        let exists 'k. z = core::cap::fresh();\n        0u32\n    };\n    y\n}\n",
+     "4:9: let exists 'k reuses a brand already in scope"),
     ("forall T, 'k. exposed struct Ref { ptr: *T, marker: core::cap::Brand['k] }\n"
      "fn f(p: *u32) -> u32 {\n    let exists 'a. a = core::cap::fresh();\n    let exists 'b. b = core::cap::fresh();\n"
      "    let r = Ref.{ ptr: p, marker: a };\n    let s: Ref[u32, 'b] = r;\n    0u32\n}\n",

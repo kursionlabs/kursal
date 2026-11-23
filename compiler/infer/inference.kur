@@ -189,13 +189,11 @@ exposed struct Level {
     names: ArenaMap[Span['k], Local['k], 'k],
     // source spelling -> unique witness
     brands: ArenaMap[Span['k], Span['k], 'k],
-    // includes witnesses whose spelling was shadowed
-    opened: ArenaSet[Span['k], 'k],
 }
 
 forall 'k.
 fn new_level(&cx: Domain!['k]) -> Level['k] {
-    Level.{ names: ArenaMap::new(&cx), brands: ArenaMap::new(&cx), opened: ArenaSet::new(&cx) }
+    Level.{ names: ArenaMap::new(&cx), brands: ArenaMap::new(&cx) }
 }
 
 // A closure or foreach body being walked: the outer locals it captures, in first-use order.
@@ -1449,7 +1447,7 @@ impl Body['k] {
     fn leave(self, &cx: Domain!['k]) {
         let level = self.level(&cx);
         self.scopes.set(&cx, self.scopes.copy(&cx).tail(&cx));
-        if level.opened.len(&cx) != 0usize {
+        if level.brands.len(&cx) != 0usize {
             self.allowed.set(&cx, Option::None);
         }
     }
@@ -1472,7 +1470,7 @@ impl Body['k] {
             i = i + 1usize;
         }
         allowed.insert(&cx, Span::from_static(&cx, "static"));
-        self.outward(&cx).each(&cx, |&cx, level: Level['k]| level.opened.each(&cx, |&cx, witness: Span['k]| {
+        self.outward(&cx).each(&cx, |&cx, level: Level['k]| level.brands.each(&cx, |&cx, spelling: Span['k], witness: Span['k]| {
             allowed.insert(&cx, witness);
         }));
         self.allowed.set(&cx, Option::Some.(allowed));
@@ -1615,6 +1613,15 @@ impl Body['k] {
         if distinct.len(&cx) != names.len(&cx) {
             self.fails(&cx, "an existential opening repeats a brand name", l.pos);
         }
+        let opened_before = self.brand_sub(&cx);
+        i = 0usize;
+        while i < names.len(&cx) {
+            let name = names.at(&cx, i);
+            if name.is(&cx, "static") || opened_before.contains(&cx, name) || self.sig.params.any(&cx, |&cx, p: Param['k]| is_brand(p.kind) && p.name.eq(&cx, name)) {
+                self.fail(&cx, Buffer!::new().push_static("let exists '").push_bytes(&cx, name).push_static(" reuses a brand already in scope").save(&cx), l.pos);
+            }
+            i = i + 1usize;
+        }
         let labels: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         let level = self.level(&cx);
         let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
@@ -1623,7 +1630,6 @@ impl Body['k] {
             let label = Buffer!::new().push_bytes(&cx, names.at(&cx, i)).push_static("#open").push_u64(self.inf.next_id(&cx) as u64).save(&cx);
             labels.push(&cx, label);
             level.brands.insert(&cx, names.at(&cx, i), label);
-            level.opened.insert(&cx, label);
             if l.pos.line != 0u32 {
                 self.inf.origins.insert(&cx, label, l.pos);
             }

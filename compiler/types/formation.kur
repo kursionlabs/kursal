@@ -132,6 +132,18 @@ fn is_brand(kind: Kind) -> bool {
     C::same_kind(kind, Kind::Brand)
 }
 
+// The arguments of `premises`, in order.
+forall 'k.
+fn premise_args(&cx: Domain!['k], premises: ArenaVec[Premise['k], 'k]) -> ArenaVec[Type['k], 'k] {
+    let out: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
+    var i = 0usize;
+    while i < premises.len(&cx) {
+        out.append(&cx, premises.at(&cx, i).args);
+        i = i + 1usize;
+    }
+    out
+}
+
 forall 'k.
 fn params_of(&cx: Domain!['k], names: ArenaVec[Span['k], 'k], kind: Kind) -> ArenaVec[Param['k], 'k] {
     let out: ArenaVec[Param['k], 'k] = ArenaVec::new(&cx);
@@ -485,6 +497,34 @@ impl Formation[D, 'k] {
         false
     }
 
+    // TY-EXISTS-FORM.scope: a package type binds no brand in scope where it is written, which `env`
+    // holds, nor one an enclosing package binds. A type the checker derives, as by unfolding a
+    // declaration, was checked where it is written.
+    fn written(self, &cx: Domain!['k], types: ArenaVec[Type['k], 'k], env: ArenaMap[Span['k], Kind, 'k]) {
+        var i = 0usize;
+        while i < types.len(&cx) {
+            let ty = types.at(&cx, i);
+            let unit = match ty {
+                Exists(binders, body) => {
+                    var b = 0usize;
+                    while b < binders.len(&cx) {
+                        let shadows = match env.get(&cx, binders.at(&cx, b)) {
+                            Some(k) => is_brand(k),
+                            None => false,
+                        };
+                        if shadows {
+                            self.fail_static(&cx, "an existential brand binder shadows a brand in scope");
+                        }
+                        b = b + 1usize;
+                    }
+                    self.written(&cx, ArenaVec::one(&cx, body.copy(&cx)), self.extend(&cx, env, params_of(&cx, binders, Kind::Brand)));
+                },
+                _ => self.written(&cx, children(&cx, ty), env),
+            };
+            i = i + 1usize;
+        }
+    }
+
     fn function(self, &cx: Domain!['k], fun: Fun['k], outer: ArenaVec[Param['k], 'k], premises: ArenaVec[Premise['k], 'k]) {
         self.pos.set(&cx, fun.pos);
         let all_premises = premises.concat(&cx, fun.premises);
@@ -495,6 +535,7 @@ impl Formation[D, 'k] {
         var i = 0usize;
         while i < all_premises.len(&cx) {
             self.premise(&cx, all_premises.at(&cx, i), env);
+            self.written(&cx, all_premises.at(&cx, i).args, env);
             i = i + 1usize;
         }
         var j = 0usize;
@@ -503,6 +544,9 @@ impl Formation[D, 'k] {
             j = j + 1usize;
         }
         self.fits(&cx, fun.ret, Kind::Any, env);
+        let signature = fun.ptypes.clone(&cx);
+        signature.push(&cx, fun.ret);
+        self.written(&cx, signature, env);
         let generic_brands: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
         var g = 0usize;
         while g < params.len(&cx) {
@@ -523,6 +567,7 @@ impl Formation[D, 'k] {
                 b = b + 1usize;
             }
             self.fits(&cx, t, Kind::Any, env);
+            self.written(&cx, ArenaVec::one(&cx, t), env);
             l = l + 1usize;
         }
         var n = 0usize;
@@ -556,11 +601,14 @@ impl Formation[D, 'k] {
             }
             o = o + 1usize;
         }
+        let params: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         var p = 0usize;
         while p < block.params.len(&cx) {
             self.fits(&cx, block.params.at(&cx, p).type, Kind::Any, scope);
+            params.push(&cx, block.params.at(&cx, p).type);
             p = p + 1usize;
         }
+        self.written(&cx, params, scope);
         var n = 0usize;
         while n < block.instrs.len(&cx) {
             let instr = block.instrs.at(&cx, n);
@@ -568,6 +616,7 @@ impl Formation[D, 'k] {
             let unit = match instr.ty {
                 Some(t) => {
                     self.fits(&cx, t, Kind::Any, scope);
+                    self.written(&cx, ArenaVec::one(&cx, t), scope);
                     if instr.op.is(&cx, "alloca") {
                         self.flat(&cx, t, "a pointee");
                     }
@@ -606,6 +655,7 @@ impl Formation[D, 'k] {
                     t = t + 1usize;
                 }
             }
+            self.written(&cx, instr.tys, scope);
             if instr.op.is(&cx, "open") {
                 scope = self.extend(&cx, scope, params_of(&cx, instr.binders, Kind::Brand));
             }
@@ -616,6 +666,7 @@ impl Formation[D, 'k] {
             Switch(_scrutinee, ty, arms, pos) => {
                 self.pos.set(&cx, pos);
                 self.fits(&cx, ty, Kind::Any, scope);
+                self.written(&cx, ArenaVec::one(&cx, ty), scope);
                 var a = 0usize;
                 while a < arms.len(&cx) {
                     edges.push(&cx, arms.at(&cx, a).edge);
@@ -694,6 +745,9 @@ impl Formation[D, 'k] {
                 p = p + 1usize;
             }
             self.fits(&cx, decl.body, Kind::Any, scope);
+            let parts = ArenaVec::one(&cx, decl.body);
+            parts.append(&cx, premise_args(&cx, decl.premises));
+            self.written(&cx, parts, scope);
             i = i + 1usize;
         }
         self.sizes.set(&cx, true);
@@ -741,6 +795,9 @@ impl Formation[D, 'k] {
                     k = k + 1usize;
                 }
                 self.fits(&cx, method.ret, Kind::Any, scope);
+                let signature = method.ptypes.clone(&cx);
+                signature.push(&cx, method.ret);
+                self.written(&cx, signature, scope);
                 m = m + 1usize;
             }
             t = t + 1usize;
@@ -762,6 +819,9 @@ impl Formation[D, 'k] {
                     self.premise(&cx, inst.premises.at(&cx, p), scope);
                     p = p + 1usize;
                 }
+                let parts = inst.head.clone(&cx);
+                parts.append(&cx, premise_args(&cx, inst.premises));
+                self.written(&cx, parts, scope);
                 n = n + 1usize;
             }
             g = g + 1usize;
@@ -779,6 +839,9 @@ impl Formation[D, 'k] {
                 k = k + 1usize;
             }
             self.fits(&cx, ext.ret, Kind::Any, env);
+            let signature = ext.ptypes.clone(&cx);
+            signature.push(&cx, ext.ret);
+            self.written(&cx, signature, env);
             x = x + 1usize;
         }
         let datas = self.program.datas.values(&cx);
@@ -788,6 +851,7 @@ impl Formation[D, 'k] {
             self.home.set(&cx, data.home);
             self.pos.set(&cx, no_pos());
             self.fits(&cx, data.ty, Kind::Any, env);
+            self.written(&cx, ArenaVec::one(&cx, data.ty), env);
             d = d + 1usize;
         }
     }

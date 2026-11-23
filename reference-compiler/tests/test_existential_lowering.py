@@ -25,8 +25,9 @@ class ExistentialLoweringTests(unittest.TestCase):
             ((x + y) as i32)
         }''', 16)
 
-    def test_shadowed_brand_does_not_retype_outer_value(self):
-        self.run_source('''
+    def test_inner_opening_cannot_shadow_an_outer_one(self):
+        with self.assertRaisesRegex(InferError, "6:17: let exists 'a reuses a brand already in scope"):
+            self.run_source('''
         forall 'a. fn same(x: core::cap::Brand['a], y: core::cap::Brand['a]) -> u32 { 7u32 }
         fn main() -> i32 {
             let exists 'a. outer = core::cap::fresh();
@@ -37,14 +38,14 @@ class ExistentialLoweringTests(unittest.TestCase):
             ((n + same(outer, outer)) as i32)
         }''', 14)
 
-    def test_shadowed_brands_cannot_unify(self):
-        with self.assertRaisesRegex(InferError, r"brand mismatch: Brand\['a \(opened at 6:21\)\] and Brand\['a \(opened at 4:17\)\]"):
+    def test_nested_openings_cannot_unify(self):
+        with self.assertRaisesRegex(InferError, r"brand mismatch: Brand\['b\] and Brand\['a\]; 'b was opened at 6:21, 'a at 4:17"):
             self.run_source('''
             forall 'a. fn same(x: core::cap::Brand['a], y: core::cap::Brand['a]) -> u32 { 7u32 }
             fn main() -> i32 {
                 let exists 'a. outer = core::cap::fresh();
                 let n = {
-                    let exists 'a. inner = core::cap::fresh();
+                    let exists 'b. inner = core::cap::fresh();
                     same(outer, inner)
                 };
                 (n as i32)
@@ -64,8 +65,9 @@ class ExistentialLoweringTests(unittest.TestCase):
                 0i32
             }''', 0)
 
-    def test_repeated_name_in_same_scope_keeps_old_witness(self):
-        self.run_source('''
+    def test_opening_cannot_repeat_a_name_in_the_same_scope(self):
+        with self.assertRaisesRegex(InferError, "5:13: let exists 'a reuses a brand already in scope"):
+            self.run_source('''
         forall 'a. fn same(x: core::cap::Brand['a], y: core::cap::Brand['a]) -> u32 { 7u32 }
         fn main() -> i32 {
             let exists 'a. outer = core::cap::fresh();
@@ -85,8 +87,9 @@ class ExistentialLoweringTests(unittest.TestCase):
             (n as i32)
         }''', 3)
 
-    def test_generic_brand_survives_shadowing_inside_closure(self):
-        self.run_source('''
+    def test_closure_opening_cannot_shadow_a_generic_brand(self):
+        with self.assertRaisesRegex(InferError, "5:17: let exists 'a reuses a brand already in scope"):
+            self.run_source('''
         forall 'a. fn same(x: core::cap::Brand['a], y: core::cap::Brand['a]) -> u32 { 7u32 }
         forall 'a. fn touch(w: core::cap::Brand['a]) -> u32 {
             let f = || {
@@ -100,12 +103,12 @@ class ExistentialLoweringTests(unittest.TestCase):
             (touch(w) as i32)
         }''', 7)
 
-    def test_pack_after_shadowing_selects_inner_witness(self):
+    def test_pack_in_an_inner_block_selects_its_own_witness(self):
         self.run_source('''fn main() -> i32 {
             let exists 'a. outer = core::cap::fresh();
             let p = {
-                let exists 'a. inner = core::cap::fresh();
-                pack 'a. inner
+                let exists 'c. inner = core::cap::fresh();
+                pack 'c. inner
             };
             let exists 'b. reopened = p;
             let p = pack 'a. outer;

@@ -809,9 +809,12 @@ stands for no position.
 `types.fresh` numbers renamed binders (`a#3`) from one counter for the whole compilation. Here that
 counter is a `types::ops::Fresh['k]`, made once and passed to everything that may rename a binder: `subst`,
 `unify`, `match_head`, `Types`, `Formation`, `check_type_expansion`, `check_coherence`, `Signatures`,
-`Infer`, `lower`, `check_program`, `emit_c`, `emit_kurs`. Passing the
+`Infer`, `lower`, `check_program`, `emit_c`. Passing the
 same one everywhere numbers names as the reference compiler does; `carry_fresh` carries it into the
-next group's arena, counting on from where it stopped.
+next group's arena, counting on from where it stopped. `types::ops::apart` names no binder from the
+counter: lowering renames a package binder of a type it writes that is spelled as a brand of the
+function (a type from another declaration may be) to the first free `b#0`, `b#1`, ..., so KURS never
+shadows a brand in scope.
 
 Where the reference wraps a phase in `with resolver.located(module, pos):`, call
 `r.locate(&cx, module, pos)` before it and `r.unlocate(&cx)` after, and report errors inside it with
@@ -948,8 +951,10 @@ These are the places where Kursal differs from what one might expect.
   `match`, `&&` or `if` may lend it in every branch.
 - **Brands.** `forall 'k.` binds a brand like a type parameter, and a type that holds branded storage
   takes it as its last argument (`ArenaVec[Span['k], 'k]`). A brand is minted by a constructor that
-  returns `exists 'k. ...` and is opened by `let exists 'k. cx = Domain!::new(hash_seed());`; a trait may take one
-  as a parameter (`forall D, 'k. trait Discharge`, `instance Discharge[Checker['k], 'k]`). Only a
+  returns `exists 'k. ...` and is opened by `let exists 'k. cx = Domain!::new(hash_seed());`. An opening's
+  names and an `exists` type's binders are distinct and new where they are written: never `'static`,
+  a brand parameter, an earlier opening still in scope or an enclosing `exists`'s binder. A trait may
+  take a brand as a parameter (`forall D, 'k. trait Discharge`, `instance Discharge[Checker['k], 'k]`). Only a
   declaration quantifies brands: a function value's type `fn(T1, ..., Tn) -> R` quantifies nothing,
   and KURS's `fn` names every brand of its function, each in scope where the value is made. A function
   named bare as a value (`let f = g;`) has its brands inferred from how the value is used, like its

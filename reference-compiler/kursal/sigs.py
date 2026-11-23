@@ -324,6 +324,11 @@ class Signatures:
                 return C.Struct((("env", environment), ("code", code)))
             case S.TExists(brands=brands, body=body):
                 labels = tuple(b[1:] for b in brands)
+                if len(set(labels)) != len(labels):
+                    fail("an exists type repeats a binder")
+                for label in labels:
+                    if label in scope.brands or label == "static":
+                        fail(f"exists binder '{label} shadows a brand in scope")
                 return C.Exists(labels, self.component(body, scope.extend(C.Param(b, C.BRAND) for b in labels), "a package body"))
             case S.TForeach(binder=binder, indirect=indirect, source=source, body=body):
                 return C.Foreach(binder, indirect, self.component(source, scope, "a foreach source"),

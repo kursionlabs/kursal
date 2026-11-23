@@ -32,7 +32,7 @@ use package::kurs::sexpr::{Form, FormKind};
 use package::sigs::signatures::{ConstValue, Sig, Signatures, binop_name, const_type, int_text};
 use package::syntax::ast as S;
 use package::syntax::ast::{Expr, Pattern, Pos, Statement, expr_id, expr_pos, no_pos};
-use package::types::ops::{Fresh, Types, brand_name, children, equal, foreach_item, free_brands, mapped_component, mapped_operand, mentions_brand, subst, surface};
+use package::types::ops::{Fresh, Types, apart, brand_name, children, equal, foreach_item, free_brands, mapped_component, mapped_operand, mentions_brand, subst, surface};
 use std::collections::hashmap::OwnedMap!;
 use std::option::Option;
 use std::slice::Slice;
@@ -149,6 +149,81 @@ exposed struct Lowering {
     closures: Ref[u64, 'k],
     // a function with branded locals (by `fun_key`) -> the types of its SSA values, for promotion
     value_types: ArenaMap[usize, ArenaMap[Span['k], Type['k], 'k], 'k],
+}
+
+// `fun` with each package binder of a type it writes that would shadow a brand of `fun` renamed
+// (`apart`).
+forall 'k.
+fn set_apart(&cx: Domain!['k], fun: Fun['k], outer: ArenaVec[Param['k], 'k], counter: Fresh['k]) -> Fun['k] {
+    let scope: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+    scope.insert(&cx, Span::from_static(&cx, "static"));
+    let params = outer.concat(&cx, fun.params);
+    var i = 0usize;
+    while i < params.len(&cx) {
+        if C::same_kind(params.at(&cx, i).kind, Kind::Brand) {
+            scope.insert(&cx, params.at(&cx, i).name);
+        }
+        i = i + 1usize;
+    }
+    i = 0usize;
+    while i < fun.blocks.len(&cx) {
+        let block = fun.blocks.at(&cx, i);
+        scope.insert_all(&cx, block.brands);
+        var j = 0usize;
+        while j < block.instrs.len(&cx) {
+            scope.insert_all(&cx, block.instrs.at(&cx, j).binders);
+            j = j + 1usize;
+        }
+        i = i + 1usize;
+    }
+    i = 0usize;
+    while i < fun.ptypes.len(&cx) {
+        fun.ptypes.set(&cx, i, apart(&cx, fun.ptypes.at(&cx, i), scope, counter));
+        i = i + 1usize;
+    }
+    let ret = apart(&cx, fun.ret, scope, counter);
+    i = 0usize;
+    while i < fun.locals.len(&cx) {
+        let local = fun.locals.at(&cx, i);
+        fun.locals.set(&cx, i, C::Binding.{ name: local.name, type: apart(&cx, local.type, scope, counter) });
+        i = i + 1usize;
+    }
+    i = 0usize;
+    while i < fun.blocks.len(&cx) {
+        let block = fun.blocks.at(&cx, i);
+        var j = 0usize;
+        while j < block.params.len(&cx) {
+            let param = block.params.at(&cx, j);
+            block.params.set(&cx, j, C::Binding.{ name: param.name, type: apart(&cx, param.type, scope, counter) });
+            j = j + 1usize;
+        }
+        j = 0usize;
+        while j < block.instrs.len(&cx) {
+            let { ty, tys, ..rest } = block.instrs.at(&cx, j);
+            let ty = match ty {
+                Some(t) => Option::Some.(apart(&cx, t, scope, counter)),
+                None => Option::None,
+            };
+            let written: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
+            var t = 0usize;
+            while t < tys.len(&cx) {
+                written.push(&cx, apart(&cx, tys.at(&cx, t), scope, counter));
+                t = t + 1usize;
+            }
+            block.instrs.set(&cx, j, Instr.{ ty, tys: written, ..rest });
+            j = j + 1usize;
+        }
+        let unit = match block.term {
+            Switch(scrutinee, ty, arms, pos) => {
+                let { term: _t, ..rest } = block;
+                fun.blocks.set(&cx, i, Block.{ term: Terminator::Switch.(scrutinee, apart(&cx, ty, scope, counter), arms, pos), ..rest });
+            },
+            _ => (),
+        };
+        i = i + 1usize;
+    }
+    let { ret: _r, ..rest } = fun;
+    Fun.{ ret, ..rest }
 }
 
 // A function's identity, as long as it lives: its block sequence's.
@@ -289,7 +364,8 @@ impl Lowering['k] {
         let funs = program.funs.values(&cx);
         i = 0usize;
         while i < funs.len(&cx) {
-            self.plan(&cx, flow, funs.at(&cx, i), ArenaVec::new(&cx), ArenaVec::new(&cx));
+            let fun = self.plan(&cx, flow, funs.at(&cx, i), ArenaVec::new(&cx), ArenaVec::new(&cx));
+            program.funs.insert(&cx, fun.name, fun);
             i = i + 1usize;
         }
         let groups = program.instances.values(&cx);
@@ -301,7 +377,7 @@ impl Lowering['k] {
                 let inst = insts.at(&cx, k);
                 var m = 0usize;
                 while m < inst.methods.len(&cx) {
-                    self.plan(&cx, flow, inst.methods.at(&cx, m), inst.params, inst.premises);
+                    inst.methods.set(&cx, m, self.plan(&cx, flow, inst.methods.at(&cx, m), inst.params, inst.premises));
                     m = m + 1usize;
                 }
                 k = k + 1usize;
@@ -311,9 +387,10 @@ impl Lowering['k] {
         program
     }
 
-    // Plans `fun`'s place contracts and promotes its branded roots; an instance method's `outer`
-    // parameters and premises are its instance's.
-    fn plan(self, &cx: Domain!['k], flow: PlaceFlow['k], fun: Fun['k], outer: ArenaVec[Param['k], 'k], outer_premises: ArenaVec[C::Premise['k], 'k]) {
+    // Plans `fun`'s place contracts, promotes its branded roots and sets its package binders apart:
+    // the function that results. An instance method's `outer` parameters and premises are its
+    // instance's.
+    fn plan(self, &cx: Domain!['k], flow: PlaceFlow['k], fun: Fun['k], outer: ArenaVec[Param['k], 'k], outer_premises: ArenaVec[C::Premise['k], 'k]) -> Fun['k] {
         let located = match fun.home {
             Some(home) => {
                 self.r.locate(&cx, home, fun.pos);
@@ -332,15 +409,17 @@ impl Lowering['k] {
         let helpers = promote_locals(&cx, fun, self.types, params, premises, value_types, self.r, self.counter);
         var i = 0usize;
         while i < helpers.len(&cx) {
-            let helper = helpers.at(&cx, i);
+            let helper = set_apart(&cx, helpers.at(&cx, i), ArenaVec::new(&cx), self.counter);
             self.program.funs.insert(&cx, helper.name, helper);
             flow.checker.formation.function(&cx, helper, ArenaVec::new(&cx), ArenaVec::new(&cx));
             i = i + 1usize;
         }
+        let fun = set_apart(&cx, fun, outer, self.counter);
         flow.checker.formation.function(&cx, fun, outer, outer_premises);
         if located {
             self.r.unlocate(&cx);
         }
+        fun
     }
 
     // A static byte array holding `bytes`: its name and length.

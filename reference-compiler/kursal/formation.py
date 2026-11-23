@@ -5,7 +5,7 @@ Premises are checked for formation here and discharged by the assertion checker.
 """
 
 from typing import Optional
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 from . import core as C
 from .sexpr import KursError, Position
@@ -204,6 +204,19 @@ class Formation:
         if self.types.closed(ty) and self.types.layout(ty) is None:
             self.fail(f"{show(ty)} is too large: its size is not below 2^64 bytes")
 
+    def written(self, types: Iterable[C.Type], env: Kinds) -> None:
+        """TY-EXISTS-FORM.scope: a package type binds no brand in scope where it is written, which
+        `env` holds, nor one an enclosing package binds. A type the checker derives, as by unfolding a
+        declaration, was checked where it is written."""
+        for ty in types:
+            match ty:
+                case C.Exists(binders=binders, body=body):
+                    if any(env.get(b) == C.BRAND for b in binders):
+                        self.fail("an existential brand binder shadows a brand in scope")
+                    self.written((body,), self.extend(env, tuple(C.Param(b, C.BRAND) for b in binders)))
+                case _:
+                    self.written(children(ty), env)
+
     def within(self, binders: tuple[str, ...], check: Callable[[], object]) -> None:
         """Run `check` with `binders` opened."""
         self.opened.extend(binders)
@@ -219,13 +232,16 @@ class Formation:
         env = self.extend({"static": C.BRAND}, outer + fun.params)
         for p in premises + fun.premises:
             self.premise(p, env)
+            self.written(p.args, env)
         for t in (*fun.ptypes, fun.ret):
             self.fits(t, C.ANY, env)
+        self.written((*fun.ptypes, fun.ret), env)
         generic_brands = {p.name for p in outer + fun.params if p.kind == C.BRAND}
         for _, t in fun.locals:
             if not free_brands(t) <= generic_brands:
                 self.fail("local types may mention only function-generic free brands")
             self.fits(t, C.ANY, env)
+            self.written((t,), env)
         for block in fun.blocks:
             self.pos = block.pos
             if any(env.get(b) == C.BRAND for b in block.brands):
@@ -236,10 +252,12 @@ class Formation:
                     self.fits(C.Skolem(brand), C.BRAND, scope)
             for _, t in block.params:
                 self.fits(t, C.ANY, scope)
+            self.written((t for _, t in block.params), scope)
             for i in block.instrs:
                 self.pos = i.pos
                 if i.ty is not None:
                     self.fits(i.ty, C.ANY, scope)
+                    self.written((i.ty,), scope)
                     if i.op == "alloca":
                         self.flat(i.ty, "a pointee")
                 if i.op in {"call", "fn"} and i.args[0] in self.program.funs:
@@ -257,12 +275,14 @@ class Formation:
                 else:
                     for t in i.tys:
                         self.kind(t, scope)
+                self.written(i.tys, scope)
                 if i.op == "open":
                     scope = self.extend(scope, tuple(C.Param(b, C.BRAND) for b in i.binders))
             self.pos = block.term.pos
             match block.term:
                 case C.Switch(ty=ty, arms=arms):
                     self.fits(ty, C.ANY, scope)
+                    self.written((ty,), scope)
                     edges = [a.edge for a in arms]
                 case C.Jnz(then=then, other=other):
                     edges = [then, other]
@@ -296,6 +316,7 @@ class Formation:
                     self.fail("Sized is not a premise of a type declaration")
                 self.premise(p, scope)
             self.fits(decl.body, C.ANY, scope)
+            self.written((decl.body, *(arg for p in decl.premises for arg in p.args)), scope)
         self.sizes = True
         for decl in self.program.types.values():
             self.declaration = decl.name
@@ -311,6 +332,7 @@ class Formation:
             for method in trait.methods:
                 for t in (*method.ptypes, method.ret):
                     self.fits(t, C.ANY, scope)
+                self.written((*method.ptypes, method.ret), scope)
         for insts in self.program.instances.values():
             for inst in insts:
                 self.pos = inst.pos
@@ -319,12 +341,15 @@ class Formation:
                 self.premise(C.Premise(inst.trait, inst.head), scope)
                 for p in inst.premises:
                     self.premise(p, scope)
+                self.written((*inst.head, *(arg for p in inst.premises for arg in p.args)), scope)
         self.module, self.premises = None, ()
         for ext in self.program.externs.values():
             self.pos = ext.pos
             for t in (*ext.ptypes, ext.ret):
                 self.fits(t, C.ANY, env)
+            self.written((*ext.ptypes, ext.ret), env)
         for data in self.program.datas.values():
             self.module = data.module
             self.pos = None
             self.fits(data.ty, C.ANY, env)
+            self.written((data.ty,), env)

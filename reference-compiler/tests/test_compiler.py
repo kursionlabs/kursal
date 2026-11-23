@@ -1158,6 +1158,11 @@ SIGNATURE_ERRORS = (
     "const N: i64 = 0i64 - 2i64;\nstruct S { a: [u8; N] }\n",
     "const U: usize = 3;\nstruct S { a: [u8; 2 * U] }\n",
     "const U: usize = 1usize / 0usize;\n",
+    # an exists type's binders are distinct and shadow no brand in scope
+    "forall 'k. fn f(x: exists 'k. core::cap::Brand['k]) -> u32 { 0u32 }\n",
+    "struct S { p: exists 'a. (core::cap::Brand['a], exists 'a. core::cap::Brand['a]) }\n",
+    "struct S { p: exists 'a, 'a. core::cap::Brand['a] }\n",
+    "struct S { p: exists 'static. core::cap::Brand['static] }\n",
     "struct S { a: Phantom }\n",
     "struct S { a: builtin::Foo }\n",
     "forall T. struct S { a: T[u32] }\n",
@@ -1490,6 +1495,11 @@ TYPE_CASES = (
     "(subst (tuple (exists ($a) (tuple $a $b)) (exists ($a#7) (tuple $a#7 $b))) ((b (tuple $a $a#7))))",
     "(subst (exists ($a) $a) ((a $z)))",
     "(subst (T T) ((T u8)))",
+    # apart: a package binder spelled as a brand in scope, or as an enclosing binder, is renamed
+    "(apart (exists ($k) (brand $k)) (k))",
+    "(apart (tuple (exists ($k $a) (tuple (brand $k) (brand $a))) (exists ($k#0) (brand $k#0))) (k k#0))",
+    "(apart (exists ($a) (tuple (brand $a) (exists ($a) (brand $a)))) ())",
+    "(apart (exists ($a) (tuple (brand $a) (brand $b))) (b))",
     "(subst (foreach (F (tuple T T)) (tuple F U)) ((T u8) (U F)))",
     "(subst (foreach (F (tuple T)) (tuple F T)) ((T (tuple F)) (F u8)))",
     # free names
@@ -1663,6 +1673,11 @@ TYPE_CASES = (
     "(formation (type G! (T) (foreach (X T) (ptr X))))",
     "(formation (type S ($static) u8))",
     "(formation (type D (T T) u8))",
+    "(formation (type E ($k) (exists ($k) (brand $k))))",
+    "(formation (type E () (exists ($k) (tuple (brand $k) (exists ($k) (brand $k))))))",
+    "(formation (type E () (exists ($k $k) (brand $k))))",
+    "(formation (type E () (exists ($static) (brand $static))))",
+    "(formation (type E ($k) (tuple (brand $k) (exists ($j) (brand $j)))))",
     "(kind () ((k brand)) $k)",
     "(kind () ((k brand)) (tuple u8 (fn ((brand $k)) u8)))",
     "(kind () () (tuple u8 (fn ((brand $a)) u8)))",
@@ -1674,6 +1689,8 @@ TYPE_CASES = (
     "(function ((type B ($k) u8)) (f () (alloca x (B $q))))",
     "(function () (g ($b T)) (f () (foreach g (foreach (F (tuple u8)) F) u8)))",
     "(function () (f (T T)))",
+    "(function () (f ($k) (alloca x (exists ($k) (brand $k)))))",
+    "(function () (f ($k) (alloca x (exists ($j) (tuple (brand $j) (brand $k))))))",
     # termination
     "(instances ((Show (List T)) (Show T)))",
     "(instances ((Show T) (Show (List T))))",
@@ -1747,6 +1764,8 @@ def type_case(case: str) -> str:
         return T.show(parse_type(form[1]))
     if op == "subst":
         return T.show(T.subst(parse_type(form[1]), {str(n): parse_type(t) for n, t in form[2]}))
+    if op == "apart":
+        return T.show(T.apart(parse_type(form[1]), {str(n) for n in form[2]}))
     if op == "free":
         return _set(T.free_names(parse_type(form[1])))
     if op == "brands":
