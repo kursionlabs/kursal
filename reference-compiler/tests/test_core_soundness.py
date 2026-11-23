@@ -456,6 +456,12 @@ REJECTED = {
                                         "(extern fun take u32 ((fn (unsafe) () (brand $static))))"),
     "extern_nested_callback": ("extern_result_layout_chosen", """
         (extern fun make (fn (unsafe) ((fn (unsafe) ((non_null u8)) u32)) u32) ())"""),
+    # Foreign code calls an `unsafe fn` of the signature with values: it lends no place, so no function
+    # type in an extern's signature takes a place parameter, nested or behind a pointer.
+    "extern_callback_takes_place": ("extern_place_parameter", "(extern fun take u32 ((fn (unsafe) ((& u32)) u32)))"),
+    "extern_nested_callback_takes_place": ("extern_place_parameter", """
+        (type Callback (struct (run (fn (unsafe) (u8 (& u64)) u8))))
+        (extern fun make (fn (unsafe) ((ptr Callback)) u32) ())"""),
 
     # Compiler-reserved traits are sealed, and a Copy premise names a parameter.
     "user_exposed_trait": ("trait_name_is_reserved", "(trait Exposed (T)) (instance Exposed (u32))"),

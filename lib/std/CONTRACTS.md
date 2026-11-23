@@ -222,7 +222,10 @@ this way: what Kursal hands C was made by checked code. A function type in an
 extern's signature, anywhere, is an `unsafe fn` type: C neither makes nor
 calls a safe function value. The parameters and result of such a type are
 held to both rules, since C makes the arguments of a callback it is given and
-takes what one it hands back returns. The library's own externs return
+takes what one it hands back returns. C takes and passes values and lends
+nothing back, so neither an extern nor a function type in its signature takes
+a place parameter (`extern f takes a place parameter; foreign code takes
+values`, `extern_place_parameter`). The library's own externs return
 integers, floats, raw pointers, `()` and `!`, and take one callback,
 `unsafe fn(*u8) -> *u8`.
 

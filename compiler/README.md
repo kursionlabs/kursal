@@ -932,7 +932,9 @@ These are the places where Kursal differs from what one might expect.
   neither makes nor calls a safe function value. Foreign code makes the arguments of such a value, and
   takes its result or hands the value back, so each of its parameters and its result is held to both
   rules, an extern parameter's and its result's, to any depth; its result may be zero-size only with an
-  erased value, as `()` is C's `void`.
+  erased value, as `()` is C's `void`. Foreign code takes and passes values and lends nothing back, so
+  an extern takes no place parameter (`extern f takes a place parameter; foreign code takes values`)
+  and no function type in its signature takes one (`extern_place_parameter`), where KURS can write one.
 - **Generic code over linear types.** A type parameter may stand for a linear type unless a premise
   says `Copy[T]`. Using a value twice, or dropping it on one path (`a && b` drops `b` when `a` is
   false), needs `Copy[T]`. The arena collections (`ArenaVec`, `ArenaMap`, `ArenaSet`, `List`) require

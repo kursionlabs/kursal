@@ -157,11 +157,14 @@ class Lowering:
 
     def foreign_signature(self, name: str, sig: Sig) -> None:
         """The core's rules for an extern's signature (`Checker.foreign_signature`), at the source: it takes no
-        type or brand parameter, a parameter has a memory form, the result holds nothing only checked code
-        makes and no layout the compiler chooses, and every function type in it is an `unsafe fn` type,
-        whose parameters and result foreign code makes or takes as it does an extern's."""
+        type or brand parameter and no place parameter, which foreign code cannot lend back, a parameter has
+        a memory form, the result holds nothing only checked code makes and no layout the compiler chooses,
+        and every function type in it is an `unsafe fn` type, whose parameters and result foreign code makes
+        or takes as it does an extern's."""
         if sig.params:
             fail(f"extern {name} takes no type or brand parameters")
+        if sig.places:
+            fail(f"extern {name} takes a place parameter; foreign code takes values")
         if any(self.types.zero_size(t) for t in sig.ptypes):
             fail(f"extern {name} takes a zero-size type, which has no memory form")
         if not isinstance(sig.ret, C.Never) and contains(self.types, sig.ret, checked_only):

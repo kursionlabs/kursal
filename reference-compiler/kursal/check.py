@@ -855,8 +855,9 @@ class Checker:
         fn` type: no safe function value comes from foreign code or goes to it. Foreign code calls such a
         value with arguments it makes, and takes its result, or hands the value back, so the program calls
         it: each parameter of one has a memory form and holds nothing only checked code makes, and so does
-        its result, which may be zero-size only with an erased value (`void`). The walk reaches the
-        function types nested in those too."""
+        its result, which may be zero-size only with an erased value (`void`), and none of its parameters
+        is a place, which foreign code cannot lend. The walk reaches the function types nested in those
+        too."""
         for t in ptypes:
             self.has_memory_form(t)
         if not isinstance(ret, Never):
@@ -865,6 +866,8 @@ class Checker:
         if any(not fn.unsafe for fn in functions):
             self.fail("extern_safe_function_type")
         for fn in functions:
+            if fn.places:
+                self.fail("extern_place_parameter")
             for t in fn.params:
                 self.has_memory_form(t)
                 self.foreign_result(t)
