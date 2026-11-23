@@ -892,8 +892,8 @@ impl Checker['k] {
             if !fun.params.is_empty(&cx) || !fun.premises.is_empty(&cx) {
                 self.fail(&cx, "instance_method_has_own_quantifier");
             }
-            let want = C::fn_type(&cx, subst_all(&cx, sig.ptypes, head, self.counter), subst(&cx, sig.ret, head, self.counter), ArenaVec::new(&cx), false, sig.places);
-            let got = C::fn_type(&cx, fun.ptypes, fun.ret, ArenaVec::new(&cx), false, fun.places(&cx));
+            let want = C::fn_type(&cx, subst_all(&cx, sig.ptypes, head, self.counter), subst(&cx, sig.ret, head, self.counter), false, sig.places);
+            let got = C::fn_type(&cx, fun.ptypes, fun.ret, false, fun.places(&cx));
             if !equal(&cx, got, want) || (fun.is_unsafe && !sig.is_unsafe) {
                 self.fail(&cx, "method_does_match_trait");
             }
@@ -1724,7 +1724,7 @@ impl Checker['k] {
             chosen.push(&cx, sub.at(&cx, inst.params.at(&cx, c).name));
             c = c + 1usize;
         }
-        self.formation.arguments(&cx, inst.params, chosen, self.scope(&cx), false);
+        self.formation.arguments(&cx, inst.params, chosen, self.scope(&cx));
         self.formation.premises.set(&cx, saved_premises);
         self.formation.home.set(&cx, saved_home);
         var q = 0usize;
@@ -1749,12 +1749,8 @@ impl Checker['k] {
         while i < params.len(&cx) {
             let p = params.at(&cx, i);
             let t = tys.at(&cx, i);
-            var skip = false;
             if C::same_kind(p.kind, Kind::Brand) {
                 let unit = match t {
-                    Type::Ignored => {
-                        skip = true;
-                    },
                     Type::Skolem(label) => {
                         if !self.brands.copy(&cx).contains(&cx, label) {
                             self.fail(&cx, "brand_argument_scope");
@@ -1765,9 +1761,7 @@ impl Checker['k] {
             } else if C::same_kind(p.kind, Kind::Copy) && !self.copy_type(&cx, t) {
                 self.fail(&cx, "copy");
             }
-            if !skip {
-                sub.insert(&cx, p.name, t);
-            }
+            sub.insert(&cx, p.name, t);
             i = i + 1usize;
         }
         var j = 0usize;
@@ -1790,8 +1784,10 @@ impl Checker['k] {
                 Type::Fn(f) => f,
                 _ => self.fail(&cx, "function_value"),
             };
-            let sub = self.instantiate(&cx, f.quantified, ArenaVec::new(&cx), tys);
-            return Signature.{ ptypes: subst_all(&cx, f.params, sub, self.counter), ret: subst(&cx, f.ret.copy(&cx), sub, self.counter), is_unsafe: f.is_unsafe, places: f.places };
+            if !tys.is_empty(&cx) {
+                self.fail(&cx, "takes_type_arguments_got");
+            }
+            return Signature.{ ptypes: f.params, ret: f.ret.copy(&cx), is_unsafe: f.is_unsafe, places: f.places };
         }
         match self.program.externs.get(&cx, callee) {
             Option::Some(ext) => {
@@ -2263,7 +2259,7 @@ impl Checker['k] {
                     Option::Some(r) => r,
                     Option::None => self.fail(&cx, "extern_value_not_callable"),
                 };
-                return C::fn_type(&cx, ptypes, ret, ArenaVec::new(&cx), true, ArenaVec::new(&cx));
+                return C::fn_type(&cx, ptypes, ret, true, ArenaVec::new(&cx));
             },
             Option::None => (),
         };
@@ -2271,44 +2267,8 @@ impl Checker['k] {
             Option::Some(f) => f,
             Option::None => self.fail(&cx, "unknown_function"),
         };
-        let retained: ArenaVec[Param['k], 'k] = ArenaVec::new(&cx);
-        var i = 0usize;
-        while i < fun.params.len(&cx) && i < instr.tys.len(&cx) {
-            let p = fun.params.at(&cx, i);
-            let ignored = match instr.tys.at(&cx, i) {
-                Type::Ignored => true,
-                _ => false,
-            };
-            if C::same_kind(p.kind, Kind::Brand) && ignored {
-                retained.push(&cx, p);
-            }
-            i = i + 1usize;
-        }
-        let retained_brands: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
-        var r = 0usize;
-        while r < retained.len(&cx) {
-            retained_brands.insert(&cx, retained.at(&cx, r).name);
-            r = r + 1usize;
-        }
-        // A function value may keep brands quantified, but no premise on them: every premise is
-        // discharged where the value is made.
-        var q = 0usize;
-        while q < fun.premises.len(&cx) {
-            let args = fun.premises.at(&cx, q).args;
-            var a = 0usize;
-            while a < args.len(&cx) {
-                if sets_meet(&cx, retained_brands, free_brands(&cx, args.at(&cx, a))) {
-                    self.fail(&cx, "retained_brand_with_premise");
-                }
-                a = a + 1usize;
-            }
-            q = q + 1usize;
-        }
         let sub = self.instantiate(&cx, fun.params, fun.premises, instr.tys);
-        // Substituting through the value's own binder renames a retained brand that a type argument would
-        // capture.
-        let value = C::fn_type(&cx, fun.ptypes, fun.ret, retained, fun.is_unsafe, fun.places(&cx));
-        subst(&cx, value, sub, self.counter)
+        subst(&cx, C::fn_type(&cx, fun.ptypes, fun.ret, fun.is_unsafe, fun.places(&cx)), sub, self.counter)
     }
 
     // What foreign code hands the program, an extern function's result or an extern value, is

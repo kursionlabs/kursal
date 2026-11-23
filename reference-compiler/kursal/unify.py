@@ -134,7 +134,7 @@ def unify(a: C.Type, b: C.Type, *, closed: bool = False) -> bool:
     match a, b:
         case C.Named(name=n, args=xs), C.Named(name=m, args=ys):
             return n == m and len(xs) == len(ys) and all(compare(x, y) for x, y in zip(xs, ys))
-        case (C.Prim() | C.Skolem() | C.Never() | C.Ignored()), _:
+        case (C.Prim() | C.Skolem() | C.Never()), _:
             return a == b
         case C.Array(length=n), C.Array(length=m) if n != m:
             return False
@@ -151,7 +151,6 @@ def unify(a: C.Type, b: C.Type, *, closed: bool = False) -> bool:
         case C.Fn(), C.Fn():
             if len(a.params) != len(b.params) or a.places != b.places or a.unsafe != b.unsafe:
                 return False
-            return quantified(a.forall, b.forall, (*a.params, a.ret), (*b.params, b.ret), closed)
     ca, cb = type_children(a), type_children(b)
     return len(ca) == len(cb) and all(compare(x, y) for x, y in zip(ca, cb))
 

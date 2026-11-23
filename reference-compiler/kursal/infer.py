@@ -31,7 +31,7 @@ from . import syntax as S
 from .resolve import Decl, ResolveError, Resolver, listed
 from .sigs import InstanceSig, Scope, Sig, Signatures
 from .sexpr import KursError, Position
-from .types import (Surface, Types, brand_differences, brand_name, equal, free_brands, free_names, fresh, made_from,
+from .types import (Surface, Types, brand_differences, brand_name, equal, free_brands, free_names, made_from,
                     mapped_component, subst)
 from .termination import check_instance_termination
 from .coherence import check_coherence
@@ -94,8 +94,8 @@ class FnCall:
 
     @property
     def targs(self) -> tuple[C.Type, ...]:
-        """In signature order; Ignored retains a function value's brand binder."""
-        return tuple(self.sub.get(p.name, C.Ignored()) for p in self.sig.params)
+        """In signature order."""
+        return tuple(self.sub[p.name] for p in self.sig.params)
 
 
 @dataclass
@@ -108,11 +108,7 @@ class TraitCall:
 
 @dataclass
 class ValueCall:
-    sub: dict[str, C.Type]
-
-    @property
-    def targs(self) -> tuple[C.Type, ...]:
-        return tuple(self.sub.values())
+    pass
 
 
 @dataclass
@@ -296,7 +292,7 @@ class Infer:
                 continue
             call = e.call
             match call:
-                case FnCall() | ValueCall():
+                case FnCall():
                     call.sub = {k: zonk(v) for k, v in call.sub.items()}
                 case TraitCall():
                     call.targs = tuple(zonk(t) for t in call.targs)
@@ -531,12 +527,12 @@ class Infer:
                 return self.let_exists(stmt)
             case S.Let(pattern=pattern, type=ty, value=value, pos=pos):
                 want = self.type(ty) if ty is not None else None
-                got = self.check(self.generic(value, want), want)
+                got = self.check(value, want)
                 self.pattern(pattern, want or got, pos)
                 return isinstance(prune(got), C.Never)
             case S.Var(name=name, type=ty, value=value):
                 want = self.type(ty) if ty is not None else None
-                got = self.check(self.generic(value, want), want)
+                got = self.check(value, want)
                 stmt.binder = self.bind(name, want or got, mutable=True).id
             case S.Const(name=name, type=ty, value=value):
                 want = self.type(ty)
@@ -550,11 +546,6 @@ class Infer:
                 fail(f"no rule for statement {type(stmt).__name__}", stmt.pos)
         return False
 
-    def generic(self, value: S.Expr, want: Optional[C.Type]) -> S.Expr:
-        """A bare function name bound with no annotation keeps its quantified brands."""
-        if want is None and isinstance(value, S.Path):
-            value.generic = True
-        return value
 
     def let_exists(self, stmt: S.Let) -> bool:
         package = self.shape(self.expr(stmt.value), stmt.pos)
@@ -761,24 +752,14 @@ class Infer:
         fail(f"{'::'.join(expr.names)} is not a value", expr.pos)
 
     def function_value(self, expr: S.Path, sig: Sig) -> C.Type:
-        """A named function keeps its declared parameter modes and result type.
-
-        Bare names bound by let retain unconstrained brand quantifiers; other
-        parameters are instantiated at the occurrence.
-        """
-        retain = expr.generic and not any(args for _, args in expr.segments)
-        kept = tuple(p for p in sig.params if p.kind == C.BRAND and retain and
-                     not any(p.name in free_names(zonk(a)) for q in sig.premises for a in q.args))
-        sub = self.instantiate([p for p in sig.params if p not in kept], expr.names[-1], expr.pos)
+        """A named function keeps its declared parameter modes and result type. A function value
+        quantifies nothing: every parameter, brands included, is instantiated at the occurrence, written
+        or inferred from how the value is used."""
+        sub = self.instantiate(sig.params, expr.names[-1], expr.pos)
         self.explicit_args(expr, sig, sub)
         expr.call = FnCall(sig, sub)
         self.require_signature(sig, sub, expr.pos)
-        # A kept brand gets a name no source spells: a type argument solved later never captures it.
-        labels = {p.name: fresh(p.name) for p in kept}
-        whole = {**sub, **{name: C.Skolem(label) for name, label in labels.items()}}
-        ptypes = tuple(subst(t, whole) for t in sig.ptypes)
-        ret = subst(sig.ret, whole)
-        return C.Fn(ptypes, ret, tuple(C.Param(labels[p.name], C.BRAND) for p in kept), sig.unsafe, sig.places)
+        return C.Fn(tuple(subst(t, sub) for t in sig.ptypes), subst(sig.ret, sub), sig.unsafe, sig.places)
 
     def explicit_args(self, path: S.Path, sig: Sig, sub: dict[str, C.Type]) -> None:
         """Type arguments written on a callee path: on its last segment, the function's own; on the type
@@ -1241,17 +1222,14 @@ class Infer:
                 code = self.shape(code_type, expr.pos)
                 if not isinstance(code, C.Fn):
                     fail("a closure code field must have a function type", expr.pos)
-                if code.forall:
-                    fail("a closure code field must have a monomorphic function type", expr.pos)
                 if not code.params or 0 in code.places:
                     fail("a closure code function must take its environment by value first", expr.pos)
                 self.unify(env, code.params[0], expr.pos)
                 expr.call = ClosureCall()
                 ptypes, places, ret = list(code.params[1:]), {k - 1 for k in code.places}, code.ret
             elif isinstance(s, C.Fn):
-                sub = self.instantiate(s.forall, expr.callee.names[-1] if isinstance(expr.callee, S.Path) else "the callee", expr.pos)
-                expr.call = ValueCall(sub)
-                ptypes, places, ret = [subst(t, sub) for t in s.params], s.places, subst(s.ret, sub)
+                expr.call = ValueCall()
+                ptypes, places, ret = list(s.params), s.places, s.ret
             else:
                 fail(f"{self.shown(zonk(callee))} is not callable", expr.pos)
             self.bind_operands(expr, got, ptypes, places)

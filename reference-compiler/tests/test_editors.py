@@ -28,7 +28,7 @@ ACCEPTED = (
     "unsafe instance Send[Cell[u32]] { } impl i8 { const MIN: i8 = -128; forall T. fn f(self) {} }",
     "fn f(&x: u32, g: fn(&_: u32, u8) -> u32, h: closure(&it: u32) -> ()) -> exists 'a, 'b. Pair['a, 'b] {"
     " pack 'a, 'b. Pair.(x, x) }",
-    "fn f(t: foreach *F of (u32, u8) => Box[F], g: forall T. fn(T) -> T, a: [u8; 4usize]) -> Map[K, V -> _] {"
+    "fn f(t: foreach *F of (u32, u8) => Box[F], g: fn(T) -> T, a: [u8; 4usize]) -> Map[K, V -> _] {"
     " sizeof[u32]() }",
     "fn f() -> u32 { let exists 'k. { a, b: (c, _), ..rest } = g(); let [x, y,] = h(); var n: u32 = 0u32;"
     " n = n + 1u32; s.a.0 = 3u32; unsafe *p = v; unsafe f(&x); n }",
@@ -44,13 +44,14 @@ ACCEPTED = (
 )
 
 # Forms of the surface syntax that Kursal does not have: a struct literal without `.`, a place written on
-# a parameter's type, an unnamed place slot, a `forall` ended by `=>`, a `!` apart from its name, and a
-# `!` on a name that is not a type's.
+# a parameter's type, an unnamed place slot, a `forall` ended by `=>`, a function type that quantifies, a
+# `!` apart from its name, and a `!` on a name that is not a type's.
 REJECTED = (
     "fn f() -> Point { Point { x: 1u32 } }",
     "fn f(x: &u32) {}",
     "fn f(g: fn(&u32) -> u32) {}",
     "forall T => fn f(x: T) {}",
+    "fn f(g: forall 'k. fn(Brand['k]) -> u32) {}",
     "fn f() { let (x) = g(); }",
     "fn f() -> u32 { match x { _ => 1u32, A => 2u32 } }",
     "fn f() -> u32 { Foo !::new() }",

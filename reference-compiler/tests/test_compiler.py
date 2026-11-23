@@ -406,7 +406,7 @@ def callee_text(call: I.Callee) -> str:
         case I.TraitCall():
             return trait_call_text(call)
         case I.ValueCall():
-            return f"(value {inferred_types(call.targs)})"
+            return "(value)"
         case I.ClosureCall():
             return "(closure)"
         case I.VariantCall():
@@ -1132,7 +1132,7 @@ SIGNATURES = (
     "forall T where Exposed[T], Show[T]. instance Show[(T, T)] { fn show(&x: (T, T)) -> u32 { 0u32 } }\n"
     "forall 'k. exposed struct Tag! { n: u32 }\nforall T, 'a. struct P { p: *T, w: core::cap::Brand['a], e: exists 'b. core::cap::Brand['b] }\n"
     "forall T. impl P[T, 'static] { fn get(self, f: closure(u32) -> u32, g: closure[u8](&_: u32) -> u32) -> u32 { 0u32 } }\n"
-    "forall T where Copy[T]. fn pair(x: T, h: unsafe fn(&_: T) -> !, k: forall 'q. fn(core::cap::Brand['q]) -> u32) -> (T, T) { (x, x) }\n"
+    "forall T where Copy[T]. fn pair(x: T, h: unsafe fn(&_: T) -> !, k: fn(core::cap::Brand['static]) -> u32) -> (T, T) { (x, x) }\n"
     "extern \"C\" fn puts(s: *u8) -> i32;\nenum E { A, B(u32), C(u8, u16) }\ntuple Pt(u32, i64);\n"
     "fn h(g: fn(closure(u32) -> u32) -> u32, k: closure(u8) -> u8) -> u32 { 0u32 }\n",
     # A generic declaration linear only through its arguments has no `!`; one with a `!` is linear even
@@ -1169,7 +1169,6 @@ SIGNATURE_ERRORS = (
     "struct S { a: core::cap::Brand['k] }\n",
     "struct S { f: fn(closure(u32) -> u32) -> u32 }\n",
     "forall T. struct B { a: *T }\nstruct S { b: B[_] }\n",
-    "struct S { f: forall 'a. u32 }\n",
     "forall T where Copy[(T, T)]. fn f(x: T) {}\n",
     "forall T where Copy[u32]. fn f(x: T) {}\n",
     "forall T where Copy[T]. struct B { a: T }\nstruct L! { x: u32 }\nstruct S { b: B[L] }\n",
@@ -1265,6 +1264,9 @@ SYNTAX_ERRORS = (
     "fn f(&x!: u32) {}",
     "fn f() -> u32 { p.x! }",
     "fn f() -> bool { a!b }",
+    # `forall` quantifies a declaration, never a type: a function type quantifies nothing.
+    "fn f(k: forall 'q. fn(core::cap::Brand['q]) -> u32) {}",
+    "struct S { f: forall 'a. u32 }",
 )
 
 KURS_ERRORS = (
@@ -1288,7 +1290,12 @@ KURS_ERRORS = (
     "(type T ((tuple) u32))",
     "(type T (foreach (F u32) u32 (keep F)))",
     "(type T (foreach (F u32)))",
-    "(type T (fn (forall () ((Eq u32)) u32 ())))",
+    # A function type quantifies nothing, and `fn` names every brand of its function.
+    "(type T (fn (forall ($k) () u32 ((brand $k)))))",
+    "(type T (fn (unsafe) (forall () () u32 ())))",
+    "(type T (tuple _))",
+    "(fun f (forall ($k) () u32 () (entry () (= %n (const u32 0)) (ret %n))))\n"
+    "(fun main u32 () (entry () (= %p (fn (f _))) (= %r (const u32 0)) (ret %r)))",
     "(fun f u32 () (entry () (opened &p) (ret %x)))",
     "(type T u32",
     ")",
@@ -1473,10 +1480,10 @@ TYPE_CASES = (
     "(show (tuple (struct) (enum (A u32)) (exists ($a $b) (brand $a)) (array u8 3)))",
     "(show (foreach (F (tuple u8 u16)) (tuple F (ptr F))))",
     "(show (foreach ((ptr F) (ptr (tuple u8))) F))",
-    "(show (fn (unsafe) (forall ($a) () ! ((Pair u32 $a) _))))",
+    "(show (fn (unsafe) ((Pair u32 $a) u8) !))",
     # subst: capture avoidance, numbering, a foreach binder
     "(subst (exists ($a) (tuple $a $b)) ((b $a)))",
-    "(subst (fn (forall ($a) () $b ($a))) ((b $a)))",
+    "(subst (fn ($a) $b) ((b $c) (a $d)))",
     "(subst (tuple (exists ($a) (tuple $a $b)) (exists ($a#7) (tuple $a#7 $b))) ((b (tuple $a $a#7))))",
     "(subst (exists ($a) $a) ((a $z)))",
     "(subst (T T) ((T u8)))",
@@ -1484,16 +1491,16 @@ TYPE_CASES = (
     "(subst (foreach (F (tuple T)) (tuple F T)) ((T (tuple F)) (F u8)))",
     # free names
     "(free (foreach (F (tuple T $k)) (tuple F G)))",
-    "(free (fn (forall ($a) () $a ($b T))))",
+    "(free (fn ($b T) $a))",
     "(brands (tuple $a (exists ($b) (tuple $b $c)) (P $d)))",
-    "(extractable (tuple T (exists ($a) U) (fn (forall ($b) () V ())) (fn (W) X) (foreach (F Y) Z) $k))",
+    "(extractable (tuple T (exists ($a) U) (fn (W) X) (foreach (F Y) Z) $k))",
     # equality modulo bound names
     "(equal (exists ($a) (brand $a)) (exists ($b) (brand $b)))",
     "(equal (exists ($a $b) (tuple $a $b)) (exists ($b $a) (tuple $a $b)))",
     "(equal (exists ($a) (tuple $a $b)) (exists ($b) (tuple $b $b)))",
     "(equal (foreach (F (tuple u8)) F) (foreach (G (tuple u8)) G))",
     "(equal (foreach (F (tuple u8)) (tuple F G)) (foreach (G (tuple u8)) (tuple G G)))",
-    "(equal (fn (forall ($p) () u8 ((brand $p)))) (fn (forall ($q) () u8 ((brand $q)))))",
+    "(equal (fn ((brand $p)) u8) (fn ((brand $q)) u8))",
     "(equal (fn (u8) u8) (fn (unsafe) (u8) u8))",
     "(equal (P T) (P T U))",
     "(fits ! u32)",
@@ -1513,14 +1520,13 @@ TYPE_CASES = (
     "(unify ((a type)) (exists ($x) (tuple $x ?a)) (exists ($y) (tuple $y u8)))",
     "(unify ((k brand)) (exists ($x) (tuple $x $?k)) (exists ($y) (tuple $y $y)))",
     "(unify-closed ((k brand)) (exists ($x) (tuple $x $?k)) (exists ($y) (tuple $y $y)))",
-    "(unify-closed ((a type)) (fn (forall ($p) () ?a ((brand $p)))) "
-    "(fn (forall ($q) () u8 ((brand $q)))))",
+    "(unify-closed ((a type)) (fn ((brand $p)) ?a) (fn ((brand $p)) u8))",
     "(unify-closed ((k brand)) (tuple (exists ($x) (tuple $x $rigid#0)) (exists ($x) (tuple $x $?k))) "
     "(tuple (exists ($y) (tuple $y $rigid#0)) (exists ($y) (tuple $y $y))))",
     "(unify ((k brand)) (exists ($x) (tuple $x $?k $x)) (exists ($y) (tuple $y $z $y)))",
     "(unify () (exists ($x) (tuple $x $x)) (exists ($y) (tuple $y $x)))",
     "(unify ((k brand) (a type)) (tuple ?a (exists ($x) (tuple $x $?k u8))) (tuple u16 (exists ($y) (tuple $y $y u16))))",
-    "(unify ((a type)) (fn (forall ($p) () ?a ((brand $p)))) (fn (forall ($q) () (brand $q) ((brand $q)))))",
+    "(unify ((a type)) (fn ((brand $p)) ?a) (fn ((brand $q)) (brand $q)))",
     "(unify ((a type)) (foreach (F (tuple ?a)) (ptr F)) (foreach (G (tuple u8)) (ptr G)))",
     "(unify ((a type)) (foreach (F (tuple u8)) ?a) (foreach (G (tuple u8)) (ptr G)))",
     "(unify () (fn (u8) u8) (fn (unsafe) (u8) u8))",
@@ -1635,9 +1641,7 @@ TYPE_CASES = (
     "(formation (type W () (foreach (F (tuple u8)) F)) (type P () (ptr W)))",
     "(formation (type W () (foreach (F (tuple u8)) F)) (type P () (exists ($k) W)))",
     "(formation (type W () (foreach (F (tuple u8)) F)) (type P () (fn (W) W)))",
-    "(formation (type F () (fn (forall (T) () u8 ()))))",
     "(formation (type D () (struct (a u8) (a u16))))",
-    "(formation (type I () (tuple _)))",
     "(formation (type V (T) (T u8)))",
     "(formation (type U () Nope))",
     "(formation (type W (T) u8) (type X () (W)))",
@@ -1657,10 +1661,11 @@ TYPE_CASES = (
     "(formation (type S ($static) u8))",
     "(formation (type D (T T) u8))",
     "(kind () ((k brand)) $k)",
-    "(kind () () (tuple u8 (fn (forall ($a) () u8 ((brand $a))))))",
+    "(kind () ((k brand)) (tuple u8 (fn ((brand $k)) u8)))",
+    "(kind () () (tuple u8 (fn ((brand $a)) u8)))",
     "(kind () () $k)",
-    "(function () (f (T $k) (call f u8 $k) (fn f u16 _)))",
-    "(function () (f (T $k) (call f u8 _)))",
+    "(function () (f (T $k) (call f u8 $k) (fn f u16 $k)))",
+    "(function () (f (T $k) (fn f u16 $q)))",
     "(function () (f (T $k)\n  (call f u8)))",
     "(function ((type B ($k) u8)) (f ($k) (call f $k) (alloca x (B $k))))",
     "(function ((type B ($k) u8)) (f () (alloca x (B $q))))",

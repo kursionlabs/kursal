@@ -507,13 +507,6 @@ class Parser:
             source = self.type()
             self.expect("=>")
             return S.TForeach(binder, indirect, source, self.type())
-        if k == "forall":
-            self.next()
-            quantified = [self.forall_param()]
-            while self.eat(","):
-                quantified.append(self.forall_param())
-            self.expect(".")
-            return S.TForall(tuple(quantified), self.type())
         self.fail()
 
     def closure_rest(self, env: Optional[S.Type]) -> S.TClosure:

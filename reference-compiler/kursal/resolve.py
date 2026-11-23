@@ -751,8 +751,6 @@ class Names:
             case S.TForeach(source=source, body=body):
                 self.type(source, types)
                 self.type(body, types | {type_expr.binder})
-            case S.TForall(params=params, body=body):
-                self.type(body, types | {p for p in params if not p.startswith("'")})
 
     def named_type(self, path: S.NamePath, trait: bool, pos: Optional[Position]) -> S.DeclRef | S.BuiltinRef:
         """What the type, or with `trait` the trait, written `path` at `pos` names."""

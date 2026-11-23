@@ -178,11 +178,11 @@ REJECTED = {
         (fun walk (foreach ((ptr F) (ptr Opt)) u32) ((ptr Opt))
           (entry ((%p (ptr Opt))) (= %out (foreach (foreach ((ptr F) (ptr Opt)) u32) %p mapper)) (ret %out)))"""),
 
-    # A function value carries no premises: they are discharged where the value is made.
-    "function_type_premise": ("a function type has no premises", """
-        (trait Q (T))
-        (fun h u32 ((fn (forall () ((Q u32)) u32 ())))
-          (entry ((%f (fn (forall () ((Q u32)) u32 ())))) (= %r (const u32 0)) (ret %r)))"""),
+    # A function type quantifies nothing: a function's brands and premises are settled where its value is
+    # made.
+    "function_type_quantifier": ("a function type quantifies nothing", """
+        (fun h u32 ((fn (forall ($k) () u32 ((brand $k)))))
+          (entry ((%f (fn (forall ($k) () u32 ((brand $k)))))) (= %r (const u32 0)) (ret %r)))"""),
 
     # Pointer projection names the pointer's type exactly.
     "pointer_destruct_wrong_type": ("destruct", """
@@ -254,20 +254,17 @@ REJECTED = {
             (= %k (pack (exists ($p0) (tuple (brand $p0) (brand $p0))) ($q) %v))
             (= %r (const u32 0)) (ret %r))))"""),
 
-    # A brand a function value keeps is its own, never the caller's brand of the same name that a type
-    # argument names: g's T is h's Brand['b], not the kept 'b, so h cannot return Tok['c] for any 'c.
-    "kept_brand_captures_type_argument": ("returning_function", """
-        (type Tok! (forall ($k) () (struct (w (brand $k)))))
+    # `fn` names every brand of its function, each in scope where the value is made.
+    "function_value_unnamed_brand": ("_ is not a type", """
         (fun g (forall ($b T) () T ((brand $b) T)
           (entry ((%w (brand $b)) (%x T)) (ret %x))))
-        (fun h (forall ($b) () (fn (forall ($b) () (Tok! $b) ((brand $b) (Tok! $b)))) ()
-          (entry () (= %f (fn (g _ (Tok! $b)))) (ret %f))))"""),
-    "kept_brand_captures_type_argument_renamed": ("returning_function", """
-        (type Tok! (forall ($k) () (struct (w (brand $k)))))
+        (fun h (forall ($b) () (fn ((brand $b) u32) u32) ()
+          (entry () (= %f (fn (g _ u32))) (ret %f))))"""),
+    "function_value_brand_out_of_scope": ("brand q is not in scope", """
         (fun g (forall ($b T) () T ((brand $b) T)
           (entry ((%w (brand $b)) (%x T)) (ret %x))))
-        (fun h (forall ($q) () (fn (forall ($b) () (Tok! $b) ((brand $b) (Tok! $b)))) ()
-          (entry () (= %f (fn (g _ (Tok! $q)))) (ret %f))))"""),
+        (fun h (fn ((brand $static) u32) u32) ()
+          (entry () (= %f (fn (g $q u32))) (ret %f)))"""),
 
     # A parameter never has a declared type's name: it would read as the declaration wherever a type is
     # unfolded, so a field of type Foo would be returned as whatever f's Foo stands for, and dup's Box
@@ -522,14 +519,6 @@ class CoreSoundnessTests(unittest.TestCase):
             """(type R (struct (a (array R 0)) (b u32)))
                (fun (unsafe) h (tuple u64 R) ((tuple u64 R)) (entry ((%t (tuple u64 R)))
                  (= %s (cast %t (tuple u64 R))) (ret %s)))""",
-            # A function value keeps a brand that a type argument's brand shares a name with: the kept one
-            # is renamed, so the value is quantified over a brand of its own beside the caller's.
-            """(fun g (forall ($b T) () T ((brand $b) T)
-                 (entry ((%w (brand $b)) (%x T)) (ret %x))))
-               (fun h (forall ($b) ()
-                   (fn (forall ($c) () (ptr (brand $b)) ((brand $c) (ptr (brand $b))))) ((brand $b) (ptr (brand $b)))
-                 (entry ((%w (brand $b)) (%p (ptr (brand $b)))) (= %f (fn (g _ (ptr (brand $b)))))
-                   (= %g (fn (g _ (ptr (brand $b))))) (= %v (call (%g $b) %w %p)) (ret %f))))""",
             # A foreach body names the caller's type parameter beside its own binder.
             """(fun m (forall (X Y) () (tuple X Y) (X Y)
                  (entry ((%x X) (%y Y)) (= %t (construct (tuple X Y) %x %y)) (ret %t))))

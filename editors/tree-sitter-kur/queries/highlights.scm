@@ -34,7 +34,6 @@
 
 (forall_clause parameter: (identifier) @type.parameter)
 (forall_clause determined: (identifier) @type.parameter)
-(forall_type parameter: (identifier) @type.parameter)
 (foreach_type binder: (identifier) @type.parameter)
 (foreach_expression binder: (identifier) @type.parameter)
 

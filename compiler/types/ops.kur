@@ -107,16 +107,6 @@ fn overlap(&cx: Domain!['k], a: ArenaSet[Span['k], 'k], b: ArenaSet[Span['k], 'k
     found
 }
 
-forall 'k.
-fn param_names(&cx: Domain!['k], params: ArenaVec[Param['k], 'k]) -> ArenaVec[Span['k], 'k] {
-    let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
-    var i = 0usize;
-    while i < params.len(&cx) {
-        out.push(&cx, params.at(&cx, i).name);
-        i = i + 1usize;
-    }
-    out
-}
 
 // `t` with every non-overlapping `old` replaced by `new`, left to right.
 forall 'k.
@@ -161,7 +151,6 @@ fn type_tag(t: Type['k]) -> u32 {
         Type::Exists(_x, _y) => 10u32,
         Type::Foreach(_x) => 11u32,
         Type::Fn(_x) => 12u32,
-        Type::Ignored => 13u32,
         Type::Meta(_x) => 14u32,
         Type::NonNull(_x) => 15u32,
     }
@@ -234,7 +223,7 @@ fn map_children(&cx: Domain!['k], ty: Type['k], transform: closure[Env](&_: Doma
                 i = i + 1usize;
             }
             let ret = transform(&cx, f.ret.copy(&cx));
-            Type::Fn.(FnType.{ params, ret: Ref::new(&cx, ret), quantified: f.quantified, is_unsafe: f.is_unsafe, places: f.places })
+            Type::Fn.(FnType.{ params, ret: Ref::new(&cx, ret), is_unsafe: f.is_unsafe, places: f.places })
         },
         _ => ty,
     }
@@ -267,23 +256,6 @@ fn subst(&cx: Domain!['k], ty: Type['k], sub: ArenaMap[Span['k], Type['k], 'k], 
             let (binders, inner) = rebind(&cx, ArenaVec::one(&cx, f.binder), sub, false, counter);
             Type::Foreach.(ForeachType.{ binder: binders.at(&cx, 0usize), indirect: f.indirect, source: Ref::new(&cx, source),
                 body: Ref::new(&cx, subst(&cx, f.body.copy(&cx), inner, counter)) })
-        },
-        Type::Fn(f) => {
-            let (names, inner) = rebind(&cx, param_names(&cx, f.quantified), sub, true, counter);
-            let params: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
-            var i = 0usize;
-            while i < f.params.len(&cx) {
-                params.push(&cx, subst(&cx, f.params.at(&cx, i), inner, counter));
-                i = i + 1usize;
-            }
-            let ret = subst(&cx, f.ret.copy(&cx), inner, counter);
-            let quantified: ArenaVec[Param['k], 'k] = ArenaVec::new(&cx);
-            var j = 0usize;
-            while j < names.len(&cx) {
-                quantified.push(&cx, Param.{ name: names.at(&cx, j), kind: f.quantified.at(&cx, j).kind });
-                j = j + 1usize;
-            }
-            Type::Fn.(FnType.{ params, ret: Ref::new(&cx, ret), quantified, is_unsafe: f.is_unsafe, places: f.places })
         },
         _ => map_children(&cx, ty, |&cx, child: Type['k]| subst(&cx, child, sub, counter)),
     }
@@ -380,9 +352,8 @@ fn free_names_in(&cx: Domain!['k], ty: Type['k], bound: ArenaSet[Span['k], 'k], 
             free_names_in(&cx, f.body.copy(&cx), with_names(&cx, bound, ArenaVec::one(&cx, f.binder)), only, out);
         },
         Type::Fn(f) => {
-            let inner = with_names(&cx, bound, param_names(&cx, f.quantified));
-            free_names_in(&cx, f.ret.copy(&cx), inner, only, out);
-            free_names_all(&cx, f.params, inner, only, out);
+            free_names_in(&cx, f.ret.copy(&cx), bound, only, out);
+            free_names_all(&cx, f.params, bound, only, out);
         },
         Type::Ptr(inner) => free_names_in(&cx, inner.copy(&cx), bound, only, out),
         Type::NonNull(inner) => free_names_in(&cx, inner.copy(&cx), bound, only, out),
@@ -570,14 +541,12 @@ fn extractable_in(&cx: Domain!['k], ty: Type['k], out: ArenaSet[Span['k], 'k]) {
     match ty {
         Type::Exists(_binders, _body) => (),
         Type::Foreach(f) => extractable_in(&cx, f.source.copy(&cx), out),
-        Type::Fn(f) => {
-            if f.quantified.is_empty(&cx) {
-                let parts = children(&cx, ty);
-                var i = 0usize;
-                while i < parts.len(&cx) {
-                    extractable_in(&cx, parts.at(&cx, i), out);
-                    i = i + 1usize;
-                }
+        Type::Fn(_f) => {
+            let parts = children(&cx, ty);
+            var i = 0usize;
+            while i < parts.len(&cx) {
+                extractable_in(&cx, parts.at(&cx, i), out);
+                i = i + 1usize;
             }
         },
         Type::Named(name, args) => {
@@ -750,12 +719,10 @@ fn equal_in(&cx: Domain!['k], a: Type['k], b: Type['k], env: Alpha['k]) -> bool 
         },
         Type::Fn(x) => match b {
             Type::Fn(y) => {
-                if x.is_unsafe != y.is_unsafe || !x.places.eq(&cx, y.places) || x.params.len(&cx) != y.params.len(&cx)
-                    || x.quantified.len(&cx) != y.quantified.len(&cx) || !same_kinds(&cx, x.quantified, y.quantified) {
+                if x.is_unsafe != y.is_unsafe || !x.places.eq(&cx, y.places) || x.params.len(&cx) != y.params.len(&cx) {
                     return false;
                 }
-                let inner = bind(&cx, env, param_names(&cx, x.quantified), param_names(&cx, y.quantified));
-                equal_in(&cx, x.ret.copy(&cx), y.ret.copy(&cx), inner) && equal_all(&cx, x.params, y.params, inner)
+                equal_in(&cx, x.ret.copy(&cx), y.ret.copy(&cx), env) && equal_all(&cx, x.params, y.params, env)
             },
             _ => false,
         },
@@ -1250,7 +1217,6 @@ impl Types['k] {
             Type::Brand(_b) => true,
             Type::Fn(_f) => true,
             Type::Never => true,
-            Type::Ignored => true,
             Type::Named(name, args) => {
                 if args.is_empty(&cx) && kinds.contains(&cx, name) {
                     return C::same_kind(kinds.at(&cx, name), Kind::Copy);
@@ -1768,17 +1734,6 @@ fn type_names(&cx: Domain!['k], ty: Type['k], out: ArenaSet[Span['k], 'k]) {
     let unit = match ty {
         Type::Named(name, _args) => { out.insert(&cx, name); },
         Type::Foreach(f) => { out.insert(&cx, f.binder); },
-        Type::Fn(f) => {
-            var i = 0usize;
-            while i < f.quantified.len(&cx) {
-                let param = f.quantified.at(&cx, i);
-                let unit = match param.kind {
-                    Kind::Brand => (),
-                    _ => { out.insert(&cx, param.name); },
-                };
-                i = i + 1usize;
-            }
-        },
         _ => (),
     };
     let parts = children(&cx, ty);
@@ -1888,23 +1843,6 @@ fn source(&cx: Domain!['k], ty: Type['k], surface: Surface['k]) -> Span['k] {
         },
         Type::Fn(f) => {
             var out = Buffer!::new();
-            if !f.quantified.is_empty(&cx) {
-                out = out.push_static("forall ");
-                var q = 0usize;
-                while q < f.quantified.len(&cx) {
-                    if q > 0usize {
-                        out = out.push_static(", ");
-                    }
-                    let param = f.quantified.at(&cx, q);
-                    let shown = match param.kind {
-                        Kind::Brand => surface.brand(&cx, param.name),
-                        _ => surface.name(&cx, param.name),
-                    };
-                    out = out.push_bytes(&cx, shown);
-                    q = q + 1usize;
-                }
-                out = out.push_static(". ");
-            }
             if f.is_unsafe {
                 out = out.push_static("unsafe ");
             }
@@ -2083,12 +2021,10 @@ fn differ_in(&cx: Domain!['k], a: Type['k], b: Type['k], env: Alpha['k], found: 
         },
         Type::Fn(x) => match b {
             Type::Fn(y) => {
-                if x.is_unsafe != y.is_unsafe || !x.places.eq(&cx, y.places) || x.params.len(&cx) != y.params.len(&cx)
-                    || x.quantified.len(&cx) != y.quantified.len(&cx) || !same_kinds(&cx, x.quantified, y.quantified) {
+                if x.is_unsafe != y.is_unsafe || !x.places.eq(&cx, y.places) || x.params.len(&cx) != y.params.len(&cx) {
                     return false;
                 }
-                let inner = bind(&cx, env, param_names(&cx, x.quantified), param_names(&cx, y.quantified));
-                differ_all(&cx, x.params, y.params, inner, found) && differ_in(&cx, x.ret.copy(&cx), y.ret.copy(&cx), inner, found)
+                differ_all(&cx, x.params, y.params, env, found) && differ_in(&cx, x.ret.copy(&cx), y.ret.copy(&cx), env, found)
             },
             _ => false,
         },

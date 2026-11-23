@@ -23,7 +23,6 @@ fn formation_children(&cx: Domain!['k], ty: Type['k]) -> ArenaVec[Type['k], 'k] 
     match ty {
         Type::Exists(_binders, _body) => ArenaVec::new(&cx),
         Type::Foreach(f) => ArenaVec::one(&cx, f.source.copy(&cx)),
-        Type::Fn(f) => if f.quantified.is_empty(&cx) { children(&cx, ty) } else { ArenaVec::new(&cx) },
         _ => children(&cx, ty),
     }
 }
@@ -68,15 +67,6 @@ fn brand_occurs(&cx: Domain!['k], ty: Type['k], label: Span['k]) -> bool {
         Type::Exists(binders, _body) => {
             if binders.contains(&cx, label) {
                 return false;
-            }
-        },
-        Type::Fn(f) => {
-            var i = 0usize;
-            while i < f.quantified.len(&cx) {
-                if f.quantified.at(&cx, i).name.eq(&cx, label) {
-                    return false;
-                }
-                i = i + 1usize;
             }
         },
         _ => (),
@@ -151,13 +141,6 @@ fn params_of(&cx: Domain!['k], names: ArenaVec[Span['k], 'k], kind: Kind) -> Are
     out
 }
 
-forall 'k.
-fn is_ignored(t: Type['k]) -> bool {
-    match t {
-        Type::Ignored => true,
-        _ => false,
-    }
-}
 
 forall D, 'k where Copy[D], Discharge[D, 'k].
 impl Formation[D, 'k] {
@@ -234,7 +217,7 @@ impl Formation[D, 'k] {
         }
     }
 
-    fn arguments(self, &cx: Domain!['k], params: ArenaVec[Param['k], 'k], args: ArenaVec[Type['k], 'k], env: ArenaMap[Span['k], Kind, 'k], retain: bool) {
+    fn arguments(self, &cx: Domain!['k], params: ArenaVec[Param['k], 'k], args: ArenaVec[Type['k], 'k], env: ArenaMap[Span['k], Kind, 'k]) {
         if params.len(&cx) != args.len(&cx) {
             self.fail_static(&cx, "wrong number of type arguments");
         }
@@ -242,12 +225,9 @@ impl Formation[D, 'k] {
         while i < params.len(&cx) {
             let param = params.at(&cx, i);
             let arg = args.at(&cx, i);
-            let skip = retain && is_brand(param.kind) && is_ignored(arg);
-            if !skip {
-                self.fits(&cx, arg, param.kind, env);
-                if !is_brand(param.kind) {
-                    self.flat(&cx, arg, "a type argument");
-                }
+            self.fits(&cx, arg, param.kind, env);
+            if !is_brand(param.kind) {
+                self.flat(&cx, arg, "a type argument");
             }
             i = i + 1usize;
         }
@@ -262,7 +242,7 @@ impl Formation[D, 'k] {
                 Option::None => self.fail(&cx, Buffer!::new().push_static("unknown trait ").push_bytes(&cx, premise.trait_name).save(&cx)),
             }
         };
-        self.arguments(&cx, params, premise.args, env, false);
+        self.arguments(&cx, params, premise.args, env);
     }
 
     fn trait_params(self, &cx: Domain!['k], t: Trait['k]) -> ArenaVec[Param['k], 'k] {
@@ -342,13 +322,6 @@ impl Formation[D, 'k] {
                 self.flat(&cx, f.body.copy(&cx), "a foreach body");
             },
             Type::Fn(f) => {
-                var i = 0usize;
-                while i < f.quantified.len(&cx) {
-                    if !is_brand(f.quantified.at(&cx, i).kind) {
-                        self.fail_static(&cx, "function values quantify only brands");
-                    }
-                    i = i + 1usize;
-                }
                 var j = 0usize;
                 while j < f.places.len(&cx) {
                     if f.places.at(&cx, j) >= f.params.len(&cx) {
@@ -356,20 +329,12 @@ impl Formation[D, 'k] {
                     }
                     j = j + 1usize;
                 }
-                let inner = self.extend(&cx, env, f.quantified);
-                let mark = self.opened.len(&cx);
-                var q = 0usize;
-                while q < f.quantified.len(&cx) {
-                    self.opened.push(&cx, f.quantified.at(&cx, q).name);
-                    q = q + 1usize;
-                }
                 var k = 0usize;
                 while k < f.params.len(&cx) {
-                    self.fits(&cx, f.params.at(&cx, k), Kind::Any, inner);
+                    self.fits(&cx, f.params.at(&cx, k), Kind::Any, env);
                     k = k + 1usize;
                 }
-                self.fits(&cx, f.ret.copy(&cx), Kind::Any, inner);
-                self.opened.truncate(&cx, mark);
+                self.fits(&cx, f.ret.copy(&cx), Kind::Any, env);
             },
             Type::Prim(name) => {
                 if !C::is_prim(&cx, name) {
@@ -384,7 +349,6 @@ impl Formation[D, 'k] {
                 }
                 self.components(&cx, ty, variants, env);
             },
-            Type::Ignored => self.fail_static(&cx, "_ is only a retained fn brand argument"),
             Type::Ptr(_inner) => self.children_fit(&cx, ty, env, "a pointee"),
             Type::NonNull(_inner) => self.children_fit(&cx, ty, env, "a pointee"),
             Type::Tuple(_elems) => self.children_fit(&cx, ty, env, "a component"),
@@ -442,7 +406,7 @@ impl Formation[D, 'k] {
             Option::Some(d) => d,
             Option::None => self.fail(&cx, Buffer!::new().push_static("unknown type ").push_bytes(&cx, name).save(&cx)),
         };
-        self.arguments(&cx, decl.params, args, env, false);
+        self.arguments(&cx, decl.params, args, env);
         let discharger = match self.discharge.copy(&cx) {
             Option::Some(d) => d,
             Option::None => {
@@ -594,9 +558,9 @@ impl Formation[D, 'k] {
             };
             let call = instr.op.is(&cx, "call") || instr.op.is(&cx, "fn");
             if call && self.program.funs.contains(&cx, instr.args.at(&cx, 0usize)) {
-                self.arguments(&cx, self.program.funs.at(&cx, instr.args.at(&cx, 0usize)).params, instr.tys, scope, instr.op.is(&cx, "fn"));
-            } else if call && self.program.externs.contains(&cx, instr.args.at(&cx, 0usize)) {
-                self.arguments(&cx, ArenaVec::new(&cx), instr.tys, scope, false);
+                self.arguments(&cx, self.program.funs.at(&cx, instr.args.at(&cx, 0usize)).params, instr.tys, scope);
+            } else if call && (self.program.externs.contains(&cx, instr.args.at(&cx, 0usize)) || instr.args.at(&cx, 0usize).starts_with(&cx, Span::from_static(&cx, "%"))) {
+                self.arguments(&cx, ArenaVec::new(&cx), instr.tys, scope);
             } else if instr.op.is(&cx, "foreach") && self.program.funs.contains(&cx, instr.args.at(&cx, 1usize)) {
                 let count = match instr.ty {
                     Option::Some(t) => match t {
@@ -614,7 +578,7 @@ impl Formation[D, 'k] {
                     }
                     q = q + 1usize;
                 }
-                self.arguments(&cx, mapper.params.skip(&cx, count), instr.tys, scope, false);
+                self.arguments(&cx, mapper.params.skip(&cx, count), instr.tys, scope);
             } else if instr.op.is(&cx, "trait_call") {
                 self.premise(&cx, Premise.{ trait_name: instr.args.at(&cx, 0usize), args: instr.tys }, scope);
             } else {

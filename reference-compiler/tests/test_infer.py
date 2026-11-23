@@ -3,7 +3,7 @@
 import unittest
 
 from kursal import core as C
-from kursal.infer import FnCall, InferError, TraitCall, infer
+from kursal.infer import FnCall, InferError, TraitCall, ValueCall, infer
 from kursal.core import ModuleId
 from kursal.resolve import resolve
 from kursal.sigs import signatures
@@ -143,13 +143,14 @@ instance Next[Wrap[T] -> I] {
 
     def test_function_values(self):
         r = run("fn bump(&c: Cur) -> u32 { 0u32 }\nforall 'k. fn take(b: core::cap::Brand['k]) -> u32 { 0u32 }\n"
-                "fn f() -> u32 { let g = bump; let h = take; 0u32 }\n")
+                "forall 'r. fn f(b: core::cap::Brand['r]) -> u32 { let g = bump; let h = take; h(b) }\n")
         g, h = stmt_types(r, "f")
         self.assertEqual(g, C.Fn((named("Cur"),), U32, places=frozenset({0})))
-        self.assertEqual(len(h.forall), 1)
+        # A function value quantifies nothing: its brand is inferred from the call.
+        self.assertEqual(h, C.Fn((C.Brand(C.Skolem("r")),), U32))
         body = fn(r, "f").body
         self.assertEqual(body.stmts[0].value.call.name, "p::bump")
-        self.assertEqual(body.stmts[1].value.call.targs, (C.Ignored(),))
+        self.assertEqual(body.stmts[1].value.call.targs, (C.Skolem("r"),))
 
     def test_call_metadata_orders_arguments_and_preserves_foreign_symbols(self):
         r = run("extern \"C\" fn foreign(x: u32) -> u32;\n"
@@ -162,7 +163,8 @@ instance Next[Wrap[T] -> I] {
         pick, foreign = (s.value.call for s in body.stmts[:2])
         self.assertEqual((pick.name, pick.targs), ("p::pick", (U32, BOOL)))
         self.assertEqual((foreign.name, foreign.targs), ("foreign", ()))
-        self.assertEqual(body.tail.call.targs, (C.Skolem("r"),))
+        self.assertEqual(body.stmts[2].value.call.targs, (C.Skolem("r"),))
+        self.assertIsInstance(body.tail.call, ValueCall)
 
     def test_lent_match_and_tuple_constructors(self):
         r = run("exposed tuple Pair(u32, bool);\n"

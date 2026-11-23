@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from typing import Sequence
 
 from . import core as C
 from .types import map_children
@@ -52,8 +53,6 @@ def type_key(ty: C.Type, scope: tuple[str, ...] = ()) -> str:
             parts = ("prim", n)
         case C.Never():
             parts = ("never",)
-        case C.Ignored():
-            parts = ("ignored",)
         case C.Tuple(elems=elems):
             parts = ("tuple", *(key(t) for t in elems))
         case C.Struct(fields=fields) | C.Enum(variants=fields):
@@ -67,13 +66,16 @@ def type_key(ty: C.Type, scope: tuple[str, ...] = ()) -> str:
         case C.Foreach():
             parts = ("foreach", str(ty.indirect), key(ty.source), type_key(ty.body, (*scope, ty.binder)))
         case C.Fn():
-            inner = scope + tuple(p.name for p in ty.forall)
             parts = ("fn", str(ty.unsafe), encode(tuple(map(str, sorted(ty.places)))),
-                     encode(tuple(p.kind for p in ty.forall)),
-                     encode(tuple(type_key(t, inner) for t in ty.params)), type_key(ty.ret, inner))
+                     encode(tuple(key(t) for t in ty.params)), key(ty.ret))
         case _:
             raise TypeError(f"cannot mangle type {ty!r}")
     return encode(parts)
+
+
+def signature_key(params: Sequence[C.Param], ty: C.Fn) -> str:
+    """A generic function's signature `ty`, its parameters `params` bound, so renaming them keeps the key."""
+    return encode((encode(tuple(p.kind for p in params)), type_key(ty, tuple(p.name for p in params))))
 
 
 def path_segments(name: str) -> tuple[str, ...]:

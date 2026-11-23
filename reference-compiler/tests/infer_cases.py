@@ -16,8 +16,7 @@ def manifest(name: str, deps: tuple[str, ...] = ()) -> str:
 
 SHOW = "trait Show { fn show(x: Self) -> u32; }\ninstance Show[u32] { fn show(x: u32) -> u32 { x } }\n"
 OTHER = "trait Other { fn show(x: Self) -> u32; }\ninstance Other[u32] { fn show(x: u32) -> u32 { 0u32 } }\n"
-KEPT_BRAND = ("forall 'k. struct Tok { w: core::cap::Brand['k] }\n"
-              "forall 'b, T. fn g(w: core::cap::Brand['b], t: T) -> T { t }\n")
+BRAND_VALUE = "forall 'b, T. fn g(w: core::cap::Brand['b], t: T) -> T { t }\n"
 NEXT = ("trait Next { fn step(x: Self) -> u32; }\ninstance Next[u32] { fn step(x: u32) -> u32 { x } }\n"
         "forall I where Next[I]. impl I { fn twice(self) -> u32 { 0u32 } }\n")
 
@@ -186,8 +185,8 @@ INFERENCES = (
     'exposed struct S { a: u32, b: u32 }\nfn main() -> i32 {\n    let s = S.{ a: 7u32, b: 9u32 };\n'
     '    let t = foreach a: A of s { let c: A = a; c };\n    let u = foreach b: A of s { let d: A = b; d };\n'
     '    let { a: x, b: y } = u;\n    (x + y) as i32\n}\n',
-    # A function value keeps its brand quantified beside the caller's brand of the same name.
-    KEPT_BRAND + "forall 'b. fn h(w: core::cap::Brand['b]) -> forall 'c. fn(core::cap::Brand['c], u32) -> u32 {\n"
+    # A function value quantifies nothing: its brand is inferred from its call, here h's 'b.
+    BRAND_VALUE + "forall 'b. fn h(w: core::cap::Brand['b]) -> fn(core::cap::Brand['b], u32) -> u32 {\n"
     "    let f = g;\n    let n = f(w, 1u32);\n    f\n}\n",
     # A map's binder may be named as the binder of the value it maps, which binds nothing in its body.
     "exposed struct S { a: u32, b: u32 }\nfn main() -> i32 {\n    let s = S.{ a: 7u32, b: 9u32 };\n"
@@ -251,7 +250,6 @@ INFER_ERRORS = (
     ('forall T. fn bad(x: T) -> T { -x } fn main() -> i32 { 7i32 }', 'operator - is'),
     ('forall T. fn bad(x: T) -> T { !x } fn main() -> i32 { 7i32 }', 'operator ! is'),
     ('exposed struct Callable { env: u32, code: fn() -> u32 }\nfn code() -> u32 { 4u32 }\n                    fn main() -> i32 {\n                        let code_value = code;\n                        let f = Callable.{ env: 4u32, code: code_value };\n                        (f() as i32)\n                    }', 'a closure code'),
-    ("exposed struct Callable { env: u32, code: forall 'a. fn(u32) -> u32 }\nforall 'a. fn code(env: u32) -> u32 { env }\n                    fn main() -> i32 {\n                        let code_value = code;\n                        let f = Callable.{ env: 4u32, code: code_value };\n                        (f() as i32)\n                    }", 'a closure code'),
     ('exposed struct Callable { code: fn(u32) -> u32 }\n                    fn code(env: u32) -> u32 { env }\n                    fn main() -> i32 {\n                        let f = Callable.{ code: code };\n                        (f() as i32)\n                    }', 'a closure must'),
     ('exposed struct Callable { env: bool, code: fn(u32) -> u32 }\n                    fn code(env: u32) -> u32 { env }\n                    fn main() -> i32 {\n                        let f = Callable.{ env: true, code: code };\n                        (f() as i32)\n                    }', 'type mismatch: bool'),
     ('fn main() -> i32 { const T: u32 = 5u8; 0i32 }', '1:35: const T has type u8, but its declared type is u32'),
@@ -340,14 +338,13 @@ INFER_ERRORS = (
      "6:27: brand mismatch: Ref[u32, 'a] and Ref[u32, 'b]; 'a was opened at 3:5, 'b at 4:5"),
     ("fn f() -> u32 {\n    let x = {\n        let exists 'a. w = core::cap::fresh();\n        w\n    };\n    0u32\n}\n",
      "2:13: brand 'a escapes its lexical scope"),
-    # A brand a function value keeps is its own, under a name no source spells, which the message writes
-    # numbered beside a brand that reads the same ('b1): g's T is h's Tok['b], not one over the kept brand.
-    (KEPT_BRAND + "forall 'b. fn h(w: core::cap::Brand['b], t: Tok['b]) -> "
-     "forall 'b. fn(core::cap::Brand['b], Tok['b]) -> Tok['b] {\n    let f = g;\n    let u: Tok['b] = f(w, t);\n    f\n}\n",
-     "3:113: brand mismatch: forall 'b1. fn(Brand['b1], Tok['b]) -> Tok['b] and forall 'b. fn(Brand['b], Tok['b]) -> Tok['b]"),
-    (KEPT_BRAND + "forall 'q. fn h(w: core::cap::Brand['q], t: Tok['q]) -> "
-     "forall 'b. fn(core::cap::Brand['b], Tok['b]) -> Tok['b] {\n    let f = g;\n    let u: Tok['q] = f(w, t);\n    f\n}\n",
-     "3:113: brand mismatch: forall 'b1. fn(Brand['b1], Tok['q]) -> Tok['q] and forall 'b. fn(Brand['b], Tok['b]) -> Tok['b]"),
+    # A function value quantifies nothing: its brands are fixed where it is named, so it is called at one
+    # brand only, and a brand no use determines is an error.
+    (BRAND_VALUE + "forall 'b, 'q. fn h(w: core::cap::Brand['b], v: core::cap::Brand['q]) -> u32 {\n"
+     "    let f = g;\n    let m = f(w, 1u32);\n    f(v, 2u32)\n}\n",
+     "5:5: brand mismatch: Brand['q] and Brand['b]"),
+    (BRAND_VALUE + "fn h() -> u32 {\n    let f = g;\n    0u32\n}\n",
+     "3:13: cannot infer the type argument 'b of g"),
     ("forall T. fn apply(x: T, f: closure(T) -> u32) -> u32 {\n    let n: u32 = f;\n    n\n}\n",
      "2:18: type mismatch: struct { env: Env, code: fn(Env, T) -> u32 } and u32"),
     ("fn f() -> u32 {\n    let items = foreach item of (1u32, 2u32) { (item, 1u32) };\n    items + 1u32\n}\n",
@@ -385,7 +382,7 @@ INFER_ERRORS = (
      "fn main() -> i32 {\n    let b = B.{ x: 1u32 };\n    b.m() as i32\n}\n",
      "5:5: cannot infer the type argument T of m"),
     ("forall 'a. fn f(x: u32) -> u32 { x }\nfn main() -> i32 {\n    let g = f;\n    g(1u32) as i32\n}\n",
-     "4:5: cannot infer the type argument 'a of g"),
+     "3:13: cannot infer the type argument 'a of f"),
     # Missing fields, listed in alphabetical order.
     ("exposed struct P { b: u32, a: u32 }\nfn f() -> P { P.{ } }\n", "2:15: missing fields a and b"),
     ("exposed struct P { c: u32, b: u32, d: u32, a: u32 }\nfn f() -> P { P.{ b: 1u32 } }\n", "2:15: missing fields a, c and d"),

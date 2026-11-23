@@ -34,7 +34,7 @@ use package::sigs::signatures::{ConstValue, InstanceSig, Sig, Signatures, const_
 use package::syntax::ast as S;
 use package::syntax::ast::{Expr, Pattern, Pos, Statement, no_pos};
 use package::types::termination::check_instance_termination;
-use package::types::ops::{Fresh, Surface, Types, brand_differences, brand_name, equal, free_brands, free_names, fresh, made_from, mapped_component, subst, surface};
+use package::types::ops::{Fresh, Surface, Types, brand_differences, brand_name, equal, free_brands, free_names, made_from, mapped_component, subst, surface};
 use package::types::unify::{ground, instantiate, match_head, prune, unify, zonk};
 use std::collections::hashmap::OwnedMap!;
 use std::collections::vec::OwnedVec!;
@@ -70,12 +70,12 @@ impl FnCall['k] {
         }
     }
 
-    // In signature order; Ignored retains a function value's brand binder.
+    // In signature order.
     fn targs(self, &cx: Domain!['k]) -> ArenaVec[Type['k], 'k] {
         let out: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < self.sig.params.len(&cx) {
-            out.push(&cx, self.sub.get_or(&cx, self.sig.params.at(&cx, i).name, Type::Ignored));
+            out.push(&cx, self.sub.at(&cx, self.sig.params.at(&cx, i).name));
             i = i + 1usize;
         }
         out
@@ -95,8 +95,8 @@ forall 'k.
 exposed enum Callee {
     Fn(FnCall['k]),
     Trait(TraitCall['k]),
-    // a function value, with its brand instantiation
-    Value(ArenaMap[Span['k], Type['k], 'k]),
+    // a function value
+    Value,
     Closure,
     Variant(Span['k]),
     Tuple,
@@ -523,9 +523,7 @@ exposed struct Infer {
     ids: Ref[u32, 'k],
     counter: Fresh['k],
     out: Results['k],
-    // inference-only flags: bare function names bound without an annotation, calls whose receiver
-    // `&` lends
-    generic: ArenaSet[u32, 'k],
+    // inference-only flags: calls whose receiver `&` lends
     lend_marked: ArenaSet[u32, 'k],
     // an opened brand's label -> where its `let exists` is
     origins: ArenaMap[Span['k], Pos, 'k],
@@ -551,7 +549,7 @@ impl Infer['k] {
         let program = Program.{ types: sigs.types, funs: ArenaMap::new(&cx), externs: ArenaMap::new(&cx), datas: ArenaMap::new(&cx), traits: sigs.traits, instances: ArenaMap::new(&cx) };
         let inf = Infer.{
             r, sigs, types: Types::new(&cx, program, counter), decl_of: ArenaMap::new(&cx), inputs: ArenaMap::new(&cx), instances: ArenaMap::new(&cx),
-            visible: ArenaMap::new(&cx), ids: Ref::new(&cx, 0u32), counter, out: new_results(&cx), generic: ArenaSet::new(&cx), lend_marked: ArenaSet::new(&cx),
+            visible: ArenaMap::new(&cx), ids: Ref::new(&cx, 0u32), counter, out: new_results(&cx), lend_marked: ArenaSet::new(&cx),
             origins: ArenaMap::new(&cx),
         };
         let scopes = r.scopes.values(&cx);
@@ -970,7 +968,6 @@ impl Body['k] {
             let unit = match out.calls.get(&cx, id) {
                 Option::Some(call) => match call {
                     Callee::Fn(f) => zonk_map(&cx, f.sub),
-                    Callee::Value(sub) => zonk_map(&cx, sub),
                     Callee::Trait(t) => zonk_all(&cx, t.targs),
                     Callee::TypedBuiltin(name, t) => { out.calls.insert(&cx, id, Callee::TypedBuiltin.(name, zonk(&cx, t))); },
                     _ => (),
@@ -1559,7 +1556,6 @@ impl Body['k] {
                     return self.let_exists(&cx, l);
                 }
                 let want = self.opt_type(&cx, l.type);
-                self.generic(&cx, l.value, want);
                 let got = self.check(&cx, l.value, want);
                 self.pattern(&cx, l.pattern, match want {
                     Option::Some(t) => t,
@@ -1569,7 +1565,6 @@ impl Body['k] {
             },
             Statement::Var(v) => {
                 let want = self.opt_type(&cx, v.type);
-                self.generic(&cx, v.value, want);
                 let got = self.check(&cx, v.value, want);
                 let local = self.bind(&cx, v.name, match want {
                     Option::Some(t) => t,
@@ -1597,15 +1592,6 @@ impl Body['k] {
         }
     }
 
-    // A bare function name bound with no annotation keeps its quantified brands.
-    fn generic(self, &cx: Domain!['k], value: Expr['k], want: Option[Type['k]]) {
-        if want.is_none() {
-            let unit = match value {
-                Expr::Path(p) => { self.inf.generic.insert(&cx, p.id); },
-                _ => (),
-            };
-        }
-    }
 
     fn let_exists(self, &cx: Domain!['k], l: S::Let['k]) -> bool {
         let package = self.shape(&cx, self.expr(&cx, l.value), l.pos);
@@ -2022,49 +2008,15 @@ impl Body['k] {
         self.fail(&cx, Buffer!::new().push_bytes(&cx, p.names(&cx).join(&cx, "::")).push_static(" is not a value").save(&cx), p.pos)
     }
 
-    // A named function keeps its declared parameter modes and result type. Bare names bound by let
-    // retain unconstrained brand quantifiers; other parameters are instantiated at the occurrence.
+    // A named function keeps its declared parameter modes and result type. A function value quantifies
+    // nothing: every parameter, brands included, is instantiated at the occurrence, written or inferred
+    // from how the value is used.
     fn function_value(self, &cx: Domain!['k], p: S::Path['k], sig: Sig['k]) -> Type['k] {
-        let retain = self.inf.generic.contains(&cx, p.id) && !has_args(&cx, p);
-        let kept: ArenaVec[Param['k], 'k] = ArenaVec::new(&cx);
-        let open: ArenaVec[Param['k], 'k] = ArenaVec::new(&cx);
-        var i = 0usize;
-        while i < sig.params.len(&cx) {
-            let param = sig.params.at(&cx, i);
-            var keep = retain && is_brand(param.kind);
-            var k = 0usize;
-            while keep && k < sig.premises.len(&cx) {
-                let args = sig.premises.at(&cx, k).args;
-                var a = 0usize;
-                while keep && a < args.len(&cx) {
-                    keep = !free_names(&cx, zonk(&cx, args.at(&cx, a))).contains(&cx, param.name);
-                    a = a + 1usize;
-                }
-                k = k + 1usize;
-            }
-            if keep {
-                kept.push(&cx, param);
-            } else {
-                open.push(&cx, param);
-            }
-            i = i + 1usize;
-        }
-        let sub = self.instantiate_at(&cx, open, last_name(&cx, p), p.pos);
+        let sub = self.instantiate_at(&cx, sig.params, last_name(&cx, p), p.pos);
         self.explicit_args(&cx, p, sig, sub);
         self.results().calls.insert(&cx, p.id, Callee::Fn.(FnCall.{ sig, sub, receiver: Option::None }));
         self.require_signature(&cx, sig, sub, p.pos);
-        // A kept brand gets a name no source spells: a type argument solved later never captures it.
-        let whole = sub.clone(&cx);
-        let labels: ArenaVec[Param['k], 'k] = ArenaVec::new(&cx);
-        var j = 0usize;
-        while j < kept.len(&cx) {
-            let param = kept.at(&cx, j);
-            let label = fresh(&cx, param.name, self.inf.counter);
-            whole.insert(&cx, param.name, Type::Skolem.(label));
-            labels.push(&cx, Param.{ name: label, kind: Kind::Brand });
-            j = j + 1usize;
-        }
-        C::fn_type(&cx, self.subst_all(&cx, sig.ptypes, whole), subst(&cx, sig.ret, whole, self.inf.counter), labels, sig.is_unsafe, sig.places)
+        C::fn_type(&cx, self.subst_all(&cx, sig.ptypes, sub), subst(&cx, sig.ret, sub, self.inf.counter), sig.is_unsafe, sig.places)
     }
 
     // Type arguments written on a callee path: on its last segment, the function's own; on the type
@@ -2559,7 +2511,7 @@ impl Body['k] {
         let env = Type::Tuple.(env_types);
         let code_params = ArenaVec::one(&cx, env);
         code_params.append(&cx, params);
-        let code = C::fn_type(&cx, code_params, ret, ArenaVec::new(&cx), false, places);
+        let code = C::fn_type(&cx, code_params, ret, false, places);
         Type::Struct.(ArenaVec::two(&cx, Member.{ name: Span::from_static(&cx, "env"), type: env }, Member.{ name: Span::from_static(&cx, "code"), type: code }))
     }
 
@@ -2969,9 +2921,6 @@ impl Body['k] {
                     Type::Fn(f) => f,
                     _ => self.fails(&cx, "a closure code field must have a function type", pos),
                 };
-                if !code.quantified.is_empty(&cx) {
-                    self.fails(&cx, "a closure code field must have a monomorphic function type", pos);
-                }
                 if code.params.is_empty(&cx) || code.places.contains(&cx, 0usize) {
                     self.fails(&cx, "a closure code function must take its environment by value first", pos);
                 }
@@ -2987,15 +2936,10 @@ impl Body['k] {
             },
             Option::None => match s {
                 Type::Fn(f) => {
-                    let owner = match w.call.callee.copy(&cx) {
-                        Expr::Path(callee) => last_name(&cx, callee),
-                        _ => Span::from_static(&cx, "the callee"),
-                    };
-                    let sub = self.instantiate_at(&cx, f.quantified, owner, pos);
-                    self.results().calls.insert(&cx, w.call.id, Callee::Value.(sub));
-                    ptypes.append(&cx, self.subst_all(&cx, f.params, sub));
+                    self.results().calls.insert(&cx, w.call.id, Callee::Value);
+                    ptypes.append(&cx, f.params);
                     places.append(&cx, f.places);
-                    subst(&cx, f.ret.copy(&cx), sub, self.inf.counter)
+                    f.ret.copy(&cx)
                 },
                 _ => self.fail(&cx, Buffer!::new().push_bytes(&cx, self.shown(&cx, zonk(&cx, w.callee))).push_static(" is not callable").save(&cx), pos),
             },

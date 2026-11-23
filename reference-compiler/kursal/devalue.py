@@ -93,7 +93,7 @@ def devalue_type(ty: Type) -> Type:
     if isinstance(ty, Fn) and ty.places:
         params = tuple(devalue_type(p) for p in ty.params)
         ret = Tuple((devalue_type(ty.ret), *(params[i] for i in sorted(ty.places))))
-        return Fn(params, ret, ty.forall, ty.unsafe)
+        return Fn(params, ret, ty.unsafe)
     return map_children(ty, devalue_type)
 
 

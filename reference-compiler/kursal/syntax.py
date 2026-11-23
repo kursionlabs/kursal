@@ -101,11 +101,6 @@ class TForeach:
     body: Type
 
 
-@dataclass
-class TForall:
-    params: tuple[str, ...]
-    body: Type
-
 
 @dataclass
 class TBrand:
@@ -140,8 +135,6 @@ class Path(ResolvedName, Inferred):
     # Inference -> lowering: binding ID for a local, or folded value for a constant.
     binder: int = field(init=False, repr=False, compare=False)
     folded: Optional[ConstValue] = field(default=None, init=False, repr=False, compare=False)
-    # Inference-only flag: an unannotated binding may retain a function's brand quantifiers.
-    generic: bool = field(default=False, init=False, repr=False, compare=False)
     # Inference -> lowering: function value or variant constructor (including direct variant calls).
     call: Optional[FnCall | VariantCall] = field(default=None, init=False, repr=False, compare=False)
 
@@ -531,7 +524,7 @@ class InstanceDecl(Declaration):
 type NamePath = tuple[str, ...]
 type Type = (
     TName | TPtr | TNever | TTuple | TArray | TFn | TClosure
-    | TExists | TForeach | TForall | TBrand | TIgnored
+    | TExists | TForeach | TBrand | TIgnored
 )
 type Expr = (
     Lit | FStr | Path | Tuple | Array | StructLit | Block | If | Match

@@ -40,8 +40,6 @@ def type_text(ty: C.Type, depth: int = 0) -> str:
             return name + arguments(args, depth)
         case C.Never():
             return "Never"
-        case C.Ignored():
-            return "_"
         case C.Skolem(label=label):
             return brand(label)
         case C.Brand(brand=witness):
@@ -67,9 +65,9 @@ def type_text(ty: C.Type, depth: int = 0) -> str:
             return "exists " + ", ".join(map(brand, binders)) + ". " + type_text(body, depth)
         case C.Foreach(binder=binder, indirect=indirect, source=source, body=body):
             return f"foreach {'*' if indirect else ''}{binder} of {type_text(source, depth)} => {type_text(body, depth)}"
-        case C.Fn(params=params, ret=ret, forall=forall, unsafe=unsafe, places=places):
+        case C.Fn(params=params, ret=ret, unsafe=unsafe, places=places):
             modes = ", ".join(("&" if index in places else "") + type_text(param, depth) for index, param in enumerate(params))
-            return quantifier(forall, ()) + ("unsafe " if unsafe else "") + f"fn({modes}) -> {type_text(ret, depth)}"
+            return ("unsafe " if unsafe else "") + f"fn({modes}) -> {type_text(ret, depth)}"
     raise ValueError(f"unsupported readable KURS type: {ty!r}")
 
 

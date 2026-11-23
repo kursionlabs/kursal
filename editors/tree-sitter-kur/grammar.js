@@ -239,7 +239,6 @@ module.exports = grammar({
       $.closure_type,
       $.exists_type,
       $.foreach_type,
-      $.forall_type,
     ),
 
     named_type: $ => seq(
@@ -313,13 +312,6 @@ module.exports = grammar({
       field('body', $._type),
     ),
 
-    forall_type: $ => seq(
-      'forall',
-      field('parameter', $._forall_parameter),
-      repeat(seq(',', field('parameter', $._forall_parameter))),
-      '.',
-      field('body', $._type),
-    ),
 
     // --------------------------------------------------------- statements --
 

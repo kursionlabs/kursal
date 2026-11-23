@@ -7,7 +7,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence, Set
 from typing import Never as NoReturn, Optional
 from dataclasses import dataclass, field
 from .core import (ATOMIC_OPS, UNSAFE_OPS, BOOL, BRAND, COPY, FLOATS, INTEGERS, U32, UNIT, USIZE, Array, Brand, Enum, Exists, Fn,
-                   Foreach, Ignored, Jmp, Jnz, Named, Never, NonNull, Prim, Ptr, Ret, Skolem, Struct, Switch, Tuple,
+                   Foreach, Jmp, Jnz, Named, Never, NonNull, Prim, Ptr, Ret, Skolem, Struct, Switch, Tuple,
                    Unreachable, Type, Kind, Program, Fun, Instance, Param, Premise, Block, Instr, Terminator, Edge, ModuleId)
 from .sexpr import Form, KursError, List, Position, Str
 from .types import Kinds, children, foreach_item, mapped_component, mapped_operand, Types, equal, fits, free_brands, fresh, subst
@@ -553,8 +553,6 @@ class Checker:
         sub = {}
         for p, t in zip(params, tys):
             if p.kind == BRAND:
-                if isinstance(t, Ignored):
-                    continue
                 if not isinstance(t, Skolem) or t.label not in self.brands:
                     self.fail("brand_argument_scope")
             elif p.kind == COPY and not self.copy_type(t):
@@ -573,8 +571,9 @@ class Checker:
             ty = self.use(callee)
             if not isinstance(ty, Fn):
                 self.fail("function_value")
-            sub = self.instantiate(ty.forall, (), tys, callee)
-            return [subst(t, sub) for t in ty.params], subst(ty.ret, sub), ty.unsafe, ty.places
+            if tys:
+                self.fail("takes_type_arguments_got")
+            return list(ty.params), ty.ret, ty.unsafe, ty.places
         if callee in self.program.externs:
             ext = self.program.externs[callee]
             if ext.ptypes is None or ext.ret is None:
@@ -828,15 +827,8 @@ class Checker:
         fun = self.program.funs.get(name)
         if fun is None:
             self.fail("unknown_function")
-        retained = tuple(p for p, t in zip(fun.params, instr.tys) if p.kind == BRAND and isinstance(t, Ignored))
-        retained_brands = {param.name for param in retained}
-        # A function value may keep brands quantified, but no premise on them: every premise is discharged
-        # where the value is made.
-        if any(retained_brands & free_brands(arg) for premise in fun.premises for arg in premise.args):
-            self.fail("retained_brand_with_premise")
         sub = self.instantiate(fun.params, fun.premises, instr.tys, name)
-        # Substituting through the value's own binder renames a retained brand that a type argument would capture.
-        return subst(Fn(fun.ptypes, fun.ret, retained, fun.unsafe, fun.places), sub)
+        return subst(Fn(fun.ptypes, fun.ret, fun.unsafe, fun.places), sub)
 
     def foreign_result(self, ty: Type) -> None:
         """What foreign code hands the program, an extern function's result or an extern value, is

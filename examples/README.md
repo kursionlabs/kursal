@@ -83,7 +83,7 @@ and report through their exit status, 0 when every check holds.
 | `borrow_trait`, `convert_trait`, `format_trait`, `traits` | traits, including multi-parameter traits and the one behind `{expr}` interpolation |
 | `format_strings` | `f"..."` strings |
 | `iter_basics`, `iter_combinators`, `iter_custom`, `iter_for_loops`, `iter_collections` | iterators, adapters, custom iterators, `for` loops and collecting |
-| `functions` | function values, indirect calls and closures |
+| `functions` (with `bad/function_value_at_two_brands.kur`) | function values, indirect calls and closures |
 | `modules` | a package whose public facade exports a namespace from an internal module |
 | `core_only` | a program that needs only `core`: no allocator, no operating system |
 | `heap` (library) | C-heap interop: `malloc` checked for null, a raw pointer cast, and `free` |
@@ -133,6 +133,7 @@ Ownership, brands and authority:
 | `linear_in_arena.kur` | a linear value is put in an arena, which never consumes what it holds |
 | `mismatched_skolem.kur` | values of two different brands are mixed |
 | `unbound_result_brand.kur` | a result type names a brand nothing binds |
+| `function_value_at_two_brands.kur` | a function value, whose type quantifies no brand, is called at two brands |
 | `ref_after_remove_in.kur` | a `Ref` into a map is used after `remove_in` gave the map a new brand |
 | `implicit_package_open.kur`, `implicit_package_open_plain_let.kur`, `implicit_package_open_assignment.kur` | an existential package is used without `let exists` opening it |
 | `close_by_number.kur`, `safe_adopt.kur` | an `unsafe fn` is called without `unsafe` |

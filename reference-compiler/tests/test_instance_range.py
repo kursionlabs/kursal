@@ -27,7 +27,6 @@ class InstanceRangeTests(unittest.TestCase):
     def test_bound_occurrences_do_not_count(self):
         for ty, param in (
             (C.Exists(("k",), C.Brand(C.Skolem("k"))), C.Param("k", C.BRAND)),
-            (C.Fn((), C.Brand(C.Skolem("k")), (C.Param("k", C.BRAND),)), C.Param("k", C.BRAND)),
             (C.Foreach("T", False, C.Tuple((C.U32,)), C.Named("T")), C.Param("T")),
         ):
             with self.subTest(ty=ty), self.assertRaisesRegex(KursError, "needs a binder-free head occurrence"):

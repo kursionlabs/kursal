@@ -47,7 +47,6 @@ class InstanceTerminationTests(unittest.TestCase):
         self.assertTrue(strict_subterm(T, C.Fn((T,), C.U32)))
         self.assertFalse(strict_subterm(T, T))
         self.assertFalse(strict_subterm(T, C.Exists(("T",), T)))
-        self.assertFalse(strict_subterm(T, C.Fn((T,), T, (C.Param("T"),))))
         self.assertFalse(strict_subterm(T, C.Foreach("T", False, C.U32, T)))
 
     def test_recursive_premise_descends_through_unbound_function(self):

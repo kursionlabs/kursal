@@ -8,22 +8,22 @@ Every quantified parameter needs a binder-free occurrence in its full head.
 Surface inference checks its instances here as KURS does; with `surface` set, a message writes types and
 brands as a message about source does (`types.Surface`), not as KURS does.
 
-The test over-approximates: every subterm that binds names (a package, a transform, a quantified function
-type) is compared as a wildcard. Two heads that differ only under binders count as
+The test over-approximates: every subterm that binds names (a package or a transform)
+is compared as a wildcard. Two heads that differ only under binders count as
 overlapping, so no overlap can hide in how binders are compared.
 """
 
 from collections.abc import Iterable, Sequence
 from typing import Optional
 
-from .core import BRAND, Exists, Fn, Foreach, Param, Premise, Type
+from .core import BRAND, Exists, Foreach, Param, Premise, Type
 from .sexpr import KursError, Position, located
 from .types import Surface, extractable_names, map_children, show, subst
 from .unify import Meta, instantiate, unify
 
 
 def binders_as_wildcards(ty: Type) -> Type:
-    if isinstance(ty, (Exists, Foreach)) or isinstance(ty, Fn) and ty.forall:
+    if isinstance(ty, (Exists, Foreach)):
         return Meta()
     return map_children(ty, binders_as_wildcards)
 

@@ -9,7 +9,7 @@ from kursal import core as C
 from kursal.cgen import Backend
 from kursal.check import check_program
 from kursal.kurs import parse_program
-from kursal.mangle import mangle, path_segments, type_key
+from kursal.mangle import mangle, path_segments, signature_key, type_key
 from tests import test_c_names
 
 
@@ -31,12 +31,11 @@ class ManglingTests(unittest.TestCase):
             self.assertRegex(symbol, r'^_ZN4kurs.*17h[0-9a-f]{16}E$')
 
     def test_bound_names_normalized_and_free_names_distinct(self):
-        def ty(a, b):
-            return C.Fn((C.Brand(C.Skolem(a)),),
-                        C.Exists((b,), C.Tuple((C.Skolem(a), C.Skolem(b)))),
-                        (C.Param(a, 'brand'),))
-        self.assertEqual(type_key(ty('a', 'b')), type_key(ty('x', 'y')))
-        self.assertNotEqual(type_key(ty('a', 'b')), type_key(ty('a', 'a')))
+        def signature(a, b):
+            ty = C.Fn((C.Brand(C.Skolem(a)),), C.Exists((b,), C.Tuple((C.Skolem(a), C.Skolem(b)))))
+            return signature_key((C.Param(a, 'brand'),), ty)
+        self.assertEqual(signature('a', 'b'), signature('x', 'y'))
+        self.assertNotEqual(signature('a', 'b'), signature('a', 'a'))
         self.assertNotEqual(type_key(C.Skolem('a')), type_key(C.Skolem('b')))
         self.assertNotEqual(type_key(C.Named('a')), type_key(C.Named('b')))
         self.assertNotEqual(type_key(C.Fn((C.U32,), C.U32)),
@@ -98,7 +97,7 @@ class ManglingTests(unittest.TestCase):
         self.assertEqual(forward, names([C.Prim('i32'), C.U32]))
         self.assertEqual(len(set(forward.values())), 2)
 
-    def test_retained_function_names_stable_across_processes(self):
+    def test_function_value_names_stable_across_processes(self):
         import os
         import sys
         script = '''from kursal.kurs import parse_program
@@ -106,7 +105,7 @@ from kursal.check import check_program
 from kursal.cgen import emit_c
 p = parse_program("""(fun f (forall ($k) () u32 ()
   (entry () (= %n (const u32 0)) (ret %n))))
-  (fun main u32 () (entry () (= %p (fn (f _))) (= %r (const u32 0)) (ret %r)))""")
+  (fun main u32 () (entry () (= %p (fn (f $static))) (= %r (const u32 0)) (ret %r)))""")
 print(emit_c(p, check_program(p)))'''
         outputs = [subprocess.check_output([sys.executable, '-c', script], text=True,
                    env={**os.environ, 'PYTHONHASHSEED': seed}) for seed in ('1', '2')]

@@ -24,7 +24,7 @@ CANONICAL = r'''(type (in (module 0 a) abstract) Secret (struct (k u32)))
 (type (in (module 0 a b) (exposed (module 0 a))) Handle! (forall (T $k) ((Copy T) (Eq T)) (struct (at (ptr T)) (brand (brand $k)))))
 (type Choice (enum (None (tuple)) (Some (array u8 4))))
 (type Any (exists ($a $b) (foreach ((ptr F) (Handle u32 $a)) (tuple F (brand $b)))))
-(type Callback (struct (plain (fn ((& u32) u64) !)) (risky (fn (unsafe) (forall ($r U) ((Copy U)) _ (U (& (ptr U))))))))
+(type Callback (struct (plain (fn ((& u32) u64) !)) (risky (fn (unsafe) (u32 (& (ptr u8))) !))))
 (fun (in (module 0 a)) main i32 ()
   (locals (&x u32) ("&odd name" (tuple)))
   (entry ()
@@ -129,6 +129,13 @@ class KursReaderTests(unittest.TestCase):
     def test_copy_kind_requires_a_parameter_name(self):
         with self.assertRaisesRegex(KursError, "Copy requires a type parameter name"):
             parse_program("(type T (forall (A) ((Copy (tuple u32))) A))")
+
+    def test_a_function_value_names_every_brand(self):
+        with self.assertRaisesRegex(KursError, "_ is not a type"):
+            parse_program("(fun f (forall ($k) () u32 () (entry () (= %n (const u32 0)) (ret %n))))\n"
+                          "(fun main u32 () (entry () (= %p (fn (f _))) (= %r (const u32 0)) (ret %r)))")
+        with self.assertRaisesRegex(KursError, "a function type quantifies nothing"):
+            parse_program("(type T (fn (forall ($k) () u32 ((brand $k)))))")
 
     def test_place_parameters_of_function_types_and_trait_methods(self):
         program = parse_program(CANONICAL)

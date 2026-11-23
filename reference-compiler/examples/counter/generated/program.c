@@ -23,9 +23,9 @@ static inline intptr_t kur_dec_isize(uintptr_t b) { return b <= (uintptr_t)INTPT
 
 typedef struct K_counter_Counter K_counter_Counter;
 struct K_counter_Counter { uint32_t f_value; };
-static int32_t _ZN4kurs7counter4main17h3c4d00f3096e51d3E(void);
-static uint32_t _ZN4kurs7counter4bump17hb7ec39266b253daeE(K_counter_Counter* restrict entry_counter);
-static int32_t _ZN4kurs7counter4main17h3c4d00f3096e51d3E(void) {
+static int32_t _ZN4kurs7counter4main17hc155b651fa495d9cE(void);
+static uint32_t _ZN4kurs7counter4bump17h02c8f876ee35ceafE(K_counter_Counter* restrict entry_counter);
+static int32_t _ZN4kurs7counter4main17hc155b651fa495d9cE(void) {
   K_counter_Counter p_counter_1;
   uint32_t entry_v2;
   uint32_t entry_v7;
@@ -44,7 +44,7 @@ static int32_t _ZN4kurs7counter4main17h3c4d00f3096e51d3E(void) {
     goto L_b11;
   }
   L_b10: ;
-  join15_r14 = _ZN4kurs7counter4bump17hb7ec39266b253daeE(&p_counter_1);
+  join15_r14 = _ZN4kurs7counter4bump17h02c8f876ee35ceafE(&p_counter_1);
   goto L_join15;
   L_b11: ;
   join15_r14 = UINT64_C(0);
@@ -55,7 +55,7 @@ static int32_t _ZN4kurs7counter4main17h3c4d00f3096e51d3E(void) {
   return join15_v22;
 }
 
-static uint32_t _ZN4kurs7counter4bump17hb7ec39266b253daeE(K_counter_Counter* restrict entry_counter) {
+static uint32_t _ZN4kurs7counter4bump17h02c8f876ee35ceafE(K_counter_Counter* restrict entry_counter) {
   uint32_t entry_v4;
   uint32_t entry_v6;
   L_entry: ;
@@ -65,4 +65,4 @@ static uint32_t _ZN4kurs7counter4bump17hb7ec39266b253daeE(K_counter_Counter* res
   return (*entry_counter).f_value;
 }
 
-int main(void) { return (int)_ZN4kurs7counter4main17h3c4d00f3096e51d3E(); }
+int main(void) { return (int)_ZN4kurs7counter4main17hc155b651fa495d9cE(); }

@@ -55,9 +55,6 @@ class CoherenceTests(unittest.TestCase):
                          head(C.Fn((C.U32,), C.U32, places=frozenset({0})))])
 
     def test_heads_that_differ_only_under_binders_overlap(self):
-        brand = (C.Param("b", C.BRAND),)
-        witness = (C.Brand(C.Skolem("b")),)
-        self.overlaps(head(C.Fn((witness[0],), C.U32, forall=brand)), head(C.Fn((witness[0],), C.BOOL, forall=brand)))
         self.overlaps(head(C.Exists(("a",), C.Tuple((C.U32, C.Brand(C.Skolem("a")))))),
                       head(C.Exists(("a",), C.Tuple((C.BOOL, C.Brand(C.Skolem("a")))))))
 
@@ -66,8 +63,6 @@ class CoherenceTests(unittest.TestCase):
                       head(C.Exists(("b",), C.Brand(C.Skolem("b")))))
         self.overlaps(head(C.Foreach("A", False, C.Tuple((C.U32,)), C.Named("A"))),
                       head(C.Foreach("B", False, C.Tuple((C.U32,)), C.Named("B"))))
-        self.overlaps(head(C.Fn((), C.Brand(C.Skolem("a")), (C.Param("a", C.BRAND),))),
-                      head(C.Fn((), C.Brand(C.Skolem("b")), (C.Param("b", C.BRAND),))))
 
     def test_brand_parameters_are_fresh_variables(self):
         check = (C.Premise("P", (C.Skolem("k"),)), (C.Param("k", C.BRAND),), (4, 2))

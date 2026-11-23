@@ -40,8 +40,6 @@ class MatchingTests(unittest.TestCase):
         for left, right in (
             (C.Exists(("k",), C.Tuple((T, brand("k")))),
              C.Exists(("q",), C.Tuple((C.U32, brand("q"))))),
-            (C.Fn((brand("k"),), T, (C.Param("k", C.BRAND),)),
-             C.Fn((brand("q"),), C.U32, (C.Param("q", C.BRAND),))),
             (C.Foreach("F", False, C.Tuple((C.U32,)), C.Tuple((C.Named("F"), T))),
              C.Foreach("G", False, C.Tuple((C.U32,)), C.Tuple((C.Named("G"), C.U32)))),
         ):
@@ -53,9 +51,6 @@ class MatchingTests(unittest.TestCase):
             (C.Exists(("k",), C.Tuple((T, brand("k")))),
              C.Exists(("q",), C.Tuple((C.U32, brand("q")))),
              C.Exists(("q",), C.Tuple((C.BOOL, brand("q"))))),
-            (C.Fn((brand("k"),), T, (C.Param("k", C.BRAND),)),
-             C.Fn((brand("q"),), C.U32, (C.Param("q", C.BRAND),)),
-             C.Fn((brand("q"),), C.BOOL, (C.Param("q", C.BRAND),))),
             (C.Foreach("F", False, C.U32, C.Tuple((C.Named("F"), T))),
              C.Foreach("G", False, C.U32, C.Tuple((C.Named("G"), C.U32))),
              C.Foreach("G", False, C.U32, C.Tuple((C.Named("G"), C.BOOL)))),
@@ -73,7 +68,6 @@ class MatchingTests(unittest.TestCase):
     def test_free_parameters_cannot_capture_bound_names(self):
         for left, right in (
             (C.Exists(("k",), T), C.Exists(("q",), brand("q"))),
-            (C.Fn((), T, (C.Param("k", C.BRAND),)), C.Fn((), brand("q"), (C.Param("q", C.BRAND),))),
             (C.Foreach("F", False, C.Tuple((C.U32,)), T),
              C.Foreach("G", False, C.Tuple((C.U32,)), C.Named("G"))),
         ):
@@ -123,11 +117,9 @@ class MatchingTests(unittest.TestCase):
                          {"T": C.U32})
 
     def test_full_head_solutions_have_binder_free_query_paths(self):
-        hidden = C.Fn((), T, forall=(C.Param("b", C.BRAND),))
         examples = (
             ((C.Tuple((T, C.U32)),), (C.Tuple((C.BOOL, C.U32)),)),
             ((C.Fn((T,), C.UNIT),), (C.Fn((C.BOOL,), C.UNIT),)),
-            ((hidden, T), (C.Fn((), C.BOOL, forall=(C.Param("q", C.BRAND),)), C.BOOL)),
         )
         for head, query in examples:
             with self.subTest(head=head):

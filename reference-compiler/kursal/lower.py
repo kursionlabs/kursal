@@ -835,7 +835,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
             case ValueCall() | ClosureCall():
                 assert callee_value is not None
                 target = (callee_value,)
-                targs = call.targs if isinstance(call, ValueCall) else ()
+                targs = ()
                 signature = self.vty[callee_value]
                 assert isinstance(signature, C.Fn)
                 requires_unsafe = signature.unsafe

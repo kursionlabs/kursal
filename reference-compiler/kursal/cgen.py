@@ -29,13 +29,13 @@ import re
 from typing import Optional
 
 from .core import (ATOMIC_OPS, FLOATS, INTEGERS, POINTER_SIZED, UNIT, WIDTHS, Array, Block, Brand, Enum, Exists, Fn,
-                   Foreach, Ignored, Jmp, Jnz, Named, Never, NonNull, Param, Prim, Ptr, Ret, Skolem, Struct, Switch,
+                   Foreach, Jmp, Jnz, Named, Never, NonNull, Param, Prim, Ptr, Ret, Skolem, Struct, Switch,
                    Tuple, Unreachable, Type, Program, Fun, Data, Instr, Edge, Terminator)
 from .check import Checker, overlap, prefix
 from .sexpr import Form, KursError, List, Str
 from .types import ForeachRow, Types, equal, map_children, mapped_component, mapped_operand, subst
 from .termination import check_mono_termination
-from .mangle import encode, mangle, path_segments, type_key, unbranded
+from .mangle import encode, mangle, path_segments, signature_key, type_key, unbranded
 from .plan import PURE, Adapter, Plan, instr_reads, root, term_edges, term_reads
 
 PRELUDE = """#include <stddef.h>
@@ -404,8 +404,8 @@ class Backend:
             if all(equal(a, b) for a, b in zip(args, previous)):
                 return symbol
         path, function_id = self.function_ids[id(fun)]
-        signature = Fn(fun.ptypes, fun.ret, params, fun.unsafe, fun.places)
-        symbol = self.function_name(path, encode((function_id, type_key(signature),
+        signature = signature_key(params, Fn(fun.ptypes, fun.ret, fun.unsafe, fun.places))
+        symbol = self.function_name(path, encode((function_id, signature,
                                                   *(type_key(t) for t in args))))
         self.symbols.setdefault(id(fun), []).append((args, symbol))
         self.queue.append((fun, dict(sub), symbol))
@@ -464,9 +464,7 @@ class Backend:
         if name in self.program.externs:
             return name
         fun = self.program.funs[name]
-        # Stable distinct rigid identities: not a wildcard and not static.
-        sub = {p.name: Skolem(encode(("#retained", fun.name, str(k)))) if isinstance(t, Ignored)
-               else self.substitute_type(t) for k, (p, t) in enumerate(zip(fun.params, instr.tys))}
+        sub = {p.name: self.substitute_type(t) for p, t in zip(fun.params, instr.tys)}
         symbol = self.request(fun, sub)
         self.address_taken.add(symbol)
         if not any(self.by_ref[symbol]) and not self.outs[symbol]:

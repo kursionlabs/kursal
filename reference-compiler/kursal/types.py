@@ -7,7 +7,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Set
 from itertools import count
 from typing import Optional
 
-from .core import (BRAND, COPY, Array, Brand, Enum, Exists, Fn, Foreach, Ignored, Named, Never, NonNull, Param, Prim,
+from .core import (COPY, Array, Brand, Enum, Exists, Fn, Foreach, Named, Never, NonNull, Prim,
                    Ptr, Kind, ModuleId, Premise, Program, Skolem, Struct, Tuple, Type, TypeDecl)
 from .sexpr import KursError, Position
 
@@ -51,8 +51,8 @@ def map_children(ty: Type, transform: Callable[[Type], Type]) -> Type:
             return Exists(binders, transform(body))
         case Foreach(binder=binder, indirect=indirect, source=source, body=body):
             return Foreach(binder, indirect, transform(source), transform(body))
-        case Fn(params=params, ret=ret, forall=forall):
-            return Fn(tuple(transform(p) for p in params), transform(ret), forall, ty.unsafe, ty.places)
+        case Fn(params=params, ret=ret):
+            return Fn(tuple(transform(p) for p in params), transform(ret), ty.unsafe, ty.places)
     return ty
 
 
@@ -75,10 +75,6 @@ def subst(ty: Type, sub: Substitution) -> Type:
             source = subst(source, sub)
             (binder,), inner = _rebind((binder,), sub, brand=False)
             return Foreach(binder, indirect, source, subst(body, inner))
-        case Fn(params=params, ret=ret, forall=forall):
-            names, inner = _rebind(tuple(p.name for p in forall), sub)
-            return Fn(tuple(subst(p, inner) for p in params), subst(ret, inner),
-                      tuple(Param(n, p.kind) for n, p in zip(names, forall)), ty.unsafe, ty.places)
     return map_children(ty, lambda child: subst(child, sub))
 
 
@@ -128,9 +124,6 @@ def free_names(ty: Type, bound: Set[str] = frozenset()) -> set[str]:
             return free_names(body, bound | set(binders))
         case Foreach(binder=binder, source=source, body=body):
             return free_names(source, bound) | free_names(body, bound | {binder})
-        case Fn(params=params, ret=ret, forall=forall):
-            inner = bound | {p.name for p in forall}
-            return set().union(free_names(ret, inner), *(free_names(p, inner) for p in params))
     return set().union(*(free_names(c, bound) for c in children(ty)))
 
 
@@ -174,8 +167,6 @@ def extractable_names(ty: Type) -> set[str]:
             return set()
         case Foreach(source=source):
             return extractable_names(source)
-        case Fn(forall=forall) if forall:
-            return set()
         case Fn(params=params, ret=ret):
             return set().union(*(extractable_names(part) for part in (*params, ret)))
         case Named(name=name, args=()):
@@ -210,12 +201,9 @@ def equal(a: Type, b: Type, env: Optional[AlphaEnv] = None) -> bool:
             return (a.indirect == b.indirect and equal(a.source, b.source, env)
                     and equal(a.body, b.body, _bind(env, (a.binder,), (b.binder,))))
         case Fn(), Fn():
-            if (a.unsafe != b.unsafe or a.places != b.places or len(a.params) != len(b.params)
-                    or len(a.forall) != len(b.forall)
-                    or [p.kind for p in a.forall] != [p.kind for p in b.forall]):
+            if a.unsafe != b.unsafe or a.places != b.places or len(a.params) != len(b.params):
                 return False
-            inner = _bind(env, [p.name for p in a.forall], [p.name for p in b.forall])
-            return equal(a.ret, b.ret, inner) and all(equal(x, y, inner) for x, y in zip(a.params, b.params))
+            return equal(a.ret, b.ret, env) and all(equal(x, y, env) for x, y in zip(a.params, b.params))
         case Struct(fields=fa), Struct(fields=fb):
             return len(fa) == len(fb) and all(n == m and equal(x, y, env) for (n, x), (m, y) in zip(fa, fb))
         case Enum(variants=fa), Enum(variants=fb):
@@ -423,7 +411,7 @@ class Types:
     def is_copy(self, ty: Type, kinds: Optional[Kinds] = None) -> bool:
         kinds = kinds or {}
         match ty:
-            case Prim() | Ptr() | NonNull() | Brand() | Fn() | Never() | Ignored():
+            case Prim() | Ptr() | NonNull() | Brand() | Fn() | Never():
                 return True
             case Named(name=name, args=()) if name in kinds:
                 return kinds[name] == COPY
@@ -679,8 +667,6 @@ def _type_names(ty: Type, out: set[str]) -> None:
             out.add(name)
         case Foreach(binder=binder):
             out.add(binder)
-        case Fn(forall=forall):
-            out.update(p.name for p in forall if p.kind != BRAND)
     for child in children(ty):
         _type_names(child, out)
 
@@ -732,11 +718,9 @@ def _source(ty: Type, surface: Surface) -> str:
             return f"exists {', '.join(map(surface.brand, binders))}. {go(body)}"
         case Foreach(binder=binder, indirect=indirect, source=source, body=body):
             return f"foreach {'*' if indirect else ''}{surface.name(binder)} of {go(source)} => {go(body)}"
-        case Fn(params=params, ret=ret, forall=forall, unsafe=unsafe):
+        case Fn(params=params, ret=ret, unsafe=unsafe):
             shown = ", ".join(f"&_: {go(p)}" if k in ty.places else go(p) for k, p in enumerate(params))
-            quantified = ", ".join(surface.brand(p.name) if p.kind == BRAND else surface.name(p.name) for p in forall)
-            return (f"{f'forall {quantified}. ' if forall else ''}{'unsafe ' if unsafe else ''}"
-                    f"fn({shown}) -> {go(ret)}")
+            return f"{'unsafe ' if unsafe else ''}fn({shown}) -> {go(ret)}"
     return "_"
 
 
@@ -809,11 +793,9 @@ def brand_differences(a: Type, b: Type) -> Optional[list[str]]:
                 return (x.indirect == y.indirect and same(x.source, y.source, env)
                         and same(x.body, y.body, _bind(env, (x.binder,), (y.binder,))))
             case Fn(), Fn():
-                if (x.unsafe != y.unsafe or x.places != y.places or len(x.params) != len(y.params)
-                        or [p.kind for p in x.forall] != [p.kind for p in y.forall]):
+                if x.unsafe != y.unsafe or x.places != y.places or len(x.params) != len(y.params):
                     return False
-                inner = _bind(env, [p.name for p in x.forall], [p.name for p in y.forall])
-                return same_all(x.params, y.params, inner) and same(x.ret, y.ret, inner)
+                return same_all(x.params, y.params, env) and same(x.ret, y.ret, env)
             case (Struct(fields=fx), Struct(fields=fy)) | (Enum(variants=fx), Enum(variants=fy)):
                 return (len(fx) == len(fy) and all(n == m for (n, _), (m, _) in zip(fx, fy))
                         and same_all((t for _, t in fx), (t for _, t in fy), env))

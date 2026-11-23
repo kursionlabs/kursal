@@ -18,8 +18,6 @@ def formation_children(ty: C.Type) -> tuple[C.Type, ...]:
         return ()
     if isinstance(ty, C.Foreach):
         return (ty.source,)
-    if isinstance(ty, C.Fn) and ty.forall:
-        return ()
     return children(ty)
 
 
@@ -41,8 +39,6 @@ def brand_occurs(ty: C.Type, label: str) -> bool:
         case C.Skolem(label=found):
             return found == label
         case C.Exists(binders=binders) if label in binders:
-            return False
-        case C.Fn(forall=forall) if any(p.name == label for p in forall):
             return False
     return any(brand_occurs(t, label) for t in children(ty))
 
@@ -88,13 +84,10 @@ class Formation:
         if want == C.COPY and not self.types.is_copy(ty, env):
             self.fail("expected Copy argument")
 
-    def arguments(self, params: tuple[C.Param, ...], args: tuple[C.Type, ...], env: Kinds,
-                  retain: bool = False) -> None:
+    def arguments(self, params: tuple[C.Param, ...], args: tuple[C.Type, ...], env: Kinds) -> None:
         if len(params) != len(args):
             self.fail("wrong number of type arguments")
         for param, arg in zip(params, args):
-            if retain and param.kind == C.BRAND and isinstance(arg, C.Ignored):
-                continue
             self.fits(arg, param.kind, env)
             if param.kind != C.BRAND:
                 self.flat(arg, "a type argument")
@@ -177,17 +170,11 @@ class Formation:
                     self.fail(f"foreach *{binder} needs a source written with pointer components")
                 self.within((binder,), lambda: self.fits(body, C.ANY, self.extend(env, (C.Param(binder),))))
                 self.flat(body, "a foreach body")
-            case C.Fn(params=params, ret=ret, forall=forall, places=places):
-                if any(p.kind != C.BRAND for p in forall):
-                    self.fail("function values quantify only brands")
+            case C.Fn(params=params, ret=ret, places=places):
                 if not places <= set(range(len(params))):
                     self.fail("function place index out of range")
-                inner = self.extend(env, forall)
-
-                def signature() -> None:
-                    for t in (*params, ret):
-                        self.fits(t, C.ANY, inner)
-                self.within(tuple(p.name for p in forall), signature)
+                for t in (*params, ret):
+                    self.fits(t, C.ANY, env)
             case C.Prim(name=name):
                 if name not in C.PRIMS:
                     self.fail(f"unknown primitive {name}")
@@ -197,8 +184,6 @@ class Formation:
                 self.fail("an enum has at least one variant")
             case C.Struct(fields=fields) | C.Enum(variants=fields) if len({n for n, _ in fields}) != len(fields):
                 self.fail("duplicate component name")
-            case C.Ignored():
-                self.fail("_ is only a retained fn brand argument")
             case C.Ptr() | C.NonNull() | C.Tuple() | C.Array() | C.Struct() | C.Enum() | C.Never():
                 for t in children(ty):
                     self.fits(t, C.ANY, env)
@@ -246,8 +231,8 @@ class Formation:
                     if i.op == "alloca":
                         self.flat(i.ty, "a pointee")
                 if i.op in {"call", "fn"} and i.args[0] in self.program.funs:
-                    self.arguments(self.program.funs[i.args[0]].params, i.tys, scope, i.op == "fn")
-                elif i.op in {"call", "fn"} and i.args[0] in self.program.externs:
+                    self.arguments(self.program.funs[i.args[0]].params, i.tys, scope)
+                elif i.op in {"call", "fn"} and (i.args[0] in self.program.externs or i.args[0].startswith("%")):
                     self.arguments((), i.tys, scope)
                 elif i.op == "foreach" and i.args[1] in self.program.funs:
                     count = 1 if isinstance(i.ty, C.Foreach) else 0

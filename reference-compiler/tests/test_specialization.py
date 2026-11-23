@@ -86,7 +86,7 @@ class SpecializationTests(unittest.TestCase):
 
 
 class FunctionAddressTests(unittest.TestCase):
-    def retained_program(self):
+    def address_program(self):
         program = pick_program()
         program.funs.clear()
         a = C.Brand(C.Skolem("a"))
@@ -97,20 +97,25 @@ class FunctionAddressTests(unittest.TestCase):
                                                   (C.Brand(C.Skolem("b")),), (constant("code", 1),))]
         main = C.Fun("main", (), (), C.U32, (),
                      (C.Block("entry", (),
-                              (C.Instr(("%f",), "fn", ("chosen",), tys=(C.Ignored(),)),
-                               C.Instr(("%n",), "call", ("%f",), tys=(C.Skolem("static"),))), C.Ret("%n")),))
+                              (C.Instr(("%f",), "fn", ("chosen",), tys=(C.Skolem("static"),)),
+                               C.Instr(("%n",), "call", ("%f",), tys=())), C.Ret("%n")),))
         program.funs = {"chosen": chosen, "main": main}
         return program
 
-    def test_a_retained_brand_carries_no_premise(self):
-        program = self.retained_program()
-        with self.assertRaisesRegex(KursError, "retained_brand_with_premise"):
-            check_program(program)
-        # Binding the brand before taking the address discharges the premise where the value is made.
-        main = program.funs["main"]
-        main.blocks[0].instrs[0].tys = (C.Skolem("static"),)
-        main.blocks[0].instrs[1].tys = ()
+    def test_a_function_value_quantifies_no_brand(self):
+        # Taking the address binds every brand, so the premise is discharged where the value is made.
+        program = self.address_program()
         self.assertIn("chosen", emit_c(program, check_program(program)))
+        main = program.funs["main"]
+        # `fn` takes no `_`: a brand left unnamed is no type.
+        main.blocks[0].instrs[0].tys = (C.Named("_"),)
+        with self.assertRaisesRegex(KursError, "unknown type _"):
+            check_program(program)
+        # A call through a function value takes no brand arguments.
+        main.blocks[0].instrs[0].tys = (C.Skolem("static"),)
+        main.blocks[0].instrs[1].tys = (C.Skolem("static"),)
+        with self.assertRaisesRegex(KursError, "wrong number of type arguments"):
+            check_program(program)
 
     def test_a_foreign_unit_function_is_its_own_address(self):
         # A unit result is `void` in C, for Kursal and foreign functions alike: no adapter.

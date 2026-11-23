@@ -58,10 +58,6 @@ class NominalPremiseTests(unittest.TestCase):
             (type Node (forall (T) ((P T))
                 (struct (value T) (next (ptr (Node T))))))''')
 
-    def test_function_types_have_no_premises(self):
-        with self.assertRaisesRegex(KursError, 'a function type has no premises'):
-            parse_program('''(trait P ($k))
-                (type Bad (fn (forall ($k) ((P $k)) (brand $k) ((brand $k)))))''')
 
     def test_surface_signature_and_nested_type_fail_before_core_assertion(self):
         from tests import test_closure_boundary
@@ -103,8 +99,6 @@ class NominalPremiseTests(unittest.TestCase):
         exists = C.Exists(('b',), C.Tuple((item, C.Brand(C.Skolem('b')))))
         self.assertFalse(nominal_descent((item,), (exists,)))
 
-        retained = C.Fn((), item, forall=(C.Param('b', C.BRAND),))
-        self.assertFalse(nominal_descent((item,), (retained,)))
         plain = C.Fn((item,), C.UNIT)
         self.assertTrue(nominal_descent((item,), (plain,)))
 
@@ -121,7 +115,6 @@ class NominalPremiseTests(unittest.TestCase):
         x = C.Named('X')
         param = (C.Param('X'),)
         hidden = (
-            C.Fn((), x, forall=(C.Param('b', C.BRAND),)),
             C.Exists(('b',), C.Tuple((x, C.Brand(C.Skolem('b'))))),
             C.Foreach('T', False, C.U32, C.Tuple((C.Named('T'), x))),
         )

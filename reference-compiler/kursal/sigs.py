@@ -328,12 +328,6 @@ class Signatures:
             case S.TForeach(binder=binder, indirect=indirect, source=source, body=body):
                 return C.Foreach(binder, indirect, self.component(source, scope, "a foreach source"),
                                  self.component(body, scope.extend((C.Param(binder, C.ANY),)), "a foreach body"))
-            case S.TForall(params=tparams, body=body):
-                quantified = tuple(C.Param(p[1:], C.BRAND) for p in tparams)
-                inner_type = self.type(body, scope.extend(quantified))
-                if not isinstance(inner_type, C.Fn) or any(not p.startswith("'") for p in tparams):
-                    fail("forall in a type quantifies brands of a function type")
-                return C.Fn(inner_type.params, inner_type.ret, quantified, inner_type.unsafe, inner_type.places)
         fail(f"no core type for {type(type_expr).__name__}")
 
     def component(self, type_expr: S.Type, scope: Scope, what: str) -> C.Type:

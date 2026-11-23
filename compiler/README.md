@@ -919,10 +919,12 @@ These are the places where Kursal differs from what one might expect.
 - **Brands.** `forall 'k.` binds a brand like a type parameter, and a type that holds branded storage
   takes it as its last argument (`ArenaVec[Span['k], 'k]`). A brand is minted by a constructor that
   returns `exists 'k. ...` and is opened by `let exists 'k. cx = Domain!::new(hash_seed());`; a trait may take one
-  as a parameter (`forall D, 'k. trait Discharge`, `instance Discharge[Checker['k], 'k]`). A
-  function named bare as a value (`let f = g;`) keeps its brands without a premise quantified, each a
-  brand of its own that no type argument can name, even one written with the same name: a message
-  writes it numbered where another reads the same (`forall 'b1. fn(Brand['b1], Tok['b]) -> Tok['b]`).
+  as a parameter (`forall D, 'k. trait Discharge`, `instance Discharge[Checker['k], 'k]`). Only a
+  declaration quantifies brands: a function value's type `fn(T1, ..., Tn) -> R` quantifies nothing,
+  and KURS's `fn` names every brand of its function, each in scope where the value is made. A function
+  named bare as a value (`let f = g;`) has its brands inferred from how the value is used, like its
+  type parameters; one no use determines is an error (`cannot infer the type argument 'k of g`), and
+  a value called at two brands is a brand mismatch.
 - **`NonNull[T]`** (`std::ptr::NonNull`) is a builtin type, like `*T` but never null:
   `NonNull::new(p)` checks and returns an `Option`, `unsafe (p as NonNull[T])` asserts it, `n as *T`
   (or `n.as_ptr()`) is safe, and `==` compares two. Its niche makes `Option[NonNull[T]]` and

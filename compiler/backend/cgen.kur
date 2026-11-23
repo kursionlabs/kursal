@@ -23,7 +23,7 @@ use package::kurs::core::{Arm, Binding, Block, Data, Edge, Fun, ForeachType, Ins
 use package::kurs::core as C;
 use package::backend::plan::{Adapter, Plan, is_member, is_place, is_pure, root, term_edges, term_reads, value_read};
 use package::check::checker::{overlap, prefix};
-use package::backend::mangle::{decode_segment, encode, mangle, path_segments, type_key, unbranded};
+use package::backend::mangle::{decode_segment, encode, mangle, path_segments, signature_key, type_key, unbranded};
 use package::kurs::sexpr::Form;
 use package::syntax::ast::{Pos, no_pos};
 use package::types::termination::check_mono_termination;
@@ -407,7 +407,7 @@ fn erase(&cx: Domain!['k], ty: Type['k], types: Types['k]) -> Type['k] {
                 params.push(&cx, erase(&cx, f.params.at(&cx, i), types));
                 i = i + 1usize;
             }
-            C::fn_type(&cx, params, erase(&cx, f.ret.copy(&cx), types), ArenaVec::new(&cx), false, f.places)
+            C::fn_type(&cx, params, erase(&cx, f.ret.copy(&cx), types), false, f.places)
         },
         _ => map_children(&cx, ty, |&cx, child: Type['k]| erase(&cx, child, types)),
     }
@@ -1224,8 +1224,7 @@ impl Backend['k] {
         let signature_key = match self.signature_keys.get(&cx, key) {
             Option::Some(found) => found,
             Option::None => {
-                let signature = C::fn_type(&cx, fun.ptypes, fun.ret, params, fun.is_unsafe, fun.places(&cx));
-                let found = type_key(&cx, signature, ArenaVec::new(&cx));
+                let found = signature_key(&cx, params, C::fn_type(&cx, fun.ptypes, fun.ret, fun.is_unsafe, fun.places(&cx)));
                 self.signature_keys.insert(&cx, key, found);
                 found
             },
@@ -1380,20 +1379,10 @@ impl Backend['k] {
             return name;
         }
         let fun = self.program.funs.at(&cx, name);
-        // Stable distinct rigid identities: not a wildcard and not static.
         let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
         var k = 0usize;
         while k < fun.params.len(&cx) && k < instr.tys.len(&cx) {
-            let t = instr.tys.at(&cx, k);
-            let value = match t {
-                Type::Ignored => {
-                    let identity = ArenaVec::two(&cx, Span::from_static(&cx, "#retained"), fun.name);
-                    identity.push(&cx, Buffer!::new().push_usize(k).save(&cx));
-                    Type::Skolem.(encode(&cx, identity))
-                },
-                _ => self.substitute_type(&cx, t),
-            };
-            sub.insert(&cx, fun.params.at(&cx, k).name, value);
+            sub.insert(&cx, fun.params.at(&cx, k).name, self.substitute_type(&cx, instr.tys.at(&cx, k)));
             k = k + 1usize;
         }
         let symbol = self.request(&cx, FunKey::Function.(name), fun, sub);

@@ -79,10 +79,8 @@ class FormationTests(unittest.TestCase):
         check_program(parse_program("(type Good (exists ($a $b) "
                                     "(tuple (brand $a) (brand $b))))"))
 
-    def test_arrays_place_indices_and_retained_slots_are_valid(self):
+    def test_arrays_and_place_indices_are_valid(self):
         self.rejects("(type Bad (array u32 -1))", "negative array")
-        self.rejects("(type Bad _)", "_ is only")
-        self.rejects("(type Bad (fn (forall (T) () T (T))))", "function values quantify only brands")
         p = C.Program(types={"Bad": C.TypeDecl("Bad", (), (), C.Fn((), C.UNIT, places=frozenset({0})))})
         with self.assertRaisesRegex(KursError, "place index"):
             check_program(p)
@@ -100,10 +98,14 @@ class FormationTests(unittest.TestCase):
           (fun main u32 () (entry () (unsafe (= %r (call (foreign u32)))) (ret %r)))""", "wrong number")
         self.rejects("""(fun f (forall ($k) () u32 ()
           (entry () (= %n (const u32 0)) (ret %n))))
-          (fun main u32 () (entry () (= %r (call (f _))) (ret %r)))""", "_ is only")
+          (fun main u32 () (entry () (= %p (fn (f $q))) (= %r (const u32 0)) (ret %r)))""", "brand q is not in scope")
+        self.rejects("""(fun f (forall ($k) () u32 ()
+          (entry () (= %n (const u32 0)) (ret %n))))
+          (fun main u32 () (entry () (= %p (fn (f $static))) (= %r (call (%p $static))) (ret %r)))""",
+                     "wrong number of type arguments")
         check_program(parse_program("""(fun f (forall ($k) () u32 ()
           (entry () (= %n (const u32 0)) (ret %n))))
-          (fun main u32 () (entry () (= %p (fn (f _))) (= %r (const u32 0)) (ret %r)))"""))
+          (fun main u32 () (entry () (= %p (fn (f $static))) (= %r (call %p)) (ret %r)))"""))
 
     def test_open_scopes_start_after_the_instruction(self):
         self.rejects("""(fun main u32 () (entry ()

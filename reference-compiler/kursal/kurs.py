@@ -10,7 +10,7 @@ from dataclasses import replace
 from typing import NoReturn, TypeGuard, Optional
 from .sexpr import Atom, Form, KursError, List, Position, Str, read
 from .core import (ANY, ATOMIC_OPS, BRAND, COPY, LITERAL_BITS, PRIMS, Array, Arm, Block, Brand, Data,
-                   Edge, Enum, Exists, Exposure, Extern, Fn, Foreach, Fun, Ignored, Instance,
+                   Edge, Enum, Exists, Exposure, Extern, Fn, Foreach, Fun, Instance,
                    Instr, Jmp, Jnz, Method, ModuleId, Named, Never, Param, Premise,
                    NonNull, Prim, Program, Ptr, Ret, Skolem, Struct, Switch, Trait, Tuple,
                    Type, TypeDecl, Terminator, Unreachable)
@@ -48,7 +48,7 @@ def _brand(atom: Form) -> str:
 def parse_type(form: Form) -> Type:
     if not isinstance(form, List):
         if form == "_":
-            return Ignored()
+            _fail("_ is not a type: a function value names every brand of its function", form)
         if form == "!":
             return Never()
         if form.startswith("$"):
@@ -85,13 +85,8 @@ def parse_type(form: Form) -> Type:
     if head == "fn":
         unsafe = _is(rest[0], "unsafe", 1)
         rest = rest[1:] if unsafe else rest
-        header = rest[0]
-        if _is(header, "forall", 5):
-            params, premises = parse_forall(header[1], header[2])
-            if premises:
-                _fail("a function type has no premises", header)
-            ptypes, places = _ptypes(header[4])
-            return Fn(ptypes, parse_type(header[3]), params, unsafe, places)
+        if _is(rest[0], "forall"):
+            _fail("a function type quantifies nothing", rest[0])
         ptypes, places = _ptypes(rest[0])
         return Fn(ptypes, parse_type(rest[1]), unsafe=unsafe, places=places)
     return Named(head, tuple(parse_type(t) for t in rest))
@@ -382,8 +377,6 @@ def write_form(form: Form) -> str:
 
 def write_type(ty: Type) -> str:
     match ty:
-        case Ignored():
-            return "_"
         case Never():
             return "!"
         case Skolem(label=label):
@@ -413,14 +406,8 @@ def write_type(ty: Type) -> str:
         case Foreach(binder=binder, indirect=indirect, source=source, body=body):
             pattern = _form(["ptr", write_atom(binder)]) if indirect else write_atom(binder)
             return _form(["foreach", _form([pattern, write_type(source)]), write_type(body)])
-        case Fn(params=params, ret=ret, forall=forall, unsafe=unsafe, places=places):
-            parts = ["fn", *(["(unsafe)"] if unsafe else [])]
-            if forall:
-                parts.append("(" + write_forall(forall, ()) + " " + write_type(ret) + " "
-                             + _write_ptypes(params, places) + ")")
-            else:
-                parts += [_write_ptypes(params, places), write_type(ret)]
-            return _form(parts)
+        case Fn(params=params, ret=ret, unsafe=unsafe, places=places):
+            return _form(["fn", *(["(unsafe)"] if unsafe else []), _write_ptypes(params, places), write_type(ret)])
     _cannot(f"the type {ty}")
 
 

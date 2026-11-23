@@ -123,14 +123,8 @@ class Foreach(Type):
 class Fn(Type):
     params: tuple[Type, ...]
     ret: Type
-    forall: tuple[Param, ...] = ()     # retained brand Params; a function value carries no premises
     unsafe: bool = False
     places: frozenset[int] = frozenset()  # indices of place parameters
-
-
-@dataclass(frozen=True)
-class Ignored(Type):
-    """`_`: a retained brand slot of `fn`'s type arguments."""
 
 
 UNIT = Tuple(())

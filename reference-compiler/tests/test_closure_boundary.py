@@ -138,7 +138,6 @@ class ClosureBoundaryTests(unittest.TestCase):
         cases = [
             ('fn() -> u32', 'fn code() -> u32 { 4u32 }'),
             ('fn(&_: u32) -> u32', 'fn code(&env: u32) -> u32 { env }'),
-            ("forall 'a. fn(u32) -> u32", "forall 'a. fn code(env: u32) -> u32 { env }"),
         ]
         for ty, function in cases:
             with self.subTest(ty=ty), self.assertRaisesRegex(InferError, 'closure'):
