@@ -274,9 +274,30 @@ class DiagnosticTests(unittest.TestCase):
         lines = error_of(app("".join(f"fn f{i}() -> u32 {{ g{i}() }}\n" for i in range(23)))).splitlines()
         self.assertEqual((len(lines), lines[-1]), (21, "and 3 more errors"))
 
+    def test_every_use_names_something_used_or_not(self):
+        a = {"app/a.kur": "struct X { x: u32 }\n"}
+        path = app("use package::a::{X, Missing};\n", a)
+        self.assertEqual(error_of(path), f"{path / 'lib.kur'}:1:21: unknown or private member Missing of a")
+        path = app("use package::nowhere::*;\nuse package::a::X::*;\n", a)
+        self.assertEqual(error_of(path).splitlines(), [
+            f"{path / 'lib.kur'}:1:5: unknown or private member nowhere of app",
+            f"{path / 'lib.kur'}:2:5: package::a::X is not a module",
+        ])
+        path = app("export absent;\n")
+        self.assertEqual(error_of(path), f"{path / 'lib.kur'}:1:8: unknown name absent")
+
+    def test_a_source_is_utf8_and_readable(self):
+        path = app("fn f() -> u32 { 0 }\n", {"app/a.kur": ""})
+        (path / "a.kur").write_bytes(b"fn g() -> u32 { 0 } // \xff\n")
+        self.assertEqual(error_of(path), f"{path / 'a.kur'} is not valid UTF-8")
+        directory = tree({}) / "x.kur"
+        directory.mkdir()
+        self.assertEqual(error_of(directory), f"cannot read {directory}")
+
     def test_a_hint_names_the_use_that_imports_the_other_spelling(self):
         path = app("use package::a::X;\nfn f(x: X!) -> u32 { 0 }\nfn g(x: X) -> u32 { 0 }\n", {"app/a.kur": "enum X! { V }\n"})
         self.assertEqual(error_of(path).splitlines(), [
+            f"{path / 'lib.kur'}:1:5: unknown or private member X of a; the linear type is X!",
             f"{path / 'lib.kur'}:2:9: unknown name X!; the linear type is X!, imported as X at {path / 'lib.kur'}:1:5",
             f"{path / 'lib.kur'}:3:9: unknown or private member X of a; the linear type is X!, imported as X at "
             f"{path / 'lib.kur'}:1:5",

@@ -145,8 +145,7 @@ class ConstTests(unittest.TestCase):
         cases = (
             ("const A: u32 = true;\n", "1:16: const A has type bool, but its declared type is u32"),
             ("const A: u32 = 5u8;\n", "1:16: const A has type u8, but its declared type is u32"),
-            ('use std::slice::Slice;\nconst A: (u32, *u8) = "x";\n',
-             "2:23: const A has type Slice[u8, 'static], but its declared type is (u32, *u8)"),
+            ('const A: (u32, *u8) = "x";\n', "1:23: const A has type Slice[u8, 'static], but its declared type is (u32, *u8)"),
         )
         for source, message in cases:
             with self.subTest(source=source), self.assertRaises(SigError) as caught:

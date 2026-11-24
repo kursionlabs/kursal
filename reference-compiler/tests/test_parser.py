@@ -1,6 +1,7 @@
 """The parser (kursal/parser.py): its rules one by one, the shape of the trees it builds for the delicate
 constructs, and every .kur file in the repository."""
 
+import sys
 import unittest
 from pathlib import Path
 
@@ -400,6 +401,34 @@ class ExpressionShapeTests(unittest.TestCase):
         for src in ("18446744073709551616", "0x1_0000_0000_0000_0000u64", "fn f() -> u32 { match 1u32 { 18446744073709551616 => 0u32, _ => 1u32 } }"):
             with self.subTest(src=src), self.assertRaisesRegex(KursError, "integer literal out of range"):
                 S.parse(src) if src.startswith("fn") else expr(src)
+
+    def test_escapes(self):
+        self.assertEqual(expr('"\\x41\\x7f\\0"').value, "A\x7f\0")
+        self.assertEqual(expr("b'\\xff'").value, 255)
+        self.assertEqual(expr('f"\\x41{x}"').parts[0], "A")
+
+    def test_an_escape_error_is_at_its_literal(self):
+        for src, message in (('"A\\xZZB"', "1:25: invalid \\\\x escape: \\\\x takes two hex digits$"),
+                             ('"\\x1"', "1:25: invalid \\\\x escape: \\\\x takes two hex digits$"),
+                             ('f"a{x}\\x"', "1:31: invalid \\\\x escape: \\\\x takes two hex digits$"),
+                             ("b'\\x'", "1:25: invalid \\\\x escape: \\\\x takes two hex digits$"),
+                             ('"\\x80"', "1:25: \\\\x80 is not ASCII; a string's \\\\x escape is at most \\\\x7f$"),
+                             ("b'é'", "1:25: a byte literal's character is ASCII; write any other byte as \\\\xHH$"),
+                             ('"\\q"', "1:25: unknown escape \\\\q$")):
+            with self.subTest(src=src), self.assertRaisesRegex(KursError, message):
+                S.parse(f"fn f() -> u32 {{ let s = {src}; 0u32 }}")
+
+    def test_nesting_is_limited(self):
+        sys.setrecursionlimit(20000)
+        S.parse("fn f() -> i32 { " + "(" * 125 + "0i32" + ")" * 125 + " }")
+        S.parse("fn f() -> i32 { " + " + ".join(["1i32"] * 2000) + " }")
+        for src in ("(" * 200 + "0i32" + ")" * 200, "{ " * 200 + "0i32" + " }" * 200, "-" * 200 + "1i32",
+                    "x" + ".f()" * 100, "0i32" + " as i32" * 200,
+                    " else ".join(["if c { 0i32 }"] * 200) + " else { 1i32 }"):
+            with self.subTest(src=src[:20]), self.assertRaisesRegex(KursError, "nested too deeply \\(the limit is 128 levels\\)$"):
+                S.parse("fn f() -> i32 { " + src + " }")
+        with self.assertRaisesRegex(KursError, "1:137: nested too deeply"):
+            S.parse("fn f(p: " + "*" * 200 + "u8) {}")
 
     def test_format_string(self):
         e = expr('f"{dst}.tag = {index(&t, "}")};"')

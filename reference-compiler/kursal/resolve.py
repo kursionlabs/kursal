@@ -132,8 +132,20 @@ def _strings(table: dict[str, object], manifest: Path, key: str) -> list[str]:
     return cast(list[str], values)
 
 
+def read_source(path: Path) -> str:
+    """The text of the file at `path`, which must be UTF-8."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        fail(f"cannot read {path}")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        fail(f"{path} is not valid UTF-8")
+
+
 def _manifest(path: Path) -> dict[str, object]:
-    text = path.read_text()
+    text = read_source(path)
     try:
         # tomllib returns dynamic values. Validate them as objects at this boundary.
         document = cast(object, tomllib.loads(text))
@@ -195,7 +207,7 @@ def load(path: str | Path) -> list[Package]:
         return package.id
 
     if path.suffix == ".kur":
-        items = S.parse(path.read_text(), str(path))
+        items = S.parse(read_source(path), str(path))
         main = any(isinstance(i, S.Fn) and i.name == "main" for i in items)
         std = {"std": LIB / "std"} if _exists(LIB / "std" / "kur.toml") else {}
         add(path, path.stem, path.parent, std, ("main",) if main else None)
@@ -269,7 +281,7 @@ class Resolver:
             self.children.setdefault(ModuleId(package.id), {})
             for module, file in package.files.items():
                 self.order[module] = len(self.order)
-                self.collect(module, S.parse(file.read_text(), str(file)))
+                self.collect(module, S.parse(read_source(file), str(file)))
                 for k in range(len(module.path)):
                     parent = ModuleId(module.package, module.path[:k])
                     self.children.setdefault(parent, {})[module.path[k]] = parent.child(module.path[k])
@@ -654,7 +666,10 @@ class Names:
                 self.type(a, types)
 
     def item(self, item: S.Item, types: Set[str]) -> None:
-        if isinstance(item, (S.Use, S.Module)):
+        if isinstance(item, S.Use):
+            self.use(item.tree, (), item.export)
+            return
+        if isinstance(item, S.Module):
             return
         forall = item.forall
         types = types | self.params(forall)
@@ -693,6 +708,25 @@ class Names:
                 self.type(ty, types, trait=True)
                 for m in methods:
                     self.item(m, types)
+
+    def use(self, tree: S.UseTree, prefix: S.NamePath, export: bool) -> None:
+        """Each name a `use` or `export` tree imports or publishes names something, used or not, and each
+        glob names a module; an error is at where its tree starts."""
+        names, star, children, alias, start = tree
+        path = prefix + names
+        for child in children:
+            self.use(child, path, export)
+        if children:
+            return
+        name = alias or path[-1]
+        with self.r.reporting(self.module, start):
+            if star:
+                if not isinstance(self.r.resolve_path(self.module, path), ModuleId):
+                    fail(f"{'::'.join(path)} is not a module")
+            elif export and path == (name,):
+                self.r.solve(("export", self.module, name))
+            elif self.r.scopes[self.module].import_pos.get(name) == start:
+                self.r.solve(("import", self.module, name))
 
     def fn(self, fn: S.Fn | S.Extern, types: Set[str]) -> None:
         types = types | self.params(fn.forall) if isinstance(fn, S.Fn) else types
@@ -830,6 +864,16 @@ class Names:
                 self.expr(body, types, values | {name})
             case S.Lit():
                 pass
+            case S.Binop():
+                # A chain `a + b - c ...` nests to the left; a loop walks its links rather than recursion.
+                rights = []
+                left: S.Expr = expr
+                while isinstance(left, S.Binop):
+                    rights.append(left.right)
+                    left = left.left
+                walk(left)
+                for right in reversed(rights):
+                    walk(right)
             case _:
                 for child in children(expr):
                     walk(child)
@@ -907,7 +951,8 @@ def bound(pattern: S.Pattern) -> set[str]:
 
 
 def children(expr: S.Expr) -> Sequence[S.Expr]:
-    """The subexpressions of the expression forms with no binding structure."""
+    """The subexpressions of the expression forms with no binding structure, but for a binary operator, whose
+    chains `expr` walks itself."""
     match expr:
         case S.Tuple(elems=elems) | S.Array(elems=elems):
             return elems
@@ -919,8 +964,6 @@ def children(expr: S.Expr) -> Sequence[S.Expr]:
             return [value] if value is not None else []
         case S.Pack(value=value):
             return [value]
-        case S.Binop(left=left, right=right):
-            return [left, right]
         case S.Unary(operand=operand):
             return [operand]
         case S.UnsafeStore(pointer=pointer, value=value):
@@ -929,7 +972,7 @@ def children(expr: S.Expr) -> Sequence[S.Expr]:
             return [value]
         case S.Call(callee=callee, args=args):
             return [callee, *args]
-    raise KursError(f"no resolution rule for {type(expr).__name__}")
+    raise AssertionError(f"Names.expr takes a {type(expr).__name__} apart itself")
 
 
 def resolve(path: str | Path) -> Resolver:

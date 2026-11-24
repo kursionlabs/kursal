@@ -32,6 +32,7 @@ use std::cmp::Order;
 use std::hash::{HashIn, HashState};
 use std::option::{Option, Result};
 use std::slice::{Slice, hash_bytes};
+use std::utf8::validate;
 use toml::parser::parse as parse_toml;
 use toml::value::{TomlValue, line_column};
 
@@ -569,12 +570,17 @@ fn load(&cx: Domain!['k], path: Span['k], ids: Ref[u32, 'k]) -> ArenaVec[Package
     packages
 }
 
+// The text of the file at `path`, which must be UTF-8.
 forall 'k.
 fn read_source(&cx: Domain!['k], path: Span['k]) -> Span['k] {
-    match read_to_arena(&cx, path) {
+    let text = match read_to_arena(&cx, path) {
         Ok(s) => s,
         Err(e) => fail(&cx, Buffer!::new().push_static("cannot read ").push_bytes(&cx, path).save(&cx)),
+    };
+    if !validate(&cx, text) {
+        fail(&cx, Buffer!::new().push_bytes(&cx, path).push_static(" is not valid UTF-8").save(&cx));
     }
+    text
 }
 
 // The package of `manifest` (a kur.toml, or a single .kur file), added with its dependencies
@@ -1677,6 +1683,49 @@ impl Names['k] {
         self.r
     }
 
+    // Each name a `use` or `export` tree imports or publishes names something, used or not, and each
+    // glob names a module; an error is at where its tree starts.
+    fn use_tree(self, &cx: Domain!['k], tree: S::UseTree['k], prefix: ArenaVec[Span['k], 'k], exported: bool) {
+        let home = self.home.copy(&cx);
+        let path = prefix.clone(&cx);
+        path.append(&cx, tree.path);
+        var i = 0usize;
+        while i < tree.children.len(&cx) {
+            self.use_tree(&cx, tree.children.at(&cx, i), path, exported);
+            i = i + 1usize;
+        }
+        if !tree.children.is_empty(&cx) {
+            return;
+        }
+        let name = match tree.alias {
+            Some(a) => a,
+            None => path.at(&cx, path.len(&cx) - 1usize),
+        };
+        let recorded = match self.r.scopes.at(&cx, home).import_pos.get(&cx, name) {
+            Some(p) => p.line == tree.pos.line && p.col == tree.pos.col,
+            None => false,
+        };
+        if tree.star {
+            match self.r.resolve_path(&cx, home, path, Option::None, true) {
+                Ok(t) => match t {
+                    Module(m) => (),
+                    _ => self.r.report(&cx, Buffer!::new().push_bytes(&cx, path.join(&cx, "::")).push_static(" is not a module").save(&cx), tree.pos),
+                },
+                Err(e) => self.r.report(&cx, e.message, if e.pos.line != 0u32 { e.pos } else { tree.pos }),
+            }
+        } else if exported && path.len(&cx) == 1usize && path.at(&cx, 0usize).eq(&cx, name) {
+            match self.r.solve(&cx, lookup_key(&cx, "export", home, path)) {
+                Ok(t) => (),
+                Err(e) => self.r.report(&cx, e.message, if e.pos.line != 0u32 { e.pos } else { tree.pos }),
+            }
+        } else if recorded {
+            match self.r.solve(&cx, lookup_key(&cx, "import", home, ArenaVec::one(&cx, name))) {
+                Ok(t) => (),
+                Err(e) => self.r.report(&cx, e.message, if e.pos.line != 0u32 { e.pos } else { tree.pos }),
+            }
+        }
+    }
+
     fn set(self, &cx: Domain!['k], id: u32, r: NameRef['k]) {
         self.r.refs.insert(&cx, id, r);
     }
@@ -1710,7 +1759,10 @@ impl Names['k] {
 
     fn item(self, &cx: Domain!['k], item: S::Item['k], types: ArenaVec[Span['k], 'k]) {
         let unit = match item {
-            Use(x) => return,
+            Use(x) => {
+                self.use_tree(&cx, x.tree, ArenaVec::new(&cx), x.is_export);
+                return;
+            },
             Module(x) => return,
             _ => (),
         };
@@ -2047,6 +2099,28 @@ impl Names['k] {
                 self.block(&cx, f.body, types, with_one(&cx, values, f.name));
             },
             Lit(l) => (),
+            Binop(b) => {
+                // A chain `a + b - c ...` nests to the left; a loop walks its links rather than recursion.
+                let rights: ArenaVec[Expr['k], 'k] = ArenaVec::one(&cx, b.right.copy(&cx));
+                var left = b.left.copy(&cx);
+                var going = true;
+                while going {
+                    going = match left {
+                        Binop(l) => {
+                            rights.push(&cx, l.right.copy(&cx));
+                            left = l.left.copy(&cx);
+                            true
+                        },
+                        _ => false,
+                    };
+                }
+                self.expr(&cx, left, types, values);
+                var i = rights.len(&cx);
+                while i > 0usize {
+                    i = i - 1usize;
+                    self.expr(&cx, rights.at(&cx, i), types, values);
+                }
+            },
             _ => {
                 let parts = children(&cx, e);
                 var i = 0usize;
@@ -2187,7 +2261,8 @@ fn bound_all(&cx: Domain!['k], out: ArenaVec[Span['k], 'k], patterns: ArenaVec[P
     }
 }
 
-// The subexpressions of the expression forms with no binding structure.
+// The subexpressions of the expression forms with no binding structure, but for a binary operator,
+// whose chains `expr` walks itself.
 forall 'k.
 fn children(&cx: Domain!['k], e: Expr['k]) -> ArenaVec[Expr['k], 'k] {
     let out: ArenaVec[Expr['k], 'k] = ArenaVec::new(&cx);
@@ -2219,10 +2294,6 @@ fn children(&cx: Domain!['k], e: Expr['k]) -> ArenaVec[Expr['k], 'k] {
             };
         },
         Pack(p) => out.push(&cx, p.value.copy(&cx)),
-        Binop(b) => {
-            out.push(&cx, b.left.copy(&cx));
-            out.push(&cx, b.right.copy(&cx));
-        },
         Unary(u) => out.push(&cx, u.operand.copy(&cx)),
         UnsafeStore(s) => {
             out.push(&cx, s.pointer.copy(&cx));
@@ -2235,7 +2306,7 @@ fn children(&cx: Domain!['k], e: Expr['k]) -> ArenaVec[Expr['k], 'k] {
             out.push(&cx, c.callee.copy(&cx));
             out.append(&cx, c.args);
         },
-        _ => fail(&cx, Span::from_static(&cx, "no resolution rule for this expression")),
+        _ => fail(&cx, Span::from_static(&cx, "internal error: an expression the walker takes apart itself")),
     };
     out
 }

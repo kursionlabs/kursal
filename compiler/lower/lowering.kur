@@ -245,8 +245,8 @@ impl Lowering['k] {
     // The core's rules for an extern's signature (`Checker::foreign_signature`), at the source: it takes
     // no type or brand parameter and no place parameter, which foreign code cannot lend back, a
     // parameter has a memory form, the result holds nothing only checked code makes and no layout the
-    // compiler chooses, and every function type in it is an `unsafe fn` type, whose parameters and
-    // result foreign code makes or takes as it does an extern's.
+    // compiler chooses and is zero-size only if it is Copy, and every function type in it is an
+    // `unsafe fn` type, whose parameters and result foreign code makes or takes as it does an extern's.
     fn foreign_signature(self, &cx: Domain!['k], name: Span['k], sig: Sig['k]) {
         if !sig.params.is_empty(&cx) {
             self.foreign_fail(&cx, name, " takes no type or brand parameters");
@@ -950,6 +950,13 @@ impl FnLower['k] {
     // same group lends is rejected, whatever its type: the program states the order with a binding
     // before the expression.
     fn operands(self, &cx: Domain!['k], items: ArenaVec[Item['k], 'k], call: Option[S::Call['k]]) -> Option[ArenaVec[Span['k], 'k]] {
+        let (reads, lent) = self.operand_group(&cx, items);
+        self.operand_values(&cx, items, reads, lent, call, Option::None)
+    }
+
+    // The start of an operand group: the places its items read plainly, and its frame of lends, which
+    // is pushed until `operand_values` ends the group.
+    fn operand_group(self, &cx: Domain!['k], items: ArenaVec[Item['k], 'k]) -> (ArenaVec[Span['k], 'k], ArenaVec[Span['k], 'k]) {
         let reads: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < items.len(&cx) {
@@ -980,14 +987,24 @@ impl FnLower['k] {
         }
         let lent: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         self.lend_frames.push(&cx, lent);
+        (reads, lent)
+    }
+
+    // The values of the group `operand_group` started, in order; `first`, if given, is the first
+    // item's, evaluated already.
+    fn operand_values(self, &cx: Domain!['k], items: ArenaVec[Item['k], 'k], reads: ArenaVec[Span['k], 'k], lent: ArenaVec[Span['k], 'k], call: Option[S::Call['k]], first: Option[Span['k]]) -> Option[ArenaVec[Span['k], 'k]] {
         let values: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         let saved: ArenaVec[(usize, Span['k], Span['k], Type['k]), 'k] = ArenaVec::new(&cx);
-        i = 0usize;
+        var i = 0usize;
         while i < items.len(&cx) {
             let item = items.at(&cx, i);
-            let v = match call {
-                Some(c) => self.operand(&cx, item, c),
-                None => self.value(&cx, item),
+            let v = if i == 0usize && first.is_some() {
+                first
+            } else {
+                match call {
+                    Some(c) => self.operand(&cx, item, c),
+                    None => self.value(&cx, item),
+                }
             };
             let v = match v {
                 Some(v) => v,
@@ -1517,21 +1534,76 @@ impl FnLower['k] {
     }
 
     fn expr_binop(self, &cx: Domain!['k], b: S::Binop['k]) -> Option[Span['k]] {
-        if b.op.is(&cx, "&&") || b.op.is(&cx, "||") {
-            let c = match self.expr(&cx, b.left.copy(&cx)) {
-                Some(c) => c,
-                None => return Option::None,
+        // A chain `a + b - c ...` or `a && b || c ...` nests to the left, and is lowered by a loop over
+        // its links rather than by recursion.
+        let short = is_short_circuit(&cx, b.op);
+        let chain: ArenaVec[S::Binop['k], 'k] = ArenaVec::one(&cx, b);
+        var going = true;
+        while going {
+            going = match chain.at(&cx, chain.len(&cx) - 1usize).left.copy(&cx) {
+                Binop(l) => if is_short_circuit(&cx, l.op) == short {
+                    chain.push(&cx, l);
+                    true
+                } else {
+                    false
+                },
+                _ => false,
             };
-            let right = ArmBody::Value.(b.right.copy(&cx));
-            if b.op.is(&cx, "&&") {
-                return self.branch(&cx, c, right, ArmBody::Constant.(Span::from_static(&cx, "false")), C::bool_type(&cx));
+        }
+        if short {
+            var c = self.expr(&cx, chain.at(&cx, chain.len(&cx) - 1usize).left.copy(&cx));
+            var depth = chain.len(&cx);
+            while depth > 0usize {
+                depth = depth - 1usize;
+                let link = chain.at(&cx, depth);
+                c = match c {
+                    Some(v) => {
+                        self.at.set(&cx, link.pos);
+                        self.short_circuit(&cx, link, v)
+                    },
+                    None => return Option::None,
+                };
             }
-            return self.branch(&cx, c, ArmBody::Constant.(Span::from_static(&cx, "true")), right, C::bool_type(&cx));
+            return c;
         }
-        match self.operands(&cx, ArenaVec::two(&cx, Item::Expr.(b.left.copy(&cx)), Item::Expr.(b.right.copy(&cx))), Option::None) {
-            Some(vals) => Option::Some.(self.emit(&cx, Op::new(&cx, binop_name(&cx, b.op), self.substitute_type(&cx, self.type_of(&cx, b.id)), vals))),
-            None => Option::None,
+        // Each link's operand group starts outermost first, as each starts before its left operand.
+        let groups: ArenaVec[(ArenaVec[Span['k], 'k], ArenaVec[Span['k], 'k]), 'k] = ArenaVec::new(&cx);
+        var k = 0usize;
+        while k < chain.len(&cx) {
+            let link = chain.at(&cx, k);
+            self.at.set(&cx, link.pos);
+            groups.push(&cx, self.operand_group(&cx, link_items(&cx, link)));
+            k = k + 1usize;
         }
+        var value = Option::None;
+        var depth = chain.len(&cx);
+        while depth > 0usize {
+            depth = depth - 1usize;
+            let link = chain.at(&cx, depth);
+            self.at.set(&cx, link.pos);
+            let (reads, lent) = groups.at(&cx, depth);
+            value = match self.operand_values(&cx, link_items(&cx, link), reads, lent, Option::None, value) {
+                Some(vals) => Option::Some.(self.emit(&cx, Op::new(&cx, binop_name(&cx, link.op), self.substitute_type(&cx, self.type_of(&cx, link.id)), vals))),
+                None => {
+                    var outer = 0usize;
+                    while outer < depth {
+                        let unit = self.lend_frames.pop(&cx);
+                        outer = outer + 1usize;
+                    }
+                    return Option::None;
+                },
+            };
+        }
+        value
+    }
+
+    // `&&` or `||` once its left operand is `c`.
+    fn short_circuit(self, &cx: Domain!['k], b: S::Binop['k], c: Span['k]) -> Option[Span['k]] {
+        let right = ArmBody::Value.(b.right.copy(&cx));
+        if b.op.is(&cx, "&&") {
+            return self.branch(&cx, c, right, ArmBody::Constant.(Span::from_static(&cx, "false")), C::bool_type(&cx));
+        }
+        self.branch(&cx, c, ArmBody::Constant.(Span::from_static(&cx, "true")), right, C::bool_type(&cx))
     }
 
     fn expr_unary(self, &cx: Domain!['k], u: S::Unary['k]) -> Option[Span['k]] {
@@ -2926,6 +2998,17 @@ impl FnLower['k] {
             None => self.fails(&cx, "assignment through a field needs a place", a.pos),
         };
     }
+}
+
+forall 'k.
+fn is_short_circuit(&cx: Domain!['k], op: Span['k]) -> bool {
+    op.is(&cx, "&&") || op.is(&cx, "||")
+}
+
+// A link of a chain of binary operators: its two operands.
+forall 'k.
+fn link_items(&cx: Domain!['k], b: S::Binop['k]) -> ArenaVec[Item['k], 'k] {
+    ArenaVec::two(&cx, Item::Expr.(b.left.copy(&cx)), Item::Expr.(b.right.copy(&cx)))
 }
 
 forall 'k.

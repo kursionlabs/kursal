@@ -979,6 +979,11 @@ def app(source: str, files: dict[str, str] | None = None) -> dict[str, str]:
 RESOLUTION_ERRORS: tuple[tuple[dict[str, str], str], ...] = (
     (app("use nothing::*;\nfn f() -> u32 { g() }\n"), "app"),
     (app("fn f() -> u32 { nothing() }\n"), "app"),
+    (app("use lib::shapes::Nothing;\n"), "app"),
+    (app("use lib::nowhere::*;\n"), "app"),
+    (app("use lib::shapes::Point::*;\n"), "app"),
+    (app("use lib::{shapes::{Point, Nothing}, nowhere::Thing};\n"), "app"),
+    (app("export absent;\n"), "app"),
     (app("fn f(x: Nothing) -> u32 { 0u32 }\n"), "app"),
     (app("fn f() -> u32 { 0u32 }\nfn f() -> u32 { 1u32 }\n"), "app"),
     (app("use lib::shapes::Point;\nuse lib::shapes::Point;\n"), "app"),
@@ -1245,6 +1250,10 @@ SIGNATURE_ERRORS = (
     "fn f(x: exists 'k. foreach X of (core::cap::Brand['k],) => X) {}\n",
 )
 
+# The examples in examples/bad/ that resolution rejects.
+UNRESOLVED = {"private_import.kur", "unused_unknown_import.kur", "glob_of_unknown_module.kur",
+              "unknown_name_in_use_tree.kur"}
+
 SYNTAX_ERRORS = (
     "fn f() -> Point { Point { x: 1u32 } }",
     "fn f(x: &u32) {}",
@@ -1258,6 +1267,20 @@ SYNTAX_ERRORS = (
     "fn f() { x # y }",
     "struct S { a: u32 b: u32 }",
     "fn f() { let s = \"\\q\"; }",
+    # `\x` takes two hex digits; in a string, which is UTF-8, they are at most 7f.
+    "fn f() { let s = \"A\\xZZB\"; }",
+    "fn f() { let s = f\"{1u32}\\x4\"; }",
+    "fn f() { let s = \"\\x80\"; }",
+    "fn f() { let b = b'\\x'; }",
+    "fn f() { let b = b'\u00e9'; }",
+    "extern \"\\xC3\" fn g();",
+    # Nesting is limited; a chain of binary operators is not nesting.
+    "fn f() -> i32 { " + "-" * 129 + "1i32 }",
+    "fn f(p: " + "*" * 129 + "u8) {}",
+    "fn f() -> i32 { x" + ".g()" * 65 + " }",
+    "fn f() -> i32 { 0i32" + " as i32" * 129 + " }",
+    "fn f() -> i32 { " + " else ".join(["if c { 0i32 }"] * 129) + " else { 1i32 } }",
+    "fn f() { let x = 1u32" + " + 1u32" * 3000 + " # }",
     "fn f() -> u32 { p.0.1 }",
     "fn f() -> u64 { 18446744073709551616 }",
     # Only a type's name ends with `!`.
@@ -1937,8 +1960,9 @@ class CompilerTests(unittest.TestCase):
         for path in [*packages, *singles, COMPILER]:
             with self.subTest(path=str(path.relative_to(ROOT))):
                 expected = reference_resolution(path)
-                # A rejected program may be rejected here: one in examples/bad/ reaches a private name.
-                self.assertEqual(expected.startswith("error:"), path.name == "private_import.kur", expected)
+                # A rejected program may be rejected here: one in examples/bad/ reaches a private name, or
+                # imports one that names nothing.
+                self.assertEqual(expected.startswith("error:"), path.name in UNRESOLVED, expected)
                 self.assertEqual(self.compiler_resolution(path), expected)
 
     def run_batches(self, command: str, paths: list[Path]) -> list[str]:

@@ -185,6 +185,7 @@ REJECTED = {
     "foreach_as_field.kur": "8:1: a component is a foreach type, which is only the type of a whole value, parameter or result$",
     "foreach_pointer_over_parameter.kur": "8:1: type formation: foreach \\*F needs a source written with pointer components$",
     "foreach_through_pointer_to_sum.kur": "9:17: a foreach source cannot be a pointer to a sum$",
+    "glob_of_unknown_module.kur": "4:5: unknown or private member nowhere of std$",
     "function_value_at_two_brands.kur": "22:36: brand mismatch: Tag!\\['b\\] and Tag!\\['a\\]; 'b was opened at 20:5, 'a at 19:5$",
     "forged_file.kur":"the shape of std::io::File! is not exposed here",
     "implicit_package_open.kur": "pattern does not match exists '1\\. \\(Tag!\\['1\\], u32\\)",
@@ -206,6 +207,8 @@ REJECTED = {
     "too_large_type.kur": "is too large: its size is not below 2\\^64 bytes in type too_large_type::Huge$",
     "type_mismatch.kur": "type mismatch: bool and u32",
     "unbound_result_brand.kur": "brand '1 is not in scope",
+    "unknown_name_in_use_tree.kur": "4:28: unknown or private member Maybe of option$",
+    "unused_unknown_import.kur": "4:5: unknown or private member Maybe of option$",
     "while_consume_without_replacement.kur": "linear value 'h' remains live on some paths to while",
     "write_by_number.kur": "13:19: calling an unsafe function requires unsafe authorization$",
 }

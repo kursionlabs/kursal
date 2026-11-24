@@ -202,6 +202,12 @@ INFERENCES = (
 )
 
 INFER_ERRORS = (
+    # A label's scrutinee whose type is not known yet is reported at the match; one whose type is solved is
+    # named solved.
+    ('forall T. fn g() -> T { g() }\nfn f() -> u32 {\n    match g() {\n        Some(x) => 0u32,\n        _ => 1u32,\n    }\n}\n',
+     '3:5: the type here is not known yet'),
+    ('use std::option::Option;\nfn f() -> u32 {\n    let o = Option::None;\n    let u: Option[u8] = o;\n'
+     '    match o {\n        Nothing => 0u32,\n        _ => 1u32,\n    }\n}\n', '6:9: Option[u8] has no variant Nothing'),
     ('fn f() -> u32 { let g = |x| x.0; 0u32 }\n', 'a type here is not known yet'),
     ('use std::option::Option;\nfn f(o: std::buffer::Buffer!) -> u32 { let { len } = o; 0u32 }\n', 'is not exposed here'),
     ('exposed struct P { x: u32 }\nfn f(p: P) -> u32 { let { y } = p; y }\n', 'no field y'),
@@ -227,7 +233,7 @@ INFER_ERRORS = (
     ('fn f() -> u32 { let b = core::cap::static_brand(1u32); 0u32 }\n', 'takes 0 value arguments'),
     ('fn f() -> u32 { let p = core::mem[u32]::alloca[u32](); 0u32 }\n', 'type arguments belong on alloca, not a namespace'),
     ('fn f() -> u32 { let p = core::mem::alloca(); 0u32 }\n', 'alloca takes 1 type arguments'),
-    ('use std::buffer::Buffer;\nfn f() -> u32 { let b = f"x".write(); 0u32 }\n', 'write takes the writer'),
+    ('use std::buffer::Buffer!;\nfn f() -> u32 { let b = f"x".write(); 0u32 }\n', 'write takes the writer'),
     ('use std::buffer::Buffer!;\nfn f(x: *u8) -> Buffer! { f"x = {x}" }\n', '2:34: no instance of Format[*u8, Buffer!]'),
     ("use std::buffer::Buffer!;\nuse std::raw::Span;\nfn f(s: Span['static]) -> Buffer! { f\"{&s}\".write(Buffer!::new()) }\n",
      "3:40: no instance of Format[Span['static], Buffer!]"),

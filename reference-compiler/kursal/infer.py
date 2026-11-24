@@ -23,7 +23,7 @@ Results are recorded on the AST for lowering:
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence, Set
-from typing import Literal, Never, Optional
+from typing import Literal, Never, Optional, assert_never
 from dataclasses import dataclass, field
 from itertools import count
 from . import core as C
@@ -543,7 +543,7 @@ class Infer:
             case S.ExprStmt(value=value):
                 return isinstance(prune(self.expr(value)), C.Never)
             case _:
-                fail(f"no rule for statement {type(stmt).__name__}", stmt.pos)
+                assert_never(stmt)
         return False
 
 
@@ -630,14 +630,8 @@ class Infer:
             case S.If(other=other):
                 assert other is not None
                 return self.apply(((expr.cond, "bool"), (expr.then, "t"), (other, "t")), "t", expr.pos)
-            case S.Binop(op=op):
-                if op in {"&&", "||"}:
-                    return self.apply(((expr.left, "bool"), (expr.right, "bool")), "bool", expr.pos)
-                if op in COMPARE | ARITH:
-                    result = self.apply(((expr.left, "t"), (expr.right, "t")), "bool" if op in COMPARE else "t", expr.pos)
-                    operand = expr.right.ty if isinstance(prune(expr.left.ty), C.Never) else expr.left.ty
-                    self.require_primitive(op, operand, expr.pos)
-                    return result
+            case S.Binop():
+                return self.expr_binop(expr)
             case S.Unary(op=op) if op in {"unsafe", "-", "!", "*"}:
                 result = self.apply(((expr.operand, "*t" if op == "*" else "t"),), "t", expr.pos)
                 if op in {"-", "!"}:
@@ -664,7 +658,7 @@ class Infer:
             case S.Index(): return self.expr_field(expr)
             case S.Try(): return self.expr_try(expr)
             case S.Call(): return self.expr_call(expr)
-        fail(f"no inference rule for {type(expr).__name__}", expr.pos)
+        assert_never(expr)
 
     def require_primitive(self, op: str, operand: C.Type, pos: Optional[Position], *, unary: bool = False) -> None:
         """Primitive applicability waits for inference, without unfolding nominal types."""
@@ -688,16 +682,39 @@ class Infer:
 
         self.later(operand, known, pos)
 
-    def apply(self, premises: Sequence[tuple[S.Expr, str]], result: str, pos: Optional[Position]) -> C.Type:
-        """Each premise pairs an expression with a type pattern; variables are shared by the rule."""
+    def expr_binop(self, expr: S.Binop) -> C.Type:
+        """A chain `a + b - c ...` nests to the left; its links are inferred by a loop, innermost first,
+        rather than by recursion."""
+        chain = [expr]
+        while isinstance(chain[-1].left, S.Binop):
+            chain.append(chain[-1].left)
+        left = self.expr(chain[-1].left)
+        for link in reversed(chain[1:]):
+            left = self.record(link, self.binop(link, left))
+        return self.binop(expr, left)
+
+    def binop(self, expr: S.Binop, left: C.Type) -> C.Type:
+        """`expr`, whose left operand has the type `left` already."""
+        if expr.op in {"&&", "||"}:
+            return self.apply(((expr.left, "bool"), (expr.right, "bool")), "bool", expr.pos, left)
+        assert expr.op in COMPARE | ARITH
+        result = self.apply(((expr.left, "t"), (expr.right, "t")), "bool" if expr.op in COMPARE else "t", expr.pos, left)
+        operand = expr.right.ty if isinstance(prune(left), C.Never) else left
+        self.require_primitive(expr.op, operand, expr.pos)
+        return result
+
+    def apply(self, premises: Sequence[tuple[S.Expr, str]], result: str, pos: Optional[Position],
+              first: Optional[C.Type] = None) -> C.Type:
+        """Each premise pairs an expression with a type pattern; variables are shared by the rule. `first`, if
+        given, is the first premise's type, inferred already."""
         variables: dict[str, C.Type] = {}
 
         def pattern(pattern_text: str) -> C.Type:
             if pattern_text.startswith("*"):
                 return C.Ptr(pattern(pattern_text[1:]))
             return CONSTANTS.get(pattern_text) or variables.setdefault(pattern_text, Meta())
-        for child, p in premises:
-            got = self.expr(child)
+        for n, (child, p) in enumerate(premises):
+            got = first if n == 0 and first is not None else self.expr(child)
             if not isinstance(prune(got), C.Never):       # a child that diverges fits anywhere
                 self.unify(got, pattern(p), pos)
         return pattern(result) if result in CONSTANTS or result in variables else C.Never()
@@ -956,7 +973,7 @@ class Infer:
             shape = self.shape(ty, pos)
             variants = dict(shape.variants) if isinstance(shape, C.Enum) else {}
             if name not in variants:
-                fail(f"{self.shown(ty)} has no variant {name}", case.pos or pos)
+                fail(f"{self.shown(zonk(ty))} has no variant {name}", case.pos or pos)
             payload = variants[name]
         else:
             assert ref[0] == "variant"

@@ -14,7 +14,7 @@ from bisect import bisect_right
 
 from . import syntax as S
 from .core import LITERAL_BITS
-from .sexpr import KursError, Position
+from .sexpr import ESCAPES, KursError, Position
 
 KEYWORDS = frozenset(
     "use export module struct tuple enum fn extern impl trait instance const forall where as exposed unsafe "
@@ -116,8 +116,8 @@ class Lexer:
                 if i >= len(text):
                     raise KursError("unterminated f-string")
                 ch = text[i]
-                if ch == "\\":
-                    width = 4 if text[i + 1:i + 2] == "x" else 2
+                if ch == "\\":                                    # `\xHH`, or `\` and one character
+                    width = 4 if text[i + 1:i + 2] == "x" and hex_digits(text[i + 2:i + 4]) else 2
                     chunk.append(text[i:i + width])
                     i += width
                 elif ch in "{}" and text[i + 1:i + 2] == ch:
@@ -154,12 +154,15 @@ EXPR_START = BLOCK_LIKE | frozenset((
 LEVELS = (("||",), ("&&",), ("==", "!=", "<=", ">=", "<", ">"), ("|",), ("^",), ("&",), ("<<", ">>"),
           ("+", "-"), ("*", "/", "%"))
 COMPARE = 2
+# The deepest a file nests expressions, blocks, types, patterns and `use` trees: every phase walks a
+# nest by recursion, and this bounds the stack it takes. A chain of binary operators is not a nest.
+NESTING = 128
 STATEMENTS = (S.Let, S.Var, S.Assign, S.ExprStmt, S.Const)
 
 
 class Parser:
     def __init__(self, tokens: list[Tok], filename: str) -> None:
-        self.t, self.i, self.filename = tokens, 0, filename
+        self.t, self.i, self.filename, self.depth = tokens, 0, filename, 0
 
     # ---- tokens
     @property
@@ -189,6 +192,16 @@ class Parser:
     def fail(self) -> Never:
         t = self.t[self.i]
         raise KursError(f"{self.filename}:{t.line}:{t.col}: syntax error")
+
+    def enter(self) -> None:
+        """One level of nesting more; `leave` ends it."""
+        self.depth += 1
+        if self.depth > NESTING:
+            t = self.t[self.i]
+            raise KursError(f"{self.filename}:{t.line}:{t.col}: nested too deeply (the limit is {NESTING} levels)")
+
+    def leave(self, levels: int = 1) -> None:
+        self.depth -= levels
 
     def list_until[T](self, close: str, item: Callable[[], T]) -> list[T]:
         """`item ("," item)* ","? close`, possibly empty."""
@@ -307,6 +320,7 @@ class Parser:
 
     def use_tree(self) -> S.UseTree:
         start = self.pos()
+        self.enter()
         names, star = [self.segment()], False
         children: tuple[S.UseTree, ...] = ()
         alias: Optional[str] = None
@@ -323,6 +337,7 @@ class Parser:
                 self.fail()
         if self.eat("as"):
             alias = self.segment()
+        self.leave()
         return (tuple(names), star, children, alias, start)
 
     def path(self) -> S.NamePath:
@@ -411,7 +426,8 @@ class Parser:
     def extern(self) -> S.Extern:
         start = self.pos()
         self.expect("extern")
-        abi = S.unescape(self.expect("STRING").text[1:-1])
+        tok = self.expect("STRING")
+        abi = self.unescape(tok, tok.text[1:-1])
         name, params, ret = self.fn_header()
         self.expect(";")
         return S.Extern(abi, name, params, ret, start)
@@ -455,6 +471,12 @@ class Parser:
     def type(self, parameter: bool = False) -> S.Type:
         """A type; with `parameter`, the type of a parameter, which may also be a `closure(...)` type whose
         environment is left unnamed."""
+        self.enter()
+        ty = self.type_form(parameter)
+        self.leave()
+        return ty
+
+    def type_form(self, parameter: bool) -> S.Type:
         k = self.k
         if k == "NAME":
             return self.named_type()
@@ -568,6 +590,7 @@ class Parser:
     def block(self) -> S.Block:
         start = self.pos()
         self.expect("{")
+        self.enter()
         items: list[S.Statement] = []
         tail: Optional[S.Expr] = None
         while self.k != "}":
@@ -576,6 +599,7 @@ class Parser:
                 items.append(item)
             else:
                 tail = item
+        self.leave()
         self.next()
         return S.Block(tuple(items), tail, start)
 
@@ -639,6 +663,12 @@ class Parser:
         return S.Let(pattern, ty, value, brands, start)
 
     def pattern(self) -> S.Pattern:
+        self.enter()
+        p = self.pattern_form()
+        self.leave()
+        return p
+
+    def pattern_form(self) -> S.Pattern:
         k = self.k
         if k == "NAME":
             return S.PBind(self.name())
@@ -697,6 +727,12 @@ class Parser:
     # ---- expressions
     def expr(self) -> S.Expr:
         """A whole expression: an operator expression, or a block-like, closure, `return` or `pack` form."""
+        self.enter()
+        e = self.expr_form()
+        self.leave()
+        return e
+
+    def expr_form(self) -> S.Expr:
         k = self.k
         if k in BLOCK_LIKE:
             return self.block_like()
@@ -724,8 +760,10 @@ class Parser:
             if self.eat("else"):
                 if self.k == "{":
                     other = self.block()
-                elif self.k == "if":
+                elif self.k == "if":                         # an `else if` chain nests
+                    self.enter()
                     nested = self.block_like()
+                    self.leave()
                     assert isinstance(nested, S.If)
                     other = nested
                 else:
@@ -832,23 +870,32 @@ class Parser:
 
     def cast(self, first: Optional[S.Expr]) -> S.Expr:
         start = first.pos if first is not None else self.pos()
-        left = first if first is not None else self.unary()
-        while self.eat("as"):
-            left = S.Cast(left, self.type(), start)
+        left, casts = first if first is not None else self.unary(), 0
+        while self.k == "as":                                 # each cast nests
+            self.enter()
+            self.next()
+            left, casts = S.Cast(left, self.type(), start), casts + 1
+        self.leave(casts)
         return left
 
     def unary(self) -> S.Expr:
         k, start = self.k, self.pos()
         if k in ("-", "!", "*", "&", "unsafe"):
+            self.enter()
             self.next()
-            return S.Unary(k, self.unary(), start)
+            e = S.Unary(k, self.unary(), start)
+            self.leave()
+            return e
         return self.postfix()
 
     def postfix(self) -> S.Expr:
         start = self.pos()
-        e, after_index = self.atom(), False
+        e, after_index, ops = self.atom(), False, 0
         while True:
             k = self.k
+            if k in (".", "(", "?") or k == "TUPLE_INDEX" and not after_index:   # each operation nests
+                self.enter()
+                ops += 1
             if k == ".":
                 self.next()
                 e, after_index = S.Field(e, self.name(), start), False
@@ -865,6 +912,7 @@ class Parser:
                 self.next()
                 e, after_index = S.Index(e, index, start), True
             else:
+                self.leave(ops)
                 return e
 
     def atom(self) -> S.Expr:
@@ -873,11 +921,11 @@ class Parser:
             return self.literal()
         if k == "FSTRING_START":
             self.next()
-            parts: list[str | S.Expr] = [S.unescape(self.expect("FSTRING_TEXT").text)]
+            parts: list[str | S.Expr] = [self.fstring_text()]
             while self.eat("FSTRING_OPEN"):
                 parts.append(self.expr())
                 self.expect("FSTRING_CLOSE")
-                parts.append(S.unescape(self.expect("FSTRING_TEXT").text))
+                parts.append(self.fstring_text())
             self.expect("FSTRING_END")
             return S.FStr(tuple(parts), start)
         if k == "(":
@@ -947,10 +995,48 @@ class Parser:
             digits, suffix = S.split_suffix(text, ("f32", "f64"))
             return S.Lit("float", digits.replace("_", ""), suffix, p)
         if k == "BYTE":
-            return S.Lit("int", ord(S.unescape(text[2:-1])), "u8", p)
+            return S.Lit("int", ord(self.unescape(tok, text[2:-1], byte=True)), "u8", p)
         if k == "STRING":
-            return S.Lit("str", S.unescape(text[1:-1]), None, p)
+            return S.Lit("str", self.unescape(tok, text[1:-1]), None, p)
         return S.Lit("bool", k == "true", None, p)
+
+    def fstring_text(self) -> str:
+        tok = self.expect("FSTRING_TEXT")
+        return self.unescape(tok, tok.text)
+
+    def unescape(self, tok: Tok, text: str, byte: bool = False) -> str:
+        """What `text`, the inside of `tok`, stands for, with `\\n`, `\\t`, `\\r`, `\\0`, `\\\\`, `\\'`, `\\"` and
+        `\\xHH`. A string is UTF-8, so its `\\xHH` is ASCII; a byte literal's is any byte, and its one
+        character is ASCII."""
+        out, i = [], 0
+        while i < len(text):
+            if text[i] != "\\":
+                if byte and ord(text[i]) > 0x7f:
+                    self.error(tok, "a byte literal's character is ASCII; write any other byte as \\xHH")
+                out.append(text[i])
+                i += 1
+            elif text[i + 1] == "x":
+                digits = text[i + 2:i + 4]
+                if not hex_digits(digits):
+                    self.error(tok, "invalid \\x escape: \\x takes two hex digits")
+                if not byte and int(digits, 16) > 0x7f:
+                    self.error(tok, f"\\x{digits} is not ASCII; a string's \\x escape is at most \\x7f")
+                out.append(chr(int(digits, 16)))
+                i += 4
+            else:
+                if text[i + 1] not in ESCAPES:
+                    self.error(tok, f"unknown escape \\{text[i + 1]}")
+                out.append(ESCAPES[text[i + 1]])
+                i += 2
+        return "".join(out)
+
+    def error(self, tok: Tok, message: str) -> Never:
+        raise KursError(f"{self.filename}:{tok.line}:{tok.col}: {message}")
+
+
+def hex_digits(text: str) -> bool:
+    """`text` is two hex digits."""
+    return len(text) == 2 and all(c in "0123456789abcdefABCDEF" for c in text)
 
 
 def assignable(e: S.Expr) -> bool:

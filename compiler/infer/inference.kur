@@ -1790,16 +1790,7 @@ impl Body['k] {
                     self.apply(&cx, parts, Pat::T, n.pos)
                 },
             },
-            Binop(b) => {
-                if b.op.is(&cx, "&&") || b.op.is(&cx, "||") {
-                    return self.apply(&cx, ArenaVec::two(&cx, (b.left.copy(&cx), Pat::Bool), (b.right.copy(&cx), Pat::Bool)), Pat::Bool, b.pos);
-                }
-                let result = self.apply(&cx, ArenaVec::two(&cx, (b.left.copy(&cx), Pat::T), (b.right.copy(&cx), Pat::T)), if is_comparison(&cx, b.op) { Pat::Bool } else { Pat::T }, b.pos);
-                let left = self.type_of(&cx, S::expr_id(b.left.copy(&cx)));
-                let operand = if is_never(&cx, left) { self.type_of(&cx, S::expr_id(b.right.copy(&cx))) } else { left };
-                self.require_primitive(&cx, b.op, operand, b.pos, false);
-                result
-            },
+            Binop(b) => self.expr_binop(&cx, b),
             Unary(u) => if u.op.is(&cx, "&") {
                 self.expr_unary(&cx, u)
             } else {
@@ -1906,13 +1897,56 @@ impl Body['k] {
         }
     }
 
+    // A chain `a + b - c ...` nests to the left; its links are inferred by a loop, innermost first,
+    // rather than by recursion.
+    fn expr_binop(self, &cx: Domain!['k], b: S::Binop['k]) -> Type['k] {
+        let chain: ArenaVec[S::Binop['k], 'k] = ArenaVec::one(&cx, b);
+        var going = true;
+        while going {
+            going = match chain.at(&cx, chain.len(&cx) - 1usize).left.copy(&cx) {
+                Binop(l) => {
+                    chain.push(&cx, l);
+                    true
+                },
+                _ => false,
+            };
+        }
+        var left = self.expr(&cx, chain.at(&cx, chain.len(&cx) - 1usize).left.copy(&cx));
+        var depth = chain.len(&cx) - 1usize;
+        while depth > 0usize {
+            let link = chain.at(&cx, depth);
+            left = self.record(&cx, link.id, link.pos, self.binop(&cx, link, left));
+            depth = depth - 1usize;
+        }
+        self.binop(&cx, b, left)
+    }
+
+    // `b`, whose left operand has the type `left` already.
+    fn binop(self, &cx: Domain!['k], b: S::Binop['k], left: Type['k]) -> Type['k] {
+        if b.op.is(&cx, "&&") || b.op.is(&cx, "||") {
+            return self.apply_after(&cx, ArenaVec::two(&cx, (b.left.copy(&cx), Pat::Bool), (b.right.copy(&cx), Pat::Bool)), Pat::Bool, b.pos, Option::Some.(left));
+        }
+        let result = self.apply_after(&cx, ArenaVec::two(&cx, (b.left.copy(&cx), Pat::T), (b.right.copy(&cx), Pat::T)), if is_comparison(&cx, b.op) { Pat::Bool } else { Pat::T }, b.pos, Option::Some.(left));
+        let operand = if is_never(&cx, left) { self.type_of(&cx, S::expr_id(b.right.copy(&cx))) } else { left };
+        self.require_primitive(&cx, b.op, operand, b.pos, false);
+        result
+    }
+
     // Each premise pairs an expression with a type pattern; `t` is shared by the rule.
     fn apply(self, &cx: Domain!['k], premises: ArenaVec[(Expr['k], Pat), 'k], result: Pat, pos: Pos) -> Type['k] {
+        self.apply_after(&cx, premises, result, pos, Option::None)
+    }
+
+    // `apply`, where `first`, if given, is the first premise's type, inferred already.
+    fn apply_after(self, &cx: Domain!['k], premises: ArenaVec[(Expr['k], Pat), 'k], result: Pat, pos: Pos, first: Option[Type['k]]) -> Type['k] {
         let t: Ref[Option[Type['k]], 'k] = Ref::new(&cx, Option::None);
         var i = 0usize;
         while i < premises.len(&cx) {
             let (child, p) = premises.at(&cx, i);
-            let got = self.expr(&cx, child);
+            let got = match first {
+                Some(f) => if i == 0usize { f } else { self.expr(&cx, child) },
+                None => self.expr(&cx, child),
+            };
             // a child that diverges fits anywhere
             if !is_never(&cx, got) {
                 self.unify_at(&cx, got, self.pat_type(&cx, p, t), pos);
@@ -2175,8 +2209,9 @@ impl Body['k] {
         (td, sub, C::named(td.name, args))
     }
 
-    // The payload of the variant `name` of the sum `ty` is, once `ty` is known.
-    fn label_payload(self, &cx: Domain!['k], ty: Type['k], name: Span['k], pos: Pos) -> Type['k] {
+    // The payload of the variant `name` of the sum `ty` is, once `ty` is known: the type is needed at
+    // `pos`, the match, and the label is at `at`, the case.
+    fn label_payload(self, &cx: Domain!['k], ty: Type['k], name: Span['k], pos: Pos, at: Pos) -> Type['k] {
         let unit = match self.shape(&cx, ty, pos) {
             Enum(variants) => {
                 var i = 0usize;
@@ -2189,7 +2224,7 @@ impl Body['k] {
             },
             _ => (),
         };
-        self.fail(&cx, Buffer!::new().push_bytes(&cx, self.shown(&cx, ty)).push_static(" has no variant ").push_bytes(&cx, name).save(&cx), pos)
+        self.fail(&cx, Buffer!::new().push_bytes(&cx, self.shown(&cx, zonk(&cx, ty))).push_static(" has no variant ").push_bytes(&cx, name).save(&cx), at)
     }
 
     fn payload_of(self, &cx: Domain!['k], td: TypeDecl['k], name: Span['k], sub: ArenaMap[Span['k], Type['k], 'k]) -> Type['k] {
@@ -2418,7 +2453,7 @@ impl Body['k] {
             // a bare label: a variant of the scrutinee's sum
             None => {
                 let name = path.segments.at(&cx, 0usize).name;
-                (name, self.label_payload(&cx, ty, name, c.pos))
+                (name, self.label_payload(&cx, ty, name, pos, c.pos))
             },
         };
         self.results().types.insert(&cx, c.id, payload);

@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, Optional
-from .sexpr import ESCAPES, KursError, Position
+from .sexpr import Position
 
 
 if TYPE_CHECKING:
@@ -541,23 +541,6 @@ type UseTree = tuple[NamePath, bool, tuple[UseTree, ...], Optional[str], Positio
 
 
 # ----------------------------------------------------------------- tokens --
-
-def unescape(text: str) -> str:
-    out, i = [], 0
-    while i < len(text):
-        if text[i] == "\\" and text[i + 1] == "x":
-            out.append(chr(int(text[i + 2:i + 4], 16)))
-            i += 4
-        elif text[i] == "\\":
-            if text[i + 1] not in ESCAPES:
-                raise KursError(f"unknown escape \\{text[i + 1]}")
-            out.append(ESCAPES[text[i + 1]])
-            i += 2
-        else:
-            out.append(text[i])
-            i += 1
-    return "".join(out)
-
 
 INT_SUFFIXES = ("isize", "usize", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64")
 

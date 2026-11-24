@@ -443,7 +443,8 @@ impl Lexer['k] {
                 }
                 let ch = self.byte(&cx, i);
                 if ch == b'\\' {
-                    let width = if self.byte(&cx, i + 1usize) == b'x' { 4usize } else { 2usize };
+                    // `\xHH`, or `\` and one byte
+                    let width = if self.byte(&cx, i + 1usize) == b'x' && is_hex_digit(self.byte(&cx, i + 2usize)) && is_hex_digit(self.byte(&cx, i + 3usize)) { 4usize } else { 2usize };
                     chunk = chunk.push_bytes(&cx, self.source.slice(i, i + width));
                     i = i + width;
                 } else if (ch == b'{' || ch == b'}') && self.byte(&cx, i + 1usize) == ch {
@@ -491,6 +492,8 @@ exposed struct Parser {
     file: Span['k],
     // The next node id, shared by every file of a program.
     ids: Ref[u32, 'k],
+    // how deep the parse is nested now
+    depth: Ref[usize, 'k],
 }
 
 forall 'k.
@@ -532,11 +535,14 @@ fn level_has(&cx: Domain!['k], level: usize, kind: Span['k]) -> bool {
 
 const LEVELS: usize = 9usize;
 const COMPARE: usize = 2usize;
+// The deepest a file nests expressions, blocks, types, patterns and `use` trees: every phase walks a
+// nest by recursion, and this bounds the stack it takes. A chain of binary operators is not a nest.
+const NESTING: usize = 128usize;
 
 // The items of one source file. `ids` numbers the nodes.
 forall 'k.
 fn parse(&cx: Domain!['k], source: Span['k], file: Span['k], ids: Ref[u32, 'k]) -> ArenaVec[S::Item['k], 'k] {
-    let p = Parser.{ toks: Lexer::new(&cx, source, file).run(&cx), i: Ref::new(&cx, 0usize), file, ids };
+    let p = Parser.{ toks: Lexer::new(&cx, source, file).run(&cx), i: Ref::new(&cx, 0usize), file, ids, depth: Ref::new(&cx, 0usize) };
     p.file_items(&cx)
 }
 
@@ -587,6 +593,20 @@ impl Parser['k] {
     fn fail(self, &cx: Domain!['k]) -> ! {
         let t = self.tok(&cx);
         fail(&cx, Buffer!::new().push_bytes(&cx, self.file).push_static(":").push_u64(t.line as u64).push_static(":").push_u64(t.col as u64).push_static(": syntax error").save(&cx))
+    }
+
+    // One level of nesting more; `leave` ends it.
+    fn enter(self, &cx: Domain!['k]) {
+        let depth = self.depth.copy(&cx) + 1usize;
+        self.depth.set(&cx, depth);
+        if depth > NESTING {
+            let t = self.tok(&cx);
+            fail(&cx, Buffer!::new().push_bytes(&cx, self.file).push_static(":").push_u64(t.line as u64).push_static(":").push_u64(t.col as u64).push_static(": nested too deeply (the limit is ").push_usize(NESTING).push_static(" levels)").save(&cx));
+        }
+    }
+
+    fn leave(self, &cx: Domain!['k], levels: usize) {
+        self.depth.set(&cx, self.depth.copy(&cx) - levels);
     }
 
     fn id(self, &cx: Domain!['k]) -> u32 {
@@ -732,6 +752,7 @@ impl Parser['k] {
 
     fn use_tree(self, &cx: Domain!['k]) -> S::UseTree['k] {
         let start = self.pos(&cx);
+        self.enter(&cx);
         let path: ArenaVec[Span['k], 'k] = ArenaVec::one(&cx, self.segment(&cx));
         var star = false;
         let children: ArenaVec[S::UseTree['k], 'k] = ArenaVec::new(&cx);
@@ -747,6 +768,7 @@ impl Parser['k] {
                     children.push(&cx, self.use_tree(&cx));
                     if !self.eat(&cx, ",") {
                         let unit = self.expect(&cx, "}");
+                        self.leave(&cx, 1usize);
                         return self.use_alias(&cx, path, star, children, start);
                     }
                 }
@@ -756,6 +778,7 @@ impl Parser['k] {
                 self.fail(&cx);
             }
         }
+        self.leave(&cx, 1usize);
         self.use_alias(&cx, path, star, children, start)
     }
 
@@ -900,8 +923,8 @@ impl Parser['k] {
     fn extern_decl(self, &cx: Domain!['k], quantifier: Option[S::Forall['k]]) -> S::Extern['k] {
         let start = self.pos(&cx);
         let unit = self.expect(&cx, "extern");
-        let raw = self.expect(&cx, "STRING").text;
-        let abi = unescape(&cx, raw.slice(1usize, raw.len() - 1usize));
+        let tok = self.expect(&cx, "STRING");
+        let abi = self.unescape(&cx, tok, tok.text.slice(1usize, tok.text.len() - 1usize), false);
         let (name, params, ret) = self.fn_header(&cx);
         let unit = self.expect(&cx, ";");
         S::Extern.{ id: self.id(&cx), abi, name, params, ret, quantifier, pos: start }
@@ -960,6 +983,13 @@ impl Parser['k] {
     }
 
     fn type_in(self, &cx: Domain!['k], parameter: bool) -> Type['k] {
+        self.enter(&cx);
+        let t = self.type_form(&cx, parameter);
+        self.leave(&cx, 1usize);
+        t
+    }
+
+    fn type_form(self, &cx: Domain!['k], parameter: bool) -> Type['k] {
         let k = self.k(&cx);
         if k.is(&cx, "NAME") {
             return Type::Name.(self.named_type(&cx));
@@ -1106,6 +1136,7 @@ impl Parser['k] {
     fn block(self, &cx: Domain!['k]) -> S::Block['k] {
         let start = self.pos(&cx);
         let unit = self.expect(&cx, "{");
+        self.enter(&cx);
         let stmts: ArenaVec[Statement['k], 'k] = ArenaVec::new(&cx);
         var tail = Option::None;
         while !self.at(&cx, "}") {
@@ -1116,6 +1147,7 @@ impl Parser['k] {
                 },
             };
         }
+        self.leave(&cx, 1usize);
         let unit = self.next(&cx);
         S::Block.{ id: self.id(&cx), stmts, tail, pos: start }
     }
@@ -1211,6 +1243,13 @@ impl Parser['k] {
     }
 
     fn pattern(self, &cx: Domain!['k]) -> S::Pattern['k] {
+        self.enter(&cx);
+        let p = self.pattern_form(&cx);
+        self.leave(&cx, 1usize);
+        p
+    }
+
+    fn pattern_form(self, &cx: Domain!['k]) -> S::Pattern['k] {
         let k = self.k(&cx);
         let start = self.pos(&cx);
         if k.is(&cx, "NAME") {
@@ -1292,6 +1331,13 @@ impl Parser['k] {
     // ---- expressions
     // A whole expression: an operator expression, or a block-like, closure, `return` or `pack` form.
     fn expr(self, &cx: Domain!['k]) -> Expr['k] {
+        self.enter(&cx);
+        let e = self.expr_form(&cx);
+        self.leave(&cx, 1usize);
+        e
+    }
+
+    fn expr_form(self, &cx: Domain!['k]) -> Expr['k] {
         let k = self.k(&cx);
         if is_block_like(&cx, k) {
             return self.block_like(&cx);
@@ -1330,7 +1376,10 @@ impl Parser['k] {
                 if self.at(&cx, "{") {
                     other = Option::Some.(Ref::new(&cx, Expr::Block.(self.block(&cx))));
                 } else if self.at(&cx, "if") {
+                    // an `else if` chain nests
+                    self.enter(&cx);
                     other = Option::Some.(Ref::new(&cx, self.block_like(&cx)));
+                    self.leave(&cx, 1usize);
                 } else {
                     self.fail(&cx);
                 }
@@ -1496,10 +1545,16 @@ impl Parser['k] {
             Some(e) => e,
             None => self.unary(&cx),
         };
-        while self.eat(&cx, "as") {
+        var casts = 0usize;
+        // each cast nests
+        while self.at(&cx, "as") {
+            self.enter(&cx);
+            let unit = self.next(&cx);
             let type = self.type(&cx);
             left = Expr::Cast.(S::Cast.{ id: self.id(&cx), value: Ref::new(&cx, left), type, pos: start });
+            casts = casts + 1usize;
         }
+        self.leave(&cx, casts);
         left
     }
 
@@ -1507,8 +1562,10 @@ impl Parser['k] {
         let k = self.k(&cx);
         let start = self.pos(&cx);
         if k.is(&cx, "-") || k.is(&cx, "!") || k.is(&cx, "*") || k.is(&cx, "&") || k.is(&cx, "unsafe") {
+            self.enter(&cx);
             let unit = self.next(&cx);
             let operand = self.unary(&cx);
+            self.leave(&cx, 1usize);
             return Expr::Unary.(S::Unary.{ id: self.id(&cx), op: k, operand: Ref::new(&cx, operand), pos: start });
         }
         self.postfix(&cx)
@@ -1518,9 +1575,15 @@ impl Parser['k] {
         let start = self.pos(&cx);
         var e = self.atom(&cx);
         var after_index = false;
+        var ops = 0usize;
         var going = true;
         while going {
             let k = self.k(&cx);
+            // each operation nests
+            if k.is(&cx, ".") || k.is(&cx, "(") || k.is(&cx, "?") || (k.is(&cx, "TUPLE_INDEX") && !after_index) {
+                self.enter(&cx);
+                ops = ops + 1usize;
+            }
             if k.is(&cx, ".") {
                 let unit = self.next(&cx);
                 let name = self.name(&cx);
@@ -1548,6 +1611,7 @@ impl Parser['k] {
                 going = false;
             }
         }
+        self.leave(&cx, ops);
         e
     }
 
@@ -1571,11 +1635,11 @@ impl Parser['k] {
         }
         if k.is(&cx, "FSTRING_START") {
             let unit = self.next(&cx);
-            let parts: ArenaVec[S::Piece['k], 'k] = ArenaVec::one(&cx, S::Piece::Text.(unescape(&cx, self.expect(&cx, "FSTRING_TEXT").text)));
+            let parts: ArenaVec[S::Piece['k], 'k] = ArenaVec::one(&cx, S::Piece::Text.(self.fstring_text(&cx)));
             while self.eat(&cx, "FSTRING_OPEN") {
                 parts.push(&cx, S::Piece::Expr.(self.expr(&cx)));
                 let unit = self.expect(&cx, "FSTRING_CLOSE");
-                parts.push(&cx, S::Piece::Text.(unescape(&cx, self.expect(&cx, "FSTRING_TEXT").text)));
+                parts.push(&cx, S::Piece::Text.(self.fstring_text(&cx)));
             }
             let unit = self.expect(&cx, "FSTRING_END");
             return Expr::FStr.(S::FStr.{ id: self.id(&cx), parts, pos: start });
@@ -1701,14 +1765,81 @@ impl Parser['k] {
             return S::Lit.{ id, kind: S::LitKind::Float, int: 0u64, negative: false, text: without_underscores(&cx, digits), suffix, pos: p };
         }
         if k.is(&cx, "BYTE") {
-            let byte = unescape(&cx, word.slice(2usize, word.len() - 1usize));
+            let byte = self.unescape(&cx, tok, word.slice(2usize, word.len() - 1usize), true);
             return S::Lit.{ id, kind: S::LitKind::Int, int: byte.byte_or_zero(&cx, 0usize) as u64, negative: false, text: word, suffix: Option::Some.(Span::from_static(&cx, "u8")), pos: p };
         }
         if k.is(&cx, "STRING") {
-            return S::Lit.{ id, kind: S::LitKind::Str, int: 0u64, negative: false, text: unescape(&cx, word.slice(1usize, word.len() - 1usize)), suffix: Option::None, pos: p };
+            return S::Lit.{ id, kind: S::LitKind::Str, int: 0u64, negative: false, text: self.unescape(&cx, tok, word.slice(1usize, word.len() - 1usize), false), suffix: Option::None, pos: p };
         }
         S::Lit.{ id, kind: S::LitKind::Bool, int: if k.is(&cx, "true") { 1u64 } else { 0u64 }, negative: false, text: word, suffix: Option::None, pos: p }
     }
+
+    fn fstring_text(self, &cx: Domain!['k]) -> Span['k] {
+        let tok = self.expect(&cx, "FSTRING_TEXT");
+        self.unescape(&cx, tok, tok.text, false)
+    }
+
+    // The bytes `raw`, the inside of `tok`, stands for, with `\n`, `\t`, `\r`, `\0`, `\\`, `\'`, `\"` and
+    // `\xHH`. A string is UTF-8, so its `\xHH` is ASCII; a byte literal's (`byte`) is any byte, and its
+    // one character is ASCII.
+    fn unescape(self, &cx: Domain!['k], tok: Tok['k], raw: Span['k], byte: bool) -> Span['k] {
+        var out = Buffer!::new();
+        var i = 0usize;
+        while i < raw.len() {
+            let b = raw.byte_or_zero(&cx, i);
+            if b != b'\\' {
+                if byte && b > 127u8 {
+                    self.error(&cx, tok, Span::from_static(&cx, "a byte literal's character is ASCII; write any other byte as \\xHH"));
+                }
+                out = out.push_byte(b);
+                i = i + 1usize;
+            } else if raw.byte_or_zero(&cx, i + 1usize) == b'x' {
+                let high = raw.byte_or_zero(&cx, i + 2usize);
+                let low = raw.byte_or_zero(&cx, i + 3usize);
+                if !is_hex_digit(high) || !is_hex_digit(low) {
+                    self.error(&cx, tok, Span::from_static(&cx, "invalid \\x escape: \\x takes two hex digits"));
+                }
+                let value = hex_value(high) * 16u8 + hex_value(low);
+                if !byte && value > 127u8 {
+                    self.error(&cx, tok, Buffer!::new().push_static("\\x").push_bytes(&cx, raw.slice(i + 2usize, i + 4usize)).push_static(" is not ASCII; a string's \\x escape is at most \\x7f").save(&cx));
+                }
+                out = out.push_byte(value);
+                i = i + 4usize;
+            } else {
+                let c = raw.byte_or_zero(&cx, i + 1usize);
+                let escaped = if c == b'n' {
+                    b'\n'
+                } else if c == b't' {
+                    b'\t'
+                } else if c == b'r' {
+                    b'\r'
+                } else if c == b'0' {
+                    0u8
+                } else if c == b'\\' || c == b'\'' || c == b'"' {
+                    c
+                } else {
+                    // the whole character after the `\`
+                    var end = i + 2usize;
+                    while end < raw.len() && (raw.byte_or_zero(&cx, end) & 192u8) == 128u8 {
+                        end = end + 1usize;
+                    }
+                    self.error(&cx, tok, Buffer!::new().push_static("unknown escape \\").push_bytes(&cx, raw.slice(i + 1usize, end)).save(&cx))
+                };
+                out = out.push_byte(escaped);
+                i = i + 2usize;
+            }
+        }
+        out.save(&cx)
+    }
+
+    fn error(self, &cx: Domain!['k], tok: Tok['k], message: Span['k]) -> ! {
+        fail(&cx, Buffer!::new().push_bytes(&cx, self.file).push_static(":").push_u64(tok.line as u64).push_static(":").push_u64(tok.col as u64).push_static(": ").push_bytes(&cx, message).save(&cx))
+    }
+}
+
+// The value of the hex digit `b`.
+fn hex_value(b: u8) -> u8 {
+    if b >= b'0' && b <= b'9' { b - b'0' } else if b >= b'a' && b <= b'f' { b - b'a' + 10u8 } else { b - b'A' + 10u8 }
 }
 
 // The left side of `=`: a name, then fields and tuple elements (`x`, `self.n`, `(p.0).1`).
@@ -1774,38 +1905,3 @@ fn int_value(&cx: Domain!['k], word: Span['k]) -> (u64, bool) {
     (value, ok)
 }
 
-// The bytes `\n`, `\t`, `\r`, `\0`, `\\`, `\'`, `\"` and `\xHH` stand for.
-forall 'k.
-fn unescape(&cx: Domain!['k], raw: Span['k]) -> Span['k] {
-    var out = Buffer!::new();
-    var i = 0usize;
-    while i < raw.len() {
-        let b = raw.byte_or_zero(&cx, i);
-        if b == b'\\' && raw.byte_or_zero(&cx, i + 1usize) == b'x' {
-            let (value, ok) = int_value(&cx, Buffer!::new().push_static("0x").push_bytes(&cx, raw.slice(i + 2usize, i + 4usize)).save(&cx));
-            out = out.push_byte(value as u8);
-            i = i + 4usize;
-        } else if b == b'\\' {
-            let c = raw.byte_or_zero(&cx, i + 1usize);
-            let byte = if c == b'n' {
-                b'\n'
-            } else if c == b't' {
-                b'\t'
-            } else if c == b'r' {
-                b'\r'
-            } else if c == b'0' {
-                0u8
-            } else if c == b'\\' || c == b'\'' || c == b'"' {
-                c
-            } else {
-                fail(&cx, Buffer!::new().push_static("unknown escape \\").push_bytes(&cx, raw.slice(i + 1usize, i + 2usize)).save(&cx))
-            };
-            out = out.push_byte(byte);
-            i = i + 2usize;
-        } else {
-            out = out.push_byte(b);
-            i = i + 1usize;
-        }
-    }
-    out.save(&cx)
-}

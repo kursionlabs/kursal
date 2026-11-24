@@ -21,7 +21,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
-from typing import Never, Optional
+from typing import Never, Optional, assert_never
 from functools import partial
 from itertools import count
 from . import core as C
@@ -177,9 +177,8 @@ class Lowering:
         """The core's rules for an extern's signature (`Checker.foreign_signature`), at the source: it takes no
         type or brand parameter and no place parameter, which foreign code cannot lend back, a parameter has
         a memory form, the result holds nothing only checked code makes and no layout the compiler chooses
-        and is zero-size only if it is Copy,
-        and every function type in it is an `unsafe fn` type, whose parameters and result foreign code makes
-        or takes as it does an extern's."""
+        and is zero-size only if it is Copy, and every function type in it is an `unsafe fn` type, whose
+        parameters and result foreign code makes or takes as it does an extern's."""
         if sig.params:
             fail(f"extern {name} takes no type or brand parameters")
         if sig.places:
@@ -407,6 +406,11 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         A plain read of a place that the same group lends is rejected, whatever its type:
         the program states the order with a binding before the expression.
         """
+        return self.operand_values(items, self.operand_group(items), evaluate)
+
+    def operand_group(self, items: Sequence[S.Expr | Binding | str]) -> tuple[list[str], list[str]]:
+        """The start of an operand group: the places its items read plainly, and its frame of lends, which
+        is pushed until `operand_values` ends the group."""
         reads = []
         for item in items:
             if isinstance(item, Binding):
@@ -419,13 +423,21 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
                 reads.append(path)
         lends: list[str] = []
         self.lend_frames.append(lends)
+        return reads, lends
+
+    def operand_values[Item: S.Expr | Binding | str](self, items: Sequence[Item], group: tuple[list[str], list[str]],
+                                                  evaluate: Optional[Callable[[Item], Optional[str]]] = None,
+                                                  first: Optional[str] = None) -> Optional[list[str]]:
+        """The values of the group `operand_group` started, in order; `first`, if given, is the first
+        item's, evaluated already."""
+        reads, lends = group
         try:
             evaluate = evaluate or self.value
             order = range(len(items))
             values: dict[int, str] = {}
             saved: list[tuple[int, str, str, C.Type]] = []
             for n, k in enumerate(order):
-                v = evaluate(items[k])
+                v = first if n == 0 and first is not None else evaluate(items[k])
                 if v is None:
                     assert self.cur is None
                     return None
@@ -605,7 +617,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
             case S.Try(): return self.expr_try(expr)
             case S.While(): return self.expr_while(expr)
             case S.For(): return self.expr_for(expr)
-        fail(f"cannot lower {type(expr).__name__}", self.pos)
+        assert_never(expr)
 
     def expr_lit(self, expr: S.Lit) -> Optional[str]:
         ty = self.substitute_type(expr.ty)
@@ -690,17 +702,43 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         return self.emit(op, ty, args)
 
     def expr_binop(self, expr: S.Binop) -> Optional[str]:
-        if expr.op in ("&&", "||"):
-            c = self.expr(expr.left)
-            if c is None:
+        # A chain `a + b - c ...` or `a && b || c ...` nests to the left, and is lowered by a loop over its
+        # links rather than by recursion.
+        short = expr.op in ("&&", "||")
+        chain = [expr]
+        while isinstance(chain[-1].left, S.Binop) and (chain[-1].left.op in ("&&", "||")) == short:
+            chain.append(chain[-1].left)
+        if short:
+            c = self.expr(chain[-1].left)
+            for link in reversed(chain):
+                if c is None:
+                    return None
+                self.pos = link.pos
+                c = self.short_circuit(link, c)
+            return c
+        # Each link's operand group starts outermost first, as each starts before its left operand.
+        groups = []
+        for link in chain:
+            self.pos = link.pos
+            groups.append(self.operand_group([link.left, link.right]))
+        value: Optional[str] = None
+        for depth in reversed(range(len(chain))):
+            link = chain[depth]
+            self.pos = link.pos
+            operands = self.operand_values([link.left, link.right], groups[depth], first=value)
+            if operands is None:
+                del self.lend_frames[len(self.lend_frames) - depth:]
                 return None
-            lit = "false" if expr.op == "&&" else "true"
-            constant = lambda: self.emit("const", C.BOOL, ty=C.BOOL, lit=lit)
-            if expr.op == "&&":
-                return self.branch(c, lambda: self.expr(expr.right), constant, C.BOOL)
-            return self.branch(c, constant, lambda: self.expr(expr.right), C.BOOL)
-        operands = self.operands([expr.left, expr.right])
-        return None if operands is None else self.emit(OPERATORS[expr.op],self.substitute_type(expr.ty), operands)
+            value = self.emit(OPERATORS[link.op], self.substitute_type(link.ty), operands)
+        return value
+
+    def short_circuit(self, expr: S.Binop, c: str) -> Optional[str]:
+        """`&&` or `||` once its left operand is `c`."""
+        lit = "false" if expr.op == "&&" else "true"
+        constant = lambda: self.emit("const", C.BOOL, ty=C.BOOL, lit=lit)
+        if expr.op == "&&":
+            return self.branch(c, lambda: self.expr(expr.right), constant, C.BOOL)
+        return self.branch(c, constant, lambda: self.expr(expr.right), C.BOOL)
 
     def expr_unary(self, expr: S.Unary) -> Optional[str]:
         op = expr.op
@@ -1351,7 +1389,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
             if value is not None and not self.copy(self.vty[value]):
                 fail("cannot discard a linear expression result; bind or consume it", stmt.value.pos)
             return
-        fail(f"cannot lower statement {type(stmt).__name__}", self.pos)
+        assert_never(stmt)
 
     def let(self, stmt: S.Let) -> None:
         v = self.expr(stmt.value)
