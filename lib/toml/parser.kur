@@ -40,13 +40,18 @@ use std::raw::Span;
 use std::slice::{ReadBytes, Slice};
 use std::utf8::{decode, encode};
 
-// The flags of a key path (see above).
+/// The flag of a key path that a header or a dotted key defined (see
+/// above). Used by the parser; not meant for direct use.
 const EXPLICIT: u32 = 1u32;
+/// The flag of a key path under an inline table or an array (see above).
+/// Used by the parser; not meant for direct use.
 const FROZEN: u32 = 2u32;
 
-// How deep arrays and inline tables may nest (see above).
+/// How deep arrays and inline tables may nest (see above).
 const MAX_DEPTH: usize = 128usize;
 
+/// A key path's flags and the nodes of the paths one part longer. Used by
+/// the parser; not meant for direct use.
 forall 'k.
 struct FlagNode {
     bits: Ref[u32, 'k],
@@ -62,6 +67,9 @@ struct KeyPath {
     count: usize,
 }
 
+/// A document being read: its text, the first error, and what the
+/// statements so far have defined. Made by `parse`; not meant for direct
+/// use.
 forall 'k.
 struct Parser {
     src: Span['k],
@@ -76,18 +84,22 @@ struct Parser {
     pending: ArenaVec[KeyPath['k], 'k],
 }
 
+/// Whether `b` may appear in a bare key.
 fn is_bare(b: u8) -> bool {
     (b >= b'A' && b <= b'Z') || (b >= b'a' && b <= b'z') || (b >= b'0' && b <= b'9') || b == b'_' || b == b'-'
 }
 
+/// Whether `b` is a decimal digit.
 fn is_digit(b: u8) -> bool {
     b >= b'0' && b <= b'9'
 }
 
+/// Whether `b` is a hexadecimal digit, in either case.
 fn is_hex(b: u8) -> bool {
     is_digit(b) || (b >= b'a' && b <= b'f') || (b >= b'A' && b <= b'F')
 }
 
+/// The value of the hexadecimal digit `b`.
 fn hex_value(b: u8) -> u32 {
     if is_digit(b) {
         (b - b'0') as u32
@@ -104,6 +116,7 @@ fn is_control(b: u8) -> bool {
     (b < 32u8 && b != b'\t') || b == 127u8
 }
 
+/// The days of `month` (1 to 12) in `year` of the Gregorian calendar.
 fn days_in_month(year: u32, month: u32) -> u32 {
     if month == 2u32 {
         let leap = (year % 4u32 == 0u32 && year % 100u32 != 0u32) || year % 400u32 == 0u32;
@@ -115,6 +128,8 @@ fn days_in_month(year: u32, month: u32) -> u32 {
     }
 }
 
+/// A flag node with no flags and nothing under it. Used by the parser; not
+/// meant for direct use.
 forall 'k, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
 fn new_flags(&cx: C) -> FlagNode['k] {
     FlagNode.{ bits: Ref::new(&cx, 0u32), nested: ArenaMap::new(&cx) }
@@ -122,11 +137,13 @@ fn new_flags(&cx: C) -> FlagNode['k] {
 
 forall 'k.
 impl KeyPath['k] {
+    /// How many parts the path has.
     forall C, R where Access[C -> 'k, R].
     fn len(self, &cx: C) -> usize {
         self.header.len(&cx) + self.count
     }
 
+    /// Part `i` of the path, which is below its `len`.
     forall C, R where Access[C -> 'k, R].
     fn part(self, &cx: C, i: usize) -> Span['k] {
         let h = self.header.len(&cx);
@@ -160,6 +177,8 @@ fn has_flag(&cx: C, root: FlagNode['k], path: KeyPath['k], bit: u32) -> bool {
     (node.bits.copy(&cx) & bit) != 0u32
 }
 
+/// Sets `bit` on `path`'s node under `root`, making the nodes on the way.
+/// Used by the parser; not meant for direct use.
 forall 'k, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
 fn set_flag(&cx: C, root: FlagNode['k], path: KeyPath['k], bit: u32) {
     let n = path.len(&cx);
@@ -242,6 +261,7 @@ fn nest(&cx: C, table: ArenaMap[Span['k], TomlValue['k], 'k], path: KeyPath['k],
 
 forall 'k.
 impl Parser['k] {
+    /// Byte `i` of the document, or 0 past its end.
     forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
     fn byte(self, &cx: C, i: usize) -> u8 {
         self.src.byte_or_zero(&cx, i)
@@ -255,6 +275,7 @@ impl Parser['k] {
         }
     }
 
+    /// Whether an error has been recorded.
     forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
     fn failed(self, &cx: C) -> bool {
         self.error.copy(&cx).is_some()
@@ -326,6 +347,8 @@ impl Parser['k] {
         }
     }
 
+    /// Spaces, tabs, newlines and comments, as an array may hold between its
+    /// values.
     forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
     fn skip_comments_and_array_space(self, &cx: C, pos: usize) -> usize {
         var i = pos;
@@ -561,6 +584,7 @@ impl Parser['k] {
 
     // --------------------------------------------------------------- keys --
 
+    /// One part of a key: bare, or a literal or basic string's text.
     forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
     fn key_part(self, &cx: C, pos: usize) -> (usize, Span['k]) {
         let b = self.byte(&cx, pos);
@@ -596,6 +620,7 @@ impl Parser['k] {
         (i, parts)
     }
 
+    /// A key, its `=` and its value, at nesting `depth`.
     forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
     fn key_value(self, &cx: C, pos: usize, depth: usize) -> (usize, ArenaVec[Span['k], 'k], TomlValue['k]) {
         let (i, key) = self.key(&cx, pos);
@@ -612,6 +637,7 @@ impl Parser['k] {
 
     // ------------------------------------------------------------- values --
 
+    /// Whether the document holds `text` at `pos`.
     forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
     fn starts_with(self, &cx: C, pos: usize, text: Slice[u8, 'static]) -> bool {
         match self.src.sub(pos, text.len()) {
@@ -702,6 +728,7 @@ impl Parser['k] {
         (self.len, TomlValue::Boolean.(false))
     }
 
+    /// The array whose `[` is at `pos`, at nesting `depth`.
     forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
     fn array(self, &cx: C, pos: usize, depth: usize) -> (usize, TomlValue['k]) {
         let items: ArenaVec[TomlValue['k], 'k] = ArenaVec::new(&cx);
@@ -731,6 +758,7 @@ impl Parser['k] {
         (self.len, TomlValue::Array.(items))
     }
 
+    /// The inline table whose `{` is at `pos`, at nesting `depth`.
     forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
     fn inline_table(self, &cx: C, pos: usize, depth: usize) -> (usize, TomlValue['k]) {
         let table: ArenaMap[Span['k], TomlValue['k], 'k] = ArenaMap::new(&cx);
@@ -893,6 +921,7 @@ impl Parser['k] {
         end
     }
 
+    /// Whether the byte at `pos` is a digit in `base` (2, 8, 10 or 16).
     forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
     fn is_digit_of(self, &cx: C, pos: usize, base: u32) -> bool {
         if pos >= self.len {
@@ -1133,6 +1162,8 @@ impl Parser['k] {
         i + 2usize
     }
 
+    /// Reads the whole document, statement by statement, until its end or
+    /// the first error.
     forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
     fn document(self, &cx: C) {
         var pos = 0usize;

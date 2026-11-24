@@ -13,7 +13,7 @@ freestanding kernels.
 | `io.c` | `libc::io` | `std::io`: descriptors read, written, opened and closed, the claim on standard input, an errno's description and kind |
 | `fs.c` | `libc::fs` | `std::fs`: what a path names, directories, removing, renaming, canonicalizing, and freeing the strings C hands back |
 | `env.c` | `libc::env` | `std::env`: a variable's value |
-| `process.c` | `libc::process` | `std::process`: starting, waiting for, signalling and reading other programs; counting processors |
+| `process.c` | `libc::process` | `std::process`: starting, waiting for, signalling and reading other programs; counting processors; ending this process |
 | `start.c` | `libc::process` (the hash seed) | the C `main` of an executable: start-up and the report of an entry's error |
 | `time.c` | `libc::time` | `std::time`: the monotonic clock and `sleep` |
 | `thread.c` | `libc::thread` | `std::thread`: start and join a thread |
@@ -88,9 +88,9 @@ concurrent file-system mutation (TOCTOU).
 
 ## `env.c`
 
-`kur_libc_env_get` copies a variable's value (`strdup`), or gives NULL when
-it is unset or the name holds a NUL or an `=`, which no variable's name
-does. The library never changes the environment.
+`kur_libc_env_get` copies a variable's value (`strdup`, aborting when there
+is no memory for the copy), or gives NULL when it is unset or the name holds
+a NUL or an `=`, which no variable's name does. The library never changes the environment.
 
 ## `process.c`
 
@@ -118,9 +118,16 @@ runs (for `try_wait`), or a negative errno. `kur_libc_process_kill` and
 `kur_libc_process_poll` waits until one of two pipes can be read, so that
 `Child!::wait_with_output` reads standard output and error as they come
 and a child that fills one pipe never waits on this process reading the
-other. `kur_libc_process_cpus` counts the processors of the process's
-affinity mask (`sched_getaffinity`, where the C library has it), else those
-online.
+other; given no pipe (both descriptors negative), it returns 0 at once.
+`kur_libc_process_cpus` counts the processors of the process's affinity
+mask (`sched_getaffinity`, where the C library has it), else those online.
+
+`kur_libc_process_exit` is `std::process::exit`: C's `exit`, which runs the
+`atexit` handlers and flushes C's streams, called once. C11 leaves a second
+`exit` while the first runs undefined, and safe code can call
+`std::process::exit` from two threads at once, so an atomic flag lets only
+the first call through; any later call never returns (another thread waits
+for the first to end the process).
 
 ## `start.c`
 

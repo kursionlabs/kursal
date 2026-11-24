@@ -152,9 +152,10 @@ class StdRuntimeTests(unittest.TestCase):
                 let seven = &region.replace(8u32);
                 let eight = record.close(region).into_value();
                 let exists 'v. (tag, v) = Vec!::new[u8]();
-                let n = &v.len(&tag);
-                v.free(tag);
-                if seven == 7u32 && eight == 8u32 && n == 0usize { 0 } else { 1 }
+                let n = &v.len();
+                let empty = &v.is_empty();
+                v.destroy(tag);
+                if seven == 7u32 && eight == 8u32 && n == 0usize && empty { 0 } else { 1 }
             }''')
 
     def test_fallible_constructors_report_exhaustion(self):
@@ -170,19 +171,19 @@ class StdRuntimeTests(unittest.TestCase):
             use std::option::Result;
             fn forget(k: u32, v: u32) -> () { () }
             fn main() -> i32 {
-                let big_buffer = match Buffer!::try_new_with_cap(1usize << 30usize) {
+                let big_buffer = match Buffer!::try_with_capacity(1usize << 30usize) {
                     Result::Ok(b) => { b.destroy(); "built" },
                     Result::Err(e) => "refused",
                 };
                 let big_vec = match Vec!::try_new[[u64; 16777216]]() {
                     Result::Ok(package) => {
                         let exists 'v. (tag, v) = package;
-                        v.free(tag);
+                        v.destroy(tag);
                         "built"
                     },
                     Result::Err(e) => "refused",
                 };
-                let buffer = match Buffer!::try_new_with_cap(2usize) {
+                let buffer = match Buffer!::try_with_capacity(2usize) {
                     Result::Ok(b) => { let b = b.push_static("abc"); let n = &b.len(); b.destroy(); n },
                     Result::Err(e) => 0usize,
                 };
@@ -190,8 +191,8 @@ class StdRuntimeTests(unittest.TestCase):
                     Result::Ok(package) => {
                         let exists 'v. (tag, v) = package;
                         let exists 'w. (tag, v) = v.push(tag, 7u64);
-                        let n = &v.len(&tag);
-                        v.free(tag);
+                        let n = &v.len();
+                        v.destroy(tag);
                         n
                     },
                     Result::Err(e) => 0usize,
@@ -200,18 +201,18 @@ class StdRuntimeTests(unittest.TestCase):
                     Result::Ok(package) => {
                         let exists 'm. (tag, m) = package;
                         let exists 'n. (tag, m, old) = m.insert(tag, 1u32, 2u32);
-                        let n = &m.len(&tag);
-                        m.free(tag);
+                        let n = &m.len();
+                        m.destroy(tag);
                         n
                     },
                     Result::Err(e) => 0usize,
                 };
                 let owned_vec = match OwnedVec!::try_new[u32]() {
-                    Result::Ok(v) => { let v = v.push(3u32).push(4u32); let n = &v.len(); v.free(); n },
+                    Result::Ok(v) => { var v = v; &v.push(3u32); &v.push(4u32); let n = &v.len(); v.destroy(); n },
                     Result::Err(e) => 0usize,
                 };
                 let owned_map = match OwnedMap!::try_new[u32, u32](std::process::hash_seed()) {
-                    Result::Ok(m) => { var m = m; let old = &m.insert(1u32, 2u32); let n = &m.len(); m.destroy(forget); n },
+                    Result::Ok(m) => { var m = m; let old = &m.insert(1u32, 2u32); let n = &m.len(); m.destroy_with(forget); n },
                     Result::Err(e) => 0usize,
                 };
                 print_buffer(f"{big_buffer} {big_vec} {buffer} {vec} {map} {owned_vec} {owned_map}");
@@ -232,12 +233,12 @@ class StdRuntimeTests(unittest.TestCase):
                 let exists 'b. (tag, map, removed) = map.remove_in(tag, &cx, 1u32);
                 let again = match &map.get_in(&tag, &cx, 1u32) { Option::Some(r) => 1i32, Option::None => 0i32 };
                 let got = match removed { Option::Some(v) => v, Option::None => 0u32 };
-                map.destroy(tag, drop_entry);
+                map.destroy_with(tag, drop_entry);
                 var owned = OwnedMap!::new[u32, u32](std::process::hash_seed());
                 let none = &owned.insert_in(&cx, 2u32, 20u32);
                 let twenty = match &owned.remove_in(&cx, 2u32) { Option::Some(v) => v, Option::None => 0u32 };
                 let left = &owned.len();
-                owned.destroy(drop_entry);
+                owned.destroy_with(drop_entry);
                 if again == 0i32 && got == 10u32 && twenty == 20u32 && left == 0usize { 0 } else { 1 }
             }''')
 
@@ -333,7 +334,7 @@ class StdRuntimeTests(unittest.TestCase):
         self.expect('''
             use std::arena::Domain!;
             use std::buffer::Buffer!;
-            use std::io::Error;
+            use std::io::{Error, File!};
             use std::fs::{FileKind, canonicalize, metadata, mkdir, path_exists, read_dir, read_to_arena, remove, rename, write};
             use std::option::{Option, Result};
             use std::raw::Span;
@@ -356,6 +357,14 @@ class StdRuntimeTests(unittest.TestCase):
                 }
                 match metadata(&cx, b) {
                     Result::Ok(m) => match m.kind { FileKind::File => if m.size != 3u64 { status = 6; }, _ => { status = 6; } },
+                    Result::Err(e) => { status = 6; },
+                }
+                match File!::open_read(&cx, b) {
+                    Result::Ok(f) => {
+                        var f = f;
+                        if (&f.file_size()).unwrap_or(0u64) != 3u64 { status = 6; }
+                        let closed = f.close();
+                    },
                     Result::Err(e) => { status = 6; },
                 }
                 match metadata(&cx, dir) {
@@ -915,7 +924,7 @@ class StdRuntimeTests(unittest.TestCase):
                 var sr = StaticRead::new();
                 let made = write(&sr, "chunks.txt", Buffer!::new().push_static("abcdefgh"));
                 var file = match File!::open_read(&sr, "chunks.txt") { Result::Ok(f) => f, Result::Err(e) => { return 1; } };
-                var text = Buffer!::new_with_cap(0usize);
+                var text = Buffer!::with_capacity(0usize);
                 let first = (&file.read(&text, 3usize)).unwrap_or(9usize);
                 let none = (&file.read(&text, 0usize)).unwrap_or(9usize);
                 let rest = (&file.read_exact(&text, 10usize)).unwrap_or(9usize);
@@ -1199,7 +1208,7 @@ class StdRuntimeTests(unittest.TestCase):
         self.expect('''
             use std::buffer::Buffer!;
             fn main() -> i32 {
-                let b = Buffer!::new_with_cap(0usize).push_byte(b'a').push_static("bc");
+                let b = Buffer!::with_capacity(0usize).push_byte(b'a').push_static("bc");
                 let n = &b.len();
                 b.destroy();
                 let z = Buffer!::new_zeroed(0usize);
@@ -1326,7 +1335,7 @@ class StdRuntimeTests(unittest.TestCase):
                 let kept = (&map.get(&k3)).unwrap_or(0u32) == 7u32 && &map.at(&k3) == 7u32;
                 let present = &map.contains(&k3) && !&map.contains(&k1);
                 let n = &map.len();
-                map.destroy(drop_entry);
+                map.destroy_with(drop_entry);
                 if replaced && removed == 3i32 && kept && present && n == 2997usize { 0 } else { 1 }
             }''')
 
@@ -1712,7 +1721,7 @@ class StdRuntimeTests(unittest.TestCase):
                 var counts = OwnedVec!::new[u32]();
                 var b = 0usize;
                 while b < 4096usize {
-                    counts = counts.push(0u32);
+                    &counts.push(0u32);
                     b = b + 1usize;
                 }
                 var most = 0u32;
@@ -1735,7 +1744,7 @@ class StdRuntimeTests(unittest.TestCase):
                     }
                     i = i + 1usize;
                 }
-                counts.free();
+                counts.destroy();
                 most
             }
             fn apart(seed: Seed) -> bool {
@@ -1805,7 +1814,7 @@ class StdRuntimeTests(unittest.TestCase):
                 let old = &m.insert(7u64, 8u64);
                 var k = 7u64;
                 let seven = &m.at(&k);
-                m.free();
+                m.destroy();
                 let exists 'k. cx = Domain!::new(seed);
                 let a: ArenaMap[u32, u32, 'k] = ArenaMap::new(&cx);
                 let none = a.insert(&cx, 1u32, 2u32);
@@ -1823,7 +1832,7 @@ class StdRuntimeTests(unittest.TestCase):
             self.assertEqual(built.returncode, 0, built.stderr[:500])
             symbols = subprocess.run(["nm", "-u", str(o_file)], capture_output=True, text=True, check=True).stdout.split()
         undefined = {name for name in symbols if name != "U"}
-        self.assertLessEqual(undefined, {"malloc", "realloc", "free", "abort", "exit", "memcpy", "memmove", "memset", "memcmp"})
+        self.assertLessEqual(undefined, {"malloc", "realloc", "free", "abort", "memcpy", "memmove", "memset", "memcmp"})
 
     def test_c_strings_read_their_bytes_safely(self):
         self.expect('''
@@ -1851,11 +1860,11 @@ class StdRuntimeTests(unittest.TestCase):
                 var v = OwnedVec!::new[(u32, u32)]();
                 var i = 0u32;
                 while i < 40u32 {
-                    v = v.push((i % 3u32, i));
+                    &v.push((i % 3u32, i));
                     i = i + 1u32;
                 }
                 var none = ();
-                v = v.sort_by(&none, |&n, a: (u32, u32), b: (u32, u32)| by_first(a, b));
+                &v.sort_by(&none, |&n, a: (u32, u32), b: (u32, u32)| by_first(a, b));
                 var stable = true;
                 var j = 1usize;
                 while j < 40usize {
@@ -1870,12 +1879,20 @@ class StdRuntimeTests(unittest.TestCase):
                 let truncated = &v.len() == 2usize && !&v.is_empty();
                 &v.clear();
                 let cleared = &v.is_empty();
-                v.free();
-                var w = OwnedVec!::new[u32]().push(5u32).push(1u32).push(4u32).sort();
-                var u = OwnedVec!::new[u32]().push(5u32).push(1u32).push(4u32).sort_unstable();
+                v.destroy();
+                var w = OwnedVec!::new[u32]();
+                &w.push(5u32);
+                &w.push(1u32);
+                &w.push(4u32);
+                &w.sort();
+                var u = OwnedVec!::new[u32]();
+                &u.push(5u32);
+                &u.push(1u32);
+                &u.push(4u32);
+                &u.sort_unstable();
                 let sorted = &w.at(0usize) == 1u32 && &w.at(2usize) == 5u32 && &u.at(1usize) == 4u32;
-                w.free();
-                u.free();
+                w.destroy();
+                u.destroy();
                 if stable && set && truncated && cleared && sorted { 0 } else { 1 }
             }''')
 
@@ -1883,9 +1900,10 @@ class StdRuntimeTests(unittest.TestCase):
         result = self.run_program('''
             use std::collections::vec::OwnedVec!;
             fn main() -> i32 {
-                var v = OwnedVec!::new[u32]().push(1u32);
+                var v = OwnedVec!::new[u32]();
+                &v.push(1u32);
                 let x = &v.at(1usize);
-                v.free();
+                v.destroy();
                 0
             }''')
         self.assertLess(result.returncode, 0)
@@ -1915,7 +1933,7 @@ class StdRuntimeTests(unittest.TestCase):
                 let none2 = &m.insert(3u32, 30u32);
                 &m.clear();
                 let cleared = &m.is_empty() && &m.len() == 0usize;
-                m.free();
+                m.destroy();
                 if replaced && looked && found && with && removed && empty && cleared { 0 } else { 1 }
             }''')
 
@@ -1984,7 +2002,7 @@ class StdRuntimeTests(unittest.TestCase):
                 count(&m, &tag, text.skip(19usize));
                 let after = &m.len();
                 restore.restore(tag).destroy();
-                m.destroy(drop_entry);
+                m.destroy_with(drop_entry);
                 let (sum, letters) = total;
                 let exists 's. (stag, sbytes, srestore) = shown.open();
                 let one = sbytes.is(&stag, "to=104");
@@ -2007,7 +2025,7 @@ class StdRuntimeTests(unittest.TestCase):
                 let again = &m.insert(7u32, 1u32);
                 var seven = 7u32;
                 let found = &m.at(&seven) == 1u32 && &m.len() == 1usize;
-                m.free();
+                m.destroy();
                 if empty && found { 0 } else { 1 }
             }''')
 
@@ -2042,14 +2060,17 @@ class StdRuntimeTests(unittest.TestCase):
                         Option::None => (),
                     }
                 }
-                v.destroy(drop);
-                var n = OwnedVec!::new[u32]().push(5u32).push(6u32).push(7u32);
+                v.destroy_with(drop);
+                var n = OwnedVec!::new[u32]();
+                &n.push(5u32);
+                &n.push(6u32);
+                &n.push(7u32);
                 let copies = (&n.first()).unwrap_or(0u32) == 5u32 && &n.contains(6u32) && !&n.contains(8u32);
-                n.free();
+                n.destroy();
                 let exists 'k. (tag, raw) = Vec!::new[u32]();
                 let exists 'k2. (tag, raw) = raw.push(tag, 4u32);
                 let branded = (&raw.get(&tag, 0usize)).unwrap_or(0u32) == 4u32 && &raw.at(&tag, 0usize) == 4u32 && (&raw.get(&tag, 1usize)).is_none();
-                raw.free(tag);
+                raw.destroy(tag);
                 let exists 'b. (btag, bytes, restore) = shown.open();
                 let order = bytes.is(&btag, "310");
                 restore.restore(btag).destroy();
@@ -2062,7 +2083,7 @@ class StdRuntimeTests(unittest.TestCase):
             fn main() -> i32 {
                 var v = OwnedVec!::new[u32]();
                 &v.insert(1usize, 5u32);
-                v.free();
+                v.destroy();
                 0
             }''')
         self.assertLess(result.returncode, 0)
@@ -2095,7 +2116,7 @@ class StdRuntimeTests(unittest.TestCase):
                     i = i + 1u64;
                 }
                 let made = unsafe probe_allocations() - before;
-                m.free();
+                m.destroy();
                 if hits != 55000u64 { 1 } else if made != 0u64 { 2 } else { 0 }
             }''', counted=True)
 

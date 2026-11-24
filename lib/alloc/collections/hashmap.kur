@@ -20,7 +20,7 @@
 //     value, and hands back the ones it replaced: `Some((key, value))`
 //     here, `Some(value)` where keys are `Copy` (`insert_in`, `ArenaMap`).
 //   - `each` and `each_in` visit every entry in place and keep the map;
-//     `drain` and `destroy` take it apart. A map whose keys own their
+//     `drain` and `destroy_with` take it apart. A map whose keys own their
 //     bytes (`Buffer!`) is looked up by a view of them with `find` and
 //     `OwnedMap!`'s `find_with`/`find_update`, so no key is built to look
 //     one up.
@@ -38,15 +38,15 @@
 // pointer is always Copy. Keys and values are `Sized`, as a raw read or write
 // is never at a zero-size type, so each allocation has bytes.
 //
-// Brand policy: `insert`, `remove` and `clear`, and the `_in` forms, always
-// return a fresh `Exclusive!['2]`, minted by `Allocation!::adopt` and sealed
-// by the operation's `exists '2.` return, whether or not an entry was
-// added, replaced or freed. Read-only operations (`len`, `is_empty`, the
-// lookups) present the caller's `Exclusive!['k]` and hand it back. `insert`
-// may replace the bucket array (`resize`) and frees the key it replaces,
-// and `remove` frees the entry a `Ref` may name, so a `Ref[V,'k]` taken
+// Brand policy: `insert`, `remove` and `clear_with`, and the `_in` forms,
+// always return a fresh `Exclusive!['2]`, minted by `Allocation!::adopt` and
+// sealed by the operation's `exists '2.` return, whether or not an entry was
+// added, replaced or freed. `len` and `is_empty` read the map's own count
+// and present no capability; the lookups present the caller's
+// `Exclusive!['k]` and hand it back. `insert` may replace the bucket array
+// (`resize`) and frees the key it replaces, and `remove` frees the entry a `Ref` may name, so a `Ref[V,'k]` taken
 // before either cannot be used after it, even though entries never move.
-// `drain` and `destroy` consume the capability with the map.
+// `drain` and `destroy_with` consume the capability with the map.
 
 use package as alloc;
 
@@ -107,6 +107,8 @@ struct HashMap! {
 /// only producer of an `Allocation!`) without re-stating a size; the
 /// `into_parts`/`adopt_raw_sized` round trip keeps the extent the
 /// allocator recorded. The allocation failure, when there is no block.
+/// Caller: uses `base` only while the returned block, or the record that
+/// adopts it, owns the storage.
 forall K, V.
 unsafe fn try_alloc_buckets(n: usize) -> Result[(Uninit!, *(*Entry[K, V])), AllocError] {
     let bytes = checked_mul(n, sizeof[*Entry[K, V]]());
@@ -127,7 +129,8 @@ unsafe fn try_alloc_buckets(n: usize) -> Result[(Uninit!, *(*Entry[K, V])), Allo
     }
 }
 
-/// `try_alloc_buckets`, aborting on failure.
+/// `try_alloc_buckets`, aborting on failure. Caller: as for
+/// `try_alloc_buckets`.
 forall K, V.
 unsafe fn alloc_buckets(n: usize) -> (Uninit!, *(*Entry[K, V])) {
     match unsafe try_alloc_buckets[K, V](n) {
@@ -137,7 +140,9 @@ unsafe fn alloc_buckets(n: usize) -> (Uninit!, *(*Entry[K, V])) {
 }
 
 /// A single value in its own allocation; used for both keys and values
-/// (see the header for why neither lives inline in `Entry`).
+/// (see the header for why neither lives inline in `Entry`). Caller: frees
+/// the block once, through `free_one` or an entry's teardown, after moving
+/// the value out or letting it go only if it is `Copy`.
 forall T where Sized[T].
 unsafe fn alloc_one(v: T) -> *T {
     let raw = HeapAllocator::alloc(sizeof[T]()).into_raw();
@@ -146,13 +151,19 @@ unsafe fn alloc_one(v: T) -> *T {
     p
 }
 
-/// Frees what `alloc_one` allocated for `p`.
+/// Frees what `alloc_one` allocated for `p`. Caller: `p` came from
+/// `alloc_one`, is freed once, and holds no value still owed to anyone
+/// (moved out, or `Copy`).
 forall T.
 unsafe fn free_one(p: *T) -> () {
     let raw = unsafe (p as *u8);
     HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(raw));
 }
 
+/// A chain entry holding `key`, `val` and `next`, in its own allocation.
+/// Caller: `key` and `val` are blocks from `alloc_one` that the entry now
+/// owns, and `next` is null or an entry of the same chain. Used by
+/// `put_chain` and `put_chain_in`; not meant for direct use.
 forall K, V.
 unsafe fn alloc_entry(key: *K, val: *V, next: *Entry[K, V]) -> *Entry[K, V] {
     let u = HeapAllocator::alloc(sizeof[Entry[K, V]]());
@@ -165,7 +176,7 @@ unsafe fn alloc_entry(key: *K, val: *V, next: *Entry[K, V]) -> *Entry[K, V] {
 
 /// Calls `f` once per entry (so linear `K`/`V` can be consumed), then frees
 /// that entry's key, value and node allocations, walking the chain in a
-/// loop.
+/// loop. Caller: `head` is null or the first entry of a chain of live entries the map owns, which nothing else touches during the call, and no entry of it is reached again.
 forall K, V where Sized[K], Sized[V].
 unsafe fn destroy_chain(head: *Entry[K, V], f: fn(K, V) -> ()) -> () {
     var cur = head;
@@ -212,23 +223,24 @@ impl HashMap![K, V] {
 
 forall K, V, 'k where Sized[K], Sized[V].
 impl HashMap![K, V, 'k] {
-    /// How many entries the map holds.
-    fn len(&self, &tag: Exclusive!['k]) -> usize {
+    /// How many entries the map holds. The count is the map's own field,
+    /// not a read of its storage, so no capability is presented.
+    fn len(&self) -> usize {
         let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n, seed } = self;
         self = HashMap!.{ alloc: a, back: bk, buckets: r, bucket_count: bc, len: n, seed };
         n
     }
 
     /// Whether the map holds no entries.
-    fn is_empty(&self, &tag: Exclusive!['k]) -> bool {
-        &self.len(&tag) == 0usize
+    fn is_empty(&self) -> bool {
+        &self.len() == 0usize
     }
 
     /// Consumes the map: calls `f` once per (key, value) pair, then frees
     /// every entry and the bucket array. The array's free takes its address
     /// from `alloc`, recorded by `Allocation!::adopt`; the per-entry frees in
     /// `destroy_chain` go through raw `*K`/`*V`/`*Entry` pointers.
-    fn destroy(self, tag: Exclusive!['k], f: fn(K, V) -> ()) -> () {
+    fn destroy_with(self, tag: Exclusive!['k], f: fn(K, V) -> ()) -> () {
         let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n, seed } = self;
         let (base, m) = r.into_parts();
         var i = 0usize;
@@ -262,7 +274,8 @@ fn hash_key(seed: Seed, &k: K) -> u64 {
     state.finish()
 }
 
-/// Whether the stored key at `a` equals `b`; both are put back.
+/// Whether the stored key at `a` equals `b`; both are put back. Caller: `a`
+/// is a live key block nothing else touches during the call.
 forall K where Eq[K, K], Sized[K].
 unsafe fn keys_equal(a: *K, &b: K) -> bool {
     let x = unsafe *a;
@@ -272,6 +285,9 @@ unsafe fn keys_equal(a: *K, &b: K) -> bool {
     same
 }
 
+/// The value block of the entry in the chain at `head` whose key equals
+/// `key`, if any. Caller: `head` is null or the first entry of a chain of live entries the map owns, which nothing else touches during the call. Used by `HashMap!::get` and
+/// `contains`; not meant for direct use.
 forall K, V where Eq[K, K], Sized[K].
 unsafe fn find_chain(head: *Entry[K, V], &key: K) -> Option[*V] {
     var cur = head;
@@ -291,7 +307,9 @@ unsafe fn find_chain(head: *Entry[K, V], &key: K) -> Option[*V] {
 
 /// Stores `val` under the key at `key_ptr`, at the end of the chain when it
 /// is new. When the key was already present, the entry takes the given key
-/// and value, and the ones it held come back.
+/// and value, and the ones it held come back. The chain's new head, and
+/// whether an entry was added. Caller: `head` is null or the first entry of a chain of live entries the map owns, which nothing else touches during the call; `key_ptr` is
+/// an `alloc_one` block the chain now owns.
 forall K, V where Eq[K, K], Sized[K], Sized[V].
 unsafe fn put_chain(head: *Entry[K, V], key_ptr: *K, val: V) -> (*Entry[K, V], Option[(K, V)], bool) {
     var last = null();
@@ -315,7 +333,8 @@ unsafe fn put_chain(head: *Entry[K, V], key_ptr: *K, val: V) -> (*Entry[K, V], O
 }
 
 /// Unlinks the entry whose key equals `key`, handing back its stored key
-/// and value. `key` is lent, and comes back.
+/// and value. `key` is lent, and comes back. The chain's new head, and
+/// whether an entry was removed. Caller: `head` is null or the first entry of a chain of live entries the map owns, which nothing else touches during the call.
 forall K, V where Eq[K, K], Sized[K], Sized[V].
 unsafe fn take_chain(head: *Entry[K, V], &key: K) -> (*Entry[K, V], Option[(K, V)], bool) {
     var last = null();
@@ -336,6 +355,9 @@ unsafe fn take_chain(head: *Entry[K, V], &key: K) -> (*Entry[K, V], Option[(K, V
     (head, Option::None, false)
 }
 
+/// Moves every entry of the chain at `head` to its bucket among the
+/// `new_bc` at `new_base`. Caller: `head` is null or the first entry of a chain of live entries the map owns, which nothing else touches during the call; `new_base` holds `new_bc`
+/// live slots. Used by `resize_hashed`; not meant for direct use.
 forall K, V where Hash[K], Sized[K].
 unsafe fn rehash_bucket_hashed(seed: Seed, head: *Entry[K, V], new_base: *(*Entry[K, V]), new_bc: usize) -> () {
     var cur = head;
@@ -352,6 +374,11 @@ unsafe fn rehash_bucket_hashed(seed: Seed, head: *Entry[K, V], new_base: *(*Entr
     }
 }
 
+/// A bucket array twice as long as the `old_bc` at `base`, every entry moved
+/// into it, and its length; frees the old array `u_old`. Caller: `u_old`
+/// is the map's bucket array, released from its record, and `base` its
+/// base, holding `old_bc` chains the map owns. Used by `HashMap!::insert`;
+/// not meant for direct use.
 forall K, V where Hash[K], Sized[K].
 unsafe fn resize_hashed(seed: Seed, u_old: Uninit!, base: *(*Entry[K, V]), old_bc: usize) -> (Uninit!, usize) {
     let new_bc = checked_mul(old_bc, 2usize);
@@ -370,11 +397,15 @@ unsafe fn resize_hashed(seed: Seed, u_old: Uninit!, base: *(*Entry[K, V]), old_b
 // point into a domain, hashed and compared through its capability `cx`
 // (`HashIn`), which every helper borrows by place.
 
+/// The hash of the domain key `key` under `seed`, read through `cx`. Used
+/// by the `_in` operations; not meant for direct use.
 forall K, C where Copy[K], HashIn[K, C].
 fn hash_key_in(&cx: C, seed: Seed, key: K) -> u64 {
     HashIn[K, C]::hash_in(&cx, key, HashState::new(seed)).finish()
 }
 
+/// `find_chain` for a domain key, compared through `cx`. Caller: `head` is null or the first entry of a chain of live entries the map owns, which nothing else touches during the call.
+/// Used by `HashMap!::get_in` and `contains_in`; not meant for direct use.
 forall K, V, C where Copy[K], HashIn[K, C], Sized[K].
 unsafe fn find_chain_in(&cx: C, head: *Entry[K, V], key: K) -> Option[*V] {
     var cur = head;
@@ -394,6 +425,7 @@ unsafe fn find_chain_in(&cx: C, head: *Entry[K, V], key: K) -> Option[*V] {
 
 /// Stores `val` under `key`, at the end of the chain when it is new; an
 /// entry already there takes `key` and `val` and hands back its value.
+/// Caller: `head` is null or the first entry of a chain of live entries the map owns, which nothing else touches during the call.
 forall K, V, C where Copy[K], HashIn[K, C], Sized[K], Sized[V].
 unsafe fn put_chain_in(&cx: C, head: *Entry[K, V], key: K, val: V) -> (*Entry[K, V], Option[V], bool) {
     var last = null();
@@ -413,7 +445,7 @@ unsafe fn put_chain_in(&cx: C, head: *Entry[K, V], key: K, val: V) -> (*Entry[K,
     (unsafe link_after[K, V](head, last, added), Option::None, true)
 }
 
-/// Unlinks `key`'s entry, handing back its value.
+/// Unlinks `key`'s entry, handing back its value. Caller: `head` is null or the first entry of a chain of live entries the map owns, which nothing else touches during the call.
 forall K, V, C where Copy[K], HashIn[K, C], Sized[K], Sized[V].
 unsafe fn take_chain_in(&cx: C, head: *Entry[K, V], key: K) -> (*Entry[K, V], Option[V], bool) {
     var last = null();
@@ -434,8 +466,8 @@ unsafe fn take_chain_in(&cx: C, head: *Entry[K, V], key: K) -> (*Entry[K, V], Op
 }
 
 /// The chain `head` with `rest` linked after `last`, or `rest` itself when
-/// `last` is null (`rest` then replaces the chain's start). Requires: `last`
-/// is null or an entry of the chain.
+/// `last` is null (`rest` then replaces the chain's start). Caller: `last`
+/// is null or a live entry of the chain at `head`.
 forall K, V.
 unsafe fn link_after(head: *Entry[K, V], last: *Entry[K, V], rest: *Entry[K, V]) -> *Entry[K, V] {
     if is_null(last) {
@@ -446,6 +478,9 @@ unsafe fn link_after(head: *Entry[K, V], last: *Entry[K, V], rest: *Entry[K, V])
     head
 }
 
+/// `rehash_bucket_hashed` for domain keys, hashed through `cx`. Caller: as
+/// for `rehash_bucket_hashed`. Used by `resize_in`; not meant for direct
+/// use.
 forall K, V, C where Copy[K], HashIn[K, C], Sized[K].
 unsafe fn rehash_bucket_in(&cx: C, seed: Seed, head: *Entry[K, V], new_base: *(*Entry[K, V]), new_bc: usize) -> () {
     var cur = head;
@@ -462,6 +497,8 @@ unsafe fn rehash_bucket_in(&cx: C, seed: Seed, head: *Entry[K, V], new_base: *(*
     }
 }
 
+/// `resize_hashed` for domain keys, hashed through `cx`. Caller: as for
+/// `resize_hashed`. Used by `HashMap!::insert_in`; not meant for direct use.
 forall K, V, C where Copy[K], HashIn[K, C], Sized[K].
 unsafe fn resize_in(&cx: C, seed: Seed, u_old: Uninit!, base: *(*Entry[K, V]), old_bc: usize) -> (Uninit!, usize) {
     let new_bc = checked_mul(old_bc, 2usize);
@@ -627,6 +664,7 @@ impl HashMap![K, V, 'k] {
 }
 
 /// Whether the stored key at `k` equals the probe `q`; both are put back.
+/// Caller: `k` is a live key block nothing else touches during the call.
 forall K, Q where Eq[K, Q], Sized[K].
 unsafe fn key_matches(k: *K, &q: Q) -> bool {
     let x = unsafe *k;
@@ -636,6 +674,8 @@ unsafe fn key_matches(k: *K, &q: Q) -> bool {
     same
 }
 
+/// `find_chain` by a probe of another type (`Eq[K, Q]`). Caller: `head` is null or the first entry of a chain of live entries the map owns, which nothing else touches during the call.
+/// Used by `HashMap!::find`; not meant for direct use.
 forall K, V, Q where Eq[K, Q], Sized[K].
 unsafe fn find_chain_by(head: *Entry[K, V], &probe: Q) -> Option[*V] {
     var cur = head;
@@ -728,7 +768,7 @@ impl HashMap![K, V, 'k] {
     /// Removes every entry, handing each to `f`, and keeps the bucket array,
     /// so the map holds as many again without growing. The entries' storage
     /// is freed, so the map comes back freshly branded, as from `remove`.
-    fn clear(self, tag: Exclusive!['k], f: fn(K, V) -> ()) -> exists '2. (Exclusive!['2], HashMap![K, V, '2]) {
+    fn clear_with(self, tag: Exclusive!['k], f: fn(K, V) -> ()) -> exists '2. (Exclusive!['2], HashMap![K, V, '2]) {
         let { alloc: a, back: bk, buckets: r, bucket_count: bc, len: n, seed } = self;
         let (base, m) = r.into_parts();
         var i = 0usize;
@@ -748,6 +788,8 @@ impl HashMap![K, V, 'k] {
     }
 }
 
+/// Lets a `Copy` key and value go: the callback `destroy` and `clear` pass
+/// to `destroy_with` and `clear_with`. Not meant for direct use.
 forall K, V where Copy[K], Copy[V].
 fn forget_entry(key: K, value: V) -> () {
     ()
@@ -756,8 +798,8 @@ fn forget_entry(key: K, value: V) -> () {
 forall K, V, 'k where Copy[K], Copy[V], Sized[K], Sized[V].
 impl HashMap![K, V, 'k] {
     /// Frees a map of `Copy` keys and values, which need no per-entry callback.
-    fn free(self, tag: Exclusive!['k]) -> () {
-        self.destroy(tag, forget_entry[K, V])
+    fn destroy(self, tag: Exclusive!['k]) -> () {
+        self.destroy_with(tag, forget_entry[K, V])
     }
 }
 
@@ -836,6 +878,7 @@ impl Drain![K, V, 'k] {
 
 // As an `Iterator`, each entry is a `Pair { a: key, b: value }`, the item
 // type `core::iter::zip` uses.
+/// The drained entries, each moved out as `Pair { a: key, b: value }`.
 forall K, V, 'k where Sized[K], Sized[V].
 instance Iterator[Drain![K, V, 'k] -> Pair[K, V]] {
     fn next(&it: Drain![K, V, 'k]) -> Option[Pair[K, V]] {
@@ -881,7 +924,7 @@ impl OwnedMap![K, V] {
     /// How many entries the map holds.
     fn len(&self) -> usize {
         let exists 'm. (tag, map) = self.inner;
-        let n = &map.len(&tag);
+        let n = &map.len();
         self = OwnedMap!.{ inner: pack 'm. (tag, map) };
         n
     }
@@ -898,9 +941,9 @@ impl OwnedMap![K, V] {
     }
 
     /// Frees the map, handing each entry to `f` first.
-    fn destroy(self, f: fn(K, V) -> ()) -> () {
+    fn destroy_with(self, f: fn(K, V) -> ()) -> () {
         let exists 'm. (tag, map) = self.inner;
-        map.destroy(tag, f)
+        map.destroy_with(tag, f)
     }
 
     /// Calls `f` on each key and its value where they live, in no
@@ -922,10 +965,10 @@ impl OwnedMap![K, V] {
     }
 
     /// Removes every entry, handing each to `f`, and keeps the room the map
-    /// has (`HashMap!::clear`).
+    /// has (`HashMap!::clear_with`).
     fn clear_with(&self, f: fn(K, V) -> ()) {
         let exists 'm. (tag, map) = self.inner;
-        let exists '2. (tag, map) = map.clear(tag, f);
+        let exists '2. (tag, map) = map.clear_with(tag, f);
         self = OwnedMap!.{ inner: pack '2. (tag, map) };
     }
 }
@@ -1173,8 +1216,8 @@ impl OwnedMap![K, V] {
     }
 
     /// Frees a map of `Copy` keys and values, which need no per-entry callback.
-    fn free(self) -> () {
+    fn destroy(self) -> () {
         let exists 'm. (tag, map) = self.inner;
-        map.free(tag)
+        map.destroy(tag)
     }
 }

@@ -123,17 +123,17 @@ class ZeroSizeTests(unittest.TestCase):
                 var v = OwnedVec!::new[(Marker, u32)]();
                 var i = 0u32;
                 while i < 100 {
-                    v = v.push((Marker.{}, i));
+                    &v.push((Marker.{}, i));
                     i = i + 1;
                 }
                 let last = &v.pop();
-                v.free();
+                v.destroy();
                 let (m, seven) = Owned!::new((Marker.{}, 7u32)).into_value();
                 var map = OwnedMap!::new[u32, ((), u8)](std::process::hash_seed());
                 let old = &map.insert(3u32, ((), 4u8));
                 var key = 3u32;
                 let present = &map.contains(&key);
-                map.free();
+                map.destroy();
                 let exists 'a. cx = Domain!::new(std::process::hash_seed());
                 let r = Ref::new(&cx, ((), 9u32));
                 let (u, nine) = r.copy(&cx);

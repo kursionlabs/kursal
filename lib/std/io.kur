@@ -11,6 +11,7 @@
 use package as std;
 
 use alloc::buffer::Buffer!;
+use core::mem::alloca;
 use core::raw::Span;
 use core::ptr::offset;
 use core::slice::{Slice, ReadBytes};
@@ -134,7 +135,7 @@ impl Error {
     /// The C library's description of the errno, as `strerror` gives it
     /// (`No such file or directory`), read thread-safely (`strerror_r`).
     fn message(self) -> Buffer! {
-        var text = Buffer!::new_with_cap(128usize);
+        var text = Buffer!::with_capacity(128usize);
         let room = &text.remaining_capacity();
         let dest = unsafe &text.tail_ptr();
         // `dest[0..room)` is the room `text` has; the call writes at most
@@ -352,7 +353,7 @@ fn stdin() -> Result[Input!, Error] {
     if claimed != 0i32 {
         Result::Err.(Error.{ errno: claimed })
     } else {
-        Result::Ok.(Input!.{ buf: Buffer!::new_with_cap(65536usize), start: 0usize })
+        Result::Ok.(Input!.{ buf: Buffer!::with_capacity(65536usize), start: 0usize })
     }
 }
 
@@ -413,7 +414,7 @@ impl Input! {
         let rest = rest_of(buf, start);
         // Standard input is the process's own, and this `Input!` holds it.
         let all = unsafe read_to_end_from(0i32, rest);
-        self = Input!.{ buf: Buffer!::new_with_cap(65536usize), start: 0usize };
+        self = Input!.{ buf: Buffer!::with_capacity(65536usize), start: 0usize };
         all
     }
 
@@ -432,7 +433,7 @@ fn rest_of(buf: Buffer!, start: usize) -> Buffer! {
     let n = &buf.len();
     let p = unsafe &buf.as_ptr();
     // `p[start..n)` are bytes `buf` holds, and `buf` is freed after the copy.
-    let rest = unsafe Buffer!::new_with_cap(n - start).push_n(unsafe offset(p, start), n - start);
+    let rest = unsafe Buffer!::with_capacity(n - start).push_n(unsafe offset(p, start), n - start);
     buf.destroy();
     rest
 }
@@ -535,7 +536,7 @@ impl File! {
         var text = c_string(&cx, path);
         let p = unsafe &text.as_ptr();
         // `p` holds the path's `len` bytes and a NUL.
-        let fd = unsafe kur_libc_fs_open_read(p, ReadBytes[C, S]::len(&cx, path));
+        let fd = unsafe kur_libc_fs_open_read(p, &text.len() - 1usize);
         text.destroy();
         if fd < 0i32 {
             Result::Err.(Error.{ errno: 0i32 - fd })
@@ -550,7 +551,7 @@ impl File! {
     fn create(&cx: C, path: S) -> Result[File!, Error] {
         var text = c_string(&cx, path);
         let p = unsafe &text.as_ptr();
-        let fd = unsafe kur_libc_fs_create(p, ReadBytes[C, S]::len(&cx, path));
+        let fd = unsafe kur_libc_fs_create(p, &text.len() - 1usize);
         text.destroy();
         if fd < 0i32 {
             Result::Err.(Error.{ errno: 0i32 - fd })
@@ -584,15 +585,20 @@ impl File! {
 
     /// The byte size of a regular file, from `fstat(2)`. Anything else is an
     /// error: EISDIR for a directory, EINVAL for a pipe, device or socket,
-    /// whose size says nothing about what a read will return.
-    fn file_size(&self) -> Result[usize, Error] {
+    /// whose size says nothing about what a read will return. A `u64`, as
+    /// `std::fs::Metadata`'s `size` is: a file's size is the file system's
+    /// number, which a 32-bit address space need not hold.
+    fn file_size(&self) -> Result[u64, Error] {
         let { fd } = self;
-        let size = unsafe kur_libc_fs_regular_size(fd);
+        let size = unsafe alloca[u64]();
+        unsafe *size = 0u64;
+        // `size` is a live `u64`.
+        let code = unsafe kur_libc_fs_regular_size(fd, size);
         self = File!.{ fd };
-        if size < 0isize {
-            Result::Err.(Error::of_return(size))
+        if code != 0i32 {
+            Result::Err.(Error.{ errno: code })
         } else {
-            Result::Ok.(size as usize)
+            Result::Ok.(unsafe *size)
         }
     }
 
@@ -637,14 +643,14 @@ impl File! {
         fd
     }
 
-    /// Writes all of `bytes`, read under `tag`, which comes back with the result.
+    /// Writes all of `bytes`, read under the capability `tag` lends.
     forall 'k.
-    fn write_all(&self, tag: Exclusive!['k], bytes: Slice[u8, 'k]) -> (Exclusive!['k], Result[(), Error]) {
+    fn write_all(&self, &tag: Exclusive!['k], bytes: Slice[u8, 'k]) -> Result[(), Error] {
         let { fd } = self;
         let (ptr, len, marker) = bytes.into_parts();
         let result = unsafe write_all(fd, ptr, len);
         self = File!.{ fd };
-        (tag, result)
+        result
     }
 
     /// Writes all of a span's bytes, read under its domain's capability,
@@ -672,7 +678,7 @@ impl File! {
     /// Writes all of `buf`, then frees it.
     fn write_buffer(&self, buf: Buffer!) -> Result[(), Error] {
         let exists 'b. (tag, bytes, restore) = buf.open();
-        let (tag, result) = &self.write_all(tag, bytes);
+        let result = &self.write_all(&tag, bytes);
         restore.restore(tag).destroy();
         result
     }
@@ -712,7 +718,7 @@ impl File! {
         let b = if hint < 0isize {
             Result::Err.(Error::of_return(hint))
         } else {
-            unsafe read_to_end_from(fd, Buffer!::new_with_cap((hint as usize) + 4096usize))
+            unsafe read_to_end_from(fd, Buffer!::with_capacity((hint as usize) + 4096usize))
         };
         self = File!.{ fd };
         b
@@ -797,6 +803,8 @@ instance Writable[Output!] {
         let { fd, buf, error } = self;
         Output!.{ fd, buf: buf.push_static(bytes), error }.gathered()
     }
+    /// Caller: `ptr[0..len)` is readable for the whole call
+    /// (`Writable::write_raw`).
     unsafe fn write_raw(self: Output!, ptr: *u8, len: usize) -> Output! {
         let { fd, buf, error } = self;
         Output!.{ fd, buf: unsafe buf.push_n(ptr, len), error }.gathered()

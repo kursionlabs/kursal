@@ -169,14 +169,15 @@ The library's own externs satisfy it. They are declared in `alloc` (the
 allocator's) and in `libc` (the C runtime's), each once; `std` declares
 none and calls `libc`'s:
 
-- `alloc::heap`: `malloc`, `realloc`, `free`, and `abort` and `exit`
-  (declared `-> !`, the permitted terminating cases); `alloc::buffer`
-  declares `abort` again for `Buffer!::new_with_cap` and `commit` (both
-  below `libc`, so that a freestanding program needs only these);
+- `alloc::heap`: `malloc`, `realloc`, `free`, and `abort` (declared
+  `-> !`, the permitted terminating case), which the rest of `alloc`
+  imports from it (all below `libc`, so that a freestanding program needs
+  only these);
 - `libc::io` (`io.c`): `kur_libc_fs_read`, `_write`, `_open_read`,
   `_create`, `_close`, `_regular_size` and `_size_hint`, which retry a call
-  a signal interrupts (but `close`) and report a failure as a negative
-  errno, `kur_libc_stdin_claim` and `_release`, which set and clear the
+  a signal interrupts (but `close`) and report a failure as an errno
+  (negative where the result is otherwise a count or a descriptor),
+  `kur_libc_stdin_claim` and `_release`, which set and clear the
   flag that makes one `std::io::Input!` at a time the reader of standard
   input, and `kur_libc_error_message` (`strerror_r`) and
   `kur_libc_error_kind`, which describe an errno;
@@ -189,9 +190,12 @@ none and calls `libc`'s:
   starts the child with `posix_spawnp` (no library code runs in the
   child), `_wait`, which waits for it, again when a signal interrupts the
   wait, `_kill` and `_signal` (`kill(2)`), `_poll`, which waits for one of
-  two pipes to be readable, again after a signal, and `_cpus`, which counts
-  the processors of the affinity mask; and `start.c`'s `_hash_seed`, which
-  reads the seed start-up drew (and aborts if it drew none);
+  two pipes to be readable, again after a signal (0 at once when given
+  none), `_cpus`, which counts the processors of the affinity mask, and
+  `kur_libc_process_exit` (declared `-> !`), C's `exit` behind an atomic
+  flag that lets only the first call run it, a later one waiting for good;
+  and `start.c`'s `_hash_seed`, which reads the seed start-up drew (and
+  aborts if it drew none);
 - `libc::time` (`time.c`): `kur_libc_time_monotonic`, which reads the
   host's `CLOCK_MONOTONIC` (and aborts where it has none), and
   `kur_libc_time_sleep`, which sleeps on after a signal; `libc::float`:
@@ -215,8 +219,8 @@ a result that holds,
 anywhere in its value (named types' fields included, not behind a pointer),
 what only checked code makes: a package, a brand witness, a safe function
 value, a transform, or `Never` (`extern_result_cannot_produce`; a result of
-`!` itself declares a function that does not return, as `abort` and `exit`
-are declared). It also rejects one that holds an enum or a `NonNull`
+`!` itself declares a function that does not return, as `abort` and
+`kur_libc_process_exit` are declared). It also rejects one that holds an enum or a `NonNull`
 (`extern_result_layout_chosen`): their layout is the compiler's choice, which
 C cannot know, and a `NonNull` from C may be null. A zero-size result must be
 `Copy` (`extern_zero_size_linear_result`): C returns no bytes for it, so a
@@ -465,7 +469,7 @@ about a pointer in the signature:
 | Function | Caller must guarantee |
 |---|---|
 | `alloc::owned::Allocation!::adopt` | the block `u` owns holds an initialized `T`, aligned for `T`, in at least `sizeof[T]()` bytes: the `Region!` it returns reads and writes it as one (`Region!::from_raw`'s obligation). A `malloc` result is aligned for every type, so in practice the obligation is the size and the contents. `adopt_value` is the checked form: it aborts on a block smaller than `sizeof[T]()` and writes the `T` itself. The library's own callers (`Vec!`, `HashMap!`, `Buffer!::open`, `Owned!::open`) state at each call why the block qualifies, or why a region over uninitialized slots never leaves the module and is never read as a `T` |
-| `alloc::owned::Allocation!::release_storage` | every `T` the block holds is accounted for: moved out, never written, or still tracked by the caller, which keeps the returned storage and its contents. The block is given up without reading it, so a linear `T` left in it unaccounted would be dropped. `release` is the safe form, for a `Copy` `T`; the library's one caller is `Vec!` (`push`/`pop` re-adopt the same storage at once and keep tracking the elements below `len`; `destroy` moves every element out first) |
+| `alloc::owned::Allocation!::release_storage` | every `T` the block holds is accounted for: moved out, never written, or still tracked by the caller, which keeps the returned storage and its contents. The block is given up without reading it, so a linear `T` left in it unaccounted would be dropped. `release` is the safe form, for a `Copy` `T`; the library's one caller is `Vec!` (`push`/`pop` re-adopt the same storage at once and keep tracking the elements below `len`; `destroy_with` moves every element out first) |
 | `std::io::File!::adopt` | the descriptor is live and open, with no other owner |
 | `std::io::write_static_to`, `write_span_to`, `write_buffer_to` | `fd` is a descriptor the caller may write: standard output or error, or one a `File!` it holds owns. A number taken from anywhere else may name a descriptor a `File!` owns, or one closed and since reused, and the write would go around its owner. The safe output functions name standard output and error themselves (`print*`, `eprint*`, `Output!`), or write through a `File!` |
 | `std::io::read_into`, `read_to_end_from` | `fd` is a descriptor the caller may read: stdin, or one a `File!` it holds owns. Reading advances the descriptor's offset, which is that owner's state. The safe reads (`File!::read`, `read_exact`, `read_to_end`, `Input!`) name their own descriptor |
@@ -486,7 +490,7 @@ signature". It does not mean "verified correct".**
   `Result` from every growing operation would cascade into every caller.
   Recovery is offered where a program can plan for it, when a container is
   made: `Storage::try_alloc`/`try_grow`, `Owned!::try_new`,
-  `Buffer!::try_new_with_cap`, `Vec!::try_new`, `OwnedVec!::try_new`,
+  `Buffer!::try_with_capacity`, `Vec!::try_new`, `OwnedVec!::try_new`,
   `HashMap!::try_new` and `OwnedMap!::try_new` return the `AllocError`
   instead (`try_grow` and `Owned!::try_new` with what they were given,
   unconsumed). A container they make still aborts if it later fails to
@@ -688,3 +692,7 @@ with its stated obligation, and either declaring it `unsafe fn` or giving a
 written ruling in section 2.0. Membership is a fact about a signature; the contract
 is the answer to the question membership asks. Keeping them separate is
 what lets section 2.0's rulings exist without weakening the class.
+
+An `unsafe fn`'s doc comment states its obligation in a sentence that
+begins `Caller:`, the one wording the library uses, so a search for
+`Caller:` finds every obligation.

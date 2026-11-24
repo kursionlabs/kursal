@@ -17,7 +17,7 @@
 // `Slice` into the vec whether or not the storage moved: the policy is
 // "mutation invalidates", not "the address moved".
 //
-// The address `destroy` frees comes from `alloc`, never from a `Ref`, so
+// The address `destroy_with` frees comes from `alloc`, never from a `Ref`, so
 // no pointer this module frees is one a caller chose.
 //
 // Adopting the block. `Allocation!::adopt` asks for an initialized `T` in
@@ -35,7 +35,7 @@
 // reading it. `push` and `pop` release only to adopt the same storage again
 // (grown or not) at once: the elements below `len` stay in it, and the
 // function goes on to track them (`pop` moves the last one out of the
-// adopted block). `destroy` moves every element out to its callback before
+// adopted block). `destroy_with` moves every element out to its callback before
 // it releases.
 //
 // `Vec!` is not `exposed`: a foreign module cannot build or destructure
@@ -160,11 +160,17 @@ impl Vec![T, 'k] {
         pack 'open1. (tag, Vec!.{ alloc: a2, back: bk2, buf: r2, len: n2, cap: new_cap })
     }
 
-    /// How many elements the vec holds.
-    fn len(&self, &tag: Exclusive!['k]) -> usize {
+    /// How many elements the vec holds. The length is the vec's own field,
+    /// not a read of its storage, so no capability is presented.
+    fn len(&self) -> usize {
         let { alloc: a, back: bk, buf: r, len: n, cap: c } = self;
         self = Vec!.{ alloc: a, back: bk, buf: r, len: n, cap: c };
         n
+    }
+
+    /// Whether the vec holds no elements.
+    fn is_empty(&self) -> bool {
+        &self.len() == 0usize
     }
 
     /// A `Ref` to element `i`, or `None` when `i >= len`. Checked against
@@ -233,7 +239,7 @@ impl Vec![T, 'k] {
     /// (`core::process::trap`) when `i` is past the length. Rebrands as
     /// `push` does.
     fn insert(self, tag: Exclusive!['k], i: usize, val: T) -> exists '2. (Exclusive!['2], Vec![T, '2]) {
-        if i > &self.len(&tag) {
+        if i > &self.len() {
             trap();
         }
         let exists '2. (tag, v) = self.push(tag, val);
@@ -304,7 +310,7 @@ impl Vec![T, 'k] {
     /// and only a captureless `fn` is provably Copy generically. The address
     /// freed comes from `alloc`, recorded by `Allocation!::adopt`, not from
     /// `buf`.
-    fn destroy(self, tag: Exclusive!['k], f: fn(T) -> ()) -> () {
+    fn destroy_with(self, tag: Exclusive!['k], f: fn(T) -> ()) -> () {
         let { alloc: a, back: bk, buf: r, len: n, cap: c } = self;
         let (p, m) = r.into_parts();
         var i = 0usize;
@@ -332,6 +338,8 @@ impl Vec![T, 'k] {
 // elements may change order.
 
 /// Whether the element at `i` orders before the one at `j`; both stay put.
+/// Caller: both indices are below the number of initialized elements at
+/// `p`, which nothing else touches during the call.
 forall T, Env where Copy[Env], Sized[T].
 unsafe fn before(p: *T, i: usize, j: usize, cmp: closure[Env](T, T) -> (T, T, Order)) -> bool {
     let a = unsafe *(unsafe offset(p, i));
@@ -345,6 +353,10 @@ unsafe fn before(p: *T, i: usize, j: usize, cmp: closure[Env](T, T) -> (T, T, Or
     }
 }
 
+/// Exchanges the elements at `i` and `j` of the block at `p`, by moves.
+/// Caller: both indices are below the number of initialized elements at
+/// `p`, which nothing else touches during the call. Used by the `Vec!`
+/// operations that move elements; not meant for direct use.
 forall T where Sized[T].
 unsafe fn swap_at(p: *T, i: usize, j: usize) -> () {
     let a = unsafe *(unsafe offset(p, i));
@@ -355,6 +367,8 @@ unsafe fn swap_at(p: *T, i: usize, j: usize) -> () {
 }
 
 /// Restores the max-heap below `root` within the first `end` elements.
+/// Caller: `end` is at most the number of initialized elements at `p`,
+/// which nothing else touches during the call.
 forall T, Env where Copy[Env], Sized[T].
 unsafe fn sift_down(p: *T, root: usize, end: usize, cmp: closure[Env](T, T) -> (T, T, Order)) -> () {
     var at = root;
@@ -466,6 +480,8 @@ impl Vec![T, 'k] {
     }
 }
 
+/// Lets a `Copy` element go: the callback `destroy` passes to
+/// `destroy_with`. Not meant for direct use.
 forall T where Copy[T].
 fn forget_copy(value: T) -> () {
     ()
@@ -494,8 +510,8 @@ impl Vec![T, 'k] {
 forall T, 'k where Copy[T], Sized[T].
 impl Vec![T, 'k] {
     /// Frees a vector of `Copy` elements, which need no per-element callback.
-    fn free(self, tag: Exclusive!['k]) -> () {
-        self.destroy(tag, forget_copy[T])
+    fn destroy(self, tag: Exclusive!['k]) -> () {
+        self.destroy_with(tag, forget_copy[T])
     }
 }
 
@@ -530,7 +546,7 @@ impl OwnedVec![T] {
     /// How many elements the vector holds.
     fn len(&self) -> usize {
         let exists 'k. (tag, v) = self.inner;
-        let n = &v.len(&tag);
+        let n = &v.len();
         self = OwnedVec!.{ inner: pack 'k. (tag, v) };
         n
     }
@@ -541,10 +557,10 @@ impl OwnedVec![T] {
     }
 
     /// Adds `val` at the end.
-    fn push(self, val: T) -> OwnedVec![T] {
+    fn push(&self, val: T) {
         let exists 'k. (tag, v) = self.inner;
         let exists '2. (tag, v) = v.push(tag, val);
-        OwnedVec!.{ inner: pack '2. (tag, v) }
+        self = OwnedVec!.{ inner: pack '2. (tag, v) };
     }
 
     /// Removes the last element and hands it back, or `None` when there is
@@ -646,36 +662,36 @@ impl OwnedVec![T] {
     /// Sorts the elements so `cmp` never says a later one orders before an
     /// earlier one. Not stable; any `T`.
     forall Env where Copy[Env].
-    fn sort_unstable_by(self, cmp: closure[Env](T, T) -> (T, T, Order)) -> OwnedVec![T] {
+    fn sort_unstable_by(&self, cmp: closure[Env](T, T) -> (T, T, Order)) {
         let exists 'k. (tag, v) = self.inner;
         &v.sort_unstable_by(&tag, cmp);
-        OwnedVec!.{ inner: pack 'k. (tag, v) }
+        self = OwnedVec!.{ inner: pack 'k. (tag, v) };
     }
 
     /// Frees the vector, handing each element to `f` first.
-    fn destroy(self, f: fn(T) -> ()) -> () {
+    fn destroy_with(self, f: fn(T) -> ()) -> () {
         let exists 'k. (tag, v) = self.inner;
-        v.destroy(tag, f)
+        v.destroy_with(tag, f)
     }
 }
 
 forall T where Ord[T, T], Sized[T].
 impl OwnedVec![T] {
     /// Sorts the elements in ascending `Ord` order. Not stable; any `T`.
-    fn sort_unstable(self) -> OwnedVec![T] {
+    fn sort_unstable(&self) {
         let exists 'k. (tag, v) = self.inner;
         &v.sort_unstable(&tag);
-        OwnedVec!.{ inner: pack 'k. (tag, v) }
+        self = OwnedVec!.{ inner: pack 'k. (tag, v) };
     }
 }
 
 forall T where Copy[T], Ord[T, T], Sized[T].
 impl OwnedVec![T] {
     /// Sorts the elements in ascending `Ord` order, stably.
-    fn sort(self) -> OwnedVec![T] {
+    fn sort(&self) {
         let exists 'k. (tag, v) = self.inner;
         &v.sort(&tag);
-        OwnedVec!.{ inner: pack 'k. (tag, v) }
+        self = OwnedVec!.{ inner: pack 'k. (tag, v) };
     }
 }
 
@@ -748,9 +764,9 @@ impl OwnedVec![T] {
     }
 
     /// Frees a vector of `Copy` elements, which need no per-element callback.
-    fn free(self) -> () {
+    fn destroy(self) -> () {
         let exists 'k. (tag, v) = self.inner;
-        v.free(tag)
+        v.destroy(tag)
     }
 }
 
@@ -774,10 +790,10 @@ impl OwnedVec![T] {
     /// Sorts, stably, by `cmp`, which is lent the context `cx` for each
     /// comparison (`Vec!::sort_by`).
     forall C, Env where Copy[Env].
-    fn sort_by(self, &cx: C, cmp: closure[Env](&_: C, T, T) -> Order) -> OwnedVec![T] {
+    fn sort_by(&self, &cx: C, cmp: closure[Env](&_: C, T, T) -> Order) {
         let exists 'k. (tag, v) = self.inner;
         &v.sort_by(&tag, &cx, cmp);
-        OwnedVec!.{ inner: pack 'k. (tag, v) }
+        self = OwnedVec!.{ inner: pack 'k. (tag, v) };
     }
 }
 
@@ -809,6 +825,7 @@ impl VecIter![T, 'k] {
     }
 }
 
+/// The vec's elements in order, copied out under its capability.
 forall T, 'k where Copy[T], Sized[T].
 instance Iterator[VecIter![T, 'k] -> T] {
     fn next(&it: VecIter![T, 'k]) -> Option[T] {
@@ -855,6 +872,7 @@ impl OwnedVecIter![T] {
     }
 }
 
+/// The vector's elements in order, copied out.
 forall T where Copy[T], Sized[T].
 instance Iterator[OwnedVecIter![T] -> T] {
     fn next(&it: OwnedVecIter![T]) -> Option[T] {
@@ -878,7 +896,7 @@ impl I {
         var it = self;
         var out = OwnedVec!::new[T]();
         for x in &it {
-            out = out.push(x);
+            &out.push(x);
         }
         (it, out)
     }

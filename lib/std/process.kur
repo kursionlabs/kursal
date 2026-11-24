@@ -6,7 +6,6 @@ use package as std;
 export core::process::trap;
 
 use alloc::buffer::Buffer!;
-use alloc::heap::exit as c_exit;
 use core::cstr::CStr;
 use core::hash::Seed;
 use core::mem::alloca;
@@ -15,7 +14,7 @@ use core::option::{Option, Result};
 use core::raw::raw_get;
 use core::slice::{ReadBytes, Slice};
 use libc::process::{kur_libc_process_spawn, kur_libc_process_wait, kur_libc_process_kill, kur_libc_process_signal,
-    kur_libc_process_poll, kur_libc_process_cpus, kur_libc_process_hash_seed};
+    kur_libc_process_poll, kur_libc_process_cpus, kur_libc_process_hash_seed, kur_libc_process_exit};
 use std::io::{Error, File!, c_string};
 
 /// The arguments the process was started with, the program's name first, as
@@ -87,8 +86,9 @@ exposed enum Stdio! {
 }
 
 impl Stdio! {
-    // What `kur_libc_process_spawn` reads for the stream: the descriptor to
-    // copy, or a negative code for the other ways (process.c's KUR_STREAM_*).
+    /// What the C runtime's spawn reads for the stream: the descriptor to
+    /// copy, or a negative code for the other ways (process.c's
+    /// KUR_STREAM_*). Used by `Command!::spawn`; not meant for direct use.
     fn code(&self) -> i32 {
         let (stdio, code) = match self {
             Inherit => (Stdio!::Inherit, 0i32 - 1i32),
@@ -104,8 +104,9 @@ impl Stdio! {
         code
     }
 
-    // Closes the file of a `File`, which the child has a copy of by now;
-    // nothing for the others.
+    /// Closes the file of a `File`, which the child has a copy of by now;
+    /// nothing for the others. Used by `Command!::spawn`; not meant for
+    /// direct use.
     fn close(self) {
         match self {
             File(f) => {
@@ -161,9 +162,10 @@ impl Command! {
     /// The command with the environment variable `name` set to `value` for
     /// the child, after the changes made before. A name that is empty or
     /// holds an `=`, or a name or value holding a NUL, makes `spawn` fail
-    /// with EINVAL.
-    forall C, S where ReadBytes[C, S], Copy[S].
-    fn env(self, &cx: C, name: S, value: S) -> Command! {
+    /// with EINVAL. The name and the value may be different kinds of view,
+    /// read under the one capability `cx`.
+    forall C, N, V where ReadBytes[C, N], Copy[N], ReadBytes[C, V], Copy[V].
+    fn env(self, &cx: C, name: N, value: V) -> Command! {
         let { env, env_ops, ..rest } = self;
         let env = env.push_byte(b's').push_bytes(&cx, name).push_byte(0u8).push_bytes(&cx, value).push_byte(0u8);
         Command!.{ env, env_ops: env_ops + 1usize, ..rest }
@@ -544,12 +546,14 @@ fn close_end(end: Option[File!]) {
     }
 }
 
-// The error of a call that returns 0 or an errno.
+/// The error of a call that returns 0 or an errno. Used by `Child!`'s
+/// `kill` and `signal`; not meant for direct use.
 fn status_of(code: i32) -> Result[(), Error] {
     if code == 0i32 { Result::Ok.(()) } else { Result::Err.(Error.{ errno: code }) }
 }
 
-// How a child ended, from what `kur_libc_process_wait` returns for one that has.
+/// How a child ended, from what the C runtime's wait returns for one that
+/// has. Used by `Child!`'s waits; not meant for direct use.
 fn exit_of(result: i64) -> Result[Exit, Error] {
     if result < 0i64 {
         Result::Err.(Error.{ errno: (0i64 - result) as i32 })
@@ -580,9 +584,12 @@ fn hash_seed() -> Seed {
 }
 
 /// Ends the process with `status` after C's `exit` runs its handlers and
-/// flushes C's own streams. Like `trap`, it breaks no invariant: nothing
-/// after it runs. Linear values still live are not consumed, so whatever
-/// they own is left for the operating system to reclaim.
+/// flushes C's own streams, once: the first call runs `exit`, and a call
+/// from another thread meanwhile never returns, waiting for the first to
+/// end the process (C leaves two `exit`s at once undefined). Like `trap`,
+/// it breaks no invariant: nothing after a call runs in the thread that
+/// made it. Linear values still live are not consumed, so whatever they own
+/// is left for the operating system to reclaim.
 fn exit(status: i32) -> ! {
-    unsafe c_exit(status)
+    unsafe kur_libc_process_exit(status)
 }

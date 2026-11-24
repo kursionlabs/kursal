@@ -14,7 +14,7 @@
 use package as alloc;
 
 use alloc::heap::Uninit!;
-use alloc::heap::{AllocError, HeapAllocator, Storage};
+use alloc::heap::{AllocError, HeapAllocator, Storage, abort};
 use alloc::heap::checked_add;
 use alloc::heap::checked_mul;
 use core::cap::{Brand, Exclusive!};
@@ -71,19 +71,18 @@ struct BufferRestore! {
     cap: usize,
 }
 
-// `new_with_cap` aborts when its allocation fails, and `commit` when asked
+// `with_capacity` aborts when its allocation fails, and `commit` when asked
 // for a `len` past `cap`, matching `alloc::heap`'s aborting API: a
 // `Buffer!`-returning method has no error channel, so an unsatisfiable
 // request is a hard stop.
-extern "C" fn abort() -> !;
 
 impl Buffer! {
     /// Takes ownership of an allocation whose first `len` bytes are initialized.
     /// The allocation's recorded extent becomes the buffer's capacity.
     /// Aborts if `len` exceeds that extent.
     ///
-    /// The caller must ensure that `storage` records the allocation's capacity
-    /// and that its prefix of `len` bytes has already been written.
+    /// Caller: `storage` records the allocation's capacity, and its prefix of
+    /// `len` bytes has already been written.
     unsafe fn from_initialized_allocation(storage: Uninit!, len: usize) -> Buffer! {
         let (ptr, cap) = storage.into_parts();
         let buffer = Buffer!.{ ptr, len: 0usize, cap };
@@ -92,7 +91,7 @@ impl Buffer! {
 
     /// A new, empty buffer with room for `cap` bytes before the first grow,
     /// or the allocation failure. Growing it later aborts as `reserve` does.
-    fn try_new_with_cap(cap: usize) -> Result[Buffer!, AllocError] {
+    fn try_with_capacity(cap: usize) -> Result[Buffer!, AllocError] {
         match Storage::try_alloc(cap) {
             Ok(u) => Result::Ok.(Buffer!.{ ptr: u.into_raw(), len: 0usize, cap }),
             Err(e) => Result::Err.(e),
@@ -102,10 +101,10 @@ impl Buffer! {
     /// A new, empty buffer with room for `cap` bytes, aborting when the
     /// allocation fails.
     ///
-    /// `try_new_with_cap`, aborting on failure. `new` is this with a starting
+    /// `try_with_capacity`, aborting on failure. `new` is this with a starting
     /// capacity of 64.
-    fn new_with_cap(cap: usize) -> Buffer! {
-        match Buffer!::try_new_with_cap(cap) {
+    fn with_capacity(cap: usize) -> Buffer! {
+        match Buffer!::try_with_capacity(cap) {
             Ok(b) => b,
             Err(e) => unsafe abort(),
         }
@@ -113,7 +112,7 @@ impl Buffer! {
 
     /// A new, empty buffer with room for 64 bytes.
     fn new() -> Buffer! {
-        Buffer!::new_with_cap(64usize)
+        Buffer!::with_capacity(64usize)
     }
 
     /// A buffer of exactly `n` zero bytes: `len == cap == n`, every byte
@@ -124,7 +123,7 @@ impl Buffer! {
     /// through the brand. Zeroing costs one pass over `n` bytes and means no
     /// uninitialized byte is ever inside `len`.
     fn new_zeroed(n: usize) -> Buffer! {
-        let b = Buffer!::new_with_cap(n);
+        let b = Buffer!::with_capacity(n);
         let { ptr: p, len: len_, cap: c } = b;
         var i = 0usize;
         while i < n {
@@ -166,7 +165,9 @@ impl Buffer! {
         Buffer!.{ ptr: p, len: checked_add(n, 1usize), cap: c }
     }
 
-    /// Copies `count` bytes from `src` in, growing first if needed.
+    /// Copies `count` bytes from `src` in, growing first if needed. Caller:
+    /// `src[0..count)` is readable, and not inside this buffer's own storage,
+    /// which the grow may free.
     unsafe fn push_n(self, src: *u8, count: usize) -> Buffer! {
         let b2 = self.reserve(count);
         let { ptr: p, len: n, cap: c } = b2;
@@ -262,7 +263,7 @@ impl Buffer! {
         let n = &self.len();
         // `p` points at the `n` initialized bytes of `self`, which stays
         // alive until the copy is made.
-        let copy = unsafe Buffer!::new_with_cap(n).push_n(p, n);
+        let copy = unsafe Buffer!::with_capacity(n).push_n(p, n);
         copy
     }
 
@@ -283,7 +284,9 @@ impl Buffer! {
         c - n
     }
 
-    /// Address of the first byte, valid until the next grow.
+    /// Address of the first byte, valid until the next grow. Caller: uses it
+    /// only for the buffer's first `len` bytes, and not after the next grow
+    /// or `destroy`.
     unsafe fn as_ptr(&self) -> *u8 {
         let { ptr: p, len: n, cap: c } = self;
         self = Buffer!.{ ptr: p, len: n, cap: c };
@@ -293,7 +296,9 @@ impl Buffer! {
     /// Address of the first unused byte, writable up to the room `reserve`
     /// most recently guaranteed. Pairs with `commit`. The pointer is valid
     /// only until the next grow. Takes `&self` because a linear buffer must
-    /// survive the call so the caller can `commit` afterwards.
+    /// survive the call so the caller can `commit` afterwards. Caller: writes
+    /// no further than the room `reserve` guaranteed, and stops using the
+    /// pointer at the next grow or `destroy`.
     unsafe fn tail_ptr(&self) -> *u8 {
         let { ptr: p, len: n, cap: c } = self;
         let addr = unsafe offset(p, n);
@@ -309,9 +314,9 @@ impl Buffer! {
     /// the block, and `Slice::get_ref`'s bounds check (against the slice's
     /// length) would admit out-of-bounds indices.
     ///
-    /// Initialization cannot be checked, so it is the caller's obligation:
-    /// all `n` bytes at `p[len .. len+n)` have been written since the last
-    /// `reserve`/grow, so the new `len` describes initialized storage.
+    /// Caller: all `n` bytes at `p[len .. len+n)` have been written since the
+    /// last `reserve`/grow, so the new `len` describes initialized storage;
+    /// initialization cannot be checked.
     ///
     /// A caller that only wants a fixed-size, fully addressable buffer should
     /// use `Buffer!::new_zeroed`, which carries no obligation.

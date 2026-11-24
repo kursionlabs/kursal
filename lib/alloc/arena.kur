@@ -49,6 +49,9 @@ use core::option::Option;
 use core::hash::Seed;
 use alloc::heap::{checked_add, checked_mul};
 
+/// One chunk of an arena: its data block, how many of its bytes are in
+/// use, its size, and the chunk made before it (null for the root). Used by
+/// `Arena!`; not meant for direct use.
 struct Chunk {
     data: *u8,
     used: usize,
@@ -109,6 +112,9 @@ fn has_room(used: usize, cap: usize, padding: usize, need: usize) -> bool {
 /// The header is a small, separate heap allocation (simpler than packing
 /// it into the front of `data`, at the cost of one extra alloc/drop pair
 /// per chunk), and is arena-private in every chunk including the root.
+///
+/// Caller: `data` is a live block of `cap` bytes that the chunk now owns,
+/// and `next` is null or the arena's live current chunk.
 unsafe fn new_header(data: *u8, cap: usize, next: *Chunk) -> *Chunk {
     let hdr_uninit = HeapAllocator::alloc(sizeof[Chunk]());
     let hdr_bytes = hdr_uninit.into_raw();
@@ -126,7 +132,7 @@ unsafe fn new_header(data: *u8, cap: usize, next: *Chunk) -> *Chunk {
 /// root's buffer is the tracked one); its data buffer never becomes an
 /// `Allocation!` and is freed by `free_chain_after_root_release`.
 ///
-/// Requires: `next` is the arena's live current chunk.
+/// Caller: `next` is the arena's live current chunk.
 unsafe fn new_chunk(min_cap: usize, next: *Chunk) -> *Chunk {
     let { data: _, used: _, cap: next_cap, next: _ } = unsafe *next;
     let max_cap = 1048576usize;
@@ -151,7 +157,7 @@ unsafe fn new_chunk(min_cap: usize, next: *Chunk) -> *Chunk {
 /// address. Everything in `Arena!::alloc` that does not depend on its `T`,
 /// kept out of it so each instantiation stays a few statements.
 ///
-/// Requires: `cur` is the arena's live current chunk.
+/// Caller: `cur` is the arena's live current chunk.
 unsafe fn bump_chunk(cur: *Chunk, need: usize, alignment: usize) -> (*Chunk, *u8) {
     let { data: d, used: u, cap: c, next: n } = unsafe *cur;
     let padding = padding_for(unsafe (d as usize) + u, alignment);
@@ -171,8 +177,8 @@ unsafe fn bump_chunk(cur: *Chunk, need: usize, alignment: usize) -> (*Chunk, *u8
 
 /// Frees every chunk's header, plus every non-root chunk's data buffer.
 ///
-/// Precondition: `Arena!::destroy` has already freed the root chunk's data
-/// buffer through `Allocation!::release` + `HeapAllocator::drop`, so freeing
+/// Caller: `c` is the arena's current chunk, and `Arena!::destroy` has
+/// already freed the root chunk's data buffer through `Allocation!::release` + `HeapAllocator::drop`, so freeing
 /// it here would be a double free. The walk skips exactly the root because
 /// the root is the chain's tail: `new_chunk` prepends (it stores
 /// `next: cur`), `Arena!::new` builds the root with a null `next`, and
@@ -302,6 +308,9 @@ impl Arena!['k] {
     /// result can be read many times without linear tracking. Unlike `alloc`,
     /// nothing is written; the caller copies the bytes in (see `copy_bytes`).
     /// No alignment padding is added.
+    ///
+    /// Caller: writes the `n` bytes before reading any of them, and uses the
+    /// pointer only while the arena lives.
     unsafe fn alloc_bytes(&self, n: usize) -> *u8 {
         let { root: a, back: bk, current: cur, marker: m, seed } = self;
         let { data: d, used: u, cap: c, next: nx } = unsafe *cur;
@@ -483,7 +492,8 @@ impl Span['j] {
 
 /// Copies `count` bytes from `src` to `dest`, byte by byte (the same loop as
 /// `alloc::buffer::Buffer!::push_n`). `alloc_bytes` only reserves room, so its
-/// callers copy with this.
+/// callers copy with this. Caller: `src[0..count)` is readable,
+/// `dest[0..count)` writable, and the two do not overlap.
 unsafe fn copy_bytes(dest: *u8, src: *u8, count: usize) -> () {
     var i = 0usize;
     while i < count {

@@ -1,12 +1,13 @@
 /* Other programs, for `std::process`: starting one with its environment,
  * directory and standard streams, waiting for it, signalling it and
- * reading its pipes; and counting processors. */
+ * reading its pipes; counting processors; and ending this process. */
 #include "common.h"
 #include <fcntl.h>
 #include <poll.h>
 #include <sched.h>
 #include <signal.h>
 #include <spawn.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -226,8 +227,10 @@ int32_t kur_libc_process_signal(int64_t pid, int32_t signal) {
 /* Waits until descriptor `a` or `b` can be read without blocking, or has
  * reached its end or failed, again when a signal interrupts the wait: bit
  * 0 set for `a`, bit 1 for `b`, or a negative errno. A negative descriptor
- * is passed over. */
+ * is passed over; when both are negative there is nothing to wait for, and
+ * the result is 0 at once. */
 int32_t kur_libc_process_poll(int32_t a, int32_t b) {
+    if (a < 0 && b < 0) return 0;
     struct pollfd fds[2] = {{a, POLLIN, 0}, {b, POLLIN, 0}};
     int n;
     do n = poll(fds, 2, -1); while (n < 0 && errno == EINTR);
@@ -248,4 +251,16 @@ uintptr_t kur_libc_process_cpus(void) {
 #endif
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return n < 1 ? 1 : (uintptr_t)n;
+}
+
+/* Ends the process with C's `exit(status)`, which runs the `atexit` handlers
+ * and flushes C's streams. C11 leaves a second call of `exit` while the
+ * first is running undefined, and two threads can call this at once, so
+ * only the first call runs `exit`. A later one never returns: from another
+ * thread it waits for the first to end the process; from an `atexit`
+ * handler, which that `exit` is itself waiting on, it waits for good. */
+_Noreturn void kur_libc_process_exit(int32_t status) {
+    static atomic_flag exiting = ATOMIC_FLAG_INIT;
+    if (atomic_flag_test_and_set(&exiting)) for (;;) pause();
+    exit(status);
 }

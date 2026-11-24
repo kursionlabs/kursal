@@ -2139,14 +2139,14 @@ class CompilerTests(unittest.TestCase):
         """A container of an element type with zero-size parts beside bytes, and the containers at a zero-size
         element type, which `Sized` rejects: `kursal build` writes the reference's C, or its error."""
         sources = (
-            "fn main() -> i32 { var v = OwnedVec!::new[((), u8)](); v = v.push(((), 1u8)); v.free(); 0 }\n",
-            "fn main() -> i32 { var m = OwnedMap!::new[u32, ((), u8)](std::process::hash_seed()); let old = &m.insert(1u32, ((), 2u8)); m.free(); 0 }\n",
+            "fn main() -> i32 { var v = OwnedVec!::new[((), u8)](); &v.push(((), 1u8)); v.destroy(); 0 }\n",
+            "fn main() -> i32 { var m = OwnedMap!::new[u32, ((), u8)](std::process::hash_seed()); let old = &m.insert(1u32, ((), 2u8)); m.destroy(); 0 }\n",
             "fn main() -> i32 { let o = Owned!::new(((), 3u8)); o.into_value(); 0 }\n",
             "forall T where Sized[T]. fn boxed(x: T) -> T { Owned!::new(x).into_value() }\nfn main() -> i32 { boxed(((), 4u8)); 0 }\n",
         )
         rejected = (
-            "fn main() -> i32 { var v = OwnedVec!::new[()](); v = v.push(()); v.free(); 0 }\n",
-            "fn main() -> i32 { var m = OwnedMap!::new[u32, ()](std::process::hash_seed()); let old = &m.insert(1u32, ()); m.free(); 0 }\n",
+            "fn main() -> i32 { var v = OwnedVec!::new[()](); &v.push(()); v.destroy(); 0 }\n",
+            "fn main() -> i32 { var m = OwnedMap!::new[u32, ()](std::process::hash_seed()); let old = &m.insert(1u32, ()); m.destroy(); 0 }\n",
             "forall T. fn boxed(x: T) -> T { Owned!::new(x).into_value() }\nfn main() -> i32 { boxed(()); 0 }\n",
         )
         imports = "use std::owned::Owned!;\nuse std::collections::{hashmap::OwnedMap!, vec::OwnedVec!};\n"

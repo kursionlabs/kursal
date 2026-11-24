@@ -96,31 +96,29 @@ int32_t kur_libc_fs_close(int32_t fd) {
     return close(fd) == 0 ? 0 : errno;
 }
 
-/* The size of the regular file open on `fd`; `other` for anything else
- * that is not a directory; or a negative errno: EISDIR for a directory,
- * EFBIG for a size an intptr_t cannot hold. */
-static intptr_t regular_size_or(int32_t fd, intptr_t other) {
+/* The size of the regular file open on `fd`, in `*size` (64 bits, as a
+ * file can outgrow the address space): 0, or the errno: EISDIR for a
+ * directory, EINVAL for anything else that is not a regular file. */
+int32_t kur_libc_fs_regular_size(int32_t fd, uint64_t *size) {
+    struct stat info;
+    if (fstat(fd, &info) != 0) return errno;
+    if (S_ISDIR(info.st_mode)) return EISDIR;
+    if (!S_ISREG(info.st_mode)) return EINVAL;
+    *size = info.st_size < 0 ? 0 : (uint64_t)info.st_size;
+    return 0;
+}
+
+/* How many bytes reading `fd` to its end is likely to give, for a buffer
+ * to hold them: a regular file's size, 0 for a pipe, device or socket,
+ * whose size says nothing about it; or a negative errno: EISDIR for a
+ * directory, EFBIG for a size an intptr_t cannot hold. */
+intptr_t kur_libc_fs_size_hint(int32_t fd) {
     struct stat info;
     if (fstat(fd, &info) != 0) return -(intptr_t)errno;
     if (S_ISDIR(info.st_mode)) return -(intptr_t)EISDIR;
-    if (!S_ISREG(info.st_mode)) return other;
+    if (!S_ISREG(info.st_mode)) return 0;
     if (info.st_size < 0 || (uintmax_t)info.st_size > (uintmax_t)INTPTR_MAX) return -(intptr_t)EFBIG;
     return (intptr_t)info.st_size;
-}
-
-/* The size of the regular file open on `fd`, or a negative errno: EISDIR
- * for a directory, EINVAL for anything else that is not a regular file,
- * EFBIG for a size an intptr_t cannot hold. */
-intptr_t kur_libc_fs_regular_size(int32_t fd) {
-    return regular_size_or(fd, -(intptr_t)EINVAL);
-}
-
-/* How many bytes reading `fd` to its end is likely to give: a regular
- * file's size, 0 for a pipe, device or socket, whose size says nothing
- * about it; or a negative errno: EISDIR for a directory, EFBIG for a size
- * an intptr_t cannot hold. */
-intptr_t kur_libc_fs_size_hint(int32_t fd) {
-    return regular_size_or(fd, 0);
 }
 
 /* Whether a `std::io::Input!` holds standard input: the one reader of it

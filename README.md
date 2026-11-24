@@ -78,7 +78,7 @@ Running out of memory aborts a program: the library's constructors, and every op
 container (`push`, `insert`, a buffer's `push_*`, an arena's allocations), stop it with `abort` when
 `malloc` or `realloc` fails, and return no error for it. A program that must recover makes its
 containers with the fallible constructors, which return an `AllocError` instead:
-`Buffer!::try_new_with_cap`, `Vec!::try_new`, `OwnedVec!::try_new`, `HashMap!::try_new`,
+`Buffer!::try_with_capacity`, `Vec!::try_new`, `OwnedVec!::try_new`, `HashMap!::try_new`,
 `OwnedMap!::try_new` and `Owned!::try_new` (listed in [`lib/alloc/lib.kur`](lib/alloc/lib.kur)). A
 container made so still aborts if it later fails to grow.
 [`lib/std/CONTRACTS.md`](lib/std/CONTRACTS.md) records the obligation of every function with a raw

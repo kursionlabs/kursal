@@ -15,7 +15,7 @@ int32_t kur_libc_fs_create(const uint8_t *path, uintptr_t len);
 intptr_t kur_libc_fs_read(int32_t fd, uint8_t *buf, uintptr_t len);
 intptr_t kur_libc_fs_write(int32_t fd, const uint8_t *buf, uintptr_t len);
 int32_t kur_libc_fs_close(int32_t fd);
-intptr_t kur_libc_fs_regular_size(int32_t fd);
+int32_t kur_libc_fs_regular_size(int32_t fd, uint64_t *size);
 intptr_t kur_libc_fs_size_hint(int32_t fd);
 int32_t kur_libc_stdin_claim(void);
 void kur_libc_stdin_release(void);
@@ -46,6 +46,7 @@ int32_t kur_libc_process_kill(int64_t pid);
 int32_t kur_libc_process_signal(int64_t pid, int32_t signal);
 int32_t kur_libc_process_poll(int32_t a, int32_t b);
 uintptr_t kur_libc_process_cpus(void);
+_Noreturn void kur_libc_process_exit(int32_t status);
 
 /* start.c */
 void kur_libc_process_start(void);
