@@ -2,7 +2,9 @@
 inverse, and every lowered program survives the round trip with the same checker verdict and C."""
 
 import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -13,7 +15,7 @@ from kursal.check import check_program
 from kursal.kurs import parse_program, write_program
 from kursal.lower import lower
 from kursal.resolve import LIB, resolve
-from kursal.sexpr import KursError
+from kursal.sexpr import KursError, read
 from kursal.sigs import signatures
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -135,6 +137,39 @@ class KursReaderTests(unittest.TestCase):
                           "(fun main u32 () (entry () (= %p (fn (f _))) (= %r (const u32 0)) (ret %r)))")
         with self.assertRaisesRegex(KursError, "a function type quantifies nothing"):
             parse_program("(type T (fn (forall ($k) () u32 ((brand $k)))))")
+
+    def test_a_hex_escape_is_two_digits_of_an_ascii_character(self):
+        self.assertEqual(read('"\\x41\\x7f"')[0], "A\x7f")
+        for escape, error in (("\\xzz", "needs two hex digits"), ("\\x4", "needs two hex digits"), ("\\x", "needs two hex digits"),
+                              ("\\x80", "is at most 7f"), ("\\xff", "is at most 7f")):
+            with self.subTest(escape=escape), self.assertRaisesRegex(KursError, f"^1:23: a \\\\x escape {error}"):
+                parse_program(f'(data d (array u8 1) ("{escape}"))')
+        # A character past ASCII is written as itself, as its UTF-8 bytes.
+        parse_program('(data d (array u8 2) ("é"))')
+
+    def test_lists_nest_at_most_256_deep(self):
+        self.assertEqual(len(read("(" * 256 + ")" * 256)), 1)
+        for text in ("(" * 257 + ")" * 257, "(" * 100_000):
+            with self.assertRaisesRegex(KursError, "^1:257: lists nest deeper than 256$"):
+                read(text)
+
+    def test_the_command_line_checks_silently_and_reports_without_a_traceback(self):
+        """`python -m kursal FILE`: nothing for a sound program; for a file it cannot read, one that is not
+        UTF-8 or one it rejects, the message alone, with status 1."""
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            (base / "sound.kurs").write_text("(fun f u32 () (entry () (= %r (const u32 0)) (ret %r)))")
+            (base / "latin1.kurs").write_bytes(b'(data d (array u8 1) ("\xe9"))')
+            (base / "deep.kurs").write_text("(" * 100_000)
+            for name, status, stderr in (
+                    ("sound.kurs", 0, ""),
+                    ("missing.kurs", 1, f"cannot read {base / 'missing.kurs'} (error 2)\n"),
+                    ("latin1.kurs", 1, f"{base / 'latin1.kurs'} is not UTF-8 text\n"),
+                    ("deep.kurs", 1, "1:257: lists nest deeper than 256\n")):
+                with self.subTest(file=name):
+                    result = subprocess.run([sys.executable, "-m", "kursal", str(base / name)], capture_output=True,
+                                            text=True, cwd=ROOT / "reference-compiler")
+                    self.assertEqual((result.returncode, result.stdout, result.stderr), (status, "", stderr))
 
     def test_place_parameters_of_function_types_and_trait_methods(self):
         program = parse_program(CANONICAL)

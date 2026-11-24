@@ -10,7 +10,6 @@ from kursal.kurs import parse_program
 from kursal.resolve import resolve
 from kursal.sexpr import KursError
 from kursal.sigs import signatures
-from kursal.unify import Meta, unify
 from tests.test_resolve import manifest, tree
 
 

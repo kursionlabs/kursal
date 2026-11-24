@@ -1,12 +1,27 @@
 """Core programs that would forge a witness, skip a premise, run an unchecked body, manufacture authority,
 or drop an obligation: each is rejected by the checker."""
 
+import os
+import subprocess
+import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 from kursal.check import check_program
 from kursal.kurs import parse_program
 from kursal.sexpr import KursError
 
+
+# A block newly empty at two roots, each of which breaks a rule its own way.
+EDGE_EMPTIES_TWO_ROOTS = """
+        (type E (enum (A (tuple u32 u32)) (B u32)))
+        (type T (struct (a u32) (b u32)))
+        (fun f u32 (E T) (entry ((&e E) (&t T)) (switch &e E (A a) (B b)))
+          (a () (known &e A) (jmp out))
+          (out () (known &e A) (empty &t.z.q) (empty &t.z.r) (empty &e.A.0) (empty &e.A.1)
+            (= %r (const u32 1)) (ret %r))
+          (b () (known &e B) (= %r (const u32 0)) (ret %r)))"""
 
 REJECTED = {
     # A block brand parameter cannot rebind `static` or a function brand: the jump would turn a fresh
@@ -122,7 +137,7 @@ REJECTED = {
     # Re-entering a nominal type's premises must descend. A brand an existential binds is a different
     # variable from the function's brand, however each is spelled: here the reentry into A changes its
     # brand argument while shrinking the other, so it does not descend under either spelling.
-    "descent_through_shadowing_binder": ("non-descending nominal premise formation for A", """
+    "descent_through_shadowing_binder": ("the premises of A require A again at arguments that are not smaller", """
         (trait P (T))
         (trait Q (T))
         (type A (forall ($a T) ((P T)) (tuple)))
@@ -134,7 +149,7 @@ REJECTED = {
         (instance P ((tuple u32 B)))
         (fun f (forall ($a) () u32 ((A $a (tuple u32 B)))
           (entry ((%x (A $a (tuple u32 B)))) (= %r (const u32 1)) (ret %r))))"""),
-    "descent_through_renamed_binder": ("non-descending nominal premise formation for A", """
+    "descent_through_renamed_binder": ("the premises of A require A again at arguments that are not smaller", """
         (trait P (T))
         (trait Q (T))
         (type A (forall ($a T) ((P T)) (tuple)))
@@ -241,6 +256,8 @@ REJECTED = {
             (= %x (const u32 0)) (= %u (store &e.A.0 %x)) (= %y (const u32 0)) (= %v (store &e.A.1 %y))
             (= %r (const u32 1)) (ret %r))
           (b () (known &e B) (= %r (const u32 0)) (ret %r)))"""),
+    # The roots are checked in the order the block names them: the first error is the first root's.
+    "edge_empties_roots_in_order": ("names_component", EDGE_EMPTIES_TWO_ROOTS),
 
     # A view opened inside a place is closed before the place is loaded or lent.
     "load_over_an_open_view": ("nested_view_open", """
@@ -547,6 +564,17 @@ class CoreSoundnessTests(unittest.TestCase):
         for name, (error, source) in REJECTED.items():
             with self.subTest(case=name), self.assertRaisesRegex(KursError, error):
                 check_program(parse_program(source))
+
+    def test_the_first_error_does_not_depend_on_the_hash_seed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "two_roots.kurs"
+            path.write_text(EDGE_EMPTIES_TWO_ROOTS)
+            for seed in range(8):
+                with self.subTest(seed=seed):
+                    result = subprocess.run([sys.executable, "-m", "kursal", str(path)], capture_output=True, text=True,
+                                            cwd=Path(__file__).resolve().parents[1],
+                                            env=dict(os.environ, PYTHONHASHSEED=str(seed)))
+                    self.assertEqual((result.returncode, result.stderr), (1, "f/a: names_component\n"))
 
     def test_the_sound_forms_are_accepted(self):
         for source in (

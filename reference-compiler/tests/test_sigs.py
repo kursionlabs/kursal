@@ -44,6 +44,10 @@ class TypeDeclTests(unittest.TestCase):
             with self.subTest(source=source), self.assertRaisesRegex(SigError, message):
                 sigs_of(lin + source)
 
+    def test_an_ignored_type_argument_is_only_in_an_expression(self):
+        with self.assertRaisesRegex(SigError, "2:1: _ stands for a type argument only in an expression"):
+            sigs_of("forall T. struct S { x: T }\nfn f(s: S[_]) -> u32 { 0u32 }\n")
+
     def test_a_foreach_type_is_no_component(self):
         # A foreach type is the type of a whole value, parameter or result (TY-FLAT).
         for source, what in (

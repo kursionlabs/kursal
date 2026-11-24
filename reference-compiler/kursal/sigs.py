@@ -217,7 +217,7 @@ class Signatures:
             if name not in inner.kinds:
                 fail(f"Copy requires an in-scope type parameter, not {name}")
             inner.kinds[name] = C.COPY
-        premises = tuple(self.premise(trait, args, inner) for trait, args in forall.premises if trait != ("Copy",))
+        premises = tuple(self.premise(args, inner) for trait, args in forall.premises if trait != ("Copy",))
         return params, premises, inner
 
     def copy_names(self, forall: Optional[S.Forall]) -> set[str]:
@@ -232,7 +232,7 @@ class Signatures:
                 names.add(arg.ref[1])
         return names
 
-    def premise(self, trait: S.NamePath, args: S.TypeArgs, scope: Scope) -> C.Premise:
+    def premise(self, args: S.TypeArgs, scope: Scope) -> C.Premise:
         for builtin in ("Exposed", "Sized"):
             if args.ref == ("builtin", builtin):
                 return C.Premise(builtin, tuple(self.component(a, scope, "a type argument") for a in args.args))
@@ -333,7 +333,7 @@ class Signatures:
             case S.TForeach(binder=binder, indirect=indirect, source=source, body=body):
                 return C.Foreach(binder, indirect, self.component(source, scope, "a foreach source"),
                                  self.component(body, scope.extend((C.Param(binder, C.ANY),)), "a foreach body"))
-        fail(f"no core type for {type(type_expr).__name__}")
+        fail("_ stands for a type argument only in an expression, where inference fills it in")
 
     def component(self, type_expr: S.Type, scope: Scope, what: str) -> C.Type:
         """A type written where a foreach type may not be (TY-FLAT): `what` names the place. A foreach

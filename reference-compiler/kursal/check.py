@@ -355,7 +355,6 @@ class Checker:
                     self.fail("known_contract_names_a_variant")
         last = None
         for instr in block.instrs:
-            self.pos = instr.pos
             self.check_instr(instr)
             last = instr
         self.check_term(block.term, last)
@@ -570,7 +569,7 @@ class Checker:
     # -------------------------------------------------------- signatures --
 
     def instantiate(self, params: Sequence[Param], premises: Sequence[Premise],
-                    tys: tuple[Type, ...], what: str) -> dict[str, Type]:
+                    tys: tuple[Type, ...]) -> dict[str, Type]:
         if len(tys) != len(params):
             self.fail("takes_type_arguments_got")
         sub = {}
@@ -603,7 +602,7 @@ class Checker:
         fun = self.program.funs.get(callee)
         if fun is None:
             self.fail("unknown_function")
-        sub = self.instantiate(fun.params, fun.premises, tys, callee)
+        sub = self.instantiate(fun.params, fun.premises, tys)
         return [subst(t, sub) for t in fun.ptypes], subst(fun.ret, sub), fun.unsafe, fun.places
 
     def arguments(self, ptypes: Sequence[Type], args: tuple[str, ...], places: frozenset[int]) -> list[str]:
@@ -847,7 +846,7 @@ class Checker:
         fun = self.program.funs.get(name)
         if fun is None:
             self.fail("unknown_function")
-        sub = self.instantiate(fun.params, fun.premises, instr.tys, name)
+        sub = self.instantiate(fun.params, fun.premises, instr.tys)
         return subst(Fn(fun.ptypes, fun.ret, fun.unsafe, fun.places), sub)
 
     def foreign_signature(self, ptypes: Sequence[Type], ret: Type) -> None:
@@ -1071,7 +1070,7 @@ class Checker:
         self.kinds = {**self.kinds, name: "any"}
         try:
             self.instantiate(mapper.params, mapper.premises,
-                             tuple(sub[param.name] for param in mapper.params), mapper.name)
+                             tuple(sub[param.name] for param in mapper.params))
         finally:
             self.kinds = saved_kinds
         item = subst(foreach_item(t), {t.binder: rigid}) if mapped is None else mapped_component(mapped, rigid)
@@ -1163,7 +1162,8 @@ class Checker:
                 if not ancestor_in(empty, z):
                     self.fail("empty_assumes_full")
             fresh = [q for q in target.empty if not places.covered(q)]
-            for root in {segments(q)[0] for q in fresh}:
+            # Each root once, in the order the block names it, so that the first error is the same in every run.
+            for root in {segments(q)[0]: None for q in fresh}:
                 own = [q for q in fresh if segments(q)[0] == root]
                 # One newly empty path per root, or leaves of one full product tree.
                 if len(own) > 1 and not (self.product_branches(own) and places.full(self.common_parent(own))):

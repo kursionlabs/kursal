@@ -16,6 +16,8 @@
 // or else one per processor, and linked with link-time optimization; --single-c writes it as one
 // file, OUTPUT.c, compiled whole, which builds slower and runs a little faster.
 // `kursal doc PATH -o DIR` writes the pages of a Krayon documentation site from resolved source.
+// A command line no command takes stops with its usage and status 2; a program the compiler rejects
+// stops with the error and status 1.
 //
 // Each group of phases keeps what it builds in an arena of its own: the front end (the command
 // line, parsing, resolving, signatures, inference and lowering, or reading KURS), the core
@@ -54,7 +56,8 @@ use package::types::ops::{Fresh, carry_fresh};
 use std::buffer::Buffer!;
 use std::io::eprint_buffer;
 use std::option::{Option, Result};
-use std::process::{Args, Child!, Command!, Exit, Polled!, available_parallelism, hash_seed};
+use std::process::{Args, Child!, Command!, Exit, Polled!, available_parallelism, exit, hash_seed};
+use std::utf8::validate;
 use std::collections::vec::OwnedVec!;
 use std::cmp::Order;
 use std::io::{Error, ErrorKind};
@@ -154,12 +157,12 @@ fn front_end(&cx: Domain!['k], process_args: Args) -> Option[Handoff['k]] {
         a = a + 1usize;
     }
     if args.is_empty(&cx) {
-        emit_buffer(Buffer!::new().push_static("Kursal compiler\n\nUse: kursal build PATH [-o OUTPUT] [--emit-c] [--times]\n     kursal COMMAND --help\n\nRun kursal --help for commands.\n"));
-        return Option::None;
+        eprint_buffer(Buffer!::new().push_static("Kursal compiler\n\nusage: ").push_static(BUILD).push_static("\n       kursal COMMAND --help\n\nRun kursal --help for commands.\n"));
+        exit(2)
     }
     let command = args.at(&cx, 0usize);
     if command.is(&cx, "--help") || command.is(&cx, "-h") || command.is(&cx, "help") {
-        emit_buffer(Buffer!::new().push_static("Kursal compiler\n\nUsage: kursal COMMAND [ARGS]\n\nCommands:\n  build PATH [-o OUTPUT] [--emit-c] [--single-c] [--times]  Build an executable (a.out by default)\n  doc PATH -o DIR     Generate the pages of a Krayon documentation site\n  parse FILE...       Print syntax trees\n  resolve PATH        Print name resolution\n  sigs PATH           Print signatures\n  infer PATH          Print inferred types\n  lower PATH          Print lowered KURS\n  kurs FILE           Read and print KURS\n  check FILE          Check KURS\n  c FILE [--entry NAME]  Generate C from KURS\n  readable FILE       Print readable KURS\n\nUse kursal COMMAND --help for command details.\n"));
+        emit_buffer(Buffer!::new().push_static("Kursal compiler\n\nusage: kursal COMMAND [ARGS]\n\nCommands:\n  build PATH [OPTIONS]   Build an executable (a.out by default)\n  doc PATH -o DIR        Generate the pages of a Krayon documentation site\n  parse FILE...          Print syntax trees\n  resolve PATH           Print name resolution\n  sigs PATH              Print signatures\n  infer PATH             Print inferred types\n  lower PATH             Print lowered KURS\n  kurs FILE              Read and print KURS\n  check FILE             Check KURS\n  c FILE [--entry NAME]  Generate C from KURS\n  readable FILE          Print readable KURS\n\nUse kursal COMMAND --help for command details.\n"));
         return Option::None;
     }
     if command.is(&cx, "--version") || command.is(&cx, "-V") {
@@ -167,36 +170,45 @@ fn front_end(&cx: Domain!['k], process_args: Args) -> Option[Handoff['k]] {
         return Option::None;
     }
     if args.len(&cx) == 2usize && (args.at(&cx, 1usize).is(&cx, "--help") || args.at(&cx, 1usize).is(&cx, "-h")) {
-        if command.is(&cx, "build") {
-            emit_buffer(Buffer!::new().push_static("Usage: kursal build PATH [-o OUTPUT] [--emit-c] [--single-c] [--times]\n\nBuild an executable at OUTPUT (default: a.out). --emit-c prints generated C instead.\nPATH is a package directory, kur.toml, or a .kur file. --times prints stage timings to stderr.\nWith Clang or GCC the C goes to OUTPUT.build, a file per module, compiled in parallel and\nlinked with link-time optimization; --single-c compiles it as one file, OUTPUT.c.\n"));
+        let (synopsis, details) = if command.is(&cx, "build") {
+            (BUILD, "Build an executable at OUTPUT (default: a.out). --emit-c prints generated C instead.\nPATH is a package directory, kur.toml, or a .kur file. --times prints stage timings to stderr.\nWith Clang or GCC the C goes to OUTPUT.build, a file per module, compiled in parallel and\nlinked with link-time optimization; --single-c compiles it as one file, OUTPUT.c.\n")
         } else if command.is(&cx, "doc") {
-            emit_buffer(Buffer!::new().push_static("Usage: kursal doc PATH -o DIR\n\nWrite the pages and search index of the public modules of PATH into DIR, which must not exist.\nDIR is the input directory of a Krayon site; the site supplies krayon.toml and the theme\n(docs/site in the Kursal repository).\n"));
+            (DOC, "Write the pages and search index of the public modules of PATH into DIR, which must not exist.\nDIR is the input directory of a Krayon site; the site supplies krayon.toml and the theme\n(docs/site in the Kursal repository).\n")
         } else if command.is(&cx, "c") {
-            emit_buffer(Buffer!::new().push_static("Usage: kursal c FILE [--entry NAME]\n\nGenerate C from serialized KURS.\n"));
+            (C_FILE, "Generate C from serialized KURS.\n")
         } else if command.is(&cx, "parse") {
-            emit_buffer(Buffer!::new().push_static("Usage: kursal parse FILE...\n\nPrint the syntax tree of each source file.\n"));
+            (PARSE, "Print the syntax tree of each source file.\n")
         } else if command.is(&cx, "resolve") {
-            emit_buffer(Buffer!::new().push_static("Usage: kursal resolve PATH\n\nPrint what each name in a package resolves to.\n"));
+            (RESOLVE, "Print what each name in a package resolves to.\n")
         } else if command.is(&cx, "sigs") {
-            emit_buffer(Buffer!::new().push_static("Usage: kursal sigs PATH\n\nPrint package signatures.\n"));
+            (SIGS, "Print package signatures.\n")
         } else if command.is(&cx, "infer") {
-            emit_buffer(Buffer!::new().push_static("Usage: kursal infer PATH\n\nPrint inferred function bodies.\n"));
+            (INFER, "Print inferred function bodies.\n")
         } else if command.is(&cx, "lower") {
-            emit_buffer(Buffer!::new().push_static("Usage: kursal lower PATH\n\nPrint a package as serialized KURS.\n"));
+            (LOWER, "Print a package as serialized KURS.\n")
         } else if command.is(&cx, "kurs") {
-            emit_buffer(Buffer!::new().push_static("Usage: kursal kurs FILE\n\nRead and print serialized KURS.\n"));
+            (KURS, "Read and print serialized KURS.\n")
         } else if command.is(&cx, "check") {
-            emit_buffer(Buffer!::new().push_static("Usage: kursal check FILE\n\nCheck serialized KURS.\n"));
+            (CHECK, "Check serialized KURS, printing nothing when it is sound.\n")
         } else if command.is(&cx, "readable") {
-            emit_buffer(Buffer!::new().push_static("Usage: kursal readable FILE\n\nPrint readable KURS.\n"));
+            (READABLE, "Print readable KURS.\n")
         } else {
-            fail(&cx, Buffer!::new().push_static("unknown command ").push_bytes(&cx, command).save(&cx));
-        }
+            unknown_command(&cx, command)
+        };
+        emit_buffer(Buffer!::new().push_static("usage: ").push_static(synopsis).push_static("\n\n").push_static(details));
         return Option::None;
     }
     if command.is(&cx, "parse") {
-        let ids = Ref::new(&cx, 0u32);
+        if args.len(&cx) == 1usize {
+            usage(PARSE);
+        }
         var i = 1usize;
+        while i < args.len(&cx) {
+            not_an_option(&cx, args.at(&cx, i), PARSE);
+            i = i + 1usize;
+        }
+        let ids = Ref::new(&cx, 0u32);
+        i = 1usize;
         while i < args.len(&cx) {
             let file = args.at(&cx, i);
             let source = read_file(&cx, file);
@@ -208,71 +220,134 @@ fn front_end(&cx: Domain!['k], process_args: Args) -> Option[Handoff['k]] {
     } else if command.is(&cx, "selftest-types") {
         selftest_types(&cx, args.skip(&cx, 1usize));
         Option::None
-    } else if command.is(&cx, "resolve") && args.len(&cx) == 2usize {
-        emit(&cx, resolve_dump::program(&cx, resolve(&cx, args.at(&cx, 1usize))));
+    } else if command.is(&cx, "resolve") {
+        emit(&cx, resolve_dump::program(&cx, resolve(&cx, operand(&cx, args, RESOLVE))));
         Option::None
-    } else if command.is(&cx, "sigs") && args.len(&cx) == 2usize {
-        emit(&cx, sigs_dump::program(&cx, signatures(&cx, resolve(&cx, args.at(&cx, 1usize)), Fresh::new(&cx))));
+    } else if command.is(&cx, "sigs") {
+        emit(&cx, sigs_dump::program(&cx, signatures(&cx, resolve(&cx, operand(&cx, args, SIGS)), Fresh::new(&cx))));
         Option::None
-    } else if command.is(&cx, "infer") && args.len(&cx) == 2usize {
+    } else if command.is(&cx, "infer") {
         let counter = Fresh::new(&cx);
-        let r = resolve(&cx, args.at(&cx, 1usize));
+        let r = resolve(&cx, operand(&cx, args, INFER));
         emit(&cx, infer_dump::program(&cx, infer(&cx, r, signatures(&cx, r, counter), counter)));
         Option::None
-    } else if command.is(&cx, "kurs") && args.len(&cx) == 2usize {
-        emit(&cx, write_program(&cx, parse_program(&cx, read_file(&cx, args.at(&cx, 1usize)))));
+    } else if command.is(&cx, "kurs") {
+        emit(&cx, write_program(&cx, parse_program(&cx, read_kurs(&cx, operand(&cx, args, KURS)))));
         Option::None
-    } else if command.is(&cx, "check") && args.len(&cx) == 2usize {
-        Option::Some.(Handoff.{ goal: Goal::Check, program: parse_program(&cx, read_file(&cx, args.at(&cx, 1usize))), counter: Fresh::new(&cx),
+    } else if command.is(&cx, "check") {
+        Option::Some.(Handoff.{ goal: Goal::Check, program: parse_program(&cx, read_kurs(&cx, operand(&cx, args, CHECK))), counter: Fresh::new(&cx),
             entry: Option::None, output: Option::None, link_flags: ArenaVec::new(&cx), c_sources: ArenaVec::new(&cx), single_c: true, times: false, started: Instant::now() })
     } else if command.is(&cx, "c") {
         var file: Option[Span['k]] = Option::None;
         var entry: Option[Span['k]] = Option::None;
         var i = 1usize;
         while i < args.len(&cx) {
-            if args.at(&cx, i).is(&cx, "--entry") && i + 1usize < args.len(&cx) {
+            let arg = args.at(&cx, i);
+            if arg.is(&cx, "--entry") {
+                if i + 1usize == args.len(&cx) || entry.is_some() {
+                    usage(C_FILE);
+                }
                 entry = Option::Some.(args.at(&cx, i + 1usize));
                 i = i + 2usize;
-            } else if file.is_none() {
-                file = Option::Some.(args.at(&cx, i));
-                i = i + 1usize;
             } else {
-                fail(&cx, Span::from_static(&cx, "usage: kursal c FILE [--entry NAME]"));
+                not_an_option(&cx, arg, C_FILE);
+                if file.is_some() {
+                    usage(C_FILE);
+                }
+                file = Option::Some.(arg);
+                i = i + 1usize;
             }
         }
         let path = match file {
             Some(f) => f,
-            None => fail(&cx, Span::from_static(&cx, "usage: kursal c FILE [--entry NAME]")),
+            None => usage(C_FILE),
         };
-        Option::Some.(Handoff.{ goal: Goal::C, program: parse_program(&cx, read_file(&cx, path)), counter: Fresh::new(&cx),
+        Option::Some.(Handoff.{ goal: Goal::C, program: parse_program(&cx, read_kurs(&cx, path)), counter: Fresh::new(&cx),
             entry, output: Option::None, link_flags: ArenaVec::new(&cx), c_sources: ArenaVec::new(&cx), single_c: true, times: false, started: Instant::now() })
-    } else if command.is(&cx, "lower") && args.len(&cx) == 2usize {
+    } else if command.is(&cx, "lower") {
         let counter = Fresh::new(&cx);
-        let r = resolve(&cx, args.at(&cx, 1usize));
+        let r = resolve(&cx, operand(&cx, args, LOWER));
         emit(&cx, write_program(&cx, lower(&cx, r, signatures(&cx, r, counter), counter)));
         Option::None
     } else if command.is(&cx, "doc") {
         if args.len(&cx) != 4usize || !args.at(&cx, 2usize).is(&cx, "-o") {
-            fail(&cx, Span::from_static(&cx, "usage: kursal doc PATH -o DIR"));
+            usage(DOC);
         }
+        not_an_option(&cx, args.at(&cx, 1usize), DOC);
+        not_an_option(&cx, args.at(&cx, 3usize), DOC);
         generate(&cx, resolve(&cx, args.at(&cx, 1usize)), args.at(&cx, 3usize));
         Option::None
     } else if command.is(&cx, "build") {
         Option::Some.(build(&cx, args.skip(&cx, 1usize)))
-    } else if command.is(&cx, "readable") && args.len(&cx) == 2usize {
-        emit(&cx, emit_kurs(&cx, parse_program(&cx, read_file(&cx, args.at(&cx, 1usize)))));
+    } else if command.is(&cx, "readable") {
+        emit(&cx, emit_kurs(&cx, parse_program(&cx, read_kurs(&cx, operand(&cx, args, READABLE)))));
         Option::None
     } else {
-        fail(&cx, Buffer!::new().push_static("unknown command ").push_bytes(&cx, command).save(&cx))
+        unknown_command(&cx, command)
     }
+}
+
+// The synopsis of each command, for its --help and its usage errors.
+const BUILD: Slice[u8, 'static] = "kursal build PATH [-o OUTPUT] [--emit-c] [--single-c] [--times]";
+const DOC: Slice[u8, 'static] = "kursal doc PATH -o DIR";
+const PARSE: Slice[u8, 'static] = "kursal parse FILE...";
+const RESOLVE: Slice[u8, 'static] = "kursal resolve PATH";
+const SIGS: Slice[u8, 'static] = "kursal sigs PATH";
+const INFER: Slice[u8, 'static] = "kursal infer PATH";
+const LOWER: Slice[u8, 'static] = "kursal lower PATH";
+const KURS: Slice[u8, 'static] = "kursal kurs FILE";
+const CHECK: Slice[u8, 'static] = "kursal check FILE";
+const C_FILE: Slice[u8, 'static] = "kursal c FILE [--entry NAME]";
+const READABLE: Slice[u8, 'static] = "kursal readable FILE";
+
+// Stops the compiler for a command line it cannot run, with status 2: `synopsis` is the command's.
+fn usage(synopsis: Slice[u8, 'static]) -> ! {
+    eprint_buffer(Buffer!::new().push_static("usage: ").push_static(synopsis).push_static("\n"));
+    exit(2)
+}
+
+forall 'k.
+fn unknown_command(&cx: Domain!['k], command: Span['k]) -> ! {
+    eprint_buffer(Buffer!::new().push_static("unknown command ").push_bytes(&cx, command).push_static("\nRun kursal --help for commands.\n"));
+    exit(2)
+}
+
+// A usage error when `arg` is an option, which the command, as `synopsis` spells it, does not take
+// there: an argument that starts with `-` and is more than `-`.
+forall 'k.
+fn not_an_option(&cx: Domain!['k], arg: Span['k], synopsis: Slice[u8, 'static]) {
+    if arg.len() > 1usize && arg.byte_or_zero(&cx, 0usize) == b'-' {
+        eprint_buffer(Buffer!::new().push_static("unknown option ").push_bytes(&cx, arg).push_static("\nusage: ").push_static(synopsis).push_static("\n"));
+        exit(2);
+    }
+}
+
+// The one operand of a command that takes one, as `synopsis` spells it.
+forall 'k.
+fn operand(&cx: Domain!['k], args: ArenaVec[Span['k], 'k], synopsis: Slice[u8, 'static]) -> Span['k] {
+    if args.len(&cx) != 2usize {
+        usage(synopsis);
+    }
+    not_an_option(&cx, args.at(&cx, 1usize), synopsis);
+    args.at(&cx, 1usize)
 }
 
 forall 'k.
 fn read_file(&cx: Domain!['k], file: Span['k]) -> Span['k] {
     match read_to_arena(&cx, file) {
         Ok(s) => s,
-        Err(e) => fail(&cx, Buffer!::new().push_static("cannot read ").push_bytes(&cx, file).save(&cx)),
+        Err(e) => fail(&cx, Buffer!::new().push_static("cannot read ").push_bytes(&cx, file).push_static(" (error ").push_i64(e.errno as i64).push_static(")").save(&cx)),
     }
+}
+
+// The text of a KURS file, which is UTF-8.
+forall 'k.
+fn read_kurs(&cx: Domain!['k], file: Span['k]) -> Span['k] {
+    let text = read_file(&cx, file);
+    if !validate(&cx, text) {
+        fail(&cx, Buffer!::new().push_bytes(&cx, file).push_static(" is not UTF-8 text").save(&cx));
+    }
+    text
 }
 
 // The time since `started` as `NAME: 1500ms` on stderr, when `times`. Restart the clock
@@ -299,31 +374,38 @@ fn build(&cx: Domain!['k], args: ArenaVec[Span['k], 'k]) -> Handoff['k] {
     var single_c = false;
     var i = 0usize;
     while i < args.len(&cx) {
-        if args.at(&cx, i).is(&cx, "--times") {
+        let arg = args.at(&cx, i);
+        if arg.is(&cx, "--times") {
             times = true;
             i = i + 1usize;
-        } else if args.at(&cx, i).is(&cx, "--emit-c") {
+        } else if arg.is(&cx, "--emit-c") {
             emit_c_only = true;
             i = i + 1usize;
-        } else if args.at(&cx, i).is(&cx, "--single-c") {
+        } else if arg.is(&cx, "--single-c") {
             single_c = true;
             i = i + 1usize;
-        } else if args.at(&cx, i).is(&cx, "-o") && i + 1usize < args.len(&cx) && output.is_none() {
+        } else if arg.is(&cx, "-o") {
+            if i + 1usize == args.len(&cx) || output.is_some() {
+                usage(BUILD);
+            }
             output = Option::Some.(args.at(&cx, i + 1usize));
             i = i + 2usize;
-        } else if path.is_none() {
-            path = Option::Some.(args.at(&cx, i));
-            i = i + 1usize;
         } else {
-            fail(&cx, Span::from_static(&cx, "usage: kursal build PATH [-o OUTPUT] [--emit-c] [--single-c] [--times]"));
+            not_an_option(&cx, arg, BUILD);
+            if path.is_some() {
+                usage(BUILD);
+            }
+            path = Option::Some.(arg);
+            i = i + 1usize;
         }
     }
     let package = match path {
         Some(p) => p,
-        None => fail(&cx, Span::from_static(&cx, "usage: kursal build PATH [-o OUTPUT] [--emit-c] [--single-c] [--times]")),
+        None => usage(BUILD),
     };
-    if emit_c_only && !output.is_none() {
-        fail(&cx, Span::from_static(&cx, "--emit-c and -o cannot be used together"));
+    if emit_c_only && output.is_some() {
+        eprint_buffer(Buffer!::new().push_static("--emit-c and -o cannot be used together\nusage: ").push_static(BUILD).push_static("\n"));
+        exit(2);
     }
     var started = Instant::now();
     let counter = Fresh::new(&cx);

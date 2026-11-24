@@ -1053,7 +1053,6 @@ class Backend:
             self.store_in_place(a[0], self.blocks[self.label].instrs[self.index - 1])
             return
         dst = self.value_name(instr.lhs[0]) if len(instr.lhs) == 1 and not self.erased(self.type_of(instr.lhs[0])) else None
-        substitute_type = self.substitute_type
         if op == "const":
             assert isinstance(instr.ty, Prim) and instr.lit is not None
             self.line(f"{dst} = {self.literal(instr.ty, instr.lit)};")

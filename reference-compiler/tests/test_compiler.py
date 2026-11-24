@@ -1336,6 +1336,11 @@ KURS_ERRORS = (
     # There is no extern value.
     "(extern value errno i32)",
     "(extern fun f u32)",
+    # A \x escape is two hex digits of an ASCII character.
+    '(data d (array u8 1) ("\\xzz"))',
+    '(data d (array u8 1) ("\\x4"))',
+    '(data d (array u8 1) ("\\x80"))',
+    "(" * 300,
 )
 
 
@@ -1912,6 +1917,55 @@ class CompilerTests(unittest.TestCase):
         self.assertEqual(short.stderr.count("\n"), 1)
         self.assertIn("type_mismatch.kur:6:22: type mismatch", short.stderr)
 
+    def test_misused_command_lines(self):
+        """A command line no command takes: its usage on stderr, with status 2."""
+        build = "usage: kursal build PATH [-o OUTPUT] [--emit-c] [--single-c] [--times]\n"
+        cases = [((), "Kursal compiler\n\n" + build + "       kursal COMMAND --help\n\nRun kursal --help for commands.\n"),
+                 (("frob",), "unknown command frob\nRun kursal --help for commands.\n"),
+                 (("frob", "--help"), "unknown command frob\nRun kursal --help for commands.\n"),
+                 (("parse",), "usage: kursal parse FILE...\n"),
+                 (("build",), build),
+                 (("build", "--bogus"), "unknown option --bogus\n" + build),
+                 (("build", "a", "b"), build),
+                 (("build", "a", "-o"), build),
+                 (("build", "a", "--emit-c", "-o", "b"), "--emit-c and -o cannot be used together\n" + build),
+                 (("c",), "usage: kursal c FILE [--entry NAME]\n"),
+                 (("c", "a", "--entry"), "usage: kursal c FILE [--entry NAME]\n"),
+                 (("c", "-x"), "unknown option -x\nusage: kursal c FILE [--entry NAME]\n"),
+                 (("doc", "a"), "usage: kursal doc PATH -o DIR\n")]
+        for command in ("resolve", "sigs", "infer", "lower"):
+            cases += [((command,), f"usage: kursal {command} PATH\n"), ((command, "a", "b"), f"usage: kursal {command} PATH\n")]
+        for command in ("kurs", "check", "readable"):
+            cases += [((command,), f"usage: kursal {command} FILE\n"),
+                      ((command, "--fast"), f"unknown option --fast\nusage: kursal {command} FILE\n")]
+        for args, stderr in cases:
+            with self.subTest(args=args):
+                result = self.run_compiler(*args)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (2, "", stderr))
+
+    def test_help_lists_the_commands_in_columns(self):
+        listed = self.run_compiler("--help").stdout.partition("Commands:\n")[2].partition("\n\n")[0].splitlines()
+        self.assertEqual(len(listed), 11)
+        self.assertEqual({len(line) - len(line[2:].split("  ")[-1].lstrip()) for line in listed}, {25})
+
+    def test_kurs_files_are_read_as_the_reference_reads_them(self):
+        """`kursal check FILE` and `python -m kursal FILE`: nothing for a sound program; the same message, with
+        status 1, for a file neither can read, one that is not UTF-8, and one each rejects."""
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            (base / "sound.kurs").write_text("(fun f u32 () (entry () (= %r (const u32 0)) (ret %r)))")
+            (base / "unsound.kurs").write_text("(fun f u32 () (entry () (ret %r)))")
+            (base / "latin1.kurs").write_bytes(b'(data d (array u8 1) ("\xe9"))')
+            (base / "deep.kurs").write_text("(" * 100_000 + ")" * 100_000)
+            for name in ("sound.kurs", "unsound.kurs", "missing.kurs", "latin1.kurs", "deep.kurs"):
+                with self.subTest(file=name):
+                    ours = self.run_compiler("check", str(base / name))
+                    reference = subprocess.run([sys.executable, "-m", "kursal", str(base / name)], capture_output=True,
+                                               text=True, timeout=TIME_LIMIT, cwd=ROOT / "reference-compiler")
+                    self.assertEqual((ours.returncode, ours.stdout, ours.stderr),
+                                     (reference.returncode, reference.stdout, reference.stderr))
+                    self.assertEqual(ours.returncode, 0 if name == "sound.kurs" else 1)
+
     def test_dependency_native_sources_and_link_flags_reach_the_c_compiler(self):
         """A library's C source and link requirement are used by both executable build commands."""
         with tempfile.TemporaryDirectory() as directory:
@@ -2245,6 +2299,22 @@ class CompilerTests(unittest.TestCase):
                                     stderr=subprocess.PIPE, text=True, timeout=TIME_LIMIT, preexec_fn=limit_memory,
                                     env=dict(os.environ, KURSAL_LIB=str(LIB)))
         self.assertEqual((result.returncode, result.stderr), (1, "cannot write the output\n"))
+
+    def test_a_package_without_an_entry_is_not_built(self):
+        """`kursal build` and tools/build.py of a library: status 1 and a message, no traceback."""
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory) / "shelf"
+            package.mkdir()
+            (package / "kur.toml").write_text(manifest("shelf"))
+            (package / "lib.kur").write_text("fn half(n: u32) -> u32 { n / 2u32 }\n")
+            ours = self.run_compiler("build", str(package), "-o", str(Path(directory) / "ours"))
+            reference = subprocess.run([sys.executable, str(ROOT / "reference-compiler/tools/build.py"), str(package),
+                                        str(Path(directory) / "reference")],
+                                       capture_output=True, text=True, timeout=TIME_LIMIT, env=dict(os.environ, KURSAL_LIB=str(LIB)))
+            self.assertEqual((ours.returncode, ours.stdout, ours.stderr),
+                             (1, "", "this package has no executable entry; use --emit-c to print its C\n"))
+            self.assertEqual((reference.returncode, reference.stdout, reference.stderr),
+                             (1, "", "this package has no executable entry\n"))
 
     def test_a_failed_c_compiler_is_reported_as_the_reference_reports_it(self):
         """`kursal build` and tools/build.py with a C compiler that cannot run, exits with a failure or is

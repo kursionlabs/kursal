@@ -1,4 +1,8 @@
-"""python3 -m kursal FILE.kurs [--emit-c | --emit-kurs] [--entry NAME] [-o OUT]"""
+"""python3 -m kursal FILE.kurs [--emit-c | --emit-kurs] [--entry NAME] [-o OUT]
+
+Checks serialized KURS, printing nothing when it is sound; with --emit-c or --emit-kurs, also prints
+its C or its readable form. An error goes to stderr, with status 1; a misused command line has status 2.
+"""
 
 from collections.abc import Sequence
 import argparse
@@ -30,24 +34,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("-o", metavar="OUTPUT")
     args = parser.parse_args(argv, namespace=Arguments())
     try:
-        with open(args.file) as f:
-            program = parse_program(f.read())
+        with open(args.file, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        return failure(f"cannot read {args.file} (error {e.errno})")
+    try:
+        text = data.decode()
+    except UnicodeDecodeError:
+        return failure(f"{args.file} is not UTF-8 text")
+    try:
+        program = parse_program(text)
         checker = check_program(program)
         if args.emit_c:
             output = emit_c(program, checker, args.entry)
         elif args.emit_kurs:
             output = emit_kurs(program)
         else:
-            output = f"{args.file}: OK\n"
-    except (KursError, OSError) as e:
-        print(f"{args.file}: {e}", file=sys.stderr)
-        return 1
+            return 0
+    except KursError as e:
+        return failure(str(e))
     if args.o:
-        with open(args.o, "w") as f:
-            f.write(output)
+        try:
+            with open(args.o, "w") as f:
+                f.write(output)
+        except OSError as e:
+            return failure(f"cannot write {args.o} (error {e.errno})")
     else:
         sys.stdout.write(output)
     return 0
+
+
+def failure(message: str) -> int:
+    """Reports `message` and gives the status of a program that fails: 1."""
+    print(message, file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":

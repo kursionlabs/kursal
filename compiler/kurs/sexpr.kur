@@ -42,13 +42,6 @@ impl Form['k] {
         }
     }
 
-    fn is_atom(self) -> bool {
-        match self.kind {
-            Atom => true,
-            _ => false,
-        }
-    }
-
     fn len(self, &cx: Domain!['k]) -> usize {
         self.items.len(&cx)
     }
@@ -67,6 +60,10 @@ forall 'k.
 fn fail_at(&cx: Domain!['k], message: Slice[u8, 'static], pos: Pos) -> ! {
     fail(&cx, located(&cx, Span::from_static(&cx, message), pos))
 }
+
+// Lists nest at most this deep. Every phase after the reader recurses into nested lists, so deeper
+// input would exhaust its stack.
+const MAX_DEPTH: usize = 256usize;
 
 // Every top-level form of `source`, as one list.
 forall 'k.
@@ -92,6 +89,10 @@ fn read(&cx: Domain!['k], source: Span['k]) -> Form['k] {
                 i = i + 1usize;
             }
         } else if c == b'(' {
+            let open = &stack.len();
+            if open > MAX_DEPTH {
+                fail_at(&cx, "lists nest deeper than 256", pos);
+            }
             let form = Form.{ kind: FormKind::List, text: Span::from_static(&cx, ""), items: ArenaVec::new(&cx), pos };
             innermost(&stack).items.push(&cx, form);
             stack = stack.push(form);
@@ -112,7 +113,17 @@ fn read(&cx: Domain!['k], source: Span['k]) -> Form['k] {
             while j < n && source.byte_or_zero(&cx, j) != b'"' {
                 let d = source.byte_or_zero(&cx, j);
                 if d == b'\\' && source.byte_or_zero(&cx, j + 1usize) == b'x' {
-                    chars = chars.push_byte(hex(source.byte_or_zero(&cx, j + 2usize)) * 16u8 + hex(source.byte_or_zero(&cx, j + 3usize)));
+                    // An ASCII character: a string is UTF-8 text, and any other character is written as itself.
+                    let high = source.byte_or_zero(&cx, j + 2usize);
+                    let low = source.byte_or_zero(&cx, j + 3usize);
+                    if j + 3usize >= n || !is_hex(high) || !is_hex(low) {
+                        fail_at(&cx, "a \\x escape needs two hex digits in a string literal", pos);
+                    }
+                    let byte = hex(high) * 16u8 + hex(low);
+                    if byte >= 128u8 {
+                        fail_at(&cx, "a \\x escape is at most 7f in a string literal", pos);
+                    }
+                    chars = chars.push_byte(byte);
                     j = j + 4usize;
                 } else if d == b'\\' {
                     let e = source.byte_or_zero(&cx, j + 1usize);
@@ -170,6 +181,10 @@ fn innermost(&stack: OwnedVec![Form['k]]) -> Form['k] {
 
 fn is_delimiter(c: u8) -> bool {
     c == b' ' || c == b'\t' || c == b'\r' || c == b'\n' || c == b'(' || c == b')' || c == b';' || c == b'"'
+}
+
+fn is_hex(c: u8) -> bool {
+    (c >= b'0' && c <= b'9') || (c >= b'a' && c <= b'f') || (c >= b'A' && c <= b'F')
 }
 
 fn hex(c: u8) -> u8 {

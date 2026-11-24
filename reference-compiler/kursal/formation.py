@@ -139,7 +139,7 @@ class Formation:
                         mentioned = set().union(*(free_names(a) for a in args))
                         if any(n == name and (mentioned & set(self.opened[depth:]) or not nominal_descent(args, previous))
                                for n, previous, depth in self.active):
-                            self.fail(f"non-descending nominal premise formation for {name}")
+                            self.fail(f"the premises of {name} require {name} again at arguments that are not smaller")
                         self.active.append((name, args, len(self.opened)))
                         try:
                             sub = dict(zip((p.name for p in decl.params), args))

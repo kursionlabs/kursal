@@ -47,7 +47,7 @@ class NominalPremiseTests(unittest.TestCase):
     def test_recursive_nominal_constraints_fail_without_unbounded_search(self):
         for payload in ('(Loop T)', '(Loop (tuple T T))'):
             with self.subTest(payload=payload):
-                with self.assertRaisesRegex(KursError, 'non-descending nominal premise'):
+                with self.assertRaisesRegex(KursError, 'require .* again at arguments that are not smaller'):
                     check_program(parse_program('(trait P (T)) '
                         '(type Loop (forall (T) ((P ' + payload + ')) (tuple)))'))
 

@@ -2,7 +2,6 @@
 
 import unittest
 
-from kursal import core as C
 from kursal.check import check_program
 from kursal.kurs import parse_program
 from kursal.lower import lower

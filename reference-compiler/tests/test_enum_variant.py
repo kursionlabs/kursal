@@ -7,12 +7,10 @@ from kursal.infer import InferError
 from kursal.lower import LowerError, lower
 from kursal.resolve import resolve
 from kursal.sigs import signatures
-from kursal.check import check_program
-from kursal.cgen import emit_c
 from kursal.placeflow import OwnershipError
 from kursal.sexpr import KursError
 from tests import test_closure_boundary
-from tests.test_lower import write, compile_and_run
+from tests.test_lower import write
 
 
 class EnumVariantTests(unittest.TestCase):

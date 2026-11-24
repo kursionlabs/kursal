@@ -41,12 +41,15 @@ def build(package: Path, output: Path, times: bool, kurs: Optional[Path] = None)
     stage("signatures")
     program = lower(resolver, sigs)
     stage("lower")
+    entry = resolver.packages[0].entry_decl
+    if entry is None:
+        raise SystemExit("this package has no executable entry")
     if kurs is not None:
         kurs.write_text(write_program(program))
         stage("KURS")
     facts = check_program(program)
     stage("check")
-    c_text = emit_c(program, facts, sigs.name(resolver.packages[0].entry_decl), hosted=True)
+    c_text = emit_c(program, facts, sigs.name(entry), hosted=True)
     stage("C")
     c_file = output.with_name(output.name + ".c")
     c_file.write_text(c_text)
