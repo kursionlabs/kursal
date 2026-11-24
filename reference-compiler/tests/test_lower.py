@@ -507,8 +507,8 @@ class LoweringTests(unittest.TestCase):
             path.write_text("use std::buffer::Buffer!;\nuse std::io::print_buffer;\nfn main() {\n"
                             "    let name = Buffer!::new().push_static(\"x\");\n    print_buffer(f\"hi {name}\\n\");\n}\n")
             resolver = resolve(path)
-            with self.assertRaisesRegex(KursError, r"fstr_lin\.kur:5:24: \{x\} in an f-string drops a linear value; "
-                                                   r"lend it with \{&x\}$"):
+            with self.assertRaisesRegex(KursError, r"fstr_lin\.kur:5:24: \{name\} in an f-string drops a linear value; "
+                                                   r"lend it with \{&name\}$"):
                 lower(resolver, signatures(resolver))
 
     def test_match_payloads_bind_values_and_alias_places(self):

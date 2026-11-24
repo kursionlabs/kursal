@@ -119,7 +119,7 @@ class ExposureTests(unittest.TestCase):
 
     def test_inference_requires_and_forwards_exact_assumptions(self):
         requirement = "forall T where Exposed[T]. fn need(x: T) -> T { x }\n"
-        with self.assertRaisesRegex(KursError, "Exposed requires"):
+        with self.assertRaisesRegex(KursError, "is not visible here: write `where Exposed\\["):
             run(requirement + "forall T. fn bad(x: T) -> T { need[T](x) }")
         run(requirement + "forall T where Exposed[T]. fn forward(x: T) -> T { need[T](x) }")
         run(requirement + "fn concrete(x: u32) -> u32 { need[u32](x) }")

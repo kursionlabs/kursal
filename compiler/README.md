@@ -1006,9 +1006,9 @@ These are the places where Kursal differs from what one might expect.
   parameter (`&x: T`, `&self`), or a binder of a case of a lent match. A `let` never changes after it
   is bound (`a is not a var; a lent place must be a var`), nor does a parameter taken by value,
   `self` included, nor the binder of a case of a match on a value: such a value is lent after
-  `var x = x;`. A closure or `foreach` body holds a copy of what it captures, so it neither assigns
-  nor lends a captured name, a `var` included (`a is captured as a copy, which cannot be lent`); it
-  takes a place parameter instead. `var` binds what `let` binds, and every name it binds is a var:
+  `var x = x;` (`var self = self;`). A closure or `foreach` body holds its own value of what it captures, a copy or the
+  value moved in, so it neither assigns nor lends a captured name, a `var` included (`a is captured,
+  and a body cannot lend what it captures; ...`); it takes a place parameter instead. `var` binds what `let` binds, and every name it binds is a var:
   `var (tag, arena) = ...;`, `var { x, ..rest } = p;`, `var [a, b] = xs;`,
   `var exists 'k. (tag, arena) = Arena!::new(seed);`.
 - **Brands.** `forall 'k.` binds a brand like a type parameter, and a type that holds branded storage

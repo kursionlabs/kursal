@@ -68,6 +68,9 @@ INFERENCES = (
     "forall T. fn pass(x: exists 'a. (core::cap::Brand['a], T)) -> T {\n                let exists 'a. (witness, value) = x;\n                value\n            }\n            fn main() -> i32 {\n                let exists 'a. witness = core::cap::fresh();\n                pass(pack 'a. (witness, 7i32))\n            }",
     'exposed struct Token! { n: i32 }\n            forall T. fn pass(x: T, flag: bool) -> T {\n                let pair = (x, if flag { 1u32 } else { 2u32 });\n                let (value, count) = pair;\n                if count == 1u32 { value } else { value }\n            }\n            fn main() -> i32 {\n                let { n } = pass(Token!.{ n: 7i32 }, true);\n                n\n            }',
     'forall T. fn bad(x: T) -> () { var x = x; match &x { _ => () } } fn main() -> i32 { 7i32 }',
+    # A receiver taken by value is lent once it is a var, as any parameter is.
+    'exposed struct C { n: u32 }\nimpl C {\n    fn bump(&self) -> u32 { self.n = self.n + 1u32; self.n }\n'
+    '    fn twice(self) -> u32 { var self = self; let a = &self.bump(); &self.bump() + a }\n}\n',
     'forall T where Copy[T]. fn bad(x: T) -> () { var x = x; match &x { _ => () } } fn main() -> i32 { 7i32 }',
     'fn bad(x: bool) -> f32 { unsafe ((x as u32) as f32) } fn main() -> i32 { 0i32 }',
     "fn bad(x: u32) -> exists 'a. core::cap::Brand['a] { unsafe (x as exists 'a. core::cap::Brand['a]) } fn main() -> i32 { 0i32 }",
@@ -228,6 +231,12 @@ INFER_ERRORS = (
     ('exposed enum E { A(u32), B }\nfn f(e: E) -> u32 { match e { E::A(x, y) => x, _ => 0u32 } }\n', 'does not carry 2 values'),
     ("fn f() -> u32 { var x: u32 = pack 'static. 1u32; x }\n", 'pack does not match'),
     ('fn f(x: u32) -> u32 { let y = &x; 0u32 }\n', '& lends a place only'),
+    # A lend is a way to pass a place: in parentheses it is no receiver, for a local or a raw pointer's target.
+    ('exposed struct C { n: u32 }\nimpl C { fn get(&self) -> u32 { self.n } }\nfn f(p: *C) -> u32 { (unsafe &*p).get() }\n',
+     "3:23: a lend in parentheses is no receiver: a local's or a field's is lent as `&x.m()`, and a raw pointer's target "
+     "as an argument, `T::m(unsafe &*p)`"),
+    ('exposed struct C { n: u32 }\nimpl C { fn get(&self) -> u32 { self.n } }\nfn f(c: C) -> u32 { var d = c; (&d).get() }\n',
+     "3:33: a lend in parentheses is no receiver"),
     ('exposed struct K { env: (), code: u32 }\nfn f(k: K) -> u32 { k(1u32) }\n', 'must have a function type'),
     ('fn g(x: u32) -> u32 { x }\nfn f() -> u32 { g(1u32, 2u32) }\n', 'expected 1 argument, got 2'),
     ('trait Show { fn show(x: Self) -> u32; }\nforall T. fn f(x: T) -> u32 { T::show(x) }\n', 'needs exactly one bound'),
@@ -286,7 +295,7 @@ INFER_ERRORS = (
     ('exposed enum E { A } fn main() -> i32 { let tag = core::mem::enum_variant(&E::A); 0i32 }', 'enum_variant(&place) requires a'),
     ("\n            fn bad(p: exists 'x, 'y. (core::cap::Brand['x], core::cap::Brand['y])) -> u32 {\n                let exists 'a, 'a. (x, y) = p;\n                0u32\n            }\n            fn main() -> i32 { 0i32 }\n            ", 'an existential opening'),
     ("fn main() -> i32 {\n                let p = pack 'missing. 7u32;\n                0i32\n            }", 'pack brand missing'),
-    ('\nforall T. exposed enum Opt { Some(T), None }\nforall T, E. exposed enum Res { Ok(T), Err(E) }\nexposed struct Cur { pos: u32 }\nimpl Cur {\n    fn bump(&self, by: u32) -> u32 { by }\n    fn get(self) -> u32 { 0u32 }\n}\nforall Self -> Item. trait Next { fn step(&it: Self) -> Opt[Item]; }\ninstance Next[Cur -> u32] { fn step(&it: Cur) -> Opt[u32] { Opt::None } }\nforall T. fn id(x: T) -> T { x }\nforall T where Exposed[T]. fn need(x: T) -> T { x }\nforall T. fn bad(x: T) -> T { need[T](x) }', 'Exposed requires an'),
+    ('\nforall T. exposed enum Opt { Some(T), None }\nforall T, E. exposed enum Res { Ok(T), Err(E) }\nexposed struct Cur { pos: u32 }\nimpl Cur {\n    fn bump(&self, by: u32) -> u32 { by }\n    fn get(self) -> u32 { 0u32 }\n}\nforall Self -> Item. trait Next { fn step(&it: Self) -> Opt[Item]; }\ninstance Next[Cur -> u32] { fn step(&it: Cur) -> Opt[u32] { Opt::None } }\nforall T. fn id(x: T) -> T { x }\nforall T where Exposed[T]. fn need(x: T) -> T { x }\nforall T. fn bad(x: T) -> T { need[T](x) }', 'the shape of T is not visible here: write `where Exposed[T]`, or expose its declaration to this module'),
     ('forall T. fn id(x: T) -> T { x }\n    forall T. exposed struct Box { value: T }\n    forall T. impl Box[T] { fn get(self: Box[T]) -> T { self.value } }\nfn main() -> i32 { Box[i32, bool]::get(Box.{ value: 7i32 }) }', 'the impl type'),
     ('forall T. fn id(x: T) -> T { x }\n    forall T. exposed struct Box { value: T }\n    forall T. impl Box[T] { fn get(self: Box[T]) -> T { self.value } }\nfn main() -> i32 { let f = id[i32]; f[bool](7i32) }', 'explicit type arguments'),
     ('forall T. fn id(x: T) -> T { x }\n    forall T. exposed struct Box { value: T }\n    forall T. impl Box[T] { fn get(self: Box[T]) -> T { self.value } }\nfn main() -> i32 { id[i32, bool](7i32) }', 'id takes 1'),
@@ -352,6 +361,15 @@ INFER_ERRORS = (
      "2:5: let exists 'k reuses a brand already in scope"),
     ("fn f() -> u32 {\n    let exists 'static. y = core::cap::fresh();\n    0u32\n}\n",
      "2:5: let exists 'static reuses a brand already in scope"),
+    # A foreach body runs once for each component, so what it captures is Copy.
+    ("struct H! { n: u32 }\nfn take(h: H!) -> u32 { let { n } = h; n }\nfn f(h: H!) -> u32 {\n"
+     "    let parts = foreach x of (1u32, 2u32) { let n = take(h); x };\n    let (a, b) = parts;\n    a + b\n}\n",
+     "4:58: h is captured by a foreach body, which runs once for each component: a capture must be Copy"),
+    ("forall T. fn f(t: T) -> u32 {\n    let parts = foreach x of (1u32, 2u32) { let u = t; x };\n    0u32\n}\n",
+     "2:53: t is captured by a foreach body, which runs once for each component: a capture must be Copy"),
+    # The message names the form written.
+    ("fn f() -> u32 {\n    var exists 'a. x = core::cap::fresh();\n    var exists 'a. y = core::cap::fresh();\n    0u32\n}\n",
+     "3:5: var exists 'a reuses a brand already in scope"),
     ("fn f() -> u32 {\n    let exists 'k. x = core::cap::fresh();\n    let y = {\n        let exists 'k. z = core::cap::fresh();\n        0u32\n    };\n    y\n}\n",
      "4:9: let exists 'k reuses a brand already in scope"),
     ("forall T, 'k. exposed struct Ref { ptr: *T, marker: core::cap::Brand['k] }\n"
@@ -446,9 +464,9 @@ INFER_ERRORS = (
      "fn f() -> u32 { let a = C.{ n: 0u32 }; &a.tick() }\n", "3:41: a is not a var; a lent place must be a var"),
     ("exposed struct C { n: u32 }\nfn g(&c: C) -> u32 { c.n }\nfn f(c: C) -> u32 { g(&c) }\n",
      "3:24: c is not a var; a lent place must be a var"),
-    ("fn f() -> u32 { var a = 1u32; let g = || { a = 2u32; a }; g() }\n", "1:44: a is captured as a copy, which cannot be assigned"),
+    ("fn f() -> u32 { var a = 1u32; let g = || { a = 2u32; a }; g() }\n", "1:44: a is captured, and a body cannot assign what it captures; assign it outside, or give a closure a place parameter for it"),
     ("exposed struct C { n: u32 }\nimpl C { fn tick(&self) -> u32 { self.n } }\n"
-     "fn f() -> u32 { var a = C.{ n: 0u32 }; let g = || &a.tick(); g() }\n", "3:52: a is captured as a copy, which cannot be lent"),
+     "fn f() -> u32 { var a = C.{ n: 0u32 }; let g = || &a.tick(); g() }\n", "3:52: a is captured, and a body cannot lend what it captures; lend it outside, or give a closure a place parameter for it"),
     # An `if` without `else` has type ().
     ("fn f(c: bool) -> u32 { if c { 1u32 } }\n", "1:24: an `if` without `else` has type (), but its block has type u32"),
     # A closure type reads as source writes it.

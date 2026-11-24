@@ -37,6 +37,47 @@ use std::collections::hashmap::OwnedMap!;
 use std::option::Option;
 use std::slice::Slice;
 
+// `e` as written, when it is a name and fields, `x` or `x.a.0`.
+forall 'k.
+fn written_place(&cx: Domain!['k], e: Expr['k]) -> Option[Span['k]] {
+    match e {
+        Path(p) => if p.segments.len(&cx) == 1usize && p.segments.at(&cx, 0usize).args.is_empty(&cx) {
+            Option::Some.(p.segments.at(&cx, 0usize).name)
+        } else {
+            Option::None
+        },
+        Field(f) => match written_place(&cx, f.value.copy(&cx)) {
+            Some(inner) => Option::Some.(Buffer!::new().push_bytes(&cx, inner).push_static(".").push_bytes(&cx, f.name).save(&cx)),
+            None => Option::None,
+        },
+        _ => Option::None,
+    }
+}
+
+// An operation that needs unsafe, as the source writes it: a read, a write, a volatile access or an
+// atomic one through a raw pointer, or a call of `alloca`, `static_brand` or `fence`. A cast is not
+// here: `expr_cast` says which casts need unsafe where the cast is written.
+forall 'k.
+fn unsafe_written(&cx: Domain!['k], op: Span['k]) -> Slice[u8, 'static] {
+    if op.is(&cx, "ptr_load") {
+        "reading through a raw pointer"
+    } else if op.is(&cx, "ptr_store") {
+        "writing through a raw pointer"
+    } else if op.is(&cx, "ptr_load_volatile") {
+        "a volatile read through a raw pointer"
+    } else if op.is(&cx, "ptr_store_volatile") {
+        "a volatile write through a raw pointer"
+    } else if op.is(&cx, "alloca") {
+        "calling alloca"
+    } else if op.is(&cx, "static_brand") {
+        "calling static_brand"
+    } else if op.is(&cx, "fence") {
+        "calling fence"
+    } else {
+        "an atomic access through a raw pointer"
+    }
+}
+
 // An `Ordering` variant's core spelling.
 forall 'k.
 fn ordering_name(&cx: Domain!['k], variant: Span['k]) -> Option[Slice[u8, 'static]] {
@@ -249,66 +290,85 @@ impl Lowering['k] {
     // parameter has a memory form, the result holds nothing only checked code makes and no layout the
     // compiler chooses and is zero-size only if it is Copy, and every function type in it is an
     // `unsafe fn` type, whose parameters and result foreign code makes or takes as it does an extern's.
-    fn foreign_signature(self, &cx: Domain!['k], name: Span['k], sig: Sig['k]) {
+    // Each error is at the parameter or the result type it is about.
+    fn foreign_signature(self, &cx: Domain!['k], node: S::Extern['k], sig: Sig['k]) {
+        let name = node.name;
         if !sig.params.is_empty(&cx) {
-            self.foreign_fail(&cx, name, " takes no type or brand parameters");
-        }
-        if !sig.places.is_empty(&cx) {
-            self.foreign_fail(&cx, name, " takes a place parameter; foreign code takes values");
+            self.foreign_fail(&cx, name, " takes no type or brand parameters", no_pos());
         }
         var p = 0usize;
+        while p < node.params.len(&cx) {
+            let param = node.params.at(&cx, p);
+            if param.lend {
+                self.foreign_fail(&cx, name, " takes a place parameter; foreign code takes values", param.pos);
+            }
+            p = p + 1usize;
+        }
+        p = 0usize;
         while p < sig.ptypes.len(&cx) {
             if self.types.zero_size(&cx, sig.ptypes.at(&cx, p)) {
-                self.foreign_fail(&cx, name, " takes a zero-size type, which has no memory form");
+                self.foreign_fail(&cx, name, " takes a zero-size type, which has no memory form", node.params.at(&cx, p).pos);
             }
             p = p + 1usize;
         }
         if !is_never(sig.ret) && contains(&cx, self.types, sig.ret, |&cx, t: Type['k]| checked_only(t)) {
-            self.foreign_fail(&cx, name, " cannot return a package, a brand witness, a safe function value, a transform or Never, which only checked code makes");
+            self.foreign_fail(&cx, name, " cannot return a package, a brand witness, a safe function value, a transform or Never, which only checked code makes", node.ret_pos);
         }
         if self.types.chosen_layout(&cx, sig.ret) {
-            self.foreign_fail(&cx, name, " cannot return an enum or a NonNull, whose layout the compiler chooses");
+            self.foreign_fail(&cx, name, " cannot return an enum or a NonNull, whose layout the compiler chooses", node.ret_pos);
         }
         if !is_never(sig.ret) && self.types.zero_size(&cx, sig.ret) && !self.types.is_copy(&cx, sig.ret, ArenaMap::new(&cx)) {
-            self.foreign_fail(&cx, name, " returns a zero-size linear type, which foreign code would make from nothing");
+            self.foreign_fail(&cx, name, " returns a zero-size linear type, which foreign code would make from nothing", node.ret_pos);
         }
-        let functions: ArenaVec[FnType['k], 'k] = ArenaVec::new(&cx);
+        // Each part of the signature, a parameter's type or the result, with where it is written.
+        let parts: ArenaVec[(Type['k], Pos), 'k] = ArenaVec::new(&cx);
+        p = 0usize;
+        while p < sig.ptypes.len(&cx) {
+            parts.push(&cx, (sig.ptypes.at(&cx, p), node.params.at(&cx, p).pos));
+            p = p + 1usize;
+        }
+        parts.push(&cx, (sig.ret, node.ret_pos));
         var q = 0usize;
-        while q <= sig.ptypes.len(&cx) {
-            let part = if q < sig.ptypes.len(&cx) { sig.ptypes.at(&cx, q) } else { sig.ret };
-            functions.append(&cx, function_types(&cx, self.types, part));
+        while q < parts.len(&cx) {
+            let (part, pos) = parts.at(&cx, q);
+            if function_types(&cx, self.types, part).any(&cx, |&cx, f: FnType['k]| !f.is_unsafe) {
+                self.foreign_fail(&cx, name, " has a safe function type in its signature; foreign code makes and calls only unsafe fn values", pos);
+            }
             q = q + 1usize;
         }
-        if functions.any(&cx, |&cx, f: FnType['k]| !f.is_unsafe) {
-            self.foreign_fail(&cx, name, " has a safe function type in its signature; foreign code makes and calls only unsafe fn values");
-        }
-        var f = 0usize;
-        while f < functions.len(&cx) {
-            let fun = functions.at(&cx, f);
-            var k = 0usize;
-            while k <= fun.params.len(&cx) {
-                let t = if k < fun.params.len(&cx) { fun.params.at(&cx, k) } else { fun.ret.copy(&cx) };
-                if k < fun.params.len(&cx) && self.types.zero_size(&cx, t) {
-                    self.foreign_fail(&cx, name, " has an unsafe fn type in its signature that takes a zero-size type, which has no memory form");
+        q = 0usize;
+        while q < parts.len(&cx) {
+            let (part, pos) = parts.at(&cx, q);
+            let functions = function_types(&cx, self.types, part);
+            var f = 0usize;
+            while f < functions.len(&cx) {
+                let fun = functions.at(&cx, f);
+                var k = 0usize;
+                while k <= fun.params.len(&cx) {
+                    let t = if k < fun.params.len(&cx) { fun.params.at(&cx, k) } else { fun.ret.copy(&cx) };
+                    if k < fun.params.len(&cx) && self.types.zero_size(&cx, t) {
+                        self.foreign_fail(&cx, name, " has an unsafe fn type in its signature that takes a zero-size type, which has no memory form", pos);
+                    }
+                    if contains(&cx, self.types, t, |&cx, u: Type['k]| checked_only(u)) {
+                        self.foreign_fail(&cx, name, " has an unsafe fn type in its signature that takes or returns a package, a brand witness, a safe function value, a transform or Never, which only checked code makes", pos);
+                    }
+                    if self.types.chosen_layout(&cx, t) {
+                        self.foreign_fail(&cx, name, " has an unsafe fn type in its signature that takes or returns an enum or a NonNull, whose layout the compiler chooses", pos);
+                    }
+                    k = k + 1usize;
                 }
-                if contains(&cx, self.types, t, |&cx, u: Type['k]| checked_only(u)) {
-                    self.foreign_fail(&cx, name, " has an unsafe fn type in its signature that takes or returns a package, a brand witness, a safe function value, a transform or Never, which only checked code makes");
+                let result = fun.ret.copy(&cx);
+                if self.types.zero_size(&cx, result) && !self.types.is_copy(&cx, result, ArenaMap::new(&cx)) {
+                    self.foreign_fail(&cx, name, " has an unsafe fn type in its signature that returns a zero-size linear type, which C's void would make vanish", pos);
                 }
-                if self.types.chosen_layout(&cx, t) {
-                    self.foreign_fail(&cx, name, " has an unsafe fn type in its signature that takes or returns an enum or a NonNull, whose layout the compiler chooses");
-                }
-                k = k + 1usize;
+                f = f + 1usize;
             }
-            let result = fun.ret.copy(&cx);
-            if self.types.zero_size(&cx, result) && !self.types.is_copy(&cx, result, ArenaMap::new(&cx)) {
-                self.foreign_fail(&cx, name, " has an unsafe fn type in its signature that returns a zero-size linear type, which C's void would make vanish");
-            }
-            f = f + 1usize;
+            q = q + 1usize;
         }
     }
 
-    fn foreign_fail(self, &cx: Domain!['k], name: Span['k], message: Slice[u8, 'static]) -> ! {
-        self.r.fail(&cx, Buffer!::new().push_static("extern ").push_bytes(&cx, name).push_static(message).save(&cx), no_pos())
+    fn foreign_fail(self, &cx: Domain!['k], name: Span['k], message: Slice[u8, 'static], pos: Pos) -> ! {
+        self.r.fail(&cx, Buffer!::new().push_static("extern ").push_bytes(&cx, name).push_static(message).save(&cx), pos)
     }
 
     fn run(self, &cx: Domain!['k]) -> Program['k] {
@@ -321,7 +381,7 @@ impl Lowering['k] {
                 Some(decl) => match decl.node {
                     Extern(x) => if decl.kind.is(&cx, "extern") {
                         self.r.locate(&cx, decl.home, x.pos);
-                        self.foreign_signature(&cx, x.name, sig);
+                        self.foreign_signature(&cx, x, sig);
                         self.r.unlocate(&cx);
                         program.externs.insert(&cx, x.name, Extern.{ name: x.name, ret: sig.ret, ptypes: sig.ptypes, pos: no_pos() });
                     },
@@ -728,7 +788,7 @@ impl FnLower['k] {
         };
         let discharged = o.discharged || self.discharge_all || marked;
         if C::is_unsafe_op(&cx, o.name) && !(discharged || self.sig.is_unsafe) {
-            self.fail(&cx, Buffer!::new().push_bytes(&cx, o.name).push_static(" requires unsafe authorization").save(&cx), pos);
+            self.fail(&cx, Buffer!::new().push_static(unsafe_written(&cx, o.name)).push_static(" needs unsafe").save(&cx), pos);
         }
         if C::is_unsafe_op(&cx, o.name) {
             self.memory_operation(&cx, o, pos);
@@ -1281,10 +1341,11 @@ impl FnLower['k] {
     fn finish_body(self, &cx: Domain!['k], body: Expr['k]) -> Fun['k] {
         let value = self.expr(&cx, body);
         if self.live(&cx) {
+            // A body's value is its tail's; a block with none ends, and drops what it holds, at its `}`.
             let result_pos = match body {
                 Block(b) => match b.tail {
                     Some(t) => expr_pos(t.copy(&cx)),
-                    None => b.pos,
+                    None => b.end,
                 },
                 _ => expr_pos(body),
             };
@@ -2028,7 +2089,7 @@ impl FnLower['k] {
             _ => (ArenaVec::one(&cx, callee_value), ArenaVec::new(&cx), self.fn_unsafe(&cx, callee_value)),
         };
         if requires_unsafe && !self.authorized(&cx, c.id) {
-            self.fails(&cx, "calling an unsafe function requires unsafe authorization", c.pos);
+            self.fails(&cx, "calling an unsafe function needs unsafe", c.pos);
         }
         // A raw lend's explicit authorization discharges the core call instruction, but must not
         // authorize an independently unsafe callee in the surface.
@@ -2086,7 +2147,7 @@ impl FnLower['k] {
                         return match p {
                             Some(p) => {
                                 if !(explicit || self.authorized(&cx, c.id)) {
-                                    self.fails(&cx, "lending a raw pointer target requires unsafe authorization", expr_pos(arg));
+                                    self.fails(&cx, "lending a raw pointer's target needs unsafe", expr_pos(arg));
                                 }
                                 let unit = match self.vty.get(&cx, p) {
                                     Some(t) => match t {
@@ -2857,7 +2918,11 @@ impl FnLower['k] {
                     let v = values.at(&cx, 1usize);
                     let vty = self.vty.at(&cx, v);
                     if !lend && !self.copy(&cx, vty) {
-                        self.fails(&cx, "{x} in an f-string drops a linear value; lend it with {&x}", expr_pos(part));
+                        match written_place(&cx, part) {
+                            Some(place) => self.fail(&cx, Buffer!::new().push_static("{").push_bytes(&cx, place).push_static("} in an f-string drops a linear value; lend it with {&")
+                                .push_bytes(&cx, place).push_static("}").save(&cx), expr_pos(part)),
+                            None => self.fails(&cx, "a value in an f-string is formatted and dropped, and this one is linear; bind it to a var and lend that", expr_pos(part)),
+                        }
                     }
                     let pair = Type::Tuple.(ArenaVec::two(&cx, vty, wty));
                     let args = ArenaVec::two(&cx, format, Span::from_static(&cx, "format"));

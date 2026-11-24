@@ -199,7 +199,8 @@ fn new_level(&cx: Domain!['k]) -> Level['k] {
 // A closure or foreach body being walked: the outer locals it captures, in first-use order.
 forall 'k.
 exposed struct Frame {
-    locals: ArenaVec[(Span['k], Local['k]), 'k],
+    // (name, local, first use)
+    locals: ArenaVec[(Span['k], Local['k], Pos), 'k],
 }
 
 forall 'k.
@@ -640,7 +641,7 @@ impl Infer['k] {
         let b = Body.{
             inf: self, home, sig, kinds, assumptions, waiting: ArenaVec::new(&cx), defaults: ArenaVec::new(&cx), recorded: ArenaVec::new(&cx),
             literals: ArenaVec::new(&cx), brand_checks: ArenaVec::new(&cx), foreaches: ArenaMap::new(&cx), open_binders: ref_in(&cx, List::empty()),
-            binder_checks: ArenaVec::new(&cx), instantiations: ArenaVec::new(&cx), unwritten: ArenaVec::new(&cx), solving: ref_in(&cx, false), returns: ArenaVec::one(&cx, sig.ret),
+            binder_checks: ArenaVec::new(&cx), capture_checks: ArenaVec::new(&cx), instantiations: ArenaVec::new(&cx), unwritten: ArenaVec::new(&cx), solving: ref_in(&cx, false), returns: ArenaVec::one(&cx, sig.ret),
             scopes: ref_in(&cx, List::empty().cons(&cx, level)), frames: ArenaVec::one(&cx, new_frame(&cx)), allowed: ref_in(&cx, Option::None),
         };
         let ids: ArenaVec[u32, 'k] = ArenaVec::new(&cx);
@@ -832,6 +833,8 @@ exposed struct Body {
     open_binders: Ref[List[Span['k], 'k], 'k],
     // each local's type, with the binders open where it was bound
     binder_checks: ArenaVec[(Type['k], List[Span['k], 'k]), 'k],
+    // each local a foreach body captures: its name, its type and where it is first used there
+    capture_checks: ArenaVec[(Span['k], Type['k], Pos), 'k],
     // each instantiation of a generic declaration: its parameters, their metavariables, the name it
     // is used by, and where
     instantiations: ArenaVec[(ArenaVec[Param['k], 'k], ArenaMap[Span['k], Type['k], 'k], Span['k], Pos), 'k],
@@ -949,6 +952,14 @@ impl Body['k] {
                     self.fail(&cx, Buffer!::new().push_static("cannot infer the type argument ").push_bytes(&cx, argument).push_static(" of ").push_bytes(&cx, owner).save(&cx), pos);
                 }
                 k = k + 1usize;
+            }
+            i = i + 1usize;
+        }
+        i = 0usize;
+        while i < self.capture_checks.len(&cx) {
+            let (name, ty, pos) = self.capture_checks.at(&cx, i);
+            if !self.inf.types.is_copy(&cx, zonk(&cx, ty), self.kinds) {
+                self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(" is captured by a foreach body, which runs once for each component: a capture must be Copy").save(&cx), pos);
             }
             i = i + 1usize;
         }
@@ -1258,13 +1269,16 @@ impl Body['k] {
     // An assumption or a unique matching instance solves the output arguments.
     fn discharge(self, &cx: Domain!['k], trait_name: Span['k], args: ArenaVec[Type['k], 'k], n: usize, pos: Pos) {
         if trait_name.is(&cx, "Exposed") {
-            if args.len(&cx) != 1usize || !self.inf.types.exposure_available(&cx, zonk(&cx, args.at(&cx, 0usize)), Option::Some.(self.home), self.kinds, self.assumptions) {
-                self.fails(&cx, "Exposed requires an exact premise or an authorized traversable shape", pos);
+            let source = zonk(&cx, args.at(&cx, 0usize));
+            if !self.inf.types.exposure_available(&cx, source, Option::Some.(self.home), self.kinds, self.assumptions) {
+                let shown = self.shown(&cx, source);
+                self.fail(&cx, Buffer!::new().push_static("the shape of ").push_bytes(&cx, shown).push_static(" is not visible here: write `where Exposed[")
+                    .push_bytes(&cx, shown).push_static("]`, or expose its declaration to this module").save(&cx), pos);
             }
             return;
         }
         if trait_name.is(&cx, "Sized") {
-            if args.len(&cx) != 1usize || !self.inf.types.sized_available(&cx, zonk(&cx, args.at(&cx, 0usize)), self.assumptions) {
+            if !self.inf.types.sized_available(&cx, zonk(&cx, args.at(&cx, 0usize)), self.assumptions) {
                 self.fails(&cx, "Sized requires an exact premise or a part whose size is not zero whatever the type parameters are", pos);
             }
             return;
@@ -1392,7 +1406,8 @@ impl Body['k] {
         self.inf.sigs.name(&cx, self.inf.sigs.library(&cx, self.home, Span::from_static(&cx, name)))
     }
 
-    fn lookup(self, &cx: Domain!['k], name: Span['k]) -> Option[Local['k]] {
+    // The local `name`, used at `pos`.
+    fn lookup(self, &cx: Domain!['k], name: Span['k], pos: Pos) -> Option[Local['k]] {
         let found = self.scopes.copy(&cx).find_map(&cx, |&cx, level: Level['k]| level.names.get(&cx, name));
         match found {
             Some(local) => {
@@ -1400,8 +1415,8 @@ impl Body['k] {
                 var f = local.depth + 1usize;
                 while f < self.frames.len(&cx) {
                     let frame = self.frames.at(&cx, f);
-                    if !frame.locals.any(&cx, |&cx, seen: (Span['k], Local['k])| seen.1.id == local.id) {
-                        frame.locals.push(&cx, (name, local));
+                    if !frame.locals.any(&cx, |&cx, seen: (Span['k], Local['k], Pos)| seen.1.id == local.id) {
+                        frame.locals.push(&cx, (name, local, pos));
                     }
                     f = f + 1usize;
                 }
@@ -1584,13 +1599,14 @@ impl Body['k] {
 
     fn let_exists(self, &cx: Domain!['k], l: S::Let['k]) -> bool {
         let package = self.shape(&cx, self.expr(&cx, l.value), l.pos);
+        let form = if l.mutable { "var exists" } else { "let exists" };
         let opened = match package {
             Exists(binders, body) => if binders.len(&cx) == l.brands.len(&cx) { Option::Some.((binders, body.copy(&cx))) } else { Option::None },
             _ => Option::None,
         };
         let (binders, body) = match opened {
             Some(pair) => pair,
-            None => self.fail(&cx, Buffer!::new().push_static("let exists opens ").push_bytes(&cx, counted(&cx, l.brands.len(&cx), "brand")).push_static(" of ").push_bytes(&cx, self.shown(&cx, zonk(&cx, package))).save(&cx), l.pos),
+            None => self.fail(&cx, Buffer!::new().push_static(form).push_static(" opens ").push_bytes(&cx, counted(&cx, l.brands.len(&cx), "brand")).push_static(" of ").push_bytes(&cx, self.shown(&cx, zonk(&cx, package))).save(&cx), l.pos),
         };
         let names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         let distinct: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
@@ -1609,7 +1625,7 @@ impl Body['k] {
         while i < names.len(&cx) {
             let name = names.at(&cx, i);
             if name.is(&cx, "static") || opened_before.contains(&cx, name) || self.sig.params.any(&cx, |&cx, p: Param['k]| is_brand(p.kind) && p.name.eq(&cx, name)) {
-                self.fail(&cx, Buffer!::new().push_static("let exists '").push_bytes(&cx, name).push_static(" reuses a brand already in scope").save(&cx), l.pos);
+                self.fail(&cx, Buffer!::new().push_static(form).push_static(" '").push_bytes(&cx, name).push_static(" reuses a brand already in scope").save(&cx), l.pos);
             }
             i = i + 1usize;
         }
@@ -2012,7 +2028,7 @@ impl Body['k] {
                     if has_args(&cx, p) {
                         self.fails(&cx, "explicit type arguments on local values are not supported; specialize the named function before binding", p.pos);
                     }
-                    let local = match self.lookup(&cx, name) {
+                    let local = match self.lookup(&cx, name, p.pos) {
                         Some(l) => l,
                         None => self.fail(&cx, Buffer!::new().push_static("unknown local ").push_bytes(&cx, name).save(&cx), p.pos),
                     };
@@ -2324,7 +2340,7 @@ impl Body['k] {
                     let unit = self.check(&cx, v, Option::Some.(fields.at(&cx, f.name)));
                 },
                 None => {
-                    let local = match self.lookup(&cx, f.name) {
+                    let local = match self.lookup(&cx, f.name, s.pos) {
                         Some(l) => l,
                         None => self.fail(&cx, Buffer!::new().push_static("unknown local ").push_bytes(&cx, f.name).save(&cx), s.pos),
                     };
@@ -2336,7 +2352,7 @@ impl Body['k] {
         }
         let unit = match s.spread {
             Some(spread) => {
-                let bundle = match self.lookup(&cx, spread) {
+                let bundle = match self.lookup(&cx, spread, s.pos) {
                     Some(rest) => match rest.rest {
                         Some(b) => {
                             self.results().spread_ids.insert(&cx, s.id, rest.id);
@@ -2491,7 +2507,7 @@ impl Body['k] {
         let out: ArenaVec[Capture['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < frame.locals.len(&cx) {
-            let (name, local) = frame.locals.at(&cx, i);
+            let (name, local, _at) = frame.locals.at(&cx, i);
             out.push(&cx, Capture.{ name, binder: local.id });
             i = i + 1usize;
         }
@@ -2544,7 +2560,7 @@ impl Body['k] {
         let env_types: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         i = 0usize;
         while i < frame.locals.len(&cx) {
-            let (_n, l) = frame.locals.at(&cx, i);
+            let (_n, l, _at) = frame.locals.at(&cx, i);
             env_types.push(&cx, l.type);
             i = i + 1usize;
         }
@@ -2662,6 +2678,13 @@ impl Body['k] {
         let unit = self.frames.pop(&cx);
         self.open_binders.set(&cx, outer);
         self.results().captures.insert(&cx, f.id, self.captures(&cx, frame));
+        // The body runs once for each component, so what it captures is used as many times.
+        var i = 0usize;
+        while i < frame.locals.len(&cx) {
+            let (name, local, at) = frame.locals.at(&cx, i);
+            self.capture_checks.push(&cx, (name, local.type, at));
+            i = i + 1usize;
+        }
         C::foreach_type(&cx, binder, indirect, source, body)
     }
 
@@ -2669,7 +2692,7 @@ impl Body['k] {
     fn expr_unary(self, &cx: Domain!['k], u: S::Unary['k]) -> Type['k] {
         let first = match self.first_call(&cx, u.operand.copy(&cx)) {
             Some(c) => c,
-            None => self.fails(&cx, "& lends a place only as a call argument, a receiver, or a match scrutinee", u.pos),
+            None => self.fails(&cx, "& lends a place only as a call argument `f(&x)`, a receiver `&x.m()` or a match scrutinee `match &x`", u.pos),
         };
         self.inf.lend_marked.insert(&cx, first.id);
         self.expr(&cx, u.operand.copy(&cx))
@@ -2772,7 +2795,7 @@ impl Body['k] {
                 };
                 let unit = match local_name {
                     Some(name) => {
-                        let local = match self.lookup(&cx, name) {
+                        let local = match self.lookup(&cx, name, p.pos) {
                             Some(l) => l,
                             None => self.fail(&cx, Buffer!::new().push_static("unknown local ").push_bytes(&cx, name).save(&cx), p.pos),
                         };
@@ -2780,7 +2803,7 @@ impl Body['k] {
                             self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(if lend { " is not a var; a lent place must be a var" } else { " is not a var" }).save(&cx), p.pos);
                         }
                         if (assign || lend) && local.depth != self.frames.len(&cx) - 1usize {
-                            self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(if lend { " is captured as a copy, which cannot be lent" } else { " is captured as a copy, which cannot be assigned" }).save(&cx), p.pos);
+                            self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(if lend { " is captured, and a body cannot lend what it captures; lend it outside, or give a closure a place parameter for it" } else { " is captured, and a body cannot assign what it captures; assign it outside, or give a closure a place parameter for it" }).save(&cx), p.pos);
                         }
                         self.results().binders.insert(&cx, p.id, local.id);
                         return self.record(&cx, p.id, p.pos, local.type);
@@ -3243,6 +3266,18 @@ impl Body['k] {
                 self.unify_at(&cx, writer, out, c.pos);
                 self.require(&cx, self.library(&cx, "Writable"), ArenaVec::one(&cx, out), c.pos);
                 return out;
+            },
+            _ => (),
+        };
+        // `&` is a way to pass a place, never a value: `(&x).m()` and `(unsafe &*p).m()` lend nothing, while
+        // `(&x.m()).n()` lends the receiver of `m`.
+        let lend = match receiver {
+            Unary(u) => if u.op.is(&cx, "unsafe") { u.operand.copy(&cx) } else { receiver },
+            _ => receiver,
+        };
+        let unit = match lend {
+            Unary(u) => if u.op.is(&cx, "&") && self.first_call(&cx, u.operand.copy(&cx)).is_none() {
+                self.fails(&cx, "a lend in parentheses is no receiver: a local's or a field's is lent as `&x.m()`, and a raw pointer's target as an argument, `T::m(unsafe &*p)`", S::expr_pos(receiver));
             },
             _ => (),
         };

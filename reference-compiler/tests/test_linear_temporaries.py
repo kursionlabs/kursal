@@ -73,6 +73,18 @@ fn early(c: bool) -> i32 {
             self.run_source(source.replace("    let t = make(7u32);\n    0i32", "    0i32", 1), 0)
         self.assertEqual(error.exception.pos, (10, 9))
 
+    def test_unused_value_diagnostic_points_to_the_end_of_a_body_without_a_tail(self):
+        """A body with no tail and no `return` returns at its `}`, where it drops what it holds."""
+        source = PREFIX + '''fn quiet(n: u32) {
+    let t = make(n);
+}
+fn main() -> i32 {
+    0i32
+}'''
+        with self.assertRaisesRegex(OwnershipError, "quiet: linear value 't' is not consumed before return") as error:
+            self.run_source(source, 0)
+        self.assertEqual(error.exception.pos, (6, 1))
+
     def test_temporary_root_does_not_alias_a_parameter(self):
         self.run_source('''fn add(a: u32, b: u32) -> u32 { a + b }
             fn f(&t0: u32) -> u32 { add(1u32, 2u32) + t0 }

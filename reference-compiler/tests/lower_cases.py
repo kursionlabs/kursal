@@ -20,12 +20,18 @@ LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
     # `{x}` hands its value to `Format::format` and drops the copy it gets back.
     ("use std::buffer::Buffer!;\nuse std::io::print_buffer;\nfn main() {\n"
      "    let name = Buffer!::new().push_static(\"x\");\n    print_buffer(f\"hi {name}\\n\");\n}\n",
-     "5:24: {x} in an f-string drops a linear value; lend it with {&x}"),
+     "5:24: {name} in an f-string drops a linear value; lend it with {&name}"),
+    ("use std::buffer::Buffer!;\nuse std::io::print_buffer;\nstruct P! { b: Buffer! }\nfn main() {\n"
+     "    let p = P!.{ b: Buffer!::new() };\n    print_buffer(f\"hi {p.b}\\n\");\n}\n",
+     "6:24: {p.b} in an f-string drops a linear value; lend it with {&p.b}"),
+    ("use std::buffer::Buffer!;\nuse std::io::print_buffer;\nfn main() {\n"
+     "    print_buffer(f\"hi {Buffer!::new()}\\n\");\n}\n",
+     "4:24: a value in an f-string is formatted and dropped, and this one is linear; bind it to a var and lend that"),
     # lowering
     ("fn f() -> i8 { -129i8 }\n", "does not fit"),
     ("fn f() -> u8 { var x: u8 = 300; x }\n", "does not fit"),
-    ("fn f(p: *u32) -> u32 { *p }\n", "requires unsafe authorization"),
-    ("fn f() -> *u32 { core::mem::alloca[u32]() }\n", "requires unsafe authorization"),
+    ("fn f(p: *u32) -> u32 { *p }\n", "reading through a raw pointer needs unsafe"),
+    ("fn f() -> *u32 { core::mem::alloca[u32]() }\n", "calling alloca needs unsafe"),
     ("fn bump(&x: u32) -> u32 { x = x + 1u32; x }\nfn add(a: u32, b: u32) -> u32 { a + b }\n"
      "fn f() -> u32 { var n = 1u32; add(n, bump(&n)) }\n", "a plain read overlaps a lend"),
     ("struct P { a: u32, b: u32 }\nfn f(p: P) -> u32 { let { a, ..rest } = p; let q = rest; a }\n", "bundle"),
@@ -47,7 +53,7 @@ LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
     ("exposed struct W { p: *u8 }\nfn f(p: *u8) -> W { unsafe (p as W) }\n", "an unsafe cast converts a pointer only"),
     ("exposed struct W { p: *u8 }\nfn f(w: W) -> *u8 { unsafe (w as *u8) }\n", "an unsafe cast converts a pointer only"),
     # What an extern hands back holds nothing only checked code makes, and no layout the compiler chooses.
-    ('extern "C" fn get_cb() -> fn() -> u32;\n', "extern get_cb cannot return a package, a brand witness, a safe function"),
+    ('extern "C" fn get_cb() -> fn() -> u32;\n', "1:27: extern get_cb cannot return a package, a brand witness, a safe function"),
     ('struct W { n: u64, f: fn() -> u32 }\nextern "C" fn make() -> W;\n', "extern make cannot return a package"),
     ('extern "C" fn make() -> (u64, !);\n', "extern make cannot return a package"),
     ('forall T. exposed enum Opt { Some(T), None }\nextern "C" fn make() -> Opt[u32];\n',
@@ -56,19 +62,19 @@ LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
     # An extern's signature is closed, and every function type in it is an `unsafe fn` type, anywhere,
     # whose parameters and result foreign code makes or takes as it does an extern's.
     ('forall T. extern "C" fn f(x: *T) -> u32;\n', "extern f takes no type or brand parameters"),
-    ('extern "C" fn f(&x: u32) -> u32;\n', "extern f takes a place parameter; foreign code takes values"),
+    ('extern "C" fn f(&x: u32) -> u32;\n', "1:17: extern f takes a place parameter; foreign code takes values"),
     ('struct Cap! {}\nextern "C" fn make() -> Cap!;\n',
      "extern make returns a zero-size linear type, which foreign code would make from nothing"),
     ('extern "C" fn f(n: u64, &x: u32) -> u32;\nfn g() -> u32 { var x = 1u32; unsafe f(2u64, &x) }\n',
-     "extern f takes a place parameter; foreign code takes values"),
+     "1:25: extern f takes a place parameter; foreign code takes values"),
     ('extern "C" fn f(x: fn() -> u32) -> u32;\n', "extern f has a safe function type in its signature"),
     ('struct Cb { run: fn() -> u32 }\nextern "C" fn f(x: *Cb) -> u32;\n', "extern f has a safe function type in its signature"),
     ('extern "C" fn f(x: unsafe fn(u8, ()) -> u8) -> u32;\n',
-     "extern f has an unsafe fn type in its signature that takes a zero-size type"),
+     "1:17: extern f has an unsafe fn type in its signature that takes a zero-size type"),
     ("forall 'k.\nstruct W { b: core::cap::Brand['k], n: u64 }\nextern \"C\" fn f(x: unsafe fn(W['static]) -> u8) -> u32;\n",
      "extern f has an unsafe fn type in its signature that takes or returns a package, a brand witness"),
     ('enum E { A(u8), B(u16) }\nextern "C" fn f() -> unsafe fn() -> unsafe fn(E) -> u8;\n',
-     "extern f has an unsafe fn type in its signature that takes or returns an enum or a NonNull"),
+     "2:22: extern f has an unsafe fn type in its signature that takes or returns an enum or a NonNull"),
     # No memory holds a value that holds Never, however deep.
     ("struct S { n: ! }\nfn f(p: *S) -> u32 { var s = unsafe *p; 0u32 }\n",
      "an unsafe read cannot produce a value that holds Never"),
@@ -112,7 +118,7 @@ LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
     ("fn f(p: *[[u8; 9223372036854775808]; 2]) -> u32 { 0u32 }\n", "is too large: its size is not below 2^64 bytes"),
     (TOKEN + "fn f() -> u32 { (Token!.{ n: 1u32 }, Token!.{ n: 2u32 }).0.n }\n", "linear sibling"),
     ("unsafe fn danger() -> u32 { 0u32 }\nfn f() -> u32 { danger() }\n", "calling an unsafe function"),
-    ("fn take(&x: u32) -> u32 { x }\nfn f(p: *u32) -> u32 { take(&*p) }\n", "lending a raw pointer target"),
+    ("fn take(&x: u32) -> u32 { x }\nfn f(p: *u32) -> u32 { take(&*p) }\n", "lending a raw pointer's target needs unsafe"),
     ("use std::atomic::Ordering;\nfn f(p: *u32) -> u32 { unsafe p.atomic_load(Ordering::Release) }\n", "does not support ordering"),
     ("use std::atomic::Ordering;\nfn f(p: *u32) -> u32 { unsafe p.atomic_store(1u32, Ordering::Acquire); 0u32 }\n",
      "does not support ordering"),
@@ -147,6 +153,8 @@ LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
     # place flow
     (TOKEN + "fn f() -> u32 { var t = Token!.{ n: 7u32 }; 0u32 }\n", "is not consumed before return"),
     (TOKEN + "fn f(t: Token!) -> u32 { 0u32 }\n", "is not consumed before return"),
+    # A body with no tail returns at its `}`.
+    (TOKEN + "fn f() {\n    var t = Token!.{ n: 7u32 };\n}\n", "5:1: "),
     (TOKEN + "fn f() -> u32 { var t = Token!.{ n: 7u32 }; let n = take(t); take(t) }\n", "has been moved"),
     (TOKEN + "fn f(t: Token!, c: bool) -> u32 { if c { let n = take(t); }; 0u32 }\n", "remains live on some paths"),
     (TOKEN + "fn f() -> u32 { var t = Token!.{ n: 7u32 }; t = Token!.{ n: 9u32 }; take(t) }\n", "cannot overwrite live linear value"),

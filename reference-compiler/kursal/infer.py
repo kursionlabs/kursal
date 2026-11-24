@@ -188,7 +188,7 @@ class Capture:
 @dataclass
 class Frame:
     """A closure or foreach body being walked: the outer locals it captures, in first-use order."""
-    locals: list[tuple[str, Local]] = field(default_factory=list)   # (name, Local)
+    locals: list[tuple[str, Local, Optional[Position]]] = field(default_factory=list)   # (name, Local, first use)
 
 
 # -------------------------------------------------------------- inference --
@@ -239,6 +239,8 @@ class Infer:
         self.foreaches: dict[str, tuple[str, Optional[Position]]] = {}
         self.open_binders: tuple[str, ...] = ()
         self.binder_checks: list[tuple[C.Type, tuple[str, ...]]] = []
+        # each local a foreach body captures: its name, its type and where it is first used there
+        self.capture_checks: list[tuple[str, C.Type, Optional[Position]]] = []
         # Each instantiation of a generic declaration: its parameters, their metavariables, the name it is
         # used by, and where.
         self.instantiations: list[tuple[tuple[C.Param, ...], dict[str, C.Type], str, Optional[Position]]] = []
@@ -282,6 +284,9 @@ class Infer:
                 if not ground(sub[p.name]):
                     argument = brand_name(p.name) if p.kind == C.BRAND else Surface((), {}).name(p.name)
                     fail(f"cannot infer the type argument {argument} of {owner}", pos)
+        for name, ty, pos in self.capture_checks:
+            if not self.types.is_copy(zonk(ty), self.kinds):
+                fail(f"{name} is captured by a foreach body, which runs once for each component: a capture must be Copy", pos)
         for e in self.recorded:
             e.ty = zonk(e.ty)
             if isinstance(e, S.For):
@@ -408,14 +413,14 @@ class Infer:
     def discharge(self, trait: str, args: Sequence[C.Type], input_count: int, pos: Optional[Position]) -> None:
         """An assumption or a unique matching instance solves the output arguments."""
         if trait == "Exposed":
-            concrete = tuple(zonk(arg) for arg in args)
-            if len(concrete) != 1 or not self.types.exposure_available(
-                    concrete[0], self.module, self.kinds, self.assumptions):
-                fail("Exposed requires an exact premise or an authorized traversable shape", pos)
+            source = zonk(args[0])
+            if not self.types.exposure_available(source, self.module, self.kinds, self.assumptions):
+                shown = self.shown(source)
+                fail(f"the shape of {shown} is not visible here: write `where Exposed[{shown}]`, "
+                     "or expose its declaration to this module", pos)
             return
         if trait == "Sized":
-            concrete = tuple(zonk(arg) for arg in args)
-            if len(concrete) != 1 or not self.types.sized_available(concrete[0], self.assumptions):
+            if not self.types.sized_available(zonk(args[0]), self.assumptions):
                 fail("Sized requires an exact premise or a part whose size is not zero whatever the type parameters "
                      "are", pos)
             return
@@ -464,13 +469,14 @@ class Infer:
     def library(self, name: str) -> str:
         return self.sigs.name(self.sigs.library(self.module, name))
 
-    def lookup(self, name: str) -> Optional[Local]:
+    def lookup(self, name: str, pos: Optional[Position]) -> Optional[Local]:
+        """The local `name`, used at `pos`."""
         for level in reversed(self.scopes):
             local = level.names.get(name)
             if local is not None:
                 for frame in self.frames[local.depth + 1:]:      # every closure it is used inside captures it
-                    if all(l is not local for _, l in frame.locals):
-                        frame.locals.append((name, local))
+                    if all(l is not local for _, l, _ in frame.locals):
+                        frame.locals.append((name, local, pos))
                 return local
         return None
 
@@ -545,15 +551,16 @@ class Infer:
 
     def let_exists(self, stmt: S.Let) -> bool:
         package = self.shape(self.expr(stmt.value), stmt.pos)
+        form = "var exists" if stmt.mutable else "let exists"
         if not isinstance(package, C.Exists) or len(package.binders) != len(stmt.brands):
-            fail(f"let exists opens {counted(len(stmt.brands), 'brand')} of {self.shown(zonk(package))}", stmt.pos)
+            fail(f"{form} opens {counted(len(stmt.brands), 'brand')} of {self.shown(zonk(package))}", stmt.pos)
         names = tuple(b[1:] for b in stmt.brands)
         if len(set(names)) != len(names):
             fail("an existential opening repeats a brand name", stmt.pos)
         in_scope = {p.name for p in self.sig.params if p.kind == C.BRAND} | {"static"} | set(self.brand_sub())
         for name in names:
             if name in in_scope:
-                fail(f"let exists '{name} reuses a brand already in scope", stmt.pos)
+                fail(f"{form} '{name} reuses a brand already in scope", stmt.pos)
         labels = stmt.opened_brands = tuple(f"{name}#open{next(_ids)}" for name in names)
         if stmt.pos is not None:
             self.origins.update((label, stmt.pos) for label in labels)
@@ -756,7 +763,7 @@ class Infer:
             case ("local", name):
                 if any(args for _, args in expr.segments):
                     fail("explicit type arguments on local values are not supported; specialize the named function before binding", expr.pos)
-                local = self.lookup(name)
+                local = self.lookup(name, expr.pos)
                 if local is None:
                     fail(f"unknown local {name}", expr.pos)
                 if local.rest is not None:
@@ -893,13 +900,13 @@ class Infer:
             if value is not None:
                 self.check(value, fields[name])
                 continue
-            local = self.lookup(name)
+            local = self.lookup(name, expr.pos)
             if local is None:
                 fail(f"unknown local {name}", expr.pos)
             expr.field_ids[name] = local.id
             self.unify(local.type, fields[name], expr.pos)
         if expr.spread:
-            rest = self.lookup(expr.spread)
+            rest = self.lookup(expr.spread, expr.pos)
             if rest is None or rest.rest is None:
                 fail(f"{expr.spread} is not a ..rest bundle", expr.pos)
             expr.spread_id = rest.id
@@ -1017,8 +1024,8 @@ class Infer:
         self.returns.pop()
         self.scopes.pop()
         self.frames.pop()
-        expr.captures = tuple(Capture(name, local.id) for name, local in frame.locals)
-        env = C.Tuple(tuple(l.type for _, l in frame.locals))
+        expr.captures = tuple(Capture(name, local.id) for name, local, _ in frame.locals)
+        env = C.Tuple(tuple(l.type for _, l, _ in frame.locals))
         return C.Struct((("env", env), ("code", C.Fn((env, *params), ret, places=places))))
 
     def expr_pack(self, expr: S.Pack) -> C.Type:
@@ -1080,7 +1087,9 @@ class Infer:
         self.scopes.pop()
         self.frames.pop()
         self.open_binders = outer
-        expr.captures = tuple(Capture(name, local.id) for name, local in frame.locals)
+        expr.captures = tuple(Capture(name, local.id) for name, local, _ in frame.locals)
+        # The body runs once for each component, so what it captures is used as many times.
+        self.capture_checks.extend((name, local.type, pos) for name, local, pos in frame.locals)
         return C.Foreach(binder, indirect, source, body)
 
     def expr_cast(self, expr: S.Cast) -> C.Type:
@@ -1090,7 +1099,7 @@ class Infer:
     def expr_unary(self, expr: S.Unary) -> C.Type:                  # the other operators have rules; `&` lends the receiver of a call
         first = self.first_call(expr.operand)
         if first is None:
-            fail("& lends a place only as a call argument, a receiver, or a match scrutinee", expr.pos)
+            fail("& lends a place only as a call argument `f(&x)`, a receiver `&x.m()` or a match scrutinee `match &x`", expr.pos)
         first.lend_marked = True
         return self.expr(expr.operand)
 
@@ -1151,17 +1160,19 @@ class Infer:
     def place_type(self, expr: S.Expr, assign: bool = False, lend: bool = False) -> C.Type:
         """The type of a place expression: a local, or fields and tuple elements of one. A place that is
         assigned or lent is rooted at a var, a place parameter or a binder of a lent match case, bound in
-        the function, closure or foreach body it is written in: such a body holds a copy of what it
-        captures."""
+        the function, closure or foreach body it is written in: such a body holds its own value of what it
+        captures, a copy or the value moved in."""
         match expr:
             case S.Path(ref=("local", name)):
-                local = self.lookup(name)
+                local = self.lookup(name, expr.pos)
                 if local is None:
                     fail(f"unknown local {name}", expr.pos)
                 if (assign or lend) and not local.mutable:
                     fail(f"{name} is not a var; a lent place must be a var" if lend else f"{name} is not a var", expr.pos)
                 if (assign or lend) and local.depth != len(self.frames) - 1:
-                    fail(f"{name} is captured as a copy, which cannot be {'lent' if lend else 'assigned'}", expr.pos)
+                    verb = "lend" if lend else "assign"
+                    fail(f"{name} is captured, and a body cannot {verb} what it captures; {verb} it outside, or give a "
+                         "closure a place parameter for it", expr.pos)
                 expr.binder = local.id
                 return self.record(expr, local.type)
             case S.Field() | S.Index():
@@ -1400,6 +1411,11 @@ class Infer:
             self.unify(writer, out, expr.pos)
             self.require(self.library("Writable"), [out], expr.pos)
             return out
+        # `&` is a way to pass a place, never a value: `(&x).m()` and `(unsafe &*p).m()` lend nothing, while
+        # `(&x.m()).n()` lends the receiver of `m`.
+        lend = receiver.operand if isinstance(receiver, S.Unary) and receiver.op == "unsafe" else receiver
+        if isinstance(lend, S.Unary) and lend.op == "&" and self.first_call(lend.operand) is None:
+            fail("a lend in parentheses is no receiver: a local's or a field's is lent as `&x.m()`, and a raw pointer's target as an argument, `T::m(unsafe &*p)`", receiver.pos)
         if lent_receiver and not self.is_place(receiver):
             fail("& lends a local or a field of one", expr.pos)
         receiver_ty = self.place_type(receiver, lend=True) if lent_receiver else self.expr(receiver)

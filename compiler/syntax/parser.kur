@@ -12,7 +12,7 @@ use std::raw::Span;
 use std::arena::{Domain!, ref_in};
 use std::buffer::Buffer!;
 use package::syntax::ast as S;
-use package::syntax::ast::{Expr, Pos, Statement, Type};
+use package::syntax::ast::{Expr, Pos, Statement, Type, no_pos};
 use std::slice::Slice;
 use std::option::Option;
 
@@ -645,12 +645,20 @@ impl Parser['k] {
 
     // `BRAND ("," BRAND)* "."`: nonempty, with no trailing comma.
     fn brands(self, &cx: Domain!['k]) -> ArenaVec[Span['k], 'k] {
+        let (brands, _at) = self.positioned_brands(&cx);
+        brands
+    }
+
+    // `BRAND ("," BRAND)* "."`: nonempty, with no trailing comma; the brands, and where each is.
+    fn positioned_brands(self, &cx: Domain!['k]) -> (ArenaVec[Span['k], 'k], ArenaVec[Pos, 'k]) {
+        let positions: ArenaVec[Pos, 'k] = ArenaVec::one(&cx, self.pos(&cx));
         let brands: ArenaVec[Span['k], 'k] = ArenaVec::one(&cx, self.expect(&cx, "BRAND").text);
         while self.eat(&cx, ",") {
+            positions.push(&cx, self.pos(&cx));
             brands.push(&cx, self.expect(&cx, "BRAND").text);
         }
         let unit = self.expect(&cx, ".");
-        brands
+        (brands, positions)
     }
 
     fn forall_param(self, &cx: Domain!['k]) -> Span['k] {
@@ -876,29 +884,34 @@ impl Parser['k] {
         let out: ArenaVec[S::Param['k], 'k] = ArenaVec::new(&cx);
         var going = true;
         while going && !self.at(&cx, ")") {
+            let start = self.pos(&cx);
             let lend = self.eat(&cx, "&");
             if out.is_empty(&cx) && self.eat(&cx, "self") {
                 let type = if self.eat(&cx, ":") { Option::Some.(self.type(&cx)) } else { Option::None };
-                out.push(&cx, S::Param.{ name: Span::from_static(&cx, "self"), type, lend });
+                out.push(&cx, S::Param.{ name: Span::from_static(&cx, "self"), type, lend, pos: start });
             } else {
                 let name = self.name(&cx);
                 let unit = self.expect(&cx, ":");
-                out.push(&cx, S::Param.{ name, type: Option::Some.(self.ptype(&cx)), lend });
+                out.push(&cx, S::Param.{ name, type: Option::Some.(self.ptype(&cx)), lend, pos: start });
             }
             going = self.eat(&cx, ",");
         }
         out
     }
 
-    // `fn NAME "(" params? ")" ("->" type)?`, shared by definitions and externs.
-    fn fn_header(self, &cx: Domain!['k]) -> (Span['k], ArenaVec[S::Param['k], 'k], Option[Type['k]]) {
+    // `fn NAME "(" params? ")" ("->" type)?`, shared by definitions and externs; also where the
+    // result type is.
+    fn fn_header(self, &cx: Domain!['k]) -> (Span['k], ArenaVec[S::Param['k], 'k], Option[Type['k]], Pos) {
         let unit = self.expect(&cx, "fn");
         let name = self.name(&cx);
         let unit = self.expect(&cx, "(");
         let params = self.params(&cx);
         let unit = self.expect(&cx, ")");
-        let ret = if self.eat(&cx, "->") { Option::Some.(self.type(&cx)) } else { Option::None };
-        (name, params, ret)
+        if !self.eat(&cx, "->") {
+            return (name, params, Option::None, no_pos());
+        }
+        let ret_pos = self.pos(&cx);
+        (name, params, Option::Some.(self.type(&cx)), ret_pos)
     }
 
     // `"unsafe"? fn_header (";" | block)`.
@@ -909,7 +922,7 @@ impl Parser['k] {
     }
 
     fn fn_rest(self, &cx: Domain!['k], start: Pos, is_unsafe: bool, quantifier: Option[S::Forall['k]]) -> S::Fn['k] {
-        let (name, params, ret) = self.fn_header(&cx);
+        let (name, params, ret, _ret_pos) = self.fn_header(&cx);
         let body = if self.eat(&cx, ";") { Option::None } else { Option::Some.(self.block(&cx)) };
         S::Fn.{ id: self.id(&cx), name, params, ret, body, is_unsafe, quantifier, pos: start }
     }
@@ -919,9 +932,9 @@ impl Parser['k] {
         let unit = self.expect(&cx, "extern");
         let tok = self.expect(&cx, "STRING");
         let abi = self.unescape(&cx, tok, tok.text.slice(1usize, tok.text.len() - 1usize), false);
-        let (name, params, ret) = self.fn_header(&cx);
+        let (name, params, ret, ret_pos) = self.fn_header(&cx);
         let unit = self.expect(&cx, ";");
-        S::Extern.{ id: self.id(&cx), abi, name, params, ret, quantifier, pos: start }
+        S::Extern.{ id: self.id(&cx), abi, name, params, ret, quantifier, pos: start, abi_pos: Pos.{ line: tok.line, col: tok.col }, ret_pos }
     }
 
     fn const_decl(self, &cx: Domain!['k], quantifier: Option[S::Forall['k]]) -> S::Const['k] {
@@ -1042,17 +1055,18 @@ impl Parser['k] {
         }
         if k.is(&cx, "exists") {
             let unit = self.next(&cx);
-            let brands = self.brands(&cx);
-            return Type::Exists.(brands, ref_in(&cx, self.type(&cx)));
+            let (brands, positions) = self.positioned_brands(&cx);
+            return Type::Exists.(brands, positions, ref_in(&cx, self.type(&cx)));
         }
         if k.is(&cx, "foreach") {
+            let start = self.pos(&cx);
             let unit = self.next(&cx);
             let indirect = self.eat(&cx, "*");
             let binder = self.name(&cx);
             let unit = self.expect(&cx, "of");
             let source = self.type(&cx);
             let unit = self.expect(&cx, "=>");
-            return Type::Foreach.(S::TForeach.{ binder, indirect, source: ref_in(&cx, source), body: ref_in(&cx, self.type(&cx)) });
+            return Type::Foreach.(S::TForeach.{ binder, indirect, source: ref_in(&cx, source), body: ref_in(&cx, self.type(&cx)), pos: start });
         }
         self.fail(&cx)
     }
@@ -1142,8 +1156,9 @@ impl Parser['k] {
             };
         }
         self.leave(&cx, 1usize);
+        let end = self.pos(&cx);
         let unit = self.next(&cx);
-        S::Block.{ id: self.id(&cx), stmts, tail, pos: start }
+        S::Block.{ id: self.id(&cx), stmts, tail, pos: start, end }
     }
 
     fn expr_stmt(self, &cx: Domain!['k], e: Expr['k], start: Pos) -> Statement['k] {
@@ -1244,6 +1259,11 @@ impl Parser['k] {
         let start = self.pos(&cx);
         if k.is(&cx, "NAME") {
             return S::Pattern::Bind.(S::Node.{ id: self.id(&cx), value: self.name(&cx), pos: start });
+        }
+        // `var self = self;`, as `var x = x;`
+        if k.is(&cx, "self") {
+            let unit = self.next(&cx);
+            return S::Pattern::Bind.(S::Node.{ id: self.id(&cx), value: Span::from_static(&cx, "self"), pos: start });
         }
         if k.is(&cx, "_") {
             let unit = self.next(&cx);

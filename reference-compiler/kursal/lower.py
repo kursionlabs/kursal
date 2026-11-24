@@ -39,6 +39,13 @@ from .types import apart, brand_name, equal, foreach_item, mapped_component, map
 
 ORDERINGS = {"Relaxed": "relaxed", "Acquire": "acquire", "Release": "release", "AcqRel": "acq_rel",
              "SeqCst": "seq_cst"}
+# Each operation that needs unsafe, as the source writes it. A cast is not here: `expr_cast` says
+# which casts need unsafe where the cast is written.
+UNSAFE_WRITTEN = {"ptr_load": "reading through a raw pointer", "ptr_store": "writing through a raw pointer",
+                  "ptr_load_volatile": "a volatile read through a raw pointer",
+                  "ptr_store_volatile": "a volatile write through a raw pointer",
+                  "alloca": "calling alloca", "static_brand": "calling static_brand", "fence": "calling fence",
+                  **{op: "an atomic access through a raw pointer" for op in C.ATOMIC_OPS if op != "fence"}}
 
 
 # What a match arm covers: enum variant names, or integer ranges; empty for the wildcard.
@@ -76,6 +83,17 @@ class BlockB:
         self.label, self.params, self.brands = label, list(params), tuple(brands)
         self.instrs: list[C.Instr] = []
         self.term: Optional[C.Terminator] = None
+
+
+def written_place(expr: S.Expr) -> Optional[str]:
+    """`expr` as written, when it is a name and fields, `x` or `x.a.0`."""
+    match expr:
+        case S.Path(segments=((name, ()),)):
+            return name
+        case S.Field(value=value, name=name):
+            inner = written_place(value)
+            return None if inner is None else f"{inner}.{name}"
+    return None
 
 
 def set_apart(fun: C.Fun, outer: tuple[C.Param, ...]) -> None:
@@ -117,9 +135,9 @@ class Lowering:
         Infer(self.r, self.sigs).run()
         program = self.program
         for decl, sig in self.sigs.sigs.items():
-            if decl.kind == "extern":
+            if isinstance(decl.node, S.Extern):
                 with self.r.located(decl.module, decl.node.pos):
-                    self.foreign_signature(decl.node.name, sig)
+                    self.foreign_signature(decl.node, sig)
                 program.externs[decl.node.name] = C.Extern(decl.node.name, sig.ret, sig.ptypes)
             elif isinstance(decl.node, S.Fn) and decl.node.body is not None:
                 node = decl.node
@@ -175,41 +193,48 @@ class Lowering:
                         plan(method, lowered)
         return program
 
-    def foreign_signature(self, name: str, sig: Sig) -> None:
+    def foreign_signature(self, node: S.Extern, sig: Sig) -> None:
         """The core's rules for an extern's signature (`Checker.foreign_signature`), at the source: it takes no
         type or brand parameter and no place parameter, which foreign code cannot lend back, a parameter has
         a memory form, the result holds nothing only checked code makes and no layout the compiler chooses
         and is zero-size only if it is Copy, and every function type in it is an `unsafe fn` type, whose
-        parameters and result foreign code makes or takes as it does an extern's."""
+        parameters and result foreign code makes or takes as it does an extern's. Each error is at the
+        parameter or the result type it is about."""
+        name = node.name
         if sig.params:
             fail(f"extern {name} takes no type or brand parameters")
-        if sig.places:
-            fail(f"extern {name} takes a place parameter; foreign code takes values")
-        if any(self.types.zero_size(t) for t in sig.ptypes):
-            fail(f"extern {name} takes a zero-size type, which has no memory form")
+        for param in node.params:
+            if param.lend:
+                fail(f"extern {name} takes a place parameter; foreign code takes values", param.pos)
+        for t, param in zip(sig.ptypes, node.params):
+            if self.types.zero_size(t):
+                fail(f"extern {name} takes a zero-size type, which has no memory form", param.pos)
         if not isinstance(sig.ret, C.Never) and contains(self.types, sig.ret, checked_only):
             fail(f"extern {name} cannot return a package, a brand witness, a safe function "
-                 "value, a transform or Never, which only checked code makes")
+                 "value, a transform or Never, which only checked code makes", node.ret_pos)
         if self.types.chosen_layout(sig.ret):
-            fail(f"extern {name} cannot return an enum or a NonNull, whose layout the compiler chooses")
+            fail(f"extern {name} cannot return an enum or a NonNull, whose layout the compiler chooses", node.ret_pos)
         if not isinstance(sig.ret, C.Never) and self.types.zero_size(sig.ret) and not self.types.is_copy(sig.ret):
-            fail(f"extern {name} returns a zero-size linear type, which foreign code would make from nothing")
+            fail(f"extern {name} returns a zero-size linear type, which foreign code would make from nothing",
+                 node.ret_pos)
         inner = f"extern {name} has an unsafe fn type in its signature that"
-        functions = [fn for part in (*sig.ptypes, sig.ret) for fn in function_types(self.types, part)]
-        if any(not fn.unsafe for fn in functions):
-            fail(f"extern {name} has a safe function type in its signature; foreign code makes and calls only "
-                 "unsafe fn values")
-        for fn in functions:
-            for k, t in enumerate((*fn.params, fn.ret)):
-                if k < len(fn.params) and self.types.zero_size(t):
-                    fail(f"{inner} takes a zero-size type, which has no memory form")
-                if contains(self.types, t, checked_only):
-                    fail(f"{inner} takes or returns a package, a brand witness, a safe function value, a "
-                         "transform or Never, which only checked code makes")
-                if self.types.chosen_layout(t):
-                    fail(f"{inner} takes or returns an enum or a NonNull, whose layout the compiler chooses")
-            if self.types.zero_size(fn.ret) and not self.types.is_copy(fn.ret):
-                fail(f"{inner} returns a zero-size linear type, which C's void would make vanish")
+        parts = [*zip(sig.ptypes, (param.pos for param in node.params)), (sig.ret, node.ret_pos)]
+        for part, pos in parts:
+            if any(not fn.unsafe for fn in function_types(self.types, part)):
+                fail(f"extern {name} has a safe function type in its signature; foreign code makes and calls only "
+                     "unsafe fn values", pos)
+        for part, pos in parts:
+            for fn in function_types(self.types, part):
+                for k, t in enumerate((*fn.params, fn.ret)):
+                    if k < len(fn.params) and self.types.zero_size(t):
+                        fail(f"{inner} takes a zero-size type, which has no memory form", pos)
+                    if contains(self.types, t, checked_only):
+                        fail(f"{inner} takes or returns a package, a brand witness, a safe function value, a "
+                             "transform or Never, which only checked code makes", pos)
+                    if self.types.chosen_layout(t):
+                        fail(f"{inner} takes or returns an enum or a NonNull, whose layout the compiler chooses", pos)
+                if self.types.zero_size(fn.ret) and not self.types.is_copy(fn.ret):
+                    fail(f"{inner} returns a zero-size linear type, which C's void would make vanish", pos)
 
     def located(self, fun: C.Fun) -> AbstractContextManager[None]:
         return self.r.located(fun.module, fun.pos) if fun.module is not None else nullcontext()
@@ -299,7 +324,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
                 frame.extend(a for a in args if a.startswith("&") and not a.startswith("&*"))
         discharged = unsafe or self.discharge_all or node is not None and id(node) in self.unsafe_nodes
         if op in C.UNSAFE_OPS and not (discharged or self.sig.unsafe):
-            fail(f"{op} requires unsafe authorization", pos)
+            fail(f"{UNSAFE_WRITTEN[op]} needs unsafe", pos)
         if op in C.UNSAFE_OPS:
             self.memory_operation(op, args, ty, pos)
         self.current.instrs.append(C.Instr((name,), op, tuple(args), unsafe=discharged, pos=pos, ty=ty, tys=tys, lit=lit, binders=binders))
@@ -569,7 +594,12 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         value = self.expr(expr.body)
         if self.cur is not None:
             assert value is not None
-            result_pos = expr.body.tail.pos if isinstance(expr.body, S.Block) and expr.body.tail is not None else expr.body.pos
+            # A body's value is its tail's; a block with none ends, and drops what it holds, at its `}`.
+            body = expr.body
+            if isinstance(body, S.Block):
+                result_pos = body.end if body.tail is None else body.tail.pos
+            else:
+                result_pos = body.pos
             self.terminate(C.Ret(value, result_pos))
         return self.finish()
 
@@ -958,7 +988,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
                 assert isinstance(signature, C.Fn)
                 requires_unsafe = signature.unsafe
         if requires_unsafe and not self.authorized(expr):
-            fail("calling an unsafe function requires unsafe authorization", expr.pos)
+            fail("calling an unsafe function needs unsafe", expr.pos)
         # A raw lend's explicit authorization discharges the core call instruction,
         # but must not authorize an independently unsafe callee in the surface.
         raw_lend = any(o.startswith("&*") for o in operands)
@@ -982,7 +1012,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
             if isinstance(target, S.Unary) and target.op == "*":
                 p = self.expr(target.operand)
                 if p is not None and not (explicit or self.authorized(call)):
-                    fail("lending a raw pointer target requires unsafe authorization", arg.pos)
+                    fail("lending a raw pointer's target needs unsafe", arg.pos)
                 pointer = self.vty.get(p) if p is not None else None
                 if isinstance(pointer, C.Ptr) and contains(self.types, pointer.inner, lambda t: isinstance(t, C.Never)):
                     fail("an unsafe lend of a pointer's target cannot lend a value that holds Never", arg.pos)
@@ -1364,7 +1394,10 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
                 return None
             writer, v = values
             if not lend and not self.copy(self.vty[v]):
-                fail("{x} in an f-string drops a linear value; lend it with {&x}", part.pos)
+                place = written_place(part)
+                if place is None:
+                    fail("a value in an f-string is formatted and dropped, and this one is linear; bind it to a var and lend that", part.pos)
+                fail(f"{{{place}}} in an f-string drops a linear value; lend it with {{&{place}}}", part.pos)
             vty, pair = self.vty[v], C.Tuple((self.vty[v], wty))
             both = self.emit("trait_call", pair, (fmt, "format", v, writer), tys=(vty, wty))
             (v2, _), (writer, _) = self.destruct(both, pair)

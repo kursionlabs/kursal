@@ -91,6 +91,7 @@ class TClosure:
 class TExists:
     brands: tuple[str, ...]
     body: Type
+    brand_pos: tuple[Position, ...] = field(default=(), init=False, repr=False, compare=False)   # each binder's
 
 
 @dataclass
@@ -99,6 +100,7 @@ class TForeach:
     indirect: bool
     source: Type
     body: Type
+    pos: Optional[Position] = field(default=None, init=False, repr=False, compare=False)   # its `foreach`
 
 
 
@@ -172,6 +174,7 @@ class Block(Inferred):
     stmts: tuple[Statement, ...]
     tail: Optional[Expr] = None
     pos: Optional[Position] = None
+    end: Optional[Position] = field(default=None, init=False, repr=False, compare=False)   # its `}`
 
 
 @dataclass
@@ -407,6 +410,7 @@ class Param:
     name: str
     type: Optional[Type] = None
     lend: bool = False     # written `&name: T` or `&self`
+    pos: Optional[Position] = field(default=None, init=False, repr=False, compare=False)
 
 
 @dataclass
@@ -466,6 +470,8 @@ class Extern(Declaration):
     params: tuple[Param, ...]
     ret: Optional[Type]
     pos: Optional[Position] = None
+    abi_pos: Optional[Position] = field(default=None, init=False, repr=False, compare=False)   # its string's
+    ret_pos: Optional[Position] = field(default=None, init=False, repr=False, compare=False)   # its result type's
 
 
 @dataclass

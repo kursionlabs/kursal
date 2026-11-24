@@ -39,7 +39,8 @@ class ClosureBoundaryTests(unittest.TestCase):
 
     def test_a_closure_neither_assigns_nor_lends_what_it_captures(self):
         # The closure holds a copy, so a change would reach the copy alone.
-        with self.assertRaisesRegex(InferError, "3:32: n is captured as a copy, which cannot be assigned$"):
+        with self.assertRaisesRegex(InferError, "3:32: n is captured, and a body cannot assign what it captures; "
+                                                "assign it outside, or give a closure a place parameter for it$"):
             self.run_source('''fn main() -> i32 {
             var n = 3u32;
             let f = |x: u32| { n = n + x; n };

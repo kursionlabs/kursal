@@ -239,12 +239,17 @@ class Parser:
         return decl
 
     def brands(self) -> tuple[str, ...]:
-        """`BRAND ("," BRAND)* "."`: nonempty, with no trailing comma."""
+        return self.positioned_brands()[0]
+
+    def positioned_brands(self) -> tuple[tuple[str, ...], tuple[Position, ...]]:
+        """`BRAND ("," BRAND)* "."`: nonempty, with no trailing comma; the brands, and where each is."""
+        positions = [self.pos()]
         brands = [self.expect("BRAND").text]
         while self.eat(","):
+            positions.append(self.pos())
             brands.append(self.expect("BRAND").text)
         self.expect(".")
-        return tuple(brands)
+        return tuple(brands), tuple(positions)
 
     def forall_param(self) -> str:
         if self.k == "NAME":
@@ -390,31 +395,38 @@ class Parser:
     def params(self) -> list[S.Param]:
         out: list[S.Param] = []
         while self.k != ")":
+            start = self.pos()
             lend = bool(self.eat("&"))
             if not out and self.eat("self"):                 # `self` only first
-                out.append(S.Param("self", self.type() if self.eat(":") else None, lend))
+                param = S.Param("self", self.type() if self.eat(":") else None, lend)
             else:
                 name = self.name()
                 self.expect(":")
-                out.append(S.Param(name, self.ptype(), lend))
+                param = S.Param(name, self.ptype(), lend)
+            param.pos = start
+            out.append(param)
             if not self.eat(","):
                 break
         return out
 
-    def fn_header(self) -> tuple[str, tuple[S.Param, ...], Optional[S.Type]]:
-        """`fn NAME "(" params? ")" ("->" type)?`, shared by definitions and externs."""
+    def fn_header(self) -> tuple[str, tuple[S.Param, ...], Optional[S.Type], Optional[Position]]:
+        """`fn NAME "(" params? ")" ("->" type)?`, shared by definitions and externs; also where the
+        result type is."""
         self.expect("fn")
         name = self.name()
         self.expect("(")
         params = tuple(self.params())
         self.expect(")")
-        return name, params, self.type() if self.eat("->") else None
+        if not self.eat("->"):
+            return name, params, None, None
+        ret_pos = self.pos()
+        return name, params, self.type(), ret_pos
 
     def fn_decl(self, start: Optional[Position] = None, unsafe: bool = False) -> S.Fn:
         """`"unsafe"? fn_header (";" | block)`; `start` and `unsafe` are given when the caller read the `unsafe`."""
         if start is None:
             start, unsafe = self.pos(), bool(self.eat("unsafe"))
-        name, params, ret = self.fn_header()
+        name, params, ret, _ = self.fn_header()
         body = None if self.eat(";") else self.block()
         return S.Fn(name, params, ret, body, unsafe, None, start)
 
@@ -423,9 +435,11 @@ class Parser:
         self.expect("extern")
         tok = self.expect("STRING")
         abi = self.unescape(tok, tok.text[1:-1])
-        name, params, ret = self.fn_header()
+        name, params, ret, ret_pos = self.fn_header()
         self.expect(";")
-        return S.Extern(abi, name, params, ret, start)
+        extern = S.Extern(abi, name, params, ret, start)
+        extern.abi_pos, extern.ret_pos = (tok.line, tok.col), ret_pos
+        return extern
 
     def const_decl(self) -> S.Const:
         start = self.pos()
@@ -515,15 +529,21 @@ class Parser:
             return self.closure_rest(env)
         if k == "exists":
             self.next()
-            return S.TExists(self.brands(), self.type())
+            brands, positions = self.positioned_brands()
+            exists = S.TExists(brands, self.type())
+            exists.brand_pos = positions
+            return exists
         if k == "foreach":
+            start = self.pos()
             self.next()
             indirect = bool(self.eat("*"))
             binder = self.name()
             self.expect("of")
             source = self.type()
             self.expect("=>")
-            return S.TForeach(binder, indirect, source, self.type())
+            foreach = S.TForeach(binder, indirect, source, self.type())
+            foreach.pos = start
+            return foreach
         self.fail()
 
     def closure_rest(self, env: Optional[S.Type]) -> S.TClosure:
@@ -595,8 +615,11 @@ class Parser:
             else:
                 tail = item
         self.leave()
+        end = self.pos()
         self.next()
-        return S.Block(tuple(items), tail, start)
+        block = S.Block(tuple(items), tail, start)
+        block.end = end
+        return block
 
     def statement(self) -> S.Statement | S.Expr:
         """A statement; or, when the block ends right after it, a bare expression (its tail)."""
@@ -662,6 +685,9 @@ class Parser:
         k = self.k
         if k == "NAME":
             return S.PBind(self.name())
+        if k == "self":                    # `var self = self;`, as `var x = x;`
+            self.next()
+            return S.PBind("self")
         if k == "_":
             self.next()
             return S.PWild()

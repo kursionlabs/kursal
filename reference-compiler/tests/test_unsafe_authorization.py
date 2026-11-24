@@ -26,8 +26,8 @@ class UnsafeAuthorizationTests(unittest.TestCase):
             path.write_text(emit_c(program, checker, entry))
             self.assertEqual(compile_and_run(path, directory / "program"), expected)
 
-    def reject(self, source):
-        with self.assertRaisesRegex(LowerError, 'unsafe authorization'):
+    def reject(self, source, message="calling an unsafe function needs unsafe"):
+        with self.assertRaisesRegex(LowerError, f"{message}$"):
             self.run_source(source + ' fn main() -> i32 { 0i32 }', 0)
 
     def test_direct_and_foreign_calls_require_authorization(self):
@@ -46,23 +46,30 @@ class UnsafeAuthorizationTests(unittest.TestCase):
             forall T where Read[T]. fn bad(x: T) -> u32 { Read[T]::read(x) }''')
 
     def test_dereference_and_pointer_methods_require_authorization(self):
-        for body, result in (('*p', 'u32'), ('p.load()', 'u32'), ('p.store(7u32)', '()')):
+        for body, result, message in (('*p', 'u32', "reading through a raw pointer"),
+                                      ('p.load()', 'u32', "reading through a raw pointer"),
+                                      ('p.store(7u32)', '()', "writing through a raw pointer"),
+                                      ('p.fetch_add(1u32, core::atomic::Ordering::SeqCst)', 'u32',
+                                       "an atomic access through a raw pointer")):
             with self.subTest(body=body):
-                self.reject(f'fn bad(p: *u32) -> {result} {{ {body} }}')
+                self.reject(f'fn bad(p: *u32) -> {result} {{ {body} }}', f"{message} needs unsafe")
 
     def test_volatile_builtins_require_authorization(self):
-        for body, result in (('core::ptr::load_volatile(p)', 'u32'),
-                             ('core::ptr::store_volatile(p, 7u32)', '()')):
+        for body, result, message in (('core::ptr::load_volatile(p)', 'u32', "a volatile read"),
+                                      ('core::ptr::store_volatile(p, 7u32)', '()', "a volatile write")):
             with self.subTest(body=body):
-                self.reject(f'fn bad(p: *u32) -> {result} {{ {body} }}')
+                self.reject(f'fn bad(p: *u32) -> {result} {{ {body} }}', f"{message} through a raw pointer needs unsafe")
 
     def test_raw_lend_needs_authorization(self):
-        self.reject('fn read(&x: u32) -> u32 { x } fn bad(p: *u32) -> u32 { read(&*p) }')
+        self.reject('fn read(&x: u32) -> u32 { x } fn bad(p: *u32) -> u32 { read(&*p) }',
+                    "lending a raw pointer's target needs unsafe")
 
     def test_machine_builtins_require_authorization(self):
-        self.reject('fn bad() -> *u32 { core::mem::alloca[u32]() }')
-        self.reject("fn bad() -> core::cap::Brand['static] { core::cap::static_brand() }")
-        self.reject('fn bad(p: *u32) -> u32 { p.atomic_load(core::atomic::Ordering::Relaxed) }')
+        self.reject('fn bad() -> *u32 { core::mem::alloca[u32]() }', "calling alloca needs unsafe")
+        self.reject("fn bad() -> core::cap::Brand['static] { core::cap::static_brand() }", "calling static_brand needs unsafe")
+        self.reject('fn bad(p: *u32) -> u32 { p.atomic_load(core::atomic::Ordering::Relaxed) }',
+                    "an atomic access through a raw pointer needs unsafe")
+        self.reject('fn bad() { core::atomic::fence(core::atomic::Ordering::SeqCst) }', "calling fence needs unsafe")
 
     def test_authorized_memory_and_raw_lends(self):
         for lend in ('read(unsafe &*p)', 'unsafe read(&*p)'):
@@ -80,7 +87,7 @@ class UnsafeAuthorizationTests(unittest.TestCase):
 
     def test_raw_lend_authorization_does_not_extend_to_other_arguments(self):
         self.reject('fn read(&x: u32, y: u32) -> u32 { x + y } '
-                    'fn bad(p: *u32) -> u32 { read(unsafe &*p, *p) }')
+                    'fn bad(p: *u32) -> u32 { read(unsafe &*p, *p) }', "reading through a raw pointer needs unsafe")
 
     def test_authorized_trait_call(self):
         self.run_source('''forall T. trait Read { unsafe fn read(x: T) -> i32; }
@@ -93,7 +100,7 @@ class UnsafeAuthorizationTests(unittest.TestCase):
 
     def test_outer_call_does_not_authorize_nested_call_or_dereference(self):
         self.reject('unsafe fn read(x: u32) -> u32 { x } '
-                    'fn bad(p: *u32) -> u32 { unsafe read(*p) }')
+                    'fn bad(p: *u32) -> u32 { unsafe read(*p) }', "reading through a raw pointer needs unsafe")
         self.reject('unsafe fn read(x: u32) -> u32 { x } '
                     'fn bad() -> u32 { unsafe read(read(7u32)) }')
 

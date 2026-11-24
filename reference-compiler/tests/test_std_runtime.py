@@ -252,7 +252,7 @@ class StdRuntimeTests(unittest.TestCase):
                 let raw = HeapAllocator::alloc(8usize).into_raw();
                 let result = trampoline[(), u32](raw);
                 0
-            }''', "calling an unsafe function requires unsafe authorization")
+            }''', "calling an unsafe function needs unsafe")
 
     def test_spawn_returns_a_zero_size_result(self):
         self.expect('''

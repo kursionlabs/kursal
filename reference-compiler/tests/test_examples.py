@@ -182,11 +182,13 @@ RUNS: dict[str, tuple[tuple, ...]] = {
 # examples/bad/: each program, and the diagnostic that rejects it.
 REJECTED = {
     "branch_inconsistent.kur": "22:5: .*linear value 'h' remains live on some paths to the end of the `if` at 22:5$",
-    "close_by_number.kur": "calling an unsafe function requires unsafe authorization",
+    "close_by_number.kur": "calling an unsafe function needs unsafe",
     "constructor_call.kur": "8:5: `Option::Some` is a constructor; write `Option::Some\\.\\(\\.\\.\\.\\)`$",
     "double_use_handle.kur": "value 'h' has been moved",
+    "extern_abi.kur": '7:8: the only extern ABI is "C"$',
     "foreach_as_field.kur": "8:1: a component is a foreach type, which is only the type of a whole value, parameter or result$",
-    "foreach_pointer_over_parameter.kur": "8:1: type formation: foreach \\*F needs a source written with pointer components$",
+    "foreach_pointer_over_leaf.kur": "12:17: foreach \\*F needs a source written with pointer components$",
+    "foreach_pointer_over_parameter.kur": "8:14: foreach \\*F needs a source written with pointer components$",
     "foreach_through_pointer_to_sum.kur": "9:17: a foreach source cannot be a pointer to a sum$",
     "glob_of_unknown_module.kur": "4:5: unknown or private member nowhere of std$",
     "function_value_at_two_brands.kur": "22:36: brand mismatch: Tag!\\['b\\] and Tag!\\['a\\]; 'b was opened at 20:5, 'a at 19:5$",
@@ -195,7 +197,7 @@ REJECTED = {
     "implicit_package_open_assignment.kur": "type mismatch: exists '1\\. Tag!\\['1\\] and Tag!\\['a\\]",
     "implicit_package_open_plain_let.kur": "a struct pattern needs a struct, not exists '1\\. Tag!\\['1\\]",
     "leaked_handle.kur": "15:5: .*linear value 'h' is not consumed before return$",
-    "lend_a_capture.kur": "19:20: a is captured as a copy, which cannot be lent$",
+    "lend_a_capture.kur": "20:20: a is captured, and a body cannot lend what it captures; lend it outside, or give a closure a place parameter for it$",
     "lend_a_let.kur": "19:14: a is not a var; a lent place must be a var$",
     "linear_in_arena.kur": "type argument must satisfy Copy",
     "mismatched_skolem.kur": "15:41: brand mismatch: Ref\\[u32, '2\\] and Ref\\[u32, 'k\\]; '2 was opened at 16:5$",
@@ -207,8 +209,8 @@ REJECTED = {
     "ref_after_remove_in.kur": "16:20: brand mismatch: 'b and 'a; 'b was opened at 14:5, 'a at 12:5$",
     "release_linear.kur": "14:25: type argument must satisfy Copy$",
     "reopened_brand.kur": "15:5: let exists 'a reuses a brand already in scope$",
-    "safe_adopt.kur": "calling an unsafe function requires unsafe authorization",
-    "shadowing_exists_binder.kur": "9:12: exists binder 'k shadows a brand in scope$",
+    "safe_adopt.kur": "calling an unsafe function needs unsafe",
+    "shadowing_exists_binder.kur": "9:44: exists binder 'k shadows a brand in scope$",
     "try_on_own_enum.kur": "15:13: \\? needs the operand and the function result to be the same Option or Result of core::option$",
     "too_large_type.kur": "is too large: its size is not below 2\\^64 bytes in type too_large_type::Huge$",
     "type_mismatch.kur": "type mismatch: bool and u32",
@@ -216,7 +218,7 @@ REJECTED = {
     "unknown_name_in_use_tree.kur": "4:28: unknown or private member Maybe of option$",
     "unused_unknown_import.kur": "4:5: unknown or private member Maybe of option$",
     "while_consume_without_replacement.kur": "25:5: .*linear value 'h' remains live where the loop at 25:5 starts, but not when it repeats$",
-    "write_by_number.kur": "13:19: calling an unsafe function requires unsafe authorization$",
+    "write_by_number.kur": "13:19: calling an unsafe function needs unsafe$",
 }
 
 

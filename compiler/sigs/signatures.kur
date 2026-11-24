@@ -27,14 +27,14 @@ use std::mem::Ref;
 use std::raw::Span;
 use std::arena::{Domain!, concat, ref_in};
 use std::buffer::Buffer!;
-use package::kurs::core::{Exposure, ExposureMode, Kind, Member, ModuleId, Param, Premise, Program, Type, TypeDecl};
+use package::kurs::core::{Exposure, ExposureMode, ForeachType, Kind, Member, ModuleId, Param, Premise, Program, Type, TypeDecl};
 use package::kurs::core as C;
 use package::types::layout::check_type_expansion;
 use package::types::literals::valid_literal;
 use package::resolve::resolver::{Decl, NameRef, Named, Package, Resolver, Target, name_pos, named_pos};
 use package::syntax::ast as S;
 use package::syntax::ast::{Expr, Pos, no_pos};
-use package::types::ops::{Fresh, Types, equal, subst, surface};
+use package::types::ops::{POINTER_TO_SUM, Fresh, Types, equal, subst, surface};
 use std::option::{Option, Result};
 use std::slice::Slice;
 
@@ -400,6 +400,8 @@ exposed struct Signatures {
     // Copy checks of type arguments in type declarations, made once every type is known: the type,
     // the kinds in scope, the declaration and where the argument is written.
     copy_checks: ArenaVec[(Type['k], ArenaMap[Span['k], Kind, 'k], Decl['k], Pos), 'k],
+    // The same for the formation of foreach types (`foreach_formation`).
+    foreach_checks: ArenaVec[(ForeachType['k], ArenaMap[Span['k], Kind, 'k], Decl['k], Pos), 'k],
     // the type declaration being translated
     declaring: Ref[Option[Decl['k]], 'k],
     types_ready: Ref[bool, 'k],
@@ -440,6 +442,7 @@ impl Signatures['k] {
             folding: ArenaSet::new(&cx),
             implicit: ref_in(&cx, 0u32),
             copy_checks: ArenaVec::new(&cx),
+            foreach_checks: ArenaVec::new(&cx),
             declaring: ref_in(&cx, Option::None),
             types_ready: ref_in(&cx, false),
             counter,
@@ -489,8 +492,17 @@ impl Signatures['k] {
             resolver.unlocate(&cx);
             i = i + 1usize;
         }
+        i = 0usize;
+        while i < s.foreach_checks.len(&cx) {
+            let (formed, kinds, declaring, pos) = s.foreach_checks.at(&cx, i);
+            resolver.locate(&cx, declaring.home, named_pos(declaring.node));
+            let unit = s.reported(&cx, s.foreach_formation(&cx, formed, kinds, pos));
+            resolver.unlocate(&cx);
+            i = i + 1usize;
+        }
         resolver.stop(&cx);
         s.copy_checks.clear(&cx);
+        s.foreach_checks.clear(&cx);
         let types = Types::new(&cx, s.program(&cx), counter);
         i = 0usize;
         while i < scopes.len(&cx) {
@@ -710,6 +722,12 @@ impl Signatures['k] {
             Builtin(name) => if name.is(&cx, "Exposed") || name.is(&cx, "Sized") { Option::Some.(name) } else { Option::None },
             _ => Option::None,
         };
+        let unit = match builtin {
+            Some(name) => if args.args.len(&cx) != 1usize {
+                return sig_error(Buffer!::new().push_bytes(&cx, name).push_static(" takes 1 type argument, got ").push_usize(args.args.len(&cx)).save(&cx), pos);
+            },
+            None => (),
+        };
         let actual = self.components(&cx, args.args, scope, "a type argument")?;
         match builtin {
             Some(name) => { return Result::Ok.(Premise.{ trait_name: name, args: actual }); },
@@ -761,6 +779,27 @@ impl Signatures['k] {
             }
         } else if !Types::new(&cx, self.program(&cx), self.counter).is_copy(&cx, ty, kinds) {
             return sig_error(Span::from_static(&cx, "type argument must satisfy Copy"), pos);
+        }
+        Result::Ok.(true)
+    }
+
+    // The foreach type `ty`, written at `pos`, has an expansion at every instantiation, as type
+    // formation requires: its source is no pointer to a sum, and a `*F` pattern's source is written
+    // with pointer components. Inside a type declaration it waits until every type is known.
+    fn foreach_formation(self, &cx: Domain!['k], ty: ForeachType['k], kinds: ArenaMap[Span['k], Kind, 'k], pos: Pos) -> Result[bool, SigError['k]] {
+        if !self.types_ready.copy(&cx) {
+            match self.declaring.copy(&cx) {
+                Some(d) => self.foreach_checks.push(&cx, (ty, kinds.clone(&cx), d, pos)),
+                None => fail(&cx, Span::from_static(&cx, "internal error: a foreach formation check outside a type declaration")),
+            }
+            return Result::Ok.(true);
+        }
+        let types = Types::new(&cx, self.program(&cx), self.counter);
+        if types.points_to_sum(&cx, ty.source.copy(&cx), kinds) {
+            return sig_error(Span::from_static(&cx, POINTER_TO_SUM), pos);
+        }
+        if !types.pattern_available(&cx, ty) {
+            return sig_error(Buffer!::new().push_static("foreach *").push_bytes(&cx, ty.binder).push_static(" needs a source written with pointer components").save(&cx), pos);
         }
         Result::Ok.(true)
     }
@@ -884,17 +923,17 @@ impl Signatures['k] {
                 let code = C::fn_type(&cx, params, ret, false, places_of(&cx, c.params, 1usize));
                 Result::Ok.(Type::Struct.(ArenaVec::two(&cx, Member.{ name: Span::from_static(&cx, "env"), type: environment }, Member.{ name: Span::from_static(&cx, "code"), type: code })))
             },
-            Exists(brands, body) => {
+            Exists(brands, at, body) => {
                 let labels: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
                 let binders: ArenaVec[Param['k], 'k] = ArenaVec::new(&cx);
                 var i = 0usize;
                 while i < brands.len(&cx) {
                     let label = brands.at(&cx, i).skip(1usize);
                     if labels.contains(&cx, label) {
-                        return sig_error_static(&cx, "an exists type repeats a binder");
+                        return sig_error(Span::from_static(&cx, "an exists type repeats a binder"), at.at(&cx, i));
                     }
                     if scope.brands.contains(&cx, label) || label.is(&cx, "static") {
-                        return sig_error(Buffer!::new().push_static("exists binder '").push_bytes(&cx, label).push_static(" shadows a brand in scope").save(&cx), no_pos());
+                        return sig_error(Buffer!::new().push_static("exists binder '").push_bytes(&cx, label).push_static(" shadows a brand in scope").save(&cx), at.at(&cx, i));
                     }
                     labels.push(&cx, label);
                     binders.push(&cx, Param.{ name: label, kind: Kind::Brand });
@@ -907,7 +946,9 @@ impl Signatures['k] {
                 let source = self.component(&cx, f.source.copy(&cx), scope, "a foreach source")?;
                 let bound = ArenaVec::one(&cx, Param.{ name: f.binder, kind: Kind::Any });
                 let body = self.component(&cx, f.body.copy(&cx), scope.extend(&cx, bound), "a foreach body")?;
-                Result::Ok.(C::foreach_type(&cx, f.binder, f.indirect, source, body))
+                let formed = ForeachType.{ binder: f.binder, indirect: f.indirect, source: ref_in(&cx, source), body: ref_in(&cx, body) };
+                let unit = self.foreach_formation(&cx, formed, scope.kinds, f.pos)?;
+                Result::Ok.(Type::Foreach.(formed))
             },
             Ignored => sig_error_static(&cx, "_ stands for a type argument only in an expression, where inference fills it in"),
         }
@@ -1059,7 +1100,12 @@ impl Signatures['k] {
     fn decl_signature(self, &cx: Domain!['k], decl: Decl['k]) -> Result[Sig['k], SigError['k]] {
         let node = match decl.node {
             Fn(f) => fn_header(f),
-            Extern(x) => Header.{ params: x.params, ret: x.ret, quantifier: x.quantifier, is_unsafe: true, pos: x.pos },
+            Extern(x) => {
+                if !x.abi.is(&cx, "C") {
+                    return sig_error(Span::from_static(&cx, "the only extern ABI is \"C\""), x.abi_pos);
+                }
+                Header.{ params: x.params, ret: x.ret, quantifier: x.quantifier, is_unsafe: true, pos: x.pos }
+            },
             _ => fail(&cx, Span::from_static(&cx, "internal error: a signature of a declaration that is not callable")),
         };
         self.signature(&cx, Option::Some.(decl), node, ArenaVec::new(&cx), ArenaVec::new(&cx), Option::None, Option::None)
@@ -1135,6 +1181,12 @@ impl Signatures['k] {
                 },
                 Some(t) => ptypes.push(&cx, self.type(&cx, t, scope)?),
             };
+            let unit = match decl {
+                Some(d) => if d.kind.is(&cx, "extern") && !implicit.is_empty(&cx) {
+                    return sig_error(Buffer!::new().push_static("a closure parameter of extern ").push_bytes(&cx, d.name).push_static(" needs [Env]").save(&cx), p.pos);
+                },
+                None => (),
+            };
             pnames.push(&cx, p.name);
             if p.lend {
                 places.push(&cx, k);
@@ -1142,12 +1194,6 @@ impl Signatures['k] {
             k = k + 1usize;
         }
         scope.implicit.set(&cx, Option::None);
-        let unit = match decl {
-            Some(d) => if d.kind.is(&cx, "extern") && !implicit.is_empty(&cx) {
-                return sig_error(Buffer!::new().push_static("a closure parameter of extern ").push_bytes(&cx, d.name).push_static(" needs [Env]").save(&cx), node.pos);
-            },
-            None => (),
-        };
         let ret = match node.ret {
             None => C::unit(&cx),
             Some(t) => self.type(&cx, t, scope)?,

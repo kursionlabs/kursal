@@ -23,7 +23,7 @@ from .resolve import Decl, Resolver
 from .sexpr import KursError, Position, counted, located
 from .layout import check_type_expansion
 from .literals import valid_literal
-from .types import Surface, Types, equal, subst
+from .types import POINTER_TO_SUM, Surface, Types, equal, subst
 
 LIBRARY = {  # name: (home library, path there, path through std)
     "Option": ("core", ("option", "Option"), ("option", "Option")),
@@ -134,6 +134,8 @@ class Signatures:
         # Copy checks of type arguments in type declarations, made once every type is known: the type, the kinds
         # in scope, the declaration and where the argument is written.
         self.copy_checks: list[tuple[C.Type, dict[str, C.Kind], Decl, Optional[Position]]] = []
+        # The same for the formation of foreach types (`foreach_formation`).
+        self.foreach_checks: list[tuple[C.Foreach, dict[str, C.Kind], Decl, Optional[Position]]] = []
         self.declaring: Optional[Decl] = None
         self.types_ready = False
         for scope in resolver.scopes.values():
@@ -151,8 +153,12 @@ class Signatures:
         for ty, kinds, declaring, pos in self.copy_checks:
             with self.reporting(declaring.module, declaring.node.pos):
                 self.require_copy(ty, kinds, pos)
+        for formed, kinds, declaring, pos in self.foreach_checks:
+            with self.reporting(declaring.module, declaring.node.pos):
+                self.foreach_formation(formed, kinds, pos)
         resolver.stop(SigError)
         self.copy_checks.clear()
+        self.foreach_checks.clear()
         types = Types(C.Program(types=self.types))
         for scope in resolver.scopes.values():
             for decl in scope.decls.values():
@@ -235,6 +241,8 @@ class Signatures:
     def premise(self, args: S.TypeArgs, scope: Scope) -> C.Premise:
         for builtin in ("Exposed", "Sized"):
             if args.ref == ("builtin", builtin):
+                if len(args.args) != 1:
+                    fail(f"{builtin} takes 1 type argument, got {len(args.args)}", args.pos)
                 return C.Premise(builtin, tuple(self.component(a, scope, "a type argument") for a in args.args))
         ref = args.ref
         assert ref is not None and ref[0] == "decl"
@@ -324,16 +332,32 @@ class Signatures:
                 return C.Struct((("env", environment), ("code", code)))
             case S.TExists(brands=brands, body=body):
                 labels = tuple(b[1:] for b in brands)
-                if len(set(labels)) != len(labels):
-                    fail("an exists type repeats a binder")
-                for label in labels:
+                for i, label in enumerate(labels):
+                    if label in labels[:i]:
+                        fail("an exists type repeats a binder", type_expr.brand_pos[i])
                     if label in scope.brands or label == "static":
-                        fail(f"exists binder '{label} shadows a brand in scope")
+                        fail(f"exists binder '{label} shadows a brand in scope", type_expr.brand_pos[i])
                 return C.Exists(labels, self.component(body, scope.extend(C.Param(b, C.BRAND) for b in labels), "a package body"))
-            case S.TForeach(binder=binder, indirect=indirect, source=source, body=body):
-                return C.Foreach(binder, indirect, self.component(source, scope, "a foreach source"),
-                                 self.component(body, scope.extend((C.Param(binder, C.ANY),)), "a foreach body"))
+            case S.TForeach(binder=binder, indirect=indirect, source=source, body=body, pos=pos):
+                formed = C.Foreach(binder, indirect, self.component(source, scope, "a foreach source"),
+                                   self.component(body, scope.extend((C.Param(binder, C.ANY),)), "a foreach body"))
+                self.foreach_formation(formed, scope.kinds, pos)
+                return formed
         fail("_ stands for a type argument only in an expression, where inference fills it in")
+
+    def foreach_formation(self, ty: C.Foreach, kinds: dict[str, C.Kind], pos: Optional[Position]) -> None:
+        """The foreach type `ty`, written at `pos`, has an expansion at every instantiation, as type
+        formation requires: its source is no pointer to a sum, and a `*F` pattern's source is written
+        with pointer components. Inside a type declaration it waits until every type is known."""
+        if not self.types_ready:
+            assert self.declaring is not None
+            self.foreach_checks.append((ty, dict(kinds), self.declaring, pos))
+            return
+        types = Types(C.Program(types=self.types))
+        if types.points_to_sum(ty.source, kinds):
+            fail(POINTER_TO_SUM, pos)
+        if not types.pattern_available(ty):
+            fail(f"foreach *{ty.binder} needs a source written with pointer components", pos)
 
     def component(self, type_expr: S.Type, scope: Scope, what: str) -> C.Type:
         """A type written where a foreach type may not be: `what` names the place. A foreach
@@ -418,6 +442,8 @@ class Signatures:
                   name: Optional[str] = None) -> Sig:
         node = decl.node if isinstance(decl, Decl) else decl
         assert isinstance(node, (S.Fn, S.Extern))
+        if isinstance(node, S.Extern) and node.abi != "C":
+            fail('the only extern ABI is "C"', node.abi_pos)
         scope = outer_scope or Scope()
         if isinstance(decl, Decl) and decl.kind == "method":
             assert decl.impl is not None
@@ -437,13 +463,13 @@ class Signatures:
                 ptypes.append(self.type(decl.impl.type, scope))
             else:
                 ptypes.append(self.type(p.type, scope))
+            if scope.implicit and isinstance(node, S.Extern):
+                fail(f"a closure parameter of extern {node.name} needs [Env]", p.pos)
             pnames.append(p.name)
             if p.lend:
                 places.add(k)
         implicit = tuple(scope.implicit)
         scope.implicit = None
-        if implicit and isinstance(node, S.Extern):
-            fail(f"a closure parameter of extern {node.name} needs [Env]", node.pos)
         ret = C.UNIT if node.ret is None else self.type(node.ret, scope)
         if name is None:
             assert isinstance(decl, Decl)
