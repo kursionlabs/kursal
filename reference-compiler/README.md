@@ -1,12 +1,11 @@
 # reference-compiler
 
-The reference compiler for Kursal (Python package `kursal`). It is a direct,
-spec-driven implementation of the language: source text is parsed, resolved,
-typed, lowered to KURS (the core language), checked, and translated to C. The
-translation leaves out what the C would not use, reads values where they lie instead of
-copying them, passes large aggregates by pointer, and turns calls in tail position into jumps
-(`plan.py`, `cgen.py`; [`compiler/README.md`](../compiler/README.md), "The C backend"); there
-are no passes over KURS.
+The reference compiler for Kursal (Python package `kursal`), the implementation of the language that
+the self-hosted compiler in [`compiler/`](../compiler/) must agree with: source text is parsed,
+resolved, typed, lowered to KURS (the core language), checked, and translated to C. The translation
+leaves out what the C would not use, reads values where they lie instead of copying them, passes
+large aggregates by pointer, and turns calls in tail position into jumps (`plan.py`, `cgen.py`;
+[`compiler/README.md`](../compiler/README.md), "The C backend"); there are no passes over KURS.
 
 It needs only Python 3.12+. [uv](https://docs.astral.sh/uv/) manages the
 development tools (`pyproject.toml`, `uv.lock`); mypy checks `kursal/`.
@@ -129,33 +128,11 @@ What to look for in each output:
 
 ## Packages
 
-A package is a directory with a `kur.toml`:
-
-```toml
-[package]
-name = "app"
-kind = "executable"          # or "library" (the default)
-entry = "package::main"      # executables only
-source_root = "src"          # the default
-link_flags = ["-luv"]        # optional linker arguments, inherited by dependents
-c_sources = ["native/uv.c"] # optional C sources, relative to this package
-
-[dependencies.std]
-path = "../lib/std"
-```
-
-A `kind` other than those two is an error that names the manifest (`.../kur.toml: manifest 'kind' must
-be "library" or "executable"`).
-
-`link_flags` is an array of nonempty strings without NUL. Each element is passed as one argument
-to the C compiler after the generated C and helper sources. Flags from the executable and every dependency
-are included in package traversal order, so a library can declare its own `-l` requirement.
-The compiler passes arguments directly, without a shell.
-
-`c_sources` is an array of package-relative C source paths. Both build commands resolve each path
-against the declaring package's directory and compile the sources of all dependencies alongside
-the generated C, before passing `link_flags` to the linker. Native dependencies such as libuv
-remain optional: only packages that declare these sources and flags require them.
+A package is a directory with a `kur.toml`; the root [`README.md`](../README.md), "Packages", lists
+the manifest's keys. Both build commands resolve each of a package's `c_sources` against its
+directory and compile those of every package with the generated C, then pass every package's
+`link_flags`, in package traversal order, as arguments of their own; native dependencies such as
+libuv are needed only by the packages that declare them.
 
 An executable's entry is a safe, non-generic function without premises, of
 one of three shapes, each with or without a parameter `args: Args` of type
@@ -231,8 +208,15 @@ uv run python tools/test.py                  # every tests/test_*.py, up to four
 uv run python tools/test.py -j 8             # choose the worker count
 uv run python tools/test.py tests.test_lower # one module (class and method names also work)
 uv run python tools/test.py -j 1 -v          # serial, full unittest output
+uv run python tools/test.py --timeout 7200   # allow each module two hours (the default is one)
 uv run mypy                                  # static types
 ```
+
+Each test module runs in a process of its own, and fails if it runs longer than the timeout.
+`tests/test_examples.py` builds and runs the packages of [`examples/`](../examples/) and of
+[`tests/fixtures/`](tests/fixtures/), packages that each test one feature or one past bug.
+`tests/test_editors.py` needs the `tree-sitter` CLI, and `test_libuv_echo_builds` libuv's headers;
+each is skipped without them.
 
 End-to-end tests build C with the command of `kursal/cc.py` (`$KURSAL_CC`, else `clang`, with
 `-O3 -w -fno-builtin`), the one `tools/build.py` and the self-hosted compiler use, and run it; each

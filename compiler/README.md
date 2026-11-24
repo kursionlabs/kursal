@@ -6,8 +6,8 @@ module, and must accept and reject the same programs, with the same messages, an
 output.
 
 The compiler has one directory per phase, in pipeline order below; `support` is the layer beneath
-them all, and the standard library (`std`, `toml`) beneath that. A phase's `dump` module prints what the phase computed, as text, for comparison with the
-reference in the tests.
+them all, and the standard library (`std`, `toml`) beneath that. A phase's `dump` module prints what
+the phase computed, as text, for comparison with the reference in the tests.
 
 | Module | Translates | |
 |---|---|---|
@@ -611,28 +611,28 @@ There is no `KurUnit` and no adapter for foreign functions returning `()`: a for
 function is its own function pointer. A function that takes and returns only zero-size values is
 `static void f(void)`, and a call of it still runs it.
 
-Erasing them never changes what a program reads or writes: a zero-size value has no bytes to read
-or write, and memory never holds one on its own. A raw load or store (`ptr_load`, `ptr_store`,
-volatile or not), an `alloca`, or a lend of a raw pointer's target (`f(unsafe &*p)`, which reads and
-writes it) is formed only at a type with `Sized` (MEM-SIZED-ACCESS): at a type
-without parameters, one that is not zero-size, so `unsafe *p` at `()`, a `Brand['k]` or a capability
-is rejected, `Copy` or not (`raw_access_at_zero_size`, and at the source `a raw read, write or
-alloca at a zero-size type`); at a type that mentions a parameter, one with an exact `Sized`
-premise or a part with bytes whatever the parameters are, so a generic function's `unsafe *p` at
-`T` needs `where Sized[T]` (`raw_access_needs_sized`, and at the source `a raw read, write or alloca
-at T needs Sized[T]`). Nothing is checked again at an instantiation: a caller discharges `Sized`
-where it calls, so no specialization reads, writes or reserves a zero-size type, and the backend
-writes every load, store and `alloca` it meets. The containers and allocation functions take
-`Sized` of their elements (`lib/std/CONTRACTS.md`, "Zero sizes"): `OwnedVec![()]`, `Owned!::new(())`
-and a map to `()` are not formed. Two more operations reject a zero-size type
-(`zero_size_type_has_no_memory_form`), as the front end does first, at the source (`a zero-size type
-has no memory form`): an unsafe cast from or to one, which reinterprets a representation it does not
-have; and an extern parameter of one, which C has no form for. Neither can take a type parameter (a
-cast cannot take or produce a value of one, and an extern is not generic). An atomic operation works
-on an integer, a bool or a pointer, never a zero-size type. `sizeof` of a zero-size type is 0, and
-the arithmetic the standard library does with sizes is defined at 0 for what asks for no bytes
-(`checked_mul` does not divide by it, `bump_chunk` reserves no bytes and returns the current address,
-`HeapAllocator::alloc(0)` asks `malloc` for one byte so that it is never null).
+Erasing them never changes what a program reads or writes: a zero-size value has no bytes to read or
+write, and memory never holds one on its own. A raw load or store (`ptr_load`, `ptr_store`, volatile
+or not), an `alloca`, or a lend of a raw pointer's target (`f(unsafe &*p)`, which reads and writes
+it) is formed only at a type with `Sized`: at a type without parameters, one that is not zero-size,
+so `unsafe *p` at `()`, a `Brand['k]` or a capability is rejected, `Copy` or not
+(`raw_access_at_zero_size`, and at the source `a raw read, write or alloca at a zero-size type`); at
+a type that mentions a parameter, one with an exact `Sized` premise or a part with bytes whatever
+the parameters are, so a generic function's `unsafe *p` at `T` needs `where Sized[T]`
+(`raw_access_needs_sized`, and at the source `a raw read, write or alloca at T needs Sized[T]`).
+Nothing is checked again at an instantiation: a caller discharges `Sized` where it calls, so no
+specialization reads, writes or reserves a zero-size type, and the backend writes every load, store
+and `alloca` it meets. The containers and allocation functions take `Sized` of their elements
+(`lib/std/CONTRACTS.md`, "Zero sizes"): `OwnedVec![()]`, `Owned!::new(())` and a map to `()` are not
+formed. Two more operations reject a zero-size type (`zero_size_type_has_no_memory_form`), as the
+front end does first, at the source (`a zero-size type has no memory form`): an unsafe cast from or
+to one, which reinterprets a representation it does not have; and an extern parameter of one, which
+C has no form for. Neither can take a type parameter (a cast cannot take or produce a value of one,
+and an extern is not generic). An atomic operation works on an integer, a bool or a pointer, never a
+zero-size type. `sizeof` of a zero-size type is 0, and the arithmetic the standard library does with
+sizes is defined at 0 for what asks for no bytes (`checked_mul` does not divide by it, `bump_chunk`
+reserves no bytes and returns the current address, `HeapAllocator::alloc(0)` asks `malloc` for one
+byte so that it is never null).
 
 Two zero-size objects may share an address, with each other and with what holds them. Nothing relies on distinct addresses for zero-size data: the identities the
 compiler and the standard library compare (`Ref::address`, `ArenaVec::address` and
@@ -723,19 +723,18 @@ is right on a 32-bit and on a 64-bit target. The compiler never assumes their wi
 The size estimate that passes aggregates by pointer (`words`) counts every scalar, `usize`
 included, as one word on every target.
 
-**The size limit is the one place a width is assumed.** A type is formed only if its size is
-below 2^64 bytes, the address space of a 64-bit target (TY-SIZE-LIMIT), so `sizeof` of any formed
-type is a `usize`. The size is the one the backend's C has (`Types.layout`, `Types::layout`): a
-primitive its width, a pointer, a function value, `usize` and `isize` 8 bytes, zero-size parts
-erased, a product a C struct of the rest with C's padding, an array its element's size times its
-length, and an enum a `uint32_t` tag beside a union of its payloads, or its payload in the niche
-layout. Formation checks every closed type where it is written, declarations' closed parts once all
-declarations are formed (`type formation: (array (array u8 9223372036854775808) 2) is too large:
-its size is not below 2^64 bytes`), and the backend checks every type of a specialization again at
-its type arguments (`backend: ... is too large: its size is not below 2^64 bytes, in a
-specialization of g`), as a type that mentions a parameter may be small at one instantiation and
-too large at another. A 32-bit target would need the limit at 2^32; the compiler checks the 64-bit
-one only.
+**The size limit is the one place a width is assumed.** A type is formed only if its size is below
+2^64 bytes, the address space of a 64-bit target, so `sizeof` of any formed type is a `usize`. The
+size is the one the backend's C has (`Types.layout`, `Types::layout`): a primitive its width, a
+pointer, a function value, `usize` and `isize` 8 bytes, zero-size parts erased, a product a C struct
+of the rest with C's padding, an array its element's size times its length, and an enum a `uint32_t`
+tag beside a union of its payloads, or its payload in the niche layout. Formation checks every
+closed type where it is written, declarations' closed parts once all declarations are formed (`type
+formation: (array (array u8 9223372036854775808) 2) is too large: its size is not below 2^64
+bytes`), and the backend checks every type of a specialization again at its type arguments
+(`backend: ... is too large: its size is not below 2^64 bytes, in a specialization of g`), as a type
+that mentions a parameter may be small at one instantiation and too large at another. A 32-bit
+target would need the limit at 2^32; the compiler checks the 64-bit one only.
 
 ### Number conversions
 
@@ -862,13 +861,10 @@ These are the places where Kursal differs from what one might expect.
   a linear type in an array of length zero. Type parameters never carry it: `forall T` may stand for
   a linear type unless a premise says `Copy[T]`.
 
-  Moving code to `!` names is not a find-and-replace. The same name can be linear in one module and
-  plain in another (`elf::Open` beside `fatfile::Open!`), and a type of one's own named `Copy!` is
-  not the `Copy[T]` premise. Let the compiler drive the change: resolution reports every name it
-  cannot resolve in one run, each at the name itself, and says which spelling exists
-  (`unknown name Open; the linear type is Open!`). When the name came through a `use` that still
-  imports the other spelling, the hint names that line too (`unknown name Open!; the linear type is
-  Open!, imported as Open at src/lib.kur:3:5`), so the fix goes in the `use`.
+  Resolution reports every name it cannot resolve in one run, each at the name itself and with the
+  spelling that exists. When the name came through a `use` that imports the other spelling, the hint
+  names that line too (`unknown name Buffer!; the linear type is Buffer!, imported as Buffer at
+  src/lib.kur:1:5`), so the fix goes in the `use`.
 - **Builtins are imported.** Only the primitive types, `Never`, `Copy`, `Exposed` and `Sized` are
   always in scope. What else the compiler provides, `core` exports from the module it belongs to, and
   code imports it like any other name (see the reference compiler's README, "Builtins"):
@@ -939,6 +935,14 @@ These are the places where Kursal differs from what one might expect.
   is `Copy`, as `()` is C's `void`, where a linear value would vanish. Foreign code takes and passes values and lends nothing back, so
   an extern takes no place parameter (`extern f takes a place parameter; foreign code takes values`)
   and no function type in its signature takes one (`extern_place_parameter`), where KURS can write one.
+  Two externs of the standard library (`lib/alloc/heap.kur`, `lib/libc/thread.kur`):
+
+  ```kursal
+  extern "C" fn malloc(size: usize) -> *u8;
+  extern "C" fn kur_libc_thread_create(entry: unsafe fn(*u8) -> *u8, arg: *u8) -> *u8;
+  ```
+
+  and a call of one is unsafe: `let p = unsafe malloc(16usize);`.
 - **Generic code over linear types.** A type parameter may stand for a linear type unless a premise
   says `Copy[T]`. Using a value twice, or dropping it on one path (`a && b` drops `b` when `a` is
   false), needs `Copy[T]`. The arena collections (`ArenaVec`, `ArenaMap`, `ArenaSet`, `List`) require
@@ -978,24 +982,22 @@ These are the places where Kursal differs from what one might expect.
   rejected too (`struct T { f: fn(foreach *F of *T => *F) -> u32 }`: `recursive foreach needs a
   named type between`). Errors name the declaration whose walk found them.
 - **A `foreach` type has an expansion at every instantiation.** A source that is no product (nor a
-  sum) is one component: `foreach F of u32 => *F` is `(*u32,)`. Behind a pointer each component is
-  a pointer to it, to a field or an element; a pointer to a leaf is the one component. A pointer to
-  a sum is opaque, copied, passed and read whole (`unsafe *p`, then a `match`), and is no source:
-  its components would be those of the variant held there, which only a read finds.
-  `foreach F of *Option[u8] => F` is rejected, by value or with `*F`, through a name too, and so is
-  a traversal of such a pointer (`a foreach source cannot be a pointer to a sum`). Nothing is checked
-  again at an instantiation: `Exposed[*T]`, which a generic traversal needs, and which the core's
-  `sizeof` of a foreach type needs of each pointer source that mentions a parameter
-  (`foreach_source_not_exposed`; the source writes no `sizeof` of a foreach type, which is no type
-  argument), never holds for an enum `T`, so no generic code forms `foreach *F of *T => F` there,
-  and a pointer to a sum gives no rows, an empty expansion, where a type that is never formed is
-  laid out anyway (TY-FOREACH-ROWS-PTR). `*F` binds F to each component's
-  pointee, so its source must give pointers whatever the type arguments are, and show them as
-  written: an explicit pointer, or a tuple, struct, enum or array whose components are written as
-  pointers. `foreach *F of T => F` is rejected, as `T` may be
-  `bool`, and so is a name, even one whose shape is a visible product of pointers: `foreach *F
-  needs a source written with pointer components`. Through a pointer a `foreach` only computes
-  addresses, and reads nothing.
+  sum) is one component: `foreach F of u32 => *F` is `(*u32,)`. Behind a pointer each component is a
+  pointer to it, to a field or an element; a pointer to a leaf is the one component. A pointer to a
+  sum is opaque, copied, passed and read whole (`unsafe *p`, then a `match`), and is no source: its
+  components would be those of the variant held there, which only a read finds. `foreach F of
+  *Option[u8] => F` is rejected, by value or with `*F`, through a name too, and so is a traversal of
+  such a pointer (`a foreach source cannot be a pointer to a sum`). Nothing is checked again at an
+  instantiation: `Exposed[*T]`, which a generic traversal needs, and which the core's `sizeof` of a
+  foreach type needs of each pointer source that mentions a parameter (`foreach_source_not_exposed`;
+  the source writes no `sizeof` of a foreach type, which is no type argument), never holds for an
+  enum `T`, so no generic code forms `foreach *F of *T => F` there, and a pointer to a sum gives no
+  rows, an empty expansion, where a type that is never formed is laid out anyway. `*F` binds F to
+  each component's pointee, so its source must give pointers whatever the type arguments are, and
+  show them as written: an explicit pointer, or a tuple, struct, enum or array whose components are
+  written as pointers. `foreach *F of T => F` is rejected, as `T` may be `bool`, and so is a name,
+  even one whose shape is a visible product of pointers: `foreach *F needs a source written with
+  pointer components`. Through a pointer a `foreach` only computes addresses, and reads nothing.
 - **A `foreach` over a value of a `foreach` type maps it.** With `v: foreach F of S => B`, `foreach
   x of v { .. }` gives the body each component of `v`, of type `B` at the component's row, and makes
   `foreach F of S => R`, `R` the body's type: the same source and pattern, so it needs `Exposed[S]`

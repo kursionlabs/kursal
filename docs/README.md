@@ -72,12 +72,7 @@ runtime's, which the `libc` package declares (so `bin/kursal doc lib/std`
 documents `libc` as a dependency of `std`, and its module pages hold their
 overviews and `libc::thread`'s raw `Thread!`), and are plumbing rather than
 interface. Kursal has no item-level privacy, so every other declaration of a
-public module is listed. A visibility rule would be applied where the
-generator walks a module's items (`module_page` and `search_index` in
-`compiler/doc/generator.kur`) and where it gathers a type's methods and the
-instances (`model::build`), so that hidden items get no page, row, sidebar
-entry or search record, and links to them (`model::decl_url`) are left out as
-links to undocumented items are.
+public module is listed.
 
 ## Re-exported modules
 
@@ -146,7 +141,7 @@ result, Enter to open it and Escape to close the list.
 
 ## Theme
 
-The site uses the Kursion palette and opens in dark mode; the header toggle switches
+The site uses the project's palette and opens in dark mode; the header toggle switches
 to light mode and saves the choice in the browser. Headings, navigation and prose use
 Space Grotesk and code uses JetBrains Mono, loaded from Google Fonts with system fallbacks.
 Text keeps a contrast of at least 4.5:1 against its background in both modes.

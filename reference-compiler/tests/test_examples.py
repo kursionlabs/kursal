@@ -1,5 +1,5 @@
-"""The example programs: every package in examples/ builds, every program runs as recorded, and every
-program in examples/bad/ is rejected for the reason it demonstrates."""
+"""The example programs: every package in examples/ and tests/fixtures/ builds, every program runs as
+recorded, and every program in examples/bad/ is rejected for the reason it demonstrates."""
 
 import subprocess
 import shutil
@@ -19,6 +19,8 @@ from kursal.sexpr import KursError
 from kursal.sigs import signatures
 
 EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
+# Packages that test one feature of the compiler or one past bug, rather than show the language.
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 SAMPLE = "one two\nthree four five\n"
 JSON_IN = '{"name": "Ada", "tags": ["x", 1, -2.5e3, true, null], "nested": {"empty": [], "o": {}}}'
@@ -199,7 +201,7 @@ REJECTED = {
     "overlapping_instances.kur": "overlapping instances of Describe: \\(u32\\) and \\(T\\)",
     "private_import.kur": "unknown or private member File! of fs",
     "push_after_finish.kur": "15:6: .*value 'builder' has been moved and cannot be lent$",
-    "ref_after_remove_in.kur": "17:28: brand mismatch: 'b and 'a; 'b was opened at 15:5, 'a at 13:5$",
+    "ref_after_remove_in.kur": "16:20: brand mismatch: 'b and 'a; 'b was opened at 14:5, 'a at 12:5$",
     "release_linear.kur": "14:25: type argument must satisfy Copy$",
     "reopened_brand.kur": "15:5: let exists 'a reuses a brand already in scope$",
     "safe_adopt.kur": "calling an unsafe function requires unsafe authorization",
@@ -241,7 +243,8 @@ def build(package: Path, out: Path) -> tuple[str, Optional[Path], str]:
 
 class ExampleTests(unittest.TestCase):
     def test_every_example_builds_and_runs_as_recorded(self):
-        packages = sorted(p.parent for p in EXAMPLES.glob("*/kur.toml") if p.parent.name != "libuv_echo")
+        packages = sorted(p.parent for top in (EXAMPLES, FIXTURES) for p in top.glob("*/kur.toml")
+                          if p.parent.name != "libuv_echo")
         with tempfile.TemporaryDirectory(prefix="kursal-examples-") as base:
             out = Path(base)
             with ProcessPoolExecutor(max_workers=4) as pool:

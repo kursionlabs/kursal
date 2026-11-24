@@ -643,7 +643,8 @@ def reference_lowering(path: Path) -> str:
 
 def built_paths() -> list[Path]:
     """Every package in the repository, every bad example, and the compiler itself."""
-    packages = sorted({p.parent for top in ("examples", "lib") for p in (ROOT / top).glob("*/kur.toml")})
+    packages = sorted({p.parent for top in ("examples", "reference-compiler/tests/fixtures", "lib")
+                       for p in (ROOT / top).glob("*/kur.toml")})
     return [*packages, *sorted((ROOT / "examples/bad").glob("*.kur")), COMPILER]
 
 
@@ -651,7 +652,8 @@ def reference_builds() -> list[dict[str, Optional[str]]]:
     """`reference_build` for each of `built_paths`, computed once per change to the sources."""
     paths = built_paths()
     sources = [*(ROOT / "lib").rglob("*.kur"), *(ROOT / "lib").rglob("*.toml"), *(ROOT / "examples").rglob("*.kur"),
-               *(ROOT / "examples").rglob("*.toml"), *COMPILER.rglob("*.kur"), *COMPILER.rglob("*.toml"),
+               *(ROOT / "examples").rglob("*.toml"), *(ROOT / "reference-compiler/tests/fixtures").rglob("*.kur"),
+               *(ROOT / "reference-compiler/tests/fixtures").rglob("*.toml"), *COMPILER.rglob("*.kur"), *COMPILER.rglob("*.toml"),
                *(ROOT / "reference-compiler/kursal").glob("*.py")]
 
     def make() -> list:
@@ -1378,7 +1380,8 @@ def serialized(package: Path) -> Optional[dict[str, Optional[str]]]:
 def lowered_programs() -> list[dict[str, Optional[str]]]:
     """`serialized` for every package that builds, computed once per change to the sources."""
     sources = [*(ROOT / "lib").rglob("*.kur"), *(ROOT / "lib").rglob("*.toml"), *(ROOT / "examples").rglob("*.kur"),
-               *(ROOT / "examples").rglob("*.toml"), *(ROOT / "reference-compiler/kursal").glob("*.py")]
+               *(ROOT / "examples").rglob("*.toml"), *(ROOT / "reference-compiler/tests/fixtures").rglob("*.kur"),
+               *(ROOT / "reference-compiler/tests/fixtures").rglob("*.toml"), *(ROOT / "reference-compiler/kursal").glob("*.py")]
 
     def make() -> list:
         with ProcessPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
@@ -2008,7 +2011,8 @@ class CompilerTests(unittest.TestCase):
         return result.stdout
 
     def test_resolver_matches_reference(self):
-        packages = sorted({p.parent for top in ("examples", "lib") for p in (ROOT / top).glob("*/kur.toml")})
+        packages = sorted({p.parent for top in ("examples", "reference-compiler/tests/fixtures", "lib")
+                           for p in (ROOT / top).glob("*/kur.toml")})
         singles = sorted((ROOT / "examples/bad").glob("*.kur"))
         self.assertGreater(len(packages), 40)
         for path in [*packages, *singles, COMPILER]:
@@ -2048,7 +2052,8 @@ class CompilerTests(unittest.TestCase):
         self.compare_outputs("sigs", reference_signatures, paths)
 
     def test_signatures_match_reference(self):
-        packages = sorted({p.parent for top in ("examples", "lib") for p in (ROOT / top).glob("*/kur.toml")})
+        packages = sorted({p.parent for top in ("examples", "reference-compiler/tests/fixtures", "lib")
+                           for p in (ROOT / top).glob("*/kur.toml")})
         singles = sorted((ROOT / "examples/bad").glob("*.kur"))
         self.assertGreater(len(packages), 40)
         self.compare_signatures([*packages, *singles, COMPILER])
@@ -2072,7 +2077,8 @@ class CompilerTests(unittest.TestCase):
             self.compare_signatures(paths)
 
     def test_inference_matches_reference(self):
-        packages = sorted({p.parent for top in ("examples", "lib") for p in (ROOT / top).glob("*/kur.toml")})
+        packages = sorted({p.parent for top in ("examples", "reference-compiler/tests/fixtures", "lib")
+                           for p in (ROOT / top).glob("*/kur.toml")})
         singles = sorted((ROOT / "examples/bad").glob("*.kur"))
         self.assertGreater(len(packages), 40)
         self.compare_outputs("infer", reference_inference_text, [*packages, *singles, COMPILER])
@@ -2295,8 +2301,9 @@ class CompilerTests(unittest.TestCase):
 
     def test_a_failed_output_write_fails_the_command(self):
         with open("/dev/full", "w") as full:
-            result = subprocess.run([str(self.binary), "parse", str(ROOT / "examples/sayhi/lib.kur")], stdout=full,
-                                    stderr=subprocess.PIPE, text=True, timeout=TIME_LIMIT, preexec_fn=limit_memory,
+            result = subprocess.run([str(self.binary), "parse", str(ROOT / "reference-compiler/tests/fixtures/sayhi/lib.kur")],
+                                    stdout=full, stderr=subprocess.PIPE, text=True, timeout=TIME_LIMIT,
+                                    preexec_fn=limit_memory,
                                     env=dict(os.environ, KURSAL_LIB=str(LIB)))
         self.assertEqual((result.returncode, result.stderr), (1, "cannot write the output\n"))
 
@@ -2618,7 +2625,8 @@ class CompilerTests(unittest.TestCase):
             self.assertTrue((base / "site/std/index.md").is_file())
 
     def test_parser_matches_reference(self):
-        paths = sorted(p for top in ("lib", "examples", "compiler", "reference-compiler/examples")
+        paths = sorted(p for top in ("lib", "examples", "compiler", "reference-compiler/examples",
+                                     "reference-compiler/tests/fixtures")
                        for p in (ROOT / top).rglob("*.kur"))
         accepted = []
         for path in paths:

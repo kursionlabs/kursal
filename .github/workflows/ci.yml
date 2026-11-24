@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      # Clang compiles the generated C; its package brings LLVM's gold plugin, which the GNU linker
+      # needs for the split build's -flto=thin. libuv is for examples/libuv_echo's build test.
+      - name: Install Clang and libuv
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libuv1-dev pkg-config
+
+      - uses: astral-sh/setup-uv@v6
+
+      # The tree-sitter CLI runs tests/test_editors.py; `tree-sitter generate` needs Node.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install the tree-sitter CLI
+        run: npm install -g tree-sitter-cli@0.26.9
+
+      - name: Type-check the reference compiler
+        working-directory: reference-compiler
+        run: |
+          uv sync
+          uv run mypy
+
+      - name: Run the tests
+        working-directory: reference-compiler
+        run: uv run python tools/test.py -j 4
+
+      - name: Bootstrap the compiler and check its fixpoint
+        run: scripts/bootstrap.sh --check
+
+      # KURSAL_SELFHOST=1 adds the self-compilation tests of tests/test_compiler.py, the only module
+      # that reads it.
+      - name: Run the self-compilation tests
+        working-directory: reference-compiler
+        env:
+          KURSAL_SELFHOST: "1"
+        run: uv run python tools/test.py -j 4 tests.test_compiler

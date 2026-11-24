@@ -1,17 +1,29 @@
 """Packages and name resolution, on small package trees written per test."""
 
+import os
 import re
+import shutil
 import tempfile
 import unittest
+from multiprocessing import util
 from pathlib import Path
 
 from kursal.core import ModuleId
 from kursal.resolve import LIB as LIBRARIES, Decl, ResolveError, resolve
 
+# The directory of this process's trees, made on first use and removed when the process exits: a
+# multiprocessing finalizer runs at the exit of the main process and of a pool's worker alike (where
+# `atexit` does not), and only in the process that made it.
+_roots: dict[int, Path] = {}
+
 
 def tree(files):
-    """Write {relative path: text} into a fresh directory; returns its path."""
-    root = Path(tempfile.mkdtemp(prefix="kursal-resolve-"))
+    """Write {relative path: text} into a fresh directory, removed when the process exits; returns its path."""
+    parent = _roots.get(os.getpid())
+    if parent is None:
+        parent = _roots[os.getpid()] = Path(tempfile.mkdtemp(prefix="kursal-resolve-"))
+        util.Finalize(None, shutil.rmtree, args=(parent,), kwargs={"ignore_errors": True}, exitpriority=0)
+    root = Path(tempfile.mkdtemp(dir=parent))
     for rel, text in files.items():
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)

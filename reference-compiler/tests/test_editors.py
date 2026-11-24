@@ -80,7 +80,8 @@ class EditorGrammarTests(unittest.TestCase):
                                      f"{grammar.name}/src/{name} is stale: run `tree-sitter generate`")
 
     def test_every_source_parses(self):
-        paths = [str(path) for top in ("lib", "examples", "reference-compiler/examples") for path in (ROOT / top).rglob("*.kur")
+        tops = ("lib", "examples", "compiler", "reference-compiler/examples", "reference-compiler/tests/fixtures")
+        paths = [str(path) for top in tops for path in (ROOT / top).rglob("*.kur")
                  if "bad" not in path.relative_to(ROOT).parts]
         self.assertGreater(len(paths), 100)
         result = tree_sitter(KUR, "parse", "-q", *paths)

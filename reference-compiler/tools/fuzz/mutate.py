@@ -1,6 +1,6 @@
 """Mutation of existing sources: programs near ones the front end accepts.
 
-A seed picks a source module (a generated program, a module of `examples/`, or a module of a package
+A seed picks a source module (a generated program, a module of `examples/` or the test fixtures, or a module of a package
 the reference's own tests lower, from a corpus `python -m tools.fuzz corpus` writes) and applies one to three mutations to its function bodies, statement by statement:
 drop, duplicate or swap statements; move a statement into or out of a branch or loop; insert an early
 `return` (or a trap) inside a loop or branch holding linear values; replace a moved name with another of
@@ -21,10 +21,10 @@ from tools.fuzz.reduce import split_statements
 
 
 def sources() -> list[tuple[str, bool]]:
-    """Single-module sources to mutate, each with whether it needs the standard library: examples whose
-    package is one module depending on at most `core`."""
+    """Single-module sources to mutate, each with whether it needs the standard library: examples and
+    test fixtures whose package is one module depending on at most `core`."""
     found: list[tuple[str, bool]] = []
-    for toml in sorted((ROOT / "examples").glob("*/kur.toml")):
+    for toml in sorted(p for top in ("examples", "reference-compiler/tests/fixtures") for p in (ROOT / top).glob("*/kur.toml")):
         mods = sorted(toml.parent.rglob("*.kur"))
         text = toml.read_text()
         deps = re.findall(r"\[dependencies\.(\w+)\]", text)

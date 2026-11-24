@@ -1,11 +1,14 @@
 # Examples
 
 Each directory is a package: a `kur.toml` manifest and its `.kur` sources. Packages with
-`kind="executable"` are programs; the others are libraries that demonstrate a feature and only need to
-build. `bad/` holds single-file programs that the compiler must reject.
+`kind="executable"` are programs; the others are libraries that demonstrate a feature by compiling.
+`bad/` holds single-file programs that the compiler must reject.
 
 `tests/test_examples.py` in the reference compiler builds the packages, runs programs with the
 arguments and input they expect, and checks that every program in `bad/` is rejected for its reason.
+Packages that exist only to test the compiler, one feature or one past bug each, are in
+[`reference-compiler/tests/fixtures/`](../reference-compiler/tests/fixtures/), and the same test builds
+and runs them.
 `libuv_echo` has a separate build check when libuv is installed and a loopback script for its socket behavior.
 
 ## Building and running one
@@ -22,7 +25,8 @@ printf 'the cat and the hat\n' | /tmp/wordfreq
 `bin/kursal build PACKAGE -o OUTPUT` writes the C into `OUTPUT.build`, a file per module, and
 compiles it, with the C runtime (`lib/libc`), into `OUTPUT`; with `--single-c` it writes one
 file, `OUTPUT.c`. Without `-o` it writes `a.out` and `a.out.build` in the current directory.
-Use `--emit-c` to print the C, including for a library package.
+A library has no executable to build, so `build` of one needs `--emit-c`, which prints its C:
+`bin/kursal build examples/linear --emit-c > /dev/null` checks it.
 `bin/kursal build examples/bad/type_mismatch.kur` shows a rejected program's diagnostic.
 
 The reference compiler builds a program the same way, from `reference-compiler/`:
@@ -84,26 +88,23 @@ and report through their exit status, 0 when every check holds.
 | `format_strings` | `f"..."` strings |
 | `iter_basics`, `iter_combinators`, `iter_custom`, `iter_for_loops`, `iter_collections` | iterators, adapters, custom iterators, `for` loops and collecting |
 | `functions` (with `bad/function_value_at_two_brands.kur`) | function values, indirect calls and closures |
+| `match_labels`, with `bad/match_unknown_label.kur` | match cases that name a variant by its label alone, `Some(x)` or `None`, looked up in the scrutinee's sum, also a sum with no name |
+| `foreach_map`, with `bad/foreach_as_field.kur`, `bad/foreach_pointer_over_parameter.kur`, `bad/foreach_through_pointer_to_sum.kur` | a `foreach` over a value of a `foreach` type, mapping each component once, and where a `foreach` type may not appear |
 | `modules` | a package whose public facade exports a namespace from an internal module |
 | `core_only` | a program that needs only `core`: no allocator, no operating system |
 | `heap` (library) | C-heap interop: `malloc` checked for null, a raw pointer cast, and `free` |
-| `skolems`, `mint_in_arm`, `mint_join`, `mint_loop` (libraries), with `bad/mismatched_skolem.kur`, `bad/unbound_result_brand.kur` | brands: minting them and carrying them through branches, joins and loops |
+| `skolems`, `mint_join` (libraries), with `bad/mismatched_skolem.kur`, `bad/unbound_result_brand.kur`, `bad/reopened_brand.kur`, `bad/shadowing_exists_binder.kur` | brands: minting them, carrying them through branches and joins, and naming each apart from those in scope |
 | `basic`, `arrays`, `tuples`, `shapes` (libraries) | structs, fixed-size arrays, tuples, enums |
 | `generics`, `generic_result`, `option_result` (libraries) | generic types and functions, `Result`, `Option` and `?` |
 | `recursion`, `strings` (libraries) | recursion and early `return`; string literals as `Slice[u8, 'static]` |
-| `closure_env_copy`, `closure_method` (libraries) | closure parameter types |
+| `closure_method` (library) | closure parameter types |
 
-## Fixtures and feature tests
+## Feature tests
 
-Programs that exist to test the compiler: each probes one feature or one past bug, and most report only
-through their exit status.
+Programs that each check one feature through its exit status.
 
 | Example | Tests |
 |---|---|
-| `ring` | a fixed-capacity ring buffer over `OwnedVec!`; exits with 211, a checksum of what it popped and turned away |
-| `sayhi` | stdin to a formatted reply, the smallest such program (`greet` is the one to read) |
-| `box_store_liveness` | storing a linear value through a raw pointer consumes what the stored value moved |
-| `at_sugar` | `&` in-out parameters |
 | `tuple_decl` | `tuple Name(T, ...);` declarations |
 | `non_null` | `NonNull[T]`, the pointer that is never null, and the enums whose layout it fills: `Option[NonNull[T]]`, `Option[Ref[T, 'k]]`, a `List` link and a user's own enum are one word |
 | `zero_size` | zero-size types (`()`, brands, capabilities, markers, empty arrays): no bytes in `sizeof`, in the structs that hold them, or in calls and matches; no raw read, write or `alloca` at one, so a container holds one only beside bytes |
@@ -118,9 +119,14 @@ Ordinary errors:
 |---|---|
 | `type_mismatch.kur` | a `bool` is where a `u32` is declared: no implicit conversions |
 | `non_exhaustive_match.kur` | a `match` leaves out a variant of the enum |
+| `match_unknown_label.kur` | a match case names a label the scrutinee's sum does not have |
 | `overlapping_instances.kur` | two instances of one trait apply to the same type |
 | `private_import.kur` | a name is reached through a module that only imports it, without `export` |
 | `forged_file.kur` | a `File!` is built outside its module, whose representation is restricted |
+| `too_large_type.kur` | a type is not smaller than the address space, 2^64 bytes |
+| `foreach_as_field.kur` | a `foreach` type is a struct's field; it is only the type of a whole value, parameter or result |
+| `foreach_pointer_over_parameter.kur` | `foreach *F of T` matches pointer components, and a type parameter `T` may have none |
+| `foreach_through_pointer_to_sum.kur` | a `foreach` traverses a pointer to a sum, whose components depend on the variant it holds |
 
 Ownership, brands and authority:
 
@@ -134,6 +140,10 @@ Ownership, brands and authority:
 | `mismatched_skolem.kur` | values of two different brands are mixed |
 | `unbound_result_brand.kur` | a result type names a brand nothing binds |
 | `function_value_at_two_brands.kur` | a function value, whose type quantifies no brand, is called at two brands |
+| `reopened_brand.kur` | `let exists` opens a package under a brand name already in scope |
+| `shadowing_exists_binder.kur` | an `exists` type's binder is spelled as a brand in scope |
+| `push_after_finish.kur` | a list builder is used after `finish` consumed it and handed the persistent list out |
+| `release_linear.kur` | `Allocation!::release`, which gives up the value in the block, is used at a linear type |
 | `ref_after_remove_in.kur` | a `Ref` into a map is used after `remove_in` gave the map a new brand |
 | `implicit_package_open.kur`, `implicit_package_open_plain_let.kur`, `implicit_package_open_assignment.kur` | an existential package is used without `let exists` opening it |
-| `close_by_number.kur`, `safe_adopt.kur` | an `unsafe fn` is called without `unsafe` |
+| `close_by_number.kur`, `write_by_number.kur`, `safe_adopt.kur` | an `unsafe fn` is called without `unsafe` |

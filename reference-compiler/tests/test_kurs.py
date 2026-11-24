@@ -93,8 +93,9 @@ VARIANTS = (
 
 
 def packages() -> list[Path]:
-    """The library packages and every example package."""
-    return [LIB / name for name in LIBRARY] + sorted(p.parent for p in (ROOT / "examples").glob("*/kur.toml"))
+    """The library packages and every example and fixture package."""
+    return [LIB / name for name in LIBRARY] + sorted(p.parent for top in ("examples", "reference-compiler/tests/fixtures")
+                                                     for p in (ROOT / top).glob("*/kur.toml"))
 
 
 def round_trip(package: Path) -> tuple[str, Optional[str]]:

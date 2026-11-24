@@ -4,8 +4,17 @@ Kursal is a systems programming language that compiles to C.
 
 ## Quickstart
 
-You need Linux, [uv](https://docs.astral.sh/uv/) (it provides Python 3.12 for the reference compiler),
-and Clang, or another C compiler named by `$KURSAL_CC`. Build the compiler, then a program with it:
+You need:
+
+- Linux: `scripts/bootstrap.sh` runs each compiler it builds under `ulimit -v` and `timeout`, capped at
+  6 GB of address space and 10 minutes.
+- [uv](https://docs.astral.sh/uv/), which provides Python 3.12 or later for the reference compiler.
+- Clang, or another C compiler named by `$KURSAL_CC`, and a linker that does link-time optimization:
+  `kursal build`, the bootstrap's included, compiles a file per module with `-flto=thin`, so the GNU
+  linker needs LLVM's gold plugin (`LLVMgold.so`), which most distributions install with Clang.
+
+The tested toolchain is Clang 23.1, GNU ld 2.47, uv 0.9 and Python 3.12. Build the compiler, then a
+program with it:
 
 ```sh
 scripts/bootstrap.sh
@@ -17,6 +26,7 @@ which then builds itself into `bin/kursal`. The program is
 [`examples/hello/lib.kur`](examples/hello/lib.kur):
 
 ```kursal
+// Prints "Hello, world!" to standard output with `std::io::print`.
 use std::io::print;
 
 fn main() {
@@ -31,13 +41,49 @@ Hello, world!
 ```
 
 `kursal build PATH` writes `a.out` in the current directory, and its generated C in `a.out.build`,
-a file per module, which Clang or GCC compiles in parallel and links with link-time optimization.
-Use `-o OUTPUT` to choose another location, `--single-c` to compile the C as one file, `a.out.c`,
-which builds slower and runs a little faster, or `--emit-c` to print the C. Run `bin/kursal --help`
-for the other commands.
+a file per module, which Clang or GCC compiles in parallel and links with link-time optimization;
+another `$KURSAL_CC` gets the C as one file, `a.out.c`. Use `-o OUTPUT` to choose another location,
+`--single-c` to compile the C as one file with any compiler, which builds slower and runs a little
+faster, or `--emit-c` to print the C. `kursal check` checks a KURS file, the core language the
+compiler lowers to, not a source package; `bin/kursal build PATH --emit-c > /dev/null` checks a
+package, a library too, without compiling its C. Run `bin/kursal --help` for the other commands.
 
 [`examples/README.md`](examples/README.md) lists the example programs, starting with the ones to read
 first.
+
+## Packages
+
+A package is a directory with a manifest, `kur.toml`, and its sources: every `.kur` file under the
+source root is a module, named by its path (`a/lib.kur` and `a.kur` are both module `a`), and
+`lib.kur` at the root is the package's root module. A single `.kur` file also builds on its own, as
+a package that depends on the standard library `std`.
+
+```toml
+[package]
+name = "app"
+kind = "executable"
+entry = "main"
+source_root = "."
+
+[dependencies.std]
+path = "../lib/std"
+```
+
+| Key | |
+|---|---|
+| `name` | the package's name; required |
+| `kind` | `"library"` (the default) or `"executable"` |
+| `entry` | an executable's entry function, required for one: a path in the package, bare (`"main"`) or from `package` (`"package::main"`, `"package::server::main"`) |
+| `source_root` | the directory of the sources, relative to the manifest; the default is `"src"` |
+| `link_flags` | an array of nonempty strings, each passed as one argument to the C compiler after the generated C and C sources, without a shell; the flags of every dependency are passed too, so a library can declare its own `-l` |
+| `c_sources` | an array of C source paths, relative to the package, compiled with the generated C into every executable that depends on the package |
+| `[dependencies.NAME]` | a dependency, imported as `NAME` (`use NAME::module::Item;`); `path`, its only key, is its directory or its `kur.toml`, relative to the manifest |
+
+Any other key in the manifest or in `[package]` is an error (`.../kur.toml: unknown manifest key
+version`), as is a `kind` other than those two (`.../kur.toml: manifest kind must be "library" or
+"executable"`). The standard library is `std`, over `core`, `alloc` and `libc`, all in
+[`lib/`](lib/); a package that needs `core` alone depends on it directly, as
+[`examples/core_only`](examples/core_only/kur.toml) does.
 
 ## API documentation
 
@@ -83,6 +129,25 @@ containers with the fallible constructors, which return an `AllocError` instead:
 container made so still aborts if it later fails to grow.
 [`lib/std/CONTRACTS.md`](lib/std/CONTRACTS.md) records the obligation of every function with a raw
 pointer in its signature, and why the rest are safe.
+
+## Contributing
+
+Report bugs and propose changes in the repository's GitHub issues. The compiler in `compiler/` must
+accept and reject the same programs as the reference compiler, with the same messages, and produce
+the same output, so a change to the language changes both, with tests in
+`reference-compiler/tests/`. Before sending a change, run:
+
+```sh
+cd reference-compiler
+uv sync
+uv run mypy                          # static types of the reference compiler
+uv run python tools/test.py -j 8     # every test module, compiler/ against the reference too
+cd ..
+scripts/bootstrap.sh --check         # the compiler builds itself to a fixpoint
+```
+
+[`reference-compiler/README.md`](reference-compiler/README.md) has more ways to run the tests, and
+[`compiler/README.md`](compiler/README.md) how the compiler is built and compared.
 
 ## License
 
