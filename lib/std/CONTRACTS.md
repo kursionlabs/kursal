@@ -516,7 +516,7 @@ every function that reads or writes an element through a pointer takes
 `Sized` of it, `Sized[T]` for a type parameter (`where Sized[T]`): the
 containers and allocation functions, `Owned!`, `Vec!`, `OwnedVec!`,
 `HashMap!` and `OwnedMap!` (`Sized[K]` and `Sized[V]`), `Arena!::alloc`
-and `alloc_slice`, `Ref::new`, `ArenaVec`, `ArenaMap` and `ArenaSet`, and
+and `alloc_slice`, `ref_in`, `ArenaVec`, `ArenaMap` and `ArenaSet`, and
 the raw accessors in `core` (`Ref::with`, `update`, `update_in`, `replace`,
 `copy`, `set` and `read`, `Region!::replace`, `Array!::set` and `get`,
 `raw_get`, `lend` and `lend_in`). An element
@@ -630,7 +630,7 @@ Types whose hidden representation protects authority or bounds:
 | `ArenaVec[T,'k]`, `Header` | `alloc::collections::arena_vec` | a header naming segments of the sizes `locate` computes, with `len` within them; a forged one is read and written through |
 | `ArenaMap[K,V,'k]`, `ArenaSet[K,'k]`, `MapState`, `Entry` | `alloc::collections::arena_map` | slots that index live entries; a forged map probes out of range, which `trap` stops |
 | `List[T,'k]`, `Cons[T,'k]`, `ListBuilder![T,'k]` | `alloc::collections::list` | a list is persistent: no code outside the module reaches a cell's `Ref`, so none can rewrite a cell a list holds (and make it cyclic). `ListBuilder!` writes only the cells of the list it is building, and is linear so that `finish` leaves no copy to link more cells onto the list it hands out |
-| `Arena!['k]`, `Chunk` | `alloc::arena` | one long-lived brand tied to a chunk chain this module built. It holds only `Copy` values (`alloc`, `alloc_slice`, `Ref::new` and `List::cons` require `Copy`), so freeing its chunks unread loses nothing linear |
+| `Arena!['k]`, `Chunk` | `alloc::arena` | one long-lived brand tied to a chunk chain this module built. It holds only `Copy` values (`alloc`, `alloc_slice`, `ref_in` and `List::cons` require `Copy`), so freeing its chunks unread loses nothing linear |
 | `Buffer!`, `BufferRestore!['k]` | `alloc::buffer` | `Buffer!` owns a heap byte run that `destroy` frees with no capability; `BufferRestore!` plus the matching `Exclusive!` yields the owning `Buffer!` back |
 | `FixedWriter!` | `alloc::fmt` | a buffer that never grows past `cap`; its contents are always a prefix of what was written |
 | `HeapAllocator`, `Storage` | `alloc::heap` | zero-field receivers for the allocator's static methods; they own no memory |

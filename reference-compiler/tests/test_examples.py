@@ -181,8 +181,9 @@ RUNS: dict[str, tuple[tuple, ...]] = {
 
 # examples/bad/: each program, and the diagnostic that rejects it.
 REJECTED = {
-    "branch_inconsistent.kur": "linear value 'h' remains live on some paths",
+    "branch_inconsistent.kur": "22:5: .*linear value 'h' remains live on some paths to the end of the `if` at 22:5$",
     "close_by_number.kur": "calling an unsafe function requires unsafe authorization",
+    "constructor_call.kur": "8:5: `Option::Some` is a constructor; write `Option::Some\\.\\(\\.\\.\\.\\)`$",
     "double_use_handle.kur": "value 'h' has been moved",
     "foreach_as_field.kur": "8:1: a component is a foreach type, which is only the type of a whole value, parameter or result$",
     "foreach_pointer_over_parameter.kur": "8:1: type formation: foreach \\*F needs a source written with pointer components$",
@@ -193,11 +194,13 @@ REJECTED = {
     "implicit_package_open.kur": "pattern does not match exists '1\\. \\(Tag!\\['1\\], u32\\)",
     "implicit_package_open_assignment.kur": "type mismatch: exists '1\\. Tag!\\['1\\] and Tag!\\['a\\]",
     "implicit_package_open_plain_let.kur": "a struct pattern needs a struct, not exists '1\\. Tag!\\['1\\]",
-    "leaked_handle.kur": "linear value 'h' is not consumed before return",
+    "leaked_handle.kur": "15:5: .*linear value 'h' is not consumed before return$",
+    "lend_a_capture.kur": "19:20: a is captured as a copy, which cannot be lent$",
+    "lend_a_let.kur": "19:14: a is not a var; a lent place must be a var$",
     "linear_in_arena.kur": "type argument must satisfy Copy",
     "mismatched_skolem.kur": "15:41: brand mismatch: Ref\\[u32, '2\\] and Ref\\[u32, 'k\\]; '2 was opened at 16:5$",
     "match_unknown_label.kur": "9:9: Option\\[u8\\] has no variant Nothing$",
-    "non_exhaustive_match.kur": "a match must cover every enum variant",
+    "non_exhaustive_match.kur": "14:5: a match must cover every enum variant; it misses Amber$",
     "overlapping_instances.kur": "overlapping instances of Describe: \\(u32\\) and \\(T\\)",
     "private_import.kur": "unknown or private member File! of fs",
     "push_after_finish.kur": "15:6: .*value 'builder' has been moved and cannot be lent$",
@@ -206,12 +209,13 @@ REJECTED = {
     "reopened_brand.kur": "15:5: let exists 'a reuses a brand already in scope$",
     "safe_adopt.kur": "calling an unsafe function requires unsafe authorization",
     "shadowing_exists_binder.kur": "9:12: exists binder 'k shadows a brand in scope$",
+    "try_on_own_enum.kur": "15:13: \\? needs the operand and the function result to be the same Option or Result of core::option$",
     "too_large_type.kur": "is too large: its size is not below 2\\^64 bytes in type too_large_type::Huge$",
     "type_mismatch.kur": "type mismatch: bool and u32",
     "unbound_result_brand.kur": "brand '1 is not in scope",
     "unknown_name_in_use_tree.kur": "4:28: unknown or private member Maybe of option$",
     "unused_unknown_import.kur": "4:5: unknown or private member Maybe of option$",
-    "while_consume_without_replacement.kur": "linear value 'h' remains live on some paths to while",
+    "while_consume_without_replacement.kur": "25:5: .*linear value 'h' remains live where the loop at 25:5 starts, but not when it repeats$",
     "write_by_number.kur": "13:19: calling an unsafe function requires unsafe authorization$",
 }
 

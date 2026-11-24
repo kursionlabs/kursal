@@ -26,7 +26,7 @@ BRANDS = """\
 forall T. exposed enum Opt { Some(T), None }
 forall 'k. fn same(x: core::cap::Brand['k], y: core::cap::Brand['k]) -> u32 { 1u32 }
 forall 'a. fn second(pk: exists 'b. (core::cap::Brand['b], core::cap::Brand['a])) -> core::cap::Brand['a] {
-    let exists 'c. (x, y) = pk;
+    var exists 'c. (x, y) = pk;
     y
 }
 """
@@ -45,7 +45,7 @@ REJECTED = (
      "let r = match &e { E!::A(t) => 0u32, E!::B(n) => { e = E!::A.(make(n)); n = 3u32; 0u32 } }; eat(e) + r }\n",
      "'e.B' is used after its enum was assigned"),
     (TOKEN + "fn f() -> u32 { var e = E!::A.(make(1u32)); "
-     "let r = match &e { E!::A(t) => { let x = eat(e); e = E!::A.(make(x)); peek(&t) }, E!::B(n) => n }; eat(e) + r }\n",
+     "let r = match &e { E!::A(t) => { var x = eat(e); e = E!::A.(make(x)); peek(&t) }, E!::B(n) => n }; eat(e) + r }\n",
      "'e.A' is used after its enum was assigned"),
     (TOKEN + "fn f(&e: E!) -> u32 { match &e { E!::A(t) => 0u32, E!::B(n) => { e = E!::B.(7u32); n } } }\n",
      "'e.B' is used after its enum was assigned"),
@@ -129,7 +129,7 @@ REJECTED = (
 ACCEPTED = (
     # The binder is not used after the store, or the arm puts a value back through it.
     TOKEN + "fn f() -> u32 { var e = E!::A.(make(1u32)); "
-    "let r = match &e { E!::A(t) => { let x = eat(e); e = E!::B.(x); 0u32 }, E!::B(n) => n }; eat(e) + r }\n",
+    "let r = match &e { E!::A(t) => { var x = eat(e); e = E!::B.(x); 0u32 }, E!::B(n) => n }; eat(e) + r }\n",
     TOKEN + "fn f() -> u32 { var e = E!::A.(make(1u32)); "
     "let r = match &e { E!::A(t) => { e = E!::B.(take(t)); 1u32 }, E!::B(n) => { n = n + 1u32; n } }; eat(e) + r }\n",
     TOKEN + "fn f(&e: E!) -> u32 { match &e { E!::A(t) => { let n = take(t); t = make(n + 1u32); n }, "

@@ -221,14 +221,20 @@ class StatementTests(unittest.TestCase):
 
 
 class UnsafeItemTests(unittest.TestCase):
-    """`unsafe` opens a function or an instance."""
+    """`unsafe` opens a function, and nothing else."""
 
-    def test_unsafe_functions_and_instances(self):
-        f, i, g, j = S.parse("unsafe fn f() {} unsafe instance T[u32] {} fn g() {} instance T[u8] {}")
-        self.assertEqual((type(f), f.unsafe, type(g), g.unsafe), (S.Fn, True, S.Fn, False))
-        self.assertEqual((type(i), i.unsafe, type(j), j.unsafe), (S.InstanceDecl, True, S.InstanceDecl, False))
+    def test_unsafe_functions(self):
+        f, g, j = S.parse("unsafe fn f() {} fn g() {} instance T[u8] {}")
+        self.assertEqual((type(f), f.unsafe, type(g), g.unsafe, type(j)), (S.Fn, True, S.Fn, False, S.InstanceDecl))
+        with self.assertRaisesRegex(KursError, "1:8: `unsafe` marks a function, not an instance$"):
+            S.parse("unsafe instance T[u32] {}")
         rejected(self, "unsafe struct S { x: u32 }")
         rejected(self, "unsafe;")
+
+    def test_module_is_reserved(self):
+        with self.assertRaisesRegex(KursError, "1:1: `module` is a reserved keyword$"):
+            S.parse("module x;")
+        rejected(self, "fn f() { let module = 1u32; }")
 
 
 class LexicalTests(unittest.TestCase):
@@ -375,11 +381,12 @@ class ExpressionShapeTests(unittest.TestCase):
         self.assertEqual(e.spread, "rest")
 
     def test_type_arguments_in_paths(self):
-        e = expr("Result[TomlValue['k], TomlError]::Err(e)")
+        e = expr("Result[TomlValue['k], TomlError]::Err.(e)")
         name, args = e.callee.segments[0]
         self.assertEqual(name, "Result")
         self.assertEqual(args[0].args, (S.TBrand("'k"),))
         self.assertEqual(e.callee.names, ("Result", "Err"))
+        self.assertTrue(e.construct)
         self.assertEqual(len(args), 2)
 
     def test_closures_extend_right(self):
@@ -483,6 +490,18 @@ class StatementShapeTests(unittest.TestCase):
         self.assertEqual([n for n, _ in fields.fields], ["a", "b"])
         self.assertEqual(fields.rest, "rest")
         self.assertIsInstance(b.stmts[2].pattern, S.PArray)
+
+    def test_a_var_binds_what_a_let_binds(self):
+        b = body("var exists 'k. (tag, s) = buf.open(); var { a, ..rest } = t; var [x, y] = arr; var n: u32 = 0; "
+                 "let m = 1; 0")
+        self.assertEqual([s.mutable for s in b.stmts], [True, True, True, True, False])
+        self.assertEqual(b.stmts[0].brands, ("'k",))
+        self.assertEqual([type(s.pattern) for s in b.stmts[:4]], [S.PTuple, S.PStruct, S.PArray, S.PBind])
+
+    def test_a_tail_return_ends_with_a_semicolon(self):
+        with self.assertRaisesRegex(KursError, "1:29: a `return` at the end of a block ends with `;`$"):
+            S.parse("fn f() -> u32 { return 1u32 }")
+        self.assertIsInstance(body("return 1u32;").stmts[0].value, S.Return)
 
 
 class ItemShapeTests(unittest.TestCase):

@@ -35,12 +35,12 @@ class LocalScopeTests(unittest.TestCase):
 
     def test_local_witness_lending_uses_generic_adapter(self):
         self.run_source('''forall 'a. fn touch(&x: core::cap::Brand['a]) -> u32 { 7u32 }
-            fn main() -> i32 { let exists 'a. w = core::cap::fresh(); touch(&w) as i32 }''', 7)
+            fn main() -> i32 { var exists 'a. w = core::cap::fresh(); touch(&w) as i32 }''', 7)
 
     def test_indirect_lending_adapter_retains_brand_arguments(self):
         self.run_source('''forall 'a. fn touch(&x: core::cap::Brand['a]) -> u32 { 7u32 }
             fn main() -> i32 {
-                let exists 'a. w = core::cap::fresh();
+                var exists 'a. w = core::cap::fresh();
                 let action = touch;
                 action(&w) as i32
             }''', 7)
@@ -64,7 +64,7 @@ class LocalScopeTests(unittest.TestCase):
             fn bump(&n: u32) -> () { n = n + 1u32; }
             fn main() -> i32 {
                 let exists 'a. w = core::cap::fresh();
-                let tagged = Tagged.{ witness: w, n: 6u32 };
+                var tagged = Tagged.{ witness: w, n: 6u32 };
                 bump(&tagged.n);
                 tagged.n as i32
             }''', 7)
@@ -75,14 +75,14 @@ class LocalScopeTests(unittest.TestCase):
                 fn touch(&x: core::cap::Brand['a]) -> u32 { 7u32 }
             }
             fn main() -> i32 {
-                let exists 'a. w = core::cap::fresh();
+                var exists 'a. w = core::cap::fresh();
                 Touch['a]::touch(&w) as i32
             }''', 7)
 
     def test_promoted_lends_cannot_hide_overlap(self):
         with self.assertRaisesRegex(KursError, 'overlap'):
             self.run_source('''forall 'a. fn touch(&x: core::cap::Brand['a], &y: core::cap::Brand['a]) -> u32 { 7u32 }
-                fn main() -> i32 { let exists 'a. w = core::cap::fresh(); touch(&w, &w) as i32 }''', 7)
+                fn main() -> i32 { var exists 'a. w = core::cap::fresh(); touch(&w, &w) as i32 }''', 7)
 
     def test_match_on_a_locally_branded_sum_in_place(self):
         # The switch is on the enum's value; each arm holds the payload and rebuilds the enum.
@@ -90,7 +90,7 @@ class LocalScopeTests(unittest.TestCase):
             forall 'a. exposed struct M { e: E['a], n: u32 }
             fn main() -> i32 {
                 let exists 'a. w = core::cap::fresh();
-                let value = M.{ e: E::A.(w, 5u32), n: 2u32 };
+                var value = M.{ e: E::A.(w, 5u32), n: 2u32 };
                 let k = match &value.e { E::A(_, k) => k, E::B => 0u32 };
                 let m = match &value.e { E::A(_, k) => k + value.n, E::B => 9u32 };
                 let { e, n } = value;
@@ -103,7 +103,7 @@ class LocalScopeTests(unittest.TestCase):
             self.run_source('''forall 'a. exposed enum E { A(core::cap::Brand['a]) }
                 fn main() -> i32 {
                     let exists 'a. w = core::cap::fresh();
-                    let value = E::A.(w);
+                    var value = E::A.(w);
                     let tag = core::mem::enum_variant(&value);
                     match value { E::A(payload) => tag as i32 }
                 }''', 0)

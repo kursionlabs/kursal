@@ -65,7 +65,7 @@ class SpecializationTests(unittest.TestCase):
         self.assertEqual(len(backend.queue), 1)
 
     def test_a_generic_traversal_is_never_specialized_at_a_foreach_source(self):
-        # A type parameter never stands for a foreach type (TY-FLAT), so specialization never makes a
+        # A type parameter never stands for a foreach type, so specialization never makes a
         # traversal whose source is one.
         f, s = C.Named("F"), C.Named("S")
         mapped = C.Foreach("F", False, s, f)

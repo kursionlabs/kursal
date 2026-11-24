@@ -20,12 +20,12 @@ class EnumVariantTests(unittest.TestCase):
         for ty in ('u32', '(u32, u32)', '*u32', "core::cap::Brand['static]"):
             for lend in ('', '&'):
                 with self.subTest(ty=ty, lend=lend), self.assertRaisesRegex(InferError, 'enum'):
-                    self.run_source(f'fn bad(x: {ty}) -> () {{ let result = core::mem::enum_variant({lend}x); () }} '
+                    self.run_source(f'fn bad(x: {ty}) -> () {{ var x = x; let result = core::mem::enum_variant({lend}x); () }} '
                                     'fn main() -> i32 { 0i32 }', 0)
 
     def test_abstract_type_parameter_is_not_known_to_be_an_enum(self):
         with self.assertRaisesRegex(InferError, 'enum'):
-            self.run_source('forall T. fn bad(x: T) -> () { let result = core::mem::enum_variant(&x); () } '
+            self.run_source('forall T. fn bad(x: T) -> () { var x = x; let result = core::mem::enum_variant(&x); () } '
                             'fn main() -> i32 { 0i32 }', 0)
 
     def test_lent_operand_must_be_a_place(self):
@@ -59,7 +59,7 @@ class EnumVariantTests(unittest.TestCase):
                 'hidden.kur': 'enum E! { A, B } fn make() -> E! { E!::B } fn consume(x: E!) -> () { match x { E!::A => (), E!::B => () } }',
                 'lib.kur': '''use package::hidden::{make, consume};
                     fn main() -> i32 {
-                        let value = make();
+                        var value = make();
                         let tag = core::mem::enum_variant(&value);
                         consume(value);
                         (tag + 6u32) as i32
@@ -73,7 +73,7 @@ class EnumVariantTests(unittest.TestCase):
     def test_lent_linear_enum_remains_available(self):
         self.run_source('''exposed enum E! { A, B(u32) }
             fn main() -> i32 {
-                let value = E!::B.(5u32);
+                var value = E!::B.(5u32);
                 let a = core::mem::enum_variant(&value);
                 let b = core::mem::enum_variant(&value);
                 match value { E!::A => 0i32, E!::B(n) => (n + a + b) as i32 }
@@ -83,7 +83,7 @@ class EnumVariantTests(unittest.TestCase):
         with self.assertRaises(OwnershipError):
             self.run_source('''exposed enum E! { A }
                 fn main() -> i32 {
-                    let value = E!::A;
+                    var value = E!::A;
                     let moved = value;
                     let tag = core::mem::enum_variant(&value);
                     match moved { E!::A => tag as i32 }
@@ -102,7 +102,7 @@ class EnumVariantTests(unittest.TestCase):
             self.run_source('''exposed struct Token! { n: u32 }
             exposed enum E! { B(Token!) }
             fn main() -> i32 {
-                let value = E!::B.(Token!.{ n: 7u32 });
+                var value = E!::B.(Token!.{ n: 7u32 });
                 let tag = match &value { E!::B(payload) => {
                     let moved = payload;
                     let tag = core::mem::enum_variant(&value);

@@ -220,7 +220,7 @@ def parse_block(form: Form) -> Block:
 
 def parse_fun(forms: Sequence[Form], name: str, module: Optional[ModuleId] = None,
               unsafe: bool = False, pos: Optional[Position] = None) -> Fun:
-    """`RET (PARAM-TYPES) (locals ...)? BLOCK+`, possibly forall-wrapped."""
+    """`RET (PARAM...) (locals ...)? BLOCK+`, possibly forall-wrapped."""
     params: tuple[Param, ...] = ()
     premises: tuple[Premise, ...] = ()
     header = forms[0]

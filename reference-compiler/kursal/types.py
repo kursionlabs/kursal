@@ -9,7 +9,7 @@ from typing import Optional
 
 from .core import (COPY, WIDTHS, Array, Brand, Enum, Exists, Fn, Foreach, Named, Never, NonNull, Prim,
                    Ptr, Kind, ModuleId, Premise, Program, Skolem, Struct, Tuple, Type, TypeDecl)
-from .sexpr import KursError, Position
+from .sexpr import KursError, Position, counted
 
 type Substitution = Mapping[str, Type]
 type Kinds = Mapping[str, Kind]
@@ -18,7 +18,7 @@ type ForeachRow = tuple[str, Type]
 type Skeleton = Struct | Enum | Tuple | Array
 
 # The target's pointer width in bytes, which the layout assumes: of a pointer, a function value, `usize` and
-# `isize` (TY-SIZE-LIMIT). Every formed type's size is below 2^64.
+# `isize`. Every formed type's size is below 2^64, the address space of that width.
 WORD = 8
 SIZE_LIMIT = 1 << (8 * WORD)
 PRIM_SIZES = {**{name: bits // 8 for name, bits in WIDTHS.items()}, "usize": WORD, "isize": WORD,
@@ -106,9 +106,10 @@ def subst(ty: Type, sub: Substitution) -> Type:
 
 
 def apart(ty: Type, scope: Set[str]) -> Type:
-    """`ty` with each package binder that would shadow a brand of `scope` or of an enclosing package
-    (TY-EXISTS-FORM.scope) renamed `b#n`, a spelling no written brand has: a type the compiler writes
-    may come from a declaration whose binders are spelled as a brand where it is written."""
+    """`ty` with each package binder that would shadow a brand of `scope` or of an enclosing package,
+    which a written type's binder may not, renamed `b#n`, a spelling no written brand has: a type the
+    compiler writes may come from a declaration whose binders are spelled as a brand where it is
+    written."""
     match ty:
         case Exists(binders=binders, body=body):
             taken = set(scope) | set(binders)
@@ -317,7 +318,7 @@ class Types:
 
     def pointer_sources(self, ty: Type) -> list[Type]:
         """The pointer sources that mention a type parameter of the foreach types in `ty`, declarations that
-        mention one unfolded, each once (TY-FOREACH-EXPOSED-PTR): `sizeof` of `ty` needs `Exposed` of each,
+        mention one unfolded, each once: `sizeof` of `ty` needs `Exposed` of each,
         as a traversal does, so none points to a sum at an instantiation."""
         sources: list[Type] = []
         seen: list[Type] = []
@@ -342,8 +343,8 @@ class Types:
         """The size and alignment of a closed type's value as the backend lays it out at the target's
         pointer width: a primitive its width, a pointer or a function value a word, a zero-size part
         erased, a product a C struct of the rest, and an enum a `uint32_t` tag and a union of its payloads,
-        or its payload in the niche layout. None when the size is 2^64 or more: no formed type has one
-        (TY-SIZE-LIMIT)."""
+        or its payload in the niche layout. None when the size is 2^64 or more: formation rejects such a
+        type."""
         if ty not in self._layout:
             self._layout[ty] = self._lay_out(ty)
         return self._layout[ty]
@@ -455,7 +456,7 @@ class Types:
         With `module` given, the declaration must expose its shape there."""
         decl = self.decl(ty.name)
         if len(ty.args) != len(decl.params):
-            raise KursError(f"{ty.name} takes {len(decl.params)} type arguments")
+            raise KursError(f"{ty.name} takes {counted(len(decl.params), 'type argument')}")
         if not self.exposed(decl, module):
             raise KursError(f"the shape of {ty.name} is not exposed here")
         return subst(decl.body, {p.name: a for p, a in zip(decl.params, ty.args)})
@@ -480,7 +481,7 @@ class Types:
         return self.concrete_exposure(source, module, kinds)
 
     def sized_available(self, ty: Type, premises: Iterable[Premise]) -> bool:
-        """`Sized[ty]` (TY-SIZED): `ty` has a finite by-value layout of non-zero size, at every instantiation.
+        """`Sized[ty]`: `ty` has a finite by-value layout of non-zero size, at every instantiation.
         An exact assumption gives it; otherwise its shape decides it, with each type parameter standing for
         the zero-size `()`: a part of it held by value, a primitive, a pointer, a sum or a function value,
         has bytes whatever the parameters are. So `Sized[T]` and `Sized[U]` do not give `Sized[(T, U)]`,
@@ -630,8 +631,8 @@ class Types:
         s = self.shape(source, module)
         wrap: Callable[[Type], Type] = lambda c: c
         if isinstance(s, Ptr):
-            # Behind a pointer each component is a pointer to it; a sum has none, so no rows
-            # (TY-FOREACH-ROWS-PTR). Formation rejects a written one, and a traversal or `sizeof` with a
+            # Behind a pointer each component is a pointer to it; a sum has none, so no rows.
+            # Formation rejects a written one, and a traversal or `sizeof` with a
             # parameter in the pointee needs `Exposed` of the source, which no sum has.
             s, wrap = self.shape(s.inner, module), Ptr
             if isinstance(s, Enum):
@@ -690,7 +691,7 @@ class Types:
         return Tuple(tuple(m for _, m in mapped))
 
     def expands_to_foreach(self, ty: Type) -> bool:
-        """`ty`'s head, unfolding declarations, is a foreach type (TY-FLAT). A declaration whose body's
+        """`ty`'s head, unfolding declarations, is a foreach type. A declaration whose body's
         head is one of its parameters takes the head of that argument; a cycle of heads is no foreach,
         and a type parameter never is one. Components are not looked at."""
         seen: list[Type] = []
@@ -842,6 +843,11 @@ def _source(ty: Type, surface: Surface) -> str:
             return f"({all_of(elems)})"
         case Array(elem=elem, length=length):
             return f"[{go(elem)}; {length}]"
+        case Struct(fields=(("env", env), ("code", Fn(params=(_, *params), ret=ret) as code))):
+            # A closure: its environment, then a function of the environment and the arguments.
+            shown = ", ".join(f"&_: {go(p)}" if k + 1 in code.places else go(p) for k, p in enumerate(params))
+            environment = go(env)
+            return f"closure{'' if environment == '_' else f'[{environment}]'}({shown}) -> {go(ret)}"
         case Struct(fields=fields):
             return "struct { " + ", ".join(f"{n}: {go(f)}" for n, f in fields) + " }"
         case Enum(variants=variants):

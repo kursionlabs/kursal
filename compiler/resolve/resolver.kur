@@ -20,7 +20,7 @@ use std::collections::arena_vec::ArenaVec;
 use std::collections::arena_map::{ArenaMap, ArenaSet};
 use std::mem::Ref;
 use std::raw::Span;
-use std::arena::Domain!;
+use std::arena::{Domain!, concat, ref_in};
 use std::buffer::Buffer!;
 use package::kurs::core::ModuleId;
 use package::syntax::parser::parse;
@@ -39,7 +39,7 @@ use toml::value::{TomlValue, line_column};
 // Whether `name` is one of the space-separated `names`.
 forall 'k.
 fn among(&cx: Domain!['k], name: Span['k], names: Slice[u8, 'static]) -> bool {
-    Span::from_static(&cx, names).split(&cx, Span::from_static(&cx, " ")).contains(&cx, name)
+    ArenaVec::split(&cx, Span::from_static(&cx, names), Span::from_static(&cx, " ")).contains(&cx, name)
 }
 
 forall 'k.
@@ -95,7 +95,7 @@ fn lib_dir(&cx: Domain!['k]) -> Span['k] {
 // `path` as Python's `Path` spells it: no repeated, trailing or `.` separators.
 forall 'k.
 fn clean(&cx: Domain!['k], path: Span['k]) -> Span['k] {
-    let parts = path.split(&cx, Span::from_static(&cx, "/"));
+    let parts = ArenaVec::split(&cx, path, Span::from_static(&cx, "/"));
     var out = Buffer!::new();
     if path.starts_with(&cx, Span::from_static(&cx, "/")) {
         out = out.push_static("/");
@@ -128,7 +128,7 @@ fn join(&cx: Domain!['k], a: Span['k], b: Span['k]) -> Span['k] {
     if b.starts_with(&cx, Span::from_static(&cx, "/")) || a.is_empty() || a.is(&cx, ".") {
         b
     } else if a.ends_with(&cx, Span::from_static(&cx, "/")) {
-        a.concat(&cx, b)
+        concat(&cx, a, b)
     } else {
         Buffer!::new().push_bytes(&cx, a).push_static("/").push_bytes(&cx, b).save(&cx)
     }
@@ -304,7 +304,6 @@ forall 'k.
 fn item_pos(item: S::Item['k]) -> Pos {
     match item {
         Use(x) => x.pos,
-        Module(x) => x.pos,
         Struct(x) => x.pos,
         Tuple(x) => x.pos,
         Enum(x) => x.pos,
@@ -382,7 +381,7 @@ fn other_spelling(&cx: Domain!['k], name: Span['k]) -> Span['k] {
     if name.ends_with(&cx, Span::from_static(&cx, "!")) {
         name.slice(0usize, name.len() - 1usize)
     } else {
-        name.concat(&cx, Span::from_static(&cx, "!"))
+        concat(&cx, name, Span::from_static(&cx, "!"))
     }
 }
 
@@ -598,15 +597,15 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
     }
     let package = Package.{
         id: packages.len(&cx),
-        name: Ref::new(&cx, match name { Some(n) => n, None => base_name(&cx, root) }),
+        name: ref_in(&cx, match name { Some(n) => n, None => base_name(&cx, root) }),
         root,
-        source_root: Ref::new(&cx, match source_root { Some(s) => s, None => root }),
+        source_root: ref_in(&cx, match source_root { Some(s) => s, None => root }),
         deps: ArenaMap::new(&cx),
         link_flags: ArenaVec::new(&cx),
         c_sources: ArenaVec::new(&cx),
-        entry: Ref::new(&cx, entry),
+        entry: ref_in(&cx, entry),
         files: ArenaMap::new(&cx),
-        entry_decl: Ref::new(&cx, Option::None),
+        entry_decl: ref_in(&cx, Option::None),
         manifest,
     };
     packages.push(&cx, package);
@@ -618,6 +617,14 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
         by_dir.insert(&cx, root, package.id);
         let config = manifest_table(&cx, manifest);
         let info = table(&cx, config.get_or(&cx, Span::from_static(&cx, "package"), TomlValue::Table.(ArenaMap::new(&cx))), in_manifest(&cx, manifest, Span::from_static(&cx, "package")));
+        let deps_table = table(&cx, config.get_or(&cx, Span::from_static(&cx, "dependencies"), TomlValue::Table.(ArenaMap::new(&cx))), in_manifest(&cx, manifest, Span::from_static(&cx, "dependencies")));
+        let aliases = deps_table.keys(&cx);
+        let specs: ArenaVec[ArenaMap[Span['k], TomlValue['k], 'k], 'k] = ArenaVec::new(&cx);
+        var k = 0usize;
+        while k < aliases.len(&cx) {
+            specs.push(&cx, table(&cx, deps_table.at(&cx, aliases.at(&cx, k)), in_manifest(&cx, manifest, aliases.at(&cx, k))));
+            k = k + 1usize;
+        }
         let unknown: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
         let config_keys = config.keys(&cx);
         var i = 0usize;
@@ -636,6 +643,18 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
                 unknown.insert(&cx, key);
             }
             i = i + 1usize;
+        }
+        k = 0usize;
+        while k < specs.len(&cx) {
+            let spec_keys = specs.at(&cx, k).keys(&cx);
+            i = 0usize;
+            while i < spec_keys.len(&cx) {
+                if !spec_keys.at(&cx, i).is(&cx, "path") {
+                    unknown.insert(&cx, spec_keys.at(&cx, i));
+                }
+                i = i + 1usize;
+            }
+            k = k + 1usize;
         }
         if unknown.len(&cx) > 0usize {
             let names = unknown.keys(&cx);
@@ -662,7 +681,7 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
             fail(&cx, Buffer!::new().push_bytes(&cx, manifest).push_static(": manifest kind must be \"library\" or \"executable\"").save(&cx));
         }
         if kind.is(&cx, "executable") {
-            let parts = string(&cx, info, manifest, "entry", Option::None).split(&cx, Span::from_static(&cx, "::"));
+            let parts = ArenaVec::split(&cx, string(&cx, info, manifest, "entry", Option::None), Span::from_static(&cx, "::"));
             let path: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
             var k = 0usize;
             while k < parts.len(&cx) {
@@ -672,14 +691,13 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
                 k = k + 1usize;
             }
             package.entry.set(&cx, Option::Some.(path));
+        } else if info.contains(&cx, Span::from_static(&cx, "entry")) {
+            fail(&cx, Buffer!::new().push_bytes(&cx, manifest).push_static(": manifest entry is only for kind \"executable\"").save(&cx));
         }
         deps = ArenaMap::new(&cx);
-        let specs = table(&cx, config.get_or(&cx, Span::from_static(&cx, "dependencies"), TomlValue::Table.(ArenaMap::new(&cx))), in_manifest(&cx, manifest, Span::from_static(&cx, "dependencies")));
-        let aliases = specs.keys(&cx);
-        var k = 0usize;
+        k = 0usize;
         while k < aliases.len(&cx) {
-            let alias = aliases.at(&cx, k);
-            deps.insert(&cx, alias, resolved(&cx, join(&cx, root, string(&cx, table(&cx, specs.at(&cx, alias), in_manifest(&cx, manifest, alias)), manifest, "path", Option::None))));
+            deps.insert(&cx, aliases.at(&cx, k), resolved(&cx, join(&cx, root, string(&cx, specs.at(&cx, k), manifest, "path", Option::None))));
             k = k + 1usize;
         }
     }
@@ -938,7 +956,7 @@ impl Resolver['k] {
             searching: ArenaSet::new(&cx),
             refs: ArenaMap::new(&cx),
             locations: ArenaVec::new(&cx),
-            decl_ids: Ref::new(&cx, 0u32),
+            decl_ids: ref_in(&cx, 0u32),
             errors: ArenaVec::new(&cx),
             reported: ArenaSet::new(&cx),
             order: ArenaMap::new(&cx),
@@ -1000,7 +1018,6 @@ impl Resolver['k] {
         while i < items.len(&cx) {
             self.locate(&cx, home, item_pos(items.at(&cx, i)));
             let unit = match items.at(&cx, i) {
-                Module(m) => self.report(&cx, Span::from_static(&cx, "package sources do not declare `module`"), m.pos),
                 Use(u) => self.use_tree(&cx, scope, ArenaVec::new(&cx), u.tree, u.is_export),
                 Instance(n) => self.instances.push(&cx, (home, n)),
                 Struct(x) => { let declared = self.declare(&cx, scope, self.new_decl(&cx, "struct", home, x.name, Named::Struct.(x), Option::None)); },
@@ -1117,6 +1134,7 @@ impl Resolver['k] {
         } else {
             self.impl_owner(&cx, scope.home, target)
         };
+        self.impl_home(&cx, scope.home, owner, target);
         var k = 0usize;
         while k < item.items.len(&cx) {
             let decl = match item.items.at(&cx, k) {
@@ -1135,6 +1153,20 @@ impl Resolver['k] {
                 }
             }
             k = k + 1usize;
+        }
+    }
+
+    // An inherent impl is in the package that declares its type, and one of a primitive or builtin
+    // type is in core: no other package adds a method to a type, which could clash with the type's own.
+    fn impl_home(self, &cx: Domain!['k], home: ModuleId['k], owner: Owner['k], target: S::TName['k]) {
+        match owner {
+            Prim(name) => if !self.in_core(&cx, home) {
+                self.report(&cx, Buffer!::new().push_static("an inherent impl of ").push_bytes(&cx, name).push_static(" belongs in core").save(&cx), target.pos);
+            },
+            Decl(d) => if d.home.package != home.package {
+                self.report(&cx, Buffer!::new().push_static("an inherent impl of ").push_bytes(&cx, d.name).push_static(" belongs in the package that declares it").save(&cx), target.pos);
+            },
+            Blanket => (),
         }
     }
 
@@ -1318,7 +1350,7 @@ impl Resolver['k] {
                     if misspelled.is_empty() {
                         return Result::Err.(e);
                     }
-                    return Result::Err.(Problem.{ message: e.message.concat(&cx, misspelled), pos: e.pos });
+                    return Result::Err.(Problem.{ message: concat(&cx, e.message, misspelled), pos: e.pos });
                 },
             }
         } else {
@@ -1616,7 +1648,6 @@ forall 'k.
 fn quantifier_of(item: S::Item['k]) -> Option[S::Forall['k]] {
     match item {
         Use(x) => x.quantifier,
-        Module(x) => Option::None,
         Struct(x) => x.quantifier,
         Tuple(x) => x.quantifier,
         Enum(x) => x.quantifier,
@@ -1659,7 +1690,7 @@ exposed struct Names {
 forall 'k.
 impl Names['k] {
     fn new(&cx: Domain!['k], r: Resolver['k]) -> Names['k] {
-        Names.{ r, home: Ref::new(&cx, ModuleId::root(&cx, 0usize)) }
+        Names.{ r, home: ref_in(&cx, ModuleId::root(&cx, 0usize)) }
     }
 
     fn run(self, &cx: Domain!['k]) -> Resolver['k] {
@@ -1763,7 +1794,6 @@ impl Names['k] {
                 self.use_tree(&cx, x.tree, ArenaVec::new(&cx), x.is_export);
                 return;
             },
-            Module(x) => return,
             _ => (),
         };
         let quantifier = quantifier_of(item);
@@ -2098,6 +2128,19 @@ impl Names['k] {
                 self.expr(&cx, f.iterator.copy(&cx), types, values);
                 self.block(&cx, f.body, types, with_one(&cx, values, f.name));
             },
+            Call(c) => {
+                let callee = c.callee.copy(&cx);
+                self.expr(&cx, callee, types, values);
+                var i = 0usize;
+                while i < c.args.len(&cx) {
+                    self.expr(&cx, c.args.at(&cx, i), types, values);
+                    i = i + 1usize;
+                }
+                match callee {
+                    Path(p) => self.construction(&cx, p, c.construct),
+                    _ => (),
+                }
+            },
             Lit(l) => (),
             Binop(b) => {
                 // A chain `a + b - c ...` nests to the left; a loop walks its links rather than recursion.
@@ -2155,14 +2198,6 @@ impl Names['k] {
                 };
                 with(&cx, values, bound(&cx, l.pattern))
             },
-            Var(v) => {
-                self.expr(&cx, v.value, types, values);
-                let unit = match v.type {
-                    Some(t) => self.type(&cx, t, types, false),
-                    None => (),
-                };
-                with_one(&cx, values, v.name)
-            },
             Const(c) => {
                 self.type(&cx, c.type, types, false);
                 self.expr(&cx, c.value, types, values);
@@ -2215,6 +2250,24 @@ impl Names['k] {
                 },
                 None => (),
             }
+        }
+    }
+
+    // `Name.(args)` constructs a tuple or a variant, which a call `Name(args)` never does.
+    fn construction(self, &cx: Domain!['k], callee: S::Path['k], construct: bool) {
+        let constructor = match self.r.refs.get(&cx, callee.id) {
+            Some(r) => match r {
+                Variant(d, v) => true,
+                Decl(d) => d.kind.is(&cx, "tuple"),
+                _ => false,
+            },
+            None => return,
+        };
+        let name = callee.names(&cx).join(&cx, "::");
+        if constructor && !construct {
+            self.r.report(&cx, Buffer!::new().push_static("`").push_bytes(&cx, name).push_static("` is a constructor; write `").push_bytes(&cx, name).push_static(".(...)`").save(&cx), callee.pos);
+        } else if construct && !constructor {
+            self.r.report(&cx, Buffer!::new().push_static("`").push_bytes(&cx, name).push_static("` is not a tuple or an enum variant; write `").push_bytes(&cx, name).push_static("(...)`").save(&cx), callee.pos);
         }
     }
 
@@ -2302,10 +2355,6 @@ fn children(&cx: Domain!['k], e: Expr['k]) -> ArenaVec[Expr['k], 'k] {
         Field(f) => out.push(&cx, f.value.copy(&cx)),
         Index(x) => out.push(&cx, x.value.copy(&cx)),
         Try(n) => out.push(&cx, n.value.copy(&cx)),
-        Call(c) => {
-            out.push(&cx, c.callee.copy(&cx));
-            out.append(&cx, c.args);
-        },
         _ => fail(&cx, Span::from_static(&cx, "internal error: an expression the walker takes apart itself")),
     };
     out
@@ -2314,7 +2363,7 @@ fn children(&cx: Domain!['k], e: Expr['k]) -> ArenaVec[Expr['k], 'k] {
 // The resolved package graph rooted at `path`.
 forall 'k.
 fn resolve(&cx: Domain!['k], path: Span['k]) -> Resolver['k] {
-    let ids = Ref::new(&cx, 0u32);
+    let ids = ref_in(&cx, 0u32);
     let resolver = Resolver::new(&cx, load(&cx, path, ids), ids);
     if !resolver.packages.is_empty(&cx) {
         let package = resolver.packages.at(&cx, 0usize);

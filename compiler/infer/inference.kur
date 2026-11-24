@@ -18,13 +18,13 @@
 // Results are kept in `Results`, by syntax node id, for lowering: each expression's, pattern's and
 // variant case's type, what each call calls (`Callee`), local binding ids, captures and the rest.
 
-use package::support::base::fail_static;
+use package::support::base::{counted, fail_static};
 use std::collections::list::List;
 use std::collections::arena_vec::ArenaVec;
 use std::collections::arena_map::{ArenaMap, ArenaSet};
 use std::mem::Ref;
 use std::raw::Span;
-use std::arena::{Domain!, seed};
+use std::arena::{Domain!, ref_in, seed};
 use std::buffer::Buffer!;
 use package::types::coherence::check_coherence;
 use package::kurs::core::{ForeachType, Kind, Member, Meta, MetaKind, ModuleId, Param, Premise, Program, Type, TypeDecl};
@@ -547,7 +547,7 @@ impl Infer['k] {
         let program = Program.{ types: sigs.types, funs: ArenaMap::new(&cx), externs: ArenaMap::new(&cx), datas: ArenaMap::new(&cx), traits: sigs.traits, instances: ArenaMap::new(&cx) };
         let inf = Infer.{
             r, sigs, types: Types::new(&cx, program, counter), decl_of: ArenaMap::new(&cx), inputs: ArenaMap::new(&cx), instances: ArenaMap::new(&cx),
-            visible: ArenaMap::new(&cx), ids: Ref::new(&cx, 0u32), counter, out: new_results(&cx), lend_marked: ArenaSet::new(&cx),
+            visible: ArenaMap::new(&cx), ids: ref_in(&cx, 0u32), counter, out: new_results(&cx), lend_marked: ArenaSet::new(&cx),
             origins: ArenaMap::new(&cx),
         };
         let scopes = r.scopes.values(&cx);
@@ -639,9 +639,9 @@ impl Infer['k] {
         let level = new_level(&cx);
         let b = Body.{
             inf: self, home, sig, kinds, assumptions, waiting: ArenaVec::new(&cx), defaults: ArenaVec::new(&cx), recorded: ArenaVec::new(&cx),
-            literals: ArenaVec::new(&cx), brand_checks: ArenaVec::new(&cx), foreaches: ArenaMap::new(&cx), open_binders: Ref::new(&cx, List::empty()),
-            binder_checks: ArenaVec::new(&cx), instantiations: ArenaVec::new(&cx), unwritten: ArenaVec::new(&cx), solving: Ref::new(&cx, false), returns: ArenaVec::one(&cx, sig.ret),
-            scopes: Ref::new(&cx, List::empty().cons(&cx, level)), frames: ArenaVec::one(&cx, new_frame(&cx)), allowed: Ref::new(&cx, Option::None),
+            literals: ArenaVec::new(&cx), brand_checks: ArenaVec::new(&cx), foreaches: ArenaMap::new(&cx), open_binders: ref_in(&cx, List::empty()),
+            binder_checks: ArenaVec::new(&cx), instantiations: ArenaVec::new(&cx), unwritten: ArenaVec::new(&cx), solving: ref_in(&cx, false), returns: ArenaVec::one(&cx, sig.ret),
+            scopes: ref_in(&cx, List::empty().cons(&cx, level)), frames: ArenaVec::one(&cx, new_frame(&cx)), allowed: ref_in(&cx, Option::None),
         };
         let ids: ArenaVec[u32, 'k] = ArenaVec::new(&cx);
         i = 0usize;
@@ -876,10 +876,10 @@ impl Body['k] {
             let m = self.literals.at(&cx, i);
             if is_unsolved(&cx, Type::Meta.(m)) {
                 let what = match m.kind(&cx) {
-                    Float => "floating",
-                    _ => "integer",
+                    Float => "a float",
+                    _ => "an integer",
                 };
-                self.fail(&cx, Buffer!::new().push_static("a ").push_static(what).push_static(" literal's type is not determined; write a suffix").save(&cx), m.pos(&cx));
+                self.fail(&cx, Buffer!::new().push_static(what).push_static(" literal's type is not determined; write a suffix").save(&cx), m.pos(&cx));
             }
             i = i + 1usize;
         }
@@ -1319,7 +1319,7 @@ impl Body['k] {
                 k = k + 1usize;
             }
             let spelling = surface(&cx, concrete, ArenaVec::one(&cx, trait_name), self.inf.origins);
-            var shown = Buffer!::new().push_static(if found.is_empty(&cx) { "no" } else { "several" }).push_static(" instance of ")
+            var shown = Buffer!::new().push_static(if found.is_empty(&cx) { "no instance" } else { "several instances" }).push_static(" of ")
                 .push_bytes(&cx, spelling.name(&cx, trait_name)).push_static("[");
             k = 0usize;
             while k < concrete.len(&cx) {
@@ -1512,7 +1512,7 @@ impl Body['k] {
         subst(&cx, self.inf.sigs.got(&cx, self.inf.sigs.type(&cx, type_expr, scope)), sub, self.inf.counter)
     }
 
-    // A type argument written at `pos`, which is never a foreach type (TY-FLAT).
+    // A type argument written at `pos`, which is never a foreach type.
     fn argument(self, &cx: Domain!['k], type_expr: S::Type['k], pos: Pos) -> Type['k] {
         let ty = self.core_type(&cx, type_expr);
         match ty {
@@ -1559,18 +1559,8 @@ impl Body['k] {
                 self.pattern(&cx, l.pattern, match want {
                     Some(t) => t,
                     None => got,
-                }, l.pos, false);
+                }, l.pos, l.mutable);
                 is_never(&cx, got)
-            },
-            Var(v) => {
-                let want = self.opt_type(&cx, v.type);
-                let got = self.check(&cx, v.value, want);
-                let local = self.bind(&cx, v.name, match want {
-                    Some(t) => t,
-                    None => got,
-                }, true, Option::None);
-                self.results().binders.insert(&cx, v.id, local.id);
-                false
             },
             Const(c) => {
                 let value = self.inf.sigs.got(&cx, self.inf.sigs.typed(&cx, c.name, c.value, self.core_type(&cx, c.type), self.home));
@@ -1583,7 +1573,7 @@ impl Body['k] {
                 false
             },
             Assign(a) => {
-                let target = self.place_type(&cx, a.target, true);
+                let target = self.place_type(&cx, a.target, true, false);
                 let unit = self.check(&cx, a.value, Option::Some.(target));
                 false
             },
@@ -1600,7 +1590,7 @@ impl Body['k] {
         };
         let (binders, body) = match opened {
             Some(pair) => pair,
-            None => self.fail(&cx, Buffer!::new().push_static("let exists opens ").push_usize(l.brands.len(&cx)).push_static(" brands of ").push_bytes(&cx, self.shown(&cx, zonk(&cx, package))).save(&cx), l.pos),
+            None => self.fail(&cx, Buffer!::new().push_static("let exists opens ").push_bytes(&cx, counted(&cx, l.brands.len(&cx), "brand")).push_static(" of ").push_bytes(&cx, self.shown(&cx, zonk(&cx, package))).save(&cx), l.pos),
         };
         let names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         let distinct: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
@@ -1644,7 +1634,7 @@ impl Body['k] {
             Some(t) => self.unify_at(&cx, payload, self.core_type(&cx, t), l.pos),
             None => (),
         };
-        self.pattern(&cx, l.pattern, payload, l.pos, false);
+        self.pattern(&cx, l.pattern, payload, l.pos, l.mutable);
         false
     }
 
@@ -1665,7 +1655,7 @@ impl Body['k] {
                     metas.insert(&cx, ps.fields.at(&cx, i).name, new_meta(&cx));
                     i = i + 1usize;
                 }
-                let bundle = Bundle.{ types: ArenaMap::new(&cx), filled: Ref::new(&cx, false) };
+                let bundle = Bundle.{ types: ArenaMap::new(&cx), filled: ref_in(&cx, false) };
                 self.later(&cx, ty, Action::Fields.(Fields.{ ty, metas, bundle }), pos);
                 i = 0usize;
                 while i < ps.fields.len(&cx) {
@@ -1784,7 +1774,15 @@ impl Body['k] {
         match e {
             While(w) => self.apply(&cx, ArenaVec::two(&cx, (w.cond.copy(&cx), Pat::Bool), (Expr::Block.(w.body), Pat::Unit)), Pat::Unit, w.pos),
             If(n) => match n.other {
-                None => self.apply(&cx, ArenaVec::two(&cx, (n.cond.copy(&cx), Pat::Bool), (Expr::Block.(n.then), Pat::Unit)), Pat::Unit, n.pos),
+                None => {
+                    let unit = self.apply(&cx, ArenaVec::one(&cx, (n.cond.copy(&cx), Pat::Bool)), Pat::Unit, n.pos);
+                    let then = self.expr(&cx, Expr::Block.(n.then));
+                    if !is_never(&cx, then) && !unify(&cx, then, unit, false, self.inf.counter) {
+                        self.fail(&cx, Buffer!::new().push_static("an `if` without `else` has type (), but its block has type ").push_bytes(&cx, self.shown(&cx, zonk(&cx, then))).save(&cx), n.pos);
+                    }
+                    self.solve(&cx);
+                    unit
+                },
                 Some(other) => {
                     let parts = ArenaVec::two(&cx, (n.cond.copy(&cx), Pat::Bool), (Expr::Block.(n.then), Pat::T));
                     parts.push(&cx, (other.copy(&cx), Pat::T));
@@ -1835,8 +1833,8 @@ impl Body['k] {
                 let unit = self.expr(&cx, c.value.copy(&cx));
                 self.core_type(&cx, c.type)
             },
-            Field(f) => self.projection(&cx, f.value.copy(&cx), Option::Some.(f.name), 0usize, f.id, f.pos, false),
-            Index(x) => self.projection(&cx, x.value.copy(&cx), Option::None, x.index, x.id, x.pos, false),
+            Field(f) => self.projection(&cx, f.value.copy(&cx), Option::Some.(f.name), 0usize, f.id, f.pos, false, false),
+            Index(x) => self.projection(&cx, x.value.copy(&cx), Option::None, x.index, x.id, x.pos, false, false),
             Try(n) => {
                 let operand = self.expr(&cx, n.value.copy(&cx));
                 let returned = self.returns.at(&cx, self.returns.len(&cx) - 1usize);
@@ -1940,7 +1938,7 @@ impl Body['k] {
 
     // `apply`, where `first`, if given, is the first premise's type, inferred already.
     fn apply_after(self, &cx: Domain!['k], premises: ArenaVec[(Expr['k], Pat), 'k], result: Pat, pos: Pos, first: Option[Type['k]]) -> Type['k] {
-        let t: Ref[Option[Type['k]], 'k] = Ref::new(&cx, Option::None);
+        let t: Ref[Option[Type['k]], 'k] = ref_in(&cx, Option::None);
         var i = 0usize;
         while i < premises.len(&cx) {
             let (child, p) = premises.at(&cx, i);
@@ -1992,11 +1990,11 @@ impl Body['k] {
         while i < f.parts.len(&cx) {
             let unit = match f.parts.at(&cx, i) {
                 Expr(part) => {
-                    let operand = match part {
-                        Unary(u) => if u.op.is(&cx, "&") { u.operand.copy(&cx) } else { part },
-                        _ => part,
+                    let (lent, operand) = match part {
+                        Unary(u) => if u.op.is(&cx, "&") { (true, u.operand.copy(&cx)) } else { (false, part) },
+                        _ => (false, part),
                     };
-                    let value = self.expr(&cx, operand);
+                    let value = if lent && self.is_place(&cx, operand) { self.place_type(&cx, operand, false, true) } else { self.expr(&cx, operand) };
                     self.require(&cx, fmt, ArenaVec::two(&cx, value, writer), S::expr_pos(part));
                 },
                 Text(_t) => (),
@@ -2103,7 +2101,7 @@ impl Body['k] {
             } else if outer.len(&cx) == own.len(&cx) {
                 outer
             } else {
-                self.fail(&cx, Buffer!::new().push_bytes(&cx, segments.at(&cx, count - 1usize).name).push_static(" takes ").push_usize(mine.len(&cx)).push_static(" type arguments").save(&cx), path.pos)
+                self.fail(&cx, Buffer!::new().push_bytes(&cx, segments.at(&cx, count - 1usize).name).push_static(" takes ").push_bytes(&cx, counted(&cx, mine.len(&cx), "type argument")).save(&cx), path.pos)
             };
             i = 0usize;
             while i < params.len(&cx) {
@@ -2138,7 +2136,7 @@ impl Body['k] {
                     }
                     let written = segments.at(&cx, count - 2usize).args;
                     if written.len(&cx) != args.len(&cx) {
-                        self.fail(&cx, Buffer!::new().push_static("the impl type qualifier takes ").push_usize(args.len(&cx)).push_static(" type arguments").save(&cx), path.pos);
+                        self.fail(&cx, Buffer!::new().push_static("the impl type qualifier takes ").push_bytes(&cx, counted(&cx, args.len(&cx), "type argument")).save(&cx), path.pos);
                     }
                     let given: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
                     var i = 0usize;
@@ -2192,7 +2190,7 @@ impl Body['k] {
         let td = self.inf.sigs.types.at(&cx, self.inf.sigs.name(&cx, decl));
         self.require_visible_shape(&cx, C::named(td.name, ArenaVec::new(&cx)), pos);
         if written.len(&cx) > td.params.len(&cx) {
-            self.fail(&cx, Buffer!::new().push_bytes(&cx, td.name).push_static(" accepts at most ").push_usize(td.params.len(&cx)).push_static(" type arguments, got ").push_usize(written.len(&cx)).save(&cx), pos);
+            self.fail(&cx, Buffer!::new().push_bytes(&cx, td.name).push_static(" accepts at most ").push_bytes(&cx, counted(&cx, td.params.len(&cx), "type argument")).push_static(", got ").push_usize(written.len(&cx)).save(&cx), pos);
         }
         let sub = self.instantiate_at(&cx, td.params, surface(&cx, ArenaVec::new(&cx), ArenaVec::one(&cx, td.name), ArenaMap::new(&cx)).name(&cx, td.name), pos);
         var i = 0usize;
@@ -2284,7 +2282,7 @@ impl Body['k] {
             i = i + 1usize;
         }
         if !a.fill {
-            return Type::Array.(Ref::new(&cx, elem), a.elems.len(&cx) as u64);
+            return Type::Array.(ref_in(&cx, elem), a.elems.len(&cx) as u64);
         }
         // `[x, ..]` gets its length from the type it is used at
         let result = new_meta(&cx);
@@ -2377,7 +2375,7 @@ impl Body['k] {
             Some(t) => t,
             None => self.fails(&cx, "a for loop lends its iterator: `for x in &it`", f.pos),
         };
-        let it = self.place_type(&cx, operand, false);
+        let it = self.place_type(&cx, operand, false, true);
         let item = new_meta(&cx);
         let next = TraitCall.{ trait_name: self.library(&cx, "Iterator"), method: Span::from_static(&cx, "next"), targs: ArenaVec::two(&cx, it, item), receiver: Option::None };
         self.results().next_calls.insert(&cx, f.id, next);
@@ -2401,7 +2399,7 @@ impl Body['k] {
         let lent = place.is_some();
         self.results().lent.insert(&cx, m.id, lent);
         let ty = match place {
-            Some(p) => self.place_type(&cx, p, false),
+            Some(p) => self.place_type(&cx, p, false, true),
             None => self.expr(&cx, scrutinee),
         };
         self.later(&cx, ty, Action::VisibleShape.(ty), m.pos);
@@ -2476,9 +2474,9 @@ impl Body['k] {
                 Tuple(elems) => if elems.len(&cx) == binders.len(&cx) {
                     elems
                 } else {
-                    self.fail(&cx, Buffer!::new().push_static("variant ").push_bytes(&cx, name).push_static(" does not carry ").push_usize(binders.len(&cx)).push_static(" values").save(&cx), pos)
+                    self.fail(&cx, Buffer!::new().push_static("variant ").push_bytes(&cx, name).push_static(" does not carry ").push_bytes(&cx, counted(&cx, binders.len(&cx), "value")).save(&cx), pos)
                 },
-                _ => self.fail(&cx, Buffer!::new().push_static("variant ").push_bytes(&cx, name).push_static(" does not carry ").push_usize(binders.len(&cx)).push_static(" values").save(&cx), pos),
+                _ => self.fail(&cx, Buffer!::new().push_static("variant ").push_bytes(&cx, name).push_static(" does not carry ").push_bytes(&cx, counted(&cx, binders.len(&cx), "value")).save(&cx), pos),
             }
         };
         var i = 0usize;
@@ -2608,7 +2606,7 @@ impl Body['k] {
             sub.insert(&cx, p.labels.at(&cx, i), Type::Skolem.(binder));
             i = i + 1usize;
         }
-        self.unify_at(&cx, p.result, Type::Exists.(binders, Ref::new(&cx, subst(&cx, zonk(&cx, p.value), sub, self.inf.counter))), no_pos());
+        self.unify_at(&cx, p.result, Type::Exists.(binders, ref_in(&cx, subst(&cx, zonk(&cx, p.value), sub, self.inf.counter))), no_pos());
     }
 
     fn expr_foreach(self, &cx: Domain!['k], f: S::Foreach['k]) -> Type['k] {
@@ -2706,7 +2704,7 @@ impl Body['k] {
         Option::None
     }
 
-    // `x?` unwraps success or returns failure from the same Option/Result family.
+    // `x?` unwraps success or returns failure, from core's Option or Result.
     fn resolve_try(self, &cx: Domain!['k], t: TryWait['k], pos: Pos) -> Type['k] {
         let operand = zonk(&cx, t.operand);
         let returned = zonk(&cx, t.returned);
@@ -2721,10 +2719,8 @@ impl Body['k] {
         };
         let fits = !family.is_empty() && self.family(&cx, returned).eq(&cx, family) && name.eq(&cx, other_name);
         if !fits {
-            self.fails(&cx, "? needs the operand and the function result to be the same direct Option/Result type", pos);
+            self.fails(&cx, "? needs the operand and the function result to be the same Option or Result of core::option", pos);
         }
-        self.require_visible_shape(&cx, operand, pos);
-        self.require_visible_shape(&cx, returned, pos);
         let result = family.is(&cx, "result");
         let ok = Span::from_static(&cx, if result { "Ok" } else { "Some" });
         let error = Span::from_static(&cx, if result { "Err" } else { "None" });
@@ -2744,37 +2740,27 @@ impl Body['k] {
         self.payload_of(&cx, td, name, sub)
     }
 
-    // `option`, `result`, or empty for any other type.
+    // `option` for core's Option and `result` for its Result, the types `?` takes apart; empty for any
+    // other.
     fn family(self, &cx: Domain!['k], ty: Type['k]) -> Span['k] {
-        let name = match ty {
-            Named(name, _args) => name,
-            _ => return Span::from_static(&cx, ""),
-        };
-        let variants = match self.inf.types.program.types.get(&cx, name) {
-            Some(td) => match td.body {
-                Enum(variants) => variants,
-                _ => return Span::from_static(&cx, ""),
+        match ty {
+            Named(name, _args) => if name.is(&cx, "core::option::Option") {
+                Span::from_static(&cx, "option")
+            } else if name.is(&cx, "core::option::Result") {
+                Span::from_static(&cx, "result")
+            } else {
+                Span::from_static(&cx, "")
             },
-            None => return Span::from_static(&cx, ""),
-        };
-        let names: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
-        var i = 0usize;
-        while i < variants.len(&cx) {
-            names.insert(&cx, variants.at(&cx, i).name);
-            i = i + 1usize;
-        }
-        if names.len(&cx) == 2usize && names.contains(&cx, Span::from_static(&cx, "Ok")) && names.contains(&cx, Span::from_static(&cx, "Err")) {
-            Span::from_static(&cx, "result")
-        } else if names.len(&cx) == 2usize && names.contains(&cx, Span::from_static(&cx, "Some")) && names.contains(&cx, Span::from_static(&cx, "None")) {
-            Span::from_static(&cx, "option")
-        } else {
-            Span::from_static(&cx, "")
+            _ => Span::from_static(&cx, ""),
         }
     }
 
     // ---- places
-    // The type of a place expression: a local, or fields and tuple elements of one.
-    fn place_type(self, &cx: Domain!['k], e: Expr['k], assign: bool) -> Type['k] {
+    // The type of a place expression: a local, or fields and tuple elements of one. A place that is
+    // assigned or lent is rooted at a var, a place parameter or a binder of a lent match case, bound in
+    // the function, closure or foreach body it is written in: such a body holds a copy of what it
+    // captures.
+    fn place_type(self, &cx: Domain!['k], e: Expr['k], assign: bool, lend: bool) -> Type['k] {
         let unit = match e {
             Path(p) => {
                 let local_name = match self.inf.r.refs.get(&cx, p.id) {
@@ -2790,8 +2776,11 @@ impl Body['k] {
                             Some(l) => l,
                             None => self.fail(&cx, Buffer!::new().push_static("unknown local ").push_bytes(&cx, name).save(&cx), p.pos),
                         };
-                        if assign && !local.mutable {
-                            self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(" is not a var").save(&cx), p.pos);
+                        if (assign || lend) && !local.mutable {
+                            self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(if lend { " is not a var; a lent place must be a var" } else { " is not a var" }).save(&cx), p.pos);
+                        }
+                        if (assign || lend) && local.depth != self.frames.len(&cx) - 1usize {
+                            self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(if lend { " is captured as a copy, which cannot be lent" } else { " is captured as a copy, which cannot be assigned" }).save(&cx), p.pos);
                         }
                         self.results().binders.insert(&cx, p.id, local.id);
                         return self.record(&cx, p.id, p.pos, local.type);
@@ -2799,8 +2788,8 @@ impl Body['k] {
                     None => (),
                 };
             },
-            Field(f) => return self.projection(&cx, f.value.copy(&cx), Option::Some.(f.name), 0usize, f.id, f.pos, assign),
-            Index(x) => return self.projection(&cx, x.value.copy(&cx), Option::None, x.index, x.id, x.pos, assign),
+            Field(f) => return self.projection(&cx, f.value.copy(&cx), Option::Some.(f.name), 0usize, f.id, f.pos, assign, lend),
+            Index(x) => return self.projection(&cx, x.value.copy(&cx), Option::None, x.index, x.id, x.pos, assign, lend),
             _ => (),
         };
         if assign {
@@ -2811,8 +2800,8 @@ impl Body['k] {
 
     // The type of `owner.name` or `owner.N`; an owner that is a place is typed as one, so that an
     // assignment is checked down to its root local.
-    fn projection(self, &cx: Domain!['k], value: Expr['k], field: Option[Span['k]], index: usize, id: u32, pos: Pos, assign: bool) -> Type['k] {
-        let owner = if self.is_place(&cx, value) { self.place_type(&cx, value, assign) } else { self.expr(&cx, value) };
+    fn projection(self, &cx: Domain!['k], value: Expr['k], field: Option[Span['k]], index: usize, id: u32, pos: Pos, assign: bool, lend: bool) -> Type['k] {
+        let owner = if self.is_place(&cx, value) { self.place_type(&cx, value, assign, lend) } else { self.expr(&cx, value) };
         let result = new_meta(&cx);
         self.later(&cx, owner, Action::Component.(Component.{ field, index, owner, result }), pos);
         self.record(&cx, id, pos, result)
@@ -2904,7 +2893,7 @@ impl Body['k] {
                     _ => self.fails(&cx, "internal error: a tuple declaration that is not a tuple", c.pos),
                 };
                 if c.args.len(&cx) != elems.len(&cx) {
-                    self.fail(&cx, Buffer!::new().push_bytes(&cx, td.name).push_static(" has ").push_usize(elems.len(&cx)).push_static(" elements").save(&cx), c.pos);
+                    self.fail(&cx, Buffer!::new().push_bytes(&cx, td.name).push_static(" has ").push_bytes(&cx, counted(&cx, elems.len(&cx), "element")).save(&cx), c.pos);
                 }
                 var i = 0usize;
                 while i < elems.len(&cx) {
@@ -3028,7 +3017,7 @@ impl Body['k] {
                         _ => (),
                     };
                     if self.is_place(&cx, inner) {
-                        return (self.record(&cx, u.id, u.pos, self.place_type(&cx, inner, false)), true);
+                        return (self.record(&cx, u.id, u.pos, self.place_type(&cx, inner, false, true)), true);
                     }
                 }
             },
@@ -3041,7 +3030,7 @@ impl Body['k] {
     // is none.
     fn bind_operands(self, &cx: Domain!['k], c: S::Call['k], got: ArenaVec[Option[(Type['k], bool)], 'k], ptypes: ArenaVec[Type['k], 'k], places: ArenaVec[usize, 'k]) {
         if got.len(&cx) != ptypes.len(&cx) {
-            self.fail(&cx, Buffer!::new().push_static("expected ").push_usize(ptypes.len(&cx)).push_static(" arguments, got ").push_usize(got.len(&cx)).save(&cx), c.pos);
+            self.fail(&cx, Buffer!::new().push_static("expected ").push_bytes(&cx, counted(&cx, ptypes.len(&cx), "argument")).push_static(", got ").push_usize(got.len(&cx)).save(&cx), c.pos);
         }
         var k = 0usize;
         while k < got.len(&cx) {
@@ -3079,7 +3068,7 @@ impl Body['k] {
         let tr = self.inf.sigs.traits.at(&cx, self.inf.sigs.name(&cx, trait_decl));
         let written = self.path_arguments(&cx, path, trait_decl, true);
         if written.len(&cx) > tr.params.len(&cx) {
-            self.fail(&cx, Buffer!::new().push_bytes(&cx, tr.name).push_static(" accepts at most ").push_usize(tr.params.len(&cx)).push_static(" type arguments, got ").push_usize(written.len(&cx)).save(&cx), c.pos);
+            self.fail(&cx, Buffer!::new().push_bytes(&cx, tr.name).push_static(" accepts at most ").push_bytes(&cx, counted(&cx, tr.params.len(&cx), "type argument")).push_static(", got ").push_usize(written.len(&cx)).save(&cx), c.pos);
         }
         let targs: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
@@ -3175,7 +3164,7 @@ impl Body['k] {
             if name.is(&cx, "fence") {
                 self.fails(&cx, "fence takes one ordering argument", c.pos);
             }
-            self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(" takes ").push_usize(arity).push_static(" value arguments").save(&cx), c.pos);
+            self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(" takes ").push_bytes(&cx, counted(&cx, arity, "value argument")).save(&cx), c.pos);
         }
         let count = path.segments.len(&cx);
         let targs = path.segments.at(&cx, count - 1usize).args;
@@ -3188,13 +3177,13 @@ impl Body['k] {
         }
         let expected = if name.is(&cx, "alloca") || name.is(&cx, "sizeof") { 1usize } else { 0usize };
         if targs.len(&cx) != expected {
-            self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(" takes ").push_usize(expected).push_static(" type arguments").save(&cx), c.pos);
+            self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(" takes ").push_bytes(&cx, counted(&cx, expected, "type argument")).save(&cx), c.pos);
         }
         self.results().calls.insert(&cx, c.id, Callee::Builtin.(name));
         if name.is(&cx, "fresh") {
-            Type::Exists.(ArenaVec::one(&cx, Span::from_static(&cx, "x")), Ref::new(&cx, Type::Brand.(Ref::new(&cx, Type::Skolem.(Span::from_static(&cx, "x"))))))
+            Type::Exists.(ArenaVec::one(&cx, Span::from_static(&cx, "x")), ref_in(&cx, Type::Brand.(ref_in(&cx, Type::Skolem.(Span::from_static(&cx, "x"))))))
         } else if name.is(&cx, "static_brand") {
-            Type::Brand.(Ref::new(&cx, Type::Skolem.(Span::from_static(&cx, "static"))))
+            Type::Brand.(ref_in(&cx, Type::Skolem.(Span::from_static(&cx, "static"))))
         } else if name.is(&cx, "trap") {
             Type::Never
         } else if name.is(&cx, "enum_variant") {
@@ -3209,7 +3198,7 @@ impl Body['k] {
                     if !self.is_place(&cx, u.operand.copy(&cx)) {
                         self.fails(&cx, "enum_variant(&place) requires a place", arg_pos);
                     }
-                    self.record(&cx, u.id, u.pos, self.place_type(&cx, u.operand.copy(&cx), false))
+                    self.record(&cx, u.id, u.pos, self.place_type(&cx, u.operand.copy(&cx), false, true))
                 },
                 None => self.expr(&cx, arg),
             };
@@ -3260,7 +3249,7 @@ impl Body['k] {
         if lent_receiver && !self.is_place(&cx, receiver) {
             self.fails(&cx, "& lends a local or a field of one", c.pos);
         }
-        let receiver_ty = if lent_receiver { self.place_type(&cx, receiver, false) } else { self.expr(&cx, receiver) };
+        let receiver_ty = if lent_receiver { self.place_type(&cx, receiver, false, true) } else { self.expr(&cx, receiver) };
         let actual = Receiver.{ value: receiver, lend: lent_receiver };
         let got: ArenaVec[Option[(Type['k], bool)], 'k] = ArenaVec::one(&cx, Option::None);
         got.append(&cx, self.operands(&cx, c.args));
@@ -3388,17 +3377,54 @@ impl Body['k] {
                 i = i + 1usize;
             }
         }
-        if candidates.len(&cx) != 1usize {
-            self.fail(&cx, Buffer!::new().push_bytes(&cx, self.shown(&cx, t)).push_static(" has ").push_static(if candidates.is_empty(&cx) { "no" } else { "several" }).push_static(" method ").push_bytes(&cx, name).save(&cx), pos);
+        if candidates.len(&cx) > 1usize {
+            self.fail(&cx, Buffer!::new().push_bytes(&cx, self.shown(&cx, t)).push_static(" has several methods named ").push_bytes(&cx, name).save(&cx), pos);
+        }
+        if candidates.is_empty(&cx) {
+            self.fail(&cx, Buffer!::new().push_bytes(&cx, self.shown(&cx, t)).push_static(" has no method ").push_bytes(&cx, name).push_bytes(&cx, self.import_hint(&cx, name)).save(&cx), pos);
         }
         candidates.at(&cx, 0usize)
+    }
+
+    // For a method no visible trait provides: the traits of one input that provide it but are not
+    // visible in the calling module, to import.
+    fn import_hint(self, &cx: Domain!['k], name: Span['k]) -> Span['k] {
+        let visible = self.inf.visible_traits(&cx, self.home);
+        let hidden: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+        let traits = self.inf.sigs.traits.values(&cx);
+        var i = 0usize;
+        while i < traits.len(&cx) {
+            let tr = traits.at(&cx, i);
+            var has = false;
+            var k = 0usize;
+            while k < tr.methods.len(&cx) {
+                has = has || tr.methods.at(&cx, k).name.eq(&cx, name);
+                k = k + 1usize;
+            }
+            let unit = match self.inf.decl_of.get(&cx, tr.name) {
+                Some(d) => if has && self.inf.inputs.get_or(&cx, tr.name, 0usize) == 1usize && !visible.contains(&cx, d.id) {
+                    hidden.insert(&cx, d.name);
+                },
+                None => (),
+            };
+            i = i + 1usize;
+        }
+        let names = hidden.keys(&cx);
+        names.sort_by(&cx, |&cx, a, b| a.cmp(&cx, b));
+        if names.is_empty(&cx) {
+            Span::from_static(&cx, "")
+        } else if names.len(&cx) == 1usize {
+            Buffer!::new().push_static("; the trait ").push_bytes(&cx, names.at(&cx, 0usize)).push_static(" provides it, import it").save(&cx)
+        } else {
+            Buffer!::new().push_static("; the traits ").push_bytes(&cx, listed(&cx, names)).push_static(" provide it, import one").save(&cx)
+        }
     }
 
     // A pointer operation: its operands held to their types, once the pointee is known.
     fn pointer_op(self, &cx: Domain!['k], c: S::Call['k], name: Span['k], pointer: Type['k], operands: ArenaVec[Type['k], 'k]) -> Type['k] {
         let params = pointer_params(&cx, name);
         if operands.len(&cx) != params.len() {
-            self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(" takes ").push_usize(params.len()).push_static(" arguments").save(&cx), c.pos);
+            self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(" takes ").push_bytes(&cx, counted(&cx, params.len(), "argument")).save(&cx), c.pos);
         }
         let out = new_meta(&cx);
         self.later(&cx, pointer, Action::Pointer.(PointerWait.{ name, pointer, operands, out }), c.pos);

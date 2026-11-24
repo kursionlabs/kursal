@@ -36,7 +36,7 @@ class LinearDiagnosticTests(unittest.TestCase):
     def test_repeated_loop_consumption(self):
         self.rejects('''fn f(t: Token!, c: bool) -> u32 {
             while c { let n = take(t); }; 0u32
-        } fn main() -> i32 { 0i32 }''', "(linear value 't'.*some paths|value 't'.*moved)")
+        } fn main() -> i32 { 0i32 }''', "(linear value 't' remains live|value 't'.*moved)")
 
     def test_overwriting_live_linear_value(self):
         self.rejects('''fn main() -> i32 {
@@ -74,7 +74,7 @@ class LinearDiagnosticTests(unittest.TestCase):
     def test_lending_after_move(self):
         self.rejects('''fn peek(&t: Token!) -> u32 { t.n }
             fn main() -> i32 {
-                let t = Token!.{ n: 7u32 }; let n = take(t); (peek(&t) as i32)
+                var t = Token!.{ n: 7u32 }; let n = take(t); (peek(&t) as i32)
             }''', "value 't'.*moved.*lent")
 
     def test_partial_move_preserves_disjoint_copy_field(self):

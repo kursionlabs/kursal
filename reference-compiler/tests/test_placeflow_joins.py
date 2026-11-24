@@ -142,5 +142,5 @@ fn bump(&t: Token!) -> u32 { t.n = t.n + 1u32; t.n }
 fn consume(t: Token!, n: u32) -> u32 { let { n: old } = t; old + n }
 """
         with self.assertRaisesRegex(KursError, 'plain read overlaps a lend'):
-            lowered(prefix + "fn use_token(t: Token!) -> u32 { consume(t, bump(&t)) }")
+            lowered(prefix + "fn use_token(t: Token!) -> u32 { var t = t; consume(t, bump(&t)) }")
         lowered(prefix + "fn use_token(t: Token!) -> u32 { var t = t; let n = bump(&t); consume(t, n) }")

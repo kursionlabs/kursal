@@ -18,7 +18,7 @@ the phase computed, as text, for comparison with the reference in the tests.
 | `resolve::dump` | | a resolved program as text |
 | `doc::model` | | what the documentation site shows and where: each package's modules, its own and re-exported, every type's methods, every instance, each item's URL |
 | `doc::text` | | escaping, the URL spelling of names, relative links, summary lines, and Kursal highlighted with its names linked |
-| `doc::generator` | | the Krayon site's content (`kursal doc`): module, type, trait and source pages, and the search index; see `docs/README.md` |
+| `doc::generator` | | the documentation site's content (`kursal doc`): module, type, trait and source pages, and the search index; see `docs/README.md` |
 | `kurs::core`, `kurs::sexpr` | `core.py`, `sexpr.py` | the KURS core and S-expressions |
 | `kurs::serial` | `kurs.py` | serialized KURS: its reader and writer |
 | `kurs::readable` | `readable.py` | readable KURS |
@@ -123,7 +123,7 @@ branded `'k`:
 - A map is a `std::collections::arena_map::ArenaMap[K, V, 'k]`, in insertion order like Python's
   `dict`: its entries in one `ArenaVec`, its hash slots in an arena slice made at the first key; a
   set is an `ArenaSet[K, 'k]` on top of one.
-- One mutable value, and a recursive field, is a `std::mem::Ref[T, 'k]` (`Ref::new(&cx, value)`).
+- One mutable value, and a recursive field, is a `std::mem::Ref[T, 'k]` (`std::arena::ref_in(&cx, value)`).
 - The scopes of inference, opened and closed as a body is walked, are a persistent
   `std::collections::list::List` of levels, innermost first.
 
@@ -155,7 +155,7 @@ because place flow and promotion report errors through the resolver, in their fi
 
 A group's hand-off is copied into the next arena with `kurs::transfer::copy_program` (every type,
 function, block, instruction, declaration and data form, maps in the same order),
-`check::checker::copy_typed`, `Span::copy_to(&from, &to)` (read under the first arena's
+`check::checker::copy_typed`, `std::arena::copy_span(span, &from, &to)` (read under the first arena's
 capability) and `types::ops::carry_fresh`; then the first arena is destroyed. A
 part shared by two places in the original is copied for each: nothing changes a program once it is
 lowered. `fail` still stops the process from inside, leaving whichever arenas are open to the
@@ -296,7 +296,7 @@ it paths as spans of the arena, which it reads in place:
   checks the tables and strings it reads with the reference's messages.
 - **The environment.** `std::env::variable` reads `KURSAL_LIB` and `KURSAL_CC`.
 - **Running `cc`.** `back_end` builds a `std::process::Command!`, which copies each argument out
-  of the arena, destroys the arena, and runs it (`posix_spawnp`); `Exit::Code(0)` is success.
+  of the arena, destroys the arena, and runs it (`posix_spawnp`); `Exit::Code.(0)` is success.
 
 The standard library's directory, without `KURSAL_LIB`, is found from `/proc/self/exe` (Linux),
 the one path the compiler names. Times come from `std::time::Instant`, and float literals are read
@@ -770,6 +770,52 @@ A constant conversion with a float on either side, and constant arithmetic or co
 (see "Pointer-sized integers") it is kept as an operation (`OpConst`, `ConstValue::Op`), and the C
 compiler folds it.
 
+### Integer arithmetic
+
+An operation on integers is defined for every pair of operands, signed or unsigned: no operand
+makes the C undefined, and the C compiler needs no flag such as `-fwrapv` for it. For an N-bit type:
+
+| Operation | Result |
+|---|---|
+| `+`, `-`, `*` | the exact result modulo 2^N, as a value of the type: it wraps (`127i8 + 1i8` is -128, `0u8 - 1u8` is 255) |
+| `-x` | `0 - x`, so the negation of a signed type's minimum is the minimum |
+| `/` | the quotient rounded toward zero (`-7i32 / 2i32` is -3); a signed minimum divided by -1 wraps to the minimum |
+| `%` | `x - (x / y) * y`, with the sign of `x` (`-7i32 % 2i32` is -1); a signed minimum modulo -1 is 0 |
+| `/`, `%` by 0 | the program traps (`KUR_TRAP`, `__builtin_trap()`) |
+| `<<`, `>>` | the amount is taken modulo N, as a two's complement value: an amount at or above N, or a negative one, shifts by its low log2(N) bits (`1u64 << 65u64` is 2, `1i8 << -1i8` is -128) |
+| `>>` on a signed type | arithmetic: the sign bit fills the vacated bits (`-128i8 >> 1i8` is -64) |
+
+The operands of an operation have one type, a shift's amount included. The C computes in
+`uint64_t` (`uintptr_t` for `usize` and `isize`), where C defines every result modulo 2^64, and
+reduces the result to the type: a cast for an unsigned type, and for a signed one `kur_dec_i8` to
+`kur_dec_i64` (`kur_dec_isize`), which take the low N bits as a two's complement value without a C
+conversion of an out-of-range value, which C leaves to the implementation. A shift widens its
+operand from its unsigned N-bit type, masks the amount with `N - 1` (`KUR_PTR_BITS - 1`), and for a
+signed `>>` fills the high bits itself, since C's `>>` of a negative value is the implementation's.
+Division tests its divisor first and computes the quotient in the signed type only when the
+divisor is not -1, the one case where C's signed division overflows:
+
+```c
+v3 = kur_dec_i8((uint64_t)(v1) + (uint64_t)(v2));
+if (v2 == 0) KUR_TRAP();
+v3 = (v2 == -1) ? kur_dec_i8((uint64_t)0 - (uint64_t)(v1)) : (int8_t)(v1 / v2);
+v3 = (v2 == -1) ? 0 : (int8_t)(v1 % v2);
+v3 = kur_dec_i8(((uint64_t)(uint8_t)(v1) >> ((uint64_t)(v2) & 7)) | (v1 < 0 && ((uint64_t)(v2) & 7) ? (UINT64_MAX << (8 - ((uint64_t)(v2) & 7))) : 0));
+```
+
+A division or remainder is never left out as dead (see "The C backend"): its trap happens wherever
+the operation is evaluated, whether or not its result is read.
+
+**Constant folding agrees with run time.** Folding (`sigs::signatures`, `sigs.py`) computes the
+same results: it wraps to the type's width, rounds a quotient toward zero, takes a shift amount
+modulo N and shifts a negative signed value arithmetically, so a constant has the value the same
+operation has at run time. A division or remainder by a constant 0 is an error (`constant division
+by zero`) rather than a trap, in a constant operand that is evaluated (not the right of a `&&` or
+`||` the left decides). An operation on `usize` or `isize` is not folded (see "Pointer-sized
+integers"): it is lowered to the instructions above, so only a divisor that is a literal 0, or a
+constant that is one, is an error there; a divisor that is 0 only once computed
+(`1usize / (1usize - 1usize)`) traps where the constant is used.
+
 ### The C compiler
 
 `kursal build` compiles the C with `$KURSAL_CC`, else `clang`, with `-O3 -w -fno-builtin`, and so do
@@ -902,7 +948,9 @@ These are the places where Kursal differs from what one might expect.
 - **An enum has at least one variant.** `enum E {}` is rejected (`enum E has no variant; an enum
   has at least one`), in KURS too: a sum of no variant would be a type with no value.
 - **Struct literals** are `Point.{ x: 1u32, y }`; tuple structs and variants with a payload are built
-  with `.(`: `Option::Some.(x)`. A spread `..rest` names a bundle made by a pattern
+  with `.(`, and only those: `Option::Some.(x)`. Resolution rejects a call of a constructor
+  (`` `Option::Some` is a constructor; write `Option::Some.(...)` ``) and a `.(` after anything
+  else (`` `f` is not a tuple or an enum variant; write `f(...)` ``). A spread `..rest` names a bundle made by a pattern
   (`let { x, ..rest } = p; Point.{ x: 2u32, ..rest }`), not an arbitrary value.
 - **Literals** carry their type when nothing else fixes it: `0u32`, `1usize`, `b'a'`. A bare `0`
   needs a type from context. A float literal has a point (`2.5`), an exponent (`1e-7`, `1.5E+300`)
@@ -953,9 +1001,19 @@ These are the places where Kursal differs from what one might expect.
   (`f(&cx, g(&cx, x))`). A function may move a place parameter out if it puts a value back before it
   returns: `let { tag, arena } = cx; ...; cx = Domain!.{ tag, arena };`. A
   `match`, `&&` or `if` may lend it in every branch.
+- **Only a var is lent or assigned.** The root of a place that is lent (`&x`, `&x.f`, `&x.m()`,
+  `f(&x)`, `match &x`, `for v in &it`, `{&x}` in an f-string) or assigned is a `var`, a place
+  parameter (`&x: T`, `&self`), or a binder of a case of a lent match. A `let` never changes after it
+  is bound (`a is not a var; a lent place must be a var`), nor does a parameter taken by value,
+  `self` included, nor the binder of a case of a match on a value: such a value is lent after
+  `var x = x;`. A closure or `foreach` body holds a copy of what it captures, so it neither assigns
+  nor lends a captured name, a `var` included (`a is captured as a copy, which cannot be lent`); it
+  takes a place parameter instead. `var` binds what `let` binds, and every name it binds is a var:
+  `var (tag, arena) = ...;`, `var { x, ..rest } = p;`, `var [a, b] = xs;`,
+  `var exists 'k. (tag, arena) = Arena!::new(seed);`.
 - **Brands.** `forall 'k.` binds a brand like a type parameter, and a type that holds branded storage
   takes it as its last argument (`ArenaVec[Span['k], 'k]`). A brand is minted by a constructor that
-  returns `exists 'k. ...` and is opened by `let exists 'k. cx = Domain!::new(hash_seed());`. An opening's
+  returns `exists 'k. ...` and is opened by `let exists 'k. ...`, or `var exists 'k. cx = Domain!::new(hash_seed());` to lend what it binds. An opening's
   names and an `exists` type's binders are distinct and new where they are written: never `'static`,
   a brand parameter, an earlier opening still in scope or an enclosing `exists`'s binder. A trait may
   take a brand as a parameter (`forall D, 'k. trait Discharge`, `instance Discharge[Checker['k], 'k]`). Only a
@@ -1015,9 +1073,25 @@ These are the places where Kursal differs from what one might expect.
   foreach type`). To keep what a `foreach` made, make it a function's whole result, as
   `Splitting!::parts` does.
 - **Expressions as statements.** `f(x);` discards a Copy result. A block's value is its last
-  expression, without a `;`. `return` is allowed anywhere; a function whose type is `!` (such as
-  `fail`) can stand in any expression position.
-- **`if` and `match` are expressions** and need an `else`/every case when their value is used.
+  expression, without a `;`. `return` is allowed anywhere, and ends with `;` at the end of a block
+  (``a `return` at the end of a block ends with `;` ``); a function whose type is `!` (such as `fail`)
+  can stand in any expression position.
+- **`if` and `match` are expressions** and need an `else`/every case when their value is used: an
+  `if` without `else` has type `()`. A `match` names each variant it misses (`a match must cover
+  every enum variant; it misses Amber`).
+- **`?`** takes apart `core::option`'s `Option` and `Result` only, of the type the function returns:
+  `x?` on an `Option` returns `None` from an `Option` function, and on a `Result` its `Err` from a
+  `Result` function with the same error type. An enum of one's own with the same variants is
+  another type.
+- **Methods belong to their type's package.** An inherent impl, `impl T { ... }`, is in the package
+  that declares `T`, and one of a primitive or builtin type is in `core` (`an inherent impl of
+  Buffer! belongs in the package that declares it`), so no package adds a method that could clash
+  with the type's own. Another package writes a function, or a trait and its instance. A blanket
+  impl, `forall M where Tr[M]. impl M`, is no inherent impl: its methods are found through its
+  bounding traits.
+- **F-strings.** `{x}` formats `x` by `Format::format`, which hands the value back; `{x}` drops it,
+  so a linear `x` is written `{&x}`, which lends it (`{x} in an f-string drops a linear value; lend
+  it with {&x}`).
 - **Closures** `|x| x + 1u32` have types `closure(u32) -> u32` as parameters. A closure captures
   the locals of its function it mentions, a linear one by moving it in, which makes the closure
   linear: it is then called once or handed on, as `std::thread::spawn` takes one that owns a `Buffer!`

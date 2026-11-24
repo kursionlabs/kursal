@@ -12,7 +12,7 @@ use std::collections::arena_vec::ArenaVec;
 use std::collections::arena_map::{ArenaMap, ArenaSet};
 use std::mem::Ref;
 use std::raw::Span;
-use std::arena::Domain!;
+use std::arena::{Domain!, copy_span, ref_in};
 use std::buffer::Buffer!;
 use package::kurs::transfer::copy_type;
 use package::kurs::core::{Arm, Block, Edge, FnType, Fun, Instance, Instr, Kind, Member, Method, ModuleId, Param, Premise, Program, Terminator, Type};
@@ -107,7 +107,7 @@ fn sealed(&cx: Domain!['k], name: Span['k]) -> bool {
 
 forall 'k.
 fn segments(&cx: Domain!['k], path: Span['k]) -> ArenaVec[Span['k], 'k] {
-    path.split(&cx, Span::from_static(&cx, "."))
+    ArenaVec::split(&cx, path, Span::from_static(&cx, "."))
 }
 
 // Resolve a bounded decimal tuple component without parsing huge atoms.
@@ -718,28 +718,28 @@ impl Checker['k] {
             formation,
             types: Types::new(&cx, program, counter),
             typed: ArenaMap::new(&cx),
-            home: Ref::new(&cx, Option::None),
-            kinds: Ref::new(&cx, ArenaMap::new(&cx)),
-            copies: Ref::new(&cx, (0usize, ArenaMap::new(&cx))),
-            brands: Ref::new(&cx, ArenaSet::new(&cx)),
-            premises: Ref::new(&cx, ArenaVec::new(&cx)),
-            location: Ref::new(&cx, Span::from_static(&cx, "")),
-            current: Ref::new(&cx, Option::None),
-            params: Ref::new(&cx, ArenaVec::new(&cx)),
-            blocks: Ref::new(&cx, ArenaMap::new(&cx)),
-            record: Ref::new(&cx, ArenaMap::new(&cx)),
-            roots: Ref::new(&cx, ArenaMap::new(&cx)),
-            param_roots: Ref::new(&cx, ArenaSet::new(&cx)),
-            root_brand_cache: Ref::new(&cx, ArenaMap::new(&cx)),
-            edge_roots: Ref::new(&cx, Option::None),
-            facts: Ref::new(&cx, PathFacts.{ roots: 0usize, kinds: 0usize, stored: ArenaMap::new(&cx), empty_sets: ArenaMap::new(&cx), linear_empty: ArenaMap::new(&cx) }),
+            home: ref_in(&cx, Option::None),
+            kinds: ref_in(&cx, ArenaMap::new(&cx)),
+            copies: ref_in(&cx, (0usize, ArenaMap::new(&cx))),
+            brands: ref_in(&cx, ArenaSet::new(&cx)),
+            premises: ref_in(&cx, ArenaVec::new(&cx)),
+            location: ref_in(&cx, Span::from_static(&cx, "")),
+            current: ref_in(&cx, Option::None),
+            params: ref_in(&cx, ArenaVec::new(&cx)),
+            blocks: ref_in(&cx, ArenaMap::new(&cx)),
+            record: ref_in(&cx, ArenaMap::new(&cx)),
+            roots: ref_in(&cx, ArenaMap::new(&cx)),
+            param_roots: ref_in(&cx, ArenaSet::new(&cx)),
+            root_brand_cache: ref_in(&cx, ArenaMap::new(&cx)),
+            edge_roots: ref_in(&cx, Option::None),
+            facts: ref_in(&cx, PathFacts.{ roots: 0usize, kinds: 0usize, stored: ArenaMap::new(&cx), empty_sets: ArenaMap::new(&cx), linear_empty: ArenaMap::new(&cx) }),
             set_pool: ArenaVec::new(&cx),
             working: Places::new(ArenaSet::new(&cx), ArenaMap::new(&cx), ArenaMap::new(&cx)),
-            label: Ref::new(&cx, Span::from_static(&cx, "")),
-            env: Ref::new(&cx, ArenaMap::new(&cx)),
-            used: Ref::new(&cx, ArenaSet::new(&cx)),
-            places: Ref::new(&cx, Places::new(ArenaSet::new(&cx), ArenaMap::new(&cx), ArenaMap::new(&cx))),
-            instr: Ref::new(&cx, Option::None),
+            label: ref_in(&cx, Span::from_static(&cx, "")),
+            env: ref_in(&cx, ArenaMap::new(&cx)),
+            used: ref_in(&cx, ArenaSet::new(&cx)),
+            places: ref_in(&cx, Places::new(ArenaSet::new(&cx), ArenaMap::new(&cx), ArenaMap::new(&cx))),
+            instr: ref_in(&cx, Option::None),
         };
         checker.brands.copy(&cx).insert(&cx, static_brand(&cx));
         formation.discharge.set(&cx, Option::Some.(checker));
@@ -845,7 +845,7 @@ impl Checker['k] {
                 None => nowhere(&cx),
             }));
             // A data item's static object is never written, and a load through a pointer to it must
-            // leave it as it is: a move out of a linear value would change it (DECL-DATA).
+            // leave it as it is: a move out of a linear value would change it. So its type is Copy.
             if !self.types.is_copy(&cx, data.ty, ArenaMap::new(&cx)) {
                 self.fail(&cx, "data_type_not_copy");
             }
@@ -1379,7 +1379,7 @@ impl Checker['k] {
 
     // The paths `block` declares empty that an edge into it must show hold no linear contents, in
     // order: all of them, or, once an edge has found them while no view was open, those of them
-    // `empty_discardable` does not answer for every state. The others answer `Ok(true)` with
+    // `empty_discardable` does not answer for every state. The others answer `Ok.(true)` with
     // nothing found or drawn, so leaving them out changes nothing.
     fn empty_to_check(self, &cx: Domain!['k], block: Block['k]) -> ArenaVec[Span['k], 'k] {
         if self.places.copy(&cx).opened.is_empty(&cx) {
@@ -2258,10 +2258,10 @@ impl Checker['k] {
         subst(&cx, C::fn_type(&cx, fun.ptypes, fun.ret, fun.is_unsafe, fun.places(&cx)), sub, self.counter)
     }
 
-    // DECL-EXTERN-FN and DECL-EXTERN-RESULT. A parameter has a memory form, and the result holds
-    // nothing only checked code makes (`foreign_result`) and is zero-size only if it is Copy: a
-    // zero-size linear result would be a resource foreign code made from nothing. A function type
-    // anywhere in the signature is an `unsafe fn` type: no safe function value comes from foreign
+    // An extern's signature, which crosses to foreign code. A parameter has a memory form, and the
+    // result holds nothing only checked code makes (`foreign_result`) and is zero-size only if it is
+    // Copy: a zero-size linear result would be a resource foreign code made from nothing. A function
+    // type anywhere in the signature is an `unsafe fn` type: no safe function value comes from foreign
     // code or goes to it. Foreign code calls such a value with arguments it makes, and takes its
     // result, or hands the value back, so the program calls it: each parameter of one has a memory
     // form and holds nothing only checked code makes, and so does its result, which may be
@@ -2340,7 +2340,7 @@ impl Checker['k] {
         C::ptr(&cx, ty)
     }
 
-    // INS-SIZEOF: a foreach type's pointer source that mentions a parameter is `Exposed`, as a
+    // `sizeof`: a foreach type's pointer source that mentions a parameter is `Exposed`, as a
     // traversal needs, so the type has its rows at every instantiation (`Types::pointer_sources`).
     fn op_sizeof(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
         let sources = self.types.pointer_sources(&cx, self.type_operand(&cx, instr));
@@ -2362,11 +2362,11 @@ impl Checker['k] {
     }
 
     fn op_static_brand(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
-        Type::Brand.(Ref::new(&cx, Type::Skolem.(static_brand(&cx))))
+        Type::Brand.(ref_in(&cx, Type::Skolem.(static_brand(&cx))))
     }
 
     fn op_fresh(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
-        Type::Exists.(ArenaVec::one(&cx, Span::from_static(&cx, "k")), Ref::new(&cx, Type::Brand.(Ref::new(&cx, Type::Skolem.(Span::from_static(&cx, "k"))))))
+        Type::Exists.(ArenaVec::one(&cx, Span::from_static(&cx, "k")), ref_in(&cx, Type::Brand.(ref_in(&cx, Type::Skolem.(Span::from_static(&cx, "k"))))))
     }
 
     fn op_pack(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
@@ -2502,7 +2502,7 @@ impl Checker['k] {
         C::unit(&cx)
     }
 
-    // MEM-SIZED-ACCESS: a raw load, store, `alloca` or lend of a raw pointer's target (`&*p`, a read
+    // A raw load, store, `alloca` or lend of a raw pointer's target (`&*p`, a read
     // and a write) is at a type of non-zero size, never a zero-size one, which has no memory to read,
     // write or reserve: it needs `Sized` of the type
     // (`Types::sized_available`), which the shape decides for a type without parameters, and which
@@ -3084,8 +3084,8 @@ fn copy_typed(&from: Domain!['a], &to: Domain!['b], typed: ArenaMap[FunKey['a], 
         match typed.key_at(&from, i) {
             Some(key) => {
                 let key_b = match key {
-                    Function(name) => FunKey::Function.(name.copy_to(&from, &to)),
-                    Method(trait_name, index, name) => FunKey::Method.(trait_name.copy_to(&from, &to), index, name.copy_to(&from, &to)),
+                    Function(name) => FunKey::Function.(copy_span(name, &from, &to)),
+                    Method(trait_name, index, name) => FunKey::Method.(copy_span(trait_name, &from, &to), index, copy_span(name, &from, &to)),
                 };
                 let values = typed.at(&from, key);
                 let values_b: ArenaMap[(Span['b], Span['b]), Type['b], 'b] = ArenaMap::new(&to);
@@ -3094,7 +3094,7 @@ fn copy_typed(&from: Domain!['a], &to: Domain!['b], typed: ArenaMap[FunKey['a], 
                     match values.key_at(&from, k) {
                         Some(at) => {
                             let (label, name) = at;
-                            values_b.insert(&to, (label.copy_to(&from, &to), name.copy_to(&from, &to)), copy_type(&from, &to, values.at(&from, at)));
+                            values_b.insert(&to, (copy_span(label, &from, &to), copy_span(name, &from, &to)), copy_type(&from, &to, values.at(&from, at)));
                         },
                         None => (),
                     };

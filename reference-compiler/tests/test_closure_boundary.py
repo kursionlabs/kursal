@@ -5,6 +5,7 @@ from pathlib import Path
 
 from kursal import core as C
 from kursal.cgen import emit_c
+from kursal.infer import InferError
 from kursal.check import check_program
 from kursal.lower import lower
 from kursal.resolve import resolve
@@ -36,14 +37,14 @@ class ClosureBoundaryTests(unittest.TestCase):
             (f(2) as i32)
         }''', 5)
 
-    def test_copy_environment_is_fresh_per_call(self):
-        self.run_source('''fn main() -> i32 {
+    def test_a_closure_neither_assigns_nor_lends_what_it_captures(self):
+        # The closure holds a copy, so a change would reach the copy alone.
+        with self.assertRaisesRegex(InferError, "3:32: n is captured as a copy, which cannot be assigned$"):
+            self.run_source('''fn main() -> i32 {
             var n = 3u32;
             let f = |x: u32| { n = n + x; n };
-            let a = f(2);
-            let b = f(4);
-            ((a + b + n) as i32)
-        }''', 15)
+            ((f(2) + n) as i32)
+        }''', 0)
 
     def test_nested_capture_preserves_binding_identity(self):
         self.run_source('''fn main() -> i32 {

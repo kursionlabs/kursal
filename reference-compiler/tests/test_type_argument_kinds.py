@@ -11,19 +11,19 @@ class TypeArgumentKindTests(unittest.TestCase):
 
     def test_constant_value_paths_reject_arguments(self):
         for path in ('N[bool]', 'package[bool]::N'):
-            with self.subTest(path=path), self.assertRaisesRegex(InferError, 'type arguments'):
+            with self.subTest(path=path), self.assertRaisesRegex(InferError, 'type argument'):
                 self.run_source('const N: i32 = 7i32; fn main() -> i32 { ' + path + ' }', 7)
 
     def test_folded_constant_paths_reject_arguments(self):
         for path in ('N[bool]', 'package[bool]::N'):
-            with self.subTest(path=path), self.assertRaisesRegex(SigError, 'type arguments'):
+            with self.subTest(path=path), self.assertRaisesRegex(SigError, 'type argument'):
                 self.run_source('const N: i32 = 7i32; const M: i32 = ' + path + '; '
                                 'fn main() -> i32 { M }', 7)
 
     def test_primitive_and_parameter_types_reject_arguments(self):
         for source in ('fn bad(x: u32[bool]) -> u32 { x }',
                        'forall T. fn bad(x: T[u32]) -> T { x }'):
-            with self.subTest(source=source), self.assertRaisesRegex(SigError, 'type arguments'):
+            with self.subTest(source=source), self.assertRaisesRegex(SigError, 'type argument'):
                 self.run_source(source + ' fn main() -> i32 { 7i32 }', 7)
 
     def test_brand_constructor_requires_one_brand_argument(self):
@@ -64,5 +64,5 @@ class TypeArgumentKindTests(unittest.TestCase):
     def test_trait_premise_and_instance_argument_counts(self):
         for declaration in ('forall T where Tag[T, T]. fn bad(x: T) -> T { x }',
                             'instance Tag[u32, u32] {}'):
-            with self.subTest(declaration=declaration), self.assertRaisesRegex(SigError, 'type arguments'):
+            with self.subTest(declaration=declaration), self.assertRaisesRegex(SigError, 'type argument'):
                 self.run_source('forall T. trait Tag {} ' + declaration + ' fn main() -> i32 { 7i32 }', 7)

@@ -479,7 +479,7 @@ WALKED = {
     S.Field: ("field", lambda n: (n.value,)), S.Index: ("index", lambda n: (n.value,)),
     S.Call: ("call", lambda n: (n.callee, *n.args)), S.Try: ("try", lambda n: (n.value,)),
     S.While: ("while", lambda n: (n.cond, n.body)), S.For: ("for", lambda n: (n.iterator, n.body)),
-    S.Let: ("let", lambda n: (n.pattern, n.value)), S.Var: ("var", lambda n: (n.value,)),
+    S.Let: ("let", lambda n: (n.pattern, n.value)),
     S.Const: ("const", lambda n: (n.value,)),
 }
 PATTERNS = {
@@ -1006,12 +1006,19 @@ RESOLUTION_ERRORS: tuple[tuple[dict[str, str], str], ...] = (
     (app("use lib::shapes::Point;\nfn f() -> Point { Point.{ x } }\n"), "app"),
     (app("use lib::shapes;\nuse lib::shapes::Point;\nfn f(p: Point) -> u32 { match p { shapes::Point(x) => 0u32 } }\n"), "app"),
     (app("fn f(x: builtin) -> () { () }\n"), "app"),
+    # The whole of TOML, read before its keys are checked: a dependency has no key but `path`.
+    (app("", {"app/kur.toml": "[package]\nname = \"app\"\nsource_root = \".\"\n[dependencies.lib]\npath = '../lib'\n"
+                              "version = 1\nratio = 0.5\nflags = [true, false]\nwhen = 1979-05-27T07:32:00Z\n"
+                              "[[dependencies.lib.authors]]\nname = \"a\"\n"}), "app"),
+    # An inherent impl is in the package that declares its type; one of a primitive is in core.
+    (app("use lib::shapes::Point;\nimpl Point { fn other(self) -> u32 { 0u32 } }\nimpl bool { fn no(self) -> bool { self } }\n"), "app"),
+    # Construction is `Name.(args)`, and only a tuple or a variant is constructed.
+    (app("use lib::shapes::{Shape, make};\nfn f() -> u32 { let s = Shape::Dot(make(1u32)); let p = make.(2u32); 0u32 }\n"), "app"),
     (app("fn f() -> u32 { u32::nope() }\n"), "app"),
     (app("forall T where lib::shapes::make[T]. fn f(x: T) -> u32 { 0u32 }\n"), "app"),
     (app("impl (u32, u32) { fn f(self) -> u32 { 0u32 } }\n"), "app"),
     (app("use lib::shapes;\nimpl shapes { fn f(self) -> u32 { 0u32 } }\n"), "app"),
     (app("struct P { x: u32 }\nimpl P { fn f(self) -> u32 { 0u32 } }\nimpl P { fn f(self) -> u32 { 1u32 } }\n"), "app"),
-    (app("module x;\n"), "app"),
     (app("", {"app/kur.toml": manifest("app", ("lib",), "package::Nope")}), "app"),
     (app("struct Main {}\n", {"app/kur.toml": manifest("app", ("lib",), "Main")}), "app"),
     (app("", {"app/kur.toml": manifest("app", ("lib",), "lib::shapes::make")}), "app"),
@@ -1033,6 +1040,9 @@ RESOLUTION_ERRORS: tuple[tuple[dict[str, str], str], ...] = (
     ({"p/kur.toml": '[package]\nname="p"\nsource_root="."\nkind="executable"\n', "p/lib.kur": ""}, "p"),
     ({"p/kur.toml": '[package]\nname="p"\nsource_root="."\nkind="executabl"\nentry="package::main"\n', "p/lib.kur": ""}, "p"),
     ({"p/kur.toml": '[package]\nname="p"\nsource_root="."\nkind="Library"\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": '[package]\nname="p"\nsource_root="."\n[dependencies.x]\npath="../missing"\nversion="1"\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": '[package]\nname="p"\nedition=1\n[dependencies.x]\npath="../missing"\noptional=true\n', "p/lib.kur": ""}, "p"),
+    ({"p/kur.toml": '[package]\nname="p"\nsource_root="."\nkind="library"\nentry="package::main"\n[dependencies.x]\npath="../missing"\n', "p/lib.kur": ""}, "p"),
     ({"p/kur.toml": '[package]\nname="p"\nsource_root="."\nkind=1\n', "p/lib.kur": ""}, "p"),
     ({"p/kur.toml": '[package]\nname = "p" # the name\n"source_root" = "."\n[package.x]\n', "p/lib.kur": ""}, "p"),
     ({"one.kur": "fn main() -> i32 { nothing() }\n"}, "one.kur"),
@@ -1075,7 +1085,7 @@ RESOLUTION_ERRORS: tuple[tuple[dict[str, str], str], ...] = (
     (app("struct P { x: u32 }\nimpl (u32, P) { fn f(self) -> u32 { 0u32 } }\nimpl P { fn g(self) -> u32 { 0u32 } }\n"
          "impl P { fn g(self) -> u32 { 1u32 } }\n"), "app"),
     (app("", {"app/kur.toml": manifest("app", ("lib",), "package::Nope"), "app/b.kur": "fn f() -> u32 { g() }\n"}), "app"),
-    (app("use package::b;\nuse builtin::fresh;\n", {"app/b.kur": "module b;\nuse lib::{shapes::Point as P!, shapes as Copy};\n"}), "app"),
+    (app("use package::b;\nuse builtin::fresh;\n", {"app/b.kur": "use lib::{shapes::Point as P!, shapes as Copy};\n"}), "app"),
     # Resolution reports every error, in source order: the modules in order, each by position.
     (app("use package::a;\nfn f(x: Nothing) -> u32 { nothing() }\nfn g() -> Other { 0u32 }\n",
          {"app/a.kur": "struct L! { x: u32 }\nstruct S { l: L, m: Missing }\n"
@@ -1102,18 +1112,14 @@ RESOLVED: tuple[tuple[dict[str, str], str], ...] = (
          "forall T where Copy[T], Show[T]. fn f(a: u32, x: T) -> Point {\n"
          "    let p = mk(a); let n = p.x; let q = Point::get(p); let s = Show::show(n);\n"
          "    match Shape::Empty { Shape::Dot(d) => d, _ => Point.{ x: T::size } }\n}\n",
-         {"app/kur.toml": manifest("app", ("lib",)).replace('"', "'") + "kind = \"executable\"\nentry = \"package::run::main\"\n",
+         {"app/kur.toml": manifest("app").replace('"', "'") + "kind = \"executable\"\nentry = \"package::run::main\"\n"
+                          "[dependencies.lib]\npath = '../lib'\n",
           "app/run.kur": "fn main() -> i32 { 0i32 }\n"}), "app"),
     # Every reference to a linear type spells its `!`, and so does an alias of it.
     (app("use package::a::{L!, E! as F!};\nfn f(l: L!) -> L! { let { x } = l; L!::make(x) }\n"
          "fn g(e: F!) -> u32 { match e { F!::A => 0u32, F!::B(l) => l.get() } }\n",
          {"app/a.kur": "exposed struct L! { x: u32 }\nenum E! { A, B(L!) }\n"
                        "impl L! { fn make(x: u32) -> L! { L!.{ x } } fn get(self) -> u32 { self.x } }\n"}), "app"),
-    # The whole of TOML, of which the manifest reads its strings and tables: a dependency's other keys
-    # are not read.
-    (app("", {"app/kur.toml": "[package]\nname = \"app\"\nsource_root = \".\"\n[dependencies.lib]\npath = '../lib'\n"
-                              "version = 1\nratio = 0.5\nflags = [true, false]\nwhen = 1979-05-27T07:32:00Z\n"
-                              "[[dependencies.lib.authors]]\nname = \"a\"\n"}), "app"),
 )
 
 
@@ -1254,7 +1260,7 @@ SIGNATURE_ERRORS = (
 
 # The examples in examples/bad/ that resolution rejects.
 UNRESOLVED = {"private_import.kur", "unused_unknown_import.kur", "glob_of_unknown_module.kur",
-              "unknown_name_in_use_tree.kur"}
+              "unknown_name_in_use_tree.kur", "constructor_call.kur"}
 
 SYNTAX_ERRORS = (
     "fn f() -> Point { Point { x: 1u32 } }",
@@ -1297,6 +1303,11 @@ SYNTAX_ERRORS = (
     # `forall` quantifies a declaration, never a type: a function type quantifies nothing.
     "fn f(k: forall 'q. fn(core::cap::Brand['q]) -> u32) {}",
     "struct S { f: forall 'a. u32 }",
+    # A `return` at the end of a block ends with `;`.
+    "fn f() -> u32 { return 1u32 }",
+    # `module` is reserved, and `unsafe` marks only a function.
+    "module x;",
+    "unsafe instance Send[u32] {}",
 )
 
 KURS_ERRORS = (

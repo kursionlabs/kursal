@@ -30,7 +30,7 @@ use std::slice::{StaticRead, bytes_eq};
 fn main() -> i32 {
     var n = 5u32;
     let msg = f"{if n == 5 { 7u32 } else { 8u32 }}:{match n { 5 => 9u32, _ => 10u32 }}:{&n}:{n}";
-    let exists 'opened. (tag, bytes, restore) = msg.open();
+    var exists 'opened. (tag, bytes, restore) = msg.open();
     var sr = StaticRead::new();
     let good = bytes_eq(&tag, bytes, &sr, "7:9:5:5");
     restore.restore(tag).destroy();
@@ -143,7 +143,7 @@ fn main() -> i32 {
     let pair = ((1u32, 2u32), (3u32, 4u32));
     let (l1, r1) = pair;
     let (a, b) = l1;
-    let (c, d) = r1;
+    var (c, d) = r1;
     let l = Line.{ a: Pt.{ x: 1, y: 2 }, b: Pt.{ x: 30, y: 40 } };
     let arr = [a, b, c, d];
     let [p, q, r, s] = arr;
@@ -152,7 +152,7 @@ fn main() -> i32 {
 }
 """},
     "try": {"lib.kur": """
-forall T, E. exposed enum Result { Ok(T), Err(E) }
+use core::option::Result;
 fn half(n: u32) -> Result[u32, u32] {
     if n % 2 == 0 { Result::Ok.(n / 2) } else { Result::Err.(n) }
 }
@@ -178,10 +178,10 @@ impl Cube { fn volume(self) -> u32 { self.side * self.side * self.side } }
 forall A, B. trait Pairing { fn pair(a: A, b: B) -> u32; }
 instance Pairing[u32, bool] { fn pair(a: u32, b: bool) -> u32 { if b { a } else { 0 } } }
 fn main() -> i32 {
-    let c = twice(Cube.{ side: 2 }, 3);
+    var c = twice(Cube.{ side: 2 }, 3);
     let v = c.volume();
     let n = twice(5u32, 2);
-    let p = Pairing[u32, bool]::pair(7, true);
+    var p = Pairing[u32, bool]::pair(7, true);
     (((v + n + p) % 251) as i32)
 }
 """},
@@ -284,7 +284,7 @@ fn mint() -> exists 'r. Tag!['r] {
 }
 forall 'k. fn read(t: Tag!['k]) -> (Tag!['k], u32) { (t, 5) }
 fn use_tag(p: exists 'r. Tag!['r]) -> u32 {
-    let exists 'x. t = p;
+    var exists 'x. t = p;
     let (t2, n) = read(t);
     let { marker } = t2;
     n
@@ -298,7 +298,7 @@ fn main() -> i32 {
     let x = 5u32;
     let y = 2u32;
     let a = add3(pick(x), match y { 0 => 7, 1..=3 => 4, _ => 9 }, if x > 1 && y > 1 { 3 } else { 8 });
-    let t = (if x > 9 { 1u32 } else { 2u32 }, match y { 2 => 5u32, _ => 6u32 }, x);
+    var t = (if x > 9 { 1u32 } else { 2u32 }, match y { 2 => 5u32, _ => 6u32 }, x);
     let (p, q, r) = t;
     (((a + p + q + r) % 251u32) as i32)
 }
@@ -308,7 +308,7 @@ exposed struct Tag! { id: u32 }
 exposed struct Ctx! { tag: Tag!, count: u32, extra: u32 }
 fn bump(&t: Tag!) -> u32 { let { id } = t; t = Tag!.{ id: id + 1 }; id }
 fn run(&ctx: Ctx!) -> u32 {
-    let { tag, ..rest } = ctx;
+    var { tag, ..rest } = ctx;
     let count = bump(&tag);
     ctx = Ctx!.{ tag, count, ..rest };
     let { tag, count, extra } = ctx;
@@ -408,8 +408,7 @@ fn main() -> i32 {
 }
 """},
     "direct_try": {"lib.kur": """
-forall T. exposed enum Option { Some(T), None }
-forall T, E. exposed enum Result { Ok(T), Err(E) }
+use core::option::{Option, Result};
 exposed struct Cur { n: u32 }
 fn get(o: Option[(u32, bool)], &c: Cur) -> Option[u32] {
     c.n = c.n + 1;
@@ -500,6 +499,17 @@ class LoweringTests(unittest.TestCase):
             c_file = directory / "main.c"
             c_file.write_text(emit_c(program, check_program(program), sigs.name(resolver.packages[0].entry_decl)))
             self.assertEqual(compile_and_run(c_file, directory / "main"), 0)
+
+    @unittest.skipUnless((LIB / "std" / "kur.toml").exists(), "needs the standard library")
+    def test_an_fstring_rejects_a_linear_value_it_would_drop_where_it_is_written(self):
+        with tempfile.TemporaryDirectory(prefix="kursal-fstring-") as base:
+            path = Path(base) / "fstr_lin.kur"
+            path.write_text("use std::buffer::Buffer!;\nuse std::io::print_buffer;\nfn main() {\n"
+                            "    let name = Buffer!::new().push_static(\"x\");\n    print_buffer(f\"hi {name}\\n\");\n}\n")
+            resolver = resolve(path)
+            with self.assertRaisesRegex(KursError, r"fstr_lin\.kur:5:24: \{x\} in an f-string drops a linear value; "
+                                                   r"lend it with \{&x\}$"):
+                lower(resolver, signatures(resolver))
 
     def test_match_payloads_bind_values_and_alias_places(self):
         source = """

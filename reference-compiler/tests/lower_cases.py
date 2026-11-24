@@ -6,14 +6,24 @@ tests/test_compiler.py records them as the tests run.
 A case is a source, lowered as the one module of a package `p` (or, when it names `std::`, as a single
 file depending on the standard library), or a dict of files, of which the package in `a/` is lowered."""
 
-TOKEN = "exposed struct Token! { n: u32 }\nfn take(t: Token!) -> u32 { let { n } = t; n }\n"
+TOKEN = "exposed struct Token! { n: u32 }\nfn take(t: Token!) -> u32 { var { n } = t; n }\n"
 OPTION = "forall T. exposed enum Option { Some(T), None }\n"
 BOX = "exposed struct Box! { t: Token!, n: u32 }\n"
 
 LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
+    # `as` converts between numbers; any other cast is unsafe.
+    ("fn f() -> u8 { true as u8 }\n", "1:16: a safe `as` converts only between number types and from a NonNull to its pointer; "
+     "any other cast reinterprets bits and needs unsafe"),
+    # A match names the variants it misses.
+    ("exposed enum L { R, A, G }\nfn f(l: L) -> u32 { match l { R => 1u32, G => 2u32 } }\n",
+     "2:21: a match must cover every enum variant; it misses A"),
+    # `{x}` hands its value to `Format::format` and drops the copy it gets back.
+    ("use std::buffer::Buffer!;\nuse std::io::print_buffer;\nfn main() {\n"
+     "    let name = Buffer!::new().push_static(\"x\");\n    print_buffer(f\"hi {name}\\n\");\n}\n",
+     "5:24: {x} in an f-string drops a linear value; lend it with {&x}"),
     # lowering
     ("fn f() -> i8 { -129i8 }\n", "does not fit"),
-    ("fn f() -> u8 { let x: u8 = 300; x }\n", "does not fit"),
+    ("fn f() -> u8 { var x: u8 = 300; x }\n", "does not fit"),
     ("fn f(p: *u32) -> u32 { *p }\n", "requires unsafe authorization"),
     ("fn f() -> *u32 { core::mem::alloca[u32]() }\n", "requires unsafe authorization"),
     ("fn bump(&x: u32) -> u32 { x = x + 1u32; x }\nfn add(a: u32, b: u32) -> u32 { a + b }\n"
@@ -60,9 +70,9 @@ LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
     ('enum E { A(u8), B(u16) }\nextern "C" fn f() -> unsafe fn() -> unsafe fn(E) -> u8;\n',
      "extern f has an unsafe fn type in its signature that takes or returns an enum or a NonNull"),
     # No memory holds a value that holds Never, however deep.
-    ("struct S { n: ! }\nfn f(p: *S) -> u32 { let s = unsafe *p; 0u32 }\n",
+    ("struct S { n: ! }\nfn f(p: *S) -> u32 { var s = unsafe *p; 0u32 }\n",
      "an unsafe read cannot produce a value that holds Never"),
-    ("fn f(p: *(u32, !)) -> u32 { let s = unsafe *p; 0u32 }\n", "an unsafe read cannot produce a value that holds Never"),
+    ("fn f(p: *(u32, !)) -> u32 { var s = unsafe *p; 0u32 }\n", "an unsafe read cannot produce a value that holds Never"),
     ("struct S { n: ! }\nfn get(&s: S) -> u32 { 0u32 }\nfn f(p: *S) -> u32 { get(unsafe &*p) }\n",
      "an unsafe lend of a pointer's target cannot lend a value that holds Never"),
     # A raw read, write or alloca is never at a zero-size type, Copy or not, volatile or not; at a type
@@ -93,8 +103,8 @@ LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
     # of one over a pointer to a parameter needs `Exposed` of the source, test_core_soundness).
     ("forall T.\nfn f() -> usize { core::mem::sizeof[foreach *F of *T => (F,)]() }\n",
      "a type argument is a foreach type"),
-    ("use std::arena::Domain!;\nuse std::mem::Ref;\nfn main() -> i32 {\n"
-     "    let exists 'a. cx = Domain!::new(std::process::hash_seed());\n    let r = Ref::new(&cx, ());\n"
+    ("use std::arena::{Domain!, ref_in};\nfn main() -> i32 {\n"
+     "    var exists 'a. cx = Domain!::new(std::process::hash_seed());\n    let r = ref_in(&cx, ());\n"
      "    cx.destroy();\n    0\n}\n", "Sized requires an exact premise"),
     # Every formed type is smaller than the address space, 2^64 bytes.
     ("fn f() -> usize { core::mem::sizeof[[[u8; 9223372036854775808]; 2]]() }\n",
@@ -135,22 +145,22 @@ LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
     ("forall T where Copy[T]. fn f(x: T) -> u32 { match x { _ => 0u32 } }\n", "abstract type"),
     (TOKEN + "fn make() -> Token! { Token!.{ n: 1u32 } }\nfn f() -> u32 { make(); 0u32 }\n", "cannot discard a linear expression"),
     # place flow
-    (TOKEN + "fn f() -> u32 { let t = Token!.{ n: 7u32 }; 0u32 }\n", "is not consumed before return"),
+    (TOKEN + "fn f() -> u32 { var t = Token!.{ n: 7u32 }; 0u32 }\n", "is not consumed before return"),
     (TOKEN + "fn f(t: Token!) -> u32 { 0u32 }\n", "is not consumed before return"),
-    (TOKEN + "fn f() -> u32 { let t = Token!.{ n: 7u32 }; let n = take(t); take(t) }\n", "has been moved"),
+    (TOKEN + "fn f() -> u32 { var t = Token!.{ n: 7u32 }; let n = take(t); take(t) }\n", "has been moved"),
     (TOKEN + "fn f(t: Token!, c: bool) -> u32 { if c { let n = take(t); }; 0u32 }\n", "remains live on some paths"),
     (TOKEN + "fn f() -> u32 { var t = Token!.{ n: 7u32 }; t = Token!.{ n: 9u32 }; take(t) }\n", "cannot overwrite live linear value"),
     (TOKEN + "fn bad(&t: Token!) -> u32 { take(t) }\n", "must be restored before return"),
-    (TOKEN + "fn peek(&t: Token!) -> u32 { t.n }\nfn f() -> u32 { let t = Token!.{ n: 7u32 }; let n = take(t); peek(&t) }\n",
+    (TOKEN + "fn peek(&t: Token!) -> u32 { t.n }\nfn f() -> u32 { var t = Token!.{ n: 7u32 }; let n = take(t); peek(&t) }\n",
      "cannot be lent"),
-    (TOKEN + OPTION + "fn f(o: Option[Token!]) -> u32 { let x = o; let tag = core::mem::enum_variant(&o); match x { Option::Some(t) => take(t), Option::None => tag } }\n",
+    (TOKEN + OPTION + "fn f(o: Option[Token!]) -> u32 { var o = o; let x = o; let tag = core::mem::enum_variant(&o); match x { Option::Some(t) => take(t), Option::None => tag } }\n",
      "its tag is unavailable"),
     (TOKEN + BOX + "fn f(b: Box!) -> u32 { let { t, n } = b; let m = take(t); take(t) }\n", "has been moved"),
     (TOKEN + "fn pair(a: Token!, b: u32) -> u32 { take(a) + b }\nfn make() -> Token! { Token!.{ n: 1u32 } }\n"
      "fn f() -> u32 { pair(make(), { return 0u32; 2u32 }) }\n", "temporary expression result"),
     ("use std::iter::{Iterator, range};\nfn f() -> u32 { var s = 0u32; for i in &range(0usize, 3usize) { s = s + 1u32; } s }\n",
      "iterator is not a place"),
-    ("use std::buffer::Buffer!;\nfn g() -> u32 { 1u32 }\nfn f() -> u32 { let b = f\"{&g()}\"; 0u32 }\n", "needs a local or a place"),
+    ("use std::buffer::Buffer!;\nfn g() -> u32 { 1u32 }\nfn f() -> u32 { var b = f\"{&g()}\"; 0u32 }\n", "needs a local or a place"),
     # place flow names a closure's body by the function it is in
     (TOKEN + "fn f() -> u32 {\n    let g = |x: u32| {\n        let t = Token!.{ n: x };\n        take(t) + take(t)\n    };\n    g(1u32)\n}\n",
      "6:24: p::f: value 't' has been moved or is only partially available"),

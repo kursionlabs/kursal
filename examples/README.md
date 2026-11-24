@@ -120,6 +120,10 @@ Ordinary errors:
 | `type_mismatch.kur` | a `bool` is where a `u32` is declared: no implicit conversions |
 | `non_exhaustive_match.kur` | a `match` leaves out a variant of the enum |
 | `match_unknown_label.kur` | a match case names a label the scrutinee's sum does not have |
+| `lend_a_let.kur` | a `let` binding is lent, which only a `var` is |
+| `lend_a_capture.kur` | a closure lends a `var` it captures, of which it holds a copy |
+| `try_on_own_enum.kur` | `?` is applied to an enum of the program's own, which has the variants of `Option` but is not core's |
+| `constructor_call.kur` | a variant is called like a function, `Option::Some(n)`, where it is built with `Option::Some.(n)` |
 | `overlapping_instances.kur` | two instances of one trait apply to the same type |
 | `private_import.kur` | a name is reached through a module that only imports it, without `export` |
 | `forged_file.kur` | a `File!` is built outside its module, whose representation is restricted |

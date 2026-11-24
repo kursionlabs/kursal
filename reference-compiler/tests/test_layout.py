@@ -151,7 +151,7 @@ class LayoutTests(unittest.TestCase):
 
 
 class SizeLimitTests(unittest.TestCase):
-    """TY-SIZE-LIMIT: every formed type is smaller than the 64-bit address space, 2^64 bytes, as the
+    """Every formed type is smaller than the 64-bit address space, 2^64 bytes, as the
     backend lays it out: zero-size parts erased, C's padding, a `uint32_t` tag beside a union."""
 
     def test_the_size_of_a_layout(self):

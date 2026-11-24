@@ -9,7 +9,7 @@ program that shows a bug, minimized.
 
 Program `i` of a campaign is made from seed `SEED * 1_000_003 + i`, so a campaign is deterministic
 given its seed and count (the order findings are reported in depends on scheduling). Findings go to
-OUT/findings/CLASS-HASH/ (the program, the minimized program, the compilers' messages), and a summary
+OUT/findings/<class>-<hash>/ (the program, the minimized program, the compilers' messages), and a summary
 of every run to OUT/summary.json. Run campaigns from reference-compiler/, in a memory-capped scope
 (see README.md, "Fuzzing")."""
 

@@ -124,7 +124,7 @@ class StdRuntimeTests(unittest.TestCase):
             use std::heap::HeapAllocator;
             use std::owned::Allocation!;
             fn main() -> i32 {
-                let exists 'r. (record, region) = Allocation!::adopt_value(HeapAllocator::alloc(8usize), 41u64);
+                var exists 'r. (record, region) = Allocation!::adopt_value(HeapAllocator::alloc(8usize), 41u64);
                 let old = &region.replace(1u64);
                 HeapAllocator::drop(record.release(region));
                 if old == 41u64 { 0 } else { 1 }
@@ -135,7 +135,7 @@ class StdRuntimeTests(unittest.TestCase):
             use std::heap::HeapAllocator;
             use std::owned::Allocation!;
             fn main() -> i32 {
-                let exists 'r. (record, region) = Allocation!::adopt_value(HeapAllocator::alloc(4usize), 41u64);
+                var exists 'r. (record, region) = Allocation!::adopt_value(HeapAllocator::alloc(4usize), 41u64);
                 let old = &region.replace(1u64);
                 HeapAllocator::drop(record.release(region));
                 0
@@ -148,10 +148,10 @@ class StdRuntimeTests(unittest.TestCase):
             use std::collections::vec::Vec!;
             use std::buffer::Buffer!;
             fn main() -> i32 {
-                let exists 'a. (record, region) = Owned!::new(7u32).open();
+                var exists 'a. (record, region) = Owned!::new(7u32).open();
                 let seven = &region.replace(8u32);
                 let eight = record.close(region).into_value();
-                let exists 'v. (tag, v) = Vec!::new[u8]();
+                var exists 'v. (tag, v) = Vec!::new[u8]();
                 let n = &v.len();
                 let empty = &v.is_empty();
                 v.destroy(tag);
@@ -177,20 +177,20 @@ class StdRuntimeTests(unittest.TestCase):
                 };
                 let big_vec = match Vec!::try_new[[u64; 16777216]]() {
                     Result::Ok(package) => {
-                        let exists 'v. (tag, v) = package;
+                        var exists 'v. (tag, v) = package;
                         v.destroy(tag);
                         "built"
                     },
                     Result::Err(e) => "refused",
                 };
                 let buffer = match Buffer!::try_with_capacity(2usize) {
-                    Result::Ok(b) => { let b = b.push_static("abc"); let n = &b.len(); b.destroy(); n },
+                    Result::Ok(b) => { var b = b.push_static("abc"); let n = &b.len(); b.destroy(); n },
                     Result::Err(e) => 0usize,
                 };
                 let vec = match Vec!::try_new[u64]() {
                     Result::Ok(package) => {
-                        let exists 'v. (tag, v) = package;
-                        let exists 'w. (tag, v) = v.push(tag, 7u64);
+                        var exists 'v. (tag, v) = package;
+                        var exists 'w. (tag, v) = v.push(tag, 7u64);
                         let n = &v.len();
                         v.destroy(tag);
                         n
@@ -199,8 +199,8 @@ class StdRuntimeTests(unittest.TestCase):
                 };
                 let map = match HashMap!::try_new[u32, u32](std::process::hash_seed()) {
                     Result::Ok(package) => {
-                        let exists 'm. (tag, m) = package;
-                        let exists 'n. (tag, m, old) = m.insert(tag, 1u32, 2u32);
+                        var exists 'm. (tag, m) = package;
+                        var exists 'n. (tag, m, old) = m.insert(tag, 1u32, 2u32);
                         let n = &m.len();
                         m.destroy(tag);
                         n
@@ -228,9 +228,9 @@ class StdRuntimeTests(unittest.TestCase):
             fn drop_entry(key: u32, value: u32) {}
             fn main() -> i32 {
                 var cx = ();
-                let exists 'm. (tag, map) = HashMap!::new[u32, u32](std::process::hash_seed());
-                let exists 'a. (tag, map, old) = map.insert_in(tag, &cx, 1u32, 10u32);
-                let exists 'b. (tag, map, removed) = map.remove_in(tag, &cx, 1u32);
+                var exists 'm. (tag, map) = HashMap!::new[u32, u32](std::process::hash_seed());
+                var exists 'a. (tag, map, old) = map.insert_in(tag, &cx, 1u32, 10u32);
+                var exists 'b. (tag, map, removed) = map.remove_in(tag, &cx, 1u32);
                 let again = match &map.get_in(&tag, &cx, 1u32) { Option::Some(r) => 1i32, Option::None => 0i32 };
                 let got = match removed { Option::Some(v) => v, Option::None => 0u32 };
                 map.destroy_with(tag, drop_entry);
@@ -282,7 +282,7 @@ class StdRuntimeTests(unittest.TestCase):
             use std::option::Result;
             fn main() -> i32 {
                 let owned = Buffer!::new().push_static("abc");
-                match thread::spawn(|| -> usize { let n = &owned.len(); owned.destroy(); n }) {
+                match thread::spawn(|| -> usize { var b = owned; let n = &b.len(); b.destroy(); n }) {
                     Result::Err(failed) => {
                         let (f, error) = failed;
                         if f() == 3usize && error.errno > 0i32 { 7 } else { 1 }
@@ -300,7 +300,7 @@ class StdRuntimeTests(unittest.TestCase):
         self.expect('''
             use std::arena::Arena!;
             fn main() -> i32 {
-                let exists 'k. (tag, arena) = Arena!::new(std::process::hash_seed());
+                var exists 'k. (tag, arena) = Arena!::new(std::process::hash_seed());
                 var bad = 0i32;
                 var i = 0usize;
                 while i < 5000usize {
@@ -321,7 +321,7 @@ class StdRuntimeTests(unittest.TestCase):
             use std::collections::list::List;
             use std::buffer::Buffer!;
             fn main() -> i32 {
-                let exists 'k. cx = Domain!::new(std::process::hash_seed());
+                var exists 'k. cx = Domain!::new(std::process::hash_seed());
                 let list = List::empty().cons(&cx, Buffer!::new());
                 cx.destroy();
                 0
@@ -339,7 +339,7 @@ class StdRuntimeTests(unittest.TestCase):
             use std::option::{Option, Result};
             use std::raw::Span;
             fn main() -> i32 {
-                let exists 'k. cx = Domain!::new(std::process::hash_seed());
+                var exists 'k. cx = Domain!::new(std::process::hash_seed());
                 var cx = cx;
                 let dir = Span::from_static(&cx, "d.dir/");
                 let dir = dir.take(5usize);
@@ -605,7 +605,7 @@ class StdRuntimeTests(unittest.TestCase):
                 let script = "head -c 1048576 /dev/zero >&2; head -c 1048576 /dev/zero; echo out; echo err >&2; exit 3";
                 match Command!::new(&sr, "sh").arg(&sr, "-c").arg(&sr, script).output() {
                     Result::Ok(captured) => {
-                        let { exit, stdout, stderr } = captured;
+                        var { exit, stdout, stderr } = captured;
                         let code = match exit { Exit::Code(c) => c, Exit::Signal(s) => 0i32 - s };
                         let out = &stdout.len();
                         let err = &stderr.len();
@@ -671,6 +671,7 @@ class StdRuntimeTests(unittest.TestCase):
                         var child = child;
                         match &child.take_stdin() {
                             Option::Some(w) => {
+                                var w = w;
                                 let wrote = &w.write_static("piped");
                                 let closed = w.close();
                             },
@@ -747,7 +748,7 @@ class StdRuntimeTests(unittest.TestCase):
                     Result::Err(e) => {
                         let kinds = found(e) && denied(Error.{ errno: 13i32 }) && present(Error.{ errno: 17i32 })
                             && other(Error.{ errno: 9999i32 });
-                        let message = e.message();
+                        var message = e.message();
                         let n = &message.len();
                         print_buffer(f"{e}; {n} {kinds}");
                         message.destroy();
@@ -859,7 +860,7 @@ class StdRuntimeTests(unittest.TestCase):
             use std::slice::StaticRead;
             fn length(r: Result[Buffer!, Error]) -> i32 {
                 match r {
-                    Result::Ok(b) => { let n = &b.len(); b.destroy(); n as i32 },
+                    Result::Ok(b) => { var b = b; let n = &b.len(); b.destroy(); n as i32 },
                     Result::Err(e) => 0i32 - e.errno,
                 }
             }
@@ -976,7 +977,7 @@ class StdRuntimeTests(unittest.TestCase):
             use std::slice::StaticRead;
             fn main() {
                 var read = StaticRead::new();
-                let exists 'k. cx = Domain!::new(std::process::hash_seed());
+                var exists 'k. cx = Domain!::new(std::process::hash_seed());
                 var cx = cx;
                 print("a");
                 print_bytes(&read, "b");
@@ -1052,7 +1053,7 @@ class StdRuntimeTests(unittest.TestCase):
             use std::slice::StaticRead;
             fn main() -> i32 {
                 var sr = StaticRead::new();
-                let file = match File!::create(&sr, "owned.txt") {
+                var file = match File!::create(&sr, "owned.txt") {
                     Result::Ok(f) => f,
                     Result::Err(e) => return 1,
                 };
@@ -1067,13 +1068,13 @@ class StdRuntimeTests(unittest.TestCase):
                     Result::Err(e) => 5,
                 };
                 let closed = file.close().is_ok();
-                let reader = match File!::open_read(&sr, "owned.txt") {
+                var reader = match File!::open_read(&sr, "owned.txt") {
                     Result::Ok(f) => f,
                     Result::Err(e) => return 6,
                 };
                 var reader = reader;
                 let length = match &reader.read_to_end() {
-                    Result::Ok(text) => { let n = &text.len(); text.destroy(); n },
+                    Result::Ok(text) => { var text = text; let n = &text.len(); text.destroy(); n },
                     Result::Err(e) => 0usize,
                 };
                 let shut = reader.close();
@@ -1147,7 +1148,7 @@ class StdRuntimeTests(unittest.TestCase):
                 shown(&out, &second.read_line());
                 second.finish().destroy();
                 var third = match stdin() { Result::Ok(i) => i, Result::Err(e) => trap(), };
-                let none = match &third.read_to_end() { Result::Ok(text) => { let n = &text.len(); text.destroy(); n }, Result::Err(e) => 9usize };
+                let none = match &third.read_to_end() { Result::Ok(text) => { var text = text; let n = &text.len(); text.destroy(); n }, Result::Err(e) => 9usize };
                 shown(&out, &third.read_line());
                 third.finish().destroy();
                 let printed = print_buffer(out);
@@ -1171,6 +1172,7 @@ class StdRuntimeTests(unittest.TestCase):
                     match &input.read_line() {
                         Result::Ok(found) => match found {
                             Option::Some(text) => {
+                                var text = text;
                                 let n = &text.len();
                                 if n > longest { longest = n; }
                                 text.destroy();
@@ -1208,11 +1210,11 @@ class StdRuntimeTests(unittest.TestCase):
         self.expect('''
             use std::buffer::Buffer!;
             fn main() -> i32 {
-                let b = Buffer!::with_capacity(0usize).push_byte(b'a').push_static("bc");
+                var b = Buffer!::with_capacity(0usize).push_byte(b'a').push_static("bc");
                 let n = &b.len();
                 b.destroy();
-                let z = Buffer!::new_zeroed(0usize);
-                let c = &z.clone();
+                var z = Buffer!::new_zeroed(0usize);
+                var c = &z.clone();
                 var c = c.push_byte(b'x');
                 let m = &c.len();
                 z.destroy();
@@ -1223,12 +1225,13 @@ class StdRuntimeTests(unittest.TestCase):
     def test_split_on_an_empty_separator_is_the_whole_span(self):
         self.expect('''
             use std::arena::Domain!;
+            use std::collections::arena_vec::ArenaVec;
             use std::raw::Span;
             fn main() -> i32 {
-                let exists 'k. cx = Domain!::new(std::process::hash_seed());
+                var exists 'k. cx = Domain!::new(std::process::hash_seed());
                 let text = Span::from_static(&cx, "a,b");
-                let whole = text.split(&cx, Span::from_static(&cx, ""));
-                let parts = text.split(&cx, Span::from_static(&cx, ","));
+                let whole = ArenaVec::split(&cx, text, Span::from_static(&cx, ""));
+                let parts = ArenaVec::split(&cx, text, Span::from_static(&cx, ","));
                 let status = if whole.len(&cx) == 1usize && whole.at(&cx, 0usize).len() == 3usize
                     && parts.len(&cx) == 2usize { 0 } else { 1 };
                 cx.destroy();
@@ -1244,7 +1247,7 @@ class StdRuntimeTests(unittest.TestCase):
                 match o { Option::Some(x) => x == v, Option::None => false }
             }
             fn main() -> i32 {
-                let exists 'k. cx = Domain!::new(std::process::hash_seed());
+                var exists 'k. cx = Domain!::new(std::process::hash_seed());
                 let map: ArenaMap[u32, u32, 'k] = ArenaMap::new(&cx);
                 map.grow(&cx, 3usize);
                 map.insert(&cx, 1u32, 10u32);
@@ -1287,7 +1290,7 @@ class StdRuntimeTests(unittest.TestCase):
                 }
             }
             fn main() -> i32 {
-                let exists 'k. cx = Domain!::new(std::process::hash_seed());
+                var exists 'k. cx = Domain!::new(std::process::hash_seed());
                 var cx = cx;
                 let map: ArenaMap[u32, u32, 'k] = ArenaMap::new(&cx);
                 churn(&cx, map, 0u32, 1000u32);
@@ -1366,7 +1369,7 @@ class StdRuntimeTests(unittest.TestCase):
                 long == 1500000usize && sums && head == 1999998u32
             }
             fn main() -> i32 {
-                let exists 'k. cx = Domain!::new(std::process::hash_seed());
+                var exists 'k. cx = Domain!::new(std::process::hash_seed());
                 let listed = lists(&cx);
                 cx.destroy();
                 var b = Buffer!::new();
@@ -1375,7 +1378,7 @@ class StdRuntimeTests(unittest.TestCase):
                     b = b.push_byte(b'a');
                     j = j + 1usize;
                 }
-                let exists 't. (tag, bytes, restore) = b.open();
+                var exists 't. (tag, bytes, restore) = b.open();
                 var cur = Cursor::new(bytes);
                 let run = &cur.take_while(&tag, is_a);
                 let beyond = cur.peek_at(&tag, 18446744073709551615usize);
@@ -1469,7 +1472,7 @@ class StdRuntimeTests(unittest.TestCase):
             let a = Option::Some.(3u32).unwrap();
             let r: Result[u32, u32] = Result::Ok.(4u32);
             let b = r.unwrap();
-            let exists 'b. (tag, bytes, restore) = Buffer!::new().push_static("pq").open();
+            var exists 'b. (tag, bytes, restore) = Buffer!::new().push_static("pq").open();
             let c = bytes.at(&tag, 0usize);
             let (p, n, m) = bytes.into_parts();
             let text = unsafe Span::from_raw_parts(&tag, p, n);
@@ -1528,8 +1531,8 @@ class StdRuntimeTests(unittest.TestCase):
                 let tuples = same && !diff && h1.finish() == h2.finish();
                 let good = Buffer!::new().push_byte(104u8).push_byte(195u8).push_byte(169u8);
                 let bad = Buffer!::new().push_byte(237u8).push_byte(160u8).push_byte(128u8);
-                let exists 'g. (gt, gs, gr) = good.open();
-                let exists 'b. (bt, bs, br) = bad.open();
+                var exists 'g. (gt, gs, gr) = good.open();
+                var exists 'b. (bt, bs, br) = bad.open();
                 var text = encode(encode(encode(Buffer!::new(), 233u32), 128512u32), 55296u32);
                 let n = &text.len();
                 text.destroy();
@@ -1539,7 +1542,7 @@ class StdRuntimeTests(unittest.TestCase):
                 br.restore(bt).destroy();
                 let empty: Slice[u8, 'static] = "";
                 let slices = empty.is_empty() && !"a".is_empty();
-                let store = Buffer!::new_zeroed(12usize);
+                var store = Buffer!::new_zeroed(12usize);
                 let base = unsafe (unsafe &store.as_ptr() as *u32);
                 var array = unsafe Array!::from_parts(base, 3usize);
                 let old = &array.set(1usize, 7u32);
@@ -1594,7 +1597,7 @@ class StdRuntimeTests(unittest.TestCase):
             use std::slice::StaticRead;
             use std::ascii::is_alpha;
             fn main() -> i32 {
-                let sr = StaticRead::new();
+                var sr = StaticRead::new();
                 let cur = Cursor::new("abc1");
                 let (cur, word) = cur.take_matching(&sr, is_alpha);
                 if word.len() == 3usize && cur.peek(&sr).unwrap_or(0u8) == b'1' && cur.starts_with(&sr, "1") { 0 } else { 1 }
@@ -1604,7 +1607,7 @@ class StdRuntimeTests(unittest.TestCase):
         self.expect('''
             use std::owned::Owned!;
             fn main() -> i32 {
-                let exists 'r. (alloc, region) = Owned!::new((10u32, 20u32)).open();
+                var exists 'r. (alloc, region) = Owned!::new((10u32, 20u32)).open();
                 let (restore, splitting) = region.split();
                 var region = restore.merge(splitting.parts());
                 let pair = &region.replace((1u32, 2u32));
@@ -1623,9 +1626,9 @@ class StdRuntimeTests(unittest.TestCase):
             use std::buffer::Buffer!;
             use std::raw::Span;
             fn main() -> i32 {
-                let exists 'b. (tag, bytes, restore) = Buffer!::new().push_static("  key=value \\n").open();
+                var exists 'b. (tag, bytes, restore) = Buffer!::new().push_static("  key=value \\n").open();
                 let exists 'q. (root, back) = tag.share();
-                let exists 'l, 'r. (left, right, join) = root.split();
+                var exists 'l, 'r. (left, right, join) = root.split();
                 let second = match bytes.get_ref(2usize) {
                     std::option::Option::Some(at) => at.read(&left),
                     std::option::Option::None => 0u8,
@@ -1639,7 +1642,7 @@ class StdRuntimeTests(unittest.TestCase):
                     && bytes.trim_end(&right).len() == 11usize && bytes.skip(2usize).starts_with(&left, bytes.slice(2usize, 5usize))
                     && bytes.find(&right, bytes.slice(6usize, 8usize), 0usize).unwrap_or(0usize) == 6usize
                     && bytes.rfind_byte(&left, b' ').unwrap_or(0usize) == 11usize && bytes.byte_or_zero(&right, 99usize) == 0u8;
-                let tag = back.resume(join.join(left, right));
+                var tag = back.resume(join.join(left, right));
                 let written = match bytes.get_ref(0usize) {
                     std::option::Option::Some(at) => { at.set(&tag, b'#'); at.copy(&tag) },
                     std::option::Option::None => 0u8,
@@ -1653,7 +1656,7 @@ class StdRuntimeTests(unittest.TestCase):
             use std::buffer::Buffer!;
             fn main() -> i32 {
                 let exists 'b. (tag, bytes, restore) = Buffer!::new().push_static("ab").open();
-                let exists 'q. (root, back) = tag.share();
+                var exists 'q. (root, back) = tag.share();
                 match bytes.get_ref(0usize) {
                     std::option::Option::Some(at) => at.set(&root, b'#'),
                     std::option::Option::None => (),
@@ -1670,9 +1673,9 @@ class StdRuntimeTests(unittest.TestCase):
             use std::cap::Exclusive!;
             use std::slice::{Slice, StaticRead};
             fn main() -> i32 {
-                let exists 'b. (tag, bytes, restore) = Buffer!::new().push_static("name").open();
+                var exists 'b. (tag, bytes, restore) = Buffer!::new().push_static("name").open();
                 let span = Span::from_slice(bytes);
-                let sr = StaticRead::new();
+                var sr = StaticRead::new();
                 let literal: Slice[u8, 'static] = "name";
                 let seed = std::process::hash_seed();
                 let same = key_hash(&tag, span, seed) == key_hash(&tag, bytes, seed) && key_hash(&tag, bytes, seed) == key_hash(&sr, literal, seed)
@@ -1699,7 +1702,7 @@ class StdRuntimeTests(unittest.TestCase):
             use std::fmt::Writable;
             use std::option::Result;
             fn main() -> Result[(), Error] {
-                let sr = StaticRead::new();
+                var sr = StaticRead::new();
                 let seed = Seed::new(''' + f"{seed[0]}u64, {seed[1]}u64" + ''');
                 var out = stdout();
 ''' + lines + '''                out.finish()
@@ -1733,7 +1736,7 @@ class StdRuntimeTests(unittest.TestCase):
                         key = if (i >> bit) % 2usize == 0usize { key.push_static("aB") } else { key.push_static("b!") };
                         bit = bit + 1usize;
                     }
-                    let exists 'k. (tag, bytes, restore) = key.open();
+                    var exists 'k. (tag, bytes, restore) = key.open();
                     let bucket = (key_hash(&tag, bytes, seed) % 4096u64) as usize;
                     restore.restore(tag).destroy();
                     let before = &counts.at(bucket);
@@ -1748,7 +1751,7 @@ class StdRuntimeTests(unittest.TestCase):
                 most
             }
             fn apart(seed: Seed) -> bool {
-                let sr = StaticRead::new();
+                var sr = StaticRead::new();
                 let a = key_hash(&sr, "aBaBaB", seed);
                 let b = key_hash(&sr, "b!b!b!", seed);
                 let c = key_hash(&sr, "aBb!aB", seed);
@@ -1782,7 +1785,7 @@ class StdRuntimeTests(unittest.TestCase):
             use std::fmt::Writable;
             use std::option::Result;
             fn main() -> Result[(), Error] {
-                let sr = StaticRead::new();
+                var sr = StaticRead::new();
                 let first = key_hash(&sr, "a fixed string", hash_seed());
                 let second = key_hash(&sr, "a fixed string", hash_seed());
                 var out = stdout();
@@ -1815,7 +1818,7 @@ class StdRuntimeTests(unittest.TestCase):
                 var k = 7u64;
                 let seven = &m.at(&k);
                 m.destroy();
-                let exists 'k. cx = Domain!::new(seed);
+                var exists 'k. cx = Domain!::new(seed);
                 let a: ArenaMap[u32, u32, 'k] = ArenaMap::new(&cx);
                 let none = a.insert(&cx, 1u32, 2u32);
                 let two = a.at(&cx, 1u32);
@@ -1840,7 +1843,7 @@ class StdRuntimeTests(unittest.TestCase):
             use std::slice::StaticRead;
             use std::option::Option;
             fn main(args: Args) -> i32 {
-                let sr = StaticRead::new();
+                var sr = StaticRead::new();
                 match args.get(1usize) {
                     Option::Some(arg) => if arg.len() == 5usize && arg.bytes().is(&sr, "hello") && args.bytes(1usize).unwrap().is(&sr, "hello") { 0 } else { 1 },
                     Option::None => 2,
@@ -1914,7 +1917,7 @@ class StdRuntimeTests(unittest.TestCase):
             use std::option::Option;
             // `HashMap::find`, with a probe of the key type.
             fn find(&named: OwnedMap![u32, u32], &probe: u32) -> bool {
-                let exists 'm. (tag, map) = named.inner;
+                var exists 'm. (tag, map) = named.inner;
                 let found = match &map.find(&tag, &probe) { Option::Some(r) => r.copy(&tag) == 11u32, Option::None => false };
                 named = OwnedMap!.{ inner: pack 'm. (tag, map) };
                 found
@@ -1964,14 +1967,14 @@ class StdRuntimeTests(unittest.TestCase):
             fn drop_entry(k: Buffer!, v: u64) { k.destroy(); }
             fn main() -> i32 {
                 var m = OwnedMap!::new[Buffer!, u64](std::process::hash_seed());
-                let exists 'b. (tag, text, restore) = Buffer!::new().push_static("to be or not to be again").open();
+                var exists 'b. (tag, text, restore) = Buffer!::new().push_static("to be or not to be again").open();
                 var tag = tag;
                 var at = 0usize;
                 var words = 0usize;
                 while words < 6usize {
                     match word_at(&tag, text, at) {
                         Option::Some(found) => {
-                            let (word, next) = found;
+                            var (word, next) = found;
                             count(&m, &tag, word);
                             at = next;
                         },
@@ -2004,7 +2007,7 @@ class StdRuntimeTests(unittest.TestCase):
                 restore.restore(tag).destroy();
                 m.destroy_with(drop_entry);
                 let (sum, letters) = total;
-                let exists 's. (stag, sbytes, srestore) = shown.open();
+                var exists 's. (stag, sbytes, srestore) = shown.open();
                 let one = sbytes.is(&stag, "to=104");
                 srestore.restore(stag).destroy();
                 if to == 2u64 && doubled == 2u64 && sum == 8u64 && letters == 9usize && one && before == 4usize && cleared && after == 1usize { 0 } else { 1 }
@@ -2046,7 +2049,7 @@ class StdRuntimeTests(unittest.TestCase):
                 &v.swap(0usize, 3usize);
                 &v.reverse();
                 let taken = match &v.remove(1usize) {
-                    Option::Some(b) => { let n = &b.len(); b.destroy(); n },
+                    Option::Some(b) => { var b = b; let n = &b.len(); b.destroy(); n },
                     Option::None => 9usize,
                 };
                 let missed = match &v.remove(7usize) {
@@ -2067,11 +2070,11 @@ class StdRuntimeTests(unittest.TestCase):
                 &n.push(7u32);
                 let copies = (&n.first()).unwrap_or(0u32) == 5u32 && &n.contains(6u32) && !&n.contains(8u32);
                 n.destroy();
-                let exists 'k. (tag, raw) = Vec!::new[u32]();
-                let exists 'k2. (tag, raw) = raw.push(tag, 4u32);
+                var exists 'k. (tag, raw) = Vec!::new[u32]();
+                var exists 'k2. (tag, raw) = raw.push(tag, 4u32);
                 let branded = (&raw.get(&tag, 0usize)).unwrap_or(0u32) == 4u32 && &raw.at(&tag, 0usize) == 4u32 && (&raw.get(&tag, 1usize)).is_none();
                 raw.destroy(tag);
-                let exists 'b. (btag, bytes, restore) = shown.open();
+                var exists 'b. (btag, bytes, restore) = shown.open();
                 let order = bytes.is(&btag, "310");
                 restore.restore(btag).destroy();
                 if taken == 1usize && missed && order && copies && branded { 0 } else { 1 }
@@ -2096,7 +2099,7 @@ class StdRuntimeTests(unittest.TestCase):
             use std::option::Option;
             extern "C" fn probe_allocations() -> u64;
             fn find(&named: OwnedMap![u64, u64], &probe: u64) -> bool {
-                let exists 'm. (tag, map) = named.inner;
+                var exists 'm. (tag, map) = named.inner;
                 let found = (&map.find(&tag, &probe)).is_some();
                 named = OwnedMap!.{ inner: pack 'm. (tag, map) };
                 found
@@ -2129,7 +2132,7 @@ class StdRuntimeTests(unittest.TestCase):
                 let m: ArenaMap[u32, u32, 'k] = ArenaMap::new(&cx);
                 let a = m.get_or_insert(&cx, 1u32, 10u32);
                 let b = m.get_or_insert(&cx, 1u32, 20u32);
-                let c = m.upsert(&cx, 1u32, 0u32, |&cx, v: u32| v + 5u32);
+                var c = m.upsert(&cx, 1u32, 0u32, |&cx, v: u32| v + 5u32);
                 let d = m.upsert(&cx, 2u32, 7u32, |&cx, v: u32| v * 2u32);
                 let e = m.insert(&cx, 3u32, 30u32);
                 m.retain(&cx, |&c, k: u32, v: u32| k != 2u32);
@@ -2148,7 +2151,7 @@ class StdRuntimeTests(unittest.TestCase):
                 maps && sets
             }
             fn main() -> i32 {
-                let exists 'k. cx = Domain!::new(std::process::hash_seed());
+                var exists 'k. cx = Domain!::new(std::process::hash_seed());
                 let ok = check(&cx);
                 cx.destroy();
                 if ok { 0 } else { 1 }
@@ -2177,7 +2180,7 @@ class StdRuntimeTests(unittest.TestCase):
                 emptied && map.len(&cx) == 0usize
             }
             fn main() -> i32 {
-                let exists 'k. cx = Domain!::new(std::process::hash_seed());
+                var exists 'k. cx = Domain!::new(std::process::hash_seed());
                 let ok = check(&cx);
                 cx.destroy();
                 if ok { 0 } else { 1 }
@@ -2203,7 +2206,7 @@ class StdRuntimeTests(unittest.TestCase):
                 grown && v.span(&cx).is(&cx, "abc")
             }
             fn main() -> i32 {
-                let exists 'k. cx = Domain!::new(std::process::hash_seed());
+                var exists 'k. cx = Domain!::new(std::process::hash_seed());
                 let ok = check(&cx);
                 cx.destroy();
                 if ok { 0 } else { 1 }
@@ -2238,7 +2241,7 @@ class StdRuntimeTests(unittest.TestCase):
                     && joined.last(&cx).unwrap_or(0u32) == 6u32 && list.len(&cx) == 3usize && failed == 2u32
             }
             fn main() -> i32 {
-                let exists 'k. cx = Domain!::new(std::process::hash_seed());
+                var exists 'k. cx = Domain!::new(std::process::hash_seed());
                 let ok = check(&cx);
                 cx.destroy();
                 if ok { 0 } else { 1 }
@@ -2250,7 +2253,7 @@ class StdRuntimeTests(unittest.TestCase):
             use std::arena::Domain!;
             use std::collections::list::List;
             fn main() -> i32 {
-                let exists 'k. cx = Domain!::new(std::process::hash_seed());
+                var exists 'k. cx = Domain!::new(std::process::hash_seed());
                 let list: List[u32, 'k] = List::empty().cons(&cx, 1u32);
                 let cells = match list {
                     List::Cell(r) => 1,
@@ -2264,11 +2267,11 @@ class StdRuntimeTests(unittest.TestCase):
         self.expect('''
             use std::buffer::Buffer!;
             fn main() -> i32 {
-                let b = Buffer!::new().push_static("hello").truncate(2usize).push_static("y");
+                var b = Buffer!::new().push_static("hello").truncate(2usize).push_static("y");
                 let n = &b.len();
-                let b = b.truncate(10usize);
+                var b = b.truncate(10usize);
                 let m = &b.len();
-                let b = b.clear();
+                var b = b.clear();
                 let z = &b.len();
                 b.destroy();
                 if n == 3usize && m == 3usize && z == 0usize { 0 } else { 1 }

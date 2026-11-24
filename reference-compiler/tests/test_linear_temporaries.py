@@ -54,14 +54,24 @@ fn main() -> i32 {
             self.run_source(source, 0)
         self.assertEqual(error.exception.pos, (6, 5))
 
-    def test_unused_value_diagnostic_points_to_binding(self):
+    def test_unused_value_diagnostic_points_to_the_return(self):
         source = PREFIX + '''fn main() -> i32 {
     let t = make(7u32);
     0i32
+}
+fn early(c: bool) -> i32 {
+    let t = make(7u32);
+    if c {
+        return 1i32;
+    }
+    (take(t) as i32)
 }'''
         with self.assertRaisesRegex(OwnershipError, 'not consumed') as error:
             self.run_source(source, 0)
-        self.assertEqual(error.exception.pos, (5, 5))
+        self.assertEqual(error.exception.pos, (6, 5))
+        with self.assertRaisesRegex(OwnershipError, 'early: linear value .t. is not consumed before return') as error:
+            self.run_source(source.replace("    let t = make(7u32);\n    0i32", "    0i32", 1), 0)
+        self.assertEqual(error.exception.pos, (10, 9))
 
     def test_temporary_root_does_not_alias_a_parameter(self):
         self.run_source('''fn add(a: u32, b: u32) -> u32 { a + b }

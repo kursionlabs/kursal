@@ -59,7 +59,7 @@ class ScalarBoundaryTests(unittest.TestCase):
                     check_program(parse_program(source))
 
     def test_undetermined_float_gets_inference_diagnostic(self):
-        with self.assertRaisesRegex(InferError, 'floating literal.*not determined'):
+        with self.assertRaisesRegex(InferError, 'float literal.*not determined'):
             self.run_source('fn main() -> i32 { let x = 1.5; 0i32 }', 0)
 
     def test_core_integer_spelling_and_bounds(self):

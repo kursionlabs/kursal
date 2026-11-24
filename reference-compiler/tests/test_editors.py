@@ -21,11 +21,11 @@ KURS = ROOT / "editors/tree-sitter-kurs"
 
 ACCEPTED = (
     "use package::{mem::{Region as R, raw::*}, raw}; export raw;",
-    "module a::b; forall T. exposed(package::mem) struct Node! { value: T }",
+    "forall T. exposed(package::mem) struct Node! { value: T }",
     "exposed enum Choice { Some(u32), None } forall T. tuple Pair(T, T,);",
     'extern "C" fn abort() -> !; const LIMIT: u32 = 9u32;',
     "forall Self -> Item. trait Iterator { fn next(&self: Self) -> Option[Item]; }",
-    "unsafe instance Send[Cell[u32]] { } impl i8 { const MIN: i8 = -128; forall T. fn f(self) {} }",
+    "instance Send[Cell[u32]] { } impl i8 { const MIN: i8 = -128; forall T. fn f(self) {} }",
     "fn f(&x: u32, g: fn(&_: u32, u8) -> u32, h: closure(&it: u32) -> ()) -> exists 'a, 'b. Pair['a, 'b] {"
     " pack 'a, 'b. Pair.(x, x) }",
     "fn f(t: foreach *F of (u32, u8) => Box[F], g: fn(T) -> T, a: [u8; 4usize]) -> Map[K, V -> _] {"
@@ -45,7 +45,8 @@ ACCEPTED = (
 
 # Forms of the surface syntax that Kursal does not have: a struct literal without `.`, a place written on
 # a parameter's type, an unnamed place slot, a `forall` ended by `=>`, a function type that quantifies, a
-# `!` apart from its name, and a `!` on a name that is not a type's.
+# `!` apart from its name, a `!` on a name that is not a type's, an unsafe instance, and a declaration
+# that begins with the reserved word `module`.
 REJECTED = (
     "fn f() -> Point { Point { x: 1u32 } }",
     "fn f(x: &u32) {}",
@@ -56,6 +57,8 @@ REJECTED = (
     "fn f() -> u32 { match x { _ => 1u32, A => 2u32 } }",
     "fn f() -> u32 { Foo !::new() }",
     "fn f!() {}",
+    "unsafe instance Send[Cell[u32]] { }",
+    "module a::b;",
 )
 
 READABLE_PACKAGES = ("shapes", "option_result", "skolems", "mint_join", "generic_capabilities", "iter_combinators")

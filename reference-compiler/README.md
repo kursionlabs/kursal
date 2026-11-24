@@ -237,7 +237,7 @@ uv run python -m tools.fuzz run --seed 1 --minutes 25 --count 100000 --out OUT \
     --selfhost ../bin/kursal --execute --corpus CORPUS.json --minimize -j 8
 uv run python -m tools.fuzz show --seed 1000003           # the program one seed makes
 uv run python -m tools.fuzz one FILE.kur --prelude --selfhost ../bin/kursal   # one program's outcome
-uv run python -m tools.fuzz minimize OUT/findings/CLASS-HASH/seedN --out MIN  # delta debugging
+uv run python -m tools.fuzz minimize OUT/findings/<class>-<hash>/seedN --out MIN  # delta debugging
 ```
 
 `gen.py` writes well-typed programs over a prelude of linear and `Copy` structs and enums, a branded

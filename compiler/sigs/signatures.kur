@@ -20,12 +20,12 @@
 // their operands' low bits. Division, remainder, comparison and right shifts depend on whole values,
 // and are computed on them (see `binop`).
 
-use package::support::base::fail;
+use package::support::base::{counted, fail};
 use std::collections::arena_vec::ArenaVec;
 use std::collections::arena_map::{ArenaMap, ArenaSet};
 use std::mem::Ref;
 use std::raw::Span;
-use std::arena::Domain!;
+use std::arena::{Domain!, concat, ref_in};
 use std::buffer::Buffer!;
 use package::kurs::core::{Exposure, ExposureMode, Kind, Member, ModuleId, Param, Premise, Program, Type, TypeDecl};
 use package::kurs::core as C;
@@ -51,7 +51,7 @@ exposed struct LibraryItem {
 
 forall 'k.
 fn library_entry(&cx: Domain!['k], home: Slice[u8, 'static], path: Slice[u8, 'static], std_path: Slice[u8, 'static]) -> LibraryItem['k] {
-    LibraryItem.{ home: Span::from_static(&cx, home), path: Span::from_static(&cx, path).split(&cx, Span::from_static(&cx, "::")), std_path: Span::from_static(&cx, std_path).split(&cx, Span::from_static(&cx, "::")) }
+    LibraryItem.{ home: Span::from_static(&cx, home), path: ArenaVec::split(&cx, Span::from_static(&cx, path), Span::from_static(&cx, "::")), std_path: ArenaVec::split(&cx, Span::from_static(&cx, std_path), Span::from_static(&cx, "::")) }
 }
 
 // The table `LIBRARY`: the item named `name`.
@@ -293,13 +293,13 @@ exposed struct Scope {
 
 forall 'k.
 fn new_scope(&cx: Domain!['k]) -> Scope['k] {
-    Scope.{ kinds: ArenaMap::new(&cx), brands: ArenaSet::new(&cx), implicit: Ref::new(&cx, Option::None) }
+    Scope.{ kinds: ArenaMap::new(&cx), brands: ArenaSet::new(&cx), implicit: ref_in(&cx, Option::None) }
 }
 
 forall 'k.
 impl Scope['k] {
     fn extend(self, &cx: Domain!['k], params: ArenaVec[Param['k], 'k]) -> Scope['k] {
-        let out = Scope.{ kinds: self.kinds.clone(&cx), brands: self.brands.clone(&cx), implicit: Ref::new(&cx, self.implicit.copy(&cx)) };
+        let out = Scope.{ kinds: self.kinds.clone(&cx), brands: self.brands.clone(&cx), implicit: ref_in(&cx, self.implicit.copy(&cx)) };
         var i = 0usize;
         while i < params.len(&cx) {
             let p = params.at(&cx, i);
@@ -438,10 +438,10 @@ impl Signatures['k] {
             instances: ArenaVec::new(&cx),
             consts: ArenaMap::new(&cx),
             folding: ArenaSet::new(&cx),
-            implicit: Ref::new(&cx, 0u32),
+            implicit: ref_in(&cx, 0u32),
             copy_checks: ArenaVec::new(&cx),
-            declaring: Ref::new(&cx, Option::None),
-            types_ready: Ref::new(&cx, false),
+            declaring: ref_in(&cx, Option::None),
+            types_ready: ref_in(&cx, false),
             counter,
         };
         let scopes = resolver.scopes.values(&cx);
@@ -731,7 +731,7 @@ impl Signatures['k] {
             None => if decl.kind.is(&cx, "trait") { ArenaVec::one(&cx, Span::from_static(&cx, "Self")) } else { ArenaVec::new(&cx) },
         };
         if args.len(&cx) != params.len(&cx) {
-            return sig_error(Buffer!::new().push_bytes(&cx, decl.name).push_static(" takes ").push_usize(params.len(&cx)).push_static(" type arguments, got ").push_usize(args.len(&cx)).save(&cx), pos);
+            return sig_error(Buffer!::new().push_bytes(&cx, decl.name).push_static(" takes ").push_bytes(&cx, counted(&cx, params.len(&cx), "type argument")).push_static(", got ").push_usize(args.len(&cx)).save(&cx), pos);
         }
         let copied = match self.copy_names(&cx, header) {
             Ok(c) => c,
@@ -766,7 +766,7 @@ impl Signatures['k] {
     }
 
     // ---- types
-    // Types written where a foreach type may not be (TY-FLAT): `what` names the place.
+    // Types written where a foreach type may not be: `what` names the place.
     fn components(self, &cx: Domain!['k], exprs: ArenaVec[S::Type['k], 'k], scope: Scope['k], what: Slice[u8, 'static]) -> Result[ArenaVec[Type['k], 'k], SigError['k]] {
         let out: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
@@ -777,7 +777,7 @@ impl Signatures['k] {
         Result::Ok.(out)
     }
 
-    // A type written where a foreach type may not be (TY-FLAT): `what` names the place. A foreach type
+    // A type written where a foreach type may not be: `what` names the place. A foreach type
     // is a whole value's type, or a function's parameter or result.
     fn component(self, &cx: Domain!['k], type_expr: S::Type['k], scope: Scope['k], what: Slice[u8, 'static]) -> Result[Type['k], SigError['k]] {
         let ty = self.type(&cx, type_expr, scope)?;
@@ -821,7 +821,7 @@ impl Signatures['k] {
                         if args.len(&cx) != 1usize || !is_skolem(args.at(&cx, 0usize)) {
                             sig_error(Span::from_static(&cx, "Brand requires exactly one brand argument"), n.pos)
                         } else {
-                            Result::Ok.(Type::Brand.(Ref::new(&cx, args.at(&cx, 0usize))))
+                            Result::Ok.(Type::Brand.(ref_in(&cx, args.at(&cx, 0usize))))
                         }
                     } else if name.is(&cx, "NonNull") {
                         if args.len(&cx) != 1usize || is_skolem(args.at(&cx, 0usize)) {
@@ -858,7 +858,7 @@ impl Signatures['k] {
             Array(elem, length) => {
                 let elem_type = self.component(&cx, elem.copy(&cx), scope, "a component")?;
                 let count = self.array_length(&cx, length.copy(&cx))?;
-                Result::Ok.(Type::Array.(Ref::new(&cx, elem_type), count))
+                Result::Ok.(Type::Array.(ref_in(&cx, elem_type), count))
             },
             Fn(f) => {
                 let params = self.slot_types(&cx, f.params, scope)?;
@@ -901,7 +901,7 @@ impl Signatures['k] {
                     i = i + 1usize;
                 }
                 let inner = self.component(&cx, body.copy(&cx), scope.extend(&cx, binders), "a package body")?;
-                Result::Ok.(Type::Exists.(labels, Ref::new(&cx, inner)))
+                Result::Ok.(Type::Exists.(labels, ref_in(&cx, inner)))
             },
             Foreach(f) => {
                 let source = self.component(&cx, f.source.copy(&cx), scope, "a foreach source")?;
@@ -1487,7 +1487,7 @@ impl Signatures['k] {
         let v = self.fold(&cx, expr.operand.copy(&cx), want, home, evaluate)?;
         match v {
             Float(digits, ty) => if expr.op.is(&cx, "-") {
-                let negated = if digits.starts_with(&cx, Span::from_static(&cx, "-")) { digits.skip(1usize) } else { Span::from_static(&cx, "-").concat(&cx, digits) };
+                let negated = if digits.starts_with(&cx, Span::from_static(&cx, "-")) { digits.skip(1usize) } else { concat(&cx, Span::from_static(&cx, "-"), digits) };
                 return Result::Ok.(ConstValue::Float.(negated, ty));
             },
             Bool(b) => if expr.op.is(&cx, "!") {

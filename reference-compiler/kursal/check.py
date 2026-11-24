@@ -227,7 +227,7 @@ class Checker:
             self.where = data.name
             self.module = data.module or NOWHERE
             # A data item's static object is never written, and a load through a pointer to it must
-            # leave it as it is: a move out of a linear value would change it (DECL-DATA).
+            # leave it as it is: a move out of a linear value would change it. So its type is Copy.
             if not self.types.is_copy(data.ty):
                 self.fail("data_type_not_copy")
             self.check_data(data.ty, data.init)
@@ -850,15 +850,15 @@ class Checker:
         return subst(Fn(fun.ptypes, fun.ret, fun.unsafe, fun.places), sub)
 
     def foreign_signature(self, ptypes: Sequence[Type], ret: Type) -> None:
-        """DECL-EXTERN-FN and DECL-EXTERN-RESULT. A parameter has a memory form, and the result holds nothing
-        only checked code makes (`foreign_result`) and is zero-size only if it is Copy: a zero-size linear
-        result would be a resource foreign code made from nothing. A function type anywhere in the signature is an `unsafe
-        fn` type: no safe function value comes from foreign code or goes to it. Foreign code calls such a
-        value with arguments it makes, and takes its result, or hands the value back, so the program calls
-        it: each parameter of one has a memory form and holds nothing only checked code makes, and so does
-        its result, which may be zero-size only if it is Copy (C's `void`, where a linear value would
-        vanish), and none of its parameters is a place, which foreign code cannot lend. The walk reaches the function types nested in those
-        too."""
+        """An extern's signature, which crosses to foreign code. A parameter has a memory form, and the result
+        holds nothing only checked code makes (`foreign_result`) and is zero-size only if it is Copy: a
+        zero-size linear result would be a resource foreign code made from nothing. A function type anywhere
+        in the signature is an `unsafe fn` type: no safe function value comes from foreign code or goes to it.
+        Foreign code calls such a value with arguments it makes, and takes its result, or hands the value
+        back, so the program calls it: each parameter of one has a memory form and holds nothing only checked
+        code makes, and so does its result, which may be zero-size only if it is Copy (C's `void`, where a
+        linear value would vanish), and none of its parameters is a place, which foreign code cannot lend. The
+        walk reaches the function types nested in those too."""
         for t in ptypes:
             self.has_memory_form(t)
         if not isinstance(ret, Never):
@@ -883,8 +883,8 @@ class Checker:
         `unsafe fn` of the signature, is reinterpreted from C's bytes as an unsafe cast's result is: it
         holds nothing only checked code makes (`checked_only`; an extern's result of `!` itself says the
         function does not return), and no enum or `NonNull`, whose layout the compiler chooses. The walk
-        is TY-REACH's (`contains`): named types unfolded, not through a pointer, a function value or an
-        array of length 0."""
+        is `contains`'s, which finds what a value holds: named types unfolded, not through a pointer, a
+        function value or an array of length 0."""
         if contains(self.types, ty, checked_only):
             self.fail("extern_result_cannot_produce")
         if self.types.chosen_layout(ty):
@@ -905,7 +905,7 @@ class Checker:
         return Ptr(instr.ty)
 
     def op_sizeof(self, instr: Instr) -> Type:
-        """INS-SIZEOF: a foreach type's pointer source that mentions a parameter is `Exposed`, as a traversal
+        """`sizeof`: a foreach type's pointer source that mentions a parameter is `Exposed`, as a traversal
         needs, so the type has its rows at every instantiation (`Types.pointer_sources`)."""
         if instr.ty is None:
             self.fail("instruction_requires_type")
@@ -996,7 +996,7 @@ class Checker:
     op_ptr_store_volatile = op_ptr_store
 
     def raw_access(self, ty: Type) -> None:
-        """MEM-SIZED-ACCESS: a raw load, store, `alloca` or lend of a raw pointer's target (`&*p`, a read
+        """A raw load, store, `alloca` or lend of a raw pointer's target (`&*p`, a read
         and a write) is at a type of non-zero size, never a zero-size one, which has no memory to read,
         write or reserve: it needs `Sized` of the type
         (`Types.sized_available`), which the shape decides for a type without parameters, and which

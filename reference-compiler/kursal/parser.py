@@ -157,7 +157,7 @@ COMPARE = 2
 # The deepest a file nests expressions, blocks, types, patterns and `use` trees: every phase walks a
 # nest by recursion, and this bounds the stack it takes. A chain of binary operators is not a nest.
 NESTING = 128
-STATEMENTS = (S.Let, S.Var, S.Assign, S.ExprStmt, S.Const)
+STATEMENTS = (S.Let, S.Assign, S.ExprStmt, S.Const)
 
 
 class Parser:
@@ -284,18 +284,13 @@ class Parser:
             self.expect(";")
             return S.Use(tree, k == "export", start)
         if k == "module":
-            self.next()
-            names = [self.name()]
-            while self.eat("::"):
-                names.append(self.name())
-            self.expect(";")
-            return S.Module(tuple(names), start)
+            self.error(self.t[self.i], "`module` is a reserved keyword")
         if k in ("exposed", "struct", "tuple", "enum"):
             return self.aggregate()
         if k == "unsafe":
             self.next()
             if self.k == "instance":
-                return self.instance(start, unsafe=True)
+                self.error(self.t[self.i], "`unsafe` marks a function, not an instance")
             return self.fn_decl(start, unsafe=True)
         if k == "instance":
             return self.instance(start)
@@ -457,7 +452,7 @@ class Parser:
         self.next()
         return S.Impl(ty, tuple(decls), None, start)
 
-    def instance(self, start: Position, unsafe: bool = False) -> S.InstanceDecl:
+    def instance(self, start: Position) -> S.InstanceDecl:
         self.expect("instance")
         ty = self.type()
         self.expect("{")
@@ -465,7 +460,7 @@ class Parser:
         while self.k != "}":
             methods.append(self.fn_decl())
         self.next()
-        return S.InstanceDecl(ty, tuple(methods), unsafe, None, start)
+        return S.InstanceDecl(ty, tuple(methods), None, start)
 
     # ---- types
     def type(self, parameter: bool = False) -> S.Type:
@@ -607,16 +602,8 @@ class Parser:
         """A statement; or, when the block ends right after it, a bare expression (its tail)."""
         k, start = self.k, self.pos()
         e: S.Expr
-        if k == "let":
+        if k == "let" or k == "var":
             return self.let_stmt()
-        if k == "var":
-            self.next()
-            name = self.name()
-            ty = self.type() if self.eat(":") else None
-            self.expect("=")
-            value = self.expr()
-            self.expect(";")
-            return S.Var(name, ty, value, start)
         if k == "const":
             return self.const_decl()
         if k in BLOCK_LIKE:
@@ -647,20 +634,23 @@ class Parser:
             return S.Assign(e, value, start)
         if self.eat(";"):
             return S.ExprStmt(e, start)
-        if self.k == "}" and not isinstance(e, S.Return):
+        if self.k == "}" and isinstance(e, S.Return):
+            self.error(self.t[self.i], "a `return` at the end of a block ends with `;`")
+        if self.k == "}":
             return e
         self.fail()
 
     def let_stmt(self) -> S.Let:
-        start = self.pos()
-        self.expect("let")
+        """`("let" | "var") ("exists" brands ".")? pattern (":" type)? "=" expr ";"`."""
+        start, mutable = self.pos(), self.k == "var"
+        self.next()
         brands = self.brands() if self.eat("exists") else ()
         pattern = self.pattern()
         ty = self.type() if self.eat(":") else None
         self.expect("=")
         value = self.expr()
         self.expect(";")
-        return S.Let(pattern, ty, value, brands, start)
+        return S.Let(pattern, ty, value, brands, mutable, start)
 
     def pattern(self) -> S.Pattern:
         self.enter()
@@ -901,7 +891,7 @@ class Parser:
                 e, after_index = S.Field(e, self.name(), start), False
             elif k == "(":
                 self.next()
-                e, after_index = S.Call(e, tuple(self.list_until(")", self.expr)), start), False
+                e, after_index = S.Call(e, tuple(self.list_until(")", self.expr)), False, start), False
             elif k == "?":
                 self.next()
                 e, after_index = S.Try(e, start), False
@@ -957,7 +947,7 @@ class Parser:
             fields, spread = self.braced(self.field_init)
             return S.StructLit(path, tuple(fields), spread, start)
         if self.eat(".("):
-            return S.Call(path, tuple(self.list_until(")", self.expr)), start)
+            return S.Call(path, tuple(self.list_until(")", self.expr)), True, start)
         return path
 
     def field_init(self) -> tuple[str, Optional[S.Expr]]:

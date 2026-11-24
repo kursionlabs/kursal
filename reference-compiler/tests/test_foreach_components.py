@@ -29,7 +29,7 @@ class ComponentTests(unittest.TestCase):
         opt = C.Enum((("none", C.Tuple(())), ("some", C.Prim("u8"))))
         self.assertEqual(self.types.expand(C.Foreach("F", False, opt, C.Ptr(C.Named("F")))),
                          C.Enum((("none", C.Ptr(C.Tuple(()))), ("some", C.Ptr(C.Prim("u8"))))))
-        # A pointer to a sum has no rows (TY-FOREACH-ROWS-PTR), with either pattern: formation rejects one
+        # A pointer to a sum has no rows, with either pattern: formation rejects one
         # written, and `Exposed` of a pointer source, which a traversal and `sizeof` need where a
         # parameter is in the pointee, never holds of one, so none is reached at an instantiation.
         for indirect in (True, False):

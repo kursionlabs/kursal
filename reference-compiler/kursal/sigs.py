@@ -20,7 +20,7 @@ from typing import Literal, Never, Optional
 from . import core as C
 from . import syntax as S
 from .resolve import Decl, Resolver
-from .sexpr import KursError, Position, located
+from .sexpr import KursError, Position, counted, located
 from .layout import check_type_expansion
 from .literals import valid_literal
 from .types import Surface, Types, equal, subst
@@ -247,7 +247,7 @@ class Signatures:
         forall = decl.node.forall
         params = forall.params + forall.determined if forall else (("Self",) if decl.kind == "trait" else ())
         if len(args) != len(params):
-            fail(f"{decl.name} takes {len(params)} type arguments, got {len(args)}", pos)
+            fail(f"{decl.name} takes {counted(len(params), 'type argument')}, got {len(args)}", pos)
         copied = self.copy_names(forall)
         for param, arg in zip(params, args):
             if param.startswith("'") != isinstance(arg, C.Skolem):
@@ -336,7 +336,7 @@ class Signatures:
         fail("_ stands for a type argument only in an expression, where inference fills it in")
 
     def component(self, type_expr: S.Type, scope: Scope, what: str) -> C.Type:
-        """A type written where a foreach type may not be (TY-FLAT): `what` names the place. A foreach
+        """A type written where a foreach type may not be: `what` names the place. A foreach
         type is a whole value's type, or a function's parameter or result."""
         ty = self.type(type_expr, scope)
         if isinstance(ty, C.Foreach):

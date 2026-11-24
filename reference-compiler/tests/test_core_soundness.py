@@ -380,7 +380,7 @@ REJECTED = {
             (= %z (const u64 0)) (= %s (construct (tuple u64) %z))
             (= %r (foreach (foreach (G (tuple u64)) u32) %s m)) (ret %r))))"""),
 
-    # A foreach type is flat (TY-FLAT): a whole value's type, a function's parameter or result, or a
+    # A foreach type is flat: a whole value's type, a function's parameter or result, or a
     # declaration's body, never anywhere else, a declaration whose body is one included.
     "foreach_source_is_a_foreach": ("a foreach source expands to a foreach type", """
         (fun f usize () (entry () (= %n (sizeof (foreach (G (foreach (F (tuple u32)) F)) G))) (ret %n)))"""),
@@ -408,7 +408,7 @@ REJECTED = {
     # An enum has at least one variant: a sum of none would be a type with no value.
     "empty_enum_declaration": ("an enum has at least one variant", "(type E (enum))"),
     # A data item is Copy: its static object is never written, so a load through a pointer to it may not
-    # move a linear value out (DECL-DATA), a forced-linear type's whose fields are all Copy included.
+    # move a linear value out, a forced-linear type's whose fields are all Copy included.
     "data_linear": ("data_type_not_copy", """
         (type L! (struct (n u32)))
         (data d L! (7))"""),
@@ -419,7 +419,7 @@ REJECTED = {
     "empty_enum_written": ("an enum has at least one variant", """
         (fun f usize () (entry () (= %n (sizeof (tuple (enum)))) (ret %n)))"""),
 
-    # A raw load, store or alloca is never at a zero-size type (MEM-ZERO-SIZE), Copy or not: unit, an empty
+    # A raw load, store or alloca is never at a zero-size type, Copy or not: unit, an empty
     # array, a brand witness, a package of one, a capability and a struct of such. At a type that mentions
     # a parameter it needs Sized of the type: an exact premise, or a part with bytes whatever the
     # parameters are.

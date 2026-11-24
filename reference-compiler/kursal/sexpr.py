@@ -32,6 +32,11 @@ def located(error: KursError, file: object, pos: Optional[Position]) -> KursErro
     return located_error
 
 
+def counted(n: int, noun: str) -> str:
+    """`n` of `noun`, as a message writes it: `1 argument`, `2 arguments`."""
+    return f"{n} {noun}{'' if n == 1 else 's'}"
+
+
 class Atom(str):
     pos: Optional[Position] = None
 

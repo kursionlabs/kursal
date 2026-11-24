@@ -39,7 +39,7 @@ class GenericOwnershipTests(unittest.TestCase):
 
     def test_lent_abstract_value_may_remain_full(self):
         self.run_source('''forall T. fn observe(&x: T) -> () { () }
-            fn main() -> i32 { let x = 7i32; observe(&x); x }''', 7)
+            fn main() -> i32 { var x = 7i32; observe(&x); x }''', 7)
 
     def test_core_reports_unconsumed_generic_local(self):
         ty = C.Named('T')

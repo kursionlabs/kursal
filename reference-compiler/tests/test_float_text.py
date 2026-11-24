@@ -105,7 +105,7 @@ use std::option::Option;
 
 // TEXT read back: 0 when it gives `bits` again (some NaN for a NaN), else 1.
 fn misread(text: Buffer!, bits: u64, single: bool) -> u32 {
-    let exists 'b. (tag, bytes, restore) = text.open();
+    var exists 'b. (tag, bytes, restore) = text.open();
     let parsed = parse_f64(&tag, bytes);
     restore.restore(tag).destroy();
     let x = match parsed {
@@ -132,7 +132,7 @@ fn single(out: Buffer!, bits: u32) -> (Buffer!, u32) {
 }
 
 fn parsed(text: Buffer!) -> f64 {
-    let exists 'b. (tag, bytes, restore) = text.open();
+    var exists 'b. (tag, bytes, restore) = text.open();
     let x = parse_f64(&tag, bytes);
     restore.restore(tag).destroy();
     match x {

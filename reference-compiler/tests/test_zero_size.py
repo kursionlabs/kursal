@@ -112,7 +112,7 @@ class ZeroSizeTests(unittest.TestCase):
     def test_containers_of_values_with_zero_size_parts(self):
         # The containers take `Sized` of their elements: a pair of a marker and a number has bytes.
         self.expect('''
-            use std::arena::Domain!;
+            use std::arena::{Domain!, ref_in};
             use std::collections::arena_vec::ArenaVec;
             use std::collections::hashmap::OwnedMap!;
             use std::collections::vec::OwnedVec!;
@@ -134,8 +134,8 @@ class ZeroSizeTests(unittest.TestCase):
                 var key = 3u32;
                 let present = &map.contains(&key);
                 map.destroy();
-                let exists 'a. cx = Domain!::new(std::process::hash_seed());
-                let r = Ref::new(&cx, ((), 9u32));
+                var exists 'a. cx = Domain!::new(std::process::hash_seed());
+                let r = ref_in(&cx, ((), 9u32));
                 let (u, nine) = r.copy(&cx);
                 let pairs: ArenaVec[(Marker, u8), 'a] = ArenaVec::filled(&cx, 10usize, (Marker.{}, 1u8));
                 let ten = pairs.len(&cx);

@@ -936,7 +936,7 @@ class Backend:
 
     def substitute_type(self, ty: Type) -> Type:
         """`ty` at the specialization's type arguments. A type that mentions a parameter is checked again
-        here, at each instantiation, for its size (TY-SIZE-LIMIT), as formation checks a closed one."""
+        here, at each instantiation, for a size below 2^64, as formation checks a closed one."""
         out = subst(ty, self.sub)
         if self.sub and out not in self.sized:
             self.sized.add(out)

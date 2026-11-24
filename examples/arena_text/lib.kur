@@ -13,7 +13,7 @@
 // It prints each distinct word with its count, in first-seen order, then
 // checks the rest of the arena vec's and span's operations, and exits with
 // status 3 through `std::process::exit`.
-use std::arena::{Allocate, Arena!, Domain!, seed};
+use std::arena::{Allocate, Arena!, Domain!, concat, copy_span, seed};
 use std::buffer::Buffer!;
 use std::cap::{Access, Exclusive!};
 use std::cmp::Order;
@@ -68,7 +68,7 @@ instance Allocate[Mem!['k] -> 'k, u32] {
 forall 'k.
 instance ReadBytes[Mem!['k], Span['k]] {
     fn get(&mem: Mem!['k], bytes: Span['k], index: usize) -> Option[u8] {
-        let { tag, arena, printed } = mem;
+        var { tag, arena, printed } = mem;
         let b = bytes.get(&tag, index);
         mem = Mem!.{ tag, arena, printed };
         b
@@ -119,7 +119,7 @@ fn run(&mem: Mem!['k]) {
     text.push_static(&mem, "the hat");
     let all = text.span(&mem);
     let table: ArenaVec[(Span['k], u32), 'k] = ArenaVec::new(&mem);
-    let ws = all.split(&mem, Span::from_static(&mem, " "));
+    let ws = ArenaVec::split(&mem, all, Span::from_static(&mem, " "));
     ws.each(&mem, |&m, w| count(&m, table, w));
     var j = 0usize;
     while j < table.len(&mem) {
@@ -142,7 +142,7 @@ fn run(&mem: Mem!['k]) {
     check(all.find_byte(&mem, b'a', 6usize).unwrap_or(0usize) == 8usize && all.rfind_byte(&mem, b't').unwrap_or(0usize) == 18usize, "find_byte");
     check(all.slice(4usize, 7usize).is(&mem, "cat") && all.slice(17usize, 99usize).is(&mem, "at"), "slice");
     check(all.byte_or_zero(&mem, 1usize) == b'h' && all.byte_or_zero(&mem, 99usize) == 0u8 && all.get(&mem, 99usize).is_none(), "byte_or_zero");
-    let catch = ws.at(&mem, 1usize).concat(&mem, Span::from_static(&mem, "ch"));
+    let catch = concat(&mem, ws.at(&mem, 1usize), Span::from_static(&mem, "ch"));
     check(catch.is(&mem, "catch") && catch.cmp(&mem, all).is_lt() && hat.eq(&mem, ws.at(&mem, 4usize)), "concat, cmp, eq");
     check(ws.join(&mem, "_").is(&mem, "the_cat_and_the_hat") && ws.slice(&mem, 1usize, 3usize).join(&mem, "").is(&mem, "catand"), "join");
     let padded = Span::from_static(&mem, " \t cat \n");
@@ -152,10 +152,9 @@ fn run(&mem: Mem!['k]) {
     check(hash(&mem, (ws.at(&mem, 0usize), 7u32)) == hash(&mem, (ws.at(&mem, 3usize), 7u32)), "hash_in");
 
     // Text moves between arenas: copied out of this one under its capability.
-    let exists 'o. other = Domain!::new(hash_seed());
-    var other = other;
-    let moved = catch.copy_to(&mem, &other);
-    check(moved.is(&other, "catch"), "copy_to");
+    var exists 'o. other = Domain!::new(hash_seed());
+    let moved = copy_span(catch, &mem, &other);
+    check(moved.is(&other, "catch"), "copy_span");
     other.destroy();
 
     // The rest of the vec.

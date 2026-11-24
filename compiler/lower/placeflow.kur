@@ -18,7 +18,7 @@ use std::collections::arena_vec::ArenaVec;
 use std::collections::arena_map::{ArenaMap, ArenaSet};
 use std::mem::Ref;
 use std::raw::Span;
-use std::arena::{Domain!, seed};
+use std::arena::{Domain!, ref_in, seed};
 use std::buffer::Buffer!;
 use package::check::checker::{Checker, Places, overlap, prefix, root_of, strict_ancestor_in};
 use package::kurs::core::{Block, Edge, Fun, Kind, Known, Opened, Param, Program, Terminator, Type};
@@ -362,7 +362,7 @@ fn subset(&cx: Domain!['k], a: ArenaSet[Span['k], 'k], b: ArenaSet[Span['k], 'k]
 forall 'k.
 impl PlaceFlow['k] {
     fn new(&cx: Domain!['k], program: Program['k], r: Resolver['k], counter: Fresh['k]) -> PlaceFlow['k] {
-        PlaceFlow.{ checker: Checker::new(&cx, program, counter), r, origins: Ref::new(&cx, ArenaMap::new(&cx)), working: no_places(&cx), arm: no_places(&cx) }
+        PlaceFlow.{ checker: Checker::new(&cx, program, counter), r, origins: ref_in(&cx, ArenaMap::new(&cx)), working: no_places(&cx), arm: no_places(&cx) }
     }
 
     fn places(self, &cx: Domain!['k]) -> Places['k] {
@@ -375,7 +375,7 @@ impl PlaceFlow['k] {
 
     // Plans the contracts of `fun`'s blocks, an instance method's with the instance's parameters
     // `outer`, then reports its ownership errors.
-    fn plan(self, &cx: Domain!['k], fun: Fun['k], outer: ArenaVec[Param['k], 'k]) {
+    fn plan(self, &cx: Domain!['k], fun: Fun['k], outer: ArenaVec[Param['k], 'k], sites: ArenaMap[Span['k], Span['k], 'k]) {
         let c = self.checker;
         let params = outer.clone(&cx);
         params.append(&cx, fun.params);
@@ -503,7 +503,7 @@ impl PlaceFlow['k] {
             };
             i = i + 1usize;
         }
-        self.diagnose_places(&cx, fun, header);
+        self.diagnose_places(&cx, fun, header, sites);
     }
 
     // Merges `incoming` into the header of block `b`; whether the header changed. The header is
@@ -720,11 +720,11 @@ impl PlaceFlow['k] {
 
     // Stops with `message` about the place `path`: the message reads `before`, the variable's name,
     // then `after`.
-    fn ownership_error(self, &cx: Domain!['k], path: Span['k], before: Slice[u8, 'static], after: Span['k], pos: Pos, origin: bool) -> ! {
+    fn ownership_error(self, &cx: Domain!['k], path: Span['k], before: Slice[u8, 'static], after: Span['k], pos: Pos) -> ! {
         let (root, _fields) = place_parts(&cx, path);
         let fun = self.fun(&cx);
         var at = pos;
-        if root.starts_with(&cx, Span::from_static(&cx, "#tmp")) || origin {
+        if root.starts_with(&cx, Span::from_static(&cx, "#tmp")) {
             at = match self.origins.copy(&cx).get(&cx, Buffer!::new().push_static("&").push_bytes(&cx, root).save(&cx)) {
                 Some(p) => p,
                 None => Pos.{ line: 0u32, col: 0u32 },
@@ -742,7 +742,7 @@ impl PlaceFlow['k] {
     // Replays the finalized headers for source diagnostics, without checking SSA. Do not diagnose
     // while the fixed point is evolving: a provisional header can still change. This reuses the
     // checker's path and state helpers, but none of its instruction, edge or function validators.
-    fn diagnose_places(self, &cx: Domain!['k], fun: Fun['k], header: ArenaMap[Span['k], Places['k], 'k]) {
+    fn diagnose_places(self, &cx: Domain!['k], fun: Fun['k], header: ArenaMap[Span['k], Places['k], 'k], sites: ArenaMap[Span['k], Span['k], 'k]) {
         let c = self.checker;
         let index: ArenaMap[Span['k], usize, 'k] = ArenaMap::new(&cx);
         var i = 0usize;
@@ -796,12 +796,12 @@ impl PlaceFlow['k] {
                                 Some(root) => {
                                     if parameters.contains(&cx, root) {
                                         if !flow.places(&cx).full(&cx, root) {
-                                            flow.ownership_error(&cx, root, "lent value '", Span::from_static(&cx, "' must be restored before return"), pos, false);
+                                            flow.ownership_error(&cx, root, "lent value '", Span::from_static(&cx, "' must be restored before return"), pos);
                                         }
                                     } else {
                                         match c.discardable(&cx, root, roots.at(&cx, root)) {
                                             Ok(free) => if !free {
-                                                flow.ownership_error(&cx, root, "linear value '", Span::from_static(&cx, "' is not consumed before return"), pos, true);
+                                                flow.ownership_error(&cx, root, "linear value '", Span::from_static(&cx, "' is not consumed before return"), pos);
                                             },
                                             Err(_m) => (),
                                         };
@@ -838,8 +838,12 @@ impl PlaceFlow['k] {
                         let (result, always) = c.empty_discardable(&cx, path);
                         match result {
                             Ok(free) => if !free {
-                                flow.ownership_error(&cx, path, "linear value '",
-                                    Buffer!::new().push_static("' remains live on some paths to ").push_bytes(&cx, edge.target).save(&cx), term_pos(block.term), false);
+                                let edge_key = Buffer!::new().push_bytes(&cx, block.label).push_static(">").push_bytes(&cx, edge.target).save(&cx);
+                                let site = match sites.get(&cx, edge_key) {
+                                    Some(w) => w,
+                                    None => sites.get_or(&cx, edge.target, Span::from_static(&cx, "on some paths")),
+                                };
+                                flow.ownership_error(&cx, path, "linear value '", Buffer!::new().push_static("' remains live ").push_bytes(&cx, site).save(&cx), term_pos(block.term));
                             },
                             Err(_m) => (),
                         };
@@ -945,7 +949,7 @@ impl PlaceFlow['k] {
     fn variant_known(self, &cx: Domain!['k], path: Span['k], pos: Pos) {
         match self.checker.place_storage(&cx, path) {
             Err(message) => if Span::from_static(&cx, message).is(&cx, "known") {
-                self.ownership_error(&cx, path, "'", Span::from_static(&cx, "' is used after its enum was assigned; match it again"), pos, false);
+                self.ownership_error(&cx, path, "'", Span::from_static(&cx, "' is used after its enum was assigned; match it again"), pos);
             },
             Ok(_t) => (),
         };
@@ -960,7 +964,7 @@ impl PlaceFlow['k] {
             var j = i + 1usize;
             while j < paths.len(&cx) {
                 if overlap(&cx, paths.at(&cx, i), paths.at(&cx, j)) {
-                    self.ownership_error(&cx, paths.at(&cx, j), "'", Span::from_static(&cx, "' overlaps another place the same call lends"), pos, false);
+                    self.ownership_error(&cx, paths.at(&cx, j), "'", Span::from_static(&cx, "' overlaps another place the same call lends"), pos);
                 }
                 j = j + 1usize;
             }
@@ -975,12 +979,12 @@ impl PlaceFlow['k] {
             i = i + 1usize;
         }
         if nested.len(&cx) > 2usize {
-            self.ownership_error(&cx, nested.at(&cx, 2usize), "a call lends at most two parts of places; '", Span::from_static(&cx, "' is a third"), pos, false);
+            self.ownership_error(&cx, nested.at(&cx, 2usize), "a call lends at most two parts of places; '", Span::from_static(&cx, "' is a third"), pos);
         }
         if nested.len(&cx) == 2usize {
             match self.checker.parts_at_product(&cx, nested) {
                 Ok(apart) => if !apart {
-                    self.ownership_error(&cx, nested.at(&cx, 0usize), "'", Span::from_static(&cx, "' and another part of a place are lent by one call, but they do not part at a struct or tuple field reached through no enum"), pos, false);
+                    self.ownership_error(&cx, nested.at(&cx, 0usize), "'", Span::from_static(&cx, "' and another part of a place are lent by one call, but they do not part at a struct or tuple field reached through no enum"), pos);
                 },
                 Err(_m) => (),
             };
@@ -1006,7 +1010,7 @@ impl PlaceFlow['k] {
             let places = c.places.copy(&cx);
             if op.is(&cx, "load") || op.is(&cx, "destruct") && place {
                 if diagnose && !places.full(&cx, first) {
-                    self.ownership_error(&cx, first, "value '", Span::from_static(&cx, "' has been moved or is only partially available"), instr.pos, false);
+                    self.ownership_error(&cx, first, "value '", Span::from_static(&cx, "' has been moved or is only partially available"), instr.pos);
                 }
                 if diagnose {
                     self.variant_known(&cx, first, instr.pos);
@@ -1025,7 +1029,7 @@ impl PlaceFlow['k] {
                     known = match c.storage_discardable(&cx, first) {
                         Ok(free) => {
                             if !free {
-                                self.ownership_error(&cx, first, "cannot overwrite live linear value '", Span::from_static(&cx, "'"), instr.pos, false);
+                                self.ownership_error(&cx, first, "cannot overwrite live linear value '", Span::from_static(&cx, "'"), instr.pos);
                             }
                             true
                         },
@@ -1038,7 +1042,7 @@ impl PlaceFlow['k] {
                 }
             } else if op.is(&cx, "variant_tag") && place {
                 if diagnose && !places.full(&cx, first) {
-                    self.ownership_error(&cx, first, "enum value '", Span::from_static(&cx, "' has been moved or is only partially available; its tag is unavailable"), instr.pos, false);
+                    self.ownership_error(&cx, first, "enum value '", Span::from_static(&cx, "' has been moved or is only partially available; its tag is unavailable"), instr.pos);
                 }
                 if diagnose {
                     self.variant_known(&cx, first, instr.pos);
@@ -1058,7 +1062,7 @@ impl PlaceFlow['k] {
                     while k < lent.len(&cx) {
                         let arg = lent.at(&cx, k);
                         if !places.full(&cx, arg) {
-                            self.ownership_error(&cx, arg, "value '", Span::from_static(&cx, "' has been moved and cannot be lent"), instr.pos, false);
+                            self.ownership_error(&cx, arg, "value '", Span::from_static(&cx, "' has been moved and cannot be lent"), instr.pos);
                         }
                         self.variant_known(&cx, arg, instr.pos);
                         k = k + 1usize;

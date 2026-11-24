@@ -13,7 +13,7 @@ class AbstractShapeTests(unittest.TestCase):
         for header in ('forall T.', 'forall T where Copy[T].'):
             for scrutinee in ('x', '&x'):
                 with self.subTest(header=header, scrutinee=scrutinee), self.assertRaisesRegex(LowerError, 'match'):
-                    self.run_source(header + ' fn bad(x: T) -> () { match ' + scrutinee + ' { _ => () } } '
+                    self.run_source(header + ' fn bad(x: T) -> () { var x = x; match ' + scrutinee + ' { _ => () } } '
                                     'fn main() -> i32 { 7i32 }', 7)
 
     def test_projection_and_destructuring_require_known_shapes(self):

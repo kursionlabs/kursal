@@ -94,7 +94,7 @@ class Formation:
                 self.flat(arg, "a type argument")
 
     def flat(self, ty: C.Type, what: str) -> None:
-        """TY-FLAT: a type that expands to a foreach is a whole value's type, a function's parameter or
+        """A type that expands to a foreach is a whole value's type, a function's parameter or
         result, or a declaration's body, never a component, a pointee, a package body, a foreach source
         or body, or a type argument (premises' included)."""
         if self.types.expands_to_foreach(ty):
@@ -198,14 +198,14 @@ class Formation:
         return C.ANY
 
     def sized(self, ty: C.Type) -> None:
-        """TY-SIZE-LIMIT: a closed type's size is below 2^64, the target's address space. A type that
+        """A closed type's size is below 2^64, the target's address space. A type that
         mentions a parameter is checked at each instantiation: where it is written closed, and in the
         backend's specializations."""
         if self.types.closed(ty) and self.types.layout(ty) is None:
             self.fail(f"{show(ty)} is too large: its size is not below 2^64 bytes")
 
     def written(self, types: Iterable[C.Type], env: Kinds) -> None:
-        """TY-EXISTS-FORM.scope: a package type binds no brand in scope where it is written, which
+        """A package type binds no brand in scope where it is written, which
         `env` holds, nor one an enclosing package binds. A type the checker derives, as by unfolding a
         declaration, was checked where it is written."""
         for ty in types:

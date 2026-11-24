@@ -100,7 +100,8 @@ def serialized_kurs(program: C.Program) -> str:
 def annotations(bump: S.Fn, main: S.Fn) -> str:
     assert bump.body is not None and main.body is not None
     counter, result = main.body.stmts
-    assert isinstance(counter, S.Var) and isinstance(result, S.Let)
+    assert isinstance(counter, S.Let) and counter.mutable and isinstance(counter.pattern, S.PBind)
+    assert isinstance(result, S.Let)
     assert isinstance(result.pattern, S.PBind) and isinstance(result.value, S.If)
     branch = result.value
     call = branch.then.tail
@@ -112,7 +113,7 @@ def annotations(bump: S.Fn, main: S.Fn) -> str:
         f"bump parameter types: {[show(ty) for ty in call.call.sig.ptypes]}; lent indices: {sorted(call.call.sig.places)}",
         f"bump body type: {show(bump.body.ty)}",
         f"main parameter IDs: {main.param_ids}",
-        f"counter binding ID: {counter.binder}; initializer type: {show(counter.value.ty)}",
+        f"counter binding ID: {counter.pattern.binder}; initializer type: {show(counter.value.ty)}",
         f"if condition type: {show(branch.cond.ty)}",
         f"if result type: {show(branch.ty)}",
         f"then call: {type(call.call).__name__}; result type: {show(call.ty)}",

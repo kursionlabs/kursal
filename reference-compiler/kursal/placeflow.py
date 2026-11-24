@@ -10,6 +10,8 @@ accounting or all contract obligations. Callers must still run check_program on
 the lowered program before passing it and the resulting checker to emit_c.
 """
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Never, Optional
 
 from . import core as C
@@ -43,7 +45,10 @@ class PlaceFlow(Checker):
     dropping an incoming view does not close it, and exact edge checking will
     reject that predecessor unless lowering explicitly closes it first."""
 
-    def plan(self, fun: C.Fun, instance: Optional[C.Instance] = None, *, diagnose: bool = False) -> None:
+    def plan(self, fun: C.Fun, instance: Optional[C.Instance] = None, *, diagnose: bool = False,
+             sites: Mapping[str, str] = MappingProxyType({})) -> None:
+        """Compute each block's place contract; with `diagnose`, report what the source gets wrong, with
+        `sites` saying where in the source paths meet: by a block's label, or `source>target` for one edge."""
         params = (instance.params if instance else ()) + fun.params
         self.fun, self.params, self.where = fun, params, fun.name
         self.kinds = {p.name: p.kind for p in params}
@@ -112,7 +117,7 @@ class PlaceFlow(Checker):
                 block.opened = tuple(sorted(state.opened.items()))
 
         if diagnose:
-            self.diagnose_places(fun, set(header))
+            self.diagnose_places(fun, set(header), sites)
 
     @staticmethod
     def reverse_postorder(fun: C.Fun, blocks: dict[str, C.Block]) -> list[C.Block]:
@@ -150,13 +155,13 @@ class PlaceFlow(Checker):
         header[block.label] = merged
         return True
 
-    def ownership_error(self, path: str, message: str, pos: Optional[Position], *, origin: bool = False) -> Never:
+    def ownership_error(self, path: str, message: str, pos: Optional[Position]) -> Never:
         root = path.removeprefix("&").partition(".")[0]
-        if root.startswith("#tmp") or origin:
+        if root.startswith("#tmp"):
             pos = self.origins.get("&" + root) or self.fun.pos or pos
         raise OwnershipError(f"{function_name(self.fun.name)}: {message.format(name=place_name(path))}", pos)
 
-    def diagnose_places(self, fun: C.Fun, reachable: set[str]) -> None:
+    def diagnose_places(self, fun: C.Fun, reachable: set[str], sites: Mapping[str, str]) -> None:
         """Replay finalized headers for source diagnostics, without checking SSA.
 
         Do not diagnose while the fixed point is evolving: a provisional header
@@ -183,7 +188,7 @@ class PlaceFlow(Checker):
                             if not self.places.full(root):
                                 self.ownership_error(root, "lent value '{name}' must be restored before return", block.term.pos)
                         elif not self.no_linear(root, ty):
-                            self.ownership_error(root, "linear value '{name}' is not consumed before return", block.term.pos, origin=True)
+                            self.ownership_error(root, "linear value '{name}' is not consumed before return", block.term.pos)
                     except CheckError:
                         pass  # A malformed path/view is still a core assertion.
             for edge, known in self.edges(block):
@@ -195,8 +200,8 @@ class PlaceFlow(Checker):
                     for path in blocks[edge.target].empty:
                         try:
                             if not self.no_linear(path, self.storage_type(path)):
-                                self.ownership_error(path, "linear value '{name}' remains live on some paths "
-                                                     f"to {edge.target}", block.term.pos)
+                                site = sites.get(f"{block.label}>{edge.target}") or sites.get(edge.target, "on some paths")
+                                self.ownership_error(path, f"linear value '{{name}}' remains live {site}", block.term.pos)
                         except CheckError:
                             pass
                 finally:

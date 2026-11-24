@@ -19,7 +19,7 @@
 // holds any number of values of different types with no way to walk them.
 // `destroy` therefore cannot route every contained value through a
 // consumer, so everything stored in an arena is `Copy`: `alloc`,
-// `alloc_slice` and `Ref::new` require it, and the arena collections
+// `alloc_slice` and `ref_in` require it, and the arena collections
 // (`ArenaVec`, `ArenaMap`, `ArenaSet`, `List`) require it of their
 // elements. A linear value never enters an arena, so none is lost when the
 // arena goes. Arenas are meant for `Copy` node data forming
@@ -354,7 +354,7 @@ trait Allocate {
 /// (`Arena!::seed`).
 forall 'k, C, R where Allocate[C -> 'k, R].
 fn seed(&cx: C) -> Seed {
-    let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
+    var (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
     let s = &arena.seed();
     cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
     s
@@ -418,7 +418,7 @@ instance Allocate[Domain!['k] -> 'k, ()] {
 forall 'k.
 instance ReadBytes[Domain!['k], Span['k]] {
     fn get(&cx: Domain!['k], bytes: Span['k], index: usize) -> Option[u8] {
-        let { tag, arena } = cx;
+        var { tag, arena } = cx;
         let b = bytes.get(&tag, index);
         cx = Domain!.{ tag, arena };
         b
@@ -429,17 +429,14 @@ instance ReadBytes[Domain!['k], Span['k]] {
     }
 }
 
-forall T, 'k.
-impl Ref[T, 'k] {
-    /// `value`, put in the context's arena. `T` is `Copy`, as for
-    /// `Arena!::alloc`.
-    forall C, R where Copy[T], Allocate[C -> 'k, R], Sized[T].
-    fn new(&cx: C, value: T) -> Ref[T, 'k] {
-        let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
-        let r = &arena.alloc(&tag, value);
-        cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
-        r
-    }
+/// `value`, put in the context's arena. `T` is `Copy`, as for
+/// `Arena!::alloc`.
+forall T, 'k, C, R where Copy[T], Allocate[C -> 'k, R], Sized[T].
+fn ref_in(&cx: C, value: T) -> Ref[T, 'k] {
+    var (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
+    let r = &arena.alloc(&tag, value);
+    cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
+    r
 }
 
 impl Buffer! {
@@ -448,46 +445,44 @@ impl Buffer! {
     /// buffer is freed. `Buffer!::new().push_static("x").push_u64(n).save(&cx)`.
     forall 'k, C, R where Allocate[C -> 'k, R].
     fn save(self, &cx: C) -> Span['k] {
-        let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
-        let p = unsafe &self.as_ptr();
-        let n = &self.len();
+        var (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
+        var buffer = self;
+        let p = unsafe &buffer.as_ptr();
+        let n = &buffer.len();
         let dest = unsafe &arena.alloc_bytes(n);
         let u = unsafe copy_bytes(dest, p, n);
-        let u2 = self.destroy();
+        let u2 = buffer.destroy();
         let saved = unsafe Span::from_raw_parts_branded(dest, n, arena.marker);
         cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
         saved
     }
 }
 
-forall 'j.
-impl Span['j] {
-    /// The span's bytes, read under the capability `from` lends, copied into
-    /// the arena `to` lends: how text moves from one arena to another, so
-    /// that the first can be destroyed while the copy lives on.
-    forall 'k, C, R, D, Q where Access[C -> 'j, R], Allocate[D -> 'k, Q].
-    fn copy_to(self, &from: C, &to: D) -> Span['k] {
-        let (from_tag, from_rest) = Access[C -> 'j, R]::open(from);
-        let (tag, arena, rest) = Allocate[D -> 'k, Q]::open(to);
-        let (p, n) = self.into_parts();
-        let dest = unsafe &arena.alloc_bytes(n);
-        let u = unsafe copy_bytes(dest, p, n);
-        let copied = unsafe Span::from_raw_parts_branded(dest, n, arena.marker);
-        to = Allocate[D -> 'k, Q]::close(tag, arena, rest);
-        from = Access[C -> 'j, R]::close(from_tag, from_rest);
-        copied
-    }
+/// The bytes of `span`, read under the capability `from` lends, copied into
+/// the arena `to` lends: how text moves from one arena to another, so that
+/// the first can be destroyed while the copy lives on.
+forall 'j, 'k, C, R, D, Q where Access[C -> 'j, R], Allocate[D -> 'k, Q].
+fn copy_span(span: Span['j], &from: C, &to: D) -> Span['k] {
+    let (from_tag, from_rest) = Access[C -> 'j, R]::open(from);
+    var (tag, arena, rest) = Allocate[D -> 'k, Q]::open(to);
+    let (p, n) = span.into_parts();
+    let dest = unsafe &arena.alloc_bytes(n);
+    let u = unsafe copy_bytes(dest, p, n);
+    let copied = unsafe Span::from_raw_parts_branded(dest, n, arena.marker);
+    to = Allocate[D -> 'k, Q]::close(tag, arena, rest);
+    from = Access[C -> 'j, R]::close(from_tag, from_rest);
+    copied
+}
 
-    /// The bytes of `self` then `other`, in one new block of the arena.
-    forall C, R where Allocate[C -> 'j, R].
-    fn concat(self, &cx: C, other: Span['j]) -> Span['j] {
-        let (tag, arena, rest) = Allocate[C -> 'j, R]::open(cx);
-        var d = Domain!.{ tag, arena };
-        let joined = Buffer!::new().push_bytes(&d, self).push_bytes(&d, other).save(&d);
-        let { tag, arena } = d;
-        cx = Allocate[C -> 'j, R]::close(tag, arena, rest);
-        joined
-    }
+/// The bytes of `first` then `second`, in one new block of the arena.
+forall 'j, C, R where Allocate[C -> 'j, R].
+fn concat(&cx: C, first: Span['j], second: Span['j]) -> Span['j] {
+    let (tag, arena, rest) = Allocate[C -> 'j, R]::open(cx);
+    var d = Domain!.{ tag, arena };
+    let joined = Buffer!::new().push_bytes(&d, first).push_bytes(&d, second).save(&d);
+    let { tag, arena } = d;
+    cx = Allocate[C -> 'j, R]::close(tag, arena, rest);
+    joined
 }
 
 /// Copies `count` bytes from `src` to `dest`, byte by byte (the same loop as

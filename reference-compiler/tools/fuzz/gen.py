@@ -103,6 +103,10 @@ class Var:
     frozen: bool = False     # an outer linear value inside a loop body: lent, never moved
     lendable: bool = True
 
+    def lends(self) -> bool:
+        """Whether a lend may name it: only a var or a place is lent."""
+        return self.lendable and (self.mutable or self.place)
+
 
 class Env:
     def __init__(self) -> None:
@@ -244,7 +248,7 @@ class Gen:
         r = self.r
         options = []
         for v in env.live():
-            if not v.lendable:
+            if not v.lends():
                 continue
             if v.ty == "T!":
                 options += [f"peek_t(&{v.name})", f"bump_t(&{v.name})", f"&{v.name}.get()"]
@@ -266,7 +270,7 @@ class Gen:
         """The `T!` places that may be lent here: locals, and fields of locals that hold one."""
         out = []
         for v in env.live():
-            if not v.lendable:
+            if not v.lends():
                 continue
             if v.ty == "T!":
                 out.append(v.name)
@@ -327,7 +331,7 @@ class Gen:
             vs = env.live("T!")
             if vs:
                 v = r.choice(vs)
-                if v.lendable and (v.mutable or v.place):
+                if v.lends():
                     return f"swap_in(&{v.name}, {self.expr('T!', env, depth - 1)})"
         if ty == "P":
             return f"P.{{ a: {self.u32(env, depth - 1)}, b: {self.u32(env, depth - 1)} }}"
@@ -413,7 +417,7 @@ class Gen:
         lent: list[Var] = []
         for name, pty, place in f.params:
             if place:
-                vs = [v for v in env.live(pty) if v.lendable and v not in lent]
+                vs = [v for v in env.live(pty) if v.lends() and v not in lent]
                 if not vs:
                     return None
                 v = self.r.choice(vs)
@@ -538,7 +542,7 @@ class Gen:
         """`match &x { ... }` on a live `E!` or `Opt[T!]` local: the payload binder is a place in `x`. An
         arm may lend it, move it out and put a value back, or move it out and store a whole new value
         of another variant into `x`."""
-        vs = [v for v in env.live() if (v.ty == "E!" or v.ty.startswith("Opt[")) and v.lendable
+        vs = [v for v in env.live() if (v.ty == "E!" or v.ty.startswith("Opt[")) and v.lends()
               and self.makeable(v.ty, env)]
         if not vs:
             return None
@@ -610,7 +614,7 @@ class Gen:
                 return f"let {name} = {text};"
         if kind == "lend_loop":
             # `bump_t` returns the value before it adds one, so the loop ends.
-            vs = [v for v in env.live("T!") if v.lendable]
+            vs = [v for v in env.live("T!") if v.lends()]
             if vs:
                 v = r.choice(vs)
                 inner = env.copy()
@@ -629,7 +633,7 @@ class Gen:
                                  f"&{v.name}.get() < {r.randrange(1, 30)}u32 && bump_t(&{v.name}) < 40u32"])
                 return f"while {cond} {{ {' '.join(body)} }}"
         if kind == "place_closure":
-            vs = [v for v in env.live("T!") if v.lendable]
+            vs = [v for v in env.live("T!") if v.lends()]
             if vs:
                 v = r.choice(vs)
                 name, call = self.fresh("c"), self.fresh("r")
@@ -654,8 +658,8 @@ class Gen:
         if kind == "mint":
             brand, tag = self.fresh("b"), self.fresh("g")
             value = self.u32(env, depth - 1)
-            env.vars[tag] = Var(tag, f"Tag!['{brand}]")
-            return f"let exists '{brand}. {tag} = mint({value});"
+            env.vars[tag] = Var(tag, f"Tag!['{brand}]", mutable=True)
+            return f"var exists '{brand}. {tag} = mint({value});"
         if kind in ("let", "var"):
             ty = r.choice(COPY_TYPES + self.linear_types(env))
             name = self.fresh("v")
@@ -771,7 +775,7 @@ class Gen:
             env.vars[name] = Var(name, "u32")
             return f"let {name} = {text};"
         if kind == "swap":
-            vs = [v for v in env.live() if (v.ty == "T!" or v.ty.startswith("Tag!")) and v.lendable
+            vs = [v for v in env.live() if (v.ty == "T!" or v.ty.startswith("Tag!")) and v.lends()
                   and (v.mutable or v.place) and self.makeable(v.ty, env)]
             if vs:
                 v = r.choice(vs)

@@ -15,7 +15,7 @@ class FunctionArgumentTests(unittest.TestCase):
     run_source = test_closure_boundary.ClosureBoundaryTests.run_source
 
     def reject(self, body, prefix=''):
-        with self.assertRaisesRegex(InferError, 'type arguments'):
+        with self.assertRaisesRegex(InferError, 'type argument'):
             self.run_source(DECLS + prefix + 'fn main() -> i32 { ' + body + ' }', 7)
 
     def test_namespace_arguments_on_calls_and_values(self):

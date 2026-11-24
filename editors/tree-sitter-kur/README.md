@@ -5,8 +5,9 @@ Tree-sitter grammar and highlight queries for Kursal source (`.kur`).
 The reference parser, `reference-compiler/kursal/parser.py`, decides what is Kursal; `grammar.js`
 follows its productions. Where rejecting a program takes more than its shape, this grammar accepts
 it and leaves the rejection to the compiler: a chained comparison (`a < b < c`), a second tuple
-index (`p.0.1`, written `(p.0).1`), an assignment to something that is not a place, and a `match` arm
-whose body is not a block with no comma before the next arm.
+index (`p.0.1`, written `(p.0).1`), an assignment to something that is not a place, a `match` arm
+whose body is not a block with no comma before the next arm, and the reserved word `module` used as
+a name.
 
 Captures to note:
 

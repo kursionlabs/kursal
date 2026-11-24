@@ -105,13 +105,13 @@ instance Next[Wrap[T] -> I] {
                 "fn f(c: Wrap[Other]) -> Opt[u32] { var d = c; &d.step() }")
 
     def test_try_unwraps_direct_option(self):
-        r = run("fn f(o: Opt[u32]) -> Opt[bool] { let n = o?; Opt::Some.(n == 0) }\n")
+        r = run("fn f(o: core::option::Option[u32]) -> core::option::Option[bool] { let n = o?; core::option::Option::Some.(n == 0) }\n")
         t = fn(r, "f").body.stmts[0].value
         self.assertEqual((t.kind, t.ty), ("option", U32))
 
     def test_try_preserves_tuple_payloads_and_allows_different_success_types(self):
-        r = run("fn f(o: Opt[(u32, bool)]) -> Opt[u32] { let (n, b) = o?; Opt::Some.(n) }\n"
-                "fn g(r: Res[u32, u32]) -> Res[bool, u32] { let n = r?; Res::Ok.(n == 0) }\n")
+        r = run("fn f(o: core::option::Option[(u32, bool)]) -> core::option::Option[u32] { let (n, b) = o?; core::option::Option::Some.(n) }\n"
+                "fn g(r: core::option::Result[u32, u32]) -> core::option::Result[bool, u32] { let n = r?; core::option::Result::Ok.(n == 0) }\n")
         self.assertEqual(fn(r, "f").body.stmts[0].value.ty, C.Tuple((U32, BOOL)))
         self.assertEqual(fn(r, "g").body.stmts[0].value.ty, U32)
 
@@ -169,7 +169,7 @@ instance Next[Wrap[T] -> I] {
     def test_lent_match_and_tuple_constructors(self):
         r = run("exposed tuple Pair(u32, bool);\n"
                 "fn f(o: Opt[u32]) -> Pair { var p = o; let n = match &p { Opt::Some(v) => v, Opt::None => 0u32 }; "
-                "Pair(n, true) }\n")
+                "Pair.(n, true) }\n")
         body = fn(r, "f").body
         self.assertTrue(body.stmts[1].value.lent)
         self.assertEqual(body.tail.ty, named("Pair"))
@@ -208,7 +208,7 @@ class MethodVisibilityTests(unittest.TestCase):
     def test_a_shared_method_name_is_ambiguous_only_when_both_traits_are_visible(self):
         r = run_modules("use package::m::Show;\nfn f(x: u32) -> u32 { x.show() }\n", m=SHOW, n=OTHER)
         self.assertEqual(fn(r, "f").body.tail.call.trait, "p::m::Show")
-        with self.assertRaisesRegex(InferError, "u32 has several method show"):
+        with self.assertRaisesRegex(InferError, "u32 has several methods named show"):
             run_modules("use package::m::Show;\nuse package::n::Other;\nfn f(x: u32) -> u32 { x.show() }\n",
                         m=SHOW, n=OTHER)
 

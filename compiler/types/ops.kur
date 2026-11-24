@@ -1,7 +1,7 @@
 // Type operations shared by the checker and the backend: substitution, equality, multiplicity,
 // exposure and logical shape.
 
-use package::support::base::fail;
+use package::support::base::{counted, fail};
 use std::hash::{HashState, key_eq};
 use std::cmp::Order;
 use std::collections::arena_vec::ArenaVec;
@@ -10,7 +10,7 @@ use std::mem::Ref;
 use std::raw::Span;
 use std::slice::Slice;
 use std::slice::hash_bytes;
-use std::arena::{Domain!, seed};
+use std::arena::{Domain!, ref_in, seed};
 use std::buffer::Buffer!;
 use package::kurs::core::{Exposure, ExposureMode, FnType, ForeachType, Kind, Member, ModuleId, Param, Premise, Program, Type, TypeDecl};
 use package::kurs::core as C;
@@ -19,7 +19,7 @@ use package::syntax::ast::{Pos, no_pos};
 use std::option::Option;
 
 // The target's pointer width in bytes, which the layout assumes: of a pointer, a function value,
-// `usize` and `isize` (TY-SIZE-LIMIT). Every formed type's size is below 2^64.
+// `usize` and `isize`. Every formed type's size is below 2^64, the address space of that width.
 const WORD: u64 = 8u64;
 
 // The size of a primitive, which is its alignment too.
@@ -127,7 +127,7 @@ exposed struct Fresh {
 forall 'k.
 impl Fresh['k] {
     fn new(&cx: Domain!['k]) -> Fresh['k] {
-        Fresh.{ next: Ref::new(&cx, 0u64) }
+        Fresh.{ next: ref_in(&cx, 0u64) }
     }
 }
 
@@ -135,7 +135,7 @@ impl Fresh['k] {
 // stopped.
 forall 'a, 'b.
 fn carry_fresh(&from: Domain!['a], &to: Domain!['b], counter: Fresh['a]) -> Fresh['b] {
-    Fresh.{ next: Ref::new(&to, counter.next.copy(&from)) }
+    Fresh.{ next: ref_in(&to, counter.next.copy(&from)) }
 }
 
 // `label` without any `#` suffix, numbered anew: `a#3`.
@@ -247,10 +247,10 @@ fn map_children(&cx: Domain!['k], ty: Type['k], transform: closure[Env](&_: Doma
                 Type::Named.(name, out)
             }
         },
-        Brand(brand) => Type::Brand.(Ref::new(&cx, transform(&cx, brand.copy(&cx)))),
-        Ptr(inner) => Type::Ptr.(Ref::new(&cx, transform(&cx, inner.copy(&cx)))),
-        NonNull(inner) => Type::NonNull.(Ref::new(&cx, transform(&cx, inner.copy(&cx)))),
-        Array(elem, length) => Type::Array.(Ref::new(&cx, transform(&cx, elem.copy(&cx))), length),
+        Brand(brand) => Type::Brand.(ref_in(&cx, transform(&cx, brand.copy(&cx)))),
+        Ptr(inner) => Type::Ptr.(ref_in(&cx, transform(&cx, inner.copy(&cx)))),
+        NonNull(inner) => Type::NonNull.(ref_in(&cx, transform(&cx, inner.copy(&cx)))),
+        Array(elem, length) => Type::Array.(ref_in(&cx, transform(&cx, elem.copy(&cx))), length),
         Tuple(elems) => {
             let out: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
             var i = 0usize;
@@ -278,11 +278,11 @@ fn map_children(&cx: Domain!['k], ty: Type['k], transform: closure[Env](&_: Doma
             }
             Type::Enum.(out)
         },
-        Exists(binders, body) => Type::Exists.(binders, Ref::new(&cx, transform(&cx, body.copy(&cx)))),
+        Exists(binders, body) => Type::Exists.(binders, ref_in(&cx, transform(&cx, body.copy(&cx)))),
         Foreach(f) => {
             let source = transform(&cx, f.source.copy(&cx));
             let body = transform(&cx, f.body.copy(&cx));
-            Type::Foreach.(ForeachType.{ binder: f.binder, indirect: f.indirect, source: Ref::new(&cx, source), body: Ref::new(&cx, body) })
+            Type::Foreach.(ForeachType.{ binder: f.binder, indirect: f.indirect, source: ref_in(&cx, source), body: ref_in(&cx, body) })
         },
         Fn(f) => {
             let params: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
@@ -292,7 +292,7 @@ fn map_children(&cx: Domain!['k], ty: Type['k], transform: closure[Env](&_: Doma
                 i = i + 1usize;
             }
             let ret = transform(&cx, f.ret.copy(&cx));
-            Type::Fn.(FnType.{ params, ret: Ref::new(&cx, ret), is_unsafe: f.is_unsafe, places: f.places })
+            Type::Fn.(FnType.{ params, ret: ref_in(&cx, ret), is_unsafe: f.is_unsafe, places: f.places })
         },
         _ => ty,
     }
@@ -318,21 +318,22 @@ fn subst(&cx: Domain!['k], ty: Type['k], sub: ArenaMap[Span['k], Type['k], 'k], 
         Skolem(label) => sub.get_or(&cx, label, ty),
         Exists(binders, body) => {
             let (names, inner) = rebind(&cx, binders, sub, true, counter);
-            Type::Exists.(names, Ref::new(&cx, subst(&cx, body.copy(&cx), inner, counter)))
+            Type::Exists.(names, ref_in(&cx, subst(&cx, body.copy(&cx), inner, counter)))
         },
         Foreach(f) => {
             let source = subst(&cx, f.source.copy(&cx), sub, counter);
             let (binders, inner) = rebind(&cx, ArenaVec::one(&cx, f.binder), sub, false, counter);
-            Type::Foreach.(ForeachType.{ binder: binders.at(&cx, 0usize), indirect: f.indirect, source: Ref::new(&cx, source),
-                body: Ref::new(&cx, subst(&cx, f.body.copy(&cx), inner, counter)) })
+            Type::Foreach.(ForeachType.{ binder: binders.at(&cx, 0usize), indirect: f.indirect, source: ref_in(&cx, source),
+                body: ref_in(&cx, subst(&cx, f.body.copy(&cx), inner, counter)) })
         },
         _ => map_children(&cx, ty, |&cx, child: Type['k]| subst(&cx, child, sub, counter)),
     }
 }
 
-// `ty` with each package binder that would shadow a brand of `scope` or of an enclosing package
-// (TY-EXISTS-FORM.scope) renamed `b#n`, a spelling no written brand has: a type the compiler writes
-// may come from a declaration whose binders are spelled as a brand where it is written.
+// `ty` with each package binder that would shadow a brand of `scope` or of an enclosing package,
+// which a written type's binder may not, renamed `b#n`, a spelling no written brand has: a type the
+// compiler writes may come from a declaration whose binders are spelled as a brand where it is
+// written.
 forall 'k.
 fn apart(&cx: Domain!['k], ty: Type['k], scope: ArenaSet[Span['k], 'k], counter: Fresh['k]) -> Type['k] {
     match ty {
@@ -361,7 +362,7 @@ fn apart(&cx: Domain!['k], ty: Type['k], scope: ArenaSet[Span['k], 'k], counter:
                 taken.insert(&cx, name);
                 i = i + 1usize;
             }
-            Type::Exists.(spelled, Ref::new(&cx, apart(&cx, subst(&cx, body.copy(&cx), renamed, counter), taken, counter)))
+            Type::Exists.(spelled, ref_in(&cx, apart(&cx, subst(&cx, body.copy(&cx), renamed, counter), taken, counter)))
         },
         _ => map_children(&cx, ty, |&cx, child: Type['k]| apart(&cx, child, scope, counter)),
     }
@@ -751,7 +752,7 @@ forall 'k.
 fn bind(&cx: Domain!['k], env: Alpha['k], left: ArenaVec[Span['k], 'k], right: ArenaVec[Span['k], 'k]) -> Alpha['k] {
     let env = match env.scopes {
         Some(s) => s,
-        None => Scopes.{ left: ArenaMap::new(&cx), right: ArenaMap::new(&cx), marks: Ref::new(&cx, 0u64) },
+        None => Scopes.{ left: ArenaMap::new(&cx), right: ArenaMap::new(&cx), marks: ref_in(&cx, 0u64) },
     };
     let a = env.left.clone(&cx);
     let b = env.right.clone(&cx);
@@ -1043,7 +1044,7 @@ impl Types['k] {
     // `ty` mentions no type parameter or binder: every name it has is a declaration's. Brands do not
     // change a layout.
     // The pointer sources that mention a type parameter of the foreach types in `ty`, declarations
-    // that mention one unfolded, each once (TY-FOREACH-EXPOSED-PTR): `sizeof` of `ty` needs `Exposed`
+    // that mention one unfolded, each once: `sizeof` of `ty` needs `Exposed`
     // of each, as a traversal does, so none points to a sum at an instantiation.
     fn pointer_sources(self, &cx: Domain!['k], ty: Type['k]) -> ArenaVec[Type['k], 'k] {
         let out: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
@@ -1098,8 +1099,8 @@ impl Types['k] {
     // The size and alignment of a closed type's value as the backend lays it out at the target's
     // pointer width: a primitive its width, a pointer or a function value a word, a zero-size part
     // erased, a product a C struct of the rest, and an enum a `uint32_t` tag and a union of its
-    // payloads, or its payload in the niche layout. None when the size is 2^64 or more: no formed type
-    // has one (TY-SIZE-LIMIT).
+    // payloads, or its payload in the niche layout. None when the size is 2^64 or more: formation
+    // rejects such a type.
     fn layout(self, &cx: Domain!['k], ty: Type['k]) -> Option[(u64, u64)] {
         match self.layouts.get(&cx, ty) {
             Some(known) => return known,
@@ -1312,7 +1313,7 @@ impl Types['k] {
         };
         let decl = self.decl(&cx, name);
         if args.len(&cx) != decl.params.len(&cx) {
-            kurs_error(&cx, Buffer!::new().push_bytes(&cx, name).push_static(" takes ").push_usize(decl.params.len(&cx)).push_static(" type arguments").save(&cx), no_pos());
+            kurs_error(&cx, Buffer!::new().push_bytes(&cx, name).push_static(" takes ").push_bytes(&cx, counted(&cx, decl.params.len(&cx), "type argument")).save(&cx), no_pos());
         }
         if !self.is_exposed(&cx, decl, home) {
             kurs_error(&cx, Buffer!::new().push_static("the shape of ").push_bytes(&cx, name).push_static(" is not exposed here").save(&cx), no_pos());
@@ -1367,7 +1368,7 @@ impl Types['k] {
         self.concrete_exposure(&cx, source, home, kinds)
     }
 
-    // `Sized[ty]` (TY-SIZED): `ty` has a finite by-value layout of non-zero size, at every
+    // `Sized[ty]`: `ty` has a finite by-value layout of non-zero size, at every
     // instantiation. An exact assumption gives it; otherwise its shape decides it, with each type
     // parameter standing for a zero-size type: a part of it held by value, a primitive, a pointer, a
     // sum or a function value, has bytes whatever the parameters are. So `Sized[T]` and `Sized[U]` do
@@ -1609,8 +1610,8 @@ impl Types['k] {
         var s = self.shape(&cx, source, home);
         var pointer = false;
         let unit = match s {
-            // Behind a pointer each component is a pointer to it; a sum has none, so no rows
-            // (TY-FOREACH-ROWS-PTR). Formation rejects a written one, and a traversal or `sizeof` with a
+            // Behind a pointer each component is a pointer to it; a sum has none, so no rows.
+            // Formation rejects a written one, and a traversal or `sizeof` with a
             // parameter in the pointee needs `Exposed` of the source, which no sum has.
             Ptr(inner) => {
                 s = self.shape(&cx, inner.copy(&cx), home);
@@ -1726,14 +1727,14 @@ impl Types['k] {
             Some(skeleton) => match skeleton {
                 Struct(_f) => Type::Struct.(mapped),
                 Enum(_v) => Type::Enum.(mapped),
-                Array(_e, length) => Type::Array.(Ref::new(&cx, mapped.at(&cx, 0usize).type), length),
+                Array(_e, length) => Type::Array.(ref_in(&cx, mapped.at(&cx, 0usize).type), length),
                 _ => Type::Tuple.(member_types(&cx, mapped)),
             },
             None => Type::Tuple.(member_types(&cx, mapped)),
         }
     }
 
-    // `ty`'s head, unfolding declarations, is a foreach type (TY-FLAT). A declaration whose body's
+    // `ty`'s head, unfolding declarations, is a foreach type. A declaration whose body's
     // head is one of its parameters takes the head of that argument; a cycle of heads is no foreach,
     // and a type parameter never is one. Components are not looked at.
     fn expands_to_foreach(self, &cx: Domain!['k], ty: Type['k]) -> bool {
@@ -2069,6 +2070,43 @@ fn source_members(&cx: Domain!['k], out: Buffer!, ms: ArenaVec[Member['k], 'k], 
     out
 }
 
+// The environment and the code of a closure, a struct of `env` and `code`, a function of the
+// environment and the arguments; None for any other struct.
+forall 'k.
+fn closure_parts(&cx: Domain!['k], fields: ArenaVec[Member['k], 'k]) -> Option[(Type['k], FnType['k])] {
+    if fields.len(&cx) != 2usize || !fields.at(&cx, 0usize).name.is(&cx, "env") || !fields.at(&cx, 1usize).name.is(&cx, "code") {
+        return Option::None;
+    }
+    match fields.at(&cx, 1usize).type {
+        Fn(f) => if f.params.is_empty(&cx) { Option::None } else { Option::Some.((fields.at(&cx, 0usize).type, f)) },
+        _ => Option::None,
+    }
+}
+
+// A closure as source writes its type: `closure(A, &_: B) -> R`, with `[Env]` after `closure` when its
+// environment is known.
+forall 'k.
+fn source_closure(&cx: Domain!['k], env: Type['k], code: FnType['k], surface: Surface['k]) -> Span['k] {
+    var out = Buffer!::new().push_static("closure");
+    let environment = source(&cx, env, surface);
+    if !environment.is(&cx, "_") {
+        out = out.push_static("[").push_bytes(&cx, environment).push_static("]");
+    }
+    out = out.push_static("(");
+    var i = 1usize;
+    while i < code.params.len(&cx) {
+        if i > 1usize {
+            out = out.push_static(", ");
+        }
+        if code.places.contains(&cx, i) {
+            out = out.push_static("&_: ");
+        }
+        out = out.push_bytes(&cx, source(&cx, code.params.at(&cx, i), surface));
+        i = i + 1usize;
+    }
+    out.push_static(") -> ").push_bytes(&cx, source(&cx, code.ret.copy(&cx), surface)).save(&cx)
+}
+
 // `ty` as source writes it, by `surface`.
 forall 'k.
 fn source(&cx: Domain!['k], ty: Type['k], surface: Surface['k]) -> Span['k] {
@@ -2091,7 +2129,10 @@ fn source(&cx: Domain!['k], ty: Type['k], surface: Surface['k]) -> Span['k] {
             (if elems.len(&cx) == 1usize { out.push_static(",)") } else { out.push_static(")") }).save(&cx)
         },
         Array(elem, length) => Buffer!::new().push_static("[").push_bytes(&cx, source(&cx, elem.copy(&cx), surface)).push_static("; ").push_u64(length).push_static("]").save(&cx),
-        Struct(fields) => source_members(&cx, Buffer!::new().push_static("struct { "), fields, false, surface).push_static(" }").save(&cx),
+        Struct(fields) => match closure_parts(&cx, fields) {
+            Some(env, code) => source_closure(&cx, env, code, surface),
+            None => source_members(&cx, Buffer!::new().push_static("struct { "), fields, false, surface).push_static(" }").save(&cx),
+        },
         Enum(variants) => source_members(&cx, Buffer!::new().push_static("enum { "), variants, true, surface).push_static(" }").save(&cx),
         Exists(binders, body) => {
             var out = Buffer!::new().push_static("exists ");

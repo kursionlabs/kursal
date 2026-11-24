@@ -70,7 +70,6 @@
 (const_declaration name: (identifier) @constant)
 
 (use_tree path: (identifier) @module)
-(module_declaration path: (path (identifier) @module))
 (exposure scope: (path (identifier) @module))
 
 ; --------------------------------------------------------------- literals --
@@ -93,7 +92,6 @@
 [
   "use"
   "export"
-  "module"
   "exposed"
   "struct"
   "tuple"
@@ -184,3 +182,9 @@
 (closure_parameter place: "&" @attribute name: (identifier) @attribute)
 (place_slot "&" @attribute name: (_) @attribute)
 (unary_expression operator: "&" @attribute)
+
+; --------------------------------------------------------- reserved words --
+; `module` is reserved: the compiler rejects it wherever it appears.
+
+((identifier) @keyword
+  (#eq? @keyword "module"))

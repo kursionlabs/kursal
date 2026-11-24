@@ -49,7 +49,7 @@ class TypeDeclTests(unittest.TestCase):
             sigs_of("forall T. struct S { x: T }\nfn f(s: S[_]) -> u32 { 0u32 }\n")
 
     def test_a_foreach_type_is_no_component(self):
-        # A foreach type is the type of a whole value, parameter or result (TY-FLAT).
+        # A foreach type is the type of a whole value, parameter or result.
         for source, what in (
             ("struct F { f: foreach F of (u32, u8) => *F }\n", "a component"),
             ("tuple P(foreach X of (u32,) => X, u8);\n", "a component"),

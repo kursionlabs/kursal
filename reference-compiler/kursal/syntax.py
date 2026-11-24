@@ -297,6 +297,7 @@ class Index(Inferred):
 class Call(Inferred):
     callee: Expr
     args: tuple[Expr, ...]
+    construct: bool = False          # written `Name.(args)`: a tuple's or a variant's construction
     pos: Optional[Position] = None
     # Inference -> lowering: resolved call target; filled before Infer.finish succeeds.
     call: Optional[Callee] = field(default=None, init=False, repr=False, compare=False)
@@ -320,18 +321,9 @@ class Let:
     type: Optional[Type]
     value: Expr
     brands: tuple[str, ...] = ()     # `let exists 'a. ...`
+    mutable: bool = False            # written `var`: every name the pattern binds is a var
     pos: Optional[Position] = None
     opened_brands: tuple[str, ...] = field(init=False, repr=False, compare=False)
-
-
-@dataclass
-class Var:
-    name: str
-    type: Optional[Type]
-    value: Expr
-    pos: Optional[Position] = None
-    # Inference -> lowering: mutable local's binding ID.
-    binder: int = field(init=False, repr=False, compare=False)
 
 
 @dataclass
@@ -425,12 +417,6 @@ class Use(Declaration):
 
 
 @dataclass
-class Module(Declaration):
-    path: NamePath
-    pos: Optional[Position] = None
-
-
-@dataclass
 class Struct(Declaration):
     name: str              # a linear type's name ends with `!`
     fields: tuple[tuple[str, Type], ...]          # ((name, type), ...)
@@ -515,7 +501,6 @@ class TraitDecl(Declaration):
 class InstanceDecl(Declaration):
     type: Type
     methods: tuple[Fn, ...]
-    unsafe: bool = False
     forall: Optional[Forall] = None
     pos: Optional[Position] = None
 
@@ -532,9 +517,9 @@ type Expr = (
     | Field | Index | Call | Try | While | For
 )
 type Pattern = PBind | PWild | PTuple | PArray | PStruct
-type Statement = Let | Var | Assign | ExprStmt | Const
+type Statement = Let | Assign | ExprStmt | Const
 type Item = (
-    Use | Module | Struct | TupleDecl | EnumDecl | Fn | Extern
+    Use | Struct | TupleDecl | EnumDecl | Fn | Extern
     | Const | Impl | TraitDecl | InstanceDecl
 )
 type UseTree = tuple[NamePath, bool, tuple[UseTree, ...], Optional[str], Position]   # (path, star, children, alias, where it starts)

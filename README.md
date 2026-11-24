@@ -73,24 +73,25 @@ path = "../lib/std"
 |---|---|
 | `name` | the package's name; required |
 | `kind` | `"library"` (the default) or `"executable"` |
-| `entry` | an executable's entry function, required for one: a path in the package, bare (`"main"`) or from `package` (`"package::main"`, `"package::server::main"`) |
+| `entry` | an executable's entry function, required for one and not allowed in a library: a path in the package, bare (`"main"`) or from `package` (`"package::main"`, `"package::server::main"`) |
 | `source_root` | the directory of the sources, relative to the manifest; the default is `"src"` |
 | `link_flags` | an array of nonempty strings, each passed as one argument to the C compiler after the generated C and C sources, without a shell; the flags of every dependency are passed too, so a library can declare its own `-l` |
 | `c_sources` | an array of C source paths, relative to the package, compiled with the generated C into every executable that depends on the package |
 | `[dependencies.NAME]` | a dependency, imported as `NAME` (`use NAME::module::Item;`); `path`, its only key, is its directory or its `kur.toml`, relative to the manifest |
 
-Any other key in the manifest or in `[package]` is an error (`.../kur.toml: unknown manifest key
-version`), as is a `kind` other than those two (`.../kur.toml: manifest kind must be "library" or
-"executable"`). The standard library is `std`, over `core`, `alloc` and `libc`, all in
+A manifest is checked when it is read, before its sources or its dependencies are. Any other key
+in the manifest, in `[package]` or in a dependency's table is an error (`.../kur.toml: unknown
+manifest key version`), as are a `kind` other than those two (`.../kur.toml: manifest kind must be
+"library" or "executable"`) and an `entry` in a library (`.../kur.toml: manifest entry is only for
+kind "executable"`). The standard library is `std`, over `core`, `alloc` and `libc`, all in
 [`lib/`](lib/); a package that needs `core` alone depends on it directly, as
 [`examples/core_only`](examples/core_only/kur.toml) does.
 
 ## API documentation
 
-`kursal doc` generates the pages of a Krayon site from a package's public modules, `//!`
+`kursal doc` generates the content of a documentation site from a package's public modules, `//!`
 module comments, `///` item comments, and declaration signatures; the site's configuration and
-theme are in [`docs/site/`](docs/site/). Krayon, a static site generator written in Kursal, is
-built separately and must be on your `PATH`. For the standard library and its dependencies:
+theme are in [`docs/site/`](docs/site/). For the standard library and its dependencies:
 
 ```sh
 bin/kursal doc lib/std -o docs/generated/src

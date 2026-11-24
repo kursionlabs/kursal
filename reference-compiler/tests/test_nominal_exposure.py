@@ -61,7 +61,7 @@ class NominalExposureTests(unittest.TestCase):
         for scrutinee in ('e', '&e'):
             for arms in ('E::A => 7i32, E::B(n) => n as i32', '_ => 7i32'):
                 with self.subTest(scrutinee=scrutinee, arms=arms):
-                    self.reject('let e = make_e(); match ' + scrutinee + ' { ' + arms + ' }')
+                    self.reject('var e = make_e(); match ' + scrutinee + ' { ' + arms + ' }')
 
     def test_deferred_projection_still_checks_exposure(self):
         self.reject('let get = |x| x.n; get(make_s()) as i32')
@@ -107,16 +107,10 @@ class NominalExposureTests(unittest.TestCase):
                 fn callable() -> Callable { Callable.{ env: 7i32, code: code } }
             ''')
 
-    def test_try_requires_exposed_variants(self):
-        with self.assertRaisesRegex(InferError, 'not exposed'):
-            self.run_source('''use package::owner::Opt;
-                fn bad(x: Opt[u32]) -> Opt[u32] { let n = x?; x }
-                fn main() -> i32 { 7i32 }''', DECLS + 'forall T. enum Opt { Some(T), None }')
-
     def test_opaque_tag_inspection(self):
         for operand in ('e', '&e'):
             with self.subTest(operand=operand):
-                self.reject('let e = make_e(); let tag = core::mem::enum_variant(' + operand + '); 7i32')
+                self.reject('var e = make_e(); let tag = core::mem::enum_variant(' + operand + '); 7i32')
 
     def test_core_tag_inspection_requires_exposure(self):
         from kursal import core as C

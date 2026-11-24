@@ -187,7 +187,11 @@ def load(path: str | Path) -> list[Package]:
             by_dir[root] = package.id
             config = _manifest(manifest)
             info = _table(config.get("package", {}), f"{manifest}: package")
-            unknown = set(config) - {"package", "dependencies"} | set(info) - {"name", "kind", "source_root", "entry", "link_flags", "c_sources"}
+            specs = {alias: _table(spec, f"{manifest}: {alias}")
+                     for alias, spec in _table(config.get("dependencies", {}), f"{manifest}: dependencies").items()}
+            unknown = (set(config) - {"package", "dependencies"}
+                       | set(info) - {"name", "kind", "source_root", "entry", "link_flags", "c_sources"}
+                       | {key for spec in specs.values() for key in spec if key != "path"})
             if unknown:
                 fail(f"{manifest}: unknown manifest key{'s' if len(unknown) > 1 else ''} {listed(sorted(unknown))}")
             package.name = _string(info, manifest, "name")
@@ -199,8 +203,9 @@ def load(path: str | Path) -> list[Package]:
                 fail(f"{manifest}: manifest kind must be \"library\" or \"executable\"")
             if kind == "executable":
                 package.entry = tuple(p for p in _string(info, manifest, "entry").split("::") if p != "package")
-            deps = {alias: (root / _string(_table(spec, f"{manifest}: {alias}"), manifest, "path")).resolve()
-                    for alias, spec in _table(config.get("dependencies", {}), f"{manifest}: dependencies").items()}
+            elif "entry" in info:
+                fail(f"{manifest}: manifest entry is only for kind \"executable\"")
+            deps = {alias: (root / _string(spec, manifest, "path")).resolve() for alias, spec in specs.items()}
         for alias, target in (deps or {}).items():
             manifest_path = target if target.suffix == ".toml" else target / "kur.toml"
             package.deps[alias] = add(manifest_path)
@@ -295,8 +300,6 @@ class Resolver:
                  S.Extern: "extern", S.TraitDecl: "trait", S.Const: "const"}
         for item in items:
             match item:
-                case S.Module():
-                    self.report(ResolveError("package sources do not declare `module`", item.pos), module)
                 case S.Use():
                     self.use(scope, (), item.tree, item.export)
                 case S.InstanceDecl():
@@ -358,12 +361,22 @@ class Resolver:
                 owner = None  # a blanket impl: its methods are found by method calls only
             else:
                 owner = self.impl_owner(scope.module, target)
+            self.impl_home(scope.module, owner, target)
             for member in item.items:
                 kind = "method" if isinstance(member, S.Fn) else "const"
                 decl = Decl(kind, scope.module, f"{target.path[-1]}::{member.name}", member, item)
                 with self.reporting(scope.module, member.pos):
                     self.declare(scope, decl)
                     self.attached.setdefault((owner, member.name), []).append(decl)
+
+    def impl_home(self, module: ModuleId, owner: Optional[Decl | str], target: S.TName) -> None:
+        """An inherent impl is in the package that declares its type, and one of a primitive or builtin type
+        is in core: no other package adds a method to a type, which could clash with the type's own."""
+        if isinstance(owner, str) and self.packages[module.package].name != CORE:
+            self.report(ResolveError(f"an inherent impl of {owner} belongs in core", target.pos), module)
+        if isinstance(owner, Decl) and owner.module.package != module.package:
+            self.report(ResolveError(f"an inherent impl of {owner.name} belongs in the package that declares it",
+                                     target.pos), module)
 
     def impl_owner(self, module: ModuleId, target: S.TName) -> Optional[Decl | str]:
         """What `impl target` gives methods. When `target` names nothing but its other spelling names a type,
@@ -669,8 +682,6 @@ class Names:
         if isinstance(item, S.Use):
             self.use(item.tree, (), item.export)
             return
-        if isinstance(item, S.Module):
-            return
         forall = item.forall
         types = types | self.params(forall)
         self.premises(forall, types)
@@ -862,6 +873,13 @@ class Names:
             case S.For(iterator=iterator, body=body, name=name):
                 walk(iterator)
                 self.expr(body, types, values | {name})
+            case S.Call(callee=callee, args=args, construct=construct):
+                walk(callee)
+                for arg in args:
+                    walk(arg)
+                if isinstance(callee, S.Path):
+                    with self.reporting():
+                        self.construction(callee, construct)
             case S.Lit():
                 pass
             case S.Binop():
@@ -891,11 +909,6 @@ class Names:
                 if ty is not None:
                     self.type(ty, types)
                 return values | bound(pattern)
-            case S.Var(name=name, type=ty, value=value):
-                self.expr(value, types, values)
-                if ty is not None:
-                    self.type(ty, types)
-                return values | {name}
             case S.Const(name=name, type=ty, value=value):
                 self.type(ty, types)
                 self.expr(value, types, values)
@@ -931,6 +944,17 @@ class Names:
                 if isinstance(target, ModuleId):
                     fail(f"{'::'.join(names)} is a module, not a value", expr.pos)
                 expr.ref = target if isinstance(target, tuple) else ("decl", target)
+
+    def construction(self, callee: S.Path, construct: bool) -> None:
+        """`Name.(args)` constructs a tuple or a variant, which a call `Name(args)` never does."""
+        ref, name = callee.ref, "::".join(callee.names)
+        if ref is None:
+            return
+        constructor = ref[0] == "variant" or ref[0] == "decl" and ref[1].kind == "tuple"
+        if constructor and not construct:
+            fail(f"`{name}` is a constructor; write `{name}.(...)`", callee.pos)
+        if construct and not constructor:
+            fail(f"`{name}` is not a tuple or an enum variant; write `{name}(...)`", callee.pos)
 
     def variant(self, path: S.Path) -> None:
         target = self.r.lookup(self.module, path.names, path.pos)
@@ -970,8 +994,6 @@ def children(expr: S.Expr) -> Sequence[S.Expr]:
             return [pointer, value]
         case S.Field(value=value) | S.Index(value=value) | S.Try(value=value):
             return [value]
-        case S.Call(callee=callee, args=args):
-            return [callee, *args]
     raise AssertionError(f"Names.expr takes a {type(expr).__name__} apart itself")
 
 

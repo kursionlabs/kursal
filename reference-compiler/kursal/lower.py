@@ -34,7 +34,7 @@ from .infer import (POINTER_OPS, BuiltinCall, ClosureCall, FnCall, FStringWrite,
                     TraitCall, TupleCall, ValueCall, VariantCall)
 from .sexpr import KursError, List, Position, Str
 from .sigs import OPERATORS, ConstValue, OpConst, Sig, Signatures
-from .resolve import Resolver
+from .resolve import Resolver, listed
 from .types import apart, brand_name, equal, foreach_item, mapped_component, mapped_operand, Surface, Types, free_brands, subst
 
 ORDERINGS = {"Relaxed": "relaxed", "Acquire": "acquire", "Release": "release", "AcqRel": "acq_rel",
@@ -104,6 +104,8 @@ class Lowering:
         self.datas: dict[bytes, str] = {}
         self.closures = count()
         self.value_types: dict[int, dict[str, C.Type]] = {}
+        # Each function's blocks where paths meet: label -> where in the source, for place-flow messages.
+        self.sites: dict[int, dict[str, str]] = {}
 
     def library_name(self, name: str, module: C.ModuleId) -> str:
         return self.sigs.name(self.sigs.library(module, name))
@@ -144,7 +146,7 @@ class Lowering:
 
         def plan(fun: C.Fun, instance: Optional[C.Instance] = None) -> None:
             try:
-                flow.plan(fun, instance, diagnose=True)
+                flow.plan(fun, instance, diagnose=True, sites=self.sites.pop(id(fun), {}))
                 try:
                     helpers = promote_locals(fun, self.types, (instance.params if instance else ()) + fun.params,
                                              (instance.premises if instance else ()) + fun.premises,
@@ -251,6 +253,9 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         self.module = sig.module
         self.kinds: dict[str, C.Kind] = {p.name: p.kind for p in sig.params}
         self.blocks: list[BlockB] = []
+        # Where paths meet, for place-flow messages: a block's label, or `source>target` for one edge, ->
+        # where in the source.
+        self.sites: dict[str, str] = {}
         self.cur: Optional[BlockB] = None
         self.vty: dict[str, C.Type] = {}
         self.bindings: dict[BindingId, Binding] = {}
@@ -461,8 +466,18 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         finally:
             self.lend_frames.pop()
 
-    def arms(self, arms: Sequence[tuple[BlockB, Callable[[], Optional[str]]]], ty: C.Type) -> Optional[str]:
-        """Run each arm in its block; the arms that finish meet in a join block taking their results."""
+    def here(self) -> str:
+        line, col = self.pos or (0, 0)
+        return f"{line}:{col}"
+
+    def loop_sites(self, head: BlockB) -> None:
+        """The edges into a loop's `head`: the one from the current block starts the loop, the others repeat it."""
+        self.sites[f"{self.current.label}>{head.label}"] = f"where the loop at {self.here()} starts, but not when it repeats"
+        self.sites[head.label] = f"when the loop at {self.here()} repeats, but not where it starts"
+
+    def arms(self, arms: Sequence[tuple[BlockB, Callable[[], Optional[str]]]], ty: C.Type, what: str) -> Optional[str]:
+        """Run each arm in its block; the arms that finish meet in a join block taking their results, the end
+        of the `what` at the current position."""
         outer, mapping, ends = list(self.open_brands), dict(self.brand_map), []
         for block, body in arms:
             self.start(block)
@@ -475,6 +490,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
             self.cur = None
             return None
         join = self.new_block([(self.fresh("r"), self.substitute_type(ty))], "join")
+        self.sites[join.label] = f"on some paths to the end of the `{what}` at {self.here()}"
         for block, result in ends:
             self.cur = block
             self.jump(join, (result,))
@@ -568,6 +584,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         brands = {p.name for p in sig.params if p.kind == C.BRAND}
         if any(not free_brands(t) <= brands for _, t in self.locals):
             self.lowering.value_types[id(fun)] = dict(self.vty)
+        self.lowering.sites[id(fun)] = self.sites
         return fun
 
     def identity_args(self) -> tuple[C.Type, ...]:
@@ -689,7 +706,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
             c = self.const(operands[0])
             right = lambda: self.const(operands[1])
             constant = lambda: self.emit("const", C.BOOL, ty=C.BOOL, lit="false" if op == "and" else "true")
-            result = self.branch(c, right, constant, C.BOOL) if op == "and" else self.branch(c, constant, right, C.BOOL)
+            result = self.branch(c, right, constant, C.BOOL, "&&") if op == "and" else self.branch(c, constant, right, C.BOOL, "||")
             assert result is not None
             return result
         args = tuple(self.const(operand) for operand in operands)
@@ -737,8 +754,8 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         lit = "false" if expr.op == "&&" else "true"
         constant = lambda: self.emit("const", C.BOOL, ty=C.BOOL, lit=lit)
         if expr.op == "&&":
-            return self.branch(c, lambda: self.expr(expr.right), constant, C.BOOL)
-        return self.branch(c, constant, lambda: self.expr(expr.right), C.BOOL)
+            return self.branch(c, lambda: self.expr(expr.right), constant, C.BOOL, "&&")
+        return self.branch(c, constant, lambda: self.expr(expr.right), C.BOOL, "||")
 
     def expr_unary(self, expr: S.Unary) -> Optional[str]:
         op = expr.op
@@ -803,6 +820,8 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         # `emit` holds a cast to the core's rules for it (`memory_operation`); a package is opened or packed.
         if isinstance(src, C.Exists) or isinstance(dst, C.Exists):
             fail("a cast cannot consume or produce an outer existential package; use opening or packing", expr.pos)
+        if not self.authorized(expr):
+            fail("a safe `as` converts only between number types and from a NonNull to its pointer; any other cast reinterprets bits and needs unsafe", expr.pos)
         return self.emit("cast", dst, (v,), ty=dst, node=expr)
 
     def expr_unsafe_store(self, expr: S.UnsafeStore) -> Optional[str]:
@@ -1045,10 +1064,11 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         return "/".join(orders)
 
     # ---- control flow
-    def branch(self, cond: str, then_fn: Callable[[], Optional[str]], else_fn: Callable[[], Optional[str]], ty: C.Type) -> Optional[str]:
+    def branch(self, cond: str, then_fn: Callable[[], Optional[str]], else_fn: Callable[[], Optional[str]], ty: C.Type,
+               what: str) -> Optional[str]:
         a, b = self.new_block(), self.new_block()
         self.terminate(C.Jnz(cond, self.edge(a), self.edge(b), self.pos))
-        return self.arms([(a, then_fn), (b, else_fn)], ty)
+        return self.arms([(a, then_fn), (b, else_fn)], ty, what)
 
     def expr_if(self, expr: S.If) -> Optional[str]:
         c = self.expr(expr.cond)
@@ -1056,7 +1076,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
             return None
         other_expr = expr.other
         other = (lambda: self.expr(other_expr)) if other_expr is not None else self.unit
-        return self.branch(c, lambda: self.expr(expr.then), other, expr.ty)
+        return self.branch(c, lambda: self.expr(expr.then), other, expr.ty, "if")
 
     def expr_return(self, expr: S.Return) -> Optional[str]:
         v = self.expr(expr.value) if expr.value is not None else self.unit()
@@ -1067,6 +1087,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
 
     def expr_while(self, expr: S.While) -> Optional[str]:
         head = self.new_block(hint="while")
+        self.loop_sites(head)
         self.jump(head)
         self.start(head)
         c = self.expr(expr.cond)
@@ -1090,6 +1111,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         iterator_ty, item = [self.substitute_type(a) for a in call.targs]
         option = self.substitute_type(expr.option)
         head = self.new_block(hint="for")
+        self.loop_sites(head)
         self.jump(head)
         self.start(head)
         step = self.emit("trait_call", option, (call.trait, call.method, path), tys=(iterator_ty, item))
@@ -1203,8 +1225,9 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
                     assert isinstance(name, str)
                     self.discard_pattern(variants[name])
             resolved.append(names)
-        if seen != set(variants):
-            fail("a match must cover every enum variant", expr.pos)
+        missing = [name for name in variants if name not in seen]
+        if missing:
+            fail(f"a match must cover every enum variant; it misses {listed(missing)}", expr.pos)
         return resolved
 
     def expr_match(self, expr: S.Match) -> Optional[str]:
@@ -1251,7 +1274,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
                 self.bind_payload(case, place or block.params[0][0], lent=bool(place))
             return self.scoped(lambda: self.expr(arm.body))
         return self.arms([(block, partial(body, arm, block)) for arm, block in zip(expr.arms, blocks)],
-                         expr.ty)
+                         expr.ty, "match")
 
     def bind_payload(self, case: S.Case, payload: str, lent: bool = False) -> None:
         """Bind the whole payload or its components, by value or by place alias."""
@@ -1340,6 +1363,8 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
             if values is None:
                 return None
             writer, v = values
+            if not lend and not self.copy(self.vty[v]):
+                fail("{x} in an f-string drops a linear value; lend it with {&x}", part.pos)
             vty, pair = self.vty[v], C.Tuple((self.vty[v], wty))
             both = self.emit("trait_call", pair, (fmt, "format", v, writer), tys=(vty, wty))
             (v2, _), (writer, _) = self.destruct(both, pair)
@@ -1373,11 +1398,6 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
     def lower_stmt(self, stmt: S.Statement) -> None:
         if isinstance(stmt, S.Let):
             return self.let(stmt)
-        if isinstance(stmt, S.Var):
-            v = self.expr(stmt.value)
-            if v is not None:
-                self.declare(stmt.binder, stmt.name, self.vty[v], v)
-            return
         if isinstance(stmt, S.Const):
             assert stmt.folded[2] is not None
             self.declare(stmt.binder, stmt.name, stmt.folded[2], self.const(stmt.folded))

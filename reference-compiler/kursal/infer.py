@@ -30,7 +30,7 @@ from . import core as C
 from . import syntax as S
 from .resolve import Decl, ResolveError, Resolver, listed
 from .sigs import InstanceSig, Scope, Sig, Signatures
-from .sexpr import KursError, Position
+from .sexpr import KursError, Position, counted
 from .types import (POINTER_TO_SUM, Surface, Types, brand_differences, brand_name, equal, free_brands, free_names, made_from,
                     mapped_component, subst)
 from .termination import check_instance_termination
@@ -264,7 +264,7 @@ class Infer:
             fail("a type here is not known yet; annotate it", pos)
         for m in self.literals:
             if isinstance(prune(m), Meta):
-                fail(f"a {'floating' if m.kind == 'float' else 'integer'} literal's type is not determined; write a suffix", m.pos)
+                fail(f"{'a float' if m.kind == 'float' else 'an integer'} literal's type is not determined; write a suffix", m.pos)
         for ty, allowed, pos in self.brand_checks:
             escaped = free_brands(zonk(ty)) - allowed
             if escaped:
@@ -434,7 +434,7 @@ class Infer:
             written = [zonk(a) for a in args]
             surface = Surface(written, self.origins, (trait,))
             shown = ", ".join(map(surface.show, written))
-            fail(f"{'no' if not found else 'several'} instance of {surface.name(trait)}[{shown}]", pos)
+            fail(f"{'no instance' if not found else 'several instances'} of {surface.name(trait)}[{shown}]", pos)
         inst, sub = found[0]
         for param in inst.params:
             sub.setdefault(param.name, Meta("brand" if param.kind == C.BRAND else "type"))
@@ -497,7 +497,7 @@ class Infer:
         return subst(self.sigs.type(type_expr, scope), {**binders, **self.brand_sub()})
 
     def argument(self, type_expr: S.Type, pos: Optional[Position]) -> C.Type:
-        """A type argument written at `pos`, which is never a foreach type (TY-FLAT)."""
+        """A type argument written at `pos`, which is never a foreach type."""
         ty = self.type(type_expr)
         if isinstance(ty, C.Foreach):
             fail("a type argument is a foreach type, which is only the type of a whole value, parameter or result", pos)
@@ -528,12 +528,8 @@ class Infer:
             case S.Let(pattern=pattern, type=ty, value=value, pos=pos):
                 want = self.type(ty) if ty is not None else None
                 got = self.check(value, want)
-                self.pattern(pattern, want or got, pos)
+                self.pattern(pattern, want or got, pos, stmt.mutable)
                 return isinstance(prune(got), C.Never)
-            case S.Var(name=name, type=ty, value=value):
-                want = self.type(ty) if ty is not None else None
-                got = self.check(value, want)
-                stmt.binder = self.bind(name, want or got, mutable=True).id
             case S.Const(name=name, type=ty, value=value):
                 want = self.type(ty)
                 stmt.folded = self.sigs.typed(name, value, want, self.module)
@@ -550,7 +546,7 @@ class Infer:
     def let_exists(self, stmt: S.Let) -> bool:
         package = self.shape(self.expr(stmt.value), stmt.pos)
         if not isinstance(package, C.Exists) or len(package.binders) != len(stmt.brands):
-            fail(f"let exists opens {len(stmt.brands)} brands of {self.shown(zonk(package))}", stmt.pos)
+            fail(f"let exists opens {counted(len(stmt.brands), 'brand')} of {self.shown(zonk(package))}", stmt.pos)
         names = tuple(b[1:] for b in stmt.brands)
         if len(set(names)) != len(names):
             fail("an existential opening repeats a brand name", stmt.pos)
@@ -565,7 +561,7 @@ class Infer:
         payload = subst(package.body, {b: C.Skolem(l) for b, l in zip(package.binders, labels)})
         if stmt.type is not None:
             self.unify(payload, self.type(stmt.type), stmt.pos)
-        self.pattern(stmt.pattern, payload, stmt.pos)
+        self.pattern(stmt.pattern, payload, stmt.pos, stmt.mutable)
         return False
 
     def pattern(self, pattern: S.Pattern, ty: C.Type, pos: Optional[Position], mutable: bool = False) -> None:
@@ -626,7 +622,12 @@ class Infer:
             case S.While():
                 return self.apply(((expr.cond, "bool"), (expr.body, "()")), "()", expr.pos)
             case S.If(other=None):
-                return self.apply(((expr.cond, "bool"), (expr.then, "()")), "()", expr.pos)
+                self.apply(((expr.cond, "bool"),), "()", expr.pos)
+                then = self.expr(expr.then)
+                if not isinstance(prune(then), C.Never) and not unify(then, C.UNIT):
+                    fail(f"an `if` without `else` has type (), but its block has type {self.shown(zonk(then))}", expr.pos)
+                self.solve()
+                return C.UNIT
             case S.If(other=other):
                 assert other is not None
                 return self.apply(((expr.cond, "bool"), (expr.then, "t"), (other, "t")), "t", expr.pos)
@@ -741,9 +742,12 @@ class Infer:
         """Each `{x}` of the f-string needs `Format[X, W]`, for `W` the `writer` it is written into."""
         fmt = self.library("Format")
         for part in expr.parts:
-            if not isinstance(part, str):
-                value = self.expr(part.operand if isinstance(part, S.Unary) and part.op == "&" else part)
-                self.require(fmt, [value, writer], part.pos)
+            if isinstance(part, str):
+                continue
+            lent = isinstance(part, S.Unary) and part.op == "&"
+            operand = part.operand if isinstance(part, S.Unary) and lent else part
+            value = self.place_type(operand, lend=True) if lent and self.is_place(operand) else self.expr(operand)
+            self.require(fmt, [value, writer], part.pos)
         return C.Named(self.library("Buffer!"))
 
     def expr_path(self, expr: S.Path) -> C.Type:
@@ -796,7 +800,7 @@ class Infer:
             mine, impl = explicit[impl_params:], explicit[:impl_params]
             params = next((ps for ps in (mine, impl + mine, impl) if len(ps) == len(own)), None)
             if params is None:
-                fail(f"{segments[-1][0]} takes {len(mine)} type arguments", path.pos)
+                fail(f"{segments[-1][0]} takes {counted(len(mine), 'type argument')}", path.pos)
             for p, a in zip(params, own):
                 if not isinstance(a, S.TIgnored) and a != S.TBrand("'_") and p.name in sub:
                     self.unify(sub[p.name], self.argument(a, path.pos), path.pos)
@@ -809,7 +813,7 @@ class Infer:
             if not isinstance(owner, Decl) or self.sigs.name(owner) != target.name:
                 fail("method type arguments belong on the impl type, not a namespace", path.pos)
             if len(segments[-2][1]) != len(target.args):
-                fail(f"the impl type qualifier takes {len(target.args)} type arguments", path.pos)
+                fail(f"the impl type qualifier takes {counted(len(target.args), 'type argument')}", path.pos)
             written = C.Named(target.name, tuple(self.argument(a, path.pos) for a in segments[-2][1]))
             self.unify(subst(target, sub), written, path.pos)
 
@@ -829,7 +833,7 @@ class Infer:
         td = self.sigs.types[self.sigs.name(decl)]
         self.require_visible_shape(C.Named(td.name), expr.pos)
         if len(written) > len(td.params):
-            fail(f"{td.name} accepts at most {len(td.params)} type arguments, got {len(written)}", expr.pos)
+            fail(f"{td.name} accepts at most {counted(len(td.params), 'type argument')}, got {len(written)}", expr.pos)
         sub = self.instantiate(td.params, Surface((), {}, (td.name,)).name(td.name), expr.pos)
         for p, a in zip(td.params, written):
             self.unify(sub[p.name], self.argument(a, expr.pos), expr.pos)
@@ -919,7 +923,7 @@ class Infer:
         iterator = expr.iterator
         if not (isinstance(iterator, S.Unary) and iterator.op == "&"):
             fail("a for loop lends its iterator: `for x in &it`", expr.pos)
-        it, item = self.place_type(iterator.operand), Meta()
+        it, item = self.place_type(iterator.operand, lend=True), Meta()
         expr.next_call = TraitCall(self.library("Iterator"), "next", (it, item))
         self.require(expr.next_call.trait, expr.next_call.targs, expr.pos)
         expr.option = C.Named(self.library("Option"), (item,))
@@ -942,7 +946,7 @@ class Infer:
         expr.lent = isinstance(scrutinee, S.Unary) and scrutinee.op == "&" and self.is_place(scrutinee.operand)
         if expr.lent:
             assert isinstance(scrutinee, S.Unary)
-            ty = self.place_type(scrutinee.operand)
+            ty = self.place_type(scrutinee.operand, lend=True)
         else:
             ty = self.expr(scrutinee)
         self.later(ty, lambda: self.require_visible_shape(ty, expr.pos), expr.pos)
@@ -994,7 +998,7 @@ class Infer:
         elif isinstance(payload, C.Tuple) and len(payload.elems) == len(binders):
             types = list(payload.elems)
         else:
-            fail(f"variant {name} does not carry {len(binders)} values", pos)
+            fail(f"variant {name} does not carry {counted(len(binders), 'value')}", pos)
         case.binder_ids = [None if b == "_" else self.bind(b, t, mutable=lent).id for b, t in zip(binders, types)]
 
     def expr_closure(self, expr: S.Closure) -> C.Type:
@@ -1113,7 +1117,7 @@ class Infer:
         return self.projection(expr)
 
     def expr_try(self, expr: S.Try) -> C.Type:
-        """`x?` unwraps success or returns failure from the same Option/Result family."""
+        """`x?` unwraps success or returns failure, from core's Option or Result."""
         operand, returned, result = self.expr(expr.value), self.returns[-1], Meta()
         self.wait(lambda: not isinstance(prune(operand), Meta) and not isinstance(prune(returned), Meta),
                   lambda: self.unify(result, self.resolve_try(expr, operand, returned)), expr.pos)
@@ -1123,24 +1127,19 @@ class Infer:
         operand, returned = zonk(operand), zonk(returned)
         family = self.family(operand)
         if family is None or self.family(returned) != family or not isinstance(operand, C.Named) or not isinstance(returned, C.Named) or operand.name != returned.name:
-            fail("? needs the operand and the function result to be the same direct Option/Result type", expr.pos)
+            fail("? needs the operand and the function result to be the same Option or Result of core::option", expr.pos)
         variants, other = self.variants_of(operand), self.variants_of(returned)
-        self.require_visible_shape(operand, expr.pos)
-        self.require_visible_shape(returned, expr.pos)
         ok, error = ("Ok", "Err") if family == "result" else ("Some", "None")
         self.unify(variants[error], other[error], expr.pos)
         expr.kind = family
         return variants[ok]
 
     def family(self, ty: C.Type) -> Optional[Literal["option", "result"]]:
-        if not isinstance(ty, C.Named) or ty.name not in self.types.program.types:
-            return None
-        body = self.types.program.types[ty.name].body
-        names = {n for n, _ in body.variants} if isinstance(body, C.Enum) else set()
-        if names == {"Ok", "Err"}:
-            return "result"
-        if names == {"Some", "None"}:
+        """`option` for core's Option and `result` for its Result, the types `?` takes apart; None for any other."""
+        if isinstance(ty, C.Named) and ty.name == "core::option::Option":
             return "option"
+        if isinstance(ty, C.Named) and ty.name == "core::option::Result":
+            return "result"
         return None
 
     def variants_of(self, ty: C.Named) -> dict[str, C.Type]:
@@ -1149,27 +1148,32 @@ class Infer:
         return {n: subst(f, {p.name: a for p, a in zip(td.params, ty.args)}) for n, f in td.body.variants}
 
     # ---- places
-    def place_type(self, expr: S.Expr, assign: bool = False) -> C.Type:
-        """The type of a place expression: a local, or fields and tuple elements of one."""
+    def place_type(self, expr: S.Expr, assign: bool = False, lend: bool = False) -> C.Type:
+        """The type of a place expression: a local, or fields and tuple elements of one. A place that is
+        assigned or lent is rooted at a var, a place parameter or a binder of a lent match case, bound in
+        the function, closure or foreach body it is written in: such a body holds a copy of what it
+        captures."""
         match expr:
             case S.Path(ref=("local", name)):
                 local = self.lookup(name)
                 if local is None:
                     fail(f"unknown local {name}", expr.pos)
-                if assign and not local.mutable:
-                    fail(f"{name} is not a var", expr.pos)
+                if (assign or lend) and not local.mutable:
+                    fail(f"{name} is not a var; a lent place must be a var" if lend else f"{name} is not a var", expr.pos)
+                if (assign or lend) and local.depth != len(self.frames) - 1:
+                    fail(f"{name} is captured as a copy, which cannot be {'lent' if lend else 'assigned'}", expr.pos)
                 expr.binder = local.id
                 return self.record(expr, local.type)
             case S.Field() | S.Index():
-                return self.projection(expr, assign)
+                return self.projection(expr, assign, lend)
         if assign:
             fail("not an assignable place", expr.pos)
         return self.expr(expr)
 
-    def projection(self, expr: S.Field | S.Index, assign: bool = False) -> C.Type:
+    def projection(self, expr: S.Field | S.Index, assign: bool = False, lend: bool = False) -> C.Type:
         """The type of `owner.name` or `owner.N`; an owner that is a place is typed as one, so that an
         assignment is checked down to its root local."""
-        owner = self.place_type(expr.value, assign) if self.is_place(expr.value) else self.expr(expr.value)
+        owner = self.place_type(expr.value, assign, lend) if self.is_place(expr.value) else self.expr(expr.value)
         result = Meta()
 
         def component() -> None:
@@ -1213,7 +1217,7 @@ class Infer:
                     td, sub, result = self.construct(expr, decl, self.path_arguments(callee, decl))
                     assert isinstance(td.body, C.Tuple)
                     if len(expr.args) != len(td.body.elems):
-                        fail(f"{td.name} has {len(td.body.elems)} elements", expr.pos)
+                        fail(f"{td.name} has {counted(len(td.body.elems), 'element')}", expr.pos)
                     for a, t in zip(expr.args, td.body.elems):
                         self.check(a, subst(t, sub))
                     expr.call = TupleCall()
@@ -1267,13 +1271,13 @@ class Infer:
             case S.Unary(op="&", operand=S.Unary(op="*", operand=pointer)):       # `&*p`: a raw pointer's target
                 return self.record(arg, self.pointee(self.expr(pointer), arg.pos)), True
             case S.Unary(op="&", operand=target) if self.is_place(target):
-                return self.record(arg, self.place_type(target)), True
+                return self.record(arg, self.place_type(target, lend=True)), True
         return self.expr(arg), False
 
     def bind_operands(self, expr: S.Call, got: Sequence[Optional[Operand]], ptypes: Sequence[C.Type], places: Set[int]) -> None:
         """Hold the operands to the parameters: the count, the `&` modes, the types. A method's receiver is `None`."""
         if len(got) != len(ptypes):
-            fail(f"expected {len(ptypes)} arguments, got {len(got)}", expr.pos)
+            fail(f"expected {counted(len(ptypes), 'argument')}, got {len(got)}", expr.pos)
         for k, (operand, want) in enumerate(zip(got, ptypes)):
             if operand is not None:
                 operand_ty, lends_place = operand
@@ -1296,7 +1300,7 @@ class Infer:
         trait = self.sigs.traits[self.sigs.name(trait_decl)]
         written = self.path_arguments(callee, trait_decl, member=True)
         if len(written) > len(trait.params):
-            fail(f"{trait.name} accepts at most {len(trait.params)} type arguments, got {len(written)}", expr.pos)
+            fail(f"{trait.name} accepts at most {counted(len(trait.params), 'type argument')}, got {len(written)}", expr.pos)
         targs = [Meta("brand" if kind == C.BRAND else "type") for kind in trait.param_kinds]
         for t, a in zip(targs, written):
             if not isinstance(a, S.TIgnored):
@@ -1334,14 +1338,14 @@ class Infer:
         if len(expr.args) != BUILTIN_ARITY[name]:
             if name == "fence":
                 fail("fence takes one ordering argument", expr.pos)
-            fail(f"{name} takes {BUILTIN_ARITY[name]} value arguments", expr.pos)
+            fail(f"{name} takes {counted(BUILTIN_ARITY[name], 'value argument')}", expr.pos)
         assert isinstance(expr.callee, S.Path)
         targs = expr.callee.segments[-1][1]
         if any(args for _, args in expr.callee.segments[:-1]):
             fail(f"type arguments belong on {name}, not a namespace", expr.pos)
         expected_types = 1 if name in ("alloca", "sizeof") else 0
         if len(targs) != expected_types:
-            fail(f"{name} takes {expected_types} type arguments", expr.pos)
+            fail(f"{name} takes {counted(expected_types, 'type argument')}", expr.pos)
         expr.call = BuiltinCall(name)
         match name:
             case "fresh":
@@ -1356,7 +1360,7 @@ class Infer:
                 if isinstance(arg, S.Unary) and arg.op == "&":
                     if not self.is_place(arg.operand):
                         fail("enum_variant(&place) requires a place", arg.pos)
-                    operand = self.record(arg, self.place_type(arg.operand))
+                    operand = self.record(arg, self.place_type(arg.operand, lend=True))
                 else:
                     operand = self.expr(arg)
 
@@ -1398,7 +1402,7 @@ class Infer:
             return out
         if lent_receiver and not self.is_place(receiver):
             fail("& lends a local or a field of one", expr.pos)
-        receiver_ty = self.place_type(receiver) if lent_receiver else self.expr(receiver)
+        receiver_ty = self.place_type(receiver, lend=True) if lent_receiver else self.expr(receiver)
         actual = Receiver(receiver, lent_receiver)
         got, result = [None] + self.operands(expr.args), Meta()
         self.later(receiver_ty, lambda: self.unify(result, self.resolve_method(expr, receiver_ty, name, actual, got), expr.pos), expr.pos)
@@ -1454,9 +1458,23 @@ class Infer:
                           if self.inputs.get(n) == 1 and self.decl_of[n] in visible and any(m.name == name for m in tr.methods)]
             candidates.extend(("method", self.sigs.sigs[d]) for d in self.r.attached.get((None, name), [])
                               if d.kind == "method" and self.blanket_visible(d, visible))
-        if len(candidates) != 1:
-            fail(f"{self.shown(t)} has {'no' if not candidates else 'several'} method {name}", pos)
+        if len(candidates) > 1:
+            fail(f"{self.shown(t)} has several methods named {name}", pos)
+        if not candidates:
+            fail(f"{self.shown(t)} has no method {name}{self.import_hint(name)}", pos)
         return candidates[0]
+
+    def import_hint(self, name: str) -> str:
+        """For a method no visible trait provides: the traits of one input that provide it but are not
+        visible in the calling module, to import."""
+        visible = self.visible_traits(self.module)
+        hidden = sorted({self.decl_of[n].name for n, tr in self.sigs.traits.items()
+                         if self.inputs.get(n) == 1 and self.decl_of[n] not in visible and any(m.name == name for m in tr.methods)})
+        if not hidden:
+            return ""
+        if len(hidden) == 1:
+            return f"; the trait {hidden[0]} provides it, import it"
+        return f"; the traits {listed(hidden)} provide it, import one"
 
     def visible_traits(self, module: C.ModuleId) -> set[Decl]:
         """The traits a name in `module`'s scope resolves to: declared, imported by name or glob, or
@@ -1515,7 +1533,7 @@ class Infer:
         """A pointer operation: its operands held to their types, once the pointee is known."""
         params, result = POINTER_OPS[name]
         if len(operands) != len(params):
-            fail(f"{name} takes {len(params)} arguments", expr.pos)
+            fail(f"{name} takes {counted(len(params), 'argument')}", expr.pos)
         out = Meta()
 
         def known() -> None:

@@ -102,6 +102,14 @@ class GraphTests(unittest.TestCase):
             ('[package]\nname="p"\nsyntax=12\nversion="1"\n[extra]\n', "unknown manifest keys extra, syntax and version"),
             ('dependencies=[]\n[package]\nname="p"\nsource_root="."\n', "dependencies: expected a table"),
             (manifest("p") + '[dependencies.x]\npath=3\n', "manifest path must be a string"),
+            # A dependency names only its path, and the manifest is rejected before the dependency is read.
+            (manifest("p") + '[dependencies.x]\npath="../missing"\nversion="1"\n', "unknown manifest key version"),
+            ('[package]\nname="p"\nedition=1\n[dependencies.x]\npath="../missing"\noptional=true\n',
+             "unknown manifest keys edition and optional"),
+            # Only an executable has an entry.
+            ('[package]\nname="p"\nsource_root="."\nentry="package::main"\n', 'manifest entry is only for kind "executable"'),
+            ('[package]\nname="p"\nsource_root="."\nkind="library"\nentry="package::main"\n[dependencies.x]\npath="../missing"\n',
+             'manifest entry is only for kind "executable"'),
             ('[package]\nname="p"\nsource_root="."\nlink_flags="-lm"\n', f"manifest {flags}"),
             ('[package]\nname="p"\nsource_root="."\nlink_flags=["-lm", 3]\n', f"manifest {flags}"),
             ('[package]\nname="p"\nsource_root="."\nlink_flags=[""]\n', f"manifest {flags}"),
@@ -159,10 +167,6 @@ class GraphTests(unittest.TestCase):
                      "b/kur.toml": manifest("b", ["a"]), "b/lib.kur": ""})
         with self.assertRaises(ResolveError):
             resolve(root / "a")
-
-    def test_module_directive_rejected(self):
-        with self.assertRaisesRegex(ResolveError, "1:1: package sources do not declare `module`$"):
-            resolve(tree({"p/kur.toml": manifest("p"), "p/lib.kur": "module x;\n"}) / "p")
 
     def test_entry(self):
         root = tree({"p/kur.toml": manifest("p", entry="package::run::main"), "p/lib.kur": "",
@@ -254,6 +258,36 @@ class NameTests(unittest.TestCase):
     def test_struct_literal_needs_a_struct(self):
         with self.assertRaises(ResolveError):
             resolve(app("use lib::shapes::make;\nfn f() -> u32 { make.{ x: 1u32 } }\n"))
+
+    def test_an_inherent_impl_is_in_the_package_of_its_type(self):
+        resolve(app("struct Mine { x: u32 }\nimpl Mine { fn get(self) -> u32 { 0u32 } }\n"
+                    "trait Show { fn show(x: Self) -> u32; }\nforall M where Show[M]. impl M { fn twice(self) -> u32 { 0u32 } }\n"))
+        cases = (
+            ("use lib::shapes::Point;\nimpl Point { fn other(self) -> u32 { 0u32 } }\n",
+             "2:6: an inherent impl of Point belongs in the package that declares it$"),
+            ("impl u32 { fn twice(self) -> u32 { self } }\n", "1:6: an inherent impl of u32 belongs in core$"),
+        )
+        for source, message in cases:
+            with self.subTest(source=source), self.assertRaisesRegex(ResolveError, message):
+                resolve(app(source))
+
+    def test_only_a_tuple_or_a_variant_is_constructed_and_never_called(self):
+        pair = {"app/a.kur": "tuple Pair(u32, u32);\n"}
+        resolve(app("use package::a::Pair;\nuse lib::shapes::{Shape, make};\n"
+                    "fn f() -> Pair { let s = Shape::Dot.(make(1u32)); Pair.(1u32, 2u32) }\n", pair))
+        cases = (
+            ("use package::a::Pair;\nfn f() -> Pair { Pair(1u32, 2u32) }\n",
+             "2:18: `Pair` is a constructor; write `Pair\\.\\(\\.\\.\\.\\)`$"),
+            ("use lib::shapes;\nfn f(p: shapes::Point) -> u32 { let s = shapes::Shape::Dot(p); 0u32 }\n",
+             "2:41: `shapes::Shape::Dot` is a constructor; write `shapes::Shape::Dot\\.\\(\\.\\.\\.\\)`$"),
+            ("use lib::shapes::make;\nfn f() -> u32 { let p = make.(1u32); 0u32 }\n",
+             "2:25: `make` is not a tuple or an enum variant; write `make\\(\\.\\.\\.\\)`$"),
+            ("fn f(g: fn(u32) -> u32) -> u32 { g.(1u32) }\n",
+             "1:34: `g` is not a tuple or an enum variant; write `g\\(\\.\\.\\.\\)`$"),
+        )
+        for source, message in cases:
+            with self.subTest(source=source), self.assertRaisesRegex(ResolveError, message):
+                resolve(app(source, pair))
 
 
 def error_of(path):

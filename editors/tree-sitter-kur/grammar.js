@@ -4,8 +4,8 @@
  * The reference parser, `reference-compiler/kursal/parser.py`, decides what is accepted; this grammar
  * follows its productions for editor parsing and highlighting. It accepts a superset where a rejection
  * takes more than a program's shape: a chained comparison, `p.0.1`, an assignment to something that
- * is not a place, and a `match` arm whose body is not a block with no comma before the next arm parse
- * here and are rejected by the compiler.
+ * is not a place, a `match` arm whose body is not a block with no comma before the next arm, and the
+ * reserved word `module` used as a name parse here and are rejected by the compiler.
  */
 
 function commaSep1(rule) {
@@ -65,7 +65,6 @@ module.exports = grammar({
 
     _item: $ => choice(
       $.use_declaration,
-      $.module_declaration,
       $.struct_declaration,
       $.tuple_declaration,
       $.enum_declaration,
@@ -107,8 +106,6 @@ module.exports = grammar({
       ))),
       optional(seq('as', field('alias', $.identifier), linear())),
     ),
-
-    module_declaration: $ => seq('module', field('path', $.path), ';'),
 
     path: $ => seq($.identifier, repeat(seq('::', $.identifier))),
 
@@ -208,7 +205,6 @@ module.exports = grammar({
 
     instance_declaration: $ => seq(
       optional($.forall_clause),
-      optional('unsafe'),
       'instance',
       field('trait', $._type),
       '{',
@@ -335,9 +331,11 @@ module.exports = grammar({
       ';',
     ),
 
+    // A `var` binds what a `let` binds, and every name it binds is a var.
     var_statement: $ => seq(
       'var',
-      field('name', $.identifier),
+      optional(seq('exists', brandList($), '.')),
+      field('pattern', $._pattern),
       optional(seq(':', field('type', $._type))),
       '=',
       field('value', $._expression),

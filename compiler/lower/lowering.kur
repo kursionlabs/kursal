@@ -18,7 +18,7 @@ use std::collections::arena_vec::ArenaVec;
 use std::collections::arena_map::{ArenaMap, ArenaSet};
 use std::mem::Ref;
 use std::raw::Span;
-use std::arena::{Domain!, seed};
+use std::arena::{Domain!, ref_in, seed};
 use std::buffer::Buffer!;
 use package::check::checker::{checked_only, contains, function_types, is_never, overlap, pointer_cast_fits};
 use package::kurs::core::{Block, Data, Edge, Extern, FnType, Fun, Instance, Instr, Kind, ModuleId, Param, Program, Terminator, Type};
@@ -27,7 +27,7 @@ use package::infer::inference::{Callee, Capture, Results, infer, pointer_params}
 use package::types::literals::valid_literal;
 use package::lower::placeflow::PlaceFlow;
 use package::lower::promote::promote_locals;
-use package::resolve::resolver::{NameRef, Named, Resolver};
+use package::resolve::resolver::{NameRef, Named, Resolver, listed};
 use package::kurs::sexpr::{Form, FormKind};
 use package::sigs::signatures::{ConstValue, Sig, Signatures, binop_name, const_type, int_text};
 use package::syntax::ast as S;
@@ -149,6 +149,8 @@ exposed struct Lowering {
     closures: Ref[u64, 'k],
     // a function with branded locals (by `fun_key`) -> the types of its SSA values, for promotion
     value_types: ArenaMap[usize, ArenaMap[Span['k], Type['k], 'k], 'k],
+    // a function (by `fun_key`) -> where its paths meet in the source (`FnLower::sites`)
+    sites: ArenaMap[usize, ArenaMap[Span['k], Span['k], 'k], 'k],
 }
 
 // `fun` with each package binder of a type it writes that would shadow a brand of `fun` renamed
@@ -398,12 +400,13 @@ impl Lowering['k] {
             },
             None => false,
         };
-        flow.plan(&cx, fun, outer);
+        let key = fun_key(fun);
+        flow.plan(&cx, fun, outer, self.sites.get_or(&cx, key, ArenaMap::new(&cx)));
+        self.sites.remove(&cx, key);
         let params = outer.clone(&cx);
         params.append(&cx, fun.params);
         let premises = outer_premises.clone(&cx);
         premises.append(&cx, fun.premises);
-        let key = fun_key(fun);
         let value_types = self.value_types.get_or(&cx, key, ArenaMap::new(&cx));
         self.value_types.remove(&cx, key);
         let helpers = promote_locals(&cx, fun, self.types, params, premises, value_types, self.r, self.counter);
@@ -432,7 +435,7 @@ impl Lowering['k] {
         let item = Form.{ kind: FormKind::Str, text: bytes, items: ArenaVec::new(&cx), pos: no_pos() };
         let init = Form.{ kind: FormKind::List, text: Span::from_static(&cx, ""), items: ArenaVec::one(&cx, item), pos: no_pos() };
         self.datas.insert(&cx, bytes, label);
-        self.program.datas.insert(&cx, label, Data.{ name: label, ty: Type::Array.(Ref::new(&cx, C::prim(&cx, "u8")), bytes.len() as u64), init, home: Option::None });
+        self.program.datas.insert(&cx, label, Data.{ name: label, ty: Type::Array.(ref_in(&cx, C::prim(&cx, "u8")), bytes.len() as u64), init, home: Option::None });
         (label, bytes.len())
     }
 }
@@ -565,6 +568,9 @@ exposed struct FnLower {
     lend_frames: ArenaVec[ArenaVec[Span['k], 'k], 'k],
     n: Ref[u64, 'k],
     at: Ref[Pos, 'k],
+    // where paths meet, for place-flow messages: a block's label, or `source>target` for one edge, ->
+    // where in the source
+    sites: ArenaMap[Span['k], Span['k], 'k],
 }
 
 forall 'k.
@@ -581,9 +587,10 @@ impl FnLower['k] {
             None => lowering.r.fail(&cx, Span::from_static(&cx, "internal error: a function without a module"), node_pos),
         };
         FnLower.{
-            lowering, sig, name, home, node_pos, mode, kinds, copies: ArenaMap::new(&cx), blocks: ArenaVec::new(&cx), cur: Ref::new(&cx, Option::None), vty: ArenaMap::new(&cx),
-            bindings: ArenaMap::new(&cx), locals: ArenaVec::new(&cx), open_brands: Ref::new(&cx, ArenaVec::new(&cx)), brand_map: Ref::new(&cx, ArenaMap::new(&cx)),
-            unsafe_nodes: ArenaSet::new(&cx), discharge_all: false, lend_frames: ArenaVec::new(&cx), n: Ref::new(&cx, 0u64), at: Ref::new(&cx, no_pos()),
+            lowering, sig, name, home, node_pos, mode, kinds, copies: ArenaMap::new(&cx), blocks: ArenaVec::new(&cx), cur: ref_in(&cx, Option::None), vty: ArenaMap::new(&cx),
+            bindings: ArenaMap::new(&cx), locals: ArenaVec::new(&cx), open_brands: ref_in(&cx, ArenaVec::new(&cx)), brand_map: ref_in(&cx, ArenaMap::new(&cx)),
+            unsafe_nodes: ArenaSet::new(&cx), discharge_all: false, lend_frames: ArenaVec::new(&cx), n: ref_in(&cx, 0u64), at: ref_in(&cx, no_pos()),
+            sites: ArenaMap::new(&cx),
         }
     }
 
@@ -881,7 +888,7 @@ impl FnLower['k] {
     }
 
     fn block_named(self, &cx: Domain!['k], label: Span['k], params: ArenaVec[C::Binding['k], 'k]) -> BlockB['k] {
-        let block = BlockB.{ label, params, instrs: ArenaVec::new(&cx), term: Ref::new(&cx, Option::None), brands: self.open_brands.copy(&cx).clone(&cx) };
+        let block = BlockB.{ label, params, instrs: ArenaVec::new(&cx), term: ref_in(&cx, Option::None), brands: self.open_brands.copy(&cx).clone(&cx) };
         self.blocks.push(&cx, block);
         block
     }
@@ -1094,8 +1101,23 @@ impl FnLower['k] {
         }
     }
 
-    // Runs each arm in its block; the arms that finish meet in a join block taking their results.
-    fn arms(self, &cx: Domain!['k], blocks: ArenaVec[BlockB['k], 'k], bodies: ArenaVec[ArmBody['k], 'k], ty: Type['k]) -> Option[Span['k]] {
+    // `line:col` of the current position.
+    fn here(self, &cx: Domain!['k]) -> Span['k] {
+        let at = self.at.copy(&cx);
+        Buffer!::new().push_u64(at.line as u64).push_static(":").push_u64(at.col as u64).save(&cx)
+    }
+
+    // The edges into a loop's `head`: the one from the current block starts the loop, the others repeat it.
+    fn loop_sites(self, &cx: Domain!['k], head: BlockB['k]) {
+        let at = self.here(&cx);
+        let entry = Buffer!::new().push_bytes(&cx, self.current(&cx).label).push_static(">").push_bytes(&cx, head.label).save(&cx);
+        self.sites.insert(&cx, entry, Buffer!::new().push_static("where the loop at ").push_bytes(&cx, at).push_static(" starts, but not when it repeats").save(&cx));
+        self.sites.insert(&cx, head.label, Buffer!::new().push_static("when the loop at ").push_bytes(&cx, at).push_static(" repeats, but not where it starts").save(&cx));
+    }
+
+    // Runs each arm in its block; the arms that finish meet in a join block taking their results, the
+    // end of the `what` at the current position.
+    fn arms(self, &cx: Domain!['k], blocks: ArenaVec[BlockB['k], 'k], bodies: ArenaVec[ArmBody['k], 'k], ty: Type['k], what: Slice[u8, 'static]) -> Option[Span['k]] {
         let outer = self.open_brands.copy(&cx).clone(&cx);
         let mapping = self.brand_map.copy(&cx).clone(&cx);
         let ends: ArenaVec[(BlockB['k], Span['k]), 'k] = ArenaVec::new(&cx);
@@ -1120,6 +1142,7 @@ impl FnLower['k] {
         }
         let r = self.fresh(&cx, "r");
         let join = self.new_block(&cx, ArenaVec::one(&cx, C::Binding.{ name: r, type: self.substitute_type(&cx, ty) }), "join");
+        self.sites.insert(&cx, join.label, Buffer!::new().push_static("on some paths to the end of the `").push_static(what).push_static("` at ").push_bytes(&cx, self.here(&cx)).save(&cx));
         i = 0usize;
         while i < ends.len(&cx) {
             let (block, result) = ends.at(&cx, i);
@@ -1311,6 +1334,7 @@ impl FnLower['k] {
         if branded {
             self.lowering.value_types.insert(&cx, fun_key(fun), self.vty.clone(&cx));
         }
+        self.lowering.sites.insert(&cx, fun_key(fun), self.sites);
         fun
     }
 
@@ -1415,9 +1439,9 @@ impl FnLower['k] {
         let (data, n) = self.lowering.data(&cx, bytes);
         let u8_type = C::prim(&cx, "u8");
         let fixed = Type::Skolem.(Span::from_static(&cx, "static"));
-        let d = self.emit(&cx, Op::new(&cx, "data", C::ptr(&cx, Type::Array.(Ref::new(&cx, u8_type), n as u64)), ArenaVec::one(&cx, data)));
+        let d = self.emit(&cx, Op::new(&cx, "data", C::ptr(&cx, Type::Array.(ref_in(&cx, u8_type), n as u64)), ArenaVec::one(&cx, data)));
         let p = self.emit(&cx, Op::new(&cx, "cast", C::ptr(&cx, u8_type), ArenaVec::one(&cx, d)).typed(C::ptr(&cx, u8_type)).discharge(true));
-        let brand = self.emit(&cx, Op::new(&cx, "static_brand", Type::Brand.(Ref::new(&cx, fixed)), ArenaVec::new(&cx)).discharge(true));
+        let brand = self.emit(&cx, Op::new(&cx, "static_brand", Type::Brand.(ref_in(&cx, fixed)), ArenaVec::new(&cx)).discharge(true));
         let length = self.constant(&cx, C::usize_type(&cx), Buffer!::new().push_usize(n).save(&cx));
         let sig = self.lowering.library_sig(&cx, "Slice::from_raw_parts", self.home);
         let slice_ty = Type::Named.(self.lowering.library_name(&cx, "Slice", self.home), ArenaVec::two(&cx, u8_type, fixed));
@@ -1507,9 +1531,9 @@ impl FnLower['k] {
             let c = self.constant_value(&cx, operands.at(&cx, 0usize));
             let right = ArmBody::Folded.(operands.at(&cx, 1usize));
             let result = if name.is(&cx, "and") {
-                self.branch(&cx, c, right, ArmBody::Constant.(Span::from_static(&cx, "false")), C::bool_type(&cx))
+                self.branch(&cx, c, right, ArmBody::Constant.(Span::from_static(&cx, "false")), C::bool_type(&cx), "&&")
             } else {
-                self.branch(&cx, c, ArmBody::Constant.(Span::from_static(&cx, "true")), right, C::bool_type(&cx))
+                self.branch(&cx, c, ArmBody::Constant.(Span::from_static(&cx, "true")), right, C::bool_type(&cx), "||")
             };
             return match result {
                 Some(r) => r,
@@ -1601,9 +1625,9 @@ impl FnLower['k] {
     fn short_circuit(self, &cx: Domain!['k], b: S::Binop['k], c: Span['k]) -> Option[Span['k]] {
         let right = ArmBody::Value.(b.right.copy(&cx));
         if b.op.is(&cx, "&&") {
-            return self.branch(&cx, c, right, ArmBody::Constant.(Span::from_static(&cx, "false")), C::bool_type(&cx));
+            return self.branch(&cx, c, right, ArmBody::Constant.(Span::from_static(&cx, "false")), C::bool_type(&cx), "&&");
         }
-        self.branch(&cx, c, ArmBody::Constant.(Span::from_static(&cx, "true")), right, C::bool_type(&cx))
+        self.branch(&cx, c, ArmBody::Constant.(Span::from_static(&cx, "true")), right, C::bool_type(&cx), "||")
     }
 
     fn expr_unary(self, &cx: Domain!['k], u: S::Unary['k]) -> Option[Span['k]] {
@@ -1743,6 +1767,9 @@ impl FnLower['k] {
         };
         if package {
             self.fails(&cx, "a cast cannot consume or produce an outer existential package; use opening or packing", c.pos);
+        }
+        if !self.authorized(&cx, c.id) {
+            self.fails(&cx, "a safe `as` converts only between number types and from a NonNull to its pointer; any other cast reinterprets bits and needs unsafe", c.pos);
         }
         Option::Some.(self.emit(&cx, Op::new(&cx, "cast", dst, ArenaVec::one(&cx, v)).typed(dst).from_node(c.id, c.pos)))
     }
@@ -2218,11 +2245,11 @@ impl FnLower['k] {
     }
 
     // ---- control flow
-    fn branch(self, &cx: Domain!['k], cond: Span['k], then: ArmBody['k], other: ArmBody['k], ty: Type['k]) -> Option[Span['k]] {
+    fn branch(self, &cx: Domain!['k], cond: Span['k], then: ArmBody['k], other: ArmBody['k], ty: Type['k], what: Slice[u8, 'static]) -> Option[Span['k]] {
         let a = self.new_block(&cx, ArenaVec::new(&cx), "b");
         let b = self.new_block(&cx, ArenaVec::new(&cx), "b");
         self.terminate(&cx, Terminator::Jnz.(cond, self.edge(&cx, a, ArenaVec::new(&cx)), self.edge(&cx, b, ArenaVec::new(&cx)), self.at.copy(&cx)));
-        self.arms(&cx, ArenaVec::two(&cx, a, b), ArenaVec::two(&cx, then, other), ty)
+        self.arms(&cx, ArenaVec::two(&cx, a, b), ArenaVec::two(&cx, then, other), ty, what)
     }
 
     fn expr_if(self, &cx: Domain!['k], x: S::If['k]) -> Option[Span['k]] {
@@ -2234,7 +2261,7 @@ impl FnLower['k] {
             Some(o) => ArmBody::Value.(o.copy(&cx)),
             None => ArmBody::Unit,
         };
-        self.branch(&cx, c, ArmBody::Value.(Expr::Block.(x.then)), other, self.type_of(&cx, x.id))
+        self.branch(&cx, c, ArmBody::Value.(Expr::Block.(x.then)), other, self.type_of(&cx, x.id), "if")
     }
 
     fn expr_return(self, &cx: Domain!['k], value: Option[Ref[Expr['k], 'k]]) -> Option[Span['k]] {
@@ -2253,6 +2280,7 @@ impl FnLower['k] {
 
     fn expr_while(self, &cx: Domain!['k], w: S::While['k]) -> Option[Span['k]] {
         let head = self.new_block(&cx, ArenaVec::new(&cx), "while");
+        self.loop_sites(&cx, head);
         self.jump(&cx, head, ArenaVec::new(&cx));
         self.start(&cx, head);
         let c = match self.expr(&cx, w.cond.copy(&cx)) {
@@ -2285,6 +2313,7 @@ impl FnLower['k] {
         let item = self.substitute_type(&cx, call.targs.at(&cx, 1usize));
         let option = self.substitute_type(&cx, self.results().options.at(&cx, f.id));
         let head = self.new_block(&cx, ArenaVec::new(&cx), "for");
+        self.loop_sites(&cx, head);
         self.jump(&cx, head, ArenaVec::new(&cx));
         self.start(&cx, head);
         let args = ArenaVec::two(&cx, call.trait_name, call.method);
@@ -2513,10 +2542,19 @@ impl FnLower['k] {
             resolved.push(&cx, items);
             k = k + 1usize;
         }
-        let covered = &seen.len();
+        let missing: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        var v = 0usize;
+        while v < variants.len(&cx) {
+            let name = variants.at(&cx, v).name;
+            let covered = &seen.contains_in(&cx, name);
+            if !covered {
+                missing.push(&cx, name);
+            }
+            v = v + 1usize;
+        }
         seen.destroy();
-        if covered != variants.len(&cx) {
-            self.fails(&cx, "a match must cover every enum variant", m.pos);
+        if !missing.is_empty(&cx) {
+            self.fail(&cx, Buffer!::new().push_static("a match must cover every enum variant; it misses ").push_bytes(&cx, listed(&cx, missing)).save(&cx), m.pos);
         }
         resolved
     }
@@ -2597,7 +2635,7 @@ impl FnLower['k] {
             bodies.push(&cx, ArmBody::Case.(m.arms.at(&cx, i), blocks.at(&cx, i), place));
             i = i + 1usize;
         }
-        self.arms(&cx, blocks, bodies, self.type_of(&cx, m.id))
+        self.arms(&cx, blocks, bodies, self.type_of(&cx, m.id), "match")
     }
 
     fn case_variant(self, &cx: Domain!['k], case: S::Case['k]) -> Span['k] {
@@ -2818,6 +2856,9 @@ impl FnLower['k] {
                     writer = values.at(&cx, 0usize);
                     let v = values.at(&cx, 1usize);
                     let vty = self.vty.at(&cx, v);
+                    if !lend && !self.copy(&cx, vty) {
+                        self.fails(&cx, "{x} in an f-string drops a linear value; lend it with {&x}", expr_pos(part));
+                    }
                     let pair = Type::Tuple.(ArenaVec::two(&cx, vty, wty));
                     let args = ArenaVec::two(&cx, format, Span::from_static(&cx, "format"));
                     args.push(&cx, v);
@@ -2855,7 +2896,6 @@ impl FnLower['k] {
         let previous = self.at.copy(&cx);
         let pos = match s {
             Let(l) => l.pos,
-            Var(v) => v.pos,
             Assign(a) => a.pos,
             Expr(n) => n.pos,
             Const(c) => c.pos,
@@ -2863,10 +2903,6 @@ impl FnLower['k] {
         self.at.set(&cx, pos);
         match s {
             Let(l) => self.let_stmt(&cx, l),
-            Var(v) => match self.expr(&cx, v.value) {
-                Some(value) => self.declare(&cx, self.binder(&cx, v.id), v.name, self.vty.at(&cx, value), value),
-                None => (),
-            },
             Const(c) => {
                 let value = self.results().folded.at(&cx, c.id);
                 let ty = match const_type(&cx, value) {
@@ -3048,7 +3084,7 @@ forall 'k.
 fn lower_inferred(&cx: Domain!['k], r: Resolver['k], sigs: Signatures['k], results: Results['k], counter: Fresh['k]) -> Program['k] {
     let program = Program.{ types: sigs.types, funs: ArenaMap::new(&cx), externs: ArenaMap::new(&cx), datas: ArenaMap::new(&cx), traits: sigs.traits, instances: ArenaMap::new(&cx) };
     let lowering = Lowering.{ r, sigs, results, program, types: Types::new(&cx, program, counter), counter, datas: ArenaMap::new(&cx),
-        closures: Ref::new(&cx, 0u64), value_types: ArenaMap::new(&cx) };
+        closures: ref_in(&cx, 0u64), value_types: ArenaMap::new(&cx), sites: ArenaMap::new(&cx) };
     lowering.run(&cx)
 }
 
