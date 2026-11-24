@@ -623,8 +623,6 @@ exposed struct FnLower {
     open_brands: Ref[ArenaVec[Span['k], 'k], 'k],
     brand_map: Ref[ArenaMap[Span['k], Type['k], 'k], 'k],
     unsafe_nodes: ArenaSet[u32, 'k],
-    // inside an unsafe function's lifted closures every operation is discharged
-    discharge_all: bool,
     lend_frames: ArenaVec[ArenaVec[Span['k], 'k], 'k],
     n: Ref[u64, 'k],
     at: Ref[Pos, 'k],
@@ -649,7 +647,7 @@ impl FnLower['k] {
         FnLower.{
             lowering, sig, name, home, node_pos, mode, kinds, copies: ArenaMap::new(&cx), blocks: ArenaVec::new(&cx), cur: ref_in(&cx, Option::None), vty: ArenaMap::new(&cx),
             bindings: ArenaMap::new(&cx), locals: ArenaVec::new(&cx), open_brands: ref_in(&cx, ArenaVec::new(&cx)), brand_map: ref_in(&cx, ArenaMap::new(&cx)),
-            unsafe_nodes: ArenaSet::new(&cx), discharge_all: false, lend_frames: ArenaVec::new(&cx), n: ref_in(&cx, 0u64), at: ref_in(&cx, no_pos()),
+            unsafe_nodes: ArenaSet::new(&cx), lend_frames: ArenaVec::new(&cx), n: ref_in(&cx, 0u64), at: ref_in(&cx, no_pos()),
             sites: ArenaMap::new(&cx),
         }
     }
@@ -734,7 +732,7 @@ impl FnLower['k] {
     }
 
     fn authorized(self, &cx: Domain!['k], id: u32) -> bool {
-        self.sig.is_unsafe || self.discharge_all || self.unsafe_nodes.contains(&cx, id)
+        self.unsafe_nodes.contains(&cx, id)
     }
 
     fn emit(self, &cx: Domain!['k], o: Op['k]) -> Span['k] {
@@ -786,8 +784,8 @@ impl FnLower['k] {
             },
             None => false,
         };
-        let discharged = o.discharged || self.discharge_all || marked;
-        if C::is_unsafe_op(&cx, o.name) && !(discharged || self.sig.is_unsafe) {
+        let discharged = o.discharged || marked;
+        if C::is_unsafe_op(&cx, o.name) && !discharged {
             self.fail(&cx, Buffer!::new().push_static(unsafe_written(&cx, o.name)).push_static(" needs unsafe").save(&cx), pos);
         }
         if C::is_unsafe_op(&cx, o.name) {
@@ -2837,8 +2835,6 @@ impl FnLower['k] {
     // Lowers a closure or foreach body to a function of its own.
     fn lift(self, &cx: Domain!['k], sig: Sig['k], mode: Mode['k], pos: Pos) {
         let inner = FnLower::new(&cx, self.lowering, sig, mode, sig.name, pos);
-        let { discharge_all: _d, ..rest } = inner;
-        let inner = FnLower.{ discharge_all: self.discharge_all || self.sig.is_unsafe, ..rest };
         let fun = inner.run(&cx);
         self.lowering.program.funs.insert(&cx, sig.name, fun);
     }

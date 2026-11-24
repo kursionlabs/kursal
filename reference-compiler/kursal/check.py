@@ -632,7 +632,7 @@ class Checker:
         return lent
 
     def authorize(self, instr: Instr, unsafe: bool) -> None:
-        if unsafe and not (self.fun.unsafe or instr.unsafe):
+        if unsafe and not instr.unsafe:
             self.fail("unsafe_authorization")
 
     # ------------------------------------------------------ instructions --

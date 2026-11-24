@@ -41,12 +41,16 @@ ACCEPTED = (
     "fn f(c: u8) -> bool { let s = f\"{{x}} = {x + 1u32} {f\"{y}\"}\\n\"; c == b'\\n' || c == b'\\x41' && c != b' ' }",
     "fn f() -> f64 { 1_000.5f64 + 0x_ff as f64 + 0b1010u8 as f64 + 2f32 as f64 }",
     "use a::{B!, C! as D!}; fn f(x: B!) -> bool { let y = D!::new(); let z = B!.{ x }; a!=b && !c && a != b }",
+    "fn f(self, g: fn(closure() -> u32) -> u32) -> u32 { var self = self; let (self, x) = y; return x; }",
 )
 
 # Forms of the surface syntax that Kursal does not have: a struct literal without `.`, a place written on
 # a parameter's type, an unnamed place slot, a `forall` ended by `=>`, a function type that quantifies, a
-# `!` apart from its name, a `!` on a name that is not a type's, an unsafe instance, and a declaration
-# that begins with the reserved word `module`.
+# `!` apart from its name, a `!` on a name that is not a type's, an unsafe instance, a declaration
+# that begins with the reserved word `module`, a trait method with a body, a function without one, a
+# `forall` before a `use`, a `const`, a trait's method or an instance's, a `self` parameter after the
+# first, a closure type with no environment outside a parameter, a `return` as a block's tail, and a
+# keyword used as a name.
 REJECTED = (
     "fn f() -> Point { Point { x: 1u32 } }",
     "fn f(x: &u32) {}",
@@ -59,6 +63,18 @@ REJECTED = (
     "fn f!() {}",
     "unsafe instance Send[Cell[u32]] { }",
     "module a::b;",
+    "forall Self. trait Show { fn show(self: Self) -> u32 { 1u32 } }",
+    "fn f() -> u32;",
+    "forall T. use a::b;",
+    "forall T. const N: u32 = 1u32;",
+    "impl P { forall T. const N: u32 = 1u32; }",
+    "fn f() { forall T. const N: u32 = 1u32; }",
+    "forall Self. trait Show { forall T. fn show(self: Self, t: T) -> u32; }",
+    "instance Show[u32] { forall T. fn show(self: u32) -> u32 { 1u32 } }",
+    "fn f(x: u32, self) {}",
+    "fn f() { let g: closure() -> u32 = h; }",
+    "fn f() -> u32 { return 1u32 }",
+    "fn f() { let g = |_| 1u32; }",
 )
 
 READABLE_PACKAGES = ("shapes", "option_result", "skolems", "mint_join", "generic_capabilities", "iter_combinators")

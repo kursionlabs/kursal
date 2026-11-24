@@ -1187,6 +1187,7 @@ SIGNATURE_ERRORS = (
     "struct S { a: core::cap::Brand['k] }\n",
     "struct S { f: fn(closure(u32) -> u32) -> u32 }\n",
     "forall T. struct B { a: *T }\nstruct S { b: B[_] }\n",
+    "forall T. struct B { a: *T }\nfn f(b: B[_]) -> u32 { 0u32 }\n",
     "forall T where Copy[(T, T)]. fn f(x: T) {}\n",
     "forall T where Copy[u32]. fn f(x: T) {}\n",
     "forall T, U where Exposed[T, U]. fn f(x: T) {}\n",
@@ -1316,6 +1317,16 @@ SYNTAX_ERRORS = (
     # `module` is reserved, and `unsafe` marks only a function.
     "module x;",
     "unsafe instance Send[u32] {}",
+    # A trait method is a signature, every other function has a body, and `forall` comes before a
+    # declaration that takes parameters.
+    "forall T. trait Tr { fn m(x: T) -> u32 { 1u32 } }",
+    "fn f() -> u32;",
+    "forall T. use a::b;",
+    "forall T. const N: u32 = 1u32;",
+    "impl P { forall T. const N: u32 = 1u32; }",
+    # A store through a raw pointer is written `unsafe *p = v;`.
+    "fn f() { *p = 1u32; }",
+    "fn f() { (*p) = 1u32; }",
 )
 
 KURS_ERRORS = (

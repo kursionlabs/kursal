@@ -4,8 +4,10 @@
  * The reference parser, `reference-compiler/kursal/parser.py`, decides what is accepted; this grammar
  * follows its productions for editor parsing and highlighting. It accepts a superset where a rejection
  * takes more than a program's shape: a chained comparison, `p.0.1`, an assignment to something that
- * is not a place, a `match` arm whose body is not a block with no comma before the next arm, and the
- * reserved word `module` used as a name parse here and are rejected by the compiler.
+ * is not a place (`*p = v`, which is written `unsafe *p = v`, among them), a `match` arm with no
+ * comma after a body that needs one (any body but a block-like one before the next arm, and a
+ * `return` in the last arm), and the reserved word `module` used as a name parse here and are
+ * rejected by the compiler.
  */
 
 function commaSep1(rule) {
@@ -50,12 +52,21 @@ module.exports = grammar({
 
   word: $ => $.identifier,
 
+  // The reference parser's keywords, which are never a name; `module` is left out, as above.
+  reserved: {
+    global: _ => [
+      'use', 'export', 'struct', 'tuple', 'enum', 'fn', 'extern', 'impl', 'trait', 'instance', 'const',
+      'forall', 'where', 'as', 'exposed', 'unsafe', 'closure', 'exists', 'foreach', 'of', 'in', 'for',
+      'while', 'if', 'else', 'match', 'let', 'var', 'return', 'pack', 'true', 'false', 'self', '_',
+    ],
+  },
+
   extras: $ => [/\s/, $.line_comment, $.block_comment],
 
   conflicts: $ => [
     // A block-like expression that ends a block is its tail; one followed by more statements is a
     // statement of its own.
-    [$.expression_statement, $._expression],
+    [$.expression_statement, $._tail],
   ],
 
   rules: {
@@ -152,15 +163,26 @@ module.exports = grammar({
       optional(seq('(', commaSep1(field('payload', $._type)), ')')),
     ),
 
-    // A trait method may end in `;` instead of a body.
-    function_declaration: $ => seq(
-      optional($.forall_clause),
+    // A function or an impl's method; `forall` comes before neither a trait's nor an instance's.
+    function_declaration: $ => seq(optional($.forall_clause), $._function),
+
+    _function: $ => seq(
       optional('unsafe'),
       'fn',
       field('name', $.identifier),
       field('parameters', $.parameter_list),
       optional(seq('->', field('return_type', $._type))),
-      choice(field('body', $.block), ';'),
+      field('body', $.block),
+    ),
+
+    // A trait method: a signature, which each instance gives a body.
+    function_signature: $ => seq(
+      optional('unsafe'),
+      'fn',
+      field('name', $.identifier),
+      field('parameters', $.parameter_list),
+      optional(seq('->', field('return_type', $._type))),
+      ';',
     ),
 
     extern_function: $ => seq(
@@ -174,15 +196,30 @@ module.exports = grammar({
       ';',
     ),
 
-    parameter_list: $ => seq('(', commaSep(field('parameter', $.parameter)), ')'),
+    // `self` comes first if at all.
+    parameter_list: $ => seq(
+      '(',
+      optional(seq(
+        field('parameter', choice($.parameter, alias($._self_parameter, $.parameter))),
+        repeat(seq(',', field('parameter', $.parameter))),
+        optional(','),
+      )),
+      ')',
+    ),
 
-    // `x: T`, `&x: T` (a place), `self`, `&self`, `self: T`.
+    // `x: T` or `&x: T` (a place).
     parameter: $ => seq(
       optional(field('place', '&')),
-      choice(
-        seq(field('name', $.self), optional(seq(':', field('type', $._type)))),
-        seq(field('name', $.identifier), ':', field('type', $._type)),
-      ),
+      field('name', $.identifier),
+      ':',
+      field('type', $._parameter_type),
+    ),
+
+    // `self`, `&self`, `self: T`.
+    _self_parameter: $ => seq(
+      optional(field('place', '&')),
+      field('name', $.self),
+      optional(seq(':', field('type', $._type))),
     ),
 
     impl_block: $ => seq(
@@ -199,7 +236,7 @@ module.exports = grammar({
       'trait',
       field('name', $.identifier),
       '{',
-      repeat(field('method', $.function_declaration)),
+      repeat(field('method', $.function_signature)),
       '}',
     ),
 
@@ -208,12 +245,11 @@ module.exports = grammar({
       'instance',
       field('trait', $._type),
       '{',
-      repeat(field('method', $.function_declaration)),
+      repeat(field('method', alias($._function, $.function_declaration))),
       '}',
     ),
 
     const_declaration: $ => seq(
-      optional($.forall_clause),
       'const',
       field('name', $.identifier),
       ':',
@@ -280,10 +316,24 @@ module.exports = grammar({
       field('return_type', $._type),
     ),
 
-    // `closure[Env](...) -> T`; a parameter's type may leave the environment unnamed.
     closure_type: $ => seq(
       'closure',
-      optional(seq('[', field('environment', $._type), ']')),
+      '[',
+      field('environment', $._type),
+      ']',
+      '(',
+      commaSep($._slot),
+      ')',
+      '->',
+      field('return_type', $._type),
+    ),
+
+    // The type of a parameter, of a closure's or of a slot, which may also be a closure type that
+    // leaves its environment unnamed: `closure(...) -> T`.
+    _parameter_type: $ => choice($._type, alias($._unnamed_closure_type, $.closure_type)),
+
+    _unnamed_closure_type: $ => seq(
+      'closure',
       '(',
       commaSep($._slot),
       ')',
@@ -292,7 +342,7 @@ module.exports = grammar({
     ),
 
     // A slot of a function or closure type: `T`, or a place `&name: T` (`&_: T`).
-    _slot: $ => choice(field('parameter', $._type), field('parameter', $.place_slot)),
+    _slot: $ => choice(field('parameter', $._parameter_type), field('parameter', $.place_slot)),
 
     place_slot: $ => seq('&', field('name', choice($.identifier, '_')), ':', field('type', $._type)),
 
@@ -311,7 +361,15 @@ module.exports = grammar({
 
     // --------------------------------------------------------- statements --
 
-    block: $ => seq('{', repeat($._statement), optional(field('tail', $._expression)), '}'),
+    // A `return` ends with `;`, so it is never the tail.
+    block: $ => seq('{', repeat($._statement), optional(field('tail', $._tail)), '}'),
+
+    _tail: $ => choice(
+      $._block_like,
+      $.closure_expression,
+      $.pack_expression,
+      $._operator_expression,
+    ),
 
     _statement: $ => choice(
       $.let_statement,
@@ -352,8 +410,10 @@ module.exports = grammar({
 
     // ----------------------------------------------------------- patterns --
 
+    // `self` binds as a name does: `var self = self;`.
     _pattern: $ => choice(
       $.identifier,
+      $.self,
       $.wildcard_pattern,
       $.tuple_pattern,
       $.array_pattern,
@@ -480,7 +540,7 @@ module.exports = grammar({
     closure_parameter: $ => seq(
       optional(field('place', '&')),
       field('name', $.identifier),
-      optional(seq(':', field('type', $._type))),
+      optional(seq(':', field('type', $._parameter_type))),
     ),
 
     return_expression: $ => prec.right(seq('return', optional(field('value', $._expression)))),

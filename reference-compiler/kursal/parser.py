@@ -232,10 +232,13 @@ class Parser:
         return items
 
     def item(self) -> S.Item:
-        forall = self.forall() if self.k == "forall" else None
+        if self.k != "forall":
+            return self.item_body()
+        forall = self.forall()
+        if self.k in ("use", "export", "const"):
+            self.error(self.t[self.i], "`forall` comes before a struct, tuple, enum, function, impl, trait or instance")
         decl = self.item_body()
-        if forall:
-            decl.forall = forall
+        decl.forall = forall
         return decl
 
     def brands(self) -> tuple[str, ...]:
@@ -311,7 +314,7 @@ class Parser:
             self.expect("{")
             methods = []
             while self.k != "}":
-                methods.append(self.fn_decl())
+                methods.append(self.trait_method())
             self.next()
             return S.TraitDecl(name, tuple(methods), None, start)
         if k == "const":
@@ -423,12 +426,22 @@ class Parser:
         return name, params, self.type(), ret_pos
 
     def fn_decl(self, start: Optional[Position] = None, unsafe: bool = False) -> S.Fn:
-        """`"unsafe"? fn_header (";" | block)`; `start` and `unsafe` are given when the caller read the `unsafe`."""
+        """`"unsafe"? fn_header block`; `start` and `unsafe` are given when the caller read the `unsafe`."""
         if start is None:
             start, unsafe = self.pos(), bool(self.eat("unsafe"))
         name, params, ret, _ = self.fn_header()
-        body = None if self.eat(";") else self.block()
-        return S.Fn(name, params, ret, body, unsafe, None, start)
+        if self.k == ";":
+            self.error(self.t[self.i], "a function needs a body; only a trait method or an extern is a signature")
+        return S.Fn(name, params, ret, self.block(), unsafe, None, start)
+
+    def trait_method(self) -> S.Fn:
+        """`"unsafe"? fn_header ";"`: a signature, which each instance gives a body."""
+        start, unsafe = self.pos(), bool(self.eat("unsafe"))
+        name, params, ret, _ = self.fn_header()
+        if self.k == "{":
+            self.error(self.t[self.i], "a trait method is a signature; its body belongs in each instance")
+        self.expect(";")
+        return S.Fn(name, params, ret, None, unsafe, None, start)
 
     def extern(self) -> S.Extern:
         start = self.pos()
@@ -450,7 +463,7 @@ class Parser:
         self.expect("=")
         value = self.expr()
         self.expect(";")
-        return S.Const(name, ty, value, None, start)
+        return S.Const(name, ty, value, start)
 
     def impl(self) -> S.Impl:
         start = self.pos()
@@ -459,9 +472,15 @@ class Parser:
         self.expect("{")
         decls = []
         while self.k != "}":
-            forall = self.forall() if self.k == "forall" else None
-            decl = self.const_decl() if self.k == "const" else self.fn_decl()
-            decl.forall = forall
+            decl: S.Fn | S.Const
+            if self.k == "const":
+                decl = self.const_decl()
+            else:
+                forall = self.forall() if self.k == "forall" else None
+                if self.k == "const":
+                    self.error(self.t[self.i], "in an impl, `forall` comes before a method")
+                decl = self.fn_decl()
+                decl.forall = forall
             decls.append(decl)
         self.next()
         return S.Impl(ty, tuple(decls), None, start)
@@ -581,8 +600,11 @@ class Parser:
     def type_arg(self) -> S.Type:
         if self.k == "BRAND":
             return S.TBrand(self.next().text)
-        if self.eat("_"):
-            return S.TIgnored()
+        if self.k == "_":
+            ignored = S.TIgnored()
+            ignored.pos = self.pos()
+            self.next()
+            return ignored
         return self.type()
 
     def type_args(self) -> S.TypeArgs:
@@ -648,7 +670,10 @@ class Parser:
                 operand = self.unary()
             e = self.oexpr(S.Unary("unsafe", operand, start))
         else:
+            first = self.t[self.i]
             e = self.expr()
+            if self.k == "=" and isinstance(e, S.Unary) and e.op == "*":
+                self.error(first, "a store through a raw pointer is written `unsafe *p = v;`")
         if self.eat("="):
             if not assignable(e):
                 self.fail()

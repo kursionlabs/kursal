@@ -288,7 +288,6 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         self.open_brands: list[str] = []
         self.brand_map: dict[str, C.Type] = {}
         self.unsafe_nodes: set[int] = set()
-        self.discharge_all = False   # inside an unsafe function's lifted closures every operation is discharged
         self.lend_frames: list[list[str]] = []
         self.n = 0
         self.pos: Optional[Position] = None
@@ -309,8 +308,8 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
     def copy(self, ty: C.Type) -> bool:
         return self.types.is_copy(ty, self.kinds)
 
-    def authorized(self, node: Optional[S.Expr] = None) -> bool:
-        return self.sig.unsafe or self.discharge_all or node is not None and id(node) in self.unsafe_nodes
+    def authorized(self, node: Optional[S.Expr]) -> bool:
+        return node is not None and id(node) in self.unsafe_nodes
 
     def emit(self, op: str, rty: C.Type, args: Sequence[str] = (), node: Optional[S.Expr] = None,
              unsafe: bool = False, *, ty: Optional[C.Type] = None, tys: tuple[C.Type, ...] = (),
@@ -322,8 +321,8 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         if op in {"call", "trait_call"}:
             for frame in self.lend_frames:
                 frame.extend(a for a in args if a.startswith("&") and not a.startswith("&*"))
-        discharged = unsafe or self.discharge_all or node is not None and id(node) in self.unsafe_nodes
-        if op in C.UNSAFE_OPS and not (discharged or self.sig.unsafe):
+        discharged = unsafe or self.authorized(node)
+        if op in C.UNSAFE_OPS and not discharged:
             fail(f"{UNSAFE_WRITTEN[op]} needs unsafe", pos)
         if op in C.UNSAFE_OPS:
             self.memory_operation(op, args, ty, pos)
@@ -1527,7 +1526,6 @@ class ClosureLower(Lifted[S.Closure]):
                   tuple(code_ty.params), places, code_ty.ret, False, parent.sig.module)
         super().__init__(lowering, sig, expr, name)
         self.env_ty = env_ty
-        self.discharge_all = parent.discharge_all or parent.sig.unsafe
 
     def run(self) -> C.Fun:
         e = self.node
@@ -1550,7 +1548,6 @@ class MapperLower(Lifted[S.Foreach]):
         sig = Sig(name, None, (C.Param(ty.binder, C.ANY), *parent.sig.params), parent.sig.premises,
                   (expr.name, *(c.name for c in expr.captures)), (item, *captured), frozenset(), ty.body, False, parent.sig.module)
         super().__init__(lowering, sig, expr, name)
-        self.discharge_all = parent.discharge_all or parent.sig.unsafe
 
     def run(self) -> C.Fun:
         e = self.node

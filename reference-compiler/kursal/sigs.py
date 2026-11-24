@@ -343,7 +343,8 @@ class Signatures:
                                    self.component(body, scope.extend((C.Param(binder, C.ANY),)), "a foreach body"))
                 self.foreach_formation(formed, scope.kinds, pos)
                 return formed
-        fail("_ stands for a type argument only in an expression, where inference fills it in")
+        assert isinstance(type_expr, S.TIgnored)
+        fail("_ stands for a type argument only in an expression, where inference fills it in", type_expr.pos)
 
     def foreach_formation(self, ty: C.Foreach, kinds: dict[str, C.Kind], pos: Optional[Position]) -> None:
         """The foreach type `ty`, written at `pos`, has an expansion at every instantiation, as type

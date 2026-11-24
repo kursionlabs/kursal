@@ -111,7 +111,7 @@ class TBrand:
 
 @dataclass
 class TIgnored:
-    pass
+    pos: Optional[Position] = field(default=None, init=False, repr=False, compare=False)   # its `_`
 
 
 # ----------------------------------------------------------- expressions --
@@ -394,7 +394,8 @@ class PStruct(Inferred):
 # ------------------------------------------------------------------ items --
 
 class Declaration:
-    """The grammar permits an optional forall header before any declaration."""
+    """A forall header may come before a type, function, extern, impl, trait or instance declaration,
+    and before an impl's method."""
     forall: Optional[Forall] = None
 
 
@@ -479,7 +480,6 @@ class Const(Declaration):
     name: str
     type: Type
     value: Expr
-    forall: Optional[Forall] = None
     pos: Optional[Position] = None
     # Local constants only: inference -> lowering, binding ID and folded value.
     # Declaration constants use Signatures.consts; these fields remain absent there.

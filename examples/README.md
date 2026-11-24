@@ -133,6 +133,7 @@ Ordinary errors:
 | `foreach_pointer_over_leaf.kur` | `foreach *F of (*u8, u32)` matches pointer components, and `u32` is none; the type is rejected before the body that misuses the parameter |
 | `foreach_through_pointer_to_sum.kur` | a `foreach` traverses a pointer to a sum, whose components depend on the variant it holds |
 | `extern_abi.kur` | an extern names a calling convention other than `"C"` |
+| `inferred_type_in_annotation.kur` | `_` stands for a type argument in an annotation, where only an expression's is inferred |
 
 Ownership, brands and authority:
 
@@ -153,3 +154,4 @@ Ownership, brands and authority:
 | `ref_after_remove_in.kur` | a `Ref` into a map is used after `remove_in` gave the map a new brand |
 | `implicit_package_open.kur`, `implicit_package_open_plain_let.kur`, `implicit_package_open_assignment.kur` | an existential package is used without `let exists` opening it |
 | `close_by_number.kur`, `write_by_number.kur`, `safe_adopt.kur` | an `unsafe fn` is called without `unsafe` |
+| `unmarked_in_unsafe_fn.kur` | an `unsafe fn` reads through a raw pointer without `unsafe`: its body is no unsafe context |

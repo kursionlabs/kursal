@@ -89,8 +89,9 @@ leaves it out (`K_alloc_buffer_Buffer`).
   `ptr_atomic_KIND` per atomic method of `*T`, whatever the method's own spelling (`ptr_atomic_load`,
   `ptr_atomic_store`, `ptr_atomic_swap`, `ptr_atomic_compare_exchange`, `ptr_atomic_fetch_add`,
   `_sub`, `_and`, `_or`, `_xor`), and `fence`, which takes no pointer.
-- **Unsafety** is marked only by the `(unsafe (= ...))` wrapper of one instruction, or by an unsafe
-  function (the `(unsafe)` clause of its declaration, and of its type). The operations that need it are exactly `UNSAFE_OPS` (`core.py`; `kurs::core::is_unsafe_op`):
+- **Unsafety** is marked only by the `(unsafe (= ...))` wrapper of one instruction, in an unsafe
+  function too: the `(unsafe)` clause of a function's declaration, and of its type, makes calling it
+  an unsafe operation, and authorizes nothing in its body. The operations that need the wrapper are exactly `UNSAFE_OPS` (`core.py`; `kurs::core::is_unsafe_op`):
   `cast`, `alloca`, `static_brand`, the `ptr_` loads and stores, the atomics and `fence`; a call needs
   it when its callee is unsafe or when it lends a raw pointer's target (`&*%p`).
 

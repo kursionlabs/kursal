@@ -99,8 +99,8 @@ holding the arena is what entitles a caller to place objects there.
 Each entry is a genuine caller obligation, normally declared with
 `unsafe fn`. The checker enforces it: a call to an `extern "C"` function or
 to an `unsafe fn` (directly, or through a function value whose type is
-`unsafe`) is rejected unless the enclosing function is itself `unsafe fn`
-or the call carries an `unsafe` marker. A safe function value cannot be
+`unsafe`) is rejected unless the call carries an `unsafe` marker, in an
+`unsafe fn`'s body as anywhere else. A safe function value cannot be
 bound to an `unsafe fn`. A reader of a signature sees the obligation, a
 reviewer of a diff sees where it is discharged, and a program that ignores
 it does not compile.

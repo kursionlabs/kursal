@@ -204,6 +204,12 @@ class StatementTests(unittest.TestCase):
             with self.subTest(target=target):
                 rejected(self, "fn f() { " + target + " = 1; }")
 
+    def test_a_bare_store_says_how_a_store_is_written(self):
+        for target in ("*p", "(*p)", "*p.f", "**p"):
+            with self.subTest(target=target), self.assertRaisesRegex(
+                    KursError, "1:10: a store through a raw pointer is written `unsafe \\*p = v;`$"):
+                S.parse("fn f() { " + target + " = 1; }")
+
     def test_unsafe_reads_and_calls_are_expressions(self):
         self.assertEqual(body("unsafe *p").tail.operand.op, "*")
         self.assertEqual(body("let v = unsafe f(x); v").stmts[0].value.op, "unsafe")
@@ -230,6 +236,32 @@ class UnsafeItemTests(unittest.TestCase):
             S.parse("unsafe instance T[u32] {}")
         rejected(self, "unsafe struct S { x: u32 }")
         rejected(self, "unsafe;")
+
+    def test_a_trait_method_is_a_signature(self):
+        (trait,) = S.parse("forall T. trait Tr { fn m(x: T) -> u32; unsafe fn n(x: T); }")
+        self.assertEqual([(m.name, m.body, m.unsafe) for m in trait.methods], [("m", None, False), ("n", None, True)])
+        with self.assertRaisesRegex(KursError, "1:40: a trait method is a signature; its body belongs in each instance$"):
+            S.parse("forall T. trait Tr { fn m(x: T) -> u32 { 1u32 } }")
+
+    def test_every_other_function_has_a_body(self):
+        for src, at in (("fn f() -> u32;", 14), ("impl P { fn m(self); }", 20),
+                        ("instance Tr[u8] { fn m(x: u8); }", 30)):
+            with self.subTest(src=src), self.assertRaisesRegex(
+                    KursError, f"1:{at}: a function needs a body; only a trait method or an extern is a signature$"):
+                S.parse(src)
+
+    def test_what_forall_comes_before(self):
+        for src in ("forall T. use a::b;", "forall T. export a::b;", "forall T. const N: u32 = 1u32;"):
+            with self.subTest(src=src), self.assertRaisesRegex(
+                    KursError, "1:11: `forall` comes before a struct, tuple, enum, function, impl, trait or instance$"):
+                S.parse(src)
+        with self.assertRaisesRegex(KursError, "1:20: in an impl, `forall` comes before a method$"):
+            S.parse("impl P { forall T. const N: u32 = 1u32; }")
+        (impl,) = S.parse("impl P { const N: u32 = 1u32; forall T. fn m(x: T) {} }")
+        self.assertEqual(impl.items[1].forall.params, ("T",))
+        rejected(self, "fn f() { forall T. const N: u32 = 1u32; }")
+        rejected(self, "forall T. trait Tr { forall U. fn m(x: T, u: U); }")
+        rejected(self, "forall T. instance Tr[T] { forall U. fn m(x: T) {} }")
 
     def test_module_is_reserved(self):
         with self.assertRaisesRegex(KursError, "1:1: `module` is a reserved keyword$"):

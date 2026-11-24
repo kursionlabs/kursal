@@ -915,6 +915,13 @@ These are the places where Kursal differs from what one might expect.
   always in scope. What else the compiler provides, `core` exports from the module it belongs to, and
   code imports it like any other name (see the reference compiler's README, "Builtins"):
   `use std::ptr::NonNull;`, `use std::mem::sizeof;`, `use std::cap::Brand;`.
+- **Declarations.** A function, an impl's method and an instance's method each have a body (`a
+  function needs a body; only a trait method or an extern is a signature`). A trait method is a
+  signature ending in `;`, and every instance gives it a body: there are no default methods (`a
+  trait method is a signature; its body belongs in each instance`). `forall` comes before a
+  struct, tuple, enum, function, impl, trait or instance, and before an impl's method; never before
+  a `use` or a `const` (`` `forall` comes before a struct, tuple, enum, function, impl, trait or
+  instance ``, `` in an impl, `forall` comes before a method ``).
 - **`Sized[T]`** says that `T` has a finite by-value layout of non-zero size. It is a premise of a
   function or an instance (so of each of its methods), never of a type declaration, and no program
   declares an instance of it. It holds of a type that mentions no type parameter when that type is
@@ -957,7 +964,10 @@ These are the places where Kursal differs from what one might expect.
   or a float suffix (`7f64`); a point needs digits on both sides.
 - **`unsafe`** marks one operation: `unsafe f(x)` calls an unsafe or extern function, `unsafe *p`
   reads through a pointer, `unsafe (x as *T)` casts, `f(unsafe &*p)` lends a pointer's target.
-  `unsafe (unsafe malloc(n) as *T)` is two operations. A safe function may contain unsafe operations.
+  `unsafe (unsafe malloc(n) as *T)` is two operations. A safe function may contain unsafe operations,
+  and an `unsafe fn`'s body is no unsafe context: each unsafe operation in it is marked too, and
+  `unsafe fn` says only that its callers take on an obligation. A store through a raw pointer is the
+  statement `unsafe *p = v;`.
   `as` between two number types is a conversion by value and needs no `unsafe` (see "Number
   conversions"); a float's bits are `x.to_bits()` and `f64::from_bits(b)`. An unsafe cast neither
   makes nor takes apart a value that holds a package, a brand witness, a function value, a

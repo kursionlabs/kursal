@@ -104,10 +104,16 @@ class UnsafeAuthorizationTests(unittest.TestCase):
         self.reject('unsafe fn read(x: u32) -> u32 { x } '
                     'fn bad() -> u32 { unsafe read(read(7u32)) }')
 
-    def test_unsafe_context_and_lifted_closure(self):
+    def test_an_unsafe_function_body_is_no_unsafe_context(self):
+        self.reject('unsafe fn add(x: i32) -> i32 { x + 1 } unsafe fn run() -> i32 { add(6i32) }')
+        self.reject('unsafe fn add(x: i32) -> i32 { x + 1 } '
+                    'unsafe fn run() -> i32 { let f = |x: i32| add(x); f(6i32) }')
+        self.reject('unsafe fn read(p: *u32) -> u32 { *p }', "reading through a raw pointer needs unsafe")
+
+    def test_a_marked_call_in_a_lifted_closure(self):
         self.run_source('''unsafe fn add(x: i32) -> i32 { x + 1 }
             unsafe fn run() -> i32 {
-                let f = |x: i32| add(x);
+                let f = |x: i32| unsafe add(x);
                 f(6i32)
             }
             fn main() -> i32 { unsafe run() }''', 7)

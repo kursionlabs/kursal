@@ -193,6 +193,7 @@ REJECTED = {
     "glob_of_unknown_module.kur": "4:5: unknown or private member nowhere of std$",
     "function_value_at_two_brands.kur": "22:36: brand mismatch: Tag!\\['b\\] and Tag!\\['a\\]; 'b was opened at 20:5, 'a at 19:5$",
     "forged_file.kur":"the shape of std::io::File! is not exposed here",
+    "inferred_type_in_annotation.kur": "9:19: _ stands for a type argument only in an expression, where inference fills it in$",
     "implicit_package_open.kur": "pattern does not match exists '1\\. \\(Tag!\\['1\\], u32\\)",
     "implicit_package_open_assignment.kur": "type mismatch: exists '1\\. Tag!\\['1\\] and Tag!\\['a\\]",
     "implicit_package_open_plain_let.kur": "a struct pattern needs a struct, not exists '1\\. Tag!\\['1\\]",
@@ -217,6 +218,7 @@ REJECTED = {
     "unbound_result_brand.kur": "brand '1 is not in scope",
     "unknown_name_in_use_tree.kur": "4:28: unknown or private member Maybe of option$",
     "unused_unknown_import.kur": "4:5: unknown or private member Maybe of option$",
+    "unmarked_in_unsafe_fn.kur": "11:13: reading through a raw pointer needs unsafe$",
     "while_consume_without_replacement.kur": "25:5: .*linear value 'h' remains live where the loop at 25:5 starts, but not when it repeats$",
     "write_by_number.kur": "13:19: calling an unsafe function needs unsafe$",
 }

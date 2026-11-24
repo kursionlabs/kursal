@@ -75,16 +75,19 @@ class CastTypingTests(unittest.TestCase):
             self.run_source('fn bad(x: bool) -> bool { unsafe ((x as u32) as bool) } '
                             'fn main() -> i32 { 0i32 }', 0)
 
-    def test_unsafe_function_and_lifted_closure_authorize_casts(self):
-        self.run_source('''unsafe fn convert(x: bool) -> i32 {
-            let f = |y: bool| y as i32;
-            f(x) + (x as i32) + 5
-        }
-        fn main() -> i32 { unsafe convert(true) }''', 7)
+    def test_an_unsafe_function_authorizes_no_cast(self):
+        for body in ('unsafe (p as usize)', 'let f = |q: *u8| unsafe (q as usize); f(p)'):
+            with self.subTest(body=body):
+                self.run_source('unsafe fn address(p: *u8) -> usize { ' + body + ' } '
+                                'fn main() -> i32 { 0i32 }', 0)
+        for body in ('p as usize', 'let f = |q: *u8| q as usize; f(p)'):
+            with self.subTest(body=body), self.assertRaisesRegex(LowerError, 'needs unsafe'):
+                self.run_source('unsafe fn address(p: *u8) -> usize { ' + body + ' } '
+                                'fn main() -> i32 { 0i32 }', 0)
 
     def test_values_of_abstract_types_are_not_cast(self):
         with self.assertRaisesRegex(KursError, 'an unsafe cast cannot produce or take apart'):
-            self.run_source('''forall T, U. unsafe fn convert(x: T) -> U { x as U }
+            self.run_source('''forall T, U. unsafe fn convert(x: T) -> U { unsafe (x as U) }
                 fn main() -> i32 { (unsafe convert[(u32, u32), (i32, i32)]((7u32, 9u32))).0 }
             ''', 7)
 

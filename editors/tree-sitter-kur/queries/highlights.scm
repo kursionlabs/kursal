@@ -42,6 +42,7 @@
 ; -------------------------------------------------------------- functions --
 
 (function_declaration name: (identifier) @function)
+(function_signature name: (identifier) @function)
 (extern_function name: (identifier) @function)
 
 (call_expression

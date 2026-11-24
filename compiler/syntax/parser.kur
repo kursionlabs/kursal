@@ -639,8 +639,14 @@ impl Parser['k] {
     }
 
     fn item(self, &cx: Domain!['k]) -> S::Item['k] {
-        let quantifier = if self.at(&cx, "forall") { Option::Some.(self.forall_clause(&cx)) } else { Option::None };
-        self.item_body(&cx, quantifier)
+        if !self.at(&cx, "forall") {
+            return self.item_body(&cx, Option::None);
+        }
+        let quantifier = self.forall_clause(&cx);
+        if self.at(&cx, "use") || self.at(&cx, "export") || self.at(&cx, "const") {
+            self.error(&cx, self.tok(&cx), Span::from_static(&cx, "`forall` comes before a struct, tuple, enum, function, impl, trait or instance"));
+        }
+        self.item_body(&cx, Option::Some.(quantifier))
     }
 
     // `BRAND ("," BRAND)* "."`: nonempty, with no trailing comma.
@@ -708,7 +714,7 @@ impl Parser['k] {
             let unit = self.next(&cx);
             let tree = self.use_tree(&cx);
             let unit = self.expect(&cx, ";");
-            return S::Item::Use.(S::UseItem.{ tree, is_export: k.is(&cx, "export"), quantifier, pos: start });
+            return S::Item::Use.(S::UseItem.{ tree, is_export: k.is(&cx, "export"), pos: start });
         }
         if k.is(&cx, "module") {
             self.error(&cx, self.tok(&cx), Span::from_static(&cx, "`module` is a reserved keyword"));
@@ -741,13 +747,13 @@ impl Parser['k] {
             let unit = self.expect(&cx, "{");
             let methods: ArenaVec[S::Fn['k], 'k] = ArenaVec::new(&cx);
             while !self.at(&cx, "}") {
-                methods.push(&cx, self.fn_decl(&cx, Option::None));
+                methods.push(&cx, self.trait_method(&cx));
             }
             let unit = self.next(&cx);
             return S::Item::Trait.(S::TraitDecl.{ id: self.id(&cx), name, methods, quantifier, pos: start });
         }
         if k.is(&cx, "const") {
-            return S::Item::Const.(self.const_decl(&cx, quantifier));
+            return S::Item::Const.(self.const_decl(&cx));
         }
         self.fail(&cx)
     }
@@ -914,7 +920,7 @@ impl Parser['k] {
         (name, params, Option::Some.(self.type(&cx)), ret_pos)
     }
 
-    // `"unsafe"? fn_header (";" | block)`.
+    // `"unsafe"? fn_header block`.
     fn fn_decl(self, &cx: Domain!['k], quantifier: Option[S::Forall['k]]) -> S::Fn['k] {
         let start = self.pos(&cx);
         let is_unsafe = self.eat(&cx, "unsafe");
@@ -923,8 +929,23 @@ impl Parser['k] {
 
     fn fn_rest(self, &cx: Domain!['k], start: Pos, is_unsafe: bool, quantifier: Option[S::Forall['k]]) -> S::Fn['k] {
         let (name, params, ret, _ret_pos) = self.fn_header(&cx);
-        let body = if self.eat(&cx, ";") { Option::None } else { Option::Some.(self.block(&cx)) };
-        S::Fn.{ id: self.id(&cx), name, params, ret, body, is_unsafe, quantifier, pos: start }
+        if self.at(&cx, ";") {
+            self.error(&cx, self.tok(&cx), Span::from_static(&cx, "a function needs a body; only a trait method or an extern is a signature"));
+        }
+        let body = self.block(&cx);
+        S::Fn.{ id: self.id(&cx), name, params, ret, body: Option::Some.(body), is_unsafe, quantifier, pos: start }
+    }
+
+    // `"unsafe"? fn_header ";"`: a signature, which each instance gives a body.
+    fn trait_method(self, &cx: Domain!['k]) -> S::Fn['k] {
+        let start = self.pos(&cx);
+        let is_unsafe = self.eat(&cx, "unsafe");
+        let (name, params, ret, _ret_pos) = self.fn_header(&cx);
+        if self.at(&cx, "{") {
+            self.error(&cx, self.tok(&cx), Span::from_static(&cx, "a trait method is a signature; its body belongs in each instance"));
+        }
+        let unit = self.expect(&cx, ";");
+        S::Fn.{ id: self.id(&cx), name, params, ret, body: Option::None, is_unsafe, quantifier: Option::None, pos: start }
     }
 
     fn extern_decl(self, &cx: Domain!['k], quantifier: Option[S::Forall['k]]) -> S::Extern['k] {
@@ -937,7 +958,7 @@ impl Parser['k] {
         S::Extern.{ id: self.id(&cx), abi, name, params, ret, quantifier, pos: start, abi_pos: Pos.{ line: tok.line, col: tok.col }, ret_pos }
     }
 
-    fn const_decl(self, &cx: Domain!['k], quantifier: Option[S::Forall['k]]) -> S::Const['k] {
+    fn const_decl(self, &cx: Domain!['k]) -> S::Const['k] {
         let start = self.pos(&cx);
         let unit = self.expect(&cx, "const");
         let name = self.name(&cx);
@@ -946,7 +967,7 @@ impl Parser['k] {
         let unit = self.expect(&cx, "=");
         let value = self.expr(&cx);
         let unit = self.expect(&cx, ";");
-        S::Const.{ id: self.id(&cx), name, type, value, quantifier, pos: start }
+        S::Const.{ id: self.id(&cx), name, type, value, pos: start }
     }
 
     fn impl_block(self, &cx: Domain!['k], quantifier: Option[S::Forall['k]]) -> S::Impl['k] {
@@ -956,10 +977,13 @@ impl Parser['k] {
         let unit = self.expect(&cx, "{");
         let items: ArenaVec[S::Member['k], 'k] = ArenaVec::new(&cx);
         while !self.at(&cx, "}") {
-            let member_forall = if self.at(&cx, "forall") { Option::Some.(self.forall_clause(&cx)) } else { Option::None };
             if self.at(&cx, "const") {
-                items.push(&cx, S::Member::Const.(self.const_decl(&cx, member_forall)));
+                items.push(&cx, S::Member::Const.(self.const_decl(&cx)));
             } else {
+                let member_forall = if self.at(&cx, "forall") { Option::Some.(self.forall_clause(&cx)) } else { Option::None };
+                if self.at(&cx, "const") {
+                    self.error(&cx, self.tok(&cx), Span::from_static(&cx, "in an impl, `forall` comes before a method"));
+                }
                 items.push(&cx, S::Member::Fn.(self.fn_decl(&cx, member_forall)));
             }
         }
@@ -1107,8 +1131,10 @@ impl Parser['k] {
         if self.at(&cx, "BRAND") {
             return Type::Brand.(self.next(&cx).text);
         }
-        if self.eat(&cx, "_") {
-            return Type::Ignored;
+        if self.at(&cx, "_") {
+            let at = self.pos(&cx);
+            let unit = self.next(&cx);
+            return Type::Ignored.(at);
         }
         self.type(&cx)
     }
@@ -1173,7 +1199,7 @@ impl Parser['k] {
             return Parsed::Stmt.(Statement::Let.(self.let_stmt(&cx)));
         }
         if k.is(&cx, "const") {
-            return Parsed::Stmt.(Statement::Const.(self.const_decl(&cx, Option::None)));
+            return Parsed::Stmt.(Statement::Const.(self.const_decl(&cx)));
         }
         if is_block_like(&cx, k) {
             let e = self.block_like(&cx);
@@ -1207,7 +1233,16 @@ impl Parser['k] {
                 self.oexpr_from(&cx, Expr::Unary.(S::Unary.{ id: self.id(&cx), op: Span::from_static(&cx, "unsafe"), operand: ref_in(&cx, operand), pos: start }))
             }
         } else {
-            self.expr(&cx)
+            let first = self.tok(&cx);
+            let e = self.expr(&cx);
+            let deref = match e {
+                Unary(u) => u.op.is(&cx, "*"),
+                _ => false,
+            };
+            if deref && self.at(&cx, "=") {
+                self.error(&cx, first, Span::from_static(&cx, "a store through a raw pointer is written `unsafe *p = v;`"));
+            }
+            e
         };
         if self.eat(&cx, "=") {
             if !assignable(&cx, e) {

@@ -80,7 +80,7 @@ INFERENCES = (
     'fn bad(x: (u32,)) -> u32 { x as u32 } fn main() -> i32 { 0i32 }',
     'fn main() -> i32 {\n            let x = -1i8;\n            if (x as u32) == 4294967295u32 && (255u32 as i8) == -1i8 { 7i32 } else { 0i32 }\n        }',
     'fn main() -> i32 { let x = unsafe ((unsafe (0usize as *u32)) as f32); 0i32 }',
-    'forall T, U. unsafe fn convert(x: T) -> U { x as U }\n                fn main() -> i32 { (unsafe convert[(u32, u32), (i32, i32)]((7u32, 9u32))).0 }\n            ',
+    'forall T, U. unsafe fn convert(x: T) -> U { unsafe (x as U) }\n                fn main() -> i32 { (unsafe convert[(u32, u32), (i32, i32)]((7u32, 9u32))).0 }\n            ',
     "fn main() -> i32 {\n                let f = || {\n                    let exists 'a. witness = core::cap::fresh();\n                    let size = core::mem::sizeof[(u32, core::cap::Brand['a])]();\n                    if size == core::mem::sizeof[(u32, core::cap::Brand['a])]() { 7i32 } else { 1i32 }\n                };\n                f()\n            }",
     'fn main() -> i32 {\n            var n = 3u32;\n            let f = |x: u32| n + x;\n            n = 10;\n            (f(2) as i32)\n        }',
     "forall 'a. fn use_brand(w: core::cap::Brand['a]) -> u32 {\n            let f = |n: u32| { let witness = w; n + 1u32 };\n            f(4)\n        }\n        fn main() -> i32 {\n            let exists 'a. witness = core::cap::fresh();\n            (use_brand(witness) as i32)\n        }",

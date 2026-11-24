@@ -86,16 +86,16 @@ REJECTED = {
     # Unsafe operations do not conjure Never, packages, brand witnesses or values of abstract types.
     "cast_to_never": ("unsafe_cast_cannot_produce", """
         (type L! (struct (a u32)))
-        (fun (unsafe) h u32 (L! u32) (entry ((%l L!) (%x u32)) (= %n (cast %x !)) (unreachable)))"""),
+        (fun (unsafe) h u32 (L! u32) (entry ((%l L!) (%x u32)) (unsafe (= %n (cast %x !))) (unreachable)))"""),
     "deref_to_never": ("unsafe_read_cannot_produce_never", """
         (fun (unsafe) h u32 ((ptr !)) (entry ((%p (ptr !)))
-          (= %n (ptr_load %p)) (unreachable)))"""),
+          (unsafe (= %n (ptr_load %p))) (unreachable)))"""),
     # Nor a value that holds Never: a named type's fields are its value.
     "deref_to_struct_holding_never": ("unsafe_read_cannot_produce_never", """
         (type L! (struct (a u32)))
         (type S (struct (n !)))
         (fun (unsafe) h u32 (L! (ptr S)) (entry ((%l L!) (%p (ptr S)))
-          (= %s (ptr_load %p)) (= %n (destruct %s S)) (unreachable)))"""),
+          (unsafe (= %s (ptr_load %p))) (= %n (destruct %s S)) (unreachable)))"""),
     "lend_target_holding_never": ("unsafe_read_cannot_produce_never", """
         (type S (struct (n !)))
         (fun get u32 (S) (entry ((&s S)) (= %v (load &s)) (= %n (destruct %v S)) (unreachable)))
@@ -103,36 +103,36 @@ REJECTED = {
     "deref_to_tuple_holding_never": ("unsafe_read_cannot_produce_never", """
         (type L! (struct (a u32)))
         (fun (unsafe) h u32 (L! (ptr (tuple !))) (entry ((%l L!) (%p (ptr (tuple !))))
-          (= %s (ptr_load_volatile %p)) (= %n (destruct %s (tuple !))) (unreachable)))"""),
+          (unsafe (= %s (ptr_load_volatile %p))) (= %n (destruct %s (tuple !))) (unreachable)))"""),
     "cast_to_static_brand": ("unsafe_cast_cannot_produce", """
         (fun (unsafe) h (brand $static) (u32)
-          (entry ((%x u32)) (= %b (cast %x (brand $static))) (ret %b)))"""),
+          (entry ((%x u32)) (unsafe (= %b (cast %x (brand $static)))) (ret %b)))"""),
     "cast_to_nested_package": ("unsafe_cast_cannot_produce", """
         (fun (unsafe) h (tuple (exists ($k) (brand $k))) ((tuple u32))
-          (entry ((%x (tuple u32))) (= %n (cast %x (tuple (exists ($k) (brand $k))))) (ret %n)))"""),
+          (entry ((%x (tuple u32))) (unsafe (= %n (cast %x (tuple (exists ($k) (brand $k)))))) (ret %n)))"""),
     "cast_to_named_function": ("unsafe_cast_cannot_produce", """
         (type S (struct (f (fn () u32))))
-        (fun (unsafe) h S (u64) (entry ((%x u64)) (= %s (cast %x S)) (ret %s)))"""),
+        (fun (unsafe) h S (u64) (entry ((%x u64)) (unsafe (= %s (cast %x S))) (ret %s)))"""),
     "cast_to_nested_named_brand": ("unsafe_cast_cannot_produce", """
         (type W (struct (b (brand $static))))
         (type O (struct (n u64) (w W)))
-        (fun (unsafe) h O (u64) (entry ((%x u64)) (= %o (cast %x O)) (ret %o)))"""),
+        (fun (unsafe) h O (u64) (entry ((%x u64)) (unsafe (= %o (cast %x O))) (ret %o)))"""),
     "cast_from_named_function": ("unsafe_cast_cannot_produce", """
         (type S (struct (f (fn () u32))))
-        (fun (unsafe) h u64 (S) (entry ((%s S)) (= %x (cast %s u64)) (ret %x)))"""),
+        (fun (unsafe) h u64 (S) (entry ((%s S)) (unsafe (= %x (cast %s u64))) (ret %x)))"""),
     "cast_from_abstract": ("unsafe_cast_cannot_produce", """
-        (fun (unsafe) h (forall (T) () u32 (T) (entry ((%x T)) (= %n (cast %x u32)) (ret %n))))"""),
+        (fun (unsafe) h (forall (T) () u32 (T) (entry ((%x T)) (unsafe (= %n (cast %x u32))) (ret %n))))"""),
 
     # A raw pointer is cast only to or from a pointer or an integer, named types unfolded: a struct
     # holding a pointer is not one.
     "cast_pointer_to_struct_of_pointer": ("pointer_cast_pointer_or_integer", """
         (type W (struct (p (ptr u8))))
-        (fun (unsafe) h W ((ptr u8)) (entry ((%p (ptr u8))) (= %w (cast %p W)) (ret %w)))"""),
+        (fun (unsafe) h W ((ptr u8)) (entry ((%p (ptr u8))) (unsafe (= %w (cast %p W))) (ret %w)))"""),
     "cast_struct_of_pointer_to_pointer": ("pointer_cast_pointer_or_integer", """
         (type W (struct (p (ptr u8))))
-        (fun (unsafe) h (ptr u8) (W) (entry ((%w W)) (= %p (cast %w (ptr u8))) (ret %p)))"""),
+        (fun (unsafe) h (ptr u8) (W) (entry ((%w W)) (unsafe (= %p (cast %w (ptr u8)))) (ret %p)))"""),
     "cast_pointer_to_float": ("pointer_cast_pointer_or_integer", """
-        (fun (unsafe) h f64 ((ptr u8)) (entry ((%p (ptr u8))) (= %f (cast %p f64)) (ret %f)))"""),
+        (fun (unsafe) h f64 ((ptr u8)) (entry ((%p (ptr u8))) (unsafe (= %f (cast %p f64))) (ret %f)))"""),
 
     # Re-entering a nominal type's premises must descend. A brand an existential binds is a different
     # variable from the function's brand, however each is spelled: here the reentry into A changes its
@@ -166,7 +166,7 @@ REJECTED = {
     "atomic_fetch_on_struct": ("atomic_pointee_type", """
         (type S (struct (a u32)))
         (fun (unsafe) h u32 ((ptr S) S) (entry ((%p (ptr S)) (%s S))
-          (= %v (ptr_atomic_fetch_add seq_cst %p %s)) (= %r (const u32 0)) (ret %r)))"""),
+          (unsafe (= %v (ptr_atomic_fetch_add seq_cst %p %s))) (= %r (const u32 0)) (ret %r)))"""),
 
     # A foreach type has an expansion at every instantiation: `*F` matches only pointer components, so its
     # source must show them as written, whatever its type arguments are, and not through a name.
@@ -403,7 +403,7 @@ REJECTED = {
         (fun f (forall (T) ((Exposed (foreach (F T) F))) u32 () (entry () (= %r (const u32 0)) (ret %r))))"""),
     "foreach_stack_slot": ("a pointee expands to a foreach type", """
         (fun (unsafe) f u32 () (entry ()
-          (= %p (alloca (foreach (F (tuple u32)) F))) (= %r (const u32 0)) (ret %r)))"""),
+          (unsafe (= %p (alloca (foreach (F (tuple u32)) F)))) (= %r (const u32 0)) (ret %r)))"""),
 
     # An enum has at least one variant: a sum of none would be a type with no value.
     "empty_enum_declaration": ("an enum has at least one variant", "(type E (enum))"),
@@ -424,56 +424,56 @@ REJECTED = {
     # a parameter it needs Sized of the type: an exact premise, or a part with bytes whatever the
     # parameters are.
     "zero_size_unit_load": ("raw_access_at_zero_size", """
-        (fun (unsafe) f (tuple) ((ptr (tuple))) (entry ((%p (ptr (tuple)))) (= %u (ptr_load %p)) (ret %u)))"""),
+        (fun (unsafe) f (tuple) ((ptr (tuple))) (entry ((%p (ptr (tuple)))) (unsafe (= %u (ptr_load %p))) (ret %u)))"""),
     "zero_size_empty_array_store": ("raw_access_at_zero_size", """
         (fun (unsafe) f (tuple) ((ptr (array u64 0)) (array u64 0))
-          (entry ((%p (ptr (array u64 0))) (%a (array u64 0))) (= %u (ptr_store %p %a)) (ret %u)))"""),
+          (entry ((%p (ptr (array u64 0))) (%a (array u64 0))) (unsafe (= %u (ptr_store %p %a))) (ret %u)))"""),
     "zero_size_alloca": ("raw_access_at_zero_size", """
         (type Marker (struct))
-        (fun (unsafe) f (tuple) () (entry () (= %p (alloca Marker)) (= %u (construct (tuple))) (ret %u)))"""),
+        (fun (unsafe) f (tuple) () (entry () (unsafe (= %p (alloca Marker))) (= %u (construct (tuple))) (ret %u)))"""),
     "zero_size_linear_store": ("raw_access_at_zero_size", """
         (type Cap! (struct))
         (fun (unsafe) f (tuple) ((ptr Cap!) Cap!) (entry ((%p (ptr Cap!)) (%c Cap!))
-          (= %u (ptr_store %p %c)) (ret %u)))"""),
+          (unsafe (= %u (ptr_store %p %c))) (ret %u)))"""),
     "zero_size_linear_volatile_store": ("raw_access_at_zero_size", """
         (type Cap! (struct))
         (fun (unsafe) f (tuple) ((ptr (tuple Cap! (tuple))) (tuple Cap! (tuple)))
           (entry ((%p (ptr (tuple Cap! (tuple)))) (%c (tuple Cap! (tuple))))
-            (= %u (ptr_store_volatile %p %c)) (ret %u)))"""),
+            (unsafe (= %u (ptr_store_volatile %p %c))) (ret %u)))"""),
     "zero_size_linear_load": ("raw_access_at_zero_size", """
         (type Cap! (struct))
-        (fun (unsafe) f Cap! ((ptr Cap!)) (entry ((%p (ptr Cap!))) (= %c (ptr_load %p)) (ret %c)))"""),
+        (fun (unsafe) f Cap! ((ptr Cap!)) (entry ((%p (ptr Cap!))) (unsafe (= %c (ptr_load %p))) (ret %c)))"""),
     "zero_size_witness_load": ("raw_access_at_zero_size", """
         (type W (forall ($k) () (struct (b (brand $k)) (u (tuple)))))
-        (fun (unsafe) f (forall ($k) () (W $k) ((ptr (W $k))) (entry ((%p (ptr (W $k)))) (= %w (ptr_load_volatile %p)) (ret %w))))"""),
+        (fun (unsafe) f (forall ($k) () (W $k) ((ptr (W $k))) (entry ((%p (ptr (W $k)))) (unsafe (= %w (ptr_load_volatile %p))) (ret %w))))"""),
     "zero_size_witness_store": ("raw_access_at_zero_size", """
         (fun (unsafe) f (forall ($k) () (tuple) ((ptr (brand $k)) (brand $k))
-          (entry ((%p (ptr (brand $k))) (%b (brand $k))) (= %u (ptr_store %p %b)) (ret %u))))"""),
+          (entry ((%p (ptr (brand $k))) (%b (brand $k))) (unsafe (= %u (ptr_store %p %b))) (ret %u))))"""),
     "zero_size_package_load": ("raw_access_at_zero_size", """
         (fun (unsafe) f (exists ($a) (brand $a)) ((ptr (exists ($a) (brand $a))))
-          (entry ((%p (ptr (exists ($a) (brand $a))))) (= %w (ptr_load %p)) (ret %w)))"""),
+          (entry ((%p (ptr (exists ($a) (brand $a))))) (unsafe (= %w (ptr_load %p))) (ret %w)))"""),
     "parameter_load_without_sized": ("raw_access_needs_sized", """
-        (fun (unsafe) f (forall (T) ((Copy T)) T ((ptr T)) (entry ((%p (ptr T))) (= %v (ptr_load %p)) (ret %v))))"""),
+        (fun (unsafe) f (forall (T) ((Copy T)) T ((ptr T)) (entry ((%p (ptr T))) (unsafe (= %v (ptr_load %p))) (ret %v))))"""),
     "parameter_alloca_without_sized": ("raw_access_needs_sized", """
-        (fun (unsafe) f (forall (T) () (ptr T) () (entry () (= %p (alloca T)) (ret %p))))"""),
+        (fun (unsafe) f (forall (T) () (ptr T) () (entry () (unsafe (= %p (alloca T))) (ret %p))))"""),
     "parameter_tuple_from_sized_parts": ("raw_access_needs_sized", """
         (fun (unsafe) f (forall (T U) ((Sized T) (Sized U)) (tuple) ((ptr (tuple T U)) (tuple T U))
-          (entry ((%p (ptr (tuple T U))) (%v (tuple T U))) (= %u (ptr_store %p %v)) (ret %u))))"""),
+          (entry ((%p (ptr (tuple T U))) (%v (tuple T U))) (unsafe (= %u (ptr_store %p %v))) (ret %u))))"""),
     "parameter_empty_array_with_sized": ("raw_access_needs_sized", """
-        (fun (unsafe) f (forall (T) ((Sized T)) (tuple) () (entry () (= %p (alloca (array T 0))) (= %u (construct (tuple))) (ret %u))))"""),
+        (fun (unsafe) f (forall (T) ((Sized T)) (tuple) () (entry () (unsafe (= %p (alloca (array T 0)))) (= %u (construct (tuple))) (ret %u))))"""),
     # The premise is discharged where the generic function is called, by shape or by the caller's own.
     "parameter_load_at_a_brand_holding_struct": ("unsatisfied_premise", """
         (type W (forall ($k) () (struct (b (brand $k)) (u (tuple)))))
-        (fun (unsafe) get (forall (T) ((Copy T) (Sized T)) T ((ptr T)) (entry ((%p (ptr T))) (= %v (ptr_load %p)) (ret %v))))
+        (fun (unsafe) get (forall (T) ((Copy T) (Sized T)) T ((ptr T)) (entry ((%p (ptr T))) (unsafe (= %v (ptr_load %p))) (ret %v))))
         (fun (unsafe) f (W $static) ((ptr (W $static)))
           (entry ((%p (ptr (W $static)))) (= %w (call (get (W $static)) %p)) (ret %w)))"""),
 
     # A zero-size type is erased: an unsafe cast has no representation of one to reinterpret, and C has
     # no zero-size parameter or object for an extern.
     "cast_to_unit": ("zero_size_type_has_no_memory_form", """
-        (fun (unsafe) h (tuple) (u8) (entry ((%x u8)) (= %u (cast %x (tuple))) (ret %u)))"""),
+        (fun (unsafe) h (tuple) (u8) (entry ((%x u8)) (unsafe (= %u (cast %x (tuple)))) (ret %u)))"""),
     "cast_from_unit": ("zero_size_type_has_no_memory_form", """
-        (fun (unsafe) h u8 ((tuple)) (entry ((%u (tuple))) (= %x (cast %u u8)) (ret %x)))"""),
+        (fun (unsafe) h u8 ((tuple)) (entry ((%u (tuple))) (unsafe (= %x (cast %u u8))) (ret %x)))"""),
     "extern_unit_parameter": ("zero_size_type_has_no_memory_form", "(extern fun f u32 ((tuple)))"),
     # There is no extern value: a foreign datum is reached through a function that returns a pointer to it.
     "extern_value": ("an extern is \\(extern fun NAME RET \\(PTYPE\\*\\)\\)", "(extern value v (tuple u64 u8))"),
@@ -520,7 +520,7 @@ REJECTED = {
         (fun g (forall (T) () usize () (entry () (= %n (sizeof (foreach ((ptr F) (ptr T)) (tuple F)))) (ret %n))))"""),
     "raw_target_lend_without_sized": ("raw_access_needs_sized", """
         (fun get (forall (T) () u32 (T) (entry ((&x T)) (= %r (const u32 0)) (ret %r))))
-        (fun (unsafe) f (forall (T) () u32 ((ptr T)) (entry ((%p (ptr T))) (= %r (call (get T) &*%p)) (ret %r))))"""),
+        (fun (unsafe) f (forall (T) () u32 ((ptr T)) (entry ((%p (ptr T))) (unsafe (= %r (call (get T) &*%p))) (ret %r))))"""),
     # Foreign code calls an `unsafe fn` of the signature with values: it lends no place, so no function
     # type in an extern's signature takes a place parameter, nested or behind a pointer.
     "extern_zero_size_linear_result": ("extern_zero_size_linear_result", """
@@ -601,8 +601,8 @@ class CoreSoundnessTests(unittest.TestCase):
             # An unsafe cast may make and take apart a restricted type outside its module: the type's
             # invariants are the cast's obligation (lib/std/CONTRACTS.md, section 4).
             """(type (in (module 0 a) abstract) Secret (struct (k u32)))
-               (fun (in (module 0 b) unsafe) make Secret (u32) (entry ((%x u32)) (= %s (cast %x Secret)) (ret %s)))
-               (fun (in (module 0 b) unsafe) open u32 (Secret) (entry ((%s Secret)) (= %x (cast %s u32)) (ret %x)))""",
+               (fun (in (module 0 b) unsafe) make Secret (u32) (entry ((%x u32)) (unsafe (= %s (cast %x Secret))) (ret %s)))
+               (fun (in (module 0 b) unsafe) open u32 (Secret) (entry ((%s Secret)) (unsafe (= %x (cast %s u32))) (ret %x)))""",
             # Sizes are public: of a hidden type, of a type holding one, of a type parameter.
             """(type (in (module 0 a) abstract) Secret (struct (k u32)))
                (fun (in (module 0 b)) h usize () (entry () (= %n (sizeof Secret)) (ret %n)))
@@ -631,12 +631,12 @@ class CoreSoundnessTests(unittest.TestCase):
             # through a pointer never produces Never, here at `rd[(u32, !)]`, which is `Sized`, is the
             # unsafe read's obligation (lib/std/CONTRACTS.md, section 2.3), which nothing checks.
             """(type L! (struct (a u32)))
-               (fun (unsafe) rd (forall (T) ((Sized T)) T ((ptr T)) (entry ((%p (ptr T))) (= %v (ptr_load %p)) (ret %v))))
+               (fun (unsafe) rd (forall (T) ((Sized T)) T ((ptr T)) (entry ((%p (ptr T))) (unsafe (= %v (ptr_load %p))) (ret %v))))
                (fun (unsafe) h u32 (L! (ptr (tuple u32 !))) (entry ((%l L!) (%p (ptr (tuple u32 !))))
-                 (= %n (call (rd (tuple u32 !)) %p)) (= (%a %b) (destruct %n (tuple u32 !))) (= %c (copy %b)) (unreachable)))""",
+                 (unsafe (= %n (call (rd (tuple u32 !)) %p))) (= (%a %b) (destruct %n (tuple u32 !))) (= %c (copy %b)) (unreachable)))""",
             # A pointer read out of memory is a value; what it points at is not.
             """(type S (struct (n !)))
-               (fun (unsafe) h (ptr S) ((ptr (ptr S))) (entry ((%p (ptr (ptr S)))) (= %q (ptr_load %p)) (ret %q)))""",
+               (fun (unsafe) h (ptr S) ((ptr (ptr S))) (entry ((%p (ptr (ptr S)))) (unsafe (= %q (ptr_load %p))) (ret %q)))""",
             # A foreign function that does not return, one that hands back an `unsafe fn` value (calling
             # it needs `unsafe`), parameters, which the result rule does not reach, and a callback whose
             # result is unit, C's `void`.
@@ -651,13 +651,13 @@ class CoreSoundnessTests(unittest.TestCase):
                (type Ref (forall (T) () (struct (ptr (ptr T)))))
                (type Node (forall (T) () (struct (value T) (next (Ref (Node T))))))
                (extern fun make A ())
-               (fun (unsafe) read A ((ptr A)) (entry ((%p (ptr A))) (= %a (ptr_load %p)) (ret %a)))
+               (fun (unsafe) read A ((ptr A)) (entry ((%p (ptr A))) (unsafe (= %a (ptr_load %p))) (ret %a)))
                (fun (unsafe) cast (Node u64) ((tuple u64 (ptr u8))) (entry ((%t (tuple u64 (ptr u8))))
-                 (= %n (cast %t (Node u64))) (ret %n)))""",
+                 (unsafe (= %n (cast %t (Node u64)))) (ret %n)))""",
             # A cast of a type holding itself in an array of length 0, which holds no value.
             """(type R (struct (a (array R 0)) (b u32)))
                (fun (unsafe) h (tuple u64 R) ((tuple u64 R)) (entry ((%t (tuple u64 R)))
-                 (= %s (cast %t (tuple u64 R))) (ret %s)))""",
+                 (unsafe (= %s (cast %t (tuple u64 R)))) (ret %s)))""",
             # A foreach body names the caller's type parameter beside its own binder.
             """(fun m (forall (X Y) () (tuple X Y) (X Y)
                  (entry ((%x X) (%y Y)) (= %t (construct (tuple X Y) %x %y)) (ret %t))))
@@ -686,14 +686,14 @@ class CoreSoundnessTests(unittest.TestCase):
             # `Sized` of exactly it, and at an open struct with a field of bytes, called at `u32`.
             """(type Q (forall (T) () (struct (a u32) (b T))))
                (fun (unsafe) get (forall (T) ((Copy T) (Sized T)) T ((ptr T))
-                 (entry ((%p (ptr T))) (= %v (ptr_load %p)) (ret %v))))
+                 (entry ((%p (ptr T))) (unsafe (= %v (ptr_load %p))) (ret %v))))
                (fun (unsafe) put (forall (T) ((Sized T)) (tuple) ((ptr T) T)
-                 (entry ((%p (ptr T)) (%v T)) (= %u (ptr_store_volatile %p %v)) (ret %u))))
+                 (entry ((%p (ptr T)) (%v T)) (unsafe (= %u (ptr_store_volatile %p %v))) (ret %u))))
                (fun (unsafe) pair (forall (T U) ((Copy T) (Copy U) (Sized (tuple T U))) (ptr (tuple T U)) ()
-                 (entry () (= %p (alloca (tuple T U))) (ret %p))))
+                 (entry () (unsafe (= %p (alloca (tuple T U)))) (ret %p))))
                (fun (unsafe) open (forall (T) ((Copy T)) (Q T) ((ptr (Q T)))
-                 (entry ((%p (ptr (Q T)))) (= %v (ptr_load %p)) (ret %v))))
-               (fun (unsafe) f u32 ((ptr u32)) (entry ((%p (ptr u32))) (= %v (call (get u32) %p)) (ret %v)))""",
+                 (entry ((%p (ptr (Q T)))) (unsafe (= %v (ptr_load %p))) (ret %v))))
+               (fun (unsafe) f u32 ((ptr u32)) (entry ((%p (ptr u32))) (unsafe (= %v (call (get u32) %p))) (ret %v)))""",
             # Pointer projection at the pointer's own type.
             """(type S (struct (a u32)))
                (fun h u32 ((ptr S)) (entry ((%p (ptr S)))
@@ -726,7 +726,7 @@ UNSAFE_INSTRUCTIONS = {
 
 
 class UnsafeOperationTests(unittest.TestCase):
-    """Each operation of `UNSAFE_OPS` needs the `(unsafe ...)` marker in a safe function, and only those do."""
+    """Each operation of `UNSAFE_OPS` needs the `(unsafe ...)` marker, in an unsafe function too, and only those do."""
 
     def program(self, instr: str) -> str:
         return f"(fun f u32 ((ptr u32) u32 u32) (entry ((%p (ptr u32)) (%x u32) (%y u32)) {instr} (= %r (const u32 0)) (ret %r)))"
@@ -742,9 +742,9 @@ class UnsafeOperationTests(unittest.TestCase):
                 with self.assertRaisesRegex(KursError, "unsafe_authorization"):
                     check_program(parse_program(self.program(instr)))
 
-    def test_an_unsafe_function_needs_no_marker(self):
+    def test_an_unsafe_function_needs_the_marker_too(self):
         for op, instr in UNSAFE_INSTRUCTIONS.items():
-            with self.subTest(op=op):
+            with self.subTest(op=op), self.assertRaisesRegex(KursError, "unsafe_authorization"):
                 check_program(parse_program(self.program(instr).replace("(fun f", "(fun (unsafe) f", 1)))
 
     def test_safe_operations_need_no_marker(self):

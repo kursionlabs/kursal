@@ -253,7 +253,7 @@ def promote_locals(fun: C.Fun, types: Types, params: Sequence[C.Param],
                 term = C.Ret('%out', instr.pos)
             helper = C.Fun(name, generic, premises, ret, tuple(t for _, t in bindings),
                            (C.Block('entry', tuple(bindings), tuple(body), term),), locals_,
-                           fun.unsafe or instr.unsafe, fun.module, instr.pos)
+                           instr.unsafe, fun.module, instr.pos)
             helpers.append(helper)
             tys = tuple(C.Skolem(p.name) if p.kind == C.BRAND else C.Named(p.name) for p in generic)
             if isinstance(result, C.Never):

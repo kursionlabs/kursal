@@ -98,7 +98,7 @@ class ZeroSizeTests(unittest.TestCase):
         # parts sit beside bytes moves only the bytes.
         output = self.run_core('''(type Marker (struct))
             (type Mixed (struct (m Marker) (n u32) (u (tuple))))
-            (fun (unsafe) read (forall (T) ((Copy T) (Sized T)) T ((ptr T)) (entry ((%p (ptr T))) (= %v (ptr_load %p)) (ret %v))))
+            (fun (unsafe) read (forall (T) ((Copy T) (Sized T)) T ((ptr T)) (entry ((%p (ptr T))) (unsafe (= %v (ptr_load %p))) (ret %v))))
             (fun main i32 () (entry ()
               (unsafe (= %p (alloca Mixed)))
               (= %p1 (copy %p)) (= %p2 (copy %p)) (= %p3 (copy %p))
