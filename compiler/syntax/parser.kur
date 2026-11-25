@@ -19,7 +19,7 @@ use std::option::Option;
 // Every keyword, each between spaces.
 forall 'k.
 fn keywords(&cx: Domain!['k]) -> Span['k] {
-    Span::from_static(&cx, " use export module struct tuple enum fn extern impl trait instance const forall where as exposed unsafe closure exists foreach of in for while if else match let var return pack true false self _ ")
+    Span::from_static(&cx, " use export module struct tuple enum type fn extern impl trait instance const forall where as exposed unsafe closure exists foreach of in for while if else match let var return pack true false self _ ")
 }
 // ------------------------------------------------------------------ lexer --
 
@@ -644,7 +644,7 @@ impl Parser['k] {
         }
         let quantifier = self.forall_clause(&cx);
         if self.at(&cx, "use") || self.at(&cx, "export") || self.at(&cx, "const") {
-            self.error(&cx, self.tok(&cx), Span::from_static(&cx, "`forall` comes before a struct, tuple, enum, function, impl, trait or instance"));
+            self.error(&cx, self.tok(&cx), Span::from_static(&cx, "`forall` comes before a struct, tuple, enum, type alias, function, impl, trait or instance"));
         }
         self.item_body(&cx, Option::Some.(quantifier))
     }
@@ -719,7 +719,7 @@ impl Parser['k] {
         if k.is(&cx, "module") {
             self.error(&cx, self.tok(&cx), Span::from_static(&cx, "`module` is a reserved keyword"));
         }
-        if k.is(&cx, "exposed") || k.is(&cx, "struct") || k.is(&cx, "tuple") || k.is(&cx, "enum") {
+        if k.is(&cx, "exposed") || k.is(&cx, "struct") || k.is(&cx, "tuple") || k.is(&cx, "enum") || k.is(&cx, "type") {
             return self.aggregate(&cx, quantifier);
         }
         if k.is(&cx, "unsafe") {
@@ -816,6 +816,9 @@ impl Parser['k] {
             Option::None
         };
         let kind = self.k(&cx);
+        if kind.is(&cx, "type") {
+            return S::Item::Alias.(self.type_alias(&cx, start, exposure, quantifier));
+        }
         if !kind.is(&cx, "struct") && !kind.is(&cx, "tuple") && !kind.is(&cx, "enum") {
             self.fail(&cx);
         }
@@ -828,7 +831,7 @@ impl Parser['k] {
             while !self.at(&cx, "}") {
                 let field_name = self.name(&cx);
                 let unit = self.expect(&cx, ":");
-                fields.push(&cx, S::FieldDecl.{ name: field_name, type: self.type(&cx) });
+                fields.push(&cx, S::FieldDecl.{ name: field_name, ty: self.ty(&cx) });
                 if !self.eat(&cx, ",") {
                     let unit = self.expect(&cx, "}");
                     return S::Item::Struct.(S::StructDecl.{ id: self.id(&cx), name, fields, exposure, quantifier, pos: start, name_pos });
@@ -856,12 +859,23 @@ impl Parser['k] {
         S::Item::Enum.(S::EnumDecl.{ id: self.id(&cx), name, variants, exposure, quantifier, pos: start, name_pos })
     }
 
+    // `type NAME = TYPE ;`, after an `exposed` that signatures reject.
+    fn type_alias(self, &cx: Domain!['k], start: Pos, exposure: Option[S::Exposed['k]], quantifier: Option[S::Forall['k]]) -> S::TypeAlias['k] {
+        let unit = self.expect(&cx, "type");
+        let name_pos = self.pos(&cx);
+        let name = self.segment(&cx);
+        let unit = self.expect(&cx, "=");
+        let body = self.ty(&cx);
+        let unit = self.expect(&cx, ";");
+        S::TypeAlias.{ id: self.id(&cx), name, body, exposure, quantifier, pos: start, name_pos }
+    }
+
     // `type ("," type)* ","? ")"`, possibly empty; the `(` was read.
     fn types_until_close(self, &cx: Domain!['k]) -> ArenaVec[Type['k], 'k] {
         let out: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         var going = true;
         while going && !self.at(&cx, ")") {
-            out.push(&cx, self.type(&cx));
+            out.push(&cx, self.ty(&cx));
             going = self.eat(&cx, ",");
         }
         let unit = self.expect(&cx, ")");
@@ -872,13 +886,13 @@ impl Parser['k] {
         let name = self.name(&cx);
         let payload: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         if self.eat(&cx, "(") {
-            payload.push(&cx, self.type(&cx));
+            payload.push(&cx, self.ty(&cx));
             var going = true;
             while going && self.eat(&cx, ",") {
                 if self.at(&cx, ")") {
                     going = false;
                 } else {
-                    payload.push(&cx, self.type(&cx));
+                    payload.push(&cx, self.ty(&cx));
                 }
             }
             let unit = self.expect(&cx, ")");
@@ -893,12 +907,12 @@ impl Parser['k] {
             let start = self.pos(&cx);
             let lend = self.eat(&cx, "&");
             if out.is_empty(&cx) && self.eat(&cx, "self") {
-                let type = if self.eat(&cx, ":") { Option::Some.(self.type(&cx)) } else { Option::None };
-                out.push(&cx, S::Param.{ name: Span::from_static(&cx, "self"), type, lend, pos: start });
+                let ty = if self.eat(&cx, ":") { Option::Some.(self.ty(&cx)) } else { Option::None };
+                out.push(&cx, S::Param.{ name: Span::from_static(&cx, "self"), ty, lend, pos: start });
             } else {
                 let name = self.name(&cx);
                 let unit = self.expect(&cx, ":");
-                out.push(&cx, S::Param.{ name, type: Option::Some.(self.ptype(&cx)), lend, pos: start });
+                out.push(&cx, S::Param.{ name, ty: Option::Some.(self.ptype(&cx)), lend, pos: start });
             }
             going = self.eat(&cx, ",");
         }
@@ -917,7 +931,7 @@ impl Parser['k] {
             return (name, params, Option::None, no_pos());
         }
         let ret_pos = self.pos(&cx);
-        (name, params, Option::Some.(self.type(&cx)), ret_pos)
+        (name, params, Option::Some.(self.ty(&cx)), ret_pos)
     }
 
     // `"unsafe"? fn_header block`.
@@ -963,17 +977,17 @@ impl Parser['k] {
         let unit = self.expect(&cx, "const");
         let name = self.name(&cx);
         let unit = self.expect(&cx, ":");
-        let type = self.type(&cx);
+        let ty = self.ty(&cx);
         let unit = self.expect(&cx, "=");
         let value = self.expr(&cx);
         let unit = self.expect(&cx, ";");
-        S::Const.{ id: self.id(&cx), name, type, value, pos: start }
+        S::Const.{ id: self.id(&cx), name, ty, value, pos: start }
     }
 
     fn impl_block(self, &cx: Domain!['k], quantifier: Option[S::Forall['k]]) -> S::Impl['k] {
         let start = self.pos(&cx);
         let unit = self.expect(&cx, "impl");
-        let type = self.type(&cx);
+        let ty = self.ty(&cx);
         let unit = self.expect(&cx, "{");
         let items: ArenaVec[S::Member['k], 'k] = ArenaVec::new(&cx);
         while !self.at(&cx, "}") {
@@ -988,23 +1002,23 @@ impl Parser['k] {
             }
         }
         let unit = self.next(&cx);
-        S::Impl.{ id: self.id(&cx), type, items, quantifier, pos: start }
+        S::Impl.{ id: self.id(&cx), ty, items, quantifier, pos: start }
     }
 
     fn instance_decl(self, &cx: Domain!['k], start: Pos, quantifier: Option[S::Forall['k]]) -> S::InstanceDecl['k] {
         let unit = self.expect(&cx, "instance");
-        let type = self.type(&cx);
+        let ty = self.ty(&cx);
         let unit = self.expect(&cx, "{");
         let methods: ArenaVec[S::Fn['k], 'k] = ArenaVec::new(&cx);
         while !self.at(&cx, "}") {
             methods.push(&cx, self.fn_decl(&cx, Option::None));
         }
         let unit = self.next(&cx);
-        S::InstanceDecl.{ id: self.id(&cx), type, methods, quantifier, pos: start }
+        S::InstanceDecl.{ id: self.id(&cx), ty, methods, quantifier, pos: start }
     }
 
     // ---- types
-    fn type(self, &cx: Domain!['k]) -> Type['k] {
+    fn ty(self, &cx: Domain!['k]) -> Type['k] {
         self.type_in(&cx, false)
     }
 
@@ -1027,7 +1041,7 @@ impl Parser['k] {
         }
         if k.is(&cx, "*") {
             let unit = self.next(&cx);
-            return Type::Ptr.(ref_in(&cx, self.type(&cx)));
+            return Type::Ptr.(ref_in(&cx, self.ty(&cx)));
         }
         if k.is(&cx, "!") {
             let unit = self.next(&cx);
@@ -1038,7 +1052,7 @@ impl Parser['k] {
             if self.eat(&cx, ")") {
                 return Type::Tuple.(ArenaVec::new(&cx));
             }
-            let first = self.type(&cx);
+            let first = self.ty(&cx);
             if self.eat(&cx, ")") {
                 return first;
             }
@@ -1049,7 +1063,7 @@ impl Parser['k] {
         }
         if k.is(&cx, "[") {
             let unit = self.next(&cx);
-            let elem = self.type(&cx);
+            let elem = self.ty(&cx);
             let unit = self.expect(&cx, ";");
             let length = self.expr(&cx);
             let unit = self.expect(&cx, "]");
@@ -1061,13 +1075,13 @@ impl Parser['k] {
             let unit = self.expect(&cx, "(");
             let params = self.fn_params(&cx);
             let unit = self.expect(&cx, "->");
-            return Type::Fn.(S::TFn.{ params, ret: ref_in(&cx, self.type(&cx)), is_unsafe });
+            return Type::Fn.(S::TFn.{ params, ret: ref_in(&cx, self.ty(&cx)), is_unsafe });
         }
         if k.is(&cx, "closure") {
             let unit = self.next(&cx);
             var env = Option::None;
             if self.eat(&cx, "[") {
-                env = Option::Some.(ref_in(&cx, self.type(&cx)));
+                env = Option::Some.(ref_in(&cx, self.ty(&cx)));
                 let unit = self.expect(&cx, "]");
             } else if !parameter {
                 self.fail(&cx);
@@ -1075,12 +1089,12 @@ impl Parser['k] {
             let unit = self.expect(&cx, "(");
             let params = self.fn_params(&cx);
             let unit = self.expect(&cx, "->");
-            return Type::Closure.(S::TClosure.{ env, params, ret: ref_in(&cx, self.type(&cx)) });
+            return Type::Closure.(S::TClosure.{ env, params, ret: ref_in(&cx, self.ty(&cx)) });
         }
         if k.is(&cx, "exists") {
             let unit = self.next(&cx);
             let (brands, positions) = self.positioned_brands(&cx);
-            return Type::Exists.(brands, positions, ref_in(&cx, self.type(&cx)));
+            return Type::Exists.(brands, positions, ref_in(&cx, self.ty(&cx)));
         }
         if k.is(&cx, "foreach") {
             let start = self.pos(&cx);
@@ -1088,9 +1102,9 @@ impl Parser['k] {
             let indirect = self.eat(&cx, "*");
             let binder = self.name(&cx);
             let unit = self.expect(&cx, "of");
-            let source = self.type(&cx);
+            let source = self.ty(&cx);
             let unit = self.expect(&cx, "=>");
-            return Type::Foreach.(S::TForeach.{ binder, indirect, source: ref_in(&cx, source), body: ref_in(&cx, self.type(&cx)), pos: start });
+            return Type::Foreach.(S::TForeach.{ binder, indirect, source: ref_in(&cx, source), body: ref_in(&cx, self.ty(&cx)), pos: start });
         }
         self.fail(&cx)
     }
@@ -1105,9 +1119,9 @@ impl Parser['k] {
                     let unit = self.name(&cx);
                 }
                 let unit = self.expect(&cx, ":");
-                out.push(&cx, S::Slot.{ lend: true, type: self.type(&cx) });
+                out.push(&cx, S::Slot.{ lend: true, ty: self.ty(&cx) });
             } else {
-                out.push(&cx, S::Slot.{ lend: false, type: self.ptype(&cx) });
+                out.push(&cx, S::Slot.{ lend: false, ty: self.ptype(&cx) });
             }
             going = self.eat(&cx, ",");
         }
@@ -1136,7 +1150,7 @@ impl Parser['k] {
             let unit = self.next(&cx);
             return Type::Ignored.(at);
         }
-        self.type(&cx)
+        self.ty(&cx)
     }
 
     // `a, b` or `a, b -> c`, with an optional trailing comma; ends before the `]`.
@@ -1275,11 +1289,11 @@ impl Parser['k] {
         let unit = self.next(&cx);
         let brands = if self.eat(&cx, "exists") { self.brands(&cx) } else { ArenaVec::new(&cx) };
         let pattern = self.pattern(&cx);
-        let type = if self.eat(&cx, ":") { Option::Some.(self.type(&cx)) } else { Option::None };
+        let ty = if self.eat(&cx, ":") { Option::Some.(self.ty(&cx)) } else { Option::None };
         let unit = self.expect(&cx, "=");
         let value = self.expr(&cx);
         let unit = self.expect(&cx, ";");
-        S::Let.{ id: self.id(&cx), pattern, type, value, brands, mutable, pos: start }
+        S::Let.{ id: self.id(&cx), pattern, ty, value, brands, mutable, pos: start }
     }
 
     fn pattern(self, &cx: Domain!['k]) -> S::Pattern['k] {
@@ -1537,14 +1551,14 @@ impl Parser['k] {
             while going && !self.at(&cx, "|") {
                 let lend = self.eat(&cx, "&");
                 let name = self.name(&cx);
-                let type = if self.eat(&cx, ":") { Option::Some.(self.ptype(&cx)) } else { Option::None };
-                params.push(&cx, S::ClosureParam.{ lend, name, type });
+                let ty = if self.eat(&cx, ":") { Option::Some.(self.ptype(&cx)) } else { Option::None };
+                params.push(&cx, S::ClosureParam.{ lend, name, ty });
                 going = self.eat(&cx, ",");
             }
             let unit = self.expect(&cx, "|");
         }
         if self.eat(&cx, "->") {
-            let ret = self.type(&cx);
+            let ret = self.ty(&cx);
             let body = Expr::Block.(self.block(&cx));
             return Expr::Closure.(S::Closure.{ id: self.id(&cx), params, ret: Option::Some.(ret), body: ref_in(&cx, body), pos: start });
         }
@@ -1595,8 +1609,8 @@ impl Parser['k] {
         while self.at(&cx, "as") {
             self.enter(&cx);
             let unit = self.next(&cx);
-            let type = self.type(&cx);
-            left = Expr::Cast.(S::Cast.{ id: self.id(&cx), value: ref_in(&cx, left), type, pos: start });
+            let ty = self.ty(&cx);
+            left = Expr::Cast.(S::Cast.{ id: self.id(&cx), value: ref_in(&cx, left), ty, pos: start });
             casts = casts + 1usize;
         }
         self.leave(&cx, casts);

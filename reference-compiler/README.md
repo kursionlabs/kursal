@@ -16,7 +16,7 @@ development tools (`pyproject.toml`, `uv.lock`); mypy checks `kursal/`.
 |---|---|---|
 | Parse | `parser.py` | the surface AST of `syntax.py` |
 | Resolve | `resolve.py` | the package graph from `kur.toml`; every path bound to what it names |
-| Signatures | `sigs.py`, `formation.py`, `layout.py`, `coherence.py`, `termination.py` | declaration types in core terms; folded constants, but for arithmetic on `usize` and `isize`, which the C compiler folds |
+| Signatures | `sigs.py`, `formation.py`, `layout.py`, `coherence.py`, `termination.py` | declaration types in core terms, each type alias replaced by the type it stands for; folded constants, but for arithmetic on `usize` and `isize`, which the C compiler folds |
 | Inference | `infer.py`, `unify.py`, `types.py` | the type of every expression; call targets; closure captures |
 | Lowering | `lower.py`, `placeflow.py`, `promote.py` | a KURS program (`core.py`), with `&` places and block contracts |
 | Checking | `check.py` | acceptance by the core rules |

@@ -5,10 +5,11 @@ identity. Functions, methods, externs and trait methods get core
 signatures, with place modes. Consts are folded to values, except arithmetic
 on `usize` and `isize`, which the C compiler folds.
 
-Errors are reported together, in source order, a step at a time: the type declarations, the Copy checks of
-their type arguments, which declarations are linear, the other declarations, and whether each instance
-conforms to its trait. A step runs only when every step before it succeeded, and a declaration reports at
-most its first error. An error in a constant stops at once: it would recur wherever the constant is used.
+Errors are reported together, in source order, a step at a time: the type aliases, the type declarations,
+the Copy checks of their type arguments, which declarations and aliases are linear, the other declarations,
+and whether each instance conforms to its trait. A step runs only when every step before it succeeded, and
+a declaration reports at most its first error. An error in a constant stops at once: it would recur
+wherever the constant is used.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from .resolve import Decl, Resolver
 from .sexpr import KursError, Position, counted, located
 from .layout import check_type_expansion, check_written_type
 from .literals import valid_literal
-from .types import Surface, Types, equal, subst
+from .types import Surface, Types, equal, free_names, subst
 
 LIBRARY = {  # name: (home library, path there, path through std)
     "Option": ("core", ("option", "Option"), ("option", "Option")),
@@ -32,9 +33,12 @@ LIBRARY = {  # name: (home library, path there, path through std)
     "Buffer!": ("alloc", ("buffer", "Buffer!"), ("buffer", "Buffer!")),
     "Iterator": ("core", ("iter", "Iterator"), ("iter", "Iterator")),
     "Format": ("core", ("fmt", "Format"), ("fmt", "Format")),
-    "Writable": ("core", ("fmt", "Writable"), ("fmt", "Writable")),
+    "Writer": ("core", ("fmt", "Writer"), ("fmt", "Writer")),
     "Slice::from_raw_parts": ("core", ("slice", "Slice", "from_raw_parts"), ("slice", "Slice", "from_raw_parts")),
     "Buffer!::new": ("alloc", ("buffer", "Buffer!", "new"), ("buffer", "Buffer!", "new")),
+    "ReadingWriter!": ("core", ("fmt", "ReadingWriter!"), ("fmt", "ReadingWriter!")),
+    "ReadingWriter!::new": ("core", ("fmt", "ReadingWriter!", "new"), ("fmt", "ReadingWriter!", "new")),
+    "ReadingWriter!::finish": ("core", ("fmt", "ReadingWriter!", "finish"), ("fmt", "ReadingWriter!", "finish")),
     "Ordering": ("core", ("atomic", "Ordering"), ("atomic", "Ordering")),
 }
 
@@ -60,6 +64,40 @@ def name_pos(decl: Decl) -> Optional[Position]:
 
 def fail(message: str, pos: Optional[Position] = None) -> Never:
     raise SigError(message, pos)
+
+
+def aliases_named(ty: S.Type) -> list[Decl]:
+    """The type aliases that `ty` names, in the order they are written."""
+    out: list[Decl] = []
+
+    def walk(t: S.Type) -> None:
+        match t:
+            case S.TName(args=args):
+                if t.ref is not None and t.ref[0] == "decl" and t.ref[1].kind == "alias":
+                    out.append(t.ref[1])
+                for a in args:
+                    walk(a)
+            case S.TPtr(inner=inner):
+                walk(inner)
+            case S.TTuple(elems=elems):
+                for e in elems:
+                    walk(e)
+            case S.TArray(elem=elem):
+                walk(elem)
+            case S.TFn(params=params, ret=ret) | S.TClosure(params=params, ret=ret):
+                for _, p in params:
+                    walk(p)
+                walk(ret)
+                if isinstance(t, S.TClosure) and t.env is not None:
+                    walk(t.env)
+            case S.TExists(body=body):
+                walk(body)
+            case S.TForeach(source=source, body=body):
+                walk(source)
+                walk(body)
+
+    walk(ty)
+    return out
 
 
 @dataclass
@@ -138,6 +176,20 @@ class Signatures:
         self.foreach_checks: list[tuple[C.Foreach, dict[str, C.Kind], Decl, Optional[Position]]] = []
         self.declaring: Optional[Decl] = None
         self.types_ready = False
+        # Each type alias's parameters and the core type it stands for, put in its place wherever it is written.
+        self.aliases: dict[Decl, tuple[tuple[C.Param, ...], C.Type]] = {}
+        failed: set[Decl] = set()
+        for decl in self.aliases_in_order():
+            node = decl.node
+            assert isinstance(node, S.TypeAlias)
+            if any(named in failed for named in aliases_named(node.body)):
+                failed.add(decl)
+                continue
+            with self.reporting(decl.module, node.pos):
+                failed.add(decl)
+                self.alias(decl)
+                failed.discard(decl)
+        resolver.stop(SigError)
         for scope in resolver.scopes.values():
             for decl in scope.decls.values():
                 if decl.kind in ("struct", "enum", "tuple"):
@@ -165,6 +217,9 @@ class Signatures:
                 if decl.kind in ("struct", "enum", "tuple") and not decl.name.endswith("!"):
                     with self.reporting(decl.module, decl.node.pos):
                         self.unmarked(decl, types)
+        for decl in self.aliases:
+            with self.reporting(decl.module, decl.node.pos):
+                self.alias_linearity(decl, types)
         resolver.stop(SigError)
         for scope in resolver.scopes.values():
             for decl in scope.decls.values():
@@ -296,6 +351,10 @@ class Signatures:
                         if args:
                             fail("Never takes no type arguments", pos)
                         return C.Never()
+                    case ("decl", decl) if decl.kind == "alias":
+                        self.check_arguments(decl, args, scope, pos)
+                        params, body = self.alias(decl)
+                        return subst(body, {p.name: a for p, a in zip(params, args)})
                     case ("decl", decl):
                         self.check_arguments(decl, args, scope, pos)
                         return C.Named(self.name(decl), args)
@@ -376,6 +435,76 @@ class Signatures:
         if value[1] == 0:
             fail("an array has at least one element", expr.pos)
         return value[1]
+
+    # ---- type aliases
+    def aliases_in_order(self) -> list[Decl]:
+        """Every type alias, each after the aliases its body names. An alias that refers to itself, directly
+        or through others, is reported, and left out with every alias that names it."""
+        order: list[Decl] = []
+        done: dict[Decl, bool] = {}
+        stack: list[Decl] = []
+
+        def visit(decl: Decl) -> bool:
+            if decl in done:
+                return done[decl]
+            node = decl.node
+            assert isinstance(node, S.TypeAlias)
+            if decl in stack:
+                chain = stack[stack.index(decl) + 1:]
+                through = f" through {', '.join(d.name for d in chain)}" if chain else ""
+                self.r.report(SigError(f"type alias {decl.name} refers to itself{through}", node.pos), decl.module)
+                return False
+            stack.append(decl)
+            fine = all([visit(named) for named in aliases_named(node.body)])
+            stack.pop()
+            done[decl] = fine
+            if fine:
+                order.append(decl)
+            return fine
+
+        for scope in self.r.scopes.values():
+            for decl in scope.decls.values():
+                if decl.kind == "alias":
+                    visit(decl)
+        return order
+
+    def alias(self, decl: Decl) -> tuple[tuple[C.Param, ...], C.Type]:
+        """The parameters of the type alias `decl` and the core type it stands for. Its forall lists only
+        parameters, and its body uses each of them."""
+        if decl in self.aliases:
+            return self.aliases[decl]
+        node = decl.node
+        assert isinstance(node, S.TypeAlias)
+        if node.exposed is not None:
+            fail("a type alias is never exposed: it has no representation of its own", node.pos)
+        if node.forall is not None and (node.forall.premises or node.forall.determined):
+            fail(f"type alias {decl.name} takes no premises or determined parameters", node.pos)
+        declaring, self.declaring = self.declaring, decl
+        try:
+            params, _, scope = self.forall(node.forall, Scope())
+            body = self.type(node.body, scope)
+        finally:
+            self.declaring = declaring
+        used = free_names(body)
+        for p in params:
+            if p.name not in used:
+                spelled = f"'{p.name}" if p.kind == C.BRAND else p.name
+                fail(f"type alias {decl.name} does not use its parameter {spelled}", node.pos)
+        self.aliases[decl] = (params, body)
+        return params, body
+
+    def alias_linearity(self, decl: Decl, types: Types) -> None:
+        """A type alias's name ends with `!` exactly when the type it stands for is linear whatever its type
+        arguments are."""
+        params, body = self.aliases[decl]
+        node = decl.node
+        assert isinstance(node, S.TypeAlias)
+        linear = not types.is_copy(body, {p.name: C.COPY for p in params if p.kind != C.BRAND})
+        if linear and not decl.name.endswith("!"):
+            fail(f"type alias {decl.name} stands for a linear type; name it {decl.name}!", node.name_pos)
+        if not linear and decl.name.endswith("!"):
+            fail(f"type alias {decl.name} stands for a type that is not linear; name it {decl.name[:-1]}",
+                 node.name_pos)
 
     # ---- declarations
     def type_decl(self, decl: Decl) -> C.TypeDecl:

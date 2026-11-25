@@ -17,7 +17,7 @@ from .core import LITERAL_BITS
 from .sexpr import ESCAPES, KursError, Position
 
 KEYWORDS = frozenset(
-    "use export module struct tuple enum fn extern impl trait instance const forall where as exposed unsafe "
+    "use export module struct tuple enum type fn extern impl trait instance const forall where as exposed unsafe "
     "closure exists foreach of in for while if else match let var return pack true false self _".split())
 
 SCAN = re.compile(r"""
@@ -236,7 +236,7 @@ class Parser:
             return self.item_body()
         forall = self.forall()
         if self.k in ("use", "export", "const"):
-            self.error(self.t[self.i], "`forall` comes before a struct, tuple, enum, function, impl, trait or instance")
+            self.error(self.t[self.i], "`forall` comes before a struct, tuple, enum, type alias, function, impl, trait or instance")
         decl = self.item_body()
         decl.forall = forall
         return decl
@@ -293,7 +293,7 @@ class Parser:
             return S.Use(tree, k == "export", start)
         if k == "module":
             self.error(self.t[self.i], "`module` is a reserved keyword")
-        if k in ("exposed", "struct", "tuple", "enum"):
+        if k in ("exposed", "struct", "tuple", "enum", "type"):
             return self.aggregate()
         if k == "unsafe":
             self.next()
@@ -349,7 +349,7 @@ class Parser:
             names.append(self.segment())
         return tuple(names)
 
-    def aggregate(self) -> S.Struct | S.TupleDecl | S.EnumDecl:
+    def aggregate(self) -> S.Struct | S.TupleDecl | S.EnumDecl | S.TypeAlias:
         start, exposed = self.pos(), None
         if self.eat("exposed"):
             scope = None
@@ -358,6 +358,8 @@ class Parser:
                 self.expect(")")
             exposed = S.Exposed(scope)
         kind = self.k
+        if kind == "type":
+            return self.type_alias(start, exposed)
         if kind not in ("struct", "tuple", "enum"):
             self.fail()
         self.next()
@@ -378,6 +380,18 @@ class Parser:
             decl = S.EnumDecl(name, tuple(self.list_until("}", self.variant)), exposed, None, start)
         decl.name_pos = name_pos
         return decl
+
+    def type_alias(self, start: Position, exposed: Optional[S.Exposed]) -> S.TypeAlias:
+        """`type NAME = TYPE ;`, after an `exposed` that signatures reject."""
+        self.expect("type")
+        name_pos = self.pos()
+        name = self.segment()
+        self.expect("=")
+        body = self.type()
+        self.expect(";")
+        alias = S.TypeAlias(name, body, exposed, None, start)
+        alias.name_pos = name_pos
+        return alias
 
     def field(self) -> tuple[str, S.Type]:
         name = self.name()

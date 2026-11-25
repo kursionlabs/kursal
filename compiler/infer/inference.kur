@@ -105,7 +105,8 @@ exposed enum Callee {
     TypedBuiltin(Span['k], Type['k]),
     // a pointer method, and its receiver
     Pointer(Span['k], Expr['k]),
-    FStringWrite(S::FStr['k]),
+    // an f-string written into a writer, and the place `.write(&cx, out)` lends, if any
+    FStringWrite(S::FStr['k], Option[Expr['k]]),
 }
 
 // One captured binding, in first-use order.
@@ -173,7 +174,7 @@ exposed struct Bundle {
 
 forall 'k.
 exposed struct Local {
-    type: Type['k],
+    ty: Type['k],
     // a var, or an `&` parameter
     mutable: bool,
     // a `..rest` bundle
@@ -379,7 +380,7 @@ forall 'k.
 fn members_settled(&cx: Domain!['k], ms: ArenaVec[Member['k], 'k]) -> bool {
     var i = 0usize;
     while i < ms.len(&cx) {
-        if !settled(&cx, ms.at(&cx, i).type) {
+        if !settled(&cx, ms.at(&cx, i).ty) {
             return false;
         }
         i = i + 1usize;
@@ -643,11 +644,12 @@ impl Infer['k] {
             literals: ArenaVec::new(&cx), brand_checks: ArenaVec::new(&cx), foreaches: ArenaMap::new(&cx), open_binders: ref_in(&cx, List::empty()),
             binder_checks: ArenaVec::new(&cx), capture_checks: ArenaVec::new(&cx), instantiations: ArenaVec::new(&cx), unwritten: ArenaVec::new(&cx), solving: ref_in(&cx, false), returns: ArenaVec::one(&cx, sig.ret),
             scopes: ref_in(&cx, List::empty().cons(&cx, level)), frames: ArenaVec::one(&cx, new_frame(&cx)), allowed: ref_in(&cx, Option::None),
+            fstring_lent: ref_in(&cx, Option::None),
         };
         let ids: ArenaVec[u32, 'k] = ArenaVec::new(&cx);
         i = 0usize;
         while i < sig.pnames.len(&cx) {
-            let local = Local.{ type: sig.ptypes.at(&cx, i), mutable: has_place(&cx, sig.places, i), rest: Option::None, depth: 0usize, id: self.next_id(&cx) };
+            let local = Local.{ ty: sig.ptypes.at(&cx, i), mutable: has_place(&cx, sig.places, i), rest: Option::None, depth: 0usize, id: self.next_id(&cx) };
             level.names.insert(&cx, sig.pnames.at(&cx, i), local);
             ids.push(&cx, local.id);
             i = i + 1usize;
@@ -774,7 +776,7 @@ impl Infer['k] {
             Some(b) => b,
             None => return false,
         };
-        let param = match impl_block.type {
+        let param = match impl_block.ty {
             Name(n) => n.path.at(&cx, 0usize),
             _ => return false,
         };
@@ -847,6 +849,8 @@ exposed struct Body {
     frames: ArenaVec[Frame['k], 'k],
     // the brands a type recorded here may mention, until a scope opens or closes some
     allowed: Ref[Option[ArenaSet[Span['k], 'k]], 'k],
+    // the id of the local whose place `f"...".write(&cx, out)` lends while its `{x}` are inferred
+    fstring_lent: Ref[Option[u32], 'k],
 }
 
 forall 'k.
@@ -1424,6 +1428,12 @@ impl Body['k] {
         let found = self.scopes.copy(&cx).find_map(&cx, |&cx, level: Level['k]| level.names.get(&cx, name));
         match found {
             Some(local) => {
+                match self.fstring_lent.copy(&cx) {
+                    Some(id) => if id == local.id {
+                        self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(" is lent to this f-string; it cannot be used inside it").save(&cx), pos);
+                    },
+                    None => (),
+                }
                 // every closure it is used inside captures it
                 var f = local.depth + 1usize;
                 while f < self.frames.len(&cx) {
@@ -1442,7 +1452,7 @@ impl Body['k] {
     fn bind(self, &cx: Domain!['k], name: Span['k], ty: Type['k], mutable: bool, rest: Option[Bundle['k]]) -> Local['k] {
         self.check_brand_scope(&cx, ty, no_pos());
         self.binder_checks.push(&cx, (ty, self.open_binders.copy(&cx)));
-        let local = Local.{ type: ty, mutable, rest, depth: self.frames.len(&cx) - 1usize, id: self.inf.next_id(&cx) };
+        let local = Local.{ ty: ty, mutable, rest, depth: self.frames.len(&cx) - 1usize, id: self.inf.next_id(&cx) };
         self.level(&cx).names.insert(&cx, name, local);
         local
     }
@@ -1537,7 +1547,7 @@ impl Body['k] {
             sub.insert(&cx, names.at(&cx, i), brands.at(&cx, names.at(&cx, i)));
             i = i + 1usize;
         }
-        subst(&cx, self.inf.sigs.got(&cx, self.inf.sigs.type(&cx, type_expr, scope)), sub, self.inf.counter)
+        subst(&cx, self.inf.sigs.got(&cx, self.inf.sigs.ty(&cx, type_expr, scope)), sub, self.inf.counter)
     }
 
     fn opt_type(self, &cx: Domain!['k], t: Option[S::Type['k]]) -> Option[Type['k]] {
@@ -1573,7 +1583,7 @@ impl Body['k] {
                 if !l.brands.is_empty(&cx) {
                     return self.let_exists(&cx, l);
                 }
-                let want = self.opt_type(&cx, l.type);
+                let want = self.opt_type(&cx, l.ty);
                 let got = self.check(&cx, l.value, want);
                 self.pattern(&cx, l.pattern, match want {
                     Some(t) => t,
@@ -1582,7 +1592,7 @@ impl Body['k] {
                 is_never(&cx, got)
             },
             Const(c) => {
-                let value = self.inf.sigs.got(&cx, self.inf.sigs.typed(&cx, c.name, c.value, self.core_type(&cx, c.type), self.home));
+                let value = self.inf.sigs.got(&cx, self.inf.sigs.typed(&cx, c.name, c.value, self.core_type(&cx, c.ty), self.home));
                 self.results().folded.insert(&cx, c.id, value);
                 let ty = match const_type(&cx, value) {
                     Some(t) => t,
@@ -1650,7 +1660,7 @@ impl Body['k] {
         }
         self.results().opened.insert(&cx, l.id, labels);
         let payload = subst(&cx, body, sub, self.inf.counter);
-        let unit = match l.type {
+        let unit = match l.ty {
             Some(t) => self.unify_at(&cx, payload, self.core_type(&cx, t), l.pos),
             None => (),
         };
@@ -1754,7 +1764,7 @@ impl Body['k] {
         let by_name: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
         var i = 0usize;
         while i < fields.len(&cx) {
-            by_name.insert(&cx, fields.at(&cx, i).name, fields.at(&cx, i).type);
+            by_name.insert(&cx, fields.at(&cx, i).name, fields.at(&cx, i).ty);
             i = i + 1usize;
         }
         let names = f.metas.keys(&cx);
@@ -1771,7 +1781,7 @@ impl Body['k] {
         i = 0usize;
         while i < fields.len(&cx) {
             if !f.metas.contains(&cx, fields.at(&cx, i).name) {
-                f.bundle.types.insert(&cx, fields.at(&cx, i).name, fields.at(&cx, i).type);
+                f.bundle.types.insert(&cx, fields.at(&cx, i).name, fields.at(&cx, i).ty);
             }
             i = i + 1usize;
         }
@@ -1851,7 +1861,7 @@ impl Body['k] {
             Foreach(f) => self.expr_foreach(&cx, f),
             Cast(c) => {
                 let unit = self.expr(&cx, c.value.copy(&cx));
-                self.core_type(&cx, c.type)
+                self.core_type(&cx, c.ty)
             },
             Field(f) => self.projection(&cx, f.value.copy(&cx), Option::Some.(f.name), 0usize, f.id, f.pos, false, false),
             Index(x) => self.projection(&cx, x.value.copy(&cx), Option::None, x.index, x.id, x.pos, false, false),
@@ -2024,6 +2034,57 @@ impl Body['k] {
         C::named(self.library(&cx, "Buffer!"), ArenaVec::new(&cx))
     }
 
+    // `f"...".write(&cx, out)`: the f-string is written into `ReadingWriter![W, C]`, which wraps
+    // `out: W` with the capability `C` moved out of the place `cx` and put back after, so each `{x}`
+    // may read through it. No `{x}` mentions `cx`'s local while it is lent.
+    fn fstring_reading(self, &cx: Domain!['k], c: S::Call['k], f: S::FStr['k]) -> Type['k] {
+        let lent = c.args.at(&cx, 0usize);
+        let place = match lent {
+            Unary(u) => if u.op.is(&cx, "&") && self.is_place(&cx, u.operand.copy(&cx)) {
+                u.operand.copy(&cx)
+            } else {
+                self.fails(&cx, "write lends its context first: .write(&cx, out)", S::expr_pos(lent))
+            },
+            _ => self.fails(&cx, "write lends its context first: .write(&cx, out)", S::expr_pos(lent)),
+        };
+        let out = self.expr(&cx, c.args.at(&cx, 1usize));
+        self.require(&cx, self.library(&cx, "Writer"), ArenaVec::one(&cx, out), c.pos);
+        let context = self.place_type(&cx, place, false, true);
+        var root = place;
+        var going = true;
+        while going {
+            root = match root {
+                Field(x) => x.value.copy(&cx),
+                Index(x) => x.value.copy(&cx),
+                _ => {
+                    going = false;
+                    root
+                },
+            };
+        }
+        let local = match root {
+            Path(p) => match self.inf.r.refs.get(&cx, p.id) {
+                Some(r) => match r {
+                    Local(name) => self.lookup(&cx, name, p.pos),
+                    _ => Option::None,
+                },
+                None => Option::None,
+            },
+            _ => Option::None,
+        };
+        let lent_id = match local {
+            Some(l) => l.id,
+            None => fail_static("internal error: a lent place with no local at its root"),
+        };
+        let writer = C::named(self.library(&cx, "ReadingWriter!"), ArenaVec::two(&cx, out, context));
+        let outer = self.fstring_lent.copy(&cx);
+        self.fstring_lent.set(&cx, Option::Some.(lent_id));
+        let unit = self.record(&cx, f.id, f.pos, self.expr_fstring(&cx, f, writer));
+        self.fstring_lent.set(&cx, outer);
+        self.results().calls.insert(&cx, c.id, Callee::FStringWrite.(f, Option::Some.(place)));
+        out
+    }
+
     fn expr_path(self, &cx: Domain!['k], p: S::Path['k]) -> Type['k] {
         let r = self.inf.r.refs.get(&cx, p.id);
         let unit = match r {
@@ -2040,7 +2101,7 @@ impl Body['k] {
                         self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(" is a ..rest bundle, not a value").save(&cx), p.pos);
                     }
                     self.results().binders.insert(&cx, p.id, local.id);
-                    return local.type;
+                    return local.ty;
                 },
                 Decl(decl) => {
                     if decl.kind.is(&cx, "const") {
@@ -2141,7 +2202,7 @@ impl Body['k] {
             let unit = match impl_block {
                 Some(b) => {
                     let (_params, _premises, scope) = self.inf.sigs.got(&cx, self.inf.sigs.quantifier(&cx, b.quantifier, new_scope(&cx)));
-                    let target = self.inf.sigs.got(&cx, self.inf.sigs.type(&cx, b.type, scope));
+                    let target = self.inf.sigs.got(&cx, self.inf.sigs.ty(&cx, b.ty, scope));
                     let (name, args) = match target {
                         Named(name, args) => (name, args),
                         _ => self.fails(&cx, "type arguments on a method path need a named impl target", path.pos),
@@ -2236,7 +2297,7 @@ impl Body['k] {
                 var i = 0usize;
                 while i < variants.len(&cx) {
                     if variants.at(&cx, i).name.eq(&cx, name) {
-                        return variants.at(&cx, i).type;
+                        return variants.at(&cx, i).ty;
                     }
                     i = i + 1usize;
                 }
@@ -2254,7 +2315,7 @@ impl Body['k] {
         var i = 0usize;
         while i < variants.len(&cx) {
             if variants.at(&cx, i).name.eq(&cx, name) {
-                return subst(&cx, variants.at(&cx, i).type, sub, self.inf.counter);
+                return subst(&cx, variants.at(&cx, i).ty, sub, self.inf.counter);
             }
             i = i + 1usize;
         }
@@ -2326,7 +2387,7 @@ impl Body['k] {
         let fields: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
         var i = 0usize;
         while i < members.len(&cx) {
-            fields.insert(&cx, members.at(&cx, i).name, subst(&cx, members.at(&cx, i).type, sub, self.inf.counter));
+            fields.insert(&cx, members.at(&cx, i).name, subst(&cx, members.at(&cx, i).ty, sub, self.inf.counter));
             i = i + 1usize;
         }
         let given: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
@@ -2349,7 +2410,7 @@ impl Body['k] {
                         None => self.fail(&cx, Buffer!::new().push_static("unknown local ").push_bytes(&cx, f.name).save(&cx), s.pos),
                     };
                     field_ids.insert(&cx, f.name, local.id);
-                    self.unify_at(&cx, local.type, fields.at(&cx, f.name), s.pos);
+                    self.unify_at(&cx, local.ty, fields.at(&cx, f.name), s.pos);
                 },
             };
             i = i + 1usize;
@@ -2523,7 +2584,7 @@ impl Body['k] {
         let places: ArenaVec[usize, 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < c.params.len(&cx) {
-            params.push(&cx, match c.params.at(&cx, i).type {
+            params.push(&cx, match c.params.at(&cx, i).ty {
                 Some(t) => self.core_type(&cx, t),
                 None => {
                     let meta = new_meta(&cx);
@@ -2565,14 +2626,14 @@ impl Body['k] {
         i = 0usize;
         while i < frame.locals.len(&cx) {
             let (_n, l, _at) = frame.locals.at(&cx, i);
-            env_types.push(&cx, l.type);
+            env_types.push(&cx, l.ty);
             i = i + 1usize;
         }
         let env = Type::Tuple.(env_types);
         let code_params = ArenaVec::one(&cx, env);
         code_params.append(&cx, params);
         let code = C::fn_type(&cx, code_params, ret, false, places);
-        Type::Struct.(ArenaVec::two(&cx, Member.{ name: Span::from_static(&cx, "env"), type: env }, Member.{ name: Span::from_static(&cx, "code"), type: code }))
+        Type::Struct.(ArenaVec::two(&cx, Member.{ name: Span::from_static(&cx, "env"), ty: env }, Member.{ name: Span::from_static(&cx, "code"), ty: code }))
     }
 
     fn expr_pack(self, &cx: Domain!['k], p: S::Pack['k]) -> Type['k] {
@@ -2690,7 +2751,7 @@ impl Body['k] {
         var i = 0usize;
         while i < frame.locals.len(&cx) {
             let (name, local, at) = frame.locals.at(&cx, i);
-            self.capture_checks.push(&cx, (name, local.type, at));
+            self.capture_checks.push(&cx, (name, local.ty, at));
             i = i + 1usize;
         }
         C::foreach_type(&cx, binder, indirect, source, body)
@@ -2814,7 +2875,7 @@ impl Body['k] {
                             self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(if lend { " is captured, and a body cannot lend what it captures; lend it outside, or give a closure a place parameter for it" } else { " is captured, and a body cannot assign what it captures; assign it outside, or give a closure a place parameter for it" }).save(&cx), p.pos);
                         }
                         self.results().binders.insert(&cx, p.id, local.id);
-                        return self.record(&cx, p.id, p.pos, local.type);
+                        return self.record(&cx, p.id, p.pos, local.ty);
                     },
                     None => (),
                 };
@@ -2847,7 +2908,7 @@ impl Body['k] {
                     var i = 0usize;
                     while i < fields.len(&cx) {
                         if fields.at(&cx, i).name.eq(&cx, name) {
-                            self.unify_at(&cx, c.result, fields.at(&cx, i).type, pos);
+                            self.unify_at(&cx, c.result, fields.at(&cx, i).ty, pos);
                             return;
                         }
                         i = i + 1usize;
@@ -2976,8 +3037,8 @@ impl Body['k] {
                 if fields.len(&cx) != 2usize || !fields.at(&cx, 0usize).name.is(&cx, "env") || !fields.at(&cx, 1usize).name.is(&cx, "code") {
                     self.fails(&cx, "a closure must have exactly env and code fields, in that order", pos);
                 }
-                let env = fields.at(&cx, 0usize).type;
-                let code = match self.shape(&cx, fields.at(&cx, 1usize).type, pos) {
+                let env = fields.at(&cx, 0usize).ty;
+                let code = match self.shape(&cx, fields.at(&cx, 1usize).ty, pos) {
                     Fn(f) => f,
                     _ => self.fails(&cx, "a closure code field must have a function type", pos),
                 };
@@ -3273,15 +3334,18 @@ impl Body['k] {
         let name = callee.name;
         let unit = match receiver {
             FStr(f) => if name.is(&cx, "write") {
+                if c.args.len(&cx) == 2usize {
+                    return self.fstring_reading(&cx, c, f);
+                }
                 let writer = new_meta(&cx);
                 let unit = self.record(&cx, f.id, f.pos, self.expr_fstring(&cx, f, writer));
-                self.results().calls.insert(&cx, c.id, Callee::FStringWrite.(f));
+                self.results().calls.insert(&cx, c.id, Callee::FStringWrite.(f, Option::None));
                 if c.args.len(&cx) != 1usize {
-                    self.fails(&cx, "write takes the writer", c.pos);
+                    self.fails(&cx, "write takes the writer, or a lent context and the writer", c.pos);
                 }
                 let out = self.expr(&cx, c.args.at(&cx, 0usize));
                 self.unify_at(&cx, writer, out, c.pos);
-                self.require(&cx, self.library(&cx, "Writable"), ArenaVec::one(&cx, out), c.pos);
+                self.require(&cx, self.library(&cx, "Writer"), ArenaVec::one(&cx, out), c.pos);
                 return out;
             },
             _ => (),

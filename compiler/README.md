@@ -890,8 +890,8 @@ stage.
 These are the places where Kursal differs from what one might expect.
 
 - **Names.** Keywords cannot be field, method or variable names: `use export module struct tuple
-  enum fn extern impl trait instance const forall where as exposed unsafe closure exists foreach of in
-  for while if else match let var return pack true false self _`. Fields here are named
+  enum type fn extern impl trait instance const forall where as exposed unsafe closure exists foreach
+  of in for while if else match let var return pack true false self _`. Fields here are named `ty`,
   `is_unsafe`, `home`, `quantifier`, `trait_name` and the like instead.
 - **A linear type's name ends with `!`.** `struct Buffer! { ... }` declares the name `Buffer!`, and
   every reference spells it: `Buffer!`, `Buffer!::new()`, `Buffer!.{ ... }`, `Polled!::Running(x)`,
@@ -925,9 +925,24 @@ These are the places where Kursal differs from what one might expect.
   function needs a body; only a trait method or an extern is a signature`). A trait method is a
   signature ending in `;`, and every instance gives it a body: there are no default methods (`a
   trait method is a signature; its body belongs in each instance`). `forall` comes before a
-  struct, tuple, enum, function, impl, trait or instance, and before an impl's method; never before
-  a `use` or a `const` (`` `forall` comes before a struct, tuple, enum, function, impl, trait or
-  instance ``, `` in an impl, `forall` comes before a method ``).
+  struct, tuple, enum, type alias, function, impl, trait or instance, and before an impl's method;
+  never before a `use` or a `const` (`` `forall` comes before a struct, tuple, enum, type alias,
+  function, impl, trait or instance ``, `` in an impl, `forall` comes before a method ``).
+- **Type aliases.** `forall 'k. type Str = Slice[u8, 'k];` names a type. The alias is transparent:
+  wherever a type is written, signatures put the body in its place, its parameters replaced by the
+  arguments (`Str['k]` is `Slice[u8, 'k]`, and the two mix freely), so inference, KURS and the C
+  never see it, and messages show the type it stands for. Its `forall` lists only parameters, each
+  of which the body uses (`type alias Pair takes no premises or determined parameters`, `type alias
+  Pair does not use its parameter U`); a use gives every argument (`Str takes 1 type argument, got
+  0`); no alias refers to itself, directly or through others (`type alias A refers to itself through
+  B`); and its name ends with `!` exactly when the type it stands for is linear whatever its
+  arguments are (`type alias L stands for a linear type; name it L!`, `type alias M! stands for a
+  type that is not linear; name it M`). It has no representation of its own, so it is never
+  `exposed` (`a type alias is never exposed: it has no representation of its own`), and it names a
+  type only: not a value, a constructor or the namespace of members (`Str is a type alias; it
+  stands only where a type is written`). An `impl` or `instance` written through an alias means the
+  head it stands for, so `impl Str['k]` gives methods to `Slice`, and must be in `Slice`'s package.
+  An alias is imported, exported and kept private like any item.
 - **`Sized[T]`** says that `T` has a finite by-value layout of non-zero size. It is a premise of a
   function or an instance (so of each of its methods), never of a type declaration, and no program
   declares an instance of it. It holds of a type that mentions no type parameter when that type is
@@ -1018,9 +1033,9 @@ These are the places where Kursal differs from what one might expect.
   returns: `let { tag, arena } = cx; ...; cx = Domain!.{ tag, arena };`. A
   `match`, `&&` or `if` may lend it in every branch.
 - **Only a var is lent or assigned.** The root of a place that is lent (`&x`, `&x.f`, `&x.m()`,
-  `f(&x)`, `match &x`, `for v in &it`, `{&x}` in an f-string) or assigned is a `var`, a place
-  parameter (`&x: T`, `&self`), or a binder of a case of a lent match. A `let` never changes after it
-  is bound (`a is not a var; a lent place must be a var`), nor does a parameter taken by value,
+  `f(&x)`, `match &x`, `for v in &it`, `{&x}` in an f-string, `f"...".write(&x, out)`) or assigned
+  is a `var`, a place parameter (`&x: T`, `&self`), or a binder of a case of a lent match. A `let`
+  never changes after it is bound (`a is not a var; a lent place must be a var`), nor does a parameter taken by value,
   `self` included, nor the binder of a case of a match on a value: such a value is lent after
   `var x = x;` (`var self = self;`). A closure or `foreach` body holds its own value of what it captures, a copy or the
   value moved in, so it neither assigns nor lends a captured name, a `var` included (`a is captured,
@@ -1144,7 +1159,14 @@ These are the places where Kursal differs from what one might expect.
   bounding traits.
 - **F-strings.** `{x}` formats `x` by `Format::format`, which hands the value back; `{x}` drops it,
   so a linear `x` is written `{&x}`, which lends it (`{x} in an f-string drops a linear value; lend
-  it with {&x}`).
+  it with {&x}`). `f"...".write(out)` writes into the writer `out` and hands it back.
+  `f"...".write(&cx, out)` also lends the f-string the capability in the place `cx`, a var as for any
+  lend: the capability is moved out of `cx`, `out` is wrapped with it as `ReadingWriter![W,
+  C]::new(out, cx)`, each segment is written through the wrapper, and `finish` hands back the writer,
+  the result, and the capability, which goes back into `cx`. So a `{span}` of a domain reads through
+  the domain's context: `f"{line}:{col}: {message}".write(&cx, Buffer!::new())` with `message:
+  Span['k]` and `&cx: Domain!['k]`. No `{x}` uses `cx` while it is lent (`cx is lent to this
+  f-string; it cannot be used inside it`).
 - **Closures** `|x| x + 1u32` have types `closure(u32) -> u32` as parameters. A closure captures
   the locals of its function it mentions, a linear one by moving it in, which makes the closure
   linear: it is then called once or handed on, as `std::thread::spawn` takes one that owns a `Buffer!`

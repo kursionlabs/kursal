@@ -147,6 +147,7 @@ class PointerCall:
 @dataclass
 class FStringWrite:
     string: S.FStr
+    context: Optional[S.Expr] = None     # the place lent by `.write(&cx, out)`
 
 
 type Callee = (
@@ -247,6 +248,8 @@ class Infer:
         # Each type no source writes that the body must determine: the type, what it is, and where.
         self.unwritten: list[tuple[C.Type, str, Optional[Position]]] = []
         self.solving = False
+        # the local whose place `f"...".write(&cx, out)` lends while its `{x}` are inferred
+        self.fstring_lent: Optional[Local] = None
         self.returns = [sig.ret]
         level, node.param_ids = Level(), []
         self.scopes, self.frames = [level], [Frame()]
@@ -481,6 +484,8 @@ class Infer:
         for level in reversed(self.scopes):
             local = level.names.get(name)
             if local is not None:
+                if local is self.fstring_lent:
+                    fail(f"{name} is lent to this f-string; it cannot be used inside it", pos)
                 for frame in self.frames[local.depth + 1:]:      # every closure it is used inside captures it
                     if all(l is not local for _, l, _ in frame.locals):
                         frame.locals.append((name, local, pos))
@@ -756,6 +761,30 @@ class Infer:
             value = self.place_type(operand, lend=True) if lent and self.is_place(operand) else self.expr(operand)
             self.require(fmt, [value, writer], part.pos)
         return C.Named(self.library("Buffer!"))
+
+    def fstring_reading(self, expr: S.Call, string: S.FStr) -> C.Type:
+        """`f"...".write(&cx, out)`: the f-string is written into `ReadingWriter![W, C]`, which wraps `out: W`
+        with the capability `C` moved out of the place `cx` and put back after, so each `{x}` may read
+        through it. No `{x}` mentions `cx`'s local while it is lent."""
+        lent, out_expr = expr.args
+        if not (isinstance(lent, S.Unary) and lent.op == "&" and self.is_place(lent.operand)):
+            fail("write lends its context first: .write(&cx, out)", lent.pos)
+        place = lent.operand
+        out = self.expr(out_expr)
+        self.require(self.library("Writer"), [out], expr.pos)
+        context = self.place_type(place, lend=True)
+        root = place
+        while isinstance(root, (S.Field, S.Index)):
+            root = root.value
+        assert isinstance(root, S.Path)
+        writer = C.Named(self.library("ReadingWriter!"), (out, context))
+        outer, self.fstring_lent = self.fstring_lent, self.lookup(root.names[0], root.pos)
+        try:
+            self.record(string, self.expr_fstring(string, writer))
+        finally:
+            self.fstring_lent = outer
+        expr.call = FStringWrite(string, place)
+        return out
 
     def expr_path(self, expr: S.Path) -> C.Type:
         ref = expr.ref
@@ -1409,14 +1438,16 @@ class Infer:
         assert isinstance(expr.callee, S.Field)
         receiver, name = expr.callee.value, expr.callee.name
         if isinstance(receiver, S.FStr) and name == "write":
+            if len(expr.args) == 2:
+                return self.fstring_reading(expr, receiver)
             writer = Meta()
             self.record(receiver, self.expr_fstring(receiver, writer))
             expr.call = FStringWrite(receiver)
             if len(expr.args) != 1:
-                fail("write takes the writer", expr.pos)
+                fail("write takes the writer, or a lent context and the writer", expr.pos)
             out = self.expr(expr.args[0])
             self.unify(writer, out, expr.pos)
-            self.require(self.library("Writable"), [out], expr.pos)
+            self.require(self.library("Writer"), [out], expr.pos)
             return out
         # `&` is a way to pass a place, never a value: `(&x).m()` and `(unsafe &*p).m()` lend nothing, while
         # `(&x.m()).n()` lends the receiver of `m`.

@@ -97,7 +97,7 @@ and report through their exit status, 0 when every check holds.
 | `skolems`, `mint_join` (libraries), with `bad/mismatched_skolem.kur`, `bad/unbound_result_brand.kur`, `bad/reopened_brand.kur`, `bad/shadowing_exists_binder.kur` | brands: minting them, carrying them through branches and joins, and naming each apart from those in scope |
 | `basic`, `arrays`, `tuples`, `shapes` (libraries) | structs, fixed-size arrays, tuples, enums |
 | `generics`, `generic_result`, `option_result` (libraries) | generic types and functions, `Result`, `Option` and `?` |
-| `recursion`, `strings` (libraries) | recursion and early `return`; string literals as `Slice[u8, 'static]` |
+| `recursion`, `strings` (libraries) | recursion and early `return`; string literals as `Str['static]` |
 | `closure_method` (library) | closure parameter types |
 
 ## Feature tests
@@ -137,6 +137,15 @@ Ordinary errors:
 | `foreach_through_pointer_to_sum.kur` | a `foreach` traverses a pointer to a sum, whose components depend on the variant it holds; the type over it is formed |
 | `extern_abi.kur` | an extern names a calling convention other than `"C"` |
 | `inferred_type_in_annotation.kur` | `_` stands for a type argument in an annotation, where only an expression's is inferred |
+| `type_alias_unused_parameter.kur` | a type alias's body leaves out one of its parameters |
+| `type_alias_cycle.kur` | a type alias refers to itself through another |
+| `type_alias_linear_unmarked.kur`, `type_alias_marked_not_linear.kur` | a type alias's name has the `!` exactly when the type it stands for is linear, and these do not |
+| `type_alias_arity.kur` | a type alias is given more arguments than it takes |
+| `type_alias_premises.kur` | a type alias's `forall` states a premise, which nothing would check |
+| `exposed_type_alias.kur` | a type alias is `exposed`, and it has no representation of its own |
+| `type_alias_as_namespace.kur` | a type alias names a member, where only the type it stands for does |
+| `impl_through_alias_elsewhere.kur` | an `impl` through a type alias adds methods to `Slice` outside its package |
+| `fstring_context_used_inside.kur` | an f-string uses the context `.write(&cx, out)` lends it, inside |
 
 Ownership, brands and authority:
 

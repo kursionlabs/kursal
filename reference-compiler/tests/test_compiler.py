@@ -1100,6 +1100,14 @@ RESOLUTION_ERRORS: tuple[tuple[dict[str, str], str], ...] = (
     (app("use package::a::{\n    Y,\n    P!,\n};\nfn f(p: P) -> P! { p }\n", {"app/a.kur": "struct P { x: u32 }\nfn Y() {}\n"}), "app"),
     (app("use package::a::X as Z;\nfn f(x: Z!) -> u32 { 0u32 }\n", {"app/a.kur": "enum X! { V }\n"}), "app"),
     (app("use lib::shapes::{Point as Q!, make as Copy};\nfn f(q: Q!) -> u32 { 0u32 }\n"), "app"),
+    # A type alias stands only where a type is written, and an impl through one is an impl of the type
+    # it stands for, in that type's package.
+    (app("type P = lib::shapes::Point;\nfn f() -> u32 { P::get(lib::shapes::make(1u32)) }\n"
+         "fn g() -> P { P.{ x: 1u32 } }\nfn h(p: P) -> u32 { match lib::shapes::Shape::Empty { P::Dot(d) => 0u32, _ => 1u32 } }\n"
+         "forall T where P[T]. fn k(x: T) {}\n"), "app"),
+    (app("type P = lib::shapes::Point;\nimpl P { fn z(self) -> u32 { 0u32 } }\n"
+         "forall T. type Same = T;\nforall T. impl Same[T] { fn w(self) -> u32 { 0u32 } }\n"
+         "type Two = (u32, u32);\nimpl Two { fn v(self) -> u32 { 0u32 } }\n"), "app"),
 )
 
 
@@ -1120,6 +1128,13 @@ RESOLVED: tuple[tuple[dict[str, str], str], ...] = (
          "fn g(e: F!) -> u32 { match e { F!::A => 0u32, F!::B(l) => l.get() } }\n",
          {"app/a.kur": "exposed struct L! { x: u32 }\nenum E! { A, B(L!) }\n"
                        "impl L! { fn make(x: u32) -> L! { L!.{ x } } fn get(self) -> u32 { self.x } }\n"}), "app"),
+    # A type alias is imported, exported and renamed like any item; an impl through one gives methods to
+    # the type it stands for.
+    (app("use package::a::{Pair, Spot as Place, Held!};\nexport Pair;\n"
+         "fn f(p: Pair[Place], h: Held!) -> Held! { h }\n",
+         {"app/a.kur": "use lib::shapes::Point;\nforall T. type Pair = (T, T);\ntype Spot = Point;\n"
+                       "struct L! { x: u32 }\ntype Held! = L!;\nimpl Held! { fn get(self) -> u32 { let { x } = self; x } }\n"}),
+     "app"),
 )
 
 
@@ -1164,9 +1179,26 @@ SIGNATURES = (
     "fn i(x: foreach X of (foreach Y of (u32,) => Y) => X) {}\nfn j(x: foreach X of (u32,) => foreach Y of (X,) => Y) {}\n"
     "fn k(x: exists 'k. foreach X of (core::cap::Brand['k],) => X) {}\n"
     "struct T { f: foreach *F of *T => u8 }\n",
+    # A type alias stands for its body wherever a type is written: fields, signatures, premises, impl and
+    # instance heads; a linear one carries the `!`, and one alias may name another.
+    "forall T. type Pair = (T, T);\nforall T, 'k. type Tagged = (T, *core::cap::Brand['k]);\n"
+    "struct L! { x: u32 }\ntype Held! = L!;\nforall T. type Twice = Pair[Pair[T]];\n"
+    "forall T. type Gen = exists 'a. (T, core::cap::Brand['a]);\n"
+    "struct S { p: Pair[u32], t: Tagged[u8, 'static], w: Twice[u8], f: fn(Pair[u8]) -> Pair[u8] }\n"
+    "type Point = S;\nimpl Point { fn first(self) -> Pair[u32] { self.p } }\n"
+    "trait Show { fn show(x: Self) -> u32; }\ninstance Show[Pair[u32]] { fn show(x: (u32, u32)) -> u32 { 0u32 } }\n"
+    "forall T where Show[Pair[T]]. fn f(x: Pair[T], h: Held!, g: Gen[u8]) -> Held! { h }\n",
 )
 
 SIGNATURE_ERRORS = (
+    # A type alias uses every parameter, takes no premise, refers to itself through no alias, and has the
+    # `!` exactly when it stands for a linear type; a use gives it its arguments.
+    "forall T, U. type Unused = (T, T);\ntype A = (u32, B);\ntype B = *A;\ntype C = C;\n"
+    "forall T where Copy[T]. type P = (T, T);\nforall T -> U. type D = (T, U);\nforall 'k. type E = u32;\n"
+    "type F = (G, C);\ntype G = u8;\n",
+    "struct H! { x: u32 }\ntype L = H!;\ntype M! = u32;\nforall T. type N = T;\nforall T. type O! = (T, H!);\n",
+    "forall T. type Pair = (T, T);\nfn f(p: Pair[u32, u8], q: Pair) -> u32 { 0u32 }\nforall 'k. type V = *core::cap::Brand['k];\n"
+    "fn g(v: V[u32]) {}\n",
     # several errors, reported together in source order
     "fn f(x: u32[u8]) -> u32 { 0u32 }\nstruct S { a: u32 }\n"
     "fn g(y: core::cap::Brand[u32]) -> u32 { 0u32 }\nforall T. fn h(x: T[u32]) -> u32 { 0u32 }\n",
@@ -1272,9 +1304,15 @@ SIGNATURE_ERRORS = (
 
 # The examples in examples/bad/ that resolution rejects.
 UNRESOLVED = {"private_import.kur", "unused_unknown_import.kur", "glob_of_unknown_module.kur",
-              "unknown_name_in_use_tree.kur", "constructor_call.kur"}
+              "unknown_name_in_use_tree.kur", "constructor_call.kur",
+              "type_alias_as_namespace.kur", "impl_through_alias_elsewhere.kur"}
 
 SYNTAX_ERRORS = (
+    # `type` is a keyword, and a type alias is written `type Name = Type;`.
+    "fn f() { let type = 1u32; }",
+    "type P: u32;",
+    "type P = u32",
+    "forall T. const N: u32 = 1u32;",
     "fn f() -> Point { Point { x: 1u32 } }",
     "fn f(x: &u32) {}",
     "fn f() { let (x) = g(); }",

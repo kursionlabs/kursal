@@ -4,7 +4,7 @@
 // Allocator-free: everything here works with any writer. `alloc::fmt`
 // re-exports it and adds what needs `Buffer!`.
 //
-// `Writable[W]` is the output protocol: write one byte, a whole `'static`
+// `Writer[W]` is the output protocol: write one byte, a whole `'static`
 // byte view, or raw bytes. Reading `'static` storage needs no capability
 // argument (`core::slice::StaticRead`), so a bulk write of one can live in
 // the trait itself and lets a writer copy literal segments in one step.
@@ -13,15 +13,24 @@
 //
 // Writers use sticky errors. A writer that can fail records its first
 // failure and ignores every later write; its own `finish` reports the
-// failure together with the underlying resource. Neither `Writable` nor
+// failure together with the underlying resource. Neither `Writer` nor
 // `Format` carries an error type, so an f-string never has to infer one,
 // and the writer and every threaded input always come back.
 //
 // `Format[T, W]` formats a `T` into any writer `W` and hands the value back:
 // formatting does not consume. The compiler expands `f"..."` into these
-// calls -- literal segments through `Writable::write_static`, `{expr}`
+// calls -- literal segments through `Writer::write_static`, `{expr}`
 // segments through `Format::format` -- so instances are written once,
 // generically over the writer, and work with every writer.
+//
+// `f"...".write(out)` writes into `out` and hands it back.
+// `f"...".write(&cx, out)` also lends the f-string the capability in the
+// place `cx`: it is moved out of `cx`, wrapped with `out` as
+// `ReadingWriter![W, C]::new(out, cx)`, every segment is written through
+// the wrapper, so each `{span}` reads through `cx`, and `finish` hands back
+// the writer, the result, and the capability, which goes back into `cx`:
+//
+//     f"{name} = {value}".write(&cx, Buffer!::new())
 //
 // Floats. An `f64` or `f32` is written as the decimal with the fewest
 // significant digits that reads back as the same float (`core::dtoa`), and
@@ -48,7 +57,7 @@ use core::raw::Span;
 /// A destination for bytes: the output protocol that f-strings and `Format`
 /// write to.
 forall Self.
-trait Writable {
+trait Writer {
     /// Writes one byte.
     fn write_byte(self: Self, byte: u8) -> Self;
     /// Writes the bytes of a `'static` byte view.
@@ -60,7 +69,7 @@ trait Writable {
 }
 
 /// Writes any readable byte view's bytes, reading through its capability.
-forall W, C, S where Writable[W], ReadBytes[C, S], Copy[S].
+forall W, C, S where Writer[W], ReadBytes[C, S], Copy[S].
 fn write_bytes(out: W, &cx: C, bytes: S) -> W {
     let n = ReadBytes[C, S]::len(&cx, bytes);
     var o = out;
@@ -68,7 +77,7 @@ fn write_bytes(out: W, &cx: C, bytes: S) -> W {
     while i < n {
         let b = ReadBytes[C, S]::get(&cx, bytes, i);
         let next = match b {
-            Some(x) => Writable[W]::write_byte(o, x),
+            Some(x) => Writer[W]::write_byte(o, x),
             None => o,
         };
         o = next;
@@ -78,7 +87,7 @@ fn write_bytes(out: W, &cx: C, bytes: S) -> W {
 }
 
 /// Writes the decimal digits of `n`, most significant first.
-forall W where Writable[W].
+forall W where Writer[W].
 fn write_u64(out: W, n: u64) -> W {
     let ten = 10u64;
     let rest = n / ten;
@@ -88,14 +97,14 @@ fn write_u64(out: W, n: u64) -> W {
         out
     };
     let digit = ((n % ten) as u8) + b'0';
-    Writable[W]::write_byte(o, digit)
+    Writer[W]::write_byte(o, digit)
 }
 
 /// Writes the decimal digits of `n`, after a `-` when it is negative.
-forall W where Writable[W].
+forall W where Writer[W].
 fn write_i64(out: W, n: i64) -> W {
     if n < 0i64 {
-        let o = Writable[W]::write_byte(out, 45u8);
+        let o = Writer[W]::write_byte(out, 45u8);
         // Two's-complement negation in `u64`, so `i64::MIN` has a magnitude.
         let magnitude = 0u64 - (n as u64);
         write_u64(o, magnitude)
@@ -107,20 +116,20 @@ fn write_i64(out: W, n: i64) -> W {
 /// Writes `x` as the shortest decimal that reads back as it (see
 /// "Floats" in the module notes): `2.5`, `0.1`, `100`, `1e21`, `5e-324`,
 /// `-0`, `inf`, `-inf`, `NaN`.
-forall W where Writable[W].
+forall W where Writer[W].
 fn write_f64(out: W, x: f64) -> W {
     if x.is_nan() {
-        return Writable[W]::write_static(out, "NaN");
+        return Writer[W]::write_static(out, "NaN");
     }
     let bits = x.to_bits();
-    let o = if x.is_sign_negative() { Writable[W]::write_byte(out, b'-') } else { out };
+    let o = if x.is_sign_negative() { Writer[W]::write_byte(out, b'-') } else { out };
     let biased = (bits >> 52u64) & 2047u64;
     let fraction = bits & 4503599627370495u64;
     if biased == 2047u64 {
-        return Writable[W]::write_static(o, "inf");
+        return Writer[W]::write_static(o, "inf");
     }
     if biased == 0u64 && fraction == 0u64 {
-        return Writable[W]::write_byte(o, b'0');
+        return Writer[W]::write_byte(o, b'0');
     }
     let decimal = if biased == 0u64 {
         shortest(fraction, -1074i32, false)
@@ -133,20 +142,20 @@ fn write_f64(out: W, x: f64) -> W {
 
 /// Writes `x` as the shortest decimal that reads back as it as an `f32`,
 /// as `write_f64` does for an `f64`: `0.1f32` is `0.1`.
-forall W where Writable[W].
+forall W where Writer[W].
 fn write_f32(out: W, x: f32) -> W {
     if x.is_nan() {
-        return Writable[W]::write_static(out, "NaN");
+        return Writer[W]::write_static(out, "NaN");
     }
     let bits = x.to_bits();
-    let o = if x.is_sign_negative() { Writable[W]::write_byte(out, b'-') } else { out };
+    let o = if x.is_sign_negative() { Writer[W]::write_byte(out, b'-') } else { out };
     let biased = (bits >> 23u32) & 255u32;
     let fraction = (bits & 8388607u32) as u64;
     if biased == 255u32 {
-        return Writable[W]::write_static(o, "inf");
+        return Writer[W]::write_static(o, "inf");
     }
     if biased == 0u32 && fraction == 0u64 {
-        return Writable[W]::write_byte(o, b'0');
+        return Writer[W]::write_byte(o, b'0');
     }
     let decimal = if biased == 0u32 {
         shortest(fraction, -149i32, false)
@@ -159,7 +168,7 @@ fn write_f32(out: W, x: f32) -> W {
 /// A positive decimal laid out as ECMAScript's `Number::toString` does: an
 /// integer of at most 21 digits in full, a number from 10^-6 on positionally,
 /// anything else as `d.ddde±x`.
-forall W where Writable[W].
+forall W where Writer[W].
 fn write_decimal(out: W, decimal: Decimal) -> W {
     let { digits, count, point } = decimal;
     let n = count as i32;
@@ -168,19 +177,19 @@ fn write_decimal(out: W, decimal: Decimal) -> W {
         write_zeros(o, (point - n) as u32)
     } else if 0i32 < point && point <= 21i32 {
         let o = write_digits(out, digits, count, 0u32, point as u32);
-        write_digits(Writable[W]::write_byte(o, b'.'), digits, count, point as u32, count)
+        write_digits(Writer[W]::write_byte(o, b'.'), digits, count, point as u32, count)
     } else if -6i32 < point && point <= 0i32 {
-        let o = write_zeros(Writable[W]::write_static(out, "0."), (0i32 - point) as u32);
+        let o = write_zeros(Writer[W]::write_static(out, "0."), (0i32 - point) as u32);
         write_digits(o, digits, count, 0u32, count)
     } else {
         let o = write_digits(out, digits, count, 0u32, 1u32);
-        let o = if count > 1u32 { write_digits(Writable[W]::write_byte(o, b'.'), digits, count, 1u32, count) } else { o };
-        write_i64(Writable[W]::write_byte(o, b'e'), ((point - 1i32) as i64))
+        let o = if count > 1u32 { write_digits(Writer[W]::write_byte(o, b'.'), digits, count, 1u32, count) } else { o };
+        write_i64(Writer[W]::write_byte(o, b'e'), ((point - 1i32) as i64))
     }
 }
 
 /// Writes the digits `from` to `to` of the `count` decimal digits of `digits`, most significant first.
-forall W where Writable[W].
+forall W where Writer[W].
 fn write_digits(out: W, digits: u64, count: u32, from: u32, to: u32) -> W {
     var o = out;
     var i = from;
@@ -191,19 +200,19 @@ fn write_digits(out: W, digits: u64, count: u32, from: u32, to: u32) -> W {
             unit = unit * 10u64;
             j = j + 1u32;
         }
-        o = Writable[W]::write_byte(o, (((digits / unit) % 10u64) as u8) + b'0');
+        o = Writer[W]::write_byte(o, (((digits / unit) % 10u64) as u8) + b'0');
         i = i + 1u32;
     }
     o
 }
 
 /// Writes `n` zeros.
-forall W where Writable[W].
+forall W where Writer[W].
 fn write_zeros(out: W, n: u32) -> W {
     var o = out;
     var i = 0u32;
     while i < n {
-        o = Writable[W]::write_byte(o, b'0');
+        o = Writer[W]::write_byte(o, b'0');
         i = i + 1u32;
     }
     o
@@ -217,7 +226,7 @@ trait Format {
 }
 
 /// A `u8` formats as its decimal digits.
-forall W where Writable[W].
+forall W where Writer[W].
 instance Format[u8, W] {
     fn format(value: u8, out: W) -> (u8, W) {
         (value, write_u64(out, (value as u64)))
@@ -225,7 +234,7 @@ instance Format[u8, W] {
 }
 
 /// A `u16` formats as its decimal digits.
-forall W where Writable[W].
+forall W where Writer[W].
 instance Format[u16, W] {
     fn format(value: u16, out: W) -> (u16, W) {
         (value, write_u64(out, (value as u64)))
@@ -233,7 +242,7 @@ instance Format[u16, W] {
 }
 
 /// A `u32` formats as its decimal digits.
-forall W where Writable[W].
+forall W where Writer[W].
 instance Format[u32, W] {
     fn format(value: u32, out: W) -> (u32, W) {
         (value, write_u64(out, (value as u64)))
@@ -241,7 +250,7 @@ instance Format[u32, W] {
 }
 
 /// A `u64` formats as its decimal digits.
-forall W where Writable[W].
+forall W where Writer[W].
 instance Format[u64, W] {
     fn format(value: u64, out: W) -> (u64, W) {
         (value, write_u64(out, value))
@@ -249,7 +258,7 @@ instance Format[u64, W] {
 }
 
 /// A `usize` formats as its decimal digits.
-forall W where Writable[W].
+forall W where Writer[W].
 instance Format[usize, W] {
     fn format(value: usize, out: W) -> (usize, W) {
         (value, write_u64(out, (value as u64)))
@@ -257,7 +266,7 @@ instance Format[usize, W] {
 }
 
 /// A `i8` formats as its decimal digits, after `-` when negative.
-forall W where Writable[W].
+forall W where Writer[W].
 instance Format[i8, W] {
     fn format(value: i8, out: W) -> (i8, W) {
         (value, write_i64(out, (value as i64)))
@@ -265,7 +274,7 @@ instance Format[i8, W] {
 }
 
 /// A `i16` formats as its decimal digits, after `-` when negative.
-forall W where Writable[W].
+forall W where Writer[W].
 instance Format[i16, W] {
     fn format(value: i16, out: W) -> (i16, W) {
         (value, write_i64(out, (value as i64)))
@@ -273,7 +282,7 @@ instance Format[i16, W] {
 }
 
 /// A `i32` formats as its decimal digits, after `-` when negative.
-forall W where Writable[W].
+forall W where Writer[W].
 instance Format[i32, W] {
     fn format(value: i32, out: W) -> (i32, W) {
         (value, write_i64(out, (value as i64)))
@@ -281,7 +290,7 @@ instance Format[i32, W] {
 }
 
 /// A `i64` formats as its decimal digits, after `-` when negative.
-forall W where Writable[W].
+forall W where Writer[W].
 instance Format[i64, W] {
     fn format(value: i64, out: W) -> (i64, W) {
         (value, write_i64(out, value))
@@ -289,7 +298,7 @@ instance Format[i64, W] {
 }
 
 /// A `isize` formats as its decimal digits, after `-` when negative.
-forall W where Writable[W].
+forall W where Writer[W].
 instance Format[isize, W] {
     fn format(value: isize, out: W) -> (isize, W) {
         (value, write_i64(out, (value as i64)))
@@ -297,7 +306,7 @@ instance Format[isize, W] {
 }
 
 /// An `f64` formats as the shortest decimal that reads back as it (`write_f64`).
-forall W where Writable[W].
+forall W where Writer[W].
 instance Format[f64, W] {
     fn format(value: f64, out: W) -> (f64, W) {
         (value, write_f64(out, value))
@@ -305,7 +314,7 @@ instance Format[f64, W] {
 }
 
 /// An `f32` formats as the shortest decimal that reads back as it (`write_f32`).
-forall W where Writable[W].
+forall W where Writer[W].
 instance Format[f32, W] {
     fn format(value: f32, out: W) -> (f32, W) {
         (value, write_f32(out, value))
@@ -313,24 +322,24 @@ instance Format[f32, W] {
 }
 
 /// A `bool` formats as `true` or `false`.
-forall W where Writable[W].
+forall W where Writer[W].
 instance Format[bool, W] {
     fn format(value: bool, out: W) -> (bool, W) {
         let text = if value { "true" } else { "false" };
-        (value, Writable[W]::write_static(out, text))
+        (value, Writer[W]::write_static(out, text))
     }
 }
 
 /// A static byte slice formats as its bytes.
-forall W where Writable[W].
+forall W where Writer[W].
 instance Format[Slice[u8, 'static], W] {
     fn format(value: Slice[u8, 'static], out: W) -> (Slice[u8, 'static], W) {
-        (value, Writable[W]::write_static(out, value))
+        (value, Writer[W]::write_static(out, value))
     }
 }
 
 /// A borrowed byte view formats as its bytes, read through its capability.
-forall C, S, W where ReadBytes[C, S], Copy[S], Writable[W].
+forall C, S, W where ReadBytes[C, S], Copy[S], Writer[W].
 instance Format[Readable[C, S], W] {
     fn format(value: Readable[C, S], out: W) -> (Readable[C, S], W) {
         var { cap: c, bytes: s } = value;
@@ -342,9 +351,10 @@ instance Format[Readable[C, S], W] {
 /// A writer that also carries a context that reads a domain's bytes
 /// (`ReadBytes`), so an f-string can interpolate spans of that domain directly:
 /// every `{span}` is read through the writer's own context, one context
-/// serving any number of parts. `finish` hands both back.
+/// serving any number of parts. `finish` hands both back. `f"...".write(&cx,
+/// out)` is written through one, the context moved out of `cx` and put back:
 ///
-///     let (text, cx) = f"{name} = {value}".write(ReadingWriter::new(Buffer::new(), cx)).finish();
+///     let text = f"{name} = {value}".write(&cx, Buffer!::new());
 forall W, C.
 exposed struct ReadingWriter! {
     out: W,
@@ -366,26 +376,26 @@ impl ReadingWriter![W, C] {
 }
 
 /// Every write goes to the inner writer.
-forall W, C where Writable[W].
-instance Writable[ReadingWriter![W, C]] {
+forall W, C where Writer[W].
+instance Writer[ReadingWriter![W, C]] {
     fn write_byte(self: ReadingWriter![W, C], byte: u8) -> ReadingWriter![W, C] {
         let { out, ..rest } = self;
-        ReadingWriter!.{ out: Writable[W]::write_byte(out, byte), ..rest }
+        ReadingWriter!.{ out: Writer[W]::write_byte(out, byte), ..rest }
     }
     fn write_static(self: ReadingWriter![W, C], bytes: Slice[u8, 'static]) -> ReadingWriter![W, C] {
         let { out, ..rest } = self;
-        ReadingWriter!.{ out: Writable[W]::write_static(out, bytes), ..rest }
+        ReadingWriter!.{ out: Writer[W]::write_static(out, bytes), ..rest }
     }
-    /// Caller: as for `Writable::write_raw`, `ptr[0..len)` is readable for the
+    /// Caller: as for `Writer::write_raw`, `ptr[0..len)` is readable for the
     /// whole call.
     unsafe fn write_raw(self: ReadingWriter![W, C], ptr: *u8, len: usize) -> ReadingWriter![W, C] {
         let { out, ..rest } = self;
-        ReadingWriter!.{ out: unsafe Writable[W]::write_raw(out, ptr, len), ..rest }
+        ReadingWriter!.{ out: unsafe Writer[W]::write_raw(out, ptr, len), ..rest }
     }
 }
 
 /// A span formats as its bytes, read through the writer's context.
-forall W, C, 'r where Writable[W], ReadBytes[C, Span['r]].
+forall W, C, 'r where Writer[W], ReadBytes[C, Span['r]].
 instance Format[Span['r], ReadingWriter![W, C]] {
     fn format(value: Span['r], out: ReadingWriter![W, C]) -> (Span['r], ReadingWriter![W, C]) {
         var { out: o, cx } = out;
@@ -407,7 +417,7 @@ impl CountingWriter {
 }
 
 /// Each write adds its length to the count.
-instance Writable[CountingWriter] {
+instance Writer[CountingWriter] {
     fn write_byte(self: CountingWriter, byte: u8) -> CountingWriter {
         let { count } = self;
         CountingWriter.{ count: count + 1usize }
@@ -416,7 +426,7 @@ instance Writable[CountingWriter] {
         let { count } = self;
         CountingWriter.{ count: count + bytes.len() }
     }
-    /// Caller: as for `Writable::write_raw`, `ptr[0..len)` is readable for the
+    /// Caller: as for `Writer::write_raw`, `ptr[0..len)` is readable for the
     /// whole call.
     unsafe fn write_raw(self: CountingWriter, ptr: *u8, len: usize) -> CountingWriter {
         let { count } = self;

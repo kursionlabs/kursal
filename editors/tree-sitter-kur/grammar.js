@@ -55,7 +55,7 @@ module.exports = grammar({
   // The reference parser's keywords, which are never a name; `module` is left out, as above.
   reserved: {
     global: _ => [
-      'use', 'export', 'struct', 'tuple', 'enum', 'fn', 'extern', 'impl', 'trait', 'instance', 'const',
+      'use', 'export', 'struct', 'tuple', 'enum', 'type', 'fn', 'extern', 'impl', 'trait', 'instance', 'const',
       'forall', 'where', 'as', 'exposed', 'unsafe', 'closure', 'exists', 'foreach', 'of', 'in', 'for',
       'while', 'if', 'else', 'match', 'let', 'var', 'return', 'pack', 'true', 'false', 'self', '_',
     ],
@@ -79,6 +79,7 @@ module.exports = grammar({
       $.struct_declaration,
       $.tuple_declaration,
       $.enum_declaration,
+      $.type_alias,
       $.function_declaration,
       $.extern_function,
       $.impl_block,
@@ -156,6 +157,19 @@ module.exports = grammar({
       '{',
       commaSep(field('variant', $.variant_declaration)),
       '}',
+    ),
+
+    // `type Name = Type;`. An `exposed` one parses, and the compiler rejects it: an alias has no
+    // representation of its own.
+    type_alias: $ => seq(
+      optional($.forall_clause),
+      optional($.exposure),
+      'type',
+      field('name', $.identifier),
+      linear(),
+      '=',
+      field('type', $._type),
+      ';',
     ),
 
     variant_declaration: $ => seq(

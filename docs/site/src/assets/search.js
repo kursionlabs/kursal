@@ -11,7 +11,7 @@
 //
 // `prepare` and `rank` are pure, and Node loads them as a module to test the ranking.
 (() => {
-  const types = new Set(['struct', 'enum', 'tuple', 'trait', 'primitive', 'builtin']);
+  const types = new Set(['struct', 'enum', 'tuple', 'type', 'trait', 'primitive', 'builtin']);
   const unmark = (text) => text.replace(/!/g, '');
 
   const prepare = (records) => records.map((r) => {

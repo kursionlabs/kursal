@@ -253,7 +253,7 @@ class UnsafeItemTests(unittest.TestCase):
     def test_what_forall_comes_before(self):
         for src in ("forall T. use a::b;", "forall T. export a::b;", "forall T. const N: u32 = 1u32;"):
             with self.subTest(src=src), self.assertRaisesRegex(
-                    KursError, "1:11: `forall` comes before a struct, tuple, enum, function, impl, trait or instance$"):
+                    KursError, "1:11: `forall` comes before a struct, tuple, enum, type alias, function, impl, trait or instance$"):
                 S.parse(src)
         with self.assertRaisesRegex(KursError, "1:20: in an impl, `forall` comes before a method$"):
             S.parse("impl P { forall T. const N: u32 = 1u32; }")
@@ -262,6 +262,21 @@ class UnsafeItemTests(unittest.TestCase):
         rejected(self, "fn f() { forall T. const N: u32 = 1u32; }")
         rejected(self, "forall T. trait Tr { forall U. fn m(x: T, u: U); }")
         rejected(self, "forall T. instance Tr[T] { forall U. fn m(x: T) {} }")
+
+    def test_type_aliases(self):
+        """`type Name = Type;`, after a `forall` when generic, and `type` is a keyword. An `exposed` one parses,
+        for signatures to reject."""
+        plain, generic, linear, exposed = S.parse(
+            "type Count = u32; forall T, 'k. type Pair = (T, Slice[T, 'k]); type H! = L!; exposed type P = u32;")
+        self.assertEqual((type(plain), plain.name, plain.body, plain.forall), (S.TypeAlias, "Count", S.TName(("u32",)), None))
+        self.assertEqual((generic.name, generic.forall.params, generic.body),
+                         ("Pair", ("T", "'k"), S.TTuple((S.TName(("T",)), S.TName(("Slice",), (S.TName(("T",)), S.TBrand("'k")))))))
+        self.assertEqual((linear.name, linear.body), ("H!", S.TName(("L!",))))
+        self.assertEqual((exposed.exposed, exposed.pos), (S.Exposed(), (1, 78)))
+        rejected(self, "type P: u32;")
+        rejected(self, "type P = u32")
+        rejected(self, "fn f() { let type = 1u32; }")
+        rejected(self, "struct S { type: u32 }")
 
     def test_module_is_reserved(self):
         with self.assertRaisesRegex(KursError, "1:1: `module` is a reserved keyword$"):

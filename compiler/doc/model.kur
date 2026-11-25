@@ -2,7 +2,7 @@
 // ones it re-exports; each module's source; every type's methods, wherever they are defined; every
 // instance and what its head mentions; and the URL of each documented declaration.
 use package::doc::text::{Link, encode, lit, relative};
-use package::resolve::resolver::{Decl, ModuleId, NameRef, Resolver, Target};
+use package::resolve::resolver::{Decl, ModuleId, NameRef, Resolver, Target, is_prim};
 use package::syntax::ast as S;
 use std::arena::Domain!;
 use std::buffer::Buffer!;
@@ -197,9 +197,28 @@ fn named(&cx: Domain!['k], r: Resolver['k], id: u32) -> Option[NameRef['k]] {
 // What an impl gives methods: the name reference of its target.
 forall 'k.
 fn impl_owner(&cx: Domain!['k], r: Resolver['k], block: S::Impl['k]) -> Option[NameRef['k]] {
-    match block.type {
-        Name(t) => named(&cx, r, t.id),
-        _ => Option::None,
+    let t = match block.ty {
+        Name(t) => t,
+        _ => return Option::None,
+    };
+    match named(&cx, r, t.id) {
+        // an impl written through a type alias gives methods to the type it stands for
+        Some(found) => match found {
+            Decl(d) => if d.kind.is(&cx, "alias") {
+                match r.aliased(&cx, d, t.pos) {
+                    Some(owner) => match owner {
+                        Decl(e) => Option::Some.(NameRef::Decl.(e)),
+                        Prim(name) => Option::Some.(if is_prim(&cx, name) { NameRef::Prim.(name) } else { NameRef::Builtin.(name) }),
+                        Blanket => Option::None,
+                    },
+                    None => Option::None,
+                }
+            } else {
+                Option::Some.(found)
+            },
+            _ => Option::Some.(found),
+        },
+        None => Option::None,
     }
 }
 
@@ -255,7 +274,7 @@ fn canonical_slots(&cx: Domain!['k], out: Buffer!, slots: ArenaVec[S::Slot['k], 
     while i < slots.len(&cx) {
         if i > 0usize { out = out.push_static(","); }
         if slots.at(&cx, i).lend { out = out.push_static("&"); }
-        out = canonical(&cx, out, slots.at(&cx, i).type);
+        out = canonical(&cx, out, slots.at(&cx, i).ty);
         i = i + 1usize;
     }
     out.push_static(")->")
@@ -376,7 +395,7 @@ fn build(&cx: Domain!['k], r: Resolver['k]) -> Gen['k] {
         let types: ArenaVec[u32, 'k] = ArenaVec::new(&cx);
         let prims: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         var trait_decl = Option::None;
-        match decl.type {
+        match decl.ty {
             Name(t) => {
                 match named(&cx, r, t.id) {
                     Some(found) => match found {
@@ -393,7 +412,7 @@ fn build(&cx: Domain!['k], r: Resolver['k]) -> Gen['k] {
             },
             _ => (),
         }
-        let anchor = encode(&cx, Buffer!::new().push_static("instance."), canonical(&cx, Buffer!::new(), decl.type).save(&cx)).save(&cx);
+        let anchor = encode(&cx, Buffer!::new().push_static("instance."), canonical(&cx, Buffer!::new(), decl.ty).save(&cx)).save(&cx);
         g.instances.push(&cx, Inst.{ home, decl, head: instance_head(&cx, source(&cx, g, home), decl.pos), anchor, trait_decl, types, prims });
         n = n + 1usize;
     }
@@ -446,10 +465,11 @@ fn shorter(&cx: Domain!['k], a: Loc['k], b: Loc['k]) -> bool {
 }
 
 // The kind of declaration a type or trait page documents, as its file name starts: `struct`,
-// `enum`, `tuple` or `trait`; empty for any other declaration.
+// `enum`, `tuple`, `type` (a type alias) or `trait`; empty for any other declaration.
 forall 'k.
 fn page_kind(&cx: Domain!['k], d: Decl['k]) -> Span['k] {
     if d.kind.is(&cx, "struct") || d.kind.is(&cx, "enum") || d.kind.is(&cx, "tuple") || d.kind.is(&cx, "trait") { d.kind }
+    else if d.kind.is(&cx, "alias") { lit(&cx, "type") }
     else { lit(&cx, "") }
 }
 
@@ -520,7 +540,7 @@ forall 'k.
 fn mention_slots(&cx: Domain!['k], g: Gen['k], out: ArenaVec[Mention['k], 'k], slots: ArenaVec[S::Slot['k], 'k]) {
     var i = 0usize;
     while i < slots.len(&cx) {
-        mention_type(&cx, g, out, slots.at(&cx, i).type);
+        mention_type(&cx, g, out, slots.at(&cx, i).ty);
         i = i + 1usize;
     }
 }
@@ -553,7 +573,7 @@ fn mention_fn(&cx: Domain!['k], g: Gen['k], out: ArenaVec[Mention['k], 'k], f: S
     mention_forall(&cx, g, out, f.quantifier);
     var i = 0usize;
     while i < f.params.len(&cx) {
-        match f.params.at(&cx, i).type {
+        match f.params.at(&cx, i).ty {
             Some(t) => mention_type(&cx, g, out, t),
             None => (),
         }
@@ -575,13 +595,17 @@ fn mentions(&cx: Domain!['k], g: Gen['k], it: S::Item['k]) -> ArenaVec[Mention['
             mention_forall(&cx, g, out, d.quantifier);
             var i = 0usize;
             while i < d.fields.len(&cx) {
-                mention_type(&cx, g, out, d.fields.at(&cx, i).type);
+                mention_type(&cx, g, out, d.fields.at(&cx, i).ty);
                 i = i + 1usize;
             }
         },
         Tuple(d) => {
             mention_forall(&cx, g, out, d.quantifier);
             mention_types(&cx, g, out, d.elems);
+        },
+        Alias(d) => {
+            mention_forall(&cx, g, out, d.quantifier);
+            mention_type(&cx, g, out, d.body);
         },
         Enum(d) => {
             mention_forall(&cx, g, out, d.quantifier);
@@ -600,10 +624,10 @@ fn mentions(&cx: Domain!['k], g: Gen['k], it: S::Item['k]) -> ArenaVec[Mention['
             }
         },
         Fn(f) => mention_fn(&cx, g, out, f),
-        Const(c) => mention_type(&cx, g, out, c.type),
+        Const(c) => mention_type(&cx, g, out, c.ty),
         Instance(d) => {
             mention_forall(&cx, g, out, d.quantifier);
-            match d.type {
+            match d.ty {
                 Name(t) => {
                     match named(&cx, g.r, t.id) {
                         Some(found) => match found {
@@ -635,7 +659,7 @@ fn links(&cx: Domain!['k], g: Gen['k], view: usize, page: Span['k], src: Source[
         let spelled = m.path.join(&cx, "::");
         if at >= start && at + spelled.len() <= end && src.text.slice(at, at + spelled.len()).eq(&cx, spelled) {
             match decl_url(&cx, g, view, m.decl) {
-                Some(url) => out.push(&cx, Link.{ start: at, end: at + spelled.len(), url: relative(&cx, page, url), kind: m.decl.kind }),
+                Some(url) => out.push(&cx, Link.{ start: at, end: at + spelled.len(), url: relative(&cx, page, url), kind: page_kind(&cx, m.decl) }),
                 None => (),
             }
         }

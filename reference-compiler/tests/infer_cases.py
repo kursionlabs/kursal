@@ -60,7 +60,19 @@ VISIBILITY_ERRORS = (
     (UNSEEN_IMPL, "u32 has no method twice"),
 )
 
+# What a case that writes an f-string through a domain's context imports: its first three lines.
+CONTEXT = "use std::arena::Domain!;\nuse std::buffer::Buffer!;\nuse std::raw::Span;\n"
+
 INFERENCES = (
+    # `f"...".write(&cx, out)` reads each `{span}` through the context lent from a var's place.
+    CONTEXT + "forall 'k. fn f(&cx: Domain!['k], s: Span['k], n: u32) -> Buffer! { f\"{s}: {n}\".write(&cx, Buffer!::new()) }\n"
+    "fn g() -> u32 { var exists 'k. cx = Domain!::new(std::process::hash_seed()); let s = Span::from_static(&cx, \"x\");\n"
+    "    let b = f\"{s}{s}\".write(&cx, f\"[{s}]\".write(&cx, Buffer!::new())); b.destroy(); cx.destroy(); 0u32 }\n"
+    "forall 'k. fn h(&p: (u32, Domain!['k]), n: u32, s: Span['k]) -> Buffer! { f\"{n} {s} {\"static\"}\".write(&p.1, Buffer!::new()) }\n",
+    # A type alias stands for its body in a body's annotations, casts and type arguments too.
+    "forall T. type Pair = (T, T);\nforall T. fn id(x: T) -> T { x }\n"
+    "fn g(p: Pair[u32]) -> u64 { let q: Pair[u32] = p; let r = q.0 as u64; let n = core::mem::sizeof[Pair[u8]]();\n"
+    "    let t = id[Pair[u8]]((1u8, 2u8)); let c = |x: Pair[u8]| -> Pair[u8] { x }; r + (n as u64) + (c(t).0 as u64) }\n",
     'use std::iter::{Iterator, range};\nuse std::option::{Option, Result};\nuse std::atomic::Ordering;\nuse std::buffer::Buffer!;\nfn total(n: u32) -> u32 { var sum = 0u32; var it = range(0usize, 4usize); for i in &it { sum = sum + (i as u32); } sum }\nfn first(o: Option[u32]) -> Option[u32] { let v = o?; Option::Some.(v + 1) }\nfn both(r: Result[u32, bool]) -> Result[(u32, u32), bool] { let v = r?; Result::Ok.((v, v)) }\nfn text(n: u32) -> Buffer! { f"n = {n}" }\nfn written(n: u32) -> Buffer! { f"n = {n}".write(Buffer!::new()) }\nfn atomics(p: *u32) -> u32 { std::atomic::fence(Ordering::SeqCst); let old = unsafe p.fetch_add(1u32, Ordering::Relaxed); let (v, ok) = unsafe p.compare_exchange(old, 2u32, Ordering::SeqCst, Ordering::Relaxed); unsafe p.store(v); std::ptr::store_volatile(p, 3u32); std::ptr::load_volatile(p) }\nfn tag(o: Option[u32]) -> u32 { var x = o; let t = std::mem::enum_variant(&x); let (y, u) = std::mem::enum_variant(x); t + u }\nfn mint() -> exists \'r. std::cap::Brand[\'r] { let exists \'a. w = std::cap::fresh(); pack \'a. w }\nfn use_mint() -> u32 { let exists \'b. w = mint(); let s = std::cap::static_brand(); var q = pack \'b. w; 0u32 }\n',
     'exposed struct P { x: u32, y: u32, z: u8 }\nforall T. exposed struct Box { value: T }\nforall T. impl Box[T] { forall U. fn map(self, u: U) -> (T, U) { (self.value, u) } }\ntrait Size { fn size(x: Self) -> usize; }\ninstance Size[u32] { fn size(x: u32) -> usize { 4usize } }\nforall T where Size[T]. fn size_of(x: T) -> usize { T::size(x) }\nforall T. fn id(x: T) -> T { x }\nfn f(p: P, q: *u32) -> u32 {\n  const K: u32 = 3u32 * 2u32;\n  var { x, ..rest } = p; let r = P.{ x: x + K, ..rest };\n  let a: [u32; 4] = [x, ..]; let [a0, a1, a2, a3] = a;\n  let n = core::mem::sizeof[P]() + size_of(a0); let c = (n as u32) + (r.z as u32);\n  let slot = core::mem::alloca[u32](); unsafe *slot = c; let back = unsafe *slot;\n  let bias = 2u32; let g = |y: u32| y + bias + back; let h = id; let i = id[u32](g(1u32));\n  let b = Box[u32]::map[bool](Box.{ value: i }, true);\n  let items = foreach item of (1u32, 2u32) { (item, bias) };\n  let m = match a0 { 0 => 1u32, 1..=3 => 2u32, _ => 3u32 };\n  var v = p; v.x = m; v.y = b.0; v.x + h(v.y)\n}\n',
     "forall T. exposed enum Opt { Some(T), None }\nfn f(n: u32) -> u32 { let o: Opt[u32] = Opt::None; var k = n; while k > 0u32 { k = k - 1u32; if k == 3u32 { return k; } } var q = Opt::Some.(k); let w = match &q { Opt::Some(v) => v, Opt::None => 0u32 }; let pk = pack 'static. q; w }\n",
@@ -208,6 +220,20 @@ INFERENCES = (
 )
 
 INFER_ERRORS = (
+    # `f"...".write(&cx, out)` lends a var's place, which no `{x}` of the f-string uses while it is lent.
+    (CONTEXT + "forall 'k. fn f(&cx: Domain!['k], s: Span['k]) -> Buffer! {\n"
+     "    f\"{s} {Span::from_static(&cx, \"t\")}\".write(&cx, Buffer!::new())\n}\n",
+     "5:31: cx is lent to this f-string; it cannot be used inside it"),
+    # The whole local is lent, though only a field is the place.
+    (CONTEXT + "forall 'k. fn f(&p: (u32, Domain!['k]), s: Span['k]) -> Buffer! {\n"
+     "    f\"{s} {p.0}\".write(&p.1, Buffer!::new())\n}\n",
+     "5:12: p is lent to this f-string; it cannot be used inside it"),
+    (CONTEXT + "forall 'k. fn f(cx: Domain!['k], s: Span['k]) -> (Buffer!, Domain!['k]) {\n"
+     "    (f\"{s}\".write(&cx, Buffer!::new()), cx)\n}\n",
+     "5:20: cx is not a var; a lent place must be a var"),
+    (CONTEXT + "forall 'k. fn f(&cx: Domain!['k], s: Span['k]) -> Buffer! {\n"
+     "    f\"{s}\".write(cx, Buffer!::new())\n}\n",
+     "5:18: write lends its context first: .write(&cx, out)"),
     # A label's scrutinee whose type is not known yet is reported at the match; one whose type is solved is
     # named solved.
     ('forall T. fn g() -> T { g() }\nfn f() -> u32 {\n    match g() {\n        Some(x) => 0u32,\n        _ => 1u32,\n    }\n}\n',
@@ -245,7 +271,7 @@ INFER_ERRORS = (
     ('fn f() -> u32 { let b = core::cap::static_brand(1u32); 0u32 }\n', 'takes 0 value arguments'),
     ('fn f() -> u32 { let p = core::mem[u32]::alloca[u32](); 0u32 }\n', 'type arguments belong on alloca, not a namespace'),
     ('fn f() -> u32 { let p = core::mem::alloca(); 0u32 }\n', 'alloca takes 1 type argument'),
-    ('use std::buffer::Buffer!;\nfn f() -> u32 { let b = f"x".write(); 0u32 }\n', 'write takes the writer'),
+    ('use std::buffer::Buffer!;\nfn f() -> u32 { let b = f"x".write(); 0u32 }\n', 'write takes the writer, or a lent context and the writer'),
     ('use std::buffer::Buffer!;\nfn f(x: *u8) -> Buffer! { f"x = {x}" }\n', '2:34: no instance of Format[*u8, Buffer!]'),
     ("use std::buffer::Buffer!;\nuse std::raw::Span;\nfn f(s: Span['static]) -> Buffer! { var s = s; f\"{&s}\".write(Buffer!::new()) }\n",
      "3:51: no instance of Format[Span['static], Buffer!]"),

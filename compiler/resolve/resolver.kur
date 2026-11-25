@@ -242,7 +242,7 @@ fn listed(&cx: Domain!['k], names: ArenaVec[Span['k], 'k]) -> Span['k] {
 forall 'k.
 exposed struct Decl {
     id: u32,
-    // struct enum tuple fn extern trait const method
+    // struct enum tuple alias fn extern trait const method
     kind: Span['k],
     home: ModuleId['k],
     // a method's name is `Target::method`
@@ -270,6 +270,7 @@ exposed enum Named {
     Struct(S::StructDecl['k]),
     Enum(S::EnumDecl['k]),
     Tuple(S::TupleDecl['k]),
+    Alias(S::TypeAlias['k]),
     Fn(S::Fn['k]),
     Extern(S::Extern['k]),
     Trait(S::TraitDecl['k]),
@@ -282,6 +283,7 @@ fn named_pos(n: Named['k]) -> Pos {
         Struct(x) => x.pos,
         Enum(x) => x.pos,
         Tuple(x) => x.pos,
+        Alias(x) => x.pos,
         Fn(x) => x.pos,
         Extern(x) => x.pos,
         Trait(x) => x.pos,
@@ -296,6 +298,7 @@ fn name_pos(n: Named['k]) -> Pos {
         Struct(x) => x.name_pos,
         Enum(x) => x.name_pos,
         Tuple(x) => x.name_pos,
+        Alias(x) => x.name_pos,
         _ => named_pos(n),
     }
 }
@@ -307,6 +310,7 @@ fn item_pos(item: S::Item['k]) -> Pos {
         Struct(x) => x.pos,
         Tuple(x) => x.pos,
         Enum(x) => x.pos,
+        Alias(x) => x.pos,
         Fn(x) => x.pos,
         Extern(x) => x.pos,
         Const(x) => x.pos,
@@ -910,6 +914,12 @@ fn only_core(&cx: Domain!['k]) -> Span['k] {
     Span::from_static(&cx, "only package core names builtins; import them from core")
 }
 
+// The error for a type alias written where a value, a constructor or a namespace belongs.
+forall 'k.
+fn alias_names_a_type(&cx: Domain!['k], alias: Decl['k]) -> Span['k] {
+    f"{alias.name} is a type alias; it stands only where a type is written".write(&cx, Buffer!::new()).save(&cx)
+}
+
 forall 'k.
 fn problem(message: Span['k]) -> Result[Target['k], Problem['k]] {
     Result::Err.(Problem.{ message, pos: no_pos() })
@@ -1023,6 +1033,7 @@ impl Resolver['k] {
                 Struct(x) => { let declared = self.declare(&cx, scope, self.new_decl(&cx, "struct", home, x.name, Named::Struct.(x), Option::None)); },
                 Enum(x) => { let declared = self.declare(&cx, scope, self.new_decl(&cx, "enum", home, x.name, Named::Enum.(x), Option::None)); },
                 Tuple(x) => { let declared = self.declare(&cx, scope, self.new_decl(&cx, "tuple", home, x.name, Named::Tuple.(x), Option::None)); },
+                Alias(x) => { let declared = self.declare(&cx, scope, self.new_decl(&cx, "alias", home, x.name, Named::Alias.(x), Option::None)); },
                 Fn(x) => { let declared = self.declare(&cx, scope, self.new_decl(&cx, "fn", home, x.name, Named::Fn.(x), Option::None)); },
                 Extern(x) => { let declared = self.declare(&cx, scope, self.new_decl(&cx, "extern", home, x.name, Named::Extern.(x), Option::None)); },
                 Trait(x) => { let declared = self.declare(&cx, scope, self.new_decl(&cx, "trait", home, x.name, Named::Trait.(x), Option::None)); },
@@ -1037,7 +1048,7 @@ impl Resolver['k] {
     // Declares `decl` in `scope`, unless its name is taken, which is reported; whether it did.
     fn declare(self, &cx: Domain!['k], scope: Scope['k], decl: Decl['k]) -> bool {
         if scope.decls.contains(&cx, decl.name) || scope.imports.contains(&cx, decl.name) {
-            self.report(&cx, Buffer!::new().push_static("duplicate name ").push_bytes(&cx, decl.name).save(&cx), named_pos(decl.node));
+            self.report(&cx, f"duplicate name {decl.name}".write(&cx, Buffer!::new()).save(&cx), named_pos(decl.node));
             return false;
         }
         scope.decls.insert(&cx, decl.name, decl);
@@ -1113,26 +1124,42 @@ impl Resolver['k] {
     }
 
     fn attach_impl(self, &cx: Domain!['k], scope: Scope['k], item: S::Impl['k]) {
-        let target = match item.type {
+        let target = match item.ty {
             Name(n) => n,
             _ => {
                 self.report(&cx, Span::from_static(&cx, "an impl target must be a named type"), item.pos);
                 return;
             },
         };
-        let spelled = target.path.at(&cx, target.path.len(&cx) - 1usize);
+        var spelled = target.path.at(&cx, target.path.len(&cx) - 1usize);
         let params = match item.quantifier {
             Some(f) => f.params,
             None => ArenaVec::new(&cx),
         };
         let alone = target.path.at(&cx, 0usize);
-        let owner = if target.path.len(&cx) == 1usize && is_prim(&cx, alone) {
+        var owner = if target.path.len(&cx) == 1usize && is_prim(&cx, alone) {
             Owner::Prim.(target.path.at(&cx, 0usize))
         } else if target.path.len(&cx) == 1usize && params.contains(&cx, target.path.at(&cx, 0usize)) {
             // a blanket impl: its methods are found by method calls only
             Owner::Blanket
         } else {
             self.impl_owner(&cx, scope.home, target)
+        };
+        let unit = match owner {
+            Decl(d) => if d.kind.is(&cx, "alias") {
+                match self.aliased(&cx, d, target.pos) {
+                    Some(o) => {
+                        owner = o;
+                        spelled = match o {
+                            Decl(e) => e.name,
+                            Prim(name) => name,
+                            Blanket => spelled,
+                        };
+                    },
+                    None => return,
+                }
+            },
+            _ => (),
         };
         self.impl_home(&cx, scope.home, owner, target);
         var k = 0usize;
@@ -1154,6 +1181,71 @@ impl Resolver['k] {
             }
             k = k + 1usize;
         }
+    }
+
+    // What an impl written through the type alias `alias`, at `pos`, gives methods: the type
+    // declaration, or the primitive or builtin type, that the alias stands for. Nothing when an alias on
+    // the way refers to itself, which is reported where it is declared, or when it stands for no such
+    // type, which is reported at `pos`.
+    fn aliased(self, &cx: Domain!['k], alias: Decl['k], pos: Pos) -> Option[Owner['k]] {
+        let seen: ArenaSet[u32, 'k] = ArenaSet::new(&cx);
+        var found = Target::Decl.(alias);
+        var going = true;
+        while going {
+            going = false;
+            let unit = match found {
+                Decl(d) => match d.node {
+                    Alias(a) => {
+                        if seen.contains(&cx, d.id) {
+                            return Option::None;
+                        }
+                        seen.insert(&cx, d.id);
+                        let body = match a.body {
+                            Name(n) => n,
+                            _ => {
+                                self.report(&cx, Span::from_static(&cx, "an impl target must be a named type"), pos);
+                                return Option::None;
+                            },
+                        };
+                        let first = body.path.at(&cx, 0usize);
+                        let params = match a.quantifier {
+                            Some(f) => f.params,
+                            None => ArenaVec::new(&cx),
+                        };
+                        if body.path.len(&cx) == 1usize && params.contains(&cx, first) {
+                            self.report(&cx, Span::from_static(&cx, "an impl target must name a type declaration"), pos);
+                            return Option::None;
+                        }
+                        if body.path.len(&cx) == 1usize && is_prim(&cx, first) {
+                            return Option::Some.(Owner::Prim.(first));
+                        }
+                        match self.lookup(&cx, d.home, body.path, no_pos()) {
+                            Ok(t) => {
+                                found = t;
+                                going = true;
+                            },
+                            Err(_e) => {
+                                self.report(&cx, Span::from_static(&cx, "an impl target must name a type declaration"), pos);
+                                return Option::None;
+                            },
+                        }
+                    },
+                    _ => (),
+                },
+                _ => (),
+            };
+        }
+        match found {
+            Builtin(name) => if is_owned_builtin(&cx, name) {
+                return Option::Some.(Owner::Prim.(name));
+            },
+            Decl(d) => if d.kind.is(&cx, "struct") || d.kind.is(&cx, "enum") || d.kind.is(&cx, "tuple") {
+                return Option::Some.(Owner::Decl.(d));
+            },
+            _ => (),
+        }
+        self.report(&cx, Span::from_static(&cx, "an impl target must name a type declaration"), pos);
+        Option::None
     }
 
     // An inherent impl is in the package that declares its type, and one of a primitive or builtin
@@ -1577,6 +1669,7 @@ impl Resolver['k] {
     // `Owner::name`: an enum variant, or a method or const attached to `Owner`.
     fn associated(self, &cx: Domain!['k], owner: Decl['k], name: Span['k]) -> Result[Target['k], Problem['k]] {
         let unit = match owner.node {
+            Alias(_a) => return problem(alias_names_a_type(&cx, owner)),
             Enum(e) => {
                 var i = 0usize;
                 while i < e.variants.len(&cx) {
@@ -1651,6 +1744,7 @@ fn quantifier_of(item: S::Item['k]) -> Option[S::Forall['k]] {
         Struct(x) => x.quantifier,
         Tuple(x) => x.quantifier,
         Enum(x) => x.quantifier,
+        Alias(x) => x.quantifier,
         Fn(x) => x.quantifier,
         Extern(x) => x.quantifier,
         Const(_x) => Option::None,
@@ -1778,7 +1872,7 @@ impl Names['k] {
                     }
                     var k = 0usize;
                     while k < premise.args.args.len(&cx) {
-                        self.type(&cx, premise.args.args.at(&cx, k), types, false);
+                        self.ty(&cx, premise.args.args.at(&cx, k), types, false);
                         k = k + 1usize;
                     }
                     i = i + 1usize;
@@ -1803,7 +1897,7 @@ impl Names['k] {
             Struct(s) => {
                 var i = 0usize;
                 while i < s.fields.len(&cx) {
-                    self.type(&cx, s.fields.at(&cx, i).type, types, false);
+                    self.ty(&cx, s.fields.at(&cx, i).ty, types, false);
                     i = i + 1usize;
                 }
             },
@@ -1819,23 +1913,24 @@ impl Names['k] {
             Extern(x) => {
                 var i = 0usize;
                 while i < x.params.len(&cx) {
-                    let unit = match x.params.at(&cx, i).type {
-                        Some(t) => self.type(&cx, t, types, false),
+                    let unit = match x.params.at(&cx, i).ty {
+                        Some(t) => self.ty(&cx, t, types, false),
                         None => (),
                     };
                     i = i + 1usize;
                 }
                 let unit = match x.ret {
-                    Some(t) => self.type(&cx, t, types, false),
+                    Some(t) => self.ty(&cx, t, types, false),
                     None => (),
                 };
             },
             Const(c) => {
-                self.type(&cx, c.type, types, false);
+                self.ty(&cx, c.ty, types, false);
                 self.expr(&cx, c.value, types, ArenaVec::new(&cx));
             },
+            Alias(a) => self.ty(&cx, a.body, types, false),
             Impl(m) => {
-                self.type(&cx, m.type, types, false);
+                self.ty(&cx, m.ty, types, false);
                 var i = 0usize;
                 while i < m.items.len(&cx) {
                     let unit = match m.items.at(&cx, i) {
@@ -1854,7 +1949,7 @@ impl Names['k] {
                 }
             },
             Instance(n) => {
-                self.type(&cx, n.type, types, true);
+                self.ty(&cx, n.ty, types, true);
                 var i = 0usize;
                 while i < n.methods.len(&cx) {
                     self.item(&cx, S::Item::Fn.(n.methods.at(&cx, i)), types);
@@ -1872,15 +1967,15 @@ impl Names['k] {
         var i = 0usize;
         while i < f.params.len(&cx) {
             let p = f.params.at(&cx, i);
-            let unit = match p.type {
-                Some(t) => self.type(&cx, t, types, false),
+            let unit = match p.ty {
+                Some(t) => self.ty(&cx, t, types, false),
                 None => (),
             };
             names.push(&cx, p.name);
             i = i + 1usize;
         }
         let unit = match f.ret {
-            Some(t) => self.type(&cx, t, types, false),
+            Some(t) => self.ty(&cx, t, types, false),
             None => (),
         };
         let unit = match f.body {
@@ -1916,6 +2011,9 @@ impl Names['k] {
         match target {
             Decl(d) => if k.is_empty() || d.kind.eq(&cx, k) {
                 return Option::Some.(d);
+            } else if d.kind.is(&cx, "alias") {
+                self.r.report(&cx, alias_names_a_type(&cx, d), pos);
+                return Option::None;
             },
             _ => (),
         }
@@ -1928,12 +2026,12 @@ impl Names['k] {
     fn types(self, &cx: Domain!['k], ts: ArenaVec[Type['k], 'k], types: ArenaVec[Span['k], 'k]) {
         var i = 0usize;
         while i < ts.len(&cx) {
-            self.type(&cx, ts.at(&cx, i), types, false);
+            self.ty(&cx, ts.at(&cx, i), types, false);
             i = i + 1usize;
         }
     }
 
-    fn type(self, &cx: Domain!['k], t: Type['k], types: ArenaVec[Span['k], 'k], is_trait: bool) {
+    fn ty(self, &cx: Domain!['k], t: Type['k], types: ArenaVec[Span['k], 'k], is_trait: bool) {
         match t {
             Name(n) => {
                 let path = n.path;
@@ -1953,30 +2051,30 @@ impl Names['k] {
                 }
                 self.types(&cx, n.args, types);
             },
-            Ptr(inner) => self.type(&cx, inner.copy(&cx), types, false),
+            Ptr(inner) => self.ty(&cx, inner.copy(&cx), types, false),
             Tuple(elems) => self.types(&cx, elems, types),
             Array(elem, length) => {
-                self.type(&cx, elem.copy(&cx), types, false);
+                self.ty(&cx, elem.copy(&cx), types, false);
                 self.expr(&cx, length.copy(&cx), types, ArenaVec::new(&cx));
             },
             Fn(f) => {
                 self.slots(&cx, f.params, types);
-                self.type(&cx, f.ret.copy(&cx), types, false);
+                self.ty(&cx, f.ret.copy(&cx), types, false);
             },
             Closure(c) => {
                 self.slots(&cx, c.params, types);
-                self.type(&cx, c.ret.copy(&cx), types, false);
+                self.ty(&cx, c.ret.copy(&cx), types, false);
                 let unit = match c.env {
-                    Some(env) => self.type(&cx, env.copy(&cx), types, false),
+                    Some(env) => self.ty(&cx, env.copy(&cx), types, false),
                     None => (),
                 };
             },
-            Exists(brands, _at, body) => self.type(&cx, body.copy(&cx), types, false),
+            Exists(brands, _at, body) => self.ty(&cx, body.copy(&cx), types, false),
             Foreach(f) => {
-                self.type(&cx, f.source.copy(&cx), types, false);
+                self.ty(&cx, f.source.copy(&cx), types, false);
                 let bound = types.clone(&cx);
                 bound.push(&cx, f.binder);
-                self.type(&cx, f.body.copy(&cx), bound, false);
+                self.ty(&cx, f.body.copy(&cx), bound, false);
             },
             _ => (),
         }
@@ -1985,7 +2083,7 @@ impl Names['k] {
     fn slots(self, &cx: Domain!['k], slots: ArenaVec[S::Slot['k], 'k], types: ArenaVec[Span['k], 'k]) {
         var i = 0usize;
         while i < slots.len(&cx) {
-            self.type(&cx, slots.at(&cx, i).type, types, false);
+            self.ty(&cx, slots.at(&cx, i).ty, types, false);
             i = i + 1usize;
         }
     }
@@ -2006,7 +2104,7 @@ impl Names['k] {
             _ => (),
         }
         match self.decl_of(&cx, n.path, target, if is_trait { "trait" } else { "" }, n.pos) {
-            Some(d) => if is_trait || d.kind.is(&cx, "struct") || d.kind.is(&cx, "enum") || d.kind.is(&cx, "tuple") {
+            Some(d) => if is_trait || d.kind.is(&cx, "struct") || d.kind.is(&cx, "enum") || d.kind.is(&cx, "tuple") || d.kind.is(&cx, "alias") {
                 self.set(&cx, n.id, NameRef::Decl.(d));
             } else {
                 self.r.report(&cx, not_a_type, n.pos);
@@ -2095,15 +2193,15 @@ impl Names['k] {
                 var i = 0usize;
                 while i < c.params.len(&cx) {
                     let p = c.params.at(&cx, i);
-                    let unit = match p.type {
-                        Some(t) => self.type(&cx, t, types, false),
+                    let unit = match p.ty {
+                        Some(t) => self.ty(&cx, t, types, false),
                         None => (),
                     };
                     names.push(&cx, p.name);
                     i = i + 1usize;
                 }
                 let unit = match c.ret {
-                    Some(t) => self.type(&cx, t, types, false),
+                    Some(t) => self.ty(&cx, t, types, false),
                     None => (),
                 };
                 self.expr(&cx, c.body.copy(&cx), types, with(&cx, values, names));
@@ -2118,7 +2216,7 @@ impl Names['k] {
             },
             Cast(c) => {
                 self.expr(&cx, c.value.copy(&cx), types, values);
-                self.type(&cx, c.type, types, false);
+                self.ty(&cx, c.ty, types, false);
             },
             While(w) => {
                 self.expr(&cx, w.cond.copy(&cx), types, values);
@@ -2192,14 +2290,14 @@ impl Names['k] {
         match s {
             Let(l) => {
                 self.expr(&cx, l.value, types, values);
-                let unit = match l.type {
-                    Some(t) => self.type(&cx, t, types, false),
+                let unit = match l.ty {
+                    Some(t) => self.ty(&cx, t, types, false),
                     None => (),
                 };
                 with(&cx, values, bound(&cx, l.pattern))
             },
             Const(c) => {
-                self.type(&cx, c.type, types, false);
+                self.ty(&cx, c.ty, types, false);
                 self.expr(&cx, c.value, types, values);
                 with_one(&cx, values, c.name)
             },
@@ -2243,7 +2341,11 @@ impl Names['k] {
             match self.seek(&cx, names, p.pos) {
                 Some(target) => match target {
                     Module(m) => self.r.report(&cx, Buffer!::new().push_bytes(&cx, names.join(&cx, "::")).push_static(" is a module, not a value").save(&cx), p.pos),
-                    Decl(d) => self.set(&cx, p.id, NameRef::Decl.(d)),
+                    Decl(d) => if d.kind.is(&cx, "alias") {
+                        self.r.report(&cx, alias_names_a_type(&cx, d), p.pos);
+                    } else {
+                        self.set(&cx, p.id, NameRef::Decl.(d));
+                    },
                     Variant(d, v) => self.set(&cx, p.id, NameRef::Variant.(d, v)),
                     TraitMethod(d, m) => self.set(&cx, p.id, NameRef::TraitMethod.(d, m)),
                     Builtin(name) => self.set(&cx, p.id, NameRef::Builtin.(name)),

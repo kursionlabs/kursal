@@ -45,12 +45,14 @@ Ordinary `//` comments stay in source and are omitted from the site.
   function has nothing beneath it, so its page would hold one signature and
   its comment, and the module page shows them all at once while each still
   has a stable anchor to link to.
-- **Type pages.** Each struct, enum and tuple has a page with its definition,
-  its methods and associated constants wherever they are defined (an `impl`
-  in another module or package says so), and every instance whose head
-  mentions the type. A primitive or builtin type (`u8`, `NonNull`) that a
-  module's `impl` gives methods to has a page beside that module, with those
-  methods and the instances that mention it.
+- **Type pages.** Each struct, enum, tuple and type alias has a page with its
+  definition, its methods and associated constants wherever they are defined
+  (an `impl` in another module or package says so), and every instance whose
+  head mentions the type. An `impl` written through a type alias gives its
+  methods to the type the alias stands for, on that type's page. A primitive
+  or builtin type (`u8`, `NonNull`) that a module's `impl` gives methods to
+  has a page beside that module, with those methods and the instances that
+  mention it.
 - **Trait pages.** Each trait has a page with its definition, its methods, and
   its implementors: every instance of it in every documented package.
 - **Blanket methods.** The methods of an `impl` over a type parameter
@@ -94,7 +96,7 @@ The search index lists each item once, at the path the documented package
 |---|---|
 | package root module | `/std/` |
 | module | `/std/io/`, `/std/cmp/` |
-| type, trait | `/std/io/struct.File~.html`, `/std/option/enum.Option.html`, `/std/cmp/trait.Ord.html` |
+| type, trait | `/std/io/struct.File~.html`, `/std/option/enum.Option.html`, `/std/slice/type.Str.html`, `/std/cmp/trait.Ord.html` |
 | primitive or builtin type | `/core/num/primitive.u8.html`, `/core/ptr/builtin.NonNull.html` |
 | source file | `/src/core/cmp.kur.html#L44` |
 

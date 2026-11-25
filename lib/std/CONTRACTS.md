@@ -309,7 +309,7 @@ checkers require of a KURS `data` declaration (`data_type_not_copy`).
 | `core::cstr::cstr_len` | the pointer addresses a NUL-terminated byte run; there is no length to bound the scan |
 | `core::cstr::CStr::from_raw` | `ptr` names a NUL-terminated byte run that stays readable and unchanged for the rest of the process, as `argv` entries do: a `CStr` is `Copy` and carries no brand, so nothing ends its use earlier |
 | `std::fs::is_dot` | `name` addresses a live NUL-terminated string (a directory entry's name, read before the next read or close of its directory) |
-| `core::fmt::Writable::write_raw` (and its instances) | `ptr[0..len)` is readable for the whole call; the writer reads the bytes before returning and keeps no pointer to them |
+| `core::fmt::Writer::write_raw` (and its instances) | `ptr[0..len)` is readable for the whole call; the writer reads the bytes before returning and keeps no pointer to them |
 | `alloc::buffer::Buffer!::push_n` | `src[0..count)` is readable and does not alias the buffer's own storage, which the growth on entry may reallocate |
 | `std::io::write_all` | `ptr[0..len)` is readable, and `fd` is a descriptor the caller may write: standard output or error, or one a `File!` it holds owns |
 | `std::io::File!::write_all_raw` | `ptr[0..len)` is readable throughout the write |

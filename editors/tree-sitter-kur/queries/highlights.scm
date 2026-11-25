@@ -27,6 +27,7 @@
 (struct_declaration name: (identifier) @type)
 (tuple_declaration name: (identifier) @type)
 (enum_declaration name: (identifier) @type)
+(type_alias name: (identifier) @type)
 (trait_declaration name: (identifier) @type)
 (variant_declaration name: (identifier) @constant)
 
@@ -97,6 +98,7 @@
   "struct"
   "tuple"
   "enum"
+  "type"
   "impl"
   "trait"
   "instance"
@@ -172,6 +174,7 @@
 (struct_declaration name: (identifier) @type.linear linear: "!" @type.linear)
 (tuple_declaration name: (identifier) @type.linear linear: "!" @type.linear)
 (enum_declaration name: (identifier) @type.linear linear: "!" @type.linear)
+(type_alias name: (identifier) @type.linear linear: "!" @type.linear)
 (path_segment name: (identifier) @type.linear linear: "!" @type.linear)
 (use_tree path: (identifier) @type.linear . linear: "!" @type.linear)
 (use_tree alias: (identifier) @type.linear . linear: "!" @type.linear)

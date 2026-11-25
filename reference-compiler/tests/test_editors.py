@@ -42,6 +42,8 @@ ACCEPTED = (
     "fn f() -> f64 { 1_000.5f64 + 0x_ff as f64 + 0b1010u8 as f64 + 2f32 as f64 }",
     "use a::{B!, C! as D!}; fn f(x: B!) -> bool { let y = D!::new(); let z = B!.{ x }; a!=b && !c && a != b }",
     "fn f(self, g: fn(closure() -> u32) -> u32) -> u32 { var self = self; let (self, x) = y; return x; }",
+    "forall 'k. type Str = Slice[u8, 'k]; type Held! = (L!, u8); exposed type P = u32; impl Str['static] {}",
+    "fn f(&cx: C, s: Str['k]) -> Buffer! { f\"{s}: {1u32}\".write(&cx, Buffer!::new()) }",
 )
 
 # Forms of the surface syntax that Kursal does not have: a struct literal without `.`, a place written on
@@ -49,8 +51,8 @@ ACCEPTED = (
 # `!` apart from its name, a `!` on a name that is not a type's, an unsafe instance, a declaration
 # that begins with the reserved word `module`, a trait method with a body, a function without one, a
 # `forall` before a `use`, a `const`, a trait's method or an instance's, a `self` parameter after the
-# first, a closure type with no environment outside a parameter, a `return` as a block's tail, and a
-# keyword used as a name.
+# first, a closure type with no environment outside a parameter, a `return` as a block's tail, a type
+# alias without `=` or `;` or with brackets after its name, and a keyword used as a name.
 REJECTED = (
     "fn f() -> Point { Point { x: 1u32 } }",
     "fn f(x: &u32) {}",
@@ -75,6 +77,10 @@ REJECTED = (
     "fn f() { let g: closure() -> u32 = h; }",
     "fn f() -> u32 { return 1u32 }",
     "fn f() { let g = |_| 1u32; }",
+    "fn f() { let type = 1u32; }",
+    "type P: u32;",
+    "type P = u32",
+    "forall T. type P[T] = (T, T);",
 )
 
 READABLE_PACKAGES = ("shapes", "option_result", "skolems", "mint_join", "generic_capabilities", "iter_combinators")

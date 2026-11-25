@@ -7,9 +7,9 @@
 // operands in one order and, when that fails, in the other, so an error met while folding is one
 // the caller recovers from.
 //
-// Errors are reported together, in source order, a step at a time: the type declarations, the Copy
-// checks of their type arguments, which declarations are linear, the other declarations, and
-// whether each instance conforms to its trait. A step runs only when every step before it
+// Errors are reported together, in source order, a step at a time: the type aliases, the type
+// declarations, the Copy checks of their type arguments, which declarations and aliases are linear,
+// the other declarations, and whether each instance conforms to its trait. A step runs only when every step before it
 // succeeded, and a declaration reports at most its first error. An error in a constant stops at
 // once: it would recur wherever the constant is used.
 //
@@ -34,7 +34,7 @@ use package::types::literals::valid_literal;
 use package::resolve::resolver::{Decl, NameRef, Named, Package, Resolver, Target, name_pos, named_pos};
 use package::syntax::ast as S;
 use package::syntax::ast::{Expr, Pos, no_pos};
-use package::types::ops::{Fresh, Types, equal, subst, surface, with_names};
+use package::types::ops::{Fresh, Types, equal, free_names, subst, surface, with_names};
 use std::option::{Option, Result};
 use std::slice::Slice;
 
@@ -69,12 +69,18 @@ fn library_item(&cx: Domain!['k], name: Span['k]) -> LibraryItem['k] {
         library_entry(&cx, "core", "iter::Iterator", "iter::Iterator")
     } else if name.is(&cx, "Format") {
         library_entry(&cx, "core", "fmt::Format", "fmt::Format")
-    } else if name.is(&cx, "Writable") {
-        library_entry(&cx, "core", "fmt::Writable", "fmt::Writable")
+    } else if name.is(&cx, "Writer") {
+        library_entry(&cx, "core", "fmt::Writer", "fmt::Writer")
     } else if name.is(&cx, "Slice::from_raw_parts") {
         library_entry(&cx, "core", "slice::Slice::from_raw_parts", "slice::Slice::from_raw_parts")
     } else if name.is(&cx, "Buffer!::new") {
         library_entry(&cx, "alloc", "buffer::Buffer!::new", "buffer::Buffer!::new")
+    } else if name.is(&cx, "ReadingWriter!") {
+        library_entry(&cx, "core", "fmt::ReadingWriter!", "fmt::ReadingWriter!")
+    } else if name.is(&cx, "ReadingWriter!::new") {
+        library_entry(&cx, "core", "fmt::ReadingWriter!::new", "fmt::ReadingWriter!::new")
+    } else if name.is(&cx, "ReadingWriter!::finish") {
+        library_entry(&cx, "core", "fmt::ReadingWriter!::finish", "fmt::ReadingWriter!::finish")
     } else if name.is(&cx, "Ordering") {
         library_entry(&cx, "core", "atomic::Ordering", "atomic::Ordering")
     } else {
@@ -336,10 +342,28 @@ fn named_quantifier(node: Named['k]) -> Option[S::Forall['k]] {
         Struct(x) => x.quantifier,
         Enum(x) => x.quantifier,
         Tuple(x) => x.quantifier,
+        Alias(x) => x.quantifier,
         Fn(x) => x.quantifier,
         Extern(x) => x.quantifier,
         Trait(x) => x.quantifier,
         Const(_x) => Option::None,
+    }
+}
+
+// A type alias's parameters and the core type it stands for, put in its place wherever it is
+// written.
+forall 'k.
+exposed struct AliasType {
+    decl: Decl['k],
+    params: ArenaVec[Param['k], 'k],
+    body: Type['k],
+}
+
+forall 'k.
+fn alias_node(&cx: Domain!['k], decl: Decl['k]) -> S::TypeAlias['k] {
+    match decl.node {
+        Alias(a) => a,
+        _ => fail(&cx, Span::from_static(&cx, "internal error: a type alias that declares none")),
     }
 }
 
@@ -402,7 +426,9 @@ exposed struct Signatures {
     copy_checks: ArenaVec[(Type['k], ArenaMap[Span['k], Kind, 'k], Decl['k], Pos), 'k],
     // The same for the formation of foreach types (`foreach_formation`).
     foreach_checks: ArenaVec[(ForeachType['k], ArenaMap[Span['k], Kind, 'k], Decl['k], Pos), 'k],
-    // the type declaration being translated
+    // decl id -> the type alias, in the order they were translated
+    aliases: ArenaMap[u32, AliasType['k], 'k],
+    // the type declaration or alias being translated
     declaring: Ref[Option[Decl['k]], 'k],
     types_ready: Ref[bool, 'k],
     counter: Fresh['k],
@@ -443,10 +469,36 @@ impl Signatures['k] {
             implicit: ref_in(&cx, 0u32),
             copy_checks: ArenaVec::new(&cx),
             foreach_checks: ArenaVec::new(&cx),
+            aliases: ArenaMap::new(&cx),
             declaring: ref_in(&cx, Option::None),
             types_ready: ref_in(&cx, false),
             counter,
         };
+        let order = s.aliases_in_order(&cx);
+        let failed: ArenaSet[u32, 'k] = ArenaSet::new(&cx);
+        var a = 0usize;
+        while a < order.len(&cx) {
+            let decl = order.at(&cx, a);
+            let named = s.aliases_named(&cx, alias_node(&cx, decl).body);
+            var blocked = false;
+            var n = 0usize;
+            while n < named.len(&cx) {
+                blocked = blocked || failed.contains(&cx, named.at(&cx, n).id);
+                n = n + 1usize;
+            }
+            if blocked {
+                failed.insert(&cx, decl.id);
+            } else {
+                resolver.locate(&cx, decl.home, named_pos(decl.node));
+                let unit = match s.reported(&cx, s.alias(&cx, decl)) {
+                    Some(_t) => (),
+                    None => { failed.insert(&cx, decl.id); },
+                };
+                resolver.unlocate(&cx);
+            }
+            a = a + 1usize;
+        }
+        resolver.stop(&cx);
         let scopes = resolver.scopes.values(&cx);
         var i = 0usize;
         while i < scopes.len(&cx) {
@@ -518,6 +570,15 @@ impl Signatures['k] {
                 k = k + 1usize;
             }
             i = i + 1usize;
+        }
+        let translated = s.aliases.values(&cx);
+        a = 0usize;
+        while a < translated.len(&cx) {
+            let alias = translated.at(&cx, a);
+            resolver.locate(&cx, alias.decl.home, named_pos(alias.decl.node));
+            let unit = s.reported(&cx, s.alias_linearity(&cx, alias, types));
+            resolver.unlocate(&cx);
+            a = a + 1usize;
         }
         resolver.stop(&cx);
         i = 0usize;
@@ -811,7 +872,7 @@ impl Signatures['k] {
         let out: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < exprs.len(&cx) {
-            out.push(&cx, self.type(&cx, exprs.at(&cx, i), scope)?);
+            out.push(&cx, self.ty(&cx, exprs.at(&cx, i), scope)?);
             i = i + 1usize;
         }
         Result::Ok.(out)
@@ -821,13 +882,13 @@ impl Signatures['k] {
         let out: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < slots.len(&cx) {
-            out.push(&cx, self.type(&cx, slots.at(&cx, i).type, scope)?);
+            out.push(&cx, self.ty(&cx, slots.at(&cx, i).ty, scope)?);
             i = i + 1usize;
         }
         Result::Ok.(out)
     }
 
-    fn type(self, &cx: Domain!['k], type_expr: S::Type['k], scope: Scope['k]) -> Result[Type['k], SigError['k]] {
+    fn ty(self, &cx: Domain!['k], type_expr: S::Type['k], scope: Scope['k]) -> Result[Type['k], SigError['k]] {
         match type_expr {
             Name(n) => {
                 let args = self.type_list(&cx, n.args, scope)?;
@@ -870,6 +931,16 @@ impl Signatures['k] {
                     },
                     Decl(decl) => {
                         let unit = self.check_arguments(&cx, decl, args, scope, n.pos)?;
+                        if decl.kind.is(&cx, "alias") {
+                            let alias = self.alias(&cx, decl)?;
+                            let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+                            var i = 0usize;
+                            while i < alias.params.len(&cx) {
+                                sub.insert(&cx, alias.params.at(&cx, i).name, args.at(&cx, i));
+                                i = i + 1usize;
+                            }
+                            return Result::Ok.(subst(&cx, alias.body, sub, self.counter));
+                        }
                         Result::Ok.(C::named(self.name(&cx, decl), args))
                     },
                     _ => sig_error(not_a_type, n.pos),
@@ -882,22 +953,22 @@ impl Signatures['k] {
                 }
                 Result::Ok.(Type::Skolem.(label))
             },
-            Ptr(inner) => Result::Ok.(C::ptr(&cx, self.type(&cx, inner.copy(&cx), scope)?)),
+            Ptr(inner) => Result::Ok.(C::ptr(&cx, self.ty(&cx, inner.copy(&cx), scope)?)),
             Never => Result::Ok.(Type::Never),
             Tuple(elems) => Result::Ok.(Type::Tuple.(self.type_list(&cx, elems, scope)?)),
             Array(elem, length) => {
-                let elem_type = self.type(&cx, elem.copy(&cx), scope)?;
+                let elem_type = self.ty(&cx, elem.copy(&cx), scope)?;
                 let count = self.array_length(&cx, length.copy(&cx))?;
                 Result::Ok.(Type::Array.(ref_in(&cx, elem_type), count))
             },
             Fn(f) => {
                 let params = self.slot_types(&cx, f.params, scope)?;
-                let ret = self.type(&cx, f.ret.copy(&cx), scope)?;
+                let ret = self.ty(&cx, f.ret.copy(&cx), scope)?;
                 Result::Ok.(C::fn_type(&cx, params, ret, f.is_unsafe, places_of(&cx, f.params, 0usize)))
             },
             Closure(c) => {
                 let environment = match c.env {
-                    Some(env) => self.type(&cx, env.copy(&cx), scope)?,
+                    Some(env) => self.ty(&cx, env.copy(&cx), scope)?,
                     None => match scope.implicit.copy(&cx) {
                         Some(implicit) => {
                             self.implicit.set(&cx, self.implicit.copy(&cx) + 1u32);
@@ -910,9 +981,9 @@ impl Signatures['k] {
                 };
                 let params = ArenaVec::one(&cx, environment);
                 params.append(&cx, self.slot_types(&cx, c.params, scope)?);
-                let ret = self.type(&cx, c.ret.copy(&cx), scope)?;
+                let ret = self.ty(&cx, c.ret.copy(&cx), scope)?;
                 let code = C::fn_type(&cx, params, ret, false, places_of(&cx, c.params, 1usize));
-                Result::Ok.(Type::Struct.(ArenaVec::two(&cx, Member.{ name: Span::from_static(&cx, "env"), type: environment }, Member.{ name: Span::from_static(&cx, "code"), type: code })))
+                Result::Ok.(Type::Struct.(ArenaVec::two(&cx, Member.{ name: Span::from_static(&cx, "env"), ty: environment }, Member.{ name: Span::from_static(&cx, "code"), ty: code })))
             },
             Exists(brands, at, body) => {
                 let labels: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
@@ -930,13 +1001,13 @@ impl Signatures['k] {
                     binders.push(&cx, Param.{ name: label, kind: Kind::Brand });
                     i = i + 1usize;
                 }
-                let inner = self.type(&cx, body.copy(&cx), scope.extend(&cx, binders))?;
+                let inner = self.ty(&cx, body.copy(&cx), scope.extend(&cx, binders))?;
                 Result::Ok.(Type::Exists.(labels, ref_in(&cx, inner)))
             },
             Foreach(f) => {
-                let source = self.type(&cx, f.source.copy(&cx), scope)?;
+                let source = self.ty(&cx, f.source.copy(&cx), scope)?;
                 let bound = ArenaVec::one(&cx, Param.{ name: f.binder, kind: Kind::Any });
-                let body = self.type(&cx, f.body.copy(&cx), scope.extend(&cx, bound))?;
+                let body = self.ty(&cx, f.body.copy(&cx), scope.extend(&cx, bound))?;
                 let formed = ForeachType.{ binder: f.binder, indirect: f.indirect, source: ref_in(&cx, source), body: ref_in(&cx, body) };
                 let unit = self.foreach_formation(&cx, formed, scope.kinds, f.pos)?;
                 Result::Ok.(Type::Foreach.(formed))
@@ -963,6 +1034,201 @@ impl Signatures['k] {
         }
     }
 
+    // ---- type aliases
+    // Every type alias, each after the aliases its body names. An alias that refers to itself,
+    // directly or through others, is reported, and left out with every alias that names it.
+    fn aliases_in_order(self, &cx: Domain!['k]) -> ArenaVec[Decl['k], 'k] {
+        let order: ArenaVec[Decl['k], 'k] = ArenaVec::new(&cx);
+        let done: ArenaMap[u32, bool, 'k] = ArenaMap::new(&cx);
+        let stack: ArenaVec[Decl['k], 'k] = ArenaVec::new(&cx);
+        let scopes = self.r.scopes.values(&cx);
+        var i = 0usize;
+        while i < scopes.len(&cx) {
+            let decls = scopes.at(&cx, i).decls.values(&cx);
+            var k = 0usize;
+            while k < decls.len(&cx) {
+                if decls.at(&cx, k).kind.is(&cx, "alias") {
+                    let fine = self.visit_alias(&cx, decls.at(&cx, k), order, done, stack);
+                }
+                k = k + 1usize;
+            }
+            i = i + 1usize;
+        }
+        order
+    }
+
+    // Whether `decl` and every alias it names stand for a type, with no cycle; `stack` holds the
+    // aliases whose visit is under way.
+    fn visit_alias(self, &cx: Domain!['k], decl: Decl['k], order: ArenaVec[Decl['k], 'k], done: ArenaMap[u32, bool, 'k], stack: ArenaVec[Decl['k], 'k]) -> bool {
+        match done.get(&cx, decl.id) {
+            Some(fine) => return fine,
+            None => (),
+        }
+        let node = alias_node(&cx, decl);
+        var at = 0usize;
+        while at < stack.len(&cx) {
+            if stack.at(&cx, at).id == decl.id {
+                var message = Buffer!::new().push_static("type alias ").push_bytes(&cx, decl.name).push_static(" refers to itself");
+                var k = at + 1usize;
+                while k < stack.len(&cx) {
+                    message = message.push_static(if k == at + 1usize { " through " } else { ", " }).push_bytes(&cx, stack.at(&cx, k).name);
+                    k = k + 1usize;
+                }
+                self.r.locate(&cx, decl.home, node.pos);
+                self.r.report(&cx, message.save(&cx), node.pos);
+                self.r.unlocate(&cx);
+                return false;
+            }
+            at = at + 1usize;
+        }
+        stack.push(&cx, decl);
+        let named = self.aliases_named(&cx, node.body);
+        var fine = true;
+        var i = 0usize;
+        while i < named.len(&cx) {
+            fine = self.visit_alias(&cx, named.at(&cx, i), order, done, stack) && fine;
+            i = i + 1usize;
+        }
+        let top = stack.pop(&cx);
+        done.insert(&cx, decl.id, fine);
+        if fine {
+            order.push(&cx, decl);
+        }
+        fine
+    }
+
+    // The type aliases that `ty` names, in the order they are written.
+    fn aliases_named(self, &cx: Domain!['k], ty: S::Type['k]) -> ArenaVec[Decl['k], 'k] {
+        let out: ArenaVec[Decl['k], 'k] = ArenaVec::new(&cx);
+        self.add_aliases_named(&cx, ty, out);
+        out
+    }
+
+    fn add_aliases_named(self, &cx: Domain!['k], ty: S::Type['k], out: ArenaVec[Decl['k], 'k]) {
+        match ty {
+            Name(n) => {
+                let unit = match self.r.refs.get(&cx, n.id) {
+                    Some(r) => match r {
+                        Decl(d) => if d.kind.is(&cx, "alias") {
+                            out.push(&cx, d);
+                        },
+                        _ => (),
+                    },
+                    None => (),
+                };
+                self.add_all_aliases_named(&cx, n.args, out);
+            },
+            Ptr(inner) => self.add_aliases_named(&cx, inner.copy(&cx), out),
+            Tuple(elems) => self.add_all_aliases_named(&cx, elems, out),
+            Array(elem, _length) => self.add_aliases_named(&cx, elem.copy(&cx), out),
+            Fn(f) => {
+                self.add_slot_aliases_named(&cx, f.params, out);
+                self.add_aliases_named(&cx, f.ret.copy(&cx), out);
+            },
+            Closure(c) => {
+                self.add_slot_aliases_named(&cx, c.params, out);
+                self.add_aliases_named(&cx, c.ret.copy(&cx), out);
+                let unit = match c.env {
+                    Some(env) => self.add_aliases_named(&cx, env.copy(&cx), out),
+                    None => (),
+                };
+            },
+            Exists(_brands, _at, body) => self.add_aliases_named(&cx, body.copy(&cx), out),
+            Foreach(f) => {
+                self.add_aliases_named(&cx, f.source.copy(&cx), out);
+                self.add_aliases_named(&cx, f.body.copy(&cx), out);
+            },
+            _ => (),
+        }
+    }
+
+    fn add_all_aliases_named(self, &cx: Domain!['k], types: ArenaVec[S::Type['k], 'k], out: ArenaVec[Decl['k], 'k]) {
+        var i = 0usize;
+        while i < types.len(&cx) {
+            self.add_aliases_named(&cx, types.at(&cx, i), out);
+            i = i + 1usize;
+        }
+    }
+
+    fn add_slot_aliases_named(self, &cx: Domain!['k], slots: ArenaVec[S::Slot['k], 'k], out: ArenaVec[Decl['k], 'k]) {
+        var i = 0usize;
+        while i < slots.len(&cx) {
+            self.add_aliases_named(&cx, slots.at(&cx, i).ty, out);
+            i = i + 1usize;
+        }
+    }
+
+    // The parameters of the type alias `decl` and the core type it stands for. Its forall lists only
+    // parameters, and its body uses each of them.
+    fn alias(self, &cx: Domain!['k], decl: Decl['k]) -> Result[AliasType['k], SigError['k]] {
+        match self.aliases.get(&cx, decl.id) {
+            Some(a) => return Result::Ok.(a),
+            None => (),
+        }
+        let node = alias_node(&cx, decl);
+        if node.exposure.is_some() {
+            return sig_error(Span::from_static(&cx, "a type alias is never exposed: it has no representation of its own"), node.pos);
+        }
+        let unit = match node.quantifier {
+            Some(f) => if !f.premises.is_empty(&cx) || !f.determined.is_empty(&cx) {
+                return sig_error(Buffer!::new().push_static("type alias ").push_bytes(&cx, decl.name).push_static(" takes no premises or determined parameters").save(&cx), node.pos);
+            },
+            None => (),
+        };
+        let declaring = self.declaring.copy(&cx);
+        self.declaring.set(&cx, Option::Some.(decl));
+        let translated = self.alias_body(&cx, node);
+        self.declaring.set(&cx, declaring);
+        let (params, body) = translated?;
+        let used = free_names(&cx, body);
+        var i = 0usize;
+        while i < params.len(&cx) {
+            let p = params.at(&cx, i);
+            if !used.contains(&cx, p.name) {
+                let spelled = match p.kind {
+                    Brand => Buffer!::new().push_static("'").push_bytes(&cx, p.name).save(&cx),
+                    _ => p.name,
+                };
+                return sig_error(f"type alias {decl.name} does not use its parameter {spelled}".write(&cx, Buffer!::new()).save(&cx), node.pos);
+            }
+            i = i + 1usize;
+        }
+        let alias = AliasType.{ decl, params, body };
+        self.aliases.insert(&cx, decl.id, alias);
+        Result::Ok.(alias)
+    }
+
+    fn alias_body(self, &cx: Domain!['k], node: S::TypeAlias['k]) -> Result[(ArenaVec[Param['k], 'k], Type['k]), SigError['k]] {
+        let (params, _premises, scope) = self.quantifier(&cx, node.quantifier, new_scope(&cx))?;
+        Result::Ok.((params, self.ty(&cx, node.body, scope)?))
+    }
+
+    // A type alias's name ends with `!` exactly when the type it stands for is linear whatever its
+    // type arguments are.
+    fn alias_linearity(self, &cx: Domain!['k], alias: AliasType['k], types: Types['k]) -> Result[bool, SigError['k]] {
+        let kinds: ArenaMap[Span['k], Kind, 'k] = ArenaMap::new(&cx);
+        var i = 0usize;
+        while i < alias.params.len(&cx) {
+            let p = alias.params.at(&cx, i);
+            let unit = match p.kind {
+                Brand => (),
+                _ => { kinds.insert(&cx, p.name, Kind::Copy); },
+            };
+            i = i + 1usize;
+        }
+        let name = alias.decl.name;
+        let marked = name.ends_with(&cx, Span::from_static(&cx, "!"));
+        let linear = !types.is_copy(&cx, alias.body, kinds);
+        let at = alias_node(&cx, alias.decl).name_pos;
+        if linear && !marked {
+            return sig_error(Buffer!::new().push_static("type alias ").push_bytes(&cx, name).push_static(" stands for a linear type; name it ").push_bytes(&cx, name).push_static("!").save(&cx), at);
+        }
+        if !linear && marked {
+            return sig_error(Buffer!::new().push_static("type alias ").push_bytes(&cx, name).push_static(" stands for a type that is not linear; name it ").push_bytes(&cx, name.take(name.len() - 1usize)).save(&cx), at);
+        }
+        Result::Ok.(true)
+    }
+
     // ---- declarations
     fn type_decl(self, &cx: Domain!['k], decl: Decl['k]) -> Result[TypeDecl['k], SigError['k]] {
         let (params, premises, scope) = self.quantifier(&cx, named_quantifier(decl.node), new_scope(&cx))?;
@@ -979,7 +1245,7 @@ impl Signatures['k] {
                 var i = 0usize;
                 while i < node.fields.len(&cx) {
                     let field = node.fields.at(&cx, i);
-                    fields.push(&cx, Member.{ name: field.name, type: self.type(&cx, field.type, scope)? });
+                    fields.push(&cx, Member.{ name: field.name, ty: self.ty(&cx, field.ty, scope)? });
                     i = i + 1usize;
                 }
                 (Type::Struct.(fields), node.exposure)
@@ -993,7 +1259,7 @@ impl Signatures['k] {
                 var i = 0usize;
                 while i < node.variants.len(&cx) {
                     let variant = node.variants.at(&cx, i);
-                    variants.push(&cx, Member.{ name: variant.name, type: self.payload(&cx, variant.payload, scope)? });
+                    variants.push(&cx, Member.{ name: variant.name, ty: self.payload(&cx, variant.payload, scope)? });
                     i = i + 1usize;
                 }
                 (Type::Enum.(variants), node.exposure)
@@ -1044,7 +1310,7 @@ impl Signatures['k] {
         };
         i = 0usize;
         while i < members.len(&cx) && part.is_empty() {
-            if !types.is_copy(&cx, members.at(&cx, i).type, kinds) {
+            if !types.is_copy(&cx, members.at(&cx, i).ty, kinds) {
                 part = Buffer!::new().push_static(label).push_bytes(&cx, members.at(&cx, i).name).save(&cx);
             }
             i = i + 1usize;
@@ -1070,7 +1336,7 @@ impl Signatures['k] {
             return Result::Ok.(C::unit(&cx));
         }
         if types.len(&cx) == 1usize {
-            return self.type(&cx, types.at(&cx, 0usize), scope);
+            return self.ty(&cx, types.at(&cx, 0usize), scope);
         }
         Result::Ok.(Type::Tuple.(self.type_list(&cx, types, scope)?))
     }
@@ -1161,18 +1427,18 @@ impl Signatures['k] {
         var k = 0usize;
         while k < node.params.len(&cx) {
             let p = node.params.at(&cx, k);
-            let unit = match p.type {
+            let unit = match p.ty {
                 None => {
                     let self_type = match method_impl {
-                        Some(impl_block) => if p.name.is(&cx, "self") { Option::Some.(impl_block.type) } else { Option::None },
+                        Some(impl_block) => if p.name.is(&cx, "self") { Option::Some.(impl_block.ty) } else { Option::None },
                         None => Option::None,
                     };
                     match self_type {
-                        Some(t) => ptypes.push(&cx, self.type(&cx, t, scope)?),
+                        Some(t) => ptypes.push(&cx, self.ty(&cx, t, scope)?),
                         None => return sig_error(Buffer!::new().push_static("parameter ").push_bytes(&cx, p.name).push_static(" needs a type").save(&cx), node.pos),
                     }
                 },
-                Some(t) => ptypes.push(&cx, self.type(&cx, t, scope)?),
+                Some(t) => ptypes.push(&cx, self.ty(&cx, t, scope)?),
             };
             let unit = match decl {
                 Some(d) => if d.kind.is(&cx, "extern") && !implicit.is_empty(&cx) {
@@ -1189,7 +1455,7 @@ impl Signatures['k] {
         scope.implicit.set(&cx, Option::None);
         let ret = match node.ret {
             None => C::unit(&cx),
-            Some(t) => self.type(&cx, t, scope)?,
+            Some(t) => self.ty(&cx, t, scope)?,
         };
         let core_name = match name {
             Some(n) => n,
@@ -1254,7 +1520,7 @@ impl Signatures['k] {
     fn instance_decl(self, &cx: Domain!['k], item: S::InstanceDecl['k], home: ModuleId['k])
         -> Result[(InstanceSig['k], S::InstanceDecl['k], ModuleId['k]), SigError['k]] {
         let (params, premises, scope) = self.quantifier(&cx, item.quantifier, new_scope(&cx))?;
-        let head = match item.type {
+        let head = match item.ty {
             Name(n) => n,
             _ => fail(&cx, Span::from_static(&cx, "internal error: an instance of something other than a trait")),
         };
@@ -1366,7 +1632,7 @@ impl Signatures['k] {
             Const(c) => c,
             _ => fail(&cx, Span::from_static(&cx, "internal error: a const declaration that declares no const")),
         };
-        let value = self.typed(&cx, decl.name, node.value, self.type(&cx, node.type, new_scope(&cx))?, decl.home)?;
+        let value = self.typed(&cx, decl.name, node.value, self.ty(&cx, node.ty, new_scope(&cx))?, decl.home)?;
         self.consts.insert(&cx, decl.id, value);
         Result::Ok.(value)
     }
@@ -1471,7 +1737,7 @@ impl Signatures['k] {
             },
             Cast(c) => {
                 let v = self.fold(&cx, c.value.copy(&cx), Option::None, home, evaluate)?;
-                let to = self.type(&cx, c.type, new_scope(&cx))?;
+                let to = self.ty(&cx, c.ty, new_scope(&cx))?;
                 let source = match integer_of(&cx, v) {
                     Some(name) => name,
                     None => match floating_of(&cx, v) {

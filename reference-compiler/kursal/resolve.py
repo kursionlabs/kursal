@@ -49,7 +49,7 @@ class ResolveError(KursError):
 
 @dataclass(eq=False)
 class Decl:
-    kind: str              # struct enum tuple fn extern trait const method
+    kind: str              # struct enum tuple alias fn extern trait const method
     module: ModuleId
     name: str              # a method's name is `Target::method`
     node: NamedItem
@@ -86,7 +86,7 @@ class Scope:
     items: list[S.Item] = field(default_factory=list)
 
 
-type NamedItem = S.Struct | S.EnumDecl | S.TupleDecl | S.Fn | S.Extern | S.TraitDecl | S.Const
+type NamedItem = S.Struct | S.EnumDecl | S.TupleDecl | S.TypeAlias | S.Fn | S.Extern | S.TraitDecl | S.Const
 type Target = Decl | ModuleId | S.VariantRef | S.TraitMethodRef | S.BuiltinRef
 type LookupKey = (
     tuple[Literal["path"], ModuleId, S.NamePath]
@@ -296,7 +296,7 @@ class Resolver:
 
     def collect(self, module: ModuleId, items: list[S.Item]) -> None:
         scope = self.scopes[module] = Scope(module, items=items)
-        kinds = {S.Struct: "struct", S.EnumDecl: "enum", S.TupleDecl: "tuple", S.Fn: "fn",
+        kinds = {S.Struct: "struct", S.EnumDecl: "enum", S.TupleDecl: "tuple", S.TypeAlias: "alias", S.Fn: "fn",
                  S.Extern: "extern", S.TraitDecl: "trait", S.Const: "const"}
         for item in items:
             match item:
@@ -304,7 +304,8 @@ class Resolver:
                     self.use(scope, (), item.tree, item.export)
                 case S.InstanceDecl():
                     self.instances.append((module, item))
-                case S.Struct() | S.EnumDecl() | S.TupleDecl() | S.Fn() | S.Extern() | S.TraitDecl() | S.Const():
+                case S.Struct() | S.EnumDecl() | S.TupleDecl() | S.TypeAlias() | S.Fn() | S.Extern() | S.TraitDecl() \
+                        | S.Const():
                     with self.reporting(module, item.pos):
                         self.declare(scope, Decl(kinds[type(item)], module, item.name, item))
 
@@ -355,19 +356,59 @@ class Resolver:
                 continue
             owner: Optional[Decl | str]
             params = item.forall.params if item.forall else ()
+            label = target.path[-1]
             if len(target.path) == 1 and target.path[0] in PRIMS:
                 owner = target.path[0]
             elif len(target.path) == 1 and target.path[0] in params:
                 owner = None  # a blanket impl: its methods are found by method calls only
             else:
                 owner = self.impl_owner(scope.module, target)
+                if isinstance(owner, Decl) and owner.kind == "alias":
+                    try:
+                        owner = self.aliased(owner)
+                    except ResolveError as error:
+                        self.report(error, scope.module, target.pos)
+                        continue
+                    if owner is None:
+                        continue
+                    label = owner if isinstance(owner, str) else owner.name
             self.impl_home(scope.module, owner, target)
             for member in item.items:
                 kind = "method" if isinstance(member, S.Fn) else "const"
-                decl = Decl(kind, scope.module, f"{target.path[-1]}::{member.name}", member, item)
+                decl = Decl(kind, scope.module, f"{label}::{member.name}", member, item)
                 with self.reporting(scope.module, member.pos):
                     self.declare(scope, decl)
                     self.attached.setdefault((owner, member.name), []).append(decl)
+
+    def aliased(self, alias: Decl) -> Optional[Decl | str]:
+        """What an impl written through the type alias `alias` gives methods: the type declaration, or the
+        primitive or builtin type, that the alias stands for. None when an alias on the way refers to
+        itself, which is reported where it is declared."""
+        seen: set[Decl] = set()
+        found: Target = alias
+        while isinstance(found, Decl) and found.kind == "alias":
+            if found in seen:
+                return None
+            seen.add(found)
+            node = found.node
+            assert isinstance(node, S.TypeAlias)
+            body = node.body
+            if not isinstance(body, S.TName):
+                fail("an impl target must be a named type")
+            params = node.forall.params if node.forall else ()
+            if len(body.path) == 1 and body.path[0] in params:
+                fail("an impl target must name a type declaration")
+            if len(body.path) == 1 and body.path[0] in PRIMS:
+                return body.path[0]
+            try:
+                found = self.lookup(found.module, body.path)
+            except ResolveError:
+                fail("an impl target must name a type declaration")
+        if isinstance(found, tuple) and found[0] == "builtin" and found[1] in OWNED_BUILTINS:
+            return found[1]
+        if isinstance(found, Decl) and found.kind in ("struct", "enum", "tuple"):
+            return found
+        fail("an impl target must name a type declaration")
 
     def impl_home(self, module: ModuleId, owner: Optional[Decl | str], target: S.TName) -> None:
         """An inherent impl is in the package that declares its type, and one of a primitive or builtin type
@@ -611,6 +652,8 @@ class Resolver:
 
     def associated(self, owner: Decl, name: str) -> Decl | S.VariantRef | S.TraitMethodRef:
         """`Owner::name`: an enum variant, or a method or const attached to `Owner`."""
+        if owner.kind == "alias":
+            fail(alias_names_a_type(owner))
         if isinstance(owner.node, S.EnumDecl) and name in (v for v, _ in owner.node.variants):
             return ("variant", owner, name)
         if isinstance(owner.node, S.TraitDecl) and name in (m.name for m in owner.node.methods):
@@ -629,6 +672,11 @@ class Resolver:
         deps = self.packages[module.package].deps
         root = home if home in deps else "std" if "std" in deps else "package"
         return self.lookup(module, (root, *(std_path if root == "std" else path)))
+
+
+def alias_names_a_type(alias: Decl) -> str:
+    """The error for a type alias written where a value, a constructor or a namespace belongs."""
+    return f"{alias.name} is a type alias; it stands only where a type is written"
 
 
 def respelling(name: str) -> str:
@@ -707,6 +755,8 @@ class Names:
             case S.Const(type=ty, value=value):
                 self.type(ty, types)
                 self.expr(value, types, frozenset())
+            case S.TypeAlias(body=body):
+                self.type(body, types)
             case S.Impl(type=ty, items=members):
                 self.type(ty, types)
                 for member in members:
@@ -753,6 +803,8 @@ class Names:
 
     def decl(self, path: S.NamePath, kind: Optional[str] = None, pos: Optional[Position] = None) -> S.DeclRef:
         target = self.r.lookup(self.module, path, pos)
+        if isinstance(target, Decl) and target.kind == "alias" and kind not in (None, "alias"):
+            fail(alias_names_a_type(target), pos)
         if not isinstance(target, Decl) or kind and target.kind != kind:
             fail(f"{'::'.join(path)} is not a {kind or 'declaration'}", pos)
         return ("decl", target)
@@ -803,7 +855,7 @@ class Names:
         if builtin is not None:
             return builtin
         ref = self.decl(path, "trait" if trait else None, pos)
-        if not trait and ref[1].kind not in ("struct", "enum", "tuple"):
+        if not trait and ref[1].kind not in ("struct", "enum", "tuple", "alias"):
             fail(f"{'::'.join(path)} is not a type", pos)
         return ref
 
@@ -943,6 +995,8 @@ class Names:
                 target = self.r.lookup(self.module, names, expr.pos)
                 if isinstance(target, ModuleId):
                     fail(f"{'::'.join(names)} is a module, not a value", expr.pos)
+                if isinstance(target, Decl) and target.kind == "alias":
+                    fail(alias_names_a_type(target), expr.pos)
                 expr.ref = target if isinstance(target, tuple) else ("decl", target)
 
     def construction(self, callee: S.Path, construct: bool) -> None:

@@ -452,6 +452,18 @@ class EnumDecl(Declaration):
 
 
 @dataclass
+class TypeAlias(Declaration):
+    """`type Name = Type;`: another name for its body, which resolution and signatures put in its place
+    wherever it is written."""
+    name: str              # a linear type's name ends with `!`
+    body: Type
+    exposed: Optional[Exposed] = None    # never accepted: an alias has no representation of its own
+    forall: Optional[Forall] = None
+    pos: Optional[Position] = None
+    name_pos: Optional[Position] = field(default=None, init=False, repr=False, compare=False)
+
+
+@dataclass
 class Fn(Declaration):
     name: str
     params: tuple[Param, ...]
@@ -525,7 +537,7 @@ type Expr = (
 type Pattern = PBind | PWild | PTuple | PArray | PStruct
 type Statement = Let | Assign | ExprStmt | Const
 type Item = (
-    Use | Struct | TupleDecl | EnumDecl | Fn | Extern
+    Use | Struct | TupleDecl | EnumDecl | TypeAlias | Fn | Extern
     | Const | Impl | TraitDecl | InstanceDecl
 )
 type UseTree = tuple[NamePath, bool, tuple[UseTree, ...], Optional[str], Position]   # (path, star, children, alias, where it starts)

@@ -948,6 +948,8 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
             case PointerCall():
                 return self.pointer_method(expr, call)
             case FStringWrite():
+                if call.context is not None:
+                    return self.fstring_reading(call.string, expr.args[1], call.context)
                 out = self.expr(expr.args[0])
                 return None if out is None else self.fstring(call.string, out)
         items: list[S.Expr | str] = [expr.callee] if isinstance(call, (ValueCall, ClosureCall)) else []
@@ -1378,14 +1380,14 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         return self.fstring(expr, self.emit("call", self.substitute_type(expr.ty), (sig.name,), tys=()))
 
     def fstring(self, expr: S.FStr, writer: str) -> Optional[str]:
-        """Write each segment into the writer `w`: literals through `Writable::write_static`,
+        """Write each segment into the writer `w`: literals through `Writer::write_static`,
         `{expr}` through `Format::format`, which hands the value back (`{&x}` stores it again)."""
         module, wty = self.module, self.vty[writer]
-        writable, fmt = self.lowering.library_name("Writable", module), self.lowering.library_name("Format", module)
+        writer_trait, fmt = self.lowering.library_name("Writer", module), self.lowering.library_name("Format", module)
         for part in expr.parts:
             if isinstance(part, str):
                 if part:
-                    writer = self.emit("trait_call", wty, (writable, "write_static", writer, self.string(part)), tys=(wty,))
+                    writer = self.emit("trait_call", wty, (writer_trait, "write_static", writer, self.string(part)), tys=(wty,))
                 continue
             lend = isinstance(part, S.Unary) and part.op == "&"
             operand = part.operand if isinstance(part, S.Unary) and lend else part
@@ -1402,14 +1404,37 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
             both = self.emit("trait_call", pair, (fmt, "format", v, writer), tys=(vty, wty))
             (v2, _), (writer, _) = self.destruct(both, pair)
             if lend:
-                if isinstance(operand, S.Path) and self.is_plain_local(operand):
-                    self.write(self.bindings[operand.binder], v2)
-                else:
-                    path = self.place_path(operand)
-                    if path is None:
-                        fail("{&x} in an f-string needs a local or a place", self.pos)
-                    self.emit("store", C.UNIT, (path, v2))
+                self.put_back(operand, v2)
         return writer
+
+    def fstring_reading(self, string: S.FStr, out_expr: S.Expr, place: S.Expr) -> Optional[str]:
+        """`f"...".write(&cx, out)`: the capability moved out of the place `cx` and the writer `out` are
+        wrapped in `ReadingWriter![W, C]::new(out, cx)`, each segment is written through it, and `finish`
+        hands back the writer, which is the result, and the capability, which goes back into `cx`."""
+        values = self.operands([out_expr, place])
+        if values is None:
+            return None
+        out, context = values
+        module, wty, cty = self.module, self.vty[out], self.vty[context]
+        reading = C.Named(self.lowering.library_name("ReadingWriter!", module), (wty, cty))
+        new = self.lowering.library_sig("ReadingWriter!::new", module)
+        writer = self.fstring(string, self.emit("call", reading, (new.name, out, context), tys=(wty, cty)))
+        if writer is None:
+            return None
+        finish, pair = self.lowering.library_sig("ReadingWriter!::finish", module), C.Tuple((wty, cty))
+        (out, _), (context, _) = self.destruct(self.emit("call", pair, (finish.name, writer), tys=(wty, cty)), pair)
+        self.put_back(place, context)
+        return out
+
+    def put_back(self, place: S.Expr, value: str) -> None:
+        """Stores `value` in the place it was moved out of: a lent `{&x}`'s or a written f-string's context."""
+        if isinstance(place, S.Path) and self.is_plain_local(place):
+            self.write(self.bindings[place.binder], value)
+        else:
+            path = self.place_path(place)
+            if path is None:
+                fail("{&x} in an f-string needs a local or a place", self.pos)
+            self.emit("store", C.UNIT, (path, value))
 
     # ---- brands
     def expr_pack(self, expr: S.Pack) -> Optional[str]:

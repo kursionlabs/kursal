@@ -1699,7 +1699,7 @@ class StdRuntimeTests(unittest.TestCase):
             use std::hash::{Seed, key_hash};
             use std::slice::StaticRead;
             use std::io::{Error, stdout};
-            use std::fmt::Writable;
+            use std::fmt::Writer;
             use std::option::Result;
             fn main() -> Result[(), Error] {
                 var sr = StaticRead::new();
@@ -1718,7 +1718,7 @@ class StdRuntimeTests(unittest.TestCase):
             use std::slice::StaticRead;
             use std::collections::vec::OwnedVec!;
             use std::io::{Error, stdout};
-            use std::fmt::Writable;
+            use std::fmt::Writer;
             use std::option::Result;
             fn most_in_one_bucket(seed: Seed) -> u32 {
                 var counts = OwnedVec!::new[u32]();
@@ -1782,7 +1782,7 @@ class StdRuntimeTests(unittest.TestCase):
             use std::process::hash_seed;
             use std::slice::StaticRead;
             use std::io::{Error, stdout};
-            use std::fmt::Writable;
+            use std::fmt::Writer;
             use std::option::Result;
             fn main() -> Result[(), Error] {
                 var sr = StaticRead::new();
