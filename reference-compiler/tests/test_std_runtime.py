@@ -439,9 +439,9 @@ class StdRuntimeTests(unittest.TestCase):
                         f();
                         1
                     },
-                    Result::Ok(t) => match t.join() {
-                        Result::Ok(unit) => 0,
-                        Result::Err(error) => 2,
+                    Result::Ok(t) => {
+                        t.join();
+                        0
                     },
                 }
             }''')
@@ -462,9 +462,9 @@ class StdRuntimeTests(unittest.TestCase):
                         let (f, error) = failed;
                         if f() == 3usize && error.errno > 0i32 { 7 } else { 1 }
                     },
-                    Result::Ok(t) => match t.join() {
-                        Result::Ok(n) => 2,
-                        Result::Err(error) => 3,
+                    Result::Ok(t) => {
+                        t.join();
+                        2
                     },
                 }
             }''', status=7, preexec=no_more_processes)

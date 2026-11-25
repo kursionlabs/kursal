@@ -28,6 +28,7 @@ use package as std;
 use alloc::heap::HeapAllocator;
 use core::mem::sizeof;
 use core::option::Result;
+use core::process::trap;
 use libc::thread::{spawn as raw_spawn, Thread! as RawThread!};
 use std::io::Error;
 
@@ -105,22 +106,29 @@ fn spawn(f: closure[Env]() -> Ret) -> Result[Thread![Ret], (closure[Env]() -> Re
 forall Ret.
 impl Thread![Ret] {
     /// Blocks until the thread exits, consuming the handle, and returns
-    /// the `Ret` value `f` produced. Safe, unlike `libc::thread::Thread!::join`:
-    /// no raw pointer escapes, and the pointer read back is the
+    /// the `Ret` value `f` produced, so every thread's result reaches
+    /// exactly one `join`. Safe, unlike `libc::thread::Thread!::join`: no
+    /// raw pointer escapes, and the pointer read back is the
     /// `ResultBox[Ret]` `trampoline` built for this same `Ret`, which
     /// nothing else writes through. The box is freed after unboxing.
-    fn join(self) -> Result[Ret, Error] {
+    ///
+    /// `pthread_join` fails only for a thread that is not joinable, is
+    /// the caller, or would deadlock, and a `Thread!` is none of these: a
+    /// thread `spawn` started, joined once, by a thread that holds its
+    /// handle and so is not it. A failure would leave the result
+    /// unreachable, so it traps rather than return without one.
+    fn join(self) -> Ret {
         let { raw } = self;
         let joined = unsafe raw.join();
         match joined {
-            Err(errno) => Result::Err.(Error.{ errno }),
+            Err(errno) => trap(),
             Ok(result_ptr) => {
                 let typed = unsafe (result_ptr as *ResultBox[Ret]);
                 let boxed_result = unsafe *typed;
                 let { value, present } = boxed_result;
                 let reclaimed = unsafe HeapAllocator::adopt_raw(result_ptr);
                 let freed = HeapAllocator::drop(reclaimed);
-                Result::Ok.(value)
+                value
             },
         }
     }
