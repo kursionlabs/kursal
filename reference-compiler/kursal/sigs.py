@@ -373,6 +373,8 @@ class Signatures:
             fail("an array length is an integer constant")
         if value[1] < 0:
             fail("negative array length")
+        if value[1] == 0:
+            fail("an array has at least one element", expr.pos)
         return value[1]
 
     # ---- declarations

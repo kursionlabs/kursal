@@ -92,7 +92,7 @@ LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
      "a raw read, write or alloca at a zero-size type"),
     ("forall 'k.\nfn f(p: *core::cap::Brand['k], b: core::cap::Brand['k]) { unsafe p.store_volatile(b); }\n",
      "a raw read, write or alloca at a zero-size type"),
-    ("fn f() -> *[u64; 0] { unsafe core::mem::alloca[[u64; 0]]() }\n", "a raw read, write or alloca at a zero-size type"),
+    ("fn f() -> *[(); 3] { unsafe core::mem::alloca[[(); 3]]() }\n", "a raw read, write or alloca at a zero-size type"),
     ("forall T where Copy[T].\nfn get(p: *T) -> T { unsafe *p }\n", "a raw read, write or alloca at T needs Sized[T]"),
     ("forall T.\nfn make() -> *T { unsafe core::mem::alloca[T]() }\n", "a raw read, write or alloca at T needs Sized[T]"),
     ("forall T, U where Copy[T], Copy[U], Sized[T], Sized[U].\nfn get(p: *(T, U)) -> (T, U) { unsafe *p }\n",

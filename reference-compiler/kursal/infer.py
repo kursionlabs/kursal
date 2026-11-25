@@ -868,9 +868,9 @@ class Infer:
         return C.Tuple(tuple(self.expr(x) for x in expr.elems))
 
     def expr_array(self, expr: S.Array) -> C.Type:
-        elem = Meta()
         if not expr.elems:
-            self.unwritten.append((elem, "element type of the empty array", expr.pos))
+            fail("an array has at least one element", expr.pos)
+        elem = Meta()
         for x in expr.elems:
             self.check(x, elem)
         if not expr.fill:

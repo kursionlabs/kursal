@@ -431,9 +431,11 @@ INFER_ERRORS = (
     ("forall T. fn id(x: T) -> T { x }\nfn main() -> i32 {\n    let f = |a: u32, &b| id(b);\n    0i32\n}\n",
      "3:13: cannot infer the type of closure parameter b"),
     ("fn main() -> i32 {\n    let f = || std::process::exit(1i32);\n    0i32\n}\n", "2:13: cannot infer the return type of the closure"),
-    ("fn main() -> i32 {\n    let a = ([], 1u32);\n    0i32\n}\n", "2:14: cannot infer the element type of the empty array"),
+    # An array has at least one element: no literal is empty.
+    ("fn main() -> i32 {\n    let a = ([], 1u32);\n    0i32\n}\n", "2:14: an array has at least one element"),
     ("forall T. exposed struct B { v: T }\nfn main() -> i32 {\n    let b = B.{ v: [] };\n    0i32\n}\n",
-     "3:20: cannot infer the element type of the empty array"),
+     "3:20: an array has at least one element"),
+    ("fn main() -> i32 {\n    let a: [u8; 1] = [];\n    0i32\n}\n", "2:22: an array has at least one element"),
     # The type of one `foreach` item reaches the body of a sibling that writes the same binder.
     ("exposed struct S { a: u32, b: u32 }\nexposed struct P { c: u8, d: u8 }\nforall T. fn same(x: T, y: T) -> (T, T) { (x, y) }\n"
      "fn main() -> i32 {\n    let s = S.{ a: 7u32, b: 9u32 };\n    let p = P.{ c: 1u8, d: 2u8 };\n"
@@ -454,7 +456,7 @@ INFER_ERRORS = (
      "Sized requires an exact premise"),
     ("forall T where Sized[T]. fn need(x: T) -> T { x }\n"
      "forall U, V where Sized[U], Sized[V]. fn bad(x: (U, V)) -> (U, V) { need(x) }\n", "Sized requires an exact premise"),
-    ("forall T where Sized[T]. fn need(x: T) -> T { x }\nfn bad(x: ((), [u64; 0])) -> ((), [u64; 0]) { need(x) }\n",
+    ("forall T where Sized[T]. fn need(x: T) -> T { x }\nfn bad(x: ((), [(); 2])) -> ((), [(); 2]) { need(x) }\n",
      "Sized requires an exact premise"),
     # A zero-size value has no heap block, so no region to split.
     ("use std::owned::Owned!;\nfn main() -> i32 {\n    let exists 'r. (alloc, region) = Owned!::new(((), ())).open();\n"

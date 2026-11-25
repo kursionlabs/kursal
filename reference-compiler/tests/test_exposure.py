@@ -67,7 +67,7 @@ class ExposureTests(unittest.TestCase):
         types = Types(program)
         self.assertFalse(types.exposure_available(C.Named("Alias"), CLIENT, {}, ()))
         self.assertFalse(types.exposure_available(C.Ptr(C.Enum((("A", C.U32),))), CLIENT, {}, ()))
-        self.assertTrue(types.exposure_available(C.Ptr(C.Array(C.U32, 0)), CLIENT, {}, ()))
+        self.assertTrue(types.exposure_available(C.Ptr(C.Array(C.U32, 2)), CLIENT, {}, ()))
 
     def test_direct_foreach_requires_source_authority(self):
         program = declarations()

@@ -168,8 +168,6 @@ class Walk:
             return
         elif isinstance(ty, (C.Tuple, C.Struct, C.Enum, C.Array)) and aliases:
             return
-        elif isinstance(ty, C.Array) and ty.length == 0:
-            return
         else:
             for child in children(ty):
                 self.walk(owner, child, active, bound, aliases)

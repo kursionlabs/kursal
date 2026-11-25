@@ -190,6 +190,7 @@ REJECTED = {
     "close_by_number.kur": "calling an unsafe function needs unsafe",
     "constructor_call.kur": "8:5: `Option::Some` is a constructor; write `Option::Some\\.\\(\\.\\.\\.\\)`$",
     "double_use_handle.kur": "value 'h' has been moved",
+    "empty_array.kur": "7:17: an array has at least one element$",
     "extern_abi.kur": '7:8: the only extern ABI is "C"$',
     "foreach_holds_itself.kur": "10:8: type foreach_holds_itself::Wrap!: infinite by-value layout$",
     "foreach_of_foreach.kur": "15:13: a foreach source cannot be a foreach type$",

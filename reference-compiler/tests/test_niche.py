@@ -1,5 +1,5 @@
 """`NonNull T` and the niche layout of enums: a `NonNull`'s all-zero value is none of its values, a
-struct, tuple or non-empty array has the niche of its first component with one, and an enum of two
+struct, tuple or array has the niche of its first component with one, and an enum of two
 variants, one whose payload has a niche and one of a zero-size type, is its payload alone, the other
 variant a null at the niche. Everything else keeps the tag. The layout follows from the types, per
 specialization, never from a name. `examples/non_null` runs the same through the surface language."""
@@ -37,7 +37,6 @@ class NicheRuleTests(unittest.TestCase):
         self.assertEqual(niche(Struct((("len", Prim("u64")), ("p", self.nn), ("q", self.nn)))), ("p",))
         self.assertEqual(niche(Tuple((Prim("u32"), Tuple((UNIT, self.nn))))), ("1", "1"))
         self.assertEqual(niche(Array(self.nn, 3)), ("0",))
-        self.assertIsNone(niche(Array(self.nn, 0)))
         self.assertIsNone(niche(Enum((("A", UNIT), ("B", self.nn)))))
         self.assertIsNone(niche(Named("T")))   # a type parameter: answered at each specialization
 

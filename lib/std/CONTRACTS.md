@@ -508,7 +508,7 @@ signature". It does not mean "verified correct".**
   out-of-bounds indices.
 
 **Zero sizes.** A zero-size type (`()`, a brand, a capability, an empty
-struct, `[T; 0]`) has size 0: `sizeof[T]()` is `0` and `alignof[T]()` is 1.
+struct, an array of one of them) has size 0: `sizeof[T]()` is `0` and `alignof[T]()` is 1.
 Memory never holds one on its own: a raw load, store or `alloca` at one, or
 a lend of a raw pointer's target of one (`f(unsafe &*p)`), is rejected, `Copy` or not (compiler/README.md, "Zero-size types are erased"),
 as are an unsafe cast from or to one and an extern parameter of one. So

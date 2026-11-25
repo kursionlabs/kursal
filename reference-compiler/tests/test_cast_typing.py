@@ -55,14 +55,10 @@ class CastTypingTests(unittest.TestCase):
             if unsafe (true as u32) == 1u32 { rebuilt.0 } else { 0i32 }
         }''', 7)
 
-    def test_a_type_holding_itself_in_an_empty_array_is_cast(self):
-        # An array of length 0 holds no value: the walks for what a cast may not take or make, and for a
-        # layout the compiler chooses, stop there instead of unfolding the type again.
-        self.run_source('''struct R { a: [R; 0], b: u32 }
-            fn same(x: (u64, R)) -> (u64, R) { unsafe (x as (u64, R)) }
-            fn main() -> i32 { 7i32 }''', 7)
-        # Nor do they look into a named type's arguments but through its fields, nor into what a function
-        # value takes (a read walks for Never): here they would meet the type again without end.
+    def test_a_type_reaching_itself_is_cast(self):
+        # The walks for what a cast may not take or make, and for a layout the compiler chooses, do not
+        # look into a named type's arguments but through its fields, nor into what a function value takes
+        # (a read walks for Never): here they would meet the type again without end.
         self.run_source('''forall T. struct Link { p: *T }
             forall T. struct Node { value: T, next: Link[Node[T]] }
             struct F { f: unsafe fn(F) -> u64, n: u64 }

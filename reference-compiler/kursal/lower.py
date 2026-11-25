@@ -32,7 +32,7 @@ from .literals import valid_literal
 from .check import checked_only, contains, function_types, overlap, pointer_cast_fits
 from .infer import (POINTER_OPS, BuiltinCall, ClosureCall, FnCall, FStringWrite, Infer, PointerCall, TypedBuiltinCall,
                     TraitCall, TupleCall, ValueCall, VariantCall)
-from .sexpr import KursError, List, Position, Str
+from .sexpr import Atom, KursError, List, Position, Str
 from .sigs import OPERATORS, ConstValue, OpConst, Sig, Signatures
 from .resolve import Resolver, listed
 from .types import apart, brand_name, equal, foreach_item, mapped_component, mapped_operand, Surface, Types, free_brands, subst
@@ -252,13 +252,14 @@ class Lowering:
         return FnLower(self, sig, node, name).run()
 
     def data(self, text: str) -> tuple[str, int]:
-        """A static byte array holding `text`; returns its name and length."""
+        """A static byte array holding `text` and a zero byte after it, so that it has an element even for
+        the empty string; returns its name and the length of `text`."""
         raw = text.encode()
         if raw not in self.datas:
             label = f"string#{len(self.datas)}"
-            init = List([Str(text)])
+            init = List([Str(text), Atom("0")])
             self.datas[raw] = label
-            self.program.datas[label] = C.Data(label, C.Array(C.Prim("u8"), len(raw)), init)
+            self.program.datas[label] = C.Data(label, C.Array(C.Prim("u8"), len(raw) + 1), init)
         return self.datas[raw], len(raw)
 
 
@@ -678,7 +679,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         """A string literal: a `Slice[u8, 'static]` over static bytes."""
         data, n = self.lowering.data(text)
         u8, static = C.Prim("u8"), C.Skolem("static")
-        d = self.emit("data", C.Ptr(C.Array(u8, n)), (data,))
+        d = self.emit("data", C.Ptr(C.Array(u8, n + 1)), (data,))
         p = self.emit("cast", C.Ptr(u8), (d,), ty=C.Ptr(u8), unsafe=True)
         brand = self.emit("static_brand", C.Brand(static), unsafe=True)
         length = self.emit("const", C.USIZE, ty=C.USIZE, lit=str(n))

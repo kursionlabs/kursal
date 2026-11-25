@@ -39,13 +39,13 @@ class ComponentTests(unittest.TestCase):
         self.assertEqual(self.types.rows(C.Ptr(opt), False), (None, [("0", C.Ptr(opt))]))
         self.assertEqual(self.types.expand(C.Foreach("F", False, C.Ptr(opt), C.Named("F"))), C.Tuple((C.Ptr(opt),)))
 
-    def test_empty_array_has_schema_but_no_runtime_components(self):
-        mapped = C.Foreach("F", True, C.Ptr(C.Array(C.U32, 0)), C.Tuple((C.Named("F"),)))
-        self.assertEqual(self.types.rows(mapped.source, mapped.indirect)[1], [])
-        self.assertEqual(self.types.expand(mapped), C.Array(C.Tuple((C.U32,)), 0))
+    def test_every_array_element_shares_one_row(self):
+        mapped = C.Foreach("F", True, C.Ptr(C.Array(C.U32, 3)), C.Tuple((C.Named("F"),)))
+        self.assertEqual(self.types.rows(mapped.source, mapped.indirect)[1], [("0", C.Ptr(C.U32))])
+        self.assertEqual(self.types.expand(mapped), C.Array(C.Tuple((C.U32,)), 3))
 
     def test_pointer_pattern_needs_more_than_an_unknown_exposed_shape(self):
-        for source in (C.Named("T"), C.Tuple((C.U32,)), C.Array(C.U32, 0)):
+        for source in (C.Named("T"), C.Tuple((C.U32,)), C.Array(C.U32, 3)):
             with self.subTest(source=source):
                 mapped = C.Foreach("F", True, source, C.Named("F"))
                 self.assertFalse(self.types.pattern_available(mapped))

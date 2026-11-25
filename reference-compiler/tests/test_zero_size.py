@@ -16,11 +16,11 @@ class ZeroSizeTests(unittest.TestCase):
 
     def test_zero_size_components_have_no_members(self):
         output = self.run_core('''(type Marker (struct))
-            (type Tagged (forall ($k) () (struct (brand (brand $k)) (unit (tuple)) (empty (array u64 0))
+            (type Tagged (forall ($k) () (struct (brand (brand $k)) (unit (tuple)) (empty (array (tuple) 2))
               (value u32) (markers (array Marker 3)))))
             (type Shape (enum (Empty (tuple)) (Mark Marker)))
             (fun main i32 () (entry ()
-              (unsafe (= %b (static_brand))) (= %u (construct (tuple))) (= %e (construct (array u64 0)))
+              (unsafe (= %b (static_brand))) (= %u (construct (tuple))) (= %eu (construct (tuple))) (= %e (construct (array (tuple) 2) %eu))
               (= %v (const u32 7)) (= %m (construct Marker)) (= %ms (construct (array Marker 3) %m))
               (= %t (construct (Tagged $static) %b %u %e %v %ms))
               (= (%b2 %u2 %e2 %v2 %ms2) (destruct %t (Tagged $static)))
@@ -55,7 +55,7 @@ class ZeroSizeTests(unittest.TestCase):
         output = self.run_core('''(type Marker (struct))
             (fun size (forall (T) () usize () (entry () (= %n (sizeof T)) (ret %n))))
             (fun main i32 () (entry ()
-              (= %a (call (size (tuple)))) (= %b (call (size (array u64 0)))) (= %c (call (size (tuple Marker (tuple)))))
+              (= %a (call (size (tuple)))) (= %b (call (size (array (tuple) 5)))) (= %c (call (size (tuple Marker (tuple)))))
               (= %d (sizeof (tuple u32 Marker))) (= %e (sizeof u32))
               (= %ab (add %a %b)) (= %abc (add %ab %c)) (= %r (int_cast %abc i32)) (= %same (eq %d %e))
               (jnz %same (done %r) (wrong)))
@@ -64,7 +64,7 @@ class ZeroSizeTests(unittest.TestCase):
         self.assertIn("= UINT64_C(0);", output)
 
     def test_zero_size_data_has_an_address(self):
-        output = self.run_core('''(data empty (array u8 0) ())
+        output = self.run_core('''(data empty (array (tuple) 2) (() ()))
             (fun main i32 () (entry ()
               (= %p (data empty)) (= %z (const usize 0)) (unsafe (= %q (cast %p usize)))
               (= %b (ne %q %z)) (jnz %b (yes) (no)))

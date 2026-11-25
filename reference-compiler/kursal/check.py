@@ -38,12 +38,12 @@ SEALED = {"Copy", "Exposed", "Sized"}     # compiler-reserved trait names: no us
 def contains(types: Types, ty: Type, pred: Callable[[Type], bool]) -> bool:
     """`pred` holds somewhere in the value representation of `ty`. A named type is unfolded, since its
     fields are its value; its arguments are part of it only through them. A pointer's target is not part
-    of it, nor what a function value takes and returns, nor the element of an array of length 0, which
-    holds no value. So the walk follows the by-value layout, which is finite (`check_type_expansion`)."""
+    of it, nor what a function value takes and returns. So the walk follows the by-value layout, which is
+    finite (`check_type_expansion`)."""
     if pred(ty):
         return True
     match ty:
-        case Ptr() | NonNull() | Fn() | Array(length=0):
+        case Ptr() | NonNull() | Fn():
             return False
         case Named():
             return ty.name in types.program.types and contains(types, types.shape(ty), pred)
@@ -883,8 +883,8 @@ class Checker:
         `unsafe fn` of the signature, is reinterpreted from C's bytes as an unsafe cast's result is: it
         holds nothing only checked code makes (`checked_only`; an extern's result of `!` itself says the
         function does not return), and no enum or `NonNull`, whose layout the compiler chooses. The walk
-        is `contains`'s, which finds what a value holds: named types unfolded, not through a pointer, a
-        function value or an array of length 0."""
+        is `contains`'s, which finds what a value holds: named types unfolded, not through a pointer or a
+        function value."""
         if contains(self.types, ty, checked_only):
             self.fail("extern_result_cannot_produce")
         if self.types.chosen_layout(ty):

@@ -108,7 +108,7 @@ Programs that each check one feature through its exit status.
 |---|---|
 | `tuple_decl` | `tuple Name(T, ...);` declarations |
 | `non_null` | `NonNull[T]`, the pointer that is never null, and the enums whose layout it fills: `Option[NonNull[T]]`, `Option[Ref[T, 'k]]`, a `List` link and a user's own enum are one word |
-| `zero_size` | zero-size types (`()`, brands, capabilities, markers, empty arrays): no bytes in `sizeof`, in the structs that hold them, or in calls and matches; no raw read, write or `alloca` at one, so a container holds one only beside bytes |
+| `zero_size` | zero-size types (`()`, brands, capabilities, markers, arrays of them): no bytes in `sizeof`, in the structs that hold them, or in calls and matches; no raw read, write or `alloca` at one, so a container holds one only beside bytes |
 
 ## Rejected programs (`bad/`)
 
@@ -129,6 +129,7 @@ Ordinary errors:
 | `private_import.kur` | a name is reached through a module that only imports it, without `export` |
 | `forged_file.kur` | a `File!` is built outside its module, whose representation is restricted |
 | `too_large_type.kur` | a type is not smaller than the address space, 2^64 bytes |
+| `empty_array.kur` | an array type's length folds to 0, and an array has at least one element |
 | `foreach_holds_itself.kur` | a struct holds itself by value through the pointee of a `foreach`'s pointer source |
 | `foreach_of_foreach.kur` | a `foreach` maps a value whose `foreach` type has a `foreach` type as its source |
 | `foreach_pointer_over_parameter.kur` | `foreach *F of T` matches pointer components, and a type parameter `T` may have none; only an explicit `*P` will do |

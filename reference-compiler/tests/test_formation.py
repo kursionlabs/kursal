@@ -49,11 +49,12 @@ class FormationTests(unittest.TestCase):
         self.rejects(lin + "(type F (foreach (X (tuple u32 L!)) X))", "type F holds a linear type; declare it F!$")
         self.rejects(lin + "(type G (forall (T) () (foreach (X T) (ptr X))))",
                      "type G holds a linear type whatever its type arguments; declare it G!$")
+        self.rejects(lin + "(type P (forall (T) () (foreach (X (tuple T (array L! 1))) X)))",
+                     "type P holds a linear type whatever its type arguments; declare it P!$")
         check_program(parse_program(
             lin + "(type H! (struct (o (Opt L!)) (p (ptr L!)))) (type W (forall (T) () (Opt T))) "
             "(type Cap! (forall ($k) () (tuple))) (type F (foreach (X (tuple u32 L!)) (ptr X))) "
-            "(type G! (forall (T) () (foreach (X T) (ptr X)))) "
-            "(type P (forall (T) () (foreach (X (tuple T (array L! 0))) X)))"))
+            "(type G! (forall (T) () (foreach (X T) (ptr X))))"))
 
     def test_trait_premises_have_valid_names_arity_and_kinds(self):
         self.rejects("(type Bad (forall (T) ((Missing T)) T))", "unknown trait Missing")
@@ -62,6 +63,12 @@ class FormationTests(unittest.TestCase):
         self.rejects("(trait P (T) (run Missing (T)))", "unknown type Missing")
         check_program(parse_program("(trait P ($k) (run (brand $k) ())) "
                                     "(type Good (forall ($k) ((P $k)) (tuple)))"))
+
+    def test_an_array_has_at_least_one_element(self):
+        self.rejects("(type Bad (array u8 0))", "an array has at least one element")
+        self.rejects("(type Bad (struct (a (array (array u8 0) 2))))", "an array has at least one element")
+        self.rejects("(data d (array u8 0) ())", "an array has at least one element")
+        check_program(parse_program("(type Good (array (tuple) 1))"))
 
     def test_binders_are_scoped_and_names_unique(self):
         self.rejects("(type Bad (forall (T T) () T))", "duplicate parameter")

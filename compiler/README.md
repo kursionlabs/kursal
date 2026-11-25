@@ -583,8 +583,8 @@ an out-result is written through a pointer by the callee instead of returned:
 
 A type is zero-size when `zero_size` (`types::ops`, `types.py`) says so: `()`, a brand witness
 (`Brand['k]`), `!`, a struct or tuple whose components are all zero-size (an empty struct, a
-capability such as `Exclusive!['k]`, `(Brand['k], ())`), an array of length 0 or of zero-size
-elements, an `exists` whose body is, and a `foreach` whose expansion is. An enum never is: its tag
+capability such as `Exclusive!['k]`, `(Brand['k], ())`), an array of zero-size elements, an
+`exists` whose body is, and a `foreach` whose expansion is. An enum never is: its tag
 has bytes. A type parameter is answered at each specialization, after brands are erased.
 
 Such a type has no C representation. Its C type is `void` (`erased` asks), and:
@@ -604,8 +604,9 @@ Such a type has no C representation. Its C type is `void` (`erased` asks), and:
   the address of the whole (`(void*)p`), since zero-size objects may share an address;
 - `sizeof` of one is `UINT64_C(0)`, and the sizes C gives the types holding one leave it out, so
   `sizeof[(u64, Exclusive!['k])]()` is `sizeof[u64]()`;
-- the one C object a zero-size type gets is a `data` of it (an empty string's bytes, `[u8; 0]`),
-  whose address the program can observe and compare with null: a `static char`.
+- the one C object a zero-size type gets is a `data` of it, whose address the program can observe
+  and compare with null: a `static char`. A string literal's `data` is never one: it holds the
+  string's bytes and a zero byte after them, so the empty string's is `[u8; 1]`.
 
 There is no `KurUnit` and no adapter for foreign functions returning `()`: a foreign `void`
 function is its own function pointer. A function that takes and returns only zero-size values is
@@ -647,8 +648,8 @@ all-zero value is none of its values. `niche` (`types::ops`, `types.py`) finds a
 its structure alone:
 
 - a `NonNull` has one, at offset 0, and offers one invalid value, the null pointer;
-- a struct or tuple has the niche of its first component, in declaration order, that has one, and a
-  non-empty array that of its element 0;
+- a struct or tuple has the niche of its first component, in declaration order, that has one, and an
+  array that of its element 0;
 - an `exists` has its body's;
 - nothing else has one: a raw pointer, a primitive (`bool` included), a function value, a zero-size
   type, and an enum, whatever its layout (a tagged enum's unused tags are not used; a niche-layout
@@ -712,7 +713,11 @@ is right on a 32-bit and on a 64-bit target. The compiler never assumes their wi
   is computed from it. A division by a literal 0 is still an error, since 0 is 0 at every width.
 - **An array length** is part of a type, so the compiler must know it: it may not use arithmetic on
   `usize` or `isize` (`an array length cannot use arithmetic on usize or isize`); a literal, a
-  constant that is one, or arithmetic in `u64` is accepted.
+  constant that is one, or arithmetic in `u64` is accepted. **An array has at least one element**:
+  a length that folds to 0, `[u8; 0]` or `[u8; N]` with `const N: usize = 0usize`, is rejected where
+  it is written, and so is the empty literal `[]` (`an array has at least one element`;
+  `examples/bad/empty_array.kur`), and a KURS `(array T 0)` in formation. Lengths are folded where
+  a signature is read and there are no constant parameters, so no instantiation makes one 0.
 - **Run-time arithmetic** is done unsigned in `uintptr_t` and decoded to `intptr_t` for `isize`
   (`kur_dec_isize`); a shift amount is taken modulo `KUR_PTR_BITS`, the width C gives
   `uintptr_t`. Conversions to and from the fixed-width types truncate or extend at the target's
@@ -903,8 +908,9 @@ These are the places where Kursal differs from what one might expect.
   (`Option[T]`; `Option[Buffer!]` shows its linearity through its argument), and one with the `!` is
   linear even when every field is `Copy` (`Exclusive!['k]`). A `foreach` whose source has a fixed
   shape counts as its expansion (`foreach F of (u32, u8) => *F` is `Copy`); over a type parameter
-  it is `Copy` only when its body does not mention the binder, since even a `Copy` argument may hold
-  a linear type in an array of length zero. Type parameters never carry it: `forall T` may stand for
+  it is `Copy` only when its body does not mention the binder and is `Copy`, since a parameter of
+  kind Any may have linear components, and under `*F` the rows are components of the pointee, which
+  need not be `Copy` even when the pointer is. Type parameters never carry it: `forall T` may stand for
   a linear type unless a premise says `Copy[T]`.
 
   Resolution reports every name it cannot resolve in one run, each at the name itself and with the
@@ -983,7 +989,7 @@ These are the places where Kursal differs from what one might expect.
   `Copy`, since a zero-size linear result would be a resource made from nothing
   (`extern_zero_size_linear_result`; `extern f returns a zero-size linear type`); an `unsafe fn` value may come
   back (`lib/std/CONTRACTS.md`, section 2.0c). The walk is the by-value one: named types unfolded,
-  not through a pointer, a function value or an array of length 0. An extern takes no type or brand
+  not through a pointer or a function value. An extern takes no type or brand
   parameter (`extern f takes no type or brand parameters`) and no zero-size one, and a function type
   anywhere in its signature, behind a pointer or in a named type's fields too, is an `unsafe fn` type
   (`extern_safe_function_type`; `extern f has a safe function type in its signature`): foreign code
@@ -1041,7 +1047,7 @@ These are the places where Kursal differs from what one might expect.
   a set.
 - **Types are finite** (`check_type_expansion`, `types::layout`, run before anything else asks a
   question of a declared type). A type that holds itself by value is rejected (`type T: infinite
-  by-value layout`); a pointer, a function or an empty array between breaks the cycle. Every
+  by-value layout`); a pointer or a function between breaks the cycle. Every
   declaration is walked, one whose body is a `foreach` or holds one like any other. A `foreach`
   whose source's components are known counts as its expansion, and is itself active while its
   expansion is walked: `foreach *F of *L => F` over `struct L { next: *L, v: u32 }` is `(*L, u32)`
@@ -1059,8 +1065,8 @@ These are the places where Kursal differs from what one might expect.
   reaches itself again before any name, even behind a function, is rejected too (`struct T { f:
   fn(foreach *F of *T => *F) -> u32 }`: `recursive foreach needs a named type between`). Errors name
   the declaration whose walk found them. The size of every closed type the program writes, each part
-  of it included (a pointee too; a closed `foreach` through its expansion, but for the element of an
-  empty array that only the expansion has), is below 2^64 bytes, checked where it is written; the
+  of it included (a pointee too; a closed `foreach` through its expansion), is below 2^64 bytes,
+  checked where it is written; the
   backend's check of each specialization's types is the one check made at an instantiation.
 - **A `foreach` type stands in every type position**: a field or element, a tuple's or an enum's
   component, a pointee, a package body, a `foreach`'s source or body, and a type argument, a
@@ -1070,8 +1076,9 @@ These are the places where Kursal differs from what one might expect.
   and under `*F` a pointer to one, as `foreach *F of *T => F`), is *stuck*: a type of its own, equal only to a `foreach` with the same pattern and
   equal source and body, the binders renamed, never to what it expands to. It has no components in
   generic code (`pattern does not match foreach F of T => (F, u8)`), and is expanded where the
-  parameter is known. Over a parameter, even a `Copy` argument may hold a linear type in an array
-  of length zero, so a stuck `foreach` whose body mentions the binder is linear, and a declaration
+  parameter is known. Over a parameter, a parameter of kind Any may have linear components, and
+  under `*F` the rows are components of the pointee, which need not be `Copy` even when the pointer
+  is, so a stuck `foreach` whose body mentions the binder is linear, and a declaration
   that holds one carries the `!` (`struct Tagged holds a linear type in its field tags whatever its
   type arguments; declare it Tagged!`).
 - **A `foreach` type has an expansion at every instantiation.** A source that is no product (nor a
@@ -1117,7 +1124,7 @@ These are the places where Kursal differs from what one might expect.
   than dropping it (`examples/foreach_map`). No `foreach` type is a traversal's or a map's source:
   `Exposed` of one never holds, by its shape or by a premise, so a value whose type is a `foreach`
   over a `foreach` is passed and kept whole but not mapped (`a foreach source cannot be a foreach
-  type`). The map of a value whose source is an empty array never applies its body.
+  type`).
 - **Expressions as statements.** `f(x);` discards a Copy result. A block's value is its last
   expression, without a `;`. `return` is allowed anywhere, and ends with `;` at the end of a block
   (``a `return` at the end of a block ends with `;` ``); a function whose type is `!` (such as `fail`)

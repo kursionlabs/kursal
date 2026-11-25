@@ -385,6 +385,10 @@ REJECTED = {
 
     # An enum has at least one variant: a sum of none would be a type with no value.
     "empty_enum_declaration": ("an enum has at least one variant", "(type E (enum))"),
+    # An array has at least one element, wherever its type is written.
+    "empty_array_declaration": ("an array has at least one element", "(type A (array u8 0))"),
+    "empty_array_written": ("an array has at least one element", """
+        (fun f usize () (entry () (= %n (sizeof (tuple (array u64 0)))) (ret %n)))"""),
     # A data item is Copy: its static object is never written, so a load through a pointer to it may not
     # move a linear value out, a forced-linear type's whose fields are all Copy included.
     "data_linear": ("data_type_not_copy", """
@@ -397,15 +401,15 @@ REJECTED = {
     "empty_enum_written": ("an enum has at least one variant", """
         (fun f usize () (entry () (= %n (sizeof (tuple (enum)))) (ret %n)))"""),
 
-    # A raw load, store or alloca is never at a zero-size type, Copy or not: unit, an empty
-    # array, a brand witness, a package of one, a capability and a struct of such. At a type that mentions
+    # A raw load, store or alloca is never at a zero-size type, Copy or not: unit, an array of
+    # zero-size elements, a brand witness, a package of one, a capability and a struct of such. At a type that mentions
     # a parameter it needs Sized of the type: an exact premise, or a part with bytes whatever the
     # parameters are.
     "zero_size_unit_load": ("raw_access_at_zero_size", """
         (fun (unsafe) f (tuple) ((ptr (tuple))) (entry ((%p (ptr (tuple)))) (unsafe (= %u (ptr_load %p))) (ret %u)))"""),
-    "zero_size_empty_array_store": ("raw_access_at_zero_size", """
-        (fun (unsafe) f (tuple) ((ptr (array u64 0)) (array u64 0))
-          (entry ((%p (ptr (array u64 0))) (%a (array u64 0))) (unsafe (= %u (ptr_store %p %a))) (ret %u)))"""),
+    "zero_size_array_store": ("raw_access_at_zero_size", """
+        (fun (unsafe) f (tuple) ((ptr (array (tuple) 3)) (array (tuple) 3))
+          (entry ((%p (ptr (array (tuple) 3))) (%a (array (tuple) 3))) (unsafe (= %u (ptr_store %p %a))) (ret %u)))"""),
     "zero_size_alloca": ("raw_access_at_zero_size", """
         (type Marker (struct))
         (fun (unsafe) f (tuple) () (entry () (unsafe (= %p (alloca Marker))) (= %u (construct (tuple))) (ret %u)))"""),
@@ -437,8 +441,6 @@ REJECTED = {
     "parameter_tuple_from_sized_parts": ("raw_access_needs_sized", """
         (fun (unsafe) f (forall (T U) ((Sized T) (Sized U)) (tuple) ((ptr (tuple T U)) (tuple T U))
           (entry ((%p (ptr (tuple T U))) (%v (tuple T U))) (unsafe (= %u (ptr_store %p %v))) (ret %u))))"""),
-    "parameter_empty_array_with_sized": ("raw_access_needs_sized", """
-        (fun (unsafe) f (forall (T) ((Sized T)) (tuple) () (entry () (unsafe (= %p (alloca (array T 0)))) (= %u (construct (tuple))) (ret %u))))"""),
     # The premise is discharged where the generic function is called, by shape or by the caller's own.
     "parameter_load_at_a_brand_holding_struct": ("unsatisfied_premise", """
         (type W (forall ($k) () (struct (b (brand $k)) (u (tuple)))))
@@ -542,7 +544,7 @@ REJECTED = {
         (fun f (forall (U V) ((Sized U) (Sized V)) u32 () (entry () (= %r (call (need (tuple U V)))) (ret %r))))"""),
     "sized_zero_size": ("unsatisfied_premise", """
         (fun need (forall (T) ((Sized T)) u32 () (entry () (= %r (const u32 0)) (ret %r))))
-        (fun f u32 () (entry () (= %r (call (need (tuple (tuple) (array u64 0))))) (ret %r)))"""),
+        (fun f u32 () (entry () (= %r (call (need (tuple (tuple) (array (tuple) 2))))) (ret %r)))"""),
     "sized_brand_witness": ("unsatisfied_premise", """
         (fun need (forall (T) ((Sized T)) u32 () (entry () (= %r (const u32 0)) (ret %r))))
         (fun f u32 () (entry () (= %r (call (need (brand $static)))) (ret %r)))"""),
@@ -650,10 +652,6 @@ class CoreSoundnessTests(unittest.TestCase):
                (fun (unsafe) read A ((ptr A)) (entry ((%p (ptr A))) (unsafe (= %a (ptr_load %p))) (ret %a)))
                (fun (unsafe) cast (Node u64) ((tuple u64 (ptr u8))) (entry ((%t (tuple u64 (ptr u8))))
                  (unsafe (= %n (cast %t (Node u64)))) (ret %n)))""",
-            # A cast of a type holding itself in an array of length 0, which holds no value.
-            """(type R (struct (a (array R 0)) (b u32)))
-               (fun (unsafe) h (tuple u64 R) ((tuple u64 R)) (entry ((%t (tuple u64 R)))
-                 (unsafe (= %s (cast %t (tuple u64 R)))) (ret %s)))""",
             # A foreach body names the caller's type parameter beside its own binder.
             """(fun m (forall (X Y) () (tuple X Y) (X Y)
                  (entry ((%x X) (%y Y)) (= %t (construct (tuple X Y) %x %y)) (ret %t))))

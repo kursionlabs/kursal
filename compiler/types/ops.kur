@@ -1012,7 +1012,7 @@ impl Types['k] {
         }
     }
 
-    // `ty` has no bytes of its own: unit-like products, empty arrays, brand witnesses, Never. A
+    // `ty` has no bytes of its own: unit-like products, arrays of them, brand witnesses, Never. A
     // type parameter is answered when it is instantiated.
     fn zero_size(self, &cx: Domain!['k], ty: Type['k]) -> bool {
         self.zero_size_at(&cx, ty, false)
@@ -1060,7 +1060,7 @@ impl Types['k] {
                 }
                 all
             },
-            Array(elem, length) => length == 0u64 || self.zero_size_at(&cx, elem.copy(&cx), parameters),
+            Array(elem, _length) => self.zero_size_at(&cx, elem.copy(&cx), parameters),
             Exists(_binders, body) => self.zero_size_at(&cx, body.copy(&cx), parameters),
             _ => false,
         }
@@ -1165,9 +1165,6 @@ impl Types['k] {
             Foreach(_f) => self.layout(&cx, self.shape(&cx, ty, Option::None)),
             Exists(_binders, body) => self.layout(&cx, body.copy(&cx)),
             Array(elem, length) => {
-                if length == 0u64 {
-                    return Option::Some.((0u64, 1u64));
-                }
                 match self.layout(&cx, elem.copy(&cx)) {
                     Some(part) => {
                         let (size, align) = part;
@@ -1237,7 +1234,7 @@ impl Types['k] {
 
     // Where a value of `ty` has bytes that hold no value of it: the path (field names, tuple indices,
     // `0` for an array's first element) to its first `NonNull` in layout order, whose all-zero value
-    // is none of its values. A struct, tuple or non-empty array has the niche of its first component
+    // is none of its values. A struct, tuple or array has the niche of its first component
     // that has one; a pointer, a primitive, a zero-size type and an enum have none. A type parameter
     // is answered when it is instantiated.
     fn niche(self, &cx: Domain!['k], ty: Type['k]) -> Option[ArenaVec[Span['k], 'k]] {
@@ -1267,10 +1264,8 @@ impl Types['k] {
                     i = i + 1usize;
                 }
             },
-            Array(elem, length) => {
-                if length > 0u64 {
-                    parts.push(&cx, Member.{ name: Span::from_static(&cx, "0"), type: elem.copy(&cx) });
-                }
+            Array(elem, _length) => {
+                parts.push(&cx, Member.{ name: Span::from_static(&cx, "0"), type: elem.copy(&cx) });
             },
             Exists(_binders, body) => {
                 return self.niche(&cx, body.copy(&cx));
@@ -1313,8 +1308,8 @@ impl Types['k] {
     }
 
     // The compiler chooses how `ty`'s value is laid out: an enum or a `NonNull` is in its value
-    // representation (named types unfolded; not through a pointer, a function or an array of length
-    // 0, which holds no value; a type parameter is a leaf).
+    // representation (named types unfolded; not through a pointer or a function; a type parameter is a
+    // leaf).
     fn chosen_layout(self, &cx: Domain!['k], ty: Type['k]) -> bool {
         match ty {
             Enum(_variants) => true,
@@ -1322,7 +1317,6 @@ impl Types['k] {
             Ptr(_inner) => false,
             Fn(_f) => false,
             Brand(_brand) => false,
-            Array(elem, length) => length != 0u64 && self.chosen_layout(&cx, elem.copy(&cx)),
             Named(name, args) => {
                 if args.is_empty(&cx) && !self.program.types.contains(&cx, name) {
                     false
@@ -1533,15 +1527,14 @@ impl Types['k] {
                 let key = (ty, sorted_kinds(&cx, kinds));
                 if !self.copy_cache.contains(&cx, key) {
                     // An active nominal Copy query cannot justify itself. A valid recursive type
-                    // reaches a pointer, function, or zero-length array before demanding the
-                    // same query.
+                    // reaches a pointer or function before demanding the same query.
                     self.copy_cache.insert(&cx, key, false);
                     let answer = self.is_copy(&cx, self.unfold(&cx, ty, Option::None), kinds);
                     self.copy_cache.insert(&cx, key, answer);
                 }
                 self.copy_cache.at(&cx, key)
             },
-            Array(elem, length) => length == 0u64 || self.is_copy(&cx, elem.copy(&cx), kinds),
+            Array(elem, _length) => self.is_copy(&cx, elem.copy(&cx), kinds),
             Exists(_binders, body) => self.is_copy(&cx, body.copy(&cx), kinds),
             Foreach(f) => {
                 // A source whose rows are fixed expands; otherwise every row is the body only when
@@ -1581,8 +1574,9 @@ impl Types['k] {
     // Whether a foreach source's rows under the pattern `indirect` are the same whatever the type
     // parameters in `kinds`, and any name no declaration gives, stand for: its outer shape, and with
     // `*F` a pointer's pointee's, is reached without meeting one. A parameter's shape is unknown, and
-    // even a Copy argument may have a linear component, in an array of length zero. Under the value
-    // pattern a pointer source is a leaf, whatever its pointee.
+    // so is whether its rows are Copy: a parameter of kind Any may have linear components, and under
+    // `*F` the rows are components of the pointee, which need not be Copy even when the pointer is.
+    // Under the value pattern a pointer source is a leaf, whatever its pointee.
     fn rows_fixed(self, &cx: Domain!['k], source: Type['k], indirect: bool, kinds: ArenaMap[Span['k], Kind, 'k]) -> bool {
         match self.fixed_shape(&cx, source, kinds) {
             None => false,
@@ -1645,14 +1639,13 @@ impl Types['k] {
 
     // One-level traversal of a foreach source under the pattern `indirect` (`*F`) or not: its outer
     // skeleton (a structural type, or none for a leaf) and one (label, item type) row per component,
-    // in order. With `schema`, an array contributes one element type even when its runtime length is
-    // zero.
+    // in order. An array has one row, its element's, which every element of the skeleton shares.
     //
     // Under the value pattern a pointer source, written or reached through a name, is a leaf: its one
     // row is the source itself, and the pointee is not looked at. Under `*F` each component behind it
     // is a pointer to it: of a sum, a pointer to each payload. No traversal has a pointer to a sum as
     // its source, which is never `Exposed`.
-    fn rows(self, &cx: Domain!['k], source: Type['k], indirect: bool, home: Option[ModuleId['k]], schema: bool) -> Rows['k] {
+    fn rows(self, &cx: Domain!['k], source: Type['k], indirect: bool, home: Option[ModuleId['k]]) -> Rows['k] {
         var s = self.shape(&cx, source, home);
         var pointer = false;
         let unit = match s {
@@ -1682,13 +1675,8 @@ impl Types['k] {
                 }
                 Rows.{ skeleton: Option::Some.(s), rows }
             },
-            Array(elem, length) => {
-                let count = if schema { 1u64 } else { length };
-                var i = 0u64;
-                while i < count {
-                    rows.push(&cx, Row.{ label: Buffer!::new().push_u64(i).save(&cx), item: wrap(&cx, elem.copy(&cx), pointer) });
-                    i = i + 1u64;
-                }
+            Array(elem, _length) => {
+                rows.push(&cx, Row.{ label: Span::from_static(&cx, "0"), item: wrap(&cx, elem.copy(&cx), pointer) });
                 Rows.{ skeleton: Option::Some.(s), rows }
             },
             Enum(variants) => {
@@ -1754,7 +1742,7 @@ impl Types['k] {
 
     // The structural type a foreach transform denotes.
     fn expand(self, &cx: Domain!['k], ty: ForeachType['k], home: Option[ModuleId['k]]) -> Type['k] {
-        let found = self.rows(&cx, ty.source.copy(&cx), ty.indirect, home, true);
+        let found = self.rows(&cx, ty.source.copy(&cx), ty.indirect, home);
         let mapped: ArenaVec[Member['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < found.rows.len(&cx) {

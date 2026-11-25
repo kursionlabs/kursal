@@ -15,7 +15,7 @@ class NominalPremiseTests(unittest.TestCase):
 
     def test_unused_nested_type_applications_require_premises(self):
         for ty in ('(Box u32)', '(ptr (Box u32))',
-                   '(array (Box u32) 0)', '(tuple (Box u32))',
+                   '(array (Box u32) 2)', '(tuple (Box u32))',
                    '(fn () (Box u32))'):
             with self.subTest(ty=ty):
                 with self.assertRaisesRegex(KursError, 'unsatisfied nominal premise'):

@@ -15,7 +15,6 @@ class AggregateBoundaryTests(unittest.TestCase):
             '(data x (tuple (tuple u8)) ((256)))',
             '(data x (array u8 2) (1))',
             '(data x (array u8 1) (1 2))',
-            '(data x (array u8 0) (1))',
             '(data x (array u8 3) ("ab"))',
             '(data x (array u8 1) ("é"))',
             '(data x u8 (1 2))',
@@ -50,7 +49,6 @@ class AggregateBoundaryTests(unittest.TestCase):
         cases = (
             '(= %x (construct (tuple i32)))',
             '(= %x (construct (array i32 1)))',
-            '(= %x (const i32 1)) (= %a (construct (array i32 0) %x))',
             '(= %a (construct (tuple))) (= %x (destruct %a (tuple)))',
         )
         for instructions in cases:
@@ -66,19 +64,11 @@ class AggregateBoundaryTests(unittest.TestCase):
               (= %x (int_cast %c i32)) (= %y (int_cast %d i32))
               (= %r (add %x %y)) (ret %r)))''', 40)
 
-    def test_empty_array_representation_is_initialized(self):
-        output = self.run_core('''(fun keep i32 ((array u8 0)) (entry ((%a (array u8 0)))
-              (= () (destruct %a (array u8 0))) (= %r (const i32 7)) (ret %r)))
-            (fun main i32 () (entry ()
-            (= %empty (construct (array u8 0)))
-            (= %r (call keep %empty)) (ret %r)))''', 7)
-        self.assertNotIn('entry_empty', output)
-
     def test_nested_empty_data(self):
-        self.run_core('''(data values (tuple (array u8 0) (tuple) i32) (() () 7))
+        self.run_core('''(data values (tuple (tuple) (tuple) i32) (() () 7))
             (fun main i32 () (entry () (= %p (data values))
               (unsafe (= %v (ptr_load %p)))
-              (= (%a %b %n) (destruct %v (tuple (array u8 0) (tuple) i32)))
+              (= (%a %b %n) (destruct %v (tuple (tuple) (tuple) i32)))
               (ret %n)))''', 7)
 
     def test_linear_array_elements_cannot_be_repeated(self):

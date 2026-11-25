@@ -91,7 +91,7 @@ REJECTED = (
     ("fn g(x: ()) -> u32 { unsafe (x as u32) }\n", "a zero-size type has no memory form"),
     ("fn g() -> u32 { let p = unsafe core::mem::alloca[()](); 0u32 }\n", "a raw read, write or alloca at a zero-size type"),
     ("fn g(p: *()) -> u32 { let x = unsafe *p; 0u32 }\n", "a raw read, write or alloca at a zero-size type"),
-    ("fn g(p: *[u8; 0]) -> u32 { unsafe *p = []; 0u32 }\n", "a raw read, write or alloca at a zero-size type"),
+    ("fn g(p: *[(); 2]) -> u32 { unsafe *p = [(), ()]; 0u32 }\n", "a raw read, write or alloca at a zero-size type"),
     ('extern "C" fn ext(x: ()) -> u32;\n', "extern ext takes a zero-size type, which has no memory form"),
     ("forall T, U. unsafe fn convert(x: T) -> U { unsafe (x as U) }\n", "an unsafe cast cannot produce or take apart"),
     ("fn g(x: u64) -> core::cap::Brand['static] { unsafe (x as core::cap::Brand['static]) }\n",

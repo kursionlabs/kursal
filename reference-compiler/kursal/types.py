@@ -311,7 +311,7 @@ class Types:
         return decl
 
     def zero_size(self, ty: Type, parameters: bool = False) -> bool:
-        """`ty` has no bytes of its own: unit-like products, empty arrays, brand witnesses, Never. A type
+        """`ty` has no bytes of its own: unit-like products, arrays of them, brand witnesses, Never. A type
         parameter is answered when it is instantiated, or with `parameters` is taken to be zero-size, as
         it may be, and so is a foreach type that mentions one: `ty` then has bytes only through a part
         that has them whatever the parameters are."""
@@ -327,8 +327,8 @@ class Types:
                 return all(self.zero_size(t, parameters) for t in elems)
             case Struct(fields=fields):
                 return all(self.zero_size(t, parameters) for _, t in fields)
-            case Array(elem=elem, length=length):
-                return length == 0 or self.zero_size(elem, parameters)
+            case Array(elem=elem):
+                return self.zero_size(elem, parameters)
             case Exists(body=body):
                 return self.zero_size(body, parameters)
         return False
@@ -381,8 +381,6 @@ class Types:
             case Exists(body=body):
                 return self.layout(body)
             case Array(elem=elem, length=length):
-                if length == 0:
-                    return 0, 1
                 part = self.layout(elem)
                 return None if part is None else _fitted(part[0] * length, part[1])
             case Tuple(elems=elems):
@@ -417,7 +415,7 @@ class Types:
     def niche(self, ty: Type) -> Optional[tuple[str, ...]]:
         """Where a value of `ty` has bytes that hold no value of it: the path (field names, tuple indices,
         `0` for an array's first element) to its first `NonNull` in layout order, whose all-zero value is
-        none of its values. A struct, tuple or non-empty array has the niche of its first component that
+        none of its values. A struct, tuple or array has the niche of its first component that
         has one; a pointer, a primitive, a zero-size type and an enum have none. A type parameter is
         answered when it is instantiated."""
         match ty:
@@ -432,7 +430,7 @@ class Types:
                 parts = list(fields)
             case Tuple(elems=elems):
                 parts = [(str(k), e) for k, e in enumerate(elems)]
-            case Array(elem=elem, length=length) if length > 0:
+            case Array(elem=elem):
                 parts = [("0", elem)]
             case Exists(body=body):
                 return self.niche(body)
@@ -458,12 +456,12 @@ class Types:
 
     def chosen_layout(self, ty: Type) -> bool:
         """The compiler chooses how `ty`'s value is laid out: an enum or a `NonNull` is in its value
-        representation (named types unfolded; not through a pointer, a function or an array of length 0,
-        which holds no value; a type parameter is a leaf)."""
+        representation (named types unfolded; not through a pointer or a function; a type parameter is a
+        leaf)."""
         match ty:
             case Enum() | NonNull():
                 return True
-            case Ptr() | Fn() | Brand() | Array(length=0):
+            case Ptr() | Fn() | Brand():
                 return False
             case Named(args=()) if ty.name not in self.program.types:
                 return False
@@ -567,8 +565,8 @@ class Types:
                 key = (ty, tuple(sorted(kinds.items())))   # whether `T` is Copy changes the answer for `Node[T]`
                 if key not in self._copy:
                     # An active nominal Copy query cannot justify itself.
-                    # A valid recursive type reaches a pointer, function, or
-                    # zero-length array before demanding the same query.
+                    # A valid recursive type reaches a pointer or function
+                    # before demanding the same query.
                     self._copy[key] = False
                     try:
                         self._copy[key] = self.is_copy(self.unfold(ty), kinds)
@@ -576,8 +574,8 @@ class Types:
                         del self._copy[key]
                         raise
                 return self._copy[key]
-            case Array(elem=elem, length=length):
-                return length == 0 or self.is_copy(elem, kinds)
+            case Array(elem=elem):
+                return self.is_copy(elem, kinds)
             case Exists(body=body):
                 return self.is_copy(body, kinds)
             case Foreach(body=body):
@@ -600,9 +598,10 @@ class Types:
     def rows_fixed(self, source: Type, indirect: bool, kinds: Kinds) -> bool:
         """Whether a foreach source's rows under the pattern `indirect` are the same whatever the type
         parameters in `kinds`, and any name no declaration gives, stand for: its outer shape, and with
-        `*F` a pointer's pointee's, is reached without meeting one. A parameter's shape is unknown, and
-        even a Copy argument may have a linear component, in an array of length zero. Under the value
-        pattern a pointer source is a leaf, whatever its pointee."""
+        `*F` a pointer's pointee's, is reached without meeting one. A parameter's shape is unknown, and so
+        is whether its rows are Copy: a parameter of kind Any may have linear components, and under `*F`
+        the rows are components of the pointee, which need not be Copy even when the pointer is. Under the
+        value pattern a pointer source is a leaf, whatever its pointee."""
         shape = self.fixed_shape(source, kinds)
         if isinstance(shape, Ptr) and indirect:
             shape = self.fixed_shape(shape.inner, kinds)
@@ -640,12 +639,11 @@ class Types:
             raise KursError(f"{show(ty)} is not a sum")
         return s.variants
 
-    def rows(self, source: Type, indirect: bool, module: Optional[ModuleId] = None, *,
-             schema: bool = False) -> tuple[Optional[Skeleton], list[ForeachRow]]:
+    def rows(self, source: Type, indirect: bool,
+             module: Optional[ModuleId] = None) -> tuple[Optional[Skeleton], list[ForeachRow]]:
         """One-level traversal of a foreach source under the pattern `indirect` (`*F`) or not: its outer
         skeleton (a structural type, or None for a leaf) and one (label, item type) row per component, in
-        order. With `schema`, an array contributes one element type even when its runtime length is
-        zero.
+        order. An array has one row, its element's, which every element of the skeleton shares.
 
         Under the value pattern a pointer source, written or reached through a name, is a leaf: its one
         row is the source itself, and the pointee is not looked at. Under `*F` each component behind it is
@@ -662,8 +660,8 @@ class Types:
                 return s, [(n, wrap(f)) for n, f in fields]
             case Tuple(elems=elems):
                 return s, [(str(i), wrap(e)) for i, e in enumerate(elems)]
-            case Array(elem=elem, length=length):
-                return s, [(str(i), wrap(elem)) for i in range(1 if schema else length)]
+            case Array(elem=elem):
+                return s, [("0", wrap(elem))]
             case Enum(variants=variants):
                 return s, [(n, wrap(f)) for n, f in variants]
         return None, [("0", source)]
@@ -699,7 +697,7 @@ class Types:
 
     def expand(self, ty: Foreach, module: Optional[ModuleId] = None) -> Type:
         """The structural type a foreach transform denotes."""
-        skeleton, rows = self.rows(ty.source, ty.indirect, module, schema=True)
+        skeleton, rows = self.rows(ty.source, ty.indirect, module)
         mapped = [(label, subst(ty.body, {ty.binder: self.binding(ty, item)})) for label, item in rows]
         match skeleton:
             case Struct():

@@ -5,7 +5,7 @@ Generic functions are specialized on demand by logical type arguments, up to the
 Representation erasure is separate from code-specialization identity.
 
 A zero-size type (`Types.zero_size`: unit, brand witnesses, Never, products of zero-size components,
-arrays of length 0 or of zero-size elements) has no C representation: its C type is `void` (`erased`),
+arrays of zero-size elements) has no C representation: its C type is `void` (`erased`),
 and no struct member, parameter, local, argument or assignment has it. A function returning one
 returns `void`; constructing, destructuring, copying, loading or storing one in a place writes nothing;
 a pointer to one is a `void*`, and no raw load, store or `alloca` is at one (`Checker.raw_access`). The
@@ -1526,6 +1526,8 @@ class Backend:
                 for c in instr.args[2:] if not self.erased(self.type_of(c))]
         values = [self.value_name(c) for c in instr.args[2:] if not self.erased(self.type_of(c))]
         skeleton, rows = self.types.rows(t.source, t.indirect)
+        if isinstance(skeleton, Array):
+            rows = rows * skeleton.length   # every element of an array shares its one row
         # A traversal through a pointer with `*F` computes the components' addresses; under the value
         # pattern the pointer is the one component.
         pointer = mapped is None and t.indirect and isinstance(self.shape(t.source), Ptr)

@@ -142,9 +142,11 @@ class LayoutTests(unittest.TestCase):
             ("f", C.Foreach("F", True, C.Ptr(C.Named("T")), C.Named("F"))),)))})
         self.assertFalse(Types(program).is_copy(C.Named("T")))
 
-    def test_erased_arguments_and_empty_arrays_do_not_store_their_types(self):
+    def test_erased_arguments_do_not_store_their_types(self):
         self.compiles("(type Phantom (forall (T) () u32)) (type A (Phantom A))", C.Named("A"))
-        self.compiles("(type A (array A 0)) (type B (struct (a A) (n u32)))", C.Named("B"))
+
+    def test_an_array_does_not_break_a_storage_cycle(self):
+        self.rejects("(type A (array A 1)) (type B (struct (a A) (n u32)))", "infinite by-value layout")
 
     def test_recursive_aliases_require_an_aggregate_name(self):
         for body in ("A", "(ptr A)", "(fn () A)"):
@@ -191,7 +193,7 @@ class SizeLimitTests(unittest.TestCase):
             (type E (enum (a u8) (b (tuple u16 u8)) (c (tuple))))"""))
         for written, layout in (("u8", (1, 1)), ("(tuple u8 u64 u8)", (24, 8)), ("(tuple (brand $static) u16)", (2, 2)),
                                 ("(array (tuple u32 u8) 3)", (24, 4)), ("Opt", (8, 8)), ("E", (8, 4)),
-                                ("(enum (a (tuple)))", (4, 4)), ("(array u64 0)", (0, 1))):
+                                ("(enum (a (tuple)))", (4, 4)), ("(array (tuple) 4)", (0, 1))):
             with self.subTest(type=written):
                 self.assertEqual(types.layout(parse_type(read(written)[0])), layout)
 
