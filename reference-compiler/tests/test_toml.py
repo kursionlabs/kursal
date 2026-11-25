@@ -30,7 +30,7 @@ use std::arena::Domain!;
 use std::buffer::Buffer!;
 use std::fmt::Writer;
 use std::collections::arena_map::ArenaMap;
-use std::io::{print, read_all_stdin};
+use std::io::{print, stdin};
 use std::option::{Option, Result};
 use std::raw::Span;
 use toml::parse;
@@ -115,7 +115,11 @@ fn table(&cx: Domain!['k], out: Buffer!, t: ArenaMap[Span['k], TomlValue['k], 'k
 fn main() -> i32 {
     var exists 'k. cx = Domain!::new(std::process::hash_seed());
     var cx = cx;
-    let input = match read_all_stdin() {
+    let read = match stdin() {
+        Result::Ok(reader) => reader.read_to_end(),
+        Result::Err(e) => Result::Err.(e),
+    };
+    let input = match read {
         Result::Ok(b) => b,
         Result::Err(e) => Buffer!::new(),
     };

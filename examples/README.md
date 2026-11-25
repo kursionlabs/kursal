@@ -46,7 +46,7 @@ then `greet`, then `linear`, which declares a linear type of its own and consume
 | Example | What it shows |
 |---|---|
 | `hello` | the smallest program: `fn main()` printing a line with `std::io::print` |
-| `greet` | reading a line from stdin into an owned `Buffer!`, and formatting a reply with `f"..."`; `main` returns `Result[(), std::io::Error]`, so `?` ends it on an I/O error |
+| `greet` | reading a line from stdin through an `Input!` (`std::io::stdin`) into an owned `Buffer!`, and formatting a reply with `f"..."`; `main` returns `Result[(), std::io::Error]`, so `?` ends it on an I/O error |
 | `linear` (library), with `bad/leaked_handle.kur`, `bad/double_use_handle.kur`, `bad/branch_inconsistent.kur`, `bad/while_consume_without_replacement.kur` | a linear type, `struct Handle! { ... }`, the control flow that consumes it, and the programs that get it wrong |
 | `calc` | an integer calculator over stdin: parsing, and errors reported with their column |
 | `wc`, `wordfreq` | command-line tools: line, word and byte counts of files; word frequencies of stdin |
@@ -62,7 +62,7 @@ Larger programs: complete applications, or a feature used where it is the right 
 
 | Example | What it shows |
 |---|---|
-| `kvstore` | a key-value store kept in a file |
+| `kvstore` | a key-value store kept in a file, read through an `Input!` and written through an `Output!` |
 | `json_check` | a JSON validator and pretty-printer |
 | `routes` | shortest routes over a weighted, directed graph |
 | `lisp` | a small Lisp interpreter: closures, recursion, a list library |

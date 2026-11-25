@@ -41,6 +41,176 @@ uint64_t probe_reads(void) { return reads; }
 COUNTED_LINK = ("-Wl,--wrap=malloc,--wrap=realloc,--wrap=read",)
 
 
+# Programs that read and write files and standard input through `Input!` and `Output!`, by name: each
+# one's source, its standard input and what it prints, exiting 0. tests/test_compiler.py builds them with
+# the self-hosted compiler too.
+IO_PROGRAMS: dict[str, tuple[str, str, str]] = {
+    "input over a file": ('''
+    use std::buffer::Buffer!;
+    use std::fmt::Writer;
+    use std::fs::write;
+    use std::io::{Error, File!, Input!, print};
+    use std::option::{Option, Result};
+    use std::process::trap;
+    use std::slice::StaticRead;
+    fn shown(&out: Buffer!, line: Result[Option[Buffer!], Error]) {
+        out = match line {
+            Result::Ok(found) => match found {
+                Option::Some(text) => out.write_byte(b'[').put(text).write_byte(b']'),
+                Option::None => out.put("end"),
+            },
+            Result::Err(e) => out.put("error ").put(e.errno),
+        };
+    }
+    fn done(input: Input!) -> Buffer! {
+        match input.finish() {
+            Result::Ok(rest) => rest,
+            Result::Err(e) => trap(),
+        }
+    }
+    fn main() -> i32 {
+        var sr = StaticRead::new();
+        let made = write(&sr, "in.txt", Buffer!::new().put("first\\nsecond\\nthird line\\nrest of it"));
+        var out = Buffer!::new();
+        var input = match File!::open_read(&sr, "in.txt") { Result::Ok(f) => f.input(), Result::Err(e) => trap(), };
+        shown(&out, &input.read_line());
+        var chunk = Buffer!::with_capacity(0usize);
+        let some = (&input.read(&chunk, 3usize)).unwrap_or(9usize);
+        let none = (&input.read(&chunk, 0usize)).unwrap_or(9usize);
+        let exact = (&input.read_exact(&chunk, 5usize)).unwrap_or(9usize);
+        out = out.put(f" {some} {none} {exact} ").put(chunk).put(" ");
+        shown(&out, &input.read_line());
+        out = match input.read_to_end() {
+            Result::Ok(text) => out.put(" (").put(text).put(") "),
+            Result::Err(e) => out.put(" error ").put(e.errno),
+        };
+        var second = match File!::open_read(&sr, "in.txt") { Result::Ok(f) => f.input(), Result::Err(e) => trap(), };
+        shown(&out, &second.read_line());
+        out = out.put(" ahead ").put(done(second)).put(" ");
+        let emptied = write(&sr, "empty.txt", Buffer!::new());
+        var last = match File!::open_read(&sr, "empty.txt") { Result::Ok(f) => f.input(), Result::Err(e) => trap(), };
+        shown(&out, &last.read_line());
+        var empty = Buffer!::with_capacity(0usize);
+        let end = (&last.read(&empty, 4usize)).unwrap_or(9usize);
+        let short = (&last.read_exact(&empty, 4usize)).unwrap_or(9usize);
+        empty.destroy();
+        var left = done(last);
+        let n = &left.len();
+        left.destroy();
+        out = out.put(f" {end} {short} {n}");
+        let failed = match File!::open_read(&sr, ".") {
+            Result::Err(e) => 0i32,
+            Result::Ok(dir) => {
+                var dir = dir.input();
+                var bytes = Buffer!::new().put("kept");
+                let read = &dir.read(&bytes, 4usize);
+                done(dir).destroy();
+                out = out.put(" ").put(bytes);
+                match read {
+                    Result::Ok(n) => 0i32,
+                    Result::Err(e) => e.errno,
+                }
+            },
+        };
+        print(out.put(f" {failed}"));
+        0
+    }''', "", "[first] 3 0 5 second\nt [hird line] (rest of it) [first] ahead second\nthird line\nrest of it end 0 0 0 kept 21"),
+    "output over a file": ('''
+    use std::buffer::Buffer!;
+    use std::fmt::Writer;
+    use std::fs::read;
+    use std::io::{Error, File!, Output!, print};
+    use std::option::Result;
+    use std::process::trap;
+    use std::slice::StaticRead;
+    fn large() -> Buffer! {
+        var big = Buffer!::new();
+        var i = 0usize;
+        while i < 8192usize {
+            big = big.write_byte(b'x');
+            i = i + 1usize;
+        }
+        big
+    }
+    fn errno(r: Result[(), Error]) -> i32 {
+        match r {
+            Result::Ok(nothing) => 0i32,
+            Result::Err(e) => e.errno,
+        }
+    }
+    fn full() -> Output! {
+        var sr = StaticRead::new();
+        match File!::create(&sr, "/dev/full") {
+            Result::Ok(f) => f.output(),
+            Result::Err(e) => trap(),
+        }
+    }
+    fn main() -> i32 {
+        var sr = StaticRead::new();
+        let out = match File!::create(&sr, "out.txt") { Result::Ok(f) => f.output(), Result::Err(e) => trap(), };
+        let written = errno(out.put("one ").write(&sr, "two ").put(f"{3i32} ").put(large()).put(" end").finish());
+        let back = match read(&sr, "out.txt") {
+            Result::Ok(text) => text,
+            Result::Err(e) => trap(),
+        };
+        let small = errno(full().put("full").finish());
+        let big = errno(full().put(large()).put("after").finish());
+        print(back.put(f" {written} {small} {big}"));
+        0
+    }''', "", "one two 3 " + "x" * 8192 + " end 0 28 28"),
+    "input over stdin": ('''
+    use std::buffer::Buffer!;
+    use std::fmt::Writer;
+    use std::io::{Error, Input!, print, stdin};
+    use std::process::trap;
+    use std::option::{Option, Result};
+    fn shown(&out: Buffer!, line: Result[Option[Buffer!], Error]) {
+        out = match line {
+            Result::Ok(found) => match found {
+                Option::Some(text) => out.write_byte(b'[').put(text).write_byte(b']'),
+                Option::None => out.put("end"),
+            },
+            Result::Err(e) => out.put("error ").put(e.errno),
+        };
+    }
+    fn done(input: Input!) -> Buffer! {
+        match input.finish() {
+            Result::Ok(rest) => rest,
+            Result::Err(e) => trap(),
+        }
+    }
+    fn errno(r: Result[Input!, Error]) -> i32 {
+        match r {
+            Result::Ok(input) => { done(input).destroy(); 0i32 },
+            Result::Err(e) => e.errno,
+        }
+    }
+    fn main() -> i32 {
+        var out = Buffer!::new();
+        var input = match stdin() { Result::Ok(i) => i, Result::Err(e) => trap(), };
+        shown(&out, &input.read_line());
+        shown(&out, &input.read_line());
+        let again = errno(stdin());
+        var chunk = Buffer!::new();
+        let some = (&input.read(&chunk, 1usize)).unwrap_or(9usize);
+        let exact = (&input.read_exact(&chunk, 2usize)).unwrap_or(9usize);
+        out = out.put(f" {some} {exact} ").put(chunk);
+        shown(&out, &input.read_line());
+        out = out.put(" ahead ").put(done(input));
+        var second = match stdin() { Result::Ok(i) => i, Result::Err(e) => trap(), };
+        shown(&out, &second.read_line());
+        done(second).destroy();
+        let third = match stdin() { Result::Ok(i) => i, Result::Err(e) => trap(), };
+        let none = match third.read_to_end() { Result::Ok(text) => { var text = text; let n = &text.len(); text.destroy(); n }, Result::Err(e) => 9usize };
+        var fourth = match stdin() { Result::Ok(i) => i, Result::Err(e) => trap(), };
+        shown(&out, &fourth.read_line());
+        done(fourth).destroy();
+        let printed = print(out);
+        if again == 16i32 && none == 0usize { 0 } else { 4 }
+    }''', "a\n\nb\ncd\ne\nlast", "[a][] 1 2 b\nc[d] ahead e\nlastendend"),
+}
+
+
 def siphash13(seed: tuple[int, int], words: list[int]) -> int:
     """SipHash-1-3 under the key `seed` of the 64-bit `words`, each as its 8 little-endian bytes."""
     mask = (1 << 64) - 1
@@ -108,6 +278,9 @@ class StdRuntimeTests(unittest.TestCase):
     def expect(self, source: str, status: int = 0, stdout: str = "", **kwargs) -> None:
         result = self.run_program(source, **kwargs)
         self.assertEqual((result.stdout, result.returncode), (stdout, status), result.stderr[:500])
+
+    def expect_program(self, source: str, stdin: str, stdout: str) -> None:
+        self.expect(source, stdout=stdout, stdin=stdin)
 
     def reject(self, source: str, message: str, deps: tuple[str, ...] = ("std",)) -> None:
         with tempfile.TemporaryDirectory(prefix="kursal-std-") as base:
@@ -678,18 +851,19 @@ class StdRuntimeTests(unittest.TestCase):
                         var child = child;
                         match &child.take_stdin() {
                             Option::Some(w) => {
-                                var w = w;
-                                let wrote = &w.write_static("piped");
-                                let closed = w.close();
+                                let wrote = w.output().put("piped").finish();
                             },
                             Option::None => (),
                         }
                         var piped = Buffer!::new();
                         match &child.take_stdout() {
                             Option::Some(r) => {
-                                var r = r;
+                                var r = r.input();
                                 let n = &r.read_exact(&piped, 100usize);
-                                let closed = r.close();
+                                match r.finish() {
+                                    Result::Ok(rest) => rest.destroy(),
+                                    Result::Err(e) => (),
+                                }
                             },
                             Option::None => (),
                         }
@@ -842,21 +1016,16 @@ class StdRuntimeTests(unittest.TestCase):
                 var sr = StaticRead::new();
                 match File!::open_read(&sr, ".") {
                     Result::Err(code) => 1,
-                    Result::Ok(file) => {
-                        var file = file;
-                        let status = match &file.read_to_buffer() {
-                            Result::Ok(contents) => { contents.destroy(); 2 },
-                            Result::Err(e) => if e.errno == 21i32 { 0 } else { 3 },
-                        };
-                        let closed = file.close();
-                        status
+                    Result::Ok(file) => match file.input().read_to_end() {
+                        Result::Ok(contents) => { contents.destroy(); 2 },
+                        Result::Err(e) => if e.errno == 21i32 { 0 } else { 3 },
                     },
                 }
             }''')
 
     def test_files_that_are_not_regular_are_read_to_their_end(self):
         # A pipe (/dev/stdin fed by one) and a device (/dev/null) have no size to read by: `fs::read` and
-        # `File!::read_to_buffer` read them until they end. A regular file is read whole, a directory is
+        # `Input!::read_to_end` read them until they end. A regular file is read whole, a directory is
         # EISDIR.
         text = "line\n" * 20000
         self.expect('''
@@ -879,12 +1048,7 @@ class StdRuntimeTests(unittest.TestCase):
                 let written = write(&sr, "file.txt", Buffer!::new().put("12345")).is_ok();
                 let regular = length(read(&sr, "file.txt"));
                 let piped = match File!::open_read(&sr, "/dev/stdin") {
-                    Result::Ok(file) => {
-                        var file = file;
-                        let n = length(&file.read_to_buffer());
-                        let closed = file.close();
-                        n
-                    },
+                    Result::Ok(file) => length(file.input().read_to_end()),
                     Result::Err(e) => 0i32 - e.errno,
                 };
                 let printed = print(f"{none} {directory} {regular} {piped}");
@@ -920,62 +1084,52 @@ class StdRuntimeTests(unittest.TestCase):
             finally:
                 locked.chmod(0o755)
 
-    def test_files_are_read_in_chunks(self):
-        # `read` appends at most its count, one `read(2)`, and 0 at the end; `read_exact` reads on after
-        # a short read, fewer only at the end; a directory is EISDIR, and the buffer stays as it was.
+    def test_input_reads_a_file(self):
+        # An `Input!` over a file: `read` and `read_exact` hand out the bytes `read_line` read ahead before
+        # they read more, and `read_to_end` returns the rest and closes the file; `finish` closes it and
+        # hands back what was read ahead and not returned. At the end `read_line` is `None` and `read` 0. A
+        # directory is EISDIR, and the buffer stays as it was.
+        self.expect_program(*IO_PROGRAMS["input over a file"])
+
+    def test_input_reads_a_file_to_its_end_without_reading_ahead(self):
+        # `read_to_end` of a file sizes its buffer by the file, reads it with one `read(2)` and finds the end
+        # with another, and never makes the 64 KiB buffer `read_line` reads ahead into.
         self.expect('''
             use std::buffer::Buffer!;
             use std::fmt::Writer;
             use std::fs::write;
-            use std::io::{File!, print};
-            use std::option::Result;
-            use std::slice::StaticRead;
-            fn main() -> i32 {
-                var sr = StaticRead::new();
-                let made = write(&sr, "chunks.txt", Buffer!::new().put("abcdefgh"));
-                var file = match File!::open_read(&sr, "chunks.txt") { Result::Ok(f) => f, Result::Err(e) => { return 1; } };
-                var text = Buffer!::with_capacity(0usize);
-                let first = (&file.read(&text, 3usize)).unwrap_or(9usize);
-                let none = (&file.read(&text, 0usize)).unwrap_or(9usize);
-                let rest = (&file.read_exact(&text, 10usize)).unwrap_or(9usize);
-                let end = (&file.read(&text, 3usize)).unwrap_or(9usize);
-                let closed = file.close();
-                let failed = match File!::open_read(&sr, ".") {
-                    Result::Err(e) => 0i32,
-                    Result::Ok(dir) => {
-                        var dir = dir;
-                        let read = &dir.read(&text, 4usize);
-                        let closed = dir.close();
-                        match read {
-                            Result::Ok(n) => 0i32,
-                            Result::Err(e) => e.errno,
-                        }
-                    },
-                };
-                print(f"{first} {none} {rest} {end} {failed} ".put(text));
-                0
-            }''', stdout="3 0 5 0 21 abcdefgh")
-
-    def test_a_failed_write_is_an_error(self):
-        self.expect('''
-            use std::option::Result;
             use std::io::File!;
+            use std::option::Result;
+            use std::process::trap;
             use std::slice::StaticRead;
+            extern "C" fn probe_allocated() -> u64;
+            extern "C" fn probe_reads() -> u64;
             fn main() -> i32 {
                 var sr = StaticRead::new();
-                match File!::create(&sr, "/dev/full") {
-                    Result::Err(code) => 1,
-                    Result::Ok(file) => {
-                        var file = file;
-                        let status = match &file.write_static("full") {
-                            Result::Ok(nothing) => 2,
-                            Result::Err(e) => if e.errno == 28i32 { 0 } else { 3 },
-                        };
-                        let closed = file.close();
-                        status
-                    },
+                var text = Buffer!::new();
+                var i = 0usize;
+                while i < 20000usize {
+                    text = text.write_byte(b'a');
+                    i = i + 1usize;
                 }
-            }''')
+                let made = write(&sr, "big.txt", text);
+                let allocated = unsafe probe_allocated();
+                let reads = unsafe probe_reads();
+                let input = match File!::open_read(&sr, "big.txt") { Result::Ok(f) => f.input(), Result::Err(e) => trap(), };
+                let n = match input.read_to_end() {
+                    Result::Ok(all) => { var all = all; let n = &all.len(); all.destroy(); n },
+                    Result::Err(e) => 0usize,
+                };
+                let allocated = unsafe probe_allocated() - allocated;
+                let reads = unsafe probe_reads() - reads;
+                if n != 20000usize { 1 } else if allocated >= 65536u64 { 2 } else if reads != 2u64 { 3 } else { 0 }
+            }''', counted=True)
+
+    def test_output_writes_a_file(self):
+        # An `Output!` over a file: what is put and written, and the bytes of a large buffer, written where
+        # they lie, all in order; `finish` closes the file. A failed write is the error `finish` reports,
+        # for a small write gathered and for a large one alike.
+        self.expect_program(*IO_PROGRAMS["output over a file"])
 
     def test_print_and_eprint_write_to_stdout_and_stderr(self):
         result = self.run_program('''
@@ -1174,57 +1328,69 @@ class StdRuntimeTests(unittest.TestCase):
 
     def test_standard_streams_the_process_started_without_stay_out_of_reach(self):
         # Started with descriptors 0, 1 and 2 closed, the program still has them, on /dev/null, so the file
-        # it creates takes another number: `print`, `eprint` and `read_line` work and reach /dev/null, and
-        # the file holds only what was written to it.
+        # it creates takes another number: `print`, `eprint` and `stdin` work and reach /dev/null, and the
+        # file holds only what was written to it.
         def close_standard_streams() -> None:
             for fd in (0, 1, 2):
                 os.close(fd)
         self.expect('''
-            use std::io::{File!, eprint, print, read_line};
+            use std::fmt::Writer;
+            use std::io::{File!, eprint, print, stdin};
             use std::option::{Option, Result};
             use std::slice::StaticRead;
             fn main() -> i32 {
                 var sr = StaticRead::new();
-                var file = match File!::create(&sr, "owned.txt") {
-                    Result::Ok(f) => f,
+                let out = match File!::create(&sr, "owned.txt") {
+                    Result::Ok(f) => f.output(),
                     Result::Err(e) => return 1,
                 };
-                var file = file;
-                let written = &file.write_static("the file's own\\n");
+                let out = out.put("the file's own\\n");
                 let printed = print("stdout\\n").is_ok() && eprint("stderr\\n").is_ok();
-                let line = match read_line() {
-                    Result::Ok(found) => match found {
-                        Option::Some(text) => { text.destroy(); 4 },
-                        Option::None => 0,
+                let line = match stdin() {
+                    Result::Ok(input) => {
+                        var input = input;
+                        let line = match &input.read_line() {
+                            Result::Ok(found) => match found {
+                                Option::Some(text) => { text.destroy(); 4 },
+                                Option::None => 0,
+                            },
+                            Result::Err(e) => 5,
+                        };
+                        match input.finish() {
+                            Result::Ok(rest) => { rest.destroy(); line },
+                            Result::Err(e) => 5,
+                        }
                     },
                     Result::Err(e) => 5,
                 };
-                let closed = file.close().is_ok();
-                var reader = match File!::open_read(&sr, "owned.txt") {
-                    Result::Ok(f) => f,
+                let written = out.finish().is_ok();
+                let reader = match File!::open_read(&sr, "owned.txt") {
+                    Result::Ok(f) => f.input(),
                     Result::Err(e) => return 6,
                 };
-                var reader = reader;
-                let length = match &reader.read_to_end() {
+                let length = match reader.read_to_end() {
                     Result::Ok(text) => { var text = text; let n = &text.len(); text.destroy(); n },
                     Result::Err(e) => 0usize,
                 };
-                let shut = reader.close();
-                if !written.is_ok() || !closed { 2 } else if !printed { 3 } else if line != 0 { line } else if length != 15usize { 7 } else { 0 }
+                if !written { 2 } else if !printed { 3 } else if line != 0 { line } else if length != 15usize { 7 } else { 0 }
             }''', preexec=close_standard_streams)
 
     def test_read_line_tells_an_empty_line_from_the_end(self):
         self.expect('''
-            use std::io::{read_line, print};
+            use std::io::{print, stdin};
             use std::buffer::Buffer!;
             use std::fmt::Writer;
             use std::option::{Option, Result};
             fn main() -> i32 {
+                var input = match stdin() { Result::Ok(i) => i, Result::Err(e) => return 8, };
                 var lines = 0i32;
                 var reading = true;
                 while reading {
-                    match read_line() {
-                        Result::Err(e) => return 9,
+                    match &input.read_line() {
+                        Result::Err(e) => {
+                            lines = 9i32;
+                            reading = false;
+                        },
                         Result::Ok(line) => match line {
                             Option::None => {
                                 reading = false;
@@ -1236,58 +1402,19 @@ class StdRuntimeTests(unittest.TestCase):
                         },
                     }
                 }
+                match input.finish() {
+                    Result::Ok(rest) => rest.destroy(),
+                    Result::Err(e) => return 8,
+                }
                 lines
             }''', status=3, stdout="[a][][b]", stdin="a\n\nb")
 
     def test_input_reads_lines_ahead_and_loses_no_byte(self):
-        # An `Input!` returns lines as `read_line` does; while it holds standard input, the other readers
-        # of it fail with EBUSY (16) rather than skip what it read ahead; `read_to_end` returns the rest,
-        # and `finish` hands back what was read ahead and not returned, and standard input with it.
-        self.expect('''
-            use std::buffer::Buffer!;
-            use std::fmt::Writer;
-            use std::io::{Error, Input!, print, read_all_stdin, read_line, stdin};
-            use std::process::trap;
-            use std::option::{Option, Result};
-            fn shown(&out: Buffer!, line: Result[Option[Buffer!], Error]) {
-                out = match line {
-                    Result::Ok(found) => match found {
-                        Option::Some(text) => out.write_byte(b'[').put(text).write_byte(b']'),
-                        Option::None => out.put("end"),
-                    },
-                    Result::Err(e) => out.put("error ").put(e.errno),
-                };
-            }
-            fn errno(r: Result[Input!, Error]) -> i32 {
-                match r {
-                    Result::Ok(input) => { input.finish().destroy(); 0i32 },
-                    Result::Err(e) => e.errno,
-                }
-            }
-            fn main() -> i32 {
-                var out = Buffer!::new();
-                var input = match stdin() { Result::Ok(i) => i, Result::Err(e) => trap(), };
-                shown(&out, &input.read_line());
-                shown(&out, &input.read_line());
-                shown(&out, read_line());
-                let again = errno(stdin());
-                let all_busy = match read_all_stdin() {
-                    Result::Ok(text) => { text.destroy(); false },
-                    Result::Err(e) => e.errno == 16i32,
-                };
-                shown(&out, &input.read_line());
-                let ahead = input.finish();
-                out = out.put(" ahead ").put(ahead);
-                var second = match stdin() { Result::Ok(i) => i, Result::Err(e) => trap(), };
-                shown(&out, &second.read_line());
-                second.finish().destroy();
-                var third = match stdin() { Result::Ok(i) => i, Result::Err(e) => trap(), };
-                let none = match &third.read_to_end() { Result::Ok(text) => { var text = text; let n = &text.len(); text.destroy(); n }, Result::Err(e) => 9usize };
-                shown(&out, &third.read_line());
-                third.finish().destroy();
-                let printed = print(out);
-                if again == 16i32 && all_busy && none == 0usize { 0 } else { 4 }
-            }''', stdout="[a][]error 16[b] ahead c\nlastendend", stdin="a\n\nb\nc\nlast")
+        # An `Input!` over standard input returns lines, and `read` and `read_exact` hand out what it read
+        # ahead first; while it holds standard input, another `stdin` fails with EBUSY (16) rather than
+        # skip what it read ahead; `finish` hands back what was read ahead and not returned, and standard
+        # input with it, as `read_to_end` gives it back with the rest.
+        self.expect_program(*IO_PROGRAMS["input over stdin"])
 
     def test_input_reads_many_lines_in_few_reads(self):
         # 20000 lines, 200 KB, take a few reads of 64 KiB, not one per byte; a line longer than the buffer
@@ -1317,7 +1444,10 @@ class StdRuntimeTests(unittest.TestCase):
                         Result::Err(e) => { reading = false; },
                     }
                 }
-                input.finish().destroy();
+                match input.finish() {
+                    Result::Ok(rest) => rest.destroy(),
+                    Result::Err(e) => return 1,
+                }
                 let reads = unsafe probe_reads();
                 if lines != 20002u64 || longest != 100000usize { 2 } else if reads > 64u64 { 3 } else { 0 }
             }''', stdin="\n".join(lines), counted=True)
@@ -1326,12 +1456,15 @@ class StdRuntimeTests(unittest.TestCase):
         directory = os.open(".", os.O_RDONLY)
         try:
             result = self.run_program('''
-                use std::io::read_all_stdin;
+                use std::io::stdin;
                 use std::option::Result;
                 fn main() -> i32 {
-                    match read_all_stdin() {
-                        Result::Ok(text) => { text.destroy(); 1 },
-                        Result::Err(e) => e.errno,
+                    match stdin() {
+                        Result::Ok(input) => match input.read_to_end() {
+                            Result::Ok(text) => { text.destroy(); 1 },
+                            Result::Err(e) => e.errno,
+                        },
+                        Result::Err(e) => 1,
                     }
                 }''', stdin_fd=directory)
         finally:

@@ -44,8 +44,8 @@ in the mapping body is counted. Structural region split/merge over `*T` is
 therefore not a raw-pointer API merely because its shape is selected
 through indirection.
 
-So `std::io::File!::write_static(&self, bytes: Slice[u8, 'static])` is class C
-even though its body reads through the slice's pointer, while
+So `Writer[Buffer!]::write_static(self: Buffer!, bytes: Slice[u8, 'static])` is
+class C even though its body reads through the slice's pointer, while
 `std::io::write_all(fd: i32, ptr: *u8, len: usize)` is class B: the same
 pointer, spelled bare. Unfolding would put nearly every function that takes
 or returns a `Slice`, `Span`, `Ref`, `Buffer!`, `Vec!`, `Arena!`, `HashMap!`
@@ -310,8 +310,7 @@ checkers require of a KURS `data` declaration (`data_type_not_copy`).
 | `core::cstr::CStr::from_raw` | `ptr` names a NUL-terminated byte run that stays readable and unchanged for the rest of the process, as `argv` entries do: a `CStr` is `Copy` and carries no brand, so nothing ends its use earlier |
 | `std::fs::is_dot` | `name` addresses a live NUL-terminated string (a directory entry's name, read before the next read or close of its directory) |
 | `core::fmt::Writer::write_raw` (and its instances) | `ptr[0..len)` is readable for the whole call; the writer reads the bytes before returning and keeps no pointer to them. `Buffer!`'s also needs them outside its own storage, which the growth on entry may reallocate |
-| `std::io::write_all` | `ptr[0..len)` is readable, and `fd` is a descriptor the caller may write: standard output or error, or one a `File!` it holds owns. A number taken from anywhere else may name a descriptor a `File!` owns, or one closed and since reused, and the write would go around its owner. The safe output functions name standard output and error themselves (`print`, `eprint`, `Output!`), or write through a `File!` |
-| `std::io::File!::write_all_raw` | `ptr[0..len)` is readable throughout the write |
+| `std::io::write_all` | `ptr[0..len)` is readable, and `fd` is a descriptor the caller may write: standard output or error, or one a `File!` it holds owns. A number taken from anywhere else may name a descriptor a `File!` owns, or one closed and since reused, and the write would go around its owner. The one safe writer, `Output!`, names standard output or error itself (`stdout`, `stderr`, and `print` and `eprint` through them), or writes the descriptor of the `File!` it owns (`File!::output`) |
 
 Every read through a raw pointer (`unsafe *p`, and the functions above) owes the same thing for
 brands: a value of a type that holds a brand witness (`Brand['r]`, `Exclusive!`, `Shared!`, a
@@ -470,7 +469,7 @@ about a pointer in the signature:
 | `alloc::owned::Allocation!::adopt` | the block `u` owns holds an initialized `T`, aligned for `T`, in at least `sizeof[T]()` bytes: the `Region!` it returns reads and writes it as one (`Region!::from_raw`'s obligation). A `malloc` result is aligned for every type, so in practice the obligation is the size and the contents. `adopt_value` is the checked form: it aborts on a block smaller than `sizeof[T]()` and writes the `T` itself. The library's own callers (`Vec!`, `HashMap!`, `Buffer!::open`, `Owned!::open`) state at each call why the block qualifies, or why a region over uninitialized slots never leaves the module and is never read as a `T` |
 | `alloc::owned::Allocation!::release_storage` | every `T` the block holds is accounted for: moved out, never written, or still tracked by the caller, which keeps the returned storage and its contents. The block is given up without reading it, so a linear `T` left in it unaccounted would be dropped. `release` is the safe form, for a `Copy` `T`; the library's one caller is `Vec!` (`push`/`pop` re-adopt the same storage at once and keep tracking the elements below `len`; `destroy_with` moves every element out first) |
 | `std::io::File!::adopt` | the descriptor is live and open, with no other owner |
-| `std::io::read_into`, `read_to_end_from` | `fd` is a descriptor the caller may read: stdin, or one a `File!` it holds owns. Reading advances the descriptor's offset, which is that owner's state. The safe reads (`File!::read`, `read_exact`, `read_to_end`, `Input!`) name their own descriptor |
+| `std::io::read_into`, `read_to_end_from` | `fd` is a descriptor the caller may read: stdin, or one a `File!` it holds owns. Reading advances the descriptor's offset, which is that owner's state. The one safe reader, `Input!`, reads standard input, which it holds, or the descriptor of the `File!` it owns (`File!::input`); `std::process` reads a child's pipe through the `File!` that owns its end, one read at a time, so that `poll` tells when the next can be made |
 | `std::process::pipe_end` | `fd` is -1 or a descriptor nothing else owns, which the `File!` made of it closes: the parent's end of a pipe `kur_libc_process_spawn` made for the child |
 
 **Class C means "no brand-to-authority conversion and no raw pointer in the
@@ -568,8 +567,8 @@ runs, so it breaks no invariant and is safe to call.
   site (section 2.2), but it is an attestation, not evidence. A linear "filled"
   counter would prove that `n` writes happened, not that these `n` slots
   were the ones written. The remaining callers have the kernel write the
-  bytes through a raw pointer (`std::io::read_into`, behind `File!::read`
-  and every read to the end, `read_line`, and `Error::message`, which the C
+  bytes through a raw pointer (`std::io::read_into`, behind every read of
+  an `Input!` and of a child's pipe, and `Error::message`, which the C
   library fills), where no per-slot operation exists to attach a witness to.
   Callers that only need a fully addressable scratch buffer use
   `Buffer!::new_zeroed`, which makes the claim true and carries no
@@ -633,7 +632,7 @@ Types whose hidden representation protects authority or bounds:
 | `HeapAllocator`, `Storage` | `alloc::heap` | zero-field receivers for the allocator's static methods; they own no memory |
 | `AlignProbe[T]` | `core::mem` | never built; `alignof` takes only its size |
 | `Stamp['r]` | `core::cap` | exposed to `core` alone (`exposed (package)`): `core` modules read a domain's brand out of it, code outside `core` can hold one but not open it |
-| `File!`, `Output!`, `Input!` | `std::io` | `File!` owns one open descriptor; forging one closes an arbitrary descriptor. `descriptor` hands out its number, which no safe function takes. `Output!` writes to a descriptor it does not own (stdout, stderr), which a forged one could point anywhere. `Input!` is made only by `stdin`, once it holds standard input, so that one reader at a time reads ahead from it; a forged one would skip what another has read ahead, and its `finish` would give standard input back from under the one that holds it. No `File!` owns a standard stream's number: the C `main` of an executable (`kursal build`) opens `/dev/null` on each of descriptors 0, 1 and 2 the process started without, before the program runs |
+| `File!`, `Output!`, `Input!`, `Sink!`, `Source!` | `std::io` | `File!` owns one open descriptor; forging one closes an arbitrary descriptor. `descriptor` hands out its number, which no safe function takes. `Output!` writes to standard output or error, which it does not own, or to the `File!` it owns (`File!::output`); a forged one could point at any descriptor. `Input!` reads standard input, made only by `stdin` once it holds standard input, so that one reader at a time reads ahead from it, or the `File!` it owns (`File!::input`); a forged one would skip what another has read ahead, and its `read_to_end` or `finish` would give standard input back from under the one that holds it. Each names its stream or file through a private enum (`Sink!`, `Source!`), which no code outside builds. No `File!` owns a standard stream's number: the C `main` of an executable (`kursal build`) opens `/dev/null` on each of descriptors 0, 1 and 2 the process started without, before the program runs |
 | `Args` | `std::process` | `argv` and `argc` as C's `main` received them: made only by the C `main` the compiler writes for an entry function taking one (its `argv` has `count` readable entries, each a NUL-terminated string live for the rest of the process) |
 | `Command!` | `std::process` | a command line of `count` NUL-terminated arguments, which `process.c` splits into the table `posix_spawnp` reads, and `env_ops` environment changes in the form `process.c` parses; a forged one would hand `process.c` a mismatched count. Its streams are `Stdio!` values, whose `File` is a `File!` the command closes after `spawn` |
 | `Child!` | `std::process` | a child this process started and has not waited for, so its process id names it and no other: `wait`, `kill` and `signal` reach it. A forged one would `waitpid` or signal an arbitrary process, and reap a child another component owns. Its pipe ends are `File!`s |

@@ -63,13 +63,13 @@ glibc, the POSIX one elsewhere), and `kur_libc_error_kind` sorts an errno
 into the kinds of `std::io::ErrorKind`, so that no host's errno numbers
 are written in Kursal code.
 
-`kur_libc_fs_size_hint` is what `File!::read_to_buffer` sizes its buffer
-by: a regular file's size, 0 for a pipe, device or socket, which are read
-until they end, EISDIR for a directory. `kur_libc_stdin_claim` and
+`kur_libc_fs_size_hint` is what `Input!::read_to_end` sizes its buffer by,
+for a file: a regular file's size, 0 for a pipe, device or socket, which
+are read until they end, EISDIR for a directory. `kur_libc_stdin_claim` and
 `kur_libc_stdin_release` set and clear one process-wide flag, so that one
-reader of standard input at a time (a `std::io::Input!`, or `read_line` or
-`read_all_stdin` for the length of the call) holds it, and none skips the
-bytes another has read ahead.
+reader of standard input at a time (a `std::io::Input!`, from `stdin` until
+its `read_to_end` or `finish`) holds it, and none skips the bytes another
+has read ahead.
 
 ## `fs.c`
 
@@ -135,7 +135,7 @@ for the first to end the process).
 `kursal build` writes calls it before anything else. It opens `/dev/null`
 on each of the descriptors 0, 1 and 2 the process started without (and
 aborts if it cannot), so a `File!` never gets a standard stream's number
-and `print`, `eprint` and `read_line` never reach a file the program owns.
+and `print`, `eprint` and `stdin` never reach a file the program owns.
 It ignores SIGPIPE, so a write to a closed pipe fails with EPIPE, which the
 output functions return, instead of ending the process. The children
 `kur_libc_process_spawn` starts get the default action back

@@ -102,7 +102,7 @@ The search index lists each item once, at the path the documented package
 
 | Anchor | On |
 |---|---|
-| `#fn.read_line`, `#const.MAX` | a module page |
+| `#fn.print`, `#const.MAX` | a module page |
 | `#method.read_line`, `#const.MAX` | a type, trait or primitive page; a module page's blanket methods |
 | `#instance.Ord-5bu8-2cu8-5d` | module, type and trait pages |
 | `#L12` | a source page |
@@ -131,7 +131,7 @@ trait, primitive, function, constant, method and instance, with its name
 (`s`). The search box in the header (`site/src/assets/search.js`, no dependencies)
 loads it on first use from the root the page's `doc-root` meta tag names,
 which Krayon's `url` filter fills in with `base_path`. A query is matched
-against names, or against paths when it contains `::` (`io::read_line`,
+against names, or against paths when it contains `::` (`io::print`,
 `std::fs`), and a linear type's `!` is ignored on both sides. Results rank an
 exact match first, then names or paths the query starts, each written in the
 query's case before any other case; then path segments it starts, then names

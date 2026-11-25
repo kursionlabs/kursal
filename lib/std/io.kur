@@ -3,9 +3,10 @@
 //! Process I/O over the POSIX `read`/`write`/`open`/`close`/`fstat` calls:
 //! printing to standard output (`print`) and standard error (`eprint`),
 //! any `Printable` value: `print("done\n")`, `print(f"{n} files\n")`;
-//! whole-file and stdin reads into an owned `Buffer!`, the owning
-//! descriptor type `File!`, buffered `Output!`, and `Input!`, the buffered
-//! reader of standard input;
+//! the owning descriptor type `File!`; `Output!`, the one buffered writer,
+//! of standard output, standard error or a file (`File!::output`);
+//! `Input!`, the one buffered reader, of standard input (`stdin`) or a file
+//! (`File!::input`);
 //! and `Error`, the error of every operating-system call of the library.
 //! Paths are any byte view (`c_string`); `std::fs` works with them whole.
 
@@ -13,12 +14,10 @@ use package as std;
 
 use alloc::buffer::Buffer!;
 use core::mem::alloca;
-use core::raw::Span;
 use core::ptr::offset;
 use core::slice::{Slice, ReadBytes};
 use core::fmt::{Format, Printable, Writer};
 use core::option::{Option, Result};
-use core::cap::{Access, Exclusive!};
 // The system calls: a read or write a signal interrupts is made again,
 // descriptors are opened close-on-exec, and a failure is an errno.
 use libc::io::{kur_libc_fs_read, kur_libc_fs_write, kur_libc_fs_open_read, kur_libc_fs_create, kur_libc_fs_close,
@@ -164,17 +163,17 @@ instance Printable[Error, W] {
 }
 
 // -------------------------------------------------------------- output --
-// Output goes to standard output (`print`), standard error (`eprint`), a
-// `File!` (its `write_*` methods) or a buffered `Output!` over one of the
-// two streams. No safe function takes a descriptor number: a number could
-// name a descriptor a `File!` owns, or one closed and reused, and writing
-// to it would go around the `File!` that owns it.
+// Output goes through an `Output!`: over standard output (`stdout`, and
+// `print`), standard error (`stderr`, and `eprint`), or a file it owns
+// (`File!::output`). No safe function takes a descriptor number: a number
+// could name a descriptor a `File!` owns, or one closed and reused, and
+// writing to it would go around the `File!` that owns it.
 //
 // `write_all` retries partial writes (`write(2)` may write fewer bytes
 // than requested, even to a regular file) until every byte is written. It
 // fails with the call's errno on a negative return, and with EIO on zero
 // progress (`write` returning 0, which POSIX permits and which would
-// otherwise loop forever). Every output function returns the result; a
+// otherwise loop forever). `Output!::finish` returns the first failure; a
 // caller that prints to its own stdout or stderr and has no recovery
 // discards it, while a program whose output is its product checks it.
 // Writing to a closed pipe is such a failure (EPIPE), not the end of the
@@ -217,7 +216,7 @@ fn eprint(x: T) -> Result[(), Error] {
     stderr().put(x).finish()
 }
 
-// ---------------------------------------------------------------- files --
+// --------------------------------------------------------------- input --
 
 /// Reads at most `max` bytes from `fd`, with one `read(2)`, appending them
 /// to `buf`: how many, which is 0 at the end of the input (and for a `max`
@@ -265,46 +264,109 @@ unsafe fn read_to_end_from(fd: i32, b: Buffer!) -> Result[Buffer!, Error] {
     Result::Ok.(b)
 }
 
-// ------------------------------------------------------- standard input --
-// Standard input is read through an `Input!`, which reads ahead into a
-// buffer and returns lines from it, or through `read_all_stdin` and
-// `read_line`. Bytes an `Input!` has read ahead are its own: another reader
-// of standard input would skip them. So one reader at a time holds
-// standard input, by a flag io.c keeps (`kur_libc_stdin_claim`): `stdin`
-// fails with EBUSY while an `Input!` holds it, and so do `read_all_stdin`
-// and `read_line`, which hold it for the length of the call. `finish`
-// gives it back, with the bytes read ahead and not yet returned. Code that
-// reads standard input without these (a C library, a child process
-// `std::process` starts) does not see the bytes an `Input!` has read ahead.
+// Input comes through an `Input!`: over standard input (`stdin`) or a file
+// it owns (`File!::input`). It reads ahead into a buffer of 64 KiB when it
+// looks for the end of a line, and hands those bytes out before it reads
+// more. Bytes an `Input!` has read ahead are its own: another reader of
+// standard input would skip them. So one `Input!` at a time holds standard
+// input, by a flag io.c keeps (`kur_libc_stdin_claim`): `stdin` fails with
+// EBUSY while one holds it. `read_to_end` gives it back with the rest of
+// the input, and `finish` with the bytes read ahead and not yet returned.
+// Code that reads standard input without an `Input!` (a C library, a child
+// process `std::process` starts) does not see the bytes one has read ahead.
 
-/// The buffered reader of standard input: lines (`read_line`) and the rest
-/// (`read_to_end`), read 64 KiB at a time. The one reader of standard input
-/// while it lives (see `stdin`). Call `finish` to give it back.
+/// What an `Input!` reads: standard input, which it holds until its end
+/// (`read_to_end` or `finish`), or a file it owns and closes then.
+enum Source! {
+    Stdin,
+    File(File!),
+}
+
+impl Source! {
+    /// The descriptor read: 0 for standard input, or the file's.
+    fn descriptor(&self) -> i32 {
+        let (source, fd) = match self {
+            Stdin => (Source!::Stdin, 0i32),
+            File(f) => {
+                var f = f;
+                let fd = &f.descriptor();
+                (Source!::File.(f), fd)
+            },
+        };
+        self = source;
+        fd
+    }
+
+    /// The room to read the rest of the source into without growing the
+    /// buffer, beyond what was read ahead: for a file, its size and 4096
+    /// bytes for the read that finds the end (only those bytes for a pipe,
+    /// device or socket, whose size says nothing); nothing for standard
+    /// input, read as it comes. A directory is EISDIR.
+    fn room(&self) -> Result[usize, Error] {
+        let (source, room) = match self {
+            Stdin => (Source!::Stdin, Result::Ok.(0usize)),
+            File(f) => {
+                var f = f;
+                let fd = &f.descriptor();
+                // `fd` is the descriptor `f` owns.
+                let hint = unsafe kur_libc_fs_size_hint(fd);
+                let room = if hint < 0isize { Result::Err.(Error::of_return(hint)) } else { Result::Ok.((hint as usize) + 4096usize) };
+                (Source!::File.(f), room)
+            },
+        };
+        self = source;
+        room
+    }
+
+    /// Gives standard input back, or closes the file and reports a failed
+    /// `close(2)`.
+    fn finish(self) -> Result[(), Error] {
+        match self {
+            Stdin => {
+                unsafe kur_libc_stdin_release();
+                Result::Ok.(())
+            },
+            File(f) => f.close(),
+        }
+    }
+}
+
+/// A buffered reader of standard input or a file: lines (`read_line`),
+/// chunks (`read`, `read_exact`) and the rest (`read_to_end`). Standard
+/// input's is the one reader of it while it lives (see `stdin`). Its end,
+/// `read_to_end` or `finish`, gives standard input back or closes the file.
 struct Input! {
-    // what standard input gave and has not been returned yet: `buf[start..)`
-    buf: Buffer!,
+    source: Source!,
+    // What was read ahead and not returned yet, `ahead[start..)`; none
+    // until `read_line` first reads ahead.
+    ahead: Option[Buffer!],
     start: usize,
 }
 
-/// Standard input, held by the `Input!` returned until its `finish`, or
-/// EBUSY while another `Input!` holds it.
+/// Standard input, held by the `Input!` returned until its `read_to_end`
+/// or `finish`, or EBUSY while another `Input!` holds it.
 fn stdin() -> Result[Input!, Error] {
     let claimed = unsafe kur_libc_stdin_claim();
     if claimed != 0i32 {
         Result::Err.(Error.{ errno: claimed })
     } else {
-        Result::Ok.(Input!.{ buf: Buffer!::with_capacity(65536usize), start: 0usize })
+        Result::Ok.(Input!.{ source: Source!::Stdin, ahead: Option::None, start: 0usize })
     }
 }
 
 impl Input! {
-    /// The next line, without its newline, as the free `read_line` reads
-    /// it: `None` at the end of input, when no byte is left to read; an
-    /// empty line is `Some` of an empty buffer, and a last line with no
-    /// newline is still a line. A read error is returned, and the bytes of
-    /// the line read before it are lost with it.
+    /// The next line, without its newline: `None` at the end of input,
+    /// when no byte is left to read; an empty line is `Some` of an empty
+    /// buffer, and a last line with no newline is still a line. A read
+    /// error is returned, and the bytes of the line read before it are lost
+    /// with it. It reads ahead, 64 KiB at a time.
     fn read_line(&self) -> Result[Option[Buffer!], Error] {
-        var { buf, start } = self;
+        var { source, ahead, start } = self;
+        let fd = &source.descriptor();
+        var buf = match ahead {
+            Some(buf) => buf,
+            None => Buffer!::with_capacity(65536usize),
+        };
         var line = Buffer!::new();
         while true {
             let n = &buf.len();
@@ -317,22 +379,23 @@ impl Input! {
             }
             line = unsafe Writer[Buffer!]::write_raw(line, unsafe offset(p, start), end - start);
             if end < n {
-                self = Input!.{ buf, start: end + 1usize };
+                self = Input!.{ source, ahead: Option::Some.(buf), start: end + 1usize };
                 return Result::Ok.(Option::Some.(line));
             }
             // Every byte read ahead is in `line`: read more into the room.
             start = 0usize;
             buf = buf.clear();
             let room = &buf.remaining_capacity();
-            // Standard input is the process's own, and this `Input!` holds it.
-            match unsafe read_into(0i32, &buf, room) {
+            // `fd` is standard input, which this `Input!` holds, or the
+            // descriptor of the file it owns.
+            match unsafe read_into(fd, &buf, room) {
                 Err(e) => {
-                    self = Input!.{ buf, start };
+                    self = Input!.{ source, ahead: Option::Some.(buf), start };
                     line.destroy();
                     return Result::Err.(e);
                 },
                 Ok(got) => if got == 0usize {
-                    self = Input!.{ buf, start };
+                    self = Input!.{ source, ahead: Option::Some.(buf), start };
                     if &line.len() > 0usize {
                         return Result::Ok.(Option::Some.(line));
                     }
@@ -341,111 +404,141 @@ impl Input! {
                 },
             }
         }
-        self = Input!.{ buf, start };
+        self = Input!.{ source, ahead: Option::Some.(buf), start };
         Result::Ok.(Option::Some.(line))
     }
 
-    /// The rest of standard input, read to its end, the bytes read ahead
-    /// first. A read error is returned, and what was read is lost with it.
-    fn read_to_end(&self) -> Result[Buffer!, Error] {
-        let { buf, start } = self;
-        let rest = rest_of(buf, start);
-        // Standard input is the process's own, and this `Input!` holds it.
-        let all = unsafe read_to_end_from(0i32, rest);
-        self = Input!.{ buf: Buffer!::with_capacity(65536usize), start: 0usize };
-        all
+    /// The rest of the input, read to its end, the bytes read ahead first,
+    /// and the reading ended: standard input is given back, for the next
+    /// `stdin`, and a file is closed. A file's is read into a buffer sized
+    /// up front by the file's size, so a regular file is read without
+    /// growing it; reading goes on to EOF whatever the size said, so a file
+    /// that grows or shrinks meanwhile is read as it is, and a pipe, device
+    /// or socket is read until it ends. A directory is EISDIR. A failure to
+    /// read, or else to close the file, is the error: a read error takes
+    /// precedence, and a failed close frees what was read.
+    fn read_to_end(self) -> Result[Buffer!, Error] {
+        var { source, ahead, start } = self;
+        let fd = &source.descriptor();
+        let all = match &source.room() {
+            Err(e) => {
+                match ahead {
+                    Some(buf) => buf.destroy(),
+                    None => (),
+                }
+                Result::Err.(e)
+            },
+            Ok(room) => {
+                let rest = match ahead {
+                    Some(buf) => rest_of(buf, start, room),
+                    None => Buffer!::with_capacity(room),
+                };
+                // `fd` is standard input, which this `Input!` holds, or the
+                // descriptor of the file it owns.
+                unsafe read_to_end_from(fd, rest)
+            },
+        };
+        match source.finish() {
+            Ok(nothing) => all,
+            Err(e) => match all {
+                Ok(read) => {
+                    read.destroy();
+                    Result::Err.(e)
+                },
+                Err(failed) => Result::Err.(failed),
+            },
+        }
     }
 
-    /// Gives standard input back, for the next `stdin`, `read_line` or
-    /// `read_all_stdin`: the bytes read ahead and not returned yet, which
-    /// the next reader of standard input does not see.
-    fn finish(self) -> Buffer! {
-        let { buf, start } = self;
-        unsafe kur_libc_stdin_release();
-        rest_of(buf, start)
+    /// Reads at most `max` bytes, appending them to `buf`: how many, which
+    /// is 0 at the end of the input (and for a `max` of 0). Bytes read ahead
+    /// come first, and while there are any, no more are read; else it is
+    /// one `read(2)`. Fewer than `max` is no sign of the end (a pipe gives
+    /// what it has); read until it returns 0. A failed read is the error,
+    /// with `buf` as it was.
+    fn read(&self, &buf: Buffer!, max: usize) -> Result[usize, Error] {
+        var { source, ahead, start } = self;
+        match ahead {
+            Some(held) => {
+                var held = held;
+                let n = &held.len();
+                if start < n {
+                    let count = if n - start < max { n - start } else { max };
+                    let p = unsafe &held.as_ptr();
+                    // `p[start..n)` are bytes `held` holds, and `count <= n - start`.
+                    buf = unsafe Writer[Buffer!]::write_raw(buf, unsafe offset(p, start), count);
+                    self = Input!.{ source, ahead: Option::Some.(held), start: start + count };
+                    return Result::Ok.(count);
+                }
+                ahead = Option::Some.(held);
+            },
+            None => {
+                ahead = Option::None;
+            },
+        }
+        let fd = &source.descriptor();
+        // `fd` is standard input, which this `Input!` holds, or the
+        // descriptor of the file it owns.
+        let got = unsafe read_into(fd, &buf, max);
+        self = Input!.{ source, ahead, start };
+        got
+    }
+
+    /// Reads `size` bytes, appending them to `buf`, again after each short
+    /// read: how many, which is fewer only at the end of the input. Bytes
+    /// read ahead come first. A failed read is the error, even when some
+    /// bytes were appended before it; they stay in `buf`.
+    fn read_exact(&self, &buf: Buffer!, size: usize) -> Result[usize, Error] {
+        var done = 0usize;
+        while done < size {
+            match &self.read(&buf, size - done) {
+                Ok(n) => if n == 0usize {
+                    return Result::Ok.(done);
+                } else {
+                    done = done + n;
+                },
+                Err(e) => return Result::Err.(e),
+            }
+        }
+        Result::Ok.(done)
+    }
+
+    /// Ends the reading: the bytes read ahead and not returned yet, which
+    /// no later reader sees. Standard input is given back, for the next
+    /// `stdin`; a file is closed, and a failed `close(2)` is the error, with
+    /// those bytes freed.
+    fn finish(self) -> Result[Buffer!, Error] {
+        let { source, ahead, start } = self;
+        let rest = match ahead {
+            Some(buf) => rest_of(buf, start, 0usize),
+            None => Buffer!::with_capacity(0usize),
+        };
+        match source.finish() {
+            Ok(nothing) => Result::Ok.(rest),
+            Err(e) => {
+                rest.destroy();
+                Result::Err.(e)
+            },
+        }
     }
 }
 
-/// `buf[start..)` in a buffer of its own; `buf` is freed.
-fn rest_of(buf: Buffer!, start: usize) -> Buffer! {
+/// `buf[start..)` in a buffer of its own, with room for `room` bytes more;
+/// `buf` is freed.
+fn rest_of(buf: Buffer!, start: usize, room: usize) -> Buffer! {
     var buf = buf;
     let n = &buf.len();
     let p = unsafe &buf.as_ptr();
     // `p[start..n)` are bytes `buf` holds, and `buf` is freed after the copy.
-    let rest = unsafe Writer[Buffer!]::write_raw(Buffer!::with_capacity(n - start), unsafe offset(p, start), n - start);
+    let rest = unsafe Writer[Buffer!]::write_raw(Buffer!::with_capacity(n - start + room), unsafe offset(p, start), n - start);
     buf.destroy();
     rest
 }
 
-/// All of standard input, read to its end: what `Input!::read_to_end`
-/// reads from a new `Input!`. Fails with EBUSY while an `Input!` holds
-/// standard input.
-fn read_all_stdin() -> Result[Buffer!, Error] {
-    match stdin() {
-        Err(e) => Result::Err.(e),
-        Ok(input) => {
-            var input = input;
-            let all = &input.read_to_end();
-            input.finish().destroy();
-            all
-        },
-    }
-}
-
-/// One line of stdin, without its newline: reads through the next newline
-/// or to the end of input. `None` at the end of input, when no byte is left
-/// to read; an empty line is `Some` of an empty buffer, and a last line
-/// with no newline is still a line.
-///
-/// It reads one byte at a time, a system call for each, so that nothing
-/// past the line is consumed: what follows is left for whatever reads
-/// standard input next, such as a program `std::process` starts. To read
-/// many lines, read them through an `Input!` (`stdin`), which reads ahead.
-/// Fails with EBUSY while an `Input!` holds standard input, since the line
-/// would skip the bytes it has read ahead.
-fn read_line() -> Result[Option[Buffer!], Error] {
-    let claimed = unsafe kur_libc_stdin_claim();
-    if claimed != 0i32 {
-        return Result::Err.(Error.{ errno: claimed });
-    }
-    let line = read_line_unbuffered();
-    unsafe kur_libc_stdin_release();
-    line
-}
-
-/// `read_line`, holding standard input.
-fn read_line_unbuffered() -> Result[Option[Buffer!], Error] {
-    var b = Buffer!::new();
-    var any = false;
-    while true {
-        b = b.reserve(1usize);
-        let dest = unsafe &b.tail_ptr();
-        let n = unsafe kur_libc_fs_read(0i32, dest, 1usize);
-        if n < 0isize {
-            b.destroy();
-            return Result::Err.(Error::of_return(n));
-        }
-        if n == 0isize {
-            if any {
-                return Result::Ok.(Option::Some.(b));
-            }
-            b.destroy();
-            return Result::Ok.(Option::None);
-        }
-        if unsafe *dest == b'\n' {
-            return Result::Ok.(Option::Some.(b));
-        }
-        // `read` returned 1, so it wrote `dest[0]`, inside the byte
-        // `reserve` made room for.
-        b = unsafe b.commit(1usize);
-        any = true;
-    }
-    Result::Ok.(Option::Some.(b))
-}
-
 // ----------------------------------------------------------- File! --
 // An owner of exactly one open descriptor, with one terminal operation,
-// `close`. `File!` is restricted so that a safe constructor never accepts
+// `close`, which `Input!::finish` and `Output!::finish` reach for a file
+// they own. `File!` is restricted so that a safe constructor never accepts
 // an arbitrary integer and later reads, writes or closes it: without that,
 // safe code could build `File! { fd: 3 }` over a descriptor it never opened
 // and close whatever the process holds at that number. A `File!` comes
@@ -455,12 +548,13 @@ fn read_line_unbuffered() -> Result[Option[Buffer!], Error] {
 //
 // Standard input, output and error stay bare `i32`s (0/1/2), never
 // `File!`: they are borrowed process handles this program did not open
-// and must not close. Only this module names them, in `Input!`,
-// `read_line`, and `stdout` and `stderr`, which make an `Output!`. A `File!`
+// and must not close. Only this module names them, in `stdin`, `stdout`
+// and `stderr`, which make an `Input!` or an `Output!` over one. A `File!`
 // never gets one of their numbers: the C `main` the compiler writes for an
 // executable opens /dev/null on each of the three the process started
 // without, before the program runs.
-/// Owns one open file descriptor. Call `close` to consume it.
+/// Owns one open file descriptor. Read it through `input`, write it
+/// through `output`, or call `close` to consume it.
 struct File! {
     fd: i32,
 }
@@ -541,38 +635,6 @@ impl File! {
         }
     }
 
-    /// Reads at most `max` bytes from the descriptor's offset, with one
-    /// `read(2)`, appending them to `buf`: how many, which is 0 at the end of
-    /// the file. Fewer than `max` is no sign of the end (a pipe gives what it
-    /// has); read in chunks until it returns 0. A failed read is the error,
-    /// with `buf` as it was.
-    fn read(&self, &buf: Buffer!, max: usize) -> Result[usize, Error] {
-        let { fd } = self;
-        // `fd` is the descriptor this `File!` owns.
-        let got = unsafe read_into(fd, &buf, max);
-        self = File!.{ fd };
-        got
-    }
-
-    /// Reads `size` bytes from the descriptor's offset, appending them to
-    /// `buf`, again after each short read: how many, which is fewer only at
-    /// the end of the file. A failed read is the error, even when some bytes
-    /// were appended before it; they stay in `buf`.
-    fn read_exact(&self, &buf: Buffer!, size: usize) -> Result[usize, Error] {
-        var done = 0usize;
-        while done < size {
-            match &self.read(&buf, size - done) {
-                Ok(n) => if n == 0usize {
-                    return Result::Ok.(done);
-                } else {
-                    done = done + n;
-                },
-                Err(e) => return Result::Err.(e),
-            }
-        }
-        Result::Ok.(done)
-    }
-
     /// The descriptor's number, for a C interface or another process (a
     /// `std::process::Stdio!::File` hands a child a copy). No safe function
     /// takes a number to read, write or close, so it grants nothing.
@@ -582,85 +644,16 @@ impl File! {
         fd
     }
 
-    /// Writes all of `bytes`, read under the capability `tag` lends.
-    forall 'k.
-    fn write_all(&self, &tag: Exclusive!['k], bytes: Slice[u8, 'k]) -> Result[(), Error] {
-        let { fd } = self;
-        let (ptr, len, marker) = bytes.into_parts();
-        let result = unsafe write_all(fd, ptr, len);
-        self = File!.{ fd };
-        result
+    /// A reader of the file from its offset, which owns it and closes it on
+    /// `read_to_end` or `finish`.
+    fn input(self) -> Input! {
+        Input!.{ source: Source!::File.(self), ahead: Option::None, start: 0usize }
     }
 
-    /// Writes all of a span's bytes, read under its domain's capability,
-    /// which `cx` lends.
-    forall 'k, C, R where Access[C -> 'k, R].
-    fn write_span(&self, &cx: C, bytes: Span['k]) -> Result[(), Error] {
-        let (tag, rest) = Access[C -> 'k, R]::open(cx);
-        let { fd } = self;
-        let (ptr, len) = bytes.into_parts();
-        let result = unsafe write_all(fd, ptr, len);
-        self = File!.{ fd };
-        cx = Access[C -> 'k, R]::close(tag, rest);
-        result
-    }
-
-    /// Writes all of a static byte slice.
-    fn write_static(&self, bytes: Slice[u8, 'static]) -> Result[(), Error] {
-        let { fd } = self;
-        let (ptr, len, marker) = bytes.into_parts();
-        let result = unsafe write_all(fd, ptr, len);
-        self = File!.{ fd };
-        result
-    }
-
-    /// Writes all of `buf`, then frees it.
-    fn write_buffer(&self, buf: Buffer!) -> Result[(), Error] {
-        var exists 'b. (tag, bytes, restore) = buf.open();
-        let result = &self.write_all(&tag, bytes);
-        restore.restore(tag).destroy();
-        result
-    }
-
-    /// Writes `ptr[0..len)`, for producers that hold a raw pointer and
-    /// length. Caller: the entire range is readable.
-    unsafe fn write_all_raw(&self, ptr: *u8, len: usize) -> Result[(), Error] {
-        let { fd } = self;
-        let result = unsafe write_all(fd, ptr, len);
-        self = File!.{ fd };
-        result
-    }
-
-    /// Reads from the descriptor's offset to EOF into a fresh `Buffer!`,
-    /// which grows as it fills (`read_to_buffer` sizes it up front for a
-    /// regular file). A read error is returned, not taken for the end. Does
-    /// not close `self`.
-    fn read_to_end(&self) -> Result[Buffer!, Error] {
-        let { fd } = self;
-        // `fd` is the descriptor this `File!` owns.
-        let b = unsafe read_to_end_from(fd, Buffer!::new());
-        self = File!.{ fd };
-        b
-    }
-
-    /// Reads from the descriptor's offset to EOF into a fresh `Buffer!`, as
-    /// `read_to_end` does, but sized up front for a regular file: by its
-    /// size, so it is read without growing the buffer. Reading goes on to EOF
-    /// whatever the size said, so a file that grows or shrinks meanwhile is
-    /// read as it is; a pipe, a device or a socket, whose size says nothing,
-    /// is read until it ends. A directory is EISDIR. Does not close `self`.
-    fn read_to_buffer(&self) -> Result[Buffer!, Error] {
-        let { fd } = self;
-        let hint = unsafe kur_libc_fs_size_hint(fd);
-        // `fd` is the descriptor this `File!` owns. The room past the size
-        // is for the read that finds the end, or a pipe's first reads.
-        let b = if hint < 0isize {
-            Result::Err.(Error::of_return(hint))
-        } else {
-            unsafe read_to_end_from(fd, Buffer!::with_capacity((hint as usize) + 4096usize))
-        };
-        self = File!.{ fd };
-        b
+    /// A buffered writer to the file at its offset, which owns it and
+    /// closes it on `finish`.
+    fn output(self) -> Output! {
+        Output!.{ sink: Sink!::File.(self), buf: Buffer!::new(), error: 0i32 }
     }
 }
 
@@ -674,51 +667,86 @@ impl File! {
 // after them. Its error is sticky: once a write fails, the
 // rest is dropped, and `finish` reports the first failure (`error` holds
 // its errno, 0 until then).
-/// Buffered output handle. Call `finish` to flush and consume it.
+
+/// Where an `Output!` writes: standard output or error, which it does not
+/// own and never closes, or a file it owns and closes on `finish`.
+enum Sink! {
+    // standard output (1) or standard error (2)
+    Stream(i32),
+    File(File!),
+}
+
+impl Sink! {
+    /// The descriptor written to.
+    fn descriptor(&self) -> i32 {
+        let (sink, fd) = match self {
+            Stream(fd) => (Sink!::Stream.(fd), fd),
+            File(f) => {
+                var f = f;
+                let fd = &f.descriptor();
+                (Sink!::File.(f), fd)
+            },
+        };
+        self = sink;
+        fd
+    }
+
+    /// Closes the file, reporting a failed `close(2)`; a stream stays open.
+    fn close(self) -> Result[(), Error] {
+        match self {
+            Stream(fd) => Result::Ok.(()),
+            File(f) => f.close(),
+        }
+    }
+}
+
+/// Buffered writer to standard output, standard error or a file. Call
+/// `finish` to flush it and close the file.
 struct Output! {
-    fd: i32,
+    sink: Sink!,
     buf: Buffer!,
     error: i32,
 }
 
 /// A buffered writer for standard output.
 fn stdout() -> Output! {
-    Output!.{ fd: 1i32, buf: Buffer!::new(), error: 0i32 }
+    Output!.{ sink: Sink!::Stream.(1i32), buf: Buffer!::new(), error: 0i32 }
 }
 
 /// A buffered writer for standard error.
 fn stderr() -> Output! {
-    Output!.{ fd: 2i32, buf: Buffer!::new(), error: 0i32 }
+    Output!.{ sink: Sink!::Stream.(2i32), buf: Buffer!::new(), error: 0i32 }
 }
 
 impl Output! {
     /// Writes what has gathered so far.
     fn flush(self) -> Output! {
-        var { fd, buf, error } = self;
+        var { sink, buf, error } = self;
         let n = &buf.len();
         if n == 0usize || error != 0i32 {
-            let unit = buf.destroy();
-            return Output!.{ fd, buf: Buffer!::new(), error };
+            return Output!.{ sink, buf: buf.clear(), error };
         }
+        let fd = &sink.descriptor();
         let p = unsafe &buf.as_ptr();
         // `p` addresses the `n` bytes `buf` holds, and `buf` outlives the
-        // write; `fd` is standard output or error, the only descriptors
-        // `stdout` and `stderr` make an `Output!` over.
+        // write; `fd` is standard output or error, or the descriptor of the
+        // file this `Output!` owns.
         let written = unsafe write_all(fd, p, n);
-        let unit = buf.destroy();
         let error = match written {
             Ok(nothing) => 0i32,
             Err(e) => e.errno,
         };
-        Output!.{ fd, buf: Buffer!::new(), error }
+        Output!.{ sink, buf: buf.clear(), error }
     }
 
-    /// Writes what is left and reports the first failure, if any.
+    /// Writes what is left, closes the file of one over a file, and reports
+    /// the first failure, if any: a failed write before a failed close.
     fn finish(self) -> Result[(), Error] {
-        let { fd, buf, error } = self.flush();
-        let unit = buf.destroy();
+        let { sink, buf, error } = self.flush();
+        buf.destroy();
+        let closed = sink.close();
         if error == 0i32 {
-            Result::Ok.(())
+            closed
         } else {
             Result::Err.(Error.{ errno: error })
         }
@@ -726,9 +754,9 @@ impl Output! {
 
     /// Writes what has gathered once it reaches 4 KiB.
     fn gathered(self) -> Output! {
-        var { fd, buf, error } = self;
+        var { sink, buf, error } = self;
         let n = &buf.len();
-        let out = Output!.{ fd, buf, error };
+        let out = Output!.{ sink, buf, error };
         if n >= 4096usize { out.flush() } else { out }
     }
 }
@@ -736,31 +764,32 @@ impl Output! {
 /// Output as a writer: bytes gather and are written 4 KiB at a time.
 instance Writer[Output!] {
     fn write_byte(self: Output!, byte: u8) -> Output! {
-        let { fd, buf, error } = self;
-        Output!.{ fd, buf: buf.write_byte(byte), error }.gathered()
+        let { sink, buf, error } = self;
+        Output!.{ sink, buf: buf.write_byte(byte), error }.gathered()
     }
     fn write_static(self: Output!, bytes: Slice[u8, 'static]) -> Output! {
-        let { fd, buf, error } = self;
-        Output!.{ fd, buf: buf.write_static(bytes), error }.gathered()
+        let { sink, buf, error } = self;
+        Output!.{ sink, buf: buf.write_static(bytes), error }.gathered()
     }
     /// Caller: `ptr[0..len)` is readable for the whole call
     /// (`Writer::write_raw`).
     unsafe fn write_raw(self: Output!, ptr: *u8, len: usize) -> Output! {
         if len < 4096usize {
-            let { fd, buf, error } = self;
-            return Output!.{ fd, buf: unsafe Writer[Buffer!]::write_raw(buf, ptr, len), error }.gathered();
+            let { sink, buf, error } = self;
+            return Output!.{ sink, buf: unsafe Writer[Buffer!]::write_raw(buf, ptr, len), error }.gathered();
         }
         // 4 KiB or more is written where it lies, after what has gathered,
         // rather than copied: `print` of a whole buffer.
-        let { fd, buf, error } = self.flush();
+        var { sink, buf, error } = self.flush();
         if error != 0i32 {
-            return Output!.{ fd, buf, error };
+            return Output!.{ sink, buf, error };
         }
-        // `fd` is standard output or error, as for `flush`.
+        let fd = &sink.descriptor();
+        // `fd` is standard output or error, or the file's, as for `flush`.
         let error = match unsafe write_all(fd, ptr, len) {
             Ok(nothing) => 0i32,
             Err(e) => e.errno,
         };
-        Output!.{ fd, buf, error }
+        Output!.{ sink, buf, error }
     }
 }

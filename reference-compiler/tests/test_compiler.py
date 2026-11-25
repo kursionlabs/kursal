@@ -65,6 +65,7 @@ from kursal.sigs import ConstValue, Sig, Signatures, signatures
 from tests.infer_cases import INFER_ERRORS, INFERENCES
 from tests.lower_cases import LOWER_ERRORS
 from tests.test_kurs import CANONICAL, VARIANTS, packages
+from tests.test_std_runtime import IO_PROGRAMS
 
 ROOT = Path(__file__).resolve().parents[2]
 COMPILER = ROOT / "compiler"
@@ -2381,6 +2382,20 @@ class CompilerTests(unittest.TestCase):
                                     env=dict(os.environ, KURSAL_LIB=str(LIB)))
         self.assertEqual((result.returncode, result.stderr), (1, "cannot write the output\n"))
 
+    def test_io_programs_run(self):
+        """The programs of tests/test_std_runtime.py that read and write files and standard input through
+        `Input!` and `Output!`: built by this compiler, each prints what it prints when the reference builds
+        it, and exits 0."""
+        for name, (source, stdin, stdout) in IO_PROGRAMS.items():
+            with self.subTest(program=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "kur.toml").write_text(manifest("app", entry="main") + f'[dependencies.std]\npath="{LIB / "std"}"\n')
+                (root / "lib.kur").write_text(source)
+                built = self.run_compiler("build", str(root), "-o", str(root / "app"))
+                self.assertEqual(built.returncode, 0, built.stderr)
+                ran = subprocess.run([str(root / "app")], input=stdin, capture_output=True, text=True, timeout=60, cwd=root)
+                self.assertEqual((ran.stdout, ran.returncode), (stdout, 0), ran.stderr[:500])
+
     def test_a_package_without_an_entry_is_not_built(self):
         """`kursal build` and tools/build.py of a library: status 1 and a message, no traceback."""
         with tempfile.TemporaryDirectory() as directory:
@@ -2608,7 +2623,8 @@ class CompilerTests(unittest.TestCase):
         self.assertEqual(len({(r["p"], r["k"]) for r in index}), len(index))
         found = {r["p"]: r["u"] for r in index}
         self.assertEqual(found["std::cmp::Ord"], "/std/cmp/trait.Ord.html")
-        self.assertEqual(found["std::io::read_line"], "/std/io/#fn.read_line")
+        self.assertEqual(found["std::io::print"], "/std/io/#fn.print")
+        self.assertEqual(found["std::io::Input!::read_line"], "/std/io/struct.Input~.html#method.read_line")
         self.assertEqual(found["std::collections::vec::Vec!"], "/std/collections/vec/struct.Vec~.html")
         self.assertNotIn("core::cmp::Ord", found)
 
@@ -2648,8 +2664,9 @@ class CompilerTests(unittest.TestCase):
             self.skipTest("node is not on the PATH; install Node.js to check the search ranking")
         records = [("module", "std::buffer"), ("struct", "std::buffer::Buffer!"),
                    ("struct", "std::buffer::BufferRestore!"), ("method", "std::buffer::Buffer!::new"),
-                   ("fn", "std::io::write_buffer"), ("fn", "std::io::read_line"), ("fn", "std::io::read_exact"),
-                   ("method", "std::io::File!::read_exact"), ("module", "std::io"), ("module", "std::fs"),
+                   ("fn", "std::fmt::to_buffer"), ("method", "std::io::Input!::read_line"), ("fn", "std::io::read_into"),
+                   ("fn", "std::io::read_to_end_from"), ("method", "std::io::Input!::read_exact"), ("module", "std::io"),
+                   ("module", "std::fs"),
                    ("fn", "std::fs::read"), ("trait", "std::cmp::Ord"), ("instance", "std::cmp::Ord[u8, u8]"),
                    ("method", "std::cmp::Ord::cmp"), ("enum", "std::cmp::Order"), ("module", "std::collections::vec"),
                    ("struct", "std::collections::vec::Vec!"), ("struct", "std::collections::vec::VecIter!"),
@@ -2664,14 +2681,14 @@ class CompilerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         ranked = dict(zip(queries, json.loads(result.stdout)))
         buffer = ["std::buffer::Buffer!", "std::buffer", "std::buffer::BufferRestore!",
-                  "std::buffer::Buffer!::new", "std::io::write_buffer"]
+                  "std::buffer::Buffer!::new", "std::fmt::to_buffer"]
         self.assertEqual(ranked["Buffer"], buffer)
         self.assertEqual(ranked["Buffer!"], buffer)
         self.assertEqual(ranked["buffer"][:3], ["std::buffer", "std::buffer::Buffer!",
                                                 "std::buffer::BufferRestore!"])
-        self.assertEqual(ranked["read_line"], ["std::io::read_line"])
+        self.assertEqual(ranked["read_line"], ["std::io::Input!::read_line"])
         self.assertEqual(ranked["Ord"], ["std::cmp::Ord", "std::cmp::Order", "std::cmp::Ord[u8, u8]", "std::cmp::Ord::cmp"])
-        self.assertEqual(ranked["io::read"], ["std::io::read_line", "std::io::read_exact"])
+        self.assertEqual(ranked["io::read"], ["std::io::read_into", "std::io::read_to_end_from"])
         self.assertEqual(ranked["std::fs"], ["std::fs", "std::fs::read"])
         self.assertEqual(ranked["vec"][:3], ["std::collections::vec", "std::collections::vec::Vec!",
                                              "std::collections::vec::VecIter!"])

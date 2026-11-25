@@ -21,7 +21,7 @@ static int hash_seed_drawn;
  * compiler writes for `kursal build` calls it before anything else. Each of
  * the standard descriptors 0, 1 and 2 the process started without is opened
  * on /dev/null, so no file the program opens later takes its number and
- * receives what `print`, `eprint` or `read_line` mean for the standard
+ * receives what `print`, `eprint` or `stdin` mean for the standard
  * streams; the process aborts when one cannot be opened. SIGPIPE is ignored,
  * so a write to a closed pipe fails with EPIPE, which the output functions
  * return, instead of ending the process (`kur_libc_process_spawn` gives
