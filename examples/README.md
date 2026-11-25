@@ -52,6 +52,7 @@ then `greet`, then `linear`, which declares a linear type of its own and consume
 | `wc`, `wordfreq` | command-line tools: line, word and byte counts of files; word frequencies of stdin |
 | `graph` | a cyclic graph in one arena, read and written through one capability, with no `unsafe` |
 | `thread_sum` | two OS threads, each given ownership of its own buffer |
+| `shared_readers`, with `bad/resume_while_reading.kur`, `bad/spawn_with_block_brand.kur`, `bad/free_while_reading.kur`, `bad/lend_after_spawn.kur`, `bad/unjoined_thread.kur` | two OS threads reading one buffer at once through shared leaves of its capability, then the writer coming back, and the programs that get it wrong |
 | `config` | a TOML configuration read with the `toml` package, with defaults and its errors reported |
 | `shop`, `stock` | a program and the library it depends on, which keeps its type's representation to itself |
 | `consts` | module constants and associated constants |

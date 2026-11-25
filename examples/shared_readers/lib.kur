@@ -1,0 +1,71 @@
+// Two OS threads read one buffer at the same time, then the writer comes
+// back.
+//
+// The buffer's `Exclusive!` is traded for the root of a tree of shared
+// readers (`share`), and the root is split into two leaves (`split`). Each
+// leaf moves into its own thread with a view of the bytes, reads its half
+// under that leaf, and comes back through `join`. The receipt `split` kept
+// back joins the two leaves into the root again, and the receipt `share`
+// kept back turns the root into the `Exclusive!`, which closes the buffer.
+// Every token is linear, so the writer cannot come back while a leaf is
+// still in a thread: the receipts accept only the very leaves their own
+// split made (see `bad/resume_while_reading.kur`).
+//
+// A closure cannot mention a brand its block opened, so the leaves, whose
+// lineages `split` opens, are sent by `reader`, which is generic over them
+// (see `bad/spawn_with_block_brand.kur`).
+
+use std::buffer::Buffer!;
+use std::fmt::Writer;
+use std::io::print;
+use std::option::Result;
+use std::slice::{Slice, byte_or_zero};
+use std::cap::{Exclusive!, Shared!};
+use std::process::trap;
+use std::thread;
+use std::thread::Thread!;
+
+// The sum of `bytes[from..to)`, read under a shared leaf, and the leaf.
+forall 'r, 'a.
+fn sum(leaf: Shared!['r, 'a], bytes: Slice[u8, 'r], from: usize, to: usize) -> (Shared!['r, 'a], u32) {
+    var leaf = leaf;
+    var total = 0u32;
+    var i = from;
+    while i < to {
+        total = total + (byte_or_zero(&leaf, bytes, i) as u32);
+        i = i + 1;
+    }
+    (leaf, total)
+}
+
+// A thread summing `bytes[from..to)`: the leaf moves in, and `join` gives it
+// back with the sum. A thread that cannot start ends the program.
+forall 'r, 'a.
+fn reader(leaf: Shared!['r, 'a], bytes: Slice[u8, 'r], from: usize, to: usize) -> Thread![(Shared!['r, 'a], u32)] {
+    match thread::spawn(|| -> (Shared!['r, 'a], u32) { sum(leaf, bytes, from, to) }) {
+        Ok(t) => t,
+        Err(failed) => trap(),
+    }
+}
+
+// The sum of `bytes`, its two halves read by two threads at once.
+forall 'r.
+fn parallel_sum(tag: Exclusive!['r], bytes: Slice[u8, 'r]) -> (Exclusive!['r], u32) {
+    let n = bytes.len();
+    let exists 'q. (root, resume) = tag.share();
+    let exists 'a, 'b. (left, right, receipt) = root.split();
+    let first = reader(left, bytes, 0usize, n / 2);
+    let second = reader(right, bytes, n / 2, n);
+    let (left, x) = match first.join() { Ok(v) => v, Err(e) => trap() };
+    let (right, y) = match second.join() { Ok(v) => v, Err(e) => trap() };
+    let root = receipt.join(left, right);
+    (resume.resume(root), x + y)
+}
+
+fn main() {
+    let buf = Buffer!::new().put("hello, world");
+    var exists 'b. (tag, bytes, restore) = buf.open();
+    let (tag, total) = parallel_sum(tag, bytes);
+    restore.restore(tag).destroy();
+    print(f"{total}\n");
+}
