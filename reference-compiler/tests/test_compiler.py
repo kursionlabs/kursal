@@ -1142,7 +1142,7 @@ RESOLVED: tuple[tuple[dict[str, str], str], ...] = (
 # Packages of one module, without dependencies, for signatures: sources the reference accepts, and
 # sources it rejects at the signature stage.
 SIGNATURES = (
-    "use std::slice::Slice;\nconst T: Slice[u8, 'static] = \"te\\\"xt\\n\";\n",
+    "use std::str::Str;\nconst T: Str['static] = \"te\\\"xt\\n\";\n",
     "const A: u8 = 200u8 + 100u8;\nconst B: i8 = -128;\nconst C: i8 = -B;\nconst D: i32 = -7 / 2;\n"
     "const E: i32 = -7 % 2;\nconst F: i64 = -9223372036854775808 / -1;\nconst G: u64 = 18446744073709551615 * 3;\n"
     "const H: i16 = -1 >> 3;\nconst I: u32 = 1 << 35;\nconst J: i32 = 1i32 << -1i32;\nconst K: bool = -1i32 < 1i32;\n"
@@ -1211,7 +1211,7 @@ SIGNATURE_ERRORS = (
     "struct S { a: [u8; -1i32] }\n",
     "struct S { a: [u8; 0] }\n",
     "const N: u64 = 2u64 - 2u64;\nstruct S { a: [[u8; 3]; N] }\n",
-    "use std::slice::Slice;\nconst T: u32 = \"text\";\n",
+    "use std::str::Str;\nconst T: u32 = \"text\";\n",
     "const N: i64 = 0i64 - 2i64;\nstruct S { a: [u8; N] }\n",
     "const U: usize = 3;\nstruct S { a: [u8; 2 * U] }\n",
     "const U: usize = 1usize / 0usize;\n",

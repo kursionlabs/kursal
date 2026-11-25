@@ -61,14 +61,14 @@ VISIBILITY_ERRORS = (
 )
 
 # What a case that writes an f-string through a domain's context imports: its first three lines.
-CONTEXT = "use std::arena::Domain!;\nuse std::buffer::Buffer!;\nuse std::raw::Span;\n"
+CONTEXT = "use std::arena::Domain!;\nuse std::buffer::Buffer!;\nuse std::str::Str;\n"
 
 INFERENCES = (
-    # `f"...".write(&cx, out)` reads each `{span}` through the context lent from a var's place.
-    CONTEXT + "forall 'k. fn f(&cx: Domain!['k], s: Span['k], n: u32) -> Buffer! { f\"{s}: {n}\".write(&cx, Buffer!::new()) }\n"
-    "fn g() -> u32 { var exists 'k. cx = Domain!::new(std::process::hash_seed()); let s = Span::from_static(&cx, \"x\");\n"
+    # `f"...".write(&cx, out)` reads each `{text}` through the context lent from a var's place.
+    CONTEXT + "forall 'k. fn f(&cx: Domain!['k], s: Str['k], n: u32) -> Buffer! { f\"{s}: {n}\".write(&cx, Buffer!::new()) }\n"
+    "fn g() -> u32 { var exists 'k. cx = Domain!::new(std::process::hash_seed()); let s = Str::from_static(&cx, \"x\");\n"
     "    let b = f\"{s}{s}\".write(&cx, f\"[{s}]\".write(&cx, Buffer!::new())); b.destroy(); cx.destroy(); 0u32 }\n"
-    "forall 'k. fn h(&p: (u32, Domain!['k]), n: u32, s: Span['k]) -> Buffer! { f\"{n} {s} {\"static\"}\".write(&p.1, Buffer!::new()) }\n",
+    "forall 'k. fn h(&p: (u32, Domain!['k]), n: u32, s: Str['k]) -> Buffer! { f\"{n} {s} {\"static\"}\".write(&p.1, Buffer!::new()) }\n",
     # A type alias stands for its body in a body's annotations, casts and type arguments too.
     "forall T. type Pair = (T, T);\nforall T. fn id(x: T) -> T { x }\n"
     "fn g(p: Pair[u32]) -> u64 { let q: Pair[u32] = p; let r = q.0 as u64; let n = core::mem::sizeof[Pair[u8]]();\n"
@@ -101,7 +101,7 @@ INFERENCES = (
     "fn main() -> i32 {\n                let exists 'a. witness = core::cap::fresh();\n                let f = || core::mem::sizeof[(u32, core::cap::Brand['a])]();\n                (f() as i32)\n            }",
     'const A: u8 = (-1i32 as u8);\n            const B: i8 = (255u32 as i8);\n            const C: u64 = (-1i8 as u64);\n            fn main() -> i32 {\n                let a = -1i32; let b = 255u32; let c = -1i8;\n                if (a as u8) == A && (b as i8) == B && (c as u64) == C { 7i32 } else { 1i32 }\n            }',
     'const X: bool = (1u8 << 9) == 2u8;\n            const Y: bool = (-8i16 >> 1) == -4i16;\n            const Z: bool = (1u8 << 9) == (2u8 << 0);\n            fn main() -> i32 { if X && Y && Z { 7i32 } else { 1i32 } }\n            ',
-    'use std::slice::Slice;\n            const GREETING: Slice[u8, \'static] = "hello";\n            fn main() -> i32 {\n                const LOCAL: Slice[u8, \'static] = "hi";\n                (GREETING.len() + LOCAL.len()) as i32\n            }',
+    'use std::str::Str;\n            const GREETING: Str[\'static] = "hello";\n            fn main() -> i32 {\n                const LOCAL: Str[\'static] = "hi";\n                (GREETING.len() + LOCAL.len()) as i32\n            }',
     "forall 'k, T. exposed struct Tagged { witness: core::cap::Brand['k], value: T }\n                    fn main() -> i32 {\n                        let exists 'a. witness = core::cap::fresh();\n                        let tagged = Tagged['a].{ witness, value: 7u32 };\n                        tagged.value as i32\n                    }",
     'forall T, U. exposed struct S { first: T, second: U }\n    forall T, U. exposed tuple Pair(T, U);\n    forall T, U. exposed enum E { Item(T, U), Empty }\n    exposed struct Plain { n: u32 }\n    exposed tuple Single(u32);\n    exposed enum Flag { On }\nfn main() -> i32 {\n                    let s = S.{ first: 3u32, second: 4u32 };\n                    let (a, b) = Pair.(s.first, s.second);\n                    match E::Item.(a, b) {\n                        E::Item(x, y) => (x + y) as i32, E::Empty => 0i32\n                    }\n                }',
     'forall T, U. exposed struct S { first: T, second: U }\n    forall T, U. exposed tuple Pair(T, U);\n    forall T, U. exposed enum E { Item(T, U), Empty }\n    exposed struct Plain { n: u32 }\n    exposed tuple Single(u32);\n    exposed enum Flag { On }\nfn main() -> i32 {\n                    let s = S[u32, u32].{ first: 3u32, second: 4u32 };\n                    let (a, b) = Pair[u32, u32].(s.first, s.second);\n                    match E[u32, u32]::Item.(a, b) {\n                        E::Item(x, y) => (x + y) as i32, E::Empty => 0i32\n                    }\n                }',
@@ -214,6 +214,12 @@ INFERENCES = (
     "forall U where Sized[U]. fn forward(x: U) -> U { need[U](x) }\n"
     "forall U, V where Sized[(U, V)]. fn pair(x: (U, V)) -> (U, V) { need(x) }\n"
     "forall U. fn leaf(x: (U, u8)) -> (U, u8) { need(x) }\n",
+    # A literal is text, `Str['static]`; a byte slice is seen as text of its domain by `as_str`; a
+    # `Str['static]` in an f-string is written as the literal text around it is.
+    "use std::buffer::Buffer!;\nuse std::slice::Slice;\nuse std::str::Str;\n"
+    "forall 'k. fn view(bytes: Slice[u8, 'k]) -> Str['k] { bytes.as_str() }\n"
+    "fn literal() -> Str['static] { let s: Str['static] = \"lit\"; s }\n"
+    "fn hello(name: Str['static]) -> Buffer! { var lent = name; f\"hello, {name}{&lent}{\"!\"}\" }\n",
     # A var binds what a let binds, and each name it binds is a var.
     "exposed struct C { n: u32 }\nimpl C { fn tick(&self) -> u32 { self.n } }\n"
     "fn f(p: (C, u32)) -> u32 { var (c, k) = p; k = &c.tick(); var [x, y] = [1u32, 2u32]; y = x; k + y }\n",
@@ -221,17 +227,17 @@ INFERENCES = (
 
 INFER_ERRORS = (
     # `f"...".write(&cx, out)` lends a var's place, which no `{x}` of the f-string uses while it is lent.
-    (CONTEXT + "forall 'k. fn f(&cx: Domain!['k], s: Span['k]) -> Buffer! {\n"
-     "    f\"{s} {Span::from_static(&cx, \"t\")}\".write(&cx, Buffer!::new())\n}\n",
-     "5:31: cx is lent to this f-string; it cannot be used inside it"),
+    (CONTEXT + "forall 'k. fn f(&cx: Domain!['k], s: Str['k]) -> Buffer! {\n"
+     "    f\"{s} {Str::from_static(&cx, \"t\")}\".write(&cx, Buffer!::new())\n}\n",
+     "5:30: cx is lent to this f-string; it cannot be used inside it"),
     # The whole local is lent, though only a field is the place.
-    (CONTEXT + "forall 'k. fn f(&p: (u32, Domain!['k]), s: Span['k]) -> Buffer! {\n"
+    (CONTEXT + "forall 'k. fn f(&p: (u32, Domain!['k]), s: Str['k]) -> Buffer! {\n"
      "    f\"{s} {p.0}\".write(&p.1, Buffer!::new())\n}\n",
      "5:12: p is lent to this f-string; it cannot be used inside it"),
-    (CONTEXT + "forall 'k. fn f(cx: Domain!['k], s: Span['k]) -> (Buffer!, Domain!['k]) {\n"
+    (CONTEXT + "forall 'k. fn f(cx: Domain!['k], s: Str['k]) -> (Buffer!, Domain!['k]) {\n"
      "    (f\"{s}\".write(&cx, Buffer!::new()), cx)\n}\n",
      "5:20: cx is not a var; a lent place must be a var"),
-    (CONTEXT + "forall 'k. fn f(&cx: Domain!['k], s: Span['k]) -> Buffer! {\n"
+    (CONTEXT + "forall 'k. fn f(&cx: Domain!['k], s: Str['k]) -> Buffer! {\n"
      "    f\"{s}\".write(cx, Buffer!::new())\n}\n",
      "5:18: write lends its context first: .write(&cx, out)"),
     # A label's scrutinee whose type is not known yet is reported at the match; one whose type is solved is
@@ -273,9 +279,19 @@ INFER_ERRORS = (
     ('fn f() -> u32 { let p = core::mem::alloca(); 0u32 }\n', 'alloca takes 1 type argument'),
     ('use std::buffer::Buffer!;\nfn f() -> u32 { let b = f"x".write(); 0u32 }\n', 'write takes the writer, or a lent context and the writer'),
     ('use std::buffer::Buffer!;\nfn f(x: *u8) -> Buffer! { f"x = {x}" }\n', '2:34: no instance of Format[*u8, Buffer!]'),
-    ("use std::buffer::Buffer!;\nuse std::raw::Span;\nfn f(s: Span['static]) -> Buffer! { var s = s; f\"{&s}\".write(Buffer!::new()) }\n",
-     "3:51: no instance of Format[Span['static], Buffer!]"),
+    # Branded text is read through a context, which `.write(out)` does not lend.
+    ("use std::buffer::Buffer!;\nuse std::str::Str;\nforall 'k. fn f(s: Str['k]) -> Buffer! { f\"{s}\".write(Buffer!::new()) }\n",
+     "3:45: no instance of Format[Str['k], Buffer!]"),
     ('use std::buffer::Buffer!;\nforall T. fn f(x: T) -> Buffer! { f"{x}" }\n', 'no instance of Format[T, Buffer!]'),
+    # A literal is read-only text, not a byte slice: nothing writes through a `Str`, which hands out no `Ref`,
+    # is no `Slice`, and is built only by its own module.
+    ("use std::slice::Slice;\nfn f() -> Slice[u8, 'static] { \"x\" }\n", "2:30: type mismatch: Str['static] and Slice[u8, 'static]"),
+    ("use std::str::Str;\nforall 'k. fn f(s: Str['k]) -> u8 { match s.get_ref(0usize) { Some(r) => 0u8, None => 1u8 } }\n",
+     "2:43: Str['k] has no method get_ref"),
+    ("use std::str::Str;\nuse std::slice::Slice;\nforall 'k. fn f(s: Str['k]) -> Slice[u8, 'k] { s }\n",
+     "3:46: type mismatch: Str['k] and Slice[u8, 'k]"),
+    ("use std::str::Str;\nfn f() -> Str['static] { Str.{ ptr: unsafe (0usize as *u8), len: 0usize, marker: std::cap::static_brand() } }\n",
+     "2:26: the shape of core::str::Str is not exposed here"),
     ('exposed struct C { n: u32 }\nimpl C { fn get(self) -> u32 { 0u32 } }\nfn f(c: C) -> u32 { var d = c; &d.get() }\n', 'takes its receiver by value'),
     ('trait A { fn go(x: Self) -> u32; }\ntrait B { fn go(x: Self) -> u32; }\nfn f(x: u8) -> u32 { x.go() }\n', 'has several methods named go'),
     ('fn f(p: *u32) -> u32 { unsafe p.store() }\n', 'store takes 1 argument'),

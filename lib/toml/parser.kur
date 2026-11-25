@@ -5,7 +5,7 @@
 // the first error with the byte it was found at. It reads a document one
 // statement at a time, as Python's `tomllib` does, and reports each error
 // where `tomllib` does: a definition that conflicts with an earlier one at
-// the end of the statement making it. Strings without escapes are spans of
+// the end of the statement making it. Strings without escapes are text of
 // `src`; everything else is allocated in `src`'s arena.
 //
 // What a key path may still become is kept apart from the values, in a tree
@@ -37,8 +37,8 @@ use std::collections::arena_vec::ArenaVec;
 use std::float::parse_f64;
 use std::mem::Ref;
 use std::option::{Option, Result};
-use std::raw::Span;
-use std::slice::{ReadBytes, Slice};
+use std::str::Str;
+use std::slice::ReadBytes;
 use std::utf8::{decode, encode};
 
 /// The flag of a key path that a header or a dotted key defined (see
@@ -56,15 +56,15 @@ const MAX_DEPTH: usize = 128usize;
 forall 'k.
 struct FlagNode {
     bits: Ref[u32, 'k],
-    nested: ArenaMap[Span['k], FlagNode['k], 'k],
+    nested: ArenaMap[Str['k], FlagNode['k], 'k],
 }
 
 /// A key path: the first `count` parts of `key` after all of `header`, so
 /// that a statement's paths share the header and the key it read.
 forall 'k.
 struct KeyPath {
-    header: ArenaVec[Span['k], 'k],
-    key: ArenaVec[Span['k], 'k],
+    header: ArenaVec[Str['k], 'k],
+    key: ArenaVec[Str['k], 'k],
     count: usize,
 }
 
@@ -73,13 +73,13 @@ struct KeyPath {
 /// use.
 forall 'k.
 struct Parser {
-    src: Span['k],
+    src: Str['k],
     len: usize,
     error: Ref[Option[TomlError], 'k],
     // the header of the current section; empty before the first
-    header: Ref[ArenaVec[Span['k], 'k], 'k],
-    empty: ArenaVec[Span['k], 'k],
-    root: ArenaMap[Span['k], TomlValue['k], 'k],
+    header: Ref[ArenaVec[Str['k], 'k], 'k],
+    empty: ArenaVec[Str['k], 'k],
+    root: ArenaMap[Str['k], TomlValue['k], 'k],
     flags: FlagNode['k],
     // dotted keys' tables, explicit from the next header on
     pending: ArenaVec[KeyPath['k], 'k],
@@ -131,7 +131,7 @@ fn days_in_month(year: u32, month: u32) -> u32 {
 
 /// A flag node with no flags and nothing under it. Used by the parser; not
 /// meant for direct use.
-forall 'k, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+forall 'k, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
 fn new_flags(&cx: C) -> FlagNode['k] {
     FlagNode.{ bits: ref_in(&cx, 0u32), nested: ArenaMap::new(&cx) }
 }
@@ -146,7 +146,7 @@ impl KeyPath['k] {
 
     /// Part `i` of the path, which is below its `len`.
     forall C, R where Access[C -> 'k, R].
-    fn part(self, &cx: C, i: usize) -> Span['k] {
+    fn part(self, &cx: C, i: usize) -> Str['k] {
         let h = self.header.len(&cx);
         if i < h { self.header.at(&cx, i) } else { self.key.at(&cx, i - h) }
     }
@@ -154,7 +154,7 @@ impl KeyPath['k] {
 
 /// Whether `path` has the flag `bit`: explicit at the path itself, frozen at
 /// the path or any table above it.
-forall 'k, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+forall 'k, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
 fn has_flag(&cx: C, root: FlagNode['k], path: KeyPath['k], bit: u32) -> bool {
     let n = path.len(&cx);
     if n == 0usize {
@@ -180,7 +180,7 @@ fn has_flag(&cx: C, root: FlagNode['k], path: KeyPath['k], bit: u32) -> bool {
 
 /// Sets `bit` on `path`'s node under `root`, making the nodes on the way.
 /// Used by the parser; not meant for direct use.
-forall 'k, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+forall 'k, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
 fn set_flag(&cx: C, root: FlagNode['k], path: KeyPath['k], bit: u32) {
     let n = path.len(&cx);
     var node = root;
@@ -201,7 +201,7 @@ fn set_flag(&cx: C, root: FlagNode['k], path: KeyPath['k], bit: u32) {
 }
 
 /// Forgets every flag at `path` and under it.
-forall 'k, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+forall 'k, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
 fn unset_all(&cx: C, root: FlagNode['k], path: KeyPath['k]) {
     let n = path.len(&cx);
     var node = root;
@@ -221,8 +221,8 @@ fn unset_all(&cx: C, root: FlagNode['k], path: KeyPath['k]) {
 /// The table `path` names under `table`, made where missing; through an array
 /// (of tables) when `arrays`, its last element. `None` when a part is
 /// another value.
-forall 'k, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
-fn nest(&cx: C, table: ArenaMap[Span['k], TomlValue['k], 'k], path: KeyPath['k], arrays: bool) -> Option[ArenaMap[Span['k], TomlValue['k], 'k]] {
+forall 'k, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
+fn nest(&cx: C, table: ArenaMap[Str['k], TomlValue['k], 'k], path: KeyPath['k], arrays: bool) -> Option[ArenaMap[Str['k], TomlValue['k], 'k]] {
     let n = path.len(&cx);
     var t = table;
     var i = 0usize;
@@ -231,7 +231,7 @@ fn nest(&cx: C, table: ArenaMap[Span['k], TomlValue['k], 'k], path: KeyPath['k],
         var value = match t.get(&cx, part) {
             Some(v) => v,
             None => {
-                let made: ArenaMap[Span['k], TomlValue['k], 'k] = ArenaMap::new(&cx);
+                let made: ArenaMap[Str['k], TomlValue['k], 'k] = ArenaMap::new(&cx);
                 t.insert(&cx, part, TomlValue::Table.(made));
                 TomlValue::Table.(made)
             },
@@ -263,27 +263,27 @@ fn nest(&cx: C, table: ArenaMap[Span['k], TomlValue['k], 'k], path: KeyPath['k],
 forall 'k.
 impl Parser['k] {
     /// Byte `i` of the document, or 0 past its end.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
     fn byte(self, &cx: C, i: usize) -> u8 {
         self.src.byte_or_zero(&cx, i)
     }
 
     /// Records the first error; later ones are what it caused.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
-    fn fail(self, &cx: C, at: usize, message: Slice[u8, 'static]) {
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
+    fn fail(self, &cx: C, at: usize, message: Str['static]) {
         if self.error.copy(&cx).is_none() {
             self.error.set(&cx, Option::Some.(TomlError.{ offset: at, message }));
         }
     }
 
     /// Whether an error has been recorded.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
     fn failed(self, &cx: C) -> bool {
         self.error.copy(&cx).is_some()
     }
 
     /// The length of the newline at `i`, `\n` or `\r\n`; 0 for anything else.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
     fn newline(self, &cx: C, i: usize) -> usize {
         let b = self.byte(&cx, i);
         if b == b'\n' {
@@ -296,7 +296,7 @@ impl Parser['k] {
     }
 
     /// Spaces and tabs.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
     fn skip_space(self, &cx: C, pos: usize) -> usize {
         var i = pos;
         while i < self.len && (self.byte(&cx, i) == b' ' || self.byte(&cx, i) == b'\t') {
@@ -306,7 +306,7 @@ impl Parser['k] {
     }
 
     /// Spaces, tabs and newlines.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
     fn skip_space_and_newlines(self, &cx: C, pos: usize) -> usize {
         var i = pos;
         var going = true;
@@ -327,7 +327,7 @@ impl Parser['k] {
     }
 
     /// A comment at `pos`, up to the newline that ends it, which is left.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
     fn skip_comment(self, &cx: C, pos: usize) -> usize {
         if self.byte(&cx, pos) != b'#' {
             return pos;
@@ -350,7 +350,7 @@ impl Parser['k] {
 
     /// Spaces, tabs, newlines and comments, as an array may hold between its
     /// values.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
     fn skip_comments_and_array_space(self, &cx: C, pos: usize) -> usize {
         var i = pos;
         var going = true;
@@ -366,8 +366,8 @@ impl Parser['k] {
     // ------------------------------------------------------------ strings --
 
     /// A literal string's text, from after its opening quote.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
-    fn literal_string(self, &cx: C, pos: usize) -> (usize, Span['k]) {
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
+    fn literal_string(self, &cx: C, pos: usize) -> (usize, Str['k]) {
         let start = pos + 1usize;
         let end = match self.src.find_byte(&cx, b'\'', start) {
             Some(e) => e,
@@ -390,8 +390,8 @@ impl Parser['k] {
     /// A basic string's text, from after its opening quote (or quotes), with
     /// its escapes replaced; a multiline one's `\r\n`s are `\n`s. Also whether
     /// the text had to be copied rather than viewed in `src`.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
-    fn basic_string(self, &cx: C, pos: usize, multiline: bool) -> (usize, Span['k], bool) {
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
+    fn basic_string(self, &cx: C, pos: usize, multiline: bool) -> (usize, Str['k], bool) {
         var out = Buffer!::new();
         var copied = false;
         var start = pos;
@@ -446,7 +446,7 @@ impl Parser['k] {
 
     /// The escape at `pos` (its backslash) written to `out`; where the string
     /// goes on.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
     fn escape(self, &cx: C, pos: usize, multiline: bool, &out: Buffer!) -> usize {
         let id = self.byte(&cx, pos + 1usize);
         let after = pos + 2usize;
@@ -509,8 +509,8 @@ impl Parser['k] {
     }
 
     /// A multiline string at `pos`, its first quote.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
-    fn multiline_string(self, &cx: C, pos: usize, literal: bool) -> (usize, Span['k]) {
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
+    fn multiline_string(self, &cx: C, pos: usize, literal: bool) -> (usize, Str['k]) {
         let delim = if literal { b'\'' } else { b'"' };
         var i = pos + 3usize;
         i = i + self.newline(&cx, i);
@@ -547,9 +547,9 @@ impl Parser['k] {
 
     /// A multiline literal string's text, from after its opening quotes and
     /// newline.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
-    fn multiline_literal(self, &cx: C, pos: usize) -> (usize, Span['k], bool) {
-        let end = match self.src.find(&cx, Span::from_static(&cx, "'''"), pos) {
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
+    fn multiline_literal(self, &cx: C, pos: usize) -> (usize, Str['k], bool) {
+        let end = match self.src.find(&cx, Str::from_static(&cx, "'''"), pos) {
             Some(e) => e,
             None => {
                 self.fail(&cx, self.len, "unterminated string");
@@ -586,8 +586,8 @@ impl Parser['k] {
     // --------------------------------------------------------------- keys --
 
     /// One part of a key: bare, or a literal or basic string's text.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
-    fn key_part(self, &cx: C, pos: usize) -> (usize, Span['k]) {
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
+    fn key_part(self, &cx: C, pos: usize) -> (usize, Str['k]) {
         let b = self.byte(&cx, pos);
         if pos < self.len && is_bare(b) {
             var i = pos;
@@ -607,10 +607,10 @@ impl Parser['k] {
     }
 
     /// A dotted key, and the spaces after it.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
-    fn key(self, &cx: C, pos: usize) -> (usize, ArenaVec[Span['k], 'k]) {
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
+    fn key(self, &cx: C, pos: usize) -> (usize, ArenaVec[Str['k], 'k]) {
         let (first_end, first) = self.key_part(&cx, pos);
-        let parts: ArenaVec[Span['k], 'k] = ArenaVec::one(&cx, first);
+        let parts: ArenaVec[Str['k], 'k] = ArenaVec::one(&cx, first);
         var i = self.skip_space(&cx, first_end);
         while !self.failed(&cx) && self.byte(&cx, i) == b'.' && i < self.len {
             i = self.skip_space(&cx, i + 1usize);
@@ -622,8 +622,8 @@ impl Parser['k] {
     }
 
     /// A key, its `=` and its value, at nesting `depth`.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
-    fn key_value(self, &cx: C, pos: usize, depth: usize) -> (usize, ArenaVec[Span['k], 'k], TomlValue['k]) {
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
+    fn key_value(self, &cx: C, pos: usize, depth: usize) -> (usize, ArenaVec[Str['k], 'k], TomlValue['k]) {
         let (i, key) = self.key(&cx, pos);
         if self.failed(&cx) {
             return (self.len, key, TomlValue::Boolean.(false));
@@ -639,8 +639,8 @@ impl Parser['k] {
     // ------------------------------------------------------------- values --
 
     /// Whether the document holds `text` at `pos`.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
-    fn starts_with(self, &cx: C, pos: usize, text: Slice[u8, 'static]) -> bool {
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
+    fn starts_with(self, &cx: C, pos: usize, text: Str['static]) -> bool {
         match self.src.sub(pos, text.len()) {
             Some(s) => s.is(&cx, text),
             None => false,
@@ -648,7 +648,7 @@ impl Parser['k] {
     }
 
     /// The value at `pos`, nested `depth` arrays and inline tables deep.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
     fn value(self, &cx: C, pos: usize, depth: usize) -> (usize, TomlValue['k]) {
         let b = self.byte(&cx, pos);
         if pos >= self.len {
@@ -730,7 +730,7 @@ impl Parser['k] {
     }
 
     /// The array whose `[` is at `pos`, at nesting `depth`.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
     fn array(self, &cx: C, pos: usize, depth: usize) -> (usize, TomlValue['k]) {
         let items: ArenaVec[TomlValue['k], 'k] = ArenaVec::new(&cx);
         var i = self.skip_comments_and_array_space(&cx, pos + 1usize);
@@ -760,9 +760,9 @@ impl Parser['k] {
     }
 
     /// The inline table whose `{` is at `pos`, at nesting `depth`.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
     fn inline_table(self, &cx: C, pos: usize, depth: usize) -> (usize, TomlValue['k]) {
-        let table: ArenaMap[Span['k], TomlValue['k], 'k] = ArenaMap::new(&cx);
+        let table: ArenaMap[Str['k], TomlValue['k], 'k] = ArenaMap::new(&cx);
         let flags = new_flags(&cx);
         var i = self.skip_space(&cx, pos + 1usize);
         if self.byte(&cx, i) == b'}' && i < self.len {
@@ -815,7 +815,7 @@ impl Parser['k] {
 
     /// The value of the `count` digits at `pos`, or `None` unless all are
     /// digits.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
     fn digits(self, &cx: C, pos: usize, count: usize) -> Option[u32] {
         var value = 0u32;
         var k = 0usize;
@@ -831,7 +831,7 @@ impl Parser['k] {
     }
 
     /// Two digits at `pos` no more than `max`.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
     fn two_digits(self, &cx: C, pos: usize, max: u32) -> bool {
         match self.digits(&cx, pos, 2usize) {
             Some(v) => v <= max,
@@ -841,7 +841,7 @@ impl Parser['k] {
 
     /// The end of a time `HH:MM:SS` or `HH:MM:SS.fraction` at `pos`; `pos`
     /// when there is none.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
     fn time(self, &cx: C, pos: usize) -> usize {
         let fields = self.two_digits(&cx, pos, 23u32) && self.byte(&cx, pos + 2usize) == b':'
             && self.two_digits(&cx, pos + 3usize, 59u32) && self.byte(&cx, pos + 5usize) == b':'
@@ -861,7 +861,7 @@ impl Parser['k] {
 
     /// A date, or a date and time with or without an offset, at `pos`: its
     /// end and form. A date that does not exist (`2023-02-29`) is an error.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
     fn datetime(self, &cx: C, pos: usize) -> Option[(usize, DatetimeKind)] {
         let year = match self.digits(&cx, pos, 4usize) {
             Some(y) => y,
@@ -903,7 +903,7 @@ impl Parser['k] {
 
     /// Digits of `base` at `pos`, each but the first after an optional `_`:
     /// their end.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
     fn digit_run(self, &cx: C, pos: usize, base: u32) -> usize {
         if !self.is_digit_of(&cx, pos, base) {
             return pos;
@@ -923,7 +923,7 @@ impl Parser['k] {
     }
 
     /// Whether the byte at `pos` is a digit in `base` (2, 8, 10 or 16).
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
     fn is_digit_of(self, &cx: C, pos: usize, base: u32) -> bool {
         if pos >= self.len {
             return false;
@@ -938,7 +938,7 @@ impl Parser['k] {
 
     /// An integer or a float at `pos`. An integer out of the range of `i64`
     /// is an error.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
     fn number(self, &cx: C, pos: usize) -> Option[(usize, TomlValue['k])] {
         let b = self.byte(&cx, pos);
         if b == b'0' {
@@ -1004,7 +1004,7 @@ impl Parser['k] {
 
     /// The integer whose digits of `base` are `[start, end)`, negated when
     /// `negative`; an error at `pos` past the range of `i64`.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
     fn integer(self, &cx: C, pos: usize, start: usize, end: usize, base: u32, negative: bool) -> i64 {
         // 2^63: the magnitude of the most negative value.
         let limit = 9223372036854775808u64;
@@ -1035,7 +1035,7 @@ impl Parser['k] {
     // --------------------------------------------------------- statements --
 
     /// `key = value` in the current section.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
     fn assignment(self, &cx: C, pos: usize) -> usize {
         let (i, key, value) = self.key_value(&cx, pos, 0usize);
         if self.failed(&cx) {
@@ -1081,7 +1081,7 @@ impl Parser['k] {
     }
 
     /// The dotted keys' tables of the section that ends become explicit.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
     fn finish_section(self, &cx: C) {
         var k = 0usize;
         while k < self.pending.len(&cx) {
@@ -1092,7 +1092,7 @@ impl Parser['k] {
     }
 
     /// `[key]` at `pos`.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
     fn table_header(self, &cx: C, pos: usize) -> usize {
         let (i, key) = self.key(&cx, self.skip_space(&cx, pos + 1usize));
         if self.failed(&cx) {
@@ -1117,7 +1117,7 @@ impl Parser['k] {
     }
 
     /// `[[key]]` at `pos`.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
     fn array_header(self, &cx: C, pos: usize) -> usize {
         let (i, key) = self.key(&cx, self.skip_space(&cx, pos + 2usize));
         if self.failed(&cx) {
@@ -1141,7 +1141,7 @@ impl Parser['k] {
             },
         };
         let stem = key.at(&cx, n - 1usize);
-        let element: ArenaMap[Span['k], TomlValue['k], 'k] = ArenaMap::new(&cx);
+        let element: ArenaMap[Str['k], TomlValue['k], 'k] = ArenaMap::new(&cx);
         match parent.get(&cx, stem) {
             Some(existing) => match existing {
                 Array(items) => items.push(&cx, TomlValue::Table.(element)),
@@ -1165,7 +1165,7 @@ impl Parser['k] {
 
     /// Reads the whole document, statement by statement, until its end or
     /// the first error.
-    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
+    forall C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
     fn document(self, &cx: C) {
         var pos = 0usize;
         while !self.failed(&cx) {
@@ -1208,8 +1208,8 @@ impl Parser['k] {
 
 /// The first byte of `src` that does not start a UTF-8 scalar `decode`
 /// reads, if any.
-forall 'k, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
-fn invalid_utf8(&cx: C, src: Span['k]) -> Option[usize] {
+forall 'k, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
+fn invalid_utf8(&cx: C, src: Str['k]) -> Option[usize] {
     var i = 0usize;
     while i < src.len() {
         if src.byte_or_zero(&cx, i) < 128u8 {
@@ -1230,14 +1230,14 @@ fn invalid_utf8(&cx: C, src: Span['k]) -> Option[usize] {
 /// The root table of the TOML document `src`, in `src`'s arena, or the first
 /// error. Arrays and inline tables nested more than 128 deep are an error
 /// ("nesting too deep"), which TOML itself does not make one.
-forall 'k, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Span['k]].
-fn parse(&cx: C, src: Span['k]) -> Result[ArenaMap[Span['k], TomlValue['k], 'k], TomlError] {
+forall 'k, C, R, Q where Allocate[C -> 'k, R], Access[C -> 'k, Q], ReadBytes[C, Str['k]].
+fn parse(&cx: C, src: Str['k]) -> Result[ArenaMap[Str['k], TomlValue['k], 'k], TomlError] {
     match invalid_utf8(&cx, src) {
         Some(at) => return Result::Err.(TomlError.{ offset: at, message: "invalid UTF-8" }),
         None => (),
     }
-    let empty: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
-    let root: ArenaMap[Span['k], TomlValue['k], 'k] = ArenaMap::new(&cx);
+    let empty: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
+    let root: ArenaMap[Str['k], TomlValue['k], 'k] = ArenaMap::new(&cx);
     let p = Parser.{
         src,
         len: src.len(),

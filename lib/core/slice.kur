@@ -35,12 +35,11 @@ use core::cap::{Access, Brand, Exclusive!};
 use core::mem::{Ref, sizeof};
 use core::ptr::offset;
 use core::cap::Shared!;
-use core::hash::{Hash, Eq, HashIn, HashState};
+use core::hash::{Hash, Eq, HashState};
 use core::option::Option;
 use core::cmp::Order;
 use core::iter::Iterator;
 use core::process::trap;
-use core::ascii::{space_prefix, space_suffix};
 
 /// A checked view of `len` contiguous `T`s in domain `'k`.
 ///
@@ -75,8 +74,8 @@ impl Slice[T, 'k] {
     /// from `get_ref` is never null), so an honest `ptr` and `len` here are
     /// the whole of `Slice`'s soundness boundary. Typical callers already hold a `Ref`
     /// of the same brand and assert that more elements are live starting
-    /// there (`Vec!::as_slice`, `Buffer!::open`); string literals are built
-    /// through it by the compiler, which discharges the obligation.
+    /// there (`Vec!::as_slice`, `Buffer!::open`). String literals are not
+    /// slices: they are read-only text, `core::str::Str['static]`.
     unsafe fn from_raw_parts(ptr: *T, len: usize, marker: Brand['k]) -> Slice[T, 'k] {
         Slice.{ ptr, len, marker }
     }
@@ -85,7 +84,7 @@ impl Slice[T, 'k] {
     ///
     /// The safe inverse of `from_raw_parts`: the `(ptr, len, marker)` the
     /// slice was built from, for code that must read through it directly
-    /// (e.g. `Buffer!`'s `write_static`). Safe because it grants no authority:
+    /// or see it as another view (`Slice::as_str`). Safe because it grants no authority:
     /// rebuilding a `Slice` from the result still goes through the `unsafe`
     /// `from_raw_parts`, and the raw pointer can only be dereferenced
     /// under `unsafe`.
@@ -199,34 +198,20 @@ impl Slice[T, 'k] {
 // ---------------------------------------------------------------------
 // Read capabilities.
 //
-// A `Slice[u8,'r]` only describes bytes; reading them needs a capability
-// for `'r`. `ReadBytes[C, S]` is the one protocol every safe byte reader
-// goes through, with an instance per capability that can authorize the
-// read: `Exclusive!['r]` (exclusive), `Shared!['r,'q]` (a shared-read node), and
-// `StaticRead` (permanent read access to `'static`). The brand relationship
-// lives in the instance heads; the trait itself needs no brand parameter.
+// A byte view (a `Slice[u8,'r]`, or text, a `core::str::Str['r]`) only
+// describes bytes; reading them needs a capability for `'r`.
+// `ReadBytes[C, S]` is the one protocol every safe byte reader goes
+// through, with an instance per capability that can authorize the read:
+// `Exclusive!['r]` (exclusive), `Shared!['r,'q]` (a shared-read node), and,
+// for text only, `core::str::StaticRead` (permanent read access to
+// `'static`). The brand relationship lives in the instance heads; the trait
+// itself needs no brand parameter.
 //
 // Generic code carries `where ReadBytes[C, S], Copy[S]` with bare
 // parameters (a premise may not nest a caller's parameter inside another
 // type) and must read through the trait, never through the slice's raw
 // pointer: a user-written instance can then only return wrong bytes, not
 // read memory it has no authority over.
-
-/// Permanent read access to the immutable `'static` byte domain. Copy and
-/// zero-sized; it has no write, resume, or deallocation operation, so
-/// duplicating it is harmless. It authorizes reads through
-/// `Slice[u8,'static]` only: `Slice` is restricted and built only by
-/// `unsafe from_raw_parts`, whose `'static` obligation (extent,
-/// initialization, permanence, immutability) string-literal lowering
-/// discharges for literals.
-struct StaticRead {}
-
-impl StaticRead {
-    /// The capability to read `'static` bytes.
-    fn new() -> StaticRead {
-        StaticRead.{}
-    }
-}
 
 /// Reading the bytes of a view `S` through the capability `C`.
 forall C, S.
@@ -243,7 +228,7 @@ trait ReadBytes {
 
 /// Byte `index` of `s`, or `None` past its end, read with no capability.
 ///
-/// The shared body of the three instances below. Caller: holds a capability
+/// The shared body of the two instances below. Caller: holds a capability
 /// of `s`'s brand for the call, since this reads its bytes with none of its
 /// own.
 forall 'k.
@@ -279,20 +264,11 @@ instance ReadBytes[Shared!['r, 'q], Slice[u8, 'r]] {
     }
 }
 
-/// A `'static` byte slice is read through `StaticRead`.
-instance ReadBytes[StaticRead, Slice[u8, 'static]] {
-    fn get(&cx: StaticRead, bytes: Slice[u8, 'static], index: usize) -> Option[u8] {
-        unsafe slice_byte_at(bytes, index)
-    }
-    fn len(&cx: StaticRead, bytes: Slice[u8, 'static]) -> usize {
-        bytes.len()
-    }
-}
-
 /// A byte view together with the capability that permits reading it, as
 /// one value: what `Eq`, `Hash`, and `Format` instances take, since an
 /// instance head must be a named type. `core::borrow::Borrowed!` is the
-/// same idea for a `Ref`. Copy exactly when `C` is (e.g. `StaticRead`).
+/// same idea for a `Ref`. Copy exactly when `C` is (e.g.
+/// `core::str::StaticRead`).
 forall C, S.
 exposed struct Readable {
     cap: C,
@@ -417,7 +393,7 @@ fn bytes_cmp_within(&cx: C, left: S, right: S) -> Order {
 
 /// The first index at or after `start` holding `needle`. Every search
 /// takes what it looks for before where it starts:
-/// `find_byte(&cx, bytes, needle, start)`, as `Span::find` and `Span::find_byte` do.
+/// `find_byte(&cx, bytes, needle, start)`, as `Str::find` and `Str::find_byte` do.
 forall C, S where ReadBytes[C, S], Copy[S].
 fn find_byte(&cx: C, bytes: S, needle: u8, start: usize) -> Option[usize] {
     let n = ReadBytes[C, S]::len(&cx, bytes);
@@ -512,115 +488,6 @@ fn word8(&cx: C, bytes: S, i: usize) -> u64 {
         | (byte_word(&cx, bytes, i + 2usize) << 16u64) | (byte_word(&cx, bytes, i + 3usize) << 24u64)
         | (byte_word(&cx, bytes, i + 4usize) << 32u64) | (byte_word(&cx, bytes, i + 5usize) << 40u64)
         | (byte_word(&cx, bytes, i + 6usize) << 48u64) | (byte_word(&cx, bytes, i + 7usize) << 56u64)
-}
-
-// ------------------------------------------------------------ byte views --
-// A byte slice reads as a `core::raw::Span` does, with the same methods,
-// each through any capability that may read it (`ReadBytes`). `Str['k]` is
-// its name as text.
-
-/// Text: a view of bytes in domain `'k`. `Str['k]` is another name for
-/// `Slice[u8, 'k]`, the same type, so the two mix freely; a string literal
-/// is a `Str['static]`.
-forall 'k.
-type Str = Slice[u8, 'k];
-
-forall 'k.
-impl Str['k] {
-    /// Without the ASCII whitespace at its start (`core::ascii::is_space`).
-    forall C where ReadBytes[C, Str['k]].
-    fn trim_start(self, &cx: C) -> Str['k] {
-        self.skip(space_prefix(&cx, self))
-    }
-
-    /// Without the ASCII whitespace at its end.
-    forall C where ReadBytes[C, Str['k]].
-    fn trim_end(self, &cx: C) -> Str['k] {
-        self.take(self.len() - space_suffix(&cx, self))
-    }
-
-    /// Without the ASCII whitespace at either end.
-    forall C where ReadBytes[C, Str['k]].
-    fn trim(self, &cx: C) -> Str['k] {
-        self.trim_start(&cx).trim_end(&cx)
-    }
-
-    /// Byte `i`, or `0u8` past the end (`byte_or_zero`).
-    forall C where ReadBytes[C, Str['k]].
-    fn byte_or_zero(self, &cx: C, i: usize) -> u8 {
-        byte_or_zero(&cx, self, i)
-    }
-
-    /// Byte equality with another slice of the domain.
-    forall C where ReadBytes[C, Str['k]].
-    fn eq(self, &cx: C, other: Str['k]) -> bool {
-        bytes_eq_within(&cx, self, other)
-    }
-
-    /// Byte equality with a literal.
-    forall C where ReadBytes[C, Str['k]].
-    fn is(self, &cx: C, literal: Str['static]) -> bool {
-        var sr = StaticRead::new();
-        bytes_eq(&cx, self, &sr, literal)
-    }
-
-    /// Byte order, as unsigned values, a shorter prefix first (`bytes_cmp`).
-    forall C where ReadBytes[C, Str['k]].
-    fn cmp(self, &cx: C, other: Str['k]) -> Order {
-        bytes_cmp_within(&cx, self, other)
-    }
-
-    /// Whether the slice's bytes start with `prefix`'s.
-    forall C where ReadBytes[C, Str['k]].
-    fn starts_with(self, &cx: C, prefix: Str['k]) -> bool {
-        prefix.len() <= self.len() && self.take(prefix.len()).eq(&cx, prefix)
-    }
-
-    /// Whether the slice's bytes end with `suffix`'s.
-    forall C where ReadBytes[C, Str['k]].
-    fn ends_with(self, &cx: C, suffix: Str['k]) -> bool {
-        suffix.len() <= self.len() && self.skip(self.len() - suffix.len()).eq(&cx, suffix)
-    }
-
-    /// The first index at or after `start` where `needle`'s bytes appear
-    /// (`find_bytes`).
-    forall C where ReadBytes[C, Str['k]].
-    fn find(self, &cx: C, needle: Str['k], start: usize) -> Option[usize] {
-        find_bytes(&cx, self, needle, start)
-    }
-
-    /// Whether `needle`'s bytes appear in the slice.
-    forall C where ReadBytes[C, Str['k]].
-    fn contains(self, &cx: C, needle: Str['k]) -> bool {
-        self.find(&cx, needle, 0usize).is_some()
-    }
-
-    /// The first index at or after `start` holding `byte` (`find_byte`).
-    forall C where ReadBytes[C, Str['k]].
-    fn find_byte(self, &cx: C, byte: u8, start: usize) -> Option[usize] {
-        find_byte(&cx, self, byte, start)
-    }
-
-    /// The last index holding `byte` (`rfind_byte`).
-    forall C where ReadBytes[C, Str['k]].
-    fn rfind_byte(self, &cx: C, byte: u8) -> Option[usize] {
-        rfind_byte(&cx, self, byte)
-    }
-}
-
-// A byte view of a domain, as a map key read through that domain's
-// capability (`HashMap!::get_in` and friends).
-/// Byte slices hash and compare by their bytes, read through the capability
-/// `C`.
-forall C, 't where ReadBytes[C, Slice[u8, 't]].
-instance HashIn[Slice[u8, 't], C] {
-    fn hash_in(&cx: C, key: Slice[u8, 't], state: HashState) -> HashState {
-        hash_bytes(&cx, key, state)
-    }
-
-    fn eq_in(&cx: C, a: Slice[u8, 't], b: Slice[u8, 't]) -> bool {
-        bytes_eq_within(&cx, a, b)
-    }
 }
 
 /// Readable views are equal when their bytes are (`bytes_eq`).

@@ -42,7 +42,7 @@ ACCEPTED = (
     "fn f() -> f64 { 1_000.5f64 + 0x_ff as f64 + 0b1010u8 as f64 + 2f32 as f64 }",
     "use a::{B!, C! as D!}; fn f(x: B!) -> bool { let y = D!::new(); let z = B!.{ x }; a!=b && !c && a != b }",
     "fn f(self, g: fn(closure() -> u32) -> u32) -> u32 { var self = self; let (self, x) = y; return x; }",
-    "forall 'k. type Str = Slice[u8, 'k]; type Held! = (L!, u8); exposed type P = u32; impl Str['static] {}",
+    "forall 'k. type Bytes = Slice[u8, 'k]; type Held! = (L!, u8); exposed type P = u32; impl Bytes['static] {}",
     "fn f(&cx: C, s: Str['k]) -> Buffer! { f\"{s}: {1u32}\".write(&cx, Buffer!::new()) }",
 )
 

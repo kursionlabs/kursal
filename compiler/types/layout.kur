@@ -12,7 +12,7 @@
 use std::collections::arena_vec::ArenaVec;
 use std::collections::arena_map::{ArenaMap, ArenaSet};
 use std::mem::Ref;
-use std::raw::Span;
+use std::str::Str;
 use std::arena::{Domain!, ref_in};
 use std::buffer::Buffer!;
 use std::fmt::Writer;
@@ -22,11 +22,10 @@ use package::syntax::ast::{Pos, no_pos};
 use package::types::termination::components;
 use package::types::ops::{Fresh, Row, Rows, children, equal, free_brands, free_names, is_ptr, kurs_error_in, member_types, overlap, subst, with_names, wrap};
 use std::option::{Option, Result};
-use std::slice::Slice;
 
 // A `*F` pattern binds its binder to the pointee of each component. Where a type parameter decides
 // the source's shape only an explicit pointer source has pointer components at every instantiation.
-const STUCK_POINTER_PATTERN: Slice[u8, 'static] = "needs a source written as a pointer *P, as a type parameter decides its shape";
+const STUCK_POINTER_PATTERN: Str['static] = "needs a source written as a pointer *P, as a type parameter decides its shape";
 
 // What the rows of a foreach source are: decided, decided by the type parameter given (the foreach
 // is stuck), or unknown (formation reports an unknown name or a pattern that does not fit).
@@ -41,20 +40,20 @@ enum SourceRows {
 // owner's parameters and the names derived from them in scope there.
 forall 'k.
 exposed struct ExpansionSite {
-    owner: Span['k],
-    name: Span['k],
+    owner: Str['k],
+    name: Str['k],
     args: ArenaVec[Type['k], 'k],
-    params: ArenaSet[Span['k], 'k],
-    derived: ArenaSet[Span['k], 'k],
+    params: ArenaSet[Str['k], 'k],
+    derived: ArenaSet[Str['k], 'k],
 }
 
 forall 'k.
 exposed struct Expansion {
     program: Program['k],
     counter: Fresh['k],
-    graph: ArenaMap[ArenaVec[Span['k], 'k], ArenaSet[ArenaVec[Span['k], 'k], 'k], 'k],
+    graph: ArenaMap[ArenaVec[Str['k], 'k], ArenaSet[ArenaVec[Str['k], 'k], 'k], 'k],
     sites: ArenaVec[ExpansionSite['k], 'k],
-    places: ArenaMap[Span['k], (Span['k], Pos), 'k],
+    places: ArenaMap[Str['k], (Str['k], Pos), 'k],
     // The keys `walk` has unfolded to the end without an error, by value and as aliases. Nothing
     // reachable from one of them reaches it again, so walking it again would find nothing.
     walked: ArenaSet[Type['k], 'k],
@@ -62,8 +61,8 @@ exposed struct Expansion {
 }
 
 forall 'k.
-fn without(&cx: Domain!['k], names: ArenaSet[Span['k], 'k], removed: ArenaSet[Span['k], 'k]) -> ArenaSet[Span['k], 'k] {
-    let out: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+fn without(&cx: Domain!['k], names: ArenaSet[Str['k], 'k], removed: ArenaSet[Str['k], 'k]) -> ArenaSet[Str['k], 'k] {
+    let out: ArenaSet[Str['k], 'k] = ArenaSet::new(&cx);
     let items = names.keys(&cx);
     var i = 0usize;
     while i < items.len(&cx) {
@@ -95,7 +94,7 @@ fn any_equal(&cx: Domain!['k], t: Type['k], active: ArenaVec[Type['k], 'k]) -> b
 
 forall 'k.
 impl Expansion['k] {
-    fn collect(self, &cx: Domain!['k], owner: Span['k], ty: Type['k], bound: ArenaSet[Span['k], 'k], params: ArenaSet[Span['k], 'k], derived: ArenaSet[Span['k], 'k]) {
+    fn collect(self, &cx: Domain!['k], owner: Str['k], ty: Type['k], bound: ArenaSet[Str['k], 'k], params: ArenaSet[Str['k], 'k], derived: ArenaSet[Str['k], 'k]) {
         match ty {
             Named(name, args) => {
                 if !bound.contains(&cx, name) && self.program.types.contains(&cx, name) {
@@ -125,13 +124,13 @@ impl Expansion['k] {
         }
     }
 
-    fn unfold(self, &cx: Domain!['k], name: Span['k], args: ArenaVec[Type['k], 'k], bound: ArenaSet[Span['k], 'k]) -> Option[Type['k]] {
+    fn unfold(self, &cx: Domain!['k], name: Str['k], args: ArenaVec[Type['k], 'k], bound: ArenaSet[Str['k], 'k]) -> Option[Type['k]] {
         if bound.contains(&cx, name) || !self.program.types.contains(&cx, name) {
             // Formation reports unknown names and arities separately.
             return Option::None;
         }
         let decl = self.program.types.at(&cx, name);
-        let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+        let sub: ArenaMap[Str['k], Type['k], 'k] = ArenaMap::new(&cx);
         var i = 0usize;
         while i < decl.params.len(&cx) && i < args.len(&cx) {
             sub.insert(&cx, decl.params.at(&cx, i).name, args.at(&cx, i));
@@ -143,25 +142,25 @@ impl Expansion['k] {
     // Brand identity cannot affect size or C representation. Equality also ignores alpha-renaming
     // of binders introduced by subst.
     fn key(self, &cx: Domain!['k], ty: Type['k]) -> Type['k] {
-        let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+        let sub: ArenaMap[Str['k], Type['k], 'k] = ArenaMap::new(&cx);
         let brands = free_brands(&cx, ty).keys(&cx);
         var b = 0usize;
         while b < brands.len(&cx) {
-            sub.insert(&cx, brands.at(&cx, b), Type::Skolem.(Span::from_static(&cx, "_")));
+            sub.insert(&cx, brands.at(&cx, b), Type::Skolem.(Str::from_static(&cx, "_")));
             b = b + 1usize;
         }
         subst(&cx, ty, sub, self.counter)
     }
 
     // Stops with `message`, at the declaration named `owner` when `places` has it.
-    fn fail(self, &cx: Domain!['k], owner: Span['k], message: Span['k]) -> ! {
-        let (file, pos) = self.places.get_or(&cx, owner, (Span::from_static(&cx, ""), no_pos()));
+    fn fail(self, &cx: Domain!['k], owner: Str['k], message: Str['k]) -> ! {
+        let (file, pos) = self.places.get_or(&cx, owner, (Str::from_static(&cx, ""), no_pos()));
         kurs_error_in(&cx, message, file, pos)
     }
 
     // Demand just the outer shape needed by foreach rows (one pointer layer, which only the pointer
     // pattern looks through).
-    fn shape(self, &cx: Domain!['k], ty: Type['k], active: ArenaVec[Type['k], 'k], bound: ArenaSet[Span['k], 'k], pointer: bool) -> Result[(), Span['k]] {
+    fn shape(self, &cx: Domain!['k], ty: Type['k], active: ArenaVec[Type['k], 'k], bound: ArenaSet[Str['k], 'k], pointer: bool) -> Result[(), Str['k]] {
         match ty {
             Named(name, args) => match self.unfold(&cx, name, args, bound) {
                 Some(found) => {
@@ -184,7 +183,7 @@ impl Expansion['k] {
 
     // The outer shape of `ty`: a structural type, or the parameter of `bound` that decides it; none
     // for an unknown name or a pattern that does not fit its components (formation reports those).
-    fn outer(self, &cx: Domain!['k], ty: Type['k], bound: ArenaSet[Span['k], 'k]) -> Option[Type['k]] {
+    fn outer(self, &cx: Domain!['k], ty: Type['k], bound: ArenaSet[Str['k], 'k]) -> Option[Type['k]] {
         match ty {
             Named(name, args) => {
                 if bound.contains(&cx, name) {
@@ -207,7 +206,7 @@ impl Expansion['k] {
     // The skeleton and rows of `source` under the pattern `indirect` (`*F`) or not, or the parameter
     // that decides them (the foreach is stuck). Only `*F` looks through a pointer source; under the
     // value pattern it is a leaf.
-    fn rows(self, &cx: Domain!['k], source: Type['k], indirect: bool, bound: ArenaSet[Span['k], 'k]) -> SourceRows['k] {
+    fn rows(self, &cx: Domain!['k], source: Type['k], indirect: bool, bound: ArenaSet[Str['k], 'k]) -> SourceRows['k] {
         var shape = match self.outer(&cx, source, bound) {
             Some(shape) => shape,
             None => return SourceRows::Unknown,
@@ -245,7 +244,7 @@ impl Expansion['k] {
                 SourceRows::Decided.(Rows.{ skeleton: Option::Some.(shape), rows })
             },
             Array(elem, _length) => {
-                rows.push(&cx, Row.{ label: Span::from_static(&cx, "0"), item: wrap(&cx, elem.copy(&cx), pointer) });
+                rows.push(&cx, Row.{ label: Str::from_static(&cx, "0"), item: wrap(&cx, elem.copy(&cx), pointer) });
                 SourceRows::Decided.(Rows.{ skeleton: Option::Some.(shape), rows })
             },
             Enum(variants) => {
@@ -257,7 +256,7 @@ impl Expansion['k] {
                 SourceRows::Decided.(Rows.{ skeleton: Option::Some.(shape), rows })
             },
             _ => {
-                rows.push(&cx, Row.{ label: Span::from_static(&cx, "0"), item: source });
+                rows.push(&cx, Row.{ label: Str::from_static(&cx, "0"), item: source });
                 SourceRows::Decided.(Rows.{ skeleton: Option::None, rows })
             },
         }
@@ -277,7 +276,7 @@ impl Expansion['k] {
             } else {
                 row.item
             };
-            let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+            let sub: ArenaMap[Str['k], Type['k], 'k] = ArenaMap::new(&cx);
             sub.insert(&cx, ty.binder, bind);
             mapped.push(&cx, Member.{ name: row.label, ty: subst(&cx, ty.body.copy(&cx), sub, self.counter) });
             i = i + 1usize;
@@ -294,7 +293,7 @@ impl Expansion['k] {
     }
 
     // The pointee of a pointer source, whose components the rows of the pointer pattern point to.
-    fn origin(self, &cx: Domain!['k], source: Type['k], bound: ArenaSet[Span['k], 'k]) -> Option[Type['k]] {
+    fn origin(self, &cx: Domain!['k], source: Type['k], bound: ArenaSet[Str['k], 'k]) -> Option[Type['k]] {
         match source {
             Named(name, args) => match self.unfold(&cx, name, args, bound) {
                 Some(found) => self.origin(&cx, found, bound),
@@ -307,7 +306,7 @@ impl Expansion['k] {
 
     // Whether `bound` leaves every declared type name meaning the declaration, so that a key walks
     // the same way under it as under any other such set.
-    fn plain(self, &cx: Domain!['k], bound: ArenaSet[Span['k], 'k]) -> bool {
+    fn plain(self, &cx: Domain!['k], bound: ArenaSet[Str['k], 'k]) -> bool {
         var i = 0usize;
         while i < bound.positions(&cx) {
             let unit = match bound.key_at(&cx, i) {
@@ -325,13 +324,13 @@ impl Expansion['k] {
 
     // The by-value walk of `ty` in the declaration `owner`, or in a type written elsewhere when `owner`
     // is empty: the message of what it finds wrong, if anything.
-    fn walk(self, &cx: Domain!['k], owner: Span['k], ty: Type['k], active: ArenaVec[Type['k], 'k], bound: ArenaSet[Span['k], 'k], aliases: bool) -> Result[(), Span['k]] {
+    fn walk(self, &cx: Domain!['k], owner: Str['k], ty: Type['k], active: ArenaVec[Type['k], 'k], bound: ArenaSet[Str['k], 'k], aliases: bool) -> Result[(), Str['k]] {
         match ty {
             Named(name, args) => match self.unfold(&cx, name, args, bound) {
                 Some(found) => {
                     let current = self.key(&cx, ty);
                     if any_equal(&cx, current, active) {
-                        let reason = if aliases { Span::from_static(&cx, "recursive alias needs an aggregate boundary") } else { Span::from_static(&cx, "infinite by-value layout") };
+                        let reason = if aliases { Str::from_static(&cx, "recursive alias needs an aggregate boundary") } else { Str::from_static(&cx, "infinite by-value layout") };
                         return Result::Err.(f"type {name}: {reason}".write(&cx, Buffer!::new()).save(&cx));
                     }
                     let done = if aliases { self.aliased } else { self.walked };
@@ -401,7 +400,7 @@ impl Expansion['k] {
         }
     }
 
-    fn walk_children(self, &cx: Domain!['k], owner: Span['k], ty: Type['k], active: ArenaVec[Type['k], 'k], bound: ArenaSet[Span['k], 'k], aliases: bool) -> Result[(), Span['k]] {
+    fn walk_children(self, &cx: Domain!['k], owner: Str['k], ty: Type['k], active: ArenaVec[Type['k], 'k], bound: ArenaSet[Str['k], 'k], aliases: bool) -> Result[(), Str['k]] {
         let parts = children(&cx, ty);
         var i = 0usize;
         while i < parts.len(&cx) {
@@ -414,7 +413,7 @@ impl Expansion['k] {
     // The C representation key (`backend::cgen::erase`) keeps names and expands every foreach,
     // behind pointers and functions too: a foreach whose expansion reaches it again before a name
     // has none (`struct T { f: fn(foreach *F of *T => *F) -> u32 }`).
-    fn represent(self, &cx: Domain!['k], owner: Span['k], ty: Type['k], active: ArenaVec[Type['k], 'k], bound: ArenaSet[Span['k], 'k]) -> Result[(), Span['k]] {
+    fn represent(self, &cx: Domain!['k], owner: Str['k], ty: Type['k], active: ArenaVec[Type['k], 'k], bound: ArenaSet[Str['k], 'k]) -> Result[(), Str['k]] {
         match ty {
             Foreach(f) => {
                 self.shape(&cx, f.source.copy(&cx), ArenaVec::new(&cx), bound, f.indirect)?;
@@ -450,15 +449,15 @@ impl Expansion['k] {
 // use is walked as a declaration is, where it is written. The message of what it finds wrong, if
 // anything.
 forall 'k.
-fn check_written_type(&cx: Domain!['k], program: Program['k], counter: Fresh['k], ty: Type['k], bound: ArenaSet[Span['k], 'k]) -> Result[(), Span['k]] {
+fn check_written_type(&cx: Domain!['k], program: Program['k], counter: Fresh['k], ty: Type['k], bound: ArenaSet[Str['k], 'k]) -> Result[(), Str['k]] {
     let state = Expansion.{ program, counter, graph: ArenaMap::new(&cx), sites: ArenaVec::new(&cx), places: ArenaMap::new(&cx), walked: ArenaSet::new(&cx), aliased: ArenaSet::new(&cx) };
-    state.walk(&cx, Span::from_static(&cx, ""), ty, ArenaVec::new(&cx), bound, false)
+    state.walk(&cx, Str::from_static(&cx, ""), ty, ArenaVec::new(&cx), bound, false)
 }
 
 // `places` names the file and position of a declaration, by its name, when it has them.
 forall 'k.
-fn check_type_expansion(&cx: Domain!['k], program: Program['k], counter: Fresh['k], places: ArenaMap[Span['k], (Span['k], Pos), 'k]) {
-    let graph: ArenaMap[ArenaVec[Span['k], 'k], ArenaSet[ArenaVec[Span['k], 'k], 'k], 'k] = ArenaMap::new(&cx);
+fn check_type_expansion(&cx: Domain!['k], program: Program['k], counter: Fresh['k], places: ArenaMap[Str['k], (Str['k], Pos), 'k]) {
+    let graph: ArenaMap[ArenaVec[Str['k], 'k], ArenaSet[ArenaVec[Str['k], 'k], 'k], 'k] = ArenaMap::new(&cx);
     let names = program.types.keys(&cx);
     var n = 0usize;
     while n < names.len(&cx) {
@@ -470,7 +469,7 @@ fn check_type_expansion(&cx: Domain!['k], program: Program['k], counter: Fresh['
     var d = 0usize;
     while d < decls.len(&cx) {
         let decl = decls.at(&cx, d);
-        let params: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+        let params: ArenaSet[Str['k], 'k] = ArenaSet::new(&cx);
         var p = 0usize;
         while p < decl.params.len(&cx) {
             if !C::same_kind(decl.params.at(&cx, p).kind, Kind::Brand) {
@@ -505,7 +504,7 @@ fn check_type_expansion(&cx: Domain!['k], program: Program['k], counter: Fresh['
     var r = 0usize;
     while r < decls.len(&cx) {
         let decl = decls.at(&cx, r);
-        let bound: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+        let bound: ArenaSet[Str['k], 'k] = ArenaSet::new(&cx);
         let root_args: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         var p = 0usize;
         while p < decl.params.len(&cx) {

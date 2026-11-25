@@ -116,7 +116,7 @@ bounded by `core::cap::Access` where it reads or writes the domain and by `alloc
 where it allocates there, so `&cx` is all a call needs. Every value of the storage is a `Copy` view
 branded `'k`:
 
-- Text is a `std::raw::Span['k]`: the bytes of a literal (`Span::from_static(&cx, "x")`), of a file
+- Text is a `std::str::Str['k]`: the bytes of a literal (`Str::from_static(&cx, "x")`), of a file
   copied into the arena, or of text the compiler built.
 - A sequence is a `std::collections::arena_vec::ArenaVec[T, 'k]`: a header in the arena naming
   segments of elements that double in size, so elements never move and growing copies nothing.
@@ -155,7 +155,7 @@ because place flow and promotion report errors through the resolver, in their fi
 
 A group's hand-off is copied into the next arena with `kurs::transfer::copy_program` (every type,
 function, block, instruction, declaration and data form, maps in the same order),
-`check::checker::copy_typed`, `std::arena::copy_span(span, &from, &to)` (read under the first arena's
+`check::checker::copy_typed`, `std::arena::copy_str(text, &from, &to)` (read under the first arena's
 capability) and `types::ops::carry_fresh`; then the first arena is destroyed. A
 part shared by two places in the original is copied for each: nothing changes a program once it is
 lowered. `fail` still stops the process from inside, leaving whichever arenas are open to the
@@ -209,8 +209,8 @@ the declared empty paths an edge into it must still check.
 Text is built in the standard library's linear `Buffer!`, on the heap, threaded by value through
 a chain of writes, the methods every writer has (`std::fmt::Writer`, which a module imports to
 find them): `Buffer!::new().put("(").write(&cx, t).put(n)`. `put` prints a literal, a number, a
-`bool` or another buffer, which it frees; `write` copies a span or a byte slice, read under the
-domain's capability (`ReadBytes[Domain!['k], Span['k]]`), and `write_byte` one byte. Where the
+`bool` or another buffer, which it frees; `write` copies text or a byte slice, read under the
+domain's capability (`ReadBytes[Domain!['k], Str['k]]`), and `write_byte` one byte. Where the
 pieces read better as a sentence, an f-string writes them:
 `f"{line}:{col}: {message}".write(&cx, Buffer!::new())`. Text that must outlive the builder ends
 in the arena through `Buffer!::save`,
@@ -219,7 +219,7 @@ one block of exactly their length and frees the buffer; a builder that is droppe
 destroyed there (`out.destroy()`), and the leak check under valgrind would see one that is not.
 
 A helper that adds to text being built either takes the buffer and returns it
-(`fn str(&cx, out: Buffer!, t: Span['k]) -> Buffer!`, called `out = str(&cx, out, t)`), or, when
+(`fn str(&cx, out: Buffer!, t: Str['k]) -> Buffer!`, called `out = str(&cx, out, t)`), or, when
 it writes many lines from deep in a walk, takes it by place: `resolve::dump::Walk` and
 `infer::dump::Walk` pass `&out: Buffer!` to every method, `sigs::dump::sig` takes `&out`, and the
 C of a function's body is written into `&lines: Buffer!`, which `backend::cgen::line` appends to
@@ -231,7 +231,7 @@ write fails.
 
 | Python | Kursal |
 |---|---|
-| `str` | `Span['k]` (a byte view; `Span::from_static(&cx, "literal")`, `t.is(&cx, "literal")`, `t.eq(&cx, u)`, `t.cmp(&cx, u)`, `t.len()`, `slice`, `skip`, `find`, `split`, `starts_with`, `byte_or_zero`) |
+| `str` | `Str['k]` (a byte view; `Str::from_static(&cx, "literal")`, `t.is(&cx, "literal")`, `t.eq(&cx, u)`, `t.cmp(&cx, u)`, `t.len()`, `slice`, `skip`, `find`, `split`, `starts_with`, `byte_or_zero`) |
 | building a `str` | `Buffer!::new().put("a").write(&cx, t).put(n).save(&cx)`; in a loop, `var out = Buffer!::new();` and `out = out.put(", ");` |
 | `list`, `tuple` of values | `ArenaVec[T, 'k]` (`push`, `at`, `get` → `Option`, `set`, `len`, `pop` → `Option`, `clone`, `slice`, `skip`, `append`, `insert`, `remove`, `sort_by`, `contains`, `each`, `any`, `fold`, ...; each takes `&cx`) |
 | `dict` | `ArenaMap[K, V, 'k]` (insertion-ordered like `dict`: `insert`, `get` → `Option`, `at`, `get_or`, `contains`, `remove`, `keys`, `values`, `each`, `any`) |
@@ -258,7 +258,7 @@ rather than copying them with `keys`, and compare text without splitting it.
 Map keys are hashed and compared through the standard library's `HashIn[K, Domain!['k]]`, which
 borrows the context by place: `HashIn[K, Domain!['k]]::hash_in(&cx, key, state)`, or
 `std::hash::key_hash(&cx, key, seed)` and `key_eq(&cx, a, b)`. The standard library has the instances for the
-integers, `bool`, tuples, spans and `ArenaVec`s of keys, and `kurs::core` adds `Type`, `Param`,
+integers, `bool`, tuples, text and `ArenaVec`s of keys, and `kurs::core` adds `Type`, `Param`,
 `Premise` and `ModuleId`. `kurs::core::same` is structural type equality (Python's `==` on frozen
 dataclasses), `kurs::core::hash` its hash.
 
@@ -281,13 +281,13 @@ take `self` by value and `&cx`: the copies share the same storage. Its construct
 ### The operating system
 
 The compiler calls the standard library for everything it asks of the operating system, and hands
-it paths as spans of the arena, which it reads in place:
+it paths as text in the arena, which it reads in place:
 
 - **Arguments.** `main` is `fn main(args: std::process::Args) -> i32`, one of the entry shapes the
   backend accepts (`fn main()`, `fn main() -> i32` and `fn main() -> Result[(), std::io::Error]`,
   each with or without `args`); the C `main` the backend writes for it fills `Args` from `argv` and
   `argc` and returns the result as the exit status (see the reference compiler's README,
-  "Packages"). `front_end` views each argument as a span (`Span::from_static`), copying nothing.
+  "Packages"). `front_end` views each argument as text of the arena (`Str::from_static`), copying nothing.
 - **Files.** `std::fs::read_to_arena` reads a source, a manifest or a KURS file into the arena;
   `std::fs::write` writes the C. `resolve::resolver` lists source directories with
   `std::fs::read_dir`, asks `std::fs::path_exists` for a `kur.toml`, and resolves paths as
@@ -641,7 +641,7 @@ byte so that it is never null).
 
 Two zero-size objects may share an address, with each other and with what holds them. Nothing relies on distinct addresses for zero-size data: the identities the
 compiler and the standard library compare (`Ref::address`, `ArenaVec::address` and
-`ArenaMap::address`, which `Meta::id`, `fun_key` and the checker's copy cache use, and `Span`'s
+`ArenaMap::address`, which `Meta::id`, `fun_key` and the checker's copy cache use, and `Str`'s
 equal-address shortcut) are addresses of headers and states that have bytes.
 
 ### Enum layout: tags and niches
@@ -932,20 +932,20 @@ These are the places where Kursal differs from what one might expect.
   struct, tuple, enum, type alias, function, impl, trait or instance, and before an impl's method;
   never before a `use` or a `const` (`` `forall` comes before a struct, tuple, enum, type alias,
   function, impl, trait or instance ``, `` in an impl, `forall` comes before a method ``).
-- **Type aliases.** `forall 'k. type Str = Slice[u8, 'k];` names a type. The alias is transparent:
+- **Type aliases.** `forall 'k. type Bytes = Slice[u8, 'k];` names a type. The alias is transparent:
   wherever a type is written, signatures put the body in its place, its parameters replaced by the
-  arguments (`Str['k]` is `Slice[u8, 'k]`, and the two mix freely), so inference, KURS and the C
+  arguments (`Bytes['k]` is `Slice[u8, 'k]`, and the two mix freely), so inference, KURS and the C
   never see it, and messages show the type it stands for. Its `forall` lists only parameters, each
   of which the body uses (`type alias Pair takes no premises or determined parameters`, `type alias
-  Pair does not use its parameter U`); a use gives every argument (`Str takes 1 type argument, got
+  Pair does not use its parameter U`); a use gives every argument (`Bytes takes 1 type argument, got
   0`); no alias refers to itself, directly or through others (`type alias A refers to itself through
   B`); and its name ends with `!` exactly when the type it stands for is linear whatever its
   arguments are (`type alias L stands for a linear type; name it L!`, `type alias M! stands for a
   type that is not linear; name it M`). It has no representation of its own, so it is never
   `exposed` (`a type alias is never exposed: it has no representation of its own`), and it names a
-  type only: not a value, a constructor or the namespace of members (`Str is a type alias; it
+  type only: not a value, a constructor or the namespace of members (`Bytes is a type alias; it
   stands only where a type is written`). An `impl` or `instance` written through an alias means the
-  head it stands for, so `impl Str['k]` gives methods to `Slice`, and must be in `Slice`'s package.
+  head it stands for, so `impl Bytes['k]` gives methods to `Slice`, and must be in `Slice`'s package.
   An alias is imported, exported and kept private like any item.
 - **`Sized[T]`** says that `T` has a finite by-value layout of non-zero size. It is a premise of a
   function or an instance (so of each of its methods), never of a type declaration, and no program
@@ -1047,7 +1047,7 @@ These are the places where Kursal differs from what one might expect.
   `var (tag, arena) = ...;`, `var { x, ..rest } = p;`, `var [a, b] = xs;`,
   `var exists 'k. (tag, arena) = Arena!::new(seed);`.
 - **Brands.** `forall 'k.` binds a brand like a type parameter, and a type that holds branded storage
-  takes it as its last argument (`ArenaVec[Span['k], 'k]`). A brand is minted by a constructor that
+  takes it as its last argument (`ArenaVec[Str['k], 'k]`). A brand is minted by a constructor that
   returns `exists 'k. ...` and is opened by `let exists 'k. ...`, or `var exists 'k. cx = Domain!::new(hash_seed());` to lend what it binds. An opening's
   names and an `exists` type's binders are distinct and new where they are written: never `'static`,
   a brand parameter, an earlier opening still in scope or an enclosing `exists`'s binder. A trait may
@@ -1168,9 +1168,9 @@ These are the places where Kursal differs from what one might expect.
   `f"...".write(&cx, out)` also lends the f-string the capability in the place `cx`, a var as for any
   lend: the capability is moved out of `cx`, `out` is wrapped with it as `ReadingWriter![W,
   C]::new(out, cx)`, each segment is written through the wrapper, and `finish` hands back the writer,
-  the result, and the capability, which goes back into `cx`. So a `{span}` of a domain reads through
+  the result, and the capability, which goes back into `cx`. So a `{text}` of a domain reads through
   the domain's context: `f"{line}:{col}: {message}".write(&cx, Buffer!::new())` with `message:
-  Span['k]` and `&cx: Domain!['k]`. No `{x}` uses `cx` while it is lent (`cx is lent to this
+  Str['k]` and `&cx: Domain!['k]`. No `{x}` uses `cx` while it is lent (`cx is lent to this
   f-string; it cannot be used inside it`).
 - **Closures** `|x| x + 1u32` have types `closure(u32) -> u32` as parameters. A closure captures
   the locals of its function it mentions, a linear one by moving it in, which makes the closure

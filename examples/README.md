@@ -81,7 +81,7 @@ and report through their exit status, 0 when every check holds.
 | `generic_capabilities` | a user-defined resource protected by `core::cap` |
 | `mem_counter`, `mem_shared_sum`, `mem_shared_view`, `mem_split_fields` | sole ownership, shared access, read trees and field projection through `core::mem` |
 | `dlist` | a doubly linked list in one capability domain |
-| `arena_text` | text and tables in one arena, through a context of the program's own that lends the arena and its capability (`Access`, `Allocate`, `ReadBytes`): `ArenaVec` and its combinators, span search and comparison, keys compared through `HashIn`, text built in a `Buffer!` (with decimal numbers) and saved into the arena, text copied to another arena |
+| `arena_text` | text and tables in one arena, through a context of the program's own that lends the arena and its capability (`Access`, `Allocate`, `ReadBytes`): `ArenaVec` and its combinators, text search and comparison, keys compared through `HashIn`, text built in a `Buffer!` (with decimal numbers) and saved into the arena, text copied to another arena |
 | `arena_tables` | an `ArenaMap` and an `ArenaSet` in insertion order, with removal and growth, and scopes as a persistent `List`, in one `Domain!` |
 | `election_tally` | a vote tally on `std::collections::hashmap` |
 | `borrow_trait`, `convert_trait`, `format_trait`, `traits` | traits, including multi-parameter traits and the one behind `{expr}` interpolation |
@@ -97,7 +97,7 @@ and report through their exit status, 0 when every check holds.
 | `skolems`, `mint_join` (libraries), with `bad/mismatched_skolem.kur`, `bad/unbound_result_brand.kur`, `bad/reopened_brand.kur`, `bad/shadowing_exists_binder.kur` | brands: minting them, carrying them through branches and joins, and naming each apart from those in scope |
 | `basic`, `arrays`, `tuples`, `shapes` (libraries) | structs, fixed-size arrays, tuples, enums |
 | `generics`, `generic_result`, `option_result` (libraries) | generic types and functions, `Result`, `Option` and `?` |
-| `recursion`, `strings` (libraries) | recursion and early `return`; string literals as `Str['static]`, text built with `put`, and an f-string reading a branded `Str['k]` |
+| `recursion`, `strings` (libraries), with `bad/write_through_literal.kur` | recursion and early `return`; string literals as read-only `Str['static]`, a buffer's bytes seen as text (`as_str`), text built with `put`, and an f-string reading a branded `Str['k]` |
 | `closure_method` (library) | closure parameter types |
 
 ## Feature tests
@@ -164,6 +164,7 @@ Ownership, brands and authority:
 | `push_after_finish.kur` | a list builder is used after `finish` consumed it and handed the persistent list out |
 | `release_linear.kur` | `Allocation!::release`, which gives up the value in the block, is used at a linear type |
 | `ref_after_remove_in.kur` | a `Ref` into a map is used after `remove_in` gave the map a new brand |
+| `write_through_literal.kur` | a literal's bytes are reached for writing, and text, a `Str`, hands out no `Ref` or other way to write |
 | `implicit_package_open.kur`, `implicit_package_open_plain_let.kur`, `implicit_package_open_assignment.kur` | an existential package is used without `let exists` opening it |
 | `close_by_number.kur`, `write_by_number.kur`, `safe_adopt.kur` | an `unsafe fn` is called without `unsafe` |
 | `unmarked_in_unsafe_fn.kur` | an `unsafe fn` reads through a raw pointer without `unsafe`: its body is no unsafe context |

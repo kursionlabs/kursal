@@ -14,7 +14,7 @@
 // one pointer per segment after the first. A `Ref` from `get_ref` names its
 // element for as long as the arena lives. The first segment holds at least
 // 4 elements and at least 32 bytes, so short runs of bytes stay in one
-// piece; `span` copies longer ones into one block of the arena.
+// piece; `to_str` copies longer ones into one block of the arena.
 //
 // Elements are `Copy` and are read and written whole. Every access
 // presents the domain's `Exclusive!['k]`, lent by a context (`Access`);
@@ -42,7 +42,7 @@ use core::cmp::Order;
 use core::hash::{HashIn, HashState};
 use core::mem::{Ref, sizeof};
 use core::option::Option;
-use core::raw::Span;
+use core::str::Str;
 use core::ptr::{null, offset};
 use core::slice::Slice;
 
@@ -752,12 +752,12 @@ instance HashIn[ArenaVec[T, 'k], Domain!['k]] {
 
 forall 'k.
 impl ArenaVec[u8, 'k] {
-    /// Pushes the bytes of `bytes`, a span of the same domain. The span may
-    /// view this vec's own bytes (`span`), even ones past its length after a
+    /// Pushes the bytes of `bytes`, text of the same domain. The text may
+    /// view this vec's own bytes (`to_str`), even ones past its length after a
     /// `truncate`, which the push then overwrites: each byte is read before
     /// it is overwritten, as `memmove` does.
     forall C, R where Allocate[C -> 'k, R].
-    fn push_span(self, &cx: C, bytes: Span['k]) {
+    fn push_str(self, &cx: C, bytes: Str['k]) {
         let n = bytes.len();
         if n == 0usize {
             return;
@@ -769,7 +769,7 @@ impl ArenaVec[u8, 'k] {
         }
         // `bytes` is read under the domain's capability, which `tag` is.
         let (source, count) = bytes.into_parts();
-        // A span over this vec lies in segment 0 (`span` copies a longer run
+        // Text over this vec lies in segment 0 (`to_str` copies a longer run
         // out), where the destination's bytes follow one another too. A
         // source that starts below the destination is copied from its end,
         // so no byte is overwritten before it is read; any other, from its
@@ -794,28 +794,28 @@ impl ArenaVec[u8, 'k] {
 
     /// Pushes the bytes of a literal.
     forall C, R where Allocate[C -> 'k, R].
-    fn push_static(self, &cx: C, bytes: Slice[u8, 'static]) {
+    fn push_static(self, &cx: C, bytes: Str['static]) {
         let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
         var d = Domain!.{ tag, arena };
-        self.push_span(&d, Span::from_static(&d, bytes));
+        self.push_str(&d, Str::from_static(&d, bytes));
         let { tag, arena } = d;
         cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
     }
 
-    /// The bytes the vec holds now, as one span: a view of them while they
+    /// The bytes the vec holds now, as text: a view of them while they
     /// fit the first segment, else a copy in one block of the arena. Later
     /// pushes do not lengthen it; a `set`, or a push after a `truncate`,
     /// rewrites the bytes of a view.
     forall C, R where Allocate[C -> 'k, R].
-    fn span(self, &cx: C) -> Span['k] {
+    fn to_str(self, &cx: C) -> Str['k] {
         var (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
         let h = self.header.copy(&tag);
         let s = if h.len == 0usize {
-            Span::empty(&tag)
+            Str::empty(&tag)
         } else if h.segments == 1usize {
             // The first `len` bytes of segment 0: initialized, and arena
             // memory of the domain `tag` governs.
-            unsafe Span::from_raw_parts(&tag, h.first, h.len)
+            unsafe Str::from_raw_parts(&tag, h.first, h.len)
         } else {
             let block = &arena.alloc_slice(&tag, h.len, 0u8);
             let (dest, size, marker) = block.into_parts();
@@ -824,7 +824,7 @@ impl ArenaVec[u8, 'k] {
                 unsafe *(unsafe offset(dest, i)) = unsafe *(unsafe place(h, i));
                 i = i + 1usize;
             }
-            Span::from_slice(block)
+            block.as_str()
         };
         cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
         s
@@ -832,29 +832,29 @@ impl ArenaVec[u8, 'k] {
 }
 
 forall 'k.
-impl ArenaVec[Span['k], 'k] {
-    /// The pieces of `span` between occurrences of `separator`, in order:
+impl ArenaVec[Str['k], 'k] {
+    /// The pieces of `text` between occurrences of `separator`, in order:
     /// one more than there are occurrences, empty ones included. An empty
-    /// separator occurs nowhere: the one piece is the whole span.
+    /// separator occurs nowhere: the one piece is the whole text.
     forall C, R where Allocate[C -> 'k, R].
-    fn split(&cx: C, span: Span['k], separator: Span['k]) -> ArenaVec[Span['k], 'k] {
+    fn split(&cx: C, text: Str['k], separator: Str['k]) -> ArenaVec[Str['k], 'k] {
         let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
         var d = Domain!.{ tag, arena };
-        let pieces: ArenaVec[Span['k], 'k] = ArenaVec::new(&d);
+        let pieces: ArenaVec[Str['k], 'k] = ArenaVec::new(&d);
         var start = 0usize;
         var going = true;
         if separator.len() == 0usize {
-            pieces.push(&d, span);
+            pieces.push(&d, text);
             going = false;
         }
         while going {
-            match span.find(&d, separator, start) {
+            match text.find(&d, separator, start) {
                 Some(at) => {
-                    pieces.push(&d, span.slice(start, at));
+                    pieces.push(&d, text.slice(start, at));
                     start = at + separator.len();
                 },
                 None => {
-                    pieces.push(&d, span.skip(start));
+                    pieces.push(&d, text.skip(start));
                     going = false;
                 },
             }
@@ -864,10 +864,10 @@ impl ArenaVec[Span['k], 'k] {
         pieces
     }
 
-    /// The spans' bytes with `separator` between each two, in one new span:
+    /// The pieces' bytes with `separator` between each two, as one new text:
     /// `split`'s inverse.
     forall C, R where Allocate[C -> 'k, R].
-    fn join(self, &cx: C, separator: Slice[u8, 'static]) -> Span['k] {
+    fn join(self, &cx: C, separator: Str['static]) -> Str['k] {
         let (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
         var d = Domain!.{ tag, arena };
         var out = Buffer!::new();

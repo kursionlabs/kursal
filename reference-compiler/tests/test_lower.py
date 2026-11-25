@@ -26,7 +26,8 @@ OPTION = "forall T. exposed enum Option { Some(T), None }\n"
 ITER = "use package::option::Option;\nforall Self -> Item.\ntrait Iterator { fn next(&it: Self) -> Option[Item]; }\n"
 
 FSTRING_BRANCHES = """
-use std::slice::{StaticRead, bytes_eq};
+use std::slice::bytes_eq;
+use std::str::StaticRead;
 fn main() -> i32 {
     var n = 5u32;
     let msg = f"{if n == 5 { 7u32 } else { 8u32 }}:{match n { 5 => 9u32, _ => 10u32 }}:{&n}:{n}";

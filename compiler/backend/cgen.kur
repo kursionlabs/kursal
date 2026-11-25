@@ -16,7 +16,7 @@ use std::collections::arena_vec::ArenaVec;
 use std::collections::arena_map::{ArenaMap, ArenaSet};
 use std::mem::Ref;
 use std::ascii::{is_alnum, is_digit, to_lower};
-use std::raw::Span;
+use std::str::Str;
 use std::arena::{Domain!, concat, ref_in};
 use std::buffer::Buffer!;
 use std::fmt::Writer;
@@ -31,11 +31,10 @@ use package::syntax::ast::{Pos, no_pos};
 use package::types::termination::check_mono_termination;
 use package::types::ops::{Fresh, Row, Types, alpha_hashes, equal, kurs_error, map_children, mapped_component, mapped_operand, show, subst, walk};
 use std::option::Option;
-use std::slice::Slice;
 use std::time::Instant;
 use std::io::eprint;
 
-fn c_stage(times: bool, name: Slice[u8, 'static], started: Instant) -> Instant {
+fn c_stage(times: bool, name: Str['static], started: Instant) -> Instant {
     let now = Instant::now();
     if times {
         let ms = now.since(started).as_millis();
@@ -47,10 +46,10 @@ fn c_stage(times: bool, name: Slice[u8, 'static], started: Instant) -> Instant {
 }
 
 // The C function, in `lib/libc/start.c`, that C's `main` calls to report the error an entry returns.
-const REPORT_ERROR: Slice[u8, 'static] = "kur_libc_process_report_error";
+const REPORT_ERROR: Str['static] = "kur_libc_process_report_error";
 // The C function, in `lib/libc/start.c`, that a hosted C `main` calls first: it opens /dev/null on each
 // standard descriptor the process started without, and ignores SIGPIPE.
-const START: Slice[u8, 'static] = "kur_libc_process_start";
+const START: Str['static] = "kur_libc_process_start";
 
 // How C's `main` makes an entry's result its exit status (`Backend::entry_result`).
 enum EntryResult {
@@ -87,7 +86,7 @@ fn prelude() -> Buffer! {
 
 // The header every file of a split build includes: the program's types, externs, data declarations
 // and function heads.
-const HEADER: Slice[u8, 'static] = "kursal-decls.h";
+const HEADER: Str['static] = "kursal-decls.h";
 
 // About the most C one file of a split build holds, in bytes, unless one function is longer.
 const PIECE: usize = 524288usize;
@@ -101,7 +100,7 @@ fn included() -> Buffer! {
 forall 'k.
 exposed enum CText! {
     One(Buffer!),
-    Split(ArenaVec[(Span['k], Span['k]), 'k]),
+    Split(ArenaVec[(Str['k], Str['k]), 'k]),
 }
 
 // The file of a split build a function goes to, without its `.c`: its module, the leading segments
@@ -110,9 +109,9 @@ exposed enum CText! {
 // not a plain name ends the module before it; a linear type's `!` is left out. Such names never
 // hold a `-`, which the header and the files the backend adds have.
 forall 'k.
-fn module_file(&cx: Domain!['k], name: Span['k]) -> Span['k] {
-    let separator = Span::from_static(&cx, "::");
-    let segments: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+fn module_file(&cx: Domain!['k], name: Str['k]) -> Str['k] {
+    let separator = Str::from_static(&cx, "::");
+    let segments: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
     var rest = name;
     var more = true;
     while more {
@@ -140,7 +139,7 @@ fn module_file(&cx: Domain!['k], name: Span['k]) -> Span['k] {
             if taken > 0usize {
                 out = out.put(".");
             }
-            let bare = if segment.ends_with(&cx, Span::from_static(&cx, "!")) { segment.take(segment.len() - 1usize) } else { segment };
+            let bare = if segment.ends_with(&cx, Str::from_static(&cx, "!")) { segment.take(segment.len() - 1usize) } else { segment };
             out = out.write(&cx, bare);
             taken = taken + 1usize;
         } else {
@@ -149,14 +148,14 @@ fn module_file(&cx: Domain!['k], name: Span['k]) -> Span['k] {
     }
     if taken == 0usize {
         out.destroy();
-        return Span::from_static(&cx, "kursal-root");
+        return Str::from_static(&cx, "kursal-root");
     }
     out.save(&cx)
 }
 
 // Each of `items`, followed by a newline.
 forall 'k.
-fn text_lines(&cx: Domain!['k], c: Buffer!, items: ArenaVec[Span['k], 'k]) -> Buffer! {
+fn text_lines(&cx: Domain!['k], c: Buffer!, items: ArenaVec[Str['k], 'k]) -> Buffer! {
     var c = c;
     var i = 0usize;
     while i < items.len(&cx) {
@@ -167,17 +166,17 @@ fn text_lines(&cx: Domain!['k], c: Buffer!, items: ArenaVec[Span['k], 'k]) -> Bu
 }
 
 forall 'k.
-fn c_prim(&cx: Domain!['k], name: Span['k]) -> Span['k] {
+fn c_prim(&cx: Domain!['k], name: Str['k]) -> Str['k] {
     if name.is(&cx, "bool") {
-        Span::from_static(&cx, "_Bool")
+        Str::from_static(&cx, "_Bool")
     } else if name.is(&cx, "f32") {
-        Span::from_static(&cx, "float")
+        Str::from_static(&cx, "float")
     } else if name.is(&cx, "f64") {
-        Span::from_static(&cx, "double")
+        Str::from_static(&cx, "double")
     } else if name.is(&cx, "usize") {
-        Span::from_static(&cx, "uintptr_t")
+        Str::from_static(&cx, "uintptr_t")
     } else if name.is(&cx, "isize") {
-        Span::from_static(&cx, "intptr_t")
+        Str::from_static(&cx, "intptr_t")
     } else if name.byte_or_zero(&cx, 0usize) == b'u' {
         f"uint{name.skip(1usize)}_t".write(&cx, Buffer!::new()).save(&cx)
     } else {
@@ -193,12 +192,12 @@ fn line(&lines: Buffer!, l: Buffer!) {
 // The suffix of a signed integer type's `kur_dec_i` decoder (`8` to `64`, or `size`), or none for
 // any other type.
 forall 'k.
-fn signed_suffix(&cx: Domain!['k], name: Span['k]) -> Option[Span['k]] {
+fn signed_suffix(&cx: Domain!['k], name: Str['k]) -> Option[Str['k]] {
     if name.byte_or_zero(&cx, 0usize) == b'i' && C::is_integer(&cx, name) { Option::Some.(name.skip(1usize)) } else { Option::None }
 }
 
 forall 'k.
-fn c_order(&cx: Domain!['k], order: Span['k]) -> Span['k] {
+fn c_order(&cx: Domain!['k], order: Str['k]) -> Str['k] {
     var out = Buffer!::new().put("__ATOMIC_");
     var i = 0usize;
     while i < order.len() {
@@ -210,47 +209,47 @@ fn c_order(&cx: Domain!['k], order: Span['k]) -> Span['k] {
 }
 
 forall 'k.
-fn c_op(&cx: Domain!['k], op: Span['k]) -> Span['k] {
+fn c_op(&cx: Domain!['k], op: Str['k]) -> Str['k] {
     if op.is(&cx, "add") {
-        Span::from_static(&cx, "+")
+        Str::from_static(&cx, "+")
     } else if op.is(&cx, "sub") {
-        Span::from_static(&cx, "-")
+        Str::from_static(&cx, "-")
     } else if op.is(&cx, "mul") {
-        Span::from_static(&cx, "*")
+        Str::from_static(&cx, "*")
     } else if op.is(&cx, "div") {
-        Span::from_static(&cx, "/")
+        Str::from_static(&cx, "/")
     } else if op.is(&cx, "mod") {
-        Span::from_static(&cx, "%")
+        Str::from_static(&cx, "%")
     } else if op.is(&cx, "bit_and") {
-        Span::from_static(&cx, "&")
+        Str::from_static(&cx, "&")
     } else if op.is(&cx, "bit_or") {
-        Span::from_static(&cx, "|")
+        Str::from_static(&cx, "|")
     } else if op.is(&cx, "bit_xor") {
-        Span::from_static(&cx, "^")
+        Str::from_static(&cx, "^")
     } else if op.is(&cx, "eq") {
-        Span::from_static(&cx, "==")
+        Str::from_static(&cx, "==")
     } else if op.is(&cx, "ne") {
-        Span::from_static(&cx, "!=")
+        Str::from_static(&cx, "!=")
     } else if op.is(&cx, "lt") {
-        Span::from_static(&cx, "<")
+        Str::from_static(&cx, "<")
     } else if op.is(&cx, "le") {
-        Span::from_static(&cx, "<=")
+        Str::from_static(&cx, "<=")
     } else if op.is(&cx, "gt") {
-        Span::from_static(&cx, ">")
+        Str::from_static(&cx, ">")
     } else {
-        Span::from_static(&cx, ">=")
+        Str::from_static(&cx, ">=")
     }
 }
 
 forall 'k.
-fn is_c_op(&cx: Domain!['k], op: Span['k]) -> bool {
+fn is_c_op(&cx: Domain!['k], op: Str['k]) -> bool {
     op.is(&cx, "add") || op.is(&cx, "sub") || op.is(&cx, "mul") || op.is(&cx, "div") || op.is(&cx, "mod") || op.is(&cx, "bit_and") || op.is(&cx, "bit_or")
         || op.is(&cx, "bit_xor") || op.is(&cx, "eq") || op.is(&cx, "ne") || op.is(&cx, "lt") || op.is(&cx, "le") || op.is(&cx, "gt") || op.is(&cx, "ge")
 }
 
 forall 'k.
-fn add_words(&cx: Domain!['k], set: ArenaSet[Span['k], 'k], words: Slice[u8, 'static]) {
-    let all = ArenaVec::split(&cx, Span::from_static(&cx, words), Span::from_static(&cx, " "));
+fn add_words(&cx: Domain!['k], set: ArenaSet[Str['k], 'k], words: Str['static]) {
+    let all = ArenaVec::split(&cx, Str::from_static(&cx, words), Str::from_static(&cx, " "));
     var i = 0usize;
     while i < all.len(&cx) {
         set.insert(&cx, all.at(&cx, i));
@@ -259,8 +258,8 @@ fn add_words(&cx: Domain!['k], set: ArenaSet[Span['k], 'k], words: Slice[u8, 'st
 }
 
 forall 'k.
-fn c_keywords(&cx: Domain!['k]) -> ArenaSet[Span['k], 'k] {
-    let out: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+fn c_keywords(&cx: Domain!['k]) -> ArenaSet[Str['k], 'k] {
+    let out: ArenaSet[Str['k], 'k] = ArenaSet::new(&cx);
     add_words(&cx, out, "auto break case char const continue default do double else enum extern float for goto if");
     add_words(&cx, out, "inline int long register restrict return short signed sizeof static struct switch typedef");
     add_words(&cx, out, "union unsigned void volatile while _Alignas _Alignof _Atomic _Bool _Complex _Generic");
@@ -269,19 +268,19 @@ fn c_keywords(&cx: Domain!['k]) -> ArenaSet[Span['k], 'k] {
 }
 
 forall 'k.
-fn runtime_names(&cx: Domain!['k]) -> ArenaSet[Span['k], 'k] {
-    let out: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+fn runtime_names(&cx: Domain!['k]) -> ArenaSet[Str['k], 'k] {
+    let out: ArenaSet[Str['k], 'k] = ArenaSet::new(&cx);
     add_words(&cx, out, "KUR_TRAP KUR_MUSTTAIL KUR_FIELD KUR_PTR_BITS kur_dec_i8 kur_dec_i16 kur_dec_i32 kur_dec_i64 kur_dec_isize");
     add_words(&cx, out, "SIZE_MAX PTRDIFF_MIN PTRDIFF_MAX SIG_ATOMIC_MIN SIG_ATOMIC_MAX WCHAR_MIN WCHAR_MAX WINT_MIN WINT_MAX");
     add_words(&cx, out, "__ATOMIC_RELAXED __ATOMIC_ACQUIRE __ATOMIC_RELEASE __ATOMIC_ACQ_REL __ATOMIC_SEQ_CST");
-    let stems = ArenaVec::split(&cx, Span::from_static(&cx, "8 16 32 64 _LEAST8 _LEAST16 _LEAST32 _LEAST64 _FAST8 _FAST16 _FAST32 _FAST64 PTR MAX"), Span::from_static(&cx, " "));
-    let suffixes = ArenaVec::split(&cx, Span::from_static(&cx, "MIN MAX C WIDTH"), Span::from_static(&cx, " "));
+    let stems = ArenaVec::split(&cx, Str::from_static(&cx, "8 16 32 64 _LEAST8 _LEAST16 _LEAST32 _LEAST64 _FAST8 _FAST16 _FAST32 _FAST64 PTR MAX"), Str::from_static(&cx, " "));
+    let suffixes = ArenaVec::split(&cx, Str::from_static(&cx, "MIN MAX C WIDTH"), Str::from_static(&cx, " "));
     var i = 0usize;
     while i < stems.len(&cx) {
         let stem = stems.at(&cx, i);
         var u = 0usize;
         while u < 2usize {
-            let unsigned = if u == 1usize { Span::from_static(&cx, "U") } else { Span::from_static(&cx, "") };
+            let unsigned = if u == 1usize { Str::from_static(&cx, "U") } else { Str::from_static(&cx, "") };
             out.insert(&cx, Buffer!::new().write(&cx, lower(&cx, unsigned)).put("int").write(&cx, lower(&cx, stem)).put("_t").save(&cx));
             var s = 0usize;
             while s < suffixes.len(&cx) {
@@ -296,7 +295,7 @@ fn runtime_names(&cx: Domain!['k]) -> ArenaSet[Span['k], 'k] {
 }
 
 forall 'k.
-fn lower(&cx: Domain!['k], t: Span['k]) -> Span['k] {
+fn lower(&cx: Domain!['k], t: Str['k]) -> Str['k] {
     var out = Buffer!::new();
     var i = 0usize;
     while i < t.len() {
@@ -316,20 +315,20 @@ fn is_word_byte(b: u8) -> bool {
 // released, so every lower number is still taken, and the search resumes after it.
 forall 'k.
 exposed struct Pool {
-    taken: ArenaSet[Span['k], 'k],
-    last: ArenaMap[Span['k], usize, 'k],
+    taken: ArenaSet[Str['k], 'k],
+    last: ArenaMap[Str['k], usize, 'k],
 }
 
 forall 'k.
 impl Pool['k] {
-    fn new(&cx: Domain!['k], taken: ArenaSet[Span['k], 'k]) -> Pool['k] {
+    fn new(&cx: Domain!['k], taken: ArenaSet[Str['k], 'k]) -> Pool['k] {
         Pool.{ taken, last: ArenaMap::new(&cx) }
     }
 }
 
 // Allocate a C identifier; the readable spelling is only a hint.
 forall 'k.
-fn allocate(&cx: Domain!['k], base: Span['k], pool: Pool['k]) -> Span['k] {
+fn allocate(&cx: Domain!['k], base: Str['k], pool: Pool['k]) -> Str['k] {
     let start = if is_digit(base.byte_or_zero(&cx, 0usize)) { Buffer!::new().put("k_").write(&cx, base).save(&cx) } else { base };
     var name = start;
     if pool.taken.contains(&cx, name) {
@@ -348,9 +347,9 @@ fn allocate(&cx: Domain!['k], base: Span['k], pool: Pool['k]) -> Span['k] {
 
 // Decode the linker's hex-encoded identity segments, then make a C identifier.
 forall 'k.
-fn readable(&cx: Domain!['k], name: Span['k]) -> Span['k] {
+fn readable(&cx: Domain!['k], name: Str['k]) -> Str['k] {
     var joined = Buffer!::new();
-    let pieces = ArenaVec::split(&cx, name, Span::from_static(&cx, "::"));
+    let pieces = ArenaVec::split(&cx, name, Str::from_static(&cx, "::"));
     var i = 0usize;
     while i < pieces.len(&cx) {
         if i > 0usize {
@@ -385,12 +384,12 @@ fn readable(&cx: Domain!['k], name: Span['k]) -> Span['k] {
     while end > start && made.byte_or_zero(&cx, end - 1usize) == b'_' {
         end = end - 1usize;
     }
-    if start == end { Span::from_static(&cx, "x") } else { made.slice(start, end) }
+    if start == end { Str::from_static(&cx, "x") } else { made.slice(start, end) }
 }
 
 // The last `n` characters of ASCII text.
 forall 'k.
-fn tail(t: Span['k], n: usize) -> Span['k] {
+fn tail(t: Str['k], n: usize) -> Str['k] {
     if t.len() > n { t.skip(t.len() - n) } else { t }
 }
 
@@ -398,7 +397,7 @@ fn tail(t: Span['k], n: usize) -> Span['k] {
 forall 'k.
 fn erase(&cx: Domain!['k], ty: Type['k], types: Types['k]) -> Type['k] {
     match ty {
-        Skolem(_label) => Type::Skolem.(Span::from_static(&cx, "_")),
+        Skolem(_label) => Type::Skolem.(Str::from_static(&cx, "_")),
         Brand(_brand) => C::unit(&cx),
         Exists(_binders, body) => erase(&cx, body.copy(&cx), types),
         Foreach(f) => erase(&cx, types.expand(&cx, f, Option::None), types),
@@ -450,13 +449,13 @@ fn is_pointer_like(t: Type['k]) -> bool {
 }
 
 forall 'k.
-fn or_void(&cx: Domain!['k], t: Span['k]) -> Span['k] {
-    if t.is_empty() { Span::from_static(&cx, "void") } else { t }
+fn or_void(&cx: Domain!['k], t: Str['k]) -> Str['k] {
+    if t.is_empty() { Str::from_static(&cx, "void") } else { t }
 }
 
 // A C identifier: `[A-Za-z_][A-Za-z0-9_]*`.
 forall 'k.
-fn is_c_identifier(&cx: Domain!['k], t: Span['k]) -> bool {
+fn is_c_identifier(&cx: Domain!['k], t: Str['k]) -> bool {
     if t.is_empty() || is_digit(t.byte_or_zero(&cx, 0usize)) {
         return false;
     }
@@ -471,8 +470,8 @@ fn is_c_identifier(&cx: Domain!['k], t: Span['k]) -> bool {
 }
 
 forall 'k.
-fn member_names(&cx: Domain!['k], members: ArenaVec[(Span['k], Type['k]), 'k]) -> ArenaVec[Span['k], 'k] {
-    let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+fn member_names(&cx: Domain!['k], members: ArenaVec[(Str['k], Type['k]), 'k]) -> ArenaVec[Str['k], 'k] {
+    let out: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
     var i = 0usize;
     while i < members.len(&cx) {
         let (m, _t) = members.at(&cx, i);
@@ -485,8 +484,8 @@ fn member_names(&cx: Domain!['k], members: ArenaVec[(Span['k], Type['k]), 'k]) -
 // The members `items[k]` of an array of `count` elements of type `elem`, as `Backend::members`
 // gives a struct's.
 forall 'k.
-fn items_of(&cx: Domain!['k], count: usize, elem: Type['k]) -> ArenaVec[(Span['k], Type['k]), 'k] {
-    let out: ArenaVec[(Span['k], Type['k]), 'k] = ArenaVec::new(&cx);
+fn items_of(&cx: Domain!['k], count: usize, elem: Type['k]) -> ArenaVec[(Str['k], Type['k]), 'k] {
+    let out: ArenaVec[(Str['k], Type['k]), 'k] = ArenaVec::new(&cx);
     var k = 0usize;
     while k < count {
         out.push(&cx, (f"items[{k}]".write(&cx, Buffer!::new()).save(&cx), elem));
@@ -496,8 +495,8 @@ fn items_of(&cx: Domain!['k], count: usize, elem: Type['k]) -> ArenaVec[(Span['k
 }
 
 forall 'k.
-fn items_access(&cx: Domain!['k], count: usize) -> ArenaVec[Span['k], 'k] {
-    let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+fn items_access(&cx: Domain!['k], count: usize) -> ArenaVec[Str['k], 'k] {
+    let out: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
     var k = 0usize;
     while k < count {
         out.push(&cx, f"items[{k}]".write(&cx, Buffer!::new()).save(&cx));
@@ -510,17 +509,17 @@ fn items_access(&cx: Domain!['k], count: usize) -> ArenaVec[Span['k], 'k] {
 // `place`), the C expression `value`, which reads the C variable `base`.
 forall 'k.
 exposed struct Move {
-    dst: Span['k],
+    dst: Str['k],
     ty: Type['k],
     place: bool,
-    value: Span['k],
-    base: Span['k],
+    value: Str['k],
+    base: Str['k],
 }
 
 // Whether a C type is a scalar: an integer, a floating type or a pointer.
 forall 'k.
-fn is_scalar(&cx: Domain!['k], t: Span['k]) -> bool {
-    t.ends_with(&cx, Span::from_static(&cx, "*")) || t.is(&cx, "_Bool") || t.is(&cx, "float") || t.is(&cx, "double")
+fn is_scalar(&cx: Domain!['k], t: Str['k]) -> bool {
+    t.ends_with(&cx, Str::from_static(&cx, "*")) || t.is(&cx, "_Bool") || t.is(&cx, "float") || t.is(&cx, "double")
         || t.is(&cx, "uint8_t") || t.is(&cx, "uint16_t") || t.is(&cx, "uint32_t") || t.is(&cx, "uint64_t")
         || t.is(&cx, "int8_t") || t.is(&cx, "int16_t") || t.is(&cx, "int32_t") || t.is(&cx, "int64_t")
         || t.is(&cx, "uintptr_t") || t.is(&cx, "intptr_t")
@@ -530,8 +529,8 @@ fn is_scalar(&cx: Domain!['k], t: Span['k]) -> bool {
 // qualified as `qualifiers` decides).
 forall 'k.
 exposed struct CParam {
-    ctype: Span['k],
-    cname: Span['k],
+    ctype: Str['k],
+    cname: Str['k],
     place: bool,
 }
 
@@ -539,121 +538,121 @@ forall 'k.
 exposed struct Backend {
     program: Program['k],
     // function -> (block label, SSA name) -> type, as the checker recorded them
-    recorded: ArenaMap[FunKey['k], ArenaMap[(Span['k], Span['k]), Type['k], 'k], 'k],
+    recorded: ArenaMap[FunKey['k], ArenaMap[(Str['k], Str['k]), Type['k], 'k], 'k],
     counter: Fresh['k],
     types: Types['k],
     // representation key -> C type name
-    names: ArenaMap[Type['k], Span['k], 'k],
+    names: ArenaMap[Type['k], Str['k], 'k],
     // an enum in the niche layout -> its payload's representation key
     represented: ArenaMap[Type['k], Type['k], 'k],
     // a type as written -> its C type, once `ctype` has named and defined it
-    ctypes: ArenaMap[Type['k], Span['k], 'k],
+    ctypes: ArenaMap[Type['k], Str['k], 'k],
     // a name -> `readable` of it
-    readables: ArenaMap[Span['k], Span['k], 'k],
+    readables: ArenaMap[Str['k], Str['k], 'k],
     // named but not yet defined aggregates
     pending: ArenaMap[Type['k], Type['k], 'k],
-    forward: ArenaVec[Span['k], 'k],
-    defs: ArenaVec[Span['k], 'k],
+    forward: ArenaVec[Str['k], 'k],
+    defs: ArenaVec[Str['k], 'k],
     // (function, `alpha_hashes` of the arguments) -> the unbranded type arguments of each of its
     // specializations whose arguments hash so, and its C symbol
-    symbols: ArenaMap[(FunKey['k], u64), ArenaVec[(ArenaVec[Type['k], 'k], Span['k]), 'k], 'k],
+    symbols: ArenaMap[(FunKey['k], u64), ArenaVec[(ArenaVec[Type['k], 'k], Str['k]), 'k], 'k],
     // the same, by structure: an earlier request with these very arguments
-    symbol_index: ArenaMap[(FunKey['k], ArenaVec[Type['k], 'k]), Span['k], 'k],
+    symbol_index: ArenaMap[(FunKey['k], ArenaVec[Type['k], 'k]), Str['k], 'k],
     // the part of a specialization's C identity that depends only on its function definition
-    signature_keys: ArenaMap[FunKey['k], Span['k], 'k],
+    signature_keys: ArenaMap[FunKey['k], Str['k], 'k],
     // Whether a resolved type is passed indirectly in C, shared across function specializations.
     by_pointer_cache: ArenaMap[Type['k], bool, 'k],
-    queue: ArenaVec[(FunKey['k], Fun['k], ArenaMap[Span['k], Type['k], 'k], Span['k]), 'k],
+    queue: ArenaVec[(FunKey['k], Fun['k], ArenaMap[Str['k], Type['k], 'k], Str['k]), 'k],
     // Each function in order: its symbol, when its head waits for `qualifiers`, else its head; its body;
     // and the file of a split build it goes to (`module_file`), empty for a thunk.
-    emitted: ArenaVec[(Option[Span['k]], Span['k], Span['k], Span['k]), 'k],
+    emitted: ArenaVec[(Option[Str['k]], Str['k], Str['k], Str['k]), 'k],
     // `static ` for one C file, where every function and data is the file's own; empty for a split
     // build, whose files call one another's
-    linkage: Span['k],
+    linkage: Str['k],
     // symbol -> its C result, whether it never returns, and its parameters; a parameter of a zero-size
     // type has the C type `void` and no name, and is not written
-    heads: ArenaMap[Span['k], (Span['k], bool, ArenaVec[CParam['k], 'k]), 'k],
+    heads: ArenaMap[Str['k], (Str['k], bool, ArenaVec[CParam['k], 'k]), 'k],
     // Every place lent to a function by symbol: (callee, its parameter, where the place is: "param"
     // under the caller's place parameter, "local" in its local place, "raw" behind a pointer; the
     // caller, and its parameter for "param").
-    lends: ArenaVec[(Span['k], usize, Span['k], Span['k], usize), 'k],
+    lends: ArenaVec[(Str['k], usize, Str['k], Str['k], usize), 'k],
     // place parameters the function may write
-    written: ArenaSet[(Span['k], usize), 'k],
-    address_taken: ArenaSet[Span['k], 'k],
+    written: ArenaSet[(Str['k], usize), 'k],
+    address_taken: ArenaSet[Str['k], 'k],
     // functions whose tail call to themselves moves a place parameter
-    looping: ArenaSet[Span['k], 'k],
-    datas: ArenaMap[Span['k], (Span['k], Data['k]), 'k],
+    looping: ArenaSet[Str['k], 'k],
+    datas: ArenaMap[Str['k], (Str['k], Data['k]), 'k],
     // One conservative pool for ordinary identifiers, including function locals: later global
     // declarations must not be shadowed by earlier locals.
     taken: Pool['k],
-    component_names: ArenaMap[(Span['k], Span['k]), Span['k], 'k],
+    component_names: ArenaMap[(Str['k], Str['k]), Str['k], 'k],
     component_taken: Pool['k],
     instance_params: ArenaMap[FunKey['k], ArenaVec[Param['k], 'k], 'k],
-    function_ids: ArenaMap[FunKey['k], (ArenaVec[Span['k], 'k], Span['k]), 'k],
+    function_ids: ArenaMap[FunKey['k], (ArenaVec[Str['k], 'k], Str['k]), 'k],
     // the function being emitted
     fun: Ref[Option[Fun['k]], 'k],
-    sub: Ref[ArenaMap[Span['k], Type['k], 'k], 'k],
+    sub: Ref[ArenaMap[Str['k], Type['k], 'k], 'k],
     // types under `sub`, when substituting renamed no binder
     substituted: Ref[ArenaMap[Type['k], Type['k], 'k], 'k],
-    locals: Ref[ArenaMap[(Span['k], Span['k]), Span['k], 'k], 'k],
+    locals: Ref[ArenaMap[(Str['k], Str['k]), Str['k], 'k], 'k],
 
-    symbol: Ref[Span['k], 'k],
+    symbol: Ref[Str['k], 'k],
     plan: Ref[Option[Plan['k]], 'k],
     // the entry block's parameter names
-    params: Ref[ArenaVec[Span['k], 'k], 'k],
+    params: Ref[ArenaVec[Str['k], 'k], 'k],
     // (block label, SSA name) -> the C variable a copy or a forwarded load reads
-    aliases: Ref[ArenaMap[(Span['k], Span['k]), Span['k], 'k], 'k],
+    aliases: Ref[ArenaMap[(Str['k], Str['k]), Str['k], 'k], 'k],
     // a forwarded place -> the C variable of the value stored there
-    forwards: Ref[ArenaMap[Span['k], Span['k], 'k], 'k],
+    forwards: Ref[ArenaMap[Str['k], Str['k], 'k], 'k],
     scratch: Ref[usize, 'k],
-    labels: Ref[ArenaMap[Span['k], Span['k], 'k], 'k],
+    labels: Ref[ArenaMap[Str['k], Str['k], 'k], 'k],
     // the declarations of the scratch locals of edges
-    temps: Ref[ArenaVec[Span['k], 'k], 'k],
-    place_c: Ref[ArenaMap[Span['k], Span['k], 'k], 'k],
-    roots: Ref[ArenaMap[Span['k], Type['k], 'k], 'k],
-    typed: Ref[ArenaMap[(Span['k], Span['k]), Type['k], 'k], 'k],
+    temps: Ref[ArenaVec[Str['k], 'k], 'k],
+    place_c: Ref[ArenaMap[Str['k], Str['k], 'k], 'k],
+    roots: Ref[ArenaMap[Str['k], Type['k], 'k], 'k],
+    typed: Ref[ArenaMap[(Str['k], Str['k]), Type['k], 'k], 'k],
     // (block label, SSA name) -> whether the value's type is zero-size, as `value_erased_in` finds it
-    erasure: Ref[ArenaMap[(Span['k], Span['k]), bool, 'k], 'k],
-    blocks: Ref[ArenaMap[Span['k], Block['k], 'k], 'k],
-    label: Ref[Span['k], 'k],
+    erasure: Ref[ArenaMap[(Str['k], Str['k]), bool, 'k], 'k],
+    blocks: Ref[ArenaMap[Str['k], Block['k], 'k], 'k],
+    label: Ref[Str['k], 'k],
     // the index of the instruction being written in its block
     index: Ref[usize, 'k],
     // what `adapter` found of each function it was asked of
-    adapters: ArenaMap[Span['k], Option[(Adapter['k], Fun['k])], 'k],
+    adapters: ArenaMap[Str['k], Option[(Adapter['k], Fun['k])], 'k],
     // symbol -> for each of its parameters, whether it takes an aggregate by pointer (`request`)
-    by_ref: ArenaMap[Span['k], ArenaVec[bool, 'k], 'k],
+    by_ref: ArenaMap[Str['k], ArenaVec[bool, 'k], 'k],
     // symbol of a function whose address is taken -> its by-value entry (`thunk`)
-    thunks: ArenaMap[Span['k], Span['k], 'k],
+    thunks: ArenaMap[Str['k], Str['k], 'k],
     // the parameters of the function being written read through their pointer
-    deref: Ref[ArenaSet[Span['k], 'k], 'k],
+    deref: Ref[ArenaSet[Str['k], 'k], 'k],
     // symbol -> the elements of its tuple result it writes through out pointers (`request`)
-    outs: ArenaMap[Span['k], ArenaVec[usize, 'k], 'k],
+    outs: ArenaMap[Str['k], ArenaVec[usize, 'k], 'k],
     // symbol -> the C type and name of each out pointer's pointee, in element order
-    out_params: ArenaMap[Span['k], ArenaVec[(Span['k], Span['k]), 'k], 'k],
+    out_params: ArenaMap[Str['k], ArenaVec[(Str['k], Str['k]), 'k], 'k],
     // symbol with out pointers -> its whole result type
-    results: ArenaMap[Span['k], Type['k], 'k],
+    results: ArenaMap[Str['k], Type['k], 'k],
     // (block label, value, element) of each element of a returned value already in its out pointer's
     // pointee
-    at_out: Ref[ArenaSet[(Span['k], Span['k], usize), 'k], 'k],
+    at_out: Ref[ArenaSet[(Str['k], Str['k], usize), 'k], 'k],
     // the call being written is the one whose result its block returns (`emit_call`)
     returning: Ref[bool, 'k],
     // the place paths the call being written passes as out pointers (`by_address`)
-    out_paths: Ref[ArenaVec[Span['k], 'k], 'k],
+    out_paths: Ref[ArenaVec[Str['k], 'k], 'k],
 }
 
 forall 'k.
-fn fail_at(&cx: Domain!['k], message: Span['k], pos: Pos) -> ! {
+fn fail_at(&cx: Domain!['k], message: Str['k], pos: Pos) -> ! {
     kurs_error(&cx, message, pos)
 }
 
 forall 'k.
-fn fail_text(&cx: Domain!['k], message: Span['k]) -> ! {
+fn fail_text(&cx: Domain!['k], message: Str['k]) -> ! {
     kurs_error(&cx, message, no_pos())
 }
 
 forall 'k.
 impl Backend['k] {
-    fn new(&cx: Domain!['k], program: Program['k], typed: ArenaMap[FunKey['k], ArenaMap[(Span['k], Span['k]), Type['k], 'k], 'k], counter: Fresh['k], split: bool) -> Backend['k] {
+    fn new(&cx: Domain!['k], program: Program['k], typed: ArenaMap[FunKey['k], ArenaMap[(Str['k], Str['k]), Type['k], 'k], 'k], counter: Fresh['k], split: bool) -> Backend['k] {
         let taken = c_keywords(&cx);
         let runtime = runtime_names(&cx).keys(&cx);
         var r = 0usize;
@@ -661,21 +660,21 @@ impl Backend['k] {
             taken.insert(&cx, runtime.at(&cx, r));
             r = r + 1usize;
         }
-        taken.insert(&cx, Span::from_static(&cx, "main"));
-        taken.insert(&cx, Span::from_static(&cx, REPORT_ERROR));
-        taken.insert(&cx, Span::from_static(&cx, START));
+        taken.insert(&cx, Str::from_static(&cx, "main"));
+        taken.insert(&cx, Str::from_static(&cx, REPORT_ERROR));
+        taken.insert(&cx, Str::from_static(&cx, START));
         let externs = program.externs.values(&cx);
         var e = 0usize;
         while e < externs.len(&cx) {
             taken.insert(&cx, externs.at(&cx, e).name);
             e = e + 1usize;
         }
-        let function_ids: ArenaMap[FunKey['k], (ArenaVec[Span['k], 'k], Span['k]), 'k] = ArenaMap::new(&cx);
+        let function_ids: ArenaMap[FunKey['k], (ArenaVec[Str['k], 'k], Str['k]), 'k] = ArenaMap::new(&cx);
         let funs = program.funs.values(&cx);
         var f = 0usize;
         while f < funs.len(&cx) {
             let name = funs.at(&cx, f).name;
-            function_ids.insert(&cx, FunKey::Function.(name), (path_segments(&cx, name), encode(&cx, ArenaVec::two(&cx, Span::from_static(&cx, "function"), name))));
+            function_ids.insert(&cx, FunKey::Function.(name), (path_segments(&cx, name), encode(&cx, ArenaVec::two(&cx, Str::from_static(&cx, "function"), name))));
             f = f + 1usize;
         }
         let instance_params: ArenaMap[FunKey['k], ArenaVec[Param['k], 'k], 'k] = ArenaMap::new(&cx);
@@ -686,13 +685,13 @@ impl Backend['k] {
             var i = 0usize;
             while i < insts.len(&cx) {
                 let inst = insts.at(&cx, i);
-                let scope: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+                let scope: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
                 var p = 0usize;
                 while p < inst.params.len(&cx) {
                     scope.push(&cx, inst.params.at(&cx, p).name);
                     p = p + 1usize;
                 }
-                let head_keys: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+                let head_keys: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
                 var h = 0usize;
                 while h < inst.head.len(&cx) {
                     head_keys.push(&cx, type_key(&cx, inst.head.at(&cx, h), scope));
@@ -707,9 +706,9 @@ impl Backend['k] {
                     params.append(&cx, fun.params);
                     instance_params.insert(&cx, key, params);
                     let path = path_segments(&cx, inst.trait_name);
-                    path.push(&cx, Span::from_static(&cx, "impl"));
+                    path.push(&cx, Str::from_static(&cx, "impl"));
                     path.append(&cx, path_segments(&cx, fun.name));
-                    let identity = ArenaVec::two(&cx, Span::from_static(&cx, "instance"), inst.trait_name);
+                    let identity = ArenaVec::two(&cx, Str::from_static(&cx, "instance"), inst.trait_name);
                     identity.push(&cx, head);
                     identity.push(&cx, fun.name);
                     function_ids.insert(&cx, key, (path, encode(&cx, identity)));
@@ -737,7 +736,7 @@ impl Backend['k] {
             by_pointer_cache: ArenaMap::new(&cx),
             queue: ArenaVec::new(&cx),
             emitted: ArenaVec::new(&cx),
-            linkage: Span::from_static(&cx, if split { "" } else { "static " }),
+            linkage: Str::from_static(&cx, if split { "" } else { "static " }),
             heads: ArenaMap::new(&cx),
             lends: ArenaVec::new(&cx),
             written: ArenaSet::new(&cx),
@@ -754,7 +753,7 @@ impl Backend['k] {
             substituted: ref_in(&cx, ArenaMap::new(&cx)),
             locals: ref_in(&cx, ArenaMap::new(&cx)),
 
-            symbol: ref_in(&cx, Span::from_static(&cx, "")),
+            symbol: ref_in(&cx, Str::from_static(&cx, "")),
             plan: ref_in(&cx, Option::None),
             params: ref_in(&cx, ArenaVec::new(&cx)),
             aliases: ref_in(&cx, ArenaMap::new(&cx)),
@@ -767,7 +766,7 @@ impl Backend['k] {
             typed: ref_in(&cx, ArenaMap::new(&cx)),
             erasure: ref_in(&cx, ArenaMap::new(&cx)),
             blocks: ref_in(&cx, ArenaMap::new(&cx)),
-            label: ref_in(&cx, Span::from_static(&cx, "")),
+            label: ref_in(&cx, Str::from_static(&cx, "")),
             index: ref_in(&cx, 0usize),
             adapters: ArenaMap::new(&cx),
             by_ref: ArenaMap::new(&cx),
@@ -785,7 +784,7 @@ impl Backend['k] {
     // ------------------------------------------------------------ representations --
 
     // `readable(name)`, made once per name.
-    fn readable(self, &cx: Domain!['k], name: Span['k]) -> Span['k] {
+    fn readable(self, &cx: Domain!['k], name: Str['k]) -> Str['k] {
         match self.readables.get(&cx, name) {
             Some(known) => known,
             None => {
@@ -796,12 +795,12 @@ impl Backend['k] {
         }
     }
 
-    fn fresh_name(self, &cx: Domain!['k], hint: Span['k]) -> Span['k] {
+    fn fresh_name(self, &cx: Domain!['k], hint: Str['k]) -> Str['k] {
         allocate(&cx, Buffer!::new().put("K_").write(&cx, tail(self.readable(&cx, hint), 48usize)).save(&cx), self.taken)
     }
 
     // The C type of `ty`; through a pointer, an aggregate needs only its name.
-    fn ctype(self, &cx: Domain!['k], ty: Type['k], defined: bool) -> Span['k] {
+    fn ctype(self, &cx: Domain!['k], ty: Type['k], defined: bool) -> Str['k] {
         match self.ctypes.get(&cx, ty) {
             Some(known) => return known,
             None => (),
@@ -813,14 +812,14 @@ impl Backend['k] {
         name
     }
 
-    fn ctype_of(self, &cx: Domain!['k], ty: Type['k], defined: bool) -> Span['k] {
+    fn ctype_of(self, &cx: Domain!['k], ty: Type['k], defined: bool) -> Str['k] {
         let ty = erase(&cx, ty, self.types);
         match ty {
             Prim(name) => {
                 return c_prim(&cx, name);
             },
             Never => {
-                return Span::from_static(&cx, "void");
+                return Str::from_static(&cx, "void");
             },
             Ptr(inner) => {
                 let inner = erase(&cx, inner.copy(&cx), self.types);
@@ -842,13 +841,13 @@ impl Backend['k] {
         self.names.at(&cx, ty)
     }
 
-    fn c(self, &cx: Domain!['k], ty: Type['k]) -> Span['k] {
+    fn c(self, &cx: Domain!['k], ty: Type['k]) -> Str['k] {
         self.ctype(&cx, ty, true)
     }
 
     fn register(self, &cx: Domain!['k], ty: Type['k]) {
         if self.types.zero_size(&cx, ty) {
-            self.names.insert(&cx, ty, Span::from_static(&cx, "void"));
+            self.names.insert(&cx, ty, Str::from_static(&cx, "void"));
             return;
         }
         let s = match ty {
@@ -856,9 +855,9 @@ impl Backend['k] {
             _ => ty,
         };
         match s {
-            Tuple(_elems) => self.aggregate(&cx, ty, s, Span::from_static(&cx, "tuple")),
-            Struct(_fields) => self.aggregate(&cx, ty, s, Span::from_static(&cx, "struct")),
-            Array(_elem, _length) => self.aggregate(&cx, ty, s, Span::from_static(&cx, "array")),
+            Tuple(_elems) => self.aggregate(&cx, ty, s, Str::from_static(&cx, "tuple")),
+            Struct(_fields) => self.aggregate(&cx, ty, s, Str::from_static(&cx, "struct")),
+            Array(_elem, _length) => self.aggregate(&cx, ty, s, Str::from_static(&cx, "array")),
             Enum(variants) => match self.types.niche_variant(&cx, variants) {
                 // The niche layout: the payload's C type, the other variant a null at the niche.
                 Some(k) => {
@@ -867,15 +866,15 @@ impl Backend['k] {
                     self.names.insert(&cx, ty, name);
                     self.represented.insert(&cx, ty, payload);
                 },
-                None => self.aggregate(&cx, ty, s, Span::from_static(&cx, "enum")),
+                None => self.aggregate(&cx, ty, s, Str::from_static(&cx, "enum")),
             },
             Fn(f) => {
-                let name = self.fresh_name(&cx, Span::from_static(&cx, "fn"));
+                let name = self.fresh_name(&cx, Str::from_static(&cx, "fn"));
                 self.names.insert(&cx, ty, name);
                 // Function declarations may name forward-declared aggregates. Define their
                 // fields after this typedef, which they may use.
                 let result = self.ctype(&cx, f.ret.copy(&cx), false);
-                let params: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+                let params: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
                 var k = 0usize;
                 while k < f.params.len(&cx) {
                     let ct = self.ctype(&cx, f.params.at(&cx, k), false);
@@ -893,7 +892,7 @@ impl Backend['k] {
         };
     }
 
-    fn aggregate(self, &cx: Domain!['k], ty: Type['k], s: Type['k], kind: Span['k]) {
+    fn aggregate(self, &cx: Domain!['k], ty: Type['k], s: Type['k], kind: Str['k]) {
         let hint = match ty {
             Named(name, _args) => name,
             _ => kind,
@@ -910,7 +909,7 @@ impl Backend['k] {
         let body = match s {
             Array(elem, length) => Buffer!::new().write(&cx, self.c(&cx, elem.copy(&cx))).put(" items[").put(length).put("];").save(&cx),
             Enum(variants) => {
-                let members: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+                let members: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
                 var i = 0usize;
                 while i < variants.len(&cx) {
                     let t = variants.at(&cx, i).ty;
@@ -921,14 +920,14 @@ impl Backend['k] {
                     i = i + 1usize;
                 }
                 if members.is_empty(&cx) {
-                    Span::from_static(&cx, "uint32_t tag;")
+                    Str::from_static(&cx, "uint32_t tag;")
                 } else {
                     Buffer!::new().put("uint32_t tag; union { ").write(&cx, members.join(&cx, " ")).put(" } payload;").save(&cx)
                 }
             },
             _ => {
                 let rows = self.members(&cx, s);
-                let parts: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+                let parts: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
                 var i = 0usize;
                 while i < rows.len(&cx) {
                     let (m, f) = rows.at(&cx, i);
@@ -944,8 +943,8 @@ impl Backend['k] {
     }
 
     // (C member, component type) of a struct or tuple shape, in order.
-    fn members(self, &cx: Domain!['k], shape: Type['k]) -> ArenaVec[(Span['k], Type['k]), 'k] {
-        let out: ArenaVec[(Span['k], Type['k]), 'k] = ArenaVec::new(&cx);
+    fn members(self, &cx: Domain!['k], shape: Type['k]) -> ArenaVec[(Str['k], Type['k]), 'k] {
+        let out: ArenaVec[(Str['k], Type['k]), 'k] = ArenaVec::new(&cx);
         match shape {
             Tuple(elems) => {
                 var i = 0usize;
@@ -957,21 +956,21 @@ impl Backend['k] {
             Struct(fields) => {
                 var i = 0usize;
                 while i < fields.len(&cx) {
-                    out.push(&cx, (self.component(&cx, fields.at(&cx, i).name, Span::from_static(&cx, "f")), fields.at(&cx, i).ty));
+                    out.push(&cx, (self.component(&cx, fields.at(&cx, i).name, Str::from_static(&cx, "f")), fields.at(&cx, i).ty));
                     i = i + 1usize;
                 }
             },
-            _ => fail_text(&cx, Span::from_static(&cx, "internal error: members of a type that is not a struct or tuple")),
+            _ => fail_text(&cx, Str::from_static(&cx, "internal error: members of a type that is not a struct or tuple")),
         };
         out
     }
 
     // (C member, component type) of the component `label` (a field name or a tuple index) of a
     // struct or tuple shape.
-    fn member_of(self, &cx: Domain!['k], shape: Type['k], label: Span['k]) -> (Span['k], Type['k]) {
-        let names: ArenaVec[Span['k], 'k] = match shape {
+    fn member_of(self, &cx: Domain!['k], shape: Type['k], label: Str['k]) -> (Str['k], Type['k]) {
+        let names: ArenaVec[Str['k], 'k] = match shape {
             Struct(fields) => {
-                let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+                let out: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
                 var f = 0usize;
                 while f < fields.len(&cx) {
                     out.push(&cx, fields.at(&cx, f).name);
@@ -980,7 +979,7 @@ impl Backend['k] {
                 out
             },
             Tuple(elems) => {
-                let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+                let out: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
                 var e = 0usize;
                 while e < elems.len(&cx) {
                     out.push(&cx, Buffer!::new().put(e).save(&cx));
@@ -988,7 +987,7 @@ impl Backend['k] {
                 }
                 out
             },
-            _ => fail_text(&cx, Span::from_static(&cx, "internal error: a component of a type that is not a product")),
+            _ => fail_text(&cx, Str::from_static(&cx, "internal error: a component of a type that is not a product")),
         };
         let rows = self.members(&cx, shape);
         var k = names.len(&cx);
@@ -998,10 +997,10 @@ impl Backend['k] {
                 return rows.at(&cx, k);
             }
         }
-        fail_text(&cx, Span::from_static(&cx, "internal error: no such component"))
+        fail_text(&cx, Str::from_static(&cx, "internal error: no such component"))
     }
 
-    fn component(self, &cx: Domain!['k], name: Span['k], prefix: Span['k]) -> Span['k] {
+    fn component(self, &cx: Domain!['k], name: Str['k], prefix: Str['k]) -> Str['k] {
         let key = (prefix, name);
         if !self.component_names.contains(&cx, key) {
             self.component_names.insert(&cx, key, allocate(&cx, Buffer!::new().write(&cx, prefix).put("_").write(&cx, self.readable(&cx, name)).save(&cx), self.component_taken));
@@ -1009,8 +1008,8 @@ impl Backend['k] {
         self.component_names.at(&cx, key)
     }
 
-    fn variant(self, &cx: Domain!['k], name: Span['k]) -> Span['k] {
-        self.component(&cx, name, Span::from_static(&cx, "v"))
+    fn variant(self, &cx: Domain!['k], name: Str['k]) -> Str['k] {
+        self.component(&cx, name, Str::from_static(&cx, "v"))
     }
 
     fn shape(self, &cx: Domain!['k], ty: Type['k]) -> Type['k] {
@@ -1022,7 +1021,7 @@ impl Backend['k] {
     // For an enum in the niche layout (`Types::niche_variant`): the index of the variant it is
     // represented as, and the C access from a value of it to the niche's pointer (`""` when the
     // payload is that pointer).
-    fn niche_layout(self, &cx: Domain!['k], ty: Type['k]) -> Option[(usize, Span['k])] {
+    fn niche_layout(self, &cx: Domain!['k], ty: Type['k]) -> Option[(usize, Str['k])] {
         let variants = self.types.variants(&cx, erase(&cx, ty, self.types), Option::None);
         let k = match self.types.niche_variant(&cx, variants) {
             Some(k) => k,
@@ -1031,15 +1030,15 @@ impl Backend['k] {
         var payload = variants.at(&cx, k).ty;
         let path = match self.types.niche(&cx, payload) {
             Some(p) => p,
-            None => fail_text(&cx, Span::from_static(&cx, "internal error: a niche variant without a niche")),
+            None => fail_text(&cx, Str::from_static(&cx, "internal error: a niche variant without a niche")),
         };
-        var access = Span::from_static(&cx, "");
+        var access = Str::from_static(&cx, "");
         var i = 0usize;
         while i < path.len(&cx) {
             let s = self.shape(&cx, payload);
             let unit = match s {
                 Array(elem, _length) => {
-                    access = concat(&cx, access, Span::from_static(&cx, ".items[0]"));
+                    access = concat(&cx, access, Str::from_static(&cx, ".items[0]"));
                     payload = elem.copy(&cx);
                 },
                 _ => {
@@ -1054,7 +1053,7 @@ impl Backend['k] {
     }
 
     // The index of the variant a value of the enum `ty` holds, as C.
-    fn tag(self, &cx: Domain!['k], source: Span['k], ty: Type['k]) -> Span['k] {
+    fn tag(self, &cx: Domain!['k], source: Str['k], ty: Type['k]) -> Str['k] {
         match self.niche_layout(&cx, ty) {
             Some(layout) => {
                 let (k, access) = layout;
@@ -1066,7 +1065,7 @@ impl Backend['k] {
     }
 
     // The C object of one variant's payload within a value or place of the enum `ty`.
-    fn payload(self, &cx: Domain!['k], source: Span['k], ty: Type['k], variant: Span['k]) -> Span['k] {
+    fn payload(self, &cx: Domain!['k], source: Str['k], ty: Type['k], variant: Str['k]) -> Str['k] {
         match self.niche_layout(&cx, ty) {
             Some(_layout) => source,
             None => Buffer!::new().write(&cx, source).put(".payload.").write(&cx, self.variant(&cx, variant)).save(&cx),
@@ -1076,7 +1075,7 @@ impl Backend['k] {
     // C that makes `dst` hold `variant` of the enum `ty`, with the payload `value` (none for a payload
     // of a zero-size type). In the niche layout, the payload variant is its payload; the other is the
     // null at the niche, and the rest of the object is not written.
-    fn set_variant(self, &cx: Domain!['k], dst: Span['k], ty: Type['k], variant: Span['k], value: Option[Span['k]]) -> ArenaVec[Span['k], 'k] {
+    fn set_variant(self, &cx: Domain!['k], dst: Str['k], ty: Type['k], variant: Str['k], value: Option[Str['k]]) -> ArenaVec[Str['k], 'k] {
         let variants = self.types.variants(&cx, erase(&cx, ty, self.types), Option::None);
         var index = 0usize;
         while index < variants.len(&cx) && !variants.at(&cx, index).name.eq(&cx, variant) {
@@ -1084,7 +1083,7 @@ impl Backend['k] {
         }
         let value_text = match value {
             Some(v) => v,
-            None => Span::from_static(&cx, "None"),
+            None => Str::from_static(&cx, "None"),
         };
         match self.niche_layout(&cx, ty) {
             Some(layout) => {
@@ -1096,7 +1095,7 @@ impl Backend['k] {
                 }
             },
             None => {
-                let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+                let out: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
                 let unit = match value {
                     Some(v) => {
                         out.push(&cx, Buffer!::new().write(&cx, dst).put(".payload.").write(&cx, self.variant(&cx, variant)).put(" = ")
@@ -1157,11 +1156,11 @@ impl Backend['k] {
     }
 
     // A call argument passes nothing: a value, a lent place or a raw target of a zero-size type.
-    fn erased_arg(self, &cx: Domain!['k], arg: Span['k]) -> bool {
-        if arg.starts_with(&cx, Span::from_static(&cx, "&*")) {
+    fn erased_arg(self, &cx: Domain!['k], arg: Str['k]) -> bool {
+        if arg.starts_with(&cx, Str::from_static(&cx, "&*")) {
             return self.erased(&cx, self.pointee(&cx, self.type_of(&cx, arg.skip(2usize))));
         }
-        if arg.starts_with(&cx, Span::from_static(&cx, "&")) {
+        if arg.starts_with(&cx, Str::from_static(&cx, "&")) {
             let (_expr, ty) = self.place(&cx, arg);
             return self.erased(&cx, ty);
         }
@@ -1170,7 +1169,7 @@ impl Backend['k] {
 
     // ------------------------------------------------------------ specialization --
 
-    fn request(self, &cx: Domain!['k], key: FunKey['k], fun: Fun['k], sub: ArenaMap[Span['k], Type['k], 'k]) -> Span['k] {
+    fn request(self, &cx: Domain!['k], key: FunKey['k], fun: Fun['k], sub: ArenaMap[Str['k], Type['k], 'k]) -> Str['k] {
         let params = self.instance_params.get_or(&cx, key, fun.params);
         var agree = sub.len(&cx) == params.len(&cx);
         var p = 0usize;
@@ -1203,7 +1202,7 @@ impl Backend['k] {
         let earlier = match self.symbols.get(&cx, bucket) {
             Some(found) => found,
             None => {
-                let found: ArenaVec[(ArenaVec[Type['k], 'k], Span['k]), 'k] = ArenaVec::new(&cx);
+                let found: ArenaVec[(ArenaVec[Type['k], 'k], Str['k]), 'k] = ArenaVec::new(&cx);
                 self.symbols.insert(&cx, bucket, found);
                 found
             },
@@ -1246,7 +1245,7 @@ impl Backend['k] {
         var r = 0usize;
         while r < entry.params.len(&cx) {
             let binding = entry.params.at(&cx, r);
-            refs.push(&cx, !binding.name.starts_with(&cx, Span::from_static(&cx, "&")) && self.by_pointer(&cx, subst(&cx, binding.ty, sub, self.counter)));
+            refs.push(&cx, !binding.name.starts_with(&cx, Str::from_static(&cx, "&")) && self.by_pointer(&cx, subst(&cx, binding.ty, sub, self.counter)));
             r = r + 1usize;
         }
         self.by_ref.insert(&cx, symbol, refs);
@@ -1281,13 +1280,13 @@ impl Backend['k] {
                     k = k + 1usize;
                 }
             },
-            _ => fail_text(&cx, Span::from_static(&cx, "internal error: out pointers of a result that is not a tuple")),
+            _ => fail_text(&cx, Str::from_static(&cx, "internal error: out pointers of a result that is not a tuple")),
         };
         Type::Tuple.(rest)
     }
 
     // The C type and name of each out pointer of `symbol`, by element.
-    fn out_pointers(self, &cx: Domain!['k], symbol: Span['k]) -> ArenaVec[(Span['k], Span['k]), 'k] {
+    fn out_pointers(self, &cx: Domain!['k], symbol: Str['k]) -> ArenaVec[(Str['k], Str['k]), 'k] {
         self.out_params.get_or(&cx, symbol, ArenaVec::new(&cx))
     }
 
@@ -1352,7 +1351,7 @@ impl Backend['k] {
         }
     }
 
-    fn takes_by_ref(self, &cx: Domain!['k], symbol: Span['k]) -> bool {
+    fn takes_by_ref(self, &cx: Domain!['k], symbol: Str['k]) -> bool {
         let refs = self.by_ref.at(&cx, symbol);
         var k = 0usize;
         while k < refs.len(&cx) {
@@ -1364,7 +1363,7 @@ impl Backend['k] {
         false
     }
 
-    fn function_name(self, &cx: Domain!['k], path: ArenaVec[Span['k], 'k], identity: Span['k]) -> Span['k] {
+    fn function_name(self, &cx: Domain!['k], path: ArenaVec[Str['k], 'k], identity: Str['k]) -> Str['k] {
         var salt = 0u64;
         var symbol = mangle(&cx, path, identity, salt);
         while self.taken.taken.contains(&cx, symbol) {
@@ -1375,13 +1374,13 @@ impl Backend['k] {
         symbol
     }
 
-    fn function_address(self, &cx: Domain!['k], instr: Instr['k]) -> Span['k] {
+    fn function_address(self, &cx: Domain!['k], instr: Instr['k]) -> Str['k] {
         let name = instr.args.at(&cx, 0usize);
         if self.program.externs.contains(&cx, name) {
             return name;
         }
         let fun = self.program.funs.at(&cx, name);
-        let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+        let sub: ArenaMap[Str['k], Type['k], 'k] = ArenaMap::new(&cx);
         var k = 0usize;
         while k < fun.params.len(&cx) && k < instr.tys.len(&cx) {
             sub.insert(&cx, fun.params.at(&cx, k).name, self.substitute_type(&cx, instr.tys.at(&cx, k)));
@@ -1405,11 +1404,11 @@ impl Backend['k] {
 
     // The head and body of `thunk`, the by-value entry of `symbol` that function values call: it takes
     // each aggregate `symbol` takes by pointer as a value, and passes its address.
-    fn thunk(self, &cx: Domain!['k], symbol: Span['k], thunk: Span['k]) -> (Span['k], Span['k]) {
+    fn thunk(self, &cx: Domain!['k], symbol: Str['k], thunk: Str['k]) -> (Str['k], Str['k]) {
         let (ret, noreturn, cparams) = self.heads.at(&cx, symbol);
         let refs = self.by_ref.at(&cx, symbol);
-        let params: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
-        let args: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let params: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
+        let args: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
         var k = 0usize;
         while k < cparams.len(&cx) {
             let cp = cparams.at(&cx, k);
@@ -1436,8 +1435,8 @@ impl Backend['k] {
 
     // `thunk` of a function writing elements of its result through the out pointers `outs`: it takes
     // them into locals, and returns the whole result.
-    fn whole_thunk(self, &cx: Domain!['k], symbol: Span['k], thunk: Span['k], ret: Span['k], params: ArenaVec[Span['k], 'k], args: ArenaVec[Span['k], 'k],
-        outs: ArenaVec[(Span['k], Span['k]), 'k]) -> (Span['k], Span['k]) {
+    fn whole_thunk(self, &cx: Domain!['k], symbol: Str['k], thunk: Str['k], ret: Str['k], params: ArenaVec[Str['k], 'k], args: ArenaVec[Str['k], 'k],
+        outs: ArenaVec[(Str['k], Str['k]), 'k]) -> (Str['k], Str['k]) {
         let whole = self.results.at(&cx, symbol);
         let ks = self.outs.at(&cx, symbol);
         let members = self.members(&cx, self.shape(&cx, whole));
@@ -1452,7 +1451,7 @@ impl Backend['k] {
         let call = Buffer!::new().write(&cx, symbol).put("(").write(&cx, args.join(&cx, ", ")).put(")").save(&cx);
         let rest = self.members(&cx, self.shape(&cx, self.reduced(&cx, whole, ks)));
         var r = 0usize;
-        let parts: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let parts: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
         var k = 0usize;
         while k < members.len(&cx) {
             let (member, t) = members.at(&cx, k);
@@ -1485,9 +1484,9 @@ impl Backend['k] {
     }
 
     // The value parameters the function being written assigns (`written_params` in cgen.py).
-    fn written_params(self, &cx: Domain!['k], fun: Fun['k]) -> ArenaSet[Span['k], 'k] {
+    fn written_params(self, &cx: Domain!['k], fun: Fun['k]) -> ArenaSet[Str['k], 'k] {
         let plan = self.the_plan(&cx);
-        let out: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+        let out: ArenaSet[Str['k], 'k] = ArenaSet::new(&cx);
         var b = 0usize;
         while b < plan.emitted.len(&cx) {
             let block = plan.emitted.at(&cx, b);
@@ -1514,7 +1513,7 @@ impl Backend['k] {
                     let paths = plan.in_place.at(&cx, at);
                     var k = 0usize;
                     while k < paths.len(&cx) {
-                        if paths.at(&cx, k).starts_with(&cx, Span::from_static(&cx, "%")) {
+                        if paths.at(&cx, k).starts_with(&cx, Str::from_static(&cx, "%")) {
                             match plan.variable(&cx, label, root(&cx, paths.at(&cx, k))) {
                                 Some(home) => {
                                     let (block, name) = home;
@@ -1535,7 +1534,7 @@ impl Backend['k] {
         out
     }
 
-    fn resolve_trait(self, &cx: Domain!['k], trait_name: Span['k], method: Span['k], tys: ArenaVec[Type['k], 'k]) -> (FunKey['k], Fun['k], ArenaMap[Span['k], Type['k], 'k]) {
+    fn resolve_trait(self, &cx: Domain!['k], trait_name: Str['k], method: Str['k], tys: ArenaVec[Type['k], 'k]) -> (FunKey['k], Fun['k], ArenaMap[Str['k], Type['k], 'k]) {
         // Checking already discharged authority at the use site. Specialization selects its
         // coherent head; the callee's module need not own that shape.
         let (index, inst, sub) = match matching_instance(&cx, self.program, self.counter, trait_name, tys) {
@@ -1554,12 +1553,12 @@ impl Backend['k] {
 
     // ------------------------------------------------------------------- program --
 
-    fn emit_program(self, &cx: Domain!['k], entry: Option[Span['k]], hosted: bool, times: bool) -> CText!['k] {
+    fn emit_program(self, &cx: Domain!['k], entry: Option[Str['k]], hosted: bool, times: bool) -> CText!['k] {
         var started = Instant::now();
         check_mono_termination(&cx, self.program);
         let keywords = c_keywords(&cx);
         let runtime = runtime_names(&cx);
-        let externs: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let externs: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
         let all = self.program.externs.values(&cx);
         var e = 0usize;
         while e < all.len(&cx) {
@@ -1567,14 +1566,14 @@ impl Backend['k] {
             if !is_c_identifier(&cx, ext.name) || keywords.contains(&cx, ext.name) {
                 fail_at(&cx, f"backend: foreign symbol {ext.name} is not a C identifier".write(&cx, Buffer!::new()).save(&cx), ext.pos);
             }
-            if runtime.contains(&cx, ext.name) || ext.name.starts_with(&cx, Span::from_static(&cx, "__builtin_")) || ext.name.starts_with(&cx, Span::from_static(&cx, "__atomic_"))
+            if runtime.contains(&cx, ext.name) || ext.name.starts_with(&cx, Str::from_static(&cx, "__builtin_")) || ext.name.starts_with(&cx, Str::from_static(&cx, "__atomic_"))
                 || (ext.name.is(&cx, "main") || ext.name.is(&cx, REPORT_ERROR)) && entry.is_some()
                 || ext.name.is(&cx, START) && entry.is_some() && hosted {
                 fail_at(&cx, f"backend: foreign symbol {ext.name} conflicts with the C runtime prelude or entry wrapper".write(&cx, Buffer!::new()).save(&cx), ext.pos);
             }
             let result = self.c(&cx, ext.ret);
-            let noreturn = if is_never(ext.ret) { Span::from_static(&cx, "_Noreturn ") } else { Span::from_static(&cx, "") };
-            let params: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+            let noreturn = if is_never(ext.ret) { Str::from_static(&cx, "_Noreturn ") } else { Str::from_static(&cx, "") };
+            let params: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
             var p = 0usize;
             while p < ext.ptypes.len(&cx) {
                 params.push(&cx, self.c(&cx, ext.ptypes.at(&cx, p)));
@@ -1583,7 +1582,7 @@ impl Backend['k] {
             externs.push(&cx, Buffer!::new().write(&cx, noreturn).write(&cx, result).put(" ").write(&cx, ext.name).put("(").write(&cx, or_void(&cx, params.join(&cx, ", "))).put(");").save(&cx));
             e = e + 1usize;
         }
-        var main: Option[Span['k]] = Option::None;
+        var main: Option[Str['k]] = Option::None;
         match entry {
             Some(name) => {
                 let ok = match self.program.funs.get(&cx, name) {
@@ -1624,14 +1623,14 @@ impl Backend['k] {
             match self.thunks.key_at(&cx, t) {
                 Some(symbol) => {
                     let (head, body) = self.thunk(&cx, symbol, self.thunks.at(&cx, symbol));
-                    self.emitted.push(&cx, (Option::None, head, body, Span::from_static(&cx, "")));
+                    self.emitted.push(&cx, (Option::None, head, body, Str::from_static(&cx, "")));
                 },
                 None => (),
             };
             t = t + 1usize;
         }
-        let declared: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
-        let datas: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let declared: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
+        let datas: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
         let entries = self.datas.values(&cx);
         var d = 0usize;
         while d < entries.len(&cx) {
@@ -1652,7 +1651,7 @@ impl Backend['k] {
         }
         let (const_params, restrict_params) = self.qualifiers(&cx);
         started = c_stage(times, "C definitions", started);
-        let heads: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let heads: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
         var h = 0usize;
         while h < self.emitted.len(&cx) {
             let (symbol, fixed, _body, _file) = self.emitted.at(&cx, h);
@@ -1666,7 +1665,7 @@ impl Backend['k] {
             Some(symbol) => {
                 let fun = self.program.funs.at(&cx, match entry {
                     Some(name) => name,
-                    None => Span::from_static(&cx, ""),
+                    None => Str::from_static(&cx, ""),
                 });
                 Option::Some.(self.entry_wrapper(&cx, fun, symbol, hosted))
             },
@@ -1682,16 +1681,16 @@ impl Backend['k] {
                 c = c.write(&cx, heads.at(&cx, p)).put(";\n");
                 p = p + 1usize;
             }
-            let files: ArenaVec[(Span['k], Span['k]), 'k] = ArenaVec::new(&cx);
-            files.push(&cx, (Span::from_static(&cx, HEADER), Buffer!::new().put("#pragma once\n").put(c).save(&cx)));
-            files.push(&cx, (Span::from_static(&cx, "kursal-data.c"), text_lines(&cx, included(), datas).save(&cx)));
+            let files: ArenaVec[(Str['k], Str['k]), 'k] = ArenaVec::new(&cx);
+            files.push(&cx, (Str::from_static(&cx, HEADER), Buffer!::new().put("#pragma once\n").put(c).save(&cx)));
+            files.push(&cx, (Str::from_static(&cx, "kursal-data.c"), text_lines(&cx, included(), datas).save(&cx)));
             // the file of each group of functions, in the order their first function comes
-            let order: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
-            let groups: ArenaMap[Span['k], ArenaVec[usize, 'k], 'k] = ArenaMap::new(&cx);
+            let order: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
+            let groups: ArenaMap[Str['k], ArenaVec[usize, 'k], 'k] = ArenaMap::new(&cx);
             var b = 0usize;
             while b < self.emitted.len(&cx) {
                 let (_symbol, _fixed, _body, file) = self.emitted.at(&cx, b);
-                let name = if file.is_empty() { Span::from_static(&cx, "kursal-thunks") } else { file };
+                let name = if file.is_empty() { Str::from_static(&cx, "kursal-thunks") } else { file };
                 match groups.get(&cx, name) {
                     Some(members) => members.push(&cx, b),
                     None => {
@@ -1727,7 +1726,7 @@ impl Backend['k] {
                 g = g + 1usize;
             }
             match wrapper {
-                Some(text) => files.push(&cx, (Span::from_static(&cx, "kursal-main.c"), included().write(&cx, text).put("\n").save(&cx))),
+                Some(text) => files.push(&cx, (Str::from_static(&cx, "kursal-main.c"), included().write(&cx, text).put("\n").save(&cx))),
                 None => (),
             };
             CText!::Split.(files)
@@ -1757,29 +1756,29 @@ impl Backend['k] {
     // `fun` takes them, and makes its result the exit status (`entry_result`). A `hosted` one, for an
     // executable `kursal build` links with `lib/libc/start.c`, calls `START` first; any other (`kursal c`,
     // whose C a freestanding target may enter from start-up code of its own) does not.
-    fn entry_wrapper(self, &cx: Domain!['k], fun: Fun['k], symbol: Span['k], hosted: bool) -> Span['k] {
+    fn entry_wrapper(self, &cx: Domain!['k], fun: Fun['k], symbol: Str['k], hosted: bool) -> Str['k] {
         let (head, call) = if !fun.ptypes.is_empty(&cx) {
             let args = fun.ptypes.at(&cx, 0usize);
             let fields = match self.shape(&cx, args) {
                 Struct(members) => members,
-                _ => fail_text(&cx, Span::from_static(&cx, "internal error: entry arguments that are not a struct")),
+                _ => fail_text(&cx, Str::from_static(&cx, "internal error: entry arguments that are not a struct")),
             };
-            (Span::from_static(&cx, "int main(int argc, char **argv)"),
+            (Str::from_static(&cx, "int main(int argc, char **argv)"),
                 Buffer!::new().write(&cx, symbol).put("((").write(&cx, self.c(&cx, args)).put("){ (")
                     .write(&cx, self.c(&cx, fields.at(&cx, 0usize).ty)).put(")argv, (")
                     .write(&cx, self.c(&cx, fields.at(&cx, 1usize).ty)).put(")argc })").save(&cx))
         } else {
-            (Span::from_static(&cx, "int main(void)"), Buffer!::new().write(&cx, symbol).put("()").save(&cx))
+            (Str::from_static(&cx, "int main(void)"), Buffer!::new().write(&cx, symbol).put("()").save(&cx))
         };
         let (declare, start) = if hosted {
             (f"void {START}(void);\n".write(&cx, Buffer!::new()).save(&cx),
                 Buffer!::new().put(START).put("(); ").save(&cx))
         } else {
-            (Span::from_static(&cx, ""), Span::from_static(&cx, ""))
+            (Str::from_static(&cx, ""), Str::from_static(&cx, ""))
         };
         let kind = match self.entry_result(&cx, fun.ret) {
             Some(kind) => kind,
-            None => fail_text(&cx, Span::from_static(&cx, "internal error: an entry whose result is no exit status")),
+            None => fail_text(&cx, Str::from_static(&cx, "internal error: an entry whose result is no exit status")),
         };
         match kind {
             Status => f"{declare}{head} {{ {start}return (int){call}; }}".write(&cx, Buffer!::new()).save(&cx),
@@ -1787,19 +1786,19 @@ impl Backend['k] {
             Report => {
                 let error = match self.shape(&cx, fun.ret) {
                     Enum(variants) => self.shape(&cx, variants.at(&cx, 1usize).ty),
-                    _ => fail_text(&cx, Span::from_static(&cx, "internal error: an entry result that is not an enum")),
+                    _ => fail_text(&cx, Str::from_static(&cx, "internal error: an entry result that is not an enum")),
                 };
                 let label = match error {
                     Struct(fields) => fields.at(&cx, 0usize).name,
-                    _ => fail_text(&cx, Span::from_static(&cx, "internal error: an entry error that is not a struct")),
+                    _ => fail_text(&cx, Str::from_static(&cx, "internal error: an entry error that is not a struct")),
                 };
                 let (member, _type) = self.member_of(&cx, error, label);
-                let status = self.fresh_name(&cx, Span::from_static(&cx, "status"));
+                let status = self.fresh_name(&cx, Str::from_static(&cx, "status"));
                 Buffer!::new().write(&cx, declare).put("void ").put(REPORT_ERROR).put("(int32_t);\n")
                     .write(&cx, head).put(" { ").write(&cx, start).write(&cx, self.c(&cx, fun.ret)).put(" ").write(&cx, status)
                     .put(" = ").write(&cx, call).put("; if (").write(&cx, self.tag(&cx, status, fun.ret))
                     .put(" == 0) return 0; ").put(REPORT_ERROR).put("(")
-                    .write(&cx, self.payload(&cx, status, fun.ret, Span::from_static(&cx, "Err"))).put(".").write(&cx, member)
+                    .write(&cx, self.payload(&cx, status, fun.ret, Str::from_static(&cx, "Err"))).put(".").write(&cx, member)
                     .put("); return 1; }").save(&cx)
             },
         }
@@ -1807,7 +1806,7 @@ impl Backend['k] {
 
     // ---------------------------------------------------------------------- data --
 
-    fn data_symbol(self, &cx: Domain!['k], name: Span['k]) -> Span['k] {
+    fn data_symbol(self, &cx: Domain!['k], name: Str['k]) -> Str['k] {
         if !self.datas.contains(&cx, name) {
             let symbol = allocate(&cx, Buffer!::new().put("d").put(self.datas.len(&cx)).put("_").write(&cx, tail(self.readable(&cx, name), 40usize)).save(&cx), self.taken);
             self.datas.insert(&cx, name, (symbol, self.program.datas.at(&cx, name)));
@@ -1818,9 +1817,9 @@ impl Backend['k] {
 
     // A data's C object, declared and defined, read-only as the static image is; one of a zero-size type
     // is a `char`, for the address the program sees.
-    fn emit_data(self, &cx: Domain!['k], entry: (Span['k], Data['k])) -> (Span['k], Span['k]) {
+    fn emit_data(self, &cx: Domain!['k], entry: (Str['k], Data['k])) -> (Str['k], Str['k]) {
         let (symbol, data) = entry;
-        let ct = if self.erased(&cx, data.ty) { Span::from_static(&cx, "char") } else { self.c(&cx, data.ty) };
+        let ct = if self.erased(&cx, data.ty) { Str::from_static(&cx, "char") } else { self.c(&cx, data.ty) };
         let declared = f"extern const {ct} {symbol};".write(&cx, Buffer!::new()).save(&cx);
         let defined = Buffer!::new().write(&cx, self.linkage).put("const ").write(&cx, ct).put(" ").write(&cx, symbol);
         let defined = if self.erased(&cx, data.ty) { defined } else {
@@ -1829,14 +1828,14 @@ impl Backend['k] {
         (declared, defined.put(";").save(&cx))
     }
 
-    fn initializer(self, &cx: Domain!['k], ty: Type['k], form: Form['k]) -> Span['k] {
+    fn initializer(self, &cx: Domain!['k], ty: Type['k], form: Form['k]) -> Str['k] {
         let s = self.shape(&cx, ty);
         match s {
             Prim(_name) => {
                 return self.literal(&cx, s, form.text);
             },
             Array(elem, length) => {
-                let values: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+                let values: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
                 var i = 0usize;
                 while i < form.len(&cx) {
                     let part = form.at(&cx, i);
@@ -1856,7 +1855,7 @@ impl Backend['k] {
             _ => (),
         };
         let rows = self.members(&cx, s);
-        let parts: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let parts: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < rows.len(&cx) && i < form.len(&cx) {
             let (_m, f) = rows.at(&cx, i);
@@ -1868,35 +1867,35 @@ impl Backend['k] {
         Buffer!::new().put("{ ").write(&cx, parts.join(&cx, ", ")).put(" }").save(&cx)
     }
 
-    fn literal(self, &cx: Domain!['k], ty: Type['k], lit: Span['k]) -> Span['k] {
+    fn literal(self, &cx: Domain!['k], ty: Type['k], lit: Str['k]) -> Str['k] {
         let name = match ty {
             Prim(n) => n,
-            _ => fail_text(&cx, Span::from_static(&cx, "internal error: a literal of a type that is not primitive")),
+            _ => fail_text(&cx, Str::from_static(&cx, "internal error: a literal of a type that is not primitive")),
         };
         if name.is(&cx, "bool") {
-            return if lit.is(&cx, "1") || lit.is(&cx, "true") || lit.is(&cx, "True") { Span::from_static(&cx, "1") } else { Span::from_static(&cx, "0") };
+            return if lit.is(&cx, "1") || lit.is(&cx, "true") || lit.is(&cx, "True") { Str::from_static(&cx, "1") } else { Str::from_static(&cx, "0") };
         }
         if C::is_float(&cx, name) {
-            let digits = if lit.contains(&cx, Span::from_static(&cx, ".")) || lit.contains(&cx, Span::from_static(&cx, "e")) || lit.contains(&cx, Span::from_static(&cx, "E")) { lit } else { concat(&cx, lit, Span::from_static(&cx, ".0")) };
-            return if name.is(&cx, "f32") { concat(&cx, digits, Span::from_static(&cx, "f")) } else { digits };
+            let digits = if lit.contains(&cx, Str::from_static(&cx, ".")) || lit.contains(&cx, Str::from_static(&cx, "e")) || lit.contains(&cx, Str::from_static(&cx, "E")) { lit } else { concat(&cx, lit, Str::from_static(&cx, ".0")) };
+            return if name.is(&cx, "f32") { concat(&cx, digits, Str::from_static(&cx, "f")) } else { digits };
         }
         if signed_suffix(&cx, name).is_some() {
-            return if lit.is(&cx, "-9223372036854775808") { Span::from_static(&cx, "(-INT64_C(9223372036854775807) - 1)") } else { f"INT64_C({lit})".write(&cx, Buffer!::new()).save(&cx) };
+            return if lit.is(&cx, "-9223372036854775808") { Str::from_static(&cx, "(-INT64_C(9223372036854775807) - 1)") } else { f"INT64_C({lit})".write(&cx, Buffer!::new()).save(&cx) };
         }
         f"UINT64_C({lit})".write(&cx, Buffer!::new()).save(&cx)
     }
 
     // ----------------------------------------------------------------- functions --
 
-    fn emit_function(self, &cx: Domain!['k], key: FunKey['k], fun: Fun['k], sub: ArenaMap[Span['k], Type['k], 'k], symbol: Span['k]) {
+    fn emit_function(self, &cx: Domain!['k], key: FunKey['k], fun: Fun['k], sub: ArenaMap[Str['k], Type['k], 'k], symbol: Str['k]) {
         self.fun.set(&cx, Option::Some.(fun));
         self.sub.set(&cx, sub);
         self.symbol.set(&cx, symbol);
         self.substituted.copy(&cx).clear(&cx);
         self.erasure.copy(&cx).clear(&cx);
-        let components: ArenaMap[(Span['k], usize), ArenaVec[Span['k], 'k], 'k] = ArenaMap::new(&cx);
-        let shapes: ArenaMap[(Span['k], usize), Type['k], 'k] = ArenaMap::new(&cx);
-        let adapters: ArenaMap[Span['k], Adapter['k], 'k] = ArenaMap::new(&cx);
+        let components: ArenaMap[(Str['k], usize), ArenaVec[Str['k], 'k], 'k] = ArenaMap::new(&cx);
+        let shapes: ArenaMap[(Str['k], usize), Type['k], 'k] = ArenaMap::new(&cx);
+        let adapters: ArenaMap[Str['k], Adapter['k], 'k] = ArenaMap::new(&cx);
         var cb = 0usize;
         while cb < fun.blocks.len(&cx) {
             let block = fun.blocks.at(&cx, cb);
@@ -1925,11 +1924,11 @@ impl Backend['k] {
             }
             cb = cb + 1usize;
         }
-        let place_params: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+        let place_params: ArenaSet[Str['k], 'k] = ArenaSet::new(&cx);
         var pp = 0usize;
         while pp < fun.blocks.at(&cx, 0usize).params.len(&cx) {
             let name = fun.blocks.at(&cx, 0usize).params.at(&cx, pp).name;
-            if name.starts_with(&cx, Span::from_static(&cx, "&")) {
+            if name.starts_with(&cx, Str::from_static(&cx, "&")) {
                 place_params.insert(&cx, name);
             }
             pp = pp + 1usize;
@@ -1937,11 +1936,11 @@ impl Backend['k] {
         var plan = Plan::new(&cx, fun, components, adapters, place_params, shapes);
         self.plan.set(&cx, Option::Some.(plan));
         let typed = self.recorded.at(&cx, key);
-        let first_roots: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+        let first_roots: ArenaMap[Str['k], Type['k], 'k] = ArenaMap::new(&cx);
         var fr = 0usize;
         while fr < fun.blocks.at(&cx, 0usize).params.len(&cx) {
             let binding = fun.blocks.at(&cx, 0usize).params.at(&cx, fr);
-            if binding.name.starts_with(&cx, Span::from_static(&cx, "&")) {
+            if binding.name.starts_with(&cx, Str::from_static(&cx, "&")) {
                 first_roots.insert(&cx, binding.name, self.substitute_type(&cx, binding.ty));
             }
             fr = fr + 1usize;
@@ -1973,7 +1972,7 @@ impl Backend['k] {
             labels.insert(&cx, label, allocate(&cx, Buffer!::new().put("L_").write(&cx, self.readable(&cx, label)).save(&cx), label_taken));
             b = b + 1usize;
         }
-        let decls: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let decls: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
         let temps = self.temps.copy(&cx);
         temps.clear(&cx);
         let entry = fun.blocks.at(&cx, 0usize);
@@ -1990,17 +1989,17 @@ impl Backend['k] {
         // The parameters taken by pointer: read through it, or copied into the parameter's variable
         // where the function writes that (a call of itself in tail position, or a lend in place).
         let written = self.written_params(&cx, fun);
-        let deref: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+        let deref: ArenaSet[Str['k], 'k] = ArenaSet::new(&cx);
         self.deref.set(&cx, deref);
-        let prologue: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let prologue: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
         let refs = self.by_ref.at(&cx, symbol);
         var p = 0usize;
         while p < entry.params.len(&cx) {
             let binding = entry.params.at(&cx, p);
             let ctype = self.c(&cx, self.substitute_type(&cx, binding.ty));
-            let place = binding.name.starts_with(&cx, Span::from_static(&cx, "&"));
+            let place = binding.name.starts_with(&cx, Str::from_static(&cx, "&"));
             if ctype.is(&cx, "void") {
-                cparams.push(&cx, CParam.{ ctype, cname: Span::from_static(&cx, ""), place });
+                cparams.push(&cx, CParam.{ ctype, cname: Str::from_static(&cx, ""), place });
             } else {
                 let cname = self.cname(&cx, entry.label, binding.name);
                 var passed = cname;
@@ -2024,9 +2023,9 @@ impl Backend['k] {
         } else {
             let elems = match self.shape(&cx, ret_type) {
                 Tuple(elems) => elems,
-                _ => fail_text(&cx, Span::from_static(&cx, "internal error: out pointers of a result that is not a tuple")),
+                _ => fail_text(&cx, Str::from_static(&cx, "internal error: out pointers of a result that is not a tuple")),
             };
-            let pointees: ArenaVec[(Span['k], Span['k]), 'k] = ArenaVec::new(&cx);
+            let pointees: ArenaVec[(Str['k], Str['k]), 'k] = ArenaVec::new(&cx);
             var k = 0usize;
             while k < outs.len(&cx) {
                 let ctype = self.c(&cx, elems.at(&cx, outs.at(&cx, k)));
@@ -2050,11 +2049,11 @@ impl Backend['k] {
         }
         // Homing may add or change locals. Otherwise the map built for `homes` is still current.
         if has_homes {
-            let roots: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+            let roots: ArenaMap[Str['k], Type['k], 'k] = ArenaMap::new(&cx);
             var r = 0usize;
             while r < entry.params.len(&cx) {
                 let binding = entry.params.at(&cx, r);
-                if binding.name.starts_with(&cx, Span::from_static(&cx, "&")) {
+                if binding.name.starts_with(&cx, Str::from_static(&cx, "&")) {
                     roots.insert(&cx, binding.name, self.substitute_type(&cx, binding.ty));
                 }
                 r = r + 1usize;
@@ -2068,7 +2067,7 @@ impl Backend['k] {
         }
         self.typed.set(&cx, typed);
         // (block label, SSA name, type, C variable) of each value that is no entry parameter
-        let values: ArenaVec[(Span['k], Span['k], Type['k], Span['k]), 'k] = ArenaVec::new(&cx);
+        let values: ArenaVec[(Str['k], Str['k], Type['k], Str['k]), 'k] = ArenaVec::new(&cx);
         let keys = typed.keys(&cx);
         var v = 0usize;
         while v < keys.len(&cx) {
@@ -2089,7 +2088,7 @@ impl Backend['k] {
             }
             v = v + 1usize;
         }
-        let blocks: ArenaMap[Span['k], Block['k], 'k] = ArenaMap::new(&cx);
+        let blocks: ArenaMap[Str['k], Block['k], 'k] = ArenaMap::new(&cx);
         var k = 0usize;
         while k < fun.blocks.len(&cx) {
             blocks.insert(&cx, fun.blocks.at(&cx, k).label, fun.blocks.at(&cx, k));
@@ -2144,27 +2143,27 @@ impl Backend['k] {
             body = body.put("  ").write(&cx, decls.at(&cx, d)).put("\n");
             d = d + 1usize;
         }
-        self.emitted.push(&cx, (Option::Some.(symbol), Span::from_static(&cx, ""), body.put(lines).put("}\n").save(&cx), module_file(&cx, fun.name)));
+        self.emitted.push(&cx, (Option::Some.(symbol), Str::from_static(&cx, ""), body.put(lines).put("}\n").save(&cx), module_file(&cx, fun.name)));
     }
 
     // The local places that share the storage of a place path; `Backend.homes` in cgen.py states the
     // rules. `Plan` decides the rest on the function with their paths rewritten (`homed`).
-    fn homes(self, &cx: Domain!['k], key: FunKey['k], fun: Fun['k], typed: ArenaMap[(Span['k], Span['k]), Type['k], 'k], plan: Plan['k]) -> ArenaMap[Span['k], Span['k], 'k] {
-        let kinds: ArenaMap[Span['k], Kind, 'k] = ArenaMap::new(&cx);
+    fn homes(self, &cx: Domain!['k], key: FunKey['k], fun: Fun['k], typed: ArenaMap[(Str['k], Str['k]), Type['k], 'k], plan: Plan['k]) -> ArenaMap[Str['k], Str['k], 'k] {
+        let kinds: ArenaMap[Str['k], Kind, 'k] = ArenaMap::new(&cx);
         let quantified = self.instance_params.get_or(&cx, key, fun.params);
         var q = 0usize;
         while q < quantified.len(&cx) {
             kinds.insert(&cx, quantified.at(&cx, q).name, quantified.at(&cx, q).kind);
             q = q + 1usize;
         }
-        let local_names: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+        let local_names: ArenaSet[Str['k], 'k] = ArenaSet::new(&cx);
         var n = 0usize;
         while n < fun.locals.len(&cx) {
             local_names.insert(&cx, fun.locals.at(&cx, n).name);
             n = n + 1usize;
         }
         // local -> the one path every whole store into it stores a value lying at, or none
-        let seen: ArenaMap[Span['k], Option[Span['k]], 'k] = ArenaMap::new(&cx);
+        let seen: ArenaMap[Str['k], Option[Str['k]], 'k] = ArenaMap::new(&cx);
         var b = 0usize;
         while b < fun.blocks.len(&cx) {
             let block = fun.blocks.at(&cx, b);
@@ -2179,7 +2178,7 @@ impl Backend['k] {
                     let lying = plan.resident.get(&cx, (block.label, a.at(&cx, 1usize)));
                     let path = match lying {
                         Some(at) => at,
-                        None => Span::from_static(&cx, ""),
+                        None => Str::from_static(&cx, ""),
                     };
                     let clash = match seen.get(&cx, local) {
                         Some(known) => match known {
@@ -2188,7 +2187,7 @@ impl Backend['k] {
                         },
                         None => false,
                     };
-                    let bad = lying.is_none() || !path.starts_with(&cx, Span::from_static(&cx, "&")) || clash;
+                    let bad = lying.is_none() || !path.starts_with(&cx, Str::from_static(&cx, "&")) || clash;
                     if bad {
                         seen.insert(&cx, local, Option::None);
                     } else {
@@ -2199,7 +2198,7 @@ impl Backend['k] {
             }
             b = b + 1usize;
         }
-        let first: ArenaMap[Span['k], Span['k], 'k] = ArenaMap::new(&cx);
+        let first: ArenaMap[Str['k], Str['k], 'k] = ArenaMap::new(&cx);
         var s = 0usize;
         while s < seen.positions(&cx) {
             match seen.key_at(&cx, s) {
@@ -2214,7 +2213,7 @@ impl Backend['k] {
             };
             s = s + 1usize;
         }
-        let found: ArenaMap[Span['k], Span['k], 'k] = ArenaMap::new(&cx);
+        let found: ArenaMap[Str['k], Str['k], 'k] = ArenaMap::new(&cx);
         var f = 0usize;
         while f < first.positions(&cx) {
             match first.key_at(&cx, f) {
@@ -2254,7 +2253,7 @@ impl Backend['k] {
         while k < fun.blocks.len(&cx) {
             let block = fun.blocks.at(&cx, k);
             let count = block.instrs.len(&cx);
-            let reads: ArenaMap[Span['k], ArenaVec[usize, 'k], 'k] = ArenaMap::new(&cx);
+            let reads: ArenaMap[Str['k], ArenaVec[usize, 'k], 'k] = ArenaMap::new(&cx);
             var i = 0usize;
             while i < count {
                 let args = block.instrs.at(&cx, i).args;
@@ -2288,7 +2287,7 @@ impl Backend['k] {
                 var g = 0usize;
                 while g < a.len(&cx) {
                     let arg = a.at(&cx, g);
-                    let local = if is_place(&cx, arg) { root(&cx, arg) } else { Span::from_static(&cx, "") };
+                    let local = if is_place(&cx, arg) { root(&cx, arg) } else { Str::from_static(&cx, "") };
                     let call = instr.op.is(&cx, "call") || instr.op.is(&cx, "trait_call");
                     let skip = !found.contains(&cx, local) || (call || instr.op.is(&cx, "store")) && !arg.eq(&cx, local)
                         || instr.op.is(&cx, "store") && g == 0usize;
@@ -2342,30 +2341,30 @@ impl Backend['k] {
                 j = j + 1usize;
             }
             match block.term {
-                Switch(scrutinee, _ty, _arms, _pos) => if scrutinee.starts_with(&cx, Span::from_static(&cx, "&")) {
+                Switch(scrutinee, _ty, _arms, _pos) => if scrutinee.starts_with(&cx, Str::from_static(&cx, "&")) {
                     found.remove(&cx, root(&cx, scrutinee));
                 },
                 _ => (),
             };
             k = k + 1usize;
         }
-        let blocks: ArenaMap[Span['k], Block['k], 'k] = ArenaMap::new(&cx);
+        let blocks: ArenaMap[Str['k], Block['k], 'k] = ArenaMap::new(&cx);
         var r = 0usize;
         while r < fun.blocks.len(&cx) {
             blocks.insert(&cx, fun.blocks.at(&cx, r).label, fun.blocks.at(&cx, r));
             r = r + 1usize;
         }
-        let out: ArenaMap[Span['k], Span['k], 'k] = ArenaMap::new(&cx);
+        let out: ArenaMap[Str['k], Str['k], 'k] = ArenaMap::new(&cx);
         if found.is_empty(&cx) {
             return out;
         }
         // block -> the blocks reachable from its successors
-        let reach: ArenaMap[Span['k], ArenaSet[Span['k], 'k], 'k] = ArenaMap::new(&cx);
+        let reach: ArenaMap[Str['k], ArenaSet[Str['k], 'k], 'k] = ArenaMap::new(&cx);
         var u = 0usize;
         while u < fun.blocks.len(&cx) {
             let block = fun.blocks.at(&cx, u);
-            let reached: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
-            let todo: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+            let reached: ArenaSet[Str['k], 'k] = ArenaSet::new(&cx);
+            let todo: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
             let edges = term_edges(&cx, block.term);
             var e = 0usize;
             while e < edges.len(&cx) {
@@ -2399,7 +2398,7 @@ impl Backend['k] {
                     while w < fun.blocks.len(&cx) {
                         let block = fun.blocks.at(&cx, w);
                         // Every local place is empty where the function starts.
-                        let empty: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+                        let empty: ArenaSet[Str['k], 'k] = ArenaSet::new(&cx);
                         var z = 0usize;
                         while z < block.empty.len(&cx) {
                             empty.insert(&cx, block.empty.at(&cx, z));
@@ -2421,16 +2420,16 @@ impl Backend['k] {
                                 if !self.types.is_copy(&cx, typed.at(&cx, (block.label, instr.lhs.at(&cx, 0usize))), kinds) {
                                     empty.insert(&cx, a.at(&cx, 0usize));
                                 }
-                            } else if instr.op.is(&cx, "destruct") && a.at(&cx, 0usize).starts_with(&cx, Span::from_static(&cx, "&")) {
+                            } else if instr.op.is(&cx, "destruct") && a.at(&cx, 0usize).starts_with(&cx, Str::from_static(&cx, "&")) {
                                 let ty = match instr.ty {
                                     Some(t) => t,
-                                    None => fail_text(&cx, Span::from_static(&cx, "internal error: a destruct without a type")),
+                                    None => fail_text(&cx, Str::from_static(&cx, "internal error: a destruct without a type")),
                                 };
                                 if !self.types.is_copy(&cx, ty, kinds) {
                                     empty.insert(&cx, a.at(&cx, 0usize));
                                 }
                             } else if instr.op.is(&cx, "store") {
-                                let kept: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+                                let kept: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
                                 var m = 0usize;
                                 while m < empty.positions(&cx) {
                                     match empty.key_at(&cx, m) {
@@ -2464,8 +2463,8 @@ impl Backend['k] {
     }
 
     // The labels of a struct's or tuple's components in a place path; none for other types.
-    fn labels_of(self, &cx: Domain!['k], ty: Type['k]) -> Option[ArenaVec[Span['k], 'k]] {
-        let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+    fn labels_of(self, &cx: Domain!['k], ty: Type['k]) -> Option[ArenaVec[Str['k], 'k]] {
+        let out: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
         match self.shape(&cx, ty) {
             Struct(fields) => {
                 var f = 0usize;
@@ -2490,7 +2489,7 @@ impl Backend['k] {
     // The lend adapter `name` is, by its shape alone: one block that stores some of its value
     // parameters into its local places, one apiece, makes one call lending each place, and returns
     // the places reloaded and the call's result as a tuple, or never returns.
-    fn adapter(self, &cx: Domain!['k], name: Span['k]) -> Option[(Adapter['k], Fun['k])] {
+    fn adapter(self, &cx: Domain!['k], name: Str['k]) -> Option[(Adapter['k], Fun['k])] {
         match self.adapters.get(&cx, name) {
             Some(known) => return known,
             None => (),
@@ -2507,7 +2506,7 @@ impl Backend['k] {
         if fun.blocks.len(&cx) != 1usize || k == 0usize || instrs.len(&cx) < k + 1usize {
             return Option::None;
         }
-        let names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let names: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
         var n = 0usize;
         while n < block.params.len(&cx) {
             names.push(&cx, block.params.at(&cx, n).name);
@@ -2520,7 +2519,7 @@ impl Backend['k] {
             let store = instrs.at(&cx, i);
             let slot = fun.locals.at(&cx, i).name;
             if !store.op.is(&cx, "store") || !store.args.at(&cx, 0usize).eq(&cx, slot)
-                || !store.args.at(&cx, 1usize).starts_with(&cx, Span::from_static(&cx, "%")) {
+                || !store.args.at(&cx, 1usize).starts_with(&cx, Str::from_static(&cx, "%")) {
                 return Option::None;
             }
             match names.index_of(&cx, store.args.at(&cx, 1usize)) {
@@ -2576,9 +2575,9 @@ impl Backend['k] {
     }
 
     // A function's head, with its place parameters qualified as `qualifiers` allows.
-    fn head(self, &cx: Domain!['k], symbol: Span['k], const_params: ArenaSet[(Span['k], usize), 'k], restrict_params: ArenaSet[(Span['k], usize), 'k]) -> Span['k] {
+    fn head(self, &cx: Domain!['k], symbol: Str['k], const_params: ArenaSet[(Str['k], usize), 'k], restrict_params: ArenaSet[(Str['k], usize), 'k]) -> Str['k] {
         let (ret, noreturn, cparams) = self.heads.at(&cx, symbol);
-        let params: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let params: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
         var k = 0usize;
         while k < cparams.len(&cx) {
             let cp = cparams.at(&cx, k);
@@ -2613,7 +2612,7 @@ impl Backend['k] {
     fn the_plan(self, &cx: Domain!['k]) -> Plan['k] {
         match self.plan.copy(&cx) {
             Some(plan) => plan,
-            None => fail_text(&cx, Span::from_static(&cx, "internal error: no function is being emitted")),
+            None => fail_text(&cx, Str::from_static(&cx, "internal error: no function is being emitted")),
         }
     }
 
@@ -2639,7 +2638,7 @@ impl Backend['k] {
                 if self.types.closed(&cx, part) && self.types.layout(&cx, part).is_none() {
                     let owner = match self.fun.copy(&cx) {
                         Some(fun) => fun.name,
-                        None => Span::from_static(&cx, ""),
+                        None => Str::from_static(&cx, ""),
                     };
                     fail_text(&cx, Buffer!::new().put("backend: ").write(&cx, show(&cx, part))
                         .put(" is too large: its size is not below 2^64 bytes, in a specialization of ").write(&cx, owner).save(&cx));
@@ -2650,7 +2649,7 @@ impl Backend['k] {
         out
     }
 
-    fn cname(self, &cx: Domain!['k], label: Span['k], name: Span['k]) -> Span['k] {
+    fn cname(self, &cx: Domain!['k], label: Str['k], name: Str['k]) -> Str['k] {
         let key = (label, name);
         let locals = self.locals.copy(&cx);
         match locals.get(&cx, key) {
@@ -2665,7 +2664,7 @@ impl Backend['k] {
 
     // The C variable holding a value of the current block: its own, the one it reads, or the place it
     // lies in (`Plan`).
-    fn value_name(self, &cx: Domain!['k], name: Span['k]) -> Span['k] {
+    fn value_name(self, &cx: Domain!['k], name: Str['k]) -> Str['k] {
         let plan = self.the_plan(&cx);
         let key = (self.label.copy(&cx), name);
         if !plan.resident.contains(&cx, key) && self.deref.copy(&cx).contains(&cx, name) && self.label.copy(&cx).eq(&cx, self.fun_entry_label(&cx)) {
@@ -2711,11 +2710,11 @@ impl Backend['k] {
 
     // The C variable an assignment from `name` reads: for a value lying in a place under a place
     // parameter, the parameter's pointer, which a self tail call may assign.
-    fn value_base(self, &cx: Domain!['k], name: Span['k]) -> Span['k] {
+    fn value_base(self, &cx: Domain!['k], name: Str['k]) -> Str['k] {
         match self.the_plan(&cx).resident.get(&cx, (self.label.copy(&cx), name)) {
             Some(path) => {
                 let r = root(&cx, path);
-                if path.starts_with(&cx, Span::from_static(&cx, "%")) {
+                if path.starts_with(&cx, Str::from_static(&cx, "%")) {
                     self.cname(&cx, self.label.copy(&cx), r)
                 } else if self.param_index(&cx, r).is_some() {
                     self.cname(&cx, self.fun_entry_label(&cx), r)
@@ -2737,25 +2736,25 @@ impl Backend['k] {
         }
     }
 
-    fn fun_entry_label(self, &cx: Domain!['k]) -> Span['k] {
+    fn fun_entry_label(self, &cx: Domain!['k]) -> Str['k] {
         match self.fun.copy(&cx) {
             Some(fun) => fun.blocks.at(&cx, 0usize).label,
-            None => fail_text(&cx, Span::from_static(&cx, "internal error: no function is being emitted")),
+            None => fail_text(&cx, Str::from_static(&cx, "internal error: no function is being emitted")),
         }
     }
 
-    fn is_live(self, &cx: Domain!['k], name: Span['k]) -> bool {
+    fn is_live(self, &cx: Domain!['k], name: Str['k]) -> bool {
         self.the_plan(&cx).is_live(&cx, self.label.copy(&cx), name)
     }
 
     // Whether the value `name` of the current block has a zero-size type: `erased(type_of(name))`.
-    fn value_erased(self, &cx: Domain!['k], name: Span['k]) -> bool {
+    fn value_erased(self, &cx: Domain!['k], name: Str['k]) -> bool {
         self.value_erased_in(&cx, self.label.copy(&cx), name)
     }
 
     // Whether the value `name` of block `label` has a zero-size type, kept for the function being
     // emitted once finding it drew no fresh name.
-    fn value_erased_in(self, &cx: Domain!['k], label: Span['k], name: Span['k]) -> bool {
+    fn value_erased_in(self, &cx: Domain!['k], label: Str['k], name: Str['k]) -> bool {
         let known = self.erasure.copy(&cx);
         match known.get(&cx, (label, name)) {
             Some(answer) => answer,
@@ -2764,7 +2763,7 @@ impl Backend['k] {
     }
 
     // Record erasure using a type the caller already has, without another lookup in `typed`.
-    fn record_erasure(self, &cx: Domain!['k], label: Span['k], name: Span['k], ty: Type['k]) -> bool {
+    fn record_erasure(self, &cx: Domain!['k], label: Str['k], name: Str['k], ty: Type['k]) -> bool {
         let before = self.counter.next.copy(&cx);
         let answer = self.erased(&cx, self.substitute_type(&cx, ty));
         if self.counter.next.copy(&cx) == before {
@@ -2773,7 +2772,7 @@ impl Backend['k] {
         answer
     }
 
-    fn type_of(self, &cx: Domain!['k], name: Span['k]) -> Type['k] {
+    fn type_of(self, &cx: Domain!['k], name: Str['k]) -> Type['k] {
         self.substitute_type(&cx, self.typed.copy(&cx).at(&cx, (self.label.copy(&cx), name)))
     }
 
@@ -2782,12 +2781,12 @@ impl Backend['k] {
 
     // The C lvalue and type of a place path, or of a path in the C variable of a value of the current
     // block (`%v.f`, lent as `&%v.f`; `Plan::residences`).
-    fn place(self, &cx: Domain!['k], path: Span['k]) -> (Span['k], Type['k]) {
-        let parts = ArenaVec::split(&cx, path, Span::from_static(&cx, "."));
+    fn place(self, &cx: Domain!['k], path: Str['k]) -> (Str['k], Type['k]) {
+        let parts = ArenaVec::split(&cx, path, Str::from_static(&cx, "."));
         let first = parts.at(&cx, 0usize);
-        let in_value = first.starts_with(&cx, Span::from_static(&cx, "%")) || first.starts_with(&cx, Span::from_static(&cx, "&%"));
-        let value = if first.starts_with(&cx, Span::from_static(&cx, "&")) { first.skip(1usize) } else { first };
-        var expr = if in_value { self.value_name(&cx, value) } else { self.place_c.copy(&cx).get_or(&cx, first, Span::from_static(&cx, "")) };
+        let in_value = first.starts_with(&cx, Str::from_static(&cx, "%")) || first.starts_with(&cx, Str::from_static(&cx, "&%"));
+        let value = if first.starts_with(&cx, Str::from_static(&cx, "&")) { first.skip(1usize) } else { first };
+        var expr = if in_value { self.value_name(&cx, value) } else { self.place_c.copy(&cx).get_or(&cx, first, Str::from_static(&cx, "")) };
         var ty = if in_value { self.type_of(&cx, value) } else { self.roots.copy(&cx).at(&cx, first) };
         var i = 1usize;
         while i < parts.len(&cx) {
@@ -2800,9 +2799,9 @@ impl Backend['k] {
                     ty = last_member(&cx, variants, seg);
                 },
                 _ => {
-                    let names: ArenaVec[Span['k], 'k] = match s {
+                    let names: ArenaVec[Str['k], 'k] = match s {
                         Struct(fields) => {
-                            let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+                            let out: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
                             var f = 0usize;
                             while f < fields.len(&cx) {
                                 out.push(&cx, fields.at(&cx, f).name);
@@ -2811,7 +2810,7 @@ impl Backend['k] {
                             out
                         },
                         Tuple(elems) => {
-                            let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+                            let out: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
                             var e = 0usize;
                             while e < elems.len(&cx) {
                                 out.push(&cx, Buffer!::new().put(e).save(&cx));
@@ -2819,7 +2818,7 @@ impl Backend['k] {
                             }
                             out
                         },
-                        _ => fail_text(&cx, Span::from_static(&cx, "internal error: a place through a type that is not a product")),
+                        _ => fail_text(&cx, Str::from_static(&cx, "internal error: a place through a type that is not a product")),
                     };
                     let rows = self.members(&cx, s);
                     var found = false;
@@ -2834,7 +2833,7 @@ impl Backend['k] {
                         }
                     }
                     if !found {
-                        fail_text(&cx, Span::from_static(&cx, "internal error: a place names no component"));
+                        fail_text(&cx, Str::from_static(&cx, "internal error: a place names no component"));
                     }
                 },
             };
@@ -2852,11 +2851,11 @@ impl Backend['k] {
     }
 
     // A call argument: a value, a lent place's address, or a raw target.
-    fn operand(self, &cx: Domain!['k], arg: Span['k]) -> Span['k] {
-        if arg.starts_with(&cx, Span::from_static(&cx, "&*")) {
+    fn operand(self, &cx: Domain!['k], arg: Str['k]) -> Str['k] {
+        if arg.starts_with(&cx, Str::from_static(&cx, "&*")) {
             return self.value_name(&cx, arg.skip(2usize));
         }
-        if arg.starts_with(&cx, Span::from_static(&cx, "&")) {
+        if arg.starts_with(&cx, Str::from_static(&cx, "&")) {
             let (expr, _ty) = self.place(&cx, arg);
             return Buffer!::new().put("&").write(&cx, expr).save(&cx);
         }
@@ -2917,12 +2916,12 @@ impl Backend['k] {
         // `None` where an instruction without one result would name it, as the f-strings print it.
         let d = match dst {
             Some(t) => t,
-            None => Span::from_static(&cx, "None"),
+            None => Str::from_static(&cx, "None"),
         };
         if op.is(&cx, "const") {
             let lit = match instr.lit {
                 Some(l) => l,
-                None => Span::from_static(&cx, ""),
+                None => Str::from_static(&cx, ""),
             };
             line(&lines, Buffer!::new().write(&cx, d).put(" = ").write(&cx, self.literal(&cx, self.type_operand_raw(&cx, instr), lit)).put(";"));
         } else if op.is(&cx, "copy") {
@@ -2942,7 +2941,7 @@ impl Backend['k] {
         } else if op.is(&cx, "construct_variant") {
             let lit = match instr.lit {
                 Some(l) => l,
-                None => Span::from_static(&cx, ""),
+                None => Str::from_static(&cx, ""),
             };
             let ty = self.type_operand(&cx, instr);
             let variants = self.types.variants(&cx, erase(&cx, ty, self.types), Option::None);
@@ -2955,7 +2954,7 @@ impl Backend['k] {
                 s = s + 1usize;
             }
         } else if op.is(&cx, "variant_tag") {
-            let source = if a.at(&cx, 0usize).starts_with(&cx, Span::from_static(&cx, "&")) {
+            let source = if a.at(&cx, 0usize).starts_with(&cx, Str::from_static(&cx, "&")) {
                 let (expr, _ty) = self.place(&cx, a.at(&cx, 0usize));
                 expr
             } else {
@@ -3008,7 +3007,7 @@ impl Backend['k] {
             line(&lines, Buffer!::new().write(&cx, d).put(" = *(").write(&cx, ct).put(" volatile*)").write(&cx, self.value_name(&cx, a.at(&cx, 0usize))).put(";"));
         } else if op.is(&cx, "ptr_store") || op.is(&cx, "ptr_store_volatile") {
             let inner = self.pointee(&cx, self.type_of(&cx, a.at(&cx, 0usize)));
-            let qual = if op.ends_with(&cx, Span::from_static(&cx, "volatile")) { Buffer!::new().put("(").write(&cx, self.c(&cx, inner)).put(" volatile*)").save(&cx) } else { Span::from_static(&cx, "") };
+            let qual = if op.ends_with(&cx, Str::from_static(&cx, "volatile")) { Buffer!::new().put("(").write(&cx, self.c(&cx, inner)).put(" volatile*)").save(&cx) } else { Str::from_static(&cx, "") };
             let target = self.value_name(&cx, a.at(&cx, 0usize));
             line(&lines, Buffer!::new().put("*").write(&cx, qual).write(&cx, target).put(" = ").write(&cx, self.value_name(&cx, a.at(&cx, 1usize))).put(";"));
         } else if C::atomic_kind(&cx, op).is_some() {
@@ -3037,14 +3036,14 @@ impl Backend['k] {
     fn pointee(self, &cx: Domain!['k], pointer: Type['k]) -> Type['k] {
         match pointer {
             Ptr(inner) => inner.copy(&cx),
-            _ => fail_text(&cx, Span::from_static(&cx, "internal error: a pointer operation on a value that is not a pointer")),
+            _ => fail_text(&cx, Str::from_static(&cx, "internal error: a pointer operation on a value that is not a pointer")),
         }
     }
 
     fn type_operand_raw(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
         match instr.ty {
             Some(t) => t,
-            None => fail_text(&cx, Span::from_static(&cx, "internal error: an instruction without its type")),
+            None => fail_text(&cx, Str::from_static(&cx, "internal error: an instruction without its type")),
         }
     }
 
@@ -3054,7 +3053,7 @@ impl Backend['k] {
 
     // Assigns each component to its member of `dst`, but the components `away` sends elsewhere: to a
     // place path where a homed component ends up, or through an out pointer (`*out`), after the others.
-    fn construct(self, &cx: Domain!['k], &lines: Buffer!, dst: Span['k], ty: Type['k], args: ArenaVec[Span['k], 'k], away: ArenaVec[(usize, Span['k]), 'k]) {
+    fn construct(self, &cx: Domain!['k], &lines: Buffer!, dst: Str['k], ty: Type['k], args: ArenaVec[Str['k], 'k], away: ArenaVec[(usize, Str['k]), 'k]) {
         let s = self.shape(&cx, ty);
         match s {
             Array(_elem, length) => {
@@ -3078,11 +3077,11 @@ impl Backend['k] {
                 var w = 0usize;
                 while w < away.len(&cx) {
                     let (k, target) = away.at(&cx, w);
-                    if target.starts_with(&cx, Span::from_static(&cx, "*")) {
+                    if target.starts_with(&cx, Str::from_static(&cx, "*")) {
                         line(&lines, Buffer!::new().write(&cx, target).put(" = ").write(&cx, self.value_name(&cx, args.at(&cx, k))).put(";"));
                     } else {
                         let value = self.value_name(&cx, args.at(&cx, k));
-                        self.write_home(&cx, &lines, target, value, Span::from_static(&cx, ""));
+                        self.write_home(&cx, &lines, target, value, Str::from_static(&cx, ""));
                     }
                     w = w + 1usize;
                 }
@@ -3094,14 +3093,14 @@ impl Backend['k] {
     // variable (`away` in cgen.py): the homed ones of a value shared into a homed parameter to their
     // place paths; when the function writes elements of its result through out pointers, and the
     // value is returned and read nothing else, those elements to `*out` (then marked as there).
-    fn away(self, &cx: Domain!['k], name: Span['k]) -> ArenaVec[(usize, Span['k]), 'k] {
+    fn away(self, &cx: Domain!['k], name: Str['k]) -> ArenaVec[(usize, Str['k]), 'k] {
         let plan = self.the_plan(&cx);
         let label = self.label.copy(&cx);
         let key = (label, name);
         if plan.made_home.contains(&cx, key) {
             return plan.homed.at(&cx, plan.shared.at(&cx, key));
         }
-        let away: ArenaVec[(usize, Span['k]), 'k] = ArenaVec::new(&cx);
+        let away: ArenaVec[(usize, Str['k]), 'k] = ArenaVec::new(&cx);
         let symbol = self.symbol.copy(&cx);
         let outs = self.out_pointers(&cx, symbol);
         if outs.is_empty(&cx) || !self.returned_alone(&cx, name) {
@@ -3124,7 +3123,7 @@ impl Backend['k] {
 
     // The value `name` of the current block is what it returns, directly or through return joins, and
     // the block reads it nowhere else.
-    fn returned_alone(self, &cx: Domain!['k], name: Span['k]) -> bool {
+    fn returned_alone(self, &cx: Domain!['k], name: Str['k]) -> bool {
         let plan = self.the_plan(&cx);
         let block = self.blocks.copy(&cx).at(&cx, self.label.copy(&cx));
         let returned = match block.term {
@@ -3173,7 +3172,7 @@ impl Backend['k] {
     }
 
     // Writes `value` at the place path `path` where a homed component ends up, unless it lies there.
-    fn write_home(self, &cx: Domain!['k], &lines: Buffer!, path: Span['k], value: Span['k], indent: Span['k]) {
+    fn write_home(self, &cx: Domain!['k], &lines: Buffer!, path: Str['k], value: Str['k], indent: Str['k]) {
         let (target, _ty) = self.place(&cx, path);
         if !target.eq(&cx, value) {
             match self.param_index(&cx, root(&cx, path)) {
@@ -3189,7 +3188,7 @@ impl Backend['k] {
     // Returns the value `value` (of the SSA value `name`, or none: `""`): each element written
     // through an out pointer is assigned to its pointee, unless it is there already, and the rest
     // returned.
-    fn give_back(self, &cx: Domain!['k], &lines: Buffer!, name: Span['k], value: Span['k], indent: Span['k]) {
+    fn give_back(self, &cx: Domain!['k], &lines: Buffer!, name: Str['k], value: Str['k], indent: Str['k]) {
         let symbol = self.symbol.copy(&cx);
         let outs = self.out_pointers(&cx, symbol);
         if outs.is_empty(&cx) {
@@ -3216,7 +3215,7 @@ impl Backend['k] {
             return;
         }
         let rows = self.members(&cx, self.shape(&cx, reduced));
-        let parts: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let parts: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
         var r = 0usize;
         var k = 0usize;
         while k < members.len(&cx) {
@@ -3237,7 +3236,7 @@ impl Backend['k] {
 
     fn destruct(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k]) {
         let arg = instr.args.at(&cx, 0usize);
-        let (source, ty) = if arg.starts_with(&cx, Span::from_static(&cx, "&")) {
+        let (source, ty) = if arg.starts_with(&cx, Str::from_static(&cx, "&")) {
             self.place(&cx, arg)
         } else {
             let source = self.value_name(&cx, arg);
@@ -3274,10 +3273,10 @@ impl Backend['k] {
     }
 
     // Integer conversion by truncation or sign extension.
-    fn convert(self, &cx: Domain!['k], expr: Span['k], dst: Type['k]) -> Span['k] {
+    fn convert(self, &cx: Domain!['k], expr: Str['k], dst: Type['k]) -> Str['k] {
         let name = match dst {
             Prim(n) => n,
-            _ => fail_text(&cx, Span::from_static(&cx, "internal error: a conversion to a type that is not primitive")),
+            _ => fail_text(&cx, Str::from_static(&cx, "internal error: a conversion to a type that is not primitive")),
         };
         let wide = if C::is_pointer_sized(&cx, name) { "uintptr_t" } else { "uint64_t" };
         match signed_suffix(&cx, name) {
@@ -3291,13 +3290,13 @@ impl Backend['k] {
     // ties to even, and past the largest to an infinity. To an integer, toward zero, saturating at the
     // integer's bounds, NaN to 0: C's conversion is undefined outside the range, so it is used only in
     // it. The bounds are powers of two, exact in either float type.
-    fn float_convert(self, &cx: Domain!['k], expr: Span['k], src: Type['k], dst: Type['k]) -> Span['k] {
+    fn float_convert(self, &cx: Domain!['k], expr: Str['k], src: Type['k], dst: Type['k]) -> Str['k] {
         let (sn, dn) = match self.shape(&cx, src) {
             Prim(x) => match self.shape(&cx, dst) {
                 Prim(y) => (x, y),
-                _ => fail_text(&cx, Span::from_static(&cx, "internal error: a float conversion to a type that is not primitive")),
+                _ => fail_text(&cx, Str::from_static(&cx, "internal error: a float conversion to a type that is not primitive")),
             },
-            _ => fail_text(&cx, Span::from_static(&cx, "internal error: a float conversion from a type that is not primitive")),
+            _ => fail_text(&cx, Str::from_static(&cx, "internal error: a float conversion from a type that is not primitive")),
         };
         let ct = c_prim(&cx, dn);
         if C::is_float(&cx, dn) {
@@ -3308,7 +3307,7 @@ impl Backend['k] {
             // -2^(N-1), for the target's pointer width N.
             let low = Buffer!::new().put("(").write(&cx, c_prim(&cx, sn)).put(")INTPTR_MIN").save(&cx);
             let high = Buffer!::new().put(if signed { "-" } else { "-2 * " }).write(&cx, low).save(&cx);
-            (low, high, Span::from_static(&cx, if signed { "INTPTR" } else { "UINTPTR" }))
+            (low, high, Str::from_static(&cx, if signed { "INTPTR" } else { "UINTPTR" }))
         } else {
             let suffix = if sn.is(&cx, "f32") { "f" } else { "" };
             let bits = C::integer_bits(&cx, dn);
@@ -3330,7 +3329,7 @@ impl Backend['k] {
         out.put("0").save(&cx)
     }
 
-    fn cast(self, &cx: Domain!['k], &lines: Buffer!, dst: Span['k], expr: Span['k], src: Type['k], dst_ty: Type['k]) {
+    fn cast(self, &cx: Domain!['k], &lines: Buffer!, dst: Str['k], expr: Str['k], src: Type['k], dst_ty: Type['k]) {
         let s = self.shape(&cx, src);
         let d = self.shape(&cx, dst_ty);
         let cd = self.c(&cx, dst_ty);
@@ -3368,13 +3367,13 @@ impl Backend['k] {
         }
     }
 
-    fn reinterpret(self, &cx: Domain!['k], &lines: Buffer!, dst: Span['k], expr: Span['k]) {
+    fn reinterpret(self, &cx: Domain!['k], &lines: Buffer!, dst: Str['k], expr: Str['k]) {
         line(&lines, Buffer!::new().put("_Static_assert(sizeof(").write(&cx, dst).put(") == sizeof(").write(&cx, expr)
             .put("), \"KURS cast requires equal representation sizes\");"));
         line(&lines, Buffer!::new().put("__builtin_memcpy(&").write(&cx, dst).put(", &").write(&cx, expr).put(", sizeof(").write(&cx, dst).put("));"));
     }
 
-    fn primitive(self, &cx: Domain!['k], &lines: Buffer!, dst: Span['k], op: Span['k], args: ArenaVec[Span['k], 'k]) {
+    fn primitive(self, &cx: Domain!['k], &lines: Buffer!, dst: Str['k], op: Str['k], args: ArenaVec[Str['k], 'k]) {
         let x = self.value_name(&cx, args.at(&cx, 0usize));
         let y = self.value_name(&cx, args.at(&cx, 1usize));
         let t = self.shape(&cx, self.type_of(&cx, args.at(&cx, 0usize)));
@@ -3384,7 +3383,7 @@ impl Backend['k] {
         }
         let name = match t {
             Prim(n) => n,
-            _ => fail_text(&cx, Span::from_static(&cx, "internal error: a primitive operation on a value that is not primitive")),
+            _ => fail_text(&cx, Str::from_static(&cx, "internal error: a primitive operation on a value that is not primitive")),
         };
         if !C::is_integer(&cx, name) || op.is(&cx, "eq") || op.is(&cx, "ne") || op.is(&cx, "lt") || op.is(&cx, "le") || op.is(&cx, "gt") || op.is(&cx, "ge") {
             line(&lines, Buffer!::new().write(&cx, dst).put(" = (").write(&cx, x).put(" ").write(&cx, c_op(&cx, op)).put(" ").write(&cx, y).put(");"));
@@ -3397,10 +3396,10 @@ impl Backend['k] {
         // `usize` and `isize`.
         let pointer_sized = C::is_pointer_sized(&cx, name);
         let width = C::integer_bits(&cx, name);
-        let wide = if pointer_sized { Span::from_static(&cx, "uintptr_t") } else { Span::from_static(&cx, "uint64_t") };
-        let wide_max = if pointer_sized { Span::from_static(&cx, "UINTPTR_MAX") } else { Span::from_static(&cx, "UINT64_MAX") };
-        let bits = if pointer_sized { Span::from_static(&cx, "KUR_PTR_BITS") } else { Buffer!::new().put(width).save(&cx) };
-        let mask = if pointer_sized { Span::from_static(&cx, "(KUR_PTR_BITS - 1)") } else { Buffer!::new().put(width - 1u32).save(&cx) };
+        let wide = if pointer_sized { Str::from_static(&cx, "uintptr_t") } else { Str::from_static(&cx, "uint64_t") };
+        let wide_max = if pointer_sized { Str::from_static(&cx, "UINTPTR_MAX") } else { Str::from_static(&cx, "UINT64_MAX") };
+        let bits = if pointer_sized { Str::from_static(&cx, "KUR_PTR_BITS") } else { Buffer!::new().put(width).save(&cx) };
+        let mask = if pointer_sized { Str::from_static(&cx, "(KUR_PTR_BITS - 1)") } else { Buffer!::new().put(width - 1u32).save(&cx) };
         let bits_of = if pointer_sized {
             f"(uintptr_t)({x})".write(&cx, Buffer!::new()).save(&cx)
         } else if width < 64u32 || signed {
@@ -3414,7 +3413,7 @@ impl Backend['k] {
                 let minus = if op.is(&cx, "div") {
                     wrap(&cx, f"({wide})0 - ({wide})({x})".write(&cx, Buffer!::new()).save(&cx), suffix, ct)
                 } else {
-                    Span::from_static(&cx, "0")
+                    Str::from_static(&cx, "0")
                 };
                 line(&lines, Buffer!::new().write(&cx, dst).put(" = (").write(&cx, y).put(" == -1) ? ").write(&cx, minus).put(" : (").write(&cx, ct).put(")(")
                     .write(&cx, x).put(" ").write(&cx, c_op(&cx, op)).put(" ").write(&cx, y).put(");"));
@@ -3443,10 +3442,10 @@ impl Backend['k] {
 
     fn call(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k]) {
         let callee = instr.args.at(&cx, 0usize);
-        if callee.starts_with(&cx, Span::from_static(&cx, "%")) {
+        if callee.starts_with(&cx, Str::from_static(&cx, "%")) {
             let ret = match erase(&cx, self.type_of(&cx, callee), self.types) {
                 Fn(f) => f.ret.copy(&cx),
-                _ => fail_text(&cx, Span::from_static(&cx, "internal error: a call of a value that is not a function")),
+                _ => fail_text(&cx, Str::from_static(&cx, "internal error: a call of a value that is not a function")),
             };
             self.lend(&cx, Option::None, instr.args.skip(&cx, 1usize));
             self.emit_call(&cx, &lines, instr, self.value_name(&cx, callee), ret, ArenaMap::new(&cx), instr.args.skip(&cx, 1usize), ArenaVec::new(&cx), ArenaVec::new(&cx));
@@ -3454,7 +3453,7 @@ impl Backend['k] {
             self.emit_call(&cx, &lines, instr, callee, self.program.externs.at(&cx, callee).ret, ArenaMap::new(&cx), instr.args.skip(&cx, 1usize), ArenaVec::new(&cx), ArenaVec::new(&cx));
         } else {
             let fun = self.program.funs.at(&cx, callee);
-            let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+            let sub: ArenaMap[Str['k], Type['k], 'k] = ArenaMap::new(&cx);
             var i = 0usize;
             while i < fun.params.len(&cx) && i < instr.tys.len(&cx) {
                 sub.insert(&cx, fun.params.at(&cx, i).name, self.substitute_type(&cx, instr.tys.at(&cx, i)));
@@ -3483,14 +3482,14 @@ impl Backend['k] {
     // A lend adapter's call (`Plan::residences`) as its own call, lending the callee the places
     // `paths` the borrowed values lie in instead of the adapter's places, its result assigned to the
     // result of the destruct that follows.
-    fn lend_in_place(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k], paths: ArenaVec[Span['k], 'k]) {
+    fn lend_in_place(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k], paths: ArenaVec[Str['k], 'k]) {
         let (adapter, fun) = match self.adapters.at(&cx, instr.args.at(&cx, 0usize)) {
             Some(found) => found,
-            None => fail_text(&cx, Span::from_static(&cx, "internal error: a lend in place of no adapter")),
+            None => fail_text(&cx, Str::from_static(&cx, "internal error: a lend in place of no adapter")),
         };
         let block = fun.blocks.at(&cx, 0usize);
         let inner = block.instrs.at(&cx, fun.locals.len(&cx));
-        let actual: ArenaMap[Span['k], Span['k], 'k] = ArenaMap::new(&cx);
+        let actual: ArenaMap[Str['k], Str['k], 'k] = ArenaMap::new(&cx);
         var p = 0usize;
         while p < block.params.len(&cx) && p + 1usize < instr.args.len(&cx) {
             actual.insert(&cx, block.params.at(&cx, p).name, instr.args.at(&cx, p + 1usize));
@@ -3499,17 +3498,17 @@ impl Backend['k] {
         var s = 0usize;
         while s < fun.locals.len(&cx) && s < paths.len(&cx) {
             let path = paths.at(&cx, s);
-            let lent = if path.starts_with(&cx, Span::from_static(&cx, "&")) { path } else { Buffer!::new().put("&").write(&cx, path).save(&cx) };
+            let lent = if path.starts_with(&cx, Str::from_static(&cx, "&")) { path } else { Buffer!::new().put("&").write(&cx, path).save(&cx) };
             actual.insert(&cx, fun.locals.at(&cx, s).name, lent);
             s = s + 1usize;
         }
-        let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+        let sub: ArenaMap[Str['k], Type['k], 'k] = ArenaMap::new(&cx);
         var t = 0usize;
         while t < fun.params.len(&cx) && t < instr.tys.len(&cx) {
             sub.insert(&cx, fun.params.at(&cx, t).name, instr.tys.at(&cx, t));
             t = t + 1usize;
         }
-        let args: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let args: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
         var g = 0usize;
         while g < inner.args.len(&cx) {
             args.push(&cx, actual.get_or(&cx, inner.args.at(&cx, g), inner.args.at(&cx, g)));
@@ -3523,7 +3522,7 @@ impl Backend['k] {
         }
         let lhs = if adapter.returns {
             let after = self.blocks.copy(&cx).at(&cx, self.label.copy(&cx)).instrs.at(&cx, self.index.copy(&cx) + 1usize).lhs;
-            let only: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+            let only: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
             only.push(&cx, after.at(&cx, after.len(&cx) - 1usize));
             only
         } else {
@@ -3539,7 +3538,7 @@ impl Backend['k] {
 
     // The destruct after a lend in place: the call assigned the result, and each value handed back
     // lies in its place, or is copied out of it when it cannot be read there.
-    fn handed_back(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k], paths: ArenaVec[Span['k], 'k]) {
+    fn handed_back(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k], paths: ArenaVec[Str['k], 'k]) {
         let plan = self.the_plan(&cx);
         var k = 0usize;
         while k < instr.lhs.len(&cx) && k < paths.len(&cx) {
@@ -3554,12 +3553,12 @@ impl Backend['k] {
 
     // A store of the construction just before it (`Plan::fused`): each component written into its
     // member of the place, except the ones that lie there already.
-    fn store_in_place(self, &cx: Domain!['k], &lines: Buffer!, target: Span['k], construct: Instr['k]) {
+    fn store_in_place(self, &cx: Domain!['k], &lines: Buffer!, target: Str['k], construct: Instr['k]) {
         let (dst, _ty) = self.place(&cx, target);
         let ty = self.type_operand(&cx, construct);
         let labels = match self.labels_of(&cx, ty) {
             Some(found) => found,
-            None => fail_text(&cx, Span::from_static(&cx, "internal error: a construction in place that is not a product")),
+            None => fail_text(&cx, Str::from_static(&cx, "internal error: a construction in place that is not a product")),
         };
         let rows = self.members(&cx, self.shape(&cx, ty));
         let plan = self.the_plan(&cx);
@@ -3587,8 +3586,8 @@ impl Backend['k] {
     }
 
     // The C arguments of a call: those that pass something.
-    fn operands(self, &cx: Domain!['k], &lines: Buffer!, args: ArenaVec[Span['k], 'k], refs: ArenaVec[bool, 'k]) -> Span['k] {
-        let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+    fn operands(self, &cx: Domain!['k], &lines: Buffer!, args: ArenaVec[Str['k], 'k], refs: ArenaVec[bool, 'k]) -> Str['k] {
+        let out: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < args.len(&cx) {
             if !self.erased_arg(&cx, args.at(&cx, i)) {
@@ -3605,11 +3604,11 @@ impl Backend['k] {
 
     // The address of the value `arg` for a callee that reads it through a pointer (`by_address` in
     // cgen.py).
-    fn by_address(self, &cx: Domain!['k], &lines: Buffer!, arg: Span['k], args: ArenaVec[Span['k], 'k]) -> Span['k] {
+    fn by_address(self, &cx: Domain!['k], &lines: Buffer!, arg: Str['k], args: ArenaVec[Str['k], 'k]) -> Str['k] {
         let expr = self.value_name(&cx, arg);
-        let path = self.the_plan(&cx).resident.get_or(&cx, (self.label.copy(&cx), arg), Span::from_static(&cx, ""));
+        let path = self.the_plan(&cx).resident.get_or(&cx, (self.label.copy(&cx), arg), Str::from_static(&cx, ""));
         var unsafe_spot = false;
-        if path.starts_with(&cx, Span::from_static(&cx, "&")) {
+        if path.starts_with(&cx, Str::from_static(&cx, "&")) {
             unsafe_spot = self.param_index(&cx, root(&cx, path)).is_some();
             var g = 0usize;
             while !unsafe_spot && g < args.len(&cx) {
@@ -3633,20 +3632,20 @@ impl Backend['k] {
         Buffer!::new().put("&").write(&cx, copy).save(&cx)
     }
 
-    fn emit_call(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k], callee: Span['k], ret: Type['k], sub: ArenaMap[Span['k], Type['k], 'k], args: ArenaVec[Span['k], 'k],
+    fn emit_call(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k], callee: Str['k], ret: Type['k], sub: ArenaMap[Str['k], Type['k], 'k], args: ArenaVec[Str['k], 'k],
         refs: ArenaVec[bool, 'k], outs: ArenaVec[usize, 'k]) {
         let name = instr.lhs.at(&cx, 0usize);
         let label = self.label.copy(&cx);
         let result = subst(&cx, ret, sub, self.counter);
         let live = !self.erased(&cx, result) && self.is_live(&cx, name);
-        let dst = if live { self.value_name(&cx, name) } else { Span::from_static(&cx, "") };
+        let dst = if live { self.value_name(&cx, name) } else { Str::from_static(&cx, "") };
         let homed = if live && self.the_plan(&cx).made_home.contains(&cx, (label, name)) { self.away(&cx, name) } else { ArenaVec::new(&cx) };
         let members = if outs.is_empty(&cx) { ArenaVec::new(&cx) } else { self.members(&cx, self.shape(&cx, result)) };
         let current = self.symbol.copy(&cx);
         let own_ks = if self.returning.copy(&cx) { self.outs.at(&cx, current) } else { ArenaVec::new(&cx) };
         let own = self.out_pointers(&cx, current);
-        let pointers: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
-        let out_paths: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let pointers: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
+        let out_paths: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
         var o = 0usize;
         while o < outs.len(&cx) {
             let k = outs.at(&cx, o);
@@ -3669,7 +3668,7 @@ impl Backend['k] {
                 None => if self.passes_own(&cx, mine, result, k) {
                     let (_ctype, cname) = match mine {
                         Some(pointee) => pointee,
-                        None => fail_text(&cx, Span::from_static(&cx, "internal error: no out pointer")),
+                        None => fail_text(&cx, Str::from_static(&cx, "internal error: no out pointer")),
                     };
                     pointers.push(&cx, cname);
                     let added = self.at_out.copy(&cx).insert(&cx, (label, name, k));
@@ -3688,7 +3687,7 @@ impl Backend['k] {
         self.out_paths.set(&cx, out_paths);
         let operands = self.operands(&cx, &lines, args, refs);
         self.out_paths.set(&cx, ArenaVec::new(&cx));
-        let passed: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let passed: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
         if !operands.is_empty() {
             passed.push(&cx, operands);
         }
@@ -3733,7 +3732,7 @@ impl Backend['k] {
             let (k, path) = homed.at(&cx, h);
             if !outs.contains(&cx, k) {
                 let (member, _t) = self.members(&cx, self.shape(&cx, result)).at(&cx, k);
-                self.write_home(&cx, &lines, path, f"{dst}.{member}".write(&cx, Buffer!::new()).save(&cx), Span::from_static(&cx, ""));
+                self.write_home(&cx, &lines, path, f"{dst}.{member}".write(&cx, Buffer!::new()).save(&cx), Str::from_static(&cx, ""));
             }
             h = h + 1usize;
         }
@@ -3741,7 +3740,7 @@ impl Backend['k] {
 
     // The caller's own out pointer `mine` for element `k` of a call's result `result` is passed on: its
     // pointee has the element's C type.
-    fn passes_own(self, &cx: Domain!['k], mine: Option[(Span['k], Span['k])], result: Type['k], k: usize) -> bool {
+    fn passes_own(self, &cx: Domain!['k], mine: Option[(Str['k], Str['k])], result: Type['k], k: usize) -> bool {
         match mine {
             Some(pointee) => {
                 let (ctype, _cname) = pointee;
@@ -3755,24 +3754,24 @@ impl Backend['k] {
     fn element(self, &cx: Domain!['k], ty: Type['k], k: usize) -> Type['k] {
         match self.shape(&cx, ty) {
             Tuple(elems) => elems.at(&cx, k),
-            _ => fail_text(&cx, Span::from_static(&cx, "internal error: an element of a type that is not a tuple")),
+            _ => fail_text(&cx, Str::from_static(&cx, "internal error: an element of a type that is not a tuple")),
         }
     }
 
-    fn atomic(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k], dst: Option[Span['k]]) {
+    fn atomic(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k], dst: Option[Str['k]]) {
         let order = match instr.lit {
             Some(o) => o,
-            None => fail_text(&cx, Span::from_static(&cx, "internal error: an atomic operation without its ordering")),
+            None => fail_text(&cx, Str::from_static(&cx, "internal error: an atomic operation without its ordering")),
         };
         let d = match dst {
             Some(t) => t,
-            None => Span::from_static(&cx, "None"),
+            None => Str::from_static(&cx, "None"),
         };
         let kind = match C::atomic_kind(&cx, instr.op) {
             Some(k) => k,
-            None => fail_text(&cx, Span::from_static(&cx, "internal error: not an atomic operation")),
+            None => fail_text(&cx, Str::from_static(&cx, "internal error: not an atomic operation")),
         };
-        let args: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let args: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < instr.args.len(&cx) {
             args.push(&cx, self.value_name(&cx, instr.args.at(&cx, i)));
@@ -3785,7 +3784,7 @@ impl Backend['k] {
                 Ptr(_inner) => (false, true),
                 _ => (false, false),
             };
-            if !integer && (kind.starts_with(&cx, Span::from_static(&cx, "fetch_")) || !transfer) {
+            if !integer && (kind.starts_with(&cx, Str::from_static(&cx, "fetch_")) || !transfer) {
                 fail_at(&cx, f"backend atomic {kind} does not support this pointee type; fetch operations require integers, transfers require integers, bool or raw pointers".write(&cx, Buffer!::new()).save(&cx), instr.pos);
             }
         }
@@ -3799,9 +3798,9 @@ impl Backend['k] {
             line(&lines, Buffer!::new().write(&cx, d).put(" = __atomic_exchange_n(").write(&cx, args.at(&cx, 0usize)).put(", ").write(&cx, args.at(&cx, 1usize)).put(", ")
                 .write(&cx, c_order(&cx, order)).put(");"));
         } else if kind.is(&cx, "compare_exchange") {
-            let (success, failure) = match order.find(&cx, Span::from_static(&cx, "/"), 0usize) {
+            let (success, failure) = match order.find(&cx, Str::from_static(&cx, "/"), 0usize) {
                 Some(at) => (order.slice(0usize, at), order.skip(at + 1usize)),
-                None => (order, Span::from_static(&cx, "")),
+                None => (order, Str::from_static(&cx, "")),
             };
             line(&lines, Buffer!::new().write(&cx, d).put(".e0 = ").write(&cx, args.at(&cx, 1usize)).put(";"));
             line(&lines, Buffer!::new().write(&cx, d).put(".e1 = __atomic_compare_exchange_n(").write(&cx, args.at(&cx, 0usize)).put(", &").write(&cx, d).put(".e0, ")
@@ -3812,17 +3811,17 @@ impl Backend['k] {
         }
     }
 
-    fn foreach_instr(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k], dst: Span['k]) {
+    fn foreach_instr(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k], dst: Str['k]) {
         let t = match instr.ty {
             Some(ty) => match self.substitute_type(&cx, ty) {
                 Foreach(f) => f,
-                _ => fail_text(&cx, Span::from_static(&cx, "internal error: a foreach of a type that is not a transform")),
+                _ => fail_text(&cx, Str::from_static(&cx, "internal error: a foreach of a type that is not a transform")),
             },
-            None => fail_text(&cx, Span::from_static(&cx, "internal error: a foreach without its type")),
+            None => fail_text(&cx, Str::from_static(&cx, "internal error: a foreach without its type")),
         };
         let operand = self.type_of(&cx, instr.args.at(&cx, 0usize));
         let mapped = mapped_operand(operand);
-        let source = if self.value_erased(&cx, instr.args.at(&cx, 0usize)) { Span::from_static(&cx, "") } else { self.value_name(&cx, instr.args.at(&cx, 0usize)) };
+        let source = if self.value_erased(&cx, instr.args.at(&cx, 0usize)) { Str::from_static(&cx, "") } else { self.value_name(&cx, instr.args.at(&cx, 0usize)) };
         let mapper_name = instr.args.at(&cx, 1usize);
         let mapper = self.program.funs.at(&cx, mapper_name);
         let own: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
@@ -3832,11 +3831,11 @@ impl Backend['k] {
             o = o + 1usize;
         }
         if mapper.params.len(&cx) != 1usize + own.len(&cx) {
-            fail_at(&cx, Span::from_static(&cx, "foreach mapper parameter partition disagrees"), instr.pos);
+            fail_at(&cx, Str::from_static(&cx, "foreach mapper parameter partition disagrees"), instr.pos);
         }
         // A captured value the mapper takes by pointer (an aggregate of more than four words, as
         // `request` decides for its parameter of that type) is passed by its address.
-        let caps: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let caps: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
         var c = 2usize;
         while c < instr.args.len(&cx) {
             if !self.value_erased(&cx, instr.args.at(&cx, c)) {
@@ -3848,7 +3847,7 @@ impl Backend['k] {
             }
             c = c + 1usize;
         }
-        let values: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let values: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
         var v = 2usize;
         while v < instr.args.len(&cx) {
             if !self.value_erased(&cx, instr.args.at(&cx, v)) {
@@ -3882,7 +3881,7 @@ impl Backend['k] {
                 Enum(_variants) => {
                     let results = match out_shape {
                         Enum(variants) => variants,
-                        _ => fail_text(&cx, Span::from_static(&cx, "internal error: a foreach over an enum that makes no enum")),
+                        _ => fail_text(&cx, Str::from_static(&cx, "internal error: a foreach over an enum that makes no enum")),
                     };
                     // A sum is traversed by value only: a pointer source points to a product or an array.
                     let source_type = self.type_of(&cx, instr.args.at(&cx, 0usize));
@@ -3951,7 +3950,7 @@ impl Backend['k] {
     }
 
     // `target = call;`, or the call alone for a result of a zero-size type.
-    fn assign_result(self, &cx: Domain!['k], target: Span['k], result: Type['k], call: Span['k]) -> Span['k] {
+    fn assign_result(self, &cx: Domain!['k], target: Str['k], result: Type['k], call: Str['k]) -> Str['k] {
         if self.erased(&cx, result) {
             Buffer!::new().write(&cx, call).put(";").save(&cx)
         } else {
@@ -3967,14 +3966,14 @@ impl Backend['k] {
                 line(&lines, Buffer!::new().put("return;"));
             } else {
                 let returned = self.value_name(&cx, value);
-                self.give_back(&cx, &lines, value, returned, Span::from_static(&cx, ""));
+                self.give_back(&cx, &lines, value, returned, Str::from_static(&cx, ""));
             },
-            Jmp(edge, _pos) => self.edge(&cx, &lines, edge, Option::None, Span::from_static(&cx, ""), Span::from_static(&cx, "")),
+            Jmp(edge, _pos) => self.edge(&cx, &lines, edge, Option::None, Str::from_static(&cx, ""), Str::from_static(&cx, "")),
             Jnz(cond, then, other, _pos) => {
                 line(&lines, Buffer!::new().put("if (").write(&cx, self.value_name(&cx, cond)).put(") {"));
-                self.edge(&cx, &lines, then, Option::None, Span::from_static(&cx, ""), Span::from_static(&cx, "  "));
+                self.edge(&cx, &lines, then, Option::None, Str::from_static(&cx, ""), Str::from_static(&cx, "  "));
                 line(&lines, Buffer!::new().put("} else {"));
-                self.edge(&cx, &lines, other, Option::None, Span::from_static(&cx, ""), Span::from_static(&cx, "  "));
+                self.edge(&cx, &lines, other, Option::None, Str::from_static(&cx, ""), Str::from_static(&cx, "  "));
                 line(&lines, Buffer!::new().put("}"));
             },
             Switch(scrutinee, ty, arms, _pos) => self.switch(&cx, &lines, scrutinee, ty, arms),
@@ -3991,20 +3990,20 @@ impl Backend['k] {
     // A jump assigns the target's live parameters (`source` is the C variable `payload` reads); a jump
     // to a return join returns the value it passes there. A value of a zero-size type is empty: nothing
     // is assigned or returned.
-    fn edge(self, &cx: Domain!['k], &lines: Buffer!, edge: Edge['k], payload: Option[Span['k]], source: Span['k], indent: Span['k]) {
+    fn edge(self, &cx: Domain!['k], &lines: Buffer!, edge: Edge['k], payload: Option[Str['k]], source: Str['k], indent: Str['k]) {
         let plan = self.the_plan(&cx);
         let target = self.blocks.copy(&cx).at(&cx, edge.target);
         // (value, the C variable it reads)
-        let values: ArenaVec[(Span['k], Span['k]), 'k] = ArenaVec::new(&cx);
+        let values: ArenaVec[(Str['k], Str['k]), 'k] = ArenaVec::new(&cx);
         // the SSA value of each, or `""` for the payload
-        let names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let names: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
         if payload.is_some() {
-            names.push(&cx, Span::from_static(&cx, ""));
+            names.push(&cx, Str::from_static(&cx, ""));
         }
         names.append(&cx, edge.args);
         match payload {
             Some(p) => if plan.arrived.contains(&cx, (target.label, target.params.at(&cx, 0usize).name)) {
-                values.push(&cx, (Span::from_static(&cx, ""), source));
+                values.push(&cx, (Str::from_static(&cx, ""), source));
             } else {
                 values.push(&cx, (p, source));
             },
@@ -4014,7 +4013,7 @@ impl Backend['k] {
         while a < edge.args.len(&cx) {
             let arg = edge.args.at(&cx, a);
             if self.value_erased(&cx, arg) {
-                values.push(&cx, (Span::from_static(&cx, ""), Span::from_static(&cx, "")));
+                values.push(&cx, (Str::from_static(&cx, ""), Str::from_static(&cx, "")));
             } else {
                 values.push(&cx, (self.value_name(&cx, arg), self.value_base(&cx, arg)));
             }
@@ -4034,7 +4033,7 @@ impl Backend['k] {
         };
         let moves: ArenaVec[Move['k], 'k] = ArenaVec::new(&cx);
         // (place path, value) of each homed component the edge writes, after every other assignment
-        let homes: ArenaVec[(Span['k], Span['k]), 'k] = ArenaVec::new(&cx);
+        let homes: ArenaVec[(Str['k], Str['k]), 'k] = ArenaVec::new(&cx);
         let label = self.label.copy(&cx);
         var p = 0usize;
         while p < target.params.len(&cx) && p < values.len(&cx) {
@@ -4080,7 +4079,7 @@ impl Backend['k] {
 
     // Assigns each move at once: one after another when no assignment overwrites what a later one
     // reads, else through scratch locals.
-    fn assign(self, &cx: Domain!['k], &lines: Buffer!, all: ArenaVec[Move['k], 'k], indent: Span['k]) {
+    fn assign(self, &cx: Domain!['k], &lines: Buffer!, all: ArenaVec[Move['k], 'k], indent: Str['k]) {
         let moves: ArenaVec[Move['k], 'k] = ArenaVec::new(&cx);
         var m = 0usize;
         while m < all.len(&cx) {
@@ -4102,7 +4101,7 @@ impl Backend['k] {
             k = k + 1usize;
         }
         if conflict {
-            let temps: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+            let temps: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
             var i = 0usize;
             while i < moves.len(&cx) {
                 let move = moves.at(&cx, i);
@@ -4128,8 +4127,8 @@ impl Backend['k] {
         }
     }
 
-    fn switch(self, &cx: Domain!['k], &lines: Buffer!, arg: Span['k], ty: Type['k], arms: ArenaVec[Arm['k], 'k]) {
-        let place = arg.starts_with(&cx, Span::from_static(&cx, "&"));
+    fn switch(self, &cx: Domain!['k], &lines: Buffer!, arg: Str['k], ty: Type['k], arms: ArenaVec[Arm['k], 'k]) {
+        let place = arg.starts_with(&cx, Str::from_static(&cx, "&"));
         let (source, base) = if place {
             let (expr, _t) = self.place(&cx, arg);
             (expr, expr)
@@ -4155,12 +4154,12 @@ impl Backend['k] {
             let payload = if place {
                 Option::None
             } else if self.erased(&cx, variants.at(&cx, index).ty) {
-                Option::Some.(Span::from_static(&cx, ""))
+                Option::Some.(Str::from_static(&cx, ""))
             } else {
                 Option::Some.(self.payload(&cx, source, ty, arm.variant))
             };
             line(&lines, Buffer!::new().put("  {"));
-            self.edge(&cx, &lines, arm.edge, payload, base, Span::from_static(&cx, "    "));
+            self.edge(&cx, &lines, arm.edge, payload, base, Str::from_static(&cx, "    "));
             line(&lines, Buffer!::new().put("  }"));
             i = i + 1usize;
         }
@@ -4171,26 +4170,26 @@ impl Backend['k] {
     // ----------------------------------------------------------------- tail calls --
 
     // The position of `name` among the entry block's parameters.
-    fn param_index(self, &cx: Domain!['k], name: Span['k]) -> Option[usize] {
+    fn param_index(self, &cx: Domain!['k], name: Str['k]) -> Option[usize] {
         self.params.copy(&cx).index_of(&cx, name)
     }
 
     // Records where each place lent to `callee` lies, for `qualifiers`; `None` for a call through a
     // function value, whose place parameters are neither `const` nor `restrict`. A place of a zero-size
     // type passes nothing.
-    fn lend(self, &cx: Domain!['k], callee: Option[Span['k]], args: ArenaVec[Span['k], 'k]) {
+    fn lend(self, &cx: Domain!['k], callee: Option[Str['k]], args: ArenaVec[Str['k], 'k]) {
         var k = 0usize;
         while k < args.len(&cx) {
             let arg = args.at(&cx, k);
-            if arg.starts_with(&cx, Span::from_static(&cx, "&")) && !self.erased_arg(&cx, arg) {
-                var kind = Span::from_static(&cx, "local");
+            if arg.starts_with(&cx, Str::from_static(&cx, "&")) && !self.erased_arg(&cx, arg) {
+                var kind = Str::from_static(&cx, "local");
                 var j = 0usize;
-                if arg.starts_with(&cx, Span::from_static(&cx, "&*")) {
-                    kind = Span::from_static(&cx, "raw");
+                if arg.starts_with(&cx, Str::from_static(&cx, "&*")) {
+                    kind = Str::from_static(&cx, "raw");
                 } else {
                     match self.param_index(&cx, root(&cx, arg)) {
                         Some(index) => {
-                            kind = Span::from_static(&cx, "param");
+                            kind = Str::from_static(&cx, "param");
                             j = index;
                         },
                         None => (),
@@ -4213,11 +4212,11 @@ impl Backend['k] {
         let a = call.args;
         let (key, fun, sub, args) = if call.op.is(&cx, "call") {
             let name = a.at(&cx, 0usize);
-            if name.starts_with(&cx, Span::from_static(&cx, "%")) || self.program.externs.contains(&cx, name) {
+            if name.starts_with(&cx, Str::from_static(&cx, "%")) || self.program.externs.contains(&cx, name) {
                 return false;
             }
             let fun = self.program.funs.at(&cx, name);
-            let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+            let sub: ArenaMap[Str['k], Type['k], 'k] = ArenaMap::new(&cx);
             var i = 0usize;
             while i < fun.params.len(&cx) && i < call.tys.len(&cx) {
                 sub.insert(&cx, fun.params.at(&cx, i).name, self.substitute_type(&cx, call.tys.at(&cx, i)));
@@ -4237,7 +4236,7 @@ impl Backend['k] {
         var g = 0usize;
         while g < args.len(&cx) {
             let arg = args.at(&cx, g);
-            if arg.starts_with(&cx, Span::from_static(&cx, "&")) && !arg.starts_with(&cx, Span::from_static(&cx, "&*"))
+            if arg.starts_with(&cx, Str::from_static(&cx, "&")) && !arg.starts_with(&cx, Str::from_static(&cx, "&*"))
                 && self.param_index(&cx, root(&cx, arg)).is_none() {
                 return false;
             }
@@ -4255,25 +4254,25 @@ impl Backend['k] {
             while p < entry.params.len(&cx) && p < args.len(&cx) && p < cparams.len(&cx) {
                 let binding = entry.params.at(&cx, p);
                 let arg = args.at(&cx, p);
-                let place = binding.name.starts_with(&cx, Span::from_static(&cx, "&"));
+                let place = binding.name.starts_with(&cx, Str::from_static(&cx, "&"));
                 if cparams.at(&cx, p).ctype.is(&cx, "void") {
                 } else if place && !arg.eq(&cx, binding.name) {
                     let added = self.looping.insert(&cx, current);
-                    let base = if arg.starts_with(&cx, Span::from_static(&cx, "&*")) { self.value_name(&cx, arg.skip(2usize)) } else { self.cname(&cx, entry.label, root(&cx, arg)) };
+                    let base = if arg.starts_with(&cx, Str::from_static(&cx, "&*")) { self.value_name(&cx, arg.skip(2usize)) } else { self.cname(&cx, entry.label, root(&cx, arg)) };
                     moves.push(&cx, Move.{ dst: self.cname(&cx, entry.label, binding.name), ty: binding.ty, place: true, value: self.operand(&cx, arg), base });
                 } else if !place && plan.is_live(&cx, entry.label, binding.name) {
                     moves.push(&cx, Move.{ dst: self.cname(&cx, entry.label, binding.name), ty: binding.ty, place: false, value: self.value_name(&cx, arg), base: self.value_base(&cx, arg) });
                 }
                 p = p + 1usize;
             }
-            self.assign(&cx, &lines, moves, Span::from_static(&cx, ""));
+            self.assign(&cx, &lines, moves, Str::from_static(&cx, ""));
             line(&lines, Buffer!::new().put("goto ").write(&cx, self.labels.copy(&cx).at(&cx, entry.label)).put(";"));
             return true;
         }
         let (ret, _noreturn, all_params) = self.heads.at(&cx, current);
         let callee_ret = subst(&cx, fun.ret, sub, self.counter);
         let places = fun.places(&cx);
-        let callee_params: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let callee_params: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
         var t = 0usize;
         while t < fun.ptypes.len(&cx) {
             let ct = self.c(&cx, subst(&cx, fun.ptypes.at(&cx, t), sub, self.counter));
@@ -4319,9 +4318,9 @@ impl Backend['k] {
 
     // The place parameters that are `const` and that are `restrict`: see `qualifiers` in cgen.py,
     // which states why.
-    fn qualifiers(self, &cx: Domain!['k]) -> (ArenaSet[(Span['k], usize), 'k], ArenaSet[(Span['k], usize), 'k]) {
-        let const_params: ArenaSet[(Span['k], usize), 'k] = ArenaSet::new(&cx);
-        let restrict_params: ArenaSet[(Span['k], usize), 'k] = ArenaSet::new(&cx);
+    fn qualifiers(self, &cx: Domain!['k]) -> (ArenaSet[(Str['k], usize), 'k], ArenaSet[(Str['k], usize), 'k]) {
+        let const_params: ArenaSet[(Str['k], usize), 'k] = ArenaSet::new(&cx);
+        let restrict_params: ArenaSet[(Str['k], usize), 'k] = ArenaSet::new(&cx);
         var h = 0usize;
         while h < self.heads.positions(&cx) {
             match self.heads.key_at(&cx, h) {
@@ -4367,7 +4366,7 @@ impl Backend['k] {
 }
 
 forall 'k.
-fn wrap(&cx: Domain!['k], expr: Span['k], suffix: Option[Span['k]], ct: Span['k]) -> Span['k] {
+fn wrap(&cx: Domain!['k], expr: Str['k], suffix: Option[Str['k]], ct: Str['k]) -> Str['k] {
     match suffix {
         Some(s) => f"kur_dec_i{s}({expr})".write(&cx, Buffer!::new()).save(&cx),
         None => f"({ct})({expr})".write(&cx, Buffer!::new()).save(&cx),
@@ -4375,7 +4374,7 @@ fn wrap(&cx: Domain!['k], expr: Span['k], suffix: Option[Span['k]], ct: Span['k]
 }
 
 forall 'k.
-fn last_member(&cx: Domain!['k], members: ArenaVec[Member['k], 'k], name: Span['k]) -> Type['k] {
+fn last_member(&cx: Domain!['k], members: ArenaVec[Member['k], 'k], name: Str['k]) -> Type['k] {
     var found: Option[Type['k]] = Option::None;
     var i = 0usize;
     while i < members.len(&cx) {
@@ -4386,7 +4385,7 @@ fn last_member(&cx: Domain!['k], members: ArenaVec[Member['k], 'k], name: Span['
     }
     match found {
         Some(t) => t,
-        None => fail_text(&cx, Span::from_static(&cx, "internal error: no such variant")),
+        None => fail_text(&cx, Str::from_static(&cx, "internal error: no such variant")),
     }
 }
 
@@ -4400,23 +4399,23 @@ exposed struct Walk {
     t: ForeachType['k],
     mapped: Option[ForeachType['k]],
     mapper: Fun['k],
-    mapper_name: Span['k],
+    mapper_name: Str['k],
     own: ArenaVec[Type['k], 'k],
-    caps: ArenaVec[Span['k], 'k],
-    values: ArenaVec[Span['k], 'k],
+    caps: ArenaVec[Str['k], 'k],
+    values: ArenaVec[Str['k], 'k],
     pointer: bool,
 }
 
 forall 'k.
 impl Walk['k] {
-    fn apply(self, &cx: Domain!['k], row: Row['k], component: Span['k]) -> Span['k] {
+    fn apply(self, &cx: Domain!['k], row: Row['k], component: Str['k]) -> Str['k] {
         let bound = self.backend.types.binding(&cx, self.t, row.item);
         // What the mapper is given: the source's component, or the mapped operand's at this row.
         let given = match self.mapped {
             Some(o) => mapped_component(&cx, o, bound, self.backend.counter),
             None => row.item,
         };
-        let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
+        let sub: ArenaMap[Str['k], Type['k], 'k] = ArenaMap::new(&cx);
         sub.insert(&cx, self.mapper.params.at(&cx, 0usize).name, bound);
         var j = 1usize;
         while j < self.mapper.params.len(&cx) && j - 1usize < self.own.len(&cx) {
@@ -4424,7 +4423,7 @@ impl Walk['k] {
             j = j + 1usize;
         }
         let symbol = self.backend.request(&cx, FunKey::Function.(self.mapper_name), self.mapper, sub);
-        let arguments: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let arguments: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
         if !self.backend.outs.at(&cx, symbol).is_empty(&cx) {
             // A mapper writing elements of its result through out pointers is called through its
             // by-value entry, which returns the whole result.
@@ -4456,14 +4455,14 @@ impl Walk['k] {
 }
 
 forall 'k.
-fn emit_c(&cx: Domain!['k], program: Program['k], typed: ArenaMap[FunKey['k], ArenaMap[(Span['k], Span['k]), Type['k], 'k], 'k], entry: Option[Span['k]], counter: Fresh['k], times: bool,
+fn emit_c(&cx: Domain!['k], program: Program['k], typed: ArenaMap[FunKey['k], ArenaMap[(Str['k], Str['k]), Type['k], 'k], 'k], entry: Option[Str['k]], counter: Fresh['k], times: bool,
     split: bool, hosted: bool) -> CText!['k] {
     Backend::new(&cx, program, typed, counter, split).emit_program(&cx, entry, hosted, times)
 }
 
 // The place path or out pointer `away` sends component `k` to (`Backend::away`).
 forall 'k.
-fn home_of(&cx: Domain!['k], away: ArenaVec[(usize, Span['k]), 'k], k: usize) -> Option[Span['k]] {
+fn home_of(&cx: Domain!['k], away: ArenaVec[(usize, Str['k]), 'k], k: usize) -> Option[Str['k]] {
     var i = 0usize;
     while i < away.len(&cx) {
         let (at, target) = away.at(&cx, i);
@@ -4477,7 +4476,7 @@ fn home_of(&cx: Domain!['k], away: ArenaVec[(usize, Span['k]), 'k], k: usize) ->
 
 // Records that instruction `at` (or the terminator, at the block's length) reads `name`.
 forall 'k.
-fn read_at(&cx: Domain!['k], reads: ArenaMap[Span['k], ArenaVec[usize, 'k], 'k], name: Span['k], at: usize) {
+fn read_at(&cx: Domain!['k], reads: ArenaMap[Str['k], ArenaVec[usize, 'k], 'k], name: Str['k], at: usize) {
     match reads.get(&cx, name) {
         Some(found) => found.push(&cx, at),
         None => {
@@ -4489,7 +4488,7 @@ fn read_at(&cx: Domain!['k], reads: ArenaMap[Span['k], ArenaVec[usize, 'k], 'k],
 }
 
 forall 'k.
-fn reads_once(&cx: Domain!['k], reads: ArenaMap[Span['k], ArenaVec[usize, 'k], 'k], name: Span['k]) -> bool {
+fn reads_once(&cx: Domain!['k], reads: ArenaMap[Str['k], ArenaVec[usize, 'k], 'k], name: Str['k]) -> bool {
     match reads.get(&cx, name) {
         Some(found) => found.len(&cx) == 1usize,
         None => false,
@@ -4498,7 +4497,7 @@ fn reads_once(&cx: Domain!['k], reads: ArenaMap[Span['k], ArenaVec[usize, 'k], '
 
 // An instruction of `block` from `start` on, or its terminator, names a path under `local`.
 forall 'k.
-fn names(&cx: Domain!['k], local: Span['k], block: Block['k], start: usize) -> bool {
+fn names(&cx: Domain!['k], local: Str['k], block: Block['k], start: usize) -> bool {
     var i = start;
     while i < block.instrs.len(&cx) {
         let args = block.instrs.at(&cx, i).args;
@@ -4519,8 +4518,8 @@ fn names(&cx: Domain!['k], local: Span['k], block: Block['k], start: usize) -> b
 
 // `local` is empty or named no more from instruction `at` of `block` on, or `path` is empty.
 forall 'k.
-fn apart(&cx: Domain!['k], empty: ArenaSet[Span['k], 'k], local: Span['k], path: Span['k], block: Block['k], at: usize,
-    blocks: ArenaMap[Span['k], Block['k], 'k], reach: ArenaMap[Span['k], ArenaSet[Span['k], 'k], 'k]) -> bool {
+fn apart(&cx: Domain!['k], empty: ArenaSet[Str['k], 'k], local: Str['k], path: Str['k], block: Block['k], at: usize,
+    blocks: ArenaMap[Str['k], Block['k], 'k], reach: ArenaMap[Str['k], ArenaSet[Str['k], 'k], 'k]) -> bool {
     var m = 0usize;
     while m < empty.positions(&cx) {
         match empty.key_at(&cx, m) {
@@ -4550,7 +4549,7 @@ fn apart(&cx: Domain!['k], empty: ArenaSet[Span['k], 'k], local: Span['k], path:
 
 // A path, rewritten under the path its local place shares (`homes`).
 forall 'k.
-fn rehome(&cx: Domain!['k], homes: ArenaMap[Span['k], Span['k], 'k], arg: Span['k]) -> Span['k] {
+fn rehome(&cx: Domain!['k], homes: ArenaMap[Str['k], Str['k], 'k], arg: Str['k]) -> Str['k] {
     if !is_place(&cx, arg) {
         return arg;
     }
@@ -4563,7 +4562,7 @@ fn rehome(&cx: Domain!['k], homes: ArenaMap[Span['k], Span['k], 'k], arg: Span['
 
 // `fun` with each path under a local place of `homes` rewritten under the path it shares.
 forall 'k.
-fn homed(&cx: Domain!['k], fun: Fun['k], homes: ArenaMap[Span['k], Span['k], 'k]) -> Fun['k] {
+fn homed(&cx: Domain!['k], fun: Fun['k], homes: ArenaMap[Str['k], Str['k], 'k]) -> Fun['k] {
     let blocks: ArenaVec[Block['k], 'k] = ArenaVec::new(&cx);
     var b = 0usize;
     while b < fun.blocks.len(&cx) {
@@ -4572,7 +4571,7 @@ fn homed(&cx: Domain!['k], fun: Fun['k], homes: ArenaMap[Span['k], Span['k], 'k]
         var i = 0usize;
         while i < block.instrs.len(&cx) {
             let instr = block.instrs.at(&cx, i);
-            let args: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+            let args: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
             var g = 0usize;
             while g < instr.args.len(&cx) {
                 args.push(&cx, rehome(&cx, homes, instr.args.at(&cx, g)));

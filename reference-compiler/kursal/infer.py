@@ -749,11 +749,11 @@ class Infer:
                 return m
             case S.Lit(kind="bool"):
                 return C.BOOL
-        return self.static_slice()
+        return self.static_str()
 
     def expr_fstring(self, expr: S.FStr, writer: C.Type) -> C.Type:
         """Each `{x}` of the f-string needs `Format[X, W]`, for `W` the `writer` it is written into, but
-        one of type `Slice[u8, 'static]`, which is written as the text around it is, by `write_static`."""
+        one of type `Str['static]`, which is written as the text around it is, by `write_static`."""
         for index, part in enumerate(expr.parts):
             if isinstance(part, str):
                 continue
@@ -765,15 +765,15 @@ class Infer:
 
     def placeholder(self, expr: S.FStr, index: int, value: C.Type, writer: C.Type, pos: Optional[Position]) -> None:
         """The `{x}` part `index` of `expr`, once its type is known: written as text when it is a
-        `Slice[u8, 'static]`, else through `Format`."""
-        if equal(zonk(value), self.static_slice()):
+        `Str['static]`, else through `Format`."""
+        if equal(zonk(value), self.static_str()):
             expr.static_parts.add(index)
         else:
             self.require(self.library("Format"), [value, writer], pos)
 
-    def static_slice(self) -> C.Type:
-        """`Slice[u8, 'static]`, the type of a string literal."""
-        return C.Named(self.library("Slice"), (C.Prim("u8"), C.Skolem("static")))
+    def static_str(self) -> C.Type:
+        """`Str['static]`, the type of a string literal."""
+        return C.Named(self.library("Str"), (C.Skolem("static"),))
 
     def fstring_reading(self, expr: S.Call, string: S.FStr) -> C.Type:
         """`f"...".write(&cx, out)`: the f-string is written into `ReadingWriter![W, C]`, which wraps `out: W`

@@ -2,18 +2,18 @@
 // own context, `Mem!`, holds the arena, its capability and a count of the
 // lines it printed, and lends the first two to the standard library through
 // `Access` (reads and writes), `Allocate` (allocation) and `ReadBytes` (the
-// bytes of spans), so every call takes the one `&mem`. The text is built in
-// an `ArenaVec[u8, 'k]` and read as `Span`s; the table of distinct words is
-// an `ArenaVec` of `(Span, u32)` rows, compared through `HashIn`. Every
+// bytes of text), so every call takes the one `&mem`. The text is built in
+// an `ArenaVec[u8, 'k]` and read as `Str`s; the table of distinct words is
+// an `ArenaVec` of `(Str, u32)` rows, compared through `HashIn`. Every
 // handle is `Copy`, and nothing here is unsafe or freed one at a time:
 // destroying the arena frees it all. Each line printed is built in a
 // `Buffer!` on the heap, numbers in decimal included, and saved into the
 // arena (`Buffer!::save`), which frees the buffer.
 //
 // It prints each distinct word with its count, in first-seen order, then
-// checks the rest of the arena vec's and span's operations, and exits with
+// checks the rest of the arena vec's and text's operations, and exits with
 // status 3 through `std::process::exit`.
-use std::arena::{Allocate, Arena!, Domain!, concat, copy_span, seed};
+use std::arena::{Allocate, Arena!, Domain!, concat, copy_str, seed};
 use std::buffer::Buffer!;
 use std::fmt::Writer;
 use std::cap::{Access, Exclusive!};
@@ -23,8 +23,8 @@ use std::hash::{HashIn, HashState, key_hash};
 use std::io::{print, stdout};
 use std::option::Option;
 use std::process::{exit, hash_seed};
-use std::raw::Span;
-use std::slice::{ReadBytes, Slice};
+use std::str::Str;
+use std::slice::ReadBytes;
 
 forall 'k.
 exposed struct Mem! {
@@ -67,25 +67,25 @@ instance Allocate[Mem!['k] -> 'k, u32] {
 }
 
 forall 'k.
-instance ReadBytes[Mem!['k], Span['k]] {
-    fn get(&mem: Mem!['k], bytes: Span['k], index: usize) -> Option[u8] {
+instance ReadBytes[Mem!['k], Str['k]] {
+    fn get(&mem: Mem!['k], bytes: Str['k], index: usize) -> Option[u8] {
         var { tag, arena, printed } = mem;
         let b = bytes.get(&tag, index);
         mem = Mem!.{ tag, arena, printed };
         b
     }
 
-    fn len(&mem: Mem!['k], bytes: Span['k]) -> usize {
+    fn len(&mem: Mem!['k], bytes: Str['k]) -> usize {
         bytes.len()
     }
 }
 
 // Adds one to `word`'s row, or adds a row for it.
 forall 'k.
-fn count(&mem: Mem!['k], table: ArenaVec[(Span['k], u32), 'k], word: Span['k]) {
+fn count(&mem: Mem!['k], table: ArenaVec[(Str['k], u32), 'k], word: Str['k]) {
     match table.position(&mem, |&m, row| {
         let (seen, n) = row;
-        HashIn[Span['k], Mem!['k]]::eq_in(&m, seen, word)
+        HashIn[Str['k], Mem!['k]]::eq_in(&m, seen, word)
     }) {
         Some(i) => {
             let (seen, n) = table.at(&mem, i);
@@ -96,11 +96,11 @@ fn count(&mem: Mem!['k], table: ArenaVec[(Span['k], u32), 'k], word: Span['k]) {
 }
 
 forall 'k.
-fn hash(&mem: Mem!['k], key: (Span['k], u32)) -> u64 {
-    HashIn[(Span['k], u32), Mem!['k]]::hash_in(&mem, key, HashState::new(seed(&mem))).finish()
+fn hash(&mem: Mem!['k], key: (Str['k], u32)) -> u64 {
+    HashIn[(Str['k], u32), Mem!['k]]::hash_in(&mem, key, HashState::new(seed(&mem))).finish()
 }
 
-fn check(ok: bool, what: Slice[u8, 'static]) {
+fn check(ok: bool, what: Str['static]) {
     if !ok {
         print(what);
         print(": wrong\n");
@@ -118,9 +118,9 @@ fn run(&mem: Mem!['k]) {
     let text: ArenaVec[u8, 'k] = ArenaVec::new(&mem);
     text.push_static(&mem, "the cat and ");
     text.push_static(&mem, "the hat");
-    let all = text.span(&mem);
-    let table: ArenaVec[(Span['k], u32), 'k] = ArenaVec::new(&mem);
-    let ws = ArenaVec::split(&mem, all, Span::from_static(&mem, " "));
+    let all = text.to_str(&mem);
+    let table: ArenaVec[(Str['k], u32), 'k] = ArenaVec::new(&mem);
+    let ws = ArenaVec::split(&mem, all, Str::from_static(&mem, " "));
     ws.each(&mem, |&m, w| count(&m, table, w));
     var j = 0usize;
     while j < table.len(&mem) {
@@ -135,27 +135,27 @@ fn run(&mem: Mem!['k]) {
     }
     check(mem.printed == 4u32, "printed");
 
-    // Spans: searching, comparing, slicing, joining.
-    let hat = Span::from_static(&mem, "hat");
+    // Text: searching, comparing, slicing, joining.
+    let hat = Str::from_static(&mem, "hat");
     check(all.find(&mem, hat, 0usize).unwrap_or(0usize) == 16usize, "find");
     check(all.find(&mem, hat, 17usize).is_none(), "find past");
     check(all.contains(&mem, hat) && all.ends_with(&mem, hat) && all.starts_with(&mem, ws.at(&mem, 0usize)), "contains");
     check(all.find_byte(&mem, b'a', 6usize).unwrap_or(0usize) == 8usize && all.rfind_byte(&mem, b't').unwrap_or(0usize) == 18usize, "find_byte");
     check(all.slice(4usize, 7usize).is(&mem, "cat") && all.slice(17usize, 99usize).is(&mem, "at"), "slice");
     check(all.byte_or_zero(&mem, 1usize) == b'h' && all.byte_or_zero(&mem, 99usize) == 0u8 && all.get(&mem, 99usize).is_none(), "byte_or_zero");
-    let catch = concat(&mem, ws.at(&mem, 1usize), Span::from_static(&mem, "ch"));
+    let catch = concat(&mem, ws.at(&mem, 1usize), Str::from_static(&mem, "ch"));
     check(catch.is(&mem, "catch") && catch.cmp(&mem, all).is_lt() && hat.eq(&mem, ws.at(&mem, 4usize)), "concat, cmp, eq");
     check(ws.join(&mem, "_").is(&mem, "the_cat_and_the_hat") && ws.slice(&mem, 1usize, 3usize).join(&mem, "").is(&mem, "catand"), "join");
-    let padded = Span::from_static(&mem, " \t cat \n");
+    let padded = Str::from_static(&mem, " \t cat \n");
     check(padded.trim(&mem).is(&mem, "cat") && padded.trim_start(&mem).is(&mem, "cat \n") && padded.trim_end(&mem).is(&mem, " \t cat"), "trim");
-    check(key_hash(&mem, catch, seed(&mem)) == key_hash(&mem, Span::from_static(&mem, "catch"), seed(&mem)), "hash");
-    // Equal tuple keys hash alike, whatever span they view.
+    check(key_hash(&mem, catch, seed(&mem)) == key_hash(&mem, Str::from_static(&mem, "catch"), seed(&mem)), "hash");
+    // Equal tuple keys hash alike, whatever text they view.
     check(hash(&mem, (ws.at(&mem, 0usize), 7u32)) == hash(&mem, (ws.at(&mem, 3usize), 7u32)), "hash_in");
 
     // Text moves between arenas: copied out of this one under its capability.
     var exists 'o. other = Domain!::new(hash_seed());
-    let moved = copy_span(catch, &mem, &other);
-    check(moved.is(&other, "catch"), "copy_span");
+    let moved = copy_str(catch, &mem, &other);
+    check(moved.is(&other, "catch"), "copy_str");
     other.destroy();
 
     // The rest of the vec.

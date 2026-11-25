@@ -96,7 +96,7 @@ The search index lists each item once, at the path the documented package
 |---|---|
 | package root module | `/std/` |
 | module | `/std/io/`, `/std/cmp/` |
-| type, trait | `/std/io/struct.File~.html`, `/std/option/enum.Option.html`, `/std/slice/type.Str.html`, `/std/cmp/trait.Ord.html` |
+| type, trait | `/std/io/struct.File~.html`, `/std/option/enum.Option.html`, `/std/str/struct.Str.html`, `/std/cmp/trait.Ord.html` |
 | primitive or builtin type | `/core/num/primitive.u8.html`, `/core/ptr/builtin.NonNull.html` |
 | source file | `/src/core/cmp.kur.html#L44` |
 

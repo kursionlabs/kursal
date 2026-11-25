@@ -44,11 +44,11 @@ in the mapping body is counted. Structural region split/merge over `*T` is
 therefore not a raw-pointer API merely because its shape is selected
 through indirection.
 
-So `Writer[Buffer!]::write_static(self: Buffer!, bytes: Slice[u8, 'static])` is
+So `Writer[Buffer!]::write_static(self: Buffer!, bytes: Str['static])` is
 class C even though its body reads through the slice's pointer, while
 `std::io::write_all(fd: i32, ptr: *u8, len: usize)` is class B: the same
 pointer, spelled bare. Unfolding would put nearly every function that takes
-or returns a `Slice`, `Span`, `Ref`, `Buffer!`, `Vec!`, `Arena!`, `HashMap!`
+or returns a `Slice`, `Str`, `Ref`, `Buffer!`, `Vec!`, `Arena!`, `HashMap!`
 or `ArenaVec` into class B and make the class useless as a signal. The
 walk under-reports in one predictable direction: **a pointer that reaches a
 caller inside a checked structure is the structure's obligation, not the
@@ -64,7 +64,7 @@ written ruling (section 2.0b).
 
 ## 1. Class A: brand-to-authority constructors (empty)
 
-A brand value is `Copy` and can be read from any `Ref`, `Slice` or `Span`
+A brand value is `Copy` and can be read from any `Ref` or `Slice`
 that carries one. A function turning a brand value into a
 capability for that brand would therefore make the authority copyable too.
 
@@ -81,7 +81,7 @@ caught but **unspellable**: no function accepts the brand that such a forgery
 would need to pass.
 
 The functions that take a `Brand` value and return a branded object
-(`Ref::from_raw`, `Slice::from_raw_parts`, `Span::from_raw_parts_branded`)
+(`Ref::from_raw`, `Slice::from_raw_parts`, `Str::from_raw_parts_branded`)
 return data, not a capability, and are all `unsafe fn` (section 2).
 
 ### 1.1 Reading a brand out of a capability
@@ -128,7 +128,7 @@ yes. A blanket "class B means `unsafe fn`" rule would get them wrong.
 | `core::ptr::null`, `core::ptr::is_null` | `null` returns the null `*T`, for comparing pointers against (the allocator's results, a hash chain's end, an `ArenaVec`'s missing segment); `is_null` compares with it. Dereferencing the pointer is a separate unsafe operation, checked at that site. |
 | `core::slice::Slice::into_parts` | Returns the `(ptr, len, marker)` a `Slice` was built from. Rebuilding a `Slice` needs the `unsafe fn from_raw_parts`, so it grants no new authority. |
 | `core::mem::Ref::into_parts` | Returns the `(ptr, marker)` a `Ref` was built from; rebuilding one needs the `unsafe fn Ref::from_raw`, so a stale pointer cannot be re-wrapped under a live brand in safe code. |
-| `core::raw::Span::into_parts` | Returns the `(ptr, len)` a `Span` was built from, never its brand: a span must not hand out a witness for its domain. Reading through the pointer needs `unsafe`, and rebuilding a span needs the `unsafe fn Span::from_raw_parts`. |
+| `core::str::Str::into_parts` | Returns the `(ptr, len)` a `Str` was built from, never its brand: text must not hand out a witness for its domain. Reading through the pointer needs `unsafe`, and rebuilding text needs the `unsafe fn Str::from_raw_parts`. |
 | `core::cstr::CStr::as_ptr` | Returns the unchanged pointer of a `CStr`, which only unsafe adoption or `std::process::Args::get` can construct. A raw pointer alone grants no safe dereference or ownership. |
 | `core::array::Array!::into_parts` | Consumes the restricted, linear `Array!` and returns its storage. The only way back is the `unsafe fn from_parts` (section 2.4). |
 | `core::ptr::NonNull::new` | Checks its argument: a null pointer gives `None`, any other the unsafe cast `p as NonNull[T]`, whose one obligation (not null) the check has just discharged. |
@@ -292,7 +292,7 @@ double free.
 | `alloc::collections::arena_vec::merge_runs` | `src` and `dst` each address `n` elements and do not overlap; one bottom-up merge pass of `ArenaVec::sort_by` and `Vec!::sort_by` |
 
 Every write through a raw pointer also has this obligation: it never addresses the static
-image, the bytes of a string constant (a `Slice[u8, 'static]` the compiler made). The C
+image, the bytes of a string constant (a `Str['static]` the compiler made). The C
 backend emits them `static const`, so a write there is undefined and may fault. A load
 through a pointer into it leaves it as it is: every data item's type is `Copy`, which both
 checkers require of a KURS `data` declaration (`data_type_not_copy`).
@@ -305,7 +305,7 @@ checkers require of a KURS `data` declaration (`data_type_not_copy`).
 | `core::raw::raw_get` | `base[0..len)` is a readable array; an out-of-range `i` returns `None` |
 | `core::raw::raw_byte_at` | the same; out of range returns `0u8`, deliberately, for scanners that treat NUL as matching nothing |
 
-| `core::raw::span_byte_at`, `core::slice::slice_byte_at` | the caller has just been handed a read capability for the view's brand; these read with no capability of their own and are the shared bodies of the `ReadBytes` instances |
+| `core::str::str_byte_at`, `core::slice::slice_byte_at` | the caller has just been handed a read capability for the view's brand; these read with no capability of their own and are the shared bodies of the `ReadBytes` instances |
 | `core::cstr::cstr_len` | the pointer addresses a NUL-terminated byte run; there is no length to bound the scan |
 | `core::cstr::CStr::from_raw` | `ptr` names a NUL-terminated byte run that stays readable and unchanged for the rest of the process, as `argv` entries do: a `CStr` is `Copy` and carries no brand, so nothing ends its use earlier |
 | `std::fs::is_dot` | `name` addresses a live NUL-terminated string (a directory entry's name, read before the next read or close of its directory) |
@@ -346,8 +346,8 @@ a checked type; their obligation is the same kind of thing.
 
 | `core::slice::Slice::from_raw_parts` | `ptr[0..len)` is live, initialized and accessible under `marker`'s brand, and `ptr` is not null, even when `len` is 0 or `T` is zero-size: `get_ref` makes a `Ref` of it, which is never null |
 | `core::mem::Ref::from_raw` | `ptr` points at a live `T` inside the domain `marker` names, so presenting that domain's capability really authorizes the access |
-| `core::raw::Span::from_raw_parts` | `ptr[0..len)` is initialized and stays readable while the domain of the context `&cx` lends has its capability. Literal-backed spans use the safe `Span::from_static` |
-| `core::raw::Span::from_raw_parts_branded` | as `from_raw_parts`, for a module whose own object holds the domain's brand (an arena's `marker`); `marker` must be a witness that object really holds, since a span planted in another domain reads that domain's bytes |
+| `core::str::Str::from_raw_parts` | `ptr[0..len)` is initialized and stays readable while the domain of the context `&cx` lends has its capability. Literal-backed text uses the safe `Str::from_static` |
+| `core::str::Str::from_raw_parts_branded` | as `from_raw_parts`, for a module whose own object holds the domain's brand (an arena's `marker`); `marker` must be a witness that object really holds, since text planted in another domain reads that domain's bytes. With the `'static` brand (string literals, `CStr::bytes`), the bytes stay readable and unchanged for the rest of the process |
 | `alloc::buffer::Buffer!::as_ptr` | the pointer is invalidated by any later growth of the same buffer (which may reallocate) and by `destroy` |
 | `alloc::buffer::Buffer!::tail_ptr` | the same; the bytes it addresses are uninitialized until written externally and committed |
 
@@ -553,7 +553,7 @@ is an ordinary, recoverable condition:
   `core::raw::raw_byte_at`.
 
 **`trap` where a miss is a bug.** The accessors whose result has no room
-for "none" (`Option::unwrap`, `Result::unwrap`, `Slice::at`, `Span::at`,
+for "none" (`Option::unwrap`, `Result::unwrap`, `Slice::at`, `Str::at`,
 `Array!::at`, `ArenaVec::at`, `ArenaMap::at`, `OwnedVec!::at`,
 `OwnedMap!::at`) stop the program with the builtin `core::process::trap`.
 Each has a `get` beside it that returns an `Option`.
@@ -592,7 +592,7 @@ pointer must address a NUL-terminated string readable for the rest of the
 process, an `Uninit!` must own the block it names. This is the obligation
 the module's own unsafe constructors state (`File!::adopt`,
 `CStr::from_raw`, `HeapAllocator::adopt_raw_sized`). A type that holds a
-brand witness (a capability, a `Span`, a `Slice`, a `Ref`) is never made
+brand witness (a capability, a `Str`, a `Slice`, a `Ref`) is never made
 this way: the checker rejects a cast whose result holds one (section 2.3). The
 restriction protects what safe code can reach; an unsafe cast that breaks
 the type's invariant has undefined behavior.
@@ -616,8 +616,8 @@ Types whose hidden representation protects authority or bounds:
 | `SharedJoin!['r,'q,'a,'b]` | `core::cap` | the only route from two specific child nodes back to their parent |
 | `SharedResume!['r,'q]` | `core::cap` | the inverse of `share`; demands the exact root node back |
 | `Slice[T,'k]` | `core::slice` | pairs a pointer with an independent `len`; a forged `len` reads and writes past the allocation through the bounds-checked accessors |
-| `StaticRead` | `core::slice` | the read capability for `'static` byte slices; harmless to duplicate, since it grants no write, resume or deallocation |
-| `Span['k]` | `core::raw` | bytes in domain `'k`, readable in safe code only through a capability that may read the domain (`ReadBytes`: its `Exclusive!`, a node of its shared-read tree, a context lending one); built only by `from_static` or the unsafe constructors |
+| `StaticRead` | `core::str` | the read capability for `'static` text; harmless to duplicate, since it grants no write, resume or deallocation |
+| `Str['k]` | `core::str` | text: bytes in domain `'k`, readable in safe code only through a capability that may read the domain (`ReadBytes`: its `Exclusive!`, a node of its shared-read tree, a context lending one), and never written through: it hands out no `Ref`, so a literal's read-only bytes may stand in any domain; built only by `from_static`, `Slice::as_str` or the unsafe constructors |
 | `CStr` | `core::cstr` | a live NUL-terminated string, built only by unsafe adoption or `Args::get`; so `len` and `bytes`, which read it as a `'static` view, are safe |
 | `Array![T]` | `core::array` | storage with exactly `len` initialized elements |
 | `Vec![T,'k]` | `alloc::collections::vec` | a pointer with a `len`/`cap` the module maintains; a forged one is indexed and freed through |
@@ -671,7 +671,7 @@ that restricting a type costs nothing: it only sees the code it is run on.
   `Take`, `Skip`, `TakeWhile` and `Chain`.** Plain adapter state over an
   inner iterator.
 - **`toml::value::TomlValue`/`TomlDatetime`/`DatetimeKind`/`TomlError`.**
-  The parser's results, to be matched on; their spans, vecs and maps are
+  The parser's results, to be matched on; their text, vecs and maps are
   read through the arena's capability like any other.
 - **`core::option::Option`/`Result`, `core::cmp::Order`,
   `core::atomic::Ordering`, `alloc::heap::AllocError`,

@@ -32,7 +32,7 @@ use std::fmt::Writer;
 use std::collections::arena_map::ArenaMap;
 use std::io::{print, stdin};
 use std::option::{Option, Result};
-use std::raw::Span;
+use std::str::Str;
 use toml::parse;
 use toml::value::{DatetimeKind, TomlValue, line_column};
 
@@ -41,7 +41,7 @@ fn hex(d: u8) -> u8 {
 }
 
 forall 'k.
-fn string(&cx: Domain!['k], out: Buffer!, s: Span['k]) -> Buffer! {
+fn string(&cx: Domain!['k], out: Buffer!, s: Str['k]) -> Buffer! {
     var out = out.write_byte(b'"');
     var i = 0usize;
     while i < s.len() {
@@ -91,7 +91,7 @@ fn value(&cx: Domain!['k], out: Buffer!, v: TomlValue['k]) -> Buffer! {
 }
 
 forall 'k.
-fn table(&cx: Domain!['k], out: Buffer!, t: ArenaMap[Span['k], TomlValue['k], 'k]) -> Buffer! {
+fn table(&cx: Domain!['k], out: Buffer!, t: ArenaMap[Str['k], TomlValue['k], 'k]) -> Buffer! {
     var o = out.put("{");
     var first = true;
     var i = 0usize;

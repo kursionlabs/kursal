@@ -57,17 +57,17 @@ class ConstantRuntimeTests(unittest.TestCase):
             with self.subTest(expression=expression), self.assertRaises(SigError):
                 self.run_source('const X: bool = ' + expression + '; fn main() -> i32 { 0i32 }', 0)
 
-    def test_string_constants_are_static_byte_slices(self):
-        self.assertEqual(run_with_std('''use std::slice::Slice;
-            const GREETING: Slice[u8, 'static] = "hello";
+    def test_string_constants_are_static_text(self):
+        self.assertEqual(run_with_std('''use std::str::Str;
+            const GREETING: Str['static] = "hello";
             fn main() -> i32 {
-                const LOCAL: Slice[u8, 'static] = "hi";
+                const LOCAL: Str['static] = "hi";
                 (GREETING.len() + LOCAL.len()) as i32
             }'''), 7)
 
     def test_string_constant_of_another_type_is_rejected(self):
-        for source, got in (('const T: u32 = "text"; fn main() -> i32 { 0i32 }', "Slice[u8, 'static]"),
-                            ('fn main() -> i32 { const T: u32 = "text"; 0i32 }', "Slice[u8, 'static]"),
+        for source, got in (('const T: u32 = "text"; fn main() -> i32 { 0i32 }', "Str['static]"),
+                            ('fn main() -> i32 { const T: u32 = "text"; 0i32 }', "Str['static]"),
                             ('fn main() -> i32 { const T: u32 = 5u8; 0i32 }', "u8")):
             with self.subTest(source=source), self.assertRaises(SigError) as caught:
                 run_with_std(source)

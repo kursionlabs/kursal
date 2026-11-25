@@ -193,8 +193,8 @@ REJECTED = {
     "empty_array.kur": "7:17: an array has at least one element$",
     "exposed_type_alias.kur": "6:1: a type alias is never exposed: it has no representation of its own$",
     "extern_abi.kur": '7:8: the only extern ABI is "C"$',
-    "fstring_context_used_inside.kur": "14:35: cx is lent to this f-string; it cannot be used inside it$",
-    "impl_through_alias_elsewhere.kur": "11:6: an inherent impl of Slice belongs in the package that declares it$",
+    "fstring_context_used_inside.kur": "14:34: cx is lent to this f-string; it cannot be used inside it$",
+    "impl_through_alias_elsewhere.kur": "14:6: an inherent impl of Slice belongs in the package that declares it$",
     "foreach_holds_itself.kur": "10:8: type foreach_holds_itself::Wrap!: infinite by-value layout$",
     "foreach_of_foreach.kur": "15:13: a foreach source cannot be a foreach type$",
     "foreach_pointer_over_leaf.kur": "12:17: foreach \\*F needs a source written with pointer components$",
@@ -225,7 +225,7 @@ REJECTED = {
     "try_on_own_enum.kur": "15:13: \\? needs the operand and the function result to be the same Option or Result of core::option$",
     "too_large_type.kur": "is too large: its size is not below 2\\^64 bytes in type too_large_type::Huge$",
     "type_alias_arity.kur": "7:11: Pair takes 1 type argument, got 2$",
-    "type_alias_as_namespace.kur": "9:12: Str is a type alias; it stands only where a type is written$",
+    "type_alias_as_namespace.kur": "12:12: Bytes is a type alias; it stands only where a type is written$",
     "type_alias_cycle.kur": "7:1: type alias List refers to itself through Next$",
     "type_alias_linear_unmarked.kur": "10:6: type alias Handles stands for a linear type; name it Handles!$",
     "type_alias_marked_not_linear.kur": "7:6: type alias Count! stands for a type that is not linear; name it Count$",
@@ -238,6 +238,7 @@ REJECTED = {
     "unmarked_in_unsafe_fn.kur": "11:13: reading through a raw pointer needs unsafe$",
     "while_consume_without_replacement.kur": "25:5: .*linear value 'h' remains live where the loop at 25:5 starts, but not when it repeats$",
     "write_by_number.kur": "13:19: calling an unsafe function needs unsafe$",
+    "write_through_literal.kur": "9:11: Str\\['static\\] has no method get_ref$",
 }
 
 

@@ -1,0 +1,370 @@
+//! Text: read-only views of bytes.
+// core::str -- `Str['k]`, a run of bytes in domain 'k that is read and
+// never written through.
+//
+// A string literal is a `Str['static]`. Text in a domain is a `Str['k]`:
+// a literal planted there (`Str::from_static`), bytes copied into an arena
+// (`alloc::arena`'s `save`, `copy_str`), or a writable byte view seen as
+// text (`Slice::as_str`). Every read goes through a capability that may read
+// the domain (`core::slice::ReadBytes`), and nothing hands out a `Ref` or
+// any other way to write, which is what lets a literal's read-only bytes
+// stand in any domain: a `Slice[u8, 'k]` would let the holder of the
+// domain's `Exclusive!` write them.
+
+use package as core;
+
+use core::option::Option;
+use core::slice::{Slice, ReadBytes, byte_or_zero, bytes_cmp_within, bytes_eq, bytes_eq_within, find_byte, find_bytes, hash_bytes, rfind_byte};
+use core::cap::{Access, Brand, Exclusive!, Shared!};
+use core::ptr::offset;
+use core::raw::raw_byte_at;
+use core::ascii::{space_prefix, space_suffix};
+use core::cmp::Order;
+use core::hash::{HashIn, HashState};
+use core::process::trap;
+
+/// Text: `len` bytes at `ptr`, in domain `'k`, read and never written through.
+///
+/// Branded and restricted: a `Str` names bytes in domain 'k, and only this
+/// module can build one or see its pointer. Reading the bytes needs a
+/// capability that may read the domain (`core::slice::ReadBytes`): the
+/// `Exclusive!['k]` itself, a node of its shared-read tree, or a context that
+/// lends one (an arena's `alloc::arena::Domain!`, a program's own context),
+/// so a `Str` cannot be read once its domain's `Exclusive!['k]` is gone; a
+/// `Str['static]` is read through `StaticRead`. `marker: Brand['k]` costs
+/// nothing at runtime (`Brand` is Copy and zero-size) and does not make
+/// `Str` linear.
+///
+/// A literal is a `Str['static]`, and enters a domain through
+/// `Str::from_static`; text over memory the caller just filled uses
+/// `unsafe Str::from_raw_parts`. Both take the domain's capability, so text
+/// is planted only in a domain its maker holds. `from_raw_parts_branded`
+/// takes a brand instead, for a module whose own object holds it (an
+/// arena), and is `unsafe` for that reason: a brand is `Copy` and proves
+/// nothing. A writable `Slice[u8, 'k]` is seen as text by `as_str`.
+///
+/// The methods that read take the capability by place, `&cx`. Generic code
+/// over any readable byte view goes through `ReadBytes` too (`core::slice`'s
+/// `byte_or_zero`, `find_bytes`, `bytes_eq_within`, ...).
+forall 'k.
+struct Str {
+    ptr: *u8,
+    len: usize,
+    marker: Brand['k],
+}
+
+forall 'k.
+impl Str['k] {
+    /// The `len` bytes at `ptr` as text of domain `'k`.
+    ///
+    /// Caller: `ptr[0 .. len)` is initialized and stays readable for as long
+    /// as the domain 'k's capability exists. Only that capability's holder
+    /// may change the bytes, and only through a writable view of them.
+    forall C, R where Access[C -> 'k, R].
+    unsafe fn from_raw_parts(&cx: C, ptr: *u8, len: usize) -> Str['k] {
+        var (tag, rest) = Access[C -> 'k, R]::open(cx);
+        let stamp = &tag.stamp();
+        let { marker } = stamp;
+        cx = Access[C -> 'k, R]::close(tag, rest);
+        Str.{ ptr, len, marker }
+    }
+
+    /// The `len` bytes at `ptr` as text, branded with `marker`.
+    ///
+    /// The same, for a module whose own object already carries the domain's
+    /// brand (an arena's `marker`, set once from `Exclusive!::fresh`), and for
+    /// string literals, which the compiler builds with the `'static` brand.
+    /// Caller: as for `from_raw_parts`, and `marker` is a witness that object
+    /// really holds: text planted in someone else's domain reads their bytes.
+    /// With the `'static` brand the bytes stay unchanged for the rest of the
+    /// process, as `StaticRead` assumes.
+    unsafe fn from_raw_parts_branded(ptr: *u8, len: usize, marker: Brand['k]) -> Str['k] {
+        Str.{ ptr, len, marker }
+    }
+
+    /// No bytes at all; nothing to read.
+    forall C, R where Access[C -> 'k, R].
+    fn empty(&cx: C) -> Str['k] {
+        Str::from_static(&cx, "")
+    }
+
+    /// A literal as text of domain 'k. Static bytes outlive every domain, and
+    /// nothing writes through a `Str`, so reading them under 'k's capability
+    /// is always valid.
+    forall C, R where Access[C -> 'k, R].
+    fn from_static(&cx: C, text: Str['static]) -> Str['k] {
+        let (ptr, len) = text.into_parts();
+        var (tag, rest) = Access[C -> 'k, R]::open(cx);
+        let stamp = &tag.stamp();
+        let { marker } = stamp;
+        cx = Access[C -> 'k, R]::close(tag, rest);
+        Str.{ ptr, len, marker }
+    }
+
+    /// The pointer and length back; rebuilding text from them needs
+    /// `from_raw_parts` again. The brand stays inside: text may be made from
+    /// the capability alone, so it must not hand out a witness.
+    fn into_parts(self) -> (*u8, usize) {
+        let { ptr, len, marker } = self;
+        (ptr, len)
+    }
+
+    /// The number of bytes.
+    fn len(self) -> usize {
+        let { ptr, len, marker } = self;
+        len
+    }
+
+    /// Whether there are no bytes.
+    fn is_empty(self) -> bool {
+        self.len() == 0usize
+    }
+
+    /// Where the text starts, as a number. Like `Ref::address`, it hands out
+    /// nothing to read through; it lets text be matched against a known
+    /// buffer (a diagnostic finding the line a name came from).
+    fn address(self) -> usize {
+        let { ptr, len, marker } = self;
+        unsafe (ptr as usize)
+    }
+
+    /// The first `count` bytes, or all of them if there are fewer.
+    fn take(self, count: usize) -> Str['k] {
+        let { len, ..rest } = self;
+        if count < len {
+            Str.{ len: count, ..rest }
+        } else {
+            Str.{ len, ..rest }
+        }
+    }
+
+    /// Everything after the first `count` bytes, or empty text at the end.
+    fn skip(self, count: usize) -> Str['k] {
+        let { ptr, len, ..rest } = self;
+        let n = if count < len { count } else { len };
+        Str.{ ptr: unsafe offset(ptr, n), len: len - n, ..rest }
+    }
+
+    /// Bytes `start` to `end`, each clamped to the text (empty text when
+    /// `start` is past `end`).
+    fn slice(self, start: usize, end: usize) -> Str['k] {
+        let end = if end > self.len() { self.len() } else { end };
+        let start = if start > end { end } else { start };
+        self.skip(start).take(end - start)
+    }
+
+    /// `count` bytes starting `start` in, or `None` past the end. Checked by
+    /// subtraction so a huge `count` cannot wrap into range.
+    fn sub(self, start: usize, count: usize) -> Option[Str['k]] {
+        let { ptr, len, ..rest } = self;
+        if start > len {
+            Option::None
+        } else {
+            let remaining = len - start;
+            if count > remaining {
+                Option::None
+            } else {
+                Option::Some.(Str.{ ptr: unsafe offset(ptr, start), len: count, ..rest })
+            }
+        }
+    }
+
+    // The methods below read the bytes, through any capability that may read
+    // them (`ReadBytes`): the domain's `Exclusive!`, a node of its shared-read
+    // tree, or a context that lends one (`alloc::arena::Domain!`). They read
+    // through the trait, never the pointer, so an instance can only hand back
+    // wrong bytes, not read memory it has no capability for.
+
+    /// Byte `i`, or `None` past the end.
+    forall C where ReadBytes[C, Str['k]].
+    fn get(self, &cx: C, i: usize) -> Option[u8] {
+        ReadBytes[C, Str['k]]::get(&cx, self, i)
+    }
+
+    /// Byte `i`; stops the program (`core::process::trap`) past the end.
+    /// `get` is the form for an index that may miss.
+    forall C where ReadBytes[C, Str['k]].
+    fn at(self, &cx: C, i: usize) -> u8 {
+        match self.get(&cx, i) {
+            Some(b) => b,
+            None => trap(),
+        }
+    }
+
+    /// Byte `i`, or `0u8` past the end: a sentinel for scanners whose
+    /// character-class tests already treat `0u8` as matching nothing
+    /// (`core::slice::byte_or_zero`).
+    forall C where ReadBytes[C, Str['k]].
+    fn byte_or_zero(self, &cx: C, i: usize) -> u8 {
+        byte_or_zero(&cx, self, i)
+    }
+
+    /// Without the ASCII whitespace at its start (`core::ascii::is_space`).
+    forall C where ReadBytes[C, Str['k]].
+    fn trim_start(self, &cx: C) -> Str['k] {
+        self.skip(space_prefix(&cx, self))
+    }
+
+    /// Without the ASCII whitespace at its end.
+    forall C where ReadBytes[C, Str['k]].
+    fn trim_end(self, &cx: C) -> Str['k] {
+        self.take(self.len() - space_suffix(&cx, self))
+    }
+
+    /// Without the ASCII whitespace at either end.
+    forall C where ReadBytes[C, Str['k]].
+    fn trim(self, &cx: C) -> Str['k] {
+        self.trim_start(&cx).trim_end(&cx)
+    }
+
+    /// Byte equality with other text of the domain.
+    forall C where ReadBytes[C, Str['k]].
+    fn eq(self, &cx: C, other: Str['k]) -> bool {
+        // Text cut from one buffer often shares its bytes; skip the byte walk.
+        (self.address() == other.address() && self.len() == other.len()) || bytes_eq_within(&cx, self, other)
+    }
+
+    /// Byte equality with a literal.
+    forall C where ReadBytes[C, Str['k]].
+    fn is(self, &cx: C, literal: Str['static]) -> bool {
+        var sr = StaticRead::new();
+        bytes_eq(&cx, self, &sr, literal)
+    }
+
+    /// Byte order, as unsigned values, a shorter prefix first
+    /// (`core::slice::bytes_cmp`).
+    forall C where ReadBytes[C, Str['k]].
+    fn cmp(self, &cx: C, other: Str['k]) -> Order {
+        bytes_cmp_within(&cx, self, other)
+    }
+
+    /// Whether the bytes start with `prefix`'s.
+    forall C where ReadBytes[C, Str['k]].
+    fn starts_with(self, &cx: C, prefix: Str['k]) -> bool {
+        prefix.len() <= self.len() && self.take(prefix.len()).eq(&cx, prefix)
+    }
+
+    /// Whether the bytes end with `suffix`'s.
+    forall C where ReadBytes[C, Str['k]].
+    fn ends_with(self, &cx: C, suffix: Str['k]) -> bool {
+        suffix.len() <= self.len() && self.skip(self.len() - suffix.len()).eq(&cx, suffix)
+    }
+
+    /// The first index at or after `start` where `needle`'s bytes appear
+    /// (`core::slice::find_bytes`).
+    forall C where ReadBytes[C, Str['k]].
+    fn find(self, &cx: C, needle: Str['k], start: usize) -> Option[usize] {
+        find_bytes(&cx, self, needle, start)
+    }
+
+    /// Whether `needle`'s bytes appear in the text.
+    forall C where ReadBytes[C, Str['k]].
+    fn contains(self, &cx: C, needle: Str['k]) -> bool {
+        self.find(&cx, needle, 0usize).is_some()
+    }
+
+    /// The first index at or after `start` holding `byte`
+    /// (`core::slice::find_byte`).
+    forall C where ReadBytes[C, Str['k]].
+    fn find_byte(self, &cx: C, byte: u8, start: usize) -> Option[usize] {
+        find_byte(&cx, self, byte, start)
+    }
+
+    /// The last index holding `byte` (`core::slice::rfind_byte`).
+    forall C where ReadBytes[C, Str['k]].
+    fn rfind_byte(self, &cx: C, byte: u8) -> Option[usize] {
+        rfind_byte(&cx, self, byte)
+    }
+}
+
+forall 'k.
+impl Slice[u8, 'k] {
+    /// The bytes the slice views, as text of the same domain. Safe: the
+    /// slice's construction already vouched that its bytes are live and
+    /// readable under its brand, which is all text asks, and text only
+    /// reads them.
+    fn as_str(self) -> Str['k] {
+        let (ptr, len, marker) = self.into_parts();
+        Str.{ ptr, len, marker }
+    }
+}
+
+// ------------------------------------------------------------- reading --
+
+/// Permanent read access to the immutable `'static` byte domain. Copy and
+/// zero-sized; it has no write, resume, or deallocation operation, so
+/// duplicating it is harmless. It authorizes reads of `Str['static]` only:
+/// `Str` is restricted and built only by its constructors, whose `'static`
+/// obligation (extent, initialization, permanence, immutability)
+/// string-literal lowering discharges for literals.
+struct StaticRead {}
+
+impl StaticRead {
+    /// The capability to read `'static` bytes.
+    fn new() -> StaticRead {
+        StaticRead.{}
+    }
+}
+
+/// Byte `index` of `s`, or `None` past its end, read with no capability.
+///
+/// The shared body of the `ReadBytes` instances. Caller: holds a capability
+/// of 'k for the call, since this reads `s` with none of its own.
+forall 'k.
+unsafe fn str_byte_at(s: Str['k], index: usize) -> Option[u8] {
+    let { ptr, len, marker } = s;
+    if index < len {
+        Option::Some.(unsafe raw_byte_at(ptr, len, index))
+    } else {
+        Option::None
+    }
+}
+
+/// Text is read through its domain's `Exclusive!`.
+forall 'r.
+instance ReadBytes[Exclusive!['r], Str['r]] {
+    fn get(&cx: Exclusive!['r], bytes: Str['r], index: usize) -> Option[u8] {
+        unsafe str_byte_at(bytes, index)
+    }
+    fn len(&cx: Exclusive!['r], bytes: Str['r]) -> usize {
+        bytes.len()
+    }
+}
+
+/// Text is read through any node of its domain's shared-read tree.
+forall 'r, 'q.
+instance ReadBytes[Shared!['r, 'q], Str['r]] {
+    fn get(&cx: Shared!['r, 'q], bytes: Str['r], index: usize) -> Option[u8] {
+        unsafe str_byte_at(bytes, index)
+    }
+    fn len(&cx: Shared!['r, 'q], bytes: Str['r]) -> usize {
+        bytes.len()
+    }
+}
+
+/// `'static` text is read through `StaticRead`.
+instance ReadBytes[StaticRead, Str['static]] {
+    fn get(&cx: StaticRead, bytes: Str['static], index: usize) -> Option[u8] {
+        unsafe str_byte_at(bytes, index)
+    }
+    fn len(&cx: StaticRead, bytes: Str['static]) -> usize {
+        bytes.len()
+    }
+}
+
+// Text as a map key read through its domain's capability (`HashMap!::get_in`
+// and friends), hashed as a byte slice is: the same bytes hash the same in
+// either.
+/// Text hashes and compares by its bytes, read through the capability `C`.
+forall C, 't where ReadBytes[C, Str['t]].
+instance HashIn[Str['t], C] {
+    fn hash_in(&cx: C, key: Str['t], state: HashState) -> HashState {
+        hash_bytes(&cx, key, state)
+    }
+
+    // Text cut from one buffer often shares its bytes; equal addresses and
+    // lengths skip the byte walk.
+    fn eq_in(&cx: C, a: Str['t], b: Str['t]) -> bool {
+        (a.address() == b.address() && a.len() == b.len()) || bytes_eq_within(&cx, a, b)
+    }
+}

@@ -29,12 +29,13 @@ from .types import Surface, Types, equal, free_names, subst
 LIBRARY = {  # name: (home library, path there, path through std)
     "Option": ("core", ("option", "Option"), ("option", "Option")),
     "Result": ("core", ("option", "Result"), ("option", "Result")),
-    "Slice": ("core", ("slice", "Slice"), ("slice", "Slice")),
+    "Str": ("core", ("str", "Str"), ("str", "Str")),
     "Buffer!": ("alloc", ("buffer", "Buffer!"), ("buffer", "Buffer!")),
     "Iterator": ("core", ("iter", "Iterator"), ("iter", "Iterator")),
     "Format": ("core", ("fmt", "Format"), ("fmt", "Format")),
     "Writer": ("core", ("fmt", "Writer"), ("fmt", "Writer")),
-    "Slice::from_raw_parts": ("core", ("slice", "Slice", "from_raw_parts"), ("slice", "Slice", "from_raw_parts")),
+    "Str::from_raw_parts_branded": ("core", ("str", "Str", "from_raw_parts_branded"),
+                                    ("str", "Str", "from_raw_parts_branded")),
     "Buffer!::new": ("alloc", ("buffer", "Buffer!", "new"), ("buffer", "Buffer!", "new")),
     "ReadingWriter!": ("core", ("fmt", "ReadingWriter!"), ("fmt", "ReadingWriter!")),
     "ReadingWriter!::new": ("core", ("fmt", "ReadingWriter!", "new"), ("fmt", "ReadingWriter!", "new")),
@@ -696,8 +697,8 @@ class Signatures:
         return value
 
     def string_type(self, module: C.ModuleId) -> C.Type:
-        """`Slice[u8, 'static]`, the type of a string literal."""
-        return C.Named(self.name(self.library(module, "Slice")), (C.Prim("u8"), C.Skolem("static")))
+        """`Str['static]`, the type of a string literal."""
+        return C.Named(self.name(self.library(module, "Str")), (C.Skolem("static"),))
 
     def fold(self, expr: S.Expr, want: Optional[C.Type] = None, module: Optional[C.ModuleId] = None, *, evaluate: bool = True) -> ConstValue:
         """Type a constant expression and optionally evaluate its value.

@@ -665,7 +665,7 @@ class Resolver:
         return own[0]
 
     def library(self, module: ModuleId, home: str, path: S.NamePath, std_path: S.NamePath) -> Target:
-        """A library item the compiler itself refers to (Slice for string
+        """A library item the compiler itself refers to (Str for string
         literals, Buffer and Format for f-strings, Ordering for atomics):
         through a direct dependency on its home library, else through std,
         else in the module's own package."""

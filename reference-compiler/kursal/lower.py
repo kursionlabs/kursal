@@ -676,16 +676,16 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         return self.emit("const", ty, ty=ty, lit=str(expr.value))
 
     def string(self, text: str) -> str:
-        """A string literal: a `Slice[u8, 'static]` over static bytes."""
+        """A string literal: a `Str['static]` over static bytes."""
         data, n = self.lowering.data(text)
         u8, static = C.Prim("u8"), C.Skolem("static")
         d = self.emit("data", C.Ptr(C.Array(u8, n + 1)), (data,))
         p = self.emit("cast", C.Ptr(u8), (d,), ty=C.Ptr(u8), unsafe=True)
         brand = self.emit("static_brand", C.Brand(static), unsafe=True)
         length = self.emit("const", C.USIZE, ty=C.USIZE, lit=str(n))
-        sig = self.lowering.library_sig("Slice::from_raw_parts", self.module)
-        slice_ty = C.Named(self.lowering.library_name("Slice", self.module), (u8, static))
-        return self.emit("call", slice_ty, (sig.name, p, length, brand), tys=(u8, static), unsafe=True)
+        sig = self.lowering.library_sig("Str::from_raw_parts_branded", self.module)
+        str_ty = C.Named(self.lowering.library_name("Str", self.module), (static,))
+        return self.emit("call", str_ty, (sig.name, p, length, brand), tys=(static,), unsafe=True)
 
     def expr_tuple(self, expr: S.Tuple | S.Array) -> Optional[str]:
         vals = self.operands(list(expr.elems))
@@ -1380,7 +1380,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         return self.fstring(expr, self.emit("call", self.substitute_type(expr.ty), (sig.name,), tys=()))
 
     def fstring(self, expr: S.FStr, writer: str) -> Optional[str]:
-        """Write each segment into the writer `w`: literals, and `{x}` of type `Slice[u8, 'static]`,
+        """Write each segment into the writer `w`: literals, and `{x}` of type `Str['static]`,
         through `Writer::write_static`, any other `{x}` through `Format::format`, which hands the value
         back (`{&x}` stores it again)."""
         module, wty = self.module, self.vty[writer]

@@ -4,9 +4,9 @@
 // Allocator-free: everything here works with any writer. `alloc::fmt`
 // re-exports it and adds what needs `Buffer!`.
 //
-// `Writer[W]` is the output protocol: write one byte, a whole `'static`
-// byte view, or raw bytes. Reading `'static` storage needs no capability
-// argument (`core::slice::StaticRead`), so a bulk write of one can live in
+// `Writer[W]` is the output protocol: write one byte, a whole
+// `Str['static]`, or raw bytes. Reading `'static` text needs no capability
+// argument (`core::str::StaticRead`), so a bulk write of one can live in
 // the trait itself and lets a writer copy literal segments in one step.
 // `write_raw` is the bulk write for everything else: a caller that already
 // holds the right to read some bytes passes them without a per-byte loop.
@@ -34,8 +34,9 @@
 // `f"...".write(&cx, out)` also lends the f-string the capability in the
 // place `cx`: it is moved out of `cx`, wrapped with `out` as
 // `ReadingWriter![W, C]::new(out, cx)`, every segment is written through
-// the wrapper, so each `{span}` reads through `cx`, and `finish` hands back
-// the writer, the result, and the capability, which goes back into `cx`:
+// the wrapper, so each `{text}` of type `Str['k]` reads through `cx`, and
+// `finish` hands back the writer, the result, and the capability, which
+// goes back into `cx`:
 //
 //     f"{name} = {value}".write(&cx, Buffer!::new())
 //
@@ -57,9 +58,9 @@
 use package as core;
 
 use core::dtoa::{Decimal, shortest};
-use core::slice::{Slice, ReadBytes, Readable};
+use core::slice::{ReadBytes, Readable};
 use core::option::Option;
-use core::raw::Span;
+use core::str::Str;
 
 /// A destination for bytes: the output protocol that f-strings and `Format`
 /// write to.
@@ -67,8 +68,8 @@ forall Self.
 trait Writer {
     /// Writes one byte.
     fn write_byte(self: Self, byte: u8) -> Self;
-    /// Writes the bytes of a `'static` byte view.
-    fn write_static(self: Self, bytes: Slice[u8, 'static]) -> Self;
+    /// Writes the bytes of `'static` text, such as a literal.
+    fn write_static(self: Self, bytes: Str['static]) -> Self;
     /// Writes `len` bytes starting at `ptr`; the writer reads them before it
     /// returns and keeps no pointer to them. Caller: `ptr[0..len)` is
     /// readable for the whole call.
@@ -361,10 +362,10 @@ trait Printable {
     fn print(value: T, out: W) -> W;
 }
 
-/// A `'static` byte view prints as its bytes.
+/// `'static` text, such as a literal, prints as its bytes.
 forall W where Writer[W].
-instance Printable[Slice[u8, 'static], W] {
-    fn print(value: Slice[u8, 'static], out: W) -> W {
+instance Printable[Str['static], W] {
+    fn print(value: Str['static], out: W) -> W {
         Writer[W]::write_static(out, value)
     }
 }
@@ -484,8 +485,8 @@ instance Format[Readable[C, S], W] {
 }
 
 /// A writer that also carries a context that reads a domain's bytes
-/// (`ReadBytes`), so an f-string can interpolate spans of that domain directly:
-/// every `{span}` is read through the writer's own context, one context
+/// (`ReadBytes`), so an f-string can interpolate text of that domain directly:
+/// every `{text}` is read through the writer's own context, one context
 /// serving any number of parts. `finish` hands both back. `f"...".write(&cx,
 /// out)` is written through one, the context moved out of `cx` and put back:
 ///
@@ -498,7 +499,7 @@ exposed struct ReadingWriter! {
 
 forall W, C.
 impl ReadingWriter![W, C] {
-    /// A writer to `out` that reads spans through `cx`.
+    /// A writer to `out` that reads text through `cx`.
     fn new(out: W, cx: C) -> ReadingWriter![W, C] {
         ReadingWriter!.{ out, cx }
     }
@@ -517,7 +518,7 @@ instance Writer[ReadingWriter![W, C]] {
         let { out, ..rest } = self;
         ReadingWriter!.{ out: Writer[W]::write_byte(out, byte), ..rest }
     }
-    fn write_static(self: ReadingWriter![W, C], bytes: Slice[u8, 'static]) -> ReadingWriter![W, C] {
+    fn write_static(self: ReadingWriter![W, C], bytes: Str['static]) -> ReadingWriter![W, C] {
         let { out, ..rest } = self;
         ReadingWriter!.{ out: Writer[W]::write_static(out, bytes), ..rest }
     }
@@ -529,22 +530,12 @@ instance Writer[ReadingWriter![W, C]] {
     }
 }
 
-/// A span formats as its bytes, read through the writer's context.
-forall W, C, 'r where Writer[W], ReadBytes[C, Span['r]].
-instance Format[Span['r], ReadingWriter![W, C]] {
-    fn format(value: Span['r], out: ReadingWriter![W, C]) -> (Span['r], ReadingWriter![W, C]) {
-        var { out: o, cx } = out;
-        let o2 = o.write(&cx, value);
-        (value, ReadingWriter!.{ out: o2, cx })
-    }
-}
-
-/// A borrowed byte view formats as its bytes, read through the writer's
-/// context: `f"{name}".write(&cx, out)` with `name: Str['k]`. A `'static`
-/// one in an f-string is written directly, as literal text is.
-forall W, C, 'r where Writer[W], ReadBytes[C, Slice[u8, 'r]].
-instance Format[Slice[u8, 'r], ReadingWriter![W, C]] {
-    fn format(value: Slice[u8, 'r], out: ReadingWriter![W, C]) -> (Slice[u8, 'r], ReadingWriter![W, C]) {
+/// Text formats as its bytes, read through the writer's context:
+/// `f"{name}".write(&cx, out)` with `name: Str['k]`. A `Str['static]` in an
+/// f-string is written directly, as literal text is.
+forall W, C, 'r where Writer[W], ReadBytes[C, Str['r]].
+instance Format[Str['r], ReadingWriter![W, C]] {
+    fn format(value: Str['r], out: ReadingWriter![W, C]) -> (Str['r], ReadingWriter![W, C]) {
         var { out: o, cx } = out;
         let o2 = o.write(&cx, value);
         (value, ReadingWriter!.{ out: o2, cx })
@@ -569,7 +560,7 @@ instance Writer[CountingWriter] {
         let { count } = self;
         CountingWriter.{ count: count + 1usize }
     }
-    fn write_static(self: CountingWriter, bytes: Slice[u8, 'static]) -> CountingWriter {
+    fn write_static(self: CountingWriter, bytes: Str['static]) -> CountingWriter {
         let { count } = self;
         CountingWriter.{ count: count + bytes.len() }
     }

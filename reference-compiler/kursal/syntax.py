@@ -128,7 +128,7 @@ class Lit(Inferred):
 class FStr(Inferred):
     parts: tuple[str | Expr, ...]           # str or expression, in order
     pos: Optional[Position] = None
-    # Inference -> lowering: the indexes of the `{x}` parts of type `Slice[u8, 'static]`, written as text is.
+    # Inference -> lowering: the indexes of the `{x}` parts of type `Str['static]`, written as text is.
     static_parts: set[int] = field(default_factory=set, init=False, repr=False, compare=False)
 
 

@@ -19,7 +19,7 @@ use std::hash::key_eq;
 use std::collections::arena_vec::ArenaVec;
 use std::collections::arena_map::{ArenaMap, ArenaSet};
 use std::mem::Ref;
-use std::raw::Span;
+use std::str::Str;
 use std::arena::{Domain!, concat, ref_in};
 use std::buffer::Buffer!;
 use std::fmt::Writer;
@@ -32,25 +32,25 @@ use std::fs::{canonicalize, path_exists, read_dir, read_to_arena};
 use std::cmp::Order;
 use std::hash::{HashIn, HashState};
 use std::option::{Option, Result};
-use std::slice::{Slice, hash_bytes};
+use std::slice::hash_bytes;
 use std::utf8::validate;
 use toml::parser::parse as parse_toml;
 use toml::value::{TomlValue, line_column};
 
 // Whether `name` is one of the space-separated `names`.
 forall 'k.
-fn among(&cx: Domain!['k], name: Span['k], names: Slice[u8, 'static]) -> bool {
-    ArenaVec::split(&cx, Span::from_static(&cx, names), Span::from_static(&cx, " ")).contains(&cx, name)
+fn among(&cx: Domain!['k], name: Str['k], names: Str['static]) -> bool {
+    ArenaVec::split(&cx, Str::from_static(&cx, names), Str::from_static(&cx, " ")).contains(&cx, name)
 }
 
 forall 'k.
-fn is_prim(&cx: Domain!['k], name: Span['k]) -> bool {
+fn is_prim(&cx: Domain!['k], name: Str['k]) -> bool {
     among(&cx, name, "i8 i16 i32 i64 isize u8 u16 u32 u64 usize f32 f64 bool")
 }
 
 // Always in scope, like the primitives: the type `Never` and the traits.
 forall 'k.
-fn is_builtin_trait(&cx: Domain!['k], name: Span['k]) -> bool {
+fn is_builtin_trait(&cx: Domain!['k], name: Str['k]) -> bool {
     among(&cx, name, "Copy Exposed Sized")
 }
 
@@ -58,35 +58,35 @@ fn is_builtin_trait(&cx: Domain!['k], name: Span['k]) -> bool {
 // from the module it belongs to (`export builtin::NonNull;` in core::ptr); everyone else imports it
 // from there.
 forall 'k.
-fn is_builtin_type(&cx: Domain!['k], name: Span['k]) -> bool {
+fn is_builtin_type(&cx: Domain!['k], name: Str['k]) -> bool {
     among(&cx, name, "Brand NonNull")
 }
 
 forall 'k.
-fn is_builtin_value(&cx: Domain!['k], name: Span['k]) -> bool {
+fn is_builtin_value(&cx: Domain!['k], name: Str['k]) -> bool {
     among(&cx, name, "fresh static_brand sizeof alloca enum_variant fence load_volatile store_volatile trap")
 }
 
 // The builtin types an impl may give methods, as it may a primitive: `impl NonNull[T]` in core::ptr.
 forall 'k.
-fn is_owned_builtin(&cx: Domain!['k], name: Span['k]) -> bool {
+fn is_owned_builtin(&cx: Domain!['k], name: Str['k]) -> bool {
     name.is(&cx, "NonNull")
 }
 
 // The standard library's directory: `$KURSAL_LIB`, else `lib` beside the directory that holds the
 // compiler's binary (an installation's `bin/kursal` and `lib/`).
 forall 'k.
-fn lib_dir(&cx: Domain!['k]) -> Span['k] {
-    let configured = match variable(&cx, Span::from_static(&cx, "KURSAL_LIB")) {
+fn lib_dir(&cx: Domain!['k]) -> Str['k] {
+    let configured = match variable(&cx, Str::from_static(&cx, "KURSAL_LIB")) {
         Some(v) => v.save(&cx),
-        None => Span::from_static(&cx, ""),
+        None => Str::from_static(&cx, ""),
     };
     if !configured.is_empty() {
         clean(&cx, configured)
     } else {
-        match real_path(&cx, Span::from_static(&cx, "/proc/self/exe")) {
-            Some(exe) => join(&cx, parent(&cx, parent(&cx, exe)), Span::from_static(&cx, "lib")),
-            None => fail(&cx, Span::from_static(&cx, "set KURSAL_LIB to the standard library's directory")),
+        match real_path(&cx, Str::from_static(&cx, "/proc/self/exe")) {
+            Some(exe) => join(&cx, parent(&cx, parent(&cx, exe)), Str::from_static(&cx, "lib")),
+            None => fail(&cx, Str::from_static(&cx, "set KURSAL_LIB to the standard library's directory")),
         }
     }
 }
@@ -95,10 +95,10 @@ fn lib_dir(&cx: Domain!['k]) -> Span['k] {
 
 // `path` as Python's `Path` spells it: no repeated, trailing or `.` separators.
 forall 'k.
-fn clean(&cx: Domain!['k], path: Span['k]) -> Span['k] {
-    let parts = ArenaVec::split(&cx, path, Span::from_static(&cx, "/"));
+fn clean(&cx: Domain!['k], path: Str['k]) -> Str['k] {
+    let parts = ArenaVec::split(&cx, path, Str::from_static(&cx, "/"));
     var out = Buffer!::new();
-    if path.starts_with(&cx, Span::from_static(&cx, "/")) {
+    if path.starts_with(&cx, Str::from_static(&cx, "/")) {
         out = out.put("/");
     }
     var first = true;
@@ -117,7 +117,7 @@ fn clean(&cx: Domain!['k], path: Span['k]) -> Span['k] {
     let n = &out.len();
     if n == 0usize {
         out.destroy();
-        Span::from_static(&cx, ".")
+        Str::from_static(&cx, ".")
     } else {
         out.save(&cx)
     }
@@ -125,10 +125,10 @@ fn clean(&cx: Domain!['k], path: Span['k]) -> Span['k] {
 
 // `a / b`: `b` when it is absolute.
 forall 'k.
-fn join(&cx: Domain!['k], a: Span['k], b: Span['k]) -> Span['k] {
-    if b.starts_with(&cx, Span::from_static(&cx, "/")) || a.is_empty() || a.is(&cx, ".") {
+fn join(&cx: Domain!['k], a: Str['k], b: Str['k]) -> Str['k] {
+    if b.starts_with(&cx, Str::from_static(&cx, "/")) || a.is_empty() || a.is(&cx, ".") {
         b
-    } else if a.ends_with(&cx, Span::from_static(&cx, "/")) {
+    } else if a.ends_with(&cx, Str::from_static(&cx, "/")) {
         concat(&cx, a, b)
     } else {
         f"{a}/{b}".write(&cx, Buffer!::new()).save(&cx)
@@ -136,16 +136,16 @@ fn join(&cx: Domain!['k], a: Span['k], b: Span['k]) -> Span['k] {
 }
 
 forall 'k.
-fn parent(&cx: Domain!['k], path: Span['k]) -> Span['k] {
+fn parent(&cx: Domain!['k], path: Str['k]) -> Str['k] {
     match path.rfind_byte(&cx, b'/') {
-        Some(at) => if at == 0usize { Span::from_static(&cx, "/") } else { path.slice(0usize, at) },
-        None => Span::from_static(&cx, "."),
+        Some(at) => if at == 0usize { Str::from_static(&cx, "/") } else { path.slice(0usize, at) },
+        None => Str::from_static(&cx, "."),
     }
 }
 
 // The last component.
 forall 'k.
-fn base_name(&cx: Domain!['k], path: Span['k]) -> Span['k] {
+fn base_name(&cx: Domain!['k], path: Str['k]) -> Str['k] {
     match path.rfind_byte(&cx, b'/') {
         Some(at) => path.skip(at + 1usize),
         None => path,
@@ -154,24 +154,24 @@ fn base_name(&cx: Domain!['k], path: Span['k]) -> Span['k] {
 
 // The last component's extension, with its dot: `Path.suffix`.
 forall 'k.
-fn suffix(&cx: Domain!['k], path: Span['k]) -> Span['k] {
+fn suffix(&cx: Domain!['k], path: Str['k]) -> Str['k] {
     let name = base_name(&cx, path);
     match name.rfind_byte(&cx, b'.') {
-        Some(at) => if at > 0usize && at + 1usize < name.len() { name.skip(at) } else { Span::from_static(&cx, "") },
-        None => Span::from_static(&cx, ""),
+        Some(at) => if at > 0usize && at + 1usize < name.len() { name.skip(at) } else { Str::from_static(&cx, "") },
+        None => Str::from_static(&cx, ""),
     }
 }
 
 // The last component without its extension: `Path.stem`.
 forall 'k.
-fn stem(&cx: Domain!['k], path: Span['k]) -> Span['k] {
+fn stem(&cx: Domain!['k], path: Str['k]) -> Str['k] {
     let name = base_name(&cx, path);
     name.slice(0usize, name.len() - suffix(&cx, name).len())
 }
 
 // The absolute path with no symbolic links that `path` names, if it exists.
 forall 'k.
-fn real_path(&cx: Domain!['k], path: Span['k]) -> Option[Span['k]] {
+fn real_path(&cx: Domain!['k], path: Str['k]) -> Option[Str['k]] {
     match canonicalize(&cx, path) {
         Ok(r) => Option::Some.(r.save(&cx)),
         Err(e) => Option::None,
@@ -182,20 +182,20 @@ fn real_path(&cx: Domain!['k], path: Span['k]) -> Option[Span['k]] {
 // The longest existing prefix has its links resolved; the rest is appended, with `..` removing the
 // component before it.
 forall 'k.
-fn resolved(&cx: Domain!['k], path: Span['k]) -> Span['k] {
-    if path.starts_with(&cx, Span::from_static(&cx, "/")) {
+fn resolved(&cx: Domain!['k], path: Str['k]) -> Str['k] {
+    if path.starts_with(&cx, Str::from_static(&cx, "/")) {
         resolve_absolute(&cx, path)
     } else {
-        let cwd = match real_path(&cx, Span::from_static(&cx, ".")) {
+        let cwd = match real_path(&cx, Str::from_static(&cx, ".")) {
             Some(c) => c,
-            None => fail(&cx, Span::from_static(&cx, "cannot find the current directory")),
+            None => fail(&cx, Str::from_static(&cx, "cannot find the current directory")),
         };
         resolve_absolute(&cx, join(&cx, cwd, path))
     }
 }
 
 forall 'k.
-fn resolve_absolute(&cx: Domain!['k], path: Span['k]) -> Span['k] {
+fn resolve_absolute(&cx: Domain!['k], path: Str['k]) -> Str['k] {
     match real_path(&cx, path) {
         Some(r) => r,
         None => {
@@ -224,7 +224,7 @@ fn resolve_absolute(&cx: Domain!['k], path: Span['k]) -> Span['k] {
 
 // `names` as a message lists them: `a`, `a and b`, `a, b and c`.
 forall 'k.
-fn listed(&cx: Domain!['k], names: ArenaVec[Span['k], 'k]) -> Span['k] {
+fn listed(&cx: Domain!['k], names: ArenaVec[Str['k], 'k]) -> Str['k] {
     var out = Buffer!::new();
     var i = 0usize;
     while i < names.len(&cx) {
@@ -244,10 +244,10 @@ forall 'k.
 exposed struct Decl {
     id: u32,
     // struct enum tuple alias fn extern trait const method
-    kind: Span['k],
+    kind: Str['k],
     home: ModuleId['k],
     // a method's name is `Target::method`
-    name: Span['k],
+    name: Str['k],
     node: Named['k],
     // a method's or associated const's impl
     impl_block: Option[S::Impl['k]],
@@ -324,36 +324,36 @@ fn item_pos(item: S::Item['k]) -> Pos {
 forall 'k.
 exposed struct Package {
     id: usize,
-    name: Ref[Span['k], 'k],
+    name: Ref[Str['k], 'k],
     // its directory
-    root: Span['k],
-    source_root: Ref[Span['k], 'k],
+    root: Str['k],
+    source_root: Ref[Str['k], 'k],
     // alias -> package id
-    deps: ArenaMap[Span['k], usize, 'k],
+    deps: ArenaMap[Str['k], usize, 'k],
     // C compiler arguments, after source files; a build uses these from every package.
-    link_flags: ArenaVec[Span['k], 'k],
+    link_flags: ArenaVec[Str['k], 'k],
     // Absolute paths to C sources declared relative to this package.
-    c_sources: ArenaVec[Span['k], 'k],
+    c_sources: ArenaVec[Str['k], 'k],
     // an executable's entry path
-    entry: Ref[Option[ArenaVec[Span['k], 'k]], 'k],
+    entry: Ref[Option[ArenaVec[Str['k], 'k]], 'k],
     // module -> source path
-    files: ArenaMap[ModuleId['k], Span['k], 'k],
+    files: ArenaMap[ModuleId['k], Str['k], 'k],
     entry_decl: Ref[Option[Decl['k]], 'k],
     // its kur.toml, or its one .kur file
-    manifest: Span['k],
+    manifest: Str['k],
 }
 
 // One module's namespace.
 forall 'k.
 exposed struct Scope {
     home: ModuleId['k],
-    decls: ArenaMap[Span['k], Decl['k], 'k],
+    decls: ArenaMap[Str['k], Decl['k], 'k],
     // alias -> path
-    imports: ArenaMap[Span['k], ArenaVec[Span['k], 'k], 'k],
+    imports: ArenaMap[Str['k], ArenaVec[Str['k], 'k], 'k],
     // alias -> where its `use` names it
-    import_pos: ArenaMap[Span['k], Pos, 'k],
-    globs: ArenaVec[ArenaVec[Span['k], 'k], 'k],
-    exports: ArenaSet[Span['k], 'k],
+    import_pos: ArenaMap[Str['k], Pos, 'k],
+    globs: ArenaVec[ArenaVec[Str['k], 'k], 'k],
+    exports: ArenaSet[Str['k], 'k],
     items: ArenaVec[S::Item['k], 'k],
 }
 
@@ -362,39 +362,39 @@ forall 'k.
 exposed enum Target {
     Decl(Decl['k]),
     Module(ModuleId['k]),
-    Variant(Decl['k], Span['k]),
-    TraitMethod(Decl['k], Span['k]),
-    Builtin(Span['k]),
+    Variant(Decl['k], Str['k]),
+    TraitMethod(Decl['k], Str['k]),
+    Builtin(Str['k]),
 }
 
 // What a resolved node names; see the top of this file.
 forall 'k.
 exposed enum NameRef {
     Decl(Decl['k]),
-    Variant(Decl['k], Span['k]),
-    TraitMethod(Decl['k], Span['k]),
-    Assoc(Span['k], Span['k]),
-    Param(Span['k]),
-    Prim(Span['k]),
-    Builtin(Span['k]),
-    Local(Span['k]),
+    Variant(Decl['k], Str['k]),
+    TraitMethod(Decl['k], Str['k]),
+    Assoc(Str['k], Str['k]),
+    Param(Str['k]),
+    Prim(Str['k]),
+    Builtin(Str['k]),
+    Local(Str['k]),
 }
 
 // A name's other spelling: without the `!` of a linear type's name, or with it.
 forall 'k.
-fn other_spelling(&cx: Domain!['k], name: Span['k]) -> Span['k] {
-    if name.ends_with(&cx, Span::from_static(&cx, "!")) {
+fn other_spelling(&cx: Domain!['k], name: Str['k]) -> Str['k] {
+    if name.ends_with(&cx, Str::from_static(&cx, "!")) {
         name.slice(0usize, name.len() - 1usize)
     } else {
-        concat(&cx, name, Span::from_static(&cx, "!"))
+        concat(&cx, name, Str::from_static(&cx, "!"))
     }
 }
 
 // The end of the message for a name that names nothing, when its other spelling `other` names
 // something.
 forall 'k.
-fn respelled(&cx: Domain!['k], out: Buffer!, other: Span['k]) -> Buffer! {
-    if other.ends_with(&cx, Span::from_static(&cx, "!")) {
+fn respelled(&cx: Domain!['k], out: Buffer!, other: Str['k]) -> Buffer! {
+    if other.ends_with(&cx, Str::from_static(&cx, "!")) {
         out.put("; the linear type is ").write(&cx, other)
     } else {
         out.put("; ").write(&cx, other).put(" is not a linear type")
@@ -404,7 +404,7 @@ fn respelled(&cx: Domain!['k], out: Buffer!, other: Span['k]) -> Buffer! {
 // A resolution error, before its file is known; a `pos` on line 0 is no position.
 forall 'k.
 exposed struct Problem {
-    message: Span['k],
+    message: Str['k],
     pos: Pos,
 }
 
@@ -414,7 +414,7 @@ exposed struct Problem {
 forall 'k.
 exposed enum Owner {
     Decl(Decl['k]),
-    Prim(Span['k]),
+    Prim(Str['k]),
     Blanket,
 }
 
@@ -453,7 +453,7 @@ instance HashIn[Owner['k], Domain!['k]] {
 // where its errors sort (`Reported.rank`).
 forall 'k.
 exposed struct Location {
-    file: Span['k],
+    file: Str['k],
     pos: Pos,
     rank: usize,
 }
@@ -463,7 +463,7 @@ exposed struct Location {
 // position, then in the order it was found.
 forall 'k.
 exposed struct Reported {
-    text: Span['k],
+    text: Str['k],
     rank: usize,
     line: u32,
     col: u32,
@@ -493,7 +493,7 @@ fn source_order(a: Reported['k], b: Reported['k]) -> Order {
 
 // An error as `KursError` prints it: `line:col: message`, or the message alone.
 forall 'k.
-fn error_text(&cx: Domain!['k], message: Span['k], pos: Pos) -> Span['k] {
+fn error_text(&cx: Domain!['k], message: Str['k], pos: Pos) -> Str['k] {
     if pos.line == 0u32 {
         message
     } else {
@@ -504,7 +504,7 @@ fn error_text(&cx: Domain!['k], message: Span['k], pos: Pos) -> Span['k] {
 // The error `message` at `pos`, printed as `full`, naming `file` and, when it has no position of
 // its own, the position `at` of the item it is in. Returns the new printed form and position.
 forall 'k.
-fn located(&cx: Domain!['k], full: Span['k], message: Span['k], pos: Pos, file: Span['k], at: Pos) -> (Span['k], Pos) {
+fn located(&cx: Domain!['k], full: Str['k], message: Str['k], pos: Pos, file: Str['k], at: Pos) -> (Str['k], Pos) {
     if full.starts_with(&cx, file) {
         (full, pos)
     } else {
@@ -522,10 +522,10 @@ fn located(&cx: Domain!['k], full: Span['k], message: Span['k], pos: Pos, file: 
 // depends on the standard library `std` when one is installed (KURSAL_LIB). `ids` numbers the
 // syntax nodes.
 forall 'k.
-fn load(&cx: Domain!['k], path: Span['k], ids: Ref[u32, 'k]) -> ArenaVec[Package['k], 'k] {
+fn load(&cx: Domain!['k], path: Str['k], ids: Ref[u32, 'k]) -> ArenaVec[Package['k], 'k] {
     let path = resolved(&cx, path);
     let packages: ArenaVec[Package['k], 'k] = ArenaVec::new(&cx);
-    let by_dir: ArenaMap[Span['k], usize, 'k] = ArenaMap::new(&cx);
+    let by_dir: ArenaMap[Str['k], usize, 'k] = ArenaMap::new(&cx);
     if suffix(&cx, path).is(&cx, ".kur") {
         let items = parse(&cx, read_source(&cx, path), path, ids);
         var main = false;
@@ -541,16 +541,16 @@ fn load(&cx: Domain!['k], path: Span['k], ids: Ref[u32, 'k]) -> ArenaVec[Package
             };
             i = i + 1usize;
         }
-        let std: ArenaMap[Span['k], Span['k], 'k] = ArenaMap::new(&cx);
+        let std: ArenaMap[Str['k], Str['k], 'k] = ArenaMap::new(&cx);
         let lib = lib_dir(&cx);
-        if exists_or_fail(&cx, join(&cx, join(&cx, lib, Span::from_static(&cx, "std")), Span::from_static(&cx, "kur.toml"))) {
-            std.insert(&cx, Span::from_static(&cx, "std"), join(&cx, lib, Span::from_static(&cx, "std")));
+        if exists_or_fail(&cx, join(&cx, join(&cx, lib, Str::from_static(&cx, "std")), Str::from_static(&cx, "kur.toml"))) {
+            std.insert(&cx, Str::from_static(&cx, "std"), join(&cx, lib, Str::from_static(&cx, "std")));
         }
-        let entry = if main { Option::Some.(ArenaVec::one(&cx, Span::from_static(&cx, "main"))) } else { Option::None };
+        let entry = if main { Option::Some.(ArenaVec::one(&cx, Str::from_static(&cx, "main"))) } else { Option::None };
         let unit = add(&cx, packages, by_dir, path, Option::Some.(stem(&cx, path)), Option::Some.(parent(&cx, path)), Option::Some.(std), entry);
         packages.at(&cx, 0usize).files.insert(&cx, ModuleId::root(&cx, 0usize), path);
     } else {
-        let manifest = if suffix(&cx, path).is(&cx, ".toml") { path } else { join(&cx, path, Span::from_static(&cx, "kur.toml")) };
+        let manifest = if suffix(&cx, path).is(&cx, ".toml") { path } else { join(&cx, path, Str::from_static(&cx, "kur.toml")) };
         let unit = add(&cx, packages, by_dir, manifest, Option::None, Option::None, Option::None, Option::None);
     }
     var p = 0usize;
@@ -576,7 +576,7 @@ fn load(&cx: Domain!['k], path: Span['k], ids: Ref[u32, 'k]) -> ArenaVec[Package
 
 // The text of the file at `path`, which must be UTF-8.
 forall 'k.
-fn read_source(&cx: Domain!['k], path: Span['k]) -> Span['k] {
+fn read_source(&cx: Domain!['k], path: Str['k]) -> Str['k] {
     let text = match read_to_arena(&cx, path) {
         Ok(s) => s,
         Err(e) => fail(&cx, Buffer!::new().put("cannot read ").write(&cx, path).save(&cx)),
@@ -590,8 +590,8 @@ fn read_source(&cx: Domain!['k], path: Span['k]) -> Span['k] {
 // The package of `manifest` (a kur.toml, or a single .kur file), added with its dependencies
 // unless its directory's manifest was added already.
 forall 'k.
-fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[Span['k], usize, 'k], manifest: Span['k], name: Option[Span['k]], source_root: Option[Span['k]],
-       deps: Option[ArenaMap[Span['k], Span['k], 'k]], entry: Option[ArenaVec[Span['k], 'k]]) -> usize {
+fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[Str['k], usize, 'k], manifest: Str['k], name: Option[Str['k]], source_root: Option[Str['k]],
+       deps: Option[ArenaMap[Str['k], Str['k], 'k]], entry: Option[ArenaVec[Str['k], 'k]]) -> usize {
     let root = parent(&cx, manifest);
     let is_toml = suffix(&cx, manifest).is(&cx, ".toml");
     if is_toml {
@@ -614,23 +614,23 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
         manifest,
     };
     packages.push(&cx, package);
-    var deps: ArenaMap[Span['k], Span['k], 'k] = match deps {
+    var deps: ArenaMap[Str['k], Str['k], 'k] = match deps {
         Some(d) => d,
         None => ArenaMap::new(&cx),
     };
     if is_toml {
         by_dir.insert(&cx, root, package.id);
         let config = manifest_table(&cx, manifest);
-        let info = table(&cx, config.get_or(&cx, Span::from_static(&cx, "package"), TomlValue::Table.(ArenaMap::new(&cx))), in_manifest(&cx, manifest, Span::from_static(&cx, "package")));
-        let deps_table = table(&cx, config.get_or(&cx, Span::from_static(&cx, "dependencies"), TomlValue::Table.(ArenaMap::new(&cx))), in_manifest(&cx, manifest, Span::from_static(&cx, "dependencies")));
+        let info = table(&cx, config.get_or(&cx, Str::from_static(&cx, "package"), TomlValue::Table.(ArenaMap::new(&cx))), in_manifest(&cx, manifest, Str::from_static(&cx, "package")));
+        let deps_table = table(&cx, config.get_or(&cx, Str::from_static(&cx, "dependencies"), TomlValue::Table.(ArenaMap::new(&cx))), in_manifest(&cx, manifest, Str::from_static(&cx, "dependencies")));
         let aliases = deps_table.keys(&cx);
-        let specs: ArenaVec[ArenaMap[Span['k], TomlValue['k], 'k], 'k] = ArenaVec::new(&cx);
+        let specs: ArenaVec[ArenaMap[Str['k], TomlValue['k], 'k], 'k] = ArenaVec::new(&cx);
         var k = 0usize;
         while k < aliases.len(&cx) {
             specs.push(&cx, table(&cx, deps_table.at(&cx, aliases.at(&cx, k)), in_manifest(&cx, manifest, aliases.at(&cx, k))));
             k = k + 1usize;
         }
-        let unknown: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
+        let unknown: ArenaSet[Str['k], 'k] = ArenaSet::new(&cx);
         let config_keys = config.keys(&cx);
         var i = 0usize;
         while i < config_keys.len(&cx) {
@@ -668,7 +668,7 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
                 .write(&cx, listed(&cx, names)).save(&cx));
         }
         package.name.set(&cx, string(&cx, info, manifest, "name", Option::None));
-        package.source_root.set(&cx, resolved(&cx, join(&cx, root, string(&cx, info, manifest, "source_root", Option::Some.(Span::from_static(&cx, "src"))))));
+        package.source_root.set(&cx, resolved(&cx, join(&cx, root, string(&cx, info, manifest, "source_root", Option::Some.(Str::from_static(&cx, "src"))))));
         let flags = strings(&cx, info, manifest, "link_flags");
         var f = 0usize;
         while f < flags.len(&cx) {
@@ -681,13 +681,13 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
             package.c_sources.push(&cx, resolved(&cx, join(&cx, root, sources.at(&cx, f))));
             f = f + 1usize;
         }
-        let kind = string(&cx, info, manifest, "kind", Option::Some.(Span::from_static(&cx, "library")));
+        let kind = string(&cx, info, manifest, "kind", Option::Some.(Str::from_static(&cx, "library")));
         if !kind.is(&cx, "library") && !kind.is(&cx, "executable") {
             fail(&cx, Buffer!::new().write(&cx, manifest).put(": manifest kind must be \"library\" or \"executable\"").save(&cx));
         }
         if kind.is(&cx, "executable") {
-            let parts = ArenaVec::split(&cx, string(&cx, info, manifest, "entry", Option::None), Span::from_static(&cx, "::"));
-            let path: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+            let parts = ArenaVec::split(&cx, string(&cx, info, manifest, "entry", Option::None), Str::from_static(&cx, "::"));
+            let path: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
             var k = 0usize;
             while k < parts.len(&cx) {
                 if !parts.at(&cx, k).is(&cx, "package") {
@@ -696,7 +696,7 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
                 k = k + 1usize;
             }
             package.entry.set(&cx, Option::Some.(path));
-        } else if info.contains(&cx, Span::from_static(&cx, "entry")) {
+        } else if info.contains(&cx, Str::from_static(&cx, "entry")) {
             fail(&cx, Buffer!::new().write(&cx, manifest).put(": manifest entry is only for kind \"executable\"").save(&cx));
         }
         deps = ArenaMap::new(&cx);
@@ -710,7 +710,7 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
     var k = 0usize;
     while k < aliases.len(&cx) {
         let target = deps.at(&cx, aliases.at(&cx, k));
-        let manifest_path = if suffix(&cx, target).is(&cx, ".toml") { target } else { join(&cx, target, Span::from_static(&cx, "kur.toml")) };
+        let manifest_path = if suffix(&cx, target).is(&cx, ".toml") { target } else { join(&cx, target, Str::from_static(&cx, "kur.toml")) };
         package.deps.insert(&cx, aliases.at(&cx, k), add(&cx, packages, by_dir, manifest_path, Option::None, Option::None, Option::None, Option::None));
         k = k + 1usize;
     }
@@ -720,7 +720,7 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
 // The table of the manifest at `path`, read by the standard library's `toml`. A manifest that is not
 // TOML is an error on the line where reading it stopped.
 forall 'k.
-fn manifest_table(&cx: Domain!['k], path: Span['k]) -> ArenaMap[Span['k], TomlValue['k], 'k] {
+fn manifest_table(&cx: Domain!['k], path: Str['k]) -> ArenaMap[Str['k], TomlValue['k], 'k] {
     let source = read_source(&cx, path);
     match parse_toml(&cx, source) {
         Ok(t) => t,
@@ -732,7 +732,7 @@ fn manifest_table(&cx: Domain!['k], path: Span['k]) -> ArenaMap[Span['k], TomlVa
 }
 
 forall 'k.
-fn table(&cx: Domain!['k], value: TomlValue['k], at_pos: Span['k]) -> ArenaMap[Span['k], TomlValue['k], 'k] {
+fn table(&cx: Domain!['k], value: TomlValue['k], at_pos: Str['k]) -> ArenaMap[Str['k], TomlValue['k], 'k] {
     match value.as_table() {
         Some(t) => t,
         None => fail(&cx, Buffer!::new().write(&cx, at_pos).put(": expected a table").save(&cx)),
@@ -741,14 +741,14 @@ fn table(&cx: Domain!['k], value: TomlValue['k], at_pos: Span['k]) -> ArenaMap[S
 
 // `MANIFEST: where`, for an error in the manifest.
 forall 'k.
-fn in_manifest(&cx: Domain!['k], manifest: Span['k], at_pos: Span['k]) -> Span['k] {
+fn in_manifest(&cx: Domain!['k], manifest: Str['k], at_pos: Str['k]) -> Str['k] {
     f"{manifest}: {at_pos}".write(&cx, Buffer!::new()).save(&cx)
 }
 
 // The string `t`, a table of `manifest`, holds at `key`, else `default`.
 forall 'k.
-fn string(&cx: Domain!['k], t: ArenaMap[Span['k], TomlValue['k], 'k], manifest: Span['k], key: Slice[u8, 'static], default: Option[Span['k]]) -> Span['k] {
-    let value = match t.get(&cx, Span::from_static(&cx, key)) {
+fn string(&cx: Domain!['k], t: ArenaMap[Str['k], TomlValue['k], 'k], manifest: Str['k], key: Str['static], default: Option[Str['k]]) -> Str['k] {
+    let value = match t.get(&cx, Str::from_static(&cx, key)) {
         Some(v) => v.as_string(),
         None => default,
     };
@@ -760,15 +760,15 @@ fn string(&cx: Domain!['k], t: ArenaMap[Span['k], TomlValue['k], 'k], manifest: 
 
 // An optional array of command arguments or source paths in a manifest.
 forall 'k.
-fn strings(&cx: Domain!['k], t: ArenaMap[Span['k], TomlValue['k], 'k], manifest: Span['k], key: Slice[u8, 'static]) -> ArenaVec[Span['k], 'k] {
-    let values = match t.get(&cx, Span::from_static(&cx, key)) {
+fn strings(&cx: Domain!['k], t: ArenaMap[Str['k], TomlValue['k], 'k], manifest: Str['k], key: Str['static]) -> ArenaVec[Str['k], 'k] {
+    let values = match t.get(&cx, Str::from_static(&cx, key)) {
         Some(value) => match value.as_array() {
             Some(items) => items,
             None => fail(&cx, f"{manifest}: manifest {key} must be an array of nonempty strings without NUL".write(&cx, Buffer!::new()).save(&cx)),
         },
         None => ArenaVec::new(&cx),
     };
-    let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+    let out: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
     var i = 0usize;
     while i < values.len(&cx) {
         let value = match values.at(&cx, i).as_string() {
@@ -787,7 +787,7 @@ fn strings(&cx: Domain!['k], t: ArenaMap[Span['k], TomlValue['k], 'k], manifest:
 // Whether `path` names anything. An error other than its absence stops resolution: the file may be
 // there.
 forall 'k.
-fn exists_or_fail(&cx: Domain!['k], path: Span['k]) -> bool {
+fn exists_or_fail(&cx: Domain!['k], path: Str['k]) -> bool {
     match path_exists(&cx, path) {
         Ok(found) => found,
         Err(e) => fail(&cx, f"cannot read {path} (error {e.errno})".write(&cx, Buffer!::new()).save(&cx)),
@@ -796,8 +796,8 @@ fn exists_or_fail(&cx: Domain!['k], path: Span['k]) -> bool {
 
 // Each .kur file under the source root, by the module its path assigns.
 forall 'k.
-fn discover(&cx: Domain!['k], package: Package['k]) -> ArenaMap[ModuleId['k], Span['k], 'k] {
-    let files: ArenaMap[ModuleId['k], Span['k], 'k] = ArenaMap::new(&cx);
+fn discover(&cx: Domain!['k], package: Package['k]) -> ArenaMap[ModuleId['k], Str['k], 'k] {
+    let files: ArenaMap[ModuleId['k], Str['k], 'k] = ArenaMap::new(&cx);
     walk(&cx, package, package.source_root.copy(&cx), ArenaVec::new(&cx), files);
     files
 }
@@ -805,14 +805,14 @@ fn discover(&cx: Domain!['k], package: Package['k]) -> ArenaMap[ModuleId['k], Sp
 // The files of directory `here`, at `rel` under the source root, then its subdirectories in order;
 // a subdirectory with its own kur.toml is another package.
 forall 'k.
-fn walk(&cx: Domain!['k], package: Package['k], here: Span['k], rel: ArenaVec[Span['k], 'k], files: ArenaMap[ModuleId['k], Span['k], 'k]) {
-    let dirs: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
-    let names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+fn walk(&cx: Domain!['k], package: Package['k], here: Str['k], rel: ArenaVec[Str['k], 'k], files: ArenaMap[ModuleId['k], Str['k], 'k]) {
+    let dirs: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
+    let names: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
     match read_dir(&cx, here) {
         Ok(directory) => {
             var directory = directory;
             // Asked only of a directory that could be listed, as the reference's `os.walk` asks.
-            if !rel.is_empty(&cx) && exists_or_fail(&cx, join(&cx, here, Span::from_static(&cx, "kur.toml"))) {
+            if !rel.is_empty(&cx) && exists_or_fail(&cx, join(&cx, here, Str::from_static(&cx, "kur.toml"))) {
                 let closed = directory.close();
                 return;
             }
@@ -847,7 +847,7 @@ fn walk(&cx: Domain!['k], package: Package['k], here: Span['k], rel: ArenaVec[Sp
     i = 0usize;
     while i < names.len(&cx) {
         let name = names.at(&cx, i);
-        if name.ends_with(&cx, Span::from_static(&cx, ".kur")) {
+        if name.ends_with(&cx, Str::from_static(&cx, ".kur")) {
             let path = rel.clone(&cx);
             let module_name = stem(&cx, name);
             if !module_name.is(&cx, "lib") {
@@ -902,23 +902,23 @@ fn visit(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], state: ArenaMap[
 
 // A lookup: `("path", module, path)`, `("import", module, [alias])` or `("export", module, [name])`.
 forall 'k.
-fn lookup_key(&cx: Domain!['k], kind: Slice[u8, 'static], home: ModuleId['k], names: ArenaVec[Span['k], 'k]) -> (Span['k], ModuleId['k], ArenaVec[Span['k], 'k]) {
-    (Span::from_static(&cx, kind), home, names)
+fn lookup_key(&cx: Domain!['k], kind: Str['static], home: ModuleId['k], names: ArenaVec[Str['k], 'k]) -> (Str['k], ModuleId['k], ArenaVec[Str['k], 'k]) {
+    (Str::from_static(&cx, kind), home, names)
 }
 
 forall 'k.
-fn only_core(&cx: Domain!['k]) -> Span['k] {
-    Span::from_static(&cx, "only package core names builtins; import them from core")
+fn only_core(&cx: Domain!['k]) -> Str['k] {
+    Str::from_static(&cx, "only package core names builtins; import them from core")
 }
 
 // The error for a type alias written where a value, a constructor or a namespace belongs.
 forall 'k.
-fn alias_names_a_type(&cx: Domain!['k], alias: Decl['k]) -> Span['k] {
+fn alias_names_a_type(&cx: Domain!['k], alias: Decl['k]) -> Str['k] {
     f"{alias.name} is a type alias; it stands only where a type is written".write(&cx, Buffer!::new()).save(&cx)
 }
 
 forall 'k.
-fn problem(message: Span['k]) -> Result[Target['k], Problem['k]] {
+fn problem(message: Str['k]) -> Result[Target['k], Problem['k]] {
     Result::Err.(Problem.{ message, pos: no_pos() })
 }
 
@@ -926,16 +926,16 @@ forall 'k.
 exposed struct Resolver {
     packages: ArenaVec[Package['k], 'k],
     scopes: ArenaMap[ModuleId['k], Scope['k], 'k],
-    children: ArenaMap[ModuleId['k], ArenaMap[Span['k], ModuleId['k], 'k], 'k],
+    children: ArenaMap[ModuleId['k], ArenaMap[Str['k], ModuleId['k], 'k], 'k],
     instances: ArenaVec[(ModuleId['k], S::InstanceDecl['k]), 'k],
     // (owner, member) -> declarations
-    attached: ArenaMap[(Owner['k], Span['k]), ArenaVec[Decl['k], 'k], 'k],
-    cache: ArenaMap[(Span['k], ModuleId['k], ArenaVec[Span['k], 'k]), Target['k], 'k],
-    active: ArenaSet[(Span['k], ModuleId['k], ArenaVec[Span['k], 'k]), 'k],
+    attached: ArenaMap[(Owner['k], Str['k]), ArenaVec[Decl['k], 'k], 'k],
+    cache: ArenaMap[(Str['k], ModuleId['k], ArenaVec[Str['k], 'k]), Target['k], 'k],
+    active: ArenaSet[(Str['k], ModuleId['k], ArenaVec[Str['k], 'k]), 'k],
     // the glob imports being resolved, by module and path
-    expanding: ArenaSet[(ModuleId['k], ArenaVec[Span['k], 'k]), 'k],
+    expanding: ArenaSet[(ModuleId['k], ArenaVec[Str['k], 'k]), 'k],
     // the names being looked up through a module's glob imports
-    searching: ArenaSet[(ModuleId['k], Span['k]), 'k],
+    searching: ArenaSet[(ModuleId['k], Str['k]), 'k],
     // node id -> what it names
     refs: ArenaMap[u32, NameRef['k], 'k],
     // The files and positions errors are reported in, innermost last.
@@ -943,7 +943,7 @@ exposed struct Resolver {
     decl_ids: Ref[u32, 'k],
     // the errors reported so far, and their texts
     errors: ArenaVec[Reported['k], 'k],
-    reported: ArenaSet[Span['k], 'k],
+    reported: ArenaSet[Str['k], 'k],
     // module -> its place among the modules
     order: ArenaMap[ModuleId['k], usize, 'k],
 }
@@ -1001,21 +1001,21 @@ impl Resolver['k] {
     }
 
     // `children.setdefault(module, {})`.
-    fn children_of(self, &cx: Domain!['k], home: ModuleId['k]) -> ArenaMap[Span['k], ModuleId['k], 'k] {
+    fn children_of(self, &cx: Domain!['k], home: ModuleId['k]) -> ArenaMap[Str['k], ModuleId['k], 'k] {
         match self.children.get(&cx, home) {
             Some(c) => c,
             None => {
-                let c: ArenaMap[Span['k], ModuleId['k], 'k] = ArenaMap::new(&cx);
+                let c: ArenaMap[Str['k], ModuleId['k], 'k] = ArenaMap::new(&cx);
                 self.children.insert(&cx, home, c);
                 c
             },
         }
     }
 
-    fn new_decl(self, &cx: Domain!['k], kind: Slice[u8, 'static], home: ModuleId['k], name: Span['k], node: Named['k], impl_block: Option[S::Impl['k]]) -> Decl['k] {
+    fn new_decl(self, &cx: Domain!['k], kind: Str['static], home: ModuleId['k], name: Str['k], node: Named['k], impl_block: Option[S::Impl['k]]) -> Decl['k] {
         let id = self.decl_ids.copy(&cx);
         self.decl_ids.set(&cx, id + 1u32);
-        Decl.{ id, kind: Span::from_static(&cx, kind), home, name, node, impl_block }
+        Decl.{ id, kind: Str::from_static(&cx, kind), home, name, node, impl_block }
     }
 
     fn collect(self, &cx: Domain!['k], home: ModuleId['k], items: ArenaVec[S::Item['k], 'k]) {
@@ -1053,7 +1053,7 @@ impl Resolver['k] {
     }
 
     // The names a `use` tree imports; its errors are at where the tree starts.
-    fn use_tree(self, &cx: Domain!['k], scope: Scope['k], prefix: ArenaVec[Span['k], 'k], tree: S::UseTree['k], exported: bool) {
+    fn use_tree(self, &cx: Domain!['k], scope: Scope['k], prefix: ArenaVec[Str['k], 'k], tree: S::UseTree['k], exported: bool) {
         let path = prefix.clone(&cx);
         path.append(&cx, tree.path);
         if path.at(&cx, 0usize).is(&cx, "builtin") && !self.in_core(&cx, scope.home) {
@@ -1072,9 +1072,9 @@ impl Resolver['k] {
             let last = path.at(&cx, path.len(&cx) - 1usize);
             let name = match tree.alias {
                 Some(a) => {
-                    let linear = last.ends_with(&cx, Span::from_static(&cx, "!"));
+                    let linear = last.ends_with(&cx, Str::from_static(&cx, "!"));
                     // still imported under the alias, so that its uses report nothing more
-                    if a.ends_with(&cx, Span::from_static(&cx, "!")) != linear {
+                    if a.ends_with(&cx, Str::from_static(&cx, "!")) != linear {
                         self.report(&cx, Buffer!::new().put("the alias ").write(&cx, a).put(" of ").write(&cx, last)
                             .put(if linear { " must end with !" } else { " must not end with !" }).save(&cx), tree.pos);
                     }
@@ -1124,7 +1124,7 @@ impl Resolver['k] {
         let target = match item.ty {
             Name(n) => n,
             _ => {
-                self.report(&cx, Span::from_static(&cx, "an impl target must be a named type"), item.pos);
+                self.report(&cx, Str::from_static(&cx, "an impl target must be a named type"), item.pos);
                 return;
             },
         };
@@ -1200,7 +1200,7 @@ impl Resolver['k] {
                         let body = match a.body {
                             Name(n) => n,
                             _ => {
-                                self.report(&cx, Span::from_static(&cx, "an impl target must be a named type"), pos);
+                                self.report(&cx, Str::from_static(&cx, "an impl target must be a named type"), pos);
                                 return Option::None;
                             },
                         };
@@ -1210,7 +1210,7 @@ impl Resolver['k] {
                             None => ArenaVec::new(&cx),
                         };
                         if body.path.len(&cx) == 1usize && params.contains(&cx, first) {
-                            self.report(&cx, Span::from_static(&cx, "an impl target must name a type declaration"), pos);
+                            self.report(&cx, Str::from_static(&cx, "an impl target must name a type declaration"), pos);
                             return Option::None;
                         }
                         if body.path.len(&cx) == 1usize && is_prim(&cx, first) {
@@ -1222,7 +1222,7 @@ impl Resolver['k] {
                                 going = true;
                             },
                             Err(_e) => {
-                                self.report(&cx, Span::from_static(&cx, "an impl target must name a type declaration"), pos);
+                                self.report(&cx, Str::from_static(&cx, "an impl target must name a type declaration"), pos);
                                 return Option::None;
                             },
                         }
@@ -1241,7 +1241,7 @@ impl Resolver['k] {
             },
             _ => (),
         }
-        self.report(&cx, Span::from_static(&cx, "an impl target must name a type declaration"), pos);
+        self.report(&cx, Str::from_static(&cx, "an impl target must name a type declaration"), pos);
         Option::None
     }
 
@@ -1268,12 +1268,12 @@ impl Resolver['k] {
                 Builtin(name) => if is_owned_builtin(&cx, name) {
                     Owner::Prim.(name)
                 } else {
-                    self.report(&cx, Span::from_static(&cx, "an impl target must name a type declaration"), target.pos);
+                    self.report(&cx, Str::from_static(&cx, "an impl target must name a type declaration"), target.pos);
                     Owner::Blanket
                 },
                 Decl(d) => Owner::Decl.(d),
                 _ => {
-                    self.report(&cx, Span::from_static(&cx, "an impl target must name a type declaration"), target.pos);
+                    self.report(&cx, Str::from_static(&cx, "an impl target must name a type declaration"), target.pos);
                     Owner::Blanket
                 },
             },
@@ -1294,7 +1294,7 @@ impl Resolver['k] {
     }
 
     // ---- errors
-    fn file(self, &cx: Domain!['k], home: ModuleId['k]) -> Span['k] {
+    fn file(self, &cx: Domain!['k], home: ModuleId['k]) -> Str['k] {
         self.packages.at(&cx, home.package).files.at(&cx, home)
     }
 
@@ -1305,7 +1305,7 @@ impl Resolver['k] {
     }
 
     // Errors from here until `unlocate` are in the manifest `file`.
-    fn locate_manifest(self, &cx: Domain!['k], file: Span['k]) {
+    fn locate_manifest(self, &cx: Domain!['k], file: Str['k]) {
         self.locations.push(&cx, Location.{ file, pos: no_pos(), rank: 0usize });
     }
 
@@ -1315,7 +1315,7 @@ impl Resolver['k] {
 
     // `message` at `pos` (none on line 0) as printed, naming the files it is located in, and where it
     // is.
-    fn located_error(self, &cx: Domain!['k], message: Span['k], pos: Pos) -> (Span['k], Pos) {
+    fn located_error(self, &cx: Domain!['k], message: Str['k], pos: Pos) -> (Str['k], Pos) {
         var full = error_text(&cx, message, pos);
         var at = pos;
         var i = self.locations.len(&cx);
@@ -1330,14 +1330,14 @@ impl Resolver['k] {
     }
 
     // Stops with `message` at `pos` (none on line 0), naming the files it is located in.
-    fn fail(self, &cx: Domain!['k], message: Span['k], pos: Pos) -> ! {
+    fn fail(self, &cx: Domain!['k], message: Str['k], pos: Pos) -> ! {
         let (full, at) = self.located_error(&cx, message, pos);
         fail(&cx, full)
     }
 
     // Keeps `message` at `pos` for `stop`, located as `fail` locates it. An error reported twice is
     // kept once.
-    fn report(self, &cx: Domain!['k], message: Span['k], pos: Pos) {
+    fn report(self, &cx: Domain!['k], message: Str['k], pos: Pos) {
         let (full, at) = self.located_error(&cx, message, pos);
         if !self.reported.contains(&cx, full) {
             self.reported.insert(&cx, full);
@@ -1370,7 +1370,7 @@ impl Resolver['k] {
     // ---- path lookup
     // What `path` names from `module`, or why it names nothing; an error without a position gets
     // `pos`.
-    fn lookup(self, &cx: Domain!['k], home: ModuleId['k], path: ArenaVec[Span['k], 'k], pos: Pos) -> Result[Target['k], Problem['k]] {
+    fn lookup(self, &cx: Domain!['k], home: ModuleId['k], path: ArenaVec[Str['k], 'k], pos: Pos) -> Result[Target['k], Problem['k]] {
         match self.solve(&cx, lookup_key(&cx, "path", home, path)) {
             Ok(t) => Result::Ok.(t),
             Err(e) => if e.pos.line == 0u32 && pos.line != 0u32 {
@@ -1382,14 +1382,14 @@ impl Resolver['k] {
     }
 
     // What `path` names from `module`, stopping if it names nothing.
-    fn need(self, &cx: Domain!['k], home: ModuleId['k], path: ArenaVec[Span['k], 'k], pos: Pos) -> Target['k] {
+    fn need(self, &cx: Domain!['k], home: ModuleId['k], path: ArenaVec[Str['k], 'k], pos: Pos) -> Target['k] {
         match self.lookup(&cx, home, path, pos) {
             Ok(t) => t,
             Err(e) => self.fail(&cx, e.message, e.pos),
         }
     }
 
-    fn solve(self, &cx: Domain!['k], key: (Span['k], ModuleId['k], ArenaVec[Span['k], 'k])) -> Result[Target['k], Problem['k]] {
+    fn solve(self, &cx: Domain!['k], key: (Str['k], ModuleId['k], ArenaVec[Str['k], 'k])) -> Result[Target['k], Problem['k]] {
         let unit = match self.cache.get(&cx, key) {
             Some(t) => return Result::Ok.(t),
             None => (),
@@ -1416,7 +1416,7 @@ impl Resolver['k] {
 
     // What `path` names from `home`; with `hint`, a first name that names nothing is reported with what
     // its other spelling names (`respelled`).
-    fn resolve_path(self, &cx: Domain!['k], home: ModuleId['k], path: ArenaVec[Span['k], 'k], importing: Option[Span['k]], hint: bool) -> Result[Target['k], Problem['k]] {
+    fn resolve_path(self, &cx: Domain!['k], home: ModuleId['k], path: ArenaVec[Str['k], 'k], importing: Option[Str['k]], hint: bool) -> Result[Target['k], Problem['k]] {
         let first = path.at(&cx, 0usize);
         let rest = path.skip(&cx, 1usize);
         let scope = self.scopes.at(&cx, home);
@@ -1435,7 +1435,7 @@ impl Resolver['k] {
             match self.solve(&cx, lookup_key(&cx, "import", home, ArenaVec::one(&cx, first))) {
                 Ok(t) => t,
                 Err(e) => {
-                    let misspelled = if hint { self.misspelled_import(&cx, home, first) } else { Span::from_static(&cx, "") };
+                    let misspelled = if hint { self.misspelled_import(&cx, home, first) } else { Str::from_static(&cx, "") };
                     if misspelled.is_empty() {
                         return Result::Err.(e);
                     }
@@ -1483,7 +1483,7 @@ impl Resolver['k] {
     // For a first name that names nothing in `home`, `out` followed by what its other spelling names
     // there, or, when that is an import that names nothing, by what the import names respelled
     // (`misspelled_import`).
-    fn unknown_hint(self, &cx: Domain!['k], out: Buffer!, home: ModuleId['k], name: Span['k], importing: Option[Span['k]]) -> Buffer! {
+    fn unknown_hint(self, &cx: Domain!['k], out: Buffer!, home: ModuleId['k], name: Str['k], importing: Option[Str['k]]) -> Buffer! {
         let other = other_spelling(&cx, name);
         let scope = self.scopes.at(&cx, home);
         let not_importing = match importing {
@@ -1505,7 +1505,7 @@ impl Resolver['k] {
 
     // For an import that names nothing: where its `use` names it, when the import's last name
     // respelled, with or without the `!` of a linear type, names something; else nothing.
-    fn misspelled_import(self, &cx: Domain!['k], home: ModuleId['k], alias: Span['k]) -> Span['k] {
+    fn misspelled_import(self, &cx: Domain!['k], home: ModuleId['k], alias: Str['k]) -> Str['k] {
         let scope = self.scopes.at(&cx, home);
         let path = scope.imports.at(&cx, alias);
         let n = path.len(&cx);
@@ -1517,16 +1517,16 @@ impl Resolver['k] {
                 Buffer!::new().put(", imported as ").write(&cx, path.at(&cx, n - 1usize)).put(" at ").write(&cx, self.file(&cx, home))
                     .put(":").put(at.line).put(":").put(at.col).save(&cx)
             },
-            Err(_e) => Span::from_static(&cx, ""),
+            Err(_e) => Str::from_static(&cx, ""),
         }
     }
 
     // `builtin::name`, which only package core writes.
-    fn builtin(self, &cx: Domain!['k], home: ModuleId['k], path: ArenaVec[Span['k], 'k]) -> Result[Target['k], Problem['k]] {
+    fn builtin(self, &cx: Domain!['k], home: ModuleId['k], path: ArenaVec[Str['k], 'k]) -> Result[Target['k], Problem['k]] {
         if !self.in_core(&cx, home) {
             return problem(only_core(&cx));
         }
-        let name = if path.len(&cx) == 2usize { path.at(&cx, 1usize) } else { Span::from_static(&cx, "") };
+        let name = if path.len(&cx) == 2usize { path.at(&cx, 1usize) } else { Str::from_static(&cx, "") };
         if !is_builtin_type(&cx, name) && !is_builtin_value(&cx, name) {
             return problem(Buffer!::new().put("unknown builtin ").write(&cx, path.join(&cx, "::")).save(&cx));
         }
@@ -1538,7 +1538,7 @@ impl Resolver['k] {
     }
 
     // `Owner::name` of a primitive or builtin type: a method or const an impl of it declares.
-    fn attached_to(self, &cx: Domain!['k], owner: Span['k], name: Span['k]) -> Result[Target['k], Problem['k]] {
+    fn attached_to(self, &cx: Domain!['k], owner: Str['k], name: Str['k]) -> Result[Target['k], Problem['k]] {
         let found = self.attached.get_or(&cx, (Owner::Prim.(owner), name), ArenaVec::new(&cx));
         if found.is_empty(&cx) {
             return problem(f"unknown {owner}::{name}".write(&cx, Buffer!::new()).save(&cx));
@@ -1546,7 +1546,7 @@ impl Resolver['k] {
         Result::Ok.(Target::Decl.(found.at(&cx, 0usize)))
     }
 
-    fn root_member(self, &cx: Domain!['k], home: ModuleId['k], name: Span['k]) -> Option[Target['k]] {
+    fn root_member(self, &cx: Domain!['k], home: ModuleId['k], name: Str['k]) -> Option[Target['k]] {
         let package = self.packages.at(&cx, home.package);
         let root = ModuleId::root(&cx, home.package);
         if package.deps.contains(&cx, name) {
@@ -1567,7 +1567,7 @@ impl Resolver['k] {
 
     // `name` through the module's glob imports, in order. Globs that lead back to a search already
     // under way for `name` in `home` offer nothing more there.
-    fn glob(self, &cx: Domain!['k], home: ModuleId['k], name: Span['k]) -> Result[Option[Target['k]], Problem['k]] {
+    fn glob(self, &cx: Domain!['k], home: ModuleId['k], name: Str['k]) -> Result[Option[Target['k]], Problem['k]] {
         if self.searching.contains(&cx, (home, name)) {
             return Result::Ok.(Option::None);
         }
@@ -1579,7 +1579,7 @@ impl Resolver['k] {
 
     // A glob whose own path is being resolved offers nothing more: its path's first name is unknown
     // in the module itself.
-    fn globbed(self, &cx: Domain!['k], home: ModuleId['k], name: Span['k]) -> Result[Option[Target['k]], Problem['k]] {
+    fn globbed(self, &cx: Domain!['k], home: ModuleId['k], name: Str['k]) -> Result[Option[Target['k]], Problem['k]] {
         let globs = self.scopes.at(&cx, home).globs;
         var i = 0usize;
         while i < globs.len(&cx) {
@@ -1607,7 +1607,7 @@ impl Resolver['k] {
 
     // `module::name`, seen from `caller`: its own declarations; within one package also its
     // children and imports; across packages only exports. With `hint`, as `resolve_path`.
-    fn member(self, &cx: Domain!['k], caller: ModuleId['k], home: ModuleId['k], name: Span['k], hint: bool) -> Result[Target['k], Problem['k]] {
+    fn member(self, &cx: Domain!['k], caller: ModuleId['k], home: ModuleId['k], name: Str['k], hint: bool) -> Result[Target['k], Problem['k]] {
         let scope = self.scopes.get(&cx, home);
         let unit = match scope {
             Some(s) => match s.decls.get(&cx, name) {
@@ -1664,7 +1664,7 @@ impl Resolver['k] {
     }
 
     // `Owner::name`: an enum variant, or a method or const attached to `Owner`.
-    fn associated(self, &cx: Domain!['k], owner: Decl['k], name: Span['k]) -> Result[Target['k], Problem['k]] {
+    fn associated(self, &cx: Domain!['k], owner: Decl['k], name: Str['k]) -> Result[Target['k], Problem['k]] {
         let unit = match owner.node {
             Alias(_a) => return problem(alias_names_a_type(&cx, owner)),
             Enum(e) => {
@@ -1705,13 +1705,13 @@ impl Resolver['k] {
         Result::Ok.(Target::Decl.(own.at(&cx, 0usize)))
     }
 
-    // A library item the compiler itself refers to (Slice for string literals, Buffer and Format
+    // A library item the compiler itself refers to (Str for string literals, Buffer and Format
     // for f-strings, Ordering for atomics): through a direct dependency on its home library, else
     // through std, else in the module's own package.
-    fn library(self, &cx: Domain!['k], home: ModuleId['k], library_name: Span['k], path: ArenaVec[Span['k], 'k], std_path: ArenaVec[Span['k], 'k]) -> Target['k] {
+    fn library(self, &cx: Domain!['k], home: ModuleId['k], library_name: Str['k], path: ArenaVec[Str['k], 'k], std_path: ArenaVec[Str['k], 'k]) -> Target['k] {
         let deps = self.packages.at(&cx, home.package).deps;
-        let root = if deps.contains(&cx, library_name) { library_name } else if deps.contains(&cx, Span::from_static(&cx, "std")) { Span::from_static(&cx, "std") } else { Span::from_static(&cx, "package") };
-        let full: ArenaVec[Span['k], 'k] = ArenaVec::one(&cx, root);
+        let root = if deps.contains(&cx, library_name) { library_name } else if deps.contains(&cx, Str::from_static(&cx, "std")) { Str::from_static(&cx, "std") } else { Str::from_static(&cx, "package") };
+        let full: ArenaVec[Str['k], 'k] = ArenaVec::one(&cx, root);
         full.append(&cx, if root.is(&cx, "std") { std_path } else { path });
         self.need(&cx, home, full, no_pos())
     }
@@ -1721,14 +1721,14 @@ impl Resolver['k] {
 
 // `names` with `more` added, as a new sequence: the sets of names in scope.
 forall 'k.
-fn with(&cx: Domain!['k], names: ArenaVec[Span['k], 'k], more: ArenaVec[Span['k], 'k]) -> ArenaVec[Span['k], 'k] {
+fn with(&cx: Domain!['k], names: ArenaVec[Str['k], 'k], more: ArenaVec[Str['k], 'k]) -> ArenaVec[Str['k], 'k] {
     let out = names.clone(&cx);
     out.append(&cx, more);
     out
 }
 
 forall 'k.
-fn with_one(&cx: Domain!['k], names: ArenaVec[Span['k], 'k], name: Span['k]) -> ArenaVec[Span['k], 'k] {
+fn with_one(&cx: Domain!['k], names: ArenaVec[Str['k], 'k], name: Str['k]) -> ArenaVec[Str['k], 'k] {
     let out = names.clone(&cx);
     out.push(&cx, name);
     out
@@ -1753,14 +1753,14 @@ fn quantifier_of(item: S::Item['k]) -> Option[S::Forall['k]] {
 
 // The type parameters a quantifier binds, without its brands.
 forall 'k.
-fn forall_params(&cx: Domain!['k], quantifier: Option[S::Forall['k]]) -> ArenaVec[Span['k], 'k] {
-    let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+fn forall_params(&cx: Domain!['k], quantifier: Option[S::Forall['k]]) -> ArenaVec[Str['k], 'k] {
+    let out: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
     let unit = match quantifier {
         Some(f) => {
             let all = with(&cx, f.params, f.determined);
             var i = 0usize;
             while i < all.len(&cx) {
-                if !all.at(&cx, i).starts_with(&cx, Span::from_static(&cx, "'")) {
+                if !all.at(&cx, i).starts_with(&cx, Str::from_static(&cx, "'")) {
                     out.push(&cx, all.at(&cx, i));
                 }
                 i = i + 1usize;
@@ -1807,7 +1807,7 @@ impl Names['k] {
 
     // Each name a `use` or `export` tree imports or publishes names something, used or not, and each
     // glob names a module; an error is at where its tree starts.
-    fn use_tree(self, &cx: Domain!['k], tree: S::UseTree['k], prefix: ArenaVec[Span['k], 'k], exported: bool) {
+    fn use_tree(self, &cx: Domain!['k], tree: S::UseTree['k], prefix: ArenaVec[Str['k], 'k], exported: bool) {
         let home = self.home.copy(&cx);
         let path = prefix.clone(&cx);
         path.append(&cx, tree.path);
@@ -1852,7 +1852,7 @@ impl Names['k] {
         self.r.refs.insert(&cx, id, r);
     }
 
-    fn premises(self, &cx: Domain!['k], quantifier: Option[S::Forall['k]], types: ArenaVec[Span['k], 'k]) {
+    fn premises(self, &cx: Domain!['k], quantifier: Option[S::Forall['k]], types: ArenaVec[Str['k], 'k]) {
         let unit = match quantifier {
             Some(f) => {
                 var i = 0usize;
@@ -1879,7 +1879,7 @@ impl Names['k] {
         };
     }
 
-    fn item(self, &cx: Domain!['k], item: S::Item['k], types: ArenaVec[Span['k], 'k]) {
+    fn item(self, &cx: Domain!['k], item: S::Item['k], types: ArenaVec[Str['k], 'k]) {
         let unit = match item {
             Use(x) => {
                 self.use_tree(&cx, x.tree, ArenaVec::new(&cx), x.is_export);
@@ -1938,7 +1938,7 @@ impl Names['k] {
                 }
             },
             Trait(t) => {
-                let trait_types = if t.quantifier.is_none() { with_one(&cx, types, Span::from_static(&cx, "Self")) } else { types };
+                let trait_types = if t.quantifier.is_none() { with_one(&cx, types, Str::from_static(&cx, "Self")) } else { types };
                 var i = 0usize;
                 while i < t.methods.len(&cx) {
                     self.function(&cx, t.methods.at(&cx, i), trait_types);
@@ -1957,10 +1957,10 @@ impl Names['k] {
         }
     }
 
-    fn function(self, &cx: Domain!['k], f: S::Fn['k], types: ArenaVec[Span['k], 'k]) {
+    fn function(self, &cx: Domain!['k], f: S::Fn['k], types: ArenaVec[Str['k], 'k]) {
         let types = with(&cx, types, forall_params(&cx, f.quantifier));
         self.premises(&cx, f.quantifier, types);
-        let names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+        let names: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < f.params.len(&cx) {
             let p = f.params.at(&cx, i);
@@ -1982,7 +1982,7 @@ impl Names['k] {
     }
 
     // What `path`, written at `pos`, names; or nothing, when it names nothing, which is reported.
-    fn seek(self, &cx: Domain!['k], path: ArenaVec[Span['k], 'k], pos: Pos) -> Option[Target['k]] {
+    fn seek(self, &cx: Domain!['k], path: ArenaVec[Str['k], 'k], pos: Pos) -> Option[Target['k]] {
         match self.r.lookup(&cx, self.home.copy(&cx), path, pos) {
             Ok(t) => Option::Some.(t),
             Err(e) => {
@@ -1994,7 +1994,7 @@ impl Names['k] {
 
     // The declaration `path`, written at `pos`, names, of `kind` unless it is empty; or nothing, when
     // it names none, which is reported.
-    fn decl(self, &cx: Domain!['k], path: ArenaVec[Span['k], 'k], kind: Slice[u8, 'static], pos: Pos) -> Option[Decl['k]] {
+    fn decl(self, &cx: Domain!['k], path: ArenaVec[Str['k], 'k], kind: Str['static], pos: Pos) -> Option[Decl['k]] {
         match self.seek(&cx, path, pos) {
             Some(target) => self.decl_of(&cx, path, target, kind, pos),
             None => Option::None,
@@ -2003,8 +2003,8 @@ impl Names['k] {
 
     // `target`, which `path` names, when it is a declaration of `kind` (any kind when it is empty);
     // otherwise that is reported.
-    fn decl_of(self, &cx: Domain!['k], path: ArenaVec[Span['k], 'k], target: Target['k], kind: Slice[u8, 'static], pos: Pos) -> Option[Decl['k]] {
-        let k = Span::from_static(&cx, kind);
+    fn decl_of(self, &cx: Domain!['k], path: ArenaVec[Str['k], 'k], target: Target['k], kind: Str['static], pos: Pos) -> Option[Decl['k]] {
+        let k = Str::from_static(&cx, kind);
         match target {
             Decl(d) => if k.is_empty() || d.kind.eq(&cx, k) {
                 return Option::Some.(d);
@@ -2014,13 +2014,13 @@ impl Names['k] {
             },
             _ => (),
         }
-        let what = if k.is_empty() { Span::from_static(&cx, "declaration") } else { k };
+        let what = if k.is_empty() { Str::from_static(&cx, "declaration") } else { k };
         self.r.report(&cx, Buffer!::new().write(&cx, path.join(&cx, "::")).put(" is not a ").write(&cx, what).save(&cx), pos);
         Option::None
     }
 
     // ---- types
-    fn types(self, &cx: Domain!['k], ts: ArenaVec[Type['k], 'k], types: ArenaVec[Span['k], 'k]) {
+    fn types(self, &cx: Domain!['k], ts: ArenaVec[Type['k], 'k], types: ArenaVec[Str['k], 'k]) {
         var i = 0usize;
         while i < ts.len(&cx) {
             self.ty(&cx, ts.at(&cx, i), types, false);
@@ -2028,7 +2028,7 @@ impl Names['k] {
         }
     }
 
-    fn ty(self, &cx: Domain!['k], t: Type['k], types: ArenaVec[Span['k], 'k], is_trait: bool) {
+    fn ty(self, &cx: Domain!['k], t: Type['k], types: ArenaVec[Str['k], 'k], is_trait: bool) {
         match t {
             Name(n) => {
                 let path = n.path;
@@ -2077,7 +2077,7 @@ impl Names['k] {
         }
     }
 
-    fn slots(self, &cx: Domain!['k], slots: ArenaVec[S::Slot['k], 'k], types: ArenaVec[Span['k], 'k]) {
+    fn slots(self, &cx: Domain!['k], slots: ArenaVec[S::Slot['k], 'k], types: ArenaVec[Str['k], 'k]) {
         var i = 0usize;
         while i < slots.len(&cx) {
             self.ty(&cx, slots.at(&cx, i).ty, types, false);
@@ -2112,7 +2112,7 @@ impl Names['k] {
 
     // ---- expressions
     // Resolve `e`; `values` are the locals in scope.
-    fn expr(self, &cx: Domain!['k], e: Expr['k], types: ArenaVec[Span['k], 'k], values: ArenaVec[Span['k], 'k]) {
+    fn expr(self, &cx: Domain!['k], e: Expr['k], types: ArenaVec[Str['k], 'k], values: ArenaVec[Str['k], 'k]) {
         match e {
             Path(p) => self.path(&cx, p, types, values),
             Block(b) => self.block(&cx, b, types, values),
@@ -2145,7 +2145,7 @@ impl Names['k] {
                 var i = 0usize;
                 while i < m.arms.len(&cx) {
                     let arm = m.arms.at(&cx, i);
-                    let bound: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+                    let bound: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
                     var k = 0usize;
                     while k < arm.cases.len(&cx) {
                         let case = arm.cases.at(&cx, k);
@@ -2153,12 +2153,12 @@ impl Names['k] {
                             Variant => {
                                 let path = match case.path {
                                     Some(p) => p,
-                                    None => self.r.fail(&cx, Span::from_static(&cx, "internal error: a variant case without a path"), no_pos()),
+                                    None => self.r.fail(&cx, Str::from_static(&cx, "internal error: a variant case without a path"), no_pos()),
                                 };
                                 // A bare label names a variant of the scrutinee's sum, which inference knows.
                                 if path.segments.len(&cx) == 1usize {
                                     if !path.segments.at(&cx, 0usize).args.is_empty(&cx) {
-                                        self.r.report(&cx, Span::from_static(&cx, "a variant label takes no type arguments"), path.pos);
+                                        self.r.report(&cx, Str::from_static(&cx, "a variant label takes no type arguments"), path.pos);
                                     }
                                 } else {
                                     self.variant(&cx, path);
@@ -2186,7 +2186,7 @@ impl Names['k] {
                 }
             },
             Closure(c) => {
-                let names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+                let names: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
                 var i = 0usize;
                 while i < c.params.len(&cx) {
                     let p = c.params.at(&cx, i);
@@ -2270,7 +2270,7 @@ impl Names['k] {
         }
     }
 
-    fn block(self, &cx: Domain!['k], b: S::Block['k], types: ArenaVec[Span['k], 'k], values: ArenaVec[Span['k], 'k]) {
+    fn block(self, &cx: Domain!['k], b: S::Block['k], types: ArenaVec[Str['k], 'k], values: ArenaVec[Str['k], 'k]) {
         var values = values;
         var i = 0usize;
         while i < b.stmts.len(&cx) {
@@ -2283,7 +2283,7 @@ impl Names['k] {
         };
     }
 
-    fn stmt(self, &cx: Domain!['k], s: Statement['k], types: ArenaVec[Span['k], 'k], values: ArenaVec[Span['k], 'k]) -> ArenaVec[Span['k], 'k] {
+    fn stmt(self, &cx: Domain!['k], s: Statement['k], types: ArenaVec[Str['k], 'k], values: ArenaVec[Str['k], 'k]) -> ArenaVec[Str['k], 'k] {
         match s {
             Let(l) => {
                 self.expr(&cx, l.value, types, values);
@@ -2310,7 +2310,7 @@ impl Names['k] {
         }
     }
 
-    fn segment_args(self, &cx: Domain!['k], p: S::Path['k], types: ArenaVec[Span['k], 'k]) {
+    fn segment_args(self, &cx: Domain!['k], p: S::Path['k], types: ArenaVec[Str['k], 'k]) {
         var i = 0usize;
         while i < p.segments.len(&cx) {
             self.types(&cx, p.segments.at(&cx, i).args, types);
@@ -2318,7 +2318,7 @@ impl Names['k] {
         }
     }
 
-    fn path(self, &cx: Domain!['k], p: S::Path['k], types: ArenaVec[Span['k], 'k], values: ArenaVec[Span['k], 'k]) {
+    fn path(self, &cx: Domain!['k], p: S::Path['k], types: ArenaVec[Str['k], 'k], values: ArenaVec[Str['k], 'k]) {
         let names = p.names(&cx);
         self.segment_args(&cx, p, types);
         let first = names.at(&cx, 0usize);
@@ -2382,8 +2382,8 @@ impl Names['k] {
 }
 
 forall 'k.
-fn bound(&cx: Domain!['k], pattern: Pattern['k]) -> ArenaVec[Span['k], 'k] {
-    let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
+fn bound(&cx: Domain!['k], pattern: Pattern['k]) -> ArenaVec[Str['k], 'k] {
+    let out: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
     let unit = match pattern {
         Bind(n) => out.push(&cx, n.value),
         Tuple(n) => bound_all(&cx, out, n.value),
@@ -2405,7 +2405,7 @@ fn bound(&cx: Domain!['k], pattern: Pattern['k]) -> ArenaVec[Span['k], 'k] {
 }
 
 forall 'k.
-fn bound_all(&cx: Domain!['k], out: ArenaVec[Span['k], 'k], patterns: ArenaVec[Pattern['k], 'k]) {
+fn bound_all(&cx: Domain!['k], out: ArenaVec[Str['k], 'k], patterns: ArenaVec[Pattern['k], 'k]) {
     var i = 0usize;
     while i < patterns.len(&cx) {
         out.append(&cx, bound(&cx, patterns.at(&cx, i)));
@@ -2454,14 +2454,14 @@ fn children(&cx: Domain!['k], e: Expr['k]) -> ArenaVec[Expr['k], 'k] {
         Field(f) => out.push(&cx, f.value.copy(&cx)),
         Index(x) => out.push(&cx, x.value.copy(&cx)),
         Try(n) => out.push(&cx, n.value.copy(&cx)),
-        _ => fail(&cx, Span::from_static(&cx, "internal error: an expression the walker takes apart itself")),
+        _ => fail(&cx, Str::from_static(&cx, "internal error: an expression the walker takes apart itself")),
     };
     out
 }
 
 // The resolved package graph rooted at `path`.
 forall 'k.
-fn resolve(&cx: Domain!['k], path: Span['k]) -> Resolver['k] {
+fn resolve(&cx: Domain!['k], path: Str['k]) -> Resolver['k] {
     let ids = ref_in(&cx, 0u32);
     let resolver = Resolver::new(&cx, load(&cx, path, ids), ids);
     if !resolver.packages.is_empty(&cx) {
@@ -2470,7 +2470,7 @@ fn resolve(&cx: Domain!['k], path: Span['k]) -> Resolver['k] {
             Some(entry) => {
                 if !entry.is_empty(&cx) {
                     resolver.locate_manifest(&cx, package.manifest);
-                    let not_entry = Span::from_static(&cx, "an executable's entry must be a function of its own package");
+                    let not_entry = Str::from_static(&cx, "an executable's entry must be a function of its own package");
                     match resolver.lookup(&cx, ModuleId::root(&cx, package.id), entry, no_pos()) {
                         Ok(target) => match target {
                             Decl(d) => if !d.kind.is(&cx, "fn") || d.home.package != package.id {

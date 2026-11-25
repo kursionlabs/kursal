@@ -1,16 +1,16 @@
-//! Byte cursors for incremental parsing.
-// core::cursor -- checked traversal over a byte view (`Slice[u8, 'k]`):
-// position, `peek`, `next`, `starts_with`, `skip_while`, `take_while`,
-// `take_exact`, and `mark`/`span_since`.
+//! Text cursors for incremental parsing.
+// core::cursor -- checked traversal over text (`Str['k]`): position,
+// `peek`, `next`, `starts_with`, `skip_while`, `take_while`, `take_exact`,
+// and `mark`/`text_since`.
 //
-// `Cursor` is plain `Copy` data: a view plus a position. It is exposed
+// `Cursor` is plain `Copy` data: text plus a position. It is exposed
 // because building one from a struct literal grants no authority: its
-// `Slice` cannot be forged, and every read goes through `ReadBytes` or
-// `Slice::sub`, which check bounds whatever `pos` holds. An out-of-range
+// `Str` cannot be forged, and every read goes through `ReadBytes` or
+// `Str::sub`, which check bounds whatever `pos` holds. An out-of-range
 // `pos` therefore reads as end of input, never out of bounds.
 //
 // The methods that read bytes take the context that permits it by place,
-// `&cx: C` with `where ReadBytes[C, Slice[u8, 'k]]`: the view's
+// `&cx: C` with `where ReadBytes[C, Str['k]]`: the text's
 // `Exclusive!['k]`, a `Shared!` node of it, `StaticRead` for a literal, or
 // any context with such an instance.
 //
@@ -23,30 +23,21 @@
 
 use package as core;
 
-use core::slice::{Slice, ReadBytes, StaticRead, bytes_eq};
+use core::slice::ReadBytes;
+use core::str::Str;
 use core::option::Option;
 
-/// A position in a byte view, for reading it from front to back.
+/// A position in text, for reading it from front to back.
 forall 'k.
 exposed struct Cursor {
-    view: Slice[u8, 'k],
+    view: Str['k],
     pos: usize,
-}
-
-/// The empty subview of `v`, at `v`'s own pointer: the fallback when `pos`
-/// is already out of range and `Slice::sub` returns `None`. A zero-length
-/// view meets `from_raw_parts`'s obligation for any pointer that is not
-/// null, as `v`'s is: nothing is ever read through it.
-forall 'k.
-fn empty_slice_at(v: Slice[u8, 'k]) -> Slice[u8, 'k] {
-    let (p, n, m) = v.into_parts();
-    unsafe Slice::from_raw_parts(p, 0usize, m)
 }
 
 forall 'k.
 impl Cursor['k] {
     /// A cursor at the start of `view`.
-    fn new(view: Slice[u8, 'k]) -> Cursor['k] {
+    fn new(view: Str['k]) -> Cursor['k] {
         Cursor.{ view, pos: 0usize }
     }
 
@@ -69,14 +60,14 @@ impl Cursor['k] {
         self.remaining() == 0usize
     }
 
-    /// A checkpoint to measure from later: `pos` itself; see `span_since`.
+    /// A checkpoint to measure from later: `pos` itself; see `text_since`.
     fn mark(self) -> usize {
         self.pos()
     }
 
-    /// The subview from a previous `mark()` up to the current position;
+    /// The text from a previous `mark()` up to the current position;
     /// `None` if `mark` is after it or the range is out of bounds.
-    fn span_since(self, mark: usize) -> Option[Slice[u8, 'k]] {
+    fn text_since(self, mark: usize) -> Option[Str['k]] {
         let { view: v, pos: p } = self;
         if mark > p {
             Option::None
@@ -86,29 +77,29 @@ impl Cursor['k] {
     }
 
     /// The byte at the current position, without advancing.
-    forall C where ReadBytes[C, Slice[u8, 'k]].
+    forall C where ReadBytes[C, Str['k]].
     fn peek(self, &cx: C) -> Option[u8] {
         let { view: v, pos: p } = self;
-        ReadBytes[C, Slice[u8, 'k]]::get(&cx, v, p)
+        ReadBytes[C, Str['k]]::get(&cx, v, p)
     }
 
     /// The byte `offset` positions ahead of the current one, without
     /// advancing; `None` past the end, however large `offset` is.
-    forall C where ReadBytes[C, Slice[u8, 'k]].
+    forall C where ReadBytes[C, Str['k]].
     fn peek_at(self, &cx: C, offset: usize) -> Option[u8] {
         let { view: v, pos: p } = self;
         if p >= v.len() || offset >= v.len() - p {
             return Option::None;
         }
-        ReadBytes[C, Slice[u8, 'k]]::get(&cx, v, p + offset)
+        ReadBytes[C, Str['k]]::get(&cx, v, p + offset)
     }
 
     /// Reads the current byte and advances past it; `None`, cursor
     /// unchanged, at end of input.
-    forall C where ReadBytes[C, Slice[u8, 'k]].
+    forall C where ReadBytes[C, Str['k]].
     fn next(&self, &cx: C) -> Option[u8] {
         let { view: v, pos: p } = self;
-        let out = ReadBytes[C, Slice[u8, 'k]]::get(&cx, v, p);
+        let out = ReadBytes[C, Str['k]]::get(&cx, v, p);
         let p2 = if out.is_some() { p + 1usize } else { p };
         self = Cursor.{ view: v, pos: p2 };
         out
@@ -116,37 +107,32 @@ impl Cursor['k] {
 
     /// Whether the remaining input starts with `lit`'s bytes, without
     /// advancing; `false` when fewer than `lit.len()` bytes remain.
-    forall C where ReadBytes[C, Slice[u8, 'k]].
-    fn starts_with(self, &cx: C, lit: Slice[u8, 'static]) -> bool {
+    forall C where ReadBytes[C, Str['k]].
+    fn starts_with(self, &cx: C, lit: Str['static]) -> bool {
         let { view: v, pos: p } = self;
-        let (litp, litn, litm) = lit.into_parts();
-        var sr = StaticRead::new();
-        match v.sub(p, litn) {
-            Some(candidate) => bytes_eq(&cx, candidate, &sr, lit),
+        match v.sub(p, lit.len()) {
+            Some(candidate) => candidate.is(&cx, lit),
             None => false,
         }
     }
 
     /// The cursor advanced past every byte, from here on, that satisfies
     /// `pred`; unchanged if the current byte does not or input has ended.
-    forall C where ReadBytes[C, Slice[u8, 'k]].
+    forall C where ReadBytes[C, Str['k]].
     fn skip_while(self, &cx: C, pred: fn(u8) -> bool) -> Cursor['k] {
         let { view: v, pos: p } = self;
         let p2 = skip_while_go(&cx, v, p, pred);
         Cursor.{ view: v, pos: p2 }
     }
 
-    /// The subview of every byte, from here on, that satisfies `pred`;
+    /// The text of every byte, from here on, that satisfies `pred`;
     /// advances the cursor past it.
-    forall C where ReadBytes[C, Slice[u8, 'k]].
-    fn take_while(&self, &cx: C, pred: fn(u8) -> bool) -> Slice[u8, 'k] {
+    forall C where ReadBytes[C, Str['k]].
+    fn take_while(&self, &cx: C, pred: fn(u8) -> bool) -> Str['k] {
         let { view: v, pos: p } = self;
         let p_start = if p > v.len() { v.len() } else { p };
         let p_end = skip_while_go(&cx, v, p_start, pred);
-        let taken: Slice[u8, 'k] = match v.sub(p_start, p_end - p_start) {
-            Some(s) => s,
-            None => empty_slice_at(v),
-        };
+        let taken = v.slice(p_start, p_end);
         self = Cursor.{ view: v, pos: p_end };
         taken
     }
@@ -155,7 +141,7 @@ impl Cursor['k] {
     ///
     /// `next` returning the cursor, for `&`-sugar:
     /// `let stepped = cur.step(&cx);`.
-    forall C where ReadBytes[C, Slice[u8, 'k]].
+    forall C where ReadBytes[C, Str['k]].
     fn step(self, &cx: C) -> (Cursor['k], Option[u8]) {
         var cursor = self;
         let byte = &cursor.next(&cx);
@@ -167,17 +153,17 @@ impl Cursor['k] {
     ///
     /// `take_while` shaped for `&`-sugar:
     /// `let taken = cur.take_matching(&cx, is_digit);`.
-    forall C where ReadBytes[C, Slice[u8, 'k]].
-    fn take_matching(self, &cx: C, pred: fn(u8) -> bool) -> (Cursor['k], Slice[u8, 'k]) {
+    forall C where ReadBytes[C, Str['k]].
+    fn take_matching(self, &cx: C, pred: fn(u8) -> bool) -> (Cursor['k], Str['k]) {
         var cursor = self;
         let taken = &cursor.take_while(&cx, pred);
         (cursor, taken)
     }
 
     /// Exactly `count` bytes from here and the cursor advanced past them;
-    /// `None` if fewer than `count` remain. `Slice::sub` checks the range,
+    /// `None` if fewer than `count` remain. `Str::sub` checks the range,
     /// so no capability is needed.
-    fn take_exact(self, count: usize) -> Option[(Cursor['k], Slice[u8, 'k])] {
+    fn take_exact(self, count: usize) -> Option[(Cursor['k], Str['k])] {
         let { view: v, pos: p } = self;
         match v.sub(p, count) {
             Some(s) => Option::Some.((Cursor.{ view: v, pos: p + count }, s)),
@@ -185,26 +171,21 @@ impl Cursor['k] {
         }
     }
 
-    /// The whole remaining input as one subview, without advancing.
-    fn remaining_view(self) -> Slice[u8, 'k] {
+    /// The whole remaining input as one text, without advancing.
+    fn remaining_view(self) -> Str['k] {
         let { view: v, pos: p } = self;
-        let p_clamped = if p > v.len() { v.len() } else { p };
-        let rest = v.len() - p_clamped;
-        match v.sub(p_clamped, rest) {
-            Some(s) => s,
-            None => empty_slice_at(v),
-        }
+        v.skip(p)
     }
 }
 
 /// The first position from `p` on in `v` whose byte `pred` rejects, or the
 /// end. Used by `Cursor::skip_while` and `take_while`; not meant for direct
 /// use.
-forall 'k, C where ReadBytes[C, Slice[u8, 'k]].
-fn skip_while_go(&cx: C, v: Slice[u8, 'k], p: usize, pred: fn(u8) -> bool) -> usize {
+forall 'k, C where ReadBytes[C, Str['k]].
+fn skip_while_go(&cx: C, v: Str['k], p: usize, pred: fn(u8) -> bool) -> usize {
     var at = p;
     while true {
-        match ReadBytes[C, Slice[u8, 'k]]::get(&cx, v, at) {
+        match ReadBytes[C, Str['k]]::get(&cx, v, at) {
             Some(b) => if pred(b) {
                 at = at + 1usize;
             } else {
