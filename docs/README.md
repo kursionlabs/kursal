@@ -143,13 +143,15 @@ result, Enter to open it and Escape to close the list.
 
 ## Theme
 
-The site uses the project's palette and opens in dark mode; the header toggle switches
-to light mode and saves the choice in the browser. Headings, navigation and prose use
-Space Grotesk and code uses JetBrains Mono, loaded from Google Fonts with system fallbacks.
-Text keeps a contrast of at least 4.5:1 against its background in both modes.
+The site has kursal.dev's look: its palette, logo and header, and the same colour tokens
+in light and dark mode. It opens in the reader's system mode; the header toggle switches
+and saves the choice under the key kursal.dev uses. Types and modules are blue, traits and
+instances violet. Headings and navigation use Bricolage Grotesque, prose Source Serif 4 and
+code IBM Plex Mono, loaded from Google Fonts with system fallbacks. Text keeps a contrast of
+at least 4.5:1 against its background in both modes.
 
 The site lives in [`site/`](site/), a Krayon site without content: `site/krayon.toml`
-and, under `site/src/`, the layouts in `_includes/` and the stylesheet, scripts and logo in
+and, under `site/src/`, the layouts in `_includes/` and the stylesheet, scripts, logo and favicon in
 `assets/`. The compiler does not read it. The generated pages are its content, and they
 name the layouts they need: `doc.html` for module, type and trait pages, `source.html` for
 source files and `index.html` for the package list. `site/src/_includes/` holds the three,
@@ -158,7 +160,7 @@ names; the front matter fields they use are `title`, `kind`, `nav_title`, `paren
 `parent_title`, `package`, the `nav_items` records (`section`, `name`, `url`, `kind`) and the
 `tree` records (`name`, `url`, `depth`, `current`).
 
-The site sets `fingerprint_assets`, and the layouts link the stylesheet, scripts and logo
+The site sets `fingerprint_assets`, and the layouts link the stylesheet, scripts, logo and favicon
 through Krayon's `asset_url` filter, so each build names them by the hash of their content
 and a browser never keeps a stale copy. The search index is a page, not an asset, so it keeps
 its name. To serve the site from a subdirectory, set `base_path` in `docs/generated/krayon.toml`
