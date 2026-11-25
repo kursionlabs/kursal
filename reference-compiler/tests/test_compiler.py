@@ -1152,9 +1152,18 @@ SIGNATURES = (
     # when every field is Copy.
     "forall T. enum Opt { None, Some(T) }\nstruct L! { x: u32 }\nstruct H! { o: Opt[L!], p: *L! }\n"
     "forall 'k. struct Cap! {}\nforall T. struct W { w: Opt[T] }\nfn f(o: Opt[L!], w: W[u32]) -> Opt[L!] { o }\n",
-    # A foreach type is a whole parameter's or result's type, in a function type's too.
+    # A foreach type is a whole parameter's or result's type, in a function type's too, and stands in every
+    # other type position. Under the value pattern a pointer source is a leaf, whatever its pointee.
     "struct L { next: *L, v: u32 }\nfn m(f: foreach *F of *L => F) -> foreach *F of *L => F { f }\n"
-    "forall T where Exposed[T]. fn g(x: foreach X of T => *X, k: fn(foreach X of (u32, u8) => X) -> u32) -> u32 { 0u32 }\n",
+    "forall T where Exposed[T]. fn g(x: foreach X of T => *X, k: fn(foreach X of (u32, u8) => X) -> u32) -> u32 { 0u32 }\n"
+    "enum E { A, B }\nfn f(x: foreach y of *E => u8) {}\nstruct S { f: fn(foreach y of *E => u8) -> u8, g: (foreach y of *E => u8, u8) }\n"
+    "fn h(x: foreach *Y of *E => u8) -> u32 { 0u32 }\n",
+    "tuple P(u32, foreach X of (u32,) => X);\nenum F { A(foreach X of (u32,) => X), B }\nfn f(p: *foreach X of (u32,) => X) {}\n"
+    "forall T. struct B { b: *T }\nfn g(b: B[foreach X of (u32,) => X]) {}\n"
+    "forall T where Exposed[foreach X of T => X]. fn h(x: T) {}\n"
+    "fn i(x: foreach X of (foreach Y of (u32,) => Y) => X) {}\nfn j(x: foreach X of (u32,) => foreach Y of (X,) => Y) {}\n"
+    "fn k(x: exists 'k. foreach X of (core::cap::Brand['k],) => X) {}\n"
+    "struct T { f: foreach *F of *T => u8 }\n",
 )
 
 SIGNATURE_ERRORS = (
@@ -1200,8 +1209,8 @@ SIGNATURE_ERRORS = (
     'extern "system" fn g();\n',
     # a foreach type has an expansion at every instantiation, in a declaration too
     "forall T. fn f(x: foreach *F of T => F) {}\n",
-    "enum E { A, B }\nfn f(x: foreach y of *E => u8) {}\n",
-    "struct S { f: fn(foreach y of *E => u8) -> u8 }\nenum E { A, B }\n",
+    "forall T. struct S! { f: foreach *F of T => F }\n",
+    "forall X. struct Wrap! { f: foreach *F of *(foreach G of X => Wrap![X]) => F }\nfn f(p: *Wrap![(u8,)]) {}\n",
     "struct S { f: fn(foreach *F of (*u8, u32) => F) -> u8 }\n",
     "fn f(self) -> u32 { 0u32 }\n",
     "fn g() {}\nexposed(package::g) struct S { a: u32 }\n",
@@ -1255,16 +1264,8 @@ SIGNATURE_ERRORS = (
     "forall T. struct B { a: T }\nfn f(b: B[u32, u8]) {}\n",
     "trait Show { fn show(x: Self) -> u32; }\nforall T where Show[T, T]. fn f(x: T) {}\n",
     "forall T. struct R { r: R[(T, T)] }\n",
-    # A foreach type is flat: no component, pointee, type argument, or foreach source or body.
+    # A foreach type that holds itself by value has no finite layout.
     "struct T { f: foreach *F of *T => F }\n",
-    "tuple P(u32, foreach X of (u32,) => X);\n",
-    "enum E { A(foreach X of (u32,) => X), B }\n",
-    "fn f(p: *foreach X of (u32,) => X) {}\n",
-    "forall T. struct B { b: *T }\nfn f(b: B[foreach X of (u32,) => X]) {}\n",
-    "forall T where Exposed[foreach X of T => X]. fn f(x: T) {}\n",
-    "fn f(x: foreach X of (foreach Y of (u32,) => Y) => X) {}\n",
-    "fn f(x: foreach X of (u32,) => foreach Y of (X,) => Y) {}\n",
-    "fn f(x: exists 'k. foreach X of (core::cap::Brand['k],) => X) {}\n",
 )
 
 # The examples in examples/bad/ that resolution rejects.

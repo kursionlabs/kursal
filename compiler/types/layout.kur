@@ -3,9 +3,11 @@
 // First, recursive nominal applications pass parameters unchanged or choose fixed types. Then
 // symbolic unfolding checks aliases and stored values. Pointer and function representations break
 // storage cycles; aggregate names break C alias cycles. A foreach whose source has known
-// components unfolds to its expansion, like a name. Last, a C representation key, which expands
-// every foreach, must reach a name before the same foreach again. No concrete specialization
-// budget is needed.
+// components unfolds to its expansion, like a name, and its source is walked; one whose source a
+// type parameter decides is opaque, and the walk covers its source and, for the pointer pattern, the
+// origin of its rows, the pointee of the pointer source. Last, a C representation key, which expands every
+// foreach, must reach a name before the same foreach again. No concrete specialization budget is
+// needed.
 
 use std::collections::arena_vec::ArenaVec;
 use std::collections::arena_map::{ArenaMap, ArenaSet};
@@ -17,8 +19,22 @@ use package::kurs::core::{ForeachType, Kind, Member, Program, Type};
 use package::kurs::core as C;
 use package::syntax::ast::{Pos, no_pos};
 use package::types::termination::components;
-use package::types::ops::{Fresh, Row, Rows, children, equal, free_brands, free_names, kurs_error_in, member_types, overlap, subst, with_names, wrap};
-use std::option::Option;
+use package::types::ops::{Fresh, Row, Rows, children, equal, free_brands, free_names, is_ptr, kurs_error_in, member_types, overlap, subst, with_names, wrap};
+use std::option::{Option, Result};
+use std::slice::Slice;
+
+// A `*F` pattern binds its binder to the pointee of each component. Where a type parameter decides
+// the source's shape only an explicit pointer source has pointer components at every instantiation.
+const STUCK_POINTER_PATTERN: Slice[u8, 'static] = "needs a source written as a pointer *P, as a type parameter decides its shape";
+
+// What the rows of a foreach source are: decided, decided by the type parameter given (the foreach
+// is stuck), or unknown (formation reports an unknown name or a pattern that does not fit).
+forall 'k.
+enum SourceRows {
+    Decided(Rows['k]),
+    Stuck(Type['k]),
+    Unknown,
+}
 
 // A nominal application found while collecting: its owner declaration, the application, and the
 // owner's parameters and the names derived from them in scope there.
@@ -142,73 +158,82 @@ impl Expansion['k] {
         kurs_error_in(&cx, message, file, pos)
     }
 
-    // Demand just the outer shape needed by foreach rows (one pointer layer).
-    fn shape(self, &cx: Domain!['k], owner: Span['k], ty: Type['k], active: ArenaVec[Type['k], 'k], bound: ArenaSet[Span['k], 'k], pointer: bool) {
+    // Demand just the outer shape needed by foreach rows (one pointer layer, which only the pointer
+    // pattern looks through).
+    fn shape(self, &cx: Domain!['k], ty: Type['k], active: ArenaVec[Type['k], 'k], bound: ArenaSet[Span['k], 'k], pointer: bool) -> Result[(), Span['k]] {
         match ty {
             Named(name, args) => match self.unfold(&cx, name, args, bound) {
                 Some(found) => {
                     let current = self.key(&cx, ty);
                     if any_equal(&cx, current, active) {
-                        self.fail(&cx, owner, Buffer!::new().push_static("recursive foreach source shape through ").push_bytes(&cx, name).save(&cx));
+                        return Result::Err.(Buffer!::new().push_static("recursive foreach source shape through ").push_bytes(&cx, name).save(&cx));
                     }
-                    self.shape(&cx, owner, found, with_type(&cx, active, current), bound, pointer);
+                    self.shape(&cx, found, with_type(&cx, active, current), bound, pointer)
                 },
-                None => (),
+                None => Result::Ok.(()),
             },
-            Foreach(f) => self.shape(&cx, owner, f.source.copy(&cx), active, bound, true),
-            Ptr(inner) => {
-                if pointer {
-                    self.shape(&cx, owner, inner.copy(&cx), active, bound, false);
-                }
-            },
-            _ => (),
+            Foreach(f) => self.shape(&cx, f.source.copy(&cx), active, bound, f.indirect),
+            Ptr(inner) => if pointer { self.shape(&cx, inner.copy(&cx), active, bound, false) } else { Result::Ok.(()) },
+            _ => Result::Ok.(()),
         }
     }
 
     // The components of a foreach source, as `Types::rows` and `Types::expand` find them, following
-    // only what `shape` has demanded of it; none when a parameter or an unknown name decides them,
-    // or the pattern does not fit them (formation reports that).
+    // only what `shape` has demanded of it.
+
+    // The outer shape of `ty`: a structural type, or the parameter of `bound` that decides it; none
+    // for an unknown name or a pattern that does not fit its components (formation reports those).
     fn outer(self, &cx: Domain!['k], ty: Type['k], bound: ArenaSet[Span['k], 'k]) -> Option[Type['k]] {
-        let found = match ty {
-            Named(name, args) => self.unfold(&cx, name, args, bound),
-            Foreach(f) => self.expand(&cx, f, bound),
-            _ => return Option::Some.(ty),
-        };
-        match found {
-            Some(next) => self.outer(&cx, next, bound),
-            None => Option::None,
+        match ty {
+            Named(name, args) => {
+                if bound.contains(&cx, name) {
+                    return Option::Some.(ty);
+                }
+                match self.unfold(&cx, name, args, bound) {
+                    Some(next) => self.outer(&cx, next, bound),
+                    None => Option::None,
+                }
+            },
+            Foreach(f) => match self.rows(&cx, f.source.copy(&cx), f.indirect, bound) {
+                Decided(rows) => self.expand(&cx, f, rows),
+                Stuck(param) => Option::Some.(param),
+                Unknown => Option::None,
+            },
+            _ => Option::Some.(ty),
         }
     }
 
-    fn rows(self, &cx: Domain!['k], source: Type['k], bound: ArenaSet[Span['k], 'k]) -> Option[Rows['k]] {
+    // The skeleton and rows of `source` under the pattern `indirect` (`*F`) or not, or the parameter
+    // that decides them (the foreach is stuck). Only `*F` looks through a pointer source; under the
+    // value pattern it is a leaf.
+    fn rows(self, &cx: Domain!['k], source: Type['k], indirect: bool, bound: ArenaSet[Span['k], 'k]) -> SourceRows['k] {
         var shape = match self.outer(&cx, source, bound) {
             Some(shape) => shape,
-            None => return Option::None,
+            None => return SourceRows::Unknown,
         };
         var pointer = false;
         let unit = match shape {
             Ptr(inner) => {
-                shape = match self.outer(&cx, inner.copy(&cx), bound) {
-                    Some(pointee) => pointee,
-                    None => return Option::None,
-                };
-                pointer = true;
-                match shape {
-                    Enum(_v) => return Option::None,
-                    _ => (),
+                if indirect {
+                    shape = match self.outer(&cx, inner.copy(&cx), bound) {
+                        Some(pointee) => pointee,
+                        None => return SourceRows::Unknown,
+                    };
+                    pointer = true;
                 }
             },
             _ => (),
         };
         let rows: ArenaVec[Row['k], 'k] = ArenaVec::new(&cx);
         match shape {
+            Named(_name, _args) => SourceRows::Stuck.(shape),
             Struct(fields) => {
                 var i = 0usize;
                 while i < fields.len(&cx) {
                     rows.push(&cx, Row.{ label: fields.at(&cx, i).name, item: wrap(&cx, fields.at(&cx, i).type, pointer) });
                     i = i + 1usize;
                 }
-                Option::Some.(Rows.{ skeleton: Option::Some.(shape), rows })
+                SourceRows::Decided.(Rows.{ skeleton: Option::Some.(shape), rows })
             },
             Tuple(elems) => {
                 var i = 0usize;
@@ -216,49 +241,40 @@ impl Expansion['k] {
                     rows.push(&cx, Row.{ label: Buffer!::new().push_usize(i).save(&cx), item: wrap(&cx, elems.at(&cx, i), pointer) });
                     i = i + 1usize;
                 }
-                Option::Some.(Rows.{ skeleton: Option::Some.(shape), rows })
+                SourceRows::Decided.(Rows.{ skeleton: Option::Some.(shape), rows })
             },
             Array(elem, _length) => {
                 rows.push(&cx, Row.{ label: Span::from_static(&cx, "0"), item: wrap(&cx, elem.copy(&cx), pointer) });
-                Option::Some.(Rows.{ skeleton: Option::Some.(shape), rows })
+                SourceRows::Decided.(Rows.{ skeleton: Option::Some.(shape), rows })
             },
             Enum(variants) => {
                 var i = 0usize;
                 while i < variants.len(&cx) {
-                    rows.push(&cx, Row.{ label: variants.at(&cx, i).name, item: variants.at(&cx, i).type });
+                    rows.push(&cx, Row.{ label: variants.at(&cx, i).name, item: wrap(&cx, variants.at(&cx, i).type, pointer) });
                     i = i + 1usize;
                 }
-                Option::Some.(Rows.{ skeleton: Option::Some.(shape), rows })
+                SourceRows::Decided.(Rows.{ skeleton: Option::Some.(shape), rows })
             },
             _ => {
                 rows.push(&cx, Row.{ label: Span::from_static(&cx, "0"), item: source });
-                Option::Some.(Rows.{ skeleton: Option::None, rows })
+                SourceRows::Decided.(Rows.{ skeleton: Option::None, rows })
             },
         }
     }
 
-    fn binding(self, &cx: Domain!['k], ty: ForeachType['k], item: Type['k]) -> Option[Type['k]] {
-        if !ty.indirect {
-            return Option::Some.(item);
-        }
-        match item {
-            Ptr(inner) => Option::Some.(inner.copy(&cx)),
-            _ => Option::None,
-        }
-    }
-
-    fn expand(self, &cx: Domain!['k], ty: ForeachType['k], bound: ArenaSet[Span['k], 'k]) -> Option[Type['k]] {
-        let found = match self.rows(&cx, ty.source.copy(&cx), bound) {
-            Some(found) => found,
-            None => return Option::None,
-        };
+    // The expansion of `ty` over `found`, or none when its pattern does not fit a row.
+    fn expand(self, &cx: Domain!['k], ty: ForeachType['k], found: Rows['k]) -> Option[Type['k]] {
         let mapped: ArenaVec[Member['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < found.rows.len(&cx) {
             let row = found.rows.at(&cx, i);
-            let bind = match self.binding(&cx, ty, row.item) {
-                Some(bind) => bind,
-                None => return Option::None,
+            let bind = if ty.indirect {
+                match row.item {
+                    Ptr(inner) => inner.copy(&cx),
+                    _ => return Option::None,
+                }
+            } else {
+                row.item
             };
             let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
             sub.insert(&cx, ty.binder, bind);
@@ -274,6 +290,18 @@ impl Expansion['k] {
             },
             None => Type::Tuple.(member_types(&cx, mapped)),
         })
+    }
+
+    // The pointee of a pointer source, whose components the rows of the pointer pattern point to.
+    fn origin(self, &cx: Domain!['k], source: Type['k], bound: ArenaSet[Span['k], 'k]) -> Option[Type['k]] {
+        match source {
+            Named(name, args) => match self.unfold(&cx, name, args, bound) {
+                Some(found) => self.origin(&cx, found, bound),
+                None => Option::None,
+            },
+            Ptr(inner) => Option::Some.(inner.copy(&cx)),
+            _ => Option::None,
+        }
     }
 
     // Whether `bound` leaves every declared type name meaning the declaration, so that a key walks
@@ -294,82 +322,112 @@ impl Expansion['k] {
         true
     }
 
-    fn walk(self, &cx: Domain!['k], owner: Span['k], ty: Type['k], active: ArenaVec[Type['k], 'k], bound: ArenaSet[Span['k], 'k], aliases: bool) {
+    // The by-value walk of `ty` in the declaration `owner`, or in a type written elsewhere when `owner`
+    // is empty: the message of what it finds wrong, if anything.
+    fn walk(self, &cx: Domain!['k], owner: Span['k], ty: Type['k], active: ArenaVec[Type['k], 'k], bound: ArenaSet[Span['k], 'k], aliases: bool) -> Result[(), Span['k]] {
         match ty {
             Named(name, args) => match self.unfold(&cx, name, args, bound) {
                 Some(found) => {
                     let current = self.key(&cx, ty);
                     if any_equal(&cx, current, active) {
                         let reason = if aliases { Span::from_static(&cx, "recursive alias needs an aggregate boundary") } else { Span::from_static(&cx, "infinite by-value layout") };
-                        self.fail(&cx, owner, Buffer!::new().push_static("type ").push_bytes(&cx, name).push_static(": ").push_bytes(&cx, reason).save(&cx));
+                        return Result::Err.(Buffer!::new().push_static("type ").push_bytes(&cx, name).push_static(": ").push_bytes(&cx, reason).save(&cx));
                     }
                     let done = if aliases { self.aliased } else { self.walked };
                     let plain = self.plain(&cx, bound);
                     if !(plain && done.contains(&cx, current)) {
-                        self.walk(&cx, owner, found, with_type(&cx, active, current), bound, aliases);
+                        self.walk(&cx, owner, found, with_type(&cx, active, current), bound, aliases)?;
                         if plain {
                             done.insert(&cx, current);
                         }
                     }
+                    Result::Ok.(())
                 },
-                None => (),
+                None => Result::Ok.(()),
             },
             Foreach(f) => {
-                self.shape(&cx, owner, f.source.copy(&cx), ArenaVec::new(&cx), bound, true);
+                self.shape(&cx, f.source.copy(&cx), ArenaVec::new(&cx), bound, f.indirect)?;
                 if aliases {
                     // Every foreach result has an aggregate representation.
-                    return ();
+                    return Result::Ok.(());
                 }
-                self.walk(&cx, owner, f.source.copy(&cx), active, bound, aliases);
-                match self.expand(&cx, f, bound) {
+                self.walk(&cx, owner, f.source.copy(&cx), active, bound, aliases)?;
+                let expanded = match self.rows(&cx, f.source.copy(&cx), f.indirect, bound) {
+                    Decided(rows) => self.expand(&cx, f, rows),
+                    Stuck(_param) => {
+                        if f.indirect {
+                            // What the binder is bound to at an instantiation is a component of the
+                            // pointee, the origin of the rows, which only an explicit pointer source
+                            // gives at every instantiation.
+                            if !is_ptr(f.source.copy(&cx)) {
+                                let message = Buffer!::new().push_static("foreach *").push_bytes(&cx, f.binder).push_static(" ").push_static(STUCK_POINTER_PATTERN);
+                                return Result::Err.((if owner.is_empty() { message } else { message.push_static(" in type ").push_bytes(&cx, owner) }).save(&cx));
+                            }
+                            match self.origin(&cx, f.source.copy(&cx), bound) {
+                                Some(origin) => self.walk(&cx, owner, origin, active, bound, aliases)?,
+                                None => (),
+                            }
+                        }
+                        Option::None
+                    },
+                    Unknown => Option::None,
+                };
+                match expanded {
                     Some(expanded) => {
                         // A component may hold this foreach again by value, unfolding no name on
                         // the way: it is active like a name.
                         let current = self.key(&cx, ty);
                         if any_equal(&cx, current, active) {
-                            self.fail(&cx, owner, Buffer!::new().push_static("type ").push_bytes(&cx, owner).push_static(": infinite by-value layout").save(&cx));
+                            let message = if owner.is_empty() { Buffer!::new() } else { Buffer!::new().push_static("type ").push_bytes(&cx, owner).push_static(": ") };
+                            return Result::Err.(message.push_static("infinite by-value layout").save(&cx));
                         }
-                        self.walk(&cx, owner, expanded, with_type(&cx, active, current), bound, aliases);
+                        self.walk(&cx, owner, expanded, with_type(&cx, active, current), bound, aliases)
                     },
-                    // Opaque here; every use walks the expansion at its type arguments.
+                    // Opaque here; its rows are those of the source and origin walked above at
+                    // each instantiation.
                     None => self.walk(&cx, owner, f.body.copy(&cx), active, with_names(&cx, bound, ArenaVec::one(&cx, f.binder)), aliases),
                 }
             },
-            Brand(_b) => (),
-            Ptr(_i) => if !aliases { () } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
-            NonNull(_i) => if !aliases { () } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
-            Fn(_f) => if !aliases { () } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
-            Tuple(_e) => if aliases { () } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
-            Struct(_f) => if aliases { () } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
-            Enum(_v) => if aliases { () } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
-            Array(_e, length) => if aliases || length == 0u64 { () } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
+            Brand(_b) => Result::Ok.(()),
+            Ptr(_i) => if !aliases { Result::Ok.(()) } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
+            NonNull(_i) => if !aliases { Result::Ok.(()) } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
+            Fn(_f) => if !aliases { Result::Ok.(()) } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
+            Tuple(_e) => if aliases { Result::Ok.(()) } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
+            Struct(_f) => if aliases { Result::Ok.(()) } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
+            Enum(_v) => if aliases { Result::Ok.(()) } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
+            Array(_e, length) => if aliases || length == 0u64 { Result::Ok.(()) } else { self.walk_children(&cx, owner, ty, active, bound, aliases) },
             _ => self.walk_children(&cx, owner, ty, active, bound, aliases),
         }
     }
 
-    fn walk_children(self, &cx: Domain!['k], owner: Span['k], ty: Type['k], active: ArenaVec[Type['k], 'k], bound: ArenaSet[Span['k], 'k], aliases: bool) {
+    fn walk_children(self, &cx: Domain!['k], owner: Span['k], ty: Type['k], active: ArenaVec[Type['k], 'k], bound: ArenaSet[Span['k], 'k], aliases: bool) -> Result[(), Span['k]] {
         let parts = children(&cx, ty);
         var i = 0usize;
         while i < parts.len(&cx) {
-            self.walk(&cx, owner, parts.at(&cx, i), active, bound, aliases);
+            self.walk(&cx, owner, parts.at(&cx, i), active, bound, aliases)?;
             i = i + 1usize;
         }
+        Result::Ok.(())
     }
 
     // The C representation key (`backend::cgen::erase`) keeps names and expands every foreach,
     // behind pointers and functions too: a foreach whose expansion reaches it again before a name
     // has none (`struct T { f: fn(foreach *F of *T => *F) -> u32 }`).
-    fn represent(self, &cx: Domain!['k], owner: Span['k], ty: Type['k], active: ArenaVec[Type['k], 'k], bound: ArenaSet[Span['k], 'k]) {
+    fn represent(self, &cx: Domain!['k], owner: Span['k], ty: Type['k], active: ArenaVec[Type['k], 'k], bound: ArenaSet[Span['k], 'k]) -> Result[(), Span['k]] {
         match ty {
             Foreach(f) => {
-                self.shape(&cx, owner, f.source.copy(&cx), ArenaVec::new(&cx), bound, true);
-                match self.expand(&cx, f, bound) {
+                self.shape(&cx, f.source.copy(&cx), ArenaVec::new(&cx), bound, f.indirect)?;
+                let expanded = match self.rows(&cx, f.source.copy(&cx), f.indirect, bound) {
+                    Decided(rows) => self.expand(&cx, f, rows),
+                    _ => Option::None,
+                };
+                match expanded {
                     Some(expanded) => {
                         let current = self.key(&cx, ty);
                         if any_equal(&cx, current, active) {
-                            self.fail(&cx, owner, Buffer!::new().push_static("type ").push_bytes(&cx, owner).push_static(": recursive foreach needs a named type between").save(&cx));
+                            return Result::Err.(Buffer!::new().push_static("type ").push_bytes(&cx, owner).push_static(": recursive foreach needs a named type between").save(&cx));
                         }
-                        self.represent(&cx, owner, expanded, with_type(&cx, active, current), bound);
+                        self.represent(&cx, owner, expanded, with_type(&cx, active, current), bound)
                     },
                     None => self.represent(&cx, owner, f.body.copy(&cx), active, with_names(&cx, bound, ArenaVec::one(&cx, f.binder))),
                 }
@@ -378,12 +436,22 @@ impl Expansion['k] {
                 let parts = children(&cx, ty);
                 var i = 0usize;
                 while i < parts.len(&cx) {
-                    self.represent(&cx, owner, parts.at(&cx, i), active, bound);
+                    self.represent(&cx, owner, parts.at(&cx, i), active, bound)?;
                     i = i + 1usize;
                 }
+                Result::Ok.(())
             },
         }
     }
+}
+
+// The by-value walk of a type written outside a declaration, with the names of `bound` leaves: a
+// use is walked as a declaration is, where it is written. The message of what it finds wrong, if
+// anything.
+forall 'k.
+fn check_written_type(&cx: Domain!['k], program: Program['k], counter: Fresh['k], ty: Type['k], bound: ArenaSet[Span['k], 'k]) -> Result[(), Span['k]] {
+    let state = Expansion.{ program, counter, graph: ArenaMap::new(&cx), sites: ArenaVec::new(&cx), places: ArenaMap::new(&cx), walked: ArenaSet::new(&cx), aliased: ArenaSet::new(&cx) };
+    state.walk(&cx, Span::from_static(&cx, ""), ty, ArenaVec::new(&cx), bound, false)
 }
 
 // `places` names the file and position of a declaration, by its name, when it has them.
@@ -447,9 +515,18 @@ fn check_type_expansion(&cx: Domain!['k], program: Program['k], counter: Fresh['
             p = p + 1usize;
         }
         let root = state.key(&cx, C::named(decl.name, root_args));
-        state.walk(&cx, decl.name, decl.body, ArenaVec::one(&cx, root), bound, false);
-        state.walk(&cx, decl.name, decl.body, ArenaVec::one(&cx, root), bound, true);
-        state.represent(&cx, decl.name, decl.body, ArenaVec::new(&cx), bound);
+        // Every declaration is walked, one whose body is a foreach or holds one like any other.
+        let walked = match state.walk(&cx, decl.name, decl.body, ArenaVec::one(&cx, root), bound, false) {
+            Ok(_u) => match state.walk(&cx, decl.name, decl.body, ArenaVec::one(&cx, root), bound, true) {
+                Ok(_v) => state.represent(&cx, decl.name, decl.body, ArenaVec::new(&cx), bound),
+                Err(message) => Result::Err.(message),
+            },
+            Err(message) => Result::Err.(message),
+        };
+        match walked {
+            Ok(_u) => (),
+            Err(message) => state.fail(&cx, decl.name, message),
+        }
         r = r + 1usize;
     }
 }

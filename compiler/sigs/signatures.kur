@@ -29,12 +29,12 @@ use std::arena::{Domain!, concat, ref_in};
 use std::buffer::Buffer!;
 use package::kurs::core::{Exposure, ExposureMode, ForeachType, Kind, Member, ModuleId, Param, Premise, Program, Type, TypeDecl};
 use package::kurs::core as C;
-use package::types::layout::check_type_expansion;
+use package::types::layout::{check_type_expansion, check_written_type};
 use package::types::literals::valid_literal;
 use package::resolve::resolver::{Decl, NameRef, Named, Package, Resolver, Target, name_pos, named_pos};
 use package::syntax::ast as S;
 use package::syntax::ast::{Expr, Pos, no_pos};
-use package::types::ops::{POINTER_TO_SUM, Fresh, Types, equal, subst, surface};
+use package::types::ops::{Fresh, Types, equal, subst, surface, with_names};
 use std::option::{Option, Result};
 use std::slice::Slice;
 
@@ -728,7 +728,7 @@ impl Signatures['k] {
             },
             None => (),
         };
-        let actual = self.components(&cx, args.args, scope, "a type argument")?;
+        let actual = self.type_list(&cx, args.args, scope)?;
         match builtin {
             Some(name) => { return Result::Ok.(Premise.{ trait_name: name, args: actual }); },
             None => (),
@@ -784,8 +784,9 @@ impl Signatures['k] {
     }
 
     // The foreach type `ty`, written at `pos`, has an expansion at every instantiation, as type
-    // formation requires: its source is no pointer to a sum, and a `*F` pattern's source is written
-    // with pointer components. Inside a type declaration it waits until every type is known.
+    // formation requires: a `*F` pattern's source whose shape is decided is written with pointer
+    // components, and the walk of `ty` asks for an explicit pointer where a type parameter decides it.
+    // Inside a type declaration it waits until every type is known.
     fn foreach_formation(self, &cx: Domain!['k], ty: ForeachType['k], kinds: ArenaMap[Span['k], Kind, 'k], pos: Pos) -> Result[bool, SigError['k]] {
         if !self.types_ready.copy(&cx) {
             match self.declaring.copy(&cx) {
@@ -795,35 +796,25 @@ impl Signatures['k] {
             return Result::Ok.(true);
         }
         let types = Types::new(&cx, self.program(&cx), self.counter);
-        if types.points_to_sum(&cx, ty.source.copy(&cx), kinds) {
-            return sig_error(Span::from_static(&cx, POINTER_TO_SUM), pos);
-        }
-        if !types.pattern_available(&cx, ty) {
+        if ty.indirect && types.rows_fixed(&cx, ty.source.copy(&cx), true, kinds) && !types.pattern_available(&cx, ty) {
             return sig_error(Buffer!::new().push_static("foreach *").push_bytes(&cx, ty.binder).push_static(" needs a source written with pointer components").save(&cx), pos);
         }
-        Result::Ok.(true)
+        match check_written_type(&cx, self.program(&cx), self.counter, Type::Foreach.(ty), with_names(&cx, ArenaSet::new(&cx), kinds.keys(&cx))) {
+            Ok(_u) => Result::Ok.(true),
+            Err(message) => sig_error(message, pos),
+        }
     }
 
     // ---- types
-    // Types written where a foreach type may not be: `what` names the place.
-    fn components(self, &cx: Domain!['k], exprs: ArenaVec[S::Type['k], 'k], scope: Scope['k], what: Slice[u8, 'static]) -> Result[ArenaVec[Type['k], 'k], SigError['k]] {
+    // The types written in `exprs`, in order.
+    fn type_list(self, &cx: Domain!['k], exprs: ArenaVec[S::Type['k], 'k], scope: Scope['k]) -> Result[ArenaVec[Type['k], 'k], SigError['k]] {
         let out: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < exprs.len(&cx) {
-            out.push(&cx, self.component(&cx, exprs.at(&cx, i), scope, what)?);
+            out.push(&cx, self.type(&cx, exprs.at(&cx, i), scope)?);
             i = i + 1usize;
         }
         Result::Ok.(out)
-    }
-
-    // A type written where a foreach type may not be: `what` names the place. A foreach type
-    // is a whole value's type, or a function's parameter or result.
-    fn component(self, &cx: Domain!['k], type_expr: S::Type['k], scope: Scope['k], what: Slice[u8, 'static]) -> Result[Type['k], SigError['k]] {
-        let ty = self.type(&cx, type_expr, scope)?;
-        match ty {
-            Foreach(_f) => sig_error(Buffer!::new().push_static(what).push_static(" is a foreach type, which is only the type of a whole value, parameter or result").save(&cx), no_pos()),
-            _ => Result::Ok.(ty),
-        }
     }
 
     fn slot_types(self, &cx: Domain!['k], slots: ArenaVec[S::Slot['k], 'k], scope: Scope['k]) -> Result[ArenaVec[Type['k], 'k], SigError['k]] {
@@ -839,7 +830,7 @@ impl Signatures['k] {
     fn type(self, &cx: Domain!['k], type_expr: S::Type['k], scope: Scope['k]) -> Result[Type['k], SigError['k]] {
         match type_expr {
             Name(n) => {
-                let args = self.components(&cx, n.args, scope, "a type argument")?;
+                let args = self.type_list(&cx, n.args, scope)?;
                 let not_a_type = Buffer!::new().push_static("not a type name: ").push_bytes(&cx, n.path.join(&cx, "::")).save(&cx);
                 let r = match self.r.refs.get(&cx, n.id) {
                     Some(r) => r,
@@ -891,11 +882,11 @@ impl Signatures['k] {
                 }
                 Result::Ok.(Type::Skolem.(label))
             },
-            Ptr(inner) => Result::Ok.(C::ptr(&cx, self.component(&cx, inner.copy(&cx), scope, "a pointee")?)),
+            Ptr(inner) => Result::Ok.(C::ptr(&cx, self.type(&cx, inner.copy(&cx), scope)?)),
             Never => Result::Ok.(Type::Never),
-            Tuple(elems) => Result::Ok.(Type::Tuple.(self.components(&cx, elems, scope, "a component")?)),
+            Tuple(elems) => Result::Ok.(Type::Tuple.(self.type_list(&cx, elems, scope)?)),
             Array(elem, length) => {
-                let elem_type = self.component(&cx, elem.copy(&cx), scope, "a component")?;
+                let elem_type = self.type(&cx, elem.copy(&cx), scope)?;
                 let count = self.array_length(&cx, length.copy(&cx))?;
                 Result::Ok.(Type::Array.(ref_in(&cx, elem_type), count))
             },
@@ -939,13 +930,13 @@ impl Signatures['k] {
                     binders.push(&cx, Param.{ name: label, kind: Kind::Brand });
                     i = i + 1usize;
                 }
-                let inner = self.component(&cx, body.copy(&cx), scope.extend(&cx, binders), "a package body")?;
+                let inner = self.type(&cx, body.copy(&cx), scope.extend(&cx, binders))?;
                 Result::Ok.(Type::Exists.(labels, ref_in(&cx, inner)))
             },
             Foreach(f) => {
-                let source = self.component(&cx, f.source.copy(&cx), scope, "a foreach source")?;
+                let source = self.type(&cx, f.source.copy(&cx), scope)?;
                 let bound = ArenaVec::one(&cx, Param.{ name: f.binder, kind: Kind::Any });
-                let body = self.component(&cx, f.body.copy(&cx), scope.extend(&cx, bound), "a foreach body")?;
+                let body = self.type(&cx, f.body.copy(&cx), scope.extend(&cx, bound))?;
                 let formed = ForeachType.{ binder: f.binder, indirect: f.indirect, source: ref_in(&cx, source), body: ref_in(&cx, body) };
                 let unit = self.foreach_formation(&cx, formed, scope.kinds, f.pos)?;
                 Result::Ok.(Type::Foreach.(formed))
@@ -986,12 +977,12 @@ impl Signatures['k] {
                 var i = 0usize;
                 while i < node.fields.len(&cx) {
                     let field = node.fields.at(&cx, i);
-                    fields.push(&cx, Member.{ name: field.name, type: self.component(&cx, field.type, scope, "a component")? });
+                    fields.push(&cx, Member.{ name: field.name, type: self.type(&cx, field.type, scope)? });
                     i = i + 1usize;
                 }
                 (Type::Struct.(fields), node.exposure)
             },
-            Tuple(node) => (Type::Tuple.(self.components(&cx, node.elems, scope, "a component")?), node.exposure),
+            Tuple(node) => (Type::Tuple.(self.type_list(&cx, node.elems, scope)?), node.exposure),
             Enum(node) => {
                 if node.variants.is_empty(&cx) {
                     return sig_error(Buffer!::new().push_static("enum ").push_bytes(&cx, node.name).push_static(" has no variant; an enum has at least one").save(&cx), node.pos);
@@ -1077,9 +1068,9 @@ impl Signatures['k] {
             return Result::Ok.(C::unit(&cx));
         }
         if types.len(&cx) == 1usize {
-            return self.component(&cx, types.at(&cx, 0usize), scope, "a component");
+            return self.type(&cx, types.at(&cx, 0usize), scope);
         }
-        Result::Ok.(Type::Tuple.(self.components(&cx, types, scope, "a component")?))
+        Result::Ok.(Type::Tuple.(self.type_list(&cx, types, scope)?))
     }
 
     fn scope_module(self, &cx: Domain!['k], decl: Decl['k], path: ArenaVec[Span['k], 'k]) -> Result[ModuleId['k], SigError['k]] {
@@ -1272,7 +1263,7 @@ impl Signatures['k] {
             },
             None => fail(&cx, Span::from_static(&cx, "internal error: an unresolved instance")),
         };
-        let arguments = self.components(&cx, head.args, scope, "a type argument")?;
+        let arguments = self.type_list(&cx, head.args, scope)?;
         let unit = self.check_arguments(&cx, trait_decl, arguments, scope, head.pos)?;
         let methods: ArenaVec[Sig['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;

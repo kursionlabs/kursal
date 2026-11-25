@@ -89,7 +89,8 @@ and report through their exit status, 0 when every check holds.
 | `iter_basics`, `iter_combinators`, `iter_custom`, `iter_for_loops`, `iter_collections` | iterators, adapters, custom iterators, `for` loops and collecting |
 | `functions` (with `bad/function_value_at_two_brands.kur`) | function values, indirect calls and closures |
 | `match_labels`, with `bad/match_unknown_label.kur` | match cases that name a variant by its label alone, `Some(x)` or `None`, looked up in the scrutinee's sum, also a sum with no name |
-| `foreach_map`, with `bad/foreach_as_field.kur`, `bad/foreach_pointer_over_parameter.kur`, `bad/foreach_pointer_over_leaf.kur`, `bad/foreach_through_pointer_to_sum.kur` | a `foreach` over a value of a `foreach` type, mapping each component once, and where a `foreach` type may not appear |
+| `foreach_map`, with `bad/foreach_of_foreach.kur` | a `foreach` over a value of a `foreach` type, mapping each component once, over a source that is no `foreach` type |
+| `foreach_types`, with `bad/foreach_holds_itself.kur`, `bad/foreach_pointer_over_parameter.kur`, `bad/foreach_pointer_over_leaf.kur`, `bad/foreach_through_pointer_to_sum.kur` | a `foreach` type in every type position: a field over a type parameter, a tuple's, an enum's and an array's component, a pointee, a package body, a type argument, a `foreach`'s source and body, through a pointer to a sum; a region split into its parts in one step |
 | `modules` | a package whose public facade exports a namespace from an internal module |
 | `core_only` | a program that needs only `core`: no allocator, no operating system |
 | `heap` (library) | C-heap interop: `malloc` checked for null, a raw pointer cast, and `free` |
@@ -128,10 +129,11 @@ Ordinary errors:
 | `private_import.kur` | a name is reached through a module that only imports it, without `export` |
 | `forged_file.kur` | a `File!` is built outside its module, whose representation is restricted |
 | `too_large_type.kur` | a type is not smaller than the address space, 2^64 bytes |
-| `foreach_as_field.kur` | a `foreach` type is a struct's field; it is only the type of a whole value, parameter or result |
-| `foreach_pointer_over_parameter.kur` | `foreach *F of T` matches pointer components, and a type parameter `T` may have none |
+| `foreach_holds_itself.kur` | a struct holds itself by value through the pointee of a `foreach`'s pointer source |
+| `foreach_of_foreach.kur` | a `foreach` maps a value whose `foreach` type has a `foreach` type as its source |
+| `foreach_pointer_over_parameter.kur` | `foreach *F of T` matches pointer components, and a type parameter `T` may have none; only an explicit `*P` will do |
 | `foreach_pointer_over_leaf.kur` | `foreach *F of (*u8, u32)` matches pointer components, and `u32` is none; the type is rejected before the body that misuses the parameter |
-| `foreach_through_pointer_to_sum.kur` | a `foreach` traverses a pointer to a sum, whose components depend on the variant it holds |
+| `foreach_through_pointer_to_sum.kur` | a `foreach` traverses a pointer to a sum, whose components depend on the variant it holds; the type over it is formed |
 | `extern_abi.kur` | an extern names a calling convention other than `"C"` |
 | `inferred_type_in_annotation.kur` | `_` stands for a type argument in an annotation, where only an expression's is inferred |
 

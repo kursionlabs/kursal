@@ -65,8 +65,8 @@ class SpecializationTests(unittest.TestCase):
         self.assertEqual(len(backend.queue), 1)
 
     def test_a_generic_traversal_is_never_specialized_at_a_foreach_source(self):
-        # A type parameter never stands for a foreach type, so specialization never makes a
-        # traversal whose source is one.
+        # A type parameter may stand for a foreach type, but `Exposed` of one never holds, so
+        # specialization never makes a traversal whose source is one.
         f, s = C.Named("F"), C.Named("S")
         mapped = C.Foreach("F", False, s, f)
         mapper = C.Fun("mapper", (C.Param("F"), C.Param("S")), (), f, (f,),
@@ -81,7 +81,7 @@ class SpecializationTests(unittest.TestCase):
                                 (C.Instr(("%y",), "call", ("walk", "%x"), tys=(source,)),),
                                 C.Ret("%x")),))
         program = C.Program(funs={"mapper": mapper, "walk": walk, "caller": caller})
-        with self.assertRaisesRegex(KursError, "a type argument expands to a foreach type"):
+        with self.assertRaisesRegex(KursError, "caller/entry: unsatisfied_premise"):
             check_program(program)
 
 

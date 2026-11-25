@@ -81,9 +81,10 @@ class LayoutTests(unittest.TestCase):
 
     def test_foreach_sources_and_bodies_must_terminate(self):
         self.rejects("(type A (foreach (F A) u32))", "recursive foreach source")
-        self.rejects("(type A (foreach (F (ptr A)) u32))", "recursive foreach source")
+        self.rejects("(type A (foreach ((ptr F) (ptr A)) u32))", "recursive foreach source")
+        # Under the value pattern a pointer source is a leaf: its pointee's shape is not asked for.
+        self.compiles("(type A (foreach (F (ptr A)) u32))", C.Named("A"))
         self.rejects("(type A (foreach (F (tuple u32)) (tuple A F)))", "infinite by-value layout")
-        self.rejects("(type A (foreach (F (tuple u32)) (ptr A)))", "a pointee expands to a foreach type in type A")
         self.rejects("(type A (foreach (A (tuple u32)) A))", "A is a declared type, not a parameter name")
 
     def test_foreach_components_that_hold_the_foreach_by_value_are_infinite(self):
@@ -102,11 +103,35 @@ class LayoutTests(unittest.TestCase):
     def test_foreach_components_behind_pointers_are_finite(self):
         self.compiles("""(type L (struct (next (ptr L)) (v u32)))
           (type M (foreach ((ptr F) (ptr L)) F))""", C.Named("M"))
+        # A foreach in a component, a pointee and a type argument, and one whose body refers to its own
+        # declaration behind a pointer.
+        self.compiles("""(type L (struct (next (ptr L)) (v u32)))
+          (type Box (forall (T) () (struct (t T))))
+          (type N (struct (m (foreach ((ptr F) (ptr L)) (tuple F)))
+                          (p (ptr (foreach (F (tuple u8 u16)) F)))
+                          (b (Box (foreach (F (tuple u32)) (ptr N))))))""", C.Named("N"))
+
+    def test_the_walk_covers_the_origin_of_a_stuck_pointer_source(self):
+        # The rows of `*F` over `*(foreach G of X => Wrap![X])` are decided by X, and bind F to `Wrap![X]`
+        # itself: the pointee, walked by value, reaches the declaration again.
+        self.rejects("(type Wrap! (forall (X) () (struct (f (foreach ((ptr F) (ptr (foreach (G X) (Wrap! X)))) F)))))",
+                     "^type Wrap!: infinite by-value layout$")
+        # A decided source is walked by value, stopping at its pointer, and the expansion with the
+        # foreach active: no pointee walk. `{f: u8}` is finite; `{f: F}` holds the foreach again.
+        self.compiles("(type T (struct (f (foreach ((ptr F) (ptr T)) u8))))", C.Named("T"))
+        self.rejects("(type T (struct (f (foreach ((ptr F) (ptr T)) F))))", "^type T: infinite by-value layout$")
+
+    def test_a_stuck_pointer_pattern_needs_an_explicit_pointer_source(self):
+        self.compiles("(type S! (forall (P) () (struct (f (foreach ((ptr F) (ptr P)) (ptr F))))))",
+                      C.Named("S!", (C.U32,)))
+        self.rejects("(type S (forall (P) () (struct (f (foreach ((ptr F) P) (ptr F))))))",
+                     "^foreach \\*F needs a source written as a pointer \\*P, as a type parameter decides its shape "
+                     "in type S$")
 
     def test_a_foreach_reached_again_behind_a_pointer_needs_a_name_between(self):
         # Finite in memory, but C names a type by its expanded structure, which never ends: a function's
         # parameter is a foreach whose expansion is a pointer to the function again.
-        for param in ("(foreach ((ptr F) (ptr T)) (ptr F))", "(foreach (F (ptr T)) F)",
+        for param in ("(foreach ((ptr F) (ptr T)) (ptr F))", "(foreach ((ptr F) (ptr T)) (tuple (ptr F)))",
                       "(foreach ((ptr F) (ptr T)) (fn (F) u32))", "(foreach ((ptr F) (ptr T)) (B F))"):
             with self.subTest(param=param):
                 self.rejects(f"(type B (forall (X) () (struct (b (ptr X))))) (type T (struct (f (fn ({param}) u32))))",
@@ -141,7 +166,13 @@ class LayoutTests(unittest.TestCase):
     def test_surface_declarations_are_checked_before_inference(self):
         for source, error in (
             ("exposed struct Bad { inner: Bad }", "lib.kur:1:16: type p::Bad: infinite by-value layout$"),
-            ("struct T { f: foreach *F of *T => F }", "lib.kur:1:1: a component is a foreach type"),
+            ("struct T { f: foreach *F of *T => F }", "lib.kur:1:8: type p::T: infinite by-value layout$"),
+            ("struct T { f: foreach *F of *T => u8 }\nstruct Bad { b: Bad }", "lib.kur:2:8: type p::Bad: infinite by-value layout$"),
+            ("forall X. struct Wrap! { f: foreach *F of *(foreach G of X => Wrap![X]) => F }\n"
+             "fn f(p: *Wrap![(u8,)]) {}", "lib.kur:1:18: type p::Wrap!: infinite by-value layout$"),
+            ("forall T. struct S! { f: foreach *F of T => F }",
+             "lib.kur:1:18: foreach \\*F needs a source written as a pointer \\*P, as a type parameter decides "
+             "its shape in type p::S!$"),
             ("forall T. exposed struct Bad { next: *Bad[(T, T)] }", "recursive type expansion"),
         ):
             with self.subTest(source=source):

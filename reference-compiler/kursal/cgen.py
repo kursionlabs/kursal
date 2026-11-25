@@ -1525,8 +1525,10 @@ class Backend:
         caps = [self.by_address(c, ()) if self.by_pointer(self.type_of(c)) else self.value_name(c)
                 for c in instr.args[2:] if not self.erased(self.type_of(c))]
         values = [self.value_name(c) for c in instr.args[2:] if not self.erased(self.type_of(c))]
-        skeleton, rows = self.types.rows(t.source)
-        pointer = mapped is None and isinstance(self.shape(t.source), Ptr)
+        skeleton, rows = self.types.rows(t.source, t.indirect)
+        # A traversal through a pointer with `*F` computes the components' addresses; under the value
+        # pattern the pointer is the one component.
+        pointer = mapped is None and t.indirect and isinstance(self.shape(t.source), Ptr)
         out_shape = self.shape(t)
 
         def apply(row: ForeachRow, component: str) -> str:

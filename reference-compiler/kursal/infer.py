@@ -31,7 +31,7 @@ from . import syntax as S
 from .resolve import Decl, ResolveError, Resolver, listed
 from .sigs import InstanceSig, Scope, Sig, Signatures
 from .sexpr import KursError, Position, counted
-from .types import (POINTER_TO_SUM, Surface, Types, brand_differences, brand_name, equal, free_brands, free_names, made_from,
+from .types import (FOREACH_OF_FOREACH, POINTER_TO_SUM, Surface, Types, brand_differences, brand_name, equal, free_brands, free_names, made_from,
                     mapped_component, subst)
 from .termination import check_instance_termination
 from .coherence import check_coherence
@@ -381,7 +381,9 @@ class Infer:
         ty = zonk(ty)
         if isinstance(ty, Meta):
             fail("the type here is not known yet; annotate it", pos)
-        if isinstance(ty, C.Named) and ty.name not in self.types.program.types:
+        # A type parameter, and a foreach whose rows one decides, has no shape here.
+        if isinstance(ty, C.Named) and ty.name not in self.types.program.types or \
+                isinstance(ty, C.Foreach) and not self.types.rows_fixed(ty.source, ty.indirect, self.kinds):
             return ty
         return self.types.shape(ty) if isinstance(ty, (C.Named, C.Foreach)) else ty
 
@@ -415,6 +417,11 @@ class Infer:
         if trait == "Exposed":
             source = zonk(args[0])
             if not self.types.exposure_available(source, self.module, self.kinds, self.assumptions):
+                # Neither a foreach type nor a pointer to a sum is exposed by its shape.
+                if isinstance(source, C.Foreach):
+                    fail(FOREACH_OF_FOREACH, pos)
+                if self.types.points_to_sum(source, self.kinds):
+                    fail(POINTER_TO_SUM, pos)
                 shown = self.shown(source)
                 fail(f"the shape of {shown} is not visible here: write `where Exposed[{shown}]`, "
                      "or expose its declaration to this module", pos)
@@ -501,13 +508,6 @@ class Infer:
         # a foreach binder as written names the binder of its own `foreach`
         binders = {made_from(b): C.Named(b) for b in self.open_binders if made_from(b)}
         return subst(self.sigs.type(type_expr, scope), {**binders, **self.brand_sub()})
-
-    def argument(self, type_expr: S.Type, pos: Optional[Position]) -> C.Type:
-        """A type argument written at `pos`, which is never a foreach type."""
-        ty = self.type(type_expr)
-        if isinstance(ty, C.Foreach):
-            fail("a type argument is a foreach type, which is only the type of a whole value, parameter or result", pos)
-        return ty
 
     # ---- statements
     def block(self, block: S.Block) -> C.Type:
@@ -810,7 +810,7 @@ class Infer:
                 fail(f"{segments[-1][0]} takes {counted(len(mine), 'type argument')}", path.pos)
             for p, a in zip(params, own):
                 if not isinstance(a, S.TIgnored) and a != S.TBrand("'_") and p.name in sub:
-                    self.unify(sub[p.name], self.argument(a, path.pos), path.pos)
+                    self.unify(sub[p.name], self.type(a), path.pos)
         if len(segments) >= 2 and segments[-2][1] and decl is not None and decl.kind == "method":
             assert decl.impl is not None
             target = self.sigs.type(decl.impl.type, self.sigs.forall(decl.impl.forall, Scope())[2])
@@ -821,7 +821,7 @@ class Infer:
                 fail("method type arguments belong on the impl type, not a namespace", path.pos)
             if len(segments[-2][1]) != len(target.args):
                 fail(f"the impl type qualifier takes {counted(len(target.args), 'type argument')}", path.pos)
-            written = C.Named(target.name, tuple(self.argument(a, path.pos) for a in segments[-2][1]))
+            written = C.Named(target.name, tuple(self.type(a) for a in segments[-2][1]))
             self.unify(subst(target, sub), written, path.pos)
 
     def path_arguments(self, path: S.Path, declaration: Decl, *, member: bool = False) -> tuple[S.Type, ...]:
@@ -843,7 +843,7 @@ class Infer:
             fail(f"{td.name} accepts at most {counted(len(td.params), 'type argument')}, got {len(written)}", expr.pos)
         sub = self.instantiate(td.params, Surface((), {}, (td.name,)).name(td.name), expr.pos)
         for p, a in zip(td.params, written):
-            self.unify(sub[p.name], self.argument(a, expr.pos), expr.pos)
+            self.unify(sub[p.name], self.type(a), expr.pos)
         self.require_parameter_kinds(td.params, sub, expr.pos)
         return td, sub, C.Named(td.name, tuple(sub[p.name] for p in td.params))
 
@@ -1060,6 +1060,8 @@ class Infer:
         # A value of a foreach type is mapped (the map form): the result has its source, binder and
         # pattern, and each item is a component of the value. Anything else is the source itself.
         source = operand.source if isinstance(operand, C.Foreach) else operand
+        if isinstance(source, C.Foreach):
+            fail(FOREACH_OF_FOREACH, expr.pos)
         if self.types.points_to_sum(source, self.kinds):
             fail(POINTER_TO_SUM, expr.pos)
         self.require("Exposed", (source,), expr.pos)
@@ -1315,7 +1317,7 @@ class Infer:
         targs = [Meta("brand" if kind == C.BRAND else "type") for kind in trait.param_kinds]
         for t, a in zip(targs, written):
             if not isinstance(a, S.TIgnored):
-                self.unify(t, self.argument(a, expr.pos), expr.pos)
+                self.unify(t, self.type(a), expr.pos)
         return self.trait_method(expr, trait, method, targs, self.operands(expr.args), receiver=None)
 
     def trait_method(self, expr: S.Call, trait: C.Trait, method: str, targs: Sequence[C.Type],
@@ -1384,10 +1386,15 @@ class Infer:
                     self.later(operand, known_enum, arg.pos)
                 return C.U32 if lent else C.Tuple((operand, C.U32))
             case "sizeof":
-                expr.call = TypedBuiltinCall(name, self.argument(targs[0], expr.pos))
+                target = self.type(targs[0])
+                # The size of a foreach type needs its source's exposure, and of a pointer source that
+                # mentions a parameter, as a traversal does.
+                for source in self.types.size_sources(target):
+                    self.require("Exposed", (source,), expr.pos)
+                expr.call = TypedBuiltinCall(name, target)
                 return C.USIZE
             case "alloca":
-                target = self.argument(targs[0], expr.pos)
+                target = self.type(targs[0])
                 expr.call = TypedBuiltinCall(name, target)
                 return C.Ptr(target)
             case "fence":

@@ -458,7 +458,7 @@ INFER_ERRORS = (
      "Sized requires an exact premise"),
     # A zero-size value has no heap block, so no region to split.
     ("use std::owned::Owned!;\nfn main() -> i32 {\n    let exists 'r. (alloc, region) = Owned!::new(((), ())).open();\n"
-     "    let (restore, splitting) = region.split();\n    0i32\n}\n", "Sized requires an exact premise"),
+     "    let (restore, parts) = region.split();\n    0i32\n}\n", "Sized requires an exact premise"),
     # Only a var is lent or assigned, and a closure holds a copy of what it captures.
     ("exposed struct C { n: u32 }\nimpl C { fn tick(&self) -> u32 { self.n } }\n"
      "fn f() -> u32 { let a = C.{ n: 0u32 }; &a.tick() }\n", "3:41: a is not a var; a lent place must be a var"),

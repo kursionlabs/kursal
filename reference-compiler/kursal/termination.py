@@ -14,8 +14,7 @@ from typing import Optional
 
 from .core import BRAND, Foreach, Fun, Instr, Named, Param, Premise, Program
 from .sexpr import KursError, Position, located
-from .types import Surface, free_names, show
-from .formation import strict_subterm
+from .types import Surface, free_names, show, strict_subterm
 
 type Key = tuple[str, ...]  # (function,) or (trait, method)
 

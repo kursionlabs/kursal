@@ -1608,8 +1608,8 @@ class StdRuntimeTests(unittest.TestCase):
             use std::owned::Owned!;
             fn main() -> i32 {
                 var exists 'r. (alloc, region) = Owned!::new((10u32, 20u32)).open();
-                let (restore, splitting) = region.split();
-                var region = restore.merge(splitting.parts());
+                let (restore, parts) = region.split();
+                var region = restore.merge(parts);
                 let pair = &region.replace((1u32, 2u32));
                 let back = alloc.close(region).into_value();
                 let fallible = match Owned!::try_new(5u32) {

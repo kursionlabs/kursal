@@ -39,6 +39,10 @@ class ForeachSurfaceTests(unittest.TestCase):
             }
             fn main() -> i32 { count[u32](1u32) as i32 }''', 6)
 
+    def test_the_size_of_a_foreach_type_over_an_exposed_parameter(self):
+        self.run_source('''forall T where Exposed[T]. fn size() -> usize { core::mem::sizeof[foreach F of T => u8]() }
+            fn main() -> i32 { (size[(u8, u16, u32)]() + size[u64]()) as i32 }''', 4)
+
     def test_a_value_of_a_foreach_type_is_mapped(self):
         # The map takes each component of the value, at the source's rows, and keeps the source.
         self.run_source('''exposed struct P { a: u32, b: u8 }

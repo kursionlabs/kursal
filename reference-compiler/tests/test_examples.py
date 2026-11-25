@@ -76,6 +76,10 @@ ATOMICS_OUT = ("counter: 2000 of 2000 increments\nmessage: 42, read after the fl
 SHOP_OUT = ("a shelf for 10\ndeliver 8: 8 in stock\nsell 3: 5 in stock\ncannot sell 7: only 5 in stock\n"
             "cannot deliver 6: room for 5\n")
 
+FOREACH_TYPES_OUT = ("weighed: 14\nin a tuple, an enum and an array: 28\nbehind a pointer and in a package: 20\n"
+                     "through a generic field: 5 6, 1 value\nnested: 40 bytes\n"
+                     "through a pointer to a sum: 32 bytes\nsplit and merged: 30, then 3\n")
+
 # Each program's runs, in order and sharing one directory: (arguments, stdin, stdout, exit status), and the
 # stderr expected after them, where it is checked. `{file}` in the arguments is SAMPLE written beside the
 # build; `{store}` is a path there, missing at first.
@@ -155,6 +159,7 @@ RUNS: dict[str, tuple[tuple, ...]] = {
                                 "Candidate 3 confirmed removed -- 0 candidates found (expected 0): 0\n"
                                 "Total distinct candidates on file: 33\n", 0),),
     "foreach_map": (((), "", "", 0),),
+    "foreach_types": (((), "", FOREACH_TYPES_OUT, 0),),
     "format_strings": (((), "", "", 0),),
     "format_trait": (((), "", "point: (3, 4)\ncolor: rgb(255, 128, 0)\n", 0),),
     "functions": (((), "", "", 0),),
@@ -186,10 +191,11 @@ REJECTED = {
     "constructor_call.kur": "8:5: `Option::Some` is a constructor; write `Option::Some\\.\\(\\.\\.\\.\\)`$",
     "double_use_handle.kur": "value 'h' has been moved",
     "extern_abi.kur": '7:8: the only extern ABI is "C"$',
-    "foreach_as_field.kur": "8:1: a component is a foreach type, which is only the type of a whole value, parameter or result$",
+    "foreach_holds_itself.kur": "10:8: type foreach_holds_itself::Wrap!: infinite by-value layout$",
+    "foreach_of_foreach.kur": "15:13: a foreach source cannot be a foreach type$",
     "foreach_pointer_over_leaf.kur": "12:17: foreach \\*F needs a source written with pointer components$",
-    "foreach_pointer_over_parameter.kur": "8:14: foreach \\*F needs a source written with pointer components$",
-    "foreach_through_pointer_to_sum.kur": "9:17: a foreach source cannot be a pointer to a sum$",
+    "foreach_pointer_over_parameter.kur": "9:14: foreach \\*F needs a source written as a pointer \\*P, as a type parameter decides its shape$",
+    "foreach_through_pointer_to_sum.kur": "12:17: a foreach source cannot be a pointer to a sum$",
     "glob_of_unknown_module.kur": "4:5: unknown or private member nowhere of std$",
     "function_value_at_two_brands.kur": "22:36: brand mismatch: Tag!\\['b\\] and Tag!\\['a\\]; 'b was opened at 20:5, 'a at 19:5$",
     "forged_file.kur":"the shape of std::io::File! is not exposed here",

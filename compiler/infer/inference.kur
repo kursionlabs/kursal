@@ -34,7 +34,7 @@ use package::sigs::signatures::{ConstValue, InstanceSig, Sig, Signatures, const_
 use package::syntax::ast as S;
 use package::syntax::ast::{Expr, Pattern, Pos, Statement, no_pos};
 use package::types::termination::check_instance_termination;
-use package::types::ops::{POINTER_TO_SUM, Fresh, Surface, Types, brand_differences, brand_name, equal, free_brands, free_names, made_from, mapped_component, subst, surface};
+use package::types::ops::{FOREACH_OF_FOREACH, POINTER_TO_SUM, Fresh, Surface, Types, brand_differences, brand_name, equal, free_brands, free_names, made_from, mapped_component, subst, surface};
 use package::types::unify::{ground, instantiate, match_head, prune, unify, zonk};
 use std::collections::hashmap::OwnedMap!;
 use std::collections::vec::OwnedVec!;
@@ -1226,7 +1226,12 @@ impl Body['k] {
             } else {
                 ty
             },
-            Foreach(_f) => self.inf.types.shape(&cx, ty, Option::None),
+            // A foreach whose rows a type parameter decides has no shape here, as the parameter has none.
+            Foreach(f) => if self.inf.types.rows_fixed(&cx, f.source.copy(&cx), f.indirect, self.kinds) {
+                self.inf.types.shape(&cx, ty, Option::None)
+            } else {
+                ty
+            },
             _ => ty,
         }
     }
@@ -1271,6 +1276,14 @@ impl Body['k] {
         if trait_name.is(&cx, "Exposed") {
             let source = zonk(&cx, args.at(&cx, 0usize));
             if !self.inf.types.exposure_available(&cx, source, Option::Some.(self.home), self.kinds, self.assumptions) {
+                // Neither a foreach type nor a pointer to a sum is exposed by its shape.
+                let unit = match source {
+                    Foreach(_f) => self.fails(&cx, FOREACH_OF_FOREACH, pos),
+                    _ => (),
+                };
+                if self.inf.types.points_to_sum(&cx, source, self.kinds) {
+                    self.fails(&cx, POINTER_TO_SUM, pos);
+                }
                 let shown = self.shown(&cx, source);
                 self.fail(&cx, Buffer!::new().push_static("the shape of ").push_bytes(&cx, shown).push_static(" is not visible here: write `where Exposed[")
                     .push_bytes(&cx, shown).push_static("]`, or expose its declaration to this module").save(&cx), pos);
@@ -1525,15 +1538,6 @@ impl Body['k] {
             i = i + 1usize;
         }
         subst(&cx, self.inf.sigs.got(&cx, self.inf.sigs.type(&cx, type_expr, scope)), sub, self.inf.counter)
-    }
-
-    // A type argument written at `pos`, which is never a foreach type.
-    fn argument(self, &cx: Domain!['k], type_expr: S::Type['k], pos: Pos) -> Type['k] {
-        let ty = self.core_type(&cx, type_expr);
-        match ty {
-            Foreach(_f) => self.fails(&cx, "a type argument is a foreach type, which is only the type of a whole value, parameter or result", pos),
-            _ => ty,
-        }
     }
 
     fn opt_type(self, &cx: Domain!['k], t: Option[S::Type['k]]) -> Option[Type['k]] {
@@ -2128,7 +2132,7 @@ impl Body['k] {
                     _ => false,
                 };
                 if !skipped && sub.contains(&cx, params.at(&cx, i).name) {
-                    self.unify_at(&cx, sub.at(&cx, params.at(&cx, i).name), self.argument(&cx, a, path.pos), path.pos);
+                    self.unify_at(&cx, sub.at(&cx, params.at(&cx, i).name), self.core_type(&cx, a), path.pos);
                 }
                 i = i + 1usize;
             }
@@ -2157,7 +2161,7 @@ impl Body['k] {
                     let given: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
                     var i = 0usize;
                     while i < written.len(&cx) {
-                        given.push(&cx, self.argument(&cx, written.at(&cx, i), path.pos));
+                        given.push(&cx, self.core_type(&cx, written.at(&cx, i)));
                         i = i + 1usize;
                     }
                     self.unify_at(&cx, subst(&cx, target, sub, self.inf.counter), C::named(name, given), path.pos);
@@ -2211,7 +2215,7 @@ impl Body['k] {
         let sub = self.instantiate_at(&cx, td.params, surface(&cx, ArenaVec::new(&cx), ArenaVec::one(&cx, td.name), ArenaMap::new(&cx)).name(&cx, td.name), pos);
         var i = 0usize;
         while i < written.len(&cx) {
-            self.unify_at(&cx, sub.at(&cx, td.params.at(&cx, i).name), self.argument(&cx, written.at(&cx, i), pos), pos);
+            self.unify_at(&cx, sub.at(&cx, td.params.at(&cx, i).name), self.core_type(&cx, written.at(&cx, i)), pos);
             i = i + 1usize;
         }
         self.require_parameter_kinds(&cx, td.params, sub, pos);
@@ -2640,6 +2644,10 @@ impl Body['k] {
             Some(o) => o.source.copy(&cx),
             None => operand,
         };
+        match source {
+            Foreach(_s) => self.fails(&cx, FOREACH_OF_FOREACH, f.pos),
+            _ => (),
+        }
         if self.inf.types.points_to_sum(&cx, source, self.kinds) {
             self.fails(&cx, POINTER_TO_SUM, f.pos);
         }
@@ -3103,7 +3111,7 @@ impl Body['k] {
         while i < written.len(&cx) {
             let unit = match written.at(&cx, i) {
                 Ignored(_at) => (),
-                _ => self.unify_at(&cx, targs.at(&cx, i), self.argument(&cx, written.at(&cx, i), c.pos), c.pos),
+                _ => self.unify_at(&cx, targs.at(&cx, i), self.core_type(&cx, written.at(&cx, i)), c.pos),
             };
             i = i + 1usize;
         }
@@ -3230,10 +3238,19 @@ impl Body['k] {
             }
             if lent.is_some() { C::u32_type(&cx) } else { Type::Tuple.(ArenaVec::two(&cx, operand, C::u32_type(&cx))) }
         } else if name.is(&cx, "sizeof") {
-            self.results().calls.insert(&cx, c.id, Callee::TypedBuiltin.(name, self.argument(&cx, targs.at(&cx, 0usize), c.pos)));
+            let target = self.core_type(&cx, targs.at(&cx, 0usize));
+            // The size of a foreach type needs its source's exposure, and of a pointer source that
+            // mentions a parameter, as a traversal does.
+            let sources = self.inf.types.size_sources(&cx, target);
+            var i = 0usize;
+            while i < sources.len(&cx) {
+                self.require(&cx, Span::from_static(&cx, "Exposed"), ArenaVec::one(&cx, sources.at(&cx, i)), c.pos);
+                i = i + 1usize;
+            }
+            self.results().calls.insert(&cx, c.id, Callee::TypedBuiltin.(name, target));
             C::usize_type(&cx)
         } else if name.is(&cx, "alloca") {
-            let target = self.argument(&cx, targs.at(&cx, 0usize), c.pos);
+            let target = self.core_type(&cx, targs.at(&cx, 0usize));
             self.results().calls.insert(&cx, c.id, Callee::TypedBuiltin.(name, target));
             C::ptr(&cx, target)
         } else if name.is(&cx, "fence") {

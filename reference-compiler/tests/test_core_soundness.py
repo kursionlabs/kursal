@@ -173,7 +173,7 @@ REJECTED = {
     "pointer_pattern_over_leaf": ("foreach \\*F needs a source written with pointer components", """
         (fun main i32 ()
           (entry () (= %n (sizeof (foreach ((ptr F) bool) bool))) (= %z (const i32 0)) (ret %z)))"""),
-    "pointer_pattern_over_parameter": ("foreach \\*F needs a source written with pointer components", """
+    "pointer_pattern_over_parameter": ("foreach \\*F needs a source written as a pointer \\*P, as a type parameter decides its shape", """
         (fun g (forall (T) () usize () (entry () (= %n (sizeof (foreach ((ptr F) T) F))) (ret %n))))"""),
     "pointer_pattern_over_mixed_tuple": ("foreach \\*F needs a source written with pointer components", """
         (fun g (forall (T) () usize () (entry () (= %n (sizeof (foreach ((ptr F) (tuple (ptr u8) T)) F))) (ret %n))))"""),
@@ -183,19 +183,11 @@ REJECTED = {
     "pointer_pattern_through_a_name": ("foreach \\*F needs a source written with pointer components", """
         (type P (struct (a (ptr u8)) (b (ptr u16))))
         (fun g usize () (entry () (= %n (sizeof (foreach ((ptr F) P) F))) (ret %n)))"""),
-    "pointer_pattern_in_declaration": ("foreach \\*F needs a source written with pointer components in type Holder!", """
+    "pointer_pattern_in_declaration": ("foreach \\*F needs a source written as a pointer \\*P, as a type parameter decides its shape in type Holder!", """
         (type Holder! (forall (T) () (struct (f (foreach ((ptr F) T) F)))))"""),
-    # A pointer source points to a product, an array or a leaf: a pointer to a sum is opaque, and no
-    # foreach type or traversal has one as its source, through a name or with either pattern.
-    "foreach_type_over_pointer_to_sum": ("type formation: a foreach source cannot be a pointer to a sum", """
-        (type Opt (enum (none (tuple)) (some u8)))
-        (fun g usize () (entry () (= %n (sizeof (foreach ((ptr F) (ptr Opt)) F))) (ret %n)))"""),
-    "foreach_value_pattern_over_pointer_to_sum": ("type formation: a foreach source cannot be a pointer to a sum", """
-        (type Opt (enum (none (tuple)) (some u8)))
-        (type O (struct (o Opt)))
-        (type W (enum (only O)))
-        (fun g usize () (entry () (= %n (sizeof (foreach (F (ptr W)) F))) (ret %n)))"""),
-    "foreach_through_pointer_to_sum": ("type formation: a foreach source cannot be a pointer to a sum", """
+    # A traversal through a pointer reaches a product, an array or a leaf: a pointer to a sum is never
+    # exposed, so no traversal has one as its source, though the foreach type over it is formed.
+    "foreach_through_pointer_to_sum": ("foreach_source_not_exposed", """
         (type Opt (enum (none (tuple)) (some u8)))
         (fun mapper (forall (F) () u32 ((ptr F)) (entry ((%x (ptr F))) (= %z (const u32 0)) (ret %z))))
         (fun walk (foreach ((ptr F) (ptr Opt)) u32) ((ptr Opt))
@@ -380,30 +372,16 @@ REJECTED = {
             (= %z (const u64 0)) (= %s (construct (tuple u64) %z))
             (= %r (foreach (foreach (G (tuple u64)) u32) %s m)) (ret %r))))"""),
 
-    # A foreach type is flat: a whole value's type, a function's parameter or result, or a
-    # declaration's body, never anywhere else, a declaration whose body is one included.
-    "foreach_source_is_a_foreach": ("a foreach source expands to a foreach type", """
-        (fun f usize () (entry () (= %n (sizeof (foreach (G (foreach (F (tuple u32)) F)) G))) (ret %n)))"""),
-    "foreach_body_is_a_foreach": ("a foreach body expands to a foreach type", """
-        (fun f usize () (entry () (= %n (sizeof (foreach (G (tuple u32)) (foreach (F (tuple G)) F)))) (ret %n)))"""),
-    "foreach_component": ("a component expands to a foreach type", """
-        (fun f usize () (entry () (= %n (sizeof (tuple (foreach (F (tuple u32)) F) u8))) (ret %n)))"""),
-    "foreach_field_through_a_declaration": ("a component expands to a foreach type in type P", """
-        (type W (foreach (F (tuple u32)) F))
-        (type P (struct (w W)))"""),
-    "foreach_pointee": ("a pointee expands to a foreach type", """
-        (fun f usize () (entry () (= %n (sizeof (ptr (foreach (F (tuple u32)) F)))) (ret %n)))"""),
-    "foreach_package_body": ("a package body expands to a foreach type", """
-        (fun f usize () (entry () (= %n (sizeof (exists ($k) (foreach (F (tuple (brand $k))) F)))) (ret %n)))"""),
-    "foreach_type_argument": ("a type argument expands to a foreach type", """
-        (type W (foreach (F (tuple u32)) F))
-        (fun id (forall (T) () T (T) (entry ((%x T)) (ret %x))))
-        (fun f W (W) (entry ((%w W)) (= %v (call (id W) %w)) (ret %v)))"""),
-    "foreach_premise_argument": ("a type argument expands to a foreach type", """
-        (fun f (forall (T) ((Exposed (foreach (F T) F))) u32 () (entry () (= %r (const u32 0)) (ret %r))))"""),
-    "foreach_stack_slot": ("a pointee expands to a foreach type", """
-        (fun (unsafe) f u32 () (entry ()
-          (unsafe (= %p (alloca (foreach (F (tuple u32)) F)))) (= %r (const u32 0)) (ret %r)))"""),
+    # No foreach type is the source of a traversal or a map, not even by a premise.
+    "foreach_mapped_over_a_foreach_source": ("foreach_source_not_exposed", """
+        (fun m (forall (X) () X (X) (entry ((%x X)) (ret %x))))
+        (fun f (forall (S) ((Exposed (foreach (G S) G))) (foreach (F (foreach (G S) G)) F) ((foreach (F (foreach (G S) G)) F))
+          (entry ((%v (foreach (F (foreach (G S) G)) F)))
+            (= %r (foreach (foreach (F (foreach (G S) G)) F) %v m)) (ret %r))))"""),
+    # A foreach type holding itself by value through the pointee of its pointer source, the origin of
+    # its rows, has no finite layout.
+    "foreach_holds_itself_through_its_origin": ("type Wrap!: infinite by-value layout", """
+        (type Wrap! (forall (X) () (struct (f (foreach ((ptr F) (ptr (foreach (G X) (Wrap! X)))) F)))))"""),
 
     # An enum has at least one variant: a sum of none would be a type with no value.
     "empty_enum_declaration": ("an enum has at least one variant", "(type E (enum))"),
@@ -518,6 +496,24 @@ REJECTED = {
     # where the pointee is no sum (foreach_type_over_pointer_to_sum).
     "sizeof_foreach_pointer_source_not_exposed": ("foreach_source_not_exposed", """
         (fun g (forall (T) () usize () (entry () (= %n (sizeof (foreach ((ptr F) (ptr T)) (tuple F)))) (ret %n))))"""),
+    # `sizeof` of a foreach type, an alias of one too, needs `Exposed` of its source, whatever that is: a
+    # type parameter, a foreach type, a pointer to a sum, or a closed type whose shape is restricted to
+    # another module.
+    "sizeof_foreach_over_a_parameter": ("foreach_source_not_exposed", """
+        (fun g (forall (T) () usize () (entry () (= %n (sizeof (foreach (F T) u8))) (ret %n))))"""),
+    "sizeof_foreach_alias_over_a_parameter": ("foreach_source_not_exposed", """
+        (type A (forall (T) () (foreach (F T) u8)))
+        (fun g (forall (T) () usize () (entry () (= %n (sizeof (A T))) (ret %n))))"""),
+    "sizeof_foreach_over_a_foreach": ("foreach_source_not_exposed", """
+        (fun f usize () (entry () (= %n (sizeof (foreach (G (foreach (F (tuple u32)) F)) G))) (ret %n)))"""),
+    "sizeof_foreach_over_a_pointer_to_a_sum": ("foreach_source_not_exposed", """
+        (type Opt (enum (none (tuple)) (some u8)))
+        (fun f usize () (entry () (= %n (sizeof (foreach ((ptr F) (ptr Opt)) F))) (ret %n)))"""),
+    "sizeof_foreach_over_a_hidden_shape": ("foreach_source_not_exposed", """
+        (type (in (module 0 a) abstract) Secret (struct (k u32)))
+        (fun (in (module 0 b)) h usize () (entry () (= %n (sizeof (foreach (F Secret) u8))) (ret %n)))"""),
+    "sizeof_foreach_value_pattern_pointer_source_not_exposed": ("foreach_source_not_exposed", """
+        (fun g (forall (T) () usize () (entry () (= %n (sizeof (foreach (F (ptr T)) (tuple F)))) (ret %n))))"""),
     "raw_target_lend_without_sized": ("raw_access_needs_sized", """
         (fun get (forall (T) () u32 (T) (entry ((&x T)) (= %r (const u32 0)) (ret %r))))
         (fun (unsafe) f (forall (T) () u32 ((ptr T)) (entry ((%p (ptr T))) (unsafe (= %r (call (get T) &*%p))) (ret %r))))"""),
@@ -667,6 +663,37 @@ class CoreSoundnessTests(unittest.TestCase):
                    (= %r (foreach (foreach (G (tuple u64)) (tuple G F)) %s (m F) %c))
                    (= %row (destruct %r (foreach (G (tuple u64)) (tuple G F))))
                    (= (%a %b) (destruct %row (tuple u64 F))) (ret %b))))""",
+            # A foreach type in every type position: a component, a pointee, a package body, a foreach's
+            # source and body, a type argument, a premise's included, and a stack slot. `sizeof` of a
+            # foreach type needs its source exposed, which a foreach type never is, but a type holding one
+            # has a size like any other.
+            """(type W (foreach (F (tuple u32)) F))
+               (type P (struct (w W) (v (foreach (F (tuple u8 u16)) (ptr F)))))
+               (fun id (forall (T) () T (T) (entry ((%x T)) (ret %x))))
+               (fun f usize (P) (entry ((%p P))
+                 (= %a (sizeof (tuple (foreach (G (foreach (F (tuple u32)) F)) G))))
+                 (= %b (sizeof (foreach (G (tuple u32)) (foreach (F (tuple G)) F))))
+                 (= %c (sizeof (tuple (foreach (F (tuple u32)) F) u8)))
+                 (= %d (sizeof (ptr (foreach (F (tuple u32)) F))))
+                 (= %e (sizeof (exists ($k) (foreach (F (tuple (brand $k))) F))))
+                 (= %q (call (id P) %p))
+                 (ret %a)))
+               (fun g (forall (T) ((Exposed (foreach (F T) F))) u32 () (entry () (= %r (const u32 0)) (ret %r))))
+               (fun (unsafe) h u32 () (entry ()
+                 (unsafe (= %p (alloca (foreach (F (tuple u32)) F)))) (= %r (const u32 0)) (ret %r)))""",
+            # Through a pointer to a sum the pointer pattern has the rows of the sum, each payload; under
+            # the value pattern the pointer is a leaf. Neither source is exposed, so the types are sized
+            # where something holds them.
+            """(type Opt (enum (none (tuple)) (some u8)))
+               (type O (struct (o Opt)))
+               (type W (enum (only O)))
+               (fun g usize () (entry ()
+                 (= %a (sizeof (tuple (foreach ((ptr F) (ptr Opt)) F))))
+                 (= %b (sizeof (tuple (foreach ((ptr F) (ptr W)) (ptr F)))))
+                 (= %c (sizeof (tuple (foreach (F (ptr W)) F))))
+                 (ret %a)))""",
+            # `sizeof` of a foreach type over a parameter under `Exposed` of the source.
+            """(fun g (forall (T) ((Exposed T)) usize () (entry () (= %n (sizeof (foreach (F T) u8))) (ret %n))))""",
             # A foreach type as a declaration's body, a function's parameter and result, and a parameter
             # of a function type.
             """(type W (foreach (F (tuple u32 u8)) (tuple F)))

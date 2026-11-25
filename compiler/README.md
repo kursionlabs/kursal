@@ -1041,47 +1041,83 @@ These are the places where Kursal differs from what one might expect.
   a set.
 - **Types are finite** (`check_type_expansion`, `types::layout`, run before anything else asks a
   question of a declared type). A type that holds itself by value is rejected (`type T: infinite
-  by-value layout`); a pointer, a function or an empty array between breaks the cycle. A `foreach`
+  by-value layout`); a pointer, a function or an empty array between breaks the cycle. Every
+  declaration is walked, one whose body is a `foreach` or holds one like any other. A `foreach`
   whose source's components are known counts as its expansion, and is itself active while its
   expansion is walked: `foreach *F of *L => F` over `struct L { next: *L, v: u32 }` is `(*L, u32)`
-  as a struct, finite. Over a type parameter the components are unknown, and the use that chooses
-  the argument is walked instead. C names a type by its expanded structure, a declared name staying
-  a name, so a `foreach` that reaches itself again before any name, even behind a function, is
-  rejected too (`struct T { f: fn(foreach *F of *T => *F) -> u32 }`: `recursive foreach needs a
-  named type between`). Errors name the declaration whose walk found them.
+  as a struct, finite. The walk of a `foreach` also covers its source and, where a type parameter
+  decides its components, the pointee of a pointer source under the pointer pattern, the origin of
+  its rows: with `forall X. struct Wrap! { f: foreach *F of *(foreach G of X => Wrap![X]) => F }`
+  the rows bind F to `Wrap![X]` itself, so `Wrap!` holds itself by value and is rejected where it is
+  declared (`examples/bad/foreach_holds_itself.kur`). There the components are unknown, and the body
+  is walked with the binder a leaf; the walk of the source and its origin lays out what the binder
+  is bound to at every instantiation, so no instance is walked again. Where the components are known
+  the expansion is walked instead, and not the pointee: `struct T { f: foreach *F of *T => u8 }` is
+  `{ f: u8 }` and finite, while `struct T { f: foreach *F of *T => F }` holds the `foreach` again in
+  its expansion. A type written in a signature or a body is walked the same way where it is written.
+  C names a type by its expanded structure, a declared name staying a name, so a `foreach` that
+  reaches itself again before any name, even behind a function, is rejected too (`struct T { f:
+  fn(foreach *F of *T => *F) -> u32 }`: `recursive foreach needs a named type between`). Errors name
+  the declaration whose walk found them. The size of every closed type the program writes, each part
+  of it included (a pointee too; a closed `foreach` through its expansion, but for the element of an
+  empty array that only the expansion has), is below 2^64 bytes, checked where it is written; the
+  backend's check of each specialization's types is the one check made at an instantiation.
+- **A `foreach` type stands in every type position**: a field or element, a tuple's or an enum's
+  component, a pointee, a package body, a `foreach`'s source or body, and a type argument, a
+  premise's included, besides a value's, a parameter's or a result's type
+  (`examples/foreach_types`). A `foreach` over a type parameter, as `foreach F of T => (F, u8)`, or
+  over a source that a parameter decides (a declaration whose body is one, another such `foreach`,
+  and under `*F` a pointer to one, as `foreach *F of *T => F`), is *stuck*: a type of its own, equal only to a `foreach` with the same pattern and
+  equal source and body, the binders renamed, never to what it expands to. It has no components in
+  generic code (`pattern does not match foreach F of T => (F, u8)`), and is expanded where the
+  parameter is known. Over a parameter, even a `Copy` argument may hold a linear type in an array
+  of length zero, so a stuck `foreach` whose body mentions the binder is linear, and a declaration
+  that holds one carries the `!` (`struct Tagged holds a linear type in its field tags whatever its
+  type arguments; declare it Tagged!`).
 - **A `foreach` type has an expansion at every instantiation.** A source that is no product (nor a
-  sum) is one component: `foreach F of u32 => *F` is `(*u32,)`. Behind a pointer each component is a
-  pointer to it, to a field or an element; a pointer to a leaf is the one component. A pointer to a
-  sum is opaque, copied, passed and read whole (`unsafe *p`, then a `match`), and is no source: its
-  components would be those of the variant held there, which only a read finds. `foreach F of
-  *Option[u8] => F` is rejected, by value or with `*F`, through a name too, and so is a traversal of
-  such a pointer (`a foreach source cannot be a pointer to a sum`). Nothing is checked again at an
-  instantiation: `Exposed[*T]`, which a generic traversal needs, and which the core's `sizeof` of a
-  foreach type needs of each pointer source that mentions a parameter (`foreach_source_not_exposed`;
-  the source writes no `sizeof` of a foreach type, which is no type argument), never holds for an
-  enum `T`, so no generic code forms `foreach *F of *T => F` there, and a pointer to a sum gives no
-  rows, an empty expansion, where a type that is never formed is laid out anyway. `*F` binds F to
-  each component's pointee, so its source must give pointers whatever the type arguments are, and
-  show them as written: an explicit pointer, or a tuple, struct, enum or array whose components are
-  written as pointers. `foreach *F of T => F` is rejected, as `T` may be `bool`, and so is a name,
-  even one whose shape is a visible product of pointers: `foreach *F needs a source written with
-  pointer components`. Through a pointer a `foreach` only computes addresses, and reads nothing.
+  sum) is one component: `foreach F of u32 => *F` is `(*u32,)`. Under the value pattern a pointer
+  source, written or a declared alias of one, is such a leaf too, whatever it points to: `foreach F
+  of *E => B` is `(B,)` with F the pointer type itself (the alias, for an alias), and asks nothing
+  of the pointee, so a pointer to a sum or to a hidden type is fine there, and `type A = foreach F
+  of *A => u32` is `(u32,)`. A pointer that is a component of a larger source is one component, as
+  any is. The pointer pattern `*F` looks through a pointer source: each component is a pointer to
+  it, to a field, an element or a variant's payload, and F its pointee; a pointer to a leaf is the
+  one component. So `foreach *F of *Option[u8] => F` is `Option[u8]`'s own shape, `enum { None(()),
+  Some(u8) }`. Such a type is formed, laid out and passed, but no traversal makes one: a pointer to
+  a sum is copied, passed and read whole (`unsafe *p`, then a `match`), and is no traversal's
+  source, as its components would be those of the variant held there, which only a read finds (`a
+  foreach source cannot be a pointer to a sum`, through a name too). `Exposed[*T]`, which a generic
+  traversal needs, never holds for an enum `T`, so no generic code traverses one either. `sizeof`
+  asks the same authority a traversal does: of the source of a `foreach` type, or of a declaration
+  whose body is one, whatever that source is (`sizeof[foreach F of T => u8]()` needs `where
+  Exposed[T]`; over a type whose shape another module keeps, `the shape of File! is not visible
+  here`; over a `foreach` type or a pointer to a sum it never holds), and of each pointer source
+  that mentions a parameter of a `foreach` anywhere in the type. A type that holds a `foreach` is
+  sized like any other: `struct { f: foreach *F of *Option[u8] => F }` has a size where the
+  `foreach` type alone has none. `*F` binds F to each component's pointee, so its source must give
+  pointers whatever the type arguments are. A source whose shape is decided shows them as written:
+  an explicit pointer, or a tuple, struct, enum or array whose components are written as pointers; a
+  name is not looked through, even one whose shape is a visible product of pointers (`foreach *F
+  needs a source written with pointer components`). Where a type parameter decides the shape, only
+  an explicit pointer will do, which the walk of the type checks: `foreach *F of T => F` is
+  rejected, as `T` may be `bool` (`foreach *F needs a source written as a pointer *P, as a type
+  parameter decides its shape`). Through a pointer a `foreach` only computes addresses, and reads
+  nothing.
+
+  Exposure is authority over a source's rows and components, not over sizes and `Copy`, but for the
+  `sizeof` of a `foreach` type itself. `sizeof`, `Copy` and the layout of a container over a type
+  whose shape is hidden, a stuck `foreach` or a type restricted to its owner module, may reveal that
+  shape: the size of `struct { a: T, b: T }` is that of two `T`, and of a struct holding `foreach F
+  of T => (F, u8)` it counts the components of `T`. This is accepted, and not gated by `Exposed`.
 - **A `foreach` over a value of a `foreach` type maps it.** With `v: foreach F of S => B`, `foreach
   x of v { .. }` gives the body each component of `v`, of type `B` at the component's row, and makes
   `foreach F of S => R`, `R` the body's type: the same source and pattern, so it needs `Exposed[S]`
   as a traversal of `S` does. Each component is given to the body exactly once, so a linear one is
   consumed once, and of a sum only the variant `v` holds. The body is checked for any `F`, so it hands on a part of type `F` rather
-  than dropping it (`examples/foreach_map`).
-- **A `foreach` type is flat.** It binds one name, its binder, in its body, and it is the type of a
-  whole value, a function's parameter or result (a function type's too), never a field or element,
-  a pointee, a package body, a `foreach`'s source or body, or a type argument, a premise's
-  included: `struct T { f: foreach .. }`, `*foreach ..`, `Vec[foreach ..]` and `Exposed[foreach
-  ..]` are rejected (`a component is a foreach type, which is only the type of a whole value,
-  parameter or result`). So a `foreach` is always one layer over a structural shape, and a type
-  parameter never stands for one. The KURS checker applies the same rule through declarations: a
-  declaration whose body is a `foreach` is one wherever it is named (`a component expands to a
-  foreach type`). To keep what a `foreach` made, make it a function's whole result, as
-  `Splitting!::parts` does.
+  than dropping it (`examples/foreach_map`). No `foreach` type is a traversal's or a map's source:
+  `Exposed` of one never holds, by its shape or by a premise, so a value whose type is a `foreach`
+  over a `foreach` is passed and kept whole but not mapped (`a foreach source cannot be a foreach
+  type`). The map of a value whose source is an empty array never applies its body.
 - **Expressions as statements.** `f(x);` discards a Copy result. A block's value is its last
   expression, without a `;`. `return` is allowed anywhere, and ends with `;` at the end of a block
   (``a `return` at the end of a block ends with `;` ``); a function whose type is `!` (such as `fail`)

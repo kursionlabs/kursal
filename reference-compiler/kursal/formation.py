@@ -9,21 +9,8 @@ from collections.abc import Callable, Iterable
 
 from . import core as C
 from .sexpr import KursError, Position
-from .types import POINTER_TO_SUM, Kinds, Types, children, equal, free_brands, free_names, show, subst, walk
-
-
-def formation_children(ty: C.Type) -> tuple[C.Type, ...]:
-    """Children admissible for descent; a path cannot cross a binder."""
-    if isinstance(ty, C.Exists):
-        return ()
-    if isinstance(ty, C.Foreach):
-        return (ty.source,)
-    return children(ty)
-
-
-def strict_subterm(child: C.Type, parent: C.Type) -> bool:
-    return any(equal(child, part) or strict_subterm(child, part)
-               for part in formation_children(parent))
+from .layout import check_written_type
+from .types import Kinds, Types, children, equal, free_brands, free_names, show, strict_subterm, subst, walk
 
 
 def nominal_descent(args: tuple[C.Type, ...], previous: tuple[C.Type, ...]) -> bool:
@@ -90,15 +77,6 @@ class Formation:
             self.fail("wrong number of type arguments")
         for param, arg in zip(params, args):
             self.fits(arg, param.kind, env)
-            if param.kind != C.BRAND:
-                self.flat(arg, "a type argument")
-
-    def flat(self, ty: C.Type, what: str) -> None:
-        """A type that expands to a foreach is a whole value's type, a function's parameter or
-        result, or a declaration's body, never a component, a pointee, a package body, a foreach source
-        or body, or a type argument (premises' included)."""
-        if self.types.expands_to_foreach(ty):
-            self.fail(f"{what} expands to a foreach type")
 
     def premise(self, premise: C.Premise, env: Kinds) -> None:
         params: tuple[C.Param, ...]
@@ -161,18 +139,19 @@ class Formation:
                 if any(not brand_occurs(body, binder) for binder in binders):
                     self.fail("existential brand binder is unused")
                 self.within(binders, lambda: self.fits(body, C.ANY, inner))
-                self.flat(body, "a package body")
             case C.Foreach(binder=binder, source=source, body=body):
                 self.fits(source, C.ANY, env)
-                self.flat(source, "a foreach source")
-                if self.types.points_to_sum(source, env):
-                    self.fail(POINTER_TO_SUM)
                 # The type has an expansion only if every component is a pointer for `*F` to match, and
-                # it must have one at every instantiation: the source shows its pointers as written.
-                if ty.indirect and not self.types.pattern_available(ty):
+                # it must have one at every instantiation: a source whose shape is decided shows its
+                # pointers as written. Where a type parameter decides it, the walk asks for an explicit
+                # pointer.
+                if ty.indirect and self.types.rows_fixed(source, True, env) and not self.types.pattern_available(ty):
                     self.fail(f"foreach *{binder} needs a source written with pointer components")
                 self.within((binder,), lambda: self.fits(body, C.ANY, self.extend(env, (C.Param(binder),))))
-                self.flat(body, "a foreach body")
+                try:
+                    check_written_type(self.program, ty, set(env))
+                except KursError as error:
+                    self.fail(error.message)
             case C.Fn(params=params, ret=ret, places=places):
                 if not places <= set(range(len(params))):
                     self.fail("function place index out of range")
@@ -190,7 +169,6 @@ class Formation:
             case C.Ptr() | C.NonNull() | C.Tuple() | C.Array() | C.Struct() | C.Enum() | C.Never():
                 for t in children(ty):
                     self.fits(t, C.ANY, env)
-                    self.flat(t, "a pointee" if isinstance(ty, (C.Ptr, C.NonNull)) else "a component")
             case _:
                 self.fail("unknown type node")
         if self.sizes:
@@ -258,8 +236,6 @@ class Formation:
                 if i.ty is not None:
                     self.fits(i.ty, C.ANY, scope)
                     self.written((i.ty,), scope)
-                    if i.op == "alloca":
-                        self.flat(i.ty, "a pointee")
                 if i.op in {"call", "fn"} and i.args[0] in self.program.funs:
                     self.arguments(self.program.funs[i.args[0]].params, i.tys, scope)
                 elif i.op in {"call", "fn"} and (i.args[0] in self.program.externs or i.args[0].startswith("%")):

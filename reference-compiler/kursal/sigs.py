@@ -21,9 +21,9 @@ from . import core as C
 from . import syntax as S
 from .resolve import Decl, Resolver
 from .sexpr import KursError, Position, counted, located
-from .layout import check_type_expansion
+from .layout import check_type_expansion, check_written_type
 from .literals import valid_literal
-from .types import POINTER_TO_SUM, Surface, Types, equal, subst
+from .types import Surface, Types, equal, subst
 
 LIBRARY = {  # name: (home library, path there, path through std)
     "Option": ("core", ("option", "Option"), ("option", "Option")),
@@ -243,10 +243,10 @@ class Signatures:
             if args.ref == ("builtin", builtin):
                 if len(args.args) != 1:
                     fail(f"{builtin} takes 1 type argument, got {len(args.args)}", args.pos)
-                return C.Premise(builtin, tuple(self.component(a, scope, "a type argument") for a in args.args))
+                return C.Premise(builtin, tuple(self.type(a, scope) for a in args.args))
         ref = args.ref
         assert ref is not None and ref[0] == "decl"
-        actual = tuple(self.component(a, scope, "a type argument") for a in args.args)
+        actual = tuple(self.type(a, scope) for a in args.args)
         self.check_arguments(ref[1], actual, scope, args.pos)
         return C.Premise(self.name(ref[1]), actual)
 
@@ -274,7 +274,7 @@ class Signatures:
     def type(self, type_expr: S.Type, scope: Scope) -> C.Type:
         match type_expr:
             case S.TName(args=targs, pos=pos):
-                args = tuple(self.component(a, scope, "a type argument") for a in targs)
+                args = tuple(self.type(a, scope) for a in targs)
                 match type_expr.ref:
                     case ("param", name):
                         if args:
@@ -307,13 +307,13 @@ class Signatures:
                     fail(f"brand '{label} is not in scope")
                 return C.Skolem(label)
             case S.TPtr(inner=inner):
-                return C.Ptr(self.component(inner, scope, "a pointee"))
+                return C.Ptr(self.type(inner, scope))
             case S.TNever():
                 return C.Never()
             case S.TTuple(elems=elems):
-                return C.Tuple(tuple(self.component(e, scope, "a component") for e in elems))
+                return C.Tuple(tuple(self.type(e, scope) for e in elems))
             case S.TArray(elem=elem, length=length):
-                return C.Array(self.component(elem, scope, "a component"), self.array_length(length))
+                return C.Array(self.type(elem, scope), self.array_length(length))
             case S.TFn(params=params, ret=ret, unsafe=unsafe):
                 return C.Fn(tuple(self.type(p, scope) for _, p in params), self.type(ret, scope),
                             unsafe=unsafe, places=frozenset(i for i, (lend, _) in enumerate(params) if lend))
@@ -337,10 +337,10 @@ class Signatures:
                         fail("an exists type repeats a binder", type_expr.brand_pos[i])
                     if label in scope.brands or label == "static":
                         fail(f"exists binder '{label} shadows a brand in scope", type_expr.brand_pos[i])
-                return C.Exists(labels, self.component(body, scope.extend(C.Param(b, C.BRAND) for b in labels), "a package body"))
+                return C.Exists(labels, self.type(body, scope.extend(C.Param(b, C.BRAND) for b in labels)))
             case S.TForeach(binder=binder, indirect=indirect, source=source, body=body, pos=pos):
-                formed = C.Foreach(binder, indirect, self.component(source, scope, "a foreach source"),
-                                   self.component(body, scope.extend((C.Param(binder, C.ANY),)), "a foreach body"))
+                formed = C.Foreach(binder, indirect, self.type(source, scope),
+                                   self.type(body, scope.extend((C.Param(binder, C.ANY),))))
                 self.foreach_formation(formed, scope.kinds, pos)
                 return formed
         assert isinstance(type_expr, S.TIgnored)
@@ -348,25 +348,20 @@ class Signatures:
 
     def foreach_formation(self, ty: C.Foreach, kinds: dict[str, C.Kind], pos: Optional[Position]) -> None:
         """The foreach type `ty`, written at `pos`, has an expansion at every instantiation, as type
-        formation requires: its source is no pointer to a sum, and a `*F` pattern's source is written
-        with pointer components. Inside a type declaration it waits until every type is known."""
+        formation requires: a `*F` pattern's source whose shape is decided is written with pointer
+        components, and the walk of `ty` asks for an explicit pointer where a type parameter decides it.
+        Inside a type declaration it waits until every type is known."""
         if not self.types_ready:
             assert self.declaring is not None
             self.foreach_checks.append((ty, dict(kinds), self.declaring, pos))
             return
-        types = Types(C.Program(types=self.types))
-        if types.points_to_sum(ty.source, kinds):
-            fail(POINTER_TO_SUM, pos)
-        if not types.pattern_available(ty):
+        program = C.Program(types=self.types)
+        if ty.indirect and Types(program).rows_fixed(ty.source, True, kinds) and not Types(program).pattern_available(ty):
             fail(f"foreach *{ty.binder} needs a source written with pointer components", pos)
-
-    def component(self, type_expr: S.Type, scope: Scope, what: str) -> C.Type:
-        """A type written where a foreach type may not be: `what` names the place. A foreach
-        type is a whole value's type, or a function's parameter or result."""
-        ty = self.type(type_expr, scope)
-        if isinstance(ty, C.Foreach):
-            fail(f"{what} is a foreach type, which is only the type of a whole value, parameter or result")
-        return ty
+        try:
+            check_written_type(program, ty, set(kinds))
+        except KursError as error:
+            fail(error.message, pos)
 
     def array_length(self, expr: S.Expr) -> int:
         value = self.fold(expr, C.USIZE)
@@ -390,9 +385,9 @@ class Signatures:
         body: C.Type
         match node:
             case S.Struct(fields=fields):
-                body = C.Struct(tuple((n, self.component(t, scope, "a component")) for n, t in fields))
+                body = C.Struct(tuple((n, self.type(t, scope)) for n, t in fields))
             case S.TupleDecl(elems=elems):
-                body = C.Tuple(tuple(self.component(t, scope, "a component") for t in elems))
+                body = C.Tuple(tuple(self.type(t, scope) for t in elems))
             case S.EnumDecl():
                 if not node.variants:
                     fail(f"enum {node.name} has no variant; an enum has at least one", node.pos)
@@ -429,8 +424,8 @@ class Signatures:
         if not types:
             return C.UNIT
         if len(types) == 1:
-            return self.component(types[0], scope, "a component")
-        return C.Tuple(tuple(self.component(t, scope, "a component") for t in types))
+            return self.type(types[0], scope)
+        return C.Tuple(tuple(self.type(t, scope) for t in types))
 
     def scope_module(self, decl: Decl, path: S.NamePath) -> C.ModuleId:
         target = self.r.lookup(decl.module, path)
@@ -506,7 +501,7 @@ class Signatures:
         ref = head.ref
         assert ref is not None and ref[0] == "decl"
         trait = ref[1]
-        arguments = tuple(self.component(a, scope, "a type argument") for a in head.args)
+        arguments = tuple(self.type(a, scope) for a in head.args)
         self.check_arguments(trait, arguments, scope, head.pos)
         methods = tuple(self.signature(m, params, premises, scope, name=m.name) for m in item.methods)
         for m in methods:

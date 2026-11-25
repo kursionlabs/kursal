@@ -25,21 +25,23 @@ class ComponentTests(unittest.TestCase):
         mapped = C.Foreach("F", True, C.Ptr(C.Tuple((C.Ptr(C.U32),))), C.Named("F"))
         self.assertEqual(self.types.expand(mapped), C.Tuple((C.Ptr(C.U32),)))
 
-    def test_a_sum_has_rows_by_value_only(self):
+    def test_a_sum_has_rows_by_value_and_through_the_pointer_pattern(self):
         opt = C.Enum((("none", C.Tuple(())), ("some", C.Prim("u8"))))
         self.assertEqual(self.types.expand(C.Foreach("F", False, opt, C.Ptr(C.Named("F")))),
                          C.Enum((("none", C.Ptr(C.Tuple(()))), ("some", C.Ptr(C.Prim("u8"))))))
-        # A pointer to a sum has no rows, with either pattern: formation rejects one
-        # written, and `Exposed` of a pointer source, which a traversal and `sizeof` need where a
-        # parameter is in the pointee, never holds of one, so none is reached at an instantiation.
-        for indirect in (True, False):
-            with self.subTest(indirect=indirect):
-                self.assertEqual(self.types.rows(C.Ptr(opt))[1], [])
-                self.assertEqual(self.types.expand(C.Foreach("F", indirect, C.Ptr(opt), C.Named("F"))), C.Tuple(()))
+        # Under `*F` a pointer to a sum has the rows of the sum, a pointer to each payload, which the
+        # pattern takes off: its expansion has the payloads. Under the value pattern the pointer is a leaf,
+        # one row of the pointer itself. No traversal has one as its source, as `Exposed` of it never
+        # holds.
+        pointers = C.Enum((("none", C.Ptr(C.Tuple(()))), ("some", C.Ptr(C.Prim("u8")))))
+        self.assertEqual(self.types.rows(C.Ptr(opt), True), (opt, list(pointers.variants)))
+        self.assertEqual(self.types.expand(C.Foreach("F", True, C.Ptr(opt), C.Named("F"))), opt)
+        self.assertEqual(self.types.rows(C.Ptr(opt), False), (None, [("0", C.Ptr(opt))]))
+        self.assertEqual(self.types.expand(C.Foreach("F", False, C.Ptr(opt), C.Named("F"))), C.Tuple((C.Ptr(opt),)))
 
     def test_empty_array_has_schema_but_no_runtime_components(self):
         mapped = C.Foreach("F", True, C.Ptr(C.Array(C.U32, 0)), C.Tuple((C.Named("F"),)))
-        self.assertEqual(self.types.rows(mapped.source)[1], [])
+        self.assertEqual(self.types.rows(mapped.source, mapped.indirect)[1], [])
         self.assertEqual(self.types.expand(mapped), C.Array(C.Tuple((C.U32,)), 0))
 
     def test_pointer_pattern_needs_more_than_an_unknown_exposed_shape(self):
@@ -112,7 +114,7 @@ class MapFormTests(unittest.TestCase):
                 (ret %out)))"""))
 
     def test_no_map_has_a_pointer_to_a_sum_as_its_source(self):
-        with self.assertRaisesRegex(KursError, "a foreach source cannot be a pointer to a sum"):
+        with self.assertRaisesRegex(KursError, "foreach_source_not_exposed"):
             check_program(parse_program(MAPPERS + """
                 (fun f (foreach ((ptr F) (ptr Opt)) (tuple (ptr F))) ((foreach ((ptr F) (ptr Opt)) (ptr F)))
                   (entry ((%v (foreach ((ptr F) (ptr Opt)) (ptr F))))

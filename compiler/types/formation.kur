@@ -13,31 +13,10 @@ use package::kurs::core::{Block, Edge, Fun, Kind, ModuleId, Param, Premise, Prog
 use package::kurs::core as C;
 use package::resolve::resolver::Resolver;
 use package::syntax::ast::{Pos, no_pos};
-use package::types::ops::{POINTER_TO_SUM, Fresh, Types, children, equal, free_brands, free_names, kind_name, kurs_error, show, subst, walk, walk_into};
+use package::types::layout::check_written_type;
+use package::types::ops::{Fresh, Types, children, equal, free_brands, free_names, kind_name, kurs_error, show, strict_subterm, subst, walk, walk_into, with_names};
 use std::option::Option;
 use std::slice::Slice;
-
-// Children admissible for descent; a path cannot cross a binder.
-forall 'k.
-fn formation_children(&cx: Domain!['k], ty: Type['k]) -> ArenaVec[Type['k], 'k] {
-    match ty {
-        Exists(_binders, _body) => ArenaVec::new(&cx),
-        Foreach(f) => ArenaVec::one(&cx, f.source.copy(&cx)),
-        _ => children(&cx, ty),
-    }
-}
-
-forall 'k.
-fn strict_subterm(&cx: Domain!['k], child: Type['k], parent: Type['k]) -> bool {
-    let parts = formation_children(&cx, parent);
-    var found = false;
-    var i = 0usize;
-    while !found && i < parts.len(&cx) {
-        found = equal(&cx, child, parts.at(&cx, i)) || strict_subterm(&cx, child, parts.at(&cx, i));
-        i = i + 1usize;
-    }
-    found
-}
 
 // Componentwise subterms, with at least one strict component.
 forall 'k.
@@ -241,9 +220,6 @@ impl Formation[D, 'k] {
             let param = params.at(&cx, i);
             let arg = args.at(&cx, i);
             self.fits(&cx, arg, param.kind, env);
-            if !is_brand(param.kind) {
-                self.flat(&cx, arg, "a type argument");
-            }
             i = i + 1usize;
         }
     }
@@ -319,17 +295,14 @@ impl Formation[D, 'k] {
                 self.opened.append(&cx, binders);
                 self.fits(&cx, body.copy(&cx), Kind::Any, inner);
                 self.opened.truncate(&cx, mark);
-                self.flat(&cx, body.copy(&cx), "a package body");
             },
             Foreach(f) => {
                 self.fits(&cx, f.source.copy(&cx), Kind::Any, env);
-                self.flat(&cx, f.source.copy(&cx), "a foreach source");
-                if self.types.points_to_sum(&cx, f.source.copy(&cx), env) {
-                    self.fail_static(&cx, POINTER_TO_SUM);
-                }
                 // The type has an expansion only if every component is a pointer for `*F` to match,
-                // and it must have one at every instantiation: the source shows its pointers as written.
-                if f.indirect && !self.types.pattern_available(&cx, f) {
+                // and it must have one at every instantiation: a source whose shape is decided shows
+                // its pointers as written. Where a type parameter decides it, the walk asks for an
+                // explicit pointer.
+                if f.indirect && self.types.rows_fixed(&cx, f.source.copy(&cx), true, env) && !self.types.pattern_available(&cx, f) {
                     self.fail(&cx, Buffer!::new().push_static("foreach *").push_bytes(&cx, f.binder).push_static(" needs a source written with pointer components").save(&cx));
                 }
                 let names = ArenaVec::one(&cx, f.binder);
@@ -337,7 +310,10 @@ impl Formation[D, 'k] {
                 self.opened.append(&cx, names);
                 self.fits(&cx, f.body.copy(&cx), Kind::Any, self.extend(&cx, env, params_of(&cx, names, Kind::Any)));
                 self.opened.truncate(&cx, mark);
-                self.flat(&cx, f.body.copy(&cx), "a foreach body");
+                match check_written_type(&cx, self.program, self.types.counter, ty, with_names(&cx, ArenaSet::new(&cx), env.keys(&cx))) {
+                    Ok(_u) => (),
+                    Err(message) => self.fail(&cx, message),
+                }
             },
             Fn(f) => {
                 var j = 0usize;
@@ -367,11 +343,11 @@ impl Formation[D, 'k] {
                 }
                 self.components(&cx, ty, variants, env);
             },
-            Ptr(_inner) => self.children_fit(&cx, ty, env, "a pointee"),
-            NonNull(_inner) => self.children_fit(&cx, ty, env, "a pointee"),
-            Tuple(_elems) => self.children_fit(&cx, ty, env, "a component"),
-            Array(_elem, _length) => self.children_fit(&cx, ty, env, "a component"),
-            Never => self.children_fit(&cx, ty, env, "a component"),
+            Ptr(_inner) => self.children_fit(&cx, ty, env),
+            NonNull(_inner) => self.children_fit(&cx, ty, env),
+            Tuple(_elems) => self.children_fit(&cx, ty, env),
+            Array(_elem, _length) => self.children_fit(&cx, ty, env),
+            Never => self.children_fit(&cx, ty, env),
             _ => self.fail_static(&cx, "unknown type node"),
         }
         if self.sizes.copy(&cx) {
@@ -399,26 +375,16 @@ impl Formation[D, 'k] {
         if names.len(&cx) != members.len(&cx) {
             self.fail_static(&cx, "duplicate component name");
         }
-        self.children_fit(&cx, ty, env, "a component");
+        self.children_fit(&cx, ty, env);
     }
 
-    // Each child of `ty` fits as a value type and, being `what`, does not expand to a foreach type.
-    fn children_fit(self, &cx: Domain!['k], ty: Type['k], env: ArenaMap[Span['k], Kind, 'k], what: Slice[u8, 'static]) {
+    // Each child of `ty` fits as a value type.
+    fn children_fit(self, &cx: Domain!['k], ty: Type['k], env: ArenaMap[Span['k], Kind, 'k]) {
         let parts = children(&cx, ty);
         var i = 0usize;
         while i < parts.len(&cx) {
             self.fits(&cx, parts.at(&cx, i), Kind::Any, env);
-            self.flat(&cx, parts.at(&cx, i), what);
             i = i + 1usize;
-        }
-    }
-
-    // A type that expands to a foreach is a whole value's type, a function's parameter or
-    // result, or a declaration's body, never a component, a pointee, a package body, a foreach
-    // source or body, or a type argument (premises' included).
-    fn flat(self, &cx: Domain!['k], ty: Type['k], what: Slice[u8, 'static]) {
-        if self.types.expands_to_foreach(&cx, ty) {
-            self.fail(&cx, Buffer!::new().push_static(what).push_static(" expands to a foreach type").save(&cx));
         }
     }
 
@@ -618,9 +584,6 @@ impl Formation[D, 'k] {
                 Some(t) => {
                     self.fits(&cx, t, Kind::Any, scope);
                     self.written(&cx, ArenaVec::one(&cx, t), scope);
-                    if instr.op.is(&cx, "alloca") {
-                        self.flat(&cx, t, "a pointee");
-                    }
                 },
                 None => (),
             };

@@ -1,0 +1,125 @@
+// A `foreach` type stands in every type position: a field, a tuple's or an
+// enum's component, an array's element, a pointee, a package's body, a type
+// argument, and the source or body of another `foreach`. A `foreach` whose
+// source a type parameter decides is a type of its own, equal only to a
+// `foreach` with equal parts, and has its components where the parameter is
+// known.
+use std::io::{Error, stdout};
+use std::fmt::Writable;
+use std::option::{Option, Result};
+use std::mem::{alloca, sizeof};
+use std::cap::{Brand, fresh};
+use std::owned::Owned!;
+
+exposed struct Pair {
+    a: u32,
+    b: u32,
+}
+
+// A `foreach` whose source or body is one: the inner one is expanded first.
+// `Pair` mapped to pairs is `{ a: (u32, u32), b: (u32, u32) }`, so `pairs` is
+// `{ a: ((u32, u32), u8), b: ((u32, u32), u8) }`, 24 bytes, and `inner` is
+// `{ a: (u32, u32), b: (u32, u32) }`, 16. `sizeof` of a `foreach` type itself
+// needs its source exposed, which a `foreach` type never is; a struct that
+// holds one has a size like any other.
+struct Nested {
+    pairs: foreach F of (foreach G of Pair => (G, G)) => (F, u8),
+    inner: foreach F of Pair => foreach G of (u8, u8) => F,
+}
+
+// Through a pointer to a sum, `*F` takes each payload: `payloads` is
+// `enum { None(((), ())), Some((u64, u64)) }`, 24 bytes. Under the value
+// pattern a pointer is one component, whatever it points to: `pointer` is
+// `(*Option[u64],)`, 8 bytes. No traversal makes either, as a pointer to a
+// sum is never exposed.
+struct Views {
+    payloads: foreach *F of *Option[u64] => (F, F),
+    pointer: foreach F of *Option[u64] => F,
+}
+
+// Each field paired with a weight.
+fn weighed(p: Pair, w: u8) -> foreach F of Pair => (F, u8) {
+    foreach f of p { (f, w) }
+}
+
+fn total(t: foreach F of Pair => (F, u8)) -> u32 {
+    let { a, b } = t;
+    let (x, wx) = a;
+    let (y, wy) = b;
+    x * (wx as u32) + y * (wy as u32)
+}
+
+// A field over a type parameter. Its components are those of `T`, which may
+// be linear, so the declaration is: its name has the `!`.
+forall T.
+exposed struct Weighed! {
+    parts: foreach F of T => (F, u8),
+    count: u32,
+}
+
+forall T where Exposed[T].
+fn weigh(x: T, w: u8) -> Weighed![T] {
+    Weighed!.{ parts: foreach f of x { (f, w) }, count: 1 }
+}
+
+// Takes the weights off again: the map of a value of the field's type.
+forall T where Exposed[T].
+fn unweigh(v: Weighed![T]) -> (foreach F of T => F, u32) {
+    let { parts, count } = v;
+    let bare = foreach p of parts {
+        let (f, _) = p;
+        f
+    };
+    (bare, count)
+}
+
+// A tuple, an enum and an array of them, and one as a type argument.
+fn components() -> u32 {
+    let both = (weighed(Pair.{ a: 1, b: 2 }, 1), weighed(Pair.{ a: 3, b: 4 }, 2));
+    let (first, second) = both;
+    let some: Option[foreach F of Pair => (F, u8)] = Option::Some.(first);
+    let rows: [foreach F of Pair => (F, u8); 2] = [second, weighed(Pair.{ a: 5, b: 6 }, 1)];
+    let [r0, r1] = rows;
+    let from_option = match some {
+        Some(t) => total(t),
+        None => 0,
+    };
+    from_option + total(r0) + total(r1)
+}
+
+// Stored and read back through a pointer, and packed with a brand.
+fn behind() -> u32 {
+    let slot = unsafe alloca[foreach F of Pair => (F, u8)]();
+    unsafe slot.store(weighed(Pair.{ a: 6, b: 7 }, 1));
+    let loaded = total(unsafe slot.load());
+    let exists 'k. w = fresh();
+    let packed: exists 'q. (Brand['q], foreach F of Pair => (F, u8)) = pack 'k. (w, weighed(Pair.{ a: 2, b: 5 }, 1));
+    let exists 'j. (_, t) = packed;
+    loaded + total(t)
+}
+
+fn main() -> Result[(), Error] {
+    var out = stdout();
+    out = f"weighed: {total(weighed(Pair.{ a: 3, b: 4 }, 2))}\n".write(out);
+    out = f"in a tuple, an enum and an array: {components()}\n".write(out);
+    out = f"behind a pointer and in a package: {behind()}\n".write(out);
+
+    // Over a type parameter, weighed and unweighed again.
+    let w = weigh((5u8, 6u16), 3);
+    let (bare, count) = unweigh(w);
+    let (x, y) = bare;
+    out = f"through a generic field: {x} {y}, {count} value\n".write(out);
+
+    out = f"nested: {sizeof[Nested]()} bytes\n".write(out);
+    out = f"through a pointer to a sum: {sizeof[Views]()} bytes\n".write(out);
+
+    // A region splits into its receipt and one part per field, in one step,
+    // and the receipt takes the parts back.
+    var exists 'r. (alloc, region) = Owned!::new(Pair.{ a: 10, b: 20 }).open();
+    let (restore, parts) = region.split();
+    var region = restore.merge(parts);
+    let old = &region.replace(Pair.{ a: 1, b: 2 });
+    let back = alloc.close(region).into_value();
+    out = f"split and merged: {old.a + old.b}, then {back.a + back.b}\n".write(out);
+    out.finish()
+}

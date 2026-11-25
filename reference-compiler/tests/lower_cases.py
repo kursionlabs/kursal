@@ -105,10 +105,20 @@ LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
      "a raw read, write or alloca at T needs Sized[T]"),
     ("fn take(&x: ()) -> u32 { 0u32 }\nfn f(p: *()) -> u32 { take(unsafe &*p) }\n",
      "a raw read, write or alloca at a zero-size type"),
-    # The source writes no `sizeof` of a foreach type, which is no type argument (the core's `sizeof`
-    # of one over a pointer to a parameter needs `Exposed` of the source, test_core_soundness).
+    # `sizeof` of a foreach type over a pointer to a parameter needs `Exposed` of the source, as the
+    # core's does (test_core_soundness).
     ("forall T.\nfn f() -> usize { core::mem::sizeof[foreach *F of *T => (F,)]() }\n",
-     "a type argument is a foreach type"),
+     "the shape of *T is not visible here"),
+    # `sizeof` of a foreach type needs `Exposed` of its source, whatever that is: a parameter, a type whose
+    # shape is restricted to another module, a foreach type, a pointer to a sum.
+    ("forall T.\nfn f() -> usize { core::mem::sizeof[foreach F of T => u8]() }\n",
+     "2:19: the shape of T is not visible here: write `where Exposed[T]`"),
+    ("fn f() -> usize { std::mem::sizeof[foreach F of std::io::File! => u8]() }\n",
+     "1:19: the shape of File! is not visible here"),
+    ("fn f() -> usize { core::mem::sizeof[foreach F of (foreach G of (u8,) => G) => u8]() }\n",
+     "1:19: a foreach source cannot be a foreach type"),
+    ("exposed enum E { A, B(u8) }\nfn f() -> usize { core::mem::sizeof[foreach *F of *E => F]() }\n",
+     "2:19: a foreach source cannot be a pointer to a sum"),
     ("use std::arena::{Domain!, ref_in};\nfn main() -> i32 {\n"
      "    var exists 'a. cx = Domain!::new(std::process::hash_seed());\n    let r = ref_in(&cx, ());\n"
      "    cx.destroy();\n    0\n}\n", "Sized requires an exact premise"),

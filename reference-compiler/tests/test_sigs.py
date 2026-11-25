@@ -48,19 +48,19 @@ class TypeDeclTests(unittest.TestCase):
         with self.assertRaisesRegex(SigError, "2:11: _ stands for a type argument only in an expression"):
             sigs_of("forall T. struct S { x: T }\nfn f(s: S[_]) -> u32 { 0u32 }\n")
 
-    def test_a_foreach_type_is_no_component(self):
-        # A foreach type is the type of a whole value, parameter or result.
-        for source, what in (
-            ("struct F { f: foreach F of (u32, u8) => *F }\n", "a component"),
-            ("tuple P(foreach X of (u32,) => X, u8);\n", "a component"),
-            ("enum E { A(foreach X of (u32,) => X) }\n", "a component"),
-            ("fn f(p: *foreach X of (u32,) => X) {}\n", "a pointee"),
-            ("forall T. struct B { b: *T }\nfn f(b: B[foreach X of (u32,) => X]) {}\n", "a type argument"),
-            ("fn f(x: foreach X of (foreach Y of (u32,) => Y) => X) {}\n", "a foreach source"),
-            ("fn f(x: foreach X of (u32,) => foreach Y of (X,) => Y) {}\n", "a foreach body"),
-            ("forall T where Exposed[foreach X of T => X]. fn f(x: T) {}\n", "a type argument"),
+    def test_a_foreach_type_stands_in_every_type_position(self):
+        for source in (
+            "struct F { f: foreach F of (u32, u8) => *F }\n",
+            "tuple P(foreach X of (u32,) => X, u8);\n",
+            "enum E { A(foreach X of (u32,) => X) }\n",
+            "fn f(p: *foreach X of (u32,) => X) {}\n",
+            "forall T. struct B { b: *T }\nfn f(b: B[foreach X of (u32,) => X]) {}\n",
+            "fn f(x: foreach X of (foreach Y of (u32,) => Y) => X) {}\n",
+            "fn f(x: foreach X of (u32,) => foreach Y of (X,) => Y) {}\n",
+            "forall T where Exposed[foreach X of T => X]. fn f(x: T) {}\n",
+            "fn f(x: [foreach X of (u32,) => X; 2]) {}\n",
         ):
-            with self.subTest(source=source), self.assertRaisesRegex(SigError, f"{what} is a foreach type"):
+            with self.subTest(source=source):
                 sigs_of(source)
 
     def test_struct_enum_tuple(self):

@@ -83,8 +83,11 @@ fn product(&cx: Domain!['k], parts: ArenaVec[Option[(u64, u64)], 'k]) -> Option[
     }
 }
 
-// A pointer source points to a product, an array or a leaf; a pointer to a sum is opaque.
+// A traversal through a pointer reaches a product, an array or a leaf: a pointer to a sum is never
+// `Exposed`, as the components there are those of the variant held. Nor is a foreach type: a map
+// takes the components of a value of one, over a source that is none.
 const POINTER_TO_SUM: Slice[u8, 'static] = "a foreach source cannot be a pointer to a sum";
+const FOREACH_OF_FOREACH: Slice[u8, 'static] = "a foreach source cannot be a foreach type";
 
 // Stops the compiler with a KursError's text: `line:col: message` when `pos` is a position, the
 // message alone when it is none (line 0).
@@ -624,6 +627,28 @@ fn children(&cx: Domain!['k], ty: Type['k]) -> ArenaVec[Type['k], 'k] {
     }
 }
 
+// Children admissible for descent; a path cannot cross a binder.
+forall 'k.
+fn formation_children(&cx: Domain!['k], ty: Type['k]) -> ArenaVec[Type['k], 'k] {
+    match ty {
+        Exists(_binders, _body) => ArenaVec::new(&cx),
+        Foreach(f) => ArenaVec::one(&cx, f.source.copy(&cx)),
+        _ => children(&cx, ty),
+    }
+}
+
+forall 'k.
+fn strict_subterm(&cx: Domain!['k], child: Type['k], parent: Type['k]) -> bool {
+    let parts = formation_children(&cx, parent);
+    var found = false;
+    var i = 0usize;
+    while !found && i < parts.len(&cx) {
+        found = equal(&cx, child, parts.at(&cx, i)) || strict_subterm(&cx, child, parts.at(&cx, i));
+        i = i + 1usize;
+    }
+    found
+}
+
 forall 'k.
 fn member_types(&cx: Domain!['k], members: ArenaVec[Member['k], 'k]) -> ArenaVec[Type['k], 'k] {
     let out: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
@@ -1041,13 +1066,27 @@ impl Types['k] {
         }
     }
 
-    // `ty` mentions no type parameter or binder: every name it has is a declaration's. Brands do not
-    // change a layout.
-    // The pointer sources that mention a type parameter of the foreach types in `ty`, declarations
-    // that mention one unfolded, each once: `sizeof` of `ty` needs `Exposed`
-    // of each, as a traversal does, so none points to a sum at an instantiation.
-    fn pointer_sources(self, &cx: Domain!['k], ty: Type['k]) -> ArenaVec[Type['k], 'k] {
+    // The foreach sources `sizeof` of `ty` needs `Exposed` of, as a traversal does: the source of the
+    // foreach `ty` is, declarations unfolded whether exposed or not, whatever that source is; and
+    // each pointer source that mentions a type parameter of the foreach types in `ty`, declarations
+    // that mention one unfolded, once, under either pattern.
+    fn size_sources(self, &cx: Domain!['k], ty: Type['k]) -> ArenaVec[Type['k], 'k] {
         let out: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
+        var head = ty;
+        var more = true;
+        while more {
+            more = match head {
+                Named(name, _args) => self.program.types.contains(&cx, name),
+                _ => false,
+            };
+            if more {
+                head = self.unfold(&cx, head, Option::None);
+            }
+        }
+        match head {
+            Foreach(f) => out.push(&cx, f.source.copy(&cx)),
+            _ => (),
+        }
         self.pointer_sources_in(&cx, ty, out, ArenaVec::new(&cx));
         out
     }
@@ -1082,6 +1121,8 @@ impl Types['k] {
         }
     }
 
+    // `ty` mentions no type parameter or binder: every name it has is a declaration's. Brands do not
+    // change a layout.
     fn closed(self, &cx: Domain!['k], ty: Type['k]) -> bool {
         let brands = free_brands(&cx, ty);
         let names = free_names(&cx, ty).keys(&cx);
@@ -1409,8 +1450,8 @@ impl Types['k] {
     }
 
     // A foreach source that is a pointer to a sum, named types unfolded whether exposed or not: no
-    // traversal has one, as a pointer source points to a product, an array or a leaf. A parameter
-    // decides nothing here; an instantiation at a sum has no rows.
+    // traversal has one (`POINTER_TO_SUM`). A parameter decides nothing here; an instantiation at a
+    // sum is not `Exposed`.
     fn points_to_sum(self, &cx: Domain!['k], source: Type['k], kinds: ArenaMap[Span['k], Kind, 'k]) -> bool {
         match self.fixed_shape(&cx, source, kinds) {
             Some(shape) => match shape {
@@ -1427,7 +1468,8 @@ impl Types['k] {
         }
     }
 
-    // Reveal only the outer shape, without treating abstract types as leaves.
+    // Reveal only the outer shape, without treating abstract types as leaves. A foreach type has
+    // none: no traversal has one as its source (`FOREACH_OF_FOREACH`).
     fn visible_shape(self, &cx: Domain!['k], ty: Type['k], home: Option[ModuleId['k]], kinds: ArenaMap[Span['k], Kind, 'k]) -> Option[Type['k]] {
         var ty = ty;
         while true {
@@ -1442,11 +1484,8 @@ impl Types['k] {
                     }
                     ty = self.unfold(&cx, ty, home);
                 },
-                Foreach(f) => {
-                    if !self.concrete_exposure(&cx, f.source.copy(&cx), home, kinds) {
-                        return Option::None;
-                    }
-                    ty = self.expand(&cx, f, home);
+                Foreach(_f) => {
+                    return Option::None;
                 },
                 _ => {
                     return Option::Some.(ty);
@@ -1507,7 +1546,7 @@ impl Types['k] {
             Foreach(f) => {
                 // A source whose rows are fixed expands; otherwise every row is the body only when
                 // the body does not mention a binder.
-                if self.rows_fixed(&cx, f.source.copy(&cx), kinds) {
+                if self.rows_fixed(&cx, f.source.copy(&cx), f.indirect, kinds) {
                     // Like a nominal query, an active one cannot justify itself: a foreach whose
                     // expansion holds it again by value has no finite layout, which
                     // `check_type_expansion` rejects.
@@ -1539,15 +1578,16 @@ impl Types['k] {
         }
     }
 
-    // Whether a foreach source's rows are the same whatever the type parameters in `kinds`, and any
-    // name no declaration gives, stand for: its outer shape, and a pointer's pointee's, is reached
-    // without meeting one. A parameter's shape is unknown, and even a Copy argument may have a
-    // linear component, in an array of length zero.
-    fn rows_fixed(self, &cx: Domain!['k], source: Type['k], kinds: ArenaMap[Span['k], Kind, 'k]) -> bool {
+    // Whether a foreach source's rows under the pattern `indirect` are the same whatever the type
+    // parameters in `kinds`, and any name no declaration gives, stand for: its outer shape, and with
+    // `*F` a pointer's pointee's, is reached without meeting one. A parameter's shape is unknown, and
+    // even a Copy argument may have a linear component, in an array of length zero. Under the value
+    // pattern a pointer source is a leaf, whatever its pointee.
+    fn rows_fixed(self, &cx: Domain!['k], source: Type['k], indirect: bool, kinds: ArenaMap[Span['k], Kind, 'k]) -> bool {
         match self.fixed_shape(&cx, source, kinds) {
             None => false,
             Some(shape) => match shape {
-                Ptr(inner) => self.fixed_shape(&cx, inner.copy(&cx), kinds).is_some(),
+                Ptr(inner) => !indirect || self.fixed_shape(&cx, inner.copy(&cx), kinds).is_some(),
                 _ => true,
             },
         }
@@ -1565,7 +1605,7 @@ impl Types['k] {
                     ty = self.unfold(&cx, ty, Option::None);
                 },
                 Foreach(f) => {
-                    if !self.rows_fixed(&cx, f.source.copy(&cx), kinds) {
+                    if !self.rows_fixed(&cx, f.source.copy(&cx), f.indirect, kinds) {
                         return Option::None;
                     }
                     ty = self.expand(&cx, f, Option::None);
@@ -1603,25 +1643,24 @@ impl Types['k] {
         }
     }
 
-    // One-level traversal of a foreach source: its outer skeleton (a structural type, or none for
-    // a leaf) and one (label, item type) row per component, in order. With
-    // `schema`, an array contributes one element type even when its runtime length is zero.
-    fn rows(self, &cx: Domain!['k], source: Type['k], home: Option[ModuleId['k]], schema: bool) -> Rows['k] {
+    // One-level traversal of a foreach source under the pattern `indirect` (`*F`) or not: its outer
+    // skeleton (a structural type, or none for a leaf) and one (label, item type) row per component,
+    // in order. With `schema`, an array contributes one element type even when its runtime length is
+    // zero.
+    //
+    // Under the value pattern a pointer source, written or reached through a name, is a leaf: its one
+    // row is the source itself, and the pointee is not looked at. Under `*F` each component behind it
+    // is a pointer to it: of a sum, a pointer to each payload. No traversal has a pointer to a sum as
+    // its source, which is never `Exposed`.
+    fn rows(self, &cx: Domain!['k], source: Type['k], indirect: bool, home: Option[ModuleId['k]], schema: bool) -> Rows['k] {
         var s = self.shape(&cx, source, home);
         var pointer = false;
         let unit = match s {
-            // Behind a pointer each component is a pointer to it; a sum has none, so no rows.
-            // Formation rejects a written one, and a traversal or `sizeof` with a
-            // parameter in the pointee needs `Exposed` of the source, which no sum has.
             Ptr(inner) => {
-                s = self.shape(&cx, inner.copy(&cx), home);
-                pointer = true;
-                match s {
-                    Enum(_v) => {
-                        return Rows.{ skeleton: Option::Some.(Type::Tuple.(ArenaVec::new(&cx))), rows: ArenaVec::new(&cx) };
-                    },
-                    _ => (),
-                };
+                if indirect {
+                    s = self.shape(&cx, inner.copy(&cx), home);
+                    pointer = true;
+                }
             },
             _ => (),
         };
@@ -1715,7 +1754,7 @@ impl Types['k] {
 
     // The structural type a foreach transform denotes.
     fn expand(self, &cx: Domain!['k], ty: ForeachType['k], home: Option[ModuleId['k]]) -> Type['k] {
-        let found = self.rows(&cx, ty.source.copy(&cx), home, true);
+        let found = self.rows(&cx, ty.source.copy(&cx), ty.indirect, home, true);
         let mapped: ArenaVec[Member['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < found.rows.len(&cx) {
@@ -1731,60 +1770,6 @@ impl Types['k] {
                 _ => Type::Tuple.(member_types(&cx, mapped)),
             },
             None => Type::Tuple.(member_types(&cx, mapped)),
-        }
-    }
-
-    // `ty`'s head, unfolding declarations, is a foreach type. A declaration whose body's
-    // head is one of its parameters takes the head of that argument; a cycle of heads is no foreach,
-    // and a type parameter never is one. Components are not looked at.
-    fn expands_to_foreach(self, &cx: Domain!['k], ty: Type['k]) -> bool {
-        let seen: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
-        var head = ty;
-        var more = true;
-        while more {
-            more = false;
-            let unit = match head {
-                Named(name, args) => match self.program.types.get(&cx, name) {
-                    Some(decl) => {
-                        var known = false;
-                        var i = 0usize;
-                        while !known && i < seen.len(&cx) {
-                            known = equal(&cx, head, seen.at(&cx, i));
-                            i = i + 1usize;
-                        }
-                        if !known {
-                            seen.push(&cx, head);
-                            let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
-                            var p = 0usize;
-                            while p < decl.params.len(&cx) && p < args.len(&cx) {
-                                sub.insert(&cx, decl.params.at(&cx, p).name, args.at(&cx, p));
-                                p = p + 1usize;
-                            }
-                            head = match decl.body {
-                                Named(body_name, body_args) => if body_args.is_empty(&cx) && sub.contains(&cx, body_name) {
-                                    sub.at(&cx, body_name)
-                                } else {
-                                    let applied: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
-                                    var a = 0usize;
-                                    while a < body_args.len(&cx) {
-                                        applied.push(&cx, subst(&cx, body_args.at(&cx, a), sub, self.counter));
-                                        a = a + 1usize;
-                                    }
-                                    Type::Named.(body_name, applied)
-                                },
-                                _ => decl.body,
-                            };
-                            more = true;
-                        }
-                    },
-                    None => (),
-                },
-                _ => (),
-            };
-        }
-        match head {
-            Foreach(_f) => true,
-            _ => false,
         }
     }
 }

@@ -24,8 +24,11 @@ SIZE_LIMIT = 1 << (8 * WORD)
 PRIM_SIZES = {**{name: bits // 8 for name, bits in WIDTHS.items()}, "usize": WORD, "isize": WORD,
               "f32": 4, "f64": 8, "bool": 1}
 
-# A pointer source points to a product, an array or a leaf; a pointer to a sum is opaque.
+# A traversal through a pointer reaches a product, an array or a leaf: a pointer to a sum is never
+# `Exposed`, as the components there are those of the variant held. Nor is a foreach type: a map takes
+# the components of a value of one, over a source that is none.
 POINTER_TO_SUM = "a foreach source cannot be a pointer to a sum"
+FOREACH_OF_FOREACH = "a foreach source cannot be a foreach type"
 
 _fresh = count()
 
@@ -207,6 +210,20 @@ def children(ty: Type) -> tuple[Type, ...]:
     return ()
 
 
+def formation_children(ty: Type) -> tuple[Type, ...]:
+    """Children admissible for descent; a path cannot cross a binder."""
+    if isinstance(ty, Exists):
+        return ()
+    if isinstance(ty, Foreach):
+        return (ty.source,)
+    return children(ty)
+
+
+def strict_subterm(child: Type, parent: Type) -> bool:
+    return any(equal(child, part) or strict_subterm(child, part)
+               for part in formation_children(parent))
+
+
 def extractable_names(ty: Type) -> set[str]:
     """Free names reachable by matching without crossing a type binder."""
     match ty:
@@ -316,11 +333,15 @@ class Types:
                 return self.zero_size(body, parameters)
         return False
 
-    def pointer_sources(self, ty: Type) -> list[Type]:
-        """The pointer sources that mention a type parameter of the foreach types in `ty`, declarations that
-        mention one unfolded, each once: `sizeof` of `ty` needs `Exposed` of each,
-        as a traversal does, so none points to a sum at an instantiation."""
-        sources: list[Type] = []
+    def size_sources(self, ty: Type) -> list[Type]:
+        """The foreach sources `sizeof` of `ty` needs `Exposed` of, as a traversal does: the source of the
+        foreach `ty` is, declarations unfolded whether exposed or not, whatever that source is; and each
+        pointer source that mentions a type parameter of the foreach types in `ty`, declarations that
+        mention one unfolded, once, under either pattern."""
+        head = ty
+        while isinstance(head, Named) and head.name in self.program.types:
+            head = self.unfold(head)
+        sources: list[Type] = [head.source] if isinstance(head, Foreach) else []
         seen: list[Type] = []
 
         def visit(t: Type) -> None:
@@ -505,27 +526,22 @@ class Types:
 
     def points_to_sum(self, source: Type, kinds: Kinds) -> bool:
         """A foreach source that is a pointer to a sum, named types unfolded whether exposed or not: no
-        traversal has one, as a pointer source points to a product, an array or a leaf. A parameter
-        decides nothing here; an instantiation at a sum has no rows."""
+        traversal has one (`POINTER_TO_SUM`). A parameter decides nothing here; an instantiation at a sum
+        is not `Exposed`."""
         shape = self.fixed_shape(source, kinds)
         return isinstance(shape, Ptr) and isinstance(self.fixed_shape(shape.inner, kinds), Enum)
 
     def visible_shape(self, ty: Type, module: Optional[ModuleId], kinds: Kinds) -> Optional[Type]:
-        """Reveal only the outer shape, without treating abstract types as leaves."""
-        while True:
-            if isinstance(ty, Named):
-                if ty.name in kinds:
-                    return None
-                decl = self.decl(ty.name)
-                if decl.exposure is not None and (module is None or not self.exposed(decl, module)):
-                    return None
-                ty = self.unfold(ty, module)
-            elif isinstance(ty, Foreach):
-                if not self.concrete_exposure(ty.source, module, kinds):
-                    return None
-                ty = self.expand(ty, module)
-            else:
-                return ty
+        """Reveal only the outer shape, without treating abstract types as leaves. A foreach type has
+        none: no traversal has one as its source (`FOREACH_OF_FOREACH`)."""
+        while isinstance(ty, Named):
+            if ty.name in kinds:
+                return None
+            decl = self.decl(ty.name)
+            if decl.exposure is not None and (module is None or not self.exposed(decl, module)):
+                return None
+            ty = self.unfold(ty, module)
+        return None if isinstance(ty, Foreach) else ty
 
     def shape(self, ty: Type, module: Optional[ModuleId] = None) -> Type:
         """The outer structural type of `ty` (Named unfolded, foreach expanded)."""
@@ -567,7 +583,7 @@ class Types:
             case Foreach(body=body):
                 # A source whose rows are fixed expands; otherwise every row is the body only when the
                 # body does not mention a binder.
-                if self.rows_fixed(ty.source, kinds):
+                if self.rows_fixed(ty.source, ty.indirect, kinds):
                     # Like a nominal query, an active one cannot justify itself: a foreach whose
                     # expansion holds it again by value has no finite layout, which
                     # `check_type_expansion` rejects.
@@ -581,13 +597,14 @@ class Types:
                 return ty.binder not in free_names(body) and self.is_copy(body, kinds)
         return all(self.is_copy(c, kinds) for c in children(ty))
 
-    def rows_fixed(self, source: Type, kinds: Kinds) -> bool:
-        """Whether a foreach source's rows are the same whatever the type parameters in `kinds`, and
-        any name no declaration gives, stand for: its outer shape, and a pointer's pointee's, is
-        reached without meeting one. A parameter's shape is unknown, and even a Copy argument may have
-        a linear component, in an array of length zero."""
+    def rows_fixed(self, source: Type, indirect: bool, kinds: Kinds) -> bool:
+        """Whether a foreach source's rows under the pattern `indirect` are the same whatever the type
+        parameters in `kinds`, and any name no declaration gives, stand for: its outer shape, and with
+        `*F` a pointer's pointee's, is reached without meeting one. A parameter's shape is unknown, and
+        even a Copy argument may have a linear component, in an array of length zero. Under the value
+        pattern a pointer source is a leaf, whatever its pointee."""
         shape = self.fixed_shape(source, kinds)
-        if isinstance(shape, Ptr):
+        if isinstance(shape, Ptr) and indirect:
             shape = self.fixed_shape(shape.inner, kinds)
         return shape is not None
 
@@ -599,8 +616,8 @@ class Types:
                     if (not args and name in kinds) or name not in self.program.types:
                         return None
                     ty = self.unfold(ty)
-                case Foreach(source=source):
-                    if not self.rows_fixed(source, kinds):
+                case Foreach(source=source, indirect=indirect):
+                    if not self.rows_fixed(source, indirect, kinds):
                         return None
                     ty = self.expand(ty)
                 case _:
@@ -623,20 +640,23 @@ class Types:
             raise KursError(f"{show(ty)} is not a sum")
         return s.variants
 
-    def rows(self, source: Type, module: Optional[ModuleId] = None, *,
+    def rows(self, source: Type, indirect: bool, module: Optional[ModuleId] = None, *,
              schema: bool = False) -> tuple[Optional[Skeleton], list[ForeachRow]]:
-        """One-level traversal of a foreach source: its outer skeleton (a structural type, or None for a
-        leaf) and one (label, item type) row per component, in order. With `schema`, an array contributes
-        one element type even when its runtime length is zero."""
+        """One-level traversal of a foreach source under the pattern `indirect` (`*F`) or not: its outer
+        skeleton (a structural type, or None for a leaf) and one (label, item type) row per component, in
+        order. With `schema`, an array contributes one element type even when its runtime length is
+        zero.
+
+        Under the value pattern a pointer source, written or reached through a name, is a leaf: its one
+        row is the source itself, and the pointee is not looked at. Under `*F` each component behind it is
+        a pointer to it: of a sum, a pointer to each payload. No traversal has a pointer to a sum as its
+        source, which is never `Exposed`."""
         s = self.shape(source, module)
         wrap: Callable[[Type], Type] = lambda c: c
         if isinstance(s, Ptr):
-            # Behind a pointer each component is a pointer to it; a sum has none, so no rows.
-            # Formation rejects a written one, and a traversal or `sizeof` with a
-            # parameter in the pointee needs `Exposed` of the source, which no sum has.
+            if not indirect:
+                return None, [("0", source)]
             s, wrap = self.shape(s.inner, module), Ptr
-            if isinstance(s, Enum):
-                return Tuple(()), []
         match s:
             case Struct(fields=fields):
                 return s, [(n, wrap(f)) for n, f in fields]
@@ -679,7 +699,7 @@ class Types:
 
     def expand(self, ty: Foreach, module: Optional[ModuleId] = None) -> Type:
         """The structural type a foreach transform denotes."""
-        skeleton, rows = self.rows(ty.source, module, schema=True)
+        skeleton, rows = self.rows(ty.source, ty.indirect, module, schema=True)
         mapped = [(label, subst(ty.body, {ty.binder: self.binding(ty, item)})) for label, item in rows]
         match skeleton:
             case Struct():
@@ -689,24 +709,6 @@ class Types:
             case Array(length=length):
                 return Array(mapped[0][1], length)
         return Tuple(tuple(m for _, m in mapped))
-
-    def expands_to_foreach(self, ty: Type) -> bool:
-        """`ty`'s head, unfolding declarations, is a foreach type. A declaration whose body's
-        head is one of its parameters takes the head of that argument; a cycle of heads is no foreach,
-        and a type parameter never is one. Components are not looked at."""
-        seen: list[Type] = []
-        while isinstance(ty, Named) and ty.name in self.program.types and not any(equal(ty, s) for s in seen):
-            seen.append(ty)
-            decl = self.program.types[ty.name]
-            sub = {p.name: a for p, a in zip(decl.params, ty.args)}
-            body = decl.body
-            if isinstance(body, Named) and not body.args and body.name in sub:
-                ty = sub[body.name]
-            elif isinstance(body, Named):
-                ty = Named(body.name, tuple(subst(a, sub) for a in body.args))
-            else:
-                ty = body
-        return isinstance(ty, Foreach)
 
 
 def show(ty: Type) -> str:

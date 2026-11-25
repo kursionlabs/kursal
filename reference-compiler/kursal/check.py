@@ -905,11 +905,11 @@ class Checker:
         return Ptr(instr.ty)
 
     def op_sizeof(self, instr: Instr) -> Type:
-        """`sizeof`: a foreach type's pointer source that mentions a parameter is `Exposed`, as a traversal
-        needs, so the type has its rows at every instantiation (`Types.pointer_sources`)."""
+        """`sizeof`: the source of a foreach type, and a foreach type's pointer source that mentions a
+        parameter, is `Exposed`, as a traversal needs (`Types.size_sources`)."""
         if instr.ty is None:
             self.fail("instruction_requires_type")
-        if any(not self.holds("Exposed", (source,)) for source in self.types.pointer_sources(instr.ty)):
+        if any(not self.holds("Exposed", (source,)) for source in self.types.size_sources(instr.ty)):
             self.fail("foreach_source_not_exposed")
         return USIZE
 
@@ -1051,7 +1051,9 @@ class Checker:
         if mapped is None and not equal(got, t.source) or mapped is not None and (
                 mapped.indirect != t.indirect or not equal(mapped.source, t.source)):
             self.fail("foreach_source")
-        if not self.holds("Exposed", (t.source,)):
+        # No foreach type is exposed, not even by a premise: a map takes the components of a value of
+        # one, over a source that is none.
+        if isinstance(t.source, Foreach) or not self.holds("Exposed", (t.source,)):
             self.fail("foreach_source_not_exposed")
         mapper = self.program.funs.get(instr.args[1])
         if mapper is None:
