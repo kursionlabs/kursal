@@ -8,6 +8,7 @@ use std::mem::Ref;
 use std::raw::Span;
 use std::arena::{Domain!, concat, ref_in};
 use std::buffer::Buffer!;
+use std::fmt::Writer;
 use package::kurs::core as C;
 use package::kurs::core::{Arm, Binding, Block, Data, Edge, Exposure, ExposureMode, Extern, Fun, ForeachType, Instance, Instr, Kind, Known, Member, Method, ModuleId, Opened, Param, Premise, Program, Terminator, Trait, Type, TypeDecl};
 use package::kurs::sexpr::{Form, FormKind, located, read};
@@ -84,17 +85,17 @@ fn str_of(&cx: Domain!['k], form: Form['k]) -> Span['k] {
 forall 'k.
 fn repr_list(&cx: Domain!['k], out: Buffer!, form: Form['k]) -> Buffer! {
     var out = out;
-    out = out.push_byte(b'[');
+    out = out.write_byte(b'[');
     var i = 0usize;
     while i < form.len(&cx) {
         if i > 0usize {
-            out = out.push_static(", ");
+            out = out.put(", ");
         }
         let item = form.at(&cx, i);
         out = if item.is_list() { repr_list(&cx, out, item) } else { repr_text(&cx, out, item.text) };
         i = i + 1usize;
     }
-    out.push_byte(b']')
+    out.write_byte(b']')
 }
 
 // A string as Python's `repr` writes it.
@@ -102,32 +103,32 @@ forall 'k.
 fn repr_text(&cx: Domain!['k], out: Buffer!, t: Span['k]) -> Buffer! {
     var out = out;
     let quote = if t.contains(&cx, Span::from_static(&cx, "'")) && !t.contains(&cx, Span::from_static(&cx, "\"")) { b'"' } else { b'\'' };
-    out = out.push_byte(quote);
+    out = out.write_byte(quote);
     var i = 0usize;
     while i < t.len() {
         let b = t.byte_or_zero(&cx, i);
         out = if b == b'\\' || b == quote {
-            out.push_byte(b'\\').push_byte(b)
+            out.write_byte(b'\\').write_byte(b)
         } else if b == b'\n' {
-            out.push_static("\\n")
+            out.put("\\n")
         } else if b == b'\t' {
-            out.push_static("\\t")
+            out.put("\\t")
         } else if b == b'\r' {
-            out.push_static("\\r")
+            out.put("\\r")
         } else if b < 32u8 || b == 127u8 {
             hex_escape(&cx, out, b)
         } else {
-            out.push_byte(b)
+            out.write_byte(b)
         };
         i = i + 1usize;
     }
-    out.push_byte(quote)
+    out.write_byte(quote)
 }
 
 forall 'k.
 fn hex_escape(&cx: Domain!['k], out: Buffer!, b: u8) -> Buffer! {
     let digits = Span::from_static(&cx, "0123456789abcdef");
-    out.push_static("\\x").push_byte(digits.byte_or_zero(&cx, (b / 16u8) as usize)).push_byte(digits.byte_or_zero(&cx, (b % 16u8) as usize))
+    out.put("\\x").write_byte(digits.byte_or_zero(&cx, (b / 16u8) as usize)).write_byte(digits.byte_or_zero(&cx, (b % 16u8) as usize))
 }
 
 forall 'k.
@@ -144,7 +145,7 @@ fn strs(&cx: Domain!['k], forms: ArenaVec[Form['k], 'k]) -> ArenaVec[Span['k], '
 forall 'k.
 fn brand_of(&cx: Domain!['k], form: Form['k]) -> Span['k] {
     if form.is_list() || !form.text.starts_with(&cx, Span::from_static(&cx, "$")) || form.text.len() < 2usize {
-        fail_text_on(&cx, Buffer!::new().push_static("expected a brand such as $k, got ").push_bytes(&cx, write_form(&cx, form)).save(&cx), form);
+        fail_text_on(&cx, Buffer!::new().put("expected a brand such as $k, got ").write(&cx, write_form(&cx, form)).save(&cx), form);
     }
     form.text.skip(1usize)
 }
@@ -165,7 +166,7 @@ forall 'k.
 fn int_of(&cx: Domain!['k], form: Form['k]) -> usize {
     match parse_usize(&cx, form.text) {
         Some(n) => n,
-        None => fail_text_on(&cx, Buffer!::new().push_bytes(&cx, write_form(&cx, form)).push_static(" is not a usize").save(&cx), form),
+        None => fail_text_on(&cx, Buffer!::new().write(&cx, write_form(&cx, form)).put(" is not a usize").save(&cx), form),
     }
 }
 
@@ -445,7 +446,7 @@ fn parse_term(&cx: Domain!['k], form: Form['k]) -> Terminator['k] {
         let scrutinee = str_of(&cx, form.at(&cx, 1usize));
         return Terminator::Switch.(scrutinee, parse_type(&cx, form.at(&cx, 2usize)), arms, pos);
     }
-    fail_text_on(&cx, Buffer!::new().push_static("unknown terminator ").push_bytes(&cx, write_form(&cx, head)).save(&cx), form)
+    fail_text_on(&cx, Buffer!::new().put("unknown terminator ").write(&cx, write_form(&cx, head)).save(&cx), form)
 }
 
 forall 'k.
@@ -772,7 +773,7 @@ fn parse_program(&cx: Domain!['k], source: Span['k]) -> Program['k] {
             let name = str_of(&cx, rest.at(&cx, 0usize));
             program.datas.insert(&cx, name, Data.{ name, ty: parse_type(&cx, rest.at(&cx, 1usize)), init: rest.at(&cx, 2usize), home });
         } else {
-            fail_text_on(&cx, Buffer!::new().push_static("unknown declaration ").push_bytes(&cx, write_form(&cx, head)).save(&cx), form);
+            fail_text_on(&cx, Buffer!::new().put("unknown declaration ").write(&cx, write_form(&cx, head)).save(&cx), form);
         }
         n = n + 1usize;
     }
@@ -787,32 +788,32 @@ fn parse_program(&cx: Domain!['k], source: Span['k]) -> Program['k] {
 
 forall 'k.
 fn cannot(&cx: Domain!['k], what: Span['k]) -> ! {
-    fail(&cx, Buffer!::new().push_static("cannot write ").push_bytes(&cx, what).push_static(" as KURS").save(&cx))
+    fail(&cx, f"cannot write {what} as KURS".write(&cx, Buffer!::new()).save(&cx))
 }
 
 // `t` as a string literal.
 forall 'k.
 fn write_string(&cx: Domain!['k], t: Span['k]) -> Span['k] {
-    var out = Buffer!::new().push_byte(b'"');
+    var out = Buffer!::new().write_byte(b'"');
     var i = 0usize;
     while i < t.len() {
         let c = t.byte_or_zero(&cx, i);
         out = if c == b'\n' {
-            out.push_static("\\n")
+            out.put("\\n")
         } else if c == b'\t' {
-            out.push_static("\\t")
+            out.put("\\t")
         } else if c == b'\r' {
-            out.push_static("\\r")
+            out.put("\\r")
         } else if c == b'\\' || c == b'"' {
-            out.push_byte(b'\\').push_byte(c)
+            out.write_byte(b'\\').write_byte(c)
         } else if c < 32u8 || c == 127u8 {
             hex_escape(&cx, out, c)
         } else {
-            out.push_byte(c)
+            out.write_byte(c)
         };
         i = i + 1usize;
     }
-    out.push_byte(b'"').save(&cx)
+    out.write_byte(b'"').save(&cx)
 }
 
 // `t` as an atom, or as a string literal when it is not a single word.
@@ -830,16 +831,16 @@ fn write_atom(&cx: Domain!['k], t: Span['k]) -> Span['k] {
 
 forall 'k.
 fn form_text(&cx: Domain!['k], parts: ArenaVec[Span['k], 'k]) -> Span['k] {
-    var out = Buffer!::new().push_byte(b'(');
+    var out = Buffer!::new().write_byte(b'(');
     var i = 0usize;
     while i < parts.len(&cx) {
         if i > 0usize {
-            out = out.push_byte(b' ');
+            out = out.write_byte(b' ');
         }
-        out = out.push_bytes(&cx, parts.at(&cx, i));
+        out = out.write(&cx, parts.at(&cx, i));
         i = i + 1usize;
     }
-    out.push_byte(b')').save(&cx)
+    out.write_byte(b')').save(&cx)
 }
 
 // `(head part*)`
@@ -910,7 +911,7 @@ fn write_type(&cx: Domain!['k], ty: Type['k]) -> Span['k] {
         Struct(fields) => headed(&cx, "struct", members(&cx, fields)),
         Enum(variants) => headed(&cx, "enum", members(&cx, variants)),
         Tuple(elems) => headed(&cx, "tuple", write_types(&cx, elems)),
-        Array(elem, length) => headed(&cx, "array", ArenaVec::two(&cx, write_type(&cx, elem.copy(&cx)), Buffer!::new().push_u64(length).save(&cx))),
+        Array(elem, length) => headed(&cx, "array", ArenaVec::two(&cx, write_type(&cx, elem.copy(&cx)), Buffer!::new().put(length).save(&cx))),
         Ptr(inner) => headed(&cx, "ptr", ArenaVec::one(&cx, write_type(&cx, inner.copy(&cx)))),
         NonNull(inner) => headed(&cx, "non_null", ArenaVec::one(&cx, write_type(&cx, inner.copy(&cx)))),
         Brand(brand) => match brand.copy(&cx) {
@@ -1013,7 +1014,7 @@ fn write_forall(&cx: Domain!['k], params: ArenaVec[Param['k], 'k], premises: Are
         bounds.push(&cx, form_text(&cx, parts));
         i = i + 1usize;
     }
-    Buffer!::new().push_static("forall ").push_bytes(&cx, form_text(&cx, names)).push_static(" ").push_bytes(&cx, form_text(&cx, bounds)).save(&cx)
+    Buffer!::new().put("forall ").write(&cx, form_text(&cx, names)).put(" ").write(&cx, form_text(&cx, bounds)).save(&cx)
 }
 
 // `name` or `(name T*)`: a callee, mapper, function-value name or edge target.
@@ -1202,7 +1203,7 @@ fn write_fun(&cx: Domain!['k], fun: Fun['k], head: ArenaVec[Span['k], 'k], inden
 
 forall 'k.
 fn write_module(&cx: Domain!['k], home: ModuleId['k]) -> Span['k] {
-    let parts = ArenaVec::two(&cx, Span::from_static(&cx, "module"), Buffer!::new().push_usize(home.package).save(&cx));
+    let parts = ArenaVec::two(&cx, Span::from_static(&cx, "module"), Buffer!::new().put(home.package).save(&cx));
     parts.append(&cx, atoms(&cx, home.path));
     form_text(&cx, parts)
 }
@@ -1261,7 +1262,7 @@ fn write_type_decl(&cx: Domain!['k], decl: TypeDecl['k]) -> Span['k] {
     };
     var body = write_type(&cx, decl.body);
     if !decl.params.is_empty(&cx) || !decl.premises.is_empty(&cx) {
-        body = Buffer!::new().push_static("(").push_bytes(&cx, write_forall(&cx, decl.params, decl.premises)).push_static(" ").push_bytes(&cx, body).push_static(")").save(&cx);
+        body = Buffer!::new().put("(").write(&cx, write_forall(&cx, decl.params, decl.premises)).put(" ").write(&cx, body).put(")").save(&cx);
     }
     let parts = in_clause(&cx, decl.home, policy);
     parts.push(&cx, write_atom(&cx, decl.name));
@@ -1325,7 +1326,7 @@ forall 'k.
 fn write_instance(&cx: Domain!['k], inst: Instance['k]) -> ArenaVec[Span['k], 'k] {
     var head = form_text(&cx, write_types(&cx, inst.head));
     if !inst.params.is_empty(&cx) || !inst.premises.is_empty(&cx) {
-        head = Buffer!::new().push_static("(").push_bytes(&cx, write_forall(&cx, inst.params, inst.premises)).push_static(" ").push_bytes(&cx, head).push_static(")").save(&cx);
+        head = Buffer!::new().put("(").write(&cx, write_forall(&cx, inst.params, inst.premises)).put(" ").write(&cx, head).put(")").save(&cx);
     }
     let first = ArenaVec::one(&cx, Span::from_static(&cx, "instance"));
     first.append(&cx, in_clause(&cx, inst.home, Option::None));
@@ -1336,7 +1337,7 @@ fn write_instance(&cx: Domain!['k], inst: Instance['k]) -> ArenaVec[Span['k], 'k
     while i < inst.methods.len(&cx) {
         let method = inst.methods.at(&cx, i);
         if !same_module(&cx, method.home, inst.home) {
-            cannot(&cx, Buffer!::new().push_static("the method ").push_bytes(&cx, method.name).push_static(" of an instance of ").push_bytes(&cx, inst.trait_name).push_static(" from another module").save(&cx));
+            cannot(&cx, f"the method {method.name} of an instance of {inst.trait_name} from another module".write(&cx, Buffer!::new()).save(&cx));
         }
         let method_head = ArenaVec::one(&cx, Span::from_static(&cx, "fun"));
         if method.is_unsafe {
@@ -1399,7 +1400,7 @@ fn write_program(&cx: Domain!['k], program: Program['k]) -> Span['k] {
     var out = Buffer!::new();
     i = 0usize;
     while i < lines.len(&cx) {
-        out = out.push_bytes(&cx, lines.at(&cx, i)).push_byte(b'\n');
+        out = out.write(&cx, lines.at(&cx, i)).write_byte(b'\n');
         i = i + 1usize;
     }
     out.save(&cx)

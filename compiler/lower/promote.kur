@@ -13,6 +13,7 @@ use std::mem::Ref;
 use std::raw::Span;
 use std::arena::{Domain!, ref_in};
 use std::buffer::Buffer!;
+use std::fmt::Writer;
 use package::check::checker::{ancestor_in, overlap};
 use package::lower::placeflow::place_name;
 use package::kurs::core::{Binding, Block, Edge, Fun, Instr, Kind, Param, Premise, Terminator, Type};
@@ -87,7 +88,7 @@ fn last_segment(&cx: Domain!['k], path: Span['k]) -> Span['k] {
 
 forall 'k.
 fn child_of(&cx: Domain!['k], path: Span['k], label: Span['k]) -> Span['k] {
-    Buffer!::new().push_bytes(&cx, path).push_static(".").push_bytes(&cx, label).save(&cx)
+    f"{path}.{label}".write(&cx, Buffer!::new()).save(&cx)
 }
 
 // Whether `path` lies under `parent`: `parent` and a `.` begin it.
@@ -115,7 +116,7 @@ impl Promotion['k] {
         var name = Span::from_static(&cx, "");
         var going = true;
         while going {
-            name = Buffer!::new().push_static("%#contents").push_u64(self.serial.copy(&cx)).save(&cx);
+            name = Buffer!::new().put("%#contents").put(self.serial.copy(&cx)).save(&cx);
             self.serial.set(&cx, self.serial.copy(&cx) + 1u64);
             going = self.taken.contains(&cx, name);
         }
@@ -128,8 +129,8 @@ impl Promotion['k] {
     }
 
     fn unsupported(self, &cx: Domain!['k], path: Span['k]) -> ! {
-        self.r.fail(&cx, Buffer!::new().push_static("frontend limitation: locally branded value '").push_bytes(&cx, place_name(&cx, path))
-            .push_static("' requires structural SSA lowering; pass it by value to a generic function").save(&cx), self.fun.pos)
+        self.r.fail(&cx, Buffer!::new().put("frontend limitation: locally branded value '").write(&cx, place_name(&cx, path))
+            .put("' requires structural SSA lowering; pass it by value to a generic function").save(&cx), self.fun.pos)
     }
 
     fn expose(self, &cx: Domain!['k], path: Span['k]) {
@@ -163,7 +164,7 @@ impl Promotion['k] {
                 Tuple(elems) => {
                     var k = 0usize;
                     while k < elems.len(&cx) {
-                        fields.push(&cx, Binding.{ name: Buffer!::new().push_usize(k).save(&cx), ty: elems.at(&cx, k) });
+                        fields.push(&cx, Binding.{ name: Buffer!::new().put(k).save(&cx), ty: elems.at(&cx, k) });
                         k = k + 1usize;
                     }
                 },
@@ -179,7 +180,7 @@ impl Promotion['k] {
             let children: ArenaVec[Binding['k], 'k] = ArenaVec::new(&cx);
             var k = 0usize;
             while k < fields.len(&cx) {
-                let child = Buffer!::new().push_bytes(&cx, parent).push_static(".").push_bytes(&cx, fields.at(&cx, k).name).save(&cx);
+                let child = Buffer!::new().write(&cx, parent).put(".").write(&cx, fields.at(&cx, k).name).save(&cx);
                 children.push(&cx, Binding.{ name: child, ty: fields.at(&cx, k).ty });
                 self.path_types.insert(&cx, child, fields.at(&cx, k).ty);
                 k = k + 1usize;
@@ -347,7 +348,7 @@ impl Promotion['k] {
     fn read(self, &cx: Domain!['k], w: Rewrite['k], path: Span['k]) -> Span['k] {
         match w.contents.get(&cx, path) {
             Some(v) => v,
-            None => self.r.fail(&cx, Buffer!::new().push_static("locally branded value '").push_bytes(&cx, place_name(&cx, path)).push_static("' is unavailable").save(&cx), self.fun.pos),
+            None => self.r.fail(&cx, Buffer!::new().put("locally branded value '").write(&cx, place_name(&cx, path)).put("' is unavailable").save(&cx), self.fun.pos),
         }
     }
 
@@ -412,7 +413,7 @@ impl Promotion['k] {
     fn value(self, &cx: Domain!['k], w: Rewrite['k], name: Span['k]) -> Span['k] {
         if name.starts_with(&cx, Span::from_static(&cx, "&*")) {
             let inner = name.skip(2usize);
-            return Buffer!::new().push_static("&*").push_bytes(&cx, w.aliases.get_or(&cx, inner, inner)).save(&cx);
+            return Buffer!::new().put("&*").write(&cx, w.aliases.get_or(&cx, inner, inner)).save(&cx);
         }
         w.aliases.get_or(&cx, name, name)
     }
@@ -507,15 +508,15 @@ impl Promotion['k] {
             generic.push(&cx, Param.{ name: w.brands.at(&cx, k), kind: Kind::Brand });
             k = k + 1usize;
         }
-        var name = Buffer!::new().push_bytes(&cx, self.fun.name).push_static("#lend").push_bytes(&cx, self.fresh(&cx).skip(1usize)).save(&cx);
+        var name = Buffer!::new().write(&cx, self.fun.name).put("#lend").write(&cx, self.fresh(&cx).skip(1usize)).save(&cx);
         while self.types.program.funs.contains(&cx, name) {
-            name = Buffer!::new().push_bytes(&cx, name).push_static("_").save(&cx);
+            name = Buffer!::new().write(&cx, name).put("_").save(&cx);
         }
         let argument_names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         k = 0usize;
         while k < operands.len(&cx) {
             let p = operands.at(&cx, k);
-            argument_names.push(&cx, Buffer!::new().push_static(if p.starts_with(&cx, Span::from_static(&cx, "&")) && !self.restricted(&cx, p) { "&a" } else { "%a" }).push_usize(k).save(&cx));
+            argument_names.push(&cx, Buffer!::new().put(if p.starts_with(&cx, Span::from_static(&cx, "&")) && !self.restricted(&cx, p) { "&a" } else { "%a" }).put(k).save(&cx));
             k = k + 1usize;
         }
         let bindings: ArenaVec[Binding['k], 'k] = ArenaVec::new(&cx);
@@ -543,9 +544,9 @@ impl Promotion['k] {
         k = 0usize;
         while k < borrowed.len(&cx) {
             let b = borrowed.at(&cx, k);
-            let slot = Buffer!::new().push_static("&slot").push_usize(b).save(&cx);
+            let slot = Buffer!::new().put("&slot").put(b).save(&cx);
             locals.push(&cx, Binding.{ name: slot, ty: ptypes.at(&cx, b) });
-            body.push(&cx, instr(&cx, ArenaVec::one(&cx, Buffer!::new().push_static("%unit").push_usize(b).save(&cx)), "store", ArenaVec::two(&cx, slot, argument_names.at(&cx, b)), Option::None, ins.pos));
+            body.push(&cx, instr(&cx, ArenaVec::one(&cx, Buffer!::new().put("%unit").put(b).save(&cx)), "store", ArenaVec::two(&cx, slot, argument_names.at(&cx, b)), Option::None, ins.pos));
             forwarded.set(&cx, b, slot);
             k = k + 1usize;
         }
@@ -565,10 +566,10 @@ impl Promotion['k] {
             k = 0usize;
             while k < borrowed.len(&cx) {
                 let b = borrowed.at(&cx, k);
-                let n = Buffer!::new().push_static("%restored").push_usize(b).save(&cx);
+                let n = Buffer!::new().put("%restored").put(b).save(&cx);
                 restored.push(&cx, n);
                 elems.push(&cx, ptypes.at(&cx, b));
-                body.push(&cx, instr(&cx, ArenaVec::one(&cx, n), "load", ArenaVec::one(&cx, Buffer!::new().push_static("&slot").push_usize(b).save(&cx)), Option::None, ins.pos));
+                body.push(&cx, instr(&cx, ArenaVec::one(&cx, n), "load", ArenaVec::one(&cx, Buffer!::new().put("&slot").put(b).save(&cx)), Option::None, ins.pos));
                 k = k + 1usize;
             }
             elems.push(&cx, result);

@@ -207,10 +207,14 @@ the declared empty paths an edge into it must still check.
 ### Text being built
 
 Text is built in the standard library's linear `Buffer!`, on the heap, threaded by value through
-the chain of pushes: `Buffer!::new().push_static("(").push_bytes(&cx, t).push_u64(n)`. A span is
-read under the domain's capability (`ReadBytes[Domain!['k], Span['k]]`), so `push_bytes(&cx, t)`
-takes it whole. Text that must outlive the builder ends in the arena through `Buffer!::save`,
-`Buffer!::new().push_static("a").push_bytes(&cx, t).save(&cx)`, which copies the finished bytes into
+a chain of writes, the methods every writer has (`std::fmt::Writer`, which a module imports to
+find them): `Buffer!::new().put("(").write(&cx, t).put(n)`. `put` prints a literal, a number, a
+`bool` or another buffer, which it frees; `write` copies a span or a byte slice, read under the
+domain's capability (`ReadBytes[Domain!['k], Span['k]]`), and `write_byte` one byte. Where the
+pieces read better as a sentence, an f-string writes them:
+`f"{line}:{col}: {message}".write(&cx, Buffer!::new())`. Text that must outlive the builder ends
+in the arena through `Buffer!::save`,
+`Buffer!::new().put("a").write(&cx, t).save(&cx)`, which copies the finished bytes into
 one block of exactly their length and frees the buffer; a builder that is dropped on a path is
 destroyed there (`out.destroy()`), and the leak check under valgrind would see one that is not.
 
@@ -228,7 +232,7 @@ write fails.
 | Python | Kursal |
 |---|---|
 | `str` | `Span['k]` (a byte view; `Span::from_static(&cx, "literal")`, `t.is(&cx, "literal")`, `t.eq(&cx, u)`, `t.cmp(&cx, u)`, `t.len()`, `slice`, `skip`, `find`, `split`, `starts_with`, `byte_or_zero`) |
-| building a `str` | `Buffer!::new().push_static("a").push_bytes(&cx, t).push_u64(n).save(&cx)`; in a loop, `var out = Buffer!::new();` and `out = out.push_static(", ");` |
+| building a `str` | `Buffer!::new().put("a").write(&cx, t).put(n).save(&cx)`; in a loop, `var out = Buffer!::new();` and `out = out.put(", ");` |
 | `list`, `tuple` of values | `ArenaVec[T, 'k]` (`push`, `at`, `get` → `Option`, `set`, `len`, `pop` → `Option`, `clone`, `slice`, `skip`, `append`, `insert`, `remove`, `sort_by`, `contains`, `each`, `any`, `fold`, ...; each takes `&cx`) |
 | `dict` | `ArenaMap[K, V, 'k]` (insertion-ordered like `dict`: `insert`, `get` → `Option`, `at`, `get_or`, `contains`, `remove`, `keys`, `values`, `each`, `any`) |
 | `set` | `ArenaSet[K, 'k]` (insertion-ordered: `insert`, `contains`, `remove`, `keys`, `each`, `any`, `all`) |
@@ -245,8 +249,8 @@ write fails.
 Nothing in an arena is freed until the arena is, so a loop that builds throwaway values on every
 step costs memory for the rest of its group. A sequence takes up to twice its length in room; a
 map's slots are made again, twice as many, as it grows, and the old ones stay. Text built in a
-`Buffer!` costs the arena only its final length, in `save`; one buffer pushed into another
-(`push_buffer`) costs it nothing. Where a pure computation is repeated on the same input, cache it
+`Buffer!` costs the arena only its final length, in `save`; one buffer put into another
+(`out.put(b)`) costs it nothing. Where a pure computation is repeated on the same input, cache it
 in a map (`Backend::ctype`, `Types::unfold`, the layout walk's finished keys). In a hot
 loop, read a map's or set's keys in place with `positions` and `key_at`, or `each` and `any`,
 rather than copying them with `keys`, and compare text without splitting it.
@@ -1156,10 +1160,11 @@ These are the places where Kursal differs from what one might expect.
   Buffer! belongs in the package that declares it`), so no package adds a method that could clash
   with the type's own. Another package writes a function, or a trait and its instance. A blanket
   impl, `forall M where Tr[M]. impl M`, is no inherent impl: its methods are found through its
-  bounding traits.
+  bounding traits, as every writer's `put` and `write` are found where `Writer` is imported.
 - **F-strings.** `{x}` formats `x` by `Format::format`, which hands the value back; `{x}` drops it,
   so a linear `x` is written `{&x}`, which lends it (`{x} in an f-string drops a linear value; lend
-  it with {&x}`). `f"...".write(out)` writes into the writer `out` and hands it back.
+  it with {&x}`). An `x` of type `Str['static]` is written as the text around it is, by
+  `Writer::write_static`, with no `Format` instance. `f"...".write(out)` writes into the writer `out` and hands it back.
   `f"...".write(&cx, out)` also lends the f-string the capability in the place `cx`, a var as for any
   lend: the capability is moved out of `cx`, `out` is wrapped with it as `ReadingWriter![W,
   C]::new(out, cx)`, each segment is written through the wrapper, and `finish` hands back the writer,

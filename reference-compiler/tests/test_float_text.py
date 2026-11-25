@@ -99,8 +99,9 @@ def expected_f32(bits: int) -> str:
 # `{x}`, and reads every TEXT back through `parse_f64`, counting those that do not give the same bits.
 FORMAT_PROGRAM = '''
 use std::buffer::Buffer!;
+use std::fmt::Writer;
 use std::float::parse_f64;
-use std::io::print_buffer;
+use std::io::print;
 use std::option::Option;
 
 // TEXT read back: 0 when it gives `bits` again (some NaN for a NaN), else 1.
@@ -123,12 +124,12 @@ fn misread(text: Buffer!, bits: u64, single: bool) -> u32 {
 
 fn double(out: Buffer!, bits: u64) -> (Buffer!, u32) {
     let x = f64::from_bits(bits);
-    (out.push_buffer(f"d {bits} {x}\\n"), misread(f"{x}", bits, false))
+    (out.put(f"d {bits} {x}\\n"), misread(f"{x}", bits, false))
 }
 
 fn single(out: Buffer!, bits: u32) -> (Buffer!, u32) {
     let x = f32::from_bits(bits);
-    (out.push_buffer(f"f {bits} {x}\\n"), misread(f"{x}", (bits as u64), true))
+    (out.put(f"f {bits} {x}\\n"), misread(f"{x}", (bits as u64), true))
 }
 
 fn parsed(text: Buffer!) -> f64 {
@@ -208,7 +209,7 @@ fn main() -> i32 {
         bad = bad + b1 + b2;
         i = i + 1u32;
     }
-    print_buffer(out.push_buffer(f"misread {bad}\\n"));
+    print(out.put(f"misread {bad}\\n"));
     0i32
 }
 '''
@@ -258,20 +259,20 @@ class FloatTextTests(unittest.TestCase):
     def test_interpolation_and_writers(self):
         self.expect('''
             use std::buffer::Buffer!;
-            use std::io::print_buffer;
+            use std::io::print;
             fn main() -> i32 {
                 let x = 2.5f64;
                 let y = 0.1f32;
                 let z = 0.1f64 + 0.2f64;
                 let (nan, low, zero, big, tiny) = (f64::NAN, f64::NEG_INFINITY, -0.0f64, f32::MAX, f64::MIN_POSITIVE);
-                print_buffer(f"{x} {y} {z} {nan} {low} {zero} {big} {tiny}");
+                print(f"{x} {y} {z} {nan} {low} {zero} {big} {tiny}");
                 0i32
             }''', stdout="2.5 0.1 0.30000000000000004 NaN -inf -0 3.4028235e38 2.2250738585072014e-308")
 
     def test_number_functions(self):
         self.expect('''
             use std::buffer::Buffer!;
-            use std::io::print_buffer;
+            use std::io::print;
             use std::option::Option;
             fn checked(x: f64) -> i64 {
                 match x.to_i64_checked() { Option::Some(v) => v, Option::None => 42i64 }
@@ -288,9 +289,9 @@ class FloatTextTests(unittest.TestCase):
                 let g = (f64::EPSILON == f64::from_bits(4372995238176751616u64), f64::MIN == -f64::MAX,
                          f32::EPSILON == f32::from_bits(872415232u32), f32::MIN_POSITIVE == f32::from_bits(8388608u32),
                          2.5f64.to_bits(), f64::from_bits(4612811918334230528u64), 1.0f32.to_bits());
-                print_buffer(f"{a.0} {a.1} {a.2} {a.3} {a.4}|{b.0} {b.1} {b.2} {b.3} {b.4}|{c.0} {c.1} {c.2} {c.3}|");
-                print_buffer(f"{d.0} {d.1} {d.2} {d.3}|{e.0} {e.1} {e.2} {e.3} {e.4} {e.5} {e.6}|");
-                print_buffer(f"{f.0} {f.1} {f.2} {f.3} {f.4} {f.5} {f.6}|{g.0} {g.1} {g.2} {g.3} {g.4} {g.5} {g.6}");
+                print(f"{a.0} {a.1} {a.2} {a.3} {a.4}|{b.0} {b.1} {b.2} {b.3} {b.4}|{c.0} {c.1} {c.2} {c.3}|");
+                print(f"{d.0} {d.1} {d.2} {d.3}|{e.0} {e.1} {e.2} {e.3} {e.4} {e.5} {e.6}|");
+                print(f"{f.0} {f.1} {f.2} {f.3} {f.4} {f.5} {f.6}|{g.0} {g.1} {g.2} {g.3} {g.4} {g.5} {g.6}");
                 0i32
             }''', stdout="2 -2 -0 2 -3|3 -2 -0 3 -3|0 -0 4503599627370497 inf|"
                          "2 -2 0 8388609|true true true false true 3 -3|"

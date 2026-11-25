@@ -20,6 +20,7 @@ use std::mem::Ref;
 use std::raw::Span;
 use std::arena::{Domain!, ref_in, seed};
 use std::buffer::Buffer!;
+use std::fmt::Writer;
 use package::check::checker::{checked_only, contains, function_types, is_never, overlap, pointer_cast_fits};
 use package::kurs::core::{Block, Data, Edge, Extern, FnType, Fun, Instance, Instr, Kind, ModuleId, Param, Program, Terminator, Type};
 use package::kurs::core as C;
@@ -47,7 +48,7 @@ fn written_place(&cx: Domain!['k], e: Expr['k]) -> Option[Span['k]] {
             Option::None
         },
         Field(f) => match written_place(&cx, f.value.copy(&cx)) {
-            Some(inner) => Option::Some.(Buffer!::new().push_bytes(&cx, inner).push_static(".").push_bytes(&cx, f.name).save(&cx)),
+            Some(inner) => Option::Some.(f"{inner}.{f.name}".write(&cx, Buffer!::new()).save(&cx)),
             None => Option::None,
         },
         _ => Option::None,
@@ -108,7 +109,7 @@ fn is_unit(&cx: Domain!['k], t: Type['k]) -> bool {
 
 forall 'k.
 fn id_text(&cx: Domain!['k], id: u32) -> Span['k] {
-    Buffer!::new().push_u64(id as u64).save(&cx)
+    Buffer!::new().put(id).save(&cx)
 }
 
 // ---------------------------------------------------------- match coverage --
@@ -141,9 +142,9 @@ fn int_eq(a: Int, b: Int) -> bool {
 forall 'k.
 fn int_spelled(&cx: Domain!['k], a: Int) -> Span['k] {
     if a.negative {
-        Buffer!::new().push_static("-").push_u64(a.magnitude).save(&cx)
+        Buffer!::new().put("-").put(a.magnitude).save(&cx)
     } else {
-        Buffer!::new().push_u64(a.magnitude).save(&cx)
+        Buffer!::new().put(a.magnitude).save(&cx)
     }
 }
 
@@ -368,7 +369,7 @@ impl Lowering['k] {
     }
 
     fn foreign_fail(self, &cx: Domain!['k], name: Span['k], message: Slice[u8, 'static], pos: Pos) -> ! {
-        self.r.fail(&cx, Buffer!::new().push_static("extern ").push_bytes(&cx, name).push_static(message).save(&cx), pos)
+        self.r.fail(&cx, f"extern {name}{message}".write(&cx, Buffer!::new()).save(&cx), pos)
     }
 
     fn run(self, &cx: Domain!['k]) -> Program['k] {
@@ -492,7 +493,7 @@ impl Lowering['k] {
             Some(label) => return (label, bytes.len()),
             None => (),
         };
-        let label = Buffer!::new().push_static("string#").push_usize(self.datas.len(&cx)).save(&cx);
+        let label = Buffer!::new().put("string#").put(self.datas.len(&cx)).save(&cx);
         let item = Form.{ kind: FormKind::Str, text: bytes, items: ArenaVec::new(&cx), pos: no_pos() };
         let zero = Form.{ kind: FormKind::Atom, text: Span::from_static(&cx, "0"), items: ArenaVec::new(&cx), pos: no_pos() };
         let init = Form.{ kind: FormKind::List, text: Span::from_static(&cx, ""), items: ArenaVec::two(&cx, item, zero), pos: no_pos() };
@@ -691,7 +692,7 @@ impl FnLower['k] {
 
     fn fresh(self, &cx: Domain!['k], hint: Slice[u8, 'static]) -> Span['k] {
         self.n.set(&cx, self.n.copy(&cx) + 1u64);
-        Buffer!::new().push_static("%").push_static(hint).push_u64(self.n.copy(&cx)).save(&cx)
+        Buffer!::new().put("%").put(hint).put(self.n.copy(&cx)).save(&cx)
     }
 
     fn lifted(self) -> bool {
@@ -754,7 +755,7 @@ impl FnLower['k] {
                 Some(t) => match t {
                     Prim(prim) => match o.lit {
                         Some(lit) => if !valid_literal(&cx, t, lit) {
-                            self.fail(&cx, Buffer!::new().push_static("literal ").push_bytes(&cx, lit).push_static(" does not fit ").push_bytes(&cx, prim).save(&cx),
+                            self.fail(&cx, f"literal {lit} does not fit {prim}".write(&cx, Buffer!::new()).save(&cx),
                                 if pos.line != 0u32 { pos } else { self.at.copy(&cx) });
                         },
                         None => (),
@@ -788,7 +789,7 @@ impl FnLower['k] {
         };
         let discharged = o.discharged || marked;
         if C::is_unsafe_op(&cx, o.name) && !discharged {
-            self.fail(&cx, Buffer!::new().push_static(unsafe_written(&cx, o.name)).push_static(" needs unsafe").save(&cx), pos);
+            self.fail(&cx, Buffer!::new().put(unsafe_written(&cx, o.name)).put(" needs unsafe").save(&cx), pos);
         }
         if C::is_unsafe_op(&cx, o.name) {
             self.memory_operation(&cx, o, pos);
@@ -862,8 +863,7 @@ impl FnLower['k] {
                 self.fail(&cx, Span::from_static(&cx, "a raw read, write or alloca at a zero-size type"), pos);
             }
             let written = surface(&cx, ArenaVec::one(&cx, ty), ArenaVec::new(&cx), ArenaMap::new(&cx)).show(&cx, ty);
-            self.fail(&cx, Buffer!::new().push_static("a raw read, write or alloca at ").push_bytes(&cx, written)
-                .push_static(" needs Sized[").push_bytes(&cx, written).push_static("]").save(&cx), pos);
+            self.fail(&cx, f"a raw read, write or alloca at {written} needs Sized[{written}]".write(&cx, Buffer!::new()).save(&cx), pos);
         }
     }
 
@@ -893,14 +893,14 @@ impl FnLower['k] {
             _ => false,
         };
         if kind.starts_with(&cx, Span::from_static(&cx, "fetch_")) && !integer {
-            self.fail(&cx, Buffer!::new().push_static("atomic ").push_bytes(&cx, kind).push_static(" works on a pointer to an integer").save(&cx), pos);
+            self.fail(&cx, f"atomic {kind} works on a pointer to an integer".write(&cx, Buffer!::new()).save(&cx), pos);
         }
         let pointer = match inner {
             Ptr(_x) => true,
             _ => false,
         };
         if !(integer || C::same(&cx, inner, C::bool_type(&cx)) || pointer) {
-            self.fail(&cx, Buffer!::new().push_static("atomic ").push_bytes(&cx, kind).push_static(" works on a pointer to an integer, a bool or a pointer").save(&cx), pos);
+            self.fail(&cx, f"atomic {kind} works on a pointer to an integer, a bool or a pointer".write(&cx, Buffer!::new()).save(&cx), pos);
         }
     }
 
@@ -955,7 +955,7 @@ impl FnLower['k] {
 
     fn new_block(self, &cx: Domain!['k], params: ArenaVec[C::Binding['k], 'k], hint: Slice[u8, 'static]) -> BlockB['k] {
         self.n.set(&cx, self.n.copy(&cx) + 1u64);
-        self.block_named(&cx, Buffer!::new().push_static(hint).push_u64(self.n.copy(&cx)).save(&cx), params)
+        self.block_named(&cx, Buffer!::new().put(hint).put(self.n.copy(&cx)).save(&cx), params)
     }
 
     fn start(self, &cx: Domain!['k], block: BlockB['k]) {
@@ -998,7 +998,7 @@ impl FnLower['k] {
     }
 
     fn temporary(self, &cx: Domain!['k], ty: Type['k]) -> Span['k] {
-        let root = Buffer!::new().push_static("&#tmp").push_usize(self.locals.len(&cx)).save(&cx);
+        let root = Buffer!::new().put("&#tmp").put(self.locals.len(&cx)).save(&cx);
         self.locals.push(&cx, C::Binding.{ name: root, ty: ty });
         root
     }
@@ -1098,7 +1098,7 @@ impl FnLower['k] {
         i = 0usize;
         while i < saved.len(&cx) {
             let (k, raw, root, ty) = saved.at(&cx, i);
-            values.set(&cx, k, Buffer!::new().push_bytes(&cx, raw).push_bytes(&cx, self.emit(&cx, Op::new(&cx, "load", ty, ArenaVec::one(&cx, root)))).save(&cx));
+            values.set(&cx, k, Buffer!::new().write(&cx, raw).write(&cx, self.emit(&cx, Op::new(&cx, "load", ty, ArenaVec::one(&cx, root)))).save(&cx));
             i = i + 1usize;
         }
         i = 0usize;
@@ -1164,15 +1164,15 @@ impl FnLower['k] {
     // `line:col` of the current position.
     fn here(self, &cx: Domain!['k]) -> Span['k] {
         let at = self.at.copy(&cx);
-        Buffer!::new().push_u64(at.line as u64).push_static(":").push_u64(at.col as u64).save(&cx)
+        f"{at.line}:{at.col}".write(&cx, Buffer!::new()).save(&cx)
     }
 
     // The edges into a loop's `head`: the one from the current block starts the loop, the others repeat it.
     fn loop_sites(self, &cx: Domain!['k], head: BlockB['k]) {
         let at = self.here(&cx);
-        let entry = Buffer!::new().push_bytes(&cx, self.current(&cx).label).push_static(">").push_bytes(&cx, head.label).save(&cx);
-        self.sites.insert(&cx, entry, Buffer!::new().push_static("where the loop at ").push_bytes(&cx, at).push_static(" starts, but not when it repeats").save(&cx));
-        self.sites.insert(&cx, head.label, Buffer!::new().push_static("when the loop at ").push_bytes(&cx, at).push_static(" repeats, but not where it starts").save(&cx));
+        let entry = Buffer!::new().write(&cx, self.current(&cx).label).put(">").write(&cx, head.label).save(&cx);
+        self.sites.insert(&cx, entry, f"where the loop at {at} starts, but not when it repeats".write(&cx, Buffer!::new()).save(&cx));
+        self.sites.insert(&cx, head.label, f"when the loop at {at} repeats, but not where it starts".write(&cx, Buffer!::new()).save(&cx));
     }
 
     // Runs each arm in its block; the arms that finish meet in a join block taking their results, the
@@ -1202,7 +1202,7 @@ impl FnLower['k] {
         }
         let r = self.fresh(&cx, "r");
         let join = self.new_block(&cx, ArenaVec::one(&cx, C::Binding.{ name: r, ty: self.substitute_type(&cx, ty) }), "join");
-        self.sites.insert(&cx, join.label, Buffer!::new().push_static("on some paths to the end of the `").push_static(what).push_static("` at ").push_bytes(&cx, self.here(&cx)).save(&cx));
+        self.sites.insert(&cx, join.label, Buffer!::new().put("on some paths to the end of the `").put(what).put("` at ").write(&cx, self.here(&cx)).save(&cx));
         i = 0usize;
         while i < ends.len(&cx) {
             let (block, result) = ends.at(&cx, i);
@@ -1232,7 +1232,7 @@ impl FnLower['k] {
     // Binds a variable: a new root of the function, holding `value`.
     fn declare(self, &cx: Domain!['k], bid: Span['k], name: Span['k], ty: Type['k], value: Span['k]) {
         let ty = self.substitute_type(&cx, ty);
-        let root = Buffer!::new().push_static("&").push_bytes(&cx, name).push_static("#").push_bytes(&cx, bid).save(&cx);
+        let root = f"&{name}#{bid}".write(&cx, Buffer!::new()).save(&cx);
         self.locals.push(&cx, C::Binding.{ name: root, ty: ty });
         self.bindings.insert(&cx, bid, Binding.{ name, ty: ty, path: Option::Some.(root), fields: Option::None });
         let unit = self.emit(&cx, Op::new(&cx, "store", C::unit(&cx), ArenaVec::two(&cx, root, value)));
@@ -1241,7 +1241,7 @@ impl FnLower['k] {
     fn read(self, &cx: Domain!['k], binding: Binding['k]) -> Span['k] {
         match binding.path {
             Some(path) => self.emit(&cx, Op::new(&cx, "load", binding.ty, ArenaVec::one(&cx, path))),
-            None => self.fail(&cx, Buffer!::new().push_bytes(&cx, binding.name).push_static(" is a ..rest bundle, not a value").save(&cx), self.at.copy(&cx)),
+            None => self.fail(&cx, Buffer!::new().write(&cx, binding.name).put(" is a ..rest bundle, not a value").save(&cx), self.at.copy(&cx)),
         }
     }
 
@@ -1254,11 +1254,11 @@ impl FnLower['k] {
         match e {
             Path(p) => if self.local_ref(&cx, p) { self.local(&cx, p.id).path } else { Option::None },
             Field(f) => match self.place_path(&cx, f.value.copy(&cx)) {
-                Some(base) => Option::Some.(Buffer!::new().push_bytes(&cx, base).push_static(".").push_bytes(&cx, f.name).save(&cx)),
+                Some(base) => Option::Some.(f"{base}.{f.name}".write(&cx, Buffer!::new()).save(&cx)),
                 None => Option::None,
             },
             Index(x) => match self.place_path(&cx, x.value.copy(&cx)) {
-                Some(base) => Option::Some.(Buffer!::new().push_bytes(&cx, base).push_static(".").push_usize(x.index).save(&cx)),
+                Some(base) => Option::Some.(f"{base}.{x.index}".write(&cx, Buffer!::new()).save(&cx)),
                 None => Option::None,
             },
             _ => Option::None,
@@ -1285,7 +1285,7 @@ impl FnLower['k] {
             let source = if !sources.is_empty(&cx) {
                 sources.at(&cx, k - offset)
             } else {
-                Buffer!::new().push_static(if place { "&" } else { "%a_" }).push_bytes(&cx, name).save(&cx)
+                Buffer!::new().put(if place { "&" } else { "%a_" }).write(&cx, name).save(&cx)
             };
             self.current(&cx).params.push(&cx, C::Binding.{ name: source, ty: ty });
             if place {
@@ -1329,7 +1329,7 @@ impl FnLower['k] {
                 var i = 0usize;
                 while i < captures.len(&cx) {
                     ids.push(&cx, captures.at(&cx, i).binder);
-                    sources.push(&cx, Buffer!::new().push_static("%a_").push_bytes(&cx, captures.at(&cx, i).name).save(&cx));
+                    sources.push(&cx, Buffer!::new().put("%a_").write(&cx, captures.at(&cx, i).name).save(&cx));
                     i = i + 1usize;
                 }
                 self.parameters(&cx, ids, 0usize, sources);
@@ -1436,7 +1436,7 @@ impl FnLower['k] {
             i = i + 1usize;
         }
         match least {
-            Some(b) => self.fail(&cx, Buffer!::new().push_static("a closure or foreach body cannot mention the block-local brand ").push_bytes(&cx, brand_name(&cx, b)).save(&cx), self.at.copy(&cx)),
+            Some(b) => self.fail(&cx, Buffer!::new().put("a closure or foreach body cannot mention the block-local brand ").write(&cx, brand_name(&cx, b)).save(&cx), self.at.copy(&cx)),
             None => (),
         };
     }
@@ -1491,7 +1491,7 @@ impl FnLower['k] {
             Str => self.string(&cx, l.text),
             Bool => self.constant(&cx, ty, Span::from_static(&cx, if l.int != 0u64 { "true" } else { "false" })),
             Float => self.constant(&cx, ty, l.text),
-            Int => self.constant(&cx, ty, Buffer!::new().push_u64(l.int).save(&cx)),
+            Int => self.constant(&cx, ty, Buffer!::new().put(l.int).save(&cx)),
         }
     }
 
@@ -1503,7 +1503,7 @@ impl FnLower['k] {
         let d = self.emit(&cx, Op::new(&cx, "data", C::ptr(&cx, Type::Array.(ref_in(&cx, u8_type), n as u64 + 1u64)), ArenaVec::one(&cx, data)));
         let p = self.emit(&cx, Op::new(&cx, "cast", C::ptr(&cx, u8_type), ArenaVec::one(&cx, d)).typed(C::ptr(&cx, u8_type)).discharge(true));
         let brand = self.emit(&cx, Op::new(&cx, "static_brand", Type::Brand.(ref_in(&cx, fixed)), ArenaVec::new(&cx)).discharge(true));
-        let length = self.constant(&cx, C::usize_type(&cx), Buffer!::new().push_usize(n).save(&cx));
+        let length = self.constant(&cx, C::usize_type(&cx), Buffer!::new().put(n).save(&cx));
         let sig = self.lowering.library_sig(&cx, "Slice::from_raw_parts", self.home);
         let slice_ty = Type::Named.(self.lowering.library_name(&cx, "Slice", self.home), ArenaVec::two(&cx, u8_type, fixed));
         let args = ArenaVec::one(&cx, sig.name);
@@ -1561,13 +1561,13 @@ impl FnLower['k] {
             None => (),
         };
         let names = p.names(&cx);
-        var message = Buffer!::new().push_static("cannot lower the path ");
+        var message = Buffer!::new().put("cannot lower the path ");
         var i = 0usize;
         while i < names.len(&cx) {
             if i > 0usize {
-                message = message.push_static("::");
+                message = message.put("::");
             }
-            message = message.push_bytes(&cx, names.at(&cx, i));
+            message = message.write(&cx, names.at(&cx, i));
             i = i + 1usize;
         }
         self.fail(&cx, message.save(&cx), p.pos)
@@ -1578,7 +1578,7 @@ impl FnLower['k] {
             Str(t, _ty) => self.string(&cx, t),
             Int(v, ty) => match ty {
                 Prim(name) => self.constant(&cx, ty, int_text(&cx, v, name)),
-                _ => self.constant(&cx, ty, Buffer!::new().push_u64(v).save(&cx)),
+                _ => self.constant(&cx, ty, Buffer!::new().put(v).save(&cx)),
             },
             Bool(b) => self.constant(&cx, C::bool_type(&cx), Span::from_static(&cx, if b { "true" } else { "false" })),
             Float(digits, ty) => self.constant(&cx, ty, digits),
@@ -1728,8 +1728,8 @@ impl FnLower['k] {
         if op.is(&cx, "-") {
             match u.operand.copy(&cx) {
                 Lit(l) => match l.kind {
-                    Int => return Option::Some.(self.constant(&cx, ty, Buffer!::new().push_static("-").push_u64(l.int).save(&cx))),
-                    Float => return Option::Some.(self.constant(&cx, ty, Buffer!::new().push_static("-").push_bytes(&cx, l.text).save(&cx))),
+                    Int => return Option::Some.(self.constant(&cx, ty, Buffer!::new().put("-").put(l.int).save(&cx))),
+                    Float => return Option::Some.(self.constant(&cx, ty, Buffer!::new().put("-").write(&cx, l.text).save(&cx))),
                     _ => (),
                 },
                 _ => (),
@@ -1774,9 +1774,9 @@ impl FnLower['k] {
             let one = self.constant(&cx, ty, Span::from_static(&cx, "1"));
             self.emit(&cx, Op::new(&cx, "sub", ty, ArenaVec::two(&cx, zero, one)))
         } else if bits == 64u32 {
-            self.constant(&cx, ty, Buffer!::new().push_u64(18446744073709551615u64).save(&cx))
+            self.constant(&cx, ty, Buffer!::new().put(18446744073709551615u64).save(&cx))
         } else {
-            self.constant(&cx, ty, Buffer!::new().push_u64((1u64 << (bits as u64)) - 1u64).save(&cx))
+            self.constant(&cx, ty, Buffer!::new().put((1u64 << (bits as u64)) - 1u64).save(&cx))
         };
         self.emit(&cx, Op::new(&cx, "bit_xor", ty, ArenaVec::two(&cx, v, mask)))
     }
@@ -1980,7 +1980,7 @@ impl FnLower['k] {
         };
         let payload = if given.is_empty(&cx) {
             if !is_unit(&cx, payload_ty) {
-                self.fail(&cx, Buffer!::new().push_static("variant ").push_bytes(&cx, name).push_static(" used as a function value").save(&cx), self.at.copy(&cx));
+                self.fail(&cx, f"variant {name} used as a function value".write(&cx, Buffer!::new()).save(&cx), self.at.copy(&cx));
             }
             Option::Some.(self.emit(&cx, Op::new(&cx, "construct", C::unit(&cx), ArenaVec::new(&cx)).typed(C::unit(&cx))))
         } else if given.len(&cx) == 1usize {
@@ -2164,7 +2164,7 @@ impl FnLower['k] {
                                     },
                                     None => (),
                                 };
-                                Option::Some.(Buffer!::new().push_static("&*").push_bytes(&cx, p).save(&cx))
+                                Option::Some.(Buffer!::new().put("&*").write(&cx, p).save(&cx))
                             },
                             None => Option::None,
                         };
@@ -2265,9 +2265,9 @@ impl FnLower['k] {
             None => return Option::None,
         };
         let op = if name.is(&cx, "load") || name.is(&cx, "store") || name.is(&cx, "load_volatile") || name.is(&cx, "store_volatile") {
-            Buffer!::new().push_static("ptr_").push_bytes(&cx, name).save(&cx)
+            Buffer!::new().put("ptr_").write(&cx, name).save(&cx)
         } else {
-            Buffer!::new().push_static("ptr_atomic_").push_bytes(&cx, kind).save(&cx)
+            Buffer!::new().put("ptr_atomic_").write(&cx, kind).save(&cx)
         };
         let rty = self.substitute_type(&cx, self.type_of(&cx, c.id));
         Option::Some.(self.emit(&cx, Op::named(&cx, op, rty, operands).maybe_literal(orders)
@@ -2288,21 +2288,20 @@ impl FnLower['k] {
                 || failure.is(&cx, "acquire") && (order.is(&cx, "acquire") || order.is(&cx, "acq_rel") || order.is(&cx, "seq_cst"))
                 || failure.is(&cx, "seq_cst") && order.is(&cx, "seq_cst");
             if !allowed {
-                self.fail(&cx, Buffer!::new().push_static("compare_exchange failure ordering ").push_bytes(&cx, failure).push_static(" is invalid for success ordering ")
-                    .push_bytes(&cx, order).save(&cx), expr_pos(args.at(&cx, 1usize)));
+                self.fail(&cx, f"compare_exchange failure ordering {failure} is invalid for success ordering {order}".write(&cx, Buffer!::new()).save(&cx), expr_pos(args.at(&cx, 1usize)));
             }
         } else if kind.is(&cx, "load") && (order.is(&cx, "release") || order.is(&cx, "acq_rel"))
             || kind.is(&cx, "store") && (order.is(&cx, "acquire") || order.is(&cx, "acq_rel"))
             || kind.is(&cx, "fence") && order.is(&cx, "relaxed") {
-            self.fail(&cx, Buffer!::new().push_static("atomic ").push_bytes(&cx, kind).push_static(" does not support ordering ").push_bytes(&cx, order).save(&cx), expr_pos(args.at(&cx, 0usize)));
+            self.fail(&cx, f"atomic {kind} does not support ordering {order}".write(&cx, Buffer!::new()).save(&cx), expr_pos(args.at(&cx, 0usize)));
         }
         var out = Buffer!::new();
         i = 0usize;
         while i < orders.len(&cx) {
             if i > 0usize {
-                out = out.push_static("/");
+                out = out.put("/");
             }
-            out = out.push_bytes(&cx, orders.at(&cx, i));
+            out = out.write(&cx, orders.at(&cx, i));
             i = i + 1usize;
         }
         out.save(&cx)
@@ -2618,7 +2617,7 @@ impl FnLower['k] {
         }
         seen.destroy();
         if !missing.is_empty(&cx) {
-            self.fail(&cx, Buffer!::new().push_static("a match must cover every enum variant; it misses ").push_bytes(&cx, listed(&cx, missing)).save(&cx), m.pos);
+            self.fail(&cx, Buffer!::new().put("a match must cover every enum variant; it misses ").write(&cx, listed(&cx, missing)).save(&cx), m.pos);
         }
         resolved
     }
@@ -2721,13 +2720,13 @@ impl FnLower['k] {
         let types = if whole { ArenaVec::one(&cx, ty) } else { self.lowering.types.fields(&cx, ty, Option::None) };
         let sources: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         if lent {
-            let path = Buffer!::new().push_bytes(&cx, payload).push_static(".").push_bytes(&cx, self.case_variant(&cx, case)).save(&cx);
+            let path = Buffer!::new().write(&cx, payload).put(".").write(&cx, self.case_variant(&cx, case)).save(&cx);
             if whole {
                 sources.push(&cx, path);
             } else {
                 var k = 0usize;
                 while k < types.len(&cx) {
-                    sources.push(&cx, Buffer!::new().push_bytes(&cx, path).push_static(".").push_usize(k).save(&cx));
+                    sources.push(&cx, f"{path}.{k}".write(&cx, Buffer!::new()).save(&cx));
                     k = k + 1usize;
                 }
             }
@@ -2799,7 +2798,7 @@ impl FnLower['k] {
     fn next_lifted(self, &cx: Domain!['k], kind: Slice[u8, 'static]) -> Span['k] {
         let n = self.lowering.closures.copy(&cx);
         self.lowering.closures.set(&cx, n + 1u64);
-        Buffer!::new().push_bytes(&cx, self.name).push_static("#").push_static(kind).push_u64(n).save(&cx)
+        f"{self.name}#{kind}{n}".write(&cx, Buffer!::new()).save(&cx)
     }
 
     fn expr_closure(self, &cx: Domain!['k], c: S::Closure['k]) -> Option[Span['k]] {
@@ -2889,8 +2888,9 @@ impl FnLower['k] {
         self.fstring(&cx, f, writer)
     }
 
-    // Writes each piece into the writer: text through `Writer::write_static`, `{expr}` through
-    // `Format::format`, which hands the value back (`{&x}` stores it again).
+    // Writes each piece into the writer: text, and `{x}` of type `Slice[u8, 'static]`, through
+    // `Writer::write_static`, any other `{x}` through `Format::format`, which hands the value back
+    // (`{&x}` stores it again).
     fn fstring(self, &cx: Domain!['k], f: S::FStr['k], start: Span['k]) -> Option[Span['k]] {
         var writer = start;
         let wty = self.vty.at(&cx, writer);
@@ -2917,23 +2917,29 @@ impl FnLower['k] {
                     };
                     writer = values.at(&cx, 0usize);
                     let v = values.at(&cx, 1usize);
-                    let vty = self.vty.at(&cx, v);
-                    if !lend && !self.copy(&cx, vty) {
-                        match written_place(&cx, part) {
-                            Some(place) => self.fail(&cx, Buffer!::new().push_static("{").push_bytes(&cx, place).push_static("} in an f-string drops a linear value; lend it with {&")
-                                .push_bytes(&cx, place).push_static("}").save(&cx), expr_pos(part)),
-                            None => self.fails(&cx, "a value in an f-string is formatted and dropped, and this one is linear; bind it to a var and lend that", expr_pos(part)),
+                    if self.results().static_parts.contains(&cx, expr_id(part)) {
+                        let args = ArenaVec::two(&cx, writer_trait, Span::from_static(&cx, "write_static"));
+                        args.push(&cx, writer);
+                        args.push(&cx, v);
+                        writer = self.emit(&cx, Op::new(&cx, "trait_call", wty, args).with_tys(ArenaVec::one(&cx, wty)));
+                    } else {
+                        let vty = self.vty.at(&cx, v);
+                        if !lend && !self.copy(&cx, vty) {
+                            match written_place(&cx, part) {
+                                Some(place) => self.fail(&cx, f"{{{place}}} in an f-string drops a linear value; lend it with {{&{place}}}".write(&cx, Buffer!::new()).save(&cx), expr_pos(part)),
+                                None => self.fails(&cx, "a value in an f-string is formatted and dropped, and this one is linear; bind it to a var and lend that", expr_pos(part)),
+                            }
                         }
-                    }
-                    let pair = Type::Tuple.(ArenaVec::two(&cx, vty, wty));
-                    let args = ArenaVec::two(&cx, format, Span::from_static(&cx, "format"));
-                    args.push(&cx, v);
-                    args.push(&cx, writer);
-                    let both = self.emit(&cx, Op::new(&cx, "trait_call", pair, args).with_tys(ArenaVec::two(&cx, vty, wty)));
-                    let parts = self.destruct(&cx, both, pair);
-                    writer = parts.at(&cx, 1usize).name;
-                    if lend {
-                        self.put_back(&cx, operand, parts.at(&cx, 0usize).name);
+                        let pair = Type::Tuple.(ArenaVec::two(&cx, vty, wty));
+                        let args = ArenaVec::two(&cx, format, Span::from_static(&cx, "format"));
+                        args.push(&cx, v);
+                        args.push(&cx, writer);
+                        let both = self.emit(&cx, Op::new(&cx, "trait_call", pair, args).with_tys(ArenaVec::two(&cx, vty, wty)));
+                        let parts = self.destruct(&cx, both, pair);
+                        writer = parts.at(&cx, 1usize).name;
+                        if lend {
+                            self.put_back(&cx, operand, parts.at(&cx, 0usize).name);
+                        }
                     }
                 },
             };
@@ -3037,7 +3043,7 @@ impl FnLower['k] {
             let actual: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
             var i = 0usize;
             while i < opened.len(&cx) {
-                actual.push(&cx, Buffer!::new().push_bytes(&cx, opened.at(&cx, i)).push_static("#").push_bytes(&cx, self.fresh(&cx, "").skip(1usize)).save(&cx));
+                actual.push(&cx, Buffer!::new().write(&cx, opened.at(&cx, i)).put("#").write(&cx, self.fresh(&cx, "").skip(1usize)).save(&cx));
                 i = i + 1usize;
             }
             let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
@@ -3087,10 +3093,10 @@ impl FnLower['k] {
                         Some(sub) => self.pattern(&cx, sub, c.name),
                         None => match ps.rest {
                             Some(_r) => {
-                                let bid = Buffer!::new().push_bytes(&cx, id_text(&cx, match rest_id {
+                                let bid = Buffer!::new().write(&cx, id_text(&cx, match rest_id {
                                     Some(id) => id,
                                     None => self.fails(&cx, "internal error: a rest pattern without an id", self.at.copy(&cx)),
-                                })).push_static("_").push_bytes(&cx, name).save(&cx);
+                                })).put("_").write(&cx, name).save(&cx);
                                 rest.insert(&cx, name, bid);
                                 self.declare(&cx, bid, name, c.ty, c.name);
                             },

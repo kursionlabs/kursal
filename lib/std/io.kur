@@ -1,7 +1,8 @@
 //! Input and output through the standard streams and files.
 //!
 //! Process I/O over the POSIX `read`/`write`/`open`/`close`/`fstat` calls:
-//! byte output to standard output (`print`) and standard error (`eprint`),
+//! printing to standard output (`print`) and standard error (`eprint`),
+//! any `Printable` value: `print("done\n")`, `print(f"{n} files\n")`;
 //! whole-file and stdin reads into an owned `Buffer!`, the owning
 //! descriptor type `File!`, buffered `Output!`, and `Input!`, the buffered
 //! reader of standard input;
@@ -15,7 +16,7 @@ use core::mem::alloca;
 use core::raw::Span;
 use core::ptr::offset;
 use core::slice::{Slice, ReadBytes};
-use core::fmt::{Format, Writer, write_i64};
+use core::fmt::{Format, Printable, Writer};
 use core::option::{Option, Result};
 use core::cap::{Access, Exclusive!};
 // The system calls: a read or write a signal interrupts is made again,
@@ -31,7 +32,7 @@ use libc::io::{kur_libc_fs_read, kur_libc_fs_write, kur_libc_fs_open_read, kur_l
 /// own, which C would read as the end.
 forall C, S where ReadBytes[C, S], Copy[S].
 fn c_string(&cx: C, bytes: S) -> Buffer! {
-    Buffer!::new().push_bytes(&cx, bytes).push_byte(0u8)
+    Buffer!::new().write(&cx, bytes).write_byte(0u8)
 }
 
 /// An I/O error: the `errno` of the system call that failed, or EIO (5)
@@ -150,14 +151,15 @@ impl Error {
 forall W where Writer[W].
 instance Format[Error, W] {
     fn format(value: Error, out: W) -> (Error, W) {
-        var text = value.message();
-        let p = unsafe &text.as_ptr();
-        let n = &text.len();
-        // `p` addresses the `n` bytes `text` holds until it is freed below.
-        let out = unsafe Writer[W]::write_raw(out, p, n);
-        text.destroy();
-        let out = write_i64(Writer[W]::write_static(out, " (error "), value.errno as i64);
-        (value, Writer[W]::write_static(out, ")"))
+        (value, Printable[Error, W]::print(value, out))
+    }
+}
+
+/// An error prints as it formats: `No such file or directory (error 2)`.
+forall W where Writer[W].
+instance Printable[Error, W] {
+    fn print(value: Error, out: W) -> W {
+        out.put(value.message()).put(" (error ").put(value.errno).put(")")
     }
 }
 
@@ -197,85 +199,22 @@ unsafe fn write_all(fd: i32, ptr: *u8, len: usize) -> Result[(), Error] {
     Result::Ok.(())
 }
 
-/// Writes a static byte slice to `fd`. Caller: `fd` is a descriptor the
-/// caller may write, as for `write_all`.
-unsafe fn write_static_to(fd: i32, s: Slice[u8, 'static]) -> Result[(), Error] {
-    let (p, n, m) = s.into_parts();
-    unsafe write_all(fd, p, n)
-}
-
-/// Writes a span's bytes to `fd`, reading them under the domain's
-/// capability, which `cx` lends. Caller: `fd` is a descriptor the caller
-/// may write, as for `write_all`.
-forall 'k, C, R where Access[C -> 'k, R].
-unsafe fn write_span_to(fd: i32, &cx: C, sp: Span['k]) -> Result[(), Error] {
-    let (tag, rest) = Access[C -> 'k, R]::open(cx);
-    let (p, n) = sp.into_parts();
-    let result = unsafe write_all(fd, p, n);
-    cx = Access[C -> 'k, R]::close(tag, rest);
-    result
-}
-
-/// Writes `buf`'s bytes to `fd`, then frees it. Reads them through
-/// `as_ptr`/`len`; writing needs no brand. Caller: `fd` is a descriptor the
-/// caller may write, as for `write_all`.
-unsafe fn write_buffer_to(fd: i32, buf: Buffer!) -> Result[(), Error] {
-    var buf = buf;
-    let p = unsafe &buf.as_ptr();
-    let n = &buf.len();
-    let result = unsafe write_all(fd, p, n);
-    buf.destroy();
-    result
-}
-
 // `print` writes to standard output (descriptor 1), `eprint` to standard
 // error (descriptor 2): the process's own streams, which any of its code
-// may write.
+// may write. Each writes through an `Output!` of its own, finished before
+// it returns, so what it prints is written by the time it returns.
 
-/// Writes a static byte slice to standard output. Returns an I/O error on failure.
-fn print(s: Slice[u8, 'static]) -> Result[(), Error] {
-    unsafe write_static_to(1i32, s)
+/// Prints `x` to standard output (`Printable`): `print("done\n")`,
+/// `print(f"{n} files\n")`. Returns an I/O error on failure.
+forall T where Printable[T, Output!].
+fn print(x: T) -> Result[(), Error] {
+    stdout().put(x).finish()
 }
 
-/// Writes any byte view to standard output, read through the capability
-/// that permits it (`Exclusive!`, `Shared!`, `StaticRead`).
-forall C, S where ReadBytes[C, S], Copy[S].
-fn print_bytes(&cx: C, bytes: S) -> Result[(), Error] {
-    unsafe write_buffer_to(1i32, Buffer!::new().push_bytes(&cx, bytes))
-}
-
-/// Writes a span's bytes to standard output where they lie, reading them
-/// under the domain's capability, which `cx` lends.
-forall 'k, C, R where Access[C -> 'k, R].
-fn print_span(&cx: C, sp: Span['k]) -> Result[(), Error] {
-    unsafe write_span_to(1i32, &cx, sp)
-}
-
-/// Writes `buf`'s bytes to standard output, then frees it.
-fn print_buffer(buf: Buffer!) -> Result[(), Error] {
-    unsafe write_buffer_to(1i32, buf)
-}
-
-/// Writes a static byte slice to standard error.
-fn eprint(s: Slice[u8, 'static]) -> Result[(), Error] {
-    unsafe write_static_to(2i32, s)
-}
-
-/// Writes any byte view to standard error.
-forall C, S where ReadBytes[C, S], Copy[S].
-fn eprint_bytes(&cx: C, bytes: S) -> Result[(), Error] {
-    unsafe write_buffer_to(2i32, Buffer!::new().push_bytes(&cx, bytes))
-}
-
-/// Writes a span's bytes to standard error where they lie.
-forall 'k, C, R where Access[C -> 'k, R].
-fn eprint_span(&cx: C, sp: Span['k]) -> Result[(), Error] {
-    unsafe write_span_to(2i32, &cx, sp)
-}
-
-/// Writes `buf`'s bytes to standard error, then frees it.
-fn eprint_buffer(buf: Buffer!) -> Result[(), Error] {
-    unsafe write_buffer_to(2i32, buf)
+/// Prints `x` to standard error, as `print` does to standard output.
+forall T where Printable[T, Output!].
+fn eprint(x: T) -> Result[(), Error] {
+    stderr().put(x).finish()
 }
 
 // ---------------------------------------------------------------- files --
@@ -376,7 +315,7 @@ impl Input! {
             while end < n && unsafe *(unsafe offset(p, end)) != b'\n' {
                 end = end + 1usize;
             }
-            line = unsafe line.push_n(unsafe offset(p, start), end - start);
+            line = unsafe Writer[Buffer!]::write_raw(line, unsafe offset(p, start), end - start);
             if end < n {
                 self = Input!.{ buf, start: end + 1usize };
                 return Result::Ok.(Option::Some.(line));
@@ -433,7 +372,7 @@ fn rest_of(buf: Buffer!, start: usize) -> Buffer! {
     let n = &buf.len();
     let p = unsafe &buf.as_ptr();
     // `p[start..n)` are bytes `buf` holds, and `buf` is freed after the copy.
-    let rest = unsafe Buffer!::with_capacity(n - start).push_n(unsafe offset(p, start), n - start);
+    let rest = unsafe Writer[Buffer!]::write_raw(Buffer!::with_capacity(n - start), unsafe offset(p, start), n - start);
     buf.destroy();
     rest
 }
@@ -516,11 +455,11 @@ fn read_line_unbuffered() -> Result[Option[Buffer!], Error] {
 //
 // Standard input, output and error stay bare `i32`s (0/1/2), never
 // `File!`: they are borrowed process handles this program did not open
-// and must not close. Only this module names them, in `print`, `eprint`,
-// `Input!`, `read_line` and `Output!`. A `File!` never gets one of
-// their numbers: the C `main` the compiler writes for an executable opens
-// /dev/null on each of the three the process started without, before the
-// program runs.
+// and must not close. Only this module names them, in `Input!`,
+// `read_line`, and `stdout` and `stderr`, which make an `Output!`. A `File!`
+// never gets one of their numbers: the C `main` the compiler writes for an
+// executable opens /dev/null on each of the three the process started
+// without, before the program runs.
 /// Owns one open file descriptor. Call `close` to consume it.
 struct File! {
     fd: i32,
@@ -731,7 +670,8 @@ impl File! {
 //     let done = f"{name}: {count}\n".write(stdout()).finish();
 //
 // Output collects bytes and writes them once 4 KiB have gathered, on
-// `flush`, or on `finish`. Its error is sticky: once a write fails, the
+// `flush`, or on `finish`; one raw write of 4 KiB or more goes out at once,
+// after them. Its error is sticky: once a write fails, the
 // rest is dropped, and `finish` reports the first failure (`error` holds
 // its errno, 0 until then).
 /// Buffered output handle. Call `finish` to flush and consume it.
@@ -797,16 +737,30 @@ impl Output! {
 instance Writer[Output!] {
     fn write_byte(self: Output!, byte: u8) -> Output! {
         let { fd, buf, error } = self;
-        Output!.{ fd, buf: buf.push_byte(byte), error }.gathered()
+        Output!.{ fd, buf: buf.write_byte(byte), error }.gathered()
     }
     fn write_static(self: Output!, bytes: Slice[u8, 'static]) -> Output! {
         let { fd, buf, error } = self;
-        Output!.{ fd, buf: buf.push_static(bytes), error }.gathered()
+        Output!.{ fd, buf: buf.write_static(bytes), error }.gathered()
     }
     /// Caller: `ptr[0..len)` is readable for the whole call
     /// (`Writer::write_raw`).
     unsafe fn write_raw(self: Output!, ptr: *u8, len: usize) -> Output! {
-        let { fd, buf, error } = self;
-        Output!.{ fd, buf: unsafe buf.push_n(ptr, len), error }.gathered()
+        if len < 4096usize {
+            let { fd, buf, error } = self;
+            return Output!.{ fd, buf: unsafe Writer[Buffer!]::write_raw(buf, ptr, len), error }.gathered();
+        }
+        // 4 KiB or more is written where it lies, after what has gathered,
+        // rather than copied: `print` of a whole buffer.
+        let { fd, buf, error } = self.flush();
+        if error != 0i32 {
+            return Output!.{ fd, buf, error };
+        }
+        // `fd` is standard output or error, as for `flush`.
+        let error = match unsafe write_all(fd, ptr, len) {
+            Ok(nothing) => 0i32,
+            Err(e) => e.errno,
+        };
+        Output!.{ fd, buf, error }
     }
 }

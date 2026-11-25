@@ -121,8 +121,13 @@ compiler, and [`compiler/README.md`](compiler/README.md) for the compiler and it
 
 ## Standard library
 
+Text goes out through writers (`std::fmt::Writer`): `print("done\n")` and `print(f"{n} files\n")`
+print to standard output, `eprint` to standard error; `out.put(x)` prints a literal, a number, a
+`bool` or a `Buffer!` into any writer, a `Buffer!` or `stdout()` among them, and
+`out.write(&cx, bytes)` copies the bytes of a view read through the capability `cx` lends.
+
 Running out of memory aborts a program: the library's constructors, and every operation that grows a
-container (`push`, `insert`, a buffer's `push_*`, an arena's allocations), stop it with `abort` when
+container (`push`, `insert`, a write to a buffer, an arena's allocations), stop it with `abort` when
 `malloc` or `realloc` fails, and return no error for it. A program that must recover makes its
 containers with the fallible constructors, which return an `AllocError` instead:
 `Buffer!::try_with_capacity`, `Vec!::try_new`, `OwnedVec!::try_new`, `HashMap!::try_new`,

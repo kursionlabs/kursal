@@ -505,4 +505,10 @@ INFER_ERRORS = (
       "a/shapes.kur": "exposed struct Square { side: u32 }\ntrait Area { fn area(self: Self) -> u32; }\n"
                       "instance Area[Square] { fn area(self: Square) -> u32 { self.side } }\n"},
      "3:26: Square has no method area; the trait Area provides it, import it"),
+    # A blanket impl's method names the trait that bounds the impl.
+    ({"a/kur.toml": manifest("a"), "a/lib.kur": "use package::shapes::Square;\nuse package::shapes;\nfn f(s: Square) -> u32 { s.area() }\n",
+      "a/shapes.kur": "exposed struct Square { side: u32 }\ntrait Sided { fn side(self: Self) -> u32; }\n"
+                      "instance Sided[Square] { fn side(self: Square) -> u32 { self.side } }\n"
+                      "forall S where Sided[S].\nimpl S { fn area(self) -> u32 { let n = Sided[S]::side(self); n * n } }\n"},
+     "3:26: Square has no method area; the trait Sided provides it, import it"),
 )

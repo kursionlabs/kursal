@@ -28,8 +28,9 @@ MANIFEST = '[package]\nname="t"\nkind="executable"\nentry="package::main"\nsourc
 DECODER = r'''
 use std::arena::Domain!;
 use std::buffer::Buffer!;
+use std::fmt::Writer;
 use std::collections::arena_map::ArenaMap;
-use std::io::{print_buffer, read_all_stdin};
+use std::io::{print, read_all_stdin};
 use std::option::{Option, Result};
 use std::raw::Span;
 use toml::parse;
@@ -41,29 +42,29 @@ fn hex(d: u8) -> u8 {
 
 forall 'k.
 fn string(&cx: Domain!['k], out: Buffer!, s: Span['k]) -> Buffer! {
-    var out = out.push_byte(b'"');
+    var out = out.write_byte(b'"');
     var i = 0usize;
     while i < s.len() {
         let b = s.byte_or_zero(&cx, i);
         if b == b'"' || b == b'\\' {
-            out = out.push_byte(b'\\').push_byte(b);
+            out = out.write_byte(b'\\').write_byte(b);
         } else if b < 32u8 || b == 127u8 {
-            out = out.push_static("\\u00").push_byte(hex(b / 16u8)).push_byte(hex(b % 16u8));
+            out = out.put("\\u00").write_byte(hex(b / 16u8)).write_byte(hex(b % 16u8));
         } else {
-            out = out.push_byte(b);
+            out = out.write_byte(b);
         }
         i = i + 1usize;
     }
-    out.push_byte(b'"')
+    out.write_byte(b'"')
 }
 
 forall 'k.
 fn value(&cx: Domain!['k], out: Buffer!, v: TomlValue['k]) -> Buffer! {
     match v {
-        TomlValue::String(s) => string(&cx, out.push_static("{\"type\":\"string\",\"value\":"), s).push_static("}"),
-        TomlValue::Integer(n) => out.push_static("{\"type\":\"integer\",\"value\":\"").push_i64(n).push_static("\"}"),
-        TomlValue::Float(x) => out.push_static("{\"type\":\"float\",\"value\":\"").push_u64(x.to_bits()).push_static("\"}"),
-        TomlValue::Boolean(b) => out.push_static("{\"type\":\"bool\",\"value\":\"").push_static(if b { "true" } else { "false" }).push_static("\"}"),
+        TomlValue::String(s) => string(&cx, out.put("{\"type\":\"string\",\"value\":"), s).put("}"),
+        TomlValue::Integer(n) => out.put("{\"type\":\"integer\",\"value\":\"").put(n).put("\"}"),
+        TomlValue::Float(x) => out.put("{\"type\":\"float\",\"value\":\"").put(x.to_bits()).put("\"}"),
+        TomlValue::Boolean(b) => out.put("{\"type\":\"bool\",\"value\":\"").put(if b { "true" } else { "false" }).put("\"}"),
         TomlValue::Datetime(d) => {
             let kind = match d.kind {
                 DatetimeKind::OffsetDatetime => "datetime",
@@ -71,19 +72,19 @@ fn value(&cx: Domain!['k], out: Buffer!, v: TomlValue['k]) -> Buffer! {
                 DatetimeKind::LocalDate => "date-local",
                 DatetimeKind::LocalTime => "time-local",
             };
-            string(&cx, out.push_static("{\"type\":\"").push_static(kind).push_static("\",\"value\":"), d.text).push_static("}")
+            string(&cx, out.put("{\"type\":\"").put(kind).put("\",\"value\":"), d.text).put("}")
         },
         TomlValue::Array(a) => {
-            var o = out.push_static("[");
+            var o = out.put("[");
             var i = 0usize;
             while i < a.len(&cx) {
                 if i > 0usize {
-                    o = o.push_static(",");
+                    o = o.put(",");
                 }
                 o = value(&cx, o, a.at(&cx, i));
                 i = i + 1usize;
             }
-            o.push_static("]")
+            o.put("]")
         },
         TomlValue::Table(t) => table(&cx, out, t),
     }
@@ -91,24 +92,24 @@ fn value(&cx: Domain!['k], out: Buffer!, v: TomlValue['k]) -> Buffer! {
 
 forall 'k.
 fn table(&cx: Domain!['k], out: Buffer!, t: ArenaMap[Span['k], TomlValue['k], 'k]) -> Buffer! {
-    var o = out.push_static("{");
+    var o = out.put("{");
     var first = true;
     var i = 0usize;
     while i < t.positions(&cx) {
         match t.key_at(&cx, i) {
             Option::Some(k) => {
                 if !first {
-                    o = o.push_static(",");
+                    o = o.put(",");
                 }
                 first = false;
-                o = string(&cx, o, k).push_static(":");
+                o = string(&cx, o, k).put(":");
                 o = value(&cx, o, t.at(&cx, k));
             },
             Option::None => (),
         }
         i = i + 1usize;
     }
-    o.push_static("}")
+    o.put("}")
 }
 
 fn main() -> i32 {
@@ -121,13 +122,13 @@ fn main() -> i32 {
     let src = input.save(&cx);
     let status = match parse(&cx, src) {
         Result::Ok(root) => {
-            print_buffer(table(&cx, Buffer!::new(), root));
+            print(table(&cx, Buffer!::new(), root));
             0
         },
         Result::Err(e) => {
             let (line, column) = line_column(&cx, src, e.offset);
-            print_buffer(Buffer!::new().push_usize(e.offset).push_static(" ").push_usize(line).push_static(" ")
-                .push_usize(column).push_static(" ").push_static(e.message));
+            print(Buffer!::new().put(e.offset).put(" ").put(line).put(" ")
+                .put(column).put(" ").put(e.message));
             1
         },
     };

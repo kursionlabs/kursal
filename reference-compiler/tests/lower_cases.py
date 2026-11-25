@@ -18,15 +18,15 @@ LOWER_ERRORS: tuple[tuple[str | dict[str, str], str], ...] = (
     ("exposed enum L { R, A, G }\nfn f(l: L) -> u32 { match l { R => 1u32, G => 2u32 } }\n",
      "2:21: a match must cover every enum variant; it misses A"),
     # `{x}` hands its value to `Format::format` and drops the copy it gets back.
-    ("use std::buffer::Buffer!;\nuse std::io::print_buffer;\nfn main() {\n"
-     "    let name = Buffer!::new().push_static(\"x\");\n    print_buffer(f\"hi {name}\\n\");\n}\n",
-     "5:24: {name} in an f-string drops a linear value; lend it with {&name}"),
-    ("use std::buffer::Buffer!;\nuse std::io::print_buffer;\nstruct P! { b: Buffer! }\nfn main() {\n"
-     "    let p = P!.{ b: Buffer!::new() };\n    print_buffer(f\"hi {p.b}\\n\");\n}\n",
-     "6:24: {p.b} in an f-string drops a linear value; lend it with {&p.b}"),
-    ("use std::buffer::Buffer!;\nuse std::io::print_buffer;\nfn main() {\n"
-     "    print_buffer(f\"hi {Buffer!::new()}\\n\");\n}\n",
-     "4:24: a value in an f-string is formatted and dropped, and this one is linear; bind it to a var and lend that"),
+    ("use std::buffer::Buffer!;\nuse std::io::print;\nfn main() {\n"
+     "    let name = Buffer!::new();\n    print(f\"hi {name}\\n\");\n}\n",
+     "5:17: {name} in an f-string drops a linear value; lend it with {&name}"),
+    ("use std::buffer::Buffer!;\nuse std::io::print;\nstruct P! { b: Buffer! }\nfn main() {\n"
+     "    let p = P!.{ b: Buffer!::new() };\n    print(f\"hi {p.b}\\n\");\n}\n",
+     "6:17: {p.b} in an f-string drops a linear value; lend it with {&p.b}"),
+    ("use std::buffer::Buffer!;\nuse std::io::print;\nfn main() {\n"
+     "    print(f\"hi {Buffer!::new()}\\n\");\n}\n",
+     "4:17: a value in an f-string is formatted and dropped, and this one is linear; bind it to a var and lend that"),
     # lowering
     ("fn f() -> i8 { -129i8 }\n", "does not fit"),
     ("fn f() -> u8 { var x: u8 = 300; x }\n", "does not fit"),

@@ -9,6 +9,7 @@ use std::mem::Ref;
 use std::raw::Span;
 use std::arena::{Domain!, ref_in};
 use std::buffer::Buffer!;
+use std::fmt::Writer;
 use package::kurs::core::{Block, Edge, Fun, Kind, ModuleId, Param, Premise, Program, Terminator, Trait, Type, TypeDecl};
 use package::kurs::core as C;
 use package::resolve::resolver::Resolver;
@@ -155,8 +156,8 @@ impl Formation[D, 'k] {
 
     fn fail(self, &cx: Domain!['k], message: Span['k]) -> ! {
         let full = match self.declaration.copy(&cx) {
-            Some(name) => Buffer!::new().push_static("type formation: ").push_bytes(&cx, message).push_static(" in type ").push_bytes(&cx, name).save(&cx),
-            None => Buffer!::new().push_static("type formation: ").push_bytes(&cx, message).save(&cx),
+            Some(name) => f"type formation: {message} in type {name}".write(&cx, Buffer!::new()).save(&cx),
+            None => Buffer!::new().put("type formation: ").write(&cx, message).save(&cx),
         };
         match self.reporter.copy(&cx) {
             Some(r) => r.fail(&cx, full, self.pos.copy(&cx)),
@@ -187,7 +188,7 @@ impl Formation[D, 'k] {
         while d < params.len(&cx) {
             let name = params.at(&cx, d).name;
             if self.program.types.contains(&cx, name) {
-                self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(" is a declared type, not a parameter name").save(&cx));
+                self.fail(&cx, Buffer!::new().write(&cx, name).put(" is a declared type, not a parameter name").save(&cx));
             }
             d = d + 1usize;
         }
@@ -204,7 +205,7 @@ impl Formation[D, 'k] {
     fn fits(self, &cx: Domain!['k], ty: Type['k], want: Kind, env: ArenaMap[Span['k], Kind, 'k]) {
         let got = self.kind(&cx, ty, env);
         if is_brand(got) != is_brand(want) {
-            self.fail(&cx, Buffer!::new().push_static("expected ").push_bytes(&cx, kind_name(&cx, want)).push_static(" argument").save(&cx));
+            self.fail(&cx, Buffer!::new().put("expected ").write(&cx, kind_name(&cx, want)).put(" argument").save(&cx));
         }
         if C::same_kind(want, Kind::Copy) && !self.types.is_copy(&cx, ty, env) {
             self.fail_static(&cx, "expected Copy argument");
@@ -230,7 +231,7 @@ impl Formation[D, 'k] {
         } else {
             match self.program.traits.get(&cx, premise.trait_name) {
                 Some(t) => self.trait_params(&cx, t),
-                None => self.fail(&cx, Buffer!::new().push_static("unknown trait ").push_bytes(&cx, premise.trait_name).save(&cx)),
+                None => self.fail(&cx, Buffer!::new().put("unknown trait ").write(&cx, premise.trait_name).save(&cx)),
             }
         };
         self.arguments(&cx, params, premise.args, env);
@@ -269,7 +270,7 @@ impl Formation[D, 'k] {
                     None => false,
                 };
                 if !in_scope {
-                    self.fail(&cx, Buffer!::new().push_static("brand ").push_bytes(&cx, label).push_static(" is not in scope").save(&cx));
+                    self.fail(&cx, f"brand {label} is not in scope".write(&cx, Buffer!::new()).save(&cx));
                 }
                 return Kind::Brand;
             },
@@ -303,7 +304,7 @@ impl Formation[D, 'k] {
                 // its pointers as written. Where a type parameter decides it, the walk asks for an
                 // explicit pointer.
                 if f.indirect && self.types.rows_fixed(&cx, f.source.copy(&cx), true, env) && !self.types.pattern_available(&cx, f) {
-                    self.fail(&cx, Buffer!::new().push_static("foreach *").push_bytes(&cx, f.binder).push_static(" needs a source written with pointer components").save(&cx));
+                    self.fail(&cx, f"foreach *{f.binder} needs a source written with pointer components".write(&cx, Buffer!::new()).save(&cx));
                 }
                 let names = ArenaVec::one(&cx, f.binder);
                 let mark = self.opened.len(&cx);
@@ -332,7 +333,7 @@ impl Formation[D, 'k] {
             },
             Prim(name) => {
                 if !C::is_prim(&cx, name) {
-                    self.fail(&cx, Buffer!::new().push_static("unknown primitive ").push_bytes(&cx, name).save(&cx));
+                    self.fail(&cx, Buffer!::new().put("unknown primitive ").write(&cx, name).save(&cx));
                 }
             },
             Struct(fields) => self.components(&cx, ty, fields, env),
@@ -366,7 +367,7 @@ impl Formation[D, 'k] {
     // backend's specializations.
     fn sized(self, &cx: Domain!['k], ty: Type['k]) {
         if self.types.closed(&cx, ty) && self.types.layout(&cx, ty).is_none() {
-            self.fail(&cx, Buffer!::new().push_bytes(&cx, show(&cx, ty)).push_static(" is too large: its size is not below 2^64 bytes").save(&cx));
+            self.fail(&cx, Buffer!::new().write(&cx, show(&cx, ty)).put(" is too large: its size is not below 2^64 bytes").save(&cx));
         }
     }
 
@@ -397,7 +398,7 @@ impl Formation[D, 'k] {
         let unit = match env.get(&cx, name) {
             Some(k) => {
                 if !args.is_empty(&cx) || is_brand(k) {
-                    self.fail(&cx, Buffer!::new().push_static("invalid type parameter ").push_bytes(&cx, name).save(&cx));
+                    self.fail(&cx, Buffer!::new().put("invalid type parameter ").write(&cx, name).save(&cx));
                 }
                 return ();
             },
@@ -405,7 +406,7 @@ impl Formation[D, 'k] {
         };
         let decl = match self.program.types.get(&cx, name) {
             Some(d) => d,
-            None => self.fail(&cx, Buffer!::new().push_static("unknown type ").push_bytes(&cx, name).save(&cx)),
+            None => self.fail(&cx, Buffer!::new().put("unknown type ").write(&cx, name).save(&cx)),
         };
         self.arguments(&cx, decl.params, args, env);
         let discharger = match self.discharge.copy(&cx) {
@@ -421,8 +422,7 @@ impl Formation[D, 'k] {
         while i < self.active.len(&cx) {
             let (n, previous, depth) = self.active.at(&cx, i);
             if n.eq(&cx, name) && (self.mentions_opened_since(&cx, args, depth) || !nominal_descent(&cx, args, previous)) {
-                self.fail(&cx, Buffer!::new().push_static("the premises of ").push_bytes(&cx, name).push_static(" require ").push_bytes(&cx, name)
-                    .push_static(" again at arguments that are not smaller").save(&cx));
+                self.fail(&cx, f"the premises of {name} require {name} again at arguments that are not smaller".write(&cx, Buffer!::new()).save(&cx));
             }
             i = i + 1usize;
         }
@@ -445,7 +445,7 @@ impl Formation[D, 'k] {
             let required = Premise.{ trait_name: p.trait_name, args: required_args };
             self.premise(&cx, required, env);
             if !Discharge[D, 'k]::discharge_premise(discharger, &cx, required, env, self.premises.copy(&cx), self.home.copy(&cx)) {
-                self.fail(&cx, Buffer!::new().push_static("unsatisfied nominal premise ").push_bytes(&cx, required.trait_name).push_static(" for ").push_bytes(&cx, name).save(&cx));
+                self.fail(&cx, f"unsatisfied nominal premise {required.trait_name} for {name}".write(&cx, Buffer!::new()).save(&cx));
             }
             k = k + 1usize;
         }
@@ -688,8 +688,8 @@ impl Formation[D, 'k] {
             i = i + 1usize;
         }
         if !self.types.is_copy(&cx, C::named(decl.name, args), kinds) {
-            self.fail(&cx, Buffer!::new().push_static("type ").push_bytes(&cx, decl.name).push_static(" holds a linear type")
-                .push_static(if generic { " whatever its type arguments" } else { "" }).push_static("; declare it ").push_bytes(&cx, decl.name).push_static("!").save(&cx));
+            self.fail(&cx, Buffer!::new().put("type ").write(&cx, decl.name).put(" holds a linear type")
+                .put(if generic { " whatever its type arguments" } else { "" }).put("; declare it ").write(&cx, decl.name).put("!").save(&cx));
         }
     }
 

@@ -26,6 +26,7 @@ use std::mem::Ref;
 use std::raw::Span;
 use std::arena::{Domain!, ref_in, seed};
 use std::buffer::Buffer!;
+use std::fmt::Writer;
 use package::types::coherence::check_coherence;
 use package::kurs::core::{ForeachType, Kind, Member, Meta, MetaKind, ModuleId, Param, Premise, Program, Type, TypeDecl};
 use package::kurs::core as C;
@@ -151,6 +152,8 @@ exposed struct Results {
     next_calls: ArenaMap[u32, TraitCall['k], 'k],
     // struct patterns with `..rest`
     rest_ids: ArenaMap[u32, u32, 'k],
+    // f-strings: the `{x}` parts of type `Slice[u8, 'static]`, written as text is
+    static_parts: ArenaSet[u32, 'k],
 }
 
 forall 'k.
@@ -160,6 +163,7 @@ fn new_results(&cx: Domain!['k]) -> Results['k] {
         field_ids: ArenaMap::new(&cx), spread_ids: ArenaMap::new(&cx), case_binders: ArenaMap::new(&cx), case_labels: ArenaMap::new(&cx), lent: ArenaMap::new(&cx),
         param_ids: ArenaMap::new(&cx), captures: ArenaMap::new(&cx), witnesses: ArenaMap::new(&cx), try_kinds: ArenaMap::new(&cx),
         opened: ArenaMap::new(&cx), options: ArenaMap::new(&cx), next_calls: ArenaMap::new(&cx), rest_ids: ArenaMap::new(&cx),
+        static_parts: ArenaSet::new(&cx),
     }
 }
 
@@ -286,6 +290,14 @@ exposed struct MethodWait {
     result: Type['k],
 }
 
+// An f-string's `{x}`: its id, its type, and the writer it is written into.
+forall 'k.
+exposed struct PlaceholderWait {
+    id: u32,
+    value: Type['k],
+    writer: Type['k],
+}
+
 forall 'k.
 exposed struct PointerWait {
     name: Span['k],
@@ -315,6 +327,7 @@ exposed enum Action {
     Method(MethodWait['k]),
     EnumOperand(Type['k]),
     Pointer(PointerWait['k]),
+    Placeholder(PlaceholderWait['k]),
 }
 
 forall 'k.
@@ -768,23 +781,40 @@ impl Infer['k] {
         found
     }
 
+    // A blanket impl's method is found from a package that is the impl's or depends on it, directly
+    // or through other packages, when every trait bounding the impl's type parameter is visible there
+    // (and it has one).
     fn blanket_visible(self, &cx: Domain!['k], method: Decl['k], home: ModuleId['k], visible: ArenaSet[u32, 'k]) -> bool {
+        let bounds = self.blanket_bounds(&cx, method, home);
+        var i = 0usize;
+        while i < bounds.len(&cx) {
+            if !visible.contains(&cx, bounds.at(&cx, i).id) {
+                return false;
+            }
+            i = i + 1usize;
+        }
+        !bounds.is_empty(&cx)
+    }
+
+    // The traits bounding the type parameter of a blanket impl's method, none when `home`'s package is
+    // not the impl's and does not depend on it.
+    fn blanket_bounds(self, &cx: Domain!['k], method: Decl['k], home: ModuleId['k]) -> ArenaVec[Decl['k], 'k] {
+        let bounds: ArenaVec[Decl['k], 'k] = ArenaVec::new(&cx);
         if !self.depends_on(&cx, home.package, method.home.package) {
-            return false;
+            return bounds;
         }
         let impl_block = match method.impl_block {
             Some(b) => b,
-            None => return false,
+            None => return bounds,
         };
         let param = match impl_block.ty {
             Name(n) => n.path.at(&cx, 0usize),
-            _ => return false,
+            _ => return bounds,
         };
         let premises = match impl_block.quantifier {
             Some(f) => f.premises,
-            None => return false,
+            None => return bounds,
         };
-        var bounds = 0usize;
         var i = 0usize;
         while i < premises.len(&cx) {
             let args = premises.at(&cx, i).args;
@@ -799,12 +829,7 @@ impl Infer['k] {
             if bounding {
                 let unit = match self.r.refs.get(&cx, args.id) {
                     Some(r) => match r {
-                        Decl(d) => {
-                            if !visible.contains(&cx, d.id) {
-                                return false;
-                            }
-                            bounds = bounds + 1usize;
-                        },
+                        Decl(d) => bounds.push(&cx, d),
                         _ => (),
                     },
                     None => (),
@@ -812,7 +837,7 @@ impl Infer['k] {
             }
             i = i + 1usize;
         }
-        bounds > 0usize
+        bounds
     }
 }
 
@@ -886,7 +911,7 @@ impl Body['k] {
                     Float => "a float",
                     _ => "an integer",
                 };
-                self.fail(&cx, Buffer!::new().push_static(what).push_static(" literal's type is not determined; write a suffix").save(&cx), m.pos(&cx));
+                self.fail(&cx, Buffer!::new().put(what).put(" literal's type is not determined; write a suffix").save(&cx), m.pos(&cx));
             }
             i = i + 1usize;
         }
@@ -907,7 +932,7 @@ impl Body['k] {
                 k = k + 1usize;
             }
             let unit = match least {
-                Some(b) => self.fail(&cx, Buffer!::new().push_static("brand ").push_bytes(&cx, self.shown(&cx, Type::Skolem.(b))).push_static(" escapes its lexical scope").save(&cx), pos),
+                Some(b) => self.fail(&cx, Buffer!::new().put("brand ").write(&cx, self.shown(&cx, Type::Skolem.(b))).put(" escapes its lexical scope").save(&cx), pos),
                 None => (),
             };
             i = i + 1usize;
@@ -931,7 +956,7 @@ impl Body['k] {
             let unit = match least {
                 Some(b) => {
                     let (item, pos) = self.foreaches.at(&cx, b);
-                    self.fail(&cx, Buffer!::new().push_static("the type of foreach item ").push_bytes(&cx, item).push_static(" escapes its lexical scope").save(&cx), pos)
+                    self.fail(&cx, f"the type of foreach item {item} escapes its lexical scope".write(&cx, Buffer!::new()).save(&cx), pos)
                 },
                 None => (),
             };
@@ -941,7 +966,7 @@ impl Body['k] {
         while i < self.unwritten.len(&cx) {
             let (ty, what, pos) = self.unwritten.at(&cx, i);
             if !ground(&cx, ty) {
-                self.fail(&cx, Buffer!::new().push_static("cannot infer the ").push_bytes(&cx, what).save(&cx), pos);
+                self.fail(&cx, Buffer!::new().put("cannot infer the ").write(&cx, what).save(&cx), pos);
             }
             i = i + 1usize;
         }
@@ -953,7 +978,7 @@ impl Body['k] {
                 let p = params.at(&cx, k);
                 if !ground(&cx, sub.at(&cx, p.name)) {
                     let argument = if is_brand(p.kind) { brand_name(&cx, p.name) } else { surface(&cx, ArenaVec::new(&cx), ArenaVec::new(&cx), ArenaMap::new(&cx)).name(&cx, p.name) };
-                    self.fail(&cx, Buffer!::new().push_static("cannot infer the type argument ").push_bytes(&cx, argument).push_static(" of ").push_bytes(&cx, owner).save(&cx), pos);
+                    self.fail(&cx, f"cannot infer the type argument {argument} of {owner}".write(&cx, Buffer!::new()).save(&cx), pos);
                 }
                 k = k + 1usize;
             }
@@ -963,7 +988,7 @@ impl Body['k] {
         while i < self.capture_checks.len(&cx) {
             let (name, ty, pos) = self.capture_checks.at(&cx, i);
             if !self.inf.types.is_copy(&cx, zonk(&cx, ty), self.kinds) {
-                self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(" is captured by a foreach body, which runs once for each component: a capture must be Copy").save(&cx), pos);
+                self.fail(&cx, Buffer!::new().write(&cx, name).put(" is captured by a foreach body, which runs once for each component: a capture must be Copy").save(&cx), pos);
             }
             i = i + 1usize;
         }
@@ -1075,6 +1100,11 @@ impl Body['k] {
                 self.fails(&cx, "type argument must satisfy Copy", pos);
             },
             Discharge(trait_name, args, n) => self.discharge(&cx, trait_name, args, n, pos),
+            Placeholder(p) => if equal(&cx, zonk(&cx, p.value), self.static_slice(&cx)) {
+                self.results().static_parts.insert(&cx, p.id);
+            } else {
+                self.require(&cx, self.library(&cx, "Format"), ArenaVec::two(&cx, p.value, p.writer), pos);
+            },
             Elements(e) => self.elements(&cx, e, pos),
             Fields(f) => self.fields_known(&cx, f, pos),
             Primitive(op, operand, unary) => self.primitive(&cx, op, operand, unary, pos),
@@ -1092,7 +1122,7 @@ impl Body['k] {
                     if !s.given.contains(&cx, name) {
                         let have = match s.bundle.types.get(&cx, name) {
                             Some(t) => t,
-                            None => self.fail(&cx, Buffer!::new().push_static("..").push_bytes(&cx, s.spread).push_static(" has no field ").push_bytes(&cx, name).save(&cx), pos),
+                            None => self.fail(&cx, f"..{s.spread} has no field {name}".write(&cx, Buffer!::new()).save(&cx), pos),
                         };
                         self.unify_at(&cx, have, s.fields.at(&cx, name), pos);
                     }
@@ -1173,16 +1203,16 @@ impl Body['k] {
             Some(found) => found,
             None => ArenaVec::new(&cx),
         };
-        var out = Buffer!::new().push_static(if brands.is_empty(&cx) { "type mismatch: " } else { "brand mismatch: " })
-            .push_bytes(&cx, spelling.show(&cx, a)).push_static(" and ").push_bytes(&cx, spelling.show(&cx, b));
+        var out = Buffer!::new().put(if brands.is_empty(&cx) { "type mismatch: " } else { "brand mismatch: " })
+            .write(&cx, spelling.show(&cx, a)).put(" and ").write(&cx, spelling.show(&cx, b));
         var listed = 0usize;
         var i = 0usize;
         while i < brands.len(&cx) {
             let label = brands.at(&cx, i);
             let unit = match origins.get(&cx, label) {
                 Some(at) => if !spelling.qualified.contains(&cx, label) {
-                    out = out.push_static(if listed == 0usize { "; " } else { ", " }).push_bytes(&cx, spelling.brand(&cx, label))
-                        .push_static(if listed == 0usize { " was opened at " } else { " at " }).push_u64(at.line as u64).push_static(":").push_u64(at.col as u64);
+                    out = out.put(if listed == 0usize { "; " } else { ", " }).write(&cx, spelling.brand(&cx, label))
+                        .put(if listed == 0usize { " was opened at " } else { " at " }).put(at.line).put(":").put(at.col);
                     listed = listed + 1usize;
                 },
                 None => (),
@@ -1246,7 +1276,7 @@ impl Body['k] {
         let unit = match prune(&cx, ty) {
             Named(name, _args) => match self.inf.types.program.types.get(&cx, name) {
                 Some(decl) => if !self.inf.types.is_exposed(&cx, decl, Option::Some.(self.home)) {
-                    self.fail(&cx, Buffer!::new().push_static("the shape of ").push_bytes(&cx, name).push_static(" is not exposed here").save(&cx), pos);
+                    self.fail(&cx, f"the shape of {name} is not exposed here".write(&cx, Buffer!::new()).save(&cx), pos);
                 },
                 None => (),
             },
@@ -1289,8 +1319,7 @@ impl Body['k] {
                     self.fails(&cx, POINTER_TO_SUM, pos);
                 }
                 let shown = self.shown(&cx, source);
-                self.fail(&cx, Buffer!::new().push_static("the shape of ").push_bytes(&cx, shown).push_static(" is not visible here: write `where Exposed[")
-                    .push_bytes(&cx, shown).push_static("]`, or expose its declaration to this module").save(&cx), pos);
+                self.fail(&cx, f"the shape of {shown} is not visible here: write `where Exposed[{shown}]`, or expose its declaration to this module".write(&cx, Buffer!::new()).save(&cx), pos);
             }
             return;
         }
@@ -1350,17 +1379,17 @@ impl Body['k] {
                 k = k + 1usize;
             }
             let spelling = surface(&cx, concrete, ArenaVec::one(&cx, trait_name), self.inf.origins);
-            var shown = Buffer!::new().push_static(if found.is_empty(&cx) { "no instance" } else { "several instances" }).push_static(" of ")
-                .push_bytes(&cx, spelling.name(&cx, trait_name)).push_static("[");
+            var shown = Buffer!::new().put(if found.is_empty(&cx) { "no instance" } else { "several instances" }).put(" of ")
+                .write(&cx, spelling.name(&cx, trait_name)).put("[");
             k = 0usize;
             while k < concrete.len(&cx) {
                 if k > 0usize {
-                    shown = shown.push_static(", ");
+                    shown = shown.put(", ");
                 }
-                shown = shown.push_bytes(&cx, spelling.show(&cx, concrete.at(&cx, k)));
+                shown = shown.write(&cx, spelling.show(&cx, concrete.at(&cx, k)));
                 k = k + 1usize;
             }
-            self.fail(&cx, shown.push_static("]").save(&cx), pos);
+            self.fail(&cx, shown.put("]").save(&cx), pos);
         }
         let (inst, sub) = found.at(&cx, 0usize);
         i = 0usize;
@@ -1430,7 +1459,7 @@ impl Body['k] {
             Some(local) => {
                 match self.fstring_lent.copy(&cx) {
                     Some(id) => if id == local.id {
-                        self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(" is lent to this f-string; it cannot be used inside it").save(&cx), pos);
+                        self.fail(&cx, Buffer!::new().write(&cx, name).put(" is lent to this f-string; it cannot be used inside it").save(&cx), pos);
                     },
                     None => (),
                 }
@@ -1620,7 +1649,7 @@ impl Body['k] {
         };
         let (binders, body) = match opened {
             Some(pair) => pair,
-            None => self.fail(&cx, Buffer!::new().push_static(form).push_static(" opens ").push_bytes(&cx, counted(&cx, l.brands.len(&cx), "brand")).push_static(" of ").push_bytes(&cx, self.shown(&cx, zonk(&cx, package))).save(&cx), l.pos),
+            None => self.fail(&cx, Buffer!::new().put(form).put(" opens ").write(&cx, counted(&cx, l.brands.len(&cx), "brand")).put(" of ").write(&cx, self.shown(&cx, zonk(&cx, package))).save(&cx), l.pos),
         };
         let names: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
         let distinct: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
@@ -1639,7 +1668,7 @@ impl Body['k] {
         while i < names.len(&cx) {
             let name = names.at(&cx, i);
             if name.is(&cx, "static") || opened_before.contains(&cx, name) || self.sig.params.any(&cx, |&cx, p: Param['k]| is_brand(p.kind) && p.name.eq(&cx, name)) {
-                self.fail(&cx, Buffer!::new().push_static(form).push_static(" '").push_bytes(&cx, name).push_static(" reuses a brand already in scope").save(&cx), l.pos);
+                self.fail(&cx, f"{form} '{name} reuses a brand already in scope".write(&cx, Buffer!::new()).save(&cx), l.pos);
             }
             i = i + 1usize;
         }
@@ -1648,7 +1677,7 @@ impl Body['k] {
         let sub: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
         i = 0usize;
         while i < names.len(&cx) {
-            let label = Buffer!::new().push_bytes(&cx, names.at(&cx, i)).push_static("#open").push_u64(self.inf.next_id(&cx) as u64).save(&cx);
+            let label = Buffer!::new().write(&cx, names.at(&cx, i)).put("#open").put(self.inf.next_id(&cx)).save(&cx);
             labels.push(&cx, label);
             level.brands.insert(&cx, names.at(&cx, i), label);
             if l.pos.line != 0u32 {
@@ -1746,7 +1775,7 @@ impl Body['k] {
             }
         };
         if !fits {
-            self.fail(&cx, Buffer!::new().push_static("pattern does not match ").push_bytes(&cx, self.shown(&cx, zonk(&cx, e.ty))).save(&cx), pos);
+            self.fail(&cx, Buffer!::new().put("pattern does not match ").write(&cx, self.shown(&cx, zonk(&cx, e.ty))).save(&cx), pos);
         }
         var i = 0usize;
         while i < actual.len(&cx) {
@@ -1759,7 +1788,7 @@ impl Body['k] {
         self.require_visible_shape(&cx, f.ty, pos);
         let fields = match self.shape(&cx, f.ty, pos) {
             Struct(fields) => fields,
-            _ => self.fail(&cx, Buffer!::new().push_static("a struct pattern needs a struct, not ").push_bytes(&cx, self.shown(&cx, zonk(&cx, f.ty))).save(&cx), pos),
+            _ => self.fail(&cx, Buffer!::new().put("a struct pattern needs a struct, not ").write(&cx, self.shown(&cx, zonk(&cx, f.ty))).save(&cx), pos),
         };
         let by_name: ArenaMap[Span['k], Type['k], 'k] = ArenaMap::new(&cx);
         var i = 0usize;
@@ -1773,7 +1802,7 @@ impl Body['k] {
             let name = names.at(&cx, i);
             let have = match by_name.get(&cx, name) {
                 Some(t) => t,
-                None => self.fail(&cx, Buffer!::new().push_static("no field ").push_bytes(&cx, name).save(&cx), pos),
+                None => self.fail(&cx, Buffer!::new().put("no field ").write(&cx, name).save(&cx), pos),
             };
             self.unify_at(&cx, f.metas.at(&cx, name), have, pos);
             i = i + 1usize;
@@ -1808,7 +1837,7 @@ impl Body['k] {
                     let unit = self.apply(&cx, ArenaVec::one(&cx, (n.cond.copy(&cx), Pat::Bool)), Pat::Unit, n.pos);
                     let then = self.expr(&cx, Expr::Block.(n.then));
                     if !is_never(&cx, then) && !unify(&cx, then, unit, false, self.inf.counter) {
-                        self.fail(&cx, Buffer!::new().push_static("an `if` without `else` has type (), but its block has type ").push_bytes(&cx, self.shown(&cx, zonk(&cx, then))).save(&cx), n.pos);
+                        self.fail(&cx, Buffer!::new().put("an `if` without `else` has type (), but its block has type ").write(&cx, self.shown(&cx, zonk(&cx, then))).save(&cx), n.pos);
                     }
                     self.solve(&cx);
                     unit
@@ -1906,7 +1935,7 @@ impl Body['k] {
             numeric
         };
         if !valid {
-            self.fail(&cx, Buffer!::new().push_static("operator ").push_bytes(&cx, op).push_static(" is not defined for ").push_bytes(&cx, self.shown(&cx, ty)).save(&cx), pos);
+            self.fail(&cx, Buffer!::new().put("operator ").write(&cx, op).put(" is not defined for ").write(&cx, self.shown(&cx, ty)).save(&cx), pos);
         }
     }
 
@@ -2009,13 +2038,18 @@ impl Body['k] {
                 None => self.literal(&cx, MetaKind::Float, l.pos),
             },
             Bool => C::bool_type(&cx),
-            Str => C::named(self.library(&cx, "Slice"), ArenaVec::two(&cx, C::prim(&cx, "u8"), Type::Skolem.(Span::from_static(&cx, "static")))),
+            Str => self.static_slice(&cx),
         }
     }
 
-    /// Each `{x}` of the f-string needs `Format[X, W]`, for `W` the `writer` it is written into.
+    /// `Slice[u8, 'static]`, the type of a string literal.
+    fn static_slice(self, &cx: Domain!['k]) -> Type['k] {
+        C::named(self.library(&cx, "Slice"), ArenaVec::two(&cx, C::prim(&cx, "u8"), Type::Skolem.(Span::from_static(&cx, "static"))))
+    }
+
+    /// Each `{x}` of the f-string needs `Format[X, W]`, for `W` the `writer` it is written into, but
+    /// one of type `Slice[u8, 'static]`, which is written as the text around it is, by `write_static`.
     fn expr_fstring(self, &cx: Domain!['k], f: S::FStr['k], writer: Type['k]) -> Type['k] {
-        let fmt = self.library(&cx, "Format");
         var i = 0usize;
         while i < f.parts.len(&cx) {
             let unit = match f.parts.at(&cx, i) {
@@ -2025,7 +2059,8 @@ impl Body['k] {
                         _ => (false, part),
                     };
                     let value = if lent && self.is_place(&cx, operand) { self.place_type(&cx, operand, false, true) } else { self.expr(&cx, operand) };
-                    self.require(&cx, fmt, ArenaVec::two(&cx, value, writer), S::expr_pos(part));
+                    let wait = PlaceholderWait.{ id: S::expr_id(part), value, writer };
+                    self.wait(&cx, Ready::Ground.(ArenaVec::one(&cx, value), 1usize), Action::Placeholder.(wait), S::expr_pos(part));
                 },
                 Text(_t) => (),
             };
@@ -2095,10 +2130,10 @@ impl Body['k] {
                     }
                     let local = match self.lookup(&cx, name, p.pos) {
                         Some(l) => l,
-                        None => self.fail(&cx, Buffer!::new().push_static("unknown local ").push_bytes(&cx, name).save(&cx), p.pos),
+                        None => self.fail(&cx, Buffer!::new().put("unknown local ").write(&cx, name).save(&cx), p.pos),
                     };
                     if local.rest.is_some() {
-                        self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(" is a ..rest bundle, not a value").save(&cx), p.pos);
+                        self.fail(&cx, Buffer!::new().write(&cx, name).put(" is a ..rest bundle, not a value").save(&cx), p.pos);
                     }
                     self.results().binders.insert(&cx, p.id, local.id);
                     return local.ty;
@@ -2125,7 +2160,7 @@ impl Body['k] {
             },
             None => (),
         };
-        self.fail(&cx, Buffer!::new().push_bytes(&cx, p.names(&cx).join(&cx, "::")).push_static(" is not a value").save(&cx), p.pos)
+        self.fail(&cx, Buffer!::new().write(&cx, p.names(&cx).join(&cx, "::")).put(" is not a value").save(&cx), p.pos)
     }
 
     // A named function keeps its declared parameter modes and result type. A function value quantifies
@@ -2182,7 +2217,7 @@ impl Body['k] {
             } else if outer.len(&cx) == own.len(&cx) {
                 outer
             } else {
-                self.fail(&cx, Buffer!::new().push_bytes(&cx, segments.at(&cx, count - 1usize).name).push_static(" takes ").push_bytes(&cx, counted(&cx, mine.len(&cx), "type argument")).save(&cx), path.pos)
+                self.fail(&cx, Buffer!::new().write(&cx, segments.at(&cx, count - 1usize).name).put(" takes ").write(&cx, counted(&cx, mine.len(&cx), "type argument")).save(&cx), path.pos)
             };
             i = 0usize;
             while i < params.len(&cx) {
@@ -2217,7 +2252,7 @@ impl Body['k] {
                     }
                     let written = segments.at(&cx, count - 2usize).args;
                     if written.len(&cx) != args.len(&cx) {
-                        self.fail(&cx, Buffer!::new().push_static("the impl type qualifier takes ").push_bytes(&cx, counted(&cx, args.len(&cx), "type argument")).save(&cx), path.pos);
+                        self.fail(&cx, Buffer!::new().put("the impl type qualifier takes ").write(&cx, counted(&cx, args.len(&cx), "type argument")).save(&cx), path.pos);
                     }
                     let given: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
                     var i = 0usize;
@@ -2244,7 +2279,7 @@ impl Body['k] {
                 None => false,
             };
             if !path.segments.at(&cx, i).args.is_empty(&cx) && !at_owner {
-                self.fail(&cx, Buffer!::new().push_static("type arguments belong on ").push_bytes(&cx, declaration.name).push_static(", not a namespace or member").save(&cx), path.pos);
+                self.fail(&cx, f"type arguments belong on {declaration.name}, not a namespace or member".write(&cx, Buffer!::new()).save(&cx), path.pos);
             }
             i = i + 1usize;
         }
@@ -2259,7 +2294,7 @@ impl Body['k] {
                 _ => false,
             };
             if !same {
-                self.fail(&cx, Buffer!::new().push_static("type arguments belong on ").push_bytes(&cx, declaration.name).push_static(", not a namespace").save(&cx), path.pos);
+                self.fail(&cx, f"type arguments belong on {declaration.name}, not a namespace".write(&cx, Buffer!::new()).save(&cx), path.pos);
             }
         }
         written
@@ -2271,7 +2306,7 @@ impl Body['k] {
         let td = self.inf.sigs.types.at(&cx, self.inf.sigs.name(&cx, decl));
         self.require_visible_shape(&cx, C::named(td.name, ArenaVec::new(&cx)), pos);
         if written.len(&cx) > td.params.len(&cx) {
-            self.fail(&cx, Buffer!::new().push_bytes(&cx, td.name).push_static(" accepts at most ").push_bytes(&cx, counted(&cx, td.params.len(&cx), "type argument")).push_static(", got ").push_usize(written.len(&cx)).save(&cx), pos);
+            self.fail(&cx, Buffer!::new().write(&cx, td.name).put(" accepts at most ").write(&cx, counted(&cx, td.params.len(&cx), "type argument")).put(", got ").put(written.len(&cx)).save(&cx), pos);
         }
         let sub = self.instantiate_at(&cx, td.params, surface(&cx, ArenaVec::new(&cx), ArenaVec::one(&cx, td.name), ArenaMap::new(&cx)).name(&cx, td.name), pos);
         var i = 0usize;
@@ -2304,7 +2339,7 @@ impl Body['k] {
             },
             _ => (),
         };
-        self.fail(&cx, Buffer!::new().push_bytes(&cx, self.shown(&cx, zonk(&cx, ty))).push_static(" has no variant ").push_bytes(&cx, name).save(&cx), at)
+        self.fail(&cx, Buffer!::new().write(&cx, self.shown(&cx, zonk(&cx, ty))).put(" has no variant ").write(&cx, name).save(&cx), at)
     }
 
     fn payload_of(self, &cx: Domain!['k], td: TypeDecl['k], name: Span['k], sub: ArenaMap[Span['k], Type['k], 'k]) -> Type['k] {
@@ -2328,7 +2363,7 @@ impl Body['k] {
         self.results().calls.insert(&cx, path.id, Callee::Variant.(name));
         let unit = match payload_args {
             None => if !C::same(&cx, payload, C::unit(&cx)) {
-                self.fail(&cx, Buffer!::new().push_static("variant ").push_bytes(&cx, name).push_static(" carries a payload").save(&cx), path.pos);
+                self.fail(&cx, f"variant {name} carries a payload".write(&cx, Buffer!::new()).save(&cx), path.pos);
             },
             Some(args) => if args.len(&cx) == 1usize {
                 let unit = self.check(&cx, args.at(&cx, 0usize), Option::Some.(payload));
@@ -2345,7 +2380,7 @@ impl Body['k] {
                             i = i + 1usize;
                         }
                     },
-                    None => self.fail(&cx, Buffer!::new().push_static("variant ").push_bytes(&cx, name).push_static(" takes one payload").save(&cx), path.pos),
+                    None => self.fail(&cx, f"variant {name} takes one payload".write(&cx, Buffer!::new()).save(&cx), path.pos),
                 }
             },
         };
@@ -2397,7 +2432,7 @@ impl Body['k] {
         while i < s.fields.len(&cx) {
             let f = s.fields.at(&cx, i);
             if !fields.contains(&cx, f.name) || given.contains(&cx, f.name) {
-                self.fail(&cx, Buffer!::new().push_static("field ").push_bytes(&cx, f.name).push_static(" is unknown or given twice").save(&cx), s.pos);
+                self.fail(&cx, f"field {f.name} is unknown or given twice".write(&cx, Buffer!::new()).save(&cx), s.pos);
             }
             given.insert(&cx, f.name);
             let unit = match f.value {
@@ -2407,7 +2442,7 @@ impl Body['k] {
                 None => {
                     let local = match self.lookup(&cx, f.name, s.pos) {
                         Some(l) => l,
-                        None => self.fail(&cx, Buffer!::new().push_static("unknown local ").push_bytes(&cx, f.name).save(&cx), s.pos),
+                        None => self.fail(&cx, Buffer!::new().put("unknown local ").write(&cx, f.name).save(&cx), s.pos),
                     };
                     field_ids.insert(&cx, f.name, local.id);
                     self.unify_at(&cx, local.ty, fields.at(&cx, f.name), s.pos);
@@ -2423,9 +2458,9 @@ impl Body['k] {
                             self.results().spread_ids.insert(&cx, s.id, rest.id);
                             b
                         },
-                        None => self.fail(&cx, Buffer!::new().push_bytes(&cx, spread).push_static(" is not a ..rest bundle").save(&cx), s.pos),
+                        None => self.fail(&cx, Buffer!::new().write(&cx, spread).put(" is not a ..rest bundle").save(&cx), s.pos),
                     },
-                    None => self.fail(&cx, Buffer!::new().push_bytes(&cx, spread).push_static(" is not a ..rest bundle").save(&cx), s.pos),
+                    None => self.fail(&cx, Buffer!::new().write(&cx, spread).put(" is not a ..rest bundle").save(&cx), s.pos),
                 };
                 self.wait(&cx, Ready::Filled.(bundle), Action::Spread.(Spread.{ spread, fields, given, bundle }), s.pos);
             },
@@ -2440,8 +2475,8 @@ impl Body['k] {
                     i = i + 1usize;
                 }
                 missing.sort_by(&cx, |&cx, a, b| a.cmp(&cx, b));
-                self.fail(&cx, Buffer!::new().push_static(if missing.len(&cx) > 1usize { "missing fields " } else { "missing field " })
-                    .push_bytes(&cx, listed(&cx, missing)).save(&cx), s.pos);
+                self.fail(&cx, Buffer!::new().put(if missing.len(&cx) > 1usize { "missing fields " } else { "missing field " })
+                    .write(&cx, listed(&cx, missing)).save(&cx), s.pos);
             },
         };
         result
@@ -2555,9 +2590,9 @@ impl Body['k] {
                 Tuple(elems) => if elems.len(&cx) == binders.len(&cx) {
                     elems
                 } else {
-                    self.fail(&cx, Buffer!::new().push_static("variant ").push_bytes(&cx, name).push_static(" does not carry ").push_bytes(&cx, counted(&cx, binders.len(&cx), "value")).save(&cx), pos)
+                    self.fail(&cx, Buffer!::new().put("variant ").write(&cx, name).put(" does not carry ").write(&cx, counted(&cx, binders.len(&cx), "value")).save(&cx), pos)
                 },
-                _ => self.fail(&cx, Buffer!::new().push_static("variant ").push_bytes(&cx, name).push_static(" does not carry ").push_bytes(&cx, counted(&cx, binders.len(&cx), "value")).save(&cx), pos),
+                _ => self.fail(&cx, Buffer!::new().put("variant ").write(&cx, name).put(" does not carry ").write(&cx, counted(&cx, binders.len(&cx), "value")).save(&cx), pos),
             }
         };
         var i = 0usize;
@@ -2588,7 +2623,7 @@ impl Body['k] {
                 Some(t) => self.core_type(&cx, t),
                 None => {
                     let meta = new_meta(&cx);
-                    self.unwritten.push(&cx, (meta, Buffer!::new().push_static("type of closure parameter ").push_bytes(&cx, c.params.at(&cx, i).name).save(&cx), c.pos));
+                    self.unwritten.push(&cx, (meta, Buffer!::new().put("type of closure parameter ").write(&cx, c.params.at(&cx, i).name).save(&cx), c.pos));
                     meta
                 },
             });
@@ -2650,7 +2685,7 @@ impl Body['k] {
                 k = k + 1usize;
             }
             if !known {
-                self.fail(&cx, Buffer!::new().push_static("pack brand ").push_bytes(&cx, name).push_static(" is not in scope").save(&cx), p.pos);
+                self.fail(&cx, f"pack brand {name} is not in scope".write(&cx, Buffer!::new()).save(&cx), p.pos);
             }
             i = i + 1usize;
         }
@@ -2682,7 +2717,7 @@ impl Body['k] {
         var i = 0usize;
         while i < p.labels.len(&cx) {
             // Binders no source spells: a brand of the payload, even one solved later, is never captured.
-            let binder = Buffer!::new().push_static("p").push_usize(i).push_static("#").save(&cx);
+            let binder = f"p{i}#".write(&cx, Buffer!::new()).save(&cx);
             binders.push(&cx, binder);
             sub.insert(&cx, p.labels.at(&cx, i), Type::Skolem.(binder));
             i = i + 1usize;
@@ -2720,9 +2755,9 @@ impl Body['k] {
         };
         if !written.is_empty() && (self.sig.params.any(&cx, |&cx, p: Param['k]| p.name.eq(&cx, written))
             || self.open_binders.copy(&cx).any(&cx, |&cx, b: Span['k]| made_from(&cx, b).eq(&cx, written))) {
-            self.fail(&cx, Buffer!::new().push_static("foreach binder ").push_bytes(&cx, written).push_static(" shadows another type named ").push_bytes(&cx, written).save(&cx), f.pos);
+            self.fail(&cx, f"foreach binder {written} shadows another type named {written}".write(&cx, Buffer!::new()).save(&cx), f.pos);
         }
-        let binder = Buffer!::new().push_bytes(&cx, written).push_static("#F").push_u64(self.inf.next_id(&cx) as u64).save(&cx);
+        let binder = Buffer!::new().write(&cx, written).put("#F").put(self.inf.next_id(&cx)).save(&cx);
         self.foreaches.insert(&cx, binder, (f.name, f.pos));
         self.kinds.insert(&cx, binder, Kind::Any);
         let outer = self.open_binders.copy(&cx);
@@ -2866,13 +2901,13 @@ impl Body['k] {
                     Some(name) => {
                         let local = match self.lookup(&cx, name, p.pos) {
                             Some(l) => l,
-                            None => self.fail(&cx, Buffer!::new().push_static("unknown local ").push_bytes(&cx, name).save(&cx), p.pos),
+                            None => self.fail(&cx, Buffer!::new().put("unknown local ").write(&cx, name).save(&cx), p.pos),
                         };
                         if (assign || lend) && !local.mutable {
-                            self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(if lend { " is not a var; a lent place must be a var" } else { " is not a var" }).save(&cx), p.pos);
+                            self.fail(&cx, Buffer!::new().write(&cx, name).put(if lend { " is not a var; a lent place must be a var" } else { " is not a var" }).save(&cx), p.pos);
                         }
                         if (assign || lend) && local.depth != self.frames.len(&cx) - 1usize {
-                            self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(if lend { " is captured, and a body cannot lend what it captures; lend it outside, or give a closure a place parameter for it" } else { " is captured, and a body cannot assign what it captures; assign it outside, or give a closure a place parameter for it" }).save(&cx), p.pos);
+                            self.fail(&cx, Buffer!::new().write(&cx, name).put(if lend { " is captured, and a body cannot lend what it captures; lend it outside, or give a closure a place parameter for it" } else { " is captured, and a body cannot assign what it captures; assign it outside, or give a closure a place parameter for it" }).save(&cx), p.pos);
                         }
                         self.results().binders.insert(&cx, p.id, local.id);
                         return self.record(&cx, p.id, p.pos, local.ty);
@@ -2926,9 +2961,9 @@ impl Body['k] {
         };
         let what = match c.field {
             Some(name) => name,
-            None => Buffer!::new().push_usize(c.index).save(&cx),
+            None => Buffer!::new().put(c.index).save(&cx),
         };
-        self.fail(&cx, Buffer!::new().push_bytes(&cx, self.shown(&cx, zonk(&cx, c.owner))).push_static(" has no component ").push_bytes(&cx, what).save(&cx), pos)
+        self.fail(&cx, Buffer!::new().write(&cx, self.shown(&cx, zonk(&cx, c.owner))).put(" has no component ").write(&cx, what).save(&cx), pos)
     }
 
     fn is_place(self, &cx: Domain!['k], e: Expr['k]) -> bool {
@@ -2985,7 +3020,7 @@ impl Body['k] {
                     _ => self.fails(&cx, "internal error: a tuple declaration that is not a tuple", c.pos),
                 };
                 if c.args.len(&cx) != elems.len(&cx) {
-                    self.fail(&cx, Buffer!::new().push_bytes(&cx, td.name).push_static(" has ").push_bytes(&cx, counted(&cx, elems.len(&cx), "element")).save(&cx), c.pos);
+                    self.fail(&cx, Buffer!::new().write(&cx, td.name).put(" has ").write(&cx, counted(&cx, elems.len(&cx), "element")).save(&cx), c.pos);
                 }
                 var i = 0usize;
                 while i < elems.len(&cx) {
@@ -3062,7 +3097,7 @@ impl Body['k] {
                     places.append(&cx, f.places);
                     f.ret.copy(&cx)
                 },
-                _ => self.fail(&cx, Buffer!::new().push_bytes(&cx, self.shown(&cx, zonk(&cx, w.callee))).push_static(" is not callable").save(&cx), pos),
+                _ => self.fail(&cx, Buffer!::new().write(&cx, self.shown(&cx, zonk(&cx, w.callee))).put(" is not callable").save(&cx), pos),
             },
         };
         self.bind_operands(&cx, w.call, w.got, ptypes, places);
@@ -3122,7 +3157,7 @@ impl Body['k] {
     // is none.
     fn bind_operands(self, &cx: Domain!['k], c: S::Call['k], got: ArenaVec[Option[(Type['k], bool)], 'k], ptypes: ArenaVec[Type['k], 'k], places: ArenaVec[usize, 'k]) {
         if got.len(&cx) != ptypes.len(&cx) {
-            self.fail(&cx, Buffer!::new().push_static("expected ").push_bytes(&cx, counted(&cx, ptypes.len(&cx), "argument")).push_static(", got ").push_usize(got.len(&cx)).save(&cx), c.pos);
+            self.fail(&cx, Buffer!::new().put("expected ").write(&cx, counted(&cx, ptypes.len(&cx), "argument")).put(", got ").put(got.len(&cx)).save(&cx), c.pos);
         }
         var k = 0usize;
         while k < got.len(&cx) {
@@ -3160,7 +3195,7 @@ impl Body['k] {
         let tr = self.inf.sigs.traits.at(&cx, self.inf.sigs.name(&cx, trait_decl));
         let written = self.path_arguments(&cx, path, trait_decl, true);
         if written.len(&cx) > tr.params.len(&cx) {
-            self.fail(&cx, Buffer!::new().push_bytes(&cx, tr.name).push_static(" accepts at most ").push_bytes(&cx, counted(&cx, tr.params.len(&cx), "type argument")).push_static(", got ").push_usize(written.len(&cx)).save(&cx), c.pos);
+            self.fail(&cx, Buffer!::new().write(&cx, tr.name).put(" accepts at most ").write(&cx, counted(&cx, tr.params.len(&cx), "type argument")).put(", got ").put(written.len(&cx)).save(&cx), c.pos);
         }
         let targs: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
@@ -3241,7 +3276,7 @@ impl Body['k] {
             i = i + 1usize;
         }
         if found.len(&cx) != 1usize {
-            self.fail(&cx, Buffer!::new().push_bytes(&cx, param).push_static("::").push_bytes(&cx, name).push_static(" needs exactly one bound of ").push_bytes(&cx, param).push_static(" with that method").save(&cx), c.pos);
+            self.fail(&cx, f"{param}::{name} needs exactly one bound of {param} with that method".write(&cx, Buffer!::new()).save(&cx), c.pos);
         }
         let p = found.at(&cx, 0usize);
         self.trait_method(&cx, c, self.inf.sigs.traits.at(&cx, p.trait_name), name, p.args.clone(&cx), self.operands(&cx, c.args), Option::None)
@@ -3250,26 +3285,26 @@ impl Body['k] {
     fn builtin(self, &cx: Domain!['k], c: S::Call['k], path: S::Path['k], name: Span['k]) -> Type['k] {
         let arity = match builtin_arity(&cx, name) {
             Some(n) => n,
-            None => self.fail(&cx, Buffer!::new().push_static("unknown builtin ").push_bytes(&cx, name).save(&cx), c.pos),
+            None => self.fail(&cx, Buffer!::new().put("unknown builtin ").write(&cx, name).save(&cx), c.pos),
         };
         if c.args.len(&cx) != arity {
             if name.is(&cx, "fence") {
                 self.fails(&cx, "fence takes one ordering argument", c.pos);
             }
-            self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(" takes ").push_bytes(&cx, counted(&cx, arity, "value argument")).save(&cx), c.pos);
+            self.fail(&cx, Buffer!::new().write(&cx, name).put(" takes ").write(&cx, counted(&cx, arity, "value argument")).save(&cx), c.pos);
         }
         let count = path.segments.len(&cx);
         let targs = path.segments.at(&cx, count - 1usize).args;
         var i = 0usize;
         while i + 1usize < count {
             if !path.segments.at(&cx, i).args.is_empty(&cx) {
-                self.fail(&cx, Buffer!::new().push_static("type arguments belong on ").push_bytes(&cx, name).push_static(", not a namespace").save(&cx), c.pos);
+                self.fail(&cx, f"type arguments belong on {name}, not a namespace".write(&cx, Buffer!::new()).save(&cx), c.pos);
             }
             i = i + 1usize;
         }
         let expected = if name.is(&cx, "alloca") || name.is(&cx, "sizeof") { 1usize } else { 0usize };
         if targs.len(&cx) != expected {
-            self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(" takes ").push_bytes(&cx, counted(&cx, expected, "type argument")).save(&cx), c.pos);
+            self.fail(&cx, Buffer!::new().write(&cx, name).put(" takes ").write(&cx, counted(&cx, expected, "type argument")).save(&cx), c.pos);
         }
         self.results().calls.insert(&cx, c.id, Callee::Builtin.(name));
         if name.is(&cx, "fresh") {
@@ -3400,7 +3435,7 @@ impl Body['k] {
             },
             Method(sig) => {
                 if sig.ptypes.is_empty(&cx) {
-                    self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(" takes no receiver").save(&cx), c.pos);
+                    self.fail(&cx, Buffer!::new().write(&cx, name).put(" takes no receiver").save(&cx), c.pos);
                 }
                 self.receiver_mode(&cx, name, sig.places, receiver, c.pos);
                 let sub = self.instantiate_at(&cx, sig.params, name, c.pos);
@@ -3415,7 +3450,7 @@ impl Body['k] {
     fn receiver_mode(self, &cx: Domain!['k], name: Span['k], places: ArenaVec[usize, 'k], receiver: Receiver['k], pos: Pos) {
         let lends = places.contains(&cx, 0usize);
         if lends != receiver.lend {
-            self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(" takes its receiver ").push_static(if lends { "by &" } else { "by value" }).save(&cx), pos);
+            self.fail(&cx, Buffer!::new().write(&cx, name).put(" takes its receiver ").put(if lends { "by &" } else { "by value" }).save(&cx), pos);
         }
     }
 
@@ -3494,16 +3529,17 @@ impl Body['k] {
             }
         }
         if candidates.len(&cx) > 1usize {
-            self.fail(&cx, Buffer!::new().push_bytes(&cx, self.shown(&cx, t)).push_static(" has several methods named ").push_bytes(&cx, name).save(&cx), pos);
+            self.fail(&cx, Buffer!::new().write(&cx, self.shown(&cx, t)).put(" has several methods named ").write(&cx, name).save(&cx), pos);
         }
         if candidates.is_empty(&cx) {
-            self.fail(&cx, Buffer!::new().push_bytes(&cx, self.shown(&cx, t)).push_static(" has no method ").push_bytes(&cx, name).push_bytes(&cx, self.import_hint(&cx, name)).save(&cx), pos);
+            self.fail(&cx, Buffer!::new().write(&cx, self.shown(&cx, t)).put(" has no method ").write(&cx, name).write(&cx, self.import_hint(&cx, name)).save(&cx), pos);
         }
         candidates.at(&cx, 0usize)
     }
 
-    // For a method no visible trait provides: the traits of one input that provide it but are not
-    // visible in the calling module, to import.
+    // For a method no visible trait provides: the traits not visible in the calling module that would
+    // provide it, to import: a trait of one input with the method, or a trait bounding a blanket impl
+    // that has it.
     fn import_hint(self, &cx: Domain!['k], name: Span['k]) -> Span['k] {
         let visible = self.inf.visible_traits(&cx, self.home);
         let hidden: ArenaSet[Span['k], 'k] = ArenaSet::new(&cx);
@@ -3525,14 +3561,31 @@ impl Body['k] {
             };
             i = i + 1usize;
         }
+        let blanket = self.inf.r.attached.get_or(&cx, (Owner::Blanket, name), ArenaVec::new(&cx));
+        i = 0usize;
+        while i < blanket.len(&cx) {
+            let d = blanket.at(&cx, i);
+            if d.kind.is(&cx, "method") {
+                let bounds = self.inf.blanket_bounds(&cx, d, self.home);
+                var k = 0usize;
+                while k < bounds.len(&cx) {
+                    let b = bounds.at(&cx, k);
+                    if !visible.contains(&cx, b.id) {
+                        hidden.insert(&cx, b.name);
+                    }
+                    k = k + 1usize;
+                }
+            }
+            i = i + 1usize;
+        }
         let names = hidden.keys(&cx);
         names.sort_by(&cx, |&cx, a, b| a.cmp(&cx, b));
         if names.is_empty(&cx) {
             Span::from_static(&cx, "")
         } else if names.len(&cx) == 1usize {
-            Buffer!::new().push_static("; the trait ").push_bytes(&cx, names.at(&cx, 0usize)).push_static(" provides it, import it").save(&cx)
+            Buffer!::new().put("; the trait ").write(&cx, names.at(&cx, 0usize)).put(" provides it, import it").save(&cx)
         } else {
-            Buffer!::new().push_static("; the traits ").push_bytes(&cx, listed(&cx, names)).push_static(" provide it, import one").save(&cx)
+            Buffer!::new().put("; the traits ").write(&cx, listed(&cx, names)).put(" provide it, import one").save(&cx)
         }
     }
 
@@ -3540,7 +3593,7 @@ impl Body['k] {
     fn pointer_op(self, &cx: Domain!['k], c: S::Call['k], name: Span['k], pointer: Type['k], operands: ArenaVec[Type['k], 'k]) -> Type['k] {
         let params = pointer_params(&cx, name);
         if operands.len(&cx) != params.len() {
-            self.fail(&cx, Buffer!::new().push_bytes(&cx, name).push_static(" takes ").push_bytes(&cx, counted(&cx, params.len(), "argument")).save(&cx), c.pos);
+            self.fail(&cx, Buffer!::new().write(&cx, name).put(" takes ").write(&cx, counted(&cx, params.len(), "argument")).save(&cx), c.pos);
         }
         let out = new_meta(&cx);
         self.later(&cx, pointer, Action::Pointer.(PointerWait.{ name, pointer, operands, out }), c.pos);
@@ -3550,7 +3603,7 @@ impl Body['k] {
     fn pointer_known(self, &cx: Domain!['k], w: PointerWait['k], pos: Pos) {
         let inner = match self.shape(&cx, w.pointer, pos) {
             Ptr(inner) => inner.copy(&cx),
-            _ => self.fail(&cx, Buffer!::new().push_bytes(&cx, w.name).push_static(" needs a pointer").save(&cx), pos),
+            _ => self.fail(&cx, Buffer!::new().write(&cx, w.name).put(" needs a pointer").save(&cx), pos),
         };
         let params = pointer_params(&cx, w.name);
         var i = 0usize;

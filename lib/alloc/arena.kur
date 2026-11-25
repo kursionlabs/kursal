@@ -42,6 +42,7 @@ use alloc::owned::Allocation!;
 use core::mem::Region!;
 use core::mem::RegionResume!;
 use alloc::buffer::Buffer!;
+use core::fmt::Writer;
 use core::raw::Span;
 use core::ptr::offset;
 use core::slice::{ReadBytes, Slice};
@@ -429,6 +430,22 @@ instance ReadBytes[Domain!['k], Span['k]] {
     }
 }
 
+/// Byte slices of a domain are read through the domain itself, as its spans
+/// are.
+forall 'k.
+instance ReadBytes[Domain!['k], Slice[u8, 'k]] {
+    fn get(&cx: Domain!['k], bytes: Slice[u8, 'k], index: usize) -> Option[u8] {
+        var { tag, arena } = cx;
+        let b = ReadBytes[Exclusive!['k], Slice[u8, 'k]]::get(&tag, bytes, index);
+        cx = Domain!.{ tag, arena };
+        b
+    }
+
+    fn len(&cx: Domain!['k], bytes: Slice[u8, 'k]) -> usize {
+        bytes.len()
+    }
+}
+
 /// `value`, put in the context's arena. `T` is `Copy`, as for
 /// `Arena!::alloc`.
 forall T, 'k, C, R where Copy[T], Allocate[C -> 'k, R], Sized[T].
@@ -442,7 +459,7 @@ fn ref_in(&cx: C, value: T) -> Ref[T, 'k] {
 impl Buffer! {
     /// The buffer's bytes copied into the context's arena in one block of
     /// exactly their length, as a span that lives as long as the arena; the
-    /// buffer is freed. `Buffer!::new().push_static("x").push_u64(n).save(&cx)`.
+    /// buffer is freed. `Buffer!::new().put("x").put(n).save(&cx)`.
     forall 'k, C, R where Allocate[C -> 'k, R].
     fn save(self, &cx: C) -> Span['k] {
         var (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
@@ -479,14 +496,14 @@ forall 'j, C, R where Allocate[C -> 'j, R].
 fn concat(&cx: C, first: Span['j], second: Span['j]) -> Span['j] {
     let (tag, arena, rest) = Allocate[C -> 'j, R]::open(cx);
     var d = Domain!.{ tag, arena };
-    let joined = Buffer!::new().push_bytes(&d, first).push_bytes(&d, second).save(&d);
+    let joined = Buffer!::new().write(&d, first).write(&d, second).save(&d);
     let { tag, arena } = d;
     cx = Allocate[C -> 'j, R]::close(tag, arena, rest);
     joined
 }
 
 /// Copies `count` bytes from `src` to `dest`, byte by byte (the same loop as
-/// `alloc::buffer::Buffer!::push_n`). `alloc_bytes` only reserves room, so its
+/// `Buffer!`'s `Writer::write_raw`). `alloc_bytes` only reserves room, so its
 /// callers copy with this. Caller: `src[0..count)` is readable,
 /// `dest[0..count)` writable, and the two do not overlap.
 unsafe fn copy_bytes(dest: *u8, src: *u8, count: usize) -> () {

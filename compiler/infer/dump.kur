@@ -7,6 +7,7 @@ use std::collections::arena_vec::ArenaVec;
 use std::raw::Span;
 use std::arena::Domain!;
 use std::buffer::Buffer!;
+use std::fmt::Writer;
 use package::kurs::core::{MetaKind, Type};
 use package::infer::inference::{Callee, Capture, Infer, Receiver, TraitCall};
 use package::kurs::serial::{form_text, write_atom, write_type};
@@ -52,7 +53,7 @@ fn ids_text(&cx: Domain!['k], ids: ArenaVec[u32, 'k]) -> Span['k] {
     let parts: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
     var i = 0usize;
     while i < ids.len(&cx) {
-        parts.push(&cx, Buffer!::new().push_u64(ids.at(&cx, i) as u64).save(&cx));
+        parts.push(&cx, Buffer!::new().put(ids.at(&cx, i)).save(&cx));
         i = i + 1usize;
     }
     form_text(&cx, parts)
@@ -68,23 +69,23 @@ fn receiver_text(&cx: Domain!['k], r: Option[Receiver['k]]) -> Span['k] {
 
 forall 'k.
 fn trait_text(&cx: Domain!['k], t: TraitCall['k]) -> Span['k] {
-    Buffer!::new().push_static("(trait ").push_bytes(&cx, write_atom(&cx, t.trait_name)).push_static(" ").push_bytes(&cx, write_atom(&cx, t.method)).push_static(" ").push_bytes(&cx, types_text(&cx, t.targs))
-        .push_bytes(&cx, receiver_text(&cx, t.receiver)).push_static(")").save(&cx)
+    Buffer!::new().put("(trait ").write(&cx, write_atom(&cx, t.trait_name)).put(" ").write(&cx, write_atom(&cx, t.method)).put(" ").write(&cx, types_text(&cx, t.targs))
+        .write(&cx, receiver_text(&cx, t.receiver)).put(")").save(&cx)
 }
 
 forall 'k.
 fn callee_text(&cx: Domain!['k], c: Callee['k]) -> Span['k] {
     match c {
-        Fn(f) => Buffer!::new().push_static("(fn ").push_bytes(&cx, write_atom(&cx, f.call_name())).push_static(" ").push_bytes(&cx, write_atom(&cx, f.sig.name)).push_static(" ")
-            .push_bytes(&cx, types_text(&cx, f.targs(&cx))).push_bytes(&cx, receiver_text(&cx, f.receiver)).push_static(")").save(&cx),
+        Fn(f) => Buffer!::new().put("(fn ").write(&cx, write_atom(&cx, f.call_name())).put(" ").write(&cx, write_atom(&cx, f.sig.name)).put(" ")
+            .write(&cx, types_text(&cx, f.targs(&cx))).write(&cx, receiver_text(&cx, f.receiver)).put(")").save(&cx),
         Trait(t) => trait_text(&cx, t),
         Value => Span::from_static(&cx, "(value)"),
         Closure => Span::from_static(&cx, "(closure)"),
-        Variant(name) => Buffer!::new().push_static("(variant ").push_bytes(&cx, write_atom(&cx, name)).push_static(")").save(&cx),
+        Variant(name) => Buffer!::new().put("(variant ").write(&cx, write_atom(&cx, name)).put(")").save(&cx),
         Tuple => Span::from_static(&cx, "(tuple)"),
-        Builtin(name) => Buffer!::new().push_static("(builtin ").push_bytes(&cx, write_atom(&cx, name)).push_static(")").save(&cx),
-        TypedBuiltin(name, t) => Buffer!::new().push_static("(").push_bytes(&cx, write_atom(&cx, name)).push_static(" ").push_bytes(&cx, type_text(&cx, t)).push_static(")").save(&cx),
-        Pointer(name, _receiver) => Buffer!::new().push_static("(pointer ").push_bytes(&cx, write_atom(&cx, name)).push_static(")").save(&cx),
+        Builtin(name) => Buffer!::new().put("(builtin ").write(&cx, write_atom(&cx, name)).put(")").save(&cx),
+        TypedBuiltin(name, t) => Buffer!::new().put("(").write(&cx, write_atom(&cx, name)).put(" ").write(&cx, type_text(&cx, t)).put(")").save(&cx),
+        Pointer(name, _receiver) => Buffer!::new().put("(pointer ").write(&cx, write_atom(&cx, name)).put(")").save(&cx),
         FStringWrite(_f, _place) => Span::from_static(&cx, "(fwrite)"),
     }
 }
@@ -94,7 +95,7 @@ fn captures_text(&cx: Domain!['k], cs: ArenaVec[Capture['k], 'k]) -> Span['k] {
     let parts: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
     var i = 0usize;
     while i < cs.len(&cx) {
-        parts.push(&cx, Buffer!::new().push_static("(").push_bytes(&cx, write_atom(&cx, cs.at(&cx, i).name)).push_static(" ").push_u64(cs.at(&cx, i).binder as u64).push_static(")").save(&cx));
+        parts.push(&cx, Buffer!::new().put("(").write(&cx, write_atom(&cx, cs.at(&cx, i).name)).put(" ").put(cs.at(&cx, i).binder).put(")").save(&cx));
         i = i + 1usize;
     }
     form_text(&cx, parts)
@@ -105,7 +106,7 @@ fn pos_text(&cx: Domain!['k], p: Pos) -> Span['k] {
     if p.line == 0u32 {
         Span::from_static(&cx, "_")
     } else {
-        Buffer!::new().push_u64(p.line as u64).push_static(":").push_u64(p.col as u64).save(&cx)
+        f"{p.line}:{p.col}".write(&cx, Buffer!::new()).save(&cx)
     }
 }
 
@@ -119,25 +120,25 @@ impl Walk['k] {
     // One node's line: its tag, position, type and annotations.
     fn line(self, &cx: Domain!['k], &out: Buffer!, tag: Slice[u8, 'static], id: u32, p: Option[Pos]) {
         let r = self.inf.out;
-        out = out.push_static("  ").push_static(tag);
+        out = out.put("  ").put(tag);
         out = match p {
-            Some(at) => out.push_static(" ").push_bytes(&cx, pos_text(&cx, at)),
+            Some(at) => out.put(" ").write(&cx, pos_text(&cx, at)),
             None => out,
         };
         out = match r.types.get(&cx, id) {
-            Some(t) => out.push_static(" ").push_bytes(&cx, type_text(&cx, t)),
-            None => out.push_static(" -"),
+            Some(t) => out.put(" ").write(&cx, type_text(&cx, t)),
+            None => out.put(" -"),
         };
         out = match r.binders.get(&cx, id) {
-            Some(b) => out.push_static(" binder ").push_u64(b as u64),
+            Some(b) => out.put(" binder ").put(b),
             None => out,
         };
         out = match r.folded.get(&cx, id) {
-            Some(v) => out.push_static(" folded (").push_bytes(&cx, const_text(&cx, v)).push_static(")"),
+            Some(v) => out.put(" folded (").write(&cx, const_text(&cx, v)).put(")"),
             None => out,
         };
         out = match r.calls.get(&cx, id) {
-            Some(c) => out.push_static(" call ").push_bytes(&cx, callee_text(&cx, c)),
+            Some(c) => out.put(" call ").write(&cx, callee_text(&cx, c)),
             None => out,
         };
         out = match r.field_ids.get(&cx, id) {
@@ -146,15 +147,15 @@ impl Walk['k] {
                 let parts: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
                 var i = 0usize;
                 while i < names.len(&cx) {
-                    parts.push(&cx, Buffer!::new().push_static("(").push_bytes(&cx, write_atom(&cx, names.at(&cx, i))).push_static(" ").push_u64(fields.at(&cx, names.at(&cx, i)) as u64).push_static(")").save(&cx));
+                    parts.push(&cx, Buffer!::new().put("(").write(&cx, write_atom(&cx, names.at(&cx, i))).put(" ").put(fields.at(&cx, names.at(&cx, i))).put(")").save(&cx));
                     i = i + 1usize;
                 }
-                out.push_static(" fields ").push_bytes(&cx, form_text(&cx, parts))
+                out.put(" fields ").write(&cx, form_text(&cx, parts))
             },
             None => out,
         };
         out = match r.spread_ids.get(&cx, id) {
-            Some(b) => out.push_static(" spread ").push_u64(b as u64),
+            Some(b) => out.put(" spread ").put(b),
             None => out,
         };
         out = match r.case_binders.get(&cx, id) {
@@ -163,33 +164,33 @@ impl Walk['k] {
                 var i = 0usize;
                 while i < ids.len(&cx) {
                     parts.push(&cx, match ids.at(&cx, i) {
-                        Some(b) => Buffer!::new().push_u64(b as u64).save(&cx),
+                        Some(b) => Buffer!::new().put(b).save(&cx),
                         None => Span::from_static(&cx, "_"),
                     });
                     i = i + 1usize;
                 }
-                out.push_static(" binders ").push_bytes(&cx, form_text(&cx, parts))
+                out.put(" binders ").write(&cx, form_text(&cx, parts))
             },
             None => out,
         };
         out = match r.lent.get(&cx, id) {
-            Some(b) => out.push_static(if b { " lent #t" } else { " lent #f" }),
+            Some(b) => out.put(if b { " lent #t" } else { " lent #f" }),
             None => out,
         };
         out = match r.param_ids.get(&cx, id) {
-            Some(ids) => out.push_static(" params ").push_bytes(&cx, ids_text(&cx, ids)),
+            Some(ids) => out.put(" params ").write(&cx, ids_text(&cx, ids)),
             None => out,
         };
         out = match r.captures.get(&cx, id) {
-            Some(cs) => out.push_static(" captures ").push_bytes(&cx, captures_text(&cx, cs)),
+            Some(cs) => out.put(" captures ").write(&cx, captures_text(&cx, cs)),
             None => out,
         };
         out = match r.witnesses.get(&cx, id) {
-            Some(ts) => out.push_static(" witnesses ").push_bytes(&cx, types_text(&cx, ts)),
+            Some(ts) => out.put(" witnesses ").write(&cx, types_text(&cx, ts)),
             None => out,
         };
         out = match r.try_kinds.get(&cx, id) {
-            Some(k) => out.push_static(" kind ").push_bytes(&cx, k),
+            Some(k) => out.put(" kind ").write(&cx, k),
             None => out,
         };
         out = match r.opened.get(&cx, id) {
@@ -200,23 +201,23 @@ impl Walk['k] {
                     parts.push(&cx, write_atom(&cx, labels.at(&cx, i)));
                     i = i + 1usize;
                 }
-                out.push_static(" opened ").push_bytes(&cx, form_text(&cx, parts))
+                out.put(" opened ").write(&cx, form_text(&cx, parts))
             },
             None => out,
         };
         out = match r.options.get(&cx, id) {
-            Some(t) => out.push_static(" option ").push_bytes(&cx, type_text(&cx, t)),
+            Some(t) => out.put(" option ").write(&cx, type_text(&cx, t)),
             None => out,
         };
         out = match r.next_calls.get(&cx, id) {
-            Some(t) => out.push_static(" next ").push_bytes(&cx, trait_text(&cx, t)),
+            Some(t) => out.put(" next ").write(&cx, trait_text(&cx, t)),
             None => out,
         };
         out = match r.rest_ids.get(&cx, id) {
-            Some(b) => out.push_static(" rest ").push_u64(b as u64),
+            Some(b) => out.put(" rest ").put(b),
             None => out,
         };
-        out = out.push_static("\n");
+        out = out.put("\n");
     }
 
     fn exprs(self, &cx: Domain!['k], &out: Buffer!, es: ArenaVec[Expr['k], 'k]) {
@@ -378,7 +379,7 @@ impl Walk['k] {
                 self.expr(&cx, &out, l.value);
             },
             Assign(a) => {
-                out = out.push_static("  assign ").push_bytes(&cx, pos_text(&cx, a.pos)).push_static("\n");
+                out = out.put("  assign ").write(&cx, pos_text(&cx, a.pos)).put("\n");
                 self.expr(&cx, &out, a.target);
                 self.expr(&cx, &out, a.value);
             },
@@ -423,8 +424,8 @@ impl Walk['k] {
     }
 
     fn function(self, &cx: Domain!['k], &out: Buffer!, name: Span['k], node: S::Fn['k]) {
-        out = out.push_static("fn ").push_bytes(&cx, write_atom(&cx, name)).push_static(" ").push_bytes(&cx, pos_text(&cx, node.pos)).push_static(" params ")
-            .push_bytes(&cx, ids_text(&cx, self.inf.out.param_ids.get_or(&cx, node.id, ArenaVec::new(&cx)))).push_static("\n");
+        out = out.put("fn ").write(&cx, write_atom(&cx, name)).put(" ").write(&cx, pos_text(&cx, node.pos)).put(" params ")
+            .write(&cx, ids_text(&cx, self.inf.out.param_ids.get_or(&cx, node.id, ArenaVec::new(&cx)))).put("\n");
         let unit = match node.body {
             Some(b) => self.block(&cx, &out, b),
             None => (),
@@ -456,7 +457,7 @@ fn program(&cx: Domain!['k], inf: Infer['k]) -> Span['k] {
         let (inst, item, _home) = inf.sigs.instances.at(&cx, i);
         var k = 0usize;
         while k < inst.methods.len(&cx) {
-            w.function(&cx, &out, Buffer!::new().push_bytes(&cx, inst.trait_name).push_static("::").push_bytes(&cx, item.methods.at(&cx, k).name).save(&cx), item.methods.at(&cx, k));
+            w.function(&cx, &out, Buffer!::new().write(&cx, inst.trait_name).put("::").write(&cx, item.methods.at(&cx, k).name).save(&cx), item.methods.at(&cx, k));
             k = k + 1usize;
         }
         i = i + 1usize;

@@ -4,7 +4,7 @@ This document classifies the functions of the `core`, `alloc`, `std`,
 `libc` and `toml` packages by signature shape, and records the
 caller obligation of every function whose signature exposes a raw pointer.
 Items are named by module path within their home package
-(`core::raw::raw_get`, `alloc::buffer::Buffer!::push_n`,
+(`core::raw::raw_get`, `alloc::buffer::Buffer!::commit`,
 `libc::thread::spawn`); `std` re-exports the `core` and `alloc` modules
 under `std::` paths, but not `libc`'s. `toml` declares no raw pointer, no `unsafe fn` and no
 `extern "C"` function: all of it is class C.
@@ -44,8 +44,8 @@ in the mapping body is counted. Structural region split/merge over `*T` is
 therefore not a raw-pointer API merely because its shape is selected
 through indirection.
 
-So `std::io::print(s: Slice[u8, 'static])` is class C even though its body
-reads through the slice's pointer, while
+So `std::io::File!::write_static(&self, bytes: Slice[u8, 'static])` is class C
+even though its body reads through the slice's pointer, while
 `std::io::write_all(fd: i32, ptr: *u8, len: usize)` is class B: the same
 pointer, spelled bare. Unfolding would put nearly every function that takes
 or returns a `Slice`, `Span`, `Ref`, `Buffer!`, `Vec!`, `Arena!`, `HashMap!`
@@ -309,9 +309,8 @@ checkers require of a KURS `data` declaration (`data_type_not_copy`).
 | `core::cstr::cstr_len` | the pointer addresses a NUL-terminated byte run; there is no length to bound the scan |
 | `core::cstr::CStr::from_raw` | `ptr` names a NUL-terminated byte run that stays readable and unchanged for the rest of the process, as `argv` entries do: a `CStr` is `Copy` and carries no brand, so nothing ends its use earlier |
 | `std::fs::is_dot` | `name` addresses a live NUL-terminated string (a directory entry's name, read before the next read or close of its directory) |
-| `core::fmt::Writer::write_raw` (and its instances) | `ptr[0..len)` is readable for the whole call; the writer reads the bytes before returning and keeps no pointer to them |
-| `alloc::buffer::Buffer!::push_n` | `src[0..count)` is readable and does not alias the buffer's own storage, which the growth on entry may reallocate |
-| `std::io::write_all` | `ptr[0..len)` is readable, and `fd` is a descriptor the caller may write: standard output or error, or one a `File!` it holds owns |
+| `core::fmt::Writer::write_raw` (and its instances) | `ptr[0..len)` is readable for the whole call; the writer reads the bytes before returning and keeps no pointer to them. `Buffer!`'s also needs them outside its own storage, which the growth on entry may reallocate |
+| `std::io::write_all` | `ptr[0..len)` is readable, and `fd` is a descriptor the caller may write: standard output or error, or one a `File!` it holds owns. A number taken from anywhere else may name a descriptor a `File!` owns, or one closed and since reused, and the write would go around its owner. The safe output functions name standard output and error themselves (`print`, `eprint`, `Output!`), or write through a `File!` |
 | `std::io::File!::write_all_raw` | `ptr[0..len)` is readable throughout the write |
 
 Every read through a raw pointer (`unsafe *p`, and the functions above) owes the same thing for
@@ -471,7 +470,6 @@ about a pointer in the signature:
 | `alloc::owned::Allocation!::adopt` | the block `u` owns holds an initialized `T`, aligned for `T`, in at least `sizeof[T]()` bytes: the `Region!` it returns reads and writes it as one (`Region!::from_raw`'s obligation). A `malloc` result is aligned for every type, so in practice the obligation is the size and the contents. `adopt_value` is the checked form: it aborts on a block smaller than `sizeof[T]()` and writes the `T` itself. The library's own callers (`Vec!`, `HashMap!`, `Buffer!::open`, `Owned!::open`) state at each call why the block qualifies, or why a region over uninitialized slots never leaves the module and is never read as a `T` |
 | `alloc::owned::Allocation!::release_storage` | every `T` the block holds is accounted for: moved out, never written, or still tracked by the caller, which keeps the returned storage and its contents. The block is given up without reading it, so a linear `T` left in it unaccounted would be dropped. `release` is the safe form, for a `Copy` `T`; the library's one caller is `Vec!` (`push`/`pop` re-adopt the same storage at once and keep tracking the elements below `len`; `destroy_with` moves every element out first) |
 | `std::io::File!::adopt` | the descriptor is live and open, with no other owner |
-| `std::io::write_static_to`, `write_span_to`, `write_buffer_to` | `fd` is a descriptor the caller may write: standard output or error, or one a `File!` it holds owns. A number taken from anywhere else may name a descriptor a `File!` owns, or one closed and since reused, and the write would go around its owner. The safe output functions name standard output and error themselves (`print*`, `eprint*`, `Output!`), or write through a `File!` |
 | `std::io::read_into`, `read_to_end_from` | `fd` is a descriptor the caller may read: stdin, or one a `File!` it holds owns. Reading advances the descriptor's offset, which is that owner's state. The safe reads (`File!::read`, `read_exact`, `read_to_end`, `Input!`) name their own descriptor |
 | `std::process::pipe_end` | `fd` is -1 or a descriptor nothing else owns, which the `File!` made of it closes: the parent's end of a pipe `kur_libc_process_spawn` made for the child |
 

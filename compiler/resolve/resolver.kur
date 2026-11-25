@@ -22,6 +22,7 @@ use std::mem::Ref;
 use std::raw::Span;
 use std::arena::{Domain!, concat, ref_in};
 use std::buffer::Buffer!;
+use std::fmt::Writer;
 use package::kurs::core::ModuleId;
 use package::syntax::parser::parse;
 use package::syntax::ast as S;
@@ -98,7 +99,7 @@ fn clean(&cx: Domain!['k], path: Span['k]) -> Span['k] {
     let parts = ArenaVec::split(&cx, path, Span::from_static(&cx, "/"));
     var out = Buffer!::new();
     if path.starts_with(&cx, Span::from_static(&cx, "/")) {
-        out = out.push_static("/");
+        out = out.put("/");
     }
     var first = true;
     var i = 0usize;
@@ -106,9 +107,9 @@ fn clean(&cx: Domain!['k], path: Span['k]) -> Span['k] {
         let part = parts.at(&cx, i);
         if !part.is_empty() && !part.is(&cx, ".") {
             if !first {
-                out = out.push_static("/");
+                out = out.put("/");
             }
-            out = out.push_bytes(&cx, part);
+            out = out.write(&cx, part);
             first = false;
         }
         i = i + 1usize;
@@ -130,7 +131,7 @@ fn join(&cx: Domain!['k], a: Span['k], b: Span['k]) -> Span['k] {
     } else if a.ends_with(&cx, Span::from_static(&cx, "/")) {
         concat(&cx, a, b)
     } else {
-        Buffer!::new().push_bytes(&cx, a).push_static("/").push_bytes(&cx, b).save(&cx)
+        f"{a}/{b}".write(&cx, Buffer!::new()).save(&cx)
     }
 }
 
@@ -228,9 +229,9 @@ fn listed(&cx: Domain!['k], names: ArenaVec[Span['k], 'k]) -> Span['k] {
     var i = 0usize;
     while i < names.len(&cx) {
         if i > 0usize {
-            out = out.push_static(if i + 1usize == names.len(&cx) { " and " } else { ", " });
+            out = out.put(if i + 1usize == names.len(&cx) { " and " } else { ", " });
         }
-        out = out.push_bytes(&cx, names.at(&cx, i));
+        out = out.write(&cx, names.at(&cx, i));
         i = i + 1usize;
     }
     out.save(&cx)
@@ -394,9 +395,9 @@ fn other_spelling(&cx: Domain!['k], name: Span['k]) -> Span['k] {
 forall 'k.
 fn respelled(&cx: Domain!['k], out: Buffer!, other: Span['k]) -> Buffer! {
     if other.ends_with(&cx, Span::from_static(&cx, "!")) {
-        out.push_static("; the linear type is ").push_bytes(&cx, other)
+        out.put("; the linear type is ").write(&cx, other)
     } else {
-        out.push_static("; ").push_bytes(&cx, other).push_static(" is not a linear type")
+        out.put("; ").write(&cx, other).put(" is not a linear type")
     }
 }
 
@@ -496,7 +497,7 @@ fn error_text(&cx: Domain!['k], message: Span['k], pos: Pos) -> Span['k] {
     if pos.line == 0u32 {
         message
     } else {
-        Buffer!::new().push_u64(pos.line as u64).push_static(":").push_u64(pos.col as u64).push_static(": ").push_bytes(&cx, message).save(&cx)
+        f"{pos.line}:{pos.col}: {message}".write(&cx, Buffer!::new()).save(&cx)
     }
 }
 
@@ -509,11 +510,11 @@ fn located(&cx: Domain!['k], full: Span['k], message: Span['k], pos: Pos, file: 
     } else {
         let at_pos = if pos.line != 0u32 { pos } else { at };
         let prefix = if at_pos.line != 0u32 {
-            Buffer!::new().push_bytes(&cx, file).push_static(":").push_u64(at_pos.line as u64).push_static(":").push_u64(at_pos.col as u64).save(&cx)
+            f"{file}:{at_pos.line}:{at_pos.col}".write(&cx, Buffer!::new()).save(&cx)
         } else {
             file
         };
-        (Buffer!::new().push_bytes(&cx, prefix).push_static(": ").push_bytes(&cx, message).save(&cx), at_pos)
+        (f"{prefix}: {message}".write(&cx, Buffer!::new()).save(&cx), at_pos)
     }
 }
 
@@ -564,7 +565,7 @@ fn load(&cx: Domain!['k], path: Span['k], ids: Ref[u32, 'k]) -> ArenaVec[Package
                 k = k + 1usize;
             }
             if !package.files.contains(&cx, ModuleId::root(&cx, package.id)) {
-                fail(&cx, Buffer!::new().push_static("package ").push_bytes(&cx, package.name.copy(&cx)).push_static(" has no lib.kur in ").push_bytes(&cx, package.source_root.copy(&cx)).save(&cx));
+                fail(&cx, Buffer!::new().put("package ").write(&cx, package.name.copy(&cx)).put(" has no lib.kur in ").write(&cx, package.source_root.copy(&cx)).save(&cx));
             }
         }
         p = p + 1usize;
@@ -578,10 +579,10 @@ forall 'k.
 fn read_source(&cx: Domain!['k], path: Span['k]) -> Span['k] {
     let text = match read_to_arena(&cx, path) {
         Ok(s) => s,
-        Err(e) => fail(&cx, Buffer!::new().push_static("cannot read ").push_bytes(&cx, path).save(&cx)),
+        Err(e) => fail(&cx, Buffer!::new().put("cannot read ").write(&cx, path).save(&cx)),
     };
     if !validate(&cx, text) {
-        fail(&cx, Buffer!::new().push_bytes(&cx, path).push_static(" is not valid UTF-8").save(&cx));
+        fail(&cx, Buffer!::new().write(&cx, path).put(" is not valid UTF-8").save(&cx));
     }
     text
 }
@@ -663,8 +664,8 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
         if unknown.len(&cx) > 0usize {
             let names = unknown.keys(&cx);
             names.sort_by(&cx, |&cx, a, b| a.cmp(&cx, b));
-            fail(&cx, Buffer!::new().push_bytes(&cx, manifest).push_static(if names.len(&cx) > 1usize { ": unknown manifest keys " } else { ": unknown manifest key " })
-                .push_bytes(&cx, listed(&cx, names)).save(&cx));
+            fail(&cx, Buffer!::new().write(&cx, manifest).put(if names.len(&cx) > 1usize { ": unknown manifest keys " } else { ": unknown manifest key " })
+                .write(&cx, listed(&cx, names)).save(&cx));
         }
         package.name.set(&cx, string(&cx, info, manifest, "name", Option::None));
         package.source_root.set(&cx, resolved(&cx, join(&cx, root, string(&cx, info, manifest, "source_root", Option::Some.(Span::from_static(&cx, "src"))))));
@@ -682,7 +683,7 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
         }
         let kind = string(&cx, info, manifest, "kind", Option::Some.(Span::from_static(&cx, "library")));
         if !kind.is(&cx, "library") && !kind.is(&cx, "executable") {
-            fail(&cx, Buffer!::new().push_bytes(&cx, manifest).push_static(": manifest kind must be \"library\" or \"executable\"").save(&cx));
+            fail(&cx, Buffer!::new().write(&cx, manifest).put(": manifest kind must be \"library\" or \"executable\"").save(&cx));
         }
         if kind.is(&cx, "executable") {
             let parts = ArenaVec::split(&cx, string(&cx, info, manifest, "entry", Option::None), Span::from_static(&cx, "::"));
@@ -696,7 +697,7 @@ fn add(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], by_dir: ArenaMap[S
             }
             package.entry.set(&cx, Option::Some.(path));
         } else if info.contains(&cx, Span::from_static(&cx, "entry")) {
-            fail(&cx, Buffer!::new().push_bytes(&cx, manifest).push_static(": manifest entry is only for kind \"executable\"").save(&cx));
+            fail(&cx, Buffer!::new().write(&cx, manifest).put(": manifest entry is only for kind \"executable\"").save(&cx));
         }
         deps = ArenaMap::new(&cx);
         k = 0usize;
@@ -725,7 +726,7 @@ fn manifest_table(&cx: Domain!['k], path: Span['k]) -> ArenaMap[Span['k], TomlVa
         Ok(t) => t,
         Err(e) => {
             let (line, column) = line_column(&cx, source, e.offset);
-            fail(&cx, Buffer!::new().push_bytes(&cx, path).push_static(":").push_usize(line).push_static(": invalid manifest").save(&cx))
+            fail(&cx, f"{path}:{line}: invalid manifest".write(&cx, Buffer!::new()).save(&cx))
         },
     }
 }
@@ -734,14 +735,14 @@ forall 'k.
 fn table(&cx: Domain!['k], value: TomlValue['k], at_pos: Span['k]) -> ArenaMap[Span['k], TomlValue['k], 'k] {
     match value.as_table() {
         Some(t) => t,
-        None => fail(&cx, Buffer!::new().push_bytes(&cx, at_pos).push_static(": expected a table").save(&cx)),
+        None => fail(&cx, Buffer!::new().write(&cx, at_pos).put(": expected a table").save(&cx)),
     }
 }
 
 // `MANIFEST: where`, for an error in the manifest.
 forall 'k.
 fn in_manifest(&cx: Domain!['k], manifest: Span['k], at_pos: Span['k]) -> Span['k] {
-    Buffer!::new().push_bytes(&cx, manifest).push_static(": ").push_bytes(&cx, at_pos).save(&cx)
+    f"{manifest}: {at_pos}".write(&cx, Buffer!::new()).save(&cx)
 }
 
 // The string `t`, a table of `manifest`, holds at `key`, else `default`.
@@ -753,7 +754,7 @@ fn string(&cx: Domain!['k], t: ArenaMap[Span['k], TomlValue['k], 'k], manifest: 
     };
     match value {
         Some(s) => s,
-        None => fail(&cx, Buffer!::new().push_bytes(&cx, manifest).push_static(": manifest ").push_static(key).push_static(" must be a string").save(&cx)),
+        None => fail(&cx, f"{manifest}: manifest {key} must be a string".write(&cx, Buffer!::new()).save(&cx)),
     }
 }
 
@@ -763,8 +764,7 @@ fn strings(&cx: Domain!['k], t: ArenaMap[Span['k], TomlValue['k], 'k], manifest:
     let values = match t.get(&cx, Span::from_static(&cx, key)) {
         Some(value) => match value.as_array() {
             Some(items) => items,
-            None => fail(&cx, Buffer!::new().push_bytes(&cx, manifest).push_static(": manifest ")
-                .push_static(key).push_static(" must be an array of nonempty strings without NUL").save(&cx)),
+            None => fail(&cx, f"{manifest}: manifest {key} must be an array of nonempty strings without NUL".write(&cx, Buffer!::new()).save(&cx)),
         },
         None => ArenaVec::new(&cx),
     };
@@ -773,12 +773,10 @@ fn strings(&cx: Domain!['k], t: ArenaMap[Span['k], TomlValue['k], 'k], manifest:
     while i < values.len(&cx) {
         let value = match values.at(&cx, i).as_string() {
             Some(s) => s,
-            None => fail(&cx, Buffer!::new().push_bytes(&cx, manifest).push_static(": manifest ")
-                .push_static(key).push_static(" must be an array of nonempty strings without NUL").save(&cx)),
+            None => fail(&cx, f"{manifest}: manifest {key} must be an array of nonempty strings without NUL".write(&cx, Buffer!::new()).save(&cx)),
         };
         if value.is_empty() || !value.find_byte(&cx, 0u8, 0usize).is_none() {
-            fail(&cx, Buffer!::new().push_bytes(&cx, manifest).push_static(": manifest ")
-                .push_static(key).push_static(" must be an array of nonempty strings without NUL").save(&cx));
+            fail(&cx, f"{manifest}: manifest {key} must be an array of nonempty strings without NUL".write(&cx, Buffer!::new()).save(&cx));
         }
         out.push(&cx, value);
         i = i + 1usize;
@@ -792,8 +790,7 @@ forall 'k.
 fn exists_or_fail(&cx: Domain!['k], path: Span['k]) -> bool {
     match path_exists(&cx, path) {
         Ok(found) => found,
-        Err(e) => fail(&cx, Buffer!::new().push_static("cannot read ").push_bytes(&cx, path).push_static(" (error ")
-            .push_i64(e.errno as i64).push_static(")").save(&cx)),
+        Err(e) => fail(&cx, f"cannot read {path} (error {e.errno})".write(&cx, Buffer!::new()).save(&cx)),
     }
 }
 
@@ -858,7 +855,7 @@ fn walk(&cx: Domain!['k], package: Package['k], here: Span['k], rel: ArenaVec[Sp
             }
             let home = ModuleId.{ package: package.id, path };
             if files.contains(&cx, home) {
-                fail(&cx, Buffer!::new().push_static("two files define module ").push_bytes(&cx, path.join(&cx, "::")).push_static(" of ").push_bytes(&cx, package.name.copy(&cx)).save(&cx));
+                fail(&cx, Buffer!::new().put("two files define module ").write(&cx, path.join(&cx, "::")).put(" of ").write(&cx, package.name.copy(&cx)).save(&cx));
             }
             files.insert(&cx, home, join(&cx, here, name));
         }
@@ -887,7 +884,7 @@ forall 'k.
 fn visit(&cx: Domain!['k], packages: ArenaVec[Package['k], 'k], state: ArenaMap[usize, u32, 'k], package_id: usize) {
     let s = state.get_or(&cx, package_id, 0u32);
     if s == 1u32 {
-        fail(&cx, Buffer!::new().push_static("dependency cycle through package ").push_bytes(&cx, packages.at(&cx, package_id).name.copy(&cx)).save(&cx));
+        fail(&cx, Buffer!::new().put("dependency cycle through package ").write(&cx, packages.at(&cx, package_id).name.copy(&cx)).save(&cx));
     }
     if s == 0u32 {
         state.insert(&cx, package_id, 1u32);
@@ -1078,8 +1075,8 @@ impl Resolver['k] {
                     let linear = last.ends_with(&cx, Span::from_static(&cx, "!"));
                     // still imported under the alias, so that its uses report nothing more
                     if a.ends_with(&cx, Span::from_static(&cx, "!")) != linear {
-                        self.report(&cx, Buffer!::new().push_static("the alias ").push_bytes(&cx, a).push_static(" of ").push_bytes(&cx, last)
-                            .push_static(if linear { " must end with !" } else { " must not end with !" }).save(&cx), tree.pos);
+                        self.report(&cx, Buffer!::new().put("the alias ").write(&cx, a).put(" of ").write(&cx, last)
+                            .put(if linear { " must end with !" } else { " must not end with !" }).save(&cx), tree.pos);
                     }
                     a
                 },
@@ -1091,11 +1088,11 @@ impl Resolver['k] {
                 return;
             }
             if name.is(&cx, "package") || name.is(&cx, "builtin") || is_builtin_trait(&cx, name) {
-                self.report(&cx, Buffer!::new().push_bytes(&cx, name).push_static(" is compiler-sealed").save(&cx), tree.pos);
+                self.report(&cx, Buffer!::new().write(&cx, name).put(" is compiler-sealed").save(&cx), tree.pos);
                 return;
             }
             if scope.imports.contains(&cx, name) || scope.decls.contains(&cx, name) {
-                self.report(&cx, Buffer!::new().push_static("duplicate import ").push_bytes(&cx, name).save(&cx), tree.pos);
+                self.report(&cx, Buffer!::new().put("duplicate import ").write(&cx, name).save(&cx), tree.pos);
                 return;
             }
             scope.imports.insert(&cx, name, path);
@@ -1165,8 +1162,8 @@ impl Resolver['k] {
         var k = 0usize;
         while k < item.items.len(&cx) {
             let decl = match item.items.at(&cx, k) {
-                Fn(f) => self.new_decl(&cx, "method", scope.home, Buffer!::new().push_bytes(&cx, spelled).push_static("::").push_bytes(&cx, f.name).save(&cx), Named::Fn.(f), Option::Some.(item)),
-                Const(c) => self.new_decl(&cx, "const", scope.home, Buffer!::new().push_bytes(&cx, spelled).push_static("::").push_bytes(&cx, c.name).save(&cx), Named::Const.(c), Option::Some.(item)),
+                Fn(f) => self.new_decl(&cx, "method", scope.home, f"{spelled}::{f.name}".write(&cx, Buffer!::new()).save(&cx), Named::Fn.(f), Option::Some.(item)),
+                Const(c) => self.new_decl(&cx, "const", scope.home, f"{spelled}::{c.name}".write(&cx, Buffer!::new()).save(&cx), Named::Const.(c), Option::Some.(item)),
             };
             let member = match item.items.at(&cx, k) {
                 Fn(f) => f.name,
@@ -1253,10 +1250,10 @@ impl Resolver['k] {
     fn impl_home(self, &cx: Domain!['k], home: ModuleId['k], owner: Owner['k], target: S::TName['k]) {
         match owner {
             Prim(name) => if !self.in_core(&cx, home) {
-                self.report(&cx, Buffer!::new().push_static("an inherent impl of ").push_bytes(&cx, name).push_static(" belongs in core").save(&cx), target.pos);
+                self.report(&cx, f"an inherent impl of {name} belongs in core".write(&cx, Buffer!::new()).save(&cx), target.pos);
             },
             Decl(d) => if d.home.package != home.package {
-                self.report(&cx, Buffer!::new().push_static("an inherent impl of ").push_bytes(&cx, d.name).push_static(" belongs in the package that declares it").save(&cx), target.pos);
+                self.report(&cx, f"an inherent impl of {d.name} belongs in the package that declares it".write(&cx, Buffer!::new()).save(&cx), target.pos);
             },
             Blanket => (),
         }
@@ -1361,11 +1358,11 @@ impl Resolver['k] {
         var out = Buffer!::new();
         var i = 0usize;
         while i < n && i < ERROR_LIMIT {
-            out = out.push_static(if i > 0usize { "\n" } else { "" }).push_bytes(&cx, sorted.at(&cx, i).text);
+            out = out.put(if i > 0usize { "\n" } else { "" }).write(&cx, sorted.at(&cx, i).text);
             i = i + 1usize;
         }
         if n > ERROR_LIMIT {
-            out = out.push_static("\nand ").push_usize(n - ERROR_LIMIT).push_static(if n - ERROR_LIMIT > 1usize { " more errors" } else { " more error" });
+            out = out.put("\nand ").put(n - ERROR_LIMIT).put(if n - ERROR_LIMIT > 1usize { " more errors" } else { " more error" });
         }
         fail(&cx, out.save(&cx))
     }
@@ -1399,7 +1396,7 @@ impl Resolver['k] {
         };
         let (kind, home, names) = key;
         if self.active.contains(&cx, key) {
-            return problem(Buffer!::new().push_static("import cycle at ").push_bytes(&cx, names.join(&cx, "::")).save(&cx));
+            return problem(Buffer!::new().put("import cycle at ").write(&cx, names.join(&cx, "::")).save(&cx));
         }
         self.active.insert(&cx, key);
         let value = if kind.is(&cx, "import") {
@@ -1452,7 +1449,7 @@ impl Resolver['k] {
                     Ok(found) => match found {
                         Some(t) => t,
                         None => {
-                            var message = Buffer!::new().push_static("unknown name ").push_bytes(&cx, path.join(&cx, "::"));
+                            var message = Buffer!::new().put("unknown name ").write(&cx, path.join(&cx, "::"));
                             if hint {
                                 message = self.unknown_hint(&cx, message, home, first, importing);
                             }
@@ -1470,13 +1467,13 @@ impl Resolver['k] {
                 Builtin(name) => if is_owned_builtin(&cx, name) {
                     return self.attached_to(&cx, name, rest.skip(&cx, k).join(&cx, "::"));
                 } else {
-                    return problem(Buffer!::new().push_bytes(&cx, path.slice(&cx, 0usize, k + 1usize).join(&cx, "::")).push_static(" is not a module").save(&cx));
+                    return problem(Buffer!::new().write(&cx, path.slice(&cx, 0usize, k + 1usize).join(&cx, "::")).put(" is not a module").save(&cx));
                 },
                 Module(m) => match self.member(&cx, home, m, rest.at(&cx, k), true) {
                     Ok(t) => t,
                     Err(e) => return Result::Err.(e),
                 },
-                _ => return problem(Buffer!::new().push_bytes(&cx, path.slice(&cx, 0usize, k + 1usize).join(&cx, "::")).push_static(" is not a module").save(&cx)),
+                _ => return problem(Buffer!::new().write(&cx, path.slice(&cx, 0usize, k + 1usize).join(&cx, "::")).put(" is not a module").save(&cx)),
             };
             k = k + 1usize;
         }
@@ -1497,7 +1494,7 @@ impl Resolver['k] {
             let misspelled = self.misspelled_import(&cx, home, other);
             if !misspelled.is_empty() {
                 let imported = scope.imports.at(&cx, other);
-                return respelled(&cx, out, other_spelling(&cx, imported.at(&cx, imported.len(&cx) - 1usize))).push_bytes(&cx, misspelled);
+                return respelled(&cx, out, other_spelling(&cx, imported.at(&cx, imported.len(&cx) - 1usize))).write(&cx, misspelled);
             }
         }
         match self.resolve_path(&cx, home, ArenaVec::one(&cx, other), Option::None, false) {
@@ -1517,8 +1514,8 @@ impl Resolver['k] {
         match self.resolve_path(&cx, home, other, Option::Some.(alias), false) {
             Ok(_t) => {
                 let at = scope.import_pos.at(&cx, alias);
-                Buffer!::new().push_static(", imported as ").push_bytes(&cx, path.at(&cx, n - 1usize)).push_static(" at ").push_bytes(&cx, self.file(&cx, home))
-                    .push_static(":").push_u64(at.line as u64).push_static(":").push_u64(at.col as u64).save(&cx)
+                Buffer!::new().put(", imported as ").write(&cx, path.at(&cx, n - 1usize)).put(" at ").write(&cx, self.file(&cx, home))
+                    .put(":").put(at.line).put(":").put(at.col).save(&cx)
             },
             Err(_e) => Span::from_static(&cx, ""),
         }
@@ -1531,7 +1528,7 @@ impl Resolver['k] {
         }
         let name = if path.len(&cx) == 2usize { path.at(&cx, 1usize) } else { Span::from_static(&cx, "") };
         if !is_builtin_type(&cx, name) && !is_builtin_value(&cx, name) {
-            return problem(Buffer!::new().push_static("unknown builtin ").push_bytes(&cx, path.join(&cx, "::")).save(&cx));
+            return problem(Buffer!::new().put("unknown builtin ").write(&cx, path.join(&cx, "::")).save(&cx));
         }
         Result::Ok.(Target::Builtin.(name))
     }
@@ -1544,7 +1541,7 @@ impl Resolver['k] {
     fn attached_to(self, &cx: Domain!['k], owner: Span['k], name: Span['k]) -> Result[Target['k], Problem['k]] {
         let found = self.attached.get_or(&cx, (Owner::Prim.(owner), name), ArenaVec::new(&cx));
         if found.is_empty(&cx) {
-            return problem(Buffer!::new().push_static("unknown ").push_bytes(&cx, owner).push_static("::").push_bytes(&cx, name).save(&cx));
+            return problem(f"unknown {owner}::{name}".write(&cx, Buffer!::new()).save(&cx));
         }
         Result::Ok.(Target::Decl.(found.at(&cx, 0usize)))
     }
@@ -1600,7 +1597,7 @@ impl Resolver['k] {
                         Ok(t) => return Result::Ok.(Option::Some.(t)),
                         Err(e) => (),
                     },
-                    _ => return Result::Err.(Problem.{ message: Buffer!::new().push_bytes(&cx, path.join(&cx, "::")).push_static(" is not a module").save(&cx), pos: no_pos() }),
+                    _ => return Result::Err.(Problem.{ message: Buffer!::new().write(&cx, path.join(&cx, "::")).put(" is not a module").save(&cx), pos: no_pos() }),
                 };
             }
             i = i + 1usize;
@@ -1653,7 +1650,7 @@ impl Resolver['k] {
             };
         }
         let owner = if home.path.is_empty(&cx) { self.packages.at(&cx, home.package).name.copy(&cx) } else { home.path.join(&cx, "::") };
-        var message = Buffer!::new().push_static("unknown or private member ").push_bytes(&cx, name).push_static(" of ").push_bytes(&cx, owner);
+        var message = Buffer!::new().put("unknown or private member ").write(&cx, name).put(" of ").write(&cx, owner);
         if hint {
             let other = other_spelling(&cx, name);
             let unit = match self.member(&cx, caller, home, other, false) {
@@ -1703,7 +1700,7 @@ impl Resolver['k] {
             own = found;
         }
         if own.len(&cx) != 1usize {
-            return problem(Buffer!::new().push_static(if own.is_empty(&cx) { "unknown" } else { "ambiguous" }).push_static(" associated name ").push_bytes(&cx, owner.name).push_static("::").push_bytes(&cx, name).save(&cx));
+            return problem(Buffer!::new().put(if own.is_empty(&cx) { "unknown" } else { "ambiguous" }).put(" associated name ").write(&cx, owner.name).put("::").write(&cx, name).save(&cx));
         }
         Result::Ok.(Target::Decl.(own.at(&cx, 0usize)))
     }
@@ -1834,7 +1831,7 @@ impl Names['k] {
             match self.r.resolve_path(&cx, home, path, Option::None, true) {
                 Ok(t) => match t {
                     Module(m) => (),
-                    _ => self.r.report(&cx, Buffer!::new().push_bytes(&cx, path.join(&cx, "::")).push_static(" is not a module").save(&cx), tree.pos),
+                    _ => self.r.report(&cx, Buffer!::new().write(&cx, path.join(&cx, "::")).put(" is not a module").save(&cx), tree.pos),
                 },
                 Err(e) => self.r.report(&cx, e.message, if e.pos.line != 0u32 { e.pos } else { tree.pos }),
             }
@@ -2018,7 +2015,7 @@ impl Names['k] {
             _ => (),
         }
         let what = if k.is_empty() { Span::from_static(&cx, "declaration") } else { k };
-        self.r.report(&cx, Buffer!::new().push_bytes(&cx, path.join(&cx, "::")).push_static(" is not a ").push_bytes(&cx, what).save(&cx), pos);
+        self.r.report(&cx, Buffer!::new().write(&cx, path.join(&cx, "::")).put(" is not a ").write(&cx, what).save(&cx), pos);
         Option::None
     }
 
@@ -2091,7 +2088,7 @@ impl Names['k] {
     // The type, or with `is_trait` the trait, `n` writes: `target`, what its path names, unless that is
     // not one, which is reported.
     fn named_type(self, &cx: Domain!['k], n: S::TName['k], target: Target['k], is_trait: bool) {
-        let not_a_type = Buffer!::new().push_bytes(&cx, n.path.join(&cx, "::")).push_static(" is not a type").save(&cx);
+        let not_a_type = Buffer!::new().write(&cx, n.path.join(&cx, "::")).put(" is not a type").save(&cx);
         match target {
             Builtin(name) => if !is_trait {
                 if is_builtin_type(&cx, name) {
@@ -2138,7 +2135,7 @@ impl Names['k] {
                 while i < s.fields.len(&cx) {
                     let f = s.fields.at(&cx, i);
                     if f.value.is_none() && !values.contains(&cx, f.name) {
-                        self.r.report(&cx, Buffer!::new().push_static("unknown local ").push_bytes(&cx, f.name).save(&cx), s.pos);
+                        self.r.report(&cx, Buffer!::new().put("unknown local ").write(&cx, f.name).save(&cx), s.pos);
                     }
                     i = i + 1usize;
                 }
@@ -2330,7 +2327,7 @@ impl Names['k] {
         } else if names.len(&cx) == 2usize && is_prim(&cx, first) {
             let found = self.r.attached.get_or(&cx, (Owner::Prim.(first), names.at(&cx, 1usize)), ArenaVec::new(&cx));
             if found.is_empty(&cx) {
-                self.r.report(&cx, Buffer!::new().push_static("unknown ").push_bytes(&cx, first).push_static("::").push_bytes(&cx, names.at(&cx, 1usize)).save(&cx), p.pos);
+                self.r.report(&cx, Buffer!::new().put("unknown ").write(&cx, first).put("::").write(&cx, names.at(&cx, 1usize)).save(&cx), p.pos);
             } else {
                 self.set(&cx, p.id, NameRef::Decl.(found.at(&cx, 0usize)));
             }
@@ -2340,7 +2337,7 @@ impl Names['k] {
         } else {
             match self.seek(&cx, names, p.pos) {
                 Some(target) => match target {
-                    Module(m) => self.r.report(&cx, Buffer!::new().push_bytes(&cx, names.join(&cx, "::")).push_static(" is a module, not a value").save(&cx), p.pos),
+                    Module(m) => self.r.report(&cx, Buffer!::new().write(&cx, names.join(&cx, "::")).put(" is a module, not a value").save(&cx), p.pos),
                     Decl(d) => if d.kind.is(&cx, "alias") {
                         self.r.report(&cx, alias_names_a_type(&cx, d), p.pos);
                     } else {
@@ -2367,9 +2364,9 @@ impl Names['k] {
         };
         let name = callee.names(&cx).join(&cx, "::");
         if constructor && !construct {
-            self.r.report(&cx, Buffer!::new().push_static("`").push_bytes(&cx, name).push_static("` is a constructor; write `").push_bytes(&cx, name).push_static(".(...)`").save(&cx), callee.pos);
+            self.r.report(&cx, f"`{name}` is a constructor; write `{name}.(...)`".write(&cx, Buffer!::new()).save(&cx), callee.pos);
         } else if construct && !constructor {
-            self.r.report(&cx, Buffer!::new().push_static("`").push_bytes(&cx, name).push_static("` is not a tuple or an enum variant; write `").push_bytes(&cx, name).push_static("(...)`").save(&cx), callee.pos);
+            self.r.report(&cx, f"`{name}` is not a tuple or an enum variant; write `{name}(...)`".write(&cx, Buffer!::new()).save(&cx), callee.pos);
         }
     }
 
@@ -2377,7 +2374,7 @@ impl Names['k] {
         match self.seek(&cx, path.names(&cx), path.pos) {
             Some(target) => match target {
                 Variant(d, v) => self.set(&cx, path.id, NameRef::Variant.(d, v)),
-                _ => self.r.report(&cx, Buffer!::new().push_bytes(&cx, path.names(&cx).join(&cx, "::")).push_static(" is not an enum variant").save(&cx), path.pos),
+                _ => self.r.report(&cx, Buffer!::new().write(&cx, path.names(&cx).join(&cx, "::")).put(" is not an enum variant").save(&cx), path.pos),
             },
             None => (),
         }

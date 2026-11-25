@@ -1380,11 +1380,12 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         return self.fstring(expr, self.emit("call", self.substitute_type(expr.ty), (sig.name,), tys=()))
 
     def fstring(self, expr: S.FStr, writer: str) -> Optional[str]:
-        """Write each segment into the writer `w`: literals through `Writer::write_static`,
-        `{expr}` through `Format::format`, which hands the value back (`{&x}` stores it again)."""
+        """Write each segment into the writer `w`: literals, and `{x}` of type `Slice[u8, 'static]`,
+        through `Writer::write_static`, any other `{x}` through `Format::format`, which hands the value
+        back (`{&x}` stores it again)."""
         module, wty = self.module, self.vty[writer]
         writer_trait, fmt = self.lowering.library_name("Writer", module), self.lowering.library_name("Format", module)
-        for part in expr.parts:
+        for index, part in enumerate(expr.parts):
             if isinstance(part, str):
                 if part:
                     writer = self.emit("trait_call", wty, (writer_trait, "write_static", writer, self.string(part)), tys=(wty,))
@@ -1395,6 +1396,9 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
             if values is None:
                 return None
             writer, v = values
+            if index in expr.static_parts:
+                writer = self.emit("trait_call", wty, (writer_trait, "write_static", writer, v), tys=(wty,))
+                continue
             if not lend and not self.copy(self.vty[v]):
                 place = written_place(part)
                 if place is None:

@@ -97,7 +97,7 @@ and report through their exit status, 0 when every check holds.
 | `skolems`, `mint_join` (libraries), with `bad/mismatched_skolem.kur`, `bad/unbound_result_brand.kur`, `bad/reopened_brand.kur`, `bad/shadowing_exists_binder.kur` | brands: minting them, carrying them through branches and joins, and naming each apart from those in scope |
 | `basic`, `arrays`, `tuples`, `shapes` (libraries) | structs, fixed-size arrays, tuples, enums |
 | `generics`, `generic_result`, `option_result` (libraries) | generic types and functions, `Result`, `Option` and `?` |
-| `recursion`, `strings` (libraries) | recursion and early `return`; string literals as `Str['static]` |
+| `recursion`, `strings` (libraries) | recursion and early `return`; string literals as `Str['static]`, text built with `put`, and an f-string reading a branded `Str['k]` |
 | `closure_method` (library) | closure parameter types |
 
 ## Feature tests

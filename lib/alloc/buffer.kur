@@ -3,13 +3,14 @@
 // `u8`. Linear, so a buffer that is built but never consumed is a compile
 // error rather than a leak.
 //
-// It serves two roles: a growable accumulator (`new`, the `push_*` methods,
-// `reserve`/`tail_ptr`/`commit`, `as_ptr`, `len`) and, through `open` and
-// `BufferRestore!`, a checked, branded view of its bytes that can be turned
-// back into a growable buffer.
+// It serves two roles: a growable accumulator (`new`, its `Writer`
+// instance, `reserve`/`tail_ptr`/`commit`, `as_ptr`, `len`) and, through
+// `open` and `BufferRestore!`, a checked, branded view of its bytes that can
+// be turned back into a growable buffer.
 //
-// `Buffer!` is also the default writer for `f"..."` interpolation
-// (`alloc::fmt`'s `Writer`/`Format`).
+// It is written through `core::fmt::Writer` and the methods every writer
+// has: `Buffer!::new().put("n = ").put(n).write(&cx, name)`. It is also
+// the default writer for `f"..."` interpolation.
 
 use package as alloc;
 
@@ -27,8 +28,9 @@ use core::slice::Slice;
 use core::slice::{ReadBytes, Readable, hash_bytes, bytes_eq, bytes_cmp};
 use core::cmp::{Ord, Order};
 use core::hash::{Hash, Eq, HashState};
-use core::option::{Option, Result};
+use core::option::Result;
 use core::iter::Iterator;
+use core::fmt::Writer;
 
 /// Growable byte buffer with an explicit owner and initialized length.
 ///
@@ -156,98 +158,8 @@ impl Buffer! {
         }
     }
 
-    /// Appends one byte, growing first if needed.
-    fn push_byte(self, val: u8) -> Buffer! {
-        let b2 = self.reserve(1usize);
-        let { ptr: p, len: n, cap: c } = b2;
-        let dest = unsafe offset(p, n);
-        unsafe *dest = val;
-        Buffer!.{ ptr: p, len: checked_add(n, 1usize), cap: c }
-    }
-
-    /// Copies `count` bytes from `src` in, growing first if needed. Caller:
-    /// `src[0..count)` is readable, and not inside this buffer's own storage,
-    /// which the grow may free.
-    unsafe fn push_n(self, src: *u8, count: usize) -> Buffer! {
-        let b2 = self.reserve(count);
-        let { ptr: p, len: n, cap: c } = b2;
-        var i = 0usize;
-        while i < count {
-            let s = unsafe offset(src, i);
-            let v = unsafe *s;
-            let d = unsafe offset(p, n + i);
-            unsafe *d = v;
-            i = i + 1usize;
-        }
-        Buffer!.{ ptr: p, len: checked_add(n, count), cap: c }
-    }
-
-    /// Appends a `'static` byte view's bytes. Safe without a capability
-    /// argument because `'static` storage is permanent and immutable
-    /// (`core::slice::StaticRead`); f-string lowering uses this for literal
-    /// segments.
-    fn push_static(self, bytes: Slice[u8, 'static]) -> Buffer! {
-        let (p, n, m) = bytes.into_parts();
-        unsafe self.push_n(p, n)
-    }
-
-    /// Appends any readable byte view's bytes, reading through the
-    /// capability that permits it. Never consumes or frees the view itself.
-    forall C, S where ReadBytes[C, S], Copy[S].
-    fn push_bytes(self, &cx: C, bytes: S) -> Buffer! {
-        let n = ReadBytes[C, S]::len(&cx, bytes);
-        // One reservation covers every byte, so the loop stores directly.
-        let { ptr: p, len: start, cap: c } = self.reserve(n);
-        var len = start;
-        var i = 0usize;
-        while i < n {
-            let x = ReadBytes[C, S]::get(&cx, bytes, i);
-            match x {
-                Some(v) => {
-                    let dest = unsafe offset(p, len);
-                    unsafe *dest = v;
-                    len = len + 1usize;
-                },
-                None => (),
-            }
-            i = i + 1usize;
-        }
-        Buffer!.{ ptr: p, len, cap: c }
-    }
-
-    /// Appends the decimal rendering of `n`.
-    fn push_u64(self, n: u64) -> Buffer! {
-        let b = if n >= 10u64 { self.push_u64(n / 10u64) } else { self };
-        b.push_byte(b'0' + ((n % 10u64) as u8))
-    }
-
-    /// Appends the decimal rendering of `n`.
-    fn push_usize(self, n: usize) -> Buffer! {
-        self.push_u64(n as u64)
-    }
-
-    /// Appends the decimal rendering of `n`, after a `-` when it is negative.
-    fn push_i64(self, n: i64) -> Buffer! {
-        if n < 0i64 {
-            // Two's-complement negation in `u64`, so `i64::MIN` has a magnitude.
-            self.push_byte(b'-').push_u64(0u64 - (n as u64))
-        } else {
-            self.push_u64(n as u64)
-        }
-    }
-
-    /// Appends `other`'s bytes, then destroys `other`.
-    fn push_buffer(self, other: Buffer!) -> Buffer! {
-        var other = other;
-        let p = unsafe &other.as_ptr();
-        let n = &other.len();
-        let b = unsafe self.push_n(p, n);
-        let u = other.destroy();
-        b
-    }
-
     /// The first `len` bytes, or all of them when there are fewer; the
-    /// room stays for what is pushed next.
+    /// room stays for what is written next.
     fn truncate(self, len: usize) -> Buffer! {
         let { ptr: p, len: n, cap: c } = self;
         Buffer!.{ ptr: p, len: if len < n { len } else { n }, cap: c }
@@ -264,8 +176,7 @@ impl Buffer! {
         let n = &self.len();
         // `p` points at the `n` initialized bytes of `self`, which stays
         // alive until the copy is made.
-        let copy = unsafe Buffer!::with_capacity(n).push_n(p, n);
-        copy
+        unsafe Writer[Buffer!]::write_raw(Buffer!::with_capacity(n), p, n)
     }
 
     /// Number of initialized bytes.
@@ -373,6 +284,40 @@ impl Buffer! {
     }
 }
 
+/// A buffer as a writer: every write appends, growing first if needed.
+///
+/// Infallible: `Buffer!` aborts on out-of-memory.
+instance Writer[Buffer!] {
+    fn write_byte(self: Buffer!, byte: u8) -> Buffer! {
+        let { ptr: p, len: n, cap: c } = self.reserve(1usize);
+        let dest = unsafe offset(p, n);
+        unsafe *dest = byte;
+        Buffer!.{ ptr: p, len: checked_add(n, 1usize), cap: c }
+    }
+
+    /// Copies the bytes in one step: `'static` storage is permanent and
+    /// immutable (`core::slice::StaticRead`), so reading it needs no
+    /// capability.
+    fn write_static(self: Buffer!, bytes: Slice[u8, 'static]) -> Buffer! {
+        let (p, n, m) = bytes.into_parts();
+        unsafe Writer[Buffer!]::write_raw(self, p, n)
+    }
+
+    /// Caller: as for `Writer::write_raw`, `ptr[0..len)` is readable for the
+    /// whole call; and it is not inside this buffer's own storage, which the
+    /// grow may free.
+    unsafe fn write_raw(self: Buffer!, ptr: *u8, len: usize) -> Buffer! {
+        let { ptr: p, len: n, cap: c } = self.reserve(len);
+        var i = 0usize;
+        while i < len {
+            let v = unsafe *(unsafe offset(ptr, i));
+            unsafe *(unsafe offset(p, n + i)) = v;
+            i = i + 1usize;
+        }
+        Buffer!.{ ptr: p, len: checked_add(n, len), cap: c }
+    }
+}
+
 forall 'k.
 impl BufferRestore!['k] {
     /// Rebuilds the growable `Buffer!` from this record and the capability
@@ -451,7 +396,7 @@ impl I {
         var it = self;
         var out = Buffer!::new();
         for b in &it {
-            out = out.push_byte(b);
+            out = out.write_byte(b);
         }
         (it, out)
     }

@@ -19,6 +19,7 @@ use std::ascii::{is_alnum, is_digit, to_lower};
 use std::raw::Span;
 use std::arena::{Domain!, concat, ref_in};
 use std::buffer::Buffer!;
+use std::fmt::Writer;
 use package::check::checker::{FunKey, matching_instance};
 use package::kurs::core::{Arm, Binding, Block, Data, Edge, Fun, ForeachType, Instr, Kind, Member, Param, Program, Terminator, Type, same};
 use package::kurs::core as C;
@@ -32,13 +33,13 @@ use package::types::ops::{Fresh, Row, Types, alpha_hashes, equal, kurs_error, ma
 use std::option::Option;
 use std::slice::Slice;
 use std::time::Instant;
-use std::io::eprint_buffer;
+use std::io::eprint;
 
 fn c_stage(times: bool, name: Slice[u8, 'static], started: Instant) -> Instant {
     let now = Instant::now();
     if times {
         let ms = now.since(started).as_millis();
-        eprint_buffer(Buffer!::new().push_static(name).push_static(": ").push_usize(ms as usize).push_static("ms\n"));
+        eprint(f"{name}: {ms}ms\n");
         Instant::now()
     } else {
         now
@@ -60,28 +61,28 @@ enum EntryResult {
 
 fn prelude() -> Buffer! {
     Buffer!::new()
-        .push_static("#include <stddef.h>\n")
-        .push_static("#include <stdint.h>\n")
-        .push_static("#define KUR_TRAP() __builtin_trap()\n")
-        .push_static("/* A call the C compiler must make a tail call, where it can be told to: Clang's `musttail`. */\n")
-        .push_static("#if defined(__clang__) && defined(__has_attribute)\n")
-        .push_static("#if __has_attribute(musttail)\n")
-        .push_static("#define KUR_MUSTTAIL __attribute__((musttail))\n")
-        .push_static("#endif\n")
-        .push_static("#endif\n")
-        .push_static("#ifndef KUR_MUSTTAIL\n")
-        .push_static("#define KUR_MUSTTAIL\n")
-        .push_static("#endif\n")
-        .push_static("/* A component's address by integer arithmetic: projection never dereferences, so it is defined for any\n")
-        .push_static("   pointer value, null and dangling included. The `__typeof__` operands are not evaluated. */\n")
-        .push_static("#define KUR_FIELD(p, m) ((__typeof__(&(p)->m))((uintptr_t)(p) + offsetof(__typeof__(*(p)), m)))\n")
-        .push_static("static inline int8_t kur_dec_i8(uint64_t b) { b &= 0xFF; return b < 0x80 ? (int8_t)b : (int8_t)((int64_t)b - 0x100); }\n")
-        .push_static("static inline int16_t kur_dec_i16(uint64_t b) { b &= 0xFFFF; return b < 0x8000 ? (int16_t)b : (int16_t)((int64_t)b - 0x10000); }\n")
-        .push_static("static inline int32_t kur_dec_i32(uint64_t b) { b &= 0xFFFFFFFF; return b < 0x80000000 ? (int32_t)b : (int32_t)((int64_t)b - 0x100000000); }\n")
-        .push_static("static inline int64_t kur_dec_i64(uint64_t b) { return b <= (uint64_t)INT64_MAX ? (int64_t)b : -INT64_C(1) - (int64_t)(UINT64_MAX - b); }\n")
-        .push_static("/* usize and isize are pointer-sized: uintptr_t and intptr_t, of KUR_PTR_BITS bits. */\n")
-        .push_static("#define KUR_PTR_BITS (8 * sizeof(uintptr_t))\n")
-        .push_static("static inline intptr_t kur_dec_isize(uintptr_t b) { return b <= (uintptr_t)INTPTR_MAX ? (intptr_t)b : -(intptr_t)1 - (intptr_t)(UINTPTR_MAX - b); }\n")
+        .put("#include <stddef.h>\n")
+        .put("#include <stdint.h>\n")
+        .put("#define KUR_TRAP() __builtin_trap()\n")
+        .put("/* A call the C compiler must make a tail call, where it can be told to: Clang's `musttail`. */\n")
+        .put("#if defined(__clang__) && defined(__has_attribute)\n")
+        .put("#if __has_attribute(musttail)\n")
+        .put("#define KUR_MUSTTAIL __attribute__((musttail))\n")
+        .put("#endif\n")
+        .put("#endif\n")
+        .put("#ifndef KUR_MUSTTAIL\n")
+        .put("#define KUR_MUSTTAIL\n")
+        .put("#endif\n")
+        .put("/* A component's address by integer arithmetic: projection never dereferences, so it is defined for any\n")
+        .put("   pointer value, null and dangling included. The `__typeof__` operands are not evaluated. */\n")
+        .put("#define KUR_FIELD(p, m) ((__typeof__(&(p)->m))((uintptr_t)(p) + offsetof(__typeof__(*(p)), m)))\n")
+        .put("static inline int8_t kur_dec_i8(uint64_t b) { b &= 0xFF; return b < 0x80 ? (int8_t)b : (int8_t)((int64_t)b - 0x100); }\n")
+        .put("static inline int16_t kur_dec_i16(uint64_t b) { b &= 0xFFFF; return b < 0x8000 ? (int16_t)b : (int16_t)((int64_t)b - 0x10000); }\n")
+        .put("static inline int32_t kur_dec_i32(uint64_t b) { b &= 0xFFFFFFFF; return b < 0x80000000 ? (int32_t)b : (int32_t)((int64_t)b - 0x100000000); }\n")
+        .put("static inline int64_t kur_dec_i64(uint64_t b) { return b <= (uint64_t)INT64_MAX ? (int64_t)b : -INT64_C(1) - (int64_t)(UINT64_MAX - b); }\n")
+        .put("/* usize and isize are pointer-sized: uintptr_t and intptr_t, of KUR_PTR_BITS bits. */\n")
+        .put("#define KUR_PTR_BITS (8 * sizeof(uintptr_t))\n")
+        .put("static inline intptr_t kur_dec_isize(uintptr_t b) { return b <= (uintptr_t)INTPTR_MAX ? (intptr_t)b : -(intptr_t)1 - (intptr_t)(UINTPTR_MAX - b); }\n")
 }
 
 // The header every file of a split build includes: the program's types, externs, data declarations
@@ -93,7 +94,7 @@ const PIECE: usize = 524288usize;
 
 // The start of a split build's C file other than its header.
 fn included() -> Buffer! {
-    Buffer!::new().push_static("#include \"").push_static(HEADER).push_static("\"\n\n")
+    Buffer!::new().put("#include \"").put(HEADER).put("\"\n\n")
 }
 
 // The C of a program: one file, or the files of a split build, each its name and text (`emit_c`).
@@ -137,10 +138,10 @@ fn module_file(&cx: Domain!['k], name: Span['k]) -> Span['k] {
         }
         if plain && !segment.is_empty() {
             if taken > 0usize {
-                out = out.push_static(".");
+                out = out.put(".");
             }
             let bare = if segment.ends_with(&cx, Span::from_static(&cx, "!")) { segment.take(segment.len() - 1usize) } else { segment };
-            out = out.push_bytes(&cx, bare);
+            out = out.write(&cx, bare);
             taken = taken + 1usize;
         } else {
             plain = false;
@@ -159,7 +160,7 @@ fn text_lines(&cx: Domain!['k], c: Buffer!, items: ArenaVec[Span['k], 'k]) -> Bu
     var c = c;
     var i = 0usize;
     while i < items.len(&cx) {
-        c = c.push_bytes(&cx, items.at(&cx, i)).push_static("\n");
+        c = c.write(&cx, items.at(&cx, i)).put("\n");
         i = i + 1usize;
     }
     c
@@ -178,15 +179,15 @@ fn c_prim(&cx: Domain!['k], name: Span['k]) -> Span['k] {
     } else if name.is(&cx, "isize") {
         Span::from_static(&cx, "intptr_t")
     } else if name.byte_or_zero(&cx, 0usize) == b'u' {
-        Buffer!::new().push_static("uint").push_bytes(&cx, name.skip(1usize)).push_static("_t").save(&cx)
+        f"uint{name.skip(1usize)}_t".write(&cx, Buffer!::new()).save(&cx)
     } else {
-        Buffer!::new().push_static("int").push_bytes(&cx, name.skip(1usize)).push_static("_t").save(&cx)
+        f"int{name.skip(1usize)}_t".write(&cx, Buffer!::new()).save(&cx)
     }
 }
 
 // One line of a function's body, indented, appended to `lines`; `l` is freed.
 fn line(&lines: Buffer!, l: Buffer!) {
-    lines = lines.push_static("  ").push_buffer(l).push_static("\n");
+    lines = lines.put("  ").put(l).put("\n");
 }
 
 // The suffix of a signed integer type's `kur_dec_i` decoder (`8` to `64`, or `size`), or none for
@@ -198,11 +199,11 @@ fn signed_suffix(&cx: Domain!['k], name: Span['k]) -> Option[Span['k]] {
 
 forall 'k.
 fn c_order(&cx: Domain!['k], order: Span['k]) -> Span['k] {
-    var out = Buffer!::new().push_static("__ATOMIC_");
+    var out = Buffer!::new().put("__ATOMIC_");
     var i = 0usize;
     while i < order.len() {
         let b = order.byte_or_zero(&cx, i);
-        out = out.push_byte(if b >= b'a' && b <= b'z' { b - 32u8 } else { b });
+        out = out.write_byte(if b >= b'a' && b <= b'z' { b - 32u8 } else { b });
         i = i + 1usize;
     }
     out.save(&cx)
@@ -281,10 +282,10 @@ fn runtime_names(&cx: Domain!['k]) -> ArenaSet[Span['k], 'k] {
         var u = 0usize;
         while u < 2usize {
             let unsigned = if u == 1usize { Span::from_static(&cx, "U") } else { Span::from_static(&cx, "") };
-            out.insert(&cx, Buffer!::new().push_bytes(&cx, lower(&cx, unsigned)).push_static("int").push_bytes(&cx, lower(&cx, stem)).push_static("_t").save(&cx));
+            out.insert(&cx, Buffer!::new().write(&cx, lower(&cx, unsigned)).put("int").write(&cx, lower(&cx, stem)).put("_t").save(&cx));
             var s = 0usize;
             while s < suffixes.len(&cx) {
-                out.insert(&cx, Buffer!::new().push_bytes(&cx, unsigned).push_static("INT").push_bytes(&cx, stem).push_static("_").push_bytes(&cx, suffixes.at(&cx, s)).save(&cx));
+                out.insert(&cx, Buffer!::new().write(&cx, unsigned).put("INT").write(&cx, stem).put("_").write(&cx, suffixes.at(&cx, s)).save(&cx));
                 s = s + 1usize;
             }
             u = u + 1usize;
@@ -300,7 +301,7 @@ fn lower(&cx: Domain!['k], t: Span['k]) -> Span['k] {
     var i = 0usize;
     while i < t.len() {
         let b = t.byte_or_zero(&cx, i);
-        out = out.push_byte(to_lower(b));
+        out = out.write_byte(to_lower(b));
         i = i + 1usize;
     }
     out.save(&cx)
@@ -329,14 +330,14 @@ impl Pool['k] {
 // Allocate a C identifier; the readable spelling is only a hint.
 forall 'k.
 fn allocate(&cx: Domain!['k], base: Span['k], pool: Pool['k]) -> Span['k] {
-    let start = if is_digit(base.byte_or_zero(&cx, 0usize)) { Buffer!::new().push_static("k_").push_bytes(&cx, base).save(&cx) } else { base };
+    let start = if is_digit(base.byte_or_zero(&cx, 0usize)) { Buffer!::new().put("k_").write(&cx, base).save(&cx) } else { base };
     var name = start;
     if pool.taken.contains(&cx, name) {
         var index = pool.last.get_or(&cx, start, 0usize);
         var going = true;
         while going {
             index = index + 1usize;
-            name = Buffer!::new().push_bytes(&cx, start).push_static("_").push_usize(index).save(&cx);
+            name = f"{start}_{index}".write(&cx, Buffer!::new()).save(&cx);
             going = pool.taken.contains(&cx, name);
         }
         pool.last.insert(&cx, start, index);
@@ -353,9 +354,9 @@ fn readable(&cx: Domain!['k], name: Span['k]) -> Span['k] {
     var i = 0usize;
     while i < pieces.len(&cx) {
         if i > 0usize {
-            joined = joined.push_static("_");
+            joined = joined.put("_");
         }
-        joined = joined.push_bytes(&cx, match decode_segment(&cx, pieces.at(&cx, i)) {
+        joined = joined.write(&cx, match decode_segment(&cx, pieces.at(&cx, i)) {
             Some(bytes) => bytes,
             None => pieces.at(&cx, i),
         });
@@ -369,9 +370,9 @@ fn readable(&cx: Domain!['k], name: Span['k]) -> Span['k] {
     while j < all.len() {
         let b = all.byte_or_zero(&cx, j);
         if is_word_byte(b) {
-            out = out.push_byte(b);
+            out = out.write_byte(b);
         } else if (b & 192u8) != 128u8 {
-            out = out.push_static("_");
+            out = out.put("_");
         }
         j = j + 1usize;
     }
@@ -488,7 +489,7 @@ fn items_of(&cx: Domain!['k], count: usize, elem: Type['k]) -> ArenaVec[(Span['k
     let out: ArenaVec[(Span['k], Type['k]), 'k] = ArenaVec::new(&cx);
     var k = 0usize;
     while k < count {
-        out.push(&cx, (Buffer!::new().push_static("items[").push_usize(k).push_static("]").save(&cx), elem));
+        out.push(&cx, (f"items[{k}]".write(&cx, Buffer!::new()).save(&cx), elem));
         k = k + 1usize;
     }
     out
@@ -499,7 +500,7 @@ fn items_access(&cx: Domain!['k], count: usize) -> ArenaVec[Span['k], 'k] {
     let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
     var k = 0usize;
     while k < count {
-        out.push(&cx, Buffer!::new().push_static("items[").push_usize(k).push_static("]").save(&cx));
+        out.push(&cx, f"items[{k}]".write(&cx, Buffer!::new()).save(&cx));
         k = k + 1usize;
     }
     out
@@ -796,7 +797,7 @@ impl Backend['k] {
     }
 
     fn fresh_name(self, &cx: Domain!['k], hint: Span['k]) -> Span['k] {
-        allocate(&cx, Buffer!::new().push_static("K_").push_bytes(&cx, tail(self.readable(&cx, hint), 48usize)).save(&cx), self.taken)
+        allocate(&cx, Buffer!::new().put("K_").write(&cx, tail(self.readable(&cx, hint), 48usize)).save(&cx), self.taken)
     }
 
     // The C type of `ty`; through a pointer, an aggregate needs only its name.
@@ -823,11 +824,11 @@ impl Backend['k] {
             },
             Ptr(inner) => {
                 let inner = erase(&cx, inner.copy(&cx), self.types);
-                return Buffer!::new().push_bytes(&cx, self.ctype(&cx, inner, false)).push_static("*").save(&cx);
+                return Buffer!::new().write(&cx, self.ctype(&cx, inner, false)).put("*").save(&cx);
             },
             NonNull(inner) => {
                 let inner = erase(&cx, inner.copy(&cx), self.types);
-                return Buffer!::new().push_bytes(&cx, self.ctype(&cx, inner, false)).push_static("*").save(&cx);
+                return Buffer!::new().write(&cx, self.ctype(&cx, inner, false)).put("*").save(&cx);
             },
             _ => (),
         };
@@ -879,11 +880,11 @@ impl Backend['k] {
                 while k < f.params.len(&cx) {
                     let ct = self.ctype(&cx, f.params.at(&cx, k), false);
                     if !ct.is(&cx, "void") {
-                        params.push(&cx, if f.places.contains(&cx, k) { Buffer!::new().push_bytes(&cx, ct).push_static("*").save(&cx) } else { ct });
+                        params.push(&cx, if f.places.contains(&cx, k) { Buffer!::new().write(&cx, ct).put("*").save(&cx) } else { ct });
                     }
                     k = k + 1usize;
                 }
-                self.defs.push(&cx, Buffer!::new().push_static("typedef ").push_bytes(&cx, result).push_static(" (*").push_bytes(&cx, name).push_static(")(").push_bytes(&cx, or_void(&cx, params.join(&cx, ", "))).push_static(");").save(&cx));
+                self.defs.push(&cx, Buffer!::new().put("typedef ").write(&cx, result).put(" (*").write(&cx, name).put(")(").write(&cx, or_void(&cx, params.join(&cx, ", "))).put(");").save(&cx));
             },
             _ => {
                 let name = self.c(&cx, s);
@@ -899,7 +900,7 @@ impl Backend['k] {
         };
         let name = self.fresh_name(&cx, hint);
         self.names.insert(&cx, ty, name);
-        self.forward.push(&cx, Buffer!::new().push_static("typedef struct ").push_bytes(&cx, name).push_static(" ").push_bytes(&cx, name).push_static(";").save(&cx));
+        self.forward.push(&cx, f"typedef struct {name} {name};".write(&cx, Buffer!::new()).save(&cx));
         self.pending.insert(&cx, ty, s);
     }
 
@@ -907,7 +908,7 @@ impl Backend['k] {
         let s = self.pending.at(&cx, ty);
         self.pending.remove(&cx, ty);
         let body = match s {
-            Array(elem, length) => Buffer!::new().push_bytes(&cx, self.c(&cx, elem.copy(&cx))).push_static(" items[").push_u64(length).push_static("];").save(&cx),
+            Array(elem, length) => Buffer!::new().write(&cx, self.c(&cx, elem.copy(&cx))).put(" items[").put(length).put("];").save(&cx),
             Enum(variants) => {
                 let members: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
                 var i = 0usize;
@@ -915,14 +916,14 @@ impl Backend['k] {
                     let t = variants.at(&cx, i).ty;
                     if !self.erased(&cx, t) {
                         let ct = self.c(&cx, t);
-                        members.push(&cx, Buffer!::new().push_bytes(&cx, ct).push_static(" ").push_bytes(&cx, self.variant(&cx, variants.at(&cx, i).name)).push_static(";").save(&cx));
+                        members.push(&cx, Buffer!::new().write(&cx, ct).put(" ").write(&cx, self.variant(&cx, variants.at(&cx, i).name)).put(";").save(&cx));
                     }
                     i = i + 1usize;
                 }
                 if members.is_empty(&cx) {
                     Span::from_static(&cx, "uint32_t tag;")
                 } else {
-                    Buffer!::new().push_static("uint32_t tag; union { ").push_bytes(&cx, members.join(&cx, " ")).push_static(" } payload;").save(&cx)
+                    Buffer!::new().put("uint32_t tag; union { ").write(&cx, members.join(&cx, " ")).put(" } payload;").save(&cx)
                 }
             },
             _ => {
@@ -932,14 +933,14 @@ impl Backend['k] {
                 while i < rows.len(&cx) {
                     let (m, f) = rows.at(&cx, i);
                     if !self.erased(&cx, f) {
-                        parts.push(&cx, Buffer!::new().push_bytes(&cx, self.c(&cx, f)).push_static(" ").push_bytes(&cx, m).push_static(";").save(&cx));
+                        parts.push(&cx, Buffer!::new().write(&cx, self.c(&cx, f)).put(" ").write(&cx, m).put(";").save(&cx));
                     }
                     i = i + 1usize;
                 }
                 parts.join(&cx, " ")
             },
         };
-        self.defs.push(&cx, Buffer!::new().push_static("struct ").push_bytes(&cx, self.names.at(&cx, ty)).push_static(" { ").push_bytes(&cx, body).push_static(" };").save(&cx));
+        self.defs.push(&cx, Buffer!::new().put("struct ").write(&cx, self.names.at(&cx, ty)).put(" { ").write(&cx, body).put(" };").save(&cx));
     }
 
     // (C member, component type) of a struct or tuple shape, in order.
@@ -949,7 +950,7 @@ impl Backend['k] {
             Tuple(elems) => {
                 var i = 0usize;
                 while i < elems.len(&cx) {
-                    out.push(&cx, (Buffer!::new().push_static("e").push_usize(i).save(&cx), elems.at(&cx, i)));
+                    out.push(&cx, (Buffer!::new().put("e").put(i).save(&cx), elems.at(&cx, i)));
                     i = i + 1usize;
                 }
             },
@@ -982,7 +983,7 @@ impl Backend['k] {
                 let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
                 var e = 0usize;
                 while e < elems.len(&cx) {
-                    out.push(&cx, Buffer!::new().push_usize(e).save(&cx));
+                    out.push(&cx, Buffer!::new().put(e).save(&cx));
                     e = e + 1usize;
                 }
                 out
@@ -1003,7 +1004,7 @@ impl Backend['k] {
     fn component(self, &cx: Domain!['k], name: Span['k], prefix: Span['k]) -> Span['k] {
         let key = (prefix, name);
         if !self.component_names.contains(&cx, key) {
-            self.component_names.insert(&cx, key, allocate(&cx, Buffer!::new().push_bytes(&cx, prefix).push_static("_").push_bytes(&cx, self.readable(&cx, name)).save(&cx), self.component_taken));
+            self.component_names.insert(&cx, key, allocate(&cx, Buffer!::new().write(&cx, prefix).put("_").write(&cx, self.readable(&cx, name)).save(&cx), self.component_taken));
         }
         self.component_names.at(&cx, key)
     }
@@ -1043,7 +1044,7 @@ impl Backend['k] {
                 },
                 _ => {
                     let (member, t) = self.member_of(&cx, s, path.at(&cx, i));
-                    access = Buffer!::new().push_bytes(&cx, access).push_static(".").push_bytes(&cx, member).save(&cx);
+                    access = f"{access}.{member}".write(&cx, Buffer!::new()).save(&cx);
                     payload = t;
                 },
             };
@@ -1057,10 +1058,10 @@ impl Backend['k] {
         match self.niche_layout(&cx, ty) {
             Some(layout) => {
                 let (k, access) = layout;
-                Buffer!::new().push_static("(").push_bytes(&cx, source).push_bytes(&cx, access).push_static(" == 0 ? ").push_usize(1usize - k)
-                    .push_static(" : ").push_usize(k).push_static(")").save(&cx)
+                Buffer!::new().put("(").write(&cx, source).write(&cx, access).put(" == 0 ? ").put(1usize - k)
+                    .put(" : ").put(k).put(")").save(&cx)
             },
-            None => Buffer!::new().push_bytes(&cx, source).push_static(".tag").save(&cx),
+            None => Buffer!::new().write(&cx, source).put(".tag").save(&cx),
         }
     }
 
@@ -1068,7 +1069,7 @@ impl Backend['k] {
     fn payload(self, &cx: Domain!['k], source: Span['k], ty: Type['k], variant: Span['k]) -> Span['k] {
         match self.niche_layout(&cx, ty) {
             Some(_layout) => source,
-            None => Buffer!::new().push_bytes(&cx, source).push_static(".payload.").push_bytes(&cx, self.variant(&cx, variant)).save(&cx),
+            None => Buffer!::new().write(&cx, source).put(".payload.").write(&cx, self.variant(&cx, variant)).save(&cx),
         }
     }
 
@@ -1089,21 +1090,21 @@ impl Backend['k] {
             Some(layout) => {
                 let (k, access) = layout;
                 if index == k {
-                    ArenaVec::one(&cx, Buffer!::new().push_bytes(&cx, dst).push_static(" = ").push_bytes(&cx, value_text).push_static(";").save(&cx))
+                    ArenaVec::one(&cx, f"{dst} = {value_text};".write(&cx, Buffer!::new()).save(&cx))
                 } else {
-                    ArenaVec::one(&cx, Buffer!::new().push_bytes(&cx, dst).push_bytes(&cx, access).push_static(" = 0;").save(&cx))
+                    ArenaVec::one(&cx, f"{dst}{access} = 0;".write(&cx, Buffer!::new()).save(&cx))
                 }
             },
             None => {
                 let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
                 let unit = match value {
                     Some(v) => {
-                        out.push(&cx, Buffer!::new().push_bytes(&cx, dst).push_static(".payload.").push_bytes(&cx, self.variant(&cx, variant)).push_static(" = ")
-                            .push_bytes(&cx, v).push_static(";").save(&cx));
+                        out.push(&cx, Buffer!::new().write(&cx, dst).put(".payload.").write(&cx, self.variant(&cx, variant)).put(" = ")
+                            .write(&cx, v).put(";").save(&cx));
                     },
                     None => (),
                 };
-                out.push(&cx, Buffer!::new().push_bytes(&cx, dst).push_static(".tag = ").push_usize(index).push_static(";").save(&cx));
+                out.push(&cx, f"{dst}.tag = {index};".write(&cx, Buffer!::new()).save(&cx));
                 out
             },
         }
@@ -1178,7 +1179,7 @@ impl Backend['k] {
             p = p + 1usize;
         }
         if !agree {
-            fail_text(&cx, Buffer!::new().push_static("specialization arguments disagree for ").push_bytes(&cx, fun.name).save(&cx));
+            fail_text(&cx, Buffer!::new().put("specialization arguments disagree for ").write(&cx, fun.name).save(&cx));
         }
         // One specialization for type arguments that differ only in brands, made for the first
         // request's. Otherwise logical alpha-equivalence, not representation equality.
@@ -1395,7 +1396,7 @@ impl Backend['k] {
         match self.thunks.get(&cx, symbol) {
             Some(thunk) => thunk,
             None => {
-                let thunk = allocate(&cx, Buffer!::new().push_bytes(&cx, symbol).push_static("_value").save(&cx), self.taken);
+                let thunk = allocate(&cx, Buffer!::new().write(&cx, symbol).put("_value").save(&cx), self.taken);
                 self.thunks.insert(&cx, symbol, thunk);
                 thunk
             },
@@ -1413,8 +1414,8 @@ impl Backend['k] {
         while k < cparams.len(&cx) {
             let cp = cparams.at(&cx, k);
             if !cp.ctype.is(&cx, "void") {
-                params.push(&cx, Buffer!::new().push_bytes(&cx, cp.ctype).push_static(if cp.place { "*" } else { "" }).push_static(" ").push_bytes(&cx, cp.cname).save(&cx));
-                args.push(&cx, Buffer!::new().push_static(if refs.at(&cx, k) { "&" } else { "" }).push_bytes(&cx, cp.cname).save(&cx));
+                params.push(&cx, Buffer!::new().write(&cx, cp.ctype).put(if cp.place { "*" } else { "" }).put(" ").write(&cx, cp.cname).save(&cx));
+                args.push(&cx, Buffer!::new().put(if refs.at(&cx, k) { "&" } else { "" }).write(&cx, cp.cname).save(&cx));
             }
             k = k + 1usize;
         }
@@ -1422,14 +1423,14 @@ impl Backend['k] {
         if !outs.is_empty(&cx) {
             return self.whole_thunk(&cx, symbol, thunk, ret, params, args, outs);
         }
-        let call = Buffer!::new().push_bytes(&cx, symbol).push_static("(").push_bytes(&cx, args.join(&cx, ", ")).push_static(");").save(&cx);
+        let call = Buffer!::new().write(&cx, symbol).put("(").write(&cx, args.join(&cx, ", ")).put(");").save(&cx);
         let body = if ret.is(&cx, "void") {
-            Buffer!::new().push_static(" {\n  ").push_bytes(&cx, call).push_static("\n}\n").save(&cx)
+            f" {{\n  {call}\n}}\n".write(&cx, Buffer!::new()).save(&cx)
         } else {
-            Buffer!::new().push_static(" {\n  return ").push_bytes(&cx, call).push_static("\n}\n").save(&cx)
+            f" {{\n  return {call}\n}}\n".write(&cx, Buffer!::new()).save(&cx)
         };
-        let head = Buffer!::new().push_static(if noreturn { "_Noreturn " } else { "" }).push_bytes(&cx, self.linkage).push_bytes(&cx, ret).push_static(" ").push_bytes(&cx, thunk)
-            .push_static("(").push_bytes(&cx, or_void(&cx, params.join(&cx, ", "))).push_static(")").save(&cx);
+        let head = Buffer!::new().put(if noreturn { "_Noreturn " } else { "" }).write(&cx, self.linkage).write(&cx, ret).put(" ").write(&cx, thunk)
+            .put("(").write(&cx, or_void(&cx, params.join(&cx, ", "))).put(")").save(&cx);
         (head, body)
     }
 
@@ -1440,15 +1441,15 @@ impl Backend['k] {
         let whole = self.results.at(&cx, symbol);
         let ks = self.outs.at(&cx, symbol);
         let members = self.members(&cx, self.shape(&cx, whole));
-        var body = Buffer!::new().push_static(" {\n");
+        var body = Buffer!::new().put(" {\n");
         var o = 0usize;
         while o < outs.len(&cx) {
             let (ctype, cname) = outs.at(&cx, o);
-            body = body.push_static("  ").push_bytes(&cx, ctype).push_static(" ").push_bytes(&cx, cname).push_static(";\n");
-            args.push(&cx, Buffer!::new().push_static("&").push_bytes(&cx, cname).save(&cx));
+            body = body.put("  ").write(&cx, ctype).put(" ").write(&cx, cname).put(";\n");
+            args.push(&cx, Buffer!::new().put("&").write(&cx, cname).save(&cx));
             o = o + 1usize;
         }
-        let call = Buffer!::new().push_bytes(&cx, symbol).push_static("(").push_bytes(&cx, args.join(&cx, ", ")).push_static(")").save(&cx);
+        let call = Buffer!::new().write(&cx, symbol).put("(").write(&cx, args.join(&cx, ", ")).put(")").save(&cx);
         let rest = self.members(&cx, self.shape(&cx, self.reduced(&cx, whole, ks)));
         var r = 0usize;
         let parts: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
@@ -1463,23 +1464,23 @@ impl Backend['k] {
                 None => {
                     let (m, _t) = rest.at(&cx, r);
                     r = r + 1usize;
-                    Buffer!::new().push_static("reduced.").push_bytes(&cx, m).save(&cx)
+                    Buffer!::new().put("reduced.").write(&cx, m).save(&cx)
                 },
             };
             if !self.erased(&cx, t) {
-                parts.push(&cx, Buffer!::new().push_static(".").push_bytes(&cx, member).push_static(" = ").push_bytes(&cx, source).save(&cx));
+                parts.push(&cx, f".{member} = {source}".write(&cx, Buffer!::new()).save(&cx));
             }
             k = k + 1usize;
         }
         body = if ret.is(&cx, "void") {
-            body.push_static("  ").push_bytes(&cx, call).push_static(";\n")
+            body.put("  ").write(&cx, call).put(";\n")
         } else {
-            body.push_static("  ").push_bytes(&cx, ret).push_static(" reduced = ").push_bytes(&cx, call).push_static(";\n")
+            body.put("  ").write(&cx, ret).put(" reduced = ").write(&cx, call).put(";\n")
         };
         let ct = self.c(&cx, whole);
-        body = body.push_static("  return (").push_bytes(&cx, ct).push_static("){ ").push_bytes(&cx, parts.join(&cx, ", ")).push_static(" };\n}\n");
-        let head = Buffer!::new().push_bytes(&cx, self.linkage).push_bytes(&cx, self.c(&cx, whole)).push_static(" ").push_bytes(&cx, thunk)
-            .push_static("(").push_bytes(&cx, or_void(&cx, params.join(&cx, ", "))).push_static(")").save(&cx);
+        body = body.put("  return (").write(&cx, ct).put("){ ").write(&cx, parts.join(&cx, ", ")).put(" };\n}\n");
+        let head = Buffer!::new().write(&cx, self.linkage).write(&cx, self.c(&cx, whole)).put(" ").write(&cx, thunk)
+            .put("(").write(&cx, or_void(&cx, params.join(&cx, ", "))).put(")").save(&cx);
         (head, body.save(&cx))
     }
 
@@ -1539,7 +1540,7 @@ impl Backend['k] {
         // coherent head; the callee's module need not own that shape.
         let (index, inst, sub) = match matching_instance(&cx, self.program, self.counter, trait_name, tys) {
             Some(found) => found,
-            None => fail_text(&cx, Buffer!::new().push_static("no instance of ").push_bytes(&cx, trait_name).push_static(" for these types").save(&cx)),
+            None => fail_text(&cx, f"no instance of {trait_name} for these types".write(&cx, Buffer!::new()).save(&cx)),
         };
         var i = 0usize;
         while i < inst.methods.len(&cx) {
@@ -1548,7 +1549,7 @@ impl Backend['k] {
             }
             i = i + 1usize;
         }
-        fail_text(&cx, Buffer!::new().push_static("internal error: no method ").push_bytes(&cx, method).save(&cx))
+        fail_text(&cx, Buffer!::new().put("internal error: no method ").write(&cx, method).save(&cx))
     }
 
     // ------------------------------------------------------------------- program --
@@ -1564,13 +1565,12 @@ impl Backend['k] {
         while e < all.len(&cx) {
             let ext = all.at(&cx, e);
             if !is_c_identifier(&cx, ext.name) || keywords.contains(&cx, ext.name) {
-                fail_at(&cx, Buffer!::new().push_static("backend: foreign symbol ").push_bytes(&cx, ext.name).push_static(" is not a C identifier").save(&cx), ext.pos);
+                fail_at(&cx, f"backend: foreign symbol {ext.name} is not a C identifier".write(&cx, Buffer!::new()).save(&cx), ext.pos);
             }
             if runtime.contains(&cx, ext.name) || ext.name.starts_with(&cx, Span::from_static(&cx, "__builtin_")) || ext.name.starts_with(&cx, Span::from_static(&cx, "__atomic_"))
                 || (ext.name.is(&cx, "main") || ext.name.is(&cx, REPORT_ERROR)) && entry.is_some()
                 || ext.name.is(&cx, START) && entry.is_some() && hosted {
-                fail_at(&cx, Buffer!::new().push_static("backend: foreign symbol ").push_bytes(&cx, ext.name)
-                    .push_static(" conflicts with the C runtime prelude or entry wrapper").save(&cx), ext.pos);
+                fail_at(&cx, f"backend: foreign symbol {ext.name} conflicts with the C runtime prelude or entry wrapper".write(&cx, Buffer!::new()).save(&cx), ext.pos);
             }
             let result = self.c(&cx, ext.ret);
             let noreturn = if is_never(ext.ret) { Span::from_static(&cx, "_Noreturn ") } else { Span::from_static(&cx, "") };
@@ -1580,7 +1580,7 @@ impl Backend['k] {
                 params.push(&cx, self.c(&cx, ext.ptypes.at(&cx, p)));
                 p = p + 1usize;
             }
-            externs.push(&cx, Buffer!::new().push_bytes(&cx, noreturn).push_bytes(&cx, result).push_static(" ").push_bytes(&cx, ext.name).push_static("(").push_bytes(&cx, or_void(&cx, params.join(&cx, ", "))).push_static(");").save(&cx));
+            externs.push(&cx, Buffer!::new().write(&cx, noreturn).write(&cx, result).put(" ").write(&cx, ext.name).put("(").write(&cx, or_void(&cx, params.join(&cx, ", "))).put(");").save(&cx));
             e = e + 1usize;
         }
         var main: Option[Span['k]] = Option::None;
@@ -1593,9 +1593,7 @@ impl Backend['k] {
                     None => false,
                 };
                 if !ok {
-                    fail_text(&cx, Buffer!::new().push_static("backend: the entry ").push_bytes(&cx, name).push_static(" must be `fn()`, `fn() -> i32` or ")
-                        .push_static("`fn() -> Result[(), std::io::Error]`, each with or without a parameter ")
-                        .push_static("`args: std::process::Args`, and safe, not generic and without premises").save(&cx));
+                    fail_text(&cx, f"backend: the entry {name} must be `fn()`, `fn() -> i32` or `fn() -> Result[(), std::io::Error]`, each with or without a parameter `args: std::process::Args`, and safe, not generic and without premises".write(&cx, Buffer!::new()).save(&cx));
                 }
                 main = Option::Some.(self.request(&cx, FunKey::Function.(name), self.program.funs.at(&cx, name), ArenaMap::new(&cx)));
             },
@@ -1676,16 +1674,16 @@ impl Backend['k] {
         };
         // Types, externs and data, then every head, then every body: one file, or a split build's
         // header and the files that include it.
-        var c = text_lines(&cx, text_lines(&cx, text_lines(&cx, prelude().push_static("\n"), self.forward), self.defs), externs);
+        var c = text_lines(&cx, text_lines(&cx, text_lines(&cx, prelude().put("\n"), self.forward), self.defs), externs);
         let result = if self.linkage.is_empty() {
             c = text_lines(&cx, c, declared);
             var p = 0usize;
             while p < heads.len(&cx) {
-                c = c.push_bytes(&cx, heads.at(&cx, p)).push_static(";\n");
+                c = c.write(&cx, heads.at(&cx, p)).put(";\n");
                 p = p + 1usize;
             }
             let files: ArenaVec[(Span['k], Span['k]), 'k] = ArenaVec::new(&cx);
-            files.push(&cx, (Span::from_static(&cx, HEADER), Buffer!::new().push_static("#pragma once\n").push_buffer(c).save(&cx)));
+            files.push(&cx, (Span::from_static(&cx, HEADER), Buffer!::new().put("#pragma once\n").put(c).save(&cx)));
             files.push(&cx, (Span::from_static(&cx, "kursal-data.c"), text_lines(&cx, included(), datas).save(&cx)));
             // the file of each group of functions, in the order their first function comes
             let order: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
@@ -1715,12 +1713,12 @@ impl Backend['k] {
                 while m < members.len(&cx) {
                     let at = members.at(&cx, m);
                     let (_symbol, _fixed, body, _file) = self.emitted.at(&cx, at);
-                    text = text.push_bytes(&cx, heads.at(&cx, at)).push_bytes(&cx, body).push_static("\n");
+                    text = text.write(&cx, heads.at(&cx, at)).write(&cx, body).put("\n");
                     m = m + 1usize;
                     if &text.len() >= PIECE || m == members.len(&cx) {
-                        let file = Buffer!::new().push_bytes(&cx, name);
-                        let file = if piece > 1usize { file.push_static(".").push_usize(piece) } else { file };
-                        files.push(&cx, (file.push_static(".c").save(&cx), text.save(&cx)));
+                        let file = Buffer!::new().write(&cx, name);
+                        let file = if piece > 1usize { file.put(".").put(piece) } else { file };
+                        files.push(&cx, (file.put(".c").save(&cx), text.save(&cx)));
                         text = included();
                         piece = piece + 1usize;
                     }
@@ -1729,7 +1727,7 @@ impl Backend['k] {
                 g = g + 1usize;
             }
             match wrapper {
-                Some(text) => files.push(&cx, (Span::from_static(&cx, "kursal-main.c"), included().push_bytes(&cx, text).push_static("\n").save(&cx))),
+                Some(text) => files.push(&cx, (Span::from_static(&cx, "kursal-main.c"), included().write(&cx, text).put("\n").save(&cx))),
                 None => (),
             };
             CText!::Split.(files)
@@ -1737,17 +1735,17 @@ impl Backend['k] {
             c = text_lines(&cx, c, datas);
             var p = 0usize;
             while p < heads.len(&cx) {
-                c = c.push_bytes(&cx, heads.at(&cx, p)).push_static(";\n");
+                c = c.write(&cx, heads.at(&cx, p)).put(";\n");
                 p = p + 1usize;
             }
             var b = 0usize;
             while b < self.emitted.len(&cx) {
                 let (_symbol, _fixed, body, _file) = self.emitted.at(&cx, b);
-                c = c.push_bytes(&cx, heads.at(&cx, b)).push_bytes(&cx, body).push_static("\n");
+                c = c.write(&cx, heads.at(&cx, b)).write(&cx, body).put("\n");
                 b = b + 1usize;
             }
             CText!::One.(match wrapper {
-                Some(text) => c.push_bytes(&cx, text).push_static("\n"),
+                Some(text) => c.write(&cx, text).put("\n"),
                 None => c,
             })
         };
@@ -1767,15 +1765,15 @@ impl Backend['k] {
                 _ => fail_text(&cx, Span::from_static(&cx, "internal error: entry arguments that are not a struct")),
             };
             (Span::from_static(&cx, "int main(int argc, char **argv)"),
-                Buffer!::new().push_bytes(&cx, symbol).push_static("((").push_bytes(&cx, self.c(&cx, args)).push_static("){ (")
-                    .push_bytes(&cx, self.c(&cx, fields.at(&cx, 0usize).ty)).push_static(")argv, (")
-                    .push_bytes(&cx, self.c(&cx, fields.at(&cx, 1usize).ty)).push_static(")argc })").save(&cx))
+                Buffer!::new().write(&cx, symbol).put("((").write(&cx, self.c(&cx, args)).put("){ (")
+                    .write(&cx, self.c(&cx, fields.at(&cx, 0usize).ty)).put(")argv, (")
+                    .write(&cx, self.c(&cx, fields.at(&cx, 1usize).ty)).put(")argc })").save(&cx))
         } else {
-            (Span::from_static(&cx, "int main(void)"), Buffer!::new().push_bytes(&cx, symbol).push_static("()").save(&cx))
+            (Span::from_static(&cx, "int main(void)"), Buffer!::new().write(&cx, symbol).put("()").save(&cx))
         };
         let (declare, start) = if hosted {
-            (Buffer!::new().push_static("void ").push_static(START).push_static("(void);\n").save(&cx),
-                Buffer!::new().push_static(START).push_static("(); ").save(&cx))
+            (f"void {START}(void);\n".write(&cx, Buffer!::new()).save(&cx),
+                Buffer!::new().put(START).put("(); ").save(&cx))
         } else {
             (Span::from_static(&cx, ""), Span::from_static(&cx, ""))
         };
@@ -1784,10 +1782,8 @@ impl Backend['k] {
             None => fail_text(&cx, Span::from_static(&cx, "internal error: an entry whose result is no exit status")),
         };
         match kind {
-            Status => Buffer!::new().push_bytes(&cx, declare).push_bytes(&cx, head).push_static(" { ").push_bytes(&cx, start)
-                .push_static("return (int)").push_bytes(&cx, call).push_static("; }").save(&cx),
-            Zero => Buffer!::new().push_bytes(&cx, declare).push_bytes(&cx, head).push_static(" { ").push_bytes(&cx, start)
-                .push_bytes(&cx, call).push_static("; return 0; }").save(&cx),
+            Status => f"{declare}{head} {{ {start}return (int){call}; }}".write(&cx, Buffer!::new()).save(&cx),
+            Zero => f"{declare}{head} {{ {start}{call}; return 0; }}".write(&cx, Buffer!::new()).save(&cx),
             Report => {
                 let error = match self.shape(&cx, fun.ret) {
                     Enum(variants) => self.shape(&cx, variants.at(&cx, 1usize).ty),
@@ -1799,12 +1795,12 @@ impl Backend['k] {
                 };
                 let (member, _type) = self.member_of(&cx, error, label);
                 let status = self.fresh_name(&cx, Span::from_static(&cx, "status"));
-                Buffer!::new().push_bytes(&cx, declare).push_static("void ").push_static(REPORT_ERROR).push_static("(int32_t);\n")
-                    .push_bytes(&cx, head).push_static(" { ").push_bytes(&cx, start).push_bytes(&cx, self.c(&cx, fun.ret)).push_static(" ").push_bytes(&cx, status)
-                    .push_static(" = ").push_bytes(&cx, call).push_static("; if (").push_bytes(&cx, self.tag(&cx, status, fun.ret))
-                    .push_static(" == 0) return 0; ").push_static(REPORT_ERROR).push_static("(")
-                    .push_bytes(&cx, self.payload(&cx, status, fun.ret, Span::from_static(&cx, "Err"))).push_static(".").push_bytes(&cx, member)
-                    .push_static("); return 1; }").save(&cx)
+                Buffer!::new().write(&cx, declare).put("void ").put(REPORT_ERROR).put("(int32_t);\n")
+                    .write(&cx, head).put(" { ").write(&cx, start).write(&cx, self.c(&cx, fun.ret)).put(" ").write(&cx, status)
+                    .put(" = ").write(&cx, call).put("; if (").write(&cx, self.tag(&cx, status, fun.ret))
+                    .put(" == 0) return 0; ").put(REPORT_ERROR).put("(")
+                    .write(&cx, self.payload(&cx, status, fun.ret, Span::from_static(&cx, "Err"))).put(".").write(&cx, member)
+                    .put("); return 1; }").save(&cx)
             },
         }
     }
@@ -1813,7 +1809,7 @@ impl Backend['k] {
 
     fn data_symbol(self, &cx: Domain!['k], name: Span['k]) -> Span['k] {
         if !self.datas.contains(&cx, name) {
-            let symbol = allocate(&cx, Buffer!::new().push_static("d").push_usize(self.datas.len(&cx)).push_static("_").push_bytes(&cx, tail(self.readable(&cx, name), 40usize)).save(&cx), self.taken);
+            let symbol = allocate(&cx, Buffer!::new().put("d").put(self.datas.len(&cx)).put("_").write(&cx, tail(self.readable(&cx, name), 40usize)).save(&cx), self.taken);
             self.datas.insert(&cx, name, (symbol, self.program.datas.at(&cx, name)));
         }
         let (symbol, _data) = self.datas.at(&cx, name);
@@ -1825,12 +1821,12 @@ impl Backend['k] {
     fn emit_data(self, &cx: Domain!['k], entry: (Span['k], Data['k])) -> (Span['k], Span['k]) {
         let (symbol, data) = entry;
         let ct = if self.erased(&cx, data.ty) { Span::from_static(&cx, "char") } else { self.c(&cx, data.ty) };
-        let declared = Buffer!::new().push_static("extern const ").push_bytes(&cx, ct).push_static(" ").push_bytes(&cx, symbol).push_static(";").save(&cx);
-        let defined = Buffer!::new().push_bytes(&cx, self.linkage).push_static("const ").push_bytes(&cx, ct).push_static(" ").push_bytes(&cx, symbol);
+        let declared = f"extern const {ct} {symbol};".write(&cx, Buffer!::new()).save(&cx);
+        let defined = Buffer!::new().write(&cx, self.linkage).put("const ").write(&cx, ct).put(" ").write(&cx, symbol);
         let defined = if self.erased(&cx, data.ty) { defined } else {
-            defined.push_static(" = ").push_bytes(&cx, self.initializer(&cx, data.ty, data.init))
+            defined.put(" = ").write(&cx, self.initializer(&cx, data.ty, data.init))
         };
-        (declared, defined.push_static(";").save(&cx))
+        (declared, defined.put(";").save(&cx))
     }
 
     fn initializer(self, &cx: Domain!['k], ty: Type['k], form: Form['k]) -> Span['k] {
@@ -1847,7 +1843,7 @@ impl Backend['k] {
                     if C::same(&cx, elem.copy(&cx), C::prim(&cx, "u8")) && part.is_str() {
                         var b = 0usize;
                         while b < part.text.len() {
-                            values.push(&cx, Buffer!::new().push_u64(part.text.byte_or_zero(&cx, b) as u64).save(&cx));
+                            values.push(&cx, Buffer!::new().put(part.text.byte_or_zero(&cx, b)).save(&cx));
                             b = b + 1usize;
                         }
                     } else {
@@ -1855,7 +1851,7 @@ impl Backend['k] {
                     }
                     i = i + 1usize;
                 }
-                return Buffer!::new().push_static("{ { ").push_bytes(&cx, values.join(&cx, ", ")).push_static(" } }").save(&cx);
+                return Buffer!::new().put("{ { ").write(&cx, values.join(&cx, ", ")).put(" } }").save(&cx);
             },
             _ => (),
         };
@@ -1869,7 +1865,7 @@ impl Backend['k] {
             }
             i = i + 1usize;
         }
-        Buffer!::new().push_static("{ ").push_bytes(&cx, parts.join(&cx, ", ")).push_static(" }").save(&cx)
+        Buffer!::new().put("{ ").write(&cx, parts.join(&cx, ", ")).put(" }").save(&cx)
     }
 
     fn literal(self, &cx: Domain!['k], ty: Type['k], lit: Span['k]) -> Span['k] {
@@ -1885,9 +1881,9 @@ impl Backend['k] {
             return if name.is(&cx, "f32") { concat(&cx, digits, Span::from_static(&cx, "f")) } else { digits };
         }
         if signed_suffix(&cx, name).is_some() {
-            return if lit.is(&cx, "-9223372036854775808") { Span::from_static(&cx, "(-INT64_C(9223372036854775807) - 1)") } else { Buffer!::new().push_static("INT64_C(").push_bytes(&cx, lit).push_static(")").save(&cx) };
+            return if lit.is(&cx, "-9223372036854775808") { Span::from_static(&cx, "(-INT64_C(9223372036854775807) - 1)") } else { f"INT64_C({lit})".write(&cx, Buffer!::new()).save(&cx) };
         }
-        Buffer!::new().push_static("UINT64_C(").push_bytes(&cx, lit).push_static(")").save(&cx)
+        f"UINT64_C({lit})".write(&cx, Buffer!::new()).save(&cx)
     }
 
     // ----------------------------------------------------------------- functions --
@@ -1974,7 +1970,7 @@ impl Backend['k] {
         var b = 0usize;
         while b < fun.blocks.len(&cx) {
             let label = fun.blocks.at(&cx, b).label;
-            labels.insert(&cx, label, allocate(&cx, Buffer!::new().push_static("L_").push_bytes(&cx, self.readable(&cx, label)).save(&cx), label_taken));
+            labels.insert(&cx, label, allocate(&cx, Buffer!::new().put("L_").write(&cx, self.readable(&cx, label)).save(&cx), label_taken));
             b = b + 1usize;
         }
         let decls: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
@@ -2009,11 +2005,11 @@ impl Backend['k] {
                 let cname = self.cname(&cx, entry.label, binding.name);
                 var passed = cname;
                 if place {
-                    place_c.insert(&cx, binding.name, Buffer!::new().push_static("(*").push_bytes(&cx, cname).push_static(")").save(&cx));
+                    place_c.insert(&cx, binding.name, f"(*{cname})".write(&cx, Buffer!::new()).save(&cx));
                 } else if refs.at(&cx, p) && written.contains(&cx, binding.name) {
-                    passed = allocate(&cx, Buffer!::new().push_bytes(&cx, cname).push_static("_ref").save(&cx), self.taken);
-                    decls.push(&cx, Buffer!::new().push_bytes(&cx, ctype).push_static(" ").push_bytes(&cx, cname).push_static(";").save(&cx));
-                    prologue.push(&cx, Buffer!::new().push_bytes(&cx, cname).push_static(" = *").push_bytes(&cx, passed).push_static(";").save(&cx));
+                    passed = allocate(&cx, Buffer!::new().write(&cx, cname).put("_ref").save(&cx), self.taken);
+                    decls.push(&cx, f"{ctype} {cname};".write(&cx, Buffer!::new()).save(&cx));
+                    prologue.push(&cx, f"{cname} = *{passed};".write(&cx, Buffer!::new()).save(&cx));
                 } else if refs.at(&cx, p) {
                     deref.insert(&cx, binding.name);
                 }
@@ -2034,7 +2030,7 @@ impl Backend['k] {
             var k = 0usize;
             while k < outs.len(&cx) {
                 let ctype = self.c(&cx, elems.at(&cx, outs.at(&cx, k)));
-                pointees.push(&cx, (ctype, allocate(&cx, Buffer!::new().push_static("out_").push_usize(outs.at(&cx, k)).save(&cx), self.taken)));
+                pointees.push(&cx, (ctype, allocate(&cx, Buffer!::new().put("out_").put(outs.at(&cx, k)).save(&cx), self.taken)));
                 k = k + 1usize;
             }
             self.out_params.insert(&cx, symbol, pointees);
@@ -2046,9 +2042,9 @@ impl Backend['k] {
         while l < fun.locals.len(&cx) {
             let binding = fun.locals.at(&cx, l);
             if !plan.forwarded.contains(&cx, binding.name) && !self.erased(&cx, self.substitute_type(&cx, binding.ty)) {
-                let cname = allocate(&cx, Buffer!::new().push_static("p_").push_bytes(&cx, self.readable(&cx, binding.name)).save(&cx), self.taken);
+                let cname = allocate(&cx, Buffer!::new().put("p_").write(&cx, self.readable(&cx, binding.name)).save(&cx), self.taken);
                 place_c.insert(&cx, binding.name, cname);
-                decls.push(&cx, Buffer!::new().push_bytes(&cx, self.c(&cx, self.substitute_type(&cx, binding.ty))).push_static(" ").push_bytes(&cx, cname).push_static(";").save(&cx));
+                decls.push(&cx, Buffer!::new().write(&cx, self.c(&cx, self.substitute_type(&cx, binding.ty))).put(" ").write(&cx, cname).put(";").save(&cx));
             }
             l = l + 1usize;
         }
@@ -2106,14 +2102,14 @@ impl Backend['k] {
         var lines = Buffer!::new();
         var pr = 0usize;
         while pr < prologue.len(&cx) {
-            line(&lines, Buffer!::new().push_bytes(&cx, prologue.at(&cx, pr)));
+            line(&lines, Buffer!::new().write(&cx, prologue.at(&cx, pr)));
             pr = pr + 1usize;
         }
         var e = 0usize;
         while e < plan.emitted.len(&cx) {
             let block = plan.emitted.at(&cx, e);
             self.label.set(&cx, block.label);
-            line(&lines, Buffer!::new().push_bytes(&cx, labels.at(&cx, block.label)).push_static(": ;"));
+            line(&lines, Buffer!::new().write(&cx, labels.at(&cx, block.label)).put(": ;"));
             let tail = plan.tail_call(&cx, block);
             let count = if tail { block.instrs.len(&cx) - 1usize } else { block.instrs.len(&cx) };
             var i = 0usize;
@@ -2137,18 +2133,18 @@ impl Backend['k] {
         while w < values.len(&cx) {
             let (label, name, ty, cname) = values.at(&cx, w);
             if plan.variables.contains(&cx, (label, name)) {
-                decls.push(&cx, Buffer!::new().push_bytes(&cx, self.c(&cx, self.substitute_type(&cx, ty))).push_static(" ").push_bytes(&cx, cname).push_static(";").save(&cx));
+                decls.push(&cx, Buffer!::new().write(&cx, self.c(&cx, self.substitute_type(&cx, ty))).put(" ").write(&cx, cname).put(";").save(&cx));
             }
             w = w + 1usize;
         }
         decls.append(&cx, temps);
-        var body = Buffer!::new().push_static(" {\n");
+        var body = Buffer!::new().put(" {\n");
         var d = 0usize;
         while d < decls.len(&cx) {
-            body = body.push_static("  ").push_bytes(&cx, decls.at(&cx, d)).push_static("\n");
+            body = body.put("  ").write(&cx, decls.at(&cx, d)).put("\n");
             d = d + 1usize;
         }
-        self.emitted.push(&cx, (Option::Some.(symbol), Span::from_static(&cx, ""), body.push_buffer(lines).push_static("}\n").save(&cx), module_file(&cx, fun.name)));
+        self.emitted.push(&cx, (Option::Some.(symbol), Span::from_static(&cx, ""), body.put(lines).put("}\n").save(&cx), module_file(&cx, fun.name)));
     }
 
     // The local places that share the storage of a place path; `Backend.homes` in cgen.py states the
@@ -2482,7 +2478,7 @@ impl Backend['k] {
             Tuple(elems) => {
                 var e = 0usize;
                 while e < elems.len(&cx) {
-                    out.push(&cx, Buffer!::new().push_usize(e).save(&cx));
+                    out.push(&cx, Buffer!::new().put(e).save(&cx));
                     e = e + 1usize;
                 }
                 Option::Some.(out)
@@ -2587,19 +2583,19 @@ impl Backend['k] {
         while k < cparams.len(&cx) {
             let cp = cparams.at(&cx, k);
             if !cp.ctype.is(&cx, "void") {
-                var t = Buffer!::new().push_bytes(&cx, cp.ctype);
+                var t = Buffer!::new().write(&cx, cp.ctype);
                 if cp.place {
                     if const_params.contains(&cx, (symbol, k)) {
-                        t = t.push_static(" const");
+                        t = t.put(" const");
                     }
-                    t = t.push_static("*");
+                    t = t.put("*");
                     if restrict_params.contains(&cx, (symbol, k)) {
-                        t = t.push_static(" restrict");
+                        t = t.put(" restrict");
                     }
                 } else if self.by_ref.at(&cx, symbol).at(&cx, k) {
-                    t = t.push_static(" const*");
+                    t = t.put(" const*");
                 }
-                params.push(&cx, t.push_static(" ").push_bytes(&cx, cp.cname).save(&cx));
+                params.push(&cx, t.put(" ").write(&cx, cp.cname).save(&cx));
             }
             k = k + 1usize;
         }
@@ -2607,11 +2603,11 @@ impl Backend['k] {
         var o = 0usize;
         while o < outs.len(&cx) {
             let (ctype, cname) = outs.at(&cx, o);
-            params.push(&cx, Buffer!::new().push_bytes(&cx, ctype).push_static("* ").push_bytes(&cx, cname).save(&cx));
+            params.push(&cx, f"{ctype}* {cname}".write(&cx, Buffer!::new()).save(&cx));
             o = o + 1usize;
         }
-        Buffer!::new().push_static(if noreturn { "_Noreturn " } else { "" }).push_bytes(&cx, self.linkage).push_bytes(&cx, ret).push_static(" ").push_bytes(&cx, symbol)
-            .push_static("(").push_bytes(&cx, or_void(&cx, params.join(&cx, ", "))).push_static(")").save(&cx)
+        Buffer!::new().put(if noreturn { "_Noreturn " } else { "" }).write(&cx, self.linkage).write(&cx, ret).put(" ").write(&cx, symbol)
+            .put("(").write(&cx, or_void(&cx, params.join(&cx, ", "))).put(")").save(&cx)
     }
 
     fn the_plan(self, &cx: Domain!['k]) -> Plan['k] {
@@ -2645,8 +2641,8 @@ impl Backend['k] {
                         Some(fun) => fun.name,
                         None => Span::from_static(&cx, ""),
                     };
-                    fail_text(&cx, Buffer!::new().push_static("backend: ").push_bytes(&cx, show(&cx, part))
-                        .push_static(" is too large: its size is not below 2^64 bytes, in a specialization of ").push_bytes(&cx, owner).save(&cx));
+                    fail_text(&cx, Buffer!::new().put("backend: ").write(&cx, show(&cx, part))
+                        .put(" is too large: its size is not below 2^64 bytes, in a specialization of ").write(&cx, owner).save(&cx));
                 }
                 i = i + 1usize;
             }
@@ -2660,7 +2656,7 @@ impl Backend['k] {
         match locals.get(&cx, key) {
             Some(known) => known,
             None => {
-                let made = allocate(&cx, Buffer!::new().push_bytes(&cx, self.readable(&cx, label)).push_static("_").push_bytes(&cx, self.readable(&cx, name)).save(&cx), self.taken);
+                let made = allocate(&cx, Buffer!::new().write(&cx, self.readable(&cx, label)).put("_").write(&cx, self.readable(&cx, name)).save(&cx), self.taken);
                 locals.insert(&cx, key, made);
                 made
             },
@@ -2673,7 +2669,7 @@ impl Backend['k] {
         let plan = self.the_plan(&cx);
         let key = (self.label.copy(&cx), name);
         if !plan.resident.contains(&cx, key) && self.deref.copy(&cx).contains(&cx, name) && self.label.copy(&cx).eq(&cx, self.fun_entry_label(&cx)) {
-            return Buffer!::new().push_static("(*").push_bytes(&cx, self.cname(&cx, self.label.copy(&cx), name)).push_static(")").save(&cx);
+            return Buffer!::new().put("(*").write(&cx, self.cname(&cx, self.label.copy(&cx), name)).put(")").save(&cx);
         }
         if !plan.moved.contains(&cx, key) {
             return match self.aliases.copy(&cx).get(&cx, key) {
@@ -2818,7 +2814,7 @@ impl Backend['k] {
                             let out: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
                             var e = 0usize;
                             while e < elems.len(&cx) {
-                                out.push(&cx, Buffer!::new().push_usize(e).save(&cx));
+                                out.push(&cx, Buffer!::new().put(e).save(&cx));
                                 e = e + 1usize;
                             }
                             out
@@ -2832,7 +2828,7 @@ impl Backend['k] {
                         k = k - 1usize;
                         if names.at(&cx, k).eq(&cx, seg) {
                             let (m, t) = rows.at(&cx, k);
-                            expr = Buffer!::new().push_bytes(&cx, expr).push_static(".").push_bytes(&cx, m).save(&cx);
+                            expr = f"{expr}.{m}".write(&cx, Buffer!::new()).save(&cx);
                             ty = t;
                             found = true;
                         }
@@ -2862,7 +2858,7 @@ impl Backend['k] {
         }
         if arg.starts_with(&cx, Span::from_static(&cx, "&")) {
             let (expr, _ty) = self.place(&cx, arg);
-            return Buffer!::new().push_static("&").push_bytes(&cx, expr).save(&cx);
+            return Buffer!::new().put("&").write(&cx, expr).save(&cx);
         }
         self.value_name(&cx, arg)
     }
@@ -2928,7 +2924,7 @@ impl Backend['k] {
                 Some(l) => l,
                 None => Span::from_static(&cx, ""),
             };
-            line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, self.literal(&cx, self.type_operand_raw(&cx, instr), lit)).push_static(";"));
+            line(&lines, Buffer!::new().write(&cx, d).put(" = ").write(&cx, self.literal(&cx, self.type_operand_raw(&cx, instr), lit)).put(";"));
         } else if op.is(&cx, "copy") {
             let unit = self.aliases.copy(&cx).insert(&cx, (self.label.copy(&cx), instr.lhs.at(&cx, 0usize)), self.value_name(&cx, a.at(&cx, 0usize)));
         } else if op.is(&cx, "load") && plan.forwarded.contains(&cx, a.at(&cx, 0usize)) {
@@ -2955,7 +2951,7 @@ impl Backend['k] {
             let statements = self.set_variant(&cx, d, ty, lit, value);
             var s = 0usize;
             while s < statements.len(&cx) {
-                line(&lines, Buffer!::new().push_bytes(&cx, statements.at(&cx, s)));
+                line(&lines, Buffer!::new().write(&cx, statements.at(&cx, s)));
                 s = s + 1usize;
             }
         } else if op.is(&cx, "variant_tag") {
@@ -2965,16 +2961,16 @@ impl Backend['k] {
             } else {
                 self.value_name(&cx, a.at(&cx, 0usize))
             };
-            line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, self.tag(&cx, source, self.type_operand(&cx, instr))).push_static(";"));
+            line(&lines, Buffer!::new().write(&cx, d).put(" = ").write(&cx, self.tag(&cx, source, self.type_operand(&cx, instr))).put(";"));
         } else if op.is(&cx, "to_ptr") {
-            line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, self.value_name(&cx, a.at(&cx, 0usize))).push_static(";"));
+            line(&lines, Buffer!::new().write(&cx, d).put(" = ").write(&cx, self.value_name(&cx, a.at(&cx, 0usize))).put(";"));
         } else if op.is(&cx, "int_cast") {
             let value = self.value_name(&cx, a.at(&cx, 0usize));
-            line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, self.convert(&cx, value, self.type_operand(&cx, instr))).push_static(";"));
+            line(&lines, Buffer!::new().write(&cx, d).put(" = ").write(&cx, self.convert(&cx, value, self.type_operand(&cx, instr))).put(";"));
         } else if op.is(&cx, "float_cast") {
             let value = self.value_name(&cx, a.at(&cx, 0usize));
             let converted = self.float_convert(&cx, value, self.type_of(&cx, a.at(&cx, 0usize)), self.type_operand(&cx, instr));
-            line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, converted).push_static(";"));
+            line(&lines, Buffer!::new().write(&cx, d).put(" = ").write(&cx, converted).put(";"));
         } else if op.is(&cx, "cast") {
             let value = self.value_name(&cx, a.at(&cx, 0usize));
             let src = self.type_of(&cx, a.at(&cx, 0usize));
@@ -2986,40 +2982,40 @@ impl Backend['k] {
         } else if op.is(&cx, "trait_call") {
             self.trait_call(&cx, &lines, instr);
         } else if op.is(&cx, "fn") {
-            line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, self.function_address(&cx, instr)).push_static(";"));
+            line(&lines, Buffer!::new().write(&cx, d).put(" = ").write(&cx, self.function_address(&cx, instr)).put(";"));
         } else if op.is(&cx, "alloca") {
             let ct = self.c(&cx, self.type_operand(&cx, instr));
-            line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = (").push_bytes(&cx, ct).push_static("*)__builtin_alloca(sizeof(").push_bytes(&cx, ct).push_static("));"));
+            line(&lines, Buffer!::new().write(&cx, d).put(" = (").write(&cx, ct).put("*)__builtin_alloca(sizeof(").write(&cx, ct).put("));"));
         } else if op.is(&cx, "sizeof") {
             let ct = self.c(&cx, self.type_operand(&cx, instr));
             if ct.is(&cx, "void") {
-                line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = UINT64_C(0);"));
+                line(&lines, Buffer!::new().write(&cx, d).put(" = UINT64_C(0);"));
             } else {
-                line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = (uintptr_t)sizeof(").push_bytes(&cx, ct).push_static(");"));
+                line(&lines, Buffer!::new().write(&cx, d).put(" = (uintptr_t)sizeof(").write(&cx, ct).put(");"));
             }
         } else if op.is(&cx, "data") {
             // The program's pointer is not `const`: no write reaches the static image (CONTRACTS.md).
             let ct = self.c(&cx, self.program.datas.at(&cx, a.at(&cx, 0usize)).ty);
-            line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = (").push_bytes(&cx, ct).push_static("*)&").push_bytes(&cx, self.data_symbol(&cx, a.at(&cx, 0usize))).push_static(";"));
+            line(&lines, Buffer!::new().write(&cx, d).put(" = (").write(&cx, ct).put("*)&").write(&cx, self.data_symbol(&cx, a.at(&cx, 0usize))).put(";"));
         } else if op.is(&cx, "trap") {
-            line(&lines, Buffer!::new().push_static("KUR_TRAP();"));
+            line(&lines, Buffer!::new().put("KUR_TRAP();"));
         } else if op.is(&cx, "pack") || op.is(&cx, "open") {
-            line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, self.value_name(&cx, a.at(&cx, 0usize))).push_static(";"));
+            line(&lines, Buffer!::new().write(&cx, d).put(" = ").write(&cx, self.value_name(&cx, a.at(&cx, 0usize))).put(";"));
         } else if op.is(&cx, "ptr_load") {
-            line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = *").push_bytes(&cx, self.value_name(&cx, a.at(&cx, 0usize))).push_static(";"));
+            line(&lines, Buffer!::new().write(&cx, d).put(" = *").write(&cx, self.value_name(&cx, a.at(&cx, 0usize))).put(";"));
         } else if op.is(&cx, "ptr_load_volatile") {
             let ct = self.c(&cx, self.pointee(&cx, self.type_of(&cx, a.at(&cx, 0usize))));
-            line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = *(").push_bytes(&cx, ct).push_static(" volatile*)").push_bytes(&cx, self.value_name(&cx, a.at(&cx, 0usize))).push_static(";"));
+            line(&lines, Buffer!::new().write(&cx, d).put(" = *(").write(&cx, ct).put(" volatile*)").write(&cx, self.value_name(&cx, a.at(&cx, 0usize))).put(";"));
         } else if op.is(&cx, "ptr_store") || op.is(&cx, "ptr_store_volatile") {
             let inner = self.pointee(&cx, self.type_of(&cx, a.at(&cx, 0usize)));
-            let qual = if op.ends_with(&cx, Span::from_static(&cx, "volatile")) { Buffer!::new().push_static("(").push_bytes(&cx, self.c(&cx, inner)).push_static(" volatile*)").save(&cx) } else { Span::from_static(&cx, "") };
+            let qual = if op.ends_with(&cx, Span::from_static(&cx, "volatile")) { Buffer!::new().put("(").write(&cx, self.c(&cx, inner)).put(" volatile*)").save(&cx) } else { Span::from_static(&cx, "") };
             let target = self.value_name(&cx, a.at(&cx, 0usize));
-            line(&lines, Buffer!::new().push_static("*").push_bytes(&cx, qual).push_bytes(&cx, target).push_static(" = ").push_bytes(&cx, self.value_name(&cx, a.at(&cx, 1usize))).push_static(";"));
+            line(&lines, Buffer!::new().put("*").write(&cx, qual).write(&cx, target).put(" = ").write(&cx, self.value_name(&cx, a.at(&cx, 1usize))).put(";"));
         } else if C::atomic_kind(&cx, op).is_some() {
             self.atomic(&cx, &lines, instr, dst);
         } else if op.is(&cx, "load") {
             let (expr, _ty) = self.place(&cx, a.at(&cx, 0usize));
-            line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = ").push_bytes(&cx, expr).push_static(";"));
+            line(&lines, Buffer!::new().write(&cx, d).put(" = ").write(&cx, expr).put(";"));
         } else if op.is(&cx, "store") {
             let (expr, ty) = self.place(&cx, a.at(&cx, 0usize));
             if !self.erased(&cx, ty) {
@@ -3029,12 +3025,12 @@ impl Backend['k] {
                     },
                     None => (),
                 };
-                line(&lines, Buffer!::new().push_bytes(&cx, expr).push_static(" = ").push_bytes(&cx, self.value_name(&cx, a.at(&cx, 1usize))).push_static(";"));
+                line(&lines, Buffer!::new().write(&cx, expr).put(" = ").write(&cx, self.value_name(&cx, a.at(&cx, 1usize))).put(";"));
             }
         } else if op.is(&cx, "foreach") {
             self.foreach_instr(&cx, &lines, instr, d);
         } else {
-            fail_text(&cx, Buffer!::new().push_static("no C recipe for ").push_bytes(&cx, op).save(&cx));
+            fail_text(&cx, Buffer!::new().put("no C recipe for ").write(&cx, op).save(&cx));
         }
     }
 
@@ -3065,7 +3061,7 @@ impl Backend['k] {
                 var k = 0u64;
                 while k < length {
                     let at = if (k as usize) < args.len(&cx) - 1usize { k as usize } else { args.len(&cx) - 1usize };
-                    line(&lines, Buffer!::new().push_bytes(&cx, dst).push_static(".items[").push_u64(k).push_static("] = ").push_bytes(&cx, self.value_name(&cx, args.at(&cx, at))).push_static(";"));
+                    line(&lines, Buffer!::new().write(&cx, dst).put(".items[").put(k).put("] = ").write(&cx, self.value_name(&cx, args.at(&cx, at))).put(";"));
                     k = k + 1u64;
                 }
             },
@@ -3075,7 +3071,7 @@ impl Backend['k] {
                 while i < rows.len(&cx) && i < args.len(&cx) {
                     let (m, t) = rows.at(&cx, i);
                     if !self.erased(&cx, t) && home_of(&cx, away, i).is_none() {
-                        line(&lines, Buffer!::new().push_bytes(&cx, dst).push_static(".").push_bytes(&cx, m).push_static(" = ").push_bytes(&cx, self.value_name(&cx, args.at(&cx, i))).push_static(";"));
+                        line(&lines, Buffer!::new().write(&cx, dst).put(".").write(&cx, m).put(" = ").write(&cx, self.value_name(&cx, args.at(&cx, i))).put(";"));
                     }
                     i = i + 1usize;
                 }
@@ -3083,7 +3079,7 @@ impl Backend['k] {
                 while w < away.len(&cx) {
                     let (k, target) = away.at(&cx, w);
                     if target.starts_with(&cx, Span::from_static(&cx, "*")) {
-                        line(&lines, Buffer!::new().push_bytes(&cx, target).push_static(" = ").push_bytes(&cx, self.value_name(&cx, args.at(&cx, k))).push_static(";"));
+                        line(&lines, Buffer!::new().write(&cx, target).put(" = ").write(&cx, self.value_name(&cx, args.at(&cx, k))).put(";"));
                     } else {
                         let value = self.value_name(&cx, args.at(&cx, k));
                         self.write_home(&cx, &lines, target, value, Span::from_static(&cx, ""));
@@ -3120,7 +3116,7 @@ impl Backend['k] {
         var o = 0usize;
         while o < ks.len(&cx) && o < outs.len(&cx) {
             let (_ctype, cname) = outs.at(&cx, o);
-            away.push(&cx, (ks.at(&cx, o), Buffer!::new().push_static("*").push_bytes(&cx, cname).save(&cx)));
+            away.push(&cx, (ks.at(&cx, o), Buffer!::new().put("*").write(&cx, cname).save(&cx)));
             o = o + 1usize;
         }
         away
@@ -3186,7 +3182,7 @@ impl Backend['k] {
                 },
                 None => (),
             };
-            line(&lines, Buffer!::new().push_bytes(&cx, indent).push_bytes(&cx, target).push_static(" = ").push_bytes(&cx, value).push_static(";"));
+            line(&lines, Buffer!::new().write(&cx, indent).write(&cx, target).put(" = ").write(&cx, value).put(";"));
         }
     }
 
@@ -3197,7 +3193,7 @@ impl Backend['k] {
         let symbol = self.symbol.copy(&cx);
         let outs = self.out_pointers(&cx, symbol);
         if outs.is_empty(&cx) {
-            line(&lines, Buffer!::new().push_bytes(&cx, indent).push_static("return ").push_bytes(&cx, value).push_static(";"));
+            line(&lines, Buffer!::new().write(&cx, indent).put("return ").write(&cx, value).put(";"));
             return;
         }
         let ks = self.outs.at(&cx, symbol);
@@ -3210,13 +3206,13 @@ impl Backend['k] {
             let (_ctype, cname) = outs.at(&cx, o);
             if !self.at_out.copy(&cx).contains(&cx, (label, name, k)) {
                 let (member, _t) = members.at(&cx, k);
-                line(&lines, Buffer!::new().push_bytes(&cx, indent).push_static("*").push_bytes(&cx, cname).push_static(" = ").push_bytes(&cx, value).push_static(".").push_bytes(&cx, member).push_static(";"));
+                line(&lines, Buffer!::new().write(&cx, indent).put("*").write(&cx, cname).put(" = ").write(&cx, value).put(".").write(&cx, member).put(";"));
             }
             o = o + 1usize;
         }
         let reduced = self.reduced(&cx, whole, ks);
         if self.erased(&cx, reduced) {
-            line(&lines, Buffer!::new().push_bytes(&cx, indent).push_static("return;"));
+            line(&lines, Buffer!::new().write(&cx, indent).put("return;"));
             return;
         }
         let rows = self.members(&cx, self.shape(&cx, reduced));
@@ -3229,14 +3225,14 @@ impl Backend['k] {
                 if r < rows.len(&cx) {
                     let (into, _rt) = rows.at(&cx, r);
                     if !self.erased(&cx, t) {
-                        parts.push(&cx, Buffer!::new().push_static(".").push_bytes(&cx, into).push_static(" = ").push_bytes(&cx, value).push_static(".").push_bytes(&cx, m).save(&cx));
+                        parts.push(&cx, f".{into} = {value}.{m}".write(&cx, Buffer!::new()).save(&cx));
                     }
                 }
                 r = r + 1usize;
             }
             k = k + 1usize;
         }
-        line(&lines, Buffer!::new().push_bytes(&cx, indent).push_static("return (").push_bytes(&cx, self.c(&cx, reduced)).push_static("){ ").push_bytes(&cx, parts.join(&cx, ", ")).push_static(" };"));
+        line(&lines, Buffer!::new().write(&cx, indent).put("return (").write(&cx, self.c(&cx, reduced)).put("){ ").write(&cx, parts.join(&cx, ", ")).put(" };"));
     }
 
     fn destruct(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k]) {
@@ -3266,11 +3262,11 @@ impl Backend['k] {
                 let name = self.value_name(&cx, lhs);
                 // A pointer to a zero-size component is the pointer to the whole: they may share an address.
                 if pointer && self.erased(&cx, t) {
-                    line(&lines, Buffer!::new().push_bytes(&cx, name).push_static(" = (void*)").push_bytes(&cx, source).push_static(";"));
+                    line(&lines, Buffer!::new().write(&cx, name).put(" = (void*)").write(&cx, source).put(";"));
                 } else if pointer {
-                    line(&lines, Buffer!::new().push_bytes(&cx, name).push_static(" = KUR_FIELD(").push_bytes(&cx, source).push_static(", ").push_bytes(&cx, member).push_static(");"));
+                    line(&lines, Buffer!::new().write(&cx, name).put(" = KUR_FIELD(").write(&cx, source).put(", ").write(&cx, member).put(");"));
                 } else {
-                    line(&lines, Buffer!::new().push_bytes(&cx, name).push_static(" = ").push_bytes(&cx, source).push_static(".").push_bytes(&cx, member).push_static(";"));
+                    line(&lines, Buffer!::new().write(&cx, name).put(" = ").write(&cx, source).put(".").write(&cx, member).put(";"));
                 }
             }
             i = i + 1usize;
@@ -3285,10 +3281,10 @@ impl Backend['k] {
         };
         let wide = if C::is_pointer_sized(&cx, name) { "uintptr_t" } else { "uint64_t" };
         match signed_suffix(&cx, name) {
-            Some(suffix) => return Buffer!::new().push_static("kur_dec_i").push_bytes(&cx, suffix).push_static("((").push_static(wide).push_static(")(").push_bytes(&cx, expr).push_static("))").save(&cx),
+            Some(suffix) => return f"kur_dec_i{suffix}(({wide})({expr}))".write(&cx, Buffer!::new()).save(&cx),
             None => (),
         };
-        Buffer!::new().push_static("(").push_bytes(&cx, c_prim(&cx, name)).push_static(")((").push_static(wide).push_static(")(").push_bytes(&cx, expr).push_static("))").save(&cx)
+        Buffer!::new().put("(").write(&cx, c_prim(&cx, name)).put(")((").put(wide).put(")(").write(&cx, expr).put("))").save(&cx)
     }
 
     // Conversion by value with a float on one side. To a float, C's conversion: the nearest value,
@@ -3305,33 +3301,33 @@ impl Backend['k] {
         };
         let ct = c_prim(&cx, dn);
         if C::is_float(&cx, dn) {
-            return Buffer!::new().push_static("(").push_bytes(&cx, ct).push_static(")").push_bytes(&cx, expr).save(&cx);
+            return f"({ct}){expr}".write(&cx, Buffer!::new()).save(&cx);
         }
         let signed = signed_suffix(&cx, dn).is_some();
         let (low, high, limits) = if C::is_pointer_sized(&cx, dn) {
             // -2^(N-1), for the target's pointer width N.
-            let low = Buffer!::new().push_static("(").push_bytes(&cx, c_prim(&cx, sn)).push_static(")INTPTR_MIN").save(&cx);
-            let high = Buffer!::new().push_static(if signed { "-" } else { "-2 * " }).push_bytes(&cx, low).save(&cx);
+            let low = Buffer!::new().put("(").write(&cx, c_prim(&cx, sn)).put(")INTPTR_MIN").save(&cx);
+            let high = Buffer!::new().put(if signed { "-" } else { "-2 * " }).write(&cx, low).save(&cx);
             (low, high, Span::from_static(&cx, if signed { "INTPTR" } else { "UINTPTR" }))
         } else {
             let suffix = if sn.is(&cx, "f32") { "f" } else { "" };
             let bits = C::integer_bits(&cx, dn);
-            let low = Buffer!::new().push_static("-0x1p").push_u64(((bits - 1u32) as u64)).push_static(suffix).save(&cx);
+            let low = Buffer!::new().put("-0x1p").put(((bits - 1u32) as u64)).put(suffix).save(&cx);
             let top = if signed { bits - 1u32 } else { bits };
-            let high = Buffer!::new().push_static("0x1p").push_u64((top as u64)).push_static(suffix).save(&cx);
+            let high = Buffer!::new().put("0x1p").put((top as u64)).put(suffix).save(&cx);
             // `int8_t` to `INT8`, `uint64_t` to `UINT64`.
-            let limits = Buffer!::new().push_static(if signed { "INT" } else { "UINT" }).push_u64((bits as u64)).save(&cx);
+            let limits = Buffer!::new().put(if signed { "INT" } else { "UINT" }).put((bits as u64)).save(&cx);
             (low, high, limits)
         };
-        var out = Buffer!::new().push_bytes(&cx, expr);
-        out = if signed { out.push_static(" >= ").push_bytes(&cx, low) } else { out.push_static(" > -1") };
-        out = out.push_static(" && ").push_bytes(&cx, expr).push_static(" < ").push_bytes(&cx, high)
-            .push_static(" ? (").push_bytes(&cx, ct).push_static(")").push_bytes(&cx, expr)
-            .push_static(" : ").push_bytes(&cx, expr).push_static(" > 0 ? ").push_bytes(&cx, limits).push_static("_MAX : ");
+        var out = Buffer!::new().write(&cx, expr);
+        out = if signed { out.put(" >= ").write(&cx, low) } else { out.put(" > -1") };
+        out = out.put(" && ").write(&cx, expr).put(" < ").write(&cx, high)
+            .put(" ? (").write(&cx, ct).put(")").write(&cx, expr)
+            .put(" : ").write(&cx, expr).put(" > 0 ? ").write(&cx, limits).put("_MAX : ");
         if signed {
-            out = out.push_bytes(&cx, expr).push_static(" < 0 ? ").push_bytes(&cx, limits).push_static("_MIN : ");
+            out = out.write(&cx, expr).put(" < 0 ? ").write(&cx, limits).put("_MIN : ");
         }
-        out.push_static("0").save(&cx)
+        out.put("0").save(&cx)
     }
 
     fn cast(self, &cx: Domain!['k], &lines: Buffer!, dst: Span['k], expr: Span['k], src: Type['k], dst_ty: Type['k]) {
@@ -3339,20 +3335,20 @@ impl Backend['k] {
         let d = self.shape(&cx, dst_ty);
         let cd = self.c(&cx, dst_ty);
         if is_pointer_like(s) && is_pointer_like(d) {
-            line(&lines, Buffer!::new().push_bytes(&cx, dst).push_static(" = (").push_bytes(&cx, cd).push_static(")").push_bytes(&cx, expr).push_static(";"));
+            line(&lines, Buffer!::new().write(&cx, dst).put(" = (").write(&cx, cd).put(")").write(&cx, expr).put(";"));
             if is_non_null(d) && !is_non_null(s) {
                 // The cast's obligation: the pointer is not null. Telling the C compiler lets it fold
                 // the niche checks of an enum made from it.
-                line(&lines, Buffer!::new().push_static("if (").push_bytes(&cx, dst).push_static(" == 0) __builtin_unreachable();"));
+                line(&lines, Buffer!::new().put("if (").write(&cx, dst).put(" == 0) __builtin_unreachable();"));
             }
             return ();
         }
         if is_ptr(s) || is_ptr(d) {
             // The other side is an integer: the checker casts a pointer to or from nothing else
             // (`pointer_cast_fits`), and a `NonNull` only to or from a pointer.
-            let value = Buffer!::new().push_static("(uintptr_t)").push_bytes(&cx, expr).save(&cx);
-            let converted = if is_ptr(s) { self.convert(&cx, value, d) } else { Buffer!::new().push_static("(").push_bytes(&cx, cd).push_static(")").push_bytes(&cx, value).save(&cx) };
-            line(&lines, Buffer!::new().push_bytes(&cx, dst).push_static(" = ").push_bytes(&cx, converted).push_static(";"));
+            let value = Buffer!::new().put("(uintptr_t)").write(&cx, expr).save(&cx);
+            let converted = if is_ptr(s) { self.convert(&cx, value, d) } else { f"({cd}){value}".write(&cx, Buffer!::new()).save(&cx) };
+            line(&lines, Buffer!::new().write(&cx, dst).put(" = ").write(&cx, converted).put(";"));
             return ();
         }
         let prims = match s {
@@ -3364,7 +3360,7 @@ impl Backend['k] {
         };
         if prims {
             // One is a bool: the checker leaves a number to a number to `int_cast` and `float_cast`.
-            line(&lines, Buffer!::new().push_bytes(&cx, dst).push_static(" = (").push_bytes(&cx, cd).push_static(")").push_bytes(&cx, expr).push_static(";"));
+            line(&lines, Buffer!::new().write(&cx, dst).put(" = (").write(&cx, cd).put(")").write(&cx, expr).put(";"));
         } else {
             // Layout belongs to C. Never silently truncate a source or leave a destination tail
             // uninitialized; exact size is a target obligation.
@@ -3373,9 +3369,9 @@ impl Backend['k] {
     }
 
     fn reinterpret(self, &cx: Domain!['k], &lines: Buffer!, dst: Span['k], expr: Span['k]) {
-        line(&lines, Buffer!::new().push_static("_Static_assert(sizeof(").push_bytes(&cx, dst).push_static(") == sizeof(").push_bytes(&cx, expr)
-            .push_static("), \"KURS cast requires equal representation sizes\");"));
-        line(&lines, Buffer!::new().push_static("__builtin_memcpy(&").push_bytes(&cx, dst).push_static(", &").push_bytes(&cx, expr).push_static(", sizeof(").push_bytes(&cx, dst).push_static("));"));
+        line(&lines, Buffer!::new().put("_Static_assert(sizeof(").write(&cx, dst).put(") == sizeof(").write(&cx, expr)
+            .put("), \"KURS cast requires equal representation sizes\");"));
+        line(&lines, Buffer!::new().put("__builtin_memcpy(&").write(&cx, dst).put(", &").write(&cx, expr).put(", sizeof(").write(&cx, dst).put("));"));
     }
 
     fn primitive(self, &cx: Domain!['k], &lines: Buffer!, dst: Span['k], op: Span['k], args: ArenaVec[Span['k], 'k]) {
@@ -3383,7 +3379,7 @@ impl Backend['k] {
         let y = self.value_name(&cx, args.at(&cx, 1usize));
         let t = self.shape(&cx, self.type_of(&cx, args.at(&cx, 0usize)));
         if is_pointer_like(t) {
-            line(&lines, Buffer!::new().push_bytes(&cx, dst).push_static(" = ((uintptr_t)").push_bytes(&cx, x).push_static(" ").push_bytes(&cx, c_op(&cx, op)).push_static(" (uintptr_t)").push_bytes(&cx, y).push_static(");"));
+            line(&lines, Buffer!::new().write(&cx, dst).put(" = ((uintptr_t)").write(&cx, x).put(" ").write(&cx, c_op(&cx, op)).put(" (uintptr_t)").write(&cx, y).put(");"));
             return ();
         }
         let name = match t {
@@ -3391,7 +3387,7 @@ impl Backend['k] {
             _ => fail_text(&cx, Span::from_static(&cx, "internal error: a primitive operation on a value that is not primitive")),
         };
         if !C::is_integer(&cx, name) || op.is(&cx, "eq") || op.is(&cx, "ne") || op.is(&cx, "lt") || op.is(&cx, "le") || op.is(&cx, "gt") || op.is(&cx, "ge") {
-            line(&lines, Buffer!::new().push_bytes(&cx, dst).push_static(" = (").push_bytes(&cx, x).push_static(" ").push_bytes(&cx, c_op(&cx, op)).push_static(" ").push_bytes(&cx, y).push_static(");"));
+            line(&lines, Buffer!::new().write(&cx, dst).put(" = (").write(&cx, x).put(" ").write(&cx, c_op(&cx, op)).put(" ").write(&cx, y).put(");"));
             return ();
         }
         let ct = c_prim(&cx, name);
@@ -3403,47 +3399,46 @@ impl Backend['k] {
         let width = C::integer_bits(&cx, name);
         let wide = if pointer_sized { Span::from_static(&cx, "uintptr_t") } else { Span::from_static(&cx, "uint64_t") };
         let wide_max = if pointer_sized { Span::from_static(&cx, "UINTPTR_MAX") } else { Span::from_static(&cx, "UINT64_MAX") };
-        let bits = if pointer_sized { Span::from_static(&cx, "KUR_PTR_BITS") } else { Buffer!::new().push_u64(width as u64).save(&cx) };
-        let mask = if pointer_sized { Span::from_static(&cx, "(KUR_PTR_BITS - 1)") } else { Buffer!::new().push_u64((width - 1u32) as u64).save(&cx) };
+        let bits = if pointer_sized { Span::from_static(&cx, "KUR_PTR_BITS") } else { Buffer!::new().put(width).save(&cx) };
+        let mask = if pointer_sized { Span::from_static(&cx, "(KUR_PTR_BITS - 1)") } else { Buffer!::new().put(width - 1u32).save(&cx) };
         let bits_of = if pointer_sized {
-            Buffer!::new().push_static("(uintptr_t)(").push_bytes(&cx, x).push_static(")").save(&cx)
+            f"(uintptr_t)({x})".write(&cx, Buffer!::new()).save(&cx)
         } else if width < 64u32 || signed {
-            Buffer!::new().push_static("(uint64_t)(uint").push_u64(width as u64).push_static("_t)(").push_bytes(&cx, x).push_static(")").save(&cx)
+            f"(uint64_t)(uint{width}_t)({x})".write(&cx, Buffer!::new()).save(&cx)
         } else {
-            Buffer!::new().push_static("(uint64_t)(").push_bytes(&cx, x).push_static(")").save(&cx)
+            f"(uint64_t)({x})".write(&cx, Buffer!::new()).save(&cx)
         };
         if op.is(&cx, "div") || op.is(&cx, "mod") {
-            line(&lines, Buffer!::new().push_static("if (").push_bytes(&cx, y).push_static(" == 0) KUR_TRAP();"));
+            line(&lines, Buffer!::new().put("if (").write(&cx, y).put(" == 0) KUR_TRAP();"));
             if signed {
                 let minus = if op.is(&cx, "div") {
-                    wrap(&cx, Buffer!::new().push_static("(").push_bytes(&cx, wide).push_static(")0 - (").push_bytes(&cx, wide).push_static(")(").push_bytes(&cx, x).push_static(")").save(&cx), suffix, ct)
+                    wrap(&cx, f"({wide})0 - ({wide})({x})".write(&cx, Buffer!::new()).save(&cx), suffix, ct)
                 } else {
                     Span::from_static(&cx, "0")
                 };
-                line(&lines, Buffer!::new().push_bytes(&cx, dst).push_static(" = (").push_bytes(&cx, y).push_static(" == -1) ? ").push_bytes(&cx, minus).push_static(" : (").push_bytes(&cx, ct).push_static(")(")
-                    .push_bytes(&cx, x).push_static(" ").push_bytes(&cx, c_op(&cx, op)).push_static(" ").push_bytes(&cx, y).push_static(");"));
+                line(&lines, Buffer!::new().write(&cx, dst).put(" = (").write(&cx, y).put(" == -1) ? ").write(&cx, minus).put(" : (").write(&cx, ct).put(")(")
+                    .write(&cx, x).put(" ").write(&cx, c_op(&cx, op)).put(" ").write(&cx, y).put(");"));
             } else {
-                line(&lines, Buffer!::new().push_bytes(&cx, dst).push_static(" = (").push_bytes(&cx, ct).push_static(")((").push_bytes(&cx, wide).push_static(")").push_bytes(&cx, x).push_static(" ").push_bytes(&cx, c_op(&cx, op))
-                    .push_static(" (").push_bytes(&cx, wide).push_static(")").push_bytes(&cx, y).push_static(");"));
+                line(&lines, Buffer!::new().write(&cx, dst).put(" = (").write(&cx, ct).put(")((").write(&cx, wide).put(")").write(&cx, x).put(" ").write(&cx, c_op(&cx, op))
+                    .put(" (").write(&cx, wide).put(")").write(&cx, y).put(");"));
             }
             return ();
         }
         if op.is(&cx, "shl") || op.is(&cx, "shr") {
-            let amount = Buffer!::new().push_static("((").push_bytes(&cx, wide).push_static(")(").push_bytes(&cx, y).push_static(") & ").push_bytes(&cx, mask).push_static(")").save(&cx);
+            let amount = f"(({wide})({y}) & {mask})".write(&cx, Buffer!::new()).save(&cx);
             let shifted = if op.is(&cx, "shl") {
-                Buffer!::new().push_bytes(&cx, bits_of).push_static(" << ").push_bytes(&cx, amount).save(&cx)
+                f"{bits_of} << {amount}".write(&cx, Buffer!::new()).save(&cx)
             } else if !signed {
-                Buffer!::new().push_bytes(&cx, bits_of).push_static(" >> ").push_bytes(&cx, amount).save(&cx)
+                f"{bits_of} >> {amount}".write(&cx, Buffer!::new()).save(&cx)
             } else {
-                let fill = Buffer!::new().push_static("(").push_bytes(&cx, x).push_static(" < 0 && ").push_bytes(&cx, amount).push_static(" ? (").push_bytes(&cx, wide_max).push_static(" << (").push_bytes(&cx, bits)
-                    .push_static(" - ").push_bytes(&cx, amount).push_static(")) : 0)").save(&cx);
-                Buffer!::new().push_static("(").push_bytes(&cx, bits_of).push_static(" >> ").push_bytes(&cx, amount).push_static(") | ").push_bytes(&cx, fill).save(&cx)
+                let fill = f"({x} < 0 && {amount} ? ({wide_max} << ({bits} - {amount})) : 0)".write(&cx, Buffer!::new()).save(&cx);
+                f"({bits_of} >> {amount}) | {fill}".write(&cx, Buffer!::new()).save(&cx)
             };
-            line(&lines, Buffer!::new().push_bytes(&cx, dst).push_static(" = ").push_bytes(&cx, wrap(&cx, shifted, suffix, ct)).push_static(";"));
+            line(&lines, Buffer!::new().write(&cx, dst).put(" = ").write(&cx, wrap(&cx, shifted, suffix, ct)).put(";"));
             return ();
         }
-        let expr = Buffer!::new().push_static("(").push_bytes(&cx, wide).push_static(")(").push_bytes(&cx, x).push_static(") ").push_bytes(&cx, c_op(&cx, op)).push_static(" (").push_bytes(&cx, wide).push_static(")(").push_bytes(&cx, y).push_static(")").save(&cx);
-        line(&lines, Buffer!::new().push_bytes(&cx, dst).push_static(" = ").push_bytes(&cx, wrap(&cx, expr, suffix, ct)).push_static(";"));
+        let expr = Buffer!::new().put("(").write(&cx, wide).put(")(").write(&cx, x).put(") ").write(&cx, c_op(&cx, op)).put(" (").write(&cx, wide).put(")(").write(&cx, y).put(")").save(&cx);
+        line(&lines, Buffer!::new().write(&cx, dst).put(" = ").write(&cx, wrap(&cx, expr, suffix, ct)).put(";"));
     }
 
     fn call(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k]) {
@@ -3504,7 +3499,7 @@ impl Backend['k] {
         var s = 0usize;
         while s < fun.locals.len(&cx) && s < paths.len(&cx) {
             let path = paths.at(&cx, s);
-            let lent = if path.starts_with(&cx, Span::from_static(&cx, "&")) { path } else { Buffer!::new().push_static("&").push_bytes(&cx, path).save(&cx) };
+            let lent = if path.starts_with(&cx, Span::from_static(&cx, "&")) { path } else { Buffer!::new().put("&").write(&cx, path).save(&cx) };
             actual.insert(&cx, fun.locals.at(&cx, s).name, lent);
             s = s + 1usize;
         }
@@ -3551,7 +3546,7 @@ impl Backend['k] {
             let name = instr.lhs.at(&cx, k);
             if self.is_live(&cx, name) && !self.value_erased(&cx, name) && !plan.resident.contains(&cx, (self.label.copy(&cx), name)) {
                 let (expr, _ty) = self.place(&cx, paths.at(&cx, k));
-                line(&lines, Buffer!::new().push_bytes(&cx, self.value_name(&cx, name)).push_static(" = ").push_bytes(&cx, expr).push_static(";"));
+                line(&lines, Buffer!::new().write(&cx, self.value_name(&cx, name)).put(" = ").write(&cx, expr).put(";"));
             }
             k = k + 1usize;
         }
@@ -3585,7 +3580,7 @@ impl Backend['k] {
                     },
                     None => (),
                 };
-                line(&lines, Buffer!::new().push_bytes(&cx, dst).push_static(".").push_bytes(&cx, member).push_static(" = ").push_bytes(&cx, self.value_name(&cx, arg)).push_static(";"));
+                line(&lines, Buffer!::new().write(&cx, dst).put(".").write(&cx, member).put(" = ").write(&cx, self.value_name(&cx, arg)).put(";"));
             }
             k = k + 1usize;
         }
@@ -3629,13 +3624,13 @@ impl Backend['k] {
             }
         }
         if !unsafe_spot {
-            return Buffer!::new().push_static("&").push_bytes(&cx, expr).save(&cx);
+            return Buffer!::new().put("&").write(&cx, expr).save(&cx);
         }
-        let copy = allocate(&cx, Buffer!::new().push_static("arg_").push_usize(self.scratch.copy(&cx)).save(&cx), self.taken);
+        let copy = allocate(&cx, Buffer!::new().put("arg_").put(self.scratch.copy(&cx)).save(&cx), self.taken);
         self.scratch.set(&cx, self.scratch.copy(&cx) + 1usize);
-        self.temps.copy(&cx).push(&cx, Buffer!::new().push_bytes(&cx, self.c(&cx, self.type_of(&cx, arg))).push_static(" ").push_bytes(&cx, copy).push_static(";").save(&cx));
-        line(&lines, Buffer!::new().push_bytes(&cx, copy).push_static(" = ").push_bytes(&cx, expr).push_static(";"));
-        Buffer!::new().push_static("&").push_bytes(&cx, copy).save(&cx)
+        self.temps.copy(&cx).push(&cx, Buffer!::new().write(&cx, self.c(&cx, self.type_of(&cx, arg))).put(" ").write(&cx, copy).put(";").save(&cx));
+        line(&lines, Buffer!::new().write(&cx, copy).put(" = ").write(&cx, expr).put(";"));
+        Buffer!::new().put("&").write(&cx, copy).save(&cx)
     }
 
     fn emit_call(self, &cx: Domain!['k], &lines: Buffer!, instr: Instr['k], callee: Span['k], ret: Type['k], sub: ArenaMap[Span['k], Type['k], 'k], args: ArenaVec[Span['k], 'k],
@@ -3662,7 +3657,7 @@ impl Backend['k] {
             match home_of(&cx, homed, k) {
                 Some(path) => {
                     let (expr, _ty) = self.place(&cx, path);
-                    pointers.push(&cx, Buffer!::new().push_static("&").push_bytes(&cx, expr).save(&cx));
+                    pointers.push(&cx, Buffer!::new().put("&").write(&cx, expr).save(&cx));
                     match self.param_index(&cx, root(&cx, path)) {
                         Some(j) => {
                             let added = self.written.insert(&cx, (current, j));
@@ -3680,12 +3675,12 @@ impl Backend['k] {
                     let added = self.at_out.copy(&cx).insert(&cx, (label, name, k));
                 } else if live {
                     let (member, _t) = members.at(&cx, k);
-                    pointers.push(&cx, Buffer!::new().push_static("&").push_bytes(&cx, dst).push_static(".").push_bytes(&cx, member).save(&cx));
+                    pointers.push(&cx, f"&{dst}.{member}".write(&cx, Buffer!::new()).save(&cx));
                 } else {
-                    let temp = allocate(&cx, Buffer!::new().push_static("arg_").push_usize(self.scratch.copy(&cx)).save(&cx), self.taken);
+                    let temp = allocate(&cx, Buffer!::new().put("arg_").put(self.scratch.copy(&cx)).save(&cx), self.taken);
                     self.scratch.set(&cx, self.scratch.copy(&cx) + 1usize);
-                    self.temps.copy(&cx).push(&cx, Buffer!::new().push_bytes(&cx, self.c(&cx, self.element(&cx, result, k))).push_static(" ").push_bytes(&cx, temp).push_static(";").save(&cx));
-                    pointers.push(&cx, Buffer!::new().push_static("&").push_bytes(&cx, temp).save(&cx));
+                    self.temps.copy(&cx).push(&cx, Buffer!::new().write(&cx, self.c(&cx, self.element(&cx, result, k))).put(" ").write(&cx, temp).put(";").save(&cx));
+                    pointers.push(&cx, Buffer!::new().put("&").write(&cx, temp).save(&cx));
                 },
             };
             o = o + 1usize;
@@ -3702,16 +3697,16 @@ impl Backend['k] {
             passed.push(&cx, pointers.at(&cx, p));
             p = p + 1usize;
         }
-        let call = Buffer!::new().push_bytes(&cx, callee).push_static("(").push_bytes(&cx, passed.join(&cx, ", ")).push_static(")").save(&cx);
+        let call = Buffer!::new().write(&cx, callee).put("(").write(&cx, passed.join(&cx, ", ")).put(")").save(&cx);
         if !outs.is_empty(&cx) {
             let reduced = self.reduced(&cx, result, outs);
             if !live || self.erased(&cx, reduced) {
-                line(&lines, Buffer!::new().push_bytes(&cx, call).push_static(";"));
+                line(&lines, Buffer!::new().write(&cx, call).put(";"));
             } else {
-                let temp = allocate(&cx, Buffer!::new().push_static("ret_").push_usize(self.scratch.copy(&cx)).save(&cx), self.taken);
+                let temp = allocate(&cx, Buffer!::new().put("ret_").put(self.scratch.copy(&cx)).save(&cx), self.taken);
                 self.scratch.set(&cx, self.scratch.copy(&cx) + 1usize);
-                self.temps.copy(&cx).push(&cx, Buffer!::new().push_bytes(&cx, self.c(&cx, reduced)).push_static(" ").push_bytes(&cx, temp).push_static(";").save(&cx));
-                line(&lines, Buffer!::new().push_bytes(&cx, temp).push_static(" = ").push_bytes(&cx, call).push_static(";"));
+                self.temps.copy(&cx).push(&cx, Buffer!::new().write(&cx, self.c(&cx, reduced)).put(" ").write(&cx, temp).put(";").save(&cx));
+                line(&lines, Buffer!::new().write(&cx, temp).put(" = ").write(&cx, call).put(";"));
                 let rows = self.members(&cx, self.shape(&cx, reduced));
                 var r = 0usize;
                 var k = 0usize;
@@ -3720,7 +3715,7 @@ impl Backend['k] {
                         let (m, t) = members.at(&cx, k);
                         if r < rows.len(&cx) && !self.erased(&cx, t) {
                             let (into, _rt) = rows.at(&cx, r);
-                            line(&lines, Buffer!::new().push_bytes(&cx, dst).push_static(".").push_bytes(&cx, m).push_static(" = ").push_bytes(&cx, temp).push_static(".").push_bytes(&cx, into).push_static(";"));
+                            line(&lines, Buffer!::new().write(&cx, dst).put(".").write(&cx, m).put(" = ").write(&cx, temp).put(".").write(&cx, into).put(";"));
                         }
                         r = r + 1usize;
                     }
@@ -3728,9 +3723,9 @@ impl Backend['k] {
                 }
             }
         } else if !live {
-            line(&lines, Buffer!::new().push_bytes(&cx, call).push_static(";"));
+            line(&lines, Buffer!::new().write(&cx, call).put(";"));
         } else {
-            line(&lines, Buffer!::new().push_bytes(&cx, dst).push_static(" = ").push_bytes(&cx, call).push_static(";"));
+            line(&lines, Buffer!::new().write(&cx, dst).put(" = ").write(&cx, call).put(";"));
         }
         // A homed component the callee does not write through a pointer goes to its place after the call.
         var h = 0usize;
@@ -3738,7 +3733,7 @@ impl Backend['k] {
             let (k, path) = homed.at(&cx, h);
             if !outs.contains(&cx, k) {
                 let (member, _t) = self.members(&cx, self.shape(&cx, result)).at(&cx, k);
-                self.write_home(&cx, &lines, path, Buffer!::new().push_bytes(&cx, dst).push_static(".").push_bytes(&cx, member).save(&cx), Span::from_static(&cx, ""));
+                self.write_home(&cx, &lines, path, f"{dst}.{member}".write(&cx, Buffer!::new()).save(&cx), Span::from_static(&cx, ""));
             }
             h = h + 1usize;
         }
@@ -3791,30 +3786,29 @@ impl Backend['k] {
                 _ => (false, false),
             };
             if !integer && (kind.starts_with(&cx, Span::from_static(&cx, "fetch_")) || !transfer) {
-                fail_at(&cx, Buffer!::new().push_static("backend atomic ").push_bytes(&cx, kind).push_static(" does not support this pointee type; ")
-                    .push_static("fetch operations require integers, transfers require integers, bool or raw pointers").save(&cx), instr.pos);
+                fail_at(&cx, f"backend atomic {kind} does not support this pointee type; fetch operations require integers, transfers require integers, bool or raw pointers".write(&cx, Buffer!::new()).save(&cx), instr.pos);
             }
         }
         if kind.is(&cx, "fence") {
-            line(&lines, Buffer!::new().push_static("__atomic_thread_fence(").push_bytes(&cx, c_order(&cx, order)).push_static(");"));
+            line(&lines, Buffer!::new().put("__atomic_thread_fence(").write(&cx, c_order(&cx, order)).put(");"));
         } else if kind.is(&cx, "load") {
-            line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = __atomic_load_n(").push_bytes(&cx, args.at(&cx, 0usize)).push_static(", ").push_bytes(&cx, c_order(&cx, order)).push_static(");"));
+            line(&lines, Buffer!::new().write(&cx, d).put(" = __atomic_load_n(").write(&cx, args.at(&cx, 0usize)).put(", ").write(&cx, c_order(&cx, order)).put(");"));
         } else if kind.is(&cx, "store") {
-            line(&lines, Buffer!::new().push_static("__atomic_store_n(").push_bytes(&cx, args.at(&cx, 0usize)).push_static(", ").push_bytes(&cx, args.at(&cx, 1usize)).push_static(", ").push_bytes(&cx, c_order(&cx, order)).push_static(");"));
+            line(&lines, Buffer!::new().put("__atomic_store_n(").write(&cx, args.at(&cx, 0usize)).put(", ").write(&cx, args.at(&cx, 1usize)).put(", ").write(&cx, c_order(&cx, order)).put(");"));
         } else if kind.is(&cx, "swap") {
-            line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = __atomic_exchange_n(").push_bytes(&cx, args.at(&cx, 0usize)).push_static(", ").push_bytes(&cx, args.at(&cx, 1usize)).push_static(", ")
-                .push_bytes(&cx, c_order(&cx, order)).push_static(");"));
+            line(&lines, Buffer!::new().write(&cx, d).put(" = __atomic_exchange_n(").write(&cx, args.at(&cx, 0usize)).put(", ").write(&cx, args.at(&cx, 1usize)).put(", ")
+                .write(&cx, c_order(&cx, order)).put(");"));
         } else if kind.is(&cx, "compare_exchange") {
             let (success, failure) = match order.find(&cx, Span::from_static(&cx, "/"), 0usize) {
                 Some(at) => (order.slice(0usize, at), order.skip(at + 1usize)),
                 None => (order, Span::from_static(&cx, "")),
             };
-            line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(".e0 = ").push_bytes(&cx, args.at(&cx, 1usize)).push_static(";"));
-            line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(".e1 = __atomic_compare_exchange_n(").push_bytes(&cx, args.at(&cx, 0usize)).push_static(", &").push_bytes(&cx, d).push_static(".e0, ")
-                .push_bytes(&cx, args.at(&cx, 2usize)).push_static(", 0, ").push_bytes(&cx, c_order(&cx, success)).push_static(", ").push_bytes(&cx, c_order(&cx, failure)).push_static(");"));
+            line(&lines, Buffer!::new().write(&cx, d).put(".e0 = ").write(&cx, args.at(&cx, 1usize)).put(";"));
+            line(&lines, Buffer!::new().write(&cx, d).put(".e1 = __atomic_compare_exchange_n(").write(&cx, args.at(&cx, 0usize)).put(", &").write(&cx, d).put(".e0, ")
+                .write(&cx, args.at(&cx, 2usize)).put(", 0, ").write(&cx, c_order(&cx, success)).put(", ").write(&cx, c_order(&cx, failure)).put(");"));
         } else {
-            line(&lines, Buffer!::new().push_bytes(&cx, d).push_static(" = __atomic_").push_bytes(&cx, kind).push_static("(").push_bytes(&cx, args.at(&cx, 0usize)).push_static(", ").push_bytes(&cx, args.at(&cx, 1usize)).push_static(", ")
-                .push_bytes(&cx, c_order(&cx, order)).push_static(");"));
+            line(&lines, Buffer!::new().write(&cx, d).put(" = __atomic_").write(&cx, kind).put("(").write(&cx, args.at(&cx, 0usize)).put(", ").write(&cx, args.at(&cx, 1usize)).put(", ")
+                .write(&cx, c_order(&cx, order)).put(");"));
         }
     }
 
@@ -3893,23 +3887,23 @@ impl Backend['k] {
                     // A sum is traversed by value only: a pointer source points to a product or an array.
                     let source_type = self.type_of(&cx, instr.args.at(&cx, 0usize));
                     let result_type = Type::Foreach.(t);
-                    line(&lines, Buffer!::new().push_static("switch (").push_bytes(&cx, self.tag(&cx, source, source_type)).push_static(") {"));
+                    line(&lines, Buffer!::new().put("switch (").write(&cx, self.tag(&cx, source, source_type)).put(") {"));
                     var k = 0usize;
                     while k < rows.len(&cx) && k < results.len(&cx) {
                         let row = rows.at(&cx, k);
                         let applied = walk.apply(&cx, row, self.payload(&cx, source, source_type, row.label));
                         let body = if self.erased(&cx, results.at(&cx, k).ty) {
-                            Buffer!::new().push_bytes(&cx, applied).push_static("; ").push_bytes(&cx, self.set_variant(&cx, dst, result_type, row.label, Option::None).join(&cx, " ")).save(&cx)
+                            Buffer!::new().write(&cx, applied).put("; ").write(&cx, self.set_variant(&cx, dst, result_type, row.label, Option::None).join(&cx, " ")).save(&cx)
                         } else {
                             match self.niche_layout(&cx, result_type) {
-                                Some(_layout) => Buffer!::new().push_bytes(&cx, dst).push_static(" = ").push_bytes(&cx, applied).push_static(";").save(&cx),
+                                Some(_layout) => f"{dst} = {applied};".write(&cx, Buffer!::new()).save(&cx),
                                 None => self.set_variant(&cx, dst, result_type, row.label, Option::Some.(applied)).join(&cx, " "),
                             }
                         };
-                        line(&lines, Buffer!::new().push_static("case ").push_usize(k).push_static(": ").push_bytes(&cx, body).push_static(" break;"));
+                        line(&lines, Buffer!::new().put("case ").put(k).put(": ").write(&cx, body).put(" break;"));
                         k = k + 1usize;
                     }
-                    line(&lines, Buffer!::new().push_static("default: KUR_TRAP();\n  }"));
+                    line(&lines, Buffer!::new().put("default: KUR_TRAP();\n  }"));
                     return ();
                 },
                 _ => (),
@@ -3924,10 +3918,10 @@ impl Backend['k] {
             Some(s) => s,
             None => {
                 // A mapped operand of a leaf source is a one-component tuple.
-                let component = if mapped.is_some() { Buffer!::new().push_bytes(&cx, source).push_static(".e0").save(&cx) } else { source };
+                let component = if mapped.is_some() { Buffer!::new().write(&cx, source).put(".e0").save(&cx) } else { source };
                 let (member, result) = out.at(&cx, 0usize);
                 let applied = walk.apply(&cx, rows.at(&cx, 0usize), component);
-                line(&lines, Buffer!::new().push_bytes(&cx, self.assign_result(&cx, Buffer!::new().push_bytes(&cx, dst).push_static(".").push_bytes(&cx, member).save(&cx), result, applied)));
+                line(&lines, Buffer!::new().write(&cx, self.assign_result(&cx, f"{dst}.{member}".write(&cx, Buffer!::new()).save(&cx), result, applied)));
                 return ();
             },
         };
@@ -3943,15 +3937,15 @@ impl Backend['k] {
             let row = rows.at(&cx, k);
             // A pointer to a zero-size component is the pointer to the whole, as `destruct` makes it.
             let component = if pointer && self.erased(&cx, row.item) {
-                Buffer!::new().push_static("(void*)").push_bytes(&cx, source).save(&cx)
+                Buffer!::new().put("(void*)").write(&cx, source).save(&cx)
             } else if pointer {
-                Buffer!::new().push_static("KUR_FIELD(").push_bytes(&cx, source).push_static(", ").push_bytes(&cx, source_access.at(&cx, k)).push_static(")").save(&cx)
+                Buffer!::new().put("KUR_FIELD(").write(&cx, source).put(", ").write(&cx, source_access.at(&cx, k)).put(")").save(&cx)
             } else {
-                Buffer!::new().push_bytes(&cx, source).push_static(".").push_bytes(&cx, source_access.at(&cx, k)).save(&cx)
+                Buffer!::new().write(&cx, source).put(".").write(&cx, source_access.at(&cx, k)).save(&cx)
             };
             let (member, result) = out.at(&cx, k);
             let applied = walk.apply(&cx, row, component);
-            line(&lines, Buffer!::new().push_bytes(&cx, self.assign_result(&cx, Buffer!::new().push_bytes(&cx, dst).push_static(".").push_bytes(&cx, member).save(&cx), result, applied)));
+            line(&lines, Buffer!::new().write(&cx, self.assign_result(&cx, f"{dst}.{member}".write(&cx, Buffer!::new()).save(&cx), result, applied)));
             k = k + 1usize;
         }
     }
@@ -3959,9 +3953,9 @@ impl Backend['k] {
     // `target = call;`, or the call alone for a result of a zero-size type.
     fn assign_result(self, &cx: Domain!['k], target: Span['k], result: Type['k], call: Span['k]) -> Span['k] {
         if self.erased(&cx, result) {
-            Buffer!::new().push_bytes(&cx, call).push_static(";").save(&cx)
+            Buffer!::new().write(&cx, call).put(";").save(&cx)
         } else {
-            Buffer!::new().push_bytes(&cx, target).push_static(" = ").push_bytes(&cx, call).push_static(";").save(&cx)
+            f"{target} = {call};".write(&cx, Buffer!::new()).save(&cx)
         }
     }
 
@@ -3970,25 +3964,25 @@ impl Backend['k] {
     fn term(self, &cx: Domain!['k], &lines: Buffer!, term: Terminator['k]) {
         match term {
             Ret(value, _pos) => if self.value_erased(&cx, value) {
-                line(&lines, Buffer!::new().push_static("return;"));
+                line(&lines, Buffer!::new().put("return;"));
             } else {
                 let returned = self.value_name(&cx, value);
                 self.give_back(&cx, &lines, value, returned, Span::from_static(&cx, ""));
             },
             Jmp(edge, _pos) => self.edge(&cx, &lines, edge, Option::None, Span::from_static(&cx, ""), Span::from_static(&cx, "")),
             Jnz(cond, then, other, _pos) => {
-                line(&lines, Buffer!::new().push_static("if (").push_bytes(&cx, self.value_name(&cx, cond)).push_static(") {"));
+                line(&lines, Buffer!::new().put("if (").write(&cx, self.value_name(&cx, cond)).put(") {"));
                 self.edge(&cx, &lines, then, Option::None, Span::from_static(&cx, ""), Span::from_static(&cx, "  "));
-                line(&lines, Buffer!::new().push_static("} else {"));
+                line(&lines, Buffer!::new().put("} else {"));
                 self.edge(&cx, &lines, other, Option::None, Span::from_static(&cx, ""), Span::from_static(&cx, "  "));
-                line(&lines, Buffer!::new().push_static("}"));
+                line(&lines, Buffer!::new().put("}"));
             },
             Switch(scrutinee, ty, arms, _pos) => self.switch(&cx, &lines, scrutinee, ty, arms),
             Unreachable(_pos) => {
                 let instrs = self.blocks.copy(&cx).at(&cx, self.label.copy(&cx)).instrs;
                 // A `trap` has written its own.
                 if instrs.is_empty(&cx) || !instrs.at(&cx, instrs.len(&cx) - 1usize).op.is(&cx, "trap") {
-                    line(&lines, Buffer!::new().push_static("KUR_TRAP();"));
+                    line(&lines, Buffer!::new().put("KUR_TRAP();"));
                 }
             },
         };
@@ -4030,7 +4024,7 @@ impl Backend['k] {
             Some(index) => {
                 let (value, _base) = values.at(&cx, index);
                 if value.is_empty() {
-                    line(&lines, Buffer!::new().push_bytes(&cx, indent).push_static("return;"));
+                    line(&lines, Buffer!::new().write(&cx, indent).put("return;"));
                 } else {
                     self.give_back(&cx, &lines, names.at(&cx, index), value, indent);
                 }
@@ -4059,11 +4053,11 @@ impl Backend['k] {
                             let (member, mt) = rows.at(&cx, k);
                             match home_of(&cx, homed, k) {
                                 Some(path) => if !made {
-                                    homes.push(&cx, (path, Buffer!::new().push_bytes(&cx, value).push_static(".").push_bytes(&cx, member).save(&cx)));
+                                    homes.push(&cx, (path, f"{value}.{member}".write(&cx, Buffer!::new()).save(&cx)));
                                 },
                                 None => if !self.erased(&cx, mt) {
-                                    moves.push(&cx, Move.{ dst: Buffer!::new().push_bytes(&cx, self.cname(&cx, target.label, binding.name)).push_static(".").push_bytes(&cx, member).save(&cx),
-                                        ty: mt, place: false, value: Buffer!::new().push_bytes(&cx, value).push_static(".").push_bytes(&cx, member).save(&cx), base });
+                                    moves.push(&cx, Move.{ dst: Buffer!::new().write(&cx, self.cname(&cx, target.label, binding.name)).put(".").write(&cx, member).save(&cx),
+                                        ty: mt, place: false, value: f"{value}.{member}".write(&cx, Buffer!::new()).save(&cx), base });
                                 },
                             };
                             k = k + 1usize;
@@ -4081,7 +4075,7 @@ impl Backend['k] {
             self.write_home(&cx, &lines, path, value, indent);
             h = h + 1usize;
         }
-        line(&lines, Buffer!::new().push_bytes(&cx, indent).push_static("goto ").push_bytes(&cx, self.labels.copy(&cx).at(&cx, target.label)).push_static(";"));
+        line(&lines, Buffer!::new().write(&cx, indent).put("goto ").write(&cx, self.labels.copy(&cx).at(&cx, target.label)).put(";"));
     }
 
     // Assigns each move at once: one after another when no assignment overwrites what a later one
@@ -4112,23 +4106,23 @@ impl Backend['k] {
             var i = 0usize;
             while i < moves.len(&cx) {
                 let move = moves.at(&cx, i);
-                let temp = allocate(&cx, Buffer!::new().push_static("edge_").push_usize(self.scratch.copy(&cx)).save(&cx), self.taken);
+                let temp = allocate(&cx, Buffer!::new().put("edge_").put(self.scratch.copy(&cx)).save(&cx), self.taken);
                 self.scratch.set(&cx, self.scratch.copy(&cx) + 1usize);
-                self.temps.copy(&cx).push(&cx, Buffer!::new().push_bytes(&cx, self.c(&cx, self.substitute_type(&cx, move.ty))).push_static(if move.place { "*" } else { "" })
-                    .push_static(" ").push_bytes(&cx, temp).push_static(";").save(&cx));
-                line(&lines, Buffer!::new().push_bytes(&cx, indent).push_bytes(&cx, temp).push_static(" = ").push_bytes(&cx, move.value).push_static(";"));
+                self.temps.copy(&cx).push(&cx, Buffer!::new().write(&cx, self.c(&cx, self.substitute_type(&cx, move.ty))).put(if move.place { "*" } else { "" })
+                    .put(" ").write(&cx, temp).put(";").save(&cx));
+                line(&lines, Buffer!::new().write(&cx, indent).write(&cx, temp).put(" = ").write(&cx, move.value).put(";"));
                 temps.push(&cx, temp);
                 i = i + 1usize;
             }
             var j = 0usize;
             while j < moves.len(&cx) {
-                line(&lines, Buffer!::new().push_bytes(&cx, indent).push_bytes(&cx, moves.at(&cx, j).dst).push_static(" = ").push_bytes(&cx, temps.at(&cx, j)).push_static(";"));
+                line(&lines, Buffer!::new().write(&cx, indent).write(&cx, moves.at(&cx, j).dst).put(" = ").write(&cx, temps.at(&cx, j)).put(";"));
                 j = j + 1usize;
             }
         } else {
             var j = 0usize;
             while j < moves.len(&cx) {
-                line(&lines, Buffer!::new().push_bytes(&cx, indent).push_bytes(&cx, moves.at(&cx, j).dst).push_static(" = ").push_bytes(&cx, moves.at(&cx, j).value).push_static(";"));
+                line(&lines, Buffer!::new().write(&cx, indent).write(&cx, moves.at(&cx, j).dst).put(" = ").write(&cx, moves.at(&cx, j).value).put(";"));
                 j = j + 1usize;
             }
         }
@@ -4144,7 +4138,7 @@ impl Backend['k] {
         };
         let ty = self.substitute_type(&cx, ty);
         let variants = self.types.variants(&cx, erase(&cx, ty, self.types), Option::None);
-        line(&lines, Buffer!::new().push_static("switch (").push_bytes(&cx, self.tag(&cx, source, ty)).push_static(") {"));
+        line(&lines, Buffer!::new().put("switch (").write(&cx, self.tag(&cx, source, ty)).put(") {"));
         var i = 0usize;
         while i < arms.len(&cx) {
             let arm = arms.at(&cx, i);
@@ -4157,7 +4151,7 @@ impl Backend['k] {
                     index = index + 1usize;
                 }
             }
-            line(&lines, Buffer!::new().push_static("case ").push_usize(index).push_static(":"));
+            line(&lines, Buffer!::new().put("case ").put(index).put(":"));
             let payload = if place {
                 Option::None
             } else if self.erased(&cx, variants.at(&cx, index).ty) {
@@ -4165,13 +4159,13 @@ impl Backend['k] {
             } else {
                 Option::Some.(self.payload(&cx, source, ty, arm.variant))
             };
-            line(&lines, Buffer!::new().push_static("  {"));
+            line(&lines, Buffer!::new().put("  {"));
             self.edge(&cx, &lines, arm.edge, payload, base, Span::from_static(&cx, "    "));
-            line(&lines, Buffer!::new().push_static("  }"));
+            line(&lines, Buffer!::new().put("  }"));
             i = i + 1usize;
         }
-        line(&lines, Buffer!::new().push_static("default: KUR_TRAP();"));
-        line(&lines, Buffer!::new().push_static("}"));
+        line(&lines, Buffer!::new().put("default: KUR_TRAP();"));
+        line(&lines, Buffer!::new().put("}"));
     }
 
     // ----------------------------------------------------------------- tail calls --
@@ -4273,7 +4267,7 @@ impl Backend['k] {
                 p = p + 1usize;
             }
             self.assign(&cx, &lines, moves, Span::from_static(&cx, ""));
-            line(&lines, Buffer!::new().push_static("goto ").push_bytes(&cx, self.labels.copy(&cx).at(&cx, entry.label)).push_static(";"));
+            line(&lines, Buffer!::new().put("goto ").write(&cx, self.labels.copy(&cx).at(&cx, entry.label)).put(";"));
             return true;
         }
         let (ret, _noreturn, all_params) = self.heads.at(&cx, current);
@@ -4284,7 +4278,7 @@ impl Backend['k] {
         while t < fun.ptypes.len(&cx) {
             let ct = self.c(&cx, subst(&cx, fun.ptypes.at(&cx, t), sub, self.counter));
             if !ct.is(&cx, "void") {
-                callee_params.push(&cx, Buffer!::new().push_bytes(&cx, ct).push_static(if places.contains(&cx, t) { "*" } else { "" }).save(&cx));
+                callee_params.push(&cx, Buffer!::new().write(&cx, ct).put(if places.contains(&cx, t) { "*" } else { "" }).save(&cx));
             }
             t = t + 1usize;
         }
@@ -4300,7 +4294,7 @@ impl Backend['k] {
         var s = 0usize;
         while same && s < params.len(&cx) {
             let cp = params.at(&cx, s);
-            if !callee_params.at(&cx, s).eq(&cx, Buffer!::new().push_bytes(&cx, cp.ctype).push_static(if cp.place { "*" } else { "" }).save(&cx)) {
+            if !callee_params.at(&cx, s).eq(&cx, Buffer!::new().write(&cx, cp.ctype).put(if cp.place { "*" } else { "" }).save(&cx)) {
                 same = false;
             }
             s = s + 1usize;
@@ -4317,7 +4311,7 @@ impl Backend['k] {
             return false;
         }
         self.lend(&cx, Option::Some.(symbol), args);
-        line(&lines, Buffer!::new().push_static("KUR_MUSTTAIL return ").push_bytes(&cx, symbol).push_static("(").push_bytes(&cx, self.operands(&cx, &lines, args, ArenaVec::new(&cx))).push_static(");"));
+        line(&lines, Buffer!::new().put("KUR_MUSTTAIL return ").write(&cx, symbol).put("(").write(&cx, self.operands(&cx, &lines, args, ArenaVec::new(&cx))).put(");"));
         true
     }
 
@@ -4375,8 +4369,8 @@ impl Backend['k] {
 forall 'k.
 fn wrap(&cx: Domain!['k], expr: Span['k], suffix: Option[Span['k]], ct: Span['k]) -> Span['k] {
     match suffix {
-        Some(s) => Buffer!::new().push_static("kur_dec_i").push_bytes(&cx, s).push_static("(").push_bytes(&cx, expr).push_static(")").save(&cx),
-        None => Buffer!::new().push_static("(").push_bytes(&cx, ct).push_static(")(").push_bytes(&cx, expr).push_static(")").save(&cx),
+        Some(s) => f"kur_dec_i{s}({expr})".write(&cx, Buffer!::new()).save(&cx),
+        None => f"({ct})({expr})".write(&cx, Buffer!::new()).save(&cx),
     }
 }
 
@@ -4438,7 +4432,7 @@ impl Walk['k] {
             let thunk = match self.backend.thunks.get(&cx, symbol) {
                 Some(known) => known,
                 None => {
-                    let made = allocate(&cx, Buffer!::new().push_bytes(&cx, symbol).push_static("_value").save(&cx), self.backend.taken);
+                    let made = allocate(&cx, Buffer!::new().write(&cx, symbol).put("_value").save(&cx), self.backend.taken);
                     self.backend.thunks.insert(&cx, symbol, made);
                     made
                 },
@@ -4447,17 +4441,17 @@ impl Walk['k] {
                 arguments.push(&cx, component);
             }
             arguments.append(&cx, self.values);
-            return Buffer!::new().push_bytes(&cx, thunk).push_static("(").push_bytes(&cx, arguments.join(&cx, ", ")).push_static(")").save(&cx);
+            return Buffer!::new().write(&cx, thunk).put("(").write(&cx, arguments.join(&cx, ", ")).put(")").save(&cx);
         }
         if self.pointer || !self.backend.erased(&cx, given) {
             if self.backend.by_ref.at(&cx, symbol).at(&cx, 0usize) {
-                arguments.push(&cx, Buffer!::new().push_static("&").push_bytes(&cx, component).save(&cx));
+                arguments.push(&cx, Buffer!::new().put("&").write(&cx, component).save(&cx));
             } else {
                 arguments.push(&cx, component);
             }
         }
         arguments.append(&cx, self.caps);
-        Buffer!::new().push_bytes(&cx, symbol).push_static("(").push_bytes(&cx, arguments.join(&cx, ", ")).push_static(")").save(&cx)
+        Buffer!::new().write(&cx, symbol).put("(").write(&cx, arguments.join(&cx, ", ")).put(")").save(&cx)
     }
 }
 
@@ -4562,7 +4556,7 @@ fn rehome(&cx: Domain!['k], homes: ArenaMap[Span['k], Span['k], 'k], arg: Span['
     }
     let local = root(&cx, arg);
     match homes.get(&cx, local) {
-        Some(path) => Buffer!::new().push_bytes(&cx, path).push_bytes(&cx, arg.skip(local.len())).save(&cx),
+        Some(path) => Buffer!::new().write(&cx, path).write(&cx, arg.skip(local.len())).save(&cx),
         None => arg,
     }
 }

@@ -165,9 +165,10 @@ class StdRuntimeTests(unittest.TestCase):
             resource.setrlimit(resource.RLIMIT_AS, (256 << 20, 256 << 20))
         self.expect('''
             use std::buffer::Buffer!;
+            use std::fmt::Writer;
             use std::collections::hashmap::{HashMap!, OwnedMap!};
             use std::collections::vec::{OwnedVec!, Vec!};
-            use std::io::print_buffer;
+            use std::io::print;
             use std::option::Result;
             fn forget(k: u32, v: u32) -> () { () }
             fn main() -> i32 {
@@ -184,7 +185,7 @@ class StdRuntimeTests(unittest.TestCase):
                     Result::Err(e) => "refused",
                 };
                 let buffer = match Buffer!::try_with_capacity(2usize) {
-                    Result::Ok(b) => { var b = b.push_static("abc"); let n = &b.len(); b.destroy(); n },
+                    Result::Ok(b) => { var b = b.put("abc"); let n = &b.len(); b.destroy(); n },
                     Result::Err(e) => 0usize,
                 };
                 let vec = match Vec!::try_new[u64]() {
@@ -215,7 +216,7 @@ class StdRuntimeTests(unittest.TestCase):
                     Result::Ok(m) => { var m = m; let old = &m.insert(1u32, 2u32); let n = &m.len(); m.destroy_with(forget); n },
                     Result::Err(e) => 0usize,
                 };
-                print_buffer(f"{big_buffer} {big_vec} {buffer} {vec} {map} {owned_vec} {owned_map}");
+                print(f"{big_buffer} {big_vec} {buffer} {vec} {map} {owned_vec} {owned_map}");
                 0
             }''', stdout="refused refused 3 1 1 2 1", preexec=limit)
 
@@ -279,9 +280,10 @@ class StdRuntimeTests(unittest.TestCase):
         self.expect('''
             use std::thread;
             use std::buffer::Buffer!;
+            use std::fmt::Writer;
             use std::option::Result;
             fn main() -> i32 {
-                let owned = Buffer!::new().push_static("abc");
+                let owned = Buffer!::new().put("abc");
                 match thread::spawn(|| -> usize { var b = owned; let n = &b.len(); b.destroy(); n }) {
                     Result::Err(failed) => {
                         let (f, error) = failed;
@@ -334,6 +336,7 @@ class StdRuntimeTests(unittest.TestCase):
         self.expect('''
             use std::arena::Domain!;
             use std::buffer::Buffer!;
+            use std::fmt::Writer;
             use std::io::{Error, File!};
             use std::fs::{FileKind, canonicalize, metadata, mkdir, path_exists, read_dir, read_to_arena, remove, rename, write};
             use std::option::{Option, Result};
@@ -343,13 +346,13 @@ class StdRuntimeTests(unittest.TestCase):
                 var cx = cx;
                 let dir = Span::from_static(&cx, "d.dir/");
                 let dir = dir.take(5usize);
-                let a = Buffer!::new().push_static("d.dir/a").save(&cx);
-                let b = Buffer!::new().push_static("d.dir/b").save(&cx);
+                let a = Buffer!::new().put("d.dir/a").save(&cx);
+                let b = Buffer!::new().put("d.dir/b").save(&cx);
                 let none = Error.{ errno: 0i32 };
                 var status = 0i32;
                 if mkdir(&cx, dir).is_err() { status = 1; }
                 if mkdir(&cx, dir).err().unwrap_or(none).errno != 17i32 { status = 2; }
-                if write(&cx, a, Buffer!::new().push_static("abc")).is_err() { status = 3; }
+                if write(&cx, a, Buffer!::new().put("abc")).is_err() { status = 3; }
                 if rename(&cx, a, b).is_err() || path_exists(&cx, a).unwrap_or(true) || !path_exists(&cx, b).unwrap_or(false) { status = 4; }
                 match read_to_arena(&cx, b) {
                     Result::Ok(text) => if !text.is(&cx, "abc") { status = 5; },
@@ -405,7 +408,7 @@ class StdRuntimeTests(unittest.TestCase):
                 if remove(&cx, dir).err().unwrap_or(none).errno != 39i32 { status = 11; }
                 if remove(&cx, b).is_err() || remove(&cx, dir).is_err() || path_exists(&cx, dir).unwrap_or(true) { status = 12; }
                 if metadata(&cx, dir).err().unwrap_or(none).errno != 2i32 { status = 13; }
-                let nul = Buffer!::new().push_static("a").push_byte(0u8).push_static("b").save(&cx);
+                let nul = Buffer!::new().put("a").write_byte(0u8).put("b").save(&cx);
                 if mkdir(&cx, nul).err().unwrap_or(none).errno != 22i32 { status = 14; }
                 cx.destroy();
                 status
@@ -418,13 +421,13 @@ class StdRuntimeTests(unittest.TestCase):
         try:
             self.expect('''
                 use std::env::variable;
-                use std::io::print_buffer;
+                use std::io::print;
                 use std::option::Option;
                 use std::slice::StaticRead;
                 fn main() -> i32 {
                     var sr = StaticRead::new();
                     match variable(&sr, "KURSAL_TEST_VARIABLE") {
-                        Option::Some(value) => { print_buffer(value); },
+                        Option::Some(value) => { print(value); },
                         Option::None => (),
                     }
                     match variable(&sr, "KURSAL_TEST_UNSET_VARIABLE") {
@@ -443,7 +446,8 @@ class StdRuntimeTests(unittest.TestCase):
     def test_args_are_the_entry_parameter(self):
         self.expect('''
             use std::buffer::Buffer!;
-            use std::io::print_buffer;
+            use std::fmt::Writer;
+            use std::io::print;
             use std::option::Option;
             use std::process::Args;
             fn main(args: Args) -> i32 {
@@ -451,12 +455,12 @@ class StdRuntimeTests(unittest.TestCase):
                 var i = 1usize;
                 while i < args.len() {
                     match args.bytes(i) {
-                        Option::Some(arg) => { out = out.push_static(arg).push_static("|"); },
+                        Option::Some(arg) => { out = out.put(arg).put("|"); },
                         Option::None => (),
                     }
                     i = i + 1usize;
                 }
-                print_buffer(out);
+                print(out);
                 if args.bytes(args.len()).is_none() { args.len() as i32 } else { 99 }
             }''', status=4, stdout="one|two words||", args=("one", "two words", ""))
 
@@ -506,36 +510,38 @@ class StdRuntimeTests(unittest.TestCase):
     def test_run_reports_exit_signal_and_spawn_errors(self):
         self.expect('''
             use std::buffer::Buffer!;
+            use std::fmt::Writer;
             use std::fs::write;
-            use std::io::print_buffer;
+            use std::io::print;
             use std::option::Result;
             use std::process::{Command!, Exit};
             use std::slice::StaticRead;
             fn outcome(command: Command!) -> Buffer! {
                 match command.run() {
                     Result::Ok(exit) => match exit {
-                        Exit::Code(c) => Buffer!::new().push_static("code ").push_usize(c as usize),
-                        Exit::Signal(s) => Buffer!::new().push_static("signal ").push_usize(s as usize),
+                        Exit::Code(c) => Buffer!::new().put("code ").put(c),
+                        Exit::Signal(s) => Buffer!::new().put("signal ").put(s),
                     },
-                    Result::Err(e) => Buffer!::new().push_static("errno ").push_usize(e.errno as usize),
+                    Result::Err(e) => Buffer!::new().put("errno ").put(e.errno),
                 }
             }
             fn main() -> i32 {
                 var sr = StaticRead::new();
-                let made = write(&sr, "not-executable", Buffer!::new().push_static("#!/bin/sh"));
-                print_buffer(outcome(Command!::new(&sr, "sh").arg(&sr, "-c").arg(&sr, "exit 7")).push_static(","));
-                print_buffer(outcome(Command!::new(&sr, "sh").arg(&sr, "-c").arg(&sr, "kill -15 $$")).push_static(","));
-                print_buffer(outcome(Command!::new(&sr, "no-such-program-for-kursal")).push_static(","));
-                print_buffer(outcome(Command!::new(&sr, "./not-executable")).push_static(","));
-                print_buffer(outcome(Command!::new(&sr, "true").arg(&sr, "a\\x00b")));
+                let made = write(&sr, "not-executable", Buffer!::new().put("#!/bin/sh"));
+                print(outcome(Command!::new(&sr, "sh").arg(&sr, "-c").arg(&sr, "exit 7")).put(","));
+                print(outcome(Command!::new(&sr, "sh").arg(&sr, "-c").arg(&sr, "kill -15 $$")).put(","));
+                print(outcome(Command!::new(&sr, "no-such-program-for-kursal")).put(","));
+                print(outcome(Command!::new(&sr, "./not-executable")).put(","));
+                print(outcome(Command!::new(&sr, "true").arg(&sr, "a\\x00b")));
                 Command!::new(&sr, "never").arg(&sr, "run").destroy();
                 0
             }''', stdout="code 7,signal 15,errno 2,errno 13,errno 22")
 
     def test_spawned_children_are_polled_and_waited_for(self):
         self.expect('''
-            use std::io::print_buffer;
+            use std::io::print;
             use std::buffer::Buffer!;
+            use std::fmt::Writer;
             use std::option::Result;
             use std::process::{Child!, Command!, Exit, Polled!, available_parallelism, trap};
             use std::slice::StaticRead;
@@ -585,9 +591,9 @@ class StdRuntimeTests(unittest.TestCase):
                     Result::Ok(child) => { let ended = child.wait(); 0usize },
                     Result::Err(e) => e.errno as usize,
                 };
-                print_buffer(Buffer!::new().push_usize(slow_code).push_static(",").push_usize(quick_code).push_static(",")
-                    .push_usize(missing).push_static(if polls > 1usize { ",polled" } else { ",ended at once" })
-                    .push_static(if available_parallelism() > 0usize { ",cpus" } else { ",none" }));
+                print(Buffer!::new().put(slow_code).put(",").put(quick_code).put(",")
+                    .put(missing).put(if polls > 1usize { ",polled" } else { ",ended at once" })
+                    .put(if available_parallelism() > 0usize { ",cpus" } else { ",none" }));
                 0
             }''', stdout="3,4,2,polled,cpus")
 
@@ -596,7 +602,7 @@ class StdRuntimeTests(unittest.TestCase):
         # while this process would wait on the other: both are read as they come.
         self.expect('''
             use std::buffer::Buffer!;
-            use std::io::print_buffer;
+            use std::io::print;
             use std::option::Result;
             use std::process::{Captured!, Command!, Exit};
             use std::slice::StaticRead;
@@ -613,7 +619,7 @@ class StdRuntimeTests(unittest.TestCase):
                         let sizes = f"{code} {out} {err} {success}";
                         stdout.destroy();
                         stderr.destroy();
-                        print_buffer(sizes);
+                        print(sizes);
                         0
                     },
                     Result::Err(e) => 1,
@@ -623,8 +629,9 @@ class StdRuntimeTests(unittest.TestCase):
     def test_commands_take_their_streams_environment_and_directory(self):
         self.expect('''
             use std::buffer::Buffer!;
+            use std::fmt::Writer;
             use std::fs::{mkdir, write};
-            use std::io::{File!, print_buffer};
+            use std::io::{File!, print};
             use std::option::{Option, Result};
             use std::process::{Captured!, Command!, Exit, Stdio!};
             use std::slice::StaticRead;
@@ -633,25 +640,25 @@ class StdRuntimeTests(unittest.TestCase):
                 match command.output() {
                     Result::Ok(captured) => {
                         let { exit, stdout, stderr } = captured;
-                        stdout.push_static("|").push_buffer(stderr)
+                        stdout.put("|").put(stderr)
                     },
                     Result::Err(e) => f"error {e.errno}",
                 }
             }
             fn main() -> i32 {
                 var sr = StaticRead::new();
-                let made = write(&sr, "input.txt", Buffer!::new().push_static("from a file"));
+                let made = write(&sr, "input.txt", Buffer!::new().put("from a file"));
                 let dir = mkdir(&sr, "sub");
-                let marked = write(&sr, "sub/marker", Buffer!::new().push_static("here"));
+                let marked = write(&sr, "sub/marker", Buffer!::new().put("here"));
                 let sh = "sh";
                 var out = run(Command!::new(&sr, sh).arg(&sr, "-c").arg(&sr, "printf %s \\"$KURSAL_A$KURSAL_B\\"; printf e >&2")
                     .env(&sr, "KURSAL_A", "set").env(&sr, "KURSAL_B", "gone").env_remove(&sr, "KURSAL_B"));
-                out = out.push_static(",").push_buffer(run(Command!::new(&sr, "/usr/bin/env").env_clear().env(&sr, "ONLY", "1")));
-                out = out.push_static(",").push_buffer(run(Command!::new(&sr, "cat").arg(&sr, "marker").current_dir(&sr, "sub")));
+                out = out.put(",").put(run(Command!::new(&sr, "/usr/bin/env").env_clear().env(&sr, "ONLY", "1")));
+                out = out.put(",").put(run(Command!::new(&sr, "cat").arg(&sr, "marker").current_dir(&sr, "sub")));
                 let input = match File!::open_read(&sr, "input.txt") { Result::Ok(f) => Stdio!::File.(f), Result::Err(e) => Stdio!::Null };
-                out = out.push_static(",").push_buffer(run(Command!::new(&sr, "cat").stdin(input)));
-                out = out.push_static(",").push_buffer(run(Command!::new(&sr, "cat").stdin(Stdio!::Null)));
-                out = out.push_static(",").push_buffer(match Command!::new(&sr, sh).arg(&sr, "-c").arg(&sr, "echo hidden").stdout(Stdio!::Null).spawn() {
+                out = out.put(",").put(run(Command!::new(&sr, "cat").stdin(input)));
+                out = out.put(",").put(run(Command!::new(&sr, "cat").stdin(Stdio!::Null)));
+                out = out.put(",").put(match Command!::new(&sr, sh).arg(&sr, "-c").arg(&sr, "echo hidden").stdout(Stdio!::Null).spawn() {
                     Result::Ok(child) => {
                         var child = child;
                         let held = match &child.take_stdout() {
@@ -659,12 +666,12 @@ class StdRuntimeTests(unittest.TestCase):
                             Option::None => "null",
                         };
                         let ended = child.wait();
-                        Buffer!::new().push_static(held)
+                        Buffer!::new().put(held)
                     },
                     Result::Err(e) => Buffer!::new(),
                 });
-                out = out.push_static(",").push_buffer(run(Command!::new(&sr, "true").env(&sr, "A=B", "x")));
-                out = out.push_static(",").push_buffer(run(Command!::new(&sr, "true").current_dir(&sr, "no-such-directory")));
+                out = out.put(",").put(run(Command!::new(&sr, "true").env(&sr, "A=B", "x")));
+                out = out.put(",").put(run(Command!::new(&sr, "true").current_dir(&sr, "no-such-directory")));
                 // Into a pipe and out of another: the child reads to the end once this process closes its end.
                 match Command!::new(&sr, "tr").arg(&sr, "a-z").arg(&sr, "A-Z").stdin(Stdio!::Pipe).stdout(Stdio!::Pipe).spawn() {
                     Result::Ok(child) => {
@@ -687,17 +694,17 @@ class StdRuntimeTests(unittest.TestCase):
                             Option::None => (),
                         }
                         let ended = child.wait();
-                        out = out.push_static(",").push_buffer(piped);
+                        out = out.put(",").put(piped);
                     },
                     Result::Err(e) => (),
                 }
-                print_buffer(out);
+                print(out);
                 0
             }''', stdout="set|e,ONLY=1\n|,here|,from a file|,|,null,error 22,error 2,PIPED")
 
     def test_children_are_killed_and_signalled(self):
         self.expect('''
-            use std::io::print_buffer;
+            use std::io::print;
             use std::option::Result;
             use std::process::{Command!, Exit, Polled!};
             use std::slice::StaticRead;
@@ -728,13 +735,13 @@ class StdRuntimeTests(unittest.TestCase):
                     },
                     Result::Err(e) => 0i32,
                 };
-                print_buffer(f"{killed} {terminated}");
+                print(f"{killed} {terminated}");
                 0
             }''', stdout="109 115")
 
     def test_errors_describe_themselves(self):
         self.expect('''
-            use std::io::{Error, ErrorKind, File!, print_buffer};
+            use std::io::{Error, ErrorKind, File!, print};
             use std::option::Result;
             use std::slice::StaticRead;
             fn found(e: Error) -> bool { match e.kind() { ErrorKind::NotFound => true, _ => false } }
@@ -750,7 +757,7 @@ class StdRuntimeTests(unittest.TestCase):
                             && other(Error.{ errno: 9999i32 });
                         var message = e.message();
                         let n = &message.len();
-                        print_buffer(f"{e}; {n} {kinds}");
+                        print(f"{e}; {n} {kinds}");
                         message.destroy();
                         0
                     },
@@ -801,12 +808,12 @@ class StdRuntimeTests(unittest.TestCase):
         started = time.monotonic_ns()
         result = self.run_program('''
             use std::time::{Duration, Instant, sleep};
-            use std::io::print_buffer;
+            use std::io::print;
             fn main() -> i32 {
                 let start = Instant::now();
                 sleep(Duration::from_millis(30u64));
                 let elapsed = Instant::now().since(start).as_nanos();
-                let printed = print_buffer(f"{elapsed}");
+                let printed = print(f"{elapsed}");
                 0
             }''')
         whole = time.monotonic_ns() - started
@@ -854,8 +861,9 @@ class StdRuntimeTests(unittest.TestCase):
         text = "line\n" * 20000
         self.expect('''
             use std::buffer::Buffer!;
+            use std::fmt::Writer;
             use std::fs::{read, write};
-            use std::io::{Error, File!, print_buffer};
+            use std::io::{Error, File!, print};
             use std::option::Result;
             use std::slice::StaticRead;
             fn length(r: Result[Buffer!, Error]) -> i32 {
@@ -868,7 +876,7 @@ class StdRuntimeTests(unittest.TestCase):
                 var sr = StaticRead::new();
                 let none = length(read(&sr, "/dev/null"));
                 let directory = length(read(&sr, "."));
-                let written = write(&sr, "file.txt", Buffer!::new().push_static("12345")).is_ok();
+                let written = write(&sr, "file.txt", Buffer!::new().put("12345")).is_ok();
                 let regular = length(read(&sr, "file.txt"));
                 let piped = match File!::open_read(&sr, "/dev/stdin") {
                     Result::Ok(file) => {
@@ -879,7 +887,7 @@ class StdRuntimeTests(unittest.TestCase):
                     },
                     Result::Err(e) => 0i32 - e.errno,
                 };
-                let printed = print_buffer(f"{none} {directory} {regular} {piped}");
+                let printed = print(f"{none} {directory} {regular} {piped}");
                 if written { 0 } else { 1 }
             }''', stdout=f"0 -21 5 {len(text)}", stdin=text)
 
@@ -917,13 +925,14 @@ class StdRuntimeTests(unittest.TestCase):
         # a short read, fewer only at the end; a directory is EISDIR, and the buffer stays as it was.
         self.expect('''
             use std::buffer::Buffer!;
+            use std::fmt::Writer;
             use std::fs::write;
-            use std::io::{File!, print_buffer};
+            use std::io::{File!, print};
             use std::option::Result;
             use std::slice::StaticRead;
             fn main() -> i32 {
                 var sr = StaticRead::new();
-                let made = write(&sr, "chunks.txt", Buffer!::new().push_static("abcdefgh"));
+                let made = write(&sr, "chunks.txt", Buffer!::new().put("abcdefgh"));
                 var file = match File!::open_read(&sr, "chunks.txt") { Result::Ok(f) => f, Result::Err(e) => { return 1; } };
                 var text = Buffer!::with_capacity(0usize);
                 let first = (&file.read(&text, 3usize)).unwrap_or(9usize);
@@ -943,7 +952,7 @@ class StdRuntimeTests(unittest.TestCase):
                         }
                     },
                 };
-                print_buffer(f"{first} {none} {rest} {end} {failed} ".push_buffer(text));
+                print(f"{first} {none} {rest} {end} {failed} ".put(text));
                 0
             }''', stdout="3 0 5 0 21 abcdefgh")
 
@@ -972,7 +981,8 @@ class StdRuntimeTests(unittest.TestCase):
         result = self.run_program('''
             use std::arena::Domain!;
             use std::buffer::Buffer!;
-            use std::io::{eprint, eprint_buffer, eprint_bytes, eprint_span, print, print_buffer, print_bytes, print_span};
+            use std::fmt::Writer;
+            use std::io::{eprint, stderr, print, stdout};
             use std::raw::Span;
             use std::slice::StaticRead;
             fn main() {
@@ -980,16 +990,138 @@ class StdRuntimeTests(unittest.TestCase):
                 var exists 'k. cx = Domain!::new(std::process::hash_seed());
                 var cx = cx;
                 print("a");
-                print_bytes(&read, "b");
-                print_buffer(Buffer!::new().push_static("c"));
-                print_span(&cx, Span::from_static(&cx, "d"));
+                stdout().write(&read, "b").finish();
+                print(Buffer!::new().put("c"));
+                stdout().write(&cx, Span::from_static(&cx, "d")).finish();
                 eprint("A");
-                eprint_bytes(&read, "B");
-                eprint_buffer(Buffer!::new().push_static("C"));
-                eprint_span(&cx, Span::from_static(&cx, "D"));
+                stderr().write(&read, "B").finish();
+                eprint(Buffer!::new().put("C"));
+                stderr().write(&cx, Span::from_static(&cx, "D")).finish();
                 cx.destroy();
             }''')
         self.assertEqual((result.stdout, result.stderr, result.returncode), ("abcd", "ABCD", 0))
+
+    def test_print_and_put_take_every_printable_type(self):
+        # Each instance of `Printable`, printed to stdout by `print` and put into a buffer by `put`.
+        self.expect('''
+            use std::buffer::Buffer!;
+            use std::fmt::Writer;
+            use std::io::{Error, File!, print};
+            use std::option::Result;
+            use std::slice::StaticRead;
+            fn error() -> Error {
+                var sr = StaticRead::new();
+                match File!::open_read(&sr, "/nonexistent/kursal") {
+                    Result::Ok(f) => {
+                        let closed = f.close();
+                        Error::io()
+                    },
+                    Result::Err(e) => e,
+                }
+            }
+            fn main() {
+                print("str ");
+                print(1u8); print(" "); print(2u16); print(" "); print(3u32); print(" "); print(4u64); print(" ");
+                print(5usize); print(" "); print(-6i8); print(" "); print(-7i16); print(" "); print(-8i32); print(" ");
+                print(-9i64); print(" "); print(-10isize); print(" "); print(0.1f32); print(" "); print(2.5f64); print(" ");
+                print(true); print(" "); print(Buffer!::new().put("buf")); print(" "); print(error()); print("\n");
+                print(Buffer!::new().put("str ").put(1u8).put(" ").put(2u16).put(" ").put(3u32).put(" ").put(4u64).put(" ")
+                    .put(5usize).put(" ").put(-6i8).put(" ").put(-7i16).put(" ").put(-8i32).put(" ").put(-9i64).put(" ")
+                    .put(-10isize).put(" ").put(0.1f32).put(" ").put(2.5f64).put(" ").put(false).put(" ")
+                    .put(Buffer!::new().put("buf")).put(" ").put(error()).put("\n"));
+            }''', stdout="str 1 2 3 4 5 -6 -7 -8 -9 -10 0.1 2.5 true buf No such file or directory (error 2)\n"
+                         "str 1 2 3 4 5 -6 -7 -8 -9 -10 0.1 2.5 false buf No such file or directory (error 2)\n")
+
+    def test_every_writer_takes_put_and_write(self):
+        # `put` and `write`, the methods of every writer, on each writer of the library.
+        self.expect('''
+            use std::arena::Domain!;
+            use std::buffer::Buffer!;
+            use std::fmt::{CountingWriter, FixedWriter!, ReadingWriter!, Writer};
+            use std::io::{print, stdout};
+            use std::option::Result;
+            use std::raw::Span;
+            use std::slice::StaticRead;
+            fn main() -> i32 {
+                var sr = StaticRead::new();
+                var exists 'k. cx = Domain!::new(std::process::hash_seed());
+                var cx = cx;
+                let word = Span::from_static(&cx, "span");
+                let printed = stdout().put("output ").put(1u8).put(" ").write(&cx, word).put("\n").finish();
+                print(Buffer!::new().put("buffer ").put(2u16).put(" ").write(&sr, "static").put("\n"));
+                let (fixed, status) = FixedWriter!::new(9usize).put("fixed ").put(345u32).write(&sr, "dropped").finish();
+                let full = match status {
+                    Result::Ok(nothing) => false,
+                    Result::Err(e) => true,
+                };
+                print(fixed.put("\n"));
+                let { count } = CountingWriter::new().put("count ").put(-12i32).write(&sr, "xyz");
+                let (out, cx) = ReadingWriter!::new(Buffer!::new(), cx).put("reading ").put(true).put(" ").write(&sr, "x").finish();
+                var cx = cx;
+                print(out.put(" ").write(&cx, word).put("\n"));
+                cx.destroy();
+                if printed.is_ok() && full && count == 12usize { 0 } else { 1 }
+            }''', stdout="output 1 span\nbuffer 2 static\nfixed 345\nreading true x span\n")
+
+    def test_a_static_placeholder_is_written_as_text_is(self):
+        # No `Format` instance takes a `Str['static]`: an f-string writes one with `write_static`, as it writes
+        # its literal text, here into writers a generic function knows only by `Writer`, and lent.
+        self.expect('''
+            use std::buffer::Buffer!;
+            use std::fmt::{Format, Writer};
+            use std::io::print;
+            use std::slice::Str;
+            forall W where Writer[W].
+            fn label(out: W, name: Str['static]) -> W {
+                let open = "<";
+                f"{open}{name}>".write(out)
+            }
+            forall T, W where Format[T, W], Writer[W], Copy[T].
+            fn twice(out: W, x: T) -> W {
+                let sep: Str['static] = ", ";
+                f" {x}{sep}{x}".write(out)
+            }
+            fn main() {
+                var lent = " lent";
+                let out = twice(label(Buffer!::new(), "tag"), 7u32);
+                print(f"{&lent}\n".write(out));
+            }''', stdout="<tag> 7, 7 lent\n")
+
+    def test_a_static_slice_has_no_format_instance(self):
+        self.reject('''
+            use std::buffer::Buffer!;
+            use std::fmt::{Format, Writer};
+            forall T, W where Format[T, W], Writer[W], Copy[T].
+            fn show(out: W, x: T) -> W {
+                f"{x}".write(out)
+            }
+            fn main() {
+                show(Buffer!::new(), "text").destroy();
+            }''', r"Format\[Slice\[u8, 'static\], Buffer!\]")
+
+    def test_a_branded_slice_formats_through_the_lent_context(self):
+        # `Format[Slice[u8, 'r], ReadingWriter![W, C]]`: a borrowed byte view reads through the capability
+        # `.write(&cx, out)` lends, an open buffer's `Exclusive!` or a domain, beside the domain's spans.
+        self.expect('''
+            use std::arena::Domain!;
+            use std::buffer::Buffer!;
+            use std::fmt::Writer;
+            use std::io::print;
+            use std::raw::Span;
+            fn main() {
+                var exists 'b. (tag, digits, restore) = Buffer!::new().put(42u32).open();
+                var text = f"[{digits}]".write(&tag, Buffer!::new());
+                restore.restore(tag).destroy();
+                var exists 'k. cx = Domain!::new(std::process::hash_seed());
+                var { tag: t, arena } = cx;
+                let zs = &arena.alloc_slice(&t, 3usize, b'z');
+                var cx = Domain!.{ tag: t, arena };
+                let sp = Span::from_static(&cx, "span");
+                let line = f"{&text} {zs} {sp}\n".write(&cx, Buffer!::new());
+                text.destroy();
+                print(line);
+                cx.destroy();
+            }''', stdout="[42] zzz span\n")
 
     def test_print_reports_a_failed_write(self):
         with open("/dev/full", "w") as full:
@@ -1083,8 +1215,9 @@ class StdRuntimeTests(unittest.TestCase):
 
     def test_read_line_tells_an_empty_line_from_the_end(self):
         self.expect('''
-            use std::io::{read_line, print_buffer};
+            use std::io::{read_line, print};
             use std::buffer::Buffer!;
+            use std::fmt::Writer;
             use std::option::{Option, Result};
             fn main() -> i32 {
                 var lines = 0i32;
@@ -1098,7 +1231,7 @@ class StdRuntimeTests(unittest.TestCase):
                             },
                             Option::Some(text) => {
                                 lines = lines + 1i32;
-                                print_buffer(Buffer!::new().push_byte(b'[').push_buffer(text).push_byte(b']'));
+                                print(Buffer!::new().write_byte(b'[').put(text).write_byte(b']'));
                             },
                         },
                     }
@@ -1112,16 +1245,17 @@ class StdRuntimeTests(unittest.TestCase):
         # and `finish` hands back what was read ahead and not returned, and standard input with it.
         self.expect('''
             use std::buffer::Buffer!;
-            use std::io::{Error, Input!, print_buffer, read_all_stdin, read_line, stdin};
+            use std::fmt::Writer;
+            use std::io::{Error, Input!, print, read_all_stdin, read_line, stdin};
             use std::process::trap;
             use std::option::{Option, Result};
             fn shown(&out: Buffer!, line: Result[Option[Buffer!], Error]) {
                 out = match line {
                     Result::Ok(found) => match found {
-                        Option::Some(text) => out.push_byte(b'[').push_buffer(text).push_byte(b']'),
-                        Option::None => out.push_static("end"),
+                        Option::Some(text) => out.write_byte(b'[').put(text).write_byte(b']'),
+                        Option::None => out.put("end"),
                     },
-                    Result::Err(e) => out.push_static("error ").push_i64(e.errno as i64),
+                    Result::Err(e) => out.put("error ").put(e.errno),
                 };
             }
             fn errno(r: Result[Input!, Error]) -> i32 {
@@ -1143,7 +1277,7 @@ class StdRuntimeTests(unittest.TestCase):
                 };
                 shown(&out, &input.read_line());
                 let ahead = input.finish();
-                out = out.push_static(" ahead ").push_buffer(ahead);
+                out = out.put(" ahead ").put(ahead);
                 var second = match stdin() { Result::Ok(i) => i, Result::Err(e) => trap(), };
                 shown(&out, &second.read_line());
                 second.finish().destroy();
@@ -1151,7 +1285,7 @@ class StdRuntimeTests(unittest.TestCase):
                 let none = match &third.read_to_end() { Result::Ok(text) => { var text = text; let n = &text.len(); text.destroy(); n }, Result::Err(e) => 9usize };
                 shown(&out, &third.read_line());
                 third.finish().destroy();
-                let printed = print_buffer(out);
+                let printed = print(out);
                 if again == 16i32 && all_busy && none == 0usize { 0 } else { 4 }
             }''', stdout="[a][]error 16[b] ahead c\nlastendend", stdin="a\n\nb\nc\nlast")
 
@@ -1209,13 +1343,14 @@ class StdRuntimeTests(unittest.TestCase):
     def test_a_zero_capacity_buffer_grows(self):
         self.expect('''
             use std::buffer::Buffer!;
+            use std::fmt::Writer;
             fn main() -> i32 {
-                var b = Buffer!::with_capacity(0usize).push_byte(b'a').push_static("bc");
+                var b = Buffer!::with_capacity(0usize).write_byte(b'a').put("bc");
                 let n = &b.len();
                 b.destroy();
                 var z = Buffer!::new_zeroed(0usize);
                 var c = &z.clone();
-                var c = c.push_byte(b'x');
+                var c = c.write_byte(b'x');
                 let m = &c.len();
                 z.destroy();
                 c.destroy();
@@ -1347,6 +1482,7 @@ class StdRuntimeTests(unittest.TestCase):
             use std::arena::Domain!;
             use std::collections::list::List;
             use std::buffer::Buffer!;
+            use std::fmt::Writer;
             use std::cursor::Cursor;
             use std::option::Result;
             fn is_a(b: u8) -> bool { b == b'a' }
@@ -1375,7 +1511,7 @@ class StdRuntimeTests(unittest.TestCase):
                 var b = Buffer!::new();
                 var j = 0usize;
                 while j < 1000000usize {
-                    b = b.push_byte(b'a');
+                    b = b.write_byte(b'a');
                     j = j + 1usize;
                 }
                 var exists 't. (tag, bytes, restore) = b.open();
@@ -1468,11 +1604,12 @@ class StdRuntimeTests(unittest.TestCase):
         use std::option::{Option, Result};
         use std::raw::Span;
         use std::buffer::Buffer!;
+        use std::fmt::Writer;
         fn main() -> i32 {
             let a = Option::Some.(3u32).unwrap();
             let r: Result[u32, u32] = Result::Ok.(4u32);
             let b = r.unwrap();
-            var exists 'b. (tag, bytes, restore) = Buffer!::new().push_static("pq").open();
+            var exists 'b. (tag, bytes, restore) = Buffer!::new().put("pq").open();
             let c = bytes.at(&tag, 0usize);
             let (p, n, m) = bytes.into_parts();
             let text = unsafe Span::from_raw_parts(&tag, p, n);
@@ -1508,6 +1645,7 @@ class StdRuntimeTests(unittest.TestCase):
             use std::slice::{Slice, StaticRead};
             use std::utf8::{encode, validate, width};
             use std::buffer::Buffer!;
+            use std::fmt::Writer;
             use std::array::Array!;
             fn main() -> i32 {
                 var a = 1u32;
@@ -1529,8 +1667,8 @@ class StdRuntimeTests(unittest.TestCase):
                 let (x, y, same) = Eq[(u32, u64), (u32, u64)]::eq((1u32, 2u64), (1u32, 2u64));
                 let (x2, y2, diff) = Eq[(u32, u32, u32), (u32, u32, u32)]::eq((1u32, 2u32, 3u32), (1u32, 2u32, 4u32));
                 let tuples = same && !diff && h1.finish() == h2.finish();
-                let good = Buffer!::new().push_byte(104u8).push_byte(195u8).push_byte(169u8);
-                let bad = Buffer!::new().push_byte(237u8).push_byte(160u8).push_byte(128u8);
+                let good = Buffer!::new().write_byte(104u8).write_byte(195u8).write_byte(169u8);
+                let bad = Buffer!::new().write_byte(237u8).write_byte(160u8).write_byte(128u8);
                 var exists 'g. (gt, gs, gr) = good.open();
                 var exists 'b. (bt, bs, br) = bad.open();
                 var text = encode(encode(encode(Buffer!::new(), 233u32), 128512u32), 55296u32);
@@ -1560,6 +1698,7 @@ class StdRuntimeTests(unittest.TestCase):
             use std::collections::list::List;
             use std::fmt::ReadingWriter!;
             use std::buffer::Buffer!;
+            use std::fmt::Writer;
             use std::raw::Span;
             use std::slice::Slice;
             forall 'k.
@@ -1624,9 +1763,10 @@ class StdRuntimeTests(unittest.TestCase):
         # a byte slice's bytes through their read methods; the writer comes back once the tree is joined.
         self.expect('''
             use std::buffer::Buffer!;
+            use std::fmt::Writer;
             use std::raw::Span;
             fn main() -> i32 {
-                var exists 'b. (tag, bytes, restore) = Buffer!::new().push_static("  key=value \\n").open();
+                var exists 'b. (tag, bytes, restore) = Buffer!::new().put("  key=value \\n").open();
                 let exists 'q. (root, back) = tag.share();
                 var exists 'l, 'r. (left, right, join) = root.split();
                 let second = match bytes.get_ref(2usize) {
@@ -1654,8 +1794,9 @@ class StdRuntimeTests(unittest.TestCase):
     def test_readers_of_a_shared_tree_cannot_write(self):
         self.reject('''
             use std::buffer::Buffer!;
+            use std::fmt::Writer;
             fn main() -> i32 {
-                let exists 'b. (tag, bytes, restore) = Buffer!::new().push_static("ab").open();
+                let exists 'b. (tag, bytes, restore) = Buffer!::new().put("ab").open();
                 var exists 'q. (root, back) = tag.share();
                 match bytes.get_ref(0usize) {
                     std::option::Option::Some(at) => at.set(&root, b'#'),
@@ -1668,12 +1809,13 @@ class StdRuntimeTests(unittest.TestCase):
     def test_byte_slices_and_spans_of_the_same_bytes_hash_alike(self):
         self.expect('''
             use std::buffer::Buffer!;
+            use std::fmt::Writer;
             use std::raw::Span;
             use std::hash::{HashIn, HashState, key_hash};
             use std::cap::Exclusive!;
             use std::slice::{Slice, StaticRead};
             fn main() -> i32 {
-                var exists 'b. (tag, bytes, restore) = Buffer!::new().push_static("name").open();
+                var exists 'b. (tag, bytes, restore) = Buffer!::new().put("name").open();
                 let span = Span::from_slice(bytes);
                 var sr = StaticRead::new();
                 let literal: Slice[u8, 'static] = "name";
@@ -1733,7 +1875,7 @@ class StdRuntimeTests(unittest.TestCase):
                     var key = Buffer!::new();
                     var bit = 0usize;
                     while bit < 12usize {
-                        key = if (i >> bit) % 2usize == 0usize { key.push_static("aB") } else { key.push_static("b!") };
+                        key = if (i >> bit) % 2usize == 0usize { key.put("aB") } else { key.put("b!") };
                         bit = bit + 1usize;
                     }
                     var exists 'k. (tag, bytes, restore) = key.open();
@@ -1947,6 +2089,7 @@ class StdRuntimeTests(unittest.TestCase):
         self.expect('''
             use std::collections::hashmap::OwnedMap!;
             use std::buffer::Buffer!;
+            use std::fmt::Writer;
             use std::cap::Exclusive!;
             use std::slice::{Readable, Slice};
             use std::ascii::word_at;
@@ -1958,7 +2101,7 @@ class StdRuntimeTests(unittest.TestCase):
                 let { cap, bytes } = probe;
                 tag = cap;
                 if bumped.is_none() {
-                    match &m.insert(Buffer!::new().push_bytes(&tag, word), 1u64) {
+                    match &m.insert(Buffer!::new().write(&tag, word), 1u64) {
                         Option::Some(old) => { let (k, v) = old; k.destroy(); },
                         Option::None => (),
                     }
@@ -1967,7 +2110,7 @@ class StdRuntimeTests(unittest.TestCase):
             fn drop_entry(k: Buffer!, v: u64) { k.destroy(); }
             fn main() -> i32 {
                 var m = OwnedMap!::new[Buffer!, u64](std::process::hash_seed());
-                var exists 'b. (tag, text, restore) = Buffer!::new().push_static("to be or not to be again").open();
+                var exists 'b. (tag, text, restore) = Buffer!::new().put("to be or not to be again").open();
                 var tag = tag;
                 var at = 0usize;
                 var words = 0usize;
@@ -1994,7 +2137,7 @@ class StdRuntimeTests(unittest.TestCase):
                 var shown = Buffer!::new();
                 &m.each_in(&shown, |&word, &n, &out| {
                     if n > 103u64 {
-                        out = out.push_buffer(&word.clone()).push_static("=").push_u64(n);
+                        out = out.put(&word.clone()).put("=").put(n);
                     }
                 });
                 let before = &m.len();
@@ -2037,8 +2180,9 @@ class StdRuntimeTests(unittest.TestCase):
         self.expect('''
             use std::collections::vec::{OwnedVec!, Vec!};
             use std::buffer::Buffer!;
+            use std::fmt::Writer;
             use std::option::Option;
-            fn label(n: u64) -> Buffer! { Buffer!::new().push_u64(n) }
+            fn label(n: u64) -> Buffer! { Buffer!::new().put(n) }
             fn drop(b: Buffer!) { b.destroy(); }
             fn main() -> i32 {
                 var v = OwnedVec!::new[Buffer!]();
@@ -2059,7 +2203,7 @@ class StdRuntimeTests(unittest.TestCase):
                 var shown = Buffer!::new();
                 while !&v.is_empty() {
                     match &v.pop() {
-                        Option::Some(b) => { shown = shown.push_buffer(b); },
+                        Option::Some(b) => { shown = shown.put(b); },
                         Option::None => (),
                     }
                 }
@@ -2192,6 +2336,7 @@ class StdRuntimeTests(unittest.TestCase):
         self.expect('''
             use std::arena::Domain!;
             use std::collections::arena_vec::ArenaVec;
+            use std::fmt::Writer;
             forall 'k.
             fn check(&cx: Domain!['k]) -> bool {
                 let v: ArenaVec[u8, 'k] = ArenaVec::new(&cx);
@@ -2266,8 +2411,9 @@ class StdRuntimeTests(unittest.TestCase):
     def test_buffers_truncate_and_clear(self):
         self.expect('''
             use std::buffer::Buffer!;
+            use std::fmt::Writer;
             fn main() -> i32 {
-                var b = Buffer!::new().push_static("hello").truncate(2usize).push_static("y");
+                var b = Buffer!::new().put("hello").truncate(2usize).put("y");
                 let n = &b.len();
                 var b = b.truncate(10usize);
                 let m = &b.len();

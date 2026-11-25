@@ -7,6 +7,7 @@ use std::collections::arena_map::ArenaSet;
 use std::raw::Span;
 use std::arena::{Domain!, concat};
 use std::buffer::Buffer!;
+use std::fmt::Writer;
 use package::kurs::core::{Binding, Edge, ExposureMode, Fun, Instr, Kind, Member, ModuleId, Param, Premise, Program, Terminator, Type};
 use package::kurs::core as C;
 use package::kurs::sexpr::Form;
@@ -17,7 +18,7 @@ use std::slice::Slice;
 
 forall 'k.
 fn brand(&cx: Domain!['k], name: Span['k]) -> Span['k] {
-    Buffer!::new().push_static("'").push_bytes(&cx, name).save(&cx)
+    Buffer!::new().put("'").write(&cx, name).save(&cx)
 }
 
 fn is_brand(kind: Kind) -> bool {
@@ -44,7 +45,7 @@ fn indentation(&cx: Domain!['k], depth: usize) -> Span['k] {
     var out = Buffer!::new();
     var i = 0usize;
     while i < depth {
-        out = out.push_static("    ");
+        out = out.put("    ");
         i = i + 1usize;
     }
     out.save(&cx)
@@ -66,13 +67,13 @@ fn arguments(&cx: Domain!['k], types: ArenaVec[Type['k], 'k], depth: usize) -> S
     if types.is_empty(&cx) {
         Span::from_static(&cx, "")
     } else {
-        Buffer!::new().push_static("[").push_bytes(&cx, type_texts(&cx, types, depth).join(&cx, ", ")).push_static("]").save(&cx)
+        Buffer!::new().put("[").write(&cx, type_texts(&cx, types, depth).join(&cx, ", ")).put("]").save(&cx)
     }
 }
 
 forall 'k.
 fn premise_text(&cx: Domain!['k], premise: Premise['k]) -> Span['k] {
-    Buffer!::new().push_bytes(&cx, premise.trait_name).push_static("[").push_bytes(&cx, type_texts(&cx, premise.args, 0usize).join(&cx, ", ")).push_static("]").save(&cx)
+    Buffer!::new().write(&cx, premise.trait_name).put("[").write(&cx, type_texts(&cx, premise.args, 0usize).join(&cx, ", ")).put("]").save(&cx)
 }
 
 forall 'k.
@@ -84,7 +85,7 @@ fn quantifier(&cx: Domain!['k], params: ArenaVec[Param['k], 'k], premises: Arena
         let param = params.at(&cx, i);
         names.push(&cx, if is_brand(param.kind) { brand(&cx, param.name) } else { param.name });
         if is_copy(param.kind) {
-            bounds.push(&cx, Buffer!::new().push_static("Copy[").push_bytes(&cx, param.name).push_static("]").save(&cx));
+            bounds.push(&cx, f"Copy[{param.name}]".write(&cx, Buffer!::new()).save(&cx));
         }
         i = i + 1usize;
     }
@@ -96,11 +97,11 @@ fn quantifier(&cx: Domain!['k], params: ArenaVec[Param['k], 'k], premises: Arena
     if names.is_empty(&cx) && bounds.is_empty(&cx) {
         return Span::from_static(&cx, "");
     }
-    var out = Buffer!::new().push_static("forall ").push_bytes(&cx, names.join(&cx, ", "));
+    var out = Buffer!::new().put("forall ").write(&cx, names.join(&cx, ", "));
     if !bounds.is_empty(&cx) {
-        out = out.push_static(" where ").push_bytes(&cx, bounds.join(&cx, ", "));
+        out = out.put(" where ").write(&cx, bounds.join(&cx, ", "));
     }
-    out.push_static(". ").save(&cx)
+    out.put(". ").save(&cx)
 }
 
 forall 'k.
@@ -116,16 +117,16 @@ fn is_binder_type(t: Type['k]) -> bool {
 forall 'k.
 fn members_text(&cx: Domain!['k], kind: Slice[u8, 'static], members: ArenaVec[Member['k], 'k], depth: usize) -> Span['k] {
     if members.is_empty(&cx) {
-        return Buffer!::new().push_static(kind).push_static(" {}").save(&cx);
+        return Buffer!::new().put(kind).put(" {}").save(&cx);
     }
     let rows: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
     var i = 0usize;
     while i < members.len(&cx) {
-        rows.push(&cx, Buffer!::new().push_bytes(&cx, indentation(&cx, depth + 1usize)).push_bytes(&cx, members.at(&cx, i).name).push_static(": ")
-            .push_bytes(&cx, type_text(&cx, members.at(&cx, i).ty, depth + 1usize)).push_static(";").save(&cx));
+        rows.push(&cx, Buffer!::new().write(&cx, indentation(&cx, depth + 1usize)).write(&cx, members.at(&cx, i).name).put(": ")
+            .write(&cx, type_text(&cx, members.at(&cx, i).ty, depth + 1usize)).put(";").save(&cx));
         i = i + 1usize;
     }
-    Buffer!::new().push_static(kind).push_static(" {\n").push_bytes(&cx, rows.join(&cx, "\n")).push_static("\n").push_bytes(&cx, indentation(&cx, depth)).push_static("}").save(&cx)
+    Buffer!::new().put(kind).put(" {\n").write(&cx, rows.join(&cx, "\n")).put("\n").write(&cx, indentation(&cx, depth)).put("}").save(&cx)
 }
 
 forall 'k.
@@ -135,34 +136,34 @@ fn type_text(&cx: Domain!['k], ty: Type['k], depth: usize) -> Span['k] {
         Named(name, args) => if args.is_empty(&cx) { name } else { concat(&cx, name, arguments(&cx, args, depth)) },
         Never => Span::from_static(&cx, "Never"),
         Skolem(label) => brand(&cx, label),
-        Brand(witness) => Buffer!::new().push_static("Brand[").push_bytes(&cx, type_text(&cx, witness.copy(&cx), depth)).push_static("]").save(&cx),
-        NonNull(inner) => Buffer!::new().push_static("NonNull[").push_bytes(&cx, type_text(&cx, inner.copy(&cx), depth)).push_static("]").save(&cx),
+        Brand(witness) => Buffer!::new().put("Brand[").write(&cx, type_text(&cx, witness.copy(&cx), depth)).put("]").save(&cx),
+        NonNull(inner) => Buffer!::new().put("NonNull[").write(&cx, type_text(&cx, inner.copy(&cx), depth)).put("]").save(&cx),
         Ptr(inner) => {
             let t = type_text(&cx, inner.copy(&cx), depth);
-            if is_binder_type(inner.copy(&cx)) { Buffer!::new().push_static("*(").push_bytes(&cx, t).push_static(")").save(&cx) } else { Buffer!::new().push_static("*").push_bytes(&cx, t).save(&cx) }
+            if is_binder_type(inner.copy(&cx)) { f"*({t})".write(&cx, Buffer!::new()).save(&cx) } else { Buffer!::new().put("*").write(&cx, t).save(&cx) }
         },
         Tuple(elems) => {
             if elems.is_empty(&cx) {
                 Span::from_static(&cx, "unit")
             } else {
-                Buffer!::new().push_static("(").push_bytes(&cx, type_texts(&cx, elems, depth).join(&cx, ", ")).push_static(if elems.len(&cx) == 1usize { "," } else { "" }).push_static(")").save(&cx)
+                Buffer!::new().put("(").write(&cx, type_texts(&cx, elems, depth).join(&cx, ", ")).put(if elems.len(&cx) == 1usize { "," } else { "" }).put(")").save(&cx)
             }
         },
-        Array(elem, length) => Buffer!::new().push_static("[").push_bytes(&cx, type_text(&cx, elem.copy(&cx), depth)).push_static("; ").push_u64(length).push_static("]").save(&cx),
+        Array(elem, length) => Buffer!::new().put("[").write(&cx, type_text(&cx, elem.copy(&cx), depth)).put("; ").put(length).put("]").save(&cx),
         Struct(fields) => members_text(&cx, "struct", fields, depth),
         Enum(variants) => members_text(&cx, "enum", variants, depth),
-        Exists(binders, body) => Buffer!::new().push_static("exists ").push_bytes(&cx, brands(&cx, binders)).push_static(". ").push_bytes(&cx, type_text(&cx, body.copy(&cx), depth)).save(&cx),
-        Foreach(f) => Buffer!::new().push_static("foreach ").push_static(if f.indirect { "*" } else { "" }).push_bytes(&cx, f.binder).push_static(" of ")
-            .push_bytes(&cx, type_text(&cx, f.source.copy(&cx), depth)).push_static(" => ").push_bytes(&cx, type_text(&cx, f.body.copy(&cx), depth)).save(&cx),
+        Exists(binders, body) => Buffer!::new().put("exists ").write(&cx, brands(&cx, binders)).put(". ").write(&cx, type_text(&cx, body.copy(&cx), depth)).save(&cx),
+        Foreach(f) => Buffer!::new().put("foreach ").put(if f.indirect { "*" } else { "" }).write(&cx, f.binder).put(" of ")
+            .write(&cx, type_text(&cx, f.source.copy(&cx), depth)).put(" => ").write(&cx, type_text(&cx, f.body.copy(&cx), depth)).save(&cx),
         Fn(f) => {
             let modes: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
             var i = 0usize;
             while i < f.params.len(&cx) {
-                modes.push(&cx, Buffer!::new().push_static(if f.places.contains(&cx, i) { "&" } else { "" }).push_bytes(&cx, type_text(&cx, f.params.at(&cx, i), depth)).save(&cx));
+                modes.push(&cx, Buffer!::new().put(if f.places.contains(&cx, i) { "&" } else { "" }).write(&cx, type_text(&cx, f.params.at(&cx, i), depth)).save(&cx));
                 i = i + 1usize;
             }
-            Buffer!::new().push_static(if f.is_unsafe { "unsafe " } else { "" }).push_static("fn(")
-                .push_bytes(&cx, modes.join(&cx, ", ")).push_static(") -> ").push_bytes(&cx, type_text(&cx, f.ret.copy(&cx), depth)).save(&cx)
+            Buffer!::new().put(if f.is_unsafe { "unsafe " } else { "" }).put("fn(")
+                .write(&cx, modes.join(&cx, ", ")).put(") -> ").write(&cx, type_text(&cx, f.ret.copy(&cx), depth)).save(&cx)
         },
         Meta(_m) => kurs_error(&cx, Span::from_static(&cx, "unsupported readable KURS type: an inference variable"), no_pos()),
     }
@@ -170,7 +171,7 @@ fn type_text(&cx: Domain!['k], ty: Type['k], depth: usize) -> Span['k] {
 
 forall 'k.
 fn edge_text(&cx: Domain!['k], edge: Edge['k]) -> Span['k] {
-    Buffer!::new().push_bytes(&cx, edge.target).push_bytes(&cx, arguments(&cx, edge.tys, 0usize)).push_static("(").push_bytes(&cx, edge.args.join(&cx, ", ")).push_static(")").save(&cx)
+    Buffer!::new().write(&cx, edge.target).write(&cx, arguments(&cx, edge.tys, 0usize)).put("(").write(&cx, edge.args.join(&cx, ", ")).put(")").save(&cx)
 }
 
 forall 'k.
@@ -185,24 +186,24 @@ fn instruction_text(&cx: Domain!['k], instr: Instr['k], depth: usize, omit_unit:
         Some(l) => l,
         None => Span::from_static(&cx, ""),
     };
-    let lhs = if instr.lhs.len(&cx) == 1usize { instr.lhs.at(&cx, 0usize) } else { Buffer!::new().push_static("(").push_bytes(&cx, instr.lhs.join(&cx, ", ")).push_static(")").save(&cx) };
+    let lhs = if instr.lhs.len(&cx) == 1usize { instr.lhs.at(&cx, 0usize) } else { Buffer!::new().put("(").write(&cx, instr.lhs.join(&cx, ", ")).put(")").save(&cx) };
     let prefix = if instr.is_unsafe { Span::from_static(&cx, "unsafe ") } else { Span::from_static(&cx, "") };
     if op.is(&cx, "open") {
         let binding = if omit_unit && args.at(&cx, 0usize).starts_with(&cx, Span::from_static(&cx, "&")) { Span::from_static(&cx, "") } else { concat(&cx, lhs, Span::from_static(&cx, " = ")) };
-        return Buffer!::new().push_bytes(&cx, prefix).push_static("exists ").push_bytes(&cx, brands(&cx, instr.binders)).push_static(". ").push_bytes(&cx, binding).push_static("open ").push_bytes(&cx, args.at(&cx, 0usize)).push_static(";").save(&cx);
+        return Buffer!::new().write(&cx, prefix).put("exists ").write(&cx, brands(&cx, instr.binders)).put(". ").write(&cx, binding).put("open ").write(&cx, args.at(&cx, 0usize)).put(";").save(&cx);
     }
     let rhs = if op.is(&cx, "pack") {
-        Buffer!::new().push_static("pack ").push_bytes(&cx, type_texts(&cx, instr.tys, 0usize).join(&cx, ", ")).push_static(". ").push_bytes(&cx, args.at(&cx, 0usize)).push_static(" as ")
-            .push_bytes(&cx, ty).save(&cx)
+        Buffer!::new().put("pack ").write(&cx, type_texts(&cx, instr.tys, 0usize).join(&cx, ", ")).put(". ").write(&cx, args.at(&cx, 0usize)).put(" as ")
+            .write(&cx, ty).save(&cx)
     } else if op.is(&cx, "call") || op.is(&cx, "fn") {
-        var out = Buffer!::new().push_bytes(&cx, op).push_static(" ").push_bytes(&cx, args.at(&cx, 0usize)).push_bytes(&cx, arguments(&cx, instr.tys, depth));
+        var out = Buffer!::new().write(&cx, op).put(" ").write(&cx, args.at(&cx, 0usize)).write(&cx, arguments(&cx, instr.tys, depth));
         if op.is(&cx, "call") {
-            out = out.push_static("(").push_bytes(&cx, args.skip(&cx, 1usize).join(&cx, ", ")).push_static(")");
+            out = out.put("(").write(&cx, args.skip(&cx, 1usize).join(&cx, ", ")).put(")");
         }
         out.save(&cx)
     } else if op.is(&cx, "trait_call") {
-        Buffer!::new().push_static("trait_call ").push_bytes(&cx, args.at(&cx, 0usize)).push_bytes(&cx, arguments(&cx, instr.tys, depth)).push_static("::").push_bytes(&cx, args.at(&cx, 1usize))
-            .push_static("(").push_bytes(&cx, args.skip(&cx, 2usize).join(&cx, ", ")).push_static(")").save(&cx)
+        Buffer!::new().put("trait_call ").write(&cx, args.at(&cx, 0usize)).write(&cx, arguments(&cx, instr.tys, depth)).put("::").write(&cx, args.at(&cx, 1usize))
+            .put("(").write(&cx, args.skip(&cx, 2usize).join(&cx, ", ")).put(")").save(&cx)
     } else if op.is(&cx, "foreach") {
         let f = match instr.ty {
             Some(t) => match t {
@@ -211,9 +212,9 @@ fn instruction_text(&cx: Domain!['k], instr: Instr['k], depth: usize, omit_unit:
             },
             None => kurs_error(&cx, Span::from_static(&cx, "unsupported readable instruction: a foreach without its type"), no_pos()),
         };
-        Buffer!::new().push_static("foreach ").push_static(if f.indirect { "*" } else { "" }).push_bytes(&cx, f.binder).push_static(" of ").push_bytes(&cx, args.at(&cx, 0usize)).push_static(" : ")
-            .push_bytes(&cx, type_text(&cx, f.source.copy(&cx), depth)).push_static(" => ").push_bytes(&cx, type_text(&cx, f.body.copy(&cx), depth))
-            .push_static(" using ").push_bytes(&cx, args.at(&cx, 1usize)).push_bytes(&cx, arguments(&cx, instr.tys, depth)).push_static("(").push_bytes(&cx, args.skip(&cx, 2usize).join(&cx, ", ")).push_static(")").save(&cx)
+        Buffer!::new().put("foreach ").put(if f.indirect { "*" } else { "" }).write(&cx, f.binder).put(" of ").write(&cx, args.at(&cx, 0usize)).put(" : ")
+            .write(&cx, type_text(&cx, f.source.copy(&cx), depth)).put(" => ").write(&cx, type_text(&cx, f.body.copy(&cx), depth))
+            .put(" using ").write(&cx, args.at(&cx, 1usize)).write(&cx, arguments(&cx, instr.tys, depth)).put("(").write(&cx, args.skip(&cx, 2usize).join(&cx, ", ")).put(")").save(&cx)
     } else {
         let operands: ArenaVec[Span['k], 'k] = if op.is(&cx, "const") {
             ArenaVec::two(&cx, ty, literal)
@@ -236,27 +237,27 @@ fn instruction_text(&cx: Domain!['k], instr: Instr['k], depth: usize, omit_unit:
             out.append(&cx, args);
             out
         } else if instr.ty.is_some() || !instr.tys.is_empty(&cx) || !instr.binders.is_empty(&cx) {
-            kurs_error(&cx, Buffer!::new().push_static("unsupported readable instruction metadata: ").push_bytes(&cx, op).save(&cx), no_pos())
+            kurs_error(&cx, Buffer!::new().put("unsupported readable instruction metadata: ").write(&cx, op).save(&cx), no_pos())
         } else {
             args
         };
-        if operands.is_empty(&cx) { op } else { Buffer!::new().push_bytes(&cx, op).push_static(" ").push_bytes(&cx, operands.join(&cx, ", ")).save(&cx) }
+        if operands.is_empty(&cx) { op } else { Buffer!::new().write(&cx, op).put(" ").write(&cx, operands.join(&cx, ", ")).save(&cx) }
     };
-    Buffer!::new().push_bytes(&cx, prefix).push_bytes(&cx, lhs).push_static(" = ").push_bytes(&cx, rhs).push_static(";").save(&cx)
+    f"{prefix}{lhs} = {rhs};".write(&cx, Buffer!::new()).save(&cx)
 }
 
 forall 'k.
 fn terminator_text(&cx: Domain!['k], term: Terminator['k]) -> Span['k] {
     match term {
-        Ret(value, _pos) => Buffer!::new().push_static("return ").push_bytes(&cx, value).push_static(";").save(&cx),
-        Jmp(edge, _pos) => Buffer!::new().push_static("jump ").push_bytes(&cx, edge_text(&cx, edge)).push_static(";").save(&cx),
-        Jnz(cond, then, other, _pos) => Buffer!::new().push_static("branch ").push_bytes(&cx, cond).push_static(", ").push_bytes(&cx, edge_text(&cx, then)).push_static(", ")
-            .push_bytes(&cx, edge_text(&cx, other)).push_static(";").save(&cx),
+        Ret(value, _pos) => f"return {value};".write(&cx, Buffer!::new()).save(&cx),
+        Jmp(edge, _pos) => Buffer!::new().put("jump ").write(&cx, edge_text(&cx, edge)).put(";").save(&cx),
+        Jnz(cond, then, other, _pos) => Buffer!::new().put("branch ").write(&cx, cond).put(", ").write(&cx, edge_text(&cx, then)).put(", ")
+            .write(&cx, edge_text(&cx, other)).put(";").save(&cx),
         Switch(scrutinee, ty, arms, _pos) => {
-            let lines = ArenaVec::one(&cx, Buffer!::new().push_static("switch ").push_bytes(&cx, scrutinee).push_static(" : ").push_bytes(&cx, type_text(&cx, ty, 0usize)).push_static(" {").save(&cx));
+            let lines = ArenaVec::one(&cx, Buffer!::new().put("switch ").write(&cx, scrutinee).put(" : ").write(&cx, type_text(&cx, ty, 0usize)).put(" {").save(&cx));
             var i = 0usize;
             while i < arms.len(&cx) {
-                lines.push(&cx, Buffer!::new().push_static("    ").push_bytes(&cx, arms.at(&cx, i).variant).push_static(" => ").push_bytes(&cx, edge_text(&cx, arms.at(&cx, i).edge)).push_static(";").save(&cx));
+                lines.push(&cx, Buffer!::new().put("    ").write(&cx, arms.at(&cx, i).variant).put(" => ").write(&cx, edge_text(&cx, arms.at(&cx, i).edge)).put(";").save(&cx));
                 i = i + 1usize;
             }
             lines.push(&cx, Span::from_static(&cx, "}"));
@@ -269,27 +270,27 @@ fn terminator_text(&cx: Domain!['k], term: Terminator['k]) -> Span['k] {
 // `t` as a JSON string with only ASCII characters, as Python's `json.dumps` writes it.
 forall 'k.
 fn json_string(&cx: Domain!['k], t: Span['k]) -> Span['k] {
-    var out = Buffer!::new().push_static("\"");
+    var out = Buffer!::new().put("\"");
     var i = 0usize;
     while i < t.len() {
         let b = t.byte_or_zero(&cx, i);
         let (code, count) = decode(&cx, t, i);
         if b == b'"' {
-            out = out.push_static("\\\"");
+            out = out.put("\\\"");
         } else if b == b'\\' {
-            out = out.push_static("\\\\");
+            out = out.put("\\\\");
         } else if b == b'\n' {
-            out = out.push_static("\\n");
+            out = out.put("\\n");
         } else if b == b'\r' {
-            out = out.push_static("\\r");
+            out = out.put("\\r");
         } else if b == b'\t' {
-            out = out.push_static("\\t");
+            out = out.put("\\t");
         } else if b == 8u8 {
-            out = out.push_static("\\b");
+            out = out.put("\\b");
         } else if b == 12u8 {
-            out = out.push_static("\\f");
+            out = out.put("\\f");
         } else if code >= 32u32 && code < 127u32 {
-            out = out.push_byte(b);
+            out = out.write_byte(b);
         } else if code >= 65536u32 {
             let v = code - 65536u32;
             out = unicode_escape(&cx, unicode_escape(&cx, out, 55296u32 + (v >> 10u32)), 56320u32 + (v & 1023u32));
@@ -298,14 +299,14 @@ fn json_string(&cx: Domain!['k], t: Span['k]) -> Span['k] {
         }
         i = i + count;
     }
-    out.push_static("\"").save(&cx)
+    out.put("\"").save(&cx)
 }
 
 forall 'k.
 fn unicode_escape(&cx: Domain!['k], out: Buffer!, code: u32) -> Buffer! {
     let digits = Span::from_static(&cx, "0123456789abcdef");
-    out.push_static("\\u").push_byte(digits.byte_or_zero(&cx, ((code >> 12u32) & 15u32) as usize)).push_byte(digits.byte_or_zero(&cx, ((code >> 8u32) & 15u32) as usize))
-        .push_byte(digits.byte_or_zero(&cx, ((code >> 4u32) & 15u32) as usize)).push_byte(digits.byte_or_zero(&cx, (code & 15u32) as usize))
+    out.put("\\u").write_byte(digits.byte_or_zero(&cx, ((code >> 12u32) & 15u32) as usize)).write_byte(digits.byte_or_zero(&cx, ((code >> 8u32) & 15u32) as usize))
+        .write_byte(digits.byte_or_zero(&cx, ((code >> 4u32) & 15u32) as usize)).write_byte(digits.byte_or_zero(&cx, (code & 15u32) as usize))
 }
 
 // The code point of the UTF-8 character at `i` and its length in bytes; a byte that starts no
@@ -348,14 +349,14 @@ fn json_list(&cx: Domain!['k], items: ArenaVec[Span['k], 'k]) -> Span['k] {
         parts.push(&cx, json_string(&cx, items.at(&cx, i)));
         i = i + 1usize;
     }
-    Buffer!::new().push_static("[").push_bytes(&cx, parts.join(&cx, ", ")).push_static("]").save(&cx)
+    Buffer!::new().put("[").write(&cx, parts.join(&cx, ", ")).put("]").save(&cx)
 }
 
 forall 'k.
 fn metadata(&cx: Domain!['k], home: Option[ModuleId['k]], depth: usize) -> ArenaVec[Span['k], 'k] {
     match home {
-        Some(m) => ArenaVec::one(&cx, Buffer!::new().push_bytes(&cx, indentation(&cx, depth)).push_static("// owner: package ").push_usize(m.package).push_static(", module ")
-            .push_bytes(&cx, json_list(&cx, m.path)).save(&cx)),
+        Some(m) => ArenaVec::one(&cx, Buffer!::new().write(&cx, indentation(&cx, depth)).put("// owner: package ").put(m.package).put(", module ")
+            .write(&cx, json_list(&cx, m.path)).save(&cx)),
         None => ArenaVec::new(&cx),
     }
 }
@@ -365,7 +366,7 @@ fn bindings_text(&cx: Domain!['k], bindings: ArenaVec[Binding['k], 'k], depth: u
     let parts: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
     var i = 0usize;
     while i < bindings.len(&cx) {
-        parts.push(&cx, Buffer!::new().push_bytes(&cx, bindings.at(&cx, i).name).push_static(": ").push_bytes(&cx, type_text(&cx, bindings.at(&cx, i).ty, depth)).save(&cx));
+        parts.push(&cx, Buffer!::new().write(&cx, bindings.at(&cx, i).name).put(": ").write(&cx, type_text(&cx, bindings.at(&cx, i).ty, depth)).save(&cx));
         i = i + 1usize;
     }
     parts.join(&cx, ", ")
@@ -380,14 +381,14 @@ fn function_lines(&cx: Domain!['k], fun: Fun['k], depth: usize) -> ArenaVec[Span
         lines.push(&cx, concat(&cx, indent, quant.trim_end(&cx)));
     }
     let params = bindings_text(&cx, fun.blocks.at(&cx, 0usize).params, depth);
-    lines.push(&cx, Buffer!::new().push_bytes(&cx, indent).push_static(if fun.is_unsafe { "unsafe " } else { "" }).push_static("fn ").push_bytes(&cx, fun.name).push_static("(").push_bytes(&cx, params)
-        .push_static(") -> ").push_bytes(&cx, type_text(&cx, fun.ret, depth)).push_static(" {").save(&cx));
+    lines.push(&cx, Buffer!::new().write(&cx, indent).put(if fun.is_unsafe { "unsafe " } else { "" }).put("fn ").write(&cx, fun.name).put("(").write(&cx, params)
+        .put(") -> ").write(&cx, type_text(&cx, fun.ret, depth)).put(" {").save(&cx));
     if !fun.locals.is_empty(&cx) {
         lines.push(&cx, concat(&cx, indent, Span::from_static(&cx, "    locals {")));
         var l = 0usize;
         while l < fun.locals.len(&cx) {
-            lines.push(&cx, Buffer!::new().push_bytes(&cx, indent).push_static("        ").push_bytes(&cx, fun.locals.at(&cx, l).name).push_static(": ")
-                .push_bytes(&cx, type_text(&cx, fun.locals.at(&cx, l).ty, depth + 2usize)).push_static(";").save(&cx));
+            lines.push(&cx, Buffer!::new().write(&cx, indent).put("        ").write(&cx, fun.locals.at(&cx, l).name).put(": ")
+                .write(&cx, type_text(&cx, fun.locals.at(&cx, l).ty, depth + 2usize)).put(";").save(&cx));
             l = l + 1usize;
         }
         lines.push(&cx, concat(&cx, indent, Span::from_static(&cx, "    }")));
@@ -395,34 +396,34 @@ fn function_lines(&cx: Domain!['k], fun: Fun['k], depth: usize) -> ArenaVec[Span
     var index = 0usize;
     while index < fun.blocks.len(&cx) {
         let block = fun.blocks.at(&cx, index);
-        let block_brands = if block.brands.is_empty(&cx) { Span::from_static(&cx, "") } else { Buffer!::new().push_static("[").push_bytes(&cx, brands(&cx, block.brands)).push_static("]").save(&cx) };
+        let block_brands = if block.brands.is_empty(&cx) { Span::from_static(&cx, "") } else { Buffer!::new().put("[").write(&cx, brands(&cx, block.brands)).put("]").save(&cx) };
         let block_params = bindings_text(&cx, block.params, depth + 1usize);
         let header = if index == 0usize {
             Span::from_static(&cx, "entry")
         } else {
-            Buffer!::new().push_static("block ").push_bytes(&cx, block.label).push_bytes(&cx, block_brands).push_static("(").push_bytes(&cx, block_params).push_static(")").save(&cx)
+            f"block {block.label}{block_brands}({block_params})".write(&cx, Buffer!::new()).save(&cx)
         };
         if index == 0usize && !block.label.is(&cx, "entry") {
-            lines.push(&cx, Buffer!::new().push_bytes(&cx, indent).push_static("    // entry label: ").push_bytes(&cx, block.label).save(&cx));
+            lines.push(&cx, f"{indent}    // entry label: {block.label}".write(&cx, Buffer!::new()).save(&cx));
         }
-        lines.push(&cx, Buffer!::new().push_bytes(&cx, indent).push_static("    ").push_bytes(&cx, header).push_static(" {").save(&cx));
+        lines.push(&cx, f"{indent}    {header} {{".write(&cx, Buffer!::new()).save(&cx));
         if !block.empty.is_empty(&cx) || !block.known.is_empty(&cx) || !block.opened.is_empty(&cx) {
             lines.push(&cx, concat(&cx, indent, Span::from_static(&cx, "        state {")));
             var o = 0usize;
             while o < block.opened.len(&cx) {
-                lines.push(&cx, Buffer!::new().push_bytes(&cx, indent).push_static("            open ").push_bytes(&cx, brands(&cx, block.opened.at(&cx, o).brands)).push_static(". ")
-                    .push_bytes(&cx, block.opened.at(&cx, o).path).push_static(";").save(&cx));
+                lines.push(&cx, Buffer!::new().write(&cx, indent).put("            open ").write(&cx, brands(&cx, block.opened.at(&cx, o).brands)).put(". ")
+                    .write(&cx, block.opened.at(&cx, o).path).put(";").save(&cx));
                 o = o + 1usize;
             }
             var e = 0usize;
             while e < block.empty.len(&cx) {
-                lines.push(&cx, Buffer!::new().push_bytes(&cx, indent).push_static("            empty ").push_bytes(&cx, block.empty.at(&cx, e)).push_static(";").save(&cx));
+                lines.push(&cx, Buffer!::new().write(&cx, indent).put("            empty ").write(&cx, block.empty.at(&cx, e)).put(";").save(&cx));
                 e = e + 1usize;
             }
             var k = 0usize;
             while k < block.known.len(&cx) {
-                lines.push(&cx, Buffer!::new().push_bytes(&cx, indent).push_static("            known ").push_bytes(&cx, block.known.at(&cx, k).path).push_static(" = ")
-                    .push_bytes(&cx, block.known.at(&cx, k).variant).push_static(";").save(&cx));
+                lines.push(&cx, Buffer!::new().write(&cx, indent).put("            known ").write(&cx, block.known.at(&cx, k).path).put(" = ")
+                    .write(&cx, block.known.at(&cx, k).variant).put(";").save(&cx));
                 k = k + 1usize;
             }
             lines.push(&cx, concat(&cx, indent, Span::from_static(&cx, "        }")));
@@ -463,13 +464,13 @@ fn function_lines(&cx: Domain!['k], fun: Fun['k], depth: usize) -> ArenaVec[Span
                 }
                 n = n + 1usize;
             }
-            lines.push(&cx, Buffer!::new().push_bytes(&cx, indent).push_static("        ").push_bytes(&cx, instruction_text(&cx, instr, depth + 2usize, !any)).save(&cx));
+            lines.push(&cx, Buffer!::new().write(&cx, indent).put("        ").write(&cx, instruction_text(&cx, instr, depth + 2usize, !any)).save(&cx));
             i = i + 1usize;
         }
         let term_lines = ArenaVec::split(&cx, terminator_text(&cx, block.term), Span::from_static(&cx, "\n"));
         var t = 0usize;
         while t < term_lines.len(&cx) {
-            lines.push(&cx, Buffer!::new().push_bytes(&cx, indent).push_static("        ").push_bytes(&cx, term_lines.at(&cx, t)).save(&cx));
+            lines.push(&cx, Buffer!::new().write(&cx, indent).put("        ").write(&cx, term_lines.at(&cx, t)).save(&cx));
             t = t + 1usize;
         }
         lines.push(&cx, concat(&cx, indent, Span::from_static(&cx, "    }")));
@@ -491,7 +492,7 @@ fn initializer_text(&cx: Domain!['k], form: Form['k]) -> Span['k] {
             parts.push(&cx, initializer_text(&cx, form.at(&cx, i)));
             i = i + 1usize;
         }
-        return Buffer!::new().push_static("[").push_bytes(&cx, parts.join(&cx, ", ")).push_static("]").save(&cx);
+        return Buffer!::new().put("[").write(&cx, parts.join(&cx, ", ")).put("]").save(&cx);
     }
     form.text
 }
@@ -511,8 +512,8 @@ fn emit_kurs(&cx: Domain!['k], program: Program['k]) -> Span['k] {
                     Owner => Span::from_static(&cx, "owner"),
                     Within => Span::from_static(&cx, "within"),
                 };
-                lines.push(&cx, Buffer!::new().push_static("// exposure: ").push_bytes(&cx, mode).push_static(", package ").push_usize(exposure.home.package).push_static(", module ")
-                    .push_bytes(&cx, json_list(&cx, exposure.home.path)).save(&cx));
+                lines.push(&cx, Buffer!::new().put("// exposure: ").write(&cx, mode).put(", package ").put(exposure.home.package).put(", module ")
+                    .write(&cx, json_list(&cx, exposure.home.path)).save(&cx));
             },
             None => (),
         };
@@ -520,8 +521,8 @@ fn emit_kurs(&cx: Domain!['k], program: Program['k]) -> Span['k] {
         if !quant.is_empty() {
             lines.push(&cx, quant.trim_end(&cx));
         }
-        lines.push(&cx, Buffer!::new().push_static("type ").push_bytes(&cx, decl.name).push_static(" = ").push_bytes(&cx, type_text(&cx, decl.body, 0usize))
-            .push_static(";").save(&cx));
+        lines.push(&cx, Buffer!::new().put("type ").write(&cx, decl.name).put(" = ").write(&cx, type_text(&cx, decl.body, 0usize))
+            .put(";").save(&cx));
         sections.push(&cx, lines.join(&cx, "\n"));
         d = d + 1usize;
     }
@@ -529,9 +530,9 @@ fn emit_kurs(&cx: Domain!['k], program: Program['k]) -> Span['k] {
     var e = 0usize;
     while e < externs.len(&cx) {
         let external = externs.at(&cx, e);
-        sections.push(&cx, Buffer!::new().push_static("extern fn ").push_bytes(&cx, external.name).push_static("(")
-            .push_bytes(&cx, type_texts(&cx, external.ptypes, 0usize).join(&cx, ", ")).push_static(") -> ")
-            .push_bytes(&cx, type_text(&cx, external.ret, 0usize)).push_static(";").save(&cx));
+        sections.push(&cx, Buffer!::new().put("extern fn ").write(&cx, external.name).put("(")
+            .write(&cx, type_texts(&cx, external.ptypes, 0usize).join(&cx, ", ")).put(") -> ")
+            .write(&cx, type_text(&cx, external.ret, 0usize)).put(";").save(&cx));
         e = e + 1usize;
     }
     let datas = program.datas.values(&cx);
@@ -539,8 +540,8 @@ fn emit_kurs(&cx: Domain!['k], program: Program['k]) -> Span['k] {
     while a < datas.len(&cx) {
         let data = datas.at(&cx, a);
         let lines = metadata(&cx, data.home, 0usize);
-        lines.push(&cx, Buffer!::new().push_static("data ").push_bytes(&cx, data.name).push_static(": ").push_bytes(&cx, type_text(&cx, data.ty, 0usize)).push_static(" = ")
-            .push_bytes(&cx, initializer_text(&cx, data.init)).push_static(";").save(&cx));
+        lines.push(&cx, Buffer!::new().put("data ").write(&cx, data.name).put(": ").write(&cx, type_text(&cx, data.ty, 0usize)).put(" = ")
+            .write(&cx, initializer_text(&cx, data.init)).put(";").save(&cx));
         sections.push(&cx, lines.join(&cx, "\n"));
         a = a + 1usize;
     }
@@ -555,27 +556,27 @@ fn emit_kurs(&cx: Domain!['k], program: Program['k]) -> Span['k] {
             let kind = if tr.param_kinds.is_empty(&cx) { Kind::Any } else { tr.param_kinds.at(&cx, p) };
             names.push(&cx, if is_brand(kind) { brand(&cx, tr.params.at(&cx, p)) } else { tr.params.at(&cx, p) });
             if is_copy(kind) {
-                bounds.push(&cx, Buffer!::new().push_static("Copy[").push_bytes(&cx, tr.params.at(&cx, p)).push_static("]").save(&cx));
+                bounds.push(&cx, Buffer!::new().put("Copy[").write(&cx, tr.params.at(&cx, p)).put("]").save(&cx));
             }
             p = p + 1usize;
         }
-        var header = Buffer!::new().push_static("trait ").push_bytes(&cx, tr.name).push_static("[").push_bytes(&cx, names.join(&cx, ", ")).push_static("]");
+        var header = Buffer!::new().put("trait ").write(&cx, tr.name).put("[").write(&cx, names.join(&cx, ", ")).put("]");
         if !bounds.is_empty(&cx) {
-            header = header.push_static(" where ").push_bytes(&cx, bounds.join(&cx, ", "));
+            header = header.put(" where ").write(&cx, bounds.join(&cx, ", "));
         }
         let lines = metadata(&cx, tr.home, 0usize);
-        lines.push(&cx, header.push_static(" {").save(&cx));
+        lines.push(&cx, header.put(" {").save(&cx));
         var m = 0usize;
         while m < tr.methods.len(&cx) {
             let method = tr.methods.at(&cx, m);
             let modes: ArenaVec[Span['k], 'k] = ArenaVec::new(&cx);
             var i = 0usize;
             while i < method.ptypes.len(&cx) {
-                modes.push(&cx, Buffer!::new().push_static(if method.places.contains(&cx, i) { "&" } else { "" }).push_bytes(&cx, type_text(&cx, method.ptypes.at(&cx, i), 1usize)).save(&cx));
+                modes.push(&cx, Buffer!::new().put(if method.places.contains(&cx, i) { "&" } else { "" }).write(&cx, type_text(&cx, method.ptypes.at(&cx, i), 1usize)).save(&cx));
                 i = i + 1usize;
             }
-            lines.push(&cx, Buffer!::new().push_static("    ").push_static(if method.is_unsafe { "unsafe " } else { "" }).push_static("fn ").push_bytes(&cx, method.name).push_static("(")
-                .push_bytes(&cx, modes.join(&cx, ", ")).push_static(") -> ").push_bytes(&cx, type_text(&cx, method.ret, 1usize)).push_static(";").save(&cx));
+            lines.push(&cx, Buffer!::new().put("    ").put(if method.is_unsafe { "unsafe " } else { "" }).put("fn ").write(&cx, method.name).put("(")
+                .write(&cx, modes.join(&cx, ", ")).put(") -> ").write(&cx, type_text(&cx, method.ret, 1usize)).put(";").save(&cx));
             m = m + 1usize;
         }
         lines.push(&cx, Span::from_static(&cx, "}"));
@@ -594,7 +595,7 @@ fn emit_kurs(&cx: Domain!['k], program: Program['k]) -> Span['k] {
             if !quant.is_empty() {
                 lines.push(&cx, quant.trim_end(&cx));
             }
-            lines.push(&cx, Buffer!::new().push_static("instance ").push_bytes(&cx, inst.trait_name).push_bytes(&cx, arguments(&cx, inst.head, 0usize)).push_static(" {").save(&cx));
+            lines.push(&cx, Buffer!::new().put("instance ").write(&cx, inst.trait_name).write(&cx, arguments(&cx, inst.head, 0usize)).put(" {").save(&cx));
             var m = 0usize;
             while m < inst.methods.len(&cx) {
                 lines.append(&cx, function_lines(&cx, inst.methods.at(&cx, m), 1usize));
@@ -612,5 +613,5 @@ fn emit_kurs(&cx: Domain!['k], program: Program['k]) -> Span['k] {
         sections.push(&cx, function_lines(&cx, funs.at(&cx, f), 0usize).join(&cx, "\n"));
         f = f + 1usize;
     }
-    Buffer!::new().push_bytes(&cx, sections.join(&cx, "\n\n")).push_static("\n").save(&cx)
+    Buffer!::new().write(&cx, sections.join(&cx, "\n\n")).put("\n").save(&cx)
 }

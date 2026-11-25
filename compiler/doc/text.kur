@@ -4,6 +4,7 @@ use package::resolve::resolver::is_prim;
 use package::syntax::parser::{is_keyword, is_name_byte, is_name_start};
 use std::arena::Domain!;
 use std::buffer::Buffer!;
+use std::fmt::Writer;
 use std::collections::arena_vec::ArenaVec;
 use std::option::Option;
 use std::raw::Span;
@@ -21,11 +22,11 @@ fn html(&cx: Domain!['k], out: Buffer!, text: Span['k]) -> Buffer! {
     var i = 0usize;
     while i < text.len() {
         let c = text.byte_or_zero(&cx, i);
-        out = if c == b'&' { out.push_static("&amp;") }
-            else if c == b'<' { out.push_static("&lt;") }
-            else if c == b'>' { out.push_static("&gt;") }
-            else if c == b'"' { out.push_static("&quot;") }
-            else { out.push_byte(c) };
+        out = if c == b'&' { out.put("&amp;") }
+            else if c == b'<' { out.put("&lt;") }
+            else if c == b'>' { out.put("&gt;") }
+            else if c == b'"' { out.put("&quot;") }
+            else { out.write_byte(c) };
         i = i + 1usize;
     }
     out
@@ -34,14 +35,14 @@ fn html(&cx: Domain!['k], out: Buffer!, text: Span['k]) -> Buffer! {
 // `text` as a TOML basic string, with its quotes.
 forall 'k.
 fn toml(&cx: Domain!['k], out: Buffer!, text: Span['k]) -> Buffer! {
-    var out = out.push_byte(b'"');
+    var out = out.write_byte(b'"');
     var i = 0usize;
     while i < text.len() {
         let c = text.byte_or_zero(&cx, i);
-        out = if c == b'"' || c == b'\\' { out.push_byte(b'\\').push_byte(c) } else { out.push_byte(c) };
+        out = if c == b'"' || c == b'\\' { out.write_byte(b'\\').write_byte(c) } else { out.write_byte(c) };
         i = i + 1usize;
     }
-    out.push_byte(b'"')
+    out.write_byte(b'"')
 }
 
 fn hex_digit(n: u8) -> u8 {
@@ -52,16 +53,16 @@ fn hex_digit(n: u8) -> u8 {
 // Krayon template tag (`{{`, `{%`).
 forall 'k.
 fn json(&cx: Domain!['k], out: Buffer!, text: Span['k]) -> Buffer! {
-    var out = out.push_byte(b'"');
+    var out = out.write_byte(b'"');
     var i = 0usize;
     while i < text.len() {
         let c = text.byte_or_zero(&cx, i);
-        out = if c == b'"' || c == b'\\' { out.push_byte(b'\\').push_byte(c) }
-            else if c < 32u8 || c == b'{' { out.push_static("\\u00").push_byte(hex_digit(c / 16u8)).push_byte(hex_digit(c % 16u8)) }
-            else { out.push_byte(c) };
+        out = if c == b'"' || c == b'\\' { out.write_byte(b'\\').write_byte(c) }
+            else if c < 32u8 || c == b'{' { out.put("\\u00").write_byte(hex_digit(c / 16u8)).write_byte(hex_digit(c % 16u8)) }
+            else { out.write_byte(c) };
         i = i + 1usize;
     }
-    out.push_byte(b'"')
+    out.write_byte(b'"')
 }
 
 fn word_byte(c: u8) -> bool {
@@ -80,14 +81,14 @@ fn encode(&cx: Domain!['k], out: Buffer!, name: Span['k]) -> Buffer! {
     while i < name.len() {
         let c = name.byte_or_zero(&cx, i);
         if word_byte(c) {
-            out = out.push_byte(c);
+            out = out.write_byte(c);
         } else if c == b'!' {
-            out = out.push_byte(b'~');
+            out = out.write_byte(b'~');
         } else if c == b':' && name.byte_or_zero(&cx, i + 1usize) == b':' {
-            out = out.push_byte(b'.');
+            out = out.write_byte(b'.');
             i = i + 1usize;
         } else {
-            out = out.push_byte(b'-').push_byte(hex_digit(c / 16u8)).push_byte(hex_digit(c % 16u8));
+            out = out.write_byte(b'-').write_byte(hex_digit(c / 16u8)).write_byte(hex_digit(c % 16u8));
         }
         i = i + 1usize;
     }
@@ -119,12 +120,12 @@ fn relative(&cx: Domain!['k], from: Span['k], to: Span['k]) -> Span['k] {
     var out = Buffer!::new();
     var k = common;
     while k < directory.len() {
-        if directory.byte_or_zero(&cx, k) == b'/' { out = out.push_static("../"); }
+        if directory.byte_or_zero(&cx, k) == b'/' { out = out.put("../"); }
         k = k + 1usize;
     }
-    out = out.push_bytes(&cx, target.slice(common, target.len()));
-    if &out.len() == 0usize { out = out.push_static("./"); }
-    out.push_bytes(&cx, fragment).save(&cx)
+    out = out.write(&cx, target.slice(common, target.len()));
+    if &out.len() == 0usize { out = out.put("./"); }
+    out.write(&cx, fragment).save(&cx)
 }
 
 // Whether the `.` at `at` closes an abbreviation that leaves its sentence going: `e.g.`, `i.e.`,
@@ -154,8 +155,8 @@ fn summary(&cx: Domain!['k], doc: Span['k]) -> Span['k] {
         if line.is_empty() {
             if &out.len() > 0usize { going = false; }
         } else {
-            if &out.len() > 0usize { out = out.push_byte(b' '); }
-            out = out.push_bytes(&cx, line);
+            if &out.len() > 0usize { out = out.write_byte(b' '); }
+            out = out.write(&cx, line);
         }
         at = end + 1usize;
     }
@@ -187,7 +188,7 @@ fn inline(&cx: Domain!['k], out: Buffer!, text: Span['k]) -> Buffer! {
         let close = if c == b'`' { text.find_byte(&cx, b'`', i + 1usize) } else { Option::None };
         match close {
             Some(end) => {
-                out = html(&cx, out.push_static("<code>"), text.slice(i + 1usize, end)).push_static("</code>");
+                out = html(&cx, out.put("<code>"), text.slice(i + 1usize, end)).put("</code>");
                 i = end + 1usize;
             },
             None => {
@@ -220,7 +221,7 @@ fn plain(&cx: Domain!['k], text: Span['k]) -> Span['k] {
     var i = 0usize;
     while i < text.len() {
         let c = text.byte_or_zero(&cx, i);
-        if c != b'`' { out = out.push_byte(c); }
+        if c != b'`' { out = out.write_byte(c); }
         i = i + 1usize;
     }
     out.save(&cx)
@@ -244,9 +245,9 @@ fn token(&cx: Domain!['k], out: Buffer!, class: Slice[u8, 'static], text: Span['
     while start <= text.len() {
         let end = match text.find_byte(&cx, b'\n', start) { Some(n) => n, None => text.len() };
         if end > start {
-            out = html(&cx, out.push_static("<span class=\"tok-").push_static(class).push_static("\">"), text.slice(start, end)).push_static("</span>");
+            out = html(&cx, out.put("<span class=\"tok-").put(class).put("\">"), text.slice(start, end)).put("</span>");
         }
-        if end < text.len() { out = out.push_byte(b'\n'); }
+        if end < text.len() { out = out.write_byte(b'\n'); }
         start = end + 1usize;
     }
     out
@@ -309,9 +310,9 @@ fn highlight(&cx: Domain!['k], text: Span['k], base: usize, links: ArenaVec[Link
             while li < links.len(&cx) && links.at(&cx, li).start < base + i { li = li + 1usize; }
             if li < links.len(&cx) && links.at(&cx, li).start == base + i {
                 let link = links.at(&cx, li);
-                out = out.push_static("<a class=\"sig-link sig-").push_bytes(&cx, link.kind).push_static("\" href=\"");
-                out = html(&cx, out, link.url).push_static("\">");
-                out = html(&cx, out, text.slice(i, link.end - base)).push_static("</a>");
+                out = out.put("<a class=\"sig-link sig-").write(&cx, link.kind).put("\" href=\"");
+                out = html(&cx, out, link.url).put("\">");
+                out = html(&cx, out, text.slice(i, link.end - base)).put("</a>");
                 i = link.end - base;
             } else {
                 var end = i + 1usize;
@@ -348,7 +349,7 @@ fn highlight(&cx: Domain!['k], text: Span['k], base: usize, links: ArenaVec[Link
             }
             i = end;
         } else if c == b'\n' {
-            out = out.push_byte(b'\n');
+            out = out.write_byte(b'\n');
             i = i + 1usize;
             var skipped = 0usize;
             while skipped < dedent && text.byte_or_zero(&cx, i) == b' ' {
@@ -382,10 +383,10 @@ fn lines(&cx: Domain!['k], body: Span['k], first: u32) -> Buffer! {
             Some(at) => if at < end_all { at } else { end_all },
             None => end_all,
         };
-        if start > 0usize { out = out.push_byte(b'\n'); }
-        out = out.push_static("<span class=\"line\"");
-        if first > 0u32 { out = out.push_static(" id=\"L").push_usize(n as usize).push_static("\""); }
-        out = out.push_static(">").push_bytes(&cx, body.slice(start, end)).push_static("</span>");
+        if start > 0usize { out = out.write_byte(b'\n'); }
+        out = out.put("<span class=\"line\"");
+        if first > 0u32 { out = out.put(" id=\"L").put(n).put("\""); }
+        out = out.put(">").write(&cx, body.slice(start, end)).put("</span>");
         start = end + 1usize;
         n = n + 1u32;
     }

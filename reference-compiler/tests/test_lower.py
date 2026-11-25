@@ -504,10 +504,10 @@ class LoweringTests(unittest.TestCase):
     def test_an_fstring_rejects_a_linear_value_it_would_drop_where_it_is_written(self):
         with tempfile.TemporaryDirectory(prefix="kursal-fstring-") as base:
             path = Path(base) / "fstr_lin.kur"
-            path.write_text("use std::buffer::Buffer!;\nuse std::io::print_buffer;\nfn main() {\n"
-                            "    let name = Buffer!::new().push_static(\"x\");\n    print_buffer(f\"hi {name}\\n\");\n}\n")
+            path.write_text("use std::buffer::Buffer!;\nuse std::io::print;\nfn main() {\n"
+                            "    let name = Buffer!::new();\n    print(f\"hi {name}\\n\");\n}\n")
             resolver = resolve(path)
-            with self.assertRaisesRegex(KursError, r"fstr_lin\.kur:5:24: \{name\} in an f-string drops a linear value; "
+            with self.assertRaisesRegex(KursError, r"fstr_lin\.kur:5:17: \{name\} in an f-string drops a linear value; "
                                                    r"lend it with \{&name\}$"):
                 lower(resolver, signatures(resolver))
 

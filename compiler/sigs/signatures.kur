@@ -27,6 +27,7 @@ use std::mem::Ref;
 use std::raw::Span;
 use std::arena::{Domain!, concat, ref_in};
 use std::buffer::Buffer!;
+use std::fmt::Writer;
 use package::kurs::core::{Exposure, ExposureMode, ForeachType, Kind, Member, ModuleId, Param, Premise, Program, Type, TypeDecl};
 use package::kurs::core as C;
 use package::types::layout::{check_type_expansion, check_written_type};
@@ -84,7 +85,7 @@ fn library_item(&cx: Domain!['k], name: Span['k]) -> LibraryItem['k] {
     } else if name.is(&cx, "Ordering") {
         library_entry(&cx, "core", "atomic::Ordering", "atomic::Ordering")
     } else {
-        fail(&cx, Buffer!::new().push_static("internal error: no library item ").push_bytes(&cx, name).save(&cx))
+        fail(&cx, Buffer!::new().put("internal error: no library item ").write(&cx, name).save(&cx))
     }
 }
 
@@ -279,9 +280,9 @@ fn sign_bit() -> u64 {
 forall 'k.
 fn int_text(&cx: Domain!['k], value: u64, name: Span['k]) -> Span['k] {
     if is_signed(&cx, name) && value >= sign_bit() {
-        Buffer!::new().push_static("-").push_u64(0u64 - value).save(&cx)
+        Buffer!::new().put("-").put(0u64 - value).save(&cx)
     } else {
-        Buffer!::new().push_u64(value).save(&cx)
+        Buffer!::new().put(value).save(&cx)
     }
 }
 
@@ -450,7 +451,7 @@ impl Signatures['k] {
         while p < packages.len(&cx) {
             let package = packages.at(&cx, p);
             package_names.insert(&cx, package.id, if clash {
-                Buffer!::new().push_bytes(&cx, package.name.copy(&cx)).push_static("#").push_usize(package.id).save(&cx)
+                Buffer!::new().write(&cx, package.name.copy(&cx)).put("#").put(package.id).save(&cx)
             } else {
                 package.name.copy(&cx)
             });
@@ -674,9 +675,9 @@ impl Signatures['k] {
         var i = 0usize;
         while i < parts.len(&cx) {
             if i > 0usize {
-                out = out.push_static("::");
+                out = out.put("::");
             }
-            out = out.push_bytes(&cx, parts.at(&cx, i));
+            out = out.write(&cx, parts.at(&cx, i));
             i = i + 1usize;
         }
         out.save(&cx)
@@ -687,7 +688,7 @@ impl Signatures['k] {
         let item = library_item(&cx, name);
         match self.r.library(&cx, home, item.home, item.path, item.std_path) {
             Decl(d) => d,
-            _ => fail(&cx, Buffer!::new().push_static("internal error: library item ").push_bytes(&cx, name).push_static(" is not a declaration").save(&cx)),
+            _ => fail(&cx, f"internal error: library item {name} is not a declaration".write(&cx, Buffer!::new()).save(&cx)),
         }
     }
 
@@ -718,7 +719,7 @@ impl Signatures['k] {
         while i < copied.len(&cx) {
             let name = copied.at(&cx, i);
             if !inner.kinds.contains(&cx, name) {
-                return sig_error(Buffer!::new().push_static("Copy requires an in-scope type parameter, not ").push_bytes(&cx, name).save(&cx), no_pos());
+                return sig_error(Buffer!::new().put("Copy requires an in-scope type parameter, not ").write(&cx, name).save(&cx), no_pos());
             }
             inner.kinds.insert(&cx, name, Kind::Copy);
             i = i + 1usize;
@@ -785,7 +786,7 @@ impl Signatures['k] {
         };
         let unit = match builtin {
             Some(name) => if args.args.len(&cx) != 1usize {
-                return sig_error(Buffer!::new().push_bytes(&cx, name).push_static(" takes 1 type argument, got ").push_usize(args.args.len(&cx)).save(&cx), pos);
+                return sig_error(Buffer!::new().write(&cx, name).put(" takes 1 type argument, got ").put(args.args.len(&cx)).save(&cx), pos);
             },
             None => (),
         };
@@ -810,7 +811,7 @@ impl Signatures['k] {
             None => if decl.kind.is(&cx, "trait") { ArenaVec::one(&cx, Span::from_static(&cx, "Self")) } else { ArenaVec::new(&cx) },
         };
         if args.len(&cx) != params.len(&cx) {
-            return sig_error(Buffer!::new().push_bytes(&cx, decl.name).push_static(" takes ").push_bytes(&cx, counted(&cx, params.len(&cx), "type argument")).push_static(", got ").push_usize(args.len(&cx)).save(&cx), pos);
+            return sig_error(Buffer!::new().write(&cx, decl.name).put(" takes ").write(&cx, counted(&cx, params.len(&cx), "type argument")).put(", got ").put(args.len(&cx)).save(&cx), pos);
         }
         let copied = match self.copy_names(&cx, header) {
             Ok(c) => c,
@@ -821,8 +822,7 @@ impl Signatures['k] {
             let param = params.at(&cx, i);
             let arg = args.at(&cx, i);
             if param.starts_with(&cx, Span::from_static(&cx, "'")) != is_skolem(arg) {
-                return sig_error(Buffer!::new().push_static("argument for ").push_bytes(&cx, param).push_static(" of ").push_bytes(&cx, decl.name)
-                    .push_static(" has the wrong kind (brand versus type)").save(&cx), pos);
+                return sig_error(f"argument for {param} of {decl.name} has the wrong kind (brand versus type)".write(&cx, Buffer!::new()).save(&cx), pos);
             }
             if copied.contains(&cx, param) {
                 let unit = self.require_copy(&cx, arg, scope.kinds, pos)?;
@@ -858,7 +858,7 @@ impl Signatures['k] {
         }
         let types = Types::new(&cx, self.program(&cx), self.counter);
         if ty.indirect && types.rows_fixed(&cx, ty.source.copy(&cx), true, kinds) && !types.pattern_available(&cx, ty) {
-            return sig_error(Buffer!::new().push_static("foreach *").push_bytes(&cx, ty.binder).push_static(" needs a source written with pointer components").save(&cx), pos);
+            return sig_error(f"foreach *{ty.binder} needs a source written with pointer components".write(&cx, Buffer!::new()).save(&cx), pos);
         }
         match check_written_type(&cx, self.program(&cx), self.counter, Type::Foreach.(ty), with_names(&cx, ArenaSet::new(&cx), kinds.keys(&cx))) {
             Ok(_u) => Result::Ok.(true),
@@ -892,19 +892,19 @@ impl Signatures['k] {
         match type_expr {
             Name(n) => {
                 let args = self.type_list(&cx, n.args, scope)?;
-                let not_a_type = Buffer!::new().push_static("not a type name: ").push_bytes(&cx, n.path.join(&cx, "::")).save(&cx);
+                let not_a_type = Buffer!::new().put("not a type name: ").write(&cx, n.path.join(&cx, "::")).save(&cx);
                 let r = match self.r.refs.get(&cx, n.id) {
                     Some(r) => r,
                     None => return sig_error(not_a_type, n.pos),
                 };
                 match r {
                     Param(name) => if !args.is_empty(&cx) {
-                        sig_error(Buffer!::new().push_static("type parameter ").push_bytes(&cx, name).push_static(" takes no type arguments").save(&cx), n.pos)
+                        sig_error(f"type parameter {name} takes no type arguments".write(&cx, Buffer!::new()).save(&cx), n.pos)
                     } else {
                         Result::Ok.(C::named(name, ArenaVec::new(&cx)))
                     },
                     Prim(name) => if !args.is_empty(&cx) {
-                        sig_error(Buffer!::new().push_static("primitive ").push_bytes(&cx, name).push_static(" takes no type arguments").save(&cx), n.pos)
+                        sig_error(f"primitive {name} takes no type arguments".write(&cx, Buffer!::new()).save(&cx), n.pos)
                     } else {
                         Result::Ok.(Type::Prim.(name))
                     },
@@ -949,7 +949,7 @@ impl Signatures['k] {
             Brand(quoted) => {
                 let label = quoted.skip(1usize);
                 if !scope.brands.contains(&cx, label) && !label.is(&cx, "static") {
-                    return sig_error(Buffer!::new().push_static("brand '").push_bytes(&cx, label).push_static(" is not in scope").save(&cx), no_pos());
+                    return sig_error(f"brand '{label} is not in scope".write(&cx, Buffer!::new()).save(&cx), no_pos());
                 }
                 Result::Ok.(Type::Skolem.(label))
             },
@@ -972,7 +972,7 @@ impl Signatures['k] {
                     None => match scope.implicit.copy(&cx) {
                         Some(implicit) => {
                             self.implicit.set(&cx, self.implicit.copy(&cx) + 1u32);
-                            let name = Buffer!::new().push_static("Env#").push_u64(self.implicit.copy(&cx) as u64).save(&cx);
+                            let name = Buffer!::new().put("Env#").put(self.implicit.copy(&cx)).save(&cx);
                             implicit.push(&cx, Param.{ name, kind: Kind::Any });
                             C::named(name, ArenaVec::new(&cx))
                         },
@@ -995,7 +995,7 @@ impl Signatures['k] {
                         return sig_error(Span::from_static(&cx, "an exists type repeats a binder"), at.at(&cx, i));
                     }
                     if scope.brands.contains(&cx, label) || label.is(&cx, "static") {
-                        return sig_error(Buffer!::new().push_static("exists binder '").push_bytes(&cx, label).push_static(" shadows a brand in scope").save(&cx), at.at(&cx, i));
+                        return sig_error(f"exists binder '{label} shadows a brand in scope".write(&cx, Buffer!::new()).save(&cx), at.at(&cx, i));
                     }
                     labels.push(&cx, label);
                     binders.push(&cx, Param.{ name: label, kind: Kind::Brand });
@@ -1068,10 +1068,10 @@ impl Signatures['k] {
         var at = 0usize;
         while at < stack.len(&cx) {
             if stack.at(&cx, at).id == decl.id {
-                var message = Buffer!::new().push_static("type alias ").push_bytes(&cx, decl.name).push_static(" refers to itself");
+                var message = Buffer!::new().put("type alias ").write(&cx, decl.name).put(" refers to itself");
                 var k = at + 1usize;
                 while k < stack.len(&cx) {
-                    message = message.push_static(if k == at + 1usize { " through " } else { ", " }).push_bytes(&cx, stack.at(&cx, k).name);
+                    message = message.put(if k == at + 1usize { " through " } else { ", " }).write(&cx, stack.at(&cx, k).name);
                     k = k + 1usize;
                 }
                 self.r.locate(&cx, decl.home, node.pos);
@@ -1171,7 +1171,7 @@ impl Signatures['k] {
         }
         let unit = match node.quantifier {
             Some(f) => if !f.premises.is_empty(&cx) || !f.determined.is_empty(&cx) {
-                return sig_error(Buffer!::new().push_static("type alias ").push_bytes(&cx, decl.name).push_static(" takes no premises or determined parameters").save(&cx), node.pos);
+                return sig_error(f"type alias {decl.name} takes no premises or determined parameters".write(&cx, Buffer!::new()).save(&cx), node.pos);
             },
             None => (),
         };
@@ -1186,7 +1186,7 @@ impl Signatures['k] {
             let p = params.at(&cx, i);
             if !used.contains(&cx, p.name) {
                 let spelled = match p.kind {
-                    Brand => Buffer!::new().push_static("'").push_bytes(&cx, p.name).save(&cx),
+                    Brand => Buffer!::new().put("'").write(&cx, p.name).save(&cx),
                     _ => p.name,
                 };
                 return sig_error(f"type alias {decl.name} does not use its parameter {spelled}".write(&cx, Buffer!::new()).save(&cx), node.pos);
@@ -1221,10 +1221,10 @@ impl Signatures['k] {
         let linear = !types.is_copy(&cx, alias.body, kinds);
         let at = alias_node(&cx, alias.decl).name_pos;
         if linear && !marked {
-            return sig_error(Buffer!::new().push_static("type alias ").push_bytes(&cx, name).push_static(" stands for a linear type; name it ").push_bytes(&cx, name).push_static("!").save(&cx), at);
+            return sig_error(f"type alias {name} stands for a linear type; name it {name}!".write(&cx, Buffer!::new()).save(&cx), at);
         }
         if !linear && marked {
-            return sig_error(Buffer!::new().push_static("type alias ").push_bytes(&cx, name).push_static(" stands for a type that is not linear; name it ").push_bytes(&cx, name.take(name.len() - 1usize)).save(&cx), at);
+            return sig_error(Buffer!::new().put("type alias ").write(&cx, name).put(" stands for a type that is not linear; name it ").write(&cx, name.take(name.len() - 1usize)).save(&cx), at);
         }
         Result::Ok.(true)
     }
@@ -1253,7 +1253,7 @@ impl Signatures['k] {
             Tuple(node) => (Type::Tuple.(self.type_list(&cx, node.elems, scope)?), node.exposure),
             Enum(node) => {
                 if node.variants.is_empty(&cx) {
-                    return sig_error(Buffer!::new().push_static("enum ").push_bytes(&cx, node.name).push_static(" has no variant; an enum has at least one").save(&cx), node.pos);
+                    return sig_error(f"enum {node.name} has no variant; an enum has at least one".write(&cx, Buffer!::new()).save(&cx), node.pos);
                 }
                 let variants: ArenaVec[Member['k], 'k] = ArenaVec::new(&cx);
                 var i = 0usize;
@@ -1311,7 +1311,7 @@ impl Signatures['k] {
         i = 0usize;
         while i < members.len(&cx) && part.is_empty() {
             if !types.is_copy(&cx, members.at(&cx, i).ty, kinds) {
-                part = Buffer!::new().push_static(label).push_bytes(&cx, members.at(&cx, i).name).save(&cx);
+                part = Buffer!::new().put(label).write(&cx, members.at(&cx, i).name).save(&cx);
             }
             i = i + 1usize;
         }
@@ -1320,15 +1320,15 @@ impl Signatures['k] {
                 i = 0usize;
                 while i < elems.len(&cx) && part.is_empty() {
                     if !types.is_copy(&cx, elems.at(&cx, i), kinds) {
-                        part = Buffer!::new().push_static(" in its element ").push_usize(i).save(&cx);
+                        part = Buffer!::new().put(" in its element ").put(i).save(&cx);
                     }
                     i = i + 1usize;
                 }
             },
             _ => (),
         };
-        sig_error(Buffer!::new().push_bytes(&cx, decl.kind).push_static(" ").push_bytes(&cx, decl.name).push_static(" holds a linear type").push_bytes(&cx, part)
-            .push_static(if generic { " whatever its type arguments" } else { "" }).push_static("; declare it ").push_bytes(&cx, decl.name).push_static("!").save(&cx), name_pos(decl.node))
+        sig_error(Buffer!::new().write(&cx, decl.kind).put(" ").write(&cx, decl.name).put(" holds a linear type").write(&cx, part)
+            .put(if generic { " whatever its type arguments" } else { "" }).put("; declare it ").write(&cx, decl.name).put("!").save(&cx), name_pos(decl.node))
     }
 
     fn payload(self, &cx: Domain!['k], types: ArenaVec[S::Type['k], 'k], scope: Scope['k]) -> Result[Type['k], SigError['k]] {
@@ -1352,7 +1352,7 @@ impl Signatures['k] {
             },
             None => (),
         };
-        sig_error(Buffer!::new().push_static("an exposure scope is an enclosing module of ").push_bytes(&cx, decl.name).save(&cx), no_pos())
+        sig_error(Buffer!::new().put("an exposure scope is an enclosing module of ").write(&cx, decl.name).save(&cx), no_pos())
     }
 
     // The signature of a function, method or extern declaration.
@@ -1435,14 +1435,14 @@ impl Signatures['k] {
                     };
                     match self_type {
                         Some(t) => ptypes.push(&cx, self.ty(&cx, t, scope)?),
-                        None => return sig_error(Buffer!::new().push_static("parameter ").push_bytes(&cx, p.name).push_static(" needs a type").save(&cx), node.pos),
+                        None => return sig_error(f"parameter {p.name} needs a type".write(&cx, Buffer!::new()).save(&cx), node.pos),
                     }
                 },
                 Some(t) => ptypes.push(&cx, self.ty(&cx, t, scope)?),
             };
             let unit = match decl {
                 Some(d) => if d.kind.is(&cx, "extern") && !implicit.is_empty(&cx) {
-                    return sig_error(Buffer!::new().push_static("a closure parameter of extern ").push_bytes(&cx, d.name).push_static(" needs [Env]").save(&cx), p.pos);
+                    return sig_error(f"a closure parameter of extern {d.name} needs [Env]".write(&cx, Buffer!::new()).save(&cx), p.pos);
                 },
                 None => (),
             };
@@ -1495,13 +1495,13 @@ impl Signatures['k] {
             var d = 0usize;
             while d < methods.len(&cx) {
                 if methods.at(&cx, d).name.eq(&cx, m.name) {
-                    return sig_error(Buffer!::new().push_static("method ").push_bytes(&cx, m.name).push_static(" is declared twice").save(&cx), m.pos);
+                    return sig_error(f"method {m.name} is declared twice".write(&cx, Buffer!::new()).save(&cx), m.pos);
                 }
                 d = d + 1usize;
             }
             let sig = self.signature(&cx, Option::None, fn_header(m), ArenaVec::new(&cx), ArenaVec::new(&cx), Option::Some.(scope), Option::Some.(m.name))?;
             if !sig.params.is_empty(&cx) {
-                return sig_error(Buffer!::new().push_static("trait method ").push_bytes(&cx, m.name).push_static(" cannot be generic itself").save(&cx), no_pos());
+                return sig_error(f"trait method {m.name} cannot be generic itself".write(&cx, Buffer!::new()).save(&cx), no_pos());
             }
             methods.push(&cx, C::Method.{ name: m.name, ret: sig.ret, ptypes: sig.ptypes, is_unsafe: sig.is_unsafe, places: sig.places });
             i = i + 1usize;
@@ -1573,10 +1573,10 @@ impl Signatures['k] {
         while i < item.methods.len(&cx) {
             let node = item.methods.at(&cx, i);
             if defined.contains(&cx, node.name) {
-                return sig_error(Buffer!::new().push_static("method ").push_bytes(&cx, node.name).push_static(" is defined twice").save(&cx), node.pos);
+                return sig_error(f"method {node.name} is defined twice".write(&cx, Buffer!::new()).save(&cx), node.pos);
             }
             if !declared.contains(&cx, node.name) {
-                return sig_error(Buffer!::new().push_bytes(&cx, node.name).push_static(" is not a method of trait ").push_bytes(&cx, written).save(&cx), node.pos);
+                return sig_error(f"{node.name} is not a method of trait {written}".write(&cx, Buffer!::new()).save(&cx), node.pos);
             }
             defined.insert(&cx, node.name, i);
             i = i + 1usize;
@@ -1586,12 +1586,12 @@ impl Signatures['k] {
             let method = tr.methods.at(&cx, m);
             let at = match defined.get(&cx, method.name) {
                 Some(k) => k,
-                None => return sig_error(Buffer!::new().push_static("the instance lacks trait method ").push_bytes(&cx, method.name).save(&cx), no_pos()),
+                None => return sig_error(Buffer!::new().put("the instance lacks trait method ").write(&cx, method.name).save(&cx), no_pos()),
             };
             let sig = inst.methods.at(&cx, at);
             let node = item.methods.at(&cx, at);
             if sig.params.len(&cx) > inst.params.len(&cx) || sig.premises.len(&cx) > inst.premises.len(&cx) {
-                return sig_error(Buffer!::new().push_static("instance method ").push_bytes(&cx, method.name).push_static(" cannot be generic itself").save(&cx), node.pos);
+                return sig_error(f"instance method {method.name} cannot be generic itself".write(&cx, Buffer!::new()).save(&cx), node.pos);
             }
             let wanted: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
             var k = 0usize;
@@ -1602,7 +1602,7 @@ impl Signatures['k] {
             let want = C::fn_type(&cx, wanted, subst(&cx, method.ret, head, self.counter), false, method.places);
             let got = C::fn_type(&cx, sig.ptypes, sig.ret, false, sig.places);
             if !equal(&cx, got, want) || sig.is_unsafe && !method.is_unsafe {
-                return sig_error(Buffer!::new().push_static("method ").push_bytes(&cx, method.name).push_static(" does not match its declaration in trait ").push_bytes(&cx, written).save(&cx), node.pos);
+                return sig_error(f"method {method.name} does not match its declaration in trait {written}".write(&cx, Buffer!::new()).save(&cx), node.pos);
             }
             m = m + 1usize;
         }
@@ -1616,7 +1616,7 @@ impl Signatures['k] {
             None => (),
         };
         if self.folding.contains(&cx, decl.id) {
-            return sig_error(Buffer!::new().push_static("const ").push_bytes(&cx, decl.name).push_static(" depends on itself").save(&cx), no_pos());
+            return sig_error(f"const {decl.name} depends on itself".write(&cx, Buffer!::new()).save(&cx), no_pos());
         }
         self.folding.insert(&cx, decl.id);
         let result = self.const_value(&cx, decl);
@@ -1646,8 +1646,8 @@ impl Signatures['k] {
         };
         if !C::same(&cx, got, want) {
             let spelling = surface(&cx, ArenaVec::two(&cx, got, want), ArenaVec::new(&cx), ArenaMap::new(&cx));
-            return sig_error(Buffer!::new().push_static("const ").push_bytes(&cx, name).push_static(" has type ").push_bytes(&cx, spelling.show(&cx, got))
-                .push_static(", but its declared type is ").push_bytes(&cx, spelling.show(&cx, want)).save(&cx), S::expr_pos(expr));
+            return sig_error(Buffer!::new().put("const ").write(&cx, name).put(" has type ").write(&cx, spelling.show(&cx, got))
+                .put(", but its declared type is ").write(&cx, spelling.show(&cx, want)).save(&cx), S::expr_pos(expr));
         }
         Result::Ok.(value)
     }
@@ -1694,7 +1694,7 @@ impl Signatures['k] {
                             Prim(n) => n,
                             _ => Span::from_static(&cx, ""),
                         };
-                        return sig_error(Buffer!::new().push_static("literal ").push_bytes(&cx, lit.text).push_static(" does not fit ").push_bytes(&cx, name).save(&cx), lit.pos);
+                        return sig_error(f"literal {lit.text} does not fit {name}".write(&cx, Buffer!::new()).save(&cx), lit.pos);
                     }
                     Result::Ok.(ConstValue::Float.(lit.text, prim))
                 },
@@ -1976,7 +1976,7 @@ impl Signatures['k] {
         } else if op.is(&cx, "^") {
             x ^ y
         } else {
-            fail(&cx, Buffer!::new().push_static("internal error: no constant operator ").push_bytes(&cx, op).save(&cx))
+            fail(&cx, Buffer!::new().put("internal error: no constant operator ").write(&cx, op).save(&cx))
         };
         Result::Ok.(wrapped(&cx, value, name))
     }
@@ -1985,12 +1985,12 @@ impl Signatures['k] {
     // minimum).
     fn literal(self, &cx: Domain!['k], magnitude: u64, negative: bool, name: Span['k], pos: Pos) -> Result[ConstValue['k], SigError['k]] {
         let spelled = if negative && magnitude != 0u64 {
-            Buffer!::new().push_static("-").push_u64(magnitude).save(&cx)
+            Buffer!::new().put("-").put(magnitude).save(&cx)
         } else {
-            Buffer!::new().push_u64(magnitude).save(&cx)
+            Buffer!::new().put(magnitude).save(&cx)
         };
         if !valid_literal(&cx, Type::Prim.(name), spelled) {
-            return sig_error(Buffer!::new().push_bytes(&cx, spelled).push_static(" does not fit ").push_bytes(&cx, name).save(&cx), pos);
+            return sig_error(f"{spelled} does not fit {name}".write(&cx, Buffer!::new()).save(&cx), pos);
         }
         // A literal fits its type: negated, its 64 bits are already sign-extended.
         Result::Ok.(ConstValue::Int.(if negative { 0u64 - magnitude } else { magnitude }, Type::Prim.(name)))

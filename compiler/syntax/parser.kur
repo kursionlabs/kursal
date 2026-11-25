@@ -11,6 +11,7 @@ use std::mem::Ref;
 use std::raw::Span;
 use std::arena::{Domain!, ref_in};
 use std::buffer::Buffer!;
+use std::fmt::Writer;
 use package::syntax::ast as S;
 use package::syntax::ast::{Expr, Pos, Statement, Type, no_pos};
 use std::slice::Slice;
@@ -133,7 +134,7 @@ impl Lexer['k] {
 
     fn fail_at(self, &cx: Domain!['k], offset: usize) -> ! {
         let (line, col) = self.loc(&cx, offset);
-        fail(&cx, Buffer!::new().push_bytes(&cx, self.file).push_static(":").push_u64(line as u64).push_static(":").push_u64(col as u64).push_static(": syntax error").save(&cx))
+        fail(&cx, f"{self.file}:{line}:{col}: syntax error".write(&cx, Buffer!::new()).save(&cx))
     }
 
     fn run(self, &cx: Domain!['k]) -> ArenaVec[Tok['k], 'k] {
@@ -413,7 +414,7 @@ impl Lexer['k] {
             return start + 3usize;
         }
         let pairs = Span::from_static(&cx, " .{ .( .. :: -> => == != <= >= << >> || && ");
-        if rest.len() >= 2usize && pairs.contains(&cx, Buffer!::new().push_static(" ").push_bytes(&cx, rest.slice(0usize, 2usize)).push_static(" ").save(&cx)) {
+        if rest.len() >= 2usize && pairs.contains(&cx, f" {rest.slice(0usize, 2usize)} ".write(&cx, Buffer!::new()).save(&cx)) {
             return start + 2usize;
         }
         let singles = Span::from_static(&cx, "-+*/%&|^!<>=.,;:()[]{}?");
@@ -445,18 +446,18 @@ impl Lexer['k] {
                 if ch == b'\\' {
                     // `\xHH`, or `\` and one byte
                     let width = if self.byte(&cx, i + 1usize) == b'x' && is_hex_digit(self.byte(&cx, i + 2usize)) && is_hex_digit(self.byte(&cx, i + 3usize)) { 4usize } else { 2usize };
-                    chunk = chunk.push_bytes(&cx, self.source.slice(i, i + width));
+                    chunk = chunk.write(&cx, self.source.slice(i, i + width));
                     i = i + width;
                 } else if (ch == b'{' || ch == b'}') && self.byte(&cx, i + 1usize) == ch {
-                    chunk = chunk.push_byte(ch);
+                    chunk = chunk.write_byte(ch);
                     i = i + 2usize;
                 } else if ch == b'}' {
                     let (line, col) = self.loc(&cx, begin);
-                    fail(&cx, Buffer!::new().push_u64(line as u64).push_static(":").push_u64(col as u64).push_static(": a lone '}' in an f-string").save(&cx));
+                    fail(&cx, f"{line}:{col}: a lone '}}' in an f-string".write(&cx, Buffer!::new()).save(&cx));
                 } else if ch == b'{' || ch == b'"' {
                     scanning = false;
                 } else {
-                    chunk = chunk.push_byte(ch);
+                    chunk = chunk.write_byte(ch);
                     i = i + 1usize;
                 }
             }
@@ -592,7 +593,7 @@ impl Parser['k] {
 
     fn fail(self, &cx: Domain!['k]) -> ! {
         let t = self.tok(&cx);
-        fail(&cx, Buffer!::new().push_bytes(&cx, self.file).push_static(":").push_u64(t.line as u64).push_static(":").push_u64(t.col as u64).push_static(": syntax error").save(&cx))
+        fail(&cx, f"{self.file}:{t.line}:{t.col}: syntax error".write(&cx, Buffer!::new()).save(&cx))
     }
 
     // One level of nesting more; `leave` ends it.
@@ -601,7 +602,7 @@ impl Parser['k] {
         self.depth.set(&cx, depth);
         if depth > NESTING {
             let t = self.tok(&cx);
-            fail(&cx, Buffer!::new().push_bytes(&cx, self.file).push_static(":").push_u64(t.line as u64).push_static(":").push_u64(t.col as u64).push_static(": nested too deeply (the limit is ").push_usize(NESTING).push_static(" levels)").save(&cx));
+            fail(&cx, f"{self.file}:{t.line}:{t.col}: nested too deeply (the limit is {NESTING} levels)".write(&cx, Buffer!::new()).save(&cx));
         }
     }
 
@@ -619,7 +620,7 @@ impl Parser['k] {
     fn name(self, &cx: Domain!['k]) -> Span['k] {
         let t = self.tok(&cx);
         if t.kind.is(&cx, "NAME") && t.text.ends_with(&cx, Span::from_static(&cx, "!")) {
-            fail(&cx, Buffer!::new().push_bytes(&cx, self.file).push_static(":").push_u64(t.line as u64).push_static(":").push_u64(t.col as u64).push_static(": only a linear type's name ends with !").save(&cx));
+            fail(&cx, f"{self.file}:{t.line}:{t.col}: only a linear type's name ends with !".write(&cx, Buffer!::new()).save(&cx));
         }
         self.expect(&cx, "NAME").text
     }
@@ -1811,7 +1812,7 @@ impl Parser['k] {
             let (digits, suffix) = split_int_suffix(&cx, word);
             let (value, ok) = int_value(&cx, digits);
             if !ok {
-                fail(&cx, Buffer!::new().push_bytes(&cx, self.file).push_static(":").push_u64(tok.line as u64).push_static(":").push_u64(tok.col as u64).push_static(": integer literal out of range").save(&cx));
+                fail(&cx, f"{self.file}:{tok.line}:{tok.col}: integer literal out of range".write(&cx, Buffer!::new()).save(&cx));
             }
             return S::Lit.{ id, kind: S::LitKind::Int, int: value, negative: false, text: word, suffix, pos: p };
         }
@@ -1850,7 +1851,7 @@ impl Parser['k] {
                 if byte && b > 127u8 {
                     self.error(&cx, tok, Span::from_static(&cx, "a byte literal's character is ASCII; write any other byte as \\xHH"));
                 }
-                out = out.push_byte(b);
+                out = out.write_byte(b);
                 i = i + 1usize;
             } else if raw.byte_or_zero(&cx, i + 1usize) == b'x' {
                 let high = raw.byte_or_zero(&cx, i + 2usize);
@@ -1860,9 +1861,9 @@ impl Parser['k] {
                 }
                 let value = hex_value(high) * 16u8 + hex_value(low);
                 if !byte && value > 127u8 {
-                    self.error(&cx, tok, Buffer!::new().push_static("\\x").push_bytes(&cx, raw.slice(i + 2usize, i + 4usize)).push_static(" is not ASCII; a string's \\x escape is at most \\x7f").save(&cx));
+                    self.error(&cx, tok, f"\\x{raw.slice(i + 2usize, i + 4usize)} is not ASCII; a string's \\x escape is at most \\x7f".write(&cx, Buffer!::new()).save(&cx));
                 }
-                out = out.push_byte(value);
+                out = out.write_byte(value);
                 i = i + 4usize;
             } else {
                 let c = raw.byte_or_zero(&cx, i + 1usize);
@@ -1882,9 +1883,9 @@ impl Parser['k] {
                     while end < raw.len() && (raw.byte_or_zero(&cx, end) & 192u8) == 128u8 {
                         end = end + 1usize;
                     }
-                    self.error(&cx, tok, Buffer!::new().push_static("unknown escape \\").push_bytes(&cx, raw.slice(i + 1usize, end)).save(&cx))
+                    self.error(&cx, tok, Buffer!::new().put("unknown escape \\").write(&cx, raw.slice(i + 1usize, end)).save(&cx))
                 };
-                out = out.push_byte(escaped);
+                out = out.write_byte(escaped);
                 i = i + 2usize;
             }
         }
@@ -1892,7 +1893,7 @@ impl Parser['k] {
     }
 
     fn error(self, &cx: Domain!['k], tok: Tok['k], message: Span['k]) -> ! {
-        fail(&cx, Buffer!::new().push_bytes(&cx, self.file).push_static(":").push_u64(tok.line as u64).push_static(":").push_u64(tok.col as u64).push_static(": ").push_bytes(&cx, message).save(&cx))
+        fail(&cx, f"{self.file}:{tok.line}:{tok.col}: {message}".write(&cx, Buffer!::new()).save(&cx))
     }
 }
 
@@ -1935,7 +1936,7 @@ fn without_underscores(&cx: Domain!['k], word: Span['k]) -> Span['k] {
     var i = 0usize;
     while i < word.len() {
         if word.byte_or_zero(&cx, i) != b'_' {
-            out = out.push_byte(word.byte_or_zero(&cx, i));
+            out = out.write_byte(word.byte_or_zero(&cx, i));
         }
         i = i + 1usize;
     }

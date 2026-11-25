@@ -1,4 +1,4 @@
-//! The writer protocol and formatting traits.
+//! The writer protocol and the printing and formatting traits.
 // core::fmt -- the writer protocol and formatting.
 //
 // Allocator-free: everything here works with any writer. `alloc::fmt`
@@ -17,11 +17,18 @@
 // `Format` carries an error type, so an f-string never has to infer one,
 // and the writer and every threaded input always come back.
 //
+// Every writer has two methods beside the protocol (a blanket impl):
+// `out.put(x)` prints `x` through `Printable[T, W]`, which uses `x` up, and
+// `out.write(&cx, bytes)` copies the bytes of any view `cx` can read:
+//
+//     Buffer!::new().put("line ").put(n).put(": ").write(&cx, text)
+//
 // `Format[T, W]` formats a `T` into any writer `W` and hands the value back:
 // formatting does not consume. The compiler expands `f"..."` into these
-// calls -- literal segments through `Writer::write_static`, `{expr}`
-// segments through `Format::format` -- so instances are written once,
-// generically over the writer, and work with every writer.
+// calls -- literal segments, and `{x}` of type `Str['static]`, through
+// `Writer::write_static`, every other `{x}` through `Format::format` -- so
+// instances are written once, generically over the writer, and work with
+// every writer.
 //
 // `f"...".write(out)` writes into `out` and hands it back.
 // `f"...".write(&cx, out)` also lends the f-string the capability in the
@@ -68,22 +75,35 @@ trait Writer {
     unsafe fn write_raw(self: Self, ptr: *u8, len: usize) -> Self;
 }
 
-/// Writes any readable byte view's bytes, reading through its capability.
-forall W, C, S where Writer[W], ReadBytes[C, S], Copy[S].
-fn write_bytes(out: W, &cx: C, bytes: S) -> W {
-    let n = ReadBytes[C, S]::len(&cx, bytes);
-    var o = out;
-    var i = 0usize;
-    while i < n {
-        let b = ReadBytes[C, S]::get(&cx, bytes, i);
-        let next = match b {
-            Some(x) => Writer[W]::write_byte(o, x),
-            None => o,
-        };
-        o = next;
-        i = i + 1usize;
+/// What every writer can do with the protocol: print a value into it, and
+/// copy in the bytes of any view it can read.
+forall W where Writer[W].
+impl W {
+    /// Prints `x` into the writer (`Printable`), using `x` up:
+    /// `Buffer!::new().put("line ").put(n)`.
+    forall T where Printable[T, W].
+    fn put(self, x: T) -> W {
+        Printable[T, W]::print(x, self)
     }
-    o
+
+    /// Writes the bytes of any readable byte view, read through the
+    /// capability that permits it. Never consumes the view itself.
+    forall C, S where ReadBytes[C, S], Copy[S].
+    fn write(self, &cx: C, bytes: S) -> W {
+        let n = ReadBytes[C, S]::len(&cx, bytes);
+        var o = self;
+        var i = 0usize;
+        while i < n {
+            let b = ReadBytes[C, S]::get(&cx, bytes, i);
+            let next = match b {
+                Some(x) => Writer[W]::write_byte(o, x),
+                None => o,
+            };
+            o = next;
+            i = i + 1usize;
+        }
+        o
+    }
 }
 
 /// Writes the decimal digits of `n`, most significant first.
@@ -330,11 +350,126 @@ instance Format[bool, W] {
     }
 }
 
-/// A static byte slice formats as its bytes.
+/// A value that can be printed into a writer `W`; printing uses it up.
+///
+/// `out.put(x)` prints through it, as does `std::io::print(x)`. Unlike
+/// `Format`, which an f-string's `{x}` goes through, it hands nothing back,
+/// so it can take an owned value, a `Buffer!`, and free it.
+forall T, W.
+trait Printable {
+    /// Writes `value` to `out`.
+    fn print(value: T, out: W) -> W;
+}
+
+/// A `'static` byte view prints as its bytes.
 forall W where Writer[W].
-instance Format[Slice[u8, 'static], W] {
-    fn format(value: Slice[u8, 'static], out: W) -> (Slice[u8, 'static], W) {
-        (value, Writer[W]::write_static(out, value))
+instance Printable[Slice[u8, 'static], W] {
+    fn print(value: Slice[u8, 'static], out: W) -> W {
+        Writer[W]::write_static(out, value)
+    }
+}
+
+/// A `u8` prints as its decimal digits.
+forall W where Writer[W].
+instance Printable[u8, W] {
+    fn print(value: u8, out: W) -> W {
+        write_u64(out, (value as u64))
+    }
+}
+
+/// A `u16` prints as its decimal digits.
+forall W where Writer[W].
+instance Printable[u16, W] {
+    fn print(value: u16, out: W) -> W {
+        write_u64(out, (value as u64))
+    }
+}
+
+/// A `u32` prints as its decimal digits.
+forall W where Writer[W].
+instance Printable[u32, W] {
+    fn print(value: u32, out: W) -> W {
+        write_u64(out, (value as u64))
+    }
+}
+
+/// A `u64` prints as its decimal digits.
+forall W where Writer[W].
+instance Printable[u64, W] {
+    fn print(value: u64, out: W) -> W {
+        write_u64(out, value)
+    }
+}
+
+/// A `usize` prints as its decimal digits.
+forall W where Writer[W].
+instance Printable[usize, W] {
+    fn print(value: usize, out: W) -> W {
+        write_u64(out, (value as u64))
+    }
+}
+
+/// An `i8` prints as its decimal digits, after `-` when negative.
+forall W where Writer[W].
+instance Printable[i8, W] {
+    fn print(value: i8, out: W) -> W {
+        write_i64(out, (value as i64))
+    }
+}
+
+/// An `i16` prints as its decimal digits, after `-` when negative.
+forall W where Writer[W].
+instance Printable[i16, W] {
+    fn print(value: i16, out: W) -> W {
+        write_i64(out, (value as i64))
+    }
+}
+
+/// An `i32` prints as its decimal digits, after `-` when negative.
+forall W where Writer[W].
+instance Printable[i32, W] {
+    fn print(value: i32, out: W) -> W {
+        write_i64(out, (value as i64))
+    }
+}
+
+/// An `i64` prints as its decimal digits, after `-` when negative.
+forall W where Writer[W].
+instance Printable[i64, W] {
+    fn print(value: i64, out: W) -> W {
+        write_i64(out, value)
+    }
+}
+
+/// An `isize` prints as its decimal digits, after `-` when negative.
+forall W where Writer[W].
+instance Printable[isize, W] {
+    fn print(value: isize, out: W) -> W {
+        write_i64(out, (value as i64))
+    }
+}
+
+/// An `f32` prints as the shortest decimal that reads back as it (`write_f32`).
+forall W where Writer[W].
+instance Printable[f32, W] {
+    fn print(value: f32, out: W) -> W {
+        write_f32(out, value)
+    }
+}
+
+/// An `f64` prints as the shortest decimal that reads back as it (`write_f64`).
+forall W where Writer[W].
+instance Printable[f64, W] {
+    fn print(value: f64, out: W) -> W {
+        write_f64(out, value)
+    }
+}
+
+/// A `bool` prints as `true` or `false`.
+forall W where Writer[W].
+instance Printable[bool, W] {
+    fn print(value: bool, out: W) -> W {
+        Writer[W]::write_static(out, if value { "true" } else { "false" })
     }
 }
 
@@ -343,7 +478,7 @@ forall C, S, W where ReadBytes[C, S], Copy[S], Writer[W].
 instance Format[Readable[C, S], W] {
     fn format(value: Readable[C, S], out: W) -> (Readable[C, S], W) {
         var { cap: c, bytes: s } = value;
-        let o = write_bytes(out, &c, s);
+        let o = out.write(&c, s);
         (Readable.{ cap: c, bytes: s }, o)
     }
 }
@@ -399,7 +534,19 @@ forall W, C, 'r where Writer[W], ReadBytes[C, Span['r]].
 instance Format[Span['r], ReadingWriter![W, C]] {
     fn format(value: Span['r], out: ReadingWriter![W, C]) -> (Span['r], ReadingWriter![W, C]) {
         var { out: o, cx } = out;
-        let o2 = write_bytes(o, &cx, value);
+        let o2 = o.write(&cx, value);
+        (value, ReadingWriter!.{ out: o2, cx })
+    }
+}
+
+/// A borrowed byte view formats as its bytes, read through the writer's
+/// context: `f"{name}".write(&cx, out)` with `name: Str['k]`. A `'static`
+/// one in an f-string is written directly, as literal text is.
+forall W, C, 'r where Writer[W], ReadBytes[C, Slice[u8, 'r]].
+instance Format[Slice[u8, 'r], ReadingWriter![W, C]] {
+    fn format(value: Slice[u8, 'r], out: ReadingWriter![W, C]) -> (Slice[u8, 'r], ReadingWriter![W, C]) {
+        var { out: o, cx } = out;
+        let o2 = o.write(&cx, value);
         (value, ReadingWriter!.{ out: o2, cx })
     }
 }

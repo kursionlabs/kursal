@@ -1,42 +1,22 @@
 //! Formatting adapters for owning byte buffers.
-// alloc::fmt -- writers and formatting. Re-exports `core::fmt`'s
-// allocator-free protocol and adds what needs `Buffer!`: its `Writer` and
-// `Format` instances, and `FixedWriter!`. `f"..."`
-// expands through the `Writer` and `Format` names exported here.
+// alloc::fmt -- writers, printing and formatting. Re-exports `core::fmt`'s
+// allocator-free protocol and adds what needs `Buffer!`: its `Format` and
+// `Printable` instances, and `FixedWriter!`. `f"..."` expands through the
+// `Writer` and `Format` names exported here. `Buffer!`'s own `Writer`
+// instance is in `alloc::buffer`, beside its fields.
 
 use package as alloc;
 
-use core::fmt::{Writer, write_bytes, write_u64, write_i64, write_f64, write_f32, Format, ReadingWriter!, CountingWriter};
+use core::fmt::{Writer, Format, Printable, ReadingWriter!, CountingWriter};
 export Writer;
-export write_bytes;
-export write_u64;
-export write_i64;
-export write_f64;
-export write_f32;
 export Format;
+export Printable;
 export ReadingWriter!;
 export CountingWriter;
 use core::slice::{Slice, StaticRead};
 use core::raw::raw_byte_at;
 use core::option::Result;
 use alloc::buffer::Buffer!;
-
-/// A buffer as a writer: every write appends.
-///
-/// Infallible: `Buffer!` aborts on out-of-memory.
-instance Writer[Buffer!] {
-    fn write_byte(self: Buffer!, byte: u8) -> Buffer! {
-        self.push_byte(byte)
-    }
-    fn write_static(self: Buffer!, bytes: Slice[u8, 'static]) -> Buffer! {
-        self.push_static(bytes)
-    }
-    /// Caller: as for `Writer::write_raw`, `ptr[0..len)` is readable for the
-    /// whole call.
-    unsafe fn write_raw(self: Buffer!, ptr: *u8, len: usize) -> Buffer! {
-        unsafe self.push_n(ptr, len)
-    }
-}
 
 /// Formats an owned buffer as its contents. The buffer is handed back, not
 /// freed: an f-string formats a linear value only through `{&name}`.
@@ -48,6 +28,20 @@ instance Format[Buffer!, W] {
         let (ptr, len, marker) = bytes.into_parts();
         let o = unsafe Writer[W]::write_raw(out, ptr, len);
         (restore.restore(tag), o)
+    }
+}
+
+/// A buffer prints as its contents, and is freed.
+forall W where Writer[W].
+instance Printable[Buffer!, W] {
+    fn print(value: Buffer!, out: W) -> W {
+        var value = value;
+        let p = unsafe &value.as_ptr();
+        let n = &value.len();
+        // `p` addresses the `n` bytes `value` holds until it is freed below.
+        let o = unsafe Writer[W]::write_raw(out, p, n);
+        value.destroy();
+        o
     }
 }
 
@@ -89,12 +83,12 @@ instance Writer[FixedWriter!] {
         if full || n >= cap {
             FixedWriter!.{ buf, cap, full: true }
         } else {
-            FixedWriter!.{ buf: buf.push_byte(byte), cap, full }
+            FixedWriter!.{ buf: buf.write_byte(byte), cap, full }
         }
     }
     fn write_static(self: FixedWriter!, bytes: Slice[u8, 'static]) -> FixedWriter! {
         var sr = StaticRead::new();
-        write_bytes(self, &sr, bytes)
+        self.write(&sr, bytes)
     }
     /// Caller: as for `Writer::write_raw`, `ptr[0..len)` is readable for the
     /// whole call.

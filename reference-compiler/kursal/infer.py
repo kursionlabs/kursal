@@ -25,6 +25,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence, Set
 from typing import Literal, Never, Optional, assert_never
 from dataclasses import dataclass, field
+from functools import partial
 from itertools import count
 from . import core as C
 from . import syntax as S
@@ -748,19 +749,31 @@ class Infer:
                 return m
             case S.Lit(kind="bool"):
                 return C.BOOL
-        return C.Named(self.library("Slice"), (C.Prim("u8"), C.Skolem("static")))
+        return self.static_slice()
 
     def expr_fstring(self, expr: S.FStr, writer: C.Type) -> C.Type:
-        """Each `{x}` of the f-string needs `Format[X, W]`, for `W` the `writer` it is written into."""
-        fmt = self.library("Format")
-        for part in expr.parts:
+        """Each `{x}` of the f-string needs `Format[X, W]`, for `W` the `writer` it is written into, but
+        one of type `Slice[u8, 'static]`, which is written as the text around it is, by `write_static`."""
+        for index, part in enumerate(expr.parts):
             if isinstance(part, str):
                 continue
             lent = isinstance(part, S.Unary) and part.op == "&"
             operand = part.operand if isinstance(part, S.Unary) and lent else part
             value = self.place_type(operand, lend=True) if lent and self.is_place(operand) else self.expr(operand)
-            self.require(fmt, [value, writer], part.pos)
+            self.wait(partial(ground, value), partial(self.placeholder, expr, index, value, writer, part.pos), part.pos)
         return C.Named(self.library("Buffer!"))
+
+    def placeholder(self, expr: S.FStr, index: int, value: C.Type, writer: C.Type, pos: Optional[Position]) -> None:
+        """The `{x}` part `index` of `expr`, once its type is known: written as text when it is a
+        `Slice[u8, 'static]`, else through `Format`."""
+        if equal(zonk(value), self.static_slice()):
+            expr.static_parts.add(index)
+        else:
+            self.require(self.library("Format"), [value, writer], pos)
+
+    def static_slice(self) -> C.Type:
+        """`Slice[u8, 'static]`, the type of a string literal."""
+        return C.Named(self.library("Slice"), (C.Prim("u8"), C.Skolem("static")))
 
     def fstring_reading(self, expr: S.Call, string: S.FStr) -> C.Type:
         """`f"...".write(&cx, out)`: the f-string is written into `ReadingWriter![W, C]`, which wraps `out: W`
@@ -1519,16 +1532,21 @@ class Infer:
         return candidates[0]
 
     def import_hint(self, name: str) -> str:
-        """For a method no visible trait provides: the traits of one input that provide it but are not
-        visible in the calling module, to import."""
+        """For a method no visible trait provides: the traits not visible in the calling module that
+        would provide it, to import: a trait of one input with the method, or a trait bounding a
+        blanket impl that has it."""
         visible = self.visible_traits(self.module)
-        hidden = sorted({self.decl_of[n].name for n, tr in self.sigs.traits.items()
-                         if self.inputs.get(n) == 1 and self.decl_of[n] not in visible and any(m.name == name for m in tr.methods)})
-        if not hidden:
+        hidden = {self.decl_of[n].name for n, tr in self.sigs.traits.items()
+                  if self.inputs.get(n) == 1 and self.decl_of[n] not in visible and any(m.name == name for m in tr.methods)}
+        for d in self.r.attached.get((None, name), []):
+            if d.kind == "method":
+                hidden.update(b.name for b in self.blanket_bounds(d) if b not in visible)
+        names = sorted(hidden)
+        if not names:
             return ""
-        if len(hidden) == 1:
-            return f"; the trait {hidden[0]} provides it, import it"
-        return f"; the traits {listed(hidden)} provide it, import one"
+        if len(names) == 1:
+            return f"; the trait {names[0]} provides it, import it"
+        return f"; the traits {listed(names)} provide it, import one"
 
     def visible_traits(self, module: C.ModuleId) -> set[Decl]:
         """The traits a name in `module`'s scope resolves to: declared, imported by name or glob, or
@@ -1561,15 +1579,20 @@ class Infer:
         """A blanket impl's method is found from a package that is the impl's or depends on it, directly
         or through other packages, when every trait bounding the impl's type parameter is visible there
         (and it has one)."""
+        bounds = self.blanket_bounds(method)
+        return bool(bounds) and all(b in visible for b in bounds)
+
+    def blanket_bounds(self, method: Decl) -> list[Decl]:
+        """The traits bounding the type parameter of a blanket impl's method, none when the calling
+        module's package is not the impl's and does not depend on it."""
         if not self.depends_on(self.module.package, method.module.package):
-            return False
+            return []
         impl = method.impl
         assert impl is not None and impl.forall is not None and isinstance(impl.type, S.TName)
         param = impl.type.path[0]
-        bounds = [args.ref[1] for _, args in impl.forall.premises
-                  if args.args and isinstance(args.args[0], S.TName) and args.args[0].path == (param,)
-                  and args.ref is not None and args.ref[0] == "decl"]
-        return bool(bounds) and all(b in visible for b in bounds)
+        return [args.ref[1] for _, args in impl.forall.premises
+                if args.args and isinstance(args.args[0], S.TName) and args.args[0].path == (param,)
+                and args.ref is not None and args.ref[0] == "decl"]
 
     def depends_on(self, package: int, target: int) -> bool:
         """`package` is `target` or depends on it, directly or through other packages."""
