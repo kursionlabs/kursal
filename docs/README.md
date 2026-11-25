@@ -166,5 +166,13 @@ and a browser never keeps a stale copy. The search index is a page, not an asset
 its name. To serve the site from a subdirectory, set `base_path` in `docs/generated/krayon.toml`
 before building.
 
+## Publishing
+
+The `API docs` workflow (`.github/workflows/docs.yml`) builds the site as above on every push to
+`main` and deploys it to GitHub Pages, with the `base_path` Pages reports for the repository. It
+checks out Krayon and Kable beside the repository, bootstraps the compiler and builds Krayon
+first. A pull request that changes `lib/`, `compiler/`, `docs/site/` or the workflow builds the
+site without deploying it, so a broken link fails the check.
+
 This is a source-derived API site. It does not yet provide full language-guide
 chapters.

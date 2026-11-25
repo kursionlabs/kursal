@@ -1,0 +1,104 @@
+name: API docs
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "lib/**"
+      - "compiler/**"
+      - "docs/site/**"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out kursal
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: kursal
+          persist-credentials: false
+
+      # The site is built by Krayon, which is written in kursal and links Kable for its preview
+      # server; the three repositories sit side by side, as Krayon's README describes.
+      - name: Check out Krayon
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kursionlabs/krayon
+          ref: main
+          path: krayon
+          persist-credentials: false
+
+      - name: Check out Kable
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kursionlabs/kable
+          ref: main
+          path: kable
+          persist-credentials: false
+
+      - name: Install build libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libuv1-dev libllhttp-dev pkg-config
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Bootstrap kursal
+        working-directory: kursal
+        run: scripts/bootstrap.sh
+
+      - name: Build Krayon
+        working-directory: krayon
+        run: |
+          mkdir -p bin
+          ../kursal/bin/kursal build krayon -o bin/krayon
+
+      # Pages serves a project site under the repository's name, so the site's links take the
+      # prefix configure-pages reports.
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      # Generates the pages of lib/std and its dependencies, adds the theme from docs/site, and
+      # builds them; Krayon fails the build on a broken local link or anchor.
+      - name: Build the docs site
+        working-directory: kursal
+        env:
+          BASE_PATH: ${{ steps.pages.outputs.base_path }}
+        run: |
+          bin/kursal doc lib/std -o docs/generated/src
+          cp -R docs/site/. docs/generated
+          printf 'base_path = "%s"\n' "$BASE_PATH" >> docs/generated/krayon.toml
+          ../krayon/bin/krayon build docs/generated
+
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: kursal/docs/generated/dist
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
