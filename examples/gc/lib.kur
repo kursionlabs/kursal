@@ -1,0 +1,176 @@
+// A garbage-collected heap in library code (`gc`), holding a list, a cycle
+// nothing reaches, an object that owns a linear resource, and an object
+// whose `Markable` instance forgets one of its edges.
+use package::gc::{Collectable, Gc, Heap!, Marker!, Markable};
+use std::io::print;
+
+forall 'g.
+exposed enum Value {
+    Nil,
+    Int(i64),
+    Pair(Gc[Cell['g], 'g]),
+}
+
+forall 'g.
+exposed struct Cell {
+    name: u32,
+    car: Value['g],
+    cdr: Value['g],
+}
+
+forall 'g.
+fn mark_value(&marker: Marker!['g], v: Value['g]) {
+    match v {
+        Pair(r) => &marker.mark(r),
+        _ => (),
+    }
+}
+
+forall 'g.
+instance Markable[Cell['g], 'g] {
+    fn mark(&cell: Cell['g], &marker: Marker!['g]) {
+        mark_value(&marker, cell.car);
+        mark_value(&marker, cell.cdr);
+    }
+}
+
+forall 'g.
+instance Collectable[Cell['g]] {
+    fn collect(cell: Cell['g]) {
+        print(f"collected cell {cell.name}\n");
+    }
+}
+
+// A file, which must be closed: a linear resource a heap object can own.
+exposed struct File! {
+    id: u32,
+}
+
+fn close(file: File!) {
+    let { id } = file;
+    print(f"closed file {id}\n");
+}
+
+exposed struct Owner! {
+    file: File!,
+}
+
+forall 'g.
+instance Markable[Owner!, 'g] {
+    fn mark(&owner: Owner!, &marker: Marker!['g]) {}
+}
+
+instance Collectable[Owner!] {
+    fn collect(owner: Owner!) {
+        let { file } = owner;
+        close(file);
+    }
+}
+
+// A cell whose `Markable` instance marks `kept` and forgets `forgotten`: a
+// bug in user code, which costs the object, not memory safety.
+forall 'g.
+exposed struct Leaky {
+    kept: Value['g],
+    forgotten: Value['g],
+}
+
+forall 'g.
+instance Markable[Leaky['g], 'g] {
+    fn mark(&leaky: Leaky['g], &marker: Marker!['g]) {
+        mark_value(&marker, leaky.kept);
+    }
+}
+
+forall 'g.
+instance Collectable[Leaky['g]] {
+    fn collect(leaky: Leaky['g]) {
+        print("collected the leaky cell\n");
+    }
+}
+
+// The sum of the integers along a list, as far as it can still be read.
+forall 'g.
+fn sum(&heap: Heap!['g], list: Value['g]) -> i64 {
+    var total = 0i64;
+    var at = list;
+    var going = true;
+    while going {
+        match at {
+            Pair(r) => match &heap.with(r, |&cell| (cell.car, cell.cdr)) {
+                Some(fields) => {
+                    let (car, cdr) = fields;
+                    match car {
+                        Int(n) => {
+                            total = total + n;
+                        },
+                        _ => (),
+                    }
+                    at = cdr;
+                },
+                None => {
+                    going = false;
+                },
+            },
+            _ => {
+                going = false;
+            },
+        }
+    }
+    total
+}
+
+// The heap's brand is a parameter here, so the closures below may mention it
+// (a closure cannot mention a brand its own block opened).
+forall 'g.
+fn run(&heap: Heap!['g]) {
+    // A list 1 -> 2 -> 3.
+    let c3 = &heap.alloc(Cell.{ name: 3, car: Value::Int.(30), cdr: Value::Nil });
+    let c2 = &heap.alloc(Cell.{ name: 2, car: Value::Int.(20), cdr: Value::Pair.(c3) });
+    let root = &heap.alloc(Cell.{ name: 1, car: Value::Int.(10), cdr: Value::Pair.(c2) });
+    // A cycle 4 <-> 5 that nothing else reaches.
+    let c4 = &heap.alloc(Cell.{ name: 4, car: Value::Nil, cdr: Value::Nil });
+    let c5 = &heap.alloc(Cell.{ name: 5, car: Value::Nil, cdr: Value::Pair.(c4) });
+    let linked = &heap.with(c4, |&cell| {
+        cell.cdr = Value::Pair.(c5);
+    });
+    // A file, owned by an object nothing reaches.
+    let owner = &heap.alloc(Owner!.{ file: File!.{ id: 7 } });
+    let count = &heap.live();
+    print(f"{count} objects\n");
+
+    let n = &heap.collect(root);
+    let total = sum(&heap, Value::Pair.(root));
+    let left = &heap.live();
+    print(f"collected {n}, {left} left; the list sums to {total}\n");
+
+    // Cell 6 reuses the header cell 4 had; cell 4's handle still reads as
+    // gone, because the header's generation has moved on.
+    let c6 = &heap.alloc(Cell.{ name: 6, car: Value::Int.(60), cdr: Value::Nil });
+    match &heap.with(c4, |&cell| cell.name) {
+        Some(name) => print(f"cell 4's handle reads cell {name}\n"),
+        None => print("cell 4's handle reads as gone\n"),
+    }
+
+    // The leaky cell keeps the list and forgets cell 6, which is collected
+    // though the leaky cell still points at it.
+    let leaky = &heap.alloc(Leaky.{ kept: Value::Pair.(root), forgotten: Value::Pair.(c6) });
+    let m = &heap.collect(leaky);
+    match &heap.with(leaky, |&l| (l.forgotten, l.kept)) {
+        Some(edges) => {
+            let (forgotten, kept_edge) = edges;
+            let lost = sum(&heap, forgotten);
+            let kept = sum(&heap, kept_edge);
+            print(f"collected {m}; the forgotten edge sums to {lost}, the kept one to {kept}\n");
+        },
+        None => {
+            print("the leaky cell is gone\n");
+        },
+    }
+}
+
+fn main() {
+    var exists 'g. heap = Heap!::new();
+    run(&heap);
+    heap.destroy();
+}
