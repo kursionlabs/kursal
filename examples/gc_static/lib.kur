@@ -1,0 +1,148 @@
+// A copying garbage collector in library code (`gc`) whose collection moves
+// the surviving objects under a new brand, so a handle into the old heap
+// is a type error rather than a runtime check. Each round adds to a list
+// and leaves garbage beside it; a ring of two cells shows a cycle surviving.
+use package::gc::{Gc, Heap!, Space!, Trace, Tracer!};
+use std::io::print;
+
+forall 'g.
+exposed enum Value {
+    Nil,
+    Int(i64),
+    Pair(Gc[Cell['g], 'g]),
+}
+
+forall 'g.
+exposed struct Cell {
+    name: u32,
+    car: Value['g],
+    cdr: Value['g],
+}
+
+/// What the program keeps across a collection.
+forall 'g.
+exposed struct Roots {
+    list: Value['g],
+    ring: Gc[Cell['g], 'g],
+}
+
+forall 'g, 'h.
+fn move_value(v: Value['g], &tracer: Tracer!['g, 'h]) -> Value['h] {
+    match v {
+        Nil => Value::Nil,
+        Int(n) => Value::Int.(n),
+        Pair(r) => Value::Pair.(&tracer.relocate(r)),
+    }
+}
+
+// Each instance builds the value under 'h from the one under 'g: leaving a
+// field's handle unmoved would not type-check.
+forall 'g, 'h.
+instance Trace[Value['g], 'g, 'h -> Value['h]] {
+    fn trace(v: Value['g], &tracer: Tracer!['g, 'h]) -> Value['h] {
+        move_value(v, &tracer)
+    }
+}
+
+forall 'g, 'h.
+instance Trace[Cell['g], 'g, 'h -> Cell['h]] {
+    fn trace(cell: Cell['g], &tracer: Tracer!['g, 'h]) -> Cell['h] {
+        let car = move_value(cell.car, &tracer);
+        let cdr = move_value(cell.cdr, &tracer);
+        Cell.{ name: cell.name, car, cdr }
+    }
+}
+
+forall 'g, 'h.
+instance Trace[Roots['g], 'g, 'h -> Roots['h]] {
+    fn trace(roots: Roots['g], &tracer: Tracer!['g, 'h]) -> Roots['h] {
+        let list = move_value(roots.list, &tracer);
+        let ring = &tracer.relocate(roots.ring);
+        Roots.{ list, ring }
+    }
+}
+
+// The sum of the integers along a list.
+forall 'g.
+fn sum(&heap: Heap!['g], list: Value['g]) -> i64 {
+    var total = 0i64;
+    var at = list;
+    var going = true;
+    while going {
+        match at {
+            Pair(r) => {
+                let fields = &heap.with(r, |&cell| (cell.car, cell.cdr));
+                let (car, cdr) = fields;
+                match car {
+                    Int(n) => {
+                        total = total + n;
+                    },
+                    _ => (),
+                }
+                at = cdr;
+            },
+            _ => {
+                going = false;
+            },
+        }
+    }
+    total
+}
+
+// The names of the ring's cells, going round from `start` until back.
+forall 'g.
+fn ring_names(&heap: Heap!['g], start: Gc[Cell['g], 'g]) -> (u32, u32, u32) {
+    let first = &heap.with(start, |&cell| (cell.name, cell.cdr));
+    let (a, next) = first;
+    match next {
+        Pair(r) => {
+            let second = &heap.with(r, |&cell| (cell.name, cell.cdr));
+            let (b, back) = second;
+            match back {
+                Pair(s) => (a, b, &heap.with(s, |&cell| cell.name)),
+                _ => (a, b, 0u32),
+            }
+        },
+        _ => (a, 0u32, 0u32),
+    }
+}
+
+// One round: a cell added to the list, a cell of garbage beside it, then a
+// collection into a heap under a new brand, and the next round there.
+forall 'g.
+fn rounds(heap: Heap!['g], roots: Roots['g], round: i64, last: i64) {
+    var heap = heap;
+    let garbage: Gc[Cell['g], 'g] = &heap.alloc(Cell.{ name: 0, car: Value::Int.(-1), cdr: Value::Nil });
+    let cell = &heap.alloc(Cell.{ name: round as u32, car: Value::Int.(round * 10), cdr: roots.list });
+    let before = &heap.live();
+    let exists 'h. space = Space!::fresh();
+    let (moved, kept) = heap.collect(space, Roots.{ list: Value::Pair.(cell), ring: roots.ring });
+    var next = moved;
+    let after = &next.live();
+    let total = sum(&next, kept.list);
+    let (a, b, c) = ring_names(&next, kept.ring);
+    print(f"round {round}: {before} objects, {after} after collecting; the list sums to {total}; the ring goes {a} {b} {c}\n");
+    if round == last {
+        next.destroy();
+    } else {
+        rounds(next, kept, round + 1, last);
+    }
+}
+
+// A ring of two cells, each the other's cdr.
+forall 'g.
+fn ring(&heap: Heap!['g]) -> Gc[Cell['g], 'g] {
+    let x = &heap.alloc(Cell.{ name: 100, car: Value::Nil, cdr: Value::Nil });
+    let y = &heap.alloc(Cell.{ name: 200, car: Value::Nil, cdr: Value::Pair.(x) });
+    &heap.with(x, |&cell| {
+        cell.cdr = Value::Pair.(y);
+    });
+    x
+}
+
+fn main() {
+    let exists 'g. space = Space!::fresh();
+    var heap = Heap!::new(space);
+    let x = ring(&heap);
+    rounds(heap, Roots.{ list: Value::Nil, ring: x }, 1, 3);
+}

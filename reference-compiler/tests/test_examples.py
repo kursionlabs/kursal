@@ -80,6 +80,8 @@ GC_OUT = ("6 objects\nclosed file 7\ncollected cell 5\ncollected cell 4\ncollect
           "cell 4's handle reads as gone\ncollected cell 6\n"
           "collected 1; the forgotten edge sums to 0, the kept one to 60\ncollected the leaky cell\n"
           "collected cell 1\ncollected cell 2\ncollected cell 3\n")
+GC_STATIC_OUT = "".join(f"round {r}: {r + 3} objects, {r + 2} after collecting; the list sums to {s}; "
+                        "the ring goes 100 200 100\n" for r, s in ((1, 10), (2, 30), (3, 60)))
 FOREACH_TYPES_OUT = ("weighed: 14\nin a tuple, an enum and an array: 28\nbehind a pointer and in a package: 20\n"
                      "through a generic field: 5 6, 1 value\nnested: 40 bytes\n"
                      "through a pointer to a sum: 32 bytes\nsplit and merged: 30, then 3\n")
@@ -184,6 +186,7 @@ RUNS: dict[str, tuple[tuple, ...]] = {
     "sayhi": (((), "", "Hello, !\n", 0),),
     "shared_readers": (((), "", "1160\n", 0),),
     "gc": (((), "", GC_OUT, 0),),
+    "gc_static": (((), "", GC_STATIC_OUT, 0),),
     "thread_sum": (((), "", 'first thread, "hello": 532\nsecond thread, "world!!": 618\ntotal: 1150\n', 0),),
     "traits": (((), "", "", 0),),
     "tuple_decl": (((), "", "", 0),),

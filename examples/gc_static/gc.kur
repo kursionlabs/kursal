@@ -1,0 +1,190 @@
+//! A copying garbage collector written as library code, whose collection
+//! moves every surviving object under a new brand, so the type system, not
+//! a runtime check, keeps a handle from outliving its object.
+//!
+//! A heap under the brand `'g` is made from a `Space!['g]`, the one token of
+//! a fresh brand, so each brand has one heap. Its objects stay put until
+//! `Heap!::collect` consumes the heap: it copies what the roots reach into
+//! a heap under a new brand `'h`, frees every object of `'g`, and hands back
+//! the new heap and the roots under `'h`. A `Gc[T, 'g]` left over names
+//! nothing, and nothing can read it: reading needs the `Heap!['g]` that
+//! `collect` consumed. So a handle is a bare pointer, read with no check.
+//!
+//! Every type stored in a heap, and the roots, say how they move from one
+//! brand to the next (`Trace`): an instance builds the value under `'h`
+//! from the value under `'g`, and the only way to a `Gc[_, 'h]` is
+//! `Tracer!::relocate`. An instance that forgot a handle would leave a
+//! `Gc[_, 'g]` where a `Gc[_, 'h]` belongs, which does not type-check.
+//!
+//! Objects are `Copy`: an object nothing reaches is freed without being
+//! read. Relocation is depth-first, so its depth is that of the longest
+//! path it follows.
+use std::cap::{Brand, Exclusive!};
+use std::heap::HeapAllocator;
+use std::heap::checked_add;
+use std::mem::{alignof, sizeof};
+use std::ptr::{is_null, null, offset};
+
+/// How a value moves from the brand `'g` to `'h`: `U` is `T` with `'g`
+/// replaced by `'h`, and every `Gc` it holds goes through `tracer`.
+forall T, 'g, 'h -> U.
+trait Trace {
+    fn trace(value: T, &tracer: Tracer!['g, 'h]) -> U;
+}
+
+/// The one token of a fresh brand, which a heap is made from.
+forall 'g.
+struct Space! {
+    marker: Brand['g],
+}
+
+impl Space! {
+    /// A brand no heap has had.
+    fn fresh() -> exists 'g. Space!['g] {
+        let exists 'g. (brand, tag) = Exclusive!::fresh();
+        tag.retire();
+        pack 'g. Space!.{ marker: brand }
+    }
+}
+
+/// The start of an object's block, the same whatever the object's type:
+/// where `collect` copied the object, and the next block of its heap. The
+/// value follows at `value_offset`.
+struct Link {
+    forward: *Link,
+    next: *Link,
+}
+
+/// Where a `T` starts in its block: past the `Link`, rounded up to `T`'s
+/// alignment.
+forall T.
+fn value_offset() -> usize {
+    let align = alignof[T]();
+    (sizeof[Link]() + align - 1usize) / align * align
+}
+
+/// A new block for a `T`, linked ahead of `next`, its value not yet written.
+forall T where Sized[T].
+fn new_block(next: *Link) -> (*Link, *T) {
+    let size = checked_add(value_offset[T](), sizeof[T]());
+    let raw = HeapAllocator::alloc(size).into_raw();
+    let link = unsafe (raw as *Link);
+    unsafe *link = Link.{ forward: null(), next };
+    (link, unsafe (unsafe offset(raw, value_offset[T]()) as *T))
+}
+
+/// A handle to an object of type `T` in the heap `'g`: its block and its
+/// value. `Copy`, and only this module makes one.
+forall T, 'g.
+struct Gc {
+    link: *Link,
+    value: *T,
+    marker: Brand['g],
+}
+
+/// A garbage-collected heap under the brand `'g`.
+forall 'g.
+struct Heap! {
+    marker: Brand['g],
+    // Every object's block, the most recent first.
+    all: *Link,
+    live: usize,
+}
+
+/// What `Trace` instances relocate handles through, during a collection
+/// from `'g` to `'h`: the heap being built. Linear and lent by place, so no
+/// instance can keep it.
+forall 'g, 'h.
+struct Tracer! {
+    from: Brand['g],
+    to: Heap!['h],
+}
+
+forall 'g.
+impl Heap!['g] {
+    /// An empty heap under the brand of `space`.
+    fn new(space: Space!['g]) -> Heap!['g] {
+        let { marker } = space;
+        Heap!.{ marker, all: null(), live: 0usize }
+    }
+
+    /// How many objects the heap holds.
+    fn live(&self) -> usize {
+        self.live
+    }
+
+    /// Puts `value` in the heap.
+    forall T where Copy[T], Sized[T].
+    fn alloc(&self, value: T) -> Gc[T, 'g] {
+        let { marker, all, live } = self;
+        let (link, at) = new_block[T](all);
+        unsafe *at = value;
+        self = Heap!.{ marker, all: link, live: live + 1usize };
+        Gc.{ link, value: at, marker }
+    }
+
+    /// Lends the object `r` names to `f` in place. `r` is of this heap, so
+    /// its object is live: objects of `'g` are freed only when `collect`
+    /// consumes the heap.
+    forall T, Ret where Sized[T].
+    fn with(&self, r: Gc[T, 'g], f: closure(&_: T) -> Ret) -> Ret {
+        let { link: _, value, marker: _ } = r;
+        f(unsafe &*value)
+    }
+
+    /// Copies what `roots` reach into a heap under the brand of `space`,
+    /// frees the rest, and hands back the new heap with the roots under its
+    /// brand.
+    forall R, S, 'h where Trace[R, 'g, 'h -> S].
+    fn collect(self, space: Space!['h], roots: R) -> (Heap!['h], S) {
+        let { marker: from, all, live } = self;
+        var tracer = Tracer!.{ from, to: Heap!::new(space) };
+        let moved = Trace[R, 'g, 'h -> S]::trace(roots, &tracer);
+        let { from: _, to } = tracer;
+        free_all(all);
+        (to, moved)
+    }
+
+    /// Frees every object.
+    fn destroy(self) {
+        let { marker: _, all, live: _ } = self;
+        free_all(all);
+    }
+}
+
+/// Frees every block of the list that starts at `all`.
+fn free_all(all: *Link) {
+    var at = all;
+    while !is_null(at) {
+        let { forward: _, next } = unsafe *at;
+        let freed = HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(unsafe (at as *u8)));
+        at = next;
+    }
+}
+
+forall 'g, 'h.
+impl Tracer!['g, 'h] {
+    /// The handle under `'h` of the object `r` names: its copy in the new
+    /// heap, made the first time the object is reached. The copy is
+    /// recorded before the object's own handles are traced, so a cycle
+    /// comes back to it.
+    forall T, U where Trace[T, 'g, 'h -> U], Copy[T], Sized[T], Sized[U].
+    fn relocate(&self, r: Gc[T, 'g]) -> Gc[U, 'h] {
+        let { link, value, marker: _ } = r;
+        let { forward, next } = unsafe *link;
+        let to = self.to.marker;
+        if !is_null(forward) {
+            return Gc.{ link: forward, value: unsafe (unsafe offset(unsafe (forward as *u8), value_offset[U]()) as *U), marker: to };
+        }
+        // The copy's block, linked into the new heap, and the forwarding
+        // pointer to it, before the object's own handles are traced.
+        let { from, to: heap } = self;
+        let { marker, all, live } = heap;
+        let (copy, at) = new_block[U](all);
+        self = Tracer!.{ from, to: Heap!.{ marker, all: copy, live: live + 1usize } };
+        unsafe *link = Link.{ forward: copy, next };
+        let moved = Trace[T, 'g, 'h -> U]::trace(unsafe *value, &self);
+        unsafe *at = moved;
+        Gc.{ link: copy, value: at, marker: to }
+    }
+}
