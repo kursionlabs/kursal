@@ -583,7 +583,7 @@ class ItemShapeTests(unittest.TestCase):
         self.assertIsInstance(r.ret, S.TNever)
 
     def test_exposure(self):
-        s = S.parse("exposed (package::resolve) struct Stamp! { marker: Brand['r] }")[0]
+        s = S.parse("exposed(package::resolve) struct Stamp! { marker: Brand['r] }")[0]
         self.assertEqual(s.exposed.scope, ("package", "resolve"))
         self.assertEqual(len(s.fields), 1)
         self.assertIsNone(S.parse("struct Hidden { x: u32 }")[0].exposed)

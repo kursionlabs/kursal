@@ -76,10 +76,10 @@ class TypeDeclTests(unittest.TestCase):
 
     def test_exposure_scope_must_enclose(self):
         root = tree({"p/kur.toml": manifest("p"), "p/lib.kur": "", "p/a/lib.kur": "",
-                     "p/a/b.kur": "exposed (package::a) struct S { x: u32 }\n", "p/c.kur": ""})
+                     "p/a/b.kur": "exposed(package::a) struct S { x: u32 }\n", "p/c.kur": ""})
         s = signatures(resolve(root / "p"))
         self.assertEqual(s.types["p::a::b::S"].exposure, ("within", C.ModuleId(0, ("a",))))
-        bad = tree({"p/kur.toml": manifest("p"), "p/lib.kur": "", "p/a.kur": "exposed (package::c) struct S { x: u32 }\n",
+        bad = tree({"p/kur.toml": manifest("p"), "p/lib.kur": "", "p/a.kur": "exposed(package::c) struct S { x: u32 }\n",
                     "p/c.kur": ""})
         with self.assertRaises(SigError):
             signatures(resolve(bad / "p"))
