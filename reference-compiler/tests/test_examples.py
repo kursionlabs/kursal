@@ -76,6 +76,12 @@ ATOMICS_OUT = ("counter: 2000 of 2000 increments\nmessage: 42, read after the fl
 SHOP_OUT = ("a shelf for 10\ndeliver 8: 8 in stock\nsell 3: 5 in stock\ncannot sell 7: only 5 in stock\n"
             "cannot deliver 6: room for 5\n")
 
+GC_OUT = ("6 objects\nclosed file 7\ncollected cell 5\ncollected cell 4\ncollected 3, 3 left; the list sums to 60\n"
+          "cell 4's handle reads as gone\ncollected cell 6\n"
+          "collected 1; the forgotten edge sums to 0, the kept one to 60\ncollected the leaky cell\n"
+          "collected cell 1\ncollected cell 2\ncollected cell 3\n")
+GC_STATIC_OUT = "".join(f"round {r}: {r + 3} objects, {r + 2} after collecting; the list sums to {s}; "
+                        "the ring goes 100 200 100\n" for r, s in ((1, 10), (2, 30), (3, 60)))
 FOREACH_TYPES_OUT = ("weighed: 14\nin a tuple, an enum and an array: 28\nbehind a pointer and in a package: 20\n"
                      "through a generic field: 5 6, 1 value\nnested: 40 bytes\n"
                      "through a pointer to a sum: 32 bytes\nsplit and merged: 30, then 3\n")
@@ -179,6 +185,8 @@ RUNS: dict[str, tuple[tuple, ...]] = {
     "non_null": (((), "", "", 0),),
     "sayhi": (((), "", "Hello, !\n", 0),),
     "shared_readers": (((), "", "1160\n", 0),),
+    "gc": (((), "", GC_OUT, 0),),
+    "gc_static": (((), "", GC_STATIC_OUT, 0),),
     "thread_sum": (((), "", 'first thread, "hello": 532\nsecond thread, "world!!": 618\ntotal: 1150\n', 0),),
     "traits": (((), "", "", 0),),
     "tuple_decl": (((), "", "", 0),),

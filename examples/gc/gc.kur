@@ -1,0 +1,238 @@
+//! A garbage-collected heap written as library code, with no help from the
+//! compiler: a mark-and-sweep collector driven by two traits.
+//!
+//! Every type stored in a `Heap!['g]` says what it points to (`Markable`:
+//! it hands each `Gc` it holds to the `Marker!`) and how it is disposed of
+//! once nothing reaches it (`Collectable`: it consumes the value, so an
+//! object may own a linear resource). `Heap!::collect` marks everything
+//! reachable from a root, and sweeps the rest.
+//!
+//! A `Gc[T, 'g]` points straight at its object's header, with no table in
+//! between, and carries the generation of the object it was made for.
+//! Headers are never returned to the allocator while the heap lives: a
+//! swept object's payload is freed and its header's generation moves on,
+//! to be reused by a later object. So a handle always points at a live
+//! header, and comparing generations is enough to tell a live object from
+//! a collected one. A handle the root does not reach, or one a `Markable`
+//! instance forgot to mark, is collected like any garbage; `Heap!::with`
+//! through it afterwards gives `None`, never freed memory. A live object is
+//! read and written in place, through a closure `with` lends it to.
+//!
+//! The brand `'g` ties every handle and marker to one heap: a handle into
+//! another heap is a type error, and once the heap is destroyed there is
+//! nothing left to read a handle with.
+use std::cap::{Brand, Exclusive!};
+use std::heap::HeapAllocator;
+use std::mem::{alloca, sizeof};
+use std::option::Option;
+use std::ptr::{is_null, null};
+
+/// A type that can live in a `Heap!['g]`: `mark` hands every `Gc` that
+/// `value` holds to `marker`.
+forall T, 'g.
+trait Markable {
+    fn mark(&value: T, &marker: Marker!['g]);
+}
+
+/// How a value is disposed of once nothing reaches it. `collect` gets the
+/// value and nothing of its heap, so it can neither reach other objects nor
+/// bring itself back.
+forall T.
+trait Collectable {
+    fn collect(value: T);
+}
+
+/// One object's record, never freed while its heap lives.
+forall 'g.
+struct Header {
+    // The payload, or null once collected.
+    object: *u8,
+    // Which object the header holds: changes each time one is collected.
+    generation: u64,
+    marked: bool,
+    // The payload type's `Markable` and `Collectable`, erased.
+    mark: unsafe fn(*u8, Marker!['g]) -> Marker!['g],
+    collect: unsafe fn(*u8) -> (),
+    // Every header of the heap.
+    next: *Header['g],
+    // The mark stack while collecting; the free list otherwise.
+    link: *Header['g],
+}
+
+/// A handle to an object of type `T` in the heap `'g`. `Copy`, and only
+/// this module makes one.
+forall T, 'g.
+struct Gc {
+    header: *Header['g],
+    object: *T,
+    generation: u64,
+}
+
+/// What `Markable::mark` hands each `Gc` to, during a collection of `'g`.
+/// Linear and lent by place, so no instance can keep it past the call.
+forall 'g.
+struct Marker! {
+    stack: *(*Header['g]),
+}
+
+forall 'g.
+impl Marker!['g] {
+    /// Marks the object `r` names, unless it is marked already or collected.
+    forall T.
+    fn mark(&self, r: Gc[T, 'g]) {
+        let { header, object, generation } = r;
+        // A handle always points at a live header of this heap (the module
+        // comment); the stack is the collection's own.
+        let h = unsafe *header;
+        if h.generation == generation && !h.marked {
+            let top = unsafe *self.stack;
+            unsafe *header = Header.{ object: h.object, generation: h.generation, marked: true, mark: h.mark,
+                collect: h.collect, next: h.next, link: top };
+            unsafe *self.stack = header;
+        }
+    }
+}
+
+/// `T`'s `Markable`, for a payload whose type the heap no longer knows.
+/// Caller: `object` is a live payload of type `T`.
+forall T, 'g where Markable[T, 'g], Sized[T].
+unsafe fn mark_erased(object: *u8, marker: Marker!['g]) -> Marker!['g] {
+    let typed = unsafe (object as *T);
+    var m = marker;
+    Markable[T, 'g]::mark(unsafe &*typed, &m);
+    m
+}
+
+/// `T`'s `Collectable`, which consumes the payload, and frees its room.
+/// Caller: `object` is a live payload of type `T`, read here for the last
+/// time.
+forall T where Collectable[T], Sized[T].
+unsafe fn collect_erased(object: *u8) {
+    let value = unsafe *(unsafe (object as *T));
+    let freed = HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(object));
+    Collectable[T]::collect(value);
+}
+
+/// A garbage-collected heap under the brand `'g`.
+forall 'g.
+struct Heap! {
+    marker: Brand['g],
+    // Every header, the most recent first.
+    all: *Header['g],
+    // Headers whose object was collected, ready for reuse.
+    free: *Header['g],
+    live: usize,
+}
+
+impl Heap! {
+    /// An empty heap, under a brand of its own.
+    fn new() -> exists 'g. Heap!['g] {
+        let exists 'g. (brand, tag) = Exclusive!::fresh();
+        tag.retire();
+        pack 'g. Heap!.{ marker: brand, all: null(), free: null(), live: 0usize }
+    }
+}
+
+forall 'g.
+impl Heap!['g] {
+    /// How many objects the heap holds.
+    fn live(&self) -> usize {
+        self.live
+    }
+
+    /// Puts `value` in the heap.
+    forall T where Markable[T, 'g], Collectable[T], Sized[T].
+    fn alloc(&self, value: T) -> Gc[T, 'g] {
+        let object = unsafe (HeapAllocator::alloc(sizeof[T]()).into_raw() as *T);
+        unsafe *object = value;
+        let { marker, all, free, live } = self;
+        let mark = mark_erased[T, 'g];
+        let collect = collect_erased[T];
+        let raw = unsafe (object as *u8);
+        if is_null(free) {
+            let header = unsafe (HeapAllocator::alloc(sizeof[Header['g]]()).into_raw() as *Header['g]);
+            unsafe *header = Header.{ object: raw, generation: 0u64, marked: false, mark, collect, next: all, link: null() };
+            self = Heap!.{ marker, all: header, free, live: live + 1usize };
+            Gc.{ header, object, generation: 0u64 }
+        } else {
+            // A reused header keeps its place in `all` and its generation.
+            let h = unsafe *free;
+            unsafe *free = Header.{ object: raw, generation: h.generation, marked: false, mark, collect, next: h.next,
+                link: null() };
+            self = Heap!.{ marker, all, free: h.link, live: live + 1usize };
+            Gc.{ header: free, object, generation: h.generation }
+        }
+    }
+
+    /// Lends the object `r` names to `f` in place, unless it was collected:
+    /// `f` reads and writes it where it lies, and what it leaves there is the
+    /// object afterwards. Nothing else reaches the object while `f` runs:
+    /// the heap is lent to this call, so `f` cannot reach the heap or
+    /// another object of it. `f` captures only `Copy` values, since it goes
+    /// uncalled when the object was collected.
+    forall T, Ret, Env where Sized[T], Copy[Env].
+    fn with(&self, r: Gc[T, 'g], f: closure[Env](&_: T) -> Ret) -> Option[Ret] {
+        let { header, object, generation } = r;
+        if (unsafe *header).generation == generation {
+            Option::Some.(f(unsafe &*object))
+        } else {
+            Option::None
+        }
+    }
+
+    /// Collects every object `root` does not reach, and returns how many.
+    forall T.
+    fn collect(&self, root: Gc[T, 'g]) -> usize {
+        let stack = unsafe alloca[*Header['g]]();
+        unsafe *stack = null();
+        var marker = Marker!.{ stack };
+        &marker.mark(root);
+        while !is_null(unsafe *stack) {
+            let header = unsafe *stack;
+            let h = unsafe *header;
+            unsafe *stack = h.link;
+            let mark = h.mark;
+            marker = unsafe mark(h.object, marker);
+        }
+        let { stack: _ } = marker;
+        // Sweep: unmark what was reached, collect the rest.
+        let { marker: brand, all, free, live } = self;
+        var free_list = free;
+        var collected = 0usize;
+        var at = all;
+        while !is_null(at) {
+            let h = unsafe *at;
+            if !is_null(h.object) {
+                if h.marked {
+                    unsafe *at = Header.{ object: h.object, generation: h.generation, marked: false, mark: h.mark,
+                        collect: h.collect, next: h.next, link: null() };
+                } else {
+                    let collect = h.collect;
+                    unsafe collect(h.object);
+                    unsafe *at = Header.{ object: null(), generation: h.generation + 1u64, marked: false, mark: h.mark,
+                        collect: h.collect, next: h.next, link: free_list };
+                    free_list = at;
+                    collected = collected + 1usize;
+                }
+            }
+            at = h.next;
+        }
+        self = Heap!.{ marker: brand, all, free: free_list, live: live - collected };
+        collected
+    }
+
+    /// Collects every object, then frees the heap.
+    fn destroy(self) {
+        let { marker: _, all, free: _, live: _ } = self;
+        var at = all;
+        while !is_null(at) {
+            let h = unsafe *at;
+            if !is_null(h.object) {
+                let collect = h.collect;
+                unsafe collect(h.object);
+            }
+            let freed = HeapAllocator::drop(unsafe HeapAllocator::adopt_raw(unsafe (at as *u8)));
+            at = h.next;
+        }
+    }
+}
