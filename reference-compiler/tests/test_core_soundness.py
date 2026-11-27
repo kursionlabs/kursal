@@ -225,6 +225,18 @@ REJECTED = {
     "missing_arm": ("switch_arm_per_variant", """
         (type E (enum (A u32) (B u32)))
         (fun h u32 (E) (entry ((%e E)) (switch %e E (A a))) (a ((%n u32)) (ret %n)))"""),
+    "switch_last_arm_drops_linear_value": ("linear_value_never_consumed", """
+        (type E (enum (A u32) (B u32) (C u32)))
+        (type H! (tuple u32))
+        (fun f u32 (E H!) (entry ((%e E) (%h H!)) (switch %e E (A keep %h) (B keep %h) (C drop)))
+          (keep ((%n u32) (%h H!)) (= %v (destruct %h H!)) (ret %v))
+          (drop ((%n u32)) (ret %n)))"""),
+    "branch_repeats_value_on_one_edge": ("was_already_consumed", """
+        (fun f u32 (bool u32) (entry ((%c bool) (%x u32)) (jnz %c (one %x) (two %x %x)))
+          (one ((%a u32)) (ret %a)) (two ((%a u32) (%b u32)) (ret %a)))"""),
+    "branch_passes_its_consumed_condition": ("was_already_consumed", """
+        (fun f bool (bool) (entry ((%c bool)) (jnz %c (done %c) (done %c)))
+          (done ((%c bool)) (ret %c)))"""),
 
     # Any number of whole roots may be lent at once, but at most two paths below roots, parting at a
     # struct or tuple.
@@ -576,6 +588,10 @@ class CoreSoundnessTests(unittest.TestCase):
 
     def test_the_sound_forms_are_accepted(self):
         for source in (
+            # Each edge can pass the same linear value, including two edges to the same block.
+            """(fun f (forall (T) () T (bool T)
+                 (entry ((%c bool) (%x T)) (jnz %c (done %x) (done %x)))
+                 (done ((%x T)) (ret %x))))""",
             # A pointer gives pointer components whatever its pointee is but a sum: a leaf, a product
             # holding a sum, or a type parameter, whose `sizeof` needs `Exposed` of the source. A pointer
             # to a sum is a value still, and a component.

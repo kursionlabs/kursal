@@ -108,6 +108,71 @@ class LeftOutTests(unittest.TestCase):
         self.assertIn("edge_", c)
         self.assertEqual(run(c), 21)
 
+    def test_forwarded_parameters_share_storage_across_joins_and_loops(self):
+        c = c_of("""
+(fun count i32 (bool i32)
+  (entry ((%flag bool) (%keep i32)) (jnz %flag (left %keep) (right %keep)))
+  (left ((%keep i32)) (= %n (const i32 2)) (= %z (const i32 0)) (jmp loop %keep %n %z))
+  (right ((%keep i32)) (= %n (const i32 3)) (= %z (const i32 0)) (jmp loop %keep %n %z))
+  (loop ((%keep i32) (%remaining i32) (%total i32)) (jmp step %keep %remaining %total))
+  (step ((%keep i32) (%remaining i32) (%total i32))
+    (= %r (copy %remaining)) (= %z (const i32 0)) (= %more (ne %r %z))
+    (= %r2 (copy %remaining)) (= %one (const i32 1)) (= %dec (sub %r2 %one))
+    (= %t (copy %total)) (= %k (copy %keep)) (= %added (add %t %k))
+    (jnz %more (loop %keep %dec %added) (done %total %remaining)))
+  (done ((%total i32) (%remaining i32)) (= %answer (add %total %remaining)) (ret %answer)))
+(fun main i32 () (entry () (= %yes (const bool true)) (= %no (const bool false))
+  (= %k (const i32 5)) (= %k2 (copy %k)) (= %a (call count %yes %k)) (= %b (call count %no %k2))
+  (= %answer (add %a %b)) (ret %answer)))""")
+        count = body(c, "count")
+        self.assertNotRegex(count, r"\b(?:left|right|loop|step)_keep\b|\b(?:step|done)_(?:remaining|total)\b")
+        self.assertIn("int32_t loop_remaining;", count)
+        self.assertIn("int32_t loop_total;", count)
+        self.assertEqual(run(c), 25)
+
+    def test_switch_payload_cannot_mutate_a_forwarded_snapshot(self):
+        c = c_of(CUR + """
+(type Choice (enum (Item Cur) (None (tuple))))
+(fun bump u32 (Cur) (entry ((&c Cur)) (= %old (load &c.pos)) (= %one (const u32 1)) (= %new (add %old %one))
+  (= %out (copy %new)) (= %u (store &c.pos %new)) (ret %out)))
+(fun bump#lend (tuple Cur u32) (Cur) (locals (&slot0 Cur))
+  (entry ((%a0 Cur)) (= %u (store &slot0 %a0)) (= %result (call bump &slot0)) (= %back (load &slot0))
+    (= %out (construct (tuple Cur u32) %back %result)) (ret %out)))
+(fun check u32 (Choice)
+  (entry ((%value Choice)) (= %scrutinee (copy %value)) (switch %scrutinee Choice (Item item %value) (None none)))
+  (item ((%payload Cur) (%original Choice)) (= %r (call bump#lend %payload)) (= (%new %changed) (destruct %r (tuple Cur u32)))
+    (switch %original Choice (Item read %changed) (None missing %changed)))
+  (none ((%unit (tuple))) (= %z (const u32 0)) (ret %z))
+  (missing ((%unit (tuple)) (%changed u32)) (ret %changed))
+  (read ((%saved Cur) (%changed u32)) (= %old (destruct %saved Cur)) (= %sum (add %old %changed)) (ret %sum)))
+(fun main i32 () (entry () (= %ten (const u32 10)) (= %c (construct Cur %ten)) (= %item (construct_variant Choice Item %c))
+  (= %r (call check %item)) (= %answer (int_cast %r i32)) (ret %answer)))""")
+        check = body(c, "check")
+        self.assertNotIn("item_original", check)
+        self.assertRegex(check, r"bump\w*\(&item_payload\);")
+        self.assertEqual(run(c), 21)
+
+    def test_never_argument_has_no_storage_to_share(self):
+        program = parse_program("""
+(fun impossible i32 (!) (entry ((%input !)) (jmp next %input))
+  (next ((%value i32)) (= %one (const i32 1)) (= %sum (add %value %one)) (ret %sum)))""")
+        c = body(emit_c(program, check_program(program)), "impossible")
+        self.assertIn("int32_t next_value;", c)
+        self.assertNotIn("entry_input", c)
+
+    def test_late_switch_parameter_keeps_its_producer_live(self):
+        c = c_of("""
+(type Choice (enum (Go i32) (Stop (tuple))))
+(fun main i32 ()
+  (entry () (= %seed (const i32 20)) (= %dead_seed (const i32 3)) (jmp select %seed %dead_seed))
+  (stop ((%unit (tuple)) (%n i32) (%dead i32)) (= %twenty (const i32 20)) (= %sum (add %n %twenty)) (ret %sum))
+  (go ((%payload i32) (%n i32) (%dead i32)) (= %sum (add %payload %n)) (ret %sum))
+  (select ((%n i32) (%dead i32)) (= %two (const i32 2)) (= %next (add %n %two))
+    (= %discarded (copy %dead)) (= %unit (construct (tuple))) (= %tag (construct_variant Choice Stop %unit))
+    (switch %tag Choice (Go go %next %discarded) (Stop stop %next %discarded))))""")
+        self.assertNotRegex(body(c, "main"), r"dead|discarded")
+        self.assertEqual(run(c), 42)
+
 
 ADAPTED = CUR + """
 (type Rec (struct (cur Cur) (n u32)))

@@ -5,6 +5,7 @@ use package::support::base::{counted, fail};
 use std::hash::{HashState, key_eq};
 use std::cmp::Order;
 use std::collections::arena_vec::ArenaVec;
+use std::collections::list::List;
 use std::collections::arena_map::{ArenaMap, ArenaSet};
 use std::mem::Ref;
 use std::str::Str;
@@ -339,6 +340,23 @@ fn subst(&cx: Domain!['k], ty: Type['k], sub: ArenaMap[Str['k], Type['k], 'k], c
 // written.
 forall 'k.
 fn apart(&cx: Domain!['k], ty: Type['k], scope: ArenaSet[Str['k], 'k], counter: Fresh['k]) -> Type['k] {
+    if contains_exists(&cx, ty) {
+        rename_existentials(&cx, ty, scope, counter)
+    } else {
+        ty
+    }
+}
+
+forall 'k.
+fn contains_exists(&cx: Domain!['k], ty: Type['k]) -> bool {
+    match ty {
+        Exists(_binders, _body) => true,
+        _ => any_type_child(&cx, ty, |&cx, child: Type['k]| contains_exists(&cx, child)),
+    }
+}
+
+forall 'k.
+fn rename_existentials(&cx: Domain!['k], ty: Type['k], scope: ArenaSet[Str['k], 'k], counter: Fresh['k]) -> Type['k] {
     match ty {
         Exists(binders, body) => {
             let taken = with_names(&cx, scope, binders);
@@ -365,9 +383,9 @@ fn apart(&cx: Domain!['k], ty: Type['k], scope: ArenaSet[Str['k], 'k], counter: 
                 taken.insert(&cx, name);
                 i = i + 1usize;
             }
-            Type::Exists.(spelled, ref_in(&cx, apart(&cx, subst(&cx, body.copy(&cx), renamed, counter), taken, counter)))
+            Type::Exists.(spelled, ref_in(&cx, rename_existentials(&cx, subst(&cx, body.copy(&cx), renamed, counter), taken, counter)))
         },
-        _ => map_children(&cx, ty, |&cx, child: Type['k]| apart(&cx, child, scope, counter)),
+        _ => map_children(&cx, ty, |&cx, child: Type['k]| rename_existentials(&cx, child, scope, counter)),
     }
 }
 
@@ -505,48 +523,32 @@ fn free_names_members(&cx: Domain!['k], members: ArenaVec[Member['k], 'k], bound
     }
 }
 
-// Some brand label occurs in `ty`, free or bound. Unlike `free_brands`, this allocates nothing.
-forall 'k.
-fn mentions_brand(&cx: Domain!['k], ty: Type['k]) -> bool {
+// Test the immediate type children without allocating a vector. As in free_names_in, a
+// function's value types are its return and parameters.
+forall Env, 'k where Copy[Env].
+fn any_type_child(&cx: Domain!['k], ty: Type['k], visit: closure[Env](&_: Domain!['k], Type['k]) -> bool) -> bool {
     match ty {
-        Skolem(_label) => true,
-        Named(_name, args) => any_mentions_brand(&cx, args),
-        Tuple(elems) => any_mentions_brand(&cx, elems),
-        Struct(fields) => members_mention_brand(&cx, fields),
-        Enum(variants) => members_mention_brand(&cx, variants),
-        Array(elem, _length) => mentions_brand(&cx, elem.copy(&cx)),
-        Ptr(inner) => mentions_brand(&cx, inner.copy(&cx)),
-        NonNull(inner) => mentions_brand(&cx, inner.copy(&cx)),
-        Brand(brand) => mentions_brand(&cx, brand.copy(&cx)),
-        Exists(_binders, body) => mentions_brand(&cx, body.copy(&cx)),
-        Foreach(f) => mentions_brand(&cx, f.source.copy(&cx)) || mentions_brand(&cx, f.body.copy(&cx)),
-        Fn(f) => any_mentions_brand(&cx, f.params) || mentions_brand(&cx, f.ret.copy(&cx)),
+        Ptr(inner) => visit(&cx, inner.copy(&cx)),
+        NonNull(inner) => visit(&cx, inner.copy(&cx)),
+        Brand(inner) => visit(&cx, inner.copy(&cx)),
+        Array(elem, _length) => visit(&cx, elem.copy(&cx)),
+        Named(_name, args) => args.any(&cx, visit),
+        Tuple(elems) => elems.any(&cx, visit),
+        Struct(fields) => fields.any(&cx, |&cx, field: Member['k]| visit(&cx, field.ty)),
+        Enum(variants) => variants.any(&cx, |&cx, variant: Member['k]| visit(&cx, variant.ty)),
+        Exists(_binders, body) => visit(&cx, body.copy(&cx)),
+        Foreach(f) => visit(&cx, f.source.copy(&cx)) || visit(&cx, f.body.copy(&cx)),
+        Fn(f) => visit(&cx, f.ret.copy(&cx)) || f.params.any(&cx, visit),
         _ => false,
     }
 }
 
 forall 'k.
-fn any_mentions_brand(&cx: Domain!['k], types: ArenaVec[Type['k], 'k]) -> bool {
-    var i = 0usize;
-    while i < types.len(&cx) {
-        if mentions_brand(&cx, types.at(&cx, i)) {
-            return true;
-        }
-        i = i + 1usize;
+fn mentions_brand(&cx: Domain!['k], ty: Type['k]) -> bool {
+    match ty {
+        Skolem(_label) => true,
+        _ => any_type_child(&cx, ty, |&cx, child: Type['k]| mentions_brand(&cx, child)),
     }
-    false
-}
-
-forall 'k.
-fn members_mention_brand(&cx: Domain!['k], members: ArenaVec[Member['k], 'k]) -> bool {
-    var i = 0usize;
-    while i < members.len(&cx) {
-        if mentions_brand(&cx, members.at(&cx, i).ty) {
-            return true;
-        }
-        i = i + 1usize;
-    }
-    false
 }
 
 forall 'k.
@@ -658,6 +660,18 @@ fn member_types(&cx: Domain!['k], members: ArenaVec[Member['k], 'k]) -> ArenaVec
         i = i + 1usize;
     }
     out
+}
+
+// Names extractable from the input prefix without crossing a binder.
+forall 'k.
+fn extractable_inputs(&cx: Domain!['k], head: ArenaVec[Type['k], 'k], count: usize) -> ArenaSet[Str['k], 'k] {
+    let names: ArenaSet[Str['k], 'k] = ArenaSet::new(&cx);
+    var i = 0usize;
+    while i < count {
+        extractable_in(&cx, head.at(&cx, i), names);
+        i = i + 1usize;
+    }
+    names
 }
 
 // Free names reachable by matching without crossing a type binder.
@@ -1121,20 +1135,67 @@ impl Types['k] {
         }
     }
 
-    // `ty` mentions no type parameter or binder: every name it has is a declaration's. Brands do not
-    // change a layout.
+    // A layout is closed when every free type name is a declaration or a brand label.
     fn closed(self, &cx: Domain!['k], ty: Type['k]) -> bool {
-        let brands = free_brands(&cx, ty);
-        let names = free_names(&cx, ty).keys(&cx);
-        var n = 0usize;
-        while n < names.len(&cx) {
-            let name = names.at(&cx, n);
-            if !brands.contains(&cx, name) && !self.program.types.contains(&cx, name) {
-                return false;
-            }
-            n = n + 1usize;
+        if !self.has_open_name(&cx, ty, List::empty(), Option::None) {
+            return true;
         }
-        true
+        if !mentions_brand(&cx, ty) {
+            return false;
+        }
+        // A free name can have the same spelling as a skolem anywhere in the type. Collect
+        // those labels once, only when they could change the answer (as in free_brands).
+        let labels: ArenaSet[Str['k], 'k] = ArenaSet::new(&cx);
+        skolems(&cx, ty, labels);
+        !self.has_open_name(&cx, ty, List::empty(), Option::Some.(labels))
+    }
+
+    fn has_open_name(self, &cx: Domain!['k], ty: Type['k], bound: List[Str['k], 'k], brands: Option[ArenaSet[Str['k], 'k]]) -> bool {
+        match ty {
+            Named(name, args) => {
+                if args.is_empty(&cx) {
+                    if self.program.types.contains(&cx, name) || bound.any(&cx, |&cx, b: Str['k]| b.eq(&cx, name)) {
+                        return false;
+                    }
+                    return match brands {
+                        Some(labels) => !labels.contains(&cx, name),
+                        None => true,
+                    };
+                }
+                args.any(&cx, |&cx, child: Type['k]| self.has_open_name(&cx, child, bound, brands))
+            },
+            Exists(binders, body) => {
+                let inner = binders.fold(&cx, bound, |&cx, scope: List[Str['k], 'k], name: Str['k]| scope.cons(&cx, name));
+                self.has_open_name(&cx, body.copy(&cx), inner, brands)
+            },
+            Foreach(f) => self.has_open_name(&cx, f.source.copy(&cx), bound, brands)
+                || self.has_open_name(&cx, f.body.copy(&cx), bound.cons(&cx, f.binder), brands),
+            _ => any_type_child(&cx, ty, |&cx, child: Type['k]| self.has_open_name(&cx, child, bound, brands)),
+        }
+    }
+
+    // Checks the outer layout. Callers visit component types separately.
+    fn oversized(self, &cx: Domain!['k], ty: Type['k]) -> bool {
+        match ty {
+            Prim(_name) => return false,
+            Ptr(_inner) => return false,
+            NonNull(_inner) => return false,
+            Fn(_f) => return false,
+            Brand(_brand) => return false,
+            Skolem(_label) => return false,
+            Never => return false,
+            Tuple(elems) => {
+                if elems.is_empty(&cx) {
+                    return false;
+                }
+            },
+            _ => (),
+        }
+        // A known finite layout fits regardless of its free names. Only closed types can fail.
+        match self.layouts.get(&cx, ty) {
+            Some(known) => known.is_none() && self.closed(&cx, ty),
+            None => self.closed(&cx, ty) && self.record_layout(&cx, ty).is_none(),
+        }
     }
 
     // The size and alignment of a closed type's value as the backend lays it out at the target's
@@ -1144,9 +1205,12 @@ impl Types['k] {
     // rejects such a type.
     fn layout(self, &cx: Domain!['k], ty: Type['k]) -> Option[(u64, u64)] {
         match self.layouts.get(&cx, ty) {
-            Some(known) => return known,
-            None => (),
+            Some(known) => known,
+            None => self.record_layout(&cx, ty),
         }
+    }
+
+    fn record_layout(self, &cx: Domain!['k], ty: Type['k]) -> Option[(u64, u64)] {
         let found = self.lay_out(&cx, ty);
         self.layouts.insert(&cx, ty, found);
         found

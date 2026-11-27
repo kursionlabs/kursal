@@ -16,9 +16,8 @@
 
 use std::collections::arena_vec::ArenaVec;
 use std::collections::arena_map::{ArenaMap, ArenaSet};
-use std::mem::Ref;
 use std::str::Str;
-use std::arena::{Domain!, ref_in, seed};
+use std::arena::{Domain!, seed};
 use std::buffer::Buffer!;
 use std::fmt::Writer;
 use package::check::checker::{Checker, Places, overlap, prefix, root_of, strict_ancestor_in};
@@ -40,6 +39,11 @@ fn place_parts(&cx: Domain!['k], path: Str['k]) -> (Str['k], Str['k]) {
         Some(at) => (stripped.take(at), stripped.skip(at)),
         None => (stripped, Str::from_static(&cx, "")),
     }
+}
+
+forall 'k.
+fn lends(&cx: Domain!['k], arg: Str['k]) -> bool {
+    arg.starts_with(&cx, Str::from_static(&cx, "&")) && !arg.starts_with(&cx, Str::from_static(&cx, "&*"))
 }
 
 // How a message names the place `path`: its variable and fields, or a temporary expression result.
@@ -73,7 +77,62 @@ fn function_name(&cx: Domain!['k], name: Str['k]) -> Str['k] {
     name.take(end)
 }
 
-// The state of planning one function.
+// Instructions that read, mutate, or lend a place.
+exposed enum PlaceOp { Load, Store, Tag, Call, Open, Pack }
+
+forall 'k.
+exposed struct PlaceEffect {
+    op: PlaceOp,
+    index: usize,
+    first: Str['k],
+}
+
+forall 'k.
+fn place_op(&cx: Domain!['k], instr: C::Instr['k], first: Str['k]) -> Option[PlaceOp] {
+    let op = instr.op;
+    if op.is(&cx, "load") || op.is(&cx, "destruct") && first.starts_with(&cx, Str::from_static(&cx, "&")) {
+        Option::Some.(PlaceOp::Load)
+    } else if op.is(&cx, "store") {
+        Option::Some.(PlaceOp::Store)
+    } else if op.is(&cx, "call") || op.is(&cx, "trait_call") {
+        if instr.args.any(&cx, |&cx, arg: Str['k]| lends(&cx, arg)) { Option::Some.(PlaceOp::Call) } else { Option::None }
+    } else if first.starts_with(&cx, Str::from_static(&cx, "&")) {
+        if op.is(&cx, "variant_tag") {
+            Option::Some.(PlaceOp::Tag)
+        } else if op.is(&cx, "open") {
+            Option::Some.(PlaceOp::Open)
+        } else if op.is(&cx, "pack") {
+            Option::Some.(PlaceOp::Pack)
+        } else {
+            Option::None
+        }
+    } else {
+        Option::None
+    }
+}
+
+forall 'k.
+fn place_effects(&cx: Domain!['k], instrs: ArenaVec[C::Instr['k], 'k]) -> Option[ArenaVec[PlaceEffect['k], 'k]] {
+    var effects: Option[ArenaVec[PlaceEffect['k], 'k]] = Option::None;
+    var i = 0usize;
+    while i < instrs.len(&cx) {
+        let instr = instrs.at(&cx, i);
+        let first = if instr.args.is_empty(&cx) { Str::from_static(&cx, "") } else { instr.args.at(&cx, 0usize) };
+        match place_op(&cx, instr, first) {
+            Some(op) => {
+                let effect = PlaceEffect.{ op, index: i, first };
+                match effects {
+                    Some(xs) => xs.push(&cx, effect),
+                    None => { effects = Option::Some.(ArenaVec::one(&cx, effect)); },
+                };
+            },
+            None => (),
+        };
+        i = i + 1usize;
+    }
+    effects
+}
+
 forall 'k.
 exposed struct Plan {
     fun: Fun['k],
@@ -86,8 +145,10 @@ exposed struct Plan {
     local_copy: ArenaVec[Option[bool], 'k],
     // the locals whose types mention brands other than `global`
     branded: ArenaVec[usize, 'k],
-    // the state each block starts in, so far
-    header: ArenaMap[Str['k], Places['k], 'k],
+    // each block's incoming state by block index, or None until the walk reaches it
+    header: ArenaVec[Option[Places['k]], 'k],
+    // Place operations in each block, in instruction order, for planning and diagnostic replay.
+    effects: ArenaVec[Option[ArenaVec[PlaceEffect['k], 'k]], 'k],
     // block index -> its place in the reverse postorder the walk follows, for a block the entry
     // reaches; and, by that place, whether the block's header changed since it last ran
     rank: ArenaVec[usize, 'k],
@@ -98,8 +159,6 @@ forall 'k.
 exposed struct PlaceFlow {
     checker: Checker['k],
     r: Resolver['k],
-    // the first store into each place path, for diagnostics
-    origins: Ref[ArenaMap[Str['k], Pos, 'k], 'k],
     // The state a block is simulated in, loaded from the state it starts in, and the state of an
     // edge that knows a switched place's variant: scratch, reused for every block and function.
     working: Places['k],
@@ -167,17 +226,10 @@ fn same_places(&cx: Domain!['k], a: Places['k], b: Places['k]) -> bool {
     if a.empty.len(&cx) != b.empty.len(&cx) || a.known.len(&cx) != b.known.len(&cx) || a.opened.len(&cx) != b.opened.len(&cx) {
         return false;
     }
-    var i = 0usize;
-    while i < a.empty.positions(&cx) {
-        match a.empty.key_at(&cx, i) {
-            Some(p) => if !b.empty.contains(&cx, p) {
-                return false;
-            },
-            None => (),
-        };
-        i = i + 1usize;
+    if !a.empty.is_subset(&cx, b.empty) {
+        return false;
     }
-    i = 0usize;
+    var i = 0usize;
     while i < a.known.positions(&cx) {
         match a.known.key_at(&cx, i) {
             Some(p) => match b.known.get(&cx, p) {
@@ -312,7 +364,7 @@ fn locals_empty(&cx: Domain!['k], fun: Fun['k]) -> Places['k] {
 // outermost paths.
 forall 'k.
 fn adds_nothing(&cx: Domain!['k], state: Places['k], incoming: Places['k]) -> bool {
-    if incoming.known.len(&cx) != state.known.len(&cx) || !subset(&cx, incoming.empty, state.empty) {
+    if incoming.known.len(&cx) != state.known.len(&cx) || !incoming.empty.is_subset(&cx, state.empty) {
         return false;
     }
     var k = 0usize;
@@ -345,24 +397,9 @@ fn adds_nothing(&cx: Domain!['k], state: Places['k], incoming: Places['k]) -> bo
 }
 
 forall 'k.
-fn subset(&cx: Domain!['k], a: ArenaSet[Str['k], 'k], b: ArenaSet[Str['k], 'k]) -> bool {
-    var i = 0usize;
-    while i < a.positions(&cx) {
-        match a.key_at(&cx, i) {
-            Some(x) => if !b.contains(&cx, x) {
-                return false;
-            },
-            None => (),
-        };
-        i = i + 1usize;
-    }
-    true
-}
-
-forall 'k.
 impl PlaceFlow['k] {
     fn new(&cx: Domain!['k], program: Program['k], r: Resolver['k], counter: Fresh['k]) -> PlaceFlow['k] {
-        PlaceFlow.{ checker: Checker::new(&cx, program, counter), r, origins: ref_in(&cx, ArenaMap::new(&cx)), working: no_places(&cx), arm: no_places(&cx) }
+        PlaceFlow.{ checker: Checker::new(&cx, program, counter), r, working: no_places(&cx), arm: no_places(&cx) }
     }
 
     fn places(self, &cx: Domain!['k]) -> Places['k] {
@@ -380,18 +417,11 @@ impl PlaceFlow['k] {
         let params = outer.clone(&cx);
         params.append(&cx, fun.params);
         c.current.set(&cx, Option::Some.(fun));
-        c.params.set(&cx, params);
+        c.enter_function_scope(&cx, params);
         c.location.set(&cx, fun.name);
-        let kinds: ArenaMap[Str['k], Kind, 'k] = ArenaMap::new(&cx);
-        var i = 0usize;
-        while i < params.len(&cx) {
-            kinds.insert(&cx, params.at(&cx, i).name, params.at(&cx, i).kind);
-            i = i + 1usize;
-        }
-        c.kinds.set(&cx, kinds);
         c.home.set(&cx, fun.home);
         let roots: ArenaMap[Str['k], Type['k], 'k] = ArenaMap::new(&cx);
-        i = 0usize;
+        var i = 0usize;
         while i < fun.locals.len(&cx) {
             roots.insert(&cx, fun.locals.at(&cx, i).name, fun.locals.at(&cx, i).ty);
             i = i + 1usize;
@@ -405,10 +435,18 @@ impl PlaceFlow['k] {
             i = i + 1usize;
         }
         c.roots.set(&cx, roots);
+        // Lowering roots every named place in a local or a lent parameter. With neither,
+        // the blocks already have their final empty place contracts.
+        if roots.is_empty(&cx) {
+            return;
+        }
         let index: ArenaMap[Str['k], usize, 'k] = ArenaMap::new(&cx);
+        let effects: ArenaVec[Option[ArenaVec[PlaceEffect['k], 'k]], 'k] = ArenaVec::new(&cx);
         i = 0usize;
         while i < fun.blocks.len(&cx) {
-            index.insert(&cx, fun.blocks.at(&cx, i).label, i);
+            let block = fun.blocks.at(&cx, i);
+            index.insert(&cx, block.label, i);
+            effects.push(&cx, place_effects(&cx, block.instrs));
             i = i + 1usize;
         }
         let global: ArenaSet[Str['k], 'k] = ArenaSet::new(&cx);
@@ -429,15 +467,15 @@ impl PlaceFlow['k] {
             local_brands.push(&cx, brands);
             local_copy.push(&cx, Option::None);
             // A local whose brands are all global keeps them across every edge.
-            if !subset(&cx, brands, global) {
+            if !brands.is_subset(&cx, global) {
                 branded.push(&cx, i);
             }
             i = i + 1usize;
         }
-        let header: ArenaMap[Str['k], Places['k], 'k] = ArenaMap::new(&cx);
-        header.insert(&cx, entry.label, locals_empty(&cx, fun));
+        let header: ArenaVec[Option[Places['k]], 'k] = ArenaVec::filled(&cx, fun.blocks.len(&cx), Option::None);
+        header.set(&cx, 0usize, Option::Some.(locals_empty(&cx, fun)));
         let rank = ArenaVec::filled(&cx, fun.blocks.len(&cx), 0usize);
-        let plan = Plan.{ fun, index, global, local_brands, local_copy, branded, header, rank, dirty: ArenaVec::new(&cx) };
+        let plan = Plan.{ fun, index, global, local_brands, local_copy, branded, header, effects, rank, dirty: ArenaVec::new(&cx) };
         c.places.set(&cx, Places::new(ArenaSet::new(&cx), ArenaMap::new(&cx), ArenaMap::new(&cx)));
         // The walk takes the first block, in reverse postorder, whose header changed since it last
         // ran: a block runs once every edge into it from earlier in that order has brought its
@@ -453,14 +491,19 @@ impl PlaceFlow['k] {
         while at < order.len(&cx) {
             if plan.dirty.at(&cx, at) {
                 plan.dirty.set(&cx, at, false);
-                let block = fun.blocks.at(&cx, order.at(&cx, at));
-                let places = header.at(&cx, block.label);
+                let b = order.at(&cx, at);
+                let block = fun.blocks.at(&cx, b);
+                let places = header.at(&cx, b).unwrap();
                 // The block runs in the scratch state; it leaves in a state of its own only when it
                 // changed what it started in.
-                self.working.load(&cx, places);
-                c.places.set(&cx, self.working);
-                let changed = self.simulate(&cx, block, false);
-                let leaving = if changed { self.working.copy(&cx) } else { places };
+                let leaving = match effects.at(&cx, b) {
+                    Some(ops) => {
+                        self.working.load(&cx, places);
+                        c.places.set(&cx, self.working);
+                        if self.simulate(&cx, block, ops, false) { self.working.copy(&cx) } else { places }
+                    },
+                    None => places,
+                };
                 let earliest = self.leave(&cx, plan, block, leaving);
                 if earliest < at {
                     at = earliest;
@@ -472,7 +515,7 @@ impl PlaceFlow['k] {
         i = 1usize;
         while i < fun.blocks.len(&cx) {
             let block = fun.blocks.at(&cx, i);
-            match header.get(&cx, block.label) {
+            match header.at(&cx, i) {
                 Some(state) => {
                     let empty = state.empty.keys(&cx);
                     empty.sort_by(&cx, |&cx, a, b| a.cmp(&cx, b));
@@ -503,16 +546,15 @@ impl PlaceFlow['k] {
             };
             i = i + 1usize;
         }
-        self.diagnose_places(&cx, fun, header, sites);
+        self.diagnose_places(&cx, plan, sites);
     }
 
     // Merges `incoming` into the header of block `b`; whether the header changed. The header is
     // shared, like every state sent: the block runs in a copy.
     fn arrive(self, &cx: Domain!['k], plan: Plan['k], b: usize, incoming: Places['k]) -> bool {
-        let label = plan.fun.blocks.at(&cx, b).label;
-        let state = match plan.header.get(&cx, label) {
+        let state = match plan.header.at(&cx, b) {
             None => {
-                plan.header.insert(&cx, label, incoming);
+                plan.header.set(&cx, b, Option::Some.(incoming));
                 return true;
             },
             Some(state) => state,
@@ -563,7 +605,7 @@ impl PlaceFlow['k] {
         if same_places(&cx, merged, state) {
             return false;
         }
-        plan.header.insert(&cx, label, merged);
+        plan.header.set(&cx, b, Option::Some.(merged));
         true
     }
 
@@ -608,7 +650,7 @@ impl PlaceFlow['k] {
                 k = 0usize;
                 while k < plan.branded.len(&cx) {
                     let l = plan.branded.at(&cx, k);
-                    if !subset(&cx, plan.local_brands.at(&cx, l), kept) && self.local_is_copy(&cx, plan, l) {
+                    if !plan.local_brands.at(&cx, l).is_subset(&cx, kept) && self.local_is_copy(&cx, plan, l) {
                         forgotten.insert(&cx, fun.locals.at(&cx, l).name);
                     }
                     k = k + 1usize;
@@ -725,15 +767,19 @@ impl PlaceFlow['k] {
         let fun = self.fun(&cx);
         var at = pos;
         if root.starts_with(&cx, Str::from_static(&cx, "#tmp")) {
-            at = match self.origins.copy(&cx).get(&cx, Buffer!::new().put("&").write(&cx, root).save(&cx)) {
-                Some(p) => p,
-                None => Pos.{ line: 0u32, col: 0u32 },
-            };
-            if at.line == 0u32 {
+            let target = Buffer!::new().put("&").write(&cx, root).save(&cx);
+            let first_store = fun.blocks.find_map(&cx, |&cx, block: Block['k]| {
+                block.instrs.find_map(&cx, |&cx, instr: C::Instr['k]| {
+                    if instr.op.is(&cx, "store") && instr.args.at(&cx, 0usize).eq(&cx, target) {
+                        Option::Some.(instr.pos)
+                    } else { Option::None }
+                })
+            });
+            let origin = first_store.unwrap_or(fun.pos);
+            if origin.line != 0u32 {
+                at = origin;
+            } else if fun.pos.line != 0u32 {
                 at = fun.pos;
-            }
-            if at.line == 0u32 {
-                at = pos;
             }
         }
         self.r.fail(&cx, Buffer!::new().write(&cx, function_name(&cx, fun.name)).put(": ").put(before).write(&cx, place_name(&cx, path)).write(&cx, after).save(&cx), at)
@@ -742,33 +788,13 @@ impl PlaceFlow['k] {
     // Replays the finalized headers for source diagnostics, without checking SSA. Do not diagnose
     // while the fixed point is evolving: a provisional header can still change. This reuses the
     // checker's path and state helpers, but none of its instruction, edge or function validators.
-    fn diagnose_places(self, &cx: Domain!['k], fun: Fun['k], header: ArenaMap[Str['k], Places['k], 'k], sites: ArenaMap[Str['k], Str['k], 'k]) {
+    fn diagnose_places(self, &cx: Domain!['k], plan: Plan['k], sites: ArenaMap[Str['k], Str['k], 'k]) {
         let c = self.checker;
-        let index: ArenaMap[Str['k], usize, 'k] = ArenaMap::new(&cx);
-        var i = 0usize;
-        while i < fun.blocks.len(&cx) {
-            index.insert(&cx, fun.blocks.at(&cx, i).label, i);
-            i = i + 1usize;
-        }
-        let origins: ArenaMap[Str['k], Pos, 'k] = ArenaMap::new(&cx);
-        i = 0usize;
-        while i < fun.blocks.len(&cx) {
-            let instrs = fun.blocks.at(&cx, i).instrs;
-            var k = 0usize;
-            while k < instrs.len(&cx) {
-                let instr = instrs.at(&cx, k);
-                if instr.op.is(&cx, "store") && !origins.contains(&cx, instr.args.at(&cx, 0usize)) {
-                    origins.insert(&cx, instr.args.at(&cx, 0usize), instr.pos);
-                }
-                k = k + 1usize;
-            }
-            i = i + 1usize;
-        }
-        self.origins.set(&cx, origins);
+        let fun = plan.fun;
         let flow = self;
         let parameters: ArenaSet[Str['k], 'k] = ArenaSet::new(&cx);
         let entry = fun.blocks.at(&cx, 0usize);
-        i = 0usize;
+        var i = 0usize;
         while i < entry.params.len(&cx) {
             if entry.params.at(&cx, i).name.starts_with(&cx, Str::from_static(&cx, "&")) {
                 parameters.insert(&cx, entry.params.at(&cx, i).name);
@@ -776,18 +802,22 @@ impl PlaceFlow['k] {
             i = i + 1usize;
         }
         let roots = c.roots.copy(&cx);
+        let facts = c.path_facts(&cx);
         i = 0usize;
         while i < fun.blocks.len(&cx) {
             let block = fun.blocks.at(&cx, i);
             // the blocks reached: the entry, and those with a header
-            let reached = if i == 0usize { Option::Some.(locals_empty(&cx, fun)) } else { header.get(&cx, block.label) };
+            let reached = if i == 0usize { Option::Some.(locals_empty(&cx, fun)) } else { plan.header.at(&cx, i) };
             if reached.is_some() {
-                match reached {
-                    Some(places) => self.working.load(&cx, places),
-                    None => (),
+                let incoming = reached.unwrap();
+                match plan.effects.at(&cx, i) {
+                    Some(ops) => {
+                        self.working.load(&cx, incoming);
+                        c.places.set(&cx, self.working);
+                        let changed = flow.simulate(&cx, block, ops, true);
+                    },
+                    None => c.places.set(&cx, incoming),
                 };
-                c.places.set(&cx, self.working);
-                let changed = flow.simulate(&cx, block, true);
                 match block.term {
                     Ret(_v, pos) => {
                         var k = 0usize;
@@ -828,31 +858,26 @@ impl PlaceFlow['k] {
                         },
                         None => (),
                     };
-                    let target = fun.blocks.at(&cx, index.at(&cx, edge.target));
-                    let empty = c.empty_to_check(&cx, target);
-                    let whole = empty.address() == target.empty.address();
-                    let rest: ArenaVec[Str['k], 'k] = if whole { ArenaVec::new(&cx) } else { empty };
+                    let target = fun.blocks.at(&cx, plan.index.at(&cx, edge.target));
+                    let outgoing = flow.places(&cx);
                     var k = 0usize;
-                    while k < empty.len(&cx) {
-                        let path = empty.at(&cx, k);
-                        let (result, always) = c.empty_discardable(&cx, path);
-                        match result {
-                            Ok(free) => if !free {
-                                let edge_key = f"{block.label}>{edge.target}".write(&cx, Buffer!::new()).save(&cx);
-                                let site = match sites.get(&cx, edge_key) {
-                                    Some(w) => w,
-                                    None => sites.get_or(&cx, edge.target, Str::from_static(&cx, "on some paths")),
-                                };
-                                flow.ownership_error(&cx, path, "linear value '", Buffer!::new().put("' remains live ").write(&cx, site).save(&cx), term_pos(block.term));
-                            },
-                            Err(_m) => (),
-                        };
-                        if whole && !always {
-                            rest.push(&cx, path);
+                    while k < target.empty.len(&cx) {
+                        let path = target.empty.at(&cx, k);
+                        if !facts.proves_discardable(&cx, outgoing, path, false) {
+                            match c.storage_discardable(&cx, path) {
+                                Ok(free) => if !free {
+                                    let edge_key = f"{block.label}>{edge.target}".write(&cx, Buffer!::new()).save(&cx);
+                                    let site = match sites.get(&cx, edge_key) {
+                                        Some(w) => w,
+                                        None => sites.get_or(&cx, edge.target, Str::from_static(&cx, "on some paths")),
+                                    };
+                                    flow.ownership_error(&cx, path, "linear value '", Buffer!::new().put("' remains live ").write(&cx, site).save(&cx), term_pos(block.term));
+                                },
+                                Err(_m) => (),
+                            };
                         }
                         k = k + 1usize;
                     }
-                    c.checked_empty(&cx, target, empty, rest);
                     c.places.set(&cx, saved);
                     e = e + 1usize;
                 }
@@ -947,12 +972,37 @@ impl PlaceFlow['k] {
     // A path through an enum's payload, such as a binder of `match &e`, is used only where the enum is
     // known to hold that variant: not after a store into the enum or one of its ancestors.
     fn variant_known(self, &cx: Domain!['k], path: Str['k], pos: Pos) {
+        // Only a projection can cross an enum payload. Looking up a whole root cannot report "known".
+        if path.find_byte(&cx, b'.', 0usize).is_none() {
+            return;
+        }
         match self.checker.place_storage(&cx, path) {
             Err(message) => if Str::from_static(&cx, message).is(&cx, "known") {
                 self.ownership_error(&cx, path, "'", Str::from_static(&cx, "' is used after its enum was assigned; match it again"), pos);
             },
             Ok(_t) => (),
         };
+    }
+
+    fn check_lends(self, &cx: Domain!['k], instr: C::Instr['k]) {
+        let places = self.places(&cx);
+        var count = 0usize;
+        var i = 0usize;
+        while i < instr.args.len(&cx) {
+            let arg = instr.args.at(&cx, i);
+            if lends(&cx, arg) {
+                if !places.full(&cx, arg) {
+                    self.ownership_error(&cx, arg, "value '", Str::from_static(&cx, "' has been moved and cannot be lent"), instr.pos);
+                }
+                self.variant_known(&cx, arg, instr.pos);
+                count = count + 1usize;
+            }
+            i = i + 1usize;
+        }
+        if count > 1usize {
+            let paths = instr.args.filter(&cx, |&cx, arg| lends(&cx, arg));
+            self.lent_apart(&cx, paths, instr.pos);
+        }
     }
 
     // The places one call lends are apart: none overlaps another, and beside whole locals a call lends
@@ -997,89 +1047,79 @@ impl PlaceFlow['k] {
     // opened views are diagnosed by the core checker, which checks every instruction and requires
     // each edge to satisfy its target's contract. Whether the state may have changed: a key added
     // or removed, or a view opened.
-    fn simulate(self, &cx: Domain!['k], block: Block['k], diagnose: bool) -> bool {
+    fn simulate(self, &cx: Domain!['k], block: Block['k], effects: ArenaVec[PlaceEffect['k], 'k], diagnose: bool) -> bool {
         let c = self.checker;
         let before = extent(&cx, c.places.copy(&cx));
         var opened = false;
         var i = 0usize;
-        while i < block.instrs.len(&cx) {
-            let instr = block.instrs.at(&cx, i);
-            let op = instr.op;
-            let first = if instr.args.is_empty(&cx) { Str::from_static(&cx, "") } else { instr.args.at(&cx, 0usize) };
-            let place = first.starts_with(&cx, Str::from_static(&cx, "&"));
-            let places = c.places.copy(&cx);
-            if op.is(&cx, "load") || op.is(&cx, "destruct") && place {
-                if diagnose && !places.full(&cx, first) {
-                    self.ownership_error(&cx, first, "value '", Str::from_static(&cx, "' has been moved or is only partially available"), instr.pos);
-                }
-                if diagnose {
-                    self.variant_known(&cx, first, instr.pos);
-                }
-                match c.place_type(&cx, first) {
-                    Ok(t) => if !c.copy_type(&cx, t) {
-                        places.empty.insert(&cx, first);
-                        places.forget(&cx, first, true);
-                    },
-                    Err(_m) => (),
-                };
-            } else if op.is(&cx, "store") {
-                var known = true;
-                if diagnose {
-                    self.variant_known(&cx, first, instr.pos);
-                    known = match c.storage_discardable(&cx, first) {
-                        Ok(free) => {
-                            if !free {
-                                self.ownership_error(&cx, first, "cannot overwrite live linear value '", Str::from_static(&cx, "'"), instr.pos);
-                            }
-                            true
+        let places = self.places(&cx);
+        while i < effects.len(&cx) {
+            let effect = effects.at(&cx, i);
+            let instr = block.instrs.at(&cx, effect.index);
+            let first = effect.first;
+            match effect.op {
+                Load => {
+                    if diagnose && !places.full(&cx, first) {
+                        self.ownership_error(&cx, first, "value '", Str::from_static(&cx, "' has been moved or is only partially available"), instr.pos);
+                    }
+                    if diagnose {
+                        self.variant_known(&cx, first, instr.pos);
+                    }
+                    match c.place_type(&cx, first) {
+                        Ok(t) => if !c.copy_type(&cx, t) {
+                            places.empty.insert(&cx, first);
+                            places.forget(&cx, first, true);
                         },
-                        Err(_m) => false,
+                        Err(_m) => (),
                     };
-                }
-                if known {
-                    clear_below(&cx, places.empty, first);
-                    places.forget(&cx, first, true);
-                }
-            } else if op.is(&cx, "variant_tag") && place {
-                if diagnose && !places.full(&cx, first) {
-                    self.ownership_error(&cx, first, "enum value '", Str::from_static(&cx, "' has been moved or is only partially available; its tag is unavailable"), instr.pos);
-                }
-                if diagnose {
-                    self.variant_known(&cx, first, instr.pos);
-                }
-            } else if op.is(&cx, "call") || op.is(&cx, "trait_call") {
-                let lent: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
-                var k = 0usize;
-                while k < instr.args.len(&cx) {
-                    let arg = instr.args.at(&cx, k);
-                    if arg.starts_with(&cx, Str::from_static(&cx, "&")) && !arg.starts_with(&cx, Str::from_static(&cx, "&*")) {
-                        lent.push(&cx, arg);
+                },
+                Store => {
+                    var known = true;
+                    if diagnose {
+                        self.variant_known(&cx, first, instr.pos);
+                        known = match c.storage_discardable(&cx, first) {
+                            Ok(free) => {
+                                if !free {
+                                    self.ownership_error(&cx, first, "cannot overwrite live linear value '", Str::from_static(&cx, "'"), instr.pos);
+                                }
+                                true
+                            },
+                            Err(_m) => false,
+                        };
                     }
-                    k = k + 1usize;
-                }
-                if diagnose {
-                    k = 0usize;
-                    while k < lent.len(&cx) {
-                        let arg = lent.at(&cx, k);
-                        if !places.full(&cx, arg) {
-                            self.ownership_error(&cx, arg, "value '", Str::from_static(&cx, "' has been moved and cannot be lent"), instr.pos);
-                        }
-                        self.variant_known(&cx, arg, instr.pos);
-                        k = k + 1usize;
+                    if known {
+                        clear_below(&cx, places.empty, first);
+                        places.forget(&cx, first, true);
                     }
-                    self.lent_apart(&cx, lent, instr.pos);
-                }
-                k = 0usize;
-                while k < lent.len(&cx) {
-                    places.forget(&cx, lent.at(&cx, k), true);
-                    k = k + 1usize;
-                }
-            } else if op.is(&cx, "open") && place {
-                places.opened.insert(&cx, first, instr.binders);
-                opened = true;
-            } else if op.is(&cx, "pack") && place {
-                places.forget(&cx, first, false);
-            }
+                },
+                Tag => {
+                    if diagnose && !places.full(&cx, first) {
+                        self.ownership_error(&cx, first, "enum value '", Str::from_static(&cx, "' has been moved or is only partially available; its tag is unavailable"), instr.pos);
+                    }
+                    if diagnose {
+                        self.variant_known(&cx, first, instr.pos);
+                    }
+                },
+                Call => {
+                    if diagnose {
+                        self.check_lends(&cx, instr);
+                    }
+                    if !places.known.is_empty(&cx) || !places.opened.is_empty(&cx) {
+                        instr.args.each(&cx, |&cx, arg: Str['k]| {
+                            if lends(&cx, arg) {
+                                places.forget(&cx, arg, true);
+                            }
+                        });
+                    }
+                },
+                Open => {
+                    places.opened.insert(&cx, first, instr.binders);
+                    opened = true;
+                },
+                Pack => {
+                    places.forget(&cx, first, false);
+                },
+            };
             i = i + 1usize;
         }
         let after = extent(&cx, c.places.copy(&cx));

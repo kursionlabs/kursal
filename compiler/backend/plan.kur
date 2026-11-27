@@ -124,6 +124,37 @@ fn term_edges(&cx: Domain!['k], term: Terminator['k]) -> ArenaVec[(Edge['k], usi
     out
 }
 
+// A conflict makes the parameter its own origin for the rest of the analysis.
+forall 'k.
+fn settle_origins(&cx: Domain!['k], incoming: ArenaVec[(usize, usize), 'k], args: ArenaVec[usize, 'k],
+    origins: ArenaVec[usize, 'k], unknown: usize) {
+    var changed = true;
+    while changed {
+        changed = false;
+        var i = 0usize;
+        while i < unknown {
+            let current = origins.at(&cx, i);
+            if current != i {
+                let (start, end) = incoming.at(&cx, i);
+                var origin = unknown;
+                var a = start;
+                while origin != i && a < end {
+                    let from = origins.at(&cx, args.at(&cx, a));
+                    if from != unknown {
+                        origin = if origin == unknown || origin == from { from } else { i };
+                    }
+                    a = a + 1usize;
+                }
+                if current != origin {
+                    origins.set(&cx, i, origin);
+                    changed = true;
+                }
+            }
+            i = i + 1usize;
+        }
+    }
+}
+
 // The index of `name` among `block`'s parameters.
 forall 'k.
 fn param_index(&cx: Domain!['k], block: Block['k], name: Str['k]) -> Option[usize] {
@@ -151,6 +182,34 @@ exposed struct Scratch {
     valid: ArenaSet[Str['k], 'k],
 }
 
+enum LiveSource {
+    ParameterAt(usize),
+    PureAt(usize),
+}
+
+forall 'k.
+fn live_sources(&cx: Domain!['k], block: Block['k]) -> ArenaMap[Str['k], LiveSource, 'k] {
+    let sources: ArenaMap[Str['k], LiveSource, 'k] = ArenaMap::new(&cx);
+    var p = 0usize;
+    while p < block.params.len(&cx) {
+        sources.insert(&cx, block.params.at(&cx, p).name, LiveSource::ParameterAt.(p));
+        p = p + 1usize;
+    }
+    var i = 0usize;
+    while i < block.instrs.len(&cx) {
+        let instr = block.instrs.at(&cx, i);
+        if is_pure(&cx, instr.op) {
+            var l = 0usize;
+            while l < instr.lhs.len(&cx) {
+                sources.insert(&cx, instr.lhs.at(&cx, l), LiveSource::PureAt.(i));
+                l = l + 1usize;
+            }
+        }
+        i = i + 1usize;
+    }
+    sources
+}
+
 forall 'k.
 exposed struct Plan {
     fun: Fun['k],
@@ -163,6 +222,12 @@ exposed struct Plan {
     return_index: ArenaMap[Str['k], usize, 'k],
     // the blocks the C has: every edge into a return join returns instead
     emitted: ArenaVec[Block['k], 'k],
+    // (edge, implicit payload count) of each emitted block's outgoing edges
+    outgoing: ArenaMap[Str['k], ArenaVec[(Edge['k], usize), 'k], 'k],
+    // forwarding parameter -> original (block, parameter) whose C variable it reads
+    param_origins: ArenaMap[(Str['k], Str['k]), (Str['k], Str['k]), 'k],
+    // aliases and origins, whose shared variable is written only on entry to the origin's block
+    shared_params: ArenaSet[(Str['k], Str['k]), 'k],
     // (block label, SSA name) of every value the C reads
     live: ArenaSet[(Str['k], Str['k]), 'k],
     // Reused by `block_reads`: each result is consumed before the next block is visited.
@@ -209,7 +274,9 @@ impl Plan['k] {
             b = b + 1usize;
         }
         let plan = Plan.{ fun, blocks, forwarded: ArenaSet::new(&cx), copied: ArenaMap::new(&cx), return_index: ArenaMap::new(&cx), emitted: ArenaVec::new(&cx),
-            live: ArenaSet::new(&cx), read_scratch: ArenaSet::new(&cx), variables: ArenaSet::new(&cx), resident: ArenaMap::new(&cx), in_place: ArenaMap::new(&cx),
+            outgoing: ArenaMap::new(&cx), param_origins: ArenaMap::new(&cx), shared_params: ArenaSet::new(&cx),
+            live: ArenaSet::new(&cx), read_scratch: ArenaSet::new(&cx),
+            variables: ArenaSet::new(&cx), resident: ArenaMap::new(&cx), in_place: ArenaMap::new(&cx),
             unwritten: ArenaSet::new(&cx), fused: ArenaSet::new(&cx), shared: ArenaMap::new(&cx), arrived: ArenaMap::new(&cx),
             moved: ArenaSet::new(&cx), homed: ArenaMap::new(&cx), made_home: ArenaSet::new(&cx) };
         plan.forwarded_places(&cx);
@@ -233,6 +300,9 @@ impl Plan['k] {
             }
             e = e + 1usize;
         }
+        let preds = plan.predecessors(&cx);
+        plan.liveness(&cx, preds);
+        plan.forwarded_params(&cx, preds);
         let scratch = Scratch.{ alias: ArenaMap::new(&cx), stored: ArenaMap::new(&cx), held: ArenaMap::new(&cx), candidates: ArenaMap::new(&cx),
             lent: ArenaMap::new(&cx), last: ArenaMap::new(&cx), reads: ArenaMap::new(&cx), valid: ArenaSet::new(&cx) };
         var s = 0usize;
@@ -240,9 +310,8 @@ impl Plan['k] {
             plan.residences(&cx, plan.emitted.at(&cx, s), components, adapters, params, shapes, scratch);
             s = s + 1usize;
         }
-        plan.liveness(&cx);
-        plan.share(&cx);
-        plan.home_params(&cx, components);
+        plan.share(&cx, preds);
+        plan.home_params(&cx, preds, components);
         plan.c_variables(&cx);
         plan
     }
@@ -343,30 +412,14 @@ impl Plan['k] {
 
     // ------------------------------------------------------------------ liveness --
 
-    fn liveness(self, &cx: Domain!['k]) {
-        let live_params: ArenaSet[(Str['k], Str['k]), 'k] = ArenaSet::new(&cx);
-        var changed = true;
-        while changed {
-            changed = false;
-            var b = self.emitted.len(&cx);
-            while b > 0usize {
-                b = b - 1usize;
-                let block = self.emitted.at(&cx, b);
-                let used = self.block_reads(&cx, block, live_params);
-                var p = 0usize;
-                while p < block.params.len(&cx) {
-                    let name = block.params.at(&cx, p).name;
-                    if used.contains(&cx, name) && live_params.insert(&cx, (block.label, name)) {
-                        changed = true;
-                    }
-                    p = p + 1usize;
-                }
-            }
-        }
-        var k = 0usize;
-        while k < self.emitted.len(&cx) {
-            let block = self.emitted.at(&cx, k);
-            let used = self.block_reads(&cx, block, live_params);
+    fn liveness(self, &cx: Domain!['k], preds: ArenaMap[Str['k], ArenaVec[(Block['k], Edge['k], usize), 'k], 'k]) {
+        let scanned: ArenaSet[Str['k], 'k] = ArenaSet::new(&cx);
+        let pending: ArenaVec[(Str['k], Str['k]), 'k] = ArenaVec::new(&cx);
+        var b = self.emitted.len(&cx);
+        while b > 0usize {
+            b = b - 1usize;
+            let block = self.emitted.at(&cx, b);
+            let used = self.block_reads(&cx, block);
             var u = 0usize;
             while u < used.positions(&cx) {
                 match used.key_at(&cx, u) {
@@ -377,12 +430,79 @@ impl Plan['k] {
                 };
                 u = u + 1usize;
             }
-            k = k + 1usize;
+            scanned.insert(&cx, block.label);
+            // Predecessors yet to be scanned will read these live parameters on their own.
+            match preds.get(&cx, block.label) {
+                Some(edges) => {
+                    var e = 0usize;
+                    while e < edges.len(&cx) {
+                        let (source, edge, skip) = edges.at(&cx, e);
+                        if scanned.contains(&cx, source.label) {
+                            var a = 0usize;
+                            while a < edge.args.len(&cx) {
+                                if used.contains(&cx, block.params.at(&cx, skip + a).name) {
+                                    pending.push(&cx, (source.label, edge.args.at(&cx, a)));
+                                }
+                                a = a + 1usize;
+                            }
+                        }
+                        e = e + 1usize;
+                    }
+                },
+                None => (),
+            };
+        }
+        // Index definitions in blocks reached by a late read, once per block.
+        let sources: ArenaMap[Str['k], ArenaMap[Str['k], LiveSource, 'k], 'k] = ArenaMap::new(&cx);
+        var q = 0usize;
+        while q < pending.len(&cx) {
+            let (label, name) = pending.at(&cx, q);
+            if self.live.insert(&cx, (label, name)) {
+                let block = self.blocks.at(&cx, label);
+                let definitions = match sources.get(&cx, label) {
+                    Some(found) => found,
+                    None => {
+                        let found = live_sources(&cx, block);
+                        sources.insert(&cx, label, found);
+                        found
+                    },
+                };
+                match definitions.get(&cx, name) {
+                    Some(origin) => match origin {
+                        ParameterAt(position) => match preds.get(&cx, label) {
+                            Some(edges) => {
+                                var e = 0usize;
+                                while e < edges.len(&cx) {
+                                    let (source, edge, skip) = edges.at(&cx, e);
+                                    if position >= skip {
+                                        pending.push(&cx, (source.label, edge.args.at(&cx, position - skip)));
+                                    }
+                                    e = e + 1usize;
+                                }
+                            },
+                            None => (),
+                        },
+                        PureAt(index) => {
+                            let args = block.instrs.at(&cx, index).args;
+                            var a = 0usize;
+                            while a < args.len(&cx) {
+                                match value_read(&cx, args.at(&cx, a)) {
+                                    Some(read) => pending.push(&cx, (label, read)),
+                                    None => (),
+                                };
+                                a = a + 1usize;
+                            }
+                        },
+                    },
+                    None => (),
+                };
+            }
+            q = q + 1usize;
         }
     }
 
     // The names of `block` the C reads, given which parameters of other blocks are live.
-    fn block_reads(self, &cx: Domain!['k], block: Block['k], live_params: ArenaSet[(Str['k], Str['k]), 'k]) -> ArenaSet[Str['k], 'k] {
+    fn block_reads(self, &cx: Domain!['k], block: Block['k]) -> ArenaSet[Str['k], 'k] {
         let used = self.read_scratch;
         used.clear(&cx);
         match block.term {
@@ -399,7 +519,7 @@ impl Plan['k] {
             },
             _ => (),
         };
-        let edges = term_edges(&cx, block.term);
+        let edges = self.outgoing.at(&cx, block.label);
         var e = 0usize;
         while e < edges.len(&cx) {
             let (edge, skip) = edges.at(&cx, e);
@@ -414,7 +534,7 @@ impl Plan['k] {
                 None => {
                     var a = 0usize;
                     while a < edge.args.len(&cx) && skip + a < target.params.len(&cx) {
-                        if live_params.contains(&cx, (target.label, target.params.at(&cx, skip + a).name)) {
+                        if self.live.contains(&cx, (target.label, target.params.at(&cx, skip + a).name)) {
                             let added = used.insert(&cx, edge.args.at(&cx, a));
                         }
                         a = a + 1usize;
@@ -450,7 +570,7 @@ impl Plan['k] {
             var p = 0usize;
             while p < block.params.len(&cx) {
                 let key = (block.label, block.params.at(&cx, p).name);
-                if self.live.contains(&cx, key) && !self.arrived.contains(&cx, key) {
+                if self.live.contains(&cx, key) && !self.arrived.contains(&cx, key) && !self.param_origins.contains(&cx, key) {
                     let added = self.variables.insert(&cx, key);
                 }
                 p = p + 1usize;
@@ -479,29 +599,17 @@ impl Plan['k] {
 
     // Values that move along one edge share the C variable they move into; `Plan.share` in plan.py
     // states the rules.
-    fn share(self, &cx: Domain!['k]) {
-        let incoming: ArenaMap[Str['k], usize, 'k] = ArenaMap::new(&cx);
-        var b = 0usize;
-        while b < self.emitted.len(&cx) {
-            let edges = term_edges(&cx, self.emitted.at(&cx, b).term);
-            var e = 0usize;
-            while e < edges.len(&cx) {
-                let (edge, _skip) = edges.at(&cx, e);
-                incoming.insert(&cx, edge.target, incoming.get_or(&cx, edge.target, 0usize) + 1usize);
-                e = e + 1usize;
-            }
-            b = b + 1usize;
-        }
+    fn share(self, &cx: Domain!['k], preds: ArenaMap[Str['k], ArenaVec[(Block['k], Edge['k], usize), 'k], 'k]) {
         var a = 0usize;
         while a < self.emitted.len(&cx) {
-            self.arrive(&cx, self.emitted.at(&cx, a), incoming);
+            self.arrive(&cx, self.emitted.at(&cx, a), preds);
             a = a + 1usize;
         }
         var k = 0usize;
         while k < self.emitted.len(&cx) {
             let block = self.emitted.at(&cx, k);
             // Nothing moves along an edge without arguments.
-            let edges_here = term_edges(&cx, block.term);
+            let edges_here = self.outgoing.at(&cx, block.label);
             var moving = false;
             var q = 0usize;
             while !moving && q < edges_here.len(&cx) {
@@ -517,21 +625,21 @@ impl Plan['k] {
     }
 
     // The payloads that arrive where the scrutinee of a switch ending `block` lies (`arrived`).
-    fn arrive(self, &cx: Domain!['k], block: Block['k], incoming: ArenaMap[Str['k], usize, 'k]) {
+    fn arrive(self, &cx: Domain!['k], block: Block['k], preds: ArenaMap[Str['k], ArenaVec[(Block['k], Edge['k], usize), 'k], 'k]) {
         let label = block.label;
         match block.term {
             Switch(scrutinee, _ty, arms, _pos) => {
-                let placed = match self.resident.get(&cx, (label, scrutinee)) {
-                    Some(path) => path.starts_with(&cx, Str::from_static(&cx, "&")),
+                let unshared = match self.variable(&cx, label, scrutinee) {
+                    Some(key) => !self.shared_params.contains(&cx, key),
                     None => false,
                 };
-                if !scrutinee.starts_with(&cx, Str::from_static(&cx, "&")) && !placed {
+                if unshared {
                     var r = 0usize;
                     while r < arms.len(&cx) {
                         let arm = arms.at(&cx, r);
                         let target = self.blocks.at(&cx, arm.edge.target);
                         if !self.return_index.contains(&cx, target.label) && !target.label.eq(&cx, label)
-                            && is_at(incoming.get(&cx, target.label), 1usize) && !target.params.is_empty(&cx) {
+                            && preds.at(&cx, target.label).len(&cx) == 1usize && !target.params.is_empty(&cx) {
                             self.arrived.insert(&cx, (target.label, target.params.at(&cx, 0usize).name), (label, scrutinee, arm.variant));
                             self.moved.insert(&cx, (target.label, target.params.at(&cx, 0usize).name));
                         }
@@ -580,7 +688,7 @@ impl Plan['k] {
             i = i + 1usize;
         }
         let ending = term_reads(&cx, block.term);
-        let edges = term_edges(&cx, block.term);
+        let edges = self.outgoing.at(&cx, block.label);
         var e = 0usize;
         while e < edges.len(&cx) {
             let (edge, _skip) = edges.at(&cx, e);
@@ -609,7 +717,7 @@ impl Plan['k] {
                         None => false,
                     };
                     if assigned.contains(&cx, arg) && is_at(reads.get(&cx, arg), 1usize) && !self.resident.contains(&cx, (label, arg))
-                        && self.live.contains(&cx, (target.label, param)) && !into {
+                        && self.live.contains(&cx, (target.label, param)) && !self.shared_params.contains(&cx, (target.label, param)) && !into {
                         self.shared.insert(&cx, (label, arg), (target.label, param));
                         self.moved.insert(&cx, (label, arg));
                     }
@@ -622,15 +730,14 @@ impl Plan['k] {
 
     // ---------------------------------------------------------- homed parameters --
 
-    // Components of a block parameter written where they end up (`homed`); `Plan.home_params` in
-    // plan.py states the rules.
-    fn home_params(self, &cx: Domain!['k], components: ArenaMap[(Str['k], usize), ArenaVec[Str['k], 'k], 'k]) {
+    fn predecessors(self, &cx: Domain!['k]) -> ArenaMap[Str['k], ArenaVec[(Block['k], Edge['k], usize), 'k], 'k] {
         // block label -> each (block, edge, skip) of an edge into it
         let preds: ArenaMap[Str['k], ArenaVec[(Block['k], Edge['k], usize), 'k], 'k] = ArenaMap::new(&cx);
         var b = 0usize;
         while b < self.emitted.len(&cx) {
             let block = self.emitted.at(&cx, b);
             let edges = term_edges(&cx, block.term);
+            self.outgoing.insert(&cx, block.label, edges);
             var e = 0usize;
             while e < edges.len(&cx) {
                 let (edge, skip) = edges.at(&cx, e);
@@ -646,6 +753,100 @@ impl Plan['k] {
             }
             b = b + 1usize;
         }
+        preds
+    }
+
+    // Resolve live forwarding parameters to the parameter that owns their C variable.
+    fn forwarded_params(self, &cx: Domain!['k], preds: ArenaMap[Str['k], ArenaVec[(Block['k], Edge['k], usize), 'k], 'k]) {
+        if self.emitted.len(&cx) <= 1usize {
+            return;
+        }
+        let keys: ArenaVec[((Str['k], Str['k]), usize), 'k] = ArenaVec::new(&cx);
+        let indices: ArenaMap[(Str['k], Str['k]), usize, 'k] = ArenaMap::new(&cx);
+        var b = 0usize;
+        while b < self.emitted.len(&cx) {
+            let block = self.emitted.at(&cx, b);
+            var p = 0usize;
+            while p < block.params.len(&cx) {
+                let binding = block.params.at(&cx, p);
+                let key = (block.label, binding.name);
+                // Never fits any edge parameter type but has no C variable to share.
+                let represented = match binding.ty {
+                    Never => false,
+                    _ => true,
+                };
+                if represented && binding.name.starts_with(&cx, Str::from_static(&cx, "%")) && self.live.contains(&cx, key) {
+                    indices.insert(&cx, key, keys.len(&cx));
+                    keys.push(&cx, (key, p));
+                }
+                p = p + 1usize;
+            }
+            b = b + 1usize;
+        }
+        let unknown = keys.len(&cx);
+        let incoming: ArenaVec[(usize, usize), 'k] = ArenaVec::new(&cx);
+        let args: ArenaVec[usize, 'k] = ArenaVec::new(&cx);
+        let origins: ArenaVec[usize, 'k] = ArenaVec::new(&cx);
+        let payloads: ArenaSet[usize, 'k] = ArenaSet::new(&cx);
+        var i = 0usize;
+        while i < unknown {
+            let ((block, _name), position) = keys.at(&cx, i);
+            let start = args.len(&cx);
+            var origin = i;
+            match preds.get(&cx, block) {
+                Some(edges) => {
+                    origin = unknown;
+                    var e = 0usize;
+                    while e < edges.len(&cx) {
+                        let (source, edge, skip) = edges.at(&cx, e);
+                        if position < skip {
+                            payloads.insert(&cx, i);
+                            origin = i;
+                        } else if origin == unknown {
+                            match indices.get(&cx, (source.label, edge.args.at(&cx, position - skip))) {
+                                Some(a) => args.push(&cx, a),
+                                None => { origin = i; },
+                            };
+                        }
+                        e = e + 1usize;
+                    }
+                },
+                None => (),
+            };
+            incoming.push(&cx, (start, args.len(&cx)));
+            origins.push(&cx, origin);
+            i = i + 1usize;
+        }
+
+        // Let an entry edge supply the origin of a loop parameter before its back edge is ready.
+        // After settling, keep a separate variable for any cycle with no known origin.
+        settle_origins(&cx, incoming, args, origins, unknown);
+        i = 0usize;
+        while i < unknown {
+            if origins.at(&cx, i) == unknown {
+                origins.set(&cx, i, i);
+            }
+            i = i + 1usize;
+        }
+        settle_origins(&cx, incoming, args, origins, unknown);
+        i = 0usize;
+        while i < unknown {
+            let origin = origins.at(&cx, i);
+            if origin != i && !payloads.contains(&cx, origin) {
+                let (key, _p) = keys.at(&cx, i);
+                let (original, _q) = keys.at(&cx, origin);
+                self.param_origins.insert(&cx, key, original);
+                self.shared_params.insert(&cx, key);
+                self.shared_params.insert(&cx, original);
+            }
+            i = i + 1usize;
+        }
+    }
+
+    // Components of a block parameter written where they end up (`homed`); `Plan.home_params` in
+    // plan.py states the rules.
+    fn home_params(self, &cx: Domain!['k], preds: ArenaMap[Str['k], ArenaVec[(Block['k], Edge['k], usize), 'k], 'k],
+        components: ArenaMap[(Str['k], usize), ArenaVec[Str['k], 'k], 'k]) {
         let alias: ArenaMap[Str['k], Str['k], 'k] = ArenaMap::new(&cx);
         let stored: ArenaMap[Str['k], Str['k], 'k] = ArenaMap::new(&cx);
         // class -> (how many times the block reads it, where it reads it last: an instruction's index,
@@ -711,7 +912,7 @@ impl Plan['k] {
             j = j + 1usize;
         }
         let ending = term_reads(&cx, target.term);
-        let edges = term_edges(&cx, target.term);
+        let edges = self.outgoing.at(&cx, target.label);
         var e = 0usize;
         while e < edges.len(&cx) {
             let (edge, _skip) = edges.at(&cx, e);
@@ -728,7 +929,7 @@ impl Plan['k] {
         var pi = 0usize;
         while pi < target.params.len(&cx) {
             let p = target.params.at(&cx, pi).name;
-            if self.live.contains(&cx, (label, p)) {
+            if self.live.contains(&cx, (label, p)) && !self.shared_params.contains(&cx, (label, p)) {
                 match read_once(reads.get(&cx, p), n) {
                     Some(d) => {
                         let destruct = instrs.at(&cx, d);
@@ -921,7 +1122,7 @@ impl Plan['k] {
         }
         if made {
             let ending = term_reads(&cx, block.term);
-            let edges = term_edges(&cx, block.term);
+            let edges = self.outgoing.at(&cx, block.label);
             var e = 0usize;
             while e < edges.len(&cx) {
                 let (other, _skip) = edges.at(&cx, e);
@@ -986,7 +1187,7 @@ impl Plan['k] {
                 let (source, scrutinee, _variant) = found;
                 self.variable(&cx, source, scrutinee)
             },
-            None => Option::Some.((label, value)),
+            None => Option::Some.(self.param_origins.get_or(&cx, (label, value), (label, value))),
         }
     }
 
@@ -1123,7 +1324,7 @@ impl Plan['k] {
             j = j + 1usize;
         }
         let ending = term_reads(&cx, block.term);
-        let edges = term_edges(&cx, block.term);
+        let edges = self.outgoing.at(&cx, block.label);
         var e = 0usize;
         while e < edges.len(&cx) {
             let (edge, _skip) = edges.at(&cx, e);
@@ -1166,10 +1367,11 @@ impl Plan['k] {
                             None => true,
                         };
                         let unseen = if q.starts_with(&cx, Str::from_static(&cx, "%")) {
-                            match last.get(&cx, root(&cx, q)) {
+                            let r = root(&cx, q);
+                            !self.shared_params.contains(&cx, (label, r)) && (match last.get(&cx, r) {
                                 Some(read) => read <= at,
                                 None => true,
-                            }
+                            })
                         } else {
                             stored_back(&cx, label, instrs, alias, components, at, k, q)
                         };

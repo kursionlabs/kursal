@@ -32,15 +32,18 @@ class LinearTemporaryTests(unittest.TestCase):
     def test_abandoned_operand_reports_its_origin(self):
         source = PREFIX + '''fn combine(t: Token!, n: u32) -> u32 { take(t) + n }
 fn main() -> i32 {
-    combine(
-        make(7u32),
-        { return 0i32; 2u32 }
-    );
+    let earlier = make(3u32);
+    if take(earlier) == 3u32 {
+        combine(
+            make(7u32),
+            { return 0i32; 2u32 }
+        );
+    }
     0i32
 }'''
         with self.assertRaisesRegex(OwnershipError, 'temporary expression result') as error:
             self.run_source(source, 0)
-        self.assertEqual(error.exception.pos, (7, 9))
+        self.assertEqual(error.exception.pos, (9, 13))
 
     def test_assignment_diagnostic_points_to_assignment(self):
         source = PREFIX + '''fn main() -> i32 {

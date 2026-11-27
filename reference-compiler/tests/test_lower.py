@@ -487,6 +487,59 @@ def compile_and_run(c_file, out):
 
 
 class LoweringTests(unittest.TestCase):
+    def test_copy_locals_use_ssa_across_joins_and_back_edges(self):
+        with tempfile.TemporaryDirectory(prefix="kursal-ssa-") as base:
+            directory = Path(base)
+            write(directory, {"lib.kur": """
+struct Point { value: u32 }
+fn bump(&x: u32) { x = x + 1u32; }
+fn sum(limit: u32, base: u32) -> u32 {
+    let step = base + 1u32;
+    var i = 0u32;
+    var total = 0u32;
+    while i < limit {
+        total = if i == 0u32 { total + step } else { total + base };
+        i = i + 1u32;
+    }
+    total
+}
+fn earlier(flag: bool) -> u32 {
+    var x = 10u32;
+    let result = x + ({ x = 13u32; if flag { 1u32 } else { 2u32 } });
+    result + x
+}
+fn many_blocks(flag: bool) -> u32 {
+    var x = 10u32;
+    if flag { x = x + 1u32; }
+    if flag { x = x + 2u32; }
+    if flag { x = x + 4u32; }
+    if flag { x = x + 8u32; }
+    x
+}
+fn main() -> i32 {
+    var point = Point.{ value: sum(3u32, 4u32) };
+    point.value = point.value + 1u32;
+    bump(&point.value);
+    (point.value + earlier(true) + many_blocks(true)) as i32
+}
+"""})
+            resolver = resolve(directory)
+            sigs = signatures(resolver)
+            program = lower(resolver, sigs)
+            checker = check_program(program)
+            entry = sigs.name(resolver.packages[0].entry_decl)
+            summed = next(fun for name, fun in program.funs.items() if name.endswith("::sum"))
+            self.assertTrue(all(name.startswith("&#tmp") for name, _ in summed.locals))
+            self.assertTrue(any(block.params for block in summed.blocks[1:]))
+            self.assertTrue(any(name.startswith("&point#") for name, _ in program.funs[entry].locals))
+            many = next(fun for name, fun in program.funs.items() if name.endswith("::many_blocks"))
+            self.assertGreater(len(many.blocks), 8)
+            self.assertFalse(many.locals)
+            self.assertTrue(any(block.params for block in many.blocks))
+            c_file = directory / "main.c"
+            c_file.write_text(emit_c(program, checker, entry))
+            self.assertEqual(compile_and_run(c_file, directory / "main"), 64)
+
     @unittest.skipUnless((LIB / "std" / "kur.toml").exists(), "needs the standard library")
     def test_fstring_writer_survives_branching_and_lent_interpolations(self):
         with tempfile.TemporaryDirectory(prefix="kursal-fstring-") as base:

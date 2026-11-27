@@ -20,10 +20,10 @@
 // stops with the error and status 1.
 //
 // Each group of phases keeps what it builds in an arena of its own: the front end (the command
-// line, parsing, resolving, signatures, inference and lowering, or reading KURS), the core
-// (checking) and the back end (C). A group hands the next one only what it needs, copied into the
-// next arena: the core program, the counter of fresh names, and for the back end the types the
-// checker recorded; then its own arena is destroyed. Each arena is opened once, here in `main`, so
+// line, parsing, resolving, signatures, inference and lowering, or reading KURS) and the core
+// (checking and C emission). The front end copies the program, fresh-name counter and build
+// options into the core arena before releasing its own. Checking records the SSA types there
+// for the C emitter to read. Each arena is opened once, here in `main`, so
 // the code of every phase is made once, for the brand of the group it runs in. A command that
 // fails stops the process from inside, leaving its arenas to the operating system.
 
@@ -34,7 +34,7 @@ use std::mem::Ref;
 use std::str::Str;
 use std::arena::{Domain!, ref_in};
 use package::backend::cgen::{CText!, emit_c};
-use package::check::checker::{FunKey, check_program, copy_typed};
+use package::check::checker::{FunKey, FunctionOrigin, check_program};
 use package::syntax::dump as syntax_dump;
 use package::infer::inference::infer;
 use package::infer::dump as infer_dump;
@@ -119,7 +119,11 @@ fn main(args: Args) -> i32 {
     started = stage(times, "front copy", started);
     front.destroy();
     started = stage(times, "front free", started);
-    let checker = check_program(&core, checked.program, checked.counter);
+    let origin = match checked.goal {
+        Build => FunctionOrigin::Lowered,
+        _ => FunctionOrigin::Parsed,
+    };
+    let checker = check_program(&core, checked.program, checked.counter, origin);
     started = stage(times, "check", started);
     let unit = match checked.goal {
         Check => {
@@ -128,15 +132,7 @@ fn main(args: Args) -> i32 {
         },
         _ => (),
     };
-    var exists 'b. back = Domain!::new(hash_seed());
-    let emitted = carry(&core, &back, Handoff.{ goal: checked.goal, program: checked.program, counter: checked.counter, entry: checked.entry,
-        output: checked.output, link_flags: checked.link_flags, c_sources: checked.c_sources, single_c: checked.single_c, times: checked.times, started });
-    started = stage(times, "back copy", started);
-    let typed = copy_typed(&core, &back, checker.typed);
-    started = stage(times, "typed copy", started);
-    core.destroy();
-    started = stage(times, "core free", started);
-    back_end(back, emitted, typed, started)
+    back_end(core, checked, checker.typed, started)
 }
 
 // The front end of every command, in the arena of `cx`: a command that only the front end does is

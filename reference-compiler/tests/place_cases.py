@@ -71,6 +71,11 @@ CASES = {
    (out ((%r u32)) (empty &b.h) (= %k (load &b.n)) (= %n1 (const u32 1)) (= %h1 (construct H! %n1)) (= %u (store &b.h %h1)) (ret %r)))"""),
     "join_drops_linear": (False, 'holds_linear_contents_assumes', """(fun f u32 (Box!) (entry ((&b Box!)) (= %r (const u32 0)) (jmp out %r))
    (out ((%r u32)) (empty &b.h) (= %n1 (const u32 1)) (= %h1 (construct H! %n1)) (= %u (store &b.h %h1)) (ret %r)))"""),
+    "join_empty_on_first_two_edges_only": (False, 'holds_linear_contents_assumes', """(fun f u32 () (locals (&slot H!))
+   (entry () (= %c (const bool true)) (jnz %c (out) (again)))
+   (again () (empty &slot) (= %d (const bool false)) (jnz %d (out) (fill)))
+   (fill () (empty &slot) (= %n (const u32 1)) (= %h (construct H! %n)) (= %u (store &slot %h)) (jmp out))
+   (out () (empty &slot) (= %r (const u32 0)) (ret %r)))"""),
     "entry_declares_empty": (False, 'storing_into_discard_linear', """(fun f u32 (Box!) (entry ((&b Box!)) (empty &b.h)
    (= %n1 (const u32 1)) (= %h1 (construct H! %n1)) (= %u (store &b.h %h1)) (= %r (const u32 0)) (ret %r)))"""),
     "entry_declares_known": (False, 'known', """(fun f u32 (Holder!) (entry ((&x Holder!)) (known &x.e B) (= %v (load &x.e.B)) (ret %v)))"""),

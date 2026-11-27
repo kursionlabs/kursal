@@ -692,12 +692,23 @@ class Backend:
         self.roots = {**{n: substitute_type(t) for n, t in entry.params if n.startswith("&")},
                       **{n: substitute_type(t) for n, t in fun.locals}}
         self.typed = typed
-        values = []
-        for (label, name), ty in typed.items():
-            if label == entry.label and any(name == n for n, _ in entry.params) or self.erased(substitute_type(ty)):
+        for key, ty in typed.items():
+            needed = key in self.plan.variables
+            if not needed and not sub:
                 continue
-            values.append((label, name, ty, self.cname(label, name)))
-        self.blocks = {b.label: b for b in fun.blocks}
+            label, name = key
+            if label == entry.label and name in self.params:
+                continue
+            # Validate generic value types even when their definitions are left out of C.
+            ty = substitute_type(ty)
+            if needed:
+                ctype = self.ctype(ty)
+                if ctype != "void":
+                    decls.append(f"{ctype} {self.cname(label, name)};")
+        for key, (label, name) in self.plan.param_origins.items():
+            var = self.cname(label, name)
+            self.aliases[key] = f"(*{var})" if label == entry.label and name in self.deref else var
+        self.blocks = self.plan.blocks
         self.returning = False
         self.out_paths: list[str] = []
         self.lines.extend(prologue)
@@ -714,8 +725,6 @@ class Backend:
                     self.instr(call)
                     self.returning = False
                 self.term(block.term)
-        decls.extend(f"{self.ctype(substitute_type(ty))} {cname};" for label, name, ty, cname in values
-                     if (label, name) in self.plan.variables)
         self.emitted.append((symbol, "", " {\n" + "".join(f"  {d}\n" for d in decls + self.temps) +
                              "".join(f"  {line}\n" for line in self.lines) + "}\n"))
 
@@ -978,7 +987,8 @@ class Backend:
         if key in self.plan.resident:
             path = self.plan.resident[key]
             if path.startswith("%"):
-                return self.cname(self.label, root(path))
+                key = (self.label, root(path))
+                return self.cname(*self.plan.param_origins.get(key, key))
             return self.cname(self.fun.blocks[0].label, root(path)) if root(path) in self.params else self.place_c[root(path)]
         if key in self.plan.arrived:
             block, scrutinee, _ = self.plan.arrived[key]
@@ -1044,30 +1054,40 @@ class Backend:
             return
         if here in plan.fused or op in ("load", "open", "pack", "construct") and (self.label, instr.lhs[0]) in plan.resident:
             return
-        if op == "destruct" and (self.label, self.index - 1) in plan.in_place:
-            self.handed_back(instr, plan.in_place[self.label, self.index - 1])
+        if op == "destruct":
+            if (self.label, self.index - 1) in plan.in_place:
+                self.handed_back(instr, plan.in_place[self.label, self.index - 1])
+            else:
+                self.destruct(instr)
             return
         if here in plan.unwritten:
             return
         if op == "store" and (self.label, self.index - 1) in plan.fused:
             self.store_in_place(a[0], self.blocks[self.label].instrs[self.index - 1])
             return
-        dst = self.value_name(instr.lhs[0]) if len(instr.lhs) == 1 and not self.erased(self.type_of(instr.lhs[0])) else None
+        if op == "copy":
+            self.aliases[self.label, instr.lhs[0]] = self.value_name(a[0])
+            return
+        if op == "load" and a[0] in plan.forwarded:
+            self.aliases[self.label, instr.lhs[0]] = self.forwards[a[0]]
+            return
+        if op == "call":
+            self.call(instr)
+            return
+        if op == "trait_call":
+            self.trait_call(instr)
+            return
+        dst = self.value_name(instr.lhs[0]) if op != "store" and len(instr.lhs) == 1 and \
+            not self.erased(self.type_of(instr.lhs[0])) else None
         if op == "const":
             assert isinstance(instr.ty, Prim) and instr.lit is not None
             self.line(f"{dst} = {self.literal(instr.ty, instr.lit)};")
-        elif op == "copy":
-            self.aliases[self.label, instr.lhs[0]] = self.value_name(a[0])
-        elif op == "load" and a[0] in self.plan.forwarded:
-            self.aliases[self.label, instr.lhs[0]] = self.forwards[a[0]]
         elif op == "store" and a[0] in self.plan.forwarded:
             if not self.erased(self.type_of(a[1])):
                 self.forwards[a[0]] = self.value_name(a[1])
         elif op == "construct":
             assert dst is not None
             self.construct(dst, self.type_operand(instr), a, self.away(instr.lhs[0]))
-        elif op == "destruct":
-            self.destruct(instr)
         elif op == "construct_variant":
             assert instr.lit is not None and dst is not None
             ty = self.type_operand(instr)
@@ -1090,10 +1110,6 @@ class Backend:
         elif op in C_OPS or op in ("shl", "shr"):
             assert dst is not None
             self.primitive(dst, op, a)
-        elif op == "call":
-            self.call(instr)
-        elif op == "trait_call":
-            self.trait_call(instr)
         elif op == "fn":
             self.line(f"{dst} = {self.function_address(instr)};")
         elif op == "alloca":
@@ -1611,28 +1627,35 @@ class Backend:
                 if not instrs or instrs[-1].op != "trap":  # a `trap` has written its own
                     self.line("KUR_TRAP();")
 
+    def edge_value(self, edge: Edge, index: int, payload: Optional[str], skip: int) -> tuple[Optional[str], str]:
+        if index < skip:
+            return None, payload or ""
+        arg = edge.args[index - skip]
+        return arg, "" if self.erased(self.type_of(arg)) else self.value_name(arg)
+
     def edge(self, edge: Edge, payload: Optional[str] = None, source: str = "", indent: str = "") -> None:
-        """A jump assigns the target's live parameters (`source` is the C variable `payload` reads); a
-        jump to a return join returns the value it passes there. A value of a zero-size type is `""`:
+        """A jump assigns the target's live parameters that own a C variable, since a forwarded parameter
+        reads its origin's (`source` is the C variable `payload` reads); a jump to a return join returns
+        the value it passes there. A value of a zero-size type is `""`:
         nothing is assigned or returned."""
         target = self.blocks[edge.target]
-        if payload is not None and (target.label, target.params[0][0]) in self.plan.arrived:
-            payload = ""
-        values = ([(payload, source)] if payload is not None else []) + \
-            [("", "") if self.erased(self.type_of(a)) else (self.value_name(a), self.value_base(a)) for a in edge.args]
+        skip = int(payload is not None)
         if target.label in self.plan.return_index:
             index = self.plan.return_index[target.label]
-            value = values[index][0]
-            names = ([None] if payload is not None else []) + list(edge.args)
+            name, value = self.edge_value(edge, index, payload, skip)
             if value:
-                self.give_back(names[index], value, indent)
+                self.give_back(name, value, indent)
             else:
                 self.line(f"{indent}return;")
             return
         moves, homes = [], []
-        for (n, t), (value, base), name in zip(target.params, values, ([None] if payload is not None else []) + list(edge.args)):
-            if not value or not self.plan.is_live(target.label, n):
+        for index, (n, t) in enumerate(target.params):
+            if (target.label, n) not in self.plan.variables:
                 continue
+            name, value = self.edge_value(edge, index, payload, skip)
+            if not value:
+                continue
+            base = source if name is None else self.value_base(name)
             homed = self.plan.homed.get((target.label, n), {})
             if not homed:
                 moves.append((self.cname(target.label, n), t, False, value, base))
@@ -1644,7 +1667,8 @@ class Backend:
                     moves.append((f"{self.cname(target.label, n)}.{member}", mt, False, f"{value}.{member}", base))
                 elif k in homed and (self.label, name) not in self.plan.made_home:
                     homes.append((homed[k], f"{value}.{member}"))
-        self.assign(moves, indent)
+        if moves:
+            self.assign(moves, indent)
         for path, value in homes:
             self.write_home(path, value, indent)
         self.line(f"{indent}goto {self.labels[target.label]};")

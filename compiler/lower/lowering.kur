@@ -17,8 +17,9 @@
 use std::collections::arena_vec::ArenaVec;
 use std::collections::arena_map::{ArenaMap, ArenaSet};
 use std::mem::Ref;
+use std::parse::parse_usize;
 use std::str::Str;
-use std::arena::{Domain!, ref_in, seed};
+use std::arena::{Domain!, append_decimal, ref_in, seed};
 use std::buffer::Buffer!;
 use std::fmt::Writer;
 use package::check::checker::{checked_only, contains, function_types, is_never, overlap, pointer_cast_fits};
@@ -26,7 +27,7 @@ use package::kurs::core::{Block, Data, Edge, Extern, FnType, Fun, Instance, Inst
 use package::kurs::core as C;
 use package::infer::inference::{Callee, Capture, Results, infer, pointer_params};
 use package::types::literals::valid_literal;
-use package::lower::placeflow::PlaceFlow;
+use package::lower::placeflow::{PlaceFlow, lends};
 use package::lower::promote::promote_locals;
 use package::resolve::resolver::{NameRef, Named, Resolver, listed};
 use package::kurs::sexpr::{Form, FormKind};
@@ -97,18 +98,8 @@ fn ordering_name(&cx: Domain!['k], variant: Str['k]) -> Option[Str['static]] {
 }
 
 forall 'k.
-fn lends(&cx: Domain!['k], arg: Str['k]) -> bool {
-    arg.starts_with(&cx, Str::from_static(&cx, "&")) && !arg.starts_with(&cx, Str::from_static(&cx, "&*"))
-}
-
-forall 'k.
 fn is_unit(&cx: Domain!['k], t: Type['k]) -> bool {
     C::same(&cx, t, C::unit(&cx))
-}
-
-forall 'k.
-fn id_text(&cx: Domain!['k], id: u32) -> Str['k] {
-    Buffer!::new().put(id).save(&cx)
 }
 
 // ---------------------------------------------------------- match coverage --
@@ -156,24 +147,35 @@ exposed enum CoverItem {
 
 // ------------------------------------------------------------ the program --
 
-// A source binding: a variable and the place that holds it, or a `..rest` bundle, whose fields are
-// the ids of bindings.
+// A source binding in a place, in an SSA slot, or in a `..rest` bundle of binding ids.
 forall 'k.
 exposed struct Binding {
     name: Str['k],
     ty: Type['k],
     path: Option[Str['k]],
-    fields: Option[ArenaMap[Str['k], Str['k], 'k]],
+    fields: Option[ArenaMap[Str['k], (Str['k], Type['k]), 'k]],
+    slot: Option[u32],
 }
 
 // A block under construction.
 forall 'k.
 exposed struct BlockB {
+    index: usize,
     label: Str['k],
     params: ArenaVec[C::Binding['k], 'k],
     instrs: ArenaVec[Instr['k], 'k],
     term: Ref[Option[Terminator['k]], 'k],
     brands: ArenaVec[Str['k], 'k],
+}
+
+forall 'k.
+exposed struct OperandValue {
+    index: usize,
+    value: Str['k],
+    ty: Type['k],
+    pos: Pos,
+    raw: Str['k],
+    place: Ref[Option[Str['k]], 'k],
 }
 
 // The program-wide state.
@@ -372,6 +374,7 @@ impl Lowering['k] {
     }
 
     fn run(self, &cx: Domain!['k]) -> Program['k] {
+        let lowering = ref_in(&cx, self);
         let program = self.program;
         let sigs = self.sigs.sigs.values(&cx);
         var i = 0usize;
@@ -387,7 +390,7 @@ impl Lowering['k] {
                     },
                     Fn(node) => if node.body.is_some() {
                         self.r.locate(&cx, decl.home, node.pos);
-                        let fun = FnLower::new(&cx, self, sig, Mode::Plain.(node), sig.name, node.pos).run(&cx);
+                        let fun = FnLower::new(&cx, lowering, sig, Mode::Plain.(node), sig.name, node.pos).run(&cx);
                         self.r.unlocate(&cx);
                         program.funs.insert(&cx, sig.name, fun);
                     },
@@ -406,7 +409,7 @@ impl Lowering['k] {
                 let sig = inst.methods.at(&cx, k);
                 let node = item.methods.at(&cx, k);
                 self.r.locate(&cx, home, node.pos);
-                let fun = FnLower::new(&cx, self, sig, Mode::Plain.(node), node.name, node.pos).run(&cx);
+                let fun = FnLower::new(&cx, lowering, sig, Mode::Plain.(node), node.name, node.pos).run(&cx);
                 self.r.unlocate(&cx);
                 let { params: _p, premises: _q, ..rest } = fun;
                 methods.push(&cx, Fun.{ params: sig.params.skip(&cx, inst.params.len(&cx)), premises: sig.premises.skip(&cx, inst.premises.len(&cx)), ..rest });
@@ -602,30 +605,124 @@ impl Op['k] {
     }
 }
 
+// Generated values are numbered by the function's fresh-name counter. Named parameters
+// have no number. Textual operands can name either, or a place or callable.
+forall 'k.
+exposed struct ValueTypes {
+    numbered: ArenaVec[Option[C::Binding['k]], 'k],
+    named: ArenaMap[Str['k], Type['k], 'k],
+}
+
+forall 'k.
+impl ValueTypes['k] {
+    fn new(&cx: Domain!['k]) -> ValueTypes['k] {
+        ValueTypes.{ numbered: ArenaVec::new(&cx), named: ArenaMap::new(&cx) }
+    }
+
+    fn record(self, &cx: Domain!['k], index: usize, name: Str['k], ty: Type['k]) {
+        // Block labels and brand names draw from the same counter, leaving gaps.
+        let value = Option::Some.(C::Binding.{ name, ty });
+        let len = self.numbered.len(&cx);
+        if index < len {
+            self.numbered.set(&cx, index, value);
+        } else {
+            if index > len {
+                self.numbered.resize(&cx, index, Option::None);
+            }
+            self.numbered.push(&cx, value);
+        }
+    }
+
+    fn parameter(self, &cx: Domain!['k], param: C::Binding['k]) {
+        match value_number(&cx, param.name) {
+            Some(index) => self.record(&cx, index, param.name, param.ty),
+            None => { let previous = self.named.insert(&cx, param.name, param.ty); },
+        };
+    }
+
+    fn get(self, &cx: Domain!['k], name: Str['k]) -> Option[Type['k]] {
+        let numbered = match value_number(&cx, name) {
+            Some(index) => self.numbered.get(&cx, index).unwrap_or(Option::None),
+            None => Option::None,
+        };
+        match numbered {
+            Some(value) => if value.name.eq(&cx, name) {
+                Option::Some.(value.ty)
+            } else {
+                self.named.get(&cx, name)
+            },
+            None => self.named.get(&cx, name),
+        }
+    }
+
+    fn at(self, &cx: Domain!['k], name: Str['k]) -> Type['k] {
+        self.get(&cx, name).unwrap()
+    }
+
+    // Promotion can add values of its own. Only functions with branded locals need this map.
+    fn for_promotion(self, &cx: Domain!['k]) -> ArenaMap[Str['k], Type['k], 'k] {
+        let out = self.named.clone(&cx);
+        var i = 0usize;
+        while i < self.numbered.len(&cx) {
+            match self.numbered.at(&cx, i) {
+                Some(value) => { let previous = out.insert(&cx, value.name, value.ty); },
+                None => (),
+            };
+            i = i + 1usize;
+        }
+        out
+    }
+}
+
+// Read the suffix of an SSA operand. Compare the full name at the slot, since a named
+// parameter may also end in digits.
+forall 'k.
+fn value_number(&cx: Domain!['k], name: Str['k]) -> Option[usize] {
+    if name.len() < 3usize || name.at(&cx, 0usize) != b'%' {
+        return Option::None;
+    }
+    var i = 2usize;
+    var digit = name.at(&cx, i);
+    // Generated names have a letter prefix. Named source parameters begin with `%a_`.
+    while digit < b'0' || digit > b'9' {
+        if digit < b'a' || digit > b'z' || i + 1usize == name.len() {
+            return Option::None;
+        }
+        i = i + 1usize;
+        digit = name.at(&cx, i);
+    }
+    parse_usize(&cx, name.skip(i))
+}
+
 // Translates one function, appending instructions to the current block. `cur` is none before the
 // entry and after a terminator. `start` selects an open block; `terminate` closes it. Expression
 // rules return a value name on paths that continue, including a constructed unit value for unit
 // expressions; they return none when no path continues, leaving `cur` none.
 forall 'k.
 exposed struct FnLower {
-    lowering: Lowering['k],
-    sig: Sig['k],
+    // Shared package state and the fixed inputs to this function's lowering.
+    lowering: Ref[Lowering['k], 'k],
+    sig: Ref[Sig['k], 'k],
     name: Str['k],
     home: ModuleId['k],
     node_pos: Pos,
-    mode: Mode['k],
+    mode: Ref[Mode['k], 'k],
     kinds: ArenaMap[Str['k], Kind, 'k],
     // whether each type asked about is Copy
     copies: ArenaMap[Type['k], bool, 'k],
     blocks: ArenaVec[BlockB['k], 'k],
     cur: Ref[Option[BlockB['k]], 'k],
-    vty: ArenaMap[Str['k], Type['k], 'k],
-    bindings: ArenaMap[Str['k], Binding['k], 'k],
+    vty: ValueTypes['k],
+    bindings: ArenaMap[u32, Binding['k], 'k],
+    definitions: ArenaMap[(usize, u32), Str['k], 'k],
+    inputs: ArenaMap[(usize, u32), Str['k], 'k],
+    pending_inputs: ArenaVec[(usize, u32, C::Binding['k]), 'k],
     locals: ArenaVec[C::Binding['k], 'k],
     open_brands: Ref[ArenaVec[Str['k], 'k], 'k],
     brand_map: Ref[ArenaMap[Str['k], Type['k], 'k], 'k],
     unsafe_nodes: ArenaSet[u32, 'k],
     lend_frames: ArenaVec[ArenaVec[Str['k], 'k], 'k],
+    pending_operands: ArenaVec[OperandValue['k], 'k],
     n: Ref[u64, 'k],
     at: Ref[Pos, 'k],
     // where paths meet, for place-flow messages: a block's label, or `source>target` for one edge, ->
@@ -635,7 +732,7 @@ exposed struct FnLower {
 
 forall 'k.
 impl FnLower['k] {
-    fn new(&cx: Domain!['k], lowering: Lowering['k], sig: Sig['k], mode: Mode['k], name: Str['k], node_pos: Pos) -> FnLower['k] {
+    fn new(&cx: Domain!['k], lowering: Ref[Lowering['k], 'k], sig: Sig['k], mode: Mode['k], name: Str['k], node_pos: Pos) -> FnLower['k] {
         let kinds: ArenaMap[Str['k], Kind, 'k] = ArenaMap::new(&cx);
         var i = 0usize;
         while i < sig.params.len(&cx) {
@@ -644,38 +741,36 @@ impl FnLower['k] {
         }
         let home = match sig.home {
             Some(m) => m,
-            None => lowering.r.fail(&cx, Str::from_static(&cx, "internal error: a function without a module"), node_pos),
+            None => lowering.copy(&cx).r.fail(&cx, Str::from_static(&cx, "internal error: a function without a module"), node_pos),
         };
         FnLower.{
-            lowering, sig, name, home, node_pos, mode, kinds, copies: ArenaMap::new(&cx), blocks: ArenaVec::new(&cx), cur: ref_in(&cx, Option::None), vty: ArenaMap::new(&cx),
+            lowering, sig: ref_in(&cx, sig), name, home, node_pos, mode: ref_in(&cx, mode), kinds, copies: ArenaMap::new(&cx), blocks: ArenaVec::new(&cx), cur: ref_in(&cx, Option::None), vty: ValueTypes::new(&cx),
             bindings: ArenaMap::new(&cx), locals: ArenaVec::new(&cx), open_brands: ref_in(&cx, ArenaVec::new(&cx)), brand_map: ref_in(&cx, ArenaMap::new(&cx)),
-            unsafe_nodes: ArenaSet::new(&cx), lend_frames: ArenaVec::new(&cx), n: ref_in(&cx, 0u64), at: ref_in(&cx, no_pos()),
+            definitions: ArenaMap::new(&cx), inputs: ArenaMap::new(&cx), pending_inputs: ArenaVec::new(&cx),
+            unsafe_nodes: ArenaSet::new(&cx), lend_frames: ArenaVec::new(&cx), pending_operands: ArenaVec::new(&cx),
+            n: ref_in(&cx, 0u64), at: ref_in(&cx, no_pos()),
             sites: ArenaMap::new(&cx),
         }
     }
 
     // ---- machinery
     fn fail(self, &cx: Domain!['k], message: Str['k], pos: Pos) -> ! {
-        self.lowering.r.fail(&cx, message, pos)
+        self.lowering.copy(&cx).r.fail(&cx, message, pos)
     }
 
     fn fails(self, &cx: Domain!['k], message: Str['static], pos: Pos) -> ! {
-        self.lowering.r.fail(&cx, Str::from_static(&cx, message), pos)
+        self.lowering.copy(&cx).r.fail(&cx, Str::from_static(&cx, message), pos)
     }
 
-    fn results(self) -> Results['k] {
-        self.lowering.results
+    fn results(self, &cx: Domain!['k]) -> Results['k] {
+        self.lowering.copy(&cx).results
     }
 
     fn type_of(self, &cx: Domain!['k], id: u32) -> Type['k] {
-        match self.lowering.results.types.get(&cx, id) {
+        match self.lowering.copy(&cx).results.types.get(&cx, id) {
             Some(t) => t,
             None => self.fails(&cx, "internal error: a node without a type", self.at.copy(&cx)),
         }
-    }
-
-    fn binder(self, &cx: Domain!['k], id: u32) -> Str['k] {
-        id_text(&cx, self.lowering.results.binders.at(&cx, id))
     }
 
     fn current(self, &cx: Domain!['k]) -> BlockB['k] {
@@ -689,13 +784,25 @@ impl FnLower['k] {
         self.cur.copy(&cx).is_some()
     }
 
-    fn fresh(self, &cx: Domain!['k], hint: Str['static]) -> Str['k] {
-        self.n.set(&cx, self.n.copy(&cx) + 1u64);
-        Buffer!::new().put("%").put(hint).put(self.n.copy(&cx)).save(&cx)
+    fn next_name(self, &cx: Domain!['k]) -> u64 {
+        let n = self.n.copy(&cx) + 1u64;
+        self.n.set(&cx, n);
+        n
     }
 
-    fn lifted(self) -> bool {
-        match self.mode {
+    fn fresh(self, &cx: Domain!['k], prefix: Str['static]) -> Str['k] {
+        append_decimal(&cx, Str::from_static(&cx, prefix), self.next_name(&cx))
+    }
+
+    fn fresh_value(self, &cx: Domain!['k], prefix: Str['static], ty: Type['k]) -> Str['k] {
+        let n = self.next_name(&cx);
+        let name = append_decimal(&cx, Str::from_static(&cx, prefix), n);
+        self.vty.record(&cx, n as usize, name, ty);
+        name
+    }
+
+    fn lifted(self, &cx: Domain!['k]) -> bool {
+        match self.mode.copy(&cx) {
             Plain(_f) => false,
             _ => true,
         }
@@ -705,8 +812,8 @@ impl FnLower['k] {
     // parameters, and those opened in it so far.
     fn substitute_type(self, &cx: Domain!['k], ty: Type['k]) -> Type['k] {
         let mapping = self.brand_map.copy(&cx);
-        let t = if mapping.is_empty(&cx) { ty } else { subst(&cx, ty, mapping, self.lowering.counter) };
-        if self.lifted() {
+        let t = if mapping.is_empty(&cx) { ty } else { subst(&cx, ty, mapping, self.lowering.copy(&cx).counter) };
+        if self.lifted(&cx) {
             self.check_closed(&cx, t, self.open_brands.copy(&cx));
         }
         t
@@ -726,7 +833,7 @@ impl FnLower['k] {
         match self.copies.get(&cx, ty) {
             Some(answer) => answer,
             None => {
-                let answer = self.lowering.types.is_copy(&cx, ty, self.kinds);
+                let answer = self.lowering.copy(&cx).types.is_copy(&cx, ty, self.kinds);
                 self.copies.insert(&cx, ty, answer);
                 answer
             },
@@ -764,7 +871,7 @@ impl FnLower['k] {
                 None => (),
             };
         }
-        let name = self.fresh(&cx, "v");
+        let name = self.fresh_value(&cx, "%v", o.rty);
         if o.name.is(&cx, "call") || o.name.is(&cx, "trait_call") {
             var f = 0usize;
             while f < self.lend_frames.len(&cx) {
@@ -795,7 +902,6 @@ impl FnLower['k] {
         }
         self.current(&cx).instrs.push(&cx, Instr.{ lhs: ArenaVec::one(&cx, name), op: o.name, args: o.args, ty: o.ty, tys: o.tys, lit: o.lit,
             is_unsafe: discharged, binders: o.binders, pos });
-        self.vty.insert(&cx, name, o.rty);
         name
     }
 
@@ -827,7 +933,7 @@ impl FnLower['k] {
         };
         match accessed {
             Some(inner) => {
-                if load && contains(&cx, self.lowering.types, inner, |&cx, t: Type['k]| is_never(t)) {
+                if load && contains(&cx, self.lowering.copy(&cx).types, inner, |&cx, t: Type['k]| is_never(t)) {
                     self.fail(&cx, Str::from_static(&cx, "an unsafe read cannot produce a value that holds Never"), pos);
                 }
                 self.raw_access(&cx, inner, pos);
@@ -857,8 +963,8 @@ impl FnLower['k] {
     // A raw read, write, `alloca` or lend of a raw pointer's target is at a `Sized` type, never a
     // zero-size one (`Checker::raw_access`).
     fn raw_access(self, &cx: Domain!['k], ty: Type['k], pos: Pos) {
-        if !self.lowering.types.sized_available(&cx, ty, self.sig.premises) {
-            if self.lowering.types.closed(&cx, ty) {
+        if !self.lowering.copy(&cx).types.sized_available(&cx, ty, self.sig.copy(&cx).premises) {
+            if self.lowering.copy(&cx).types.closed(&cx, ty) {
                 self.fail(&cx, Str::from_static(&cx, "a raw read, write or alloca at a zero-size type"), pos);
             }
             let written = surface(&cx, ArenaVec::one(&cx, ty), ArenaVec::new(&cx), ArenaMap::new(&cx)).show(&cx, ty);
@@ -867,7 +973,7 @@ impl FnLower['k] {
     }
 
     fn cast_operation(self, &cx: Domain!['k], from: Type['k], to: Type['k], pos: Pos) {
-        let types = self.lowering.types;
+        let types = self.lowering.copy(&cx).types;
         if contains(&cx, types, from, |&cx, t: Type['k]| self.uncastable(&cx, t))
             || contains(&cx, types, to, |&cx, t: Type['k]| self.uncastable(&cx, t)) {
             self.fail(&cx, Str::from_static(&cx, "an unsafe cast cannot produce or take apart a package, a brand witness, a function value, a transform, a value of a type parameter or Never"), pos);
@@ -926,48 +1032,53 @@ impl FnLower['k] {
     }
 
     fn destruct(self, &cx: Domain!['k], value: Str['k], ty: Type['k]) -> ArenaVec[C::Binding['k], 'k] {
-        let comps = self.lowering.types.fields(&cx, ty, Option::None);
+        let comps = self.lowering.copy(&cx).types.fields(&cx, ty, Option::None);
         let names: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
         let out: ArenaVec[C::Binding['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < comps.len(&cx) {
-            let n = self.fresh(&cx, "c");
-            names.push(&cx, n);
-            out.push(&cx, C::Binding.{ name: n, ty: comps.at(&cx, i) });
+            let ty = comps.at(&cx, i);
+            let name = self.fresh_value(&cx, "%c", ty);
+            names.push(&cx, name);
+            out.push(&cx, C::Binding.{ name, ty });
             i = i + 1usize;
         }
         self.current(&cx).instrs.push(&cx, Instr.{ lhs: names, op: Str::from_static(&cx, "destruct"), args: ArenaVec::one(&cx, value), ty: Option::Some.(ty), tys: ArenaVec::new(&cx),
             lit: Option::None, is_unsafe: false, binders: ArenaVec::new(&cx), pos: self.at.copy(&cx) });
-        i = 0usize;
-        while i < comps.len(&cx) {
-            self.vty.insert(&cx, names.at(&cx, i), comps.at(&cx, i));
-            i = i + 1usize;
-        }
         out
     }
 
     fn block_named(self, &cx: Domain!['k], label: Str['k], params: ArenaVec[C::Binding['k], 'k]) -> BlockB['k] {
-        let block = BlockB.{ label, params, instrs: ArenaVec::new(&cx), term: ref_in(&cx, Option::None), brands: self.open_brands.copy(&cx).clone(&cx) };
+        let block = BlockB.{ index: self.blocks.len(&cx), label, params, instrs: ArenaVec::new(&cx), term: ref_in(&cx, Option::None), brands: self.open_brands.copy(&cx).clone(&cx) };
         self.blocks.push(&cx, block);
         block
     }
 
     fn new_block(self, &cx: Domain!['k], params: ArenaVec[C::Binding['k], 'k], hint: Str['static]) -> BlockB['k] {
-        self.n.set(&cx, self.n.copy(&cx) + 1u64);
-        self.block_named(&cx, Buffer!::new().put(hint).put(self.n.copy(&cx)).save(&cx), params)
+        self.block_named(&cx, self.fresh(&cx, hint), params)
     }
 
     fn start(self, &cx: Domain!['k], block: BlockB['k]) {
         self.cur.set(&cx, Option::Some.(block));
         var i = 0usize;
         while i < block.params.len(&cx) {
-            self.vty.insert(&cx, block.params.at(&cx, i).name, block.params.at(&cx, i).ty);
+            self.vty.parameter(&cx, block.params.at(&cx, i));
             i = i + 1usize;
         }
         self.open_brands.set(&cx, block.brands.clone(&cx));
     }
 
     fn terminate(self, &cx: Domain!['k], term: Terminator['k]) {
+        if has_successors(term) {
+            var i = 0usize;
+            while i < self.pending_operands.len(&cx) {
+                let operand = self.pending_operands.at(&cx, i);
+                if operand.place.copy(&cx).is_none() {
+                    self.spill_operand(&cx, operand);
+                }
+                i = i + 1usize;
+            }
+        }
         self.current(&cx).term.set(&cx, Option::Some.(term));
         self.cur.set(&cx, Option::None);
     }
@@ -986,8 +1097,88 @@ impl FnLower['k] {
         self.terminate(&cx, Terminator::Jmp.(self.edge(&cx, block, extra), self.at.copy(&cx)));
     }
 
+    fn ssa_input(self, &cx: Domain!['k], block: usize, slot: u32, ty: Type['k]) -> Str['k] {
+        let key = (block, slot);
+        match self.inputs.get(&cx, key) {
+            Some(name) => name,
+            None => {
+                let name = self.fresh_value(&cx, "%s", ty);
+                self.inputs.insert(&cx, key, name);
+                self.pending_inputs.push(&cx, (block, slot, C::Binding.{ name, ty }));
+                name
+            },
+        }
+    }
+
+    fn record_predecessor(self, &cx: Domain!['k], incoming: ArenaMap[Str['k], ArenaVec[(usize, Edge['k]), 'k], 'k], block: usize, edge: Edge['k]) {
+        let predecessors = match incoming.get(&cx, edge.target) {
+            Some(found) => found,
+            None => {
+                let found: ArenaVec[(usize, Edge['k]), 'k] = ArenaVec::new(&cx);
+                incoming.insert(&cx, edge.target, found);
+                found
+            },
+        };
+        predecessors.push(&cx, (block, edge));
+    }
+
+    // Thread only the values a block needs through its predecessor edges.
+    fn pass_ssa_inputs(self, &cx: Domain!['k]) {
+        if self.pending_inputs.is_empty(&cx) {
+            return;
+        }
+        let incoming: ArenaMap[Str['k], ArenaVec[(usize, Edge['k]), 'k], 'k] = ArenaMap::new(&cx);
+        var b = 0usize;
+        while b < self.blocks.len(&cx) {
+            let block = self.blocks.at(&cx, b);
+            match block.term.copy(&cx) {
+                Some(term) => match term {
+                    Jmp(edge, _) => self.record_predecessor(&cx, incoming, b, edge),
+                    Jnz(_, then, other, _) => {
+                        self.record_predecessor(&cx, incoming, b, then);
+                        self.record_predecessor(&cx, incoming, b, other);
+                    },
+                    Switch(_, _, arms, _) => {
+                        var a = 0usize;
+                        while a < arms.len(&cx) {
+                            self.record_predecessor(&cx, incoming, b, arms.at(&cx, a).edge);
+                            a = a + 1usize;
+                        }
+                    },
+                    _ => (),
+                },
+                None => (),
+            };
+            b = b + 1usize;
+        }
+        // The walk can add requests for intermediate blocks, including loop headers.
+        var i = 0usize;
+        while i < self.pending_inputs.len(&cx) {
+            let (index, slot, param) = self.pending_inputs.at(&cx, i);
+            let ty = param.ty;
+            let block = self.blocks.at(&cx, index);
+            block.params.push(&cx, param);
+            match incoming.get(&cx, block.label) {
+                Some(predecessors) => {
+                    var p = 0usize;
+                    while p < predecessors.len(&cx) {
+                        let (predecessor, edge) = predecessors.at(&cx, p);
+                        let value = match self.definitions.get(&cx, (predecessor, slot)) {
+                            Some(v) => v,
+                            None => self.ssa_input(&cx, predecessor, slot, ty),
+                        };
+                        edge.args.push(&cx, value);
+                        p = p + 1usize;
+                    }
+                },
+                None => (),
+            };
+            i = i + 1usize;
+        }
+    }
+
     fn local_ref(self, &cx: Domain!['k], p: S::Path['k]) -> bool {
-        match self.lowering.r.refs.get(&cx, p.id) {
+        match self.lowering.copy(&cx).r.refs.get(&cx, p.id) {
             Some(r) => match r {
                 Local(_n) => true,
                 _ => false,
@@ -997,9 +1188,15 @@ impl FnLower['k] {
     }
 
     fn temporary(self, &cx: Domain!['k], ty: Type['k]) -> Str['k] {
-        let root = Buffer!::new().put("&#tmp").put(self.locals.len(&cx)).save(&cx);
+        let root = append_decimal(&cx, Str::from_static(&cx, "&#tmp"), self.locals.len(&cx) as u64);
         self.locals.push(&cx, C::Binding.{ name: root, ty: ty });
         root
+    }
+
+    fn spill_operand(self, &cx: Domain!['k], operand: OperandValue['k]) {
+        let root = self.temporary(&cx, operand.ty);
+        operand.place.set(&cx, Option::Some.(root));
+        self.emit(&cx, Op::new(&cx, "store", C::unit(&cx), ArenaVec::two(&cx, root, operand.value)).located(operand.pos));
     }
 
     fn value(self, &cx: Domain!['k], item: Item['k]) -> Option[Str['k]] {
@@ -1011,26 +1208,22 @@ impl FnLower['k] {
     }
 
     // Evaluates strictly left to right. Items are expressions, bindings to read, or already resolved
-    // place paths. A value preceding another operand waits in a temporary place, then is reloaded
-    // in the final block. Calls (`call`) interpret explicit lends. A plain read of a place that the
+    // place paths. A Copy value stays in its block until a later operand branches. A linear value
+    // waits in a place, as does a raw pointer lent as a target. A plain read of a place that the
     // same group lends is rejected, whatever its type: the program states the order with a binding
     // before the expression.
     fn operands(self, &cx: Domain!['k], items: ArenaVec[Item['k], 'k], call: Option[S::Call['k]]) -> Option[ArenaVec[Str['k], 'k]] {
-        let (reads, lent) = self.operand_group(&cx, items);
-        self.operand_values(&cx, items, reads, lent, call, Option::None)
+        let group = self.operand_group(&cx, items);
+        self.operand_values(&cx, items, group, call, Option::None)
     }
 
-    // The start of an operand group: the places its items read plainly, and its frame of lends, which
-    // is pushed until `operand_values` ends the group.
-    fn operand_group(self, &cx: Domain!['k], items: ArenaVec[Item['k], 'k]) -> (ArenaVec[Str['k], 'k], ArenaVec[Str['k], 'k]) {
-        let reads: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
+    // Track lends only when the group has a plain read they could overlap.
+    fn operand_group(self, &cx: Domain!['k], items: ArenaVec[Item['k], 'k]) -> Option[(ArenaVec[Str['k], 'k], ArenaVec[Str['k], 'k])] {
+        var reads: Option[ArenaVec[Str['k], 'k]] = Option::None;
         var i = 0usize;
         while i < items.len(&cx) {
-            match items.at(&cx, i) {
-                Bind(b) => match b.path {
-                    Some(p) => reads.push(&cx, p),
-                    None => (),
-                },
+            let path = match items.at(&cx, i) {
+                Bind(b) => b.path,
                 Expr(e) => {
                     let place = match e {
                         Path(_p) => true,
@@ -1041,26 +1234,34 @@ impl FnLower['k] {
                     if place {
                         let path = self.place_path(&cx, e);
                         let unit = self.substitute_type(&cx, self.type_of(&cx, expr_id(e)));
-                        match path {
-                            Some(p) => reads.push(&cx, p),
-                            None => (),
-                        };
-                    }
+                        path
+                    } else { Option::None }
                 },
-                Path(_t) => (),
+                Path(_t) => Option::None,
+            };
+            match path {
+                Some(p) => match reads {
+                    Some(found) => found.push(&cx, p),
+                    None => { reads = Option::Some.(ArenaVec::one(&cx, p)); },
+                },
+                None => (),
             };
             i = i + 1usize;
         }
-        let lent: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
-        self.lend_frames.push(&cx, lent);
-        (reads, lent)
+        match reads {
+            Some(found) => {
+                let lent = ArenaVec::new(&cx);
+                self.lend_frames.push(&cx, lent);
+                Option::Some.((found, lent))
+            },
+            None => Option::None,
+        }
     }
 
-    // The values of the group `operand_group` started, in order; `first`, if given, is the first
-    // item's, evaluated already.
-    fn operand_values(self, &cx: Domain!['k], items: ArenaVec[Item['k], 'k], reads: ArenaVec[Str['k], 'k], lent: ArenaVec[Str['k], 'k], call: Option[S::Call['k]], first: Option[Str['k]]) -> Option[ArenaVec[Str['k], 'k]] {
+    // Evaluate the group left to right. `first`, if supplied, is its previously evaluated operand.
+    fn operand_values(self, &cx: Domain!['k], items: ArenaVec[Item['k], 'k], group: Option[(ArenaVec[Str['k], 'k], ArenaVec[Str['k], 'k])], call: Option[S::Call['k]], first: Option[Str['k]]) -> Option[ArenaVec[Str['k], 'k]] {
         let values: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
-        let saved: ArenaVec[(usize, Str['k], Str['k], Type['k]), 'k] = ArenaVec::new(&cx);
+        let pending = self.pending_operands.len(&cx);
         var i = 0usize;
         while i < items.len(&cx) {
             let item = items.at(&cx, i);
@@ -1075,7 +1276,10 @@ impl FnLower['k] {
             let v = match v {
                 Some(v) => v,
                 None => {
-                    let unit = self.lend_frames.pop(&cx);
+                    self.pending_operands.truncate(&cx, pending);
+                    if group.is_some() {
+                        let unit = self.lend_frames.pop(&cx);
+                    }
                     return Option::None;
                 },
             };
@@ -1084,41 +1288,57 @@ impl FnLower['k] {
             let name = if raw { v.skip(2usize) } else { v };
             if !name.starts_with(&cx, Str::from_static(&cx, "&")) && i + 1usize < items.len(&cx) {
                 let ty = self.vty.at(&cx, name);
-                let root = self.temporary(&cx, ty);
                 let origin = match item {
                     Expr(e) => expr_pos(e),
                     _ => self.at.copy(&cx),
                 };
-                let unit = self.emit(&cx, Op::new(&cx, "store", C::unit(&cx), ArenaVec::two(&cx, root, name)).located(origin));
-                saved.push(&cx, (i, if raw { Str::from_static(&cx, "&*") } else { Str::from_static(&cx, "") }, root, ty));
-            }
-            i = i + 1usize;
-        }
-        i = 0usize;
-        while i < saved.len(&cx) {
-            let (k, raw, root, ty) = saved.at(&cx, i);
-            values.set(&cx, k, Buffer!::new().write(&cx, raw).write(&cx, self.emit(&cx, Op::new(&cx, "load", ty, ArenaVec::one(&cx, root)))).save(&cx));
-            i = i + 1usize;
-        }
-        i = 0usize;
-        while i < values.len(&cx) {
-            if lends(&cx, values.at(&cx, i)) {
-                lent.push(&cx, values.at(&cx, i));
-            }
-            i = i + 1usize;
-        }
-        i = 0usize;
-        while i < reads.len(&cx) {
-            var k = 0usize;
-            while k < lent.len(&cx) {
-                if overlap(&cx, reads.at(&cx, i), lent.at(&cx, k)) {
-                    self.fails(&cx, "a plain read overlaps a lend in the same operand group; bind the value before the expression", self.at.copy(&cx));
+                let operand = OperandValue.{ index: i, value: name, ty, pos: origin,
+                    raw: Str::from_static(&cx, if raw { "&*" } else { "" }), place: ref_in(&cx, Option::None) };
+                if raw || !(scalar_type(ty) || self.copy(&cx, ty)) {
+                    self.spill_operand(&cx, operand);
                 }
-                k = k + 1usize;
+                self.pending_operands.push(&cx, operand);
             }
             i = i + 1usize;
         }
-        let unit = self.lend_frames.pop(&cx);
+        i = pending;
+        while i < self.pending_operands.len(&cx) {
+            let operand = self.pending_operands.at(&cx, i);
+            match operand.place.copy(&cx) {
+                Some(root) => {
+                    let value = self.emit(&cx, Op::new(&cx, "load", operand.ty, ArenaVec::one(&cx, root)));
+                    values.set(&cx, operand.index, Buffer!::new().write(&cx, operand.raw).write(&cx, value).save(&cx));
+                },
+                None => (),
+            };
+            i = i + 1usize;
+        }
+        self.pending_operands.truncate(&cx, pending);
+        match group {
+            Some(group) => {
+                let (reads, lent) = group;
+                i = 0usize;
+                while i < values.len(&cx) {
+                    if lends(&cx, values.at(&cx, i)) {
+                        lent.push(&cx, values.at(&cx, i));
+                    }
+                    i = i + 1usize;
+                }
+                i = 0usize;
+                while i < reads.len(&cx) {
+                    var k = 0usize;
+                    while k < lent.len(&cx) {
+                        if overlap(&cx, reads.at(&cx, i), lent.at(&cx, k)) {
+                            self.fails(&cx, "a plain read overlaps a lend in the same operand group; bind the value before the expression", self.at.copy(&cx));
+                        }
+                        k = k + 1usize;
+                    }
+                    i = i + 1usize;
+                }
+                let unit = self.lend_frames.pop(&cx);
+            },
+            None => (),
+        };
         Option::Some.(values)
     }
 
@@ -1199,7 +1419,7 @@ impl FnLower['k] {
             self.cur.set(&cx, Option::None);
             return Option::None;
         }
-        let r = self.fresh(&cx, "r");
+        let r = self.fresh(&cx, "%r");
         let join = self.new_block(&cx, ArenaVec::one(&cx, C::Binding.{ name: r, ty: self.substitute_type(&cx, ty) }), "join");
         self.sites.insert(&cx, join.label, Buffer!::new().put("on some paths to the end of the `").put(what).put("` at ").write(&cx, self.here(&cx)).save(&cx));
         i = 0usize;
@@ -1228,16 +1448,36 @@ impl FnLower['k] {
     }
 
     // ---- bindings
-    // Binds a variable: a new root of the function, holding `value`.
-    fn declare(self, &cx: Domain!['k], bid: Str['k], name: Str['k], ty: Type['k], value: Str['k]) {
+    // Keep a Copy local in SSA when no use needs its address.
+    fn declare(self, &cx: Domain!['k], bid: u32, name: Str['k], ty: Type['k], value: Str['k]) {
         let ty = self.substitute_type(&cx, ty);
-        let root = f"&{name}#{bid}".write(&cx, Buffer!::new()).save(&cx);
+        if !self.results(&cx).required_places.contains(&cx, bid) && self.open_brands.copy(&cx).is_empty(&cx) && self.copy(&cx, ty) {
+            self.bindings.insert(&cx, bid, Binding.{ name, ty, path: Option::None, fields: Option::None, slot: Option::Some.(bid) });
+            self.definitions.insert(&cx, (self.current(&cx).index, bid), value);
+        } else {
+            let root = Buffer!::new().put("&").write(&cx, name).put("#").put(bid).save(&cx);
+            self.bindings.insert(&cx, bid, Binding.{ name, ty, path: Option::Some.(root), fields: Option::None, slot: Option::None });
+            self.declare_place(&cx, root, ty, value);
+        }
+    }
+
+    fn declare_place(self, &cx: Domain!['k], root: Str['k], ty: Type['k], value: Str['k]) {
         self.locals.push(&cx, C::Binding.{ name: root, ty: ty });
-        self.bindings.insert(&cx, bid, Binding.{ name, ty: ty, path: Option::Some.(root), fields: Option::None });
         let unit = self.emit(&cx, Op::new(&cx, "store", C::unit(&cx), ArenaVec::two(&cx, root, value)));
     }
 
     fn read(self, &cx: Domain!['k], binding: Binding['k]) -> Str['k] {
+        match binding.slot {
+            Some(slot) => {
+                let block = self.current(&cx).index;
+                let value = match self.definitions.get(&cx, (block, slot)) {
+                    Some(value) => value,
+                    None => self.ssa_input(&cx, block, slot, binding.ty),
+                };
+                return self.emit(&cx, Op::new(&cx, "copy", binding.ty, ArenaVec::one(&cx, value)));
+            },
+            None => (),
+        };
         match binding.path {
             Some(path) => self.emit(&cx, Op::new(&cx, "load", binding.ty, ArenaVec::one(&cx, path))),
             None => self.fail(&cx, Buffer!::new().write(&cx, binding.name).put(" is a ..rest bundle, not a value").save(&cx), self.at.copy(&cx)),
@@ -1245,7 +1485,7 @@ impl FnLower['k] {
     }
 
     fn local(self, &cx: Domain!['k], id: u32) -> Binding['k] {
-        self.bindings.at(&cx, self.binder(&cx, id))
+        self.bindings.at(&cx, self.results(&cx).binders.at(&cx, id))
     }
 
     // The place path `e` names, or none if it is not rooted at a place.
@@ -1270,16 +1510,16 @@ impl FnLower['k] {
         self.start(&cx, self.block_named(&cx, Str::from_static(&cx, "entry"), params));
     }
 
-    // Lent parameters are roots already; value parameters start in local places. An offset skips
+    // Lent parameters are roots already; value parameters bind like locals. An offset skips
     // raw parameters such as a closure environment. Explicit sources keep the SSA names generated
     // functions use.
     fn parameters(self, &cx: Domain!['k], ids: ArenaVec[u32, 'k], offset: usize, sources: ArenaVec[Str['k], 'k]) {
-        let sig = self.sig;
+        let sig = self.sig.copy(&cx);
         var k = offset;
         while k < sig.pnames.len(&cx) && k < sig.ptypes.len(&cx) && k - offset < ids.len(&cx) {
             let name = sig.pnames.at(&cx, k);
             let ty = sig.ptypes.at(&cx, k);
-            let bid = id_text(&cx, ids.at(&cx, k - offset));
+            let bid = ids.at(&cx, k - offset);
             let place = sig.places.contains(&cx, k);
             let source = if !sources.is_empty(&cx) {
                 sources.at(&cx, k - offset)
@@ -1288,9 +1528,9 @@ impl FnLower['k] {
             };
             self.current(&cx).params.push(&cx, C::Binding.{ name: source, ty: ty });
             if place {
-                self.bindings.insert(&cx, bid, Binding.{ name, ty: ty, path: Option::Some.(source), fields: Option::None });
+                self.bindings.insert(&cx, bid, Binding.{ name, ty: ty, path: Option::Some.(source), fields: Option::None, slot: Option::None });
             } else {
-                self.vty.insert(&cx, source, ty);
+                self.vty.named.insert(&cx, source, ty);
                 self.declare(&cx, bid, name, ty, source);
             }
             k = k + 1usize;
@@ -1298,10 +1538,10 @@ impl FnLower['k] {
     }
 
     fn run(self, &cx: Domain!['k]) -> Fun['k] {
-        match self.mode {
+        match self.mode.copy(&cx) {
             Plain(node) => {
                 self.start_entry(&cx, ArenaVec::new(&cx));
-                self.parameters(&cx, self.results().param_ids.get_or(&cx, node.id, ArenaVec::new(&cx)), 0usize, ArenaVec::new(&cx));
+                self.parameters(&cx, self.results(&cx).param_ids.get_or(&cx, node.id, ArenaVec::new(&cx)), 0usize, ArenaVec::new(&cx));
                 match node.body {
                     Some(body) => self.finish_body(&cx, Expr::Block.(body)),
                     None => self.fails(&cx, "internal error: a function without a body", node.pos),
@@ -1309,21 +1549,21 @@ impl FnLower['k] {
             },
             Closure(e, env_ty) => {
                 self.start_entry(&cx, ArenaVec::one(&cx, C::Binding.{ name: Str::from_static(&cx, "%env"), ty: env_ty }));
-                self.parameters(&cx, self.results().param_ids.get_or(&cx, e.id, ArenaVec::new(&cx)), 1usize, ArenaVec::new(&cx));
-                let captures = self.results().captures.get_or(&cx, e.id, ArenaVec::new(&cx));
+                self.parameters(&cx, self.results(&cx).param_ids.get_or(&cx, e.id, ArenaVec::new(&cx)), 1usize, ArenaVec::new(&cx));
+                let captures = self.results(&cx).captures.get_or(&cx, e.id, ArenaVec::new(&cx));
                 let parts = self.destruct(&cx, Str::from_static(&cx, "%env"), env_ty);
                 var i = 0usize;
                 while i < captures.len(&cx) && i < parts.len(&cx) {
                     let capture = captures.at(&cx, i);
-                    self.declare(&cx, id_text(&cx, capture.binder), capture.name, parts.at(&cx, i).ty, parts.at(&cx, i).name);
+                    self.declare(&cx, capture.binder, capture.name, parts.at(&cx, i).ty, parts.at(&cx, i).name);
                     i = i + 1usize;
                 }
                 self.finish_body(&cx, e.body.copy(&cx))
             },
             Mapper(e) => {
                 self.start_entry(&cx, ArenaVec::new(&cx));
-                let captures = self.results().captures.get_or(&cx, e.id, ArenaVec::new(&cx));
-                let ids = ArenaVec::one(&cx, self.results().binders.at(&cx, e.id));
+                let captures = self.results(&cx).captures.get_or(&cx, e.id, ArenaVec::new(&cx));
+                let ids = ArenaVec::one(&cx, self.results(&cx).binders.at(&cx, e.id));
                 let sources = ArenaVec::one(&cx, Str::from_static(&cx, "%item"));
                 var i = 0usize;
                 while i < captures.len(&cx) {
@@ -1357,7 +1597,8 @@ impl FnLower['k] {
     }
 
     fn finish(self, &cx: Domain!['k]) -> Fun['k] {
-        let sig = self.sig;
+        self.pass_ssa_inputs(&cx);
+        let sig = self.sig.copy(&cx);
         let blocks: ArenaVec[Block['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < self.blocks.len(&cx) {
@@ -1392,9 +1633,9 @@ impl FnLower['k] {
             i = i + 1usize;
         }
         if branded {
-            self.lowering.value_types.insert(&cx, fun_key(fun), self.vty.clone(&cx));
+            self.lowering.copy(&cx).value_types.insert(&cx, fun_key(fun), self.vty.for_promotion(&cx));
         }
-        self.lowering.sites.insert(&cx, fun_key(fun), self.sites);
+        self.lowering.copy(&cx).sites.insert(&cx, fun_key(fun), self.sites);
         fun
     }
 
@@ -1403,8 +1644,8 @@ impl FnLower['k] {
     fn identity_args(self, &cx: Domain!['k]) -> ArenaVec[Type['k], 'k] {
         let out: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
-        while i < self.sig.params.len(&cx) {
-            let p = self.sig.params.at(&cx, i);
+        while i < self.sig.copy(&cx).params.len(&cx) {
+            let p = self.sig.copy(&cx).params.at(&cx, i);
             out.push(&cx, if C::same_kind(p.kind, Kind::Brand) { Type::Skolem.(p.name) } else { Type::Named.(p.name, ArenaVec::new(&cx)) });
             i = i + 1usize;
         }
@@ -1496,15 +1737,15 @@ impl FnLower['k] {
 
     // A string literal: a `Str['static]` over static bytes.
     fn string(self, &cx: Domain!['k], bytes: Str['k]) -> Str['k] {
-        let (data, n) = self.lowering.data(&cx, bytes);
+        let (data, n) = self.lowering.copy(&cx).data(&cx, bytes);
         let u8_type = C::prim(&cx, "u8");
         let fixed = Type::Skolem.(Str::from_static(&cx, "static"));
         let d = self.emit(&cx, Op::new(&cx, "data", C::ptr(&cx, Type::Array.(ref_in(&cx, u8_type), n as u64 + 1u64)), ArenaVec::one(&cx, data)));
         let p = self.emit(&cx, Op::new(&cx, "cast", C::ptr(&cx, u8_type), ArenaVec::one(&cx, d)).typed(C::ptr(&cx, u8_type)).discharge(true));
         let brand = self.emit(&cx, Op::new(&cx, "static_brand", Type::Brand.(ref_in(&cx, fixed)), ArenaVec::new(&cx)).discharge(true));
         let length = self.constant(&cx, C::usize_type(&cx), Buffer!::new().put(n).save(&cx));
-        let sig = self.lowering.library_sig(&cx, "Str::from_raw_parts_branded", self.home);
-        let str_ty = Type::Named.(self.lowering.library_name(&cx, "Str", self.home), ArenaVec::one(&cx, fixed));
+        let sig = self.lowering.copy(&cx).library_sig(&cx, "Str::from_raw_parts_branded", self.home);
+        let str_ty = Type::Named.(self.lowering.copy(&cx).library_name(&cx, "Str", self.home), ArenaVec::one(&cx, fixed));
         let args = ArenaVec::one(&cx, sig.name);
         args.push(&cx, p);
         args.push(&cx, length);
@@ -1544,11 +1785,11 @@ impl FnLower['k] {
         if self.local_ref(&cx, p) {
             return Option::Some.(self.read(&cx, self.local(&cx, p.id)));
         }
-        match self.results().folded.get(&cx, p.id) {
+        match self.results(&cx).folded.get(&cx, p.id) {
             Some(value) => return Option::Some.(self.constant_value(&cx, value)),
             None => (),
         };
-        match self.results().calls.get(&cx, p.id) {
+        match self.results(&cx).calls.get(&cx, p.id) {
             Some(call) => match call {
                 Fn(f) => {
                     let ty = self.substitute_type(&cx, self.type_of(&cx, p.id));
@@ -1621,7 +1862,25 @@ impl FnLower['k] {
         // A chain `a + b - c ...` or `a && b || c ...` nests to the left, and is lowered by a loop over
         // its links rather than by recursion.
         let short = is_short_circuit(&cx, b.op);
-        let chain: ArenaVec[S::Binop['k], 'k] = ArenaVec::one(&cx, b);
+        let left = b.left.copy(&cx);
+        let nested = match left {
+            Binop(l) => is_short_circuit(&cx, l.op) == short,
+            _ => false,
+        };
+        if !nested {
+            if short {
+                let value = self.expr(&cx, left)?;
+                self.at.set(&cx, b.pos);
+                return self.short_circuit(&cx, b, value);
+            }
+            self.at.set(&cx, b.pos);
+            let items = link_items(&cx, b);
+            let group = self.operand_group(&cx, items);
+            self.at.set(&cx, b.pos);
+            let args = self.operand_values(&cx, items, group, Option::None, Option::None)?;
+            return Option::Some.(self.emit_binop(&cx, b, args));
+        }
+        let chain = ArenaVec::one(&cx, b);
         var going = true;
         while going {
             going = match chain.at(&cx, chain.len(&cx) - 1usize).left.copy(&cx) {
@@ -1651,12 +1910,14 @@ impl FnLower['k] {
             return c;
         }
         // Each link's operand group starts outermost first, as each starts before its left operand.
-        let groups: ArenaVec[(ArenaVec[Str['k], 'k], ArenaVec[Str['k], 'k]), 'k] = ArenaVec::new(&cx);
+        let lend_depth = self.lend_frames.len(&cx);
+        let groups = ArenaVec::new(&cx);
         var k = 0usize;
         while k < chain.len(&cx) {
             let link = chain.at(&cx, k);
             self.at.set(&cx, link.pos);
-            groups.push(&cx, self.operand_group(&cx, link_items(&cx, link)));
+            let items = link_items(&cx, link);
+            groups.push(&cx, (items, self.operand_group(&cx, items)));
             k = k + 1usize;
         }
         var value = Option::None;
@@ -1665,20 +1926,20 @@ impl FnLower['k] {
             depth = depth - 1usize;
             let link = chain.at(&cx, depth);
             self.at.set(&cx, link.pos);
-            let (reads, lent) = groups.at(&cx, depth);
-            value = match self.operand_values(&cx, link_items(&cx, link), reads, lent, Option::None, value) {
-                Some(vals) => Option::Some.(self.emit(&cx, Op::new(&cx, binop_name(&cx, link.op), self.substitute_type(&cx, self.type_of(&cx, link.id)), vals))),
+            let (items, group) = groups.at(&cx, depth);
+            value = match self.operand_values(&cx, items, group, Option::None, value) {
+                Some(args) => Option::Some.(self.emit_binop(&cx, link, args)),
                 None => {
-                    var outer = 0usize;
-                    while outer < depth {
-                        let unit = self.lend_frames.pop(&cx);
-                        outer = outer + 1usize;
-                    }
+                    self.lend_frames.truncate(&cx, lend_depth);
                     return Option::None;
                 },
             };
         }
         value
+    }
+
+    fn emit_binop(self, &cx: Domain!['k], b: S::Binop['k], args: ArenaVec[Str['k], 'k]) -> Str['k] {
+        self.emit(&cx, Op::new(&cx, binop_name(&cx, b.op), self.substitute_type(&cx, self.type_of(&cx, b.id)), args))
     }
 
     // `&&` or `||` once its left operand is `c`.
@@ -1742,7 +2003,7 @@ impl FnLower['k] {
     }
 
     fn unary_prim(self, &cx: Domain!['k], ty: Type['k], pos: Pos) -> Str['k] {
-        match self.lowering.types.shape(&cx, ty, Option::None) {
+        match self.lowering.copy(&cx).types.shape(&cx, ty, Option::None) {
             Prim(name) => name,
             _ => self.fails(&cx, "internal error: a unary operator on a non-primitive", pos),
         }
@@ -1890,7 +2151,7 @@ impl FnLower['k] {
     }
 
     fn field_index(self, &cx: Domain!['k], ty: Type['k], field: Str['k]) -> usize {
-        match self.lowering.types.shape(&cx, ty, Option::None) {
+        match self.lowering.copy(&cx).types.shape(&cx, ty, Option::None) {
             Struct(fields) => {
                 var i = 0usize;
                 while i < fields.len(&cx) {
@@ -1908,7 +2169,7 @@ impl FnLower['k] {
     // ---- constructors
     fn expr_struct_lit(self, &cx: Domain!['k], s: S::StructLit['k]) -> Option[Str['k]] {
         let ty = self.substitute_type(&cx, self.type_of(&cx, s.id));
-        let shape = match self.lowering.types.shape(&cx, ty, Option::None) {
+        let shape = match self.lowering.copy(&cx).types.shape(&cx, ty, Option::None) {
             Struct(fields) => fields,
             _ => self.fails(&cx, "internal error: a struct literal of a non-struct", s.pos),
         };
@@ -1920,12 +2181,12 @@ impl FnLower['k] {
             names.push(&cx, f.name);
             items.push(&cx, match f.value {
                 Some(v) => Item::Expr.(v),
-                None => Item::Bind.(self.bindings.at(&cx, id_text(&cx, self.results().field_ids.at(&cx, s.id).at(&cx, f.name)))),
+                None => Item::Bind.(self.bindings.at(&cx, self.results(&cx).field_ids.at(&cx, s.id).at(&cx, f.name))),
             });
             i = i + 1usize;
         }
         if s.spread.is_some() {
-            let rest = self.bindings.at(&cx, id_text(&cx, self.results().spread_ids.at(&cx, s.id)));
+            let rest = self.bindings.at(&cx, self.results(&cx).spread_ids.at(&cx, s.id));
             let fields = match rest.fields {
                 Some(f) => f,
                 None => self.fails(&cx, "internal error: a spread of a non-bundle", s.pos),
@@ -1935,7 +2196,8 @@ impl FnLower['k] {
                 let name = shape.at(&cx, i).name;
                 if !names.contains(&cx, name) {
                     names.push(&cx, name);
-                    items.push(&cx, Item::Bind.(self.bindings.at(&cx, fields.at(&cx, name))));
+                    let (root, ty) = fields.at(&cx, name);
+                    items.push(&cx, Item::Bind.(Binding.{ name, ty, path: Option::Some.(root), fields: Option::None, slot: Option::None }));
                 }
                 i = i + 1usize;
             }
@@ -1961,7 +2223,7 @@ impl FnLower['k] {
 
     fn variant(self, &cx: Domain!['k], name: Str['k], ty: Type['k], args: Option[ArenaVec[Expr['k], 'k]]) -> Option[Str['k]] {
         let enum_ty = self.substitute_type(&cx, ty);
-        let variants = match self.lowering.types.shape(&cx, enum_ty, Option::None) {
+        let variants = match self.lowering.copy(&cx).types.shape(&cx, enum_ty, Option::None) {
             Enum(vs) => vs,
             _ => self.fails(&cx, "internal error: a variant of a non-enum", self.at.copy(&cx)),
         };
@@ -1998,7 +2260,7 @@ impl FnLower['k] {
 
     // ---- calls
     fn expr_call(self, &cx: Domain!['k], c: S::Call['k]) -> Option[Str['k]] {
-        let call = match self.results().calls.get(&cx, c.id) {
+        let call = match self.results(&cx).calls.get(&cx, c.id) {
             Some(call) => call,
             None => self.fails(&cx, "internal error: an unresolved call", c.pos),
         };
@@ -2075,7 +2337,7 @@ impl FnLower['k] {
         let (target, targs, requires_unsafe) = match call {
             Trait(t) => {
                 var needs = false;
-                let methods = self.lowering.sigs.traits.at(&cx, t.trait_name).methods;
+                let methods = self.lowering.copy(&cx).sigs.traits.at(&cx, t.trait_name).methods;
                 var i = 0usize;
                 while i < methods.len(&cx) {
                     if methods.at(&cx, i).name.eq(&cx, t.method) {
@@ -2154,7 +2416,7 @@ impl FnLower['k] {
                                 let unit = match self.vty.get(&cx, p) {
                                     Some(t) => match t {
                                         Ptr(inner) => {
-                                            if contains(&cx, self.lowering.types, inner.copy(&cx), |&cx, t: Type['k]| is_never(t)) {
+                                            if contains(&cx, self.lowering.copy(&cx).types, inner.copy(&cx), |&cx, t: Type['k]| is_never(t)) {
                                                 self.fails(&cx, "an unsafe lend of a pointer's target cannot lend a value that holds Never", expr_pos(arg));
                                             }
                                             self.raw_access(&cx, inner.copy(&cx), expr_pos(arg));
@@ -2229,7 +2491,7 @@ impl FnLower['k] {
 
     fn ordering(self, &cx: Domain!['k], e: Expr['k]) -> Str['k] {
         match e {
-            Path(p) => match self.lowering.r.refs.get(&cx, p.id) {
+            Path(p) => match self.lowering.copy(&cx).r.refs.get(&cx, p.id) {
                 Some(r) => match r {
                     Variant(_d, name) => match ordering_name(&cx, name) {
                         Some(o) => return Str::from_static(&cx, o),
@@ -2370,10 +2632,10 @@ impl FnLower['k] {
             Some(p) => p,
             None => self.fails(&cx, "a for loop's iterator is not a place", f.pos),
         };
-        let call = self.results().next_calls.at(&cx, f.id);
+        let call = self.results(&cx).next_calls.at(&cx, f.id);
         let iterator_ty = self.substitute_type(&cx, call.targs.at(&cx, 0usize));
         let item = self.substitute_type(&cx, call.targs.at(&cx, 1usize));
-        let option = self.substitute_type(&cx, self.results().options.at(&cx, f.id));
+        let option = self.substitute_type(&cx, self.results(&cx).options.at(&cx, f.id));
         let head = self.new_block(&cx, ArenaVec::new(&cx), "for");
         self.loop_sites(&cx, head);
         self.jump(&cx, head, ArenaVec::new(&cx));
@@ -2382,15 +2644,15 @@ impl FnLower['k] {
         args.push(&cx, path);
         let step = self.emit(&cx, Op::new(&cx, "trait_call", option, args).with_tys(ArenaVec::two(&cx, iterator_ty, item)));
         let item_ty = self.substitute_type(&cx, item);
-        let item_name = self.fresh(&cx, "item");
+        let item_name = self.fresh(&cx, "%item");
         let some = self.new_block(&cx, ArenaVec::one(&cx, C::Binding.{ name: item_name, ty: item_ty }), "some");
-        let unit_name = self.fresh(&cx, "unit");
+        let unit_name = self.fresh(&cx, "%unit");
         let none = self.new_block(&cx, ArenaVec::one(&cx, C::Binding.{ name: unit_name, ty: C::unit(&cx) }), "none");
         let arms = ArenaVec::two(&cx, C::Arm.{ variant: Str::from_static(&cx, "Some"), edge: self.edge(&cx, some, ArenaVec::new(&cx)) }, C::Arm.{ variant: Str::from_static(&cx, "None"), edge: self.edge(&cx, none, ArenaVec::new(&cx)) });
         self.terminate(&cx, Terminator::Switch.(step, option, arms, self.at.copy(&cx)));
         self.start(&cx, some);
         let saved = self.save_scope(&cx);
-        self.declare(&cx, self.binder(&cx, f.id), f.name, item_ty, item_name);
+        self.declare(&cx, self.results(&cx).binders.at(&cx, f.id), f.name, item_ty, item_name);
         let unit = self.expr(&cx, Expr::Block.(f.body));
         self.restore_scope(&cx, saved);
         if self.live(&cx) {
@@ -2424,7 +2686,7 @@ impl FnLower['k] {
                 if place || !block.params.is_empty(&cx) {
                     arms.push(&cx, C::Arm.{ variant, edge: self.edge(&cx, block, ArenaVec::new(&cx)) });
                 } else {
-                    let pay = self.fresh(&cx, "pay");
+                    let pay = self.fresh(&cx, "%pay");
                     let hop = self.new_block(&cx, ArenaVec::one(&cx, C::Binding.{ name: pay, ty: member_type(&cx, variants, variant) }), "b");
                     arms.push(&cx, C::Arm.{ variant, edge: self.edge(&cx, hop, ArenaVec::new(&cx)) });
                     hops.push(&cx, (hop, block));
@@ -2622,7 +2884,7 @@ impl FnLower['k] {
     }
 
     fn expr_match(self, &cx: Domain!['k], m: S::Match['k]) -> Option[Str['k]] {
-        let lent = self.results().lent.get_or(&cx, m.id, false);
+        let lent = self.results(&cx).lent.get_or(&cx, m.id, false);
         let scrutinee = if lent {
             match m.scrutinee.copy(&cx) {
                 Unary(u) => u.operand.copy(&cx),
@@ -2649,7 +2911,7 @@ impl FnLower['k] {
             },
             _ => (),
         };
-        let shape = self.lowering.types.shape(&cx, sty, Option::None);
+        let shape = self.lowering.copy(&cx).types.shape(&cx, sty, Option::None);
         let covers: ArenaVec[ArenaVec[CoverItem['k], 'k], 'k] = ArenaVec::new(&cx);
         let blocks: ArenaVec[BlockB['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
@@ -2662,7 +2924,7 @@ impl FnLower['k] {
             let single = arm.cases.len(&cx) == 1usize && variant;
             let payload: ArenaVec[C::Binding['k], 'k] = ArenaVec::new(&cx);
             if place.is_none() && single {
-                let pay = self.fresh(&cx, "pay");
+                let pay = self.fresh(&cx, "%pay");
                 payload.push(&cx, C::Binding.{ name: pay, ty: self.substitute_type(&cx, self.type_of(&cx, arm.cases.at(&cx, 0usize).id)) });
             }
             blocks.push(&cx, self.new_block(&cx, payload, "b"));
@@ -2701,7 +2963,7 @@ impl FnLower['k] {
     }
 
     fn case_variant(self, &cx: Domain!['k], case: S::Case['k]) -> Str['k] {
-        match self.results().case_labels.get(&cx, case.id) {
+        match self.results(&cx).case_labels.get(&cx, case.id) {
             Some(name) => name,
             None => self.fails(&cx, "internal error: a variant case inference did not label", case.pos),
         }
@@ -2714,9 +2976,9 @@ impl FnLower['k] {
             Some(b) => b,
             None => ArenaVec::new(&cx),
         };
-        let ids = self.results().case_binders.get_or(&cx, case.id, ArenaVec::new(&cx));
+        let ids = self.results(&cx).case_binders.get_or(&cx, case.id, ArenaVec::new(&cx));
         let whole = binders.len(&cx) == 1usize;
-        let types = if whole { ArenaVec::one(&cx, ty) } else { self.lowering.types.fields(&cx, ty, Option::None) };
+        let types = if whole { ArenaVec::one(&cx, ty) } else { self.lowering.copy(&cx).types.fields(&cx, ty, Option::None) };
         let sources: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
         if lent {
             let path = Buffer!::new().write(&cx, payload).put(".").write(&cx, self.case_variant(&cx, case)).save(&cx);
@@ -2744,9 +3006,9 @@ impl FnLower['k] {
             let t = types.at(&cx, i);
             match ids.at(&cx, i) {
                 Some(bid) => if lent {
-                    self.bindings.insert(&cx, id_text(&cx, bid), Binding.{ name: binders.at(&cx, i), ty: t, path: Option::Some.(sources.at(&cx, i)), fields: Option::None });
+                    self.bindings.insert(&cx, bid, Binding.{ name: binders.at(&cx, i), ty: t, path: Option::Some.(sources.at(&cx, i)), fields: Option::None, slot: Option::None });
                 } else {
-                    self.declare(&cx, id_text(&cx, bid), binders.at(&cx, i), t, sources.at(&cx, i));
+                    self.declare(&cx, bid, binders.at(&cx, i), t, sources.at(&cx, i));
                 },
                 None => if !lent {
                     self.discard_pattern(&cx, t);
@@ -2762,21 +3024,21 @@ impl FnLower['k] {
             None => return Option::None,
         };
         let enum_ty = self.vty.at(&cx, v);
-        let result = self.results().try_kinds.get_or(&cx, id, Str::from_static(&cx, "")).is(&cx, "result");
+        let result = self.results(&cx).try_kinds.get_or(&cx, id, Str::from_static(&cx, "")).is(&cx, "result");
         let ok = Str::from_static(&cx, if result { "Ok" } else { "Some" });
         let err = Str::from_static(&cx, if result { "Err" } else { "None" });
-        let variants = match self.lowering.types.shape(&cx, enum_ty, Option::None) {
+        let variants = match self.lowering.copy(&cx).types.shape(&cx, enum_ty, Option::None) {
             Enum(vs) => vs,
             _ => self.fails(&cx, "internal error: `?` on a non-enum", self.at.copy(&cx)),
         };
-        let ok_name = self.fresh(&cx, "ok");
+        let ok_name = self.fresh(&cx, "%ok");
         let ok_block = self.new_block(&cx, ArenaVec::one(&cx, C::Binding.{ name: ok_name, ty: member_type(&cx, variants, ok) }), "b");
-        let err_name = self.fresh(&cx, "err");
+        let err_name = self.fresh(&cx, "%err");
         let err_block = self.new_block(&cx, ArenaVec::one(&cx, C::Binding.{ name: err_name, ty: member_type(&cx, variants, err) }), "b");
         let arms = ArenaVec::two(&cx, C::Arm.{ variant: ok, edge: self.edge(&cx, ok_block, ArenaVec::new(&cx)) }, C::Arm.{ variant: err, edge: self.edge(&cx, err_block, ArenaVec::new(&cx)) });
         self.terminate(&cx, Terminator::Switch.(v, enum_ty, arms, self.at.copy(&cx)));
         self.start(&cx, err_block);
-        let ret = self.substitute_type(&cx, self.sig.ret);
+        let ret = self.substitute_type(&cx, self.sig.copy(&cx).ret);
         let failure = self.emit(&cx, Op::new(&cx, "construct_variant", ret, ArenaVec::one(&cx, err_name)).typed(ret).literal(err));
         self.terminate(&cx, Terminator::Ret.(failure, self.at.copy(&cx)));
         self.start(&cx, ok_block);
@@ -2788,15 +3050,15 @@ impl FnLower['k] {
         let items: ArenaVec[Item['k], 'k] = ArenaVec::new(&cx);
         var i = 0usize;
         while i < captures.len(&cx) {
-            items.push(&cx, Item::Bind.(self.bindings.at(&cx, id_text(&cx, captures.at(&cx, i).binder))));
+            items.push(&cx, Item::Bind.(self.bindings.at(&cx, captures.at(&cx, i).binder)));
             i = i + 1usize;
         }
         items
     }
 
     fn next_lifted(self, &cx: Domain!['k], kind: Str['static]) -> Str['k] {
-        let n = self.lowering.closures.copy(&cx);
-        self.lowering.closures.set(&cx, n + 1u64);
+        let n = self.lowering.copy(&cx).closures.copy(&cx);
+        self.lowering.copy(&cx).closures.set(&cx, n + 1u64);
         f"{self.name}#{kind}{n}".write(&cx, Buffer!::new()).save(&cx)
     }
 
@@ -2807,7 +3069,7 @@ impl FnLower['k] {
             Struct(fields) => (fields.at(&cx, 0usize).ty, fields.at(&cx, 1usize).ty),
             _ => self.fails(&cx, "internal error: a closure type is not a struct", c.pos),
         };
-        let captures = self.results().captures.get_or(&cx, c.id, ArenaVec::new(&cx));
+        let captures = self.results(&cx).captures.get_or(&cx, c.id, ArenaVec::new(&cx));
         let vals = match self.operands(&cx, self.capture_items(&cx, captures), Option::None) {
             Some(v) => v,
             None => return Option::None,
@@ -2828,8 +3090,8 @@ impl FnLower['k] {
             pnames.push(&cx, c.params.at(&cx, i).name);
             i = i + 1usize;
         }
-        let sig = Sig.{ name, decl: Option::None, params: self.sig.params, premises: self.sig.premises, pnames, ptypes: code.params,
-            places, ret: code.ret.copy(&cx), is_unsafe: false, home: self.sig.home };
+        let sig = Sig.{ name, decl: Option::None, params: self.sig.copy(&cx).params, premises: self.sig.copy(&cx).premises, pnames, ptypes: code.params,
+            places, ret: code.ret.copy(&cx), is_unsafe: false, home: self.sig.copy(&cx).home };
         self.lift(&cx, sig, Mode::Closure.(c, env_ty), c.pos);
         let code_value = self.emit(&cx, Op::new(&cx, "fn", code_ty, ArenaVec::one(&cx, name)).with_tys(self.identity_args(&cx)));
         Option::Some.(self.emit(&cx, Op::new(&cx, "construct", ty, ArenaVec::two(&cx, env, code_value)).typed(ty)))
@@ -2839,13 +3101,13 @@ impl FnLower['k] {
     fn lift(self, &cx: Domain!['k], sig: Sig['k], mode: Mode['k], pos: Pos) {
         let inner = FnLower::new(&cx, self.lowering, sig, mode, sig.name, pos);
         let fun = inner.run(&cx);
-        self.lowering.program.funs.insert(&cx, sig.name, fun);
+        self.lowering.copy(&cx).program.funs.insert(&cx, sig.name, fun);
     }
 
     fn expr_foreach(self, &cx: Domain!['k], f: S::Foreach['k]) -> Option[Str['k]] {
         let ty = self.substitute_type(&cx, self.type_of(&cx, f.id));
         self.check_closed(&cx, ty, ArenaVec::new(&cx));
-        let captures = self.results().captures.get_or(&cx, f.id, ArenaVec::new(&cx));
+        let captures = self.results(&cx).captures.get_or(&cx, f.id, ArenaVec::new(&cx));
         let items = ArenaVec::one(&cx, Item::Expr.(f.source.copy(&cx)));
         items.append(&cx, self.capture_items(&cx, captures));
         let vals = match self.operands(&cx, items, Option::None) {
@@ -2859,22 +3121,22 @@ impl FnLower['k] {
         // A mapped value (the map form) holds its components.
         let mapped = mapped_operand(self.vty.at(&cx, vals.at(&cx, 0usize)));
         let item = match mapped {
-            Some(o) => mapped_component(&cx, o, C::named(each.binder, ArenaVec::new(&cx)), self.lowering.counter),
+            Some(o) => mapped_component(&cx, o, C::named(each.binder, ArenaVec::new(&cx)), self.lowering.copy(&cx).counter),
             None => foreach_item(&cx, each),
         };
         let name = self.next_lifted(&cx, "foreach");
         let params = ArenaVec::one(&cx, Param.{ name: each.binder, kind: Kind::Any });
-        params.append(&cx, self.sig.params);
+        params.append(&cx, self.sig.copy(&cx).params);
         let pnames = ArenaVec::one(&cx, f.name);
         let ptypes = ArenaVec::one(&cx, item);
         var i = 0usize;
         while i < captures.len(&cx) {
             pnames.push(&cx, captures.at(&cx, i).name);
-            ptypes.push(&cx, self.bindings.at(&cx, id_text(&cx, captures.at(&cx, i).binder)).ty);
+            ptypes.push(&cx, self.bindings.at(&cx, captures.at(&cx, i).binder).ty);
             i = i + 1usize;
         }
-        let sig = Sig.{ name, decl: Option::None, params, premises: self.sig.premises, pnames, ptypes, places: ArenaVec::new(&cx),
-            ret: each.body.copy(&cx), is_unsafe: false, home: self.sig.home };
+        let sig = Sig.{ name, decl: Option::None, params, premises: self.sig.copy(&cx).premises, pnames, ptypes, places: ArenaVec::new(&cx),
+            ret: each.body.copy(&cx), is_unsafe: false, home: self.sig.copy(&cx).home };
         self.lift(&cx, sig, Mode::Mapper.(f), f.pos);
         let args = ArenaVec::two(&cx, vals.at(&cx, 0usize), name);
         args.append(&cx, vals.skip(&cx, 1usize));
@@ -2882,7 +3144,7 @@ impl FnLower['k] {
     }
 
     fn expr_fstring(self, &cx: Domain!['k], f: S::FStr['k]) -> Option[Str['k]] {
-        let sig = self.lowering.library_sig(&cx, "Buffer!::new", self.home);
+        let sig = self.lowering.copy(&cx).library_sig(&cx, "Buffer!::new", self.home);
         let writer = self.emit(&cx, Op::new(&cx, "call", self.substitute_type(&cx, self.type_of(&cx, f.id)), ArenaVec::one(&cx, sig.name)));
         self.fstring(&cx, f, writer)
     }
@@ -2893,8 +3155,8 @@ impl FnLower['k] {
     fn fstring(self, &cx: Domain!['k], f: S::FStr['k], start: Str['k]) -> Option[Str['k]] {
         var writer = start;
         let wty = self.vty.at(&cx, writer);
-        let writer_trait = self.lowering.library_name(&cx, "Writer", self.home);
-        let format = self.lowering.library_name(&cx, "Format", self.home);
+        let writer_trait = self.lowering.copy(&cx).library_name(&cx, "Writer", self.home);
+        let format = self.lowering.copy(&cx).library_name(&cx, "Format", self.home);
         var i = 0usize;
         while i < f.parts.len(&cx) {
             match f.parts.at(&cx, i) {
@@ -2916,7 +3178,7 @@ impl FnLower['k] {
                     };
                     writer = values.at(&cx, 0usize);
                     let v = values.at(&cx, 1usize);
-                    if self.results().static_parts.contains(&cx, expr_id(part)) {
+                    if self.results(&cx).static_parts.contains(&cx, expr_id(part)) {
                         let args = ArenaVec::two(&cx, writer_trait, Str::from_static(&cx, "write_static"));
                         args.push(&cx, writer);
                         args.push(&cx, v);
@@ -2961,15 +3223,15 @@ impl FnLower['k] {
         let wty = self.vty.at(&cx, out);
         let cty = self.vty.at(&cx, context);
         let tys = ArenaVec::two(&cx, wty, cty);
-        let reading = C::named(self.lowering.library_name(&cx, "ReadingWriter!", self.home), tys);
-        let new = self.lowering.library_sig(&cx, "ReadingWriter!::new", self.home);
+        let reading = C::named(self.lowering.copy(&cx).library_name(&cx, "ReadingWriter!", self.home), tys);
+        let new = self.lowering.copy(&cx).library_sig(&cx, "ReadingWriter!::new", self.home);
         let args = ArenaVec::two(&cx, new.name, out);
         args.push(&cx, context);
         let writer = match self.fstring(&cx, f, self.emit(&cx, Op::new(&cx, "call", reading, args).with_tys(tys))) {
             Some(w) => w,
             None => return Option::None,
         };
-        let finish = self.lowering.library_sig(&cx, "ReadingWriter!::finish", self.home);
+        let finish = self.lowering.copy(&cx).library_sig(&cx, "ReadingWriter!::finish", self.home);
         let pair = Type::Tuple.(tys);
         let both = self.emit(&cx, Op::new(&cx, "call", pair, ArenaVec::two(&cx, finish.name, writer)).with_tys(tys));
         let parts = self.destruct(&cx, both, pair);
@@ -2992,7 +3254,7 @@ impl FnLower['k] {
             Some(v) => v,
             None => return Option::None,
         };
-        let witnesses = self.substitute_all(&cx, self.results().witnesses.get_or(&cx, p.id, ArenaVec::new(&cx)));
+        let witnesses = self.substitute_all(&cx, self.results(&cx).witnesses.get_or(&cx, p.id, ArenaVec::new(&cx)));
         let ty = self.substitute_type(&cx, self.type_of(&cx, p.id));
         Option::Some.(self.emit(&cx, Op::new(&cx, "pack", ty, ArenaVec::one(&cx, v)).typed(ty).with_tys(witnesses)))
     }
@@ -3010,12 +3272,12 @@ impl FnLower['k] {
         match s {
             Let(l) => self.let_stmt(&cx, l),
             Const(c) => {
-                let value = self.results().folded.at(&cx, c.id);
+                let value = self.results(&cx).folded.at(&cx, c.id);
                 let ty = match const_type(&cx, value) {
                     Some(t) => t,
                     None => self.fails(&cx, "internal error: an untyped constant", c.pos),
                 };
-                self.declare(&cx, self.binder(&cx, c.id), c.name, ty, self.constant_value(&cx, value));
+                self.declare(&cx, self.results(&cx).binders.at(&cx, c.id), c.name, ty, self.constant_value(&cx, value));
             },
             Assign(a) => self.assign(&cx, a),
             Expr(n) => match self.expr(&cx, n.value) {
@@ -3034,15 +3296,15 @@ impl FnLower['k] {
             None => return,
         };
         if !l.brands.is_empty(&cx) {
-            let (binders, body) = match self.lowering.types.shape(&cx, self.vty.at(&cx, v), Option::None) {
+            let (binders, body) = match self.lowering.copy(&cx).types.shape(&cx, self.vty.at(&cx, v), Option::None) {
                 Exists(binders, body) => (binders, body.copy(&cx)),
                 _ => self.fails(&cx, "internal error: opening a non-package", l.pos),
             };
-            let opened = self.results().opened.get_or(&cx, l.id, ArenaVec::new(&cx));
+            let opened = self.results(&cx).opened.get_or(&cx, l.id, ArenaVec::new(&cx));
             let actual: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
             var i = 0usize;
             while i < opened.len(&cx) {
-                actual.push(&cx, Buffer!::new().write(&cx, opened.at(&cx, i)).put("#").write(&cx, self.fresh(&cx, "").skip(1usize)).save(&cx));
+                actual.push(&cx, Buffer!::new().write(&cx, opened.at(&cx, i)).put("#").write(&cx, self.fresh(&cx, "")).save(&cx));
                 i = i + 1usize;
             }
             let sub: ArenaMap[Str['k], Type['k], 'k] = ArenaMap::new(&cx);
@@ -3051,7 +3313,7 @@ impl FnLower['k] {
                 sub.insert(&cx, binders.at(&cx, i), Type::Skolem.(actual.at(&cx, i)));
                 i = i + 1usize;
             }
-            let payload = subst(&cx, body, sub, self.lowering.counter);
+            let payload = subst(&cx, body, sub, self.lowering.copy(&cx).counter);
             v = self.emit(&cx, Op::new(&cx, "open", payload, ArenaVec::one(&cx, v)).opening(actual));
             i = 0usize;
             while i < opened.len(&cx) && i < actual.len(&cx) {
@@ -3065,14 +3327,14 @@ impl FnLower['k] {
 
     fn pattern(self, &cx: Domain!['k], p: Pattern['k], value: Str['k]) {
         match p {
-            Bind(n) => self.declare(&cx, self.binder(&cx, n.id), n.value, self.type_of(&cx, n.id), value),
+            Bind(n) => self.declare(&cx, self.results(&cx).binders.at(&cx, n.id), n.value, self.type_of(&cx, n.id), value),
             Wild(_id) => self.discard_pattern(&cx, self.vty.at(&cx, value)),
             Tuple(n) => self.elements(&cx, n.value, value),
             Array(n) => self.elements(&cx, n.value, value),
             Struct(ps) => {
                 let ty = self.vty.at(&cx, value);
                 let comps = self.destruct(&cx, value, ty);
-                let fields = match self.lowering.types.shape(&cx, ty, Option::None) {
+                let fields = match self.lowering.copy(&cx).types.shape(&cx, ty, Option::None) {
                     Struct(fields) => fields,
                     _ => self.fails(&cx, "internal error: a struct pattern on a non-struct", self.at.copy(&cx)),
                 };
@@ -3082,8 +3344,8 @@ impl FnLower['k] {
                     named.insert(&cx, ps.fields.at(&cx, i).name, ps.fields.at(&cx, i).pattern);
                     i = i + 1usize;
                 }
-                let rest: ArenaMap[Str['k], Str['k], 'k] = ArenaMap::new(&cx);
-                let rest_id = self.results().rest_ids.get(&cx, ps.id);
+                let rest: ArenaMap[Str['k], (Str['k], Type['k]), 'k] = ArenaMap::new(&cx);
+                let rest_id = self.results(&cx).rest_ids.get(&cx, ps.id);
                 i = 0usize;
                 while i < fields.len(&cx) && i < comps.len(&cx) {
                     let name = fields.at(&cx, i).name;
@@ -3092,12 +3354,14 @@ impl FnLower['k] {
                         Some(sub) => self.pattern(&cx, sub, c.name),
                         None => match ps.rest {
                             Some(_r) => {
-                                let bid = Buffer!::new().write(&cx, id_text(&cx, match rest_id {
+                                let bid = match rest_id {
                                     Some(id) => id,
                                     None => self.fails(&cx, "internal error: a rest pattern without an id", self.at.copy(&cx)),
-                                })).put("_").write(&cx, name).save(&cx);
-                                rest.insert(&cx, name, bid);
-                                self.declare(&cx, bid, name, c.ty, c.name);
+                                };
+                                let root = Buffer!::new().put("&").write(&cx, name).put("#").put(bid).put("_").write(&cx, name).save(&cx);
+                                let ty = self.substitute_type(&cx, c.ty);
+                                rest.insert(&cx, name, (root, ty));
+                                self.declare_place(&cx, root, ty, c.name);
                             },
                             None => self.discard_pattern(&cx, c.ty),
                         },
@@ -3106,7 +3370,7 @@ impl FnLower['k] {
                 }
                 match ps.rest {
                     Some(r) => match rest_id {
-                        Some(id) => { self.bindings.insert(&cx, id_text(&cx, id), Binding.{ name: r, ty: C::unit(&cx), path: Option::None, fields: Option::Some.(rest) }); },
+                        Some(id) => { self.bindings.insert(&cx, id, Binding.{ name: r, ty: C::unit(&cx), path: Option::None, fields: Option::Some.(rest), slot: Option::None }); },
                         None => (),
                     },
                     None => (),
@@ -3130,7 +3394,17 @@ impl FnLower['k] {
             None => return,
         };
         let path = match a.target {
-            Path(p) => self.local(&cx, p.id).path,
+            Path(p) => {
+                let binding = self.local(&cx, p.id);
+                match binding.slot {
+                    Some(slot) => {
+                        self.definitions.insert(&cx, (self.current(&cx).index, slot), v);
+                        return;
+                    },
+                    None => (),
+                };
+                binding.path
+            },
             _ => self.place_path(&cx, a.target),
         };
         match path {
@@ -3139,6 +3413,24 @@ impl FnLower['k] {
             },
             None => self.fails(&cx, "assignment through a field needs a place", a.pos),
         };
+    }
+}
+
+forall 'k.
+fn scalar_type(ty: Type['k]) -> bool {
+    match ty {
+        Prim(_) => true,
+        _ => false,
+    }
+}
+
+forall 'k.
+fn has_successors(term: Terminator['k]) -> bool {
+    match term {
+        Jmp(_, _) => true,
+        Jnz(_, _, _, _) => true,
+        Switch(_, _, _, _) => true,
+        _ => false,
     }
 }
 

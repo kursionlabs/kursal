@@ -12,21 +12,20 @@ use std::collections::arena_vec::ArenaVec;
 use std::collections::arena_map::{ArenaMap, ArenaSet};
 use std::mem::Ref;
 use std::str::Str;
-use std::arena::{Domain!, copy_str, ref_in};
+use std::arena::{Domain!, ref_in};
 use std::buffer::Buffer!;
 use std::fmt::Writer;
-use package::kurs::transfer::copy_type;
-use package::kurs::core::{Arm, Block, Edge, FnType, Fun, Instance, Instr, Kind, Member, Method, ModuleId, Param, Premise, Program, Terminator, Type};
+use package::kurs::core::{Arm, Block, Edge, FnType, Fun, Instance, Instr, Kind, Member, Method, ModuleId, Opened, Param, Premise, Program, Terminator, Type};
 use package::kurs::core as C;
 use package::types::coherence::check_coherence;
-use package::types::formation::{Discharge, Formation};
+use package::types::formation::{Discharge, Formation, with_kind};
 use package::types::layout::check_type_expansion;
 use package::types::literals::valid_literal;
 use package::kurs::sexpr::Form;
 use package::syntax::ast::{Pos, no_pos};
 use package::types::termination::check_instance_termination;
 use package::types::ops::{Fresh, Types, children, equal, fits, foreach_item, free_brands, fresh, kurs_error, mapped_component, mapped_operand, subst};
-use package::types::unify::match_head;
+use package::types::unify::{ground, match_ground_head};
 use std::hash::{HashIn, HashState};
 use std::option::{Option, Result};
 use std::slice::hash_bytes;
@@ -367,38 +366,27 @@ fn texts_set(&cx: Domain!['k], names: ArenaVec[Str['k], 'k]) -> ArenaSet[Str['k]
     out
 }
 
+// Compare opened paths after substituting the edge's brand arguments.
 forall 'k.
-fn subset(&cx: Domain!['k], a: ArenaSet[Str['k], 'k], b: ArenaSet[Str['k], 'k]) -> bool {
-    a.all(&cx, |&cx, x: Str['k]| b.contains(&cx, x))
-}
-
-forall 'k.
-fn sets_meet(&cx: Domain!['k], a: ArenaSet[Str['k], 'k], b: ArenaSet[Str['k], 'k]) -> bool {
-    !subset_none(&cx, a, b)
-}
-
-forall 'k.
-fn subset_none(&cx: Domain!['k], a: ArenaSet[Str['k], 'k], b: ArenaSet[Str['k], 'k]) -> bool {
-    !a.any(&cx, |&cx, x: Str['k]| b.contains(&cx, x))
-}
-
-// The two maps hold the same keys with the same values.
-forall 'k.
-fn opened_same(&cx: Domain!['k], a: ArenaMap[Str['k], ArenaVec[Str['k], 'k], 'k], b: ArenaMap[Str['k], ArenaVec[Str['k], 'k], 'k]) -> bool {
-    if a.len(&cx) != b.len(&cx) {
-        return false;
+fn opened_match(&cx: Domain!['k], actual: ArenaMap[Str['k], ArenaVec[Str['k], 'k], 'k], expected: ArenaVec[Opened['k], 'k], sub: ArenaMap[Str['k], Type['k], 'k]) -> bool {
+    if expected.is_empty(&cx) {
+        return actual.is_empty(&cx);
     }
-    let keys = a.keys(&cx);
-    var equal = true;
-    var i = 0usize;
-    while equal && i < keys.len(&cx) {
-        equal = match b.get(&cx, keys.at(&cx, i)) {
-            Some(v) => v.eq(&cx, a.at(&cx, keys.at(&cx, i))),
-            None => false,
-        };
-        i = i + 1usize;
-    }
-    equal
+    let wanted: ArenaMap[Str['k], ArenaVec[Str['k], 'k], 'k] = ArenaMap::new(&cx);
+    expected.each(&cx, |&cx, view: Opened['k]| {
+        let labels = view.brands.map(&cx, |&cx, brand: Str['k]| match sub.get(&cx, brand) {
+            Some(t) => match t {
+                Skolem(label) => label,
+                _ => brand,
+            },
+            None => brand,
+        });
+        wanted.insert(&cx, view.path, labels);
+    });
+    actual.len(&cx) == wanted.len(&cx) && actual.all(&cx, |&cx, path, brands| match wanted.get(&cx, path) {
+        Some(labels) => brands.eq(&cx, labels),
+        None => false,
+    })
 }
 
 // ---------------------------------------------------------- function keys --
@@ -582,6 +570,36 @@ exposed struct Stored {
     kept: bool,
 }
 
+forall 'k.
+exposed struct SsaValue {
+    ty: Type['k],
+    // Zero consumes the value in the block body. Each successor has its own positive number.
+    used_on: Option[usize],
+}
+
+forall 'k.
+impl SsaValue['k] {
+    fn is_used(self, successor: usize) -> bool {
+        match self.used_on {
+            Some(n) => n == 0usize || n == successor,
+            None => false,
+        }
+    }
+}
+
+forall 'k.
+exposed struct BrandedLocal {
+    name: Str['k],
+    brands: ArenaSet[Str['k], 'k],
+}
+
+forall 'k.
+exposed struct EmptyContract {
+    paths: ArenaSet[Str['k], 'k],
+    // Every path has a state-independent stored type and a known Copy result with views closed.
+    resolved: bool,
+}
+
 // What the checker knows of the paths of the function it checks or plans, under its roots and
 // kinds maps, by their identities: made again when either changes.
 forall 'k.
@@ -590,10 +608,29 @@ exposed struct PathFacts {
     kinds: usize,
     // path -> its stored type, and whether that is Copy once asked, for a path no state decides
     stored: ArenaMap[Str['k], (Type['k], Option[bool]), 'k],
-    // block label -> the paths it declares empty, as a set
-    empty_sets: ArenaMap[Str['k], ArenaSet[Str['k], 'k], 'k],
-    // block label -> the paths it declares empty that `Checker::empty_to_check` gives
-    linear_empty: ArenaMap[Str['k], ArenaVec[Str['k], 'k], 'k],
+    // block label -> the paths it declares empty; `entails` marks an entry resolved once every
+    // path in it is
+    empty_sets: ArenaMap[Str['k], EmptyContract['k], 'k],
+}
+
+forall 'k.
+impl PathFacts['k] {
+    // A stored path with a known Copy result needs no type lookup or fresh names while views
+    // are closed. The edge may discard a Copy value or a slot already empty on arrival.
+    // When the incoming and required empty sets agree, every required path is empty.
+    fn proves_discardable(self, &cx: Domain!['k], places: Places['k], path: Str['k], same_empty: bool) -> bool {
+        if !places.opened.is_empty(&cx) {
+            return false;
+        }
+        let (_ty, copy) = match self.stored.get(&cx, path) {
+            Some(fact) => fact,
+            None => return false,
+        };
+        match copy {
+            Some(b) => b || same_empty || places.empty.contains(&cx, path),
+            None => false,
+        }
+    }
 }
 
 // (param types, result, unsafe, place indices) of a call's callee.
@@ -607,6 +644,12 @@ exposed struct Signature {
 
 // ----------------------------------------------------------------- checker --
 
+// Lowering checks the written types of each finished function, including generated helpers.
+exposed enum FunctionOrigin {
+    Parsed,
+    Lowered,
+}
+
 forall 'k.
 exposed struct Checker {
     program: Program['k],
@@ -619,7 +662,8 @@ exposed struct Checker {
     kinds: Ref[ArenaMap[Str['k], Kind, 'k], 'k],
     // whether each type asked about is Copy, under the kinds map (by its identity) it was asked under
     copies: Ref[(usize, ArenaMap[Type['k], bool, 'k]), 'k],
-    brands: Ref[ArenaSet[Str['k], 'k], 'k],
+    // Parameter kinds together with the brands in scope at the current instruction.
+    scope: Ref[ArenaMap[Str['k], Kind, 'k], 'k],
     premises: Ref[ArenaVec[Premise['k], 'k], 'k],
     // what is being checked, for messages
     location: Ref[Str['k], 'k],
@@ -628,20 +672,20 @@ exposed struct Checker {
     blocks: Ref[ArenaMap[Str['k], Block['k], 'k], 'k],
     record: Ref[ArenaMap[(Str['k], Str['k]), Type['k], 'k], 'k],
     roots: Ref[ArenaMap[Str['k], Type['k], 'k], 'k],
-    param_roots: Ref[ArenaSet[Str['k], 'k], 'k],
-    // the free brands of each root's type, as `edge` asks for them
-    root_brand_cache: Ref[ArenaMap[Str['k], ArenaSet[Str['k], 'k], 'k], 'k],
     // `branded_locals` of the function being checked, once asked
-    edge_roots: Ref[Option[(ArenaVec[Str['k], 'k], ArenaSet[Str['k], 'k])], 'k],
+    edge_roots: Ref[Option[(ArenaVec[BrandedLocal['k], 'k], ArenaSet[Str['k], 'k])], 'k],
     // what is known of paths under the current roots and kinds
     facts: Ref[PathFacts['k], 'k],
-    // The sets `empty_set` hands out, the n-th to a function's n-th block that asks, refilled for
-    // each function; and the state a block is checked in, refilled for each block.
+    // Shared read-only by every block that declares no empty paths.
+    no_empty_paths: ArenaSet[Str['k], 'k],
+    // Reusable storage for nonempty contracts in first-request order within each function.
     set_pool: ArenaVec[ArenaSet[Str['k], 'k], 'k],
+    // Working state, refilled for each block.
     working: Places['k],
     label: Ref[Str['k], 'k],
-    env: Ref[ArenaMap[Str['k], Type['k], 'k], 'k],
-    used: Ref[ArenaSet[Str['k], 'k], 'k],
+    // A block's SSA names index its values in binding order.
+    value_ids: ArenaMap[Str['k], usize, 'k],
+    values: ArenaVec[SsaValue['k], 'k],
     places: Ref[Places['k], 'k],
     instr: Ref[Option[Instr['k]], 'k],
 }
@@ -654,12 +698,14 @@ instance Discharge[Checker['k], 'k] {
 }
 
 forall 'k.
-fn with_brands(&cx: Domain!['k], kinds: ArenaMap[Str['k], Kind, 'k], brands: ArenaSet[Str['k], 'k]) -> ArenaMap[Str['k], Kind, 'k] {
+fn with_brands(&cx: Domain!['k], kinds: ArenaMap[Str['k], Kind, 'k], brands: ArenaVec[Str['k], 'k]) -> ArenaMap[Str['k], Kind, 'k] {
+    if brands.is_empty(&cx) {
+        return kinds;
+    }
     let out = kinds.clone(&cx);
-    let names = brands.keys(&cx);
     var i = 0usize;
-    while i < names.len(&cx) {
-        out.insert(&cx, names.at(&cx, i), Kind::Brand);
+    while i < brands.len(&cx) {
+        out.insert(&cx, brands.at(&cx, i), Kind::Brand);
         i = i + 1usize;
     }
     out
@@ -721,7 +767,7 @@ impl Checker['k] {
             home: ref_in(&cx, Option::None),
             kinds: ref_in(&cx, ArenaMap::new(&cx)),
             copies: ref_in(&cx, (0usize, ArenaMap::new(&cx))),
-            brands: ref_in(&cx, ArenaSet::new(&cx)),
+            scope: ref_in(&cx, ArenaMap::new(&cx)),
             premises: ref_in(&cx, ArenaVec::new(&cx)),
             location: ref_in(&cx, Str::from_static(&cx, "")),
             current: ref_in(&cx, Option::None),
@@ -729,19 +775,17 @@ impl Checker['k] {
             blocks: ref_in(&cx, ArenaMap::new(&cx)),
             record: ref_in(&cx, ArenaMap::new(&cx)),
             roots: ref_in(&cx, ArenaMap::new(&cx)),
-            param_roots: ref_in(&cx, ArenaSet::new(&cx)),
-            root_brand_cache: ref_in(&cx, ArenaMap::new(&cx)),
             edge_roots: ref_in(&cx, Option::None),
-            facts: ref_in(&cx, PathFacts.{ roots: 0usize, kinds: 0usize, stored: ArenaMap::new(&cx), empty_sets: ArenaMap::new(&cx), linear_empty: ArenaMap::new(&cx) }),
-            set_pool: ArenaVec::new(&cx),
+            facts: ref_in(&cx, PathFacts.{ roots: 0usize, kinds: 0usize, stored: ArenaMap::new(&cx), empty_sets: ArenaMap::new(&cx) }),
+            no_empty_paths: ArenaSet::new(&cx), set_pool: ArenaVec::new(&cx),
             working: Places::new(ArenaSet::new(&cx), ArenaMap::new(&cx), ArenaMap::new(&cx)),
             label: ref_in(&cx, Str::from_static(&cx, "")),
-            env: ref_in(&cx, ArenaMap::new(&cx)),
-            used: ref_in(&cx, ArenaSet::new(&cx)),
+            value_ids: ArenaMap::new(&cx),
+            values: ArenaVec::new(&cx),
             places: ref_in(&cx, Places::new(ArenaSet::new(&cx), ArenaMap::new(&cx), ArenaMap::new(&cx))),
             instr: ref_in(&cx, Option::None),
         };
-        checker.brands.copy(&cx).insert(&cx, static_brand(&cx));
+        checker.scope.copy(&cx).insert(&cx, static_brand(&cx), Kind::Brand);
         formation.discharge.set(&cx, Option::Some.(checker));
         formation.declarations(&cx);
         checker
@@ -751,25 +795,16 @@ impl Checker['k] {
         let saved_kinds = self.kinds.copy(&cx);
         let saved_premises = self.premises.copy(&cx);
         let saved_home = self.home.copy(&cx);
-        let saved_brands = self.brands.copy(&cx);
+        let saved_scope = self.scope.copy(&cx);
         self.kinds.set(&cx, kinds.clone(&cx));
         self.premises.set(&cx, premises);
         self.home.set(&cx, home);
-        let brands: ArenaSet[Str['k], 'k] = ArenaSet::new(&cx);
-        let names = kinds.keys(&cx);
-        var i = 0usize;
-        while i < names.len(&cx) {
-            if C::same_kind(kinds.at(&cx, names.at(&cx, i)), Kind::Brand) {
-                brands.insert(&cx, names.at(&cx, i));
-            }
-            i = i + 1usize;
-        }
-        self.brands.set(&cx, brands);
+        self.scope.set(&cx, kinds);
         let result = self.holds(&cx, premise.trait_name, premise.args);
         self.kinds.set(&cx, saved_kinds);
         self.premises.set(&cx, saved_premises);
         self.home.set(&cx, saved_home);
-        self.brands.set(&cx, saved_brands);
+        self.scope.set(&cx, saved_scope);
         result
     }
 
@@ -784,13 +819,28 @@ impl Checker['k] {
         }
     }
 
-    fn scope(self, &cx: Domain!['k]) -> ArenaMap[Str['k], Kind, 'k] {
-        with_brands(&cx, self.kinds.copy(&cx), self.brands.copy(&cx))
+    fn enter_function_scope(self, &cx: Domain!['k], params: ArenaVec[Param['k], 'k]) -> ArenaMap[Str['k], Kind, 'k] {
+        self.params.set(&cx, params);
+        let kinds: ArenaMap[Str['k], Kind, 'k] = ArenaMap::new(&cx);
+        var i = 0usize;
+        while i < params.len(&cx) {
+            let p = params.at(&cx, i);
+            kinds.insert(&cx, p.name, p.kind);
+            i = i + 1usize;
+        }
+        self.kinds.set(&cx, kinds);
+        let scope = with_kind(&cx, kinds, static_brand(&cx), Kind::Brand);
+        self.scope.set(&cx, scope);
+        scope
+    }
+
+    fn brand_in_scope(self, &cx: Domain!['k], name: Str['k]) -> bool {
+        C::same_kind(self.scope.copy(&cx).get_or(&cx, name, Kind::Any), Kind::Brand)
     }
 
     // ----------------------------------------------------------------- program --
 
-    fn check(self, &cx: Domain!['k]) {
+    fn check(self, &cx: Domain!['k], origin: FunctionOrigin) {
         let externs = self.program.externs.values(&cx);
         var e = 0usize;
         while e < externs.len(&cx) {
@@ -821,7 +871,7 @@ impl Checker['k] {
         let funs = self.program.funs.values(&cx);
         var f = 0usize;
         while f < funs.len(&cx) {
-            self.check_fun(&cx, funs.at(&cx, f), ArenaVec::new(&cx), ArenaVec::new(&cx), FunKey::Function.(funs.at(&cx, f).name));
+            self.check_fun(&cx, funs.at(&cx, f), ArenaVec::new(&cx), ArenaVec::new(&cx), FunKey::Function.(funs.at(&cx, f).name), origin);
             f = f + 1usize;
         }
         let trait_names = self.program.instances.keys(&cx);
@@ -830,7 +880,7 @@ impl Checker['k] {
             let insts = self.program.instances.at(&cx, trait_names.at(&cx, g));
             var i = 0usize;
             while i < insts.len(&cx) {
-                self.check_instance(&cx, insts.at(&cx, i), trait_names.at(&cx, g), i);
+                self.check_instance(&cx, insts.at(&cx, i), trait_names.at(&cx, g), i, origin);
                 i = i + 1usize;
             }
             g = g + 1usize;
@@ -855,7 +905,7 @@ impl Checker['k] {
     }
 
     // `group` is the key of the instance's list in the program, and `index` its place there.
-    fn check_instance(self, &cx: Domain!['k], inst: Instance['k], group: Str['k], index: usize) {
+    fn check_instance(self, &cx: Domain!['k], inst: Instance['k], group: Str['k], index: usize, origin: FunctionOrigin) {
         let found = self.program.traits.get(&cx, inst.trait_name);
         self.location.set(&cx, Buffer!::new().put("instance ").write(&cx, inst.trait_name).save(&cx));
         if sealed(&cx, inst.trait_name) {
@@ -889,7 +939,7 @@ impl Checker['k] {
             declared.insert(&cx, tr.methods.at(&cx, s).name);
             s = s + 1usize;
         }
-        if !subset(&cx, texts_set(&cx, by_name.keys(&cx)), declared) {
+        if !texts_set(&cx, by_name.keys(&cx)).is_subset(&cx, declared) {
             self.fail(&cx, "instance_method_not_in_trait");
         }
         var m = 0usize;
@@ -907,7 +957,7 @@ impl Checker['k] {
             if !equal(&cx, got, want) || (fun.is_unsafe && !sig.is_unsafe) {
                 self.fail(&cx, "method_does_match_trait");
             }
-            self.check_fun(&cx, fun, inst.params, inst.premises, FunKey::Method.(group, index, sig.name));
+            self.check_fun(&cx, fun, inst.params, inst.premises, FunKey::Method.(group, index, sig.name), origin);
             m = m + 1usize;
         }
     }
@@ -964,20 +1014,16 @@ impl Checker['k] {
 
     // ---------------------------------------------------------------- function --
 
-    fn check_fun(self, &cx: Domain!['k], fun: Fun['k], outer_params: ArenaVec[Param['k], 'k], outer_premises: ArenaVec[Premise['k], 'k], key: FunKey['k]) {
-        self.formation.function(&cx, fun, outer_params, outer_premises);
+    fn check_fun(self, &cx: Domain!['k], fun: Fun['k], outer_params: ArenaVec[Param['k], 'k], outer_premises: ArenaVec[Premise['k], 'k], key: FunKey['k], origin: FunctionOrigin) {
+        match origin {
+            Parsed => self.formation.function(&cx, fun, outer_params, outer_premises),
+            Lowered => self.formation.enter_function(&cx, fun, outer_premises),
+        };
         self.current.set(&cx, Option::Some.(fun));
         self.location.set(&cx, fun.name);
         let params = outer_params.concat(&cx, fun.params);
-        self.params.set(&cx, params);
-        let kinds: ArenaMap[Str['k], Kind, 'k] = ArenaMap::new(&cx);
-        var p = 0usize;
-        while p < params.len(&cx) {
-            kinds.insert(&cx, params.at(&cx, p).name, params.at(&cx, p).kind);
-            p = p + 1usize;
-        }
-        self.kinds.set(&cx, kinds);
-        self.premises.set(&cx, outer_premises.concat(&cx, fun.premises));
+        let function_scope = self.enter_function_scope(&cx, params);
+        self.premises.set(&cx, self.formation.premises.copy(&cx));
         self.home.set(&cx, Option::Some.(match fun.home {
             Some(m) => m,
             None => nowhere(&cx),
@@ -1012,12 +1058,10 @@ impl Checker['k] {
             l = l + 1usize;
         }
         self.roots.set(&cx, roots);
-        self.root_brand_cache.set(&cx, ArenaMap::new(&cx));
         self.edge_roots.set(&cx, Option::None);
         if roots.len(&cx) != fun.locals.len(&cx) {
             self.fail(&cx, "duplicate_place_root");
         }
-        let param_roots: ArenaSet[Str['k], 'k] = ArenaSet::new(&cx);
         var i = 0usize;
         while i < entry.params.len(&cx) {
             let binding = entry.params.at(&cx, i);
@@ -1025,43 +1069,27 @@ impl Checker['k] {
                 self.fail(&cx, "entry_parameter_disagrees_signature");
             }
             if binding.name.starts_with(&cx, Str::from_static(&cx, "&")) {
-                if roots.contains(&cx, binding.name) {
+                if roots.insert(&cx, binding.name, binding.ty).is_some() {
                     self.fail(&cx, "duplicate_place_root");
                 }
-                roots.insert(&cx, binding.name, binding.ty);
             }
             i = i + 1usize;
         }
-        var j = 0usize;
-        while j < entry.params.len(&cx) {
-            if entry.params.at(&cx, j).name.starts_with(&cx, Str::from_static(&cx, "&")) {
-                param_roots.insert(&cx, entry.params.at(&cx, j).name);
-            }
-            j = j + 1usize;
-        }
-        self.param_roots.set(&cx, param_roots);
         var k = 0usize;
         while k < fun.blocks.len(&cx) {
-            self.check_block(&cx, fun.blocks.at(&cx, k), k == 0usize);
+            self.check_block(&cx, fun.blocks.at(&cx, k), k == 0usize, function_scope);
             k = k + 1usize;
         }
     }
 
-    fn check_block(self, &cx: Domain!['k], block: Block['k], is_entry: bool) {
+    fn check_block(self, &cx: Domain!['k], block: Block['k], is_entry: bool, function_scope: ArenaMap[Str['k], Kind, 'k]) {
         let fun = self.fun(&cx);
         self.formation.pos.set(&cx, block.pos);
         self.location.set(&cx, f"{fun.name}/{block.label}".write(&cx, Buffer!::new()).save(&cx));
         self.label.set(&cx, block.label);
-        let brands = brand_params(&cx, self.params.copy(&cx));
-        var b = 0usize;
-        while b < block.brands.len(&cx) {
-            brands.insert(&cx, block.brands.at(&cx, b));
-            b = b + 1usize;
-        }
-        brands.insert(&cx, static_brand(&cx));
-        self.brands.set(&cx, brands);
-        self.env.set(&cx, ArenaMap::new(&cx));
-        self.used.set(&cx, ArenaSet::new(&cx));
+        self.scope.set(&cx, with_brands(&cx, function_scope, block.brands));
+        self.value_ids.clear(&cx);
+        self.values.clear(&cx);
         var p = 0usize;
         while p < block.params.len(&cx) {
             let binding = block.params.at(&cx, p);
@@ -1096,48 +1124,10 @@ impl Checker['k] {
                 state.known.insert(&cx, block.known.at(&cx, k).path, block.known.at(&cx, k).variant);
                 k = k + 1usize;
             }
-            state.empty.assign(&cx, self.empty_set(&cx, block));
+            state.empty.assign(&cx, self.empty_contract(&cx, block).paths);
             state.opened.clear(&cx);
             self.places.set(&cx, state);
-            let paths: ArenaSet[Str['k], 'k] = ArenaSet::new(&cx);
-            var o = 0usize;
-            while o < block.opened.len(&cx) {
-                paths.insert(&cx, block.opened.at(&cx, o).path);
-                o = o + 1usize;
-            }
-            if paths.len(&cx) != block.opened.len(&cx) {
-                self.fail(&cx, "duplicate_opened_view");
-            }
-            let sorted = block.opened.clone(&cx);
-            sorted.sort_by(&cx, |&cx, a, b| a.path.cmp(&cx, b.path));
-            let block_brands = texts_set(&cx, block.brands);
-            var s = 0usize;
-            while s < sorted.len(&cx) {
-                let path = sorted.at(&cx, s).path;
-                let view = sorted.at(&cx, s).brands;
-                let view_set = texts_set(&cx, view);
-                let ty = self.path_type(&cx, path);
-                let fits_package = match ty {
-                    Exists(binders, _body) => binders.len(&cx) == view.len(&cx) && view_set.len(&cx) == view.len(&cx),
-                    _ => false,
-                };
-                if !fits_package {
-                    self.fail(&cx, "opened_contract_requires_package_brands");
-                }
-                if !subset(&cx, view_set, block_brands) {
-                    self.fail(&cx, "opened_contract_requires_block_brands");
-                }
-                let others = self.places.copy(&cx).opened.values(&cx);
-                var x = 0usize;
-                while x < others.len(&cx) {
-                    if sets_meet(&cx, view_set, texts_set(&cx, others.at(&cx, x))) {
-                        self.fail(&cx, "opened_contract_brand_names_one_view");
-                    }
-                    x = x + 1usize;
-                }
-                self.places.copy(&cx).opened.insert(&cx, path, view);
-                s = s + 1usize;
-            }
+            self.enter_opened_views(&cx, block);
             var e = 0usize;
             while e < block.empty.len(&cx) {
                 let unit = self.path_type(&cx, block.empty.at(&cx, e));
@@ -1166,53 +1156,88 @@ impl Checker['k] {
         self.check_term(&cx, block.term, last);
     }
 
+    fn enter_opened_views(self, &cx: Domain!['k], block: Block['k]) {
+        if block.opened.is_empty(&cx) {
+            return;
+        }
+        let sorted = block.opened.clone(&cx);
+        sorted.sort_by(&cx, |&cx, a, b| a.path.cmp(&cx, b.path));
+        var i = 1usize;
+        while i < sorted.len(&cx) {
+            if sorted.at(&cx, i - 1usize).path.eq(&cx, sorted.at(&cx, i).path) {
+                self.fail(&cx, "duplicate_opened_view");
+            }
+            i = i + 1usize;
+        }
+        let block_brands = texts_set(&cx, block.brands);
+        let claimed: ArenaSet[Str['k], 'k] = ArenaSet::new(&cx);
+        var s = 0usize;
+        while s < sorted.len(&cx) {
+            let path = sorted.at(&cx, s).path;
+            let view = sorted.at(&cx, s).brands;
+            let view_set = texts_set(&cx, view);
+            let ty = self.path_type(&cx, path);
+            let fits_package = match ty {
+                Exists(binders, _body) => binders.len(&cx) == view.len(&cx) && view_set.len(&cx) == view.len(&cx),
+                _ => false,
+            };
+            if !fits_package {
+                self.fail(&cx, "opened_contract_requires_package_brands");
+            }
+            if !view_set.is_subset(&cx, block_brands) {
+                self.fail(&cx, "opened_contract_requires_block_brands");
+            }
+            if !view.all(&cx, |&cx, b: Str['k]| claimed.insert(&cx, b)) {
+                self.fail(&cx, "opened_contract_brand_names_one_view");
+            }
+            self.places.copy(&cx).opened.insert(&cx, path, view);
+            s = s + 1usize;
+        }
+    }
+
     // -------------------------------------------------------------- SSA values --
 
     fn bind(self, &cx: Domain!['k], name: Str['k], ty: Type['k]) {
-        self.formation.fits(&cx, ty, Kind::Any, self.scope(&cx));
-        let env = self.env.copy(&cx);
-        if env.contains(&cx, name) {
+        self.formation.fits(&cx, ty, Kind::Any, self.scope.copy(&cx));
+        if self.value_ids.insert(&cx, name, self.values.len(&cx)).is_some() {
             self.fail(&cx, "defined_twice");
         }
-        env.insert(&cx, name, ty);
+        self.values.push(&cx, SsaValue.{ ty, used_on: Option::None });
         self.record.copy(&cx).insert(&cx, (self.label.copy(&cx), name), ty);
     }
 
+    fn read_value(self, &cx: Domain!['k], name: Str['k], successor: usize, consume: bool) -> Type['k] {
+        let id = match self.value_ids.get(&cx, name) {
+            Some(id) => id,
+            None => self.fail(&cx, "defined"),
+        };
+        let value = self.values.at(&cx, id);
+        if value.is_used(successor) {
+            self.fail(&cx, "was_already_consumed");
+        }
+        if consume {
+            self.values.set(&cx, id, SsaValue.{ ty: value.ty, used_on: Option::Some.(successor) });
+        }
+        value.ty
+    }
+
     fn use_value(self, &cx: Domain!['k], name: Str['k]) -> Type['k] {
-        let ty = self.peek(&cx, name);
-        self.used.copy(&cx).insert(&cx, name);
-        ty
+        self.read_value(&cx, name, 0usize, true)
     }
 
     fn peek(self, &cx: Domain!['k], name: Str['k]) -> Type['k] {
-        let ty = match self.env.copy(&cx).get(&cx, name) {
-            Some(ty) => ty,
-            None => self.fail(&cx, "defined"),
-        };
-        if self.used.copy(&cx).contains(&cx, name) {
-            self.fail(&cx, "was_already_consumed");
-        }
-        ty
+        self.read_value(&cx, name, 0usize, false)
     }
 
-    // `free_brands` of a root's type, computed once per function.
-    fn root_brands(self, &cx: Domain!['k], root: Str['k]) -> ArenaSet[Str['k], 'k] {
-        let cache = self.root_brand_cache.copy(&cx);
-        match cache.get(&cx, root) {
-            Some(brands) => brands,
-            None => {
-                let brands = free_brands(&cx, self.roots.copy(&cx).at(&cx, root));
-                cache.insert(&cx, root, brands);
-                brands
-            },
+    // The empty paths `block` declares, made once per function; a block that declares none shares
+    // one empty set.
+    fn empty_contract(self, &cx: Domain!['k], block: Block['k]) -> EmptyContract['k] {
+        if block.empty.is_empty(&cx) {
+            return EmptyContract.{ paths: self.no_empty_paths, resolved: true };
         }
-    }
-
-    // The empty paths `block` declares, as a set, made once per function.
-    fn empty_set(self, &cx: Domain!['k], block: Block['k]) -> ArenaSet[Str['k], 'k] {
         let cache = self.path_facts(&cx).empty_sets;
         match cache.get(&cx, block.label) {
-            Some(set) => set,
+            Some(contract) => contract,
             None => {
                 let n = cache.len(&cx);
                 let set = match self.set_pool.get(&cx, n) {
@@ -1225,8 +1250,9 @@ impl Checker['k] {
                 };
                 set.clear(&cx);
                 set.insert_all(&cx, block.empty);
-                cache.insert(&cx, block.label, set);
-                set
+                let contract = EmptyContract.{ paths: set, resolved: false };
+                cache.insert(&cx, block.label, contract);
+                contract
             },
         }
     }
@@ -1252,18 +1278,13 @@ impl Checker['k] {
         }
     }
 
-    fn accounted(self, &cx: Domain!['k], used: ArenaSet[Str['k], 'k]) {
-        let env = self.env.copy(&cx);
+    fn accounted(self, &cx: Domain!['k], successor: usize) {
         var i = 0usize;
-        while i < env.positions(&cx) {
-            match env.key_at(&cx, i) {
-                Some(name) => {
-                    if !used.contains(&cx, name) && !self.copy_type(&cx, env.at(&cx, name)) {
-                        self.fail(&cx, "linear_value_never_consumed");
-                    }
-                },
-                None => (),
-            };
+        while i < self.values.len(&cx) {
+            let value = self.values.at(&cx, i);
+            if !value.is_used(successor) && !self.copy_type(&cx, value.ty) {
+                self.fail(&cx, "linear_value_never_consumed");
+            }
             i = i + 1usize;
         }
     }
@@ -1309,8 +1330,7 @@ impl Checker['k] {
         }
         facts.stored.clear(&cx);
         facts.empty_sets.clear(&cx);
-        facts.linear_empty.clear(&cx);
-        let fresh = PathFacts.{ roots, kinds, stored: facts.stored, empty_sets: facts.empty_sets, linear_empty: facts.linear_empty };
+        let fresh = PathFacts.{ roots, kinds, stored: facts.stored, empty_sets: facts.empty_sets };
         self.facts.set(&cx, fresh);
         fresh
     }
@@ -1361,43 +1381,9 @@ impl Checker['k] {
 
     // `discardable(path, place_storage(path))`, stopping at the first failure of either.
     fn storage_discardable(self, &cx: Domain!['k], path: Str['k]) -> Result[bool, Str['static]] {
-        let (result, always) = self.empty_discardable(&cx, path);
-        result
-    }
-
-    // `storage_discardable`, and whether `path` holds no linear contents in every state of the
-    // function while no view is open: no state decides its stored type, and that type is Copy.
-    fn empty_discardable(self, &cx: Domain!['k], path: Str['k]) -> (Result[bool, Str['static]], bool) {
-        match self.storage_fact(&cx, path) {
-            Ok(found) => {
-                let copy = self.storage_copy(&cx, path, found);
-                (self.discardable_with(&cx, path, found.ty, copy), copy && found.kept)
-            },
-            Err(message) => (Result::Err.(message), false),
-        }
-    }
-
-    // The paths `block` declares empty that an edge into it must show hold no linear contents, in
-    // order: all of them, or, once an edge has found them while no view was open, those of them
-    // `empty_discardable` does not answer for every state. The others answer `Ok.(true)` with
-    // nothing found or drawn, so leaving them out changes nothing.
-    fn empty_to_check(self, &cx: Domain!['k], block: Block['k]) -> ArenaVec[Str['k], 'k] {
-        if self.places.copy(&cx).opened.is_empty(&cx) {
-            match self.path_facts(&cx).linear_empty.get(&cx, block.label) {
-                Some(paths) => return paths,
-                None => (),
-            };
-        }
-        block.empty
-    }
-
-    // Records what one edge into `block` found of the paths `empty_to_check` gave: `rest` are
-    // those not answered for every state. Kept only when the edge checked all of `block.empty`
-    // with no view open.
-    fn checked_empty(self, &cx: Domain!['k], block: Block['k], checked: ArenaVec[Str['k], 'k], rest: ArenaVec[Str['k], 'k]) {
-        if checked.address() == block.empty.address() && rest.address() != checked.address() && self.places.copy(&cx).opened.is_empty(&cx) {
-            self.path_facts(&cx).linear_empty.insert(&cx, block.label, rest);
-        }
+        let found = self.storage_fact(&cx, path)?;
+        let copy = self.storage_copy(&cx, path, found);
+        self.discardable_with(&cx, path, found.ty, copy)
     }
 
     // The stored type of `path`, and whether the place state decided it: a known variant chose an
@@ -1730,7 +1716,7 @@ impl Checker['k] {
             chosen.push(&cx, sub.at(&cx, inst.params.at(&cx, c).name));
             c = c + 1usize;
         }
-        self.formation.arguments(&cx, inst.params, chosen, self.scope(&cx));
+        self.formation.arguments(&cx, inst.params, chosen, self.scope.copy(&cx));
         self.formation.premises.set(&cx, saved_premises);
         self.formation.home.set(&cx, saved_home);
         var q = 0usize;
@@ -1758,7 +1744,7 @@ impl Checker['k] {
             if C::same_kind(p.kind, Kind::Brand) {
                 let unit = match t {
                     Skolem(label) => {
-                        if !self.brands.copy(&cx).contains(&cx, label) {
+                        if !self.brand_in_scope(&cx, label) {
                             self.fail(&cx, "brand_argument_scope");
                         }
                     },
@@ -2386,7 +2372,7 @@ impl Checker['k] {
         while i < instr.tys.len(&cx) {
             let unit = match instr.tys.at(&cx, i) {
                 Skolem(label) => {
-                    if !self.brands.copy(&cx).contains(&cx, label) {
+                    if !self.brand_in_scope(&cx, label) {
                         self.fail(&cx, "pack_witness_scope");
                     }
                     witnesses.push(&cx, label);
@@ -2433,13 +2419,15 @@ impl Checker['k] {
 
     fn op_open(self, &cx: Domain!['k], instr: Instr['k]) -> Type['k] {
         let arg = instr.args.at(&cx, 0usize);
-        let brands = self.brands.copy(&cx);
+        let scope = self.scope.copy(&cx).clone(&cx);
+        self.scope.set(&cx, scope);
         var i = 0usize;
         while i < instr.binders.len(&cx) {
-            if brands.contains(&cx, instr.binders.at(&cx, i)) {
+            let binder = instr.binders.at(&cx, i);
+            if self.brand_in_scope(&cx, binder) {
                 self.fail(&cx, "open_binder_already_scope");
             }
-            brands.insert(&cx, instr.binders.at(&cx, i));
+            scope.insert(&cx, binder, Kind::Brand);
             i = i + 1usize;
         }
         if arg.starts_with(&cx, Str::from_static(&cx, "&")) {
@@ -2641,6 +2629,10 @@ impl Checker['k] {
             j = j + 1usize;
         }
         self.kinds.set(&cx, kinds);
+        let saved_scope = self.scope.copy(&cx);
+        if !saved_scope.contains(&cx, name) {
+            self.scope.set(&cx, with_kind(&cx, saved_scope, name, Kind::Any));
+        }
         let chosen: ArenaVec[Type['k], 'k] = ArenaVec::new(&cx);
         var c = 0usize;
         while c < mapper.params.len(&cx) {
@@ -2648,6 +2640,7 @@ impl Checker['k] {
             c = c + 1usize;
         }
         let unit = self.instantiate(&cx, mapper.params, mapper.premises, chosen);
+        self.scope.set(&cx, saved_scope);
         self.kinds.set(&cx, saved_kinds);
         let binding: ArenaMap[Str['k], Type['k], 'k] = ArenaMap::new(&cx);
         binding.insert(&cx, f.binder, rigid);
@@ -2685,23 +2678,27 @@ impl Checker['k] {
                 if !fits(&cx, got, fun.ret) {
                     self.fail(&cx, "returning_function");
                 }
-                self.accounted(&cx, self.used.copy(&cx));
-                let roots = self.roots.copy(&cx);
-                let param_roots = self.param_roots.copy(&cx);
+                self.accounted(&cx, 0usize);
                 let places = self.places.copy(&cx);
-                let names = roots.keys(&cx);
                 var i = 0usize;
-                while i < names.len(&cx) {
-                    let root = names.at(&cx, i);
-                    let ty = roots.at(&cx, root);
-                    if param_roots.contains(&cx, root) && places.opened.any(&cx, |&cx, q: Str['k], value| prefix(&cx, root, q)) {
-                        self.fail(&cx, "place_parameter_sealed");
-                    }
-                    if param_roots.contains(&cx, root) && !places.full(&cx, root) {
-                        self.fail(&cx, "place_parameter_restored");
-                    }
-                    if !param_roots.contains(&cx, root) && !self.no_linear(&cx, root, ty) {
+                while i < fun.locals.len(&cx) {
+                    let local = fun.locals.at(&cx, i);
+                    if !self.no_linear(&cx, local.name, local.ty) {
                         self.fail(&cx, "local_place_still_holds");
+                    }
+                    i = i + 1usize;
+                }
+                let params = fun.blocks.at(&cx, 0usize).params;
+                i = 0usize;
+                while i < params.len(&cx) {
+                    let root = params.at(&cx, i).name;
+                    if root.starts_with(&cx, Str::from_static(&cx, "&")) {
+                        if places.opened.any(&cx, |&cx, q: Str['k], value| prefix(&cx, root, q)) {
+                            self.fail(&cx, "place_parameter_sealed");
+                        }
+                        if !places.full(&cx, root) {
+                            self.fail(&cx, "place_parameter_restored");
+                        }
                     }
                     i = i + 1usize;
                 }
@@ -2719,20 +2716,18 @@ impl Checker['k] {
                     self.fail(&cx, "result_mentions_local_brands");
                 }
             },
-            Jmp(edge, _pos) => self.edge(&cx, edge, self.used.copy(&cx), self.places.copy(&cx), Option::None),
+            Jmp(edge, _pos) => self.edge(&cx, edge, 1usize, self.places.copy(&cx), Option::None),
             Jnz(cond, then, other, _pos) => {
                 if !C::same(&cx, self.use_value(&cx, cond), C::bool_type(&cx)) {
                     self.fail(&cx, "jnz_bool_condition");
                 }
-                // An edge reads the place state and changes nothing in it, so both share it.
-                let used = self.used.copy(&cx).clone(&cx);
-                self.edge(&cx, then, used.clone(&cx), self.places.copy(&cx), Option::None);
-                self.edge(&cx, other, used.clone(&cx), self.places.copy(&cx), Option::None);
+                self.edge(&cx, then, 1usize, self.places.copy(&cx), Option::None);
+                self.edge(&cx, other, 2usize, self.places.copy(&cx), Option::None);
             },
             Switch(scrutinee, ty, arms, _pos) => self.switch(&cx, scrutinee, ty, arms),
             Unreachable(_pos) => {
                 let ok = match last {
-                    Some(instr) => instr.lhs.len(&cx) == 1usize && is_never(self.env.copy(&cx).at(&cx, instr.lhs.at(&cx, 0usize))),
+                    Some(instr) => instr.lhs.len(&cx) == 1usize && is_never(self.peek(&cx, instr.lhs.at(&cx, 0usize))),
                     None => false,
                 };
                 if !ok {
@@ -2742,7 +2737,7 @@ impl Checker['k] {
         };
     }
 
-    fn edge(self, &cx: Domain!['k], edge: Edge['k], used: ArenaSet[Str['k], 'k], places: Places['k], payload: Option[Type['k]]) {
+    fn edge(self, &cx: Domain!['k], edge: Edge['k], successor: usize, places: Places['k], payload: Option[Type['k]]) {
         let fun = self.fun(&cx);
         let target = match self.blocks.copy(&cx).get(&cx, edge.target) {
             Some(b) => b,
@@ -2760,7 +2755,7 @@ impl Checker['k] {
             let t = edge.tys.at(&cx, i);
             let unit = match t {
                 Skolem(label) => {
-                    if !self.brands.copy(&cx).contains(&cx, label) {
+                    if !self.brand_in_scope(&cx, label) {
                         self.fail(&cx, "brand_argument_scope");
                     }
                 },
@@ -2773,8 +2768,6 @@ impl Checker['k] {
         if edge.args.len(&cx) + offset != target.params.len(&cx) {
             self.fail(&cx, "takes_arguments_got");
         }
-        let saved = self.used.copy(&cx);
-        self.used.set(&cx, used);
         var k = 0usize;
         while k < target.params.len(&cx) {
             let got = if k < offset {
@@ -2783,26 +2776,25 @@ impl Checker['k] {
                     None => C::unit(&cx),
                 }
             } else {
-                self.use_value(&cx, edge.args.at(&cx, k - offset))
+                self.read_value(&cx, edge.args.at(&cx, k - offset), successor, true)
             };
             if !fits(&cx, got, subst(&cx, target.params.at(&cx, k).ty, sub, self.counter)) {
                 self.fail(&cx, "argument_expected");
             }
             k = k + 1usize;
         }
-        self.accounted(&cx, self.used.copy(&cx));
-        self.used.set(&cx, saved);
-        self.entails(&cx, places, target, sub);
+        self.accounted(&cx, successor);
+        let contract = self.empty_contract(&cx, target);
+        self.entails(&cx, places, target, sub, contract);
         // The brands kept across the edge: the function's own, `static`, and the target's brands
         // the edge passes themselves. Only a local whose brands are not all the function's own can
         // name one that is not kept.
         let (local_roots, global) = self.branded_locals(&cx);
-        let target_empty = self.empty_set(&cx, target);
         var r = 0usize;
         while r < local_roots.len(&cx) {
-            let root = local_roots.at(&cx, r);
-            if !ancestor_in(&cx, target_empty, root) {
-                if !self.root_brands(&cx, root).all(&cx, |&cx, b: Str['k]| kept_brand(&cx, global, sub, b)) {
+            let local = local_roots.at(&cx, r);
+            if !ancestor_in(&cx, contract.paths, local.name) {
+                if !local.brands.all(&cx, |&cx, b: Str['k]| kept_brand(&cx, global, sub, b)) {
                     self.fail(&cx, "full_local_block_brand");
                 }
             }
@@ -2810,112 +2802,64 @@ impl Checker['k] {
         }
     }
 
-    // The function's local roots (in the order of `roots`, but for its place parameters) whose
-    // free brands are not all among its brand parameters and `static`, and the set of those: made
-    // once per function.
-    fn branded_locals(self, &cx: Domain!['k]) -> (ArenaVec[Str['k], 'k], ArenaSet[Str['k], 'k]) {
+    // In declaration order, the locals with brands beyond the function's own, and its own brands.
+    fn branded_locals(self, &cx: Domain!['k]) -> (ArenaVec[BrandedLocal['k], 'k], ArenaSet[Str['k], 'k]) {
         match self.edge_roots.copy(&cx) {
             Some(known) => return known,
             None => (),
         };
         let global = brand_params(&cx, self.params.copy(&cx));
         global.insert(&cx, static_brand(&cx));
-        let roots = self.roots.copy(&cx);
-        let param_roots = self.param_roots.copy(&cx);
-        let locals: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
+        let bindings = self.fun(&cx).locals;
+        let locals: ArenaVec[BrandedLocal['k], 'k] = ArenaVec::new(&cx);
         var r = 0usize;
-        while r < roots.positions(&cx) {
-            match roots.key_at(&cx, r) {
-                Some(root) => if !param_roots.contains(&cx, root) && !subset(&cx, self.root_brands(&cx, root), global) {
-                    locals.push(&cx, root);
-                },
-                None => (),
-            };
+        while r < bindings.len(&cx) {
+            let binding = bindings.at(&cx, r);
+            let brands = free_brands(&cx, binding.ty);
+            if !brands.is_subset(&cx, global) {
+                locals.push(&cx, BrandedLocal.{ name: binding.name, brands });
+            }
             r = r + 1usize;
         }
         self.edge_roots.set(&cx, Option::Some.((locals, global)));
         (locals, global)
     }
 
-    fn entails(self, &cx: Domain!['k], places: Places['k], target: Block['k], sub: ArenaMap[Str['k], Type['k], 'k]) {
+    fn entails(self, &cx: Domain!['k], places: Places['k], target: Block['k], sub: ArenaMap[Str['k], Type['k], 'k], contract: EmptyContract['k]) {
         let saved = self.places.copy(&cx);
         self.places.set(&cx, places);
-        let wanted: ArenaMap[Str['k], ArenaVec[Str['k], 'k], 'k] = ArenaMap::new(&cx);
-        var o = 0usize;
-        while o < target.opened.len(&cx) {
-            let brands = target.opened.at(&cx, o).brands;
-            let labels: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
-            var b = 0usize;
-            while b < brands.len(&cx) {
-                let label = match sub.get(&cx, brands.at(&cx, b)) {
-                    Some(t) => match t {
-                        Skolem(l) => l,
-                        _ => brands.at(&cx, b),
-                    },
-                    None => brands.at(&cx, b),
-                };
-                labels.push(&cx, label);
-                b = b + 1usize;
-            }
-            wanted.insert(&cx, target.opened.at(&cx, o).path, labels);
-            o = o + 1usize;
-        }
-        if !opened_same(&cx, places.opened, wanted) {
+        if !opened_match(&cx, places.opened, target.opened, sub) {
             self.fail(&cx, "opened_view_contract");
         }
-        let target_empty = self.empty_set(&cx, target);
+        let target_empty = contract.paths;
         // Most often the edge leaves empty exactly what the target assumes: then each path covers
         // itself, and no path is newly empty.
-        let exact = places.empty.len(&cx) == target_empty.len(&cx) && places.empty.all(&cx, |&cx, z: Str['k]| target_empty.contains(&cx, z));
-        if !exact && places.empty.any(&cx, |&cx, z: Str['k]| !ancestor_in(&cx, target_empty, z)) {
-            self.fail(&cx, "empty_assumes_full");
-        }
-        let fresh: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
-        var f = 0usize;
-        while !exact && f < target.empty.len(&cx) {
-            if !places.covered(&cx, target.empty.at(&cx, f)) {
-                fresh.push(&cx, target.empty.at(&cx, f));
+        let exact = places.empty.len(&cx) == target_empty.len(&cx) && places.empty.is_subset(&cx, target_empty);
+        if !exact {
+            if places.empty.any(&cx, |&cx, z: Str['k]| !ancestor_in(&cx, target_empty, z)) {
+                self.fail(&cx, "empty_assumes_full");
             }
-            f = f + 1usize;
+            self.check_newly_empty(&cx, places, target.empty);
         }
-        let roots: ArenaSet[Str['k], 'k] = ArenaSet::new(&cx);
-        var s = 0usize;
-        while s < fresh.len(&cx) {
-            roots.insert(&cx, segments(&cx, fresh.at(&cx, s)).at(&cx, 0usize));
-            s = s + 1usize;
-        }
-        let root_names = roots.keys(&cx);
-        var r = 0usize;
-        while r < root_names.len(&cx) {
-            let own: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
-            var q = 0usize;
-            while q < fresh.len(&cx) {
-                if segments(&cx, fresh.at(&cx, q)).at(&cx, 0usize).eq(&cx, root_names.at(&cx, r)) {
-                    own.push(&cx, fresh.at(&cx, q));
+        let same_closed = exact && places.opened.is_empty(&cx);
+        if !(same_closed && contract.resolved) {
+            let facts = self.path_facts(&cx);
+            var resolved = same_closed;
+            var e = 0usize;
+            while e < target.empty.len(&cx) {
+                let path = target.empty.at(&cx, e);
+                if !facts.proves_discardable(&cx, places, path, exact) {
+                    resolved = false;
+                    if !self.got(&cx, self.storage_discardable(&cx, path)) {
+                        self.fail(&cx, "holds_linear_contents_assumes");
+                    }
                 }
-                q = q + 1usize;
+                e = e + 1usize;
             }
-            // One newly empty path per root, or leaves of one full product tree.
-            if own.len(&cx) > 1usize && !(self.product_branches(&cx, own) && places.full(&cx, self.common_parent(&cx, own))) {
-                self.fail(&cx, "edge_empties_one_path_or_product_leaves");
+            if resolved {
+                facts.empty_sets.insert(&cx, target.label, EmptyContract.{ paths: target_empty, resolved: true });
             }
-            r = r + 1usize;
         }
-        let checked = self.empty_to_check(&cx, target);
-        let whole = checked.address() == target.empty.address();
-        let rest: ArenaVec[Str['k], 'k] = if whole { ArenaVec::new(&cx) } else { checked };
-        var e = 0usize;
-        while e < checked.len(&cx) {
-            let (result, always) = self.empty_discardable(&cx, checked.at(&cx, e));
-            if !self.got(&cx, result) {
-                self.fail(&cx, "holds_linear_contents_assumes");
-            }
-            if whole && !always {
-                rest.push(&cx, checked.at(&cx, e));
-            }
-            e = e + 1usize;
-        }
-        self.checked_empty(&cx, target, checked, rest);
         var k = 0usize;
         while k < target.known.len(&cx) {
             let known = target.known.at(&cx, k);
@@ -2929,6 +2873,28 @@ impl Checker['k] {
             k = k + 1usize;
         }
         self.places.set(&cx, saved);
+    }
+
+    // Newly empty paths at one root must be a single path or leaves of a full product.
+    fn check_newly_empty(self, &cx: Domain!['k], places: Places['k], empty: ArenaVec[Str['k], 'k]) {
+        if empty.len(&cx) < 2usize {
+            return;
+        }
+        let groups: ArenaMap[Str['k], ArenaVec[Str['k], 'k], 'k] = ArenaMap::new(&cx);
+        empty.each(&cx, |&cx, path: Str['k]| {
+            if !places.covered(&cx, path) {
+                let root = root_of(&cx, path);
+                match groups.get(&cx, root) {
+                    Some(paths) => paths.push(&cx, path),
+                    None => { groups.insert(&cx, root, ArenaVec::one(&cx, path)); },
+                };
+            }
+        });
+        groups.each(&cx, |&cx, _root, paths| {
+            if paths.len(&cx) > 1usize && !(self.product_branches(&cx, paths) && places.full(&cx, self.common_parent(&cx, paths))) {
+                self.fail(&cx, "edge_empties_one_path_or_product_leaves");
+            }
+        });
     }
 
     // An enum switch: one arm per variant, each variant once. A value switch passes each arm its
@@ -2964,10 +2930,9 @@ impl Checker['k] {
             arm_names.insert(&cx, arms.at(&cx, a).variant);
             a = a + 1usize;
         }
-        if arm_names.len(&cx) != arms.len(&cx) || !subset(&cx, arm_names, names) || !subset(&cx, names, arm_names) {
+        if arm_names.len(&cx) != arms.len(&cx) || !arm_names.is_subset(&cx, names) || !names.is_subset(&cx, arm_names) {
             self.fail(&cx, "switch_arm_per_variant");
         }
-        let used = self.used.copy(&cx).clone(&cx);
         var i = 0usize;
         while i < arms.len(&cx) {
             let arm = arms.at(&cx, i);
@@ -2982,7 +2947,7 @@ impl Checker['k] {
             } else {
                 payload = member(&cx, variants, arm.variant);
             }
-            self.edge(&cx, arm.edge, used.clone(&cx), places, payload);
+            self.edge(&cx, arm.edge, i + 1usize, places, payload);
             i = i + 1usize;
         }
     }
@@ -3050,9 +3015,9 @@ fn common_depth(&cx: Domain!['k], parts: ArenaVec[ArenaVec[Str['k], 'k], 'k]) ->
 }
 
 forall 'k.
-fn check_program(&cx: Domain!['k], program: Program['k], counter: Fresh['k]) -> Checker['k] {
+fn check_program(&cx: Domain!['k], program: Program['k], counter: Fresh['k], origin: FunctionOrigin) -> Checker['k] {
     let checker = Checker::new(&cx, program, counter);
-    checker.check(&cx);
+    checker.check(&cx, origin);
     checker
 }
 
@@ -3066,10 +3031,13 @@ fn matching_instance(&cx: Domain!['k], program: Program['k], counter: Fresh['k],
             return Option::None;
         },
     };
+    if !args.all(&cx, |&cx, t: Type['k]| ground(&cx, t)) {
+        return Option::None;
+    }
     var i = 0usize;
     while i < insts.len(&cx) {
         let inst = insts.at(&cx, i);
-        match match_head(&cx, inst.params, inst.head, args, true, counter) {
+        match match_ground_head(&cx, inst.params, inst.head, args, true, counter) {
             Some(sub) => {
                 return Option::Some.((i, inst, sub));
             },
@@ -3078,39 +3046,4 @@ fn matching_instance(&cx: Domain!['k], program: Program['k], counter: Fresh['k],
         i = i + 1usize;
     }
     Option::None
-}
-
-// What the checker recorded for the backend, `Checker.typed`, copied from the arena of `from` into
-// that of `to`, in the same order.
-forall 'a, 'b.
-fn copy_typed(&from: Domain!['a], &to: Domain!['b], typed: ArenaMap[FunKey['a], ArenaMap[(Str['a], Str['a]), Type['a], 'a], 'a]) -> ArenaMap[FunKey['b], ArenaMap[(Str['b], Str['b]), Type['b], 'b], 'b] {
-    let out: ArenaMap[FunKey['b], ArenaMap[(Str['b], Str['b]), Type['b], 'b], 'b] = ArenaMap::new(&to);
-    var i = 0usize;
-    while i < typed.positions(&from) {
-        match typed.key_at(&from, i) {
-            Some(key) => {
-                let key_b = match key {
-                    Function(name) => FunKey::Function.(copy_str(name, &from, &to)),
-                    Method(trait_name, index, name) => FunKey::Method.(copy_str(trait_name, &from, &to), index, copy_str(name, &from, &to)),
-                };
-                let values = typed.at(&from, key);
-                let values_b: ArenaMap[(Str['b], Str['b]), Type['b], 'b] = ArenaMap::new(&to);
-                var k = 0usize;
-                while k < values.positions(&from) {
-                    match values.key_at(&from, k) {
-                        Some(at) => {
-                            let (label, name) = at;
-                            values_b.insert(&to, (copy_str(label, &from, &to), copy_str(name, &from, &to)), copy_type(&from, &to, values.at(&from, at)));
-                        },
-                        None => (),
-                    };
-                    k = k + 1usize;
-                }
-                out.insert(&to, key_b, values_b);
-            },
-            None => (),
-        };
-        i = i + 1usize;
-    }
-    out
 }

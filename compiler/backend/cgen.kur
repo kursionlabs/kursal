@@ -2066,35 +2066,42 @@ impl Backend['k] {
             self.roots.set(&cx, roots);
         }
         self.typed.set(&cx, typed);
-        // (block label, SSA name, type, C variable) of each value that is no entry parameter
-        let values: ArenaVec[(Str['k], Str['k], Type['k], Str['k]), 'k] = ArenaVec::new(&cx);
-        let keys = typed.keys(&cx);
-        var v = 0usize;
-        while v < keys.len(&cx) {
-            let (label, name) = keys.at(&cx, v);
-            let ty = typed.at(&cx, keys.at(&cx, v));
-            var parameter = false;
-            if label.eq(&cx, entry.label) {
-                var q = 0usize;
-                while q < entry.params.len(&cx) {
-                    if entry.params.at(&cx, q).name.eq(&cx, name) {
-                        parameter = true;
+        let specialized = !sub.is_empty(&cx);
+        typed.each(&cx, |&cx, key: (Str['k], Str['k]), ty: Type['k]| {
+            let needed = plan.variables.contains(&cx, key);
+            let (label, name) = key;
+            if (needed || specialized) && !(label.eq(&cx, entry.label) && params.contains(&cx, name)) {
+                if needed {
+                    let ctype = self.record_value_ctype(&cx, label, name, ty);
+                    if !ctype.is(&cx, "void") {
+                        let cname = self.cname(&cx, label, name);
+                        decls.push(&cx, f"{ctype} {cname};".write(&cx, Buffer!::new()).save(&cx));
                     }
-                    q = q + 1usize;
+                } else {
+                    // Validate generic value types even when their definitions are left out of C.
+                    let checked = self.substitute_type(&cx, ty);
                 }
             }
-            if !parameter && !self.record_erasure(&cx, label, name, ty) {
-                values.push(&cx, (label, name, ty, self.cname(&cx, label, name)));
-            }
-            v = v + 1usize;
+        });
+        let aliases = self.aliases.copy(&cx);
+        var f = 0usize;
+        while f < plan.param_origins.positions(&cx) {
+            match plan.param_origins.key_at(&cx, f) {
+                Some(key) => {
+                    let (label, name) = plan.param_origins.at(&cx, key);
+                    let var_name = self.cname(&cx, label, name);
+                    let value = if label.eq(&cx, entry.label) && deref.contains(&cx, name) {
+                        Buffer!::new().put("(*").write(&cx, var_name).put(")").save(&cx)
+                    } else {
+                        var_name
+                    };
+                    aliases.insert(&cx, key, value);
+                },
+                None => (),
+            };
+            f = f + 1usize;
         }
-        let blocks: ArenaMap[Str['k], Block['k], 'k] = ArenaMap::new(&cx);
-        var k = 0usize;
-        while k < fun.blocks.len(&cx) {
-            blocks.insert(&cx, fun.blocks.at(&cx, k).label, fun.blocks.at(&cx, k));
-            k = k + 1usize;
-        }
-        self.blocks.set(&cx, blocks);
+        self.blocks.set(&cx, plan.blocks);
         self.returning.set(&cx, false);
         self.out_paths.set(&cx, ArenaVec::new(&cx));
         // The lines of the body, after the declarations that emitting them may add to.
@@ -2127,14 +2134,6 @@ impl Backend['k] {
                 self.term(&cx, &lines, block.term);
             }
             e = e + 1usize;
-        }
-        var w = 0usize;
-        while w < values.len(&cx) {
-            let (label, name, ty, cname) = values.at(&cx, w);
-            if plan.variables.contains(&cx, (label, name)) {
-                decls.push(&cx, Buffer!::new().write(&cx, self.c(&cx, self.substitute_type(&cx, ty))).put(" ").write(&cx, cname).put(";").save(&cx));
-            }
-            w = w + 1usize;
         }
         decls.append(&cx, temps);
         var body = Buffer!::new().put(" {\n");
@@ -2617,34 +2616,35 @@ impl Backend['k] {
     }
 
     fn substitute_type(self, &cx: Domain!['k], ty: Type['k]) -> Type['k] {
+        let sub = self.sub.copy(&cx);
+        if sub.is_empty(&cx) {
+            return ty;
+        }
         let done = self.substituted.copy(&cx);
         match done.get(&cx, ty) {
             Some(known) => return known,
             None => (),
         }
         let before = self.counter.next.copy(&cx);
-        let sub = self.sub.copy(&cx);
         let out = subst(&cx, ty, sub, self.counter);
         if self.counter.next.copy(&cx) == before {
             done.insert(&cx, ty, out);
         }
         // A type that mentions a parameter is checked again here, at each instantiation, for a size
         // below 2^64, as formation checks a closed one.
-        if !sub.is_empty(&cx) {
-            let parts = walk(&cx, out);
-            var i = 0usize;
-            while i < parts.len(&cx) {
-                let part = parts.at(&cx, i);
-                if self.types.closed(&cx, part) && self.types.layout(&cx, part).is_none() {
-                    let owner = match self.fun.copy(&cx) {
-                        Some(fun) => fun.name,
-                        None => Str::from_static(&cx, ""),
-                    };
-                    fail_text(&cx, Buffer!::new().put("backend: ").write(&cx, show(&cx, part))
-                        .put(" is too large: its size is not below 2^64 bytes, in a specialization of ").write(&cx, owner).save(&cx));
-                }
-                i = i + 1usize;
+        let parts = walk(&cx, out);
+        var i = 0usize;
+        while i < parts.len(&cx) {
+            let part = parts.at(&cx, i);
+            if self.types.oversized(&cx, part) {
+                let owner = match self.fun.copy(&cx) {
+                    Some(fun) => fun.name,
+                    None => Str::from_static(&cx, ""),
+                };
+                fail_text(&cx, Buffer!::new().put("backend: ").write(&cx, show(&cx, part))
+                    .put(" is too large: its size is not below 2^64 bytes, in a specialization of ").write(&cx, owner).save(&cx));
             }
+            i = i + 1usize;
         }
         out
     }
@@ -2711,18 +2711,21 @@ impl Backend['k] {
     // The C variable an assignment from `name` reads: for a value lying in a place under a place
     // parameter, the parameter's pointer, which a self tail call may assign.
     fn value_base(self, &cx: Domain!['k], name: Str['k]) -> Str['k] {
-        match self.the_plan(&cx).resident.get(&cx, (self.label.copy(&cx), name)) {
+        let plan = self.the_plan(&cx);
+        let label = self.label.copy(&cx);
+        match plan.resident.get(&cx, (label, name)) {
             Some(path) => {
                 let r = root(&cx, path);
                 if path.starts_with(&cx, Str::from_static(&cx, "%")) {
-                    self.cname(&cx, self.label.copy(&cx), r)
+                    let (block, param) = plan.param_origins.get_or(&cx, (label, r), (label, r));
+                    self.cname(&cx, block, param)
                 } else if self.param_index(&cx, r).is_some() {
                     self.cname(&cx, self.fun_entry_label(&cx), r)
                 } else {
                     self.place_c.copy(&cx).at(&cx, r)
                 }
             },
-            None => match self.the_plan(&cx).arrived.get(&cx, (self.label.copy(&cx), name)) {
+            None => match plan.arrived.get(&cx, (label, name)) {
                 Some(found) => {
                     let (block, scrutinee, _variant) = found;
                     let here = self.label.copy(&cx);
@@ -2758,18 +2761,18 @@ impl Backend['k] {
         let known = self.erasure.copy(&cx);
         match known.get(&cx, (label, name)) {
             Some(answer) => answer,
-            None => self.record_erasure(&cx, label, name, self.typed.copy(&cx).at(&cx, (label, name))),
+            None => self.record_value_ctype(&cx, label, name, self.typed.copy(&cx).at(&cx, (label, name))).is(&cx, "void"),
         }
     }
 
-    // Record erasure using a type the caller already has, without another lookup in `typed`.
-    fn record_erasure(self, &cx: Domain!['k], label: Str['k], name: Str['k], ty: Type['k]) -> bool {
+    // Name a value's C type and record erasure using its known KURS type.
+    fn record_value_ctype(self, &cx: Domain!['k], label: Str['k], name: Str['k], ty: Type['k]) -> Str['k] {
         let before = self.counter.next.copy(&cx);
-        let answer = self.erased(&cx, self.substitute_type(&cx, ty));
+        let ctype = self.c(&cx, self.substitute_type(&cx, ty));
         if self.counter.next.copy(&cx) == before {
-            self.erasure.copy(&cx).insert(&cx, (label, name), answer);
+            self.erasure.copy(&cx).insert(&cx, (label, name), ctype.is(&cx, "void"));
         }
-        answer
+        ctype
     }
 
     fn type_of(self, &cx: Domain!['k], name: Str['k]) -> Type['k] {
@@ -2896,8 +2899,12 @@ impl Backend['k] {
             || (op.is(&cx, "load") || op.is(&cx, "open") || op.is(&cx, "pack") || op.is(&cx, "construct")) && plan.resident.contains(&cx, (label, instr.lhs.at(&cx, 0usize))) {
             return;
         }
-        if op.is(&cx, "destruct") && after_lend {
-            self.handed_back(&cx, &lines, instr, plan.in_place.at(&cx, (label, index - 1usize)));
+        if op.is(&cx, "destruct") {
+            if after_lend {
+                self.handed_back(&cx, &lines, instr, plan.in_place.at(&cx, (label, index - 1usize)));
+            } else {
+                self.destruct(&cx, &lines, instr);
+            }
             return;
         }
         if plan.unwritten.contains(&cx, (label, index)) {
@@ -2905,6 +2912,22 @@ impl Backend['k] {
         }
         if op.is(&cx, "store") && index > 0usize && plan.fused.contains(&cx, (label, index - 1usize)) {
             self.store_in_place(&cx, &lines, a.at(&cx, 0usize), self.blocks.copy(&cx).at(&cx, label).instrs.at(&cx, index - 1usize));
+            return;
+        }
+        if op.is(&cx, "copy") {
+            let unit = self.aliases.copy(&cx).insert(&cx, (label, instr.lhs.at(&cx, 0usize)), self.value_name(&cx, a.at(&cx, 0usize)));
+            return;
+        }
+        if op.is(&cx, "load") && plan.forwarded.contains(&cx, a.at(&cx, 0usize)) {
+            let unit = self.aliases.copy(&cx).insert(&cx, (label, instr.lhs.at(&cx, 0usize)), self.forwards.copy(&cx).at(&cx, a.at(&cx, 0usize)));
+            return;
+        }
+        if op.is(&cx, "call") {
+            self.call(&cx, &lines, instr);
+            return;
+        }
+        if op.is(&cx, "trait_call") {
+            self.trait_call(&cx, &lines, instr);
             return;
         }
         // Store emission never uses its result, so it needs no C destination lookup.
@@ -2924,10 +2947,6 @@ impl Backend['k] {
                 None => Str::from_static(&cx, ""),
             };
             line(&lines, Buffer!::new().write(&cx, d).put(" = ").write(&cx, self.literal(&cx, self.type_operand_raw(&cx, instr), lit)).put(";"));
-        } else if op.is(&cx, "copy") {
-            let unit = self.aliases.copy(&cx).insert(&cx, (self.label.copy(&cx), instr.lhs.at(&cx, 0usize)), self.value_name(&cx, a.at(&cx, 0usize)));
-        } else if op.is(&cx, "load") && plan.forwarded.contains(&cx, a.at(&cx, 0usize)) {
-            let unit = self.aliases.copy(&cx).insert(&cx, (self.label.copy(&cx), instr.lhs.at(&cx, 0usize)), self.forwards.copy(&cx).at(&cx, a.at(&cx, 0usize)));
         } else if op.is(&cx, "store") && plan.forwarded.contains(&cx, a.at(&cx, 0usize)) {
             if !self.value_erased(&cx, a.at(&cx, 1usize)) {
                 let unit = self.forwards.copy(&cx).insert(&cx, a.at(&cx, 0usize), self.value_name(&cx, a.at(&cx, 1usize)));
@@ -2936,8 +2955,6 @@ impl Backend['k] {
             let ty = self.type_operand(&cx, instr);
             let away = self.away(&cx, instr.lhs.at(&cx, 0usize));
             self.construct(&cx, &lines, d, ty, a, away);
-        } else if op.is(&cx, "destruct") {
-            self.destruct(&cx, &lines, instr);
         } else if op.is(&cx, "construct_variant") {
             let lit = match instr.lit {
                 Some(l) => l,
@@ -2976,10 +2993,6 @@ impl Backend['k] {
             self.cast(&cx, &lines, d, value, src, self.type_operand(&cx, instr));
         } else if is_c_op(&cx, op) || op.is(&cx, "shl") || op.is(&cx, "shr") {
             self.primitive(&cx, &lines, d, op, a);
-        } else if op.is(&cx, "call") {
-            self.call(&cx, &lines, instr);
-        } else if op.is(&cx, "trait_call") {
-            self.trait_call(&cx, &lines, instr);
         } else if op.is(&cx, "fn") {
             line(&lines, Buffer!::new().write(&cx, d).put(" = ").write(&cx, self.function_address(&cx, instr)).put(";"));
         } else if op.is(&cx, "alloca") {
@@ -3987,45 +4000,27 @@ impl Backend['k] {
         };
     }
 
-    // A jump assigns the target's live parameters (`source` is the C variable `payload` reads); a jump
-    // to a return join returns the value it passes there. A value of a zero-size type is empty: nothing
-    // is assigned or returned.
+    fn edge_value(self, &cx: Domain!['k], edge: Edge['k], index: usize, payload: Option[Str['k]], skip: usize) -> (Str['k], Str['k]) {
+        let empty = Str::from_static(&cx, "");
+        if index < skip {
+            return (empty, payload.unwrap_or(empty));
+        }
+        let arg = edge.args.at(&cx, index - skip);
+        (arg, if self.value_erased(&cx, arg) { empty } else { self.value_name(&cx, arg) })
+    }
+
+    // Assigns parameters with storage, or returns the value passed to a return join.
     fn edge(self, &cx: Domain!['k], &lines: Buffer!, edge: Edge['k], payload: Option[Str['k]], source: Str['k], indent: Str['k]) {
         let plan = self.the_plan(&cx);
         let target = self.blocks.copy(&cx).at(&cx, edge.target);
-        // (value, the C variable it reads)
-        let values: ArenaVec[(Str['k], Str['k]), 'k] = ArenaVec::new(&cx);
-        // the SSA value of each, or `""` for the payload
-        let names: ArenaVec[Str['k], 'k] = ArenaVec::new(&cx);
-        if payload.is_some() {
-            names.push(&cx, Str::from_static(&cx, ""));
-        }
-        names.append(&cx, edge.args);
-        match payload {
-            Some(p) => if plan.arrived.contains(&cx, (target.label, target.params.at(&cx, 0usize).name)) {
-                values.push(&cx, (Str::from_static(&cx, ""), source));
-            } else {
-                values.push(&cx, (p, source));
-            },
-            None => (),
-        };
-        var a = 0usize;
-        while a < edge.args.len(&cx) {
-            let arg = edge.args.at(&cx, a);
-            if self.value_erased(&cx, arg) {
-                values.push(&cx, (Str::from_static(&cx, ""), Str::from_static(&cx, "")));
-            } else {
-                values.push(&cx, (self.value_name(&cx, arg), self.value_base(&cx, arg)));
-            }
-            a = a + 1usize;
-        }
+        let skip = if payload.is_some() { 1usize } else { 0usize };
         match plan.return_index.get(&cx, target.label) {
             Some(index) => {
-                let (value, _base) = values.at(&cx, index);
+                let (name, value) = self.edge_value(&cx, edge, index, payload, skip);
                 if value.is_empty() {
                     line(&lines, Buffer!::new().write(&cx, indent).put("return;"));
                 } else {
-                    self.give_back(&cx, &lines, names.at(&cx, index), value, indent);
+                    self.give_back(&cx, &lines, name, value, indent);
                 }
                 return;
             },
@@ -4036,38 +4031,42 @@ impl Backend['k] {
         let homes: ArenaVec[(Str['k], Str['k]), 'k] = ArenaVec::new(&cx);
         let label = self.label.copy(&cx);
         var p = 0usize;
-        while p < target.params.len(&cx) && p < values.len(&cx) {
+        while p < target.params.len(&cx) {
             let binding = target.params.at(&cx, p);
-            let (value, base) = values.at(&cx, p);
-            if !value.is_empty() && plan.is_live(&cx, target.label, binding.name) {
-                match plan.homed.get(&cx, (target.label, binding.name)) {
-                    Some(homed) => {
-                        // The components written where they end up (`Plan::home_params`): the others are
-                        // assigned one by one, and the homed ones after every other assignment, unless the
-                        // value's making wrote them.
-                        let made = plan.made_home.contains(&cx, (label, names.at(&cx, p)));
-                        let rows = self.members(&cx, self.shape(&cx, self.substitute_type(&cx, binding.ty)));
-                        var k = 0usize;
-                        while k < rows.len(&cx) {
-                            let (member, mt) = rows.at(&cx, k);
-                            match home_of(&cx, homed, k) {
-                                Some(path) => if !made {
-                                    homes.push(&cx, (path, f"{value}.{member}".write(&cx, Buffer!::new()).save(&cx)));
-                                },
-                                None => if !self.erased(&cx, mt) {
-                                    moves.push(&cx, Move.{ dst: Buffer!::new().write(&cx, self.cname(&cx, target.label, binding.name)).put(".").write(&cx, member).save(&cx),
-                                        ty: mt, place: false, value: f"{value}.{member}".write(&cx, Buffer!::new()).save(&cx), base });
-                                },
-                            };
-                            k = k + 1usize;
-                        }
-                    },
-                    None => moves.push(&cx, Move.{ dst: self.cname(&cx, target.label, binding.name), ty: binding.ty, place: false, value, base }),
-                };
+            let key = (target.label, binding.name);
+            if plan.variables.contains(&cx, key) {
+                let (name, value) = self.edge_value(&cx, edge, p, payload, skip);
+                if !value.is_empty() {
+                    let base = if p < skip { source } else { self.value_base(&cx, name) };
+                    match plan.homed.get(&cx, key) {
+                        Some(homed) => {
+                            // Homed components are assigned after the other moves, unless already written.
+                            let made = plan.made_home.contains(&cx, (label, name));
+                            let rows = self.members(&cx, self.shape(&cx, self.substitute_type(&cx, binding.ty)));
+                            var k = 0usize;
+                            while k < rows.len(&cx) {
+                                let (member, mt) = rows.at(&cx, k);
+                                match home_of(&cx, homed, k) {
+                                    Some(path) => if !made {
+                                        homes.push(&cx, (path, f"{value}.{member}".write(&cx, Buffer!::new()).save(&cx)));
+                                    },
+                                    None => if !self.erased(&cx, mt) {
+                                        moves.push(&cx, Move.{ dst: Buffer!::new().write(&cx, self.cname(&cx, target.label, binding.name)).put(".").write(&cx, member).save(&cx),
+                                            ty: mt, place: false, value: f"{value}.{member}".write(&cx, Buffer!::new()).save(&cx), base });
+                                    },
+                                };
+                                k = k + 1usize;
+                            }
+                        },
+                        None => moves.push(&cx, Move.{ dst: self.cname(&cx, target.label, binding.name), ty: binding.ty, place: false, value, base }),
+                    };
+                }
             }
             p = p + 1usize;
         }
-        self.assign(&cx, &lines, moves, indent);
+        if !moves.is_empty(&cx) {
+            self.assign(&cx, &lines, moves, indent);
+        }
         var h = 0usize;
         while h < homes.len(&cx) {
             let (path, value) = homes.at(&cx, h);

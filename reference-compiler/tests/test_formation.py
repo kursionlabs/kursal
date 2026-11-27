@@ -124,6 +124,13 @@ class FormationTests(unittest.TestCase):
           (= %n (sizeof (tuple u32 (brand $k))))
           (= %r (const u32 0)) (ret %r)))"""))
 
+    def test_open_in_one_block_does_not_bind_a_brand_in_its_sibling(self):
+        self.rejects("""(fun main u32 ()
+          (entry () (= %fresh (fresh)) (= %w (open %fresh ($k)))
+                    (= %r (const u32 0)) (ret %r))
+          (dead () (= %n (sizeof (brand $k))) (= %r (const u32 0)) (ret %r)))""",
+                     "brand k is not in scope")
+
     def test_local_storage_requires_function_generic_brands(self):
         self.rejects("""(fun main u32 () (locals (&slot (brand $k)))
           (entry () (= %fresh (fresh)) (= %w (open %fresh ($k)))
