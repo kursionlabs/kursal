@@ -198,11 +198,15 @@ class SizeLimitTests(unittest.TestCase):
                 self.assertEqual(types.layout(parse_type(read(written)[0])), layout)
 
     def test_a_type_of_2_to_the_64_bytes_or_more_is_not_formed(self):
+        oversized = "(array (array u8 9223372036854775808) 2)"
         for name, written in {
-            "a nested array": "(array (array u8 9223372036854775808) 2)",
+            "a nested array": oversized,
             "padding": "(tuple u8 (array u64 2305843009213693951))",
             "a tag": "(enum (a (array u8 18446744073709551615)) (b u8))",
-            "a pointee": "(ptr (array (array u8 9223372036854775808) 2))",
+            "a pointee": f"(ptr {oversized})",
+            "a non-null pointee": f"(non_null {oversized})",
+            "a function parameter": f"(fn ({oversized}) u32)",
+            "a function result": f"(fn () {oversized})",
         }.items():
             with self.subTest(case=name), self.assertRaisesRegex(
                     KursError, "type formation: .* is too large: its size is not below 2\\^64 bytes$"):
@@ -210,6 +214,24 @@ class SizeLimitTests(unittest.TestCase):
         with self.assertRaisesRegex(KursError, "too large: its size is not below 2\\^64 bytes in type Big$"):
             check_program(parse_program(
                 "(type Big (struct (a (array u8 9223372036854775808)) (b (array u8 9223372036854775808))))"))
+
+    def test_generic_storage_checks_the_argument_and_the_outer_layout(self):
+        decls = """
+            (type Wrap (forall (T) () (struct (h (Handle T)))))
+            (type Handle (forall (T) () (struct (p (non_null T)))))
+            (type Pair (forall (T) () (struct (a T) (b T))))"""
+        half = "(array u8 9223372036854775808)"
+        oversized = "(array u64 2305843009213693952)"
+        for ty, rejected in ((f"(Wrap {half})", None), (f"(Wrap {oversized})", oversized),
+                             (f"(Pair {half})", f"(Pair {half})")):
+            with self.subTest(ty=ty):
+                program = parse_program(decls + f"(fun f usize () (entry () (= %n (sizeof {ty})) (ret %n)))")
+                if rejected is None:
+                    check_program(program)
+                else:
+                    with self.assertRaises(KursError) as error:
+                        check_program(program)
+                    self.assertIn(f"type formation: {rejected} is too large", str(error.exception))
 
     def test_a_type_just_below_the_limit_is_formed(self):
         check_program(parse_program("""
@@ -225,6 +247,18 @@ class SizeLimitTests(unittest.TestCase):
             (fun g (forall (T) () usize () (entry () (= %n (sizeof (tuple T T))) (ret %n))))
             (fun main i32 () (entry ()
               (= %n (call (g (array u8 9223372036854775808)))) (= %r (const i32 0)) (ret %r)))""")
+        checked = check_program(program)
+        with self.assertRaisesRegex(KursError, "backend: .* is too large: its size is not below 2\\^64 bytes, "
+                                               "in a specialization of g$"):
+            emit_c(program, checked, "main")
+
+    def test_a_specialization_checks_sizes_of_unused_values(self):
+        program = parse_program("""
+            (fun g (forall (T) () i32 ()
+              (entry () (= %r (const i32 0)) (ret %r))
+              (dead ((%large (tuple T T))) (= %stop (trap)) (unreachable))))
+            (fun main i32 () (entry ()
+              (= %r (call (g (array u8 9223372036854775808)))) (ret %r)))""")
         checked = check_program(program)
         with self.assertRaisesRegex(KursError, "backend: .* is too large: its size is not below 2\\^64 bytes, "
                                                "in a specialization of g$"):

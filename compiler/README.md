@@ -30,7 +30,7 @@ the phase computed, as text, for comparison with the reference in the tests.
 | `sigs::dump` | | signatures as text |
 | `infer::inference` | `infer.py` | type inference of function bodies: each node's type, what each call calls, local bindings and captures |
 | `infer::dump` | | what inference found, as text |
-| `lower::lowering`, `lower::placeflow`, `lower::promote` | `lower.py`, `placeflow.py`, `promote.py` | lowering inferred bodies to core: control flow, places and their contracts, branded locals as SSA values |
+| `lower::lowering`, `lower::placeflow`, `lower::promote` | `lower.py`, `placeflow.py`, `promote.py` | control flow, local SSA values and block arguments, places and their contracts |
 | `check::checker` | `check.py` | the KURS checker; it records every SSA value's type by `FunKey` |
 | `backend::mangle`, `backend::plan`, `backend::cgen` | `mangle.py`, `plan.py`, `cgen.py` | symbol names (with SHA-256); what a function's C leaves out; checked KURS to C |
 | `main` | `__main__.py` | the command line, and an arena for each group of phases |
@@ -63,8 +63,7 @@ checking, C generation, and the copies and arena releases between those stages. 
 builds it also reports writing C, preparing the C compiler commands, compiling the files of a split
 build in parallel (`cc compile`), and the last C compiler run (`cc`: the link, or the whole build
 with `--single-c`).
-`front copy` moves the lowered program into the checker arena; `back copy` moves it into the C
-arena; `typed copy` moves the checker's recorded types into that arena.
+`front copy` moves the lowered program into the arena shared by the checker and C emitter.
 Within C generation, `C setup`, `C functions`, `C definitions`, and `C assembly` show where the
 backend spends its time; `C` remains the total for that stage.
 
@@ -140,33 +139,29 @@ for the whole compiler, so each group of phases runs in an arena of its own.
 
 ### An arena per group of phases
 
-`main` opens three arenas, one after another, each under a brand of its own:
+`main` opens two arenas, each under a brand of its own.
 
 | Group | Phases | Hands on |
 |---|---|---|
 | front end, `'f` | the command line; parsing, resolving, signatures, inference, lowering with place flow and promotion; or reading KURS | `main::Handoff['f]`: the core program, the `Fresh` counter, the entry's name, `build`'s output path |
-| core, `'c` | checking | the program again, and `Checker.typed`, the type of every SSA value |
-| back end, `'b` | mangling and C | the C, printed or written; then `cc` runs |
+| core, `'c` | checking, mangling, and C emission | the C, printed or written before `cc` runs |
 
 The core program is where the pipeline is narrowest: it is self-contained (the `check`, `c` and
 `readable` commands start from it, read from KURS), while the syntax trees, the resolver, the
 signatures and what inference found are not needed after lowering. Lowering stays in the front end
 because place flow and promotion report errors through the resolver, in their files.
 
-A group's hand-off is copied into the next arena with `kurs::transfer::copy_program` (every type,
-function, block, instruction, declaration and data form, maps in the same order),
-`check::checker::copy_typed`, `std::arena::copy_str(text, &from, &to)` (read under the first arena's
-capability) and `types::ops::carry_fresh`; then the first arena is destroyed. A
-part shared by two places in the original is copied for each: nothing changes a program once it is
-lowered. `fail` still stops the process from inside, leaving whichever arenas are open to the
-operating system; on success, every arena is destroyed and every byte the compiler allocated is
-freed, which `tests/test_compiler.py` checks under valgrind.
+The front end copies its handoff into the core arena with `kurs::transfer::copy_program`,
+`std::arena::copy_str` and `types::ops::carry_fresh`, then destroys the front-end arena.
+The copy preserves map order and copies shared parts separately because the lowered program
+is read-only. The C emitter reads the checked program and `Checker.typed` in the core arena
+and destroys that arena when it finishes. On failure, the operating system releases the
+remaining arenas. `tests/test_compiler.py` checks success-path allocations under Valgrind.
 
-Each arena is opened once, in `main`, and `front_end`, `check_program` and `back_end` take it by
-place. The backends specialize a generic function once for type arguments that differ only in
-brands (`backend::mangle::unbranded`), and brands are erased from C types, so code that more than
-one group runs (the `support` and `types` modules, `kurs::core`, the checker that place flow uses)
-is made once, whatever arena it runs in.
+Each arena is opened once in `main`. The backends specialize a generic function once for type
+arguments that differ only in brands (`backend::mangle::unbranded`). Brands are erased from C
+types, so the groups share the same generated code for modules such as `support`, `types` and
+`kurs::core`, including the checker code that place flow uses.
 
 ### Scratch state
 
@@ -198,11 +193,11 @@ anew: `ArenaMap::clear` and `assign` (and `ArenaSet`'s) keep the room a map has,
 room only to hold more than it has held before. Place flow simulates each block in one scratch
 `Places` (`PlaceFlow.working`, loaded from the state the block starts in) and copies it only when
 the block changed it; its replay of the finished headers runs in the scratch too. The checker
-checks each block in one scratch state (`Checker.working`), hands out the sets of the empty paths
-blocks declare from a pool refilled for each function (`Checker::empty_set`), and keeps what it
-learns of a function's paths in `PathFacts`, cleared when the roots or kinds maps change: each
-path's stored type, when no place state decides it, with whether it is Copy, and for each block
-the declared empty paths an edge into it must still check.
+checks each block in one scratch state (`Checker.working`). Blocks that declare no empty paths
+share one read-only set. For other blocks, `Checker::empty_contract` draws a set from a pool
+refilled for each function. `PathFacts` records a path's stored type and whether it is Copy when
+these are independent of place state. It also tracks which block contracts still need checking.
+The checker clears these facts when the roots or kinds maps change.
 
 ### Text being built
 
@@ -265,11 +260,9 @@ dataclasses), `kurs::core::hash` its hash.
 Types are values, not interned: two equal types may be built apart, so a type-keyed map hashes and
 compares the structure. Both are kept cheap instead. A map entry keeps its key's hash bits, so a
 probe compares keys only where the bits agree, and growing or cloning a map hashes nothing again.
-`hash` takes from each name only its length and last 8 bytes (`name_hash`): names alike in those
-collide under every seed, but a program's names are its own, so only it can slow its build down that
-way. `same` stops at a
-part (a vec of types or members, a `Ref`) that both types share, which a type copied from another,
-or looked up with the type it was stored under, mostly does. Where a backend query is asked per
+`hash` includes each complete name, so names from different modules can land in different buckets
+even when their lengths and suffixes agree. When two types share a vec of types or members, or a
+`Ref`, `same` skips that part. Copies of a type commonly share these parts. Where a backend query is asked per
 value, it is kept by the value's (block label, name) (`Backend::value_erased_in`), which hashes two
 short names instead of a type. `types::ops::alpha_hashes` is a hash, under the arena's seed, that
 alpha-equivalent types share; `Backend::request` compares a specialization's arguments only with earlier ones whose hash

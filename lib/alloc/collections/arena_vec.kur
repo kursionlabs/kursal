@@ -26,21 +26,22 @@
 //
 // `Header` and `ArenaVec` are restricted: only this module builds or opens
 // them. The unsafe reads and writes below rely on what that protects: the
-// header's `segments` blocks are live arena memory of the sizes `locate`
-// computes, segment 0 at `first` and segment `k` at `table[k - 1]`, and
-// `len` never exceeds their total.
+// header's `segments` blocks are live arena memory of the sizes
+// `locate_segment` computes, segment 0 at `first` and segment `k` at `table[k - 1]`, and
+// each segment is aligned for the handle's element type. The first `len`
+// elements are initialized. Spare capacity may be uninitialized.
 
 use package as alloc;
 
-use alloc::arena::{Allocate, Arena!, Domain!};
+use alloc::arena::{Allocate, Arena!, Domain!, padding_for};
 use alloc::buffer::Buffer!;
 use core::fmt::Writer;
-use alloc::heap::{HeapAllocator, checked_mul};
+use alloc::heap::{HeapAllocator, checked_add, checked_mul};
 use core::process::trap;
 use core::cap::{Access, Exclusive!};
 use core::cmp::Order;
 use core::hash::{HashIn, HashState};
-use core::mem::{Ref, sizeof};
+use core::mem::{Ref, alignof, sizeof};
 use core::option::Option;
 use core::str::Str;
 use core::ptr::{null, offset};
@@ -81,24 +82,24 @@ unsafe fn merge_runs(&cx: C, src: *T, dst: *T, n: usize, width: usize, cmp: clos
 }
 
 /// An `ArenaVec`'s length and segments, in the arena: segment 0, and a
-/// table of the later ones, each twice as long as the one before. Used by
-/// `ArenaVec`; not meant for direct use.
-forall T, 'k.
+/// table of the later ones, each twice as long as the one before. The
+/// header has the same layout for every element type. The typed handle
+/// supplies the element size and alignment when addressing or growing it.
 struct Header {
     len: usize,
     segments: usize,
     // Segment 0, or null before the first element.
-    first: *T,
+    first: *u8,
     // Segments 1 and on, or null; room for the next power of two of
     // `segments - 1` pointers.
-    table: *(*T),
+    table: *(*u8),
 }
 
 /// A growable sequence in an arena whose elements never move: a `Copy`
 /// handle whose copies all name the same vec.
 forall T, 'k.
 struct ArenaVec {
-    header: Ref[Header[T, 'k], 'k],
+    header: Ref[Header, 'k],
 }
 
 /// The size of segment 0: at least 4 elements and 32 bytes, a power of two.
@@ -116,12 +117,10 @@ fn first_capacity() -> usize {
     }
 }
 
-/// The segment holding element `i`, and its offset there. Segment `k` holds
-/// `first_capacity() << k` elements, and the segments before it
-/// `first_capacity() * (2^k - 1)`.
-forall T.
-fn locate(i: usize) -> (usize, usize) {
-    let b = first_capacity[T]();
+/// The segment holding element `i`, and its offset in that segment, for a
+/// segment 0 of `b` elements: segment `k` holds `b << k` elements, after
+/// `b * (2^k - 1)` earlier ones.
+fn locate_segment(i: usize, b: usize) -> (usize, usize) {
     if i < b {
         return (0usize, i);
     }
@@ -156,34 +155,34 @@ fn locate(i: usize) -> (usize, usize) {
     (k, i - b * ((1usize << k) - 1usize))
 }
 
-/// Where element `i` of `h`'s storage lives. Caller: `i` is below the
-/// capacity of `h`'s segments.
-forall T, 'k.
-unsafe fn place(h: Header[T, 'k], i: usize) -> *T {
-    if i < first_capacity[T]() {
-        return unsafe offset(h.first, i);
+/// Address of an element in the allocated segments. The starting capacity
+/// and element size must match the vec, and `i` must be below capacity.
+unsafe fn element_address(h: Header, i: usize, first_cap: usize, width: usize) -> *u8 {
+    if i < first_cap {
+        return unsafe offset(h.first, i * width);
     }
-    let (k, at) = locate[T](i);
-    let base = if k == 0usize {
-        h.first
-    } else {
-        unsafe *(unsafe offset(h.table, k - 1usize))
-    };
-    unsafe offset(base, at)
+    let (segment, index) = locate_segment(i, first_cap);
+    let base = unsafe *(unsafe offset(h.table, segment - 1usize));
+    unsafe offset(base, index * width)
 }
 
-/// The number of elements `h`'s segments hold.
-forall T, 'k.
-fn capacity(h: Header[T, 'k]) -> usize {
-    first_capacity[T]() * ((1usize << h.segments) - 1usize)
+/// Typed access to a header belonging to an `ArenaVec[T, 'k]`.
+/// The index must be below capacity. Reading it also requires initialization.
+forall T.
+unsafe fn place(h: Header, i: usize) -> *T {
+    unsafe (unsafe element_address(h, i, first_capacity[T](), sizeof[T]()) as *T)
 }
 
-/// `h` with one more segment, its elements set to `fill`.
-forall T, 'k where Copy[T], Sized[T].
-fn add_segment(&tag: Exclusive!['k], &arena: Arena!['k], h: Header[T, 'k], fill: T) -> Header[T, 'k] {
+fn capacity(h: Header, first_cap: usize) -> usize {
+    first_cap * ((1usize << h.segments) - 1usize)
+}
+
+/// Adds uninitialized room for the next segment. The header must belong
+/// to this arena, and the three layout arguments must match its elements.
+forall 'k.
+unsafe fn add_segment(&tag: Exclusive!['k], &arena: Arena!['k], h: Header, first_cap: usize, width: usize, alignment: usize) -> Header {
     let k = h.segments;
-    let block = &arena.alloc_slice(&tag, first_capacity[T]() << k, fill);
-    let (base, size, marker) = block.into_parts();
+    let base = unsafe &arena.reserve_aligned(checked_mul(first_cap << k, width), alignment);
     if k == 0usize {
         return Header.{ len: h.len, segments: 1usize, first: base, table: h.table };
     }
@@ -214,7 +213,7 @@ impl ArenaVec[T, 'k] {
     forall C, R where Allocate[C -> 'k, R].
     fn new(&cx: C) -> ArenaVec[T, 'k] {
         var (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
-        let header = &arena.alloc(&tag, Header.{ len: 0usize, segments: 0usize, first: null[T](), table: null[*T]() });
+        let header = &arena.alloc(&tag, Header.{ len: 0usize, segments: 0usize, first: null[u8](), table: null[*u8]() });
         cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
         ArenaVec.{ header }
     }
@@ -222,18 +221,44 @@ impl ArenaVec[T, 'k] {
     /// A vec holding `value`.
     forall C, R where Allocate[C -> 'k, R].
     fn one(&cx: C, value: T) -> ArenaVec[T, 'k] {
-        let v: ArenaVec[T, 'k] = ArenaVec::new(&cx);
-        v.push(&cx, value);
-        v
+        ArenaVec::short(&cx, value, Option::None)
     }
 
     /// A vec holding `a` then `b`.
     forall C, R where Allocate[C -> 'k, R].
     fn two(&cx: C, a: T, b: T) -> ArenaVec[T, 'k] {
-        let v: ArenaVec[T, 'k] = ArenaVec::new(&cx);
-        v.push(&cx, a);
-        v.push(&cx, b);
-        v
+        ArenaVec::short(&cx, a, Option::Some.(b))
+    }
+
+    // Initialize the occupied prefix of segment zero before publishing the handle.
+    forall C, R where Allocate[C -> 'k, R].
+    fn short(&cx: C, a: T, b: Option[T]) -> ArenaVec[T, 'k] {
+        var (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
+        // Keep the header and first segment in a single reservation. Offset the segment
+        // to its alignment and align the entire block for both types.
+        let element_align = alignof[T]();
+        let header_align = alignof[Header]();
+        let header_size = sizeof[Header]();
+        let start = checked_add(header_size, padding_for(header_size, element_align));
+        let bytes = checked_mul(first_capacity[T](), sizeof[T]());
+        let alignment = if header_align > element_align { header_align } else { element_align };
+        let block = unsafe &arena.reserve_aligned(checked_add(start, bytes), alignment);
+        let first = unsafe offset(block, start);
+        let elements = unsafe (first as *T);
+        unsafe *elements = a;
+        let len = match b {
+            Some(value) => {
+                unsafe *(unsafe offset(elements, 1usize)) = value;
+                2usize
+            },
+            None => 1usize,
+        };
+        let state = Header.{ len, segments: 1usize, first, table: null[*u8]() };
+        let header_ptr = unsafe (block as *Header);
+        unsafe *header_ptr = state;
+        let header = unsafe Ref::from_raw(header_ptr, &arena.marker());
+        cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
+        ArenaVec.{ header }
     }
 
     /// `count` copies of `fill`.
@@ -268,7 +293,7 @@ impl ArenaVec[T, 'k] {
         var (tag, rest) = Access[C -> 'k, R]::open(cx);
         let h = self.header.copy(&tag);
         let value = if i < h.len {
-            Option::Some.(unsafe *(unsafe place(h, i)))
+            Option::Some.(unsafe *(unsafe place[T](h, i)))
         } else {
             Option::None
         };
@@ -285,7 +310,7 @@ impl ArenaVec[T, 'k] {
         if i >= h.len {
             trap();
         }
-        let value = unsafe *(unsafe place(h, i));
+        let value = unsafe *(unsafe place[T](h, i));
         cx = Access[C -> 'k, R]::close(tag, rest);
         value
     }
@@ -300,7 +325,7 @@ impl ArenaVec[T, 'k] {
             let (at, marker) = self.header.into_parts();
             // In range of the vec's segments, which are memory of this
             // arena's domain, the one the header's own brand names.
-            Option::Some.(unsafe Ref::from_raw(unsafe place(h, i), marker))
+            Option::Some.(unsafe Ref::from_raw(unsafe place[T](h, i), marker))
         } else {
             Option::None
         };
@@ -317,7 +342,7 @@ impl ArenaVec[T, 'k] {
         if i >= h.len {
             trap();
         }
-        let at = unsafe place(h, i);
+        let at = unsafe place[T](h, i);
         let old = unsafe *at;
         unsafe *at = value;
         cx = Access[C -> 'k, R]::close(tag, rest);
@@ -352,8 +377,11 @@ impl ArenaVec[T, 'k] {
     fn push(self, &cx: C, value: T) {
         var (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
         let h = self.header.copy(&tag);
-        let h = if h.len < capacity(h) { h } else { add_segment(&tag, &arena, h, value) };
-        unsafe *(unsafe place(h, h.len)) = value;
+        let first = first_capacity[T]();
+        let h = if h.len < capacity(h, first) { h } else {
+            unsafe add_segment(&tag, &arena, h, first, sizeof[T](), alignof[T]())
+        };
+        unsafe *(unsafe place[T](h, h.len)) = value;
         self.header.set(&tag, Header.{ len: h.len + 1usize, segments: h.segments, first: h.first, table: h.table });
         cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
     }
@@ -367,7 +395,7 @@ impl ArenaVec[T, 'k] {
             Option::None
         } else {
             self.header.set(&tag, Header.{ len: h.len - 1usize, segments: h.segments, first: h.first, table: h.table });
-            Option::Some.(unsafe *(unsafe place(h, h.len - 1usize)))
+            Option::Some.(unsafe *(unsafe place[T](h, h.len - 1usize)))
         };
         cx = Access[C -> 'k, R]::close(tag, rest);
         value
@@ -397,12 +425,13 @@ impl ArenaVec[T, 'k] {
     fn resize(self, &cx: C, len: usize, fill: T) {
         var (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
         var h = self.header.copy(&tag);
-        while capacity(h) < len {
-            h = add_segment(&tag, &arena, h, fill);
+        let first = first_capacity[T]();
+        while capacity(h, first) < len {
+            h = unsafe add_segment(&tag, &arena, h, first, sizeof[T](), alignof[T]());
         }
         var i = h.len;
         while i < len {
-            unsafe *(unsafe place(h, i)) = fill;
+            unsafe *(unsafe place[T](h, i)) = fill;
             i = i + 1usize;
         }
         self.header.set(&tag, Header.{ len, segments: h.segments, first: h.first, table: h.table });
@@ -764,8 +793,9 @@ impl ArenaVec[u8, 'k] {
         }
         var (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
         var h = self.header.copy(&tag);
-        while capacity(h) < h.len + n {
-            h = add_segment(&tag, &arena, h, 0u8);
+        let first = first_capacity[u8]();
+        while capacity(h, first) < h.len + n {
+            h = unsafe add_segment(&tag, &arena, h, first, sizeof[u8](), alignof[u8]());
         }
         // `bytes` is read under the domain's capability, which `tag` is.
         let (source, count) = bytes.into_parts();
@@ -774,17 +804,17 @@ impl ArenaVec[u8, 'k] {
         // source that starts below the destination is copied from its end,
         // so no byte is overwritten before it is read; any other, from its
         // start.
-        let destination = unsafe place(h, h.len);
+        let destination = unsafe place[u8](h, h.len);
         if unsafe (source as usize) < unsafe (destination as usize) {
             var i = n;
             while i > 0usize {
                 i = i - 1usize;
-                unsafe *(unsafe place(h, h.len + i)) = unsafe *(unsafe offset(source, i));
+                unsafe *(unsafe place[u8](h, h.len + i)) = unsafe *(unsafe offset(source, i));
             }
         } else {
             var i = 0usize;
             while i < n {
-                unsafe *(unsafe place(h, h.len + i)) = unsafe *(unsafe offset(source, i));
+                unsafe *(unsafe place[u8](h, h.len + i)) = unsafe *(unsafe offset(source, i));
                 i = i + 1usize;
             }
         }
@@ -821,7 +851,7 @@ impl ArenaVec[u8, 'k] {
             let (dest, size, marker) = block.into_parts();
             var i = 0usize;
             while i < h.len {
-                unsafe *(unsafe offset(dest, i)) = unsafe *(unsafe place(h, i));
+                unsafe *(unsafe offset(dest, i)) = unsafe *(unsafe place[u8](h, i));
                 i = i + 1usize;
             }
             block.as_str()

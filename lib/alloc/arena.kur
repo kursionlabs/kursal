@@ -237,6 +237,16 @@ impl Arena!['k] {
         self.seed
     }
 
+    /// Reserves uninitialized storage in this arena. `alignment` must be a
+    /// nonzero power of two. Initialize the storage before reading it or
+    /// sharing it as a typed reference under the arena's brand.
+    unsafe fn reserve_aligned(&self, bytes: usize, alignment: usize) -> *u8 {
+        let { root, back, current, marker, seed } = self;
+        let (next, base) = unsafe bump_chunk(current, bytes, alignment);
+        self = Arena!.{ root, back, current: next, marker, seed };
+        base
+    }
+
     /// Puts `val` in the arena and hands back a `Ref` to it.
     ///
     /// Allocates naturally aligned room for one `T`, writes `val` into it,
@@ -484,6 +494,35 @@ fn concat(&cx: C, first: Str['j], second: Str['j]) -> Str['j] {
     let { tag, arena } = d;
     cx = Allocate[C -> 'j, R]::close(tag, arena, rest);
     joined
+}
+
+/// Text followed by the unsigned decimal digits of `n`, written directly
+/// into the arena.
+forall 'k, C, R where Allocate[C -> 'k, R].
+fn append_decimal(&cx: C, prefix: Str['k], n: u64) -> Str['k] {
+    var (tag, arena, rest) = Allocate[C -> 'k, R]::open(cx);
+    let (src, start) = prefix.into_parts();
+    var digits = 1usize;
+    var remaining = n;
+    while remaining >= 10u64 {
+        digits = digits + 1usize;
+        remaining = remaining / 10u64;
+    }
+    let len = checked_add(start, digits);
+    let dest = unsafe &arena.alloc_bytes(len);
+    // The new block is disjoint from the readable prefix. Initialize its
+    // remaining bytes from right to left, including one digit for zero.
+    let copied = unsafe copy_bytes(dest, src, start);
+    var i = len;
+    remaining = n;
+    while i > start {
+        i = i - 1usize;
+        unsafe *(unsafe offset(dest, i)) = b'0' + ((remaining % 10u64) as u8);
+        remaining = remaining / 10u64;
+    }
+    let text = unsafe Str::from_raw_parts_branded(dest, len, arena.marker);
+    cx = Allocate[C -> 'k, R]::close(tag, arena, rest);
+    text
 }
 
 /// Copies `count` bytes from `src` to `dest`, byte by byte (the same loop as

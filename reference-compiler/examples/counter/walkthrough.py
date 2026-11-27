@@ -59,7 +59,7 @@ def instruction_text(instr: C.Instr) -> str:
         case "int_cast":
             assert instr.ty is not None
             operands = [*instr.args, type_text(instr.ty)]
-        case "load" | "store" | "add" | "eq" | "call":
+        case "load" | "store" | "copy" | "add" | "eq" | "call":
             assert instr.ty is None and instr.lit is None
             operands = list(instr.args)
         case _:
@@ -76,7 +76,9 @@ def serialized_kurs(program: C.Program) -> str:
     for fun in program.funs.values():
         assert not fun.params and not fun.premises and not fun.unsafe
         params = " ".join(type_text(ty) for ty in fun.ptypes)
-        lines.extend(["", f"(fun {fun.name} {type_text(fun.ret)} ({params})", f"  (locals {bindings(fun.locals)[1:-1]})"])
+        lines.extend(["", f"(fun {fun.name} {type_text(fun.ret)} ({params})"])
+        if fun.locals:
+            lines.append(f"  (locals {bindings(fun.locals)[1:-1]})")
         for block in fun.blocks:
             assert not block.brands and not block.known and not block.opened
             lines.append(f"  ({block.label} {bindings(block.params)}")

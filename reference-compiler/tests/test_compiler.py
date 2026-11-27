@@ -1650,6 +1650,11 @@ TYPE_CASES = (
     "(match-head (T) ((Box (exists ($a) (P $a T)))) ((Box (exists ($a) (P $a u8)))) true)",
     "(match-head (T U) ((Box T)) ((Box u8)) false)",
     "(match-head (T) ((Box T)) ((Bag u8)) false)",
+    "(match-head (T) (T) (u16) true)",
+    "(match-head (T) ((Pair T T)) ((Pair u8 u16)) true)",
+    "(match-head ($k) ((Pair $k $k)) ((Pair $x $y)) true)",
+    "(match-head (T) ((Pair T T)) ((Pair (exists ($a) (brand $a)) (exists ($b) (brand $b)))) true)",
+    "(match-head (T U) ((Pair T (exists ($a) (P $a U)))) ((Pair u8 (exists ($b) (P $b u16)))) false)",
     # literals
     '(literal f32 "3.4028235e38")',
     '(literal f32 "3.40282356e38")',
@@ -1684,6 +1689,12 @@ TYPE_CASES = (
     '(literal bool "true")',
     '(literal bool "True")',
     # declaration-aware queries
+    "(closed ((type Byte () u8)) (tuple Byte (ptr Byte)))",
+    "(closed () (foreach (F (tuple u8)) (ptr F)))",
+    "(closed () (foreach (F (tuple F)) (ptr F)))",
+    "(closed () (tuple (exists ($a) a) a))",
+    "(closed () (tuple a (exists ($a) (brand $a))))",
+    "(closed () (fn ((brand $a) (P a)) (ptr b)))",
     "(copy ((type Node (T) (struct (v T) (next (ptr (Node T)))))) ((T copy)) (Node T))",
     "(copy ((type Node (T) (struct (v T) (next (ptr (Node T)))))) ((T any)) (Node T))",
     "(copy ((type L (T) (enum (Nil (tuple)) (Cons (tuple T (L T)))))) () (L u8))",
@@ -1893,6 +1904,8 @@ def type_case(case: str) -> str:
         return "none" if found is None else "{" + " ".join(f"{n}={T.show(t)}" for n, t in found.items()) + "}"
     if op == "literal":
         return str(valid_literal(parse_type(form[1]), str(form[2]))).lower()  # type: ignore[arg-type]
+    if op == "closed":
+        return str(T.Types(_program(form[1])).closed(parse_type(form[2]))).lower()
     if op == "copy":
         return str(T.Types(_program(form[1])).is_copy(parse_type(form[3]), _kinds(form[2]))).lower()
     if op == "zero":
@@ -2247,6 +2260,65 @@ class CompilerTests(unittest.TestCase):
             for path, want, got in zip(paths, expected, self.run_batches("build", paths)):
                 with self.subTest(source=(path / "lib.kur").read_text()):
                     self.assertEqual(got, want)
+
+    def test_word_bound_overflow_uses_the_exact_product_size(self):
+        # After 61 doublings a byte still fits, while a pointer occupies 2^64 bytes.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "size.kurs"
+            for leaf in ("u8", "(ptr T)"):
+                with self.subTest(leaf=leaf):
+                    decls = [f"(type W0 (forall (T) () {leaf}))"]
+                    for i in range(1, 62):
+                        decls.append(f"(type W{i} (forall (T) () (tuple (W{i - 1} T) (W{i - 1} T))))")
+                    decls.append("(fun f usize () (entry () (= %n (sizeof (W61 u8))) (ret %n)))")
+                    path.write_text("\n".join(decls))
+                    result = self.run_compiler("check", str(path))
+                    if leaf == "u8":
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                    else:
+                        self.assertEqual(result.returncode, 1)
+                        self.assertIn("type formation: (W61 u8) is too large", result.stderr)
+
+    def test_empty_field_on_edge_preserves_fresh_names(self):
+        self.check_following_lend_name("""
+struct Token! { n: u32 }
+forall T.
+struct Outer! { token: Token!, payload: exists 'a. (Brand['a], T) }
+
+forall 'a.
+fn visit(&p: Outer![Brand['a]], cond: bool) -> u32 {
+    let token = p.token;
+    let n = if cond { 3u32 } else { 4u32 };
+    p.token = token;
+    n
+}
+""")
+
+    def test_handle_layout_preserves_fresh_names(self):
+        self.check_following_lend_name("""
+forall T.
+struct Handle { payload: *(exists 'a. (Brand['a], T)) }
+forall 'a.
+fn visit(p: Handle[Brand['a]]) -> Handle[Brand['a]] { p }
+""")
+
+    def check_following_lend_name(self, visit):
+        """Unfolding a type in visit can rename a binder. The next lending helper makes that observable."""
+        source = "use core::cap::{Brand, fresh};\n" + visit + """
+forall T, 'j where Copy[T].
+fn touch(&tag: Brand['j], arg: exists 'a. (Brand['a], T)) { () }
+forall 'a.
+fn observe(p: exists 'q. (Brand['q], Brand['a])) {
+    let exists 'b. witness = fresh();
+    var local = witness;
+    touch(&local, p);
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = place_case(Path(directory), 0, source)
+            expected = reference_lowering(path)
+            self.assertIn("::observe#lend", expected)
+            self.assertEqual(self.outcome(self.run_compiler("lower", str(path))), expected)
 
     def test_lowering_cases_match_reference(self):
         """The packages the reference's own tests lower, and the cases of tests/lower_cases.py, which the

@@ -114,18 +114,15 @@ checks it, requires the same C from both routes, and builds and runs both execut
 
 What to look for in each output:
 
-- **Inference.** `bump`'s parameter is a place (`&counter: Counter`): lending is a parameter mode, not a
-  pointer type. `main`'s `counter` and `result` get binding IDs 1 and 2, which name their storage below.
-- **Lowering.** Each source local is a whole-function place (`&counter#1`, `&result#2`). A field read is
-  `load &counter#1.value`; the call lends the place itself, `call counter::bump(&counter#1)`. The `if`
-  becomes `branch` to `b10` and `b11`, which meet at `join15(%r14: u32)`. An operand that precedes
-  another waits in a temporary place (`&#tmp1`, `&#tmp3`) and is loaded again just before use.
-- **Place contracts.** Each block states which places are empty on entry (`state { empty &result#2; ... }`).
-  The checker checks every block against its own contract alone, and every jump against its target's.
-- **C.** The place parameter is a pointer, and the call passes the caller's storage:
-  `join15_r14 = ...bump...(&p_counter_1);`. Each block is a label; a jump with an argument assigns
-  `join15_r14` and jumps to `L_join15`, and a value only that jump reads is assigned to it where it
-  is made, as the call's result is. Contracts leave nothing behind at run time.
+- **Inference.** `bump`'s `&counter: Counter` uses the place parameter mode. `main`'s `counter` gets
+  binding ID 1, which appears in the name of its place.
+- **Lowering.** The call lends `&counter#1` to `counter::bump`, and the field read uses
+  `load &counter#1.value`. The `if` branches to `b8` and `b9`, which pass `result` to
+  `join13(%r12: u32)`. Its use in the sum reads that SSA value with `copy %r12`.
+- **Place contracts.** Each block declares its assumptions about places on entry. The checker
+  checks each block against its own contract and each jump against its target's contract.
+- **C.** The call to `bump` passes `&p_counter_1`. Both arms assign `join13_r12` before jumping to
+  `L_join13`. Place contracts are checked during compilation.
 
 ## Packages
 

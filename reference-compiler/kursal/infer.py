@@ -213,6 +213,7 @@ class Infer:
                        for name, decl in self.decl_of.items() if decl.kind == "trait"}
         self.instances: dict[str, list[InstanceSig]] = {}
         self.visible: dict[C.ModuleId, set[Decl]] = {}
+        self.required_places: set[int] = set()
         self.origins: dict[str, Position] = {}    # an opened brand's label -> where its `let exists` is
         for inst, item, module in sigs.instances:
             self.instances.setdefault(inst.trait, []).append(inst)
@@ -1201,7 +1202,7 @@ class Infer:
         return {n: subst(f, {p.name: a for p, a in zip(td.params, ty.args)}) for n, f in td.body.variants}
 
     # ---- places
-    def place_type(self, expr: S.Expr, assign: bool = False, lend: bool = False) -> C.Type:
+    def place_type(self, expr: S.Expr, assign: bool = False, lend: bool = False, *, projected: bool = False) -> C.Type:
         """The type of a place expression: a local, or fields and tuple elements of one. A place that is
         assigned or lent is rooted at a var, a place parameter or a binder of a lent match case, bound in
         the function, closure or foreach body it is written in: such a body holds its own value of what it
@@ -1218,6 +1219,8 @@ class Infer:
                     fail(f"{name} is captured, and a body cannot {verb} what it captures; {verb} it outside, or give a "
                          "closure a place parameter for it", expr.pos)
                 expr.binder = local.id
+                if lend or projected:
+                    self.required_places.add(local.id)
                 return self.record(expr, local.type)
             case S.Field() | S.Index():
                 return self.projection(expr, assign, lend)
@@ -1228,7 +1231,7 @@ class Infer:
     def projection(self, expr: S.Field | S.Index, assign: bool = False, lend: bool = False) -> C.Type:
         """The type of `owner.name` or `owner.N`; an owner that is a place is typed as one, so that an
         assignment is checked down to its root local."""
-        owner = self.place_type(expr.value, assign, lend) if self.is_place(expr.value) else self.expr(expr.value)
+        owner = self.place_type(expr.value, assign, lend, projected=True) if self.is_place(expr.value) else self.expr(expr.value)
         result = Meta()
 
         def component() -> None:

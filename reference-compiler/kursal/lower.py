@@ -72,8 +72,9 @@ class LoweredProgram(C.Program):
 class Binding:
     name: str
     ty: C.Type
-    path: Optional[str] = None       # the place that holds the variable (None for a `..rest` bundle)
+    path: Optional[str] = None
     fields: Optional[dict[str, BindingId]] = None    # a `..rest` bundle: field -> binding id
+    slot: Optional[str] = None        # a Copy local held as SSA values
 
 
 class BlockB:
@@ -83,6 +84,16 @@ class BlockB:
         self.label, self.params, self.brands = label, list(params), tuple(brands)
         self.instrs: list[C.Instr] = []
         self.term: Optional[C.Terminator] = None
+
+
+@dataclass
+class OperandValue:
+    index: int
+    value: str
+    ty: C.Type
+    pos: Optional[Position]
+    raw: str = ""
+    place: Optional[str] = None
 
 
 def written_place(expr: S.Expr) -> Optional[str]:
@@ -124,6 +135,7 @@ class Lowering:
         self.value_types: dict[int, dict[str, C.Type]] = {}
         # Each function's blocks where paths meet: label -> where in the source, for place-flow messages.
         self.sites: dict[int, dict[str, str]] = {}
+        self.required_places: set[int] = set()
 
     def library_name(self, name: str, module: C.ModuleId) -> str:
         return self.sigs.name(self.sigs.library(module, name))
@@ -132,7 +144,9 @@ class Lowering:
         return self.sigs.sigs[self.sigs.library(module, key)]
 
     def run(self, strict: bool = True) -> LoweredProgram:
-        Infer(self.r, self.sigs).run()
+        inference = Infer(self.r, self.sigs)
+        inference.run()
+        self.required_places = inference.required_places
         program = self.program
         for decl, sig in self.sigs.sigs.items():
             if isinstance(decl.node, S.Extern):
@@ -285,11 +299,15 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         self.cur: Optional[BlockB] = None
         self.vty: dict[str, C.Type] = {}
         self.bindings: dict[BindingId, Binding] = {}
+        self.definitions: dict[tuple[str, str], str] = {}
+        self.inputs: dict[tuple[str, str], str] = {}
+        self.pending_inputs: list[tuple[str, str, str]] = []
         self.locals: list[tuple[str, C.Type]] = []
         self.open_brands: list[str] = []
         self.brand_map: dict[str, C.Type] = {}
         self.unsafe_nodes: set[int] = set()
         self.lend_frames: list[list[str]] = []
+        self.pending_operands: list[OperandValue] = []
         self.n = 0
         self.pos: Optional[Position] = None
 
@@ -404,6 +422,10 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         self.open_brands = list(block.brands)
 
     def terminate(self, term: C.Terminator) -> None:
+        if isinstance(term, (C.Jmp, C.Jnz, C.Switch)):
+            for operand in self.pending_operands:
+                if operand.place is None:
+                    self.spill_operand(operand)
         self.current.term = term
         self.cur = None
 
@@ -413,6 +435,46 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
     def jump(self, block: BlockB, extra: Sequence[str] = ()) -> None:
         self.terminate(C.Jmp(self.edge(block, extra), self.pos))
 
+    def ssa_input(self, label: str, slot: str, ty: C.Type) -> str:
+        key = (label, slot)
+        if key not in self.inputs:
+            name = self.fresh("s")
+            self.inputs[key] = name
+            self.vty[name] = ty
+            self.pending_inputs.append((label, slot, name))
+        return self.inputs[key]
+
+    def pass_ssa_inputs(self) -> None:
+        """Thread only the values a block needs through its predecessor edges."""
+        if not self.pending_inputs:
+            return
+        blocks = {block.label: block for block in self.blocks}
+        incoming: dict[str, list[tuple[str, C.Edge]]] = {}
+        for block in self.blocks:
+            edges: tuple[C.Edge, ...]
+            match block.term:
+                case C.Jmp(edge=edge):
+                    edges = (edge,)
+                case C.Jnz(then=then, other=other):
+                    edges = (then, other)
+                case C.Switch(arms=arms):
+                    edges = tuple(arm.edge for arm in arms)
+                case _:
+                    edges = ()
+            for edge in edges:
+                incoming.setdefault(edge.target, []).append((block.label, edge))
+
+        # Requests added by this walk are processed too. Each block needs at most
+        # one entry value per slot, even across a loop or a join.
+        for label, slot, name in self.pending_inputs:
+            ty = self.vty[name]
+            blocks[label].params.append((name, ty))
+            for predecessor, edge in incoming.get(label, ()):
+                value = self.definitions.get((predecessor, slot))
+                if value is None:
+                    value = self.ssa_input(predecessor, slot, ty)
+                edge.args += (value,)
+
     def is_plain_local(self, expr: S.Expr) -> bool:
         return isinstance(expr, S.Path) and expr.ref is not None and expr.ref[0] == "local"
 
@@ -420,6 +482,10 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         root = f"&#tmp{len(self.locals)}"
         self.locals.append((root, ty))
         return root
+
+    def spill_operand(self, operand: OperandValue) -> None:
+        operand.place = self.temporary(operand.ty)
+        self.emit("store", C.UNIT, (operand.place, operand.value), pos=operand.pos)
 
     def value(self, item: S.Expr | Binding | str) -> Optional[str]:
         if isinstance(item, Binding):
@@ -431,7 +497,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         """Evaluate strictly left to right.
 
         Items are expressions, bindings to read, or already resolved place paths.
-        A value preceding another operand waits in a temporary place, then is
+        A value that must survive later operands waits in a temporary place, then is
         reloaded in the final block. Calls supply `operand` to interpret explicit lends.
         A plain read of a place that the same group lends is rejected, whatever its type:
         the program states the order with a binding before the expression.
@@ -461,11 +527,12 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         """The values of the group `operand_group` started, in order; `first`, if given, is the first
         item's, evaluated already."""
         reads, lends = group
+        pending = len(self.pending_operands)
         try:
             evaluate = evaluate or self.value
             order = range(len(items))
             values: dict[int, str] = {}
-            saved: list[tuple[int, str, str, C.Type]] = []
+            saved: list[OperandValue] = []
             for n, k in enumerate(order):
                 v = first if n == 0 and first is not None else evaluate(items[k])
                 if v is None:
@@ -474,13 +541,18 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
                 values[k] = v
                 raw, name = ("&*", v[2:]) if v.startswith("&*") else ("", v)
                 if not name.startswith("&") and n + 1 < len(order):
-                    root = self.temporary(self.vty[name])
+                    ty = self.vty[name]
                     item = items[k]
                     origin = self.pos if isinstance(item, (Binding, str)) else item.pos
-                    self.emit("store", C.UNIT, (root, name), pos=origin)
-                    saved.append((k, raw, root, self.vty[name]))
-            for k, raw, root, ty in saved:
-                values[k] = raw + self.emit("load", ty, (root,))
+                    operand = OperandValue(k, name, ty, origin, raw)
+                    saved.append(operand)
+                    if not raw and (isinstance(ty, C.Prim) or self.copy(ty)):
+                        self.pending_operands.append(operand)
+                    else:
+                        self.spill_operand(operand)
+            for operand in saved:
+                if operand.place is not None:
+                    values[operand.index] = operand.raw + self.emit("load", operand.ty, (operand.place,))
             result = [values[k] for k in range(len(items))]
             lends.extend(v for v in result if v.startswith("&") and not v.startswith("&*"))
             for path in reads:
@@ -489,6 +561,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
                          "bind the value before the expression", self.pos)
             return result
         finally:
+            del self.pending_operands[pending:]
             self.lend_frames.pop()
 
     def here(self) -> str:
@@ -534,19 +607,33 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
 
     # ---- bindings
     def declare(self, bid: BindingId, name: str, ty: C.Type, value: str) -> None:
-        """Bind a variable: a new root of the function, holding `value`."""
+        """Keep a Copy local in SSA when no use needs its address."""
         ty = self.substitute_type(ty)
+        if isinstance(bid, int) and bid not in self.lowering.required_places and not self.open_brands and self.copy(ty):
+            slot = str(bid)
+            self.bindings[bid] = Binding(name, ty, slot=slot)
+            self.definitions[self.current.label, slot] = value
+            return
         root = f"&{name}#{bid}"
         self.locals.append((root, ty))
         self.bindings[bid] = Binding(name, ty, root)
         self.emit("store", C.UNIT, (root, value))
 
     def read(self, binding: Binding) -> str:
+        if binding.slot is not None:
+            label = self.current.label
+            value = self.definitions.get((label, binding.slot))
+            if value is None:
+                value = self.ssa_input(label, binding.slot, binding.ty)
+            return self.emit("copy", binding.ty, (value,))
         if binding.path is None:
             fail(f"{binding.name} is a ..rest bundle, not a value", self.pos)
         return self.emit("load", binding.ty, (binding.path,))
 
     def write(self, binding: Binding, value: str) -> None:
+        if binding.slot is not None:
+            self.definitions[self.current.label, binding.slot] = value
+            return
         assert binding.path is not None
         self.emit("store", C.UNIT, (binding.path, value))
 
@@ -568,7 +655,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         self.start(entry)
 
     def parameters(self, ids: Sequence[int], offset: int = 0, sources: Sequence[str] = ()) -> None:
-        """Lent parameters are roots already; value parameters start in local places.
+        """Lent parameters are roots already; value parameters bind like locals.
 
         An offset skips raw parameters such as a closure environment. Explicit
         sources preserve the SSA names used by generated functions.
@@ -604,6 +691,7 @@ class FnLower[N: S.Fn | S.Closure | S.Foreach]:
         return self.finish()
 
     def finish(self) -> C.Fun:
+        self.pass_ssa_inputs()
         sig = self.sig
         blocks: list[C.Block] = []
         for b in self.blocks:

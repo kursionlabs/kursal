@@ -490,6 +490,22 @@ class StdRuntimeTests(unittest.TestCase):
                 bad
             }''')
 
+    def test_append_decimal_in_arena(self):
+        self.expect('''
+            use std::arena::{Domain!, append_decimal};
+            use std::str::Str;
+            fn main() -> i32 {
+                var exists 'k. cx = Domain!::new(std::process::hash_seed());
+                let prefix = Str::from_static(&cx, "%value");
+                let zero = append_decimal(&cx, prefix, 0u64);
+                let ten = append_decimal(&cx, prefix, 10u64);
+                let max = append_decimal(&cx, Str::from_static(&cx, ""), 18446744073709551615u64);
+                let ok = zero.is(&cx, "%value0") && ten.is(&cx, "%value10")
+                    && max.is(&cx, "18446744073709551615") && prefix.is(&cx, "%value");
+                cx.destroy();
+                if ok { 0i32 } else { 1i32 }
+            }''')
+
     def test_linear_values_stay_out_of_arenas(self):
         self.reject('''
             use std::arena::Domain!;
@@ -1972,9 +1988,16 @@ class StdRuntimeTests(unittest.TestCase):
         seed = (0x0706050403020100, 0x0f0e0d0c0b0a0908)
         # The reference vectors' key, and their first SipHash-1-3 output, of the empty message.
         self.assertEqual(siphash13(seed, []), 0xabac0158050fc4dc)
-        cases = (("42u64", [42]), ("(1u32, true)", [1, 1]), ('"aBaBaB"', [6, int.from_bytes(b"aBaBaB", "little")]),
-                 ('"0123456789abcdef!"', [17, *(int.from_bytes(w, "little") for w in (b"01234567", b"89abcdef", b"!"))]),
-                 ('""', [0]))
+        cases = [
+            ("42u64", [42]),
+            ("(1u32, true)", [1, 1]),
+            ('"aBaBaB"', [6, int.from_bytes(b"aBaBaB", "little")]),
+        ]
+        text = "0123456789abcdef!"
+        for length in range(len(text) + 1):
+            data = text[:length].encode()
+            words = [int.from_bytes(data[i:i + 8], "little") for i in range(0, length, 8)]
+            cases.append((f'"{text[:length]}"', [length, *words]))
         lines = "".join(f"                let h{i} = key_hash(&sr, {key}, seed);\n                out = f\"{{h{i}}}\\n\".write(out);\n"
                         for i, (key, _) in enumerate(cases))
         self.expect('''
@@ -2443,6 +2466,43 @@ class StdRuntimeTests(unittest.TestCase):
                 if ok { 0 } else { 1 }
             }''')
 
+    def test_arena_set_subset_with_collisions_and_removed_keys(self):
+        self.expect('''
+            use std::arena::Domain!;
+            use std::collections::arena_map::ArenaSet;
+            use std::hash::{HashIn, HashState};
+            struct Key { value: u32 }
+            forall 'k.
+            instance HashIn[Key, Domain!['k]] {
+                fn hash_in(&cx: Domain!['k], key: Key, state: HashState) -> HashState { state }
+                fn eq_in(&cx: Domain!['k], a: Key, b: Key) -> bool { a.value == b.value }
+            }
+            forall 'k.
+            fn check(&cx: Domain!['k]) -> bool {
+                let left: ArenaSet[Key, 'k] = ArenaSet::new(&cx);
+                let right: ArenaSet[Key, 'k] = ArenaSet::new(&cx);
+                let a = Key.{ value: 1u32 };
+                let b = Key.{ value: 2u32 };
+                let c = Key.{ value: 3u32 };
+                let empty = left.is_subset(&cx, right);
+                left.insert(&cx, a);
+                left.insert(&cx, b);
+                right.insert(&cx, b);
+                right.insert(&cx, a);
+                let equal = left.is_subset(&cx, right) && right.is_subset(&cx, left);
+                right.remove(&cx, a);
+                right.insert(&cx, c);
+                let distinct = !left.is_subset(&cx, right) && !right.is_subset(&cx, left);
+                left.remove(&cx, a);
+                empty && equal && distinct && left.is_subset(&cx, right) && !right.is_subset(&cx, left)
+            }
+            fn main() -> i32 {
+                var exists 'k. cx = Domain!::new(std::process::hash_seed());
+                let ok = check(&cx);
+                cx.destroy();
+                if ok { 0 } else { 1 }
+            }''')
+
     def test_arena_map_retain_counts_what_its_callback_changes(self):
         # The callback holds a copy of the map's handle and removes key 2 while key 1 is visited, then
         # rejects key 1: no key is left, and the count says so.
@@ -2499,12 +2559,62 @@ class StdRuntimeTests(unittest.TestCase):
                 if ok { 0 } else { 1 }
             }''')
 
-    def test_arena_vec_locates_indices_past_four_billion_segments(self):
-        # Segment k of a vec of u64 holds 4 << k elements, after 4 * (2^k - 1) of them.
+    def test_arena_vec_segments_preserve_element_stride_and_alignment(self):
         self.expect('''
-            use std::collections::arena_vec::locate;
+            use std::arena::{Domain!, ref_in};
+            use std::collections::arena_vec::ArenaVec;
+            use std::mem::alignof;
+            struct Row { tag: u8, number: u64, tail: u8 }
+            forall 'k.
+            fn check_rows(&cx: Domain!['k], rows: ArenaVec[Row, 'k]) -> bool {
+                if rows.is_empty(&cx) {
+                    rows.push(&cx, Row.{ tag: 3u8, number: 0u64, tail: 7u8 });
+                }
+                let first = rows.get_ref(&cx, 0usize).unwrap();
+                let alias = rows;
+                var i = rows.len(&cx);
+                while i < 65usize {
+                    let pad = ref_in(&cx, 0u8);
+                    alias.push(&cx, Row.{ tag: 3u8, number: i as u64, tail: 7u8 });
+                    i = i + 1usize;
+                }
+                i = 0usize;
+                while i < rows.len(&cx) {
+                    match rows.get_ref(&cx, i) {
+                        Some(r) => {
+                            let row = r.copy(&cx);
+                            if r.address() % alignof[Row]() != 0usize || row.number != i as u64
+                                || row.tag != 3u8 || row.tail != 7u8 { return false; }
+                        },
+                        None => return false,
+                    };
+                    i = i + 1usize;
+                }
+                let same = first.address() == rows.get_ref(&cx, 0usize).unwrap().address();
+                same && first.copy(&cx).number == 0u64 && rows.len(&cx) == 65usize
+            }
+            forall 'k.
+            fn check(&cx: Domain!['k]) -> bool {
+                let first = Row.{ tag: 3u8, number: 0u64, tail: 7u8 };
+                let second = Row.{ tag: 3u8, number: 1u64, tail: 7u8 };
+                check_rows(&cx, ArenaVec::new(&cx))
+                    && check_rows(&cx, ArenaVec::one(&cx, first))
+                    && check_rows(&cx, ArenaVec::two(&cx, first, second))
+            }
+            fn main() -> i32 {
+                var exists 'k. cx = Domain!::new(std::process::hash_seed());
+                let ok = check(&cx);
+                cx.destroy();
+                if ok { 0 } else { 1 }
+            }''')
+
+    def test_arena_vec_locates_indices_past_four_billion_segments(self):
+        # Segment k of a vec whose segment 0 holds 4 elements (as for u64) holds 4 << k elements,
+        # after 4 * (2^k - 1) of them.
+        self.expect('''
+            use std::collections::arena_vec::locate_segment;
             fn at(i: usize, segment: usize, offset: usize) -> bool {
-                let (k, o) = locate[u64](i);
+                let (k, o) = locate_segment(i, 4usize);
                 k == segment && o == offset && o < 4usize << k
             }
             fn main() -> i32 {

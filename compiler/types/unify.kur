@@ -9,7 +9,7 @@ use std::str::Str;
 use std::arena::{Domain!, seed};
 use package::kurs::core::{Kind, Member, Meta, MetaKind, Param, Type};
 use package::kurs::core as C;
-use package::types::ops::{Fresh, extractable_names, free_names, fresh, map_children, subst, type_tag};
+use package::types::ops::{Fresh, free_names, fresh, map_children, subst, type_tag};
 use package::types::ops as T;
 use std::collections::hashmap::OwnedMap!;
 use std::option::Option;
@@ -37,25 +37,36 @@ fn prune(&cx: Domain!['k], ty: Type['k]) -> Type['k] {
 // `ty` with every solved metavariable replaced by its solution.
 forall 'k.
 fn zonk(&cx: Domain!['k], ty: Type['k]) -> Type['k] {
-    map_children(&cx, prune(&cx, ty), |&cx, child: Type['k]| zonk(&cx, child))
+    let ty = prune(&cx, ty);
+    if has_solution(&cx, ty) {
+        zonk_all_children(&cx, ty)
+    } else {
+        ty
+    }
+}
+
+forall 'k.
+fn has_solution(&cx: Domain!['k], ty: Type['k]) -> bool {
+    match ty {
+        Meta(m) => m.solution(&cx).is_some(),
+        _ => T::any_type_child(&cx, ty, |&cx, child: Type['k]| has_solution(&cx, child)),
+    }
+}
+
+// Once a solved variable is found, rebuild in one pass. Rechecking each nested subtree
+// for solutions could visit a long branch once per ancestor.
+forall 'k.
+fn zonk_all_children(&cx: Domain!['k], ty: Type['k]) -> Type['k] {
+    map_children(&cx, prune(&cx, ty), |&cx, child: Type['k]| zonk_all_children(&cx, child))
 }
 
 // `ty` mentions no unsolved metavariable.
 forall 'k.
 fn ground(&cx: Domain!['k], ty: Type['k]) -> bool {
-    let ty = zonk(&cx, ty);
+    let ty = prune(&cx, ty);
     match ty {
         Meta(_m) => false,
-        _ => {
-            let parts = T::children(&cx, ty);
-            var all = true;
-            var i = 0usize;
-            while all && i < parts.len(&cx) {
-                all = ground(&cx, parts.at(&cx, i));
-                i = i + 1usize;
-            }
-            all
-        },
+        _ => !T::any_type_child(&cx, ty, |&cx, child: Type['k]| !ground(&cx, child)),
     }
 }
 
@@ -87,17 +98,7 @@ fn is_meta(ty: Type['k], meta: Meta['k]) -> bool {
 forall 'k.
 fn occurs(&cx: Domain!['k], meta: Meta['k], ty: Type['k]) -> bool {
     let ty = prune(&cx, ty);
-    if is_meta(ty, meta) {
-        return true;
-    }
-    let parts = T::children(&cx, ty);
-    var found = false;
-    var i = 0usize;
-    while !found && i < parts.len(&cx) {
-        found = occurs(&cx, meta, parts.at(&cx, i));
-        i = i + 1usize;
-    }
-    found
+    is_meta(ty, meta) || T::any_type_child(&cx, ty, |&cx, child: Type['k]| occurs(&cx, meta, child))
 }
 
 forall 'k.
@@ -409,55 +410,70 @@ fn solve(&cx: Domain!['k], a: Meta['k], b: Type['k]) -> bool {
     }
 }
 
-// Match rigid query types by solving only fresh instance parameters.
-//
-// Surface inference passes the input prefix; its output-only variables remain unsolved. Only
-// binder-free occurrences contribute extracted parameters. KURS passes the full head and requires
-// every parameter to be extractable. Failure discards all tentative bindings.
+// A declared parameter may match any type of its kind. Applications and primitives
+// have rigid outer names, so a mismatch here needs no tentative bindings.
+forall 'k.
+fn first_head_mismatch(&cx: Domain!['k], params: ArenaVec[Param['k], 'k], pattern: Type['k], actual: Type['k]) -> bool {
+    match pattern {
+        Prim(_name) => !C::same(&cx, pattern, actual),
+        Named(name, args) => {
+            let differs = match actual {
+                Named(other, parts) => !name.eq(&cx, other) || args.len(&cx) != parts.len(&cx),
+                _ => true,
+            };
+            differs && (!args.is_empty(&cx) || !params.any(&cx, |&cx, p: Param['k]| p.name.eq(&cx, name)))
+        },
+        _ => false,
+    }
+}
+
+// Match a standalone head, which may not have passed instance coherence.
 forall 'k.
 fn match_head(&cx: Domain!['k], params: ArenaVec[Param['k], 'k], head: ArenaVec[Type['k], 'k], query: ArenaVec[Type['k], 'k], require_extractable: bool, counter: Fresh['k]) -> Option[ArenaMap[Str['k], Type['k], 'k]] {
-    let reachable: ArenaSet[Str['k], 'k] = ArenaSet::new(&cx);
-    var i = 0usize;
-    while i < head.len(&cx) {
-        reachable.insert_all(&cx, extractable_names(&cx, head.at(&cx, i)).keys(&cx));
-        i = i + 1usize;
-    }
-    if head.len(&cx) != query.len(&cx) {
+    if head.len(&cx) != query.len(&cx) || !query.all(&cx, |&cx, t: Type['k]| ground(&cx, t)) {
         return Option::None;
     }
-    var j = 0usize;
-    while j < query.len(&cx) {
-        if !ground(&cx, query.at(&cx, j)) {
+    if require_extractable {
+        let reachable = T::extractable_inputs(&cx, head, head.len(&cx));
+        if !params.all(&cx, |&cx, p: Param['k]| reachable.contains(&cx, p.name)) {
             return Option::None;
         }
-        j = j + 1usize;
     }
-    if require_extractable {
-        var k = 0usize;
-        while k < params.len(&cx) {
-            if !reachable.contains(&cx, params.at(&cx, k).name) {
-                return Option::None;
-            }
-            k = k + 1usize;
-        }
+    match_ground_head(&cx, params, head, query, require_extractable, counter)
+}
+
+// Match the ground inputs of a trait application. For a full head, coherence has
+// already established that every parameter has a binder-free occurrence.
+forall 'k.
+fn match_ground_head(&cx: Domain!['k], params: ArenaVec[Param['k], 'k], head: ArenaVec[Type['k], 'k], query: ArenaVec[Type['k], 'k], full: bool, counter: Fresh['k]) -> Option[ArenaMap[Str['k], Type['k], 'k]] {
+    let count = query.len(&cx);
+    if count > head.len(&cx) || (full && count != head.len(&cx)) {
+        return Option::None;
+    }
+    if count > 0usize && first_head_mismatch(&cx, params, head.at(&cx, 0usize), prune(&cx, query.at(&cx, 0usize))) {
+        return Option::None;
     }
     let sub = instantiate(&cx, params);
-    var m = 0usize;
-    while m < head.len(&cx) {
-        if !unify(&cx, subst(&cx, head.at(&cx, m), sub, counter), query.at(&cx, m), true, counter) {
+    var i = 0usize;
+    while i < count {
+        if !unify(&cx, subst(&cx, head.at(&cx, i), sub, counter), query.at(&cx, i), true, counter) {
             return Option::None;
         }
-        m = m + 1usize;
+        i = i + 1usize;
     }
+    if params.is_empty(&cx) {
+        return Option::Some.(sub);
+    }
+    let reachable = if full { Option::None } else { Option::Some.(T::extractable_inputs(&cx, head, count)) };
     let out: ArenaMap[Str['k], Type['k], 'k] = ArenaMap::new(&cx);
-    let names = sub.keys(&cx);
-    var n = 0usize;
-    while n < names.len(&cx) {
-        let t = sub.at(&cx, names.at(&cx, n));
-        if reachable.contains(&cx, names.at(&cx, n)) && ground(&cx, t) {
-            out.insert(&cx, names.at(&cx, n), zonk(&cx, t));
+    sub.each(&cx, |&cx, name: Str['k], t: Type['k]| {
+        let extract = match reachable {
+            None => true,
+            Some(names) => names.contains(&cx, name),
+        };
+        if extract && ground(&cx, t) {
+            out.insert(&cx, name, zonk(&cx, t));
         }
-        n = n + 1usize;
-    }
+    });
     Option::Some.(out)
 }

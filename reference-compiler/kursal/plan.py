@@ -5,7 +5,8 @@ a parallel assignment through scratch variables. `plan` finds where less does th
 
 - Live values. A value is live when the C reads it: an instruction that is kept reads it, a terminator
   tests or returns it, or an edge passes it to a live parameter of its target. A block parameter is live
-  when its own block reads it, so liveness is a fixpoint over the blocks. A pure instruction (`PURE`)
+  when its own block reads it. A backward scan seeds liveness, and newly live values propagate through
+  their definitions and incoming edges. A pure instruction (`PURE`)
   whose results are all dead is left out; a store's unit result and a call's result that are dead are
   not assigned. A dead parameter is assigned by no edge.
 - Copies. A `copy` reads its source's C variable instead of having one of its own. Within a block every
@@ -28,6 +29,9 @@ a parallel assignment through scratch variables. `plan` finds where less does th
   only the components that are not already there.
 - Shared variables. A value read by one edge alone is assigned to the target parameter's variable, and
   a payload parameter that one arm alone enters reads the payload where the scrutinee lies (`share`).
+- Forwarded parameters. A block parameter whose incoming edges forward the same parameter reads
+  that parameter's C variable. Only edges into the original parameter's block, and a self tail call
+  when it is an entry parameter, write it.
 
 The plan only reads the program; the KURS the checker accepted is what cgen.py translates."""
 
@@ -37,7 +41,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .check import overlap
-from .core import ATOMIC_OPS, Block, Edge, Fun, Instr, Jmp, Jnz, Ret, Switch, Terminator, Type
+from .core import ATOMIC_OPS, Block, Edge, Fun, Instr, Jmp, Jnz, Never, Ret, Switch, Terminator, Type
 
 # Instructions whose C writes only their results: left out when every result is dead.
 PURE = frozenset({"const", "copy", "construct", "construct_variant", "destruct", "variant_tag", "load",
@@ -127,6 +131,14 @@ class Plan:
                 self.return_index[block.label] = index
         # The blocks the C has: every edge into a return join returns instead.
         self.emitted = [b for b in fun.blocks if b.label not in self.return_index]
+        self.outgoing = {block.label: term_edges(block.term) for block in self.emitted}
+        preds: dict[str, list[tuple[Block, Edge, int]]] = {}
+        for block in self.emitted:
+            for edge, skip in self.outgoing[block.label]:
+                preds.setdefault(edge.target, []).append((block, edge, skip))
+        self.live = self.liveness(preds)
+        self.param_origins = self.forwarded_params(preds)
+        self.shared_params = self.param_origins.keys() | self.param_origins.values()
         # (block, value) -> the place path it is read from
         self.resident: dict[tuple[str, str], str] = {}
         # (block, index) of a lend adapter's call -> the paths it lends its callee, in the order handed back
@@ -136,18 +148,17 @@ class Plan:
         self.fused: set[tuple[str, int]] = set()
         for block in self.emitted:
             self.residences(block, components or {}, adapters or {}, params, shapes or {})
-        self.live = self.liveness()
         # (block, value) -> (block, parameter) whose C variable the value is assigned to (`share`)
         self.shared: dict[tuple[str, str], tuple[str, str]] = {}
         # (block, payload parameter) -> (block, scrutinee, variant) whose payload the parameter reads (`share`)
         self.arrived: dict[tuple[str, str], tuple[str, str, str]] = {}
-        self.share()
+        self.share(preds)
         # (block, parameter) -> {component index: the place path the component is written to} (`home_params`)
         self.homed: dict[tuple[str, str], dict[int, str]] = {}
         # (block, value) of each construction or call shared into a homed parameter: it writes the homed
         # components itself, and the edge does not
         self.made_home: set[tuple[str, str]] = set()
-        self.home_params(components or {})
+        self.home_params(preds, components or {})
         self.variables = self.c_variables()
 
     def is_live(self, label: str, name: str) -> bool:
@@ -199,28 +210,94 @@ class Plan:
                 out[block.label, instr.lhs[0]] = out.get((block.label, source), source)
         return out
 
+    def forwarded_params(self, preds: dict[str, list[tuple[Block, Edge, int]]]) -> dict[tuple[str, str], tuple[str, str]]:
+        """Find the original parameter of each chain of forwarding edges, including loop back edges."""
+        # Never fits any edge parameter type but has no C variable to share.
+        keys = [(block.label, name) for block in self.emitted for name, ty in block.params
+                if name.startswith("%") and not isinstance(ty, Never) and (block.label, name) in self.live]
+        indices = {key: i for i, key in enumerate(keys)}
+        incoming: list[list[int]] = [[] for _ in keys]
+        origins: list[int | None] = [None] * len(keys)
+        payloads: set[int] = set()
+        for block in self.emitted:
+            edges = preds.get(block.label, [])
+            for pos, (name, _) in enumerate(block.params):
+                i = indices.get((block.label, name))
+                if i is None:
+                    continue
+                if any(pos < skip for _, _, skip in edges):
+                    payloads.add(i)
+                    origins[i] = i
+                    continue
+                for source, edge, skip in edges:
+                    arg = indices.get((source.label, edge.args[pos - skip]))
+                    if arg is None:
+                        origins[i] = i
+                        break
+                    incoming[i].append(arg)
+                if not edges:
+                    origins[i] = i
+
+        # A back edge with no known origin can start forwarding once another edge fixes the origin.
+        # Unresolved cycles have no such input. Keep their parameters separate and settle again.
+        for strict in (False, True):
+            if strict:
+                for i, origin in enumerate(origins):
+                    if origin is None:
+                        origins[i] = i
+            changed = True
+            while changed:
+                changed = False
+                for i, args in enumerate(incoming):
+                    if origins[i] == i:
+                        continue
+                    distinct = {origins[arg] for arg in args if origins[arg] is not None}
+                    origin = i if len(distinct) > 1 else next(iter(distinct), None)
+                    if origin != origins[i]:
+                        origins[i] = origin
+                        changed = True
+        return {key: keys[origin] for i, (key, origin) in enumerate(zip(keys, origins))
+                if origin is not None and origin != i and origin not in payloads}
+
     # --------------------------------------------------------------- liveness --
 
-    def liveness(self) -> set[tuple[str, str]]:
-        live_params: set[tuple[str, str]] = set()
-        changed = True
-        while changed:
-            changed = False
-            for block in reversed(self.emitted):
-                used = self.block_reads(block, live_params)
-                for name, _ in block.params:
-                    if name in used and (block.label, name) not in live_params:
-                        live_params.add((block.label, name))
-                        changed = True
+    def liveness(self, preds: dict[str, list[tuple[Block, Edge, int]]]) -> set[tuple[str, str]]:
         live: set[tuple[str, str]] = set()
-        for block in self.emitted:
-            live.update((block.label, name) for name in self.block_reads(block, live_params))
+        scanned: set[str] = set()
+        pending: list[tuple[str, str]] = []
+        for block in reversed(self.emitted):
+            label = block.label
+            used = self.block_reads(block, live)
+            live.update((label, name) for name in used)
+            scanned.add(label)
+            # Predecessors yet to be scanned will read these live parameters on their own.
+            for source, edge, skip in preds.get(label, ()):
+                if source.label in scanned:
+                    pending.extend((source.label, arg) for (param, _), arg in zip(block.params[skip:], edge.args)
+                                   if param in used)
+
+        sources: dict[str, dict[str, int | Instr]] = {}
+        for label, name in pending:
+            if (label, name) in live:
+                continue
+            live.add((label, name))
+            if label not in sources:
+                block = self.blocks[label]
+                definitions: dict[str, int | Instr] = {p: i for i, (p, _) in enumerate(block.params)}
+                definitions.update((v, instr) for instr in block.instrs if instr.op in PURE for v in instr.lhs)
+                sources[label] = definitions
+            source_of_value = sources[label].get(name)
+            if isinstance(source_of_value, int):
+                pending.extend((source.label, edge.args[source_of_value - skip])
+                               for source, edge, skip in preds.get(label, ()) if source_of_value >= skip)
+            elif isinstance(source_of_value, Instr):
+                pending.extend((label, v) for v in instr_reads(source_of_value))
         return live
 
-    def block_reads(self, block: Block, live_params: set[tuple[str, str]]) -> set[str]:
+    def block_reads(self, block: Block, live: set[tuple[str, str]]) -> set[str]:
         """The names of `block` the C reads, given which parameters of other blocks are live."""
         used = set(term_reads(block.term))
-        for edge, skip in term_edges(block.term):
+        for edge, skip in self.outgoing[block.label]:
             target = self.blocks[edge.target]
             if target.label in self.return_index:
                 # The payload, when it is the value returned, is the scrutinee's, which the switch reads.
@@ -228,7 +305,7 @@ class Plan:
                     used.add(edge.args[self.return_index[target.label] - skip])
                 continue
             for (param, _), arg in zip(target.params[skip:], edge.args):
-                if (target.label, param) in live_params:
+                if (target.label, param) in live:
                     used.add(arg)
         for instr in reversed(block.instrs):
             if instr.op in PURE and not any(name in used for name in instr.lhs):
@@ -241,7 +318,8 @@ class Plan:
         out: set[tuple[str, str]] = set()
         for block in self.emitted:
             out.update((block.label, name) for name, _ in block.params
-                       if (block.label, name) in self.live and (block.label, name) not in self.arrived)
+                       if (block.label, name) in self.live and (block.label, name) not in self.arrived
+                       and (block.label, name) not in self.param_origins)
             for i, instr in enumerate(block.instrs):
                 if instr.op == "copy" or self.is_forwarded_load(instr) or (block.label, i) in self.fused or \
                         (block.label, i) in self.in_place:
@@ -255,7 +333,7 @@ class Plan:
 
     # ----------------------------------------------------------------- sharing --
 
-    def share(self) -> None:
+    def share(self, preds: dict[str, list[tuple[Block, Edge, int]]]) -> None:
         """Values that move along one edge share the C variable they move into.
 
         - A value an instruction of a block assigns, which one edge of the block reads and nothing else
@@ -270,40 +348,39 @@ class Plan:
           when it lies in a parameter's variable, and the arm's block shares nothing there; the switch's
           block runs again only after the arm's block has left. A scrutinee lying in a place is not read
           so, since the arm's block may write the place."""
-        incoming: dict[str, int] = {}
-        for block in self.emitted:
-            for edge, _ in term_edges(block.term):
-                incoming[edge.target] = incoming.get(edge.target, 0) + 1
         for block in self.emitted:
             label, term = block.label, block.term
             if isinstance(term, Switch) and not term.scrutinee.startswith("&") and \
-                    not self.resident.get((label, term.scrutinee), "%").startswith("&"):
+                    (scrutinee := self.variable(label, term.scrutinee)) is not None and \
+                    scrutinee not in self.shared_params:
                 for arm in term.arms:
                     target = self.blocks[arm.edge.target]
                     if target.label not in self.return_index and target.label != label and \
-                            incoming.get(target.label) == 1 and target.params:
+                            len(preds[target.label]) == 1 and target.params:
                         self.arrived[target.label, target.params[0][0]] = (label, term.scrutinee, arm.variant)
         for block in self.emitted:
             label, term = block.label, block.term
-            if not any(edge.args for edge, _ in term_edges(term)):
+            edges = self.outgoing[label]
+            if not any(edge.args for edge, _ in edges):
                 continue
             # The variable the block's payload is read in (`arrived`), which no value of the block is made in.
             payload = block.params[0][0] if block.params else ""
             arrival = self.variable(label, payload) if (label, payload) in self.arrived else None
             reads: dict[str, int] = {}
             for name in [name for instr in block.instrs for name in instr_reads(instr)] + term_reads(term) + \
-                    [name for edge, _ in term_edges(term) for name in edge.args]:
+                    [name for edge, _ in edges for name in edge.args]:
                 reads[name] = reads.get(name, 0) + 1
             assigned = {name for i, instr in enumerate(block.instrs) for name in instr.lhs
                         if instr.op != "copy" and not self.is_forwarded_load(instr) and (label, i) not in self.fused
                         and (label, i) not in self.in_place}
-            for edge, skip in term_edges(term):
+            for edge, skip in edges:
                 target = self.blocks[edge.target]
                 if target.label in self.return_index or target.label == label:
                     continue
                 for (param, _), arg in zip(target.params[skip:], edge.args):
                     if arg in assigned and reads.get(arg) == 1 and (label, arg) not in self.resident and \
-                            (target.label, param) in self.live and arrival != (target.label, param):
+                            (target.label, param) in self.live and (target.label, param) not in self.shared_params \
+                            and arrival != (target.label, param):
                         self.shared[label, arg] = (target.label, param)
 
     def variable(self, label: str, name: str) -> Optional[tuple[str, str]]:
@@ -317,11 +394,12 @@ class Plan:
         if (label, value) in self.arrived:
             source, scrutinee, _ = self.arrived[label, value]
             return self.variable(source, scrutinee)
-        return label, value
+        return self.param_origins.get((label, value), (label, value))
 
     # ------------------------------------------------------- homed parameters --
 
-    def home_params(self, components: dict[tuple[str, int], tuple[str, ...]]) -> None:
+    def home_params(self, preds: dict[str, list[tuple[Block, Edge, int]]],
+                    components: dict[tuple[str, int], tuple[str, ...]]) -> None:
         """Components of a block parameter written where they end up (`homed`).
 
         A parameter `p` of a struct or tuple type that its block J reads once, by a destruct, whose
@@ -333,10 +411,6 @@ class Plan:
         to the edge nothing names a path overlapping P, reads a value lying at such a path, or (for the
         component written) has it lie at a path overlapping P but not P itself. P is empty from where it is
         written to J's store, so its old contents are dead and nothing reads it before the store."""
-        preds: dict[str, list[tuple[Block, Edge, int]]] = {}
-        for block in self.emitted:
-            for edge, skip in term_edges(block.term):
-                preds.setdefault(edge.target, []).append((block, edge, skip))
         for target in self.emitted[1:]:
             label = target.label
             if label not in preds or not target.params:
@@ -366,13 +440,13 @@ class Plan:
                     continue
                 for name in instr_reads(instr):
                     reads.setdefault(find(name), []).append(i)
-            for name in term_reads(target.term) + [name for edge, _ in term_edges(target.term) for name in edge.args]:
+            for name in term_reads(target.term) + [name for edge, _ in self.outgoing[label] for name in edge.args]:
                 reads.setdefault(find(name), []).append(n)
             # the paths homed so far, in the order every edge and construction writes them
             chosen: list[str] = []
             for pi, (p, _) in enumerate(target.params):
                 at = reads.get(p, [])
-                if (label, p) not in self.live or len(at) != 1 or at[0] == n:
+                if (label, p) not in self.live or (label, p) in self.shared_params or len(at) != 1 or at[0] == n:
                     continue
                 d = at[0]
                 destruct = target.instrs[d]
@@ -436,7 +510,7 @@ class Plan:
         # Nothing read after the write lies at a path overlapping `path`.
         later = [name for instr in instrs[at + 1:] for name in instr_reads(instr)]
         if at < n:
-            later += term_reads(term) + [name for e, _ in term_edges(term) for name in e.args]
+            later += term_reads(term) + [name for e, _ in self.outgoing[label] for name in e.args]
         if any(overlap(self.resident.get((label, name), "%"), path) for name in later):
             return False
         # What is written does not lie at a path overlapping `path` but `path` itself, nor at one a
@@ -532,7 +606,7 @@ class Plan:
             for name in instr_reads(instr):
                 last[find(name)] = i
                 reads[find(name)] = reads.get(find(name), 0) + 1
-        for name in term_reads(block.term) + [name for edge, _ in term_edges(block.term) for name in edge.args]:
+        for name in term_reads(block.term) + [name for edge, _ in self.outgoing[label] for name in edge.args]:
             last[find(name)] = n
 
         def kept(c: str, path: str, origin: int, until: Optional[int] = None) -> bool:
@@ -581,7 +655,8 @@ class Plan:
             others = [arg for arg in instrs[i].args[1:] if is_place(arg)]
             if all(x in valid and last.get(x) == i and
                    (candidates[x][2] == -1 or (label, candidates[x][2]) in self.in_place) and
-                   (last.get(root(q), -1) <= i if q.startswith("%") else stored_back(i, k, q))
+                   ((label, root(q)) not in self.shared_params and last.get(root(q), -1) <= i
+                    if q.startswith("%") else stored_back(i, k, q))
                    for k, (x, q) in enumerate(lent[i])) and \
                     not any(overlap(p, q) for k, p in enumerate(paths) for q in paths[k + 1:]) and \
                     not any(overlap(p, q) for p in paths for q in others):
